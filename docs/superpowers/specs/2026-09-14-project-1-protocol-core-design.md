@@ -59,6 +59,29 @@ Independent object creation uses random precomputed nonces, not a global object 
 
 Project 1 stores encrypted blobs through a content-addressed interface and verifies the full ciphertext hash on retrieval. It does not replicate or erasure-code blobs. Those remain replaceable storage implementations later.
 
+### 3.4 External protocol precedents
+
+Vana validates three boundaries used here: scopes are first-class grant objects; grants are EIP-712 signed with expiry and nonce; and its Context Gateway can deny a revoked grant immediately while on-chain state becomes the durable record. Mida adopts the narrow version of that split:
+
+```text
+Monad                 canonical authority and settlement
+Context API           immediate fail-closed enforcement
+```
+
+The API may deny sooner than chain confirmation, but it can never authorize anything Monad does not currently authorize. Unlike Vana’s current Personal Server path, Mida’s Context API is not a persistent plaintext decryptor; agents receive cryptographic access to scoped encrypted state.
+
+Ethereum Attestation Service validates keeping the public record small: its attestation record carries identity, expiry/revocation, a reference UID, and schema-encoded data, while schema definitions are separate. Mida similarly keeps evolving payload semantics off-chain and encrypted.
+
+Mida does not copy EAS `refUID` literally. `parentId` remains the contract-enforced supersession predecessor because stale-parent conflict detection depends on that meaning. Generic `derived-from`, `confirmed-from`, and supporting-evidence references live as typed encrypted payload references committed by `evidenceCommitment`.
+
+Sources verified 2026-09-14:
+
+- `https://docs.vana.org/protocol-reference/grants-permissions`
+- `https://docs.vana.org/protocol-reference/personal-servers`
+- `https://docs.vana.org/protocol-reference/storage-encryption`
+- `https://github.com/ethereum-attestation-service/eas-docs-site/blob/main/docs/tutorials/make-an-attestation.md`
+- `https://raw.githubusercontent.com/ethereum-attestation-service/eas-docs-site/main/docs/tutorials/create-a-schema.md`
+
 ## 4. Trust and authority boundaries
 
 ### 4.1 Owner
@@ -355,6 +378,13 @@ All fields are known before encryption. The contract resolves `owner` and `autho
 ### 8.2 Payload encryption
 
 ```ts
+type RecordRelation = "supports" | "derived_from" | "confirmed_from"
+
+interface RecordReference {
+  relation: RecordRelation
+  recordId: Hex
+}
+
 interface ContextPayload {
   v: 1
   value: string | Record<string, unknown>
@@ -362,7 +392,7 @@ interface ContextPayload {
   provenance: {
     source: ProvenanceSource
     extractionConfidence?: number
-    evidenceIds?: Hex[]
+    references?: RecordReference[]
     sourceHash?: Hex
     sourceUri?: string
     retrievedAt?: number
@@ -867,26 +897,31 @@ Attempts to supersede evidence revert `EVIDENCE_IMMUTABLE`.
 ### 11.8 Provenance enforcement
 
 - `USER_ASSERTED` requires owner authorship.
-- `USER_CONFIRMED` requires owner authorship and a non-zero evidence commitment to the proposal or evidence being confirmed.
+- `USER_CONFIRMED` requires owner authorship and a non-zero evidence commitment; the SDK requires at least one `confirmed_from` reference.
 - Agents can never submit either value.
 - `AGENT_INFERRED` requires agent authorship, CREATE/supersession authority, and `ALLOW_INFERENCE`; an owner-authored record cannot label itself agent-inferred.
 - `IMPORTED` requires `ALLOW_IMPORTED` for an agent and a non-zero `evidenceCommitment` revealing at least one registered evidence-record ID when decrypted.
 - `EXTERNAL_ATTESTATION` requires `ALLOW_EXTERNAL_ATTESTATION` for an agent and a non-zero `evidenceCommitment` revealing at least one registered evidence-record ID when decrypted.
 - Owner imports/attestations also require a non-zero evidence commitment.
-- The contract can enforce only that the commitment is non-zero. The SDK/API verifies revealed IDs exist and recompute the commitment; it cannot prove the encrypted evidence semantically supports the claim.
+- The contract can enforce only that the commitment is non-zero. The SDK/API verifies revealed typed references exist and recompute the commitment; it cannot prove the encrypted evidence semantically supports the claim.
 - The contract does not interpret extraction confidence or claim truth; those remain encrypted payload semantics.
 
-Evidence IDs are canonicalized off-chain as sorted unique `bytes32` values:
+Payload references are canonicalized off-chain by mapping relation strings to fixed codes (`supports = 1`, `derived_from = 2`, `confirmed_from = 3`), sorting by `(relationCode, recordId)`, and removing duplicate pairs:
 
 ```text
 evidenceCommitment = keccak256(
-  abi.encode("MIDA_EVIDENCE_V1", canonicalEvidenceIds)
+  abi.encode(
+    "MIDA_EVIDENCE_V1",
+    canonical RecordReference[]
+  )
 )
 ```
 
-A public observer can verify only that the writer committed to an evidence set. An authorized reader can decrypt the IDs, recompute the commitment, and verify the revealed set.
+The commitment binds both record IDs and their claimed semantic relations. A public observer can verify only that the writer committed to a reference set. An authorized reader can decrypt the typed references, recompute the commitment, and verify the revealed set. The SDK additionally verifies that every referenced record exists under the same owner; the contract cannot inspect encrypted references.
 
-A user-confirmed successor may edit an agent proposal. It need not contain identical plaintext. `confirmed-from` means that the new owner-authored claim acknowledges the proposal in its evidence and/or parent relation; it does not mean byte equality.
+`parentId` is not one of these generic semantic references. For context lineages it means only “the canonical record this version supersedes,” and the contract enforces it through `expectedParentId` and the latest pointer. Evidence records have `parentId == 0`.
+
+A user-confirmed successor may edit an agent proposal. It need not contain identical plaintext. A `confirmed_from` reference means the new owner-authored claim acknowledges the proposal; it does not mean byte equality or replace the contract’s supersession rules.
 
 ### 11.9 Expiry semantics
 
@@ -911,7 +946,17 @@ GET  /objects?owner=&namespaceId=
 POST /epoch-wraps
 GET  /epoch-wraps?owner=&namespaceId=&readEpoch=&agentId=&agentKeyVersion=
 GET  /manifests/:contextId
+POST /revocations
+POST /revocations/:id/cancel
 ```
+
+Effective API authority is always the intersection:
+
+```text
+effectiveAllowed = currentlyAllowedByMonad AND NOT localDeny
+```
+
+A positive cache entry or pending grant can never make `currentlyAllowedByMonad` true. An owner-authenticated revocation intent may add `localDeny` before the chain transaction confirms, making access fail immediately. The deny remains if the transaction fails or is reorganized out; only the matching on-chain revocation or a fresh P256-approved cancellation removes it. This off-chain layer can reduce availability but cannot broaden authority.
 
 ### 12.1 Authentication
 
@@ -934,6 +979,27 @@ MidaHttpRequestV1:
 ```
 
 `nonce` is a random `bytes32`. The API accepts `abs(serverTime - timestamp) <= 60 seconds` and rejects a repeated `(signer, nonce)` during that window. Empty bodies use `keccak256("")`. It recovers the current registered agent signer or exact owner account before performing authorization. Browser transport remains Project 2, but Project 1 freezes and tests this service-authentication format.
+
+For every agent operation, the API validates in this normative fail-closed order and stops at the first failure:
+
+```text
+1. authenticate request signature and recover agent signer
+2. resolve active agent identity
+3. load the exact capability; require it exists
+4. reject local deny, on-chain revocation, or agent-epoch mismatch
+5. reject capability expiry (`expiresAt != 0 && now >= expiresAt`)
+6. require exact namespace match
+7. require the requested permission bit
+8. require current registered agent signing/encryption key versions where relevant
+```
+
+The final epoch check is operation-specific:
+
+- **Read:** the object epoch must be a registered current or historical epoch, and the returned reader wrap must match the requesting agent and encryption-key version. The current epoch’s write deadline does not block historical reads.
+- **Create/supersede:** the submitted epoch must equal the current required epoch and `isWriteEpochValid` must be true.
+- **Publish reader wrap:** the target epoch must be registered, and the currently active READ capability must still exist.
+
+This distinction matters: an expired write deadline closes new writes, but it does not independently revoke a different reader whose capability remains valid.
 
 ### 12.2 Object upload
 
@@ -967,7 +1033,35 @@ Before returning an object, manifest, or location hint to an agent, the API chec
 
 Owner authentication alone is insufficient. The API cannot grant access independently.
 
-### 12.5 Typed failures
+### 12.5 Fast revocation deny overlay
+
+`POST /revocations` is owner-authenticated and names either one capability ID or one `(owner, agentId)` relationship. After verifying the target exists, the API records a unique revocation-intent ID and denies matching requests before returning success. The owner then submits the canonical Monad revoke/rotation transaction.
+
+The overlay has only three transitions:
+
+```text
+active deny → anchored       matching Monad revocation observed
+active deny → active deny    transaction failed, missing, or reorged out
+active deny → cancelled      fresh owner P256-approved cancellation
+```
+
+Cancelling a deny restores authority and therefore uses stronger authorization than creating one. The Vault signs an assertion over:
+
+```text
+keccak256(abi.encode(
+  "MIDA_CANCEL_FAST_REVOKE_V1",
+  chainId,
+  CapabilityRegistry address,
+  owner,
+  revocationIntentId,
+  apiCancellationNonce,
+  expiresAt
+))
+```
+
+The API owns and consumes `apiCancellationNonce`, requires User Verification, and accepts the assertion only before its five-minute `expiresAt`. A delegated session signature alone cannot cancel a deny. There is no timeout that silently removes a deny. Capability expiry needs no overlay because both Monad authorization and API checks use the signed absolute `expiresAt`.
+
+### 12.6 Typed failures
 
 ```text
 CAPABILITY_DENIED
@@ -1160,11 +1254,19 @@ Every behavior below must first exist as a failing test, fail for the intended r
 | Anchor | `SUPERSEDE_ANY` agent edits owner-controlled lineage | rejected |
 | Anchor | agent creates separate proposal | accepted with inference policy |
 | Evidence | supersede evidence | `EVIDENCE_IMMUTABLE` |
-| Evidence | duplicate evidence IDs canonicalized | one sorted unique commitment |
+| Evidence | duplicate typed references canonicalized | one sorted unique-pair commitment |
+| Evidence | mutate relation but keep record ID | commitment mismatch |
+| Lineage | use generic reference as a supersession parent | does not change canonical head |
 | Lineage | same current parent superseded twice | second gets `STALE_PARENT` |
 | Lineage | caller forges version/lineage/author | fields absent or recomputed; forgery rejected |
 | Concurrency | independent roots/lineages created concurrently | both succeed |
 | API | forged or expired capability | denied |
+| API | pending grant absent from Monad | denied; fast plane cannot broaden authority |
+| API | owner posts revocation before chain confirmation | matching access denied immediately |
+| API | revocation transaction fails or reorgs | deny remains until P256-approved cancellation |
+| API | delegated owner session tries to cancel deny | rejected without fresh P256 approval |
+| API | replay P256 deny-cancellation assertion | rejected by API nonce |
+| API | expired epoch deadline with separately valid reader | historical read allowed; new write denied |
 | API | replay signed HTTP nonce inside validity window | denied |
 | API | owner-authenticated wrap without recipient capability | denied |
 | API | obsolete read-epoch object upload | denied |
@@ -1191,10 +1293,11 @@ The CLI harness must execute this sequence against local contracts and then Mona
 7. Agent C receives exact CREATE goals.career without READ.
 8. Agent C uses only the public epoch key to create a new encrypted lineage.
 9. Agent C cannot fetch a reader wrap or decrypt Alice’s existing object.
-10. Alice atomically revokes Agent A and advances goals.career to epoch 2 with its public key.
-11. Agent C writes a new object under epoch 2.
-12. Agent A’s chain read fails and its epoch-1 private key cannot decrypt the epoch-2 object.
-13. A remaining authorized reader receives an epoch-2 wrap and continues normally.
+10. Alice posts an owner-signed revocation intent; the Context API denies Agent A before chain confirmation.
+11. Alice atomically revokes Agent A on Monad and advances goals.career to epoch 2 with its public key.
+12. Agent C writes a new object under epoch 2.
+13. Agent A’s chain read fails and its epoch-1 private key cannot decrypt the epoch-2 object.
+14. A remaining authorized reader receives an epoch-2 wrap and continues normally.
 ```
 
 Success requires assertions at every denial and cryptographic boundary. Console output alone is not proof.
@@ -1242,7 +1345,7 @@ Project 1 passes only when:
 
 - unit and property tests cover canonicalization, derivation, encryption, wraps, storage, and wire validation;
 - Foundry adversarial tests cover grants, replay, exact scopes, provenance, anchors, evidence, expiry, epoch rotation, and stale parents;
-- API integration tests prove authorization is checked for reads and reader-wrap publication;
+- API integration tests prove the normative validation order, chain-bounded authorization, immediate local deny, and authorization checks for reads and reader-wrap publication;
 - the complete CLI scenario passes locally;
 - the same scenario passes against deployed Monad testnet contracts;
 - local fallback and native P256 verification paths are distinguished and evidenced;
