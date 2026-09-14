@@ -24,6 +24,7 @@ These bind the executor. Report any disagreement before implementing.
 14. **Unexpected API errors fail closed** with HTTP 500 and code `CAPABILITY_DENIED`, never a stack trace or an allow.
 15. **`provisionAgent` and `buildSignedAccessRequest` are fixtures** exported by `@mida/fake-vault` for Tasks 22–26. The production request path is `MidaAgent.createAccessRequest` (Task 25).
 16. **The Monad testnet run generates every actor** and funds each one from a single `DEPLOYER_PRIVATE_KEY`, so only one address needs faucet funds.
+17. **One shared assertion adapter, in `@mida/protocol`.** It holds `P256_N`, `normalizeP256LowS` and `toWebAuthnAuthStruct`, with no FakeVault, ox or browser dependency, so Project 2's real passkey adapter imports exactly the same normalization (spec §10.4, §15). The FakeVault builds metadata and the signing digest with ox `WebAuthnP256.getSignPayload({ hash: true })`. It signs that digest with `@noble/curves` `p256`, deliberately allowing either `s`. It converts through the shared adapter and refuses any result that ox `WebAuthnP256.verify` rejects (spec §8). Part D's fixture generator (`export-webauthn-fixture.ts`) still signs with ox `P256.sign` and normalizes inline; it only produces a test vector and is not an assertion adapter.
 
 ---
 
@@ -952,6 +953,9 @@ Claude-Session: https://claude.ai/code/session_01Gjzo41PhP1bgEgNxYyz2Sk"
 **Depends on:** Tasks 6–13 (crypto, storage, advisor) and Task 21.
 
 **Files:**
+- Create: `packages/protocol/src/webauthn-assertion.ts`
+- Modify: `packages/protocol/src/index.ts`
+- Test: `packages/protocol/test/webauthn-assertion.test.ts`
 - Create: `packages/fake-vault/package.json`, `packages/fake-vault/src/prf.ts`, `packages/fake-vault/src/webauthn.ts`, `packages/fake-vault/src/ports.ts`, `packages/fake-vault/src/agents.ts`, `packages/fake-vault/src/fake-vault.ts`, `packages/fake-vault/src/index.ts`
 - Modify: root `package.json` (dependency `"@mida/fake-vault": "workspace:*"`)
 - Test: `packages/fake-vault/test/fake-vault.test.ts`
@@ -959,14 +963,159 @@ Claude-Session: https://claude.ai/code/session_01Gjzo41PhP1bgEgNxYyz2Sk"
 **Interfaces:**
 - Consumes: Part A protocol constants, `accessRequestHash`, `cancelFastRevokeDigest`, `canonicalizeNamespace`, `contextId`, `grantDigest`, `hashString`, `namespaceById`, `namespaceId`, `originHash`, `sortScopes`, `accessRequestTypedData`, `agentId`; Part B `assertNonZeroKey`, `bytesOf`, `deriveEpochKeyPair`, `deriveNamespaceSecret`, `generateX25519KeyPair`, `hexOf`, `prfSalt`, `sealContextObject`, `wrapEpochPrivateKeyToAgent`; Part C `POLICY_HASH_V1`, `adviseGrant`, `assertFinalSelection`, `manifestBindingFor`, `manifestBodyHash`; Task 21 `capabilityRegistryAbi`, `contextRegistryAbi`, `latestTimestamp`, `ownerHistory`, `readAgentRecord`, `registerAgent`, `sendContract`, `toMidaError`, types `ChainContext`, `WriteContext`, `LocalWriteContext`.
 - Produces, `prf.ts`: `fakePrfOutput(seed: Uint8Array, domain: IsolationDomain): Uint8Array`.
-- Produces, `webauthn.ts`: `P256_N`, `interface WebAuthnAuthStruct { authenticatorData; clientDataJSON; challengeIndex: bigint; typeIndex: bigint; r: bigint; s: bigint }`, `interface WebAuthnAssertionWire` (the same fields, integers as strings), `p256PublicKey(privateKey: Hex): { qx: bigint; qy: bigint }`, `signVaultAssertion({ challenge; privateKey; rpId; origin }): WebAuthnAuthStruct`, `assertionToWire(auth): WebAuthnAssertionWire`.
+- Produces, `@mida/protocol` `webauthn-assertion.ts` (the shared adapter): `P256_N: bigint`, `interface WebAuthnAuthStruct { authenticatorData: Hex; clientDataJSON: string; challengeIndex: bigint; typeIndex: bigint; r: bigint; s: bigint }`, `normalizeP256LowS(s: bigint): bigint` (throws `INVALID_WIRE` unless `0 < s < n`; returns `n - s` when `s > n/2`), `toWebAuthnAuthStruct({ authenticatorData; clientDataJSON; challengeIndex: number | bigint; typeIndex: number | bigint; r: bigint; s: bigint }): WebAuthnAuthStruct`.
+- Produces, `webauthn.ts`: `type VaultAssertionMetadata`, `interface WebAuthnAssertionWire` (the struct's fields, integers as strings), `p256PublicKey(privateKey: Hex): { qx: bigint; qy: bigint }`, `vaultSignPayload({ challenge; rpId; origin }): { metadata: VaultAssertionMetadata; digest: Hex }`, `completeVaultAssertion({ challenge; metadata; r; s; publicKey: { qx; qy }; rpId; origin }): WebAuthnAuthStruct` (throws `AUTH_INVALID` unless ox `WebAuthnP256.verify` accepts the normalized result), `signVaultAssertion({ challenge; privateKey; rpId; origin }): WebAuthnAuthStruct`, `assertionToWire(auth): WebAuthnAssertionWire`. `P256_N` and `WebAuthnAuthStruct` now come from `@mida/protocol`; the FakeVault has no normalization of its own.
 - Produces, `ports.ts`: `interface VaultContextApi { putObject(upload); publishEpochWrap(wrap); requestRevocationDeny(target): Promise<{ intentId: Hex }> }`.
 - Produces, `agents.ts` (fixtures): `interface AgentDeclaration`, `interface ProvisionedAgent { agentId; signer; encryptionPrivateKey; encryptionPublicKey; callbackOrigin; purposeId; manifest; manifestHash }`, `provisionAgent({ operator: LocalWriteContext; name; purposeId; declarations; callbackOrigin; signer? }): Promise<ProvisionedAgent>`, `buildSignedAccessRequest({ chain: ChainContext; agent; scopes; overrides? }): Promise<AccessRequest>`.
 - Produces, `fake-vault.ts`: `interface VaultAuthority` (§4.2), `type GrantSelection`, `interface GrantRequest`, `interface GrantApproval { advice; response; gasUsed: bigint }`, `type RevokeRequest`, `interface RevokeApproval { intentId; transactionHash; rotated }`, `interface FakeVaultConfig { seed; p256PrivateKey; chain: WriteContext; api: VaultContextApi; origin? }`, `toAccessRequestStruct(request)`, and `class FakeVaultAuthority implements VaultAuthority` with `owner`, `p256PublicKey`, `deriveNamespaceSecret(namespaceId)`, `registerOwnerKey()`, `initializeNamespace(namespace)`, `approveGrant(request)`, `publishReaderWraps({ agentId; namespaceId }): Promise<bigint[]>`, `approveRevocation(request)`, `rotateExpiredEpoch(namespaceId)`, `approveDenyCancellation({ revocationIntentId; apiCancellationNonce; expiresAt }): WebAuthnAssertionWire`, `createOwnerContext({ namespace; payload; lineagePolicy?; expectedParentId?; evidenceCommitment?; expiresAt? })`.
 
 `rotateExpiredEpoch` is exercised end to end in Task 24's deadline test, where writes resume under the next epoch.
 
-- [ ] **Step 1: Create the package manifest**
+- [ ] **Step 1: Write the failing shared-adapter test**
+
+This adapter lives in `@mida/protocol`, not the FakeVault, because Project 2's real passkey adapter must apply the same low-s normalization without depending on test tooling (decision 17).
+
+`packages/protocol/test/webauthn-assertion.test.ts`:
+```ts
+import { describe, expect, it } from "vitest"
+import { P256, WebAuthnP256 } from "ox"
+import type { Hex } from "@mida/protocol"
+import { P256_N, isMidaError, normalizeP256LowS, toWebAuthnAuthStruct } from "@mida/protocol"
+
+const HALF = P256_N / 2n
+const bytes32 = (value: bigint): Hex => `0x${value.toString(16).padStart(64, "0")}`
+
+const invalid = (fn: () => unknown) => {
+  try {
+    fn()
+  } catch (error) {
+    return isMidaError(error, "INVALID_WIRE")
+  }
+  return false
+}
+
+describe("shared P256 low-s assertion adapter (§10.4)", () => {
+  it("fixes the P256 group order", () => {
+    expect(P256_N).toBe(0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n)
+  })
+
+  it("maps a high-s value to n - s", () => {
+    expect(normalizeP256LowS(HALF + 1n)).toBe(P256_N - HALF - 1n)
+    expect(normalizeP256LowS(P256_N - 1n)).toBe(1n)
+  })
+
+  it("leaves low-s and exactly n/2 untouched", () => {
+    expect(normalizeP256LowS(1n)).toBe(1n)
+    expect(normalizeP256LowS(HALF - 1n)).toBe(HALF - 1n)
+    expect(normalizeP256LowS(HALF)).toBe(HALF)
+  })
+
+  it("rejects zero, negative values, n and anything above n", () => {
+    for (const s of [0n, -1n, P256_N, P256_N + 1n]) expect(invalid(() => normalizeP256LowS(s)), s.toString()).toBe(true)
+  })
+
+  it("builds the webauthn-sol struct with normalized s, and an ox-verified assertion stays valid", () => {
+    const privateKey: Hex = `0x${"4d".repeat(32)}`
+    const publicKey = P256.getPublicKey({ privateKey })
+    const challenge: Hex = `0x${"ab".repeat(32)}`
+    const rpId = "vault.mida.xyz"
+    const origin = "https://vault.mida.xyz"
+    const { metadata, payload } = WebAuthnP256.getSignPayload({ challenge, rpId, origin, userVerification: "required" })
+    const signature = P256.sign({ payload, privateKey, hash: true })
+    const verifies = (r: bigint, s: bigint) =>
+      WebAuthnP256.verify({ challenge, metadata, publicKey, rpId, origin, signature: { r: bytes32(r), s: bytes32(s), yParity: 0 } })
+    const r = BigInt(signature.r)
+    expect(verifies(r, BigInt(signature.s))).toBe(true)
+
+    const lowS = normalizeP256LowS(BigInt(signature.s))
+    for (const rawS of [lowS, P256_N - lowS]) {
+      const auth = toWebAuthnAuthStruct({
+        authenticatorData: metadata.authenticatorData,
+        clientDataJSON: metadata.clientDataJSON,
+        challengeIndex: metadata.challengeIndex!,
+        typeIndex: metadata.typeIndex!,
+        r,
+        s: rawS,
+      })
+      expect(auth).toEqual({
+        authenticatorData: metadata.authenticatorData,
+        clientDataJSON: metadata.clientDataJSON,
+        challengeIndex: BigInt(metadata.challengeIndex!),
+        typeIndex: BigInt(metadata.typeIndex!),
+        r,
+        s: lowS,
+      })
+      expect(auth.s <= HALF).toBe(true)
+      expect(verifies(auth.r, auth.s)).toBe(true)
+    }
+  })
+})
+```
+
+Run: `pnpm vitest run packages/protocol/test/webauthn-assertion.test.ts`
+Expected: FAIL with `TypeError: Cannot mix BigInt and other types`, because `P256_N` is not exported yet.
+
+- [ ] **Step 2: Implement the shared adapter**
+
+`packages/protocol/src/webauthn-assertion.ts`:
+```ts
+import type { Hex } from "viem"
+import { MidaError } from "./errors.js"
+
+/** Order of the P256 (secp256r1) group. */
+export const P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n
+
+/** Solidity `WebAuthn.WebAuthnAuth` from webauthn-sol v1.0.0, in field order. */
+export interface WebAuthnAuthStruct {
+  authenticatorData: Hex
+  clientDataJSON: string
+  challengeIndex: bigint
+  typeIndex: bigint
+  r: bigint
+  s: bigint
+}
+
+/**
+ * EIP-7951 accepts any 0 < s < n, but webauthn-sol rejects s > n/2 (spec §10.4). A valid signature with high s has an
+ * equally valid twin at n - s, so every adapter maps to that low-s form before contract submission.
+ */
+export function normalizeP256LowS(s: bigint): bigint {
+  if (s <= 0n || s >= P256_N) throw new MidaError("INVALID_WIRE", "P256 signature s must satisfy 0 < s < n")
+  return s > P256_N / 2n ? P256_N - s : s
+}
+
+/**
+ * The shared assertion adapter (spec §10.4, §15): builds the struct `grantBatch` and `rotateP256Key` consume, with s
+ * normalized. It has no FakeVault or browser dependency, so Project 2's real passkey adapter uses exactly this.
+ */
+export function toWebAuthnAuthStruct(input: {
+  authenticatorData: Hex
+  clientDataJSON: string
+  challengeIndex: number | bigint
+  typeIndex: number | bigint
+  r: bigint
+  s: bigint
+}): WebAuthnAuthStruct {
+  return {
+    authenticatorData: input.authenticatorData,
+    clientDataJSON: input.clientDataJSON,
+    challengeIndex: BigInt(input.challengeIndex),
+    typeIndex: BigInt(input.typeIndex),
+    r: input.r,
+    s: normalizeP256LowS(input.s),
+  }
+}
+```
+
+Append to `packages/protocol/src/index.ts`:
+```ts
+export * from "./webauthn-assertion.js"
+```
+
+Run: `pnpm vitest run packages/protocol/test/webauthn-assertion.test.ts`
+Expected: `Tests 5 passed`.
+
+- [ ] **Step 3: Create the package manifest**
 
 `packages/fake-vault/package.json`:
 ```json
@@ -975,12 +1124,15 @@ Claude-Session: https://claude.ai/code/session_01Gjzo41PhP1bgEgNxYyz2Sk"
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "dependencies": {
     "@mida/chain": "workspace:*",
     "@mida/crypto": "workspace:*",
     "@mida/grant-advisor": "workspace:*",
     "@mida/protocol": "workspace:*",
+    "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",
     "ox": "1.7.4",
     "viem": "2.56.3"
@@ -990,14 +1142,14 @@ Claude-Session: https://claude.ai/code/session_01Gjzo41PhP1bgEgNxYyz2Sk"
 
 Add `"@mida/fake-vault": "workspace:*"` to the root `package.json` `"dependencies"`, then run `pnpm install`.
 
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 4: Write the failing test**
 
 `packages/fake-vault/test/fake-vault.test.ts`:
 ```ts
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { zeroHash } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
-import { PERMISSION, isMidaError, namespaceId, sortScopes } from "@mida/protocol"
+import { P256_N, PERMISSION, isMidaError, namespaceId, sortScopes } from "@mida/protocol"
 import type { Address, Hex, ObjectManifest, ReaderEpochWrap, UnsignedAccessRequest } from "@mida/protocol"
 import {
   bytesOf,
@@ -1021,8 +1173,18 @@ import {
 import type { Deployment, LocalNode, WriteContext } from "@mida/chain"
 import { hmac } from "@noble/hashes/hmac.js"
 import { sha256 } from "@noble/hashes/sha2.js"
-import { randomBytes } from "@noble/hashes/utils.js"
-import { FakeVaultAuthority, buildSignedAccessRequest, p256PublicKey, provisionAgent } from "@mida/fake-vault"
+import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js"
+import { p256 } from "@noble/curves/nist.js"
+import { P256, WebAuthnP256 } from "ox"
+import {
+  FakeVaultAuthority,
+  buildSignedAccessRequest,
+  completeVaultAssertion,
+  p256PublicKey,
+  provisionAgent,
+  signVaultAssertion,
+  vaultSignPayload,
+} from "@mida/fake-vault"
 import type { ProvisionedAgent, VaultContextApi } from "@mida/fake-vault"
 
 const SEED = new Uint8Array(32).fill(0x42)
@@ -1239,14 +1401,59 @@ describe("FakeVaultAuthority (plan Task 22)", () => {
     for (const hex of forbidden) expect(serialized.includes(hex)).toBe(false)
   })
 })
+
+describe("FakeVault assertion construction (spec §8, §10.4)", () => {
+  const KEY: Hex = `0x${"4d".repeat(32)}`
+  const OTHER_KEY: Hex = `0x${"4e".repeat(32)}`
+  const CHALLENGE: Hex = `0x${"ab".repeat(32)}`
+  const RP_ID = "vault.mida.xyz"
+  const ORIGIN = "https://vault.mida.xyz"
+  const bytes32 = (value: bigint): Hex => `0x${value.toString(16).padStart(64, "0")}`
+
+  it("signs the ox signing digest with noble, emits low-s, and passes WebAuthnP256.verify", () => {
+    const auth = signVaultAssertion({ challenge: CHALLENGE, privateKey: KEY, rpId: RP_ID, origin: ORIGIN })
+    expect(auth.s <= P256_N / 2n).toBe(true)
+    const { metadata } = WebAuthnP256.getSignPayload({ challenge: CHALLENGE, rpId: RP_ID, origin: ORIGIN, userVerification: "required" })
+    expect(auth.authenticatorData).toBe(metadata.authenticatorData)
+    expect(auth.clientDataJSON).toBe(metadata.clientDataJSON)
+    const signature = { r: bytes32(auth.r), s: bytes32(auth.s), yParity: 0 }
+    const publicKey = P256.getPublicKey({ privateKey: KEY })
+    expect(WebAuthnP256.verify({ challenge: CHALLENGE, metadata, publicKey, rpId: RP_ID, origin: ORIGIN, signature })).toBe(true)
+  })
+
+  it("normalizes a forced high-s raw signature through the shared adapter", () => {
+    const { metadata, digest } = vaultSignPayload({ challenge: CHALLENGE, rpId: RP_ID, origin: ORIGIN })
+    const raw = p256.sign(hexToBytes(digest.slice(2)), hexToBytes(KEY.slice(2)), { prehash: false })
+    const r = BigInt(`0x${bytesToHex(raw.slice(0, 32))}`)
+    const lowS = BigInt(`0x${bytesToHex(raw.slice(32))}`)
+    const highS = P256_N - lowS
+    expect(highS > P256_N / 2n).toBe(true)
+    const auth = completeVaultAssertion({ challenge: CHALLENGE, metadata, r, s: highS, publicKey: p256PublicKey(KEY), rpId: RP_ID, origin: ORIGIN })
+    expect(auth.s).toBe(lowS)
+    expect(auth.r).toBe(r)
+  })
+
+  it("refuses to return an assertion that WebAuthnP256.verify rejects", () => {
+    const { metadata, digest } = vaultSignPayload({ challenge: CHALLENGE, rpId: RP_ID, origin: ORIGIN })
+    const raw = p256.sign(hexToBytes(digest.slice(2)), hexToBytes(KEY.slice(2)), { prehash: false })
+    const r = BigInt(`0x${bytesToHex(raw.slice(0, 32))}`)
+    const s = BigInt(`0x${bytesToHex(raw.slice(32))}`)
+    expect(() =>
+      completeVaultAssertion({ challenge: CHALLENGE, metadata, r, s, publicKey: p256PublicKey(OTHER_KEY), rpId: RP_ID, origin: ORIGIN }),
+    ).toThrow(expect.objectContaining({ code: "AUTH_INVALID" }))
+    expect(() =>
+      completeVaultAssertion({ challenge: `0x${"ac".repeat(32)}`, metadata, r, s, publicKey: p256PublicKey(KEY), rpId: RP_ID, origin: ORIGIN }),
+    ).toThrow(expect.objectContaining({ code: "AUTH_INVALID" }))
+  })
+})
 ```
 
-- [ ] **Step 3: Run to verify it fails**
+- [ ] **Step 5: Run to verify it fails**
 
 Run: `pnpm vitest run packages/fake-vault`
 Expected: FAIL. Vitest cannot resolve `@mida/fake-vault`, because `packages/fake-vault/src/index.ts` does not exist yet.
 
-- [ ] **Step 4: Implement the PRF stand-in, passkey assertions, the API port and the agent fixtures**
+- [ ] **Step 6: Implement the PRF stand-in, passkey assertions, the API port and the agent fixtures**
 
 `packages/fake-vault/src/prf.ts`:
 ```ts
@@ -1268,20 +1475,14 @@ export function fakePrfOutput(seed: Uint8Array, domain: IsolationDomain): Uint8A
 
 `packages/fake-vault/src/webauthn.ts`:
 ```ts
-import type { Hex } from "@mida/protocol"
+import { MidaError, toWebAuthnAuthStruct } from "@mida/protocol"
+import type { Hex, WebAuthnAuthStruct } from "@mida/protocol"
+import { p256 } from "@noble/curves/nist.js"
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js"
 import { P256, WebAuthnP256 } from "ox"
 
-export const P256_N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n
-
-/** Solidity `WebAuthn.WebAuthnAuth` from webauthn-sol v1.0.0, in field order. */
-export interface WebAuthnAuthStruct {
-  authenticatorData: Hex
-  clientDataJSON: string
-  challengeIndex: bigint
-  typeIndex: bigint
-  r: bigint
-  s: bigint
-}
+/** WebAuthn-shaped metadata as ox builds it: authenticatorData, clientDataJSON and the field indexes webauthn-sol needs. */
+export type VaultAssertionMetadata = ReturnType<typeof WebAuthnP256.getSignPayload>["metadata"]
 
 /** JSON-safe form sent to the Context API for deny cancellation (§12.5). */
 export interface WebAuthnAssertionWire {
@@ -1301,30 +1502,73 @@ export function p256PublicKey(privateKey: Hex): { qx: bigint; qy: bigint } {
 }
 
 /**
- * Software passkey assertion over a 32-byte challenge, shaped exactly like a browser assertion with user
- * verification required. `s` is normalized to low-s because webauthn-sol rejects s > n/2 (spec §10.4); EIP-7951
- * itself would accept either.
+ * Spec §8: ox builds the metadata and the exact authenticator signing digest,
+ * SHA-256(authenticatorData ‖ SHA-256(clientDataJSON)), for user verification required.
  */
-export function signVaultAssertion(input: { challenge: Hex; privateKey: Hex; rpId: string; origin: string }): WebAuthnAuthStruct {
+export function vaultSignPayload(input: { challenge: Hex; rpId: string; origin: string }): { metadata: VaultAssertionMetadata; digest: Hex } {
   const { metadata, payload } = WebAuthnP256.getSignPayload({
     challenge: input.challenge,
     rpId: input.rpId,
     origin: input.origin,
     userVerification: "required",
+    hash: true,
   })
+  return { metadata, digest: payload }
+}
+
+/**
+ * Converts a raw P256 signature over `vaultSignPayload`'s digest through the shared low-s adapter, then refuses to
+ * return it unless ox `WebAuthnP256.verify` accepts the normalized assertion for this challenge, RP ID and origin.
+ */
+export function completeVaultAssertion(input: {
+  challenge: Hex
+  metadata: VaultAssertionMetadata
+  r: bigint
+  s: bigint
+  publicKey: { qx: bigint; qy: bigint }
+  rpId: string
+  origin: string
+}): WebAuthnAuthStruct {
+  const { metadata } = input
   if (metadata.challengeIndex === undefined || metadata.typeIndex === undefined) {
-    throw new Error("ox did not report clientDataJSON challenge and type indexes")
+    throw new MidaError("AUTH_INVALID", "assertion metadata lacks clientDataJSON challenge and type indexes")
   }
-  const signature = P256.sign({ payload, privateKey: input.privateKey, hash: true })
-  const rawS = BigInt(signature.s)
-  return {
+  const auth = toWebAuthnAuthStruct({
     authenticatorData: metadata.authenticatorData,
     clientDataJSON: metadata.clientDataJSON,
-    challengeIndex: BigInt(metadata.challengeIndex),
-    typeIndex: BigInt(metadata.typeIndex),
-    r: BigInt(signature.r),
-    s: rawS > P256_N / 2n ? P256_N - rawS : rawS,
-  }
+    challengeIndex: metadata.challengeIndex,
+    typeIndex: metadata.typeIndex,
+    r: input.r,
+    s: input.s,
+  })
+  const verified = WebAuthnP256.verify({
+    challenge: input.challenge,
+    metadata,
+    rpId: input.rpId,
+    origin: input.origin,
+    publicKey: { prefix: 4, x: bytes32(input.publicKey.qx), y: bytes32(input.publicKey.qy) },
+    signature: { r: bytes32(auth.r), s: bytes32(auth.s), yParity: 0 },
+  })
+  if (!verified) throw new MidaError("AUTH_INVALID", "normalized assertion does not pass WebAuthnP256.verify")
+  return auth
+}
+
+/**
+ * Software passkey assertion (spec §8, §13.4): ox digest, a raw `@noble/curves` P256 signature with either s, the
+ * shared low-s adapter, and an ox verification parity check.
+ */
+export function signVaultAssertion(input: { challenge: Hex; privateKey: Hex; rpId: string; origin: string }): WebAuthnAuthStruct {
+  const { metadata, digest } = vaultSignPayload(input)
+  const raw = p256.sign(hexToBytes(digest.slice(2)), hexToBytes(input.privateKey.slice(2)), { prehash: false, lowS: false })
+  return completeVaultAssertion({
+    challenge: input.challenge,
+    metadata,
+    r: BigInt(`0x${bytesToHex(raw.slice(0, 32))}`),
+    s: BigInt(`0x${bytesToHex(raw.slice(32))}`),
+    publicKey: p256PublicKey(input.privateKey),
+    rpId: input.rpId,
+    origin: input.origin,
+  })
 }
 
 export function assertionToWire(auth: WebAuthnAuthStruct): WebAuthnAssertionWire {
@@ -1511,7 +1755,7 @@ export async function buildSignedAccessRequest(input: {
 }
 ```
 
-- [ ] **Step 5: Implement `FakeVaultAuthority`**
+- [ ] **Step 7: Implement `FakeVaultAuthority`**
 
 `packages/fake-vault/src/fake-vault.ts`:
 ```ts
@@ -1549,6 +1793,7 @@ import type {
   Hex,
   LineagePolicy,
   SignedAgentCapabilityManifest,
+  WebAuthnAuthStruct,
 } from "@mida/protocol"
 import {
   assertNonZeroKey,
@@ -1577,7 +1822,7 @@ import type { Abi, TransactionReceipt } from "viem"
 import { fakePrfOutput } from "./prf.js"
 import type { VaultContextApi } from "./ports.js"
 import { assertionToWire, p256PublicKey, signVaultAssertion } from "./webauthn.js"
-import type { WebAuthnAssertionWire, WebAuthnAuthStruct } from "./webauthn.js"
+import type { WebAuthnAssertionWire } from "./webauthn.js"
 
 /** §4.2 VaultAuthority. The Vault is the only component that derives passkey-controlled namespace secrets. */
 export interface VaultAuthority {
@@ -2000,14 +2245,15 @@ export * from "./agents.js"
 export * from "./fake-vault.js"
 ```
 
-- [ ] **Step 6: Run to verify it passes**
+- [ ] **Step 8: Run to verify it passes**
 
 Run:
 ```bash
-pnpm vitest run packages/fake-vault
+pnpm vitest run packages/protocol/test/webauthn-assertion.test.ts packages/fake-vault
 pnpm typecheck
 ```
-Expected: `Tests 10 passed`. Typecheck exits 0. The passing test proves:
+Expected: `Test Files 2 passed`, `Tests 18 passed` (5 adapter tests and 13 Vault tests). Typecheck exits 0. The passing test proves:
+- **Assertions follow spec §8.** The digest comes from ox, the signature from noble, `s` is normalized by the shared adapter, and ox `WebAuthnP256.verify` accepts the result. A forced high-s signature comes out low-s; a wrong key or challenge throws `AUTH_INVALID`.
 - **PRF output is per domain.** It is `HMAC-SHA256(seed, domain salt)`, and the Vault exposes no enumerable secret.
 - **The policy guard works.** A deployment with a different `POLICY_HASH_V1` is refused.
 - **The epoch-1 key matches the derivation.** The published key equals the derived key.
@@ -2018,10 +2264,10 @@ Expected: `Tests 10 passed`. Typecheck exits 0. The passing test proves:
 - **The deny comes first.** It is posted while the chain still authorizes; revocation then rotates to epoch 2.
 - **No secret leaks.** No namespace secret or epoch private key appears in any approval, wrap or upload.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add package.json pnpm-lock.yaml packages/fake-vault
+git add package.json pnpm-lock.yaml packages/protocol/src/webauthn-assertion.ts packages/protocol/src/index.ts packages/protocol/test/webauthn-assertion.test.ts packages/fake-vault
 git commit -m "feat(fake-vault): software Vault with deterministic PRF domains, passkey-bound grants and rotating revocation
 
 Claude-Session: https://claude.ai/code/session_01Gjzo41PhP1bgEgNxYyz2Sk"
@@ -4496,7 +4742,7 @@ Run:
 pnpm vitest run apps/api packages/fake-vault
 pnpm typecheck
 ```
-Expected: `Test Files 5 passed`, `Tests 38 passed`: 28 API tests and the 10 Vault tests, which now run against the real client. Typecheck exits 0. `routes.test.ts` proves:
+Expected: `Test Files 5 passed`, `Tests 41 passed`: 28 API tests and the 13 Vault tests, which now run against the real client. Typecheck exits 0. `routes.test.ts` proves:
 - **Manifests fail closed.** An envelope is served only when its bytes, body hash and operator signature match the current AgentRecord. A stale body or a tampered index is rejected.
 - **Readers decrypt only through their own wrap.** Anchored owner context reaches an authorized reader.
 - **Denials are exact.** No capability, a forged capability ID, and a CREATE-only agent's reads and wraps are all denied.
@@ -5369,18 +5615,18 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { parseEventLogs, zeroHash } from "viem"
 import type { LocalAccount } from "viem"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
-import { PERMISSION, PROVENANCE_POLICY, accessRequestHash, namespaceId } from "@mida/protocol"
+import { P256_N, PERMISSION, PROVENANCE_POLICY, accessRequestHash, namespaceId, p256RotationDigest } from "@mida/protocol"
 import type { Address, Hex, ReaderEpochWrap } from "@mida/protocol"
 import { bytesOf, deriveEpochKeyPair, hexOf, openContextObject, unwrapEpochPrivateKey } from "@mida/crypto"
-import { capabilityRegistryAbi } from "@mida/chain"
-import { FakeVaultAuthority, buildSignedAccessRequest, provisionAgent } from "@mida/fake-vault"
+import { capabilityRegistryAbi, sendContract } from "@mida/chain"
+import { FakeVaultAuthority, buildSignedAccessRequest, completeVaultAssertion, p256PublicKey, provisionAgent, vaultSignPayload } from "@mida/fake-vault"
 import type { AgentDeclaration, ProvisionedAgent } from "@mida/fake-vault"
 import { isScopeSubset } from "@mida/grant-advisor"
 import { ContextApiClient, RegistryReader } from "@mida/api"
 import type { AnchoredObject } from "@mida/api"
 import { MidaAgent } from "@mida/sdk"
 import { p256 } from "@noble/curves/nist.js"
-import { randomBytes } from "@noble/hashes/utils.js"
+import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js"
 import { PRECOMPILE_TRUE, evidencePath, localEnvironment, monadTestnetEnvironment, probeP256Precompile, writeEvidence } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 
@@ -5679,6 +5925,58 @@ describe.each(targets)("§16 end-to-end scenario on $name (plan Tasks 26 and 27)
 describe("owner passkey verification path inside grantBatch (plan Task 26)", () => {
   const P256_KEY: Hex = `0x${"4d".repeat(32)}`
 
+  /**
+   * Signs a MIDA_ROTATE_P256_V1 challenge, then forces the raw signature to high-s. webauthn-sol must reject the raw
+   * struct, and the same signature through the shared adapter must rotate the owner key on-chain.
+   */
+  async function rotateWithForcedHighS(env: ScenarioEnvironment) {
+    const ownerAccount = privateKeyToAccount(generatePrivateKey())
+    await env.fund(ownerAccount.address)
+    const owner = env.writeContext(ownerAccount)
+    const registry = env.deployment.capabilityRegistry
+    const send = (functionName: string, args: readonly unknown[]) => sendContract(owner, { address: registry, abi: capabilityRegistryAbi, functionName, args })
+    const oldKey = hexOf(p256.utils.randomSecretKey())
+    const oldPublic = p256PublicKey(oldKey)
+    const newPublic = p256PublicKey(hexOf(p256.utils.randomSecretKey()))
+    await send("registerP256Key", [oldPublic.qx, oldPublic.qy])
+
+    const challenge = p256RotationDigest({
+      chainId: env.deployment.chainId,
+      capabilityRegistry: registry,
+      owner: ownerAccount.address,
+      newQx: newPublic.qx,
+      newQy: newPublic.qy,
+      nonce: 0n,
+    })
+    const rpId = env.deployment.vaultRpId
+    const origin = `https://${rpId}`
+    const { metadata, digest } = vaultSignPayload({ challenge, rpId, origin })
+    const raw = p256.sign(hexToBytes(digest.slice(2)), hexToBytes(oldKey.slice(2)), { prehash: false })
+    const r = BigInt(`0x${bytesToHex(raw.slice(0, 32))}`)
+    const highS = P256_N - BigInt(`0x${bytesToHex(raw.slice(32))}`)
+    const rawHighS = {
+      authenticatorData: metadata.authenticatorData,
+      clientDataJSON: metadata.clientDataJSON,
+      challengeIndex: BigInt(metadata.challengeIndex!),
+      typeIndex: BigInt(metadata.typeIndex!),
+      r,
+      s: highS,
+    }
+    const rawRejected = await send("rotateP256Key", [newPublic.qx, newPublic.qy, rawHighS]).then(
+      () => false,
+      (error: unknown) => (error as { code?: string }).code === "AUTH_INVALID",
+    )
+    const normalized = completeVaultAssertion({ challenge, metadata, r, s: highS, publicKey: oldPublic, rpId, origin })
+    await send("rotateP256Key", [newPublic.qx, newPublic.qy, normalized])
+    const [qx, qy] = (await owner.publicClient.readContract({
+      address: registry,
+      abi: capabilityRegistryAbi,
+      functionName: "ownerP256Key",
+      args: [ownerAccount.address],
+    })) as readonly [bigint, bigint]
+    return { rawHighSWasHigh: highS > P256_N / 2n, rawRejected, normalizedS: normalized.s, rotated: qx === newPublic.qx && qy === newPublic.qy }
+  }
+
   async function grantOnce(hardfork: string) {
     const env = await localEnvironment({ hardfork })
     try {
@@ -5704,18 +6002,24 @@ describe("owner passkey verification path inside grantBatch (plan Task 26)", () 
       })
       const accessRequest = await buildSignedAccessRequest({ chain: alice, agent, scopes: [{ namespace: "goals.career", permissions: PERMISSION.READ }] })
       const approval = await vault.approveGrant({ accessRequest, manifest: agent.manifest, selection: { kind: "recommended" } })
-      return { gasUsed: approval.gasUsed, probe: await probeP256Precompile(alice.publicClient) }
+      return { gasUsed: approval.gasUsed, probe: await probeP256Precompile(alice.publicClient), highS: await rotateWithForcedHighS(env) }
     } finally {
       await env.stop()
     }
   }
 
-  it("verifies through the native precompile on Osaka Anvil and through FreshCryptoLib on prague Anvil, and the gas shows which", async () => {
+  it("verifies through the native precompile on Osaka Anvil and through FreshCryptoLib on prague Anvil, the gas shows which, and a forced high-s assertion is normalized and accepted on both", async () => {
     const native = await grantOnce("default")
     const fallback = await grantOnce("prague")
     expect(native.probe).toEqual({ valid: PRECOMPILE_TRUE, tampered: "0x" })
     expect(fallback.probe).toEqual({ valid: "0x", tampered: "0x" })
     expect(fallback.gasUsed - native.gasUsed).toBeGreaterThan(150_000n)
+    for (const path of [native, fallback]) {
+      expect(path.highS.rawHighSWasHigh).toBe(true)
+      expect(path.highS.rawRejected).toBe(true)
+      expect(path.highS.normalizedS <= P256_N / 2n).toBe(true)
+      expect(path.highS.rotated).toBe(true)
+    }
     writeEvidence(evidencePath("local-p256-paths"), {
       network: "local-p256-paths",
       generatedAt: new Date().toISOString(),
@@ -5920,7 +6224,9 @@ Expected: `Test Files 1 passed`, `Tests 18 passed`: the 17 scenario tests plus t
 
 Two runs on 2026-09-14 differed by a few hundred gas, because each run uses random keys and so slightly different calldata. Treat these values as approximate, not exact.
 
-The test requires the fallback to cost more than 150,000 gas above native, and requires prague's precompile probe to return nothing. Together those prove the two runs took different paths. Typecheck exits 0.
+The test requires the fallback to cost more than 150,000 gas above native, and requires prague's precompile probe to return nothing. Together those prove the two runs took different paths.
+
+On both hardforks the path test also signs a `rotateP256Key` challenge and forces the raw signature to high-s. `webauthn-sol` rejects that raw struct, which the API maps to `AUTH_INVALID`. The same signature passed through the shared adapter rotates the owner key on-chain (§15 high-s row). Typecheck exits 0.
 
 - [ ] **Step 6: Run the whole repository once**
 
@@ -5930,7 +6236,7 @@ pnpm test
 pnpm typecheck
 (cd contracts && forge test && forge test --evm-version prague)
 ```
-Expected: every Vitest file passes (270 tests on 2026-09-14), typecheck exits 0, and both Foundry runs report `139 tests passed, 0 failed, 1 skipped`.
+Expected: every Vitest file passes (278 tests in 26 files on 2026-09-14), typecheck exits 0, and both Foundry runs report `139 tests passed, 0 failed, 1 skipped`.
 
 - [ ] **Step 7: Commit**
 
@@ -6058,10 +6364,10 @@ Before committing, confirm that `git diff --cached` shows no private key. The br
 
 | §19 gate item | Command | Expected on 2026-09-14 |
 |---|---|---|
-| Unit and property tests: canonicalization, expansion, manifests, subset invariants, derivation, encryption, wraps, storage, wire validation | `pnpm vitest run packages/protocol packages/crypto packages/storage packages/grant-advisor` | 191 passed |
+| Unit and property tests: canonicalization, expansion, manifests, subset invariants, derivation, encryption, wraps, storage, wire validation | `pnpm vitest run packages/protocol packages/crypto packages/storage packages/grant-advisor` | 196 passed (191 from Parts A–C plus the 5 shared-adapter tests from Task 22) |
 | Foundry adversarial tests | `cd contracts && forge test && forge test --evm-version prague` | 139 passed, 0 failed, 1 skipped, on both |
 | API ordered validation, chain-bounded authorization, local deny, reads and wrap publication | `pnpm vitest run apps/api` | 28 passed |
-| Chain adapter, Vault and SDK | `pnpm vitest run packages/chain packages/fake-vault packages/sdk` | 33 passed |
+| Chain adapter, Vault and SDK | `pnpm vitest run packages/chain packages/fake-vault packages/sdk` | 36 passed |
 | Complete CLI scenario locally | `pnpm vitest run apps/cli` | 18 passed |
 | Same scenario on Monad testnet | Task 27 Step 4 | 35 passed, plus the committed evidence file |
 | Fallback and native P256 paths distinguished and evidenced | `pnpm vitest run apps/cli -t "verification path"`; `cd contracts && forge test --match-contract P256PathsTest -vv` and again with `--evm-version prague`; the testnet evidence probe | prague probe empty, fallback more than 150,000 gas above native; Monad probe returns `1` |
