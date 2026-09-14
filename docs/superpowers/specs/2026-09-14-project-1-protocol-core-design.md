@@ -8,12 +8,13 @@
 
 ## 1. Purpose
 
-Mida Context lets a person teach one AI something and selectively make that context available to other AI agents. The protocol separates four concerns:
+Mida Context lets a person teach one AI something and selectively make that context available to other AI agents. The protocol separates five concerns:
 
 1. **Monad authorization:** who owns context, which agent may perform which operation, and whether authority remains valid.
-2. **User-owned encryption:** the user’s passkey-derived secrets are the root of read authority; Mida has no master decryption key.
-3. **Encrypted storage:** storage providers hold content-addressed ciphertext, not plaintext.
-4. **Provenance:** every context record states who created it, how it was derived, and how it relates to earlier records.
+2. **Grant minimization:** agents declare and request authority, deterministic policy recommends a narrower subset, and the user chooses the final requested subset.
+3. **User-owned encryption:** the user’s passkey-derived secrets are the root of read authority; Mida has no master decryption key.
+4. **Encrypted storage:** storage providers hold content-addressed ciphertext, not plaintext.
+5. **Provenance:** every context record states who created it, how it was derived, and how it relates to earlier records.
 
 Project 1 proves these protocol assumptions with a software `FakeVaultAuthority`. Real Mera/WebAuthn, browser recovery, popup handoff, materialized current state, subscriptions, and reference applications belong to later projects.
 
@@ -24,7 +25,8 @@ Project 1 proves these protocol assumptions with a software `FakeVaultAuthority`
 - A pnpm TypeScript monorepo and Foundry contracts.
 - `@mida/protocol`: canonical types, identifiers, namespace rules, error codes, and encodings.
 - `@mida/crypto`: namespace derivation, asymmetric read epochs, XChaCha20-Poly1305 payload encryption, and X25519 wraps.
-- `CapabilityRegistry`: owner P256 keys, global agent identities, exact capabilities, grant replay protection, revocation, expiry deadlines, and read-epoch generations.
+- `@mida/grant-advisor`: signed agent manifests, immutable sensitivity/purpose policy, authority expansion, deterministic narrowing, warnings, and subset proofs.
+- `CapabilityRegistry`: owner P256 keys, global agent identities and manifest commitments, exact capabilities, grant replay protection, request/final-subset enforcement, revocation, expiry deadlines, and read-epoch generations.
 - `ContextRegistry`: namespace epoch public keys, immutable evidence/context records, provenance enforcement, lineage policy, latest pointers, and stale-parent protection.
 - `MemoryStorage` and `FsStorage` behind `ContextStorage`.
 - A minimal Context API that stores ciphertext, immutable manifests, and reader-epoch wraps while enforcing current chain authorization.
@@ -35,7 +37,7 @@ Project 1 proves these protocol assumptions with a software `FakeVaultAuthority`
 ### 2.2 Explicitly deferred
 
 - Real Mera/WebAuthn PRF and passkey recovery: Project 2.
-- Browser Vault, popup/redirect handoff, and React component: Project 2.
+- Browser Vault, popup/redirect handoff, Grant Advisor consent UI, progressive-grant UX, optional warning explanations, and React component: Project 2.
 - Pending/anchored/retracted subscriptions and `CurrentContext` materializer: Project 2.
 - Compiler, deterministic extraction validator, `confirm`, and `explain`: Project 3.
 - Dynamic, ERC-8004, Envio, replication, erasure coding, IPFS, and third-party integration kit: Project 4.
@@ -114,13 +116,15 @@ interface AgentRecord {
   encryptionPublicKey: Hex
   encryptionKeyVersion: number
   callbackOriginHash: Hex
+  capabilityManifestHash: Hex
+  capabilityManifestVersion: number
   active: boolean
 }
 ```
 
 - The signer authenticates requests and contract writes.
 - The X25519 encryption key receives wrapped read-epoch private keys.
-- The operator submits registration, but the proposed signing key must sign an EIP-712 registration binding the operator, agent ID, signer, encryption key/version, callback origin hash, chain, and registry.
+- The operator submits registration, but the proposed signing key must sign an EIP-712 registration binding the operator, agent ID, signer, encryption key/version, callback origin hash, capability-manifest hash/version, chain, and registry.
 - A signer may resolve to only one active agent ID.
 - Signing-key rotation requires both operator authority and an EIP-712 acceptance signature from the new signer.
 - Encryption-key rotation requires operator authority, increments `encryptionKeyVersion`, and emits `AgentEncryptionKeyRotated`.
@@ -201,7 +205,7 @@ relationships
 private
 ```
 
-The maximum depth is two segments. The deployment registers each node and its parent. Roots have parent `bytes32(0)`.
+The maximum depth is two segments. Contract construction registers each node and its parent; roots have parent `bytes32(0)`. Namespace-tree version 1 is immutable after deployment: there is no external namespace-registration function. Adding, removing, or re-parenting a node requires a new namespace-tree/protocol version, so an existing parent grant can never silently acquire a future child.
 
 ### 5.3 Parent scopes are request shorthand
 
@@ -561,8 +565,8 @@ Project 1 implements only `MemoryStorage` and `FsStorage`. R2, replication, eras
 
 - Register owner P256 keys.
 - Register protocol-standard namespace ancestry.
-- Register global agent signing/encryption identities and callback origin hashes.
-- Rotate agent signing/encryption keys under operator authority.
+- Register global agent signing/encryption identities, callback origin hashes, and capability-manifest body hash/version.
+- Rotate agent signing/encryption keys and monotonically update signed capability-manifest commitments under operator authority.
 - Grant exact namespace capabilities after P256 verification.
 - Enforce contract-owned grant nonces.
 - Revoke individual capabilities.
@@ -632,6 +636,8 @@ The registry owns grant replay state:
 mapping(address owner => uint256 nonce) public grantNonce;
 ```
 
+`grantBatch` receives the agent-signed `AccessRequest`, its sorted exact requested scopes, and the sorted exact final `GrantScope[]`. The registry recomputes the EIP-712 `requestHash`, verifies it against the agent’s current signer, and proves each final namespace/permission/provenance bit is contained by the request.
+
 The WebAuthn challenge is the 32-byte `grantDigest`:
 
 ```text
@@ -642,15 +648,19 @@ grantDigest = keccak256(
     CapabilityRegistry address,
     owner,
     agentId,
-    keccak256(abi.encode(sorted exact GrantScope[])),
-    issuedAt,
+    requestHash,
+    capabilityManifestHash,
+    capabilityManifestVersion,
+    keccak256(UTF8("mida-grant-policy-v1")),
+    keccak256(UTF8("mida-namespace-tree-v1")),
+    keccak256(abi.encode(sorted exact final GrantScope[])),
     expiresAt,
     grantNonce[owner]
   )
 )
 ```
 
-`GrantScope` contains `namespaceId`, `permissions`, and `provenancePolicy`. For sorted scope index `i`, the stored identifier is:
+`GrantScope` contains `namespaceId`, `permissions`, and `provenancePolicy`. `AccessRequest.issuedAt` must satisfy `issuedAt <= block.timestamp`, `block.timestamp < requestExpiresAt`, and `requestExpiresAt - issuedAt <= 600 seconds`. For sorted final scope index `i`, the stored identifier is:
 
 ```text
 capabilityId = keccak256(abi.encode(
@@ -666,21 +676,23 @@ capabilityId = keccak256(abi.encode(
 ))
 ```
 
-The signed `issuedAt` must satisfy `issuedAt <= block.timestamp` and `block.timestamp - issuedAt <= 300 seconds`. Stored issuance time is always `block.timestamp`, so calldata cannot forge record chronology.
+Stored capability issuance time is always `block.timestamp`, so request calldata cannot forge record chronology.
 
 A grant succeeds only if:
 
 1. `msg.sender == owner`;
-2. the agent and all exact namespaces are registered and active;
-3. scopes are sorted, unique, and non-empty;
-4. permissions and provenance bits contain no unknown bits;
-5. `expiresAt == 0 || expiresAt > block.timestamp`;
-6. active-capability limits are not exceeded: at most 32 per `(owner, namespaceId)` and 64 per `(owner, agentId)`;
-7. every READ scope’s current epoch is initialized and still writable;
-8. the WebAuthn assertion has type `webauthn.get`, contains the exact `grantDigest` challenge, matches the configured Vault origin/RP ID, and has both User Presence and User Verification flags set;
-9. the P256 signature verifies against the owner’s registered key;
-10. the registry reads and then increments `grantNonce[owner]`;
-11. every READ scope captures the namespace’s current `readEpoch` as `grantedAtReadEpoch` and lowers its write deadline when this grant expires sooner.
+2. the agent is active and its request signature resolves to its current registered signer;
+3. request manifest hash/version equal the current `AgentRecord` values;
+4. request policy/tree versions equal the immutable supported v1 constants;
+5. requested and final scopes are sorted, unique, non-empty, and contain only registered exact namespaces and known bits;
+6. effective final namespace/permission/provenance authority is a subset of the signed request;
+7. final expiry is no later than the request and satisfies `expiresAt == 0 || expiresAt > block.timestamp`; any final HIGH namespace additionally requires `expiresAt <= block.timestamp + 24 hours` and forbids zero/unbounded expiry;
+8. active-capability limits are not exceeded: at most 32 per `(owner, namespaceId)` and 64 per `(owner, agentId)`;
+9. every final READ scope’s current epoch is initialized and still writable;
+10. the WebAuthn assertion has type `webauthn.get`, contains the exact `grantDigest` challenge, matches the configured Vault origin/RP ID, and has both User Presence and User Verification flags set;
+11. the P256 signature verifies against the owner’s registered key;
+12. the registry reads and then increments `grantNonce[owner]`;
+13. every final READ scope captures the namespace’s current `readEpoch` as `grantedAtReadEpoch` and lowers its write deadline when this grant expires sooner.
 
 A zero authenticator signature counter is accepted because synced passkeys may not provide a useful monotonic counter. The contract does not treat the counter as replay protection; `grantNonce` provides replay protection.
 
@@ -730,13 +742,14 @@ AgentRegistered
 AgentSigningKeyRotated
 AgentEncryptionKeyRotated
 AgentOriginChanged
+AgentCapabilityManifestUpdated
 CapabilityGranted
 CapabilityRevoked
 AgentRevoked
 ReadEpochRequired
 ```
 
-Events include indexed owner/agent/namespace identifiers needed by an off-chain indexer.
+Events include indexed owner/agent/namespace identifiers needed by an off-chain indexer. `CapabilityGranted` also emits `requestHash`, capability-manifest hash/version, policy/tree version hashes, and the final exact capability ID so the consent context can be audited without expanding the stored `Capability` struct.
 
 ## 11. ContextRegistry
 
@@ -943,6 +956,8 @@ The Project 1 API is a thin storage and authorization service, not a trusted dec
 ```text
 PUT  /objects
 GET  /objects?owner=&namespaceId=
+PUT  /agent-manifests
+GET  /agent-manifests/:bodyHash
 POST /epoch-wraps
 GET  /epoch-wraps?owner=&namespaceId=&readEpoch=&agentId=&agentKeyVersion=
 GET  /manifests/:contextId
@@ -1117,7 +1132,12 @@ interface AccessRequest {
   requestId: Hex
   nonce: Hex
   agentId: Hex
+  purposeId: PurposeId
   callbackOrigin: string
+  manifestHash: Hex
+  manifestVersion: number
+  policyVersion: "mida-grant-policy-v1"
+  namespaceTreeVersion: "mida-namespace-tree-v1"
   scopes: RequestedScope[]
   issuedAt: string
   requestExpiresAt: string
@@ -1140,8 +1160,13 @@ interface AccessGrantResponse {
   capabilityRegistry: Address
   requestId: Hex
   nonce: Hex
+  requestHash: Hex
   owner: Address
   agentId: Hex
+  manifestHash: Hex
+  manifestVersion: number
+  policyVersion: "mida-grant-policy-v1"
+  namespaceTreeVersion: "mida-namespace-tree-v1"
   capabilities: GrantedCapability[]
 }
 ```
@@ -1161,8 +1186,13 @@ MidaAccessRequestV1:
   requestId
   nonce
   agentId
+  purposeIdHash      = keccak256(UTF8(purposeId))
   callbackOriginHash = keccak256(UTF8(canonicalOrigin))
-  scopesHash         = keccak256(abi.encode(sorted RequestedScope[]))
+  manifestHash
+  manifestVersion
+  policyVersionHash        = keccak256(UTF8(policyVersion))
+  namespaceTreeVersionHash = keccak256(UTF8(namespaceTreeVersion))
+  scopesHash         = keccak256(abi.encode(sorted exact RequestedScope[]))
   issuedAt
   requestExpiresAt
   capabilityExpiresAt
@@ -1176,8 +1206,9 @@ The Vault verifies the signature against the current registered agent signer and
 
 `createAccessRequest` persists the original request by `requestId` until `requestExpiresAt` and marks it consumed only after successful completion. Even in the CLI flow, `completeAccessRequest` verifies the response against that original stored request:
 
-- request ID, nonce, agent ID, chain, and registry match;
-- every granted namespace was requested;
+- request ID, nonce, request hash, agent ID, chain, and registry match;
+- manifest hash/version and namespace-tree/policy versions match the evaluated request and current registry constants;
+- every granted exact namespace was within the request’s effective expanded authority;
 - every permission and provenance bit is a subset of what was requested;
 - if requested `capabilityExpiresAt` is finite, every granted expiry is finite and no later; if requested value is `"0"`, the user may still narrow it to a finite expiry;
 - every capability’s owner, agent, exact namespace, permissions, provenance policy, expiry, and transaction receipt match the response and original request;
@@ -1192,7 +1223,9 @@ The FakeVault:
 
 - derives deterministic fake domain outputs from a test seed without modeling a global root API;
 - derives namespace and epoch keypairs through the production crypto package;
-- uses a software P256 key to create valid WebAuthn-shaped grant assertions;
+- loads and verifies the current signed agent manifest;
+- runs the deterministic Grant Advisor and accepts an explicit final effective-authority subset;
+- uses a software P256 key to create valid WebAuthn-shaped assertions binding request, manifest, policy/tree versions, final authority, expiry, and nonce;
 - submits owner-account grant and revoke/rotation batches;
 - creates and publishes reader-epoch wraps only after chain authorization exists;
 - never gives namespace secrets or epoch private keys directly to the app boundary;
@@ -1200,7 +1233,381 @@ The FakeVault:
 
 Project 1 server agent signing and X25519 private keys may use environment-held test secrets. Production deployments should choose managed secret storage, hardware security modules, or multiparty custody according to their custody and threat model; environment-held keys are a reference implementation choice, not a protocol custody recommendation.
 
-## 14. Adversarial test matrix
+## 14. Grant Advisor
+
+The Grant Advisor is a deterministic policy layer between an agent’s signed request and the owner’s final consent. It never creates authority:
+
+```text
+agent signed request
+→ deterministic narrower recommendation
+→ user accepts, narrows further, customizes within request, or denies
+→ P256 approval over final exact authority
+```
+
+The governing principle is:
+
+> Agents request access. Mida minimizes it. Users decide.
+
+The authority roles are distinct:
+
+```text
+AgentCapabilityManifest   what the agent claims it may need across its features
+signed AccessRequest      what the agent asks for right now
+Mida policy               deterministic sensitivity and risk classification
+user P256 approval        the final effective-authority subset actually granted
+```
+
+### 14.1 Agent Capability Manifest
+
+Sensitivity is not agent-declared. The manifest contains only the agent’s identity, supported purposes, requested capabilities, and reasons.
+
+```ts
+type PurposeId =
+  | "general_assistance"
+  | "career_coaching"
+  | "project_assistance"
+  | "travel_planning"
+
+interface PurposeDeclaration {
+  id: PurposeId
+  description: string
+}
+
+interface ScopeDeclaration {
+  purposeId: PurposeId
+  namespace: string
+  permissions: Permission[]
+  provenancePolicies?: ProvenancePolicy[]
+  reason: string
+}
+
+interface AgentCapabilityManifestBody {
+  v: 1
+  agentId: Hex
+  manifestVersion: number
+  name: string
+  purposes: PurposeDeclaration[]
+  scopeDeclarations: ScopeDeclaration[]
+  issuedAt: number
+}
+
+interface SignedAgentCapabilityManifest {
+  manifest: AgentCapabilityManifestBody
+  operatorSignature: Hex
+}
+```
+
+The body is Unicode NFC-normalized, RFC 8785 canonicalized, UTF-8 encoded, and hashed:
+
+```text
+bodyHash = keccak256(canonicalManifestBodyBytes)
+```
+
+The registered operator signs only this fixed EIP-712 binding:
+
+```text
+EIP-712 domain:
+  name              = "Mida Agent Capability Manifest"
+  version           = "1"
+  chainId           = configured chain
+  verifyingContract = CapabilityRegistry
+
+ManifestBinding:
+  bytes32 bodyHash
+  bytes32 agentId
+  uint64  manifestVersion
+```
+
+Arrays and strings are encoded once by canonical body hashing; EIP-712 does not define a second representation of manifest contents.
+
+The signed envelope is independently canonicalized and content-addressed:
+
+```text
+envelopeBytes = UTF8(RFC8785(SignedAgentCapabilityManifest))
+envelopeHash  = SHA256(envelopeBytes)
+```
+
+`envelopeHash` addresses the actual stored envelope bytes but is not stored in `AgentRecord`. The public metadata service maintains:
+
+```text
+bodyHash → envelopeHash
+envelopeHash → canonical signed envelope bytes
+```
+
+`GET /agent-manifests/:bodyHash` resolves the index and then verifies `SHA256(envelopeBytes) == envelopeHash`, recomputes the inner body hash, and verifies the operator signature. The body-hash index itself is not called content-addressed storage because the envelope bytes do not hash to `bodyHash`.
+
+`AgentRecord` stores:
+
+```text
+capabilityManifestHash    = bodyHash
+capabilityManifestVersion = manifestVersion
+```
+
+Version starts at 1 and increases by exactly one. Registration requires version 1. `updateAgentCapabilityManifest(agentId, bodyHash, version, operatorSignature)` requires the current operator, a valid signature over the exact typed binding, and the next version. The contract verifies the signed binding but cannot inspect the hashed JSON body; the API/Vault recomputes the body hash and verifies body `agentId` and version before use. The update emits `AgentCapabilityManifestUpdated`.
+
+`issuedAt` must not be in the future and is informational chronology; currentness comes from the onchain hash/version, not age. Limits are deterministic: 1–80 UTF-8 bytes for `name`, 1–280 for each description/reason, at most 8 purposes, at most 32 scope declarations, no duplicate purpose IDs, and no duplicate `(purposeId, canonical namespace)` declarations. Every namespace and permission must be valid under protocol v1. Display text is untrusted, escaped by the UI, and never interpreted as policy instructions.
+
+The Context API exposes:
+
+```text
+PUT /agent-manifests
+GET /agent-manifests/:bodyHash
+```
+
+Upload may precede the registry transaction, but an envelope is current only when its body hash/version match `AgentRecord`. Missing, mutated, incorrectly signed, or stale envelopes fail closed.
+
+### 14.2 Protocol-owned namespace sensitivity
+
+```text
+LOW
+  preferences
+  preferences.communication
+  preferences.tools
+  preferences.work
+  profile.skills
+  projects.current
+
+MEDIUM
+  profile
+  profile.identity
+  goals
+  goals.career
+  goals.learning
+  goals.personal
+  projects
+  projects.past
+  decisions
+  decisions.career
+  decisions.projects
+  relationships
+
+HIGH
+  credentials
+  financial
+  financial.preferences
+  private
+```
+
+A parent’s effective sensitivity is at least the highest sensitivity of every namespace it expands to. Sensitivity belongs to immutable policy version `mida-grant-policy-v1`; manifest claims cannot lower it. The canonical policy document is RFC 8785 hashed, and `CapabilityRegistry` exposes the matching `POLICY_HASH_V1` constant. Cross-language tests require the TypeScript policy hash and Solidity constant to match so UI and contract rules cannot silently drift.
+
+Consent consequences belong to Project 2, but Project 1 freezes them:
+
+```text
+LOW       normal approval
+MEDIUM    explicit justification
+HIGH      warning + individual selection; never default-selected
+```
+
+No “select all” action may select HIGH authority.
+
+### 14.3 Purpose policy
+
+Every exact `(purposeId, namespaceId)` is one of:
+
+```text
+EXPECTED       eligible for default recommendation with permitted bits
+ELEVATED       excluded by default; user may explicitly select
+SUSPICIOUS     excluded with critical warning
+UNCLASSIFIED   excluded because policy has no basis to recommend
+```
+
+The initial exact policy is:
+
+| Purpose | Expected | Elevated | Suspicious |
+|---|---|---|---|
+| `general_assistance` | `preferences.communication:READ`, `profile.skills:READ` | `projects.current:READ` | every HIGH namespace |
+| `career_coaching` | `profile.skills:READ`, `goals.career:READ|CREATE + ALLOW_INFERENCE`, `preferences.communication:READ` | `profile.identity:READ`, `projects.current:READ` | every HIGH namespace |
+| `project_assistance` | `profile.skills:READ`, `projects.current:READ|CREATE|SUPERSEDE_OWN + ALLOW_INFERENCE`, `preferences.communication:READ` | `decisions.projects:CREATE + ALLOW_INFERENCE`, `goals.career:READ` | every HIGH namespace |
+| `travel_planning` | `preferences:READ` after exact tree expansion | `profile.identity:READ` | every HIGH namespace |
+
+Because travel uses generic `preferences` rather than a dedicated travel namespace, its recommendation emits `BROAD_PARENT_SCOPE` and lists `preferences`, `preferences.communication`, `preferences.tools`, and `preferences.work`. It must not label that bundle as travel-only data.
+
+`SUPERSEDE_ANY` is never default-recommended, even if a future purpose table marks it expected. It requires explicit individual user selection, like HIGH authority. `SUPERSEDE_OWN` may be recommended where listed.
+
+For expected CREATE or supersession entries, `ALLOW_INFERENCE` may be recommended only when both manifest and purpose policy declare it. `ALLOW_IMPORTED` and `ALLOW_EXTERNAL_ATTESTATION` are always ELEVATED in v1 and require explicit selection. Provenance-policy bits are effective authority and follow the same subset rules as permissions.
+
+### 14.4 Duration policy
+
+```text
+LOW       recommendation cap: 30 days
+MEDIUM    recommendation cap: 7 days
+HIGH      final-selection cap: 24 hours
+```
+
+The recommended expiry is the earliest of the requested expiry and the strictest included sensitivity cap. Project 1 grants use one expiry per batch. If the user adds HIGH authority, the entire final batch is capped at 24 hours. Separate expiry groups are deferred.
+
+### 14.5 Effective authority and narrowing
+
+Policy never compares only namespace strings. It expands each parent against immutable namespace-tree v1 and represents authority as exact tuples:
+
+```ts
+interface EffectiveAuthority {
+  namespaceId: Hex
+  permission: Permission
+  provenancePolicy?: ProvenancePolicy
+}
+```
+
+For example, `preferences:READ` expands to exact READ authority over the parent and its three frozen children. Effective authority includes namespace, every permission bit, every provenance-policy bit, and expiry.
+
+The invariants are:
+
+```text
+authority(recommended) ⊆ authority(requested)
+authority(final)       ⊆ authority(requested)
+recommended expiry     ≤ requested expiry
+final expiry           ≤ requested expiry
+```
+
+A shorter expiry is narrower. For requested expiry 0 (unbounded), any finite expiry is narrower. A finite request can never become unbounded.
+
+The package exposes one pure deterministic entry point:
+
+```ts
+interface OwnerAgentHistory {
+  owner: Address
+  agentId: Hex
+  previouslyRevoked: boolean
+  observedThroughBlock: bigint
+}
+
+interface GrantAdvisorInput {
+  request: AccessRequest
+  manifest: SignedAgentCapabilityManifest
+  agentRecord: AgentRecord
+  ownerHistory: OwnerAgentHistory
+  now: bigint
+}
+
+function adviseGrant(input: GrantAdvisorInput): GrantAdvice
+```
+
+The chain adapter constructs `ownerHistory` from canonical `CapabilityRevoked` and `AgentRevoked` events for exactly `(owner, agentId)`. The pure Advisor verifies those identifiers match the request but does not accept global reputation or mutable access telemetry.
+
+The Advisor algorithm is normative:
+
+```text
+1. verify current agent identity and manifest hash/version/signature
+2. verify requested purpose is declared
+3. expand requested and declared parents through immutable tree v1
+4. derive sensitivity only from policy v1
+5. classify every exact scope under the purpose policy
+6. intersect requested permission/provenance bits with permitted bits
+7. exclude ELEVATED, SUSPICIOUS, UNCLASSIFIED, HIGH, and SUPERSEDE_ANY by default
+8. apply the strictest duration cap
+9. compute warnings and risk
+10. assert effective-authority subset before returning
+```
+
+Undeclared access remains user-overridable because the user is the final authority, but it is never recommended.
+
+### 14.6 Advice result
+
+```ts
+interface ScopeWarning {
+  code:
+    | "SCOPE_NOT_DECLARED"
+    | "SCOPE_UNCLASSIFIED"
+    | "SCOPE_ELEVATED"
+    | "SCOPE_SUSPICIOUS"
+    | "HIGH_SENSITIVITY"
+    | "BROAD_PARENT_SCOPE"
+    | "SUPERSEDE_ANY_EXPLICIT"
+    | "PERMISSION_NARROWED"
+    | "PROVENANCE_POLICY_NARROWED"
+    | "DURATION_NARROWED"
+    | "PREVIOUSLY_REVOKED"
+  namespaceId?: Hex
+  relatedNamespaceIds?: Hex[]
+  severity: "info" | "warning" | "critical"
+  messageKey: string
+}
+
+interface GrantAdvice {
+  policyVersion: "mida-grant-policy-v1"
+  namespaceTreeVersion: "mida-namespace-tree-v1"
+  requestHash: Hex
+  manifestHash: Hex
+  manifestVersion: number
+  recommended: RequestedScope[]
+  recommendedExpiresAt: string
+  warnings: ScopeWarning[]
+  risk: "low" | "medium" | "high"
+}
+```
+
+Risk is deterministic:
+
+- LOW-only recommendation with no warnings is low.
+- Any MEDIUM scope or warning makes risk at least medium.
+- Any HIGH, suspicious, undeclared, or `PREVIOUSLY_REVOKED` condition is high.
+- Identity, request, signature, manifest hash, or version failures return no advice and open no consent screen.
+
+`PREVIOUSLY_REVOKED` means this owner previously revoked this exact agent identity, based only on canonical chain events. Revocation by another owner does not trigger it. Mutable access telemetry is never a reputation input, and a new agent identity can evade this limited history.
+
+### 14.7 Request and P256 grant binding
+
+`AccessRequest` binds `purposeId`, `manifestHash`, `manifestVersion`, `policyVersion`, `namespaceTreeVersion`, and the expanded exact requested authority. The agent signer signs the request.
+
+The owner’s P256 challenge binds:
+
+```text
+keccak256(abi.encode(
+  "MIDA_GRANT_V1",
+  chainId,
+  CapabilityRegistry address,
+  owner,
+  agentId,
+  requestHash,
+  manifestHash,
+  manifestVersion,
+  keccak256(UTF8("mida-grant-policy-v1")),
+  keccak256(UTF8("mida-namespace-tree-v1")),
+  keccak256(abi.encode(final exact GrantScope[])),
+  expiresAt,
+  grantNonce[owner]
+))
+```
+
+`grantBatch` receives the agent-signed request and final exact scopes. It verifies the current agent signature, current manifest hash/version, supported tree/policy versions, effective-authority subset, final expiry narrowing, P256 assertion, and nonce. The contract does not require the final set to equal the recommendation because the user may override the Advisor. It does require the final set to remain within what the agent signed.
+
+The contract rejects a submission whose request, manifest, policy/tree versions, final authority, expiry, or nonce differ from the P256-signed challenge. This prevents stale-state and post-signature substitution. It does not make a compromised Vault UI truthful: WebAuthn signs challenge bytes, not the human-readable scopes the page displayed. The security model therefore still requires the sole Vault origin to render the bound values correctly; Project 2 must harden that origin with a minimal dependency surface and strict content security policy.
+
+### 14.8 Progressive grants and AI boundary
+
+Progressive grants use another complete signed request and P256 approval when a later feature needs more authority. The protocol cannot prove when a human reached a feature; contextual timing is a Project 2 UX rule.
+
+Project 1 returns deterministic warning codes and message keys. Project 2 may let a model rewrite those facts into plain language, but model output is never policy input, recommendation input, or authority. If deterministic evaluation fails, the Vault fails closed; it never falls back to raw scopes or model judgment.
+
+Hard failures return no advice:
+
+```text
+MANIFEST_NOT_FOUND
+MANIFEST_HASH_MISMATCH
+MANIFEST_SIGNATURE_INVALID
+MANIFEST_STALE
+AGENT_ID_MISMATCH
+PURPOSE_UNKNOWN
+REQUEST_SIGNATURE_INVALID
+NAMESPACE_TREE_VERSION_UNSUPPORTED
+POLICY_VERSION_UNSUPPORTED
+```
+
+### 14.9 Design precedents
+
+The Advisor adapts three verified practices without importing their authority models:
+
+- Google OAuth recommends the narrowest necessary scope and distinguishes non-sensitive, sensitive, and restricted scopes.
+- Android recommends contextual permission requests when a feature needs them, clear rationale, and graceful denial.
+- Vana uses stable hierarchical scopes plus human-readable scope labels/descriptions in consent surfaces.
+
+Sources verified 2026-09-14:
+
+- `https://developers.google.com/workspace/guides/configure-oauth-consent`
+- `https://developer.android.com/training/permissions/requesting`
+- `https://docs.vana.org/protocol-reference/scopes-schemas`
+
+## 15. Adversarial test matrix
 
 Every behavior below must first exist as a failing test, fail for the intended reason, and only then receive implementation.
 
@@ -1209,6 +1616,25 @@ Every behavior below must first exist as a failing test, fail for the intended r
 | Namespace | canonicalize `Goals.Career` | `goals.career` |
 | Namespace | repeated separator or unknown node | `INVALID_NAMESPACE` |
 | Namespace | caller invents a parent/path | no such input exists; forged scope rejected |
+| Namespace | deployed v1 tree receives a new child | impossible; no mutation function exists |
+| Advisor | mutate manifest body after signing | body-hash/signature verification fails |
+| Advisor | use manifest envelope from another chain/registry | operator signature fails |
+| Advisor | request references stale manifest version | hard failure; no advice/consent |
+| Advisor | API maps body hash to wrong envelope bytes | envelope/body hash verification fails |
+| Advisor | non-operator or skipped/replayed manifest version update | contract rejection |
+| Advisor | parent scope is recommended | effective exact authority stays within frozen request expansion |
+| Advisor | randomized request/property test | recommendation is always an effective-authority subset |
+| Advisor | TypeScript and Solidity policy hashes | exact equality |
+| Advisor | HIGH scope requested | excluded from default recommendation |
+| Advisor | HIGH final grant exceeds 24 hours or is unbounded | contract rejection |
+| Advisor | `SUPERSEDE_ANY` requested | excluded from default recommendation |
+| Advisor | excessive permissions requested | recommendation contains only policy-permitted bits |
+| Advisor | imported/attestation provenance requested | elevated and excluded by default |
+| Advisor | excessive duration requested | recommendation expiry is narrowed |
+| Advisor | undeclared scope requested | excluded with warning; user may explicitly select |
+| Advisor | same owner previously revoked agent | `PREVIOUSLY_REVOKED`, high risk |
+| Advisor | another owner revoked agent | no `PREVIOUSLY_REVOKED` warning |
+| Advisor | caller attempts to supply model/explanation input | Advisor interface has no such input; deterministic output unchanged |
 | Crypto | wrong namespace secret | AEAD unwrap/decrypt failure |
 | Crypto | wrong read epoch | cannot unwrap object DEK |
 | Crypto | all-zero X25519 public/shared secret | rejected before HKDF |
@@ -1224,6 +1650,9 @@ Every behavior below must first exist as a failing test, fail for the intended r
 | READ | newly granted reader requests retained historical epoch | historical wrap allowed while capability is active |
 | READ | remaining reader crosses an epoch rotation | capability stays valid; new wrap restores access |
 | Capability | replay grant assertion | rejected by owner grant nonce |
+| Capability | final exact authority exceeds signed request | contract rejection |
+| Capability | wrong request/manifest/policy/tree hash in P256 challenge | contract rejection |
+| Capability | manifest updates between request and grant | stale request rejected |
 | Capability | grant signed for wrong chain or registry | rejected |
 | Capability | grant signed without user-verification flag | rejected |
 | Capability | live session tries to overwrite registered P256 key | rejected |
@@ -1279,30 +1708,33 @@ Every behavior below must first exist as a failing test, fail for the intended r
 
 Real same-passkey fresh-browser recovery is not claimed by Project 1; Project 1 proves only the deterministic derivation seam with fake PRF outputs.
 
-## 15. Mandatory end-to-end scenario
+## 16. Mandatory end-to-end scenario
 
 The CLI harness must execute this sequence against local contracts and then Monad testnet:
 
 ```text
 1. Alice registers owner P256 and initial goals.career epoch-1 public key.
-2. Alice creates encrypted goals.career context under epoch 1.
-3. Alice grants Agent A exact READ goals.career.
-4. FakeVault publishes the epoch-1 private key wrapped to Agent A’s registered key/version.
-5. Agent A verifies manifest/ciphertext commitments, unwraps, and decrypts.
-6. Agent B has no grant and receives CAPABILITY_DENIED.
-7. Agent C receives exact CREATE goals.career without READ.
-8. Agent C uses only the public epoch key to create a new encrypted lineage.
-9. Agent C cannot fetch a reader wrap or decrypt Alice’s existing object.
-10. Alice posts an owner-signed revocation intent; the Context API denies Agent A before chain confirmation.
-11. Alice atomically revokes Agent A on Monad and advances goals.career to epoch 2 with its public key.
-12. Agent C writes a new object under epoch 2.
-13. Agent A’s chain read fails and its epoch-1 private key cannot decrypt the epoch-2 object.
-14. A remaining authorized reader receives an epoch-2 wrap and continues normally.
+2. Agents A, B, and C register signed capability manifests whose body hashes/versions are committed in AgentRecord.
+3. Alice creates encrypted goals.career context under epoch 1.
+4. Agent A signs a career_coaching request for READ goals.career plus unnecessary READ financial.
+5. Grant Advisor recommends only READ goals.career, emits HIGH/suspicious warnings for financial, and proves effective-authority narrowing.
+6. Alice uses the recommendation; P256 approval binds request, manifest, policy/tree versions, final exact READ goals.career, expiry, and grant nonce.
+7. FakeVault publishes the epoch-1 private key wrapped to Agent A’s registered key/version.
+8. Agent A verifies manifest/ciphertext commitments, unwraps, and decrypts.
+9. Agent B has no grant and receives CAPABILITY_DENIED.
+10. Agent C receives an advised exact CREATE goals.career grant without READ.
+11. Agent C uses only the public epoch key to create a new encrypted lineage.
+12. Agent C cannot fetch a reader wrap or decrypt Alice’s existing object.
+13. Alice posts an owner-signed revocation intent; the Context API denies Agent A before chain confirmation.
+14. Alice atomically revokes Agent A on Monad and advances goals.career to epoch 2 with its public key.
+15. Agent C writes a new object under epoch 2.
+16. Agent A’s chain read fails and its epoch-1 private key cannot decrypt the epoch-2 object.
+17. A remaining authorized reader receives an epoch-2 wrap and continues normally.
 ```
 
 Success requires assertions at every denial and cryptographic boundary. Console output alone is not proof.
 
-## 16. Deployment and configuration
+## 17. Deployment and configuration
 
 - Solidity: `0.8.28`.
 - Contract tests and deployment: Foundry.
@@ -1316,7 +1748,7 @@ Success requires assertions at every denial and cryptographic boundary. Console 
 - P256/WebAuthn verification still goes through the selected audited verifier abstraction rather than custom JSON parsing or curve code.
 - No secret, private key, PRF output, plaintext DEK, or plaintext context value may be committed to Git or logged.
 
-## 17. Security invariants
+## 18. Security invariants
 
 Project 1 is incomplete unless all of these hold:
 
@@ -1338,13 +1770,19 @@ Project 1 is incomplete unless all of these hold:
 16. Independent lineages do not share a global object nonce or lock.
 17. A stale expected parent cannot become the canonical head.
 18. Context API authorization cannot create authority absent from Monad.
+19. Namespace-tree v1 and sensitivity/purpose policy v1 are protocol-owned and immutable for that version.
+20. Agent manifests cannot declare or lower sensitivity.
+21. Recommended effective authority is always a subset of the agent-signed requested effective authority.
+22. Final effective authority is always a subset of the agent-signed requested effective authority and is enforced by the contract.
+23. HIGH authority and `SUPERSEDE_ANY` are never default-recommended.
+24. P256 grant approval binds request hash, current manifest hash/version, policy/tree versions, final exact authority, expiry, and contract nonce.
 
-## 18. Completion gate
+## 19. Completion gate
 
 Project 1 passes only when:
 
-- unit and property tests cover canonicalization, derivation, encryption, wraps, storage, and wire validation;
-- Foundry adversarial tests cover grants, replay, exact scopes, provenance, anchors, evidence, expiry, epoch rotation, and stale parents;
+- unit and property tests cover canonicalization, immutable authority expansion, manifest hashing/signing, Advisor subset invariants, derivation, encryption, wraps, storage, and wire validation;
+- Foundry adversarial tests cover request/final subset enforcement, manifest/policy/tree grant binding, grants, replay, exact scopes, provenance, anchors, evidence, expiry, epoch rotation, and stale parents;
 - API integration tests prove the normative validation order, chain-bounded authorization, immediate local deny, and authorization checks for reads and reader-wrap publication;
 - the complete CLI scenario passes locally;
 - the same scenario passes against deployed Monad testnet contracts;
