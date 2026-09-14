@@ -26,8 +26,8 @@ Project 1 proves these protocol assumptions with a software `FakeVaultAuthority`
 - `@mida/protocol`: canonical types, identifiers, namespace rules, error codes, and encodings.
 - `@mida/crypto`: namespace derivation, asymmetric read epochs, XChaCha20-Poly1305 payload encryption, and X25519 wraps.
 - `@mida/grant-advisor`: signed agent manifests, immutable sensitivity/purpose policy, authority expansion, deterministic narrowing, warnings, and subset proofs.
-- `CapabilityRegistry`: owner P256 keys, global agent identities and manifest commitments, exact capabilities, grant replay protection, request/final-subset enforcement, revocation, expiry deadlines, and read-epoch generations.
-- `ContextRegistry`: namespace epoch public keys, immutable evidence/context records, provenance enforcement, lineage policy, latest pointers, and stale-parent protection.
+- `CapabilityRegistry`: owner P256 keys, global agent identities and manifest commitments, exact capabilities, grant replay protection, request/final-subset enforcement, revocation, expiry deadlines, read-epoch generations, and namespace epoch public keys.
+- `ContextRegistry`: immutable evidence/context records, provenance enforcement, lineage policy, latest pointers, and stale-parent protection. It reads epoch validity from `CapabilityRegistry` and holds no epoch key state of its own.
 - `MemoryStorage` and `FsStorage` behind `ContextStorage`.
 - A minimal Context API that stores ciphertext, immutable manifests, and reader-epoch wraps while enforcing current chain authorization.
 - `FakeVaultAuthority` using software P256 and deterministic fake PRF-domain outputs.
@@ -90,7 +90,7 @@ Sources verified 2026-09-14:
 
 The owner is the Mera-derived account address. Per Monad's Mera docs (verified 2026-09-14, `https://docs.monad.xyz/guides/mera`), Mera accounts are plain EOAs ("regular EOAs. There is nothing to deploy"), not EIP-7702 delegated accounts, and the SDK is `@category-labs/mera`. Every owner contract operation must enter from execution by that account, so the registries observe `msg.sender == owner`. Gas sponsorship alone does not establish owner identity; a relayer calling a registry directly is the relayer and is rejected.
 
-Because the owner is a plain EOA, any "atomic owner-account batch" in this document (revoke + advance epoch + publish next key) must be a single contract entry point that performs all steps, not a wallet-level batched transaction. Project 1 exposes `revokeAndRotate(...)` on `CapabilityRegistry` that internally calls `ContextRegistry.setNamespaceEpochKey` (or an equivalent single-call path); EIP-7702 batching is not assumed. The owner EOA needs testnet MON from `https://faucet.monad.xyz` for gas.
+Because the owner is a plain EOA, every "revoke + advance epoch + publish next key" transition in this document is one call to one contract, not a wallet-level batched transaction and not a cross-contract call. A cross-contract path (`CapabilityRegistry` calling into `ContextRegistry`) would fail the `msg.sender == owner` check because the inner call's sender is the registry, not the owner. Read-epoch public keys therefore live in `CapabilityRegistry`, next to the required epoch, write deadline, and READ-capability endings that decide when they must change (Section 10.6). EIP-7702 batching is not assumed. The owner EOA needs testnet MON from `https://faucet.monad.xyz` for gas.
 
 ### 4.2 Vault
 
@@ -330,7 +330,7 @@ Any operation that ends READ authority requires an epoch transition for every af
 - namespace removal;
 - expiry.
 
-Explicit revocation/scope reduction executes an atomic owner-account batch:
+Explicit revocation/scope reduction executes one owner transaction into a single `CapabilityRegistry` function (`revokeAndRotate` or `revokeAgentAndRotate`, Section 10.6) that performs all three steps atomically:
 
 ```text
 invalidate capability or increment agent epoch
@@ -338,7 +338,7 @@ invalidate capability or increment agent epoch
 → publish new epoch public key
 ```
 
-At expiry there is no automatic transaction. The expired capability immediately fails authorization, and the old epoch immediately stops accepting new records because its deadline is no longer in the future. The owner must publish the next epoch public key to resume writes.
+At expiry there is no automatic transaction. The expired capability immediately fails authorization, and the old epoch immediately stops accepting new records because its deadline is no longer in the future. The owner must call `rotateExpiredEpoch` with the next epoch public key to resume writes.
 
 The next epoch’s deadline is recomputed from remaining active READ capabilities. Project 1 permits at most 32 active exact capabilities per `(owner, namespaceId)` so this scan is bounded. Revoked and expired entries may be compacted during rotation.
 
@@ -354,7 +354,7 @@ Distribution of the new private epoch key is off-chain and follows the transacti
 
 ## 8. Cryptographic objects
 
-Project 1 uses `@noble/curves`, `@noble/hashes`, and `@noble/ciphers` (all 2.4.0 as of 2026-09-14). It does not implement cryptographic primitives. Pinned import paths for v2: `x25519` from `@noble/curves/ed25519.js`, `p256` from `@noble/curves/p256.js`, `xchacha20poly1305` from `@noble/ciphers/chacha.js`, `hkdf` from `@noble/hashes/hkdf.js`, `sha256` from `@noble/hashes/sha2.js`. `@noble/curves` x25519 already throws on low-order public keys and on an all-zero shared point; Mida keeps its own explicit all-zero check as defense in depth. RFC 8785 canonicalization uses the `canonicalize` package (5.0.0). Software WebAuthn assertions for FakeVault are produced with `ox` (`WebAuthnP256.sign` / `WebAuthnP256.verify`); viem has no `signWebAuthn` export.
+Project 1 uses `@noble/curves`, `@noble/hashes`, and `@noble/ciphers` (all 2.4.0 as of 2026-09-14). It does not implement cryptographic primitives. Pinned import paths for v2: `x25519` from `@noble/curves/ed25519.js`, `p256` from `@noble/curves/p256.js`, `xchacha20poly1305` from `@noble/ciphers/chacha.js`, `hkdf` from `@noble/hashes/hkdf.js`, `sha256` from `@noble/hashes/sha2.js`. `@noble/curves` x25519 already throws on low-order public keys and on an all-zero shared point; Mida keeps its own explicit all-zero check as defense in depth. RFC 8785 canonicalization uses the `canonicalize` package (4.0.0). Software WebAuthn assertions for FakeVault are produced with `ox` 1.7.4 (`WebAuthnP256.sign` / `WebAuthnP256.verify`); viem has no `signWebAuthn` export. Exact pins are listed in Section 17; a release younger than seven days is not pinned.
 
 Canonical JSON wire objects encode `uint64` and `bigint` values as base-10 strings with no sign or leading zero, except the value `"0"`. Runtime APIs may expose `bigint`, but conversion to and from the canonical wire representation happens only in `@mida/protocol`. Fixed-size hexadecimal values are lowercase, `0x`-prefixed, and exactly the declared byte length.
 
@@ -691,14 +691,26 @@ A grant succeeds only if:
 7. final expiry is no later than the request and satisfies `expiresAt == 0 || expiresAt > block.timestamp`; any final HIGH namespace additionally requires `expiresAt <= block.timestamp + 24 hours` and forbids zero/unbounded expiry;
 8. active-capability limits are not exceeded: at most 32 per `(owner, namespaceId)` and 64 per `(owner, agentId)`;
 9. every final READ scope’s current epoch is initialized and still writable;
-10. the WebAuthn assertion has type `webauthn.get`, contains the exact `grantDigest` challenge, matches the configured Vault origin/RP ID, and has both User Presence and User Verification flags set;
+10. the WebAuthn assertion has type `webauthn.get`, contains the exact `grantDigest` challenge, has both User Presence and User Verification flags set, and carries `authenticatorData[0:32] == SHA256(configured Vault RP ID)`; the RP-ID-hash comparison is performed by Mida's wrapper, not by `webauthn-sol`, and `clientDataJSON.origin` is not independently checked on-chain (see the boundary note after this list);
 11. the P256 signature verifies against the owner’s registered key;
 12. the registry reads and then increments `grantNonce[owner]`;
 13. every final READ scope captures the namespace’s current `readEpoch` as `grantedAtReadEpoch` and lowers its write deadline when this grant expires sooner.
 
 A zero authenticator signature counter is accepted because synced passkeys may not provide a useful monotonic counter. The contract does not treat the counter as replay protection; `grantNonce` provides replay protection.
 
-Project 1 uses `webauthn-sol` (`forge install base/webauthn-sol`; it is a Foundry dependency, not an npm package). Its `verify(...)` takes a caller-supplied `requireUserVerification` bool that defaults to nothing; Mida always passes `true`. Verified 2026-09-14 from `src/WebAuthn.sol`: it calls the precompile at `address(0x100)`, requires non-empty return data decoding to `1` (EIP-7951-compatible), and falls back to FreshCryptoLib otherwise.
+Project 1 uses `webauthn-sol` v1.0.0 (commit `619f20a`; `forge install base/webauthn-sol@v1.0.0`; it is a Foundry dependency, not an npm package). Its `verify(challenge, requireUserVerification, auth, qx, qy)` takes a caller-supplied `requireUserVerification` bool; Mida always passes `true`. Verified 2026-09-14 from `src/WebAuthn.sol`: it checks `webauthn.get`, the challenge, User Presence, User Verification when requested, rejects `s > n/2`, calls the precompile at `address(0x100)`, requires non-empty return data decoding to `1` (EIP-7951-compatible), and falls back to FreshCryptoLib otherwise.
+
+The library's own comments state what it does **not** verify: `clientDataJSON.origin`, `topOrigin`, the `rpIdHash` in `authenticatorData`, and the signature counter. The v0 verification boundary is therefore split across three layers:
+
+```text
+Mida wrapper          authenticatorData[0:32] == SHA256(configured Vault RP ID)
+webauthn-sol          verify(challenge, true, auth, qx, qy)
+browser/authenticator enforces the sole Vault RP ID and origin at assertion time
+```
+
+`clientDataJSON.origin` is not independently checked on-chain in v0. The contract binds the RP-ID hash; the origin binding rests on the browser refusing to produce an assertion for that RP ID from any other origin. This is a documented v0 limitation, not an oversight, and Project 2's Vault hardening must not weaken it.
+
+Low-s: EIP-7951 accepts any `0 < s < n` and its security section says applications needing non-malleability must add the check themselves. `webauthn-sol` adds it by rejecting `s > n/2`. The FakeVault normalizes `s` to low-s because the selected library requires it, not because the precompile does.
 
 Three verification paths are exercised with the same FakeVault assertion payload:
 
@@ -725,23 +737,30 @@ The query accepts one exact registered namespace and one permission. No caller-s
 
 The required epoch defaults to 1 for an owner/namespace with no stored epoch counter.
 
+Read-epoch public keys are stored in `CapabilityRegistry`, keyed by `(owner, namespaceId, readEpoch)`, because this contract already owns the required epoch, the write deadline, and the READ-capability endings that force rotation. Keeping key publication in the same contract lets one owner EOA transaction perform revocation and rotation atomically without any cross-contract call that would change `msg.sender`.
+
 ```solidity
+struct EpochRotation { bytes32 namespaceId; bytes32 newEpochPublicKey; }
+
+initializeReadEpoch(bytes32 namespaceId, bytes32 publicKey)
 revoke(bytes32 capabilityId)
-revokeAgent(bytes32 agentId)
-advanceExpiredReadEpoch(bytes32 namespaceId) returns (uint64 newEpoch)
+revokeAndRotate(bytes32 capabilityId, bytes32 newEpochPublicKey)
+revokeAgentAndRotate(bytes32 agentId, EpochRotation[] calldata rotations)
+rotateExpiredEpoch(bytes32 namespaceId, bytes32 newEpochPublicKey)
 requiredReadEpoch(address owner, bytes32 namespaceId) view returns (uint64)
+epochPublicKey(address owner, bytes32 namespaceId, uint64 epoch) view returns (bytes32)
 isWriteEpochValid(address owner, bytes32 namespaceId, uint64 epoch) view returns (bool)
 ```
 
-- `revoke` requires `msg.sender == capability.owner`.
-- `revokeAgent` requires owner authority, increments `agentEpoch[owner][agentId]`, and advances every exact namespace for which that agent had active READ. At most 64 owner-agent capabilities are scanned.
-- Plain owner authority is sufficient because these operations reduce privilege.
+- Every function above requires `msg.sender == owner` (for `revoke*`, the capability’s owner). Plain owner authority is sufficient because these operations reduce privilege or only publish a public key.
+- `initializeReadEpoch` publishes epoch 1 for a registered namespace that has no key yet. `publicKey` must be non-zero. Published keys are immutable; rotation appends the next key rather than replacing history.
+- `revoke` (no rotation) is permitted only for capabilities whose permissions do not include READ. It rejects an active READ capability so a caller cannot end READ authority without rotating; `revokeAndRotate` is the only path for that.
+- `revokeAndRotate` invalidates the capability, increments `requiredReadEpoch[owner][namespaceId]`, stores `newEpochPublicKey` under the new epoch, and recomputes the write deadline from remaining live exact READ capabilities, all in one call.
+- `revokeAgentAndRotate` increments `agentEpoch[owner][agentId]` and then requires that `rotations` cover exactly the set of unique namespaces in which that agent held active READ: every such namespace must appear once with a non-zero key, and no namespace outside that set may appear. Missing, duplicate, or extra entries revert. At most 64 owner-agent capabilities are scanned.
 - If ended authority included READ, the registry increments `requiredReadEpoch[owner][namespaceId]` exactly once for that owner transaction, even when multiple ended capabilities cover the same namespace.
-- A scope reduction is represented as revocation plus a narrower new grant and therefore follows the same rule.
-- Context registration fails until `ContextRegistry` has a public key for the required epoch.
-- The owner-account batch combines revocation/epoch invalidation with publication of the next public key. Calling revocation alone remains safe but leaves writes blocked until key publication.
-
-When the write deadline expires without a transaction, `isWriteEpochValid` returns false. The owner calls `advanceExpiredReadEpoch` only when the old deadline is non-zero and `block.timestamp >= writeDeadline`. It increments the required epoch and recomputes the next deadline from remaining live exact READ capabilities. The same owner-account batch publishes that epoch’s public key in ContextRegistry.
+- A scope reduction is represented as `revokeAndRotate` plus a narrower new grant and therefore follows the same rule.
+- `rotateExpiredEpoch` is callable only when the current deadline is non-zero and `block.timestamp >= writeDeadline`. It increments the required epoch, stores the new key, and recomputes the next deadline from remaining live exact READ capabilities.
+- `ContextRegistry` never stores epoch keys. Context registration reads `requiredReadEpoch`, `epochPublicKey`, and `isWriteEpochValid` from `CapabilityRegistry` and fails until the required epoch has a published key.
 
 ### 10.7 Events
 
@@ -757,6 +776,7 @@ CapabilityGranted
 CapabilityRevoked
 AgentRevoked
 ReadEpochRequired
+NamespaceEpochKeySet
 ```
 
 Events include indexed owner/agent/namespace identifiers needed by an off-chain indexer. `CapabilityGranted` also emits `requestHash`, capability-manifest hash/version, policy/tree version hashes, and the final exact capability ID so the consent context can be audited without expanding the stored `Capability` struct.
@@ -765,13 +785,9 @@ Events include indexed owner/agent/namespace identifiers needed by an off-chain 
 
 ### 11.1 Namespace epoch keys
 
-```solidity
-setNamespaceEpochKey(bytes32 namespaceId, uint64 readEpoch, bytes32 publicKey)
-```
+`ContextRegistry` holds no epoch key state. Epoch public keys are published and rotated in `CapabilityRegistry` (Section 10.6) so that revocation and key publication happen in one owner transaction. `ContextRegistry` is constructed with the `CapabilityRegistry` address and, on every registration, reads `requiredReadEpoch`, `epochPublicKey`, and `isWriteEpochValid` from it.
 
-Only the owner account may publish its namespace key. The namespace must be registered, `publicKey` must be non-zero, `readEpoch` must equal `CapabilityRegistry.requiredReadEpoch(msg.sender, namespaceId)`, and that owner/namespace/epoch tuple must not already have a key. Epoch 1 is initialized through this same function. Published epoch keys are immutable; rotation appends the next key rather than replacing history.
-
-The contract does not know the owner’s namespace secret and cannot prove the public key was derived correctly. Recovery depends on the owner/Vault publishing the deterministic key specified in Section 7; the FakeVault recovery test detects a mismatch in Project 1.
+Neither contract knows the owner’s namespace secret and neither can prove the public key was derived correctly. Recovery depends on the owner/Vault publishing the deterministic key specified in Section 7; the FakeVault recovery test detects a mismatch in Project 1.
 
 ### 11.2 Record enums
 
@@ -849,7 +865,7 @@ For every input, the contract:
 3. derives `author = bytes32(0)` for owner or the resolved `agentId`;
 4. recomputes `contextId` from chain, registry, owner, author, namespace, and `objectNonce`;
 5. rejects duplicate IDs and unknown namespaces;
-6. verifies `readEpoch` equals the current required epoch, its public key is registered, and its write deadline remains valid;
+6. verifies, by reading `CapabilityRegistry`, that `readEpoch` equals the current required epoch, its public key is published, and its write deadline remains valid;
 7. checks the writer’s exact capability for CREATE or supersession;
 8. derives `createdAt = block.timestamp`, lineage, parent, and version;
 9. applies record, provenance, evidence, and lineage rules;
@@ -953,11 +969,12 @@ A context `expiresAt` controls semantic freshness and default retrieval. It does
 ### 11.10 Events
 
 ```text
-NamespaceEpochKeySet
 ContextRegistered
 ContextSuperseded
 EvidenceRegistered
 ```
+
+`NamespaceEpochKeySet` is emitted by `CapabilityRegistry`, not here.
 
 ## 12. Minimal Context API
 
@@ -1665,10 +1682,16 @@ Every behavior below must first exist as a failing test, fail for the intended r
 | Capability | manifest updates between request and grant | stale request rejected |
 | Capability | grant signed for wrong chain or registry | rejected |
 | Capability | grant signed without user-verification flag | rejected |
+| Capability | assertion whose `authenticatorData[0:32]` is not the configured Vault RP-ID hash | rejected by the Mida wrapper |
+| Capability | assertion with high-s signature | rejected by `webauthn-sol`; FakeVault always emits low-s |
+| Capability | assertion with a foreign `clientDataJSON.origin` but correct RP-ID hash | accepted on-chain; documented v0 limitation, origin is enforced by the browser |
 | Capability | live session tries to overwrite registered P256 key | rejected |
 | Capability | P256 rotation lacks old-key assertion | rejected |
 | Capability | broaden response beyond request | completion rejected |
 | Capability | user narrows requested permissions | completion accepted |
+| Revocation | `revoke` called on an active READ capability | rejected; only `revokeAndRotate` may end READ |
+| Revocation | `revokeAgentAndRotate` with a missing, duplicate, or extra namespace rotation | rejected |
+| Revocation | `CapabilityRegistry` attempts to publish a key through `ContextRegistry` | no such function exists; keys live only in `CapabilityRegistry` |
 | Revocation | revoke one reader | capability immediately fails |
 | Revocation | write in old epoch after revoke | `EPOCH_STALE` or rotation required |
 | Revocation | object written after rotation | old reader cannot decrypt |
@@ -1754,9 +1777,23 @@ Success requires assertions at every denial and cryptographic boundary. Console 
 - Contracts use deterministic CREATE2 deployment where convenient, but SDK configuration pins addresses per network. Matching addresses across networks are not required.
 - Monad mainnet chain ID is `143`.
 - Monad testnet chain ID is `10143`; the default public RPC is `https://testnet-rpc.monad.xyz`. These values are pinned in checked-in network configuration and were verified from Monad’s official testnet documentation on 2026-09-14.
-- Monad’s P256 verifier is EIP-7951 at `0x0100`, accepts 160 bytes `(hash, r, s, qx, qy)`, returns 32-byte `1` on success, and costs 6,900 gas according to Monad’s official precompile documentation on 2026-09-14. EIP-7951 (unlike RIP-7212) rejects high-s malleable signatures, so the FakeVault must normalize `s` to low-s. Live-verified on both testnet and mainnet on 2026-09-14.
-- viem `2.56.5` ships `monadTestnet` (10143) and `monad` (143) in `viem/chains`; use them rather than hand-written chain objects.
-- Monad public RPC limits that affect the indexer/CLI: `eth_getLogs` is capped at 100 blocks per request; `eth_getTransactionByHash` returns `null` for mempool transactions; block time is 300 ms minimum / ~400 ms typical, finality 600–800 ms. Testnet state was reset from genesis on 2025-12-16; the chain ID did not change.
+- Monad’s P256 verifier is EIP-7951 at `0x0100`, accepts 160 bytes `(hash, r, s, qx, qy)`, returns 32-byte `1` on success, and costs 6,900 gas according to Monad’s official precompile documentation on 2026-09-14. EIP-7951 accepts any `0 < s < n`; low-s is enforced by `webauthn-sol`, not the precompile (Section 10.4). Live-verified on both testnet and mainnet on 2026-09-14.
+- viem ships `monadTestnet` (10143) and `monad` (143) in `viem/chains`; use them rather than hand-written chain objects.
+- Exact dependency pins (verified 2026-09-14; nothing younger than seven days is pinned):
+
+  ```text
+  @noble/curves   2.4.0
+  @noble/hashes   2.4.0
+  @noble/ciphers  2.4.0
+  ox              1.7.4
+  viem            2.56.3
+  canonicalize    4.0.0
+  webauthn-sol    v1.0.0 (619f20a)
+  Foundry         1.8.1 (built 2026-08-28; P256 precompile at 0x100 verified on this build)
+  ```
+
+  The execution plan must include an explicit pinned Foundry setup step (`foundryup --install 1.8.1`) so a fresh machine reproduces the same toolchain.
+- Monad public RPC behaviour that affects the indexer/CLI: the default public RPC caps `eth_getLogs` at 100 blocks per request. This limit is provider-specific, so the implementation always chunks log queries into windows of at most 100 blocks regardless of provider. `eth_getTransactionByHash` returns `null` for mempool transactions. Official timing: 300 ms minimum block frequency, 600 ms full finality, state execution generally under 800 ms; do not present execution latency as finality. Testnet state was reset from genesis on 2025-12-16; the chain ID did not change.
 - P256/WebAuthn verification still goes through the selected audited verifier abstraction rather than custom JSON parsing or curve code.
 - No secret, private key, PRF output, plaintext DEK, or plaintext context value may be committed to Git or logged.
 
