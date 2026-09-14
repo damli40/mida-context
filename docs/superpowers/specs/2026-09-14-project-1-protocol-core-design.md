@@ -354,7 +354,7 @@ Distribution of the new private epoch key is off-chain and follows the transacti
 
 ## 8. Cryptographic objects
 
-Project 1 uses `@noble/curves`, `@noble/hashes`, and `@noble/ciphers` (all 2.4.0 as of 2026-09-14). It does not implement cryptographic primitives. Pinned import paths for v2: `x25519` from `@noble/curves/ed25519.js`, `p256` from `@noble/curves/p256.js`, `xchacha20poly1305` from `@noble/ciphers/chacha.js`, `hkdf` from `@noble/hashes/hkdf.js`, `sha256` from `@noble/hashes/sha2.js`. `@noble/curves` x25519 already throws on low-order public keys and on an all-zero shared point; Mida keeps its own explicit all-zero check as defense in depth. RFC 8785 canonicalization uses the `canonicalize` package (4.0.0). Software WebAuthn assertions for FakeVault are produced with `ox` 1.7.4 (`WebAuthnP256.sign` / `WebAuthnP256.verify`); viem has no `signWebAuthn` export. Exact pins are listed in Section 17; a release younger than seven days is not pinned.
+Project 1 uses `@noble/curves`, `@noble/hashes`, and `@noble/ciphers` (all 2.4.0 as of 2026-09-14). It does not implement cryptographic primitives. Pinned import paths for v2: `x25519` from `@noble/curves/ed25519.js`, `p256` from `@noble/curves/p256.js`, `xchacha20poly1305` from `@noble/ciphers/chacha.js`, `hkdf` from `@noble/hashes/hkdf.js`, `sha256` from `@noble/hashes/sha2.js`. `@noble/curves` x25519 already throws on low-order public keys and on an all-zero shared point; Mida keeps its own explicit all-zero check as defense in depth. RFC 8785 canonicalization uses the `canonicalize` package (4.0.0). FakeVault constructs WebAuthn-shaped metadata and the exact authenticator signing digest with `ox` 1.7.4 `WebAuthnP256.getSignPayload`, signs that digest with its software `@noble/curves` P256 private key, normalizes `s` to low-s, and checks parity with `WebAuthnP256.verify`; `WebAuthnP256.sign` is reserved for real browser credentials and viem has no `signWebAuthn` export. Exact pins are listed in Section 17; a release younger than seven days is not pinned.
 
 Canonical JSON wire objects encode `uint64` and `bigint` values as base-10 strings with no sign or leading zero, except the value `"0"`. Runtime APIs may expose `bigint`, but conversion to and from the canonical wire representation happens only in `@mida/protocol`. Fixed-size hexadecimal values are lowercase, `0x`-prefixed, and exactly the declared byte length.
 
@@ -710,7 +710,7 @@ browser/authenticator enforces the sole Vault RP ID and origin at assertion time
 
 `clientDataJSON.origin` is not independently checked on-chain in v0. The contract binds the RP-ID hash; the origin binding rests on the browser refusing to produce an assertion for that RP ID from any other origin. This is a documented v0 limitation, not an oversight, and Project 2's Vault hardening must not weaken it.
 
-Low-s: EIP-7951 accepts any `0 < s < n` and its security section says applications needing non-malleability must add the check themselves. `webauthn-sol` adds it by rejecting `s > n/2`. The FakeVault normalizes `s` to low-s because the selected library requires it, not because the precompile does.
+Low-s: EIP-7951 accepts any `0 < s < n` and its security section says applications needing non-malleability must add the check themselves. `webauthn-sol` adds it by rejecting `s > n/2`. Every Mida assertion adapter normalizes `s` to low-s before contract submission because the selected library requires it, not because the precompile does. This includes both FakeVault in Project 1 and real authenticator assertions in Project 2; normalizing only the fake path would make valid high-s passkey assertions fail intermittently.
 
 Three verification paths are exercised with the same FakeVault assertion payload:
 
@@ -1683,7 +1683,7 @@ Every behavior below must first exist as a failing test, fail for the intended r
 | Capability | grant signed for wrong chain or registry | rejected |
 | Capability | grant signed without user-verification flag | rejected |
 | Capability | assertion whose `authenticatorData[0:32]` is not the configured Vault RP-ID hash | rejected by the Mida wrapper |
-| Capability | assertion with high-s signature | rejected by `webauthn-sol`; FakeVault always emits low-s |
+| Capability | assertion with high-s signature | rejected by `webauthn-sol`; shared assertion adapter normalizes FakeVault and real WebAuthn signatures to low-s |
 | Capability | assertion with a foreign `clientDataJSON.origin` but correct RP-ID hash | accepted on-chain; documented v0 limitation, origin is enforced by the browser |
 | Capability | live session tries to overwrite registered P256 key | rejected |
 | Capability | P256 rotation lacks old-key assertion | rejected |
