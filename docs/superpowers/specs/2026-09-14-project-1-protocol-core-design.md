@@ -88,7 +88,9 @@ Sources verified 2026-09-14:
 
 ### 4.1 Owner
 
-The owner is the Mera-derived delegated account address. Every owner contract operation must enter from execution by that account, so the registries observe `msg.sender == owner`. Gas sponsorship alone does not establish owner identity; a relayer calling a registry directly is the relayer and is rejected.
+The owner is the Mera-derived account address. Per Monad's Mera docs (verified 2026-09-14, `https://docs.monad.xyz/guides/mera`), Mera accounts are plain EOAs ("regular EOAs. There is nothing to deploy"), not EIP-7702 delegated accounts, and the SDK is `@category-labs/mera`. Every owner contract operation must enter from execution by that account, so the registries observe `msg.sender == owner`. Gas sponsorship alone does not establish owner identity; a relayer calling a registry directly is the relayer and is rejected.
+
+Because the owner is a plain EOA, any "atomic owner-account batch" in this document (revoke + advance epoch + publish next key) must be a single contract entry point that performs all steps, not a wallet-level batched transaction. Project 1 exposes `revokeAndRotate(...)` on `CapabilityRegistry` that internally calls `ContextRegistry.setNamespaceEpochKey` (or an equivalent single-call path); EIP-7702 batching is not assumed. The owner EOA needs testnet MON from `https://faucet.monad.xyz` for gas.
 
 ### 4.2 Vault
 
@@ -352,7 +354,7 @@ Distribution of the new private epoch key is off-chain and follows the transacti
 
 ## 8. Cryptographic objects
 
-Project 1 uses `@noble/curves`, `@noble/hashes`, and `@noble/ciphers`. It does not implement cryptographic primitives.
+Project 1 uses `@noble/curves`, `@noble/hashes`, and `@noble/ciphers` (all 2.4.0 as of 2026-09-14). It does not implement cryptographic primitives. Pinned import paths for v2: `x25519` from `@noble/curves/ed25519.js`, `p256` from `@noble/curves/p256.js`, `xchacha20poly1305` from `@noble/ciphers/chacha.js`, `hkdf` from `@noble/hashes/hkdf.js`, `sha256` from `@noble/hashes/sha2.js`. `@noble/curves` x25519 already throws on low-order public keys and on an all-zero shared point; Mida keeps its own explicit all-zero check as defense in depth. RFC 8785 canonicalization uses the `canonicalize` package (5.0.0). Software WebAuthn assertions for FakeVault are produced with `ox` (`WebAuthnP256.sign` / `WebAuthnP256.verify`); viem has no `signWebAuthn` export.
 
 Canonical JSON wire objects encode `uint64` and `bigint` values as base-10 strings with no sign or leading zero, except the value `"0"`. Runtime APIs may expose `bigint`, but conversion to and from the canonical wire representation happens only in `@mida/protocol`. Fixed-size hexadecimal values are lowercase, `0x`-prefixed, and exactly the declared byte length.
 
@@ -696,7 +698,15 @@ A grant succeeds only if:
 
 A zero authenticator signature counter is accepted because synced passkeys may not provide a useful monotonic counter. The contract does not treat the counter as replay protection; `grantNonce` provides replay protection.
 
-Project 1 uses `webauthn-sol`: default Anvil proves its Solidity fallback; a pinned Foundry release running Anvil with Odyssey mode proves the local P256 precompile path; Monad testnet proves Monad’s native P256 path. The same FakeVault assertion payload is used for all paths. If the pinned Anvil release cannot expose the native path, Project 1 is blocked until the tool version is corrected rather than silently treating fallback coverage as native coverage.
+Project 1 uses `webauthn-sol` (`forge install base/webauthn-sol`; it is a Foundry dependency, not an npm package). Its `verify(...)` takes a caller-supplied `requireUserVerification` bool that defaults to nothing; Mida always passes `true`. Verified 2026-09-14 from `src/WebAuthn.sol`: it calls the precompile at `address(0x100)`, requires non-empty return data decoding to `1` (EIP-7951-compatible), and falls back to FreshCryptoLib otherwise.
+
+Three verification paths are exercised with the same FakeVault assertion payload:
+
+- Anvil with `--hardfork` set to a pre-Osaka fork (for example `prague`) proves the Solidity fallback.
+- Anvil at its default hardfork (Osaka, current Foundry ≥ 1.7.0) exposes P256VERIFY at `0x100` natively and proves the local precompile path. The earlier `--odyssey` flag no longer exists in current Foundry and must not be referenced.
+- Monad testnet proves Monad’s native path. Confirmed live on 2026-09-14: an `eth_call` to `0x0100` with a valid 160-byte `(hash, r, s, qx, qy)` returned `0x…01` on both testnet (chain 10143) and mainnet (chain 143); a tampered `qy` returned empty data.
+
+If a local Anvil build cannot expose the native path, Project 1 is blocked until the tool version is corrected rather than silently treating fallback coverage as native coverage.
 
 ### 10.5 Authorization
 
@@ -1744,7 +1754,9 @@ Success requires assertions at every denial and cryptographic boundary. Console 
 - Contracts use deterministic CREATE2 deployment where convenient, but SDK configuration pins addresses per network. Matching addresses across networks are not required.
 - Monad mainnet chain ID is `143`.
 - Monad testnet chain ID is `10143`; the default public RPC is `https://testnet-rpc.monad.xyz`. These values are pinned in checked-in network configuration and were verified from Monad’s official testnet documentation on 2026-09-14.
-- Monad’s P256 verifier is EIP-7951 at `0x0100`, accepts 160 bytes `(hash, r, s, qx, qy)`, returns 32-byte `1` on success, and costs 6,900 gas according to Monad’s official precompile documentation on 2026-09-14.
+- Monad’s P256 verifier is EIP-7951 at `0x0100`, accepts 160 bytes `(hash, r, s, qx, qy)`, returns 32-byte `1` on success, and costs 6,900 gas according to Monad’s official precompile documentation on 2026-09-14. EIP-7951 (unlike RIP-7212) rejects high-s malleable signatures, so the FakeVault must normalize `s` to low-s. Live-verified on both testnet and mainnet on 2026-09-14.
+- viem `2.56.5` ships `monadTestnet` (10143) and `monad` (143) in `viem/chains`; use them rather than hand-written chain objects.
+- Monad public RPC limits that affect the indexer/CLI: `eth_getLogs` is capped at 100 blocks per request; `eth_getTransactionByHash` returns `null` for mempool transactions; block time is 300 ms minimum / ~400 ms typical, finality 600–800 ms. Testnet state was reset from genesis on 2025-12-16; the chain ID did not change.
 - P256/WebAuthn verification still goes through the selected audited verifier abstraction rather than custom JSON parsing or curve code.
 - No secret, private key, PRF output, plaintext DEK, or plaintext context value may be committed to Git or logged.
 
