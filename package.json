@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "@mida/crypto": "workspace:*",
-    "@mida/protocol": "workspace:*"
+    "@mida/protocol": "workspace:*",
+    "@mida/storage": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "22.20.1",

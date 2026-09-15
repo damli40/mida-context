@@ -172,6 +172,9 @@ importers:
       '@mida/protocol':
         specifier: workspace:*
         version: link:packages/protocol
+      '@mida/storage':
+        specifier: workspace:*
+        version: link:packages/storage
     devDependencies:
       '@types/node':
         specifier: 22.20.1
@@ -215,6 +218,15 @@ importers:
       viem:
         specifier: 2.56.3
         version: 2.56.3(typescript@5.9.3)
+
+  packages/storage:
+    dependencies:
+      '@mida/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@noble/hashes':
+        specifier: 2.4.0
+        version: 2.4.0
 
 packages:
 
