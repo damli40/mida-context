@@ -2,7 +2,7 @@ import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex } from "@noble/hashes/utils.js"
 import { describe, expect, it } from "vitest"
 import { NAMESPACE_TREE_V1, canonicalBytes, isMidaError, namespaceId } from "@mida/protocol"
-import type { AgentCapabilityManifestBody, MidaErrorCode, ScopeDeclaration, SignedAgentCapabilityManifest } from "@mida/protocol"
+import type { AgentCapabilityManifestBody, Hex, MidaErrorCode, ScopeDeclaration, SignedAgentCapabilityManifest } from "@mida/protocol"
 import { keccak256, verifyTypedData } from "viem"
 import {
   MANIFEST_LIMITS,
@@ -215,6 +215,30 @@ describe("stored envelope bytes (§14.1 GET /agent-manifests/:bodyHash)", () => 
       })
     expect(failsWith("INVALID_WIRE", attempt)).toBe(true)
   })
+
+  it("rejects an envelope stored with decomposed Unicode", async () => {
+    const body = manifestBody({ name: "Cafe\u0301" })
+    const envelope = await signManifest(body)
+    const decomposedBytes = canonicalBytes({ manifest: body, operatorSignature: envelope.operatorSignature })
+    const attempt = () =>
+      parseManifestEnvelopeBytes({
+        bytes: decomposedBytes,
+        expectedEnvelopeHash: `0x${bytesToHex(sha256(decomposedBytes))}`,
+        expectedBodyHash: manifestBodyHash(body),
+      })
+    expect(failsWith("INVALID_WIRE", attempt)).toBe(true)
+  })
+
+  it("keeps envelopeHash identical to the stored bytes for an accepted parse", async () => {
+    const envelope = await signManifest(manifestBody({ name: "Caf\u00e9" }))
+    const bytes = manifestEnvelopeBytes(envelope)
+    const parsed = parseManifestEnvelopeBytes({
+      bytes,
+      expectedEnvelopeHash: manifestEnvelopeHash(envelope),
+      expectedBodyHash: manifestBodyHash(envelope.manifest),
+    })
+    expect(manifestEnvelopeHash(parsed)).toBe(`0x${bytesToHex(sha256(bytes))}`)
+  })
 })
 
 describe("synchronous signature recovery", () => {
@@ -232,5 +256,24 @@ describe("synchronous signature recovery", () => {
     expect(failsWith("REQUEST_SIGNATURE_INVALID", () => assertAccessRequestSignature(request, stranger.address))).toBe(true)
     const broadened = { ...request, scopes: [{ namespaceId: namespaceId("goals.career"), permissions: 3, provenancePolicy: 0 }] }
     expect(failsWith("REQUEST_SIGNATURE_INVALID", () => assertAccessRequestSignature(broadened, signer.address))).toBe(true)
+  })
+
+  it("rejects malleable signature encodings", async () => {
+    const binding = manifestBindingFor({ chainId: CHAIN_ID, capabilityRegistry: REGISTRY, body: manifestBody() })
+    const signature = await operator.signTypedData(binding)
+    const secp256k1N = BigInt("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141")
+    const r = signature.slice(2, 66)
+    const s = BigInt(`0x${signature.slice(66, 130)}`)
+    const v = parseInt(signature.slice(130, 132), 16)
+    const variants = [
+      `0x${r}${(secp256k1N - s).toString(16).padStart(64, "0")}${v === 27 ? "1c" : "1b"}`,
+      `0x${r}${signature.slice(66, 130)}0${v - 27}`,
+      `0x${signature.slice(2).toUpperCase()}`,
+      signature.slice(0, 130),
+    ] as Hex[]
+    for (const variant of variants) {
+      expect(recoverTypedDataSigner(binding, variant)).toBeNull()
+    }
+    expect(recoverTypedDataSigner(binding, signature)?.toLowerCase()).toBe(operator.address.toLowerCase())
   })
 })

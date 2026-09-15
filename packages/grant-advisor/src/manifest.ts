@@ -184,11 +184,11 @@ export function parseManifestEnvelopeBytes(input: { bytes: Uint8Array; expectedE
   }
   const envelope = exactKeys(parsed, ["manifest", "operatorSignature"], [], "envelope")
   if (typeof envelope.operatorSignature !== "string" || !isPlainObject(envelope.manifest)) wire("envelope shape")
-  const canonical = canonicalBytes(parsed)
+  const signed = parsed as SignedAgentCapabilityManifest
+  const canonical = manifestEnvelopeBytes(signed)
   if (canonical.length !== input.bytes.length || canonical.some((byte, index) => byte !== input.bytes[index])) {
     wire("envelope bytes are not RFC 8785 canonical")
   }
-  const signed = parsed as SignedAgentCapabilityManifest
   if (manifestBodyHash(signed.manifest) !== input.expectedBodyHash.toLowerCase()) {
     throw new MidaError("MANIFEST_HASH_MISMATCH", "envelope body does not hash to the requested body hash")
   }
