@@ -80,6 +80,14 @@ describe("payload encoding", () => {
     expect(failsWith("INVALID_WIRE", () => decodePayload(new TextEncoder().encode("not json")))).toBe(true)
     expect(failsWith("INVALID_WIRE", () => decodePayload(new Uint8Array([0xff, 0xfe])))).toBe(true)
   })
+
+  it("rejects a leading UTF-8 byte-order mark", () => {
+    const body = encodePayload(payload)
+    const bytes = new Uint8Array(3 + body.length)
+    bytes.set([0xef, 0xbb, 0xbf])
+    bytes.set(body, 3)
+    expect(failsWith("INVALID_WIRE", () => decodePayload(bytes))).toBe(true)
+  })
 })
 
 describe("payload encryption (§8.2)", () => {
