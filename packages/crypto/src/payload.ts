@@ -1,6 +1,6 @@
 import { randomBytes } from "@noble/hashes/utils.js"
-import { encodeAbiParameters, hexToBytes } from "viem"
-import { CRYPTO_VERSION, MAX_PAYLOAD_BYTES, MidaError, canonicalBytes, canonicalJson } from "@mida/protocol"
+import { encodeAbiParameters, hexToBytes, isAddress } from "viem"
+import { CRYPTO_VERSION, MAX_PAYLOAD_BYTES, MidaError, canonicalBytes, canonicalJson, encodeUint64 } from "@mida/protocol"
 import type { Address, ContextPayload, Hex } from "@mida/protocol"
 import { KEY_BYTES, NONCE_BYTES, open, seal } from "./aead.js"
 
@@ -24,6 +24,14 @@ const OBJECT_AAD_TYPES = [
 ] as const
 
 function objectAad(tag: string, binding: ObjectBinding): Uint8Array {
+  encodeUint64(binding.readEpoch)
+  if (typeof binding.chainId !== "bigint" || binding.chainId < 0n) {
+    throw new MidaError("INVALID_WIRE", "chainId must be a non-negative bigint")
+  }
+  encodeUint64(binding.chainId)
+  if (!isAddress(binding.contextRegistry)) {
+    throw new MidaError("INVALID_WIRE", "contextRegistry must be an address")
+  }
   return hexToBytes(
     encodeAbiParameters(OBJECT_AAD_TYPES, [
       tag,

@@ -1,11 +1,11 @@
 import { hkdf } from "@noble/hashes/hkdf.js"
 import { sha256 } from "@noble/hashes/sha2.js"
 import { randomBytes, utf8ToBytes } from "@noble/hashes/utils.js"
-import { encodeAbiParameters, hexToBytes } from "viem"
+import { encodeAbiParameters, hexToBytes, isAddress } from "viem"
 import { CRYPTO_VERSION, MidaError, decodeUint64, encodeUint64 } from "@mida/protocol"
 import type { Address, EpochDEKWrap, Hex, ReaderEpochWrap } from "@mida/protocol"
 import { KEY_BYTES, NONCE_BYTES, TAG_BYTES, open, seal } from "./aead.js"
-import { bytesOf, hexOf } from "./bytes.js"
+import { assertNonZeroKey, bytesOf, hexOf } from "./bytes.js"
 import { generateX25519KeyPair, x25519SharedSecret } from "./derive.js"
 import { epochDekWrapAad } from "./payload.js"
 import type { ObjectBinding } from "./payload.js"
@@ -20,6 +20,7 @@ function kek(sharedSecret: Uint8Array, salt: Hex, info: Uint8Array): Uint8Array 
 
 /** §8.3: wrap an object DEK to the namespace epoch public key. */
 export function wrapDekToEpoch(input: { dek: Uint8Array; epochPublicKey: Uint8Array; binding: ObjectBinding }): EpochDEKWrap {
+  assertNonZeroKey(input.dek, "object DEK")
   const ephemeral = generateX25519KeyPair()
   const shared = x25519SharedSecret(ephemeral.privateKey, input.epochPublicKey)
   const nonce = randomBytes(NONCE_BYTES)
@@ -66,6 +67,17 @@ export interface ReaderBinding {
 }
 
 export function readerEpochWrapAad(binding: ReaderBinding): Uint8Array {
+  encodeUint64(binding.readEpoch)
+  if (typeof binding.chainId !== "bigint" || binding.chainId < 0n) {
+    throw new MidaError("INVALID_WIRE", "chainId must be a non-negative bigint")
+  }
+  encodeUint64(binding.chainId)
+  if (!isAddress(binding.capabilityRegistry) || !isAddress(binding.owner)) {
+    throw new MidaError("INVALID_WIRE", "capabilityRegistry and owner must be addresses")
+  }
+  if (!Number.isInteger(binding.agentKeyVersion) || binding.agentKeyVersion < 0 || binding.agentKeyVersion > 0xffffffff) {
+    throw new MidaError("INVALID_WIRE", "agentKeyVersion must be a uint32")
+  }
   return hexToBytes(
     encodeAbiParameters(
       [
@@ -101,6 +113,7 @@ export function wrapEpochPrivateKeyToAgent(input: {
   binding: ReaderBinding
   createdAt: bigint
 }): ReaderEpochWrap {
+  assertNonZeroKey(input.epochPrivateKey, "epoch private key")
   const ephemeral = generateX25519KeyPair()
   const shared = x25519SharedSecret(ephemeral.privateKey, input.agentEncryptionPublicKey)
   const nonce = randomBytes(NONCE_BYTES)
@@ -112,7 +125,7 @@ export function wrapEpochPrivateKeyToAgent(input: {
   )
   return {
     v: 1,
-    owner: input.binding.owner,
+    owner: input.binding.owner.toLowerCase() as Address,
     namespaceId: input.binding.namespaceId,
     readEpoch: encodeUint64(input.binding.readEpoch),
     agentId: input.binding.agentId,

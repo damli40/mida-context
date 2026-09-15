@@ -1,7 +1,7 @@
 import fc from "fast-check"
 import { describe, expect, it } from "vitest"
 import { encodeAbiParameters, toHex } from "viem"
-import type { Hex } from "viem"
+import type { Address, Hex } from "viem"
 import { isMidaError, namespaceId } from "@mida/protocol"
 import type { ContextPayload } from "@mida/protocol"
 import { decodePayload, decryptPayload, encodePayload, encryptPayload, epochDekWrapAad, hexOf, payloadAad } from "@mida/crypto"
@@ -59,6 +59,14 @@ describe("payload AAD layout (§8.2, plan decision 2)", () => {
     const values = (tag: string) => [tag, binding.chainId, binding.contextRegistry, binding.contextId, binding.namespaceId, binding.readEpoch, "mida-crypto-v1"] as const
     expect(hexOf(epochDekWrapAad(binding))).toBe(encodeAbiParameters(types, values("MIDA_EPOCH_DEK_WRAP_V1")))
     expect(hexOf(payloadAad(binding))).not.toBe(hexOf(epochDekWrapAad(binding)))
+  })
+
+  it("rejects out-of-range numbers and malformed addresses with INVALID_WIRE, not a raw encoder error", () => {
+    for (const readEpoch of [2n ** 64n, -1n]) {
+      expect(failsWith("INVALID_WIRE", () => payloadAad({ ...binding, readEpoch }))).toBe(true)
+    }
+    expect(failsWith("INVALID_WIRE", () => payloadAad({ ...binding, chainId: -1n }))).toBe(true)
+    expect(failsWith("INVALID_WIRE", () => payloadAad({ ...binding, contextRegistry: "0x1234" as Address }))).toBe(true)
   })
 })
 

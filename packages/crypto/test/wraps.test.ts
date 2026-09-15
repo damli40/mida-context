@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
-import { encodeAbiParameters } from "viem"
-import type { Hex } from "viem"
+import { encodeAbiParameters, getAddress } from "viem"
+import type { Address, Hex } from "viem"
 import { isMidaError, namespaceId } from "@mida/protocol"
 import {
   deriveEpochKeyPair,
@@ -130,5 +130,40 @@ describe("reader epoch wrap (§8.4)", () => {
     for (const variant of variants) {
       expect(failsWith("DECRYPT_FAILED", () => unwrapEpochPrivateKey({ wrap, agentEncryptionPrivateKey: agentA.privateKey, binding: variant }))).toBe(true)
     }
+  })
+})
+
+describe("wrap input validation", () => {
+  it("rejects keys that are not 32 non-zero bytes", () => {
+    expect(failsWith("ZERO_KEY", () => wrapDekToEpoch({ dek: new Uint8Array(16), epochPublicKey: epoch1.publicKey, binding: objectBinding }))).toBe(true)
+    expect(failsWith("ZERO_KEY", () => wrapDekToEpoch({ dek: new Uint8Array(32), epochPublicKey: epoch1.publicKey, binding: objectBinding }))).toBe(true)
+    expect(failsWith("ZERO_KEY", () => wrapEpochPrivateKeyToAgent({ epochPrivateKey: new Uint8Array(64), agentEncryptionPublicKey: agentA.publicKey, binding: readerBinding, createdAt: 1n }))).toBe(true)
+  })
+
+  it("rejects out-of-range binding numbers with INVALID_WIRE, not a raw encoder error", () => {
+    for (const readEpoch of [2n ** 64n, -1n]) {
+      expect(failsWith("INVALID_WIRE", () => wrapDekToEpoch({ dek, epochPublicKey: epoch1.publicKey, binding: { ...objectBinding, readEpoch } }))).toBe(true)
+      expect(failsWith("INVALID_WIRE", () => readerEpochWrapAad({ ...readerBinding, readEpoch }))).toBe(true)
+    }
+    expect(failsWith("INVALID_WIRE", () => wrapDekToEpoch({ dek, epochPublicKey: epoch1.publicKey, binding: { ...objectBinding, chainId: -1n } }))).toBe(true)
+    expect(failsWith("INVALID_WIRE", () => readerEpochWrapAad({ ...readerBinding, chainId: -1n }))).toBe(true)
+    for (const agentKeyVersion of [2 ** 32, -1, 1.5, Number.NaN]) {
+      expect(failsWith("INVALID_WIRE", () => readerEpochWrapAad({ ...readerBinding, agentKeyVersion }))).toBe(true)
+    }
+  })
+
+  it("rejects malformed addresses with INVALID_WIRE", () => {
+    expect(failsWith("INVALID_WIRE", () => readerEpochWrapAad({ ...readerBinding, owner: "0x2222" as Address }))).toBe(true)
+    expect(failsWith("INVALID_WIRE", () => readerEpochWrapAad({ ...readerBinding, capabilityRegistry: "0xgggggggggggggggggggggggggggggggggggggggg" as Address }))).toBe(true)
+  })
+
+  it("lowercases a checksummed owner on the wire and still unwraps", () => {
+    const mixedOwner = getAddress("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd")
+    const mixed: ReaderBinding = { ...readerBinding, owner: mixedOwner }
+    const wrap = wrapEpochPrivateKeyToAgent({ epochPrivateKey: epoch1.privateKey, agentEncryptionPublicKey: agentA.publicKey, binding: mixed, createdAt: 1n })
+    expect(wrap.owner).not.toBe(mixedOwner)
+    expect(wrap.owner).toBe(mixedOwner.toLowerCase())
+    const recovered = unwrapEpochPrivateKey({ wrap, agentEncryptionPrivateKey: agentA.privateKey, binding: mixed })
+    expect(hexOf(recovered)).toBe(hexOf(epoch1.privateKey))
   })
 })
