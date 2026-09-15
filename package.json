@@ -10,6 +10,7 @@
     "test:contracts": "cd contracts && forge test"
   },
   "dependencies": {
+    "@mida/crypto": "workspace:*",
     "@mida/protocol": "workspace:*"
   },
   "devDependencies": {
