@@ -1,0 +1,13 @@
+{
+  "name": "@mida/grant-advisor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@mida/protocol": "workspace:*",
+    "@noble/hashes": "2.4.0",
+    "ox": "1.7.4",
+    "viem": "2.56.3"
+  }
+}
