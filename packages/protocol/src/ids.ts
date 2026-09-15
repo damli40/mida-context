@@ -77,10 +77,20 @@ export function assertCanonicalScopes(scopes: readonly RequestedScope[]): void {
       throw new MidaError("INVALID_WIRE", "scopes must be strictly ascending by namespaceId")
     }
     const { permissions, provenancePolicy } = scope
-    if (!Number.isInteger(permissions) || permissions <= 0 || (permissions & ~KNOWN_PERMISSION_BITS) !== 0) {
+    if (
+      !Number.isInteger(permissions) ||
+      permissions <= 0 ||
+      permissions > KNOWN_PERMISSION_BITS ||
+      (permissions & ~KNOWN_PERMISSION_BITS) !== 0
+    ) {
       throw new MidaError("INVALID_WIRE", "permissions must be non-zero known bits")
     }
-    if (!Number.isInteger(provenancePolicy) || provenancePolicy < 0 || (provenancePolicy & ~KNOWN_PROVENANCE_BITS) !== 0) {
+    if (
+      !Number.isInteger(provenancePolicy) ||
+      provenancePolicy < 0 ||
+      provenancePolicy > KNOWN_PROVENANCE_BITS ||
+      (provenancePolicy & ~KNOWN_PROVENANCE_BITS) !== 0
+    ) {
       throw new MidaError("INVALID_WIRE", "provenancePolicy must be known bits")
     }
     previous = scope.namespaceId

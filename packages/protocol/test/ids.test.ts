@@ -97,6 +97,8 @@ describe("scopes, capabilities and grant digest (§10.4)", () => {
     expect(failsWith("INVALID_WIRE", () => assertCanonicalScopes([{ namespaceId: career, permissions: 0, provenancePolicy: 0 }]))).toBe(true)
     expect(failsWith("INVALID_WIRE", () => assertCanonicalScopes([{ namespaceId: career, permissions: 16, provenancePolicy: 0 }]))).toBe(true)
     expect(failsWith("INVALID_WIRE", () => assertCanonicalScopes([{ namespaceId: career, permissions: 1, provenancePolicy: 8 }]))).toBe(true)
+    expect(failsWith("INVALID_WIRE", () => assertCanonicalScopes([{ namespaceId: career, permissions: 2 ** 32 + 1, provenancePolicy: 0 }]))).toBe(true)
+    expect(failsWith("INVALID_WIRE", () => assertCanonicalScopes([{ namespaceId: career, permissions: 1, provenancePolicy: 2 ** 32 }]))).toBe(true)
   })
 
   it("scopesHash encodes a dynamic array of (bytes32, uint8, uint8)", () => {
