@@ -1,0 +1,14 @@
+{
+  "lib/forge-std": {
+    "tag": {
+      "name": "v1.16.2",
+      "rev": "bf647bd6046f2f7da30d0c2bf435e5c76a780c1b"
+    }
+  },
+  "lib/webauthn-sol": {
+    "tag": {
+      "name": "v1.0.0",
+      "rev": "619f20ab0f074fef41066ee4ab24849a913263b2"
+    }
+  }
+}

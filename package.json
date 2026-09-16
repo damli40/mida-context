@@ -7,7 +7,9 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json",
-    "test:contracts": "cd contracts && forge test"
+    "test:contracts": "cd contracts && forge test",
+    "vectors:ids": "tsx packages/protocol/scripts/export-vectors.ts",
+    "contracts:policy-hash": "node contracts/script/gen-policy-hash.mjs"
   },
   "dependencies": {
     "@mida/crypto": "workspace:*",

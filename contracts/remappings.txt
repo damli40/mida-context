@@ -1,0 +1,5 @@
+webauthn-sol/=lib/webauthn-sol/src/
+FreshCryptoLib/=lib/webauthn-sol/lib/FreshCryptoLib/solidity/src/
+openzeppelin-contracts/=lib/webauthn-sol/lib/openzeppelin-contracts/
+solady/=lib/webauthn-sol/lib/solady/src/
+forge-std/=lib/forge-std/src/
