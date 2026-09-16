@@ -16,6 +16,7 @@
   "dependencies": {
     "@mida/chain": "workspace:*",
     "@mida/crypto": "workspace:*",
+    "@mida/fake-vault": "workspace:*",
     "@mida/grant-advisor": "workspace:*",
     "@mida/protocol": "workspace:*",
     "@mida/storage": "workspace:*"

@@ -175,6 +175,9 @@ importers:
       '@mida/crypto':
         specifier: workspace:*
         version: link:packages/crypto
+      '@mida/fake-vault':
+        specifier: workspace:*
+        version: link:packages/fake-vault
       '@mida/grant-advisor':
         specifier: workspace:*
         version: link:packages/grant-advisor
@@ -224,6 +227,33 @@ importers:
       '@noble/hashes':
         specifier: 2.4.0
         version: 2.4.0
+      viem:
+        specifier: 2.56.3
+        version: 2.56.3(typescript@5.9.3)(zod@4.5.4)
+
+  packages/fake-vault:
+    dependencies:
+      '@mida/chain':
+        specifier: workspace:*
+        version: link:../chain
+      '@mida/crypto':
+        specifier: workspace:*
+        version: link:../crypto
+      '@mida/grant-advisor':
+        specifier: workspace:*
+        version: link:../grant-advisor
+      '@mida/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@noble/curves':
+        specifier: 2.4.0
+        version: 2.4.0
+      '@noble/hashes':
+        specifier: 2.4.0
+        version: 2.4.0
+      ox:
+        specifier: 1.7.4
+        version: 1.7.4(typescript@5.9.3)
       viem:
         specifier: 2.56.3
         version: 2.56.3(typescript@5.9.3)(zod@4.5.4)

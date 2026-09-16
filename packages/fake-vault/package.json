@@ -1,0 +1,19 @@
+{
+  "name": "@mida/fake-vault",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@mida/chain": "workspace:*",
+    "@mida/crypto": "workspace:*",
+    "@mida/grant-advisor": "workspace:*",
+    "@mida/protocol": "workspace:*",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "ox": "1.7.4",
+    "viem": "2.56.3"
+  }
+}
