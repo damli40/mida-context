@@ -80,6 +80,11 @@ export class RegistryReader {
     return this.#capability("agentEpoch", [owner, agentId])
   }
 
+  /** Capability IDs ever granted by this owner to this agent; revoked/expired entries linger until a grant compacts the list. */
+  activeCapabilityIds(owner: Address, agentId: Hex): Promise<readonly Hex[]> {
+    return this.#capability("activeCapabilityIds", [owner, agentId])
+  }
+
   hasAuthority(owner: Address, agentId: Hex, namespaceId: Hex, permissions: number, provenanceBits: number): Promise<boolean> {
     return this.#capability("hasAuthority", [owner, agentId, namespaceId, permissions, provenanceBits])
   }

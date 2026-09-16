@@ -86,8 +86,13 @@ export function createContextApi(options: ContextApiOptions) {
     } else if (request.agentId !== undefined) {
       const agentId = bytes32(request.agentId, "agentId")
       if ((await reader.getAgent(agentId)) === null) throw new MidaError("NOT_FOUND", "agent not found")
-      target = { kind: "agent", agentId }
+      // Same ownership rule as the capability path: a relationship must exist (a grant ever recorded, or a prior
+      // revocation bumping the owner-agent epoch) before a stranger may pin a deny onto someone else's agent.
       agentEpochAtIntent = await reader.agentEpoch(owner, agentId)
+      if ((await reader.activeCapabilityIds(owner, agentId)).length === 0 && agentEpochAtIntent === 0n) {
+        throw new MidaError("CAPABILITY_DENIED", "signer has no capability relationship with this agent")
+      }
+      target = { kind: "agent", agentId }
     } else {
       throw new MidaError("INVALID_WIRE", "revocation needs capabilityId or agentId")
     }

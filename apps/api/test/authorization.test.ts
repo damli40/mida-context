@@ -34,6 +34,8 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
   let agentN: ProvisionedAgent
   let capabilityA: Hex
   let capabilityE: Hex
+  /** Wall-clock override for the API's request/cancellation freshness checks; undefined means real time. */
+  let apiNow: bigint | undefined
 
   const authorize = (agent: ProvisionedAgent, capabilityId: Hex | undefined, extra: { namespaceId?: Hex; permission?: number; agentKeyVersion?: number } = {}) =>
     authorizeAgent({
@@ -57,7 +59,12 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     deployment = await deployLocal({ rpcUrl: node.rpcUrl })
     owner = createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[1]!) })
     reader = new RegistryReader(owner)
-    const api = createContextApi({ reader, deployment, dataDir: mkdtempSync(join(tmpdir(), "mida-authz-")) })
+    const api = createContextApi({
+      reader,
+      deployment,
+      dataDir: mkdtempSync(join(tmpdir(), "mida-authz-")),
+      clock: () => apiNow ?? BigInt(Math.floor(Date.now() / 1000)),
+    })
     overlay = api.overlay
     const clientFor = (account: LocalAccount) =>
       new ContextApiClient({
@@ -173,24 +180,32 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     expect(await reader.hasAuthority(vault.owner, agentA.agentId, CAREER, PERMISSION.READ, 0)).toBe(true)
 
     // A session signature alone cannot cancel; nor can another passkey or an over-long validity.
+    // The API clock is pinned so the five-minute lifetime check sees exactly `now`, never a rolled-over second.
     const now = BigInt(Math.floor(Date.now() / 1000))
-    const cancel = (body: unknown) => ownerClient.request<{ state: string }>("POST", `/revocations/${intent.intentId}/cancel`, { body })
-    await expect(cancel({})).rejects.toMatchObject({ code: "AUTH_INVALID" })
-    const otherVault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: `0x${"4e".repeat(32)}`, chain: owner, api: { putObject: async () => undefined, publishEpochWrap: async () => undefined, requestRevocationDeny: async () => ({ intentId: intent.intentId }) } })
-    const nonce = BigInt(intent.cancellationNonce)
-    const wrongKey = otherVault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: nonce, expiresAt: now + 120n })
-    await expect(cancel({ expiresAt: (now + 120n).toString(), assertion: wrongKey })).rejects.toMatchObject({ code: "AUTH_INVALID" })
-    const tooLong = vault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: nonce, expiresAt: now + 301n })
-    await expect(cancel({ expiresAt: (now + 301n).toString(), assertion: tooLong })).rejects.toMatchObject({ code: "AUTH_INVALID" })
+    apiNow = now
+    try {
+      const cancel = (body: unknown) => ownerClient.request<{ state: string }>("POST", `/revocations/${intent.intentId}/cancel`, { body })
+      await expect(cancel({})).rejects.toMatchObject({ code: "AUTH_INVALID" })
+      const otherVault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: `0x${"4e".repeat(32)}`, chain: owner, api: { putObject: async () => undefined, publishEpochWrap: async () => undefined, requestRevocationDeny: async () => ({ intentId: intent.intentId }) } })
+      const nonce = BigInt(intent.cancellationNonce)
+      const wrongKey = otherVault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: nonce, expiresAt: now + 120n })
+      await expect(cancel({ expiresAt: (now + 120n).toString(), assertion: wrongKey })).rejects.toMatchObject({ code: "AUTH_INVALID" })
+      const tooLong = vault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: nonce, expiresAt: now + 301n })
+      await expect(cancel({ expiresAt: (now + 301n).toString(), assertion: tooLong })).rejects.toMatchObject({ code: "AUTH_INVALID" })
 
-    const good = { expiresAt: (now + 120n).toString(), assertion: vault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: nonce, expiresAt: now + 120n }) }
-    expect((await cancel(good)).state).toBe("cancelled")
-    await expect(authorize(agentA, capabilityA)).resolves.toMatchObject({ agentId: agentA.agentId })
-    await expect(cancel(good)).rejects.toMatchObject({ code: "REPLAY" })
+      const good = { expiresAt: (now + 120n).toString(), assertion: vault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: nonce, expiresAt: now + 120n }) }
+      expect((await cancel(good)).state).toBe("cancelled")
+      await expect(authorize(agentA, capabilityA)).resolves.toMatchObject({ agentId: agentA.agentId })
+      await expect(cancel(good)).rejects.toMatchObject({ code: "REPLAY" })
+    } finally {
+      apiNow = undefined
+    }
   })
 
   it("a deny anchors only when Monad shows the revocation; without one it stays active", async () => {
-    await ownerClient.request("POST", "/revocations", { body: { agentId: agentN.agentId } })
+    // agentA holds a live capability at this point, so an owner-signed agent deny is accepted; the per-capability
+    // revocation below does not bump the owner-agent epoch, so the intent stays "active".
+    await ownerClient.request("POST", "/revocations", { body: { agentId: agentA.agentId } })
     await overlay.reconcile(reader)
     expect(overlay.list().filter((intent) => intent.target.kind === "agent").map((intent) => intent.state)).toEqual(["active"])
 
@@ -206,5 +221,20 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     await increaseLocalTime(node.rpcUrl, 200n)
     await expect(authorize(agentE, capabilityE, { namespaceId: LEARNING, agentKeyVersion: 9 })).rejects.toMatchObject({ code: "CAPABILITY_EXPIRED" })
     expect(overlay.list().filter((intent) => intent.target.kind === "agent").map((intent) => intent.state)).toEqual(["active"])
+  })
+
+  it("an agent-target deny intent requires a real owner-agent relationship", async () => {
+    // The stranger is authenticated but has never granted to or revoked agentA: no intent may be recorded.
+    await expect(strangerClient.request("POST", "/revocations", { body: { agentId: agentA.agentId } })).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
+    // agentN is registered but has no capability from and no revocation by this owner either.
+    await expect(ownerClient.request("POST", "/revocations", { body: { agentId: agentN.agentId } })).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
+    // Positive control: the owner granted agentE capabilityE, so the intent is recorded and then cancellable.
+    const intent = await ownerClient.request<{ intentId: Hex; state: string; cancellationNonce: string }>("POST", "/revocations", { body: { agentId: agentE.agentId } })
+    expect(intent.state).toBe("active")
+    const now = BigInt(Math.floor(Date.now() / 1000))
+    const expiresAt = now + 120n
+    const assertion = vault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: BigInt(intent.cancellationNonce), expiresAt })
+    const cancelled = await ownerClient.request<{ state: string }>("POST", `/revocations/${intent.intentId}/cancel`, { body: { expiresAt: expiresAt.toString(), assertion } })
+    expect(cancelled.state).toBe("cancelled")
   })
 })
