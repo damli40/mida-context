@@ -14,6 +14,7 @@
     "chain:abis": "node packages/chain/scripts/gen-abis.mjs"
   },
   "dependencies": {
+    "@mida/api": "workspace:*",
     "@mida/chain": "workspace:*",
     "@mida/crypto": "workspace:*",
     "@mida/fake-vault": "workspace:*",
