@@ -12,6 +12,7 @@ import {
     POLICY_VERSION_HASH
 } from "../src/MidaTypes.sol";
 import {MidaHashing} from "../src/MidaHashing.sol";
+import {MIDA_POLICY_DOCUMENT_HASH_V1} from "../src/generated/PolicyHashV1.sol";
 
 /// @notice Every identifier and EIP-712 digest must equal the TypeScript vectors exported by
 ///         packages/protocol/scripts/export-vectors.ts. A failure here means the two layers drifted.
@@ -179,6 +180,11 @@ contract ParityTest is Test {
         assertEq(
             MidaHashing.agentRegistrationDigest(registration, _chainId(), _registry()), _b32("agentRegistrationDigest")
         );
+    }
+
+    function test_policyHashMatchesGrantAdvisorExport() public view {
+        string memory policy = vm.readFile("test/vectors/policy-v1.json");
+        assertEq(MIDA_POLICY_DOCUMENT_HASH_V1, vm.parseJsonBytes32(policy, ".policyHash"));
     }
 
     function test_signerRotationDigest() public view {
