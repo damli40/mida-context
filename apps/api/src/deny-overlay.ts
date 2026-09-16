@@ -80,6 +80,25 @@ export class DenyOverlay {
     )
   }
 
+  /**
+   * For wrap publication, which names no capability: an active deny on this agent, or on any of its capabilities in
+   * this namespace, blocks publication.
+   */
+  async deniesRelationship(reader: RegistryReader, input: { owner: Address; agentId: Hex; namespaceId: Hex }): Promise<boolean> {
+    const owner = input.owner.toLowerCase()
+    const agentId = input.agentId.toLowerCase()
+    for (const intent of this.#intents) {
+      if (intent.state !== "active" || intent.owner !== owner) continue
+      if (intent.target.kind === "agent") {
+        if (intent.target.agentId === agentId) return true
+        continue
+      }
+      const capability = await reader.getCapability(intent.target.capabilityId)
+      if (capability !== null && capability.agentId === agentId && capability.namespaceId === input.namespaceId.toLowerCase()) return true
+    }
+    return false
+  }
+
   /** active → anchored only when Monad shows the matching revocation. Failed or missing transactions leave it active. */
   async reconcile(reader: RegistryReader): Promise<void> {
     let changed = false

@@ -1,10 +1,12 @@
 import { httpRequestTypedData } from "@mida/protocol"
-import type { Address, Hex } from "@mida/protocol"
+import type { Address, Hex, ObjectManifest, ReaderEpochWrap, SignedAgentCapabilityManifest } from "@mida/protocol"
 import { hexOf } from "@mida/crypto"
 import { randomBytes } from "@noble/hashes/utils.js"
 import type { LocalAccount } from "viem"
 import { AUTH_HEADERS, targetOf } from "./auth.js"
 import { errorFromBody } from "./errors.js"
+import type { WebAuthnAssertionInput } from "./verify-assertion.js"
+import type { AnchoredObject, ObjectUploadBody } from "./wire.js"
 
 export interface ContextApiClientOptions {
   baseUrl: string
@@ -15,8 +17,11 @@ export interface ContextApiClientOptions {
   clock?: () => bigint
 }
 
-/** Signs every request with MidaHttpRequestV1 (§12.1). The signature covers the exact body bytes sent. */
-export class ContextApiClient {
+/**
+ * Signs every request with MidaHttpRequestV1 (§12.1); the signature covers the exact body bytes sent. The typed route
+ * methods implement the FakeVault's VaultContextApi port structurally, so the same client serves owners and agents.
+ */
+export class ContextApiClient implements ContextApiRoutes {
   readonly account: LocalAccount
   readonly #options: ContextApiClientOptions
 
@@ -61,4 +66,65 @@ export class ContextApiClient {
     if (!response.ok) throw errorFromBody(response.status, parsed)
     return parsed as T
   }
+
+  putObject(upload: ObjectUploadBody) {
+    return this.request<{ contextId: Hex; manifestHash: Hex; state: "pending" }>("PUT", "/objects", { body: upload })
+  }
+
+  async listObjects(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }) {
+    const query = { owner: input.owner.toLowerCase(), namespaceId: input.namespaceId, ...(input.capabilityId === undefined ? {} : { capabilityId: input.capabilityId }) }
+    return (await this.request<{ objects: AnchoredObject[] }>("GET", "/objects", { query })).objects
+  }
+
+  getManifest(contextId: Hex, capabilityId?: Hex) {
+    return this.request<{ manifest: ObjectManifest; manifestHash: Hex }>("GET", `/manifests/${contextId}`, capabilityId === undefined ? {} : { query: { capabilityId } })
+  }
+
+  putAgentManifest(envelope: SignedAgentCapabilityManifest) {
+    return this.request<{ bodyHash: Hex; envelopeHash: Hex }>("PUT", "/agent-manifests", { body: envelope, signed: false })
+  }
+
+  getAgentManifest(bodyHash: Hex) {
+    return this.request<SignedAgentCapabilityManifest>("GET", `/agent-manifests/${bodyHash}`, { signed: false })
+  }
+
+  publishEpochWrap(wrap: ReaderEpochWrap) {
+    return this.request<{ stored: true }>("POST", "/epoch-wraps", { body: wrap })
+  }
+
+  getEpochWrap(input: { owner: Address; namespaceId: Hex; readEpoch: bigint; agentId: Hex; agentKeyVersion: number; capabilityId: Hex }) {
+    return this.request<ReaderEpochWrap>("GET", "/epoch-wraps", {
+      query: {
+        owner: input.owner.toLowerCase(),
+        namespaceId: input.namespaceId,
+        readEpoch: input.readEpoch.toString(10),
+        agentId: input.agentId,
+        agentKeyVersion: String(input.agentKeyVersion),
+        capabilityId: input.capabilityId,
+      },
+    })
+  }
+
+  requestRevocationDeny(target: { capabilityId: Hex } | { owner: Address; agentId: Hex }) {
+    const body = "capabilityId" in target ? { capabilityId: target.capabilityId } : { agentId: target.agentId }
+    return this.request<{ intentId: Hex; state: string; cancellationNonce: string }>("POST", "/revocations", { body })
+  }
+
+  cancelRevocation(intentId: Hex, input: { expiresAt: bigint; assertion: WebAuthnAssertionInput }) {
+    return this.request<{ intentId: Hex; state: string }>("POST", `/revocations/${intentId}/cancel`, {
+      body: { expiresAt: input.expiresAt.toString(10), assertion: input.assertion },
+    })
+  }
+}
+
+export interface ContextApiRoutes {
+  putObject(upload: ObjectUploadBody): Promise<{ contextId: Hex; manifestHash: Hex; state: "pending" }>
+  listObjects(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }): Promise<AnchoredObject[]>
+  getManifest(contextId: Hex, capabilityId?: Hex): Promise<{ manifest: ObjectManifest; manifestHash: Hex }>
+  putAgentManifest(envelope: SignedAgentCapabilityManifest): Promise<{ bodyHash: Hex; envelopeHash: Hex }>
+  getAgentManifest(bodyHash: Hex): Promise<SignedAgentCapabilityManifest>
+  publishEpochWrap(wrap: ReaderEpochWrap): Promise<{ stored: true }>
+  getEpochWrap(input: { owner: Address; namespaceId: Hex; readEpoch: bigint; agentId: Hex; agentKeyVersion: number; capabilityId: Hex }): Promise<ReaderEpochWrap>
+  requestRevocationDeny(target: { capabilityId: Hex } | { owner: Address; agentId: Hex }): Promise<{ intentId: Hex; state: string; cancellationNonce: string }>
+  cancelRevocation(intentId: Hex, input: { expiresAt: bigint; assertion: WebAuthnAssertionInput }): Promise<{ intentId: Hex; state: string }>
 }
