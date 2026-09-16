@@ -1,0 +1,104 @@
+import {
+  MidaError,
+  agentId as deriveAgentId,
+  agentRegistrationTypedData,
+  canonicalizeOrigin,
+  originHash,
+} from "@mida/protocol"
+import type { Address, Hex } from "@mida/protocol"
+import { createPublicClient, createWalletClient, http } from "viem"
+import type { Abi, Account, LocalAccount, PublicClient, TransactionReceipt, WalletClient } from "viem"
+import { capabilityRegistryAbi } from "./abis.js"
+import { chainFor } from "./deployment.js"
+import type { Deployment } from "./deployment.js"
+import { toMidaError } from "./registry.js"
+import type { ChainContext } from "./registry.js"
+
+export interface WriteContext extends ChainContext {
+  walletClient: WalletClient
+  account: Account
+}
+
+/** A write context whose account can sign typed data locally (operators, owners and agent signers in tests and the CLI). */
+export interface LocalWriteContext extends WriteContext {
+  account: LocalAccount
+}
+
+export function createWriteContext(input: { rpcUrl: string; deployment: Deployment; account: LocalAccount }): LocalWriteContext {
+  const chain = chainFor(input.deployment.chainId)
+  return {
+    deployment: input.deployment,
+    account: input.account,
+    publicClient: createPublicClient({ chain, transport: http(input.rpcUrl) }),
+    walletClient: createWalletClient({ chain, account: input.account, transport: http(input.rpcUrl) }),
+  }
+}
+
+/**
+ * Simulates first so a revert surfaces as a named contract error mapped to a protocol code, then sends and waits
+ * for the receipt. A receipt with status "reverted" (for example a Monad reserve-balance revert after inclusion)
+ * is an error, never a silent success.
+ */
+export async function sendContract(
+  context: WriteContext,
+  call: { address: Address; abi: Abi; functionName: string; args: readonly unknown[] },
+): Promise<TransactionReceipt> {
+  let request: unknown
+  try {
+    ;({ request } = await context.publicClient.simulateContract({
+      account: context.account,
+      address: call.address,
+      abi: call.abi,
+      functionName: call.functionName,
+      args: call.args,
+    } as never))
+  } catch (error) {
+    throw toMidaError(error)
+  }
+  const hash = await context.walletClient.writeContract(request as never)
+  const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
+  if (receipt.status !== "success") {
+    throw new MidaError("CAPABILITY_DENIED", `${call.functionName} transaction ${hash} reverted on-chain`)
+  }
+  return receipt
+}
+
+/**
+ * Operator-side agent registration (§4.3). The proposed signer signs MidaAgentRegistrationV1 over every field;
+ * the contract fixes encryptionKeyVersion and capabilityManifestVersion at 1.
+ */
+export async function registerAgent(
+  context: WriteContext,
+  input: { agentSalt: Hex; signer: LocalAccount; encryptionPublicKey: Hex; callbackOrigin: string; capabilityManifestHash: Hex },
+): Promise<{ agentId: Hex; receipt: TransactionReceipt }> {
+  const { deployment } = context
+  const operator = context.account.address
+  const agentId = deriveAgentId({
+    chainId: deployment.chainId,
+    capabilityRegistry: deployment.capabilityRegistry,
+    operator,
+    agentSalt: input.agentSalt,
+  })
+  const callbackOriginHash = originHash(canonicalizeOrigin(input.callbackOrigin, { allowLocalhost: true }))
+  const signature = await input.signer.signTypedData(
+    agentRegistrationTypedData({
+      chainId: deployment.chainId,
+      capabilityRegistry: deployment.capabilityRegistry,
+      agentId,
+      operator,
+      signer: input.signer.address,
+      encryptionPublicKey: input.encryptionPublicKey,
+      encryptionKeyVersion: 1,
+      callbackOriginHash,
+      capabilityManifestHash: input.capabilityManifestHash,
+      capabilityManifestVersion: 1n,
+    }) as never,
+  )
+  const receipt = await sendContract(context, {
+    address: deployment.capabilityRegistry,
+    abi: capabilityRegistryAbi,
+    functionName: "registerAgent",
+    args: [input.agentSalt, input.signer.address, input.encryptionPublicKey, callbackOriginHash, input.capabilityManifestHash, signature],
+  })
+  return { agentId, receipt }
+}

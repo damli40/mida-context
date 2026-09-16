@@ -10,9 +10,11 @@
     "test:contracts": "cd contracts && forge test",
     "vectors:ids": "tsx packages/protocol/scripts/export-vectors.ts",
     "contracts:policy-hash": "node contracts/script/gen-policy-hash.mjs",
-    "vectors:webauthn": "tsx packages/protocol/scripts/export-webauthn-fixture.ts"
+    "vectors:webauthn": "tsx packages/protocol/scripts/export-webauthn-fixture.ts",
+    "chain:abis": "node packages/chain/scripts/gen-abis.mjs"
   },
   "dependencies": {
+    "@mida/chain": "workspace:*",
     "@mida/crypto": "workspace:*",
     "@mida/grant-advisor": "workspace:*",
     "@mida/protocol": "workspace:*",
