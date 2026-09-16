@@ -9,7 +9,8 @@
     "typecheck": "tsc -p tsconfig.json",
     "test:contracts": "cd contracts && forge test",
     "vectors:ids": "tsx packages/protocol/scripts/export-vectors.ts",
-    "contracts:policy-hash": "node contracts/script/gen-policy-hash.mjs"
+    "contracts:policy-hash": "node contracts/script/gen-policy-hash.mjs",
+    "vectors:webauthn": "tsx packages/protocol/scripts/export-webauthn-fixture.ts"
   },
   "dependencies": {
     "@mida/crypto": "workspace:*",

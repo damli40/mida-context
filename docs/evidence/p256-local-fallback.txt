@@ -1,0 +1,13 @@
+Compiling 30 files with Solc 0.8.28
+Solc 0.8.28 finished in 1.79s
+Compiler run successful!
+
+Ran 2 tests for test/P256Paths.t.sol:P256PathsTest
+[SKIP: P256VERIFY absent at 0x100; this run proves the fallback path] test_nativePrecompilePath() (gas: 0)
+[PASS] test_solidityFallbackPath() (gas: 437474)
+Logs:
+  FreshCryptoLib P256 verify gas: 400017
+
+Suite result: ok. 1 passed; 0 failed; 1 skipped; finished in 1.39ms (985.08µs CPU time)
+
+Ran 1 test suite in 3.99ms (1.39ms CPU time): 1 tests passed, 0 failed, 1 skipped (2 total tests)

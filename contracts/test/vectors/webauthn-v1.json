@@ -1,0 +1,13 @@
+{
+  "rpId": "vault.mida.xyz",
+  "origin": "https://vault.mida.xyz",
+  "challenge": "0xabababababababababababababababababababababababababababababababab",
+  "qx": "0x665fb8ab47c8de4abc6fa31f88937d9959f86e3396a579dbe1aca60b06bd8336",
+  "qy": "0xadc9cd1cee6831c75c02699ca89860f7acac69ffd003c496c868e2baed49130e",
+  "authenticatorData": "0xb275669f95bfc600063e7cd0d2c3b12039f5067d964f36d9bb8275e09e3a36cb0500000000",
+  "clientDataJSON": "{\"type\":\"webauthn.get\",\"challenge\":\"q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s\",\"origin\":\"https://vault.mida.xyz\",\"crossOrigin\":false}",
+  "challengeIndex": 23,
+  "typeIndex": 1,
+  "r": "0x6934c3015f8ac9aa64a8a853599669e939d274a667b5b616528ad1948dc67973",
+  "s": "0x6fc3592ee2ef5ed694514b67eb6d579cbdba76a46248f47fbd7672461b0c720f"
+}

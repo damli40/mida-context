@@ -239,6 +239,10 @@ importers:
       viem:
         specifier: 2.56.3
         version: 2.56.3(typescript@5.9.3)(zod@4.5.4)
+    devDependencies:
+      ox:
+        specifier: 1.7.4
+        version: 1.7.4(typescript@5.9.3)
 
   packages/storage:
     dependencies:
