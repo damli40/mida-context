@@ -162,15 +162,31 @@ describe("Context API routes (plan Task 24)", () => {
     expect(await publicClient.getAgentManifest(agents.R!.manifestHash)).toEqual(agents.R!.manifest)
     await expect(publicClient.getAgentManifest(hexOf(randomBytes(32)))).rejects.toMatchObject({ code: "MANIFEST_NOT_FOUND" })
 
-    // A body mutated after signing indexes under a new hash that no AgentRecord commits to.
+    // A body mutated after signing can never verify against R's AgentRecord, so the PUT itself fails closed.
     const mutated = { ...agents.R!.manifest, manifest: { ...agents.R!.manifest.manifest, name: "Renamed" } }
-    const { bodyHash } = await publicClient.putAgentManifest(mutated)
-    await expect(publicClient.getAgentManifest(bodyHash)).rejects.toMatchObject({ code: "MANIFEST_HASH_MISMATCH" })
+    await expect(publicClient.putAgentManifest(mutated)).rejects.toMatchObject({ code: "MANIFEST_HASH_MISMATCH" })
 
-    // The body-hash index pointing at another agent's envelope bytes is detected.
+    // The body-hash index pointing at another agent's envelope bytes is detected; a genuine re-PUT repairs it.
     const other = await publicClient.putAgentManifest(agents.W!.manifest)
     store.setManifestIndex(agents.R!.manifestHash, other.envelopeHash)
     await expect(publicClient.getAgentManifest(agents.R!.manifestHash)).rejects.toMatchObject({ code: "MANIFEST_HASH_MISMATCH" })
+    expect(await publicClient.putAgentManifest(agents.R!.manifest)).toMatchObject({ bodyHash: agents.R!.manifestHash })
+    expect(await publicClient.getAgentManifest(agents.R!.manifestHash)).toEqual(agents.R!.manifest)
+  })
+
+  it("never lets a forged or premature manifest write repoint the body-hash index", async () => {
+    // R's body under W's operator signature: identical bodyHash, but it can never verify for a registered agent.
+    const forged = { manifest: agents.R!.manifest.manifest, operatorSignature: agents.W!.manifest.operatorSignature }
+    await expect(clients.R!.putAgentManifest(forged)).rejects.toMatchObject({ code: "MANIFEST_SIGNATURE_INVALID" })
+    expect(await clients.R!.getAgentManifest(agents.R!.manifestHash)).toEqual(agents.R!.manifest)
+
+    // While the agent is unresolvable on Monad the index is first-write-wins: a second write keeps its bytes in the
+    // blob store but cannot displace the existing entry.
+    const prematureBody = { ...agents.R!.manifest.manifest, agentId: hexOf(randomBytes(32)) }
+    const first = await clients.R!.putAgentManifest({ manifest: prematureBody, operatorSignature: agents.R!.manifest.operatorSignature })
+    const second = await clients.R!.putAgentManifest({ manifest: prematureBody, operatorSignature: agents.W!.manifest.operatorSignature })
+    expect(second.envelopeHash).not.toBe(first.envelopeHash)
+    expect(store.getManifestIndex(first.bodyHash)).toBe(first.envelopeHash)
   })
 
   it("serves anchored owner context to an authorized reader, who decrypts it with its own epoch wrap", async () => {
@@ -234,6 +250,21 @@ describe("Context API routes (plan Task 24)", () => {
     await expect(ownerClient.publishEpochWrap({ ...genuine, readEpoch: "3" })).rejects.toMatchObject({ code: "EPOCH_STALE" })
     await expect(ownerClient.publishEpochWrap({ ...genuine, wrappedEpochPrivateKey: `0x${"00".repeat(47)}` })).rejects.toMatchObject({ code: "INVALID_WIRE" })
     expect(await ownerClient.publishEpochWrap(genuine)).toEqual({ stored: true })
+  })
+
+  it("denies a reader another agent's wrap even with a live READ capability", async () => {
+    // §12.4: the signer's authorized agentId must equal the requested agentId. Removing that check would serve
+    // T's published wrap to R, so this test fails if the line is deleted.
+    await expect(
+      clients.R!.getEpochWrap({
+        owner: vault.owner,
+        namespaceId: CAREER,
+        readEpoch: 1n,
+        agentId: agents.T!.agentId,
+        agentKeyVersion: 1,
+        capabilityId: capabilities.R!,
+      }),
+    ).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
   })
 
   it("after revoking T: old-epoch uploads are stale, T is revoked, and remaining reader R waits for its epoch-2 wrap", async () => {

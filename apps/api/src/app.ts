@@ -241,11 +241,21 @@ export function createContextApi(options: ContextApiOptions) {
     if (envelope === null || typeof envelope !== "object" || typeof envelope.operatorSignature !== "string" || !/^0x[0-9a-f]{130}$/.test(envelope.operatorSignature)) {
       throw new MidaError("INVALID_WIRE", "envelope needs a manifest and a lowercase 65-byte operatorSignature")
     }
-    validateManifestBody(envelope.manifest, await reader.now())
+    const now = await reader.now()
+    validateManifestBody(envelope.manifest, now)
     const envelopeHash = manifestEnvelopeHash(envelope)
-    await store.blobs.put(manifestEnvelopeBytes(envelope))
     const bodyHash = manifestBodyHash(envelope.manifest)
-    store.setManifestIndex(bodyHash, envelopeHash)
+    // Fail-closed indexing: once the agent is registered, an envelope that cannot verify can never be served, so the
+    // write is rejected rather than repointing the index. For agents not yet on Monad the bytes are kept for later
+    // serving, but an existing index entry is never displaced by an unverifiable write (first-write-wins).
+    const agentRecord = await reader.getAgent(envelope.manifest.agentId)
+    if (agentRecord !== null) {
+      verifySignedManifest({ envelope, agentRecord, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, now })
+      store.setManifestIndex(bodyHash, envelopeHash)
+    } else if (store.getManifestIndex(bodyHash) === undefined) {
+      store.setManifestIndex(bodyHash, envelopeHash)
+    }
+    await store.blobs.put(manifestEnvelopeBytes(envelope))
     return c.json({ bodyHash, envelopeHash })
   })
 
