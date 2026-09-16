@@ -6,12 +6,15 @@ import {
     CapabilityDenied,
     EpochRotationRequired,
     EpochStale,
+    EvidenceImmutable,
     InvalidNamespace,
     KIND_MAX,
     KIND_NONE,
     LINEAGE_OWNER_CONTROLLED,
     LINEAGE_STANDARD,
     PERM_CREATE,
+    PERM_SUPERSEDE_ANY,
+    PERM_SUPERSEDE_OWN,
     PROV_ALLOW_EXTERNAL_ATTESTATION,
     PROV_ALLOW_IMPORTED,
     PROV_ALLOW_INFERENCE,
@@ -23,7 +26,8 @@ import {
     SOURCE_IMPORTED,
     SOURCE_NONE,
     SOURCE_USER_ASSERTED,
-    SOURCE_USER_CONFIRMED
+    SOURCE_USER_CONFIRMED,
+    StaleParent
 } from "./MidaTypes.sol";
 import {ICapabilityRegistry} from "./ICapabilityRegistry.sol";
 import {MidaHashing} from "./MidaHashing.sol";
@@ -74,6 +78,7 @@ contract ContextRegistry {
     error ContextIdMismatch(bytes32 expected, bytes32 submitted);
     error DuplicateContext(bytes32 contextId);
     error ContextNotFound(bytes32 contextId);
+    error ParentMismatch(bytes32 parentId);
 
     ICapabilityRegistry public immutable CAPABILITY_REGISTRY;
 
@@ -205,9 +210,51 @@ contract ContextRegistry {
         _latest[contextId] = contextId;
     }
 
-    /// @dev Task 20 replaces this function with lineage supersession.
-    function _supersede(address, bytes32, ContextInput calldata input, bytes32, uint8) private pure {
-        revert ContextNotFound(input.expectedParentId);
+    /// @dev Spec §11.6. The parent must be the current head of a context lineage with the same owner and
+    ///      namespace. Agents need SUPERSEDE_OWN on their own lineage or SUPERSEDE_ANY on another author's
+    ///      STANDARD lineage; no agent may supersede an OWNER_CONTROLLED lineage.
+    function _supersede(address owner, bytes32 author, ContextInput calldata input, bytes32 contextId, uint8 provenanceBits)
+        private
+    {
+        bytes32 parentId = input.expectedParentId;
+        ContextRecord storage parent = _records[parentId];
+        if (parent.owner == address(0)) revert ContextNotFound(parentId);
+        if (parent.recordType == RECORD_EVIDENCE) revert EvidenceImmutable(parentId);
+        if (parent.owner != owner || parent.namespaceId != input.namespaceId) revert ParentMismatch(parentId);
+
+        bytes32 lineageId = parent.lineageId;
+        bytes32 head = _latest[lineageId];
+        if (head != parentId) revert StaleParent(parentId, head);
+
+        ContextRecord storage root = _records[lineageId];
+        // Owner-controlled status is fixed at the root and can never be added or removed later.
+        if (input.lineagePolicy != root.lineagePolicy) revert InvalidRecord(input.contextId);
+        if (author != bytes32(0)) {
+            if (root.lineagePolicy == LINEAGE_OWNER_CONTROLLED) revert AnchorOwnerOnly();
+            _requireSupersedeAuthority(owner, author, input.namespaceId, root.author == author, provenanceBits);
+        }
+
+        uint32 version = parent.version + 1;
+        _store(owner, author, input, contextId, lineageId, parentId, version);
+        _latest[lineageId] = contextId;
+        emit ContextSuperseded(owner, lineageId, contextId, parentId, version);
+    }
+
+    function _requireSupersedeAuthority(
+        address owner,
+        bytes32 agentId,
+        bytes32 namespaceId,
+        bool ownLineage,
+        uint8 provenanceBits
+    ) private view {
+        bool viaOwn = ownLineage && CAPABILITY_REGISTRY.hasAuthority(owner, agentId, namespaceId, PERM_SUPERSEDE_OWN, 0);
+        bool viaAny = CAPABILITY_REGISTRY.hasAuthority(owner, agentId, namespaceId, PERM_SUPERSEDE_ANY, 0);
+        if (!viaOwn && !viaAny) revert CapabilityDenied();
+        if (provenanceBits == 0) return;
+        bool bitsViaOwn =
+            ownLineage && CAPABILITY_REGISTRY.hasAuthority(owner, agentId, namespaceId, PERM_SUPERSEDE_OWN, provenanceBits);
+        bool bitsViaAny = CAPABILITY_REGISTRY.hasAuthority(owner, agentId, namespaceId, PERM_SUPERSEDE_ANY, provenanceBits);
+        if (!bitsViaOwn && !bitsViaAny) revert ProvenanceForbidden();
     }
 
     /// @dev One exact capability must carry the permission; if provenance bits are required, the same
