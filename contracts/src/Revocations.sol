@@ -68,9 +68,13 @@ abstract contract Revocations is Grants {
 
         if (rotations.length != count) revert RotationSetMismatch();
         for (uint256 i = 0; i < rotations.length; i++) {
+            // A zero namespaceId can never be required, and rejecting it here stops it matching a
+            // slot a previous rotation cleared — otherwise a required namespace would stay unrotated.
+            if (rotations[i].namespaceId == bytes32(0)) revert RotationSetMismatch();
             bool expected;
             for (uint256 j = 0; j < count; j++) {
-                // Namespace ids are never zero, so clearing a matched slot also rejects duplicates.
+                // Stored namespace ids are never zero and zero rotation ids revert above, so clearing
+                // a matched slot also rejects duplicates.
                 if (readNamespaces[j] == rotations[i].namespaceId) {
                     readNamespaces[j] = bytes32(0);
                     expected = true;

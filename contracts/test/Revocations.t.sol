@@ -231,6 +231,28 @@ contract RevocationsTest is GrantFixtures {
         assertEq(registry.requiredReadEpoch(alice.owner, career), 2);
     }
 
+    /// @dev Regression: a zero namespaceId must not satisfy the rotation set by matching a slot that an
+    ///      earlier rotation cleared. That would leave a required live-READ namespace unrotated and mint
+    ///      a phantom epoch 2 on namespace id 0.
+    function test_revokeAgentAndRotateRejectsZeroNamespaceId() public {
+        _initEpoch(alice, "profile.skills");
+        _grantExact(alice, readerA, _one(_scope("profile.skills", PERM_READ, 0)), 0);
+        Revocations.EpochRotation[] memory rotations = new Revocations.EpochRotation[](2);
+        rotations[0] = _rotation("goals.career", 2);
+        rotations[1] = Revocations.EpochRotation(bytes32(0), keccak256("junk"));
+
+        vm.prank(alice.owner);
+        vm.expectRevert(abi.encodeWithSelector(Revocations.RotationSetMismatch.selector));
+        registry.revokeAgentAndRotate(readerA.agentId, rotations);
+
+        assertTrue(registry.isCapabilityValid(capA), "failed attempt rolled back");
+        assertEq(registry.agentEpoch(alice.owner, readerA.agentId), 0);
+        assertEq(registry.requiredReadEpoch(alice.owner, _ns("profile.skills")), 1, "skills never rotated");
+        assertEq(registry.requiredReadEpoch(alice.owner, career), 1, "career rotation rolled back too");
+        assertFalse(registry.isWriteEpochValid(alice.owner, bytes32(0), 2), "no phantom epoch on namespace 0");
+        assertEq(registry.epochPublicKey(alice.owner, bytes32(0), 2), bytes32(0));
+    }
+
     function test_revokeAgentWithoutReadNeedsNoRotations() public {
         vm.prank(alice.owner);
         registry.revokeAgentAndRotate(creatorC.agentId, new Revocations.EpochRotation[](0));
