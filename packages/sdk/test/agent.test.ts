@@ -258,16 +258,81 @@ describe("MidaAgent (plan Task 25)", () => {
     await expect(sdk.A!.read(vault.owner, "goals.career")).rejects.toMatchObject({ code: "COMMITMENT_MISMATCH" })
   })
 
-  it("rejects a reference to a context record: an evidence commitment may only name evidence records", async () => {
+  it("reads a USER_CONFIRMED record whose confirmed_from names the CONTEXT proposal it confirms, alongside other records", async () => {
     const request = await sdk.A!.createAccessRequest({ purposeId: "career_coaching", scopes: [{ namespace: "goals.learning", permissions: PERMISSION.READ }] })
     const expiresAt = (await latestTimestamp(owner)) + 7n * 86_400n
     const { response } = await vault.approveGrant({ accessRequest: request, manifest: provisioned.A!.manifest, selection: { kind: "custom", scopes: request.scopes, expiresAt } })
     await sdk.A!.completeAccessRequest(request, response)
-    await vault.createOwnerContext({
+    // §11.8: confirmed_from acknowledges an agent proposal, which is itself a CONTEXT record — not evidence.
+    const confirmed = await vault.createOwnerContext({
       namespace: "goals.learning",
       payload: { v: 1, value: "confirmed from a context record", kind: "FACT", provenance: { source: "USER_CONFIRMED", references: [{ relation: "confirmed_from", recordId: aliceContextId }] } },
       evidenceCommitment: evidenceCommitment([{ relation: "confirmed_from", recordId: aliceContextId }]),
     })
-    await expect(sdk.A!.read(vault.owner, "goals.learning")).rejects.toMatchObject({ code: "PROVENANCE_FORBIDDEN" })
+    const other = await vault.createOwnerContext({
+      namespace: "goals.learning",
+      payload: { v: 1, value: "Finish the solidity course", kind: "GOAL", provenance: { source: "USER_ASSERTED" } },
+    })
+    const objects = await sdk.A!.read(vault.owner, "goals.learning")
+    expect(objects.find((o) => o.contextId === confirmed.contextId)?.payload.provenance.source).toBe("USER_CONFIRMED")
+    expect(objects.some((o) => o.contextId === other.contextId)).toBe(true)
+  })
+
+  it("still accepts a confirmed_from reference that names an evidence record", async () => {
+    const evidence = await ownerEvidence("accredited course certificate")
+    const confirmed = await vault.createOwnerContext({
+      namespace: "goals.learning",
+      payload: { v: 1, value: "confirmed against evidence", kind: "CREDENTIAL", provenance: { source: "USER_CONFIRMED", references: [{ relation: "confirmed_from", recordId: evidence }] } },
+      evidenceCommitment: evidenceCommitment([{ relation: "confirmed_from", recordId: evidence }]),
+    })
+    expect((await sdk.A!.read(vault.owner, "goals.learning")).some((o) => o.contextId === confirmed.contextId)).toBe(true)
+  })
+
+  it("rejects a USER_CONFIRMED record that carries no confirmed_from reference", async () => {
+    // §11.8 requires at least one confirmed_from; supports→EVIDENCE alone does not satisfy it.
+    const evidence = await ownerEvidence("supporting document")
+    await vault.createOwnerContext({
+      namespace: "goals.learning",
+      payload: { v: 1, value: "unconfirmed claim", kind: "FACT", provenance: { source: "USER_CONFIRMED", references: [{ relation: "supports", recordId: evidence }] } },
+      evidenceCommitment: evidenceCommitment([{ relation: "supports", recordId: evidence }]),
+    })
+    const reading = sdk.A!.read(vault.owner, "goals.learning")
+    await expect(reading).rejects.toMatchObject({ code: "PROVENANCE_FORBIDDEN" })
+    await expect(reading).rejects.toThrowError(/confirmed_from/)
+  })
+
+  it("rejects imported provenance whose evidence references name a context record", async () => {
+    await vault.initializeNamespace("financial.preferences")
+    const request = await sdk.A!.createAccessRequest({ purposeId: "career_coaching", scopes: [{ namespace: "financial.preferences", permissions: PERMISSION.READ }] })
+    // The financial domain is HIGH sensitivity, so the grant needs a finite expiry within 24 hours.
+    const expiresAt = (await latestTimestamp(owner)) + 3600n
+    const { response } = await vault.approveGrant({ accessRequest: request, manifest: provisioned.A!.manifest, selection: { kind: "custom", scopes: request.scopes, expiresAt } })
+    await sdk.A!.completeAccessRequest(request, response)
+    // §11.8: IMPORTED must reveal at least one registered evidence-record ID; supports can only name evidence.
+    await vault.createOwnerContext({
+      namespace: "financial.preferences",
+      payload: { v: 1, value: "imported claim", kind: "FACT", provenance: { source: "IMPORTED", references: [{ relation: "supports", recordId: aliceContextId }] } },
+      evidenceCommitment: evidenceCommitment([{ relation: "supports", recordId: aliceContextId }]),
+    })
+    const reading = sdk.A!.read(vault.owner, "financial.preferences")
+    await expect(reading).rejects.toMatchObject({ code: "PROVENANCE_FORBIDDEN" })
+    await expect(reading).rejects.toThrowError(/not an evidence record/)
+  })
+
+  it("rejects an EXTERNAL_ATTESTATION whose references name a context record", async () => {
+    await agent("E", 6, [{ namespace: "decisions.career", permissions: ["READ"] }])
+    await vault.initializeNamespace("decisions.career")
+    const request = await sdk.E!.createAccessRequest({ purposeId: "career_coaching", scopes: [{ namespace: "decisions.career", permissions: PERMISSION.READ }] })
+    const expiresAt = (await latestTimestamp(owner)) + 7n * 86_400n
+    const { response } = await vault.approveGrant({ accessRequest: request, manifest: provisioned.E!.manifest, selection: { kind: "custom", scopes: request.scopes, expiresAt } })
+    await sdk.E!.completeAccessRequest(request, response)
+    await vault.createOwnerContext({
+      namespace: "decisions.career",
+      payload: { v: 1, value: "attested claim", kind: "CREDENTIAL", provenance: { source: "EXTERNAL_ATTESTATION", references: [{ relation: "derived_from", recordId: aliceContextId }] } },
+      evidenceCommitment: evidenceCommitment([{ relation: "derived_from", recordId: aliceContextId }]),
+    })
+    const reading = sdk.E!.read(vault.owner, "decisions.career")
+    await expect(reading).rejects.toMatchObject({ code: "PROVENANCE_FORBIDDEN" })
+    await expect(reading).rejects.toThrowError(/not an evidence record/)
   })
 })

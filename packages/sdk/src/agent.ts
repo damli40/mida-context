@@ -361,8 +361,10 @@ export class MidaAgent {
   }
 
   /**
-   * §11.8: typed references must recompute the committed value, and each referenced record must exist for this owner
-   * and be an EVIDENCE record — a context record is never evidence, so referencing one is a false provenance claim.
+   * §11.8, relation-aware: references must recompute the committed value and name records that exist for this owner.
+   * `supports`/`derived_from` claim evidentiary support, so their targets must be EVIDENCE records; `confirmed_from`
+   * acknowledges an agent proposal, which is itself a CONTEXT record. USER_CONFIRMED then needs at least one
+   * `confirmed_from` reference, and IMPORTED/EXTERNAL_ATTESTATION at least one evidence-record target.
    */
   async #verifyReferences(owner: Address, record: ContextRecordView, payload: ContextPayload): Promise<void> {
     const references = payload.provenance.references ?? []
@@ -370,14 +372,28 @@ export class MidaAgent {
     if (commitment !== record.evidenceCommitment) {
       throw new MidaError("COMMITMENT_MISMATCH", `references of ${record.contextId} do not match its evidence commitment`)
     }
+    let evidenceTargets = 0
+    let confirmedFrom = 0
     for (const reference of references) {
       const target = await this.#reader.getRecord(reference.recordId)
       if (target === null || target.owner !== owner) {
         throw new MidaError("COMMITMENT_MISMATCH", `referenced record ${reference.recordId} does not exist for this owner`)
       }
-      if (target.recordType !== RECORD_TYPE.EVIDENCE) {
+      if (target.recordType === RECORD_TYPE.EVIDENCE) {
+        evidenceTargets += 1
+      } else if (reference.relation !== "confirmed_from") {
         throw new MidaError("PROVENANCE_FORBIDDEN", `referenced record ${reference.recordId} is not an evidence record`)
       }
+      if (reference.relation === "confirmed_from") confirmedFrom += 1
+    }
+    if (record.provenanceSource === PROVENANCE_SOURCE.USER_CONFIRMED && confirmedFrom === 0) {
+      throw new MidaError("PROVENANCE_FORBIDDEN", `record ${record.contextId} claims USER_CONFIRMED without a confirmed_from reference`)
+    }
+    if (
+      (record.provenanceSource === PROVENANCE_SOURCE.IMPORTED || record.provenanceSource === PROVENANCE_SOURCE.EXTERNAL_ATTESTATION) &&
+      evidenceTargets === 0
+    ) {
+      throw new MidaError("PROVENANCE_FORBIDDEN", `record ${record.contextId} does not reveal a registered evidence-record ID`)
     }
   }
 

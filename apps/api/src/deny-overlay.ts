@@ -21,12 +21,34 @@ export interface RevocationIntent {
   cancellationNonce: string | null
 }
 
+/** The persisted shape `denies`, `reconcile` and `cancel` dereference; a malformed entry fails construction. */
+function isRevocationIntent(value: unknown): value is RevocationIntent {
+  if (value === null || typeof value !== "object") return false
+  const intent = value as RevocationIntent
+  const target = intent.target as RevocationTarget | undefined
+  const targetOk =
+    target !== null &&
+    typeof target === "object" &&
+    ((target.kind === "capability" && typeof target.capabilityId === "string") ||
+      (target.kind === "agent" && typeof target.agentId === "string"))
+  return (
+    typeof intent.id === "string" &&
+    typeof intent.owner === "string" &&
+    targetOk &&
+    (intent.state === "active" || intent.state === "anchored" || intent.state === "cancelled") &&
+    (intent.agentEpochAtIntent === null || typeof intent.agentEpochAtIntent === "string") &&
+    (intent.cancellationNonce === null || typeof intent.cancellationNonce === "string")
+  )
+}
+
 /**
  * §12.5 fast revocation overlay, persisted as one JSON file. Exactly three transitions exist:
  *   active → anchored   matching Monad revocation observed (reconcile)
  *   active → active     transaction failed, missing or reorged out (no timeout ever clears a deny)
  *   active → cancelled  fresh owner P256-approved cancellation (cancel)
  * It can only reduce authority: `effectiveAllowed = currentlyAllowedByMonad AND NOT localDeny`.
+ * An unreadable or malformed store fails closed at construction: starting empty would silently restore
+ * authority a pending deny removed, which §12.5 forbids. Only a missing file means a fresh start.
  */
 export class DenyOverlay {
   readonly #file: string
@@ -34,11 +56,21 @@ export class DenyOverlay {
 
   constructor(file: string) {
     this.#file = file
+    let text: string
     try {
-      this.#intents = JSON.parse(readFileSync(file, "utf8")) as RevocationIntent[]
-    } catch {
-      this.#intents = []
+      text = readFileSync(file, "utf8")
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        this.#intents = []
+        return
+      }
+      throw error
     }
+    const parsed: unknown = JSON.parse(text)
+    if (!Array.isArray(parsed) || !parsed.every(isRevocationIntent)) {
+      throw new MidaError("INVALID_WIRE", `${file} is not a revocation intent array`)
+    }
+    this.#intents = parsed
   }
 
   list(): readonly RevocationIntent[] {
