@@ -1,0 +1,25 @@
+{
+  "network": "monad-testnet",
+  "generatedAt": "2026-09-17T02:42:28.874Z",
+  "chainId": "10143",
+  "capabilityRegistry": "0xf07d24dbd1fe21645a0489a94bae2c99d7e0e80b",
+  "contextRegistry": "0x350dc422bb2979684573409f229679fed383b2e5",
+  "deploymentBlock": "63193282",
+  "p256PrecompileProbe": {
+    "valid": "0x0000000000000000000000000000000000000000000000000000000000000001",
+    "tampered": "0x"
+  },
+  "grantBatchGasUsed": {
+    "grantA": "424323",
+    "grantC": "349525"
+  },
+  "transactions": {
+    "registerP256Key": "0x1fd063c928c9021ee85d1cc75c32486661e293fc7bd70404cdf13cefb14c4cd6",
+    "initializeReadEpoch": "0x0c4ccc16cc02ad1d9c0798846ffec7b0d4cf66a21aefe6b63601266c6b8a34c7",
+    "aliceContext": "0x36bd3bf8e1e16ae2cc24c53b1d346340396967d53608393a793a8df77e984412",
+    "grantA": "0x9333b9e1974e2d042bbfff5faac7aa7f29b3e683c4b8371c84a47d7e5b6eaa72",
+    "agentCEpoch1": "0x9301235adf37ed956f52f590635c609aa1267d74d90e05fd4d78a6a357dafd0d",
+    "revokeAndRotate": "0x0737fadc4ea65f4b2b1d9976428599a7145c0a9830c21fa817c0384f8be5445b",
+    "agentCEpoch2": "0x24112d84808097965d65132c3911f5678eb4c437fcbd70e8d86dc1360cecaca3"
+  }
+}

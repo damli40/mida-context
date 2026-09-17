@@ -93,6 +93,13 @@ export async function monadTestnetEnvironment(env: Record<string, string | undef
       if (receipt.status !== "success") {
         throw new Error(`funding ${address} reverted in ${hash}; check the funder balance against Monad's reserve-balance rule`)
       }
+      // Monad's asynchronous execution budgets an EOA's inflight gas spend against state from k=3 blocks ago, and a
+      // funder below the 10 MON reserve may transfer value only in an "emptying transaction" (no other send within k
+      // blocks). Waiting past the lag lets the lagged state see the new balance and keeps consecutive funds eligible.
+      const lag = 4n
+      while ((await funder.publicClient.getBlockNumber()) < receipt.blockNumber + lag) {
+        await new Promise((resolve) => setTimeout(resolve, 500))
+      }
     },
     writeContext: (account) => createWriteContext({ rpcUrl, deployment, account }),
     stop: () => server.close(),

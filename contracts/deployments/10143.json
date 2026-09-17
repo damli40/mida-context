@@ -1,0 +1,9 @@
+{
+  "capabilityRegistry": "0xF07D24dBD1FE21645a0489a94baE2c99d7E0E80b",
+  "chainId": 10143,
+  "contextRegistry": "0x350DC422Bb2979684573409f229679FeD383b2e5",
+  "deploymentBlock": 63193282,
+  "policyHashV1": "0xfd7cb44154ac443f554cc7f16f8d89da452475b06b71fce6df1cbda2c139dc45",
+  "vaultRpId": "vault.mida.xyz",
+  "vaultRpIdHash": "0xb275669f95bfc600063e7cd0d2c3b12039f5067d964f36d9bb8275e09e3a36cb"
+}
