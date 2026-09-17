@@ -360,7 +360,10 @@ export class MidaAgent {
     return record
   }
 
-  /** §11.8: typed references must recompute the committed value, and each referenced record must exist for this owner. */
+  /**
+   * §11.8: typed references must recompute the committed value, and each referenced record must exist for this owner
+   * and be an EVIDENCE record — a context record is never evidence, so referencing one is a false provenance claim.
+   */
   async #verifyReferences(owner: Address, record: ContextRecordView, payload: ContextPayload): Promise<void> {
     const references = payload.provenance.references ?? []
     const commitment = references.length === 0 ? zeroHash : evidenceCommitment(references)
@@ -371,6 +374,9 @@ export class MidaAgent {
       const target = await this.#reader.getRecord(reference.recordId)
       if (target === null || target.owner !== owner) {
         throw new MidaError("COMMITMENT_MISMATCH", `referenced record ${reference.recordId} does not exist for this owner`)
+      }
+      if (target.recordType !== RECORD_TYPE.EVIDENCE) {
+        throw new MidaError("PROVENANCE_FORBIDDEN", `referenced record ${reference.recordId} is not an evidence record`)
       }
     }
   }

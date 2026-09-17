@@ -2,13 +2,35 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { recoverTypedDataAddress } from "viem"
+import { recoverTypedDataAddress, zeroHash } from "viem"
 import type { LocalAccount } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
-import { PERMISSION, PROVENANCE_POLICY, accessRequestTypedData, namespaceId, sortScopes } from "@mida/protocol"
+import {
+  CONTEXT_KIND,
+  LINEAGE_POLICY,
+  OWNER_AUTHOR_ID,
+  PERMISSION,
+  PROVENANCE_POLICY,
+  PROVENANCE_SOURCE,
+  RECORD_TYPE,
+  accessRequestTypedData,
+  contextId as deriveContextId,
+  evidenceCommitment,
+  namespaceId,
+  sortScopes,
+} from "@mida/protocol"
 import type { AccessGrantResponse, Hex } from "@mida/protocol"
-import { hexOf } from "@mida/crypto"
-import { ANVIL_PRIVATE_KEYS, createWriteContext, deployLocal, fundLocal, latestTimestamp, startAnvil } from "@mida/chain"
+import { bytesOf, hexOf, sealContextObject } from "@mida/crypto"
+import {
+  ANVIL_PRIVATE_KEYS,
+  contextRegistryAbi,
+  createWriteContext,
+  deployLocal,
+  fundLocal,
+  latestTimestamp,
+  sendContract,
+  startAnvil,
+} from "@mida/chain"
 import type { Deployment, LocalNode, LocalWriteContext } from "@mida/chain"
 import { FakeVaultAuthority, provisionAgent } from "@mida/fake-vault"
 import type { AgentDeclaration, ProvisionedAgent } from "@mida/fake-vault"
@@ -24,6 +46,7 @@ describe("MidaAgent (plan Task 25)", () => {
   let node: LocalNode
   let deployment: Deployment
   let owner: LocalWriteContext
+  let reader: RegistryReader
   let app: ReturnType<typeof createContextApi>["app"]
   let vault: FakeVaultAuthority
   let aliceContextId: Hex
@@ -55,14 +78,70 @@ describe("MidaAgent (plan Task 25)", () => {
     })
   }
 
+  /** §11.7 evidence record: owner-authored (authorId 0), kind NONE, no lineage — sealed to the current epoch and anchored. */
+  async function ownerEvidence(value: string): Promise<Hex> {
+    const readEpoch = await reader.requiredReadEpoch(vault.owner, CAREER)
+    const epochPublicKey = (await reader.epochPublicKey(vault.owner, CAREER, readEpoch))!
+    const objectNonce = hexOf(randomBytes(32))
+    const evidenceId = deriveContextId({
+      chainId: deployment.chainId,
+      contextRegistry: deployment.contextRegistry,
+      owner: vault.owner,
+      authorId: OWNER_AUTHOR_ID,
+      namespaceId: CAREER,
+      objectNonce,
+    })
+    const sealed = sealContextObject({
+      payload: { v: 1, value, kind: "NONE", provenance: { source: "NONE" } },
+      binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: evidenceId, namespaceId: CAREER, readEpoch },
+      epochPublicKey: bytesOf(epochPublicKey, 32),
+    })
+    await clientFor(owner.account).putObject({
+      owner: vault.owner,
+      namespaceId: CAREER,
+      objectNonce,
+      expectedParentId: zeroHash,
+      manifest: sealed.manifest,
+      ciphertext: hexOf(sealed.ciphertext),
+    })
+    await sendContract(owner, {
+      address: deployment.contextRegistry,
+      abi: contextRegistryAbi,
+      functionName: "register",
+      args: [
+        vault.owner,
+        [
+          {
+            contextId: evidenceId,
+            objectNonce,
+            namespaceId: CAREER,
+            expectedParentId: zeroHash,
+            manifestHash: sealed.manifestHash,
+            ciphertextCommitment: sealed.ciphertextCommitment,
+            evidenceCommitment: zeroHash,
+            readEpoch,
+            expiresAt: 0n,
+            recordType: RECORD_TYPE.EVIDENCE,
+            lineagePolicy: LINEAGE_POLICY.STANDARD,
+            kind: CONTEXT_KIND.NONE,
+            provenanceSource: PROVENANCE_SOURCE.NONE,
+          },
+        ],
+      ],
+    })
+    return evidenceId
+  }
+
   beforeAll(async () => {
     node = await startAnvil()
     deployment = await deployLocal({ rpcUrl: node.rpcUrl })
     owner = createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[1]!) })
-    app = createContextApi({ reader: new RegistryReader(owner), deployment, dataDir: mkdtempSync(join(tmpdir(), "mida-sdk-")) }).app
+    reader = new RegistryReader(owner)
+    app = createContextApi({ reader, deployment, dataDir: mkdtempSync(join(tmpdir(), "mida-sdk-")) }).app
     vault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: P256_KEY, chain: owner, api: clientFor(owner.account) })
     await vault.registerOwnerKey()
     await vault.initializeNamespace("goals.career")
+    await vault.initializeNamespace("goals.learning")
     await agent("A", 2, [
       { namespace: "goals.career", permissions: ["READ"] },
       { namespace: "financial", permissions: ["READ"] },
@@ -119,6 +198,15 @@ describe("MidaAgent (plan Task 25)", () => {
     expect((await sdk.D!.completeAccessRequest(request, response)).capabilities).toHaveLength(1)
   })
 
+  it("completes a request at most once even when two completions race", async () => {
+    const request = await sdk.D!.createAccessRequest({ purposeId: "career_coaching", scopes: [{ namespace: "goals.career", permissions: PERMISSION.READ }] })
+    const { response } = await vault.approveGrant({ accessRequest: request, manifest: provisioned.D!.manifest, selection: { kind: "recommended" } })
+    const results = await Promise.allSettled([sdk.D!.completeAccessRequest(request, response), sdk.D!.completeAccessRequest(request, response)])
+    expect(results.map((result) => result.status).sort()).toEqual(["fulfilled", "rejected"])
+    const rejected = results.find((result) => result.status === "rejected")!
+    expect((rejected as PromiseRejectedResult).reason).toMatchObject({ code: "REQUEST_CONSUMED" })
+  })
+
   it("reads owner context by verifying Monad commitments and unwrapping its own epoch key; an ungranted agent is denied", async () => {
     const objects = await sdk.A!.read(vault.owner, "goals.career")
     expect(objects.find((o) => o.contextId === aliceContextId)?.payload.value).toBe("Prioritize systems engineering")
@@ -162,10 +250,24 @@ describe("MidaAgent (plan Task 25)", () => {
     await expect(sdk.C!.supersede(vault.owner, created, { value: "late", kind: "GOAL", source: "AGENT_INFERRED" })).rejects.toMatchObject({ code: "STALE_PARENT" })
   })
 
-  it("verifies evidence references on read: a real reference passes, a reference to a record that does not exist fails", async () => {
-    await sdk.C!.create(vault.owner, "goals.career", { value: "Imported from CV", kind: "FACT", source: "IMPORTED", references: [{ relation: "derived_from", recordId: aliceContextId }] })
+  it("verifies evidence references on read: a real evidence reference passes, a reference to a record that does not exist fails", async () => {
+    const evidence = await ownerEvidence("CV source document")
+    await sdk.C!.create(vault.owner, "goals.career", { value: "Imported from CV", kind: "FACT", source: "IMPORTED", references: [{ relation: "derived_from", recordId: evidence }] })
     expect((await sdk.A!.read(vault.owner, "goals.career")).some((o) => o.payload.value === "Imported from CV")).toBe(true)
     await sdk.C!.create(vault.owner, "goals.career", { value: "Dangling", kind: "FACT", source: "IMPORTED", references: [{ relation: "supports", recordId: hexOf(randomBytes(32)) }] })
     await expect(sdk.A!.read(vault.owner, "goals.career")).rejects.toMatchObject({ code: "COMMITMENT_MISMATCH" })
+  })
+
+  it("rejects a reference to a context record: an evidence commitment may only name evidence records", async () => {
+    const request = await sdk.A!.createAccessRequest({ purposeId: "career_coaching", scopes: [{ namespace: "goals.learning", permissions: PERMISSION.READ }] })
+    const expiresAt = (await latestTimestamp(owner)) + 7n * 86_400n
+    const { response } = await vault.approveGrant({ accessRequest: request, manifest: provisioned.A!.manifest, selection: { kind: "custom", scopes: request.scopes, expiresAt } })
+    await sdk.A!.completeAccessRequest(request, response)
+    await vault.createOwnerContext({
+      namespace: "goals.learning",
+      payload: { v: 1, value: "confirmed from a context record", kind: "FACT", provenance: { source: "USER_CONFIRMED", references: [{ relation: "confirmed_from", recordId: aliceContextId }] } },
+      evidenceCommitment: evidenceCommitment([{ relation: "confirmed_from", recordId: aliceContextId }]),
+    })
+    await expect(sdk.A!.read(vault.owner, "goals.learning")).rejects.toMatchObject({ code: "PROVENANCE_FORBIDDEN" })
   })
 })

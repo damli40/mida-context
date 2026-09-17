@@ -10,6 +10,11 @@ export interface StoredAccessRequest {
 export interface AccessRequestStore {
   save(request: AccessRequest): Promise<void>
   load(requestId: Hex): Promise<StoredAccessRequest | undefined>
+  /**
+   * Compare-and-set the consumed flag in one atomic step: rejects with REQUEST_CONSUMED when the requestId is already
+   * consumed. The check in `completeAccessRequest` is only a fast path; this guard is the real "a request completes at
+   * most once" invariant, so durable stores must keep the same atomicity (for example a conditional UPDATE).
+   */
   markConsumed(requestId: Hex): Promise<void>
 }
 
@@ -34,6 +39,7 @@ export class MemoryAccessRequestStore implements AccessRequestStore {
   async markConsumed(requestId: Hex): Promise<void> {
     const entry = this.#entries.get(requestId.toLowerCase())
     if (entry === undefined) throw new MidaError("NOT_FOUND", "no stored request for this requestId")
+    if (entry.consumed) throw new MidaError("REQUEST_CONSUMED", "this requestId was already completed")
     entry.consumed = true
   }
 }
