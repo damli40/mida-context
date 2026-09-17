@@ -175,6 +175,9 @@ importers:
       '@mida/chain':
         specifier: workspace:*
         version: link:packages/chain
+      '@mida/cli':
+        specifier: workspace:*
+        version: link:apps/cli
       '@mida/crypto':
         specifier: workspace:*
         version: link:packages/crypto
@@ -239,6 +242,42 @@ importers:
       hono:
         specifier: 4.13.7
         version: 4.13.7
+      viem:
+        specifier: 2.56.3
+        version: 2.56.3(typescript@5.9.3)(zod@4.5.4)
+
+  apps/cli:
+    dependencies:
+      '@hono/node-server':
+        specifier: 1.19.17
+        version: 1.19.17(hono@4.13.7)
+      '@mida/api':
+        specifier: workspace:*
+        version: link:../api
+      '@mida/chain':
+        specifier: workspace:*
+        version: link:../../packages/chain
+      '@mida/crypto':
+        specifier: workspace:*
+        version: link:../../packages/crypto
+      '@mida/fake-vault':
+        specifier: workspace:*
+        version: link:../../packages/fake-vault
+      '@mida/grant-advisor':
+        specifier: workspace:*
+        version: link:../../packages/grant-advisor
+      '@mida/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+      '@mida/sdk':
+        specifier: workspace:*
+        version: link:../../packages/sdk
+      '@noble/curves':
+        specifier: 2.4.0
+        version: 2.4.0
+      '@noble/hashes':
+        specifier: 2.4.0
+        version: 2.4.0
       viem:
         specifier: 2.56.3
         version: 2.56.3(typescript@5.9.3)(zod@4.5.4)
