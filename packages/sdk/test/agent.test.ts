@@ -1,0 +1,171 @@
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { recoverTypedDataAddress } from "viem"
+import type { LocalAccount } from "viem"
+import { privateKeyToAccount } from "viem/accounts"
+import { PERMISSION, PROVENANCE_POLICY, accessRequestTypedData, namespaceId, sortScopes } from "@mida/protocol"
+import type { AccessGrantResponse, Hex } from "@mida/protocol"
+import { hexOf } from "@mida/crypto"
+import { ANVIL_PRIVATE_KEYS, createWriteContext, deployLocal, fundLocal, latestTimestamp, startAnvil } from "@mida/chain"
+import type { Deployment, LocalNode, LocalWriteContext } from "@mida/chain"
+import { FakeVaultAuthority, provisionAgent } from "@mida/fake-vault"
+import type { AgentDeclaration, ProvisionedAgent } from "@mida/fake-vault"
+import { ContextApiClient, RegistryReader, createContextApi } from "@mida/api"
+import { randomBytes } from "@noble/hashes/utils.js"
+import { MidaAgent } from "@mida/sdk"
+
+const CAREER = namespaceId("goals.career")
+const SEED = new Uint8Array(32).fill(0x42)
+const P256_KEY: Hex = `0x${"4d".repeat(32)}`
+
+describe("MidaAgent (plan Task 25)", () => {
+  let node: LocalNode
+  let deployment: Deployment
+  let owner: LocalWriteContext
+  let app: ReturnType<typeof createContextApi>["app"]
+  let vault: FakeVaultAuthority
+  let aliceContextId: Hex
+  const provisioned: Record<string, ProvisionedAgent> = {}
+  const sdk: Record<string, MidaAgent> = {}
+  const apis: Record<string, ContextApiClient> = {}
+
+  const clientFor = (account: LocalAccount) =>
+    new ContextApiClient({
+      baseUrl: "http://mida.test",
+      account,
+      chainId: deployment.chainId,
+      capabilityRegistry: deployment.capabilityRegistry,
+      fetch: async (url, init) => app.request(url, init),
+    })
+
+  async function agent(label: string, index: number, declarations: AgentDeclaration[]) {
+    const operator = createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[index]!) })
+    const agent = await provisionAgent({ operator, name: label, purposeId: "career_coaching", declarations, callbackOrigin: `https://${label.toLowerCase()}.example` })
+    await fundLocal(node.rpcUrl, agent.signer.address)
+    provisioned[label] = agent
+    apis[label] = clientFor(agent.signer)
+    sdk[label] = new MidaAgent({
+      agentId: agent.agentId,
+      callbackOrigin: agent.callbackOrigin,
+      encryptionPrivateKey: agent.encryptionPrivateKey,
+      chain: createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: agent.signer }),
+      api: apis[label]!,
+    })
+  }
+
+  beforeAll(async () => {
+    node = await startAnvil()
+    deployment = await deployLocal({ rpcUrl: node.rpcUrl })
+    owner = createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[1]!) })
+    app = createContextApi({ reader: new RegistryReader(owner), deployment, dataDir: mkdtempSync(join(tmpdir(), "mida-sdk-")) }).app
+    vault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: P256_KEY, chain: owner, api: clientFor(owner.account) })
+    await vault.registerOwnerKey()
+    await vault.initializeNamespace("goals.career")
+    await agent("A", 2, [
+      { namespace: "goals.career", permissions: ["READ"] },
+      { namespace: "financial", permissions: ["READ"] },
+    ])
+    await agent("C", 3, [{ namespace: "goals.career", permissions: ["CREATE", "SUPERSEDE_OWN"], provenancePolicies: ["ALLOW_INFERENCE", "ALLOW_IMPORTED"] }])
+    await agent("D", 4, [{ namespace: "goals.career", permissions: ["READ"] }])
+    await agent("N", 5, [{ namespace: "goals.career", permissions: ["READ"] }])
+    aliceContextId = (
+      await vault.createOwnerContext({ namespace: "goals.career", payload: { v: 1, value: "Prioritize systems engineering", kind: "GOAL", provenance: { source: "USER_ASSERTED" } } })
+    ).contextId
+  }, 300_000)
+
+  afterAll(async () => {
+    await node?.stop()
+  })
+
+  it("createAccessRequest canonicalizes, expands parents, sorts, signs with the registered signer and lasts 300 seconds", async () => {
+    const request = await sdk.A!.createAccessRequest({
+      purposeId: "career_coaching",
+      scopes: [
+        { namespace: " Goals.Career ", permissions: PERMISSION.READ },
+        { namespace: "financial", permissions: PERMISSION.READ },
+      ],
+    })
+    const expected = sortScopes(
+      ["goals.career", "financial", "financial.preferences"].map((name) => ({ namespaceId: namespaceId(name), permissions: PERMISSION.READ, provenancePolicy: 0 })),
+    )
+    expect(request.scopes).toEqual(expected)
+    expect(BigInt(request.requestExpiresAt) - BigInt(request.issuedAt)).toBe(300n)
+    expect(request.manifestHash).toBe(provisioned.A!.manifestHash)
+    const { agentSignature, ...unsigned } = request
+    const typedData = accessRequestTypedData(unsigned)
+    expect(await recoverTypedDataAddress({ ...typedData, signature: agentSignature } as never)).toBe(provisioned.A!.signer.address)
+  })
+
+  it("completes the Vault's recommended grant only after proving it on Monad, and never twice", async () => {
+    const request = await sdk.A!.createAccessRequest({ purposeId: "career_coaching", scopes: [{ namespace: "goals.career", permissions: PERMISSION.READ }, { namespace: "financial", permissions: PERMISSION.READ }] })
+    const approval = await vault.approveGrant({ accessRequest: request, manifest: provisioned.A!.manifest, selection: { kind: "recommended" } })
+    const grant = await sdk.A!.completeAccessRequest(request, approval.response)
+    expect(grant.capabilities.map((c) => [c.namespaceId, c.permissions])).toEqual([[CAREER, PERMISSION.READ]])
+    await expect(sdk.A!.completeAccessRequest(request, approval.response)).rejects.toMatchObject({ code: "REQUEST_CONSUMED" })
+  })
+
+  it("rejects a broadened response, a capability or transaction Monad does not hold, and a different request, without consuming", async () => {
+    const request = await sdk.D!.createAccessRequest({ purposeId: "career_coaching", scopes: [{ namespace: "goals.career", permissions: PERMISSION.READ }] })
+    const { response } = await vault.approveGrant({ accessRequest: request, manifest: provisioned.D!.manifest, selection: { kind: "recommended" } })
+    const first = response.capabilities[0]!
+    const withCapability = (patch: Partial<typeof first>): AccessGrantResponse => ({ ...response, capabilities: [{ ...first, ...patch }] })
+    await expect(sdk.D!.completeAccessRequest(request, withCapability({ permissions: PERMISSION.READ | PERMISSION.CREATE }))).rejects.toMatchObject({ code: "RESPONSE_MISMATCH" })
+    await expect(sdk.D!.completeAccessRequest(request, withCapability({ capabilityId: hexOf(randomBytes(32)) }))).rejects.toMatchObject({ code: "RESPONSE_MISMATCH" })
+    await expect(sdk.D!.completeAccessRequest(request, withCapability({ transactionHash: hexOf(randomBytes(32)) }))).rejects.toMatchObject({ code: "RESPONSE_MISMATCH" })
+    await expect(sdk.D!.completeAccessRequest({ ...request, capabilityExpiresAt: "1" }, response)).rejects.toMatchObject({ code: "RESPONSE_MISMATCH" })
+    await expect(sdk.D!.completeAccessRequest(request, { ...response, requestId: hexOf(randomBytes(32)) })).rejects.toMatchObject({ code: "RESPONSE_MISMATCH" })
+    expect((await sdk.D!.completeAccessRequest(request, response)).capabilities).toHaveLength(1)
+  })
+
+  it("reads owner context by verifying Monad commitments and unwrapping its own epoch key; an ungranted agent is denied", async () => {
+    const objects = await sdk.A!.read(vault.owner, "goals.career")
+    expect(objects.find((o) => o.contextId === aliceContextId)?.payload.value).toBe("Prioritize systems engineering")
+    await expect(sdk.N!.read(vault.owner, "goals.career")).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
+  })
+
+  let created: Hex
+
+  it("a CREATE-only agent writes with the public epoch key alone and cannot read anything back", async () => {
+    const scopes = [{ namespace: "goals.career", permissions: PERMISSION.CREATE | PERMISSION.SUPERSEDE_OWN, provenancePolicy: PROVENANCE_POLICY.ALLOW_INFERENCE | PROVENANCE_POLICY.ALLOW_IMPORTED }]
+    const request = await sdk.C!.createAccessRequest({ purposeId: "career_coaching", scopes })
+    const expiresAt = (await latestTimestamp(owner)) + 7n * 86_400n
+    const { response } = await vault.approveGrant({ accessRequest: request, manifest: provisioned.C!.manifest, selection: { kind: "custom", scopes: request.scopes, expiresAt } })
+    await sdk.C!.completeAccessRequest(request, response)
+
+    const object = await sdk.C!.create(vault.owner, "goals.career", { value: "Systems engineering is the focus", kind: "GOAL", source: "AGENT_INFERRED" })
+    created = object.contextId
+    expect(object).toMatchObject({ authorId: provisioned.C!.agentId, version: 1, lineageId: object.contextId, readEpoch: 1n })
+    const seen = (await sdk.A!.read(vault.owner, "goals.career")).find((o) => o.contextId === created)!
+    expect(seen.payload.provenance.source).toBe("AGENT_INFERRED")
+    await expect(sdk.C!.read(vault.owner, "goals.career")).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
+    await expect(apis.C!.listObjects({ owner: vault.owner, namespaceId: CAREER, capabilityId: response.capabilities[0]!.capabilityId })).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
+  })
+
+  it("propose always writes AGENT_INFERRED; user provenance and reference-less imports are refused before any upload", async () => {
+    const proposed = await sdk.C!.propose(vault.owner, "goals.career", { value: "Consider staff engineer roles" })
+    expect(proposed.payload.provenance.source).toBe("AGENT_INFERRED")
+    expect(proposed.payload.kind).toBe("INFERENCE")
+    const uploads = vi.spyOn(apis.C!, "putObject")
+    for (const source of ["USER_ASSERTED", "USER_CONFIRMED"]) {
+      await expect(sdk.C!.create(vault.owner, "goals.career", { value: "x", kind: "GOAL", source: source as never })).rejects.toMatchObject({ code: "PROVENANCE_FORBIDDEN" })
+    }
+    await expect(sdk.C!.create(vault.owner, "goals.career", { value: "x", kind: "FACT", source: "IMPORTED" })).rejects.toMatchObject({ code: "PROVENANCE_FORBIDDEN" })
+    expect(uploads).not.toHaveBeenCalled()
+    uploads.mockRestore()
+  })
+
+  it("supersedes its own lineage, then loses to the stale-parent rule when reusing the old parent", async () => {
+    const next = await sdk.C!.supersede(vault.owner, created, { value: "Systems engineering, v2", kind: "GOAL", source: "AGENT_INFERRED" })
+    expect(next).toMatchObject({ version: 2, parentId: created, lineageId: created })
+    await expect(sdk.C!.supersede(vault.owner, created, { value: "late", kind: "GOAL", source: "AGENT_INFERRED" })).rejects.toMatchObject({ code: "STALE_PARENT" })
+  })
+
+  it("verifies evidence references on read: a real reference passes, a reference to a record that does not exist fails", async () => {
+    await sdk.C!.create(vault.owner, "goals.career", { value: "Imported from CV", kind: "FACT", source: "IMPORTED", references: [{ relation: "derived_from", recordId: aliceContextId }] })
+    expect((await sdk.A!.read(vault.owner, "goals.career")).some((o) => o.payload.value === "Imported from CV")).toBe(true)
+    await sdk.C!.create(vault.owner, "goals.career", { value: "Dangling", kind: "FACT", source: "IMPORTED", references: [{ relation: "supports", recordId: hexOf(randomBytes(32)) }] })
+    await expect(sdk.A!.read(vault.owner, "goals.career")).rejects.toMatchObject({ code: "COMMITMENT_MISMATCH" })
+  })
+})

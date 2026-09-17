@@ -1,0 +1,16 @@
+{
+  "name": "@mida/sdk",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@mida/api": "workspace:*",
+    "@mida/chain": "workspace:*",
+    "@mida/crypto": "workspace:*",
+    "@mida/grant-advisor": "workspace:*",
+    "@mida/protocol": "workspace:*",
+    "@noble/hashes": "2.4.0",
+    "viem": "2.56.3"
+  }
+}

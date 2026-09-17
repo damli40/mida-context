@@ -20,6 +20,7 @@
     "@mida/fake-vault": "workspace:*",
     "@mida/grant-advisor": "workspace:*",
     "@mida/protocol": "workspace:*",
+    "@mida/sdk": "workspace:*",
     "@mida/storage": "workspace:*"
   },
   "devDependencies": {
