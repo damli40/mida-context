@@ -5,9 +5,11 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http"
 import { SOCKET_FILE, callDaemon, socketPathFor } from "./control.js"
 import { drainUntilSettled } from "./drain.js"
 import type { DrainDeps, DrainResult } from "./drain.js"
+import { buildHandoff } from "./handoff.js"
 import { FLUSH_EVENTS } from "./hook.js"
 import type { MidaHome } from "./home.js"
-import { listJobs } from "./queue.js"
+import { isSafeName, listJobs } from "./queue.js"
+import { authorNamesFor } from "./skeleton.js"
 import { Runtime } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { USAGE, runCliWithRuntime, validCliArgv } from "./cli.js"
@@ -43,6 +45,8 @@ export interface DaemonDeps {
   passWaitCapMs?: number
   /** Stale-socket health probe timeout; default 500 ms. */
   staleCheckMs?: number
+  /** /handoff's read budget; default 7.5 s so the answer beats the hook's 8 s client timeout. */
+  handoffLimitMs?: number
 }
 
 export interface DaemonHandle {
@@ -215,6 +219,36 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       const lines: string[] = []
       const code = await runCli(argv, runtime, (line) => lines.push(line), { cwd }).catch(() => 1)
       respond(res, 200, { code, lines })
+      return
+    }
+    if (req.url === "/handoff") {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(body.toString("utf8"))
+      } catch {
+        parsed = undefined
+      }
+      const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
+      const agent = typeof record.agent === "string" ? record.agent : ""
+      const cwd = typeof record.cwd === "string" ? record.cwd : ""
+      const started = deps.now()
+      const result = await buildHandoff(
+        runtime,
+        { agent, cwd, authorNames: authorNamesFor(runtime) },
+        { limitMs: deps.handoffLimitMs },
+      )
+      // one stable line per call: codes, names, counts and timings — never request or handoff text
+      deps.log({
+        event: "handoff",
+        agent: isSafeName(agent) ? agent : null,
+        kind: result.kind,
+        reason: result.kind === "refused" ? result.reason : null,
+        checkpoints: result.kind === "handoff" ? result.checkpoints : 0,
+        facts: result.kind === "refused" ? 0 : result.facts,
+        readMs: result.kind === "refused" ? null : result.readMs,
+        ms: deps.now() - started,
+      })
+      respond(res, 200, result)
       return
     }
     respond(res, 404, { error: "not-found" })

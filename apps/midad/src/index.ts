@@ -19,3 +19,5 @@ export { SOCKET_FILE, callDaemon, ensureDaemon, socketPathFor } from "./control.
 export type { ControlReply } from "./control.js"
 export { startDaemon } from "./daemon.js"
 export type { DaemonDeps, DaemonHandle } from "./daemon.js"
+export { buildHandoff, noContextText } from "./handoff.js"
+export type { CapabilityState, HandoffDeps, HandoffResult } from "./handoff.js"

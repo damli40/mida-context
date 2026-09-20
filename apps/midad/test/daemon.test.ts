@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { MidaHome, callDaemon, enqueue, listJobs, removeJob, socketPathFor, startDaemon } from "@mida/midad"
@@ -183,6 +183,55 @@ describe("startDaemon", () => {
       expect((await callDaemon(home, "/health", undefined, { timeoutMs: 1_000 })).status).toBe(200)
     } finally {
       await again.close()
+    }
+  })
+
+  it("POST /handoff answers a refusal for an unapproved folder and logs one stable line", async () => {
+    const { home, deps, stubRuntime, logs } = setup()
+    // a real marked project folder, but no approved-projects.json in the home — checkProject
+    // runs against the stub runtime's home and answers not-approved
+    const work = mkdtempSync(join(tmpdir(), "mida-handoff-work-"))
+    mkdirSync(join(work, ".mida"))
+    writeFileSync(join(work, ".mida", "project.json"), JSON.stringify({ projectId: "proj-x" }))
+    const daemon = await startDaemon({
+      ...deps,
+      openRuntime: async () => ({ ...stubRuntime, home }) as Runtime,
+    })
+    try {
+      const reply = await callDaemon(home, "/handoff", { agent: "codex", cwd: work }, { timeoutMs: 2_000 })
+      expect(reply.status).toBe(200)
+      expect(reply.body).toEqual({
+        kind: "refused",
+        reason: "not-approved",
+        text: "Mida: codex is not approved for this project — run `mida approve codex` in this folder.",
+      })
+      const entries = logs.filter((e) => (e as { event?: string }).event === "handoff")
+      expect(entries).toHaveLength(1)
+      expect(entries[0]).toMatchObject({ agent: "codex", kind: "refused", reason: "not-approved", checkpoints: 0, facts: 0 })
+      expect(JSON.stringify(entries[0])).not.toContain("not approved for this project")
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it("POST /handoff refuses an unsafe agent name and logs null for it, never the name", async () => {
+    const { home, deps, stubRuntime, logs } = setup()
+    const daemon = await startDaemon({
+      ...deps,
+      openRuntime: async () => ({ ...stubRuntime, home }) as Runtime,
+    })
+    try {
+      const reply = await callDaemon(home, "/handoff", { agent: "../agents", cwd: "/tmp" }, { timeoutMs: 2_000 })
+      expect(reply.body).toEqual({
+        kind: "refused",
+        reason: "bad-agent",
+        text: "Mida: no context available right now (bad-agent).",
+      })
+      const entry = logs.find((e) => (e as { event?: string }).event === "handoff")!
+      expect(entry).toMatchObject({ agent: null, kind: "refused", reason: "bad-agent" })
+      expect(JSON.stringify(entry)).not.toContain("..")
+    } finally {
+      await daemon.close()
     }
   })
 

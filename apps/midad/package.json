@@ -7,7 +7,9 @@
     ".": "./src/index.ts"
   },
   "bin": {
-    "midad": "./src/daemon-main.ts"
+    "midad": "./src/daemon-main.ts",
+    "mida-hook": "./src/hook-main.ts",
+    "mida-inject": "./src/inject-main.ts"
   },
   "dependencies": {
     "@hono/node-server": "1.19.17",
