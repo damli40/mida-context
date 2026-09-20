@@ -73,6 +73,17 @@ export function loadOrCreateSignerKey(home: MidaHome, name: string): Hex {
   return signerPrivateKey
 }
 
+/**
+ * Throws away the saved signer key and writes a fresh one. Used when the saved key turns out to be bound to a
+ * registration whose encryption key was never persisted: that agent can never read, so a new signer is required.
+ */
+export function replaceSignerKey(home: MidaHome, name: string): Hex {
+  assertName(name)
+  const signerPrivateKey = generatePrivateKey()
+  home.writeSecretJson(`agents/${name}/signer.json`, { signerPrivateKey })
+  return signerPrivateKey
+}
+
 export function identityFrom(name: string, signerPrivateKey: Hex, provisioned: ProvisionedAgent): AgentIdentity {
   assertName(name)
   if (privateKeyToAccount(signerPrivateKey).address !== provisioned.signer.address) {

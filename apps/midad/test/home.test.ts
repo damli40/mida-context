@@ -76,6 +76,15 @@ describe("MidaHome", () => {
     expect(readdirSync(home.path("owner"))).toEqual(["secrets.json"])
   })
 
+  it("removes a file, ignores one that is already gone, and still refuses an escape", () => {
+    const home = freshHome()
+    home.writeSecretJson("agents/codex/pending-request.json", { v: 1 })
+    home.remove("agents/codex/pending-request.json")
+    expect(home.has("agents/codex/pending-request.json")).toBe(false)
+    expect(() => home.remove("agents/codex/pending-request.json")).not.toThrow()
+    expect(() => home.remove("../outside.json")).toThrow()
+  })
+
   it("lists the entries of a folder, and an empty list for a missing one", () => {
     const home = freshHome()
     home.writeSecretJson("agents/codex/identity.json", {})

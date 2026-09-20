@@ -4,6 +4,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { privateKeyToAccount } from "viem/accounts"
+import { PERMISSION, PROVENANCE_POLICY, namespaceId } from "@mida/protocol"
+import type { Hex } from "@mida/protocol"
 import { bytesOf } from "@mida/crypto"
 import { createWriteContext } from "@mida/chain"
 import { ContextApiClient } from "@mida/api"
@@ -11,7 +13,7 @@ import { MidaAgent } from "@mida/sdk"
 import { localEnvironment, monadTestnetEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
-  AGENT_PERMISSIONS, MidaHome, Runtime, approve, init, loadAgentIdentity, loadGrants, readCheckpoints, requestAccess, revoke, saveCheckpoint,
+  AGENT_PERMISSIONS, MidaHome, Runtime, approve, init, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, readCheckpoints, requestAccess, revoke, saveCheckpoint,
 } from "@mida/midad"
 import type { Network } from "@mida/midad"
 
@@ -26,6 +28,7 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
   let home: MidaHome
   let runtime: Runtime
   let grantGasUsed = ""
+  let registeredAgents: Record<string, Hex>
   const timings = { save: [] as number[], read: [] as number[] }
   const transactions: Record<string, string> = {}
   const step = (name: string, fn: () => Promise<void>) => it(name, fn, STEP_TIMEOUT)
@@ -44,6 +47,7 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
 
   step("1. init registers the owner, opens projects.current, and registers BOTH agents from ONE operator wallet", async () => {
     const result = await init(runtime, AGENTS)
+    registeredAgents = result.agents
     expect(Object.keys(result.agents).sort()).toEqual(["claude-code", "codex"])
     expect(result.agents["claude-code"]).not.toBe(result.agents.codex)
     for (const name of AGENTS) {
@@ -51,11 +55,14 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     }
   })
 
-  step("2. init is safe to run again: same agents, and the owner sends no new transaction", async () => {
-    const before = await runtime.ownerChain.publicClient.getTransactionCount({ address: runtime.owner })
+  step("2. init is safe to run again: same agents, and neither the owner nor the operator sends a new transaction", async () => {
+    const operatorAddress = privateKeyToAccount(loadOrCreateOperatorSecrets(home).privateKey).address
+    const ownerBefore = await runtime.ownerChain.publicClient.getTransactionCount({ address: runtime.owner })
+    const operatorBefore = await runtime.ownerChain.publicClient.getTransactionCount({ address: operatorAddress })
     const again = await init(runtime, AGENTS)
-    expect(again.agents["claude-code"]).toBe(runtime.agent("claude-code").agentId)
-    expect(await runtime.ownerChain.publicClient.getTransactionCount({ address: runtime.owner })).toBe(before)
+    expect(again.agents).toEqual(registeredAgents)
+    expect(await runtime.ownerChain.publicClient.getTransactionCount({ address: runtime.owner })).toBe(ownerBefore)
+    expect(await runtime.ownerChain.publicClient.getTransactionCount({ address: operatorAddress })).toBe(operatorBefore)
   })
 
   step("3. an agent that was never approved can neither save nor read", async () => {
@@ -130,6 +137,10 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     expect(result.transactionHashes).toHaveLength(1)
     expect(result.rewrapped).toEqual(["codex"])
     transactions.revokeAndRotate = result.transactionHashes[0]!
+    const claudeId = registeredAgents["claude-code"]!
+    const current = namespaceId("projects.current")
+    expect(await runtime.reader.hasAuthority(runtime.owner, claudeId, current, PERMISSION.READ, 0)).toBe(false)
+    expect(await runtime.reader.hasAuthority(runtime.owner, claudeId, current, PERMISSION.CREATE, PROVENANCE_POLICY.ALLOW_INFERENCE)).toBe(false)
     await expect(readCheckpoints(runtime, "claude-code", "proj-1")).rejects.toMatchObject({ code: "CAPABILITY_REVOKED" })
     await expect(saveCheckpoint(runtime, "claude-code", { projectId: "proj-1", checkpoint: CHECKPOINT })).rejects.toMatchObject({
       code: expect.stringMatching(/^CAPABILITY_(REVOKED|DENIED)$/),

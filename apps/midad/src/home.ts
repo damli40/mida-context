@@ -92,6 +92,14 @@ export class MidaHome {
     return true
   }
 
+  /** Removes a file inside the home. A missing file is not an error; the same escape rules apply as for reads. */
+  remove(relativePath: string): void {
+    const full = this.path(relativePath)
+    if (!existsSync(full)) return
+    rmSync(full)
+    this.#fsyncFolder(dirname(full))
+  }
+
   list(relativePath: string): string[] {
     const full = this.path(relativePath)
     return existsSync(full) ? readdirSync(full) : []

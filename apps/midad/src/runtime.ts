@@ -25,6 +25,8 @@ export const PURPOSE_ID = "project_assistance" as const
 export const AGENT_PERMISSIONS = PERMISSION.READ | PERMISSION.CREATE | PERMISSION.SUPERSEDE_OWN
 /** Below this balance an account is topped up before it has to send a transaction. */
 const MIN_BALANCE_WEI = 50_000_000_000_000_000n
+/** One runtime per home: a pid file created exclusively at open and removed at close. */
+const LOCK_FILE = "midad.lock"
 
 export class Runtime {
   readonly #agents = new Map<string, MidaAgent>()
@@ -48,15 +50,61 @@ export class Runtime {
   }
 
   static async open(home: MidaHome, network: Network): Promise<Runtime> {
-    const secrets = loadOrCreateOwnerSecrets(home)
-    const ownerAccount = privateKeyToAccount(secrets.privateKey)
-    const server = await startPersistentApi({ rpcUrl: network.rpcUrl, deployment: network.deployment, dataDir: home.path("data") })
-    const ownerChain = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: ownerAccount })
-    const ownerApi = Runtime.#apiClient(server.baseUrl, network.deployment, ownerAccount)
-    const vault = new FakeVaultAuthority({ seed: bytesOf(secrets.seed, 32), p256PrivateKey: secrets.p256PrivateKey, chain: ownerChain, api: ownerApi })
-    const runtime = new Runtime(home, network, ownerChain, ownerApi, vault, new RegistryReader(ownerChain), server.baseUrl, server.close)
-    for (const name of listAgentNames(home)) runtime.attach(loadAgentIdentity(home, name)!)
-    return runtime
+    Runtime.#acquireLock(home)
+    let server: { baseUrl: string; close(): Promise<void> } | undefined
+    try {
+      const secrets = loadOrCreateOwnerSecrets(home)
+      const ownerAccount = privateKeyToAccount(secrets.privateKey)
+      server = await startPersistentApi({ rpcUrl: network.rpcUrl, deployment: network.deployment, dataDir: home.path("data") })
+      const ownerChain = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: ownerAccount })
+      const ownerApi = Runtime.#apiClient(server.baseUrl, network.deployment, ownerAccount)
+      const vault = new FakeVaultAuthority({ seed: bytesOf(secrets.seed, 32), p256PrivateKey: secrets.p256PrivateKey, chain: ownerChain, api: ownerApi })
+      const running = server
+      const runtime = new Runtime(home, network, ownerChain, ownerApi, vault, new RegistryReader(ownerChain), running.baseUrl, async () => {
+        try {
+          await running.close()
+        } finally {
+          home.remove(LOCK_FILE)
+        }
+      })
+      for (const name of listAgentNames(home)) runtime.attach(loadAgentIdentity(home, name)!)
+      return runtime
+    } catch (error) {
+      if (server !== undefined) await server.close()
+      home.remove(LOCK_FILE)
+      throw error
+    }
+  }
+
+  /**
+   * Takes the home's lock or throws. A live pid in an existing lock means another Mida process holds it; a dead or
+   * unreadable lock is stale and is replaced. `createSecretJsonExclusive` makes the check-then-create race-free.
+   */
+  static #acquireLock(home: MidaHome): void {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (home.createSecretJsonExclusive(LOCK_FILE, { pid: process.pid })) return
+      let pid = 0
+      try {
+        const held = home.readJson<{ pid?: unknown }>(LOCK_FILE)
+        if (typeof held?.pid === "number") pid = held.pid
+      } catch {
+        // A lock file that will not parse is stale: take it over.
+      }
+      if (pid > 0 && Runtime.#processAlive(pid)) {
+        throw new Error(`another Mida process (pid ${pid}) already holds this home`)
+      }
+      home.remove(LOCK_FILE)
+    }
+    throw new Error("another Mida process already holds this home")
+  }
+
+  static #processAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "EPERM"
+    }
   }
 
   static #apiClient(baseUrl: string, deployment: Deployment, account: LocalAccount): ContextApiClient {
