@@ -7,9 +7,14 @@ import { AGENT_PERMISSIONS, NAMESPACE, PURPOSE_ID } from "./runtime.js"
 import type { Runtime } from "./runtime.js"
 import { FileAccessRequestStore } from "./request-store.js"
 import {
-  identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadOrCreateOperatorSecrets, loadOrCreateSignerKey,
+  identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, loadOrCreateSignerKey,
   markRevoked, replaceSignerKey, saveAgentIdentity, saveGrants,
 } from "./keys.js"
+
+/** "Approved" means the chain lists at least one live capability for this owner–agent pair — any permission. */
+async function hasAnyLiveCapability(runtime: Runtime, agentId: Hex): Promise<boolean> {
+  return (await runtime.reader.activeCapabilityIds(runtime.owner, agentId)).length > 0
+}
 
 const CHECKPOINT_TYPE = "mida.checkpoint.v0"
 const GRANT_LIFETIME_SECONDS = 30 * 24 * 60 * 60
@@ -60,7 +65,7 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
 /** Spec §5B step 1: the agent asks. The request is on disk before this returns, and so is which request is pending. */
 export async function requestAccess(runtime: Runtime, name: string): Promise<{ requestId: Hex }> {
   const identity = loadAgentIdentity(runtime.home, name)
-  if (identity !== undefined && (await runtime.reader.hasAuthority(runtime.owner, identity.agentId, NAMESPACE_ID, PERMISSION.READ, 0))) {
+  if (identity !== undefined && (await hasAnyLiveCapability(runtime, identity.agentId))) {
     throw new Error(`agent "${name}" is already approved`)
   }
   const request = await runtime.agent(name).createAccessRequest({
@@ -80,13 +85,15 @@ export async function approve(runtime: Runtime, name: string): Promise<{ capabil
   if (identity === undefined || pending === undefined) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
   const stored = await new FileAccessRequestStore(home, name).load(pending.request.requestId)
   if (stored === undefined || stored.consumed) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
-  if (await reader.hasAuthority(owner, identity.agentId, NAMESPACE_ID, PERMISSION.READ, 0)) {
+  if (await hasAnyLiveCapability(runtime, identity.agentId)) {
     throw new Error(`agent "${name}" is already approved`)
   }
   const approval = await vault.approveGrant({ accessRequest: pending.request, manifest: identity.manifest, selection: { kind: "recommended" } })
   const agent = runtime.agent(name)
   const grant = await agent.completeAccessRequest(pending.request, approval.response)
   saveGrants(home, name, [...agent.grants])
+  // A marker left by an earlier revoke must not outlive a fresh approval.
+  home.remove(`agents/${name}/revoked.json`)
   home.remove(`agents/${name}/pending-request.json`)
   return {
     capabilityIds: grant.capabilities.map((capability) => capability.capabilityId),
@@ -135,28 +142,51 @@ export async function readCheckpoints(runtime: Runtime, name: string, projectId:
  */
 export async function revoke(runtime: Runtime, name: string): Promise<{ transactionHashes: Hex[]; rewrapped: string[] }> {
   const { home, vault, reader, owner } = runtime
-  const identity = loadAgentIdentity(home, name)
-  if (identity === undefined) throw new Error(`agent "${name}" is not set up on this machine; run init first`)
+  const agentId = await resolveAgentId(runtime, name)
   const transactionHashes: Hex[] = []
-  if ((await reader.activeCapabilityIds(owner, identity.agentId)).length > 0) {
-    transactionHashes.push((await vault.approveRevocation({ kind: "agent", agentId: identity.agentId })).transactionHash)
+  const hadAuthority = (await reader.activeCapabilityIds(owner, agentId)).length > 0
+  if (hadAuthority) {
+    transactionHashes.push((await vault.approveRevocation({ kind: "agent", agentId })).transactionHash)
   }
-  markRevoked(home, name)
+  // Marker only when something was revoked now, or a previous run already got that far (crash between stages).
+  if (hadAuthority || isRevoked(home, name)) markRevoked(home, name)
   const rewrapped = await repairReaderWraps(runtime)
   return { transactionHashes, rewrapped }
 }
 
 /**
- * Publishes reader wraps for the current read epoch to every agent that still has authority on chain and is not
- * revoked locally. This is revoke's third stage, exported so a crash between the revocation transaction and the
+ * Publishes reader wraps for the current read epoch to every agent that still has READ authority on chain. The
+ * chain alone decides who survives; the local revoked marker is never consulted, so it cannot blind a re-approved agent. This is revoke's third stage, exported so a crash between the revocation transaction and the
  * rewrap can be repaired without re-sending anything.
  */
+/**
+ * Revoking must not depend on one local file surviving: identity.json, else any saved grant, else the chain's
+ * own signer-to-agent mapping. A damaged file counts as missing.
+ */
+async function resolveAgentId(runtime: Runtime, name: string): Promise<Hex> {
+  const { home, reader } = runtime
+  const quietly = <T>(load: () => T): T | undefined => {
+    try { return load() } catch { return undefined }
+  }
+  const identity = quietly(() => loadAgentIdentity(home, name))
+  if (identity !== undefined) return identity.agentId
+  const grant = quietly(() => loadGrants(home, name))?.[0]
+  if (grant !== undefined) return grant.agentId
+  if (home.has(`agents/${name}/signer.json`)) {
+    const signerKey = quietly(() => loadOrCreateSignerKey(home, name))
+    const onChain = signerKey === undefined ? null : await reader.agentIdOfSigner(privateKeyToAccount(signerKey).address)
+    if (onChain !== null) return onChain
+  }
+  throw new Error(`agent "${name}" cannot be identified: identity.json, grants.json and a registered signer.json are all missing or unreadable under agents/${name}/`)
+}
+
 export async function repairReaderWraps(runtime: Runtime): Promise<string[]> {
   const { home, vault, reader, owner } = runtime
   const rewrapped: string[] = []
   for (const name of listAgentNames(home)) {
-    if (isRevoked(home, name)) continue
-    const identity = loadAgentIdentity(home, name)
+    // A damaged identity.json cannot receive a wrap; it must not stop the others from getting theirs.
+    let identity: ReturnType<typeof loadAgentIdentity>
+    try { identity = loadAgentIdentity(home, name) } catch { continue }
     if (identity === undefined) continue
     if (!(await reader.hasAuthority(owner, identity.agentId, NAMESPACE_ID, PERMISSION.READ, 0))) continue
     await vault.publishReaderWraps({ agentId: identity.agentId, namespaceId: NAMESPACE_ID })
