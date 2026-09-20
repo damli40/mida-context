@@ -103,7 +103,13 @@ export function validateCheckpoint(
   if (typeof input.source !== "string" || !SOURCES.has(input.source)) {
     errors.push(`source: must be one of ${[...SOURCES].join(" | ")}`)
   }
-  if (typeof input.createdAt !== "string" || Number.isNaN(Date.parse(input.createdAt))) {
+  // Date.parse alone is too lenient — it accepts "2026", "1" and
+  // "March 3 2020". The timestamp must be actual ISO-8601 AND parse.
+  if (
+    typeof input.createdAt !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(input.createdAt) ||
+    Number.isNaN(Date.parse(input.createdAt))
+  ) {
     errors.push("createdAt: must be an ISO-8601 date string")
   }
 

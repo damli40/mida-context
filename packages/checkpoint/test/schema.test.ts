@@ -107,4 +107,13 @@ describe("validateCheckpoint", () => {
       createdAt: "yesterday", objective: "o", nextAction: "n" })
     expect(r.ok).toBe(false)
   })
+
+  it("rejects createdAt strings that Date.parse accepts but that are not ISO-8601 (A13)", () => {
+    for (const createdAt of ["2026", "1", "March 3 2020"]) {
+      expect(validateCheckpoint(validCp({ createdAt })).ok, createdAt).toBe(false)
+    }
+    for (const createdAt of ["2026-09-21T10:00:00Z", "2026-09-21T10:00:00.123Z", "2026-09-21T10:00:00+02:00"]) {
+      expect(validateCheckpoint(validCp({ createdAt })).ok, createdAt).toBe(true)
+    }
+  })
 })
