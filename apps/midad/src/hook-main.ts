@@ -1,31 +1,51 @@
 import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { MidaHome } from "./home.js"
-import { runHook } from "./hook.js"
+import { extractHookFields, runHook } from "./hook.js"
+import { appendLog } from "./log.js"
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 const DRAIN_MAIN = fileURLToPath(new URL("./drain-main.ts", import.meta.url))
 const STDIN_CAP_BYTES = 1_000_000
+const HEAD_BYTES = 64 * 1024
 
-/** Reads all of stdin, giving up on anything past 1 MB — a hooked CLI should never send more. */
-async function readStdin(cap: number): Promise<string> {
+/**
+ * Reads stdin to EOF — stopping early would leave the hooked CLI holding a full pipe. Only the
+ * first `cap` bytes are kept: a payload bigger than that is reported as `input-too-large` or
+ * salvaged by field extraction, never parsed as JSON.
+ */
+async function readStdin(cap: number): Promise<{ text: string; oversized: boolean }> {
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of process.stdin) {
     const buf = chunk as Buffer
     size += buf.length
-    if (size > cap) break
-    chunks.push(buf)
+    if (size <= cap) chunks.push(buf)
   }
-  return Buffer.concat(chunks).toString("utf8")
+  return { text: Buffer.concat(chunks).toString("utf8"), oversized: size > cap }
 }
 
 async function main(): Promise<void> {
-  const stdin = await readStdin(STDIN_CAP_BYTES)
+  const home = new MidaHome(process.env.MIDA_HOME)
+  const agent = process.argv[2] ?? "unknown"
+  const { text, oversized } = await readStdin(STDIN_CAP_BYTES)
+  let stdin = text
+  if (oversized) {
+    const fields = extractHookFields(text.slice(0, HEAD_BYTES))
+    if (
+      fields.hook_event_name !== undefined && fields.session_id !== undefined &&
+      fields.transcript_path !== undefined
+    ) {
+      stdin = JSON.stringify(fields)
+    } else {
+      appendLog(home, "hook", { agent, outcome: "ignored", reason: "input-too-large" })
+      return
+    }
+  }
   await runHook({
-    agent: process.argv[2] ?? "unknown",
+    agent,
     stdin,
-    home: new MidaHome(process.env.MIDA_HOME),
+    home,
     env: process.env,
     spawnDrainer: () => {
       const child = spawn(process.execPath, ["--import", "tsx", DRAIN_MAIN], {

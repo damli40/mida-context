@@ -24,6 +24,7 @@ describe("M1 drainOnce on local Anvil", () => {
   let env: ScenarioEnvironment
   let network: Network
   let home: MidaHome
+  let homeDir: string
   let workDir: string
   let transcriptPath: string
   let clock = T0
@@ -50,7 +51,7 @@ describe("M1 drainOnce on local Anvil", () => {
     }
   }
 
-  const drain = () => drainOnce({ home, open, compile, now: () => new Date(clock) })
+  const drain = () => drainOnce({ home, open, compile, now: () => new Date(clock), homeDir })
 
   const job = (over: Record<string, unknown> = {}) => enqueue(home, {
     agent: "claude-code",
@@ -86,7 +87,11 @@ describe("M1 drainOnce on local Anvil", () => {
     workDir = mkdtempSync(join(tmpdir(), "mida-work-"))
     mkdirSync(join(workDir, ".mida"))
     writeFileSync(join(workDir, ".mida", "project.json"), JSON.stringify({ projectId: PROJECT_ID }))
-    transcriptPath = join(workDir, "transcript.jsonl")
+    // the transcript lives where the drainer expects a claude-code session file: the injected
+    // "user home" folder's .claude/projects/, not the work folder
+    homeDir = mkdtempSync(join(tmpdir(), "mida-userhome-"))
+    mkdirSync(join(homeDir, ".claude", "projects", "proj"), { recursive: true })
+    transcriptPath = join(homeDir, ".claude", "projects", "proj", "transcript.jsonl")
     writeFileSync(transcriptPath, JSON.stringify({ type: "user", message: { content: "Build a rate limiter" } }) + "\n")
   }, STEP_TIMEOUT * 2)
 

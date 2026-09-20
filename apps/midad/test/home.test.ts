@@ -44,6 +44,17 @@ describe("MidaHome", () => {
     expect(() => freshHome().path("../outside.json")).toThrow()
   })
 
+  it("refuses relative paths with sneaky segments even when they resolve inside the home", () => {
+    const home = freshHome()
+    expect(() => home.path("queue/state/../../agents/x/identity.json")).toThrow()
+    expect(() => home.path("queue/../agents/x.json")).toThrow()
+    expect(() => home.path("queue//state/x.json")).toThrow()
+    expect(() => home.path("queue/state/x.json/")).toThrow()
+    expect(() => home.path("a\0b.json")).toThrow()
+    expect(() => home.path("/etc/hosts")).toThrow()
+    expect(home.path("queue/state/x.y-z_9.json")).toContain("queue/state/x.y-z_9.json")
+  })
+
   it("removes the temp file when the final rename fails, so no secret is left behind", () => {
     const home = freshHome()
     mkdirSync(home.path("owner/secrets.json"), { recursive: true })

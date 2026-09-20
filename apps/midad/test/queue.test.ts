@@ -68,6 +68,22 @@ describe("capture queue", () => {
     expect(listJobs(home)).toHaveLength(0)
     removeJob(home, saved.id)
   })
+
+  it("enqueue refuses an agent or session id that is not a safe name", () => {
+    const home = tempHome()
+    expect(() => enqueue(home, job({ sessionId: "../../agents/x/identity" }), () => T0)).toThrow()
+    expect(() => enqueue(home, job({ sessionId: ".." }), () => T0)).toThrow()
+    expect(() => enqueue(home, job({ sessionId: "" }), () => T0)).toThrow()
+    expect(() => enqueue(home, job({ agent: "../x" }), () => T0)).toThrow()
+    expect(listJobs(home)).toHaveLength(0)
+  })
+
+  it("listJobs moves a hand-crafted job file with an unsafe session id aside", () => {
+    const home = tempHome()
+    home.writeSecretJson("queue/zz-evil.json", { ...job({ sessionId: "../../agents/x/identity" }), at: T0.toISOString() })
+    expect(listJobs(home)).toHaveLength(0)
+    expect(home.has("queue/bad/zz-evil.json")).toBe(true)
+  })
 })
 
 describe("projectIdFor", () => {

@@ -17,6 +17,15 @@ export class MidaHome {
   }
 
   path(relativePath: string): string {
+    // Reject tricky input before resolving: a ".." segment, an empty segment ("a//b", "a/"), a NUL
+    // byte, or an absolute path are all invalid inside the home even when resolve() would land back in it.
+    if (
+      isAbsolute(relativePath) ||
+      relativePath.includes("\0") ||
+      relativePath.split("/").some((segment) => segment === "" || segment === "..")
+    ) {
+      throw new Error(`bad path inside the Mida home: ${relativePath}`)
+    }
     const full = resolve(this.root, relativePath)
     const back = relative(this.root, full)
     if (back.startsWith("..") || back === "") throw new Error(`path escapes the Mida home: ${relativePath}`)

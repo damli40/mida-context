@@ -21,11 +21,24 @@ export interface CaptureJob {
   at: string
 }
 
+/**
+ * Hook input is untrusted: a session id or agent name becomes a filename inside the home
+ * (`queue/state/<sessionId>.json`, `agents/<agent>/…`), so it can only be a short safe name —
+ * never a path. "." and ".." are safe-name-shaped but mean folders, so they are out too.
+ */
+export const SAFE_NAME = /^[A-Za-z0-9._-]{1,128}$/
+
+export function isSafeName(value: unknown): value is string {
+  return typeof value === "string" && SAFE_NAME.test(value) && value !== "." && value !== ".."
+}
+
 export function enqueue(
   home: MidaHome,
   job: Omit<CaptureJob, "id" | "at">,
   now: () => Date = () => new Date(),
 ): CaptureJob {
+  if (!isSafeName(job.agent)) throw new Error("bad-agent")
+  if (!isSafeName(job.sessionId)) throw new Error("bad-session-id")
   const at = now().toISOString()
   const id = `${at}-${randomBytes(4).toString("hex")}`
   const full: CaptureJob = { ...job, id, at }
@@ -71,7 +84,9 @@ function asJob(raw: unknown, id: string): CaptureJob | undefined {
     typeof r.transcriptPath !== "string" || typeof r.cwd !== "string" ||
     // an `at` that will not parse could never age past the 24-hour stale rule — treat it as corrupt
     typeof r.at !== "string" || Number.isNaN(Date.parse(r.at)) ||
-    (r.error !== null && typeof r.error !== "string")
+    (r.error !== null && typeof r.error !== "string") ||
+    // a hand-crafted file with path-shaped names must never reach writeState/loadAgentIdentity
+    !isSafeName(r.agent) || !isSafeName(r.sessionId)
   ) return undefined
   return {
     id, // the filename is canonical: it is what removeJob/moveToBad address

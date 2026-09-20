@@ -2,10 +2,11 @@ import { existsSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
+import { readConversation } from "@mida/compiler"
 import type { compileCheckpoint } from "@mida/compiler"
 import { eventIdFor } from "./checkpoint-payload.js"
 import type { MidaHome } from "./home.js"
-import { FLUSH_EVENTS } from "./hook.js"
+import { FLUSH_EVENTS, transcriptPathAllowed } from "./hook.js"
 import { appendLog } from "./log.js"
 import { listJobs, moveToBad, projectIdFor, removeJob } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
@@ -21,6 +22,8 @@ export interface DrainDeps {
   compile: typeof compileCheckpoint
   now?: () => Date
   minGapMs?: number
+  /** The user's real home folder — the transcript rule is checked against it, injected in tests. */
+  homeDir?: string
 }
 
 interface SessionState {
@@ -53,6 +56,7 @@ export interface DrainResult {
 export async function drainOnce(deps: DrainDeps): Promise<DrainResult> {
   const now = deps.now ?? (() => new Date())
   const minGapMs = deps.minGapMs ?? DEFAULT_MIN_GAP_MS
+  const homeDir = deps.homeDir ?? homedir()
   const counts: DrainResult = { saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0 }
   const log = (record: Record<string, unknown>) => appendLog(deps.home, "drain", record)
 
@@ -75,9 +79,11 @@ export async function drainOnce(deps: DrainDeps): Promise<DrainResult> {
           log({ sessionId, outcome: "bad", reason: "older-than-24h" })
           continue
         }
-        if (!existsSync(job.transcriptPath)) {
+        // the hook checked this path at enqueue, but the file could have been swapped since —
+        // re-check the same rule before the drainer opens it
+        if (!transcriptPathAllowed(job.transcriptPath, job.agent, homeDir)) {
           moveToBad(deps.home, `${job.id}.json`)
-          log({ sessionId, outcome: "bad", reason: "transcript-missing" })
+          log({ sessionId, outcome: "bad", reason: "bad-transcript-path" })
           continue
         }
         const projectId = projectIdFor(job.cwd)
@@ -102,12 +108,19 @@ export async function drainOnce(deps: DrainDeps): Promise<DrainResult> {
         }
 
         const eventId = eventIdFor({ projectId, sessionId, transcriptBytes, lastLine })
+        // a transcript that is not the Claude Code format is not sent to the model in M1 —
+        // the file might have been swapped for one since the path check passed
+        if (readConversation(job.transcriptPath).format === "unknown-tail") {
+          moveToBad(deps.home, `${job.id}.json`)
+          log({ sessionId, outcome: "bad", reason: "unknown-transcript-format" })
+          continue
+        }
         const compiled = await deps.compile({
           transcriptPath: job.transcriptPath,
           agent: job.agent,
           eventId,
           cwd: job.cwd,
-          homeDir: homedir(),
+          homeDir,
         })
         if (!compiled.ok) {
           counts.failed += 1
