@@ -1,7 +1,7 @@
 import { privateKeyToAccount } from "viem/accounts"
 import { PERMISSION, PROVENANCE_POLICY, namespaceId } from "@mida/protocol"
 import type { AccessRequest, Address, Hex } from "@mida/protocol"
-import { createWriteContext } from "@mida/chain"
+import { capabilityRegistryAbi, createWriteContext } from "@mida/chain"
 import { provisionAgent } from "@mida/fake-vault"
 import type { StoredCheckpoint } from "@mida/checkpoint"
 import { AGENT_PERMISSIONS, NAMESPACE, PURPOSE_ID } from "./runtime.js"
@@ -14,9 +14,27 @@ import {
   markRevoked, replaceSignerKey, saveAgentIdentity, saveGrants,
 } from "./keys.js"
 
+/**
+ * The contract's isCapabilityValid view. activeCapabilityIds returns the RAW stored list — expired and
+ * revoked ids stay in it until a later grant or revoke compacts it — so a non-empty list proves nothing.
+ * RegistryReader has no method for this view and apps/api is out of scope, so it is read here the same
+ * way chain-views.ts reads the registry.
+ */
+async function isCapabilityLive(runtime: Runtime, capabilityId: Hex): Promise<boolean> {
+  return (await runtime.ownerChain.publicClient.readContract({
+    address: runtime.ownerChain.deployment.capabilityRegistry,
+    abi: capabilityRegistryAbi,
+    functionName: "isCapabilityValid",
+    args: [capabilityId],
+  } as never)) as boolean
+}
+
 /** "Approved" means the chain lists at least one live capability for this owner–agent pair — any permission. */
 async function hasAnyLiveCapability(runtime: Runtime, agentId: Hex): Promise<boolean> {
-  return (await runtime.reader.activeCapabilityIds(runtime.owner, agentId)).length > 0
+  for (const id of await runtime.reader.activeCapabilityIds(runtime.owner, agentId)) {
+    if (await isCapabilityLive(runtime, id)) return true
+  }
+  return false
 }
 
 const GRANT_LIFETIME_SECONDS = 30 * 24 * 60 * 60
@@ -98,10 +116,16 @@ export async function approve(runtime: Runtime, name: string): Promise<{ capabil
   if (await hasAnyLiveCapability(runtime, identity.agentId)) {
     throw new Error(`agent "${name}" is already approved`)
   }
+  // A READ grant that expired closes the namespace's write epoch (§7.3): grantBatch reverts
+  // EpochRotationRequired until the owner rotates it, and every surviving reader then needs a wrap
+  // for the new epoch — so the rotation is followed by the same repair pass a revoke runs.
+  const epochStillOpen = await reader.isWriteEpochValid(owner, NAMESPACE_ID, await reader.requiredReadEpoch(owner, NAMESPACE_ID))
+  if (!epochStillOpen) await vault.rotateExpiredEpoch(NAMESPACE_ID)
   const approval = await vault.approveGrant({ accessRequest: pending.request, manifest: identity.manifest, selection: { kind: "recommended" } })
   const agent = runtime.agent(name)
   const grant = await agent.completeAccessRequest(pending.request, approval.response)
   saveGrants(home, name, [...agent.grants])
+  if (!epochStillOpen) await repairReaderWraps(runtime)
   // A marker left by an earlier revoke must not outlive a fresh approval.
   home.remove(`agents/${name}/revoked.json`)
   home.remove(`agents/${name}/pending-request.json`)
@@ -172,12 +196,22 @@ export async function revoke(runtime: Runtime, name: string): Promise<{ transact
   const { home, vault, reader, owner } = runtime
   const agentId = await resolveAgentId(runtime, name)
   const transactionHashes: Hex[] = []
-  const hadAuthority = (await reader.activeCapabilityIds(owner, agentId)).length > 0
-  if (hadAuthority) {
+  // The raw list can hold expired or already-revoked ids; the transaction goes out only when at least
+  // one id is still valid, so a re-run — or a list that only looks live — sends nothing.
+  const listed = await reader.activeCapabilityIds(owner, agentId)
+  let anyLive = false
+  for (const id of listed) {
+    if (await isCapabilityLive(runtime, id)) anyLive = true
+  }
+  if (anyLive) {
     transactionHashes.push((await vault.approveRevocation({ kind: "agent", agentId })).transactionHash)
   }
-  // Marker only when something was revoked now, or a previous run already got that far (crash between stages).
-  if (hadAuthority || isRevoked(home, name)) markRevoked(home, name)
+  // The marker records "this agent was revoked", so it is written whenever the agent was identified and
+  // the chain now shows nothing valid for it — whether this run sent the transaction or a crashed
+  // earlier run already landed it. The one case that gets no marker is the never-approved agent:
+  // the raw list was empty, no marker exists yet, and no grants.json says it ever completed a grant.
+  const neverApproved = listed.length === 0 && !isRevoked(home, name) && !home.has(`agents/${name}/grants.json`)
+  if (!neverApproved) markRevoked(home, name)
   const rewrapped = await repairReaderWraps(runtime)
   return { transactionHashes, rewrapped }
 }
@@ -188,22 +222,35 @@ export async function revoke(runtime: Runtime, name: string): Promise<{ transact
  * rewrap can be repaired without re-sending anything.
  */
 /**
- * Revoking must not depend on one local file surviving: identity.json, else any saved grant, else the chain's
- * own signer-to-agent mapping. A damaged file counts as missing.
+ * Revoking must not depend on one local file surviving — but the order matters: identity.json, then the
+ * chain's own signer-to-agent mapping, then grants.json LAST. A stale grants.json must never outrank the
+ * chain: a grants id is accepted only when no signer key exists locally to contradict it, or when the
+ * chain record for that id is still bound to the saved signer's address. A damaged file counts as missing.
+ * quietly() swallows only "missing" and "unreadable/corrupt"; EACCES/EPERM propagate, because a permission
+ * problem must never silently change which agent gets revoked.
  */
 async function resolveAgentId(runtime: Runtime, name: string): Promise<Hex> {
   const { home, reader } = runtime
   const quietly = <T>(load: () => T): T | undefined => {
-    try { return load() } catch { return undefined }
+    try {
+      return load()
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === "EACCES" || code === "EPERM") throw error
+      return undefined
+    }
   }
   const identity = quietly(() => loadAgentIdentity(home, name))
   if (identity !== undefined) return identity.agentId
+  const signerKey = home.has(`agents/${name}/signer.json`) ? quietly(() => loadOrCreateSignerKey(home, name)) : undefined
+  const signerAddress = signerKey === undefined ? null : privateKeyToAccount(signerKey).address
+  const onChain = signerAddress === null ? null : await reader.agentIdOfSigner(signerAddress)
+  if (onChain !== null) return onChain
   const grant = quietly(() => loadGrants(home, name))?.[0]
-  if (grant !== undefined) return grant.agentId
-  if (home.has(`agents/${name}/signer.json`)) {
-    const signerKey = quietly(() => loadOrCreateSignerKey(home, name))
-    const onChain = signerKey === undefined ? null : await reader.agentIdOfSigner(privateKeyToAccount(signerKey).address)
-    if (onChain !== null) return onChain
+  if (grant !== undefined) {
+    if (signerAddress === null) return grant.agentId
+    const record = await reader.getAgent(grant.agentId)
+    if (record !== null && record.signer.toLowerCase() === signerAddress.toLowerCase()) return grant.agentId
   }
   throw new Error(`agent "${name}" cannot be identified: identity.json, grants.json and a registered signer.json are all missing or unreadable under agents/${name}/`)
 }

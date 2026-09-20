@@ -63,14 +63,24 @@ export function loadOrCreateOperatorSecrets(home: MidaHome): OperatorSecrets {
 
 /**
  * The block the owner's history scan starts from on this chain. An owner has no history before it existed, so
- * Runtime.open records the head block on this home's first open and every later ownerHistory scan skips the —
- * on a live chain enormous — contract-only range before it.
+ * Runtime.open records a start block on this home's first open and every later ownerHistory scan skips the —
+ * on a live chain enormous — contract-only range before it. The record also pins the capability registry it
+ * was computed for: a file from another deployment, an old two-field file, or a block above the current head
+ * is ignored and recomputed rather than trusted.
  */
-export function saveOwnerStartBlock(home: MidaHome, chainId: bigint, block: bigint): void {
-  home.writeSecretJson("owner/start-block.json", { chainId: chainId.toString(10), blockNumber: block.toString(10) })
+export function saveOwnerStartBlock(home: MidaHome, chainId: bigint, block: bigint, registry: string): void {
+  home.writeSecretJson("owner/start-block.json", {
+    chainId: chainId.toString(10),
+    blockNumber: block.toString(10),
+    registry: registry.toLowerCase(),
+  })
 }
 
-export function loadOwnerStartBlock(home: MidaHome, chainId: bigint): bigint | undefined {
+export function loadOwnerStartBlock(
+  home: MidaHome,
+  chainId: bigint,
+  current?: { registry: string; head: bigint },
+): bigint | undefined {
   const file = "owner/start-block.json"
   const record = home.readJson<unknown>(file)
   if (record === undefined) return undefined
@@ -83,8 +93,13 @@ export function loadOwnerStartBlock(home: MidaHome, chainId: bigint): bigint | u
       throw new Error(`${file}: field "${field}" is missing or is not a decimal string`)
     }
   }
-  const saved = record as { chainId: string; blockNumber: string }
+  const saved = record as { chainId: string; blockNumber: string; registry?: unknown }
   if (BigInt(saved.chainId) !== chainId) return undefined
+  if (typeof saved.registry !== "string" || saved.registry === "") return undefined
+  if (current !== undefined) {
+    if (saved.registry.toLowerCase() !== current.registry.toLowerCase()) return undefined
+    if (BigInt(saved.blockNumber) > current.head) return undefined
+  }
   return BigInt(saved.blockNumber)
 }
 

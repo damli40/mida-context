@@ -59,14 +59,20 @@ export class Runtime {
       server = await startPersistentApi({ rpcUrl: network.rpcUrl, deployment: network.deployment, dataDir: home.path("data") })
       // An owner has no history before it existed. On a live chain the contract may have been deployed hundreds of
       // thousands of blocks ago, and ownerHistory would scan all of it in 100-block windows on every approveGrant.
-      // The first open on this chain therefore records the head block — minus a reorg margin, never below the real
-      // deployment block — before any owner transaction can happen, and only the owner's own context scans from it.
-      let ownerStartBlock = loadOwnerStartBlock(home, network.deployment.chainId)
+      // The first open on this chain therefore records a start block and only the owner's own context scans from
+      // it. The head-minus-margin shortcut is valid only for a brand-new owner: if this owner already sent any
+      // transaction on this chain, its history could reach back to deploymentBlock, so that is the start.
+      const probe = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: ownerAccount })
+      const head = await probe.publicClient.getBlockNumber()
+      let ownerStartBlock = loadOwnerStartBlock(home, network.deployment.chainId, {
+        registry: network.deployment.capabilityRegistry,
+        head,
+      })
       if (ownerStartBlock === undefined) {
-        const probe = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: ownerAccount })
-        const start = (await probe.publicClient.getBlockNumber()) - 10n
+        const alreadyActive = (await probe.publicClient.getTransactionCount({ address: ownerAccount.address })) > 0
+        const start = alreadyActive ? network.deployment.deploymentBlock : head - 10n
         ownerStartBlock = start > network.deployment.deploymentBlock ? start : network.deployment.deploymentBlock
-        saveOwnerStartBlock(home, network.deployment.chainId, ownerStartBlock)
+        saveOwnerStartBlock(home, network.deployment.chainId, ownerStartBlock, network.deployment.capabilityRegistry)
       }
       const ownerChain = createWriteContext({
         rpcUrl: network.rpcUrl,

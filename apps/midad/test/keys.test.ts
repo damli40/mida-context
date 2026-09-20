@@ -56,17 +56,39 @@ describe("owner, operator and signer secrets", () => {
 })
 
 describe("the owner's history start block", () => {
+  const REGISTRY = `0x${"ab".repeat(20)}`
+
   it("round-trips the saved start block for a chain", () => {
     const home = freshHome()
     expect(loadOwnerStartBlock(home, 31337n)).toBeUndefined()
-    saveOwnerStartBlock(home, 31337n, 123456789n)
+    saveOwnerStartBlock(home, 31337n, 123456789n, REGISTRY)
     expect(loadOwnerStartBlock(home, 31337n)).toBe(123456789n)
+    expect(loadOwnerStartBlock(home, 31337n, { registry: REGISTRY, head: 999999999n })).toBe(123456789n)
   })
 
   it("returns undefined for a different chain than the one saved", () => {
     const home = freshHome()
-    saveOwnerStartBlock(home, 31337n, 100n)
+    saveOwnerStartBlock(home, 31337n, 100n, REGISTRY)
     expect(loadOwnerStartBlock(home, 10143n)).toBeUndefined()
+  })
+
+  it("ignores a record whose registry is not the current deployment's", () => {
+    const home = freshHome()
+    saveOwnerStartBlock(home, 31337n, 100n, REGISTRY)
+    expect(loadOwnerStartBlock(home, 31337n, { registry: `0x${"cd".repeat(20)}`, head: 999999999n })).toBeUndefined()
+  })
+
+  it("ignores an old two-field file with no registry", () => {
+    const home = freshHome()
+    home.writeSecretJson("owner/start-block.json", { chainId: "31337", blockNumber: "100" })
+    expect(loadOwnerStartBlock(home, 31337n)).toBeUndefined()
+    expect(loadOwnerStartBlock(home, 31337n, { registry: REGISTRY, head: 999999999n })).toBeUndefined()
+  })
+
+  it("ignores a saved block above the current head", () => {
+    const home = freshHome()
+    saveOwnerStartBlock(home, 31337n, 123456789n, REGISTRY)
+    expect(loadOwnerStartBlock(home, 31337n, { registry: REGISTRY, head: 50n })).toBeUndefined()
   })
 
   it("rejects a file that is not two decimal strings", () => {
