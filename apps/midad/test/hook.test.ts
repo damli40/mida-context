@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest"
 import { spawnSync } from "node:child_process"
 import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs"
+import { createServer } from "node:net"
+import type { Server, Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { MidaHome, listJobs, runHook } from "@mida/midad"
+import { MidaHome, listJobs, runHook, socketPathFor } from "@mida/midad"
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 const HOOK_MAIN = fileURLToPath(new URL("../src/hook-main.ts", import.meta.url))
@@ -178,6 +180,89 @@ describe("runHook", () => {
     await hook({ dir, home, stdin: stdinFor({ transcript_path: join(sneak, "t.jsonl") }) })
     expect(listJobs(home)).toHaveLength(0)
     expect(readFileSync(home.path("logs/hook.jsonl"), "utf8")).toContain("bad-transcript-path")
+  })
+})
+
+/** A socket server the test controls: `onRequest` decides what a connection gets back. */
+function fakeDaemon(socketPath: string, onRequest: (socket: Socket, data: Buffer) => void): Promise<Server> {
+  const server = createServer((socket) => {
+    socket.on("data", (data) => onRequest(socket, data))
+  })
+  return new Promise((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(socketPath, () => resolve(server))
+  })
+}
+
+const closeServer = (server: Server) => new Promise<void>((done) => server.close(() => done()))
+
+describe("runHook kicks the daemon instead of spawning a drainer", () => {
+  it("a reachable daemon means zero spawns", async () => {
+    const { dir, home, stdinFor } = setup()
+    const server = await fakeDaemon(socketPathFor(home), (socket) => {
+      socket.end('HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{"ok":true}')
+    })
+    try {
+      let daemonSpawns = 0
+      let drainerSpawns = 0
+      await runHook({
+        agent: "claude-code",
+        stdin: stdinFor(),
+        home,
+        homeDir: dir,
+        env: {},
+        spawnDaemon: () => { daemonSpawns += 1 },
+        spawnDrainer: () => { drainerSpawns += 1 },
+      })
+      expect(daemonSpawns).toBe(0)
+      expect(drainerSpawns).toBe(0)
+      expect(listJobs(home)).toHaveLength(1)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a daemon that accepts but never answers still returns inside 300 ms and spawns once", async () => {
+    const { dir, home, stdinFor } = setup()
+    const server = await fakeDaemon(socketPathFor(home), () => {}) // silent forever
+    try {
+      let daemonSpawns = 0
+      let drainerSpawns = 0
+      const started = Date.now()
+      await runHook({
+        agent: "claude-code",
+        stdin: stdinFor(),
+        home,
+        homeDir: dir,
+        env: {},
+        spawnDaemon: () => { daemonSpawns += 1 },
+        spawnDrainer: () => { drainerSpawns += 1 },
+      })
+      expect(Date.now() - started).toBeLessThan(300)
+      expect(daemonSpawns).toBe(1)
+      expect(drainerSpawns).toBe(0)
+      expect(listJobs(home)).toHaveLength(1)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a daemon spawn that throws falls back to the old detached drainer", async () => {
+    const { dir, home, stdinFor } = setup()
+    let daemonSpawns = 0
+    let drainerSpawns = 0
+    await runHook({
+      agent: "claude-code",
+      stdin: stdinFor(),
+      home,
+      homeDir: dir,
+      env: {},
+      spawnDaemon: () => { daemonSpawns += 1; throw new Error("spawn refused") },
+      spawnDrainer: () => { drainerSpawns += 1 },
+    })
+    expect(daemonSpawns).toBe(1)
+    expect(drainerSpawns).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
   })
 })
 

@@ -1,6 +1,7 @@
 import { lstatSync, realpathSync } from "node:fs"
 import { homedir } from "node:os"
 import { isAbsolute, join, relative } from "node:path"
+import { callDaemon } from "./control.js"
 import type { MidaHome } from "./home.js"
 import { appendLog } from "./log.js"
 import { enqueue, isSafeName } from "./queue.js"
@@ -12,6 +13,8 @@ export type HookEvent = "PostToolUse" | "Stop" | "StopFailure" | "PreCompact" | 
 export const FLUSH_EVENTS: ReadonlySet<HookEvent> = new Set<HookEvent>(["Stop", "StopFailure", "PreCompact", "SessionEnd"])
 
 const KNOWN_EVENTS: ReadonlySet<string> = new Set<HookEvent>(["PostToolUse", "Stop", "StopFailure", "PreCompact", "SessionEnd"])
+/** The kick must never slow the hook down: a daemon that does not answer inside 150 ms is treated as down. */
+const KICK_TIMEOUT_MS = 150
 
 /** Where each agent keeps its session transcripts, relative to the user's home folder. */
 const TRANSCRIPT_DIRS: Readonly<Record<string, string>> = { "claude-code": ".claude/projects" }
@@ -70,9 +73,11 @@ export function extractHookFields(head: string): Record<string, string> {
 /**
  * The hook runs inside the agent CLI's own process budget: it has to be back in well under a second
  * and must never break the tool call it is attached to. So it does exactly three cheap things —
- * parse the stdin JSON, write one queue file, spawn the detached drainer — and every slow thing
- * (reading the transcript, the model call, the chain write) is the drainer's problem. It never
- * throws and never writes to stdout.
+ * parse the stdin JSON, write one queue file, kick the daemon over the control socket — and every
+ * slow thing (reading the transcript, the model call, the chain write) is the daemon's problem. A
+ * kick that gets no answer inside 150 ms spawns a detached daemon; the old detached drainer survives
+ * only as the fallback when that spawn itself throws. The hook never throws and never writes to
+ * stdout.
  *
  * MIDA_INNER=1 marks the compiler's own model subprocess so a Mida-driven run is not captured as a
  * user session.
@@ -82,7 +87,10 @@ export async function runHook(input: {
   stdin: string
   home: MidaHome
   env: NodeJS.ProcessEnv
+  /** The no-daemon fallback: spawned only when the kick fails AND `spawnDaemon` threw or is absent. */
   spawnDrainer: () => void
+  /** Spawns the detached `midad`; called once when the kick gets no answer. */
+  spawnDaemon?: () => void
   /** The user's real home folder — injected so tests can point it at a temp dir. */
   homeDir?: string
 }): Promise<void> {
@@ -130,10 +138,22 @@ export async function runHook(input: {
       error: typeof record.error === "string" ? record.error : null,
     })
     log({ event, sessionId, outcome: "enqueued", jobId: job.id })
-    try {
-      input.spawnDrainer()
-    } catch {
-      log({ event, sessionId, outcome: "drainer-spawn-failed" })
+    const reply = await callDaemon(input.home, "/kick", {}, { timeoutMs: KICK_TIMEOUT_MS })
+    if (reply.status === 0) {
+      // the daemon is not answering: it is down or was never started — spawn it and return at once
+      try {
+        (input.spawnDaemon ?? input.spawnDrainer)()
+      } catch {
+        // the detached drainer is the last resort — only when there was a real daemon spawn to fail
+        if (input.spawnDaemon !== undefined) {
+          try {
+            input.spawnDrainer()
+          } catch {
+            // both spawns failed — the job waits in the queue for the next hook
+          }
+        }
+        log({ event, sessionId, outcome: "drainer-spawn-failed" })
+      }
     }
   } catch (error) {
     log({ event, sessionId, outcome: "error", reason: error instanceof Error ? error.name : "error" })

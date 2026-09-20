@@ -6,6 +6,7 @@ import { appendLog } from "./log.js"
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 const DRAIN_MAIN = fileURLToPath(new URL("./drain-main.ts", import.meta.url))
+const DAEMON_MAIN = fileURLToPath(new URL("./daemon-main.ts", import.meta.url))
 const STDIN_CAP_BYTES = 1_000_000
 const HEAD_BYTES = 64 * 1024
 
@@ -47,6 +48,16 @@ async function main(): Promise<void> {
     stdin,
     home,
     env: process.env,
+    spawnDaemon: () => {
+      const child = spawn(process.execPath, ["--import", "tsx", DAEMON_MAIN], {
+        detached: true,
+        stdio: "ignore",
+        cwd: REPO_ROOT,
+        env: drainerEnv(process.env),
+      })
+      child.on("error", () => {})
+      child.unref()
+    },
     spawnDrainer: () => {
       const child = spawn(process.execPath, ["--import", "tsx", DRAIN_MAIN], {
         detached: true,
