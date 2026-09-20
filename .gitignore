@@ -11,3 +11,8 @@ coverage/
 
 # third-party screenshots stay out of the public repository
 docs/problem-evidence/*.png
+
+# Colosseum contest rules: third-party legal document + our digest of it.
+# Local reference only — do not redistribute in the public repository.
+docs/colosseum-cwf-rules.pdf
+docs/colosseum-cwf-rules.md
