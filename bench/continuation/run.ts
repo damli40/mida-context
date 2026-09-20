@@ -372,7 +372,7 @@ function dryRun(args: Args): void {
       argv: args.agentBCmd !== undefined ? JSON.parse(args.agentBCmd) : agentBArgv(),
     },
   ]
-  console.log("\n# agent commands it would run")
+  console.log("\n# agent commands it would run (env shows additions only — every child gets the parent env minus ANTHROPIC_*)")
   for (const c of commands) console.log(JSON.stringify(c))
   console.log("\n# nothing was created and nothing was started")
 }
@@ -411,6 +411,7 @@ async function realRun(args: Args): Promise<number> {
   // mida: provision a real home on the local chain, then hand it to a daemon.
   let chain: ScenarioEnvironment | null = null
   let daemon: DaemonHandle | null = null
+  try {
   if (args.condition === "mida") {
     chain = await localEnvironment()
     const midaHome = new MidaHome(midaHomePath)
@@ -442,7 +443,6 @@ async function realRun(args: Args): Promise<number> {
     })
   }
 
-  try {
     // --- Agent A ---
     const aEnv = childEnv(args.condition === "mida" ? { MIDA_HOME: midaHomePath } : {})
     const apiKeyVarsStripped = API_KEY_VARS.some((k) => process.env[k] !== undefined)
