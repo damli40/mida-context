@@ -147,7 +147,7 @@ export class MidaAgent {
       if (grant.agentId.toLowerCase() !== this.agentId) {
         throw new MidaError("AUTH_INVALID", "a restored grant belongs to a different agent")
       }
-      this.#grants.push({ ...grant, owner: grant.owner.toLowerCase() as Address, agentId: this.agentId, capabilities: [...grant.capabilities] })
+      this.#grants.push({ ...grant, owner: grant.owner.toLowerCase() as Address, agentId: this.agentId, capabilities: grant.capabilities.map((capability) => ({ ...capability })) })
     }
   }
 

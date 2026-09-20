@@ -1,4 +1,4 @@
-import { closeSync, openSync } from "node:fs"
+import { closeSync, fsyncSync, openSync } from "node:fs"
 import { MidaError } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
 import type { AccessRequestStore, StoredAccessRequest } from "@mida/sdk"
@@ -26,8 +26,7 @@ export class FileAccessRequestStore implements AccessRequestStore {
 
   async save(request: AccessRequest): Promise<void> {
     const file = this.#file(request.requestId)
-    if (this.#home.has(file)) throw new MidaError("REPLAY", "requestId was already used")
-    this.#home.writeSecretJson(file, request)
+    if (!this.#home.createSecretJsonExclusive(file, request)) throw new MidaError("REPLAY", "requestId was already used")
   }
 
   async load(requestId: Hex): Promise<StoredAccessRequest | undefined> {
@@ -40,11 +39,23 @@ export class FileAccessRequestStore implements AccessRequestStore {
   async markConsumed(requestId: Hex): Promise<void> {
     const file = this.#file(requestId)
     if (!this.#home.has(file)) throw new MidaError("NOT_FOUND", "no stored request for this requestId")
+    let fd: number
     try {
-      closeSync(openSync(this.#home.path(`${file}.consumed`), "wx", 0o600))
+      fd = openSync(this.#home.path(`${file}.consumed`), "wx", 0o600)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new MidaError("REQUEST_CONSUMED", "this requestId was already completed")
       throw error
+    }
+    try {
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    const folderFd = openSync(this.#home.path(this.#folder), "r")
+    try {
+      fsyncSync(folderFd)
+    } finally {
+      closeSync(folderFd)
     }
   }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { mkdtempSync, readdirSync, statSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { MidaHome } from "@mida/midad"
@@ -42,6 +42,38 @@ describe("MidaHome", () => {
 
   it("refuses a path that climbs out of the home folder", () => {
     expect(() => freshHome().path("../outside.json")).toThrow()
+  })
+
+  it("removes the temp file when the final rename fails, so no secret is left behind", () => {
+    const home = freshHome()
+    mkdirSync(home.path("owner/secrets.json"), { recursive: true })
+    expect(() => home.writeSecretJson("owner/secrets.json", { k: "v" })).toThrow()
+    expect(readdirSync(home.path("owner"))).toEqual(["secrets.json"])
+  })
+
+  it("tightens a home folder that already exists with wider permissions", () => {
+    const folder = mkdtempSync(join(tmpdir(), "mida-home-"))
+    chmodSync(folder, 0o755)
+    new MidaHome(folder)
+    expect(statSync(folder).mode & 0o777).toBe(0o700)
+  })
+
+  it("refuses to write or read through a symlink that points outside the home", () => {
+    const outside = mkdtempSync(join(tmpdir(), "mida-outside-"))
+    const home = freshHome()
+    mkdirSync(home.path("agents"), { recursive: true })
+    symlinkSync(outside, home.path("agents/evil"))
+    expect(() => home.writeSecretJson("agents/evil/identity.json", { k: "v" })).toThrow()
+    expect(readdirSync(outside)).toEqual([])
+    expect(() => home.readJson("agents/evil/identity.json")).toThrow()
+  })
+
+  it("creates exclusively: the second caller loses and the first file is untouched", () => {
+    const home = freshHome()
+    expect(home.createSecretJsonExclusive("owner/secrets.json", { v: 1 })).toBe(true)
+    expect(home.createSecretJsonExclusive("owner/secrets.json", { v: 2 })).toBe(false)
+    expect(home.readJson("owner/secrets.json")).toEqual({ v: 1 })
+    expect(readdirSync(home.path("owner"))).toEqual(["secrets.json"])
   })
 
   it("lists the entries of a folder, and an empty list for a missing one", () => {

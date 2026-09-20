@@ -81,12 +81,44 @@ describe("agent identities, grants and the revoked list", () => {
     expect(() => identityFrom("codex", `0x${"5b".repeat(32)}` as Hex, provisioned)).toThrow()
   })
 
+  it("refuses a half-written identity that has only the hex key fields", () => {
+    const home = freshHome()
+    home.writeSecretJson("agents/codex/identity.json", {
+      agentId: `0x${"aa".repeat(32)}`,
+      signerPrivateKey: `0x${"5a".repeat(32)}`,
+      encryptionPrivateKey: `0x${"09".repeat(32)}`,
+      manifestHash: `0x${"cc".repeat(32)}`,
+    })
+    expect(() => loadAgentIdentity(home, "codex")).toThrow(/identity\.json: field "(name|encryptionPublicKey|callbackOrigin|purposeId|manifest)"/)
+  })
+
+  it("refuses an identity whose name does not match the folder it lives in", () => {
+    const home = freshHome()
+    saveAgentIdentity(home, identityFrom("codex", signerPrivateKey, provisioned))
+    const saved = loadAgentIdentity(home, "codex")!
+    home.writeSecretJson("agents/codex/identity.json", { ...saved, name: "claude-code" })
+    expect(() => loadAgentIdentity(home, "codex")).toThrow(/name/)
+  })
+
   it("round-trips grants and starts empty", () => {
     const home = freshHome()
     expect(loadGrants(home, "codex")).toEqual([])
     const grant: Grant = { owner: `0x${"dd".repeat(20)}` as Address, agentId: `0x${"aa".repeat(32)}` as Hex, requestId: `0x${"01".repeat(32)}` as Hex, capabilities: [] }
     saveGrants(home, "codex", [grant])
     expect(loadGrants(home, "codex")).toEqual([grant])
+  })
+
+  it("refuses a grants file that is not an array", () => {
+    const home = freshHome()
+    home.writeSecretJson("agents/codex/grants.json", {})
+    expect(() => loadGrants(home, "codex")).toThrow(/grants\.json/)
+  })
+
+  it("refuses a grants file whose entries are missing fields", () => {
+    const home = freshHome()
+    home.writeSecretJson("agents/codex/grants.json", [{ owner: `0x${"dd".repeat(20)}` }])
+    expect(() => loadGrants(home, "codex")).toThrow(/grants\.json/)
+    expect(() => loadGrants(home, "codex")).toThrow(/agentId/)
   })
 
   it("remembers a revoked agent", () => {

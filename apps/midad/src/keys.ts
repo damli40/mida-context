@@ -101,7 +101,16 @@ export function loadAgentIdentity(home: MidaHome, name: string): AgentIdentity |
   const file = `agents/${name}/identity.json`
   const identity = home.readJson<Record<string, unknown>>(file)
   if (identity === undefined) return undefined
-  assertKeys(file, identity, ["agentId", "signerPrivateKey", "encryptionPrivateKey", "manifestHash"])
+  assertKeys(file, identity, ["agentId", "signerPrivateKey", "encryptionPrivateKey", "encryptionPublicKey", "manifestHash"])
+  if (identity.name !== name) throw new Error(`${file}: field "name" does not match the agent folder`)
+  for (const field of ["callbackOrigin", "purposeId"] as const) {
+    if (typeof identity[field] !== "string" || identity[field] === "") {
+      throw new Error(`${file}: field "${field}" is missing or is not a non-empty string`)
+    }
+  }
+  if (typeof identity.manifest !== "object" || identity.manifest === null) {
+    throw new Error(`${file}: field "manifest" is missing or is not an object`)
+  }
   return identity as unknown as AgentIdentity
 }
 
@@ -116,7 +125,18 @@ export function saveGrants(home: MidaHome, name: string, grants: readonly Grant[
 
 export function loadGrants(home: MidaHome, name: string): Grant[] {
   assertName(name)
-  return home.readJson<Grant[]>(`agents/${name}/grants.json`) ?? []
+  const file = `agents/${name}/grants.json`
+  const grants = home.readJson<unknown>(file)
+  if (grants === undefined) return []
+  if (!Array.isArray(grants)) throw new Error(`${file}: expected an array of grants`)
+  for (const entry of grants) {
+    const record = (entry ?? {}) as Record<string, unknown>
+    for (const field of ["owner", "agentId", "requestId"] as const) {
+      if (typeof record[field] !== "string") throw new Error(`${file}: field "${field}" is missing or is not a string`)
+    }
+    if (!Array.isArray(record.capabilities)) throw new Error(`${file}: field "capabilities" is missing or is not an array`)
+  }
+  return grants as Grant[]
 }
 
 export function markRevoked(home: MidaHome, name: string): void {

@@ -56,4 +56,11 @@ describe("MidaAgent restores grants completed in an earlier process", () => {
     input.pop()
     expect(agent.grants).toHaveLength(1)
   })
+
+  it("copies each capability object instead of sharing it with the caller", () => {
+    const capability = { capabilityId: hex("c1", 32), namespaceId: hex("d1", 32), permissions: 1 } as unknown as Grant["capabilities"][number]
+    const agent = agentWith([{ ...grant(AGENT_ID), capabilities: [capability] }])
+    capability.permissions = 255
+    expect(agent.grants[0]!.capabilities[0]!.permissions).toBe(1)
+  })
 })
