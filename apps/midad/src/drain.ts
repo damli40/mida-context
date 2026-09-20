@@ -34,6 +34,8 @@ const MAX_BACKOFF_MS = 60 * 60 * 1000
 /** A settle round sleeps at most this long, and at most three waits happen before giving up. */
 const SETTLE_CAP_MS = 65_000
 const MAX_SETTLE_WAITS = 3
+/** A job that lands mid-pass is invisible to that pass's counts; at most this many extra passes chase it. */
+const MAX_EXTRA_PASSES = 5
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000
 const TMP_MAX_AGE_MS = 60 * 60 * 1000
 const LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -60,7 +62,10 @@ const backoffMs = (attempts: number) => Math.min(60_000 * 2 ** attempts, MAX_BAC
 
 export interface DrainDeps {
   home: MidaHome
-  open: () => Promise<Runtime>
+  /** opens a fresh runtime — used when `runtime` is not supplied; the drain closes what it opens */
+  open?: () => Promise<Runtime>
+  /** an already-open runtime owned by the caller (the daemon) — the drain uses it and never closes it */
+  runtime?: Runtime
   compile: typeof compileCheckpoint
   now?: () => Date
   minGapMs?: number
@@ -133,13 +138,22 @@ export async function drainUntilSettled(deps: DrainDeps): Promise<DrainResult> {
   try {
     const total = emptyResult()
     let waits = 0
+    let extraPasses = 0
     for (;;) {
       const result = await drainPass(deps, now)
       total.saved += result.saved
       total.failed += result.failed
       total.skippedUnchanged += result.skippedUnchanged
       total.skippedTooSoon += result.skippedTooSoon
-      if (result.earliestDueMs === null || waits >= MAX_SETTLE_WAITS || listJobs(deps.home).length === 0) {
+      const remaining = listJobs(deps.home).length
+      // a job that arrived mid-pass was never listed by it: a pass that saved, or one that left
+      // jobs it cannot account for, re-lists and goes again — bounded so a queue that never
+      // empties cannot loop the drainer forever
+      if (remaining > 0 && extraPasses < MAX_EXTRA_PASSES && (result.saved > 0 || result.earliestDueMs === null)) {
+        extraPasses += 1
+        continue
+      }
+      if (result.earliestDueMs === null || waits >= MAX_SETTLE_WAITS || remaining === 0) {
         total.earliestDueMs = result.earliestDueMs
         return total
       }
@@ -167,6 +181,7 @@ export async function drainUntilSettled(deps: DrainDeps): Promise<DrainResult> {
  *
  * The runtime — lock, API server, keys — is opened lazily, only once a session has actually
  * compiled, and always closed before returning. A pass that only skips never touches the chain.
+ * An injected `runtime` (the daemon's) is used as-is and left open — the caller owns its life.
  */
 async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult> {
   const minGapMs = deps.minGapMs ?? DEFAULT_MIN_GAP_MS
@@ -196,7 +211,13 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
     else group.push(job)
   }
 
-  let runtime: Runtime | undefined
+  let opened: Runtime | undefined
+  const openRuntime = async (): Promise<Runtime> => {
+    if (deps.runtime !== undefined) return deps.runtime
+    if (deps.open === undefined) throw new Error("drain needs either a runtime or an open()")
+    opened ??= await deps.open()
+    return opened
+  }
   try {
     for (const [sessionId, group] of bySession) {
       const job = group[group.length - 1]! // listJobs is oldest-first, so the last is newest
@@ -313,7 +334,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           deps.home.writeSecretJson(`queue/compiled/${eventId}.json`, { ...envelope, compileMeta })
           reusedCompiled = false
         }
-        runtime ??= await deps.open()
+        const runtime = await openRuntime()
         const saveStart = now().getTime()
         await save(runtime, job.agent, {
           projectId: envelope.projectId,
@@ -380,7 +401,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
       }
     }
   } finally {
-    if (runtime !== undefined) await runtime.close()
+    if (opened !== undefined) await opened.close()
   }
   return counts
 }

@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "exports": { ".": "./src/index.ts" },
+  "bin": {
+    "midad": "./src/daemon-main.ts"
+  },
   "dependencies": {
     "@hono/node-server": "1.19.17",
     "@mida/api": "workspace:*",

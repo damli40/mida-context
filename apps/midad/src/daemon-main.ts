@@ -1,0 +1,45 @@
+import { parseDeployment } from "@mida/chain"
+import { compileCheckpoint } from "@mida/compiler"
+import { startDaemon } from "./daemon.js"
+import { MidaHome } from "./home.js"
+import { appendLog } from "./log.js"
+import type { Network } from "./runtime.js"
+
+/**
+ * The long-running Mida process entry. Like the detached drainer it never loads `.env` — the home
+ * folder carries everything: agent keys under `agents/` and the public chain coordinates `init`
+ * wrote to `network.json`. With no `network.json` there is nothing to serve, so it exits non-zero
+ * and quietly; the spawner's health polling is what notices.
+ */
+async function main(): Promise<void> {
+  const home = new MidaHome(process.env.MIDA_HOME)
+  const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown; storageUrl?: unknown }>("network.json")
+  if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) {
+    process.exit(1)
+  }
+  const network: Network = {
+    rpcUrl: stored.rpcUrl,
+    deployment: parseDeployment(stored.deployment),
+    // the daemon holds agent keys only — funding is the owner CLI's job
+    fund: async () => { throw new Error("the daemon cannot fund accounts") },
+    storageUrl: typeof stored.storageUrl === "string" ? stored.storageUrl : undefined,
+  }
+
+  const daemon = await startDaemon({
+    home,
+    network,
+    compile: compileCheckpoint,
+    now: () => Date.now(),
+    log: (entry) => appendLog(home, "daemon", entry as Record<string, unknown>),
+  })
+  // A live daemon already owns this home — this process has nothing to do.
+  if (daemon.alreadyRunning) process.exit(0)
+
+  const shutdown = () => {
+    void daemon.close().finally(() => process.exit(0))
+  }
+  process.on("SIGTERM", shutdown)
+  process.on("SIGINT", shutdown)
+}
+
+main().catch(() => process.exit(1))

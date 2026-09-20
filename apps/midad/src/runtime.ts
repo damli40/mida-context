@@ -18,6 +18,8 @@ export interface Network {
   rpcUrl: string
   deployment: Deployment
   fund(address: Address): Promise<void>
+  /** When set, the Context API lives at this URL (a remote store, M3) and no local server is started. */
+  storageUrl?: string
 }
 
 export const NAMESPACE = "projects.current"
@@ -27,6 +29,25 @@ export const AGENT_PERMISSIONS = PERMISSION.READ | PERMISSION.CREATE | PERMISSIO
 const MIN_BALANCE_WEI = 50_000_000_000_000_000n
 /** One runtime per home: a pid file created exclusively at open and removed at close. */
 const LOCK_FILE = "midad.lock"
+
+/**
+ * The optional remote Context API address (A15). Empty/absent means "run the local server as
+ * before". A set value must be https://, or http:// on 127.0.0.1/localhost only — anything else is
+ * a `bad-storage-url` error raised before the lock or any chain call is touched.
+ */
+function parseStorageUrl(raw: string | undefined): string | undefined {
+  if (raw === undefined || raw === "") return undefined
+  try {
+    const url = new URL(raw)
+    if (url.protocol === "https:") return raw
+    if (url.protocol === "http:" && (url.hostname === "127.0.0.1" || url.hostname === "localhost")) return raw
+  } catch {
+    // falls through to the refusal below
+  }
+  const error = new Error("network.storageUrl must be https://, or http:// on 127.0.0.1 or localhost") as Error & { code: string }
+  error.code = "bad-storage-url"
+  throw error
+}
 
 export class Runtime {
   readonly #agents = new Map<string, MidaAgent>()
@@ -51,12 +72,16 @@ export class Runtime {
   }
 
   static async open(home: MidaHome, network: Network, timing?: { lockWaitMs?: number; lockStepMs?: number }): Promise<Runtime> {
+    const storageUrl = parseStorageUrl(network.storageUrl)
     await Runtime.#acquireLock(home, timing?.lockWaitMs ?? 30_000, timing?.lockStepMs ?? 250)
     let server: { baseUrl: string; close(): Promise<void> } | undefined
     try {
       const secrets = loadOrCreateOwnerSecrets(home)
       const ownerAccount = privateKeyToAccount(secrets.privateKey)
-      server = await startPersistentApi({ rpcUrl: network.rpcUrl, deployment: network.deployment, dataDir: home.path("data") })
+      if (storageUrl === undefined) {
+        server = await startPersistentApi({ rpcUrl: network.rpcUrl, deployment: network.deployment, dataDir: home.path("data") })
+      }
+      const apiBaseUrl = storageUrl ?? server!.baseUrl
       // An owner has no history before it existed. On a live chain the contract may have been deployed hundreds of
       // thousands of blocks ago, and ownerHistory would scan all of it in 100-block windows on every approveGrant.
       // The first open on this chain therefore records a start block and only the owner's own context scans from
@@ -79,12 +104,12 @@ export class Runtime {
         deployment: { ...network.deployment, deploymentBlock: ownerStartBlock },
         account: ownerAccount,
       })
-      const ownerApi = Runtime.#apiClient(server.baseUrl, network.deployment, ownerAccount)
+      const ownerApi = Runtime.#apiClient(apiBaseUrl, network.deployment, ownerAccount)
       const vault = new FakeVaultAuthority({ seed: bytesOf(secrets.seed, 32), p256PrivateKey: secrets.p256PrivateKey, chain: ownerChain, api: ownerApi })
       const running = server
-      const runtime = new Runtime(home, network, ownerChain, ownerApi, vault, new RegistryReader(ownerChain), ownerStartBlock, running.baseUrl, async () => {
+      const runtime = new Runtime(home, network, ownerChain, ownerApi, vault, new RegistryReader(ownerChain), ownerStartBlock, apiBaseUrl, async () => {
         try {
-          await running.close()
+          await running?.close()
         } finally {
           home.remove(LOCK_FILE)
         }

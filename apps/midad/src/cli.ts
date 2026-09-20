@@ -1,4 +1,8 @@
+import { spawn } from "node:child_process"
+import { fileURLToPath } from "node:url"
+import { callDaemon, ensureDaemon } from "./control.js"
 import { MidaHome } from "./home.js"
+import { drainerEnv } from "./hook.js"
 import { Runtime } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
@@ -6,7 +10,9 @@ import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, 
 const AGENTS = ["claude-code", "codex"]
 const WITH_AGENT = ["request", "approve", "save-demo", "read", "revoke"]
 const WITH_PROJECT = ["save-demo", "read"]
-const USAGE = "usage: mida init | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | revoke <agent>   (agent = claude-code | codex)"
+export const USAGE = "usage: mida init | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | revoke <agent>   (agent = claude-code | codex)"
+/** Every first word runCli understands — the daemon's /cli route refuses anything else. */
+export const CLI_COMMANDS: readonly string[] = ["init", ...WITH_AGENT]
 
 export interface CliDeps {
   home: MidaHome
@@ -14,27 +20,43 @@ export interface CliDeps {
   print(line: string): void
 }
 
-export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
+/**
+ * The /cli route's input rule: argv is data, never shell — an array of at most 8 strings of at most
+ * 4,096 chars each, whose first word is a command runCli knows. Anything else is refused.
+ */
+export function validCliArgv(argv: unknown): argv is string[] {
+  return (
+    Array.isArray(argv) &&
+    argv.length <= 8 &&
+    argv.every((arg) => typeof arg === "string" && arg.length <= 4096) &&
+    CLI_COMMANDS.includes(argv[0] as string)
+  )
+}
+
+/**
+ * All of `mida`'s commands against an already-open runtime: the daemon's /cli route runs owner
+ * commands inside the daemon's runtime through this. Returns the exit code; output goes to print.
+ */
+export async function runCliWithRuntime(argv: string[], runtime: Runtime, print: (line: string) => void): Promise<number> {
   const [command = "", agent = "", projectId = ""] = argv
   const usage = () => {
-    deps.print(USAGE)
+    print(USAGE)
     return 2
   }
   if (command !== "init" && !WITH_AGENT.includes(command)) return usage()
   if (WITH_AGENT.includes(command) && !AGENTS.includes(agent)) return usage()
   if (WITH_PROJECT.includes(command) && projectId.length === 0) return usage()
 
-  const runtime = await Runtime.open(deps.home, deps.network)
   try {
     if (command === "init") {
       const result = await init(runtime, AGENTS)
-      deps.print(`owner ${result.owner}`)
-      for (const [name, agentId] of Object.entries(result.agents)) deps.print(`agent ${name} ${agentId}`)
+      print(`owner ${result.owner}`)
+      for (const [name, agentId] of Object.entries(result.agents)) print(`agent ${name} ${agentId}`)
     } else if (command === "request") {
-      deps.print(`requested ${agent} ${(await requestAccess(runtime, agent)).requestId}`)
+      print(`requested ${agent} ${(await requestAccess(runtime, agent)).requestId}`)
     } else if (command === "approve") {
       const result = await approve(runtime, agent)
-      deps.print(`approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}`)
+      print(`approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}`)
     } else if (command === "save-demo") {
       const result = await saveCheckpoint(runtime, agent, {
         projectId,
@@ -47,28 +69,58 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
           constraints: [], artifacts: [], unresolvedIssue: null, nextAction: "demo", remainingPlan: [], evidence: [],
         },
       })
-      deps.print(`saved ${result.contextId} tx ${result.transactionHash} in ${result.milliseconds} ms`)
+      print(`saved ${result.contextId} tx ${result.transactionHash} in ${result.milliseconds} ms`)
     } else if (command === "read") {
       const result = await readCheckpoints(runtime, agent, projectId)
-      deps.print(`read ${result.checkpoints.length} checkpoint(s) in ${result.milliseconds} ms`)
+      print(`read ${result.checkpoints.length} checkpoint(s) in ${result.milliseconds} ms`)
       const authorNames = authorNamesFor(runtime)
       for (const checkpoint of result.checkpoints) {
         const author = authorNames[checkpoint.authorId.toLowerCase()] ?? "unknown agent"
-        deps.print(`  ${checkpoint.contextId} written by ${author} (on-chain author ${checkpoint.authorId.slice(0, 10)}…)`)
+        print(`  ${checkpoint.contextId} written by ${author} (on-chain author ${checkpoint.authorId.slice(0, 10)}…)`)
       }
     } else {
       const result = await revoke(runtime, agent)
-      deps.print(`revoked ${agent} tx ${result.transactionHashes.join(" ")}; new key sent to: ${result.rewrapped.join(", ") || "nobody"}`)
+      print(`revoked ${agent} tx ${result.transactionHashes.join(" ")}; new key sent to: ${result.rewrapped.join(", ") || "nobody"}`)
     }
     return 0
   } catch (error) {
     // The error code only. A message from a deeper layer is never echoed: it could carry data.
     const code = (error as { code?: unknown }).code
-    deps.print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
+    print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
     return 1
+  }
+}
+
+/** Direct form kept for callers that own no daemon (tests, `mida init` before the daemon exists). */
+export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
+  if (!validCliArgv(argv)) {
+    deps.print(USAGE)
+    return 2
+  }
+  const runtime = await Runtime.open(deps.home, deps.network)
+  try {
+    return await runCliWithRuntime(argv, runtime, deps.print)
   } finally {
     await runtime.close()
   }
+}
+
+const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
+const DAEMON_MAIN = fileURLToPath(new URL("./daemon-main.ts", import.meta.url))
+/** How long a CLI waits for a spawned daemon to open its runtime — the first open fetches the chain head. */
+const DAEMON_WAIT_MS = 30_000
+const CLI_CALL_TIMEOUT_MS = 120_000
+
+/** The detached daemon spawn: same env stripping as the old drainer — no agent credentials leak. */
+function spawnDaemon(): void {
+  const child = spawn(process.execPath, ["--import", "tsx", DAEMON_MAIN], {
+    detached: true,
+    stdio: "ignore",
+    cwd: REPO_ROOT,
+    env: drainerEnv(process.env),
+  })
+  child.on("error", () => {})
+  child.unref()
 }
 
 /** Entry point for `pnpm mida`. Monad testnet only; needs DEPLOYER_PRIVATE_KEY in the environment as the funder. */
@@ -76,8 +128,39 @@ async function main(): Promise<void> {
   const { monadTestnetEnvironment } = await import("@mida/cli")
   const env = await monadTestnetEnvironment()
   try {
+    const home = new MidaHome()
     const network: Network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
-    process.exitCode = await runCli(process.argv.slice(2), { home: new MidaHome(), network, print: (line) => console.log(line) })
+    const argv = process.argv.slice(2)
+    const print = (line: string) => console.log(line)
+
+    // `init` is the one command allowed to run in-process: before it runs there is no
+    // network.json, so no daemon could start. It spawns the daemon when it is done. With a
+    // daemon already up, init goes through /cli like everything else.
+    if (argv[0] === "init") {
+      const health = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
+      if (health.status === 0) {
+        const code = await runCli(argv, { home, network, print })
+        if (code === 0) spawnDaemon()
+        process.exitCode = code
+        return
+      }
+    }
+
+    const up = await ensureDaemon(home, spawnDaemon, { waitMs: DAEMON_WAIT_MS })
+    if (!up) {
+      print("midad did not start; run `mida init` first")
+      process.exitCode = 1
+      return
+    }
+    const reply = await callDaemon(home, "/cli", { argv }, { timeoutMs: CLI_CALL_TIMEOUT_MS })
+    const body = reply.body as { code?: unknown; lines?: unknown } | null
+    if (reply.status === 0 || typeof body?.code !== "number" || !Array.isArray(body.lines)) {
+      print("midad did not answer")
+      process.exitCode = 1
+      return
+    }
+    for (const line of body.lines) print(String(line))
+    process.exitCode = body.code
   } finally {
     await env.stop()
   }

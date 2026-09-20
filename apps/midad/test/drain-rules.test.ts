@@ -314,6 +314,50 @@ describe("drainUntilSettled waits out the gap instead of stranding the job", () 
     expect(result.saved).toBe(0)
     expect(listJobs(home)).toHaveLength(1)      // the job survives for the next drainer
   })
+
+  it("a job that lands mid-pass is not stranded: the settle run re-lists and saves it", async () => {
+    const { home, job, save, open, homeDir, transcriptPath, compileCalls, saveCalls } = setup()
+    job({ event: "Stop" }, T0)
+    // while the first compile runs the session grows and its Stop job lands — the pass already
+    // listed the queue, so without a re-list this job sits until some later drain
+    const compile: typeof compileCheckpoint = async (input) => {
+      compileCalls.push(input)
+      if (compileCalls.length === 1) {
+        appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "more" }] } }) + "\n")
+        job({ event: "Stop" }, T0 + 1_000)
+      }
+      return {
+        ok: true, checkpoint: sampleCheckpoint({ eventId: input.eventId, agent: input.agent }),
+        compiledBy: "stub", droppedKeys: [], trimmed: [], attempts: 1,
+        format: "claude-jsonl", messagesKept: 1, messagesTotal: 1, charsSent: 0, modelMs: 0,
+      }
+    }
+    const result = await drainUntilSettled({
+      home, open, compile, save, homeDir, isApproved: async () => true,
+      now: () => new Date(T0 + 120_000), sleep: async () => {},
+    })
+    expect(result.saved).toBe(2)
+    expect(compileCalls).toHaveLength(2)
+    expect(saveCalls).toHaveLength(2)
+    expect(listJobs(home)).toHaveLength(0)
+  })
+
+  it("an injected runtime is used for the save and is never closed by the drain", async () => {
+    const { home, job, compile, save, homeDir, saveCalls } = setup()
+    job({ event: "Stop" }, T0)
+    let closed = 0
+    let opens = 0
+    const runtime = { close: async () => { closed += 1 } } as unknown as Runtime
+    const result = await drainUntilSettled({
+      home, runtime, compile, save, homeDir, isApproved: async () => true,
+      open: async () => { opens += 1; return runtime },
+      now: () => new Date(T0 + 120_000), sleep: async () => {},
+    })
+    expect(result.saved).toBe(1)
+    expect(saveCalls).toHaveLength(1)
+    expect(opens).toBe(0)
+    expect(closed).toBe(0)
+  })
 })
 
 describe("the transcript tail is read with one file descriptor and a bounded window", () => {
