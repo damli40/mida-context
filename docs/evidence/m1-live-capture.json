@@ -1,0 +1,153 @@
+{
+ "generatedAt": "2026-09-20",
+ "network": "local-anvil",
+ "what": "M1 Task 7: a real headless Claude Code session (spike toy task, model sonnet) with Mida hooks installed",
+ "session": {
+  "turns": 54,
+  "durationMs": 1541980,
+  "hookEvents": {
+   "PostToolUse": 48,
+   "Stop": 1,
+   "SessionEnd": 1
+  },
+  "hookMs": {
+   "min": 8,
+   "median": 10,
+   "max": 19
+  }
+ },
+ "saves": {
+  "onChain": 10,
+  "rejectedInvalid": 1,
+  "compiledBy": "claude-haiku via claude -p",
+  "allAuthoredOnChainBy": "claude-code",
+  "originalRequestVerbatimInAll": true,
+  "scrubFindsNothingInAll": true,
+  "lastHookToLastSaveSeconds": 57,
+  "readBackMs": 61
+ },
+ "mergedHandoff": {
+  "chars": 13292,
+  "limit": 8000,
+  "withinLimit": false,
+  "cause": "every compile restates the whole session, so the union merge keeps the same decision in many wordings (lazy refill appears 7 times)"
+ },
+ "stopFailure": {
+  "firesHeadless": true,
+  "trigger": "authentication_failed forced with an invalid key",
+  "carriedTranscriptPath": true,
+  "hookMs": 12
+ },
+ "perCheckpoint": [
+  {
+   "createdAt": "2026-09-20T17:46:35.377Z",
+   "sessionId": "57a58e09",
+   "compiledBy": "claude-haiku",
+   "author": "claude-code",
+   "progress": 4,
+   "decisions": 1,
+   "remainingPlan": 6,
+   "requestVerbatim": true,
+   "scrubChangesNothing": true
+  },
+  {
+   "createdAt": "2026-09-20T17:50:17.108Z",
+   "sessionId": "57a58e09",
+   "compiledBy": "claude-haiku",
+   "author": "claude-code",
+   "progress": 3,
+   "decisions": 2,
+   "remainingPlan": 6,
+   "requestVerbatim": true,
+   "scrubChangesNothing": true
+  },
+  {
+   "createdAt": "2026-09-20T17:51:16.425Z",
+   "sessionId": "57a58e09",
+   "compiledBy": "claude-haiku",
+   "author": "claude-code",
+   "progress": 5,
+   "decisions": 3,
+   "remainingPlan": 4,
+   "requestVerbatim": true,
+   "scrubChangesNothing": true
+  },
+  {
+   "createdAt": "2026-09-20T17:52:19.753Z",
+   "sessionId": "57a58e09",
+   "compiledBy": "claude-haiku",
+   "author": "claude-code",
+   "progress": 3,
+   "decisions": 2,
+   "remainingPlan": 2,
+   "requestVerbatim": true,
+   "scrubChangesNothing": true
+  },
+  {
+   "createdAt": "2026-09-20T17:53:19.653Z",
+   "sessionId": "57a58e09",
+   "compiledBy": "claude-haiku",
+   "author": "claude-code",
+   "progress": 4,
+   "decisions": 3,
+   "remainingPlan": 1,
+   "requestVerbatim": true,
+   "scrubChangesNothing": true
+  },
+  {
+   "createdAt": "2026-09-20T17:54:21.727Z",
+   "sessionId": "57a58e09",
+   "compiledBy": "claude-haiku",
+   "author": "claude-code",
+   "progress": 5,
+   "decisions": 3,
+   "remainingPlan": 1,
+   "requestVerbatim": true,
+   "scrubChangesNothing": true
+  },
+  {
+   "createdAt": "2026-09-20T17:55:20.236Z",
+   "sessionId": "57a58e09",
+   "compiledBy": "claude-haiku",
+   "author": "claude-code",
+   "progress": 5,
+   "decisions": 3,
+   "remainingPlan": 3,
+   "requestVerbatim": true,
+   "scrubChangesNothing": true
+  },
+  {
+   "createdAt": "2026-09-20T18:06:51.434Z",
+   "sessionId": "57a58e09",
+   "compiledBy": "claude-haiku",
+   "author": "claude-code",
+   "progress": 7,
+   "decisions": 3,
+   "remainingPlan": 3,
+   "requestVerbatim": true,
+   "scrubChangesNothing": true
+  },
+  {
+   "createdAt": "2026-09-20T18:10:43.947Z",
+   "sessionId": "57a58e09",
+   "compiledBy": "claude-haiku",
+   "author": "claude-code",
+   "progress": 6,
+   "decisions": 4,
+   "remainingPlan": 1,
+   "requestVerbatim": true,
+   "scrubChangesNothing": true
+  },
+  {
+   "createdAt": "2026-09-20T18:11:53.042Z",
+   "sessionId": "57a58e09",
+   "compiledBy": "claude-haiku",
+   "author": "claude-code",
+   "progress": 9,
+   "decisions": 5,
+   "remainingPlan": 1,
+   "requestVerbatim": true,
+   "scrubChangesNothing": true
+  }
+ ]
+}
