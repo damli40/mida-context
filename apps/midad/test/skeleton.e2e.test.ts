@@ -97,4 +97,68 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     expect(read.checkpoints[0]!.authorId).toBe(runtime.agent("claude-code").agentId)
     timings.read.push(read.milliseconds)
   })
+
+  step("8. after the restart claude-code can still save, and codex sees the new save", async () => {
+    const started = Date.now()
+    const saved = await saveCheckpoint(runtime, "claude-code", { projectId: "proj-1", checkpoint: { ...CHECKPOINT, nextAction: "Write the README" } })
+    const read = await readCheckpoints(runtime, "codex", "proj-1")
+    transactions.saveToReadableMs = String(Date.now() - started)
+    timings.save.push(saved.milliseconds)
+    timings.read.push(read.milliseconds)
+    transactions.saveAfterRestart = saved.transactionHash
+    expect(read.checkpoints).toHaveLength(2)
+  })
+
+  step("9. ATTACK: an agent rebuilt with a forged grant gets nothing", async () => {
+    const identity = loadAgentIdentity(home, "codex")!
+    const real = loadGrants(home, "codex")[0]!
+    const forgedCapability = { ...real.capabilities[0]!, capabilityId: `0x${"f0".repeat(32)}` as `0x${string}` }
+    const signer = privateKeyToAccount(identity.signerPrivateKey)
+    const forged = new MidaAgent({
+      agentId: identity.agentId,
+      callbackOrigin: identity.callbackOrigin,
+      encryptionPrivateKey: bytesOf(identity.encryptionPrivateKey, 32),
+      chain: createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: signer }),
+      api: new ContextApiClient({ baseUrl: runtime.apiBaseUrl, account: signer, chainId: network.deployment.chainId, capabilityRegistry: network.deployment.capabilityRegistry }),
+      grants: [{ ...real, capabilities: [forgedCapability] }],
+    })
+    await expect(forged.read(runtime.owner, "projects.current")).rejects.toMatchObject({ code: expect.stringMatching(/^(CAPABILITY_DENIED|CAPABILITY_REVOKED|NOT_FOUND)$/) })
+  })
+
+  step("10. the owner revokes claude-code: it is refused for reads AND writes", async () => {
+    const result = await revoke(runtime, "claude-code")
+    expect(result.transactionHashes).toHaveLength(1)
+    expect(result.rewrapped).toEqual(["codex"])
+    transactions.revokeAndRotate = result.transactionHashes[0]!
+    await expect(readCheckpoints(runtime, "claude-code", "proj-1")).rejects.toMatchObject({ code: "CAPABILITY_REVOKED" })
+    await expect(saveCheckpoint(runtime, "claude-code", { projectId: "proj-1", checkpoint: CHECKPOINT })).rejects.toMatchObject({
+      code: expect.stringMatching(/^CAPABILITY_(REVOKED|DENIED)$/),
+    })
+  })
+
+  step("11. codex is untouched: it still reads everything, and saves under the new key", async () => {
+    const saved = await saveCheckpoint(runtime, "codex", { projectId: "proj-1", checkpoint: { objective: "Codex carried on" } })
+    transactions.codexSaveAfterRevoke = saved.transactionHash
+    const read = await readCheckpoints(runtime, "codex", "proj-1")
+    expect(read.checkpoints).toHaveLength(3)
+    expect(read.checkpoints.map((c) => c.checkpoint.objective)).toContain("Codex carried on")
+  })
+
+  step("12. the revocation survives a restart, and the measurements are written down", async () => {
+    await runtime.close()
+    runtime = await Runtime.open(home, network)
+    await expect(readCheckpoints(runtime, "claude-code", "proj-1")).rejects.toMatchObject({ code: "CAPABILITY_REVOKED" })
+    expect((await readCheckpoints(runtime, "codex", "proj-1")).checkpoints).toHaveLength(3)
+    const folder = fileURLToPath(new URL("../../../docs/evidence/", import.meta.url))
+    mkdirSync(folder, { recursive: true })
+    const { saveToReadableMs, ...hashes } = transactions
+    writeFileSync(
+      `${folder}m0-${ON_TESTNET ? "monad-testnet" : "local-anvil"}.json`,
+      JSON.stringify({
+        network: env.name, generatedAt: new Date().toISOString(), oneOperatorRegisteredBothAgents: true,
+        grantGasUsed, saveMilliseconds: timings.save, readMilliseconds: timings.read,
+        saveToReadableMilliseconds: Number(saveToReadableMs), transactions: hashes,
+      }, null, 2),
+    )
+  })
 })

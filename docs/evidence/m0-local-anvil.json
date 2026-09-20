@@ -1,0 +1,23 @@
+{
+  "network": "local-default",
+  "generatedAt": "2026-09-20T02:59:00.193Z",
+  "oneOperatorRegisteredBothAgents": true,
+  "grantGasUsed": "347134",
+  "saveMilliseconds": [
+    4021,
+    4025
+  ],
+  "readMilliseconds": [
+    24,
+    33
+  ],
+  "saveToReadableMilliseconds": 4058,
+  "transactions": {
+    "grantClaudeCode": "0x9f89a29c84f36edada6ca4cee6659551523130a02c395dd77990f5b63ab47836",
+    "firstSave": "0x33c5947b3bceaf36161562cc0282d179c897ca77966a347cf9ce2404c8febe9c",
+    "grantCodex": "0x3bf32a8ad3c2fd7df24ff038dbdfb118ab3d3c3afc31e31b188a233f9fad0d7a",
+    "saveAfterRestart": "0x82350163adbf674c2894bd463def64cf7d11b052db99cd981c3693177ca810e5",
+    "revokeAndRotate": "0xbba12cc8c0691b30fa4a07e39d084a69e3e90e47052307e603063d1fab3821ad",
+    "codexSaveAfterRevoke": "0x495917f44eee21bc5ed372ab2fcbacd32432a454593558f9244ed30da372db9c"
+  }
+}
