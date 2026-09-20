@@ -1,8 +1,13 @@
 import { spawn } from "node:child_process"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { callDaemon, ensureDaemon } from "./control.js"
+import { runDoctor, runDoctorLive } from "./doctor.js"
 import { MidaHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
+import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeCode, uninstallCodex } from "./install.js"
+import type { InstallTool } from "./install.js"
 import { Runtime } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
@@ -10,7 +15,7 @@ import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, 
 const AGENTS = ["claude-code", "codex"]
 const WITH_AGENT = ["request", "approve", "save-demo", "read", "revoke"]
 const WITH_PROJECT = ["save-demo", "read"]
-export const USAGE = "usage: mida init | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | revoke <agent>   (agent = claude-code | codex)"
+export const USAGE = "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | revoke <agent>   (tool/agent = claude-code | codex)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
 export const CLI_COMMANDS: readonly string[] = ["init", ...WITH_AGENT]
 
@@ -157,6 +162,63 @@ async function main(): Promise<void> {
         process.exitCode = code
         return
       }
+    }
+
+    // install, uninstall and doctor are local commands: they never go through the daemon.
+    // install edits the tool's own config outside the Mida home, and doctor's first check is
+    // whether the daemon is even up — running it through the socket would report on nothing.
+    if (argv[0] === "install" || argv[0] === "uninstall") {
+      const tool = argv[1] ?? ""
+      if (argv.length !== 2 || !AGENTS.includes(tool)) {
+        print(USAGE)
+        process.exitCode = 2
+        return
+      }
+      // the real settings paths are built here and only here — tests always pass their own
+      const settingsPath =
+        tool === "claude-code" ? join(homedir(), ".claude", "settings.json") : join(homedir(), ".codex", "config.toml")
+      try {
+        const outcome =
+          argv[0] === "install"
+            ? tool === "claude-code"
+              ? installClaudeCode(settingsPath)
+              : installCodex(settingsPath)
+            : tool === "claude-code"
+              ? uninstallClaudeCode(settingsPath)
+              : uninstallCodex(settingsPath)
+        print(outcome === "already-installed" ? "already installed" : outcome === "not-installed" ? "not installed" : outcome)
+        if (argv[0] === "install" && tool === "codex") print(CODEX_TRUST_SENTENCE)
+        process.exitCode = 0
+      } catch (error) {
+        const code = (error as { code?: unknown }).code
+        print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
+        process.exitCode = 1
+      }
+      return
+    }
+
+    if (argv[0] === "doctor") {
+      const settings = {
+        "claude-code": join(homedir(), ".claude", "settings.json"),
+        codex: join(homedir(), ".codex", "config.toml"),
+      }
+      if (argv[1] === "--live") {
+        const tool = argv[2] ?? ""
+        if (argv.length !== 3 || !AGENTS.includes(tool)) {
+          print(USAGE)
+          process.exitCode = 2
+          return
+        }
+        process.exitCode = await runDoctorLive(tool as InstallTool, { home, print })
+        return
+      }
+      if (argv.length !== 1) {
+        print(USAGE)
+        process.exitCode = 2
+        return
+      }
+      process.exitCode = await runDoctor({ home, print, settings })
+      return
     }
 
     const up = await ensureDaemon(home, spawnDaemon, { waitMs: DAEMON_WAIT_MS })

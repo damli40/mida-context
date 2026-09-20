@@ -4,7 +4,7 @@ import { homedir } from "node:os"
 import { join, resolve } from "node:path"
 import { verifyMessage } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
-import type { Hex } from "@mida/protocol"
+import type { Address, Hex } from "@mida/protocol"
 import { loadOrCreateOwnerSecrets } from "./keys.js"
 import { findProjectMarker } from "./queue.js"
 import type { Runtime } from "./runtime.js"
@@ -62,10 +62,10 @@ type ApprovalsFile =
   | { kind: "signed"; entries: ProjectApproval[] }
 
 /** Missing is not corrupt: only a file that exists but will not parse or verify is tampered. */
-async function readApprovalsFile(runtime: Runtime): Promise<ApprovalsFile> {
+async function readApprovalsFile(home: Runtime["home"], owner: Address): Promise<ApprovalsFile> {
   let raw: unknown
   try {
-    raw = runtime.home.readJson(LIST_FILE)
+    raw = home.readJson(LIST_FILE)
   } catch {
     return { kind: "tampered" }
   }
@@ -81,7 +81,7 @@ async function readApprovalsFile(runtime: Runtime): Promise<ApprovalsFile> {
   }
   try {
     const ok = await verifyMessage({
-      address: runtime.owner,
+      address: owner,
       message: canonicalEntries(entries),
       signature: record.signature as Hex,
     })
@@ -90,6 +90,14 @@ async function readApprovalsFile(runtime: Runtime): Promise<ApprovalsFile> {
     return { kind: "tampered" }
   }
   return { kind: "signed", entries }
+}
+
+/**
+ * The list's integrity for `mida doctor` — read and signature-verified without a runtime, because
+ * verification is local cryptography against the owner's address. `midad`'s lock is never needed.
+ */
+export async function approvalsFileStatus(home: Runtime["home"], owner: Address): Promise<"missing" | "tampered" | "signed"> {
+  return (await readApprovalsFile(home, owner)).kind
 }
 
 async function signEntries(runtime: Runtime, entries: readonly ProjectApproval[]): Promise<Hex> {
@@ -174,7 +182,7 @@ export async function approveProject(
   const marker = ensureProjectMarker(input.cwd, input.homeDir)
   const root = realpathSync(marker.markerDir)
   return serializeListWrite(async () => {
-    const file = await readApprovalsFile(runtime)
+    const file = await readApprovalsFile(runtime.home, runtime.owner)
     const entries = file.kind === "signed" ? file.entries : []
     const kept = entries.filter(
       (e) => !(e.agent === input.agent && e.projectId === marker.projectId && e.root === root),
@@ -198,7 +206,7 @@ export async function approveProject(
  */
 export async function removeAgentApprovals(runtime: Runtime, agent: string): Promise<number> {
   return serializeListWrite(async () => {
-    const file = await readApprovalsFile(runtime)
+    const file = await readApprovalsFile(runtime.home, runtime.owner)
     if (file.kind === "missing") return 0
     const entries = file.kind === "signed" ? file.entries : []
     const kept = entries.filter((e) => e.agent !== agent)
@@ -224,7 +232,7 @@ export async function checkProject(runtime: Runtime, input: { agent: string; cwd
     } catch {
       return { ok: false, reason: "not-a-project" }
     }
-    const file = await readApprovalsFile(runtime)
+    const file = await readApprovalsFile(runtime.home, runtime.owner)
     if (file.kind === "tampered") return { ok: false, reason: "list-tampered" }
     const entries = file.kind === "signed" ? file.entries : []
     const mine = entries.filter((e) => e.agent === input.agent && e.projectId === marker.projectId)

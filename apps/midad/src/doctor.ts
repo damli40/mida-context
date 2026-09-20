@@ -1,0 +1,399 @@
+import { existsSync, mkdtempSync, readFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { spawn } from "node:child_process"
+import { createPublicClient, http } from "viem"
+import { privateKeyToAccount } from "viem/accounts"
+import type { Address, Hex } from "@mida/protocol"
+import { chainFor, parseDeployment } from "@mida/chain"
+import type { ChainContext } from "@mida/chain"
+import { RegistryReader } from "@mida/api"
+import { callDaemon } from "./control.js"
+import type { MidaHome } from "./home.js"
+import { claudeHooksStatus, codexHooksStatus } from "./install.js"
+import type { InstallTool } from "./install.js"
+import { listAgentNames, loadAgentIdentity } from "./keys.js"
+import { approvalsFileStatus } from "./projects.js"
+import { listJobs } from "./queue.js"
+import { MIN_BALANCE_WEI } from "./runtime.js"
+
+/** The whole run is capped — a check may stall, the report may not. */
+const RUN_CAP_MS = 20_000
+/** How long the /health probe waits before declaring the daemon down. */
+const DAEMON_PROBE_MS = 1_000
+/** `doctor --live` waits this long for the SessionStart handoff to reach the daemon log. */
+const LIVE_WATCH_MS = 60_000
+
+export interface DoctorDeps {
+  home: MidaHome
+  print(line: string): void
+  /** Each tool's real config path — built only inside cli.ts main(); tests pass temp paths. */
+  settings?: Partial<Record<InstallTool, string>>
+  /** Shell environment for the API-key check; default process.env. Values are never printed. */
+  env?: NodeJS.ProcessEnv
+  now?: () => number
+  /** /health probe timeout; default 1 s. */
+  daemonProbeMs?: number
+  /** Whole-run cap; default 20 s. */
+  capMs?: number
+}
+
+interface DoctorLiveDeps extends DoctorDeps {
+  /** Default: process.stdin.isTTY. Injected so the refusal is testable. */
+  stdinIsTTY?: boolean
+  /** SessionStart watch window; default 60 s. */
+  watchMs?: number
+  /** Starts the throwaway headless session; the default spawns the real tool. */
+  startSession?: (tool: InstallTool, cwd: string) => { stop(): void }
+}
+
+/** What the chain checks need; built lazily once network.json has been read. */
+interface Shared {
+  context?: ChainContext
+  reader?: RegistryReader
+  ownerAddress?: Address | "missing"
+}
+
+const problem = (sentence: string, fix: string) => `PROBLEM: ${sentence} — ${fix}`
+const INIT_FIX = "run `mida init`"
+
+/** A thrown check becomes a PROBLEM line with a stable code — never a raw error message. */
+function stableCode(error: unknown): string {
+  const code = (error as { code?: unknown }).code
+  return typeof code === "string" ? code : "check-failed"
+}
+
+/** Races a check against the time left in the run cap; a timeout is a thrown check. */
+function within<T>(work: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const error = new Error("the check timed out") as Error & { code: string }
+      error.code = "check-timeout"
+      reject(error)
+    }, ms)
+    if (typeof timer.unref === "function") timer.unref()
+    work.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error) => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+/** network.json → rpcUrl + deployment, or a refusal-shaped problem. Read only; never written. */
+function readNetwork(home: MidaHome): { rpcUrl: string; deployment: ReturnType<typeof parseDeployment> } | undefined {
+  try {
+    const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown }>("network.json")
+    if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) return undefined
+    return { rpcUrl: stored.rpcUrl, deployment: parseDeployment(stored.deployment) }
+  } catch {
+    return undefined
+  }
+}
+
+function chainOf(shared: Shared): { context: ChainContext; reader: RegistryReader } | undefined {
+  return shared.context === undefined || shared.reader === undefined ? undefined : { context: shared.context, reader: shared.reader }
+}
+
+/** The owner address from the saved secrets — read only, never created here. */
+function ownerAddressOf(home: MidaHome): Address | "missing" {
+  try {
+    const secrets = home.readJson<Record<string, unknown>>("owner/secrets.json")
+    const key = secrets?.privateKey
+    if (typeof key !== "string" || !/^0x[0-9a-f]{64}$/.test(key)) return "missing"
+    return privateKeyToAccount(key as Hex).address
+  } catch {
+    return "missing"
+  }
+}
+
+const NEEDS_NETWORK = `needs network.json — ${INIT_FIX}`
+const NEEDS_OWNER = `needs the owner key — ${INIT_FIX}`
+
+/** One line per check, in the order the spec fixes. Each returns its lines; it never decides. */
+function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): Promise<string[]> }[] {
+  const home = deps.home
+  return [
+    {
+      name: "daemon",
+      run: async () => {
+        const reply = await callDaemon(home, "/health", undefined, { timeoutMs: deps.daemonProbeMs ?? DAEMON_PROBE_MS })
+        return reply.status === 0 ? [problem("midad is not answering", "start the daemon")] : ["ok: midad answers"]
+      },
+    },
+    {
+      name: "network",
+      run: async () => {
+        const network = readNetwork(home)
+        if (network === undefined) return [problem("network.json is missing or unreadable", INIT_FIX)]
+        shared.context = {
+          publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: http(network.rpcUrl) }),
+          deployment: network.deployment,
+        }
+        shared.reader = new RegistryReader(shared.context)
+        return ["ok: network.json present"]
+      },
+    },
+    {
+      name: "owner",
+      run: async () => {
+        const chain = chainOf(shared)
+        if (chain === undefined) return [problem("the owner check cannot run", NEEDS_NETWORK)]
+        const owner = ownerAddressOf(home)
+        if (owner === "missing") return [problem("the owner key is missing", INIT_FIX)]
+        shared.ownerAddress = owner
+        const key = await chain.reader.ownerP256Key(owner)
+        return key === null
+          ? [problem("the owner is not registered on chain", INIT_FIX)]
+          : ["ok: owner registered on chain"]
+      },
+    },
+    {
+      name: "agents",
+      run: async () => {
+        const names = listAgentNames(home)
+        if (names.length === 0) return [problem("no agents are set up", INIT_FIX)]
+        const chain = chainOf(shared)
+        const owner = shared.ownerAddress ?? ownerAddressOf(home)
+        const lines: string[] = []
+        for (const name of names) {
+          const identity = loadAgentIdentity(home, name)
+          if (chain === undefined) {
+            lines.push(problem(`${name}'s grant cannot be checked`, NEEDS_NETWORK))
+            continue
+          }
+          if (owner === "missing") {
+            lines.push(problem(`${name}'s grant cannot be checked`, NEEDS_OWNER))
+            continue
+          }
+          const ids = await chain.reader.activeCapabilityIds(owner, identity!.agentId)
+          const views = (await Promise.all(ids.map((id) => chain.reader.getCapability(id)))).filter((v) => v !== null)
+          const now = await chain.reader.now()
+          const live = views.filter((v) => !v.revoked && (v.expiresAt === 0n || now < v.expiresAt))
+          if (live.length > 0) {
+            lines.push(`ok: ${name} approved`)
+          } else if (views.length === 0) {
+            lines.push(
+              home.has(`agents/${name}/pending-request.json`)
+                ? problem(`${name} asked but is not approved on chain`, `run \`mida approve ${name}\``)
+                : problem(`${name} has never asked for access`, `run \`mida request ${name}\` then \`mida approve ${name}\``),
+            )
+          } else if (views.some((v) => v.revoked)) {
+            lines.push(problem(`${name}'s access was revoked`, `run \`mida request ${name}\` then \`mida approve ${name}\``))
+          } else {
+            const latest = views.reduce((max, v) => (v.expiresAt > max ? v.expiresAt : max), 0n)
+            const date = new Date(Number(latest) * 1000).toISOString()
+            lines.push(problem(`${name}'s grant expired ${date}`, `run \`mida request ${name}\` then \`mida approve ${name}\``))
+          }
+        }
+        return lines
+      },
+    },
+    {
+      name: "approved-projects",
+      run: async () => {
+        const owner = shared.ownerAddress ?? ownerAddressOf(home)
+        if (owner === "missing") return [problem("the approved-projects list cannot be verified", NEEDS_OWNER)]
+        const status = await approvalsFileStatus(home, owner)
+        if (status === "tampered") {
+          return [problem("the approved-projects list failed its signature check", "re-run `mida approve <agent>` in each project folder")]
+        }
+        return status === "missing" ? ["ok: no approved projects yet"] : ["ok: approved-projects signature valid"]
+      },
+    },
+    {
+      name: "hooks",
+      run: async () => {
+        const lines: string[] = []
+        const claudePath = deps.settings?.["claude-code"]
+        if (claudePath !== undefined) {
+          const status = claudeHooksStatus(claudePath)
+          lines.push(
+            status === "installed"
+              ? "ok: claude-code hooks installed"
+              : status === "unreadable"
+                ? problem("claude-code settings cannot be read safely", "fix the file, then run `mida install claude-code`")
+                : problem("claude-code hooks are not installed", "run `mida install claude-code`"),
+          )
+        }
+        const codexPath = deps.settings?.codex
+        if (codexPath !== undefined) {
+          const status = codexHooksStatus(codexPath)
+          lines.push(
+            status === "installed"
+              ? "ok: codex hooks installed"
+              : status === "unreadable"
+                ? problem("codex's hook block was edited", "remove the marked block, then run `mida install codex`")
+                : problem("codex hooks are not installed", "run `mida install codex`"),
+          )
+        }
+        return lines.length === 0 ? ["ok: no hook paths to check"] : lines
+      },
+    },
+    {
+      name: "api-keys",
+      run: async () => {
+        const env = deps.env ?? process.env
+        const set = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"].filter((name) => env[name] !== undefined && env[name] !== "")
+        return set.length === 0
+          ? ["ok: no Anthropic key variable in the shell"]
+          : [`note: ${set.join(", ")} set in the shell (midad strips them for the compiler)`]
+      },
+    },
+    {
+      name: "queue",
+      run: async () => {
+        const jobs = listJobs(home)
+        if (jobs.length === 0) return ["ok: queue empty"]
+        const oldest = jobs.reduce((min, job) => Math.min(min, Date.parse(job.at)), Number.POSITIVE_INFINITY)
+        const ageMs = Math.max(0, (deps.now ?? Date.now)() - oldest)
+        return [`ok: ${jobs.length} job(s) waiting; oldest ${ageText(ageMs)}`]
+      },
+    },
+    {
+      name: "wallets",
+      run: async () => {
+        const chain = chainOf(shared)
+        if (chain === undefined) return [problem("wallets cannot be checked", NEEDS_NETWORK)]
+        const owner = shared.ownerAddress ?? ownerAddressOf(home)
+        if (owner === "missing") return [problem("wallets cannot be checked", NEEDS_OWNER)]
+        const lines: string[] = []
+        const wallets: { label: string; address: Address }[] = [{ label: "owner", address: owner }]
+        for (const name of listAgentNames(home)) {
+          const identity = loadAgentIdentity(home, name)
+          if (identity !== undefined) {
+            wallets.push({ label: name, address: privateKeyToAccount(identity.signerPrivateKey).address })
+          }
+        }
+        for (const wallet of wallets) {
+          const balance = await chain.context.publicClient.getBalance({ address: wallet.address })
+          if (balance < MIN_BALANCE_WEI) {
+            lines.push(problem(`${wallet.label}'s wallet is below the gas top-up line`, `${INIT_FIX} to top it up`))
+          }
+        }
+        return lines.length === 0 ? ["ok: wallets have gas"] : lines
+      },
+    },
+  ]
+}
+
+function ageText(ms: number): string {
+  const seconds = Math.floor(ms / 1000)
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h`
+  return `${Math.floor(hours / 24)}d`
+}
+
+/**
+ * `mida doctor`: one line per check — `ok:`, `note:` or `PROBLEM: <sentence> — <the fix>`. The
+ * exit code is the number of PROBLEM lines, capped at 9; notes never count. Every check is
+ * isolated: a thrown or timed-out check is itself a PROBLEM line with a stable code and the run
+ * goes on. Nothing here takes `midad.lock` — chain state is read through a read-only registry
+ * reader built from network.json, so the checks run whether or not the daemon is up.
+ */
+export async function runDoctor(deps: DoctorDeps): Promise<number> {
+  const now = deps.now ?? Date.now
+  const deadline = now() + (deps.capMs ?? RUN_CAP_MS)
+  const shared: Shared = {}
+  let problems = 0
+  for (const check of buildChecks(deps, shared)) {
+    const remaining = deadline - now()
+    let lines: string[]
+    if (remaining <= 0) {
+      lines = [problem(`the ${check.name} check did not run`, "re-run `mida doctor`")]
+    } else {
+      try {
+        lines = await within(check.run(), remaining)
+      } catch (error) {
+        lines = [problem(`the ${check.name} check failed (${stableCode(error)})`, "re-run `mida doctor`")]
+      }
+    }
+    for (const line of lines) {
+      deps.print(line)
+      if (line.startsWith("PROBLEM:")) problems += 1
+    }
+  }
+  return Math.min(problems, 9)
+}
+
+/**
+ * `mida doctor --live <tool>`: the only check that proves a hook really fires, because Codex
+ * skips an untrusted hook silently. It starts one throwaway headless session of the tool and
+ * watches the daemon log for the SessionStart handoff it triggers — inside 60 s or it reports.
+ * A real agent is started, so the check refuses to run in CI or without an interactive terminal;
+ * the guards run before anything is spawned.
+ */
+export async function runDoctorLive(tool: InstallTool, deps: DoctorLiveDeps): Promise<number> {
+  const env = deps.env ?? process.env
+  if (env.CI !== undefined && env.CI !== "") {
+    deps.print("refused: live checks do not run in CI")
+    return 2
+  }
+  if (!(deps.stdinIsTTY ?? process.stdin.isTTY ?? false)) {
+    deps.print("refused: live checks need an interactive terminal")
+    return 2
+  }
+  const started = (deps.now ?? Date.now)()
+  const deadline = started + (deps.watchMs ?? LIVE_WATCH_MS)
+  const cwd = mkdtempSync(join(tmpdir(), "mida-live-"))
+  const session = (deps.startSession ?? startToolSession)(tool, cwd)
+  try {
+    for (;;) {
+      if (handoffLogged(deps.home, tool, started)) {
+        deps.print(`ok: ${tool} SessionStart hook fired`)
+        return 0
+      }
+      if ((deps.now ?? Date.now)() >= deadline) {
+        deps.print(problem(`${tool}'s SessionStart hook did not fire within 60 s`, "check the hooks are installed and trusted"))
+        return 1
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+  } finally {
+    session.stop()
+  }
+}
+
+/**
+ * The throwaway session: a headless one-shot prompt in an empty folder — just enough for the
+ * tool to start, fire SessionStart and exit. `claude -p` and `codex exec` are the headless forms.
+ */
+function startToolSession(tool: InstallTool, cwd: string): { stop(): void } {
+  const [command, args] =
+    tool === "claude-code" ? ["claude", ["-p", "Reply with the word ok."]] : ["codex", ["exec", "Reply with the word ok."]]
+  const child = spawn(command, args, { cwd, stdio: "ignore" })
+  child.on("error", () => {})
+  return {
+    stop() {
+      try {
+        child.kill()
+      } catch {
+        // already gone
+      }
+    },
+  }
+}
+
+/** True once the daemon log holds a handoff record for this tool written after `since`. */
+function handoffLogged(home: MidaHome, tool: string, since: number): boolean {
+  try {
+    const file = home.path("logs/daemon.jsonl")
+    if (!existsSync(file)) return false
+    const sinceIso = new Date(since).toISOString()
+    return readFileSync(file, "utf8")
+      .split("\n")
+      .filter((line) => line !== "")
+      .some((line) => {
+        try {
+          const record = JSON.parse(line) as { at?: unknown; event?: unknown; agent?: unknown }
+          return record.event === "handoff" && record.agent === tool && typeof record.at === "string" && record.at >= sinceIso
+        } catch {
+          return false
+        }
+      })
+  } catch {
+    return false
+  }
+}

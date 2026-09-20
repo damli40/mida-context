@@ -1,0 +1,313 @@
+import { describe, expect, it } from "vitest"
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import {
+  CODEX_BLOCK,
+  HOOK_COMMAND,
+  INJECT_COMMAND,
+  installClaudeCode,
+  installCodex,
+  uninstallClaudeCode,
+  uninstallCodex,
+} from "@mida/midad"
+
+const dir = () => mkdtempSync(join(tmpdir(), "mida-install-"))
+
+describe("mida install claude-code", () => {
+  it("the command constants are the exact strings and nothing else", () => {
+    expect(HOOK_COMMAND["claude-code"]).toBe("mida-hook claude-code")
+    expect(INJECT_COMMAND["claude-code"]).toBe("mida-inject claude-code")
+    expect(HOOK_COMMAND["codex"]).toBe("mida-hook codex")
+    expect(INJECT_COMMAND["codex"]).toBe("mida-inject codex")
+  })
+
+  it("installs all six events into a missing settings file, creating the folder", () => {
+    const settings = join(dir(), ".claude", "settings.json")
+    const result = installClaudeCode(settings)
+    expect(result).toBe("installed")
+    const parsed = JSON.parse(readFileSync(settings, "utf8")) as {
+      hooks: Record<string, { hooks: { type: string; command: string }[] }[]>
+    }
+    const commandOf = (event: string) => parsed.hooks[event]![0]!.hooks[0]!.command
+    expect(commandOf("SessionStart")).toBe(INJECT_COMMAND["claude-code"])
+    for (const event of ["PostToolUse", "Stop", "StopFailure", "PreCompact", "SessionEnd"]) {
+      expect(commandOf(event)).toBe(HOOK_COMMAND["claude-code"])
+    }
+    // the installed strings equal the constants byte for byte — no path, no version, no env var
+    for (const event of Object.keys(parsed.hooks)) {
+      for (const element of parsed.hooks[event]!) {
+        for (const hook of element.hooks) {
+          expect([HOOK_COMMAND["claude-code"], INJECT_COMMAND["claude-code"]]).toContain(hook.command)
+        }
+      }
+    }
+    // no backup when the file did not exist before
+    expect(existsSync(`${settings}.mida-backup`)).toBe(false)
+  })
+
+  it("appends one element per event without touching unrelated hooks, and backs up the original once", () => {
+    const settings = join(dir(), "settings.json")
+    const original = {
+      model: "opus",
+      hooks: {
+        Stop: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo done" }] }],
+        CustomEvent: [{ hooks: [{ type: "command", command: "lint" }] }],
+      },
+    }
+    const originalText = `${JSON.stringify(original, null, 2)}\n`
+    writeFileSync(settings, originalText)
+
+    expect(installClaudeCode(settings)).toBe("installed")
+    const backup = `${settings}.mida-backup`
+    // the backup holds the pre-install bytes and is written before the first change only
+    expect(readFileSync(backup, "utf8")).toBe(originalText)
+
+    const parsed = JSON.parse(readFileSync(settings, "utf8")) as {
+      model: string
+      hooks: Record<string, { matcher?: string; hooks: { type: string; command: string }[] }[]>
+    }
+    expect(parsed.model).toBe("opus")
+    // the user's entries are first and unchanged; ours are the last element of each array
+    expect(parsed.hooks.Stop).toHaveLength(2)
+    expect(parsed.hooks.Stop![0]).toEqual(original.hooks.Stop[0])
+    expect(parsed.hooks.Stop![1]).toEqual({ hooks: [{ type: "command", command: HOOK_COMMAND["claude-code"] }] })
+    expect(parsed.hooks.CustomEvent).toEqual(original.hooks.CustomEvent)
+    expect(parsed.hooks.SessionStart).toEqual([
+      { hooks: [{ type: "command", command: INJECT_COMMAND["claude-code"] }] },
+    ])
+  })
+
+  it("a second install prints already-installed and leaves the file byte-identical", () => {
+    const settings = join(dir(), "settings.json")
+    writeFileSync(settings, `${JSON.stringify({ hooks: {} }, null, 2)}\n`)
+    expect(installClaudeCode(settings)).toBe("installed")
+    const beforeBytes = readFileSync(settings, "utf8")
+    const beforeMtime = statSync(settings).mtimeMs
+    const backupBytes = readFileSync(`${settings}.mida-backup`, "utf8")
+
+    expect(installClaudeCode(settings)).toBe("already-installed")
+    expect(readFileSync(settings, "utf8")).toBe(beforeBytes)
+    expect(statSync(settings).mtimeMs).toBe(beforeMtime)
+    // the backup is never overwritten by a later install
+    expect(readFileSync(`${settings}.mida-backup`, "utf8")).toBe(backupBytes)
+  })
+
+  it("a partial install adds only the missing events", () => {
+    const settings = join(dir(), "settings.json")
+    const partial = {
+      hooks: {
+        SessionStart: [{ hooks: [{ type: "command", command: INJECT_COMMAND["claude-code"] }] }],
+        Stop: [{ hooks: [{ type: "command", command: HOOK_COMMAND["claude-code"] }] }],
+      },
+    }
+    writeFileSync(settings, JSON.stringify(partial, null, 2))
+    expect(installClaudeCode(settings)).toBe("installed")
+    const parsed = JSON.parse(readFileSync(settings, "utf8")) as {
+      hooks: Record<string, { hooks: { command: string }[] }[]>
+    }
+    // the two pre-installed events were not duplicated
+    expect(parsed.hooks.SessionStart).toHaveLength(1)
+    expect(parsed.hooks.Stop).toHaveLength(1)
+    for (const event of ["PostToolUse", "StopFailure", "PreCompact", "SessionEnd"]) {
+      expect(parsed.hooks[event]).toHaveLength(1)
+      expect(parsed.hooks[event]![0]!.hooks[0]!.command).toBe(HOOK_COMMAND["claude-code"])
+    }
+    // and a further install is a no-op
+    expect(installClaudeCode(settings)).toBe("already-installed")
+  })
+
+  it("refuses settings-unreadable on invalid JSON and writes nothing", () => {
+    const settings = join(dir(), "settings.json")
+    const text = '{ "hooks": trul'
+    writeFileSync(settings, text)
+    expect(() => installClaudeCode(settings)).toThrowError(
+      expect.objectContaining({ code: "settings-unreadable" }),
+    )
+    expect(readFileSync(settings, "utf8")).toBe(text)
+    expect(existsSync(`${settings}.mida-backup`)).toBe(false)
+  })
+
+  it("refuses settings-unreadable on a non-object top level", () => {
+    for (const text of ['["hooks"]', '"hooks"', "42", "null"]) {
+      const settings = join(dir(), "settings.json")
+      writeFileSync(settings, text)
+      expect(() => installClaudeCode(settings)).toThrowError(
+        expect.objectContaining({ code: "settings-unreadable" }),
+      )
+      expect(readFileSync(settings, "utf8")).toBe(text)
+    }
+  })
+
+  it("refuses settings-unreadable when hooks is not an object, or an event is not an array", () => {
+    const cases = [
+      { hooks: ["Stop"] },
+      { hooks: "Stop" },
+      { hooks: { SessionStart: { hooks: [] } } },
+      { hooks: { Stop: "mida-hook claude-code" } },
+    ]
+    for (const shape of cases) {
+      const settings = join(dir(), "settings.json")
+      const text = JSON.stringify(shape, null, 2)
+      writeFileSync(settings, text)
+      expect(() => installClaudeCode(settings)).toThrowError(
+        expect.objectContaining({ code: "settings-unreadable" }),
+      )
+      expect(readFileSync(settings, "utf8")).toBe(text)
+    }
+  })
+
+  it("keeps the file's indentation and ends with a newline", () => {
+    const settings = join(dir(), "settings.json")
+    writeFileSync(settings, `{\n    "hooks": {},\n    "model": "opus"\n}\n`)
+    expect(installClaudeCode(settings)).toBe("installed")
+    const text = readFileSync(settings, "utf8")
+    expect(text).toContain('\n    "hooks": {')
+    expect(text.endsWith("\n")).toBe(true)
+  })
+})
+
+describe("mida uninstall claude-code", () => {
+  it("install then uninstall restores the original JSON deep-equal, unrelated hooks untouched", () => {
+    const settings = join(dir(), "settings.json")
+    const original = {
+      model: "opus",
+      hooks: {
+        Stop: [{ matcher: "Bash", hooks: [{ type: "command", command: "echo done" }] }],
+        CustomEvent: [{ hooks: [{ type: "command", command: "lint" }] }],
+      },
+      permissions: { allow: ["Bash(git status)"] },
+    }
+    writeFileSync(settings, JSON.stringify(original, null, 2))
+    installClaudeCode(settings)
+    expect(uninstallClaudeCode(settings)).toBe("uninstalled")
+    expect(JSON.parse(readFileSync(settings, "utf8"))).toEqual(JSON.parse(JSON.stringify(original)))
+  })
+
+  it("round-trips an empty object, an empty hooks object and an empty event array", () => {
+    for (const original of [{}, { hooks: {} }, { hooks: { SessionStart: [] } }]) {
+      const settings = join(dir(), "settings.json")
+      writeFileSync(settings, JSON.stringify(original, null, 2))
+      installClaudeCode(settings)
+      uninstallClaudeCode(settings)
+      expect(JSON.parse(readFileSync(settings, "utf8"))).toEqual(original)
+    }
+  })
+
+  it("keeps an element that shares an event with ours but carries other commands", () => {
+    const settings = join(dir(), "settings.json")
+    const original = {
+      hooks: {
+        Stop: [
+          { hooks: [{ type: "command", command: "echo user" }] },
+          { hooks: [{ type: "command", command: HOOK_COMMAND["claude-code"] }, { type: "command", command: "echo also-user" }] },
+        ],
+      },
+    }
+    writeFileSync(settings, JSON.stringify(original, null, 2))
+    expect(uninstallClaudeCode(settings)).toBe("uninstalled")
+    const parsed = JSON.parse(readFileSync(settings, "utf8")) as typeof original
+    // only the mida command entries are removed — the element's other hooks stay
+    expect(parsed.hooks.Stop).toEqual([
+      { hooks: [{ type: "command", command: "echo user" }] },
+      { hooks: [{ type: "command", command: "echo also-user" }] },
+    ])
+  })
+
+  it("not-installed on a file without our entries and on a missing file, writing nothing", () => {
+    const settings = join(dir(), "settings.json")
+    const text = JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo done" }] }] } })
+    writeFileSync(settings, text)
+    expect(uninstallClaudeCode(settings)).toBe("not-installed")
+    expect(readFileSync(settings, "utf8")).toBe(text)
+    expect(uninstallClaudeCode(join(dir(), "settings.json"))).toBe("not-installed")
+  })
+})
+
+describe("mida install codex", () => {
+  it("creates a missing config.toml with exactly the managed block", () => {
+    const config = join(dir(), "nested", "config.toml")
+    expect(installCodex(config)).toBe("installed")
+    expect(readFileSync(config, "utf8")).toBe(`${CODEX_BLOCK}\n`)
+  })
+
+  it("appends after existing content with one blank line, bytes outside preserved", () => {
+    const config = join(dir(), "config.toml")
+    const before = 'model = "gpt-5"\napproval_policy = "untrusted"\n'
+    writeFileSync(config, before)
+    expect(installCodex(config)).toBe("installed")
+    const text = readFileSync(config, "utf8")
+    expect(text).toBe(`${before}\n${CODEX_BLOCK}\n`)
+    // second install is a byte-identical no-op
+    expect(installCodex(config)).toBe("already-installed")
+    expect(readFileSync(config, "utf8")).toBe(text)
+    expect(statSync(config).mtimeMs).toBe(statSync(config).mtimeMs)
+  })
+
+  it("completes a last line without newline before the blank line", () => {
+    const config = join(dir(), "config.toml")
+    const before = 'model = "gpt-5"'
+    writeFileSync(config, before)
+    installCodex(config)
+    expect(readFileSync(config, "utf8")).toBe(`${before}\n\n${CODEX_BLOCK}\n`)
+  })
+
+  it("does not add a blank line when the file already ends in one", () => {
+    const config = join(dir(), "config.toml")
+    const before = 'model = "gpt-5"\n\n'
+    writeFileSync(config, before)
+    installCodex(config)
+    expect(readFileSync(config, "utf8")).toBe(`${before}${CODEX_BLOCK}\n`)
+  })
+
+  it("refuses settings-unreadable when the markers wrap edited content, writing nothing", () => {
+    const config = join(dir(), "config.toml")
+    const before = 'model = "gpt-5"\n'
+    writeFileSync(config, before)
+    installCodex(config)
+    const tampered = readFileSync(config, "utf8").replace(
+      'command = "mida-hook codex"',
+      'command = "mida-hook codex --extra"',
+    )
+    writeFileSync(config, tampered)
+    expect(() => installCodex(config)).toThrowError(
+      expect.objectContaining({ code: "settings-unreadable" }),
+    )
+    expect(readFileSync(config, "utf8")).toBe(tampered)
+  })
+
+  it("refuses settings-unreadable when only one marker is present", () => {
+    const config = join(dir(), "config.toml")
+    const text = 'model = "x"\n# >>> mida hooks — managed by `mida install codex`; do not edit >>>\n'
+    writeFileSync(config, text)
+    expect(() => installCodex(config)).toThrowError(
+      expect.objectContaining({ code: "settings-unreadable" }),
+    )
+    expect(readFileSync(config, "utf8")).toBe(text)
+  })
+
+  it("uninstall removes the block and its blank line, bytes outside preserved", () => {
+    const config = join(dir(), "config.toml")
+    const before = 'model = "gpt-5"\napproval_policy = "untrusted"\n'
+    writeFileSync(config, before)
+    installCodex(config)
+    expect(uninstallCodex(config)).toBe("uninstalled")
+    expect(readFileSync(config, "utf8")).toBe(before)
+  })
+
+  it("uninstall on a file created by install leaves an empty file", () => {
+    const config = join(dir(), "config.toml")
+    installCodex(config)
+    expect(uninstallCodex(config)).toBe("uninstalled")
+    expect(readFileSync(config, "utf8")).toBe("")
+  })
+
+  it("uninstall is not-installed on absent block or missing file, writing nothing", () => {
+    const config = join(dir(), "config.toml")
+    const before = 'model = "gpt-5"\n'
+    writeFileSync(config, before)
+    expect(uninstallCodex(config)).toBe("not-installed")
+    expect(readFileSync(config, "utf8")).toBe(before)
+    expect(uninstallCodex(join(dir(), "config.toml"))).toBe("not-installed")
+  })
+})

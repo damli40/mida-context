@@ -26,7 +26,7 @@ export const NAMESPACE = "projects.current"
 export const PURPOSE_ID = "project_assistance" as const
 export const AGENT_PERMISSIONS = PERMISSION.READ | PERMISSION.CREATE | PERMISSION.SUPERSEDE_OWN
 /** Below this balance an account is topped up before it has to send a transaction. */
-const MIN_BALANCE_WEI = 50_000_000_000_000_000n
+export const MIN_BALANCE_WEI = 50_000_000_000_000_000n
 /** One runtime per home: a pid file created exclusively at open and removed at close. */
 const LOCK_FILE = "midad.lock"
 
