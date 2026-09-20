@@ -1,9 +1,11 @@
 import { privateKeyToAccount } from "viem/accounts"
-import { PERMISSION, PROVENANCE_POLICY, namespaceId } from "@mida/protocol"
+import { MidaError, PERMISSION, PROVENANCE_POLICY, isMidaError, namespaceId } from "@mida/protocol"
 import type { AccessRequest, Address, Hex } from "@mida/protocol"
 import { capabilityRegistryAbi, createWriteContext } from "@mida/chain"
+import type { ChainContext } from "@mida/chain"
 import { provisionAgent } from "@mida/fake-vault"
 import type { StoredCheckpoint } from "@mida/checkpoint"
+import type { ContextObject } from "@mida/sdk"
 import { AGENT_PERMISSIONS, NAMESPACE, PURPOSE_ID } from "./runtime.js"
 import type { Runtime } from "./runtime.js"
 import { unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
@@ -18,11 +20,11 @@ import {
  * The contract's isCapabilityValid view. activeCapabilityIds returns the RAW stored list — expired and
  * revoked ids stay in it until a later grant or revoke compacts it — so a non-empty list proves nothing.
  * RegistryReader has no method for this view and apps/api is out of scope, so it is read here the same
- * way chain-views.ts reads the registry.
+ * way chain-views.ts reads the registry. Exported for the drainer's read-only approval check.
  */
-async function isCapabilityLive(runtime: Runtime, capabilityId: Hex): Promise<boolean> {
-  return (await runtime.ownerChain.publicClient.readContract({
-    address: runtime.ownerChain.deployment.capabilityRegistry,
+export async function isCapabilityLive(context: ChainContext, capabilityId: Hex): Promise<boolean> {
+  return (await context.publicClient.readContract({
+    address: context.deployment.capabilityRegistry,
     abi: capabilityRegistryAbi,
     functionName: "isCapabilityValid",
     args: [capabilityId],
@@ -32,7 +34,7 @@ async function isCapabilityLive(runtime: Runtime, capabilityId: Hex): Promise<bo
 /** "Approved" means the chain lists at least one live capability for this owner–agent pair — any permission. */
 async function hasAnyLiveCapability(runtime: Runtime, agentId: Hex): Promise<boolean> {
   for (const id of await runtime.reader.activeCapabilityIds(runtime.owner, agentId)) {
-    if (await isCapabilityLive(runtime, id)) return true
+    if (await isCapabilityLive(runtime.ownerChain, id)) return true
   }
   return false
 }
@@ -137,18 +139,57 @@ export async function approve(runtime: Runtime, name: string): Promise<{ capabil
   }
 }
 
+/**
+ * The local index of eventIds already saved, at `queue/saved-ids.json`. It is a cache, not the
+ * truth: a miss still asks the chain, and a corrupt file is rebuilt by reading as usual.
+ */
+function readSavedIds(home: Runtime["home"]): Record<string, Hex> {
+  try {
+    const raw = home.readJson<Record<string, unknown>>("queue/saved-ids.json")
+    if (raw === undefined || typeof raw !== "object" || Array.isArray(raw)) return {}
+    const index: Record<string, Hex> = {}
+    for (const [eventId, contextId] of Object.entries(raw)) {
+      if (typeof contextId === "string" && /^0x[0-9a-f]{64}$/.test(contextId)) index[eventId] = contextId as Hex
+    }
+    return index
+  } catch {
+    return {}
+  }
+}
+
+function recordSavedId(home: Runtime["home"], eventId: string, contextId: Hex): void {
+  home.writeSecretJson("queue/saved-ids.json", { ...readSavedIds(home), [eventId]: contextId })
+}
+
 /** Spec §5C steps 4–5: wrap, encrypt, upload and register on Monad under the agent's own key. A second save carrying
  * an eventId this project already has is a drainer retry after a crash — answer with the existing record, send nothing. */
 export async function saveCheckpoint(runtime: Runtime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean }> {
   const envelope = wrapCheckpoint(input)
   const started = Date.now()
   const agent = runtime.agent(name)
-  // An agent without READ has nothing readable and proceeds to create; the create itself is what the chain judges.
-  const objects = await agent.read(runtime.owner, NAMESPACE).catch(() => [])
+  // The local index answers a retry without touching the chain at all — but never for an agent
+  // the owner has revoked: the marker is set on revoke and cleared on re-approval, and an index
+  // hit that skipped this check would let a revoked agent "save" after its authority ended.
+  const known = readSavedIds(runtime.home)[envelope.checkpoint.eventId]
+  if (known !== undefined) {
+    if (isRevoked(runtime.home, name)) throw new MidaError("CAPABILITY_REVOKED", `agent ${name} has been revoked`)
+    return { contextId: known, transactionHash: null, milliseconds: Date.now() - started, duplicate: true }
+  }
+  // An agent without READ has nothing readable and proceeds to create; the create itself is what
+  // the chain judges. Any OTHER read failure is real and must surface — swallowing it would turn
+  // a broken connection into a duplicate write.
+  let objects: ContextObject[]
+  try {
+    objects = await agent.read(runtime.owner, NAMESPACE)
+  } catch (error) {
+    if (!isMidaError(error, "CAPABILITY_DENIED")) throw error
+    objects = []
+  }
   const existing = objects
     .map((object) => ({ object, found: unwrapCheckpoint(object.payload.value) }))
     .find(({ found }) => found !== null && found.projectId === envelope.projectId && found.checkpoint.eventId === envelope.checkpoint.eventId)
   if (existing !== undefined) {
+    recordSavedId(runtime.home, envelope.checkpoint.eventId, existing.object.contextId)
     return { contextId: existing.object.contextId, transactionHash: null, milliseconds: Date.now() - started, duplicate: true }
   }
   const object = await agent.create(runtime.owner, NAMESPACE, {
@@ -157,6 +198,7 @@ export async function saveCheckpoint(runtime: Runtime, name: string, input: Omit
     source: "AGENT_INFERRED",
     tags: ["mida-checkpoint", envelope.checkpoint.eventId],
   })
+  recordSavedId(runtime.home, envelope.checkpoint.eventId, object.contextId)
   return { contextId: object.contextId, transactionHash: object.transactionHash ?? null, milliseconds: Date.now() - started, duplicate: false }
 }
 
@@ -201,7 +243,7 @@ export async function revoke(runtime: Runtime, name: string): Promise<{ transact
   const listed = await reader.activeCapabilityIds(owner, agentId)
   let anyLive = false
   for (const id of listed) {
-    if (await isCapabilityLive(runtime, id)) anyLive = true
+    if (await isCapabilityLive(runtime.ownerChain, id)) anyLive = true
   }
   if (anyLive) {
     transactionHashes.push((await vault.approveRevocation({ kind: "agent", agentId })).transactionHash)

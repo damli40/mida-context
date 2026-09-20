@@ -38,6 +38,17 @@ export function transcriptPathAllowed(transcriptPath: unknown, agent: string, ho
 }
 
 /**
+ * The environment the detached drainer is spawned with: the hook runs inside the agent CLI, so the
+ * parent's Anthropic credentials must never leak into a child that outlives the tool call.
+ */
+export function drainerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const clean = { ...env }
+  delete clean.ANTHROPIC_API_KEY
+  delete clean.ANTHROPIC_AUTH_TOKEN
+  return clean
+}
+
+/**
  * Salvages the only fields the hook needs from the head of an oversized stdin payload — they
  * appear first in practice, and a >1 MB body cannot be trusted to JSON.parse anyway. Values are
  * real JSON strings (escaped chars included); a field whose value will not unescape is skipped.

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { MidaHome } from "./home.js"
-import { extractHookFields, runHook } from "./hook.js"
+import { drainerEnv, extractHookFields, runHook } from "./hook.js"
 import { appendLog } from "./log.js"
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
@@ -52,7 +52,7 @@ async function main(): Promise<void> {
         detached: true,
         stdio: "ignore",
         cwd: REPO_ROOT,
-        env: process.env,
+        env: drainerEnv(process.env),
       })
       child.on("error", () => {})
       child.unref()

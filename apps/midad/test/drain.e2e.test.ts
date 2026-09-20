@@ -160,7 +160,7 @@ describe("M1 drainOnce on local Anvil", () => {
     const result = await drain()
     expect(result).toMatchObject({ saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0 })
     expect(listJobs(home)).toHaveLength(0)
-    expect(readFileSync(home.path("logs/drain.jsonl"), "utf8")).toContain("not-a-mida-project")
+    expect(readFileSync(home.path("logs/drain.jsonl"), "utf8")).toContain("not-a-project")
     expect((await readBack()).checkpoints).toHaveLength(2)
   }, STEP_TIMEOUT)
 
@@ -192,6 +192,38 @@ describe("M1 drainOnce on local Anvil", () => {
     expect(home.has(`queue/bad/${ghost.id}.json`)).toBe(true)
     expect(listJobs(home)).toHaveLength(0)
   }, STEP_TIMEOUT)
+
+  it("(i) an agent the owner never approved saves nothing — and approving does not retro-save", async () => {
+    const runtime = await open()
+    try {
+      await init(runtime, ["codex"])   // registered, but the owner never approves it
+    } finally {
+      await runtime.close()
+    }
+    const before = compileCalls.length
+    job({ agent: "codex", sessionId: "s-codex" })
+    const result = await drain()
+    expect(result.saved).toBe(0)
+    expect(result.failed).toBe(0)
+    expect(compileCalls.length).toBe(before)            // no model call for an unapproved agent
+    expect(listJobs(home)).toHaveLength(0)              // the job is gone, not kept
+    expect(readFileSync(home.path("logs/drain.jsonl"), "utf8")).toContain("not-approved")
+
+    const runtime2 = await open()
+    try {
+      await requestAccess(runtime2, "codex")
+      await approve(runtime2, "codex")
+    } finally {
+      await runtime2.close()
+    }
+    // the dropped job was not kept, so nothing from before approval is saved — a grown
+    // transcript on a new job is what saves
+    appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "codex step" }] } }) + "\n")
+    job({ agent: "codex", sessionId: "s-codex" })
+    const after = await drain()
+    expect(after.saved).toBe(1)
+    expect((await readBack()).checkpoints.some((c) => c.sessionId === "s-codex")).toBe(true)
+  }, STEP_TIMEOUT * 2)
 
   it("a job older than a day is moved to queue/bad without work", async () => {
     const stale = enqueue(home, {

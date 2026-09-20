@@ -50,8 +50,8 @@ export class Runtime {
     return this.vault.owner
   }
 
-  static async open(home: MidaHome, network: Network): Promise<Runtime> {
-    Runtime.#acquireLock(home)
+  static async open(home: MidaHome, network: Network, timing?: { lockWaitMs?: number; lockStepMs?: number }): Promise<Runtime> {
+    await Runtime.#acquireLock(home, timing?.lockWaitMs ?? 30_000, timing?.lockStepMs ?? 250)
     let server: { baseUrl: string; close(): Promise<void> } | undefined
     try {
       const secrets = loadOrCreateOwnerSecrets(home)
@@ -99,25 +99,36 @@ export class Runtime {
   }
 
   /**
-   * Takes the home's lock or throws. A live pid in an existing lock means another Mida process holds it; a dead or
-   * unreadable lock is stale and is replaced. `createSecretJsonExclusive` makes the check-then-create race-free.
+   * Takes the home's lock or throws. A live pid in an existing lock means another Mida process
+   * holds it — the waiter retries in `stepMs` steps for up to `waitMs` before giving up, because a
+   * drainer that fired during a long CLI run must not die on a transient hold. A dead or
+   * unreadable lock is stale and is replaced. `createSecretJsonExclusive` makes the
+   * check-then-create race-free.
    */
-  static #acquireLock(home: MidaHome): void {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      if (home.createSecretJsonExclusive(LOCK_FILE, { pid: process.pid })) return
-      let pid = 0
-      try {
-        const held = home.readJson<{ pid?: unknown }>(LOCK_FILE)
-        if (typeof held?.pid === "number") pid = held.pid
-      } catch {
-        // A lock file that will not parse is stale: take it over.
+  static async #acquireLock(home: MidaHome, waitMs: number, stepMs: number): Promise<void> {
+    const deadline = Date.now() + waitMs
+    let heldPid = 0
+    for (;;) {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        if (home.createSecretJsonExclusive(LOCK_FILE, { pid: process.pid })) return
+        let pid = 0
+        try {
+          const held = home.readJson<{ pid?: unknown }>(LOCK_FILE)
+          if (typeof held?.pid === "number") pid = held.pid
+        } catch {
+          // A lock file that will not parse is stale: take it over.
+        }
+        if (pid > 0 && Runtime.#processAlive(pid)) {
+          heldPid = pid
+          break
+        }
+        home.remove(LOCK_FILE)
       }
-      if (pid > 0 && Runtime.#processAlive(pid)) {
-        throw new Error(`another Mida process (pid ${pid}) already holds this home`)
+      if (Date.now() >= deadline) {
+        throw new Error(heldPid > 0 ? `another Mida process (pid ${heldPid}) already holds this home` : "another Mida process already holds this home")
       }
-      home.remove(LOCK_FILE)
+      await new Promise((resolve) => setTimeout(resolve, stepMs))
     }
-    throw new Error("another Mida process already holds this home")
   }
 
   static #processAlive(pid: number): boolean {

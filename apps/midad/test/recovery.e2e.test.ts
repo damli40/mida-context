@@ -192,7 +192,8 @@ describe("M0 crash-safety and whole-agent revocation", () => {
   it("B7b: two runtimes cannot share one home, and a dead pid's lock is taken over", async () => {
     const lockedHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-m0-lock-")))
     const first = await Runtime.open(lockedHome, network)
-    await expect(Runtime.open(lockedHome, network)).rejects.toThrow(/another Mida process/)
+    // a held lock is now retried for up to 30 s before giving up — shrink the wait for the test
+    await expect(Runtime.open(lockedHome, network, { lockWaitMs: 400, lockStepMs: 50 })).rejects.toThrow(/another Mida process/)
     await first.close()
     const second = await Runtime.open(lockedHome, network)
     await second.close()

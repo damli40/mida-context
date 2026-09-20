@@ -4,8 +4,23 @@ import { LIMITS, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint } from "@mida/checkpoint"
 
 export const CHECKPOINT_TYPE = "mida.checkpoint.v1"
-/** Protocol limit: the encoded context value must fit in 65,536 bytes. */
-export const MAX_VALUE_BYTES = 65_536
+/**
+ * The protocol caps the canonical JSON of the whole ContextPayload at 65,536 bytes; the envelope
+ * the checkpoint fills is about 147 bytes smaller, so the envelope cap keeps 256 bytes of headroom.
+ */
+export const MAX_VALUE_BYTES = 65_536 - 256
+
+/** Stable failure codes the drainer maps onto its permanent/transient retry rules. */
+export type PayloadErrorCode = "too-large" | "invalid-checkpoint"
+
+export class CheckpointPayloadError extends Error {
+  readonly code: PayloadErrorCode
+  constructor(code: PayloadErrorCode, message: string) {
+    super(message)
+    this.name = "CheckpointPayloadError"
+    this.code = code
+  }
+}
 
 export interface CheckpointEnvelope {
   type: typeof CHECKPOINT_TYPE
@@ -26,22 +41,35 @@ export function eventIdFor(input: { projectId: string; sessionId: string; transc
   return `cp-${digest.slice(0, 40)}`
 }
 
+// The order in which a too-big checkpoint gives things up: oldest progress first, then evidence,
+// artifacts, rejected and decisions. originalRequest, remainingPlan, nextAction and objective are
+// never dropped or cut — they are what make a handoff usable.
+const DROPPABLE = ["progress", "evidence", "artifacts", "rejected", "decisions"] as const
+const CUT_TO = 300
+
 /**
- * Validates the checkpoint and wraps it in the v1 envelope. If the serialized envelope would exceed the byte cap,
- * the oldest progress entries are dropped first, then the oldest evidence entries, and a constraint line records how
- * many were left out. Throws when nothing removable remains and the value is still too large.
+ * Validates the checkpoint and wraps it in the v1 envelope. If the serialized envelope would exceed
+ * the byte cap, the checkpoint is shrunk in the DROPPABLE order — oldest entries first — and any
+ * string still longer than 300 chars outside the protected fields is cut to 300 with an ellipsis.
+ * A `(Mida: …)` note records every field that lost content: it goes on the end of constraints, or —
+ * when constraints already holds the maximum — is appended to unresolvedIssue, never by deleting a
+ * real constraint. Throws CheckpointPayloadError("too-large") when nothing can shrink it further.
  */
 export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): CheckpointEnvelope {
   if (typeof input?.projectId !== "string" || input.projectId === "") throw new Error("projectId must be a non-empty string")
   if (typeof input.sessionId !== "string" || input.sessionId === "") throw new Error("sessionId must be a non-empty string")
   if (input.continuesSession !== null && typeof input.continuesSession !== "string") throw new Error("continuesSession must be a string or null")
   const checked = validateCheckpoint(input.checkpoint)
-  if (!checked.ok) throw new Error(`invalid checkpoint: ${checked.errors.join("; ")}`)
+  if (!checked.ok) throw new CheckpointPayloadError("invalid-checkpoint", `invalid checkpoint: ${checked.errors.join("; ")}`)
   const checkpoint: Checkpoint = {
     ...checked.value,
     progress: [...checked.value.progress],
     evidence: [...checked.value.evidence],
+    artifacts: [...checked.value.artifacts],
+    rejected: [...checked.value.rejected],
+    decisions: [...checked.value.decisions],
     constraints: [...checked.value.constraints],
+    remainingPlan: [...checked.value.remainingPlan],
   }
   const envelope = (): CheckpointEnvelope => ({
     type: CHECKPOINT_TYPE,
@@ -52,31 +80,48 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
     checkpoint,
   })
   const bytes = () => Buffer.byteLength(JSON.stringify(envelope()))
-  let droppedProgress = 0
-  let droppedEvidence = 0
+
+  const dropped = new Map<string, number>()
   const dropOldest = (): boolean => {
-    if (checkpoint.progress.length > 0) {
-      checkpoint.progress.shift()
-      droppedProgress += 1
-      return true
-    }
-    if (checkpoint.evidence.length > 0) {
-      checkpoint.evidence.shift()
-      droppedEvidence += 1
+    for (const field of DROPPABLE) {
+      if (checkpoint[field].length === 0) continue
+      checkpoint[field].shift()
+      dropped.set(field, (dropped.get(field) ?? 0) + 1)
       return true
     }
     return false
   }
-  const marker = () => `(Mida: ${droppedProgress} progress and ${droppedEvidence} evidence entries were left out to fit the size limit)`
   while (bytes() > MAX_VALUE_BYTES && dropOldest()) { /* shrink until it fits or nothing is left to drop */ }
-  if (droppedProgress + droppedEvidence > 0) {
-    // The marker itself counts toward the cap, so it goes in before the last shrink pass and check.
-    if (checkpoint.constraints.length >= LIMITS.maxArray) checkpoint.constraints.shift()
-    checkpoint.constraints.push(marker())
-    while (bytes() > MAX_VALUE_BYTES && dropOldest()) checkpoint.constraints[checkpoint.constraints.length - 1] = marker()
+
+  const trimmed = new Set<string>()
+  const cut = (field: string, text: string): string => {
+    if (text.length <= CUT_TO) return text
+    trimmed.add(field)
+    return `${text.slice(0, CUT_TO)}…`
   }
   if (bytes() > MAX_VALUE_BYTES) {
-    throw new Error(`checkpoint envelope exceeds the 65,536-byte cap even after dropping ${droppedProgress} progress and ${droppedEvidence} evidence entries`)
+    checkpoint.agent = cut("agent", checkpoint.agent)
+    checkpoint.constraints = checkpoint.constraints.map((c) => cut("constraints", c))
+    if (checkpoint.unresolvedIssue !== null) checkpoint.unresolvedIssue = cut("unresolvedIssue", checkpoint.unresolvedIssue)
+  }
+
+  if (dropped.size > 0 || trimmed.size > 0) {
+    const parts: string[] = []
+    if (dropped.size > 0) parts.push(`left out ${[...dropped.entries()].map(([field, n]) => `${n} ${field}`).join(", ")}`)
+    if (trimmed.size > 0) parts.push(`cut long strings in ${[...trimmed].join(", ")}`)
+    const note = `(Mida: ${parts.join("; ")} to fit the size limit)`
+    // The note itself counts toward the cap — but it is appended, never swapped for a real constraint.
+    if (checkpoint.constraints.length < LIMITS.maxArray) {
+      checkpoint.constraints.push(note)
+    } else {
+      checkpoint.unresolvedIssue = checkpoint.unresolvedIssue === null ? note : `${checkpoint.unresolvedIssue} | ${note}`
+    }
+    // the note costs bytes too — drop whatever else can go before giving up
+    while (bytes() > MAX_VALUE_BYTES && dropOldest()) { /* keep shrinking */ }
+  }
+  if (bytes() > MAX_VALUE_BYTES) {
+    const what = [...dropped.entries()].map(([field, n]) => `${n} ${field}`).join(", ") || "nothing"
+    throw new CheckpointPayloadError("too-large", `checkpoint envelope exceeds the ${MAX_VALUE_BYTES}-byte cap even after dropping ${what}`)
   }
   return envelope()
 }

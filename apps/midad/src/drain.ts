@@ -1,20 +1,56 @@
-import { existsSync, readFileSync, statSync } from "node:fs"
+import * as fs from "node:fs"
+import { statSync } from "node:fs"
 import { homedir } from "node:os"
+import { createPublicClient, http } from "viem"
 import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
+import { isMidaError } from "@mida/protocol"
+import type { Address } from "@mida/protocol"
+import { chainFor, parseDeployment } from "@mida/chain"
+import type { ChainContext } from "@mida/chain"
+import { RegistryReader } from "@mida/api"
 import { readConversation } from "@mida/compiler"
 import type { compileCheckpoint } from "@mida/compiler"
-import { eventIdFor } from "./checkpoint-payload.js"
+import { CheckpointPayloadError, eventIdFor, unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
+import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import type { MidaHome } from "./home.js"
 import { FLUSH_EVENTS, transcriptPathAllowed } from "./hook.js"
+import { loadAgentIdentity, loadGrants } from "./keys.js"
 import { appendLog } from "./log.js"
 import { listJobs, moveToBad, projectIdFor, removeJob } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
 import type { Runtime } from "./runtime.js"
+import { isCapabilityLive } from "./skeleton.js"
 import { saveCheckpoint } from "./skeleton.js"
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const DEFAULT_MIN_GAP_MS = 60_000
+const DRAIN_LOCK = "queue/drain.lock"
+const DRAIN_LOCK_MAX_AGE_MS = 10 * 60 * 1000
+const MAX_ATTEMPTS = 8
+const MAX_BACKOFF_MS = 60 * 60 * 1000
+/** A settle round sleeps at most this long, and at most three waits happen before giving up. */
+const SETTLE_CAP_MS = 65_000
+const MAX_SETTLE_WAITS = 3
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000
+const TMP_MAX_AGE_MS = 60 * 60 * 1000
+const LOG_MAX_BYTES = 5 * 1024 * 1024
+const LOG_KEEP_BYTES = 1024 * 1024
+
+/**
+ * Stable failure codes. PERMANENT means this transcript state can never save — the job leaves the
+ * queue and the transcript state is recorded so an identical job later skips without work. Anything
+ * else is TRANSIENT: the job stays and the session waits out an exponential backoff.
+ */
+const PERMANENT_FAILURES = new Set([
+  "too-large",
+  "invalid-checkpoint",
+  "bad-transcript-path",
+  "unknown-transcript-format",
+  "not-a-project",
+  "not-approved",
+])
+const backoffMs = (attempts: number) => Math.min(60_000 * 2 ** attempts, MAX_BACKOFF_MS)
 
 export interface DrainDeps {
   home: MidaHome
@@ -24,12 +60,21 @@ export interface DrainDeps {
   minGapMs?: number
   /** The user's real home folder — the transcript rule is checked against it, injected in tests. */
   homeDir?: string
+  /** The chain save — injectable so rule tests never need a chain. Defaults to saveCheckpoint. */
+  save?: typeof saveCheckpoint
+  /** The owner's approval check — injectable in tests. Defaults to a read-only chain lookup. */
+  isApproved?: (agent: string) => Promise<boolean>
+  /** Injected in tests that move the clock; defaults to a real sleep. */
+  sleep?: (ms: number) => Promise<void>
 }
 
 interface SessionState {
   transcriptBytes: number
   lastLineHash: string
   savedAt: string
+  /** Consecutive transient failures on this transcript state; absent means the state is terminal. */
+  attempts?: number
+  failedAt?: string
 }
 
 export interface DrainResult {
@@ -37,6 +82,57 @@ export interface DrainResult {
   skippedUnchanged: number
   skippedTooSoon: number
   failed: number
+  /** Earliest epoch ms at which a held-back job becomes due, or null when nothing is waiting. */
+  earliestDueMs: number | null
+}
+
+const emptyResult = (): DrainResult => ({ saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0, earliestDueMs: null })
+
+/**
+ * One drain under `queue/drain.lock`: hooks fire often, so a second drainer that finds a live
+ * lock-holder younger than ten minutes exits at once — before compiling anything — while a stale
+ * or dead one is taken over. The lock is released in a `finally`, whatever the pass did.
+ */
+export async function drainOnce(deps: DrainDeps): Promise<DrainResult> {
+  const now = deps.now ?? (() => new Date())
+  const lock = acquireDrainLock(deps.home, now)
+  if (lock === null) return emptyResult()
+  try {
+    return await drainPass(deps, now)
+  } finally {
+    lock.release()
+  }
+}
+
+/**
+ * Drains until nothing is waiting: a pass that ends with jobs held back by the save gap or a retry
+ * backoff sleeps until the earliest one is due (never more than 65 s) and drains again — up to
+ * three waits, all inside one `queue/drain.lock`, so a second drainer can never duplicate the work.
+ */
+export async function drainUntilSettled(deps: DrainDeps): Promise<DrainResult> {
+  const now = deps.now ?? (() => new Date())
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const lock = acquireDrainLock(deps.home, now)
+  if (lock === null) return emptyResult()
+  try {
+    const total = emptyResult()
+    let waits = 0
+    for (;;) {
+      const result = await drainPass(deps, now)
+      total.saved += result.saved
+      total.failed += result.failed
+      total.skippedUnchanged += result.skippedUnchanged
+      total.skippedTooSoon += result.skippedTooSoon
+      if (result.earliestDueMs === null || waits >= MAX_SETTLE_WAITS || listJobs(deps.home).length === 0) {
+        total.earliestDueMs = result.earliestDueMs
+        return total
+      }
+      waits += 1
+      await sleep(Math.max(0, Math.min(result.earliestDueMs - now().getTime(), SETTLE_CAP_MS)))
+    }
+  } finally {
+    lock.release()
+  }
 }
 
 /**
@@ -47,18 +143,35 @@ export interface DrainResult {
  * Per session the drainer remembers `{ transcriptBytes, lastLineHash, savedAt }` in
  * `queue/state/<sessionId>.json`: an unchanged transcript is skipped even on a flush, and a changed
  * one inside `minGapMs` of the last save waits — its job stays queued so a later drain (or a flush)
- * still saves it. Compile and save failures keep the job for the next pass; stale jobs (older than
- * a day) and jobs whose transcript is gone are moved to `queue/bad/`.
+ * still saves it. A transient failure is recorded as `attempts`/`failedAt` on the state and retried
+ * only after `60 s × 2^attempts` (capped at an hour); the eighth attempt moves the job to
+ * `queue/bad/` as `gave-up`. A permanent failure removes the job and records the transcript state
+ * so an identical job later skips as unchanged. A compiled envelope is cached at
+ * `queue/compiled/<eventId>.json` so a retried save never pays for a second model call.
  *
  * The runtime — lock, API server, keys — is opened lazily, only once a session has actually
  * compiled, and always closed before returning. A pass that only skips never touches the chain.
  */
-export async function drainOnce(deps: DrainDeps): Promise<DrainResult> {
-  const now = deps.now ?? (() => new Date())
+async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult> {
   const minGapMs = deps.minGapMs ?? DEFAULT_MIN_GAP_MS
   const homeDir = deps.homeDir ?? homedir()
-  const counts: DrainResult = { saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0 }
+  const save = deps.save ?? saveCheckpoint
+  const isApproved = deps.isApproved ?? ((agent: string) => agentApprovedOnChain(deps.home, agent))
+  const counts = emptyResult()
+  const dueSooner = (at: number) => {
+    if (counts.earliestDueMs === null || at < counts.earliestDueMs) counts.earliestDueMs = at
+  }
   const log = (record: Record<string, unknown>) => appendLog(deps.home, "drain", record)
+  const approved = new Map<string, boolean>()
+  const checkApproved = async (agent: string): Promise<boolean> => {
+    const known = approved.get(agent)
+    if (known !== undefined) return known
+    const ok = await isApproved(agent)
+    approved.set(agent, ok)
+    return ok
+  }
+
+  pruneQueue(deps.home, now)
 
   const bySession = new Map<string, CaptureJob[]>()
   for (const job of listJobs(deps.home)) {
@@ -89,65 +202,223 @@ export async function drainOnce(deps: DrainDeps): Promise<DrainResult> {
         const projectId = projectIdFor(job.cwd)
         if (projectId === null) {
           removeJob(deps.home, job.id)
-          log({ sessionId, outcome: "removed", reason: "not-a-mida-project" })
+          log({ sessionId, outcome: "removed", reason: "not-a-project" })
           continue
         }
 
-        const transcriptBytes = statSync(job.transcriptPath).size
-        const lastLine = lastLineOf(job.transcriptPath)
+        // size and last line come from ONE open descriptor — a growing transcript cannot show
+        // the drainer a size and a tail from different moments
+        const { bytes: transcriptBytes, lastLine } = tailOf(job.transcriptPath)
         const lastLineHash = bytesToHex(sha256(utf8ToBytes(lastLine)))
         const state = readState(deps.home, sessionId)
-        if (state !== undefined && state.transcriptBytes === transcriptBytes && state.lastLineHash === lastLineHash) {
+        const stateMatches = state !== undefined && state.transcriptBytes === transcriptBytes && state.lastLineHash === lastLineHash
+        const terminal = { transcriptBytes, lastLineHash, savedAt: now().toISOString() }
+        if (stateMatches && (state.attempts ?? 0) === 0) {
           counts.skippedUnchanged += 1
           removeJob(deps.home, job.id)
           continue
         }
-        if (!flush && state !== undefined && now().getTime() - Date.parse(state.savedAt) < minGapMs) {
-          counts.skippedTooSoon += 1
-          continue // the job stays queued: a later drain or a flush still saves it
-        }
-
-        const eventId = eventIdFor({ projectId, sessionId, transcriptBytes, lastLine })
         // a transcript that is not the Claude Code format is not sent to the model in M1 —
         // the file might have been swapped for one since the path check passed
         if (readConversation(job.transcriptPath).format === "unknown-tail") {
           moveToBad(deps.home, `${job.id}.json`)
+          writeState(deps.home, sessionId, terminal)
           log({ sessionId, outcome: "bad", reason: "unknown-transcript-format" })
           continue
         }
-        const compiled = await deps.compile({
-          transcriptPath: job.transcriptPath,
-          agent: job.agent,
-          eventId,
-          cwd: job.cwd,
-          homeDir,
-        })
-        if (!compiled.ok) {
-          counts.failed += 1
-          log({ sessionId, outcome: "failed", reason: `compile-${compiled.reason}` })
+        // nothing is saved for an agent the owner has not approved — decided before any model call
+        if (!(await checkApproved(job.agent))) {
+          for (const other of listJobs(deps.home)) if (other.agent === job.agent) removeJob(deps.home, other.id)
+          writeState(deps.home, sessionId, terminal)
+          log({ sessionId, outcome: "removed", reason: "not-approved" })
           continue
         }
+        const attempts = state?.attempts ?? 0
+        if (attempts > 0 && state?.failedAt !== undefined) {
+          const due = Date.parse(state.failedAt) + backoffMs(attempts)
+          if (now().getTime() < due) {
+            counts.skippedTooSoon += 1
+            dueSooner(due)
+            continue // the job stays queued: the retry fires once the backoff has passed
+          }
+        }
+        // No saved state yet: the gap runs from the session's OLDEST queued job, so the first
+        // non-flush save lands one gap after the session's first event, not immediately.
+        const gapRef = Date.parse(state?.savedAt ?? group[0]!.at)
+        if (!flush && now().getTime() - gapRef < minGapMs) {
+          counts.skippedTooSoon += 1
+          dueSooner(gapRef + minGapMs)
+          continue // the job stays queued: a later drain or a flush still saves it
+        }
+
+        const eventId = eventIdFor({ projectId, sessionId, transcriptBytes, lastLine })
+        // A compiled envelope survives a failed save: the retry spends no model call on it.
+        let envelope = readCompiled(deps.home, eventId)
+        if (envelope === undefined) {
+          const compiled = await deps.compile({
+            transcriptPath: job.transcriptPath,
+            agent: job.agent,
+            eventId,
+            cwd: job.cwd,
+            homeDir,
+          })
+          if (!compiled.ok) {
+            if (compiled.reason === "invalid") throw new CheckpointPayloadError("invalid-checkpoint", "the compiler produced an invalid checkpoint")
+            throw new DrainFailure(compiled.reason)
+          }
+          envelope = wrapCheckpoint({
+            projectId,
+            sessionId,
+            continuesSession: null,
+            compiledBy: compiled.compiledBy,
+            checkpoint: compiled.checkpoint,
+          })
+          deps.home.writeSecretJson(`queue/compiled/${eventId}.json`, envelope)
+        }
         runtime ??= await deps.open()
-        await saveCheckpoint(runtime, job.agent, {
-          projectId,
-          sessionId,
-          continuesSession: null,
-          compiledBy: compiled.compiledBy,
-          checkpoint: compiled.checkpoint,
+        await save(runtime, job.agent, {
+          projectId: envelope.projectId,
+          sessionId: envelope.sessionId,
+          continuesSession: envelope.continuesSession,
+          compiledBy: envelope.compiledBy,
+          checkpoint: envelope.checkpoint,
         })
-        writeState(deps.home, sessionId, { transcriptBytes, lastLineHash, savedAt: now().toISOString() })
+        writeState(deps.home, sessionId, terminal)
         removeJob(deps.home, job.id)
         counts.saved += 1
         log({ sessionId, outcome: "saved", eventId })
       } catch (error) {
+        const code = failureCode(error)
+        if (PERMANENT_FAILURES.has(code)) {
+          if (code === "not-approved") {
+            for (const other of listJobs(deps.home)) if (other.agent === job.agent) removeJob(deps.home, other.id)
+          } else {
+            moveToBad(deps.home, `${job.id}.json`)
+          }
+          // terminal state records the real transcript stats: an identical job later skips as unchanged
+          writeState(deps.home, sessionId, terminalState(job.transcriptPath, now().toISOString()))
+          log({ sessionId, outcome: "bad", reason: code })
+          continue
+        }
+        // transient: keep the job, count the attempt, and hold the session until the backoff passes
+        const attempts = (readState(deps.home, sessionId)?.attempts ?? 0) + 1
         counts.failed += 1
-        log({ sessionId, outcome: "failed", reason: error instanceof Error ? error.name : "error" })
+        if (attempts >= MAX_ATTEMPTS) {
+          moveToBad(deps.home, `${job.id}.json`)
+          writeState(deps.home, sessionId, terminalState(job.transcriptPath, now().toISOString()))
+          log({ sessionId, outcome: "bad", reason: "gave-up" })
+          continue
+        }
+        writeState(deps.home, sessionId, {
+          // an empty lastLineHash can never match a real transcript, so the state never reads as
+          // "unchanged" — the retry is governed by attempts/failedAt alone
+          transcriptBytes: statSize(job.transcriptPath),
+          lastLineHash: "",
+          savedAt: readState(deps.home, sessionId)?.savedAt ?? job.at,
+          attempts,
+          failedAt: now().toISOString(),
+        })
+        dueSooner(now().getTime() + backoffMs(attempts))
+        log({ sessionId, outcome: "failed", reason: code, attempts })
       }
     }
   } finally {
     if (runtime !== undefined) await runtime.close()
   }
   return counts
+}
+
+/** A transient failure raised inside the drain pass, carrying the stable code the log uses. */
+class DrainFailure extends Error {
+  constructor(readonly code: "model-failed" | "no-json") {
+    super(code)
+    this.name = "DrainFailure"
+  }
+}
+
+/** Maps any thrown value onto a stable drain code; everything unrecognised is a transient chain-error. */
+function failureCode(error: unknown): string {
+  if (error instanceof DrainFailure) return error.code
+  if (error instanceof CheckpointPayloadError) return error.code
+  if (
+    isMidaError(error, "CAPABILITY_DENIED") || isMidaError(error, "CAPABILITY_EXPIRED") ||
+    isMidaError(error, "CAPABILITY_REVOKED")
+  ) return "not-approved"
+  if (error instanceof Error) {
+    if (error.message.includes("already holds this home")) return "lock-timeout"
+    if (error.message.includes("network.json")) return "network-missing"
+  }
+  return "chain-error"
+}
+
+/**
+ * The approval check the drainer can afford before every compile: local identity and grants prove
+ * the agent was approved once (missing either answers not-approved with no chain call), and a
+ * read-only registry reader built from `network.json` — no owner key, no `midad.lock` — confirms
+ * at least one capability is still live on chain.
+ */
+async function agentApprovedOnChain(home: MidaHome, agent: string): Promise<boolean> {
+  const identity = loadAgentIdentity(home, agent)
+  if (identity === undefined) return false
+  const owner = loadGrants(home, agent)[0]?.owner
+  if (typeof owner !== "string") return false
+  const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown }>("network.json")
+  if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) {
+    throw new Error("network.json is missing or incomplete; run mida init first")
+  }
+  const deployment = parseDeployment(stored.deployment)
+  const context: ChainContext = {
+    publicClient: createPublicClient({ chain: chainFor(deployment.chainId), transport: http(stored.rpcUrl) }),
+    deployment,
+  }
+  const reader = new RegistryReader(context)
+  for (const capabilityId of await reader.activeCapabilityIds(owner as Address, identity.agentId)) {
+    if (await isCapabilityLive(context, capabilityId)) return true
+  }
+  return false
+}
+
+/** The compiled-envelope cache at `queue/compiled/<eventId>.json`; a corrupt entry is ignored and recompiled. */
+function readCompiled(home: MidaHome, eventId: string): CheckpointEnvelope | undefined {
+  try {
+    const raw = home.readJson<unknown>(`queue/compiled/${eventId}.json`)
+    return raw === undefined ? undefined : (unwrapCheckpoint(raw) ?? undefined)
+  } catch {
+    return undefined
+  }
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Creates `queue/drain.lock` with flag `wx`. A live lock younger than ten minutes means another
+ * drainer owns the queue — return null. A dead or ancient lock is stale and gets replaced.
+ */
+function acquireDrainLock(home: MidaHome, now: () => Date): { release: () => void } | null {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (home.createSecretJsonExclusive(DRAIN_LOCK, { pid: process.pid, startedAt: now().toISOString() })) {
+      return { release: () => home.remove(DRAIN_LOCK) }
+    }
+    let live = false
+    try {
+      const held = home.readJson<{ pid?: unknown; startedAt?: unknown }>(DRAIN_LOCK)
+      if (typeof held?.pid === "number" && typeof held.startedAt === "string") {
+        live = processAlive(held.pid) && now().getTime() - Date.parse(held.startedAt) < DRAIN_LOCK_MAX_AGE_MS
+      }
+    } catch {
+      // an unreadable lock file is treated as stale
+    }
+    if (live) return null
+    home.remove(DRAIN_LOCK)
+  }
+  return null
 }
 
 function readState(home: MidaHome, sessionId: string): SessionState | undefined {
@@ -167,10 +438,102 @@ function writeState(home: MidaHome, sessionId: string, state: SessionState): voi
   home.writeSecretJson(`queue/state/${sessionId}.json`, state)
 }
 
-/** The last non-empty line of a JSONL transcript — a trailing newline does not count as a line. */
-function lastLineOf(path: string): string {
-  const text = readFileSync(path, "utf8")
-  let end = text.length
-  while (end > 0 && text.charCodeAt(end - 1) === 10) end -= 1
-  return text.slice(text.lastIndexOf("\n", end - 1) + 1, end)
+/**
+ * Housekeeping on every drain: `queue/bad` and `queue/compiled` entries older than a week, stray
+ * `.tmp` files older than an hour, and any JSONL log grown past 5 MB cut back to its last 1 MB
+ * (starting at a line boundary so every kept line is a whole record). Nothing here throws.
+ */
+function pruneQueue(home: MidaHome, now: () => Date): void {
+  const nowMs = now().getTime()
+  const olderThan = (path: string, ms: number): boolean => {
+    try {
+      return nowMs - statSync(path).mtimeMs > ms
+    } catch {
+      return false
+    }
+  }
+  for (const dir of ["queue/bad", "queue/compiled"]) {
+    for (const name of home.list(dir)) {
+      if (olderThan(home.path(`${dir}/${name}`), WEEK_MS)) home.remove(`${dir}/${name}`)
+    }
+  }
+  for (const dir of ["queue", "queue/bad", "queue/compiled", "queue/state"]) {
+    for (const name of home.list(dir)) {
+      if (name.endsWith(".tmp") && olderThan(home.path(`${dir}/${name}`), TMP_MAX_AGE_MS)) {
+        home.remove(`${dir}/${name}`)
+      }
+    }
+  }
+  for (const name of home.list("logs")) {
+    if (!name.endsWith(".jsonl")) continue
+    try {
+      const full = home.path(`logs/${name}`)
+      const size = statSync(full).size
+      if (size <= LOG_MAX_BYTES) continue
+      const fd = fs.openSync(full, "r")
+      let tail: Buffer
+      try {
+        const buffer = Buffer.alloc(LOG_KEEP_BYTES)
+        const read = fs.readSync(fd, buffer, 0, LOG_KEEP_BYTES, size - LOG_KEEP_BYTES)
+        tail = buffer.subarray(0, read)
+      } finally {
+        fs.closeSync(fd)
+      }
+      // a mid-line cut would leave a corrupt first record — drop the partial line
+      const firstNewline = tail.indexOf(10)
+      fs.writeFileSync(full, firstNewline === -1 ? tail : tail.subarray(firstNewline + 1))
+    } catch {
+      // a log that will not truncate is left for the next pass
+    }
+  }
+}
+
+/** A transcript that no longer stats is sized 0 — the caller has already decided the job is done. */
+function statSize(path: string): number {
+  try {
+    return statSync(path).size
+  } catch {
+    return 0
+  }
+}
+
+/** The real transcript stats for a terminal state, or zeroes when the file is already gone. */
+function terminalState(path: string, savedAt: string): SessionState {
+  try {
+    const { bytes, lastLine } = tailOf(path)
+    return {
+      transcriptBytes: bytes,
+      lastLineHash: bytesToHex(sha256(utf8ToBytes(lastLine))),
+      savedAt,
+    }
+  } catch {
+    return { transcriptBytes: 0, lastLineHash: "", savedAt }
+  }
+}
+
+/** How much of a transcript's tail is read to find its last line. */
+const TAIL_BYTES = 64 * 1024
+
+/**
+ * The transcript's size and last non-empty line from one open file descriptor — a positioned read
+ * of at most the final 64 KB, so a huge transcript costs a bounded read and the size and tail
+ * describe the same moment. `read` is injectable so a test can count the bytes it pulls.
+ */
+export function tailOf(
+  path: string,
+  read: (fd: number, buffer: Buffer, offset: number, length: number, position: number) => number = fs.readSync,
+): { bytes: number; lastLine: string } {
+  const fd = fs.openSync(path, "r")
+  try {
+    const bytes = fs.fstatSync(fd).size
+    const length = Math.min(bytes, TAIL_BYTES)
+    const buffer = Buffer.alloc(length)
+    const got = length === 0 ? 0 : read(fd, buffer, 0, length, bytes - length)
+    const text = buffer.subarray(0, got).toString("utf8")
+    let end = text.length
+    while (end > 0 && text.charCodeAt(end - 1) === 10) end -= 1
+    return { bytes, lastLine: text.slice(text.lastIndexOf("\n", end - 1) + 1, end) }
+  } finally {
+    fs.closeSync(fd)
+  }
 }
