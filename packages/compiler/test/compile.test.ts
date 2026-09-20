@@ -69,6 +69,7 @@ afterEach(() => {
   delete process.env.FAKE_MODEL_COUNTER
   delete process.env.FAKE_MODEL_STDIN_LOG
   delete process.env.FAKE_MODEL_ENV_LOG
+  delete process.env.FAKE_MODEL_PID_LOG
 })
 
 describe("compileCheckpoint", () => {
@@ -106,6 +107,17 @@ describe("compileCheckpoint", () => {
     expect(r).toMatchObject({ ok: false, reason: "model-failed" })
     expect(Date.now() - started).toBeLessThan(3000)
   })
+  it("kills the model's whole process group when a grandchild holds stdout (A5)", async () => {
+    const pidLog = path.join(dir, "grandchild.pid")
+    process.env.FAKE_MODEL_PID_LOG = pidLog
+    const started = Date.now()
+    const r = await compileCheckpoint({ ...base, model: { ...fake("grandchild"), timeoutMs: 500 }, attempts: 1 })
+    expect(r).toMatchObject({ ok: false, reason: "model-failed" })
+    expect(Date.now() - started).toBeLessThan(3000)
+    const pid = Number(fs.readFileSync(pidLog, "utf8"))
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    expect(() => process.kill(pid, 0)).toThrow()
+  })
   it("never passes ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN to the model, and sets MIDA_INNER=1", async () => {
     process.env.ANTHROPIC_API_KEY = "test-value-a"; process.env.ANTHROPIC_AUTH_TOKEN = "test-value-b"
     process.env.FAKE_MODEL_ENV_LOG = envLogPath
@@ -120,6 +132,76 @@ describe("compileCheckpoint", () => {
     // fake "good" output lists artifacts ["/Users/x/proj/src/a.ts", "/Users/x/notes.md"]
     const r = await compileCheckpoint({ ...base, cwd: "/Users/x/proj", homeDir: "/Users/x", model: fake("good") })
     expect(r.ok && r.checkpoint.artifacts).toEqual(["src/a.ts", "~/notes.md"])
+  })
+  it("scrubs a secret the model itself returns before storing (A7)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("leaky") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(JSON.stringify(r.checkpoint)).not.toContain("sk-live-abcdefgh12345678")
+      expect(r.checkpoint.progress[0]).toContain("[REDACTED]")
+    }
+  })
+  it("cuts an over-long string field to the limit and names it in trimmed (A8)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("longitem") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.progress[0]).toHaveLength(2000)
+      expect(r.checkpoint.progress[0]!.endsWith("…")).toBe(true)
+      expect(r.trimmed).toContain("progress[0]")
+    }
+  })
+  it("keeps the first 50 of an over-long array and names it in trimmed (A8)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("wide") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.decisions).toHaveLength(50)
+      expect(r.checkpoint.decisions[0]!.decision).toBe("d0")
+      expect(r.trimmed).toContain("decisions")
+    }
+  })
+  it("treats a reasoning-only object as no-json and retries (A8)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("reasoning"), sleep: async () => {} })
+    expect(r).toMatchObject({ ok: false, reason: "no-json", attempts: 3 })
+  })
+
+  // Ports of the remaining three capture-worker cases from
+  // spike/test/original-request.test.mjs (H1), now end to end through
+  // compileCheckpoint: the stored originalRequest comes from the transcript.
+  it("a secret in the first user message is redacted before storing (A9)", async () => {
+    const transcriptPath = path.join(dir, "first-secret.jsonl")
+    fs.writeFileSync(
+      transcriptPath,
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content: `build the limiter; my key is ${SECRETS.openai} in case you need it` },
+      }),
+    )
+    const r = await compileCheckpoint({ ...base, transcriptPath, model: fake("good") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.originalRequest).toContain("[REDACTED]")
+      expect(r.checkpoint.originalRequest).not.toContain(SECRETS.openai)
+    }
+  })
+  it("a 9,000-char first message stores 6,000 chars ending in … (A9)", async () => {
+    const transcriptPath = path.join(dir, "long-first.jsonl")
+    fs.writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: "user", message: { role: "user", content: "z".repeat(9_000) } }),
+    )
+    const r = await compileCheckpoint({ ...base, transcriptPath, model: fake("good") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.originalRequest).toHaveLength(6_000)
+      expect(r.checkpoint.originalRequest!.endsWith("…")).toBe(true)
+    }
+  })
+  it("an unknown-tail transcript stores originalRequest null (A9)", async () => {
+    const transcriptPath = path.join(dir, "tail.jsonl")
+    fs.writeFileSync(transcriptPath, "not json at all\nstill not json\n")
+    const r = await compileCheckpoint({ ...base, transcriptPath, model: fake("good") })
+    expect(r.ok).toBe(true)
+    if (r.ok) expect(r.checkpoint.originalRequest).toBeNull()
   })
 
   // Port of the spike's secrets case: the transcript is a JSONL file whose

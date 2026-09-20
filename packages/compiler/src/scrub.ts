@@ -65,7 +65,11 @@ export function scrubSecrets(text: string): string {
   return out
 }
 
-function scrubValue(v: unknown): unknown {
+// Recursive form of scrubSecrets for decoded JSON values: strings are
+// scrubbed, and any string sitting under a sensitive-looking KEY NAME is
+// redacted outright — that catches secrets whose value matches no pattern
+// (e.g. {"password": "correct horse battery staple"}).
+export function scrubValue(v: unknown): unknown {
   if (typeof v === "string") return scrubSecrets(v)
   if (Array.isArray(v)) return v.map(scrubValue)
   if (v !== null && typeof v === "object") {

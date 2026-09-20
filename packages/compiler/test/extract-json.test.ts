@@ -32,4 +32,10 @@ describe("extractJsonObject", () => {
     expect(extractJsonObject("[1,2,3]")).toBeUndefined()
     expect(extractJsonObject('{"a":')).toBeUndefined()
   })
+
+  it("8 MB of unmatched braces returns undefined fast (A6)", () => {
+    const started = Date.now()
+    expect(extractJsonObject("{".repeat(8 * 1024 * 1024))).toBeUndefined()
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
 })

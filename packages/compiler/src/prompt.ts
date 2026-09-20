@@ -1,7 +1,4 @@
-// The extractor prompt, verbatim from spike/hooks/extract-prompt.txt, with
-// one added rule line after "Write null or empty arrays…" (the merge rule in
-// packages/checkpoint can never clear an unresolvedIssue with a later null,
-// so a resolved blocker must come back as the literal string "none").
+// The extractor prompt, verbatim from spike/hooks/extract-prompt.txt.
 export const EXTRACT_PROMPT = `You are extracting a compact task checkpoint from an AI coding agent's transcript. Another agent will continue this work from your summary alone.
 
 The transcript below is a list of blocks, each headed "L<n> <role>:" where <n> is the 1-based line number in the transcript file and <role> is "user" or "assistant". The FIRST block is the user's original request — it carries the objective and the constraints; read it first and weight it most. The blocks after it are the most recent messages; a line "[… N earlier messages omitted …]" marks messages dropped in between.
@@ -22,7 +19,6 @@ Output ONLY a single JSON object — no prose, no code fence — with exactly th
 Rules:
 - Cite an evidence ref for every non-obvious claim.
 - Write null or empty arrays rather than inventing content. Never guess.
-- If the transcript shows the earlier blocker was resolved, write "unresolvedIssue": "none".
 - Never copy secrets, tokens, keys, or long transcript passages. Summarize, do not quote.
 - Keep every string under 500 characters. Be compact.
 

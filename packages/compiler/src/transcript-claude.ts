@@ -29,7 +29,7 @@
 // always fits the schema's originalRequest cap. unknown-tail → null.
 
 import fs from "node:fs"
-import { scrubSecrets, scrubTranscript } from "./scrub.js"
+import { scrubSecrets, scrubTranscript, scrubValue } from "./scrub.js"
 
 const TAIL_BYTES = 60_000 // fallback tail size for unknown formats
 const THINKING_CHARS = 1_000
@@ -114,13 +114,16 @@ function renderMessage(lineNo: number, obj: TranscriptLine): string | null {
       else if (p.type === "tool_use") {
         let input = ""
         try {
-          input = JSON.stringify(p.input ?? null) ?? ""
+          // scrubValue first: a secret under a sensitive key name survives
+          // the string-level scrub once JSON-escaped (its value may contain
+          // spaces), so key-name redaction has to happen on the object.
+          input = JSON.stringify(scrubValue(p.input ?? null)) ?? ""
         } catch {
           input = ""
         }
         parts.push(`[tool ${String(p.name ?? "?")}] ${cut(input, PART_CHARS)}`)
       } else if (p.type === "tool_result") {
-        parts.push(`[result] ${cut(toolResultText(p.content), PART_CHARS)}`)
+        parts.push(`[result] ${cut(toolResultText(scrubValue(p.content)), PART_CHARS)}`)
       }
     }
   }
@@ -177,9 +180,12 @@ export function readConversation(
 
   // The first user message carries the objective and constraints — pin it
   // (cut at 6,000 chars). Everything else competes for the remaining budget,
-  // filled from the most recent backwards.
+  // filled from the most recent backwards. When the pinned block ALONE is
+  // bigger than maxChars it is cut to maxChars − 200 so the final text still
+  // fits (firstUserMessage itself is unaffected — it has its own 6,000 cap).
   const pinIdx = msgs.findIndex((m) => m.role === "user")
-  const head = pinIdx >= 0 ? cut(msgs[pinIdx]!.block, FIRST_USER_CHARS) : null
+  const headCap = Math.min(FIRST_USER_CHARS, Math.max(0, maxChars - 200))
+  const head = pinIdx >= 0 ? cut(msgs[pinIdx]!.block, headCap) : null
   const rest = msgs.filter((_, i) => i !== pinIdx)
 
   const budget = Math.max(0, maxChars - (head ? head.length + 2 : 0) - MARKER_RESERVE)

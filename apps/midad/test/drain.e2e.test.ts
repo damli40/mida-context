@@ -40,6 +40,7 @@ describe("M1 drainOnce on local Anvil", () => {
       checkpoint: sampleCheckpoint({ eventId: input.eventId, agent: input.agent }),
       compiledBy: "stub",
       droppedKeys: [],
+      trimmed: [],
       attempts: 1,
       format: "claude-jsonl",
       messagesKept: 1,

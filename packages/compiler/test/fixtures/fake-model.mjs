@@ -10,8 +10,16 @@
 //   hang     — sleeps 60 s (the timeout must kill it)
 //   flaky    — fails unless the counter file named by FAKE_MODEL_COUNTER
 //              already holds 2; increments the counter each run
+//   grandchild — spawns a 60 s child with INHERITED stdout, writes its pid
+//              to FAKE_MODEL_PID_LOG, then hangs: the timeout must kill the
+//              whole process group or the held-open pipe stalls "close"
+//   leaky    — good, but progress[0] carries a secret the compiler must scrub
+//   reasoning — prints only {"thinking":"x"} (no content fields → no-json)
+//   longitem — good, but progress[0] is 2,001 chars (over the schema limit)
+//   wide     — good, but decisions has 51 entries (over the schema limit)
 
 import fs from "node:fs"
+import { spawn } from "node:child_process"
 
 const GOOD = {
   objective: "Implement the rate limiter",
@@ -76,6 +84,31 @@ process.stdin.on("end", () => {
       else process.exit(3)
       break
     }
+    case "grandchild": {
+      const g = spawn(process.execPath, ["-e", "setTimeout(()=>{},60000)"], {
+        stdio: ["ignore", "inherit", "ignore"],
+      })
+      if (process.env.FAKE_MODEL_PID_LOG) {
+        fs.writeFileSync(process.env.FAKE_MODEL_PID_LOG, String(g.pid))
+      }
+      setTimeout(() => process.exit(0), 60_000)
+      break
+    }
+    case "leaky":
+      fenced({ ...GOOD, progress: ["set API_KEY=sk-live-abcdefgh12345678 in env"] })
+      break
+    case "reasoning":
+      process.stdout.write('{"thinking":"x"}')
+      break
+    case "longitem":
+      fenced({ ...GOOD, progress: ["x".repeat(2001)] })
+      break
+    case "wide":
+      fenced({
+        ...GOOD,
+        decisions: Array.from({ length: 51 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+      })
+      break
     default:
       process.exit(2)
   }

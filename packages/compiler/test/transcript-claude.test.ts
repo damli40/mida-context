@@ -114,6 +114,41 @@ describe("readConversation", () => {
     expect(r.text).not.toContain(secret)
   })
 
+  it("a pinned first message bigger than maxChars is cut inside the budget (A9)", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "REQUEST " + "r".repeat(2_000) } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "later reply" }] } }),
+    ])
+    const r = readConversation(t, { maxChars: 500 })
+    expect(r.text.length).toBeLessThanOrEqual(500)
+    expect(r.firstUserMessage).toBe("REQUEST " + "r".repeat(2_000))
+  })
+
+  it("a secret nested under a sensitive key name in tool_use input is redacted (A7)", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "do the thing" } }),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", name: "Write", input: { a: { b: { c: { password: "correct horse battery staple" } } } } },
+          ],
+        },
+      }),
+      JSON.stringify({
+        type: "user",
+        message: {
+          content: [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "wrote { apiKey: plainWordsHere42 }" }] }],
+        },
+      }),
+    ])
+    const r = readConversation(t, { maxChars: 40_000 })
+    expect(r.text).not.toContain("correct horse battery staple")
+    expect(r.text).toContain("[REDACTED]")
+  })
+
   it("no user/assistant lines → unknown-tail fallback (G1)", () => {
     const dir = tmpdir()
     const t = writeTranscript(dir, [

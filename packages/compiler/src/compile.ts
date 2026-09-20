@@ -7,9 +7,10 @@
 import { spawn } from "node:child_process"
 import os from "node:os"
 import path from "node:path"
-import { CONTENT_FIELDS, validateCheckpoint, type Checkpoint } from "@mida/checkpoint"
+import { CONTENT_FIELDS, LIMITS, validateCheckpoint, type Checkpoint } from "@mida/checkpoint"
 import { extractJsonObject } from "./extract-json.js"
 import { EXTRACT_PROMPT } from "./prompt.js"
+import { scrubValue } from "./scrub.js"
 import { readConversation, type Conversation } from "./transcript-claude.js"
 
 export interface ModelCommand {
@@ -43,6 +44,7 @@ export type CompileResult =
       checkpoint: Checkpoint
       compiledBy: string
       droppedKeys: string[]
+      trimmed: string[]
       attempts: number
       format: Conversation["format"]
       messagesKept: number
@@ -58,16 +60,72 @@ const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 type ModelRun = { ok: true; stdout: string; ms: number } | { ok: false; detail: string; ms: number }
 
+// One bad field must not cost the whole save. Strings over the schema limit
+// are cut to it ending in "…"; arrays over the item limit keep 50 entries —
+// the LAST 50 for progress/evidence (the newest entries are the ones that
+// matter), the FIRST 50 for every other array. Each cut is named in
+// `trimmed` ("progress[3]", "decisions", "decisions[3].rationale").
+function trimFields(picked: Record<string, unknown>, trimmed: string[]): void {
+  const cutStr = (v: unknown, path: string): unknown => {
+    if (typeof v !== "string" || v.length <= LIMITS.maxString) return v
+    trimmed.push(path)
+    return v.slice(0, LIMITS.maxString - 1) + "…"
+  }
+  for (const field of ["objective", "nextAction", "unresolvedIssue"]) {
+    picked[field] = cutStr(picked[field], field)
+  }
+  const cutList = (field: string, keepLast: boolean) => {
+    const arr = picked[field]
+    if (!Array.isArray(arr)) return
+    for (let i = 0; i < arr.length; i++) arr[i] = cutStr(arr[i], `${field}[${i}]`)
+    if (arr.length > LIMITS.maxArray) {
+      trimmed.push(field)
+      picked[field] = keepLast ? arr.slice(-LIMITS.maxArray) : arr.slice(0, LIMITS.maxArray)
+    }
+  }
+  for (const field of ["progress", "constraints", "artifacts", "remainingPlan"]) {
+    cutList(field, field === "progress")
+  }
+  for (const field of ["decisions", "rejected", "evidence"]) {
+    const arr = picked[field]
+    if (!Array.isArray(arr)) continue
+    for (let i = 0; i < arr.length; i++) {
+      const item = arr[i]
+      if (item === null || typeof item !== "object" || Array.isArray(item)) continue
+      for (const k of Object.keys(item)) {
+        ;(item as Record<string, unknown>)[k] = cutStr(
+          (item as Record<string, unknown>)[k],
+          `${field}[${i}].${k}`,
+        )
+      }
+    }
+    if (arr.length > LIMITS.maxArray) {
+      trimmed.push(field)
+      picked[field] = field === "evidence" ? arr.slice(-LIMITS.maxArray) : arr.slice(0, LIMITS.maxArray)
+    }
+  }
+}
+
 // One model call: the prompt goes on stdin, stdout is captured up to
 // MAX_STDOUT, and the child is killed at the timeout. Never throws — every
 // failure mode (spawn error, timeout, non-zero exit) becomes ok:false.
 // Failure details carry exit codes and signals only, never model output.
+//
+// The child runs detached (its own process group) so the timeout can kill
+// every process the model spawned — not just the direct child. The attempt
+// settles on 'exit' or the timeout, never on 'close' alone: a grandchild
+// that inherited the stdout pipe keeps it open after the model dies, and
+// 'close' would then never come.
 function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
   const t0 = Date.now()
   const timeoutMs = model.timeoutMs ?? DEFAULT_TIMEOUT_MS
   return new Promise((resolve) => {
-    const done = (r: { ok: true; stdout: string } | { ok: false; detail: string }) =>
+    let settled = false
+    const done = (r: { ok: true; stdout: string } | { ok: false; detail: string }) => {
+      if (settled) return
+      settled = true
       resolve({ ...r, ms: Date.now() - t0 })
+    }
 
     // A shell-exported Anthropic key would silently override the model's
     // normal login (spike bug G2: an exported key produced an empty,
@@ -85,6 +143,7 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
         cwd: os.tmpdir(),
         env,
         stdio: ["pipe", "pipe", "ignore"],
+        detached: true,
       })
     } catch (err) {
       done({ ok: false, detail: `spawn: ${err instanceof Error ? err.message : String(err)}` })
@@ -93,10 +152,32 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
 
     let stdout = ""
     let timedOut = false
+    let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null
+    let closeGrace: NodeJS.Timeout | undefined
+
+    const settle = () => {
+      clearTimeout(timer)
+      if (timedOut || exited === null) return
+      if (exited.code !== 0) done({ ok: false, detail: `exit ${exited.code} signal ${exited.signal}` })
+      else done({ ok: true, stdout })
+    }
+
     const timer = setTimeout(() => {
       timedOut = true
-      child.kill("SIGKILL")
+      // Negative pid = the child's whole process group (detached made it the
+      // leader); grandchildren die with the model instead of outliving it.
+      try {
+        process.kill(-(child.pid as number), "SIGKILL")
+      } catch {
+        child.kill("SIGKILL")
+      }
+      // Held-open pipes (a surviving writer would stall 'close') must not
+      // stall the attempt: drop our end and settle now.
+      child.stdout.destroy()
+      child.stdin.destroy()
+      done({ ok: false, detail: `timeout after ${timeoutMs} ms` })
     }, timeoutMs)
+
     child.stdout.setEncoding("utf8")
     child.stdout.on("data", (c: string) => {
       if (stdout.length < MAX_STDOUT) stdout += c.slice(0, MAX_STDOUT - stdout.length)
@@ -105,11 +186,20 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
       clearTimeout(timer)
       done({ ok: false, detail: `spawn: ${err.message}` })
     })
-    child.on("close", (code, signal) => {
-      clearTimeout(timer)
-      if (timedOut) done({ ok: false, detail: `timeout after ${timeoutMs} ms` })
-      else if (code !== 0) done({ ok: false, detail: `exit ${code} signal ${signal}` })
-      else done({ ok: true, stdout })
+    child.on("exit", (code, signal) => {
+      exited = { code, signal }
+      // 'close' normally follows at once with the last stdout bytes. If a
+      // surviving grandchild still holds the pipe it never comes — give it
+      // a short grace, then take what we have.
+      closeGrace = setTimeout(() => {
+        child.stdout.destroy()
+        settle()
+      }, 1_000)
+      closeGrace.unref()
+    })
+    child.on("close", () => {
+      if (closeGrace !== undefined) clearTimeout(closeGrace)
+      settle()
     })
     child.stdin.on("error", () => {}) // the child may exit before reading the prompt
     child.stdin.end(prompt)
@@ -149,19 +239,32 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
       lastFail = { reason: "model-failed", detail: run.detail }
     } else {
       const parsed = extractJsonObject(run.stdout)
+      // An object holding none of the ten content fields (a "reasoning"
+      // object like {"thinking": "…"}) counts as no output — the model may
+      // still be thinking out loud, so the attempt is retried like no-json.
+      const hasContent =
+        parsed !== undefined &&
+        Object.keys(parsed as Record<string, unknown>).some((k) =>
+          (CONTENT_FIELDS as readonly string[]).includes(k),
+        )
       if (parsed === undefined) {
         lastFail = { reason: "no-json", detail: "model output held no JSON object" }
+      } else if (!hasContent) {
+        lastFail = { reason: "no-json", detail: "first JSON object held no checkpoint fields" }
       } else {
         // Only the model-writable fields are taken; every other key NAME is
         // reported in droppedKeys (never its value) so validation stays
         // strict on what remains. originalRequest is absent from
         // CONTENT_FIELDS on purpose — a model that returns it gets it
         // dropped and named like any unknown key (spike bug H1).
+        // The model's own output is scrubbed too: it was told never to copy
+        // secrets, but what it returns is untrusted text and a leaked key in
+        // a progress line would be stored verbatim otherwise.
         const obj = parsed as Record<string, unknown>
         const picked: Record<string, unknown> = {}
         const droppedKeys: string[] = []
         for (const k of Object.keys(obj)) {
-          if ((CONTENT_FIELDS as readonly string[]).includes(k)) picked[k] = obj[k]
+          if ((CONTENT_FIELDS as readonly string[]).includes(k)) picked[k] = scrubValue(obj[k])
           else droppedKeys.push(k)
         }
 
@@ -187,6 +290,9 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
           })
         }
 
+        const trimmed: string[] = []
+        trimFields(picked, trimmed)
+
         const v = validateCheckpoint(picked)
         // A validation failure is deterministic — the same input would fail
         // the same way — so it is reported at once and never retried.
@@ -198,6 +304,7 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
           checkpoint: v.value,
           compiledBy: model.label,
           droppedKeys,
+          trimmed,
           attempts: attempt,
           format: convo.format,
           messagesKept: convo.messagesKept,
