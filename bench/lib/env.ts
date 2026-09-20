@@ -17,7 +17,6 @@ import type { Network } from "../../apps/midad/src/index.js"
 export const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url))
 export const FIXTURES = fileURLToPath(new URL("../fixtures/", import.meta.url))
 export const STUB_MODEL = fileURLToPath(new URL("./stub-model.mjs", import.meta.url))
-export const HANGING_MODEL = fileURLToPath(new URL("./hanging-model.mjs", import.meta.url))
 
 export interface BenchChain {
   env: ScenarioEnvironment
