@@ -308,6 +308,9 @@ importers:
       '@mida/fake-vault':
         specifier: workspace:*
         version: link:../../packages/fake-vault
+      '@mida/grant-advisor':
+        specifier: workspace:*
+        version: link:../../packages/grant-advisor
       '@mida/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol

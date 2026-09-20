@@ -3,7 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "bin": {
     "midad": "./src/daemon-main.ts"
   },
@@ -16,6 +18,7 @@
     "@mida/compiler": "workspace:*",
     "@mida/crypto": "workspace:*",
     "@mida/fake-vault": "workspace:*",
+    "@mida/grant-advisor": "workspace:*",
     "@mida/protocol": "workspace:*",
     "@mida/sdk": "workspace:*",
     "@noble/curves": "2.4.0",
