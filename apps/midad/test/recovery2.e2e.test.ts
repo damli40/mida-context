@@ -10,11 +10,14 @@ import {
   saveCheckpoint,
 } from "@mida/midad"
 import type { Network } from "@mida/midad"
+import type { Checkpoint } from "@mida/checkpoint"
+import { sampleCheckpoint } from "./helpers.js"
 
 const NAMESPACE_ID = namespaceId(NAMESPACE)
 const STEP_TIMEOUT = 120_000
-const CHECKPOINT_V1 = { objective: "before the rotation", nextAction: "first" }
-const CHECKPOINT_V2 = { objective: "after the rotation", nextAction: "second" }
+const CHECKPOINT_V1 = sampleCheckpoint({ eventId: "cp-c2-v001", objective: "before the rotation", nextAction: "first" })
+const CHECKPOINT_V2 = sampleCheckpoint({ eventId: "cp-c2-v002", objective: "after the rotation", nextAction: "second" })
+const envelope = (checkpoint: Checkpoint) => ({ projectId: "proj-c2", sessionId: "s1", continuesSession: null, compiledBy: "test", checkpoint })
 
 /**
  * Fix round C2 on local Anvil, in its own home: the revoked marker, a missing identity file and the
@@ -48,7 +51,7 @@ describe("M0 fix round C2: local files never outrank the chain", () => {
     await approveAgent("claude-code")
     await approveAgent("codex")
     await approveAgent("probe")
-    await saveCheckpoint(runtime, "codex", { projectId: "proj-c2", checkpoint: CHECKPOINT_V1 })
+    await saveCheckpoint(runtime, "codex", envelope(CHECKPOINT_V1))
 
     // claude-code is revoked — the marker is written — then approved again. The marker must not survive approval.
     await revoke(runtime, "claude-code")
@@ -60,7 +63,7 @@ describe("M0 fix round C2: local files never outrank the chain", () => {
     const repair = await revoke(runtime, "probe")
     expect(repair.rewrapped).toEqual(["claude-code", "codex"])
 
-    await saveCheckpoint(runtime, "codex", { projectId: "proj-c2", checkpoint: CHECKPOINT_V2 })
+    await saveCheckpoint(runtime, "codex", envelope(CHECKPOINT_V2))
     const read = await readCheckpoints(runtime, "claude-code", "proj-c2")
     expect(read.checkpoints.map((c) => c.checkpoint)).toEqual([CHECKPOINT_V1, CHECKPOINT_V2])
   }, STEP_TIMEOUT)

@@ -17,10 +17,12 @@ import {
   saveCheckpoint,
 } from "@mida/midad"
 import type { Network } from "@mida/midad"
+import type { Checkpoint } from "@mida/checkpoint"
+import { sampleCheckpoint } from "./helpers.js"
 
 const AGENTS = ["claude-code", "codex"] as const
 const NAMESPACE_ID = namespaceId(NAMESPACE)
-const CHECKPOINT = { objective: "Keep the lights on", nextAction: "Ship it" }
+const CHECKPOINT = sampleCheckpoint({ eventId: "cp-recov-01", objective: "Keep the lights on", nextAction: "Ship it" })
 const STEP_TIMEOUT = 120_000
 
 /**
@@ -125,7 +127,7 @@ describe("M0 crash-safety and whole-agent revocation", () => {
     await runtime.vault.approveRevocation({ kind: "agent", agentId: runtime.agent("gemini").agentId })
 
     // The rotation already happened: codex writes under the new epoch but cannot read it back.
-    await saveCheckpoint(runtime, "codex", { projectId: "proj-crash", checkpoint: CHECKPOINT })
+    await saveCheckpoint(runtime, "codex", { projectId: "proj-crash", sessionId: "s1", continuesSession: null, compiledBy: "test", checkpoint: CHECKPOINT })
     await expect(readCheckpoints(runtime, "codex", "proj-crash")).rejects.toMatchObject({ code: "NO_EPOCH_WRAP" })
 
     const repair = await revoke(runtime, "gemini")
@@ -203,9 +205,10 @@ describe("M0 crash-safety and whole-agent revocation", () => {
 
   it("B8: save and read validate their inputs before any network call", async () => {
     // codex is approved at this point, so without validation these calls would reach the chain or succeed.
-    await expect(saveCheckpoint(runtime, "codex", { projectId: "", checkpoint: CHECKPOINT })).rejects.toThrow(/projectId/)
-    await expect(saveCheckpoint(runtime, "codex", { projectId: "proj-x", checkpoint: [] as unknown as Record<string, unknown> })).rejects.toThrow(/checkpoint/)
-    await expect(saveCheckpoint(runtime, "codex", { projectId: "proj-x", checkpoint: null as unknown as Record<string, unknown> })).rejects.toThrow(/checkpoint/)
+    const invalid = { sessionId: "s", continuesSession: null, compiledBy: "t" }
+    await expect(saveCheckpoint(runtime, "codex", { projectId: "", ...invalid, checkpoint: CHECKPOINT })).rejects.toThrow(/projectId/)
+    await expect(saveCheckpoint(runtime, "codex", { projectId: "proj-x", ...invalid, checkpoint: [] as unknown as Checkpoint })).rejects.toThrow(/checkpoint/)
+    await expect(saveCheckpoint(runtime, "codex", { projectId: "proj-x", ...invalid, checkpoint: null as unknown as Checkpoint })).rejects.toThrow(/checkpoint/)
     await expect(readCheckpoints(runtime, "codex", "")).rejects.toThrow(/projectId/)
     await expect(readCheckpoints(runtime, "codex", 5 as unknown as string)).rejects.toThrow(/projectId/)
   }, STEP_TIMEOUT)

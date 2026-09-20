@@ -16,11 +16,14 @@ import {
   AGENT_PERMISSIONS, MidaHome, Runtime, approve, init, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, readCheckpoints, requestAccess, revoke, saveCheckpoint,
 } from "@mida/midad"
 import type { Network } from "@mida/midad"
+import type { Checkpoint } from "@mida/checkpoint"
+import { sampleCheckpoint } from "./helpers.js"
 
 const ON_TESTNET = process.env.MIDA_E2E_MONAD_TESTNET === "1"
 const STEP_TIMEOUT = ON_TESTNET ? 300_000 : 60_000
 const AGENTS = ["claude-code", "codex"] as const
-const CHECKPOINT = { objective: "Build a rate limiter", nextAction: "Write KeyedLimiter", constraints: ["no timers"] }
+const CHECKPOINT = sampleCheckpoint({ objective: "Build a rate limiter", nextAction: "Write KeyedLimiter", constraints: ["no timers"] })
+const envelope = (projectId: string, checkpoint: Checkpoint, sessionId = "s1") => ({ projectId, sessionId, continuesSession: null, compiledBy: "test", checkpoint })
 
 describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}`, () => {
   let env: ScenarioEnvironment
@@ -66,7 +69,7 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
   })
 
   step("3. an agent that was never approved can neither save nor read", async () => {
-    await expect(saveCheckpoint(runtime, "claude-code", { projectId: "proj-1", checkpoint: CHECKPOINT })).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
+    await expect(saveCheckpoint(runtime, "claude-code", envelope("proj-1", CHECKPOINT))).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
     await expect(readCheckpoints(runtime, "codex", "proj-1")).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
   })
 
@@ -81,15 +84,15 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
   })
 
   step("5. claude-code saves a checkpoint; codex, not yet approved, still cannot read it", async () => {
-    const saved = await saveCheckpoint(runtime, "claude-code", { projectId: "proj-1", checkpoint: CHECKPOINT })
+    const saved = await saveCheckpoint(runtime, "claude-code", envelope("proj-1", CHECKPOINT))
     expect(saved.transactionHash).toMatch(/^0x[0-9a-f]{64}$/)
     timings.save.push(saved.milliseconds)
-    transactions.firstSave = saved.transactionHash
+    transactions.firstSave = saved.transactionHash!
     await expect(readCheckpoints(runtime, "codex", "proj-1")).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
   })
 
   step("6. RESTART in the middle of an approval: codex asks, the process restarts, the owner approves after it", async () => {
-    await saveCheckpoint(runtime, "claude-code", { projectId: "proj-2", checkpoint: { objective: "A different project" } })
+    await saveCheckpoint(runtime, "claude-code", envelope("proj-2", sampleCheckpoint({ eventId: "cp-proj2-01", objective: "A different project" })))
     await requestAccess(runtime, "codex")
     await runtime.close()
     runtime = await Runtime.open(home, network)
@@ -105,14 +108,17 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     timings.read.push(read.milliseconds)
   })
 
-  step("8. after the restart claude-code can still save, and codex sees the new save", async () => {
+  step("8. after the restart claude-code can still save, codex sees the new save, and a retry is a duplicate", async () => {
     const started = Date.now()
-    const saved = await saveCheckpoint(runtime, "claude-code", { projectId: "proj-1", checkpoint: { ...CHECKPOINT, nextAction: "Write the README" } })
+    const input = envelope("proj-1", sampleCheckpoint({ ...CHECKPOINT, eventId: "cp-sample02", nextAction: "Write the README" }))
+    const saved = await saveCheckpoint(runtime, "claude-code", input)
+    const again = await saveCheckpoint(runtime, "claude-code", input)
+    expect(again).toMatchObject({ duplicate: true, transactionHash: null, contextId: saved.contextId })
     const read = await readCheckpoints(runtime, "codex", "proj-1")
     transactions.saveToReadableMs = String(Date.now() - started)
     timings.save.push(saved.milliseconds)
     timings.read.push(read.milliseconds)
-    transactions.saveAfterRestart = saved.transactionHash
+    transactions.saveAfterRestart = saved.transactionHash!
     expect(read.checkpoints).toHaveLength(2)
   })
 
@@ -142,14 +148,14 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     expect(await runtime.reader.hasAuthority(runtime.owner, claudeId, current, PERMISSION.READ, 0)).toBe(false)
     expect(await runtime.reader.hasAuthority(runtime.owner, claudeId, current, PERMISSION.CREATE, PROVENANCE_POLICY.ALLOW_INFERENCE)).toBe(false)
     await expect(readCheckpoints(runtime, "claude-code", "proj-1")).rejects.toMatchObject({ code: "CAPABILITY_REVOKED" })
-    await expect(saveCheckpoint(runtime, "claude-code", { projectId: "proj-1", checkpoint: CHECKPOINT })).rejects.toMatchObject({
+    await expect(saveCheckpoint(runtime, "claude-code", envelope("proj-1", CHECKPOINT))).rejects.toMatchObject({
       code: expect.stringMatching(/^CAPABILITY_(REVOKED|DENIED)$/),
     })
   })
 
   step("11. codex is untouched: it still reads everything, and saves under the new key", async () => {
-    const saved = await saveCheckpoint(runtime, "codex", { projectId: "proj-1", checkpoint: { objective: "Codex carried on" } })
-    transactions.codexSaveAfterRevoke = saved.transactionHash
+    const saved = await saveCheckpoint(runtime, "codex", envelope("proj-1", sampleCheckpoint({ eventId: "cp-codex-01", objective: "Codex carried on" }), "s9"))
+    transactions.codexSaveAfterRevoke = saved.transactionHash!
     const read = await readCheckpoints(runtime, "codex", "proj-1")
     expect(read.checkpoints).toHaveLength(3)
     expect(read.checkpoints.map((c) => c.checkpoint.objective)).toContain("Codex carried on")

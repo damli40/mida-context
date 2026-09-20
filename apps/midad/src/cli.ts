@@ -36,7 +36,17 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
       const result = await approve(runtime, agent)
       deps.print(`approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}`)
     } else if (command === "save-demo") {
-      const result = await saveCheckpoint(runtime, agent, { projectId, checkpoint: { objective: "M0 demo checkpoint", savedBy: agent } })
+      const result = await saveCheckpoint(runtime, agent, {
+        projectId,
+        sessionId: "cli-demo",
+        continuesSession: null,
+        compiledBy: "mida-cli",
+        checkpoint: {
+          eventId: `cli-demo-${agent}-${projectId}`, agent, source: "agent-tool", createdAt: new Date().toISOString(),
+          objective: "M0 demo checkpoint", originalRequest: null, progress: [], decisions: [], rejected: [],
+          constraints: [], artifacts: [], unresolvedIssue: null, nextAction: "demo", remainingPlan: [], evidence: [],
+        },
+      })
       deps.print(`saved ${result.contextId} tx ${result.transactionHash} in ${result.milliseconds} ms`)
     } else if (command === "read") {
       const result = await readCheckpoints(runtime, agent, projectId)

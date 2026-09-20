@@ -3,8 +3,11 @@ import { PERMISSION, PROVENANCE_POLICY, namespaceId } from "@mida/protocol"
 import type { AccessRequest, Address, Hex } from "@mida/protocol"
 import { createWriteContext } from "@mida/chain"
 import { provisionAgent } from "@mida/fake-vault"
+import type { StoredCheckpoint } from "@mida/checkpoint"
 import { AGENT_PERMISSIONS, NAMESPACE, PURPOSE_ID } from "./runtime.js"
 import type { Runtime } from "./runtime.js"
+import { unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
+import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import { FileAccessRequestStore } from "./request-store.js"
 import {
   identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, loadOrCreateSignerKey,
@@ -16,7 +19,6 @@ async function hasAnyLiveCapability(runtime: Runtime, agentId: Hex): Promise<boo
   return (await runtime.reader.activeCapabilityIds(runtime.owner, agentId)).length > 0
 }
 
-const CHECKPOINT_TYPE = "mida.checkpoint.v0"
 const GRANT_LIFETIME_SECONDS = 30 * 24 * 60 * 60
 const NAMESPACE_ID = namespaceId(NAMESPACE)
 
@@ -103,35 +105,53 @@ export async function approve(runtime: Runtime, name: string): Promise<{ capabil
   }
 }
 
-/** Spec §5C steps 4–5 with a hard-coded checkpoint: encrypt, upload, and register on Monad under the agent's own key. */
-export async function saveCheckpoint(runtime: Runtime, name: string, input: { projectId: string; checkpoint: Record<string, unknown> }): Promise<{ contextId: Hex; transactionHash: Hex; milliseconds: number }> {
-  if (typeof input?.projectId !== "string" || input.projectId === "") throw new Error("projectId must be a non-empty string")
-  if (typeof input.checkpoint !== "object" || input.checkpoint === null || Array.isArray(input.checkpoint)) {
-    throw new Error("checkpoint must be a plain object")
-  }
+/** Spec §5C steps 4–5: wrap, encrypt, upload and register on Monad under the agent's own key. A second save carrying
+ * an eventId this project already has is a drainer retry after a crash — answer with the existing record, send nothing. */
+export async function saveCheckpoint(runtime: Runtime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean }> {
+  const envelope = wrapCheckpoint(input)
   const started = Date.now()
-  const object = await runtime.agent(name).create(runtime.owner, NAMESPACE, {
-    value: { type: CHECKPOINT_TYPE, projectId: input.projectId, compiledBy: "m0-hardcoded", checkpoint: input.checkpoint },
+  const agent = runtime.agent(name)
+  // An agent without READ has nothing readable and proceeds to create; the create itself is what the chain judges.
+  const objects = await agent.read(runtime.owner, NAMESPACE).catch(() => [])
+  const existing = objects
+    .map((object) => ({ object, found: unwrapCheckpoint(object.payload.value) }))
+    .find(({ found }) => found !== null && found.projectId === envelope.projectId && found.checkpoint.eventId === envelope.checkpoint.eventId)
+  if (existing !== undefined) {
+    return { contextId: existing.object.contextId, transactionHash: null, milliseconds: Date.now() - started, duplicate: true }
+  }
+  const object = await agent.create(runtime.owner, NAMESPACE, {
+    value: { ...envelope },
     kind: "EPISODE",
     source: "AGENT_INFERRED",
-    tags: ["mida-checkpoint"],
+    tags: ["mida-checkpoint", envelope.checkpoint.eventId],
   })
-  return { contextId: object.contextId, transactionHash: object.transactionHash!, milliseconds: Date.now() - started }
+  return { contextId: object.contextId, transactionHash: object.transactionHash ?? null, milliseconds: Date.now() - started, duplicate: false }
 }
 
-/** Spec §5D steps 2–3: a full protocol read as this agent, then keep only this project's checkpoints. */
-export async function readCheckpoints(runtime: Runtime, name: string, projectId: string): Promise<{ checkpoints: Array<{ contextId: Hex; authorId: Hex; checkpoint: Record<string, unknown> }>; milliseconds: number }> {
+/** Spec §5D steps 2–3: a full protocol read as this agent, then keep only this project's valid v1 envelopes. */
+export async function readCheckpoints(runtime: Runtime, name: string, projectId: string): Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }> {
   if (typeof projectId !== "string" || projectId === "") throw new Error("projectId must be a non-empty string")
   const started = Date.now()
   const objects = await runtime.agent(name).read(runtime.owner, NAMESPACE)
+  let skipped = 0
   const checkpoints = objects.flatMap((object) => {
-    const value = object.payload.value
-    if (typeof value !== "object" || value === null) return []
-    const record = value as Record<string, unknown>
-    if (record.type !== CHECKPOINT_TYPE || record.projectId !== projectId) return []
-    return [{ contextId: object.contextId, authorId: object.authorId, checkpoint: record.checkpoint as Record<string, unknown> }]
+    const envelope = unwrapCheckpoint(object.payload.value)
+    if (envelope === null) {
+      skipped += 1
+      return []
+    }
+    if (envelope.projectId !== projectId) return []
+    return [{
+      checkpoint: envelope.checkpoint,
+      projectId: envelope.projectId,
+      sessionId: envelope.sessionId,
+      continuesSession: envelope.continuesSession,
+      compiledBy: envelope.compiledBy,
+      contextId: object.contextId,
+      authorId: object.authorId,
+    }]
   })
-  return { checkpoints, milliseconds: Date.now() - started }
+  return { checkpoints, skipped, milliseconds: Date.now() - started }
 }
 
 /**

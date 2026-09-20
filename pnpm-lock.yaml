@@ -293,9 +293,15 @@ importers:
       '@mida/chain':
         specifier: workspace:*
         version: link:../../packages/chain
+      '@mida/checkpoint':
+        specifier: workspace:*
+        version: link:../../packages/checkpoint
       '@mida/cli':
         specifier: workspace:*
         version: link:../cli
+      '@mida/compiler':
+        specifier: workspace:*
+        version: link:../../packages/compiler
       '@mida/crypto':
         specifier: workspace:*
         version: link:../../packages/crypto
