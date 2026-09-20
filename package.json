@@ -14,7 +14,8 @@
     "chain:abis": "node packages/chain/scripts/gen-abis.mjs",
     "mida": "node --env-file=.env --import tsx apps/midad/src/cli.ts",
     "mida-hook": "node --import tsx apps/midad/src/hook-main.ts",
-    "mida-drain": "node --import tsx apps/midad/src/drain-main.ts"
+    "mida-drain": "node --import tsx apps/midad/src/drain-main.ts",
+    "bench": "node --import tsx bench/run.ts"
   },
   "dependencies": {
     "@mida/api": "workspace:*",
