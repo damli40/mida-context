@@ -17,6 +17,9 @@
 //   reasoning — prints only {"thinking":"x"} (no content fields → no-json)
 //   longitem — good, but progress[0] is 2,001 chars (over the schema limit)
 //   wide     — good, but decisions has 51 entries (over the schema limit)
+//   echo-previous — parses the JSON on the line after "PREVIOUS CHECKPOINT" in
+//              its stdin and echoes it back with one extra progress item: the
+//              block must reach the model intact and parseable
 
 import fs from "node:fs"
 import { spawn } from "node:child_process"
@@ -109,6 +112,15 @@ process.stdin.on("end", () => {
         decisions: Array.from({ length: 51 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
       })
       break
+    case "echo-previous": {
+      const lines = input.split("\n")
+      const i = lines.findIndex((l) => l.startsWith("PREVIOUS CHECKPOINT"))
+      if (i === -1) process.exit(4)
+      const prev = JSON.parse(lines[i + 1])
+      prev.progress = [...prev.progress, "echo-previous saw the block"]
+      fenced(prev)
+      break
+    }
     default:
       process.exit(2)
   }

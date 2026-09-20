@@ -31,6 +31,10 @@ export interface MergedHandoff {
   // True when the chosen chain's continuesSession link pointed at a session
   // with no stored checkpoints — the earlier part of the history is gone.
   missingEarlierSession: boolean
+  // True when the newest hook-compiler save held fewer than half the previous
+  // save's decisions+constraints — a bad compile — so the earlier save's
+  // lists were restored as the base and the newer save's entries appended.
+  carriedForwardFromEarlierSave: boolean
 }
 
 const byTime = (a: StoredCheckpoint, b: StoredCheckpoint) =>
@@ -65,6 +69,7 @@ function latest<T>(values: T[], isEmpty: (v: T) => boolean, fallback: T): T {
 }
 
 type ScalarKey = "objective" | "remainingPlan" | "unresolvedIssue" | "nextAction"
+type ListKey = "decisions" | "rejected" | "constraints" | "artifacts" | "progress"
 
 const isEmptyField = (v: string | string[] | null): boolean =>
   v === null || v === "" || (Array.isArray(v) && v.length === 0)
@@ -171,17 +176,48 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
   const chosen = ordered.find(isWorking) ?? ordered[0]!
   const scope = chosen.checkpoints
   const cps = scope.map((s) => s.checkpoint)
+
+  // A hook-compiler save is a full restatement, and each compile updates the
+  // previous one — so when the newest save in scope is hook-compiler it alone
+  // is the base for the list fields; unioning earlier saves would only re-add
+  // the same entries in fresh words. Entries from LATER agent-tool saves are
+  // appended, deduped. With no hook-compiler in scope the lists are the plain
+  // union of every checkpoint, as before.
+  let lastHook = -1
+  let prevHook = -1
+  for (let i = 0; i < cps.length; i++) {
+    if (cps[i]!.source === "hook-compiler") {
+      prevHook = lastHook
+      lastHook = i
+    }
+  }
+  // One bad compile must not lose the session's history: a newest save holding
+  // fewer than half the previous save's decisions+constraints looks truncated,
+  // so the earlier lists become the base and the newer save's entries append.
+  const listSize = (i: number) => cps[i]!.decisions.length + cps[i]!.constraints.length
+  const carriedForwardFromEarlierSave = prevHook >= 0 && listSize(lastHook) * 2 < listSize(prevHook)
+  const mergedList = <K extends ListKey>(key: K): Checkpoint[K] => {
+    if (lastHook < 0) return distinct(cps.flatMap((c) => c[key] as unknown[])) as Checkpoint[K]
+    const baseIdx = carriedForwardFromEarlierSave ? prevHook : lastHook
+    const items: unknown[] = [...cps[baseIdx]![key]]
+    if (carriedForwardFromEarlierSave) items.push(...cps[lastHook]![key])
+    for (let i = lastHook + 1; i < cps.length; i++) {
+      if (cps[i]!.source === "agent-tool") items.push(...cps[i]![key])
+    }
+    return distinct(items) as Checkpoint[K]
+  }
+
   return {
     originalRequest: cps.find((c) => c.originalRequest !== null)?.originalRequest ?? null,
     objective: mergedField(cps, "objective", ""),
     remainingPlan: mergedField(cps, "remainingPlan", []),
     unresolvedIssue: mergedField(cps, "unresolvedIssue", null),
     nextAction: mergedField(cps, "nextAction", ""),
-    decisions: distinct(cps.flatMap((c) => c.decisions)),
-    rejected: distinct(cps.flatMap((c) => c.rejected)),
-    constraints: distinct(cps.flatMap((c) => c.constraints)),
-    artifacts: distinct(cps.flatMap((c) => c.artifacts)),
-    progress: distinct(cps.flatMap((c) => c.progress)),
+    decisions: mergedList("decisions"),
+    rejected: mergedList("rejected"),
+    constraints: mergedList("constraints"),
+    artifacts: mergedList("artifacts"),
+    progress: mergedList("progress"),
     provenance: scope.map((s) => ({ agent: s.checkpoint.agent, authorId: s.authorId, createdAt: s.checkpoint.createdAt, contextId: s.contextId, compiledBy: s.compiledBy })),
     otherSessions: ordered
       .filter((c) => c !== chosen)
@@ -194,5 +230,6 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
         objective: c.newest.checkpoint.objective,
       })),
     missingEarlierSession: chosen.missing,
+    carriedForwardFromEarlierSave,
   }
 }

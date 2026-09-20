@@ -102,6 +102,9 @@ export function renderHandoff(merged: MergedHandoff, options: { maxChars?: numbe
     if (merged.missingEarlierSession) {
       parts.push("(An earlier session this one continued could not be read.)")
     }
+    if (merged.carriedForwardFromEarlierSave) {
+      parts.push("(Some entries were restored from an earlier save because the newest one looked incomplete.)")
+    }
     push(list("Saved by", merged.provenance.map(savedBy)))
     if (note !== null) parts.push(note)
     return `${HEAD}\n\n${parts.join("\n\n")}\n\n${TAIL}`

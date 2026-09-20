@@ -9,7 +9,7 @@ import os from "node:os"
 import path from "node:path"
 import { CONTENT_FIELDS, LIMITS, validateCheckpoint, type Checkpoint } from "@mida/checkpoint"
 import { extractJsonObject } from "./extract-json.js"
-import { EXTRACT_PROMPT } from "./prompt.js"
+import { buildExtractPrompt } from "./prompt.js"
 import { scrubValue } from "./scrub.js"
 import { readConversation, type Conversation } from "./transcript-claude.js"
 
@@ -32,6 +32,8 @@ export interface CompileInput {
   cwd: string
   homeDir: string
   model?: ModelCommand
+  /** The session's last saved checkpoint — the model updates it rather than restating from nothing. */
+  previous?: Checkpoint
   attempts?: number
   backoffMs?: readonly number[]
   now?: () => Date
@@ -214,7 +216,7 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
   const sleep = input.sleep ?? defaultSleep
 
   const convo = readConversation(input.transcriptPath)
-  const prompt = EXTRACT_PROMPT + "\n" + convo.text
+  const prompt = buildExtractPrompt(convo.text, input.previous)
 
   // Stored paths must not leak the local folder layout: a path under the
   // project cwd becomes relative; a path still absolute under the user's

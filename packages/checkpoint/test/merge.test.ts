@@ -70,29 +70,86 @@ describe("mergeCheckpoints", () => {
     expect(m.originalRequest).toBe("first")
   })
 
-  it("unions decisions, rejected, constraints and artifacts without repeats, in first-seen order", () => {
+  it("unions decisions, rejected, constraints and artifacts without repeats, in first-seen order — the rule for a chain with no hook-compiler save", () => {
     const d = { decision: "use sqlite", rationale: "no server" }
     const m = mergeCheckpoints([
-      stored({ at: "2026-09-21T10:00:00Z", decisions: [d], constraints: ["no timers"], artifacts: ["a.ts"] }),
-      stored({ at: "2026-09-21T10:05:00Z", decisions: [d, { decision: "wal mode", rationale: "speed" }], constraints: ["no timers", "node 25"], artifacts: ["b.ts", "a.ts"] }),
+      stored({ at: "2026-09-21T10:00:00Z", source: "agent-tool", decisions: [d], constraints: ["no timers"], artifacts: ["a.ts"] }),
+      stored({ at: "2026-09-21T10:05:00Z", source: "agent-tool", decisions: [d, { decision: "wal mode", rationale: "speed" }], constraints: ["no timers", "node 25"], artifacts: ["b.ts", "a.ts"] }),
     ])!
     expect(m.decisions).toEqual([d, { decision: "wal mode", rationale: "speed" }])
     expect(m.constraints).toEqual(["no timers", "node 25"])
     expect(m.artifacts).toEqual(["a.ts", "b.ts"])
   })
 
+  it("a chain of hook-compiler saves takes its lists from the NEWEST save only — earlier restatements contribute nothing (C1)", () => {
+    const m = mergeCheckpoints([
+      stored({ at: "2026-09-21T10:00:00Z", decisions: [{ decision: "Use lazy refill", rationale: "v1" }], constraints: ["old c"], artifacts: ["a.ts"], progress: ["p1"] }),
+      stored({ at: "2026-09-21T10:05:00Z", decisions: [{ decision: "Chose lazy refill", rationale: "v2" }], constraints: ["mid c"], artifacts: ["b.ts"], progress: ["p1", "p2"] }),
+      stored({ at: "2026-09-21T10:10:00Z", decisions: [{ decision: "lazy refill on each call", rationale: "v3" }], constraints: ["new c"], artifacts: ["c.ts"], progress: ["p1", "p2", "p3"] }),
+    ])!
+    // the same decision restated three ways must not triple in the handoff
+    expect(m.decisions).toEqual([{ decision: "lazy refill on each call", rationale: "v3" }])
+    expect(m.constraints).toEqual(["new c"])
+    expect(m.artifacts).toEqual(["c.ts"])
+    expect(m.progress).toEqual(["p1", "p2", "p3"])
+    expect(m.carriedForwardFromEarlierSave).toBe(false)
+    expect(m.provenance).toHaveLength(3) // every checkpoint in scope is still named
+  })
+
+  it("an agent-tool save after the newest hook-compiler appends its entries, deduped (C1)", () => {
+    const d = { decision: "lazy refill", rationale: "no timers" }
+    const m = mergeCheckpoints([
+      stored({ at: "2026-09-21T10:00:00Z", decisions: [d], constraints: ["c1"], artifacts: ["a.ts"], progress: ["p1"] }),
+      stored({ at: "2026-09-21T10:05:00Z", source: "agent-tool", decisions: [{ decision: "wal mode", rationale: "speed" }, d], constraints: ["c2"], artifacts: ["b.ts"], progress: ["p2"] }),
+    ])!
+    expect(m.decisions).toEqual([d, { decision: "wal mode", rationale: "speed" }])
+    expect(m.constraints).toEqual(["c1", "c2"])
+    expect(m.artifacts).toEqual(["a.ts", "b.ts"])
+    expect(m.progress).toEqual(["p1", "p2"])
+    expect(m.carriedForwardFromEarlierSave).toBe(false)
+  })
+
+  it("a newest hook-compiler save that lost most of the earlier lists restores them and flags it (C1)", () => {
+    const kept = [
+      { decision: "d1", rationale: "r" },
+      { decision: "d2", rationale: "r" },
+      { decision: "d3", rationale: "r" },
+    ]
+    const m = mergeCheckpoints([
+      stored({ at: "2026-09-21T10:00:00Z", decisions: kept, constraints: ["c1", "c2"], progress: ["p1", "p2"], artifacts: ["a.ts"] }),
+      stored({ at: "2026-09-21T10:05:00Z", decisions: [{ decision: "d4", rationale: "r" }], progress: ["p3"] }),
+    ])!
+    // 1 decision+constraint against the earlier 5 is under half — the earlier lists are the base
+    expect(m.decisions).toEqual([...kept, { decision: "d4", rationale: "r" }])
+    expect(m.constraints).toEqual(["c1", "c2"])
+    expect(m.progress).toEqual(["p1", "p2", "p3"])
+    expect(m.artifacts).toEqual(["a.ts"])
+    expect(m.carriedForwardFromEarlierSave).toBe(true)
+  })
+
+  it("the restore guard does not fire when the newest save keeps at least half (C1)", () => {
+    const m = mergeCheckpoints([
+      stored({ at: "2026-09-21T10:00:00Z", decisions: [{ decision: "d1", rationale: "r" }, { decision: "d2", rationale: "r" }], constraints: ["c1", "c2"] }),
+      stored({ at: "2026-09-21T10:05:00Z", decisions: [{ decision: "d3", rationale: "r" }], constraints: ["c3"] }),
+    ])!
+    // 2 entries against 4 is exactly half — no restore; the newest save is the whole state
+    expect(m.decisions).toEqual([{ decision: "d3", rationale: "r" }])
+    expect(m.constraints).toEqual(["c3"])
+    expect(m.carriedForwardFromEarlierSave).toBe(false)
+  })
+
   it("dedupes objects by content, not key order (A13)", () => {
     const m = mergeCheckpoints([
-      stored({ at: "2026-09-21T10:00:00Z", decisions: [{ decision: "sqlite", rationale: "no server" }] }),
-      stored({ at: "2026-09-21T10:05:00Z", decisions: [{ rationale: "no server", decision: "sqlite" }] }),
+      stored({ at: "2026-09-21T10:00:00Z", source: "agent-tool", decisions: [{ decision: "sqlite", rationale: "no server" }] }),
+      stored({ at: "2026-09-21T10:05:00Z", source: "agent-tool", decisions: [{ rationale: "no server", decision: "sqlite" }] }),
     ])!
     expect(m.decisions).toEqual([{ decision: "sqlite", rationale: "no server" }])
   })
 
-  it("keeps every progress entry in order, dropping only exact repeats", () => {
+  it("keeps every progress entry in order, dropping only exact repeats — the union rule for agent-tool saves", () => {
     const m = mergeCheckpoints([
-      stored({ at: "2026-09-21T10:00:00Z", progress: ["wrote schema"] }),
-      stored({ at: "2026-09-21T10:05:00Z", progress: ["wrote schema", "wrote tests"] }),
+      stored({ at: "2026-09-21T10:00:00Z", source: "agent-tool", progress: ["wrote schema"] }),
+      stored({ at: "2026-09-21T10:05:00Z", source: "agent-tool", progress: ["wrote schema", "wrote tests"] }),
     ])!
     expect(m.progress).toEqual(["wrote schema", "wrote tests"])
   })
@@ -101,7 +158,9 @@ describe("mergeCheckpoints", () => {
     const m = mergeCheckpoints([
       stored({ sessionId: "old-unrelated", at: "2026-09-20T09:00:00Z", originalRequest: "other job", constraints: ["stale rule"] }),
       stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", originalRequest: "real job", constraints: ["no timers"] }),
-      stored({ sessionId: "B", continuesSession: "A", at: "2026-09-21T11:00:00Z", nextAction: "finish" }),
+      // the continuing session's save is a delta here: under C1 a hook-compiler
+      // head would legitimately blank the base session's lists
+      stored({ sessionId: "B", continuesSession: "A", source: "agent-tool", at: "2026-09-21T11:00:00Z", nextAction: "finish" }),
     ])!
     expect(m.originalRequest).toBe("real job")
     expect(m.constraints).toEqual(["no timers"])
@@ -143,8 +202,9 @@ describe("mergeCheckpoints", () => {
   it("a continuesSession on a session's SECOND checkpoint is still followed (A11)", () => {
     const m = mergeCheckpoints([
       stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", originalRequest: "real job", constraints: ["c1"], progress: ["p1"] }),
-      stored({ sessionId: "B", at: "2026-09-21T11:00:00Z", nextAction: "n" }),
-      stored({ sessionId: "B", continuesSession: "A", at: "2026-09-21T11:05:00Z", progress: ["p2"] }),
+      // B's saves are agent-tool deltas so its list entries append to A's base
+      stored({ sessionId: "B", source: "agent-tool", at: "2026-09-21T11:00:00Z", nextAction: "n" }),
+      stored({ sessionId: "B", source: "agent-tool", continuesSession: "A", at: "2026-09-21T11:05:00Z", progress: ["p2"] }),
     ])!
     expect(m.provenance).toHaveLength(3)
     expect(m.constraints).toEqual(["c1"])

@@ -8,6 +8,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import type { Checkpoint } from "@mida/checkpoint"
 import { compileCheckpoint, type CompileInput, type ModelCommand } from "../src/index.js"
 
 const fixturePath = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-model.mjs")
@@ -162,6 +163,39 @@ describe("compileCheckpoint", () => {
   it("treats a reasoning-only object as no-json and retries (A8)", async () => {
     const r = await compileCheckpoint({ ...base, model: fake("reasoning"), sleep: async () => {} })
     expect(r).toMatchObject({ ok: false, reason: "no-json", attempts: 3 })
+  })
+  it("hands the session's previous checkpoint to the model to update (C1)", async () => {
+    const previous: Checkpoint = {
+      eventId: "evt-prev0001",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: "2026-09-21T09:00:00.000Z",
+      objective: "Implement the rate limiter",
+      originalRequest: "Build a rate limiter in 3 steps",
+      progress: ["skeleton written"],
+      decisions: [{ decision: "lazy refill on each call", rationale: "timers are banned" }],
+      rejected: [{ approach: "background interval refill", why: "no-timers constraint" }],
+      constraints: ["no dependencies"],
+      artifacts: ["src/a.ts"],
+      unresolvedIssue: null,
+      nextAction: "add tests",
+      remainingPlan: ["2. add tests", "3. write README"],
+      evidence: [],
+    }
+    // the fixture parses the PREVIOUS CHECKPOINT block out of its stdin and
+    // echoes it with one extra progress item — the returned checkpoint proves
+    // the block reached the model intact and parseable
+    const r = await compileCheckpoint({ ...base, previous, model: fake("echo-previous") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.progress).toEqual(["skeleton written", "echo-previous saw the block"])
+      expect(r.checkpoint.decisions).toEqual(previous.decisions)
+      expect(r.checkpoint.remainingPlan).toEqual(previous.remainingPlan)
+      // the fields the model may not write still come from the caller
+      expect(r.checkpoint.eventId).toBe("evt-00000001")
+      expect(r.checkpoint.originalRequest).toBe("Build a rate limiter in 3 steps")
+      expect(r.droppedKeys).toEqual([])
+    }
   })
 
   // Ports of the remaining three capture-worker cases from
