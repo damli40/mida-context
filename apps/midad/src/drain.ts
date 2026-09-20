@@ -19,7 +19,9 @@ import type { MidaHome } from "./home.js"
 import { FLUSH_EVENTS, transcriptPathAllowed } from "./hook.js"
 import { loadAgentIdentity, loadGrants } from "./keys.js"
 import { appendLog } from "./log.js"
-import { listJobs, moveToBad, projectIdFor, removeJob } from "./queue.js"
+import { checkProject as checkProjectAgainstList } from "./projects.js"
+import type { ProjectCheck } from "./projects.js"
+import { findProjectMarker, listJobs, moveToBad, removeJob } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
 import type { Runtime } from "./runtime.js"
 import { isCapabilityLive } from "./skeleton.js"
@@ -52,6 +54,8 @@ const PERMANENT_FAILURES = new Set([
   "unknown-transcript-format",
   "not-a-project",
   "not-approved",
+  "list-tampered",
+  "folder-mismatch",
 ])
 /**
  * A checkpoint the validator rejects is usually fixed by a fresh model call, so
@@ -75,6 +79,11 @@ export interface DrainDeps {
   save?: typeof saveCheckpoint
   /** The owner's approval check — injectable in tests. Defaults to a read-only chain lookup. */
   isApproved?: (agent: string) => Promise<boolean>
+  /**
+   * The owner-signed project-folder check — injectable in tests. Defaults to the real check on the
+   * drain's runtime, with a fast `not-a-project` answer for marker-less folders that never opens it.
+   */
+  checkProject?: (input: { agent: string; cwd: string }) => Promise<ProjectCheck>
   /** Injected in tests that move the clock; defaults to a real sleep. */
   sleep?: (ms: number) => Promise<void>
 }
@@ -218,6 +227,13 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
     opened ??= await deps.open()
     return opened
   }
+  const checkProject =
+    deps.checkProject ??
+    (async (input: { agent: string; cwd: string }): Promise<ProjectCheck> => {
+      // a folder with no marker is not-a-project without paying for a runtime at all
+      if (findProjectMarker(input.cwd) === null) return { ok: false, reason: "not-a-project" }
+      return checkProjectAgainstList(await openRuntime(), input)
+    })
   try {
     for (const [sessionId, group] of bySession) {
       const job = group[group.length - 1]! // listJobs is oldest-first, so the last is newest
@@ -236,12 +252,15 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           log({ sessionId, outcome: "bad", reason: "bad-transcript-path" })
           continue
         }
-        const projectId = projectIdFor(job.cwd)
-        if (projectId === null) {
+        // the owner-signed project list decides before the transcript is even opened: a refusal
+        // is permanent for this job — it is removed with the stable reason and never compiled
+        const project = await checkProject({ agent: job.agent, cwd: job.cwd })
+        if (!project.ok) {
           removeJob(deps.home, job.id)
-          log({ sessionId, outcome: "removed", reason: "not-a-project" })
+          log({ sessionId, outcome: "removed", reason: project.reason })
           continue
         }
+        const projectId = project.approval.projectId
 
         // size and last line come from ONE open descriptor — a growing transcript cannot show
         // the drainer a size and a tail from different moments
@@ -423,6 +442,8 @@ function failureCode(error: unknown): string {
     isMidaError(error, "CAPABILITY_REVOKED")
   ) return "not-approved"
   if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code
+    if (typeof code === "string" && PERMANENT_FAILURES.has(code)) return code
     if (error.message.includes("already holds this home")) return "lock-timeout"
     if (error.message.includes("network.json")) return "network-missing"
   }

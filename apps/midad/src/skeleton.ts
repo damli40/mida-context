@@ -15,6 +15,7 @@ import {
   identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, loadOrCreateSignerKey,
   markRevoked, replaceSignerKey, saveAgentIdentity, saveGrants,
 } from "./keys.js"
+import { approveProject, ensureProjectMarker, removeAgentApprovals } from "./projects.js"
 
 /**
  * The contract's isCapabilityValid view. activeCapabilityIds returns the RAW stored list — expired and
@@ -108,9 +109,22 @@ export async function requestAccess(runtime: Runtime, name: string): Promise<{ r
 }
 
 /** Spec §5B steps 3–4: the owner approves the pending request on-chain; the agent checks the result and keeps the grant. */
-export async function approve(runtime: Runtime, name: string): Promise<{ capabilityIds: Hex[]; permissions: number[]; transactionHash: Hex; gasUsed: bigint }> {
+export async function approve(
+  runtime: Runtime,
+  name: string,
+  cwd?: string,
+): Promise<{ capabilityIds: Hex[]; permissions: number[]; transactionHash: Hex | null; gasUsed: bigint; projectId?: string }> {
   const { home, vault, reader, owner } = runtime
+  // When a project folder is given its marker is resolved first: a folder that may not hold a
+  // project (the owner's home, the filesystem root) is refused with not-a-project before any
+  // transaction can go out. The list entry itself is written only after the grant succeeds.
+  if (cwd !== undefined) ensureProjectMarker(cwd)
   const identity = loadAgentIdentity(home, name)
+  if (cwd !== undefined && identity !== undefined && (await hasAnyLiveCapability(runtime, identity.agentId))) {
+    // a second project for an already-approved agent needs no new grant — only the list row
+    const listed = await approveProject(runtime, { agent: name, cwd })
+    return { capabilityIds: [], permissions: [], transactionHash: null, gasUsed: 0n, projectId: listed.projectId }
+  }
   const pending = home.readJson<{ request: AccessRequest }>(`agents/${name}/pending-request.json`)
   if (identity === undefined || pending === undefined) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
   const stored = await new FileAccessRequestStore(home, name).load(pending.request.requestId)
@@ -131,21 +145,25 @@ export async function approve(runtime: Runtime, name: string): Promise<{ capabil
   // A marker left by an earlier revoke must not outlive a fresh approval.
   home.remove(`agents/${name}/revoked.json`)
   home.remove(`agents/${name}/pending-request.json`)
+  const listed = cwd === undefined ? undefined : await approveProject(runtime, { agent: name, cwd })
   return {
     capabilityIds: grant.capabilities.map((capability) => capability.capabilityId),
     permissions: grant.capabilities.map((capability) => capability.permissions),
-    transactionHash: approval.response.capabilities[0]!.transactionHash,
+    transactionHash: approval.response.capabilities[0]!.transactionHash as Hex | null,
     gasUsed: approval.gasUsed,
+    ...(listed !== undefined ? { projectId: listed.projectId } : {}),
   }
 }
 
 /**
- * The local index of eventIds already saved, at `queue/saved-ids.json`. It is a cache, not the
- * truth: a miss still asks the chain, and a corrupt file is rebuilt by reading as usual.
+ * The local index of eventIds already saved, at `state/saved-ids.json` — outside `queue/`, whose
+ * sweeper would carry any .json it finds there to `queue/bad/` (CAP-25). It is a cache, not the
+ * truth: a miss still asks the chain, a corrupt file is rebuilt by reading as usual, and a
+ * leftover index under `queue/` is ignored — never migrated.
  */
 function readSavedIds(home: Runtime["home"]): Record<string, Hex> {
   try {
-    const raw = home.readJson<Record<string, unknown>>("queue/saved-ids.json")
+    const raw = home.readJson<Record<string, unknown>>("state/saved-ids.json")
     if (raw === undefined || typeof raw !== "object" || Array.isArray(raw)) return {}
     const index: Record<string, Hex> = {}
     for (const [eventId, contextId] of Object.entries(raw)) {
@@ -158,7 +176,7 @@ function readSavedIds(home: Runtime["home"]): Record<string, Hex> {
 }
 
 function recordSavedId(home: Runtime["home"], eventId: string, contextId: Hex): void {
-  home.writeSecretJson("queue/saved-ids.json", { ...readSavedIds(home), [eventId]: contextId })
+  home.writeSecretJson("state/saved-ids.json", { ...readSavedIds(home), [eventId]: contextId })
 }
 
 /** Spec §5C steps 4–5: wrap, encrypt, upload and register on Monad under the agent's own key. A second save carrying
@@ -267,6 +285,8 @@ export async function revoke(runtime: Runtime, name: string): Promise<{ transact
   // the raw list was empty, no marker exists yet, and no grants.json says it ever completed a grant.
   const neverApproved = listed.length === 0 && !isRevoked(home, name) && !home.has(`agents/${name}/grants.json`)
   if (!neverApproved) markRevoked(home, name)
+  // the project-folder approvals go too — the file is re-signed without this agent's rows
+  await removeAgentApprovals(runtime, name)
   const rewrapped = await repairReaderWraps(runtime)
   return { transactionHashes, rewrapped }
 }

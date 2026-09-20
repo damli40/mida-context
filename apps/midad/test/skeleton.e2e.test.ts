@@ -80,7 +80,7 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     expect(approval.capabilityIds).toHaveLength(1)
     expect(approval.permissions).toEqual([AGENT_PERMISSIONS])
     expect(approval.transactionHash).toMatch(/^0x[0-9a-f]{64}$/)
-    transactions.grantClaudeCode = approval.transactionHash
+    transactions.grantClaudeCode = approval.transactionHash!
     grantGasUsed = approval.gasUsed.toString()
   })
 
@@ -99,7 +99,7 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     runtime = await Runtime.open(home, network)
     const approval = await approve(runtime, "codex")
     expect(approval.permissions).toEqual([AGENT_PERMISSIONS])
-    transactions.grantCodex = approval.transactionHash
+    transactions.grantCodex = approval.transactionHash!
   })
 
   step("7. codex reads claude-code's checkpoint, and only for the project it asked about", async () => {

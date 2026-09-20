@@ -77,17 +77,18 @@ describe("M1 drainOnce on local Anvil", () => {
     env = await localEnvironment()
     network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-drain-")))
+    // the marker exists before approve: the owner-signed list entry names this root
+    workDir = mkdtempSync(join(tmpdir(), "mida-work-"))
+    mkdirSync(join(workDir, ".mida"))
+    writeFileSync(join(workDir, ".mida", "project.json"), JSON.stringify({ projectId: PROJECT_ID }))
     const runtime = await open()
     try {
       await init(runtime, ["claude-code"])
       await requestAccess(runtime, "claude-code")
-      await approve(runtime, "claude-code")
+      await approve(runtime, "claude-code", workDir)
     } finally {
       await runtime.close()
     }
-    workDir = mkdtempSync(join(tmpdir(), "mida-work-"))
-    mkdirSync(join(workDir, ".mida"))
-    writeFileSync(join(workDir, ".mida", "project.json"), JSON.stringify({ projectId: PROJECT_ID }))
     // the transcript lives where the drainer expects a claude-code session file: the injected
     // "user home" folder's .claude/projects/, not the work folder
     homeDir = mkdtempSync(join(tmpdir(), "mida-userhome-"))
@@ -213,7 +214,7 @@ describe("M1 drainOnce on local Anvil", () => {
     const runtime2 = await open()
     try {
       await requestAccess(runtime2, "codex")
-      await approve(runtime2, "codex")
+      await approve(runtime2, "codex", workDir)
     } finally {
       await runtime2.close()
     }

@@ -6,8 +6,9 @@ import { join } from "node:path"
 import { spawnSync } from "node:child_process"
 import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
-import { MidaHome, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, tailOf } from "@mida/midad"
-import type { Runtime, saveCheckpoint } from "@mida/midad"
+import type { Hex } from "@mida/protocol"
+import { MidaHome, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, projectIdFor, tailOf } from "@mida/midad"
+import type { DrainDeps, Runtime, saveCheckpoint } from "@mida/midad"
 import { CONTENT_FIELDS } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
 
@@ -57,40 +58,48 @@ function setup() {
     return { contextId: `0x${"ab".repeat(32)}`, transactionHash: null, milliseconds: 1, duplicate: false }
   }
   const open = async (): Promise<Runtime> => ({ close: async () => {} }) as unknown as Runtime
+  // the owner-signed list is exercised for real in projects.test.ts / the e2e files; here the stub
+  // keeps these tests on the drain rules: a marked folder is approved, an unmarked one is not
+  const checkProject: NonNullable<DrainDeps["checkProject"]> = async (input) => {
+    const projectId = projectIdFor(input.cwd)
+    return projectId === null
+      ? { ok: false, reason: "not-a-project" }
+      : { ok: true, approval: { agent: input.agent, projectId, root: input.cwd, approvedAt: "2026-09-21T00:00:00.000Z" } }
+  }
   const job = (over: Record<string, unknown> = {}, at = T0) =>
     enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath, cwd, error: null, ...over }, () => new Date(at))
   const drain = (over: Record<string, unknown> = {}) =>
-    drainOnce({ home, open, compile, save, homeDir, isApproved: async () => true, now: () => new Date(T0 + 120_000), ...over })
+    drainOnce({ home, open, compile, save, homeDir, checkProject, isApproved: async () => true, now: () => new Date(T0 + 120_000), ...over })
   const drainLog = () => readFileSync(home.path("logs/drain.jsonl"), "utf8")
-  return { dir, home, homeDir, transcriptPath, cwd, compileCalls, saveCalls, flags, compile, save, open, job, drain, drainLog }
+  return { dir, home, homeDir, transcriptPath, cwd, compileCalls, saveCalls, flags, compile, save, open, checkProject, job, drain, drainLog }
 }
 
 describe("the drainer re-checks transcript paths before trusting them", () => {
   it("a queued job naming a non-transcript file goes to queue/bad with bad-transcript-path", async () => {
-    const { home, homeDir, cwd, compile, open } = setup()
+    const { home, homeDir, cwd, compile, open, checkProject } = setup()
     const job = enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/etc/hosts", cwd, error: null })
-    await drainOnce({ home, open, compile, homeDir })
+    await drainOnce({ home, open, compile, homeDir, checkProject })
     expect(home.has(`queue/bad/${job.id}.json`)).toBe(true)
     expect(listJobs(home)).toHaveLength(0)
     expect(readFileSync(home.path("logs/drain.jsonl"), "utf8")).toContain("bad-transcript-path")
   })
 
   it("a transcript swapped for a symlink after enqueue is rejected at drain time", async () => {
-    const { home, homeDir, cwd, transcriptPath, compile, open } = setup()
+    const { home, homeDir, cwd, transcriptPath, compile, open, checkProject } = setup()
     const job = enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath, cwd, error: null })
     unlinkSync(transcriptPath)
     symlinkSync("/etc/hosts", transcriptPath)
-    await drainOnce({ home, open, compile, homeDir })
+    await drainOnce({ home, open, compile, homeDir, checkProject })
     expect(home.has(`queue/bad/${job.id}.json`)).toBe(true)
     expect(readFileSync(home.path("logs/drain.jsonl"), "utf8")).toContain("bad-transcript-path")
   })
 
   it("a transcript in an unknown format is never sent to the model", async () => {
-    const { home, homeDir, cwd, compileCalls, compile, open } = setup()
+    const { home, homeDir, cwd, compileCalls, compile, open, checkProject } = setup()
     const weird = join(homeDir, ".claude", "projects", "proj", "weird.jsonl")
     writeFileSync(weird, "this is not a jsonl transcript\nneither is this\n")
     const job = enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: weird, cwd, error: null })
-    await drainOnce({ home, open, compile, homeDir })
+    await drainOnce({ home, open, compile, homeDir, checkProject })
     expect(compileCalls).toHaveLength(0)
     expect(home.has(`queue/bad/${job.id}.json`)).toBe(true)
     expect(readFileSync(home.path("logs/drain.jsonl"), "utf8")).toContain("unknown-transcript-format")
@@ -115,11 +124,11 @@ describe("one drainer at a time", () => {
   })
 
   it("drainUntilSettled reports a held lock the same way", async () => {
-    const { home, job, compile, open, homeDir, drainLog } = setup()
+    const { home, job, compile, open, homeDir, drainLog, checkProject } = setup()
     job({ event: "Stop" }, T0)
     home.writeSecretJson("queue/drain.lock", { pid: process.pid, startedAt: new Date(T0 + 120_000).toISOString() })
     const result = await drainUntilSettled({
-      home, open, compile, homeDir, isApproved: async () => true, now: () => new Date(T0 + 120_000), sleep: async () => {},
+      home, open, compile, homeDir, checkProject, isApproved: async () => true, now: () => new Date(T0 + 120_000), sleep: async () => {},
     })
     expect(result.lockHeld).toBe(true)
     expect(drainLog()).toContain('"outcome":"lock-held"')
@@ -262,6 +271,81 @@ describe("a failed save does not buy a new model call", () => {
   })
 })
 
+describe("the owner-signed project list gates every save", () => {
+  for (const reason of ["not-approved", "list-tampered", "folder-mismatch"] as const) {
+    it(`a job refused with ${reason} is removed before any compile and never retried`, async () => {
+      const { home, job, drain, compileCalls, saveCalls, drainLog } = setup()
+      job({ event: "Stop" }, T0)
+      const result = await drain({ checkProject: async () => ({ ok: false as const, reason }) })
+      expect(result.failed).toBe(0)
+      expect(compileCalls).toHaveLength(0)   // the model is never asked
+      expect(saveCalls).toHaveLength(0)
+      expect(listJobs(home)).toHaveLength(0) // permanent: the job is gone, not kept
+      expect(drainLog()).toContain(`"reason":"${reason}"`)
+    })
+  }
+
+  it("the default check answers not-a-project for a marker-less folder without opening a runtime", async () => {
+    const { home, homeDir, open, compile } = setup()
+    const nowhere = join(homeDir, "somewhere")
+    mkdirSync(nowhere)
+    enqueue(home, {
+      agent: "claude-code", event: "Stop", sessionId: "s1",
+      transcriptPath: join(homeDir, ".claude", "projects", "proj", "t.jsonl"), cwd: nowhere, error: null,
+    })
+    let opened = 0
+    const result = await drainOnce({
+      home, homeDir, compile,
+      open: async () => { opened += 1; return open() },
+    })
+    expect(result).toMatchObject({ saved: 0, failed: 0 })
+    expect(opened).toBe(0)
+    expect(listJobs(home)).toHaveLength(0)
+    expect(readFileSync(home.path("logs/drain.jsonl"), "utf8")).toContain("not-a-project")
+  })
+})
+
+describe("the saved-ids index lives outside the queue and survives every pass (CAP-25)", () => {
+  it("three passes record three eventIds, and re-running the first event makes zero chain reads", async () => {
+    const { home, homeDir, transcriptPath, cwd, compile, checkProject } = setup()
+    // a stub "chain" that counts its reads: the index must answer the duplicate before any read
+    let reads = 0
+    let creates = 0
+    const runtime = {
+      home,
+      owner: `0x${"11".repeat(20)}`,
+      agent: () => ({
+        read: async () => {
+          reads += 1
+          return []
+        },
+        create: async () => {
+          creates += 1
+          return { contextId: `0x${"cc".repeat(32)}` as Hex, transactionHash: null }
+        },
+      }),
+      close: async () => {},
+    } as unknown as Runtime
+    // the real saveCheckpoint runs: the stub runtime's agent is what "the chain" means here
+    const pass = () =>
+      drainOnce({ home, runtime, compile, homeDir, checkProject, isApproved: async () => true, now: () => new Date(T0 + 120_000) })
+    for (const sessionId of ["s1", "s2", "s3"]) {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId, transcriptPath, cwd, error: null })
+      expect((await pass()).saved).toBe(1)
+    }
+    const index = home.readJson<Record<string, string>>("state/saved-ids.json") ?? {}
+    expect(Object.keys(index)).toHaveLength(3)
+    // the first session's job re-queued with no saved state compiles to the same eventId — a
+    // post-crash retry — and the index must answer it without a chain read
+    home.remove("queue/state/s1.json")
+    enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath, cwd, error: null })
+    const readsBefore = reads
+    expect((await pass()).saved).toBe(1)
+    expect(reads).toBe(readsBefore)
+    expect(creates).toBe(3)
+  })
+})
+
 describe("nothing is saved for an agent the owner has not approved", () => {
   it("an unapproved agent's jobs across sessions are removed before any compile", async () => {
     const { home, job, drain, compileCalls, saveCalls, drainLog } = setup()
@@ -278,7 +362,7 @@ describe("nothing is saved for an agent the owner has not approved", () => {
 
 describe("drainUntilSettled waits out the gap instead of stranding the job", () => {
   it("sleeps until the held-back job is due, then saves it — all under one lock", async () => {
-    const { home, job, compile, save, open, homeDir, compileCalls, saveCalls } = setup()
+    const { home, job, compile, save, open, homeDir, compileCalls, saveCalls, checkProject } = setup()
     job({ event: "PostToolUse" }, T0)
     let clock = T0 + 5_000
     const sleeps: number[] = []
@@ -289,7 +373,7 @@ describe("drainUntilSettled waits out the gap instead of stranding the job", () 
       expect(home.has("queue/drain.lock")).toBe(true)
     }
     const result = await drainUntilSettled({
-      home, open, compile, save, homeDir, isApproved: async () => true, now: () => new Date(clock), sleep,
+      home, open, compile, save, homeDir, checkProject, isApproved: async () => true, now: () => new Date(clock), sleep,
     })
     expect(sleeps).toHaveLength(1)
     expect(sleeps[0]).toBeGreaterThan(50_000)   // about 55 s remained of the 60 s gap
@@ -302,12 +386,12 @@ describe("drainUntilSettled waits out the gap instead of stranding the job", () 
   })
 
   it("gives up after three waits so a doomed queue cannot loop forever", async () => {
-    const { home, job, compile, save, open, homeDir } = setup()
+    const { home, job, compile, save, open, homeDir, checkProject } = setup()
     job({ event: "PostToolUse" }, T0)
     const sleeps: number[] = []
     // the clock never moves — the job stays too soon forever
     const result = await drainUntilSettled({
-      home, open, compile, save, homeDir, isApproved: async () => true,
+      home, open, compile, save, homeDir, checkProject, isApproved: async () => true,
       now: () => new Date(T0 + 5_000), sleep: async (ms) => { sleeps.push(ms) },
     })
     expect(sleeps.length).toBeLessThanOrEqual(3)
@@ -316,7 +400,7 @@ describe("drainUntilSettled waits out the gap instead of stranding the job", () 
   })
 
   it("a job that lands mid-pass is not stranded: the settle run re-lists and saves it", async () => {
-    const { home, job, save, open, homeDir, transcriptPath, compileCalls, saveCalls } = setup()
+    const { home, job, save, open, homeDir, transcriptPath, compileCalls, saveCalls, checkProject } = setup()
     job({ event: "Stop" }, T0)
     // while the first compile runs the session grows and its Stop job lands — the pass already
     // listed the queue, so without a re-list this job sits until some later drain
@@ -333,7 +417,7 @@ describe("drainUntilSettled waits out the gap instead of stranding the job", () 
       }
     }
     const result = await drainUntilSettled({
-      home, open, compile, save, homeDir, isApproved: async () => true,
+      home, open, compile, save, homeDir, checkProject, isApproved: async () => true,
       now: () => new Date(T0 + 120_000), sleep: async () => {},
     })
     expect(result.saved).toBe(2)
@@ -343,13 +427,13 @@ describe("drainUntilSettled waits out the gap instead of stranding the job", () 
   })
 
   it("an injected runtime is used for the save and is never closed by the drain", async () => {
-    const { home, job, compile, save, homeDir, saveCalls } = setup()
+    const { home, job, compile, save, homeDir, saveCalls, checkProject } = setup()
     job({ event: "Stop" }, T0)
     let closed = 0
     let opens = 0
     const runtime = { close: async () => { closed += 1 } } as unknown as Runtime
     const result = await drainUntilSettled({
-      home, runtime, compile, save, homeDir, isApproved: async () => true,
+      home, runtime, compile, save, homeDir, checkProject, isApproved: async () => true,
       open: async () => { opens += 1; return runtime },
       now: () => new Date(T0 + 120_000), sleep: async () => {},
     })

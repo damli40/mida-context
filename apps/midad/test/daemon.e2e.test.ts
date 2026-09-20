@@ -178,28 +178,29 @@ describe("the long-running midad", () => {
   }
 
   const kick = () => callDaemon(home, "/kick", {}, { timeoutMs: 2_000 })
-  const cli = (argv: string[]) => callDaemon(home, "/cli", { argv }, { timeoutMs: STEP_TIMEOUT })
+  const cli = (argv: string[]) => callDaemon(home, "/cli", { argv, cwd: workDir }, { timeoutMs: STEP_TIMEOUT })
 
   beforeAll(async () => {
     env = await localEnvironment()
     network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
     apiServer = await startPersistentApi({ rpcUrl: env.rpcUrl, deployment: env.deployment, dataDir: mkdtempSync(join(tmpdir(), "mida-api-data-")) })
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-daemon-e2e-")))
+    // the project marker exists before approve: the owner-signed list entry names this root
+    workDir = mkdtempSync(join(tmpdir(), "mida-work-"))
+    mkdirSync(join(workDir, ".mida"))
+    writeFileSync(join(workDir, ".mida", "project.json"), JSON.stringify({ projectId: "proj-daemon" }))
     // init and approve run against the shared server from the start, so manifests, wraps and
     // grants live where the daemon will look for them
     const runtime = await Runtime.open(home, { ...network, storageUrl: apiServer.baseUrl })
     try {
       await init(runtime, ["claude-code", "codex"])
       await requestAccess(runtime, "claude-code")
-      await approve(runtime, "claude-code")
+      await approve(runtime, "claude-code", workDir)
     } finally {
       await runtime.close()
     }
     // daemon-main reads storageUrl from network.json — the same file init wrote
     home.writeSecretJson("network.json", { ...(home.readJson("network.json") as Record<string, unknown>), storageUrl: apiServer.baseUrl })
-    workDir = mkdtempSync(join(tmpdir(), "mida-work-"))
-    mkdirSync(join(workDir, ".mida"))
-    writeFileSync(join(workDir, ".mida", "project.json"), JSON.stringify({ projectId: "proj-daemon" }))
     homeDir = mkdtempSync(join(tmpdir(), "mida-userhome-"))
     mkdirSync(join(homeDir, ".claude", "projects", "proj"), { recursive: true })
     transcriptPath = join(homeDir, ".claude", "projects", "proj", "transcript.jsonl")
@@ -284,10 +285,10 @@ describe("the long-running midad", () => {
       await kick()
       // the job saves exactly once: one s-crash record on the server, and the queue drained
       await poll(async () => (await readThrough("codex", "proj-daemon")).some((e) => e.sessionId === "s-crash") && listJobs(home).length === 0)
-      // every listJobs sweeps an unparseable queue/*.json into queue/bad — including the
-      // saved-ids index — so after a settled pass the index sits there with the last save's entry
-      const savedIds = home.readJson<Record<string, string>>("queue/bad/saved-ids.json") ?? home.readJson<Record<string, string>>("queue/saved-ids.json") ?? {}
-      expect(Object.keys(savedIds)).toHaveLength(1)
+      // the index lives outside the queue now (CAP-25): every save this home has made is still
+      // listed — s1, the two s2 saves and s-crash
+      const savedIds = home.readJson<Record<string, string>>("state/saved-ids.json") ?? {}
+      expect(Object.keys(savedIds)).toHaveLength(4)
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL")
     }

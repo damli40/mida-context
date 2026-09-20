@@ -1,5 +1,6 @@
 import { chmodSync, existsSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
+import { isAbsolute } from "node:path"
 import type { IncomingMessage, Server, ServerResponse } from "node:http"
 import { SOCKET_FILE, callDaemon, socketPathFor } from "./control.js"
 import { drainUntilSettled } from "./drain.js"
@@ -32,8 +33,8 @@ export interface DaemonDeps {
   drain?: (deps: DrainDeps) => Promise<DrainResult>
   /** Runtime acquisition; defaults to Runtime.open (which takes midad.lock). */
   openRuntime?: () => Promise<Runtime>
-  /** The /cli dispatch; defaults to runCliWithRuntime. */
-  runCli?: (argv: string[], runtime: Runtime, print: (line: string) => void) => Promise<number>
+  /** The /cli dispatch; defaults to runCliWithRuntime. `cwd` is the folder the client ran in. */
+  runCli?: (argv: string[], runtime: Runtime, print: (line: string) => void, context?: { cwd?: string }) => Promise<number>
   /** Save-loop period; default 15 s. */
   tickMs?: number
   /** Loop pacing; default a real sleep. */
@@ -207,8 +208,12 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         respond(res, 200, { code: 2, lines: [USAGE] })
         return
       }
+      // the client tells the daemon where it ran — `approve` signs that folder's project in;
+      // a relative or oversized value is ignored rather than resolved against the daemon's cwd
+      const cwdRaw = (parsed as { cwd?: unknown } | null)?.cwd
+      const cwd = typeof cwdRaw === "string" && isAbsolute(cwdRaw) && cwdRaw.length <= 4096 ? cwdRaw : undefined
       const lines: string[] = []
-      const code = await runCli(argv, runtime, (line) => lines.push(line)).catch(() => 1)
+      const code = await runCli(argv, runtime, (line) => lines.push(line), { cwd }).catch(() => 1)
       respond(res, 200, { code, lines })
       return
     }

@@ -18,6 +18,8 @@ export interface CliDeps {
   home: MidaHome
   network: Network
   print(line: string): void
+  /** The folder the command was run from — `approve` records it on the owner-signed project list. */
+  cwd?: string
 }
 
 /**
@@ -37,7 +39,13 @@ export function validCliArgv(argv: unknown): argv is string[] {
  * All of `mida`'s commands against an already-open runtime: the daemon's /cli route runs owner
  * commands inside the daemon's runtime through this. Returns the exit code; output goes to print.
  */
-export async function runCliWithRuntime(argv: string[], runtime: Runtime, print: (line: string) => void): Promise<number> {
+export async function runCliWithRuntime(
+  argv: string[],
+  runtime: Runtime,
+  print: (line: string) => void,
+  /** `cwd` is the folder the command ran in — `approve` adds its project to the owner's list. */
+  context?: { cwd?: string },
+): Promise<number> {
   const [command = "", agent = "", projectId = ""] = argv
   const usage = () => {
     print(USAGE)
@@ -55,8 +63,13 @@ export async function runCliWithRuntime(argv: string[], runtime: Runtime, print:
     } else if (command === "request") {
       print(`requested ${agent} ${(await requestAccess(runtime, agent)).requestId}`)
     } else if (command === "approve") {
-      const result = await approve(runtime, agent)
-      print(`approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}`)
+      const result = await approve(runtime, agent, context?.cwd)
+      print(
+        result.transactionHash === null
+          ? `approved ${agent} for project ${result.projectId}; the on-chain grant was already live`
+          : `approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}` +
+              (result.projectId !== undefined ? ` project ${result.projectId}` : ""),
+      )
     } else if (command === "save-demo") {
       const result = await saveCheckpoint(runtime, agent, {
         projectId,
@@ -99,7 +112,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   }
   const runtime = await Runtime.open(deps.home, deps.network)
   try {
-    return await runCliWithRuntime(argv, runtime, deps.print)
+    return await runCliWithRuntime(argv, runtime, deps.print, { cwd: deps.cwd })
   } finally {
     await runtime.close()
   }
@@ -139,7 +152,7 @@ async function main(): Promise<void> {
     if (argv[0] === "init") {
       const health = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
       if (health.status === 0) {
-        const code = await runCli(argv, { home, network, print })
+        const code = await runCli(argv, { home, network, print, cwd: process.cwd() })
         if (code === 0) spawnDaemon()
         process.exitCode = code
         return
@@ -152,7 +165,7 @@ async function main(): Promise<void> {
       process.exitCode = 1
       return
     }
-    const reply = await callDaemon(home, "/cli", { argv }, { timeoutMs: CLI_CALL_TIMEOUT_MS })
+    const reply = await callDaemon(home, "/cli", { argv, cwd: process.cwd() }, { timeoutMs: CLI_CALL_TIMEOUT_MS })
     const body = reply.body as { code?: unknown; lines?: unknown } | null
     if (reply.status === 0 || typeof body?.code !== "number" || !Array.isArray(body.lines)) {
       print("midad did not answer")

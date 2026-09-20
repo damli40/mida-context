@@ -102,25 +102,34 @@ function asJob(raw: unknown, id: string): CaptureJob | undefined {
 
 /**
  * Walks from `cwd` up to the filesystem root looking for `.mida/project.json` — the marker that a
- * folder is a Mida project — and returns its `projectId`. A marker that exists but does not carry a
- * non-empty string `projectId` means "not a Mida project" (`null`), not "keep walking": attributing
- * the session to some ancestor's project would save the checkpoint under the wrong id.
+ * folder is a Mida project. Returns the folder that holds `.mida` (`markerDir`, unresolved — callers
+ * needing the canonical path take its realpath) and the marker's `projectId`. A marker that exists
+ * but does not carry a non-empty string `projectId` means "not a Mida project" (`projectId: null`),
+ * not "keep walking": attributing the session to some ancestor's project would save the checkpoint
+ * under the wrong id.
  */
-export function projectIdFor(cwd: string): string | null {
+export function findProjectMarker(cwd: string): { markerDir: string; projectId: string | null } | null {
   let dir = resolve(cwd)
   for (;;) {
     const marker = join(dir, ".mida", "project.json")
     if (existsSync(marker)) {
+      let projectId: string | null = null
       try {
         const parsed: unknown = JSON.parse(readFileSync(marker, "utf8"))
         const id = (parsed as { projectId?: unknown } | null)?.projectId
-        return typeof id === "string" && id !== "" ? id : null
+        projectId = typeof id === "string" && id !== "" ? id : null
       } catch {
-        return null
+        projectId = null
       }
+      return { markerDir: dir, projectId }
     }
     const parent = dirname(dir)
     if (parent === dir) return null
     dir = parent
   }
+}
+
+/** The marker's `projectId`, or `null` when `cwd` is not inside a marked project. */
+export function projectIdFor(cwd: string): string | null {
+  return findProjectMarker(cwd)?.projectId ?? null
 }
