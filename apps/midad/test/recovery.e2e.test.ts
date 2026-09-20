@@ -83,7 +83,8 @@ describe("M0 crash-safety and whole-agent revocation", () => {
 
     const agentId = agent.agentId
     expect(await runtime.reader.hasAuthority(runtime.owner, agentId, NAMESPACE_ID, PERMISSION.READ, 0)).toBe(true)
-    expect(await runtime.reader.activeCapabilityIds(runtime.owner, agentId)).toHaveLength(2)
+    // the policy grant mints three capabilities (profile.skills, projects.current, preferences.communication) plus the vault-direct one
+    expect(await runtime.reader.activeCapabilityIds(runtime.owner, agentId)).toHaveLength(4)
 
     await revoke(runtime, "claude-code")
 

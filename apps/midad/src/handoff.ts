@@ -5,6 +5,7 @@ import { loadAgentIdentity, loadGrants } from "./keys.js"
 import { checkProject } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { isSafeName } from "./queue.js"
+import { readOwnerFacts } from "./remember.js"
 import type { Runtime } from "./runtime.js"
 import { isCapabilityLive, readCheckpoints } from "./skeleton.js"
 
@@ -15,8 +16,8 @@ import { isCapabilityLive, readCheckpoints } from "./skeleton.js"
  * answered cleanly answers with a stable code instead.
  */
 export type HandoffResult =
-  | { kind: "handoff"; text: string; checkpoints: number; facts: number; readMs: number }
-  | { kind: "empty"; text: string; facts: number; readMs: number }
+  | { kind: "handoff"; text: string; checkpoints: number; facts: number; factsFailed: string | null; readMs: number }
+  | { kind: "empty"; text: string; facts: number; factsFailed: string | null; readMs: number }
   | { kind: "refused"; text: string; reason: string }
 
 /** What the chain says about the agent's grants: one is live, at least one was revoked, or nothing valid remains. */
@@ -28,6 +29,8 @@ export interface HandoffDeps {
   checkProject?: (runtime: Runtime, input: { agent: string; cwd: string }) => Promise<ProjectCheck>
   capability?: (runtime: Runtime, agent: string) => Promise<CapabilityState>
   read?: typeof readCheckpoints
+  /** The owner-fact read; defaults to readOwnerFacts. A failure here degrades, never refuses. */
+  readFacts?: typeof readOwnerFacts
   now?: () => number
 }
 
@@ -81,6 +84,8 @@ type ReadOutcome =
   | { status: "failed"; error: unknown }
   | { status: "slow" }
 
+type FactOutcome = { status: "ok"; facts: Awaited<ReturnType<typeof readOwnerFacts>> } | { status: "failed" } | { status: "slow" }
+
 /**
  * The gate order is the security property: the owner-signed project list answers first and a
  * refusal there means zero further reads — no chain call, no server call. Then the chain's own
@@ -114,11 +119,19 @@ export async function buildHandoff(
       (value): ReadOutcome => ({ status: "ok", checkpoints: value.checkpoints }),
       (error): ReadOutcome => ({ status: "failed", error }),
     )
+    // The owner-fact read shares the deadline but degrades, never refuses: a failure here means a
+    // handoff with facts: 0 and a stable code for the daemon log — unlike a checkpoint failure.
+    const factSettled = (deps.readFacts ?? readOwnerFacts)(runtime, agent).then(
+      (facts): FactOutcome => ({ status: "ok", facts }),
+      (): FactOutcome => ({ status: "failed" }),
+    )
     let timer: ReturnType<typeof setTimeout> | undefined
-    const slow = new Promise<ReadOutcome>((resolve) => {
-      timer = setTimeout(() => resolve({ status: "slow" }), deps.limitMs ?? HANDOFF_READ_LIMIT_MS)
+    const limitMs = deps.limitMs ?? HANDOFF_READ_LIMIT_MS
+    const slow = new Promise<ReadOutcome | FactOutcome>((resolve) => {
+      timer = setTimeout(() => resolve({ status: "slow" }), limitMs)
     })
-    const outcome = await Promise.race([settled, slow])
+    const outcome = (await Promise.race([settled, slow])) as ReadOutcome
+    const factOutcome = (await Promise.race([factSettled, slow])) as FactOutcome
     clearTimeout(timer)
     const readMs = now() - readStarted
 
@@ -131,13 +144,16 @@ export async function buildHandoff(
       }
       return refused("read-failed", noContextText("read-failed"))
     }
+    const facts = factOutcome.status === "ok" ? factOutcome.facts : []
+    const factsFailed = factOutcome.status === "ok" ? null : factOutcome.status === "slow" ? "facts-read-slow" : "facts-read-failed"
     const merged = mergeCheckpoints(outcome.checkpoints)
-    if (merged === null) return { kind: "empty", text: EMPTY_TEXT, facts: 0, readMs }
+    if (merged === null) return { kind: "empty", text: EMPTY_TEXT, facts: facts.length, factsFailed, readMs }
     return {
       kind: "handoff",
-      text: renderHandoff(merged, { authorNames: input.authorNames }),
+      text: renderHandoff(merged, { authorNames: input.authorNames, facts: facts.map((fact) => fact.text) }),
       checkpoints: outcome.checkpoints.length,
-      facts: 0, // owner facts land in Task 5
+      facts: facts.length,
+      factsFailed,
       readMs,
     }
   } catch {

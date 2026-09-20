@@ -6,6 +6,7 @@ import { SOCKET_FILE, callDaemon, socketPathFor } from "./control.js"
 import { drainUntilSettled } from "./drain.js"
 import type { DrainDeps, DrainResult } from "./drain.js"
 import { buildHandoff } from "./handoff.js"
+import type { HandoffDeps } from "./handoff.js"
 import { FLUSH_EVENTS } from "./hook.js"
 import type { MidaHome } from "./home.js"
 import { isSafeName, listJobs } from "./queue.js"
@@ -47,6 +48,8 @@ export interface DaemonDeps {
   staleCheckMs?: number
   /** /handoff's read budget; default 7.5 s so the answer beats the hook's 8 s client timeout. */
   handoffLimitMs?: number
+  /** Gate overrides for /handoff — tests inject fakes here; production leaves it unset. */
+  handoffDeps?: Partial<HandoffDeps>
 }
 
 export interface DaemonHandle {
@@ -235,7 +238,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       const result = await buildHandoff(
         runtime,
         { agent, cwd, authorNames: authorNamesFor(runtime) },
-        { limitMs: deps.handoffLimitMs },
+        { ...deps.handoffDeps, limitMs: deps.handoffLimitMs ?? deps.handoffDeps?.limitMs },
       )
       // one stable line per call: codes, names, counts and timings — never request or handoff text
       deps.log({
@@ -245,6 +248,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         reason: result.kind === "refused" ? result.reason : null,
         checkpoints: result.kind === "handoff" ? result.checkpoints : 0,
         facts: result.kind === "refused" ? 0 : result.facts,
+        factsFailed: result.kind === "refused" ? null : result.factsFailed,
         readMs: result.kind === "refused" ? null : result.readMs,
         ms: deps.now() - started,
       })

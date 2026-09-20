@@ -8,16 +8,22 @@ import { MidaHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeCode, uninstallCodex } from "./install.js"
 import type { InstallTool } from "./install.js"
-import { Runtime } from "./runtime.js"
+import { attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
+import { Runtime, NAMESPACE } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
 
-const AGENTS = ["claude-code", "codex"]
+/** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. */
+const AGENTS = ["claude-code", "codex", "assistant"]
+/** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. Only the real tools can be installed or doctored. */
+const INSTALL_TOOLS = ["claude-code", "codex"]
 const WITH_AGENT = ["request", "approve", "save-demo", "read", "revoke"]
-const WITH_PROJECT = ["save-demo", "read"]
-export const USAGE = "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | revoke <agent>   (tool/agent = claude-code | codex)"
+const WITH_PROJECT = ["save-demo"]
+export const USAGE =
+  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent>" +
+  "   (tool = claude-code | codex; agent = claude-code | codex | assistant — assistant is a stand-in for any other assistant you use)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
-export const CLI_COMMANDS: readonly string[] = ["init", ...WITH_AGENT]
+export const CLI_COMMANDS: readonly string[] = ["init", "remember", ...WITH_AGENT]
 
 export interface CliDeps {
   home: MidaHome
@@ -51,13 +57,18 @@ export async function runCliWithRuntime(
   /** `cwd` is the folder the command ran in — `approve` adds its project to the owner's list. */
   context?: { cwd?: string },
 ): Promise<number> {
-  const [command = "", agent = "", projectId = ""] = argv
+  const [command = ""] = argv
+  const asFlag = command === "read" && argv[1] === "--as"
+  const agent = asFlag ? (argv[2] ?? "") : (argv[1] ?? "")
+  const projectId = argv[2] ?? ""
   const usage = () => {
     print(USAGE)
     return 2
   }
-  if (command !== "init" && !WITH_AGENT.includes(command)) return usage()
+  if (command !== "init" && command !== "remember" && !WITH_AGENT.includes(command)) return usage()
+  if (command === "remember" && argv.slice(1).join(" ").trim().length === 0) return usage()
   if (WITH_AGENT.includes(command) && !AGENTS.includes(agent)) return usage()
+  if (command === "read" && !asFlag && projectId.length === 0) return usage()
   if (WITH_PROJECT.includes(command) && projectId.length === 0) return usage()
 
   try {
@@ -65,6 +76,10 @@ export async function runCliWithRuntime(
       const result = await init(runtime, AGENTS)
       print(`owner ${result.owner}`)
       for (const [name, agentId] of Object.entries(result.agents)) print(`agent ${name} ${agentId}`)
+    } else if (command === "remember") {
+      const result = await remember(runtime, argv.slice(1).join(" "))
+      print(result.kind === "remembered" ? `remembered ${result.contextId} in ${result.namespace}` : `refused: ${result.code}`)
+      return result.kind === "remembered" ? 0 : 1
     } else if (command === "request") {
       print(`requested ${agent} ${(await requestAccess(runtime, agent)).requestId}`)
     } else if (command === "approve") {
@@ -89,12 +104,23 @@ export async function runCliWithRuntime(
       })
       print(`saved ${result.contextId} tx ${result.transactionHash} in ${result.milliseconds} ms`)
     } else if (command === "read") {
-      const result = await readCheckpoints(runtime, agent, projectId)
-      print(`read ${result.checkpoints.length} checkpoint(s) in ${result.milliseconds} ms`)
-      const authorNames = authorNamesFor(runtime)
-      for (const checkpoint of result.checkpoints) {
-        const author = authorNames[checkpoint.authorId.toLowerCase()] ?? "unknown agent"
-        print(`  ${checkpoint.contextId} written by ${author} (on-chain author ${checkpoint.authorId.slice(0, 10)}…)`)
+      if (asFlag) {
+        // `mida read --as <agent>`: what this agent can see, through the real protocol — the owner
+        // facts its grants cover, then a real `projects.current` attempt whose answer (or refusal
+        // code) comes from the server, never a local pre-check.
+        const facts = await readOwnerFacts(runtime, agent)
+        print("What you have told Mida about yourself")
+        for (const fact of facts) print(`  ${fact.text}`)
+        const attempt = await attemptNamespaceRead(runtime, agent, NAMESPACE)
+        print(attempt.ok ? `${NAMESPACE}: read ${attempt.objects} object(s)` : `${NAMESPACE}: refused ${attempt.code}`)
+      } else {
+        const result = await readCheckpoints(runtime, agent, projectId)
+        print(`read ${result.checkpoints.length} checkpoint(s) in ${result.milliseconds} ms`)
+        const authorNames = authorNamesFor(runtime)
+        for (const checkpoint of result.checkpoints) {
+          const author = authorNames[checkpoint.authorId.toLowerCase()] ?? "unknown agent"
+          print(`  ${checkpoint.contextId} written by ${author} (on-chain author ${checkpoint.authorId.slice(0, 10)}…)`)
+        }
       }
     } else {
       const result = await revoke(runtime, agent)
@@ -169,7 +195,7 @@ async function main(): Promise<void> {
     // whether the daemon is even up — running it through the socket would report on nothing.
     if (argv[0] === "install" || argv[0] === "uninstall") {
       const tool = argv[1] ?? ""
-      if (argv.length !== 2 || !AGENTS.includes(tool)) {
+      if (argv.length !== 2 || !INSTALL_TOOLS.includes(tool)) {
         print(USAGE)
         process.exitCode = 2
         return
@@ -204,7 +230,7 @@ async function main(): Promise<void> {
       }
       if (argv[1] === "--live") {
         const tool = argv[2] ?? ""
-        if (argv.length !== 3 || !AGENTS.includes(tool)) {
+        if (argv.length !== 3 || !INSTALL_TOOLS.includes(tool)) {
           print(USAGE)
           process.exitCode = 2
           return

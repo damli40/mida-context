@@ -109,6 +109,28 @@ describe("renderHandoff", () => {
     expect(text).toContain("- claude-code (on-chain author 0xclaudeau…)")
     expect(text).not.toContain("claims")
   })
+  it("renders owner facts under the exact heading, one per line — and no section when there are none", () => {
+    const withFacts = renderHandoff(base, { facts: ["answers in lowercase", "prefers pnpm"] })
+    expect(withFacts).toContain("What you have told Mida about yourself")
+    expect(withFacts).toContain("- answers in lowercase")
+    expect(withFacts).toContain("- prefers pnpm")
+    // the section sits ahead of progress: facts are kept while progress is trimmed
+    expect(withFacts.indexOf("What you have told Mida about yourself")).toBeLessThan(withFacts.indexOf("Progress:"))
+    for (const option of [{}, { facts: [] as string[] }]) {
+      expect(renderHandoff(base, option)).not.toContain("What you have told Mida about yourself")
+    }
+  })
+  it("under the limit keeps request, plan and every fact — progress is what shrinks (A14)", () => {
+    const facts = Array.from({ length: 20 }, (_, i) => `fact ${i} ${"f".repeat(200)}`)
+    const progress = Array.from({ length: 300 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
+    const text = renderHandoff({ ...base, progress }, { facts })
+    expect(text.length).toBeLessThanOrEqual(8000)
+    for (const fact of facts) expect(text).toContain(fact)
+    expect(text).toContain(base.originalRequest!)
+    expect(text).toContain("- 2. wire it")
+    expect(text).toMatch(/\(\d+ earlier progress entries left out\)/)
+    expect(text).not.toContain("progress entry number 0 ")
+  })
   it("says so plainly when nothing but progress could be cut and it still does not fit", () => {
     const text = renderHandoff({ ...base, originalRequest: "r".repeat(6000), decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i} ${"y".repeat(150)}`, rationale: "z".repeat(150) })) })
     expect(text).toContain("r".repeat(6000))

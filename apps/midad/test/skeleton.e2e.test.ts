@@ -74,11 +74,12 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     await expect(readCheckpoints(runtime, "codex", "proj-1")).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
   })
 
-  step("4. the owner approves claude-code with exactly read + add + replace-own", async () => {
+  step("4. the owner approves claude-code with the policy's whole expected grant in one batch", async () => {
     await requestAccess(runtime, "claude-code")
     const approval = await approve(runtime, "claude-code")
-    expect(approval.capabilityIds).toHaveLength(1)
-    expect(approval.permissions).toEqual([AGENT_PERMISSIONS])
+    // policy order: profile.skills READ, projects.current READ|CREATE|SUPERSEDE_OWN, preferences.communication READ
+    expect(approval.capabilityIds).toHaveLength(3)
+    expect(approval.permissions).toEqual([PERMISSION.READ, AGENT_PERMISSIONS, PERMISSION.READ])
     expect(approval.transactionHash).toMatch(/^0x[0-9a-f]{64}$/)
     transactions.grantClaudeCode = approval.transactionHash!
     grantGasUsed = approval.gasUsed.toString()
@@ -98,7 +99,7 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     await runtime.close()
     runtime = await Runtime.open(home, network)
     const approval = await approve(runtime, "codex")
-    expect(approval.permissions).toEqual([AGENT_PERMISSIONS])
+    expect(approval.permissions).toEqual([PERMISSION.READ, AGENT_PERMISSIONS, PERMISSION.READ])
     transactions.grantCodex = approval.transactionHash!
   })
 

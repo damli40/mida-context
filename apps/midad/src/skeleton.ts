@@ -1,13 +1,16 @@
 import { privateKeyToAccount } from "viem/accounts"
-import { MidaError, PERMISSION, PROVENANCE_POLICY, isMidaError, namespaceId } from "@mida/protocol"
-import type { AccessRequest, Address, Hex } from "@mida/protocol"
+import { MidaError, PERMISSION, decodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
+import type { AccessRequest, Address, Hex, PurposeId, RequestedScope } from "@mida/protocol"
 import { capabilityRegistryAbi, createWriteContext } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { provisionAgent } from "@mida/fake-vault"
+import { POLICY_DOCUMENT_V1, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
+import type { ScopeInput } from "@mida/grant-advisor"
 import type { StoredCheckpoint } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
-import { AGENT_PERMISSIONS, NAMESPACE, PURPOSE_ID } from "./runtime.js"
+import { NAMESPACE, PURPOSE_ID } from "./runtime.js"
 import type { Runtime } from "./runtime.js"
+import { FACT_NAMESPACES } from "./remember.js"
 import { unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import { FileAccessRequestStore } from "./request-store.js"
@@ -43,6 +46,61 @@ async function hasAnyLiveCapability(runtime: Runtime, agentId: Hex): Promise<boo
 const GRANT_LIFETIME_SECONDS = 30 * 24 * 60 * 60
 const NAMESPACE_ID = namespaceId(NAMESPACE)
 
+/**
+ * The grant an agent asks for is read off the grant-advisor policy's `expected` list for its
+ * purpose — never a second copy of the namespace list here. For `project_assistance` that is
+ * READ on `profile.skills` and `preferences.communication` plus READ+CREATE+SUPERSEDE_OWN on
+ * `projects.current`; for `general_assistance` the two READs only.
+ */
+export function expectedScopesFor(purposeId: PurposeId): ScopeInput[] {
+  return POLICY_DOCUMENT_V1.purposes[purposeId].expected.map((entry) => ({
+    namespace: entry.namespace,
+    permissions: permissionBits(entry.permissions),
+    provenancePolicy: provenancePolicyBits(entry.provenancePolicies),
+  }))
+}
+
+/**
+ * The policy's expected scopes that the chain does NOT currently authorize for this owner–agent
+ * pair, as exact (namespaceId, permissions, provenancePolicy) tuples. This is the upgrade path's
+ * diff: an agent holding the old single `projects.current` grant is missing exactly the two
+ * READ scopes, and only those are asked for.
+ */
+async function missingExpectedScopes(runtime: Runtime, agentId: Hex, purposeId: PurposeId): Promise<RequestedScope[]> {
+  const missing: RequestedScope[] = []
+  for (const scope of expandScopeInputs(expectedScopesFor(purposeId))) {
+    if (!(await runtime.reader.hasAuthority(runtime.owner, agentId, scope.namespaceId, scope.permissions, scope.provenancePolicy))) {
+      missing.push(scope)
+    }
+  }
+  return missing
+}
+
+/** A signed scope that the chain no longer authorizes — the still-needed part of a pending request. */
+async function ungrantedScopes(runtime: Runtime, agentId: Hex, scopes: readonly RequestedScope[]): Promise<RequestedScope[]> {
+  const needed: RequestedScope[] = []
+  for (const scope of scopes) {
+    if (!(await runtime.reader.hasAuthority(runtime.owner, agentId, scope.namespaceId, scope.permissions, scope.provenancePolicy))) {
+      needed.push(scope)
+    }
+  }
+  return needed
+}
+
+/** The agent names `mida init` knows: the two coding tools and the least-context stand-in. */
+export function purposeFor(name: string): PurposeId {
+  return name === "assistant" ? "general_assistance" : PURPOSE_ID
+}
+
+/** The manifest's scope declarations are the same policy `expected` list the grant comes from. */
+function declarationsFor(purposeId: PurposeId) {
+  return POLICY_DOCUMENT_V1.purposes[purposeId].expected.map((entry) => ({
+    namespace: entry.namespace,
+    permissions: [...entry.permissions],
+    provenancePolicies: [...entry.provenancePolicies],
+  }))
+}
+
 /** Spec §5A. Every step first asks the chain or the disk whether it is already done, so running it twice is harmless. */
 export async function init(runtime: Runtime, agentNames: readonly string[]): Promise<{ owner: Address; agents: Record<string, Hex> }> {
   const { home, network, vault, reader, owner } = runtime
@@ -57,7 +115,11 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
   await runtime.ensureFunded(owner)
   const ownerKey = await reader.ownerP256Key(owner)
   if (ownerKey == null || ownerKey.qx === 0n) await vault.registerOwnerKey()
-  if ((await reader.epochPublicKey(owner, NAMESPACE_ID, 1n)) == null) await vault.initializeNamespace(NAMESPACE)
+  // The checkpoint namespace plus the two owner-fact namespaces (A14) — opened before any grant so
+  // the first approved agent's reader wraps exist before a fact can be written.
+  for (const ns of [NAMESPACE, ...FACT_NAMESPACES]) {
+    if ((await reader.epochPublicKey(owner, namespaceId(ns), 1n)) == null) await vault.initializeNamespace(ns)
+  }
 
   const operatorAccount = privateKeyToAccount(loadOrCreateOperatorSecrets(home).privateKey)
   const operator = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: operatorAccount })
@@ -76,8 +138,8 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
       const provisioned = await provisionAgent({
         operator,
         name,
-        purposeId: PURPOSE_ID,
-        declarations: [{ namespace: NAMESPACE, permissions: ["READ", "CREATE", "SUPERSEDE_OWN"], provenancePolicies: ["ALLOW_INFERENCE"] }],
+        purposeId: purposeFor(name),
+        declarations: declarationsFor(purposeFor(name)),
         callbackOrigin: `https://${name}.mida.example`,
         signer: privateKeyToAccount(signerPrivateKey),
       })
@@ -88,20 +150,37 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
     // An idempotent PUT, run for every agent on every init: a manifest upload lost to a crash is retried here.
     await runtime.ownerApi.putAgentManifest(identity.manifest)
     await runtime.ensureFunded(privateKeyToAccount(identity.signerPrivateKey).address)
+    // `assistant` never joins a project, so there is no request/approve round-trip for it: the owner
+    // grants its whole READ-only policy grant at init. Missing scopes only — a re-run sends nothing.
+    if (identity.purposeId === "general_assistance") {
+      const missing = await missingExpectedScopes(runtime, identity.agentId, identity.purposeId)
+      if (missing.length > 0) {
+        const request = await runtime.agent(name).createAccessRequest({
+          purposeId: identity.purposeId,
+          scopes: missing.map((s) => ({ namespace: namespaceById(s.namespaceId).name, permissions: s.permissions, provenancePolicy: s.provenancePolicy })),
+          capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
+        })
+        const approval = await vault.approveGrant({ accessRequest: request, manifest: identity.manifest, selection: { kind: "recommended" } })
+        const agent = runtime.agent(name)
+        await agent.completeAccessRequest(request, approval.response)
+        saveGrants(home, name, [...agent.grants])
+      }
+    }
     agents[name] = identity.agentId
   }
   return { owner, agents }
 }
 
-/** Spec §5B step 1: the agent asks. The request is on disk before this returns, and so is which request is pending. */
+/** Spec §5B step 1: the agent asks for the policy's whole recommended grant for its purpose. The request is on disk before this returns, and so is which request is pending. */
 export async function requestAccess(runtime: Runtime, name: string): Promise<{ requestId: Hex }> {
   const identity = loadAgentIdentity(runtime.home, name)
   if (identity !== undefined && (await hasAnyLiveCapability(runtime, identity.agentId))) {
     throw new Error(`agent "${name}" is already approved`)
   }
+  const purposeId = identity?.purposeId ?? PURPOSE_ID
   const request = await runtime.agent(name).createAccessRequest({
-    purposeId: PURPOSE_ID,
-    scopes: [{ namespace: NAMESPACE, permissions: AGENT_PERMISSIONS, provenancePolicy: PROVENANCE_POLICY.ALLOW_INFERENCE }],
+    purposeId,
+    scopes: expectedScopesFor(purposeId),
     capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
   })
   runtime.home.writeSecretJson(`agents/${name}/pending-request.json`, { request })
@@ -120,32 +199,67 @@ export async function approve(
   // transaction can go out. The list entry itself is written only after the grant succeeds.
   if (cwd !== undefined) ensureProjectMarker(cwd)
   const identity = loadAgentIdentity(home, name)
-  if (cwd !== undefined && identity !== undefined && (await hasAnyLiveCapability(runtime, identity.agentId))) {
-    // a second project for an already-approved agent needs no new grant — only the list row
-    const listed = await approveProject(runtime, { agent: name, cwd })
-    return { capabilityIds: [], permissions: [], transactionHash: null, gasUsed: 0n, projectId: listed.projectId }
+  if (identity === undefined) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
+
+  // The policy's expected grant minus what the CHAIN says is already live. An agent approved under
+  // the old single `projects.current` scope (an M1 home) is missing exactly the two READ scopes —
+  // those, and only those, get asked for below.
+  const missing = await missingExpectedScopes(runtime, identity.agentId, identity.purposeId)
+  const live = await hasAnyLiveCapability(runtime, identity.agentId)
+  let pending = home.readJson<{ request: AccessRequest }>(`agents/${name}/pending-request.json`)
+
+  if (pending === undefined) {
+    if (missing.length === 0) {
+      if (!live) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
+      // a second project for an already-approved agent needs no new grant — only the list row.
+      // `assistant` is never listed: it gets no project approval, ever.
+      if (cwd !== undefined && identity.purposeId === PURPOSE_ID) {
+        const listed = await approveProject(runtime, { agent: name, cwd })
+        return { capabilityIds: [], permissions: [], transactionHash: null, gasUsed: 0n, projectId: listed.projectId }
+      }
+      throw new Error(`agent "${name}" is already approved`)
+    }
+    if (!live) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
+    // The upgrade path: the agent holds part of the grant (a live capability exists) and no request
+    // is pending — sign one for exactly the scopes the chain says are missing, then approve it below.
+    const request = await runtime.agent(name).createAccessRequest({
+      purposeId: identity.purposeId,
+      scopes: missing.map((s) => ({ namespace: namespaceById(s.namespaceId).name, permissions: s.permissions, provenancePolicy: s.provenancePolicy })),
+      capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
+    })
+    home.writeSecretJson(`agents/${name}/pending-request.json`, { request })
+    pending = { request }
   }
-  const pending = home.readJson<{ request: AccessRequest }>(`agents/${name}/pending-request.json`)
-  if (identity === undefined || pending === undefined) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
+
   const stored = await new FileAccessRequestStore(home, name).load(pending.request.requestId)
   if (stored === undefined || stored.consumed) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
-  if (await hasAnyLiveCapability(runtime, identity.agentId)) {
-    throw new Error(`agent "${name}" is already approved`)
-  }
+  // Only what the chain does not already authorize is granted — a request whose scopes are all live
+  // mints nothing, so a second approve sends no transaction.
+  const needed = await ungrantedScopes(runtime, identity.agentId, pending.request.scopes)
+  if (needed.length === 0) throw new Error(`agent "${name}" is already approved`)
   // A READ grant that expired closes the namespace's write epoch (§7.3): grantBatch reverts
   // EpochRotationRequired until the owner rotates it, and every surviving reader then needs a wrap
-  // for the new epoch — so the rotation is followed by the same repair pass a revoke runs.
-  const epochStillOpen = await reader.isWriteEpochValid(owner, NAMESPACE_ID, await reader.requiredReadEpoch(owner, NAMESPACE_ID))
-  if (!epochStillOpen) await vault.rotateExpiredEpoch(NAMESPACE_ID)
-  const approval = await vault.approveGrant({ accessRequest: pending.request, manifest: identity.manifest, selection: { kind: "recommended" } })
+  // for the new epoch — so each rotated namespace is followed by the same repair pass a revoke runs.
+  const rotated: Hex[] = []
+  for (const nsId of [...new Set(needed.map((s) => s.namespaceId))]) {
+    if (!(await reader.isWriteEpochValid(owner, nsId, await reader.requiredReadEpoch(owner, nsId)))) {
+      await vault.rotateExpiredEpoch(nsId)
+      rotated.push(nsId)
+    }
+  }
+  const approval = await vault.approveGrant({
+    accessRequest: pending.request,
+    manifest: identity.manifest,
+    selection: { kind: "custom", scopes: needed, expiresAt: decodeUint64(pending.request.capabilityExpiresAt) },
+  })
   const agent = runtime.agent(name)
   const grant = await agent.completeAccessRequest(pending.request, approval.response)
   saveGrants(home, name, [...agent.grants])
-  if (!epochStillOpen) await repairReaderWraps(runtime)
+  if (rotated.length > 0) await repairReaderWraps(runtime, rotated)
   // A marker left by an earlier revoke must not outlive a fresh approval.
   home.remove(`agents/${name}/revoked.json`)
   home.remove(`agents/${name}/pending-request.json`)
-  const listed = cwd === undefined ? undefined : await approveProject(runtime, { agent: name, cwd })
+  const listed = cwd === undefined || identity.purposeId !== PURPOSE_ID ? undefined : await approveProject(runtime, { agent: name, cwd })
   return {
     capabilityIds: grant.capabilities.map((capability) => capability.capabilityId),
     permissions: grant.capabilities.map((capability) => capability.permissions),
@@ -330,7 +444,10 @@ async function resolveAgentId(runtime: Runtime, name: string): Promise<Hex> {
   throw new Error(`agent "${name}" cannot be identified: identity.json, grants.json and a registered signer.json are all missing or unreadable under agents/${name}/`)
 }
 
-export async function repairReaderWraps(runtime: Runtime): Promise<string[]> {
+export async function repairReaderWraps(
+  runtime: Runtime,
+  namespaceIds: readonly Hex[] = [NAMESPACE_ID, ...FACT_NAMESPACES.map((ns) => namespaceId(ns))],
+): Promise<string[]> {
   const { home, vault, reader, owner } = runtime
   const rewrapped: string[] = []
   for (const name of listAgentNames(home)) {
@@ -338,9 +455,13 @@ export async function repairReaderWraps(runtime: Runtime): Promise<string[]> {
     let identity: ReturnType<typeof loadAgentIdentity>
     try { identity = loadAgentIdentity(home, name) } catch { continue }
     if (identity === undefined) continue
-    if (!(await reader.hasAuthority(owner, identity.agentId, NAMESPACE_ID, PERMISSION.READ, 0))) continue
-    await vault.publishReaderWraps({ agentId: identity.agentId, namespaceId: NAMESPACE_ID })
-    rewrapped.push(name)
+    let got = false
+    for (const nsId of namespaceIds) {
+      if (!(await reader.hasAuthority(owner, identity.agentId, nsId, PERMISSION.READ, 0))) continue
+      await vault.publishReaderWraps({ agentId: identity.agentId, namespaceId: nsId })
+      got = true
+    }
+    if (got) rewrapped.push(name)
   }
   return rewrapped
 }

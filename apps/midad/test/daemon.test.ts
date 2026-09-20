@@ -214,6 +214,33 @@ describe("startDaemon", () => {
     }
   })
 
+  it("POST /handoff logs a stable facts-failed code when the owner-fact read fails but the handoff still answers", async () => {
+    const { home, deps, stubRuntime, logs } = setup()
+    const daemon = await startDaemon({
+      ...deps,
+      openRuntime: async () => ({ ...stubRuntime, home }) as Runtime,
+      handoffDeps: {
+        checkProject: async () => ({ ok: true, approval: { agent: "codex", projectId: "p1", root: "/tmp/work", approvedAt: "2026-09-21T00:00:00.000Z" } }),
+        capability: async () => "live",
+        read: async () => ({ checkpoints: [], skipped: 0, milliseconds: 1 }),
+        readFacts: async () => {
+          throw new Error("server went away")
+        },
+      },
+    })
+    try {
+      const reply = await callDaemon(home, "/handoff", { agent: "codex", cwd: "/tmp/work" }, { timeoutMs: 2_000 })
+      expect(reply.status).toBe(200)
+      // a failed fact read is a degraded handoff, never a refusal
+      expect(reply.body).toMatchObject({ kind: "empty", facts: 0, factsFailed: "facts-read-failed" })
+      const entry = logs.find((e) => (e as { event?: string }).event === "handoff")!
+      expect(entry).toMatchObject({ agent: "codex", kind: "empty", facts: 0, factsFailed: "facts-read-failed" })
+      expect(JSON.stringify(entry)).not.toContain("server went away")
+    } finally {
+      await daemon.close()
+    }
+  })
+
   it("POST /handoff refuses an unsafe agent name and logs null for it, never the name", async () => {
     const { home, deps, stubRuntime, logs } = setup()
     const daemon = await startDaemon({

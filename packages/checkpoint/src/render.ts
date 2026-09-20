@@ -46,7 +46,10 @@ function defuse(text: string): string {
     .join("\n")
 }
 
-export function renderHandoff(merged: MergedHandoff, options: { maxChars?: number; authorNames?: Record<string, string> } = {}): string {
+export function renderHandoff(
+  merged: MergedHandoff,
+  options: { maxChars?: number; authorNames?: Record<string, string>; facts?: string[] } = {},
+): string {
   const maxChars = options.maxChars ?? 8000
   const cut = (s: string, n = 300) => (s.length > n ? s.slice(0, n - 1) + "…" : s)
   const list = (title: string, items: string[]): string | null =>
@@ -83,6 +86,11 @@ export function renderHandoff(merged: MergedHandoff, options: { maxChars?: numbe
     push(list("Rejected approaches", merged.rejected.map((r) => `${defuse(r.approach)} — ${defuse(r.why)}`)))
     push(list("Constraints", merged.constraints))
     push(list("Artifacts", merged.artifacts))
+    // Facts the owner told Mida once, kept ahead of progress: under the size limit the original
+    // request and plan are preserved first, then every fact, and progress is what gets trimmed.
+    if (options.facts !== undefined && options.facts.length > 0) {
+      parts.push(`What you have told Mida about yourself\n${options.facts.map((f) => `- ${defuse(f)}`).join("\n")}`)
+    }
     if (merged.progress.length > 0) {
       const lines = merged.progress.slice(dropped).map((p) => `- ${cut(defuse(p))}`)
       if (dropped > 0) lines.unshift(`- (${dropped} earlier progress entries left out)`)

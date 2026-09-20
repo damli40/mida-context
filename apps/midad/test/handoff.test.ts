@@ -29,7 +29,7 @@ const stored = (cp: Partial<Checkpoint> = {}, over: Partial<StoredCheckpoint> = 
  * is observable. `read` resolves empty by default; tests override the one gate under test.
  */
 function deps(over: Partial<HandoffDeps> = {}) {
-  const calls = { checkProject: 0, capability: 0, read: 0 }
+  const calls = { checkProject: 0, capability: 0, read: 0, readFacts: 0 }
   const d: HandoffDeps = {
     checkProject: async (r, i) => {
       calls.checkProject += 1
@@ -42,6 +42,10 @@ function deps(over: Partial<HandoffDeps> = {}) {
     read: async (r, n, p) => {
       calls.read += 1
       return (over.read ?? (async () => ({ checkpoints: [], skipped: 0, milliseconds: 1 })))(r, n, p)
+    },
+    readFacts: async (r, n) => {
+      calls.readFacts += 1
+      return (over.readFacts ?? (async () => []))(r, n)
     },
     limitMs: over.limitMs,
     now: over.now,
@@ -57,7 +61,7 @@ describe("buildHandoff", () => {
       const { calls, d } = deps({ checkProject: async () => ({ ok: false, reason }) })
       const result = await buildHandoff(runtime, input, d)
       expect(result.kind).toBe("refused")
-      expect(calls).toEqual({ checkProject: 1, capability: 0, read: 0 })
+      expect(calls).toEqual({ checkProject: 1, capability: 0, read: 0, readFacts: 0 })
     }
   })
 
@@ -215,6 +219,34 @@ describe("buildHandoff", () => {
     await new Promise((resolve) => setTimeout(resolve, 250))
   })
 
+  it("owner facts render under the exact heading; a failed fact read degrades to facts: 0 with a stable code", async () => {
+    const fact = { text: "answers in lowercase", contextId: `0x${"7".repeat(64)}` as `0x${string}`, namespace: "preferences.communication", assertedAt: "2026-09-21T10:00:00.000Z" }
+    const withFacts = await buildHandoff(
+      runtime,
+      input,
+      deps({ read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1 }), readFacts: async () => [fact] }).d,
+    )
+    expect(withFacts.kind).toBe("handoff")
+    if (withFacts.kind !== "handoff") return
+    expect(withFacts.facts).toBe(1)
+    expect(withFacts.factsFailed).toBeNull()
+    expect(withFacts.text).toContain("What you have told Mida about yourself")
+    expect(withFacts.text).toContain("- answers in lowercase")
+
+    // a fact read that throws — other than "no grant" — never sinks the handoff (A14)
+    const { d } = deps({
+      read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1 }),
+      readFacts: async () => {
+        throw new Error("server went away")
+      },
+    })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.facts).toBe(0)
+    expect(result.factsFailed).toBe("facts-read-failed")
+    expect(result.text).not.toContain("What you have told Mida about yourself")
+  })
   it("an approved agent with nothing saved gets the empty line — not a refusal", async () => {
     const { d } = deps()
     const result = await buildHandoff(runtime, input, d)
@@ -222,6 +254,7 @@ describe("buildHandoff", () => {
       kind: "empty",
       text: "Mida: connected. Nothing has been saved for this project yet.",
       facts: 0,
+      factsFailed: null,
       readMs: expect.any(Number),
     })
   })
