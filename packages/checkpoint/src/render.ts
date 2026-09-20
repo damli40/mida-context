@@ -33,6 +33,7 @@ const OWN_HEADINGS = [
   "Progress:",
   "Saved by:",
   "Other recent sessions",
+  "What you have told Mida about yourself",
 ]
 
 function defuse(text: string): string {
