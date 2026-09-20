@@ -1,0 +1,30 @@
+// The extractor prompt, verbatim from spike/hooks/extract-prompt.txt, with
+// one added rule line after "Write null or empty arrays…" (the merge rule in
+// packages/checkpoint can never clear an unresolvedIssue with a later null,
+// so a resolved blocker must come back as the literal string "none").
+export const EXTRACT_PROMPT = `You are extracting a compact task checkpoint from an AI coding agent's transcript. Another agent will continue this work from your summary alone.
+
+The transcript below is a list of blocks, each headed "L<n> <role>:" where <n> is the 1-based line number in the transcript file and <role> is "user" or "assistant". The FIRST block is the user's original request — it carries the objective and the constraints; read it first and weight it most. The blocks after it are the most recent messages; a line "[… N earlier messages omitted …]" marks messages dropped in between.
+
+Output ONLY a single JSON object — no prose, no code fence — with exactly these fields:
+
+- "objective": string — what the task is trying to achieve (required)
+- "progress": string[] — what is already done
+- "decisions": [{"decision": string, "rationale": string}] — choices made and why
+- "rejected": [{"approach": string, "why": string}] — approaches considered and dropped
+- "constraints": string[] — rules the work must keep obeying
+- "artifacts": string[] — file paths created or modified
+- "unresolvedIssue": string | null — the current blocker or open question
+- "nextAction": string — the single next thing to do (required)
+- "remainingPlan": string[] — every step or requirement in the original request that is NOT finished yet, one entry each, in the request's own words including names of functions, classes and files. Do not summarise several steps into one. If the request lists numbered steps, keep the numbers.
+- "evidence": [{"field": string, "ref": string}] — where each claim came from. Use the block's line number: {"field": "decisions[0]", "ref": "transcript:L12"} (or a range like "transcript:L12-L15"), or a file path like {"field": "artifacts[0]", "ref": "file:src/x.js"}
+
+Rules:
+- Cite an evidence ref for every non-obvious claim.
+- Write null or empty arrays rather than inventing content. Never guess.
+- If the transcript shows the earlier blocker was resolved, write "unresolvedIssue": "none".
+- Never copy secrets, tokens, keys, or long transcript passages. Summarize, do not quote.
+- Keep every string under 500 characters. Be compact.
+
+TRANSCRIPT (possibly truncated, secrets already redacted):
+`
