@@ -12,7 +12,9 @@
     "contracts:policy-hash": "node contracts/script/gen-policy-hash.mjs",
     "vectors:webauthn": "tsx packages/protocol/scripts/export-webauthn-fixture.ts",
     "chain:abis": "node packages/chain/scripts/gen-abis.mjs",
-    "mida": "node --env-file=.env --import tsx apps/midad/src/cli.ts"
+    "mida": "node --env-file=.env --import tsx apps/midad/src/cli.ts",
+    "mida-hook": "node --import tsx apps/midad/src/hook-main.ts",
+    "mida-drain": "node --import tsx apps/midad/src/drain-main.ts"
   },
   "dependencies": {
     "@mida/api": "workspace:*",

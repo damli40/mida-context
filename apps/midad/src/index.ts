@@ -8,3 +8,8 @@ export { init, requestAccess, approve, saveCheckpoint, readCheckpoints, revoke, 
 export * from "./checkpoint-payload.js"
 export { runCli } from "./cli.js"
 export type { CliDeps } from "./cli.js"
+export * from "./queue.js"
+export { FLUSH_EVENTS, runHook } from "./hook.js"
+export type { HookEvent } from "./hook.js"
+export { drainOnce } from "./drain.js"
+export type { DrainDeps, DrainResult } from "./drain.js"

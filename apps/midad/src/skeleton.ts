@@ -25,6 +25,14 @@ const NAMESPACE_ID = namespaceId(NAMESPACE)
 /** Spec §5A. Every step first asks the chain or the disk whether it is already done, so running it twice is harmless. */
 export async function init(runtime: Runtime, agentNames: readonly string[]): Promise<{ owner: Address; agents: Record<string, Hex> }> {
   const { home, network, vault, reader, owner } = runtime
+  // The detached drainer never loads .env; init leaves it the public chain coordinates to read back.
+  // chainId/deploymentBlock are bigints, so they go on disk as decimal strings for parseDeployment.
+  const deployment = network.deployment
+  home.writeSecretJson("network.json", {
+    chainId: Number(deployment.chainId),
+    rpcUrl: network.rpcUrl,
+    deployment: { ...deployment, chainId: deployment.chainId.toString(), deploymentBlock: deployment.deploymentBlock.toString() },
+  })
   await runtime.ensureFunded(owner)
   const ownerKey = await reader.ownerP256Key(owner)
   if (ownerKey == null || ownerKey.qx === 0n) await vault.registerOwnerKey()
