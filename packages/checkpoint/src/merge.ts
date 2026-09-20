@@ -21,11 +21,13 @@ export interface MergedHandoff {
   constraints: string[]
   artifacts: string[]
   progress: string[]
-  provenance: { agent: string; createdAt: string; contextId: string; compiledBy: string }[]
+  // `authorId` is the on-chain author the chain recorded for the record — `agent` is only what
+  // the checkpoint claims, so anything that names who saved must read authorId.
+  provenance: { agent: string; authorId: string; createdAt: string; contextId: string; compiledBy: string }[]
   // Session chains in the same project that were NOT merged in, newest first
   // (max 5) — a throwaway one-question session must not silently replace the
   // real handoff, but it is still surfaced so the reader knows it exists.
-  otherSessions: { sessionId: string; agent: string; lastSavedAt: string; objective: string }[]
+  otherSessions: { sessionId: string; agent: string; authorId: string; lastSavedAt: string; objective: string }[]
   // True when the chosen chain's continuesSession link pointed at a session
   // with no stored checkpoints — the earlier part of the history is gone.
   missingEarlierSession: boolean
@@ -180,13 +182,14 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
     constraints: distinct(cps.flatMap((c) => c.constraints)),
     artifacts: distinct(cps.flatMap((c) => c.artifacts)),
     progress: distinct(cps.flatMap((c) => c.progress)),
-    provenance: scope.map((s) => ({ agent: s.checkpoint.agent, createdAt: s.checkpoint.createdAt, contextId: s.contextId, compiledBy: s.compiledBy })),
+    provenance: scope.map((s) => ({ agent: s.checkpoint.agent, authorId: s.authorId, createdAt: s.checkpoint.createdAt, contextId: s.contextId, compiledBy: s.compiledBy })),
     otherSessions: ordered
       .filter((c) => c !== chosen)
       .slice(0, 5)
       .map((c) => ({
         sessionId: c.newest.sessionId,
         agent: c.newest.checkpoint.agent,
+        authorId: c.newest.authorId,
         lastSavedAt: c.newest.checkpoint.createdAt,
         objective: c.newest.checkpoint.objective,
       })),

@@ -1,7 +1,7 @@
 import { MidaHome } from "./home.js"
 import { Runtime } from "./runtime.js"
 import type { Network } from "./runtime.js"
-import { approve, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
+import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
 
 const AGENTS = ["claude-code", "codex"]
 const WITH_AGENT = ["request", "approve", "save-demo", "read", "revoke"]
@@ -51,7 +51,11 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     } else if (command === "read") {
       const result = await readCheckpoints(runtime, agent, projectId)
       deps.print(`read ${result.checkpoints.length} checkpoint(s) in ${result.milliseconds} ms`)
-      for (const checkpoint of result.checkpoints) deps.print(`  ${checkpoint.contextId} written by ${checkpoint.authorId}`)
+      const authorNames = authorNamesFor(runtime)
+      for (const checkpoint of result.checkpoints) {
+        const author = authorNames[checkpoint.authorId.toLowerCase()] ?? "unknown agent"
+        deps.print(`  ${checkpoint.contextId} written by ${author} (on-chain author ${checkpoint.authorId.slice(0, 10)}…)`)
+      }
     } else {
       const result = await revoke(runtime, agent)
       deps.print(`revoked ${agent} tx ${result.transactionHashes.join(" ")}; new key sent to: ${result.rewrapped.join(", ") || "nobody"}`)

@@ -46,11 +46,19 @@ function defuse(text: string): string {
     .join("\n")
 }
 
-export function renderHandoff(merged: MergedHandoff, options: { maxChars?: number } = {}): string {
+export function renderHandoff(merged: MergedHandoff, options: { maxChars?: number; authorNames?: Record<string, string> } = {}): string {
   const maxChars = options.maxChars ?? 8000
   const cut = (s: string, n = 300) => (s.length > n ? s.slice(0, n - 1) + "…" : s)
   const list = (title: string, items: string[]): string | null =>
     items.length ? `${title}:\n${items.map((i) => `- ${cut(defuse(i))}`).join("\n")}` : null
+  // Who saved each record is decided by the chain's authorId, never by the agent name the
+  // checkpoint claims — the claim is shown only as a quote when it disagrees.
+  const authorName = (authorId: string): string => options.authorNames?.[authorId.toLowerCase()] ?? "unknown agent"
+  const savedBy = (p: MergedHandoff["provenance"][number]): string => {
+    const resolved = authorName(p.authorId)
+    const line = `${defuse(resolved)} (on-chain author ${defuse(p.authorId.slice(0, 10))}…) at ${defuse(p.createdAt)}, compiled by ${defuse(p.compiledBy)}, record ${defuse(p.contextId)}`
+    return resolved === p.agent ? line : `${line} — the checkpoint itself claims "${defuse(p.agent)}"`
+  }
 
   const build = (dropped: number, note: string | null = null): string => {
     const parts: string[] = []
@@ -94,9 +102,7 @@ export function renderHandoff(merged: MergedHandoff, options: { maxChars?: numbe
     if (merged.missingEarlierSession) {
       parts.push("(An earlier session this one continued could not be read.)")
     }
-    push(list("Saved by", merged.provenance.map(
-      (p) => `${defuse(p.agent)} at ${defuse(p.createdAt)}, compiled by ${defuse(p.compiledBy)}, record ${defuse(p.contextId)}`,
-    )))
+    push(list("Saved by", merged.provenance.map(savedBy)))
     if (note !== null) parts.push(note)
     return `${HEAD}\n\n${parts.join("\n\n")}\n\n${TAIL}`
   }

@@ -4,7 +4,7 @@ import { renderHandoff, type MergedHandoff } from "../src/index.js"
 const base: MergedHandoff = { originalRequest: "Build X.\nStep 1 …", objective: "build X", remainingPlan: ["2. wire it"],
   unresolvedIssue: null, nextAction: "wire it", decisions: [{ decision: "sqlite", rationale: "no server" }],
   rejected: [{ approach: "redis", why: "needs a server" }], constraints: ["no timers"], artifacts: ["a.ts"],
-  progress: ["wrote schema"], provenance: [{ agent: "claude-code", createdAt: "2026-09-21T10:00:00Z", contextId: "0xabc", compiledBy: "haiku" }],
+  progress: ["wrote schema"], provenance: [{ agent: "claude-code", authorId: "0xclaudeauthor", createdAt: "2026-09-21T10:00:00Z", contextId: "0xabc", compiledBy: "haiku" }],
   otherSessions: [], missingEarlierSession: false }
 
 describe("renderHandoff", () => {
@@ -30,7 +30,7 @@ describe("renderHandoff", () => {
     const text = renderHandoff({
       ...base,
       otherSessions: [
-        { sessionId: "s9", agent: "codex", lastSavedAt: "2026-09-21T12:00:00Z", objective: "o".repeat(200) },
+        { sessionId: "s9", agent: "codex", authorId: "0xcodexauthor", lastSavedAt: "2026-09-21T12:00:00Z", objective: "o".repeat(200) },
       ],
     })
     expect(text).toContain("Other recent sessions in this project (not included above):")
@@ -75,6 +75,35 @@ describe("renderHandoff", () => {
     expect(text.length).toBeLessThanOrEqual(8000)
     expect(text).toContain("entry 2499")
     expect(text).not.toContain("entry 0 ")
+  })
+  it("names the on-chain author, and quotes the claimed agent only when it disagrees (B11)", () => {
+    const text = renderHandoff(
+      {
+        ...base,
+        provenance: [
+          { agent: "claude-code", authorId: "0xCodexAuthor", createdAt: "2026-09-21T10:00:00Z", contextId: "0xabc", compiledBy: "haiku" },
+        ],
+      },
+      { authorNames: { "0xcodexauthor": "codex" } },
+    )
+    expect(text).toContain("- codex (on-chain author 0xCodexAut…)")
+    expect(text).toContain('claims "claude-code"')
+  })
+  it("an authorId with no local name renders as unknown agent, claim still quoted (B11)", () => {
+    const text = renderHandoff(
+      {
+        ...base,
+        provenance: [{ agent: "claude-code", authorId: "0xNobody", createdAt: "2026-09-21T10:00:00Z", contextId: "0xabc", compiledBy: "haiku" }],
+      },
+      { authorNames: {} },
+    )
+    expect(text).toContain("- unknown agent (on-chain author 0xNobody…)")
+    expect(text).toContain('claims "claude-code"')
+  })
+  it("a matching claim renders plainly, with no self-quote (B11)", () => {
+    const text = renderHandoff(base, { authorNames: { "0xclaudeauthor": "claude-code" } })
+    expect(text).toContain("- claude-code (on-chain author 0xclaudeau…)")
+    expect(text).not.toContain("claims")
   })
   it("says so plainly when nothing but progress could be cut and it still does not fit", () => {
     const text = renderHandoff({ ...base, originalRequest: "r".repeat(6000), decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i} ${"y".repeat(150)}`, rationale: "z".repeat(150) })) })

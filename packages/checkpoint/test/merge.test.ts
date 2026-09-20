@@ -16,6 +16,17 @@ function stored(over: Partial<StoredCheckpoint["checkpoint"]> & { sessionId?: st
 describe("mergeCheckpoints", () => {
   it("returns null for no checkpoints", () => expect(mergeCheckpoints([])).toBeNull())
 
+  it("carries the on-chain authorId into provenance and otherSessions (B11)", () => {
+    const forged = stored({ at: "2026-09-21T10:00:00Z", agent: "claude-code", objective: "o", nextAction: "n", progress: ["did work"] })
+    forged.authorId = "0xreal-author"
+    const other = stored({ at: "2026-09-21T11:00:00Z", sessionId: "s2", objective: "side", nextAction: "n" })
+    other.authorId = "0xother-author"
+    const m = mergeCheckpoints([forged, other])!
+    expect(m.provenance[0]!.authorId).toBe("0xreal-author")
+    expect(m.provenance[0]!.agent).toBe("claude-code") // the claim is kept for contrast, not trusted
+    expect(m.otherSessions[0]!.authorId).toBe("0xother-author")
+  })
+
   it("keeps the first request word for word and, for an agent-tool delta, the latest non-empty objective, plan, issue and next step", () => {
     const m = mergeCheckpoints([
       stored({ at: "2026-09-21T10:00:00Z", originalRequest: "Build X in 5 steps", objective: "build X", nextAction: "step 1", remainingPlan: ["1", "2"], unresolvedIssue: "flaky test" }),

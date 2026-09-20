@@ -202,6 +202,19 @@ export async function saveCheckpoint(runtime: Runtime, name: string, input: Omit
   return { contextId: object.contextId, transactionHash: object.transactionHash ?? null, milliseconds: Date.now() - started, duplicate: false }
 }
 
+/**
+ * Maps each local agent's on-chain authorId (lower-case) to its local name, for rendering who
+ * actually saved a record — never the name the checkpoint claims for itself.
+ */
+export function authorNamesFor(runtime: Runtime): Record<string, string> {
+  const names: Record<string, string> = {}
+  for (const name of listAgentNames(runtime.home)) {
+    const identity = loadAgentIdentity(runtime.home, name)
+    if (identity !== undefined) names[identity.agentId.toLowerCase()] = name
+  }
+  return names
+}
+
 /** Spec §5D steps 2–3: a full protocol read as this agent, then keep only this project's valid v1 envelopes. */
 export async function readCheckpoints(runtime: Runtime, name: string, projectId: string): Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }> {
   if (typeof projectId !== "string" || projectId === "") throw new Error("projectId must be a non-empty string")

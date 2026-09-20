@@ -13,9 +13,10 @@ import { MidaAgent } from "@mida/sdk"
 import { localEnvironment, monadTestnetEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
-  AGENT_PERMISSIONS, MidaHome, Runtime, approve, init, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, readCheckpoints, requestAccess, revoke, saveCheckpoint,
+  AGENT_PERMISSIONS, MidaHome, Runtime, approve, authorNamesFor, init, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, readCheckpoints, requestAccess, revoke, saveCheckpoint,
 } from "@mida/midad"
 import type { Network } from "@mida/midad"
+import { mergeCheckpoints, renderHandoff } from "@mida/checkpoint"
 import type { Checkpoint } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
 
@@ -159,6 +160,20 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     const read = await readCheckpoints(runtime, "codex", "proj-1")
     expect(read.checkpoints).toHaveLength(3)
     expect(read.checkpoints.map((c) => c.checkpoint.objective)).toContain("Codex carried on")
+  })
+
+  step("11b. the handoff names the on-chain author, not the name a checkpoint claims", async () => {
+    // codex writes a checkpoint whose agent field claims "claude-code" — the chain recorded
+    // codex as the author, and the rendered handoff must say so.
+    await saveCheckpoint(runtime, "codex", envelope("proj-forge", sampleCheckpoint({ eventId: "cp-forge-ag", agent: "claude-code", objective: "a forged claim" }), "s10"))
+    const read = await readCheckpoints(runtime, "codex", "proj-forge")
+    const record = read.checkpoints.find((c) => c.checkpoint.eventId === "cp-forge-ag")!
+    expect(record.authorId).toBe(runtime.agent("codex").agentId)
+    const merged = mergeCheckpoints(read.checkpoints)!
+    expect(merged.provenance[0]!.authorId).toBe(runtime.agent("codex").agentId)
+    const line = renderHandoff(merged, { authorNames: authorNamesFor(runtime) }).split("\n").find((l) => l.includes(record.contextId))!
+    expect(line).toContain("- codex (on-chain author")
+    expect(line).toContain('claims "claude-code"')
   })
 
   step("12. the revocation survives a restart, and the measurements are written down", async () => {
