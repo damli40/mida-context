@@ -1,0 +1,16 @@
+{
+  "comment": "C4/C6: the stub returns different wording for the SAME underlying decision or state across saves. If the merge unions instead of replaces, duplicates appear.",
+  "decisionVariants": [
+    { "decision": "refill tokens lazily on each read", "rationale": "timers are banned by the task constraint" },
+    { "decision": "compute the refill when read() runs", "rationale": "the rules forbid background timers" },
+    { "decision": "do the refill at read time, never on a timer", "rationale": "no setInterval is allowed" }
+  ],
+  "issueThenResolved": {
+    "open": "bucket test flakes when two takes land in the same ms",
+    "resolved": null
+  },
+  "planThenEmpty": {
+    "open": ["finish KeyedLimiter eviction"],
+    "resolved": []
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "expectedFiles": ["src/lru.mjs"],
+  "expectedExports": { "src/lru.mjs": ["KeyedLimiter"] },
+  "readmeMustContain": "## Usage",
+  "forbiddenUnderSrc": ["setTimeout", "setInterval"],
+  "testArgv": ["--test"],
+  "comment": "Scoring reads the finished files in the run folder, never the agent's self-report."
+}

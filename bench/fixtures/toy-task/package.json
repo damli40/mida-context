@@ -1,0 +1,8 @@
+{
+  "name": "mida-bench-toy-task",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}
