@@ -233,6 +233,7 @@ describe("buildHandoff", () => {
     expect(withFacts.text).toContain("What you have told Mida about yourself")
     expect(withFacts.text).toContain("- stated by you: answers in lowercase")
     expect(withFacts.text).toContain(`(record ${fact.contextId})`)
+    expect(withFacts.text).not.toContain("(Your saved preferences could not be read for this session.)")
 
     // a fact read that throws — other than "no grant" — never sinks the handoff (A14)
     const { d } = deps({
@@ -246,6 +247,38 @@ describe("buildHandoff", () => {
     if (result.kind !== "handoff") return
     expect(result.facts).toBe(0)
     expect(result.factsFailed).toBe("facts-read-failed")
+    expect(result.text).not.toContain("What you have told Mida about yourself")
+    // the failure is visible inside the fence — the agent must not silently see no facts
+    const insideFence = result.text.split("=== BEGIN MIDA HANDOFF DATA ===")[1]!.split("=== END MIDA HANDOFF DATA ===")[0]!
+    expect(insideFence).toContain("(Your saved preferences could not be read for this session.)")
+  })
+
+  it("a fact read slower than the limit degrades the same way — the line sits inside the fence", async () => {
+    const { d } = deps({
+      limitMs: 40,
+      read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1 }),
+      readFacts: () => new Promise(() => {}), // never resolves — the deadline fires
+    })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.facts).toBe(0)
+    expect(result.factsFailed).toBe("facts-read-slow")
+    const insideFence = result.text.split("=== BEGIN MIDA HANDOFF DATA ===")[1]!.split("=== END MIDA HANDOFF DATA ===")[0]!
+    expect(insideFence).toContain("(Your saved preferences could not be read for this session.)")
+  })
+
+  it("a fact read resolving to [] emits no failure line and no facts heading", async () => {
+    const { d } = deps({
+      read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1 }),
+      readFacts: async () => [],
+    })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.facts).toBe(0)
+    expect(result.factsFailed).toBeNull()
+    expect(result.text).not.toContain("(Your saved preferences could not be read for this session.)")
     expect(result.text).not.toContain("What you have told Mida about yourself")
   })
   it("an approved agent with nothing saved gets the empty line — not a refusal", async () => {

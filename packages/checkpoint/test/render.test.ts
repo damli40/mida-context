@@ -165,6 +165,15 @@ describe("renderHandoff", () => {
       expect(renderHandoff(base, option)).not.toContain("What you have told Mida about yourself")
     }
   })
+  it("a failed fact read is stated inside the fence — and absent when the read succeeded", () => {
+    const failed = renderHandoff(base, { factsFailed: "facts-read-failed" })
+    const insideFence = failed.split("=== BEGIN MIDA HANDOFF DATA ===")[1]!.split("=== END MIDA HANDOFF DATA ===")[0]!
+    expect(insideFence).toContain("(Your saved preferences could not be read for this session.)")
+    expect(failed).not.toContain("What you have told Mida about yourself")
+    for (const option of [{}, { facts: [{ text: "x", contextId: "0x1" }], factsFailed: null }]) {
+      expect(renderHandoff(base, option)).not.toContain("(Your saved preferences could not be read for this session.)")
+    }
+  })
   it("under the limit keeps request, plan and every fact — progress is what shrinks (A14)", () => {
     const facts = Array.from({ length: 20 }, (_, i) => ({ text: `fact ${i} ${"f".repeat(200)}`, contextId: `0xfact${i}` }))
     const progress = Array.from({ length: 300 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)

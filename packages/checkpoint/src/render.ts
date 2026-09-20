@@ -49,7 +49,12 @@ function defuse(text: string): string {
 
 export function renderHandoff(
   merged: MergedHandoff,
-  options: { maxChars?: number; authorNames?: Record<string, string>; facts?: { text: string; contextId: string }[] } = {},
+  options: {
+    maxChars?: number
+    authorNames?: Record<string, string>
+    facts?: { text: string; contextId: string }[]
+    factsFailed?: string | null
+  } = {},
 ): string {
   const maxChars = options.maxChars ?? 8000
   const cut = (s: string, n = 300) => (s.length > n ? s.slice(0, n - 1) + "…" : s)
@@ -95,6 +100,11 @@ export function renderHandoff(
           .map((f) => `- stated by you: ${defuse(f.text)} (record ${defuse(f.contextId)})`)
           .join("\n")}`,
       )
+    }
+    // A failed or timed-out fact read is stated where the facts would have been — the receiving
+    // agent must not read silence as "the owner told Mida nothing".
+    if (options.factsFailed) {
+      parts.push("(Your saved preferences could not be read for this session.)")
     }
     if (merged.progress.length > 0) {
       const lines = merged.progress.slice(dropped).map((p) => `- ${cut(defuse(p))}`)
