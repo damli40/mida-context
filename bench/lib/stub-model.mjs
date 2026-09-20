@@ -65,8 +65,10 @@ const base = {
   evidence: [],
 }
 
+// The extractor expects the checkpoint fields at the top level of the first
+// JSON object — the same shape the real model is asked to emit.
 const print = (checkpoint) => {
-  process.stdout.write(JSON.stringify({ checkpoint }) + "\n")
+  process.stdout.write(JSON.stringify(checkpoint) + "\n")
 }
 
 switch (mode) {
@@ -85,7 +87,7 @@ switch (mode) {
     print({ ...base, progress: fakeSecrets(), constraints: [fakeSecrets()[0]] })
     break
   case "reasoning":
-    process.stdout.write(`I looked at the transcript and here is the checkpoint:\n${JSON.stringify({ checkpoint: base })}\nDone.\n`)
+    process.stdout.write(`I looked at the transcript and here is the checkpoint:\n${JSON.stringify(base)}\nDone.\n`)
     break
   case "hang":
     setInterval(() => {}, 1e9)
