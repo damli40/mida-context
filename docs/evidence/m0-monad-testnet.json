@@ -1,0 +1,23 @@
+{
+  "network": "monad-testnet",
+  "generatedAt": "2026-09-20T05:51:14.263Z",
+  "oneOperatorRegisteredBothAgents": true,
+  "grantGasUsed": "403382",
+  "saveMilliseconds": [
+    2857,
+    2846
+  ],
+  "readMilliseconds": [
+    2521,
+    2787
+  ],
+  "saveToReadableMilliseconds": 5633,
+  "transactions": {
+    "grantClaudeCode": "0xc6aa76b20d52c53df39090a0c2fb1dfd76dbeecf260e59b10f0bd020cb81d257",
+    "firstSave": "0x2eb2ef0fd4a8bac22a909433fd4c2a8319880bd4640c505647717f615f6d02df",
+    "grantCodex": "0x125d10fbc3e1f799bfe55fb5e09eee3e864e5805699e23979090556de235aab7",
+    "saveAfterRestart": "0xb41c233950bf3836a26c3f5aafda2e9cf945f272c1f5b7cef7f1283cec139cdd",
+    "revokeAndRotate": "0xaf8638797fb68628266720afb061f712912c4d8020aa24a9c36cc122090c91f5",
+    "codexSaveAfterRevoke": "0x9b439c73f8cd0422aed2c0ec430f210c5ec20f24e5d8d3f3677a9db993e55871"
+  }
+}
