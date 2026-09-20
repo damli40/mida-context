@@ -1,0 +1,83 @@
+{
+ "date": "2026-09-20",
+ "what": "Second live Claude Code capture, after fix round C (d9fcb97, f4d1ca0). Local chain. Same toy task as m1-live-capture.json.",
+ "sessionSeconds": 584,
+ "hookEvents": {
+  "PostToolUse": 43,
+  "Stop": 1,
+  "SessionEnd": 1
+ },
+ "checkpointsOnChain": 8,
+ "skipped": 0,
+ "rejectedInvalid": 0,
+ "requestVerbatim": 8,
+ "scrubChangedNothing": 8,
+ "compileMs": [
+  28455,
+  24856,
+  56837,
+  23051,
+  27433,
+  60480,
+  27747,
+  27471
+ ],
+ "saveMsTypical": 4090,
+ "mergedContextChars": 7691,
+ "limitChars": 8000,
+ "progressEntriesTrimmed": 0,
+ "decisionLinesInMerged": 4,
+ "perCheckpoint": [
+  {
+   "createdAt": "2026-09-20T18:56:39.691Z",
+   "progress": 3,
+   "decisions": 2,
+   "remainingPlan": 6
+  },
+  {
+   "createdAt": "2026-09-20T18:57:36.122Z",
+   "progress": 4,
+   "decisions": 3,
+   "remainingPlan": 4
+  },
+  {
+   "createdAt": "2026-09-20T18:59:08.101Z",
+   "progress": 6,
+   "decisions": 3,
+   "remainingPlan": 3
+  },
+  {
+   "createdAt": "2026-09-20T18:59:54.049Z",
+   "progress": 7,
+   "decisions": 3,
+   "remainingPlan": 0
+  },
+  {
+   "createdAt": "2026-09-20T19:00:58.458Z",
+   "progress": 8,
+   "decisions": 3,
+   "remainingPlan": 0
+  },
+  {
+   "createdAt": "2026-09-20T19:04:12.274Z",
+   "progress": 9,
+   "decisions": 3,
+   "remainingPlan": 0
+  },
+  {
+   "createdAt": "2026-09-20T19:04:46.403Z",
+   "progress": 11,
+   "decisions": 4,
+   "remainingPlan": 2
+  },
+  {
+   "createdAt": "2026-09-20T19:08:19.934Z",
+   "progress": 12,
+   "decisions": 4,
+   "remainingPlan": 0
+  }
+ ],
+ "defectFound": "CAP-24: the final Stop and SessionEnd jobs (and one PostToolUse) stayed in the queue after the session ended; the running drainer had listed the queue before they arrived and later drainers exited on lock-held. The 8th checkpoint exists only because a save pass was run by hand 3.5 minutes later.",
+ "notComparable": "This session ran 9.7 minutes and produced 8 saves; the first live run ran 26 minutes and produced 10. The size result is a confirmation of the fix's direction, not a like-for-like measurement.",
+ "oddity": "remainingPlan dropped to 0 at the 4th save while work remained, then returned as 2 at the 7th. Not investigated."
+}
