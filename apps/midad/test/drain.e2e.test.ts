@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import type { CompileInput, CompileResult } from "@mida/compiler"
+import { CONTENT_FIELDS } from "@mida/checkpoint"
 import {
   MidaHome, Runtime, approve, drainOnce, enqueue, init, listJobs, readCheckpoints, removeJob, requestAccess,
 } from "@mida/midad"
@@ -224,6 +225,19 @@ describe("M1 drainOnce on local Anvil", () => {
     expect(after.saved).toBe(1)
     expect((await readBack()).checkpoints.some((c) => c.sessionId === "s-codex")).toBe(true)
   }, STEP_TIMEOUT * 2)
+
+  it("(j) a grown transcript's next compile receives the previous save's content fields (C2)", async () => {
+    job({ sessionId: "s-prev" })
+    await drain()
+    const firstInput = compileCalls.at(-1)!
+    expect(firstInput.previous).toBeUndefined()
+    appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "prev step" }] } }) + "\n")
+    job({ sessionId: "s-prev" })
+    await drain()
+    const secondInput = compileCalls.at(-1)!
+    const saved = sampleCheckpoint({ eventId: firstInput.eventId, agent: "claude-code" })
+    for (const field of CONTENT_FIELDS) expect(secondInput.previous?.[field]).toEqual(saved[field])
+  }, STEP_TIMEOUT)
 
   it("a job older than a day is moved to queue/bad without work", async () => {
     const stale = enqueue(home, {

@@ -54,7 +54,14 @@ export type CompileResult =
       charsSent: number
       modelMs: number
     }
-  | { ok: false; reason: "model-failed" | "no-json" | "invalid"; detail: string; attempts: number }
+  | {
+      ok: false
+      reason: "model-failed" | "no-json" | "invalid"
+      detail: string
+      attempts: number
+      /** Leading field paths from the validator when reason is "invalid" — names only, safe for logs. */
+      fields?: string[]
+    }
 
 const MAX_STDOUT = 8 * 1024 * 1024
 const DEFAULT_TIMEOUT_MS = 90_000
@@ -299,7 +306,10 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
         // A validation failure is deterministic — the same input would fail
         // the same way — so it is reported at once and never retried.
         if (!v.ok) {
-          return { ok: false, reason: "invalid", detail: v.errors.join("; "), attempts: attempt }
+          // the drainer may log field NAMES ("decisions[3].rationale") — never
+          // the validator's messages, which can echo the value that failed
+          const fields = [...new Set(v.errors.map((e) => e.split(":")[0]!))]
+          return { ok: false, reason: "invalid", detail: v.errors.join("; "), attempts: attempt, fields }
         }
         return {
           ok: true,

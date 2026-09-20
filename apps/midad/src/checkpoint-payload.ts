@@ -15,11 +15,19 @@ export type PayloadErrorCode = "too-large" | "invalid-checkpoint"
 
 export class CheckpointPayloadError extends Error {
   readonly code: PayloadErrorCode
-  constructor(code: PayloadErrorCode, message: string) {
+  /** Leading field paths from the validator — names only, never values; safe for logs. */
+  readonly fields?: string[]
+  constructor(code: PayloadErrorCode, message: string, fields?: string[]) {
     super(message)
     this.name = "CheckpointPayloadError"
     this.code = code
+    this.fields = fields
   }
+}
+
+/** "decisions[3].rationale: expected string, got number" → "decisions[3].rationale" — the loggable part only. */
+export function fieldPathsFromErrors(errors: string[]): string[] {
+  return [...new Set(errors.map((e) => e.split(":")[0]!))]
 }
 
 export interface CheckpointEnvelope {
@@ -60,7 +68,9 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
   if (typeof input.sessionId !== "string" || input.sessionId === "") throw new Error("sessionId must be a non-empty string")
   if (input.continuesSession !== null && typeof input.continuesSession !== "string") throw new Error("continuesSession must be a string or null")
   const checked = validateCheckpoint(input.checkpoint)
-  if (!checked.ok) throw new CheckpointPayloadError("invalid-checkpoint", `invalid checkpoint: ${checked.errors.join("; ")}`)
+  if (!checked.ok) {
+    throw new CheckpointPayloadError("invalid-checkpoint", `invalid checkpoint: ${checked.errors.join("; ")}`, fieldPathsFromErrors(checked.errors))
+  }
   const checkpoint: Checkpoint = {
     ...checked.value,
     progress: [...checked.value.progress],

@@ -31,7 +31,9 @@ async function main(): Promise<void> {
   // One settle run: it waits out the save gap inside the drain lock rather than leaving a
   // held-back job for a hook that may never come.
   const result = await drainUntilSettled({ home, open, compile: compileCheckpoint })
-  appendLog(home, "drain", { outcome: "pass", ...result })
+  // drainUntilSettled already wrote the "lock-held" line when another drainer owns the
+  // queue — logging "pass" here too would claim a clean pass that never ran
+  if (result.lockHeld !== true) appendLog(home, "drain", { outcome: "pass", ...result })
 }
 
 // Like the hook, the drainer fails open: a broken drain writes a log line at most, never an exit code.

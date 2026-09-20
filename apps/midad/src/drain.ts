@@ -6,6 +6,8 @@ import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
 import { isMidaError } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
+import { CONTENT_FIELDS, validateCheckpoint } from "@mida/checkpoint"
+import type { Checkpoint } from "@mida/checkpoint"
 import { chainFor, parseDeployment } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { RegistryReader } from "@mida/api"
@@ -44,12 +46,16 @@ const LOG_KEEP_BYTES = 1024 * 1024
  */
 const PERMANENT_FAILURES = new Set([
   "too-large",
-  "invalid-checkpoint",
   "bad-transcript-path",
   "unknown-transcript-format",
   "not-a-project",
   "not-approved",
 ])
+/**
+ * A checkpoint the validator rejects is usually fixed by a fresh model call, so
+ * `invalid-checkpoint` is transient for the first two attempts; the third is permanent.
+ */
+const INVALID_CHECKPOINT_MAX_ATTEMPTS = 3
 const backoffMs = (attempts: number) => Math.min(60_000 * 2 ** attempts, MAX_BACKOFF_MS)
 
 export interface DrainDeps {
@@ -84,6 +90,8 @@ export interface DrainResult {
   failed: number
   /** Earliest epoch ms at which a held-back job becomes due, or null when nothing is waiting. */
   earliestDueMs: number | null
+  /** True when a live `queue/drain.lock` stopped this run before it touched the queue. */
+  lockHeld?: boolean
 }
 
 const emptyResult = (): DrainResult => ({ saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0, earliestDueMs: null })
@@ -96,7 +104,12 @@ const emptyResult = (): DrainResult => ({ saved: 0, skippedUnchanged: 0, skipped
 export async function drainOnce(deps: DrainDeps): Promise<DrainResult> {
   const now = deps.now ?? (() => new Date())
   const lock = acquireDrainLock(deps.home, now)
-  if (lock === null) return emptyResult()
+  if (lock === null) {
+    // a held lock is not an empty pass — logging "pass" with zeros would read as
+    // "ran and found nothing" while a job visibly waits in the queue
+    appendLog(deps.home, "drain", { outcome: "lock-held" })
+    return { ...emptyResult(), lockHeld: true }
+  }
   try {
     return await drainPass(deps, now)
   } finally {
@@ -113,7 +126,10 @@ export async function drainUntilSettled(deps: DrainDeps): Promise<DrainResult> {
   const now = deps.now ?? (() => new Date())
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   const lock = acquireDrainLock(deps.home, now)
-  if (lock === null) return emptyResult()
+  if (lock === null) {
+    appendLog(deps.home, "drain", { outcome: "lock-held" })
+    return { ...emptyResult(), lockHeld: true }
+  }
   try {
     const total = emptyResult()
     let waits = 0
@@ -253,17 +269,32 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
 
         const eventId = eventIdFor({ projectId, sessionId, transcriptBytes, lastLine })
         // A compiled envelope survives a failed save: the retry spends no model call on it.
-        let envelope = readCompiled(deps.home, eventId)
-        if (envelope === undefined) {
+        const cached = readCompiled(deps.home, eventId)
+        let envelope: CheckpointEnvelope
+        let compileMeta: CompileMeta
+        let reusedCompiled: boolean
+        if (cached !== undefined) {
+          envelope = cached.envelope
+          compileMeta = cached.meta
+          reusedCompiled = true
+        } else {
+          // the session's last saved checkpoint becomes the next compile's
+          // starting point — each save updates it instead of restating the
+          // whole session in fresh words
+          const previous = readPrevious(deps.home, sessionId)
+          if (previous.unreadable) log({ sessionId, outcome: "note", reason: "previous-unreadable" })
+          const compileStart = now().getTime()
           const compiled = await deps.compile({
             transcriptPath: job.transcriptPath,
             agent: job.agent,
             eventId,
             cwd: job.cwd,
             homeDir,
+            previous: previous.checkpoint,
           })
+          const compileMs = now().getTime() - compileStart
           if (!compiled.ok) {
-            if (compiled.reason === "invalid") throw new CheckpointPayloadError("invalid-checkpoint", "the compiler produced an invalid checkpoint")
+            if (compiled.reason === "invalid") throw new CheckpointPayloadError("invalid-checkpoint", "the compiler produced an invalid checkpoint", compiled.fields)
             throw new DrainFailure(compiled.reason)
           }
           envelope = wrapCheckpoint({
@@ -273,9 +304,17 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             compiledBy: compiled.compiledBy,
             checkpoint: compiled.checkpoint,
           })
-          deps.home.writeSecretJson(`queue/compiled/${eventId}.json`, envelope)
+          compileMeta = {
+            compileMs,
+            attempts: compiled.attempts,
+            trimmed: compiled.trimmed,
+            droppedKeys: compiled.droppedKeys,
+          }
+          deps.home.writeSecretJson(`queue/compiled/${eventId}.json`, { ...envelope, compileMeta })
+          reusedCompiled = false
         }
         runtime ??= await deps.open()
+        const saveStart = now().getTime()
         await save(runtime, job.agent, {
           projectId: envelope.projectId,
           sessionId: envelope.sessionId,
@@ -283,12 +322,29 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           compiledBy: envelope.compiledBy,
           checkpoint: envelope.checkpoint,
         })
+        const saveMs = now().getTime() - saveStart
         writeState(deps.home, sessionId, terminal)
+        // the saved checkpoint's content fields are the next compile's `previous`
+        const content: Record<string, unknown> = {}
+        for (const field of CONTENT_FIELDS) content[field] = envelope.checkpoint[field]
+        deps.home.writeSecretJson(`queue/state/${sessionId}.last.json`, content)
         removeJob(deps.home, job.id)
         counts.saved += 1
-        log({ sessionId, outcome: "saved", eventId })
+        log({
+          sessionId,
+          outcome: "saved",
+          eventId,
+          compileMs: compileMeta.compileMs,
+          saveMs,
+          attempts: compileMeta.attempts,
+          reusedCompiled,
+          trimmed: compileMeta.trimmed,
+          droppedKeys: compileMeta.droppedKeys,
+        })
       } catch (error) {
         const code = failureCode(error)
+        // field names are safe to log; values, validator messages and error.message are not
+        const fields = error instanceof CheckpointPayloadError && error.fields !== undefined ? { fields: error.fields } : {}
         if (PERMANENT_FAILURES.has(code)) {
           if (code === "not-approved") {
             for (const other of listJobs(deps.home)) if (other.agent === job.agent) removeJob(deps.home, other.id)
@@ -297,16 +353,17 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           }
           // terminal state records the real transcript stats: an identical job later skips as unchanged
           writeState(deps.home, sessionId, terminalState(job.transcriptPath, now().toISOString()))
-          log({ sessionId, outcome: "bad", reason: code })
+          log({ sessionId, outcome: "bad", reason: code, ...fields })
           continue
         }
         // transient: keep the job, count the attempt, and hold the session until the backoff passes
         const attempts = (readState(deps.home, sessionId)?.attempts ?? 0) + 1
         counts.failed += 1
-        if (attempts >= MAX_ATTEMPTS) {
+        const invalidGaveUp = code === "invalid-checkpoint" && attempts >= INVALID_CHECKPOINT_MAX_ATTEMPTS
+        if (attempts >= MAX_ATTEMPTS || invalidGaveUp) {
           moveToBad(deps.home, `${job.id}.json`)
           writeState(deps.home, sessionId, terminalState(job.transcriptPath, now().toISOString()))
-          log({ sessionId, outcome: "bad", reason: "gave-up" })
+          log({ sessionId, outcome: "bad", reason: invalidGaveUp ? "invalid-checkpoint" : "gave-up", ...fields })
           continue
         }
         writeState(deps.home, sessionId, {
@@ -319,7 +376,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           failedAt: now().toISOString(),
         })
         dueSooner(now().getTime() + backoffMs(attempts))
-        log({ sessionId, outcome: "failed", reason: code, attempts })
+        log({ sessionId, outcome: "failed", reason: code, attempts, ...fields })
       }
     }
   } finally {
@@ -378,11 +435,35 @@ async function agentApprovedOnChain(home: MidaHome, agent: string): Promise<bool
   return false
 }
 
-/** The compiled-envelope cache at `queue/compiled/<eventId>.json`; a corrupt entry is ignored and recompiled. */
-function readCompiled(home: MidaHome, eventId: string): CheckpointEnvelope | undefined {
+/** What a compile cost, kept beside the cached envelope so a retried save logs the real numbers. */
+interface CompileMeta {
+  compileMs: number
+  attempts: number
+  trimmed: string[]
+  droppedKeys: string[]
+}
+
+/**
+ * The compiled-envelope cache at `queue/compiled/<eventId>.json`; a corrupt entry is ignored and
+ * recompiled. Entries written before the metrics existed carry no `compileMeta` — the compile did
+ * run, so attempts reads as at least 1 and the rest as empty.
+ */
+function readCompiled(home: MidaHome, eventId: string): { envelope: CheckpointEnvelope; meta: CompileMeta } | undefined {
   try {
-    const raw = home.readJson<unknown>(`queue/compiled/${eventId}.json`)
-    return raw === undefined ? undefined : (unwrapCheckpoint(raw) ?? undefined)
+    const raw = home.readJson<Record<string, unknown>>(`queue/compiled/${eventId}.json`)
+    if (raw === undefined) return undefined
+    const envelope = unwrapCheckpoint(raw)
+    if (envelope === null) return undefined
+    const meta = (raw.compileMeta ?? {}) as Partial<CompileMeta>
+    return {
+      envelope,
+      meta: {
+        compileMs: typeof meta.compileMs === "number" ? meta.compileMs : 0,
+        attempts: typeof meta.attempts === "number" ? meta.attempts : 1,
+        trimmed: Array.isArray(meta.trimmed) ? meta.trimmed : [],
+        droppedKeys: Array.isArray(meta.droppedKeys) ? meta.droppedKeys : [],
+      },
+    }
   } catch {
     return undefined
   }
@@ -419,6 +500,37 @@ function acquireDrainLock(home: MidaHome, now: () => Date): { release: () => voi
     home.remove(DRAIN_LOCK)
   }
   return null
+}
+
+/**
+ * The session's last saved checkpoint, kept as its ten content fields at
+ * `queue/state/<sessionId>.last.json`, becomes the next compile's `previous`.
+ * The file is drainer-written but still untrusted input: it must hold only the
+ * content fields and pass validation, or the compile starts from nothing and
+ * the pass logs `previous-unreadable`.
+ */
+function readPrevious(home: MidaHome, sessionId: string): { checkpoint?: Checkpoint; unreadable: boolean } {
+  let raw: unknown
+  try {
+    raw = home.readJson<unknown>(`queue/state/${sessionId}.last.json`)
+  } catch {
+    return { unreadable: true }
+  }
+  if (raw === undefined) return { unreadable: false }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { unreadable: true }
+  const record = raw as Record<string, unknown>
+  if (Object.keys(record).some((k) => !(CONTENT_FIELDS as readonly string[]).includes(k))) return { unreadable: true }
+  // the placeholders below are never seen by the model — buildExtractPrompt
+  // sends the ten content fields only — but validation needs a full record
+  const checked = validateCheckpoint({
+    eventId: "cp-previous",
+    agent: "unknown",
+    source: "hook-compiler",
+    createdAt: "1970-01-01T00:00:00.000Z",
+    ...record,
+  })
+  if (!checked.ok) return { unreadable: true }
+  return { checkpoint: checked.value, unreadable: false }
 }
 
 function readState(home: MidaHome, sessionId: string): SessionState | undefined {

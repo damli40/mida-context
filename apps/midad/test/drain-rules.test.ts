@@ -8,6 +8,7 @@ import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import { MidaHome, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, tailOf } from "@mida/midad"
 import type { Runtime, saveCheckpoint } from "@mida/midad"
+import { CONTENT_FIELDS } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
 
 const T0 = Date.parse("2026-09-21T10:00:00.000Z")
@@ -97,15 +98,31 @@ describe("the drainer re-checks transcript paths before trusting them", () => {
 })
 
 describe("one drainer at a time", () => {
-  it("a live drain.lock makes a second drainer return at once, without compiling", async () => {
-    const { home, job, drain, compileCalls } = setup()
+  it("a live drain.lock makes a second drainer return at once, without compiling — and it says so (C4)", async () => {
+    const { home, job, drain, compileCalls, drainLog } = setup()
     job()
     // the lock file is written in the drainer's own clock so the age check is exact
     home.writeSecretJson("queue/drain.lock", { pid: process.pid, startedAt: new Date(T0 + 120_000).toISOString() })
     const result = await drain()
     expect(result).toMatchObject({ saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0 })
+    expect(result.lockHeld).toBe(true)
+    // a held lock is logged as lock-held — not as a "pass" that read the queue and found nothing
+    expect(drainLog()).toContain('"outcome":"lock-held"')
+    expect(drainLog()).not.toContain('"outcome":"pass"')
     expect(compileCalls).toHaveLength(0)
     expect(listJobs(home)).toHaveLength(1) // the job waits for the live drainer, nothing lost
+    home.remove("queue/drain.lock")
+  })
+
+  it("drainUntilSettled reports a held lock the same way", async () => {
+    const { home, job, compile, open, homeDir, drainLog } = setup()
+    job({ event: "Stop" }, T0)
+    home.writeSecretJson("queue/drain.lock", { pid: process.pid, startedAt: new Date(T0 + 120_000).toISOString() })
+    const result = await drainUntilSettled({
+      home, open, compile, homeDir, isApproved: async () => true, now: () => new Date(T0 + 120_000), sleep: async () => {},
+    })
+    expect(result.lockHeld).toBe(true)
+    expect(drainLog()).toContain('"outcome":"lock-held"')
     home.remove("queue/drain.lock")
   })
 
@@ -221,13 +238,13 @@ describe("a failed save does not buy a new model call", () => {
     expect(compileCalls).toHaveLength(1)
   })
 
-  it("a checkpoint the compiler calls invalid is removed with invalid-checkpoint", async () => {
+  it("a checkpoint the compiler calls invalid is retried, not dropped on the spot (C3)", async () => {
     const { home, job, drain, flags, drainLog } = setup()
     flags.compileReason = "invalid"
     job({ event: "Stop" }, T0)
     const result = await drain({ now: () => new Date(T0 + 120_000) })
-    expect(result).toMatchObject({ saved: 0, failed: 0 })
-    expect(listJobs(home)).toHaveLength(0)
+    expect(result).toMatchObject({ saved: 0, failed: 1 })
+    expect(listJobs(home)).toHaveLength(1)
     expect(drainLog()).toContain("invalid-checkpoint")
   })
 
@@ -354,6 +371,136 @@ describe("each drain prunes dead weight", () => {
     expect(home.has("queue/loose.tmp")).toBe(false)
     expect(home.has("queue/recent.tmp")).toBe(true)
     expect(fs.statSync(home.path("logs/drain.jsonl")).size).toBeLessThanOrEqual(1024 * 1024)
+  })
+})
+
+describe("the saved log line carries the compile and save facts (C4)", () => {
+  const savedLines = (drainLog: () => string) =>
+    drainLog().trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>).filter((l) => l.outcome === "saved")
+
+  it("a fresh save logs compileMs, saveMs, attempts, reusedCompiled, trimmed and droppedKeys", async () => {
+    const { job, drain, drainLog } = setup()
+    job({ event: "Stop" }, T0)
+    await drain({ now: () => new Date(T0 + 120_000) })
+    const saved = savedLines(drainLog).at(-1)!
+    expect(typeof saved.compileMs).toBe("number")
+    expect(typeof saved.saveMs).toBe("number")
+    expect(typeof saved.attempts).toBe("number")
+    expect(saved.reusedCompiled).toBe(false)
+    expect(Array.isArray(saved.trimmed)).toBe(true)
+    expect(Array.isArray(saved.droppedKeys)).toBe(true)
+  })
+
+  it("a save retried from the compiled cache logs reusedCompiled and the stored metrics", async () => {
+    const { job, drain, flags, drainLog } = setup()
+    job({ event: "Stop" }, T0)
+    flags.saveFailures = 1
+    await drain({ now: () => new Date(T0 + 120_000) })
+    await drain({ now: () => new Date(T0 + 400_000) })
+    const saved = savedLines(drainLog).at(-1)!
+    expect(saved.reusedCompiled).toBe(true)
+    expect(typeof saved.compileMs).toBe("number")
+    expect(saved.attempts).toBe(1)
+    expect(saved.trimmed).toEqual([])
+    expect(saved.droppedKeys).toEqual([])
+  })
+})
+
+describe("an invalid checkpoint is transient twice, then permanent (C3)", () => {
+  it("two invalid compiles keep the job, the third drain saves, and the log names fields — never values", async () => {
+    const { home, job, drain, drainLog } = setup()
+    let n = 0
+    const compile: typeof compileCheckpoint = async (input) => {
+      n += 1
+      if (n <= 2) {
+        return {
+          ok: false,
+          reason: "invalid",
+          detail: "decisions[3].rationale: expected string, got number; evidence: expected array",
+          attempts: 1,
+          fields: ["decisions[3].rationale", "evidence"],
+        }
+      }
+      return {
+        ok: true,
+        checkpoint: sampleCheckpoint({ eventId: input.eventId, agent: input.agent }),
+        compiledBy: "stub",
+        droppedKeys: [],
+        trimmed: [],
+        attempts: 1,
+        format: "claude-jsonl",
+        messagesKept: 1,
+        messagesTotal: 1,
+        charsSent: 0,
+        modelMs: 0,
+      }
+    }
+    job({ event: "Stop" }, T0)
+    const first = await drain({ compile, now: () => new Date(T0 + 120_000) })
+    expect(first).toMatchObject({ saved: 0, failed: 1 })
+    expect(listJobs(home)).toHaveLength(1)
+    const second = await drain({ compile, now: () => new Date(T0 + 300_000) })
+    expect(second).toMatchObject({ saved: 0, failed: 1 })
+    expect(listJobs(home)).toHaveLength(1)
+    const third = await drain({ compile, now: () => new Date(T0 + 800_000) })
+    expect(third).toMatchObject({ saved: 1, failed: 0 })
+    expect(listJobs(home)).toHaveLength(0)
+    const log = drainLog()
+    expect(log).toContain('"fields":["decisions[3].rationale","evidence"]')
+    expect(log).not.toContain("expected string")   // field names, never validator messages
+    expect(log).not.toContain("got number")        // and never values
+  })
+
+  it("a third invalid compile in a row is permanent: the job leaves with invalid-checkpoint", async () => {
+    const { home, job, drain, drainLog } = setup()
+    const compile: typeof compileCheckpoint = async () => ({
+      ok: false, reason: "invalid", detail: "objective: must be non-empty", attempts: 1, fields: ["objective"],
+    })
+    job({ event: "Stop" }, T0)
+    await drain({ compile, now: () => new Date(T0 + 120_000) })
+    await drain({ compile, now: () => new Date(T0 + 300_000) })
+    const third = await drain({ compile, now: () => new Date(T0 + 800_000) })
+    // the third failure still counts as a failure — permanence is in the outcome, not the counter
+    expect(third).toMatchObject({ saved: 0, failed: 1 })
+    expect(listJobs(home)).toHaveLength(0)
+    const log = drainLog()
+    expect(log).toContain('"outcome":"bad"')
+    expect(log).toContain("invalid-checkpoint")
+    expect(log).toContain('"fields":["objective"]')
+  })
+})
+
+describe("the drainer hands the session's previous checkpoint to the compiler (C2)", () => {
+  it("a second drain of a grown transcript compiles with the first save's content fields as previous", async () => {
+    const { home, transcriptPath, job, drain, compileCalls, flags } = setup()
+    flags.checkpoint = sampleCheckpoint({ objective: "the first save's objective" })
+    job({ event: "Stop" }, T0)
+    await drain({ now: () => new Date(T0 + 120_000) })
+    expect(compileCalls).toHaveLength(1)
+    expect(compileCalls[0]!.previous).toBeUndefined()
+    expect(home.has("queue/state/s1.last.json")).toBe(true)
+
+    appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "step 2" }] } }) + "\n")
+    job({ event: "Stop" }, T0 + 200_000)
+    await drain({ now: () => new Date(T0 + 300_000) })
+    expect(compileCalls).toHaveLength(2)
+    const previous = compileCalls[1]!.previous
+    expect(previous).toBeDefined()
+    // the file holds the ten content fields of the checkpoint that was actually saved —
+    // never its ids, timestamps or the user's verbatim request
+    const saved = flags.checkpoint
+    for (const field of CONTENT_FIELDS) expect(previous![field]).toEqual(saved[field])
+    expect(previous!.originalRequest).toBeNull()
+  })
+
+  it("a corrupt .last.json is ignored with a previous-unreadable log line, and the save still happens", async () => {
+    const { home, job, drain, compileCalls, drainLog } = setup()
+    home.writeSecretJson("queue/state/s1.last.json", { decisions: "not-an-array" })
+    job({ event: "Stop" }, T0)
+    const result = await drain({ now: () => new Date(T0 + 120_000) })
+    expect(result.saved).toBe(1)
+    expect(compileCalls[0]!.previous).toBeUndefined()
+    expect(drainLog()).toContain("previous-unreadable")
   })
 })
 
