@@ -231,7 +231,8 @@ describe("buildHandoff", () => {
     expect(withFacts.facts).toBe(1)
     expect(withFacts.factsFailed).toBeNull()
     expect(withFacts.text).toContain("What you have told Mida about yourself")
-    expect(withFacts.text).toContain("- answers in lowercase")
+    expect(withFacts.text).toContain("- stated by you: answers in lowercase")
+    expect(withFacts.text).toContain(`(record ${fact.contextId})`)
 
     // a fact read that throws — other than "no grant" — never sinks the handoff (A14)
     const { d } = deps({

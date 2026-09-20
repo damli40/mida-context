@@ -49,7 +49,7 @@ function defuse(text: string): string {
 
 export function renderHandoff(
   merged: MergedHandoff,
-  options: { maxChars?: number; authorNames?: Record<string, string>; facts?: string[] } = {},
+  options: { maxChars?: number; authorNames?: Record<string, string>; facts?: { text: string; contextId: string }[] } = {},
 ): string {
   const maxChars = options.maxChars ?? 8000
   const cut = (s: string, n = 300) => (s.length > n ? s.slice(0, n - 1) + "…" : s)
@@ -90,7 +90,11 @@ export function renderHandoff(
     // Facts the owner told Mida once, kept ahead of progress: under the size limit the original
     // request and plan are preserved first, then every fact, and progress is what gets trimmed.
     if (options.facts !== undefined && options.facts.length > 0) {
-      parts.push(`What you have told Mida about yourself\n${options.facts.map((f) => `- ${defuse(f)}`).join("\n")}`)
+      parts.push(
+        `What you have told Mida about yourself\n${options.facts
+          .map((f) => `- stated by you: ${defuse(f.text)} (record ${defuse(f.contextId)})`)
+          .join("\n")}`,
+      )
     }
     if (merged.progress.length > 0) {
       const lines = merged.progress.slice(dropped).map((p) => `- ${cut(defuse(p))}`)

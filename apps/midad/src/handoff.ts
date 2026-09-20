@@ -150,7 +150,7 @@ export async function buildHandoff(
     if (merged === null) return { kind: "empty", text: EMPTY_TEXT, facts: facts.length, factsFailed, readMs }
     return {
       kind: "handoff",
-      text: renderHandoff(merged, { authorNames: input.authorNames, facts: facts.map((fact) => fact.text) }),
+      text: renderHandoff(merged, { authorNames: input.authorNames, facts }),
       checkpoints: outcome.checkpoints.length,
       facts: facts.length,
       factsFailed,
