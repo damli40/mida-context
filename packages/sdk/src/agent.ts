@@ -111,6 +111,12 @@ export interface MidaAgentConfig {
   /** Context API client bound to the same signer. */
   api: ContextApiRoutes & { account: { address: Address } }
   requests?: AccessRequestStore
+  /**
+   * Grants this agent completed in an earlier process. They only tell the agent which capabilityId to present:
+   * every read is still authorised by the API against Monad and every write by the contract, so a stale or forged
+   * entry buys nothing.
+   */
+  grants?: readonly Grant[]
 }
 
 const AGENT_SOURCES: ReadonlySet<string> = new Set(["AGENT_INFERRED", "IMPORTED", "EXTERNAL_ATTESTATION"])
@@ -137,6 +143,12 @@ export class MidaAgent {
     this.#encryptionPrivateKey = Uint8Array.from(config.encryptionPrivateKey)
     this.#requests = config.requests ?? new MemoryAccessRequestStore()
     this.#reader = new RegistryReader(config.chain)
+    for (const grant of config.grants ?? []) {
+      if (grant.agentId.toLowerCase() !== this.agentId) {
+        throw new MidaError("AUTH_INVALID", "a restored grant belongs to a different agent")
+      }
+      this.#grants.push({ ...grant, owner: grant.owner.toLowerCase() as Address, agentId: this.agentId, capabilities: [...grant.capabilities] })
+    }
   }
 
   get grants(): readonly Grant[] {
