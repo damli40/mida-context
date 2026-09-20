@@ -10,7 +10,7 @@ import { FakeVaultAuthority } from "@mida/fake-vault"
 import { MidaAgent } from "@mida/sdk"
 import type { MidaHome } from "./home.js"
 import { FileAccessRequestStore } from "./request-store.js"
-import { listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets } from "./keys.js"
+import { listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerStartBlock, saveOwnerStartBlock } from "./keys.js"
 import type { AgentIdentity } from "./keys.js"
 import { startPersistentApi } from "./api-server.js"
 
@@ -39,6 +39,7 @@ export class Runtime {
     readonly ownerApi: ContextApiClient,
     readonly vault: FakeVaultAuthority,
     readonly reader: RegistryReader,
+    readonly ownerStartBlock: bigint,
     readonly apiBaseUrl: string,
     close: () => Promise<void>,
   ) {
@@ -56,11 +57,26 @@ export class Runtime {
       const secrets = loadOrCreateOwnerSecrets(home)
       const ownerAccount = privateKeyToAccount(secrets.privateKey)
       server = await startPersistentApi({ rpcUrl: network.rpcUrl, deployment: network.deployment, dataDir: home.path("data") })
-      const ownerChain = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: ownerAccount })
+      // An owner has no history before it existed. On a live chain the contract may have been deployed hundreds of
+      // thousands of blocks ago, and ownerHistory would scan all of it in 100-block windows on every approveGrant.
+      // The first open on this chain therefore records the head block — minus a reorg margin, never below the real
+      // deployment block — before any owner transaction can happen, and only the owner's own context scans from it.
+      let ownerStartBlock = loadOwnerStartBlock(home, network.deployment.chainId)
+      if (ownerStartBlock === undefined) {
+        const probe = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: ownerAccount })
+        const start = (await probe.publicClient.getBlockNumber()) - 10n
+        ownerStartBlock = start > network.deployment.deploymentBlock ? start : network.deployment.deploymentBlock
+        saveOwnerStartBlock(home, network.deployment.chainId, ownerStartBlock)
+      }
+      const ownerChain = createWriteContext({
+        rpcUrl: network.rpcUrl,
+        deployment: { ...network.deployment, deploymentBlock: ownerStartBlock },
+        account: ownerAccount,
+      })
       const ownerApi = Runtime.#apiClient(server.baseUrl, network.deployment, ownerAccount)
       const vault = new FakeVaultAuthority({ seed: bytesOf(secrets.seed, 32), p256PrivateKey: secrets.p256PrivateKey, chain: ownerChain, api: ownerApi })
       const running = server
-      const runtime = new Runtime(home, network, ownerChain, ownerApi, vault, new RegistryReader(ownerChain), running.baseUrl, async () => {
+      const runtime = new Runtime(home, network, ownerChain, ownerApi, vault, new RegistryReader(ownerChain), ownerStartBlock, running.baseUrl, async () => {
         try {
           await running.close()
         } finally {

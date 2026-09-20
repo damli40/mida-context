@@ -13,7 +13,8 @@ import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
   AGENT_PERMISSIONS, MidaHome, NAMESPACE, PURPOSE_ID, Runtime, approve, init, loadAgentIdentity,
-  loadOrCreateOperatorSecrets, loadOrCreateSignerKey, readCheckpoints, requestAccess, revoke, saveCheckpoint,
+  loadOrCreateOperatorSecrets, loadOrCreateSignerKey, loadOwnerStartBlock, readCheckpoints, requestAccess, revoke,
+  saveCheckpoint,
 } from "@mida/midad"
 import type { Network } from "@mida/midad"
 
@@ -207,5 +208,24 @@ describe("M0 crash-safety and whole-agent revocation", () => {
     await expect(saveCheckpoint(runtime, "codex", { projectId: "proj-x", checkpoint: null as unknown as Record<string, unknown> })).rejects.toThrow(/checkpoint/)
     await expect(readCheckpoints(runtime, "codex", "")).rejects.toThrow(/projectId/)
     await expect(readCheckpoints(runtime, "codex", 5 as unknown as string)).rejects.toThrow(/projectId/)
+  }, STEP_TIMEOUT)
+
+  it("C1: the owner's history scan starts at the owner's recorded first block, and survives a restart", async () => {
+    // The shared runtime was opened on a fresh home in beforeAll, so its start block was recorded then.
+    const saved = loadOwnerStartBlock(home, network.deployment.chainId)
+    expect(saved).toBeDefined()
+    expect(runtime.ownerStartBlock).toBe(saved)
+    expect(runtime.ownerChain.deployment.deploymentBlock).toBe(saved)
+    expect(saved!).toBeGreaterThanOrEqual(network.deployment.deploymentBlock)
+    expect(saved!).toBeLessThanOrEqual(await runtime.ownerChain.publicClient.getBlockNumber())
+    // Every other context keeps the true deployment block.
+    expect(runtime.network.deployment.deploymentBlock).toBe(network.deployment.deploymentBlock)
+
+    // Blocks have been mined since the first open, so a recomputed start would differ: equal means it was loaded.
+    await runtime.close()
+    runtime = await Runtime.open(home, network)
+    expect(loadOwnerStartBlock(home, network.deployment.chainId)).toBe(saved)
+    expect(runtime.ownerStartBlock).toBe(saved)
+    expect(runtime.ownerChain.deployment.deploymentBlock).toBe(saved)
   }, STEP_TIMEOUT)
 })

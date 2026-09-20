@@ -8,7 +8,8 @@ import type { ProvisionedAgent } from "@mida/fake-vault"
 import type { Grant } from "@mida/sdk"
 import {
   MidaHome, identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets,
-  loadOrCreateOwnerSecrets, loadOrCreateSignerKey, markRevoked, saveAgentIdentity, saveGrants,
+  loadOrCreateOwnerSecrets, loadOrCreateSignerKey, loadOwnerStartBlock, markRevoked, saveAgentIdentity, saveGrants,
+  saveOwnerStartBlock,
 } from "@mida/midad"
 
 const freshHome = () => new MidaHome(mkdtempSync(join(tmpdir(), "mida-keys-")))
@@ -51,6 +52,35 @@ describe("owner, operator and signer secrets", () => {
     home.writeSecretJson("owner/secrets.json", { privateKey: "0xnot-a-key-SECRETVALUE", seed: "x", p256PrivateKey: "y" })
     expect(() => loadOrCreateOwnerSecrets(home)).toThrow(/privateKey/)
     expect(() => loadOrCreateOwnerSecrets(home)).not.toThrow(/SECRETVALUE/)
+  })
+})
+
+describe("the owner's history start block", () => {
+  it("round-trips the saved start block for a chain", () => {
+    const home = freshHome()
+    expect(loadOwnerStartBlock(home, 31337n)).toBeUndefined()
+    saveOwnerStartBlock(home, 31337n, 123456789n)
+    expect(loadOwnerStartBlock(home, 31337n)).toBe(123456789n)
+  })
+
+  it("returns undefined for a different chain than the one saved", () => {
+    const home = freshHome()
+    saveOwnerStartBlock(home, 31337n, 100n)
+    expect(loadOwnerStartBlock(home, 10143n)).toBeUndefined()
+  })
+
+  it("rejects a file that is not two decimal strings", () => {
+    const home = freshHome()
+    home.writeSecretJson("owner/start-block.json", { chainId: "31337", blockNumber: 100 })
+    expect(() => loadOwnerStartBlock(home, 31337n)).toThrow(/blockNumber/)
+    home.writeSecretJson("owner/start-block.json", { chainId: "31337" })
+    expect(() => loadOwnerStartBlock(home, 31337n)).toThrow(/blockNumber/)
+    home.writeSecretJson("owner/start-block.json", { chainId: "0x123", blockNumber: "100" })
+    expect(() => loadOwnerStartBlock(home, 31337n)).toThrow(/chainId/)
+    home.writeSecretJson("owner/start-block.json", { chainId: "31337", blockNumber: "-5" })
+    expect(() => loadOwnerStartBlock(home, 31337n)).toThrow(/blockNumber/)
+    home.writeSecretJson("owner/start-block.json", "not an object")
+    expect(() => loadOwnerStartBlock(home, 31337n)).toThrow(/start-block\.json/)
   })
 })
 

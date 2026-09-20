@@ -23,6 +23,7 @@ export interface AgentIdentity {
 
 const KEY = /^0x[0-9a-f]{64}$/
 const NAME = /^[a-z0-9-]+$/
+const DECIMAL = /^(0|[1-9][0-9]*)$/
 
 function assertKeys(file: string, record: Record<string, unknown> | undefined, fields: string[]): void {
   for (const field of fields) {
@@ -58,6 +59,33 @@ export function loadOrCreateOperatorSecrets(home: MidaHome): OperatorSecrets {
   const created: OperatorSecrets = { privateKey: generatePrivateKey() }
   home.writeSecretJson(file, created)
   return created
+}
+
+/**
+ * The block the owner's history scan starts from on this chain. An owner has no history before it existed, so
+ * Runtime.open records the head block on this home's first open and every later ownerHistory scan skips the —
+ * on a live chain enormous — contract-only range before it.
+ */
+export function saveOwnerStartBlock(home: MidaHome, chainId: bigint, block: bigint): void {
+  home.writeSecretJson("owner/start-block.json", { chainId: chainId.toString(10), blockNumber: block.toString(10) })
+}
+
+export function loadOwnerStartBlock(home: MidaHome, chainId: bigint): bigint | undefined {
+  const file = "owner/start-block.json"
+  const record = home.readJson<unknown>(file)
+  if (record === undefined) return undefined
+  if (typeof record !== "object" || record === null || Array.isArray(record)) {
+    throw new Error(`${file}: expected an object with "chainId" and "blockNumber" decimal strings`)
+  }
+  for (const field of ["chainId", "blockNumber"] as const) {
+    const value = (record as Record<string, unknown>)[field]
+    if (typeof value !== "string" || !DECIMAL.test(value)) {
+      throw new Error(`${file}: field "${field}" is missing or is not a decimal string`)
+    }
+  }
+  const saved = record as { chainId: string; blockNumber: string }
+  if (BigInt(saved.chainId) !== chainId) return undefined
+  return BigInt(saved.blockNumber)
 }
 
 export function loadOrCreateSignerKey(home: MidaHome, name: string): Hex {
