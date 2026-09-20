@@ -1,0 +1,20 @@
+{
+  "name": "@mida/midad",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@hono/node-server": "1.19.17",
+    "@mida/api": "workspace:*",
+    "@mida/chain": "workspace:*",
+    "@mida/cli": "workspace:*",
+    "@mida/crypto": "workspace:*",
+    "@mida/fake-vault": "workspace:*",
+    "@mida/protocol": "workspace:*",
+    "@mida/sdk": "workspace:*",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "viem": "2.56.3"
+  }
+}
