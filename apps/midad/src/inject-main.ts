@@ -160,17 +160,21 @@ async function main(): Promise<void> {
     return
   }
   // the session's whats-new seen set starts here: the contextIds this handoff covered — or the
-  // empty set, so the first real save afterwards still shows up as new
+  // empty set, so the first real save afterwards still shows up as new. It is written only once
+  // the handoff was actually delivered: a line that never reached the model covered nothing.
   const sessionId = typeof record.session_id === "string" ? record.session_id : undefined
-  if (sessionId !== undefined && body.kind !== "refused") {
+  const covered =
+    body.kind === "refused" || !Array.isArray(body.seen)
+      ? undefined
+      : body.seen.filter((id): id is string => typeof id === "string")
+  await writeLine(hookReply("SessionStart", sessionStartMessage(body, agent, Date.now()), body.text))
+  if (sessionId !== undefined && covered !== undefined) {
     try {
-      const covered = Array.isArray(body.seen) ? body.seen.filter((id): id is string => typeof id === "string") : []
       writeSeen(home, sessionId, covered)
     } catch {
       // no baseline written — the whats-new read will simply treat everything as new once
     }
   }
-  await writeLine(hookReply("SessionStart", sessionStartMessage(body, agent, Date.now()), body.text))
 }
 
 // fail-open, always: one try/catch around everything, exit 0, nothing on stderr
