@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { PERMISSION, RECORD_TYPE, namespaceId } from "@mida/protocol"
-import type { Address, Hex } from "@mida/protocol"
+import type { Address, Hex, ObjectManifest } from "@mida/protocol"
 import { hexOf, sealContextObject, wrapEpochPrivateKeyToAgent, x25519PublicKey } from "@mida/crypto"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { zeroHash } from "viem"
@@ -47,7 +47,9 @@ function fixture(count = 12, delayMs = 12): Fixture {
     wrapCalls: [],
   }
   const records = new Map<string, Record<string, unknown>>()
-  const objects: { contextId: Hex; owner: Address; namespaceId: Hex; authorId: Hex; manifest: unknown; manifestHash: Hex; ciphertext: Uint8Array }[] = []
+  // The wire shape (AnchoredObject): the manifest is the parsed object and the ciphertext is
+  // lowercase 0x hex — the same helpers agent.test.ts uses, sealed.manifest + hexOf(ciphertext).
+  const objects: { contextId: Hex; owner: Address; namespaceId: Hex; authorId: Hex; manifest: ObjectManifest; manifestHash: Hex; ciphertext: Hex }[] = []
   for (let i = 0; i < count; i += 1) {
     const readEpoch = BigInt((i % 2) + 1) // two epochs, interleaved
     const contextId = hexOf(randomBytes(32))
@@ -57,7 +59,7 @@ function fixture(count = 12, delayMs = 12): Fixture {
       binding: { chainId: CHAIN_ID, contextRegistry: CONTEXT_REGISTRY, contextId, namespaceId: NAMESPACE_ID, readEpoch },
       epochPublicKey: x25519PublicKey(EPOCH_PRIVATE[Number(readEpoch)]!),
     })
-    objects.push({ contextId, owner: OWNER, namespaceId: NAMESPACE_ID, authorId: AGENT_ID, manifest: sealed.manifest, manifestHash: sealed.manifestHash, ciphertext: sealed.ciphertext })
+    objects.push({ contextId, owner: OWNER, namespaceId: NAMESPACE_ID, authorId: AGENT_ID, manifest: sealed.manifest, manifestHash: sealed.manifestHash, ciphertext: hexOf(sealed.ciphertext) })
     records.set(contextId, {
       contextId,
       owner: OWNER,
