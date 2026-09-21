@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { spawn } from "node:child_process"
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -14,8 +14,8 @@ import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
   FileAccessRequestStore, MidaHome, NAMESPACE, Runtime, approve, callDaemon, enqueue, init,
-  loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, requestAccess, saveCheckpoint,
-  startDaemon, startPersistentApi,
+  listJobs, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, removeJob, requestAccess,
+  saveCheckpoint, startDaemon, startPersistentApi,
 } from "@mida/midad"
 import type { DaemonHandle, HandoffResult, Network } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
@@ -161,7 +161,7 @@ describe("POST /handoff on local Anvil", () => {
     await daemon?.close()
     await apiServer?.close()
     await env?.stop()
-  })
+  }, 120_000)
 
   it("(a) an approved agent gets the merged handoff: the first session's request verbatim, then both record ids", async () => {
     const result = await handoff("codex", workDir)
@@ -271,7 +271,84 @@ describe("POST /handoff on local Anvil", () => {
     expect(home.readJson("state/continues/sess-d.json")).toEqual({ continues: "sess-c", projectId: "proj-hand" })
   }, STEP_TIMEOUT)
 
-  it("(g) an agent the chain shows revoked gets the revoked line — and the server refuses the read itself", async () => {
+  it("(g) a missing grants.json is not 'not approved': the chain still answers live and the job saves", async () => {
+    // grants.json is the local index of what the agent holds, not the authority. With it deleted
+    // the drainer must ask the chain under the owner the runtime holds — a live answer means the
+    // queued job saves, not that the whole queue for the agent is dropped as not-approved.
+    const grantsPath = home.path("agents/claude-code/grants.json")
+    const grantsBytes = readFileSync(grantsPath)
+    rmSync(grantsPath)
+    try {
+      const transcript = join(hookHomeDir, ".claude", "projects", "proj", "sess-nogrants.jsonl")
+      mkdirSync(dirname(transcript), { recursive: true })
+      writeFileSync(transcript, JSON.stringify({ type: "user", message: { content: "hi" } }) + "\n")
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "sess-nogrants", transcriptPath: transcript, cwd: workDir, error: null })
+      await callDaemon(home, "/kick", {}, { timeoutMs: STEP_TIMEOUT })
+      const deadline = Date.now() + 20_000
+      for (;;) {
+        const saved = home.has("logs/drain.jsonl") && readFileSync(home.path("logs/drain.jsonl"), "utf8")
+          .split("\n")
+          .some((line) => line.includes('"sessionId":"sess-nogrants"') && line.includes('"outcome":"saved"'))
+        if (saved) break
+        if (Date.now() > deadline) {
+          const drainLog = home.has("logs/drain.jsonl") ? readFileSync(home.path("logs/drain.jsonl"), "utf8") : "(none)"
+          throw new Error(`sess-nogrants was never saved; drain log ${drainLog}`)
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+      expect(listJobs(home).map((j) => j.sessionId)).not.toContain("sess-nogrants")
+    } finally {
+      writeFileSync(grantsPath, grantsBytes)
+    }
+  }, STEP_TIMEOUT)
+
+  it("(h) a chain the drainer cannot reach leaves the job queued — 'cannot determine' is transient, and the job saves once the chain returns", async () => {
+    // same missing-grants fallback, with the chain unreachable: the drainer cannot determine
+    // approval at all, which is transient — the job stays queued rather than being deleted as
+    // not-approved, and it still saves when the chain comes back.
+    const grantsPath = home.path("agents/claude-code/grants.json")
+    const grantsBytes = readFileSync(grantsPath)
+    const networkPath = home.path("network.json")
+    const networkBytes = readFileSync(networkPath)
+    rmSync(grantsPath)
+    writeFileSync(networkPath, JSON.stringify({ ...JSON.parse(networkBytes.toString("utf8")), rpcUrl: "http://127.0.0.1:1" }))
+    const transcript = join(hookHomeDir, ".claude", "projects", "proj", "sess-unreach.jsonl")
+    mkdirSync(dirname(transcript), { recursive: true })
+    writeFileSync(transcript, JSON.stringify({ type: "user", message: { content: "hi" } }) + "\n")
+    const drainLines = () =>
+      home.has("logs/drain.jsonl")
+        ? readFileSync(home.path("logs/drain.jsonl"), "utf8").split("\n").filter((line) => line.includes('"sessionId":"sess-unreach"'))
+        : []
+    const poll = async (outcome: string, ms: number) => {
+      const deadline = Date.now() + ms
+      for (;;) {
+        if (drainLines().some((line) => line.includes(`"outcome":"${outcome}"`))) return true
+        if (Date.now() > deadline) return false
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+    }
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "sess-unreach", transcriptPath: transcript, cwd: workDir, error: null })
+      await callDaemon(home, "/kick", {}, { timeoutMs: STEP_TIMEOUT })
+      if (!(await poll("failed", 20_000))) {
+        throw new Error(`sess-unreach never recorded a transient failure; drain log ${drainLines().join("\n")}`)
+      }
+      // transient, not a verdict: the job is still queued after the failed pass
+      expect(listJobs(home).map((j) => j.sessionId)).toContain("sess-unreach")
+    } finally {
+      writeFileSync(networkPath, networkBytes)
+      writeFileSync(grantsPath, grantsBytes)
+      // clear the recorded backoff so the surviving job saves on the settle pass that is already
+      // sleeping — waiting for "saved" both proves the heal and leaves no pass in flight
+      home.remove("queue/state/sess-unreach.json")
+      await callDaemon(home, "/kick", {}, { timeoutMs: STEP_TIMEOUT }).catch(() => {})
+      if (!(await poll("saved", 90_000))) {
+        for (const job of listJobs(home)) if (job.sessionId === "sess-unreach") removeJob(home, job.id)
+      }
+    }
+  }, 120_000)
+
+  it("(i) an agent the chain shows revoked gets the revoked line — and the server refuses the read itself", async () => {
     // revoke on the chain only, leaving the approved-projects row in place: the check passes,
     // the chain's own capability record says revoked. (mida revoke would also drop the row, which
     // is the not-approved path — tested above.)
@@ -300,7 +377,7 @@ describe("POST /handoff on local Anvil", () => {
     await expect(readThrough("doomed-agent")).rejects.toMatchObject({ code: "CAPABILITY_REVOKED" })
   }, STEP_TIMEOUT)
 
-  it("(h) an expired grant answers not-approved (Anvil time travel)", async () => {
+  it("(j) an expired grant answers not-approved (Anvil time travel)", async () => {
     // grants live 30 days — last test in the file: the moved clock must not leak into anything else
     await increaseLocalTime(env.rpcUrl, 33n * 24n * 60n * 60n)
     const result = await handoff("codex", workDir)

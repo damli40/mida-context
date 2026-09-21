@@ -198,7 +198,8 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
   const minGapMs = deps.minGapMs ?? DEFAULT_MIN_GAP_MS
   const homeDir = deps.homeDir ?? homedir()
   const save = deps.save ?? saveCheckpoint
-  const isApproved = deps.isApproved ?? ((agent: string) => agentApprovedOnChain(deps.home, agent))
+  const isApproved =
+    deps.isApproved ?? ((agent: string) => agentApprovedOnChain(deps.home, agent, async () => (await openRuntime()).owner))
   const counts = emptyResult()
   const dueSooner = (at: number) => {
     if (counts.earliestDueMs === null || at < counts.earliestDueMs) counts.earliestDueMs = at
@@ -453,16 +454,22 @@ function failureCode(error: unknown): string {
 }
 
 /**
- * The approval check the drainer can afford before every compile: local identity and grants prove
- * the agent was approved once (missing either answers not-approved with no chain call), and a
- * read-only registry reader built from `network.json` — no owner key, no `midad.lock` — confirms
- * at least one capability is still live on chain.
+ * The approval check the drainer can afford before every compile: a missing local identity means
+ * the agent was never set up here (not-approved with no chain call), and a read-only registry
+ * reader built from `network.json` — no owner key, no `midad.lock` — confirms at least one
+ * capability is still live on chain. `grants.json` supplies the owner to ask about, but it is only
+ * the local index: when it is absent the owner comes from the runtime (`ownerOf`), because a
+ * missing file proves nothing. A runtime that cannot open or has no owner throws — "cannot
+ * determine" is transient — and only the chain's own "no live capability" is permanent.
  */
-async function agentApprovedOnChain(home: MidaHome, agent: string): Promise<boolean> {
+async function agentApprovedOnChain(home: MidaHome, agent: string, ownerOf: () => Promise<Address | undefined>): Promise<boolean> {
   const identity = loadAgentIdentity(home, agent)
   if (identity === undefined) return false
-  const owner = loadGrants(home, agent)[0]?.owner
-  if (typeof owner !== "string") return false
+  let owner = loadGrants(home, agent)[0]?.owner
+  if (typeof owner !== "string") {
+    owner = await ownerOf()
+    if (typeof owner !== "string") throw new Error(`cannot determine the owner for ${agent}'s approval check`)
+  }
   const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown }>("network.json")
   if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) {
     throw new Error("network.json is missing or incomplete; run mida init first")
