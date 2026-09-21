@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS objects (
   expected_parent_id TEXT NOT NULL,
   manifest TEXT NOT NULL,           -- JSON ObjectManifest
   manifest_hash TEXT NOT NULL,
+  size INTEGER NOT NULL,            -- manifest.ciphertextSize; SUM(size) feeds the atomic pending cap
   uploaded_at TEXT NOT NULL,        -- ISO-8601 UTC, sorts lexicographically
   anchored_at TEXT                  -- ISO-8601 UTC of the first verified chain match, NULL = pending
 );

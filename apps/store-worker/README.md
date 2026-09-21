@@ -88,6 +88,11 @@ against a real Cloudflare account.
 - **Daily maintenance is automatic.** The `scheduled` cron (`0 4 * * *` in `wrangler.toml`)
   deletes pending objects older than 24 h that the chain never anchored, and nonces older than
   the 60-second request window.
+- **One process per data directory.** The file-backed store (what `createContextApi` uses with
+  `dataDir` — the local/self-hosted mode) enforces its quotas read-then-write: atomic inside one
+  Node process, but two processes sharing a directory can both pass the pending-byte check. Run
+  exactly one process per directory; if you need several front ends, use the D1-backed deployment
+  where the pending cap is a single conditional `INSERT` and atomic across instances.
 - **`nodejs_compat` is on, deliberately.** The shared `@mida/api` package re-exports its
   file-backed stores (`node:fs`/`node:path`), so the bundler sees Node imports. The Worker always
   injects the D1 stores; those code paths never execute.

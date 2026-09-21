@@ -48,6 +48,16 @@ export interface ObjectStore {
    * and is never cleared, because a record cannot be un-registered on this chain design.
    */
   markAnchored(contextId: Hex, anchoredAt: string): Promise<void>
+  /**
+   * The quota-gated write for `PUT /objects`: the row lands only while the signer's unanchored bytes
+   * (`anchored_at IS NULL`) plus this object's ciphertext stay within `maxPendingBytes`. "repeat" is a
+   * row with the same manifestHash already stored — a free no-op; a different manifest for the same
+   * contextId throws COMMITMENT_MISMATCH, as `putObject` does. D1 evaluates the sum and the insert in
+   * a single statement, so two Worker instances cannot both squeeze under the cap; the file-backed
+   * store performs the same check synchronously — atomic inside one Node process, but not across
+   * processes sharing a directory, which the README documents as single-process.
+   */
+  putObjectWithinPending(object: StoredObject, maxPendingBytes: number): Promise<"stored" | "repeat" | "over-cap">
   putWrap(wrap: ReaderEpochWrap): Promise<void>
   getWrap(key: WrapKey): Promise<ReaderEpochWrap | undefined>
   /**

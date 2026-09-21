@@ -290,21 +290,31 @@ export function createContextApi(options: ContextApiOptions) {
       return quotaExceeded(c, "maxPutsPerSignerPerDay", `${putCount - 1} puts already accepted on ${day}`)
     }
 
-    // 8. store as pending; §12.3 serves it only once Monad holds matching commitments
+    // 8. store as pending; §12.3 serves it only once Monad holds matching commitments. The conditional
+    // insert re-runs the pending-byte sum inside the same statement, so two instances racing the cap
+    // cannot both be admitted — the loser sees "over-cap" here even though its own scan passed. The row
+    // lands before its blob: a failed blob write leaves a pending row the 24 h sweep reclaims, rather
+    // than an orphaned blob nobody references.
+    const admission = await store.putObjectWithinPending(
+      {
+        contextId: manifest.contextId,
+        owner: upload.owner,
+        uploader: signer,
+        namespaceId: upload.namespaceId,
+        authorId,
+        objectNonce: upload.objectNonce,
+        expectedParentId: upload.expectedParentId,
+        manifest,
+        manifestHash: committedManifestHash,
+        uploadedAt: new Date().toISOString(),
+        anchoredAt: null,
+      },
+      limits.maxPendingBytesPerSigner,
+    )
+    if (admission === "over-cap") {
+      return quotaExceeded(c, "maxPendingBytesPerSigner", "unanchored ciphertext reached the cap while this PUT was in flight")
+    }
     await store.blobs.put(ciphertext)
-    await store.putObject({
-      contextId: manifest.contextId,
-      owner: upload.owner,
-      uploader: signer,
-      namespaceId: upload.namespaceId,
-      authorId,
-      objectNonce: upload.objectNonce,
-      expectedParentId: upload.expectedParentId,
-      manifest,
-      manifestHash: committedManifestHash,
-      uploadedAt: new Date().toISOString(),
-      anchoredAt: null,
-    })
     return c.json({ contextId: manifest.contextId, manifestHash: committedManifestHash, state: "pending" })
   })
 

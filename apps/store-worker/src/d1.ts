@@ -122,8 +122,8 @@ export class D1ObjectStore implements ObjectStore {
     await this.db
       .prepare(
         `INSERT OR IGNORE INTO objects
-           (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, uploaded_at, anchored_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, size, uploaded_at, anchored_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         object.contextId.toLowerCase(),
@@ -135,6 +135,7 @@ export class D1ObjectStore implements ObjectStore {
         object.expectedParentId.toLowerCase(),
         JSON.stringify(object.manifest),
         object.manifestHash.toLowerCase(),
+        object.manifest.ciphertextSize,
         object.uploadedAt,
         object.anchoredAt,
       )
@@ -159,6 +160,48 @@ export class D1ObjectStore implements ObjectStore {
     return results
       .map(objectFrom)
       .sort((a, b) => (a.uploadedAt === b.uploadedAt ? (a.contextId < b.contextId ? -1 : 1) : a.uploadedAt < b.uploadedAt ? -1 : 1))
+  }
+
+  async putObjectWithinPending(object: StoredObject, maxPendingBytes: number): Promise<"stored" | "repeat" | "over-cap"> {
+    // The cap check and the write are one statement: SQLite computes the unanchored-byte sum for this
+    // uploader at insert time, so two Worker instances racing the same cap cannot both be admitted —
+    // one of them sees 0 changes here and is refused below.
+    const inserted = await this.db
+      .prepare(
+        `INSERT INTO objects
+           (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, size, uploaded_at, anchored_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (SELECT 1 FROM objects WHERE context_id = ?)
+           AND (SELECT COALESCE(SUM(size), 0) FROM objects WHERE uploader = ? AND anchored_at IS NULL) + ? <= ?`,
+      )
+      .bind(
+        object.contextId.toLowerCase(),
+        object.owner.toLowerCase(),
+        object.uploader.toLowerCase(),
+        object.namespaceId.toLowerCase(),
+        object.authorId.toLowerCase(),
+        object.objectNonce.toLowerCase(),
+        object.expectedParentId.toLowerCase(),
+        JSON.stringify(object.manifest),
+        object.manifestHash.toLowerCase(),
+        object.manifest.ciphertextSize,
+        object.uploadedAt,
+        object.anchoredAt,
+        object.contextId.toLowerCase(),
+        object.uploader.toLowerCase(),
+        object.manifest.ciphertextSize,
+        maxPendingBytes,
+      )
+      .run()
+    if (changes(inserted) > 0) return "stored"
+    // 0 changes is ambiguous by design of WHERE-guarded inserts: the row either already exists
+    // (repeat or commitment attack) or the sum refused the cap — the stored row decides which.
+    const row = await this.db.prepare("SELECT manifest_hash FROM objects WHERE context_id = ?").bind(object.contextId.toLowerCase()).first<{ manifest_hash: string }>()
+    if (row === null) return "over-cap"
+    if (row.manifest_hash !== object.manifestHash.toLowerCase()) {
+      throw new MidaError("COMMITMENT_MISMATCH", "a different manifest is already stored for this contextId")
+    }
+    return "repeat"
   }
 
   async pendingByUploader(uploader: Address): Promise<StoredObject[]> {

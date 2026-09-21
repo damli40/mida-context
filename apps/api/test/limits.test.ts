@@ -283,6 +283,22 @@ describe("upload-abuse limits", () => {
     expect(recordCalls).toHaveLength(40)
   })
 
+  it("two simultaneous PUTs that together exceed the pending cap admit exactly one", async () => {
+    const { app } = apiFor(stubReader(), { maxPendingBytesPerSigner: 100 })
+    const statuses: number[] = []
+    const client = clientFor(app, async (url, init) => {
+      const response = await app.request(url, init)
+      statuses.push(response.status)
+      return response
+    })
+    // Both requests run their own pending-byte scan against an empty store and pass it; the admission
+    // decision is re-made inside putObjectWithinPending, so only the winner's row lands.
+    const results = await Promise.allSettled([client.putObject(upload(randomBytes(60))), client.putObject(upload(randomBytes(60)))])
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1)
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1)
+    expect(statuses.sort()).toEqual([200, 429])
+  })
+
   it("caps the public agent-manifest body at 16 KB at the boundary", async () => {
     const { app } = apiFor(stubReader())
     const client = clientFor(app)

@@ -78,6 +78,26 @@ export class ApiStore implements ObjectStore {
       .sort((a, b) => (a.uploadedAt === b.uploadedAt ? (a.contextId < b.contextId ? -1 : 1) : a.uploadedAt < b.uploadedAt ? -1 : 1))
   }
 
+  async putObjectWithinPending(object: StoredObject, maxPendingBytes: number): Promise<"stored" | "repeat" | "over-cap"> {
+    const path = join(this.#dir, "objects", `${object.contextId}.json`)
+    const existing = readJson<StoredObject>(path)
+    if (existing !== undefined) {
+      if (existing.manifestHash === object.manifestHash) return "repeat"
+      throw new MidaError("COMMITMENT_MISMATCH", "a different manifest is already stored for this contextId")
+    }
+    // The check runs fully synchronously — no await between the directory read and the write — so a
+    // single Node process cannot interleave two admissions. Across processes it is not atomic, which
+    // is why the README documents one process per data directory.
+    let pending = object.manifest.ciphertextSize
+    const uploader = object.uploader.toLowerCase()
+    for (const other of this.#allObjectsSync()) {
+      if (other.uploader.toLowerCase() === uploader && other.anchoredAt === null) pending += other.manifest.ciphertextSize
+    }
+    if (pending > maxPendingBytes) return "over-cap"
+    writeJsonAtomic(this.#dir, path, normalize(object))
+    return "stored"
+  }
+
   async pendingByUploader(uploader: Address): Promise<StoredObject[]> {
     const key = uploader.toLowerCase()
     return (await this.#allObjects())
@@ -93,6 +113,11 @@ export class ApiStore implements ObjectStore {
   }
 
   async #allObjects(): Promise<StoredObject[]> {
+    return this.#allObjectsSync()
+  }
+
+  /** The synchronous core — `putObjectWithinPending` uses it so its check-and-write never yields. */
+  #allObjectsSync(): StoredObject[] {
     let names: string[]
     try {
       names = readdirSync(join(this.#dir, "objects")).filter((name) => name.endsWith(".json"))

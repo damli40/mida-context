@@ -264,6 +264,36 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
       }
     })
 
+    it("admits only one of two racing PUTs that together exceed the pending cap", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const a = fakeObject(OWNER).object
+        a.manifest.ciphertextSize = 60
+        const b = fakeObject(OWNER).object
+        b.manifest.ciphertextSize = 60
+        // Both PUTs see an empty store; the conditional insert lets exactly one land under cap 100.
+        const results = await Promise.all([
+          stores.objects.putObjectWithinPending(a, 100),
+          stores.objects.putObjectWithinPending(b, 100),
+        ])
+        expect(results.slice().sort()).toEqual(["over-cap", "stored"])
+        const aStored = await stores.objects.getObject(a.contextId)
+        const bStored = await stores.objects.getObject(b.contextId)
+        expect(aStored === undefined).not.toBe(bStored === undefined)
+        const winner = aStored === undefined ? b : a
+
+        // Marking the winner anchored frees its bytes: a third 60-byte PUT fits under the cap again.
+        await stores.objects.markAnchored(winner.contextId, "2026-09-21T00:00:00.000Z")
+        const c = fakeObject(OWNER).object
+        c.manifest.ciphertextSize = 60
+        expect(await stores.objects.putObjectWithinPending(c, 100)).toBe("stored")
+        // And a repeat of stored bytes is still a free no-op, even while over the byte cap.
+        expect(await stores.objects.putObjectWithinPending(winner, 1)).toBe("repeat")
+      } finally {
+        await cleanup()
+      }
+    })
+
     it("sweeps pending objects past 24 h and expired nonces, and never an anchored object", async () => {
       const { stores, cleanup } = await make()
       try {
