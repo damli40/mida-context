@@ -13,18 +13,20 @@ import type { Address, Hex, SignedAgentCapabilityManifest } from "@mida/protocol
 import { bytesOf, hexOf, manifestHash, verifyObjectManifest } from "@mida/crypto"
 import type { Deployment } from "@mida/chain"
 import {
+  manifestBindingFor,
   manifestBodyHash,
   manifestEnvelopeBytes,
   manifestEnvelopeHash,
   parseManifestEnvelopeBytes,
+  recoverTypedDataSigner,
   validateManifestBody,
   verifySignedManifest,
 } from "@mida/grant-advisor"
 import { Hono } from "hono"
 import type { Context } from "hono"
 import { createMiddleware } from "hono/factory"
-import { zeroHash } from "viem"
-import { authenticateRequest } from "./auth.js"
+import { isAddressEqual, zeroHash } from "viem"
+import { assertAuthHeaderShape, authenticateRequest } from "./auth.js"
 import { authorizeAgent } from "./authorize.js"
 import type { ContextRecordView, RegistryReader } from "./chain-views.js"
 import { DenyOverlay } from "./deny-overlay.js"
@@ -106,25 +108,6 @@ export function createContextApi(options: ContextApiOptions) {
     return c.json(body, status as 400)
   })
 
-  const authenticated = createMiddleware<Env>(async (c, next) => {
-    const body = await readBodyWithin(c, limits.maxRequestBodyBytes)
-    c.set(
-      "signer",
-      await authenticateRequest({
-        method: c.req.method,
-        url: new URL(c.req.url),
-        headers: c.req.raw.headers,
-        body,
-        chainId: deployment.chainId,
-        capabilityRegistry: deployment.capabilityRegistry,
-        now: clock(),
-        replay,
-      }),
-    )
-    c.set("body", body)
-    await next()
-  })
-
   const json = <T>(body: Uint8Array): T => {
     try {
       return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body)) as T
@@ -133,11 +116,39 @@ export function createContextApi(options: ContextApiOptions) {
     }
   }
 
+  /**
+   * The §12.1 gate for signed routes, ordered cheapest-first so a malformed request costs nothing: header
+   * presence and format, then the body byte cap, then JSON shape — all before a signature is verified,
+   * a replay nonce is recorded or Monad is read. `maxBodyBytes` is per-route: the manifest PUT is capped
+   * at 16 KB while object uploads may carry up to 1 MB of ciphertext.
+   */
+  const authenticated = (maxBodyBytes: number) =>
+    createMiddleware<Env>(async (c, next) => {
+      assertAuthHeaderShape(c.req.raw.headers)
+      const body = await readBodyWithin(c, maxBodyBytes)
+      if (body.length > 0) json(body)
+      c.set(
+        "signer",
+        await authenticateRequest({
+          method: c.req.method,
+          url: new URL(c.req.url),
+          headers: c.req.raw.headers,
+          body,
+          chainId: deployment.chainId,
+          capabilityRegistry: deployment.capabilityRegistry,
+          now: clock(),
+          replay,
+        }),
+      )
+      c.set("body", body)
+      await next()
+    })
+
   const optionalCapability = (value: string | undefined): Hex | undefined =>
     value === undefined ? undefined : hex(value, 32, "capabilityId")
 
   // ---------- §12.2 object upload ----------
-  app.put("/objects", authenticated, async (c) => {
+  app.put("/objects", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const signer = c.get("signer")
     const upload = parseObjectUpload(json(c.get("body")))
     namespaceById(upload.namespaceId)
@@ -244,7 +255,7 @@ export function createContextApi(options: ContextApiOptions) {
   })
 
   // ---------- §12.3 object read ----------
-  app.get("/objects", authenticated, async (c) => {
+  app.get("/objects", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const signer = c.get("signer")
     const owner = address(c.req.query("owner"), "owner")
     const namespaceId = hex(c.req.query("namespaceId"), 32, "namespaceId")
@@ -268,7 +279,7 @@ export function createContextApi(options: ContextApiOptions) {
     return c.json({ objects })
   })
 
-  app.get("/manifests/:contextId", authenticated, async (c) => {
+  app.get("/manifests/:contextId", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const signer = c.get("signer")
     const contextId = hex(c.req.param("contextId"), 32, "contextId")
     const stored = await store.getObject(contextId)
@@ -288,25 +299,60 @@ export function createContextApi(options: ContextApiOptions) {
   })
 
   // ---------- §14.1 agent capability manifests (public metadata) ----------
-  app.put("/agent-manifests", async (c) => {
-    const envelope = json<SignedAgentCapabilityManifest>(await readBodyWithin(c, limits.maxManifestBodyBytes))
-    if (envelope === null || typeof envelope !== "object" || typeof envelope.operatorSignature !== "string" || !/^0x[0-9a-f]{130}$/.test(envelope.operatorSignature)) {
+  app.put("/agent-manifests", authenticated(limits.maxManifestBodyBytes), async (c) => {
+    const signer = c.get("signer")
+    const envelope = json<SignedAgentCapabilityManifest>(c.get("body"))
+    if (envelope === null || typeof envelope !== "object" || typeof envelope.manifest !== "object" || typeof envelope.operatorSignature !== "string" || !/^0x[0-9a-f]{130}$/.test(envelope.operatorSignature)) {
       throw new MidaError("INVALID_WIRE", "envelope needs a manifest and a lowercase 65-byte operatorSignature")
     }
-    const now = await reader.now()
-    validateManifestBody(envelope.manifest, now)
+    // Structural rules are local work: issuedAt is informational chronology, so the wall clock is the check
+    // here — a body the chain later commits to is re-validated against chain time inside verifySignedManifest.
+    validateManifestBody(envelope.manifest, clock())
     const envelopeHash = manifestEnvelopeHash(envelope)
     const bodyHash = manifestBodyHash(envelope.manifest)
-    // Fail-closed indexing: once the agent is registered, an envelope that cannot verify can never be served, so the
-    // write is rejected rather than repointing the index. For agents not yet on Monad the bytes are kept for later
-    // serving, but an existing index entry is never displaced by an unverifiable write (first-write-wins).
+
+    const existing = await store.getManifestIndex(bodyHash)
+    // The manifest names no key field; the only identity it carries is the operator that signed the body,
+    // recoverable from operatorSignature locally — no chain read needed to learn who may stage it.
+    const operator = recoverTypedDataSigner(
+      manifestBindingFor({ chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, body: envelope.manifest }),
+      envelope.operatorSignature,
+    )
+
+    // A repeat of identical bytes is a no-op — but only for the manifest's own operator key (or a manifest
+    // whose signature names no one). The same bytes carried by any other key are someone else's upload and
+    // are decided below: denied while the agent is unregistered, accepted only once the chain can verify.
+    if (existing?.envelopeHash === envelopeHash && (operator === null || isAddressEqual(operator, signer))) {
+      return c.json({ bodyHash, envelopeHash })
+    }
+
+    // The request signature buys a per-signer quota and replay protection, not authority: any key may
+    // carry a manifest, but only up to the daily cap.
+    const day = new Date(Number(clock()) * 1000).toISOString().slice(0, 10)
+    const manifestPuts = await store.recordManifestPut(signer, day)
+    if (manifestPuts > limits.maxManifestPutsPerSignerPerDay) {
+      return quotaExceeded(c, "maxManifestPutsPerSignerPerDay", `${manifestPuts - 1} puts already accepted on ${day}`)
+    }
+
     const agentRecord = await reader.getAgent(envelope.manifest.agentId)
     if (agentRecord !== null) {
-      verifySignedManifest({ envelope, agentRecord, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, now })
-    }
-    const existing = await store.getManifestIndex(bodyHash)
-    if (existing !== envelopeHash && (agentRecord !== null || existing === undefined)) {
-      await store.setManifestIndex(bodyHash, envelopeHash)
+      // Fail-closed indexing: once the agent is registered, an envelope that cannot verify can never be
+      // served, so the write is rejected rather than repointing the index. The envelope is fully
+      // self-authenticating here — body hash and operator signature both check against the chain record —
+      // so any signer may carry it: the bytes are identical to what the operator published.
+      verifySignedManifest({ envelope, agentRecord, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, now: await reader.now() })
+      await store.setManifestIndex(bodyHash, envelopeHash, { verifiedAt: new Date(Number(clock()) * 1000).toISOString() })
+    } else {
+      // While the agent has no chain record, only the operator that signed the manifest may stage these
+      // bytes — the same manifest uploaded by anyone else is denied. An operatorSignature that does not
+      // recover names no one: the daily quota alone bounds it, and the row still cannot serve until a
+      // registered agent record verifies it.
+      if (operator !== null && !isAddressEqual(operator, signer)) {
+        throw new MidaError("CAPABILITY_DENIED", "only the operator that signed this manifest may store it before the agent registers")
+      }
+      // For agents not yet on Monad the bytes are kept for later serving, but an existing index entry is
+      // never displaced by an unverifiable write (first-write-wins).
+      if (existing === undefined) await store.setManifestIndex(bodyHash, envelopeHash)
     }
     // Content-addressed: writing the same envelope again changes nothing and costs nothing.
     await store.blobs.put(manifestEnvelopeBytes(envelope))
@@ -315,16 +361,16 @@ export function createContextApi(options: ContextApiOptions) {
 
   app.get("/agent-manifests/:bodyHash", async (c) => {
     const bodyHash = hex(c.req.param("bodyHash"), 32, "bodyHash")
-    const envelopeHash = await store.getManifestIndex(bodyHash)
-    if (envelopeHash === undefined) throw new MidaError("MANIFEST_NOT_FOUND", "no envelope indexed for this body hash")
+    const entry = await store.getManifestIndex(bodyHash)
+    if (entry === undefined) throw new MidaError("MANIFEST_NOT_FOUND", "no envelope indexed for this body hash")
     let bytes: Uint8Array
     try {
-      bytes = await store.blobs.get(envelopeHash)
+      bytes = await store.blobs.get(entry.envelopeHash)
     } catch (error) {
       if (isMidaError(error)) throw error
       throw new MidaError("MANIFEST_NOT_FOUND", "indexed envelope bytes are missing")
     }
-    const envelope = parseManifestEnvelopeBytes({ bytes, expectedEnvelopeHash: envelopeHash, expectedBodyHash: bodyHash })
+    const envelope = parseManifestEnvelopeBytes({ bytes, expectedEnvelopeHash: entry.envelopeHash, expectedBodyHash: bodyHash })
     const agentRecord = await reader.getAgent(envelope.manifest.agentId)
     if (agentRecord === null) throw new MidaError("AGENT_ID_MISMATCH", "manifest agent is not registered")
     verifySignedManifest({ envelope, agentRecord, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, now: await reader.now() })
@@ -332,7 +378,7 @@ export function createContextApi(options: ContextApiOptions) {
   })
 
   // ---------- §12.4 reader-epoch wraps ----------
-  app.post("/epoch-wraps", authenticated, async (c) => {
+  app.post("/epoch-wraps", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const signer = c.get("signer")
     const wrap = parseReaderWrap(json(c.get("body")))
     // 1. owner authentication alone is necessary but never sufficient
@@ -360,7 +406,7 @@ export function createContextApi(options: ContextApiOptions) {
     return c.json({ stored: true })
   })
 
-  app.get("/epoch-wraps", authenticated, async (c) => {
+  app.get("/epoch-wraps", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const signer = c.get("signer")
     const owner = address(c.req.query("owner"), "owner")
     const namespaceId = hex(c.req.query("namespaceId"), 32, "namespaceId")
@@ -388,7 +434,7 @@ export function createContextApi(options: ContextApiOptions) {
   })
 
   // ---------- §12.5 fast revocation deny overlay ----------
-  app.post("/revocations", authenticated, async (c) => {
+  app.post("/revocations", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const owner = c.get("signer")
     const request = json<{ capabilityId?: unknown; agentId?: unknown }>(c.get("body"))
     let target: RevocationTarget
@@ -415,7 +461,7 @@ export function createContextApi(options: ContextApiOptions) {
     return c.json({ intentId: intent.id, state: intent.state, cancellationNonce: intent.cancellationNonce })
   })
 
-  app.post("/revocations/:id/cancel", authenticated, async (c) => {
+  app.post("/revocations/:id/cancel", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const owner = c.get("signer")
     const id = hex(c.req.param("id"), 32, "id")
     const request = json<{ expiresAt?: string; assertion?: WebAuthnAssertionInput }>(c.get("body"))

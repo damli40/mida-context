@@ -159,7 +159,7 @@ describe("the file-backed store implementations", () => {
       now,
       isAnchored: async (object) => object.contextId === anchoredOld.contextId,
     })
-    expect(result).toEqual({ objectsRemoved: 1, noncesRemoved: 1 })
+    expect(result).toEqual({ objectsRemoved: 1, manifestsRemoved: 0, noncesRemoved: 1 })
     expect(await stores.objects.getObject(old.contextId)).toBeUndefined()
     expect(await stores.objects.getObject(young.contextId)).toBeDefined()
     expect(await stores.objects.getObject(anchoredOld.contextId)).toBeDefined()

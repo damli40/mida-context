@@ -34,6 +34,7 @@ import type { AgentDeclaration, GrantSelection, ProvisionedAgent } from "@mida/f
 import { randomBytes } from "@noble/hashes/utils.js"
 import { ContextApiClient, RegistryReader, createContextApi } from "@mida/api"
 import type { ObjectStore, ObjectUploadBody } from "@mida/api"
+import { manifestBindingFor } from "@mida/grant-advisor"
 
 const CAREER = namespaceId("goals.career")
 const SEED = new Uint8Array(32).fill(0x42)
@@ -180,13 +181,20 @@ describe("Context API routes (plan Task 24)", () => {
     await expect(clients.R!.putAgentManifest(forged)).rejects.toMatchObject({ code: "MANIFEST_SIGNATURE_INVALID" })
     expect(await clients.R!.getAgentManifest(agents.R!.manifestHash)).toEqual(agents.R!.manifest)
 
-    // While the agent is unresolvable on Monad the index is first-write-wins: a second write keeps its bytes in the
-    // blob store but cannot displace the existing entry.
+    // While the agent is unresolvable on Monad the index is first-write-wins, and the only identity the
+    // manifest names is the operator recovered from operatorSignature — so a staging write must be
+    // request-signed by that same key. A second operator's write stores its bytes but cannot displace
+    // the existing entry; the same manifest carried by any other key is denied outright.
     const prematureBody = { ...agents.R!.manifest.manifest, agentId: hexOf(randomBytes(32)) }
-    const first = await clients.R!.putAgentManifest({ manifest: prematureBody, operatorSignature: agents.R!.manifest.operatorSignature })
-    const second = await clients.R!.putAgentManifest({ manifest: prematureBody, operatorSignature: agents.W!.manifest.operatorSignature })
+    const binding = manifestBindingFor({ chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, body: prematureBody })
+    const envelopeFor = async (operator: LocalAccount) => ({ manifest: prematureBody, operatorSignature: await operator.signTypedData(binding as never) })
+    const operatorA = privateKeyToAccount(ANVIL_PRIVATE_KEYS[7]!)
+    const operatorB = privateKeyToAccount(ANVIL_PRIVATE_KEYS[8]!)
+    const first = await clientFor(operatorA).putAgentManifest(await envelopeFor(operatorA))
+    await expect(clientFor(operatorB).putAgentManifest(await envelopeFor(operatorA))).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
+    const second = await clientFor(operatorB).putAgentManifest(await envelopeFor(operatorB))
     expect(second.envelopeHash).not.toBe(first.envelopeHash)
-    expect(await store.getManifestIndex(first.bodyHash)).toBe(first.envelopeHash)
+    expect(await store.getManifestIndex(first.bodyHash)).toMatchObject({ envelopeHash: first.envelopeHash })
   })
 
   it("serves anchored owner context to an authorized reader, who decrypts it with its own epoch wrap", async () => {

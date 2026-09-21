@@ -399,6 +399,7 @@ describe("the worker entry", () => {
       maxPutsPerSignerPerDay: 2_000,
       maxPendingBytesPerSigner: 20 * 1024 * 1024,
       maxManifestBodyBytes: 16_384,
+      maxManifestPutsPerSignerPerDay: 20,
       maxRequestBodyBytes: 1_048_576,
     })
     expect(body["notice"]).toBe(

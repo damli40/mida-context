@@ -38,10 +38,14 @@ CREATE TABLE IF NOT EXISTS wraps (
   PRIMARY KEY (owner, namespace_id, read_epoch, agent_id, agent_key_version)
 );
 
--- §14.1 agent manifest body-hash → envelope-hash index.
+-- §14.1 agent manifest body-hash → envelope-hash index. stored_at starts the 24 h
+-- staging window; verified_at records the last time the envelope verified against the
+-- agent's chain record (NULL = the agent never registered → the sweep reclaims the row).
 CREATE TABLE IF NOT EXISTS manifest_index (
   body_hash TEXT PRIMARY KEY,
-  envelope_hash TEXT NOT NULL
+  envelope_hash TEXT NOT NULL,
+  stored_at TEXT NOT NULL,        -- ISO-8601 UTC
+  verified_at TEXT                -- ISO-8601 UTC, NULL while unverified
 );
 
 -- §12.1 replay record. The primary key IS the check-and-record: INSERT ON
@@ -70,6 +74,14 @@ CREATE TABLE IF NOT EXISTS denies (
 CREATE TABLE IF NOT EXISTS puts (
   signer TEXT NOT NULL,
   day TEXT NOT NULL,                -- YYYY-MM-DD
+  count INTEGER NOT NULL CHECK (count > 0),
+  PRIMARY KEY (signer, day)
+);
+
+-- Same atomic counter on its own table, for maxManifestPutsPerSignerPerDay.
+CREATE TABLE IF NOT EXISTS manifest_puts (
+  signer TEXT NOT NULL,
+  day TEXT NOT NULL,
   count INTEGER NOT NULL CHECK (count > 0),
   PRIMARY KEY (signer, day)
 );

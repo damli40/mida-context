@@ -3,7 +3,7 @@ import type { Address, Hex, ReaderEpochWrap, StorageRef } from "@mida/protocol"
 import { contentHash, verifyContent } from "@mida/storage"
 import type { ContextStorage } from "@mida/storage"
 import { REQUEST_WINDOW_SECONDS } from "@mida/api"
-import type { ContextStores, DenyStore, NonceStore, ObjectStore, RevocationIntent, StoredObject, WrapKey } from "@mida/api"
+import type { ContextStores, DenyStore, ManifestIndexEntry, NonceStore, ObjectStore, RevocationIntent, StoredObject, WrapKey } from "@mida/api"
 
 /**
  * The slice of the Cloudflare D1 API these stores use, declared structurally so this package needs no Workers
@@ -188,16 +188,24 @@ export class D1ObjectStore implements ObjectStore {
     return row === null ? undefined : (JSON.parse(row.wrap) as ReaderEpochWrap)
   }
 
-  async setManifestIndex(bodyHash: Hex, envelopeHash: Hex): Promise<void> {
+  async setManifestIndex(bodyHash: Hex, envelopeHash: Hex, opts?: { storedAt?: string; verifiedAt?: string | null }): Promise<void> {
+    // stored_at is set only on the row's first write: a repointing PUT or a re-upload keeps the original
+    // store time, so re-uploading cannot keep unverified staging bytes alive past the 24 h window.
     await this.db
-      .prepare("INSERT OR REPLACE INTO manifest_index (body_hash, envelope_hash) VALUES (?, ?)")
-      .bind(bodyHash.toLowerCase(), envelopeHash.toLowerCase())
+      .prepare(
+        `INSERT INTO manifest_index (body_hash, envelope_hash, stored_at, verified_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT (body_hash) DO UPDATE SET envelope_hash = excluded.envelope_hash, verified_at = excluded.verified_at`,
+      )
+      .bind(bodyHash.toLowerCase(), envelopeHash.toLowerCase(), opts?.storedAt ?? new Date().toISOString(), opts?.verifiedAt ?? null)
       .run()
   }
 
-  async getManifestIndex(bodyHash: Hex): Promise<Hex | undefined> {
-    const row = await this.db.prepare("SELECT envelope_hash FROM manifest_index WHERE body_hash = ?").bind(bodyHash.toLowerCase()).first<{ envelope_hash: string }>()
-    return row === null ? undefined : (row.envelope_hash as Hex)
+  async getManifestIndex(bodyHash: Hex): Promise<ManifestIndexEntry | undefined> {
+    const row = await this.db
+      .prepare("SELECT envelope_hash, stored_at, verified_at FROM manifest_index WHERE body_hash = ?")
+      .bind(bodyHash.toLowerCase())
+      .first<{ envelope_hash: string; stored_at: string; verified_at: string | null }>()
+    return row === null ? undefined : { envelopeHash: row.envelope_hash as Hex, storedAt: row.stored_at, verifiedAt: row.verified_at }
   }
 
   /** One statement, atomic across instances: the insert-or-increment happens inside SQLite, not read-then-write. */
@@ -214,6 +222,20 @@ export class D1ObjectStore implements ObjectStore {
     return row.count
   }
 
+  /** Same one-statement atomic count as `recordPut`, on the separate manifest table. */
+  async recordManifestPut(signer: Address, day: string): Promise<number> {
+    const row = await this.db
+      .prepare(
+        `INSERT INTO manifest_puts (signer, day, count) VALUES (?, ?, 1)
+         ON CONFLICT (signer, day) DO UPDATE SET count = count + 1
+         RETURNING count`,
+      )
+      .bind(signer.toLowerCase(), day)
+      .first<{ count: number }>()
+    if (row === null) throw new Error("the manifest PUT counter did not return a count")
+    return row.count
+  }
+
   async sweepPending(olderThan: Date, stillPending: (object: StoredObject) => Promise<boolean>): Promise<number> {
     // ISO-8601 UTC strings sort chronologically, so the cutoff is a plain string comparison.
     const { results } = await this.db.prepare("SELECT * FROM objects WHERE uploaded_at < ?").bind(olderThan.toISOString()).all<ObjectRow>()
@@ -225,6 +247,29 @@ export class D1ObjectStore implements ObjectStore {
     if (deletable.length === 0) return 0
     await this.db.batch(deletable.map((id) => this.db.prepare("DELETE FROM objects WHERE context_id = ?").bind(id)))
     return deletable.length
+  }
+
+  async sweepManifests(olderThan: Date): Promise<number> {
+    const { results } = await this.db
+      .prepare("SELECT body_hash, envelope_hash FROM manifest_index WHERE verified_at IS NULL AND stored_at < ?")
+      .bind(olderThan.toISOString())
+      .all<{ body_hash: string; envelope_hash: string }>()
+    if (results.length === 0) return 0
+    // The blob survives if anything still references its hash: another index row (same envelope can sit under
+    // another body hash in principle) or an object's ciphertextHash — never a dangling-content delete.
+    await this.db.batch([
+      ...results.map((row) => this.db.prepare("DELETE FROM manifest_index WHERE body_hash = ?").bind(row.body_hash)),
+      ...results.map((row) =>
+        this.db
+          .prepare(
+            `DELETE FROM blobs WHERE hash = ?
+             AND NOT EXISTS (SELECT 1 FROM manifest_index WHERE envelope_hash = ?)
+             AND NOT EXISTS (SELECT 1 FROM objects WHERE json_extract(manifest, '$.ciphertextHash') = ?)`,
+          )
+          .bind(row.envelope_hash, row.envelope_hash, row.envelope_hash),
+      ),
+    ])
+    return results.length
   }
 }
 

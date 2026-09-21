@@ -156,6 +156,7 @@ describe("upload-abuse limits", () => {
       maxPendingBytesPerSigner: 20 * 1024 * 1024,
       maxManifestBodyBytes: 16_384,
       maxRequestBodyBytes: 1_048_576,
+      maxManifestPutsPerSignerPerDay: 20,
     })
   })
 
@@ -177,13 +178,14 @@ describe("upload-abuse limits", () => {
     })
     await expect(client.request("PUT", "/objects", { body: { pad: "x".repeat(1_048_577) } })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" })
 
-    // An honest large declaration is refused before the body is even read — no signature needed to get the 413.
+    // Cheap checks run before anything expensive: a request with no auth headers at all is refused on
+    // header shape alone (401) — the body cap is never reached because the body is never even sized up.
     const response = await app.request("http://mida.test/objects", {
       method: "PUT",
       headers: { "content-type": "application/json", "content-length": "1048577" },
       body: "{}",
     })
-    expect(response.status).toBe(413)
+    expect(response.status).toBe(401)
   })
 
   it("enforces the per-signer PUT count with a 429 that names the limit", async () => {
@@ -213,31 +215,42 @@ describe("upload-abuse limits", () => {
 
   it("caps the public agent-manifest body at 16 KB at the boundary", async () => {
     const { app } = apiFor(stubReader())
-    const pad = (bytes: number) => JSON.stringify({ pad: "x".repeat(bytes - JSON.stringify({ pad: "" }).length) })
-    const atCap = pad(16_384)
-    expect(atCap.length).toBe(16_384)
-    // Exactly at the cap the body is read and rejected for its shape — INVALID_WIRE, not a size refusal.
-    const ok = await app.request("http://mida.test/agent-manifests", {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: atCap,
-    })
-    expect(ok.status).toBe(400)
-    const over = await app.request("http://mida.test/agent-manifests", {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: pad(16_385),
-    })
-    expect(over.status).toBe(413)
+    const client = clientFor(app)
+    // The manifest PUT is a signed route now: the client signs, and {"pad":"…"} serializes to exactly
+    // repeat + 10 bytes. At the cap the body is read and rejected for its shape — INVALID_WIRE, not a
+    // size refusal; one byte over is the 413.
+    await expect(client.request("PUT", "/agent-manifests", { body: { pad: "x".repeat(16_374) } })).rejects.toMatchObject({ code: "INVALID_WIRE" })
+    await expect(client.request("PUT", "/agent-manifests", { body: { pad: "x".repeat(16_375) } })).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" })
   })
 
-  it("a repeated content-addressed manifest PUT is a no-op that writes nothing new", async () => {
-    const { app, store } = apiFor(stubReader())
+  it("rejects an unsigned manifest PUT with 401 before any store work", async () => {
+    const { app } = apiFor(stubReader())
+    const response = await app.request("http://mida.test/agent-manifests", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(envelope()),
+    })
+    expect(response.status).toBe(401)
+  })
+
+  it("enforces the manifest PUT count with a 429 that names the limit", async () => {
+    const { app } = apiFor(stubReader(), { maxManifestPutsPerSignerPerDay: 2 })
+    const { client, seen } = watchingClient(app)
+    await expect(client.putAgentManifest(envelope())).resolves.toBeDefined()
+    await expect(client.putAgentManifest(envelope())).resolves.toBeDefined()
+    await expect(client.putAgentManifest(envelope())).rejects.toThrowError(/429/)
+    expect(seen.status).toBe(429)
+    expect(seen.body).toContain("maxManifestPutsPerSignerPerDay")
+  })
+
+  it("a repeated content-addressed manifest PUT is a no-op that does not count", async () => {
+    const { app, store } = apiFor(stubReader(), { maxManifestPutsPerSignerPerDay: 1 })
     const client = clientFor(app)
     const env = envelope()
     const first = await client.putAgentManifest(env)
+    // With the daily cap at one, a repeat that counted would already be refused — the no-op is free.
     const second = await client.putAgentManifest(env)
     expect(second).toEqual(first)
-    expect(await store.getManifestIndex(first.bodyHash)).toBe(first.envelopeHash)
+    expect(await store.getManifestIndex(first.bodyHash)).toMatchObject({ envelopeHash: first.envelopeHash })
   })
 })

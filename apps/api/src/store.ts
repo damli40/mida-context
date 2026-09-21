@@ -4,7 +4,7 @@ import { MidaError } from "@mida/protocol"
 import type { Address, Hex, ObjectManifest, ReaderEpochWrap } from "@mida/protocol"
 import { FsStorage } from "@mida/storage"
 import { writeJsonAtomic } from "./secure-fs.js"
-import type { ObjectStore, WrapKey } from "./stores.js"
+import type { ManifestIndexEntry, ObjectStore, WrapKey } from "./stores.js"
 
 /** A ciphertext upload's immutable metadata. Served as context only after Monad holds matching commitments (§12.2). */
 export interface StoredObject {
@@ -102,17 +102,42 @@ export class ApiStore implements ObjectStore {
     return readJson<ReaderEpochWrap>(this.#wrapPath(key))
   }
 
-  async setManifestIndex(bodyHash: Hex, envelopeHash: Hex): Promise<void> {
-    writeJsonAtomic(this.#dir, join(this.#dir, "agent-manifests", `${bodyHash}.json`), { envelopeHash })
+  #manifestIndexPath(bodyHash: Hex): string {
+    return join(this.#dir, "agent-manifests", `${bodyHash}.json`)
   }
 
-  async getManifestIndex(bodyHash: Hex): Promise<Hex | undefined> {
-    return readJson<{ envelopeHash: Hex }>(join(this.#dir, "agent-manifests", `${bodyHash}.json`))?.envelopeHash
+  #readManifestIndex(bodyHash: Hex): ManifestIndexEntry | undefined {
+    const entry = readJson<Partial<ManifestIndexEntry> & { envelopeHash?: Hex }>(this.#manifestIndexPath(bodyHash))
+    if (entry === undefined || typeof entry.envelopeHash !== "string") return undefined
+    // Pre-M3-A2 rows carry only the envelope hash: no store time means the 24 h window has long expired,
+    // so they read as ancient unverified rows and the sweep reclaims them.
+    return { envelopeHash: entry.envelopeHash, storedAt: entry.storedAt ?? new Date(0).toISOString(), verifiedAt: entry.verifiedAt ?? null }
+  }
+
+  async setManifestIndex(bodyHash: Hex, envelopeHash: Hex, opts?: { storedAt?: string; verifiedAt?: string | null }): Promise<void> {
+    const existing = this.#readManifestIndex(bodyHash)
+    const entry: ManifestIndexEntry = {
+      envelopeHash,
+      storedAt: opts?.storedAt ?? existing?.storedAt ?? new Date().toISOString(),
+      verifiedAt: opts?.verifiedAt ?? null,
+    }
+    writeJsonAtomic(this.#dir, this.#manifestIndexPath(bodyHash), entry)
+  }
+
+  async getManifestIndex(bodyHash: Hex): Promise<ManifestIndexEntry | undefined> {
+    return this.#readManifestIndex(bodyHash)
   }
 
   async recordPut(signer: Address, day: string): Promise<number> {
+    return this.#recordPut(`${signer.toLowerCase()}:${day}`)
+  }
+
+  async recordManifestPut(signer: Address, day: string): Promise<number> {
+    return this.#recordPut(`manifest:${signer.toLowerCase()}:${day}`)
+  }
+
+  #recordPut(key: string): number {
     const puts = this.#loadPuts()
-    const key = `${signer.toLowerCase()}:${day}`
     const count = (puts.get(key) ?? 0) + 1
     puts.set(key, count)
     writeJsonAtomic(this.#dir, join(this.#dir, "puts.json"), Object.fromEntries(puts))
@@ -135,6 +160,40 @@ export class ApiStore implements ObjectStore {
       if (Number.isNaN(uploadedAt) || uploadedAt >= cutoff || !(await stillPending(object))) continue
       rmSync(join(this.#dir, "objects", `${object.contextId}.json`))
       removed += 1
+    }
+    return removed
+  }
+
+  async sweepManifests(olderThan: Date): Promise<number> {
+    const cutoff = olderThan.getTime()
+    const folder = join(this.#dir, "agent-manifests")
+    let names: string[]
+    try {
+      names = readdirSync(folder).filter((name) => name.endsWith(".json"))
+    } catch {
+      return 0
+    }
+    const expired = new Set<Hex>()
+    let removed = 0
+    for (const name of names) {
+      const entry = this.#readManifestIndex(name.slice(0, -5) as Hex)
+      if (entry === undefined || entry.verifiedAt !== null) continue
+      const storedAt = Date.parse(entry.storedAt)
+      if (Number.isNaN(storedAt) || storedAt >= cutoff) continue
+      rmSync(join(folder, name))
+      expired.add(entry.envelopeHash)
+      removed += 1
+    }
+    if (removed === 0) return 0
+    // A blob dies only when nothing references its hash: surviving index rows and every object's ciphertext.
+    const referenced = new Set<string>()
+    for (const name of names) {
+      const entry = this.#readManifestIndex(name.slice(0, -5) as Hex)
+      if (entry !== undefined) referenced.add(entry.envelopeHash.toLowerCase())
+    }
+    for (const object of await this.#allObjects()) referenced.add(object.manifest.ciphertextHash.toLowerCase())
+    for (const hash of expired) {
+      if (!referenced.has(hash.toLowerCase())) rmSync(this.blobs.pathFor(hash), { force: true })
     }
     return removed
   }

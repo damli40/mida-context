@@ -175,6 +175,12 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
         expect(await stores.objects.recordPut(OWNER, "2026-09-22")).toBe(1)
         expect(await stores.objects.recordPut(other, "2026-09-21")).toBe(1)
 
+        // The manifest quota is its own counter — object PUTs and manifest PUTs never share a bucket.
+        expect(await stores.objects.recordManifestPut(OWNER, "2026-09-21")).toBe(1)
+        expect(await stores.objects.recordManifestPut(OWNER, "2026-09-21")).toBe(2)
+        expect(await stores.objects.recordManifestPut(OWNER, "2026-09-22")).toBe(1)
+        expect(await stores.objects.recordManifestPut(other, "2026-09-21")).toBe(1)
+
         const mine = fakeObject(OWNER).object
         const theirs = fakeObject(other).object
         await stores.objects.putObject(mine)
@@ -208,7 +214,7 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
           now,
           isAnchored: async (object) => object.contextId === anchoredOld.contextId,
         })
-        expect(result).toEqual({ objectsRemoved: 1, noncesRemoved: 1 })
+        expect(result).toEqual({ objectsRemoved: 1, manifestsRemoved: 0, noncesRemoved: 1 })
         expect(await stores.objects.getObject(old.contextId)).toBeUndefined()
         expect(await stores.objects.getObject(young.contextId)).toBeDefined()
         expect(await stores.objects.getObject(anchoredOld.contextId)).toBeDefined()
@@ -245,14 +251,56 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
 
         const bodyHash = hexOf(randomBytes(32))
         const envelopeHash = hexOf(randomBytes(32))
-        await stores.objects.setManifestIndex(bodyHash, envelopeHash)
-        expect(await stores.objects.getManifestIndex(bodyHash)).toBe(envelopeHash)
+        const storedAt = "2026-09-20T00:00:00.000Z"
+        const verifiedAt = "2026-09-20T01:00:00.000Z"
+        await stores.objects.setManifestIndex(bodyHash, envelopeHash, { storedAt })
+        expect(await stores.objects.getManifestIndex(bodyHash)).toMatchObject({ envelopeHash, storedAt, verifiedAt: null })
         expect(await stores.objects.getManifestIndex(hexOf(randomBytes(32)))).toBeUndefined()
+        // Marking verified keeps the original store time; repointing keeps it too — a re-upload must
+        // not be able to extend an unverified row's life.
+        await stores.objects.setManifestIndex(bodyHash, envelopeHash, { verifiedAt })
+        expect(await stores.objects.getManifestIndex(bodyHash)).toMatchObject({ envelopeHash, storedAt, verifiedAt })
+        await stores.objects.setManifestIndex(bodyHash, hexOf(randomBytes(32)), { verifiedAt })
+        expect(await stores.objects.getManifestIndex(bodyHash)).toMatchObject({ storedAt })
 
         const blob = randomBytes(48)
         await stores.objects.blobs.put(blob)
         expect(await stores.objects.blobs.get(contentHash(blob))).toEqual(blob)
         await expect(stores.objects.blobs.get(hexOf(randomBytes(32)))).rejects.toMatchObject({ code: "NOT_FOUND" })
+      } finally {
+        await cleanup()
+      }
+    })
+
+    it("sweeps stale unverified manifest rows and their unreferenced blobs, never verified ones", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const cutoff = new Date("2026-09-21T12:00:00.000Z")
+        const at = (h: number) => new Date(cutoff.getTime() - h * 60 * 60_000).toISOString()
+        const put = async (label: string) => {
+          const bytes = new TextEncoder().encode(label)
+          await stores.objects.blobs.put(bytes)
+          return contentHash(bytes)
+        }
+        const staleRow = { bodyHash: hexOf(randomBytes(32)), envelopeHash: await put("stale") }
+        const youngRow = { bodyHash: hexOf(randomBytes(32)), envelopeHash: await put("young") }
+        const verifiedRow = { bodyHash: hexOf(randomBytes(32)), envelopeHash: await put("verified") }
+        const sharedHash = await put("shared")
+        const sharedRow = { bodyHash: hexOf(randomBytes(32)) }
+        await stores.objects.setManifestIndex(staleRow.bodyHash, staleRow.envelopeHash, { storedAt: at(25) })
+        await stores.objects.setManifestIndex(youngRow.bodyHash, youngRow.envelopeHash, { storedAt: at(23) })
+        await stores.objects.setManifestIndex(verifiedRow.bodyHash, verifiedRow.envelopeHash, { storedAt: at(48), verifiedAt: at(47) })
+        // A stale row points at a blob a fresh row also references — the row goes, the bytes stay.
+        await stores.objects.setManifestIndex(sharedRow.bodyHash, sharedHash, { storedAt: at(25) })
+        await stores.objects.setManifestIndex(hexOf(randomBytes(32)), sharedHash, { storedAt: at(1) })
+
+        expect(await stores.objects.sweepManifests(new Date(cutoff.getTime() - 24 * 60 * 60_000))).toBe(2)
+        expect(await stores.objects.getManifestIndex(staleRow.bodyHash)).toBeUndefined()
+        expect(await stores.objects.getManifestIndex(sharedRow.bodyHash)).toBeUndefined()
+        await expect(stores.objects.blobs.get(staleRow.envelopeHash)).rejects.toMatchObject({ code: "NOT_FOUND" })
+        expect(await stores.objects.blobs.get(sharedHash)).toBeDefined()
+        expect(await stores.objects.getManifestIndex(youngRow.bodyHash)).toMatchObject({ envelopeHash: youngRow.envelopeHash })
+        expect(await stores.objects.getManifestIndex(verifiedRow.bodyHash)).toMatchObject({ envelopeHash: verifiedRow.envelopeHash })
       } finally {
         await cleanup()
       }

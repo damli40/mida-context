@@ -81,7 +81,9 @@ export class ContextApiClient implements ContextApiRoutes {
   }
 
   putAgentManifest(envelope: SignedAgentCapabilityManifest) {
-    return this.request<{ bodyHash: Hex; envelopeHash: Hex }>("PUT", "/agent-manifests", { body: envelope, signed: false })
+    // Signed like every other write: the signature buys the per-signer manifest quota and replay
+    // protection — and for an agent not yet on Monad it must be the operator that signed the manifest.
+    return this.request<{ bodyHash: Hex; envelopeHash: Hex }>("PUT", "/agent-manifests", { body: envelope })
   }
 
   getAgentManifest(bodyHash: Hex) {

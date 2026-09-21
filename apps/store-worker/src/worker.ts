@@ -183,7 +183,7 @@ export default {
       (async () => {
         const { stores, reader } = buildWorker(env)
         const result = await runSweep({ stores, reader })
-        console.log(JSON.stringify({ event: "sweep", objectsRemoved: result.objectsRemoved, noncesRemoved: result.noncesRemoved }))
+        console.log(JSON.stringify({ event: "sweep", objectsRemoved: result.objectsRemoved, manifestsRemoved: result.manifestsRemoved, noncesRemoved: result.noncesRemoved }))
       })(),
     )
   },

@@ -79,7 +79,12 @@ describe("the scheduled sweep", () => {
       const now = new Date("2026-09-21T12:00:00.000Z")
       const young = objectAt(new Date(now.getTime() - (23 * 60 + 59) * 60_000))
       const old = objectAt(new Date(now.getTime() - (24 * 60 + 1) * 60_000))
+      const sharedBytes = new TextEncoder().encode("shared bytes")
+      const sharedBlob = contentHash(sharedBytes)
       const anchoredAncient = objectAt(new Date(now.getTime() - 90 * 24 * 60 * 60_000))
+      // The anchored object's ciphertext hash doubles as a swept manifest row's blob hash below —
+      // deleting the index row must not delete bytes another row still references.
+      anchoredAncient.manifest = { ...anchoredAncient.manifest, ciphertextHash: sharedBlob }
       for (const object of [young, old, anchoredAncient]) await stores.objects.putObject(object)
 
       const records = new Map<Hex, ContextRecordView>()
@@ -108,14 +113,37 @@ describe("the scheduled sweep", () => {
       await stores.nonces.consume(OWNER, hexOf(randomBytes(32)), nowSeconds - 61n, nowSeconds)
       await stores.nonces.consume(OWNER, hexOf(randomBytes(32)), nowSeconds, nowSeconds)
 
+      // Staged agent manifests: the stale unverified row and its blob are reclaimed together, while
+      // verified and still-fresh rows survive. The shared blob's index row is also stale — the bytes
+      // stay anyway because the anchored object's manifest names the same hash as its ciphertext.
+      const utf8 = new TextEncoder()
+      const staleBytes = utf8.encode("stale manifest")
+      const verifiedBytes = utf8.encode("verified manifest")
+      const staleUnverified = { bodyHash: hexOf(randomBytes(32)), envelopeHash: contentHash(staleBytes) }
+      const verifiedOld = { bodyHash: hexOf(randomBytes(32)), envelopeHash: contentHash(verifiedBytes) }
+      const youngUnverified = { bodyHash: hexOf(randomBytes(32)), envelopeHash: hexOf(randomBytes(32)) }
+      await stores.objects.blobs.put(staleBytes)
+      await stores.objects.blobs.put(verifiedBytes)
+      await stores.objects.blobs.put(sharedBytes)
+      const hourAgo = (h: number) => new Date(now.getTime() - h * 60 * 60_000).toISOString()
+      await stores.objects.setManifestIndex(staleUnverified.bodyHash, staleUnverified.envelopeHash, { storedAt: hourAgo(25) })
+      await stores.objects.setManifestIndex(verifiedOld.bodyHash, verifiedOld.envelopeHash, { storedAt: hourAgo(90 * 24), verifiedAt: hourAgo(80 * 24) })
+      await stores.objects.setManifestIndex(youngUnverified.bodyHash, youngUnverified.envelopeHash, { storedAt: hourAgo(23) })
+      await stores.objects.setManifestIndex(hexOf(randomBytes(32)), sharedBlob, { storedAt: hourAgo(25) })
+
       const result = await runSweep({ stores, reader, now })
-      expect(result).toEqual({ objectsRemoved: 1, noncesRemoved: 1 })
+      expect(result).toEqual({ objectsRemoved: 1, manifestsRemoved: 2, noncesRemoved: 1 })
       expect(await stores.objects.getObject(old.contextId)).toBeUndefined()
       expect(await stores.objects.getObject(young.contextId)).toBeDefined()
       expect(await stores.objects.getObject(anchoredAncient.contextId)).toBeDefined()
+      expect(await stores.objects.getManifestIndex(staleUnverified.bodyHash)).toBeUndefined()
+      await expect(stores.objects.blobs.get(staleUnverified.envelopeHash)).rejects.toMatchObject({ code: "NOT_FOUND" })
+      expect(await stores.objects.getManifestIndex(verifiedOld.bodyHash)).toMatchObject({ envelopeHash: verifiedOld.envelopeHash })
+      expect(await stores.objects.getManifestIndex(youngUnverified.bodyHash)).toMatchObject({ envelopeHash: youngUnverified.envelopeHash })
+      expect(await stores.objects.blobs.get(sharedBlob)).toEqual(utf8.encode("shared bytes"))
 
       // A second sweep at the same fake now removes nothing — the work is idempotent.
-      expect(await runSweep({ stores, reader, now })).toEqual({ objectsRemoved: 0, noncesRemoved: 0 })
+      expect(await runSweep({ stores, reader, now })).toEqual({ objectsRemoved: 0, manifestsRemoved: 0, noncesRemoved: 0 })
     } finally {
       await dispose()
     }
