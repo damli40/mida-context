@@ -237,6 +237,15 @@ function infoResponse(config: SponsorConfig): Response {
       signingsGlobalPerDay: config.globalDailyLimit,
       freeCallsPerSenderPerDay: config.freePerSenderDailyLimit,
     },
+    policy: {
+      budgets:
+        "signing budgets are consumed by pm_getPaymasterData, not by eth_sendUserOperation — a send is forwarded only for an operation this endpoint signed today (same sender, nonce and callData); pm_getPaymasterStubData and eth_estimateUserOperationGas share the free-calls allowance instead",
+      factory:
+        "only the EIP-7702 marker 0x7702 (optionally right-padded to 20 bytes) alongside a valid eip7702Auth; any other non-empty factory, initCode or factoryData is refused",
+      delegationClearing: config.policy.allowClearing
+        ? "enabled by ALLOW_CLEARING: a zero-address eip7702Auth sponsors only one execute to the sender's own address with empty data"
+        : "disabled: zero-address eip7702Auth authorizations are refused",
+    },
   }
   return new Response(JSON.stringify(body, null, 2), { headers: { "content-type": "application/json" } })
 }

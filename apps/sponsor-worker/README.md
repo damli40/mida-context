@@ -32,27 +32,44 @@ key; the user operation is already signed by the user's own key before it arrive
 - **Enforce a Mida-only policy.** `callData` must decode as `execute`/`executeBatch` (or Alchemy's
   `executeWithRuntimeValidation` wrapper, one level deep) with at most 8 inner calls; every inner
   call must target the configured `CAPABILITY_REGISTRY` or `CONTEXT_REGISTRY`, move 0 MON, and
-  begin with the selector of a state-changing function from their ABIs. One explicit exception:
-  an `execute` to the sender itself with empty data is allowed **only** alongside an
-  `eip7702Auth.address` of the zero address — that is how a user clears their delegation, and it
-  needs no Mida call.
+  begin with the selector of a state-changing function from their ABIs. One explicit exception,
+  **off unless `ALLOW_CLEARING="true"`**: an `execute` to the sender itself with empty data is
+  allowed **only** alongside an `eip7702Auth.address` of the zero address — that is how a user
+  clears their delegation, and it needs no Mida call. A zero-address authorization paired with
+  anything else is refused even when the flag is on.
 - **Bound what Monad bills.** Monad charges the gas *limit*, not gas used, so every gas field is
-  capped: `callGasLimit` ≤ the largest per-kind ceiling in `packages/chain/src/gas.ts`
-  (6,000,000), `verificationGasLimit`/`preVerificationGas` ≤ 500,000, paymaster gas fields ≤
-  300,000 each, and both fee fields ≤ 500 gwei — a user operation names its own fee caps, and the
-  paymaster is charged `min(maxFeePerGas, baseFee + maxPriorityFeePerGas)`, so an absurd priority
-  fee would be paid in full.
+  capped: `callGasLimit` ≤ the sum of each inner call's per-function ceiling from
+  `packages/chain/src/gas.ts` plus 60,000 of account-execution overhead per call — a cheap
+  `registerP256Key` can no longer bill like a 6,000,000-gas agent revoke, and a selector with no
+  mapped ceiling is refused outright. `verificationGasLimit`/`preVerificationGas` ≤ 500,000,
+  paymaster gas fields ≤ 300,000 each, and both fee fields ≤ 300 gwei — a user operation names
+  its own fee caps, and the paymaster is charged `min(maxFeePerGas, baseFee +
+  maxPriorityFeePerGas)`, so an absurd priority fee would be paid in full. The four fixed
+  ceilings accept env overrides (`VERIFICATION_GAS_CEILING`, `PRE_VERIFICATION_GAS_CEILING`,
+  `PAYMASTER_GAS_CEILING`, `FEE_CEILING`) that may only tighten them — a value above the built-in
+  is ignored and logged.
 - **Check the delegation story.** An `eip7702Auth` must name this chain (a chain-id-0
   authorization is valid on every chain and is refused) and an allowed implementation address —
-  or the zero address for a delegation-clearing op. When no `eip7702Auth` is present — the field
-  the bundler actually applies; an `authorization` field under any other name is validated but
-  never substitutes — the sender's on-chain code (read via `RPC_URL`) must already be `0xef0100`
-  + an allowed implementation. `factory`/`initCode` must be empty: a 7702 sender is never
-  deployed by a factory.
-- **Spend slowly.** Two D1 counters, incremented atomically on `eth_sendUserOperation` only: 30
-  sponsored operations per sender per day and 2,000 globally (UTC days, both configurable). Over
-  either limit is a refusal, and the sender budget is checked first so a spammy sender cannot
-  drain the global one.
+  or the zero address for a delegation-clearing op (see the flag above). When no `eip7702Auth` is
+  present — the field the bundler actually applies; an `authorization` field under any other name
+  is validated but never substitutes — the sender's on-chain code (read via `RPC_URL`) must
+  already be `0xef0100` + an allowed implementation. `factory` may only be the EIP-7702 marker
+  `0x7702` (optionally right-padded to 20 bytes), and only alongside a valid `eip7702Auth` —
+  account libraries set it on a first operation to signal the accompanying authorization.
+  `initCode` may be empty or exactly the 20-byte padded marker, nothing appended. `factoryData`
+  must always be empty: with the marker, EntryPoint calls the sender with those bytes as an
+  initialisation call our inner-call rules would never see. Any other factory or deployment path
+  is refused.
+- **Spend slowly, at the signing step.** Budgets are consumed by `pm_getPaymasterData` — the
+  moment the endpoint commits money — not by `eth_sendUserOperation`, because a returned
+  paymaster signature can be submitted through any bundler. 30 signings per sender per day and
+  2,000 globally (UTC days, both configurable); if the provider then fails to return a signature
+  the count is refunded. `eth_sendUserOperation` is forwarded only for an operation this
+  endpoint signed today (same sender, nonce and callData hash) — the signing record is not
+  consumed, so re-sending the same signed op stays possible. `pm_getPaymasterStubData` and
+  `eth_estimateUserOperationGas` carry no spendable signature: they skip the signing budget but
+  share a separate free allowance of 120 calls per sender per day
+  (`FREE_PER_SENDER_DAILY_LIMIT`) so they cannot be used as a free simulation service.
 - **Keep the secrets.** The provider API key and the sponsorship policy id live in Worker
   secrets. A client-supplied `paymasterContext` is discarded and the configured `POLICY_ID` is
   injected by the Worker. Provider error bodies are scrubbed of every secret before they reach a
@@ -95,7 +112,11 @@ account with a sponsorship policy configured for chain `10143` and EntryPoint v0
 3. Set `[vars]` in `wrangler.toml`: `CHAIN_ID` (`10143` for Monad testnet), the two registry
    addresses, `ALLOWED_IMPLEMENTATIONS` (the EIP-7702 smart-account implementations you trust —
    verify the address on-chain before listing it; `scripts/sponsor-probe.mts` exists to do
-   exactly that), and optionally the budget limits.
+   exactly that), and optionally the budget limits, `FREE_PER_SENDER_DAILY_LIMIT` (default 120
+   for stub/estimate calls), tighter gas ceilings (`VERIFICATION_GAS_CEILING`,
+   `PRE_VERIFICATION_GAS_CEILING`, `PAYMASTER_GAS_CEILING`, `FEE_CEILING` — each may only lower
+   its built-in), and `ALLOW_CLEARING="true"` if sponsored delegation clearing should ever be on
+   (default off — see "Check the delegation story").
 
 4. Set the secrets — the provider key, the sponsorship policy id, and a chain RPC endpoint:
 

@@ -227,6 +227,10 @@ describe("HTTP and envelope behaviour", () => {
     expect(info.description).toContain("It can pay for a call or refuse to. It cannot sign, read, grant or revoke.")
     expect((info.limits as Record<string, unknown>).signingsPerSenderPerDay).toBe(30)
     expect((info.methods as string[])).toContain("eth_sendUserOperation")
+    const policy = info.policy as Record<string, unknown>
+    expect(policy.budgets).toMatch(/pm_getPaymasterData/)
+    expect(policy.factory).toMatch(/0x7702/)
+    expect(policy.delegationClearing).toMatch(/^disabled/)
   })
 
   it("refuses batch bodies outright — batching is how a policy check gets skipped", async () => {
