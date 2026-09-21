@@ -1,0 +1,6 @@
+# Ephemeral codegen output. Add other .envio entries here as needed.
+#
+# types.d.ts is deliberately NOT ignored: it is committed so the repo-root
+# `pnpm typecheck` sees envio's generated Global augmentation without running
+# codegen first. Regenerate with `pnpm --filter @mida/indexer codegen` after
+# changing config.yaml, schema.graphql or the ABI files.

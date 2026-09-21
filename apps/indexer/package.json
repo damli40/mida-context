@@ -1,0 +1,13 @@
+{
+  "name": "@mida/indexer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "export-abis": "node scripts/export-abis.mjs",
+    "codegen": "envio codegen"
+  },
+  "dependencies": {
+    "envio": "3.12.1"
+  }
+}
