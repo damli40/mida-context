@@ -1,17 +1,17 @@
 {
-  "commit": "d45195e8b187eb66a026536a51d1ab6ea838be2b",
-  "startedAt": "2026-09-21T17:21:11.549Z",
-  "seconds": 879.7,
+  "commit": "0c13e6f28d5b0ba2658466c45f4efae7dc87065f",
+  "startedAt": "2026-09-21T18:51:37.084Z",
+  "seconds": 881.8,
   "checks": [
     {
       "id": "A1",
       "pass": true,
-      "value": 17,
+      "value": 11.7,
       "limit": 100,
       "unit": "ms",
       "detail": {
-        "p50": 10.3,
-        "p95": 17,
+        "p50": 9.9,
+        "p95": 11.7,
         "events": 200
       }
     },
@@ -44,12 +44,12 @@
     {
       "id": "B1",
       "pass": true,
-      "value": 6.207,
+      "value": 6.199,
       "limit": null,
       "unit": "s",
       "detail": {
-        "flushSeconds": 4.16,
-        "gapSeconds": 6.21,
+        "flushSeconds": 4.19,
+        "gapSeconds": 6.2,
         "midGapWaitMs": 2000
       }
     },
@@ -63,7 +63,7 @@
       "pass": true,
       "value": {
         "saved": 1,
-        "seconds": 4.21
+        "seconds": 4.2
       },
       "limit": null
     },
@@ -197,7 +197,7 @@
       },
       "limit": null,
       "detail": {
-        "refusalMs": 4244
+        "refusalMs": 4240
       }
     },
     {
@@ -277,18 +277,18 @@
     {
       "id": "F1",
       "pass": true,
-      "value": 99.5,
+      "value": 86.5,
       "limit": 8000,
       "unit": "ms",
       "detail": {
         "medians": {
-          "1": 44.4,
-          "10": 54.4,
-          "50": 99.5,
-          "100": 150.6
+          "1": 44.2,
+          "10": 49.8,
+          "50": 86.5,
+          "100": 140.7
         },
-        "saveMsAt100": 4216,
-        "saveMsMedian": 4153
+        "saveMsAt100": 4177,
+        "saveMsMedian": 4151.5
       }
     },
     {
@@ -300,8 +300,8 @@
       "id": "F3",
       "pass": true,
       "value": {
-        "renderMs": 2.26,
-        "parseMs": 6.37,
+        "renderMs": 2.12,
+        "parseMs": 6.08,
         "transcriptBytesRead": 125536
       },
       "limit": {
