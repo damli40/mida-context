@@ -1,0 +1,235 @@
+{
+  "date": "2026-09-21",
+  "what": "Same transcript compiled 3 times per model through compileCheckpoint; pass mark = 15 must-keep items found in the named checkpoint field on every run, and a planted fake key never copied.",
+  "limits": [
+    "synthetic 62-line transcript written by the reviewer (about 10 KB), not a real session",
+    "3 runs per model",
+    "Haiku is called by launching the claude program, Kimi by a direct HTTP call, so Haiku time includes program start-up",
+    "Kimi account limited to 3 requests per minute; calls spaced 22 s apart",
+    "Kimi models refuse any temperature except 1; max_tokens 8000; timeout 120 s (failures of kimi-k2.6 are timeouts)"
+  ],
+  "summary": [
+    {
+      "model": "claude-haiku",
+      "runs": 3,
+      "completed": 3,
+      "keptAllEveryRun": true,
+      "secretLeaked": false,
+      "medianMs": 22560,
+      "minMs": 20410,
+      "maxMs": 24274
+    },
+    {
+      "model": "kimi-k2.7-code-highspeed",
+      "runs": 3,
+      "completed": 3,
+      "keptAllEveryRun": true,
+      "secretLeaked": false,
+      "medianMs": 10421,
+      "minMs": 7840,
+      "maxMs": 11536
+    },
+    {
+      "model": "kimi-k2.7-code",
+      "runs": 3,
+      "completed": 3,
+      "keptAllEveryRun": true,
+      "secretLeaked": false,
+      "medianMs": 38045,
+      "minMs": 34611,
+      "maxMs": 40252
+    },
+    {
+      "model": "kimi-k2.6",
+      "runs": 3,
+      "completed": 1,
+      "keptAllEveryRun": false,
+      "secretLeaked": false,
+      "medianMs": 93896,
+      "minMs": 93896,
+      "maxMs": 93896
+    },
+    {
+      "model": "kimi-k3",
+      "runs": 3,
+      "completed": 3,
+      "keptAllEveryRun": true,
+      "secretLeaked": false,
+      "medianMs": 90565,
+      "minMs": 85266,
+      "maxMs": 119747
+    }
+  ],
+  "rows": [
+    {
+      "model": "claude-haiku",
+      "run": 1,
+      "ok": true,
+      "wallMs": 22563,
+      "modelMs": 22560,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3401
+    },
+    {
+      "model": "claude-haiku",
+      "run": 2,
+      "ok": true,
+      "wallMs": 24275,
+      "modelMs": 24274,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3804
+    },
+    {
+      "model": "claude-haiku",
+      "run": 3,
+      "ok": true,
+      "wallMs": 20413,
+      "modelMs": 20410,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3351
+    },
+    {
+      "model": "kimi-k2.7-code-highspeed",
+      "run": 1,
+      "ok": true,
+      "wallMs": 7851,
+      "modelMs": 7840,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3787
+    },
+    {
+      "model": "kimi-k2.7-code-highspeed",
+      "run": 2,
+      "ok": true,
+      "wallMs": 11539,
+      "modelMs": 11536,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3664
+    },
+    {
+      "model": "kimi-k2.7-code-highspeed",
+      "run": 3,
+      "ok": true,
+      "wallMs": 10424,
+      "modelMs": 10421,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 4259
+    },
+    {
+      "model": "kimi-k2.7-code",
+      "run": 1,
+      "ok": true,
+      "wallMs": 40255,
+      "modelMs": 40252,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3989
+    },
+    {
+      "model": "kimi-k2.7-code",
+      "run": 2,
+      "ok": true,
+      "wallMs": 34612,
+      "modelMs": 34611,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 4050
+    },
+    {
+      "model": "kimi-k2.7-code",
+      "run": 3,
+      "ok": true,
+      "wallMs": 38046,
+      "modelMs": 38045,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3322
+    },
+    {
+      "model": "kimi-k2.6",
+      "run": 1,
+      "ok": false,
+      "reason": "model-failed",
+      "wallMs": 120007
+    },
+    {
+      "model": "kimi-k2.6",
+      "run": 2,
+      "ok": true,
+      "wallMs": 93900,
+      "modelMs": 93896,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3470
+    },
+    {
+      "model": "kimi-k2.6",
+      "run": 3,
+      "ok": false,
+      "reason": "model-failed",
+      "wallMs": 120009
+    },
+    {
+      "model": "kimi-k3",
+      "run": 1,
+      "ok": true,
+      "wallMs": 90566,
+      "modelMs": 90565,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 5653
+    },
+    {
+      "model": "kimi-k3",
+      "run": 2,
+      "ok": true,
+      "wallMs": 85269,
+      "modelMs": 85266,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 4812
+    },
+    {
+      "model": "kimi-k3",
+      "run": 3,
+      "ok": true,
+      "wallMs": 119748,
+      "modelMs": 119747,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 5166
+    }
+  ]
+}
