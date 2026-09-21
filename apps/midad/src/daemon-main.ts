@@ -13,7 +13,7 @@ import type { Network } from "./runtime.js"
  */
 async function main(): Promise<void> {
   const home = resolveHome(process.env)
-  const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown; storageUrl?: unknown }>("network.json")
+  const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown; storageUrl?: unknown; sponsorUrl?: unknown }>("network.json")
   if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) {
     process.exit(1)
   }
@@ -23,6 +23,7 @@ async function main(): Promise<void> {
     // the daemon holds agent keys only — funding is the owner CLI's job
     fund: async () => { throw new Error("the daemon cannot fund accounts") },
     storageUrl: typeof stored.storageUrl === "string" ? stored.storageUrl : undefined,
+    sponsorUrl: typeof stored.sponsorUrl === "string" ? stored.sponsorUrl : undefined,
   }
 
   // The compile model is chosen once here from the environment (MIDA_COMPILE_MODEL /

@@ -113,6 +113,9 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
     chainId: Number(deployment.chainId),
     rpcUrl: network.rpcUrl,
     deployment: { ...deployment, chainId: deployment.chainId.toString(), deploymentBlock: deployment.deploymentBlock.toString() },
+    // absent stays absent — an unset sponsorUrl serializes as no key, and a later `init` without
+    // the variable does not blank one an operator wrote into the file by hand
+    ...(network.sponsorUrl === undefined ? {} : { sponsorUrl: network.sponsorUrl }),
   })
   // The daemon needs the owner's public address to verify the signed approved-projects list and to
   // ask the chain about grants — it never reads owner/secrets.json, so the address is public metadata.

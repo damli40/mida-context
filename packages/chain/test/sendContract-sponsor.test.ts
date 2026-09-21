@@ -64,7 +64,7 @@ const successfulSponsor = (send?: SponsoredSender["send"]): SponsoredSender => (
       gasUsed: 1n,
       gasLimit: 500_000n,
       userOpHash: USER_OP_HASH,
-    })) as SponsoredSender["send"],
+    })) as unknown as SponsoredSender["send"],
 })
 
 describe("sendContract with a sponsor wired", () => {

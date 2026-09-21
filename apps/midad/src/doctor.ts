@@ -382,6 +382,45 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         return lines.length === 0 ? ["ok: wallets have gas"] : lines
       },
     },
+    {
+      name: "sponsor",
+      run: async () => {
+        // network.json again, not the shared context — the sponsor answer needs no chain at all
+        const stored = home.readJson<{ sponsorUrl?: unknown }>("network.json")
+        const sponsorUrl = typeof stored?.sponsorUrl === "string" ? stored.sponsorUrl : ""
+        if (sponsorUrl === "") return ["ok: no gas sponsor configured — sends pay their own gas"]
+        // the HOST is printed, never the URL — its path or query may carry an operator's key
+        let host = "an address that does not parse"
+        try {
+          host = new URL(sponsorUrl).host
+          if (host === "") host = "an address that does not parse"
+        } catch {
+          // the placeholder stands
+        }
+        try {
+          const reply = await fetch(sponsorUrl, { signal: AbortSignal.timeout(2_000) })
+          if (!reply.ok) {
+            return [problem(`the gas sponsor ${host} answered HTTP ${reply.status}`, "check sponsorUrl in network.json")]
+          }
+          const body = (await reply.json().catch(() => undefined)) as
+            | { limits?: { signingsPerSenderPerDay?: unknown; signingsGlobalPerDay?: unknown; freeCallsPerSenderPerDay?: unknown } }
+            | undefined
+          const limits = body?.limits
+          const detail =
+            typeof limits?.signingsPerSenderPerDay === "number" && typeof limits?.signingsGlobalPerDay === "number"
+              ? ` (${limits.signingsPerSenderPerDay} signings per address a day, ${limits.signingsGlobalPerDay} a day in total)`
+              : ""
+          return [`ok: gas sponsor ${host} answers${detail}`]
+        } catch {
+          return [
+            problem(
+              `the gas sponsor ${host} did not answer within 2 s`,
+              "check sponsorUrl in network.json — sends will pay their own gas until it answers",
+            ),
+          ]
+        }
+      },
+    },
   ]
 }
 

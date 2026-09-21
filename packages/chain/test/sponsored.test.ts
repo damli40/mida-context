@@ -203,7 +203,7 @@ describe("createSponsoredSender", () => {
       { code: "0x", txCount: "0x0" },
     )
     try {
-      const sender = await createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
       const receipt = await sender.send(call, "owner.key")
       expect(env.sent).toHaveLength(1)
       const op = env.sent[0]!
@@ -226,7 +226,7 @@ describe("createSponsoredSender", () => {
     const delegated = `0xef0100${IMPL.slice(2)}`
     const env = await start({ receipt: userOpReceipt(account.address, true), byHash: { userOperation: OP_GAS } }, { code: delegated, txCount: "0x3" })
     try {
-      const sender = await createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
       await sender.send(call, "owner.key")
       expect(env.sent[0]!.sender).toBe(account.address)
       expect(env.sent[0]!.eip7702Auth).toBeUndefined()
@@ -238,7 +238,7 @@ describe("createSponsoredSender", () => {
   it("a sponsor refusal becomes SponsorDidNotPay", async () => {
     const env = await start({ sendError: { code: -32000, message: "refused: this endpoint only pays for calls to the Mida contracts" } }, { code: "0x", txCount: "0x0" })
     try {
-      const sender = await createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
       const error = await sender.send(call, "owner.key").then(() => null, (e: unknown) => e)
       expect(error).toBeInstanceOf(SponsorDidNotPay)
       expect((error as MidaError).code).toBe("SPONSOR_FAILED")
@@ -250,7 +250,7 @@ describe("createSponsoredSender", () => {
   it("a sponsor that never answers becomes SponsorDidNotPay after the deadline", async () => {
     const env = await start({ sendHang: true }, { code: "0x", txCount: "0x0" })
     try {
-      const sender = await createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, timeoutMs: 300 })
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, timeoutMs: 300 })
       const error = await sender.send(call, "owner.key").then(() => null, (e: unknown) => e)
       expect(error).toBeInstanceOf(SponsorDidNotPay)
       expect((error as Error).message).toContain("did not answer")
@@ -262,7 +262,7 @@ describe("createSponsoredSender", () => {
   it("a reverted operation is an error, not SponsorDidNotPay — the sponsor did pay", async () => {
     const env = await start({ receipt: userOpReceipt(account.address, false, "execution reverted") }, { code: "0x", txCount: "0x0" })
     try {
-      const sender = await createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
       const error = await sender.send(call, "owner.key").then(() => null, (e: unknown) => e)
       expect(error).toBeInstanceOf(MidaError)
       expect(error).not.toBeInstanceOf(SponsorDidNotPay)
@@ -277,7 +277,7 @@ describe("createSponsoredSender", () => {
     const reason = encodeErrorResult({ abi: contextRegistryAbi, errorName: "ContextNotFound", args: [`0x${"11".repeat(32)}`] })
     const env = await start({ receipt: userOpReceipt(account.address, false, reason) }, { code: "0x", txCount: "0x0" })
     try {
-      const sender = await createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
       const error = await sender.send(call, "owner.key").then(() => null, (e: unknown) => e)
       expect(error).not.toBeInstanceOf(SponsorDidNotPay)
       expect((error as MidaError).code).toBe("NOT_FOUND")

@@ -1,7 +1,7 @@
 export { MidaHome, resolveHome } from "./home.js"
 export { FileAccessRequestStore } from "./request-store.js"
 export * from "./keys.js"
-export { Runtime, ServiceRuntime, AGENT_PERMISSIONS, MIN_BALANCE_WEI, NAMESPACE, PURPOSE_ID, formatMon, makeOwnerBalanceGuard } from "./runtime.js"
+export { Runtime, ServiceRuntime, AGENT_PERMISSIONS, MIN_BALANCE_WEI, NAMESPACE, PURPOSE_ID, formatMon, makeOwnerBalanceGuard, parseSponsorUrl } from "./runtime.js"
 export type { Network } from "./runtime.js"
 export { startPersistentApi } from "./api-server.js"
 export {

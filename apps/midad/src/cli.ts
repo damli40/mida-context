@@ -469,7 +469,14 @@ async function main(): Promise<void> {
     // MIDA_HOME must mean the same folder here as in the daemon and both hooks (they all read it);
     // when this ignored it, `init` wrote to ~/.mida while the daemon it spawned looked elsewhere.
     const home = resolveHome(process.env)
-    const network: Network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
+    const network: Network = {
+      rpcUrl: env.rpcUrl,
+      deployment: env.deployment,
+      fund: env.fund,
+      // the gas sponsor's address, when this machine has one — init persists it to network.json
+      // so the daemon and the drainer sponsor their sends without seeing the variable
+      sponsorUrl: process.env.MIDA_SPONSOR_URL,
+    }
     const argv = process.argv.slice(2)
     const print = (line: string) => console.log(line)
 

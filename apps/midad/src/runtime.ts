@@ -4,7 +4,7 @@ import type { LocalAccount } from "viem"
 import { MidaError, PERMISSION } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
 import { bytesOf } from "@mida/crypto"
-import { chainFor, createWriteContext } from "@mida/chain"
+import { chainFor, createSponsoredSender, createWriteContext } from "@mida/chain"
 import type { ChainContext, Deployment, LocalWriteContext, SendCost } from "@mida/chain"
 import { ContextApiClient, RegistryReader } from "@mida/api"
 import { FakeVaultAuthority } from "@mida/fake-vault"
@@ -27,6 +27,12 @@ export interface Network {
   fund?(address: Address): Promise<void>
   /** When set, the Context API lives at this URL (a remote store, M3) and no local server is started. */
   storageUrl?: string
+  /**
+   * When set, sends go through this gas sponsor first — the wallet still signs, the sponsor pays
+   * (M3-D). Same URL rules as storageUrl plus no embedded credentials; a bad value is a
+   * `bad-sponsor-url` error raised before the lock or any chain call is touched.
+   */
+  sponsorUrl?: string
 }
 
 export const NAMESPACE = "projects.current"
@@ -60,6 +66,32 @@ function parseStorageUrl(raw: string | undefined): string | undefined {
   }
   const error = new Error("network.storageUrl must be https://, or http:// on 127.0.0.1 or localhost") as Error & { code: string }
   error.code = "bad-storage-url"
+  throw error
+}
+
+/**
+ * The optional gas-sponsor address (M3-D). Empty/absent means every send pays its own gas, exactly
+ * as before. A set value follows the storageUrl rules — https://, or http:// on 127.0.0.1 or
+ * localhost only — and additionally refuses a URL carrying credentials, because the sponsor sees
+ * every operation this wallet sends.
+ */
+export function parseSponsorUrl(raw: string | undefined): string | undefined {
+  if (raw === undefined || raw === "") return undefined
+  try {
+    const url = new URL(raw)
+    if (url.username !== "" || url.password !== "") {
+      // not a protocol violation — a value we refuse on purpose; the catch folds it into bad-sponsor-url
+      throw new Error("credentials in the sponsor URL")
+    }
+    if (url.protocol === "https:") return raw
+    if (url.protocol === "http:" && (url.hostname === "127.0.0.1" || url.hostname === "localhost")) return raw
+  } catch {
+    // falls through to the refusal below
+  }
+  const error = new Error(
+    "network.sponsorUrl must be https://, or http:// on 127.0.0.1 or localhost, with no credentials",
+  ) as Error & { code: string }
+  error.code = "bad-sponsor-url"
   throw error
 }
 
@@ -117,13 +149,26 @@ function agentNotSetup(name: string): Error {
 }
 
 /** Builds an agent from its saved identity and the grants it completed so far. */
-function buildAgent(home: MidaHome, network: Network, apiBaseUrl: string, identity: AgentIdentity): MidaAgent {
+function buildAgent(
+  home: MidaHome,
+  network: Network,
+  apiBaseUrl: string,
+  identity: AgentIdentity,
+  progress?: (line: string) => void,
+): MidaAgent {
   const signer = privateKeyToAccount(identity.signerPrivateKey)
+  const chain = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: signer })
+  const sponsorUrl = parseSponsorUrl(network.sponsorUrl)
+  if (sponsorUrl !== undefined) {
+    // An agent signer holds no MON by design — the sponsored send is how its chain calls get paid.
+    chain.sponsor = createSponsoredSender({ sponsorUrl, rpcUrl: network.rpcUrl, account: signer, deployment: network.deployment })
+  }
+  chain.progress = progress
   return new MidaAgent({
     agentId: identity.agentId,
     callbackOrigin: identity.callbackOrigin,
     encryptionPrivateKey: bytesOf(identity.encryptionPrivateKey, 32),
-    chain: createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: signer }),
+    chain,
     api: apiClient(apiBaseUrl, network.deployment, signer),
     requests: new FileAccessRequestStore(home, identity.name),
     grants: loadGrants(home, identity.name),
@@ -177,6 +222,7 @@ export class ServiceRuntime {
 
   static async open(home: MidaHome, network: Network, timing?: { lockWaitMs?: number; lockStepMs?: number }): Promise<ServiceRuntime> {
     const storageUrl = parseStorageUrl(network.storageUrl)
+    parseSponsorUrl(network.sponsorUrl) // a malformed sponsor URL is refused before the lock too
     const owner = loadOwnerAddress(home)
     if (owner === undefined) {
       const error = new Error("owner-address.json is missing — run `mida init` first") as Error & { code: string }
@@ -219,7 +265,7 @@ export class ServiceRuntime {
   agent(name: string): MidaAgent {
     const identity = loadAgentIdentity(this.home, name)
     if (identity === undefined) throw agentNotSetup(name)
-    return buildAgent(this.home, this.network, this.apiBaseUrl, identity)
+    return buildAgent(this.home, this.network, this.apiBaseUrl, identity, (line) => this.progress?.(line))
   }
 
   close(): Promise<void> {
@@ -259,6 +305,7 @@ export class Runtime extends ServiceRuntime {
 
   static override async open(home: MidaHome, network: Network, timing?: { lockWaitMs?: number; lockStepMs?: number }): Promise<Runtime> {
     const storageUrl = parseStorageUrl(network.storageUrl)
+    const sponsorUrl = parseSponsorUrl(network.sponsorUrl)
     let server: { baseUrl: string; close(): Promise<void> } | undefined
     let apiBaseUrl: string
     let locked = false
@@ -312,19 +359,30 @@ export class Runtime extends ServiceRuntime {
         deployment: { ...network.deployment, deploymentBlock: ownerStartBlock },
         account: ownerAccount,
       })
+      if (sponsorUrl !== undefined) {
+        // The owner still signs every call; the sponsor only pays the gas (M3-D).
+        ownerChain.sponsor = createSponsoredSender({
+          sponsorUrl,
+          rpcUrl: network.rpcUrl,
+          account: ownerAccount,
+          deployment: network.deployment,
+        })
+      }
       const ownerApi = apiClient(apiBaseUrl, network.deployment, ownerAccount)
       const vault = new FakeVaultAuthority({ seed: bytesOf(secrets.seed, 32), p256PrivateKey: secrets.p256PrivateKey, chain: ownerChain, api: ownerApi })
       const runtime = new Runtime(home, network, ownerChain, ownerApi, vault, ownerStartBlock, apiBaseUrl, async () => {
         await server?.close()
         if (locked) home.remove(LOCK_FILE)
       })
-      // R4-4: every owner send checks the wallet can pay before it goes out. The closure reads
-      // runtime.progress at send time so the CLI can attach its line after open.
+      // R4-4: every owner send checks the wallet can pay before it goes out. Both closures read
+      // runtime.progress at send time so the CLI can attach its line after open — the sponsor
+      // fallback explains itself through the second one.
       ownerChain.beforeSend = makeOwnerBalanceGuard({
         chain: ownerChain,
         fund: network.fund,
         progress: (line) => runtime.progress?.(line),
       })
+      ownerChain.progress = (line) => runtime.progress?.(line)
       for (const name of listAgentNames(home)) runtime.attach(loadAgentIdentity(home, name)!)
       return runtime
     } catch (error) {
@@ -336,7 +394,7 @@ export class Runtime extends ServiceRuntime {
 
   /** Builds the agent from its saved identity and the grants it completed before, and keeps it for `agent(name)`. */
   attach(identity: AgentIdentity): MidaAgent {
-    const agent = buildAgent(this.home, this.network, this.apiBaseUrl, identity)
+    const agent = buildAgent(this.home, this.network, this.apiBaseUrl, identity, (line) => this.progress?.(line))
     this.#agents.set(identity.name, agent)
     return agent
   }

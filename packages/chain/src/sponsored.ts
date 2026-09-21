@@ -66,7 +66,7 @@ export interface SponsoredSender {
  * first operation signs an EIP-7702 authorization for `implementation`; later ones carry none,
  * because the delegation is already on chain.
  */
-export async function createSponsoredSender(input: {
+export function createSponsoredSender(input: {
   sponsorUrl: string
   rpcUrl: string
   account: LocalAccount
@@ -77,7 +77,7 @@ export async function createSponsoredSender(input: {
   timeoutMs?: number
   /** Receipt polling interval; viem's default when unset. */
   pollingIntervalMs?: number
-}): Promise<SponsoredSender> {
+}): SponsoredSender {
   const chain = chainFor(input.deployment.chainId)
   const publicClient = createPublicClient({ chain, transport: http(input.rpcUrl) })
   const pimlico = createPimlicoClient({
@@ -85,22 +85,27 @@ export async function createSponsoredSender(input: {
     transport: http(input.sponsorUrl),
     entryPoint: { address: entryPoint08Address, version: "0.8" },
   })
-  const smartAccount = await to7702SimpleSmartAccount({ client: publicClient, owner: input.account })
-  const bundler = createSmartAccountClient({
-    account: smartAccount,
-    chain,
-    bundlerTransport: http(input.sponsorUrl),
-    paymaster: pimlico,
-    userOperation: {
-      estimateFeesPerGas: async () => (await pimlico.getUserOperationGasPrice()).fast,
-    },
-  })
+  // The 7702 account and bundler client are built on first use — constructing a sender must stay
+  // synchronous and free of network I/O so contexts can wire it at open time.
+  let bundler: Promise<ReturnType<typeof createSmartAccountClient>> | undefined
+  const getBundler = () =>
+    (bundler ??= (async () =>
+      createSmartAccountClient({
+        account: await to7702SimpleSmartAccount({ client: publicClient, owner: input.account }),
+        chain,
+        bundlerTransport: http(input.sponsorUrl),
+        paymaster: pimlico,
+        userOperation: {
+          estimateFeesPerGas: async () => (await pimlico.getUserOperationGasPrice()).fast,
+        },
+      }))())
   const implementation = input.implementation ?? SPONSORED_IMPLEMENTATION
   const timeoutMs = input.timeoutMs ?? SPONSOR_TIMEOUT_MS
 
   return {
     async send(call, _kind) {
       const work = (async (): Promise<SponsoredReceipt> => {
+        const bundlerClient = await getBundler()
         const data = encodeFunctionData({ abi: call.abi, functionName: call.functionName, args: call.args } as never)
         // A delegated sender needs no authorization — the endpoint reads the delegation from
         // chain instead; carrying a fresh one anyway would spend a signature for nothing.
@@ -118,11 +123,11 @@ export async function createSponsoredSender(input: {
               chainId: Number(input.deployment.chainId),
               nonce: await publicClient.getTransactionCount({ address: input.account.address }),
             })
-        const userOpHash = (await bundler.sendUserOperation({
+        const userOpHash = (await bundlerClient.sendUserOperation({
           calls: [{ to: call.address, value: 0n, data }],
           authorization,
         })) as Hex
-        const receipt = await bundler.waitForUserOperationReceipt({
+        const receipt = await bundlerClient.waitForUserOperationReceipt({
           hash: userOpHash,
           timeout: timeoutMs,
           pollingInterval: input.pollingIntervalMs,

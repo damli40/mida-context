@@ -17,7 +17,7 @@ import type { Network } from "./runtime.js"
 async function main(): Promise<void> {
   const home = resolveHome(process.env)
   const open = async (): Promise<ServiceRuntime> => {
-    const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown }>("network.json")
+    const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown; storageUrl?: unknown; sponsorUrl?: unknown }>("network.json")
     if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) {
       throw new Error("network.json is missing or incomplete; run mida init first")
     }
@@ -26,6 +26,10 @@ async function main(): Promise<void> {
       deployment: parseDeployment(stored.deployment),
       // the drainer holds agent keys only — funding is the owner CLI's job
       fund: async () => { throw new Error("the drainer cannot fund accounts") },
+      // both URLs the daemon honours — a drain writing to a local store while the CLI writes to
+      // the hosted one would split the checkpoints in two
+      storageUrl: typeof stored.storageUrl === "string" ? stored.storageUrl : undefined,
+      sponsorUrl: typeof stored.sponsorUrl === "string" ? stored.sponsorUrl : undefined,
     }
     return ServiceRuntime.open(home, network)
   }
