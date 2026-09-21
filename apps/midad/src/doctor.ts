@@ -198,7 +198,12 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         const owner = shared.ownerAddress ?? ownerAddressOf(home)
         if (owner === "missing") return [problem("the approved-projects list cannot be verified", NEEDS_OWNER)]
         const status = await approvalsFileStatus(home, owner)
-        if (status === "tampered") {
+        if (status === "unreadable") {
+          // the fix is permissions, not re-approving — re-running approve could not rebuild a
+          // list it cannot read anyway
+          return [problem("the approved-projects list could not be read", "check the file's permissions")]
+        }
+        if (status === "bad-signature") {
           return [problem("the approved-projects list failed its signature check", "re-run `mida approve <agent>` in each project folder")]
         }
         return status === "missing" ? ["ok: no approved projects yet"] : ["ok: approved-projects signature valid"]

@@ -192,7 +192,7 @@ export async function approve(
   runtime: Runtime,
   name: string,
   cwd?: string,
-): Promise<{ capabilityIds: Hex[]; permissions: number[]; transactionHash: Hex | null; gasUsed: bigint; projectId?: string }> {
+): Promise<{ capabilityIds: Hex[]; permissions: number[]; transactionHash: Hex | null; gasUsed: bigint; projectId?: string; droppedRows?: number | null }> {
   const { home, vault, reader, owner } = runtime
   // When a project folder is given its marker is resolved first: a folder that may not hold a
   // project (the owner's home, the filesystem root) is refused with not-a-project before any
@@ -215,7 +215,7 @@ export async function approve(
       // `assistant` is never listed: it gets no project approval, ever.
       if (cwd !== undefined && identity.purposeId === PURPOSE_ID) {
         const listed = await approveProject(runtime, { agent: name, cwd })
-        return { capabilityIds: [], permissions: [], transactionHash: null, gasUsed: 0n, projectId: listed.projectId }
+        return { capabilityIds: [], permissions: [], transactionHash: null, gasUsed: 0n, projectId: listed.approval.projectId, droppedRows: listed.droppedRows }
       }
       throw new Error(`agent "${name}" is already approved`)
     }
@@ -265,7 +265,7 @@ export async function approve(
     permissions: grant.capabilities.map((capability) => capability.permissions),
     transactionHash: approval.response.capabilities[0]!.transactionHash as Hex | null,
     gasUsed: approval.gasUsed,
-    ...(listed !== undefined ? { projectId: listed.projectId } : {}),
+    ...(listed !== undefined ? { projectId: listed.approval.projectId, droppedRows: listed.droppedRows } : {}),
   }
 }
 

@@ -272,7 +272,7 @@ describe("a failed save does not buy a new model call", () => {
 })
 
 describe("the owner-signed project list gates every save", () => {
-  for (const reason of ["not-approved", "list-tampered", "folder-mismatch"] as const) {
+  for (const reason of ["not-approved", "list-tampered", "list-unreadable", "check-failed", "folder-mismatch"] as const) {
     it(`a job refused with ${reason} is removed before any compile and never retried`, async () => {
       const { home, job, drain, compileCalls, saveCalls, drainLog } = setup()
       job({ event: "Stop" }, T0)

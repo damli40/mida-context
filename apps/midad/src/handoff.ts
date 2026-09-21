@@ -41,6 +41,7 @@ const notApprovedText = (agent: string): string =>
 const revokedText = (agent: string): string =>
   `Mida: ${agent}'s access was revoked by the owner. Nothing was shared.`
 const TAMPERED_TEXT = "Mida: the approved-projects list failed its signature check. Nothing was shared. Run `mida doctor`."
+const UNREADABLE_TEXT = "Mida: the approved-projects list could not be read: check the file's permissions. Nothing was shared. Run `mida doctor`."
 const EMPTY_TEXT = "Mida: connected. Nothing has been saved for this project yet."
 
 /** The generic refusal line — the only text a session-start hook prints on its own failures. */
@@ -105,6 +106,9 @@ export async function buildHandoff(
     const check = await (deps.checkProject ?? checkProject)(runtime, { agent, cwd: input.cwd })
     if (!check.ok) {
       if (check.reason === "list-tampered") return refused("list-tampered", TAMPERED_TEXT)
+      if (check.reason === "list-unreadable") return refused("list-unreadable", UNREADABLE_TEXT)
+      // a failed check names no cause the owner could act on — the generic line, not a guess
+      if (check.reason === "check-failed") return refused("check-failed", noContextText("check-failed"))
       return refused(check.reason, notApprovedText(agent))
     }
     const state = await (deps.capability ?? capabilityState)(runtime, agent)

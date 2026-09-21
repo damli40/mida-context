@@ -17,8 +17,9 @@ import type { Runtime } from "./runtime.js"
  * holds `.mida/`, so a symlinked cwd resolves to the same row.
  *
  * `checkProject` is the read side used by the drain before any compile: it returns a stable
- * refusal reason and never throws — a missing file is `not-approved`, anything present but wrong
- * is `list-tampered`, and there is no "treat corrupt as empty" path.
+ * refusal reason and never throws — a missing file is `not-approved`, a file that will not read
+ * or parse is `list-unreadable`, one that parses but fails shape or signature is `list-tampered`,
+ * and there is no "treat corrupt as empty" path.
  */
 
 export interface ProjectApproval {
@@ -30,7 +31,7 @@ export interface ProjectApproval {
 
 export type ProjectCheck =
   | { ok: true; approval: ProjectApproval }
-  | { ok: false; reason: "not-a-project" | "not-approved" | "list-tampered" | "folder-mismatch" }
+  | { ok: false; reason: "not-a-project" | "not-approved" | "list-tampered" | "list-unreadable" | "folder-mismatch" | "check-failed" }
 
 const LIST_FILE = "approved-projects.json"
 const ENTRY_KEYS: readonly (keyof ProjectApproval)[] = ["agent", "projectId", "root", "approvedAt"]
@@ -58,25 +59,32 @@ function asApproval(raw: unknown): ProjectApproval | undefined {
 
 type ApprovalsFile =
   | { kind: "missing" }
-  | { kind: "tampered" }
+  | { kind: "unreadable" }
+  /** `rows` is the entry count when the file held a countable list, else null — for reporting. */
+  | { kind: "bad-signature"; rows: number | null }
   | { kind: "signed"; entries: ProjectApproval[] }
 
-/** Missing is not corrupt: only a file that exists but will not parse or verify is tampered. */
+/**
+ * Missing is not corrupt, and unreadable is not a signature failure: a read or JSON.parse throw
+ * is `unreadable` — a permissions or filesystem problem with a different fix. Anything that
+ * parses but fails shape or verification is `bad-signature` — content nobody signed.
+ */
 async function readApprovalsFile(home: Runtime["home"], owner: Address): Promise<ApprovalsFile> {
   let raw: unknown
   try {
     raw = home.readJson(LIST_FILE)
   } catch {
-    return { kind: "tampered" }
+    return { kind: "unreadable" }
   }
   if (raw === undefined) return { kind: "missing" }
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { kind: "tampered" }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { kind: "bad-signature", rows: null }
   const record = raw as Record<string, unknown>
-  if (typeof record.signature !== "string" || !Array.isArray(record.entries)) return { kind: "tampered" }
+  const rows = Array.isArray(record.entries) ? record.entries.length : null
+  if (typeof record.signature !== "string" || !Array.isArray(record.entries)) return { kind: "bad-signature", rows }
   const entries: ProjectApproval[] = []
   for (const item of record.entries) {
     const entry = asApproval(item)
-    if (entry === undefined) return { kind: "tampered" }
+    if (entry === undefined) return { kind: "bad-signature", rows }
     entries.push(entry)
   }
   try {
@@ -85,9 +93,9 @@ async function readApprovalsFile(home: Runtime["home"], owner: Address): Promise
       message: canonicalEntries(entries),
       signature: record.signature as Hex,
     })
-    if (!ok) return { kind: "tampered" }
+    if (!ok) return { kind: "bad-signature", rows }
   } catch {
-    return { kind: "tampered" }
+    return { kind: "bad-signature", rows }
   }
   return { kind: "signed", entries }
 }
@@ -96,7 +104,7 @@ async function readApprovalsFile(home: Runtime["home"], owner: Address): Promise
  * The list's integrity for `mida doctor` — read and signature-verified without a runtime, because
  * verification is local cryptography against the owner's address. `midad`'s lock is never needed.
  */
-export async function approvalsFileStatus(home: Runtime["home"], owner: Address): Promise<"missing" | "tampered" | "signed"> {
+export async function approvalsFileStatus(home: Runtime["home"], owner: Address): Promise<"missing" | "unreadable" | "bad-signature" | "signed"> {
   return (await readApprovalsFile(home, owner)).kind
 }
 
@@ -172,17 +180,25 @@ function codedError(code: "not-a-project", message: string): Error {
 
 /**
  * Adds (or refreshes) the `agent → projectId → root` row for the folder `cwd` runs in and re-signs
- * the list atomically (same-folder temp file, rename, mode 0600 — `writeSecretJson`). A list file
- * that will not verify is rebuilt from nothing: untrusted rows are never re-signed.
+ * the list atomically (same-folder temp file, rename, mode 0600 — `writeSecretJson`). A list that
+ * parses but will not verify is rebuilt from nothing — untrusted rows are never re-signed — and
+ * `droppedRows` reports how many it discarded (null when they could not be counted). A list that
+ * cannot be READ is a different problem: rebuilding it would silently destroy every other row, so
+ * the command refuses with the permissions message and writes nothing.
  */
 export async function approveProject(
   runtime: Runtime,
   input: { agent: string; cwd: string; homeDir?: string },
-): Promise<ProjectApproval> {
+): Promise<{ approval: ProjectApproval; droppedRows: number | null }> {
   const marker = ensureProjectMarker(input.cwd, input.homeDir)
   const root = realpathSync(marker.markerDir)
   return serializeListWrite(async () => {
     const file = await readApprovalsFile(runtime.home, runtime.owner)
+    if (file.kind === "unreadable") {
+      const error = new Error("the approved-projects list could not be read: check the file's permissions") as Error & { code: string }
+      error.code = "list-unreadable"
+      throw error
+    }
     const entries = file.kind === "signed" ? file.entries : []
     const kept = entries.filter(
       (e) => !(e.agent === input.agent && e.projectId === marker.projectId && e.root === root),
@@ -195,7 +211,7 @@ export async function approveProject(
     }
     const next = [...kept, approval]
     runtime.home.writeSecretJson(LIST_FILE, { entries: next, signature: await signEntries(runtime, next) })
-    return approval
+    return { approval, droppedRows: file.kind === "bad-signature" ? file.rows : 0 }
   })
 }
 
@@ -218,8 +234,9 @@ export async function removeAgentApprovals(runtime: Runtime, agent: string): Pro
 /**
  * The drain-time gate: does the folder this job ran in belong to a project the owner approved for
  * this agent? Marker first — a folder with no marker is `not-a-project` even when the list itself
- * is broken. Then the list: missing means nobody approved anything (`not-approved`), unverifiable
- * means `list-tampered`, and a signed file decides — `folder-mismatch` when this agent's projectId
+ * is broken. Then the list: missing means nobody approved anything (`not-approved`), unreadable
+ * means `list-unreadable`, a failed signature is `list-tampered`, and a signed file decides —
+ * `folder-mismatch` when this agent's projectId
  * is listed under a different root (the folder was copied), else `not-approved`. Never throws.
  */
 export async function checkProject(runtime: Runtime, input: { agent: string; cwd: string }): Promise<ProjectCheck> {
@@ -233,13 +250,15 @@ export async function checkProject(runtime: Runtime, input: { agent: string; cwd
       return { ok: false, reason: "not-a-project" }
     }
     const file = await readApprovalsFile(runtime.home, runtime.owner)
-    if (file.kind === "tampered") return { ok: false, reason: "list-tampered" }
+    if (file.kind === "unreadable") return { ok: false, reason: "list-unreadable" }
+    if (file.kind === "bad-signature") return { ok: false, reason: "list-tampered" }
     const entries = file.kind === "signed" ? file.entries : []
     const mine = entries.filter((e) => e.agent === input.agent && e.projectId === marker.projectId)
     const match = mine.find((e) => e.root === root)
     if (match !== undefined) return { ok: true, approval: match }
     return { ok: false, reason: mine.length > 0 ? "folder-mismatch" : "not-approved" }
   } catch {
-    return { ok: false, reason: "list-tampered" }
+    // the check itself failed — unreadable-class, and never a signature claim
+    return { ok: false, reason: "check-failed" }
   }
 }

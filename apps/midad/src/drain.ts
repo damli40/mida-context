@@ -55,7 +55,9 @@ const PERMANENT_FAILURES = new Set([
   "not-a-project",
   "not-approved",
   "list-tampered",
+  "list-unreadable",
   "folder-mismatch",
+  "check-failed",
 ])
 /**
  * A checkpoint the validator rejects is usually fixed by a fresh model call, so

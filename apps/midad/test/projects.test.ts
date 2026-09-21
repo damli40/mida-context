@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import type { Hex } from "@mida/protocol"
 import {
-  MidaHome, approveProject, checkProject, loadOrCreateOwnerSecrets, removeAgentApprovals,
+  MidaHome, approveProject, approvalsFileStatus, checkProject, loadOrCreateOwnerSecrets, removeAgentApprovals,
 } from "@mida/midad"
 import type { ProjectApproval, Runtime } from "@mida/midad"
 
@@ -44,24 +44,42 @@ describe("checkProject never throws and names a stable reason", () => {
     expect(await checkProject(runtime, { agent: "claude-code", cwd: workDir })).toEqual({ ok: false, reason: "not-approved" })
   })
 
-  it("every present-but-wrong list file is list-tampered — never an exception, never treated as empty", async () => {
+  it("a list file that parses but fails shape or signature is list-tampered — never an exception, never treated as empty", async () => {
     const { home, runtime, workDir } = setup()
     mark(workDir, "p-1")
     const sig = `0x${"ab".repeat(65)}` as Hex
     const cases: [string, () => void][] = [
-      ["unparseable JSON", () => writeFileSync(home.path(LIST), "{not json")],
       ["no signature field", () => home.writeSecretJson(LIST, { entries: [] })],
       ["entries not an array", () => home.writeSecretJson(LIST, { entries: "nope", signature: sig })],
       ["an entry with a wrong-typed field", () =>
         home.writeSecretJson(LIST, { entries: [{ agent: "claude-code", projectId: "p-1", root: 42, approvedAt: "x" }], signature: sig })],
       ["a signature that is not a string", () => home.writeSecretJson(LIST, { entries: [], signature: 7 })],
-      ["an unreadable file", () => { writeFileSync(home.path(LIST), "{}"); chmodSync(home.path(LIST), 0o000) }],
     ]
     for (const [name, write] of cases) {
       try {
         write()
         const result = await checkProject(runtime, { agent: "claude-code", cwd: workDir })
         expect(result, name).toEqual({ ok: false, reason: "list-tampered" })
+        expect(await approvalsFileStatus(home, runtime.owner), name).toBe("bad-signature")
+      } finally {
+        home.remove(LIST)
+      }
+    }
+  })
+
+  it("a list file that cannot be read or parsed is list-unreadable — a permissions problem, not a signature claim", async () => {
+    const { home, runtime, workDir } = setup()
+    mark(workDir, "p-1")
+    const cases: [string, () => void][] = [
+      ["unparseable JSON", () => writeFileSync(home.path(LIST), "{not json")],
+      ["a permission-denied file", () => { writeFileSync(home.path(LIST), "{}"); chmodSync(home.path(LIST), 0o000) }],
+    ]
+    for (const [name, write] of cases) {
+      try {
+        write()
+        const result = await checkProject(runtime, { agent: "claude-code", cwd: workDir })
+        expect(result, name).toEqual({ ok: false, reason: "list-unreadable" })
+        expect(await approvalsFileStatus(home, runtime.owner), name).toBe("unreadable")
       } finally {
         if (home.has(LIST)) chmodSync(home.path(LIST), 0o600)
         home.remove(LIST)
@@ -74,8 +92,9 @@ describe("approveProject", () => {
   it("uses an existing marker's projectId, stores the realpath root, and checkProject then approves — even two folders down", async () => {
     const { home, runtime, workDir } = setup()
     mark(workDir, "p-1")
-    const approval = await approveProject(runtime, { agent: "claude-code", cwd: workDir })
+    const { approval, droppedRows } = await approveProject(runtime, { agent: "claude-code", cwd: workDir })
     expect(approval).toMatchObject({ agent: "claude-code", projectId: "p-1", root: realpathSync(workDir) })
+    expect(droppedRows).toBe(0)
     const nested = join(workDir, "a", "b")
     mkdirSync(nested, { recursive: true })
     expect(await checkProject(runtime, { agent: "claude-code", cwd: nested })).toEqual({ ok: true, approval })
@@ -86,7 +105,7 @@ describe("approveProject", () => {
     const { dir, runtime } = setup()
     const fresh = join(dir, "fresh")
     mkdirSync(fresh)
-    const approval = await approveProject(runtime, { agent: "codex", cwd: fresh })
+    const { approval } = await approveProject(runtime, { agent: "codex", cwd: fresh })
     const marker = JSON.parse(readFileSync(join(fresh, ".mida", "project.json"), "utf8")) as { projectId: string }
     expect(marker.projectId).toBe(approval.projectId)
     expect(approval.root).toBe(realpathSync(fresh))
@@ -102,6 +121,46 @@ describe("approveProject", () => {
     await expect(approveProject(runtime, { agent: "codex", cwd: "/", homeDir: fakeHome }))
       .rejects.toMatchObject({ code: "not-a-project" })
     expect(home.has(LIST)).toBe(false)
+  })
+
+  it("an unreadable list refuses — one approve cannot silently discard every other row", async () => {
+    const { home, runtime, workDir } = setup()
+    mark(workDir, "p-1")
+    const bytes = '{"entries":[],"signature":"0x12"}'
+    writeFileSync(home.path(LIST), bytes)
+    chmodSync(home.path(LIST), 0o000)
+    try {
+      await expect(approveProject(runtime, { agent: "claude-code", cwd: workDir }))
+        .rejects.toThrow("the approved-projects list could not be read: check the file's permissions")
+    } finally {
+      chmodSync(home.path(LIST), 0o600)
+    }
+    // the refusal wrote nothing — the bytes the owner may still fix are untouched
+    expect(readFileSync(home.path(LIST), "utf8")).toBe(bytes)
+  })
+
+  it("a bad-signature list is rebuilt from empty and reports how many rows it dropped", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); mark(dirA, "p-a")
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    // a hand-added row the signature does not cover — the file parses, the signature fails
+    const file = home.readJson<{ entries: ProjectApproval[]; signature: Hex }>(LIST)!
+    const planted: ProjectApproval = { agent: "evil", projectId: "p-evil", root: "/tmp", approvedAt: "x" }
+    home.writeSecretJson(LIST, { entries: [...file.entries, planted], signature: file.signature })
+    const dirB = join(dir, "b"); mark(dirB, "p-b")
+    const result = await approveProject(runtime, { agent: "codex", cwd: dirB })
+    expect(result.approval.agent).toBe("codex")
+    expect(result.droppedRows).toBe(2)   // both unverifiable rows went away — none was re-signed
+    const healed = home.readJson<{ entries: ProjectApproval[] }>(LIST)!
+    expect(healed.entries).toHaveLength(1)
+  })
+
+  it("a bad-signature file whose rows cannot be counted reports null, not a guess", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); mark(dirA, "p-a")
+    home.writeSecretJson(LIST, { entries: "nope", signature: `0x${"ab".repeat(65)}` })
+    const result = await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    expect(result.droppedRows).toBeNull()
   })
 
   it("two approvals back to back — and two run concurrently — both land in the file", async () => {
@@ -131,8 +190,8 @@ describe("the signature covers a canonical form of the entries", () => {
     const { dir, home, runtime } = setup()
     const dirA = join(dir, "a"); const dirB = join(dir, "b")
     mark(dirA, "p-a"); mark(dirB, "p-b")
-    const a = await approveProject(runtime, { agent: "claude-code", cwd: dirA })
-    const b = await approveProject(runtime, { agent: "claude-code", cwd: dirB })
+    const { approval: a } = await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    const { approval: b } = await approveProject(runtime, { agent: "claude-code", cwd: dirB })
     const signed = home.readJson<{ entries: ProjectApproval[]; signature: Hex }>(LIST)!
 
     // reorder the two entries in place — the canonical sort makes the signature still hold
@@ -175,7 +234,7 @@ describe("folder-mismatch beats not-approved", () => {
     symlinkSync(real, link)
     expect(await checkProject(runtime, { agent: "claude-code", cwd: link })).toMatchObject({ ok: true })
     // approving through the link stores the realpath, so the bare path checks out too
-    const approval = await approveProject(runtime, { agent: "codex", cwd: link })
+    const { approval } = await approveProject(runtime, { agent: "codex", cwd: link })
     expect(approval.root).toBe(realpathSync(real))
     expect(await checkProject(runtime, { agent: "codex", cwd: real })).toMatchObject({ ok: true })
   })

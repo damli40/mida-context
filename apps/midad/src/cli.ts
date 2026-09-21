@@ -90,6 +90,14 @@ export async function runCliWithRuntime(
           : `approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}` +
               (result.projectId !== undefined ? ` project ${result.projectId}` : ""),
       )
+      // a list rebuilt from a bad signature silently dropped rows — the owner must hear the count
+      if (result.droppedRows !== undefined && result.droppedRows !== 0) {
+        print(
+          result.droppedRows === null
+            ? "the old approved-projects list was invalid; the old list was discarded"
+            : `the old approved-projects list was invalid; ${result.droppedRows} row(s) were dropped`,
+        )
+      }
     } else if (command === "save-demo") {
       const result = await saveCheckpoint(runtime, agent, {
         projectId,

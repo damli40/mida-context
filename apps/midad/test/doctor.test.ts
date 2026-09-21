@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest"
-import { mkdtempSync } from "node:fs"
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { MidaHome, installClaudeCode, installCodex, runDoctor, runDoctorLive } from "@mida/midad"
+import { MidaHome, installClaudeCode, installCodex, loadOrCreateOwnerSecrets, runDoctor, runDoctorLive } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
 
@@ -45,6 +45,35 @@ describe("mida doctor without a chain", () => {
     })
     expect(lines).toContain("ok: claude-code hooks installed")
     expect(lines).toContain("ok: codex hooks installed")
+  })
+
+  it("an unreadable approved-projects file is a permissions problem — never a signature claim", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    // the check needs only the owner's address — the signature verify is local cryptography
+    loadOrCreateOwnerSecrets(home)
+    const list = home.path("approved-projects.json")
+    writeFileSync(list, "{}")
+    chmodSync(list, 0o000)
+    try {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      const line = lines.find((l) => l.includes("approved-projects"))
+      expect(line).toBeDefined()
+      expect(line).toContain("could not be read")
+      expect(line).toContain("permissions")
+      expect(line).not.toContain("signature")
+    } finally {
+      chmodSync(list, 0o600)
+    }
+  })
+
+  it("a bad-signature approved-projects file still names the signature check", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    loadOrCreateOwnerSecrets(home)
+    home.writeSecretJson("approved-projects.json", { entries: [], signature: `0x${"ab".repeat(65)}` })
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    expect(lines).toContain("PROBLEM: the approved-projects list failed its signature check — re-run `mida approve <agent>` in each project folder")
   })
 
   it("names the API-key variables that are set — never their values", async () => {

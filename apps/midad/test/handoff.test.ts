@@ -57,7 +57,7 @@ const input = { agent: "codex", cwd: "/tmp/work", authorNames: {} }
 
 describe("buildHandoff", () => {
   it("checkProject runs first: every project refusal makes zero chain calls and zero reads", async () => {
-    for (const reason of ["not-a-project", "not-approved", "folder-mismatch", "list-tampered"] as const) {
+    for (const reason of ["not-a-project", "not-approved", "folder-mismatch", "list-tampered", "list-unreadable", "check-failed"] as const) {
       const { calls, d } = deps({ checkProject: async () => ({ ok: false, reason }) })
       const result = await buildHandoff(runtime, input, d)
       expect(result.kind).toBe("refused")
@@ -94,6 +94,26 @@ describe("buildHandoff", () => {
       kind: "refused",
       reason: "list-tampered",
       text: "Mida: the approved-projects list failed its signature check. Nothing was shared. Run `mida doctor`.",
+    })
+  })
+
+  it("a list that cannot be read gets the permissions line — never a signature claim", async () => {
+    const { d } = deps({ checkProject: async () => ({ ok: false, reason: "list-unreadable" }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toEqual({
+      kind: "refused",
+      reason: "list-unreadable",
+      text: "Mida: the approved-projects list could not be read: check the file's permissions. Nothing was shared. Run `mida doctor`.",
+    })
+  })
+
+  it("a check that fails inside gets the no-context line with check-failed, not a signature claim", async () => {
+    const { d } = deps({ checkProject: async () => ({ ok: false, reason: "check-failed" }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toEqual({
+      kind: "refused",
+      reason: "check-failed",
+      text: "Mida: no context available right now (check-failed).",
     })
   })
 
