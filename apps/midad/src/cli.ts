@@ -327,6 +327,22 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown)
       return `this folder cannot hold a project — run \`mida approve ${agent}\` inside the project's folder`
     case "list-unreadable":
       return "the approved-projects list could not be read — check the file's permissions"
+    case "SPONSOR_PENDING": {
+      // The call was accepted by the sponsor but its receipt never confirmed — resending would be
+      // the double-send this error exists to prevent, so the line says where it stands and how to
+      // check. The hash is shortened to 10 characters: enough to find the operation, little enough
+      // that nobody mistakes it for something sensitive. The deeper message is never echoed.
+      const hash = (error as { userOpHash?: unknown }).userOpHash
+      const label = typeof hash === "string" && hash.startsWith("0x") ? ` ${hash.slice(0, 10)}…` : ""
+      const opener = `the sponsored operation${label} was accepted and may still land`
+      // A blind re-run is honest for approve, revoke and init — each asks the chain what already
+      // landed and sends only what is missing. `remember` is the exception: a second run writes a
+      // SECOND fact, so the owner must look first.
+      if (command === "remember") {
+        return `${opener} — check whether the fact is already there with \`mida read --as assistant\` before running it again; nothing was sent from your wallet`
+      }
+      return `${opener} — run the same command again in a minute — it will tell you if it already went through; nothing was sent from your wallet`
+    }
     default:
       return `refused: ${typeof code === "string" ? code : "ERROR"}`
   }

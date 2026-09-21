@@ -161,7 +161,7 @@ function buildAgent(
   const sponsorUrl = parseSponsorUrl(network.sponsorUrl)
   if (sponsorUrl !== undefined) {
     // An agent signer holds no MON by design — the sponsored send is how its chain calls get paid.
-    chain.sponsor = createSponsoredSender({ sponsorUrl, rpcUrl: network.rpcUrl, account: signer, deployment: network.deployment })
+    chain.sponsor = createSponsoredSender({ sponsorUrl, rpcUrl: network.rpcUrl, account: signer, deployment: network.deployment, progress })
   }
   chain.progress = progress
   return new MidaAgent({
@@ -359,15 +359,6 @@ export class Runtime extends ServiceRuntime {
         deployment: { ...network.deployment, deploymentBlock: ownerStartBlock },
         account: ownerAccount,
       })
-      if (sponsorUrl !== undefined) {
-        // The owner still signs every call; the sponsor only pays the gas (M3-D).
-        ownerChain.sponsor = createSponsoredSender({
-          sponsorUrl,
-          rpcUrl: network.rpcUrl,
-          account: ownerAccount,
-          deployment: network.deployment,
-        })
-      }
       const ownerApi = apiClient(apiBaseUrl, network.deployment, ownerAccount)
       const vault = new FakeVaultAuthority({ seed: bytesOf(secrets.seed, 32), p256PrivateKey: secrets.p256PrivateKey, chain: ownerChain, api: ownerApi })
       const runtime = new Runtime(home, network, ownerChain, ownerApi, vault, ownerStartBlock, apiBaseUrl, async () => {
@@ -383,6 +374,17 @@ export class Runtime extends ServiceRuntime {
         progress: (line) => runtime.progress?.(line),
       })
       ownerChain.progress = (line) => runtime.progress?.(line)
+      if (sponsorUrl !== undefined) {
+        // The owner still signs every call; the sponsor only pays the gas (M3-D). The progress
+        // line is the same deferred read — a slow receipt wait surfaces on the CLI after open.
+        ownerChain.sponsor = createSponsoredSender({
+          sponsorUrl,
+          rpcUrl: network.rpcUrl,
+          account: ownerAccount,
+          deployment: network.deployment,
+          progress: (line) => runtime.progress?.(line),
+        })
+      }
       for (const name of listAgentNames(home)) runtime.attach(loadAgentIdentity(home, name)!)
       return runtime
     } catch (error) {

@@ -132,6 +132,21 @@ describe("sendContract with a sponsor wired", () => {
     expect(sent).toHaveLength(0)
   })
 
+  it("SPONSOR_PENDING propagates untouched — an accepted operation never gets a self-paid copy", async () => {
+    const pending = new MidaError(
+      "SPONSOR_PENDING",
+      `sponsored operation ${USER_OP_HASH} was accepted and may still land — check it before retrying; nothing was sent from your wallet`,
+    ) as MidaError & { userOpHash: Hex }
+    pending.userOpHash = USER_OP_HASH
+    const sponsor = successfulSponsor(async () => {
+      throw pending
+    })
+    const { context, sent } = stubContext({ sponsor })
+    const error = await sendContract(context, call, "context.register").then(() => null, (e: unknown) => e)
+    expect(error).toBe(pending)
+    expect(sent).toHaveLength(0) // ZERO self-paid sends: the operation was accepted
+  })
+
   it("a sponsor error that is not SponsorDidNotPay propagates untouched", async () => {
     const weird = new MidaError("NOT_FOUND", "contract reverted ContextNotFound")
     const sponsor = successfulSponsor(async () => {
