@@ -5,7 +5,7 @@ const base: MergedHandoff = { originalRequest: "Build X.\nStep 1 …", objective
   unresolvedIssue: null, nextAction: "wire it", decisions: [{ decision: "sqlite", rationale: "no server" }],
   rejected: [{ approach: "redis", why: "needs a server" }], constraints: ["no timers"], artifacts: ["a.ts"],
   progress: ["wrote schema"], provenance: [{ agent: "claude-code", authorId: "0xclaudeauthor", createdAt: "2026-09-21T10:00:00Z", contextId: "0xabc", compiledBy: "haiku" }],
-  otherSessions: [], missingEarlierSession: false, carriedForwardFromEarlierSave: false }
+  otherSessions: [], missingEarlierSession: false, carriedForwardFromEarlierSave: false, headSessionId: "sess-base" }
 
 describe("renderHandoff", () => {
   it("leads with the request, then the remaining plan, and ends with provenance", () => {
