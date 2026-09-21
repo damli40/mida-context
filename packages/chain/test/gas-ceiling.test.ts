@@ -20,6 +20,8 @@ function stubContext(estimate: bigint | (() => Promise<bigint>)) {
       simulateContract: async () => ({ request: { address: ADDRESS, functionName: "register" } }),
       estimateContractGas: typeof estimate === "function" ? estimate : async () => estimate,
       estimateGas: typeof estimate === "function" ? estimate : async () => estimate,
+      // every send now prices its fee once (R5-9) — the stub answers a fixed EIP-1559 pair
+      estimateFeesPerGas: async () => ({ maxFeePerGas: 12n, maxPriorityFeePerGas: 1n }),
       waitForTransactionReceipt: async () => ({ status: "success", transactionHash: HASH, gasUsed: 1n }),
     },
     walletClient: {

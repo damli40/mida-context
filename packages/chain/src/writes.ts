@@ -16,6 +16,31 @@ import type { TxKind } from "./gas.js"
 import { toMidaError } from "./registry.js"
 import type { ChainContext } from "./registry.js"
 
+/**
+ * The fee fields a send carries — the answer of `estimateFeesPerGas`, forwarded verbatim into
+ * the transaction so the number the balance guard checked is the number the node checks (R5-9).
+ * An EIP-1559 chain sets `maxFeePerGas`/`maxPriorityFeePerGas`; a legacy chain sets `gasPrice`.
+ */
+export interface SendFee {
+  maxFeePerGas?: bigint
+  maxPriorityFeePerGas?: bigint
+  gasPrice?: bigint
+}
+
+/** What a send is about to cost the payer, handed to `beforeSend` after the estimates. */
+export interface SendCost {
+  payer: Address
+  gasLimit: bigint
+  /**
+   * The exact fee values the transaction goes out with. The node verifies the payer against
+   * `gasLimit × maxFeePerGas` — checking a fresh (cheaper) gas price instead let a wallet
+   * through that the send itself then refused (R5-9).
+   */
+  fee: SendFee
+  /** A plain transfer's moved value — part of the payer's total exposure, absent on contract calls. */
+  value?: bigint
+}
+
 export interface WriteContext extends ChainContext {
   walletClient: WalletClient
   account: Account
@@ -25,7 +50,7 @@ export interface WriteContext extends ChainContext {
    * pay for goes out (R4-4). Only the owner's context wires this; agent signers keep the bare
    * node error, exactly as before.
    */
-  beforeSend?: (cost: { payer: Address; gasLimit: bigint }) => Promise<void>
+  beforeSend?: (cost: SendCost) => Promise<void>
 }
 
 /** A write context whose account can sign typed data locally (operators, owners and agent signers in tests and the CLI). */
@@ -45,6 +70,20 @@ export function createWriteContext(input: { rpcUrl: string; deployment: Deployme
 
 /** A mined receipt plus the gas limit the transaction was actually sent with — the number Monad bills. */
 export type SentReceipt = TransactionReceipt & { gasLimit: bigint }
+
+/**
+ * The fee a send will offer, estimated once per transaction. viem's EIP-1559 default multiplies
+ * the base fee (×1.2) into `maxFeePerGas`, which is exactly the product the node verifies the
+ * payer's balance against — so the guard must see THIS number, not the raw gas price (R5-9).
+ */
+async function estimateSendFee(context: WriteContext): Promise<SendFee> {
+  const estimated = await context.publicClient.estimateFeesPerGas()
+  const fee: SendFee = {}
+  if (estimated.gasPrice !== undefined) fee.gasPrice = estimated.gasPrice
+  if (estimated.maxFeePerGas !== undefined) fee.maxFeePerGas = estimated.maxFeePerGas
+  if (estimated.maxPriorityFeePerGas !== undefined) fee.maxPriorityFeePerGas = estimated.maxPriorityFeePerGas
+  return fee
+}
 
 /**
  * Simulates first so a revert surfaces as a named contract error mapped to a protocol code, then
@@ -72,13 +111,17 @@ export async function sendContract(
     throw toMidaError(error)
   }
   let gas: bigint
+  let fee: SendFee
   try {
-    gas = await contractGas(context, call, kind)
+    // The fee is estimated ONCE here and forwarded into the send below: the balance guard checks
+    // gasLimit × this maxFeePerGas, the node checks the same product, and no second estimate can
+    // drift between the two reads (R5-9).
+    ;[gas, fee] = await Promise.all([contractGas(context, call, kind), estimateSendFee(context)])
   } catch (error) {
     throw toMidaError(error)
   }
-  await context.beforeSend?.({ payer: context.account.address, gasLimit: gas })
-  const hash = await context.walletClient.writeContract({ ...(request as object), gas } as never)
+  await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee })
+  const hash = await context.walletClient.writeContract({ ...(request as object), gas, ...fee } as never)
   const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
   if (receipt.status !== "success") {
     throw new MidaError("CAPABILITY_DENIED", `${call.functionName} transaction ${hash} reverted on-chain`)
@@ -96,18 +139,20 @@ export async function sendValue(
   kind: TxKind,
 ): Promise<SentReceipt> {
   let gas: bigint
+  let fee: SendFee
   try {
-    gas = await valueGas(context, transfer, kind)
+    ;[gas, fee] = await Promise.all([valueGas(context, transfer, kind), estimateSendFee(context)])
   } catch (error) {
     throw toMidaError(error)
   }
-  await context.beforeSend?.({ payer: context.account.address, gasLimit: gas })
+  await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee, value: transfer.value })
   const hash = await context.walletClient.sendTransaction({
     account: context.account,
     chain: context.walletClient.chain,
     to: transfer.to,
     value: transfer.value,
     gas,
+    ...fee,
   } as never)
   const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
   if (receipt.status !== "success") {

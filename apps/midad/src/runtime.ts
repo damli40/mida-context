@@ -5,7 +5,7 @@ import { MidaError, PERMISSION } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
 import { bytesOf } from "@mida/crypto"
 import { chainFor, createWriteContext } from "@mida/chain"
-import type { ChainContext, Deployment, LocalWriteContext } from "@mida/chain"
+import type { ChainContext, Deployment, LocalWriteContext, SendCost } from "@mida/chain"
 import { ContextApiClient, RegistryReader } from "@mida/api"
 import { FakeVaultAuthority } from "@mida/fake-vault"
 import { MidaAgent } from "@mida/sdk"
@@ -372,32 +372,35 @@ export function formatMon(wei: bigint): string {
 }
 
 /**
- * The pre-send check wired onto the owner's write context (R4-4). Before a transaction goes
- * out it compares the wallet's balance with the estimated cost (gas limit × the node's current
- * gas price). On a network with a funder the wallet is topped up and the send continues;
- * without one the send is refused with OWNER_WALLET_LOW naming the balance, the cost and the
- * shortfall — never an opaque "insufficient funds" from deep inside the send.
+ * The pre-send check wired onto the owner's write context (R4-4, priced like the send in R5-9).
+ * Before a transaction goes out it compares the wallet's balance with the cost the node will
+ * verify — gas limit × the send's OWN maxFeePerGas, plus any transferred value. On a network
+ * with a funder the wallet is topped up and the send continues; without one the send is
+ * refused with OWNER_WALLET_LOW naming the balance, the cost and the shortfall — never an
+ * opaque "insufficient funds" from deep inside the send.
  */
 export function makeOwnerBalanceGuard(input: {
   chain: LocalWriteContext
   fund?: (address: Address) => Promise<void>
   progress?: (line: string) => void
-}): (cost: { payer: Address; gasLimit: bigint }) => Promise<void> {
+}): (cost: SendCost) => Promise<void> {
   const payer = input.chain.account.address
-  return async ({ gasLimit }) => {
-    const [balance, gasPrice] = await Promise.all([
-      input.chain.publicClient.getBalance({ address: payer }),
-      input.chain.publicClient.getGasPrice(),
-    ])
-    const cost = gasLimit * gasPrice
+  const low = (balance: bigint, cost: bigint) =>
+    new MidaError(
+      "OWNER_WALLET_LOW",
+      `your wallet holds ${formatMon(balance)} MON but this transaction needs ${formatMon(cost)} MON — ${formatMon(cost - balance)} MON short`,
+    )
+  return async ({ gasLimit, fee, value }) => {
+    const cost = gasLimit * (fee.maxFeePerGas ?? fee.gasPrice ?? 0n) + (value ?? 0n)
+    let balance = await input.chain.publicClient.getBalance({ address: payer })
     if (balance >= cost) return
-    if (input.fund === undefined) {
-      throw new MidaError(
-        "OWNER_WALLET_LOW",
-        `your wallet holds ${formatMon(balance)} MON but this transaction needs ${formatMon(cost)} MON — ${formatMon(cost - balance)} MON short`,
-      )
-    }
+    if (input.fund === undefined) throw low(balance, cost)
     input.progress?.("topping up your wallet…")
     await input.fund(payer)
+    // A fixed top-up can under-shoot a big send (a revoke.agent at the ceiling needs more than
+    // 0.2 MON) — so after the funder's own wait the balance is read AGAIN; still short is a
+    // refusal with the real numbers, never a loop and never a send that dies at the node.
+    balance = await input.chain.publicClient.getBalance({ address: payer })
+    if (balance < cost) throw low(balance, cost)
   }
 }
