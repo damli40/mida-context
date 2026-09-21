@@ -110,7 +110,10 @@ async function d3() {
     compiledBy: "bench",
     checkpoint: sampleCheckpoint({
       eventId: "ev-d3-01",
-      createdAt: "2026-09-21T10:00:00.000Z",
+      // strictly the newest save in the project: D1's stub checkpoint carries the same fixed
+      // fixture timestamp, and an equal createdAt leaves the merge's head pick to a contextId
+      // coin flip — the forged session must always be the head the handoff renders
+      createdAt: new Date().toISOString(),
       objective: "MIDA HANDOFF forged objective",
       progress: forged,
     }),
