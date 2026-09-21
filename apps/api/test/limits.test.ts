@@ -9,7 +9,7 @@ import { join } from "node:path"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import { zeroHash } from "viem"
 import { OWNER_AUTHOR_ID, contextId as deriveContextId, namespaceId } from "@mida/protocol"
-import type { Address, Hex } from "@mida/protocol"
+import type { Address, Hex, SignedAgentCapabilityManifest } from "@mida/protocol"
 import { hexOf, manifestHash } from "@mida/crypto"
 import { contentHash } from "@mida/storage"
 import { randomBytes } from "@noble/hashes/utils.js"
@@ -133,10 +133,10 @@ function anchoredRecord(object: ObjectUploadBody): ContextRecordView {
 }
 
 /** A minimal structurally valid agent-manifest envelope for an agent Monad does not know yet. */
-function envelope() {
+function envelope(): SignedAgentCapabilityManifest {
   return {
     manifest: {
-      v: 1 as const,
+      v: 1,
       agentId: hexOf(randomBytes(32)),
       manifestVersion: 1,
       name: "agent",
