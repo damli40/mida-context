@@ -50,6 +50,24 @@ describe("mida doctor without a chain", () => {
     expect(code).toBeLessThanOrEqual(9)
   })
 
+  it("reports which compile model is active — haiku without a key, kimi with one plus the Moonshot note (R5-8)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const haikuLines: string[] = []
+    await runDoctor({ home, print: (line) => haikuLines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    expect(haikuLines).toContain("ok: compile model is claude-haiku")
+    expect(haikuLines.some((line) => line.toLowerCase().includes("moonshot"))).toBe(false)
+
+    const kimiLines: string[] = []
+    await runDoctor({ home, print: (line) => kimiLines.push(line), settings: {}, env: { KIMI_API_KEY: "test-key" }, daemonProbeMs: 50 })
+    expect(kimiLines).toContain("ok: compile model is kimi-k2.7-code-highspeed")
+    // the owner must be told where the session text goes — scrubbed, but still sent off-machine
+    const note = kimiLines.find((line) => line.startsWith("note:") && line.includes("moonshot"))
+    expect(note).toBeDefined()
+    expect(note).toContain("scrub")
+    // the key itself never reaches a doctor line
+    expect(kimiLines.join("\n")).not.toContain("test-key")
+  })
+
   it("a listener that answers 404 is a PROBLEM naming the status — never 'ok: midad answers'", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const server = await stubDaemon(home, 404, { error: "not-found" })

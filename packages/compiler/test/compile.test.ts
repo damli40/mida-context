@@ -171,6 +171,69 @@ describe("compileCheckpoint", () => {
     const r = await compileCheckpoint({ ...base, model: fake("reasoning"), sleep: async () => {} })
     expect(r).toMatchObject({ ok: false, reason: "no-json", attempts: 3 })
   })
+  it("a failed primary falls back once inside the same attempt — compiledBy says who wrote it (R5-8)", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "fail"], label: "kimi-x" },
+      fallbackModel: { argv: [process.execPath, fixturePath, "good"], label: "haiku-y" },
+      sleep: async () => {},
+    })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.compiledBy).toBe("haiku-y")
+      expect(r.attempts).toBe(1) // the fallback ran INSIDE attempt 1, not as a retry
+      expect(r.fellBack).toEqual({ from: "kimi-x", to: "haiku-y", reason: expect.stringContaining("exit 3") })
+    }
+  })
+
+  it("a fallback that also fails ends the attempt — and the fallback is spent, never run again (R5-8)", async () => {
+    // the fallback's "flaky" mode counts its runs in FAKE_MODEL_COUNTER; three attempts with a
+    // dead primary must still call it exactly once
+    const counter = path.join(dir, "fallback-ran.log")
+    process.env.FAKE_MODEL_COUNTER = counter
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "fail"], label: "kimi-x" },
+      fallbackModel: { argv: [process.execPath, fixturePath, "flaky"], label: "haiku-y" },
+      sleep: async () => {},
+    })
+    expect(r).toMatchObject({ ok: false, reason: "model-failed", attempts: 3 })
+    expect(fs.readFileSync(counter, "utf8")).toBe("1")
+    // the failure still records that the fallback ran and lost — the primary's reason that triggered it
+    if (!r.ok) expect(r.fellBack).toEqual({ from: "kimi-x", to: "haiku-y", reason: expect.stringContaining("exit 3") })
+  })
+
+  it("a primary that answers with no JSON does not spend the fallback — only a command failure does (R5-8)", async () => {
+    const counter = path.join(dir, "fallback-ran.log")
+    process.env.FAKE_MODEL_COUNTER = counter
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "garbage"], label: "kimi-x" },
+      fallbackModel: { argv: [process.execPath, fixturePath, "flaky"], label: "haiku-y" },
+      attempts: 1,
+      sleep: async () => {},
+    })
+    expect(r).toMatchObject({ ok: false, reason: "no-json", attempts: 1 })
+    expect(fs.existsSync(counter)).toBe(false) // the fallback never ran
+  })
+
+  it("stderrDetail lets a model command's safe stderr line into the failure detail (R5-8)", async () => {
+    const withFlag = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "stderr-fail"], label: "kimi-x", stderrDetail: true },
+      attempts: 1,
+    })
+    expect(withFlag).toMatchObject({ ok: false, reason: "model-failed" })
+    if (!withFlag.ok) expect(withFlag.detail).toContain("kimi http 429")
+    // without the flag the same command's stderr stays out of the log — never model output
+    const without = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "stderr-fail"], label: "kimi-x" },
+      attempts: 1,
+    })
+    if (!without.ok) expect(without.detail).not.toContain("kimi http 429")
+  })
+
   it("hands the session's previous checkpoint to the model to update (C1)", async () => {
     const previous: Checkpoint = {
       eventId: "evt-prev0001",

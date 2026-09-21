@@ -20,6 +20,11 @@
 //   echo-previous — parses the JSON on the line after "PREVIOUS CHECKPOINT" in
 //              its stdin and echoes it back with one extra progress item: the
 //              block must reach the model intact and parseable
+//   stderr-fail — writes "kimi http 429" to stderr, exits 1 (stderrDetail tests)
+//
+// The mode comes from argv[2] when present, else FAKE_MODEL_MODE — argv lets a
+// primary and a fallback command differ inside one compile even though both
+// children share the same environment.
 
 import fs from "node:fs"
 import { spawn } from "node:child_process"
@@ -53,7 +58,7 @@ process.stdin.on("end", () => {
       "Here is the extracted checkpoint.\n```json\n" + JSON.stringify(obj) + "\n```\nDone.\n",
     )
 
-  switch (process.env.FAKE_MODEL_MODE) {
+  switch (process.argv[2] ?? process.env.FAKE_MODEL_MODE) {
     case "good":
       fenced(GOOD)
       break
@@ -111,6 +116,10 @@ process.stdin.on("end", () => {
         ...GOOD,
         decisions: Array.from({ length: 51 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
       })
+      break
+    case "stderr-fail":
+      process.stderr.write("kimi http 429\n")
+      process.exit(1)
       break
     case "echo-previous": {
       const lines = input.split("\n")

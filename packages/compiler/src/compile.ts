@@ -17,6 +17,12 @@ export interface ModelCommand {
   argv: readonly string[]
   label: string // becomes compiledBy
   timeoutMs?: number
+  /**
+   * Opt-in: this command's stderr is a controlled channel (kimi-model.mjs prints only
+   * "kimi http <status>"-style lines), so its first line may join the failure detail.
+   * Without the flag stderr stays ignored — an arbitrary model's stderr is never loggable.
+   */
+  stderrDetail?: boolean
 }
 
 export const DEFAULT_MODEL: ModelCommand = {
@@ -32,6 +38,12 @@ export interface CompileInput {
   cwd: string
   homeDir: string
   model?: ModelCommand
+  /**
+   * Tried once, inside the same attempt, when the primary command itself fails (non-zero exit,
+   * spawn error, timeout). A run that produced output that simply lacks JSON does NOT spend it.
+   * `compiledBy` names whichever model actually wrote the checkpoint.
+   */
+  fallbackModel?: ModelCommand
   /** The session's last saved checkpoint — the model updates it rather than restating from nothing. */
   previous?: Checkpoint
   attempts?: number
@@ -53,6 +65,8 @@ export type CompileResult =
       messagesTotal: number
       charsSent: number
       modelMs: number
+      /** Present when the fallback ran: which model failed, which took over, and the failure that triggered it. */
+      fellBack?: { from: string; to: string; reason: string }
     }
   | {
       ok: false
@@ -61,6 +75,8 @@ export type CompileResult =
       attempts: number
       /** Leading field paths from the validator when reason is "invalid" — names only, safe for logs. */
       fields?: string[]
+      /** Present when the fallback ran (and lost too): which model failed and the reason that triggered it. */
+      fellBack?: { from: string; to: string; reason: string }
     }
 
 const MAX_STDOUT = 8 * 1024 * 1024
@@ -155,7 +171,9 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
       child = spawn(model.argv[0] ?? "", [...model.argv.slice(1)], {
         cwd: os.tmpdir(),
         env,
-        stdio: ["pipe", "pipe", "ignore"],
+        // stderr is piped only for commands whose stderr is a controlled channel (stderrDetail);
+        // an arbitrary model's stderr is ignored, never captured into a log line
+        stdio: ["pipe", "pipe", model.stderrDetail === true ? "pipe" : "ignore"],
         detached: true,
       })
     } catch (err) {
@@ -164,14 +182,24 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
     }
 
     let stdout = ""
+    let stderr = ""
     let timedOut = false
     let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null
     let closeGrace: NodeJS.Timeout | undefined
 
+    // A controlled stderr's first non-empty line may annotate a failure ("kimi http 429"):
+    // printable characters only, one line, 160 characters — the channel is trusted to be
+    // safe, the shape is still bounded.
+    const stderrNote = (): string => {
+      const line = stderr.split("\n").find((entry) => entry.trim() !== "")
+      if (line === undefined) return ""
+      return ` — ${line.replace(/[^\x20-\x7e]/g, "?").slice(0, 160)}`
+    }
+
     const settle = () => {
       clearTimeout(timer)
       if (timedOut || exited === null) return
-      if (exited.code !== 0) done({ ok: false, detail: `exit ${exited.code} signal ${exited.signal}` })
+      if (exited.code !== 0) done({ ok: false, detail: `exit ${exited.code} signal ${exited.signal}${stderrNote()}` })
       else done({ ok: true, stdout })
     }
 
@@ -186,14 +214,19 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
       }
       // Held-open pipes (a surviving writer would stall 'close') must not
       // stall the attempt: drop our end and settle now.
-      child.stdout.destroy()
-      child.stdin.destroy()
+      child.stdout!.destroy()
+      child.stderr?.destroy()
+      child.stdin!.destroy()
       done({ ok: false, detail: `timeout after ${timeoutMs} ms` })
     }, timeoutMs)
 
-    child.stdout.setEncoding("utf8")
-    child.stdout.on("data", (c: string) => {
+    child.stdout!.setEncoding("utf8")
+    child.stdout!.on("data", (c: string) => {
       if (stdout.length < MAX_STDOUT) stdout += c.slice(0, MAX_STDOUT - stdout.length)
+    })
+    child.stderr?.setEncoding("utf8")
+    child.stderr?.on("data", (c: string) => {
+      if (stderr.length < 4096) stderr += c.slice(0, 4096 - stderr.length)
     })
     child.on("error", (err) => {
       clearTimeout(timer)
@@ -205,7 +238,8 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
       // surviving grandchild still holds the pipe it never comes — give it
       // a short grace, then take what we have.
       closeGrace = setTimeout(() => {
-        child.stdout.destroy()
+        child.stdout!.destroy()
+        child.stderr?.destroy()
         settle()
       }, 1_000)
       closeGrace.unref()
@@ -214,13 +248,14 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
       if (closeGrace !== undefined) clearTimeout(closeGrace)
       settle()
     })
-    child.stdin.on("error", () => {}) // the child may exit before reading the prompt
-    child.stdin.end(prompt)
+    child.stdin!.on("error", () => {}) // the child may exit before reading the prompt
+    child.stdin!.end(prompt)
   })
 }
 
 export async function compileCheckpoint(input: CompileInput): Promise<CompileResult> {
   const model = input.model ?? DEFAULT_MODEL
+  const fallback = input.fallbackModel
   const attempts = input.attempts ?? 3
   const backoff = input.backoffMs ?? [2000, 8000]
   const now = input.now ?? (() => new Date())
@@ -240,14 +275,29 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
   }
 
   let modelMs = 0
+  let fallbackSpent = false
+  let fellBack: { from: string; to: string; reason: string } | undefined
   let lastFail: { reason: "model-failed" | "no-json"; detail: string } = {
     reason: "model-failed",
     detail: "no attempt ran",
   }
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const run = await runModel(model, prompt)
+    let run = await runModel(model, prompt)
     modelMs += run.ms
+    // A command that failed (exit, spawn error, timeout) falls back ONCE inside the same
+    // attempt — the rate-limited Kimi loses nothing but the call itself. Output that parsed
+    // badly is a content problem, not a command failure, and never spends the fallback.
+    let label = model.label
+    if (!run.ok && fallback !== undefined && !fallbackSpent) {
+      fallbackSpent = true
+      const reason = run.detail
+      run = await runModel(fallback, prompt)
+      modelMs += run.ms
+      fellBack = { from: model.label, to: fallback.label, reason }
+      if (run.ok) label = fallback.label
+      else run = { ok: false, detail: `${reason}; ${fallback.label}: ${run.detail}`, ms: run.ms }
+    }
     if (!run.ok) {
       lastFail = { reason: "model-failed", detail: run.detail }
     } else {
@@ -313,15 +363,18 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
           // the drainer may log field NAMES ("decisions[3].rationale") — never
           // the validator's messages, which can echo the value that failed
           const fields = [...new Set(v.errors.map((e) => e.split(":")[0]!))]
-          return { ok: false, reason: "invalid", detail: v.errors.join("; "), attempts: attempt, fields }
+          return { ok: false, reason: "invalid", detail: v.errors.join("; "), attempts: attempt, fields, ...(fellBack !== undefined ? { fellBack } : {}) }
         }
         return {
           ok: true,
           checkpoint: v.value,
-          compiledBy: model.label,
+          compiledBy: label,
           droppedKeys,
           trimmed,
           attempts: attempt,
+          // fellBack is reported only when the fallback actually wrote the checkpoint — a fallback
+          // that ran and lost before a later primary success would mislabel the save
+          ...(label !== model.label && fellBack !== undefined ? { fellBack } : {}),
           format: convo.format,
           messagesKept: convo.messagesKept,
           messagesTotal: convo.messagesTotal,
@@ -332,5 +385,6 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     }
     if (attempt < attempts) await sleep(backoff[Math.min(attempt - 1, backoff.length - 1)] ?? 0)
   }
-  return { ok: false, reason: lastFail.reason, detail: lastFail.detail, attempts }
+  // a fallback that ran and still lost is part of the failure report — the daemon log says so
+  return { ok: false, reason: lastFail.reason, detail: lastFail.detail, attempts, ...(fellBack !== undefined ? { fellBack } : {}) }
 }

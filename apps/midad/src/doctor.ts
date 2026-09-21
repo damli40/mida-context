@@ -8,6 +8,7 @@ import { privateKeyToAccount } from "viem/accounts"
 import type { Address, Hex } from "@mida/protocol"
 import { chainFor, parseDeployment } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
+import { compileModelChoice } from "@mida/compiler"
 import { RegistryReader } from "@mida/api"
 import { callDaemon } from "./control.js"
 import type { MidaHome } from "./home.js"
@@ -302,6 +303,21 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         return set.length === 0
           ? ["ok: no Anthropic key variable in the shell"]
           : [`note: ${set.join(", ")} set in the shell (midad strips them for the compiler)`]
+      },
+    },
+    {
+      name: "compile-model",
+      run: async () => {
+        // the same resolution the daemon used at start-up — the owner sees which model compiles
+        // sessions and, on the kimi path, that session text leaves the machine for Moonshot's API
+        const choice = compileModelChoice(deps.env ?? process.env)
+        const lines = [`ok: compile model is ${choice.model.label}`]
+        if (choice.fallback !== undefined) {
+          lines.push(
+            `note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to ${choice.fallback.label}`,
+          )
+        }
+        return lines
       },
     },
     {

@@ -1,5 +1,5 @@
 import { parseDeployment } from "@mida/chain"
-import { compileCheckpoint } from "@mida/compiler"
+import { compileCheckpoint, compileModelChoice } from "@mida/compiler"
 import { startDaemon } from "./daemon.js"
 import { resolveHome } from "./home.js"
 import { appendLog } from "./log.js"
@@ -25,10 +25,13 @@ async function main(): Promise<void> {
     storageUrl: typeof stored.storageUrl === "string" ? stored.storageUrl : undefined,
   }
 
+  // The compile model is chosen once here from the environment (MIDA_COMPILE_MODEL /
+  // KIMI_API_KEY): kimi when it can run, claude-haiku otherwise or as its fallback.
+  const compileModel = compileModelChoice(process.env)
   const daemon = await startDaemon({
     home,
     network,
-    compile: compileCheckpoint,
+    compile: (input) => compileCheckpoint({ ...input, model: compileModel.model, fallbackModel: compileModel.fallback }),
     now: () => Date.now(),
     log: (entry) => appendLog(home, "daemon", entry as Record<string, unknown>),
   })

@@ -366,6 +366,9 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           })
           const compileMs = now().getTime() - compileStart
           if (!compiled.ok) {
+            // a fallback that ran and still lost belongs in the log — "model-failed" alone
+            // would hide that the second model was tried too
+            if (compiled.fellBack !== undefined) log({ sessionId, outcome: "note", reason: "compile-fallback-failed", fellBack: compiled.fellBack })
             if (compiled.reason === "invalid") throw new CheckpointPayloadError("invalid-checkpoint", "the compiler produced an invalid checkpoint", compiled.fields)
             throw new DrainFailure(compiled.reason)
           }
@@ -381,6 +384,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             attempts: compiled.attempts,
             trimmed: compiled.trimmed,
             droppedKeys: compiled.droppedKeys,
+            ...(compiled.fellBack !== undefined ? { fellBack: compiled.fellBack } : {}),
           }
           deps.home.writeSecretJson(`queue/compiled/${eventId}.json`, { ...envelope, compileMeta })
           reusedCompiled = false
@@ -412,6 +416,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           reusedCompiled,
           trimmed: compileMeta.trimmed,
           droppedKeys: compileMeta.droppedKeys,
+          fellBack: compileMeta.fellBack,
         })
       } catch (error) {
         const code = failureCode(error)
@@ -538,6 +543,8 @@ interface CompileMeta {
   attempts: number
   trimmed: string[]
   droppedKeys: string[]
+  /** When the compile fell back to the second model: who failed, who wrote, and why. */
+  fellBack?: { from: string; to: string; reason: string }
 }
 
 /**
@@ -559,6 +566,7 @@ function readCompiled(home: MidaHome, eventId: string): { envelope: CheckpointEn
         attempts: typeof meta.attempts === "number" ? meta.attempts : 1,
         trimmed: Array.isArray(meta.trimmed) ? meta.trimmed : [],
         droppedKeys: Array.isArray(meta.droppedKeys) ? meta.droppedKeys : [],
+        ...(typeof meta.fellBack === "object" && meta.fellBack !== null ? { fellBack: meta.fellBack } : {}),
       },
     }
   } catch {

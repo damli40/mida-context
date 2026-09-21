@@ -202,6 +202,30 @@ describe("one drainer at a time", () => {
     expect(compileCalls).toHaveLength(1)
     expect(home.has("queue/drain.lock")).toBe(false)
   })
+
+  it("a save written by the fallback model logs who wrote it and why (R5-8)", async () => {
+    const { job, drain, drainLog } = setup()
+    job()
+    const compile: typeof compileCheckpoint = async (input) => ({
+      ok: true,
+      checkpoint: sampleCheckpoint({ eventId: input.eventId, agent: input.agent }),
+      compiledBy: "claude-haiku",
+      droppedKeys: [],
+      trimmed: [],
+      attempts: 1,
+      format: "claude-jsonl",
+      messagesKept: 1,
+      messagesTotal: 1,
+      charsSent: 0,
+      modelMs: 0,
+      fellBack: { from: "kimi-k2.7-code-highspeed", to: "claude-haiku", reason: "exit 1 — kimi http 429" },
+    })
+    expect((await drain({ compile })).saved).toBe(1)
+    const savedLine = drainLog().split("\n").find((line) => line.includes('"outcome":"saved"'))
+    expect(savedLine).toBeDefined()
+    expect(savedLine).toContain("kimi http 429")
+    expect(savedLine).toContain("claude-haiku")
+  })
 })
 
 describe("a first save waits one gap after the session's first event", () => {
