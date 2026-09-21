@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { spawn } from "node:child_process"
-import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs"
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -16,8 +16,8 @@ import type { CompileInput, CompileResult } from "@mida/compiler"
 import {
   FileAccessRequestStore, MidaHome, NAMESPACE, Runtime, approve, callDaemon, enqueue, init,
   isCapabilityLive, listJobs, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets,
-  loadOwnerAddress, ownerOnlyLine, requestAccess, saveCheckpoint, startDaemon, startPersistentApi,
-  unwrapCheckpoint,
+  loadOwnerAddress, ownerOnlyLine, readOwnerFacts, requestAccess, revoke, saveCheckpoint, startDaemon,
+  startPersistentApi, unwrapCheckpoint,
 } from "@mida/midad"
 import type { DaemonHandle, Network } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
@@ -191,8 +191,9 @@ describe("the long-running midad", () => {
     mkdirSync(join(workDir, ".mida"))
     writeFileSync(join(workDir, ".mida", "project.json"), JSON.stringify({ projectId: "proj-daemon" }))
     // init and approve run against the shared server from the start, so manifests, wraps and
-    // grants live where the daemon will look for them. `assistant` is registered but never approved —
-    // test (a) asks the socket to approve it.
+    // grants live where the daemon will look for them. `assistant` gets its READ-only grant at
+    // init by design, so the owner revokes it here: test (a) needs an agent that can ask and must
+    // never get an approval through the socket.
     const runtime = await Runtime.open(home, { ...network, storageUrl: apiServer.baseUrl })
     try {
       await init(runtime, ["claude-code", "codex", "assistant"])
@@ -200,6 +201,7 @@ describe("the long-running midad", () => {
       await approve(runtime, "claude-code", workDir)
       await requestAccess(runtime, "codex")
       await approve(runtime, "codex", workDir)
+      await revoke(runtime, "assistant")
     } finally {
       await runtime.close()
     }
@@ -218,7 +220,7 @@ describe("the long-running midad", () => {
     await env?.stop()
   })
 
-  it("(a) /cli request for an unapproved agent works — but /cli approve is refused and nothing is signed", async () => {
+  it("(a) /cli request for a revoked agent works — but /cli approve is refused and nothing is signed", async () => {
     // `request` is agent-signed and grants nothing by itself, so the socket may run it
     const requested = await cli(["request", "assistant"])
     expect(requested.body).toMatchObject({ code: 0 })
@@ -226,14 +228,18 @@ describe("the long-running midad", () => {
     // `approve` changes who has access — the daemon refuses it outright
     const approved = await cli(["approve", "assistant"])
     expect(approved.body).toEqual({ code: 2, lines: [ownerOnlyLine("approve")] })
-    // the chain is the judge, not the reply text: no capability exists for assistant
+    // the chain is the judge, not the reply text: nothing live for assistant — its init-time
+    // grant was revoked in beforeAll and the socket's approve signed nothing
     const reader = new RegistryReader({
       publicClient: createPublicClient({ chain: chainFor(env.deployment.chainId), transport: http(env.rpcUrl) }),
       deployment: env.deployment,
     })
     const owner = loadOwnerAddress(home)!
     const agentId = loadAgentIdentity(home, "assistant")!.agentId
-    expect(await reader.activeCapabilityIds(owner, agentId)).toHaveLength(0)
+    const ids = await reader.activeCapabilityIds(owner, agentId)
+    for (const id of ids) {
+      expect(await isCapabilityLive({ publicClient: createPublicClient({ chain: chainFor(env.deployment.chainId), transport: http(env.rpcUrl) }), deployment: env.deployment }, id)).toBe(false)
+    }
   }, STEP_TIMEOUT)
 
   it("(b) /kick drains a queued Stop job; the record reads back through the server as codex", async () => {
@@ -297,4 +303,48 @@ describe("the long-running midad", () => {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL")
     }
   }, STEP_TIMEOUT * 2)
+
+  it("(e) a revoked agent cannot re-approve itself through the socket — and the socket cannot revoke or remember either", async () => {
+    // The attack the runtime split exists to stop: the owner revokes claude-code, and the agent —
+    // which shares the OS user and can reach the socket — asks for access and then tries to grant
+    // it to itself. The daemon holds no owner key, so the approve must be refused and nothing may
+    // change on the chain or on disk.
+    const reader = new RegistryReader({
+      publicClient: createPublicClient({ chain: chainFor(env.deployment.chainId), transport: http(env.rpcUrl) }),
+      deployment: env.deployment,
+    })
+    const publicClient = createPublicClient({ chain: chainFor(env.deployment.chainId), transport: http(env.rpcUrl) })
+    const owner = loadOwnerAddress(home)!
+    const ownerRuntime = await Runtime.open(home, { ...network, storageUrl: apiServer.baseUrl })
+    try {
+      await revoke(ownerRuntime, "claude-code")
+      const projectsPath = home.path("approved-projects.json")
+      const projectsBytes = readFileSync(projectsPath)
+      const factsBefore = await readOwnerFacts(ownerRuntime, "codex")
+
+      // the ask is agent-signed and allowed; every authority-changing call is refused
+      expect((await cli(["request", "claude-code"])).body).toMatchObject({ code: 0 })
+      expect((await cli(["approve", "claude-code"])).body).toEqual({ code: 2, lines: [ownerOnlyLine("approve")] })
+      expect((await cli(["revoke", "codex"])).body).toEqual({ code: 2, lines: [ownerOnlyLine("revoke")] })
+      expect((await cli(["remember", "the owner likes tabs"])).body).toEqual({ code: 2, lines: [ownerOnlyLine("remember")] })
+      expect((await cli(["init"])).body).toEqual({ code: 2, lines: [ownerOnlyLine("init")] })
+
+      // the chain is the judge: claude-code still has no live capability, codex still has its grant
+      const claudeIds = await reader.activeCapabilityIds(owner, loadAgentIdentity(home, "claude-code")!.agentId)
+      for (const id of claudeIds) {
+        expect(await isCapabilityLive({ publicClient, deployment: env.deployment }, id)).toBe(false)
+      }
+      const codexIds = await reader.activeCapabilityIds(owner, loadAgentIdentity(home, "codex")!.agentId)
+      expect(codexIds.length).toBeGreaterThan(0)
+      expect((await Promise.all(codexIds.map((id) => isCapabilityLive({ publicClient, deployment: env.deployment }, id)))).some(Boolean)).toBe(true)
+
+      // and nothing on disk moved: the revocation marker stands and the signed list is byte-identical
+      expect(home.has("agents/claude-code/revoked.json")).toBe(true)
+      expect(readFileSync(projectsPath)).toEqual(projectsBytes)
+      // the remember never landed: codex sees exactly the facts that were there before
+      expect(await readOwnerFacts(ownerRuntime, "codex")).toEqual(factsBefore)
+    } finally {
+      await ownerRuntime.close()
+    }
+  }, STEP_TIMEOUT)
 })
