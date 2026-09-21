@@ -16,7 +16,8 @@ import type { CompileInput, CompileResult } from "@mida/compiler"
 import {
   FileAccessRequestStore, MidaHome, NAMESPACE, Runtime, approve, callDaemon, enqueue, init,
   isCapabilityLive, listJobs, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets,
-  requestAccess, saveCheckpoint, startDaemon, startPersistentApi, unwrapCheckpoint,
+  loadOwnerAddress, ownerOnlyLine, requestAccess, saveCheckpoint, startDaemon, startPersistentApi,
+  unwrapCheckpoint,
 } from "@mida/midad"
 import type { DaemonHandle, Network } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
@@ -190,12 +191,15 @@ describe("the long-running midad", () => {
     mkdirSync(join(workDir, ".mida"))
     writeFileSync(join(workDir, ".mida", "project.json"), JSON.stringify({ projectId: "proj-daemon" }))
     // init and approve run against the shared server from the start, so manifests, wraps and
-    // grants live where the daemon will look for them
+    // grants live where the daemon will look for them. `assistant` is registered but never approved —
+    // test (a) asks the socket to approve it.
     const runtime = await Runtime.open(home, { ...network, storageUrl: apiServer.baseUrl })
     try {
-      await init(runtime, ["claude-code", "codex"])
+      await init(runtime, ["claude-code", "codex", "assistant"])
       await requestAccess(runtime, "claude-code")
       await approve(runtime, "claude-code", workDir)
+      await requestAccess(runtime, "codex")
+      await approve(runtime, "codex", workDir)
     } finally {
       await runtime.close()
     }
@@ -214,22 +218,22 @@ describe("the long-running midad", () => {
     await env?.stop()
   })
 
-  it("(a) /cli request + approve for codex run inside the daemon; the chain shows the capability live", async () => {
-    const requested = await cli(["request", "codex"])
+  it("(a) /cli request for an unapproved agent works — but /cli approve is refused and nothing is signed", async () => {
+    // `request` is agent-signed and grants nothing by itself, so the socket may run it
+    const requested = await cli(["request", "assistant"])
     expect(requested.body).toMatchObject({ code: 0 })
-    const approved = await cli(["approve", "codex"])
-    expect(approved.body).toMatchObject({ code: 0 })
-    // the chain is the judge, not the reply text
+    expect(home.has("agents/assistant/pending-request.json")).toBe(true)
+    // `approve` changes who has access — the daemon refuses it outright
+    const approved = await cli(["approve", "assistant"])
+    expect(approved.body).toEqual({ code: 2, lines: [ownerOnlyLine("approve")] })
+    // the chain is the judge, not the reply text: no capability exists for assistant
     const reader = new RegistryReader({
       publicClient: createPublicClient({ chain: chainFor(env.deployment.chainId), transport: http(env.rpcUrl) }),
       deployment: env.deployment,
     })
-    const owner = privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey).address
-    const agentId = loadAgentIdentity(home, "codex")!.agentId
-    const ids = await reader.activeCapabilityIds(owner, agentId)
-    expect(ids.length).toBeGreaterThan(0)
-    const lives = await Promise.all(ids.map((id) => isCapabilityLive({ publicClient: createPublicClient({ chain: chainFor(env.deployment.chainId), transport: http(env.rpcUrl) }), deployment: env.deployment }, id)))
-    expect(lives.some(Boolean)).toBe(true)
+    const owner = loadOwnerAddress(home)!
+    const agentId = loadAgentIdentity(home, "assistant")!.agentId
+    expect(await reader.activeCapabilityIds(owner, agentId)).toHaveLength(0)
   }, STEP_TIMEOUT)
 
   it("(b) /kick drains a queued Stop job; the record reads back through the server as codex", async () => {

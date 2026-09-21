@@ -42,4 +42,8 @@ async function main(): Promise<void> {
   process.on("SIGINT", shutdown)
 }
 
-main().catch(() => process.exit(1))
+main().catch((error) => {
+  // one plain line when the home was never initialised — the fix is `mida init`, not a retry
+  if (error instanceof Error) console.error(error.message)
+  process.exit(1)
+})

@@ -3,7 +3,7 @@ import { ContextApiClient } from "@mida/api"
 import { MidaError, OWNER_AUTHOR_ID, PERMISSION, PROVENANCE_SOURCE, isMidaError, namespaceId } from "@mida/protocol"
 import type { ContextKind, Hex } from "@mida/protocol"
 import { scrubSecrets } from "@mida/compiler"
-import type { Runtime } from "./runtime.js"
+import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { listAgentNames, loadAgentIdentity } from "./keys.js"
 
 /**
@@ -123,7 +123,7 @@ function factText(value: unknown): string | null {
  * provenance is dropped. A namespace the agent has no grant for contributes nothing, and is not an
  * error. Newest first, at most MAX_FACTS.
  */
-export async function readOwnerFacts(runtime: Runtime, name: string): Promise<OwnerFact[]> {
+export async function readOwnerFacts(runtime: ServiceRuntime, name: string): Promise<OwnerFact[]> {
   const agent = runtime.agent(name)
   const { reader, owner } = runtime
   const facts: { fact: OwnerFact; createdAt: bigint }[] = []
@@ -161,7 +161,7 @@ export async function readOwnerFacts(runtime: Runtime, name: string): Promise<Ow
  * is presented when the agent holds one for the namespace.
  */
 export async function attemptNamespaceRead(
-  runtime: Runtime,
+  runtime: ServiceRuntime,
   name: string,
   namespace: string,
 ): Promise<{ ok: true; objects: number } | { ok: false; code: string }> {

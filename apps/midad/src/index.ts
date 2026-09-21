@@ -1,7 +1,7 @@
 export { MidaHome } from "./home.js"
 export { FileAccessRequestStore } from "./request-store.js"
 export * from "./keys.js"
-export { Runtime, AGENT_PERMISSIONS, MIN_BALANCE_WEI, NAMESPACE, PURPOSE_ID } from "./runtime.js"
+export { Runtime, ServiceRuntime, AGENT_PERMISSIONS, MIN_BALANCE_WEI, NAMESPACE, PURPOSE_ID } from "./runtime.js"
 export type { Network } from "./runtime.js"
 export { startPersistentApi } from "./api-server.js"
 export {
@@ -20,7 +20,7 @@ export {
 export { attemptNamespaceRead, readOwnerFacts, remember, FACT_NAMESPACES, MAX_FACTS } from "./remember.js"
 export type { OwnerFact, RememberResult } from "./remember.js"
 export * from "./checkpoint-payload.js"
-export { CLI_COMMANDS, USAGE, runCli, runCliWithRuntime, validCliArgv } from "./cli.js"
+export { CLI_COMMANDS, OWNER_COMMANDS, USAGE, ownerOnlyLine, runCli, runCliWithRuntime, validCliArgv } from "./cli.js"
 export type { CliDeps } from "./cli.js"
 export * from "./queue.js"
 export { approveProject, approvalsFileStatus, checkProject, ensureProjectMarker, removeAgentApprovals } from "./projects.js"

@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest"
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, removeJob, socketPathFor, startDaemon } from "@mida/midad"
-import type { DrainDeps, DrainResult, Runtime } from "@mida/midad"
+import { MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, ownerOnlyLine, removeJob, socketPathFor, startDaemon } from "@mida/midad"
+import type { DrainDeps, DrainResult, Runtime, ServiceRuntime } from "@mida/midad"
 import type { DaemonDeps } from "@mida/midad"
 
 const DRAIN_OK: DrainResult = { saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0, earliestDueMs: null }
@@ -155,6 +155,43 @@ describe("startDaemon", () => {
       expect(ok.body).toEqual({ code: 0, lines: ["cli read codex p1"] })
     } finally {
       await daemon.close()
+    }
+  })
+
+  it("/cli refuses every owner command with the terminal line, code 2 — and the dispatcher never sees it", async () => {
+    const { home, deps } = setup()
+    const cliCalls: string[][] = []
+    const daemon = await startDaemon({
+      ...deps,
+      runCli: async (argv, _runtime, print) => {
+        cliCalls.push(argv)
+        print(`cli ${argv.join(" ")}`)
+        return 0
+      },
+    })
+    try {
+      for (const argv of [["init"], ["approve", "codex"], ["revoke", "claude-code"], ["remember", "i like tests"]]) {
+        const reply = await callDaemon(home, "/cli", { argv, cwd: "/tmp" }, { timeoutMs: 1_000 })
+        expect(reply.status).toBe(200)
+        expect(reply.body).toEqual({ code: 2, lines: [ownerOnlyLine(argv[0]!)] })
+      }
+      // nothing was dispatched — the spy records every call it gets, and it got none
+      expect(cliCalls).toHaveLength(0)
+      // a service command still reaches the dispatcher
+      const ok = await callDaemon(home, "/cli", { argv: ["read", "codex", "p1"] }, { timeoutMs: 1_000 })
+      expect(ok.body).toEqual({ code: 0, lines: ["cli read codex p1"] })
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it("runCliWithRuntime itself refuses an owner command — the refusal does not depend on the route", async () => {
+    const { runCliWithRuntime } = await import("@mida/midad")
+    const lines: string[] = []
+    const runtime = { close: async () => {} } as unknown as ServiceRuntime
+    for (const argv of [["init"], ["approve", "codex"], ["revoke", "codex"], ["remember", "x"]]) {
+      expect(await runCliWithRuntime(argv, runtime, (line) => lines.push(line))).toBe(2)
+      expect(lines[lines.length - 1]).toBe(ownerOnlyLine(argv[0]!))
     }
   })
 

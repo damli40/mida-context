@@ -7,7 +7,7 @@ import type { ScenarioEnvironment } from "@mida/cli"
 import type { CompileInput, CompileResult } from "@mida/compiler"
 import { CONTENT_FIELDS } from "@mida/checkpoint"
 import {
-  MidaHome, Runtime, approve, drainOnce, enqueue, init, listJobs, readCheckpoints, removeJob, requestAccess,
+  MidaHome, Runtime, ServiceRuntime, approve, drainOnce, enqueue, init, listJobs, readCheckpoints, removeJob, requestAccess,
 } from "@mida/midad"
 import type { Network } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
@@ -33,6 +33,8 @@ describe("M1 drainOnce on local Anvil", () => {
   let compileFails = false
 
   const open = () => Runtime.open(home, network)
+  // what the drainer actually runs: a service runtime — agent keys and the public owner address only
+  const openService = () => ServiceRuntime.open(home, network)
 
   const compile = async (input: CompileInput): Promise<CompileResult> => {
     compileCalls.push(input)
@@ -52,7 +54,7 @@ describe("M1 drainOnce on local Anvil", () => {
     }
   }
 
-  const drain = () => drainOnce({ home, open, compile, now: () => new Date(clock), homeDir })
+  const drain = () => drainOnce({ home, open: openService, compile, now: () => new Date(clock), homeDir })
 
   const job = (over: Record<string, unknown> = {}) => enqueue(home, {
     agent: "claude-code",

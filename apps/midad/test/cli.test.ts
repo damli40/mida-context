@@ -44,6 +44,25 @@ describe("the crude mida command", () => {
     expect(lines.some((line) => line.includes("CAPABILITY_REVOKED"))).toBe(true)
   }, 300_000)
 
+  it("kicks the daemon after a successful approve and revoke so the service notices, and never otherwise", async () => {
+    const kicks: string[] = []
+    const kick = () => (kicks.push("x"), Promise.resolve())
+    const run2 = (...argv: string[]) => runCli(argv, { home, network, print: () => {}, kickDaemon: kick })
+    // request grants nothing by itself — no kick
+    expect(await run2("request", "claude-code")).toBe(0)
+    expect(kicks).toHaveLength(0)
+    expect(await run2("approve", "claude-code")).toBe(0)
+    expect(kicks).toHaveLength(1)
+    expect(await run2("revoke", "claude-code")).toBe(0)
+    expect(kicks).toHaveLength(2)
+    // a command that fails does not kick: claude-code has no pending request now
+    expect(await run2("approve", "claude-code")).toBe(1)
+    expect(kicks).toHaveLength(2)
+    // undo the revoke so the last test's home still has a live agent
+    expect(await run2("request", "claude-code")).toBe(0)
+    expect(await run2("approve", "claude-code")).toBe(0)
+  }, 300_000)
+
   it("never prints a secret: no output line contains any key stored in the home folder", () => {
     const secrets: string[] = []
     const walk = (folder: string) => {

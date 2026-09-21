@@ -7,7 +7,7 @@ import { privateKeyToAccount } from "viem/accounts"
 import type { Address, Hex } from "@mida/protocol"
 import { loadOrCreateOwnerSecrets } from "./keys.js"
 import { findProjectMarker } from "./queue.js"
-import type { Runtime } from "./runtime.js"
+import type { Runtime, ServiceRuntime } from "./runtime.js"
 
 /**
  * The owner-signed list of which agent may use which project folder. One JSON file at the home
@@ -69,7 +69,7 @@ type ApprovalsFile =
  * is `unreadable` — a permissions or filesystem problem with a different fix. Anything that
  * parses but fails shape or verification is `bad-signature` — content nobody signed.
  */
-async function readApprovalsFile(home: Runtime["home"], owner: Address): Promise<ApprovalsFile> {
+async function readApprovalsFile(home: ServiceRuntime["home"], owner: Address): Promise<ApprovalsFile> {
   let raw: unknown
   try {
     raw = home.readJson(LIST_FILE)
@@ -104,7 +104,7 @@ async function readApprovalsFile(home: Runtime["home"], owner: Address): Promise
  * The list's integrity for `mida doctor` — read and signature-verified without a runtime, because
  * verification is local cryptography against the owner's address. `midad`'s lock is never needed.
  */
-export async function approvalsFileStatus(home: Runtime["home"], owner: Address): Promise<"missing" | "unreadable" | "bad-signature" | "signed"> {
+export async function approvalsFileStatus(home: ServiceRuntime["home"], owner: Address): Promise<"missing" | "unreadable" | "bad-signature" | "signed"> {
   return (await readApprovalsFile(home, owner)).kind
 }
 
@@ -239,7 +239,7 @@ export async function removeAgentApprovals(runtime: Runtime, agent: string): Pro
  * `folder-mismatch` when this agent's projectId
  * is listed under a different root (the folder was copied), else `not-approved`. Never throws.
  */
-export async function checkProject(runtime: Runtime, input: { agent: string; cwd: string }): Promise<ProjectCheck> {
+export async function checkProject(runtime: ServiceRuntime, input: { agent: string; cwd: string }): Promise<ProjectCheck> {
   try {
     const marker = findProjectMarker(input.cwd)
     if (marker === null || marker.projectId === null) return { ok: false, reason: "not-a-project" }

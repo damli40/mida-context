@@ -3,18 +3,20 @@ import { compileCheckpoint } from "@mida/compiler"
 import { drainUntilSettled } from "./drain.js"
 import { MidaHome } from "./home.js"
 import { appendLog } from "./log.js"
-import { Runtime } from "./runtime.js"
+import { ServiceRuntime } from "./runtime.js"
 import type { Network } from "./runtime.js"
 
 /**
  * The detached drainer entry. It never loads `.env` — everything it needs is in the home folder:
- * agent keys under `agents/` and the public chain coordinates `init` wrote to `network.json`. If a
- * live process holds the home's lock, `Runtime.open` waits it out for up to 30 s before the drain
+ * agent keys under `agents/`, the owner's public address in `owner-address.json`, and the public
+ * chain coordinates `init` wrote to `network.json`. The owner key is never read: the drainer is a
+ * service process and ServiceRuntime has no owner-signing member. If a live process holds the
+ * home's lock, `ServiceRuntime.open` waits it out for up to 30 s before the drain
  * records a `lock-timeout`.
  */
 async function main(): Promise<void> {
   const home = new MidaHome(process.env.MIDA_HOME)
-  const open = async (): Promise<Runtime> => {
+  const open = async (): Promise<ServiceRuntime> => {
     const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown }>("network.json")
     if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) {
       throw new Error("network.json is missing or incomplete; run mida init first")
@@ -25,7 +27,7 @@ async function main(): Promise<void> {
       // the drainer holds agent keys only — funding is the owner CLI's job
       fund: async () => { throw new Error("the drainer cannot fund accounts") },
     }
-    return Runtime.open(home, network)
+    return ServiceRuntime.open(home, network)
   }
 
   // One settle run: it waits out the save gap inside the drain lock rather than leaving a

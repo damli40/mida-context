@@ -1,22 +1,22 @@
 import { privateKeyToAccount } from "viem/accounts"
 import { MidaError, PERMISSION, decodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
-import type { AccessRequest, Address, Hex, PurposeId, RequestedScope } from "@mida/protocol"
-import { capabilityRegistryAbi, createWriteContext } from "@mida/chain"
+import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScope } from "@mida/protocol"
+import { capabilityRegistryAbi, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { provisionAgent } from "@mida/fake-vault"
-import { POLICY_DOCUMENT_V1, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
+import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
 import type { StoredCheckpoint } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
 import { NAMESPACE, PURPOSE_ID } from "./runtime.js"
-import type { Runtime } from "./runtime.js"
+import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { FACT_NAMESPACES } from "./remember.js"
 import { unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import { FileAccessRequestStore } from "./request-store.js"
 import {
   identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, loadOrCreateSignerKey,
-  markRevoked, replaceSignerKey, saveAgentIdentity, saveGrants,
+  markRevoked, replaceSignerKey, saveAgentIdentity, saveGrants, saveOwnerAddress,
 } from "./keys.js"
 import { approveProject, ensureProjectMarker, removeAgentApprovals } from "./projects.js"
 
@@ -36,9 +36,9 @@ export async function isCapabilityLive(context: ChainContext, capabilityId: Hex)
 }
 
 /** "Approved" means the chain lists at least one live capability for this owner–agent pair — any permission. */
-async function hasAnyLiveCapability(runtime: Runtime, agentId: Hex): Promise<boolean> {
+async function hasAnyLiveCapability(runtime: ServiceRuntime, agentId: Hex): Promise<boolean> {
   for (const id of await runtime.reader.activeCapabilityIds(runtime.owner, agentId)) {
-    if (await isCapabilityLive(runtime.ownerChain, id)) return true
+    if (await isCapabilityLive(runtime.chain, id)) return true
   }
   return false
 }
@@ -66,7 +66,7 @@ export function expectedScopesFor(purposeId: PurposeId): ScopeInput[] {
  * diff: an agent holding the old single `projects.current` grant is missing exactly the two
  * READ scopes, and only those are asked for.
  */
-async function missingExpectedScopes(runtime: Runtime, agentId: Hex, purposeId: PurposeId): Promise<RequestedScope[]> {
+async function missingExpectedScopes(runtime: ServiceRuntime, agentId: Hex, purposeId: PurposeId): Promise<RequestedScope[]> {
   const missing: RequestedScope[] = []
   for (const scope of expandScopeInputs(expectedScopesFor(purposeId))) {
     if (!(await runtime.reader.hasAuthority(runtime.owner, agentId, scope.namespaceId, scope.permissions, scope.provenancePolicy))) {
@@ -77,7 +77,7 @@ async function missingExpectedScopes(runtime: Runtime, agentId: Hex, purposeId: 
 }
 
 /** A signed scope that the chain no longer authorizes — the still-needed part of a pending request. */
-async function ungrantedScopes(runtime: Runtime, agentId: Hex, scopes: readonly RequestedScope[]): Promise<RequestedScope[]> {
+async function ungrantedScopes(runtime: ServiceRuntime, agentId: Hex, scopes: readonly RequestedScope[]): Promise<RequestedScope[]> {
   const needed: RequestedScope[] = []
   for (const scope of scopes) {
     if (!(await runtime.reader.hasAuthority(runtime.owner, agentId, scope.namespaceId, scope.permissions, scope.provenancePolicy))) {
@@ -112,6 +112,9 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
     rpcUrl: network.rpcUrl,
     deployment: { ...deployment, chainId: deployment.chainId.toString(), deploymentBlock: deployment.deploymentBlock.toString() },
   })
+  // The daemon needs the owner's public address to verify the signed approved-projects list and to
+  // ask the chain about grants — it never reads owner/secrets.json, so the address is public metadata.
+  saveOwnerAddress(home, owner)
   await runtime.ensureFunded(owner)
   const ownerKey = await reader.ownerP256Key(owner)
   if (ownerKey == null || ownerKey.qx === 0n) await vault.registerOwnerKey()
@@ -172,7 +175,7 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
 }
 
 /** Spec §5B step 1: the agent asks for the policy's whole recommended grant for its purpose. The request is on disk before this returns, and so is which request is pending. */
-export async function requestAccess(runtime: Runtime, name: string): Promise<{ requestId: Hex }> {
+export async function requestAccess(runtime: ServiceRuntime, name: string): Promise<{ requestId: Hex }> {
   const identity = loadAgentIdentity(runtime.home, name)
   if (identity !== undefined && (await hasAnyLiveCapability(runtime, identity.agentId))) {
     throw new Error(`agent "${name}" is already approved`)
@@ -187,17 +190,45 @@ export async function requestAccess(runtime: Runtime, name: string): Promise<{ r
   return { requestId: request.requestId }
 }
 
+/**
+ * What the owner is shown before an approve signs anything. `grant` is a fresh (or pending)
+ * capability grant with the advisor's advice; `project` is only a row in the signed
+ * approved-projects list for an agent the chain already approves.
+ */
+export type ApprovePreview =
+  | { kind: "grant"; agent: string; scopes: RequestedScope[]; expiresAt: bigint; advice: GrantAdvice }
+  | { kind: "project"; agent: string; projectId: string }
+
+/** The owner saw the ask and did not type yes. Coded so the CLI can print "not approved" and exit 1. */
+function notApprovedError(): Error {
+  const error = new Error("the owner did not approve") as Error & { code: string }
+  error.code = "not-approved"
+  return error
+}
+
+/**
+ * The same advice approveGrant computes internally, run read-only so the owner can see it before
+ * deciding. assertRequestIsCurrent throws for a stale request here, exactly as it would below.
+ */
+async function grantAdviceFor(runtime: Runtime, request: AccessRequest, manifest: Parameters<typeof adviseGrant>[0]["manifest"]): Promise<GrantAdvice> {
+  const agentRecord = await readAgentRecord(runtime.ownerChain, request.agentId)
+  const history = await ownerHistory({ client: runtime.ownerChain.publicClient, deployment: runtime.ownerChain.deployment, owner: runtime.owner, agentId: request.agentId })
+  const now = await latestTimestamp(runtime.ownerChain)
+  return adviseGrant({ request, manifest, agentRecord, ownerHistory: history, now })
+}
+
 /** Spec §5B steps 3–4: the owner approves the pending request on-chain; the agent checks the result and keeps the grant. */
 export async function approve(
   runtime: Runtime,
   name: string,
   cwd?: string,
+  confirm?: (preview: ApprovePreview) => Promise<boolean>,
 ): Promise<{ capabilityIds: Hex[]; permissions: number[]; transactionHash: Hex | null; gasUsed: bigint; projectId?: string; droppedRows?: number | null }> {
   const { home, vault, reader, owner } = runtime
   // When a project folder is given its marker is resolved first: a folder that may not hold a
   // project (the owner's home, the filesystem root) is refused with not-a-project before any
   // transaction can go out. The list entry itself is written only after the grant succeeds.
-  if (cwd !== undefined) ensureProjectMarker(cwd)
+  const marker = cwd === undefined ? undefined : ensureProjectMarker(cwd)
   const identity = loadAgentIdentity(home, name)
   if (identity === undefined) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
 
@@ -214,6 +245,7 @@ export async function approve(
       // a second project for an already-approved agent needs no new grant — only the list row.
       // `assistant` is never listed: it gets no project approval, ever.
       if (cwd !== undefined && identity.purposeId === PURPOSE_ID) {
+        if (confirm !== undefined && !(await confirm({ kind: "project", agent: name, projectId: marker!.projectId }))) throw notApprovedError()
         const listed = await approveProject(runtime, { agent: name, cwd })
         return { capabilityIds: [], permissions: [], transactionHash: null, gasUsed: 0n, projectId: listed.approval.projectId, droppedRows: listed.droppedRows }
       }
@@ -237,6 +269,12 @@ export async function approve(
   // mints nothing, so a second approve sends no transaction.
   const needed = await ungrantedScopes(runtime, identity.agentId, pending.request.scopes)
   if (needed.length === 0) throw new Error(`agent "${name}" is already approved`)
+  // The owner sees the ask and the advisor's advice before anything is signed — only an explicit
+  // confirm gets past this point. The question and the answer live in the CLI, which injects it.
+  if (confirm !== undefined) {
+    const advice = await grantAdviceFor(runtime, pending.request, identity.manifest)
+    if (!(await confirm({ kind: "grant", agent: name, scopes: needed, expiresAt: decodeUint64(pending.request.capabilityExpiresAt), advice }))) throw notApprovedError()
+  }
   // A READ grant that expired closes the namespace's write epoch (§7.3): grantBatch reverts
   // EpochRotationRequired until the owner rotates it, and every surviving reader then needs a wrap
   // for the new epoch — so each rotated namespace is followed by the same repair pass a revoke runs.
@@ -275,7 +313,7 @@ export async function approve(
  * truth: a miss still asks the chain, a corrupt file is rebuilt by reading as usual, and a
  * leftover index under `queue/` is ignored — never migrated.
  */
-function readSavedIds(home: Runtime["home"]): Record<string, Hex> {
+function readSavedIds(home: ServiceRuntime["home"]): Record<string, Hex> {
   try {
     const raw = home.readJson<Record<string, unknown>>("state/saved-ids.json")
     if (raw === undefined || typeof raw !== "object" || Array.isArray(raw)) return {}
@@ -289,13 +327,13 @@ function readSavedIds(home: Runtime["home"]): Record<string, Hex> {
   }
 }
 
-function recordSavedId(home: Runtime["home"], eventId: string, contextId: Hex): void {
+function recordSavedId(home: ServiceRuntime["home"], eventId: string, contextId: Hex): void {
   home.writeSecretJson("state/saved-ids.json", { ...readSavedIds(home), [eventId]: contextId })
 }
 
 /** Spec §5C steps 4–5: wrap, encrypt, upload and register on Monad under the agent's own key. A second save carrying
  * an eventId this project already has is a drainer retry after a crash — answer with the existing record, send nothing. */
-export async function saveCheckpoint(runtime: Runtime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean }> {
+export async function saveCheckpoint(runtime: ServiceRuntime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean }> {
   const envelope = wrapCheckpoint(input)
   const started = Date.now()
   const agent = runtime.agent(name)
@@ -338,7 +376,7 @@ export async function saveCheckpoint(runtime: Runtime, name: string, input: Omit
  * Maps each local agent's on-chain authorId (lower-case) to its local name, for rendering who
  * actually saved a record — never the name the checkpoint claims for itself.
  */
-export function authorNamesFor(runtime: Runtime): Record<string, string> {
+export function authorNamesFor(runtime: ServiceRuntime): Record<string, string> {
   const names: Record<string, string> = {}
   for (const name of listAgentNames(runtime.home)) {
     const identity = loadAgentIdentity(runtime.home, name)
@@ -348,7 +386,7 @@ export function authorNamesFor(runtime: Runtime): Record<string, string> {
 }
 
 /** Spec §5D steps 2–3: a full protocol read as this agent, then keep only this project's valid v1 envelopes. */
-export async function readCheckpoints(runtime: Runtime, name: string, projectId: string): Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }> {
+export async function readCheckpoints(runtime: ServiceRuntime, name: string, projectId: string): Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }> {
   if (typeof projectId !== "string" || projectId === "") throw new Error("projectId must be a non-empty string")
   const started = Date.now()
   const objects = await runtime.agent(name).read(runtime.owner, NAMESPACE)
@@ -418,7 +456,7 @@ export async function revoke(runtime: Runtime, name: string): Promise<{ transact
  * quietly() swallows only "missing" and "unreadable/corrupt"; EACCES/EPERM propagate, because a permission
  * problem must never silently change which agent gets revoked.
  */
-async function resolveAgentId(runtime: Runtime, name: string): Promise<Hex> {
+async function resolveAgentId(runtime: ServiceRuntime, name: string): Promise<Hex> {
   const { home, reader } = runtime
   const quietly = <T>(load: () => T): T | undefined => {
     try {

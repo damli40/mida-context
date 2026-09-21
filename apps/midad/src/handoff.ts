@@ -6,7 +6,7 @@ import { checkProject } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { isSafeName } from "./queue.js"
 import { readOwnerFacts } from "./remember.js"
-import type { Runtime } from "./runtime.js"
+import type { ServiceRuntime } from "./runtime.js"
 import { isCapabilityLive, readCheckpoints } from "./skeleton.js"
 
 /**
@@ -26,8 +26,8 @@ export type CapabilityState = "live" | "none" | "revoked"
 export interface HandoffDeps {
   /** The read must finish inside this budget so the daemon answers before the hook's 8 s client timeout. Default 7.5 s. */
   limitMs?: number
-  checkProject?: (runtime: Runtime, input: { agent: string; cwd: string }) => Promise<ProjectCheck>
-  capability?: (runtime: Runtime, agent: string) => Promise<CapabilityState>
+  checkProject?: (runtime: ServiceRuntime, input: { agent: string; cwd: string }) => Promise<ProjectCheck>
+  capability?: (runtime: ServiceRuntime, agent: string) => Promise<CapabilityState>
   read?: typeof readCheckpoints
   /** The owner-fact read; defaults to readOwnerFacts. A failure here degrades, never refuses. */
   readFacts?: typeof readOwnerFacts
@@ -60,7 +60,7 @@ const refused = (reason: string, text: string): HandoffResult => ({ kind: "refus
  * records give the verdict). Anything else — expired, superseded, never granted — is "none",
  * the not-approved refusal: if the chain cannot tell those cases apart, neither can we.
  */
-async function capabilityState(runtime: Runtime, agent: string): Promise<CapabilityState> {
+async function capabilityState(runtime: ServiceRuntime, agent: string): Promise<CapabilityState> {
   const identity = loadAgentIdentity(runtime.home, agent)
   if (identity === undefined) return "none"
   const ids = new Set(await runtime.reader.activeCapabilityIds(runtime.owner, identity.agentId))
@@ -71,7 +71,7 @@ async function capabilityState(runtime: Runtime, agent: string): Promise<Capabil
   const agentEpoch = await runtime.reader.agentEpoch(runtime.owner, identity.agentId)
   let sawRevoked = false
   for (const id of ids) {
-    if (await isCapabilityLive(runtime.ownerChain, id)) return "live"
+    if (await isCapabilityLive(runtime.chain, id)) return "live"
     const capability = await runtime.reader.getCapability(id).catch(() => null)
     if (capability !== null && capability.owner === runtime.owner && (capability.revoked || capability.agentEpoch !== agentEpoch)) {
       sawRevoked = true
@@ -93,7 +93,7 @@ type FactOutcome = { status: "ok"; facts: Awaited<ReturnType<typeof readOwnerFac
  * answer on the agent's capability, then the full protocol read, merged and rendered.
  */
 export async function buildHandoff(
-  runtime: Runtime,
+  runtime: ServiceRuntime,
   input: { agent: string; cwd: string; authorNames: Record<string, string>; sessionId?: string },
   deps: HandoffDeps = {},
 ): Promise<HandoffResult> {

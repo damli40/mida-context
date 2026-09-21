@@ -23,7 +23,7 @@ import { checkProject as checkProjectAgainstList } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { findProjectMarker, isSafeName, listJobs, moveToBad, removeJob } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
-import type { Runtime } from "./runtime.js"
+import type { ServiceRuntime } from "./runtime.js"
 import { isCapabilityLive } from "./skeleton.js"
 import { saveCheckpoint } from "./skeleton.js"
 
@@ -70,9 +70,9 @@ const backoffMs = (attempts: number) => Math.min(60_000 * 2 ** attempts, MAX_BAC
 export interface DrainDeps {
   home: MidaHome
   /** opens a fresh runtime — used when `runtime` is not supplied; the drain closes what it opens */
-  open?: () => Promise<Runtime>
+  open?: () => Promise<ServiceRuntime>
   /** an already-open runtime owned by the caller (the daemon) — the drain uses it and never closes it */
-  runtime?: Runtime
+  runtime?: ServiceRuntime
   compile: typeof compileCheckpoint
   now?: () => Date
   minGapMs?: number
@@ -224,8 +224,8 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
     else group.push(job)
   }
 
-  let opened: Runtime | undefined
-  const openRuntime = async (): Promise<Runtime> => {
+  let opened: ServiceRuntime | undefined
+  const openRuntime = async (): Promise<ServiceRuntime> => {
     if (deps.runtime !== undefined) return deps.runtime
     if (deps.open === undefined) throw new Error("drain needs either a runtime or an open()")
     opened ??= await deps.open()

@@ -2,7 +2,7 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import { p256 } from "@noble/curves/nist.js"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { hexOf } from "@mida/crypto"
-import type { Hex, PurposeId, SignedAgentCapabilityManifest } from "@mida/protocol"
+import type { Address, Hex, PurposeId, SignedAgentCapabilityManifest } from "@mida/protocol"
 import type { ProvisionedAgent } from "@mida/fake-vault"
 import type { Grant } from "@mida/sdk"
 import type { MidaHome } from "./home.js"
@@ -47,6 +47,24 @@ export function loadOrCreateOwnerSecrets(home: MidaHome): OwnerSecrets {
   const created: OwnerSecrets = { privateKey: generatePrivateKey(), seed: hexOf(randomBytes(32)), p256PrivateKey: hexOf(p256.utils.randomSecretKey()) }
   home.writeSecretJson(file, created)
   return created
+}
+
+const OWNER_ADDRESS_FILE = "owner-address.json"
+const ADDRESS = /^0x[0-9a-fA-F]{40}$/
+
+/** The owner's public address — written by `mida init`, read by the daemon. Not a secret. */
+export function saveOwnerAddress(home: MidaHome, address: Address): void {
+  home.writeSecretJson(OWNER_ADDRESS_FILE, { address })
+}
+
+export function loadOwnerAddress(home: MidaHome): Address | undefined {
+  const record = home.readJson<Record<string, unknown>>(OWNER_ADDRESS_FILE)
+  if (record === undefined) return undefined
+  const address = record.address
+  if (typeof address !== "string" || !ADDRESS.test(address)) {
+    throw new Error(`${OWNER_ADDRESS_FILE}: field "address" is missing or is not an address`)
+  }
+  return address.toLowerCase() as Address
 }
 
 export function loadOrCreateOperatorSecrets(home: MidaHome): OperatorSecrets {

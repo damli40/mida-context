@@ -10,7 +10,7 @@ import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeC
 import type { InstallTool } from "./install.js"
 import { attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE } from "./runtime.js"
-import type { Network } from "./runtime.js"
+import type { Network, ServiceRuntime } from "./runtime.js"
 import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
 
 /** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. */
@@ -24,6 +24,16 @@ export const USAGE =
   "   (tool = claude-code | codex; agent = claude-code | codex | assistant — assistant is a stand-in for any other assistant you use)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
 export const CLI_COMMANDS: readonly string[] = ["init", "remember", ...WITH_AGENT]
+/**
+ * The commands that change who has access. Only `mida` in the owner's own terminal may run them —
+ * they open the owner runtime in-process and are never sent to the daemon socket.
+ */
+export const OWNER_COMMANDS: readonly string[] = ["init", "approve", "revoke", "remember"]
+
+/** What the daemon answers when an owner command reaches /cli anyway. */
+export function ownerOnlyLine(command: string): string {
+  return `This changes who has access, so it only runs in your own terminal: mida ${command}`
+}
 
 export interface CliDeps {
   home: MidaHome
@@ -31,6 +41,12 @@ export interface CliDeps {
   print(line: string): void
   /** The folder the command was run from — `approve` records it on the owner-signed project list. */
   cwd?: string
+  /**
+   * After a successful approve or revoke the command pokes the daemon for a drain pass so the
+   * service notices on its next pass instead of its next tick. Best-effort: a daemon that is not
+   * running cannot be kicked, and a failed kick never fails the command. Injectable in tests.
+   */
+  kickDaemon?: () => unknown | Promise<unknown>
 }
 
 /**
@@ -47,17 +63,23 @@ export function validCliArgv(argv: unknown): argv is string[] {
 }
 
 /**
- * All of `mida`'s commands against an already-open runtime: the daemon's /cli route runs owner
- * commands inside the daemon's runtime through this. Returns the exit code; output goes to print.
+ * The agent-facing commands against an already-open service runtime — what the daemon's /cli
+ * route is allowed to run. Owner commands (init/approve/revoke/remember) are refused outright:
+ * a ServiceRuntime cannot sign as the owner, and the refusal is stated here so the socket answer
+ * is always the same line. Returns the exit code; output goes to print.
  */
 export async function runCliWithRuntime(
   argv: string[],
-  runtime: Runtime,
+  runtime: ServiceRuntime,
   print: (line: string) => void,
-  /** `cwd` is the folder the command ran in — `approve` adds its project to the owner's list. */
+  /** `cwd` is the folder the command ran in — kept for interface parity; owner commands never reach here. */
   context?: { cwd?: string },
 ): Promise<number> {
   const [command = ""] = argv
+  if (OWNER_COMMANDS.includes(command)) {
+    print(ownerOnlyLine(command))
+    return 2
+  }
   const asFlag = command === "read" && argv[1] === "--as"
   const agent = asFlag ? (argv[2] ?? "") : (argv[1] ?? "")
   const projectId = argv[2] ?? ""
@@ -65,39 +87,14 @@ export async function runCliWithRuntime(
     print(USAGE)
     return 2
   }
-  if (command !== "init" && command !== "remember" && !WITH_AGENT.includes(command)) return usage()
-  if (command === "remember" && argv.slice(1).join(" ").trim().length === 0) return usage()
+  if (!WITH_AGENT.includes(command)) return usage()
   if (WITH_AGENT.includes(command) && !AGENTS.includes(agent)) return usage()
   if (command === "read" && !asFlag && projectId.length === 0) return usage()
   if (WITH_PROJECT.includes(command) && projectId.length === 0) return usage()
 
   try {
-    if (command === "init") {
-      const result = await init(runtime, AGENTS)
-      print(`owner ${result.owner}`)
-      for (const [name, agentId] of Object.entries(result.agents)) print(`agent ${name} ${agentId}`)
-    } else if (command === "remember") {
-      const result = await remember(runtime, argv.slice(1).join(" "))
-      print(result.kind === "remembered" ? `remembered ${result.contextId} in ${result.namespace}` : `refused: ${result.code}`)
-      return result.kind === "remembered" ? 0 : 1
-    } else if (command === "request") {
+    if (command === "request") {
       print(`requested ${agent} ${(await requestAccess(runtime, agent)).requestId}`)
-    } else if (command === "approve") {
-      const result = await approve(runtime, agent, context?.cwd)
-      print(
-        result.transactionHash === null
-          ? `approved ${agent} for project ${result.projectId}; the on-chain grant was already live`
-          : `approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}` +
-              (result.projectId !== undefined ? ` project ${result.projectId}` : ""),
-      )
-      // a list rebuilt from a bad signature silently dropped rows — the owner must hear the count
-      if (result.droppedRows !== undefined && result.droppedRows !== 0) {
-        print(
-          result.droppedRows === null
-            ? "the old approved-projects list was invalid; the old list was discarded"
-            : `the old approved-projects list was invalid; ${result.droppedRows} row(s) were dropped`,
-        )
-      }
     } else if (command === "save-demo") {
       const result = await saveCheckpoint(runtime, agent, {
         projectId,
@@ -130,9 +127,6 @@ export async function runCliWithRuntime(
           print(`  ${checkpoint.contextId} written by ${author} (on-chain author ${checkpoint.authorId.slice(0, 10)}…)`)
         }
       }
-    } else {
-      const result = await revoke(runtime, agent)
-      print(`revoked ${agent} tx ${result.transactionHashes.join(" ")}; new key sent to: ${result.rewrapped.join(", ") || "nobody"}`)
     }
     return 0
   } catch (error) {
@@ -143,7 +137,64 @@ export async function runCliWithRuntime(
   }
 }
 
-/** Direct form kept for callers that own no daemon (tests, `mida init` before the daemon exists). */
+/**
+ * The owner commands — init, approve, revoke, remember — run here, in the `mida` process, on the
+ * owner runtime. They never touch the daemon socket: the daemon cannot sign as the owner, and a
+ * socket client must never be able to.
+ */
+async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps): Promise<number> {
+  const command = argv[0]!
+  const agent = argv[1] ?? ""
+  const usage = () => {
+    deps.print(USAGE)
+    return 2
+  }
+  if ((command === "approve" || command === "revoke") && !AGENTS.includes(agent)) return usage()
+  if (command === "remember" && argv.slice(1).join(" ").trim().length === 0) return usage()
+
+  try {
+    if (command === "init") {
+      const result = await init(runtime, AGENTS)
+      deps.print(`owner ${result.owner}`)
+      for (const [name, agentId] of Object.entries(result.agents)) deps.print(`agent ${name} ${agentId}`)
+    } else if (command === "remember") {
+      const result = await remember(runtime, argv.slice(1).join(" "))
+      deps.print(result.kind === "remembered" ? `remembered ${result.contextId} in ${result.namespace}` : `refused: ${result.code}`)
+      return result.kind === "remembered" ? 0 : 1
+    } else if (command === "approve") {
+      const result = await approve(runtime, agent, deps.cwd)
+      deps.print(
+        result.transactionHash === null
+          ? `approved ${agent} for project ${result.projectId}; the on-chain grant was already live`
+          : `approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}` +
+              (result.projectId !== undefined ? ` project ${result.projectId}` : ""),
+      )
+      // a list rebuilt from a bad signature silently dropped rows — the owner must hear the count
+      if (result.droppedRows !== undefined && result.droppedRows !== 0) {
+        deps.print(
+          result.droppedRows === null
+            ? "the old approved-projects list was invalid; the old list was discarded"
+            : `the old approved-projects list was invalid; ${result.droppedRows} row(s) were dropped`,
+        )
+      }
+    } else {
+      const result = await revoke(runtime, agent)
+      deps.print(`revoked ${agent} tx ${result.transactionHashes.join(" ")}; new key sent to: ${result.rewrapped.join(", ") || "nobody"}`)
+    }
+    return 0
+  } catch (error) {
+    // The error code only. A message from a deeper layer is never echoed: it could carry data.
+    const code = (error as { code?: unknown }).code
+    deps.print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
+    return 1
+  }
+}
+
+/**
+ * One `mida` command end to end: opens the owner runtime in-process (it is the only runtime that
+ * can sign as the owner), runs the command, closes. Owner commands run their own dispatch; the
+ * agent-facing ones share the socket path's.
+ */
 export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   if (!validCliArgv(argv)) {
     deps.print(USAGE)
@@ -151,7 +202,13 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   }
   const runtime = await Runtime.open(deps.home, deps.network)
   try {
-    return await runCliWithRuntime(argv, runtime, deps.print, { cwd: deps.cwd })
+    const command = argv[0]!
+    if (!OWNER_COMMANDS.includes(command)) return await runCliWithRuntime(argv, runtime, deps.print, { cwd: deps.cwd })
+    const code = await runOwnerCommand(argv, runtime, deps)
+    if (code === 0 && (command === "approve" || command === "revoke")) {
+      await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
+    }
+    return code
   } finally {
     await runtime.close()
   }
@@ -185,17 +242,17 @@ async function main(): Promise<void> {
     const argv = process.argv.slice(2)
     const print = (line: string) => console.log(line)
 
-    // `init` is the one command allowed to run in-process: before it runs there is no
-    // network.json, so no daemon could start. It spawns the daemon when it is done. With a
-    // daemon already up, init goes through /cli like everything else.
-    if (argv[0] === "init") {
-      const health = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
-      if (health.status === 0) {
-        const code = await runCli(argv, { home, network, print, cwd: process.cwd() })
-        if (code === 0) spawnDaemon()
-        process.exitCode = code
-        return
+    // Owner commands — init, approve, revoke, remember — run in this process on the owner
+    // runtime and are never sent to the daemon socket. `init` still spawns the daemon when one
+    // is not already running; the others reuse a live daemon's Context API or start their own.
+    if (OWNER_COMMANDS.includes(argv[0] ?? "")) {
+      const code = await runCli(argv, { home, network, print, cwd: process.cwd() })
+      if (argv[0] === "init" && code === 0) {
+        const health = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
+        if (health.status === 0) spawnDaemon()
       }
+      process.exitCode = code
+      return
     }
 
     // install, uninstall and doctor are local commands: they never go through the daemon.

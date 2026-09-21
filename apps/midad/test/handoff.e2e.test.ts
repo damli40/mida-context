@@ -271,10 +271,12 @@ describe("POST /handoff on local Anvil", () => {
     expect(home.readJson("state/continues/sess-d.json")).toEqual({ continues: "sess-c", projectId: "proj-hand" })
   }, STEP_TIMEOUT)
 
-  it("(g) a missing grants.json is not 'not approved': the chain still answers live and the job saves", async () => {
-    // grants.json is the local index of what the agent holds, not the authority. With it deleted
-    // the drainer must ask the chain under the owner the runtime holds — a live answer means the
-    // queued job saves, not that the whole queue for the agent is dropped as not-approved.
+  it("(g) a missing grants.json is not authority: the chain still answers live, but the agent's own credentials are gone", async () => {
+    // grants.json is the agent's working credential set — the capability ids and wrap keys it must
+    // present — never the authority (the chain is). The daemon rebuilds agents from disk on every
+    // call now, so with the file deleted the chain check still passes but the save itself cannot
+    // proceed: the job leaves the queue as not-approved. Restoring the exact bytes restores the
+    // save with no re-approval — proof the file was credentials, not permission.
     const grantsPath = home.path("agents/claude-code/grants.json")
     const grantsBytes = readFileSync(grantsPath)
     rmSync(grantsPath)
@@ -286,17 +288,36 @@ describe("POST /handoff on local Anvil", () => {
       await callDaemon(home, "/kick", {}, { timeoutMs: STEP_TIMEOUT })
       const deadline = Date.now() + 20_000
       for (;;) {
-        const saved = home.has("logs/drain.jsonl") && readFileSync(home.path("logs/drain.jsonl"), "utf8")
+        const dropped = home.has("logs/drain.jsonl") && readFileSync(home.path("logs/drain.jsonl"), "utf8")
           .split("\n")
-          .some((line) => line.includes('"sessionId":"sess-nogrants"') && line.includes('"outcome":"saved"'))
-        if (saved) break
+          .some((line) => line.includes('"sessionId":"sess-nogrants"') && line.includes('"reason":"not-approved"'))
+        if (dropped) break
         if (Date.now() > deadline) {
           const drainLog = home.has("logs/drain.jsonl") ? readFileSync(home.path("logs/drain.jsonl"), "utf8") : "(none)"
-          throw new Error(`sess-nogrants was never saved; drain log ${drainLog}`)
+          throw new Error(`sess-nogrants was never dropped as not-approved; drain log ${drainLog}`)
         }
         await new Promise((resolve) => setTimeout(resolve, 250))
       }
       expect(listJobs(home).map((j) => j.sessionId)).not.toContain("sess-nogrants")
+
+      // restore the file: the chain's "live" verdict never changed, so the next job saves at once
+      writeFileSync(grantsPath, grantsBytes, { mode: 0o600 })
+      const transcript2 = join(hookHomeDir, ".claude", "projects", "proj", "sess-restored.jsonl")
+      writeFileSync(transcript2, JSON.stringify({ type: "user", message: { content: "back" } }) + "\n")
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "sess-restored", transcriptPath: transcript2, cwd: workDir, error: null })
+      await callDaemon(home, "/kick", {}, { timeoutMs: STEP_TIMEOUT })
+      const deadline2 = Date.now() + 20_000
+      for (;;) {
+        const saved = home.has("logs/drain.jsonl") && readFileSync(home.path("logs/drain.jsonl"), "utf8")
+          .split("\n")
+          .some((line) => line.includes('"sessionId":"sess-restored"') && line.includes('"outcome":"saved"'))
+        if (saved) break
+        if (Date.now() > deadline2) {
+          const drainLog = home.has("logs/drain.jsonl") ? readFileSync(home.path("logs/drain.jsonl"), "utf8") : "(none)"
+          throw new Error(`sess-restored was never saved after grants.json came back; drain log ${drainLog}`)
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
     } finally {
       writeFileSync(grantsPath, grantsBytes)
     }

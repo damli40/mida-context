@@ -12,9 +12,9 @@ import { FLUSH_EVENTS } from "./hook.js"
 import type { MidaHome } from "./home.js"
 import { isSafeName, listJobs } from "./queue.js"
 import { authorNamesFor } from "./skeleton.js"
-import { Runtime } from "./runtime.js"
+import { ServiceRuntime } from "./runtime.js"
 import type { Network } from "./runtime.js"
-import { USAGE, runCliWithRuntime, validCliArgv } from "./cli.js"
+import { OWNER_COMMANDS, USAGE, ownerOnlyLine, runCliWithRuntime, validCliArgv } from "./cli.js"
 
 /** Request bodies over this size are refused with 413 and the connection is closed. */
 const BODY_CAP_BYTES = 64 * 1024
@@ -35,10 +35,10 @@ export interface DaemonDeps {
   drainDeps?: Partial<DrainDeps>
   /** The drain itself; defaults to drainUntilSettled. Tests substitute a queue-clearing spy. */
   drain?: (deps: DrainDeps) => Promise<DrainResult>
-  /** Runtime acquisition; defaults to Runtime.open (which takes midad.lock). */
-  openRuntime?: () => Promise<Runtime>
+  /** Runtime acquisition; defaults to ServiceRuntime.open — the daemon's runtime cannot sign as the owner. */
+  openRuntime?: () => Promise<ServiceRuntime>
   /** The /cli dispatch; defaults to runCliWithRuntime. `cwd` is the folder the client ran in. */
-  runCli?: (argv: string[], runtime: Runtime, print: (line: string) => void, context?: { cwd?: string }) => Promise<number>
+  runCli?: (argv: string[], runtime: ServiceRuntime, print: (line: string) => void, context?: { cwd?: string }) => Promise<number>
   /** Save-loop period; default 15 s. */
   tickMs?: number
   /** Loop pacing; default a real sleep. */
@@ -96,7 +96,7 @@ function respond(res: ServerResponse, status: number, body: unknown): void {
 }
 
 /**
- * The one long-running owner of a Mida home: it takes `midad.lock` through Runtime.open, serves the
+ * The one long-running owner of a Mida home: it takes `midad.lock` through ServiceRuntime.open, serves the
  * private control socket, and runs the save loop the detached drainer used to be. A second call on
  * the same home resolves to `alreadyRunning` when a live daemon answers /health on the socket; a
  * socket file with no listener behind it is stale and is replaced.
@@ -131,7 +131,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
     rmSync(socketPath, { force: true })
   }
 
-  const runtime = await (deps.openRuntime ?? (() => Runtime.open(home, deps.network)))()
+  const runtime = await (deps.openRuntime ?? (() => ServiceRuntime.open(home, deps.network)))()
 
   const startedAt = new Date(deps.now()).toISOString()
   let stopped = false
@@ -224,6 +224,12 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       const argv = (parsed as { argv?: unknown } | null)?.argv
       if (!validCliArgv(argv)) {
         respond(res, 200, { code: 2, lines: [USAGE] })
+        return
+      }
+      // owner commands are refused before dispatch — no socket client may change who has access,
+      // and the service runtime could not sign for them anyway
+      if (OWNER_COMMANDS.includes(argv[0]!)) {
+        respond(res, 200, { code: 2, lines: [ownerOnlyLine(argv[0]!)] })
         return
       }
       // the client tells the daemon where it ran — `approve` signs that folder's project in;
