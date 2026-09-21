@@ -156,7 +156,9 @@ export function createSponsoredSender(input: {
         const authorization = delegated
           ? undefined
           : // The bundler sends the transaction, so the authorization nonce is the address's
-            // CURRENT transaction count — the probe found count+1 refused by the bundler.
+            // CURRENT transaction count. What the probe actually found: its first run failed
+            // because NO real authorization was attached — the library only inserts a
+            // placeholder — so this send signs one itself. It never tried count+1.
             await input.account.signAuthorization!({
               address: implementation,
               chainId: Number(input.deployment.chainId),
