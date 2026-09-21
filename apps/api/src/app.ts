@@ -46,6 +46,15 @@ export const CANCELLATION_MAX_LIFETIME_SECONDS = 300n
 /** Manifest GET responses are allowed this stale before the envelope is re-verified against Monad. */
 export const MANIFEST_VERIFY_CACHE_SECONDS = 60n
 
+/**
+ * How far ahead of the wall clock a staged manifest's issuedAt may run. The field is written on chain
+ * time (provisionAgent stamps the latest block timestamp) and the two clocks legitimately skew — local
+ * rigs move chain time forward on purpose — so the wall clock must not hard-gate staging. The bound
+ * still rejects absurd values cheaply; the authoritative check is verifySignedManifest's, against chain
+ * time, once the agent registers — and an unverified envelope is swept at 24 h regardless.
+ */
+export const MANIFEST_STAGING_FUTURE_SECONDS = 86_400n
+
 /** The pending-bytes quota re-checks unmarked uploads in batches of 8, at most this many chain reads per PUT. */
 export const PENDING_CHECK_BATCH = 8
 export const PENDING_CHECK_MAX_READS = 40
@@ -380,9 +389,10 @@ export function createContextApi(options: ContextApiOptions) {
     if (envelope === null || typeof envelope !== "object" || typeof envelope.manifest !== "object" || typeof envelope.operatorSignature !== "string" || !/^0x[0-9a-f]{130}$/.test(envelope.operatorSignature)) {
       throw new MidaError("INVALID_WIRE", "envelope needs a manifest and a lowercase 65-byte operatorSignature")
     }
-    // Structural rules are local work: issuedAt is informational chronology, so the wall clock is the check
-    // here — a body the chain later commits to is re-validated against chain time inside verifySignedManifest.
-    validateManifestBody(envelope.manifest, clock())
+    // Structural rules are local work: issuedAt is informational chronology written on chain time, so the
+    // wall clock bounds it only loosely — a body the chain later commits to is re-validated against chain
+    // time inside verifySignedManifest.
+    validateManifestBody(envelope.manifest, clock() + MANIFEST_STAGING_FUTURE_SECONDS)
     const envelopeHash = manifestEnvelopeHash(envelope)
     const bodyHash = manifestBodyHash(envelope.manifest)
 
