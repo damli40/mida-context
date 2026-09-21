@@ -12,7 +12,7 @@ import { callDaemon } from "./control.js"
 import type { MidaHome } from "./home.js"
 import { claudeHooksStatus, codexHooksStatus } from "./install.js"
 import type { InstallTool } from "./install.js"
-import { listAgentNames, loadAgentIdentity } from "./keys.js"
+import { isRevoked, listAgentNames, loadAgentIdentity } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
 import { listJobs } from "./queue.js"
 import { MIN_BALANCE_WEI } from "./runtime.js"
@@ -171,6 +171,10 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           const live = views.filter((v) => !v.revoked && (v.expiresAt === 0n || now < v.expiresAt))
           if (live.length > 0) {
             lines.push(`ok: ${name} approved`)
+          } else if (views.length === 0 && isRevoked(home, name)) {
+            // an agent-level revoke empties the live capability list entirely — the marker says it
+            // was revoked, not that it never asked
+            lines.push(problem(`${name}'s access was revoked`, `run \`mida request ${name}\` then \`mida approve ${name}\``))
           } else if (views.length === 0) {
             lines.push(
               home.has(`agents/${name}/pending-request.json`)

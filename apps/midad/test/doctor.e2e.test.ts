@@ -13,6 +13,7 @@ import {
   installClaudeCode,
   installCodex,
   requestAccess,
+  revoke,
   runDoctor,
   startDaemon,
   startPersistentApi,
@@ -124,7 +125,30 @@ describe("mida doctor on local Anvil", () => {
     writeFileSync(home.path("approved-projects.json"), listBytes)
   }, STEP_TIMEOUT)
 
-  it("(c) an expired grant prints the expiry date (Anvil time travel)", async () => {
+  it("(c) a just-revoked agent is reported revoked — never 'has never asked for access'", async () => {
+    // a second home keeps the revoke away from the shared one: the real path writes
+    // agents/doomed-agent/revoked.json and empties the agent's live capability list on chain.
+    // it runs before the time-travel test — after the clock moves, approve() cannot create a grant.
+    const home2 = new MidaHome(mkdtempSync(join(tmpdir(), "mida-doctor-revoked-")))
+    const workDir = join(mkdtempSync(join(tmpdir(), "mida-doctor-work-")), "work")
+    mark(workDir, "proj-revoked")
+    const runtime = await Runtime.open(home2, { ...network, storageUrl: apiServer.baseUrl })
+    try {
+      await init(runtime, ["doomed-agent"])
+      await requestAccess(runtime, "doomed-agent")
+      await approve(runtime, "doomed-agent", workDir)
+      await revoke(runtime, "doomed-agent")
+    } finally {
+      await runtime.close()
+    }
+    const lines: string[] = []
+    await runDoctor({ home: home2, print: (line) => lines.push(line), env: {}, daemonProbeMs: 50 })
+    const agentLine = lines.find((line) => line.includes("doomed-agent"))
+    expect(agentLine).toContain("revoked")
+    expect(agentLine).not.toContain("never asked")
+  }, STEP_TIMEOUT)
+
+  it("(d) an expired grant prints the expiry date (Anvil time travel)", async () => {
     await increaseLocalTime(env.rpcUrl, 33n * 24n * 60n * 60n)
     const { lines, code } = await doctor()
     const expired = lines.filter((line) => line.includes("grant expired"))
@@ -134,7 +158,7 @@ describe("mida doctor on local Anvil", () => {
     expect(code).toBe(expired.length)
   }, STEP_TIMEOUT)
 
-  it("(d) with the daemon down the daemon line is a PROBLEM and the run still finishes", async () => {
+  it("(e) with the daemon down the daemon line is a PROBLEM and the run still finishes", async () => {
     await daemon?.close()
     const { lines, code } = await doctor()
     expect(lines[0]).toBe("PROBLEM: midad is not answering — start the daemon")
