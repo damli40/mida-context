@@ -6,6 +6,9 @@ test = "test"
 script = "script"
 solc_version = "0.8.28"
 evm_version = "osaka"
+# Price tests with Monad's gas rules (cold reads cost about 4x Ethereum's; the P256 check is a flat
+# 6,900). Needs Foundry >= 1.8.0. It does not change the compiled bytecode (checked 2026-09-21).
+network = "monad"
 optimizer = true
 optimizer_runs = 200
 via_ir = true
