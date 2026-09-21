@@ -11,6 +11,8 @@ import type { Abi, Account, LocalAccount, PublicClient, TransactionReceipt, Wall
 import { capabilityRegistryAbi } from "./abis.js"
 import { chainFor } from "./deployment.js"
 import type { Deployment } from "./deployment.js"
+import { contractGas, valueGas } from "./gas.js"
+import type { TxKind } from "./gas.js"
 import { toMidaError } from "./registry.js"
 import type { ChainContext } from "./registry.js"
 
@@ -34,15 +36,22 @@ export function createWriteContext(input: { rpcUrl: string; deployment: Deployme
   }
 }
 
+/** A mined receipt plus the gas limit the transaction was actually sent with — the number Monad bills. */
+export type SentReceipt = TransactionReceipt & { gasLimit: bigint }
+
 /**
- * Simulates first so a revert surfaces as a named contract error mapped to a protocol code, then sends and waits
- * for the receipt. A receipt with status "reverted" (for example a Monad reserve-balance revert after inclusion)
+ * Simulates first so a revert surfaces as a named contract error mapped to a protocol code, then
+ * estimates the gas and refuses the send when the estimate exceeds the kind's ceiling (Monad bills
+ * the limit, not the usage). Within the ceiling the transaction is sent with `gas` set explicitly
+ * to the estimate — no padding — and the receipt comes back carrying that limit as `gasLimit`.
+ * A receipt with status "reverted" (for example a Monad reserve-balance revert after inclusion)
  * is an error, never a silent success.
  */
 export async function sendContract(
   context: WriteContext,
   call: { address: Address; abi: Abi; functionName: string; args: readonly unknown[] },
-): Promise<TransactionReceipt> {
+  kind: TxKind,
+): Promise<SentReceipt> {
   let request: unknown
   try {
     ;({ request } = await context.publicClient.simulateContract({
@@ -55,12 +64,47 @@ export async function sendContract(
   } catch (error) {
     throw toMidaError(error)
   }
-  const hash = await context.walletClient.writeContract(request as never)
+  let gas: bigint
+  try {
+    gas = await contractGas(context, call, kind)
+  } catch (error) {
+    throw toMidaError(error)
+  }
+  const hash = await context.walletClient.writeContract({ ...(request as object), gas } as never)
   const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
   if (receipt.status !== "success") {
     throw new MidaError("CAPABILITY_DENIED", `${call.functionName} transaction ${hash} reverted on-chain`)
   }
-  return receipt
+  return { ...receipt, gasLimit: gas }
+}
+
+/**
+ * A plain value transfer under the same ceiling rule: the node's estimate is the explicit `gas`
+ * on the send, refused above the kind's ceiling. Used for environment funding (R3-1).
+ */
+export async function sendValue(
+  context: WriteContext,
+  transfer: { to: Address; value: bigint },
+  kind: TxKind,
+): Promise<SentReceipt> {
+  let gas: bigint
+  try {
+    gas = await valueGas(context, transfer, kind)
+  } catch (error) {
+    throw toMidaError(error)
+  }
+  const hash = await context.walletClient.sendTransaction({
+    account: context.account,
+    chain: context.walletClient.chain,
+    to: transfer.to,
+    value: transfer.value,
+    gas,
+  } as never)
+  const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
+  if (receipt.status !== "success") {
+    throw new MidaError("CAPABILITY_DENIED", `funding transaction ${hash} reverted on-chain`)
+  }
+  return { ...receipt, gasLimit: gas }
 }
 
 /**
@@ -94,11 +138,15 @@ export async function registerAgent(
       capabilityManifestVersion: 1n,
     }) as never,
   )
-  const receipt = await sendContract(context, {
-    address: deployment.capabilityRegistry,
-    abi: capabilityRegistryAbi,
-    functionName: "registerAgent",
-    args: [input.agentSalt, input.signer.address, input.encryptionPublicKey, callbackOriginHash, input.capabilityManifestHash, signature],
-  })
+  const receipt = await sendContract(
+    context,
+    {
+      address: deployment.capabilityRegistry,
+      abi: capabilityRegistryAbi,
+      functionName: "registerAgent",
+      args: [input.agentSalt, input.signer.address, input.encryptionPublicKey, callbackOriginHash, input.capabilityManifestHash, signature],
+    },
+    "agent.register",
+  )
   return { agentId, receipt }
 }

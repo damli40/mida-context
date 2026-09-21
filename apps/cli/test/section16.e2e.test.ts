@@ -6,6 +6,7 @@ import { P256_N, PERMISSION, PROVENANCE_POLICY, accessRequestHash, namespaceId, 
 import type { Address, Hex, ReaderEpochWrap } from "@mida/protocol"
 import { bytesOf, deriveEpochKeyPair, hexOf, openContextObject, unwrapEpochPrivateKey } from "@mida/crypto"
 import { capabilityRegistryAbi, sendContract } from "@mida/chain"
+import type { TxKind } from "@mida/chain"
 import { FakeVaultAuthority, buildSignedAccessRequest, completeVaultAssertion, p256PublicKey, provisionAgent, vaultSignPayload } from "@mida/fake-vault"
 import type { AgentDeclaration, ProvisionedAgent } from "@mida/fake-vault"
 import { isScopeSubset } from "@mida/grant-advisor"
@@ -321,7 +322,9 @@ describe("owner passkey verification path inside grantBatch (plan Task 26)", () 
     await env.fund(ownerAccount.address)
     const owner = env.writeContext(ownerAccount)
     const registry = env.deployment.capabilityRegistry
-    const send = (functionName: string, args: readonly unknown[]) => sendContract(owner, { address: registry, abi: capabilityRegistryAbi, functionName, args })
+    const KIND: Record<string, TxKind> = { registerP256Key: "owner.key", rotateP256Key: "owner.keyRotate" }
+    const send = (functionName: string, args: readonly unknown[]) =>
+      sendContract(owner, { address: registry, abi: capabilityRegistryAbi, functionName, args }, KIND[functionName]!)
     const oldKey = hexOf(p256.utils.randomSecretKey())
     const oldPublic = p256PublicKey(oldKey)
     const newPublic = p256PublicKey(hexOf(p256.utils.randomSecretKey()))

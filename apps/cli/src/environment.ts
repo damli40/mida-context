@@ -9,6 +9,7 @@ import {
   deployLocal,
   fundLocal,
   loadDeployment,
+  sendValue,
   startAnvil,
 } from "@mida/chain"
 import type { Deployment, LocalWriteContext } from "@mida/chain"
@@ -88,11 +89,7 @@ export async function monadTestnetEnvironment(env: Record<string, string | undef
     deployment,
     apiBaseUrl: server.baseUrl,
     fund: async (address) => {
-      const hash = await funder.walletClient.sendTransaction({ account: funder.account, chain: funder.walletClient.chain, to: address, value: funding })
-      const receipt = await funder.publicClient.waitForTransactionReceipt({ hash })
-      if (receipt.status !== "success") {
-        throw new Error(`funding ${address} reverted in ${hash}; check the funder balance against Monad's reserve-balance rule`)
-      }
+      const receipt = await sendValue(funder, { to: address, value: funding }, "funding")
       // Monad's asynchronous execution budgets an EOA's inflight gas spend against state from k=3 blocks ago, and a
       // funder below the 10 MON reserve may transfer value only in an "emptying transaction" (no other send within k
       // blocks). Waiting past the lag lets the lagged state see the new balance and keeps consecutive funds eligible.

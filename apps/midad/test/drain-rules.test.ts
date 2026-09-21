@@ -6,6 +6,7 @@ import { join } from "node:path"
 import { spawnSync } from "node:child_process"
 import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
+import { MidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
 import { MidaHome, buildHandoff, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, projectIdFor, tailOf } from "@mida/midad"
 import type { DrainDeps, Runtime, saveCheckpoint } from "@mida/midad"
@@ -291,6 +292,29 @@ describe("a failed save does not buy a new model call", () => {
     const again = await drain({ now: () => new Date(T0 + 300_000) })
     expect(again).toMatchObject({ saved: 0, failed: 0 })
     expect(compileCalls).toHaveLength(1)
+  })
+
+  it("a save refused by the gas ceiling is transient: job stays, backoff applies, reason logged (R3-1)", async () => {
+    const { home, job, drain, drainLog, compileCalls } = setup()
+    let calls = 0
+    const save: typeof saveCheckpoint = async () => {
+      calls += 1
+      if (calls === 1) throw new MidaError("GAS_CEILING_EXCEEDED", "context.register: estimate 700000 exceeds ceiling 650000")
+      return { contextId: `0x${"cd".repeat(32)}`, transactionHash: null, milliseconds: 1, duplicate: false }
+    }
+    job({ event: "Stop" }, T0)
+    const failed = await drain({ save, now: () => new Date(T0 + 120_000) })
+    expect(failed).toMatchObject({ saved: 0, failed: 1 })
+    expect(listJobs(home)).toHaveLength(1)
+    expect(drainLog()).toContain('"reason":"gas-ceiling"')
+    // inside the backoff window the job waits untouched
+    const held = await drain({ save, now: () => new Date(T0 + 120_000 + 60_000) })
+    expect(held).toMatchObject({ skippedTooSoon: 1, failed: 0 })
+    // past the backoff the retry saves on the cached envelope — no second compile
+    const retried = await drain({ save, now: () => new Date(T0 + 120_000 + 121_000) })
+    expect(retried).toMatchObject({ saved: 1, failed: 0 })
+    expect(compileCalls).toHaveLength(1)
+    expect(calls).toBe(2)
   })
 
   it("a checkpoint the compiler calls invalid is retried, not dropped on the spot (C3)", async () => {

@@ -470,31 +470,35 @@ export class MidaAgent {
       ciphertext: hexOf(sealed.ciphertext),
       capabilityId: args.capability.capabilityId,
     })
-    const receipt = await sendContract(this.#chain, {
-      address: deployment.contextRegistry,
-      abi: contextRegistryAbi,
-      functionName: "register",
-      args: [
-        args.owner,
-        [
-          {
-            contextId,
-            objectNonce,
-            namespaceId: args.namespaceId,
-            expectedParentId: args.expectedParentId,
-            manifestHash: sealed.manifestHash,
-            ciphertextCommitment: sealed.ciphertextCommitment,
-            evidenceCommitment: references.length === 0 ? zeroHash : evidenceCommitment(references),
-            readEpoch,
-            expiresAt: input.expiresAt ?? 0n,
-            recordType: RECORD_TYPE.CONTEXT,
-            lineagePolicy: LINEAGE_POLICY.STANDARD,
-            kind: CONTEXT_KIND[input.kind],
-            provenanceSource: PROVENANCE_SOURCE[input.source],
-          },
+    const receipt = await sendContract(
+      this.#chain,
+      {
+        address: deployment.contextRegistry,
+        abi: contextRegistryAbi,
+        functionName: "register",
+        args: [
+          args.owner,
+          [
+            {
+              contextId,
+              objectNonce,
+              namespaceId: args.namespaceId,
+              expectedParentId: args.expectedParentId,
+              manifestHash: sealed.manifestHash,
+              ciphertextCommitment: sealed.ciphertextCommitment,
+              evidenceCommitment: references.length === 0 ? zeroHash : evidenceCommitment(references),
+              readEpoch,
+              expiresAt: input.expiresAt ?? 0n,
+              recordType: RECORD_TYPE.CONTEXT,
+              lineagePolicy: LINEAGE_POLICY.STANDARD,
+              kind: CONTEXT_KIND[input.kind],
+              provenanceSource: PROVENANCE_SOURCE[input.source],
+            },
+          ],
         ],
-      ],
-    })
+      },
+      "context.register",
+    )
     const record = await this.#reader.getRecord(contextId)
     if (record === null) throw new MidaError("COMMITMENT_MISMATCH", "the registered record is missing after the transaction")
     return { ...this.#toObject(record, args.name, payload), transactionHash: receipt.transactionHash }

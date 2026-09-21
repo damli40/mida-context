@@ -116,7 +116,7 @@ describe("Context API routes (plan Task 24)", () => {
             },
           ],
         ],
-      })
+      }, "context.register")
     return { upload, contextId, register }
   }
 

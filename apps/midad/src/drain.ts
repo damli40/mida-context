@@ -460,6 +460,9 @@ function failureCode(error: unknown): string {
     isMidaError(error, "CAPABILITY_DENIED") || isMidaError(error, "CAPABILITY_EXPIRED") ||
     isMidaError(error, "CAPABILITY_REVOKED")
   ) return "not-approved"
+  // a refused send is transient: the ceiling may pass on retry after the queue settles or the
+  // estimate changes — the job stays and the usual backoff applies (R3-1)
+  if (isMidaError(error, "GAS_CEILING_EXCEEDED")) return "gas-ceiling"
   if (error instanceof Error) {
     const code = (error as { code?: unknown }).code
     if (typeof code === "string" && PERMANENT_FAILURES.has(code)) return code

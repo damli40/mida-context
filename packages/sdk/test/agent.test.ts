@@ -128,7 +128,7 @@ describe("MidaAgent (plan Task 25)", () => {
           },
         ],
       ],
-    })
+    }, "context.register")
     return evidenceId
   }
 

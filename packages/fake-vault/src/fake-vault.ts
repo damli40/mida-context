@@ -53,7 +53,7 @@ import {
   sendContract,
   toMidaError,
 } from "@mida/chain"
-import type { WriteContext } from "@mida/chain"
+import type { TxKind, WriteContext } from "@mida/chain"
 import { POLICY_HASH_V1, adviseGrant, assertFinalSelection } from "@mida/grant-advisor"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { parseEventLogs, zeroHash } from "viem"
@@ -175,13 +175,13 @@ export class FakeVaultAuthority implements VaultAuthority {
 
   async registerOwnerKey(): Promise<Hex> {
     const { qx, qy } = this.p256PublicKey
-    return (await this.#sendCapability("registerP256Key", [qx, qy])).transactionHash
+    return (await this.#sendCapability("owner.key", "registerP256Key", [qx, qy])).transactionHash
   }
 
   async initializeNamespace(namespace: string): Promise<Hex> {
     const id = toNamespaceId(canonicalizeNamespace(namespace))
     const keys = await this.#epochKeys(id, 1n)
-    return (await this.#sendCapability("initializeReadEpoch", [id, hexOf(keys.publicKey)])).transactionHash
+    return (await this.#sendCapability("epoch.init", "initializeReadEpoch", [id, hexOf(keys.publicKey)])).transactionHash
   }
 
   async approveGrant(request: GrantRequest): Promise<GrantApproval> {
@@ -232,7 +232,7 @@ export class FakeVaultAuthority implements VaultAuthority {
       expiresAt: selected.expiresAt,
       grantNonce: nonce,
     })
-    const receipt = await this.#sendCapability("grantBatch", [
+    const receipt = await this.#sendCapability("grant.batch", "grantBatch", [
       toAccessRequestStruct(accessRequest),
       selected.scopes,
       selected.expiresAt,
@@ -326,12 +326,12 @@ export class FakeVaultAuthority implements VaultAuthority {
       const endsRead = live && (capability.permissions & PERMISSION.READ) !== 0
       const { intentId } = await this.#api.requestRevocationDeny({ capabilityId: request.capabilityId })
       if (!endsRead) {
-        const receipt = await this.#sendCapability("revoke", [request.capabilityId])
+        const receipt = await this.#sendCapability("revoke.capability", "revoke", [request.capabilityId])
         return { intentId, transactionHash: receipt.transactionHash, rotated: [] }
       }
       const next = (await this.#readCapability<bigint>("requiredReadEpoch", [this.owner, capability.namespaceId])) + 1n
       const keys = await this.#epochKeys(capability.namespaceId, next)
-      const receipt = await this.#sendCapability("revokeAndRotate", [request.capabilityId, hexOf(keys.publicKey)])
+      const receipt = await this.#sendCapability("revoke.rotate", "revokeAndRotate", [request.capabilityId, hexOf(keys.publicKey)])
       return { intentId, transactionHash: receipt.transactionHash, rotated: [{ namespaceId: capability.namespaceId, readEpoch: next }] }
     }
 
@@ -352,7 +352,7 @@ export class FakeVaultAuthority implements VaultAuthority {
       rotated.push({ namespaceId, readEpoch: next })
     }
     const { intentId } = await this.#api.requestRevocationDeny({ owner: this.owner, agentId: request.agentId })
-    const receipt = await this.#sendCapability("revokeAgentAndRotate", [request.agentId, rotations])
+    const receipt = await this.#sendCapability("revoke.agent", "revokeAgentAndRotate", [request.agentId, rotations])
     return { intentId, transactionHash: receipt.transactionHash, rotated }
   }
 
@@ -360,7 +360,7 @@ export class FakeVaultAuthority implements VaultAuthority {
   async rotateExpiredEpoch(namespaceId: Hex): Promise<{ transactionHash: Hex; readEpoch: bigint }> {
     const next = (await this.#readCapability<bigint>("requiredReadEpoch", [this.owner, namespaceId])) + 1n
     const keys = await this.#epochKeys(namespaceId, next)
-    const receipt = await this.#sendCapability("rotateExpiredEpoch", [namespaceId, hexOf(keys.publicKey)])
+    const receipt = await this.#sendCapability("epoch.rotateExpired", "rotateExpiredEpoch", [namespaceId, hexOf(keys.publicKey)])
     return { transactionHash: receipt.transactionHash, readEpoch: next }
   }
 
@@ -415,7 +415,7 @@ export class FakeVaultAuthority implements VaultAuthority {
       manifest: sealed.manifest,
       ciphertext: hexOf(sealed.ciphertext),
     })
-    const receipt = await this.#send(contextRegistryAbi, deployment.contextRegistry, "register", [
+    const receipt = await this.#send("context.register", contextRegistryAbi, deployment.contextRegistry, "register", [
       this.owner,
       [
         {
@@ -465,11 +465,11 @@ export class FakeVaultAuthority implements VaultAuthority {
     }
   }
 
-  #sendCapability(functionName: string, args: readonly unknown[]): Promise<TransactionReceipt> {
-    return this.#send(capabilityRegistryAbi, this.#chain.deployment.capabilityRegistry, functionName, args)
+  #sendCapability(kind: TxKind, functionName: string, args: readonly unknown[]): Promise<TransactionReceipt> {
+    return this.#send(kind, capabilityRegistryAbi, this.#chain.deployment.capabilityRegistry, functionName, args)
   }
 
-  #send(abi: Abi, address: Address, functionName: string, args: readonly unknown[]): Promise<TransactionReceipt> {
-    return sendContract(this.#chain, { address, abi, functionName, args })
+  #send(kind: TxKind, abi: Abi, address: Address, functionName: string, args: readonly unknown[]): Promise<TransactionReceipt> {
+    return sendContract(this.#chain, { address, abi, functionName, args }, kind)
   }
 }
