@@ -4,7 +4,12 @@
 // must refuse rather than throw, and an `authorization` field smuggled under the other wire name.
 
 import { describe, expect, it } from "vitest"
+import { createClient, custom } from "viem"
 import type { Hex } from "viem"
+import { toSimple7702SmartAccount } from "viem/account-abstraction"
+import { privateKeyToAccount } from "viem/accounts"
+import { to7702SimpleSmartAccount } from "permissionless/accounts"
+import { monadTestnet } from "viem/chains"
 import { checkUserOperation, checkedParams, decodeCalls } from "../src/policy.js"
 import type { ChainQueries } from "../src/policy.js"
 import {
@@ -71,6 +76,9 @@ describe("decodeCalls", () => {
   })
 })
 
+const EIP7702_MARKER = "0x7702"
+const EIP7702_MARKER_PADDED = "0x7702000000000000000000000000000000000000"
+
 describe("checkUserOperation — sender and factory", () => {
   it("accepts a valid operation", async () => {
     expect(await checkUserOperation(validUserOp(), policyEnv, neverCalled)).toBeNull()
@@ -81,7 +89,33 @@ describe("checkUserOperation — sender and factory", () => {
     expect(await refused(validUserOp({ sender: 42 }))).toBe("sender")
   })
 
-  it("refuses any factory or initCode", async () => {
+  it("accepts the EIP-7702 factory marker — bare or 20-byte padded — with a valid authorization", async () => {
+    expect(await checkUserOperation(validUserOp({ factory: EIP7702_MARKER }), policyEnv, neverCalled)).toBeNull()
+    expect(await checkUserOperation(validUserOp({ factory: EIP7702_MARKER_PADDED }), policyEnv, neverCalled)).toBeNull()
+  })
+
+  it("accepts the packed initCode marker with a valid authorization — and nothing appended", async () => {
+    expect(await checkUserOperation(validUserOp({ initCode: EIP7702_MARKER_PADDED }), policyEnv, neverCalled)).toBeNull()
+    expect(await refused(validUserOp({ initCode: `${EIP7702_MARKER_PADDED}abcd` }))).toBe("factory")
+    expect(await refused(validUserOp({ initCode: EIP7702_MARKER }))).toBe("factory")
+  })
+
+  it("refuses the marker without an eip7702Auth — on-chain delegation is not a substitute", async () => {
+    expect(await refused(validUserOp({ factory: EIP7702_MARKER, eip7702Auth: undefined }), delegated())).toBe("factory")
+    // An `authorization` field under the other wire name does not unlock the marker either.
+    expect(
+      await refused(validUserOp({ factory: EIP7702_MARKER, eip7702Auth: undefined, authorization: validAuth() }), delegated()),
+    ).toBe("factory")
+  })
+
+  it("refuses factoryData even alongside the marker — EntryPoint would call the sender with it", async () => {
+    expect(await refused(validUserOp({ factory: EIP7702_MARKER, factoryData: "0x1234" }))).toBe("factory")
+    expect(await refused(validUserOp({ initCode: EIP7702_MARKER_PADDED, factoryData: "0x1234" }))).toBe("factory")
+  })
+
+  it("refuses a marker-looking prefix on a longer factory address, and any other non-empty factory", async () => {
+    expect(await refused(validUserOp({ factory: `0x7702${"dead".repeat(9)}` }))).toBe("factory")
+    expect(await refused(validUserOp({ factory: "0x7702aa" }))).toBe("factory")
     expect(await refused(validUserOp({ factory: randomAddress() }))).toBe("factory")
     expect(await refused(validUserOp({ initCode: "0x1234" }))).toBe("factory")
     expect(await refused(validUserOp({ factoryData: "0x1234" }))).toBe("factory")
@@ -89,6 +123,53 @@ describe("checkUserOperation — sender and factory", () => {
 
   it("accepts empty factory fields", async () => {
     expect(await checkUserOperation(validUserOp({ factory: ZERO, factoryData: "0x", initCode: "0x" }), policyEnv, neverCalled)).toBeNull()
+  })
+})
+
+describe("checkUserOperation — operations built by the real account libraries", () => {
+  const owner = privateKeyToAccount(`0x${"01".repeat(32)}`)
+  // A chain stub answering the only reads the account builders make: getCode (undeployed) and ids.
+  const fakeChain = createClient({
+    chain: monadTestnet,
+    transport: custom({
+      async request({ method }) {
+        if (method === "eth_getCode") return "0x"
+        if (method === "eth_chainId") return CHAIN_ID_HEX
+        if (method === "eth_getTransactionCount") return "0x0"
+        throw new Error(`unexpected chain call: ${method}`)
+      },
+    }),
+  })
+
+  it("viem's toSimple7702SmartAccount emits the 0x7702 marker — and the policy accepts the op it builds", async () => {
+    const account = await toSimple7702SmartAccount({ client: fakeChain, owner })
+    const { factory, factoryData } = await account.getFactoryArgs()
+    expect(factory).toBe(EIP7702_MARKER)
+    expect(factoryData).toBe("0x")
+    const op = validUserOp({
+      sender: await account.getAddress(),
+      callData: await account.encodeCalls([{ to: CAP, value: 0n, data: midaCallData() }]),
+      factory,
+      factoryData,
+      // The signed authorization object, passed through exactly as the library produced it.
+      eip7702Auth: await owner.signAuthorization({ contractAddress: IMPL, chainId: 10143, nonce: 0 }),
+    })
+    expect(await checkUserOperation(op, policyEnv, neverCalled)).toBeNull()
+  })
+
+  it("permissionless's to7702SimpleSmartAccount emits no factory — the authorization carries it", async () => {
+    const account = await to7702SimpleSmartAccount({ client: fakeChain, owner })
+    const { factory, factoryData } = await account.getFactoryArgs()
+    expect(factory).toBeUndefined()
+    expect(factoryData).toBeUndefined()
+    const op = validUserOp({
+      sender: await account.getAddress(),
+      callData: await account.encodeCalls([{ to: CAP, value: 0n, data: midaCallData() }]),
+      factory,
+      factoryData,
+      eip7702Auth: await owner.signAuthorization({ contractAddress: IMPL, chainId: 10143, nonce: 0 }),
+    })
+    expect(await checkUserOperation(op, policyEnv, neverCalled)).toBeNull()
   })
 })
 

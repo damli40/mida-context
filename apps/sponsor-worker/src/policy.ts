@@ -15,6 +15,17 @@ export const ENTRY_POINT_V0_8 = "0x4337084d9e255ff0702461cf8895ce9e3b5ff108"
 
 export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 export const EIP7702_DELEGATION_PREFIX = "0xef0100"
+/**
+ * The factory marker a FIRST user operation carries when its accompanying EIP-7702 authorization
+ * deploys the sender's account in the same transaction. viem emits it bare (`0x7702`) and packs it
+ * right-padded to 20 bytes inside `initCode` — both forms confirmed in the installed source at
+ * `node_modules/viem/_esm/account-abstraction/utils/userOperation/getInitCode.js` lines 5–14.
+ * It is only meaningful alongside a real `eip7702Auth`, and `factoryData` must stay empty — with
+ * the marker, EntryPoint calls the SENDER with those bytes as an initialisation call the
+ * inner-call rules would never see.
+ */
+const EIP7702_FACTORY_MARKER = "0x7702"
+const EIP7702_FACTORY_MARKER_PADDED = "0x7702000000000000000000000000000000000000"
 export const MAX_INNER_CALLS = 8
 
 /**
@@ -272,13 +283,6 @@ export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: Cha
     }
     const sender = (uo.sender as string).toLowerCase()
 
-    // Rule 4: a 7702 sender is never deployed by a factory.
-    for (const field of ["factory", "initCode", "factoryData"]) {
-      if (!emptyField(uo[field])) {
-        refuse("factory", `refused: ${field} must be empty — a delegated user operation is never deployed by a factory`)
-      }
-    }
-
     // Rule 3: every authorization present must name this chain and an allowed implementation
     // (or the zero address for a delegation-clearing op); with none, the sender must already be
     // delegated on-chain to an allowed implementation.
@@ -286,11 +290,13 @@ export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: Cha
     for (const auth of auths) checkAuthorization(auth, env)
     // Only a real `eip7702Auth` stands in for the on-chain delegation read and only it confers
     // the zero-address clearing privilege — it is the field the bundler applies. (The malformed
-    // case already refused inside `authorizations`, so a non-null value here is an object.)
+    // case already refused inside `authorizations`, so a non-null value here is an object whose
+    // fields passed checkAuthorization.)
     const eipAuth = uo.eip7702Auth as Authorization | null | undefined
+    const hasValidEipAuth = eipAuth !== undefined && eipAuth !== null
     const authZeroDelegation =
       eipAuth != null && isAddress(eipAuth.address) && (eipAuth.address as string).toLowerCase() === ZERO_ADDRESS
-    if (eipAuth === undefined || eipAuth === null) {
+    if (!hasValidEipAuth) {
       let code: string
       try {
         code = await chain.getCode(sender)
@@ -305,6 +311,31 @@ export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: Cha
       if (!delegated) {
         refuse("auth", "refused: the sender is not delegated to an allowed smart-account implementation — include an eip7702Auth")
       }
+    }
+
+    // Rule 4: factory fields stay empty — except the EIP-7702 marker, bare or right-padded to 20
+    // bytes, and only when a valid eip7702Auth rides along. An on-chain delegation does not unlock
+    // it: the marker means "apply this authorization", so the authorization must be in the op.
+    if (!emptyField(uo.factory)) {
+      const factory = isHex(uo.factory) ? (uo.factory as string).toLowerCase() : ""
+      const isMarker = factory === EIP7702_FACTORY_MARKER || factory === EIP7702_FACTORY_MARKER_PADDED
+      if (!isMarker || !hasValidEipAuth) {
+        refuse(
+          "factory",
+          "refused: factory must be empty — or exactly the EIP-7702 marker alongside a valid authorization",
+        )
+      }
+    }
+    if (!emptyField(uo.initCode)) {
+      const initCode = isHex(uo.initCode) ? (uo.initCode as string).toLowerCase() : ""
+      if (initCode !== EIP7702_FACTORY_MARKER_PADDED || !hasValidEipAuth) {
+        refuse("factory", "refused: initCode must be empty — or exactly the 20-byte EIP-7702 marker, nothing appended")
+      }
+    }
+    // With the marker, EntryPoint calls the sender with factoryData as an initialisation call —
+    // bytes the inner-call rules never see. It stays empty, always.
+    if (!emptyField(uo.factoryData)) {
+      refuse("factory", "refused: factoryData must be empty — a delegated user operation is never initialised by a factory call")
     }
 
     // Rule 5: Monad bills the gas limit in full, so every gas field is capped.
