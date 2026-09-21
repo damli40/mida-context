@@ -5,8 +5,8 @@ import { createPublicClient, http } from "viem"
 import { assertHex } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import type { Deployment } from "@mida/chain"
-import { RegistryReader, createContextApi } from "@mida/api"
-import type { RequestLimiter, StoreLimits } from "@mida/api"
+import { AUTH_HEADERS, MANIFEST_VERIFY_CACHE_SECONDS, RegistryReader, createContextApi } from "@mida/api"
+import type { StoreLimits } from "@mida/api"
 import { d1Stores, runSweep } from "./index.js"
 import type { D1Like } from "./d1.js"
 
@@ -101,18 +101,7 @@ function buildWorker(env: WorkerEnv): Built {
   const publicClient = createPublicClient({ transport: http(rpcUrl) })
   const reader = new RegistryReader({ publicClient, deployment })
   const stores = d1Stores(env.DB)
-  // The ratelimit bindings are optional: a binding-less dev worker limits nothing, and a self-hosted
-  // deployment that passes no bindings still gets every other protection.
-  const limiter: RequestLimiter | undefined =
-    env.LIMITER_SIGNED === undefined && env.LIMITER_UNSIGNED === undefined
-      ? undefined
-      : {
-          check: async ({ ip, signed }) => {
-            const binding = signed ? env.LIMITER_SIGNED : env.LIMITER_UNSIGNED
-            return binding === undefined ? true : (await binding.limit({ key: ip })).success
-          },
-        }
-  const { app, limits } = createContextApi({ reader, deployment, stores, limiter })
+  const { app, limits } = createContextApi({ reader, deployment, stores })
   built = { env, value: { app, reader, stores, deployment, limits } }
   return built.value
 }
@@ -150,6 +139,14 @@ function withCors(response: Response): Response {
 const ROOT_NOTICE =
   "This server stores ciphertext only. It holds no keys and cannot read what it stores. Source: <repo url placeholder>"
 
+/**
+ * The per-IP request budgets the [[ratelimits]] bindings in wrangler.toml enforce — kept here for GET / to
+ * report. A binding that is absent reports null: nothing on the worker limits that bucket then, which is
+ * what a binding-less dev deployment should say about itself.
+ */
+const RATE_LIMIT_SIGNED_PER_MINUTE = 120
+const RATE_LIMIT_UNSIGNED_PER_MINUTE = 20
+
 /** Exported for tests: the same request path `fetch` runs, with logging and CORS wrapped around the app. */
 export async function handleRequest(env: WorkerEnv, request: Request): Promise<Response> {
   const started = Date.now()
@@ -159,6 +156,21 @@ export async function handleRequest(env: WorkerEnv, request: Request): Promise<R
   let bytes = 0
   try {
     const { app, deployment, limits } = buildWorker(env)
+    // The per-IP budget is checked here, at the edge of every route — including OPTIONS and GET /, which
+    // never reach the app's own middleware. Each request consumes exactly one token: signed traffic
+    // (a signature header is present) against the 120/min binding, anonymous traffic against the 20/min
+    // one. A binding that is absent limits nothing — a self-hosted deployment limits at its proxy.
+    const signed = request.headers.get(AUTH_HEADERS.signature) !== null
+    const binding = signed ? env.LIMITER_SIGNED : env.LIMITER_UNSIGNED
+    if (binding !== undefined) {
+      const ip = request.headers.get("cf-connecting-ip") ?? "unknown"
+      if (!(await binding.limit({ key: ip })).success) {
+        status = 429
+        const payload = JSON.stringify({ error: { code: "RATE_LIMITED", message: "too many requests from this address — try again in a minute" } })
+        bytes = payload.length
+        return withCors(new Response(payload, { status, headers: { "content-type": "application/json", "retry-after": "60" } }))
+      }
+    }
     if (request.method === "OPTIONS") {
       status = 204
       return new Response(null, { status, headers: CORS_HEADERS })
@@ -171,6 +183,11 @@ export async function handleRequest(env: WorkerEnv, request: Request): Promise<R
         capabilityRegistry: deployment.capabilityRegistry,
         contextRegistry: deployment.contextRegistry,
         limits,
+        manifestVerifyCacheSeconds: Number(MANIFEST_VERIFY_CACHE_SECONDS),
+        rateLimitsPerMinute: {
+          signed: env.LIMITER_SIGNED === undefined ? null : RATE_LIMIT_SIGNED_PER_MINUTE,
+          unsigned: env.LIMITER_UNSIGNED === undefined ? null : RATE_LIMIT_UNSIGNED_PER_MINUTE,
+        },
         notice: ROOT_NOTICE,
       })
       status = 200

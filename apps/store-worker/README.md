@@ -21,13 +21,19 @@ decides what is allowed; the server can only ever be stricter, never looser.
 
 **It can:**
 
-- **Refuse ciphertext.** It rejects uploads that are unsigned, malformed, over the size cap
-  (256 KB per object), over quota (2,000 PUTs per signer per day, 20 MB of unanchored ciphertext
-  per signer), or signed by someone the chain does not authorise — so it cannot be used as free
-  file hosting.
+- **Refuse ciphertext.** It rejects uploads that are unsigned, malformed, over the size caps
+  (1 MB per request body, 256 KB of ciphertext per object, 16 KB per agent-manifest envelope),
+  over quota (2,000 object PUTs and 20 manifest PUTs per signer per day, 20 MB of unanchored
+  ciphertext per signer), or signed by someone the chain does not authorise — so it cannot be
+  used as free file hosting. `GET /` reports every one of these limits.
+- **Throttle callers.** Two Cloudflare `[[ratelimits]]` bindings give every route a per-IP
+  budget keyed on `CF-Connecting-IP`: 120 requests a minute for signed traffic, 20 a minute for
+  anonymous traffic — including `GET /` and CORS preflights. A refusal is 429 with
+  `Retry-After: 60`.
 - **Delete ciphertext.** Pending uploads that the chain never anchors are swept after 24 hours,
-  and expired request nonces are swept with them. The operator can also delete rows directly;
-  deleting data only makes objects disappear — it can never make new ones valid.
+  and expired request nonces are swept with them — as are agent-manifest envelopes whose agent
+  never registered. The operator can also delete rows directly; deleting data only makes objects
+  disappear — it can never make new ones valid.
 
 **It cannot:**
 
@@ -95,12 +101,31 @@ against a real Cloudflare account.
   where the pending cap is a single conditional `INSERT` and atomic across instances.
 - **`nodejs_compat` is on, deliberately.** The shared `@mida/api` package re-exports its
   file-backed stores (`node:fs`/`node:path`), so the bundler sees Node imports. The Worker always
-  injects the D1 stores; those code paths never execute.
-- **`import.meta.url` is defined in `wrangler.toml`, deliberately.** `@mida/chain`'s barrel
-  computes two directory constants at module scope from `import.meta.url`, which is not a URL in
-  workerd; the define keeps that dead code from crashing startup.
+  injects the D1 stores; those code paths never execute. `@mida/chain`'s directory constants
+  resolve lazily on first call, so the bundle's module scope touches no `import.meta.url` — no
+  `[define]` shim is needed or present.
+- **Manifest reads are cheap for verified agents.** `GET /agent-manifests/:bodyHash` re-verifies
+  the envelope against Monad only when the row's verified mark is older than 60 seconds; inside
+  the window it serves without a chain read. The consequence to know: an agent removed on chain
+  keeps being served for up to 60 seconds after its last verification — that number is the worst
+  case, and it is the same `manifestVerifyCacheSeconds` `GET /` reports. Failed verifications
+  are never cached.
 - **Check `GET /` after deploying.** It returns the deployment's chain id, the two registry
-  addresses, the enforced limits, and a sentence telling callers this server stores ciphertext
-  only.
+  addresses, every enforced limit, the 60-second manifest cache window, the per-IP budgets the
+  bindings are configured with (`null` where a binding is absent), and a sentence telling
+  callers this server stores ciphertext only.
 - **Logs are safe by construction.** Method, path template, status, byte count and duration —
   never a request body, a signature, a full address or a full hash.
+
+### Self-hosting on a public address
+
+Running this Worker is one way to self-host; the other is the plain Node server (`createContextApi`
+with `dataDir`, the same app the CLI runs). If you put that Node server on a public address you get
+the identical application rules — same signatures, quotas, sweeps and capability checks — but you
+lose everything Cloudflare's edge provides here for free: per-IP rate limiting applied before your
+code runs (the Node app takes an optional `limiter` hook and ships with none — put your own reverse
+proxy with a request budget in front, or anonymous traffic reaches your process unfiltered), TLS
+termination at the edge, DDoS absorption, and D1's atomic quotas across instances (the file store's
+pending-byte check is atomic inside one process only — one process per data directory, as above).
+A bare Node server on a public address without a limiting proxy is not a safe deployment of this
+code.

@@ -411,6 +411,19 @@ describe("the worker entry", () => {
     const passed = await handleRequest(limitedEnv, signedRequest)
     expect(passed.status).toBe(401)
     expect(calls.signed).toEqual(["192.0.2.4"])
+
+    // GET / is a route like any other: the same unsigned binding gates it before the app is asked.
+    expect((await handleRequest(limitedEnv, new Request("http://worker.test/"))).status).toBe(429)
+
+    // With both bindings present and permitting, GET / advertises the budgets wrangler.toml configures.
+    const openEnv: WorkerEnv = {
+      ...env(db, rpc.url),
+      LIMITER_SIGNED: { limit: async () => ({ success: true }) },
+      LIMITER_UNSIGNED: { limit: async () => ({ success: true }) },
+    }
+    const root = await handleRequest(openEnv, new Request("http://worker.test/"))
+    expect(root.status).toBe(200)
+    expect(((await root.json()) as Record<string, unknown>)["rateLimitsPerMinute"]).toEqual({ signed: 120, unsigned: 20 })
   })
 
   it("GET / reports the deployment, the shared limits and the ciphertext-only sentence", async () => {
@@ -432,6 +445,10 @@ describe("the worker entry", () => {
       maxManifestPutsPerSignerPerDay: 20,
       maxRequestBodyBytes: 1_048_576,
     })
+    // The 60-second manifest verification cache is advertised; a removed agent disappears within it.
+    expect(body["manifestVerifyCacheSeconds"]).toBe(60)
+    // This Miniflare env binds no [[ratelimits]], so the worker honestly reports no per-IP budget.
+    expect(body["rateLimitsPerMinute"]).toEqual({ signed: null, unsigned: null })
     expect(body["notice"]).toBe(
       "This server stores ciphertext only. It holds no keys and cannot read what it stores. Source: <repo url placeholder>",
     )
