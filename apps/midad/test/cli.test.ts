@@ -12,7 +12,8 @@ describe("the crude mida command", () => {
   let network: Network
   let home: MidaHome
   const lines: string[] = []
-  const run = (...argv: string[]) => runCli(argv, { home, network, print: (line) => lines.push(line) })
+  // the prompt dep stands in for a human typing at the terminal — every approve here answers yes
+  const run = (...argv: string[]) => runCli(argv, { home, network, print: (line) => lines.push(line), prompt: async () => "yes" })
 
   beforeAll(async () => {
     env = await localEnvironment()
@@ -47,7 +48,7 @@ describe("the crude mida command", () => {
   it("kicks the daemon after a successful approve and revoke so the service notices, and never otherwise", async () => {
     const kicks: string[] = []
     const kick = () => (kicks.push("x"), Promise.resolve())
-    const run2 = (...argv: string[]) => runCli(argv, { home, network, print: () => {}, kickDaemon: kick })
+    const run2 = (...argv: string[]) => runCli(argv, { home, network, print: () => {}, kickDaemon: kick, prompt: async () => "yes" })
     // request grants nothing by itself — no kick
     expect(await run2("request", "claude-code")).toBe(0)
     expect(kicks).toHaveLength(0)
@@ -60,6 +61,32 @@ describe("the crude mida command", () => {
     expect(kicks).toHaveLength(2)
     // undo the revoke so the last test's home still has a live agent
     expect(await run2("request", "claude-code")).toBe(0)
+    expect(await run2("approve", "claude-code")).toBe(0)
+  }, 300_000)
+
+  it("approve prints the ask and the advice, waits for 'yes', and signs nothing without it", async () => {
+    const lines: string[] = []
+    const asked: string[] = []
+    const answers: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async (question) => { asked.push(question); return answers.shift() ?? "" },
+      })
+    // claude-code is live from the tests above; a fresh ask needs a revoked agent first
+    expect(await run2("revoke", "claude-code")).toBe(0)
+    expect(await run2("request", "claude-code")).toBe(0)
+    answers.push("no")
+    expect(await run2("approve", "claude-code")).toBe(1)
+    // the owner saw the request, the advisor's read on it, and the question — then declined
+    expect(lines.some((line) => line.includes("claude-code is asking for"))).toBe(true)
+    expect(lines.some((line) => line.includes("grant advisor"))).toBe(true)
+    expect(asked).toEqual(["Type yes to approve: "])
+    expect(lines).toContain("not approved")
+    // nothing was signed: the pending request is still there, waiting
+    expect(home.has("agents/claude-code/pending-request.json")).toBe(true)
+    // an explicit yes signs
+    answers.push("yes")
     expect(await run2("approve", "claude-code")).toBe(0)
   }, 300_000)
 

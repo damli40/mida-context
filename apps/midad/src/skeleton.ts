@@ -196,7 +196,7 @@ export async function requestAccess(runtime: ServiceRuntime, name: string): Prom
  * approved-projects list for an agent the chain already approves.
  */
 export type ApprovePreview =
-  | { kind: "grant"; agent: string; scopes: RequestedScope[]; expiresAt: bigint; advice: GrantAdvice }
+  | { kind: "grant"; agent: string; requested: RequestedScope[]; scopes: RequestedScope[]; expiresAt: bigint; advice: GrantAdvice }
   | { kind: "project"; agent: string; projectId: string }
 
 /** The owner saw the ask and did not type yes. Coded so the CLI can print "not approved" and exit 1. */
@@ -273,7 +273,7 @@ export async function approve(
   // confirm gets past this point. The question and the answer live in the CLI, which injects it.
   if (confirm !== undefined) {
     const advice = await grantAdviceFor(runtime, pending.request, identity.manifest)
-    if (!(await confirm({ kind: "grant", agent: name, scopes: needed, expiresAt: decodeUint64(pending.request.capabilityExpiresAt), advice }))) throw notApprovedError()
+    if (!(await confirm({ kind: "grant", agent: name, requested: pending.request.scopes, scopes: needed, expiresAt: decodeUint64(pending.request.capabilityExpiresAt), advice }))) throw notApprovedError()
   }
   // A READ grant that expired closes the namespace's write epoch (§7.3): grantBatch reverts
   // EpochRotationRequired until the owner rotates it, and every surviving reader then needs a wrap

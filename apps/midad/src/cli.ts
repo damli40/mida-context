@@ -2,6 +2,9 @@ import { spawn } from "node:child_process"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { createInterface } from "node:readline"
+import { decodeUint64, namespaceById } from "@mida/protocol"
+import { permissionNames } from "@mida/grant-advisor"
 import { callDaemon, ensureDaemon } from "./control.js"
 import { runDoctor, runDoctorLive } from "./doctor.js"
 import { MidaHome } from "./home.js"
@@ -47,6 +50,11 @@ export interface CliDeps {
    * running cannot be kicked, and a failed kick never fails the command. Injectable in tests.
    */
   kickDaemon?: () => unknown | Promise<unknown>
+  /**
+   * Reads the one line `approve` waits on. The default asks the real terminal; tests inject an
+   * answer. There is no flag, file or environment variable that skips the question.
+   */
+  prompt?: (question: string) => Promise<string>
 }
 
 /**
@@ -162,7 +170,24 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       deps.print(result.kind === "remembered" ? `remembered ${result.contextId} in ${result.namespace}` : `refused: ${result.code}`)
       return result.kind === "remembered" ? 0 : 1
     } else if (command === "approve") {
-      const result = await approve(runtime, agent, deps.cwd)
+      const prompt = deps.prompt ?? terminalPrompt
+      const result = await approve(runtime, agent, deps.cwd, async (preview) => {
+        if (preview.kind === "project") {
+          deps.print(`${preview.agent} already holds a live grant; this lists it for project ${preview.projectId}`)
+        } else {
+          deps.print(`${preview.agent} is asking for:`)
+          for (const scope of preview.requested) {
+            deps.print(`  ${namespaceById(scope.namespaceId).name}: ${permissionNames(scope.permissions).join(" + ")}`)
+          }
+          deps.print(`  until ${new Date(Number(preview.expiresAt) * 1000).toISOString()}`)
+          if (preview.scopes.length < preview.requested.length) {
+            deps.print(`  ${preview.requested.length - preview.scopes.length} scope(s) are already granted on chain; only the missing ones are signed`)
+          }
+          deps.print(`grant advisor: ${preview.advice.risk} risk; recommends ${preview.advice.recommended.length} scope(s) until ${new Date(Number(decodeUint64(preview.advice.recommendedExpiresAt)) * 1000).toISOString()}`)
+          for (const warning of preview.advice.warnings) deps.print(`  ${warning.severity}: ${warning.messageKey}`)
+        }
+        return (await prompt("Type yes to approve: ")).trim() === "yes"
+      })
       deps.print(
         result.transactionHash === null
           ? `approved ${agent} for project ${result.projectId}; the on-chain grant was already live`
@@ -183,11 +208,27 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     }
     return 0
   } catch (error) {
-    // The error code only. A message from a deeper layer is never echoed: it could carry data.
     const code = (error as { code?: unknown }).code
+    // The owner saw the preview and answered something other than yes — nothing was signed.
+    if (code === "not-approved") {
+      deps.print("not approved")
+      return 1
+    }
+    // The error code only. A message from a deeper layer is never echoed: it could carry data.
     deps.print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
     return 1
   }
+}
+
+/** The real-terminal prompt — the only way `approve` gets its yes outside tests. */
+function terminalPrompt(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout })
+    rl.question(question, (answer) => {
+      rl.close()
+      resolve(answer)
+    })
+  })
 }
 
 /**
