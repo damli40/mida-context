@@ -1,5 +1,6 @@
 export * from "./auth.js"
 export * from "./authorize.js"
+export * from "./chain-budget.js"
 export * from "./chain-views.js"
 export * from "./client.js"
 export * from "./deny-overlay.js"

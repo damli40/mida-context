@@ -28,6 +28,7 @@ import { createMiddleware } from "hono/factory"
 import { isAddressEqual, zeroHash } from "viem"
 import { AUTH_HEADERS, assertAuthHeaderShape, authenticateRequest } from "./auth.js"
 import { authorizeAgent } from "./authorize.js"
+import { BudgetedReader, ChainReadBudgetExceeded, isChainReadBudgetExceeded } from "./chain-budget.js"
 import type { ContextRecordView, RegistryReader } from "./chain-views.js"
 import { DenyOverlay } from "./deny-overlay.js"
 import type { RevocationTarget } from "./deny-overlay.js"
@@ -55,9 +56,13 @@ export const MANIFEST_VERIFY_CACHE_SECONDS = 60n
  */
 export const MANIFEST_STAGING_FUTURE_SECONDS = 86_400n
 
-/** The pending-bytes quota re-checks unmarked uploads in batches of 8, at most this many chain reads per PUT. */
+/**
+ * The pending-bytes quota re-checks unmarked uploads in batches of 8, at most this many chain reads
+ * per PUT — and never more than the request's remaining budget after authorization
+ * (MAX_CHAIN_READS_PER_REQUEST bounds every route's total Monad reads).
+ */
 export const PENDING_CHECK_BATCH = 8
-export const PENDING_CHECK_MAX_READS = 40
+export const PENDING_CHECK_MAX_READS = 16
 
 /**
  * Per-IP request limiting, injected by the deployment. The hosted Worker's [[ratelimits]] bindings adapt
@@ -83,7 +88,7 @@ export interface ContextApiOptions {
   clock?: () => bigint
 }
 
-type Env = { Variables: { signer: Address; body: Uint8Array } }
+type Env = { Variables: { signer: Address; body: Uint8Array; chain: BudgetedReader } }
 
 /** §12.3: an object is served only once Monad holds matching commitments for it. */
 export function isAnchored(stored: StoredObject, record: ContextRecordView | null): boolean {
@@ -146,6 +151,11 @@ export function createContextApi(options: ContextApiOptions) {
     c.json({ error: { code: "QUOTA_EXCEEDED", message: `quota exceeded: ${limit} (${detail})` } }, 429)
 
   app.onError((error, c) => {
+    // A request that runs out of chain reads is refused as retryable — the platform's own
+    // subrequest ceiling (which would surface as a bare 500) is never reached.
+    if (isChainReadBudgetExceeded(error)) {
+      return c.json({ error: { code: error.code, message: error.message } }, 503, { "retry-after": "5" })
+    }
     const { status, body } = toErrorBody(error)
     return c.json(body, status as 400)
   })
@@ -182,6 +192,9 @@ export function createContextApi(options: ContextApiOptions) {
           replay,
         }),
       )
+      // One counting wrapper per request: every Monad read below — authorization, quota re-checks,
+      // list scans — spends from the same 30-read budget, never the platform's own ceiling.
+      c.set("chain", new BudgetedReader(reader))
       c.set("body", body)
       await next()
     })
@@ -192,6 +205,7 @@ export function createContextApi(options: ContextApiOptions) {
   // ---------- §12.2 object upload ----------
   app.put("/objects", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const signer = c.get("signer")
+    const chain = c.get("chain")
     const upload = parseObjectUpload(json(c.get("body")))
     namespaceById(upload.namespaceId)
     const { manifest } = upload
@@ -200,7 +214,7 @@ export function createContextApi(options: ContextApiOptions) {
     const isOwner = signer === upload.owner
     let authorId: Hex = OWNER_AUTHOR_ID
     if (!isOwner) {
-      const agentId = await reader.agentIdOfSigner(signer)
+      const agentId = await chain.agentIdOfSigner(signer)
       if (agentId === null) throw new MidaError("CAPABILITY_DENIED", "signer is neither the owner nor a registered agent")
       authorId = agentId
     }
@@ -236,23 +250,23 @@ export function createContextApi(options: ContextApiOptions) {
 
     // 5. the submitted epoch is current and writable
     const readEpoch = decodeUint64(manifest.readEpoch)
-    const required = await reader.requiredReadEpoch(upload.owner, upload.namespaceId)
+    const required = await chain.requiredReadEpoch(upload.owner, upload.namespaceId)
     if (readEpoch !== required) throw new MidaError("EPOCH_STALE", `object uses epoch ${readEpoch}; epoch ${required} is required`)
-    if (!(await reader.isWriteEpochValid(upload.owner, upload.namespaceId, required))) {
+    if (!(await chain.isWriteEpochValid(upload.owner, upload.namespaceId, required))) {
       throw new MidaError("EPOCH_ROTATION_REQUIRED", "the current epoch no longer accepts writes")
     }
 
     // 6. agent CREATE, or applicable supersession authority
     if (!isOwner) {
-      const base = { reader, overlay, signer, owner: upload.owner, capabilityId: upload.capabilityId, namespaceId: upload.namespaceId }
+      const base = { reader: chain, overlay, signer, owner: upload.owner, capabilityId: upload.capabilityId, namespaceId: upload.namespaceId }
       if (upload.expectedParentId === zeroHash) {
         await authorizeAgent({ ...base, permission: PERMISSION.CREATE })
       } else {
-        const parent = await reader.getRecord(upload.expectedParentId)
+        const parent = await chain.getRecord(upload.expectedParentId)
         if (parent === null || parent.owner !== upload.owner || parent.namespaceId !== upload.namespaceId) {
           throw new MidaError("NOT_FOUND", "expected parent is not a record of this owner and namespace")
         }
-        const ownLineage = (await reader.getRecord(parent.lineageId))?.author === authorId
+        const ownLineage = (await chain.getRecord(parent.lineageId))?.author === authorId
         try {
           await authorizeAgent({ ...base, permission: PERMISSION.SUPERSEDE_ANY })
         } catch (error) {
@@ -264,21 +278,23 @@ export function createContextApi(options: ContextApiOptions) {
 
     // 7. quotas: a signer may not use the store as free hosting. Only rows never marked anchored count
     // against the byte cap — an uploader's anchored history is skipped entirely. Each unmarked row is
-    // re-checked against Monad oldest-first, 8 at a time and at most 40 reads per request; a confirmed
-    // anchor marks the row once, permanently, and frees its bytes. Rows left unchecked still count as
-    // pending, so a flood of unconfirmed uploads cannot hide behind the read budget.
+    // re-checked against Monad oldest-first, 8 at a time and at most 16 reads — and never more than
+    // what authorization left of this request's chain budget. A confirmed anchor marks the row once,
+    // permanently, and frees its bytes. Rows left unchecked still count as pending, so a flood of
+    // unconfirmed uploads cannot hide behind the read budget.
     const alreadyStored = (await store.getObject(manifest.contextId))?.manifestHash === committedManifestHash
     const unmarked = await store.pendingByUploader(signer)
     let pendingBytes =
       (alreadyStored ? 0 : ciphertext.length) +
       unmarked.reduce((total, other) => (other.contextId === manifest.contextId ? total : total + other.manifest.ciphertextSize), 0)
     const anchoredNow = new Date(Number(clock()) * 1000).toISOString()
+    const checkBudget = Math.min(PENDING_CHECK_MAX_READS, chain.remaining)
     let scanned = 0
-    while (scanned < unmarked.length && pendingBytes > limits.maxPendingBytesPerSigner && scanned < PENDING_CHECK_MAX_READS) {
-      const batch = unmarked.slice(scanned, scanned + PENDING_CHECK_BATCH)
+    while (scanned < unmarked.length && pendingBytes > limits.maxPendingBytesPerSigner && scanned < checkBudget) {
+      const batch = unmarked.slice(scanned, Math.min(scanned + PENDING_CHECK_BATCH, checkBudget))
       const freed = await Promise.all(
         batch.map(async (other) => {
-          if (!isAnchored(other, await reader.getRecord(other.contextId))) return 0
+          if (!isAnchored(other, await chain.getRecord(other.contextId))) return 0
           await store.markAnchored(other.contextId, anchoredNow)
           return other.contextId === manifest.contextId ? 0 : other.manifest.ciphertextSize
         }),
@@ -287,11 +303,12 @@ export function createContextApi(options: ContextApiOptions) {
       pendingBytes -= freed.reduce((total, size) => total + size, 0)
     }
     if (pendingBytes > limits.maxPendingBytesPerSigner) {
-      const detail =
-        scanned < unmarked.length
-          ? "too many uploads waiting to be confirmed on chain"
-          : `unanchored ciphertext would reach ${pendingBytes} bytes`
-      return quotaExceeded(c, "maxPendingBytesPerSigner", detail)
+      if (scanned < unmarked.length) {
+        // Unexamined uploads remain and the bytes still exceed the cap — the quota verdict cannot be
+        // made inside this request's chain budget. That is a retryable refusal, not a breach.
+        throw new ChainReadBudgetExceeded("too many uploads waiting to be confirmed on chain to check within one request — retry in a few seconds")
+      }
+      return quotaExceeded(c, "maxPendingBytesPerSigner", `unanchored ciphertext would reach ${pendingBytes} bytes`)
     }
     const day = new Date().toISOString().slice(0, 10)
     const putCount = await store.recordPut(signer, day)
@@ -330,20 +347,29 @@ export function createContextApi(options: ContextApiOptions) {
   // ---------- §12.3 object read ----------
   app.get("/objects", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const signer = c.get("signer")
+    const chain = c.get("chain")
     const owner = address(c.req.query("owner"), "owner")
     const namespaceId = hex(c.req.query("namespaceId"), 32, "namespaceId")
     namespaceById(namespaceId)
     if (signer !== owner) {
-      await authorizeAgent({ reader, overlay, signer, owner, capabilityId: optionalCapability(c.req.query("capabilityId")), namespaceId, permission: PERMISSION.READ })
+      await authorizeAgent({ reader: chain, overlay, signer, owner, capabilityId: optionalCapability(c.req.query("capabilityId")), namespaceId, permission: PERMISSION.READ })
     }
     const objects: AnchoredObject[] = []
     const anchoredNow = new Date(Number(clock()) * 1000).toISOString()
+    let partial = false
     for (const stored of await store.listObjects(owner, namespaceId)) {
       // anchored_at records the first verified match; a Monad record cannot be un-registered, so only
       // an unmarked row asks the chain — and the first match is marked once, permanently. Every check
       // that decides who may read (capability, epoch, deny overlay) still runs per request above.
       if (stored.anchoredAt === null) {
-        if (!isAnchored(stored, await reader.getRecord(stored.contextId))) continue
+        // One read per unmarked row, bounded by what authorization left of the request budget. A row
+        // the budget cannot reach stays unexamined and unserved — flagged below, retried later: every
+        // row verified in this pass was marked, so a retry spends reads only on rows not yet seen.
+        if (chain.remaining <= 0) {
+          partial = true
+          continue
+        }
+        if (!isAnchored(stored, await chain.getRecord(stored.contextId))) continue
         await store.markAnchored(stored.contextId, anchoredNow)
       }
       objects.push({
@@ -356,21 +382,22 @@ export function createContextApi(options: ContextApiOptions) {
         ciphertext: hexOf(await store.blobs.get(stored.manifest.ciphertextHash)),
       })
     }
-    return c.json({ objects })
+    return c.json({ objects }, 200, partial ? { "x-mida-partial": "true" } : {})
   })
 
   app.get("/manifests/:contextId", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const signer = c.get("signer")
+    const chain = c.get("chain")
     const contextId = hex(c.req.param("contextId"), 32, "contextId")
     const stored = await store.getObject(contextId)
     if (stored === undefined) throw new MidaError("NOT_FOUND", "no anchored object")
     if (stored.anchoredAt === null) {
-      if (!isAnchored(stored, await reader.getRecord(contextId))) throw new MidaError("NOT_FOUND", "no anchored object")
+      if (!isAnchored(stored, await chain.getRecord(contextId))) throw new MidaError("NOT_FOUND", "no anchored object")
       await store.markAnchored(contextId, new Date(Number(clock()) * 1000).toISOString())
     }
     if (signer !== stored.owner) {
       await authorizeAgent({
-        reader,
+        reader: chain,
         overlay,
         signer,
         owner: stored.owner,
@@ -385,6 +412,7 @@ export function createContextApi(options: ContextApiOptions) {
   // ---------- §14.1 agent capability manifests (public metadata) ----------
   app.put("/agent-manifests", authenticated(limits.maxManifestBodyBytes), async (c) => {
     const signer = c.get("signer")
+    const chain = c.get("chain")
     const envelope = json<SignedAgentCapabilityManifest>(c.get("body"))
     if (envelope === null || typeof envelope !== "object" || typeof envelope.manifest !== "object" || typeof envelope.operatorSignature !== "string" || !/^0x[0-9a-f]{130}$/.test(envelope.operatorSignature)) {
       throw new MidaError("INVALID_WIRE", "envelope needs a manifest and a lowercase 65-byte operatorSignature")
@@ -419,13 +447,13 @@ export function createContextApi(options: ContextApiOptions) {
       return quotaExceeded(c, "maxManifestPutsPerSignerPerDay", `${manifestPuts - 1} puts already accepted on ${day}`)
     }
 
-    const agentRecord = await reader.getAgent(envelope.manifest.agentId)
+    const agentRecord = await chain.getAgent(envelope.manifest.agentId)
     if (agentRecord !== null) {
       // Fail-closed indexing: once the agent is registered, an envelope that cannot verify can never be
       // served, so the write is rejected rather than repointing the index. The envelope is fully
       // self-authenticating here — body hash and operator signature both check against the chain record —
       // so any signer may carry it: the bytes are identical to what the operator published.
-      verifySignedManifest({ envelope, agentRecord, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, now: await reader.now() })
+      verifySignedManifest({ envelope, agentRecord, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, now: await chain.now() })
       await store.setManifestIndex(bodyHash, envelopeHash, { verifiedAt: new Date(Number(clock()) * 1000).toISOString() })
     } else {
       // While the agent has no chain record, only the operator that signed the manifest may stage these
@@ -445,6 +473,9 @@ export function createContextApi(options: ContextApiOptions) {
   })
 
   app.get("/agent-manifests/:bodyHash", async (c) => {
+    // The one unsigned route gets the same per-request chain budget: anonymous traffic is exactly
+    // where an unbounded read would be cheapest to abuse.
+    const chain = new BudgetedReader(reader)
     const bodyHash = hex(c.req.param("bodyHash"), 32, "bodyHash")
     const entry = await store.getManifestIndex(bodyHash)
     if (entry === undefined) throw new MidaError("MANIFEST_NOT_FOUND", "no envelope indexed for this body hash")
@@ -463,9 +494,9 @@ export function createContextApi(options: ContextApiOptions) {
     const nowMs = Number(clock()) * 1000
     const verifiedAgeMs = entry.verifiedAt === null ? Number.POSITIVE_INFINITY : nowMs - Date.parse(entry.verifiedAt)
     if (verifiedAgeMs < Number(MANIFEST_VERIFY_CACHE_SECONDS) * 1000) return c.json(envelope)
-    const agentRecord = await reader.getAgent(envelope.manifest.agentId)
+    const agentRecord = await chain.getAgent(envelope.manifest.agentId)
     if (agentRecord === null) throw new MidaError("AGENT_ID_MISMATCH", "manifest agent is not registered")
-    verifySignedManifest({ envelope, agentRecord, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, now: await reader.now() })
+    verifySignedManifest({ envelope, agentRecord, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, now: await chain.now() })
     await store.setManifestIndex(bodyHash, entry.envelopeHash, { verifiedAt: new Date(nowMs).toISOString() })
     return c.json(envelope)
   })
@@ -473,25 +504,26 @@ export function createContextApi(options: ContextApiOptions) {
   // ---------- §12.4 reader-epoch wraps ----------
   app.post("/epoch-wraps", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const signer = c.get("signer")
+    const chain = c.get("chain")
     const wrap = parseReaderWrap(json(c.get("body")))
     // 1. owner authentication alone is necessary but never sufficient
     if (signer !== wrap.owner) throw new MidaError("CAPABILITY_DENIED", "only the owner may publish reader wraps")
     // 2 and 5. namespace and epoch exist: current, or historical with a registered key
     namespaceById(wrap.namespaceId)
     const epoch = decodeUint64(wrap.readEpoch)
-    const required = await reader.requiredReadEpoch(wrap.owner, wrap.namespaceId)
-    if (epoch > required || (await reader.epochPublicKey(wrap.owner, wrap.namespaceId, epoch)) === null) {
+    const required = await chain.requiredReadEpoch(wrap.owner, wrap.namespaceId)
+    if (epoch > required || (await chain.epochPublicKey(wrap.owner, wrap.namespaceId, epoch)) === null) {
       throw new MidaError("EPOCH_STALE", "read epoch is not a registered current or historical epoch")
     }
     // 3. recipient agent and exact key version
-    const agent = await reader.getAgent(wrap.agentId)
+    const agent = await chain.getAgent(wrap.agentId)
     if (agent === null) throw new MidaError("CAPABILITY_DENIED", "recipient is not an active agent")
     if (agent.encryptionKeyVersion !== wrap.agentKeyVersion) throw new MidaError("WRAP_KEY_VERSION_MISMATCH", "wrap targets a stale agent key version")
     // 4. recipient holds active exact READ, and no local deny covers the relationship
-    await overlay.reconcile(reader)
+    await overlay.reconcile(chain)
     if (
-      (await overlay.deniesRelationship(reader, { owner: wrap.owner, agentId: wrap.agentId, namespaceId: wrap.namespaceId })) ||
-      !(await reader.hasAuthority(wrap.owner, wrap.agentId, wrap.namespaceId, PERMISSION.READ, 0))
+      (await overlay.deniesRelationship(chain, { owner: wrap.owner, agentId: wrap.agentId, namespaceId: wrap.namespaceId })) ||
+      !(await chain.hasAuthority(wrap.owner, wrap.agentId, wrap.namespaceId, PERMISSION.READ, 0))
     ) {
       throw new MidaError("CAPABILITY_DENIED", "recipient has no active exact READ authority")
     }
@@ -501,6 +533,7 @@ export function createContextApi(options: ContextApiOptions) {
 
   app.get("/epoch-wraps", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const signer = c.get("signer")
+    const chain = c.get("chain")
     const owner = address(c.req.query("owner"), "owner")
     const namespaceId = hex(c.req.query("namespaceId"), 32, "namespaceId")
     const agentId = hex(c.req.query("agentId"), 32, "agentId")
@@ -508,7 +541,7 @@ export function createContextApi(options: ContextApiOptions) {
     const versionText = c.req.query("agentKeyVersion") ?? ""
     if (!/^[1-9][0-9]{0,9}$/.test(versionText)) throw new MidaError("INVALID_WIRE", "agentKeyVersion must be a positive integer")
     const authorization = await authorizeAgent({
-      reader,
+      reader: chain,
       overlay,
       signer,
       owner,
@@ -518,7 +551,7 @@ export function createContextApi(options: ContextApiOptions) {
       agentKeyVersion: Number(versionText),
     })
     if (authorization.agentId !== agentId) throw new MidaError("CAPABILITY_DENIED", "an agent may fetch only its own wraps")
-    if ((await reader.epochPublicKey(owner, namespaceId, readEpoch)) === null) {
+    if ((await chain.epochPublicKey(owner, namespaceId, readEpoch)) === null) {
       throw new MidaError("EPOCH_STALE", "read epoch is not a registered current or historical epoch")
     }
     const wrap = await store.getWrap({ owner, namespaceId, readEpoch: encodeUint64(readEpoch), agentId, agentKeyVersion: Number(versionText) })
@@ -529,21 +562,22 @@ export function createContextApi(options: ContextApiOptions) {
   // ---------- §12.5 fast revocation deny overlay ----------
   app.post("/revocations", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const owner = c.get("signer")
+    const chain = c.get("chain")
     const request = json<{ capabilityId?: unknown; agentId?: unknown }>(c.get("body"))
     let target: RevocationTarget
     let agentEpochAtIntent: bigint | null = null
     if (request.capabilityId !== undefined) {
       const capabilityId = hex(request.capabilityId, 32, "capabilityId")
-      const capability = await reader.getCapability(capabilityId)
+      const capability = await chain.getCapability(capabilityId)
       if (capability === null || capability.owner !== owner) throw new MidaError("CAPABILITY_DENIED", "capability is not the signer's")
       target = { kind: "capability", capabilityId }
     } else if (request.agentId !== undefined) {
       const agentId = hex(request.agentId, 32, "agentId")
-      if ((await reader.getAgent(agentId)) === null) throw new MidaError("NOT_FOUND", "agent not found")
+      if ((await chain.getAgent(agentId)) === null) throw new MidaError("NOT_FOUND", "agent not found")
       // Same ownership rule as the capability path: a relationship must exist (a grant ever recorded, or a prior
       // revocation bumping the owner-agent epoch) before a stranger may pin a deny onto someone else's agent.
-      agentEpochAtIntent = await reader.agentEpoch(owner, agentId)
-      if ((await reader.activeCapabilityIds(owner, agentId)).length === 0 && agentEpochAtIntent === 0n) {
+      agentEpochAtIntent = await chain.agentEpoch(owner, agentId)
+      if ((await chain.activeCapabilityIds(owner, agentId)).length === 0 && agentEpochAtIntent === 0n) {
         throw new MidaError("CAPABILITY_DENIED", "signer has no capability relationship with this agent")
       }
       target = { kind: "agent", agentId }
@@ -556,6 +590,7 @@ export function createContextApi(options: ContextApiOptions) {
 
   app.post("/revocations/:id/cancel", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const owner = c.get("signer")
+    const chain = c.get("chain")
     const id = hex(c.req.param("id"), 32, "id")
     const request = json<{ expiresAt?: string; assertion?: WebAuthnAssertionInput }>(c.get("body"))
     const intent = await overlay.get(id)
@@ -569,7 +604,7 @@ export function createContextApi(options: ContextApiOptions) {
     if (now >= expiresAt || expiresAt - now > CANCELLATION_MAX_LIFETIME_SECONDS) {
       throw new MidaError("AUTH_INVALID", "cancellation assertion is expired or valid for more than five minutes")
     }
-    const key = await reader.ownerP256Key(owner)
+    const key = await chain.ownerP256Key(owner)
     const nonce = BigInt(intent.cancellationNonce)
     const challenge = cancelFastRevokeDigest({
       chainId: deployment.chainId,

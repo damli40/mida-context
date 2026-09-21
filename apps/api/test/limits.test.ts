@@ -259,7 +259,7 @@ describe("upload-abuse limits", () => {
     expect((await store.getObject(pendingBody.manifest.contextId))?.anchoredAt).not.toBeNull()
   })
 
-  it("the pending scan is capped: past 40 unmarked rows the PUT is refused, not an unbounded scan", async () => {
+  it("a PUT that cannot finish the pending re-check inside the chain budget is a retryable 503", async () => {
     const records = new Map<Hex, ContextRecordView>()
     const base = stubReader(records)
     const recordCalls: Hex[] = []
@@ -271,16 +271,20 @@ describe("upload-abuse limits", () => {
       },
     } as RegistryReader
     const { app, store } = apiFor(reader, { maxPendingBytesPerSigner: 100 })
-    const { client, seen } = watchingClient(app)
 
-    // 41 unmarked uploads the chain has not anchored: the scan budget (40 reads) cannot clear them.
+    // 41 unmarked uploads the chain has not anchored: the re-check cannot examine them all inside
+    // this request's remaining chain budget, so the refusal is a retryable 503 — the request is too
+    // expensive to decide right now, not a quota verdict and never the platform's 500.
     for (let i = 0; i < 41; i++) {
       await store.putObject(storedObject(upload(randomBytes(4))))
     }
-    await expect(client.putObject(upload(randomBytes(4)))).rejects.toThrowError(/429/)
-    expect(seen.status).toBe(429)
-    expect(seen.body).toContain("too many uploads waiting to be confirmed on chain")
-    expect(recordCalls).toHaveLength(40)
+    let last: Response | undefined
+    const client = clientFor(app, async (url, init) => (last = await app.request(url, init)))
+    await expect(client.putObject(upload(randomBytes(4)))).rejects.toThrowError(/503/)
+    expect(last!.status).toBe(503)
+    expect(last!.headers.get("retry-after")).toBe("5")
+    // Authorization spent its reads first; the re-check spent at most 16 of what remained.
+    expect(recordCalls.length).toBeLessThanOrEqual(16)
   })
 
   it("two simultaneous PUTs that together exceed the pending cap admit exactly one", async () => {

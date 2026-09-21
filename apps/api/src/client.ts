@@ -31,6 +31,11 @@ export class ContextApiClient implements ContextApiRoutes {
   }
 
   async request<T>(method: string, path: string, options: { query?: Record<string, string>; body?: unknown; signed?: boolean } = {}): Promise<T> {
+    return (await this.#requestRaw<T>(method, path, options)).body
+  }
+
+  /** `request` plus the raw Response: listObjects needs `x-mida-partial` to drive its retries. */
+  async #requestRaw<T>(method: string, path: string, options: { query?: Record<string, string>; body?: unknown; signed?: boolean } = {}): Promise<{ body: T; response: Response }> {
     const url = new URL(path, this.#options.baseUrl)
     for (const [key, value] of Object.entries(options.query ?? {})) url.searchParams.set(key, value)
     const body = options.body === undefined ? new Uint8Array() : new TextEncoder().encode(JSON.stringify(options.body))
@@ -64,16 +69,35 @@ export class ContextApiClient implements ContextApiRoutes {
     const text = await response.text()
     const parsed: unknown = text.length === 0 ? null : JSON.parse(text)
     if (!response.ok) throw errorFromBody(response.status, parsed)
-    return parsed as T
+    return { body: parsed as T, response }
   }
 
   putObject(upload: ObjectUploadBody) {
     return this.request<{ contextId: Hex; manifestHash: Hex; state: "pending" }>("PUT", "/objects", { body: upload })
   }
 
-  async listObjects(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }) {
+  async listObjects(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }): Promise<ListObjectsResult> {
     const query = { owner: input.owner.toLowerCase(), namespaceId: input.namespaceId, ...(input.capabilityId === undefined ? {} : { capabilityId: input.capabilityId }) }
-    return (await this.request<{ objects: AnchoredObject[] }>("GET", "/objects", { query })).objects
+    const seen = new Set<string>()
+    const objects: AnchoredObject[] = []
+    let partial = false
+    // The server marks x-mida-partial when rows were left unexamined by the chain-read budget; every
+    // row it did verify was marked anchored, so each retry's budget lands on rows not yet seen. Up to
+    // three retries — then the caller gets what accumulated WITH the flag, never a silent short list.
+    for (let attempt = 0; attempt <= LIST_PARTIAL_MAX_RETRIES; attempt++) {
+      const { body, response } = await this.#requestRaw<{ objects: AnchoredObject[] }>("GET", "/objects", { query })
+      for (const object of body.objects) {
+        if (seen.has(object.contextId)) continue
+        seen.add(object.contextId)
+        objects.push(object)
+      }
+      partial = response.headers.get("x-mida-partial") === "true"
+      if (!partial) break
+    }
+    const result = objects as ListObjectsResult
+    // Non-enumerable on purpose: the result still compares, spreads and serializes as a plain array.
+    Object.defineProperty(result, "partial", { value: partial, enumerable: false, writable: false })
+    return result
   }
 
   getManifest(contextId: Hex, capabilityId?: Hex) {
@@ -119,9 +143,21 @@ export class ContextApiClient implements ContextApiRoutes {
   }
 }
 
+/** Retries `listObjects` performs after the first response still carries `x-mida-partial`. */
+export const LIST_PARTIAL_MAX_RETRIES = 3
+
+/**
+ * The objects a `listObjects` call verified — an array in every respect — plus `partial`: true when
+ * the server left rows unexamined after the initial request and all retries. Read it; a caller that
+ * ignores it cannot tell a complete list from a truncated one.
+ */
+export interface ListObjectsResult extends Array<AnchoredObject> {
+  readonly partial: boolean
+}
+
 export interface ContextApiRoutes {
   putObject(upload: ObjectUploadBody): Promise<{ contextId: Hex; manifestHash: Hex; state: "pending" }>
-  listObjects(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }): Promise<AnchoredObject[]>
+  listObjects(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }): Promise<ListObjectsResult>
   getManifest(contextId: Hex, capabilityId?: Hex): Promise<{ manifest: ObjectManifest; manifestHash: Hex }>
   putAgentManifest(envelope: SignedAgentCapabilityManifest): Promise<{ bodyHash: Hex; envelopeHash: Hex }>
   getAgentManifest(bodyHash: Hex): Promise<SignedAgentCapabilityManifest>
