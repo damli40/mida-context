@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { privateKeyToAccount } from "viem/accounts"
 import { OWNER_AUTHOR_ID, PERMISSION, PROVENANCE_POLICY, PROVENANCE_SOURCE, evidenceCommitment, namespaceId } from "@mida/protocol"
 import { bytesOf } from "@mida/crypto"
-import { createWriteContext } from "@mida/chain"
+import { createWriteContext, increaseLocalTime } from "@mida/chain"
 import { ContextApiClient } from "@mida/api"
 import { MidaAgent } from "@mida/sdk"
 import { localEnvironment } from "@mida/cli"
@@ -97,6 +97,9 @@ describe("mida remember on local Anvil", () => {
   it("a fact told once reaches every authorized agent, newest first — through the real protocol", async () => {
     const first = await remember(runtime, "i answer in lowercase")
     expect(first.kind).toBe("remembered")
+    // block timestamps tick in whole seconds — two facts inside the same second order by their
+    // contextId hash, so "newest first" needs the chain's clock to move before the second write
+    await increaseLocalTime(env.rpcUrl, 2n)
     const second = await remember(runtime, "fluent in typescript", { namespace: SKILLS })
     expect(second.kind).toBe("remembered")
     expect(await serverCount(PREFS)).toBe(1)
