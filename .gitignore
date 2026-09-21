@@ -9,6 +9,10 @@ contracts/broadcast/*/31337/
 contracts/deployments/31337.json
 coverage/
 
+# built packages and packed tarballs — the templates and generators are committed, these are not
+publish/*/dist/
+*.tgz
+
 # third-party screenshots stay out of the public repository
 docs/problem-evidence/*.png
 

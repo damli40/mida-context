@@ -1,0 +1,34 @@
+{
+  "name": "mida-context-sdk",
+  "version": "0.1.0",
+  "description": "Mida SDK — ask a user's Mida for scoped context: request access, read and write what the grant allows.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "private": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@hono/node-server": "1.19.17",
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "canonicalize": "4.0.0",
+    "hono": "4.13.7",
+    "ox": "1.7.4",
+    "permissionless": "0.4.1",
+    "viem": "2.56.3"
+  }
+}
