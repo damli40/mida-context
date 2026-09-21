@@ -1,9 +1,10 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { readFileSync } from "node:fs"
 import { dirname } from "node:path"
 import { MidaError, assertHex, canonicalTarget, httpRequestTypedData } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { isTypedDataSignedBy } from "@mida/grant-advisor"
 import type { TypedDataDefinition } from "viem"
+import { writeJsonAtomic } from "./secure-fs.js"
 
 export const AUTH_HEADERS = {
   signer: "x-mida-signer",
@@ -64,10 +65,7 @@ export class ReplayGuard {
     const key = ReplayGuard.#key(signer, nonce)
     if (this.#seen.has(key)) throw new MidaError("REPLAY", "request nonce was already used")
     this.#seen.set(key, { signer: signer.toLowerCase() as Address, nonce: nonce.toLowerCase() as Hex, timestamp: signedAt.toString(10) })
-    mkdirSync(dirname(this.#file), { recursive: true })
-    const temporary = `${this.#file}.tmp`
-    writeFileSync(temporary, JSON.stringify([...this.#seen.values()]))
-    renameSync(temporary, this.#file)
+    writeJsonAtomic(dirname(this.#file), this.#file, [...this.#seen.values()])
   }
 }
 

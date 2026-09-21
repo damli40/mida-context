@@ -1,8 +1,9 @@
-import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs"
-import { dirname, join } from "node:path"
+import { readFileSync, readdirSync } from "node:fs"
+import { join } from "node:path"
 import { MidaError } from "@mida/protocol"
 import type { Address, Hex, ObjectManifest, ReaderEpochWrap } from "@mida/protocol"
 import { FsStorage } from "@mida/storage"
+import { writeJsonAtomic } from "./secure-fs.js"
 
 /** A ciphertext upload's immutable metadata. Served as context only after Monad holds matching commitments (§12.2). */
 export interface StoredObject {
@@ -15,13 +16,6 @@ export interface StoredObject {
   manifest: ObjectManifest
   manifestHash: Hex
   uploadedAt: string
-}
-
-function writeJsonAtomic(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true })
-  const temporary = `${path}.tmp`
-  writeFileSync(temporary, JSON.stringify(value, null, 2))
-  renameSync(temporary, path)
 }
 
 function readJson<T>(path: string): T | undefined {
@@ -54,7 +48,7 @@ export class ApiStore {
       }
       return
     }
-    writeJsonAtomic(path, object)
+    writeJsonAtomic(this.#dir, path, object)
   }
 
   getObject(contextId: Hex): StoredObject | undefined {
@@ -79,7 +73,7 @@ export class ApiStore {
   }
 
   putWrap(wrap: ReaderEpochWrap): void {
-    writeJsonAtomic(this.#wrapPath(wrap), wrap)
+    writeJsonAtomic(this.#dir, this.#wrapPath(wrap), wrap)
   }
 
   getWrap(key: { owner: Address; namespaceId: Hex; readEpoch: string; agentId: Hex; agentKeyVersion: number }): ReaderEpochWrap | undefined {
@@ -87,7 +81,7 @@ export class ApiStore {
   }
 
   setManifestIndex(bodyHash: Hex, envelopeHash: Hex): void {
-    writeJsonAtomic(join(this.#dir, "agent-manifests", `${bodyHash}.json`), { envelopeHash })
+    writeJsonAtomic(this.#dir, join(this.#dir, "agent-manifests", `${bodyHash}.json`), { envelopeHash })
   }
 
   getManifestIndex(bodyHash: Hex): Hex | undefined {

@@ -29,6 +29,7 @@ import type { ContextRecordView, RegistryReader } from "./chain-views.js"
 import { DenyOverlay } from "./deny-overlay.js"
 import type { RevocationTarget } from "./deny-overlay.js"
 import { toErrorBody } from "./errors.js"
+import { repairModes } from "./secure-fs.js"
 import { ApiStore } from "./store.js"
 import type { StoredObject } from "./store.js"
 import { verifyVaultAssertion } from "./verify-assertion.js"
@@ -65,6 +66,9 @@ function isAnchored(stored: StoredObject, record: ContextRecordView | null): boo
 export function createContextApi(options: ContextApiOptions) {
   const { reader, deployment } = options
   const clock = options.clock ?? (() => BigInt(Math.floor(Date.now() / 1000)))
+  // A tree that predates the mode rules — or was chmodded by hand — is repaired at startup:
+  // every directory 0700, every file 0600, before anything reads or writes it.
+  repairModes(options.dataDir)
   const overlay = new DenyOverlay(`${options.dataDir}/revocations.json`)
   const store = new ApiStore(options.dataDir)
   const replay = new ReplayGuard(`${options.dataDir}/replay-nonces.json`)

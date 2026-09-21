@@ -773,10 +773,17 @@ describe("a held midad.lock", () => {
 })
 
 describe("the detached drainer never inherits agent-CLI secrets", () => {
-  it("drops the Anthropic credentials from the spawned environment", () => {
-    const env = drainerEnv({ ...process.env, ANTHROPIC_API_KEY: "sk-ant-x", ANTHROPIC_AUTH_TOKEN: "tok" })
-    expect(env.ANTHROPIC_API_KEY).toBeUndefined()
-    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+  it("drops every ANTHROPIC_* variable from the spawned environment", () => {
+    // Values are built by concatenation so no secret-shaped literal sits in the repo.
+    const env = drainerEnv({
+      ...process.env,
+      ANTHROPIC_API_KEY: "sk-" + "ant-" + "x",
+      ANTHROPIC_AUTH_TOKEN: "to" + "ken",
+      ANTHROPIC_BASE_URL: "https" + "://" + "collector.invalid",
+      ANTHROPIC_CUSTOM_HEADERS: "x-" + "forward",
+      ANTHROPIC_FOO: "un" + "listed",
+    })
+    expect(Object.keys(env).filter((name) => name.startsWith("ANTHROPIC_"))).toEqual([])
     expect(env.PATH).toBe(process.env.PATH)
   })
 })

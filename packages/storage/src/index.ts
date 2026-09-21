@@ -59,10 +59,10 @@ export class FsStorage implements ContextStorage {
 
   async put(blob: Uint8Array): Promise<StorageRef[]> {
     const hash = contentHash(blob)
-    await mkdir(this.#directory, { recursive: true })
+    await mkdir(this.#directory, { recursive: true, mode: 0o700 })
     const target = this.pathFor(hash)
     const temporary = `${target}.${process.pid}.${Date.now()}.tmp`
-    await writeFile(temporary, blob)
+    await writeFile(temporary, blob, { mode: 0o600 })
     await rename(temporary, target)
     return [{ provider: "fs", locator: hash }]
   }

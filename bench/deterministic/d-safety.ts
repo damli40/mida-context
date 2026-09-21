@@ -32,7 +32,7 @@ await requestAccess(runtime, "claude-code")
 await approve(runtime, "claude-code")
 const workDir = join(dir, "work")
 mkdirSync(workDir, { recursive: true })
-const approval = await approveProject(runtime, { agent: "claude-code", cwd: workDir })
+const { approval } = await approveProject(runtime, { agent: "claude-code", cwd: workDir })
 
 /** Every file under a folder, as repo-relative-style posix paths. */
 function walkFiles(root: string): string[] {

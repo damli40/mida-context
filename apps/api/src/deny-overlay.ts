@@ -1,9 +1,10 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { readFileSync } from "node:fs"
 import { dirname } from "node:path"
 import { MidaError } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { hexOf } from "@mida/crypto"
 import { randomBytes } from "@noble/hashes/utils.js"
+import { writeJsonAtomic } from "./secure-fs.js"
 import type { RegistryReader } from "./chain-views.js"
 
 export type RevocationTarget = { kind: "capability"; capabilityId: Hex } | { kind: "agent"; agentId: Hex }
@@ -163,9 +164,6 @@ export class DenyOverlay {
   }
 
   #save(): void {
-    mkdirSync(dirname(this.#file), { recursive: true })
-    const temporary = `${this.#file}.tmp`
-    writeFileSync(temporary, JSON.stringify(this.#intents, null, 2))
-    renameSync(temporary, this.#file)
+    writeJsonAtomic(dirname(this.#file), this.#file, this.#intents)
   }
 }

@@ -66,6 +66,9 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.ANTHROPIC_API_KEY
   delete process.env.ANTHROPIC_AUTH_TOKEN
+  delete process.env.ANTHROPIC_BASE_URL
+  delete process.env.ANTHROPIC_CUSTOM_HEADERS
+  delete process.env.ANTHROPIC_FOO
   delete process.env.FAKE_MODEL_MODE
   delete process.env.FAKE_MODEL_COUNTER
   delete process.env.FAKE_MODEL_STDIN_LOG
@@ -119,13 +122,17 @@ describe("compileCheckpoint", () => {
     await new Promise((resolve) => setTimeout(resolve, 1000))
     expect(() => process.kill(pid, 0)).toThrow()
   })
-  it("never passes ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN to the model, and sets MIDA_INNER=1", async () => {
-    process.env.ANTHROPIC_API_KEY = "test-value-a"; process.env.ANTHROPIC_AUTH_TOKEN = "test-value-b"
+  it("never passes any ANTHROPIC_* variable to the model, and sets MIDA_INNER=1", async () => {
+    // Values are built by concatenation so no secret-shaped literal sits in the repo.
+    process.env.ANTHROPIC_API_KEY = "sk-" + "ant-" + "a"
+    process.env.ANTHROPIC_AUTH_TOKEN = "to" + "ken"
+    process.env.ANTHROPIC_BASE_URL = "https" + "://" + "collector.invalid"
+    process.env.ANTHROPIC_CUSTOM_HEADERS = "x-" + "forward"
+    process.env.ANTHROPIC_FOO = "un" + "listed"
     process.env.FAKE_MODEL_ENV_LOG = envLogPath
     await compileCheckpoint({ ...base, model: fake("good") })
     const names = fs.readFileSync(envLogPath, "utf8").split("\n")
-    expect(names).not.toContain("ANTHROPIC_API_KEY")
-    expect(names).not.toContain("ANTHROPIC_AUTH_TOKEN")
+    expect(names.filter((name) => name.startsWith("ANTHROPIC_"))).toEqual([])
     expect(names).toContain("MIDA_INNER")
     expect(names).toContain("PATH")
   })

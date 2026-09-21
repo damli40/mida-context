@@ -52,12 +52,17 @@ export function transcriptPathAllowed(transcriptPath: unknown, agent: string, ho
 
 /**
  * The environment the detached drainer is spawned with: the hook runs inside the agent CLI, so the
- * parent's Anthropic credentials must never leak into a child that outlives the tool call.
+ * parent's Anthropic credentials must never leak into a child that outlives the tool call. The
+ * default compile command authenticates through the CLI's own stored login and needs no
+ * ANTHROPIC_* variable at all — an inherited ANTHROPIC_BASE_URL or ANTHROPIC_CUSTOM_HEADERS would
+ * silently redirect the model traffic, so the allow-list of Anthropic names is empty and every
+ * ANTHROPIC_* key is stripped.
  */
 export function drainerEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const clean = { ...env }
-  delete clean.ANTHROPIC_API_KEY
-  delete clean.ANTHROPIC_AUTH_TOKEN
+  for (const key of Object.keys(clean)) {
+    if (key.startsWith("ANTHROPIC_")) delete clean[key]
+  }
   return clean
 }
 

@@ -71,7 +71,7 @@ async function h1() {
   await approve(runtime, "conv")
   const cwd = join(dir, "work-h1")
   mkdirSync(cwd, { recursive: true })
-  const approval = await approveProject(runtime, { agent: "conv", cwd })
+  const { approval } = await approveProject(runtime, { agent: "conv", cwd })
   const input = {
     projectId: approval.projectId, sessionId: "h1", continuesSession: null, compiledBy: "bench",
     checkpoint: sampleCheckpoint({ eventId: "ev-h1-0001", progress: ["one"] }),
@@ -98,7 +98,7 @@ async function h1() {
 async function h2() {
   const cwd = join(dir, "work-h2")
   mkdirSync(cwd, { recursive: true })
-  const approval = await approveProject(runtime, { agent: "conv", cwd })
+  const { approval } = await approveProject(runtime, { agent: "conv", cwd })
   const transcript = writeTranscript(homeDir, "proj", "h2.jsonl", [userLine("h2 request"), assistantText("h2 step")])
 
   const compileCalls: unknown[] = []
@@ -140,7 +140,7 @@ async function h2() {
 async function h3() {
   const cwd = join(dir, "work-h3")
   mkdirSync(cwd, { recursive: true })
-  const approval = await approveProject(runtime, { agent: "conv", cwd })
+  const { approval } = await approveProject(runtime, { agent: "conv", cwd })
   const cases: { name: string; bytesOk: boolean; requestOk: boolean; planOk: boolean; constraintsOk: boolean; noteOk: boolean; savedOk: boolean }[] = []
 
   const check = async (name: string, checkpoint: ReturnType<typeof sampleCheckpoint>) => {

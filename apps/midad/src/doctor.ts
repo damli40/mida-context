@@ -10,6 +10,7 @@ import type { ChainContext } from "@mida/chain"
 import { RegistryReader } from "@mida/api"
 import { callDaemon } from "./control.js"
 import type { MidaHome } from "./home.js"
+import { drainerEnv } from "./hook.js"
 import { claudeHooksStatus, codexHooksStatus } from "./install.js"
 import type { InstallTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity } from "./keys.js"
@@ -378,7 +379,8 @@ export async function runDoctorLive(tool: InstallTool, deps: DoctorLiveDeps): Pr
 function startToolSession(tool: InstallTool, cwd: string): { stop(): void } {
   const [command, args] =
     tool === "claude-code" ? ["claude", ["-p", "Reply with the word ok."]] : ["codex", ["exec", "Reply with the word ok."]]
-  const child = spawn(command, args, { cwd, stdio: "ignore" })
+  // A model child gets the same environment rule as the drainer: no ANTHROPIC_* name crosses over.
+  const child = spawn(command, args, { cwd, stdio: "ignore", env: drainerEnv(process.env) })
   child.on("error", () => {})
   return {
     stop() {

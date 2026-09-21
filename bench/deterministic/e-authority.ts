@@ -256,7 +256,7 @@ async function e6() {
 async function e7() {
   const e7dir = join(dir, "work-e7")
   mkdirSync(e7dir, { recursive: true })
-  const codexApproval = await approveProject(runtime, { agent: "codex", cwd: e7dir })
+  const { approval: codexApproval } = await approveProject(runtime, { agent: "codex", cwd: e7dir })
   await requestAccess(runtime, "codex")
   await approve(runtime, "codex")
   await approveProject(runtime, { agent: "claude-code", cwd: e7dir })

@@ -37,7 +37,7 @@ await approve(runtime, "claude-code")
 async function project(tag: string): Promise<{ cwd: string; projectId: string }> {
   const cwd = join(dir, `work-${tag}`)
   mkdirSync(cwd, { recursive: true })
-  const approval = await approveProject(runtime, { agent: "claude-code", cwd })
+  const { approval } = await approveProject(runtime, { agent: "claude-code", cwd })
   return { cwd, projectId: approval.projectId }
 }
 

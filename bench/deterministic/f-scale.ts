@@ -36,7 +36,7 @@ await approve(runtime, "claude-code")
 async function f1() {
   const cwd = join(dir, "work-f1")
   mkdirSync(cwd, { recursive: true })
-  const approval = await approveProject(runtime, { agent: "claude-code", cwd })
+  const { approval } = await approveProject(runtime, { agent: "claude-code", cwd })
   const milestones = [1, 10, 50, 100]
   const medians: Record<string, number> = {}
   const saveMs: number[] = []

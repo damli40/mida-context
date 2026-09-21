@@ -136,15 +136,19 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
       resolve({ ...r, ms: Date.now() - t0 })
     }
 
-    // A shell-exported Anthropic key would silently override the model's
+    // A shell-exported Anthropic variable would silently override the model's
     // normal login (spike bug G2: an exported key produced an empty,
-    // successful-looking run), so both names are stripped — values are never
-    // logged. MIDA_INNER marks the subprocess so the capture hook ignores it:
-    // the real model command is itself an agent run and would otherwise be
-    // captured as a session of its own, forever.
+    // successful-looking run) — and ANTHROPIC_BASE_URL or ANTHROPIC_CUSTOM_HEADERS
+    // would redirect the transcript text to another server outright. The default
+    // command authenticates through the CLI's stored login and needs none of
+    // them, so every ANTHROPIC_* name is stripped — values are never logged.
+    // MIDA_INNER marks the subprocess so the capture hook ignores it: the real
+    // model command is itself an agent run and would otherwise be captured as a
+    // session of its own, forever.
     const env: NodeJS.ProcessEnv = { ...process.env, MIDA_INNER: "1" }
-    delete env.ANTHROPIC_API_KEY
-    delete env.ANTHROPIC_AUTH_TOKEN
+    for (const key of Object.keys(env)) {
+      if (key.startsWith("ANTHROPIC_")) delete env[key]
+    }
 
     let child
     try {
