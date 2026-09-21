@@ -473,8 +473,9 @@ async function main(): Promise<void> {
       rpcUrl: env.rpcUrl,
       deployment: env.deployment,
       fund: env.fund,
-      // the gas sponsor's address, when this machine has one — init persists it to network.json
-      // so the daemon and the drainer sponsor their sends without seeing the variable
+      // the hosted Context API and the gas sponsor, when this machine has them — init persists
+      // both to network.json so the daemon and the drainer see them without the variables
+      storageUrl: process.env.MIDA_STORAGE_URL,
       sponsorUrl: process.env.MIDA_SPONSOR_URL,
     }
     const argv = process.argv.slice(2)
