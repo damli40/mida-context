@@ -12,6 +12,16 @@ const ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 export const P256_VERIFIER: Hex = "0x0000000000000000000000000000000000000100"
 export const PRECOMPILE_TRUE: Hex = `0x${"00".repeat(31)}01`
 
+/** Top-level note every evidence file carries so a reader never mistakes gasUsed for usage. */
+export const GAS_NOTE = "On Monad the receipt's gasUsed equals the gas limit, which is what is billed."
+
+/** What one mined transaction was billed: the limit it was sent with, plus the receipt's figures. */
+export interface TxGasFacts {
+  gasUsed: string
+  gasLimit: string
+  effectiveGasPriceWei: string
+}
+
 export interface ScenarioEvidence {
   network: string
   generatedAt: string
@@ -21,7 +31,29 @@ export interface ScenarioEvidence {
   deploymentBlock: string
   p256PrecompileProbe: { valid: Hex; tampered: Hex }
   grantBatchGasUsed: Record<string, string>
+  gasNote: string
+  gas: Record<string, TxGasFacts>
   transactions: Record<string, Hex>
+}
+
+/**
+ * Pulls the billed facts for each labelled transaction hash: the limit from the transaction
+ * itself, the used gas and the effective price from its receipt.
+ */
+export async function gasFacts(publicClient: PublicClient, transactions: Record<string, string>): Promise<Record<string, TxGasFacts>> {
+  const facts: Record<string, TxGasFacts> = {}
+  for (const [label, hash] of Object.entries(transactions)) {
+    const [transaction, receipt] = await Promise.all([
+      publicClient.getTransaction({ hash: hash as Hex }),
+      publicClient.getTransactionReceipt({ hash: hash as Hex }),
+    ])
+    facts[label] = {
+      gasUsed: receipt.gasUsed.toString(),
+      gasLimit: transaction.gas.toString(),
+      effectiveGasPriceWei: receipt.effectiveGasPrice.toString(),
+    }
+  }
+  return facts
 }
 
 /** Local runs write to the gitignored .mida-data/; the Monad testnet run writes the committed docs/evidence/ file. */

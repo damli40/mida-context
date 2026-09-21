@@ -10,7 +10,7 @@ import { bytesOf } from "@mida/crypto"
 import { createWriteContext } from "@mida/chain"
 import { ContextApiClient } from "@mida/api"
 import { MidaAgent } from "@mida/sdk"
-import { localEnvironment, monadTestnetEnvironment } from "@mida/cli"
+import { GAS_NOTE, gasFacts, localEnvironment, monadTestnetEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
   AGENT_PERMISSIONS, MidaHome, Runtime, approve, authorNamesFor, init, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, readCheckpoints, requestAccess, revoke, saveCheckpoint,
@@ -185,12 +185,13 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     const folder = fileURLToPath(new URL("../../../docs/evidence/", import.meta.url))
     mkdirSync(folder, { recursive: true })
     const { saveToReadableMs, ...hashes } = transactions
+    const gas = await gasFacts(runtime.ownerChain.publicClient, hashes)
     writeFileSync(
       `${folder}m0-${ON_TESTNET ? "monad-testnet" : "local-anvil"}.json`,
       JSON.stringify({
         network: env.name, generatedAt: new Date().toISOString(), oneOperatorRegisteredBothAgents: true,
         grantGasUsed, saveMilliseconds: timings.save, readMilliseconds: timings.read,
-        saveToReadableMilliseconds: Number(saveToReadableMs), transactions: hashes,
+        saveToReadableMilliseconds: Number(saveToReadableMs), gasNote: GAS_NOTE, gas, transactions: hashes,
       }, null, 2),
     )
   })

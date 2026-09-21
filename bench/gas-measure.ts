@@ -16,15 +16,15 @@ import type { Hex } from "@mida/protocol"
 import { generateX25519KeyPair, hexOf } from "@mida/crypto"
 import { FakeVaultAuthority, buildSignedAccessRequest, completeVaultAssertion, p256PublicKey, provisionAgent, vaultSignPayload } from "@mida/fake-vault"
 
-interface Row { kind: string; estimate: bigint | null; txGas: bigint | null; gasUsed: bigint | null }
+interface Row { kind: string; estimate: bigint | null; txGas: bigint | null; gasUsed: bigint | null; priceWei: bigint | null }
 const rows: Row[] = []
-const row = (kind: string, estimate: bigint | null, txGas: bigint | null, gasUsed: bigint | null) =>
-  rows.push({ kind, estimate, txGas, gasUsed })
+const row = (kind: string, estimate: bigint | null, txGas: bigint | null, gasUsed: bigint | null, priceWei: bigint | null = null) =>
+  rows.push({ kind, estimate, txGas, gasUsed, priceWei })
 
-async function txNumbers(client: PublicClient, hash: Hex): Promise<{ txGas: bigint; gasUsed: bigint }> {
+async function txNumbers(client: PublicClient, hash: Hex): Promise<{ txGas: bigint; gasUsed: bigint; priceWei: bigint }> {
   const tx = await client.getTransaction({ hash })
   const receipt = await client.getTransactionReceipt({ hash })
-  return { txGas: tx.gas, gasUsed: receipt.gasUsed }
+  return { txGas: tx.gas, gasUsed: receipt.gasUsed, priceWei: receipt.effectiveGasPrice }
 }
 
 async function measure(hardfork: string) {
@@ -57,7 +57,7 @@ async function measure(hardfork: string) {
       account: ownerAccount, address: registry, abi: capabilityRegistryAbi, functionName: "registerP256Key", args: [vault.p256PublicKey.qx, vault.p256PublicKey.qy],
     })
     const keyTx = await txNumbers(client, await vault.registerOwnerKey())
-    row(`${hardfork}/owner.key`, keyEstimate, keyTx.txGas, keyTx.gasUsed)
+    row(`${hardfork}/owner.key`, keyEstimate, keyTx.txGas, keyTx.gasUsed, keyTx.priceWei)
 
     // owner.keyRotate — fresh owner registers then rotates its own key (section16 pattern)
     const rotAccount = privateKeyToAccount(generatePrivateKey())
@@ -86,11 +86,11 @@ async function measure(hardfork: string) {
     })
     const rotReceipt = await sendContract(rotOwner, { address: registry, abi: capabilityRegistryAbi, functionName: "rotateP256Key", args: [...rotArgs] })
     const rotTx = await txNumbers(client, rotReceipt.transactionHash)
-    row(`${hardfork}/owner.keyRotate`, rotEstimate, rotTx.txGas, rotTx.gasUsed)
+    row(`${hardfork}/owner.keyRotate`, rotEstimate, rotTx.txGas, rotTx.gasUsed, rotTx.priceWei)
 
     // epoch.init
     const initTx = await txNumbers(client, await vault.initializeNamespace("goals.career"))
-    row(`${hardfork}/epoch.init`, null, initTx.txGas, initTx.gasUsed)
+    row(`${hardfork}/epoch.init`, null, initTx.txGas, initTx.gasUsed, initTx.priceWei)
 
     // agent.register — the real registerAgent call; re-estimating after the fact reverts
     const operatorAccount = privateKeyToAccount(generatePrivateKey())
@@ -102,7 +102,7 @@ async function measure(hardfork: string) {
       callbackOrigin: "https://measure.example", capabilityManifestHash: hexOf(randomBytes(32)),
     })
     const regTxNums = await txNumbers(client, registered.receipt.transactionHash)
-    row(`${hardfork}/agent.register`, null, regTxNums.txGas, regTxNums.gasUsed)
+    row(`${hardfork}/agent.register`, null, regTxNums.txGas, regTxNums.gasUsed, regTxNums.priceWei)
 
     // context.register (owner write)
     const created = await vault.createOwnerContext({
@@ -110,7 +110,7 @@ async function measure(hardfork: string) {
       payload: { v: 1, value: "measurement payload ".repeat(8), kind: "GOAL", provenance: { source: "USER_ASSERTED" } },
     })
     const regTx = await txNumbers(client, created.transactionHash)
-    row(`${hardfork}/context.register`, null, regTx.txGas, regTx.gasUsed)
+    row(`${hardfork}/context.register`, null, regTx.txGas, regTx.gasUsed, regTx.priceWei)
 
     // an agent holding CREATE + READ for revoke paths — two grants, one capability each
     const agent = await provisionAgent({
@@ -132,7 +132,7 @@ async function measure(hardfork: string) {
     })
     const approval = await vault.approveGrant({ accessRequest: requestRead, manifest: agent.manifest, selection: { kind: "recommended" } })
     const grantTx = await txNumbers(client, approval.response.capabilities[0]!.transactionHash)
-    row(`${hardfork}/grant.batch`, null, grantTx.txGas, grantTx.gasUsed)
+    row(`${hardfork}/grant.batch`, null, grantTx.txGas, grantTx.gasUsed, grantTx.priceWei)
 
     const createCap = approvalCreate.response.capabilities.find((c) => (c.permissions & PERMISSION.READ) === 0)
     const readCap = approval.response.capabilities.find((c) => (c.permissions & PERMISSION.READ) !== 0)
@@ -143,12 +143,12 @@ async function measure(hardfork: string) {
       })
       const revoked = await vault.approveRevocation({ kind: "capability", capabilityId: createCap.capabilityId })
       const revTx = await txNumbers(client, revoked.transactionHash)
-      row(`${hardfork}/revoke.capability`, estimate, revTx.txGas, revTx.gasUsed)
+      row(`${hardfork}/revoke.capability`, estimate, revTx.txGas, revTx.gasUsed, revTx.priceWei)
     }
     if (readCap !== undefined) {
       const revoked = await vault.approveRevocation({ kind: "capability", capabilityId: readCap.capabilityId })
       const revTx = await txNumbers(client, revoked.transactionHash)
-      row(`${hardfork}/revoke.rotate`, null, revTx.txGas, revTx.gasUsed)
+      row(`${hardfork}/revoke.rotate`, null, revTx.txGas, revTx.gasUsed, revTx.priceWei)
     }
 
     // revoke.agent — a second agent with a READ grant, revoked wholesale
@@ -161,7 +161,7 @@ async function measure(hardfork: string) {
     await vault.approveGrant({ accessRequest: request2, manifest: agent2.manifest, selection: { kind: "recommended" } })
     const agentRevoke = await vault.approveRevocation({ kind: "agent", agentId: agent2.agentId })
     const agentRevTx = await txNumbers(client, agentRevoke.transactionHash)
-    row(`${hardfork}/revoke.agent`, null, agentRevTx.txGas, agentRevTx.gasUsed)
+    row(`${hardfork}/revoke.agent`, null, agentRevTx.txGas, agentRevTx.gasUsed, agentRevTx.priceWei)
 
     // epoch.rotateExpired — grant a READ that expires in a minute, advance chain time, rotate
     try {
@@ -180,7 +180,7 @@ async function measure(hardfork: string) {
       await increaseLocalTime(env.rpcUrl, 120n)
       const rotated = await vault.rotateExpiredEpoch(namespaceId("financial"))
       const rotTxNums = await txNumbers(client, rotated.transactionHash)
-      row(`${hardfork}/epoch.rotateExpired`, null, rotTxNums.txGas, rotTxNums.gasUsed)
+      row(`${hardfork}/epoch.rotateExpired`, null, rotTxNums.txGas, rotTxNums.gasUsed, rotTxNums.priceWei)
     } catch (error) {
       row(`${hardfork}/epoch.rotateExpired`, null, null, null)
       console.error("epoch.rotateExpired failed:", error instanceof Error ? error.message : error)
@@ -194,7 +194,8 @@ for (const hardfork of ["default", "prague"]) {
   await measure(hardfork)
 }
 
-console.log("\nkind | estimate | tx.gas (auto limit) | receipt.gasUsed")
+console.log("\nkind | estimate | tx.gas (auto limit) | receipt.gasUsed | effectiveGasPriceWei")
 for (const r of rows) {
-  console.log(`${r.kind} | ${r.estimate ?? "-"} | ${r.txGas ?? "-"} | ${r.gasUsed ?? "-"}`)
+  console.log(`${r.kind} | ${r.estimate ?? "-"} | ${r.txGas ?? "-"} | ${r.gasUsed ?? "-"} | ${r.priceWei ?? "-"}`)
 }
+console.log("On Monad the receipt's gasUsed equals the gas limit, which is what is billed.")

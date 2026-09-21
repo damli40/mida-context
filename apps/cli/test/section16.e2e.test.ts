@@ -15,7 +15,7 @@ import type { AnchoredObject } from "@mida/api"
 import { MidaAgent } from "@mida/sdk"
 import { p256 } from "@noble/curves/nist.js"
 import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils.js"
-import { PRECOMPILE_TRUE, evidencePath, localEnvironment, monadTestnetEnvironment, probeP256Precompile, writeEvidence } from "@mida/cli"
+import { GAS_NOTE, PRECOMPILE_TRUE, evidencePath, gasFacts, localEnvironment, monadTestnetEnvironment, probeP256Precompile, writeEvidence } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 
 const CAREER = namespaceId("goals.career")
@@ -195,6 +195,7 @@ describe.each(targets)("§16 end-to-end scenario on $name (plan Tasks 26 and 27)
   step("8b. Agent D, who will remain a reader after A is revoked, is granted READ goals.career", async () => {
     const request = await actors.D.sdk.createAccessRequest({ purposeId: "career_coaching", scopes: [{ namespace: "goals.career", permissions: PERMISSION.READ }] })
     const approval = await vault.approveGrant({ accessRequest: request, manifest: actors.D.provisioned.manifest, selection: { kind: "recommended" } })
+    transactions.grantD = approval.response.capabilities[0]!.transactionHash
     await actors.D.sdk.completeAccessRequest(request, approval.response)
     expect((await actors.D.sdk.read(owner, "goals.career")).map((o) => o.payload.value)).toEqual([GOAL_TEXT])
   })
@@ -221,6 +222,7 @@ describe.each(targets)("§16 end-to-end scenario on $name (plan Tasks 26 and 27)
     const grant = await actors.C.sdk.completeAccessRequest(request, approval.response)
     capabilityC = grant.capabilities[0]!.capabilityId
     grantBatchGasUsed.grantC = approval.gasUsed.toString()
+    transactions.grantC = grant.capabilities[0]!.transactionHash
     expect(await reader.hasAuthority(owner, agentId("C"), CAREER, PERMISSION.CREATE, PROVENANCE_POLICY.ALLOW_INFERENCE)).toBe(true)
     expect(await reader.hasAuthority(owner, agentId("C"), CAREER, PERMISSION.READ, 0)).toBe(false)
   })
@@ -305,6 +307,8 @@ describe.each(targets)("§16 end-to-end scenario on $name (plan Tasks 26 and 27)
       deploymentBlock: env.deployment.deploymentBlock.toString(),
       p256PrecompileProbe: probe,
       grantBatchGasUsed,
+      gasNote: GAS_NOTE,
+      gas: await gasFacts(reader.context.publicClient, transactions),
       transactions,
     })
   })
@@ -392,7 +396,8 @@ describe("owner passkey verification path inside grantBatch (plan Task 26)", () 
       })
       const accessRequest = await buildSignedAccessRequest({ chain: alice, agent, scopes: [{ namespace: "goals.career", permissions: PERMISSION.READ }] })
       const approval = await vault.approveGrant({ accessRequest, manifest: agent.manifest, selection: { kind: "recommended" } })
-      return { gasUsed: approval.gasUsed, probe: await probeP256Precompile(alice.publicClient), highS: await rotateWithForcedHighS(env) }
+      const gas = (await gasFacts(alice.publicClient, { grant: approval.response.capabilities[0]!.transactionHash })).grant!
+      return { gasUsed: approval.gasUsed, gas, probe: await probeP256Precompile(alice.publicClient), highS: await rotateWithForcedHighS(env) }
     } finally {
       await env.stop()
     }
@@ -419,6 +424,8 @@ describe("owner passkey verification path inside grantBatch (plan Task 26)", () 
       deploymentBlock: "0",
       p256PrecompileProbe: native.probe,
       grantBatchGasUsed: { nativeOsaka: native.gasUsed.toString(), fallbackPrague: fallback.gasUsed.toString() },
+      gasNote: GAS_NOTE,
+      gas: { nativeOsaka: native.gas, fallbackPrague: fallback.gas },
       transactions: {},
     })
   }, 300_000)
