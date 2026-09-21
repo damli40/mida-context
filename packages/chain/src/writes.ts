@@ -15,6 +15,8 @@ import { contractGas, valueGas } from "./gas.js"
 import type { TxKind } from "./gas.js"
 import { toMidaError } from "./registry.js"
 import type { ChainContext } from "./registry.js"
+import { SponsorDidNotPay } from "./sponsored.js"
+import type { SponsoredSender } from "./sponsored.js"
 
 /**
  * The fee fields a send carries — the answer of `estimateFeesPerGas`, forwarded verbatim into
@@ -48,9 +50,21 @@ export interface WriteContext extends ChainContext {
    * Runs between the gas estimate and the send: the payer's balance can be checked against the
    * estimated cost and topped up, or the send refused before a transaction the wallet cannot
    * pay for goes out (R4-4). Only the owner's context wires this; agent signers keep the bare
-   * node error, exactly as before.
+   * node error, exactly as before. On the sponsored path it never runs — the user pays nothing.
    */
   beforeSend?: (cost: SendCost) => Promise<void>
+  /**
+   * When set, `sendContract` asks this sender to pay the gas first (the user still signs; the
+   * sponsor pays). A SponsorDidNotPay falls back to the self-paid path — or refuses, when
+   * SPONSOR_FALLBACK_TO_SELF_PAY is off. Any other error (an included-but-reverted operation
+   * among them) propagates untouched: the sponsor did pay and the call itself failed.
+   */
+  sponsor?: SponsoredSender
+  /**
+   * One plain line while a slow step runs — where the sponsor fallback explains itself. Wired by
+   * the runtime to its own progress channel; unset means silent code paths stay silent.
+   */
+  progress?: (line: string) => void
 }
 
 /** A write context whose account can sign typed data locally (operators, owners and agent signers in tests and the CLI). */
@@ -86,6 +100,15 @@ async function estimateSendFee(context: WriteContext): Promise<SendFee> {
 }
 
 /**
+ * Whether a sponsor failure falls back to paying gas from the user's own wallet. The testnet
+ * probe's step f (docs/evidence/m3-sponsor-probe.json, Sep 21) measured that a 7702-delegated
+ * address holding under 10 MON CAN still pay its own gas, so the fallback is safe — the
+ * reviewer flips this constant if a later probe or a Monad change breaks that finding, and the
+ * fallback message becomes a refusal with instructions instead.
+ */
+export const SPONSOR_FALLBACK_TO_SELF_PAY = true
+
+/**
  * Simulates first so a revert surfaces as a named contract error mapped to a protocol code, then
  * estimates the gas and refuses the send when the estimate exceeds the kind's ceiling (Monad bills
  * the limit, not the usage). Within the ceiling the transaction is sent with `gas` set explicitly
@@ -111,12 +134,38 @@ export async function sendContract(
     throw toMidaError(error)
   }
   let gas: bigint
+  try {
+    // The per-kind ceiling runs before the sponsor is asked — a call over its ceiling is refused
+    // locally, never sent to be refused remotely (M3-D).
+    gas = await contractGas(context, call, kind)
+  } catch (error) {
+    throw toMidaError(error)
+  }
+  if (context.sponsor !== undefined) {
+    try {
+      return await context.sponsor.send(call, kind)
+    } catch (error) {
+      if (!(error instanceof SponsorDidNotPay)) throw error
+      if (!SPONSOR_FALLBACK_TO_SELF_PAY) {
+        // The probe (m3-sponsor-probe step f, Sep 21) measured that a delegated address under
+        // 10 MON CAN pay its own gas — while that stays true the fallback below is safe and this
+        // branch is unreachable. If a Monad change ever makes self-pay impossible for delegated
+        // addresses, flipping the constant turns the silent failure mode into this refusal.
+        throw new MidaError(
+          "SPONSOR_FAILED",
+          `the gas sponsor did not pay (${error.reason}) and this build cannot fall back to self-pay — fund the wallet or try the sponsor again later`,
+        )
+      }
+      context.progress?.(`the gas sponsor did not pay (${error.reason}); paying from your own wallet…`)
+      // falls through to the self-paid path — exactly one attempt, never a retry loop
+    }
+  }
   let fee: SendFee
   try {
     // The fee is estimated ONCE here and forwarded into the send below: the balance guard checks
     // gasLimit × this maxFeePerGas, the node checks the same product, and no second estimate can
     // drift between the two reads (R5-9).
-    ;[gas, fee] = await Promise.all([contractGas(context, call, kind), estimateSendFee(context)])
+    fee = await estimateSendFee(context)
   } catch (error) {
     throw toMidaError(error)
   }

@@ -30,9 +30,13 @@ const DELEGATION_PREFIX = "0xef0100"
  * that was included and reverted is a different outcome (the sponsor DID pay) and is never retried.
  */
 export class SponsorDidNotPay extends MidaError {
-  constructor(detail: string) {
-    super("SPONSOR_FAILED", detail)
+  /** The short human reason, surfaced on the fallback progress line. */
+  readonly reason: string
+
+  constructor(reason: string) {
+    super("SPONSOR_FAILED", reason)
     this.name = "SponsorDidNotPay"
+    this.reason = reason
   }
 }
 
