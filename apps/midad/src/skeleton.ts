@@ -1,14 +1,14 @@
 import { privateKeyToAccount } from "viem/accounts"
 import { MidaError, PERMISSION, decodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
 import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScope } from "@mida/protocol"
-import { capabilityRegistryAbi, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
+import { capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
 import type { ChainContext, HistoryScanCursor } from "@mida/chain"
 import { provisionAgent } from "@mida/fake-vault"
 import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
 import type { StoredCheckpoint } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
-import { NAMESPACE, PURPOSE_ID } from "./runtime.js"
+import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl } from "./runtime.js"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { FACT_NAMESPACES } from "./remember.js"
 import { unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
@@ -121,7 +121,11 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
   // The daemon needs the owner's public address to verify the signed approved-projects list and to
   // ask the chain about grants — it never reads owner/secrets.json, so the address is public metadata.
   saveOwnerAddress(home, owner)
-  await runtime.ensureFunded(owner, "your wallet")
+  // With a gas sponsor every send below is paid by the sponsor — a brand-new empty owner wallet
+  // inits fine (M3-C). Without one the owner pays for everything, so the wallet must hold gas
+  // first: the refusal names the address to fund and a re-run resumes where this one stopped.
+  const sponsorUrl = parseSponsorUrl(network.sponsorUrl)
+  if (sponsorUrl === undefined) await runtime.ensureFunded(owner, "your wallet")
   const ownerKey = await reader.ownerP256Key(owner)
   if (ownerKey == null || ownerKey.qx === 0n) {
     runtime.progress?.("registering your key on the chain…")
@@ -140,11 +144,29 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
 
   const operatorAccount = privateKeyToAccount(loadOrCreateOperatorSecrets(home).privateKey)
   const operator = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: operatorAccount })
+  if (sponsorUrl !== undefined) {
+    // The operator registers every agent — sponsored too, so an empty wallet still works.
+    operator.sponsor = createSponsoredSender({
+      sponsorUrl,
+      rpcUrl: network.rpcUrl,
+      account: operatorAccount,
+      deployment: network.deployment,
+      progress: (line) => runtime.progress?.(line),
+    })
+  }
+  // The operator pays its own gas only when the sponsor cannot (or is off) — and its top-up
+  // then comes from the owner's wallet, so the failure still prints the send-MON line instead
+  // of a bare node error deep inside a register.
+  operator.beforeSend = makeOwnerBalanceGuard({
+    chain: operator,
+    fund: network.fund ?? ((address) => runtime.topUpFromOwner(address)),
+    progress: (line) => runtime.progress?.(line),
+  })
   const agents: Record<string, Hex> = {}
   for (const name of agentNames) {
     let identity = loadAgentIdentity(home, name)
     if (identity === undefined) {
-      await runtime.ensureFunded(operatorAccount.address, "the operator wallet")
+      if (sponsorUrl === undefined) await runtime.ensureFunded(operatorAccount.address, "the operator wallet")
       // Saved to disk BEFORE the registration transaction: a crash must never leave a registered agent with no key.
       let signerPrivateKey = loadOrCreateSignerKey(home, name)
       // Unless the crash came after registration: then this signer is bound to an agent whose encryption key was
@@ -167,7 +189,9 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
     }
     // An idempotent PUT, run for every agent on every init: a manifest upload lost to a crash is retried here.
     await runtime.ownerApi.putAgentManifest(identity.manifest)
-    await runtime.ensureFunded(privateKeyToAccount(identity.signerPrivateKey).address, `${name}'s wallet`)
+    if (sponsorUrl === undefined) {
+      await runtime.ensureFunded(privateKeyToAccount(identity.signerPrivateKey).address, `${name}'s wallet`)
+    }
     // `assistant` never joins a project, so there is no request/approve round-trip for it: the owner
     // grants its whole READ-only policy grant at init. Missing scopes only — a re-run sends nothing.
     if (identity.purposeId === "general_assistance") {

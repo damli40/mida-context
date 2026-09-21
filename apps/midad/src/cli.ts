@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { realpathSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -16,6 +17,8 @@ import type { InstallTool } from "./install.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE } from "./runtime.js"
 import type { Network, ServiceRuntime } from "./runtime.js"
+import { siblingEntryArgs } from "./sibling.js"
+import { testnetNetwork } from "./testnet.js"
 import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
 
 /** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. */
@@ -283,7 +286,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     }
     return 0
   } catch (error) {
-    deps.print(ownerRefusalLine(command, agent, error))
+    deps.print(ownerRefusalLine(command, agent, error, runtime.owner))
     // Owner commands run in the owner's own terminal, and a bare "ERROR" leaves them blind. Only
     // when they ask (MIDA_DEBUG=1): the error's name and first lines, long hex strings masked.
     if (process.env.MIDA_DEBUG === "1") {
@@ -301,7 +304,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
  * never echoed because it could carry data. `agent` is the command's subject — for `remember`
  * argv[1] is fact text, but the agent-naming codes cannot surface from remember anyway.
  */
-export function ownerRefusalLine(command: string, agent: string, error: unknown): string {
+export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string): string {
   const code = (error as { code?: unknown }).code
   switch (code) {
     // The owner saw the preview and answered something other than yes — nothing was signed.
@@ -319,6 +322,12 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown)
     // MidaError prefixes its own message with "<code>: " — the owner reads the sentence, not
     // the code, so that prefix is stripped here.
     case "OWNER_WALLET_LOW": {
+      // No funder and no sponsor means the owner wallet itself pays for everything — so the
+      // answer to a failed init is always the address that needs MON, not the wallet that was
+      // short mid-run. `init` resumes: re-running it sends only what has not landed yet.
+      if (command === "init" && ownerAddress !== undefined) {
+        return `your owner wallet cannot pay for the setup — send at least 0.5 testnet MON to this address, then run \`mida init\` again: ${ownerAddress}`
+      }
       if (!(error instanceof Error)) return "refused: OWNER_WALLET_LOW"
       const prefix = "OWNER_WALLET_LOW: "
       return error.message.startsWith(prefix) ? error.message.slice(prefix.length) : error.message
@@ -459,112 +468,121 @@ export function runInstall(
   }
 }
 
-const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
-const DAEMON_MAIN = fileURLToPath(new URL("./daemon-main.ts", import.meta.url))
 /** How long a CLI waits for a spawned daemon to open its runtime — the first open fetches the chain head. */
 const DAEMON_WAIT_MS = 30_000
 const CLI_CALL_TIMEOUT_MS = 120_000
 
-/** The detached daemon spawn: same env stripping as the old drainer — no agent credentials leak. */
-function spawnDaemon(): void {
-  const child = spawn(process.execPath, ["--import", "tsx", DAEMON_MAIN], {
+/**
+ * The detached daemon spawn: same env stripping as the old drainer — no agent credentials leak.
+ * The child is the built `midad` next to this file when the package is bundled, the .ts source
+ * through the repo's tsx loader when it is not (sibling.ts owns that decision), and its working
+ * directory is the Mida home — never the folder the code happens to live in.
+ */
+function spawnDaemon(cwd: string): void {
+  const child = spawn(process.execPath, siblingEntryArgs("midad"), {
     detached: true,
     stdio: "ignore",
-    cwd: REPO_ROOT,
+    cwd,
     env: drainerEnv(process.env),
   })
   child.on("error", () => {})
   child.unref()
 }
 
-/** Entry point for `pnpm mida`. Monad testnet only; needs DEPLOYER_PRIVATE_KEY in the environment as the funder. */
+/** Entry point for the `mida` command. Monad testnet only; a funder is optional (see testnet.ts). */
 async function main(): Promise<void> {
-  const { monadTestnetEnvironment } = await import("@mida/cli")
-  const env = await monadTestnetEnvironment()
-  try {
-    // MIDA_HOME must mean the same folder here as in the daemon and both hooks (they all read it);
-    // when this ignored it, `init` wrote to ~/.mida while the daemon it spawned looked elsewhere.
-    const home = resolveHome(process.env)
-    const network: Network = {
-      rpcUrl: env.rpcUrl,
-      deployment: env.deployment,
-      fund: env.fund,
-      // the hosted Context API and the gas sponsor, when this machine has them — init persists
-      // both to network.json so the daemon and the drainer see them without the variables
-      storageUrl: process.env.MIDA_STORAGE_URL,
-      sponsorUrl: process.env.MIDA_SPONSOR_URL,
-    }
-    const argv = process.argv.slice(2)
-    const print = (line: string) => console.log(line)
+  // MIDA_HOME must mean the same folder here as in the daemon and both hooks (they all read it);
+  // when this ignored it, `init` wrote to ~/.mida while the daemon it spawned looked elsewhere.
+  const home = resolveHome(process.env)
+  const argv = process.argv.slice(2)
+  const print = (line: string) => console.log(line)
 
-    // Owner commands — init, approve, revoke, remember — run in this process on the owner
-    // runtime and are never sent to the daemon socket. `init` still spawns the daemon when one
-    // is not already running; the others reuse a live daemon's Context API or start their own.
-    if (OWNER_COMMANDS.includes(argv[0] ?? "")) {
-      const code = await runCli(argv, { home, network, print, cwd: process.cwd() })
-      if (argv[0] === "init" && code === 0) {
-        const health = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
-        if (health.status === 0) spawnDaemon()
-      }
-      process.exitCode = code
-      return
-    }
+  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
+    print(USAGE)
+    process.exitCode = argv.length === 0 ? 2 : 0
+    return
+  }
 
-    // install, uninstall and doctor are local commands: they never go through the daemon.
-    // install edits the tool's own config outside the Mida home, and doctor's first check is
-    // whether the daemon is even up — running it through the socket would report on nothing.
-    if (argv[0] === "install" || argv[0] === "uninstall") {
-      // the real settings paths are built here and only here — tests always pass their own
-      process.exitCode = runInstall(argv, {
-        print,
-        claudeSettings: join(homedir(), ".claude", "settings.json"),
-        codexConfig: join(homedir(), ".codex", "config.toml"),
-      })
-      return
-    }
+  // install, uninstall and doctor are local commands: they never go through the daemon.
+  // install edits the tool's own config outside the Mida home, and doctor's first check is
+  // whether the daemon is even up — running it through the socket would report on nothing.
+  if (argv[0] === "install" || argv[0] === "uninstall") {
+    // the real settings paths are built here and only here — tests always pass their own
+    process.exitCode = runInstall(argv, {
+      print,
+      claudeSettings: join(homedir(), ".claude", "settings.json"),
+      codexConfig: join(homedir(), ".codex", "config.toml"),
+    })
+    return
+  }
 
-    if (argv[0] === "doctor") {
-      const settings = {
-        "claude-code": join(homedir(), ".claude", "settings.json"),
-        codex: join(homedir(), ".codex", "config.toml"),
-      }
-      if (argv[1] === "--live") {
-        const tool = argv[2] ?? ""
-        if (argv.length !== 3 || !INSTALL_TOOLS.includes(tool)) {
-          print(USAGE)
-          process.exitCode = 2
-          return
-        }
-        process.exitCode = await runDoctorLive(tool as InstallTool, { home, print })
-        return
-      }
-      if (argv.length !== 1) {
+  if (argv[0] === "doctor") {
+    const settings = {
+      "claude-code": join(homedir(), ".claude", "settings.json"),
+      codex: join(homedir(), ".codex", "config.toml"),
+    }
+    if (argv[1] === "--live") {
+      const tool = argv[2] ?? ""
+      if (argv.length !== 3 || !INSTALL_TOOLS.includes(tool)) {
         print(USAGE)
         process.exitCode = 2
         return
       }
-      process.exitCode = await runDoctor({ home, print, settings })
+      process.exitCode = await runDoctorLive(tool as InstallTool, { home, print })
       return
     }
-
-    const up = await ensureDaemon(home, spawnDaemon, { waitMs: DAEMON_WAIT_MS })
-    if (!up) {
-      print("midad did not start; run `mida init` first")
-      process.exitCode = 1
+    if (argv.length !== 1) {
+      print(USAGE)
+      process.exitCode = 2
       return
     }
-    const reply = await callDaemon(home, "/cli", { argv, cwd: process.cwd() }, { timeoutMs: CLI_CALL_TIMEOUT_MS })
-    const body = reply.body as { code?: unknown; lines?: unknown } | null
-    if (reply.status === 0 || typeof body?.code !== "number" || !Array.isArray(body.lines)) {
-      print("midad did not answer")
-      process.exitCode = 1
-      return
-    }
-    for (const line of body.lines) print(String(line))
-    process.exitCode = body.code
-  } finally {
-    await env.stop()
+    process.exitCode = await runDoctor({ home, print, settings })
+    return
   }
+
+  // Everything below touches the chain, so this is where the network is resolved — deployment
+  // record, hosted service defaults, the optional funder — never earlier: `--help`, `install`
+  // and `doctor` must work with no RPC reachable at all.
+  const network = await testnetNetwork(process.env)
+
+  // Owner commands — init, approve, revoke, remember — run in this process on the owner
+  // runtime and are never sent to the daemon socket. `init` still spawns the daemon when one
+  // is not already running; the others reuse a live daemon's Context API or start their own.
+  if (OWNER_COMMANDS.includes(argv[0] ?? "")) {
+    const code = await runCli(argv, { home, network, print, cwd: process.cwd() })
+    if (argv[0] === "init" && code === 0) {
+      const health = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
+      if (health.status === 0) spawnDaemon(home.root)
+    }
+    process.exitCode = code
+    return
+  }
+
+  const up = await ensureDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS })
+  if (!up) {
+    print("midad did not start; run `mida init` first")
+    process.exitCode = 1
+    return
+  }
+  const reply = await callDaemon(home, "/cli", { argv, cwd: process.cwd() }, { timeoutMs: CLI_CALL_TIMEOUT_MS })
+  const body = reply.body as { code?: unknown; lines?: unknown } | null
+  if (reply.status === 0 || typeof body?.code !== "number" || !Array.isArray(body.lines)) {
+    print("midad did not answer")
+    process.exitCode = 1
+    return
+  }
+  for (const line of body.lines) print(String(line))
+  process.exitCode = body.code
 }
 
-if (process.argv[1] !== undefined && import.meta.url === new URL(`file://${process.argv[1]}`).href) await main()
+// `node dist/mida.js` reaches main through the bin symlink too: argv[1] is the .bin shim path
+// while import.meta.url is the real file, so the comparison must run on realpaths.
+const invoked =
+  process.argv[1] !== undefined && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
+if (invoked) {
+  main().catch((error: unknown) => {
+    const e = error as { message?: unknown }
+    console.error(`mida: ${typeof e.message === "string" ? e.message : String(error)}`)
+    process.exitCode = 1
+  })
+}

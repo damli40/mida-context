@@ -1,5 +1,4 @@
 import { spawn } from "node:child_process"
-import { fileURLToPath } from "node:url"
 import { callDaemon, ensureDaemon } from "./control.js"
 import { noContextText } from "./handoff.js"
 import type { SessionStartBody } from "./hook-output.js"
@@ -10,9 +9,8 @@ import { drainerEnv } from "./hook.js"
 import { appendLog } from "./log.js"
 import { isSafeName } from "./queue.js"
 import { writeSeen } from "./whatsnew.js"
+import { siblingEntryArgs } from "./sibling.js"
 
-const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
-const DAEMON_MAIN = fileURLToPath(new URL("./daemon-main.ts", import.meta.url))
 const STDIN_CAP_BYTES = 1_000_000
 /** The session-start hook may wait for the daemon to come up — but not forever. */
 const DAEMON_WAIT_MS = 4_000
@@ -46,11 +44,13 @@ function writeLine(line: string): Promise<void> {
   })
 }
 
-function spawnDaemon(): void {
-  const child = spawn(process.execPath, ["--import", "tsx", DAEMON_MAIN], {
+// Built `midad` beside this file in dist, or the .ts entry through the repo's tsx loader —
+// sibling.ts decides; the Mida home is the child's working directory.
+function spawnDaemon(cwd: string): void {
+  const child = spawn(process.execPath, siblingEntryArgs("midad"), {
     detached: true,
     stdio: "ignore",
-    cwd: REPO_ROOT,
+    cwd,
     env: drainerEnv(process.env),
   })
   child.on("error", () => {})
@@ -139,7 +139,7 @@ async function main(): Promise<void> {
   if (record.hook_event_name !== "SessionStart") return
   const cwd = typeof record.cwd === "string" && record.cwd !== "" ? record.cwd : process.cwd()
   // before `init` wrote network.json no daemon can exist — the spawn would die on the same check
-  const up = home.has("network.json") && (await ensureDaemon(home, spawnDaemon, { waitMs: DAEMON_WAIT_MS }))
+  const up = home.has("network.json") && (await ensureDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS }))
   if (!up) {
     await writeLine(degraded("daemon-down"))
     return

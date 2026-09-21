@@ -18,7 +18,8 @@ import type { InstallTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
 import { listJobs } from "./queue.js"
-import { MIN_BALANCE_WEI } from "./runtime.js"
+import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI } from "./runtime.js"
+import { cliPackageName, isBundled } from "./sibling.js"
 
 /** The whole run is capped — a check may stall, the report may not. */
 const RUN_CAP_MS = 20_000
@@ -111,13 +112,58 @@ function ownerAddressOf(home: MidaHome): Address | "missing" {
 
 const NEEDS_NETWORK = `needs network.json — ${INIT_FIX}`
 const NEEDS_OWNER = `needs the owner key — ${INIT_FIX}`
-/**
- * The repo's own `bin/` — the fix text for a missing hook command names it, because until the
- * npm package exists the launchers live here and nowhere else.
- */
+/** The repo's own `bin/` — the missing-hook-command fix for SOURCE-tree runs only (see hookCommandFix). */
 const BIN_DIR = fileURLToPath(new URL("../../../bin/", import.meta.url))
 /** The commands `mida install` writes into the tools' hook settings — bare text on purpose. */
 const HOOK_COMMANDS = ["mida-hook", "mida-inject"] as const
+
+/**
+ * The fix for a hook command missing from PATH. Running from the npm package, the answer is the
+ * global install — npm links the bins itself, and the package name comes from its own
+ * package.json so nothing but publish/names.json hard-codes it. Running from the source tree
+ * the launchers live in the repo's bin/. The two texts must never cross: a packaged user has no
+ * repo to add to PATH, and a repo run has no package.
+ */
+function hookCommandFix(): string {
+  if (isBundled()) {
+    const name = cliPackageName()
+    return name === undefined ? "reinstall the mida CLI package globally" : `run \`npm i -g ${name}\``
+  }
+  return `add ${BIN_DIR} to your PATH`
+}
+
+/** The HOST of a service URL — the path or query could carry an operator's key, so only the host is ever printed. */
+function hostOf(raw: string): string {
+  try {
+    const host = new URL(raw).host
+    return host === "" ? "an address that does not parse" : host
+  } catch {
+    return "an address that does not parse"
+  }
+}
+
+/** Every environment variable Mida reads — the environment check prints set/unset, never a value. */
+const ENV_VARS = [
+  "MIDA_HOME",
+  "MIDA_STORAGE_URL",
+  "MIDA_SPONSOR_URL",
+  "MIDA_DEPLOYMENTS_DIR",
+  "MIDA_DEBUG",
+  "MIDA_COMPILE_MODEL",
+  "MIDA_CLAUDE_SETTINGS",
+  "MIDA_CODEX_CONFIG",
+  "MIDA_INNER",
+  "MIDA_E2E_MONAD_TESTNET",
+  "KIMI_API_KEY",
+  "KIMI_BASE_URL",
+  "KIMI_MODEL",
+  "KIMI_TIMEOUT_MS",
+  "MONAD_TESTNET_RPC",
+  "DEPLOYER_PRIVATE_KEY",
+  "TESTNET_FUNDING_WEI",
+  "FOUNDRY_BIN",
+  "VAULT_RP_ID",
+] as const
 
 /**
  * Is `command` runnable on the PATH the doctor itself runs with? The PATH is walked directly —
@@ -253,7 +299,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         return HOOK_COMMANDS.map((command) =>
           onPath(env, command)
             ? `ok: ${command} is on the PATH`
-            : problem(`the command \`${command}\` is not on your PATH, so the hooks cannot run`, `add ${BIN_DIR} to your PATH`),
+            : problem(`the command \`${command}\` is not on your PATH, so the hooks cannot run`, hookCommandFix()),
         )
       },
     },
@@ -383,20 +429,48 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       },
     },
     {
+      name: "services",
+      run: async () => {
+        // What the Context API and the gas sponsor resolve to right now: the value init
+        // persisted to network.json when one is there, else the env override, else the hosted
+        // default the package ships with. The host only — a path or query could carry a key.
+        const env = deps.env ?? process.env
+        const stored = home.readJson<{ storageUrl?: unknown; sponsorUrl?: unknown }>("network.json")
+        const describe = (label: string, envName: string, raw: string | undefined, persisted: unknown, hosted: string, off: string): string => {
+          if (typeof persisted === "string" && persisted !== "") return `${label}: ${hostOf(persisted)} (network.json)`
+          if (raw === "off") return `${label}: ${off}`
+          if (raw !== undefined && raw !== "") return `${label}: ${hostOf(raw)} (${envName})`
+          return `${label}: ${hostOf(hosted)} (default)`
+        }
+        return [
+          `ok: ${describe("store", "MIDA_STORAGE_URL", env.MIDA_STORAGE_URL, stored?.storageUrl, HOSTED_STORAGE_URL, "off — the local store")}`,
+          `ok: ${describe("sponsor", "MIDA_SPONSOR_URL", env.MIDA_SPONSOR_URL, stored?.sponsorUrl, HOSTED_SPONSOR_URL, "off — sends pay their own gas")}`,
+        ]
+      },
+    },
+    {
+      name: "environment",
+      run: async () => {
+        // Every variable Mida reads, named set or unset — never a value: DEPLOYER_PRIVATE_KEY,
+        // KIMI_API_KEY and a URL carrying a key must not echo to a pasted report.
+        const env = deps.env ?? process.env
+        const set = ENV_VARS.filter((name) => env[name] !== undefined && env[name] !== "")
+        const unset = ENV_VARS.filter((name) => env[name] === undefined || env[name] === "")
+        return [
+          `ok: environment — set: ${set.length === 0 ? "none" : set.join(", ")}`,
+          `ok: environment — unset: ${unset.length === 0 ? "none" : unset.join(", ")}`,
+        ]
+      },
+    },
+    {
       name: "sponsor",
       run: async () => {
         // network.json again, not the shared context — the sponsor answer needs no chain at all
         const stored = home.readJson<{ sponsorUrl?: unknown }>("network.json")
         const sponsorUrl = typeof stored?.sponsorUrl === "string" ? stored.sponsorUrl : ""
-        if (sponsorUrl === "") return ["ok: no gas sponsor configured — sends pay their own gas"]
+        if (sponsorUrl === "") return ["ok: no gas sponsor in network.json — the services check shows what init will use"]
         // the HOST is printed, never the URL — its path or query may carry an operator's key
-        let host = "an address that does not parse"
-        try {
-          host = new URL(sponsorUrl).host
-          if (host === "") host = "an address that does not parse"
-        } catch {
-          // the placeholder stands
-        }
+        const host = hostOf(sponsorUrl)
         try {
           const reply = await fetch(sponsorUrl, { signal: AbortSignal.timeout(2_000) })
           if (!reply.ok) {

@@ -141,6 +141,6 @@ describe("the doctor sponsor line", () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-sponsorurl-")))
     home.writeSecretJson("network.json", { chainId: 31337 })
     const lines = await doctorLines(home)
-    expect(lines).toContain("ok: no gas sponsor configured — sends pay their own gas")
+    expect(lines).toContain("ok: no gas sponsor in network.json — the services check shows what init will use")
   })
 })
