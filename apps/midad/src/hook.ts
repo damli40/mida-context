@@ -16,23 +16,33 @@ const KNOWN_EVENTS: ReadonlySet<string> = new Set<HookEvent>(["PostToolUse", "St
 /** The kick must never slow the hook down: a daemon that does not answer inside 150 ms is treated as down. */
 const KICK_TIMEOUT_MS = 150
 
-/** Where each agent keeps its session transcripts, relative to the user's home folder. */
-const TRANSCRIPT_DIRS: Readonly<Record<string, string>> = { "claude-code": ".claude/projects" }
+/**
+ * Where each agent keeps its session transcripts, relative to the user's home folder. Codex
+ * writes session rollouts at `<CODEX_HOME>/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl` — verified
+ * against the throwaway CODEX_HOME the spike harness runs — and CODEX_HOME defaults to ~/.codex.
+ * An agent with no entry here has no trusted transcript folder at all and is refused outright.
+ */
+const TRANSCRIPT_DIRS: Readonly<Record<string, string>> = {
+  "claude-code": ".claude/projects",
+  codex: ".codex/sessions",
+}
 
 /**
  * The hook must not be an any-file reader: a transcript is only trusted when it is an absolute
  * `.jsonl` path that really is a regular file (never a symlink, checked with lstat) sitting under
  * the agent's transcript folder inside `homeDir` — for `claude-code` that is
- * `<homeDir>/.claude/projects/`. The realpath comparison also catches a symlinked parent folder;
- * an agent with no known transcript folder may only read files under `homeDir` at all.
+ * `<homeDir>/.claude/projects/`. The realpath comparison also catches a symlinked parent folder.
+ * An agent with no entry in TRANSCRIPT_DIRS is refused — there is no fallback to the home folder.
  */
 export function transcriptPathAllowed(transcriptPath: unknown, agent: string, homeDir: string): transcriptPath is string {
   if (typeof transcriptPath !== "string" || transcriptPath === "") return false
   if (!isAbsolute(transcriptPath) || !transcriptPath.endsWith(".jsonl")) return false
+  const dir = TRANSCRIPT_DIRS[agent]
+  if (dir === undefined) return false
   try {
     const stat = lstatSync(transcriptPath)
     if (stat.isSymbolicLink() || !stat.isFile()) return false
-    const base = realpathSync(join(homeDir, TRANSCRIPT_DIRS[agent] ?? ""))
+    const base = realpathSync(join(homeDir, dir))
     const inside = relative(base, realpathSync(transcriptPath))
     return inside !== "" && !inside.startsWith("..") && !isAbsolute(inside)
   } catch {

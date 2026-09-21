@@ -181,6 +181,36 @@ describe("runHook", () => {
     expect(listJobs(home)).toHaveLength(0)
     expect(readFileSync(home.path("logs/hook.jsonl"), "utf8")).toContain("bad-transcript-path")
   })
+
+  it("an agent with no configured transcript folder is refused — never handed the whole home", async () => {
+    const { dir, home, stdinFor } = setup()
+    // a perfectly valid .jsonl inside the home folder but outside every transcript dir:
+    // a missing TRANSCRIPT_DIRS entry must mean refusal, not "anywhere under home goes"
+    const loose = join(dir, "anywhere.jsonl")
+    writeFileSync(loose, "{}\n")
+    for (const agent of ["cursor", "windsurf"]) {
+      await hook({ dir, home, stdin: stdinFor({ transcript_path: loose }), agent })
+    }
+    expect(listJobs(home)).toHaveLength(0)
+    const log = readFileSync(home.path("logs/hook.jsonl"), "utf8")
+    expect(log.match(/bad-transcript-path/g)).toHaveLength(2)
+  })
+
+  it("a codex rollout under .codex/sessions is accepted; the same agent in another folder is refused", async () => {
+    const { dir, home, transcriptPath, stdinFor } = setup()
+    // codex-cli writes session rollouts at <CODEX_HOME>/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl
+    const sessions = join(dir, ".codex", "sessions", "2026", "09", "21")
+    mkdirSync(sessions, { recursive: true })
+    const rollout = join(sessions, "rollout-2026-09-21T10-00-00-abc.jsonl")
+    writeFileSync(rollout, "{}\n")
+    await hook({ dir, home, stdin: stdinFor({ transcript_path: rollout }), agent: "codex" })
+    const jobs = listJobs(home)
+    expect(jobs).toHaveLength(1)
+    expect(jobs[0]).toMatchObject({ agent: "codex", transcriptPath: rollout })
+    // the folders are per-agent: codex naming a claude-code transcript is refused
+    await hook({ dir, home, stdin: stdinFor({ transcript_path: transcriptPath }), agent: "codex" })
+    expect(listJobs(home)).toHaveLength(1)
+  })
 })
 
 /** A socket server the test controls: `onRequest` decides what a connection gets back. */

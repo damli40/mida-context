@@ -41,6 +41,31 @@ function measuredShape(dir: string) {
 }
 
 describe("readConversation", () => {
+  it("collects the cwd each line records — first-seen order, broken and cwd-less lines skipped", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", cwd: "/work/one", message: { content: "hi" } }),
+      "not json{",
+      JSON.stringify({ type: "assistant", cwd: "/work/two", message: { content: [{ type: "text", text: "ok" }] } }),
+      JSON.stringify({ type: "user", cwd: "/work/one", message: { content: "again" } }),
+      JSON.stringify({ type: "summary", summary: "no folder recorded here" }),
+    ])
+    const r = readConversation(t)
+    expect(r.format).toBe("claude-jsonl")
+    expect(r.cwds).toEqual(["/work/one", "/work/two"])
+  })
+
+  it("a transcript that records no folders answers an empty cwds list", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { content: "hi" } }),
+    ])
+    expect(readConversation(t).cwds).toEqual([])
+    // and an unreadable-format file collects nothing either
+    const weird = writeTranscript(dir, ["plain text, not json"])
+    expect(readConversation(weird).cwds).toEqual([])
+  })
+
   it("bookkeeping is skipped, constraint + final answer kept (G1)", () => {
     const dir = tmpdir()
     const { path: t, payload } = measuredShape(dir)

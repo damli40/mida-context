@@ -106,6 +106,52 @@ describe("the drainer re-checks transcript paths before trusting them", () => {
   })
 })
 
+describe("the transcript's own record of where it ran must agree with the project", () => {
+  it("lines that record a different marked project's folder refuse with transcript-project-mismatch", async () => {
+    const { dir, home, transcriptPath, cwd, job, drain, compileCalls, saveCalls, drainLog } = setup()
+    // a second marked folder belonging to a different project than the job's cwd (p-1)
+    const other = join(dir, "other-work")
+    mkdirSync(join(other, ".mida"), { recursive: true })
+    writeFileSync(join(other, ".mida", "project.json"), JSON.stringify({ projectId: "p-2" }))
+    // the job claims the session ran in p-1's folder; the transcript itself says it ran in p-2's
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: "user", cwd: other, message: { content: "work on the other project" } }) + "\n" +
+        JSON.stringify({ type: "assistant", cwd: other, message: { content: [{ type: "text", text: "done" }] } }) + "\n",
+    )
+    const queued = job({ event: "Stop" }, T0)
+    const result = await drain()
+    expect(result.saved).toBe(0)
+    expect(compileCalls).toHaveLength(0)
+    expect(saveCalls).toHaveLength(0)
+    expect(home.has(`queue/bad/${queued.id}.json`)).toBe(true)
+    expect(listJobs(home)).toHaveLength(0)
+    expect(drainLog()).toContain('"reason":"transcript-project-mismatch"')
+  })
+
+  it("lines recording folders inside the same project still save", async () => {
+    const { transcriptPath, cwd, job, drain, saveCalls } = setup()
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: "user", cwd, message: { content: "work on this" } }) + "\n" +
+        JSON.stringify({ type: "assistant", cwd: join(cwd, "sub"), message: { content: [{ type: "text", text: "done" }] } }) + "\n",
+    )
+    job({ event: "Stop" }, T0)
+    expect((await drain()).saved).toBe(1)
+    expect(saveCalls).toHaveLength(1)
+  })
+
+  it("a recorded folder with no project marker above it does not refuse the save", async () => {
+    const { dir, transcriptPath, job, drain, saveCalls } = setup()
+    const nowhere = join(dir, "unmarked")
+    mkdirSync(nowhere)
+    writeFileSync(transcriptPath, JSON.stringify({ type: "user", cwd: nowhere, message: { content: "hi" } }) + "\n")
+    job({ event: "Stop" }, T0)
+    expect((await drain()).saved).toBe(1)
+    expect(saveCalls).toHaveLength(1)
+  })
+})
+
 describe("one drainer at a time", () => {
   it("a live drain.lock makes a second drainer return at once, without compiling — and it says so (C4)", async () => {
     const { home, job, drain, compileCalls, drainLog } = setup()

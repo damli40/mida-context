@@ -43,6 +43,12 @@ export interface Conversation {
   format: "claude-jsonl" | "unknown-tail"
   text: string // "L<n> <role>:" blocks, ≤ maxChars
   firstUserMessage: string | null // verbatim, scrubbed, ≤ 6000 chars incl. "…"
+  /**
+   * Every distinct working folder the transcript itself records — Claude Code stamps a `cwd`
+   * field on each line — unique, in first-seen order. A file whose lines record none answers []:
+   * "no record", never a guess.
+   */
+  cwds: string[]
   messagesKept: number
   messagesTotal: number
   omitted: number
@@ -56,6 +62,7 @@ const hardCut = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "�
 // One line of the JSONL transcript, typed only as far as the reader looks.
 interface TranscriptLine {
   type?: string
+  cwd?: unknown
   message?: { content?: unknown }
 }
 
@@ -146,6 +153,7 @@ export function readConversation(
   // messagesTotal counts every user/assistant line (even ones that render
   // empty); msgs holds only those that produced a rendered block.
   const msgs: { role: string; block: string }[] = []
+  const cwds: string[] = []
   let messagesTotal = 0
   let firstUserMessage: string | null = null
   raw.split("\n").forEach((line, idx) => {
@@ -156,6 +164,8 @@ export function readConversation(
     } catch {
       return // truncated or non-JSON line — skip
     }
+    const folder = obj?.cwd
+    if (typeof folder === "string" && folder !== "" && !cwds.includes(folder)) cwds.push(folder)
     if (obj?.type !== "user" && obj?.type !== "assistant") return
     messagesTotal++
     if (firstUserMessage === null && obj.type === "user") {
@@ -172,6 +182,7 @@ export function readConversation(
       format: "unknown-tail",
       text: scrubTranscript(tail),
       firstUserMessage: null,
+      cwds,
       messagesKept: 0,
       messagesTotal: 0,
       omitted: 0,
@@ -208,6 +219,7 @@ export function readConversation(
     format: "claude-jsonl",
     text: blocks.join("\n\n"),
     firstUserMessage,
+    cwds,
     messagesKept: (head ? 1 : 0) + keptTail.length,
     messagesTotal,
     omitted,

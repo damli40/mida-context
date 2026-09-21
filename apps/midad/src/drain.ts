@@ -58,6 +58,7 @@ const PERMANENT_FAILURES = new Set([
   "list-unreadable",
   "folder-mismatch",
   "check-failed",
+  "transcript-project-mismatch",
 ])
 /**
  * A checkpoint the validator rejects is usually fixed by a fresh model call, so
@@ -279,10 +280,25 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         }
         // a transcript that is not the Claude Code format is not sent to the model in M1 —
         // the file might have been swapped for one since the path check passed
-        if (readConversation(job.transcriptPath).format === "unknown-tail") {
+        const convo = readConversation(job.transcriptPath)
+        if (convo.format === "unknown-tail") {
           moveToBad(deps.home, `${job.id}.json`)
           writeState(deps.home, sessionId, terminal)
           log({ sessionId, outcome: "bad", reason: "unknown-transcript-format" })
+          continue
+        }
+        // the folders the transcript itself recorded must agree with the approved project: a
+        // session whose lines carry another marked project's folder was never this project's to
+        // save — permanent, and nothing is saved. A folder with no marker is "no record" and a
+        // transcript with no cwd fields at all keeps the old behaviour.
+        const foreign = convo.cwds.some((folder) => {
+          const marker = findProjectMarker(folder)
+          return marker !== null && marker.projectId !== null && marker.projectId !== projectId
+        })
+        if (foreign) {
+          moveToBad(deps.home, `${job.id}.json`)
+          writeState(deps.home, sessionId, terminal)
+          log({ sessionId, outcome: "bad", reason: "transcript-project-mismatch" })
           continue
         }
         // nothing is saved for an agent the owner has not approved — decided before any model call
