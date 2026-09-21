@@ -1,0 +1,10 @@
+#!/bin/sh
+# Development launcher for the capture hook, until the npm package (M3) puts a real `mida-hook`
+# on the PATH. `mida install` writes the hook as the bare text `mida-hook <tool>` on purpose:
+# Codex fingerprints the hook text and silently drops one that changes, so the text never holds
+# a path. Put this folder on the PATH of the terminal you start your agents from:
+#   export PATH="$HOME/Desktop/mida-context/bin:$PATH"
+# The loader is given by absolute path because the hook runs in the project's folder, where a
+# bare `--import tsx` would not resolve.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+exec node --import "$ROOT/node_modules/tsx/dist/loader.mjs" "$ROOT/apps/midad/src/hook-main.ts" "$@"

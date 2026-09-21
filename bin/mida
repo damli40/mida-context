@@ -1,0 +1,8 @@
+#!/bin/sh
+# Development launcher for the `mida` command, until the npm package (M3) ships a real one.
+# Unlike `pnpm mida`, it keeps the folder you ran it from, so `mida approve <agent>` approves
+# THAT project folder. Node loads the repo's `.env` itself (`--env-file`); this script never
+# reads or prints it. `exec` keeps your terminal attached, which `approve`, `revoke` and
+# `remember` require.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+exec node --env-file="$ROOT/.env" --import "$ROOT/node_modules/tsx/dist/loader.mjs" "$ROOT/apps/midad/src/cli.ts" "$@"

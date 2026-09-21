@@ -1,0 +1,6 @@
+#!/bin/sh
+# Development launcher for the session-start hook (prints the handoff), until the npm package
+# (M3) puts a real `mida-inject` on the PATH. See `bin/mida-hook` for why the hook text is a bare
+# name and how to put this folder on the PATH.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+exec node --import "$ROOT/node_modules/tsx/dist/loader.mjs" "$ROOT/apps/midad/src/inject-main.ts" "$@"

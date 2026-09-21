@@ -226,6 +226,13 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     }
     // The error code only. A message from a deeper layer is never echoed: it could carry data.
     deps.print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
+    // Owner commands run in the owner's own terminal, and a bare "ERROR" leaves them blind. Only
+    // when they ask (MIDA_DEBUG=1): the error's name and first lines, long hex strings masked.
+    if (process.env.MIDA_DEBUG === "1") {
+      const e = error as { name?: unknown; shortMessage?: unknown; message?: unknown; details?: unknown }
+      const text = [e.name, e.shortMessage ?? e.message, e.details].filter((part) => typeof part === "string").join(" | ")
+      deps.print(`debug: ${text.split("\n").slice(0, 6).join(" / ").replace(/[0-9a-fA-F]{40,}/g, "<hex>").slice(0, 900)}`)
+    }
     return 1
   }
 }
@@ -301,7 +308,9 @@ async function main(): Promise<void> {
   const { monadTestnetEnvironment } = await import("@mida/cli")
   const env = await monadTestnetEnvironment()
   try {
-    const home = new MidaHome()
+    // MIDA_HOME must mean the same folder here as in the daemon and both hooks (they all read it);
+    // when this ignored it, `init` wrote to ~/.mida while the daemon it spawned looked elsewhere.
+    const home = new MidaHome(process.env.MIDA_HOME)
     const network: Network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
     const argv = process.argv.slice(2)
     const print = (line: string) => console.log(line)
