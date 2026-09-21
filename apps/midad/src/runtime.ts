@@ -38,9 +38,9 @@ export interface Network {
 export const NAMESPACE = "projects.current"
 export const PURPOSE_ID = "project_assistance" as const
 export const AGENT_PERMISSIONS = PERMISSION.READ | PERMISSION.CREATE | PERMISSION.SUPERSEDE_OWN
-/** The hosted services the published CLI defaults to (M3-C): public endpoints, never secrets. */
-export const HOSTED_STORAGE_URL = "https://store.midacontext.xyz"
-export const HOSTED_SPONSOR_URL = "https://sponsor.midacontext.xyz"
+/** The hosted services the published CLI defaults to (M3-C): public endpoints, never secrets.
+ *  Defined once in the SDK (connect.ts) so the CLI and integrators share one source of truth. */
+export { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL } from "@mida/sdk"
 
 /**
  * One env value → the service URL that should be in effect. Unset means the hosted default the
