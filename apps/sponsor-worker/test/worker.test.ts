@@ -19,6 +19,7 @@ import { build } from "esbuild"
 import { Miniflare } from "miniflare"
 import type { Hex } from "viem"
 import type { D1Like } from "../src/budget.js"
+import { resolveGasCeilings } from "../src/worker.js"
 import {
   CAP,
   CHAIN_ID,
@@ -542,5 +543,46 @@ describe("provider failures never leak", () => {
     expect(reply.error).toBeDefined()
     expect(reply.error!.code).toBeLessThanOrEqual(-32000)
     provider = await startFakeProvider()
+  })
+})
+
+describe("the fixed gas ceilings are env-overridable downward only", () => {
+  it("unset envs give the built-ins", () => {
+    const lines: string[] = []
+    const ceilings = resolveGasCeilings({}, (line) => lines.push(line))
+    expect(ceilings).toEqual({ verificationGas: 500_000n, preVerificationGas: 500_000n, paymasterGas: 300_000n, fee: 300_000_000_000n })
+    expect(lines).toEqual([])
+  })
+
+  it("a lower env value applies", () => {
+    const ceilings = resolveGasCeilings(
+      { VERIFICATION_GAS_CEILING: "400000", PRE_VERIFICATION_GAS_CEILING: "0x61a80", PAYMASTER_GAS_CEILING: "250000", FEE_CEILING: "100000000000" },
+      () => {},
+    )
+    expect(ceilings).toEqual({ verificationGas: 400_000n, preVerificationGas: 400_000n, paymasterGas: 250_000n, fee: 100_000_000_000n })
+  })
+
+  it("a higher env value is ignored and logged", () => {
+    const lines: string[] = []
+    const ceilings = resolveGasCeilings(
+      { VERIFICATION_GAS_CEILING: "600000", PAYMASTER_GAS_CEILING: "300001", FEE_CEILING: "500000000000" },
+      (line) => lines.push(line),
+    )
+    expect(ceilings).toEqual({ verificationGas: 500_000n, preVerificationGas: 500_000n, paymasterGas: 300_000n, fee: 300_000_000_000n })
+    expect(lines).toHaveLength(3)
+    expect(lines.join(" ")).toMatch(/VERIFICATION_GAS_CEILING/)
+    expect(lines.join(" ")).toMatch(/PAYMASTER_GAS_CEILING/)
+    expect(lines.join(" ")).toMatch(/FEE_CEILING/)
+  })
+
+  it("garbage and negative env values are ignored and logged", () => {
+    const lines: string[] = []
+    const ceilings = resolveGasCeilings(
+      { VERIFICATION_GAS_CEILING: "not-a-number", PRE_VERIFICATION_GAS_CEILING: "-5" },
+      (line) => lines.push(line),
+    )
+    expect(ceilings.verificationGas).toBe(500_000n)
+    expect(ceilings.preVerificationGas).toBe(500_000n)
+    expect(lines).toHaveLength(2)
   })
 })

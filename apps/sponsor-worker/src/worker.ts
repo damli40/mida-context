@@ -1,20 +1,17 @@
 import { consumeFreeCalls, consumeSignBudget, recordIssued, refundSignBudget, utcDay, wasIssued } from "./budget.js"
 import type { D1Like } from "./budget.js"
 import {
-  CALL_GAS_CEILING,
+  CALL_OVERHEAD_PER_CALL,
+  DEFAULT_GAS_CEILINGS,
   ENTRY_POINT_V0_8,
-  FEE_CEILING,
   MAX_INNER_CALLS,
-  PAYMASTER_GAS_CEILING,
-  PRE_VERIFICATION_GAS_CEILING,
   USER_OP_METHODS,
-  VERIFICATION_GAS_CEILING,
   PolicyRefusal,
   checkUserOperation,
   checkedParams,
   operationIdentity,
 } from "./policy.js"
-import type { PolicyEnv } from "./policy.js"
+import type { GasCeilings, PolicyEnv } from "./policy.js"
 import { ProviderError, alchemyProvider, httpJsonRpcProvider, pimlicoProvider } from "./provider.js"
 import type { SponsorProvider } from "./provider.js"
 
@@ -51,6 +48,14 @@ export interface SponsorEnv {
   GLOBAL_DAILY_LIMIT?: string
   /** Daily allowance for the unsigned methods (stub data, gas estimation) — 120 by default. */
   FREE_PER_SENDER_DAILY_LIMIT?: string
+  /**
+   * Optional tighter values for the fixed gas ceilings, in wei (decimal or 0x-prefixed). Each may
+   * only LOWER its built-in — a value above it is ignored and logged, never applied.
+   */
+  VERIFICATION_GAS_CEILING?: string
+  PRE_VERIFICATION_GAS_CEILING?: string
+  PAYMASTER_GAS_CEILING?: string
+  FEE_CEILING?: string
 }
 
 const ALLOWED_METHODS = new Set([
@@ -105,6 +110,38 @@ function parseLimit(value: string | undefined, fallback: number, name: string): 
   return n
 }
 
+/**
+ * The fixed gas ceilings as deployed. An env var may only tighten a built-in — a value above it,
+ * a negative one, or one that does not parse is ignored and reported through `warn`, never
+ * applied. Values are wei, decimal or 0x-prefixed.
+ */
+export function resolveGasCeilings(
+  env: Pick<SponsorEnv, "VERIFICATION_GAS_CEILING" | "PRE_VERIFICATION_GAS_CEILING" | "PAYMASTER_GAS_CEILING" | "FEE_CEILING">,
+  warn: (line: string) => void = (line) => console.log(JSON.stringify({ warn: line })),
+): GasCeilings {
+  const resolve = (raw: string | undefined, builtin: bigint, name: string): bigint => {
+    if (raw === undefined || raw === "") return builtin
+    let value: bigint
+    try {
+      value = BigInt(raw)
+    } catch {
+      warn(`${name}="${raw}" is not a wei quantity — ignored, using the built-in ${builtin}`)
+      return builtin
+    }
+    if (value < 0n || value > builtin) {
+      warn(`${name}=${value} is outside 0..${builtin} — a ceiling may only be lowered; ignored`)
+      return builtin
+    }
+    return value
+  }
+  return {
+    verificationGas: resolve(env.VERIFICATION_GAS_CEILING, DEFAULT_GAS_CEILINGS.verificationGas, "VERIFICATION_GAS_CEILING"),
+    preVerificationGas: resolve(env.PRE_VERIFICATION_GAS_CEILING, DEFAULT_GAS_CEILINGS.preVerificationGas, "PRE_VERIFICATION_GAS_CEILING"),
+    paymasterGas: resolve(env.PAYMASTER_GAS_CEILING, DEFAULT_GAS_CEILINGS.paymasterGas, "PAYMASTER_GAS_CEILING"),
+    fee: resolve(env.FEE_CEILING, DEFAULT_GAS_CEILINGS.fee, "FEE_CEILING"),
+  }
+}
+
 export function buildWorker(env: SponsorEnv): SponsorConfig {
   const cached = built.get(env)
   if (cached) return cached
@@ -136,6 +173,7 @@ export function buildWorker(env: SponsorEnv): SponsorConfig {
       capabilityRegistry: parseAddress(required(env, "CAPABILITY_REGISTRY"), "CAPABILITY_REGISTRY"),
       contextRegistry: parseAddress(required(env, "CONTEXT_REGISTRY"), "CONTEXT_REGISTRY"),
       allowedImplementations,
+      ceilings: resolveGasCeilings(env),
     },
     secrets,
     perSenderDailyLimit: parseLimit(env.PER_SENDER_DAILY_LIMIT, 30, "PER_SENDER_DAILY_LIMIT"),
@@ -184,11 +222,11 @@ function infoResponse(config: SponsorConfig): Response {
     methods: [...ALLOWED_METHODS],
     limits: {
       maxInnerCalls: MAX_INNER_CALLS,
-      callGasLimit: CALL_GAS_CEILING.toString(),
-      verificationGasLimit: VERIFICATION_GAS_CEILING.toString(),
-      preVerificationGas: PRE_VERIFICATION_GAS_CEILING.toString(),
-      paymasterGas: PAYMASTER_GAS_CEILING.toString(),
-      maxFee: FEE_CEILING.toString(),
+      callGasLimit: `sum of each inner call's per-function ceiling + ${CALL_OVERHEAD_PER_CALL} overhead per call`,
+      verificationGasLimit: config.policy.ceilings.verificationGas.toString(),
+      preVerificationGas: config.policy.ceilings.preVerificationGas.toString(),
+      paymasterGas: config.policy.ceilings.paymasterGas.toString(),
+      maxFee: config.policy.ceilings.fee.toString(),
       signingsPerSenderPerDay: config.perSenderDailyLimit,
       signingsGlobalPerDay: config.globalDailyLimit,
       freeCallsPerSenderPerDay: config.freePerSenderDailyLimit,

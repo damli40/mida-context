@@ -2,7 +2,7 @@ import { encodeFunctionData, zeroAddress } from "viem"
 import type { Address, Hex } from "viem"
 import { capabilityRegistryAbi, contextRegistryAbi } from "@mida/chain"
 import { randomBytes } from "node:crypto"
-import { ACCOUNT_ABI } from "../src/policy.js"
+import { ACCOUNT_ABI, DEFAULT_GAS_CEILINGS } from "../src/policy.js"
 import type { PolicyEnv } from "../src/policy.js"
 
 /**
@@ -25,6 +25,7 @@ export const policyEnv: PolicyEnv = {
   capabilityRegistry: CAP,
   contextRegistry: CTX,
   allowedImplementations: new Set([IMPL]),
+  ceilings: { ...DEFAULT_GAS_CEILINGS },
 }
 
 export function randomAddress(): string {
@@ -93,7 +94,8 @@ export function validUserOp(overrides?: Record<string, unknown>): Record<string,
     sender: randomAddress(),
     nonce: "0x0",
     callData: executeCall(CAP, 0n, midaCallData()),
-    callGasLimit: "0x100000",
+    // 196,608 — under the 260,000 a single registerP256Key may bill (200k ceiling + 60k overhead).
+    callGasLimit: "0x30000",
     verificationGasLimit: "0x40000",
     preVerificationGas: "0x20000",
     maxFeePerGas: "0x1000",

@@ -1,4 +1,5 @@
 import { GAS_CEILINGS, capabilityRegistryAbi, contextRegistryAbi } from "@mida/chain"
+import type { TxKind } from "@mida/chain"
 import { decodeFunctionData, encodeFunctionData, keccak256, toFunctionSelector } from "viem"
 import type { Address, Hex } from "viem"
 
@@ -78,37 +79,86 @@ export const ACCOUNT_ABI = [
   },
 ] as const
 
-/** Every state-changing function of the two registries — the complete inner-selector allowlist. */
-export const ALLOWED_INNER_SELECTORS: ReadonlySet<string> = new Set(
+/**
+ * Every state-changing registry function names the TxKind whose measured ceiling it bills under —
+ * the same GAS_CEILINGS table the SDK's own sends use. A function absent here is absent from the
+ * payable set: a contract upgrade cannot make a new selector payable by accident.
+ *
+ * The four agent-admin functions with no measured kind ride on the measured envelopes of their
+ * shape: the two signature-free setters (rotateAgentEncryptionKey, setAgentCallbackOrigin — an
+ * operator check, a couple of writes, an event) bill like `revoke`, and the two that also recover
+ * a signature (rotateAgentSigner, updateAgentCapabilityManifest) bill like `revokeAndRotate`.
+ */
+export const GAS_KIND_BY_FUNCTION: Readonly<Record<string, TxKind>> = {
+  grantBatch: "grant.batch",
+  initializeReadEpoch: "epoch.init",
+  registerAgent: "agent.register",
+  registerP256Key: "owner.key",
+  revoke: "revoke.capability",
+  revokeAgentAndRotate: "revoke.agent",
+  revokeAndRotate: "revoke.rotate",
+  rotateAgentEncryptionKey: "revoke.capability",
+  rotateAgentSigner: "revoke.rotate",
+  rotateExpiredEpoch: "epoch.rotateExpired",
+  rotateP256Key: "owner.keyRotate",
+  setAgentCallbackOrigin: "revoke.capability",
+  updateAgentCapabilityManifest: "revoke.rotate",
+  register: "context.register",
+}
+
+/**
+ * Selector → billed ceiling, built by walking the two registry ABIs so it can never drift from
+ * them: every state-changing function contributes exactly its GAS_KIND_BY_FUNCTION ceiling, and
+ * nothing else is in the map.
+ */
+export const INNER_CALL_GAS: ReadonlyMap<string, bigint> = new Map(
   [...capabilityRegistryAbi, ...contextRegistryAbi]
     .filter(
       (item): item is Extract<(typeof item), { type: "function" }> =>
         item.type === "function" && (item.stateMutability as string) !== "view" && (item.stateMutability as string) !== "pure",
     )
-    .map((item) => toFunctionSelector(item)),
+    .flatMap((item) => {
+      const kind = GAS_KIND_BY_FUNCTION[item.name]
+      return kind === undefined ? [] : [[toFunctionSelector(item).toLowerCase(), GAS_CEILINGS[kind]] as const]
+    }),
 )
 
+/** Every state-changing function of the two registries — the complete inner-selector allowlist. */
+export const ALLOWED_INNER_SELECTORS: ReadonlySet<string> = new Set(INNER_CALL_GAS.keys())
+
+/**
+ * The account's own execution cost per inner call, billed on top of the call's ceiling — the
+ * Simple account's execute loop, calldata handling and per-call frame. callGasLimit may reach at
+ * most sum(inner ceilings) + this × the call count.
+ */
+export const CALL_OVERHEAD_PER_CALL = 60_000n
+
 /** Monad bills the gas LIMIT, not gas used — every field gets a hard ceiling. */
-export const CALL_GAS_CEILING = Object.values(GAS_CEILINGS).reduce((a, b) => (b > a ? b : a))
 export const VERIFICATION_GAS_CEILING = 500_000n
 export const PRE_VERIFICATION_GAS_CEILING = 500_000n
 export const PAYMASTER_GAS_CEILING = 300_000n
 /**
  * Beyond the brief's fields: a user operation also names its own fee caps, and the paymaster is
  * charged gasPrice = min(maxFeePerGas, baseFee + maxPriorityFeePerGas). A huge priority fee would
- * be paid in full — so both fee fields are capped at a very generous 500 gwei for Monad testnet.
+ * be paid in full — so both fee fields are capped at a generous 300 gwei for Monad testnet.
  */
-export const FEE_CEILING = 500_000_000_000n // 500 gwei
+export const FEE_CEILING = 300_000_000_000n // 300 gwei
 
-const GAS_LIMITS: ReadonlyArray<[field: string, ceiling: bigint]> = [
-  ["callGasLimit", CALL_GAS_CEILING],
-  ["verificationGasLimit", VERIFICATION_GAS_CEILING],
-  ["preVerificationGas", PRE_VERIFICATION_GAS_CEILING],
-  ["paymasterVerificationGasLimit", PAYMASTER_GAS_CEILING],
-  ["paymasterPostOpGasLimit", PAYMASTER_GAS_CEILING],
-  ["maxFeePerGas", FEE_CEILING],
-  ["maxPriorityFeePerGas", FEE_CEILING],
-]
+/** The four fixed ceilings an operation is billed against, resolved per deployment. */
+export interface GasCeilings {
+  verificationGas: bigint
+  preVerificationGas: bigint
+  paymasterGas: bigint
+  /** Wei — caps both maxFeePerGas and maxPriorityFeePerGas. */
+  fee: bigint
+}
+
+export const DEFAULT_GAS_CEILINGS: GasCeilings = {
+  verificationGas: VERIFICATION_GAS_CEILING,
+  preVerificationGas: PRE_VERIFICATION_GAS_CEILING,
+  paymasterGas: PAYMASTER_GAS_CEILING,
+  fee: FEE_CEILING,
+}
 
 /** Methods that carry a user operation in params[0] — the only methods the policy engine sees. */
 export const USER_OP_METHODS = new Set([
@@ -131,6 +181,8 @@ export interface PolicyEnv {
   capabilityRegistry: string
   contextRegistry: string
   allowedImplementations: ReadonlySet<string>
+  /** The fixed ceilings as deployed — env may have tightened them below the built-ins. */
+  ceilings: GasCeilings
 }
 
 /** Injected so the policy stays pure — the Worker wires env.RPC_URL here; tests wire a stub. */
@@ -338,14 +390,6 @@ export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: Cha
       refuse("factory", "refused: factoryData must be empty — a delegated user operation is never initialised by a factory call")
     }
 
-    // Rule 5: Monad bills the gas limit in full, so every gas field is capped.
-    for (const [field, ceiling] of GAS_LIMITS) {
-      const value = quantity(uo[field], field)
-      if (value !== undefined && value > ceiling) {
-        refuse("gas", `refused: ${field} ${value} is over this endpoint's ceiling of ${ceiling}`)
-      }
-    }
-
     // Rules 1–2: decode the account call; every inner call must be a zero-value Mida call, except
     // the single delegation-clearing shape (execute to self, empty data, zero-address authorization).
     const { kind, calls } = decodeCalls(uo.callData)
@@ -368,6 +412,41 @@ export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: Cha
         if (selector === undefined || !ALLOWED_INNER_SELECTORS.has(selector)) {
           refuse("selector", "refused: this endpoint only pays for Mida contract calls")
         }
+      }
+    }
+
+    // Rule 5: Monad bills the gas limit in full, so every gas field is capped — the fixed fields
+    // against the deployed ceilings, and callGasLimit against what the decoded calls may bill:
+    // the sum of their per-function ceilings plus the account's per-call overhead. A cheap call
+    // can no longer bill like the most expensive one.
+    for (const [field, ceiling] of [
+      ["verificationGasLimit", env.ceilings.verificationGas],
+      ["preVerificationGas", env.ceilings.preVerificationGas],
+      ["paymasterVerificationGasLimit", env.ceilings.paymasterGas],
+      ["paymasterPostOpGasLimit", env.ceilings.paymasterGas],
+      ["maxFeePerGas", env.ceilings.fee],
+      ["maxPriorityFeePerGas", env.ceilings.fee],
+    ] as const) {
+      const value = quantity(uo[field], field)
+      if (value !== undefined && value > ceiling) {
+        refuse("gas", `refused: ${field} ${value} is over this endpoint's ceiling of ${ceiling}`)
+      }
+    }
+    const callGas = quantity(uo.callGasLimit, "callGasLimit")
+    if (callGas !== undefined) {
+      let ceiling = CALL_OVERHEAD_PER_CALL * BigInt(calls.length)
+      if (!clearing) {
+        for (const call of calls) {
+          const selector = call.data.slice(0, 10)
+          const billed = INNER_CALL_GAS.get(selector)
+          if (billed === undefined) {
+            refuse("gas", "refused: an inner call has no gas ceiling — it cannot be sponsored")
+          }
+          ceiling += billed
+        }
+      }
+      if (callGas > ceiling) {
+        refuse("gas", `refused: callGasLimit ${callGas} is over this operation's ceiling of ${ceiling}`)
       }
     }
     return null

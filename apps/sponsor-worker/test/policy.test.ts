@@ -10,8 +10,18 @@ import { toSimple7702SmartAccount } from "viem/account-abstraction"
 import { privateKeyToAccount } from "viem/accounts"
 import { to7702SimpleSmartAccount } from "permissionless/accounts"
 import { monadTestnet } from "viem/chains"
-import { checkUserOperation, checkedParams, decodeCalls } from "../src/policy.js"
+import {
+  ALLOWED_INNER_SELECTORS,
+  CALL_OVERHEAD_PER_CALL,
+  GAS_KIND_BY_FUNCTION,
+  INNER_CALL_GAS,
+  checkUserOperation,
+  checkedParams,
+  decodeCalls,
+} from "../src/policy.js"
 import type { ChainQueries } from "../src/policy.js"
+import { GAS_CEILINGS, capabilityRegistryAbi, contextRegistryAbi } from "@mida/chain"
+import { toFunctionSelector } from "viem"
 import {
   CAP,
   CHAIN_ID,
@@ -232,13 +242,12 @@ describe("checkUserOperation — eip7702Auth", () => {
 describe("checkUserOperation — gas ceilings", () => {
   // Boundary: exactly at the ceiling passes, one over refuses and names the field.
   const cases: [field: string, at: string, over: string][] = [
-    ["callGasLimit", "0x5b8d80" /* 6_000_000 */, "0x5b8d81"],
     ["verificationGasLimit", "0x7a120" /* 500_000 */, "0x7a121"],
     ["preVerificationGas", "0x7a120", "0x7a121"],
     ["paymasterVerificationGasLimit", "0x493e0" /* 300_000 */, "0x493e1"],
     ["paymasterPostOpGasLimit", "0x493e0", "0x493e1"],
-    ["maxFeePerGas", "0x746a528800" /* 500 gwei */, "0x746a528801"],
-    ["maxPriorityFeePerGas", "0x746a528800", "0x746a528801"],
+    ["maxFeePerGas", "0x45d964b800" /* 300 gwei */, "0x45d964b801"],
+    ["maxPriorityFeePerGas", "0x45d964b800", "0x45d964b801"],
   ]
   for (const [field, at, over] of cases) {
     it(`${field}: ceiling passes, one over refuses`, async () => {
@@ -248,6 +257,66 @@ describe("checkUserOperation — gas ceilings", () => {
       expect(refusal?.message).toContain(field)
     })
   }
+})
+
+describe("checkUserOperation — callGasLimit is billed per inner function", () => {
+  const stateChanging = (abi: readonly unknown[]) =>
+    abi.filter(
+      (item): item is { type: "function"; name: string; stateMutability?: string } =>
+        (item as { type: string }).type === "function" &&
+        ((item as { stateMutability?: string }).stateMutability ?? "") !== "view" &&
+        ((item as { stateMutability?: string }).stateMutability ?? "") !== "pure",
+    )
+
+  it("every state-changing ABI function maps to a TxKind and a ceiling — nothing unmapped can become payable", () => {
+    const expected = new Set<string>()
+    for (const fn of [...stateChanging(capabilityRegistryAbi), ...stateChanging(contextRegistryAbi)]) {
+      const kind = GAS_KIND_BY_FUNCTION[fn.name]
+      expect(kind, `${fn.name} has no TxKind mapping`).toBeDefined()
+      const selector = toFunctionSelector(fn as never)
+      expected.add(selector)
+      expect(INNER_CALL_GAS.get(selector)).toBe(GAS_CEILINGS[kind!])
+    }
+    // And the payable set is exactly the mapped set — no stray selectors on either side.
+    expect(new Set(INNER_CALL_GAS.keys())).toEqual(expected)
+    expect(new Set(ALLOWED_INNER_SELECTORS)).toEqual(expected)
+  })
+
+  // A single call of each function may bill its own ceiling plus the account's per-call overhead —
+  // and nothing more. The selector alone is enough: inner data is never argument-decoded.
+  const fnCalls: { registry: string; fn: { name: string } }[] = [
+    ...stateChanging(capabilityRegistryAbi).map((fn) => ({ registry: CAP, fn })),
+    ...stateChanging(contextRegistryAbi).map((fn) => ({ registry: CTX, fn })),
+  ]
+  for (const { registry, fn } of fnCalls) {
+    it(`${fn.name}: bills up to ${GAS_KIND_BY_FUNCTION[fn.name]} + overhead, refuses one over`, async () => {
+      const ceiling = GAS_CEILINGS[GAS_KIND_BY_FUNCTION[fn.name]!]
+      const selector = toFunctionSelector(fn as never)
+      const op = (callGasLimit: bigint) =>
+        validUserOp({ callData: executeCall(registry, 0n, selector), callGasLimit: `0x${callGasLimit.toString(16)}` })
+      expect(await checkUserOperation(op(ceiling + CALL_OVERHEAD_PER_CALL), policyEnv, neverCalled)).toBeNull()
+      const refusal = await checkUserOperation(op(ceiling + CALL_OVERHEAD_PER_CALL + 1n), policyEnv, neverCalled)
+      expect(refusal?.rule).toBe("gas")
+      expect(refusal?.message).toContain("callGasLimit")
+    })
+  }
+
+  it("a batch bills the SUM of its inner ceilings plus overhead per call", async () => {
+    // registerP256Key (200k) + register (650k) + 2×60k overhead = 970,000.
+    const callData = batchCall([
+      { target: CAP, value: 0n, data: midaCallData() },
+      { target: CTX, value: 0n, data: midaCallData("register") },
+    ])
+    const op = (callGasLimit: bigint) => validUserOp({ callData, callGasLimit: `0x${callGasLimit.toString(16)}` })
+    expect(await checkUserOperation(op(970_000n), policyEnv, neverCalled)).toBeNull()
+    expect((await checkUserOperation(op(970_001n), policyEnv, neverCalled))?.rule).toBe("gas")
+  })
+
+  it("a cheap call can no longer bill like a full agent revoke", async () => {
+    // registerP256Key at the old flat 6,000,000 ceiling: refused now.
+    const op = validUserOp({ callGasLimit: "0x5b8d80" /* 6_000_000 */ })
+    expect((await checkUserOperation(op, policyEnv, neverCalled))?.rule).toBe("gas")
+  })
 })
 
 describe("checkUserOperation — inner calls", () => {
@@ -307,6 +376,8 @@ describe("checkUserOperation — inner calls", () => {
       sender,
       callData: executeCall(sender, 0n, "0x"),
       eip7702Auth: validAuth({ address: ZERO }),
+      // The clearing call buys no function — its ceiling is the per-call overhead alone, 60,000.
+      callGasLimit: "0xea60",
     })
     expect(await checkUserOperation(clearing, policyEnv, neverCalled)).toBeNull()
 
