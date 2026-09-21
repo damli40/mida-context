@@ -64,13 +64,19 @@ export async function ownerHistory(input: {
   }
   // The cursor is consulted only AFTER the contract answered: an epoch above 0 already proved a
   // revoke with one request, and no cache should shadow that. A saved true is sticky — revoked is
-  // forever — and a position at or past the head leaves nothing new to scan.
-  const cursor = await input.cursor?.load()
+  // forever — and a position AT the head leaves nothing new to scan.
+  let cursor = await input.cursor?.load()
+  if (cursor !== undefined && cursor.observedThroughBlock > toBlock) {
+    // a cursor ahead of the head is impossible for an honest file — wrong chain, a redeploy or a
+    // tampered file. It is treated exactly like a malformed one: ignored wholesale (the saved
+    // `previouslyRevoked` included) and overwritten by the scan below (R5-7).
+    cursor = undefined
+  }
   if (cursor !== undefined) {
     if (cursor.previouslyRevoked) {
       return { owner: input.owner, agentId: input.agentId, previouslyRevoked: true, observedThroughBlock: toBlock }
     }
-    if (cursor.observedThroughBlock >= toBlock) {
+    if (cursor.observedThroughBlock === toBlock) {
       return { owner: input.owner, agentId: input.agentId, previouslyRevoked: false, observedThroughBlock: toBlock }
     }
   }

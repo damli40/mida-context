@@ -246,12 +246,37 @@ describe("the history scan cursor (R4-9)", () => {
     expect(calls).toHaveLength(0)
   })
 
-  it("a cursor at or past the head scans nothing", async () => {
+  it("a cursor at the head scans nothing", async () => {
     const { client, calls } = recordingClient(20n, () => [])
     const { cursor } = memoryCursor({ observedThroughBlock: 20n, previouslyRevoked: false })
     const history = await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })
     expect(history.previouslyRevoked).toBe(false)
     expect(calls).toHaveLength(0)
+  })
+
+  it("a cursor AHEAD of the head is impossible — it is ignored, scanned over in full, and overwritten (R5-7)", async () => {
+    // head+1 with a real CapabilityRevoked in the range: an honest file could never have observed it
+    const { client, calls } = recordingClient(20n, (call) =>
+      call.event.name === "CapabilityRevoked" ? [{ args: { owner: OWNER, agentId: AGENT }, blockNumber: 9n, transactionHash: null, logIndex: 0 }] : [],
+    )
+    const { cursor, writes } = memoryCursor({ observedThroughBlock: 21n, previouslyRevoked: false })
+    const history = await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })
+    expect(history.previouslyRevoked).toBe(true)
+    expect(history.observedThroughBlock).toBe(20n)
+    // the scan ran the full range from deploymentBlock, not the fake position — and the file was rewritten
+    expect(calls.length).toBeGreaterThan(0)
+    expect(Math.min(...calls.map((call) => Number(call.fromBlock)))).toBe(5)
+    expect(writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: true }])
+  })
+
+  it("an ahead-of-head cursor that claims a revoke is still not trusted — the scan decides", async () => {
+    const { client, calls } = recordingClient(20n, () => [])
+    const { cursor, writes } = memoryCursor({ observedThroughBlock: 500n, previouslyRevoked: true })
+    const history = await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })
+    // no events on this chain — the file's claimed revoke was wrong-chain or tampered
+    expect(history.previouslyRevoked).toBe(false)
+    expect(calls.length).toBeGreaterThan(0)
+    expect(writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: false }])
   })
 
   it("a cursor behind the head scans only the new range and then saves the new position", async () => {
