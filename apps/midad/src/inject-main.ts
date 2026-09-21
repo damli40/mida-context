@@ -88,7 +88,12 @@ async function main(): Promise<void> {
     await writeLine(noContextText("daemon-down"))
     return
   }
-  const reply = await callDaemon(home, "/handoff", { agent, cwd }, { timeoutMs: HANDOFF_TIMEOUT_MS })
+  const reply = await callDaemon(
+    home,
+    "/handoff",
+    { agent, cwd, sessionId: typeof record.session_id === "string" ? record.session_id : undefined },
+    { timeoutMs: HANDOFF_TIMEOUT_MS },
+  )
   const body = reply.body as { text?: unknown } | null
   if (reply.status === 0) {
     await writeLine(noContextText("daemon-down"))

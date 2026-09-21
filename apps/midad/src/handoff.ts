@@ -93,7 +93,7 @@ type FactOutcome = { status: "ok"; facts: Awaited<ReturnType<typeof readOwnerFac
  */
 export async function buildHandoff(
   runtime: Runtime,
-  input: { agent: string; cwd: string; authorNames: Record<string, string> },
+  input: { agent: string; cwd: string; authorNames: Record<string, string>; sessionId?: string },
   deps: HandoffDeps = {},
 ): Promise<HandoffResult> {
   const agent = input.agent
@@ -148,6 +148,20 @@ export async function buildHandoff(
     const factsFailed = factOutcome.status === "ok" ? null : factOutcome.status === "slow" ? "facts-read-slow" : "facts-read-failed"
     const merged = mergeCheckpoints(outcome.checkpoints)
     if (merged === null) return { kind: "empty", text: EMPTY_TEXT, facts: facts.length, factsFailed, readMs }
+    // Serving a handoff to a named new session binds it to the chain it was shown: the drainer's
+    // saves for that session read state/continues/<sessionId>.json into continuesSession. A record
+    // scoped to this project, a session never continues itself, and a write that fails only means
+    // the link is missing later — never a refused handoff.
+    if (isSafeName(input.sessionId) && input.sessionId !== merged.headSessionId) {
+      try {
+        runtime.home.writeSecretJson(`state/continues/${input.sessionId}.json`, {
+          continues: merged.headSessionId,
+          projectId: check.approval.projectId,
+        })
+      } catch {
+        // a failed record degrades to continuesSession null at save time
+      }
+    }
     return {
       kind: "handoff",
       text: renderHandoff(merged, { authorNames: input.authorNames, facts, factsFailed }),

@@ -21,7 +21,7 @@ import { loadAgentIdentity, loadGrants } from "./keys.js"
 import { appendLog } from "./log.js"
 import { checkProject as checkProjectAgainstList } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
-import { findProjectMarker, listJobs, moveToBad, removeJob } from "./queue.js"
+import { findProjectMarker, isSafeName, listJobs, moveToBad, removeJob } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
 import type { Runtime } from "./runtime.js"
 import { isCapabilityLive } from "./skeleton.js"
@@ -340,7 +340,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           envelope = wrapCheckpoint({
             projectId,
             sessionId,
-            continuesSession: null,
+            continuesSession: readContinues(deps.home, sessionId, projectId),
             compiledBy: compiled.compiledBy,
             checkpoint: compiled.checkpoint,
           })
@@ -573,6 +573,23 @@ function readPrevious(home: MidaHome, sessionId: string): { checkpoint?: Checkpo
   })
   if (!checked.ok) return { unreadable: true }
   return { checkpoint: checked.value, unreadable: false }
+}
+
+/**
+ * The continuation a served handoff recorded for this session at `state/continues/<sessionId>.json`:
+ * which earlier session's chain head it continues, scoped to the project the handoff was served
+ * under. A missing, unreadable, unsafe or wrong-project record is null — never a guess.
+ */
+function readContinues(home: MidaHome, sessionId: string, projectId: string): string | null {
+  try {
+    const raw = home.readJson<unknown>(`state/continues/${sessionId}.json`)
+    if (typeof raw !== "object" || raw === null) return null
+    const record = raw as Record<string, unknown>
+    if (record.projectId !== projectId || !isSafeName(record.continues)) return null
+    return record.continues
+  } catch {
+    return null
+  }
 }
 
 function readState(home: MidaHome, sessionId: string): SessionState | undefined {

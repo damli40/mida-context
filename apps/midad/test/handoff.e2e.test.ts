@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { spawn } from "node:child_process"
-import { cpSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { privateKeyToAccount } from "viem/accounts"
 import { ContextApiClient } from "@mida/api"
@@ -13,7 +13,7 @@ import { MidaAgent } from "@mida/sdk"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
-  FileAccessRequestStore, MidaHome, NAMESPACE, Runtime, approve, callDaemon, init,
+  FileAccessRequestStore, MidaHome, NAMESPACE, Runtime, approve, callDaemon, enqueue, init,
   loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, requestAccess, saveCheckpoint,
   startDaemon, startPersistentApi,
 } from "@mida/midad"
@@ -50,8 +50,10 @@ describe("POST /handoff on local Anvil", () => {
   let saved1: { contextId: string }
   let saved2: { contextId: string }
 
-  const handoff = async (agent: string, cwd: string) =>
-    (await callDaemon(home, "/handoff", { agent, cwd }, { timeoutMs: STEP_TIMEOUT })).body as HandoffResult
+  let hookHomeDir: string
+
+  const handoff = async (agent: string, cwd: string, sessionId?: string) =>
+    (await callDaemon(home, "/handoff", { agent, cwd, sessionId }, { timeoutMs: STEP_TIMEOUT })).body as HandoffResult
 
   /** A real protocol read through the API server as a named agent — the daemon holds the lock. */
   const readThrough = async (name: string) => {
@@ -89,6 +91,8 @@ describe("POST /handoff on local Anvil", () => {
     mark(emptyDir, "proj-empty")
     mark(movedDir, "proj-hand") // same marker as workDir — a copied project folder
     mark(unapprovedDir, "proj-lonely")
+    // a stand-in for the user's real home — transcripts the drain accepts live under it
+    hookHomeDir = mkdtempSync(join(tmpdir(), "mida-hook-home-"))
 
     const runtime = await Runtime.open(home, { ...network, storageUrl: apiServer.baseUrl })
     try {
@@ -136,7 +140,17 @@ describe("POST /handoff on local Anvil", () => {
     daemon = await startDaemon({
       home,
       network: { ...network, storageUrl: apiServer.baseUrl },
-      compile: async () => { throw new Error("no compile in this suite") },
+      // stands in for the model: the queued transcript compiles to this checkpoint
+      compile: async (input) => ({
+        ok: true as const,
+        checkpoint: sampleCheckpoint({
+          eventId: input.eventId, agent: input.agent, createdAt: "2026-09-21T12:00:00.000Z",
+          objective: "Finish the worker port", nextAction: "Wire the worker pool", progress: ["sess-c work"],
+        }),
+        compiledBy: "test", droppedKeys: [], trimmed: [], attempts: 1,
+        format: "claude-jsonl", messagesKept: 1, messagesTotal: 1, charsSent: 0, modelMs: 0,
+      }),
+      drainDeps: { homeDir: hookHomeDir },
       now: () => Date.now(),
       log: (entry) => daemonLogs.push(entry),
       tickMs: 60_000,
@@ -222,7 +236,42 @@ describe("POST /handoff on local Anvil", () => {
     expect(res.stdout).toContain(saved2.contextId)
   }, 30_000)
 
-  it("(f) an agent the chain shows revoked gets the revoked line — and the server refuses the read itself", async () => {
+  it("(f) a third session continues the chain: the served handoff becomes its continuesSession link", async () => {
+    // the session-start hook carries the NEW session's id — the daemon records the chain head it served
+    const served = await handoff("codex", workDir, "sess-c")
+    expect(served.kind).toBe("handoff")
+    expect(home.readJson("state/continues/sess-c.json")).toEqual({ continues: "sess-b", projectId: "proj-hand" })
+
+    // that session's own save then goes through the real hook path: enqueue, kick, drain, chain write
+    const transcript = join(hookHomeDir, ".claude", "projects", "proj", "sess-c.jsonl")
+    mkdirSync(dirname(transcript), { recursive: true })
+    writeFileSync(transcript, JSON.stringify({ type: "user", message: { content: "hi" } }) + "\n")
+    enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "sess-c", transcriptPath: transcript, cwd: workDir, error: null })
+    await callDaemon(home, "/kick", {}, { timeoutMs: STEP_TIMEOUT })
+    const deadline = Date.now() + 20_000
+    let merged: HandoffResult
+    for (;;) {
+      merged = await handoff("claude-code", workDir, "sess-d")
+      if (merged.kind === "handoff" && merged.checkpoints === 3) break
+      if (Date.now() > deadline) {
+        const drainLog = home.has("logs/drain.jsonl") ? readFileSync(home.path("logs/drain.jsonl"), "utf8") : "(none)"
+        throw new Error(`sess-c's checkpoint was never saved; last handoff ${JSON.stringify(merged)}; drain log ${drainLog}`)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250))
+    }
+    // the merged chain leads with the FIRST session's request — a tool switch, not "Continue."
+    if (merged!.kind !== "handoff") throw new Error("expected a handoff")
+    const afterBegin = merged!.text.split("=== BEGIN MIDA HANDOFF DATA ===\n\n")[1]!
+    expect(
+      afterBegin.startsWith(
+        `ORIGINAL REQUEST (the user's own words, copied from the first message — not a summary):\n${ORIGINAL_REQUEST}`,
+      ),
+    ).toBe(true)
+    // and the head moved: the next session's record points at sess-c, the newest link in the chain
+    expect(home.readJson("state/continues/sess-d.json")).toEqual({ continues: "sess-c", projectId: "proj-hand" })
+  }, STEP_TIMEOUT)
+
+  it("(g) an agent the chain shows revoked gets the revoked line — and the server refuses the read itself", async () => {
     // revoke on the chain only, leaving the approved-projects row in place: the check passes,
     // the chain's own capability record says revoked. (mida revoke would also drop the row, which
     // is the not-approved path — tested above.)
@@ -251,7 +300,7 @@ describe("POST /handoff on local Anvil", () => {
     await expect(readThrough("doomed-agent")).rejects.toMatchObject({ code: "CAPABILITY_REVOKED" })
   }, STEP_TIMEOUT)
 
-  it("(g) an expired grant answers not-approved (Anvil time travel)", async () => {
+  it("(h) an expired grant answers not-approved (Anvil time travel)", async () => {
     // grants live 30 days — last test in the file: the moved clock must not leak into anything else
     await increaseLocalTime(env.rpcUrl, 33n * 24n * 60n * 60n)
     const result = await handoff("codex", workDir)

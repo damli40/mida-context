@@ -234,10 +234,12 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
       const agent = typeof record.agent === "string" ? record.agent : ""
       const cwd = typeof record.cwd === "string" ? record.cwd : ""
+      // the new session's own id — the hook sends it so a served handoff binds the session to the chain
+      const sessionId = typeof record.sessionId === "string" ? record.sessionId : undefined
       const started = deps.now()
       const result = await buildHandoff(
         runtime,
-        { agent, cwd, authorNames: authorNamesFor(runtime) },
+        { agent, cwd, authorNames: authorNamesFor(runtime), sessionId },
         { ...deps.handoffDeps, limitMs: deps.handoffLimitMs ?? deps.handoffDeps?.limitMs },
       )
       // one stable line per call: codes, names, counts and timings — never request or handoff text

@@ -7,9 +7,9 @@ import { spawnSync } from "node:child_process"
 import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import type { Hex } from "@mida/protocol"
-import { MidaHome, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, projectIdFor, tailOf } from "@mida/midad"
+import { MidaHome, buildHandoff, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, projectIdFor, tailOf } from "@mida/midad"
 import type { DrainDeps, Runtime, saveCheckpoint } from "@mida/midad"
-import { CONTENT_FIELDS } from "@mida/checkpoint"
+import { CONTENT_FIELDS, mergeCheckpoints } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
 
 const T0 = Date.parse("2026-09-21T10:00:00.000Z")
@@ -357,6 +357,62 @@ describe("nothing is saved for an agent the owner has not approved", () => {
     expect(listJobs(home)).toHaveLength(0)
     expect(result.failed).toBe(0)
     expect(drainLog()).toContain("not-approved")
+  })
+})
+
+describe("a handoff served to a new session becomes its continuesSession link", () => {
+  it("save session A, serve a handoff to session B, save B — the merge reads A's original request", async () => {
+    const { home, cwd, job, drain, saveCalls } = setup()
+
+    // session A works and saves; nothing was served to it, so there is nothing to continue
+    job({ sessionId: "sess-a", event: "Stop" }, T0)
+    expect((await drain()).saved).toBe(1)
+    expect((saveCalls[0] as { continuesSession: string | null }).continuesSession).toBeNull()
+
+    // session B's start hook is served the handoff — the daemon records the chain head it merged
+    const storedA = {
+      checkpoint: sampleCheckpoint({ eventId: "cp-a1", originalRequest: "Port the billing engine" }),
+      projectId: "p-1", sessionId: "sess-a", continuesSession: null, compiledBy: "test",
+      contextId: `0x${"a1".repeat(32)}`, authorId: `0x${"aa".repeat(32)}`,
+    }
+    const runtime = { home, close: async () => {} } as unknown as Runtime
+    const handoff = await buildHandoff(runtime, { agent: "claude-code", cwd, sessionId: "sess-b", authorNames: {} }, {
+      checkProject: async () => ({ ok: true, approval: { agent: "claude-code", projectId: "p-1", root: cwd, approvedAt: "2026-09-21T00:00:00.000Z" } }),
+      capability: async () => "live",
+      read: async () => ({ checkpoints: [storedA], skipped: 0, milliseconds: 1 }),
+      readFacts: async () => [],
+    })
+    expect(handoff.kind).toBe("handoff")
+    expect(home.readJson("state/continues/sess-b.json")).toEqual({ continues: "sess-a", projectId: "p-1" })
+
+    // B's own saves carry the link: the drainer reads the record the handoff wrote
+    job({ sessionId: "sess-b", event: "Stop" }, T0 + 1_000)
+    expect((await drain({ now: () => new Date(T0 + 240_000) })).saved).toBe(1)
+    const savedB = saveCalls[1] as { continuesSession: string | null; checkpoint: Checkpoint; projectId: string; sessionId: string; compiledBy: string }
+    expect(savedB.continuesSession).toBe("sess-a")
+
+    // merged, the chain leads with A's words — a tool switch never turns the request into "Continue."
+    const storedB = { ...savedB, contextId: `0x${"b1".repeat(32)}`, authorId: `0x${"bb".repeat(32)}` }
+    expect(mergeCheckpoints([storedA, storedB])?.originalRequest).toBe("Port the billing engine")
+  })
+
+  it("a missing, unreadable or wrong-project record means null — never a guess", async () => {
+    const { home, job, drain, saveCalls } = setup()
+    // no record at all
+    job({ sessionId: "sess-x", event: "Stop" }, T0)
+    await drain()
+    expect((saveCalls.at(-1) as { continuesSession: string | null }).continuesSession).toBeNull()
+    // a record written for another project does not chain this session into it
+    home.writeSecretJson("state/continues/sess-y.json", { continues: "sess-a", projectId: "p-other" })
+    job({ sessionId: "sess-y", event: "Stop" }, T0 + 1_000)
+    await drain()
+    expect((saveCalls.at(-1) as { continuesSession: string | null }).continuesSession).toBeNull()
+    // a corrupt record reads as missing, not as a link
+    mkdirSync(home.path("state/continues"), { recursive: true })
+    fs.writeFileSync(home.path("state/continues/sess-z.json"), "not json{")
+    job({ sessionId: "sess-z", event: "Stop" }, T0 + 2_000)
+    await drain()
+    expect((saveCalls.at(-1) as { continuesSession: string | null }).continuesSession).toBeNull()
   })
 })
 

@@ -11,6 +11,8 @@ export interface StoredCheckpoint {
 }
 
 export interface MergedHandoff {
+  // The newest session in the chosen chain — the session a handoff recipient continues.
+  headSessionId: string
   originalRequest: string | null
   objective: string
   remainingPlan: string[]
@@ -208,6 +210,7 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
   }
 
   return {
+    headSessionId: chosen.newest.sessionId,
     originalRequest: cps.find((c) => c.originalRequest !== null)?.originalRequest ?? null,
     objective: mergedField(cps, "objective", ""),
     remainingPlan: mergedField(cps, "remainingPlan", []),
