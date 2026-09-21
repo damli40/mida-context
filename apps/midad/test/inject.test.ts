@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { spawn } from "node:child_process"
-import { mkdtempSync } from "node:fs"
+import { mkdtempSync, readFileSync } from "node:fs"
 import { createServer } from "node:net"
 import type { Server, Socket } from "node:net"
 import { tmpdir } from "node:os"
@@ -383,7 +383,7 @@ describe("inject-main process — UserPromptSubmit", () => {
     }
   }, 30_000)
 
-  it("a daemon that answers late gets silence — the prompt never waits past 1.5 s", async () => {
+  it("a daemon that answers late gets silence — the prompt never waits past 1.5 s, and the give-up is logged", async () => {
     const dir = home()
     const daemon = await whatsnewDaemon(dir, { kind: "updates", note: "N", updates: [], lastSeen: "" }, { delayMs: 5_000 })
     try {
@@ -394,6 +394,10 @@ describe("inject-main process — UserPromptSubmit", () => {
       expect(res.stdout).toBe("")
       // the child gave up at its 1.5 s ceiling, far before the daemon's 5 s answer
       expect(Date.now() - started).toBeLessThan(4_000)
+      // silence for the model, but the give-up is visible in the hook log for doctor to count
+      const hookLog = readFileSync(dir.path("logs/hook.jsonl"), "utf8")
+      const entries = hookLog.split("\n").filter((l) => l !== "").map((l) => JSON.parse(l) as { event?: string })
+      expect(entries.some((e) => e.event === "whatsnew-timeout")).toBe(true)
     } finally {
       await daemon.stop()
     }

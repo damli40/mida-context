@@ -68,6 +68,34 @@ describe("mida doctor without a chain", () => {
     expect(kimiLines.join("\n")).not.toContain("test-key")
   })
 
+  it("more than three whats-new timeouts in the last hour is a PROBLEM — fewer stays visible, none is ok", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const record = (at: string) => `${JSON.stringify({ at, event: "whatsnew-timeout", agent: "codex", sessionId: "s1" })}`
+    mkdirSync(home.path("logs"), { recursive: true })
+    // four give-ups inside the hour, plus one from two hours ago that must NOT count
+    const recent = new Date(Date.now() - 10 * 60_000).toISOString()
+    const old = new Date(Date.now() - 2 * 60 * 60_000).toISOString()
+    writeFileSync(
+      home.path("logs/hook.jsonl"),
+      [record(recent), record(recent), record(recent), record(recent), record(old), ""].join("\n"),
+    )
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    const line = lines.find((l) => l.includes("timing out"))
+    expect(line).toBeDefined()
+    expect(line).toContain("PROBLEM:")
+    expect(line).toContain("the daemon may be unreachable")
+
+    // three or fewer is a note with the count — silence is visible, but it is not a problem
+    writeFileSync(home.path("logs/hook.jsonl"), [record(recent), record(recent), record(old), ""].join("\n"))
+    const fewer: string[] = []
+    await runDoctor({ home, print: (line) => fewer.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    const noteLine = fewer.find((l) => l.includes("timeout"))
+    expect(noteLine).toBeDefined()
+    expect(noteLine).not.toContain("PROBLEM:")
+    expect(noteLine).toContain("2")
+  })
+
   it("a listener that answers 404 is a PROBLEM naming the status — never 'ok: midad answers'", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const server = await stubDaemon(home, 404, { error: "not-found" })

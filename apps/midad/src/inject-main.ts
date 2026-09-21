@@ -7,6 +7,7 @@ import { degradedMessage, hookReply, sessionStartMessage, whatsNewMessage } from
 import { resolveHome } from "./home.js"
 import type { MidaHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
+import { appendLog } from "./log.js"
 import { isSafeName } from "./queue.js"
 import { writeLastSeen } from "./whatsnew.js"
 
@@ -74,7 +75,11 @@ async function whatsNew(home: MidaHome, agent: string | undefined, record: Recor
     const cwd = typeof record.cwd === "string" && record.cwd !== "" ? record.cwd : process.cwd()
     const sessionId = typeof record.session_id === "string" ? record.session_id : undefined
     const reply = await callDaemon(home, "/whatsnew", { agent, cwd, sessionId }, { timeoutMs: WHATS_NEW_TIMEOUT_MS })
-    if (reply.status !== 200) return
+    if (reply.status !== 200) {
+      // silence stays the prompt's contract — but a give-up is not invisible: doctor counts these
+      if (reply.status === 0) appendLog(home, "hook", { event: "whatsnew-timeout", agent, sessionId })
+      return
+    }
     const body = reply.body as { kind?: unknown; note?: unknown; updates?: unknown; lastSeen?: unknown } | null
     if (body?.kind !== "updates" || typeof body.note !== "string" || body.note === "") return
     if (sessionId !== undefined && typeof body.lastSeen === "string") {

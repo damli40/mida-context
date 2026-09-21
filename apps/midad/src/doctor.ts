@@ -331,6 +331,20 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       },
     },
     {
+      name: "whatsnew",
+      run: async () => {
+        // the prompt hook is silent by contract — a give-up lands in the hook log instead, and
+        // this check makes that silence visible: a count, a problem past the line
+        const timeouts = whatsnewTimeouts(home, (deps.now ?? Date.now)())
+        if (timeouts > 3) {
+          return [problem("the per-prompt update is timing out; the daemon may be unreachable", "check `midad` is running and restart it")]
+        }
+        return timeouts === 0
+          ? ["ok: the per-prompt update is answering"]
+          : [`note: ${timeouts} whats-new timeout(s) in the last hour`]
+      },
+    },
+    {
       name: "wallets",
       run: async () => {
         const chain = chainOf(shared)
@@ -355,6 +369,30 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       },
     },
   ]
+}
+
+/** `whatsnew-timeout` records the prompt hook wrote to logs/hook.jsonl during the last hour. */
+function whatsnewTimeouts(home: MidaHome, nowMs: number): number {
+  let text: string
+  try {
+    text = readFileSync(home.path("logs/hook.jsonl"), "utf8")
+  } catch {
+    return 0 // no hook log yet — nothing has ever timed out
+  }
+  const since = nowMs - 60 * 60 * 1000
+  let count = 0
+  for (const line of text.split("\n")) {
+    if (line.trim() === "") continue
+    try {
+      const record = JSON.parse(line) as { event?: unknown; at?: unknown }
+      if (record.event !== "whatsnew-timeout" || typeof record.at !== "string") continue
+      const at = Date.parse(record.at)
+      if (!Number.isNaN(at) && at >= since) count += 1
+    } catch {
+      // a corrupt log line is not a timeout — and never a doctor problem
+    }
+  }
+  return count
 }
 
 function ageText(ms: number): string {

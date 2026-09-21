@@ -6,6 +6,7 @@ import { join } from "node:path"
 import type { StoredCheckpoint } from "@mida/checkpoint"
 import type { ServiceRuntime } from "@mida/midad"
 import {
+  CheckpointCopies,
   MidaHome,
   buildWhatsNew,
   readLastSeen,
@@ -36,17 +37,27 @@ const runtimeWith = (dir: MidaHome) => ({ home: dir }) as unknown as ServiceRunt
 
 const NAMES = { "0xauthorcodex": "codex", "0xauthorclaude": "claude-code" }
 
-const baseDeps = (checkpoints: StoredCheckpoint[], over: Record<string, unknown> = {}) => ({
-  checkProject: async () => ({
-    ok: true as const,
-    approval: { agent: "claude-code", projectId: "p1", root: "/repo", approvedAt: "2026-09-21T00:00:00.000Z" },
-  }),
-  capability: async () => "live" as const,
-  read: async () => ({ checkpoints, skipped: 0, milliseconds: 1 }),
-  authorNames: NAMES,
-  now: () => NOW,
-  ...over,
-})
+/**
+ * The deps every whats-new call needs: the gates say live, and the daemon's copy already holds
+ * `checkpoints` — the `read` spy is only reached by a background refresh, which a fresh copy
+ * never triggers. Tests about refresh behaviour build their own copies/deps.
+ */
+const baseDeps = (checkpoints: StoredCheckpoint[], over: Record<string, unknown> = {}) => {
+  const copies = new CheckpointCopies(() => NOW)
+  copies.seed("claude-code", "p1", checkpoints)
+  return {
+    checkProject: async () => ({
+      ok: true as const,
+      approval: { agent: "claude-code", projectId: "p1", root: "/repo", approvedAt: "2026-09-21T00:00:00.000Z" },
+    }),
+    capability: async () => "live" as const,
+    read: async () => ({ checkpoints, skipped: 0, milliseconds: 1 }),
+    authorNames: NAMES,
+    now: () => NOW,
+    copies,
+    ...over,
+  }
+}
 
 describe("buildWhatsNew", () => {
   it("a foreign checkpoint newer than lastSeen becomes a one-line update", async () => {
@@ -200,15 +211,23 @@ describe("buildWhatsNew", () => {
     expect(out.note).toContain("Mida update since you last checked:")
   })
 
-  it("a read failure refuses internally rather than reporting stale state", async () => {
+  it("a failed refresh answers none on an absent copy and logs the failure — it never refuses", async () => {
     const dir = home()
     writeLastSeen(dir, "s-1", iso(10))
+    const logs: object[] = []
+    const copies = new CheckpointCopies(() => NOW)
     const out = await buildWhatsNew(
       runtimeWith(dir),
       { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
-      baseDeps([], { read: async () => { throw new Error("boom") } }),
+      baseDeps([], {
+        copies,
+        read: async () => { throw new Error("boom") },
+        log: (entry: object) => logs.push(entry),
+      }),
     )
-    expect(out).toEqual({ kind: "refused", reason: "internal" })
+    expect(out.kind).toBe("none")
+    await copies.idle()
+    expect(logs.filter((e) => (e as { event?: string }).event === "whatsnew-refresh-failed")).toHaveLength(1)
   })
 
   it("an unsafe session id reads no state file and still answers", async () => {
@@ -220,6 +239,143 @@ describe("buildWhatsNew", () => {
     )
     expect(out.kind).toBe("updates")
     expect(dir.list("state/lastseen")).toEqual([])
+  })
+})
+
+describe("the daemon's checkpoint copy", () => {
+  /** Gates that always approve — the copy and refresh behaviour is what varies. */
+  const gateDeps = (over: Record<string, unknown> = {}) => ({
+    checkProject: async () => ({
+      ok: true as const,
+      approval: { agent: "claude-code", projectId: "p1", root: "/repo", approvedAt: "2026-09-21T00:00:00.000Z" },
+    }),
+    authorNames: NAMES,
+    ...over,
+  })
+
+  it("a read that takes 5 s never blocks the prompt — the stale copy answers at once", async () => {
+    const dir = home()
+    writeLastSeen(dir, "s-1", iso(30))
+    let t = NOW
+    const copies = new CheckpointCopies(() => t)
+    copies.seed("claude-code", "p1", [cp("other", "0xauthorCodex", iso(10), { progress: ["stale but present"] })])
+    t += 21_000 // the copy is stale — the request starts a refresh it must not wait for
+    let resolveRead: ((value: { checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }) => void) | undefined
+    const read = () =>
+      new Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }>((resolve) => {
+        resolveRead = resolve
+      })
+    const started = Date.now()
+    const out = await buildWhatsNew(
+      runtimeWith(dir),
+      { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
+      gateDeps({ capability: async () => "live" as const, read, now: () => t, copies }),
+    )
+    expect(Date.now() - started).toBeLessThan(50)
+    expect(out.kind).toBe("updates")
+    if (out.kind === "updates") expect(out.note).toContain("stale but present")
+    resolveRead?.({ checkpoints: [], skipped: 0, milliseconds: 5_000 })
+    await copies.idle()
+  })
+
+  it("two prompts during one slow refresh share a single read — the second never starts another", async () => {
+    const dir = home()
+    let reads = 0
+    let resolveRead: ((value: { checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }) => void) | undefined
+    const copies = new CheckpointCopies(() => NOW) // absent copy — the first request must start a refresh
+    const read = () => {
+      reads += 1
+      return new Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }>((resolve) => {
+        resolveRead = resolve
+      })
+    }
+    const deps = gateDeps({ capability: async () => "live" as const, read, now: () => NOW, copies })
+    const input = { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }
+    const [a, b] = await Promise.all([
+      buildWhatsNew(runtimeWith(dir), input, deps),
+      buildWhatsNew(runtimeWith(dir), input, deps),
+    ])
+    expect(reads).toBe(1)
+    // no copy existed yet — both answered none at once, and the refresh serves the NEXT prompt
+    expect(a.kind).toBe("none")
+    expect(b.kind).toBe("none")
+    resolveRead?.({ checkpoints: [cp("other", "0xauthorCodex", iso(5))], skipped: 0, milliseconds: 1 })
+    await copies.idle()
+    const next = await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(next.kind).toBe("updates")
+  })
+
+  it("a failed refresh keeps the old copy, still serves it, and logs once a minute at most", async () => {
+    const dir = home()
+    writeLastSeen(dir, "s-1", iso(30))
+    let t = NOW
+    const copies = new CheckpointCopies(() => t)
+    copies.seed("claude-code", "p1", [cp("other", "0xauthorCodex", iso(10), { progress: ["kept across failures"] })])
+    t += 21_000
+    const logs: object[] = []
+    const deps = gateDeps({
+      capability: async () => "live" as const,
+      read: async () => { throw new Error("network down") },
+      now: () => t,
+      copies,
+      log: (entry: object) => logs.push(entry),
+    })
+    const input = { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }
+    const first = await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(first.kind).toBe("updates")
+    if (first.kind === "updates") expect(first.note).toContain("kept across failures")
+    await copies.idle()
+    const failures = () => logs.filter((e) => (e as { event?: string }).event === "whatsnew-refresh-failed")
+    expect(failures()).toHaveLength(1)
+    // the next stale prompt refreshes again and fails again — inside the minute, still one line
+    const second = await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(second.kind).toBe("updates")
+    await copies.idle()
+    expect(failures()).toHaveLength(1)
+  })
+
+  it("a local revoke refuses the very next prompt even with a warm copy — and the copy is gone", async () => {
+    const dir = home()
+    writeLastSeen(dir, "s-1", iso(30))
+    const copies = new CheckpointCopies(() => NOW)
+    copies.seed("claude-code", "p1", [cp("other", "0xauthorCodex", iso(10))])
+    // `mida revoke` ran in the owner's process: the marker file landed and the approval row is
+    // gone — the project check answers not-approved and the marker says why
+    const out = await buildWhatsNew(
+      runtimeWith(dir),
+      { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
+      gateDeps({
+        checkProject: async () => ({ ok: false as const, reason: "not-approved" as const }),
+        isRevoked: () => true,
+        copies,
+      }),
+    )
+    expect(out).toEqual({ kind: "refused", reason: "revoked" })
+    expect(copies.get("claude-code", "p1")).toBeUndefined()
+  })
+
+  it("a live capability verdict is reused for 30 s per (agent, projectId), then re-checked", async () => {
+    const dir = home()
+    let t = NOW
+    const copies = new CheckpointCopies(() => t)
+    copies.seed("claude-code", "p1", [])
+    let calls = 0
+    const deps = gateDeps({
+      capability: async () => {
+        calls += 1
+        return "live" as const
+      },
+      copies,
+      now: () => t,
+    })
+    const input = { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }
+    await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(calls).toBe(1)
+    await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(calls).toBe(1) // inside the reuse window — the chain was not asked again
+    t += 31_000
+    await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(calls).toBe(2) // past 30 s the verdict is stale — asked again
   })
 })
 

@@ -84,7 +84,7 @@ const refused = (reason: string, text: string): HandoffResult => ({ kind: "refus
  * records give the verdict). Anything else — expired, superseded, never granted — is "none",
  * the not-approved refusal: if the chain cannot tell those cases apart, neither can we.
  */
-async function capabilityState(runtime: ServiceRuntime, agent: string): Promise<CapabilityState> {
+export async function capabilityState(runtime: ServiceRuntime, agent: string): Promise<CapabilityState> {
   const identity = loadAgentIdentity(runtime.home, agent)
   if (identity === undefined) return "none"
   const ids = new Set(await runtime.reader.activeCapabilityIds(runtime.owner, identity.agentId))

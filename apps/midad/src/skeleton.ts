@@ -45,7 +45,8 @@ async function hasAnyLiveCapability(runtime: ServiceRuntime, agentId: Hex): Prom
 }
 
 const GRANT_LIFETIME_SECONDS = 30 * 24 * 60 * 60
-const NAMESPACE_ID = namespaceId(NAMESPACE)
+/** The namespace every Mida checkpoint is written under — exported for the daemon's copy seeding. */
+export const NAMESPACE_ID = namespaceId(NAMESPACE)
 
 /**
  * The grant an agent asks for is read off the grant-advisor policy's `expected` list for its
