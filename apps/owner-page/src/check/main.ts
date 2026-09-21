@@ -174,10 +174,18 @@ async function onUse(): Promise<void> {
     })
     setLine("prf", "pass", "The passkey returned its secret bytes (PRF).")
     updateDeterminismLine(fingerprintOf(result.prfOutput))
+    if (!saved) {
+      saved = { credentialId: result.credentialId }
+      saveCredential(window.localStorage, saved)
+    }
     await verifyCapturedAssertion()
     note("Done — copy the report to share what this device answered.")
   } catch (error) {
     setLine("prf", "fail", describeFailure(error))
+    // The browser may still have produced a verifiable assertion — PRF can fail while signing works.
+    if (capture.get?.authenticatorData && capture.get.clientDataJSON && capture.get.signatureDer) {
+      await verifyCapturedAssertion()
+    }
     note("The use ceremony did not finish.")
   } finally {
     updatePromptCountLine(counts.create + counts.get - before)
@@ -337,6 +345,11 @@ async function boot(): Promise<void> {
     )
   }
 
+  document.getElementById("btn-create")?.addEventListener("click", () => void onCreate())
+  document.getElementById("btn-use")?.addEventListener("click", () => void onUse())
+  document.getElementById("btn-copy")?.addEventListener("click", () => void onCopyReport())
+  document.getElementById("btn-forget")?.addEventListener("click", onForget)
+
   try {
     platformAuthenticatorAvailable =
       typeof window.PublicKeyCredential?.isUserVerifyingPlatformAuthenticatorAvailable === "function"
@@ -346,11 +359,6 @@ async function boot(): Promise<void> {
     platformAuthenticatorAvailable = null
   }
   renderEnvironmentLine()
-
-  document.getElementById("btn-create")?.addEventListener("click", () => void onCreate())
-  document.getElementById("btn-use")?.addEventListener("click", () => void onUse())
-  document.getElementById("btn-copy")?.addEventListener("click", () => void onCopyReport())
-  document.getElementById("btn-forget")?.addEventListener("click", onForget)
 
   if (saved) note(`A test passkey (${saved.credentialId.slice(0, 12)}…) is remembered on this device — "Use my test passkey" will ask for it.`)
 }
