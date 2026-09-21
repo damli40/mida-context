@@ -3,7 +3,7 @@
 // putting persistence behind the interface. The D1 half runs on a real SQLite D1 through Miniflare, not a fake.
 
 import { describe, expect, it } from "vitest"
-import { mkdtempSync, readFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, utimesSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -13,6 +13,7 @@ import { namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { hexOf } from "@mida/crypto"
 import { contentHash } from "@mida/storage"
+import type { FsStorage } from "@mida/storage"
 import { randomBytes } from "@noble/hashes/utils.js"
 import type { Deployment } from "@mida/chain"
 import { ContextApiClient, createContextApi, fileStores, sweepStores } from "@mida/api"
@@ -93,7 +94,15 @@ function anchoredRecord(object: StoredObject): ContextRecordView {
   }
 }
 
-function contractSuite(name: string, make: () => Promise<{ stores: ContextStores; cleanup: () => Promise<void> }>): void {
+function contractSuite(
+  name: string,
+  make: () => Promise<{
+    stores: ContextStores
+    cleanup: () => Promise<void>
+    /** Give a written blob an older creation time — the sweep's ten-minute grace is age-based. */
+    backdateBlob: (hash: Hex, when: Date) => Promise<void>
+  }>,
+): void {
   describe(name, () => {
     it("a second consume of one nonce is REPLAY; two racing consumes admit exactly one", async () => {
       const { stores, cleanup } = await make()
@@ -267,28 +276,28 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
     it("admits only one of two racing PUTs that together exceed the pending cap", async () => {
       const { stores, cleanup } = await make()
       try {
-        const a = fakeObject(OWNER).object
-        a.manifest.ciphertextSize = 60
-        const b = fakeObject(OWNER).object
-        b.manifest.ciphertextSize = 60
+        const a = fakeObject(OWNER)
+        a.object.manifest.ciphertextSize = 60
+        const b = fakeObject(OWNER)
+        b.object.manifest.ciphertextSize = 60
         // Both PUTs see an empty store; the conditional insert lets exactly one land under cap 100.
         const results = await Promise.all([
-          stores.objects.putObjectWithinPending(a, 100),
-          stores.objects.putObjectWithinPending(b, 100),
+          stores.objects.putObjectWithinPending(a.object, 100, a.ciphertext),
+          stores.objects.putObjectWithinPending(b.object, 100, b.ciphertext),
         ])
         expect(results.slice().sort()).toEqual(["over-cap", "stored"])
-        const aStored = await stores.objects.getObject(a.contextId)
-        const bStored = await stores.objects.getObject(b.contextId)
+        const aStored = await stores.objects.getObject(a.object.contextId)
+        const bStored = await stores.objects.getObject(b.object.contextId)
         expect(aStored === undefined).not.toBe(bStored === undefined)
         const winner = aStored === undefined ? b : a
 
         // Marking the winner anchored frees its bytes: a third 60-byte PUT fits under the cap again.
-        await stores.objects.markAnchored(winner.contextId, "2026-09-21T00:00:00.000Z")
-        const c = fakeObject(OWNER).object
-        c.manifest.ciphertextSize = 60
-        expect(await stores.objects.putObjectWithinPending(c, 100)).toBe("stored")
+        await stores.objects.markAnchored(winner.object.contextId, "2026-09-21T00:00:00.000Z")
+        const c = fakeObject(OWNER)
+        c.object.manifest.ciphertextSize = 60
+        expect(await stores.objects.putObjectWithinPending(c.object, 100, c.ciphertext)).toBe("stored")
         // And a repeat of stored bytes is still a free no-op, even while over the byte cap.
-        expect(await stores.objects.putObjectWithinPending(winner, 1)).toBe("repeat")
+        expect(await stores.objects.putObjectWithinPending(winner.object, 1, winner.ciphertext)).toBe("repeat")
       } finally {
         await cleanup()
       }
@@ -345,7 +354,7 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
     })
 
     it("a swept pending object's ciphertext blob is deleted along with its row", async () => {
-      const { stores, cleanup } = await make()
+      const { stores, cleanup, backdateBlob } = await make()
       try {
         const now = new Date("2026-09-21T12:00:00.000Z")
         const { object, ciphertext } = fakeObject()
@@ -353,12 +362,62 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
         await stores.objects.putObject(object)
         await stores.objects.blobs.put(ciphertext)
         const hash = contentHash(ciphertext)
+        // The blob must be older than the ten-minute grace to be reclaimable — as a real 25 h
+        // upload's would be. Fresh writes are spared for the in-flight PUT race instead.
+        await backdateBlob(hash, new Date(now.getTime() - 25 * 60 * 60_000))
 
         // Monad never anchored it: the row AND the bytes are reclaimed together — without the
         // blob delete the bytes stayed stored while no longer counting against any quota.
         expect(await sweepStores({ stores, now, isAnchored: async () => false })).toMatchObject({ objectsRemoved: 1 })
         expect(await stores.objects.getObject(object.contextId)).toBeUndefined()
         await expect(stores.objects.blobs.get(hash)).rejects.toMatchObject({ code: "NOT_FOUND" })
+      } finally {
+        await cleanup()
+      }
+    })
+
+    it("a sweep landing between the blob write and the row write cannot orphan the blob", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const { object, ciphertext } = fakeObject()
+        const hash = object.manifest.ciphertextHash
+        // An old pending row whose ciphertext IS this blob — the sweep deleting it is what would
+        // carry the fresh blob away before the new row lands.
+        const doomed = fakeObject().object
+        doomed.manifest.ciphertextHash = hash
+        doomed.uploadedAt = new Date(Date.now() - 25 * 60 * 60_000).toISOString()
+        await stores.objects.putObject(doomed)
+        // Re-open the window the pre-M3-D split write had: the blob lands, a whole sweep runs, and
+        // only then the object row arrives. The ten-minute grace is what carries the blob through.
+        const raced: ContextStores["objects"] = {
+          ...stores.objects,
+          async putObjectWithinPending(candidate, cap, blob) {
+            await stores.objects.blobs.put(blob)
+            await sweepStores({ stores, now: new Date(), isAnchored: async () => false })
+            return stores.objects.putObjectWithinPending(candidate, cap, blob)
+          },
+        }
+        expect(await raced.putObjectWithinPending(object, 1024, ciphertext)).toBe("stored")
+        expect(await stores.objects.getObject(doomed.contextId)).toBeUndefined()
+        expect(await stores.objects.getObject(object.contextId)).toBeDefined()
+        expect(await raced.blobs.get(hash)).toEqual(ciphertext)
+      } finally {
+        await cleanup()
+      }
+    })
+
+    it("a blob older than the ten-minute grace still dies with its swept row", async () => {
+      const { stores, cleanup, backdateBlob } = await make()
+      try {
+        const now = new Date()
+        const { object, ciphertext } = fakeObject()
+        object.uploadedAt = new Date(now.getTime() - 25 * 60 * 60_000).toISOString()
+        await stores.objects.putObject(object)
+        await stores.objects.blobs.put(ciphertext)
+        await backdateBlob(object.manifest.ciphertextHash, new Date(now.getTime() - 11 * 60_000))
+        await sweepStores({ stores, now, isAnchored: async () => false })
+        expect(await stores.objects.getObject(object.contextId)).toBeUndefined()
+        await expect(stores.objects.blobs.get(object.manifest.ciphertextHash)).rejects.toMatchObject({ code: "NOT_FOUND" })
       } finally {
         await cleanup()
       }
@@ -393,7 +452,7 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
     })
 
     it("a ciphertext blob shared with a younger pending object dies only when the last reference goes", async () => {
-      const { stores, cleanup } = await make()
+      const { stores, cleanup, backdateBlob } = await make()
       try {
         const now = new Date("2026-09-21T12:00:00.000Z")
         const { ciphertext } = fakeObject()
@@ -407,6 +466,8 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
         await stores.objects.putObject(older)
         await stores.objects.putObject(younger)
         await stores.objects.blobs.put(ciphertext)
+        // Written when the older row was — past the ten-minute grace, so the last sweep reclaims it.
+        await backdateBlob(sharedHash, new Date(now.getTime() - 25 * 60 * 60_000))
 
         const isAnchored = async () => false
         await sweepStores({ stores, now, isAnchored })
@@ -536,7 +597,7 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
     })
 
     it("a blob referenced by a manifest index row survives its object's sweep, then dies with the index", async () => {
-      const { stores, cleanup } = await make()
+      const { stores, cleanup, backdateBlob } = await make()
       try {
         const now = new Date("2026-09-21T12:00:00.000Z")
         const hoursAgo = (h: number) => new Date(now.getTime() - h * 60 * 60_000).toISOString()
@@ -548,6 +609,8 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
         const bodyHash = hexOf(randomBytes(32))
         await stores.objects.putObject(object)
         await stores.objects.blobs.put(ciphertext)
+        // As old as the upload itself — past the ten-minute grace, so the last sweep reclaims it.
+        await backdateBlob(sharedHash, new Date(now.getTime() - 25 * 60 * 60_000))
         // The index row is fresh (2 h) — it survives the same sweep that reclaims the object.
         await stores.objects.setManifestIndex(bodyHash, sharedHash, { storedAt: hoursAgo(2) })
 
@@ -671,10 +734,15 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
   })
 }
 
-contractSuite("the file-backed stores", async () => ({
-  stores: fileStores(mkdtempSync(join(tmpdir(), "mida-contract-"))),
-  cleanup: async () => {},
-}))
+contractSuite("the file-backed stores", async () => {
+  const stores = fileStores(mkdtempSync(join(tmpdir(), "mida-contract-")))
+  return {
+    stores,
+    cleanup: async () => {},
+    // A blob file's age is its mtime — utimesSync is how a test writes a blob "a day ago".
+    backdateBlob: async (hash, when) => utimesSync((stores.objects.blobs as FsStorage).pathFor(hash), when, when),
+  }
+})
 
 contractSuite("the D1 stores on a real SQLite D1", async () => {
   const mf = new Miniflare({
@@ -691,5 +759,10 @@ contractSuite("the D1 stores on a real SQLite D1", async () => {
     .map((statement) => statement.trim())
     .filter((statement) => statement.length > 0)
   await db.batch(statements.map((sql) => db.prepare(sql)))
-  return { stores: d1Stores(db), cleanup: async () => void (await mf.dispose()) }
+  return {
+    stores: d1Stores(db),
+    cleanup: async () => void (await mf.dispose()),
+    backdateBlob: async (hash, when) =>
+      void (await db.prepare("UPDATE blobs SET created_at = ? WHERE hash = ?").bind(when.toISOString(), hash.toLowerCase()).run()),
+  }
 })

@@ -1,8 +1,8 @@
-import { readFileSync, readdirSync, rmSync } from "node:fs"
+import { readFileSync, readdirSync, rmSync, statSync } from "node:fs"
 import { join } from "node:path"
 import { MidaError } from "@mida/protocol"
 import type { Address, Hex, ObjectManifest, ReaderEpochWrap } from "@mida/protocol"
-import { FsStorage } from "@mida/storage"
+import { FsStorage, verifyContent } from "@mida/storage"
 import { writeJsonAtomic } from "./secure-fs.js"
 import { SWEEP_MAX_OBJECTS_PER_RUN } from "./stores.js"
 import type { ManifestIndexEntry, ObjectStore, WrapKey } from "./stores.js"
@@ -79,12 +79,17 @@ export class ApiStore implements ObjectStore {
       .sort((a, b) => (a.uploadedAt === b.uploadedAt ? (a.contextId < b.contextId ? -1 : 1) : a.uploadedAt < b.uploadedAt ? -1 : 1))
   }
 
-  async putObjectWithinPending(object: StoredObject, maxPendingBytes: number): Promise<"stored" | "repeat" | "over-cap"> {
+  async putObjectWithinPending(object: StoredObject, maxPendingBytes: number, blob: Uint8Array): Promise<"stored" | "repeat" | "over-cap"> {
+    verifyContent(object.manifest.ciphertextHash, blob)
     const path = join(this.#dir, "objects", `${object.contextId}.json`)
     const existing = readJson<StoredObject>(path)
     if (existing !== undefined) {
-      if (existing.manifestHash === object.manifestHash) return "repeat"
-      throw new MidaError("COMMITMENT_MISMATCH", "a different manifest is already stored for this contextId")
+      if (existing.manifestHash !== object.manifestHash) {
+        throw new MidaError("COMMITMENT_MISMATCH", "a different manifest is already stored for this contextId")
+      }
+      // A repeat still (re)writes the blob — healing a row whose first upload crashed between writes.
+      await this.blobs.put(blob)
+      return "repeat"
     }
     // The check runs fully synchronously — no await between the directory read and the write — so a
     // single Node process cannot interleave two admissions. Across processes it is not atomic, which
@@ -95,7 +100,11 @@ export class ApiStore implements ObjectStore {
       if (other.uploader.toLowerCase() === uploader && other.anchoredAt === null) pending += other.manifest.ciphertextSize
     }
     if (pending > maxPendingBytes) return "over-cap"
+    // The row lands before the blob here: this process's sweeps re-check references at delete time,
+    // so the written row already protects the hash, and a crash leaves a pending row the 24 h sweep
+    // reclaims — never an orphan blob file nothing counts.
     writeJsonAtomic(this.#dir, path, normalize(object))
+    await this.blobs.put(blob)
     return "stored"
   }
 
@@ -210,8 +219,19 @@ export class ApiStore implements ObjectStore {
     return referenced
   }
 
-  async sweepPending(olderThan: Date, stillPending: (object: StoredObject) => Promise<boolean>): Promise<number> {
+  /** A blob file may be deleted when it is older than the grace cutoff (or no grace was asked for). */
+  #blobReclaimable(hash: Hex, cutoffMs: number): boolean {
+    try {
+      return statSync(this.blobs.pathFor(hash)).mtimeMs < cutoffMs
+    } catch {
+      // Missing or unreadable: nothing young to spare — let the delete run (rmSync force no-ops).
+      return true
+    }
+  }
+
+  async sweepPending(olderThan: Date, stillPending: (object: StoredObject) => Promise<boolean>, blobGraceCutoff?: Date): Promise<number> {
     const cutoff = olderThan.getTime()
+    const graceMs = blobGraceCutoff?.getTime() ?? Number.POSITIVE_INFINITY
     const markedAt = new Date().toISOString()
     let removed = 0
     // Candidates are the oldest unmarked rows past the window, capped at SWEEP_MAX_OBJECTS_PER_RUN:
@@ -237,8 +257,9 @@ export class ApiStore implements ObjectStore {
         rmSync(path)
         removed += 1
         // The row's ciphertext blob dies with it only when no surviving row references the hash —
-        // another object's ciphertext, or a manifest index row's envelope (identical bytes, one hash).
-        if (!this.#referencedBlobHashes().has(object.manifest.ciphertextHash.toLowerCase())) {
+        // another object's ciphertext, or a manifest index row's envelope (identical bytes, one hash)
+        // — and only when it is past the grace window: a younger blob belongs to a row still landing.
+        if (!this.#referencedBlobHashes().has(object.manifest.ciphertextHash.toLowerCase()) && this.#blobReclaimable(object.manifest.ciphertextHash, graceMs)) {
           rmSync(this.blobs.pathFor(object.manifest.ciphertextHash), { force: true })
         }
       } else {
@@ -249,8 +270,9 @@ export class ApiStore implements ObjectStore {
     return removed
   }
 
-  async sweepManifests(olderThan: Date): Promise<number> {
+  async sweepManifests(olderThan: Date, blobGraceCutoff?: Date): Promise<number> {
     const cutoff = olderThan.getTime()
+    const graceMs = blobGraceCutoff?.getTime() ?? Number.POSITIVE_INFINITY
     const folder = join(this.#dir, "agent-manifests")
     let names: string[]
     try {
@@ -270,10 +292,11 @@ export class ApiStore implements ObjectStore {
       removed += 1
     }
     if (removed === 0) return 0
-    // A blob dies only when nothing references its hash: surviving index rows and every object's ciphertext.
+    // A blob dies only when nothing references its hash: surviving index rows and every object's
+    // ciphertext — and only past the grace window, same as the object sweep above.
     const referenced = this.#referencedBlobHashes()
     for (const hash of expired) {
-      if (!referenced.has(hash.toLowerCase())) rmSync(this.blobs.pathFor(hash), { force: true })
+      if (!referenced.has(hash.toLowerCase()) && this.#blobReclaimable(hash, graceMs)) rmSync(this.blobs.pathFor(hash), { force: true })
     }
     return removed
   }

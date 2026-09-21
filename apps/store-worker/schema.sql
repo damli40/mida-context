@@ -5,9 +5,13 @@
 -- Primary keys mirror the file names the local store used.
 
 -- §9.2 content-addressed blobs: ciphertext and signed manifest envelopes.
+-- On a database created before created_at existed:
+--   ALTER TABLE blobs ADD COLUMN created_at TEXT NOT NULL DEFAULT '';
+-- (empty created_at sorts before every real timestamp, so old blobs stay sweepable).
 CREATE TABLE IF NOT EXISTS blobs (
   hash TEXT PRIMARY KEY,            -- 0x-prefixed lowercase sha256 of `bytes`
-  bytes BLOB NOT NULL
+  bytes BLOB NOT NULL,
+  created_at TEXT NOT NULL          -- ISO-8601 UTC; the sweep's young-blob grace reads it
 );
 
 -- §12.2 pending/anchored objects: immutable manifest metadata per contextId. anchored_at is set

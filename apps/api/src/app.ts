@@ -318,9 +318,9 @@ export function createContextApi(options: ContextApiOptions) {
 
     // 8. store as pending; §12.3 serves it only once Monad holds matching commitments. The conditional
     // insert re-runs the pending-byte sum inside the same statement, so two instances racing the cap
-    // cannot both be admitted — the loser sees "over-cap" here even though its own scan passed. The row
-    // lands before its blob: a failed blob write leaves a pending row the 24 h sweep reclaims, rather
-    // than an orphaned blob nobody references.
+    // cannot both be admitted — the loser sees "over-cap" here even though its own scan passed. Row
+    // and blob are admitted together: on D1 they are one batch, so a sweep can never land between the
+    // two writes and delete the blob of a row about to exist.
     const admission = await store.putObjectWithinPending(
       {
         contextId: manifest.contextId,
@@ -336,11 +336,11 @@ export function createContextApi(options: ContextApiOptions) {
         anchoredAt: null,
       },
       limits.maxPendingBytesPerSigner,
+      ciphertext,
     )
     if (admission === "over-cap") {
       return quotaExceeded(c, "maxPendingBytesPerSigner", "unanchored ciphertext reached the cap while this PUT was in flight")
     }
-    await store.blobs.put(ciphertext)
     return c.json({ contextId: manifest.contextId, manifestHash: committedManifestHash, state: "pending" })
   })
 

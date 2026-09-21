@@ -91,13 +91,14 @@ function denyFrom(row: DenyRow): RevocationIntent {
 /**
  * The §9.2 blob store as one D1 table: ciphertext and manifest envelopes live in a BLOB column keyed by their
  * sha256. `get` still runs the same verify-the-bytes-against-the-hash check every implementation must.
+ * `created_at` records when the blob entered the store — the sweep's young-blob grace reads it.
  */
 export class D1BlobStorage implements ContextStorage {
   constructor(readonly db: D1Like) {}
 
   async put(blob: Uint8Array): Promise<StorageRef[]> {
     const hash = contentHash(blob)
-    await this.db.prepare("INSERT OR IGNORE INTO blobs (hash, bytes) VALUES (?, ?)").bind(hash, blob).run()
+    await this.db.prepare("INSERT OR IGNORE INTO blobs (hash, bytes, created_at) VALUES (?, ?, ?)").bind(hash, blob, new Date().toISOString()).run()
     return [{ provider: "mida-api", locator: hash }]
   }
 
@@ -164,39 +165,56 @@ export class D1ObjectStore implements ObjectStore {
       .sort((a, b) => (a.uploadedAt === b.uploadedAt ? (a.contextId < b.contextId ? -1 : 1) : a.uploadedAt < b.uploadedAt ? -1 : 1))
   }
 
-  async putObjectWithinPending(object: StoredObject, maxPendingBytes: number): Promise<"stored" | "repeat" | "over-cap"> {
-    // The cap check and the write are one statement: SQLite computes the unanchored-byte sum for this
-    // uploader at insert time, so two Worker instances racing the same cap cannot both be admitted —
-    // one of them sees 0 changes here and is refused below.
-    const inserted = await this.db
-      .prepare(
-        `INSERT INTO objects
-           (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, ciphertext_hash, size, uploaded_at, anchored_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE NOT EXISTS (SELECT 1 FROM objects WHERE context_id = ?)
-           AND (SELECT COALESCE(SUM(size), 0) FROM objects WHERE uploader = ? AND anchored_at IS NULL) + ? <= ?`,
-      )
-      .bind(
-        object.contextId.toLowerCase(),
-        object.owner.toLowerCase(),
-        object.uploader.toLowerCase(),
-        object.namespaceId.toLowerCase(),
-        object.authorId.toLowerCase(),
-        object.objectNonce.toLowerCase(),
-        object.expectedParentId.toLowerCase(),
-        JSON.stringify(object.manifest),
-        object.manifestHash.toLowerCase(),
-        object.manifest.ciphertextHash.toLowerCase(),
-        object.manifest.ciphertextSize,
-        object.uploadedAt,
-        object.anchoredAt,
-        object.contextId.toLowerCase(),
-        object.uploader.toLowerCase(),
-        object.manifest.ciphertextSize,
-        maxPendingBytes,
-      )
-      .run()
-    if (changes(inserted) > 0) return "stored"
+  async putObjectWithinPending(object: StoredObject, maxPendingBytes: number, blob: Uint8Array): Promise<"stored" | "repeat" | "over-cap"> {
+    verifyContent(object.manifest.ciphertextHash, blob)
+    // The row and its blob land in ONE batch — a sweep can never land between them and delete the
+    // blob of a row about to exist. The blob insert follows the row insert and writes only when a
+    // matching row is there afterwards ("stored" or "repeat"), so a refused or mismatched PUT leaves
+    // no orphan blob behind. Inside one transaction the ordering is cosmetic; the guard — not the
+    // order — is what stops a blob the quota did not admit.
+    const inserted = await this.db.batch([
+      this.db
+        .prepare(
+          `INSERT INTO objects
+             (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, ciphertext_hash, size, uploaded_at, anchored_at)
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           WHERE NOT EXISTS (SELECT 1 FROM objects WHERE context_id = ?)
+             AND (SELECT COALESCE(SUM(size), 0) FROM objects WHERE uploader = ? AND anchored_at IS NULL) + ? <= ?`,
+        )
+        .bind(
+          object.contextId.toLowerCase(),
+          object.owner.toLowerCase(),
+          object.uploader.toLowerCase(),
+          object.namespaceId.toLowerCase(),
+          object.authorId.toLowerCase(),
+          object.objectNonce.toLowerCase(),
+          object.expectedParentId.toLowerCase(),
+          JSON.stringify(object.manifest),
+          object.manifestHash.toLowerCase(),
+          object.manifest.ciphertextHash.toLowerCase(),
+          object.manifest.ciphertextSize,
+          object.uploadedAt,
+          object.anchoredAt,
+          object.contextId.toLowerCase(),
+          object.uploader.toLowerCase(),
+          object.manifest.ciphertextSize,
+          maxPendingBytes,
+        ),
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO blobs (hash, bytes, created_at)
+           SELECT ?, ?, ?
+           WHERE EXISTS (SELECT 1 FROM objects WHERE context_id = ? AND manifest_hash = ?)`,
+        )
+        .bind(
+          object.manifest.ciphertextHash.toLowerCase(),
+          blob,
+          object.uploadedAt,
+          object.contextId.toLowerCase(),
+          object.manifestHash.toLowerCase(),
+        ),
+    ]) as D1RunResult[]
+    if (changes(inserted[0]!) > 0) return "stored"
     // 0 changes is ambiguous by design of WHERE-guarded inserts: the row either already exists
     // (repeat or commitment attack) or the sum refused the cap — the stored row decides which.
     const row = await this.db.prepare("SELECT manifest_hash FROM objects WHERE context_id = ?").bind(object.contextId.toLowerCase()).first<{ manifest_hash: string }>()
@@ -298,7 +316,9 @@ export class D1ObjectStore implements ObjectStore {
     return row.count
   }
 
-  async sweepPending(olderThan: Date, stillPending: (object: StoredObject) => Promise<boolean>): Promise<number> {
+  async sweepPending(olderThan: Date, stillPending: (object: StoredObject) => Promise<boolean>, blobGraceCutoff?: Date): Promise<number> {
+    // With no grace asked for, a cutoff far in the future keeps every blob deletable — same as today.
+    const blobCutoff = blobGraceCutoff?.toISOString() ?? "9999-12-31T23:59:59.999Z"
     // ISO-8601 UTC strings sort chronologically, so the cutoff is a plain string comparison. Marked
     // rows are skipped outright — the anchoring fact is permanent — and an unmarked row stillPending
     // reports anchored gets its mark here, so the next sweep never asks about it again. LIMIT bounds
@@ -331,15 +351,16 @@ export class D1ObjectStore implements ObjectStore {
       // The row's ciphertext blob dies with it, but only when no remaining row references the hash:
       // another object (two uploads of identical ciphertext share one blob) or a manifest_index row
       // (an envelope with identical bytes). These run after every object delete in the same batch,
-      // so the guards see the final row set.
+      // so the guards see the final row set. created_at is the young-blob grace: a fresh blob belongs
+      // to a PUT still landing its row, and outlives this delete.
       ...deletable.map((row) =>
         this.db
           .prepare(
-            `DELETE FROM blobs WHERE hash = ?
+            `DELETE FROM blobs WHERE hash = ? AND created_at < ?
              AND NOT EXISTS (SELECT 1 FROM objects WHERE ciphertext_hash = ?)
              AND NOT EXISTS (SELECT 1 FROM manifest_index WHERE envelope_hash = ?)`,
           )
-          .bind(row.ciphertext_hash, row.ciphertext_hash, row.ciphertext_hash),
+          .bind(row.ciphertext_hash, blobCutoff, row.ciphertext_hash, row.ciphertext_hash),
       ),
       ...anchored.map((id) => this.db.prepare("UPDATE objects SET anchored_at = ? WHERE context_id = ? AND anchored_at IS NULL").bind(markedAt, id)),
     ]
@@ -348,24 +369,27 @@ export class D1ObjectStore implements ObjectStore {
     return settled.slice(0, deletable.length).reduce((total, result) => total + changes(result), 0)
   }
 
-  async sweepManifests(olderThan: Date): Promise<number> {
+  async sweepManifests(olderThan: Date, blobGraceCutoff?: Date): Promise<number> {
     const { results } = await this.db
       .prepare("SELECT body_hash, envelope_hash FROM manifest_index WHERE verified_at IS NULL AND stored_at < ?")
       .bind(olderThan.toISOString())
       .all<{ body_hash: string; envelope_hash: string }>()
     if (results.length === 0) return 0
+    // With no grace asked for, a cutoff far in the future keeps every blob deletable — same as today.
+    const blobCutoff = blobGraceCutoff?.toISOString() ?? "9999-12-31T23:59:59.999Z"
     // The blob survives if anything still references its hash: another index row (same envelope can sit under
     // another body hash in principle) or an object's ciphertext_hash — never a dangling-content delete.
+    // The created_at clause is the same young-blob grace the object sweep applies.
     await this.db.batch([
       ...results.map((row) => this.db.prepare("DELETE FROM manifest_index WHERE body_hash = ?").bind(row.body_hash)),
       ...results.map((row) =>
         this.db
           .prepare(
-            `DELETE FROM blobs WHERE hash = ?
+            `DELETE FROM blobs WHERE hash = ? AND created_at < ?
              AND NOT EXISTS (SELECT 1 FROM manifest_index WHERE envelope_hash = ?)
              AND NOT EXISTS (SELECT 1 FROM objects WHERE ciphertext_hash = ?)`,
           )
-          .bind(row.envelope_hash, row.envelope_hash, row.envelope_hash),
+          .bind(row.envelope_hash, blobCutoff, row.envelope_hash, row.envelope_hash),
       ),
     ])
     return results.length

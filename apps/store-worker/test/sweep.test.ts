@@ -127,6 +127,9 @@ describe("the scheduled sweep", () => {
       await stores.objects.blobs.put(verifiedBytes)
       await stores.objects.blobs.put(sharedBytes)
       const hourAgo = (h: number) => new Date(now.getTime() - h * 60 * 60_000).toISOString()
+      // The stale blob was written when its row was — past the sweep's ten-minute grace, which
+      // exists to spare blobs a still-in-flight PUT has not finished writing a row for.
+      await db.prepare("UPDATE blobs SET created_at = ? WHERE hash = ?").bind(hourAgo(25), staleUnverified.envelopeHash).run()
       await stores.objects.setManifestIndex(staleUnverified.bodyHash, staleUnverified.envelopeHash, { storedAt: hourAgo(25) })
       await stores.objects.setManifestIndex(verifiedOld.bodyHash, verifiedOld.envelopeHash, { storedAt: hourAgo(90 * 24), verifiedAt: hourAgo(80 * 24) })
       await stores.objects.setManifestIndex(youngUnverified.bodyHash, youngUnverified.envelopeHash, { storedAt: hourAgo(23) })
