@@ -344,6 +344,22 @@ describe("policy refusals arrive as JSON-RPC errors, not 500s and not forwards",
     expect(reply.error?.message).toMatch(/callGasLimit/)
   })
 
+  it("a delegation-clearing operation is refused — clearing is off by default", async () => {
+    const sender = randomAddress()
+    const before = provider.calls.length
+    const reply = await signOp(
+      validUserOp({
+        sender,
+        callData: executeCall(sender, 0n, "0x"),
+        eip7702Auth: validAuth({ address: ZERO }),
+        callGasLimit: "0xea60",
+      }),
+    )
+    expect(reply.error?.code).toBe(-32000)
+    expect(reply.error?.message).toMatch(/clearing/)
+    expect(provider.calls.length).toBe(before)
+  })
+
   it("without an authorization the sender's on-chain delegation is consulted", async () => {
     const sender = randomAddress()
     const op = validUserOp({ sender, eip7702Auth: undefined })

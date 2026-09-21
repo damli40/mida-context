@@ -56,6 +56,11 @@ export interface SponsorEnv {
   PRE_VERIFICATION_GAS_CEILING?: string
   PAYMASTER_GAS_CEILING?: string
   FEE_CEILING?: string
+  /**
+   * "true" sponsors the exact delegation-clearing operation (zero-address authorization, one
+   * execute to self, empty data). Anything else — including unset — leaves it off.
+   */
+  ALLOW_CLEARING?: string
 }
 
 const ALLOWED_METHODS = new Set([
@@ -174,6 +179,7 @@ export function buildWorker(env: SponsorEnv): SponsorConfig {
       contextRegistry: parseAddress(required(env, "CONTEXT_REGISTRY"), "CONTEXT_REGISTRY"),
       allowedImplementations,
       ceilings: resolveGasCeilings(env),
+      allowClearing: env.ALLOW_CLEARING === "true",
     },
     secrets,
     perSenderDailyLimit: parseLimit(env.PER_SENDER_DAILY_LIMIT, 30, "PER_SENDER_DAILY_LIMIT"),

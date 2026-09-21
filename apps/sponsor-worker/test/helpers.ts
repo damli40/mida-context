@@ -26,6 +26,7 @@ export const policyEnv: PolicyEnv = {
   contextRegistry: CTX,
   allowedImplementations: new Set([IMPL]),
   ceilings: { ...DEFAULT_GAS_CEILINGS },
+  allowClearing: false,
 }
 
 export function randomAddress(): string {

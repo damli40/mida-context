@@ -183,6 +183,12 @@ export interface PolicyEnv {
   allowedImplementations: ReadonlySet<string>
   /** The fixed ceilings as deployed — env may have tightened them below the built-ins. */
   ceilings: GasCeilings
+  /**
+   * Whether a zero-address authorization may buy the exact delegation-clearing operation. Off by
+   * default: whether a delegated account can even validate the operation that clears its own code
+   * is unproven until the probe says so — an unproven exception is only attack surface.
+   */
+  allowClearing: boolean
 }
 
 /** Injected so the policy stays pure — the Worker wires env.RPC_URL here; tests wire a stub. */
@@ -400,6 +406,20 @@ export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: Cha
     const only = calls[0]
     const clearing =
       kind === "execute" && calls.length === 1 && only !== undefined && only.target === sender && only.data === "0x" && authZeroDelegation
+    // A zero-address authorization erases the sender's code in the same transaction — allowed only
+    // for the exact clearing shape, and only when this endpoint opted in. An ordinary Mida call
+    // riding along would clear the delegation and still fail on chain at the sponsor's expense.
+    if (authZeroDelegation) {
+      if (!env.allowClearing) {
+        refuse("auth", "refused: this endpoint does not sponsor delegation clearing")
+      }
+      if (!clearing) {
+        refuse(
+          "auth",
+          "refused: a zero-address authorization buys only the delegation-clearing operation — one execute to the sender's own address with empty data",
+        )
+      }
+    }
     if (!clearing) {
       for (const call of calls) {
         if (call.target !== env.capabilityRegistry && call.target !== env.contextRegistry) {

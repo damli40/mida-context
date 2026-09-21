@@ -19,7 +19,7 @@ import {
   checkedParams,
   decodeCalls,
 } from "../src/policy.js"
-import type { ChainQueries } from "../src/policy.js"
+import type { ChainQueries, PolicyEnv } from "../src/policy.js"
 import { GAS_CEILINGS, capabilityRegistryAbi, contextRegistryAbi } from "@mida/chain"
 import { toFunctionSelector } from "viem"
 import {
@@ -50,8 +50,8 @@ const neverCalled: ChainQueries = {
   },
 }
 
-async function refused(op: Record<string, unknown>, chain: ChainQueries = neverCalled): Promise<string> {
-  const refusal = await checkUserOperation(op, policyEnv, chain)
+async function refused(op: Record<string, unknown>, chain: ChainQueries = neverCalled, env: PolicyEnv = policyEnv): Promise<string> {
+  const refusal = await checkUserOperation(op, env, chain)
   expect(refusal).not.toBeNull()
   return refusal!.rule
 }
@@ -197,8 +197,8 @@ describe("checkUserOperation — eip7702Auth", () => {
     expect(await refused(validUserOp({ eip7702Auth: validAuth({ address: randomAddress() }) }))).toBe("auth")
   })
 
-  it("accepts the zero address — the delegation-clearing authorization", async () => {
-    expect(await checkUserOperation(validUserOp({ eip7702Auth: validAuth({ address: ZERO }) }), policyEnv, neverCalled)).toBeNull()
+  it("refuses the zero address when it accompanies ordinary calls — a clearing authorization buys only the clearing shape", async () => {
+    expect(await refused(validUserOp({ eip7702Auth: validAuth({ address: ZERO }) }))).toBe("auth")
   })
 
   it("checks an `authorization` field too — the other wire name cannot smuggle a bad auth", async () => {
@@ -370,7 +370,7 @@ describe("checkUserOperation — inner calls", () => {
     expect(await refused(validUserOp({ callData: batchCall([]) }))).toBe("calldata")
   })
 
-  it("the delegation-clearing case: execute to self, empty data, zero-address auth — and only that", async () => {
+  it("the delegation-clearing case is off by default and exact even when enabled", async () => {
     const sender = randomAddress()
     const clearing = validUserOp({
       sender,
@@ -379,26 +379,49 @@ describe("checkUserOperation — inner calls", () => {
       // The clearing call buys no function — its ceiling is the per-call overhead alone, 60,000.
       callGasLimit: "0xea60",
     })
-    expect(await checkUserOperation(clearing, policyEnv, neverCalled)).toBeNull()
+    const clearingOn: PolicyEnv = { ...policyEnv, allowClearing: true }
+
+    // Default: off. The exact clearing shape is refused until the endpoint opts in.
+    expect(await refused(clearing)).toBe("auth")
+    // Enabled: the exact shape passes — and still bills only the 60,000 overhead.
+    expect(await checkUserOperation(clearing, clearingOn, neverCalled)).toBeNull()
+    expect((await checkUserOperation(validUserOp({ ...clearing, callGasLimit: "0xea61" }), clearingOn, neverCalled))?.rule).toBe("gas")
+
+    // Enabled or not, a zero-address authorization never accompanies an ordinary Mida call —
+    // today it would clear the delegation and the calls would still fail on chain at our expense.
+    for (const env of [policyEnv, clearingOn]) {
+      expect(
+        await refused(validUserOp({ sender, eip7702Auth: validAuth({ address: ZERO }) }), neverCalled, env),
+      ).toBe("auth")
+    }
 
     // Same shape without the zero-address authorization is just a non-Mida call — refused.
     expect(await refused(validUserOp({ sender, callData: executeCall(sender, 0n, "0x") }))).toBe("target")
     // Empty data to self inside a batch is not the clearing case.
-    expect(
-      await refused(
-        validUserOp({
-          sender,
-          callData: batchCall([{ target: sender, value: 0n, data: "0x" as Hex }]),
-          eip7702Auth: validAuth({ address: ZERO }),
-        }),
-      ),
-    ).toBe("target")
+    for (const env of [policyEnv, clearingOn]) {
+      expect(
+        await refused(
+          validUserOp({
+            sender,
+            callData: batchCall([{ target: sender, value: 0n, data: "0x" as Hex }]),
+            eip7702Auth: validAuth({ address: ZERO }),
+            callGasLimit: "0xea60",
+          }),
+          neverCalled,
+          env,
+        ),
+      ).toBe("auth")
+    }
     // And self-call with non-empty data is not clearing either.
-    expect(
-      await refused(
-        validUserOp({ sender, callData: executeCall(sender, 0n, midaCallData()), eip7702Auth: validAuth({ address: ZERO }) }),
-      ),
-    ).toBe("target")
+    for (const env of [policyEnv, clearingOn]) {
+      expect(
+        await refused(
+          validUserOp({ sender, callData: executeCall(sender, 0n, midaCallData()), eip7702Auth: validAuth({ address: ZERO }) }),
+          neverCalled,
+          env,
+        ),
+      ).toBe("auth")
+    }
   })
 
   it("garbage callData is a refusal, never a throw", async () => {

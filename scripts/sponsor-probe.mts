@@ -28,8 +28,11 @@
 //                             address still pay its OWN gas? Monad reverts a transaction that
 //                             drops a delegated balance while under 10 MON. PASS means ordinary
 //                             self-pay still works; FAIL means the SDK fallback is broken
-//   g. clear-delegation       one sponsored operation carrying an authorization to the zero
-//                             address removes the delegation again
+//   g. clear-delegation       whether a sponsored operation carrying an authorization to the zero
+//                             address can clear the delegation AT ALL — rejected before inclusion,
+//                             included-but-reverted, included-but-not-cleared, or cleared. The
+//                             answer decides whether the sponsor worker's ALLOW_CLEARING flag
+//                             (default off) may ever be turned on
 //
 // Output: one PASS/FAIL/SKIP line per step plus docs/evidence/m3-sponsor-probe.json. Exit code is
 // 1 when any step failed — a FAIL is a finding, not a crash; read the JSON for the evidence.
@@ -320,25 +323,73 @@ async function main(): Promise<void> {
       },
     })
     // Clearing needs no Mida call: an authorization to the zero address plus an execute() to the
-    // sender itself with empty data — the exact shape the sponsor worker's special case allows.
+    // sender itself with empty data — the exact shape the sponsor worker's ALLOW_CLEARING flag
+    // gates. The detail below records HOW it failed, because each failure means something
+    // different for the flag: rejected before inclusion or reverted inside means a delegated
+    // account cannot validate an operation carrying a clearing authorization at all — the flag
+    // stays off forever; included-but-not-cleared means the shape did not apply — fix the shape.
     const clearing = await account.signAuthorization({
       contractAddress: zeroAddress,
       chainId: Number(MONAD_TESTNET_CHAIN_ID),
       nonce: await publicClient.getTransactionCount({ address: freshAddress }),
     })
-    const clearHash = await bundler.sendUserOperation({
-      calls: [{ to: freshAddress, value: 0n, data: "0x" as Hex }],
-      authorization: clearing,
-    }) as Hex
+    let clearHash: Hex
+    try {
+      clearHash = await bundler.sendUserOperation({
+        calls: [{ to: freshAddress, value: 0n, data: "0x" as Hex }],
+        authorization: clearing,
+      }) as Hex
+    } catch (error) {
+      return {
+        status: "fail",
+        detail: {
+          clearingPossible: false,
+          stage: "rejected-before-inclusion",
+          outcome:
+            "the sponsored clearing operation was rejected before inclusion — a delegated account cannot validate an operation carrying a clearing authorization; ALLOW_CLEARING must stay off",
+          error: maskForLog(error instanceof Error ? error.message : String(error), { secrets, allow: [...allow] }),
+        },
+      }
+    }
     allow.add(clearHash)
     const receipt = await bundler.waitForUserOperationReceipt({ hash: clearHash, timeout: 180_000 })
     allow.add(receipt.receipt.transactionHash)
     const codeAfter = await publicClient.getCode({ address: freshAddress })
     const cleared = codeAfter === undefined || !codeAfter.startsWith("0xef0100")
+    if (!receipt.success) {
+      return {
+        status: "fail",
+        detail: {
+          clearingPossible: false,
+          stage: "included-but-reverted",
+          outcome:
+            "the clearing operation was included but reverted — the account could not validate it under a clearing authorization; ALLOW_CLEARING must stay off",
+          userOpHash: clearHash,
+          transactionHash: receipt.receipt.transactionHash,
+          codeAfterPrefix: typeof codeAfter === "string" ? codeAfter.slice(0, 10) : String(codeAfter),
+        },
+      }
+    }
+    if (!cleared) {
+      return {
+        status: "fail",
+        detail: {
+          clearingPossible: false,
+          stage: "included-but-not-cleared",
+          outcome:
+            "the operation succeeded but the delegation code remains — the clearing shape did not apply; investigate the shape, not the flag",
+          userOpHash: clearHash,
+          transactionHash: receipt.receipt.transactionHash,
+          codeAfterPrefix: typeof codeAfter === "string" ? codeAfter.slice(0, 10) : String(codeAfter),
+        },
+      }
+    }
     return {
-      status: receipt.success && cleared ? "pass" : "fail",
+      status: "pass",
       detail: {
-        outcome: receipt.success ? (cleared ? "delegation cleared" : "operation succeeded but delegation code remains") : "clearing operation failed",
+        clearingPossible: true,
+        stage: "cleared",
+        outcome: "sponsored delegation clearing works — ALLOW_CLEARING may be enabled deliberately",
         userOpHash: clearHash,
         transactionHash: receipt.receipt.transactionHash,
         codeAfterPrefix: typeof codeAfter === "string" ? codeAfter.slice(0, 10) : String(codeAfter),
