@@ -250,6 +250,23 @@ function infoResponse(config: SponsorConfig): Response {
   return new Response(JSON.stringify(body, null, 2), { headers: { "content-type": "application/json" } })
 }
 
+/**
+ * A provider can answer a call with an error object smuggled inside `result` instead of a real
+ * JSON-RPC error — it resolves instead of throwing, so nothing refunds or scrubs unless we look.
+ * No legitimate result carries a top-level `error` object (signatures, receipts, gas prices and
+ * entry-point lists all have their own fields), so the shape is safe to recognise anywhere.
+ */
+function errorInside(result: unknown): { code: number; message: string } | null {
+  if (typeof result !== "object" || result === null) return null
+  const error = (result as { error?: unknown }).error
+  if (typeof error !== "object" || error === null) return null
+  const { code, message } = error as { code?: unknown; message?: unknown }
+  return {
+    code: typeof code === "number" ? code : INTERNAL_ERROR,
+    message: typeof message === "string" ? message : "the sponsor provider refused the request",
+  }
+}
+
 function jsonRpcResponse(id: unknown, result: unknown): Response {
   return Response.json({ jsonrpc: "2.0", id: id ?? null, result })
 }
@@ -321,6 +338,14 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
         await refundSignBudget(env.DB, { day, sender: sender! })
         throw e
       }
+      // An error-shaped result means no signature exists either — refund exactly like a throw,
+      // and answer the client with the scrubbed error, never the provider's raw body.
+      const resultError = errorInside(result)
+      if (resultError !== null) {
+        await refundSignBudget(env.DB, { day, sender: sender! })
+        config.log(method, `provider-${resultError.code}`, sender, Date.now() - started)
+        return jsonRpcError(id ?? null, resultError.code, scrub(resultError.message, config.secrets))
+      }
       await recordIssued(env.DB, { day, ...identity })
       config.log(method, undefined, sender, Date.now() - started)
       return jsonRpcResponse(id ?? null, result)
@@ -356,6 +381,12 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
     }
 
     const result = await config.provider.forward(method, outParams)
+    // The same smuggled-error shape on any other method is an error, not a result to echo.
+    const resultError = errorInside(result)
+    if (resultError !== null) {
+      config.log(method, `provider-${resultError.code}`, sender, Date.now() - started)
+      return jsonRpcError(id ?? null, resultError.code, scrub(resultError.message, config.secrets))
+    }
     config.log(method, undefined, sender, Date.now() - started)
     return jsonRpcResponse(id ?? null, result)
   } catch (e) {

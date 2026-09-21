@@ -53,10 +53,12 @@ async function startFakeProvider(): Promise<{
   url: string
   calls: RecordedCall[]
   failNext(error: { code: number; message: string }): void
+  /** Answer with the error nested inside `result` — the provider resolves instead of throwing. */
+  failNextAsResult(error: { code: number; message: string }): void
   close(): Promise<void>
 }> {
   const calls: RecordedCall[] = []
-  let failure: { code: number; message: string } | null = null
+  let failure: { code: number; message: string; insideResult?: boolean } | null = null
   const server: Server = createServer((req, res) => {
     let raw = ""
     req.on("data", (chunk: Buffer) => (raw += chunk.toString()))
@@ -65,9 +67,13 @@ async function startFakeProvider(): Promise<{
       calls.push({ method, params })
       res.setHeader("content-type", "application/json")
       if (failure) {
-        const error = failure
+        const { code, message, insideResult } = failure
         failure = null
-        return res.end(JSON.stringify({ jsonrpc: "2.0", id, error }))
+        return res.end(
+          insideResult
+            ? JSON.stringify({ jsonrpc: "2.0", id, result: { error: { code, message } } })
+            : JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }),
+        )
       }
       switch (method) {
         case "eth_sendUserOperation":
@@ -98,6 +104,9 @@ async function startFakeProvider(): Promise<{
     calls,
     failNext(error) {
       failure = error
+    },
+    failNextAsResult(error) {
+      failure = { ...error, insideResult: true }
     },
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }
@@ -421,6 +430,39 @@ describe("daily budgets are spent at signing, atomically in D1", () => {
       .bind(today())
       .first<{ count: number }>()
     expect(globalRow?.count ?? 0).toBe(globalBefore)
+  })
+
+  it("an error inside the RESULT refunds too — a provider that resolves instead of throwing spent nothing", async () => {
+    const sender = randomAddress()
+    const globalBefore =
+      (await db.prepare("SELECT count FROM sponsor_global_signings WHERE day = ?").bind(today()).first<{ count: number }>())
+        ?.count ?? 0
+    provider.failNextAsResult({
+      code: -32077,
+      message: `paymaster refused — upstream ${provider.url} policy ${POLICY_ID} invalid`,
+    })
+    const reply = await signOp(validUserOp({ sender }))
+    // The client gets a safe error — never the provider's raw body.
+    expect(reply.error?.code).toBe(-32077)
+    expect(reply.error?.message).not.toContain(PROVIDER_KEY_HINT)
+    expect(reply.error?.message).not.toContain(POLICY_ID)
+    expect(reply.result).toBeUndefined()
+    const senderRow = await db
+      .prepare("SELECT count FROM sponsor_sender_signings WHERE day = ? AND sender = ?")
+      .bind(today(), sender.toLowerCase())
+      .first<{ count: number }>()
+    expect(senderRow?.count ?? 0).toBe(0)
+    const globalRow = await db
+      .prepare("SELECT count FROM sponsor_global_signings WHERE day = ?")
+      .bind(today())
+      .first<{ count: number }>()
+    expect(globalRow?.count ?? 0).toBe(globalBefore)
+    // And nothing was recorded as issued — a later eth_sendUserOperation must not pass.
+    const issued = await db
+      .prepare("SELECT 1 AS found FROM sponsor_issued WHERE day = ? AND sender = ?")
+      .bind(today(), sender.toLowerCase())
+      .first<{ found: number }>()
+    expect(issued).toBeNull()
   })
 
   it("the 31st signing of the day refuses with the plain budget message and zero provider calls", async () => {
