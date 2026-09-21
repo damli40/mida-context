@@ -203,7 +203,12 @@ describe("M1 drainOnce on local Anvil", () => {
       await runtime.close()
     }
     const before = compileCalls.length
-    job({ agent: "codex", sessionId: "s-codex" })
+    // a codex job names a codex transcript: rollouts live under <home>/.codex/sessions/
+    const codexSessions = join(homeDir, ".codex", "sessions", "2026", "09", "21")
+    mkdirSync(codexSessions, { recursive: true })
+    const codexTranscript = join(codexSessions, "rollout-s-codex.jsonl")
+    writeFileSync(codexTranscript, JSON.stringify({ type: "user", cwd: workDir, message: { content: "codex session" } }) + "\n")
+    job({ agent: "codex", sessionId: "s-codex", transcriptPath: codexTranscript })
     const result = await drain()
     expect(result.saved).toBe(0)
     expect(result.failed).toBe(0)
@@ -220,8 +225,8 @@ describe("M1 drainOnce on local Anvil", () => {
     }
     // the dropped job was not kept, so nothing from before approval is saved — a grown
     // transcript on a new job is what saves
-    appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "codex step" }] } }) + "\n")
-    job({ agent: "codex", sessionId: "s-codex" })
+    appendFileSync(codexTranscript, JSON.stringify({ type: "assistant", cwd: workDir, message: { content: [{ type: "text", text: "codex step" }] } }) + "\n")
+    job({ agent: "codex", sessionId: "s-codex", transcriptPath: codexTranscript })
     const after = await drain()
     expect(after.saved).toBe(1)
     expect((await readBack()).checkpoints.some((c) => c.sessionId === "s-codex")).toBe(true)
