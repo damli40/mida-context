@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { increaseLocalTime } from "@mida/chain"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
@@ -21,6 +22,13 @@ import {
 import type { DaemonHandle, Network } from "@mida/midad"
 
 const STEP_TIMEOUT = 60_000
+
+/**
+ * The repo's own `bin/` — where the `mida-hook` and `mida-inject` launchers live until the npm
+ * package exists. The healthy home's env carries it on PATH, exactly as a real install expects
+ * the owner to have it (R4-6); the empty-PATH case proves the PROBLEM line when it is absent.
+ */
+const REPO_BIN = fileURLToPath(new URL("../../../bin/", import.meta.url))
 
 const mark = (folder: string, projectId: string) => {
   mkdirSync(join(folder, ".mida"), { recursive: true })
@@ -48,7 +56,9 @@ describe("mida doctor on local Anvil", () => {
       home,
       print: (line) => lines.push(line),
       settings: { "claude-code": claudeSettings, codex: codexConfig },
-      env: {},
+      // the hook commands must resolve on the PATH the hooks get — the repo's bin/ is prepended,
+      // and the rest of the ambient env stays out of the test
+      env: { PATH: `${REPO_BIN}${delimiter}${process.env.PATH ?? ""}` },
     })
     return { lines, code }
   }
@@ -142,7 +152,7 @@ describe("mida doctor on local Anvil", () => {
       await runtime.close()
     }
     const lines: string[] = []
-    await runDoctor({ home: home2, print: (line) => lines.push(line), env: {}, daemonProbeMs: 50 })
+    await runDoctor({ home: home2, print: (line) => lines.push(line), env: { PATH: `${REPO_BIN}${delimiter}${process.env.PATH ?? ""}` }, daemonProbeMs: 50 })
     const agentLine = lines.find((line) => line.includes("doomed-agent"))
     expect(agentLine).toContain("revoked")
     expect(agentLine).not.toContain("never asked")
@@ -166,5 +176,26 @@ describe("mida doctor on local Anvil", () => {
     expect(lines.some((line) => line.includes("grant expired"))).toBe(true)
     expect(code).toBeGreaterThan(0)
     expect(code).toBeLessThanOrEqual(9)
+  }, STEP_TIMEOUT)
+
+  it("(f) a PATH without the hook commands is a PROBLEM that names the fix (R4-6)", async () => {
+    const emptyPath = mkdtempSync(join(tmpdir(), "mida-doctor-path-"))
+    const lines: string[] = []
+    const code = await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: { "claude-code": claudeSettings, codex: codexConfig },
+      env: { PATH: emptyPath },
+      daemonProbeMs: 50,
+    })
+    for (const command of ["mida-hook", "mida-inject"]) {
+      const line = lines.find((l) => l.includes(command))
+      expect(line).toContain("PROBLEM:")
+      expect(line).toContain(`the command \`${command}\` is not on your PATH`)
+      // the fix text points at a real folder — the repo's own bin/, until the npm package exists
+      expect(line).toContain(`add ${REPO_BIN}`)
+      expect(line).toContain("to your PATH")
+    }
+    expect(code).toBeGreaterThan(0)
   }, STEP_TIMEOUT)
 })
