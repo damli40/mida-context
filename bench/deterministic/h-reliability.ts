@@ -98,7 +98,12 @@ async function h1() {
 async function h2() {
   const cwd = join(dir, "work-h2")
   mkdirSync(cwd, { recursive: true })
-  const { approval } = await approveProject(runtime, { agent: "conv", cwd })
+  // the drain refuses agents with no known transcript folder, so the save leg needs a
+  // real agent name — claude-code gets its own grant here; conv's story stays in h1
+  await init(runtime, ["claude-code"])
+  await requestAccess(runtime, "claude-code")
+  await approve(runtime, "claude-code")
+  const { approval } = await approveProject(runtime, { agent: "claude-code", cwd })
   const transcript = writeTranscript(homeDir, "proj", "h2.jsonl", [userLine("h2 request"), assistantText("h2 step")])
 
   const compileCalls: unknown[] = []
@@ -110,11 +115,11 @@ async function h2() {
   }
   const compile = stubCompile(compileCalls)
 
-  enqueue(home, { agent: "conv", event: "Stop", sessionId: "h2", transcriptPath: transcript, cwd, error: null }, () => new Date(T0))
+  enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "h2", transcriptPath: transcript, cwd, error: null }, () => new Date(T0))
   const d1 = await drainOnce({ home, runtime, compile, save, homeDir, now: () => new Date(T0) })
   // backoff(1) = 120 s: the retry drains once it is due
   const d2 = await drainOnce({ home, runtime, compile, save, homeDir, now: () => new Date(T0 + 121_000) })
-  const read = await readCheckpoints(runtime, "conv", approval.projectId)
+  const read = await readCheckpoints(runtime, "claude-code", approval.projectId)
 
   // CAP-21: while this runtime holds the home, a CLI-side open must fail fast, not hang
   const contention = await throwCode(() => Runtime.open(home, chain.network, { lockWaitMs: 300, lockStepMs: 50 }))

@@ -234,16 +234,18 @@ async function e5() {
 async function e6() {
   const e6dir = join(dir, "work-e6")
   mark(e6dir, "p-e6")
+  // the drain only opens transcripts of agents with a known transcript folder, so the
+  // queued jobs name claude-code: it is chain-approved from setup, and "approval" here is
+  // the project row — approve(cwd) adds it without minting a second grant
   const pre = writeTranscript(homeDir, "proj", "e6-pre.jsonl", [userLine("queued before approval")])
-  enqueue(home, { agent: "latecomer", event: "PostToolUse", sessionId: "e6-pre", transcriptPath: pre, cwd: e6dir, error: null })
+  enqueue(home, { agent: "claude-code", event: "PostToolUse", sessionId: "e6-pre", transcriptPath: pre, cwd: e6dir, error: null })
   const compile = stubCompile([])
   await drainOnce({ home, runtime, compile, homeDir })
-  await requestAccess(runtime, "latecomer")
-  await approve(runtime, "latecomer", e6dir)
+  await approve(runtime, "claude-code", e6dir)
   const post = writeTranscript(homeDir, "proj", "e6-post.jsonl", [userLine("queued after approval"), assistantText("post step")])
-  enqueue(home, { agent: "latecomer", event: "Stop", sessionId: "e6-post", transcriptPath: post, cwd: e6dir, error: null })
+  enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "e6-post", transcriptPath: post, cwd: e6dir, error: null })
   await drainOnce({ home, runtime, compile, homeDir })
-  const read = await readCheckpoints(runtime, "latecomer", "p-e6")
+  const read = await readCheckpoints(runtime, "claude-code", "p-e6")
   return {
     pass: read.checkpoints.length === 1 && read.checkpoints[0]!.sessionId === "e6-post",
     value: { stored: read.checkpoints.length, sessions: read.checkpoints.map((c) => c.sessionId) },
