@@ -48,7 +48,7 @@ async function b1() {
   appendTranscript(t2, assistantText("one more step"))
   const gapAt = Date.now()
   enqueue(home, { agent: "claude-code", event: "PostToolUse", sessionId: "b1-gap", transcriptPath: t2, cwd, error: null })
-  await drainUntilSettled({ home, runtime, compile, homeDir, minGapMs: 2_000 })
+  await drainUntilSettled({ home, runtime, compile, homeDir, minGapMs: 2_000, firstGapMs: 2_000 })
   const read2 = await readCheckpoints(runtime, "claude-code", PROJECT)
   const gapSeconds = (Date.now() - gapAt) / 1000
   const gapReadable = read2.checkpoints.length === 2

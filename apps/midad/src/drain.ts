@@ -29,6 +29,11 @@ import { saveCheckpoint } from "./skeleton.js"
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const DEFAULT_MIN_GAP_MS = 60_000
+/**
+ * A session's FIRST save owes only this gap: one run from its first event, so a session that
+ * dies inside its first minute still leaves a checkpoint. Every later save keeps `minGapMs`.
+ */
+const DEFAULT_FIRST_GAP_MS = 10_000
 const DRAIN_LOCK = "queue/drain.lock"
 const DRAIN_LOCK_MAX_AGE_MS = 10 * 60 * 1000
 const MAX_ATTEMPTS = 8
@@ -77,6 +82,8 @@ export interface DrainDeps {
   compile: typeof compileCheckpoint
   now?: () => Date
   minGapMs?: number
+  /** Gap for a session's FIRST save only — defaults to ten seconds; later saves use `minGapMs`. */
+  firstGapMs?: number
   /** The user's real home folder — the transcript rule is checked against it, injected in tests. */
   homeDir?: string
   /** The chain save — injectable so rule tests never need a chain. Defaults to saveCheckpoint. */
@@ -198,6 +205,7 @@ export async function drainUntilSettled(deps: DrainDeps): Promise<DrainResult> {
  */
 async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult> {
   const minGapMs = deps.minGapMs ?? DEFAULT_MIN_GAP_MS
+  const firstGapMs = deps.firstGapMs ?? DEFAULT_FIRST_GAP_MS
   const homeDir = deps.homeDir ?? homedir()
   const save = deps.save ?? saveCheckpoint
   const isApproved =
@@ -318,12 +326,16 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             continue // the job stays queued: the retry fires once the backoff has passed
           }
         }
-        // No saved state yet: the gap runs from the session's OLDEST queued job, so the first
-        // non-flush save lands one gap after the session's first event, not immediately.
+        // No saved state yet: the gap runs from the session's OLDEST queued job. The FIRST save
+        // owes only the short first gap — a session killed in its first minute still leaves a
+        // checkpoint; every later save keeps the full gap. A session inside a retry backoff never
+        // reaches this line — the backoff check above already holds it.
+        const first = state?.savedAt === undefined
         const gapRef = Date.parse(state?.savedAt ?? group[0]!.at)
-        if (!flush && now().getTime() - gapRef < minGapMs) {
+        const gapMs = first ? firstGapMs : minGapMs
+        if (!flush && now().getTime() - gapRef < gapMs) {
           counts.skippedTooSoon += 1
-          dueSooner(gapRef + minGapMs)
+          dueSooner(gapRef + gapMs)
           continue // the job stays queued: a later drain or a flush still saves it
         }
 

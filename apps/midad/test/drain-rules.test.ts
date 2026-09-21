@@ -237,6 +237,76 @@ describe("a first save waits one gap after the session's first event", () => {
   })
 })
 
+describe("the first save lands about ten seconds in, later saves keep the minute gap (R5-2)", () => {
+  it("a session with no savedAt is due at +10 s, and the earliest-due report says so", async () => {
+    const { job, drain, compileCalls, saveCalls } = setup()
+    job({ event: "PostToolUse" }, T0)
+    const tooSoon = await drain({ now: () => new Date(T0 + 9_000) })
+    expect(tooSoon).toMatchObject({ saved: 0, skippedTooSoon: 1 })
+    expect(tooSoon.earliestDueMs).toBe(T0 + 10_000)
+    expect(compileCalls).toHaveLength(0)
+    const due = await drain({ now: () => new Date(T0 + 11_000) })
+    expect(due.saved).toBe(1)
+    expect(compileCalls).toHaveLength(1)
+    expect(saveCalls).toHaveLength(1)
+  })
+
+  it("the settle pass sleeps the short gap, so the first save is attempted inside 12 s (fake clock)", async () => {
+    const { home, job, compile, save, open, homeDir, compileCalls, saveCalls, checkProject } = setup()
+    job({ event: "PostToolUse" }, T0)
+    let clock = T0 + 5_000
+    const sleeps: number[] = []
+    const result = await drainUntilSettled({
+      home, open, compile, save, homeDir, checkProject, isApproved: async () => true,
+      now: () => new Date(clock),
+      sleep: async (ms) => {
+        sleeps.push(ms)
+        clock += ms
+      },
+    })
+    expect(sleeps).toHaveLength(1)
+    expect(sleeps[0]).toBeGreaterThan(0)
+    expect(sleeps[0]).toBeLessThanOrEqual(10_000)
+    expect(result.saved).toBe(1)
+    // the save was attempted inside 12 s of the first event — the 15 s daemon tick never hid the gap
+    expect(clock).toBeLessThanOrEqual(T0 + 12_000)
+    expect(compileCalls).toHaveLength(1)
+    expect(saveCalls).toHaveLength(1)
+  })
+
+  it("the second save still waits the full 60 s after the first", async () => {
+    const { transcriptPath, job, drain, compileCalls, saveCalls } = setup()
+    job({ event: "PostToolUse" }, T0)
+    expect((await drain({ now: () => new Date(T0 + 11_000) })).saved).toBe(1)
+    appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "more" }] } }) + "\n")
+    job({ event: "PostToolUse" }, T0 + 20_000)
+    const tooSoon = await drain({ now: () => new Date(T0 + 21_000) })
+    expect(tooSoon.skippedTooSoon).toBe(1)
+    // savedAt was written at T0+11 s — the next save is due at +60 s from there, not +10 s
+    expect(tooSoon.earliestDueMs).toBe(T0 + 71_000)
+    const due = await drain({ now: () => new Date(T0 + 72_000) })
+    expect(due.saved).toBe(1)
+    expect(compileCalls).toHaveLength(2)
+    expect(saveCalls).toHaveLength(2)
+  })
+
+  it("a failed first save follows the existing backoff, not the short gap", async () => {
+    const { job, drain, flags, saveCalls } = setup()
+    job({ event: "PostToolUse" }, T0)
+    flags.saveFailures = 1
+    const failed = await drain({ now: () => new Date(T0 + 11_000) })
+    expect(failed).toMatchObject({ saved: 0, failed: 1 })
+    expect(saveCalls).toHaveLength(1)
+    // 19 s after the failure the 10 s gap is long past — only the 120 s backoff still holds it
+    const held = await drain({ now: () => new Date(T0 + 30_000) })
+    expect(held).toMatchObject({ saved: 0, failed: 0, skippedTooSoon: 1 })
+    expect(saveCalls).toHaveLength(1)
+    const retried = await drain({ now: () => new Date(T0 + 132_000) })
+    expect(retried.saved).toBe(1)
+    expect(saveCalls).toHaveLength(2)
+  })
+})
+
 describe("a failed save does not buy a new model call", () => {
   it("the retry after the backoff reuses the compiled envelope — the compile stub runs once", async () => {
     const { home, job, drain, compileCalls, saveCalls, flags } = setup()
@@ -538,8 +608,9 @@ describe("drainUntilSettled waits out the gap instead of stranding the job", () 
       home, open, compile, save, homeDir, checkProject, isApproved: async () => true, now: () => new Date(clock), sleep,
     })
     expect(sleeps).toHaveLength(1)
-    expect(sleeps[0]).toBeGreaterThan(50_000)   // about 55 s remained of the 60 s gap
-    expect(sleeps[0]).toBeLessThanOrEqual(65_000)
+    // the first save owes only the 10 s first gap — about 5 s remained of it (R5-2)
+    expect(sleeps[0]).toBeGreaterThan(0)
+    expect(sleeps[0]).toBeLessThanOrEqual(10_000)
     expect(result.saved).toBe(1)
     expect(compileCalls).toHaveLength(1)
     expect(saveCalls).toHaveLength(1)
