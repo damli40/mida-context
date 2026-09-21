@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs"
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs"
 import { request } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -12,12 +12,45 @@ export const SOCKET_FILE = "midad.sock"
 const SOCKET_PATH_LIMIT = 100
 
 /**
- * Where this home's control socket lives. Normally `<home>/midad.sock`; when that path would be too
- * long for a Unix socket, a deterministic name in the system temp folder instead — `mida-<16 hex of
- * sha256(home)>.sock` — which the daemon also records in `<home>/midad.sock.path` so the real path
- * is discoverable. A present, non-empty pointer file wins either way.
+ * The per-user folder fallback sockets live in: `<base>/mida-<uid>` — one folder per user, never
+ * loose in the shared temp folder where another user could plant a socket of the same name.
  */
-export function socketPathFor(home: MidaHome): string {
+export function fallbackSocketDir(base: string = tmpdir()): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0
+  return join(base, `mida-${uid}`)
+}
+
+/**
+ * The daemon's own fallback socket folder, created private (0700) if missing — the daemon makes it
+ * itself rather than trusting whatever the shared temp folder happens to hold. A folder that
+ * already exists is used only when it is a real directory owned by this user with mode exactly
+ * 0700; a symlink, a plain file, another user's folder, or looser permissions refuse the start
+ * rather than place a control socket where someone else could reach it.
+ */
+export function ensureFallbackSocketDir(base: string = tmpdir()): string {
+  const dir = fallbackSocketDir(base)
+  try {
+    mkdirSync(dir, { mode: 0o700 })
+    chmodSync(dir, 0o700) // a created dir still wears the umask — pin the mode we require
+  } catch (error) {
+    if ((error as { code?: unknown }).code !== "EEXIST") throw error
+  }
+  const stat = lstatSync(dir)
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0
+  if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o777) !== 0o700) {
+    throw new Error(`refusing to use the fallback socket folder ${dir}: it must be a directory owned by this user with mode 0700`)
+  }
+  return dir
+}
+
+/**
+ * Where this home's control socket lives. Normally `<home>/midad.sock`; when that path would be too
+ * long for a Unix socket, a deterministic name inside the per-user fallback folder —
+ * `<base>/mida-<uid>/mida-<16 hex of sha256(home)>.sock` — which the daemon also records in
+ * `<home>/midad.sock.path` so the real path is discoverable. A present, non-empty pointer file wins
+ * either way. `base` is the fallback folder's parent; tests inject a private temp dir.
+ */
+export function socketPathFor(home: MidaHome, base: string = tmpdir()): string {
   try {
     const pointer = home.path(`${SOCKET_FILE}.path`)
     if (existsSync(pointer)) {
@@ -29,7 +62,7 @@ export function socketPathFor(home: MidaHome): string {
   }
   const direct = home.path(SOCKET_FILE)
   if (Buffer.byteLength(direct) <= SOCKET_PATH_LIMIT) return direct
-  return join(tmpdir(), `mida-${bytesToHex(sha256(utf8ToBytes(home.root))).slice(0, 16)}.sock`)
+  return join(fallbackSocketDir(base), `mida-${bytesToHex(sha256(utf8ToBytes(home.root))).slice(0, 16)}.sock`)
 }
 
 export interface ControlReply {

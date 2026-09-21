@@ -1,8 +1,9 @@
 import { chmodSync, existsSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
-import { isAbsolute } from "node:path"
+import { tmpdir } from "node:os"
+import { dirname, isAbsolute } from "node:path"
 import type { IncomingMessage, Server, ServerResponse } from "node:http"
-import { SOCKET_FILE, callDaemon, socketPathFor } from "./control.js"
+import { SOCKET_FILE, callDaemon, ensureFallbackSocketDir, fallbackSocketDir, socketPathFor } from "./control.js"
 import { drainUntilSettled } from "./drain.js"
 import type { DrainDeps, DrainResult } from "./drain.js"
 import { buildHandoff } from "./handoff.js"
@@ -50,6 +51,8 @@ export interface DaemonDeps {
   handoffLimitMs?: number
   /** Gate overrides for /handoff — tests inject fakes here; production leaves it unset. */
   handoffDeps?: Partial<HandoffDeps>
+  /** The fallback socket folder's parent (default tmpdir()); tests inject a private temp dir. */
+  socketBase?: string
 }
 
 export interface DaemonHandle {
@@ -105,7 +108,8 @@ function respond(res: ServerResponse, status: number, body: unknown): void {
  */
 export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   const home = deps.home
-  const socketPath = socketPathFor(home)
+  const socketBase = deps.socketBase ?? tmpdir()
+  const socketPath = socketPathFor(home, socketBase)
   const pointerFile = `${SOCKET_FILE}.path`
   const tickMs = deps.tickMs ?? TICK_MS
   const sleep = deps.sleep ?? realSleep
@@ -113,6 +117,13 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   const passWaitCapMs = deps.passWaitCapMs ?? PASS_WAIT_CAP_MS
   const drain = deps.drain ?? drainUntilSettled
   const runCli = deps.runCli ?? runCliWithRuntime
+
+  // a socket outside the home lands in the per-user fallback folder — the daemon itself makes it
+  // private; an existing folder that is not a real 0700 directory owned by this user refuses the
+  // start rather than place the control socket where someone else could reach it
+  if (dirname(socketPath) === fallbackSocketDir(socketBase)) {
+    ensureFallbackSocketDir(socketBase)
+  }
 
   if (existsSync(socketPath)) {
     const alive = await callDaemon(home, "/health", undefined, { timeoutMs: staleCheckMs })
@@ -270,6 +281,9 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
     })
   })
 
+  // umask 0o177 for the listen itself: the socket file lands 0600, never connectable by another
+  // user even for the instant before the chmod — then the caller's umask is restored
+  const previousUmask = process.umask(0o177)
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject)
@@ -278,6 +292,8 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   } catch (error) {
     await runtime.close()
     throw error
+  } finally {
+    process.umask(previousUmask)
   }
   // only this user may talk to the socket
   chmodSync(socketPath, 0o600)

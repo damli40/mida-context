@@ -1,10 +1,10 @@
 import { afterAll, describe, expect, it } from "vitest"
 import { createServer } from "node:net"
 import type { Server, Socket } from "node:net"
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
-import { MidaHome, SOCKET_FILE, callDaemon, ensureDaemon, socketPathFor } from "@mida/midad"
+import { dirname, join } from "node:path"
+import { MidaHome, SOCKET_FILE, callDaemon, ensureDaemon, ensureFallbackSocketDir, fallbackSocketDir, socketPathFor } from "@mida/midad"
 
 /** A Unix-socket server the test controls by hand; `onRequest` decides what a connection gets. */
 function fakeDaemon(socketPath: string, onRequest: (socket: Socket, data: Buffer) => void): Promise<Server> {
@@ -36,13 +36,14 @@ describe("socketPathFor", () => {
     expect(socketPathFor(home)).toBe(home.path(SOCKET_FILE))
   })
 
-  it("falls back to a short tmpdir name when the home path would exceed the socket limit", () => {
+  it("falls back inside a private per-user tmpdir folder when the home path would exceed the socket limit", () => {
     // deep enough that <root>/midad.sock is longer than 100 bytes
     const deep = join(tmpdir(), "mida-deep-" + "d".repeat(60), "e".repeat(60), "home")
     const home = new MidaHome(deep)
     expect(Buffer.byteLength(home.path(SOCKET_FILE))).toBeGreaterThan(100)
     const resolved = socketPathFor(home)
-    expect(resolved.startsWith(tmpdir())).toBe(true)
+    // the socket never sits loose in the shared temp folder — it lives in <tmp>/mida-<uid>/
+    expect(dirname(resolved)).toBe(fallbackSocketDir())
     expect(resolved).not.toBe(home.path(SOCKET_FILE))
     expect(Buffer.byteLength(resolved)).toBeLessThanOrEqual(100)
     // the same home resolves to the same fallback every time
@@ -54,6 +55,36 @@ describe("socketPathFor", () => {
     const pointed = join(tmpdir(), "mida-pointed-test.sock")
     writeFileSync(home.path(`${SOCKET_FILE}.path`), pointed, { mode: 0o600 })
     expect(socketPathFor(home)).toBe(pointed)
+  })
+})
+
+describe("ensureFallbackSocketDir", () => {
+  it("creates a missing folder itself as a private 0700 directory owned by this user", () => {
+    const base = mkdtempSync(join(tmpdir(), "mida-sockbase-"))
+    const dir = ensureFallbackSocketDir(base)
+    const stat = lstatSync(dir)
+    expect(stat.isDirectory()).toBe(true)
+    expect(stat.mode & 0o777).toBe(0o700)
+    expect(stat.uid).toBe(process.getuid!())
+  })
+
+  it("reuses the folder it made, but refuses one that exists with looser permissions", () => {
+    const base = mkdtempSync(join(tmpdir(), "mida-sockbase-"))
+    const dir = ensureFallbackSocketDir(base)
+    expect(ensureFallbackSocketDir(base)).toBe(dir)
+    chmodSync(dir, 0o777)
+    expect(() => ensureFallbackSocketDir(base)).toThrow(/0700/)
+    chmodSync(dir, 0o700)
+    expect(() => ensureFallbackSocketDir(base)).not.toThrow()
+  })
+
+  it("refuses a symlink or a plain file standing in for the folder", () => {
+    const base = mkdtempSync(join(tmpdir(), "mida-sockbase-"))
+    symlinkSync(mkdtempSync(join(tmpdir(), "mida-real-")), fallbackSocketDir(base))
+    expect(() => ensureFallbackSocketDir(base)).toThrow(/0700/)
+    const base2 = mkdtempSync(join(tmpdir(), "mida-sockbase-"))
+    writeFileSync(fallbackSocketDir(base2), "")
+    expect(() => ensureFallbackSocketDir(base2)).toThrow(/0700/)
   })
 })
 

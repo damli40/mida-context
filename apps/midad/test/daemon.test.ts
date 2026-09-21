@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
-import { MidaHome, callDaemon, enqueue, listJobs, removeJob, socketPathFor, startDaemon } from "@mida/midad"
+import { dirname, join } from "node:path"
+import { MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, removeJob, socketPathFor, startDaemon } from "@mida/midad"
 import type { DrainDeps, DrainResult, Runtime } from "@mida/midad"
 import type { DaemonDeps } from "@mida/midad"
 
@@ -262,22 +262,69 @@ describe("startDaemon", () => {
     }
   })
 
-  it("a home path too long for a socket lands in tmpdir and is recorded in midad.sock.path (0600)", async () => {
+  it("a home path too long for a socket lands in the private fallback folder and is recorded in midad.sock.path (0600)", async () => {
     const deep = join(tmpdir(), "mida-deep-" + "d".repeat(60), "e".repeat(60), "home")
     const home = new MidaHome(deep)
     const deps = { ...setup().deps, home }
     const socket = socketPathFor(home)
     expect(socket).not.toBe(home.path("midad.sock"))
+    expect(dirname(socket)).toBe(fallbackSocketDir())
     const daemon = await startDaemon(deps)
     try {
       expect(existsSync(socket)).toBe(true)
       expect(readFileSync(home.path("midad.sock.path"), "utf8").trim()).toBe(socket)
       expect(statSync(home.path("midad.sock.path")).mode & 0o777).toBe(0o600)
+      expect(statSync(socket).mode & 0o777).toBe(0o600)
       expect((await callDaemon(home, "/health", undefined, { timeoutMs: 1_000 })).status).toBe(200)
     } finally {
       await daemon.close()
     }
     expect(existsSync(socket)).toBe(false)
     expect(home.has("midad.sock.path")).toBe(false)
+  })
+
+  it("the daemon itself creates the fallback folder as a private 0700 directory, and restores the umask after listen", async () => {
+    // a short private base keeps this test's fallback folder away from the real <tmp>/mida-<uid>
+    // AND keeps the socket path under the ~104-byte Unix limit (macOS tmpdir alone is ~50 chars)
+    const base = mkdtempSync(join("/tmp", "mida-sockbase-"))
+    const deep = join(base, "d".repeat(60), "e".repeat(60), "home")
+    const home = new MidaHome(deep)
+    const deps = { ...setup().deps, home, socketBase: base }
+    expect(existsSync(fallbackSocketDir(base))).toBe(false)
+    const umaskBefore = process.umask()
+    const daemon = await startDaemon(deps)
+    try {
+      const dirStat = lstatSync(fallbackSocketDir(base))
+      expect(dirStat.isDirectory()).toBe(true)
+      expect(dirStat.mode & 0o777).toBe(0o700)
+      expect(dirStat.uid).toBe(process.getuid!())
+      const socket = socketPathFor(home, base)
+      expect(statSync(socket).mode & 0o777).toBe(0o600)
+      expect(process.umask()).toBe(umaskBefore)
+      expect((await callDaemon(home, "/health", undefined, { timeoutMs: 1_000 })).status).toBe(200)
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it("a pre-existing fallback folder with mode 0777 refuses the start with a plain message", async () => {
+    const base = mkdtempSync(join("/tmp", "mida-sockbase-"))
+    const deep = join(base, "d".repeat(60), "e".repeat(60), "home")
+    const home = new MidaHome(deep)
+    const deps = { ...setup().deps, home, socketBase: base }
+    mkdirSync(fallbackSocketDir(base))
+    chmodSync(fallbackSocketDir(base), 0o777)
+    await expect(startDaemon(deps)).rejects.toThrow(/mode 0700/)
+    expect(home.has("midad.lock")).toBe(false) // refused before the runtime opened
+  })
+
+  it("a symlink standing in for the fallback folder refuses the start", async () => {
+    const base = mkdtempSync(join("/tmp", "mida-sockbase-"))
+    const deep = join(base, "d".repeat(60), "e".repeat(60), "home")
+    const home = new MidaHome(deep)
+    const deps = { ...setup().deps, home, socketBase: base }
+    symlinkSync(mkdtempSync(join(tmpdir(), "mida-real-")), fallbackSocketDir(base))
+    await expect(startDaemon(deps)).rejects.toThrow(/mode 0700/)
+    expect(home.has("midad.lock")).toBe(false)
   })
 })
