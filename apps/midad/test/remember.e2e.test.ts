@@ -225,6 +225,12 @@ describe("mida remember on local Anvil", () => {
     }
     const facts = await readOwnerFacts(runtime, "codex")
     expect(facts).toHaveLength(20)
-    expect(facts[0]!.text).toBe("numbered fact 21")
+    // the chain timestamps facts at second granularity — writes inside one second share a
+    // createdAt, so assert the ordering rule itself, not one particular first slot
+    for (let i = 1; i < facts.length; i += 1) {
+      expect(facts[i - 1]!.assertedAt >= facts[i]!.assertedAt).toBe(true)
+    }
+    // the cap evicted the oldest: the three named facts are gone, only numbered ones survive
+    expect(facts.every((f) => /^numbered fact \d+$/.test(f.text))).toBe(true)
   }, STEP_TIMEOUT)
 })
