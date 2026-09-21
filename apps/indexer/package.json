@@ -8,6 +8,6 @@
     "codegen": "envio codegen"
   },
   "dependencies": {
-    "envio": "3.12.1"
+    "envio": "3.11.0"
   }
 }
