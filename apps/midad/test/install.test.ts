@@ -4,8 +4,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   CODEX_BLOCK,
+  CODEX_BLOCK_V1,
   HOOK_COMMAND,
   INJECT_COMMAND,
+  claudeHooksStatus,
+  codexHooksStatus,
   installClaudeCode,
   installCodex,
   uninstallClaudeCode,
@@ -22,7 +25,7 @@ describe("mida install claude-code", () => {
     expect(INJECT_COMMAND["codex"]).toBe("mida-inject codex")
   })
 
-  it("installs all six events into a missing settings file, creating the folder", () => {
+  it("installs all seven events into a missing settings file, creating the folder", () => {
     const settings = join(dir(), ".claude", "settings.json")
     const result = installClaudeCode(settings)
     expect(result).toBe("installed")
@@ -31,6 +34,8 @@ describe("mida install claude-code", () => {
     }
     const commandOf = (event: string) => parsed.hooks[event]![0]!.hooks[0]!.command
     expect(commandOf("SessionStart")).toBe(INJECT_COMMAND["claude-code"])
+    // the whats-new hook rides the same inject command — one trusted command serves both events
+    expect(commandOf("UserPromptSubmit")).toBe(INJECT_COMMAND["claude-code"])
     for (const event of ["PostToolUse", "Stop", "StopFailure", "PreCompact", "SessionEnd"]) {
       expect(commandOf(event)).toBe(HOOK_COMMAND["claude-code"])
     }
@@ -165,6 +170,30 @@ describe("mida install claude-code", () => {
     expect(text).toContain('\n    "hooks": {')
     expect(text.endsWith("\n")).toBe(true)
   })
+
+  it("an install from before UserPromptSubmit reads incomplete and gains the event", () => {
+    const settings = join(dir(), "settings.json")
+    const old = {
+      hooks: {
+        SessionStart: [{ hooks: [{ type: "command", command: INJECT_COMMAND["claude-code"] }] }],
+        PostToolUse: [{ hooks: [{ type: "command", command: HOOK_COMMAND["claude-code"] }] }],
+        Stop: [{ hooks: [{ type: "command", command: HOOK_COMMAND["claude-code"] }] }],
+        StopFailure: [{ hooks: [{ type: "command", command: HOOK_COMMAND["claude-code"] }] }],
+        PreCompact: [{ hooks: [{ type: "command", command: HOOK_COMMAND["claude-code"] }] }],
+        SessionEnd: [{ hooks: [{ type: "command", command: HOOK_COMMAND["claude-code"] }] }],
+      },
+    }
+    writeFileSync(settings, JSON.stringify(old, null, 2))
+    expect(claudeHooksStatus(settings)).toBe("incomplete")
+    expect(installClaudeCode(settings)).toBe("installed")
+    expect(claudeHooksStatus(settings)).toBe("installed")
+    const parsed = JSON.parse(readFileSync(settings, "utf8")) as {
+      hooks: Record<string, { hooks: { command: string }[] }[]>
+    }
+    expect(parsed.hooks.UserPromptSubmit).toEqual([
+      { hooks: [{ type: "command", command: INJECT_COMMAND["claude-code"] }] },
+    ])
+  })
 })
 
 describe("mida uninstall claude-code", () => {
@@ -229,6 +258,34 @@ describe("mida install codex", () => {
     const config = join(dir(), "nested", "config.toml")
     expect(installCodex(config)).toBe("installed")
     expect(readFileSync(config, "utf8")).toBe(`${CODEX_BLOCK}\n`)
+  })
+
+  it("the managed block carries the whats-new hook on the same inject command", () => {
+    expect(CODEX_BLOCK).toContain("[[hooks.UserPromptSubmit]]")
+    expect(CODEX_BLOCK).toContain('command = "mida-inject codex"')
+    expect(CODEX_BLOCK).toContain('command = "mida-hook codex"')
+  })
+
+  it("an older managed block is upgraded in place, bytes outside preserved", () => {
+    const config = join(dir(), "config.toml")
+    const before = 'model = "gpt-5"\n'
+    writeFileSync(config, `${before}\n${CODEX_BLOCK_V1}\n`)
+    expect(codexHooksStatus(config)).toBe("outdated")
+    expect(installCodex(config)).toBe("installed")
+    const text = readFileSync(config, "utf8")
+    expect(text).toBe(`${before}\n${CODEX_BLOCK}\n`)
+    expect(codexHooksStatus(config)).toBe("installed")
+    // and the upgrade is idempotent
+    expect(installCodex(config)).toBe("already-installed")
+    expect(readFileSync(config, "utf8")).toBe(text)
+  })
+
+  it("uninstall removes an outdated block too — markers still mean it is ours", () => {
+    const config = join(dir(), "config.toml")
+    const before = 'model = "gpt-5"\n'
+    writeFileSync(config, `${before}\n${CODEX_BLOCK_V1}\n`)
+    expect(uninstallCodex(config)).toBe("uninstalled")
+    expect(readFileSync(config, "utf8")).toBe(before)
   })
 
   it("appends after existing content with one blank line, bytes outside preserved", () => {

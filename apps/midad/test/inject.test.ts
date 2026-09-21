@@ -6,7 +6,7 @@ import type { Server, Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { MidaHome, socketPathFor } from "@mida/midad"
+import { MidaHome, readLastSeen, socketPathFor, writeLastSeen } from "@mida/midad"
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 const INJECT_MAIN = fileURLToPath(new URL("../src/inject-main.ts", import.meta.url))
@@ -39,6 +39,8 @@ const run = (args: string[], input: string, homeDir: string): Promise<{ status: 
   })
 
 const sessionStart = (cwd = "/tmp/work") => JSON.stringify({ hook_event_name: "SessionStart", session_id: "s1", cwd })
+const promptSubmit = (cwd = "/tmp/work", sessionId = "s1") =>
+  JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: sessionId, cwd })
 
 /** Every SessionStart answer is the JSON envelope the tools show the owner and feed the model. */
 const envelope = (stdout: string) =>
@@ -63,6 +65,48 @@ const fakeDaemon = (dir: MidaHome, handoffBody: unknown, silent = false): Promis
   })
 
 const close = (server: Server) => new Promise<void>((done) => server.close(() => done()))
+
+/**
+ * A socket server answering only /whatsnew — the prompt hook goes straight to the socket, it
+ * never asks /health and never boots a daemon. `delayMs` models a slow daemon; `silent` a dead
+ * one. `stop()` drops open connections first so a delayed answer cannot hold the test open.
+ */
+const whatsnewDaemon = (dir: MidaHome, body: unknown, opts: { silent?: boolean; delayMs?: number } = {}) =>
+  new Promise<{ server: Server; stop(): Promise<void> }>((resolve, reject) => {
+    const sockets = new Set<Socket>()
+    const s = createServer((socket: Socket) => {
+      sockets.add(socket)
+      socket.on("close", () => sockets.delete(socket))
+      socket.on("error", () => {}) // the client may already be gone when a delayed answer lands
+      socket.on("data", (data) => {
+        const path = data.toString("utf8").split(" ")[1]
+        if (path !== "/whatsnew" || opts.silent) return
+        const payload = JSON.stringify(body)
+        const answer = () => {
+          try {
+            socket.end(
+              `HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(payload)}\r\nconnection: close\r\n\r\n${payload}`,
+            )
+          } catch {
+            // the client gave up — nothing to answer
+          }
+        }
+        if (opts.delayMs === undefined) answer()
+        else setTimeout(answer, opts.delayMs).unref()
+      })
+    })
+    s.once("error", reject)
+    s.listen(socketPathFor(dir), () =>
+      resolve({
+        server: s,
+        stop: () =>
+          new Promise<void>((done) => {
+            for (const socket of sockets) socket.destroy()
+            s.close(() => done())
+          }),
+      }),
+    )
+  })
 
 /** An init'ed home with a live fake daemon answering /handoff with `body`. */
 const liveDaemon = async (body: unknown, silent = false) => {
@@ -247,6 +291,130 @@ describe("inject-main process", () => {
       expect(Date.now() - started).toBeLessThan(15_000)
     } finally {
       await close(server)
+    }
+  }, 30_000)
+
+  it("a served handoff records the covered checkpoint's time as the session's lastSeen", async () => {
+    const savedAt = "2026-09-21T10:00:00.000Z"
+    const { dir, server } = await liveDaemon(handoffBody({ savedAt }))
+    try {
+      const res = await run(["codex"], sessionStart(), dir.root)
+      expect(res.status).toBe(0)
+      expect(readLastSeen(dir, "s1")).toBe(savedAt)
+    } finally {
+      await close(server)
+    }
+  }, 30_000)
+
+  it("an empty handoff records the empty baseline so the first real save shows as new", async () => {
+    const { dir, server } = await liveDaemon({ kind: "empty", text: "x" })
+    try {
+      const res = await run(["codex"], sessionStart(), dir.root)
+      expect(res.status).toBe(0)
+      expect(readLastSeen(dir, "s1")).toBe("")
+    } finally {
+      await close(server)
+    }
+  }, 30_000)
+
+  it("a refused handoff records nothing — the agent never had a baseline", async () => {
+    const { dir, server } = await liveDaemon({ kind: "refused", reason: "revoked", text: "x" })
+    try {
+      const res = await run(["codex"], sessionStart(), dir.root)
+      expect(res.status).toBe(0)
+      expect(dir.has("state/lastseen/s1.json")).toBe(false)
+    } finally {
+      await close(server)
+    }
+  }, 30_000)
+})
+
+describe("inject-main process — UserPromptSubmit", () => {
+  it("an update prints the envelope with the owner's line and the note, then advances lastSeen", async () => {
+    const dir = home()
+    writeLastSeen(dir, "s1", "2026-09-21T11:00:00.000Z")
+    const savedAt = new Date(Date.now() - 40_000).toISOString()
+    const daemon = await whatsnewDaemon(dir, {
+      kind: "updates",
+      note: "Mida update since you last checked:\n- codex: did the thing",
+      updates: [{ agent: "codex", savedAt }],
+      lastSeen: savedAt,
+    })
+    try {
+      const res = await run(["claude-code"], promptSubmit(), dir.root)
+      expect(res.status).toBe(0)
+      expect(res.stderr).toBe("")
+      const out = envelope(res.stdout)
+      expect(out.systemMessage).toMatch(/^Mida: update from codex \(\d+ s ago\)$/)
+      expect(out.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit")
+      expect(out.hookSpecificOutput.additionalContext).toContain("did the thing")
+      // the watermark moved to the newest covered checkpoint — a second prompt sees nothing
+      expect(readLastSeen(dir, "s1")).toBe(savedAt)
+    } finally {
+      await daemon.stop()
+    }
+  }, 30_000)
+
+  it("nothing new prints nothing at all — no JSON, no empty note — and lastSeen is untouched", async () => {
+    const dir = home()
+    writeLastSeen(dir, "s1", "2026-09-21T11:00:00.000Z")
+    const daemon = await whatsnewDaemon(dir, { kind: "none", lastSeen: "2026-09-21T11:00:00.000Z" })
+    try {
+      const res = await run(["claude-code"], promptSubmit(), dir.root)
+      expect(res.status).toBe(0)
+      expect(res.stderr).toBe("")
+      expect(res.stdout).toBe("")
+      expect(readLastSeen(dir, "s1")).toBe("2026-09-21T11:00:00.000Z")
+    } finally {
+      await daemon.stop()
+    }
+  }, 30_000)
+
+  it("a refused agent prints nothing — the refusal is the daemon's to log, not the prompt's to show", async () => {
+    const dir = home()
+    const daemon = await whatsnewDaemon(dir, { kind: "refused", reason: "revoked" })
+    try {
+      const res = await run(["codex"], promptSubmit(), dir.root)
+      expect(res.status).toBe(0)
+      expect(res.stderr).toBe("")
+      expect(res.stdout).toBe("")
+    } finally {
+      await daemon.stop()
+    }
+  }, 30_000)
+
+  it("a daemon that answers late gets silence — the prompt never waits past 1.5 s", async () => {
+    const dir = home()
+    const daemon = await whatsnewDaemon(dir, { kind: "updates", note: "N", updates: [], lastSeen: "" }, { delayMs: 5_000 })
+    try {
+      const started = Date.now()
+      const res = await run(["claude-code"], promptSubmit(), dir.root)
+      expect(res.status).toBe(0)
+      expect(res.stderr).toBe("")
+      expect(res.stdout).toBe("")
+      // the child gave up at its 1.5 s ceiling, far before the daemon's 5 s answer
+      expect(Date.now() - started).toBeLessThan(4_000)
+    } finally {
+      await daemon.stop()
+    }
+  }, 30_000)
+
+  it("no daemon at all is just another silent prompt, exit 0", async () => {
+    const res = await run(["claude-code"], promptSubmit(), home().root)
+    expect(res.status).toBe(0)
+    expect(res.stderr).toBe("")
+    expect(res.stdout).toBe("")
+  }, 30_000)
+
+  it("a malformed whats-new answer prints nothing", async () => {
+    const dir = home()
+    const daemon = await whatsnewDaemon(dir, { kind: "updates" }) // note missing
+    try {
+      const res = await run(["claude-code"], promptSubmit(), dir.root)
+      expect(res.status).toBe(0)
+      expect(res.stdout).toBe("")
+    } finally {
+      await daemon.stop()
     }
   }, 30_000)
 })

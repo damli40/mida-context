@@ -8,6 +8,8 @@ import { drainUntilSettled } from "./drain.js"
 import type { DrainDeps, DrainResult } from "./drain.js"
 import { buildHandoff } from "./handoff.js"
 import type { HandoffDeps } from "./handoff.js"
+import { buildWhatsNew } from "./whatsnew.js"
+import type { WhatsNewDeps } from "./whatsnew.js"
 import { FLUSH_EVENTS } from "./hook.js"
 import type { MidaHome } from "./home.js"
 import { isSafeName, listJobs } from "./queue.js"
@@ -51,6 +53,8 @@ export interface DaemonDeps {
   handoffLimitMs?: number
   /** Gate overrides for /handoff — tests inject fakes here; production leaves it unset. */
   handoffDeps?: Partial<HandoffDeps>
+  /** Gate and read overrides for /whatsnew — same role as handoffDeps for the prompt hook. */
+  whatsnewDeps?: Partial<WhatsNewDeps>
   /** The fallback socket folder's parent (default tmpdir()); tests inject a private temp dir. */
   socketBase?: string
 }
@@ -275,6 +279,31 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         cut: result.kind === "handoff" && result.cut,
         oversized: result.kind === "handoff" && result.oversized,
         readMs: result.kind === "refused" ? null : result.readMs,
+        ms: deps.now() - started,
+      })
+      respond(res, 200, result)
+      return
+    }
+    if (req.url === "/whatsnew") {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(body.toString("utf8"))
+      } catch {
+        parsed = undefined
+      }
+      const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
+      const agent = typeof record.agent === "string" ? record.agent : ""
+      const cwd = typeof record.cwd === "string" ? record.cwd : ""
+      const sessionId = typeof record.sessionId === "string" ? record.sessionId : undefined
+      const started = deps.now()
+      const result = await buildWhatsNew(runtime, { agent, cwd, sessionId }, deps.whatsnewDeps ?? {})
+      // same discipline as the handoff line: codes and counts, never note or checkpoint text
+      deps.log({
+        event: "whatsnew",
+        agent: isSafeName(agent) ? agent : null,
+        kind: result.kind,
+        reason: result.kind === "refused" ? result.reason : null,
+        updates: result.kind === "updates" ? result.updates.length : 0,
         ms: deps.now() - started,
       })
       respond(res, 200, result)

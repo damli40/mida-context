@@ -3,10 +3,12 @@ import { fileURLToPath } from "node:url"
 import { callDaemon, ensureDaemon } from "./control.js"
 import { noContextText } from "./handoff.js"
 import type { SessionStartBody } from "./hook-output.js"
-import { degradedMessage, hookReply, sessionStartMessage } from "./hook-output.js"
+import { degradedMessage, hookReply, sessionStartMessage, whatsNewMessage } from "./hook-output.js"
 import { resolveHome } from "./home.js"
+import type { MidaHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { isSafeName } from "./queue.js"
+import { writeLastSeen } from "./whatsnew.js"
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 const DAEMON_MAIN = fileURLToPath(new URL("./daemon-main.ts", import.meta.url))
@@ -14,6 +16,8 @@ const STDIN_CAP_BYTES = 1_000_000
 /** The session-start hook may wait for the daemon to come up — but not forever. */
 const DAEMON_WAIT_MS = 4_000
 const HANDOFF_TIMEOUT_MS = 8_000
+/** A prompt must never wait: the whats-new hook gives up silently after this and injects nothing. */
+const WHATS_NEW_TIMEOUT_MS = 1_500
 
 /**
  * Reads stdin to EOF — stopping early would leave the hooked CLI holding a full pipe. Only the
@@ -58,6 +62,36 @@ function degraded(reason: string): string {
 }
 
 /**
+ * The UserPromptSubmit hook — the "what's new" note. It goes straight to the socket: no daemon
+ * boot, no health probe, one call with a 1.5 s ceiling. Silence is the contract for every
+ * non-update answer — nothing new, a refusal, a timeout or a dead daemon all print nothing and
+ * exit 0, so a prompt never waits and never fails. The watermark advances only here, after the
+ * note actually reached the model: a lost answer is re-offered by the next prompt.
+ */
+async function whatsNew(home: MidaHome, agent: string | undefined, record: Record<string, unknown>): Promise<void> {
+  try {
+    if (!isSafeName(agent)) return
+    const cwd = typeof record.cwd === "string" && record.cwd !== "" ? record.cwd : process.cwd()
+    const sessionId = typeof record.session_id === "string" ? record.session_id : undefined
+    const reply = await callDaemon(home, "/whatsnew", { agent, cwd, sessionId }, { timeoutMs: WHATS_NEW_TIMEOUT_MS })
+    if (reply.status !== 200) return
+    const body = reply.body as { kind?: unknown; note?: unknown; updates?: unknown; lastSeen?: unknown } | null
+    if (body?.kind !== "updates" || typeof body.note !== "string" || body.note === "") return
+    if (sessionId !== undefined && typeof body.lastSeen === "string") {
+      try {
+        writeLastSeen(home, sessionId, body.lastSeen)
+      } catch {
+        // a failed state write only means the same note may be offered once more
+      }
+    }
+    const updates = Array.isArray(body.updates) ? body.updates : []
+    await writeLine(hookReply("UserPromptSubmit", whatsNewMessage(updates, Date.now()), body.note))
+  } catch {
+    // the prompt hook never throws — silence, exit 0
+  }
+}
+
+/**
  * The SessionStart hook: asks midad for this project's handoff as `inject-main.ts <agent>` and
  * prints one JSON line — `systemMessage` is the one-line outcome both tools show the owner,
  * `hookSpecificOutput.additionalContext` carries the model's text byte-for-byte. It is fail-open
@@ -70,10 +104,6 @@ async function main(): Promise<void> {
   const home = resolveHome(process.env)
   const agent = process.argv[2]
   const { text, oversized } = await readStdin(STDIN_CAP_BYTES)
-  if (!isSafeName(agent)) {
-    await writeLine(degraded("bad-agent"))
-    return
-  }
   let parsed: unknown = undefined
   if (!oversized) {
     try {
@@ -82,11 +112,21 @@ async function main(): Promise<void> {
       parsed = undefined
     }
   }
+  const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
+  // the prompt hook is a different contract — silent always, even on bad input or a bad name:
+  // it dispatches before the checks that print SessionStart-shaped refusals
+  if (record.hook_event_name === "UserPromptSubmit") {
+    await whatsNew(home, agent, record)
+    return
+  }
+  if (!isSafeName(agent)) {
+    await writeLine(degraded("bad-agent"))
+    return
+  }
   if (parsed === undefined) {
     await writeLine(degraded("bad-input"))
     return
   }
-  const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
   // anything that is not a session start — another hook event, or no event at all — stays silent
   if (record.hook_event_name !== "SessionStart") return
   const cwd = typeof record.cwd === "string" && record.cwd !== "" ? record.cwd : process.cwd()
@@ -110,6 +150,16 @@ async function main(): Promise<void> {
   if (typeof body?.text !== "string") {
     await writeLine(degraded("bad-reply"))
     return
+  }
+  // the session's whats-new watermark starts here: the newest checkpoint this handoff covered —
+  // or the empty baseline, so the first real save afterwards still shows up as new
+  const sessionId = typeof record.session_id === "string" ? record.session_id : undefined
+  if (sessionId !== undefined && body.kind !== "refused") {
+    try {
+      writeLastSeen(home, sessionId, body.kind === "handoff" && typeof body.savedAt === "string" ? body.savedAt : "")
+    } catch {
+      // no baseline written — the whats-new read will simply treat everything as new once
+    }
   }
   await writeLine(hookReply("SessionStart", sessionStartMessage(body, agent, Date.now()), body.text))
 }

@@ -38,10 +38,13 @@ export { runDoctor, runDoctorLive } from "./doctor.js"
 export type { DoctorDeps } from "./doctor.js"
 export { buildHandoff, noContextText } from "./handoff.js"
 export type { CapabilityState, HandoffDeps, HandoffResult } from "./handoff.js"
-export { agoText, degradedMessage, hookReply, sessionStartMessage, systemMessage } from "./hook-output.js"
+export { WHATS_NEW_HEADER, buildWhatsNew, readLastSeen, writeLastSeen } from "./whatsnew.js"
+export type { WhatsNewDeps, WhatsNewResult } from "./whatsnew.js"
+export { agoText, degradedMessage, hookReply, sessionStartMessage, systemMessage, whatsNewMessage } from "./hook-output.js"
 export type { SessionStartBody } from "./hook-output.js"
 export {
   CODEX_BLOCK,
+  CODEX_BLOCK_V1,
   CODEX_TRUST_SENTENCE,
   HOOK_COMMAND,
   INJECT_COMMAND,

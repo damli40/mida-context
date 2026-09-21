@@ -104,6 +104,52 @@ async function capabilityState(runtime: ServiceRuntime, agent: string): Promise<
   return sawRevoked ? "revoked" : "none"
 }
 
+/**
+ * The gates every context read passes through, in their security order: the agent name and the
+ * cwd are proven safe, then the owner-signed project list answers, and only a live chain
+ * capability opens the read. The whats-new read goes through exactly this — a refused agent gets
+ * nothing there either (R5-5).
+ */
+export type AccessCheck =
+  | { ok: true; approval: Extract<ProjectCheck, { ok: true }>["approval"] }
+  | { ok: false; reason: string; text: string }
+
+export async function checkAccess(
+  runtime: ServiceRuntime,
+  input: { agent: string; cwd: string },
+  deps: Pick<HandoffDeps, "checkProject" | "capability" | "isRevoked"> = {},
+): Promise<AccessCheck> {
+  const agent = input.agent
+  // the name is interpolated into refusal text — only after it is proven a safe local agent name
+  if (!isSafeName(agent)) return { ok: false, reason: "bad-agent", text: noContextText("bad-agent") }
+  // a relative cwd would be resolved against the DAEMON's working directory — refuse it outright
+  if (typeof input.cwd !== "string" || !isAbsolute(input.cwd)) {
+    return { ok: false, reason: "bad-input", text: noContextText("bad-input") }
+  }
+  const check = await (deps.checkProject ?? checkProject)(runtime, { agent, cwd: input.cwd })
+  if (!check.ok) {
+    if (check.reason === "list-tampered") return { ok: false, reason: "list-tampered", text: TAMPERED_TEXT }
+    if (check.reason === "list-unreadable") return { ok: false, reason: "list-unreadable", text: UNREADABLE_TEXT }
+    // a failed check names no cause the owner could act on — the generic line, not a guess
+    if (check.reason === "check-failed") return { ok: false, reason: "check-failed", text: noContextText("check-failed") }
+    // A revoked agent's project row is gone, so the project check answers not-approved first —
+    // the marker `mida revoke` left behind says why access really ended (R4-3). A marker that
+    // cannot be read leaves the not-approved answer standing, never a crash.
+    if (check.reason === "not-approved") {
+      try {
+        if ((deps.isRevoked ?? ((name) => isRevoked(runtime.home, name)))(agent)) {
+          return { ok: false, reason: "revoked", text: revokedText(agent) }
+        }
+      } catch { /* fall through to not-approved */ }
+    }
+    return { ok: false, reason: check.reason, text: notApprovedText(agent) }
+  }
+  const state = await (deps.capability ?? capabilityState)(runtime, agent)
+  if (state === "revoked") return { ok: false, reason: "revoked", text: revokedText(agent) }
+  if (state !== "live") return { ok: false, reason: "not-approved", text: notApprovedText(agent) }
+  return { ok: true, approval: check.approval }
+}
+
 type ReadOutcome =
   | { status: "ok"; checkpoints: Awaited<ReturnType<typeof readCheckpoints>>["checkpoints"] }
   | { status: "failed"; error: unknown }
@@ -122,38 +168,16 @@ export async function buildHandoff(
   deps: HandoffDeps = {},
 ): Promise<HandoffResult> {
   const agent = input.agent
-  // the name is interpolated into refusal text — only after it is proven a safe local agent name
-  if (!isSafeName(agent)) return refused("bad-agent", noContextText("bad-agent"))
-  // a relative cwd would be resolved against the DAEMON's working directory — refuse it outright
-  if (typeof input.cwd !== "string" || !isAbsolute(input.cwd)) return refused("bad-input", noContextText("bad-input"))
   try {
-    const check = await (deps.checkProject ?? checkProject)(runtime, { agent, cwd: input.cwd })
-    if (!check.ok) {
-      if (check.reason === "list-tampered") return refused("list-tampered", TAMPERED_TEXT)
-      if (check.reason === "list-unreadable") return refused("list-unreadable", UNREADABLE_TEXT)
-      // a failed check names no cause the owner could act on — the generic line, not a guess
-      if (check.reason === "check-failed") return refused("check-failed", noContextText("check-failed"))
-      // A revoked agent's project row is gone, so the project check answers not-approved first —
-      // the marker `mida revoke` left behind says why access really ended (R4-3). A marker that
-      // cannot be read leaves the not-approved answer standing, never a crash.
-      if (check.reason === "not-approved") {
-        try {
-          if ((deps.isRevoked ?? ((name) => isRevoked(runtime.home, name)))(agent)) {
-            return refused("revoked", revokedText(agent))
-          }
-        } catch { /* fall through to not-approved */ }
-      }
-      return refused(check.reason, notApprovedText(agent))
-    }
-    const state = await (deps.capability ?? capabilityState)(runtime, agent)
-    if (state === "revoked") return refused("revoked", revokedText(agent))
-    if (state !== "live") return refused("not-approved", notApprovedText(agent))
+    const access = await checkAccess(runtime, { agent, cwd: input.cwd }, deps)
+    if (!access.ok) return refused(access.reason, access.text)
+    const check = access.approval
 
     const now = deps.now ?? (() => Date.now())
     const readStarted = now()
     // `settled` never rejects, so a read that finishes or fails after the deadline is discarded
     // quietly — no unhandled rejection, and its text is never logged or rendered.
-    const settled = (deps.read ?? readCheckpoints)(runtime, agent, check.approval.projectId).then(
+    const settled = (deps.read ?? readCheckpoints)(runtime, agent, check.projectId).then(
       (value): ReadOutcome => ({ status: "ok", checkpoints: value.checkpoints }),
       (error): ReadOutcome => ({ status: "failed", error }),
     )
@@ -199,7 +223,7 @@ export async function buildHandoff(
       try {
         runtime.home.writeSecretJson(`state/continues/${input.sessionId}.json`, {
           continues: merged.headSessionId,
-          projectId: check.approval.projectId,
+          projectId: check.projectId,
         })
       } catch {
         // a failed record degrades to continuesSession null at save time

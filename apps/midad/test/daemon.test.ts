@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, ownerOnlyLine, removeJob, socketPathFor, startDaemon } from "@mida/midad"
+import { MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, ownerOnlyLine, removeJob, socketPathFor, startDaemon, writeLastSeen } from "@mida/midad"
 import type { DrainDeps, DrainResult, Runtime, ServiceRuntime } from "@mida/midad"
 import type { DaemonDeps } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
@@ -325,6 +325,62 @@ describe("startDaemon", () => {
       const entry = logs.find((e) => (e as { event?: string }).event === "handoff")!
       expect(entry).toMatchObject({ agent: null, kind: "refused", reason: "bad-agent" })
       expect(JSON.stringify(entry)).not.toContain("..")
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it("POST /whatsnew answers updates for foreign checkpoints and logs one stable line (R5-5)", async () => {
+    const { home, deps, stubRuntime, logs } = setup()
+    writeLastSeen(home, "s-1", "2026-09-21T11:00:00.000Z")
+    const foreign = {
+      checkpoint: sampleCheckpoint({ eventId: "cp-1", agent: "codex", createdAt: "2026-09-21T11:30:00.000Z", progress: ["shipped it"], nextAction: "rest" }),
+      projectId: "p1", sessionId: "other-session", continuesSession: null, compiledBy: "test",
+      contextId: `0x${"a1".repeat(32)}`, authorId: `0x${"b2".repeat(32)}`, namespaceId: `0x${"c3".repeat(32)}`,
+    }
+    const daemon = await startDaemon({
+      ...deps,
+      openRuntime: async () => ({ ...stubRuntime, home }) as Runtime,
+      whatsnewDeps: {
+        checkProject: async () => ({ ok: true, approval: { agent: "claude-code", projectId: "p1", root: "/tmp/work", approvedAt: "2026-09-21T00:00:00.000Z" } }),
+        capability: async () => "live",
+        read: async () => ({ checkpoints: [foreign], skipped: 0, milliseconds: 1 }),
+        authorNames: { [`0x${"b2".repeat(32)}`]: "codex" },
+        now: () => Date.parse("2026-09-21T12:00:00.000Z"),
+      },
+    })
+    try {
+      const reply = await callDaemon(home, "/whatsnew", { agent: "claude-code", cwd: "/tmp/work", sessionId: "s-1" }, { timeoutMs: 2_000 })
+      expect(reply.status).toBe(200)
+      const body = reply.body as { kind: string; note: string; updates: { agent: string }[]; lastSeen: string }
+      expect(body.kind).toBe("updates")
+      expect(body.note).toContain("Mida update since you last checked:")
+      expect(body.note).toContain("codex")
+      expect(body.updates).toEqual([{ agent: "codex", savedAt: "2026-09-21T11:30:00.000Z" }])
+      expect(body.lastSeen).toBe("2026-09-21T11:30:00.000Z")
+      const entry = logs.find((e) => (e as { event?: string }).event === "whatsnew")! as Record<string, unknown>
+      expect(entry).toMatchObject({ agent: "claude-code", kind: "updates", updates: 1, reason: null })
+      expect(JSON.stringify(entry)).not.toContain("shipped it")
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it("POST /whatsnew answers refused for a revoked agent and the refusal lands in the log", async () => {
+    const { home, deps, stubRuntime, logs } = setup()
+    const daemon = await startDaemon({
+      ...deps,
+      openRuntime: async () => ({ ...stubRuntime, home }) as Runtime,
+      whatsnewDeps: {
+        checkProject: async () => ({ ok: true, approval: { agent: "codex", projectId: "p1", root: "/tmp/work", approvedAt: "2026-09-21T00:00:00.000Z" } }),
+        capability: async () => "revoked",
+      },
+    })
+    try {
+      const reply = await callDaemon(home, "/whatsnew", { agent: "codex", cwd: "/tmp/work", sessionId: "s-1" }, { timeoutMs: 2_000 })
+      expect(reply.body).toEqual({ kind: "refused", reason: "revoked" })
+      const entry = logs.find((e) => (e as { event?: string }).event === "whatsnew")!
+      expect(entry).toMatchObject({ agent: "codex", kind: "refused", reason: "revoked" })
     } finally {
       await daemon.close()
     }

@@ -19,9 +19,10 @@ export const INJECT_COMMAND = {
 
 export type InstallTool = keyof typeof HOOK_COMMAND
 
-/** Claude Code events: the inject command on session start, the capture hook on the five save events. */
+/** Claude Code events: the inject command on session start and on every prompt, the capture hook on the five save events. */
 const EVENT_COMMANDS: Readonly<Record<string, string>> = {
   SessionStart: INJECT_COMMAND["claude-code"],
+  UserPromptSubmit: INJECT_COMMAND["claude-code"],
   PostToolUse: HOOK_COMMAND["claude-code"],
   Stop: HOOK_COMMAND["claude-code"],
   StopFailure: HOOK_COMMAND["claude-code"],
@@ -223,7 +224,9 @@ export function uninstallClaudeCode(settingsPath: string): UninstallOutcome {
  */
 const CODEX_MARKER_OPEN = "# >>> mida hooks — managed by `mida install codex`; do not edit >>>"
 const CODEX_MARKER_CLOSE = "# <<< mida hooks <<<"
-export const CODEX_BLOCK = [
+
+/** The block install wrote before UserPromptSubmit existed — still recognised as ours, and upgraded in place. */
+export const CODEX_BLOCK_V1 = [
   CODEX_MARKER_OPEN,
   "[[hooks.SessionStart]]",
   'matcher = "startup|resume|clear|compact"',
@@ -240,12 +243,41 @@ export const CODEX_BLOCK = [
   CODEX_MARKER_CLOSE,
 ].join("\n")
 
+export const CODEX_BLOCK = [
+  CODEX_MARKER_OPEN,
+  "[[hooks.SessionStart]]",
+  'matcher = "startup|resume|clear|compact"',
+  "",
+  "[[hooks.SessionStart.hooks]]",
+  'type = "command"',
+  `command = "${INJECT_COMMAND.codex}"`,
+  "",
+  "[[hooks.UserPromptSubmit]]",
+  "",
+  "[[hooks.UserPromptSubmit.hooks]]",
+  'type = "command"',
+  `command = "${INJECT_COMMAND.codex}"`,
+  "",
+  "[[hooks.Stop]]",
+  "",
+  "[[hooks.Stop.hooks]]",
+  'type = "command"',
+  `command = "${HOOK_COMMAND.codex}"`,
+  CODEX_MARKER_CLOSE,
+].join("\n")
+
+/** Every managed-block shape this build recognises as its own — anything else between the markers is a human's edit. */
+const CODEX_KNOWN_BLOCKS: Readonly<Record<string, "current" | "v1">> = {
+  [CODEX_BLOCK]: "current",
+  [CODEX_BLOCK_V1]: "v1",
+}
+
 /** The exact sentence the owner sees after `mida install codex` — Codex asks once. */
 export const CODEX_TRUST_SENTENCE =
   "Codex must be told to trust these hooks once: open Codex in this folder and approve them. Then run `mida doctor`."
 
-/** Finds the managed block between its markers; "absent" when neither marker is present. */
-function locateCodexBlock(text: string): { start: number; end: number } | "absent" {
+/** Finds a KNOWN managed block between its markers; "absent" when neither marker is present. */
+function locateCodexBlock(text: string): { start: number; end: number; version: "current" | "v1" } | "absent" {
   const hasOpen = text.includes(CODEX_MARKER_OPEN)
   const hasClose = text.includes(CODEX_MARKER_CLOSE)
   if (!hasOpen && !hasClose) return "absent"
@@ -253,19 +285,30 @@ function locateCodexBlock(text: string): { start: number; end: number } | "absen
   const closeAt = text.indexOf(CODEX_MARKER_CLOSE)
   if (!hasOpen || !hasClose || closeAt < start) throw settingsUnreadable()
   const end = closeAt + CODEX_MARKER_CLOSE.length
-  if (text.slice(start, end) !== CODEX_BLOCK) throw settingsUnreadable()
-  return { start, end }
+  const version = CODEX_KNOWN_BLOCKS[text.slice(start, end)]
+  // markers around anything that is not a known managed block mean a human touched it
+  if (version === undefined) throw settingsUnreadable()
+  return { start, end, version }
 }
 
 /**
  * Appends the managed block to config.toml, one blank line separating it from whatever came
  * before (or nothing, when the file is created). A block that is already exactly right is a
- * byte-identical no-op. Markers around anything else refuse settings-unreadable — the block is
+ * byte-identical no-op; an older KNOWN block is upgraded in place — the markers still mean it
+ * is ours to rewrite. Markers around anything else refuse settings-unreadable — the block is
  * never silently overwritten.
  */
 export function installCodex(configPath: string): InstallOutcome {
   const text = existsSync(configPath) ? readFileSync(configPath, "utf8") : null
-  if (text !== null && locateCodexBlock(text) !== "absent") return "already-installed"
+  if (text !== null) {
+    const block = locateCodexBlock(text)
+    if (block !== "absent") {
+      if (block.version === "current") return "already-installed"
+      // an older managed block is ours to replace in place — same outcome as a fresh append
+      writeFileAtomic(configPath, `${text.slice(0, block.start)}${CODEX_BLOCK}${text.slice(block.end)}`)
+      return "installed"
+    }
+  }
   const separator = text === null || text === "" ? "" : text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n"
   mkdirSync(dirname(configPath), { recursive: true })
   writeFileAtomic(configPath, `${text ?? ""}${separator}${CODEX_BLOCK}\n`)
@@ -273,13 +316,16 @@ export function installCodex(configPath: string): InstallOutcome {
 }
 
 /**
- * Doctor's read-only view: "installed" only for the exact managed block. "unreadable" means the
- * markers wrap edited content — `mida install codex` would refuse the file too.
+ * Doctor's read-only view: "installed" only for the current managed block, "outdated" for an
+ * older one install can still upgrade. "unreadable" means the markers wrap edited content —
+ * `mida install codex` would refuse the file too.
  */
-export function codexHooksStatus(configPath: string): "installed" | "absent" | "unreadable" {
+export function codexHooksStatus(configPath: string): "installed" | "outdated" | "absent" | "unreadable" {
   try {
     if (!existsSync(configPath)) return "absent"
-    return locateCodexBlock(readFileSync(configPath, "utf8")) === "absent" ? "absent" : "installed"
+    const block = locateCodexBlock(readFileSync(configPath, "utf8"))
+    if (block === "absent") return "absent"
+    return block.version === "current" ? "installed" : "outdated"
   } catch {
     return "unreadable"
   }

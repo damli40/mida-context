@@ -86,6 +86,19 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
   return degradedMessage(typeof body.reason === "string" ? body.reason : "no-answer")
 }
 
+/**
+ * The owner-facing line for a whats-new note: `Mida: update from codex (40 s ago)`, plural for
+ * several agents. The note itself is model-facing — this line only says an update arrived.
+ */
+export function whatsNewMessage(updates: { agent?: unknown; savedAt?: unknown }[], now: number): string {
+  const parts = updates.slice(0, 4).map((u) => {
+    const name = typeof u.agent === "string" && u.agent !== "" ? u.agent : "another agent"
+    return `${name} (${agoText(typeof u.savedAt === "string" ? u.savedAt : "", now)})`
+  })
+  if (parts.length === 0) return systemMessage("Mida: update from another agent")
+  return systemMessage(`Mida: update${parts.length === 1 ? "" : "s"} from ${parts.join(", ")}`)
+}
+
 /** The JSON envelope both tools read: one line, the human line and the model text side by side. */
 export function hookReply(eventName: string, message: string, additionalContext: string): string {
   return JSON.stringify({

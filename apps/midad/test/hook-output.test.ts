@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { agoText, hookReply, sessionStartMessage } from "@mida/midad"
+import { agoText, hookReply, sessionStartMessage, whatsNewMessage } from "@mida/midad"
 
 const NOW = Date.parse("2026-09-21T12:00:00.000Z")
 
@@ -151,5 +151,39 @@ describe("sessionStartMessage", () => {
     }
     const line = sessionStartMessage(body, "codex", NOW)
     expect(line.length).toBeLessThanOrEqual(160)
+  })
+})
+
+describe("whatsNewMessage", () => {
+  it("one updating agent names the agent and its checkpoint's age", () => {
+    expect(
+      whatsNewMessage([{ agent: "codex", savedAt: "2026-09-21T11:59:20.000Z" }], NOW),
+    ).toBe("Mida: update from codex (40 s ago)")
+  })
+
+  it("several agents list them newest first", () => {
+    const line = whatsNewMessage(
+      [
+        { agent: "codex", savedAt: "2026-09-21T11:59:20.000Z" },
+        { agent: "claude-code", savedAt: "2026-09-21T11:57:00.000Z" },
+      ],
+      NOW,
+    )
+    expect(line).toBe("Mida: updates from codex (40 s ago), claude-code (3 min ago)")
+  })
+
+  it("a missing agent name or timestamp degrades to words, never blank", () => {
+    const line = whatsNewMessage([{ agent: "", savedAt: "not-a-date" }], NOW)
+    expect(line).toBe("Mida: update from another agent (a while ago)")
+  })
+
+  it("stays under 160 characters and carries no hex even with many agents", () => {
+    const updates = Array.from({ length: 6 }, (_, i) => ({
+      agent: `agent-${"x".repeat(40)}-${i}`,
+      savedAt: "2026-09-21T11:59:20.000Z",
+    }))
+    const line = whatsNewMessage(updates, NOW)
+    expect(line.length).toBeLessThanOrEqual(160)
+    expect(line).not.toMatch(/[0-9a-f]{40}/)
   })
 })

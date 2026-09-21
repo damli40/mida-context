@@ -280,9 +280,11 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           lines.push(
             status === "installed"
               ? "ok: codex hooks installed"
-              : status === "unreadable"
-                ? problem("codex's hook block was edited", "remove the marked block, then run `mida install codex`")
-                : problem("codex hooks are not installed", "run `mida install codex`"),
+              : status === "outdated"
+                ? problem("codex's hook block is an older version — the whats-new hook is missing", "run `mida install codex`")
+                : status === "unreadable"
+                  ? problem("codex's hook block was edited", "remove the marked block, then run `mida install codex`")
+                  : problem("codex hooks are not installed", "run `mida install codex`"),
           )
         }
         return lines.length === 0 ? ["ok: no hook paths to check"] : lines

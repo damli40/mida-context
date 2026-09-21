@@ -36,7 +36,8 @@ const OWN_HEADINGS = [
   "What you have told Mida about yourself",
 ]
 
-function defuse(text: string): string {
+/** Exported so other context surfaces (the whats-new note) defuse checkpoint text the same way. */
+export function defuse(text: string): string {
   return text
     .replace(/mida handoff/gi, "MIDA-HANDOFF (quoted)")
     .replace(/original request/gi, "original request (quoted)")
