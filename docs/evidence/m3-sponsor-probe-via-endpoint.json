@@ -1,0 +1,102 @@
+{
+  "probe": "m3-sponsor-probe",
+  "generatedAt": "2026-09-21T21:52:00.794Z",
+  "chainId": 10143,
+  "freshAddress": "0x5e7c4f6d40ad4c855ba48ed8292d80f1c3b4503f",
+  "steps": [
+    {
+      "id": "a",
+      "name": "fresh-account",
+      "status": "pass",
+      "detail": {
+        "freshAddress": "0x5e7c4f6d40ad4c855ba48ed8292d80f1c3b4503f",
+        "chainId": 10143,
+        "balanceWei": "0"
+      }
+    },
+    {
+      "id": "b",
+      "name": "implementation-code",
+      "status": "pass",
+      "detail": {
+        "implementation": "0xe6Cae83BdE06E4c305530e199D7217f42808555B",
+        "codeBytes": 3639
+      }
+    },
+    {
+      "id": "c",
+      "name": "sponsored-register",
+      "status": "pass",
+      "detail": {
+        "userOpHash": "0x90fcbdefe16e2ecf962390508550174b4b87947317493554edcf43e00264c16d",
+        "transactionHash": "0xc179292062c54e77c05a373f0b280680bfe3adc1950bfffb0bf317ed9d91aea8",
+        "success": true,
+        "sender": "0x5e7C4F6D40Ad4c855Ba48ED8292d80F1c3B4503F",
+        "paymaster": "0x88888888…[masked]",
+        "actualGasUsed": "367398",
+        "actualGasCost": "37750144500000000"
+      }
+    },
+    {
+      "id": "d",
+      "name": "sender-is-owner",
+      "status": "pass",
+      "detail": {
+        "recordedUnder": "0x5e7c4f6d40ad4c855ba48ed8292d80f1c3b4503f",
+        "expectedQx": "0xfc88323e…[masked]",
+        "expectedQy": "0x33a7baaa…[masked]",
+        "onchainQx": "0xfc88323e…[masked]",
+        "onchainQy": "0x33a7baaa…[masked]",
+        "outcome": "msg.sender was the fresh address — the payer changed, the sender did not"
+      }
+    },
+    {
+      "id": "e",
+      "name": "gas-fields",
+      "status": "pass",
+      "detail": {
+        "requestedGasFields": {
+          "callGasLimit": "66293",
+          "verificationGasLimit": "87355",
+          "preVerificationGas": "209236",
+          "paymasterVerificationGasLimit": "57442",
+          "paymasterPostOpGasLimit": "1",
+          "maxFeePerGas": "167750000000",
+          "maxPriorityFeePerGas": "2750000000"
+        },
+        "billedToPaymaster": {
+          "actualGasCost": "37750144500000000"
+        },
+        "note": "Monad bills the LIMIT on every field, not gas used — the requested column is what the sponsor paid for"
+      }
+    },
+    {
+      "id": "f",
+      "name": "self-paid-under-10mon",
+      "status": "pass",
+      "detail": {
+        "outcome": "delegated address self-paid successfully",
+        "delegated": true,
+        "fundedWei": "50000000000000000",
+        "transactionHash": "0xc2df6d13923e50ebae26a9b3f54b912118078c9ee69643e4ccc8992f3178d774",
+        "receiptStatus": "success"
+      }
+    },
+    {
+      "id": "g",
+      "name": "clear-delegation",
+      "status": "fail",
+      "detail": {
+        "clearingPossible": false,
+        "stage": "rejected-before-inclusion",
+        "outcome": "the sponsored clearing operation was rejected before inclusion — a delegated account cannot validate an operation carrying a clearing authorization; ALLOW_CLEARING must stay off",
+        "error": "Missing or invalid parameters.\nDouble check you have provided the correct parameters.\n\nURL: [redacted]\nRequest body: {\"method\":\"pm_getPaymasterStubData\",\"params\":[{\"callData\":\"0xb61d27f6…[masked]\",\"maxFeePerGas\":\"0x270eaddd80\",\"maxPriorityFeePerGas\":\"0xa3e9ab80\",\"nonce\":\"0x1a0c5f458850000000000000000\",\"sender\":\"0x5e7C4F6D40Ad4c855Ba48ED8292d80F1c3B4503F\",\"signature\":\"0xffffffff…[masked]\",\"eip7702Auth\":{\"address\":\"0x0000000000000000000000000000000000000000\",\"chainId\":\"0x279f\",\"nonce\":\"0x2\",\"r\":\"0x0a2019fb…[masked]\",\"s\":\"0x01b593c3…[masked]\",\"yParity\":\"0x00\"},\"callGasLimit\":\"0x0\",\"verificationGasLimit\":\"0x0\",\"preVerificationGas\":\"0x0\"},\"0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108\",\"0x279f\",{\"sponsorshipPolicyId\":\"[redacted]\"}]}\n\nDetails: refused: this endpoint does not sponsor delegation clearing\nVersion: viem@2.56.3"
+      }
+    }
+  ],
+  "summary": {
+    "passed": 6,
+    "failed": 1,
+    "skipped": 0
+  }
+}

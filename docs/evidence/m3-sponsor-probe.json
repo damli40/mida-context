@@ -1,0 +1,102 @@
+{
+  "probe": "m3-sponsor-probe",
+  "generatedAt": "2026-09-21T21:32:28.202Z",
+  "chainId": 10143,
+  "freshAddress": "0x98dd15534adfe65e1bb52ce27f0e1b3604cfac04",
+  "steps": [
+    {
+      "id": "a",
+      "name": "fresh-account",
+      "status": "pass",
+      "detail": {
+        "freshAddress": "0x98dd15534adfe65e1bb52ce27f0e1b3604cfac04",
+        "chainId": 10143,
+        "balanceWei": "0"
+      }
+    },
+    {
+      "id": "b",
+      "name": "implementation-code",
+      "status": "pass",
+      "detail": {
+        "implementation": "0xe6Cae83BdE06E4c305530e199D7217f42808555B",
+        "codeBytes": 3639
+      }
+    },
+    {
+      "id": "c",
+      "name": "sponsored-register",
+      "status": "pass",
+      "detail": {
+        "userOpHash": "0xf548c25cb3470459f53fa69fe229f2bc3f55e831b0fb2ea610f1b2cb3cc172b4",
+        "transactionHash": "0x13711c46001a35f0a0fa98695acdafb849e59643e8e311911f72696f314baebc",
+        "success": true,
+        "sender": "0x98dD15534ADfE65e1Bb52CE27f0e1B3604CFac04",
+        "paymaster": "0x88888888…[masked]",
+        "actualGasUsed": "367398",
+        "actualGasCost": "37750144500000000"
+      }
+    },
+    {
+      "id": "d",
+      "name": "sender-is-owner",
+      "status": "pass",
+      "detail": {
+        "recordedUnder": "0x98dd15534adfe65e1bb52ce27f0e1b3604cfac04",
+        "expectedQx": "0x1e681768…[masked]",
+        "expectedQy": "0x14ec8d18…[masked]",
+        "onchainQx": "0x1e681768…[masked]",
+        "onchainQy": "0x14ec8d18…[masked]",
+        "outcome": "msg.sender was the fresh address — the payer changed, the sender did not"
+      }
+    },
+    {
+      "id": "e",
+      "name": "gas-fields",
+      "status": "pass",
+      "detail": {
+        "requestedGasFields": {
+          "callGasLimit": "66293",
+          "verificationGasLimit": "87355",
+          "preVerificationGas": "209236",
+          "paymasterVerificationGasLimit": "57442",
+          "paymasterPostOpGasLimit": "1",
+          "maxFeePerGas": "167750000000",
+          "maxPriorityFeePerGas": "2750000000"
+        },
+        "billedToPaymaster": {
+          "actualGasCost": "37750144500000000"
+        },
+        "note": "Monad bills the LIMIT on every field, not gas used — the requested column is what the sponsor paid for"
+      }
+    },
+    {
+      "id": "f",
+      "name": "self-paid-under-10mon",
+      "status": "pass",
+      "detail": {
+        "outcome": "delegated address self-paid successfully",
+        "delegated": true,
+        "fundedWei": "50000000000000000",
+        "transactionHash": "0x68f2f1905a07aae90f1f801d9a0604b9fe6e050d92cc47a36033076b23eaeb4f",
+        "receiptStatus": "success"
+      }
+    },
+    {
+      "id": "g",
+      "name": "clear-delegation",
+      "status": "fail",
+      "detail": {
+        "clearingPossible": false,
+        "stage": "rejected-before-inclusion",
+        "outcome": "the sponsored clearing operation was rejected before inclusion — a delegated account cannot validate an operation carrying a clearing authorization; ALLOW_CLEARING must stay off",
+        "error": "Invalid fields set on User Operation.\n\nRequest Arguments:\n  callData:                       0xb61d27f6…[masked]\n  callGasLimit:                   0\n  maxFeePerGas:                   167.75 gwei\n  maxPriorityFeePerGas:           2.75 gwei\n  nonce:                          33020157912585852043297042726912\n  paymaster:                      0x88888888…[masked]\n  paymasterData:                  0x01000000…[masked]\n  paymasterPostOpGasLimit:        1\n  paymasterVerificationGasLimit:  0\n  preVerificationGas:             0\n  sender:                         0x98dD15534ADfE65e1Bb52CE27f0e1B3604CFac04\n  signature:                      0xffffffff…[masked]\n  verificationGasLimit:           0\n\nDetails: Invalid EIP-7702 authorization: Cannot delegate to the zero address.\nVersion: viem@2.56.3"
+      }
+    }
+  ],
+  "summary": {
+    "passed": 6,
+    "failed": 1,
+    "skipped": 0
+  }
+}

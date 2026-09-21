@@ -67,7 +67,9 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const EVIDENCE_PATH = join(HERE, "..", "docs", "evidence", "m3-sponsor-probe.json")
 
 const env = process.env
-const pimlicoUrl = `https://api.pimlico.io/v2/monad-testnet/rpc?apikey=${env.PIMLICO_API_KEY ?? ""}`
+// SPONSOR_URL points the whole probe at OUR sponsor endpoint instead of the provider — the end-to-end
+// check that the payment policy accepts what the real account library produces.
+const pimlicoUrl = env.SPONSOR_URL ?? `https://api.pimlico.io/v2/monad-testnet/rpc?apikey=${env.PIMLICO_API_KEY ?? ""}`
 
 /** Everything that must never reach a log line or the evidence file. */
 const secrets: (string | undefined)[] = [
@@ -185,8 +187,19 @@ async function main(): Promise<void> {
       functionName: "registerP256Key",
       args: [registeredQx, registeredQy],
     })
+    // The library only inserts a PLACEHOLDER authorization while preparing the operation; the real
+    // one must be signed by the address itself and passed in (first live run, Sep 21: without it
+    // the bundler answered "recovered signer address does not match the userOperation sender").
+    // The bundler — not this address — sends the transaction, so the nonce is the address's
+    // CURRENT transaction count, not count + 1.
+    const authorization = await account.signAuthorization({
+      address: PIMLICO_7702_IMPLEMENTATION,
+      chainId: Number(MONAD_TESTNET_CHAIN_ID),
+      nonce: await publicClient.getTransactionCount({ address: account.address }),
+    })
     userOpHash = await bundler.sendUserOperation({
       calls: [{ to: deployment.capabilityRegistry, value: 0n, data: callData }],
+      authorization,
     }) as Hex
     allow.add(userOpHash)
     const userOpReceipt = await bundler.waitForUserOperationReceipt({ hash: userOpHash, timeout: 180_000 })
@@ -279,6 +292,14 @@ async function main(): Promise<void> {
       const hash = await freshWallet.sendTransaction({ to: deployer.address, value: 0n, chain: monadTestnet })
       allow.add(hash)
       const receipt = await publicClient.waitForTransactionReceipt({ hash })
+      // The question is about a DELEGATED address. If the address carries no delegation (the
+      // sponsored step failed), a successful send proves nothing — say so instead of passing.
+      if (!delegated) {
+        return {
+          status: "skip",
+          detail: { outcome: "address is NOT delegated, so this send says nothing about a delegated address under 10 MON", delegated, transactionHash: hash, receiptStatus: receipt.status },
+        }
+      }
       return {
         status: receipt.status === "success" ? "pass" : "fail",
         detail: {
