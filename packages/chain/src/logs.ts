@@ -47,17 +47,48 @@ export async function getLogsChunked(
   parameters: { address: Address; event: AbiEvent; args?: Record<string, unknown>; fromBlock: bigint; toBlock?: bigint },
 ): Promise<DecodedLog[]> {
   const toBlock = parameters.toBlock ?? (await client.getBlockNumber())
-  const logs: DecodedLog[] = []
-  for (const window of blockWindows(parameters.fromBlock, toBlock)) {
-    const page = await client.getLogs({
-      address: parameters.address,
-      event: parameters.event,
-      ...(parameters.args === undefined ? {} : { args: parameters.args }),
-      fromBlock: window.fromBlock,
-      toBlock: window.toBlock,
-      strict: true,
-    })
-    logs.push(...(page as DecodedLog[]))
+  const windows = blockWindows(parameters.fromBlock, toBlock)
+  // One request at a time made a scan grow by about 4,300 sequential requests per day of chain
+  // age (Monad: a block every 0.4 s, 100 blocks per request). Windows are fetched a few at a
+  // time — the public RPC allows about 25 requests a second — and put back in block order.
+  const pages: DecodedLog[][] = new Array(windows.length)
+  let next = 0
+  const worker = async (): Promise<void> => {
+    while (next < windows.length) {
+      const index = next++
+      const window = windows[index]!
+      pages[index] = (await fetchWindow(client, parameters, window)) as DecodedLog[]
+    }
   }
-  return logs
+  // A window that still fails after its retries rejects here and fails the whole scan: a scan
+  // with a hole in it could report "never revoked" when the revoke sits in the missing window.
+  await Promise.all(Array.from({ length: Math.min(LOG_SCAN_CONCURRENCY, windows.length) }, worker))
+  return pages.flat()
+}
+
+/** How many 100-block windows are in flight at once. */
+export const LOG_SCAN_CONCURRENCY = 8
+const WINDOW_ATTEMPTS = 3
+
+async function fetchWindow(
+  client: LogClient,
+  parameters: { address: Address; event: AbiEvent; args?: Record<string, unknown> },
+  window: BlockWindow,
+): Promise<readonly unknown[]> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await client.getLogs({
+        address: parameters.address,
+        event: parameters.event,
+        ...(parameters.args === undefined ? {} : { args: parameters.args }),
+        fromBlock: window.fromBlock,
+        toBlock: window.toBlock,
+        strict: true,
+      })
+    } catch (error) {
+      // a rate-limit or a dropped connection is worth a short wait; the last failure is thrown
+      if (attempt >= WINDOW_ATTEMPTS) throw error
+      await new Promise((resolve) => setTimeout(resolve, 400 * attempt))
+    }
+  }
 }

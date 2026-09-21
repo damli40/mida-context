@@ -4,6 +4,7 @@ import type { AbiEvent } from "viem"
 import { isMidaError, namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import {
+  LOG_SCAN_CONCURRENCY,
   MAX_LOG_BLOCK_RANGE,
   REVERT_CODES,
   blockWindows,
@@ -130,6 +131,41 @@ describe("chunked log scans (≤100 blocks per request)", () => {
   })
 })
 
+describe("chunked log scans run a few windows at a time", () => {
+  const event = getAbiItem({ abi: capabilityRegistryAbi, name: "AgentRevoked" }) as AbiEvent
+
+  it("keeps block order and never has more than the limit in flight", async () => {
+    let inFlight = 0
+    let peak = 0
+    const client = {
+      getBlockNumber: async () => 2_999n,
+      getLogs: async (call: { fromBlock: bigint }) => {
+        inFlight += 1
+        peak = Math.max(peak, inFlight)
+        await new Promise((resolve) => setTimeout(resolve, call.fromBlock % 300n === 0n ? 15 : 1))
+        inFlight -= 1
+        return [{ args: {}, blockNumber: call.fromBlock, transactionHash: null, logIndex: 0 }]
+      },
+    }
+    const logs = await getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 0n })
+    expect(logs).toHaveLength(30)
+    expect(logs.map((entry) => entry.blockNumber)).toEqual(Array.from({ length: 30 }, (_, i) => BigInt(i * 100)))
+    expect(peak).toBeLessThanOrEqual(LOG_SCAN_CONCURRENCY)
+    expect(peak).toBeGreaterThan(1)
+  })
+
+  it("a window that keeps failing fails the whole scan — no answer with a hole in it", async () => {
+    const client = {
+      getBlockNumber: async () => 499n,
+      getLogs: async (call: { fromBlock: bigint }) => {
+        if (call.fromBlock === 200n) throw new Error("window down")
+        return []
+      },
+    }
+    await expect(getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 0n })).rejects.toThrow("window down")
+  }, 10_000)
+})
+
 describe("owner history (§14.6 PREVIOUSLY_REVOKED)", () => {
   const log = (owner: string, agentId: string) => ({ args: { owner, agentId }, blockNumber: 9n, transactionHash: null, logIndex: 0 })
 
@@ -147,6 +183,28 @@ describe("owner history (§14.6 PREVIOUSLY_REVOKED)", () => {
   it("reports a revocation of this exact pair", async () => {
     const { client } = recordingClient(20n, (call) => (call.event.name === "AgentRevoked" ? [log(OWNER, AGENT.toUpperCase().replace("0X", "0x"))] : []))
     expect((await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT })).previouslyRevoked).toBe(true)
+  })
+
+  it("a revocation counter above 0 answers in one request, with no log scan at all", async () => {
+    const { client, calls } = recordingClient(20n, () => [])
+    const withView = { ...client, getBlockNumber: client.getBlockNumber.bind(client), getLogs: client.getLogs.bind(client), readContract: async () => 1n }
+    const history = await ownerHistory({ client: withView, deployment, owner: OWNER, agentId: AGENT })
+    expect(history).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: true, observedThroughBlock: 20n })
+    expect(calls).toHaveLength(0)
+  })
+
+  it("a counter of 0 still scans, but only for single-capability revokes", async () => {
+    const { client, calls } = recordingClient(20n, (call) => (call.event.name === "CapabilityRevoked" ? [log(OWNER, AGENT)] : []))
+    const withView = { ...client, getBlockNumber: client.getBlockNumber.bind(client), getLogs: client.getLogs.bind(client), readContract: async () => 0n }
+    expect((await ownerHistory({ client: withView, deployment, owner: OWNER, agentId: AGENT })).previouslyRevoked).toBe(true)
+    expect(new Set(calls.map((call) => call.event))).toEqual(new Set(["CapabilityRevoked"]))
+  })
+
+  it("a counter read that fails, or returns nonsense, fails the whole check — never 'not revoked'", async () => {
+    const { client } = recordingClient(20n, () => [])
+    const base = { ...client, getBlockNumber: client.getBlockNumber.bind(client), getLogs: client.getLogs.bind(client) }
+    await expect(ownerHistory({ client: { ...base, readContract: async () => { throw new Error("rpc down") } }, deployment, owner: OWNER, agentId: AGENT })).rejects.toThrow("rpc down")
+    await expect(ownerHistory({ client: { ...base, readContract: async () => "1" }, deployment, owner: OWNER, agentId: AGENT })).rejects.toThrow()
   })
 
   it("ignores revocations of another agent or by another owner even if a provider returns them", async () => {
