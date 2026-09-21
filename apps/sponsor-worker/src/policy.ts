@@ -1,5 +1,5 @@
 import { GAS_CEILINGS, capabilityRegistryAbi, contextRegistryAbi } from "@mida/chain"
-import { decodeFunctionData, encodeFunctionData, toFunctionSelector } from "viem"
+import { decodeFunctionData, encodeFunctionData, keccak256, toFunctionSelector } from "viem"
 import type { Address, Hex } from "viem"
 
 /**
@@ -344,6 +344,20 @@ export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: Cha
     if (e instanceof PolicyRefusal) return e.refusal
     throw e
   }
+}
+
+/**
+ * The identifying tuple the Worker stores when it signs an operation and requires before it will
+ * send one: sender, nonce, and the callData hash — the fields that decide what the paymaster
+ * signature can buy. Normalised the same way on both paths so a signed operation always finds
+ * its own record. A malformed nonce is a refusal here too, because an operation whose nonce we
+ * cannot compare is an operation we cannot say we signed.
+ */
+export function operationIdentity(op: Record<string, unknown>): { sender: string; nonce: string; callDataHash: string } {
+  const sender = (op.sender as string).toLowerCase()
+  const nonce = quantity(op.nonce, "nonce")
+  const callDataHash = keccak256((op.callData as string).toLowerCase() as Hex)
+  return { sender, nonce: nonce === undefined ? "" : nonce.toString(10), callDataHash }
 }
 
 /**

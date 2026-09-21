@@ -1,4 +1,4 @@
-import { consumeSendBudget, utcDay } from "./budget.js"
+import { consumeFreeCalls, consumeSignBudget, recordIssued, refundSignBudget, utcDay, wasIssued } from "./budget.js"
 import type { D1Like } from "./budget.js"
 import {
   CALL_GAS_CEILING,
@@ -12,6 +12,7 @@ import {
   PolicyRefusal,
   checkUserOperation,
   checkedParams,
+  operationIdentity,
 } from "./policy.js"
 import type { PolicyEnv } from "./policy.js"
 import { ProviderError, alchemyProvider, httpJsonRpcProvider, pimlicoProvider } from "./provider.js"
@@ -48,6 +49,8 @@ export interface SponsorEnv {
   ALLOWED_IMPLEMENTATIONS: string
   PER_SENDER_DAILY_LIMIT?: string
   GLOBAL_DAILY_LIMIT?: string
+  /** Daily allowance for the unsigned methods (stub data, gas estimation) — 120 by default. */
+  FREE_PER_SENDER_DAILY_LIMIT?: string
 }
 
 const ALLOWED_METHODS = new Set([
@@ -75,6 +78,7 @@ interface SponsorConfig {
   secrets: string[]
   perSenderDailyLimit: number
   globalDailyLimit: number
+  freePerSenderDailyLimit: number
   /** The log body — everything the worker may print, already reduced to non-secret fields. */
   log(method: string, refused: string | undefined, sender: string | undefined, ms: number): void
 }
@@ -136,6 +140,7 @@ export function buildWorker(env: SponsorEnv): SponsorConfig {
     secrets,
     perSenderDailyLimit: parseLimit(env.PER_SENDER_DAILY_LIMIT, 30, "PER_SENDER_DAILY_LIMIT"),
     globalDailyLimit: parseLimit(env.GLOBAL_DAILY_LIMIT, 2000, "GLOBAL_DAILY_LIMIT"),
+    freePerSenderDailyLimit: parseLimit(env.FREE_PER_SENDER_DAILY_LIMIT, 120, "FREE_PER_SENDER_DAILY_LIMIT"),
     log(method, refused, sender, ms) {
       // method, refusal rule, first 10 chars of the sender, milliseconds — never a body, a key,
       // a policy id, a private key, or a full address or hash.
@@ -184,8 +189,9 @@ function infoResponse(config: SponsorConfig): Response {
       preVerificationGas: PRE_VERIFICATION_GAS_CEILING.toString(),
       paymasterGas: PAYMASTER_GAS_CEILING.toString(),
       maxFee: FEE_CEILING.toString(),
-      perSenderPerDay: config.perSenderDailyLimit,
-      globalPerDay: config.globalDailyLimit,
+      signingsPerSenderPerDay: config.perSenderDailyLimit,
+      signingsGlobalPerDay: config.globalDailyLimit,
+      freeCallsPerSenderPerDay: config.freePerSenderDailyLimit,
     },
   }
   return new Response(JSON.stringify(body, null, 2), { headers: { "content-type": "application/json" } })
@@ -215,12 +221,14 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
   if (!ALLOWED_METHODS.has(method)) return jsonRpcError(id ?? null, METHOD_NOT_FOUND, `method ${method} is not supported here`)
 
   const started = Date.now()
+  const day = utcDay()
   let sender: string | undefined
   try {
     let outParams: unknown = params
+    let op: Record<string, unknown> | undefined
     if (USER_OP_METHODS.has(method)) {
       const checked = checkedParams(method, params, config.policy, config.provider.policyContext(required(env, "POLICY_ID")))
-      const op = checked[0] as Record<string, unknown>
+      op = checked[0] as Record<string, unknown>
       sender = typeof op.sender === "string" ? op.sender.toLowerCase() : undefined
       const refusal = await checkUserOperation(op, config.policy, {
         getCode: (address) => rpcGetCode(env.RPC_URL, address),
@@ -229,26 +237,70 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
         config.log(method, refusal.rule, sender, Date.now() - started)
         return jsonRpcError(id ?? null, REFUSED, refusal.message)
       }
-      if (method === "eth_sendUserOperation" && sender) {
-        const budget = await consumeSendBudget(env.DB, {
-          day: utcDay(),
-          sender,
-          perSender: config.perSenderDailyLimit,
-          global: config.globalDailyLimit,
-        })
-        if (!budget.allowed) {
-          config.log(method, `budget-${budget.reason}`, sender, Date.now() - started)
-          return jsonRpcError(
-            id ?? null,
-            REFUSED,
-            budget.reason === "sender"
-              ? `refused: this sender used its ${config.perSenderDailyLimit} sponsored operations for today — pay gas yourself or try tomorrow`
-              : "refused: the sponsor's daily budget is exhausted — pay gas yourself or try tomorrow",
-          )
-        }
-      }
       outParams = checked
     }
+
+    // The budget is spent at signing: pm_getPaymasterData returns a paymaster signature the
+    // contract will honour on chain through ANY bundler, so the counters must tick before the
+    // request is forwarded — and are given back when the provider never produced a signature.
+    if (method === "pm_getPaymasterData") {
+      const identity = operationIdentity(op!)
+      const budget = await consumeSignBudget(env.DB, {
+        day,
+        sender: sender!,
+        perSender: config.perSenderDailyLimit,
+        global: config.globalDailyLimit,
+      })
+      if (!budget.allowed) {
+        config.log(method, `budget-${budget.reason}`, sender, Date.now() - started)
+        return jsonRpcError(
+          id ?? null,
+          REFUSED,
+          budget.reason === "sender"
+            ? `refused: this sender used its ${config.perSenderDailyLimit} sponsored signings for today — pay gas yourself or try tomorrow`
+            : "refused: the sponsor's daily budget is exhausted — pay gas yourself or try tomorrow",
+        )
+      }
+      let result: unknown
+      try {
+        result = await config.provider.forward(method, outParams)
+      } catch (e) {
+        await refundSignBudget(env.DB, { day, sender: sender! })
+        throw e
+      }
+      await recordIssued(env.DB, { day, ...identity })
+      config.log(method, undefined, sender, Date.now() - started)
+      return jsonRpcResponse(id ?? null, result)
+    }
+
+    // The unsigned methods cannot spend — but each forwarded call still costs the provider, so
+    // they get their own small per-sender allowance instead of the signing budget.
+    if (method === "pm_getPaymasterStubData" || method === "eth_estimateUserOperationGas") {
+      const free = await consumeFreeCalls(env.DB, { day, sender: sender!, perSender: config.freePerSenderDailyLimit })
+      if (!free.allowed) {
+        config.log(method, "free-sender", sender, Date.now() - started)
+        return jsonRpcError(
+          id ?? null,
+          REFUSED,
+          `refused: this sender used its ${config.freePerSenderDailyLimit} free calls for today — try tomorrow`,
+        )
+      }
+    }
+
+    // A send is only forwarded for an operation this endpoint signed today — we never relay a
+    // paymaster sponsorship we did not issue, and we never let send become a free provider call.
+    if (method === "eth_sendUserOperation") {
+      const identity = operationIdentity(op!)
+      if (!(await wasIssued(env.DB, { day, ...identity }))) {
+        config.log(method, "not-signed", sender, Date.now() - started)
+        return jsonRpcError(
+          id ?? null,
+          REFUSED,
+          "refused: this endpoint did not sign this operation today — call pm_getPaymasterData first",
+        )
+      }
+    }
+
     const result = await config.provider.forward(method, outParams)
     config.log(method, undefined, sender, Date.now() - started)
     return jsonRpcResponse(id ?? null, result)
