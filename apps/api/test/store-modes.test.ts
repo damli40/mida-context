@@ -31,6 +31,7 @@ function fakeObject(): StoredObject {
   return {
     contextId,
     owner: OWNER,
+    uploader: OWNER,
     namespaceId: NAMESPACE,
     authorId: hexOf(randomBytes(32)),
     objectNonce: hexOf(randomBytes(32)),
@@ -55,6 +56,7 @@ function fakeObject(): StoredObject {
     },
     manifestHash: hexOf(randomBytes(32)),
     uploadedAt: new Date().toISOString(),
+    anchoredAt: null,
   }
 }
 
@@ -84,8 +86,8 @@ describe("the embedded store's data tree is user-only", () => {
     const dataDir = join(mkdtempSync(join(tmpdir(), "mida-modes-")), "data")
     const { store, overlay } = createContextApi({ reader: {} as RegistryReader, deployment, dataDir })
 
-    store.putObject(fakeObject())
-    store.putWrap({
+    await store.putObject(fakeObject())
+    await store.putWrap({
       v: 1,
       owner: OWNER,
       namespaceId: NAMESPACE,
@@ -97,10 +99,10 @@ describe("the embedded store's data tree is user-only", () => {
       wrappedEpochPrivateKey: hexOf(randomBytes(48)),
       createdAt: new Date().toISOString(),
     })
-    store.setManifestIndex(hexOf(randomBytes(32)), hexOf(randomBytes(32)))
+    await store.setManifestIndex(hexOf(randomBytes(32)), hexOf(randomBytes(32)))
     await store.blobs.put(new Uint8Array([1, 2, 3]))
-    overlay.create(OWNER, { kind: "capability", capabilityId: hexOf(randomBytes(32)) }, 1n)
-    new ReplayGuard(join(dataDir, "replay-nonces.json")).consume(OWNER, hexOf(randomBytes(32)), 100n, 100n)
+    await overlay.create(OWNER, { kind: "capability", capabilityId: hexOf(randomBytes(32)) }, 1n)
+    await new ReplayGuard(join(dataDir, "replay-nonces.json")).consume(OWNER, hexOf(randomBytes(32)), 100n, 100n)
 
     expectLocked(dataDir)
   })

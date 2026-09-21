@@ -1,0 +1,51 @@
+name = "mida-context-store"
+main = "src/worker.ts"
+compatibility_date = "2026-09-21"
+
+# nodejs_compat is required: the shared @mida/api package re-exports its file-backed stores
+# (apps/api/src/file-stores.ts → store.ts, secure-fs.ts, auth.ts, deny-overlay.ts → node:fs,
+# node:path) so the bundler sees node: imports even though the Worker always injects the D1
+# stores and never executes those code paths. The flag provides inert stubs only.
+compatibility_flags = ["nodejs_compat"]
+
+# Sweep of never-anchored pending uploads (>24 h) and expired request nonces, every 15 minutes.
+# Each run examines at most 25 object rows (one chain read each), oldest first — a backlog drains
+# in bounded tranches that always fit the platform's subrequest ceiling.
+[triggers]
+crons = ["*/15 * * * *"]
+
+# Per-IP request budgets, keyed on CF-Connecting-IP by the worker: signed requests get 120 a minute,
+# unsigned ones (anonymous manifest reads and unauthenticated probes) get 20. Each namespace is a
+# separate counter; the worker returns 429 with Retry-After when either says stop.
+[[ratelimits]]
+name = "LIMITER_SIGNED"
+namespace_id = "1001"
+simple = { limit = 120, period = 60 }
+
+[[ratelimits]]
+name = "LIMITER_UNSIGNED"
+namespace_id = "1002"
+simple = { limit = 20, period = 60 }
+
+# No account id, database id or secret lives in this file.
+# Create the database with `wrangler d1 create mida-context-store` and paste the returned
+# database_id below, then apply schema.sql with `wrangler d1 execute`.
+[[d1_databases]]
+binding = "DB"
+database_name = "mida-context-store"
+database_id = "REPLACE_WITH_D1_DATABASE_ID" # placeholder — NOT a real id; do not commit one
+
+# Deployment configuration — every value the Worker needs comes from the environment, never
+# from a file (there is no filesystem; packages/chain/src/deployment.ts loadDeployment would
+# try to read one). Replace each placeholder for your network; these are NOT real values.
+[vars]
+CHAIN_ID = "REPLACE_WITH_CHAIN_ID"                       # e.g. "10143" for Monad testnet
+CAPABILITY_REGISTRY = "0xREPLACE_WITH_CAPABILITY_REGISTRY_ADDRESS"
+CONTEXT_REGISTRY = "0xREPLACE_WITH_CONTEXT_REGISTRY_ADDRESS"
+DEPLOYMENT_BLOCK = "REPLACE_WITH_DEPLOYMENT_BLOCK"
+POLICY_HASH_V1 = "0xREPLACE_WITH_32_BYTE_POLICY_HASH"
+VAULT_RP_ID = "REPLACE_WITH_VAULT_RP_ID"
+VAULT_RP_ID_HASH = "0xREPLACE_WITH_32_BYTE_RP_ID_HASH"
+
+# RPC_URL is a URL and may carry an API key — set it as a secret, not a var:
+#   wrangler secret put RPC_URL

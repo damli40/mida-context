@@ -33,7 +33,8 @@ import { FakeVaultAuthority, buildSignedAccessRequest, provisionAgent } from "@m
 import type { AgentDeclaration, GrantSelection, ProvisionedAgent } from "@mida/fake-vault"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { ContextApiClient, RegistryReader, createContextApi } from "@mida/api"
-import type { ApiStore, ObjectUploadBody } from "@mida/api"
+import type { ObjectStore, ObjectUploadBody } from "@mida/api"
+import { manifestBindingFor } from "@mida/grant-advisor"
 
 const CAREER = namespaceId("goals.career")
 const SEED = new Uint8Array(32).fill(0x42)
@@ -46,7 +47,7 @@ describe("Context API routes (plan Task 24)", () => {
   let deployment: Deployment
   let owner: LocalWriteContext
   let reader: RegistryReader
-  let store: ApiStore
+  let store: ObjectStore
   let app: ReturnType<typeof createContextApi>["app"]
   let vault: FakeVaultAuthority
   let aliceContextId: Hex
@@ -168,7 +169,7 @@ describe("Context API routes (plan Task 24)", () => {
 
     // The body-hash index pointing at another agent's envelope bytes is detected; a genuine re-PUT repairs it.
     const other = await publicClient.putAgentManifest(agents.W!.manifest)
-    store.setManifestIndex(agents.R!.manifestHash, other.envelopeHash)
+    await store.setManifestIndex(agents.R!.manifestHash, other.envelopeHash)
     await expect(publicClient.getAgentManifest(agents.R!.manifestHash)).rejects.toMatchObject({ code: "MANIFEST_HASH_MISMATCH" })
     expect(await publicClient.putAgentManifest(agents.R!.manifest)).toMatchObject({ bodyHash: agents.R!.manifestHash })
     expect(await publicClient.getAgentManifest(agents.R!.manifestHash)).toEqual(agents.R!.manifest)
@@ -180,13 +181,23 @@ describe("Context API routes (plan Task 24)", () => {
     await expect(clients.R!.putAgentManifest(forged)).rejects.toMatchObject({ code: "MANIFEST_SIGNATURE_INVALID" })
     expect(await clients.R!.getAgentManifest(agents.R!.manifestHash)).toEqual(agents.R!.manifest)
 
-    // While the agent is unresolvable on Monad the index is first-write-wins: a second write keeps its bytes in the
-    // blob store but cannot displace the existing entry.
+    // While the agent is unresolvable on Monad the index is first-write-wins, and the only identity the
+    // manifest names is the operator recovered from operatorSignature — so a staging write must be
+    // request-signed by that same key. A second operator's write is acknowledged but cannot displace
+    // the existing entry, and its bytes are not stored either — a blob no index row points at would be
+    // storage nothing counts and nothing ever deletes. The same manifest carried by any other key is
+    // denied outright.
     const prematureBody = { ...agents.R!.manifest.manifest, agentId: hexOf(randomBytes(32)) }
-    const first = await clients.R!.putAgentManifest({ manifest: prematureBody, operatorSignature: agents.R!.manifest.operatorSignature })
-    const second = await clients.R!.putAgentManifest({ manifest: prematureBody, operatorSignature: agents.W!.manifest.operatorSignature })
+    const binding = manifestBindingFor({ chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, body: prematureBody })
+    const envelopeFor = async (operator: LocalAccount) => ({ manifest: prematureBody, operatorSignature: await operator.signTypedData(binding as never) })
+    const operatorA = privateKeyToAccount(ANVIL_PRIVATE_KEYS[7]!)
+    const operatorB = privateKeyToAccount(ANVIL_PRIVATE_KEYS[8]!)
+    const first = await clientFor(operatorA).putAgentManifest(await envelopeFor(operatorA))
+    await expect(clientFor(operatorB).putAgentManifest(await envelopeFor(operatorA))).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
+    const second = await clientFor(operatorB).putAgentManifest(await envelopeFor(operatorB))
     expect(second.envelopeHash).not.toBe(first.envelopeHash)
-    expect(store.getManifestIndex(first.bodyHash)).toBe(first.envelopeHash)
+    expect(await store.getManifestIndex(first.bodyHash)).toMatchObject({ envelopeHash: first.envelopeHash })
+    await expect(store.blobs.get(second.envelopeHash)).rejects.toMatchObject({ code: "NOT_FOUND" })
   })
 
   it("serves anchored owner context to an authorized reader, who decrypts it with its own epoch wrap", async () => {

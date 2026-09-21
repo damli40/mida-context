@@ -1,0 +1,42 @@
+name = "mida-gas-sponsor"
+main = "src/worker.ts"
+compatibility_date = "2026-09-21"
+
+# nodejs_compat is required: @mida/chain re-exports its local-anvil tooling (packages/chain/src/
+# local.ts → node:child_process, node:fs, node:net) so the bundler sees node: imports even though
+# the Worker only reads GAS_CEILINGS and the ABIs and never executes those code paths. The flag
+# provides inert stubs only.
+compatibility_flags = ["nodejs_compat"]
+
+# No account id, database id, API key or policy id lives in this file.
+# Create the database with `wrangler d1 create mida-gas-sponsor` and paste the returned
+# database_id below, then apply schema.sql with `wrangler d1 execute`.
+[[d1_databases]]
+binding = "DB"
+database_name = "mida-gas-sponsor"
+database_id = "REPLACE_WITH_D1_DATABASE_ID" # placeholder — NOT a real id; do not commit one
+
+# Deployment configuration — every value the Worker needs comes from the environment.
+# Replace each placeholder for your network; these are NOT real values.
+[vars]
+CHAIN_ID = "REPLACE_WITH_CHAIN_ID"                     # e.g. "10143" for Monad testnet
+CAPABILITY_REGISTRY = "0xREPLACE_WITH_CAPABILITY_REGISTRY_ADDRESS"
+CONTEXT_REGISTRY = "0xREPLACE_WITH_CONTEXT_REGISTRY_ADDRESS"
+# Comma-separated EIP-7702 implementation addresses the sender may delegate to.
+# Pimlico's Simple-account implementation is unverified on Monad testnet — the probe of item 1
+# (scripts/sponsor-probe.mts) exists to confirm the address before it goes here.
+ALLOWED_IMPLEMENTATIONS = "0xREPLACE_WITH_IMPL_1,0xREPLACE_WITH_IMPL_2"
+# Provider selection: "pimlico" (default), "alchemy", or ignored when PROVIDER_URL is set.
+PROVIDER = "pimlico"
+PIMLICO_CHAIN_SLUG = "monad-testnet"
+# Daily sponsored-operation budgets; these are the defaults, override as needed.
+PER_SENDER_DAILY_LIMIT = "30"
+GLOBAL_DAILY_LIMIT = "2000"
+# ALCHEMY_BASE_URL is required only when PROVIDER = "alchemy".
+
+# Secrets — set with `wrangler secret put`, never commit them:
+#   PROVIDER_KEY   the provider API key (Pimlico or Alchemy)
+#   POLICY_ID      the sponsorship policy id configured on the provider's dashboard
+#   RPC_URL        a chain JSON-RPC endpoint (may itself carry a key) used to read a sender's
+#                  delegation when a user operation arrives without an eip7702Auth
+#   PROVIDER_URL   optional: full provider URL including the key, overrides PROVIDER/PROVIDER_KEY

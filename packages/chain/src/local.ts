@@ -10,7 +10,16 @@ import type { Deployment } from "./deployment.js"
 
 /** Development tooling for tests and the CLI. Never used against a real network. */
 export const FOUNDRY_BIN = process.env.FOUNDRY_BIN ?? `${homedir()}/.foundry/bin`
-export const CONTRACTS_DIR = fileURLToPath(new URL("../../../contracts/", import.meta.url))
+
+let contractsDir: string | undefined
+/**
+ * The contracts/ directory, resolved on first use and cached. It must stay lazy: this module is bundled
+ * into the store Worker, where `import.meta.url` is not a parseable URL — evaluating
+ * fileURLToPath(new URL(…)) at module scope would throw on startup. The Worker never calls this.
+ */
+export function CONTRACTS_DIR(): string {
+  return (contractsDir ??= fileURLToPath(new URL("../../../contracts/", import.meta.url)))
+}
 
 /** Anvil's public, pre-funded development keys (mnemonic "test test ... junk"). Never use on a real network. */
 export const ANVIL_PRIVATE_KEYS: readonly Hex[] = Object.freeze([
@@ -82,21 +91,20 @@ export async function startAnvil(options: { hardfork?: string } = {}): Promise<L
   }
 }
 
-const LOCK_DIR = `${CONTRACTS_DIR}deployments/.deploy-lock`
-
 /**
  * Deploys with contracts/script/Deploy.s.sol and returns the parsed deployment file. Every local Anvil writes the
  * same deployments/31337.json, so deployments from parallel test files are serialized with a directory lock.
  */
 export async function deployLocal(options: { rpcUrl: string; privateKey?: Hex }): Promise<Deployment> {
   const privateKey = options.privateKey ?? ANVIL_PRIVATE_KEYS[0]!
+  const lockDir = `${CONTRACTS_DIR()}deployments/.deploy-lock`
   const deadline = Date.now() + 120_000
   for (;;) {
     try {
-      mkdirSync(LOCK_DIR)
+      mkdirSync(lockDir)
       break
     } catch {
-      if (Date.now() > deadline) throw new Error(`deploy lock ${LOCK_DIR} held for 120s`)
+      if (Date.now() > deadline) throw new Error(`deploy lock ${lockDir} held for 120s`)
       await new Promise((resolve) => setTimeout(resolve, 200))
     }
   }
@@ -104,12 +112,12 @@ export async function deployLocal(options: { rpcUrl: string; privateKey?: Hex })
     const result = spawnSync(
       `${FOUNDRY_BIN}/forge`,
       ["script", "script/Deploy.s.sol", "--rpc-url", options.rpcUrl, "--broadcast", "--private-key", privateKey],
-      { cwd: CONTRACTS_DIR, encoding: "utf8", env: { ...process.env, VAULT_RP_ID: process.env.VAULT_RP_ID ?? "vault.mida.xyz" } },
+      { cwd: CONTRACTS_DIR(), encoding: "utf8", env: { ...process.env, VAULT_RP_ID: process.env.VAULT_RP_ID ?? "vault.mida.xyz" } },
     )
     if (result.status !== 0) throw new Error(`forge script failed:\n${result.stdout}\n${result.stderr}`)
     return loadDeployment(31337n)
   } finally {
-    rmdirSync(LOCK_DIR)
+    rmdirSync(lockDir)
   }
 }
 
