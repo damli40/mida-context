@@ -115,6 +115,28 @@ describe("checkUserOperation — eip7702Auth", () => {
     expect(await refused(validUserOp({ eip7702Auth: validAuth(), authorization: validAuth({ address: randomAddress() }) }))).toBe("auth")
   })
 
+  it("an `authorization` field alone never stands in for eip7702Auth — the bundler ignores it", async () => {
+    // Valid under the other name, but the sender runs whatever code it actually has on-chain:
+    // not delegated → refused; delegated to the allowed impl → payable.
+    const op = validUserOp({ eip7702Auth: undefined, authorization: validAuth() })
+    expect(await refused(op, { getCode: async () => "0x" })).toBe("auth")
+    expect(await checkUserOperation(op, policyEnv, delegated())).toBeNull()
+    // And a zero address under the other name confers no clearing privilege — the self-call is
+    // still just a non-Mida call.
+    const sender = randomAddress()
+    expect(
+      await refused(
+        validUserOp({
+          sender,
+          eip7702Auth: undefined,
+          authorization: validAuth({ address: ZERO }),
+          callData: executeCall(sender, 0n, "0x"),
+        }),
+        delegated(),
+      ),
+    ).toBe("target")
+  })
+
   it("with no authorization, the sender must already be delegated to an allowed implementation", async () => {
     const op = validUserOp({ eip7702Auth: undefined })
     expect(await checkUserOperation(op, policyEnv, delegated())).toBeNull()

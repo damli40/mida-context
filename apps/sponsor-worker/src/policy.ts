@@ -220,8 +220,10 @@ interface Authorization {
 }
 
 /**
- * Collect every authorization-shaped field. `eip7702Auth` is the wire name; `authorization` is
- * checked too so a client cannot smuggle a second, unchecked authorization past the policy.
+ * Collect every authorization-shaped field. `eip7702Auth` is the wire name the bundler acts on;
+ * `authorization` is a second name some tooling emits. Both are validated — a bad one under
+ * either name refuses — but only `eip7702Auth` counts as a real authorization below, because a
+ * field the provider ignores proves nothing about the code the sender will actually run.
  */
 function authorizations(op: Record<string, unknown>): Authorization[] {
   const auths: Authorization[] = []
@@ -282,8 +284,13 @@ export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: Cha
     // delegated on-chain to an allowed implementation.
     const auths = authorizations(uo)
     for (const auth of auths) checkAuthorization(auth, env)
-    const authZeroDelegation = auths.some((a) => isAddress(a.address) && (a.address as string).toLowerCase() === ZERO_ADDRESS)
-    if (auths.length === 0) {
+    // Only a real `eip7702Auth` stands in for the on-chain delegation read and only it confers
+    // the zero-address clearing privilege — it is the field the bundler applies. (The malformed
+    // case already refused inside `authorizations`, so a non-null value here is an object.)
+    const eipAuth = uo.eip7702Auth as Authorization | null | undefined
+    const authZeroDelegation =
+      eipAuth != null && isAddress(eipAuth.address) && (eipAuth.address as string).toLowerCase() === ZERO_ADDRESS
+    if (eipAuth === undefined || eipAuth === null) {
       let code: string
       try {
         code = await chain.getCode(sender)
