@@ -84,7 +84,9 @@ describe("readConversation", () => {
 
   it("first user message pinned, middle omitted with marker (G1)", () => {
     const dir = tmpdir()
-    const body = (tag: string) => `${tag} ` + "m".repeat(500)
+    // ~300 B per line keeps the file inside the one-shot read window — this
+    // case measures the maxChars budget, not file truncation.
+    const body = (tag: string) => `${tag} ` + "m".repeat(200)
     const lines = [
       JSON.stringify({ type: "user", message: { role: "user", content: body("FIRST-REQUEST") } }),
     ]
@@ -186,5 +188,109 @@ describe("readConversation", () => {
     expect(r.format).toBe("unknown-tail")
     expect(r.text).toContain("tail-content-marker")
     expect(r.messagesTotal).toBe(0)
+  })
+
+  // F3: a transcript bigger than the head+tail budgets is never read whole —
+  // the reader opens it once and touches at most 64 KiB + 60,000 bytes.
+  it("a 5 MB transcript is read only through bounded head and tail windows", () => {
+    const dir = tmpdir()
+    const lines = [
+      JSON.stringify({ type: "user", message: { role: "user", content: "FIRST-REQUEST build the thing" } }),
+    ]
+    let size = lines[0]!.length + 1
+    let i = 0
+    while (size < 5 * 1024 * 1024) {
+      const line = JSON.stringify({
+        type: "assistant",
+        message: { content: [{ type: "text", text: `middle-${i} ` + "m".repeat(1_500) }] },
+      })
+      lines.push(line)
+      size += line.length + 1
+      i += 1
+    }
+    lines.push(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "FINAL-TAIL end of session" }] } }))
+    const t = writeTranscript(dir, lines)
+
+    let bytesRead = 0
+    const readFilePaths: unknown[] = []
+    const origReadFileSync = fs.readFileSync
+    const origReadSync = fs.readSync
+    // @ts-expect-error deliberate measurement shim around the real reader
+    fs.readFileSync = (...args: Parameters<typeof fs.readFileSync>) => {
+      readFilePaths.push(args[0])
+      return origReadFileSync(...args)
+    }
+    // @ts-expect-error deliberate measurement shim around the real reader
+    fs.readSync = (...args: Parameters<typeof fs.readSync>) => {
+      const n = origReadSync(...args)
+      bytesRead += n
+      return n
+    }
+    let r: ReturnType<typeof readConversation>
+    try {
+      r = readConversation(t)
+    } finally {
+      fs.readFileSync = origReadFileSync
+      fs.readSync = origReadSync
+    }
+
+    expect(readFilePaths).not.toContain(t)
+    expect(bytesRead).toBeLessThanOrEqual(64 * 1024 + 60_000)
+    expect(r.format).toBe("claude-jsonl")
+    expect(r.firstUserMessage).toBe("FIRST-REQUEST build the thing")
+    expect(r.text).toContain("FIRST-REQUEST")
+    expect(r.text).toContain("FINAL-TAIL end of session")
+    // the unread middle is flagged, never silently dropped
+    expect(r.text).toContain("[… earlier messages omitted …]")
+    // tail lines keep their content but are numbered relative to the window
+    expect(r.text).toMatch(/L~\d+ assistant:\nFINAL-TAIL/)
+  })
+
+  it("a tail window that opens mid-line drops the partial line", () => {
+    const dir = tmpdir()
+    // One giant line straddles the tail window's start: the window opens
+    // inside it, so the partial first segment must be dropped, not parsed.
+    const giant = JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "PADMARKER " + "p".repeat(200_000) }] },
+    })
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "the request" } }),
+      giant,
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "CLOSING-LINE done" }] } }),
+    ])
+    const r = readConversation(t)
+    expect(r.format).toBe("claude-jsonl")
+    expect(r.firstUserMessage).toBe("the request")
+    expect(r.text).toContain("CLOSING-LINE done")
+    expect(r.text).not.toContain("PADMARKER")
+  })
+
+  it("a file inside the budgets is read once end to end — unchanged behaviour", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "small request" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "small reply" }] } }),
+    ])
+    let reads = 0
+    const origReadSync = fs.readSync
+    // @ts-expect-error deliberate measurement shim around the real reader
+    fs.readSync = (...args: Parameters<typeof fs.readSync>) => {
+      reads += 1
+      return origReadSync(...args)
+    }
+    let r: ReturnType<typeof readConversation>
+    try {
+      r = readConversation(t)
+    } finally {
+      fs.readSync = origReadSync
+    }
+    expect(reads).toBe(1)
+    expect(r.format).toBe("claude-jsonl")
+    expect(r.messagesTotal).toBe(2)
+    expect(r.firstUserMessage).toBe("small request")
+    expect(r.text).toContain("L1 user:")
+    expect(r.text).toContain("L2 assistant:")
+    expect(r.text).not.toContain("omitted")
   })
 })

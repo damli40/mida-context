@@ -18,20 +18,31 @@
 //
 // Rendering: each kept message becomes one block headed "L<n> <role>:" where
 // <n> is the real 1-based line number in the file, so the extractor can cite
-// evidence as transcript:L<n>. Secrets are scrubbed on the DECODED text of
-// every rendered part (this replaces the raw-line scrubTranscript call for
-// this format).
+// evidence as transcript:L<n>. In a truncated file the tail lines' absolute
+// numbers are unknowable without reading the middle, so they are headed
+// "L~<n> <role>:" — <n> counts the tail window's lines, flagging the number
+// as relative rather than a file line number. Secrets are scrubbed on the
+// DECODED text of every rendered part (this replaces the raw-line
+// scrubTranscript call for this format).
 //
 // The result also carries firstUserMessage: the first `user` line whose
 // content is a plain string or has a `text` part (a bare `tool_result` does
 // not count — resumed sessions open with tool output, not the request). It
 // is scrubbed and hard-capped at 6,000 chars *including* the ellipsis, so it
 // always fits the schema's originalRequest cap. unknown-tail → null.
+//
+// Reads are bounded: the file is opened once and never loaded whole. A
+// transcript no bigger than HEAD_BYTES + TAIL_BYTES is read in one shot —
+// byte-for-byte the old behaviour. A bigger one gets the first HEAD_BYTES
+// (the original request lives at the top) and the last TAIL_BYTES (the
+// newest messages live at the bottom), and the middle is never touched:
+// messagesTotal and cwds then count only the lines that were read.
 
 import fs from "node:fs"
 import { scrubSecrets, scrubTranscript, scrubValue } from "./scrub.js"
 
-const TAIL_BYTES = 60_000 // fallback tail size for unknown formats
+const HEAD_BYTES = 64 * 1024 // bounded head — the first user message lives at the top
+const TAIL_BYTES = 60_000 // tail window — the newest messages live at the bottom
 const THINKING_CHARS = 1_000
 const PART_CHARS = 600
 const FIRST_USER_CHARS = 6_000
@@ -105,9 +116,10 @@ function toolResultText(content: unknown): string {
   return ""
 }
 
-// Render one user/assistant line as "L<lineNo> <role>:\n<parts>".
-// Returns null when the message renders to nothing (empty content).
-function renderMessage(lineNo: number, obj: TranscriptLine): string | null {
+// Render one user/assistant line as "L<label> <role>:\n<parts>" — the label
+// is the real line number, or "~<n>" for a tail line whose absolute number is
+// unknowable. Returns null when the message renders to nothing (empty content).
+function renderMessage(label: string, obj: TranscriptLine): string | null {
   const content = obj.message?.content
   const parts: string[] = []
   if (typeof content === "string") {
@@ -139,7 +151,32 @@ function renderMessage(lineNo: number, obj: TranscriptLine): string | null {
     .filter((p) => p.length)
     .join("\n")
   if (!body) return null
-  return `L${lineNo} ${obj.type}:\n${body}`
+  return `L${label} ${obj.type}:\n${body}`
+}
+
+/**
+ * One open descriptor, at most HEAD_BYTES + TAIL_BYTES read: the whole file when it fits,
+ * else {head: first HEAD_BYTES, tail: last TAIL_BYTES} — the middle stays on disk.
+ */
+function readWindows(path: string): { head: Buffer; tail: Buffer | null } {
+  const fd = fs.openSync(path, "r")
+  try {
+    const size = fs.fstatSync(fd).size
+    const read = (position: number, length: number): Buffer => {
+      const buf = Buffer.alloc(length)
+      let got = 0
+      while (got < length) {
+        const n = fs.readSync(fd, buf, got, length - got, position + got)
+        if (n === 0) break // the file shrank between stat and read
+        got += n
+      }
+      return buf.subarray(0, got)
+    }
+    if (size <= HEAD_BYTES + TAIL_BYTES) return { head: read(0, size), tail: null }
+    return { head: read(0, HEAD_BYTES), tail: read(size - TAIL_BYTES, TAIL_BYTES) }
+  } finally {
+    fs.closeSync(fd)
+  }
 }
 
 export function readConversation(
@@ -147,40 +184,59 @@ export function readConversation(
   options: { maxChars?: number } = {},
 ): Conversation {
   const { maxChars = 40_000 } = options
-  const buf = fs.readFileSync(transcriptPath)
-  const raw = buf.toString("utf8")
 
-  // messagesTotal counts every user/assistant line (even ones that render
-  // empty); msgs holds only those that produced a rendered block.
+  // Bounded reads from one descriptor: a file that fits inside head+tail is
+  // read once end to end; anything bigger gets only its head and tail windows.
+  const { head: headWindow, tail: tailWindow } = readWindows(transcriptPath)
+  const truncated = tailWindow !== null
+
+  // One (label, text) pair per line. Head lines keep their real 1-based
+  // numbers; tail lines are labelled "~n" — the line's place inside the tail
+  // window, since its absolute number is unknowable without the middle.
+  const lines: { label: string; text: string }[] = []
+  if (!truncated) {
+    headWindow.toString("utf8").split("\n").forEach((line, idx) => lines.push({ label: String(idx + 1), text: line }))
+  } else {
+    const headLines = headWindow.toString("utf8").split("\n")
+    // a last segment without its terminator is a partial line — its rest sits in the unread middle
+    if (headWindow.length > 0 && headWindow[headWindow.length - 1] !== 10) headLines.pop()
+    headLines.forEach((line, idx) => lines.push({ label: String(idx + 1), text: line }))
+    const tailLines = tailWindow.toString("utf8").split("\n")
+    tailLines.shift() // the first segment began before the window — a partial line
+    tailLines.forEach((line, idx) => lines.push({ label: `~${idx + 1}`, text: line }))
+  }
+
+  // messagesTotal counts every user/assistant line read (even ones that
+  // render empty); msgs holds only those that produced a rendered block.
   const msgs: { role: string; block: string }[] = []
   const cwds: string[] = []
   let messagesTotal = 0
   let firstUserMessage: string | null = null
-  raw.split("\n").forEach((line, idx) => {
-    if (!line.trim()) return
+  for (const { label, text: line } of lines) {
+    if (!line.trim()) continue
     let obj: TranscriptLine
     try {
       obj = JSON.parse(line)
     } catch {
-      return // truncated or non-JSON line — skip
+      continue // truncated or non-JSON line — skip
     }
     const folder = obj?.cwd
     if (typeof folder === "string" && folder !== "" && !cwds.includes(folder)) cwds.push(folder)
-    if (obj?.type !== "user" && obj?.type !== "assistant") return
+    if (obj?.type !== "user" && obj?.type !== "assistant") continue
     messagesTotal++
     if (firstUserMessage === null && obj.type === "user") {
       const t = userRequestText(obj.message?.content)
       if (t) firstUserMessage = hardCut(scrubSecrets(t), FIRST_USER_CHARS)
     }
-    const block = renderMessage(idx + 1, obj)
+    const block = renderMessage(label, obj)
     if (block) msgs.push({ role: obj.type, block })
-  })
+  }
 
   if (messagesTotal === 0) {
-    const tail = buf.subarray(Math.max(0, buf.length - TAIL_BYTES)).toString("utf8")
+    const tailText = (tailWindow ?? headWindow.subarray(Math.max(0, headWindow.length - TAIL_BYTES))).toString("utf8")
     return {
       format: "unknown-tail",
-      text: scrubTranscript(tail),
+      text: scrubTranscript(tailText),
       firstUserMessage: null,
       cwds,
       messagesKept: 0,
@@ -208,11 +264,14 @@ export function readConversation(
     keptTail.unshift(rest[i]!)
     used += cost
   }
+  // When the middle was never read the true omitted count is unknowable —
+  // count only the lines that were read but did not fit, and say so.
   const omitted = rest.length - keptTail.length
 
   const blocks: string[] = []
   if (head) blocks.push(head)
-  if (omitted) blocks.push(`[… ${omitted} earlier messages omitted …]`)
+  if (truncated) blocks.push(`[… earlier messages omitted …]`)
+  else if (omitted) blocks.push(`[… ${omitted} earlier messages omitted …]`)
   for (const m of keptTail) blocks.push(m.block)
 
   return {
