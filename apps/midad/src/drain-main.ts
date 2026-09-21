@@ -1,7 +1,7 @@
 import { parseDeployment } from "@mida/chain"
 import { compileCheckpoint } from "@mida/compiler"
 import { drainUntilSettled } from "./drain.js"
-import { MidaHome } from "./home.js"
+import { resolveHome } from "./home.js"
 import { appendLog } from "./log.js"
 import { ServiceRuntime } from "./runtime.js"
 import type { Network } from "./runtime.js"
@@ -15,7 +15,7 @@ import type { Network } from "./runtime.js"
  * records a `lock-timeout`.
  */
 async function main(): Promise<void> {
-  const home = new MidaHome(process.env.MIDA_HOME)
+  const home = resolveHome(process.env)
   const open = async (): Promise<ServiceRuntime> => {
     const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown }>("network.json")
     if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) {

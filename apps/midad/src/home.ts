@@ -6,6 +6,22 @@ import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { randomBytes } from "node:crypto"
 
+/**
+ * The one way every entry point finds the home folder (R4-7). `MIDA_HOME` unset means the
+ * default `~/.mida`; set, it must be an absolute path — an empty string or a relative path
+ * would resolve against a different working directory in the CLI, the daemon and the hooks,
+ * which is exactly how `init` and the daemon once disagreed about where the home was. A bad
+ * value is refused with a plain message, never silently pointed somewhere else.
+ */
+export function resolveHome(env: { MIDA_HOME?: string | undefined } = process.env): MidaHome {
+  const root = env.MIDA_HOME
+  if (root === undefined) return new MidaHome()
+  if (root === "" || !isAbsolute(root)) {
+    throw new Error("MIDA_HOME must be an absolute path (or unset for the default ~/.mida)")
+  }
+  return new MidaHome(root)
+}
+
 /** One folder that holds everything Mida keeps on this machine. Secrets in it are readable by the user only. */
 export class MidaHome {
   readonly root: string

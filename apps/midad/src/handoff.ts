@@ -1,7 +1,7 @@
 import { isAbsolute } from "node:path"
 import { isMidaError } from "@mida/protocol"
 import { mergeCheckpoints, renderHandoff } from "@mida/checkpoint"
-import { loadAgentIdentity, loadGrants } from "./keys.js"
+import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { checkProject } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { isSafeName } from "./queue.js"
@@ -31,6 +31,13 @@ export interface HandoffDeps {
   read?: typeof readCheckpoints
   /** The owner-fact read; defaults to readOwnerFacts. A failure here degrades, never refuses. */
   readFacts?: typeof readOwnerFacts
+  /**
+   * "The owner revoked this agent" — the marker `mida revoke` writes into the home. Consulted
+   * when the project check answers not-approved: the revoked agent's list row is gone by then,
+   * so the check alone cannot tell "never approved" from "revoked" (R4-3). Defaults to the
+   * real file; tests inject it.
+   */
+  isRevoked?: (agent: string) => boolean
   now?: () => number
 }
 
@@ -109,6 +116,16 @@ export async function buildHandoff(
       if (check.reason === "list-unreadable") return refused("list-unreadable", UNREADABLE_TEXT)
       // a failed check names no cause the owner could act on — the generic line, not a guess
       if (check.reason === "check-failed") return refused("check-failed", noContextText("check-failed"))
+      // A revoked agent's project row is gone, so the project check answers not-approved first —
+      // the marker `mida revoke` left behind says why access really ended (R4-3). A marker that
+      // cannot be read leaves the not-approved answer standing, never a crash.
+      if (check.reason === "not-approved") {
+        try {
+          if ((deps.isRevoked ?? ((name) => isRevoked(runtime.home, name)))(agent)) {
+            return refused("revoked", revokedText(agent))
+          }
+        } catch { /* fall through to not-approved */ }
+      }
       return refused(check.reason, notApprovedText(agent))
     }
     const state = await (deps.capability ?? capabilityState)(runtime, agent)
@@ -134,8 +151,13 @@ export async function buildHandoff(
     const slow = new Promise<ReadOutcome | FactOutcome>((resolve) => {
       timer = setTimeout(() => resolve({ status: "slow" }), limitMs)
     })
-    const outcome = (await Promise.race([settled, slow])) as ReadOutcome
-    const factOutcome = (await Promise.race([factSettled, slow])) as FactOutcome
+    // The two reads are independent and run concurrently (R4-2): each is raced against the one
+    // shared deadline, so the facts read gets the checkpoint read's leftover time, not a fresh
+    // budget — and its slow/failed outcome still degrades inside the handoff.
+    const [outcome, factOutcome] = await Promise.all([
+      Promise.race([settled, slow]) as Promise<ReadOutcome>,
+      Promise.race([factSettled, slow]) as Promise<FactOutcome>,
+    ])
     clearTimeout(timer)
     const readMs = now() - readStarted
 

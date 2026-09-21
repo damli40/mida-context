@@ -1,7 +1,7 @@
-export { MidaHome } from "./home.js"
+export { MidaHome, resolveHome } from "./home.js"
 export { FileAccessRequestStore } from "./request-store.js"
 export * from "./keys.js"
-export { Runtime, ServiceRuntime, AGENT_PERMISSIONS, MIN_BALANCE_WEI, NAMESPACE, PURPOSE_ID } from "./runtime.js"
+export { Runtime, ServiceRuntime, AGENT_PERMISSIONS, MIN_BALANCE_WEI, NAMESPACE, PURPOSE_ID, formatMon, makeOwnerBalanceGuard } from "./runtime.js"
 export type { Network } from "./runtime.js"
 export { startPersistentApi } from "./api-server.js"
 export {
@@ -12,6 +12,7 @@ export {
   readCheckpoints,
   revoke,
   repairReaderWraps,
+  historyCursor,
   isCapabilityLive,
   authorNamesFor,
   expectedScopesFor,
@@ -20,7 +21,7 @@ export {
 export { attemptNamespaceRead, readOwnerFacts, remember, FACT_NAMESPACES, MAX_FACTS } from "./remember.js"
 export type { OwnerFact, RememberResult } from "./remember.js"
 export * from "./checkpoint-payload.js"
-export { CLI_COMMANDS, NEEDS_TERMINAL_LINE, OWNER_COMMANDS, USAGE, ownerOnlyLine, runCli, runCliWithRuntime, validCliArgv } from "./cli.js"
+export { CLI_COMMANDS, NEEDS_TERMINAL_LINE, OWNER_COMMANDS, USAGE, ownerOnlyLine, ownerRefusalLine, runCli, runCliWithRuntime, validCliArgv } from "./cli.js"
 export type { CliDeps } from "./cli.js"
 export * from "./queue.js"
 export { approveProject, approvalsFileStatus, checkProject, ensureProjectMarker, removeAgentApprovals } from "./projects.js"

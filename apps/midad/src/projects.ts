@@ -113,8 +113,9 @@ async function signEntries(runtime: Runtime, entries: readonly ProjectApproval[]
   return account.signMessage({ message: canonicalEntries(entries) })
 }
 
-// Two writers in one process (e.g. two /cli calls on the daemon) read-modify-write the same file;
-// serialising the critical section keeps a lost update from silently dropping a row.
+// Owner commands run in one `mida` process, and a single command can write the list more than
+// once (the grant, then the project row; a revoke, then a re-approve). read-modify-write is
+// serialised so a lost update can never silently drop a row.
 let listWrites: Promise<unknown> = Promise.resolve()
 
 function serializeListWrite<T>(write: () => Promise<T>): Promise<T> {

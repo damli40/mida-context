@@ -1,6 +1,7 @@
-import { existsSync, mkdtempSync, readFileSync } from "node:fs"
+import { accessSync, constants, existsSync, mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { delimiter, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
 import { createPublicClient, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
@@ -109,6 +110,32 @@ function ownerAddressOf(home: MidaHome): Address | "missing" {
 
 const NEEDS_NETWORK = `needs network.json — ${INIT_FIX}`
 const NEEDS_OWNER = `needs the owner key — ${INIT_FIX}`
+/**
+ * The repo's own `bin/` — the fix text for a missing hook command names it, because until the
+ * npm package exists the launchers live here and nowhere else.
+ */
+const BIN_DIR = fileURLToPath(new URL("../../../bin/", import.meta.url))
+/** The commands `mida install` writes into the tools' hook settings — bare text on purpose. */
+const HOOK_COMMANDS = ["mida-hook", "mida-inject"] as const
+
+/**
+ * Is `command` runnable on the PATH the doctor itself runs with? The PATH is walked directly —
+ * spawning a shell to ask would answer for a DIFFERENT environment than the hooks get.
+ */
+function onPath(env: NodeJS.ProcessEnv, command: string): boolean {
+  const pathEnv = env.PATH
+  if (pathEnv === undefined || pathEnv === "") return false
+  for (const dir of pathEnv.split(delimiter)) {
+    if (dir === "") continue
+    try {
+      accessSync(join(dir, command), constants.X_OK)
+      return true
+    } catch {
+      // not here — keep walking
+    }
+  }
+  return false
+}
 
 /** One line per check, in the order the spec fixes. Each returns its lines; it never decides. */
 function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): Promise<string[]> }[] {
@@ -217,10 +244,26 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       },
     },
     {
+      name: "hook-commands",
+      run: async () => {
+        // `install` writes the bare command name into the tools' settings (Codex fingerprints
+        // the text) — so nothing works unless that name resolves on the PATH the hooks get (R4-6).
+        const env = deps.env ?? process.env
+        return HOOK_COMMANDS.map((command) =>
+          onPath(env, command)
+            ? `ok: ${command} is on the PATH`
+            : problem(`the command \`${command}\` is not on your PATH, so the hooks cannot run`, `add ${BIN_DIR} to your PATH`),
+        )
+      },
+    },
+    {
       name: "hooks",
       run: async () => {
         const lines: string[] = []
-        const claudePath = deps.settings?.["claude-code"]
+        // MIDA_CLAUDE_SETTINGS / MIDA_CODEX_CONFIG let a run that uses throwaway settings files
+        // point the check at them — without it the check would report two false problems (R4-6).
+        const env = deps.env ?? process.env
+        const claudePath = deps.settings?.["claude-code"] ?? env.MIDA_CLAUDE_SETTINGS
         if (claudePath !== undefined) {
           const status = claudeHooksStatus(claudePath)
           lines.push(
@@ -231,7 +274,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
                 : problem("claude-code hooks are not installed", "run `mida install claude-code`"),
           )
         }
-        const codexPath = deps.settings?.codex
+        const codexPath = deps.settings?.codex ?? env.MIDA_CODEX_CONFIG
         if (codexPath !== undefined) {
           const status = codexHooksStatus(codexPath)
           lines.push(

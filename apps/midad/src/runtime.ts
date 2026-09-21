@@ -1,7 +1,7 @@
 import { createPublicClient, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import type { LocalAccount } from "viem"
-import { PERMISSION } from "@mida/protocol"
+import { MidaError, PERMISSION } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
 import { bytesOf } from "@mida/crypto"
 import { chainFor, createWriteContext } from "@mida/chain"
@@ -19,7 +19,12 @@ import { startPersistentApi } from "./api-server.js"
 export interface Network {
   rpcUrl: string
   deployment: Deployment
-  fund(address: Address): Promise<void>
+  /**
+   * Tops an account up — exists on the networks that have a funder (local Anvil, Monad
+   * testnet). Absent elsewhere: a low owner wallet then fails with OWNER_WALLET_LOW instead
+   * of a bare transaction error (R4-4).
+   */
+  fund?(address: Address): Promise<void>
   /** When set, the Context API lives at this URL (a remote store, M3) and no local server is started. */
   storageUrl?: string
 }
@@ -104,6 +109,13 @@ function apiClient(baseUrl: string, deployment: Deployment, account: LocalAccoun
   return new ContextApiClient({ baseUrl, account, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry })
 }
 
+/** A coded refusal — an agent-facing command that hits this must never print a bare `ERROR`. */
+function agentNotSetup(name: string): Error {
+  const error = new Error(`agent "${name}" is not set up on this machine; run init first`) as Error & { code: string }
+  error.code = "agent-not-setup"
+  return error
+}
+
 /** Builds an agent from its saved identity and the grants it completed so far. */
 function buildAgent(home: MidaHome, network: Network, apiBaseUrl: string, identity: AgentIdentity): MidaAgent {
   const signer = privateKeyToAccount(identity.signerPrivateKey)
@@ -144,6 +156,12 @@ async function daemonApiBaseUrl(home: MidaHome): Promise<string | undefined> {
 export class ServiceRuntime {
   readonly #close: () => Promise<void>
   readonly reader: RegistryReader
+  /**
+   * One plain line to the owner while a slow step runs — the `mida` command sets it to STDERR;
+   * every other entry point (daemon, drainer, hooks, tests) leaves it unset and the library
+   * stays silent. It never carries a key, a seed, a signature or a full hex value.
+   */
+  progress?: (line: string) => void
 
   protected constructor(
     readonly home: MidaHome,
@@ -200,7 +218,7 @@ export class ServiceRuntime {
    */
   agent(name: string): MidaAgent {
     const identity = loadAgentIdentity(this.home, name)
-    if (identity === undefined) throw new Error(`agent "${name}" is not set up on this machine; run init first`)
+    if (identity === undefined) throw agentNotSetup(name)
     return buildAgent(this.home, this.network, this.apiBaseUrl, identity)
   }
 
@@ -300,6 +318,13 @@ export class Runtime extends ServiceRuntime {
         await server?.close()
         if (locked) home.remove(LOCK_FILE)
       })
+      // R4-4: every owner send checks the wallet can pay before it goes out. The closure reads
+      // runtime.progress at send time so the CLI can attach its line after open.
+      ownerChain.beforeSend = makeOwnerBalanceGuard({
+        chain: ownerChain,
+        fund: network.fund,
+        progress: (line) => runtime.progress?.(line),
+      })
       for (const name of listAgentNames(home)) runtime.attach(loadAgentIdentity(home, name)!)
       return runtime
     } catch (error) {
@@ -318,12 +343,61 @@ export class Runtime extends ServiceRuntime {
 
   override agent(name: string): MidaAgent {
     const agent = this.#agents.get(name)
-    if (agent === undefined) throw new Error(`agent "${name}" is not set up on this machine; run init first`)
+    if (agent === undefined) throw agentNotSetup(name)
     return agent
   }
 
-  async ensureFunded(address: Address): Promise<void> {
+  async ensureFunded(address: Address, label?: string): Promise<void> {
     const balance = await this.ownerChain.publicClient.getBalance({ address })
-    if (balance < MIN_BALANCE_WEI) await this.network.fund(address)
+    if (balance >= MIN_BALANCE_WEI) return
+    // No funder on this network: a wallet we cannot top up fails its first send with an opaque
+    // node error later — refuse now with the balance, the need and the shortfall named (R4-4).
+    if (this.network.fund === undefined) {
+      const whose = label ?? "the wallet"
+      throw new MidaError(
+        "OWNER_WALLET_LOW",
+        `${whose} holds ${formatMon(balance)} MON and needs ${formatMon(MIN_BALANCE_WEI)} MON to start — ${formatMon(MIN_BALANCE_WEI - balance)} MON short`,
+      )
+    }
+    if (label !== undefined) this.progress?.(`topping up ${label}…`)
+    await this.network.fund(address)
+  }
+}
+
+/** A wei amount printed as MON to four decimal places, truncated — never rounded up past the truth. */
+export function formatMon(wei: bigint): string {
+  const whole = wei / 1_000_000_000_000_000_000n
+  const frac = (wei % 1_000_000_000_000_000_000n) / 100_000_000_000_000n
+  return `${whole}.${frac.toString().padStart(4, "0")}`
+}
+
+/**
+ * The pre-send check wired onto the owner's write context (R4-4). Before a transaction goes
+ * out it compares the wallet's balance with the estimated cost (gas limit × the node's current
+ * gas price). On a network with a funder the wallet is topped up and the send continues;
+ * without one the send is refused with OWNER_WALLET_LOW naming the balance, the cost and the
+ * shortfall — never an opaque "insufficient funds" from deep inside the send.
+ */
+export function makeOwnerBalanceGuard(input: {
+  chain: LocalWriteContext
+  fund?: (address: Address) => Promise<void>
+  progress?: (line: string) => void
+}): (cost: { payer: Address; gasLimit: bigint }) => Promise<void> {
+  const payer = input.chain.account.address
+  return async ({ gasLimit }) => {
+    const [balance, gasPrice] = await Promise.all([
+      input.chain.publicClient.getBalance({ address: payer }),
+      input.chain.publicClient.getGasPrice(),
+    ])
+    const cost = gasLimit * gasPrice
+    if (balance >= cost) return
+    if (input.fund === undefined) {
+      throw new MidaError(
+        "OWNER_WALLET_LOW",
+        `your wallet holds ${formatMon(balance)} MON but this transaction needs ${formatMon(cost)} MON — ${formatMon(cost - balance)} MON short`,
+      )
+    }
+    input.progress?.("topping up your wallet…")
+    await input.fund(payer)
   }
 }

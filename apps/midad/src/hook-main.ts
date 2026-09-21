@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
-import { MidaHome } from "./home.js"
+import { resolveHome } from "./home.js"
 import { drainerEnv, extractHookFields, runHook } from "./hook.js"
 import { appendLog } from "./log.js"
 
@@ -27,7 +27,7 @@ async function readStdin(cap: number): Promise<{ text: string; oversized: boolea
 }
 
 async function main(): Promise<void> {
-  const home = new MidaHome(process.env.MIDA_HOME)
+  const home = resolveHome(process.env)
   const agent = process.argv[2] ?? "unknown"
   const { text, oversized } = await readStdin(STDIN_CAP_BYTES)
   let stdin = text

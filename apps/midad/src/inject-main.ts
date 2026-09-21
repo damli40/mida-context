@@ -2,7 +2,7 @@ import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { callDaemon, ensureDaemon } from "./control.js"
 import { noContextText } from "./handoff.js"
-import { MidaHome } from "./home.js"
+import { resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { isSafeName } from "./queue.js"
 
@@ -59,7 +59,7 @@ function spawnDaemon(): void {
 async function main(): Promise<void> {
   // an EPIPE on stdout must not become an unhandled stream error — stdout is best-effort
   process.stdout.on("error", () => {})
-  const home = new MidaHome(process.env.MIDA_HOME)
+  const home = resolveHome(process.env)
   const agent = process.argv[2]
   const { text, oversized } = await readStdin(STDIN_CAP_BYTES)
   if (!isSafeName(agent)) {

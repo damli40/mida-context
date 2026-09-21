@@ -68,9 +68,11 @@ export async function remember(
   // A namespace the owner has never opened gets epoch 1 here (an M1 home only opened
   // projects.current); every agent that already holds READ then needs its reader wrap.
   if ((await reader.epochPublicKey(owner, nsId, 1n)) == null) {
+    runtime.progress?.(`opening the ${namespace} context area…`)
     await vault.initializeNamespace(namespace)
     await repairFactWraps(runtime, nsId)
   }
+  runtime.progress?.("writing your fact (about 5 seconds)…")
   const written = await vault.createOwnerContext({
     namespace,
     payload: {
@@ -90,6 +92,7 @@ export async function remember(
  */
 async function repairFactWraps(runtime: Runtime, nsId: Hex): Promise<void> {
   const { vault, reader, owner, home } = runtime
+  const targets: Hex[] = []
   for (const name of listAgentNames(home)) {
     let identity: ReturnType<typeof loadAgentIdentity>
     try {
@@ -98,8 +101,13 @@ async function repairFactWraps(runtime: Runtime, nsId: Hex): Promise<void> {
       continue
     }
     if (identity === undefined) continue
-    if (!(await reader.hasAuthority(owner, identity.agentId, nsId, PERMISSION.READ, 0))) continue
-    await vault.publishReaderWraps({ agentId: identity.agentId, namespaceId: nsId })
+    if (await reader.hasAuthority(owner, identity.agentId, nsId, PERMISSION.READ, 0)) targets.push(identity.agentId)
+  }
+  if (targets.length > 0) {
+    runtime.progress?.(`sending the new key to ${targets.length} agent${targets.length === 1 ? "" : "s"}…`)
+  }
+  for (const agentId of targets) {
+    await vault.publishReaderWraps({ agentId, namespaceId: nsId })
   }
 }
 

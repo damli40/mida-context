@@ -17,7 +17,7 @@ import { CheckpointPayloadError, eventIdFor, unwrapCheckpoint, wrapCheckpoint } 
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import type { MidaHome } from "./home.js"
 import { FLUSH_EVENTS, transcriptPathAllowed } from "./hook.js"
-import { loadAgentIdentity, loadGrants } from "./keys.js"
+import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { appendLog } from "./log.js"
 import { checkProject as checkProjectAgainstList } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
@@ -54,6 +54,7 @@ const PERMANENT_FAILURES = new Set([
   "unknown-transcript-format",
   "not-a-project",
   "not-approved",
+  "revoked",
   "list-tampered",
   "list-unreadable",
   "folder-mismatch",
@@ -261,7 +262,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         const project = await checkProject({ agent: job.agent, cwd: job.cwd })
         if (!project.ok) {
           removeJob(deps.home, job.id)
-          log({ sessionId, outcome: "removed", reason: project.reason })
+          log({ sessionId, outcome: "removed", reason: removalReason(deps.home, job.agent, project.reason) })
           continue
         }
         const projectId = project.approval.projectId
@@ -305,7 +306,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         if (!(await checkApproved(job.agent))) {
           for (const other of listJobs(deps.home)) if (other.agent === job.agent) removeJob(deps.home, other.id)
           writeState(deps.home, sessionId, terminal)
-          log({ sessionId, outcome: "removed", reason: "not-approved" })
+          log({ sessionId, outcome: "removed", reason: removalReason(deps.home, job.agent, "not-approved") })
           continue
         }
         const attempts = state?.attempts ?? 0
@@ -405,7 +406,8 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         // field names are safe to log; values, validator messages and error.message are not
         const fields = error instanceof CheckpointPayloadError && error.fields !== undefined ? { fields: error.fields } : {}
         if (PERMANENT_FAILURES.has(code)) {
-          if (code === "not-approved") {
+          if (code === "not-approved" || code === "revoked") {
+            // every queued job for this agent fails the same way — remove them all, like not-approved
             for (const other of listJobs(deps.home)) if (other.agent === job.agent) removeJob(deps.home, other.id)
           } else {
             moveToBad(deps.home, `${job.id}.json`)
@@ -444,6 +446,20 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
   return counts
 }
 
+/**
+ * The reason a job-removal logs. "not-approved" from either gate hides the real cause for an
+ * agent the owner revoked: its project-list row and its live capabilities are gone by then, so
+ * both gates answer not-approved. The marker `mida revoke` wrote is the tell (R4-3).
+ */
+function removalReason(home: MidaHome, agent: string, reason: string): string {
+  if (reason !== "not-approved") return reason
+  try {
+    return isRevoked(home, agent) ? "revoked" : "not-approved"
+  } catch {
+    return "not-approved"
+  }
+}
+
 /** A transient failure raised inside the drain pass, carrying the stable code the log uses. */
 class DrainFailure extends Error {
   constructor(readonly code: "model-failed" | "no-json") {
@@ -456,10 +472,9 @@ class DrainFailure extends Error {
 function failureCode(error: unknown): string {
   if (error instanceof DrainFailure) return error.code
   if (error instanceof CheckpointPayloadError) return error.code
-  if (
-    isMidaError(error, "CAPABILITY_DENIED") || isMidaError(error, "CAPABILITY_EXPIRED") ||
-    isMidaError(error, "CAPABILITY_REVOKED")
-  ) return "not-approved"
+  // the chain's own "revoked" stays distinct from "not approved" — the cause is different (R4-3)
+  if (isMidaError(error, "CAPABILITY_REVOKED")) return "revoked"
+  if (isMidaError(error, "CAPABILITY_DENIED") || isMidaError(error, "CAPABILITY_EXPIRED")) return "not-approved"
   // a refused send is transient: the ceiling may pass on retry after the queue settles or the
   // estimate changes — the job stays and the usual backoff applies (R3-1)
   if (isMidaError(error, "GAS_CEILING_EXCEEDED")) return "gas-ceiling"

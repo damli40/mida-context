@@ -4,10 +4,11 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createInterface } from "node:readline"
 import { decodeUint64, namespaceById } from "@mida/protocol"
+import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { permissionNames } from "@mida/grant-advisor"
 import { callDaemon, ensureDaemon } from "./control.js"
 import { runDoctor, runDoctorLive } from "./doctor.js"
-import { MidaHome } from "./home.js"
+import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeCode, uninstallCodex } from "./install.js"
 import type { InstallTool } from "./install.js"
@@ -53,6 +54,19 @@ export interface CliDeps {
    * running cannot be kicked, and a failed kick never fails the command. Injectable in tests.
    */
   kickDaemon?: () => unknown | Promise<unknown>
+  /**
+   * One plain line before each slow step — registering keys, opening namespaces, sending
+   * transactions, republishing reader wraps. The default writes the line to STDERR, so nothing
+   * printed to stdout changes shape. A line is always present tense and never carries a key, a
+   * seed, a signature or a full 64-hex value. Tests inject a collector.
+   */
+  progress?: (line: string) => void
+  /**
+   * Drops whatever is already buffered on stdin — a paste typed while the command ran must not
+   * be consumed as the answer to `Type yes to approve:`. Called right before the ask is printed;
+   * it drains without blocking. The default drains the real stdin; tests inject a spy.
+   */
+  drainInput?: () => unknown | Promise<unknown>
   /**
    * Reads the one line `approve` waits on. The default asks the real terminal; tests inject an
    * answer. There is no flag, file or environment variable that skips the question.
@@ -148,9 +162,13 @@ export async function runCliWithRuntime(
     }
     return 0
   } catch (error) {
-    // The error code only. A message from a deeper layer is never echoed: it could carry data.
+    // The error code only — plus the one plain-English line a code can honestly name.
     const code = (error as { code?: unknown }).code
-    print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
+    if (code === "already-approved") {
+      print(`${agent} is already approved. To let it use THIS folder too, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`)
+    } else {
+      print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
+    }
     return 1
   }
 }
@@ -181,6 +199,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       return result.kind === "remembered" ? 0 : 1
     } else if (command === "approve") {
       const prompt = deps.prompt ?? terminalPrompt
+      const drain = deps.drainInput ?? drainBufferedStdin
       const result = await approve(runtime, agent, deps.cwd, async (preview) => {
         if (preview.kind === "project") {
           deps.print(`${preview.agent} already holds a live grant; this lists it for project ${preview.projectId}`)
@@ -196,6 +215,9 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
           deps.print(`grant advisor: ${preview.advice.risk} risk; recommends ${preview.advice.recommended.length} scope(s) until ${new Date(Number(decodeUint64(preview.advice.recommendedExpiresAt)) * 1000).toISOString()}`)
           for (const warning of preview.advice.warnings) deps.print(`  ${warning.severity}: ${warning.messageKey}`)
         }
+        // Anything the owner typed — or pasted — before this question existed is stale input:
+        // drain it so only a line typed against the visible ask can be the answer.
+        await drain()
         return (await prompt("Type yes to approve: ")).trim() === "yes"
       })
       deps.print(
@@ -218,14 +240,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     }
     return 0
   } catch (error) {
-    const code = (error as { code?: unknown }).code
-    // The owner saw the preview and answered something other than yes — nothing was signed.
-    if (code === "not-approved") {
-      deps.print("not approved")
-      return 1
-    }
-    // The error code only. A message from a deeper layer is never echoed: it could carry data.
-    deps.print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
+    deps.print(ownerRefusalLine(command, agent, error))
     // Owner commands run in the owner's own terminal, and a bare "ERROR" leaves them blind. Only
     // when they ask (MIDA_DEBUG=1): the error's name and first lines, long hex strings masked.
     if (process.env.MIDA_DEBUG === "1") {
@@ -235,6 +250,64 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     }
     return 1
   }
+}
+
+/**
+ * What an owner command prints when it fails. Codes with an obvious next step get a plain line
+ * that names it; everything else keeps `refused: <code>` — a message from a deeper layer is
+ * never echoed because it could carry data. `agent` is the command's subject — for `remember`
+ * argv[1] is fact text, but the agent-naming codes cannot surface from remember anyway.
+ */
+export function ownerRefusalLine(command: string, agent: string, error: unknown): string {
+  const code = (error as { code?: unknown }).code
+  switch (code) {
+    // The owner saw the preview and answered something other than yes — nothing was signed.
+    case "not-approved": return "not approved"
+    case "REQUEST_EXPIRED":
+      return `${agent}'s request has expired (a request lasts ${Number(REQUEST_LIFETIME_SECONDS) / 60} minutes): run \`mida request ${agent}\` and approve again`
+    case "already-approved":
+      return `${agent} is already approved. To let it use THIS folder too, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`
+    case "no-pending-request":
+      return `${agent} has no pending request — run \`mida request ${agent}\` first`
+    case "agent-unidentified":
+    case "agent-not-setup":
+      return `${agent} is not set up on this machine — run \`mida init\` first`
+    // The message IS the answer: we built it from the balance, the cost and the shortfall.
+    case "OWNER_WALLET_LOW":
+      return error instanceof Error ? error.message : "refused: OWNER_WALLET_LOW"
+    case "not-a-project":
+      return `this folder cannot hold a project — run \`mida approve ${agent}\` inside the project's folder`
+    case "list-unreadable":
+      return "the approved-projects list could not be read — check the file's permissions"
+    default:
+      return `refused: ${typeof code === "string" ? code : "ERROR"}`
+  }
+}
+
+/**
+ * How long the drain listens before the ask is printed — long enough for the OS to deliver a
+ * buffered paste, short enough that a human about to read the question never notices.
+ */
+const STDIN_DRAIN_MS = 25
+
+/**
+ * Discards whatever is already waiting on stdin, without blocking: resume the stream, drop every
+ * chunk that arrives for one beat, then pause again so the readline question reads fresh input.
+ * Nothing here echoes or stores what was dropped.
+ */
+function drainBufferedStdin(): Promise<void> {
+  const stdin = process.stdin
+  return new Promise((resolve) => {
+    const drop = (): void => {}
+    stdin.on("data", drop)
+    stdin.resume()
+    const timer = setTimeout(() => {
+      stdin.pause()
+      stdin.removeListener("data", drop)
+      resolve()
+    }, STDIN_DRAIN_MS)
+    timer.unref()
+  })
 }
 
 /** The real-terminal prompt — the only way `approve` gets its yes outside tests. */
@@ -273,6 +346,8 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   }
   const runtime = await Runtime.open(deps.home, deps.network)
   try {
+    // Owner-command narration goes to STDERR by default: `print` output keeps its exact shape.
+    runtime.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
     const command = argv[0]!
     if (!OWNER_COMMANDS.includes(command)) return await runCliWithRuntime(argv, runtime, deps.print, { cwd: deps.cwd })
     const code = await runOwnerCommand(argv, runtime, deps)
@@ -310,7 +385,7 @@ async function main(): Promise<void> {
   try {
     // MIDA_HOME must mean the same folder here as in the daemon and both hooks (they all read it);
     // when this ignored it, `init` wrote to ~/.mida while the daemon it spawned looked elsewhere.
-    const home = new MidaHome(process.env.MIDA_HOME)
+    const home = resolveHome(process.env)
     const network: Network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
     const argv = process.argv.slice(2)
     const print = (line: string) => console.log(line)

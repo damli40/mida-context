@@ -1,7 +1,7 @@
 import { parseDeployment } from "@mida/chain"
 import { compileCheckpoint } from "@mida/compiler"
 import { startDaemon } from "./daemon.js"
-import { MidaHome } from "./home.js"
+import { resolveHome } from "./home.js"
 import { appendLog } from "./log.js"
 import type { Network } from "./runtime.js"
 
@@ -12,7 +12,7 @@ import type { Network } from "./runtime.js"
  * and quietly; the spawner's health polling is what notices.
  */
 async function main(): Promise<void> {
-  const home = new MidaHome(process.env.MIDA_HOME)
+  const home = resolveHome(process.env)
   const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown; storageUrl?: unknown }>("network.json")
   if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) {
     process.exit(1)

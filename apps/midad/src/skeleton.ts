@@ -2,7 +2,7 @@ import { privateKeyToAccount } from "viem/accounts"
 import { MidaError, PERMISSION, decodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
 import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScope } from "@mida/protocol"
 import { capabilityRegistryAbi, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
-import type { ChainContext } from "@mida/chain"
+import type { ChainContext, HistoryScanCursor } from "@mida/chain"
 import { provisionAgent } from "@mida/fake-vault"
 import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
@@ -14,6 +14,7 @@ import { FACT_NAMESPACES } from "./remember.js"
 import { unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import { FileAccessRequestStore } from "./request-store.js"
+import type { MidaHome } from "./home.js"
 import {
   identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, loadOrCreateSignerKey,
   markRevoked, replaceSignerKey, saveAgentIdentity, saveGrants, saveOwnerAddress,
@@ -115,13 +116,21 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
   // The daemon needs the owner's public address to verify the signed approved-projects list and to
   // ask the chain about grants — it never reads owner/secrets.json, so the address is public metadata.
   saveOwnerAddress(home, owner)
-  await runtime.ensureFunded(owner)
+  await runtime.ensureFunded(owner, "your wallet")
   const ownerKey = await reader.ownerP256Key(owner)
-  if (ownerKey == null || ownerKey.qx === 0n) await vault.registerOwnerKey()
+  if (ownerKey == null || ownerKey.qx === 0n) {
+    runtime.progress?.("registering your key on the chain…")
+    await vault.registerOwnerKey()
+  }
   // The checkpoint namespace plus the two owner-fact namespaces (A14) — opened before any grant so
   // the first approved agent's reader wraps exist before a fact can be written.
+  const unopened: string[] = []
   for (const ns of [NAMESPACE, ...FACT_NAMESPACES]) {
-    if ((await reader.epochPublicKey(owner, namespaceId(ns), 1n)) == null) await vault.initializeNamespace(ns)
+    if ((await reader.epochPublicKey(owner, namespaceId(ns), 1n)) == null) unopened.push(ns)
+  }
+  if (unopened.length > 0) {
+    runtime.progress?.(`opening ${unopened.length} context areas (${unopened.length} transactions)…`)
+    for (const ns of unopened) await vault.initializeNamespace(ns)
   }
 
   const operatorAccount = privateKeyToAccount(loadOrCreateOperatorSecrets(home).privateKey)
@@ -130,7 +139,7 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
   for (const name of agentNames) {
     let identity = loadAgentIdentity(home, name)
     if (identity === undefined) {
-      await runtime.ensureFunded(operatorAccount.address)
+      await runtime.ensureFunded(operatorAccount.address, "the operator wallet")
       // Saved to disk BEFORE the registration transaction: a crash must never leave a registered agent with no key.
       let signerPrivateKey = loadOrCreateSignerKey(home, name)
       // Unless the crash came after registration: then this signer is bound to an agent whose encryption key was
@@ -138,6 +147,7 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
       if ((await reader.agentIdOfSigner(privateKeyToAccount(signerPrivateKey).address)) !== null) {
         signerPrivateKey = replaceSignerKey(home, name)
       }
+      runtime.progress?.(`registering ${name} on the chain…`)
       const provisioned = await provisionAgent({
         operator,
         name,
@@ -152,7 +162,7 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
     }
     // An idempotent PUT, run for every agent on every init: a manifest upload lost to a crash is retried here.
     await runtime.ownerApi.putAgentManifest(identity.manifest)
-    await runtime.ensureFunded(privateKeyToAccount(identity.signerPrivateKey).address)
+    await runtime.ensureFunded(privateKeyToAccount(identity.signerPrivateKey).address, `${name}'s wallet`)
     // `assistant` never joins a project, so there is no request/approve round-trip for it: the owner
     // grants its whole READ-only policy grant at init. Missing scopes only — a re-run sends nothing.
     if (identity.purposeId === "general_assistance") {
@@ -163,6 +173,7 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
           scopes: missing.map((s) => ({ namespace: namespaceById(s.namespaceId).name, permissions: s.permissions, provenancePolicy: s.provenancePolicy })),
           capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
         })
+        runtime.progress?.(`sending ${name}'s grant (about 5 seconds)…`)
         const approval = await vault.approveGrant({ accessRequest: request, manifest: identity.manifest, selection: { kind: "recommended" } })
         const agent = runtime.agent(name)
         await agent.completeAccessRequest(request, approval.response)
@@ -177,8 +188,9 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
 /** Spec §5B step 1: the agent asks for the policy's whole recommended grant for its purpose. The request is on disk before this returns, and so is which request is pending. */
 export async function requestAccess(runtime: ServiceRuntime, name: string): Promise<{ requestId: Hex }> {
   const identity = loadAgentIdentity(runtime.home, name)
+  runtime.progress?.(`asking the chain what ${name} already holds…`)
   if (identity !== undefined && (await hasAnyLiveCapability(runtime, identity.agentId))) {
-    throw new Error(`agent "${name}" is already approved`)
+    throw codedError("already-approved", `agent "${name}" is already approved`)
   }
   const purposeId = identity?.purposeId ?? PURPOSE_ID
   const request = await runtime.agent(name).createAccessRequest({
@@ -207,12 +219,63 @@ function notApprovedError(): Error {
 }
 
 /**
+ * A refusal a user-facing command can hit carries a stable code — a bare `refused: ERROR` on the
+ * owner's screen names nothing. The CLI maps the codes it knows a next step for; the rest print
+ * as `refused: <code>`.
+ */
+function codedError(code: string, message: string): Error {
+  const error = new Error(message) as Error & { code: string }
+  error.code = code
+  return error
+}
+
+/**
+ * The per-agent scan cursor (R4-9): `state/history/<agentId>.json`, written atomically by the
+ * home. The file names the chain id and the registry it was scanned on, so a cursor from a
+ * different chain or deployment is ignored rather than trusted. Anything missing, unreadable or
+ * malformed answers undefined — a full scan, never a guess.
+ */
+export function historyCursor(home: MidaHome, agentId: Hex, chainId: bigint, registry: Address): HistoryScanCursor {
+  const file = `state/history/${agentId}.json`
+  return {
+    load() {
+      try {
+        const raw = home.readJson<Record<string, unknown>>(file)
+        if (raw === undefined || typeof raw !== "object" || Array.isArray(raw)) return undefined
+        if (String(raw.chainId) !== chainId.toString()) return undefined
+        if (typeof raw.registry !== "string" || raw.registry.toLowerCase() !== registry.toLowerCase()) return undefined
+        const observedThroughBlock = BigInt(raw.observedThroughBlock as string)
+        if (observedThroughBlock < 0n) return undefined
+        return { observedThroughBlock, previouslyRevoked: raw.previouslyRevoked === true }
+      } catch {
+        return undefined
+      }
+    },
+    save(state) {
+      home.writeSecretJson(file, {
+        chainId: chainId.toString(),
+        registry,
+        observedThroughBlock: state.observedThroughBlock.toString(),
+        previouslyRevoked: state.previouslyRevoked,
+      })
+    },
+  }
+}
+
+/**
  * The same advice approveGrant computes internally, run read-only so the owner can see it before
  * deciding. assertRequestIsCurrent throws for a stale request here, exactly as it would below.
  */
-async function grantAdviceFor(runtime: Runtime, request: AccessRequest, manifest: Parameters<typeof adviseGrant>[0]["manifest"]): Promise<GrantAdvice> {
+async function grantAdviceFor(runtime: Runtime, name: string, request: AccessRequest, manifest: Parameters<typeof adviseGrant>[0]["manifest"]): Promise<GrantAdvice> {
   const agentRecord = await readAgentRecord(runtime.ownerChain, request.agentId)
-  const history = await ownerHistory({ client: runtime.ownerChain.publicClient, deployment: runtime.ownerChain.deployment, owner: runtime.owner, agentId: request.agentId })
+  const history = await ownerHistory({
+    client: runtime.ownerChain.publicClient,
+    deployment: runtime.ownerChain.deployment,
+    owner: runtime.owner,
+    agentId: request.agentId,
+    cursor: historyCursor(runtime.home, request.agentId, runtime.network.deployment.chainId, runtime.network.deployment.capabilityRegistry),
+    onScan: (requests) => runtime.progress?.(`checking ${name}'s history on the chain (${requests} requests)…`),
+  })
   const now = await latestTimestamp(runtime.ownerChain)
   return adviseGrant({ request, manifest, agentRecord, ownerHistory: history, now })
 }
@@ -230,18 +293,19 @@ export async function approve(
   // transaction can go out. The list entry itself is written only after the grant succeeds.
   const marker = cwd === undefined ? undefined : ensureProjectMarker(cwd)
   const identity = loadAgentIdentity(home, name)
-  if (identity === undefined) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
+  if (identity === undefined) throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
 
   // The policy's expected grant minus what the CHAIN says is already live. An agent approved under
   // the old single `projects.current` scope (an M1 home) is missing exactly the two READ scopes —
   // those, and only those, get asked for below.
+  runtime.progress?.(`asking the chain what ${name} already holds…`)
   const missing = await missingExpectedScopes(runtime, identity.agentId, identity.purposeId)
   const live = await hasAnyLiveCapability(runtime, identity.agentId)
   let pending = home.readJson<{ request: AccessRequest }>(`agents/${name}/pending-request.json`)
 
   if (pending === undefined) {
     if (missing.length === 0) {
-      if (!live) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
+      if (!live) throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
       // a second project for an already-approved agent needs no new grant — only the list row.
       // `assistant` is never listed: it gets no project approval, ever.
       if (cwd !== undefined && identity.purposeId === PURPOSE_ID) {
@@ -249,9 +313,9 @@ export async function approve(
         const listed = await approveProject(runtime, { agent: name, cwd })
         return { capabilityIds: [], permissions: [], transactionHash: null, gasUsed: 0n, projectId: listed.approval.projectId, droppedRows: listed.droppedRows }
       }
-      throw new Error(`agent "${name}" is already approved`)
+      throw codedError("already-approved", `agent "${name}" is already approved`)
     }
-    if (!live) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
+    if (!live) throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
     // The upgrade path: the agent holds part of the grant (a live capability exists) and no request
     // is pending — sign one for exactly the scopes the chain says are missing, then approve it below.
     const request = await runtime.agent(name).createAccessRequest({
@@ -264,15 +328,15 @@ export async function approve(
   }
 
   const stored = await new FileAccessRequestStore(home, name).load(pending.request.requestId)
-  if (stored === undefined || stored.consumed) throw new Error(`agent "${name}" has no pending request; run requestAccess first`)
+  if (stored === undefined || stored.consumed) throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
   // Only what the chain does not already authorize is granted — a request whose scopes are all live
   // mints nothing, so a second approve sends no transaction.
   const needed = await ungrantedScopes(runtime, identity.agentId, pending.request.scopes)
-  if (needed.length === 0) throw new Error(`agent "${name}" is already approved`)
+  if (needed.length === 0) throw codedError("already-approved", `agent "${name}" is already approved`)
   // The owner sees the ask and the advisor's advice before anything is signed — only an explicit
   // confirm gets past this point. The question and the answer live in the CLI, which injects it.
   if (confirm !== undefined) {
-    const advice = await grantAdviceFor(runtime, pending.request, identity.manifest)
+    const advice = await grantAdviceFor(runtime, name, pending.request, identity.manifest)
     if (!(await confirm({ kind: "grant", agent: name, requested: pending.request.scopes, scopes: needed, expiresAt: decodeUint64(pending.request.capabilityExpiresAt), advice }))) throw notApprovedError()
   }
   // A READ grant that expired closes the namespace's write epoch (§7.3): grantBatch reverts
@@ -281,16 +345,19 @@ export async function approve(
   const rotated: Hex[] = []
   for (const nsId of [...new Set(needed.map((s) => s.namespaceId))]) {
     if (!(await reader.isWriteEpochValid(owner, nsId, await reader.requiredReadEpoch(owner, nsId)))) {
+      runtime.progress?.(`rotating the ${namespaceById(nsId).name} epoch…`)
       await vault.rotateExpiredEpoch(nsId)
       rotated.push(nsId)
     }
   }
+  runtime.progress?.("sending the grant (about 5 seconds)…")
   const approval = await vault.approveGrant({
     accessRequest: pending.request,
     manifest: identity.manifest,
     selection: { kind: "custom", scopes: needed, expiresAt: decodeUint64(pending.request.capabilityExpiresAt) },
   })
   const agent = runtime.agent(name)
+  runtime.progress?.("proving the grant on the chain…")
   const grant = await agent.completeAccessRequest(pending.request, approval.response)
   saveGrants(home, name, [...agent.grants])
   if (rotated.length > 0) await repairReaderWraps(runtime, rotated)
@@ -387,7 +454,7 @@ export function authorNamesFor(runtime: ServiceRuntime): Record<string, string> 
 
 /** Spec §5D steps 2–3: a full protocol read as this agent, then keep only this project's valid v1 envelopes. */
 export async function readCheckpoints(runtime: ServiceRuntime, name: string, projectId: string): Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }> {
-  if (typeof projectId !== "string" || projectId === "") throw new Error("projectId must be a non-empty string")
+  if (typeof projectId !== "string" || projectId === "") throw codedError("bad-input", "projectId must be a non-empty string")
   const started = Date.now()
   const objects = await runtime.agent(name).read(runtime.owner, NAMESPACE)
   let skipped = 0
@@ -419,6 +486,7 @@ export async function readCheckpoints(runtime: ServiceRuntime, name: string, pro
  */
 export async function revoke(runtime: Runtime, name: string): Promise<{ transactionHashes: Hex[]; rewrapped: string[] }> {
   const { home, vault, reader, owner } = runtime
+  runtime.progress?.(`asking the chain what ${name} already holds…`)
   const agentId = await resolveAgentId(runtime, name)
   const transactionHashes: Hex[] = []
   // The raw list can hold expired or already-revoked ids; the transaction goes out only when at least
@@ -429,6 +497,7 @@ export async function revoke(runtime: Runtime, name: string): Promise<{ transact
     if (await isCapabilityLive(runtime.ownerChain, id)) anyLive = true
   }
   if (anyLive) {
+    runtime.progress?.("sending the revocation (about 5 seconds)…")
     transactionHashes.push((await vault.approveRevocation({ kind: "agent", agentId })).transactionHash)
   }
   // The marker records "this agent was revoked", so it is written whenever the agent was identified and
@@ -479,7 +548,7 @@ async function resolveAgentId(runtime: ServiceRuntime, name: string): Promise<He
     const record = await reader.getAgent(grant.agentId)
     if (record !== null && record.signer.toLowerCase() === signerAddress.toLowerCase()) return grant.agentId
   }
-  throw new Error(`agent "${name}" cannot be identified: identity.json, grants.json and a registered signer.json are all missing or unreadable under agents/${name}/`)
+  throw codedError("agent-unidentified", `agent "${name}" cannot be identified: identity.json, grants.json and a registered signer.json are all missing or unreadable under agents/${name}/`)
 }
 
 export async function repairReaderWraps(
@@ -487,19 +556,29 @@ export async function repairReaderWraps(
   namespaceIds: readonly Hex[] = [NAMESPACE_ID, ...FACT_NAMESPACES.map((ns) => namespaceId(ns))],
 ): Promise<string[]> {
   const { home, vault, reader, owner } = runtime
-  const rewrapped: string[] = []
+  // Who gets a wrap is decided first, so the owner hears how many agents the new key goes to
+  // before the sends start — the authority checks run either way.
+  const targets: { name: string; agentId: Hex; nsIds: Hex[] }[] = []
   for (const name of listAgentNames(home)) {
     // A damaged identity.json cannot receive a wrap; it must not stop the others from getting theirs.
     let identity: ReturnType<typeof loadAgentIdentity>
     try { identity = loadAgentIdentity(home, name) } catch { continue }
     if (identity === undefined) continue
-    let got = false
+    const nsIds: Hex[] = []
     for (const nsId of namespaceIds) {
-      if (!(await reader.hasAuthority(owner, identity.agentId, nsId, PERMISSION.READ, 0))) continue
-      await vault.publishReaderWraps({ agentId: identity.agentId, namespaceId: nsId })
-      got = true
+      if (await reader.hasAuthority(owner, identity.agentId, nsId, PERMISSION.READ, 0)) nsIds.push(nsId)
     }
-    if (got) rewrapped.push(name)
+    if (nsIds.length > 0) targets.push({ name, agentId: identity.agentId, nsIds })
+  }
+  if (targets.length > 0) {
+    runtime.progress?.(`sending the new key to ${targets.length} agent${targets.length === 1 ? "" : "s"}…`)
+  }
+  const rewrapped: string[] = []
+  for (const target of targets) {
+    for (const nsId of target.nsIds) {
+      await vault.publishReaderWraps({ agentId: target.agentId, namespaceId: nsId })
+    }
+    rewrapped.push(target.name)
   }
   return rewrapped
 }
