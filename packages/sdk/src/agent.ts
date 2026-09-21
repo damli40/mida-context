@@ -47,6 +47,13 @@ import type { AccessRequestStore } from "./request-store.js"
 /** §13.2 allows up to 600 seconds; the SDK uses 300 so a request stays valid through a normal consent screen. */
 export const REQUEST_LIFETIME_SECONDS = 300n
 
+/**
+ * Objects fetched at once inside `read` (R4-2). The public RPC allows about 25 requests a
+ * second and one object can cost several requests (record, wrap, references), so the work is
+ * bounded — never unbounded — while still overlapping the slow network waits.
+ */
+const READ_CONCURRENCY = 6
+
 export interface AccessRequestInput {
   purposeId: PurposeId
   /** Builder-supplied scopes; parents are expanded through the frozen tree before signing. */
@@ -254,35 +261,43 @@ export class MidaAgent {
     const { deployment } = this.#chain
     const objects = await this.#api.listObjects({ owner: ownerAddress, namespaceId, capabilityId: capability.capabilityId })
     const agent = await readAgentRecord(this.#chain, this.agentId)
-    const epochKeys = new Map<bigint, Uint8Array>()
-    const results: ContextObject[] = []
-    for (const object of objects) {
-      const record = await this.#verifiedRecord(ownerAddress, namespaceId, object)
-      let epochPrivateKey = epochKeys.get(record.readEpoch)
-      if (epochPrivateKey === undefined) {
-        const wrap = await this.#api.getEpochWrap({
-          owner: ownerAddress,
-          namespaceId,
-          readEpoch: record.readEpoch,
-          agentId: this.agentId,
-          agentKeyVersion: agent.encryptionKeyVersion,
-          capabilityId: capability.capabilityId,
-        })
-        epochPrivateKey = unwrapEpochPrivateKey({
-          wrap,
-          agentEncryptionPrivateKey: this.#encryptionPrivateKey,
-          binding: {
-            chainId: deployment.chainId,
-            capabilityRegistry: deployment.capabilityRegistry,
+    // Each distinct epoch key is fetched exactly once, also under concurrency: the map holds
+    // the in-flight promise, so workers reading objects on the same epoch share one call.
+    const epochKeys = new Map<bigint, Promise<Uint8Array>>()
+    const epochKeyFor = (readEpoch: bigint): Promise<Uint8Array> => {
+      let pending = epochKeys.get(readEpoch)
+      if (pending === undefined) {
+        pending = this.#api
+          .getEpochWrap({
             owner: ownerAddress,
             namespaceId,
-            readEpoch: record.readEpoch,
+            readEpoch,
             agentId: this.agentId,
             agentKeyVersion: agent.encryptionKeyVersion,
-          },
-        })
-        epochKeys.set(record.readEpoch, epochPrivateKey)
+            capabilityId: capability.capabilityId,
+          })
+          .then((wrap) =>
+            unwrapEpochPrivateKey({
+              wrap,
+              agentEncryptionPrivateKey: this.#encryptionPrivateKey,
+              binding: {
+                chainId: deployment.chainId,
+                capabilityRegistry: deployment.capabilityRegistry,
+                owner: ownerAddress,
+                namespaceId,
+                readEpoch,
+                agentId: this.agentId,
+                agentKeyVersion: agent.encryptionKeyVersion,
+              },
+            }),
+          )
+        epochKeys.set(readEpoch, pending)
       }
+      return pending
+    }
+    const readObject = async (object: AnchoredObject): Promise<ContextObject> => {
+      const record = await this.#verifiedRecord(ownerAddress, namespaceId, object)
+      const epochPrivateKey = await epochKeyFor(record.readEpoch)
       const payload = openContextObject({
         manifest: object.manifest,
         expectedManifestHash: record.manifestHash,
@@ -291,8 +306,22 @@ export class MidaAgent {
         binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: record.contextId, namespaceId, readEpoch: record.readEpoch },
       })
       await this.#verifyReferences(ownerAddress, record, payload)
-      results.push(this.#toObject(record, name, payload))
+      return this.#toObject(record, name, payload)
     }
+    // Workers pull indexes in list order and results land by index, so the output order is
+    // identical to the sequential loop; a failing object still fails the whole read.
+    const results = new Array<ContextObject>(objects.length)
+    let next = 0
+    const worker = async (): Promise<void> => {
+      while (next < objects.length) {
+        const index = next
+        next += 1
+        results[index] = await readObject(objects[index]!)
+      }
+    }
+    const workers: Promise<void>[] = []
+    for (let i = 0; i < Math.min(READ_CONCURRENCY, objects.length); i += 1) workers.push(worker())
+    await Promise.all(workers)
     return results
   }
 
