@@ -272,9 +272,13 @@ const CODEX_KNOWN_BLOCKS: Readonly<Record<string, "current" | "v1">> = {
   [CODEX_BLOCK_V1]: "v1",
 }
 
-/** The exact sentence the owner sees after `mida install codex` — Codex asks once. */
+/**
+ * The exact sentence the owner sees whenever the Codex config was written or changed. Codex
+ * fingerprints a hook's command text and skips an untrusted hook silently — and re-asks after
+ * every change — so the reminder belongs on every write, and only on a write (R5-6).
+ */
 export const CODEX_TRUST_SENTENCE =
-  "Codex must be told to trust these hooks once: open Codex in this folder and approve them. Then run `mida doctor`."
+  "Codex will ignore these hooks until you trust them: open codex, type /hooks, and trust the Mida entries."
 
 /** Finds a KNOWN managed block between its markers; "absent" when neither marker is present. */
 function locateCodexBlock(text: string): { start: number; end: number; version: "current" | "v1" } | "absent" {

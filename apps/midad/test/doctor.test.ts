@@ -4,7 +4,7 @@ import { createServer } from "node:net"
 import type { Server } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { MidaHome, installClaudeCode, installCodex, loadOrCreateOwnerSecrets, runDoctor, runDoctorLive, socketPathFor } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, installClaudeCode, installCodex, loadOrCreateOwnerSecrets, runDoctor, runDoctorLive, socketPathFor } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
 
@@ -109,6 +109,34 @@ describe("mida doctor without a chain", () => {
     })
     expect(lines).toContain("ok: claude-code hooks installed")
     expect(lines).toContain("ok: codex hooks installed")
+  })
+
+  it("the Codex trust reminder prints whenever a managed block exists — installed, outdated or edited", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const config = join(dir(), "config.toml")
+    installCodex(config)
+    const note = `note: ${CODEX_TRUST_SENTENCE}`
+    for (const variant of ["installed", "outdated", "edited"] as const) {
+      if (variant === "outdated") writeFileSync(config, `${CODEX_BLOCK_V1}\n`)
+      if (variant === "edited") {
+        writeFileSync(
+          config,
+          `${CODEX_BLOCK_V1}\n`.replace('command = "mida-hook codex"', 'command = "mida-hook codex --extra"'),
+        )
+      }
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: { codex: config }, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain(note)
+      expect(lines.filter((l) => l === note)).toHaveLength(1)
+    }
+  })
+
+  it("no managed block means nothing was written — the reminder stays away", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const config = join(dir(), "config.toml")
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), settings: { codex: config }, env: {}, daemonProbeMs: 50 })
+    expect(lines.some((line) => line.includes("Codex will ignore these hooks"))).toBe(false)
   })
 
   it("an unreadable approved-projects file is a permissions problem — never a signature claim", async () => {

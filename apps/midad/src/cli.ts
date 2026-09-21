@@ -395,6 +395,41 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   }
 }
 
+/**
+ * `mida install <tool>` / `mida uninstall <tool>` — edits the tool's own config file, which lives
+ * outside the Mida home, so the paths come in as deps. The Codex trust reminder prints only when
+ * the config was actually written or changed: Codex re-asks trust on every change and silently
+ * ignores an untrusted hook, but repeating the reminder on a no-op teaches the owner to skip it.
+ */
+export function runInstall(
+  argv: string[],
+  deps: { print: (line: string) => void; claudeSettings: string; codexConfig: string },
+): number {
+  const tool = argv[1] ?? ""
+  if (argv.length !== 2 || !INSTALL_TOOLS.includes(tool)) {
+    deps.print(USAGE)
+    return 2
+  }
+  const settingsPath = tool === "claude-code" ? deps.claudeSettings : deps.codexConfig
+  try {
+    const outcome =
+      argv[0] === "install"
+        ? tool === "claude-code"
+          ? installClaudeCode(settingsPath)
+          : installCodex(settingsPath)
+        : tool === "claude-code"
+          ? uninstallClaudeCode(settingsPath)
+          : uninstallCodex(settingsPath)
+    deps.print(outcome === "already-installed" ? "already installed" : outcome === "not-installed" ? "not installed" : outcome)
+    if (argv[0] === "install" && tool === "codex" && outcome === "installed") deps.print(CODEX_TRUST_SENTENCE)
+    return 0
+  } catch (error) {
+    const code = (error as { code?: unknown }).code
+    deps.print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
+    return 1
+  }
+}
+
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 const DAEMON_MAIN = fileURLToPath(new URL("./daemon-main.ts", import.meta.url))
 /** How long a CLI waits for a spawned daemon to open its runtime — the first open fetches the chain head. */
@@ -442,32 +477,12 @@ async function main(): Promise<void> {
     // install edits the tool's own config outside the Mida home, and doctor's first check is
     // whether the daemon is even up — running it through the socket would report on nothing.
     if (argv[0] === "install" || argv[0] === "uninstall") {
-      const tool = argv[1] ?? ""
-      if (argv.length !== 2 || !INSTALL_TOOLS.includes(tool)) {
-        print(USAGE)
-        process.exitCode = 2
-        return
-      }
       // the real settings paths are built here and only here — tests always pass their own
-      const settingsPath =
-        tool === "claude-code" ? join(homedir(), ".claude", "settings.json") : join(homedir(), ".codex", "config.toml")
-      try {
-        const outcome =
-          argv[0] === "install"
-            ? tool === "claude-code"
-              ? installClaudeCode(settingsPath)
-              : installCodex(settingsPath)
-            : tool === "claude-code"
-              ? uninstallClaudeCode(settingsPath)
-              : uninstallCodex(settingsPath)
-        print(outcome === "already-installed" ? "already installed" : outcome === "not-installed" ? "not installed" : outcome)
-        if (argv[0] === "install" && tool === "codex") print(CODEX_TRUST_SENTENCE)
-        process.exitCode = 0
-      } catch (error) {
-        const code = (error as { code?: unknown }).code
-        print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
-        process.exitCode = 1
-      }
+      process.exitCode = runInstall(argv, {
+        print,
+        claudeSettings: join(homedir(), ".claude", "settings.json"),
+        codexConfig: join(homedir(), ".codex", "config.toml"),
+      })
       return
     }
 

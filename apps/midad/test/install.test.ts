@@ -5,12 +5,14 @@ import { join } from "node:path"
 import {
   CODEX_BLOCK,
   CODEX_BLOCK_V1,
+  CODEX_TRUST_SENTENCE,
   HOOK_COMMAND,
   INJECT_COMMAND,
   claudeHooksStatus,
   codexHooksStatus,
   installClaudeCode,
   installCodex,
+  runInstall,
   uninstallClaudeCode,
   uninstallCodex,
 } from "@mida/midad"
@@ -366,5 +368,46 @@ describe("mida install codex", () => {
     expect(uninstallCodex(config)).toBe("not-installed")
     expect(readFileSync(config, "utf8")).toBe(before)
     expect(uninstallCodex(join(dir(), "config.toml"))).toBe("not-installed")
+  })
+})
+
+describe("the Codex trust reminder", () => {
+  it("the sentence is the exact line the tools' docs describe", () => {
+    expect(CODEX_TRUST_SENTENCE).toBe(
+      "Codex will ignore these hooks until you trust them: open codex, type /hooks, and trust the Mida entries.",
+    )
+  })
+
+  const install = (config: string, settings: string, argv: string[]) => {
+    const lines: string[] = []
+    const code = runInstall(argv, { print: (line) => lines.push(line), claudeSettings: settings, codexConfig: config })
+    return { code, lines }
+  }
+
+  it("prints when the config was written — a fresh install and a version upgrade", () => {
+    const config = join(dir(), "config.toml")
+    const settings = join(dir(), "settings.json")
+    const first = install(config, settings, ["install", "codex"])
+    expect(first.code).toBe(0)
+    expect(first.lines).toContain(CODEX_TRUST_SENTENCE)
+    // an older managed block counts as a write too — the upgrade changes what Codex must trust
+    const upgraded = join(dir(), "config.toml")
+    writeFileSync(upgraded, `${CODEX_BLOCK_V1}\n`)
+    const second = install(upgraded, settings, ["install", "codex"])
+    expect(second.code).toBe(0)
+    expect(second.lines).toContain(CODEX_TRUST_SENTENCE)
+  })
+
+  it("stays quiet when the config was not changed — already-installed, uninstall, claude-code", () => {
+    const config = join(dir(), "config.toml")
+    const settings = join(dir(), "settings.json")
+    install(config, settings, ["install", "codex"])
+    const again = install(config, settings, ["install", "codex"])
+    expect(again.lines).toContain("already installed")
+    expect(again.lines).not.toContain(CODEX_TRUST_SENTENCE)
+    const removed = install(config, settings, ["uninstall", "codex"])
+    expect(removed.lines).not.toContain(CODEX_TRUST_SENTENCE)
+    const claude = install(config, settings, ["install", "claude-code"])
+    expect(claude.lines).not.toContain(CODEX_TRUST_SENTENCE)
   })
 })

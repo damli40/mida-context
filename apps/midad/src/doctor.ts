@@ -12,7 +12,7 @@ import { RegistryReader } from "@mida/api"
 import { callDaemon } from "./control.js"
 import type { MidaHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
-import { claudeHooksStatus, codexHooksStatus } from "./install.js"
+import { CODEX_TRUST_SENTENCE, claudeHooksStatus, codexHooksStatus } from "./install.js"
 import type { InstallTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
@@ -286,6 +286,10 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
                   ? problem("codex's hook block was edited", "remove the marked block, then run `mida install codex`")
                   : problem("codex hooks are not installed", "run `mida install codex`"),
           )
+          // any managed block means the config was written or changed — Codex fingerprints the
+          // hook text and skips an untrusted hook SILENTLY, and doctor cannot read Codex's trust
+          // state, so the reminder runs whenever the block is there (R5-6)
+          if (status !== "absent") lines.push(`note: ${CODEX_TRUST_SENTENCE}`)
         }
         return lines.length === 0 ? ["ok: no hook paths to check"] : lines
       },
