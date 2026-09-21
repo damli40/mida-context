@@ -44,6 +44,7 @@ interface ObjectRow {
   manifest: string
   manifest_hash: string
   uploaded_at: string
+  anchored_at: string | null
 }
 
 function objectFrom(row: ObjectRow): StoredObject {
@@ -58,6 +59,7 @@ function objectFrom(row: ObjectRow): StoredObject {
     manifest: JSON.parse(row.manifest) as StoredObject["manifest"],
     manifestHash: row.manifest_hash as Hex,
     uploadedAt: row.uploaded_at,
+    anchoredAt: row.anchored_at,
   }
 }
 
@@ -120,8 +122,8 @@ export class D1ObjectStore implements ObjectStore {
     await this.db
       .prepare(
         `INSERT OR IGNORE INTO objects
-           (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, uploaded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, uploaded_at, anchored_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         object.contextId.toLowerCase(),
@@ -134,6 +136,7 @@ export class D1ObjectStore implements ObjectStore {
         JSON.stringify(object.manifest),
         object.manifestHash.toLowerCase(),
         object.uploadedAt,
+        object.anchoredAt,
       )
       .run()
     const row = await this.db.prepare("SELECT manifest_hash FROM objects WHERE context_id = ?").bind(object.contextId.toLowerCase()).first<{ manifest_hash: string }>()
@@ -158,9 +161,22 @@ export class D1ObjectStore implements ObjectStore {
       .sort((a, b) => (a.uploadedAt === b.uploadedAt ? (a.contextId < b.contextId ? -1 : 1) : a.uploadedAt < b.uploadedAt ? -1 : 1))
   }
 
-  async objectsByUploader(uploader: Address): Promise<StoredObject[]> {
-    const { results } = await this.db.prepare("SELECT * FROM objects WHERE uploader = ?").bind(uploader.toLowerCase()).all<ObjectRow>()
+  async pendingByUploader(uploader: Address): Promise<StoredObject[]> {
+    // Only never-anchored rows feed the quota scan — marked rows are proven permanently and are
+    // excluded here, which is what bounds the scan to work that is still outstanding.
+    const { results } = await this.db
+      .prepare("SELECT * FROM objects WHERE uploader = ? AND anchored_at IS NULL ORDER BY uploaded_at ASC")
+      .bind(uploader.toLowerCase())
+      .all<ObjectRow>()
     return results.map(objectFrom)
+  }
+
+  async markAnchored(contextId: Hex, anchoredAt: string): Promise<void> {
+    // AND anchored_at IS NULL makes the mark first-write-wins: set once, never updated, never cleared.
+    await this.db
+      .prepare("UPDATE objects SET anchored_at = ? WHERE context_id = ? AND anchored_at IS NULL")
+      .bind(anchoredAt, contextId.toLowerCase())
+      .run()
   }
 
   async putWrap(wrap: ReaderEpochWrap): Promise<void> {
@@ -237,15 +253,23 @@ export class D1ObjectStore implements ObjectStore {
   }
 
   async sweepPending(olderThan: Date, stillPending: (object: StoredObject) => Promise<boolean>): Promise<number> {
-    // ISO-8601 UTC strings sort chronologically, so the cutoff is a plain string comparison.
-    const { results } = await this.db.prepare("SELECT * FROM objects WHERE uploaded_at < ?").bind(olderThan.toISOString()).all<ObjectRow>()
+    // ISO-8601 UTC strings sort chronologically, so the cutoff is a plain string comparison. Marked
+    // rows are skipped outright — the anchoring fact is permanent — and an unmarked row stillPending
+    // reports anchored gets its mark here, so the next sweep never asks about it again.
+    const { results } = await this.db.prepare("SELECT * FROM objects WHERE uploaded_at < ? AND anchored_at IS NULL").bind(olderThan.toISOString()).all<ObjectRow>()
     const deletable: string[] = []
+    const anchored: string[] = []
     for (const row of results) {
       const object = objectFrom(row)
       if (await stillPending(object)) deletable.push(object.contextId)
+      else anchored.push(object.contextId)
     }
-    if (deletable.length === 0) return 0
-    await this.db.batch(deletable.map((id) => this.db.prepare("DELETE FROM objects WHERE context_id = ?").bind(id)))
+    const markedAt = new Date().toISOString()
+    const statements = [
+      ...deletable.map((id) => this.db.prepare("DELETE FROM objects WHERE context_id = ?").bind(id)),
+      ...anchored.map((id) => this.db.prepare("UPDATE objects SET anchored_at = ? WHERE context_id = ? AND anchored_at IS NULL").bind(markedAt, id)),
+    ]
+    if (statements.length > 0) await this.db.batch(statements)
     return deletable.length
   }
 

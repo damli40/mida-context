@@ -61,6 +61,7 @@ function fakeObject(uploader: Address = OWNER): StoredObject {
     },
     manifestHash: hexOf(randomBytes(32)),
     uploadedAt: new Date().toISOString(),
+    anchoredAt: null,
   }
 }
 
@@ -127,14 +128,34 @@ describe("the file-backed store implementations", () => {
     expect(await fileStores(dataDir).objects.recordPut(OWNER, "2026-09-21")).toBe(3)
   })
 
-  it("objectsByUploader returns only that signer's uploads, and stores the signer on the object", async () => {
+  it("pendingByUploader returns only that signer's unmarked uploads, and stores the signer on the object", async () => {
     const stores = fileStores(dir())
     const mine = fakeObject(OWNER)
     const other = fakeObject(`0x${"2".repeat(40)}` as Address)
+    const anchored = fakeObject(OWNER)
+    anchored.anchoredAt = "2026-09-20T00:00:00.000Z"
     await stores.objects.putObject(mine)
     await stores.objects.putObject(other)
-    expect((await stores.objects.objectsByUploader(OWNER)).map((object) => object.contextId)).toEqual([mine.contextId])
+    await stores.objects.putObject(anchored)
+    expect((await stores.objects.pendingByUploader(OWNER)).map((object) => object.contextId)).toEqual([mine.contextId])
     expect((await stores.objects.getObject(mine.contextId))?.uploader).toBe(OWNER)
+  })
+
+  it("markAnchored is first-write-wins and never clears", async () => {
+    const stores = fileStores(dir())
+    const object = fakeObject(OWNER)
+    await stores.objects.putObject(object)
+    expect((await stores.objects.getObject(object.contextId))?.anchoredAt).toBeNull()
+
+    await stores.objects.markAnchored(object.contextId, "2026-09-21T00:00:00.000Z")
+    expect((await stores.objects.getObject(object.contextId))?.anchoredAt).toBe("2026-09-21T00:00:00.000Z")
+    expect(await stores.objects.pendingByUploader(OWNER)).toEqual([])
+
+    // A second mark cannot overwrite or clear the first.
+    await stores.objects.markAnchored(object.contextId, "2026-09-22T00:00:00.000Z")
+    expect((await stores.objects.getObject(object.contextId))?.anchoredAt).toBe("2026-09-21T00:00:00.000Z")
+    // Marking an unknown object is a no-op, not an error.
+    await stores.objects.markAnchored(hexOf(randomBytes(32)), "2026-09-21T00:00:00.000Z")
   })
 
   it("sweep removes stale pending objects and expired nonces, and never an anchored object", async () => {
@@ -154,15 +175,33 @@ describe("the file-backed store implementations", () => {
     await stores.nonces.consume(OWNER, staleNonce, nowSeconds - 61n, nowSeconds)
     await stores.nonces.consume(OWNER, liveNonce, nowSeconds, nowSeconds)
 
+    const checks: Hex[] = []
     const result = await sweepStores({
       stores,
       now,
-      isAnchored: async (object) => object.contextId === anchoredOld.contextId,
+      isAnchored: async (object) => {
+        checks.push(object.contextId)
+        return object.contextId === anchoredOld.contextId
+      },
     })
     expect(result).toEqual({ objectsRemoved: 1, manifestsRemoved: 0, noncesRemoved: 1 })
+    // Only the two past-cutoff unmarked rows were asked about; `young` was skipped on age alone.
+    expect(new Set(checks)).toEqual(new Set([old.contextId, anchoredOld.contextId]))
     expect(await stores.objects.getObject(old.contextId)).toBeUndefined()
     expect(await stores.objects.getObject(young.contextId)).toBeDefined()
-    expect(await stores.objects.getObject(anchoredOld.contextId)).toBeDefined()
+    // The anchored row survived and the sweep marked it — a second sweep never asks the chain again.
+    expect((await stores.objects.getObject(anchoredOld.contextId))?.anchoredAt).not.toBeNull()
+    const secondChecks: Hex[] = []
+    await sweepStores({
+      stores,
+      now,
+      isAnchored: async (object) => {
+        secondChecks.push(object.contextId)
+        return false
+      },
+    })
+    // old is gone, anchoredOld is marked, young is still too new: nothing left to check.
+    expect(secondChecks).toHaveLength(0)
 
     // The swept nonce can be recorded again; the fresh one still replays.
     await stores.nonces.consume(OWNER, staleNonce, nowSeconds - 61n, nowSeconds)

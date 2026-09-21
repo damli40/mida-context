@@ -36,8 +36,18 @@ export interface ObjectStore {
   putObject(object: StoredObject): Promise<void>
   getObject(contextId: Hex): Promise<StoredObject | undefined>
   listObjects(owner: Address, namespaceId: Hex): Promise<StoredObject[]>
-  /** Every object this signer uploaded, across owners and namespaces; feeds the pending-bytes quota. */
-  objectsByUploader(uploader: Address): Promise<StoredObject[]>
+  /**
+   * This signer's objects that were never observed anchored on Monad (`anchoredAt` null), oldest
+   * first — the bounded set the pending-bytes quota re-checks. Rows marked anchored are excluded:
+   * anchoring cannot un-happen on this chain, so re-reading their records would be pure cost.
+   */
+  pendingByUploader(uploader: Address): Promise<StoredObject[]>
+  /**
+   * Records that this object was observed matching its Monad record at `anchoredAt`. First write
+   * wins: the mark is set once — it records a verified match, not merely that a record exists —
+   * and is never cleared, because a record cannot be un-registered on this chain design.
+   */
+  markAnchored(contextId: Hex, anchoredAt: string): Promise<void>
   putWrap(wrap: ReaderEpochWrap): Promise<void>
   getWrap(key: WrapKey): Promise<ReaderEpochWrap | undefined>
   /**
@@ -51,8 +61,10 @@ export interface ObjectStore {
   /** Same atomic daily count as `recordPut`, on a separate counter for `PUT /agent-manifests`. */
   recordManifestPut(signer: Address, day: string): Promise<number>
   /**
-   * Deletes every object uploaded before `olderThan` for which `stillPending` reports true. An object the chain has
-   * anchored is never passed for deletion. Returns how many objects were removed.
+   * Deletes every object uploaded before `olderThan` for which `stillPending` reports true — but only
+   * unmarked rows are even asked. A row `stillPending` reports false for was observed anchored: the
+   * implementation marks it once instead of deleting, so the next sweep skips it without a chain read.
+   * Returns how many objects were removed.
    */
   sweepPending(olderThan: Date, stillPending: (object: StoredObject) => Promise<boolean>): Promise<number>
   /**

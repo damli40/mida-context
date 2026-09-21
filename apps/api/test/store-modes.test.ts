@@ -56,6 +56,7 @@ function fakeObject(): StoredObject {
     },
     manifestHash: hexOf(randomBytes(32)),
     uploadedAt: new Date().toISOString(),
+    anchoredAt: null,
   }
 }
 

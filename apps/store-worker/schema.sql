@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS blobs (
   bytes BLOB NOT NULL
 );
 
--- §12.2 pending/anchored objects: immutable manifest metadata per contextId.
+-- §12.2 pending/anchored objects: immutable manifest metadata per contextId. anchored_at is set
+-- once, the first time any code path observes the row matching its Monad record — anchoring cannot
+-- un-happen, so a marked row is never re-checked and never swept. NULL = still pending.
 CREATE TABLE IF NOT EXISTS objects (
   context_id TEXT PRIMARY KEY,
   owner TEXT NOT NULL,
@@ -21,7 +23,8 @@ CREATE TABLE IF NOT EXISTS objects (
   expected_parent_id TEXT NOT NULL,
   manifest TEXT NOT NULL,           -- JSON ObjectManifest
   manifest_hash TEXT NOT NULL,
-  uploaded_at TEXT NOT NULL         -- ISO-8601 UTC, sorts lexicographically
+  uploaded_at TEXT NOT NULL,        -- ISO-8601 UTC, sorts lexicographically
+  anchored_at TEXT                  -- ISO-8601 UTC of the first verified chain match, NULL = pending
 );
 CREATE INDEX IF NOT EXISTS objects_owner_ns ON objects (owner, namespace_id);
 CREATE INDEX IF NOT EXISTS objects_uploader ON objects (uploader);

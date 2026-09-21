@@ -15,7 +15,7 @@ import { contentHash } from "@mida/storage"
 import { randomBytes } from "@noble/hashes/utils.js"
 import type { Deployment } from "@mida/chain"
 import { ContextApiClient, createContextApi, fileStores } from "@mida/api"
-import type { ContextRecordView, ContextStores, ObjectUploadBody, RegistryReader, RequestLimiter, StoreLimits } from "@mida/api"
+import type { ContextRecordView, ContextStores, ObjectUploadBody, RegistryReader, RequestLimiter, StoreLimits, StoredObject } from "@mida/api"
 import { DEFAULT_STORE_LIMITS } from "@mida/api"
 
 const deployment: Deployment = {
@@ -132,6 +132,23 @@ function anchoredRecord(object: ObjectUploadBody): ContextRecordView {
   }
 }
 
+/** The stored metadata an accepted upload leaves behind — for seeding object rows directly. */
+function storedObject(body: ObjectUploadBody): StoredObject {
+  return {
+    contextId: body.manifest.contextId,
+    owner,
+    uploader: owner,
+    namespaceId: NAMESPACE,
+    authorId: OWNER_AUTHOR_ID,
+    objectNonce: body.objectNonce,
+    expectedParentId: body.expectedParentId,
+    manifest: body.manifest,
+    manifestHash: manifestHash(body.manifest),
+    uploadedAt: new Date().toISOString(),
+    anchoredAt: null,
+  }
+}
+
 /** A minimal structurally valid agent-manifest envelope for an agent Monad does not know yet. */
 function envelope(): SignedAgentCapabilityManifest {
   return {
@@ -211,6 +228,59 @@ describe("upload-abuse limits", () => {
     // Once Monad anchors the first object it is no longer pending: the budget is freed and the second PUT passes.
     records.set(first.manifest.contextId, anchoredRecord(first))
     await expect(client.putObject(upload(randomBytes(64)))).resolves.toMatchObject({ state: "pending" })
+  })
+
+  it("an uploader's anchored history is not re-scanned: 500 marked rows cost zero chain reads", async () => {
+    const records = new Map<Hex, ContextRecordView>()
+    const base = stubReader(records)
+    const recordCalls: Hex[] = []
+    const reader = {
+      ...base,
+      getRecord: async (id: Hex) => {
+        recordCalls.push(id)
+        return base.getRecord(id)
+      },
+    } as RegistryReader
+    const { app, store } = apiFor(reader, { maxPendingBytesPerSigner: 100 })
+    const client = clientFor(app)
+
+    // The uploader's whole anchored history: marked rows never enter the quota scan at all.
+    for (let i = 0; i < 500; i++) {
+      await store.putObject({ ...storedObject(upload(randomBytes(4))), anchoredAt: "2026-09-20T00:00:00.000Z" })
+    }
+    // One unmarked row whose record is already anchored on chain: the only chain read still due.
+    const pendingBody = upload(randomBytes(80))
+    await store.putObject(storedObject(pendingBody))
+    records.set(pendingBody.manifest.contextId, anchoredRecord(pendingBody))
+
+    // 80 pending + 30 new = 110 > 100 forces the re-check; the anchor frees the budget and admits.
+    await expect(client.putObject(upload(randomBytes(30)))).resolves.toMatchObject({ state: "pending" })
+    expect(recordCalls).toEqual([pendingBody.manifest.contextId])
+    expect((await store.getObject(pendingBody.manifest.contextId))?.anchoredAt).not.toBeNull()
+  })
+
+  it("the pending scan is capped: past 40 unmarked rows the PUT is refused, not an unbounded scan", async () => {
+    const records = new Map<Hex, ContextRecordView>()
+    const base = stubReader(records)
+    const recordCalls: Hex[] = []
+    const reader = {
+      ...base,
+      getRecord: async (id: Hex) => {
+        recordCalls.push(id)
+        return base.getRecord(id)
+      },
+    } as RegistryReader
+    const { app, store } = apiFor(reader, { maxPendingBytesPerSigner: 100 })
+    const { client, seen } = watchingClient(app)
+
+    // 41 unmarked uploads the chain has not anchored: the scan budget (40 reads) cannot clear them.
+    for (let i = 0; i < 41; i++) {
+      await store.putObject(storedObject(upload(randomBytes(4))))
+    }
+    await expect(client.putObject(upload(randomBytes(4)))).rejects.toThrowError(/429/)
+    expect(seen.status).toBe(429)
+    expect(seen.body).toContain("too many uploads waiting to be confirmed on chain")
+    expect(recordCalls).toHaveLength(40)
   })
 
   it("caps the public agent-manifest body at 16 KB at the boundary", async () => {

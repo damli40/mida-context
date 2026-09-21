@@ -66,6 +66,7 @@ function fakeObject(uploader: Address = OWNER): { object: StoredObject; cipherte
       },
       manifestHash: hexOf(randomBytes(32)),
       uploadedAt: new Date().toISOString(),
+      anchoredAt: null,
     },
   }
 }
@@ -141,7 +142,13 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
         await stores.objects.blobs.put(ciphertext)
 
         const records = new Map<Hex, ContextRecordView>()
-        const reader = { getRecord: async (id: Hex) => records.get(id.toLowerCase() as Hex) ?? null } as unknown as RegistryReader
+        const recordCalls: Hex[] = []
+        const reader = {
+          getRecord: async (id: Hex) => {
+            recordCalls.push(id)
+            return records.get(id.toLowerCase() as Hex) ?? null
+          },
+        } as unknown as RegistryReader
         const { app } = createContextApi({ reader, deployment, stores, clock: () => NOW })
         const client = new ContextApiClient({
           baseUrl: "http://mida.test",
@@ -161,6 +168,48 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
         expect(listed.objects.map((stored) => stored.contextId)).toContain(object.contextId)
         expect(listed.objects[0]!.ciphertext).toBe(`0x${Buffer.from(ciphertext).toString("hex")}`)
         await expect(client.request("GET", `/manifests/${object.contextId}`)).resolves.toMatchObject({ manifestHash: object.manifestHash })
+
+        // The first verified match was marked — every later read serves without asking Monad again.
+        expect((await stores.objects.getObject(object.contextId))?.anchoredAt).not.toBeNull()
+        recordCalls.length = 0
+        await expect(client.request("GET", `/manifests/${object.contextId}`)).resolves.toMatchObject({ manifestHash: object.manifestHash })
+        expect(recordCalls).toHaveLength(0)
+      } finally {
+        await cleanup()
+      }
+    })
+
+    it("a chain record that does not match is not marked, and is refused again after a fix", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const { object } = fakeObject()
+        const account = privateKeyToAccount(generatePrivateKey())
+        const ownerAccount = account.address.toLowerCase() as Address
+        object.owner = ownerAccount
+        object.uploader = ownerAccount
+        await stores.objects.putObject(object)
+
+        // A record exists but commits to a different manifest: not an anchor for these bytes.
+        const records = new Map<Hex, ContextRecordView>()
+        records.set(object.contextId, { ...anchoredRecord(object), manifestHash: hexOf(randomBytes(32)) })
+        const reader = { getRecord: async (id: Hex) => records.get(id.toLowerCase() as Hex) ?? null } as unknown as RegistryReader
+        const { app } = createContextApi({ reader, deployment, stores, clock: () => NOW })
+        const client = new ContextApiClient({
+          baseUrl: "http://mida.test",
+          account,
+          chainId: deployment.chainId,
+          capabilityRegistry: deployment.capabilityRegistry,
+          clock: () => NOW,
+          fetch: async (url, init) => app.request(url, init),
+        })
+
+        await expect(client.request("GET", `/manifests/${object.contextId}`)).rejects.toMatchObject({ code: "NOT_FOUND" })
+        // A mismatched record leaves no mark — the row stays pending for the next honest check.
+        expect((await stores.objects.getObject(object.contextId))?.anchoredAt).toBeNull()
+
+        records.set(object.contextId, anchoredRecord(object))
+        await expect(client.request("GET", `/manifests/${object.contextId}`)).resolves.toMatchObject({ manifestHash: object.manifestHash })
+        expect((await stores.objects.getObject(object.contextId))?.anchoredAt).not.toBeNull()
       } finally {
         await cleanup()
       }
@@ -183,9 +232,33 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
 
         const mine = fakeObject(OWNER).object
         const theirs = fakeObject(other).object
+        const marked = fakeObject(OWNER).object
+        marked.anchoredAt = "2026-09-20T00:00:00.000Z"
         await stores.objects.putObject(mine)
         await stores.objects.putObject(theirs)
-        expect((await stores.objects.objectsByUploader(OWNER)).map((object) => object.contextId)).toEqual([mine.contextId])
+        await stores.objects.putObject(marked)
+        // Only unmarked rows belong to the uploader: the quota scan never touches marked history.
+        expect((await stores.objects.pendingByUploader(OWNER)).map((object) => object.contextId)).toEqual([mine.contextId])
+      } finally {
+        await cleanup()
+      }
+    })
+
+    it("marks anchored rows once, first-write-wins, and never clears the mark", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const object = fakeObject(OWNER).object
+        await stores.objects.putObject(object)
+        expect((await stores.objects.getObject(object.contextId))?.anchoredAt).toBeNull()
+
+        await stores.objects.markAnchored(object.contextId, "2026-09-21T00:00:00.000Z")
+        expect((await stores.objects.getObject(object.contextId))?.anchoredAt).toBe("2026-09-21T00:00:00.000Z")
+        expect(await stores.objects.pendingByUploader(OWNER)).toEqual([])
+
+        // A second mark cannot overwrite or clear the first.
+        await stores.objects.markAnchored(object.contextId, "2026-09-22T00:00:00.000Z")
+        expect((await stores.objects.getObject(object.contextId))?.anchoredAt).toBe("2026-09-21T00:00:00.000Z")
+        await stores.objects.markAnchored(hexOf(randomBytes(32)), "2026-09-21T00:00:00.000Z") // unknown id: no-op
       } finally {
         await cleanup()
       }
@@ -209,15 +282,30 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
         await stores.nonces.consume(OWNER, staleNonce, nowSeconds - 61n, nowSeconds)
         await stores.nonces.consume(OWNER, liveNonce, nowSeconds, nowSeconds)
 
+        const checks: Hex[] = []
         const result = await sweepStores({
           stores,
           now,
-          isAnchored: async (object) => object.contextId === anchoredOld.contextId,
+          isAnchored: async (object) => {
+            checks.push(object.contextId)
+            return object.contextId === anchoredOld.contextId
+          },
         })
         expect(result).toEqual({ objectsRemoved: 1, manifestsRemoved: 0, noncesRemoved: 1 })
         expect(await stores.objects.getObject(old.contextId)).toBeUndefined()
         expect(await stores.objects.getObject(young.contextId)).toBeDefined()
-        expect(await stores.objects.getObject(anchoredOld.contextId)).toBeDefined()
+        // The anchored row survived AND was marked: a second sweep never asks the chain about it.
+        expect((await stores.objects.getObject(anchoredOld.contextId))?.anchoredAt).not.toBeNull()
+        const secondChecks: Hex[] = []
+        await sweepStores({
+          stores,
+          now,
+          isAnchored: async (object) => {
+            secondChecks.push(object.contextId)
+            return false
+          },
+        })
+        expect(secondChecks).toHaveLength(0)
 
         await stores.nonces.consume(OWNER, staleNonce, nowSeconds - 61n, nowSeconds)
         await expect(stores.nonces.consume(OWNER, liveNonce, nowSeconds, nowSeconds)).rejects.toMatchObject({ code: "REPLAY" })

@@ -19,6 +19,12 @@ export interface StoredObject {
   manifest: ObjectManifest
   manifestHash: Hex
   uploadedAt: string
+  /**
+   * ISO-8601 UTC of the first verified isAnchored match, or null while pending. Set once, never cleared:
+   * a Monad record cannot be un-registered, so a row that matched once matches forever. Absent in
+   * pre-M3-A2 files → read as null (pending), which is always safe — it only costs a re-check.
+   */
+  anchoredAt: string | null
 }
 
 function readJson<T>(path: string): T | undefined {
@@ -30,7 +36,7 @@ function readJson<T>(path: string): T | undefined {
 }
 
 function normalize(object: StoredObject): StoredObject {
-  return { ...object, uploader: object.uploader ?? object.owner }
+  return { ...object, uploader: object.uploader ?? object.owner, anchoredAt: object.anchoredAt ?? null }
 }
 
 /**
@@ -58,7 +64,7 @@ export class ApiStore implements ObjectStore {
       }
       return
     }
-    writeJsonAtomic(this.#dir, path, object)
+    writeJsonAtomic(this.#dir, path, normalize(object))
   }
 
   async getObject(contextId: Hex): Promise<StoredObject | undefined> {
@@ -72,9 +78,18 @@ export class ApiStore implements ObjectStore {
       .sort((a, b) => (a.uploadedAt === b.uploadedAt ? (a.contextId < b.contextId ? -1 : 1) : a.uploadedAt < b.uploadedAt ? -1 : 1))
   }
 
-  async objectsByUploader(uploader: Address): Promise<StoredObject[]> {
+  async pendingByUploader(uploader: Address): Promise<StoredObject[]> {
     const key = uploader.toLowerCase()
-    return (await this.#allObjects()).filter((object) => object.uploader.toLowerCase() === key)
+    return (await this.#allObjects())
+      .filter((object) => object.uploader.toLowerCase() === key && object.anchoredAt === null)
+      .sort((a, b) => (a.uploadedAt === b.uploadedAt ? (a.contextId < b.contextId ? -1 : 1) : a.uploadedAt < b.uploadedAt ? -1 : 1))
+  }
+
+  async markAnchored(contextId: Hex, anchoredAt: string): Promise<void> {
+    const path = join(this.#dir, "objects", `${contextId}.json`)
+    const object = readJson<StoredObject>(path)
+    if (object === undefined || (object.anchoredAt ?? null) !== null) return
+    writeJsonAtomic(this.#dir, path, { ...normalize(object), anchoredAt })
   }
 
   async #allObjects(): Promise<StoredObject[]> {
@@ -154,12 +169,20 @@ export class ApiStore implements ObjectStore {
 
   async sweepPending(olderThan: Date, stillPending: (object: StoredObject) => Promise<boolean>): Promise<number> {
     const cutoff = olderThan.getTime()
+    const markedAt = new Date().toISOString()
     let removed = 0
     for (const object of await this.#allObjects()) {
+      // Marked rows skip the chain entirely — the anchoring fact is already proven and permanent.
+      if (object.anchoredAt !== null) continue
       const uploadedAt = Date.parse(object.uploadedAt)
-      if (Number.isNaN(uploadedAt) || uploadedAt >= cutoff || !(await stillPending(object))) continue
-      rmSync(join(this.#dir, "objects", `${object.contextId}.json`))
-      removed += 1
+      if (Number.isNaN(uploadedAt) || uploadedAt >= cutoff) continue
+      if (await stillPending(object)) {
+        rmSync(join(this.#dir, "objects", `${object.contextId}.json`))
+        removed += 1
+      } else {
+        // stillPending reported an anchored record: mark the first verified match and keep the row.
+        await this.markAnchored(object.contextId, markedAt)
+      }
     }
     return removed
   }

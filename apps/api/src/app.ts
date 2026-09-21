@@ -46,6 +46,10 @@ export const CANCELLATION_MAX_LIFETIME_SECONDS = 300n
 /** Manifest GET responses are allowed this stale before the envelope is re-verified against Monad. */
 export const MANIFEST_VERIFY_CACHE_SECONDS = 60n
 
+/** The pending-bytes quota re-checks unmarked uploads in batches of 8, at most this many chain reads per PUT. */
+export const PENDING_CHECK_BATCH = 8
+export const PENDING_CHECK_MAX_READS = 40
+
 /**
  * Per-IP request limiting, injected by the deployment. The hosted Worker's [[ratelimits]] bindings adapt
  * to it; a self-hosted Node server may pass its own (or none — the README says a reverse proxy is needed
@@ -249,16 +253,36 @@ export function createContextApi(options: ContextApiOptions) {
       }
     }
 
-    // 7. quotas: a signer may not use the store as free hosting. Pending bytes count what Monad has not
-    // anchored yet (anchored objects are the chain's problem, not ours); the daily count counts accepted PUTs.
+    // 7. quotas: a signer may not use the store as free hosting. Only rows never marked anchored count
+    // against the byte cap — an uploader's anchored history is skipped entirely. Each unmarked row is
+    // re-checked against Monad oldest-first, 8 at a time and at most 40 reads per request; a confirmed
+    // anchor marks the row once, permanently, and frees its bytes. Rows left unchecked still count as
+    // pending, so a flood of unconfirmed uploads cannot hide behind the read budget.
     const alreadyStored = (await store.getObject(manifest.contextId))?.manifestHash === committedManifestHash
-    let pendingBytes = alreadyStored ? 0 : ciphertext.length
-    for (const other of await store.objectsByUploader(signer)) {
-      if (other.contextId === manifest.contextId || isAnchored(other, await reader.getRecord(other.contextId))) continue
-      pendingBytes += other.manifest.ciphertextSize
+    const unmarked = await store.pendingByUploader(signer)
+    let pendingBytes =
+      (alreadyStored ? 0 : ciphertext.length) +
+      unmarked.reduce((total, other) => (other.contextId === manifest.contextId ? total : total + other.manifest.ciphertextSize), 0)
+    const anchoredNow = new Date(Number(clock()) * 1000).toISOString()
+    let scanned = 0
+    while (scanned < unmarked.length && pendingBytes > limits.maxPendingBytesPerSigner && scanned < PENDING_CHECK_MAX_READS) {
+      const batch = unmarked.slice(scanned, scanned + PENDING_CHECK_BATCH)
+      const freed = await Promise.all(
+        batch.map(async (other) => {
+          if (!isAnchored(other, await reader.getRecord(other.contextId))) return 0
+          await store.markAnchored(other.contextId, anchoredNow)
+          return other.contextId === manifest.contextId ? 0 : other.manifest.ciphertextSize
+        }),
+      )
+      scanned += batch.length
+      pendingBytes -= freed.reduce((total, size) => total + size, 0)
     }
     if (pendingBytes > limits.maxPendingBytesPerSigner) {
-      return quotaExceeded(c, "maxPendingBytesPerSigner", `unanchored ciphertext would reach ${pendingBytes} bytes`)
+      const detail =
+        scanned < unmarked.length
+          ? "too many uploads waiting to be confirmed on chain"
+          : `unanchored ciphertext would reach ${pendingBytes} bytes`
+      return quotaExceeded(c, "maxPendingBytesPerSigner", detail)
     }
     const day = new Date().toISOString().slice(0, 10)
     const putCount = await store.recordPut(signer, day)
@@ -279,6 +303,7 @@ export function createContextApi(options: ContextApiOptions) {
       manifest,
       manifestHash: committedManifestHash,
       uploadedAt: new Date().toISOString(),
+      anchoredAt: null,
     })
     return c.json({ contextId: manifest.contextId, manifestHash: committedManifestHash, state: "pending" })
   })
@@ -293,8 +318,15 @@ export function createContextApi(options: ContextApiOptions) {
       await authorizeAgent({ reader, overlay, signer, owner, capabilityId: optionalCapability(c.req.query("capabilityId")), namespaceId, permission: PERMISSION.READ })
     }
     const objects: AnchoredObject[] = []
+    const anchoredNow = new Date(Number(clock()) * 1000).toISOString()
     for (const stored of await store.listObjects(owner, namespaceId)) {
-      if (!isAnchored(stored, await reader.getRecord(stored.contextId))) continue
+      // anchored_at records the first verified match; a Monad record cannot be un-registered, so only
+      // an unmarked row asks the chain — and the first match is marked once, permanently. Every check
+      // that decides who may read (capability, epoch, deny overlay) still runs per request above.
+      if (stored.anchoredAt === null) {
+        if (!isAnchored(stored, await reader.getRecord(stored.contextId))) continue
+        await store.markAnchored(stored.contextId, anchoredNow)
+      }
       objects.push({
         contextId: stored.contextId,
         owner: stored.owner,
@@ -312,7 +344,11 @@ export function createContextApi(options: ContextApiOptions) {
     const signer = c.get("signer")
     const contextId = hex(c.req.param("contextId"), 32, "contextId")
     const stored = await store.getObject(contextId)
-    if (stored === undefined || !isAnchored(stored, await reader.getRecord(contextId))) throw new MidaError("NOT_FOUND", "no anchored object")
+    if (stored === undefined) throw new MidaError("NOT_FOUND", "no anchored object")
+    if (stored.anchoredAt === null) {
+      if (!isAnchored(stored, await reader.getRecord(contextId))) throw new MidaError("NOT_FOUND", "no anchored object")
+      await store.markAnchored(contextId, new Date(Number(clock()) * 1000).toISOString())
+    }
     if (signer !== stored.owner) {
       await authorizeAgent({
         reader,

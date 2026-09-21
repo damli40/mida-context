@@ -487,6 +487,7 @@ describe("the worker entry", () => {
       manifest: stalePending.manifest,
       manifestHash: manifestHash(stalePending.manifest),
       uploadedAt: new Date(nowMs - 25 * 60 * 60_000).toISOString(),
+      anchoredAt: null,
     }
     const anchoredBody = upload(randomBytes(8))
     const anchoredObject = { ...staleObject, contextId: anchoredBody.manifest.contextId, objectNonce: anchoredBody.objectNonce, manifest: anchoredBody.manifest, manifestHash: manifestHash(anchoredBody.manifest) }

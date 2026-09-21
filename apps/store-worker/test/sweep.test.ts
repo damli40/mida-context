@@ -50,6 +50,7 @@ function objectAt(uploadedAt: Date): StoredObject {
     },
     manifestHash: hexOf(randomBytes(32)),
     uploadedAt: uploadedAt.toISOString(),
+    anchoredAt: null,
   }
 }
 
@@ -136,6 +137,8 @@ describe("the scheduled sweep", () => {
       expect(await stores.objects.getObject(old.contextId)).toBeUndefined()
       expect(await stores.objects.getObject(young.contextId)).toBeDefined()
       expect(await stores.objects.getObject(anchoredAncient.contextId)).toBeDefined()
+      // The sweep also marked it: the row is now permanently out of every later pending scan.
+      expect((await stores.objects.getObject(anchoredAncient.contextId))?.anchoredAt).not.toBeNull()
       expect(await stores.objects.getManifestIndex(staleUnverified.bodyHash)).toBeUndefined()
       await expect(stores.objects.blobs.get(staleUnverified.envelopeHash)).rejects.toMatchObject({ code: "NOT_FOUND" })
       expect(await stores.objects.getManifestIndex(verifiedOld.bodyHash)).toMatchObject({ envelopeHash: verifiedOld.envelopeHash })
