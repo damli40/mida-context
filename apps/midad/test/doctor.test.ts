@@ -1,10 +1,31 @@
 import { describe, expect, it } from "vitest"
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs"
+import { createServer } from "node:net"
+import type { Server } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { MidaHome, installClaudeCode, installCodex, loadOrCreateOwnerSecrets, runDoctor, runDoctorLive } from "@mida/midad"
+import { MidaHome, installClaudeCode, installCodex, loadOrCreateOwnerSecrets, runDoctor, runDoctorLive, socketPathFor } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
+
+/** A stub listener on the home's control socket that answers every request with `status` + JSON `body`. */
+async function stubDaemon(home: MidaHome, status: number, body: unknown): Promise<Server> {
+  const server = createServer((socket) => {
+    socket.on("data", () => {
+      const payload = JSON.stringify(body)
+      socket.end(
+        `HTTP/1.1 ${status} OK\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(payload)}\r\nconnection: close\r\n\r\n${payload}`,
+      )
+    })
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(socketPathFor(home), () => resolve())
+  })
+  return server
+}
+
+const closeServer = (server: Server) => new Promise<void>((done) => server.close(() => done()))
 
 describe("mida doctor without a chain", () => {
   it("a fresh home reports the daemon, network.json and every dependent check — and finishes", async () => {
@@ -27,6 +48,49 @@ describe("mida doctor without a chain", () => {
     expect(lines.some((line) => line.includes("codex hooks"))).toBe(true)
     expect(code).toBeGreaterThan(0)
     expect(code).toBeLessThanOrEqual(9)
+  })
+
+  it("a listener that answers 404 is a PROBLEM naming the status — never 'ok: midad answers'", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 404, { error: "not-found" })
+    try {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 500 })
+      expect(lines).not.toContain("ok: midad answers")
+      const daemonLine = lines.find((l) => l.includes("midad"))
+      expect(daemonLine).toBeDefined()
+      expect(daemonLine).toContain("PROBLEM:")
+      expect(daemonLine).toContain("404")
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a 200 whose body does not say ok:true is still a PROBLEM naming the status", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: false })
+    try {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 500 })
+      expect(lines).not.toContain("ok: midad answers")
+      const daemonLine = lines.find((l) => l.includes("midad"))
+      expect(daemonLine).toContain("PROBLEM:")
+      expect(daemonLine).toContain("200")
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a 200 with ok:true reports ok: midad answers", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true, pid: 1 })
+    try {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 500 })
+      expect(lines).toContain("ok: midad answers")
+    } finally {
+      await closeServer(server)
+    }
   })
 
   it("installed hooks report ok", async () => {

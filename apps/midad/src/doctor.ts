@@ -117,7 +117,13 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       name: "daemon",
       run: async () => {
         const reply = await callDaemon(home, "/health", undefined, { timeoutMs: deps.daemonProbeMs ?? DAEMON_PROBE_MS })
-        return reply.status === 0 ? [problem("midad is not answering", "start the daemon")] : ["ok: midad answers"]
+        if (reply.status === 0) return [problem("midad is not answering", "start the daemon")]
+        // any answer at all used to read as healthy — only 200 with { ok: true } is midad;
+        // anything else is a problem that names the status it actually got
+        const body = reply.body as { ok?: unknown } | null
+        return reply.status === 200 && body !== null && typeof body === "object" && body.ok === true
+          ? ["ok: midad answers"]
+          : [problem(`midad answered with status ${reply.status}, not ok:true`, "restart midad")]
       },
     },
     {
