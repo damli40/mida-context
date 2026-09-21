@@ -213,7 +213,7 @@ export default {
     return handleRequest(env, request)
   },
 
-  /** Daily cron: sweep pending uploads past 24 h and expired nonces (item 5). */
+  /** Every-15-minutes cron: sweep pending uploads past 24 h and expired nonces, ≤25 object rows a run. */
   async scheduled(_event: { cron: string }, env: WorkerEnv, ctx: ExecutionContextLike): Promise<void> {
     ctx.waitUntil(
       (async () => {

@@ -4,6 +4,7 @@ import { MidaError } from "@mida/protocol"
 import type { Address, Hex, ObjectManifest, ReaderEpochWrap } from "@mida/protocol"
 import { FsStorage } from "@mida/storage"
 import { writeJsonAtomic } from "./secure-fs.js"
+import { SWEEP_MAX_OBJECTS_PER_RUN } from "./stores.js"
 import type { ManifestIndexEntry, ObjectStore, WrapKey } from "./stores.js"
 
 /** A ciphertext upload's immutable metadata. Served as context only after Monad holds matching commitments (§12.2). */
@@ -213,12 +214,21 @@ export class ApiStore implements ObjectStore {
     const cutoff = olderThan.getTime()
     const markedAt = new Date().toISOString()
     let removed = 0
-    for (const object of await this.#allObjects()) {
-      // Marked rows skip the chain entirely — the anchoring fact is already proven and permanent.
-      if (object.anchoredAt !== null) continue
-      const uploadedAt = Date.parse(object.uploadedAt)
-      if (Number.isNaN(uploadedAt) || uploadedAt >= cutoff) continue
-      if (await stillPending(object)) {
+    // Candidates are the oldest unmarked rows past the window, capped at SWEEP_MAX_OBJECTS_PER_RUN:
+    // each stillPending ask is a chain read, and one run must fit the platform subrequest ceiling.
+    const candidates = (await this.#allObjects())
+      .filter((object) => object.anchoredAt === null && !Number.isNaN(Date.parse(object.uploadedAt)) && Date.parse(object.uploadedAt) < cutoff)
+      .sort((a, b) => (a.uploadedAt === b.uploadedAt ? (a.contextId < b.contextId ? -1 : 1) : a.uploadedAt < b.uploadedAt ? -1 : 1))
+      .slice(0, SWEEP_MAX_OBJECTS_PER_RUN)
+    for (const object of candidates) {
+      let pending: boolean
+      try {
+        pending = await stillPending(object)
+      } catch {
+        // A failed chain read leaves the row for the next run — never deleted, never marked.
+        continue
+      }
+      if (pending) {
         const path = join(this.#dir, "objects", `${object.contextId}.json`)
         // Re-read before deleting — the file-backed race guard matching D1's AND anchored_at IS NULL:
         // a mark that landed while the chain was asked (stillPending itself can mark) wins; the row stays.

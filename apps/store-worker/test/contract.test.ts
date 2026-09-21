@@ -455,6 +455,86 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
       }
     })
 
+    it("one sweep invocation examines at most 25 old rows, oldest first, and later runs keep going", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const now = new Date("2026-09-21T12:00:00.000Z")
+        // 100 unmarked rows, all past the window, each a distinct age — a scheduled invocation may
+        // spend at most 25 chain reads, so the other 75 must not even be examined.
+        const objects: StoredObject[] = []
+        for (let i = 0; i < 100; i++) {
+          const object = fakeObject().object
+          object.uploadedAt = new Date(now.getTime() - (124 - i) * 60 * 60_000).toISOString() // i=0 oldest
+          objects.push(object)
+          await stores.objects.putObject(object)
+        }
+        const checks: Hex[] = []
+        const result = await sweepStores({
+          stores,
+          now,
+          isAnchored: async (object) => {
+            checks.push(object.contextId)
+            return false
+          },
+        })
+        // Exactly the 25 oldest were asked about, in order — the other 75 stay untouched.
+        expect(checks).toEqual(objects.slice(0, 25).map((object) => object.contextId))
+        expect(result.objectsRemoved).toBe(25)
+        for (const object of objects.slice(0, 25)) expect(await stores.objects.getObject(object.contextId)).toBeUndefined()
+        for (const object of objects.slice(25)) expect(await stores.objects.getObject(object.contextId)).toBeDefined()
+
+        // The cron runs again in 15 minutes: the next invocation takes the next tranche, so a
+        // backlog drains in bounded steps instead of dying against the subrequest limit.
+        const more: Hex[] = []
+        await sweepStores({
+          stores,
+          now,
+          isAnchored: async (object) => {
+            more.push(object.contextId)
+            return false
+          },
+        })
+        expect(more).toEqual(objects.slice(25, 50).map((object) => object.contextId))
+      } finally {
+        await cleanup()
+      }
+    })
+
+    it("a chain read that throws skips that row — it is neither deleted nor marked — and the run continues", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const now = new Date("2026-09-21T12:00:00.000Z")
+        const doomed: { object: StoredObject; ciphertext: Uint8Array }[] = []
+        for (let i = 0; i < 3; i++) {
+          const entry = fakeObject()
+          entry.object.uploadedAt = new Date(now.getTime() - (30 - i) * 60 * 60_000).toISOString()
+          doomed.push(entry)
+          await stores.objects.putObject(entry.object)
+          await stores.objects.blobs.put(entry.ciphertext)
+        }
+        // The middle row's Monad read fails outright: skipped, never deleted, never marked — and
+        // the rows around it are still swept. A dead RPC must not freeze the sweep at one row.
+        const flaky = doomed[1]!
+        const result = await sweepStores({
+          stores,
+          now,
+          isAnchored: async (object) => {
+            if (object.contextId === flaky.object.contextId) throw new Error("rpc timeout")
+            return false
+          },
+        })
+        expect(result.objectsRemoved).toBe(2)
+        expect(await stores.objects.getObject(doomed[0]!.object.contextId)).toBeUndefined()
+        expect(await stores.objects.getObject(doomed[2]!.object.contextId)).toBeUndefined()
+        const survivor = await stores.objects.getObject(flaky.object.contextId)
+        expect(survivor).toBeDefined()
+        expect(survivor?.anchoredAt).toBeNull()
+        expect(await stores.objects.blobs.get(contentHash(flaky.ciphertext))).toEqual(flaky.ciphertext)
+      } finally {
+        await cleanup()
+      }
+    })
+
     it("a blob referenced by a manifest index row survives its object's sweep, then dies with the index", async () => {
       const { stores, cleanup } = await make()
       try {

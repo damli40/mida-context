@@ -71,10 +71,13 @@ export interface ObjectStore {
   /** Same atomic daily count as `recordPut`, on a separate counter for `PUT /agent-manifests`. */
   recordManifestPut(signer: Address, day: string): Promise<number>
   /**
-   * Deletes every object uploaded before `olderThan` for which `stillPending` reports true — but only
-   * unmarked rows are even asked. A row `stillPending` reports false for was observed anchored: the
-   * implementation marks it once instead of deleting, so the next sweep skips it without a chain read.
-   * Returns how many objects were removed.
+   * Deletes objects uploaded before `olderThan` for which `stillPending` reports true — but only
+   * unmarked rows are even asked, and at most SWEEP_MAX_OBJECTS_PER_RUN of the oldest per call, so
+   * one invocation can never spend more chain reads than a request budget allows. A row
+   * `stillPending` reports false for was observed anchored: the implementation marks it once
+   * instead of deleting, so the next sweep skips it without a chain read. A `stillPending` call
+   * that throws skips that row entirely — it is neither deleted nor marked, and the run continues
+   * with the next row. Returns how many objects were removed.
    */
   sweepPending(olderThan: Date, stillPending: (object: StoredObject) => Promise<boolean>): Promise<number>
   /**
@@ -138,6 +141,13 @@ export const DEFAULT_STORE_LIMITS: StoreLimits = {
 
 /** Pending uploads older than this are swept: they were never anchored, so they only cost storage. */
 export const PENDING_OBJECT_MAX_AGE_MS = 24 * 60 * 60 * 1000
+
+/**
+ * The most object rows one sweep invocation may ask `stillPending` about — each ask is a chain read,
+ * and one scheduled run must fit the same platform subrequest ceiling a request fits. Runs oldest-first
+ * and the cron repeats every 15 minutes, so a backlog drains in bounded tranches.
+ */
+export const SWEEP_MAX_OBJECTS_PER_RUN = 25
 
 /**
  * The worker's scheduled job and any self-hoster's cron call: drop pending objects older than the window,

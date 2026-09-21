@@ -8,9 +8,11 @@ compatibility_date = "2026-09-21"
 # stores and never executes those code paths. The flag provides inert stubs only.
 compatibility_flags = ["nodejs_compat"]
 
-# Daily sweep of never-anchored pending uploads (>24 h) and expired request nonces.
+# Sweep of never-anchored pending uploads (>24 h) and expired request nonces, every 15 minutes.
+# Each run examines at most 25 object rows (one chain read each), oldest first — a backlog drains
+# in bounded tranches that always fit the platform's subrequest ceiling.
 [triggers]
-crons = ["0 4 * * *"]
+crons = ["*/15 * * * *"]
 
 # Per-IP request budgets, keyed on CF-Connecting-IP by the worker: signed requests get 120 a minute,
 # unsigned ones (anonymous manifest reads and unauthenticated probes) get 20. Each namespace is a

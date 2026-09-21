@@ -2,7 +2,7 @@ import { MidaError, assertHex } from "@mida/protocol"
 import type { Address, Hex, ReaderEpochWrap, StorageRef } from "@mida/protocol"
 import { contentHash, verifyContent } from "@mida/storage"
 import type { ContextStorage } from "@mida/storage"
-import { REQUEST_WINDOW_SECONDS } from "@mida/api"
+import { REQUEST_WINDOW_SECONDS, SWEEP_MAX_OBJECTS_PER_RUN } from "@mida/api"
 import type { ContextStores, DenyStore, ManifestIndexEntry, NonceStore, ObjectStore, RevocationIntent, StoredObject, WrapKey } from "@mida/api"
 
 /**
@@ -301,15 +301,25 @@ export class D1ObjectStore implements ObjectStore {
   async sweepPending(olderThan: Date, stillPending: (object: StoredObject) => Promise<boolean>): Promise<number> {
     // ISO-8601 UTC strings sort chronologically, so the cutoff is a plain string comparison. Marked
     // rows are skipped outright — the anchoring fact is permanent — and an unmarked row stillPending
-    // reports anchored gets its mark here, so the next sweep never asks about it again.
+    // reports anchored gets its mark here, so the next sweep never asks about it again. LIMIT bounds
+    // the chain reads one invocation can spend; oldest-first plus the 15-minute cron drains a backlog
+    // in tranches instead of dying against the platform subrequest limit at the same row every day.
     const { results } = await this.db
-      .prepare("SELECT * FROM objects WHERE uploaded_at < ? AND anchored_at IS NULL ORDER BY uploaded_at ASC")
-      .bind(olderThan.toISOString())
+      .prepare("SELECT * FROM objects WHERE uploaded_at < ? AND anchored_at IS NULL ORDER BY uploaded_at ASC LIMIT ?")
+      .bind(olderThan.toISOString(), SWEEP_MAX_OBJECTS_PER_RUN)
       .all<ObjectRow>()
     const deletable: ObjectRow[] = []
     const anchored: string[] = []
     for (const row of results) {
-      if (await stillPending(objectFrom(row))) deletable.push(row)
+      let pending: boolean
+      try {
+        pending = await stillPending(objectFrom(row))
+      } catch {
+        // A failed chain read skips the row entirely — not deleted, not marked — so the next run
+        // retries it, and the failure cannot freeze the sweep on one row for every later run.
+        continue
+      }
+      if (pending) deletable.push(row)
       else anchored.push(row.context_id)
     }
     if (deletable.length === 0 && anchored.length === 0) return 0
