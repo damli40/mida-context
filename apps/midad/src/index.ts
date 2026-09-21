@@ -38,6 +38,8 @@ export { runDoctor, runDoctorLive } from "./doctor.js"
 export type { DoctorDeps } from "./doctor.js"
 export { buildHandoff, noContextText } from "./handoff.js"
 export type { CapabilityState, HandoffDeps, HandoffResult } from "./handoff.js"
+export { agoText, degradedMessage, hookReply, sessionStartMessage, systemMessage } from "./hook-output.js"
+export type { SessionStartBody } from "./hook-output.js"
 export {
   CODEX_BLOCK,
   CODEX_TRUST_SENTENCE,

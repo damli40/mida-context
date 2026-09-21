@@ -2,6 +2,8 @@ import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { callDaemon, ensureDaemon } from "./control.js"
 import { noContextText } from "./handoff.js"
+import type { SessionStartBody } from "./hook-output.js"
+import { degradedMessage, hookReply, sessionStartMessage } from "./hook-output.js"
 import { resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { isSafeName } from "./queue.js"
@@ -50,10 +52,16 @@ function spawnDaemon(): void {
   child.unref()
 }
 
+/** A local failure still answers the envelope — the owner gets the degraded line either way. */
+function degraded(reason: string): string {
+  return hookReply("SessionStart", degradedMessage(reason), noContextText(reason))
+}
+
 /**
  * The SessionStart hook: asks midad for this project's handoff as `inject-main.ts <agent>` and
- * prints whatever it answers — the merged context or one plain refusal line. It is fail-open by
- * contract: whatever goes wrong, the exit code is 0 and stderr stays empty, because a failing
+ * prints one JSON line — `systemMessage` is the one-line outcome both tools show the owner,
+ * `hookSpecificOutput.additionalContext` carries the model's text byte-for-byte. It is fail-open
+ * by contract: whatever goes wrong, the exit code is 0 and stderr stays empty, because a failing
  * session-start hook must never block the agent.
  */
 async function main(): Promise<void> {
@@ -63,7 +71,7 @@ async function main(): Promise<void> {
   const agent = process.argv[2]
   const { text, oversized } = await readStdin(STDIN_CAP_BYTES)
   if (!isSafeName(agent)) {
-    await writeLine(noContextText("bad-agent"))
+    await writeLine(degraded("bad-agent"))
     return
   }
   let parsed: unknown = undefined
@@ -75,7 +83,7 @@ async function main(): Promise<void> {
     }
   }
   if (parsed === undefined) {
-    await writeLine(noContextText("bad-input"))
+    await writeLine(degraded("bad-input"))
     return
   }
   const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
@@ -85,7 +93,7 @@ async function main(): Promise<void> {
   // before `init` wrote network.json no daemon can exist — the spawn would die on the same check
   const up = home.has("network.json") && (await ensureDaemon(home, spawnDaemon, { waitMs: DAEMON_WAIT_MS }))
   if (!up) {
-    await writeLine(noContextText("daemon-down"))
+    await writeLine(degraded("daemon-down"))
     return
   }
   const reply = await callDaemon(
@@ -94,16 +102,16 @@ async function main(): Promise<void> {
     { agent, cwd, sessionId: typeof record.session_id === "string" ? record.session_id : undefined },
     { timeoutMs: HANDOFF_TIMEOUT_MS },
   )
-  const body = reply.body as { text?: unknown } | null
+  const body = reply.body as SessionStartBody | null
   if (reply.status === 0) {
-    await writeLine(noContextText("daemon-down"))
+    await writeLine(degraded("daemon-down"))
     return
   }
   if (typeof body?.text !== "string") {
-    await writeLine(noContextText("bad-reply"))
+    await writeLine(degraded("bad-reply"))
     return
   }
-  await writeLine(body.text)
+  await writeLine(hookReply("SessionStart", sessionStartMessage(body, agent, Date.now()), body.text))
 }
 
 // fail-open, always: one try/catch around everything, exit 0, nothing on stderr

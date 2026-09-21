@@ -16,7 +16,18 @@ import { isCapabilityLive, readCheckpoints } from "./skeleton.js"
  * answered cleanly answers with a stable code instead.
  */
 export type HandoffResult =
-  | { kind: "handoff"; text: string; checkpoints: number; facts: number; factsFailed: string | null; readMs: number }
+  | {
+      kind: "handoff"
+      text: string
+      checkpoints: number
+      facts: number
+      factsFailed: string | null
+      readMs: number
+      /** The resolved name of the agent that saved the newest covered checkpoint — for the owner's line. */
+      savedBy: string
+      /** The newest covered checkpoint's createdAt — the point a whats-new read continues from. */
+      savedAt: string
+    }
   | { kind: "empty"; text: string; facts: number; factsFailed: string | null; readMs: number }
   | { kind: "refused"; text: string; reason: string }
 
@@ -188,6 +199,10 @@ export async function buildHandoff(
         // a failed record degrades to continuesSession null at save time
       }
     }
+    // the newest record the merge covered — scope is time-sorted, so the last provenance row is it
+    const newest = merged.provenance.at(-1)
+    const savedBy =
+      newest === undefined ? "unknown agent" : (input.authorNames[newest.authorId.toLowerCase()] ?? "unknown agent")
     return {
       kind: "handoff",
       text: renderHandoff(merged, { authorNames: input.authorNames, facts, factsFailed }),
@@ -195,6 +210,8 @@ export async function buildHandoff(
       facts: facts.length,
       factsFailed,
       readMs,
+      savedBy,
+      savedAt: newest?.createdAt ?? "",
     }
   } catch {
     return refused("internal", noContextText("internal"))
