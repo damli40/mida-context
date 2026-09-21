@@ -183,8 +183,10 @@ describe("Context API routes (plan Task 24)", () => {
 
     // While the agent is unresolvable on Monad the index is first-write-wins, and the only identity the
     // manifest names is the operator recovered from operatorSignature — so a staging write must be
-    // request-signed by that same key. A second operator's write stores its bytes but cannot displace
-    // the existing entry; the same manifest carried by any other key is denied outright.
+    // request-signed by that same key. A second operator's write is acknowledged but cannot displace
+    // the existing entry, and its bytes are not stored either — a blob no index row points at would be
+    // storage nothing counts and nothing ever deletes. The same manifest carried by any other key is
+    // denied outright.
     const prematureBody = { ...agents.R!.manifest.manifest, agentId: hexOf(randomBytes(32)) }
     const binding = manifestBindingFor({ chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, body: prematureBody })
     const envelopeFor = async (operator: LocalAccount) => ({ manifest: prematureBody, operatorSignature: await operator.signTypedData(binding as never) })
@@ -195,6 +197,7 @@ describe("Context API routes (plan Task 24)", () => {
     const second = await clientFor(operatorB).putAgentManifest(await envelopeFor(operatorB))
     expect(second.envelopeHash).not.toBe(first.envelopeHash)
     expect(await store.getManifestIndex(first.bodyHash)).toMatchObject({ envelopeHash: first.envelopeHash })
+    await expect(store.blobs.get(second.envelopeHash)).rejects.toMatchObject({ code: "NOT_FOUND" })
   })
 
   it("serves anchored owner context to an authorized reader, who decrypts it with its own epoch wrap", async () => {

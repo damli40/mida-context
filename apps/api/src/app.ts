@@ -464,8 +464,13 @@ export function createContextApi(options: ContextApiOptions) {
         throw new MidaError("CAPABILITY_DENIED", "only the operator that signed this manifest may store it before the agent registers")
       }
       // For agents not yet on Monad the bytes are kept for later serving, but an existing index entry is
-      // never displaced by an unverifiable write (first-write-wins).
-      if (existing === undefined) await store.setManifestIndex(bodyHash, envelopeHash)
+      // never displaced by an unverifiable write (first-write-wins) — and a displaced envelope's bytes are
+      // not stored either: a blob no index row points at is storage nothing counts and nothing deletes.
+      if (existing === undefined) {
+        await store.setManifestIndex(bodyHash, envelopeHash)
+        await store.blobs.put(manifestEnvelopeBytes(envelope))
+      }
+      return c.json({ bodyHash, envelopeHash })
     }
     // Content-addressed: writing the same envelope again changes nothing and costs nothing.
     await store.blobs.put(manifestEnvelopeBytes(envelope))
