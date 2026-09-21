@@ -237,10 +237,9 @@ async function bundleWorker(): Promise<string> {
     platform: "browser",
     target: "es2022",
     external: ["node:*"],
-    // The same define wrangler.toml carries: @mida/chain's barrel evaluates
-    // fileURLToPath(new URL("...", import.meta.url)) at module scope for constants the Worker never
-    // uses, and workerd's import.meta.url is not a parseable URL.
-    define: { "import.meta.url": '"file:///worker.mjs"' },
+    // No define for import.meta.url: @mida/chain's directory constants are resolved lazily on first
+    // call now, so module scope never evaluates fileURLToPath(new URL(…)) — this bundle is the proof
+    // that the Worker starts in workerd with no shim.
     outfile,
     logLevel: "silent",
   })
@@ -249,8 +248,8 @@ async function bundleWorker(): Promise<string> {
 
 async function makeWorker(script: string, vars: Record<string, string>): Promise<{ mf: Miniflare; db: D1Like }> {
   const mf = new Miniflare({
-    // A file-named module (not a `script` string): workerd then gives import.meta.url a file URL, exactly
-    // like a real deploy — @mida/chain's barrel evaluates fileURLToPath(new URL(...)) at module scope.
+    // A file-named module (not a `script` string), the shape a real deploy ships. Module scope of the
+    // bundle never evaluates import.meta.url — whatever workerd assigns it is simply never read.
     modules: [{ type: "ESModule", path: "worker.mjs", contents: script }],
     // The newest date this workerd build supports; wrangler.toml uses today's date for real deploys.
     compatibilityDate: "2026-08-06",

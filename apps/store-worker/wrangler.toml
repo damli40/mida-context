@@ -8,13 +8,6 @@ compatibility_date = "2026-09-21"
 # stores and never executes those code paths. The flag provides inert stubs only.
 compatibility_flags = ["nodejs_compat"]
 
-# @mida/chain's barrel evaluates fileURLToPath(new URL("...", import.meta.url)) at module scope for the
-# CONTRACTS_DIR / DEFAULT_DEPLOYMENTS_DIR constants (packages/chain/src/local.ts, deployment.ts) — code paths
-# this Worker never calls. workerd's import.meta.url is not a parseable URL, so that eval would throw
-# "Invalid URL string" on startup. Defining it keeps the unused constants harmless.
-[define]
-"import.meta.url" = '"file:///worker.mjs"'
-
 # Daily sweep of never-anchored pending uploads (>24 h) and expired request nonces.
 [triggers]
 crons = ["0 4 * * *"]

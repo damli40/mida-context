@@ -19,7 +19,15 @@ export interface Deployment {
 export const LOCAL_CHAIN_ID = 31337n
 export const MONAD_TESTNET_CHAIN_ID = 10143n
 
-export const DEFAULT_DEPLOYMENTS_DIR = fileURLToPath(new URL("../../../contracts/deployments/", import.meta.url))
+let deploymentsDir: string | undefined
+/**
+ * The contracts/deployments directory, resolved on first use and cached. It must stay lazy: this module is
+ * bundled into the store Worker, where `import.meta.url` is not a parseable URL — evaluating
+ * fileURLToPath(new URL(…)) at module scope would throw on startup. The Worker never calls this.
+ */
+export function DEFAULT_DEPLOYMENTS_DIR(): string {
+  return (deploymentsDir ??= fileURLToPath(new URL("../../../contracts/deployments/", import.meta.url)))
+}
 
 function wire(detail: string): never {
   throw new MidaError("INVALID_WIRE", `deployment: ${detail}`)
@@ -52,7 +60,7 @@ export function parseDeployment(json: unknown): Deployment {
   }
 }
 
-export function loadDeployment(chainId: bigint, directory: string = DEFAULT_DEPLOYMENTS_DIR): Deployment {
+export function loadDeployment(chainId: bigint, directory: string = DEFAULT_DEPLOYMENTS_DIR()): Deployment {
   const path = `${directory.replace(/\/$/, "")}/${chainId}.json`
   let text: string
   try {
