@@ -9,8 +9,8 @@ import {
   CheckpointCopies,
   MidaHome,
   buildWhatsNew,
-  readLastSeen,
-  writeLastSeen,
+  readSeen,
+  writeSeen,
 } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
 
@@ -20,14 +20,20 @@ const NOW = Date.parse("2026-09-21T12:00:00.000Z")
 /** An ISO timestamp `minutes` before NOW. */
 const iso = (minutesAgo: number) => new Date(NOW - minutesAgo * 60_000).toISOString()
 
-/** A stored checkpoint as readCheckpoints returns it. */
-const cp = (sessionId: string, authorId: string, createdAt: string, over: Record<string, unknown> = {}): StoredCheckpoint => ({
+/** A stored checkpoint as readCheckpoints returns it; `contextId` defaults to a unique-per-call id. */
+const cp = (
+  sessionId: string,
+  authorId: string,
+  createdAt: string,
+  over: Record<string, unknown> = {},
+  contextId = `0x${sessionId}ctx-${createdAt}`,
+): StoredCheckpoint => ({
   checkpoint: sampleCheckpoint({ createdAt, ...over }),
   projectId: "p1",
   sessionId,
   continuesSession: null,
   compiledBy: "claude-haiku",
-  contextId: `0x${sessionId}ctx`,
+  contextId,
   authorId,
   namespaceId: "0xns",
 })
@@ -60,17 +66,15 @@ const baseDeps = (checkpoints: StoredCheckpoint[], over: Record<string, unknown>
 }
 
 describe("buildWhatsNew", () => {
-  it("a foreign checkpoint newer than lastSeen becomes a one-line update", async () => {
+  it("a foreign checkpoint the session never saw becomes a one-line update", async () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(30))
-    const checkpoints = [
-      cp("other-session", "0xauthorCodex", iso(5), {
-        progress: ["fixed the retry loop", "added the tests"],
-        nextAction: "run the suite",
-        artifacts: ["src/retry.ts", "test/retry.test.ts"],
-      }),
-    ]
-    const out = await buildWhatsNew(runtimeWith(dir), { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }, baseDeps(checkpoints))
+    writeSeen(dir, "s-1", ["0xprior-delivery"])
+    const foreign = cp("other-session", "0xauthorCodex", iso(5), {
+      progress: ["fixed the retry loop", "added the tests"],
+      nextAction: "run the suite",
+      artifacts: ["src/retry.ts", "test/retry.test.ts"],
+    })
+    const out = await buildWhatsNew(runtimeWith(dir), { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }, baseDeps([foreign]))
     expect(out.kind).toBe("updates")
     if (out.kind !== "updates") return
     expect(out.note).toContain("Mida update since you last checked:")
@@ -82,36 +86,46 @@ describe("buildWhatsNew", () => {
     expect(out.note).toContain("src/retry.ts")
     expect(out.note).toContain("test/retry.test.ts")
     expect(out.updates).toEqual([{ agent: "codex", savedAt: iso(5) }])
-    // the watermark advances to the newest checkpoint the read saw
-    expect(out.lastSeen).toBe(iso(5))
+    // the proposed set keeps what was already delivered and adds this checkpoint's id
+    expect(out.seen).toEqual(["0xprior-delivery", foreign.contextId])
   })
 
-  it("nothing newer than lastSeen answers none and keeps the old watermark", async () => {
+  it("a foreign checkpoint already in the seen set answers none", async () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(10))
+    const old = cp("other", "0xauthorCodex", iso(20))
+    writeSeen(dir, "s-1", [old.contextId])
     const out = await buildWhatsNew(
       runtimeWith(dir),
       { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
-      baseDeps([cp("other", "0xauthorCodex", iso(20))]),
+      baseDeps([old]),
     )
     expect(out.kind).toBe("none")
-    if (out.kind === "none") expect(out.lastSeen).toBe(iso(10))
   })
 
-  it("the session's own checkpoints never appear, even when they are the only new ones", async () => {
+  it("the session's own checkpoints never appear and never enter the seen set", async () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(30))
+    const own = cp("s-1", "0xauthorCodex", iso(2))
+    const foreign = cp("other", "0xauthorCodex", iso(3), { progress: ["real update"] })
     const out = await buildWhatsNew(
       runtimeWith(dir),
       { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
-      baseDeps([cp("s-1", "0xauthorCodex", iso(2))]),
+      baseDeps([own, foreign]),
     )
-    expect(out.kind).toBe("none")
+    expect(out.kind).toBe("updates")
+    if (out.kind !== "updates") return
+    expect(out.note).not.toContain("2 min ago")
+    expect(out.seen).toEqual([foreign.contextId])
+    // and when the own save is the only arrival, there is nothing to say
+    const only = await buildWhatsNew(
+      runtimeWith(dir),
+      { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
+      baseDeps([own]),
+    )
+    expect(only.kind).toBe("none")
   })
 
   it("two foreign agents get one line each, newest first", async () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(60))
     const out = await buildWhatsNew(
       runtimeWith(dir),
       { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
@@ -128,24 +142,26 @@ describe("buildWhatsNew", () => {
     expect(lines[1]).toContain("claude-code")
   })
 
-  it("only the files an author added since lastSeen are listed as new", async () => {
+  it("the artifact baseline is the newest SEEN checkpoint of that author", async () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(30))
+    const seenOld = cp("other", "0xauthorCodex", iso(40), { artifacts: ["a.ts"] })
+    const unseenOld = cp("other", "0xauthorCodex", iso(30), { artifacts: ["a.ts", "x.ts"] })
+    const newest = cp("other", "0xauthorCodex", iso(5), { artifacts: ["a.ts", "x.ts", "b.ts"] })
+    writeSeen(dir, "s-1", [seenOld.contextId])
     const out = await buildWhatsNew(
       runtimeWith(dir),
       { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
-      baseDeps([
-        cp("other", "0xauthorCodex", iso(40), { artifacts: ["a.ts"] }),
-        cp("other", "0xauthorCodex", iso(5), { artifacts: ["a.ts", "b.ts"] }),
-      ]),
+      baseDeps([seenOld, unseenOld, newest]),
     )
     expect(out.kind).toBe("updates")
     if (out.kind !== "updates") return
+    // the diff is measured against the newest seen checkpoint, not the newest before some time
     expect(out.note).toContain("b.ts")
+    expect(out.note).toContain("x.ts")
     expect(out.note).not.toContain("a.ts")
   })
 
-  it("a missing lastSeen file treats every checkpoint as new", async () => {
+  it("a missing seen file treats every checkpoint as new", async () => {
     const dir = home()
     const out = await buildWhatsNew(
       runtimeWith(dir),
@@ -155,9 +171,9 @@ describe("buildWhatsNew", () => {
     expect(out.kind).toBe("updates")
   })
 
-  it("a corrupt lastSeen file degrades to no baseline, never a crash", async () => {
+  it("a corrupt seen file degrades to no baseline, never a crash", async () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(10))
+    writeSeen(dir, "s-1", ["0xanything"])
     writeFileSync(dir.path("state/lastseen/s-1.json"), "{ not json")
     const out = await buildWhatsNew(
       runtimeWith(dir),
@@ -165,6 +181,91 @@ describe("buildWhatsNew", () => {
       baseDeps([cp("other", "0xauthorCodex", iso(5))]),
     )
     expect(out.kind).toBe("updates")
+  })
+
+  it("an old { lastSeen } watermark file is treated as missing — everything new once", async () => {
+    const dir = home()
+    dir.writeSecretJson("state/lastseen/s-1.json", { lastSeen: iso(10) })
+    const out = await buildWhatsNew(
+      runtimeWith(dir),
+      { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
+      baseDeps([cp("other", "0xauthorCodex", iso(20), { progress: ["stamped before the old watermark"] })]),
+    )
+    expect(out.kind).toBe("updates")
+  })
+
+  it("a checkpoint stamped before the session's own newest still reports — the late-landing case", async () => {
+    const dir = home()
+    // the exact loss the watermark caused: codex compiled at 12:00:00 but its save landed at
+    // 12:00:20, after this session's own 12:00:10 checkpoint was already seen — under a time
+    // watermark codex's checkpoint was "older than the watermark" forever
+    const own = cp("s-1", "0xauthorClaude", "2026-09-21T12:00:10.000Z")
+    const codexLate = cp("codex-session", "0xauthorCodex", "2026-09-21T12:00:00.000Z", {
+      progress: ["codex landed late"],
+    })
+    writeSeen(dir, "s-1", ["0xprior-delivery"])
+    const out = await buildWhatsNew(
+      runtimeWith(dir),
+      { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
+      baseDeps([own, codexLate]),
+    )
+    expect(out.kind).toBe("updates")
+    if (out.kind !== "updates") return
+    expect(out.note).toContain("codex")
+    expect(out.note).toContain("codex landed late")
+    expect(out.seen).toEqual(["0xprior-delivery", codexLate.contextId])
+    // the session's own checkpoint was covered by the answer but its id never enters the set
+    expect(out.seen).not.toContain(own.contextId)
+  })
+
+  it("a foreign checkpoint stamped five minutes behind a seen one is still new — clock skew changes nothing", async () => {
+    const dir = home()
+    // the other machine's clock runs 5 minutes slow: its checkpoint lands stamped BEFORE a
+    // foreign checkpoint this session already saw — a watermark hides it, the set does not
+    const earlier = cp("other", "0xauthorCodex", iso(10))
+    const skewed = cp("other", "0xauthorCodex", iso(15), { progress: ["written on a slow clock"] })
+    writeSeen(dir, "s-1", [earlier.contextId])
+    const out = await buildWhatsNew(
+      runtimeWith(dir),
+      { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
+      baseDeps([earlier, skewed]),
+    )
+    expect(out.kind).toBe("updates")
+    if (out.kind !== "updates") return
+    expect(out.note).toContain("written on a slow clock")
+    expect(out.seen).toEqual([earlier.contextId, skewed.contextId])
+  })
+
+  it("a delivered checkpoint is never reported twice", async () => {
+    const dir = home()
+    const foreign = cp("other", "0xauthorCodex", iso(5), { progress: ["say it once"] })
+    const deps = baseDeps([foreign])
+    const input = { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }
+    const first = await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(first.kind).toBe("updates")
+    if (first.kind !== "updates") return
+    // the hook writes the proposed set after the note was printed — the next prompt has nothing
+    writeSeen(dir, "s-1", first.seen)
+    const second = await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(second.kind).toBe("none")
+  })
+
+  it("the proposed set keeps the newest 300 ids — a 301st drops the oldest", async () => {
+    const dir = home()
+    const ids = Array.from({ length: 300 }, (_, i) => `0xid-${i}`)
+    writeSeen(dir, "s-1", ids)
+    const foreign = cp("other", "0xauthorCodex", iso(5))
+    const out = await buildWhatsNew(
+      runtimeWith(dir),
+      { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
+      baseDeps([foreign]),
+    )
+    expect(out.kind).toBe("updates")
+    if (out.kind !== "updates") return
+    expect(out.seen).toHaveLength(300)
+    expect(out.seen).not.toContain("0xid-0")
+    expect(out.seen).toContain("0xid-299")
+    expect(out.seen).toContain(foreign.contextId)
   })
 
   it("a revoked agent is refused, not silently emptied", async () => {
@@ -192,7 +293,6 @@ describe("buildWhatsNew", () => {
 
   it("the note never exceeds 600 characters, however big the checkpoints are", async () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(60))
     const checkpoints = ["0xauthorCodex", "0xauthorClaude", "0xauthorthird"].map((author, i) =>
       cp(`s-${i}`, author, iso(5 + i), {
         progress: ["x".repeat(400)],
@@ -213,7 +313,6 @@ describe("buildWhatsNew", () => {
 
   it("a failed refresh answers none on an absent copy and logs the failure — it never refuses", async () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(10))
     const logs: object[] = []
     const copies = new CheckpointCopies(() => NOW)
     const out = await buildWhatsNew(
@@ -255,7 +354,6 @@ describe("the daemon's checkpoint copy", () => {
 
   it("a read that takes 5 s never blocks the prompt — the stale copy answers at once", async () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(30))
     let t = NOW
     const copies = new CheckpointCopies(() => t)
     copies.seed("claude-code", "p1", [cp("other", "0xauthorCodex", iso(10), { progress: ["stale but present"] })])
@@ -307,7 +405,6 @@ describe("the daemon's checkpoint copy", () => {
 
   it("a failed refresh keeps the old copy, still serves it, and logs once a minute at most", async () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(30))
     let t = NOW
     const copies = new CheckpointCopies(() => t)
     copies.seed("claude-code", "p1", [cp("other", "0xauthorCodex", iso(10), { progress: ["kept across failures"] })])
@@ -336,7 +433,6 @@ describe("the daemon's checkpoint copy", () => {
 
   it("a local revoke refuses the very next prompt even with a warm copy — and the copy is gone", async () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(30))
     const copies = new CheckpointCopies(() => NOW)
     copies.seed("claude-code", "p1", [cp("other", "0xauthorCodex", iso(10))])
     // `mida revoke` ran in the owner's process: the marker file landed and the approval row is
@@ -379,23 +475,38 @@ describe("the daemon's checkpoint copy", () => {
   })
 })
 
-describe("lastSeen state", () => {
-  it("writeLastSeen then readLastSeen round-trips the watermark", () => {
+describe("seen state", () => {
+  it("writeSeen then readSeen round-trips the set", () => {
     const dir = home()
-    writeLastSeen(dir, "s-1", iso(10))
-    expect(readLastSeen(dir, "s-1")).toBe(iso(10))
+    writeSeen(dir, "s-1", ["0xa", "0xb"])
+    expect(readSeen(dir, "s-1")).toEqual(new Set(["0xa", "0xb"]))
   })
 
-  it("a missing file reads as the empty baseline", () => {
+  it("a missing file reads as the empty set", () => {
     const dir = home()
-    expect(readLastSeen(dir, "s-1")).toBe("")
+    expect(readSeen(dir, "s-1")).toEqual(new Set())
+  })
+
+  it("an old { lastSeen } file reads as the empty set — a silent migration", () => {
+    const dir = home()
+    dir.writeSecretJson("state/lastseen/s-1.json", { lastSeen: iso(10) })
+    expect(readSeen(dir, "s-1")).toEqual(new Set())
+  })
+
+  it("the file keeps the newest 300 ids — a 301st drops the oldest", () => {
+    const dir = home()
+    writeSeen(dir, "s-1", Array.from({ length: 301 }, (_, i) => `0xid-${i}`))
+    const seen = readSeen(dir, "s-1")
+    expect(seen.size).toBe(300)
+    expect(seen.has("0xid-0")).toBe(false)
+    expect(seen.has("0xid-300")).toBe(true)
   })
 
   it("an unsafe session id writes nothing and reads nothing", () => {
     const dir = home()
-    writeLastSeen(dir, "../escape", iso(10))
+    writeSeen(dir, "../escape", ["0xa"])
     expect(dir.list("state/lastseen")).toEqual([])
-    expect(readLastSeen(dir, "../escape")).toBe("")
-    expect(readLastSeen(dir, undefined)).toBe("")
+    expect(readSeen(dir, "../escape")).toEqual(new Set())
+    expect(readSeen(dir, undefined)).toEqual(new Set())
   })
 })

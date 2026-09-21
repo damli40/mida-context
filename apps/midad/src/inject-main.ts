@@ -9,7 +9,7 @@ import type { MidaHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { appendLog } from "./log.js"
 import { isSafeName } from "./queue.js"
-import { writeLastSeen } from "./whatsnew.js"
+import { writeSeen } from "./whatsnew.js"
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 const DAEMON_MAIN = fileURLToPath(new URL("./daemon-main.ts", import.meta.url))
@@ -80,17 +80,20 @@ async function whatsNew(home: MidaHome, agent: string | undefined, record: Recor
       if (reply.status === 0) appendLog(home, "hook", { event: "whatsnew-timeout", agent, sessionId })
       return
     }
-    const body = reply.body as { kind?: unknown; note?: unknown; updates?: unknown; lastSeen?: unknown } | null
+    const body = reply.body as { kind?: unknown; note?: unknown; updates?: unknown; seen?: unknown } | null
     if (body?.kind !== "updates" || typeof body.note !== "string" || body.note === "") return
-    if (sessionId !== undefined && typeof body.lastSeen === "string") {
+    const updates = Array.isArray(body.updates) ? body.updates : []
+    const seen = Array.isArray(body.seen) ? body.seen.filter((id): id is string => typeof id === "string") : undefined
+    await writeLine(hookReply("UserPromptSubmit", whatsNewMessage(updates, Date.now()), body.note))
+    // the seen set is written only after the note was printed — an answer lost on the way to the
+    // model stays undelivered, and the next prompt offers it again
+    if (sessionId !== undefined && seen !== undefined) {
       try {
-        writeLastSeen(home, sessionId, body.lastSeen)
+        writeSeen(home, sessionId, seen)
       } catch {
         // a failed state write only means the same note may be offered once more
       }
     }
-    const updates = Array.isArray(body.updates) ? body.updates : []
-    await writeLine(hookReply("UserPromptSubmit", whatsNewMessage(updates, Date.now()), body.note))
   } catch {
     // the prompt hook never throws — silence, exit 0
   }
@@ -156,12 +159,13 @@ async function main(): Promise<void> {
     await writeLine(degraded("bad-reply"))
     return
   }
-  // the session's whats-new watermark starts here: the newest checkpoint this handoff covered —
-  // or the empty baseline, so the first real save afterwards still shows up as new
+  // the session's whats-new seen set starts here: the contextIds this handoff covered — or the
+  // empty set, so the first real save afterwards still shows up as new
   const sessionId = typeof record.session_id === "string" ? record.session_id : undefined
   if (sessionId !== undefined && body.kind !== "refused") {
     try {
-      writeLastSeen(home, sessionId, body.kind === "handoff" && typeof body.savedAt === "string" ? body.savedAt : "")
+      const covered = Array.isArray(body.seen) ? body.seen.filter((id): id is string => typeof id === "string") : []
+      writeSeen(home, sessionId, covered)
     } catch {
       // no baseline written — the whats-new read will simply treat everything as new once
     }

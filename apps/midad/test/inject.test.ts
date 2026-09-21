@@ -6,7 +6,7 @@ import type { Server, Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { MidaHome, readLastSeen, socketPathFor, writeLastSeen } from "@mida/midad"
+import { MidaHome, readSeen, socketPathFor, writeSeen } from "@mida/midad"
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 const INJECT_MAIN = fileURLToPath(new URL("../src/inject-main.ts", import.meta.url))
@@ -294,24 +294,25 @@ describe("inject-main process", () => {
     }
   }, 30_000)
 
-  it("a served handoff records the covered checkpoint's time as the session's lastSeen", async () => {
-    const savedAt = "2026-09-21T10:00:00.000Z"
-    const { dir, server } = await liveDaemon(handoffBody({ savedAt }))
+  it("a served handoff records the covered contextIds as the session's seen set", async () => {
+    const { dir, server } = await liveDaemon(handoffBody({ seen: ["0xcovered-1", "0xcovered-2"] }))
     try {
       const res = await run(["codex"], sessionStart(), dir.root)
       expect(res.status).toBe(0)
-      expect(readLastSeen(dir, "s1")).toBe(savedAt)
+      expect(readSeen(dir, "s1")).toEqual(new Set(["0xcovered-1", "0xcovered-2"]))
     } finally {
       await close(server)
     }
   }, 30_000)
 
   it("an empty handoff records the empty baseline so the first real save shows as new", async () => {
-    const { dir, server } = await liveDaemon({ kind: "empty", text: "x" })
+    const { dir, server } = await liveDaemon({ kind: "empty", text: "x", seen: [] })
     try {
       const res = await run(["codex"], sessionStart(), dir.root)
       expect(res.status).toBe(0)
-      expect(readLastSeen(dir, "s1")).toBe("")
+      expect(readSeen(dir, "s1")).toEqual(new Set())
+      // the baseline file exists — the session started and saw nothing
+      expect(dir.has("state/lastseen/s1.json")).toBe(true)
     } finally {
       await close(server)
     }
@@ -330,15 +331,15 @@ describe("inject-main process", () => {
 })
 
 describe("inject-main process — UserPromptSubmit", () => {
-  it("an update prints the envelope with the owner's line and the note, then advances lastSeen", async () => {
+  it("an update prints the envelope with the owner's line and the note, then marks the ids seen", async () => {
     const dir = home()
-    writeLastSeen(dir, "s1", "2026-09-21T11:00:00.000Z")
+    writeSeen(dir, "s1", ["0xearlier"])
     const savedAt = new Date(Date.now() - 40_000).toISOString()
     const daemon = await whatsnewDaemon(dir, {
       kind: "updates",
       note: "Mida update since you last checked:\n- codex: did the thing",
       updates: [{ agent: "codex", savedAt }],
-      lastSeen: savedAt,
+      seen: ["0xearlier", "0xnew-delivered"],
     })
     try {
       const res = await run(["claude-code"], promptSubmit(), dir.root)
@@ -348,23 +349,23 @@ describe("inject-main process — UserPromptSubmit", () => {
       expect(out.systemMessage).toMatch(/^Mida: update from codex \(\d+ s ago\)$/)
       expect(out.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit")
       expect(out.hookSpecificOutput.additionalContext).toContain("did the thing")
-      // the watermark moved to the newest covered checkpoint — a second prompt sees nothing
-      expect(readLastSeen(dir, "s1")).toBe(savedAt)
+      // the delivered ids are recorded — a second prompt sees nothing
+      expect(readSeen(dir, "s1")).toEqual(new Set(["0xearlier", "0xnew-delivered"]))
     } finally {
       await daemon.stop()
     }
   }, 30_000)
 
-  it("nothing new prints nothing at all — no JSON, no empty note — and lastSeen is untouched", async () => {
+  it("nothing new prints nothing at all — no JSON, no empty note — and the seen set is untouched", async () => {
     const dir = home()
-    writeLastSeen(dir, "s1", "2026-09-21T11:00:00.000Z")
-    const daemon = await whatsnewDaemon(dir, { kind: "none", lastSeen: "2026-09-21T11:00:00.000Z" })
+    writeSeen(dir, "s1", ["0xkeep"])
+    const daemon = await whatsnewDaemon(dir, { kind: "none" })
     try {
       const res = await run(["claude-code"], promptSubmit(), dir.root)
       expect(res.status).toBe(0)
       expect(res.stderr).toBe("")
       expect(res.stdout).toBe("")
-      expect(readLastSeen(dir, "s1")).toBe("2026-09-21T11:00:00.000Z")
+      expect(readSeen(dir, "s1")).toEqual(new Set(["0xkeep"]))
     } finally {
       await daemon.stop()
     }
@@ -385,7 +386,7 @@ describe("inject-main process — UserPromptSubmit", () => {
 
   it("a daemon that answers late gets silence — the prompt never waits past 1.5 s, and the give-up is logged", async () => {
     const dir = home()
-    const daemon = await whatsnewDaemon(dir, { kind: "updates", note: "N", updates: [], lastSeen: "" }, { delayMs: 5_000 })
+    const daemon = await whatsnewDaemon(dir, { kind: "updates", note: "N", updates: [], seen: [] }, { delayMs: 5_000 })
     try {
       const started = Date.now()
       const res = await run(["claude-code"], promptSubmit(), dir.root)

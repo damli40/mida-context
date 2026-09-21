@@ -374,6 +374,7 @@ describe("buildHandoff", () => {
       facts: 0,
       factsFailed: null,
       readMs: expect.any(Number),
+      seen: [],
     })
   })
 
@@ -413,6 +414,22 @@ describe("buildHandoff", () => {
     expect(result.text).toContain(second.contextId)
     expect(result.text).toContain("- claude-code (on-chain author")
     expect(result.text).toContain("- codex (on-chain author")
+  })
+
+  it("the covered set names the foreign contextIds — the session's own checkpoints never enter it", async () => {
+    const own = stored(
+      { eventId: "cp-own", agent: "codex", createdAt: "2026-09-21T10:00:00.000Z" },
+      { sessionId: "s2", contextId: `0x${"d".repeat(64)}`, authorId: `0x${"e".repeat(64)}` },
+    )
+    const foreign = stored(
+      { eventId: "cp-other", agent: "claude-code", createdAt: "2026-09-21T09:00:00.000Z" },
+      { sessionId: "s1", contextId: `0x${"b".repeat(64)}`, authorId: `0x${"c".repeat(64)}` },
+    )
+    const { d } = deps({ read: async () => ({ checkpoints: [own, foreign], skipped: 0, milliseconds: 3 }) })
+    const result = await buildHandoff(runtime, { ...input, sessionId: "s2" }, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.seen).toEqual([foreign.contextId])
   })
 
   it("an author id the runtime does not know renders as 'unknown agent', never undefined", async () => {

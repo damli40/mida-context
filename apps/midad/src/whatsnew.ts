@@ -11,11 +11,14 @@ import { authorNamesFor, readCheckpoints } from "./skeleton.js"
 
 /**
  * What the UserPromptSubmit hook asks the daemon: did any OTHER session save to this project
- * since this session last saw context? The session keeps a watermark — `lastSeen`, the newest
- * checkpoint its handoff covered — in `state/lastseen/<sessionId>.json`. Checkpoints created
- * after it, minus the session's own, become a ≤600-char note: one line per authoring agent,
- * newest first. Nothing new means an empty answer and an untouched watermark, so a second
- * prompt never repeats what the first one already said.
+ * since this session last saw context? The session keeps a set — `seen`, the foreign contextIds
+ * already delivered to it or covered by its handoff — in `state/lastseen/<sessionId>.json`. A
+ * foreign checkpoint whose id is not in the set is new, whenever it was compiled: checkpoints
+ * are stamped at compile time but land on-chain seconds later, so a time watermark loses the
+ * ones that arrive late, and another machine's slow clock must not matter either. New
+ * checkpoints become a ≤600-char note: one line per authoring agent, newest first. Nothing new
+ * means an empty answer and an untouched set, so a second prompt never repeats what the first
+ * one already said.
  *
  * The answer always comes from the daemon's memory copy — never from a network read a prompt
  * cannot wait for (a real chain+storage read takes seconds; the hook hangs up at 1.5 s). A stale
@@ -191,8 +194,8 @@ export class CheckpointCopies {
 }
 
 export type WhatsNewResult =
-  | { kind: "updates"; note: string; updates: { agent: string; savedAt: string }[]; lastSeen: string }
-  | { kind: "none"; lastSeen: string }
+  | { kind: "updates"; note: string; updates: { agent: string; savedAt: string }[]; seen: string[] }
+  | { kind: "none" }
   | { kind: "refused"; reason: string }
 
 export interface WhatsNewDeps {
@@ -213,25 +216,33 @@ export interface WhatsNewDeps {
 
 const lastSeenPath = (sessionId: string) => `state/lastseen/${sessionId}.json`
 
+/** How many delivered contextIds a session's seen record keeps — the oldest drop past this. */
+const SEEN_MAX = 300
+
 /**
- * The session's watermark, or "" when there is no usable record — a missing or corrupt file is
- * "never saw anything", so every foreign checkpoint counts as new once and the delivered
- * watermark then quietens later prompts.
+ * The session's seen set — the foreign contextIds already delivered to it or covered by its
+ * handoff — or the empty set when there is no usable record: a missing file, a corrupt one, or
+ * the old `{ lastSeen }` watermark shape all mean "never saw anything", so every foreign
+ * checkpoint counts as new once and the delivered set then quietens later prompts.
  */
-export function readLastSeen(home: MidaHome, sessionId: string | undefined): string {
-  if (sessionId === undefined || !isSafeName(sessionId)) return ""
+export function readSeen(home: MidaHome, sessionId: string | undefined): Set<string> {
+  if (sessionId === undefined || !isSafeName(sessionId)) return new Set()
   try {
-    const stored = home.readJson<{ lastSeen?: unknown }>(lastSeenPath(sessionId))
-    return typeof stored?.lastSeen === "string" ? stored.lastSeen : ""
+    const stored = home.readJson<{ seen?: unknown }>(lastSeenPath(sessionId))
+    if (!Array.isArray(stored?.seen)) return new Set()
+    return new Set(stored.seen.filter((id): id is string => typeof id === "string"))
   } catch {
-    return ""
+    return new Set()
   }
 }
 
-/** Written by the hook only — at session start (what the handoff covered) and after a delivered note. */
-export function writeLastSeen(home: MidaHome, sessionId: string, lastSeen: string): void {
+/**
+ * Written by the hook only — at session start (the contextIds the handoff covered) and after a
+ * delivered note. `seen` is oldest-first; the file keeps at most SEEN_MAX, the oldest dropped.
+ */
+export function writeSeen(home: MidaHome, sessionId: string, seen: string[]): void {
   if (!isSafeName(sessionId)) return
-  home.writeSecretJson(lastSeenPath(sessionId), { lastSeen })
+  home.writeSecretJson(lastSeenPath(sessionId), { seen: seen.slice(-SEEN_MAX) })
 }
 
 const parse = (iso: string): number => Date.parse(iso)
@@ -276,7 +287,7 @@ function buildNote(lines: string[]): string {
  * read itself. It passes the same access gates as the handoff — a refused agent gets
  * `{ kind: "refused" }` and the daemon log records the reason — with one relaxation: the on-chain
  * capability verdict may be reused for CAPABILITY_REUSE_MS, because the local gates still refuse
- * a revoke made here on the very next prompt. The answer carries `lastSeen` only as a proposal:
+ * a revoke made here on the very next prompt. The answer carries `seen` only as a proposal:
  * the hook writes it after the note reaches the model, so a timed-out delivery can be re-sent
  * by the next prompt instead of being silently dropped.
  */
@@ -309,7 +320,7 @@ export async function buildWhatsNew(
       copies.dropAgent(input.agent)
       return { kind: "refused", reason: access.reason }
     }
-    const lastSeen = readLastSeen(runtime.home, input.sessionId)
+    const seen = readSeen(runtime.home, input.sessionId)
     const entry = copies.get(input.agent, access.approval.projectId)
     if (entry === undefined || now() - entry.fetchedAt >= COPY_STALE_MS) {
       // refresh behind the prompt's back — the old copy (or none) answers right now, and this
@@ -327,41 +338,38 @@ export async function buildWhatsNew(
       )
     }
     const checkpoints = entry?.checkpoints ?? []
-    const sinceMs = parse(lastSeen) // NaN when unset — every parseable createdAt is newer
-    const isNew = (iso: string): boolean => {
-      const at = parse(iso)
-      return !Number.isNaN(at) && (Number.isNaN(sinceMs) || at > sinceMs)
-    }
-    // The watermark covers everything this read saw — the session's own checkpoints included:
-    // they are always filtered out, so advancing past them costs nothing.
-    let watermarkMs = Number.isNaN(sinceMs) ? 0 : sinceMs
-    for (const cp of checkpoints) {
-      const at = parse(cp.checkpoint.createdAt)
-      if (!Number.isNaN(at) && at > watermarkMs) watermarkMs = at
-    }
-    // Per foreign author: the newest checkpoint after lastSeen is the line; the newest at-or-
-    // before lastSeen is the baseline the artifact diff is measured against.
+    // Per foreign author: the newest checkpoint the session has NOT seen is the line; the
+    // newest one it HAS seen is the baseline the artifact diff is measured against. A
+    // checkpoint whose createdAt will not parse can neither be ordered into the note nor serve
+    // as a baseline — but it still lands in the covered set so it is never offered either.
     const perAuthor = new Map<string, { newest?: StoredCheckpoint; baseline?: StoredCheckpoint }>()
+    const foreignIds: { id: string; at: number }[] = []
     for (const cp of checkpoints) {
       if (cp.sessionId === input.sessionId) continue
-      const entry = perAuthor.get(cp.authorId) ?? {}
       const at = parse(cp.checkpoint.createdAt)
+      foreignIds.push({ id: cp.contextId, at: Number.isNaN(at) ? 0 : at })
       if (Number.isNaN(at)) continue
-      if (isNew(cp.checkpoint.createdAt)) {
-        if (entry.newest === undefined || at > parse(entry.newest.checkpoint.createdAt)) entry.newest = cp
-      } else if (entry.baseline === undefined || at > parse(entry.baseline.checkpoint.createdAt)) {
-        entry.baseline = cp
+      const bucket = perAuthor.get(cp.authorId) ?? {}
+      if (!seen.has(cp.contextId)) {
+        if (bucket.newest === undefined || at > parse(bucket.newest.checkpoint.createdAt)) bucket.newest = cp
+      } else if (bucket.baseline === undefined || at > parse(bucket.baseline.checkpoint.createdAt)) {
+        bucket.baseline = cp
       }
-      perAuthor.set(cp.authorId, entry)
+      perAuthor.set(cp.authorId, bucket)
     }
     const updates = [...perAuthor.entries()]
-      .flatMap(([authorId, entry]) => (entry.newest === undefined ? [] : [{ authorId, ...entry, newest: entry.newest }]))
+      .flatMap(([authorId, bucket]) => (bucket.newest === undefined ? [] : [{ authorId, ...bucket, newest: bucket.newest }]))
       .sort((a, b) => parse(b.newest.checkpoint.createdAt) - parse(a.newest.checkpoint.createdAt))
-    if (updates.length === 0) return { kind: "none", lastSeen }
+    if (updates.length === 0) return { kind: "none" }
     const names = deps.authorNames ?? authorNamesFor(runtime)
     const lines = updates.map((u) =>
       updateLine(names[u.authorId.toLowerCase()] ?? "unknown agent", u.newest, u.baseline, now()),
     )
+    // the proposed set covers every foreign checkpoint this answer saw — shown in the note or
+    // folded into "…and N more" — appended newest-last so the record's cap drops the oldest
+    const known = new Set(seen)
+    const arrived = foreignIds.filter((f) => !known.has(f.id)).sort((a, b) => a.at - b.at).map((f) => f.id)
+    const proposed = [...seen, ...arrived].slice(-SEEN_MAX)
     return {
       kind: "updates",
       note: buildNote(lines),
@@ -369,7 +377,7 @@ export async function buildWhatsNew(
         agent: names[u.authorId.toLowerCase()] ?? "unknown agent",
         savedAt: u.newest.checkpoint.createdAt,
       })),
-      lastSeen: new Date(watermarkMs).toISOString(),
+      seen: proposed,
     }
   } catch {
     return { kind: "refused", reason: "internal" }

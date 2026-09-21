@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { CheckpointCopies, MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, ownerOnlyLine, removeJob, socketPathFor, startDaemon, writeLastSeen } from "@mida/midad"
+import { CheckpointCopies, MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, ownerOnlyLine, removeJob, socketPathFor, startDaemon, writeSeen } from "@mida/midad"
 import type { DrainDeps, DrainResult, Runtime, ServiceRuntime } from "@mida/midad"
 import type { DaemonDeps } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
@@ -374,7 +374,7 @@ describe("startDaemon", () => {
 
   it("POST /whatsnew answers updates for foreign checkpoints and logs one stable line (R5-5)", async () => {
     const { home, deps, stubRuntime, logs } = setup()
-    writeLastSeen(home, "s-1", "2026-09-21T11:00:00.000Z")
+    writeSeen(home, "s-1", ["0xprior-delivery"])
     const foreign = {
       checkpoint: sampleCheckpoint({ eventId: "cp-1", agent: "codex", createdAt: "2026-09-21T11:30:00.000Z", progress: ["shipped it"], nextAction: "rest" }),
       projectId: "p1", sessionId: "other-session", continuesSession: null, compiledBy: "test",
@@ -402,12 +402,13 @@ describe("startDaemon", () => {
     try {
       const reply = await callDaemon(home, "/whatsnew", { agent: "claude-code", cwd: "/tmp/work", sessionId: "s-1" }, { timeoutMs: 2_000 })
       expect(reply.status).toBe(200)
-      const body = reply.body as { kind: string; note: string; updates: { agent: string }[]; lastSeen: string }
+      const body = reply.body as { kind: string; note: string; updates: { agent: string }[]; seen: string[] }
       expect(body.kind).toBe("updates")
       expect(body.note).toContain("Mida update since you last checked:")
       expect(body.note).toContain("codex")
       expect(body.updates).toEqual([{ agent: "codex", savedAt: "2026-09-21T11:30:00.000Z" }])
-      expect(body.lastSeen).toBe("2026-09-21T11:30:00.000Z")
+      // the proposed set keeps what was already delivered and adds the reported checkpoint's id
+      expect(body.seen).toEqual(["0xprior-delivery", `0x${"a1".repeat(32)}`])
       // the warm copy answered — the checkpoint read never ran
       expect(reads).toBe(0)
       const entry = logs.find((e) => (e as { event?: string }).event === "whatsnew")! as Record<string, unknown>

@@ -27,6 +27,8 @@ export type HandoffResult =
       savedBy: string
       /** The newest covered checkpoint's createdAt — the point a whats-new read continues from. */
       savedAt: string
+      /** The foreign contextIds this handoff covered, oldest first — the session's whats-new seen set starts here. */
+      seen: string[]
       /** The size limit the text was cut against — the daemon logs it next to the text's length. */
       limitChars: number
       /** Oldest progress entries were left out so the text fits the limit — the owner sees "(shortened)". */
@@ -34,7 +36,7 @@ export type HandoffResult =
       /** Still longer than the limit after trimming — the owner sees "(longer than the limit)". */
       oversized: boolean
     }
-  | { kind: "empty"; text: string; facts: number; factsFailed: string | null; readMs: number }
+  | { kind: "empty"; text: string; facts: number; factsFailed: string | null; readMs: number; seen: string[] }
   | { kind: "refused"; text: string; reason: string }
 
 /** What the chain says about the agent's grants: one is live, at least one was revoked, or nothing valid remains. */
@@ -214,7 +216,13 @@ export async function buildHandoff(
     const facts = factOutcome.status === "ok" ? factOutcome.facts : []
     const factsFailed = factOutcome.status === "ok" ? null : factOutcome.status === "slow" ? "facts-read-slow" : "facts-read-failed"
     const merged = mergeCheckpoints(outcome.checkpoints)
-    if (merged === null) return { kind: "empty", text: EMPTY_TEXT, facts: facts.length, factsFailed, readMs }
+    if (merged === null) return { kind: "empty", text: EMPTY_TEXT, facts: facts.length, factsFailed, readMs, seen: [] }
+    // the checkpoints this session may treat as covered — its own never count: a session's own
+    // saves are never updates for it and must never enter its seen set
+    const covered = outcome.checkpoints
+      .filter((cp) => cp.sessionId !== input.sessionId)
+      .sort((a, b) => Date.parse(a.checkpoint.createdAt) - Date.parse(b.checkpoint.createdAt))
+      .map((cp) => cp.contextId)
     // Serving a handoff to a named new session binds it to the chain it was shown: the drainer's
     // saves for that session read state/continues/<sessionId>.json into continuesSession. A record
     // scoped to this project, a session never continues itself, and a write that fails only means
@@ -243,6 +251,7 @@ export async function buildHandoff(
       readMs,
       savedBy,
       savedAt: newest?.createdAt ?? "",
+      seen: covered,
       limitChars: rendered.limitChars,
       cut: rendered.cut,
       oversized: rendered.oversized,

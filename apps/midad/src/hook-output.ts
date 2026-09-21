@@ -44,6 +44,8 @@ export interface SessionStartBody {
   savedAt?: string
   cut?: boolean
   oversized?: boolean
+  /** The contextIds the handoff covered — the session's whats-new seen set starts from these. */
+  seen?: unknown
 }
 
 /** The one-line degraded outcome: daemon silent, reply unreadable, or a refusal with no prose. */
