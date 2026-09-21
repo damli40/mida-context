@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { renderHandoff, type MergedHandoff } from "../src/index.js"
+import { renderHandoff, renderHandoffReport, type MergedHandoff } from "../src/index.js"
 
 const base: MergedHandoff = { originalRequest: "Build X.\nStep 1 …", objective: "build X", remainingPlan: ["2. wire it"],
   unresolvedIssue: null, nextAction: "wire it", decisions: [{ decision: "sqlite", rationale: "no server" }],
@@ -189,5 +189,37 @@ describe("renderHandoff", () => {
     const text = renderHandoff({ ...base, originalRequest: "r".repeat(6000), decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i} ${"y".repeat(150)}`, rationale: "z".repeat(150) })) })
     expect(text).toContain("r".repeat(6000))
     expect(text).toContain("(handoff longer than the limit; nothing further was cut)")
+  })
+})
+
+describe("renderHandoffReport (R5-4)", () => {
+  it("reports the text's size, the limit it was cut against, and that nothing was cut", () => {
+    const out = renderHandoffReport(base)
+    expect(out.text).toBe(renderHandoff(base))
+    expect(out.chars).toBe(out.text.length)
+    expect(out.limitChars).toBe(8000)
+    expect(out.cut).toBe(false)
+    expect(out.oversized).toBe(false)
+  })
+  it("a handoff trimmed to fit reports cut: true", () => {
+    const progress = Array.from({ length: 400 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
+    const out = renderHandoffReport({ ...base, progress })
+    expect(out.cut).toBe(true)
+    expect(out.oversized).toBe(false)
+    expect(out.chars).toBeLessThanOrEqual(out.limitChars)
+  })
+  it("a handoff that still does not fit reports oversized — it was NOT 'cut'", () => {
+    const out = renderHandoffReport({ ...base, originalRequest: "r".repeat(9000) })
+    expect(out.cut).toBe(false)
+    expect(out.oversized).toBe(true)
+    expect(out.chars).toBeGreaterThan(out.limitChars)
+    expect(out.text).toContain("(handoff longer than the limit; nothing further was cut)")
+  })
+  it("a handoff that was trimmed AND still does not fit reports both", () => {
+    const progress = Array.from({ length: 400 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
+    const decisions = Array.from({ length: 60 }, (_, i) => ({ decision: `d${i} ${"y".repeat(300)}`, rationale: "z".repeat(300) }))
+    const out = renderHandoffReport({ ...base, progress, decisions })
+    expect(out.cut).toBe(true)
+    expect(out.oversized).toBe(true)
   })
 })

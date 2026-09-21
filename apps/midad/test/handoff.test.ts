@@ -433,6 +433,23 @@ describe("buildHandoff", () => {
     expect(result.kind).toBe("handoff")
   })
 
+  it("a handoff that needed trimming reports cut, the limit it was cut to, and its oversize state (R5-4)", async () => {
+    const progress = Array.from({ length: 400 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
+    const { d } = deps({ read: async () => ({ checkpoints: [stored({ progress })], skipped: 0, milliseconds: 1 }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toMatchObject({ kind: "handoff", cut: true, limitChars: 8000, oversized: false })
+    if (result.kind !== "handoff") return
+    expect(result.text.length).toBeLessThanOrEqual(result.limitChars)
+  })
+
+  it("a handoff that could not fit reports oversized instead of cut — the truth, not a guess (R5-4)", async () => {
+    const { d } = deps({
+      read: async () => ({ checkpoints: [stored({ originalRequest: "r".repeat(9000) })], skipped: 0, milliseconds: 1 }),
+    })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toMatchObject({ kind: "handoff", cut: false, oversized: true })
+  })
+
   it("merge or render throwing is a generic refusal, never a partial handoff", async () => {
     const a = stored({}, { projectId: "p1" })
     const b = stored({}, { projectId: "p2" }) // two projects — mergeCheckpoints throws

@@ -79,6 +79,21 @@ describe("sessionStartMessage", () => {
     expect(sessionStartMessage(body, "codex", NOW)).toContain("(shortened)")
   })
 
+  it("an oversized handoff says so — it was not shortened, it is longer than the limit (R5-4)", () => {
+    const body = {
+      kind: "handoff",
+      text: "CTX",
+      checkpoints: 1,
+      facts: 0,
+      savedBy: "codex",
+      savedAt: "2026-09-21T11:59:20.000Z",
+      oversized: true,
+    }
+    expect(sessionStartMessage(body, "codex", NOW)).toContain("(longer than the limit)")
+    const both = { ...body, cut: true }
+    expect(sessionStartMessage(both, "codex", NOW)).toContain("(shortened, longer than the limit)")
+  })
+
   it("empty: the connected line", () => {
     expect(sessionStartMessage({ kind: "empty", text: "x" }, "codex", NOW)).toBe(
       "Mida: connected — nothing saved for this project yet",

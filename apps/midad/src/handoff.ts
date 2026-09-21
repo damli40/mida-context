@@ -1,6 +1,6 @@
 import { isAbsolute } from "node:path"
 import { isMidaError } from "@mida/protocol"
-import { mergeCheckpoints, renderHandoff } from "@mida/checkpoint"
+import { mergeCheckpoints, renderHandoffReport } from "@mida/checkpoint"
 import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { checkProject } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
@@ -27,6 +27,12 @@ export type HandoffResult =
       savedBy: string
       /** The newest covered checkpoint's createdAt — the point a whats-new read continues from. */
       savedAt: string
+      /** The size limit the text was cut against — the daemon logs it next to the text's length. */
+      limitChars: number
+      /** Oldest progress entries were left out so the text fits the limit — the owner sees "(shortened)". */
+      cut: boolean
+      /** Still longer than the limit after trimming — the owner sees "(longer than the limit)". */
+      oversized: boolean
     }
   | { kind: "empty"; text: string; facts: number; factsFailed: string | null; readMs: number }
   | { kind: "refused"; text: string; reason: string }
@@ -203,15 +209,19 @@ export async function buildHandoff(
     const newest = merged.provenance.at(-1)
     const savedBy =
       newest === undefined ? "unknown agent" : (input.authorNames[newest.authorId.toLowerCase()] ?? "unknown agent")
+    const rendered = renderHandoffReport(merged, { authorNames: input.authorNames, facts, factsFailed })
     return {
       kind: "handoff",
-      text: renderHandoff(merged, { authorNames: input.authorNames, facts, factsFailed }),
+      text: rendered.text,
       checkpoints: outcome.checkpoints.length,
       facts: facts.length,
       factsFailed,
       readMs,
       savedBy,
       savedAt: newest?.createdAt ?? "",
+      limitChars: rendered.limitChars,
+      cut: rendered.cut,
+      oversized: rendered.oversized,
     }
   } catch {
     return refused("internal", noContextText("internal"))

@@ -268,6 +268,12 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         checkpoints: result.kind === "handoff" ? result.checkpoints : 0,
         facts: result.kind === "refused" ? 0 : result.facts,
         factsFailed: result.kind === "refused" ? null : result.factsFailed,
+        // the size the model received, the limit it was cut against, and whether it was cut —
+        // never re-derived from the text: the render reports them itself
+        chars: result.text.length,
+        limitChars: result.kind === "handoff" ? result.limitChars : null,
+        cut: result.kind === "handoff" && result.cut,
+        oversized: result.kind === "handoff" && result.oversized,
         readMs: result.kind === "refused" ? null : result.readMs,
         ms: deps.now() - started,
       })

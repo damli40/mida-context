@@ -5,6 +5,7 @@ import { dirname, join } from "node:path"
 import { MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, ownerOnlyLine, removeJob, socketPathFor, startDaemon } from "@mida/midad"
 import type { DrainDeps, DrainResult, Runtime, ServiceRuntime } from "@mida/midad"
 import type { DaemonDeps } from "@mida/midad"
+import { sampleCheckpoint } from "./helpers.js"
 
 const DRAIN_OK: DrainResult = { saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0, earliestDueMs: null }
 
@@ -273,6 +274,36 @@ describe("startDaemon", () => {
       const entry = logs.find((e) => (e as { event?: string }).event === "handoff")!
       expect(entry).toMatchObject({ agent: "codex", kind: "empty", facts: 0, factsFailed: "facts-read-failed" })
       expect(JSON.stringify(entry)).not.toContain("server went away")
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it("POST /handoff logs the delivered size and limit, and says when the text was cut (R5-4)", async () => {
+    const { home, deps, stubRuntime, logs } = setup()
+    const progress = Array.from({ length: 400 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
+    const big = {
+      checkpoint: sampleCheckpoint({ eventId: "cp-big", agent: "codex", progress }),
+      projectId: "p1", sessionId: "s1", continuesSession: null, compiledBy: "test",
+      contextId: `0x${"a1".repeat(32)}`, authorId: `0x${"b2".repeat(32)}`, namespaceId: `0x${"c3".repeat(32)}`,
+    }
+    const daemon = await startDaemon({
+      ...deps,
+      openRuntime: async () => ({ ...stubRuntime, home }) as Runtime,
+      handoffDeps: {
+        checkProject: async () => ({ ok: true, approval: { agent: "codex", projectId: "p1", root: "/tmp/work", approvedAt: "2026-09-21T00:00:00.000Z" } }),
+        capability: async () => "live",
+        read: async () => ({ checkpoints: [big], skipped: 0, milliseconds: 1 }),
+        readFacts: async () => [],
+      },
+    })
+    try {
+      const reply = await callDaemon(home, "/handoff", { agent: "codex", cwd: "/tmp/work" }, { timeoutMs: 2_000 })
+      expect(reply.status).toBe(200)
+      expect(reply.body).toMatchObject({ kind: "handoff", cut: true, limitChars: 8000, oversized: false })
+      const entry = logs.find((e) => (e as { event?: string }).event === "handoff")! as Record<string, unknown>
+      expect(entry).toMatchObject({ kind: "handoff", cut: true, limitChars: 8000, oversized: false })
+      expect(entry.chars).toBe((reply.body as { text: string }).text.length)
     } finally {
       await daemon.close()
     }

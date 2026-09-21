@@ -43,6 +43,7 @@ export interface SessionStartBody {
   savedBy?: string
   savedAt?: string
   cut?: boolean
+  oversized?: boolean
 }
 
 /** The one-line degraded outcome: daemon silent, reply unreadable, or a refusal with no prose. */
@@ -67,8 +68,13 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
       typeof body.savedBy === "string" && typeof body.savedAt === "string"
         ? ` (from ${body.savedBy}, ${agoText(body.savedAt, now)})`
         : ""
-    const shortened = body.cut === true ? " (shortened)" : ""
-    return systemMessage(`Mida: handoff loaded — ${counts}${from}${shortened}`)
+    // honest size state: "(shortened)" only when progress was actually left out — a handoff that
+    // is simply longer than the limit says so instead (R5-4)
+    const size = [body.cut === true ? "shortened" : null, body.oversized === true ? "longer than the limit" : null].filter(
+      (s): s is string => s !== null,
+    )
+    const state = size.length > 0 ? ` (${size.join(", ")})` : ""
+    return systemMessage(`Mida: handoff loaded — ${counts}${from}${state}`)
   }
   if (body.kind === "empty") return "Mida: connected — nothing saved for this project yet"
   if (body.kind === "refused" && body.reason === "revoked") {

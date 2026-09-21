@@ -47,6 +47,19 @@ function defuse(text: string): string {
     .join("\n")
 }
 
+/** What the rendered text's size came out as — the daemon logs this and the owner sees `cut`. */
+export interface RenderedHandoff {
+  text: string
+  /** The final text's length — what the model receives. */
+  chars: number
+  /** The size limit the text was cut against. */
+  limitChars: number
+  /** Oldest progress entries were left out so the text fits the limit. */
+  cut: boolean
+  /** Still longer than the limit after trimming — the text itself says so. */
+  oversized: boolean
+}
+
 export function renderHandoff(
   merged: MergedHandoff,
   options: {
@@ -56,6 +69,23 @@ export function renderHandoff(
     factsFailed?: string | null
   } = {},
 ): string {
+  return renderHandoffReport(merged, options).text
+}
+
+/**
+ * The render plus an honest account of its size: `cut` means oldest progress entries were left
+ * out, `oversized` means the text is still longer than the limit (the text says so itself). A
+ * caller that logs the handoff should record all three numbers, never re-derive them.
+ */
+export function renderHandoffReport(
+  merged: MergedHandoff,
+  options: {
+    maxChars?: number
+    authorNames?: Record<string, string>
+    facts?: { text: string; contextId: string }[]
+    factsFailed?: string | null
+  } = {},
+): RenderedHandoff {
   const maxChars = options.maxChars ?? 8000
   const cut = (s: string, n = 300) => (s.length > n ? s.slice(0, n - 1) + "…" : s)
   const list = (title: string, items: string[]): string | null =>
@@ -157,5 +187,5 @@ export function renderHandoff(
   if (out.length > maxChars) {
     out = build(dropped, "(handoff longer than the limit; nothing further was cut)")
   }
-  return out
+  return { text: out, chars: out.length, limitChars: maxChars, cut: dropped > 0, oversized: out.length > maxChars }
 }
