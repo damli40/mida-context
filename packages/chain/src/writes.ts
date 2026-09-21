@@ -19,6 +19,13 @@ import type { ChainContext } from "./registry.js"
 export interface WriteContext extends ChainContext {
   walletClient: WalletClient
   account: Account
+  /**
+   * Runs between the gas estimate and the send: the payer's balance can be checked against the
+   * estimated cost and topped up, or the send refused before a transaction the wallet cannot
+   * pay for goes out (R4-4). Only the owner's context wires this; agent signers keep the bare
+   * node error, exactly as before.
+   */
+  beforeSend?: (cost: { payer: Address; gasLimit: bigint }) => Promise<void>
 }
 
 /** A write context whose account can sign typed data locally (operators, owners and agent signers in tests and the CLI). */
@@ -70,6 +77,7 @@ export async function sendContract(
   } catch (error) {
     throw toMidaError(error)
   }
+  await context.beforeSend?.({ payer: context.account.address, gasLimit: gas })
   const hash = await context.walletClient.writeContract({ ...(request as object), gas } as never)
   const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
   if (receipt.status !== "success") {
@@ -93,6 +101,7 @@ export async function sendValue(
   } catch (error) {
     throw toMidaError(error)
   }
+  await context.beforeSend?.({ payer: context.account.address, gasLimit: gas })
   const hash = await context.walletClient.sendTransaction({
     account: context.account,
     chain: context.walletClient.chain,

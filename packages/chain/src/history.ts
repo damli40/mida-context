@@ -3,7 +3,7 @@ import { getAbiItem } from "viem"
 import type { AbiEvent } from "viem"
 import { capabilityRegistryAbi } from "./abis.js"
 import type { Deployment } from "./deployment.js"
-import { getLogsChunked } from "./logs.js"
+import { blockWindows, getLogsChunked } from "./logs.js"
 import type { LogClient } from "./logs.js"
 
 const CAPABILITY_REVOKED = getAbiItem({ abi: capabilityRegistryAbi, name: "CapabilityRevoked" }) as AbiEvent
@@ -21,12 +21,27 @@ export interface HistoryClient extends LogClient {
   readContract?(parameters: { address: Address; abi: typeof capabilityRegistryAbi; functionName: "agentEpoch"; args: readonly [Address, Hex] }): Promise<unknown>
 }
 
+/**
+ * Where the last successful scan stopped for one (owner, agentId) pair (R4-9). A cache of chain
+ * facts, never an authority: the caller supplies load/save (the CLI keeps it at
+ * `state/history/<agentId>.json`, keyed on chain id and registry) and a missing, malformed or
+ * wrong-chain answer from load() means a full scan, not a guess. `previouslyRevoked` is sticky —
+ * nothing on the chain un-revokes — so a saved true answers without any scan at all.
+ */
+export interface HistoryScanCursor {
+  load(): { observedThroughBlock: bigint; previouslyRevoked: boolean } | undefined | Promise<{ observedThroughBlock: bigint; previouslyRevoked: boolean } | undefined>
+  save(state: { observedThroughBlock: bigint; previouslyRevoked: boolean }): void | Promise<void>
+}
+
 export async function ownerHistory(input: {
   client: HistoryClient
   deployment: Deployment
   owner: Address
   agentId: Hex
   toBlock?: bigint
+  cursor?: HistoryScanCursor
+  /** Called once, before the log scan starts, with the number of requests it will take. */
+  onScan?: (requests: number) => void
 }): Promise<OwnerAgentHistory> {
   const toBlock = input.toBlock ?? (await input.client.getBlockNumber())
   // Ask the contract before scanning anything. `agentEpoch(owner, agentId)` starts at 0, every
@@ -47,12 +62,31 @@ export async function ownerHistory(input: {
     // which does not move the counter, could — so that one event still has to be scanned for.
     agentLevelRevokePossible = false
   }
-  const scan = { address: input.deployment.capabilityRegistry, fromBlock: input.deployment.deploymentBlock, toBlock }
+  // The cursor is consulted only AFTER the contract answered: an epoch above 0 already proved a
+  // revoke with one request, and no cache should shadow that. A saved true is sticky — revoked is
+  // forever — and a position at or past the head leaves nothing new to scan.
+  const cursor = await input.cursor?.load()
+  if (cursor !== undefined) {
+    if (cursor.previouslyRevoked) {
+      return { owner: input.owner, agentId: input.agentId, previouslyRevoked: true, observedThroughBlock: toBlock }
+    }
+    if (cursor.observedThroughBlock >= toBlock) {
+      return { owner: input.owner, agentId: input.agentId, previouslyRevoked: false, observedThroughBlock: toBlock }
+    }
+  }
+  const fromBlock =
+    cursor !== undefined && cursor.observedThroughBlock + 1n > input.deployment.deploymentBlock
+      ? cursor.observedThroughBlock + 1n
+      : input.deployment.deploymentBlock
   const filter = { owner: input.owner, agentId: input.agentId }
+  input.onScan?.(blockWindows(fromBlock, toBlock).length)
   const logs = [
-    ...(await getLogsChunked(input.client, { ...scan, event: CAPABILITY_REVOKED, args: filter })),
-    ...(agentLevelRevokePossible ? await getLogsChunked(input.client, { ...scan, event: AGENT_REVOKED, args: filter }) : []),
+    ...(await getLogsChunked(input.client, { address: input.deployment.capabilityRegistry, fromBlock, toBlock, event: CAPABILITY_REVOKED, args: filter })),
+    ...(agentLevelRevokePossible ? await getLogsChunked(input.client, { address: input.deployment.capabilityRegistry, fromBlock, toBlock, event: AGENT_REVOKED, args: filter }) : []),
   ]
   const previouslyRevoked = logs.some((log) => same(log.args.owner, input.owner) && same(log.args.agentId, input.agentId))
+  // Only a complete scan may move the cursor — a failed window threw above, so what is saved here
+  // always covers every block up to toBlock.
+  await input.cursor?.save({ observedThroughBlock: toBlock, previouslyRevoked })
   return { owner: input.owner, agentId: input.agentId, previouslyRevoked, observedThroughBlock: toBlock }
 }

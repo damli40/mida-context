@@ -35,6 +35,9 @@ export const GAS_CEILINGS = {
   "context.register": 650_000n,
   // grantBatch. Ceiling 1,500,000 — grows with the scope count and with how many grants the
   // agent already holds. Measured tx.gas 654,761 under prague for the benchmark-sized batch.
+  // Live cost finding (Monad testnet, Sep 21): re-approving a previously revoked agent billed
+  // 832,470 gas — about twice a first approval (403,382 to 424,323) — because the compacted
+  // capability list is rebuilt on top of the old grant rows.
   "grant.batch": 1_500_000n,
   // revoke (single capability). Measured tx.gas 55,430, both hardforks. 2x = 110,860, rounded up.
   "revoke.capability": 150_000n,

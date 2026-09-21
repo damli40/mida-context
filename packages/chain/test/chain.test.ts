@@ -215,3 +215,85 @@ describe("owner history (§14.6 PREVIOUSLY_REVOKED)", () => {
     expect((await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT })).previouslyRevoked).toBe(false)
   })
 })
+
+describe("the history scan cursor (R4-9)", () => {
+  const zeroCounter = (client: LogClient) => ({
+    ...client,
+    getBlockNumber: client.getBlockNumber.bind(client),
+    getLogs: client.getLogs.bind(client),
+    readContract: async () => 0n,
+  })
+  /** An in-memory cursor standing in for the CLI's state/history/<agentId>.json file. */
+  const memoryCursor = (saved: { observedThroughBlock: bigint; previouslyRevoked: boolean } | undefined) => {
+    const writes: { observedThroughBlock: bigint; previouslyRevoked: boolean }[] = []
+    return {
+      writes,
+      cursor: {
+        load: () => saved,
+        save: (state: { observedThroughBlock: bigint; previouslyRevoked: boolean }) => {
+          writes.push(state)
+        },
+      },
+    }
+  }
+
+  it("a saved previouslyRevoked answers with no log scan at all", async () => {
+    const { client, calls } = recordingClient(20n, () => [])
+    const { cursor } = memoryCursor({ observedThroughBlock: 10n, previouslyRevoked: true })
+    const history = await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })
+    expect(history.previouslyRevoked).toBe(true)
+    expect(history.observedThroughBlock).toBe(20n)
+    expect(calls).toHaveLength(0)
+  })
+
+  it("a cursor at or past the head scans nothing", async () => {
+    const { client, calls } = recordingClient(20n, () => [])
+    const { cursor } = memoryCursor({ observedThroughBlock: 20n, previouslyRevoked: false })
+    const history = await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })
+    expect(history.previouslyRevoked).toBe(false)
+    expect(calls).toHaveLength(0)
+  })
+
+  it("a cursor behind the head scans only the new range and then saves the new position", async () => {
+    const { client, calls } = recordingClient(250n, () => [])
+    const { cursor, writes } = memoryCursor({ observedThroughBlock: 100n, previouslyRevoked: false })
+    const scans: number[] = []
+    const history = await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor, onScan: (n) => scans.push(n) })
+    expect(history).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: false, observedThroughBlock: 250n })
+    // the scan resumes one block after the cursor — never rescans what was already observed
+    expect(calls.length).toBeGreaterThan(0)
+    expect(Math.min(...calls.map((call) => Number(call.fromBlock)))).toBe(101)
+    expect(writes).toEqual([{ observedThroughBlock: 250n, previouslyRevoked: false }])
+    // the progress line gets the window count before the requests start
+    expect(scans).toEqual([blockWindows(101n, 250n).length])
+  })
+
+  it("a found revocation is saved sticky — previouslyRevoked: true", async () => {
+    const { client } = recordingClient(20n, (call) =>
+      call.event.name === "CapabilityRevoked" ? [{ args: { owner: OWNER, agentId: AGENT }, blockNumber: 9n, transactionHash: null, logIndex: 0 }] : [],
+    )
+    const { cursor, writes } = memoryCursor(undefined)
+    await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })
+    expect(writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: true }])
+  })
+
+  it("a scan that fails saves no cursor — a partial position would hide a missed revoke", async () => {
+    const { client, calls } = recordingClient(250n, (call) => {
+      if (call.fromBlock === 105n) throw new Error("window down")
+      return []
+    })
+    const { cursor, writes } = memoryCursor(undefined)
+    await expect(ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })).rejects.toThrow("window down")
+    expect(calls.length).toBeGreaterThan(0)
+    expect(writes).toHaveLength(0)
+  }, 15_000)
+
+  it("the contract's own answer wins over any cursor — the cursor is consulted only after the counter read", async () => {
+    const { client, calls } = recordingClient(20n, () => [])
+    const withView = { ...zeroCounter(client), readContract: async () => 3n }
+    const { cursor } = memoryCursor({ observedThroughBlock: 10n, previouslyRevoked: false })
+    const history = await ownerHistory({ client: withView, deployment, owner: OWNER, agentId: AGENT, cursor })
+    expect(history.previouslyRevoked).toBe(true)
+    expect(calls).toHaveLength(0)
+  })
+})
