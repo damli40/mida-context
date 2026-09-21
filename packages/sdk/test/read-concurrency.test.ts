@@ -113,7 +113,7 @@ function fixture(count = 12, delayMs = 12): Fixture {
   }
   const api = {
     account: { address: `0x${"55".repeat(20)}` as Address },
-    listObjects: async () => objects,
+    listObjects: async () => ({ objects, partial: false }),
     getEpochWrap: async (params: { readEpoch: bigint }) => {
       fx.wrapCalls.push(params.readEpoch)
       return wrapEpochPrivateKeyToAgent({

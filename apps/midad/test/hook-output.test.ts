@@ -100,6 +100,27 @@ describe("sessionStartMessage", () => {
     )
   })
 
+  it("a partial handoff tells the owner the list may be incomplete (M3-D)", () => {
+    const body = {
+      kind: "handoff",
+      text: "CTX",
+      checkpoints: 1,
+      facts: 0,
+      savedBy: "codex",
+      savedAt: "2026-09-21T11:59:20.000Z",
+      partial: true,
+    }
+    const line = sessionStartMessage(body, "codex", NOW)
+    expect(line).toContain("(incomplete — try again in a moment)")
+    expect(line).toContain("handoff loaded")
+  })
+
+  it("a partial empty read never claims 'nothing saved' — it asks for a retry instead (M3-D)", () => {
+    const line = sessionStartMessage({ kind: "empty", text: "x", partial: true }, "codex", NOW)
+    expect(line).toContain("(incomplete — try again in a moment)")
+    expect(line).not.toContain("nothing saved")
+  })
+
   it("refused revoked names the agent and the owner", () => {
     expect(sessionStartMessage({ kind: "refused", reason: "revoked", text: "x" }, "codex", NOW)).toBe(
       "Mida: codex has no access to this project (revoked by the owner)",

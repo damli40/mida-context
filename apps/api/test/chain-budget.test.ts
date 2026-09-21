@@ -245,12 +245,12 @@ describe("the per-request chain-read budget", () => {
     })
     const listed = await client.listObjects({ owner, namespaceId: NAMESPACE })
     expect(calls).toHaveLength(2)
-    expect(listed).toHaveLength(60)
-    expect(new Set(listed.map((object) => object.contextId)).size).toBe(60)
+    expect(listed.objects).toHaveLength(60)
+    expect(new Set(listed.objects.map((object) => object.contextId)).size).toBe(60)
     expect(listed.partial).toBe(false)
 
     // Still partial after the initial call plus three retries: the caller gets what accumulated
-    // WITH the flag — never a silent short list.
+    // WITH the flag — an honest { objects, partial } shape, never an array that looks complete.
     const alwaysPartial = new ContextApiClient({
       baseUrl: "http://mida.test",
       account,
@@ -264,6 +264,8 @@ describe("the per-request chain-read budget", () => {
     })
     const incomplete = await alwaysPartial.listObjects({ owner, namespaceId: NAMESPACE })
     expect(incomplete.partial).toBe(true)
-    expect(incomplete).toHaveLength(20) // 5 new objects per call × 4 calls
+    expect(incomplete.objects).toHaveLength(20) // 5 new objects per call × 4 calls
+    // the flag is a first-class field — it cannot hide as a non-enumerable property anymore
+    expect(JSON.parse(JSON.stringify(incomplete))).toEqual({ objects: expect.any(Array), partial: true })
   })
 })

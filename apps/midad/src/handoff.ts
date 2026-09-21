@@ -35,8 +35,10 @@ export type HandoffResult =
       cut: boolean
       /** Still longer than the limit after trimming — the owner sees "(longer than the limit)". */
       oversized: boolean
+      /** The store's list was incomplete — the text opens with the may-be-incomplete line and the owner sees "(incomplete …)". */
+      partial: boolean
     }
-  | { kind: "empty"; text: string; facts: number; factsFailed: string | null; readMs: number; seen: string[] }
+  | { kind: "empty"; text: string; facts: number; factsFailed: string | null; readMs: number; seen: string[]; partial: boolean }
   | { kind: "refused"; text: string; reason: string }
 
 /** What the chain says about the agent's grants: one is live, at least one was revoked, or nothing valid remains. */
@@ -69,6 +71,12 @@ const revokedText = (agent: string): string =>
 const TAMPERED_TEXT = "Mida: the approved-projects list failed its signature check. Nothing was shared. Run `mida doctor`."
 const UNREADABLE_TEXT = "Mida: the approved-projects list could not be read: check the file's permissions. Nothing was shared. Run `mida doctor`."
 const EMPTY_TEXT = "Mida: connected. Nothing has been saved for this project yet."
+/**
+ * The one line a partial read adds at the top of the model text (M3-D): the store verified what it
+ * served but could not check every row, so what follows may be missing context. The same sentence
+ * is the whole text when nothing rendered at all.
+ */
+export const PARTIAL_LINE = "Some saved context could not be loaded yet; what follows may be incomplete."
 
 /** The generic refusal line — the only text a session-start hook prints on its own failures. */
 export function noContextText(code: string): string {
@@ -153,7 +161,7 @@ export async function checkAccess(
 }
 
 type ReadOutcome =
-  | { status: "ok"; checkpoints: Awaited<ReturnType<typeof readCheckpoints>>["checkpoints"] }
+  | { status: "ok"; checkpoints: Awaited<ReturnType<typeof readCheckpoints>>["checkpoints"]; partial: boolean }
   | { status: "failed"; error: unknown }
   | { status: "slow" }
 
@@ -180,7 +188,7 @@ export async function buildHandoff(
     // `settled` never rejects, so a read that finishes or fails after the deadline is discarded
     // quietly — no unhandled rejection, and its text is never logged or rendered.
     const settled = (deps.read ?? readCheckpoints)(runtime, agent, check.projectId).then(
-      (value): ReadOutcome => ({ status: "ok", checkpoints: value.checkpoints }),
+      (value): ReadOutcome => ({ status: "ok", checkpoints: value.checkpoints, partial: value.partial }),
       (error): ReadOutcome => ({ status: "failed", error }),
     )
     // The owner-fact read shares the deadline but degrades, never refuses: a failure here means a
@@ -216,7 +224,20 @@ export async function buildHandoff(
     const facts = factOutcome.status === "ok" ? factOutcome.facts : []
     const factsFailed = factOutcome.status === "ok" ? null : factOutcome.status === "slow" ? "facts-read-slow" : "facts-read-failed"
     const merged = mergeCheckpoints(outcome.checkpoints)
-    if (merged === null) return { kind: "empty", text: EMPTY_TEXT, facts: facts.length, factsFailed, readMs, seen: [] }
+    // A partial read still produces a handoff — the served checkpoints are real — but both
+    // channels must say the list was incomplete: the model text opens with PARTIAL_LINE, the
+    // owner's line adds "(incomplete — try again in a moment)", the daemon log records it.
+    if (merged === null) {
+      return {
+        kind: "empty",
+        text: outcome.partial ? `Mida: connected. ${PARTIAL_LINE}` : EMPTY_TEXT,
+        facts: facts.length,
+        factsFailed,
+        readMs,
+        seen: [],
+        partial: outcome.partial,
+      }
+    }
     // the checkpoints this session may treat as covered — its own never count: a session's own
     // saves are never updates for it and must never enter its seen set
     const covered = outcome.checkpoints
@@ -226,8 +247,9 @@ export async function buildHandoff(
     // Serving a handoff to a named new session binds it to the chain it was shown: the drainer's
     // saves for that session read state/continues/<sessionId>.json into continuesSession. A record
     // scoped to this project, a session never continues itself, and a write that fails only means
-    // the link is missing later — never a refused handoff.
-    if (isSafeName(input.sessionId) && input.sessionId !== merged.headSessionId) {
+    // the link is missing later — never a refused handoff. A partial merge may be missing the
+    // real head, so it binds nothing — the next complete read links the session properly (M3-D).
+    if (!outcome.partial && isSafeName(input.sessionId) && input.sessionId !== merged.headSessionId) {
       try {
         runtime.home.writeSecretJson(`state/continues/${input.sessionId}.json`, {
           continues: merged.headSessionId,
@@ -244,7 +266,7 @@ export async function buildHandoff(
     const rendered = renderHandoffReport(merged, { authorNames: input.authorNames, facts, factsFailed })
     return {
       kind: "handoff",
-      text: rendered.text,
+      text: outcome.partial ? `${PARTIAL_LINE}\n\n${rendered.text}` : rendered.text,
       checkpoints: outcome.checkpoints.length,
       facts: facts.length,
       factsFailed,
@@ -255,6 +277,7 @@ export async function buildHandoff(
       limitChars: rendered.limitChars,
       cut: rendered.cut,
       oversized: rendered.oversized,
+      partial: outcome.partial,
     }
   } catch {
     return refused("internal", noContextText("internal"))

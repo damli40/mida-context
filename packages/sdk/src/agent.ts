@@ -252,45 +252,64 @@ export class MidaAgent {
     return grant
   }
 
-  /** §12.3 read: API objects are re-checked against Monad commitments, then decrypted with this agent's own epoch wraps. */
+  /**
+   * §12.3 read: API objects are re-checked against Monad commitments, then decrypted with this
+   * agent's own epoch wraps. A list the store could not fully verify is never returned as if it
+   * were complete — `read` refuses it outright; callers that can carry the flag use
+   * `readWithStatus` instead.
+   */
   async read(owner: Address, namespace: string): Promise<ContextObject[]> {
+    const { objects, partial } = await this.readWithStatus(owner, namespace)
+    if (partial) {
+      throw new MidaError("PARTIAL_READ", `the store could not verify the whole ${namespace} list — try again in a moment`)
+    }
+    return objects
+  }
+
+  /** `read` plus the store's completeness flag, for callers that can surface it downstream (M3-D). */
+  async readWithStatus(owner: Address, namespace: string): Promise<{ objects: ContextObject[]; partial: boolean }> {
     const ownerAddress = owner.toLowerCase() as Address
     const name = canonicalizeNamespace(namespace)
     const namespaceId = toNamespaceId(name)
     const capability = this.#requireCapability(ownerAddress, namespaceId, PERMISSION.READ)
     const { deployment } = this.#chain
-    const objects = await this.#api.listObjects({ owner: ownerAddress, namespaceId, capabilityId: capability.capabilityId })
-    const agent = await readAgentRecord(this.#chain, this.agentId)
+    const { objects, partial } = await this.#api.listObjects({ owner: ownerAddress, namespaceId, capabilityId: capability.capabilityId })
+    // The agent record's key version is needed only to unwrap an epoch key — and only a non-empty
+    // list has objects to open, so an empty (or empty-and-partial) read spends no chain call here.
+    let agentRecord: Promise<Awaited<ReturnType<typeof readAgentRecord>>> | undefined
+    const agent = () => (agentRecord ??= readAgentRecord(this.#chain, this.agentId))
     // Each distinct epoch key is fetched exactly once, also under concurrency: the map holds
     // the in-flight promise, so workers reading objects on the same epoch share one call.
     const epochKeys = new Map<bigint, Promise<Uint8Array>>()
     const epochKeyFor = (readEpoch: bigint): Promise<Uint8Array> => {
       let pending = epochKeys.get(readEpoch)
       if (pending === undefined) {
-        pending = this.#api
-          .getEpochWrap({
-            owner: ownerAddress,
-            namespaceId,
-            readEpoch,
-            agentId: this.agentId,
-            agentKeyVersion: agent.encryptionKeyVersion,
-            capabilityId: capability.capabilityId,
-          })
-          .then((wrap) =>
-            unwrapEpochPrivateKey({
-              wrap,
-              agentEncryptionPrivateKey: this.#encryptionPrivateKey,
-              binding: {
-                chainId: deployment.chainId,
-                capabilityRegistry: deployment.capabilityRegistry,
-                owner: ownerAddress,
-                namespaceId,
-                readEpoch,
-                agentId: this.agentId,
-                agentKeyVersion: agent.encryptionKeyVersion,
-              },
-            }),
-          )
+        pending = agent().then((record) =>
+          this.#api
+            .getEpochWrap({
+              owner: ownerAddress,
+              namespaceId,
+              readEpoch,
+              agentId: this.agentId,
+              agentKeyVersion: record.encryptionKeyVersion,
+              capabilityId: capability.capabilityId,
+            })
+            .then((wrap) =>
+              unwrapEpochPrivateKey({
+                wrap,
+                agentEncryptionPrivateKey: this.#encryptionPrivateKey,
+                binding: {
+                  chainId: deployment.chainId,
+                  capabilityRegistry: deployment.capabilityRegistry,
+                  owner: ownerAddress,
+                  namespaceId,
+                  readEpoch,
+                  agentId: this.agentId,
+                  agentKeyVersion: record.encryptionKeyVersion,
+                },
+              }),
+            ),
+        )
         epochKeys.set(readEpoch, pending)
       }
       return pending
@@ -322,7 +341,7 @@ export class MidaAgent {
     const workers: Promise<void>[] = []
     for (let i = 0; i < Math.min(READ_CONCURRENCY, objects.length); i += 1) workers.push(worker())
     await Promise.all(workers)
-    return results
+    return { objects: results, partial }
   }
 
   async create(owner: Address, namespace: string, input: CreateContextInput): Promise<ContextObject> {

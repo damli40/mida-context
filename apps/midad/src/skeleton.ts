@@ -454,10 +454,12 @@ export function authorNamesFor(runtime: ServiceRuntime): Record<string, string> 
 }
 
 /** Spec §5D steps 2–3: a full protocol read as this agent, then keep only this project's valid v1 envelopes. */
-export async function readCheckpoints(runtime: ServiceRuntime, name: string, projectId: string): Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }> {
+export async function readCheckpoints(runtime: ServiceRuntime, name: string, projectId: string): Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number; partial: boolean }> {
   if (typeof projectId !== "string" || projectId === "") throw codedError("bad-input", "projectId must be a non-empty string")
   const started = Date.now()
-  const objects = await runtime.agent(name).read(runtime.owner, NAMESPACE)
+  // readWithStatus, not read: a partial list still yields its checkpoints — the caller flags them
+  // rather than the read throwing away work that did verify (M3-D).
+  const { objects, partial } = await runtime.agent(name).readWithStatus(runtime.owner, NAMESPACE)
   let skipped = 0
   const checkpoints = objects.flatMap((object) => {
     const envelope = unwrapCheckpoint(object.payload.value)
@@ -477,7 +479,7 @@ export async function readCheckpoints(runtime: ServiceRuntime, name: string, pro
       namespaceId: object.namespaceId,
     }]
   })
-  return { checkpoints, skipped, milliseconds: Date.now() - started }
+  return { checkpoints, skipped, milliseconds: Date.now() - started, partial }
 }
 
 /**

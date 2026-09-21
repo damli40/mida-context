@@ -1,5 +1,6 @@
 import { defuse } from "@mida/checkpoint"
 import type { StoredCheckpoint } from "@mida/checkpoint"
+import { MidaError } from "@mida/protocol"
 import { capabilityState, checkAccess } from "./handoff.js"
 import type { HandoffDeps } from "./handoff.js"
 import { agoText } from "./hook-output.js"
@@ -328,8 +329,13 @@ export async function buildWhatsNew(
       copies.refresh(
         input.agent,
         access.approval.projectId,
-        async () =>
-          (await (deps.read ?? readCheckpoints)(runtime, input.agent, access.approval.projectId)).checkpoints,
+        async () => {
+          const result = await (deps.read ?? readCheckpoints)(runtime, input.agent, access.approval.projectId)
+          // a list the store itself calls incomplete must never replace the copy — treated as a
+          // failed refresh, so the last complete list keeps answering until a full one lands (M3-D)
+          if (result.partial) throw new MidaError("PARTIAL_READ", "the store's list was incomplete")
+          return result.checkpoints
+        },
         () => {
           if (copies.failLogDue(input.agent, access.approval.projectId)) {
             deps.log?.({ event: "whatsnew-refresh-failed", agent: input.agent, projectId: access.approval.projectId })

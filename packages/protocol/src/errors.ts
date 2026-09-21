@@ -36,6 +36,7 @@ export const MIDA_ERROR_CODES = [
   "NOT_FOUND",
   "GAS_CEILING_EXCEEDED",
   "OWNER_WALLET_LOW",
+  "PARTIAL_READ",
 ] as const
 
 export type MidaErrorCode = (typeof MIDA_ERROR_CODES)[number]

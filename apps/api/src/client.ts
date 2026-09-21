@@ -94,10 +94,7 @@ export class ContextApiClient implements ContextApiRoutes {
       partial = response.headers.get("x-mida-partial") === "true"
       if (!partial) break
     }
-    const result = objects as ListObjectsResult
-    // Non-enumerable on purpose: the result still compares, spreads and serializes as a plain array.
-    Object.defineProperty(result, "partial", { value: partial, enumerable: false, writable: false })
-    return result
+    return { objects, partial }
   }
 
   getManifest(contextId: Hex, capabilityId?: Hex) {
@@ -147,12 +144,13 @@ export class ContextApiClient implements ContextApiRoutes {
 export const LIST_PARTIAL_MAX_RETRIES = 3
 
 /**
- * The objects a `listObjects` call verified — an array in every respect — plus `partial`: true when
- * the server left rows unexamined after the initial request and all retries. Read it; a caller that
- * ignores it cannot tell a complete list from a truncated one.
+ * What `listObjects` returns: the objects it verified plus `partial` — true when the server left
+ * rows unexamined after the initial request and all retries. An honest field, never a hidden
+ * property: a caller that ignores it cannot mistake a truncated list for a complete one.
  */
-export interface ListObjectsResult extends Array<AnchoredObject> {
-  readonly partial: boolean
+export interface ListObjectsResult {
+  objects: AnchoredObject[]
+  partial: boolean
 }
 
 export interface ContextApiRoutes {

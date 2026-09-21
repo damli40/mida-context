@@ -172,7 +172,7 @@ export async function attemptNamespaceRead(
   runtime: ServiceRuntime,
   name: string,
   namespace: string,
-): Promise<{ ok: true; objects: number } | { ok: false; code: string }> {
+): Promise<{ ok: true; objects: number; partial: boolean } | { ok: false; code: string }> {
   const identity = loadAgentIdentity(runtime.home, name)
   if (identity === undefined) throw new MidaError("CAPABILITY_DENIED", `agent "${name}" is not set up on this machine`)
   const signer = privateKeyToAccount(identity.signerPrivateKey)
@@ -188,8 +188,8 @@ export async function attemptNamespaceRead(
     .grants.flatMap((grant) => grant.capabilities)
     .find((cap) => cap.namespaceId.toLowerCase() === nsId && (cap.permissions & PERMISSION.READ) === PERMISSION.READ)?.capabilityId
   try {
-    const objects = await api.listObjects({ owner: runtime.owner, namespaceId: nsId, ...(capabilityId === undefined ? {} : { capabilityId }) })
-    return { ok: true, objects: objects.length }
+    const listed = await api.listObjects({ owner: runtime.owner, namespaceId: nsId, ...(capabilityId === undefined ? {} : { capabilityId }) })
+    return { ok: true, objects: listed.objects.length, partial: listed.partial }
   } catch (error) {
     if (error instanceof MidaError) return { ok: false, code: error.code }
     throw error

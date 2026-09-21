@@ -302,7 +302,7 @@ describe("startDaemon", () => {
       handoffDeps: {
         checkProject: async () => ({ ok: true, approval: { agent: "codex", projectId: "p1", root: "/tmp/work", approvedAt: "2026-09-21T00:00:00.000Z" } }),
         capability: async () => "live",
-        read: async () => ({ checkpoints: [], skipped: 0, milliseconds: 1 }),
+        read: async () => ({ checkpoints: [], skipped: 0, milliseconds: 1, partial: false }),
         readFacts: async () => {
           throw new Error("server went away")
         },
@@ -316,6 +316,48 @@ describe("startDaemon", () => {
       const entry = logs.find((e) => (e as { event?: string }).event === "handoff")!
       expect(entry).toMatchObject({ agent: "codex", kind: "empty", facts: 0, factsFailed: "facts-read-failed" })
       expect(JSON.stringify(entry)).not.toContain("server went away")
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it("POST /handoff on a partial read logs partial: true and does NOT seed the whats-new copy (M3-D)", async () => {
+    const { home, deps, stubRuntime, logs } = setup()
+    const foreign = {
+      checkpoint: sampleCheckpoint({ eventId: "cp-partial", agent: "codex", createdAt: "2026-09-21T11:30:00.000Z" }),
+      projectId: "p1", sessionId: "other-session", continuesSession: null, compiledBy: "test",
+      contextId: `0x${"a1".repeat(32)}`, authorId: `0x${"b2".repeat(32)}`, namespaceId: `0x${"c3".repeat(32)}`,
+    }
+    const daemon = await startDaemon({
+      ...deps,
+      openRuntime: async () => ({ ...stubRuntime, home }) as Runtime,
+      handoffDeps: {
+        checkProject: async () => ({ ok: true, approval: { agent: "codex", projectId: "p1", root: "/tmp/work", approvedAt: "2026-09-21T00:00:00.000Z" } }),
+        capability: async () => "live",
+        read: async () => ({ checkpoints: [foreign], skipped: 0, milliseconds: 1, partial: true }),
+        readFacts: async () => [],
+      },
+      whatsnewDeps: {
+        checkProject: async () => ({ ok: true, approval: { agent: "codex", projectId: "p1", root: "/tmp/work", approvedAt: "2026-09-21T00:00:00.000Z" } }),
+        capability: async () => "live",
+        // a read that never resolves: if the partial handoff DID seed the copy, /whatsnew answers
+        // "updates" from memory without ever calling this — the "none" answer is the proof no
+        // incomplete list was cached.
+        read: () => new Promise(() => {}),
+      },
+    })
+    try {
+      const reply = await callDaemon(home, "/handoff", { agent: "codex", cwd: "/tmp/work" }, { timeoutMs: 2_000 })
+      expect(reply.status).toBe(200)
+      expect(reply.body).toMatchObject({ kind: "handoff", partial: true })
+      expect((reply.body as { text: string }).text.startsWith("Some saved context could not be loaded yet; what follows may be incomplete.")).toBe(true)
+      const entry = logs.find((e) => (e as { event?: string }).event === "handoff")!
+      expect(entry).toMatchObject({ agent: "codex", kind: "handoff", partial: true })
+
+      // the partial list must not have become the warm copy: a prompt right after answers "none"
+      // (and quietly starts a real refresh), not "updates" from a list the store called incomplete
+      const prompt = await callDaemon(home, "/whatsnew", { agent: "codex", cwd: "/tmp/work", sessionId: "s-9" }, { timeoutMs: 2_000 })
+      expect(prompt.body).toEqual({ kind: "none" })
     } finally {
       await daemon.close()
     }
@@ -335,7 +377,7 @@ describe("startDaemon", () => {
       handoffDeps: {
         checkProject: async () => ({ ok: true, approval: { agent: "codex", projectId: "p1", root: "/tmp/work", approvedAt: "2026-09-21T00:00:00.000Z" } }),
         capability: async () => "live",
-        read: async () => ({ checkpoints: [big], skipped: 0, milliseconds: 1 }),
+        read: async () => ({ checkpoints: [big], skipped: 0, milliseconds: 1, partial: false }),
         readFacts: async () => [],
       },
     })
@@ -392,7 +434,7 @@ describe("startDaemon", () => {
         capability: async () => "live",
         read: async () => {
           reads += 1
-          return { checkpoints: [], skipped: 0, milliseconds: 1 }
+          return { checkpoints: [], skipped: 0, milliseconds: 1, partial: false }
         },
         authorNames: { [`0x${"b2".repeat(32)}`]: "codex" },
         now: () => Date.parse("2026-09-21T12:00:00.000Z"),
@@ -458,7 +500,7 @@ describe("startDaemon", () => {
         capability: async () => "live",
         read: async () => {
           whatsnewReads += 1
-          return { checkpoints: [], skipped: 0, milliseconds: 1 }
+          return { checkpoints: [], skipped: 0, milliseconds: 1, partial: false }
         },
         authorNames: { "claude-code": "claude-code" },
         now: () => fakeNow,

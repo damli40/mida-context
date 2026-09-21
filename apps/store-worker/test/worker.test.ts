@@ -361,19 +361,19 @@ describe("the worker entry", () => {
     expect(put).toMatchObject({ contextId: body.manifest.contextId, manifestHash: manifestHash(body.manifest), state: "pending" })
 
     // Nothing on chain yet: the store has the ciphertext but must not serve it — to anyone.
-    expect(await ownerClient.listObjects({ owner, namespaceId: NAMESPACE })).toEqual([])
+    expect(await ownerClient.listObjects({ owner, namespaceId: NAMESPACE })).toEqual({ objects: [], partial: false })
     await expect(ownerClient.getManifest(body.manifest.contextId)).rejects.toMatchObject({ code: "NOT_FOUND" })
 
     // Monad anchors the record: now the owner sees the object and its ciphertext.
     chain.records.set(body.manifest.contextId.toLowerCase(), anchoredRecord(body))
     const listed = await ownerClient.listObjects({ owner, namespaceId: NAMESPACE })
-    expect(listed.map((object) => object.contextId)).toEqual([body.manifest.contextId])
-    expect(listed[0]!.ciphertext).toBe(hexOf(ciphertext))
+    expect(listed.objects.map((object) => object.contextId)).toEqual([body.manifest.contextId])
+    expect(listed.objects[0]!.ciphertext).toBe(hexOf(ciphertext))
     await expect(ownerClient.getManifest(body.manifest.contextId)).resolves.toMatchObject({ manifestHash: manifestHash(body.manifest) })
 
     // An agent holding READ on this namespace sees it; one whose capability lacks READ does not.
     const agentClient = clientFor(mf, agentAccount)
-    expect((await agentClient.listObjects({ owner, namespaceId: NAMESPACE, capabilityId: CAP_ID })).map((object) => object.contextId)).toEqual([
+    expect((await agentClient.listObjects({ owner, namespaceId: NAMESPACE, capabilityId: CAP_ID })).objects.map((object) => object.contextId)).toEqual([
       body.manifest.contextId,
     ])
     const deniedClient = clientFor(mf, deniedAccount)

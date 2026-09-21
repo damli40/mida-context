@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest"
-import { MidaError } from "@mida/protocol"
+import { MidaError, PERMISSION, namespaceId } from "@mida/protocol"
+import type { Address, Hex } from "@mida/protocol"
 import type { Checkpoint } from "@mida/checkpoint"
 import type { StoredCheckpoint } from "@mida/checkpoint"
-import { buildHandoff } from "@mida/midad"
+import { randomBytes } from "@noble/hashes/utils.js"
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
+import { ContextApiClient } from "@mida/api"
+import { MidaAgent } from "@mida/sdk"
+import { NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
 import type { HandoffDeps, ProjectCheck, Runtime } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
 
@@ -42,7 +47,7 @@ function deps(over: Partial<HandoffDeps> = {}) {
     },
     read: async (r, n, p) => {
       calls.read += 1
-      return (over.read ?? (async () => ({ checkpoints: [], skipped: 0, milliseconds: 1 })))(r, n, p)
+      return (over.read ?? (async () => ({ checkpoints: [], skipped: 0, milliseconds: 1, partial: false })))(r, n, p)
     },
     readFacts: async (r, n) => {
       calls.readFacts += 1
@@ -254,7 +259,7 @@ describe("buildHandoff", () => {
       limitMs: 40,
       read: () =>
         new Promise((resolve) =>
-          setTimeout(() => resolve({ checkpoints: [stored()], skipped: 0, milliseconds: 200 }), 200),
+          setTimeout(() => resolve({ checkpoints: [stored()], skipped: 0, milliseconds: 200, partial: false }), 200),
         ),
     })
     const started = Date.now()
@@ -291,7 +296,7 @@ describe("buildHandoff", () => {
       read: async () => {
         openRead()
         await factsGate
-        return { checkpoints: [stored()], skipped: 0, milliseconds: 1 }
+        return { checkpoints: [stored()], skipped: 0, milliseconds: 1, partial: false }
       },
       readFacts: async () => {
         openFacts()
@@ -308,7 +313,7 @@ describe("buildHandoff", () => {
     const withFacts = await buildHandoff(
       runtime,
       input,
-      deps({ read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1 }), readFacts: async () => [fact] }).d,
+      deps({ read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1, partial: false }), readFacts: async () => [fact] }).d,
     )
     expect(withFacts.kind).toBe("handoff")
     if (withFacts.kind !== "handoff") return
@@ -321,7 +326,7 @@ describe("buildHandoff", () => {
 
     // a fact read that throws — other than "no grant" — never sinks the handoff (A14)
     const { d } = deps({
-      read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1 }),
+      read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1, partial: false }),
       readFacts: async () => {
         throw new Error("server went away")
       },
@@ -340,7 +345,7 @@ describe("buildHandoff", () => {
   it("a fact read slower than the limit degrades the same way — the line sits inside the fence", async () => {
     const { d } = deps({
       limitMs: 40,
-      read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1 }),
+      read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1, partial: false }),
       readFacts: () => new Promise(() => {}), // never resolves — the deadline fires
     })
     const result = await buildHandoff(runtime, input, d)
@@ -354,7 +359,7 @@ describe("buildHandoff", () => {
 
   it("a fact read resolving to [] emits no failure line and no facts heading", async () => {
     const { d } = deps({
-      read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1 }),
+      read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1, partial: false }),
       readFacts: async () => [],
     })
     const result = await buildHandoff(runtime, input, d)
@@ -375,6 +380,7 @@ describe("buildHandoff", () => {
       factsFailed: null,
       readMs: expect.any(Number),
       seen: [],
+      partial: false,
     })
   })
 
@@ -398,7 +404,7 @@ describe("buildHandoff", () => {
       { eventId: "cp-2", agent: "codex", createdAt: "2026-09-21T10:00:00.000Z", objective: "Finish the port" },
       { sessionId: "s2", continuesSession: "s1", contextId: `0x${"d".repeat(64)}`, authorId: `0x${"e".repeat(64)}` },
     )
-    const { d } = deps({ read: async () => ({ checkpoints: [first, second], skipped: 0, milliseconds: 3 }) })
+    const { d } = deps({ read: async () => ({ checkpoints: [first, second], skipped: 0, milliseconds: 3, partial: false }) })
     const result = await buildHandoff(runtime, {
       ...input,
       authorNames: { [`0x${"c".repeat(64)}`]: "claude-code", [`0x${"e".repeat(64)}`]: "codex" },
@@ -425,7 +431,7 @@ describe("buildHandoff", () => {
       { eventId: "cp-other", agent: "claude-code", createdAt: "2026-09-21T09:00:00.000Z" },
       { sessionId: "s1", contextId: `0x${"b".repeat(64)}`, authorId: `0x${"c".repeat(64)}` },
     )
-    const { d } = deps({ read: async () => ({ checkpoints: [own, foreign], skipped: 0, milliseconds: 3 }) })
+    const { d } = deps({ read: async () => ({ checkpoints: [own, foreign], skipped: 0, milliseconds: 3, partial: false }) })
     const result = await buildHandoff(runtime, { ...input, sessionId: "s2" }, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
@@ -434,7 +440,7 @@ describe("buildHandoff", () => {
 
   it("an author id the runtime does not know renders as 'unknown agent', never undefined", async () => {
     const foreign = stored({}, { authorId: `0x${"f".repeat(64)}` })
-    const { d } = deps({ read: async () => ({ checkpoints: [foreign], skipped: 0, milliseconds: 1 }) })
+    const { d } = deps({ read: async () => ({ checkpoints: [foreign], skipped: 0, milliseconds: 1, partial: false }) })
     const result = await buildHandoff(runtime, input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
@@ -445,14 +451,14 @@ describe("buildHandoff", () => {
   it("skipped non-checkpoint records do not block a render — they are filtered by design", async () => {
     // readCheckpoints counts decrypted records that are not v1 checkpoint envelopes; that number
     // is filtering, not corruption — an undecryptable record throws inside agent.read instead.
-    const { d } = deps({ read: async () => ({ checkpoints: [stored()], skipped: 3, milliseconds: 1 }) })
+    const { d } = deps({ read: async () => ({ checkpoints: [stored()], skipped: 3, milliseconds: 1, partial: false }) })
     const result = await buildHandoff(runtime, input, d)
     expect(result.kind).toBe("handoff")
   })
 
   it("a handoff that needed trimming reports cut, the limit it was cut to, and its oversize state (R5-4)", async () => {
     const progress = Array.from({ length: 400 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
-    const { d } = deps({ read: async () => ({ checkpoints: [stored({ progress })], skipped: 0, milliseconds: 1 }) })
+    const { d } = deps({ read: async () => ({ checkpoints: [stored({ progress })], skipped: 0, milliseconds: 1, partial: false }) })
     const result = await buildHandoff(runtime, input, d)
     expect(result).toMatchObject({ kind: "handoff", cut: true, limitChars: 8000, oversized: false })
     if (result.kind !== "handoff") return
@@ -461,7 +467,7 @@ describe("buildHandoff", () => {
 
   it("a handoff that could not fit reports oversized instead of cut — the truth, not a guess (R5-4)", async () => {
     const { d } = deps({
-      read: async () => ({ checkpoints: [stored({ originalRequest: "r".repeat(9000) })], skipped: 0, milliseconds: 1 }),
+      read: async () => ({ checkpoints: [stored({ originalRequest: "r".repeat(9000) })], skipped: 0, milliseconds: 1, partial: false }),
     })
     const result = await buildHandoff(runtime, input, d)
     expect(result).toMatchObject({ kind: "handoff", cut: false, oversized: true })
@@ -470,9 +476,79 @@ describe("buildHandoff", () => {
   it("merge or render throwing is a generic refusal, never a partial handoff", async () => {
     const a = stored({}, { projectId: "p1" })
     const b = stored({}, { projectId: "p2" }) // two projects — mergeCheckpoints throws
-    const { d } = deps({ read: async () => ({ checkpoints: [a, b], skipped: 0, milliseconds: 1 }) })
+    const { d } = deps({ read: async () => ({ checkpoints: [a, b], skipped: 0, milliseconds: 1, partial: false }) })
     const result = await buildHandoff(runtime, input, d)
     expect(result.kind).toBe("refused")
     expect((result as { text: string }).text).toMatch(/^Mida: no context available right now \([a-z-]+\)\.$/)
+  })
+
+  it("a partial read still produces a handoff — flagged at the top of the model text and in the result (M3-D)", async () => {
+    const { d } = deps({ read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1, partial: true }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toMatchObject({ kind: "handoff", partial: true })
+    if (result.kind !== "handoff") return
+    // the checkpoint that DID load is still in the report — partial means "maybe more", not "discard"
+    expect(result.text).toContain(stored().contextId)
+    expect(result.text.startsWith("Some saved context could not be loaded yet; what follows may be incomplete.")).toBe(true)
+  })
+
+  it("a partial read with no usable checkpoints says the list may be incomplete — never 'nothing saved'", async () => {
+    const { d } = deps({ read: async () => ({ checkpoints: [], skipped: 0, milliseconds: 1, partial: true }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toMatchObject({ kind: "empty", partial: true })
+    expect(result.text).toContain("Some saved context could not be loaded yet; what follows may be incomplete.")
+    expect(result.text).not.toContain("Nothing has been saved")
+  })
+
+  it("the flag travels end to end: a server partial through every retry marks the handoff text (M3-D)", async () => {
+    // the REAL ContextApiClient against a fake server that answers x-mida-partial every time —
+    // the client's own retries (1 + 3) are the only calls, and the flag must reach the text.
+    let calls = 0
+    const client = new ContextApiClient({
+      baseUrl: "http://mida.test",
+      account: privateKeyToAccount(generatePrivateKey()),
+      chainId: 31337n,
+      capabilityRegistry: `0x${"11".repeat(20)}` as Address,
+      fetch: async () => {
+        calls += 1
+        return new Response(JSON.stringify({ objects: [] }), { status: 200, headers: { "x-mida-partial": "true" } })
+      },
+    })
+    const owner = `0x${"33".repeat(20)}` as Address
+    const agentId = `0x${"aa".repeat(32)}` as Hex
+    const agent = new MidaAgent({
+      agentId,
+      callbackOrigin: "https://agent.example",
+      encryptionPrivateKey: randomBytes(32),
+      chain: {
+        deployment: { chainId: 31337n, capabilityRegistry: `0x${"11".repeat(20)}` as Address, contextRegistry: `0x${"22".repeat(20)}` as Address, deploymentBlock: 0n },
+        account: client.account,
+        publicClient: { readContract: async () => { throw new Error("no chain read expected for an empty list") } },
+      } as never,
+      api: client,
+      grants: [
+        {
+          owner,
+          agentId,
+          requestId: `0x${"99".repeat(32)}` as Hex,
+          capabilities: [
+            {
+              capabilityId: `0x${"77".repeat(32)}` as Hex,
+              namespaceId: namespaceId(NAMESPACE),
+              permissions: PERMISSION.READ,
+              provenancePolicy: 0,
+              expiresAt: "0",
+              transactionHash: `0x${"88".repeat(32)}` as Hex,
+            },
+          ],
+        },
+      ],
+    })
+    const rt = { owner, agent: () => agent } as unknown as Runtime
+    const { d } = deps({ read: readCheckpoints })
+    const result = await buildHandoff(rt, input, d)
+    expect(calls).toBe(4) // the first list plus all three retries — still partial
+    expect(result).toMatchObject({ kind: "empty", partial: true })
+    expect(result.text).toContain("Some saved context could not be loaded yet; what follows may be incomplete.")
   })
 })

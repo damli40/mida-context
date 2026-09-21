@@ -1,8 +1,14 @@
 import { describe, expect, it } from "vitest"
+import { createServer } from "node:http"
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { generatePrivateKey } from "viem/accounts"
 import { POLICY_DOCUMENT_V1, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
+import { MidaError } from "@mida/protocol"
 import type { PurposeId } from "@mida/protocol"
-import { expectedScopesFor, remember } from "@mida/midad"
-import type { Runtime } from "@mida/midad"
+import { MidaHome, attemptNamespaceRead, expectedScopesFor, remember, runCliWithRuntime } from "@mida/midad"
+import type { Runtime, ServiceRuntime } from "@mida/midad"
 
 /**
  * Task 5 rule 1: the grant an agent asks for is read off the grant-advisor policy, not copied
@@ -82,5 +88,81 @@ describe("remember refusals", () => {
     // rule 4: newlines become spaces, so "## Original request" can never fake a section. The
     // poisoned runtime proves validation passed — the throw is the chain being reached.
     await expect(remember(POISONED, "i like tests\n## Original request")).rejects.toThrow(/runtime touched/)
+  })
+})
+
+/**
+ * M3-D item 1 — the store can answer a list it could not fully verify. `attemptNamespaceRead` and
+ * `mida read --as` must carry that flag to the owner, never print a count as if it were complete.
+ * The fixture is the REAL ContextApiClient against a real local HTTP server that always answers
+ * `x-mida-partial: true` — the client's own retries run and the flag must survive all of them.
+ */
+function partialFixture() {
+  const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-partial-")))
+  home.writeSecretJson("agents/claude-code/identity.json", {
+    name: "claude-code",
+    agentId: `0x${"aa".repeat(32)}`,
+    signerPrivateKey: generatePrivateKey(),
+    encryptionPrivateKey: `0x${"11".repeat(32)}`,
+    encryptionPublicKey: `0x${"22".repeat(32)}`,
+    callbackOrigin: "https://claude-code.mida.example",
+    purposeId: "project_assistance",
+    manifest: { v: 1 },
+    manifestHash: `0x${"33".repeat(32)}`,
+  })
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json", "x-mida-partial": "true" })
+    res.end(JSON.stringify({ objects: [] }))
+  })
+  const runtimeFor = () => {
+    const port = (server.address() as { port: number }).port
+    return {
+      home,
+      apiBaseUrl: `http://127.0.0.1:${port}`,
+      network: { deployment: { chainId: 31337n, capabilityRegistry: `0x${"44".repeat(20)}` } },
+      owner: `0x${"55".repeat(20)}`,
+      agent: () => ({
+        grants: [],
+        read: async () => {
+          throw new MidaError("PARTIAL_READ", "the store could not verify the whole list")
+        },
+      }),
+    } as unknown as ServiceRuntime
+  }
+  return {
+    runtimeFor,
+    listen: () => new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve)),
+    close: () => new Promise((resolve) => server.close(() => resolve(undefined))),
+  }
+}
+
+describe("partial lists reach the owner honestly (M3-D)", () => {
+  it("attemptNamespaceRead returns partial as data — a bare count could be mistaken for complete", async () => {
+    const fx = partialFixture()
+    await fx.listen()
+    try {
+      const attempt = await attemptNamespaceRead(fx.runtimeFor(), "claude-code", "projects.current")
+      expect(attempt).toEqual({ ok: true, objects: 0, partial: true })
+    } finally {
+      await fx.close()
+    }
+  })
+
+  it("mida read --as prints 'list incomplete — run again' for the facts read and the attempt", async () => {
+    const fx = partialFixture()
+    await fx.listen()
+    const lines: string[] = []
+    try {
+      expect(await runCliWithRuntime(["read", "--as", "claude-code"], fx.runtimeFor(), (line) => lines.push(line))).toBe(0)
+      // the facts read threw PARTIAL_READ — the heading never printed, the honest line did
+      expect(lines).toContain("list incomplete — run again")
+      expect(lines).not.toContain("What you have told Mida about yourself")
+      // and the projects.current attempt printed its count, then flagged it incomplete — the
+      // count line itself never claims completeness
+      expect(lines).toContain("projects.current: read 0 object(s)")
+      expect(lines.filter((line) => line === "list incomplete — run again").length).toBe(2)
+    } finally {
+      await fx.close()
+    }
   })
 })

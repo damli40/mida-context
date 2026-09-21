@@ -44,6 +44,8 @@ export interface SessionStartBody {
   savedAt?: string
   cut?: boolean
   oversized?: boolean
+  /** The store's list was incomplete — the owner's line must say so, never claim completeness. */
+  partial?: boolean
   /** The contextIds the handoff covered — the session's whats-new seen set starts from these. */
   seen?: unknown
 }
@@ -71,14 +73,21 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
         ? ` (from ${body.savedBy}, ${agoText(body.savedAt, now)})`
         : ""
     // honest size state: "(shortened)" only when progress was actually left out — a handoff that
-    // is simply longer than the limit says so instead (R5-4)
-    const size = [body.cut === true ? "shortened" : null, body.oversized === true ? "longer than the limit" : null].filter(
-      (s): s is string => s !== null,
-    )
+    // is simply longer than the limit says so instead (R5-4). A partial store list gets the same
+    // treatment: the owner hears "incomplete", never a count that looks whole (M3-D).
+    const size = [
+      body.cut === true ? "shortened" : null,
+      body.oversized === true ? "longer than the limit" : null,
+      body.partial === true ? "incomplete — try again in a moment" : null,
+    ].filter((s): s is string => s !== null)
     const state = size.length > 0 ? ` (${size.join(", ")})` : ""
     return systemMessage(`Mida: handoff loaded — ${counts}${from}${state}`)
   }
-  if (body.kind === "empty") return "Mida: connected — nothing saved for this project yet"
+  if (body.kind === "empty") {
+    return body.partial === true
+      ? "Mida: connected — could not check saved context fully (incomplete — try again in a moment)"
+      : "Mida: connected — nothing saved for this project yet"
+  }
   if (body.kind === "refused" && body.reason === "revoked") {
     return systemMessage(`Mida: ${agent} has no access to this project (revoked by the owner)`)
   }

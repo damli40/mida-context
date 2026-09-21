@@ -57,7 +57,7 @@ const baseDeps = (checkpoints: StoredCheckpoint[], over: Record<string, unknown>
       approval: { agent: "claude-code", projectId: "p1", root: "/repo", approvedAt: "2026-09-21T00:00:00.000Z" },
     }),
     capability: async () => "live" as const,
-    read: async () => ({ checkpoints, skipped: 0, milliseconds: 1 }),
+    read: async () => ({ checkpoints, skipped: 0, milliseconds: 1, partial: false }),
     authorNames: NAMES,
     now: () => NOW,
     copies,
@@ -358,9 +358,9 @@ describe("the daemon's checkpoint copy", () => {
     const copies = new CheckpointCopies(() => t)
     copies.seed("claude-code", "p1", [cp("other", "0xauthorCodex", iso(10), { progress: ["stale but present"] })])
     t += 21_000 // the copy is stale — the request starts a refresh it must not wait for
-    let resolveRead: ((value: { checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }) => void) | undefined
+    let resolveRead: ((value: { checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number; partial: boolean }) => void) | undefined
     const read = () =>
-      new Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }>((resolve) => {
+      new Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number; partial: boolean }>((resolve) => {
         resolveRead = resolve
       })
     const started = Date.now()
@@ -372,18 +372,18 @@ describe("the daemon's checkpoint copy", () => {
     expect(Date.now() - started).toBeLessThan(50)
     expect(out.kind).toBe("updates")
     if (out.kind === "updates") expect(out.note).toContain("stale but present")
-    resolveRead?.({ checkpoints: [], skipped: 0, milliseconds: 5_000 })
+    resolveRead?.({ checkpoints: [], skipped: 0, milliseconds: 5_000, partial: false })
     await copies.idle()
   })
 
   it("two prompts during one slow refresh share a single read — the second never starts another", async () => {
     const dir = home()
     let reads = 0
-    let resolveRead: ((value: { checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }) => void) | undefined
+    let resolveRead: ((value: { checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number; partial: boolean }) => void) | undefined
     const copies = new CheckpointCopies(() => NOW) // absent copy — the first request must start a refresh
     const read = () => {
       reads += 1
-      return new Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number }>((resolve) => {
+      return new Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number; partial: boolean }>((resolve) => {
         resolveRead = resolve
       })
     }
@@ -397,7 +397,7 @@ describe("the daemon's checkpoint copy", () => {
     // no copy existed yet — both answered none at once, and the refresh serves the NEXT prompt
     expect(a.kind).toBe("none")
     expect(b.kind).toBe("none")
-    resolveRead?.({ checkpoints: [cp("other", "0xauthorCodex", iso(5))], skipped: 0, milliseconds: 1 })
+    resolveRead?.({ checkpoints: [cp("other", "0xauthorCodex", iso(5))], skipped: 0, milliseconds: 1, partial: false })
     await copies.idle()
     const next = await buildWhatsNew(runtimeWith(dir), input, deps)
     expect(next.kind).toBe("updates")
@@ -429,6 +429,31 @@ describe("the daemon's checkpoint copy", () => {
     expect(second.kind).toBe("updates")
     await copies.idle()
     expect(failures()).toHaveLength(1)
+  })
+
+  it("a partial refresh never lands — the copy keeps its last complete list (M3-D)", async () => {
+    const dir = home()
+    let t = NOW
+    const copies = new CheckpointCopies(() => t)
+    const kept = cp("other", "0xauthorCodex", iso(10), { progress: ["the last complete list"] })
+    copies.seed("claude-code", "p1", [kept])
+    t += 21_000 // stale — the request starts a refresh behind its answer
+    const logs: object[] = []
+    const deps = gateDeps({
+      capability: async () => "live" as const,
+      // the store answers partial: a shorter, unverifiable list must not replace the known one
+      read: async () => ({ checkpoints: [cp("other", "0xauthorCodex", iso(1), { progress: ["partial-new"] })], skipped: 0, milliseconds: 1, partial: true }),
+      now: () => t,
+      copies,
+      log: (entry: object) => logs.push(entry),
+    })
+    const input = { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }
+    const out = await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(out.kind).toBe("updates")
+    await copies.idle()
+    // the refresh was refused as an answer source: the copy still holds only the complete list
+    expect(copies.get("claude-code", "p1")?.checkpoints.map((c) => c.contextId)).toEqual([kept.contextId])
+    expect(logs.some((e) => (e as { event?: string }).event === "whatsnew-refresh-failed")).toBe(true)
   })
 
   it("a local revoke refuses the very next prompt even with a warm copy — and the copy is gone", async () => {

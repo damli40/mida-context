@@ -579,7 +579,7 @@ describe("a handoff served to a new session becomes its continuesSession link", 
     const handoff = await buildHandoff(runtime, { agent: "claude-code", cwd, sessionId: "sess-b", authorNames: {} }, {
       checkProject: async () => ({ ok: true, approval: { agent: "claude-code", projectId: "p-1", root: cwd, approvedAt: "2026-09-21T00:00:00.000Z" } }),
       capability: async () => "live",
-      read: async () => ({ checkpoints: [storedA], skipped: 0, milliseconds: 1 }),
+      read: async () => ({ checkpoints: [storedA], skipped: 0, milliseconds: 1, partial: false }),
       readFacts: async () => [],
     })
     expect(handoff.kind).toBe("handoff")

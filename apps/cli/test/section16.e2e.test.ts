@@ -80,7 +80,7 @@ describe.each(targets)("§16 end-to-end scenario on $name (plan Tasks 26 and 27)
       epochPrivateKey,
       binding: objectBinding(object.contextId, readEpoch),
     })
-  const ownerObject = async (contextId: Hex) => (await ownerApi.listObjects({ owner, namespaceId: CAREER })).find((o) => o.contextId === contextId)!
+  const ownerObject = async (contextId: Hex) => (await ownerApi.listObjects({ owner, namespaceId: CAREER })).objects.find((o) => o.contextId === contextId)!
 
   async function provision(label: Label, declarations: AgentDeclaration[]) {
     const operatorAccount = privateKeyToAccount(generatePrivateKey())

@@ -201,7 +201,7 @@ describe("Context API routes (plan Task 24)", () => {
   })
 
   it("serves anchored owner context to an authorized reader, who decrypts it with its own epoch wrap", async () => {
-    const objects = await clients.R!.listObjects({ owner: vault.owner, namespaceId: CAREER, capabilityId: capabilities.R! })
+    const { objects } = await clients.R!.listObjects({ owner: vault.owner, namespaceId: CAREER, capabilityId: capabilities.R! })
     const object = objects.find((candidate) => candidate.contextId === aliceContextId)!
     expect(object.authorId).toBe(zeroHash)
     const wrap = await wrapFor("R", 1n)
@@ -219,7 +219,7 @@ describe("Context API routes (plan Task 24)", () => {
       binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: aliceContextId, namespaceId: CAREER, readEpoch: 1n },
     })
     expect(payload.value).toBe("Prioritize systems engineering")
-    expect((await clientFor(owner.account).listObjects({ owner: vault.owner, namespaceId: CAREER })).map((o) => o.contextId)).toContain(aliceContextId)
+    expect((await clientFor(owner.account).listObjects({ owner: vault.owner, namespaceId: CAREER })).objects.map((o) => o.contextId)).toContain(aliceContextId)
   })
 
   it("denies an agent with no capability, a forged capability id, and a CREATE-only agent's reads and wraps", async () => {
@@ -233,7 +233,7 @@ describe("Context API routes (plan Task 24)", () => {
   it("keeps an upload pending, and out of every read, until Monad holds its commitments", async () => {
     const written = await agentObject("W")
     expect(await clients.W!.putObject(written.upload)).toMatchObject({ contextId: written.contextId, state: "pending" })
-    const ids = async () => (await clients.R!.listObjects({ owner: vault.owner, namespaceId: CAREER, capabilityId: capabilities.R! })).map((o) => o.contextId)
+    const ids = async () => (await clients.R!.listObjects({ owner: vault.owner, namespaceId: CAREER, capabilityId: capabilities.R! })).objects.map((o) => o.contextId)
     expect(await ids()).not.toContain(written.contextId)
     await expect(clients.R!.getManifest(written.contextId, capabilities.R!)).rejects.toMatchObject({ code: "NOT_FOUND" })
     await written.register()
@@ -304,7 +304,7 @@ describe("Context API routes (plan Task 24)", () => {
     const blocked = await agentObject("W")
     await expect(clients.W!.putObject(blocked.upload)).rejects.toMatchObject({ code: "EPOCH_ROTATION_REQUIRED" })
     const history = await clients.R!.listObjects({ owner: vault.owner, namespaceId: CAREER, capabilityId: capabilities.R! })
-    expect(history.map((object) => object.contextId)).toContain(aliceContextId)
+    expect(history.objects.map((object) => object.contextId)).toContain(aliceContextId)
     expect((await wrapFor("R", 1n)).readEpoch).toBe("1")
     await expect(wrapFor("S", 2n)).rejects.toMatchObject({ code: "CAPABILITY_EXPIRED" })
 

@@ -41,7 +41,7 @@ describe("mida remember on local Anvil", () => {
 
   const ownerTxCount = () => runtime.ownerChain.publicClient.getTransactionCount({ address: runtime.owner })
   /** "Through the server": the API's own object list for the owner's namespace. */
-  const serverCount = async (ns: string) => (await runtime.ownerApi.listObjects({ owner: runtime.owner, namespaceId: namespaceId(ns) })).length
+  const serverCount = async (ns: string) => (await runtime.ownerApi.listObjects({ owner: runtime.owner, namespaceId: namespaceId(ns) })).objects.length
   const totalFacts = async () => (await serverCount(PREFS)) + (await serverCount(SKILLS))
 
   beforeAll(async () => {

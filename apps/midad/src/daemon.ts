@@ -302,10 +302,11 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         { agent, cwd, authorNames: authorNamesFor(runtime), sessionId },
         {
           ...deps.handoffDeps,
-          // the session-start read seeds the same copy whats-new serves — the first prompt is warm
+          // the session-start read seeds the same copy whats-new serves — the first prompt is warm.
+          // A partial list never seeds it: an incomplete read must not stand in for the full one (M3-D).
           read: async (rt, agentName, projectId) => {
             const outcome = await (deps.handoffDeps?.read ?? readCheckpoints)(rt, agentName, projectId)
-            copies.seed(agentName, projectId, outcome.checkpoints)
+            if (!outcome.partial) copies.seed(agentName, projectId, outcome.checkpoints)
             return outcome
           },
           limitMs: deps.handoffLimitMs ?? deps.handoffDeps?.limitMs,
@@ -326,6 +327,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         limitChars: result.kind === "handoff" ? result.limitChars : null,
         cut: result.kind === "handoff" && result.cut,
         oversized: result.kind === "handoff" && result.oversized,
+        partial: result.kind !== "refused" && result.partial,
         readMs: result.kind === "refused" ? null : result.readMs,
         ms: deps.now() - started,
       })

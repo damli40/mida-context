@@ -3,7 +3,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createInterface } from "node:readline"
-import { decodeUint64, namespaceById } from "@mida/protocol"
+import { decodeUint64, isMidaError, namespaceById } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { permissionNames } from "@mida/grant-advisor"
@@ -158,14 +158,27 @@ export async function runCliWithRuntime(
         // `mida read --as <agent>`: what this agent can see, through the real protocol — the owner
         // facts its grants cover, then a real `projects.current` attempt whose answer (or refusal
         // code) comes from the server, never a local pre-check.
-        const facts = await readOwnerFacts(runtime, agent)
-        print("What you have told Mida about yourself")
-        for (const fact of facts) print(`  ${fact.namespace}: ${fact.text}`)
+        let facts: Awaited<ReturnType<typeof readOwnerFacts>> | null
+        try {
+          facts = await readOwnerFacts(runtime, agent)
+        } catch (error) {
+          // a list the store calls incomplete is not "no facts" — say so, then still run the attempt
+          if (!isMidaError(error, "PARTIAL_READ")) throw error
+          facts = null
+        }
+        if (facts === null) {
+          print("list incomplete — run again")
+        } else {
+          print("What you have told Mida about yourself")
+          for (const fact of facts) print(`  ${fact.namespace}: ${fact.text}`)
+        }
         const attempt = await attemptNamespaceRead(runtime, agent, NAMESPACE)
         print(attempt.ok ? `${NAMESPACE}: read ${attempt.objects} object(s)` : `${NAMESPACE}: refused ${attempt.code}`)
+        if (attempt.ok && attempt.partial) print("list incomplete — run again")
       } else {
         const result = await readCheckpoints(runtime, agent, projectId)
         print(`read ${result.checkpoints.length} checkpoint(s) in ${result.milliseconds} ms`)
+        if (result.partial) print("list incomplete — run again")
         const authorNames = authorNamesFor(runtime)
         for (const checkpoint of result.checkpoints) {
           const author = authorNames[checkpoint.authorId.toLowerCase()] ?? "unknown agent"
