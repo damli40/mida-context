@@ -368,8 +368,14 @@ export async function buildWhatsNew(
     // the proposed set covers every foreign checkpoint this answer saw — shown in the note or
     // folded into "…and N more" — appended newest-last so the record's cap drops the oldest
     const known = new Set(seen)
-    const arrived = foreignIds.filter((f) => !known.has(f.id)).sort((a, b) => a.at - b.at).map((f) => f.id)
-    const proposed = [...seen, ...arrived].slice(-SEEN_MAX)
+    const arrived: { id: string; at: number }[] = []
+    for (const f of foreignIds) {
+      if (known.has(f.id)) continue
+      known.add(f.id) // a duplicate record in the copy lands its id once
+      arrived.push(f)
+    }
+    arrived.sort((a, b) => a.at - b.at)
+    const proposed = [...seen, ...arrived.map((f) => f.id)].slice(-SEEN_MAX)
     return {
       kind: "updates",
       note: buildNote(lines),
