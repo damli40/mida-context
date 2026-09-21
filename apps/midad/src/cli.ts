@@ -272,9 +272,14 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown)
     case "agent-unidentified":
     case "agent-not-setup":
       return `${agent} is not set up on this machine — run \`mida init\` first`
-    // The message IS the answer: we built it from the balance, the cost and the shortfall.
-    case "OWNER_WALLET_LOW":
-      return error instanceof Error ? error.message : "refused: OWNER_WALLET_LOW"
+    // The message IS the answer: we built it from the balance, the cost and the shortfall. A
+    // MidaError prefixes its own message with "<code>: " — the owner reads the sentence, not
+    // the code, so that prefix is stripped here.
+    case "OWNER_WALLET_LOW": {
+      if (!(error instanceof Error)) return "refused: OWNER_WALLET_LOW"
+      const prefix = "OWNER_WALLET_LOW: "
+      return error.message.startsWith(prefix) ? error.message.slice(prefix.length) : error.message
+    }
     case "not-a-project":
       return `this folder cannot hold a project — run \`mida approve ${agent}\` inside the project's folder`
     case "list-unreadable":
