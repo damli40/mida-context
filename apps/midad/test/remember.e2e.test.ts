@@ -201,8 +201,11 @@ describe("mida remember on local Anvil", () => {
     const result = await buildHandoff(runtime, { agent: "claude-code", cwd: workDir, authorNames: {} })
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
+    const facts = await readOwnerFacts(runtime, "claude-code")
+    const lowercase = facts.find((f) => f.text === "i answer in lowercase")
+    expect(lowercase).toBeDefined()
     expect(result.text).toContain("What you have told Mida about yourself")
-    expect(result.text).toContain("- i answer in lowercase")
+    expect(result.text).toContain(`- stated by you: i answer in lowercase (record ${lowercase!.contextId})`)
     expect(result.text).not.toContain("confirmed by the owner, never asserted")
     expect(result.facts).toBeGreaterThanOrEqual(3)
 
