@@ -43,6 +43,7 @@ interface ObjectRow {
   expected_parent_id: string
   manifest: string
   manifest_hash: string
+  ciphertext_hash: string
   uploaded_at: string
   anchored_at: string | null
 }
@@ -122,8 +123,8 @@ export class D1ObjectStore implements ObjectStore {
     await this.db
       .prepare(
         `INSERT OR IGNORE INTO objects
-           (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, size, uploaded_at, anchored_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, ciphertext_hash, size, uploaded_at, anchored_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         object.contextId.toLowerCase(),
@@ -135,6 +136,7 @@ export class D1ObjectStore implements ObjectStore {
         object.expectedParentId.toLowerCase(),
         JSON.stringify(object.manifest),
         object.manifestHash.toLowerCase(),
+        object.manifest.ciphertextHash.toLowerCase(),
         object.manifest.ciphertextSize,
         object.uploadedAt,
         object.anchoredAt,
@@ -169,8 +171,8 @@ export class D1ObjectStore implements ObjectStore {
     const inserted = await this.db
       .prepare(
         `INSERT INTO objects
-           (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, size, uploaded_at, anchored_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, ciphertext_hash, size, uploaded_at, anchored_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (SELECT 1 FROM objects WHERE context_id = ?)
            AND (SELECT COALESCE(SUM(size), 0) FROM objects WHERE uploader = ? AND anchored_at IS NULL) + ? <= ?`,
       )
@@ -184,6 +186,7 @@ export class D1ObjectStore implements ObjectStore {
         object.expectedParentId.toLowerCase(),
         JSON.stringify(object.manifest),
         object.manifestHash.toLowerCase(),
+        object.manifest.ciphertextHash.toLowerCase(),
         object.manifest.ciphertextSize,
         object.uploadedAt,
         object.anchoredAt,
@@ -299,21 +302,40 @@ export class D1ObjectStore implements ObjectStore {
     // ISO-8601 UTC strings sort chronologically, so the cutoff is a plain string comparison. Marked
     // rows are skipped outright — the anchoring fact is permanent — and an unmarked row stillPending
     // reports anchored gets its mark here, so the next sweep never asks about it again.
-    const { results } = await this.db.prepare("SELECT * FROM objects WHERE uploaded_at < ? AND anchored_at IS NULL").bind(olderThan.toISOString()).all<ObjectRow>()
-    const deletable: string[] = []
+    const { results } = await this.db
+      .prepare("SELECT * FROM objects WHERE uploaded_at < ? AND anchored_at IS NULL ORDER BY uploaded_at ASC")
+      .bind(olderThan.toISOString())
+      .all<ObjectRow>()
+    const deletable: ObjectRow[] = []
     const anchored: string[] = []
     for (const row of results) {
-      const object = objectFrom(row)
-      if (await stillPending(object)) deletable.push(object.contextId)
-      else anchored.push(object.contextId)
+      if (await stillPending(objectFrom(row))) deletable.push(row)
+      else anchored.push(row.context_id)
     }
+    if (deletable.length === 0 && anchored.length === 0) return 0
     const markedAt = new Date().toISOString()
     const statements = [
-      ...deletable.map((id) => this.db.prepare("DELETE FROM objects WHERE context_id = ?").bind(id)),
+      // AND anchored_at IS NULL is the race guard: a row that anchored between our SELECT and this
+      // statement reports 0 changes and survives — its blob then survives the reference guard below.
+      ...deletable.map((row) => this.db.prepare("DELETE FROM objects WHERE context_id = ? AND anchored_at IS NULL").bind(row.context_id)),
+      // The row's ciphertext blob dies with it, but only when no remaining row references the hash:
+      // another object (two uploads of identical ciphertext share one blob) or a manifest_index row
+      // (an envelope with identical bytes). These run after every object delete in the same batch,
+      // so the guards see the final row set.
+      ...deletable.map((row) =>
+        this.db
+          .prepare(
+            `DELETE FROM blobs WHERE hash = ?
+             AND NOT EXISTS (SELECT 1 FROM objects WHERE ciphertext_hash = ?)
+             AND NOT EXISTS (SELECT 1 FROM manifest_index WHERE envelope_hash = ?)`,
+          )
+          .bind(row.ciphertext_hash, row.ciphertext_hash, row.ciphertext_hash),
+      ),
       ...anchored.map((id) => this.db.prepare("UPDATE objects SET anchored_at = ? WHERE context_id = ? AND anchored_at IS NULL").bind(markedAt, id)),
     ]
-    if (statements.length > 0) await this.db.batch(statements)
-    return deletable.length
+    const settled = (await this.db.batch(statements)) as D1RunResult[]
+    // Report rows actually deleted — a race-marked row's DELETE changes nothing and is not counted.
+    return settled.slice(0, deletable.length).reduce((total, result) => total + changes(result), 0)
   }
 
   async sweepManifests(olderThan: Date): Promise<number> {
@@ -323,7 +345,7 @@ export class D1ObjectStore implements ObjectStore {
       .all<{ body_hash: string; envelope_hash: string }>()
     if (results.length === 0) return 0
     // The blob survives if anything still references its hash: another index row (same envelope can sit under
-    // another body hash in principle) or an object's ciphertextHash — never a dangling-content delete.
+    // another body hash in principle) or an object's ciphertext_hash — never a dangling-content delete.
     await this.db.batch([
       ...results.map((row) => this.db.prepare("DELETE FROM manifest_index WHERE body_hash = ?").bind(row.body_hash)),
       ...results.map((row) =>
@@ -331,7 +353,7 @@ export class D1ObjectStore implements ObjectStore {
           .prepare(
             `DELETE FROM blobs WHERE hash = ?
              AND NOT EXISTS (SELECT 1 FROM manifest_index WHERE envelope_hash = ?)
-             AND NOT EXISTS (SELECT 1 FROM objects WHERE json_extract(manifest, '$.ciphertextHash') = ?)`,
+             AND NOT EXISTS (SELECT 1 FROM objects WHERE ciphertext_hash = ?)`,
           )
           .bind(row.envelope_hash, row.envelope_hash, row.envelope_hash),
       ),

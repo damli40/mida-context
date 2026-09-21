@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS objects (
   expected_parent_id TEXT NOT NULL,
   manifest TEXT NOT NULL,           -- JSON ObjectManifest
   manifest_hash TEXT NOT NULL,
+  ciphertext_hash TEXT NOT NULL,    -- manifest.ciphertextHash, the row's blob reference; indexed so the
+                                    -- sweep's blob-reference guard is a lookup, not a json_extract scan
   size INTEGER NOT NULL,            -- manifest.ciphertextSize; SUM(size) feeds the atomic pending cap
   uploaded_at TEXT NOT NULL,        -- ISO-8601 UTC, sorts lexicographically
   anchored_at TEXT                  -- ISO-8601 UTC of the first verified chain match, NULL = pending
@@ -30,6 +32,7 @@ CREATE TABLE IF NOT EXISTS objects (
 CREATE INDEX IF NOT EXISTS objects_owner_ns ON objects (owner, namespace_id);
 CREATE INDEX IF NOT EXISTS objects_uploader ON objects (uploader);
 CREATE INDEX IF NOT EXISTS objects_uploaded ON objects (uploaded_at);
+CREATE INDEX IF NOT EXISTS objects_ciphertext ON objects (ciphertext_hash);
 
 -- §12.4 reader-epoch wraps: one per (owner, namespace, epoch, agent key version).
 CREATE TABLE IF NOT EXISTS wraps (

@@ -192,6 +192,23 @@ export class ApiStore implements ObjectStore {
     return this.#puts
   }
 
+  /** Every blob hash a surviving row can still serve: object ciphertexts and indexed manifest envelopes. */
+  #referencedBlobHashes(): Set<string> {
+    const referenced = new Set<string>()
+    for (const object of this.#allObjectsSync()) referenced.add(object.manifest.ciphertextHash.toLowerCase())
+    let names: string[]
+    try {
+      names = readdirSync(join(this.#dir, "agent-manifests")).filter((name) => name.endsWith(".json"))
+    } catch {
+      names = []
+    }
+    for (const name of names) {
+      const entry = this.#readManifestIndex(name.slice(0, -5) as Hex)
+      if (entry !== undefined) referenced.add(entry.envelopeHash.toLowerCase())
+    }
+    return referenced
+  }
+
   async sweepPending(olderThan: Date, stillPending: (object: StoredObject) => Promise<boolean>): Promise<number> {
     const cutoff = olderThan.getTime()
     const markedAt = new Date().toISOString()
@@ -202,8 +219,18 @@ export class ApiStore implements ObjectStore {
       const uploadedAt = Date.parse(object.uploadedAt)
       if (Number.isNaN(uploadedAt) || uploadedAt >= cutoff) continue
       if (await stillPending(object)) {
-        rmSync(join(this.#dir, "objects", `${object.contextId}.json`))
+        const path = join(this.#dir, "objects", `${object.contextId}.json`)
+        // Re-read before deleting — the file-backed race guard matching D1's AND anchored_at IS NULL:
+        // a mark that landed while the chain was asked (stillPending itself can mark) wins; the row stays.
+        const fresh = readJson<StoredObject>(path)
+        if (fresh === undefined || (fresh.anchoredAt ?? null) !== null) continue
+        rmSync(path)
         removed += 1
+        // The row's ciphertext blob dies with it only when no surviving row references the hash —
+        // another object's ciphertext, or a manifest index row's envelope (identical bytes, one hash).
+        if (!this.#referencedBlobHashes().has(object.manifest.ciphertextHash.toLowerCase())) {
+          rmSync(this.blobs.pathFor(object.manifest.ciphertextHash), { force: true })
+        }
       } else {
         // stillPending reported an anchored record: mark the first verified match and keep the row.
         await this.markAnchored(object.contextId, markedAt)
@@ -234,12 +261,7 @@ export class ApiStore implements ObjectStore {
     }
     if (removed === 0) return 0
     // A blob dies only when nothing references its hash: surviving index rows and every object's ciphertext.
-    const referenced = new Set<string>()
-    for (const name of names) {
-      const entry = this.#readManifestIndex(name.slice(0, -5) as Hex)
-      if (entry !== undefined) referenced.add(entry.envelopeHash.toLowerCase())
-    }
-    for (const object of await this.#allObjects()) referenced.add(object.manifest.ciphertextHash.toLowerCase())
+    const referenced = this.#referencedBlobHashes()
     for (const hash of expired) {
       if (!referenced.has(hash.toLowerCase())) rmSync(this.blobs.pathFor(hash), { force: true })
     }

@@ -344,6 +344,149 @@ function contractSuite(name: string, make: () => Promise<{ stores: ContextStores
       }
     })
 
+    it("a swept pending object's ciphertext blob is deleted along with its row", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const now = new Date("2026-09-21T12:00:00.000Z")
+        const { object, ciphertext } = fakeObject()
+        object.uploadedAt = new Date(now.getTime() - 25 * 60 * 60_000).toISOString()
+        await stores.objects.putObject(object)
+        await stores.objects.blobs.put(ciphertext)
+        const hash = contentHash(ciphertext)
+
+        // Monad never anchored it: the row AND the bytes are reclaimed together — without the
+        // blob delete the bytes stayed stored while no longer counting against any quota.
+        expect(await sweepStores({ stores, now, isAnchored: async () => false })).toMatchObject({ objectsRemoved: 1 })
+        expect(await stores.objects.getObject(object.contextId)).toBeUndefined()
+        await expect(stores.objects.blobs.get(hash)).rejects.toMatchObject({ code: "NOT_FOUND" })
+      } finally {
+        await cleanup()
+      }
+    })
+
+    it("a swept object's ciphertext blob survives while another object row references the same hash", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const now = new Date("2026-09-21T12:00:00.000Z")
+        const hoursAgo = (h: number) => new Date(now.getTime() - h * 60 * 60_000).toISOString()
+        const { ciphertext } = fakeObject()
+        const sharedHash = contentHash(ciphertext)
+        const anchored = fakeObject().object
+        anchored.manifest.ciphertextHash = sharedHash
+        anchored.uploadedAt = hoursAgo(90 * 24)
+        anchored.anchoredAt = hoursAgo(80 * 24)
+        const pending = fakeObject().object
+        pending.manifest.ciphertextHash = sharedHash
+        pending.uploadedAt = hoursAgo(25)
+        await stores.objects.putObject(anchored)
+        await stores.objects.putObject(pending)
+        await stores.objects.blobs.put(ciphertext)
+
+        // Two uploads of identical ciphertext share one blob: sweeping the pending row must not
+        // delete bytes the anchored row still serves.
+        expect(await sweepStores({ stores, now, isAnchored: async () => false })).toMatchObject({ objectsRemoved: 1 })
+        expect(await stores.objects.getObject(pending.contextId)).toBeUndefined()
+        expect(await stores.objects.blobs.get(sharedHash)).toEqual(ciphertext)
+      } finally {
+        await cleanup()
+      }
+    })
+
+    it("a ciphertext blob shared with a younger pending object dies only when the last reference goes", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const now = new Date("2026-09-21T12:00:00.000Z")
+        const { ciphertext } = fakeObject()
+        const sharedHash = contentHash(ciphertext)
+        const older = fakeObject().object
+        older.manifest.ciphertextHash = sharedHash
+        older.uploadedAt = new Date(now.getTime() - 25 * 60 * 60_000).toISOString()
+        const younger = fakeObject().object
+        younger.manifest.ciphertextHash = sharedHash
+        younger.uploadedAt = new Date(now.getTime() - 2 * 60 * 60_000).toISOString()
+        await stores.objects.putObject(older)
+        await stores.objects.putObject(younger)
+        await stores.objects.blobs.put(ciphertext)
+
+        const isAnchored = async () => false
+        await sweepStores({ stores, now, isAnchored })
+        expect(await stores.objects.getObject(older.contextId)).toBeUndefined()
+        expect(await stores.objects.getObject(younger.contextId)).toBeDefined()
+        expect(await stores.objects.blobs.get(sharedHash)).toEqual(ciphertext)
+
+        // Once the younger row passes the window and is swept too, nothing references the hash.
+        const later = new Date(now.getTime() + 23 * 60 * 60_000)
+        await sweepStores({ stores, now: later, isAnchored })
+        expect(await stores.objects.getObject(younger.contextId)).toBeUndefined()
+        await expect(stores.objects.blobs.get(sharedHash)).rejects.toMatchObject({ code: "NOT_FOUND" })
+      } finally {
+        await cleanup()
+      }
+    })
+
+    it("an object marked anchored while the sweep checks it is not deleted", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const now = new Date("2026-09-21T12:00:00.000Z")
+        const { object, ciphertext } = fakeObject()
+        object.uploadedAt = new Date(now.getTime() - 25 * 60 * 60_000).toISOString()
+        await stores.objects.putObject(object)
+        await stores.objects.blobs.put(ciphertext)
+
+        // The mark lands after the sweep selected the row but before its delete: the row must
+        // survive, and so must its blob — it now serves an anchored object.
+        const result = await sweepStores({
+          stores,
+          now,
+          isAnchored: async (candidate) => {
+            if (candidate.contextId === object.contextId) {
+              await stores.objects.markAnchored(object.contextId, now.toISOString())
+            }
+            return false
+          },
+        })
+        expect(result.objectsRemoved).toBe(0)
+        const stored = await stores.objects.getObject(object.contextId)
+        expect(stored).toBeDefined()
+        expect(stored?.anchoredAt).not.toBeNull()
+        expect(await stores.objects.blobs.get(contentHash(ciphertext))).toEqual(ciphertext)
+      } finally {
+        await cleanup()
+      }
+    })
+
+    it("a blob referenced by a manifest index row survives its object's sweep, then dies with the index", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        const now = new Date("2026-09-21T12:00:00.000Z")
+        const hoursAgo = (h: number) => new Date(now.getTime() - h * 60 * 60_000).toISOString()
+        // One hash does double duty: an object's ciphertext and a staged manifest envelope —
+        // identical bytes land under one content-addressed hash, referenced from both tables.
+        const { object, ciphertext } = fakeObject()
+        object.uploadedAt = hoursAgo(25)
+        const sharedHash = contentHash(ciphertext)
+        const bodyHash = hexOf(randomBytes(32))
+        await stores.objects.putObject(object)
+        await stores.objects.blobs.put(ciphertext)
+        // The index row is fresh (2 h) — it survives the same sweep that reclaims the object.
+        await stores.objects.setManifestIndex(bodyHash, sharedHash, { storedAt: hoursAgo(2) })
+
+        // Sweeping the pending object must not orphan the envelope the index row still serves.
+        await sweepStores({ stores, now, isAnchored: async () => false })
+        expect(await stores.objects.getObject(object.contextId)).toBeUndefined()
+        expect(await stores.objects.blobs.get(sharedHash)).toEqual(ciphertext)
+
+        // And sweeping the stale unverified index row must not orphan it the other way either —
+        // only when BOTH references are gone may the bytes die. A day later the index row is
+        // stale too, the object is already gone, so the index sweep takes the blob with it.
+        const later = new Date(now.getTime() + 24 * 60 * 60_000)
+        expect(await sweepStores({ stores, now: later, isAnchored: async () => false })).toMatchObject({ manifestsRemoved: 1 })
+        await expect(stores.objects.blobs.get(sharedHash)).rejects.toMatchObject({ code: "NOT_FOUND" })
+      } finally {
+        await cleanup()
+      }
+    })
+
     it("round-trips wraps, manifest index entries and blobs; missing lookups miss cleanly", async () => {
       const { stores, cleanup } = await make()
       try {
