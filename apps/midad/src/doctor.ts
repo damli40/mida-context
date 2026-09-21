@@ -310,12 +310,26 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       run: async () => {
         // the same resolution the daemon used at start-up — the owner sees which model compiles
         // sessions and, on the kimi path, that session text leaves the machine for Moonshot's API
-        const choice = compileModelChoice(deps.env ?? process.env)
+        const env = deps.env ?? process.env
+        const choice = compileModelChoice(env)
         const lines = [`ok: compile model is ${choice.model.label}`]
         if (choice.fallback !== undefined) {
           lines.push(
             `note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to ${choice.fallback.label}`,
           )
+        }
+        // an overridden endpoint receives the API key and the transcript text — the owner must
+        // see which HOST that is; the full URL is never printed (its path or query may be secret)
+        const override = env.KIMI_BASE_URL
+        if (override !== undefined && override.replace(/\/+$/, "") !== "https://api.moonshot.ai") {
+          let host = "an address that does not parse"
+          try {
+            const parsed = new URL(override).host
+            if (parsed !== "") host = parsed
+          } catch {
+            // a value that is not a URL is still not Moonshot — the placeholder names that
+          }
+          lines.push(problem(`compile text is being sent to ${host}, not Moonshot`, "unset KIMI_BASE_URL to compile against Moonshot"))
         }
         return lines
       },

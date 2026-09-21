@@ -145,4 +145,35 @@ describe("kimi-model.mjs — the Moonshot compile command (R5-8)", () => {
     expect(Date.now() - started).toBeLessThan(5_000)
     expect(r.stderr).not.toContain(KEY)
   }, 10_000)
+
+  it("plain http to a non-loopback host makes NO request — the key and text never leave", async () => {
+    const r = await runModel("p", { KIMI_API_KEY: KEY, KIMI_BASE_URL: "http://example.com" })
+    expect(r.code).toBe(1)
+    expect(r.stdout).toBe("")
+    expect(r.stderr).toBe("kimi: KIMI_BASE_URL must be https\n")
+  })
+
+  it("an http URL that WOULD route to a listener still sends nothing — 0.0.0.0 is not loopback", async () => {
+    server = await fakeApi({ status: 200, body: { choices: [{ message: { content: "x" } }] } })
+    const port = new URL(server.url).port
+    const r = await runModel("p", { KIMI_API_KEY: KEY, KIMI_BASE_URL: `http://0.0.0.0:${port}` })
+    expect(r.code).toBe(1)
+    expect(r.stderr).toBe("kimi: KIMI_BASE_URL must be https\n")
+    expect(server.seen).toHaveLength(0)
+  })
+
+  it("a value that is not a URL at all gets the same refusal, no request", async () => {
+    const r = await runModel("p", { KIMI_API_KEY: KEY, KIMI_BASE_URL: "not a url" })
+    expect(r.code).toBe(1)
+    expect(r.stderr).toBe("kimi: KIMI_BASE_URL must be https\n")
+  })
+
+  it("http on localhost is the allowed loopback exception — the test fake works", async () => {
+    server = await fakeApi({ status: 200, body: { choices: [{ message: { content: "ok" } }] } })
+    const port = new URL(server.url).port
+    const r = await runModel("p", { KIMI_API_KEY: KEY, KIMI_BASE_URL: `http://localhost:${port}` })
+    expect(r.code).toBe(0)
+    expect(r.stdout).toBe("ok")
+    expect(server.seen).toHaveLength(1)
+  })
 })

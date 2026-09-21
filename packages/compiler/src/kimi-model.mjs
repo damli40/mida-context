@@ -8,6 +8,9 @@
 //                   only: never argv (it would show in `ps`), never printed,
 //                   never logged, never written to disk, never in an error.
 //   KIMI_BASE_URL   default https://api.moonshot.ai — tests point it at a fake.
+//                   Whatever this names receives the API key AND the session's
+//                   text, so the only schemes accepted are https:// everywhere
+//                   and http:// on a loopback host (127.0.0.1, ::1, localhost).
 //   KIMI_MODEL      default kimi-k2.7-code-highspeed.
 //   KIMI_TIMEOUT_MS default 120000.
 //
@@ -31,6 +34,20 @@ const fail = (line) => {
 
 if (typeof key !== "string" || key === "") fail("kimi: KIMI_API_KEY is not set")
 if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) fail("kimi: KIMI_TIMEOUT_MS is not a number")
+
+// The endpoint check runs before stdin is even read: an http URL pointing anywhere but loopback
+// would ship the key and the transcript to a stranger, so the answer is exit 1 and NO request.
+let endpointOk = false
+try {
+  const url = new URL(base)
+  const host = url.hostname.replace(/^\[|\]$/g, "")
+  endpointOk =
+    url.protocol === "https:" ||
+    (url.protocol === "http:" && (host === "127.0.0.1" || host === "::1" || host === "localhost"))
+} catch {
+  endpointOk = false
+}
+if (!endpointOk) fail("kimi: KIMI_BASE_URL must be https")
 
 const chunks = []
 process.stdin.on("data", (c) => chunks.push(c))

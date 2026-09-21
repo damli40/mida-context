@@ -66,6 +66,33 @@ describe("mida doctor without a chain", () => {
     expect(note).toContain("scrub")
     // the key itself never reaches a doctor line
     expect(kimiLines.join("\n")).not.toContain("test-key")
+    // with the endpoint unset there is nothing to warn about
+    expect(kimiLines.some((line) => line.includes("not Moonshot"))).toBe(false)
+  })
+
+  it("an overridden KIMI_BASE_URL is a PROBLEM that names the host only — never the full URL (R5-5b-3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const env = { KIMI_API_KEY: "test-key", KIMI_BASE_URL: "http://example.com/secret/path?token=abc" }
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env, daemonProbeMs: 50 })
+    const warn = lines.find((line) => line.includes("not Moonshot"))
+    expect(warn).toBeDefined()
+    expect(warn).toContain("PROBLEM:")
+    expect(warn).toContain("compile text is being sent to example.com, not Moonshot")
+    // host only: the path and query that followed the host are never echoed — they may be secret
+    expect(warn).not.toContain("/secret/path")
+    expect(warn).not.toContain("token=abc")
+
+    // even an https override is not Moonshot — the problem names its host too
+    const httpsLines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => httpsLines.push(line),
+      settings: {},
+      env: { KIMI_API_KEY: "test-key", KIMI_BASE_URL: "https://evil.example" },
+      daemonProbeMs: 50,
+    })
+    expect(httpsLines.some((line) => line.includes("compile text is being sent to evil.example, not Moonshot"))).toBe(true)
   })
 
   it("more than three whats-new timeouts in the last hour is a PROBLEM — fewer stays visible, none is ok", async () => {
