@@ -1,0 +1,14 @@
+{
+  "name": "@mida/sponsor-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@mida/chain": "workspace:*",
+    "viem": "2.56.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.27.3",
+    "miniflare": "^4.20250913.0"
+  }
+}
