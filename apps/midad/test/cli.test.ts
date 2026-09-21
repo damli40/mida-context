@@ -165,6 +165,67 @@ describe("the crude mida command", () => {
     expect(await run("approve", "claude-code")).toBe(0)
   }, 300_000)
 
+  it("remember names the context area before the ask and after the write, and waits for a typed yes (R5-3)", async () => {
+    const lines: string[] = []
+    const asked: string[] = []
+    const order: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network,
+        print: (line) => {
+          lines.push(line)
+          if (line.startsWith("area:")) order.push("area")
+        },
+        prompt: async (question) => {
+          asked.push(question)
+          order.push("prompt")
+          return "yes"
+        },
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await run2("remember", "prefers short answers")).toBe(0)
+    // the owner saw WHERE the fact will live before being asked to confirm, and again after it landed
+    expect(lines).toContain("area: preferences.communication (agents with READ on this area will see it)")
+    expect(asked).toEqual(["Type yes to remember: "])
+    expect(lines.at(-1)).toMatch(/^remembered 0x[0-9a-f]{64} in preferences\.communication$/)
+    expect(order).toEqual(["area", "prompt", "area"])
+  }, 300_000)
+
+  it("an answer other than yes stores nothing (R5-3)", async () => {
+    const lines: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, { home, network, print: (line) => lines.push(line), prompt: async () => "no", stdinIsTTY: true, stdoutIsTTY: true })
+    expect(await run2("remember", "should never be stored")).toBe(1)
+    expect(lines).toContain("area: preferences.communication (agents with READ on this area will see it)")
+    expect(lines.some((line) => line.startsWith("remembered "))).toBe(false)
+    // and the declined fact is really not there to read back
+    lines.length = 0
+    expect(await run2("read", "--as", "claude-code")).toBe(0)
+    expect(lines.join("\n")).not.toContain("should never be stored")
+  }, 300_000)
+
+  it("mida read labels every item with the context area it lives in (R5-3)", async () => {
+    const lines: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, { home, network, print: (line) => lines.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
+    // a fact from the remember test above, labelled with its area
+    expect(await run2("read", "--as", "claude-code")).toBe(0)
+    expect(lines).toContain("  preferences.communication: prefers short answers")
+    // checkpoints carry their area too — resolved from the record's namespace id
+    expect(await run2("save-demo", "claude-code", "proj-areas")).toBe(0)
+    lines.length = 0
+    expect(await run2("read", "claude-code", "proj-areas")).toBe(0)
+    expect(lines.some((line) => /^  projects\.current: 0x[0-9a-f]{64} written by /.test(line))).toBe(true)
+  }, 300_000)
+
+  it("a namespace id the tree cannot name prints its first ten characters, never nothing (R5-3)", async () => {
+    const { namespaceLabel } = await import("@mida/midad")
+    const { namespaceId } = await import("@mida/protocol")
+    expect(namespaceLabel(namespaceId("projects.current"))).toBe("projects.current")
+    const foreign = `0x${"f1".repeat(32)}`
+    expect(namespaceLabel(foreign)).toBe("0xf1f1f1f1…")
+  })
+
   it("never prints a secret: no output line contains any key stored in the home folder", () => {
     const secrets: string[] = []
     const walk = (folder: string) => {

@@ -549,7 +549,7 @@ describe("a handoff served to a new session becomes its continuesSession link", 
     const storedA = {
       checkpoint: sampleCheckpoint({ eventId: "cp-a1", originalRequest: "Port the billing engine" }),
       projectId: "p-1", sessionId: "sess-a", continuesSession: null, compiledBy: "test",
-      contextId: `0x${"a1".repeat(32)}`, authorId: `0x${"aa".repeat(32)}`,
+      contextId: `0x${"a1".repeat(32)}`, authorId: `0x${"aa".repeat(32)}`, namespaceId: `0x${"c1".repeat(32)}`,
     }
     const runtime = { home, close: async () => {} } as unknown as Runtime
     const handoff = await buildHandoff(runtime, { agent: "claude-code", cwd, sessionId: "sess-b", authorNames: {} }, {
@@ -568,7 +568,7 @@ describe("a handoff served to a new session becomes its continuesSession link", 
     expect(savedB.continuesSession).toBe("sess-a")
 
     // merged, the chain leads with A's words — a tool switch never turns the request into "Continue."
-    const storedB = { ...savedB, contextId: `0x${"b1".repeat(32)}`, authorId: `0x${"bb".repeat(32)}` }
+    const storedB = { ...savedB, contextId: `0x${"b1".repeat(32)}`, authorId: `0x${"bb".repeat(32)}`, namespaceId: `0x${"c1".repeat(32)}` }
     expect(mergeCheckpoints([storedA, storedB])?.originalRequest).toBe("Port the billing engine")
   })
 

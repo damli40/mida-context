@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createInterface } from "node:readline"
 import { decodeUint64, namespaceById } from "@mida/protocol"
+import type { Hex } from "@mida/protocol"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { permissionNames } from "@mida/grant-advisor"
 import { callDaemon, ensureDaemon } from "./control.js"
@@ -12,7 +13,7 @@ import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeCode, uninstallCodex } from "./install.js"
 import type { InstallTool } from "./install.js"
-import { attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
+import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE } from "./runtime.js"
 import type { Network, ServiceRuntime } from "./runtime.js"
 import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
@@ -40,6 +41,18 @@ export const NEEDS_TERMINAL_LINE = "needs-terminal: run this yourself in a termi
 /** What the daemon answers when an owner command reaches /cli anyway. */
 export function ownerOnlyLine(command: string): string {
   return `This changes who has access, so it only runs in your own terminal: mida ${command}`
+}
+
+/**
+ * The context area's plain name for a bytes32 namespace id — never nothing: an id the namespace
+ * tree cannot name shows its first ten characters so the owner can still tell records apart.
+ */
+export function namespaceLabel(id: string): string {
+  try {
+    return namespaceById(id as Hex).name
+  } catch {
+    return `${id.slice(0, 10)}…`
+  }
 }
 
 export interface CliDeps {
@@ -147,7 +160,7 @@ export async function runCliWithRuntime(
         // code) comes from the server, never a local pre-check.
         const facts = await readOwnerFacts(runtime, agent)
         print("What you have told Mida about yourself")
-        for (const fact of facts) print(`  ${fact.text}`)
+        for (const fact of facts) print(`  ${fact.namespace}: ${fact.text}`)
         const attempt = await attemptNamespaceRead(runtime, agent, NAMESPACE)
         print(attempt.ok ? `${NAMESPACE}: read ${attempt.objects} object(s)` : `${NAMESPACE}: refused ${attempt.code}`)
       } else {
@@ -156,7 +169,7 @@ export async function runCliWithRuntime(
         const authorNames = authorNamesFor(runtime)
         for (const checkpoint of result.checkpoints) {
           const author = authorNames[checkpoint.authorId.toLowerCase()] ?? "unknown agent"
-          print(`  ${checkpoint.contextId} written by ${author} (on-chain author ${checkpoint.authorId.slice(0, 10)}…)`)
+          print(`  ${namespaceLabel(checkpoint.namespaceId)}: ${checkpoint.contextId} written by ${author} (on-chain author ${checkpoint.authorId.slice(0, 10)}…)`)
         }
       }
     }
@@ -194,8 +207,25 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       deps.print(`owner ${result.owner}`)
       for (const [name, agentId] of Object.entries(result.agents)) deps.print(`agent ${name} ${agentId}`)
     } else if (command === "remember") {
+      // The owner sees WHICH context area the fact will land in before the ask — answering the
+      // "which namespace does this belong to" question — and sees it again after the write.
+      const area = `area: ${DEFAULT_FACT_NAMESPACE} (agents with READ on this area will see it)`
+      deps.print(area)
+      const prompt = deps.prompt ?? terminalPrompt
+      const drain = deps.drainInput ?? drainBufferedStdin
+      // same stale-input rule as approve: only a line typed against the visible ask counts
+      await drain()
+      if ((await prompt("Type yes to remember: ")).trim() !== "yes") {
+        deps.print("not approved")
+        return 1
+      }
       const result = await remember(runtime, argv.slice(1).join(" "))
-      deps.print(result.kind === "remembered" ? `remembered ${result.contextId} in ${result.namespace}` : `refused: ${result.code}`)
+      if (result.kind === "remembered") {
+        deps.print(`area: ${result.namespace} (agents with READ on this area will see it)`)
+        deps.print(`remembered ${result.contextId} in ${result.namespace}`)
+      } else {
+        deps.print(`refused: ${result.code}`)
+      }
       return result.kind === "remembered" ? 0 : 1
     } else if (command === "approve") {
       const prompt = deps.prompt ?? terminalPrompt
@@ -206,7 +236,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
         } else {
           deps.print(`${preview.agent} is asking for:`)
           for (const scope of preview.requested) {
-            deps.print(`  ${namespaceById(scope.namespaceId).name}: ${permissionNames(scope.permissions).join(" + ")}`)
+            deps.print(`  ${namespaceLabel(scope.namespaceId)}: ${permissionNames(scope.permissions).join(" + ")}`)
           }
           deps.print(`  until ${new Date(Number(preview.expiresAt) * 1000).toISOString()}`)
           if (preview.scopes.length < preview.requested.length) {

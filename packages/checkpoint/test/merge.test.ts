@@ -6,7 +6,7 @@ function stored(over: Partial<StoredCheckpoint["checkpoint"]> & { sessionId?: st
   n += 1
   const { sessionId = "s1", continuesSession = null, at, ...cp } = over
   return {
-    projectId: "p", sessionId, continuesSession, compiledBy: "test", contextId: `0x${n.toString(16).padStart(64, "0")}`, authorId: "0xa",
+    projectId: "p", sessionId, continuesSession, compiledBy: "test", contextId: `0x${n.toString(16).padStart(64, "0")}`, authorId: "0xa", namespaceId: `0x${"c".repeat(64)}`,
     checkpoint: { eventId: `event-${n}xxxx`, agent: "claude-code", source: "hook-compiler", createdAt: at,
       objective: "", originalRequest: null, progress: [], decisions: [], rejected: [], constraints: [], artifacts: [],
       unresolvedIssue: null, nextAction: "", remainingPlan: [], evidence: [], ...cp },

@@ -473,6 +473,7 @@ export async function readCheckpoints(runtime: ServiceRuntime, name: string, pro
       compiledBy: envelope.compiledBy,
       contextId: object.contextId,
       authorId: object.authorId,
+      namespaceId: object.namespaceId,
     }]
   })
   return { checkpoints, skipped, milliseconds: Date.now() - started }

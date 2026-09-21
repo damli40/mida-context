@@ -21,6 +21,7 @@ const stored = (cp: Partial<Checkpoint> = {}, over: Partial<StoredCheckpoint> = 
   compiledBy: "test",
   contextId: `0x${"1".repeat(64)}`,
   authorId: `0x${"a".repeat(64)}`,
+  namespaceId: `0x${"2".repeat(64)}`,
   ...over,
 })
 

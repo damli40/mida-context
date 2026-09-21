@@ -8,6 +8,8 @@ export interface StoredCheckpoint {
   compiledBy: string
   contextId: string
   authorId: string
+  /** The chain record's namespace — the context area this checkpoint lives in. */
+  namespaceId: string
 }
 
 export interface MergedHandoff {

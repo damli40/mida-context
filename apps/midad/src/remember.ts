@@ -12,7 +12,7 @@ import { listAgentNames, loadAgentIdentity } from "./keys.js"
  */
 export const FACT_NAMESPACES = ["preferences.communication", "profile.skills"] as const
 export type FactNamespace = (typeof FACT_NAMESPACES)[number]
-const DEFAULT_FACT_NAMESPACE: FactNamespace = "preferences.communication"
+export const DEFAULT_FACT_NAMESPACE: FactNamespace = "preferences.communication"
 const MAX_FACT_CHARS = 2_000
 /** At most this many facts are shown to a receiving agent, newest first. */
 export const MAX_FACTS = 20

@@ -21,7 +21,7 @@ export {
 export { attemptNamespaceRead, readOwnerFacts, remember, FACT_NAMESPACES, MAX_FACTS } from "./remember.js"
 export type { OwnerFact, RememberResult } from "./remember.js"
 export * from "./checkpoint-payload.js"
-export { CLI_COMMANDS, NEEDS_TERMINAL_LINE, OWNER_COMMANDS, USAGE, ownerOnlyLine, ownerRefusalLine, runCli, runCliWithRuntime, validCliArgv } from "./cli.js"
+export { CLI_COMMANDS, NEEDS_TERMINAL_LINE, OWNER_COMMANDS, USAGE, namespaceLabel, ownerOnlyLine, ownerRefusalLine, runCli, runCliWithRuntime, validCliArgv } from "./cli.js"
 export type { CliDeps } from "./cli.js"
 export * from "./queue.js"
 export { approveProject, approvalsFileStatus, checkProject, ensureProjectMarker, removeAgentApprovals } from "./projects.js"
