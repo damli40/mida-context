@@ -32,6 +32,9 @@ export const CLI_COMMANDS: readonly string[] = ["init", "remember", ...WITH_AGEN
  * they open the owner runtime in-process and are never sent to the daemon socket.
  */
 export const OWNER_COMMANDS: readonly string[] = ["init", "approve", "revoke", "remember"]
+/** The owner commands that must see a real terminal. `init` is exempt: it grants nothing to an agent. */
+const TERMINAL_COMMANDS: readonly string[] = ["approve", "revoke", "remember"]
+export const NEEDS_TERMINAL_LINE = "needs-terminal: run this yourself in a terminal window"
 
 /** What the daemon answers when an owner command reaches /cli anyway. */
 export function ownerOnlyLine(command: string): string {
@@ -55,6 +58,13 @@ export interface CliDeps {
    * answer. There is no flag, file or environment variable that skips the question.
    */
   prompt?: (question: string) => Promise<string>
+  /**
+   * Terminal presence for the commands that require it — approve, revoke, remember. The defaults
+   * are the real `process.stdin`/`process.stdout`; tests inject them. There is no flag, file or
+   * environment variable that skips the check.
+   */
+  stdinIsTTY?: boolean
+  stdoutIsTTY?: boolean
 }
 
 /**
@@ -239,6 +249,19 @@ function terminalPrompt(question: string): Promise<string> {
 export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   if (!validCliArgv(argv)) {
     deps.print(USAGE)
+    return 2
+  }
+  const command = argv[0]!
+  // approve, revoke and remember change who has access or write owner facts, so they ask for a
+  // real terminal — stdin and stdout both TTY — before the owner key is even loaded. This is a
+  // speed bump, not a wall: until the passkey work (M3) the owner key is still a file on disk,
+  // and a determined program running as the user can read it or fake a terminal. The check is
+  // here to stop a confused caller from changing authority by accident, not to stop one acting
+  // on purpose.
+  const stdinTTY = deps.stdinIsTTY ?? process.stdin.isTTY === true
+  const stdoutTTY = deps.stdoutIsTTY ?? process.stdout.isTTY === true
+  if (TERMINAL_COMMANDS.includes(command) && !(stdinTTY && stdoutTTY)) {
+    deps.print(NEEDS_TERMINAL_LINE)
     return 2
   }
   const runtime = await Runtime.open(deps.home, deps.network)

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, runCli } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, runCli } from "@mida/midad"
 import type { Network } from "@mida/midad"
 
 describe("the crude mida command", () => {
@@ -12,8 +12,10 @@ describe("the crude mida command", () => {
   let network: Network
   let home: MidaHome
   const lines: string[] = []
-  // the prompt dep stands in for a human typing at the terminal — every approve here answers yes
-  const run = (...argv: string[]) => runCli(argv, { home, network, print: (line) => lines.push(line), prompt: async () => "yes" })
+  // the prompt dep stands in for a human typing at the terminal — every approve here answers yes —
+  // and the terminal deps stand in for the real TTY the owner commands refuse to run without
+  const run = (...argv: string[]) =>
+    runCli(argv, { home, network, print: (line) => lines.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
 
   beforeAll(async () => {
     env = await localEnvironment()
@@ -48,7 +50,8 @@ describe("the crude mida command", () => {
   it("kicks the daemon after a successful approve and revoke so the service notices, and never otherwise", async () => {
     const kicks: string[] = []
     const kick = () => (kicks.push("x"), Promise.resolve())
-    const run2 = (...argv: string[]) => runCli(argv, { home, network, print: () => {}, kickDaemon: kick, prompt: async () => "yes" })
+    const run2 = (...argv: string[]) =>
+      runCli(argv, { home, network, print: () => {}, kickDaemon: kick, prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
     // request grants nothing by itself — no kick
     expect(await run2("request", "claude-code")).toBe(0)
     expect(kicks).toHaveLength(0)
@@ -72,6 +75,7 @@ describe("the crude mida command", () => {
       runCli(argv, {
         home, network, print: (line) => lines.push(line),
         prompt: async (question) => { asked.push(question); return answers.shift() ?? "" },
+        stdinIsTTY: true, stdoutIsTTY: true,
       })
     // claude-code is live from the tests above; a fresh ask needs a revoked agent first
     expect(await run2("revoke", "claude-code")).toBe(0)
@@ -88,6 +92,21 @@ describe("the crude mida command", () => {
     // an explicit yes signs
     answers.push("yes")
     expect(await run2("approve", "claude-code")).toBe(0)
+  }, 300_000)
+
+  it("approve, revoke and remember refuse when there is no real terminal; init is exempt", async () => {
+    const refusals: string[] = []
+    const noStdin = (...argv: string[]) =>
+      runCli(argv, { home, network, print: (line) => refusals.push(line), prompt: async () => "yes", stdinIsTTY: false, stdoutIsTTY: true })
+    const noStdout = (...argv: string[]) =>
+      runCli(argv, { home, network, print: (line) => refusals.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: false })
+    expect(await noStdin("approve", "claude-code")).toBe(2)
+    expect(await noStdin("revoke", "claude-code")).toBe(2)
+    expect(await noStdin("remember", "a fact")).toBe(2)
+    expect(await noStdout("approve", "claude-code")).toBe(2)
+    expect(refusals.filter((line) => line === NEEDS_TERMINAL_LINE)).toHaveLength(4)
+    // init changes no agent's access, so it may run without a terminal
+    expect(await noStdin("init")).toBe(0)
   }, 300_000)
 
   it("never prints a secret: no output line contains any key stored in the home folder", () => {
