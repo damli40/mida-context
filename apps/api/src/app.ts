@@ -21,6 +21,7 @@ import {
   verifySignedManifest,
 } from "@mida/grant-advisor"
 import { Hono } from "hono"
+import type { Context } from "hono"
 import { createMiddleware } from "hono/factory"
 import { zeroHash } from "viem"
 import { authenticateRequest } from "./auth.js"
@@ -31,7 +32,8 @@ import type { RevocationTarget } from "./deny-overlay.js"
 import { toErrorBody } from "./errors.js"
 import { fileStores } from "./file-stores.js"
 import type { StoredObject } from "./store.js"
-import type { ContextStores } from "./stores.js"
+import { DEFAULT_STORE_LIMITS } from "./stores.js"
+import type { ContextStores, StoreLimits } from "./stores.js"
 import { verifyVaultAssertion } from "./verify-assertion.js"
 import type { WebAuthnAssertionInput } from "./verify-assertion.js"
 import { address, hex, parseObjectUpload, parseReaderWrap } from "./wire.js"
@@ -46,6 +48,8 @@ export interface ContextApiOptions {
   dataDir?: string
   /** Injected persistence — the hosted worker passes its D1 stores here. */
   stores?: ContextStores
+  /** Upload-abuse limits; any field overrides the shared defaults in DEFAULT_STORE_LIMITS. */
+  limits?: Partial<StoreLimits>
   /** Wall-clock seconds for request freshness. Chain time decides capability expiry. */
   clock?: () => bigint
 }
@@ -76,7 +80,26 @@ export function createContextApi(options: ContextApiOptions) {
   const overlay = new DenyOverlay(stores.denies)
   const store = stores.objects
   const replay = stores.nonces
+  const limits: StoreLimits = { ...DEFAULT_STORE_LIMITS, ...options.limits }
   const app = new Hono<Env>()
+
+  /**
+   * Reads a request body under a byte cap: an honest content-length is refused before a byte is read, and the
+   * count of bytes actually read decides — a header that lies low never gets an oversized body through.
+   */
+  const readBodyWithin = async (c: Context<Env>, max: number): Promise<Uint8Array> => {
+    const declared = c.req.header("content-length")
+    if (declared !== undefined && /^\d+$/.test(declared) && Number(declared) > max) {
+      throw new MidaError("PAYLOAD_TOO_LARGE", `request body is over the ${max} byte limit`)
+    }
+    const body = new Uint8Array(await c.req.arrayBuffer())
+    if (body.length > max) throw new MidaError("PAYLOAD_TOO_LARGE", `request body is over the ${max} byte limit`)
+    return body
+  }
+
+  /** A quota refusal: HTTP 429 with a plain message naming the exceeded limit. */
+  const quotaExceeded = (c: Context<Env>, limit: string, detail: string) =>
+    c.json({ error: { code: "QUOTA_EXCEEDED", message: `quota exceeded: ${limit} (${detail})` } }, 429)
 
   app.onError((error, c) => {
     const { status, body } = toErrorBody(error)
@@ -84,7 +107,7 @@ export function createContextApi(options: ContextApiOptions) {
   })
 
   const authenticated = createMiddleware<Env>(async (c, next) => {
-    const body = new Uint8Array(await c.req.arrayBuffer())
+    const body = await readBodyWithin(c, limits.maxRequestBodyBytes)
     c.set(
       "signer",
       await authenticateRequest({
@@ -129,7 +152,10 @@ export function createContextApi(options: ContextApiOptions) {
       authorId = agentId
     }
 
-    // 2–3. canonical manifest hash, ciphertext hash and size
+    // 2–3. canonical manifest hash, ciphertext hash and size — capped before the bytes are even decoded
+    if ((upload.ciphertext.length - 2) / 2 > limits.maxCiphertextBytes) {
+      throw new MidaError("PAYLOAD_TOO_LARGE", `ciphertext is over the ${limits.maxCiphertextBytes} byte limit`)
+    }
     const ciphertext = bytesOf(upload.ciphertext, (upload.ciphertext.length - 2) / 2)
     const committedManifestHash = manifestHash(manifest)
     if (ciphertext.length !== manifest.ciphertextSize) throw new MidaError("CONTENT_HASH_MISMATCH", "ciphertext size differs from the manifest")
@@ -183,7 +209,24 @@ export function createContextApi(options: ContextApiOptions) {
       }
     }
 
-    // 7. store as pending; §12.3 serves it only once Monad holds matching commitments
+    // 7. quotas: a signer may not use the store as free hosting. Pending bytes count what Monad has not
+    // anchored yet (anchored objects are the chain's problem, not ours); the daily count counts accepted PUTs.
+    const alreadyStored = (await store.getObject(manifest.contextId))?.manifestHash === committedManifestHash
+    let pendingBytes = alreadyStored ? 0 : ciphertext.length
+    for (const other of await store.objectsByUploader(signer)) {
+      if (other.contextId === manifest.contextId || isAnchored(other, await reader.getRecord(other.contextId))) continue
+      pendingBytes += other.manifest.ciphertextSize
+    }
+    if (pendingBytes > limits.maxPendingBytesPerSigner) {
+      return quotaExceeded(c, "maxPendingBytesPerSigner", `unanchored ciphertext would reach ${pendingBytes} bytes`)
+    }
+    const day = new Date().toISOString().slice(0, 10)
+    const putCount = await store.recordPut(signer, day)
+    if (putCount > limits.maxPutsPerSignerPerDay) {
+      return quotaExceeded(c, "maxPutsPerSignerPerDay", `${putCount - 1} puts already accepted on ${day}`)
+    }
+
+    // 8. store as pending; §12.3 serves it only once Monad holds matching commitments
     await store.blobs.put(ciphertext)
     await store.putObject({
       contextId: manifest.contextId,
@@ -246,7 +289,7 @@ export function createContextApi(options: ContextApiOptions) {
 
   // ---------- §14.1 agent capability manifests (public metadata) ----------
   app.put("/agent-manifests", async (c) => {
-    const envelope = json<SignedAgentCapabilityManifest>(new Uint8Array(await c.req.arrayBuffer()))
+    const envelope = json<SignedAgentCapabilityManifest>(await readBodyWithin(c, limits.maxManifestBodyBytes))
     if (envelope === null || typeof envelope !== "object" || typeof envelope.operatorSignature !== "string" || !/^0x[0-9a-f]{130}$/.test(envelope.operatorSignature)) {
       throw new MidaError("INVALID_WIRE", "envelope needs a manifest and a lowercase 65-byte operatorSignature")
     }
@@ -260,10 +303,12 @@ export function createContextApi(options: ContextApiOptions) {
     const agentRecord = await reader.getAgent(envelope.manifest.agentId)
     if (agentRecord !== null) {
       verifySignedManifest({ envelope, agentRecord, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, now })
-      await store.setManifestIndex(bodyHash, envelopeHash)
-    } else if ((await store.getManifestIndex(bodyHash)) === undefined) {
+    }
+    const existing = await store.getManifestIndex(bodyHash)
+    if (existing !== envelopeHash && (agentRecord !== null || existing === undefined)) {
       await store.setManifestIndex(bodyHash, envelopeHash)
     }
+    // Content-addressed: writing the same envelope again changes nothing and costs nothing.
     await store.blobs.put(manifestEnvelopeBytes(envelope))
     return c.json({ bodyHash, envelopeHash })
   })
@@ -402,5 +447,5 @@ export function createContextApi(options: ContextApiOptions) {
     return c.json({ intentId: cancelled.id, state: cancelled.state })
   })
 
-  return { app, overlay, store }
+  return { app, overlay, store, limits }
 }
