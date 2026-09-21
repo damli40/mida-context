@@ -27,8 +27,13 @@ export interface Network {
 export const NAMESPACE = "projects.current"
 export const PURPOSE_ID = "project_assistance" as const
 export const AGENT_PERMISSIONS = PERMISSION.READ | PERMISSION.CREATE | PERMISSION.SUPERSEDE_OWN
-/** Below this balance an account is topped up before it has to send a transaction. */
-export const MIN_BALANCE_WEI = 50_000_000_000_000_000n
+/**
+ * Below this balance an account is topped up before it has to send a transaction. 0.15 MON, from
+ * the live run on Sep 21: a grant bills about 0.043 MON on Monad (the full gas limit, at ~102 gwei)
+ * and the node wants roughly twice that in the wallet to cover the maximum fee — so at the old
+ * 0.05 line a wallet holding 0.064 was reported "has gas" and then could not pay for one approve.
+ */
+export const MIN_BALANCE_WEI = 150_000_000_000_000_000n
 /** One service runtime per home: a pid file created exclusively at open and removed at close. */
 const LOCK_FILE = "midad.lock"
 /** Where a running service publishes its Context API address so the owner CLI can reuse it. */

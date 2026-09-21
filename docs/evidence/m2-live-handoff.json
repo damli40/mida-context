@@ -1,0 +1,198 @@
+{
+  "what": "M2 live handoff: a real Claude Code session killed mid-task, a fresh Codex typing one word, on Monad testnet. Run by the owner (Dami) by hand in a real terminal; measurements read by Claude from the service's own logs.",
+  "date": "2026-09-21",
+  "chainId": 10143,
+  "repoHead": "23d26765630f1938e241537699fbf30aa1a35396",
+  "owner": "0x8b1974fa692b226e43d7a7711dea36874f21989b",
+  "agents": {
+    "claude-code": "0x9d77c4e56ed509cb1dc49b5053932c073a021ef955bf82c026478dd29c5cd295",
+    "codex": "0xb1e64743c6805530d3885c8cf418872d7f51a5fc04dffea01fffdc8e12f53e12",
+    "assistant": "0xba8d05bf2a8b098d6ec65cdcf2f46e31aaf29e45a8c758cef3619077f809c295"
+  },
+  "transactionsSeenInTheOwnersTerminal": {
+    "revokeClaudeCode": "0x7dfc6cb25a27b573efe9bcfa40748cbbceb8c50864c06b8516584ca27c24f643",
+    "reApproveClaudeCode": {
+      "hash": "0x69a3bf5074ab461c0689f81f95b00aeb4b2ca323ce9abd72c65624d2f97c9f1c",
+      "gasBilled": 832470,
+      "note": "re-approving a previously revoked agent; about twice a first approval"
+    },
+    "rememberedFactContextId": "0xb3585de4dafcb3df6cf34c0715e63e2d3753bd74a43f10dfa6f364b01ce00658"
+  },
+  "gasNote": "On Monad the receipt's gasUsed equals the gas limit, which is what is billed.",
+  "run1": {
+    "folder": "~/mida-live/toy",
+    "result": "INCONCLUSIVE for continuation: Claude Code had finished every step before the kill (src/lru.mjs written 11:14:22 local, kill about 11:15:30), so Codex only verified. Proves capture, save, handoff delivery, mida remember, read --as assistant, revoke.",
+    "claudeCodeSession": "e5662247-b8c6-4a80-9241-95cc2a3340e3",
+    "checkpointsSaved": 3
+  },
+  "run2": {
+    "folder": "~/mida-live/toy2",
+    "claudeCodeSession": "761f0ec8-abf7-4135-b1a0-a10bb49c7105",
+    "killedAfterSeconds": "about 70",
+    "stateAtKill": {
+      "src/lru.mjs": "absent",
+      "README Usage section": "absent",
+      "tests": "2 of 2 (starting state)"
+    },
+    "checkpointsSaved": 2,
+    "codexPrompt": "continue",
+    "codexFirstLine": "I'll pick up from the saved state: inspect the current bucket API and test setup, then add the limiter, usage example, and deterministic coverage before running the suite.",
+    "scoredByClaudeFromTheFinishedFiles": {
+      "KeyedLimiter class exported from src/lru.mjs": true,
+      "constructor default maxKeys = 100": true,
+      "evicts least recently used": true,
+      "take(key, n) returns the bucket result": true,
+      "README has ## Usage with a KeyedLimiter example": true,
+      "no setTimeout/setInterval under src/": true,
+      "bucket.mjs public names kept (file untouched)": true,
+      "npm test": "4 of 4"
+    },
+    "result": "PASS: every step that existed only in the saved context was built by an agent that was told one word."
+  },
+  "measurements": {
+    "captureHookMs": {
+      "events": 20,
+      "min": 9,
+      "median": 11,
+      "max": 13,
+      "budget": 100
+    },
+    "sessionStartHandoffs": [
+      {
+        "at": "2026-09-21T10:11:42.290Z",
+        "agent": "claude-code",
+        "kind": "empty",
+        "reason": null,
+        "checkpoints": 0,
+        "facts": 0,
+        "factsFailed": null,
+        "readMs": 2207,
+        "ms": 3237
+      },
+      {
+        "at": "2026-09-21T10:30:05.057Z",
+        "agent": "codex",
+        "kind": "handoff",
+        "reason": null,
+        "checkpoints": 3,
+        "facts": 0,
+        "factsFailed": null,
+        "readMs": 3406,
+        "ms": 4601
+      },
+      {
+        "at": "2026-09-21T13:39:28.240Z",
+        "agent": "claude-code",
+        "kind": "refused",
+        "reason": "not-approved",
+        "checkpoints": 0,
+        "facts": 0,
+        "factsFailed": null,
+        "readMs": null,
+        "ms": 2
+      },
+      {
+        "at": "2026-09-21T13:40:48.999Z",
+        "agent": "codex",
+        "kind": "handoff",
+        "reason": null,
+        "checkpoints": 3,
+        "facts": 1,
+        "factsFailed": null,
+        "readMs": 3528,
+        "ms": 4625
+      },
+      {
+        "at": "2026-09-21T14:47:08.147Z",
+        "agent": "claude-code",
+        "kind": "empty",
+        "reason": null,
+        "checkpoints": 0,
+        "facts": 1,
+        "factsFailed": null,
+        "readMs": 3793,
+        "ms": 4753
+      },
+      {
+        "at": "2026-09-21T14:50:49.297Z",
+        "agent": "codex",
+        "kind": "handoff",
+        "reason": null,
+        "checkpoints": 2,
+        "facts": 1,
+        "factsFailed": null,
+        "readMs": 4979,
+        "ms": 6149
+      }
+    ],
+    "sessionStartLimitMs": 8000,
+    "saves": [
+      {
+        "at": "2026-09-21T10:13:52.750Z",
+        "sessionId": "e5662247-b8c6-4a80-9241-95cc2a3340e3",
+        "outcome": "saved",
+        "eventId": "cp-4e335c1836cb166c0bb94b9884891ad36dd8b049",
+        "compileMs": 17574,
+        "saveMs": 4589,
+        "attempts": 1
+      },
+      {
+        "at": "2026-09-21T10:14:51.504Z",
+        "sessionId": "e5662247-b8c6-4a80-9241-95cc2a3340e3",
+        "outcome": "saved",
+        "eventId": "cp-ef72b7dbf7f2a90dcb72165c39bb0253b45c694f",
+        "compileMs": 14310,
+        "saveMs": 6567,
+        "attempts": 1
+      },
+      {
+        "at": "2026-09-21T10:15:52.445Z",
+        "sessionId": "e5662247-b8c6-4a80-9241-95cc2a3340e3",
+        "outcome": "saved",
+        "eventId": "cp-558966d1c1803dcd47fcf49a2f89953f8582d75c",
+        "compileMs": 15001,
+        "saveMs": 6761,
+        "attempts": 1
+      },
+      {
+        "at": "2026-09-21T14:49:00.135Z",
+        "sessionId": "761f0ec8-abf7-4135-b1a0-a10bb49c7105",
+        "outcome": "saved",
+        "eventId": "cp-c1918ee88df72696303af19333ed5142114bd94c",
+        "compileMs": 15078,
+        "saveMs": 7220,
+        "attempts": 1
+      },
+      {
+        "at": "2026-09-21T14:49:44.159Z",
+        "sessionId": "761f0ec8-abf7-4135-b1a0-a10bb49c7105",
+        "outcome": "saved",
+        "eventId": "cp-e6fdbb698e2c40dad00fed40a94596b7bcd70778",
+        "compileMs": 35663,
+        "saveMs": 8036,
+        "attempts": 1
+      }
+    ],
+    "firstSaveAfterFirstEventSeconds_run2": 84,
+    "lossWindowNote": "SPEC-05: the first save of a session landed about 84 s after its first event (60 s gap + compile + save). A kill inside the first minute was NOT tested and would probably save nothing."
+  },
+  "limits": [
+    "one run of one small task, one operator; not a benchmark",
+    "one direction only: Claude Code to Codex; Codex sessions are not captured (no Codex transcript reader)",
+    "throwaway settings files were used for both tools so the owner's real settings were untouched",
+    "the handoff text itself was not captured by the log, so its length (limit 8,000 characters) is NOT measured here",
+    "software owner key on disk; passkey page is M3"
+  ],
+  "defectsFoundByThisRun": [
+    "hook commands written by install did not exist on the PATH",
+    "the mida command ignored MIDA_HOME",
+    "refused: ERROR hid every cause",
+    "the revocation-history scan outlasted the 10-minute request window (fixed: 0.5 s and 28 s measured live)",
+    "wallets-have-gas passed a wallet that could not pay for one approval",
+    "owner commands print nothing while they work",
+    "input pasted before the yes prompt would be read as its answer",
+    "a revoked agent is refused with reason not-approved instead of revoked",
+    "request for an already-approved agent prints refused: ERROR",
+    "session-start hook output is invisible to the user in both tools"
+  ]
+}
