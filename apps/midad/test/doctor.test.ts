@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import type { Server } from "node:net"
 import { tmpdir } from "node:os"
@@ -158,6 +158,59 @@ describe("mida doctor without a chain", () => {
     expect(note).not.toContain("tok-secret")
     // notes are not problems: the note line never counts toward the exit code
     expect(lines.every((line) => !line.startsWith("note:") || !line.startsWith("PROBLEM:"))).toBe(true)
+  })
+
+  it("a PATH without mida-hook and mida-inject is a PROBLEM naming the repo's bin folder (R4-6)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const emptyPath = join(dir(), "empty-path")
+    mkdirSync(emptyPath)
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: { PATH: emptyPath }, daemonProbeMs: 50 })
+    const hook = lines.find((line) => line.includes("mida-hook"))
+    const inject = lines.find((line) => line.includes("mida-inject"))
+    expect(hook).toBeDefined()
+    expect(inject).toBeDefined()
+    expect(hook).toContain("PROBLEM:")
+    expect(inject).toContain("PROBLEM:")
+    // the fix names a bin/ folder the owner can add to their PATH — the repo's own, until npm exists
+    for (const line of [hook, inject]) {
+      expect(line).toContain("add")
+      expect(line).toContain("PATH")
+      expect(line).toMatch(/bin\/?\s+to your PATH/)
+    }
+    expect(lines).not.toContain("ok: mida-hook is on the PATH")
+  })
+
+  it("a PATH carrying both commands reports ok for each (R4-6)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const binDir = join(dir(), "fake-bin")
+    mkdirSync(binDir)
+    for (const command of ["mida-hook", "mida-inject"]) {
+      writeFileSync(join(binDir, command), "#!/bin/sh\nexit 0\n")
+      chmodSync(join(binDir, command), 0o755)
+    }
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: { PATH: binDir }, daemonProbeMs: 50 })
+    expect(lines).toContain("ok: mida-hook is on the PATH")
+    expect(lines).toContain("ok: mida-inject is on the PATH")
+  })
+
+  it("MIDA_CLAUDE_SETTINGS and MIDA_CODEX_CONFIG point the hooks check at throwaway settings files (R4-6)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const settings = join(dir(), "settings.json")
+    const config = join(dir(), "config.toml")
+    installClaudeCode(settings)
+    installCodex(config)
+    const lines: string[] = []
+    // no `settings` dep at all — the env vars name the files, as a throwaway-settings run does
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      env: { MIDA_CLAUDE_SETTINGS: settings, MIDA_CODEX_CONFIG: config },
+      daemonProbeMs: 50,
+    })
+    expect(lines).toContain("ok: claude-code hooks installed")
+    expect(lines).toContain("ok: codex hooks installed")
   })
 })
 

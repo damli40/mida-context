@@ -47,6 +47,7 @@ function deps(over: Partial<HandoffDeps> = {}) {
       calls.readFacts += 1
       return (over.readFacts ?? (async () => []))(r, n)
     },
+    isRevoked: over.isRevoked ?? (() => false),
     limitMs: over.limitMs,
     now: over.now,
   }
@@ -67,6 +68,44 @@ describe("buildHandoff", () => {
 
   it("a folder the owner never approved gets the not-approved line, word for word", async () => {
     const { d } = deps({ checkProject: async () => ({ ok: false, reason: "not-approved" }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toEqual({
+      kind: "refused",
+      reason: "not-approved",
+      text: "Mida: codex is not approved for this project — run `mida approve codex` in this folder.",
+    })
+  })
+
+  it("not-approved plus the revoke marker answers revoked — the row is gone but the owner said why (R4-3)", async () => {
+    const { calls, d } = deps({
+      checkProject: async () => ({ ok: false, reason: "not-approved" }),
+      isRevoked: () => true,
+    })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toEqual({
+      kind: "refused",
+      reason: "revoked",
+      text: "Mida: codex's access was revoked by the owner. Nothing was shared.",
+    })
+    expect(calls).toEqual({ checkProject: 1, capability: 0, read: 0, readFacts: 0 })
+  })
+
+  it("the marker only rewrites not-approved — other project refusals keep their own reason", async () => {
+    for (const reason of ["not-a-project", "folder-mismatch", "list-unreadable", "check-failed"] as const) {
+      const { d } = deps({ checkProject: async () => ({ ok: false, reason }), isRevoked: () => true })
+      const result = await buildHandoff(runtime, input, d)
+      expect(result.kind).toBe("refused")
+      expect((result as { reason: string }).reason).toBe(reason)
+    }
+  })
+
+  it("a marker that throws while being read leaves the not-approved answer, never a crash", async () => {
+    const { d } = deps({
+      checkProject: async () => ({ ok: false, reason: "not-approved" }),
+      isRevoked: () => {
+        throw new Error("disk went away")
+      },
+    })
     const result = await buildHandoff(runtime, input, d)
     expect(result).toEqual({
       kind: "refused",
@@ -237,6 +276,30 @@ describe("buildHandoff", () => {
     const result = await buildHandoff(runtime, input, d)
     expect(result).toMatchObject({ kind: "refused", reason: "read-slow" })
     await new Promise((resolve) => setTimeout(resolve, 250))
+  })
+
+  it("the checkpoint read and the facts read run concurrently — each waiting on the other still completes (R4-2)", async () => {
+    // If the reads ran one after another, the first would block on a gate the second only opens
+    // when IT starts — a sequential buildHandoff would hit the deadline and refuse read-slow.
+    let openRead!: () => void
+    let openFacts!: () => void
+    const readGate = new Promise<void>((resolve) => (openRead = resolve))
+    const factsGate = new Promise<void>((resolve) => (openFacts = resolve))
+    const { d } = deps({
+      limitMs: 2_000,
+      read: async () => {
+        openRead()
+        await factsGate
+        return { checkpoints: [stored()], skipped: 0, milliseconds: 1 }
+      },
+      readFacts: async () => {
+        openFacts()
+        await readGate
+        return []
+      },
+    })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result.kind).toBe("handoff")
   })
 
   it("owner facts render under the exact heading; a failed fact read degrades to facts: 0 with a stable code", async () => {

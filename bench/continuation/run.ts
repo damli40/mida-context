@@ -587,8 +587,7 @@ main()
     process.exitCode = code
   })
   .catch((error: unknown) => {
-    // stable code only — a message can carry paths or values
-    const code = error instanceof Error ? error.name : "error"
-    console.error(`harness: ${code}`)
+    // the error's own message — `harness: Error` for a missing --condition named nothing (R4-8)
+    console.error(`harness: ${error instanceof Error ? error.message : String(error)}`)
     process.exitCode = 1
   })

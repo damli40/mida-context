@@ -109,6 +109,62 @@ describe("the crude mida command", () => {
     expect(await noStdin("init")).toBe(0)
   }, 300_000)
 
+  it("the yes-prompt drains whatever was already buffered before it asks, then waits for a fresh answer (R4-10)", async () => {
+    const order: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: () => {},
+        drainInput: async () => { order.push("drain") },
+        prompt: async () => { order.push("prompt"); return "yes" },
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // a fresh ask needs a revoked-then-requested agent
+    expect(await run2("revoke", "claude-code")).toBe(0)
+    expect(await run2("request", "claude-code")).toBe(0)
+    expect(await run2("approve", "claude-code")).toBe(0)
+    // the drain ran before the question was printed — input pasted while approve ran is dropped
+    expect(order).toEqual(["drain", "prompt"])
+  }, 300_000)
+
+  it("MIDA_DEBUG=1 prints a masked debug line on failure; unset prints nothing extra (R4-8)", async () => {
+    const hex = `0x${"ab".repeat(40)}`
+    const failingPrompt = async () => {
+      throw new Error(`execution reverted: ${hex} with more data`)
+    }
+    const out: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => out.push(line),
+        drainInput: async () => {},
+        prompt: failingPrompt,
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // claude-code was approved by the test above — a fresh ask needs it revoked and re-requested
+    expect(await run2("revoke", "claude-code")).toBe(0)
+    expect(await run2("request", "claude-code")).toBe(0)
+    const prev = process.env.MIDA_DEBUG
+    try {
+      process.env.MIDA_DEBUG = "1"
+      out.length = 0
+      expect(await run2("approve", "claude-code")).toBe(1)
+      const debug = out.find((line) => line.startsWith("debug:"))
+      expect(debug).toBeDefined()
+      expect(debug).toContain("<hex>")
+      expect(debug).not.toContain(hex)
+      expect(out.some((line) => line.startsWith("refused:"))).toBe(true)
+      delete process.env.MIDA_DEBUG
+      out.length = 0
+      expect(await run2("approve", "claude-code")).toBe(1)
+      expect(out.every((line) => !line.startsWith("debug:"))).toBe(true)
+      expect(out.join("\n")).not.toContain(hex)
+    } finally {
+      if (prev === undefined) delete process.env.MIDA_DEBUG
+      else process.env.MIDA_DEBUG = prev
+    }
+    // restore: the pending request is still waiting — approve it for real
+    expect(await run("approve", "claude-code")).toBe(0)
+  }, 300_000)
+
   it("never prints a secret: no output line contains any key stored in the home folder", () => {
     const secrets: string[] = []
     const walk = (folder: string) => {

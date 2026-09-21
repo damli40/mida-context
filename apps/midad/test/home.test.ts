@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest"
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
-import { MidaHome } from "@mida/midad"
+import { readFileSync } from "node:fs"
+import { dirname } from "node:path"
+import { fileURLToPath } from "node:url"
+import { MidaHome, resolveHome } from "@mida/midad"
 
 const freshHome = () => new MidaHome(mkdtempSync(join(tmpdir(), "mida-home-")))
 
@@ -102,5 +105,41 @@ describe("MidaHome", () => {
     home.writeSecretJson("agents/claude-code/identity.json", {})
     expect(home.list("agents").sort()).toEqual(["claude-code", "codex"])
     expect(home.list("nothing-here")).toEqual([])
+  })
+})
+
+/**
+ * R4-7 — every entry point finds the home folder through resolveHome, so `mida`, the daemon,
+ * the drainer and both hooks can never disagree about where MIDA_HOME points again.
+ */
+describe("resolveHome (R4-7)", () => {
+  it("unset MIDA_HOME means the default ~/.mida", () => {
+    expect(resolveHome({}).root).toBe(join(homedir(), ".mida"))
+  })
+
+  it("an absolute MIDA_HOME is honoured, verbatim", () => {
+    const root = mkdtempSync(join(tmpdir(), "mida-elsewhere-"))
+    expect(resolveHome({ MIDA_HOME: root }).root).toBe(root)
+  })
+
+  it("an empty string or a relative path is refused with a plain message — never silently resolved", () => {
+    for (const bad of ["", "relative/home", "./also-relative", ".."]) {
+      expect(() => resolveHome({ MIDA_HOME: bad }), JSON.stringify(bad)).toThrow("MIDA_HOME must be an absolute path")
+    }
+  })
+
+  it("no source file under apps/midad/src constructs a MidaHome directly — all go through resolveHome", () => {
+    const srcDir = join(dirname(fileURLToPath(import.meta.url)), "../src")
+    const offenders: string[] = []
+    const walk = (folder: string) => {
+      for (const entry of readdirSync(folder)) {
+        const full = join(folder, entry)
+        if (statSync(full).isDirectory()) walk(full)
+        else if (entry.endsWith(".ts") && readFileSync(full, "utf8").includes("new MidaHome(")) offenders.push(full)
+      }
+    }
+    walk(srcDir)
+    // home.ts itself is the only legal site — inside resolveHome
+    expect(offenders).toEqual([join(srcDir, "home.ts")])
   })
 })

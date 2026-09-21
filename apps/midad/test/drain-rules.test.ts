@@ -8,7 +8,7 @@ import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { MidaHome, buildHandoff, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, projectIdFor, tailOf } from "@mida/midad"
+import { MidaHome, buildHandoff, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, projectIdFor, tailOf } from "@mida/midad"
 import type { DrainDeps, Runtime, saveCheckpoint } from "@mida/midad"
 import { CONTENT_FIELDS, mergeCheckpoints } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
@@ -317,6 +317,20 @@ describe("a failed save does not buy a new model call", () => {
     expect(calls).toBe(2)
   })
 
+  it("a save refused CAPABILITY_REVOKED removes the job with reason revoked — permanent, distinct from not-approved (R4-3)", async () => {
+    const { home, job, drain, drainLog, compileCalls } = setup()
+    const save: typeof saveCheckpoint = async () => {
+      throw new MidaError("CAPABILITY_REVOKED", "capability is revoked")
+    }
+    job({ event: "Stop" }, T0)
+    const result = await drain({ save, now: () => new Date(T0 + 120_000) })
+    expect(result).toMatchObject({ saved: 0, failed: 0 })
+    expect(listJobs(home)).toHaveLength(0)
+    expect(compileCalls).toHaveLength(1)
+    expect(drainLog()).toContain('"reason":"revoked"')
+    expect(drainLog()).not.toContain('"reason":"not-approved"')
+  })
+
   it("a checkpoint the compiler calls invalid is retried, not dropped on the spot (C3)", async () => {
     const { home, job, drain, flags, drainLog } = setup()
     flags.compileReason = "invalid"
@@ -354,6 +368,28 @@ describe("the owner-signed project list gates every save", () => {
       expect(drainLog()).toContain(`"reason":"${reason}"`)
     })
   }
+
+  it("a job refused not-approved for a revoked agent logs revoked — the marker says why (R4-3)", async () => {
+    const { home, job, drain, compileCalls, saveCalls, drainLog } = setup()
+    markRevoked(home, "claude-code")
+    job({ event: "Stop" }, T0)
+    const result = await drain({ checkProject: async () => ({ ok: false as const, reason: "not-approved" as const }) })
+    expect(result.failed).toBe(0)
+    expect(compileCalls).toHaveLength(0)
+    expect(saveCalls).toHaveLength(0)
+    expect(listJobs(home)).toHaveLength(0)
+    expect(drainLog()).toContain('"reason":"revoked"')
+    expect(drainLog()).not.toContain('"reason":"not-approved"')
+  })
+
+  it("a chain-level refusal for a revoked agent also logs revoked, not not-approved (R4-3)", async () => {
+    const { home, job, drain, drainLog } = setup()
+    markRevoked(home, "claude-code")
+    job({ event: "Stop" }, T0)
+    await drain({ isApproved: async () => false })
+    expect(drainLog()).toContain('"reason":"revoked"')
+    expect(drainLog()).not.toContain('"reason":"not-approved"')
+  })
 
   it("the default check answers not-a-project for a marker-less folder without opening a runtime", async () => {
     const { home, homeDir, open, compile } = setup()
