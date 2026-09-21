@@ -145,6 +145,8 @@ export async function sendContract(
     try {
       return await context.sponsor.send(call, kind)
     } catch (error) {
+      // SPONSOR_PENDING leaves through this line untouched: the operation was accepted and may
+      // still land, so a self-paid copy is exactly the double-send this seam must never create.
       if (!(error instanceof SponsorDidNotPay)) throw error
       if (!SPONSOR_FALLBACK_TO_SELF_PAY) {
         // The probe (m3-sponsor-probe step f, Sep 21) measured that a delegated address under

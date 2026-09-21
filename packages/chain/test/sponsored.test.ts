@@ -75,10 +75,16 @@ interface SponsorScript {
   stubData?: unknown
   estimateGas?: unknown
   paymasterData?: unknown
+  /** When set, both paymaster calls refuse — the sponsor will not pay for this operation. */
+  paymasterError?: { code: number; message: string }
   sendResult?: unknown
   sendError?: { code: number; message: string }
   sendHang?: boolean
   receipt?: unknown
+  /** ms after eth_sendUserOperation before the receipt appears — a slow-landing operation. */
+  receiptDelayMs?: number
+  /** The first N receipt polls fail with a transport error — a bundler hiccup mid-wait. */
+  receiptErrorCalls?: number
   byHash?: unknown
 }
 
@@ -136,18 +142,38 @@ async function start(script: SponsorScript, chain: { code: string; txCount: stri
   sponsorUrl: string
   rpcUrl: string
   sent: Record<string, unknown>[]
+  /** Live call counts — the recovery probes show up here after the wait gives up. */
+  counts(): { receiptPolls: number; byHashCalls: number }
   close(): Promise<void>
 }> {
   const sent: Record<string, unknown>[] = []
+  let sentAt = 0
+  let receiptPolls = 0
+  let byHashCalls = 0
+  const refusal = () => {
+    if (script.paymasterError === undefined) return undefined
+    const error = new Error(script.paymasterError.message) as Error & { code: number }
+    error.code = script.paymasterError.code
+    return error
+  }
   const sponsor = await rpcServer({
     pimlico_getUserOperationGasPrice: () => script.gasPrice ?? DEFAULT_GAS_PRICE,
-    pm_getPaymasterStubData: () => script.stubData ?? { ...PAYMASTER_FIELDS, isFinal: false },
-    pm_getPaymasterData: () => script.paymasterData ?? PAYMASTER_FIELDS,
+    pm_getPaymasterStubData: () => {
+      const error = refusal()
+      if (error !== undefined) throw error
+      return script.stubData ?? { ...PAYMASTER_FIELDS, isFinal: false }
+    },
+    pm_getPaymasterData: () => {
+      const error = refusal()
+      if (error !== undefined) throw error
+      return script.paymasterData ?? PAYMASTER_FIELDS
+    },
     eth_estimateUserOperationGas: () => script.estimateGas ?? OP_GAS,
     eth_supportedEntryPoints: () => [ENTRY_POINT],
     eth_chainId: () => "0x279f",
     eth_sendUserOperation: (params) => {
       sent.push(params[0] as Record<string, unknown>)
+      sentAt = Date.now()
       if (script.sendHang === true) return new Promise(() => {})
       if (script.sendError !== undefined) {
         const error = new Error(script.sendError.message) as Error & { code: number }
@@ -156,8 +182,20 @@ async function start(script: SponsorScript, chain: { code: string; txCount: stri
       }
       return script.sendResult ?? USER_OP_HASH
     },
-    eth_getUserOperationReceipt: () => script.receipt ?? null,
-    eth_getUserOperationByHash: () => script.byHash ?? null,
+    eth_getUserOperationReceipt: () => {
+      receiptPolls += 1
+      if (receiptPolls <= (script.receiptErrorCalls ?? 0)) {
+        const error = new Error("the bundler dropped the connection") as Error & { code: number }
+        error.code = -32000
+        throw error
+      }
+      if (script.receiptDelayMs !== undefined && Date.now() - sentAt < script.receiptDelayMs) return null
+      return script.receipt ?? null
+    },
+    eth_getUserOperationByHash: () => {
+      byHashCalls += 1
+      return script.byHash ?? null
+    },
   })
   const chainRpc = await rpcServer({
     eth_chainId: () => "0x279f",
@@ -171,6 +209,7 @@ async function start(script: SponsorScript, chain: { code: string; txCount: stri
     sponsorUrl: sponsor.url,
     rpcUrl: chainRpc.url,
     sent,
+    counts: () => ({ receiptPolls, byHashCalls }),
     close: async () => {
       await sponsor.close()
       await chainRpc.close()
@@ -281,6 +320,100 @@ describe("createSponsoredSender", () => {
       const error = await sender.send(call, "owner.key").then(() => null, (e: unknown) => e)
       expect(error).not.toBeInstanceOf(SponsorDidNotPay)
       expect((error as MidaError).code).toBe("NOT_FOUND")
+    } finally {
+      await env.close()
+    }
+  })
+
+  // M3-D2: after the bundler ACCEPTS an operation there is no falling back. The receipt wait is a
+  // separate, longer phase whose failures are SPONSOR_PENDING — never SponsorDidNotPay, so
+  // sendContract can never send a second copy of a call that may still land.
+
+  it("a slow receipt still succeeds — acceptance is not failure, and the owner hears one progress line", async () => {
+    const env = await start(
+      { receipt: userOpReceipt(account.address, true), byHash: { userOperation: OP_GAS }, receiptDelayMs: 250 },
+      { code: "0x", txCount: "0x0" },
+    )
+    const lines: string[] = []
+    try {
+      const sender = createSponsoredSender({
+        sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment,
+        receiptTimeoutMs: 5_000, receiptNoticeMs: 40, pollingIntervalMs: 5,
+        progress: (line) => lines.push(line),
+      })
+      const receipt = await sender.send(call, "owner.key")
+      expect(receipt.userOpHash).toBe(USER_OP_HASH)
+      expect(receipt.transactionHash).toBe(BUNDLE_TX)
+      expect(env.sent).toHaveLength(1) // one operation, never a second copy
+      expect(lines).toEqual(["still waiting for the sponsored transaction to be confirmed…"])
+    } finally {
+      await env.close()
+    }
+  })
+
+  it("a receipt that never arrives is SPONSOR_PENDING — the accepted operation is never resent", async () => {
+    const env = await start({}, { code: "0x", txCount: "0x0" }) // the receipt endpoint answers null forever
+    const lines: string[] = []
+    try {
+      const sender = createSponsoredSender({
+        sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment,
+        receiptTimeoutMs: 200, receiptNoticeMs: 50, pollingIntervalMs: 5,
+        progress: (line) => lines.push(line),
+      })
+      const error = await sender.send(call, "owner.key").then(() => null, (e: unknown) => e)
+      expect(error).toBeInstanceOf(MidaError)
+      expect(error).not.toBeInstanceOf(SponsorDidNotPay)
+      expect((error as MidaError).code).toBe("SPONSOR_PENDING")
+      expect((error as Error).message).toContain(USER_OP_HASH)
+      expect((error as Error).message).toContain("may still land")
+      expect((error as Error).message).toContain("nothing was sent from your wallet")
+      expect((error as { userOpHash?: unknown }).userOpHash).toBe(USER_OP_HASH)
+      expect(env.sent).toHaveLength(1) // the accepted operation went out exactly once
+      expect(env.counts().byHashCalls).toBe(1) // the last-look probe ran before giving up
+      expect(lines).toEqual(["still waiting for the sponsored transaction to be confirmed…"])
+    } finally {
+      await env.close()
+    }
+  })
+
+  it("a transport error mid-wait is recovered by one more probe — the landed receipt still answers success", async () => {
+    const env = await start(
+      { receipt: userOpReceipt(account.address, true), byHash: { userOperation: OP_GAS }, receiptErrorCalls: 1 },
+      { code: "0x", txCount: "0x0" },
+    )
+    try {
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, receiptTimeoutMs: 5_000, pollingIntervalMs: 5 })
+      const receipt = await sender.send(call, "owner.key")
+      expect(receipt.userOpHash).toBe(USER_OP_HASH)
+      expect(receipt.transactionHash).toBe(BUNDLE_TX)
+      expect(env.sent).toHaveLength(1)
+    } finally {
+      await env.close()
+    }
+  })
+
+  it("a paymaster refusal is still SponsorDidNotPay — nothing was accepted, the fallback is safe", async () => {
+    const env = await start({ paymasterError: { code: -32000, message: "refused: the sponsor's daily budget is exhausted" } }, { code: "0x", txCount: "0x0" })
+    try {
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
+      const error = await sender.send(call, "owner.key").then(() => null, (e: unknown) => e)
+      expect(error).toBeInstanceOf(SponsorDidNotPay)
+      expect(env.sent).toHaveLength(0) // refused before eth_sendUserOperation — nothing to wait on
+    } finally {
+      await env.close()
+    }
+  })
+
+  it("a bundler that is down before acceptance is SponsorDidNotPay", async () => {
+    const dead = await rpcServer({})
+    const deadUrl = dead.url
+    await dead.close() // a port nothing listens on anymore
+    const env = await start({}, { code: "0x", txCount: "0x0" }) // the chain RPC stays up
+    try {
+      const sender = createSponsoredSender({ sponsorUrl: deadUrl, rpcUrl: env.rpcUrl, account, deployment, timeoutMs: 5_000, pollingIntervalMs: 5 })
+      const error = await sender.send(call, "owner.key").then(() => null, (e: unknown) => e)
+      expect(error).toBeInstanceOf(SponsorDidNotPay)
+      expect(env.sent).toHaveLength(0)
     } finally {
       await env.close()
     }

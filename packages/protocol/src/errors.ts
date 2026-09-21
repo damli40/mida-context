@@ -38,6 +38,7 @@ export const MIDA_ERROR_CODES = [
   "OWNER_WALLET_LOW",
   "PARTIAL_READ",
   "SPONSOR_FAILED",
+  "SPONSOR_PENDING",
 ] as const
 
 export type MidaErrorCode = (typeof MIDA_ERROR_CODES)[number]

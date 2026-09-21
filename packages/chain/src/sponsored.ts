@@ -2,6 +2,7 @@ import { MidaError } from "@mida/protocol"
 import { createPublicClient, encodeFunctionData, http } from "viem"
 import type { Abi, Address, Hex, LocalAccount } from "viem"
 import { entryPoint08Address } from "viem/account-abstraction"
+import type { UserOperationReceipt } from "viem/account-abstraction"
 import { createSmartAccountClient } from "permissionless"
 import { to7702SimpleSmartAccount } from "permissionless/accounts"
 import { createPimlicoClient } from "permissionless/clients/pimlico"
@@ -18,8 +19,14 @@ import type { SentReceipt } from "./writes.js"
  */
 export const SPONSORED_IMPLEMENTATION: Address = "0xe6Cae83BdE06E4c305530e199D7217f42808555B"
 
-/** A sponsored attempt gets this long end to end; past it the caller falls back or refuses. */
+/** Phase 1 — up to the bundler answering with a hash — gets this long; past it the caller may fall back. */
 export const SPONSOR_TIMEOUT_MS = 20_000
+
+/** Phase 2 — waiting for the receipt of an ACCEPTED operation — gets its own, longer deadline. */
+export const SPONSOR_RECEIPT_TIMEOUT_MS = 120_000
+
+/** Once the receipt wait runs this long the owner hears one progress line — silence is not pending. */
+export const SPONSOR_RECEIPT_NOTICE_MS = 15_000
 
 /** EIP-7702 delegated code on an address starts with this designator followed by the implementation. */
 const DELEGATION_PREFIX = "0xef0100"
@@ -37,6 +44,26 @@ export class SponsorDidNotPay extends MidaError {
     super("SPONSOR_FAILED", reason)
     this.name = "SponsorDidNotPay"
     this.reason = reason
+  }
+}
+
+/**
+ * The bundler accepted a user operation — a hash exists — but its receipt could not be confirmed
+ * inside the receipt deadline. The operation may still land, so this is deliberately NOT
+ * SponsorDidNotPay: `sendContract` falls back only on that type, and a self-paid copy of an
+ * accepted call is the exact double-send this error exists to prevent.
+ */
+export class SponsorPending extends MidaError {
+  /** The accepted operation's hash — surfaced to the owner so the outcome can be checked. */
+  readonly userOpHash: Hex
+
+  constructor(userOpHash: Hex) {
+    super(
+      "SPONSOR_PENDING",
+      `sponsored operation ${userOpHash} was accepted and may still land — check it before retrying; nothing was sent from your wallet`,
+    )
+    this.name = "SponsorPending"
+    this.userOpHash = userOpHash
   }
 }
 
@@ -73,10 +100,16 @@ export function createSponsoredSender(input: {
   deployment: Deployment
   /** Override the delegated implementation — must be on the endpoint's allow list. */
   implementation?: Address
-  /** Whole-attempt deadline, default SPONSOR_TIMEOUT_MS; tests pass less. */
+  /** Phase-1 deadline (paymaster + send, up to acceptance), default SPONSOR_TIMEOUT_MS; tests pass less. */
   timeoutMs?: number
+  /** Phase-2 deadline (receipt confirmation after acceptance), default SPONSOR_RECEIPT_TIMEOUT_MS. */
+  receiptTimeoutMs?: number
+  /** Delay before the "still waiting" progress line, default SPONSOR_RECEIPT_NOTICE_MS. */
+  receiptNoticeMs?: number
   /** Receipt polling interval; viem's default when unset. */
   pollingIntervalMs?: number
+  /** Progress lines for the human running the command — fires once if the receipt wait runs long. */
+  progress?: (line: string) => void
 }): SponsoredSender {
   const chain = chainFor(input.deployment.chainId)
   const publicClient = createPublicClient({ chain, transport: http(input.rpcUrl) })
@@ -104,7 +137,13 @@ export function createSponsoredSender(input: {
 
   return {
     async send(call, _kind) {
-      const work = (async (): Promise<SponsoredReceipt> => {
+      // Phase 1 — everything up to the bundler answering with a user-operation hash. The
+      // deadline is safe here: while no hash exists nothing was provably accepted, so a
+      // SponsorDidNotPay lets sendContract send the same call from the owner's wallet.
+      // One edge remains: the bundler can accept the operation yet never answer — then the
+      // deadline fires with no hash to wait on and no way to check, and the fallback may send
+      // a second copy. That residual risk has no fix without an identifier, so it stands.
+      const phaseOne = (async (): Promise<Hex> => {
         const bundlerClient = await getBundler()
         const data = encodeFunctionData({ abi: call.abi, functionName: call.functionName, args: call.args } as never)
         // A delegated sender needs no authorization — the endpoint reads the delegation from
@@ -123,15 +162,52 @@ export function createSponsoredSender(input: {
               chainId: Number(input.deployment.chainId),
               nonce: await publicClient.getTransactionCount({ address: input.account.address }),
             })
-        const userOpHash = (await bundlerClient.sendUserOperation({
+        return (await bundlerClient.sendUserOperation({
           calls: [{ to: call.address, value: 0n, data }],
           authorization,
         })) as Hex
-        const receipt = await bundlerClient.waitForUserOperationReceipt({
-          hash: userOpHash,
-          timeout: timeoutMs,
-          pollingInterval: input.pollingIntervalMs,
-        })
+      })()
+      let userOpHash: Hex
+      try {
+        userOpHash = await within(phaseOne, timeoutMs)
+      } catch (error) {
+        // MidaError passes through untouched: an already-wrapped sponsor failure is not wrapped
+        // twice. Everything else — refused, down, timeout, a shape the client could not parse —
+        // becomes SponsorDidNotPay, the only error the seam falls back on.
+        if (error instanceof MidaError) throw error
+        const message = error instanceof Error ? error.message : String(error)
+        throw new SponsorDidNotPay(message.length > 200 ? `${message.slice(0, 200)}…` : message)
+      }
+
+      // Phase 2 — the bundler answered with a hash, so the operation is ACCEPTED and can land at
+      // any moment. Nothing past this line may become SponsorDidNotPay: sendContract would send
+      // a second copy of a call that may still succeed, and the contracts' duplicate refusal
+      // turns that into a reverted transaction the owner paid for. Confirmation gets its own,
+      // longer deadline; past it the answer is SPONSOR_PENDING, never a resend.
+      const bundlerClient = await getBundler()
+      const notice = setTimeout(
+        () => input.progress?.("still waiting for the sponsored transaction to be confirmed…"),
+        input.receiptNoticeMs ?? SPONSOR_RECEIPT_NOTICE_MS,
+      )
+      if (typeof notice.unref === "function") notice.unref()
+      try {
+        let receipt: UserOperationReceipt
+        try {
+          receipt = await bundlerClient.waitForUserOperationReceipt({
+            hash: userOpHash,
+            timeout: input.receiptTimeoutMs ?? SPONSOR_RECEIPT_TIMEOUT_MS,
+            pollingInterval: input.pollingIntervalMs,
+          })
+        } catch {
+          // A slow or dropped answer is not a refusal. Before giving up ask twice more — the
+          // receipt, then the operation itself — and only then admit it is pending.
+          const landed = await bundlerClient.getUserOperationReceipt({ hash: userOpHash }).catch(() => null)
+          if (landed === null) {
+            await bundlerClient.getUserOperation({ hash: userOpHash }).catch(() => null)
+            throw new SponsorPending(userOpHash)
+          }
+          receipt = landed
+        }
         if (!receipt.success) {
           // The sponsor paid and the call still reverted — the same failure a reverted
           // transaction is today, never a silent success and never a fallback candidate.
@@ -145,16 +221,8 @@ export function createSponsoredSender(input: {
           )
         }
         return { ...receipt.receipt, gasLimit: await operationGasLimit(pimlico, userOpHash, receipt), userOpHash }
-      })()
-      try {
-        return await within(work, timeoutMs)
-      } catch (error) {
-        // MidaError passes through untouched: reverts keep their mapped code and an already-wrapped
-        // sponsor failure is not wrapped twice. Everything else — refused, down, timeout, a shape
-        // the client could not parse — becomes SponsorDidNotPay, the only error the seam falls back on.
-        if (error instanceof MidaError) throw error
-        const message = error instanceof Error ? error.message : String(error)
-        throw new SponsorDidNotPay(message.length > 200 ? `${message.slice(0, 200)}…` : message)
+      } finally {
+        clearTimeout(notice)
       }
     },
   }
