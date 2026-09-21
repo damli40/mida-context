@@ -19,6 +19,7 @@ import { build } from "esbuild"
 import { Miniflare } from "miniflare"
 import type { Hex } from "viem"
 import type { D1Like } from "../src/budget.js"
+import { operationIdentity } from "../src/policy.js"
 import { resolveGasCeilings } from "../src/worker.js"
 import {
   CAP,
@@ -503,6 +504,34 @@ describe("eth_sendUserOperation only sends what this endpoint signed today", () 
     expect((await sendOp(op)).error).toBeUndefined()
     // A bundler that silently dropped the operation must not force a second signing.
     expect((await sendOp(op)).error).toBeUndefined()
+  })
+
+  it("a send signed at 23:59:59 UTC is still accepted at 00:00:01 — yesterday's record counts", async () => {
+    const op = validUserOp()
+    const identity = operationIdentity(op)
+    // The signing is recorded under its own UTC day, so a signing that landed just before
+    // midnight leaves its row under yesterday — the send that follows must still find it.
+    const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10)
+    await db
+      .prepare("INSERT OR IGNORE INTO sponsor_issued (day, sender, nonce, calldata_hash) VALUES (?, ?, ?, ?)")
+      .bind(yesterday, identity.sender, identity.nonce, identity.callDataHash)
+      .run()
+    const reply = await sendOp(op)
+    expect(reply.error).toBeUndefined()
+    expect(reply.result).toBe(`0x${"aa".repeat(32)}`)
+  })
+
+  it("a signing from the day before yesterday does NOT unlock a send — the window stays one day back", async () => {
+    const op = validUserOp()
+    const identity = operationIdentity(op)
+    const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10)
+    await db
+      .prepare("INSERT OR IGNORE INTO sponsor_issued (day, sender, nonce, calldata_hash) VALUES (?, ?, ?, ?)")
+      .bind(twoDaysAgo, identity.sender, identity.nonce, identity.callDataHash)
+      .run()
+    const reply = await sendOp(op)
+    expect(reply.error?.code).toBe(-32000)
+    expect(reply.error?.message).toMatch(/did not sign|pm_getPaymasterData/)
   })
 })
 

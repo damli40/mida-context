@@ -123,14 +123,20 @@ export async function recordIssued(
     .run()
 }
 
-/** Whether this endpoint signed an operation with this identifying tuple today. */
+/**
+ * Whether this endpoint signed an operation with this identifying tuple today — or yesterday.
+ * A signing that lands at 23:59:59 UTC is recorded under that day; the send that follows at
+ * 00:00:01 must still find it, so both UTC days count. Older records do not — the window stays
+ * one day back, not a rolling set.
+ */
 export async function wasIssued(
   db: D1Like,
   input: { day: string; sender: string; nonce: string; callDataHash: string },
 ): Promise<boolean> {
+  const yesterday = utcDay(new Date(Date.parse(`${input.day}T00:00:00.000Z`) - 86_400_000))
   const row = await db
-    .prepare(`SELECT 1 AS found FROM sponsor_issued WHERE day = ? AND sender = ? AND nonce = ? AND calldata_hash = ?`)
-    .bind(input.day, input.sender, input.nonce, input.callDataHash)
+    .prepare(`SELECT 1 AS found FROM sponsor_issued WHERE day IN (?, ?) AND sender = ? AND nonce = ? AND calldata_hash = ?`)
+    .bind(input.day, yesterday, input.sender, input.nonce, input.callDataHash)
     .first<{ found: number }>()
   return row !== null
 }

@@ -239,7 +239,7 @@ function infoResponse(config: SponsorConfig): Response {
     },
     policy: {
       budgets:
-        "signing budgets are consumed by pm_getPaymasterData, not by eth_sendUserOperation — a send is forwarded only for an operation this endpoint signed today (same sender, nonce and callData); pm_getPaymasterStubData and eth_estimateUserOperationGas share the free-calls allowance instead",
+        "signing budgets are consumed by pm_getPaymasterData, not by eth_sendUserOperation — a send is forwarded only for an operation this endpoint signed today or yesterday (same sender, nonce and callData); pm_getPaymasterStubData and eth_estimateUserOperationGas share the free-calls allowance instead",
       factory:
         "only the EIP-7702 marker 0x7702 (optionally right-padded to 20 bytes) alongside a valid eip7702Auth; any other non-empty factory, initCode or factoryData is refused",
       delegationClearing: config.policy.allowClearing
@@ -340,8 +340,9 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
       }
     }
 
-    // A send is only forwarded for an operation this endpoint signed today — we never relay a
-    // paymaster sponsorship we did not issue, and we never let send become a free provider call.
+    // A send is only forwarded for an operation this endpoint signed — today or yesterday, so a
+    // signature issued just before UTC midnight stays spendable just after. We never relay a
+    // paymaster sponsorship we did not issue, and send never becomes a free provider call.
     if (method === "eth_sendUserOperation") {
       const identity = operationIdentity(op!)
       if (!(await wasIssued(env.DB, { day, ...identity }))) {
@@ -349,7 +350,7 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
         return jsonRpcError(
           id ?? null,
           REFUSED,
-          "refused: this endpoint did not sign this operation today — call pm_getPaymasterData first",
+          "refused: this endpoint did not sign this operation today or yesterday — call pm_getPaymasterData first",
         )
       }
     }
