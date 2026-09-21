@@ -1,3 +1,8 @@
+import { base64UrlEncode, bytesToHex } from "./bytes.js"
+import type { CreateCapture } from "./client.js"
+import { parseP256Spki } from "./spki.js"
+import type { SavedTestCredential } from "./storage.js"
+
 /**
  * The "Copy report" payload: everything a reviewer needs to reproduce the check and nothing that
  * would hand them key material. `assertNoSecretMaterial` is the guard — it refuses to serialize
@@ -33,6 +38,24 @@ export interface ReportInput {
   calls: { create: number; get: number }
   fingerprintOfSecret: string | null
   lines: CheckLine[]
+}
+
+/**
+ * What the report calls "the credential". The saved record wins for identity (it is what a later
+ * "use" targets), but a create ceremony whose PRF eval failed is still captured — the public key
+ * and transports survive the throw, and a report that dropped them would hide exactly the data a
+ * reviewer needs to see which part failed.
+ */
+export function credentialForReport(saved: SavedTestCredential | null, created: CreateCapture | null): ReportInput["credential"] {
+  const credentialId = saved?.credentialId ?? (created !== null ? base64UrlEncode(created.credentialId) : null)
+  if (credentialId === null) return null
+  const captured = created?.spki ? parseP256Spki(created.spki) : null
+  return {
+    credentialId,
+    transports: saved?.transports ?? created?.transports ?? null,
+    algorithm: saved?.algorithm ?? created?.algorithm ?? null,
+    publicKey: saved?.x && saved.y ? { x: saved.x, y: saved.y } : captured !== null ? { x: bytesToHex(captured.x), y: bytesToHex(captured.y) } : null,
+  }
 }
 
 const SECRET_KEY = /^(prf|secret|private)/i

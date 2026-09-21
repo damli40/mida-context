@@ -10,7 +10,7 @@ import { parseDerSignature } from "./der.js"
 import { parseAuthenticatorData } from "./authdata.js"
 import { assertionDigest, buildPrecompileInput, verifyAssertionInBrowser } from "./assertion.js"
 import { callP256Precompile } from "./rpc.js"
-import { assertNoSecretMaterial, buildReport } from "./report.js"
+import { assertNoSecretMaterial, buildReport, credentialForReport } from "./report.js"
 import type { CheckStatus } from "./report.js"
 import { clearSaved, loadSaved, saveCredential } from "./storage.js"
 import type { SavedTestCredential } from "./storage.js"
@@ -291,14 +291,9 @@ async function onCopyReport(): Promise<void> {
     rpId: RP_ID,
     challengeHex: bytesToHex(TEST_CHALLENGE),
     environment: env,
-    credential: saved
-      ? {
-          credentialId: saved.credentialId,
-          transports: saved.transports ?? null,
-          algorithm: saved.algorithm ?? null,
-          publicKey: saved.x && saved.y ? { x: saved.x, y: saved.y } : null,
-        }
-      : null,
+    // The captured create ceremony, not only the saved record: when PRF fails the throw leaves
+    // `saved` unset while the public key was already captured — dropping it would hide the answer.
+    credential: credentialForReport(saved, capture.create),
     calls: counts,
     fingerprintOfSecret: firstFingerprint,
     lines: [...document.querySelectorAll<HTMLElement>("[data-line]")].map((el) => ({
