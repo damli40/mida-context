@@ -6,6 +6,7 @@ import { hexOf } from "@mida/crypto"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { writeJsonAtomic } from "./secure-fs.js"
 import type { RegistryReader } from "./chain-views.js"
+import type { DenyStore } from "./stores.js"
 
 export type RevocationTarget = { kind: "capability"; capabilityId: Hex } | { kind: "agent"; agentId: Hex }
 
@@ -23,7 +24,7 @@ export interface RevocationIntent {
 }
 
 /** The persisted shape `denies`, `reconcile` and `cancel` dereference; a malformed entry fails construction. */
-function isRevocationIntent(value: unknown): value is RevocationIntent {
+export function isRevocationIntent(value: unknown): value is RevocationIntent {
   if (value === null || typeof value !== "object") return false
   const intent = value as RevocationIntent
   const target = intent.target as RevocationTarget | undefined
@@ -43,15 +44,11 @@ function isRevocationIntent(value: unknown): value is RevocationIntent {
 }
 
 /**
- * §12.5 fast revocation overlay, persisted as one JSON file. Exactly three transitions exist:
- *   active → anchored   matching Monad revocation observed (reconcile)
- *   active → active     transaction failed, missing or reorged out (no timeout ever clears a deny)
- *   active → cancelled  fresh owner P256-approved cancellation (cancel)
- * It can only reduce authority: `effectiveAllowed = currentlyAllowedByMonad AND NOT localDeny`.
- * An unreadable or malformed store fails closed at construction: starting empty would silently restore
- * authority a pending deny removed, which §12.5 forbids. Only a missing file means a fresh start.
+ * The file-backed DenyStore: the revocation intents as one JSON file, kept in memory once loaded and rewritten
+ * atomically on every mutation. An unreadable or malformed file fails closed at construction: starting empty would
+ * silently restore authority a pending deny removed, which §12.5 forbids. Only a missing file means a fresh start.
  */
-export class DenyOverlay {
+export class FileDenyStore implements DenyStore {
   readonly #file: string
   #intents: RevocationIntent[]
 
@@ -74,16 +71,55 @@ export class DenyOverlay {
     this.#intents = parsed
   }
 
-  list(): readonly RevocationIntent[] {
+  async list(): Promise<RevocationIntent[]> {
     return this.#intents.map((intent) => ({ ...intent }))
   }
 
-  get(id: Hex): RevocationIntent | undefined {
+  async get(id: Hex): Promise<RevocationIntent | undefined> {
     const intent = this.#intents.find((candidate) => candidate.id === id.toLowerCase())
     return intent === undefined ? undefined : { ...intent }
   }
 
-  create(owner: Address, target: RevocationTarget, agentEpochAtIntent: bigint | null): RevocationIntent {
+  async insert(intent: RevocationIntent): Promise<void> {
+    this.#intents.push({ ...intent })
+    this.#save()
+  }
+
+  async update(intent: RevocationIntent): Promise<void> {
+    const index = this.#intents.findIndex((candidate) => candidate.id === intent.id.toLowerCase())
+    if (index === -1) throw new MidaError("NOT_FOUND", "revocation intent not found")
+    this.#intents[index] = { ...intent }
+    this.#save()
+  }
+
+  #save(): void {
+    writeJsonAtomic(dirname(this.#file), this.#file, this.#intents)
+  }
+}
+
+/**
+ * §12.5 fast revocation overlay over a DenyStore. Exactly three transitions exist:
+ *   active → anchored   matching Monad revocation observed (reconcile)
+ *   active → active     transaction failed, missing or reorged out (no timeout ever clears a deny)
+ *   active → cancelled  fresh owner P256-approved cancellation (cancel)
+ * It can only reduce authority: `effectiveAllowed = currentlyAllowedByMonad AND NOT localDeny`.
+ */
+export class DenyOverlay {
+  readonly #store: DenyStore
+
+  constructor(store: DenyStore | string) {
+    this.#store = typeof store === "string" ? new FileDenyStore(store) : store
+  }
+
+  async list(): Promise<RevocationIntent[]> {
+    return this.#store.list()
+  }
+
+  async get(id: Hex): Promise<RevocationIntent | undefined> {
+    return this.#store.get(id)
+  }
+
+  async create(owner: Address, target: RevocationTarget, agentEpochAtIntent: bigint | null): Promise<RevocationIntent> {
     const intent: RevocationIntent = {
       id: hexOf(randomBytes(32)),
       owner: owner.toLowerCase() as Address,
@@ -95,22 +131,25 @@ export class DenyOverlay {
       agentEpochAtIntent: agentEpochAtIntent === null ? null : agentEpochAtIntent.toString(10),
       cancellationNonce: BigInt(hexOf(randomBytes(32))).toString(10),
     }
-    this.#intents.push(intent)
-    this.#save()
+    await this.#store.insert(intent)
     return { ...intent }
   }
 
   /** True when an active deny matches this owner and either this agent relationship or this exact capability. */
-  denies(input: { owner: Address; agentId: Hex; capabilityId: Hex }): boolean {
+  async denies(input: { owner: Address; agentId: Hex; capabilityId: Hex }): Promise<boolean> {
     const owner = input.owner.toLowerCase()
-    return this.#intents.some(
-      (intent) =>
+    for (const intent of await this.#store.list()) {
+      if (
         intent.state === "active" &&
         intent.owner === owner &&
         (intent.target.kind === "agent"
           ? intent.target.agentId === input.agentId.toLowerCase()
-          : intent.target.capabilityId === input.capabilityId.toLowerCase()),
-    )
+          : intent.target.capabilityId === input.capabilityId.toLowerCase())
+      ) {
+        return true
+      }
+    }
+    return false
   }
 
   /**
@@ -120,7 +159,7 @@ export class DenyOverlay {
   async deniesRelationship(reader: RegistryReader, input: { owner: Address; agentId: Hex; namespaceId: Hex }): Promise<boolean> {
     const owner = input.owner.toLowerCase()
     const agentId = input.agentId.toLowerCase()
-    for (const intent of this.#intents) {
+    for (const intent of await this.#store.list()) {
       if (intent.state !== "active" || intent.owner !== owner) continue
       if (intent.target.kind === "agent") {
         if (intent.target.agentId === agentId) return true
@@ -134,36 +173,25 @@ export class DenyOverlay {
 
   /** active → anchored only when Monad shows the matching revocation. Failed or missing transactions leave it active. */
   async reconcile(reader: RegistryReader): Promise<void> {
-    let changed = false
-    for (const intent of this.#intents) {
+    for (const intent of await this.#store.list()) {
       if (intent.state !== "active") continue
       const anchored =
         intent.target.kind === "capability"
           ? (await reader.getCapability(intent.target.capabilityId))?.revoked === true
           : (await reader.agentEpoch(intent.owner, intent.target.agentId)) > BigInt(intent.agentEpochAtIntent ?? "0")
-      if (anchored) {
-        intent.state = "anchored"
-        intent.cancellationNonce = null
-        changed = true
-      }
+      if (anchored) await this.#store.update({ ...intent, state: "anchored", cancellationNonce: null })
     }
-    if (changed) this.#save()
   }
 
   /** active → cancelled. The caller must already have verified a fresh P256 assertion over this nonce. */
-  cancel(id: Hex, owner: Address, nonce: bigint): RevocationIntent {
-    const intent = this.#intents.find((candidate) => candidate.id === id.toLowerCase())
+  async cancel(id: Hex, owner: Address, nonce: bigint): Promise<RevocationIntent> {
+    const intent = await this.#store.get(id)
     if (intent === undefined || intent.owner !== owner.toLowerCase()) throw new MidaError("NOT_FOUND", "revocation intent not found")
     if (intent.state !== "active" || intent.cancellationNonce === null || BigInt(intent.cancellationNonce) !== nonce) {
       throw new MidaError("REPLAY", "revocation intent is not cancellable with this nonce")
     }
-    intent.state = "cancelled"
-    intent.cancellationNonce = null
-    this.#save()
-    return { ...intent }
-  }
-
-  #save(): void {
-    writeJsonAtomic(dirname(this.#file), this.#file, this.#intents)
+    const cancelled: RevocationIntent = { ...intent, state: "cancelled", cancellationNonce: null }
+    await this.#store.update(cancelled)
+    return { ...cancelled }
   }
 }

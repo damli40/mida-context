@@ -207,20 +207,20 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     // revocation below does not bump the owner-agent epoch, so the intent stays "active".
     await ownerClient.request("POST", "/revocations", { body: { agentId: agentA.agentId } })
     await overlay.reconcile(reader)
-    expect(overlay.list().filter((intent) => intent.target.kind === "agent").map((intent) => intent.state)).toEqual(["active"])
+    expect((await overlay.list()).filter((intent) => intent.target.kind === "agent").map((intent) => intent.state)).toEqual(["active"])
 
     const approval = await vault.approveRevocation({ kind: "capability", capabilityId: capabilityA })
-    expect(overlay.get(approval.intentId)?.state).toBe("active")
+    expect((await overlay.get(approval.intentId))?.state).toBe("active")
     await overlay.reconcile(reader)
-    expect(overlay.get(approval.intentId)?.state).toBe("anchored")
+    expect((await overlay.get(approval.intentId))?.state).toBe("anchored")
     await expect(authorize(agentA, capabilityA)).rejects.toMatchObject({ code: "CAPABILITY_REVOKED" })
-    expect(overlay.list().filter((intent) => intent.target.kind === "agent").map((intent) => intent.state)).toEqual(["active"])
+    expect((await overlay.list()).filter((intent) => intent.target.kind === "agent").map((intent) => intent.state)).toEqual(["active"])
   })
 
   it("step 5: expiry, on chain time, fails before namespace and key-version checks", async () => {
     await increaseLocalTime(node.rpcUrl, 200n)
     await expect(authorize(agentE, capabilityE, { namespaceId: LEARNING, agentKeyVersion: 9 })).rejects.toMatchObject({ code: "CAPABILITY_EXPIRED" })
-    expect(overlay.list().filter((intent) => intent.target.kind === "agent").map((intent) => intent.state)).toEqual(["active"])
+    expect((await overlay.list()).filter((intent) => intent.target.kind === "agent").map((intent) => intent.state)).toEqual(["active"])
   })
 
   it("an agent-target deny intent requires a real owner-agent relationship", async () => {

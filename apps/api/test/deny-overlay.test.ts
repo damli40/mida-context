@@ -12,10 +12,10 @@ const CAPABILITY = `0x${"33".repeat(32)}` as Hex
 const file = () => join(mkdtempSync(join(tmpdir(), "mida-deny-")), "revocations.json")
 
 describe("DenyOverlay persistence (§12.5)", () => {
-  it("starts empty only when the file does not exist", () => {
+  it("starts empty only when the file does not exist", async () => {
     const overlay = new DenyOverlay(file())
-    expect(overlay.list()).toEqual([])
-    expect(overlay.denies({ owner: OWNER, agentId: AGENT, capabilityId: CAPABILITY })).toBe(false)
+    expect(await overlay.list()).toEqual([])
+    expect(await overlay.denies({ owner: OWNER, agentId: AGENT, capabilityId: CAPABILITY })).toBe(false)
   })
 
   it("fails closed on a corrupt file instead of silently dropping pending denies", () => {
@@ -33,11 +33,11 @@ describe("DenyOverlay persistence (§12.5)", () => {
     expect(() => new DenyOverlay(malformed)).toThrow(/revocation intent/)
   })
 
-  it("still denies an active intent after a clean reload", () => {
+  it("still denies an active intent after a clean reload", async () => {
     const path = file()
-    const intent = new DenyOverlay(path).create(OWNER, { kind: "agent", agentId: AGENT }, 4n)
+    const intent = await new DenyOverlay(path).create(OWNER, { kind: "agent", agentId: AGENT }, 4n)
     const reloaded = new DenyOverlay(path)
-    expect(reloaded.list().map((candidate) => candidate.id)).toEqual([intent.id])
-    expect(reloaded.denies({ owner: OWNER, agentId: AGENT, capabilityId: CAPABILITY })).toBe(true)
+    expect((await reloaded.list()).map((candidate) => candidate.id)).toEqual([intent.id])
+    expect(await reloaded.denies({ owner: OWNER, agentId: AGENT, capabilityId: CAPABILITY })).toBe(true)
   })
 })

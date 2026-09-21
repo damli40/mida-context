@@ -23,15 +23,15 @@ import {
 import { Hono } from "hono"
 import { createMiddleware } from "hono/factory"
 import { zeroHash } from "viem"
-import { ReplayGuard, authenticateRequest } from "./auth.js"
+import { authenticateRequest } from "./auth.js"
 import { authorizeAgent } from "./authorize.js"
 import type { ContextRecordView, RegistryReader } from "./chain-views.js"
 import { DenyOverlay } from "./deny-overlay.js"
 import type { RevocationTarget } from "./deny-overlay.js"
 import { toErrorBody } from "./errors.js"
-import { repairModes } from "./secure-fs.js"
-import { ApiStore } from "./store.js"
+import { fileStores } from "./file-stores.js"
 import type { StoredObject } from "./store.js"
+import type { ContextStores } from "./stores.js"
 import { verifyVaultAssertion } from "./verify-assertion.js"
 import type { WebAuthnAssertionInput } from "./verify-assertion.js"
 import { address, hex, parseObjectUpload, parseReaderWrap } from "./wire.js"
@@ -42,14 +42,18 @@ export const CANCELLATION_MAX_LIFETIME_SECONDS = 300n
 export interface ContextApiOptions {
   reader: RegistryReader
   deployment: Deployment
-  dataDir: string
+  /** The file-backed stores' directory; used only when `stores` is not given. */
+  dataDir?: string
+  /** Injected persistence — the hosted worker passes its D1 stores here. */
+  stores?: ContextStores
   /** Wall-clock seconds for request freshness. Chain time decides capability expiry. */
   clock?: () => bigint
 }
 
 type Env = { Variables: { signer: Address; body: Uint8Array } }
 
-function isAnchored(stored: StoredObject, record: ContextRecordView | null): boolean {
+/** §12.3: an object is served only once Monad holds matching commitments for it. */
+export function isAnchored(stored: StoredObject, record: ContextRecordView | null): boolean {
   return (
     record !== null &&
     record.owner === stored.owner &&
@@ -66,12 +70,12 @@ function isAnchored(stored: StoredObject, record: ContextRecordView | null): boo
 export function createContextApi(options: ContextApiOptions) {
   const { reader, deployment } = options
   const clock = options.clock ?? (() => BigInt(Math.floor(Date.now() / 1000)))
-  // A tree that predates the mode rules — or was chmodded by hand — is repaired at startup:
-  // every directory 0700, every file 0600, before anything reads or writes it.
-  repairModes(options.dataDir)
-  const overlay = new DenyOverlay(`${options.dataDir}/revocations.json`)
-  const store = new ApiStore(options.dataDir)
-  const replay = new ReplayGuard(`${options.dataDir}/replay-nonces.json`)
+  // The stores are injectable: the file-backed defaults when a dataDir is given, D1 in the hosted worker.
+  const stores = options.stores ?? (options.dataDir === undefined ? undefined : fileStores(options.dataDir))
+  if (stores === undefined) throw new Error("createContextApi needs either `stores` or `dataDir`")
+  const overlay = new DenyOverlay(stores.denies)
+  const store = stores.objects
+  const replay = stores.nonces
   const app = new Hono<Env>()
 
   app.onError((error, c) => {
@@ -83,7 +87,7 @@ export function createContextApi(options: ContextApiOptions) {
     const body = new Uint8Array(await c.req.arrayBuffer())
     c.set(
       "signer",
-      authenticateRequest({
+      await authenticateRequest({
         method: c.req.method,
         url: new URL(c.req.url),
         headers: c.req.raw.headers,
@@ -181,9 +185,10 @@ export function createContextApi(options: ContextApiOptions) {
 
     // 7. store as pending; §12.3 serves it only once Monad holds matching commitments
     await store.blobs.put(ciphertext)
-    store.putObject({
+    await store.putObject({
       contextId: manifest.contextId,
       owner: upload.owner,
+      uploader: signer,
       namespaceId: upload.namespaceId,
       authorId,
       objectNonce: upload.objectNonce,
@@ -205,7 +210,7 @@ export function createContextApi(options: ContextApiOptions) {
       await authorizeAgent({ reader, overlay, signer, owner, capabilityId: optionalCapability(c.req.query("capabilityId")), namespaceId, permission: PERMISSION.READ })
     }
     const objects: AnchoredObject[] = []
-    for (const stored of store.listObjects(owner, namespaceId)) {
+    for (const stored of await store.listObjects(owner, namespaceId)) {
       if (!isAnchored(stored, await reader.getRecord(stored.contextId))) continue
       objects.push({
         contextId: stored.contextId,
@@ -223,7 +228,7 @@ export function createContextApi(options: ContextApiOptions) {
   app.get("/manifests/:contextId", authenticated, async (c) => {
     const signer = c.get("signer")
     const contextId = hex(c.req.param("contextId"), 32, "contextId")
-    const stored = store.getObject(contextId)
+    const stored = await store.getObject(contextId)
     if (stored === undefined || !isAnchored(stored, await reader.getRecord(contextId))) throw new MidaError("NOT_FOUND", "no anchored object")
     if (signer !== stored.owner) {
       await authorizeAgent({
@@ -255,9 +260,9 @@ export function createContextApi(options: ContextApiOptions) {
     const agentRecord = await reader.getAgent(envelope.manifest.agentId)
     if (agentRecord !== null) {
       verifySignedManifest({ envelope, agentRecord, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, now })
-      store.setManifestIndex(bodyHash, envelopeHash)
-    } else if (store.getManifestIndex(bodyHash) === undefined) {
-      store.setManifestIndex(bodyHash, envelopeHash)
+      await store.setManifestIndex(bodyHash, envelopeHash)
+    } else if ((await store.getManifestIndex(bodyHash)) === undefined) {
+      await store.setManifestIndex(bodyHash, envelopeHash)
     }
     await store.blobs.put(manifestEnvelopeBytes(envelope))
     return c.json({ bodyHash, envelopeHash })
@@ -265,7 +270,7 @@ export function createContextApi(options: ContextApiOptions) {
 
   app.get("/agent-manifests/:bodyHash", async (c) => {
     const bodyHash = hex(c.req.param("bodyHash"), 32, "bodyHash")
-    const envelopeHash = store.getManifestIndex(bodyHash)
+    const envelopeHash = await store.getManifestIndex(bodyHash)
     if (envelopeHash === undefined) throw new MidaError("MANIFEST_NOT_FOUND", "no envelope indexed for this body hash")
     let bytes: Uint8Array
     try {
@@ -306,7 +311,7 @@ export function createContextApi(options: ContextApiOptions) {
     ) {
       throw new MidaError("CAPABILITY_DENIED", "recipient has no active exact READ authority")
     }
-    store.putWrap(wrap)
+    await store.putWrap(wrap)
     return c.json({ stored: true })
   })
 
@@ -332,7 +337,7 @@ export function createContextApi(options: ContextApiOptions) {
     if ((await reader.epochPublicKey(owner, namespaceId, readEpoch)) === null) {
       throw new MidaError("EPOCH_STALE", "read epoch is not a registered current or historical epoch")
     }
-    const wrap = store.getWrap({ owner, namespaceId, readEpoch: encodeUint64(readEpoch), agentId, agentKeyVersion: Number(versionText) })
+    const wrap = await store.getWrap({ owner, namespaceId, readEpoch: encodeUint64(readEpoch), agentId, agentKeyVersion: Number(versionText) })
     if (wrap === undefined) throw new MidaError("NO_EPOCH_WRAP", "no reader wrap is published yet for this agent key and epoch")
     return c.json(wrap)
   })
@@ -361,7 +366,7 @@ export function createContextApi(options: ContextApiOptions) {
     } else {
       throw new MidaError("INVALID_WIRE", "revocation needs capabilityId or agentId")
     }
-    const intent = overlay.create(owner, target, agentEpochAtIntent)
+    const intent = await overlay.create(owner, target, agentEpochAtIntent)
     return c.json({ intentId: intent.id, state: intent.state, cancellationNonce: intent.cancellationNonce })
   })
 
@@ -369,7 +374,7 @@ export function createContextApi(options: ContextApiOptions) {
     const owner = c.get("signer")
     const id = hex(c.req.param("id"), 32, "id")
     const request = json<{ expiresAt?: string; assertion?: WebAuthnAssertionInput }>(c.get("body"))
-    const intent = overlay.get(id)
+    const intent = await overlay.get(id)
     if (intent === undefined || intent.owner !== owner) throw new MidaError("NOT_FOUND", "revocation intent not found")
     if (intent.state !== "active" || intent.cancellationNonce === null) throw new MidaError("REPLAY", "revocation intent is not cancellable")
     if (request.assertion === undefined || typeof request.expiresAt !== "string" || !/^(0|[1-9][0-9]*)$/.test(request.expiresAt)) {
@@ -393,7 +398,7 @@ export function createContextApi(options: ContextApiOptions) {
     if (key === null || !verifyVaultAssertion({ challenge, assertion: request.assertion, qx: key.qx, qy: key.qy, rpIdHash: deployment.vaultRpIdHash })) {
       throw new MidaError("AUTH_INVALID", "cancellation assertion is not a valid owner passkey assertion")
     }
-    const cancelled = overlay.cancel(intent.id, owner, nonce)
+    const cancelled = await overlay.cancel(intent.id, owner, nonce)
     return c.json({ intentId: cancelled.id, state: cancelled.state })
   })
 
