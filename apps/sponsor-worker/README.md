@@ -44,9 +44,11 @@ key; the user operation is already signed by the user's own key before it arrive
   fee would be paid in full.
 - **Check the delegation story.** An `eip7702Auth` must name this chain (a chain-id-0
   authorization is valid on every chain and is refused) and an allowed implementation address —
-  or the zero address for a delegation-clearing op. When no authorization is present, the sender's
-  on-chain code (read via `RPC_URL`) must already be `0xef0100` + an allowed implementation.
-  `factory`/`initCode` must be empty: a 7702 sender is never deployed by a factory.
+  or the zero address for a delegation-clearing op. When no `eip7702Auth` is present — the field
+  the bundler actually applies; an `authorization` field under any other name is validated but
+  never substitutes — the sender's on-chain code (read via `RPC_URL`) must already be `0xef0100`
+  + an allowed implementation. `factory`/`initCode` must be empty: a 7702 sender is never
+  deployed by a factory.
 - **Spend slowly.** Two D1 counters, incremented atomically on `eth_sendUserOperation` only: 30
   sponsored operations per sender per day and 2,000 globally (UTC days, both configurable). Over
   either limit is a refusal, and the sender budget is checked first so a spammy sender cannot
