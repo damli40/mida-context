@@ -8,12 +8,13 @@ import { drainUntilSettled } from "./drain.js"
 import type { DrainDeps, DrainResult } from "./drain.js"
 import { buildHandoff } from "./handoff.js"
 import type { HandoffDeps } from "./handoff.js"
-import { buildWhatsNew } from "./whatsnew.js"
+import { CheckpointCopies, buildWhatsNew } from "./whatsnew.js"
 import type { WhatsNewDeps } from "./whatsnew.js"
 import { FLUSH_EVENTS } from "./hook.js"
 import type { MidaHome } from "./home.js"
+import { loadAgentIdentity } from "./keys.js"
 import { isSafeName, listJobs } from "./queue.js"
-import { authorNamesFor } from "./skeleton.js"
+import { NAMESPACE_ID, authorNamesFor, readCheckpoints, saveCheckpoint } from "./skeleton.js"
 import { ServiceRuntime } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { OWNER_COMMANDS, USAGE, ownerOnlyLine, runCliWithRuntime, validCliArgv } from "./cli.js"
@@ -107,7 +108,8 @@ function respond(res: ServerResponse, status: number, body: unknown): void {
  *
  * The loop is driven by a flag, not a lock file: at most one pass is in flight, a `/kick` during a
  * pass asks for one more look when it ends, and after every pass the queue is listed again — a
- * waiting flush event (`FLUSH_EVENTS`) triggers the next pass immediately, anything else waits for
+ * waiting flush event (`FLUSH_EVENTS`) triggers the next pass immediately, but only when the pass
+ * made progress or the flush set changed mid-pass; a flush job the pass could not touch waits for
  * the tick. An empty queue costs nothing: no pass runs and no log line is written.
  */
 export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
@@ -137,6 +139,11 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
 
   const runtime = await (deps.openRuntime ?? (() => ServiceRuntime.open(home, deps.network)))()
 
+  // the memory-held checkpoint copies /whatsnew answers from — decrypted content never leaves
+  // daemon memory. The handoff's read and every drain save seed it, so the first prompt of a
+  // session is already warm; a stale or absent copy refreshes behind the prompt's back.
+  const copies = new CheckpointCopies(() => deps.now())
+
   const startedAt = new Date(deps.now()).toISOString()
   let stopped = false
   let inFlight: Promise<void> | null = null
@@ -145,7 +152,15 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
 
   const runPasses = async (): Promise<void> => {
     for (;;) {
-      if (stopped || listJobs(home).length === 0) return
+      if (stopped) return
+      const queued = listJobs(home)
+      if (queued.length === 0) return
+      // the flush jobs waiting before this pass — compared against the set after it to tell "a
+      // new flush job arrived mid-pass" from "the same job is still queued", which means the
+      // pass could not touch it (the drain lock is held elsewhere, or it sits inside its retry
+      // backoff): re-passing on it at once would spin a full core until the condition clears
+      const flushBefore = new Set(queued.filter((job) => FLUSH_EVENTS.has(job.event)).map((job) => job.id))
+      let saved = 0
       try {
         const result = await drain({
           home,
@@ -154,7 +169,25 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
           now: () => new Date(deps.now()),
           sleep,
           ...deps.drainDeps,
+          // a successful save teaches the whats-new copy the new checkpoint at once — another
+          // session's next prompt sees it without any new read
+          save: async (rt, agent, input) => {
+            const saved = await (deps.drainDeps?.save ?? saveCheckpoint)(rt, agent, input)
+            copies.noteSaved(agent, {
+              checkpoint: input.checkpoint,
+              projectId: input.projectId,
+              sessionId: input.sessionId,
+              continuesSession: input.continuesSession,
+              compiledBy: input.compiledBy,
+              contextId: saved.contextId,
+              // the on-chain author is the agent's identity; without one the name still tells who saved
+              authorId: loadAgentIdentity(home, agent)?.agentId ?? agent,
+              namespaceId: NAMESPACE_ID,
+            })
+            return saved
+          },
         })
+        saved = result.saved
         deps.log({
           event: "pass",
           saved: result.saved,
@@ -169,8 +202,14 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       }
       if (stopped) return
       const waiting = listJobs(home)
-      if (waiting.length === 0 || !waiting.some((job) => FLUSH_EVENTS.has(job.event))) return
-      // a flush job arrived too late for the pass that just ran — it goes again at once
+      const flushNow = waiting.filter((job) => FLUSH_EVENTS.has(job.event))
+      if (waiting.length === 0 || flushNow.length === 0) return
+      // go again at once only when the pass made progress or a flush job genuinely arrived
+      // mid-pass; an unchanged flush set is stuck, not late — the tick or the next kick
+      // reschedules it
+      const flushMoved =
+        flushNow.length !== flushBefore.size || flushNow.some((job) => !flushBefore.has(job.id))
+      if (saved === 0 && !flushMoved) return
     }
   }
 
@@ -261,7 +300,16 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       const result = await buildHandoff(
         runtime,
         { agent, cwd, authorNames: authorNamesFor(runtime), sessionId },
-        { ...deps.handoffDeps, limitMs: deps.handoffLimitMs ?? deps.handoffDeps?.limitMs },
+        {
+          ...deps.handoffDeps,
+          // the session-start read seeds the same copy whats-new serves — the first prompt is warm
+          read: async (rt, agentName, projectId) => {
+            const outcome = await (deps.handoffDeps?.read ?? readCheckpoints)(rt, agentName, projectId)
+            copies.seed(agentName, projectId, outcome.checkpoints)
+            return outcome
+          },
+          limitMs: deps.handoffLimitMs ?? deps.handoffDeps?.limitMs,
+        },
       )
       // one stable line per call: codes, names, counts and timings — never request or handoff text
       deps.log({
@@ -296,7 +344,11 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       const cwd = typeof record.cwd === "string" ? record.cwd : ""
       const sessionId = typeof record.sessionId === "string" ? record.sessionId : undefined
       const started = deps.now()
-      const result = await buildWhatsNew(runtime, { agent, cwd, sessionId }, deps.whatsnewDeps ?? {})
+      const result = await buildWhatsNew(runtime, { agent, cwd, sessionId }, {
+        copies,
+        log: deps.log,
+        ...deps.whatsnewDeps,
+      })
       // same discipline as the handoff line: codes and counts, never note or checkpoint text
       deps.log({
         event: "whatsnew",

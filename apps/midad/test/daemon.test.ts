@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, ownerOnlyLine, removeJob, socketPathFor, startDaemon, writeLastSeen } from "@mida/midad"
+import { CheckpointCopies, MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, ownerOnlyLine, removeJob, socketPathFor, startDaemon, writeLastSeen } from "@mida/midad"
 import type { DrainDeps, DrainResult, Runtime, ServiceRuntime } from "@mida/midad"
 import type { DaemonDeps } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
@@ -135,6 +135,48 @@ describe("startDaemon", () => {
       await callDaemon(home, "/kick", {}, { timeoutMs: 1_000 })
       await poll(() => calls >= 2)
       expect(listJobs(home)).toHaveLength(0)
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it("a flush job the drain cannot touch (lock held) gets exactly one pass, not a spin", async () => {
+    const { home, deps, logs } = setup()
+    let calls = 0
+    const drain = async (): Promise<DrainResult> => {
+      // the lock is held elsewhere: the pass cannot touch the queued flush job and leaves it
+      calls += 1
+      return { ...DRAIN_OK, lockHeld: true }
+    }
+    enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+    const daemon = await startDaemon({ ...deps, drain, tickMs: 60_000 })
+    try {
+      await callDaemon(home, "/kick", {}, { timeoutMs: 1_000 })
+      await poll(() => calls >= 1)
+      // the stuck job must NOT re-pass at once — give a broken loop room to betray itself
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      expect(calls).toBe(1)
+      expect(logs.filter((e) => (e as { event?: string }).event === "pass")).toHaveLength(1)
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it("a flush job inside its retry backoff gets one pass, then waits for the tick", async () => {
+    const { home, deps } = setup()
+    let calls = 0
+    const drain = async (): Promise<DrainResult> => {
+      // the job is not due yet: the pass reports backoff and leaves it queued
+      calls += 1
+      return { ...DRAIN_OK, earliestDueMs: 30_000 }
+    }
+    enqueue(home, { agent: "claude-code", event: "SessionEnd", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+    const daemon = await startDaemon({ ...deps, drain, tickMs: 60_000 })
+    try {
+      await callDaemon(home, "/kick", {}, { timeoutMs: 1_000 })
+      await poll(() => calls >= 1)
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      expect(calls).toBe(1)
     } finally {
       await daemon.close()
     }
@@ -338,15 +380,23 @@ describe("startDaemon", () => {
       projectId: "p1", sessionId: "other-session", continuesSession: null, compiledBy: "test",
       contextId: `0x${"a1".repeat(32)}`, authorId: `0x${"b2".repeat(32)}`, namespaceId: `0x${"c3".repeat(32)}`,
     }
+    // the daemon's copy is already warm — the request is answered from memory, no read at all
+    const copies = new CheckpointCopies(() => Date.parse("2026-09-21T12:00:00.000Z"))
+    copies.seed("claude-code", "p1", [foreign])
+    let reads = 0
     const daemon = await startDaemon({
       ...deps,
       openRuntime: async () => ({ ...stubRuntime, home }) as Runtime,
       whatsnewDeps: {
         checkProject: async () => ({ ok: true, approval: { agent: "claude-code", projectId: "p1", root: "/tmp/work", approvedAt: "2026-09-21T00:00:00.000Z" } }),
         capability: async () => "live",
-        read: async () => ({ checkpoints: [foreign], skipped: 0, milliseconds: 1 }),
+        read: async () => {
+          reads += 1
+          return { checkpoints: [], skipped: 0, milliseconds: 1 }
+        },
         authorNames: { [`0x${"b2".repeat(32)}`]: "codex" },
         now: () => Date.parse("2026-09-21T12:00:00.000Z"),
+        copies,
       },
     })
     try {
@@ -358,9 +408,79 @@ describe("startDaemon", () => {
       expect(body.note).toContain("codex")
       expect(body.updates).toEqual([{ agent: "codex", savedAt: "2026-09-21T11:30:00.000Z" }])
       expect(body.lastSeen).toBe("2026-09-21T11:30:00.000Z")
+      // the warm copy answered — the checkpoint read never ran
+      expect(reads).toBe(0)
       const entry = logs.find((e) => (e as { event?: string }).event === "whatsnew")! as Record<string, unknown>
       expect(entry).toMatchObject({ agent: "claude-code", kind: "updates", updates: 1, reason: null })
       expect(JSON.stringify(entry)).not.toContain("shipped it")
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it("a checkpoint the drain saved is visible to another session's /whatsnew without a new read", async () => {
+    const { home, deps, stubRuntime } = setup()
+    const fakeNow = Date.parse("2026-09-21T12:00:00.000Z")
+    const savedCheckpoint = sampleCheckpoint({
+      eventId: "cp-drain",
+      agent: "claude-code",
+      createdAt: "2026-09-21T11:59:00.000Z",
+      progress: ["the drain just saved this"],
+      nextAction: "continue",
+    })
+    let drainRan = false
+    let whatsnewReads = 0
+    const daemon = await startDaemon({
+      ...deps,
+      now: () => fakeNow,
+      openRuntime: async () => ({ ...stubRuntime, home }) as Runtime,
+      drain: async (d) => {
+        // a real drain pass ends in saveCheckpoint — calling the injected save exercises the
+        // daemon's wrapper, which is what seeds the whats-new copy; a saved job leaves the
+        // queue, so the spy removes it too
+        drainRan = true
+        await d.save!(stubRuntime as unknown as ServiceRuntime, "claude-code", {
+          projectId: "p1",
+          sessionId: "session-a",
+          continuesSession: null,
+          compiledBy: "test",
+          checkpoint: savedCheckpoint,
+        })
+        for (const job of listJobs(home)) removeJob(home, job.id)
+        return { ...DRAIN_OK, saved: 1 }
+      },
+      drainDeps: {
+        save: async () => ({ contextId: `0x${"d1".repeat(32)}` as `0x${string}`, transactionHash: null, milliseconds: 1, duplicate: false }),
+      },
+      whatsnewDeps: {
+        checkProject: async () => ({ ok: true, approval: { agent: "claude-code", projectId: "p1", root: "/tmp/work", approvedAt: "2026-09-21T00:00:00.000Z" } }),
+        capability: async () => "live",
+        read: async () => {
+          whatsnewReads += 1
+          return { checkpoints: [], skipped: 0, milliseconds: 1 }
+        },
+        authorNames: { "claude-code": "claude-code" },
+        now: () => fakeNow,
+      },
+    })
+    try {
+      enqueue(home, {
+        agent: "claude-code",
+        event: "Stop",
+        sessionId: "session-a",
+        transcriptPath: "/tmp/transcript.jsonl",
+        cwd: "/tmp",
+        error: null,
+      })
+      await callDaemon(home, "/kick", {}, { timeoutMs: 1_000 })
+      await poll(() => drainRan, 5_000)
+      const reply = await callDaemon(home, "/whatsnew", { agent: "claude-code", cwd: "/tmp/work", sessionId: "session-b" }, { timeoutMs: 2_000 })
+      expect(reply.status).toBe(200)
+      const body = reply.body as { kind: string; note?: string }
+      expect(body.kind).toBe("updates")
+      expect(body.note).toContain("the drain just saved this")
+      // the seeded copy answered — no checkpoint read ran at all
+      expect(whatsnewReads).toBe(0)
     } finally {
       await daemon.close()
     }
