@@ -383,6 +383,37 @@ describe("the worker entry", () => {
     })
   })
 
+  it("the rate-limit bindings gate requests per CF-Connecting-IP with 429 and Retry-After", async () => {
+    const calls = { signed: [] as string[], unsigned: [] as string[] }
+    const limitedEnv: WorkerEnv = {
+      ...env(db, rpc.url),
+      LIMITER_SIGNED: { limit: async ({ key }) => (calls.signed.push(key), { success: true }) },
+      LIMITER_UNSIGNED: { limit: async ({ key }) => (calls.unsigned.push(key), { success: false }) },
+    }
+    // An unsigned request is checked against the unsigned binding — it says stop → 429 + Retry-After.
+    const denied = await handleRequest(
+      limitedEnv,
+      new Request(`http://worker.test/agent-manifests/${`0x${"0".repeat(64)}`}`, { headers: { "cf-connecting-ip": "198.51.100.9" } }),
+    )
+    expect(denied.status).toBe(429)
+    expect(denied.headers.get("retry-after")).toBe("60")
+    expect(calls).toEqual({ signed: [], unsigned: ["198.51.100.9"] })
+    // A request carrying a signature header goes to the signed binding; allowed → the app answers (401
+    // here, because the signature is shape-valid but wrong — the limiter let it through).
+    const signedRequest = new Request(`http://worker.test/manifests/${`0x${"0".repeat(64)}`}`, {
+      headers: {
+        "cf-connecting-ip": "192.0.2.4",
+        "x-mida-signer": `0x${"0".repeat(40)}`,
+        "x-mida-timestamp": "1",
+        "x-mida-nonce": `0x${"0".repeat(64)}`,
+        "x-mida-signature": `0x${"0".repeat(130)}`,
+      },
+    })
+    const passed = await handleRequest(limitedEnv, signedRequest)
+    expect(passed.status).toBe(401)
+    expect(calls.signed).toEqual(["192.0.2.4"])
+  })
+
   it("GET / reports the deployment, the shared limits and the ciphertext-only sentence", async () => {
     const response = await mf.dispatchFetch("http://worker.test/")
     expect(response.status).toBe(200)

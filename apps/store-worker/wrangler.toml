@@ -19,6 +19,19 @@ compatibility_flags = ["nodejs_compat"]
 [triggers]
 crons = ["0 4 * * *"]
 
+# Per-IP request budgets, keyed on CF-Connecting-IP by the worker: signed requests get 120 a minute,
+# unsigned ones (anonymous manifest reads and unauthenticated probes) get 20. Each namespace is a
+# separate counter; the worker returns 429 with Retry-After when either says stop.
+[[ratelimits]]
+name = "LIMITER_SIGNED"
+namespace_id = "1001"
+simple = { limit = 120, period = 60 }
+
+[[ratelimits]]
+name = "LIMITER_UNSIGNED"
+namespace_id = "1002"
+simple = { limit = 20, period = 60 }
+
 # No account id, database id or secret lives in this file.
 # Create the database with `wrangler d1 create mida-context-store` and paste the returned
 # database_id below, then apply schema.sql with `wrangler d1 execute`.

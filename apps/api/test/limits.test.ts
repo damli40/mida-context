@@ -14,8 +14,8 @@ import { hexOf, manifestHash } from "@mida/crypto"
 import { contentHash } from "@mida/storage"
 import { randomBytes } from "@noble/hashes/utils.js"
 import type { Deployment } from "@mida/chain"
-import { ContextApiClient, createContextApi } from "@mida/api"
-import type { ContextRecordView, ObjectUploadBody, RegistryReader, StoreLimits } from "@mida/api"
+import { ContextApiClient, createContextApi, fileStores } from "@mida/api"
+import type { ContextRecordView, ContextStores, ObjectUploadBody, RegistryReader, RequestLimiter, StoreLimits } from "@mida/api"
 import { DEFAULT_STORE_LIMITS } from "@mida/api"
 
 const deployment: Deployment = {
@@ -44,8 +44,8 @@ function stubReader(records: Map<Hex, ContextRecordView> = new Map()): RegistryR
   } as unknown as RegistryReader
 }
 
-function apiFor(reader: RegistryReader, limits?: Partial<StoreLimits>) {
-  return createContextApi({ reader, deployment, dataDir: mkdtempSync(join(tmpdir(), "mida-limits-")), clock: () => NOW, limits })
+function apiFor(reader: RegistryReader, limits?: Partial<StoreLimits>, limiter?: RequestLimiter) {
+  return createContextApi({ reader, deployment, dataDir: mkdtempSync(join(tmpdir(), "mida-limits-")), clock: () => NOW, limits, limiter })
 }
 
 type FetchLike = (input: string, init: RequestInit) => Promise<Response>
@@ -252,5 +252,94 @@ describe("upload-abuse limits", () => {
     const second = await client.putAgentManifest(env)
     expect(second).toEqual(first)
     expect(await store.getManifestIndex(first.bodyHash)).toMatchObject({ envelopeHash: first.envelopeHash })
+  })
+
+  it("the injected per-IP limiter gates every route with a 429 and Retry-After", async () => {
+    const checked: Array<{ ip: string; signed: boolean }> = []
+    let allow = true
+    const { app } = apiFor(stubReader(), undefined, {
+      check: async (input) => {
+        checked.push(input)
+        return allow
+      },
+    })
+    const client = clientFor(app)
+    // Signed requests count against the signed bucket, unsigned ones against the other; the key is
+    // the CF-Connecting-IP the edge supplies, or "unknown" behind a plain server.
+    await expect(client.putAgentManifest(envelope())).resolves.toBeDefined()
+    await app.request(`http://mida.test/agent-manifests/${hexOf(randomBytes(32))}`, { headers: { "cf-connecting-ip": "203.0.113.7" } })
+    expect(checked).toEqual([
+      { ip: "unknown", signed: true },
+      { ip: "203.0.113.7", signed: false },
+    ])
+
+    allow = false
+    const denied = await app.request(`http://mida.test/agent-manifests/${hexOf(randomBytes(32))}`)
+    expect(denied.status).toBe(429)
+    expect(denied.headers.get("retry-after")).toBe("60")
+    await expect(denied.json()).resolves.toMatchObject({ error: { code: "RATE_LIMITED" } })
+    await expect(client.putObject(upload(randomBytes(8)))).rejects.toThrowError(/429/)
+  })
+
+  it("a malformed request makes zero reader calls and zero store calls", async () => {
+    const calls: string[] = []
+    const spying = <T extends object>(target: T, prefix: string): T =>
+      new Proxy(target, {
+        get: (target, property, receiver) => {
+          const value = Reflect.get(target, property, receiver)
+          return typeof value === "function"
+            ? (...args: unknown[]) => {
+                calls.push(`${prefix}.${String(property)}`)
+                return (value as (...a: unknown[]) => unknown).apply(target, args)
+              }
+            : value
+        },
+      })
+    const inner = fileStores(mkdtempSync(join(tmpdir(), "mida-cheap-")))
+    const stores: ContextStores = {
+      objects: spying(inner.objects, "objects"),
+      nonces: spying(inner.nonces, "nonces"),
+      denies: spying(inner.denies, "denies"),
+    }
+    const reader = spying(stubReader(), "reader") as RegistryReader
+    const { app } = createContextApi({ reader, deployment, stores, clock: () => NOW })
+    calls.length = 0 // construction-time reads (e.g. the deny overlay's file) are not under test
+
+    // No auth headers at all.
+    expect((await app.request("http://mida.test/objects", { method: "PUT", body: "{}" })).status).toBe(401)
+    // Auth headers present but malformed.
+    expect(
+      (
+        await app.request("http://mida.test/objects", {
+          method: "PUT",
+          headers: { "x-mida-signer": "not-an-address", "x-mida-timestamp": "1", "x-mida-nonce": "0x", "x-mida-signature": "0x" },
+          body: "{}",
+        })
+      ).status,
+    ).toBe(401)
+    // Well-formed signed headers but a body that is not JSON: the parse is checked before the signature.
+    const tampering = clientFor(app, async (url, init) => app.request(url, { ...init, body: "this is not json{" }))
+    await expect(tampering.request("PUT", "/objects", { body: { pad: "x" } })).rejects.toMatchObject({ code: "INVALID_WIRE" })
+    // An honest over-cap declaration is refused at the byte cap, before signature recovery.
+    expect(
+      (
+        await app.request("http://mida.test/objects", {
+          method: "PUT",
+          headers: {
+            "content-type": "application/json",
+            "content-length": "1048577",
+            "x-mida-signer": account.address,
+            "x-mida-timestamp": NOW.toString(10),
+            "x-mida-nonce": `0x${"0".repeat(64)}`,
+            "x-mida-signature": `0x${"0".repeat(130)}`,
+          },
+          body: "{}",
+        })
+      ).status,
+    ).toBe(413)
+    // A garbage body hash on the anonymous manifest read.
+    expect((await app.request("http://mida.test/agent-manifests/0xnothex")).status).toBe(400)
+
+    expect(calls).toEqual([])
   })
 })

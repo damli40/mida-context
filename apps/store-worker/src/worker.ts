@@ -6,13 +6,21 @@ import { assertHex } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import type { Deployment } from "@mida/chain"
 import { RegistryReader, createContextApi } from "@mida/api"
-import type { StoreLimits } from "@mida/api"
+import type { RequestLimiter, StoreLimits } from "@mida/api"
 import { d1Stores, runSweep } from "./index.js"
 import type { D1Like } from "./d1.js"
+
+/** The slice of Cloudflare's rate-limit binding this worker calls: one `limit` per request. */
+export interface RateLimitBinding {
+  limit(input: { key: string }): Promise<{ success: boolean }>
+}
 
 /** Environment bindings. No file paths, no secrets in wrangler.toml — RPC_URL goes in as a secret. */
 export interface WorkerEnv {
   DB: D1Like
+  /** [[ratelimits]] bindings: 120/min for signed requests, 20/min for unsigned ones — absent in local dev. */
+  LIMITER_SIGNED?: RateLimitBinding
+  LIMITER_UNSIGNED?: RateLimitBinding
   RPC_URL: string
   CHAIN_ID: string
   CAPABILITY_REGISTRY: string
@@ -93,7 +101,18 @@ function buildWorker(env: WorkerEnv): Built {
   const publicClient = createPublicClient({ transport: http(rpcUrl) })
   const reader = new RegistryReader({ publicClient, deployment })
   const stores = d1Stores(env.DB)
-  const { app, limits } = createContextApi({ reader, deployment, stores })
+  // The ratelimit bindings are optional: a binding-less dev worker limits nothing, and a self-hosted
+  // deployment that passes no bindings still gets every other protection.
+  const limiter: RequestLimiter | undefined =
+    env.LIMITER_SIGNED === undefined && env.LIMITER_UNSIGNED === undefined
+      ? undefined
+      : {
+          check: async ({ ip, signed }) => {
+            const binding = signed ? env.LIMITER_SIGNED : env.LIMITER_UNSIGNED
+            return binding === undefined ? true : (await binding.limit({ key: ip })).success
+          },
+        }
+  const { app, limits } = createContextApi({ reader, deployment, stores, limiter })
   built = { env, value: { app, reader, stores, deployment, limits } }
   return built.value
 }

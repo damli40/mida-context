@@ -26,7 +26,7 @@ import { Hono } from "hono"
 import type { Context } from "hono"
 import { createMiddleware } from "hono/factory"
 import { isAddressEqual, zeroHash } from "viem"
-import { assertAuthHeaderShape, authenticateRequest } from "./auth.js"
+import { AUTH_HEADERS, assertAuthHeaderShape, authenticateRequest } from "./auth.js"
 import { authorizeAgent } from "./authorize.js"
 import type { ContextRecordView, RegistryReader } from "./chain-views.js"
 import { DenyOverlay } from "./deny-overlay.js"
@@ -43,6 +43,18 @@ import type { AnchoredObject } from "./wire.js"
 
 export const CANCELLATION_MAX_LIFETIME_SECONDS = 300n
 
+/** Manifest GET responses are allowed this stale before the envelope is re-verified against Monad. */
+export const MANIFEST_VERIFY_CACHE_SECONDS = 60n
+
+/**
+ * Per-IP request limiting, injected by the deployment. The hosted Worker's [[ratelimits]] bindings adapt
+ * to it; a self-hosted Node server may pass its own (or none — the README says a reverse proxy is needed
+ * then). `signed` tells the limiter which bucket the request counts against.
+ */
+export interface RequestLimiter {
+  check(input: { ip: string; signed: boolean }): Promise<boolean>
+}
+
 export interface ContextApiOptions {
   reader: RegistryReader
   deployment: Deployment
@@ -52,6 +64,8 @@ export interface ContextApiOptions {
   stores?: ContextStores
   /** Upload-abuse limits; any field overrides the shared defaults in DEFAULT_STORE_LIMITS. */
   limits?: Partial<StoreLimits>
+  /** Per-IP request-rate limiting; default none (a self-hoster limits at their reverse proxy). */
+  limiter?: RequestLimiter
   /** Wall-clock seconds for request freshness. Chain time decides capability expiry. */
   clock?: () => bigint
 }
@@ -84,6 +98,21 @@ export function createContextApi(options: ContextApiOptions) {
   const replay = stores.nonces
   const limits: StoreLimits = { ...DEFAULT_STORE_LIMITS, ...options.limits }
   const app = new Hono<Env>()
+
+  // The cheapest gate of all: a per-IP request budget, checked before a byte of the body is read. The
+  // hosted worker binds Cloudflare's ratelimits; a self-hosted app can inject any implementation.
+  const limiter = options.limiter
+  if (limiter !== undefined) {
+    app.use(async (c, next) => {
+      const ip = c.req.header("cf-connecting-ip") ?? "unknown"
+      const signed = c.req.header(AUTH_HEADERS.signature) !== undefined
+      if (await limiter.check({ ip, signed })) {
+        await next()
+        return
+      }
+      return c.json({ error: { code: "RATE_LIMITED", message: "too many requests from this address — try again in a minute" } }, 429, { "retry-after": "60" })
+    })
+  }
 
   /**
    * Reads a request body under a byte cap: an honest content-length is refused before a byte is read, and the
@@ -371,9 +400,17 @@ export function createContextApi(options: ContextApiOptions) {
       throw new MidaError("MANIFEST_NOT_FOUND", "indexed envelope bytes are missing")
     }
     const envelope = parseManifestEnvelopeBytes({ bytes, expectedEnvelopeHash: entry.envelopeHash, expectedBodyHash: bodyHash })
+    // A row marked verified inside the cache window is served without a chain read; older or never-verified
+    // rows re-verify against Monad and refresh the mark. Negatives are never cached: a missing or failing
+    // record is checked again on the next request, so a newly registered agent appears immediately and a
+    // removed one disappears within MANIFEST_VERIFY_CACHE_SECONDS of its last verification.
+    const nowMs = Number(clock()) * 1000
+    const verifiedAgeMs = entry.verifiedAt === null ? Number.POSITIVE_INFINITY : nowMs - Date.parse(entry.verifiedAt)
+    if (verifiedAgeMs < Number(MANIFEST_VERIFY_CACHE_SECONDS) * 1000) return c.json(envelope)
     const agentRecord = await reader.getAgent(envelope.manifest.agentId)
     if (agentRecord === null) throw new MidaError("AGENT_ID_MISMATCH", "manifest agent is not registered")
     verifySignedManifest({ envelope, agentRecord, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, now: await reader.now() })
+    await store.setManifestIndex(bodyHash, entry.envelopeHash, { verifiedAt: new Date(nowMs).toISOString() })
     return c.json(envelope)
   })
 
