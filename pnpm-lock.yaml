@@ -388,6 +388,9 @@ importers:
       '@mida/protocol':
         specifier: workspace:*
         version: link:../protocol
+      permissionless:
+        specifier: 0.4.1
+        version: 0.4.1(viem@2.56.3(typescript@5.9.3)(zod@4.5.4))
       viem:
         specifier: 2.56.3
         version: 2.56.3(typescript@5.9.3)(zod@4.5.4)
