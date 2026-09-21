@@ -1,0 +1,411 @@
+{
+  "commit": "662b51add352a2dc191f2994600da9c613ba70f5",
+  "startedAt": "2026-09-21T04:53:49.378Z",
+  "seconds": 887.7,
+  "checks": [
+    {
+      "id": "A1",
+      "pass": true,
+      "value": 10.7,
+      "limit": 100,
+      "unit": "ms",
+      "detail": {
+        "p50": 9.6,
+        "p95": 10.7,
+        "events": 200
+      }
+    },
+    {
+      "id": "A2",
+      "pass": true,
+      "value": 1,
+      "limit": 1.2,
+      "unit": "calls/active-min",
+      "detail": {
+        "steadyCalls": 5,
+        "burstCalls": 1,
+        "first60sLimit": 1
+      }
+    },
+    {
+      "id": "A3",
+      "pass": true,
+      "value": {
+        "jobs": 1,
+        "cleanExits": true,
+        "cleanStdout": true
+      },
+      "limit": null,
+      "detail": {
+        "expectedJobs": 1,
+        "spawned": 4
+      }
+    },
+    {
+      "id": "B1",
+      "pass": true,
+      "value": 6.207,
+      "limit": null,
+      "unit": "s",
+      "detail": {
+        "flushSeconds": 4.18,
+        "gapSeconds": 6.21,
+        "midGapWaitMs": 2000
+      }
+    },
+    {
+      "id": "B2",
+      "pass": null,
+      "skipped": "needs-real-model"
+    },
+    {
+      "id": "B3",
+      "pass": true,
+      "value": {
+        "saved": 1,
+        "seconds": 4.19
+      },
+      "limit": null
+    },
+    {
+      "id": "C1",
+      "pass": true,
+      "value": {
+        "stored": true,
+        "injected": true,
+        "records": 2
+      },
+      "limit": null
+    },
+    {
+      "id": "C2",
+      "pass": null,
+      "skipped": "needs-real-model"
+    },
+    {
+      "id": "C3",
+      "pass": true,
+      "value": 7921,
+      "limit": 8000,
+      "unit": "chars"
+    },
+    {
+      "id": "C4",
+      "pass": true,
+      "value": 1,
+      "limit": 1.2,
+      "detail": {
+        "bullets": 1,
+        "saves": 3
+      }
+    },
+    {
+      "id": "C5",
+      "pass": true,
+      "value": {
+        "workWon": true,
+        "otherListed": true
+      },
+      "limit": null
+    },
+    {
+      "id": "C6",
+      "pass": true,
+      "value": {
+        "issueResolved": true,
+        "planEmpty": true
+      },
+      "limit": null
+    },
+    {
+      "id": "C7",
+      "pass": true,
+      "value": {
+        "rejected": 2,
+        "saved": 1,
+        "fieldsNamed": true,
+        "tooLarge": true,
+        "stored": 1
+      },
+      "limit": null
+    },
+    {
+      "id": "D1",
+      "pass": true,
+      "value": {
+        "reachedModel": 0,
+        "reachedChain": 0
+      },
+      "limit": 0,
+      "detail": {
+        "shapes": 8,
+        "placements": 4,
+        "unscrubbed": 0
+      }
+    },
+    {
+      "id": "D3",
+      "pass": true,
+      "value": {
+        "forgedUndisguised": 0,
+        "realFences": true,
+        "headers": true,
+        "planHeadings": true,
+        "defusedPresent": true
+      },
+      "limit": null
+    },
+    {
+      "id": "D4",
+      "pass": true,
+      "value": {
+        "escaped": 0,
+        "jobs": 1
+      },
+      "limit": 0
+    },
+    {
+      "id": "D5",
+      "pass": true,
+      "value": {
+        "jobs": 1,
+        "rejected": 7
+      },
+      "limit": null
+    },
+    {
+      "id": "D6",
+      "pass": true,
+      "value": {
+        "fileModeAreas": [],
+        "dirModeAreas": [],
+        "anthropicKeys": 0
+      },
+      "limit": 0,
+      "detail": {
+        "fileMode": "0600",
+        "dirMode": "0700"
+      }
+    },
+    {
+      "id": "E1",
+      "pass": true,
+      "value": {
+        "liveCaps": 0,
+        "readCode": "CAPABILITY_REVOKED",
+        "writeCode": "CAPABILITY_REVOKED"
+      },
+      "limit": null,
+      "detail": {
+        "refusalMs": 4270
+      }
+    },
+    {
+      "id": "E2",
+      "pass": true,
+      "value": {
+        "doubleCode": "already-approved",
+        "capsBefore": 3,
+        "capsAfter": 3,
+        "requestAgain": "already-approved",
+        "canRead": false,
+        "canCreate": true
+      },
+      "limit": null
+    },
+    {
+      "id": "E3",
+      "pass": true,
+      "value": {
+        "liveBefore": 1,
+        "expired": true,
+        "liveAfter": 3
+      },
+      "limit": null
+    },
+    {
+      "id": "E4",
+      "pass": true,
+      "value": {
+        "revokeB": null,
+        "bLive": 0,
+        "aLive": 3,
+        "saveB": null,
+        "aRecords": 2
+      },
+      "limit": null
+    },
+    {
+      "id": "E5",
+      "pass": true,
+      "value": {
+        "revokedCorrectAgent": true,
+        "missingIdentityRevoked": true
+      },
+      "limit": null
+    },
+    {
+      "id": "E6",
+      "pass": true,
+      "value": {
+        "stored": 1,
+        "sessions": [
+          "e6-post"
+        ]
+      },
+      "limit": null
+    },
+    {
+      "id": "E7",
+      "pass": true,
+      "value": {
+        "onChainAuthor": true,
+        "claimFlagged": true
+      },
+      "limit": null
+    },
+    {
+      "id": "E8",
+      "pass": true,
+      "value": {
+        "facts": true,
+        "factsObjects": 1,
+        "projectsCode": "CAPABILITY_DENIED"
+      },
+      "limit": null
+    },
+    {
+      "id": "F1",
+      "pass": true,
+      "value": 101.1,
+      "limit": 8000,
+      "unit": "ms",
+      "detail": {
+        "medians": {
+          "1": 48.3,
+          "10": 51.9,
+          "50": 101.1,
+          "100": 152.1
+        },
+        "saveMsAt100": 4226,
+        "saveMsMedian": 4160
+      }
+    },
+    {
+      "id": "F2",
+      "pass": null,
+      "skipped": "needs-testnet"
+    },
+    {
+      "id": "F3",
+      "pass": true,
+      "value": {
+        "renderMs": 2.05,
+        "parseMs": 5.86,
+        "transcriptBytesRead": 125536
+      },
+      "limit": {
+        "renderMs": 60,
+        "parseMs": 1000,
+        "transcriptBytes": 131072
+      }
+    },
+    {
+      "id": "H1",
+      "pass": true,
+      "value": {
+        "initConverged": true,
+        "approveConverged": true,
+        "revokeConverged": true,
+        "saveConverged": true,
+        "doubleApprove": "already-approved"
+      },
+      "limit": null
+    },
+    {
+      "id": "H2",
+      "pass": true,
+      "value": {
+        "compileCalls": 1,
+        "saveAttempts": 2,
+        "stored": 1,
+        "contention": "threw",
+        "drainStillWorks": true
+      },
+      "limit": null
+    },
+    {
+      "id": "H3",
+      "pass": true,
+      "value": [
+        {
+          "name": "cap02",
+          "bytesOk": true,
+          "requestOk": true,
+          "planOk": true,
+          "constraintsOk": true,
+          "noteOk": true,
+          "savedOk": true
+        },
+        {
+          "name": "constraints50",
+          "bytesOk": true,
+          "requestOk": true,
+          "planOk": true,
+          "constraintsOk": true,
+          "noteOk": true,
+          "savedOk": true
+        },
+        {
+          "name": "emoji",
+          "bytesOk": true,
+          "requestOk": true,
+          "planOk": true,
+          "constraintsOk": true,
+          "noteOk": true,
+          "savedOk": true
+        }
+      ],
+      "limit": 65280,
+      "unit": "bytes"
+    },
+    {
+      "id": "H4",
+      "pass": true,
+      "value": {
+        "compileOk": false,
+        "reason": "model-failed",
+        "modelGone": true,
+        "grandchildGone": true
+      },
+      "limit": null
+    },
+    {
+      "id": "H5",
+      "pass": true,
+      "value": {
+        "distinctReasons": 5,
+        "reasons": [
+          "bad-transcript-path",
+          "chain-error",
+          "model-failed",
+          "not-a-project",
+          "unknown-transcript-format"
+        ],
+        "stableCodes": true,
+        "leaked": false
+      },
+      "limit": null
+    },
+    {
+      "id": "G1",
+      "pass": null,
+      "skipped": "needs-real-agents"
+    },
+    {
+      "id": "G2",
+      "pass": null,
+      "skipped": "needs-real-agents"
+    }
+  ]
+}
