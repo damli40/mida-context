@@ -5,7 +5,7 @@ import { createPublicClient, http } from "viem"
 import { assertHex } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import type { Deployment } from "@mida/chain"
-import { AUTH_HEADERS, MANIFEST_VERIFY_CACHE_SECONDS, RegistryReader, createContextApi } from "@mida/api"
+import { AUTH_HEADERS, MANIFEST_VERIFY_CACHE_SECONDS, MAX_CHAIN_READS_PER_REQUEST, RegistryReader, SWEEP_MAX_OBJECTS_PER_RUN, createContextApi } from "@mida/api"
 import type { StoreLimits } from "@mida/api"
 import { d1Stores, runSweep } from "./index.js"
 import type { D1Like } from "./d1.js"
@@ -184,6 +184,13 @@ export async function handleRequest(env: WorkerEnv, request: Request): Promise<R
         contextRegistry: deployment.contextRegistry,
         limits,
         manifestVerifyCacheSeconds: Number(MANIFEST_VERIFY_CACHE_SECONDS),
+        // Every Monad read a request makes is one subrequest; the budget is sized under the
+        // Cloudflare Workers Free plan's 50-per-invocation ceiling — see the README's assumption
+        // note and the current Workers limits page.
+        chainReadsPerRequest: MAX_CHAIN_READS_PER_REQUEST,
+        // A list that ran out of read budget flags x-mida-partial; clients retry and make progress.
+        partialObjectsHeader: "x-mida-partial",
+        sweep: { cron: "*/15 * * * *", maxObjectsPerRun: SWEEP_MAX_OBJECTS_PER_RUN },
         rateLimitsPerMinute: {
           signed: env.LIMITER_SIGNED === undefined ? null : RATE_LIMIT_SIGNED_PER_MINUTE,
           unsigned: env.LIMITER_UNSIGNED === undefined ? null : RATE_LIMIT_UNSIGNED_PER_MINUTE,

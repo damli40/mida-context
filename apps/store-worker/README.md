@@ -30,10 +30,14 @@ decides what is allowed; the server can only ever be stricter, never looser.
   budget keyed on `CF-Connecting-IP`: 120 requests a minute for signed traffic, 20 a minute for
   anonymous traffic — including `GET /` and CORS preflights. A refusal is 429 with
   `Retry-After: 60`.
-- **Delete ciphertext.** Pending uploads that the chain never anchors are swept after 24 hours,
-  and expired request nonces are swept with them — as are agent-manifest envelopes whose agent
-  never registered. The operator can also delete rows directly; deleting data only makes objects
-  disappear — it can never make new ones valid.
+- **Spend a bounded number of chain reads per request.** Every Monad read is one outgoing
+  subrequest, and one request is allowed at most **30** (`MAX_CHAIN_READS_PER_REQUEST`,
+  reported by `GET /` as `chainReadsPerRequest`). A request that would need more fails with
+  503 and `Retry-After: 5` — never a 500, and never a partial write.
+- **Delete ciphertext.** Pending uploads that the chain never anchors are swept after 24 hours
+  — row and ciphertext blob together — and expired request nonces are swept with them, as are
+  agent-manifest envelopes whose agent never registered. The operator can also delete rows
+  directly; deleting data only makes objects disappear — it can never make new ones valid.
 
 **It cannot:**
 
@@ -91,9 +95,21 @@ against a real Cloudflare account.
 
 ### Notes for operators
 
-- **Daily maintenance is automatic.** The `scheduled` cron (`0 4 * * *` in `wrangler.toml`)
-  deletes pending objects older than 24 h that the chain never anchored, and nonces older than
-  the 60-second request window.
+- **Maintenance is automatic and bounded.** The `scheduled` cron (`*/15 * * * *` in
+  `wrangler.toml`) deletes pending objects older than 24 h that the chain never anchored —
+  row and ciphertext blob together — and nonces older than the 60-second request window. Each
+  run examines at most **25** object rows, oldest first (one chain read each), so a run always
+  fits the platform's subrequest ceiling; a backlog drains over successive runs instead of a
+  daily job dying half-way. A row whose chain read fails is skipped, never deleted.
+- **The 30-read budget assumes the Cloudflare Workers Free plan** (50 subrequests per
+  invocation, of which every Monad read is one — 30 leaves headroom for rate-limit checks and
+  D1). **Check the current Workers limits page** before deploying on another plan; the number
+  is `MAX_CHAIN_READS_PER_REQUEST` in `apps/api/src/chain-budget.ts`.
+- **`GET /objects` can be partial.** Rows never yet verified against Monad cost one chain read
+  each; when the budget runs out mid-list the response carries `x-mida-partial: true` and omits
+  the unexamined rows. Verified rows are marked, so a retry makes progress — the bundled client
+  retries up to 3 times and then returns what it has with `partial: true` on the result, never
+  a silent short list.
 - **One process per data directory.** The file-backed store (what `createContextApi` uses with
   `dataDir` — the local/self-hosted mode) enforces its quotas read-then-write: atomic inside one
   Node process, but two processes sharing a directory can both pass the pending-byte check. Run
@@ -111,9 +127,10 @@ against a real Cloudflare account.
   case, and it is the same `manifestVerifyCacheSeconds` `GET /` reports. Failed verifications
   are never cached.
 - **Check `GET /` after deploying.** It returns the deployment's chain id, the two registry
-  addresses, every enforced limit, the 60-second manifest cache window, the per-IP budgets the
-  bindings are configured with (`null` where a binding is absent), and a sentence telling
-  callers this server stores ciphertext only.
+  addresses, every enforced limit, the 60-second manifest cache window, the per-request
+  chain-read budget, the partial-list header name, the sweep cadence and bound, the per-IP
+  budgets the bindings are configured with (`null` where a binding is absent), and a sentence
+  telling callers this server stores ciphertext only.
 - **Logs are safe by construction.** Method, path template, status, byte count and duration —
   never a request body, a signature, a full address or a full hash.
 

@@ -447,6 +447,10 @@ describe("the worker entry", () => {
     })
     // The 60-second manifest verification cache is advertised; a removed agent disappears within it.
     expect(body["manifestVerifyCacheSeconds"]).toBe(60)
+    // The chain-read budget, the partial-list header and the 15-minute bounded sweep are advertised too.
+    expect(body["chainReadsPerRequest"]).toBe(30)
+    expect(body["partialObjectsHeader"]).toBe("x-mida-partial")
+    expect(body["sweep"]).toEqual({ cron: "*/15 * * * *", maxObjectsPerRun: 25 })
     // This Miniflare env binds no [[ratelimits]], so the worker honestly reports no per-IP budget.
     expect(body["rateLimitsPerMinute"]).toEqual({ signed: null, unsigned: null })
     expect(body["notice"]).toBe(
