@@ -3,5 +3,6 @@ packages:
   - "apps/*"
 allowBuilds:
   esbuild: true
+  workerd: true
 overrides:
   zod: 4.5.4

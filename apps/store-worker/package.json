@@ -1,0 +1,20 @@
+{
+  "name": "@mida/store-worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@mida/api": "workspace:*",
+    "@mida/chain": "workspace:*",
+    "@mida/crypto": "workspace:*",
+    "@mida/protocol": "workspace:*",
+    "@mida/storage": "workspace:*",
+    "@noble/hashes": "2.4.0",
+    "hono": "4.13.7",
+    "viem": "2.56.3"
+  },
+  "devDependencies": {
+    "miniflare": "^4.20250913.0"
+  }
+}
