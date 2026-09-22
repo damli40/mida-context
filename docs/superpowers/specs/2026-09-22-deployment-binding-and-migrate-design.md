@@ -105,9 +105,14 @@ contract, and they are not stored.
 
 ## 4. `request` names its failure (CHAIN-09)
 
-1. `toMidaError` (packages/chain/src/registry.ts:59-63) wraps any chain error it cannot decode as
-   `MidaError("CHAIN_CALL_FAILED")`, keeping the original as `cause`. A known revert keeps its
-   current code.
+1. **Invariant (amended Sep 22, Plan A Task 3):** unrecognised errors are normalised at the `mida`
+   CLI refusal/printing boundary, not by changing `toMidaError`. `refusalCode(error)`
+   (`apps/midad/src/debug-line.ts`) returns the error's own code, else `CHAIN_CALL_FAILED` for a
+   viem chain error, else `UNEXPECTED`, and never `ERROR`. `toMidaError`
+   (packages/chain/src/registry.ts:60) is unchanged: it has 14 callers across the chain package,
+   the API, the owner page and the SDK, and some pass the raw error on or inspect it
+   (`apps/api/src/chain-views.ts:120`). The original wording here ("`toMidaError` wraps any chain
+   error it cannot decode") would have changed behaviour in all of them.
 2. `CHAIN_CALL_FAILED` prints: `the chain call failed — this setup's contract is 0xf07d…; run with
    MIDA_DEBUG=1 to see why`. Both refusal paths (`runCliWithRuntime` and `ownerRefusalLine` in
    cli.ts) get the line.
