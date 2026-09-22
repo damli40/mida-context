@@ -19,11 +19,18 @@ describe("deployments.generated.ts", () => {
   })
 
   it("the embedded record answers loadDeployment with no directory", () => {
+    // Compared against the committed record, never a copied literal: the Sep 22 redeploy moved
+    // the addresses and a copied address would have failed here for the wrong reason.
+    const committed = JSON.parse(readFileSync(join(ROOT, "contracts/deployments/10143.json"), "utf8")) as {
+      capabilityRegistry: string
+      contextRegistry: string
+      deploymentBlock: number
+    }
     const deployment = loadDeployment(MONAD_TESTNET_CHAIN_ID)
     expect(deployment.chainId).toBe(MONAD_TESTNET_CHAIN_ID)
-    expect(deployment.capabilityRegistry).toBe("0xf07d24dbd1fe21645a0489a94bae2c99d7e0e80b")
-    expect(deployment.contextRegistry).toBe("0x350dc422bb2979684573409f229679fed383b2e5")
-    expect(deployment.deploymentBlock).toBe(63193282n)
+    expect(deployment.capabilityRegistry).toBe(committed.capabilityRegistry.toLowerCase())
+    expect(deployment.contextRegistry).toBe(committed.contextRegistry.toLowerCase())
+    expect(deployment.deploymentBlock).toBe(BigInt(committed.deploymentBlock))
   })
 
   it("never embeds the local-Anvil record — it is per-machine and stays a disk read", () => {
