@@ -361,39 +361,90 @@ describe("mida doctor without a chain", () => {
     expect(lines.every((line) => !line.startsWith("note:") || !line.startsWith("PROBLEM:"))).toBe(true)
   })
 
-  it("a PATH without mida-hook and mida-inject is a PROBLEM naming the repo's bin folder (R4-6)", async () => {
+  it("the hook binaries resolve absolutely — PATH is never consulted (R5-7)", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const emptyPath = join(dir(), "empty-path")
     mkdirSync(emptyPath)
     const lines: string[] = []
     await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: { PATH: emptyPath }, daemonProbeMs: 50 })
-    const hook = lines.find((line) => line.includes("mida-hook"))
-    const inject = lines.find((line) => line.includes("mida-inject"))
+    const hook = lines.find((line) => line.includes("mida-hook resolves to"))
+    const inject = lines.find((line) => line.includes("mida-inject resolves to"))
     expect(hook).toBeDefined()
     expect(inject).toBeDefined()
-    expect(hook).toContain("PROBLEM:")
-    expect(inject).toContain("PROBLEM:")
-    // the fix names a bin/ folder the owner can add to their PATH — the repo's own, until npm exists
+    expect(hook).toContain("ok:")
+    expect(inject).toContain("ok:")
+    // the resolved path is absolute — the file the settings will name, not a PATH lookup
     for (const line of [hook, inject]) {
-      expect(line).toContain("add")
-      expect(line).toContain("PATH")
-      expect(line).toMatch(/bin\/?\s+to your PATH/)
+      expect(line).toMatch(/resolves to \//)
     }
-    expect(lines).not.toContain("ok: mida-hook is on the PATH")
+    expect(lines.some((line) => line.includes("on your PATH"))).toBe(false)
   })
 
-  it("a PATH carrying both commands reports ok for each (R4-6)", async () => {
+  it("a hook command pointing at a missing path is a PROBLEM naming the file (R5-7)", async () => {
     const home = new MidaHome(join(dir(), "home"))
-    const binDir = join(dir(), "fake-bin")
-    mkdirSync(binDir)
-    for (const command of ["mida-hook", "mida-inject"]) {
-      writeFileSync(join(binDir, command), "#!/bin/sh\nexit 0\n")
-      chmodSync(join(binDir, command), 0o755)
-    }
+    const settings = join(dir(), "settings.json")
+    // an absolute-path install whose files are gone — a moved or deleted checkout
+    const goneHook = "/gone/hook-main.ts claude-code"
+    const goneInject = "/gone/inject-main.ts claude-code"
+    writeFileSync(
+      settings,
+      JSON.stringify({
+        hooks: {
+          SessionStart: [{ hooks: [{ type: "command", command: goneInject }] }],
+          UserPromptSubmit: [{ hooks: [{ type: "command", command: goneInject }] }],
+          PostToolUse: [{ hooks: [{ type: "command", command: goneHook }] }],
+          Stop: [{ hooks: [{ type: "command", command: goneHook }] }],
+          StopFailure: [{ hooks: [{ type: "command", command: goneHook }] }],
+          PreCompact: [{ hooks: [{ type: "command", command: goneHook }] }],
+          SessionEnd: [{ hooks: [{ type: "command", command: goneHook }] }],
+        },
+      }),
+    )
     const lines: string[] = []
-    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: { PATH: binDir }, daemonProbeMs: 50 })
-    expect(lines).toContain("ok: mida-hook is on the PATH")
-    expect(lines).toContain("ok: mida-inject is on the PATH")
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: { "claude-code": settings },
+      env: {},
+      daemonProbeMs: 50,
+    })
+    expect(lines).toContain("PROBLEM: a claude-code hook points at /gone/hook-main.ts, which does not exist — run `mida install claude-code`")
+    expect(lines).toContain("PROBLEM: a claude-code hook points at /gone/inject-main.ts, which does not exist — run `mida install claude-code`")
+  })
+
+  it("a bare-name install from before the absolute-path change reads outdated, with the reinstall fix (R5-7)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const settings = join(dir(), "settings.json")
+    const legacy = (command: string) => [{ hooks: [{ type: "command", command }] }]
+    writeFileSync(
+      settings,
+      JSON.stringify({
+        hooks: {
+          SessionStart: legacy("mida-inject claude-code"),
+          UserPromptSubmit: legacy("mida-inject claude-code"),
+          PostToolUse: legacy("mida-hook claude-code"),
+          Stop: legacy("mida-hook claude-code"),
+          StopFailure: legacy("mida-hook claude-code"),
+          PreCompact: legacy("mida-hook claude-code"),
+          SessionEnd: legacy("mida-hook claude-code"),
+        },
+      }),
+    )
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: { "claude-code": settings },
+      env: {},
+      daemonProbeMs: 50,
+    })
+    expect(lines.some((line) => line.startsWith("PROBLEM: claude-code hooks point at an older command"))).toBe(true)
+    // the bare name is reported once, by the outdated line — never as a separate path problem
+    expect(lines.every((line) => !line.includes("runs the bare name"))).toBe(true)
+    // and install upgrades the file to the absolute commands
+    installClaudeCode(settings)
+    await runDoctor({ home, print: (line) => lines.push(line), settings: { "claude-code": settings }, env: {}, daemonProbeMs: 50 })
+    expect(lines).toContain("ok: claude-code hooks installed")
   })
 
   it("MIDA_CLAUDE_SETTINGS and MIDA_CODEX_CONFIG point the hooks check at throwaway settings files (R4-6)", async () => {

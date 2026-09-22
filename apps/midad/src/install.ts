@@ -1,12 +1,19 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
-import { dirname } from "node:path"
+import { basename, dirname, isAbsolute } from "node:path"
 import { randomBytes } from "node:crypto"
+import { isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
+import type { SiblingEntry } from "./sibling.js"
 
 /**
- * The hook command text is exact and carries nothing else — no path, no `node`, no version, no
- * environment variable, no trailing space. Codex fingerprints the command text and silently drops
- * a hook whose text changed (spike); the same discipline is kept for Claude Code. Install,
- * uninstall and doctor all compare against these constants.
+ * The hook command text is exact and carries nothing else — no environment variable, no
+ * trailing space. Codex fingerprints the command text and silently drops a hook whose text
+ * changed (spike); the same discipline is kept for Claude Code.
+ *
+ * Since the Sep 22 live failure (`/bin/sh: mida-hook: command not found` in a Claude Code
+ * window started outside a Mida PATH shell) the command names the hook binary ABSOLUTELY —
+ * the path `mida` itself resolved to — instead of a bare name the tool's shell must find.
+ * These constants keep the legacy bare text for recognition only: uninstall removes both
+ * forms and doctor reports a bare entry as stale.
  */
 export const HOOK_COMMAND = {
   "claude-code": "mida-hook claude-code",
@@ -19,17 +26,103 @@ export const INJECT_COMMAND = {
 
 export type InstallTool = keyof typeof HOOK_COMMAND
 
-/** Claude Code events: the inject command on session start and on every prompt, the capture hook on the five save events. */
-const EVENT_COMMANDS: Readonly<Record<string, string>> = {
-  SessionStart: INJECT_COMMAND["claude-code"],
-  UserPromptSubmit: INJECT_COMMAND["claude-code"],
-  PostToolUse: HOOK_COMMAND["claude-code"],
-  Stop: HOOK_COMMAND["claude-code"],
-  StopFailure: HOOK_COMMAND["claude-code"],
-  PreCompact: HOOK_COMMAND["claude-code"],
-  SessionEnd: HOOK_COMMAND["claude-code"],
+/** Characters safe to leave unquoted in a command line — anything else is double-quoted. */
+const BARE_TOKEN = /^[A-Za-z0-9_@%+=:,./-]+$/
+const quoteToken = (token: string): string =>
+  BARE_TOKEN.test(token) ? token : `"${token.replace(/(["\\$`])/g, "\\$1")}"`
+
+/**
+ * The invocation install writes for one entry: the entry file absolutely, runnable without
+ * PATH. Bundled, the dist file itself is executable (shebang + 0o755 are built in). From the
+ * source tree the file is TypeScript, so the command spells out node + the tsx loader — every
+ * token still absolute.
+ */
+function invocation(entry: SiblingEntry, tool: InstallTool): string {
+  const tokens = isBundled() ? [siblingEntryPath(entry)] : [process.execPath, ...siblingEntryArgs(entry)]
+  return `${tokens.map(quoteToken).join(" ")} ${tool}`
 }
-const CLAUDE_EVENTS: readonly string[] = Object.keys(EVENT_COMMANDS)
+
+/** The current hook command text for this install — absolute; what a fresh `mida install` writes. */
+export function hookCommand(tool: InstallTool): string {
+  return invocation("mida-hook", tool)
+}
+
+/** The current inject command text for this install — absolute; what a fresh `mida install` writes. */
+export function injectCommand(tool: InstallTool): string {
+  return invocation("mida-inject", tool)
+}
+
+/**
+ * What a Mida hook command resolves to: which sibling it invokes, which tool it serves, and
+ * the file paths inside it a checker can stat. `paths` lists the program run first — marked
+ * whether the shell needs it executable — then the script file it loads. A bare-name command
+ * (the pre-absolute form) reports its single token as `executable` but NOT absolute, which is
+ * how doctor tells "installed the old way" from "installed".
+ */
+export interface ParsedHookCommand {
+  kind: "hook" | "inject"
+  tool: InstallTool
+  paths: { file: string; executable: boolean }[]
+}
+
+/** The file names a Mida hook command can point at — bare bin, bundled dist file, source file. */
+const ENTRY_FILES: Record<"hook" | "inject", readonly string[]> = {
+  hook: ["mida-hook", "mida-hook.js", "hook-main.ts"],
+  inject: ["mida-inject", "mida-inject.js", "inject-main.ts"],
+}
+
+/** Splits a command line into tokens; double-quoted spans are kept whole, quotes stripped. */
+function commandTokens(command: string): string[] {
+  const tokens: string[] = []
+  for (const match of command.matchAll(/"([^"]*)"|(\S+)/g)) tokens.push(match[1] ?? match[2]!)
+  return tokens
+}
+
+/**
+ * Parses a settings-file command: ours if its last token is a tool name and some earlier
+ * token's file name is a Mida entry point. Returns null for anything else — a command that
+ * merely mentions mida mid-text is not ours to touch.
+ */
+export function parseMidaCommand(command: unknown): ParsedHookCommand | null {
+  if (typeof command !== "string") return null
+  const tokens = commandTokens(command)
+  if (tokens.length < 2) return null
+  const tool = tokens[tokens.length - 1]
+  if (tool !== "claude-code" && tool !== "codex") return null
+  for (const [index, token] of tokens.slice(0, -1).entries()) {
+    for (const kind of ["hook", "inject"] as const) {
+      if (!ENTRY_FILES[kind].includes(basename(token))) continue
+      const paths: ParsedHookCommand["paths"] = []
+      const program = tokens[0]!
+      if (index === 0) {
+        // the entry file IS the program — bundled form or legacy bare name
+        paths.push({ file: program, executable: true })
+      } else {
+        // node + loader + script — the program is checked executable, the script readable
+        if (isAbsolute(program)) paths.push({ file: program, executable: true })
+        paths.push({ file: token, executable: false })
+      }
+      return { kind, tool: tool as InstallTool, paths }
+    }
+  }
+  return null
+}
+
+/** Claude Code events: the inject command on session start and on every prompt, the capture hook on the five save events. */
+function eventCommands(): Readonly<Record<string, string>> {
+  const inject = injectCommand("claude-code")
+  const hook = hookCommand("claude-code")
+  return {
+    SessionStart: inject,
+    UserPromptSubmit: inject,
+    PostToolUse: hook,
+    Stop: hook,
+    StopFailure: hook,
+    PreCompact: hook,
+    SessionEnd: hook,
+  }
+}
+const CLAUDE_EVENTS: readonly string[] = ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "StopFailure", "PreCompact", "SessionEnd"]
 
 export type InstallOutcome = "installed" | "already-installed"
 export type UninstallOutcome = "uninstalled" | "not-installed"
@@ -105,53 +198,121 @@ function readSettings(settingsPath: string): { text: string; settings: Record<st
  * overwrites an existing backup.
  */
 export function installClaudeCode(settingsPath: string): InstallOutcome {
+  const commands = eventCommands()
   const read = readSettings(settingsPath)
   if (read === "absent") {
     const hooks: Record<string, unknown> = {}
-    for (const event of CLAUDE_EVENTS) hooks[event] = [hookElement(EVENT_COMMANDS[event]!)]
+    for (const event of CLAUDE_EVENTS) hooks[event] = [hookElement(commands[event]!)]
     mkdirSync(dirname(settingsPath), { recursive: true })
     writeFileAtomic(settingsPath, `${JSON.stringify({ hooks }, null, 2)}\n`)
     return "installed"
   }
   const { text, settings } = read
   const hooks = (settings.hooks ?? {}) as Record<string, unknown>
-  const missing = CLAUDE_EVENTS.filter(
-    (event) => !((hooks[event] ?? []) as unknown[]).some((el) => eventHasCommand(el, EVENT_COMMANDS[event]!)),
-  )
-  if (missing.length === 0) return "already-installed"
+  // For each event: rewrite any Mida command of the right kind that is not the current text
+  // (a bare `mida-hook claude-code` from an older install) and append where none exists. An
+  // element is ours to rewrite only when its command parses as Mida's — user entries are
+  // never edited, reordered or removed.
+  let changed = false
+  for (const event of CLAUDE_EVENTS) {
+    const expected = commands[event]!
+    let present = false
+    for (const element of (hooks[event] ?? []) as unknown[]) {
+      if (!isPlainObject(element) || !Array.isArray(element.hooks)) continue
+      for (const hook of element.hooks as unknown[]) {
+        if (!isPlainObject(hook)) continue
+        if (hook.command === expected) {
+          present = true
+        } else {
+          const parsed = parseMidaCommand(hook.command)
+          if (parsed !== null && parsed.tool === "claude-code" && parsed.kind === kindFor(event)) {
+            hook.command = expected
+            present = true
+            changed = true
+          }
+        }
+      }
+    }
+    if (!present) {
+      if (!isPlainObject(settings.hooks)) settings.hooks = {}
+      const target = settings.hooks as Record<string, unknown>
+      if (!Array.isArray(target[event])) target[event] = []
+      ;(target[event] as unknown[]).push(hookElement(expected))
+      changed = true
+    }
+  }
+  if (!changed) return "already-installed"
   const backupPath = `${settingsPath}.mida-backup`
   if (!existsSync(backupPath)) writeFileAtomic(backupPath, text)
-  if (!isPlainObject(settings.hooks)) settings.hooks = {}
-  const target = settings.hooks as Record<string, unknown>
-  for (const event of missing) {
-    if (!Array.isArray(target[event])) target[event] = []
-    ;(target[event] as unknown[]).push(hookElement(EVENT_COMMANDS[event]!))
-  }
   writeFileAtomic(settingsPath, `${JSON.stringify(settings, null, detectIndent(text))}\n`)
   return "installed"
 }
 
+/** Which sibling an event's command must invoke — inject on the two prompt events, hook on the rest. */
+const kindFor = (event: string): "hook" | "inject" =>
+  event === "SessionStart" || event === "UserPromptSubmit" ? "inject" : "hook"
+
 /**
- * Doctor's read-only view: "installed" only when all six events carry the exact command; an
- * unreadable file is reported, never repaired. "incomplete" covers a missing hooks key and a
- * partial install alike — the fix is `mida install claude-code` either way.
+ * Doctor's read-only view: "installed" only when all six events carry the exact current
+ * command; "outdated" when every event is covered but at least one entry is an older form
+ * (the bare name) — `mida install claude-code` rewrites it in place. "incomplete" covers a
+ * missing hooks key and a partial install alike; an unreadable file is reported, never repaired.
  */
-export function claudeHooksStatus(settingsPath: string): "installed" | "incomplete" | "absent" | "unreadable" {
+export function claudeHooksStatus(settingsPath: string): "installed" | "outdated" | "incomplete" | "absent" | "unreadable" {
   try {
     const read = readSettings(settingsPath)
     if (read === "absent") return "absent"
     const hooks = (read.settings.hooks ?? {}) as Record<string, unknown>
-    const present = CLAUDE_EVENTS.filter((event) =>
-      ((hooks[event] ?? []) as unknown[]).some((element) => eventHasCommand(element, EVENT_COMMANDS[event]!)),
-    )
-    return present.length === CLAUDE_EVENTS.length ? "installed" : "incomplete"
+    const commands = eventCommands()
+    let stale = 0
+    for (const event of CLAUDE_EVENTS) {
+      let exact = false
+      let ours = false
+      for (const element of (hooks[event] ?? []) as unknown[]) {
+        if (eventHasCommand(element, commands[event]!)) exact = true
+        if (isPlainObject(element) && Array.isArray(element.hooks)) {
+          for (const hook of element.hooks as unknown[]) {
+            const parsed = isPlainObject(hook) ? parseMidaCommand(hook.command) : null
+            if (parsed !== null && parsed.tool === "claude-code" && parsed.kind === kindFor(event)) ours = true
+          }
+        }
+      }
+      if (!exact && !ours) return "incomplete"
+      if (!exact) stale += 1
+    }
+    return stale === 0 ? "installed" : "outdated"
   } catch {
     return "unreadable"
   }
 }
 
-const isMidaCommand = (command: unknown): boolean =>
-  command === HOOK_COMMAND["claude-code"] || command === INJECT_COMMAND["claude-code"]
+/**
+ * Every Mida command string the settings file carries — doctor stats the paths inside them.
+ * "absent" when there is no file, "unreadable" when it cannot be parsed.
+ */
+export function midaCommandsInClaudeSettings(settingsPath: string): string[] | "absent" | "unreadable" {
+  try {
+    const read = readSettings(settingsPath)
+    if (read === "absent") return "absent"
+    const hooks = (read.settings.hooks ?? {}) as Record<string, unknown>
+    const commands: string[] = []
+    for (const list of Object.values(hooks)) {
+      if (!Array.isArray(list)) continue
+      for (const element of list) {
+        if (!isPlainObject(element) || !Array.isArray(element.hooks)) continue
+        for (const hook of element.hooks as unknown[]) {
+          if (isPlainObject(hook) && parseMidaCommand(hook.command) !== null) commands.push(hook.command as string)
+        }
+      }
+    }
+    return commands
+  } catch {
+    return "unreadable"
+  }
+}
+
+/** Ours whatever form it takes — the bare name from an older install or an absolute path. */
+const isMidaCommand = (command: unknown): boolean => parseMidaCommand(command) !== null
 
 /**
  * What the pre-install backup says was there before the first change — the only record of which
@@ -243,6 +404,11 @@ export const CODEX_BLOCK_V1 = [
   CODEX_MARKER_CLOSE,
 ].join("\n")
 
+/**
+ * The block installs before the absolute-path change wrote — the same shape with the bare
+ * command names. Still recognised as ours so doctor can call it outdated and uninstall can
+ * remove it.
+ */
 export const CODEX_BLOCK = [
   CODEX_MARKER_OPEN,
   "[[hooks.SessionStart]]",
@@ -266,10 +432,43 @@ export const CODEX_BLOCK = [
   CODEX_MARKER_CLOSE,
 ].join("\n")
 
-/** Every managed-block shape this build recognises as its own — anything else between the markers is a human's edit. */
-const CODEX_KNOWN_BLOCKS: Readonly<Record<string, "current" | "v1">> = {
-  [CODEX_BLOCK]: "current",
-  [CODEX_BLOCK_V1]: "v1",
+/** The managed block a fresh `mida install codex` writes — the same shape, with absolute commands. */
+export function codexBlock(): string {
+  return [
+    CODEX_MARKER_OPEN,
+    "[[hooks.SessionStart]]",
+    'matcher = "startup|resume|clear|compact"',
+    "",
+    "[[hooks.SessionStart.hooks]]",
+    'type = "command"',
+    `command = "${injectCommand("codex")}"`,
+    "",
+    "[[hooks.UserPromptSubmit]]",
+    "",
+    "[[hooks.UserPromptSubmit.hooks]]",
+    'type = "command"',
+    `command = "${injectCommand("codex")}"`,
+    "",
+    "[[hooks.Stop]]",
+    "",
+    "[[hooks.Stop.hooks]]",
+    'type = "command"',
+    `command = "${hookCommand("codex")}"`,
+    CODEX_MARKER_CLOSE,
+  ].join("\n")
+}
+
+/**
+ * Every managed-block shape this build recognises as its own — anything else between the
+ * markers is a human's edit. Built per call because the current block carries the resolved
+ * absolute paths.
+ */
+function codexKnownBlocks(): Readonly<Record<string, "current" | "bare" | "v1">> {
+  return {
+    [codexBlock()]: "current",
+    [CODEX_BLOCK]: "bare",
+    [CODEX_BLOCK_V1]: "v1",
+  }
 }
 
 /**
@@ -281,7 +480,7 @@ export const CODEX_TRUST_SENTENCE =
   "Codex will ignore these hooks until you trust them: open codex, type /hooks, and trust the Mida entries."
 
 /** Finds a KNOWN managed block between its markers; "absent" when neither marker is present. */
-function locateCodexBlock(text: string): { start: number; end: number; version: "current" | "v1" } | "absent" {
+function locateCodexBlock(text: string): { start: number; end: number; version: "current" | "bare" | "v1" | "stale" } | "absent" {
   const hasOpen = text.includes(CODEX_MARKER_OPEN)
   const hasClose = text.includes(CODEX_MARKER_CLOSE)
   if (!hasOpen && !hasClose) return "absent"
@@ -289,10 +488,17 @@ function locateCodexBlock(text: string): { start: number; end: number; version: 
   const closeAt = text.indexOf(CODEX_MARKER_CLOSE)
   if (!hasOpen || !hasClose || closeAt < start) throw settingsUnreadable()
   const end = closeAt + CODEX_MARKER_CLOSE.length
-  const version = CODEX_KNOWN_BLOCKS[text.slice(start, end)]
-  // markers around anything that is not a known managed block mean a human touched it
-  if (version === undefined) throw settingsUnreadable()
-  return { start, end, version }
+  const version = codexKnownBlocks()[text.slice(start, end)]
+  if (version !== undefined) return { start, end, version }
+  // A block we do not byte-match can still be ours: an absolute-path block written from a
+  // different checkout (the repo moved, or an older build's dist). Every command line must
+  // parse as a Mida hook for that to be true — anything else between the markers is a
+  // human's edit and refuses.
+  const commands = [...text.slice(start, end).matchAll(/command = "([^"]*)"/g)].map((match) => match[1]!)
+  if (commands.length > 0 && commands.every((command) => parseMidaCommand(command) !== null)) {
+    return { start, end, version: "stale" }
+  }
+  throw settingsUnreadable()
 }
 
 /**
@@ -309,20 +515,21 @@ export function installCodex(configPath: string): InstallOutcome {
     if (block !== "absent") {
       if (block.version === "current") return "already-installed"
       // an older managed block is ours to replace in place — same outcome as a fresh append
-      writeFileAtomic(configPath, `${text.slice(0, block.start)}${CODEX_BLOCK}${text.slice(block.end)}`)
+      writeFileAtomic(configPath, `${text.slice(0, block.start)}${codexBlock()}${text.slice(block.end)}`)
       return "installed"
     }
   }
   const separator = text === null || text === "" ? "" : text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n"
   mkdirSync(dirname(configPath), { recursive: true })
-  writeFileAtomic(configPath, `${text ?? ""}${separator}${CODEX_BLOCK}\n`)
+  writeFileAtomic(configPath, `${text ?? ""}${separator}${codexBlock()}\n`)
   return "installed"
 }
 
 /**
  * Doctor's read-only view: "installed" only for the current managed block, "outdated" for an
- * older one install can still upgrade. "unreadable" means the markers wrap edited content —
- * `mida install codex` would refuse the file too.
+ * older one install can still upgrade — the bare-name block and the pre-UserPromptSubmit v1
+ * both land there. "unreadable" means the markers wrap edited content — `mida install codex`
+ * would refuse the file too.
  */
 export function codexHooksStatus(configPath: string): "installed" | "outdated" | "absent" | "unreadable" {
   try {
@@ -330,6 +537,27 @@ export function codexHooksStatus(configPath: string): "installed" | "outdated" |
     const block = locateCodexBlock(readFileSync(configPath, "utf8"))
     if (block === "absent") return "absent"
     return block.version === "current" ? "installed" : "outdated"
+  } catch {
+    return "unreadable"
+  }
+}
+
+/**
+ * Every command line inside the managed block — doctor stats the paths inside them. Absent
+ * or unreadable blocks surface as their own statuses first, so this is only called on a
+ * current block.
+ */
+export function midaCommandsInCodexConfig(configPath: string): string[] | "absent" | "unreadable" {
+  try {
+    if (!existsSync(configPath)) return "absent"
+    const text = readFileSync(configPath, "utf8")
+    const block = locateCodexBlock(text)
+    if (block === "absent") return "absent"
+    const commands: string[] = []
+    for (const match of text.slice(block.start, block.end).matchAll(/command = "([^"]*)"/g)) {
+      commands.push(match[1]!)
+    }
+    return commands
   } catch {
     return "unreadable"
   }

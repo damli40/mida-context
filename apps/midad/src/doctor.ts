@@ -1,7 +1,6 @@
 import { accessSync, constants, existsSync, mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { delimiter, join } from "node:path"
-import { fileURLToPath } from "node:url"
+import { isAbsolute, join } from "node:path"
 import { spawn } from "node:child_process"
 import { createPublicClient, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
@@ -16,14 +15,14 @@ import type { LocalAccount } from "viem"
 import { callDaemon } from "./control.js"
 import type { MidaHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
-import { CODEX_TRUST_SENTENCE, claudeHooksStatus, codexHooksStatus } from "./install.js"
+import { CODEX_TRUST_SENTENCE, claudeHooksStatus, codexHooksStatus, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, parseMidaCommand } from "./install.js"
 import type { InstallTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
 import { listJobs } from "./queue.js"
 import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, serviceUrlInEffect, sponsorReachable } from "./runtime.js"
-import { cliPackageName, isBundled } from "./sibling.js"
+import { cliPackageName, isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
 
 /** The whole run is capped — a check may stall, the report may not. */
 const RUN_CAP_MS = 20_000
@@ -175,24 +174,22 @@ function serviceUrls(home: MidaHome, env: NodeJS.ProcessEnv) {
   }
 }
 
-/** The repo's own `bin/` — the missing-hook-command fix for SOURCE-tree runs only (see hookCommandFix). */
-const BIN_DIR = fileURLToPath(new URL("../../../bin/", import.meta.url))
-/** The commands `mida install` writes into the tools' hook settings — bare text on purpose. */
-const HOOK_COMMANDS = ["mida-hook", "mida-inject"] as const
+/** The entries the hook checks resolve — the files install points the tools' settings at. */
+const HOOK_ENTRIES = ["mida-hook", "mida-inject"] as const
 
 /**
- * The fix for a hook command missing from PATH. Running from the npm package, the answer is the
- * global install — npm links the bins itself, and the package name comes from its own
- * package.json so nothing but publish/names.json hard-codes it. Running from the source tree
- * the launchers live in the repo's bin/. The two texts must never cross: a packaged user has no
- * repo to add to PATH, and a repo run has no package.
+ * The fix for a hook binary that is not where install would point. Running from the npm
+ * package, the answer is the global install — the package name comes from its own package.json
+ * so nothing but publish/names.json hard-codes it. Running from the source tree a missing
+ * entry means the repo itself is incomplete — nothing PATH can fix, because the hooks name
+ * the file absolutely now.
  */
 function hookCommandFix(): string {
   if (isBundled()) {
     const name = cliPackageName()
     return name === undefined ? "reinstall the mida CLI package globally" : `run \`npm i -g ${name}\``
   }
-  return `add ${BIN_DIR} to your PATH`
+  return "restore the repository — the apps/midad sources are incomplete"
 }
 
 /** The HOST of a service URL — the path or query could carry an operator's key, so only the host is ever printed. */
@@ -237,23 +234,39 @@ const ENV_VARS = [
   "VAULT_RP_ID",
 ] as const
 
+/** Is the file executable? The bundled hook bins are chmod 0755 at build time; anything less means a dead hook. */
+function isExecutable(file: string): boolean {
+  try {
+    accessSync(file, constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /**
- * Is `command` runnable on the PATH the doctor itself runs with? The PATH is walked directly —
- * spawning a shell to ask would answer for a DIFFERENT environment than the hooks get.
+ * What the hook commands a settings file carries resolve to — a PROBLEM line for each distinct
+ * failure: a path that is gone or a program that lost its executable bit. A bare name is not
+ * reported here — the "outdated" status line already names that fix. The path in the FILE is
+ * checked, never PATH — that is the contract the absolute-path install bought (R5-7).
  */
-function onPath(env: NodeJS.ProcessEnv, command: string): boolean {
-  const pathEnv = env.PATH
-  if (pathEnv === undefined || pathEnv === "") return false
-  for (const dir of pathEnv.split(delimiter)) {
-    if (dir === "") continue
-    try {
-      accessSync(join(dir, command), constants.X_OK)
-      return true
-    } catch {
-      // not here — keep walking
+function hookPathProblems(commands: string[] | "absent" | "unreadable", tool: InstallTool): string[] {
+  if (!Array.isArray(commands)) return []
+  const problems = new Set<string>()
+  const reinstall = `run \`mida install ${tool}\``
+  for (const command of commands) {
+    const parsed = parseMidaCommand(command)
+    if (parsed === null) continue
+    for (const target of parsed.paths) {
+      if (!isAbsolute(target.file)) continue
+      if (!existsSync(target.file)) {
+        problems.add(problem(`a ${tool} hook points at ${target.file}, which does not exist`, reinstall))
+      } else if (target.executable && !isExecutable(target.file)) {
+        problems.add(problem(`a ${tool} hook points at ${target.file}, which is not executable`, reinstall))
+      }
     }
   }
-  return false
+  return [...problems]
 }
 
 /** One line per check, in the order the spec fixes. Each returns its lines; it never decides. */
@@ -460,14 +473,20 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
     {
       name: "hook-commands",
       run: async () => {
-        // `install` writes the bare command name into the tools' settings (Codex fingerprints
-        // the text) — so nothing works unless that name resolves on the PATH the hooks get (R4-6).
-        const env = deps.env ?? process.env
-        return HOOK_COMMANDS.map((command) =>
-          onPath(env, command)
-            ? `ok: ${command} is on the PATH`
-            : problem(`the command \`${command}\` is not on your PATH, so the hooks cannot run`, hookCommandFix()),
-        )
+        // `install` writes the resolved absolute path into the tools' settings — the check is
+        // that every file that path names exists (and, bundled, stays executable). PATH is
+        // not consulted: the hooks stopped depending on it (R5-7).
+        return HOOK_ENTRIES.map((entry) => {
+          const missing = siblingEntryArgs(entry).filter((token) => isAbsolute(token) && !existsSync(token))
+          if (missing.length > 0) {
+            return problem(`the ${entry} binary is missing at ${missing[0]}`, hookCommandFix())
+          }
+          const file = siblingEntryPath(entry)
+          if (isBundled() && !isExecutable(file)) {
+            return problem(`the ${entry} binary at ${file} is not executable`, hookCommandFix())
+          }
+          return `ok: ${entry} resolves to ${file}`
+        })
       },
     },
     {
@@ -483,10 +502,17 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           lines.push(
             status === "installed"
               ? "ok: claude-code hooks installed"
-              : status === "unreadable"
-                ? problem("claude-code settings cannot be read safely", "fix the file, then run `mida install claude-code`")
-                : problem("claude-code hooks are not installed", "run `mida install claude-code`"),
+              : status === "outdated"
+                ? problem("claude-code hooks point at an older command — the bare name needs PATH", "run `mida install claude-code` to pin the absolute path")
+                : status === "unreadable"
+                  ? problem("claude-code settings cannot be read safely", "fix the file, then run `mida install claude-code`")
+                  : problem("claude-code hooks are not installed", "run `mida install claude-code`"),
           )
+          // "installed" only proves the text matches — the path inside it is what runs, so it
+          // is stat'ed too; an "outdated" file may be a moved checkout's paths, worth the same stat (R5-7)
+          if (status === "installed" || status === "outdated") {
+            lines.push(...hookPathProblems(midaCommandsInClaudeSettings(claudePath), "claude-code"))
+          }
         }
         const codexPath = deps.settings?.codex ?? env.MIDA_CODEX_CONFIG
         if (codexPath !== undefined) {
@@ -495,11 +521,14 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             status === "installed"
               ? "ok: codex hooks installed"
               : status === "outdated"
-                ? problem("codex's hook block is an older version — the whats-new hook is missing", "run `mida install codex`")
+                ? problem("codex's hook block is an older version", "run `mida install codex`")
                 : status === "unreadable"
                   ? problem("codex's hook block was edited", "remove the marked block, then run `mida install codex`")
                   : problem("codex hooks are not installed", "run `mida install codex`"),
           )
+          if (status === "installed" || status === "outdated") {
+            lines.push(...hookPathProblems(midaCommandsInCodexConfig(codexPath), "codex"))
+          }
           // any managed block means the config was written or changed — Codex fingerprints the
           // hook text and skips an untrusted hook SILENTLY, and doctor cannot read Codex's trust
           // state, so the reminder runs whenever the block is there (R5-6)

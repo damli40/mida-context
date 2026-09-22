@@ -43,6 +43,16 @@ export function siblingEntryArgs(name: SiblingEntry): string[] {
 }
 
 /**
+ * The file an entry runs from — `dist/<name>.js` bundled, the `.ts` source from the repo. This
+ * is the path `mida install` writes into hook settings (R5-7): a hook spawned by Claude Code or
+ * Codex gets a bare shell with no guarantee Mida's bin is on PATH, so the command must name the
+ * file absolutely. Doctor stats this same path rather than searching PATH.
+ */
+export function siblingEntryPath(name: SiblingEntry): string {
+  return fileURLToPath(new URL(isBundled() ? `./${name}.js` : `./${ENTRIES[name]}`, import.meta.url))
+}
+
+/**
  * The npm package's own name, read from the package.json one level above the bundled dist file —
  * doctor's PATH fix prints `npm i -g <name>` without hard-coding the name anywhere but
  * publish/names.json. Undefined when the file cannot be read (and in the source tree, where the
