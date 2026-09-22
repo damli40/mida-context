@@ -62,7 +62,14 @@ async function rpcServer(methods: Record<string, RpcHandler>): Promise<{ url: st
           res.end(JSON.stringify({ jsonrpc: "2.0", id, result }))
         } catch (error) {
           const code = typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : -32000
-          res.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code, message: error instanceof Error ? error.message : String(error) } }))
+          const data = (error as { data?: unknown }).data
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id,
+              error: { code, message: error instanceof Error ? error.message : String(error), ...(data === undefined ? {} : { data }) },
+            }),
+          )
         }
       })()
     })
@@ -87,7 +94,7 @@ interface SponsorScript {
   estimateGas?: unknown
   paymasterData?: unknown
   /** When set, both paymaster calls refuse — the sponsor will not pay for this operation. */
-  paymasterError?: { code: number; message: string }
+  paymasterError?: { code: number; message: string; data?: unknown }
   sendResult?: unknown
   sendError?: { code: number; message: string }
   sendHang?: boolean
@@ -163,8 +170,9 @@ async function start(script: SponsorScript, chain: { code: string; txCount: stri
   let byHashCalls = 0
   const refusal = () => {
     if (script.paymasterError === undefined) return undefined
-    const error = new Error(script.paymasterError.message) as Error & { code: number }
+    const error = new Error(script.paymasterError.message) as Error & { code: number; data?: unknown }
     error.code = script.paymasterError.code
+    error.data = script.paymasterError.data
     return error
   }
   const sponsor = await rpcServer({
@@ -507,6 +515,39 @@ describe("createSponsoredSender", () => {
       expect(qty("maxPriorityFeePerGas")).toBeLessThanOrEqual(300_000_000_000n)
       // and the call really is the three-scope grant — the sponsor's per-function policy reads this
       expect((op.callData as string).length).toBeGreaterThan(10)
+    } finally {
+      await env.close()
+    }
+  })
+
+  // M3-D3 item 5b: the Sep 22 refusal reached the owner as a multi-line dump that included the
+  // request body ("Request body: {\"method\":\"pm_getPaymasterData\", …}"). The reason the owner
+  // sees is ONE line: the provider's own message and, when it sent one, its `data` — the URL
+  // (which can embed a key) and the request body are stripped.
+
+  it("a refusal's reason is ONE line — the provider's message and data, never the request it echoed", async () => {
+    const env = await start(
+      {
+        paymasterError: {
+          code: -32602,
+          message: "Missing or invalid parameters.\nprovider note: second line",
+          data: { argument: "paymasterContext", detail: "field not accepted" },
+        },
+      },
+      { code: "0x", txCount: "0x0" },
+    )
+    try {
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
+      const error = await sender.send(call, "owner.key").then(() => null, (e: unknown) => e)
+      expect(error).toBeInstanceOf(SponsorDidNotPay)
+      const reason = (error as SponsorDidNotPay).reason
+      expect(reason).not.toContain("\n") // the whole reason is one line
+      expect(reason).toContain("Missing or invalid parameters.")
+      expect(reason).toContain("second line") // a multi-line provider message flattens, it is not dropped
+      expect(reason).toContain("paymasterContext") // the provider's data made it through
+      expect(reason).not.toContain("Request body")
+      expect(reason).not.toContain(env.sponsorUrl)
+      expect(reason).not.toContain("pm_getPaymaster") // the dumped request's own method name stays out
     } finally {
       await env.close()
     }

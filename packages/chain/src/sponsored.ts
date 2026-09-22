@@ -198,8 +198,7 @@ export function createSponsoredSender(input: {
         // twice. Everything else — refused, down, timeout, a shape the client could not parse —
         // becomes SponsorDidNotPay, the only error the seam falls back on.
         if (error instanceof MidaError) throw error
-        const message = error instanceof Error ? error.message : String(error)
-        throw new SponsorDidNotPay(message.length > 200 ? `${message.slice(0, 200)}…` : message)
+        throw new SponsorDidNotPay(sponsorReason(error))
       }
 
       // Phase 2 — the bundler answered with a hash, so the operation is ACCEPTED and can land at
@@ -273,6 +272,56 @@ async function operationGasLimit(
     else if (typeof value === "number") sum += BigInt(value)
   }
   return sum
+}
+
+const REASON_MAX = 200
+
+/**
+ * What a sponsor failure tells the owner — ONE line: the provider's own message and, when it
+ * sent one, its `data`. A viem request error keeps the provider's message under `details` while
+ * `message` appends `URL:` (which can embed the provider's key) and `Request body:` (the whole
+ * request the SDK sent) as meta lines — the Sep 22 refusal reached the owner as exactly that
+ * dump. Those lines are stripped, what is left is flattened to a single line, and the total is
+ * capped so a verbose provider cannot flood the progress output.
+ */
+function sponsorReason(error: unknown): string {
+  const parts: string[] = []
+  const seen = new Set<unknown>()
+  for (
+    let current: unknown = error;
+    current !== null && typeof current === "object" && !seen.has(current);
+    current = (current as { cause?: unknown }).cause
+  ) {
+    seen.add(current)
+    const record = current as Record<string, unknown>
+    const primary =
+      typeof record.details === "string" && record.details.length > 0
+        ? record.details
+        : typeof record.shortMessage === "string" && record.shortMessage.length > 0
+          ? record.shortMessage
+          : typeof record.message === "string"
+            ? record.message
+            : undefined
+    if (primary !== undefined && !parts.includes(primary)) parts.push(primary)
+    const data = record.data
+    if (data !== undefined && data !== null && data !== "") {
+      let text: string
+      try {
+        text = (typeof data === "string" ? data : JSON.stringify(data)) ?? String(data)
+      } catch {
+        text = String(data)
+      }
+      if (!parts.includes(text)) parts.push(text)
+    }
+  }
+  const raw = parts.length === 0 ? String(error) : parts.join(" — ")
+  const line = raw
+    .split("\n")
+    .filter((row) => !/^\s*(URL|Request body|Request Arguments|Docs|Version):/.test(row))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim()
+  return line.length > REASON_MAX ? `${line.slice(0, REASON_MAX)}…` : line
 }
 
 /** Races the sponsored attempt against its deadline; a timeout is a SponsorDidNotPay. */

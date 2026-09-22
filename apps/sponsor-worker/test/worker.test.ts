@@ -52,13 +52,13 @@ interface RecordedCall {
 async function startFakeProvider(): Promise<{
   url: string
   calls: RecordedCall[]
-  failNext(error: { code: number; message: string }): void
+  failNext(error: { code: number; message: string; data?: unknown }): void
   /** Answer with the error nested inside `result` — the provider resolves instead of throwing. */
-  failNextAsResult(error: { code: number; message: string }): void
+  failNextAsResult(error: { code: number; message: string; data?: unknown }): void
   close(): Promise<void>
 }> {
   const calls: RecordedCall[] = []
-  let failure: { code: number; message: string; insideResult?: boolean } | null = null
+  let failure: { code: number; message: string; data?: unknown; insideResult?: boolean } | null = null
   const server: Server = createServer((req, res) => {
     let raw = ""
     req.on("data", (chunk: Buffer) => (raw += chunk.toString()))
@@ -67,12 +67,13 @@ async function startFakeProvider(): Promise<{
       calls.push({ method, params })
       res.setHeader("content-type", "application/json")
       if (failure) {
-        const { code, message, insideResult } = failure
+        const { code, message, data, insideResult } = failure
         failure = null
+        const error = { code, message, ...(data === undefined ? {} : { data }) }
         return res.end(
           insideResult
-            ? JSON.stringify({ jsonrpc: "2.0", id, result: { error: { code, message } } })
-            : JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }),
+            ? JSON.stringify({ jsonrpc: "2.0", id, result: { error } })
+            : JSON.stringify({ jsonrpc: "2.0", id, error }),
         )
       }
       switch (method) {
@@ -145,6 +146,34 @@ async function bundleWorker(): Promise<string> {
   return readFileSync(outfile, "utf8")
 }
 
+/**
+ * Everything the Worker prints, parsed back into objects. workerd console output does NOT go
+ * through Miniflare's `log` option — it rides the runtime's stdout as {timestamp, level, message}
+ * lines, which `handleStructuredLogs` hands back here. The stream is asynchronous, so tests poll
+ * briefly for a record rather than expecting it the instant the response returns.
+ */
+const workerLog: { records: Record<string, unknown>[] } = { records: [] }
+
+function captureWorkerLog(entry: { timestamp: number; level: string; message: string }): void {
+  const brace = entry.message.indexOf("{")
+  if (brace === -1) return
+  try {
+    workerLog.records.push(JSON.parse(entry.message.slice(brace)) as Record<string, unknown>)
+  } catch {
+    // workerd's own noise is not JSON — only the Worker's JSON.stringify lines matter here.
+  }
+}
+
+/** Waits up to ~2 s for a matching log record — the stdout stream delivers it asynchronously. */
+async function findWorkerRecord(match: (record: Record<string, unknown>) => boolean): Promise<Record<string, unknown> | undefined> {
+  for (let waited = 0; waited < 2000; waited += 25) {
+    const record = workerLog.records.find(match)
+    if (record !== undefined) return record
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  return undefined
+}
+
 let mf: Miniflare
 let db: D1Like
 let provider: Awaited<ReturnType<typeof startFakeProvider>>
@@ -156,6 +185,7 @@ beforeAll(async () => {
   chain = await startFakeChain(delegatedCode)
   const script = await bundleWorker()
   mf = new Miniflare({
+    handleStructuredLogs: captureWorkerLog,
     modules: [{ type: "ESModule", path: "worker.mjs", contents: script }],
     compatibilityDate: "2026-08-06",
     compatibilityFlags: ["nodejs_compat"],
@@ -624,6 +654,67 @@ describe("provider failures never leak", () => {
     expect(reply.error?.message).not.toContain(PROVIDER_KEY_HINT)
     expect(reply.error?.message).not.toContain(chain.url)
     expect(reply.error?.message).toContain("[redacted]")
+  })
+
+  // M3-D3 item 5a: the Sep 22 `pm_getPaymasterData` refusal reached the owner as a request-body
+  // dump and the Worker's own logs held nothing that could explain it. Now the provider's full
+  // error object, the operation's gas fields, the sender prefix and the method land in the
+  // Worker logs — while the client answer stays exactly as scrubbed as before.
+  it("the provider's refusal is LOGGED with its full error and the op's gas fields — the client still gets only the scrubbed message", async () => {
+    const op = validUserOp()
+    provider.failNext({
+      code: -32602,
+      message: "Missing or invalid parameters.",
+      data: { argument: "paymasterContext", detail: "field not accepted" },
+    })
+    const reply = await signOp(op)
+    // Client side: the provider's `data` never leaves the Worker.
+    expect(reply.error?.code).toBe(-32602)
+    expect(reply.error?.message).toBe("Missing or invalid parameters.")
+    expect(JSON.stringify(reply.error)).not.toContain("paymasterContext")
+
+    // Worker side: the record that answers "what did the provider actually refuse?".
+    const record = await findWorkerRecord(
+      (r) =>
+        "providerError" in r &&
+        r.method === "pm_getPaymasterData" &&
+        r.sender === (op.sender as string).slice(0, 10),
+    )
+    expect(record).toBeDefined()
+    expect(record!.method).toBe("pm_getPaymasterData")
+    expect(record!.sender).toBe((op.sender as string).slice(0, 10))
+    expect(record!.providerError).toMatchObject({
+      code: -32602,
+      message: "Missing or invalid parameters.",
+      data: { argument: "paymasterContext", detail: "field not accepted" },
+    })
+    expect(record!.gas).toMatchObject({
+      callGasLimit: "0x30000",
+      verificationGasLimit: "0x40000",
+      preVerificationGas: "0x20000",
+      maxFeePerGas: "0x1000",
+      maxPriorityFeePerGas: "0x100",
+    })
+    // The log line passed through the same scrubber as the client answer — no secret reaches logs.
+    const raw = JSON.stringify(record)
+    expect(raw).not.toContain(POLICY_ID)
+    expect(raw).not.toContain(PROVIDER_KEY_HINT)
+  })
+
+  it("a provider error smuggled inside `result` is diagnosed the same way", async () => {
+    const op = validUserOp()
+    provider.failNextAsResult({ code: -32077, message: "paymaster refused upstream", data: { upstream: "429 too many requests" } })
+    const reply = await signOp(op)
+    expect(reply.error?.code).toBe(-32077)
+    const record = await findWorkerRecord(
+      (r) =>
+        "providerError" in r &&
+        r.method === "pm_getPaymasterData" &&
+        r.sender === (op.sender as string).slice(0, 10),
+    )
+    expect(record).toBeDefined()
+    expect(record!.providerError).toMatchObject({ code: -32077, message: "paymaster refused upstream", data: { upstream: "429 too many requests" } })
+    expect(record!.gas).toMatchObject({ callGasLimit: "0x30000" })
   })
 
   it("a provider that is unreachable produces a JSON-RPC error, not a crash", async () => {
