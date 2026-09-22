@@ -176,4 +176,29 @@ describe("M3-D4: `mida approve` clears a stale store deny", () => {
     await expect(revoke(stub, "codex5")).rejects.toMatchObject({ code: "SPONSOR_PENDING" })
     expect(home.readJson("agents/codex5/revoke-pending.json")).toMatchObject({ intentId, userOpHash: pending.userOpHash })
   })
+
+  it("a capability deny whose read fails is named, not silently skipped", async () => {
+    await init(runtime, ["codex6"])
+    await requestAccess(runtime, "codex6")
+    await approve(runtime, "codex6")
+    const capabilityId = loadGrants(home, "codex6")[0]!.capabilities[0]!.capabilityId
+    const { intentId } = await runtime.ownerApi.requestRevocationDeny({ capabilityId })
+
+    // An RPC hiccup on the capability read must not read as "not this agent": the deny stays
+    // standing AND the owner hears which block could not be checked.
+    const realGet = runtime.reader.getCapability
+    runtime.reader.getCapability = async () => {
+      throw new Error("connection reset")
+    }
+    try {
+      progressLines = []
+      await expect(approve(runtime, "codex6")).rejects.toMatchObject({ code: "already-approved" })
+    } finally {
+      runtime.reader.getCapability = realGet
+    }
+    const line = `could not check one store block (capability ${capabilityId}): connection reset — run \`mida approve codex6\` again`
+    expect(progressLines).toContain(line)
+    expect(progressLines).not.toContain(CLEARED)
+    expect((await runtime.ownerApi.listRevocations("active")).map((intent) => intent.intentId)).toContain(intentId)
+  })
 })

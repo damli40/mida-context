@@ -703,10 +703,26 @@ async function clearStaleStoreDenies(runtime: Runtime, agentId: Hex, name: strin
   let cleared = 0
   let pendingPrinted = false
   for (const intent of intents) {
-    const forAgent =
-      intent.target.kind === "agent"
-        ? intent.target.agentId.toLowerCase() === agentId.toLowerCase()
-        : (await runtime.reader.getCapability(intent.target.capabilityId))?.agentId.toLowerCase() === agentId.toLowerCase()
+    let forAgent: boolean
+    if (intent.target.kind === "agent") {
+      forAgent = intent.target.agentId.toLowerCase() === agentId.toLowerCase()
+    } else {
+      // A capability deny whose owner cannot be resolved — RPC hiccup or a record the chain no
+      // longer returns — must not read as "not this agent": the deny stays AND the owner hears
+      // which block could not be checked, instead of a silent skip that ends in CAPABILITY_DENIED.
+      let capabilityAgent: string | null
+      try {
+        capabilityAgent = (await runtime.reader.getCapability(intent.target.capabilityId))?.agentId ?? null
+      } catch (error) {
+        runtime.progress?.(`could not check one store block (capability ${intent.target.capabilityId}): ${wrapFailureReason(error)} — run \`mida approve ${name}\` again`)
+        continue
+      }
+      if (capabilityAgent === null) {
+        runtime.progress?.(`could not check one store block (capability ${intent.target.capabilityId}): the chain returned no record for it — run \`mida approve ${name}\` again`)
+        continue
+      }
+      forAgent = capabilityAgent.toLowerCase() === agentId.toLowerCase()
+    }
     if (!forAgent) continue
     if (stillLanding) {
       if (!pendingPrinted) {
