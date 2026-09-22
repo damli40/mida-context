@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
 /**
- * The five shipped entry points: the bin name the npm package exposes → the TypeScript source
+ * The six shipped entry points: the bin name the npm package exposes → the TypeScript source
  * file in this folder that builds it. One table is the whole mapping; a spawn site never names
  * a path itself.
  */
@@ -12,6 +12,7 @@ const ENTRIES = {
   "mida-drain": "drain-main.ts",
   "mida-hook": "hook-main.ts",
   "mida-inject": "inject-main.ts",
+  "mida-mcp": "mcp-main.ts",
 } as const
 
 export type SiblingEntry = keyof typeof ENTRIES

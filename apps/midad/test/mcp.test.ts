@@ -22,7 +22,7 @@ const projectDir = () => mkdtempSync(join(tmpdir(), "mida-mcp-project-"))
  * and a record of what the adapter sent. A route value is the JSON body to answer, a function of
  * the parsed request body, or `{ silent: true }` for a daemon that accepts but never answers.
  */
-type Route = unknown | ((body: Record<string, unknown> | undefined) => unknown) | { silent: true }
+type Route = Record<string, unknown> | { silent: true } | ((body: Record<string, unknown> | undefined) => unknown)
 
 const fakeDaemon = (dir: MidaHome, routes: Record<string, Route>) =>
   new Promise<{ requests: { path: string; body: Record<string, unknown> | undefined }[]; stop(): Promise<void> }>((res, rej) => {

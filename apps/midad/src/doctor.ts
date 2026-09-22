@@ -174,8 +174,12 @@ function serviceUrls(home: MidaHome, env: NodeJS.ProcessEnv) {
   }
 }
 
-/** The entries the hook checks resolve — the files install points the tools' settings at. */
-const HOOK_ENTRIES = ["mida-hook", "mida-inject"] as const
+/**
+ * The entries this check resolves — the hooks install points the tools' settings at, plus the
+ * MCP adapter, which no settings file carries: an MCP client launches it by absolute path from
+ * its own config, so the same "the file the path names exists" check applies.
+ */
+const RESOLVED_ENTRIES = ["mida-hook", "mida-inject", "mida-mcp"] as const
 
 /**
  * The fix for a hook binary that is not where install would point. Running from the npm
@@ -476,7 +480,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         // `install` writes the resolved absolute path into the tools' settings — the check is
         // that every file that path names exists (and, bundled, stays executable). PATH is
         // not consulted: the hooks stopped depending on it (R5-7).
-        return HOOK_ENTRIES.map((entry) => {
+        return RESOLVED_ENTRIES.map((entry) => {
           const missing = siblingEntryArgs(entry).filter((token) => isAbsolute(token) && !existsSync(token))
           if (missing.length > 0) {
             return problem(`the ${entry} binary is missing at ${missing[0]}`, hookCommandFix())

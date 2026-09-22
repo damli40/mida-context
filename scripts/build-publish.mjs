@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // pnpm build:publish — builds the two installable packages under publish/:
 //
-//   publish/cli/dist/{mida,midad,mida-drain,mida-hook,mida-inject}.js — one bundled ESM file
+//   publish/cli/dist/{mida,midad,mida-drain,mida-hook,mida-inject,mida-mcp}.js — one bundled ESM file
 //     per entry point with a node shebang; every @mida/* workspace package is bundled in, every
 //     third-party package stays external and lands in the generated package.json at the exact
 //     version the workspace itself uses. kimi-model.mjs ships as-is beside the bundles.
@@ -28,6 +28,7 @@ const CLI_ENTRIES = {
   "mida-drain": "apps/midad/src/drain-main.ts",
   "mida-hook": "apps/midad/src/hook-main.ts",
   "mida-inject": "apps/midad/src/inject-main.ts",
+  "mida-mcp": "apps/midad/src/mcp-main.ts",
 }
 
 /** Every workspace package, keyed by name, discovered from its own package.json. */

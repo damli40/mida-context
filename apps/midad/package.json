@@ -9,10 +9,12 @@
   "bin": {
     "midad": "./src/daemon-main.ts",
     "mida-hook": "./src/hook-main.ts",
-    "mida-inject": "./src/inject-main.ts"
+    "mida-inject": "./src/inject-main.ts",
+    "mida-mcp": "./src/mcp-main.ts"
   },
   "dependencies": {
     "@hono/node-server": "1.19.17",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "@mida/api": "workspace:*",
     "@mida/chain": "workspace:*",
     "@mida/checkpoint": "workspace:*",

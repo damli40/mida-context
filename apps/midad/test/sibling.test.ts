@@ -27,5 +27,6 @@ describe("siblingEntryArgs in source mode", () => {
     expect(siblingEntryArgs("mida-drain")[2]).toMatch(/drain-main\.ts$/)
     expect(siblingEntryArgs("mida-hook")[2]).toMatch(/hook-main\.ts$/)
     expect(siblingEntryArgs("mida-inject")[2]).toMatch(/inject-main\.ts$/)
+    expect(siblingEntryArgs("mida-mcp")[2]).toMatch(/mcp-main\.ts$/)
   })
 })

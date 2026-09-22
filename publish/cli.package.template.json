@@ -9,7 +9,8 @@
     "midad": "dist/midad.js",
     "mida-drain": "dist/mida-drain.js",
     "mida-hook": "dist/mida-hook.js",
-    "mida-inject": "dist/mida-inject.js"
+    "mida-inject": "dist/mida-inject.js",
+    "mida-mcp": "dist/mida-mcp.js"
   },
   "exports": {},
   "files": [
