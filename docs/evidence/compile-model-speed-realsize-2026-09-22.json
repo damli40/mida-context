@@ -1,0 +1,154 @@
+{
+  "date": "2026-09-22",
+  "what": "Same 15 must-keep checks as the Sep 21/22 files, on a REALISTIC-SIZE synthetic transcript: 110 lines, 77,843 bytes, mostly tool output (file reads, tsc diagnostics, test-runner output) around the same conversation. 3 runs per model, 22 s apart.",
+  "why": "The live run on Sep 22 showed 30.9 s and 12.7 s compiles on deepseek-flash against the 7.9 s median measured on a 10 KB transcript; the earlier files understate real sessions.",
+  "limits": [
+    "synthetic, one transcript, 3 runs per model, one scorer",
+    "'invalid' = the model's output failed the checkpoint schema; the daemon would walk to the next provider in the chain",
+    "Haiku is called through the claude program (start-up included)"
+  ],
+  "summary": {
+    "claude-haiku": {
+      "runsOk": 3,
+      "runs": 3,
+      "medianWallMsOfOk": 25020,
+      "kept": [
+        "15/15",
+        "15/15",
+        "15/15"
+      ],
+      "failures": [],
+      "leaked": false
+    },
+    "deepseek-flash": {
+      "runsOk": 2,
+      "runs": 3,
+      "medianWallMsOfOk": 11054.5,
+      "kept": [
+        "15/15",
+        "15/15"
+      ],
+      "failures": [
+        "invalid"
+      ],
+      "leaked": false
+    },
+    "kimi-k2.7-code-highspeed": {
+      "runsOk": 3,
+      "runs": 3,
+      "medianWallMsOfOk": 12401,
+      "kept": [
+        "15/15",
+        "15/15",
+        "15/15"
+      ],
+      "failures": [],
+      "leaked": false
+    }
+  },
+  "rows": [
+    {
+      "model": "deepseek-flash",
+      "run": 1,
+      "ok": true,
+      "wallMs": 9939,
+      "modelMs": 9924,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 5385
+    },
+    {
+      "model": "deepseek-flash",
+      "run": 2,
+      "ok": true,
+      "wallMs": 12170,
+      "modelMs": 12160,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 6221
+    },
+    {
+      "model": "deepseek-flash",
+      "run": 3,
+      "ok": false,
+      "reason": "invalid",
+      "wallMs": 14396
+    },
+    {
+      "model": "kimi-k2.7-code-highspeed",
+      "run": 1,
+      "ok": true,
+      "wallMs": 12401,
+      "modelMs": 12395,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3303
+    },
+    {
+      "model": "kimi-k2.7-code-highspeed",
+      "run": 2,
+      "ok": true,
+      "wallMs": 14142,
+      "modelMs": 14135,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3399
+    },
+    {
+      "model": "kimi-k2.7-code-highspeed",
+      "run": 3,
+      "ok": true,
+      "wallMs": 10960,
+      "modelMs": 10952,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3154
+    },
+    {
+      "model": "claude-haiku",
+      "run": 1,
+      "ok": true,
+      "wallMs": 25020,
+      "modelMs": 25012,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3398
+    },
+    {
+      "model": "claude-haiku",
+      "run": 2,
+      "ok": true,
+      "wallMs": 21383,
+      "modelMs": 21375,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3279
+    },
+    {
+      "model": "claude-haiku",
+      "run": 3,
+      "ok": true,
+      "wallMs": 30287,
+      "modelMs": 30279,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 3340
+    }
+  ]
+}
