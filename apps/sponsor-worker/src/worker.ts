@@ -25,6 +25,13 @@ import type { SponsorProvider } from "./provider.js"
 export interface SponsorEnv {
   /** D1 binding for the daily budget counters. */
   DB: D1Like
+  /**
+   * Browser origins allowed to call this endpoint (comma-separated). The CLI is not a browser and
+   * sends no Origin; the owner page at app.midacontext.xyz is, and Safari reports a blocked
+   * cross-origin fetch as "Load failed" (seen live Sep 22). Default: the owner page only — this
+   * endpoint spends money, so it is never `*`.
+   */
+  ALLOWED_ORIGINS?: string
   /** Provider selection: "pimlico" (default) or "alchemy"; PROVIDER_URL overrides both. */
   PROVIDER?: string
   /** Full provider JSON-RPC URL including any embedded key — a secret. Overrides PROVIDER. */
@@ -441,24 +448,56 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
   }
 }
 
-export default {
-  async fetch(request: Request, env: SponsorEnv): Promise<Response> {
-    const url = new URL(request.url)
-    if (request.method === "GET" && url.pathname === "/") {
-      try {
-        return infoResponse(buildWorker(env))
-      } catch {
-        return Response.json({ error: "the sponsor endpoint is not configured" }, { status: 500 })
-      }
-    }
-    if (request.method !== "POST" || url.pathname !== "/") {
-      return Response.json({ error: "not found" }, { status: 404 })
-    }
+export const DEFAULT_ALLOWED_ORIGINS = ["https://app.midacontext.xyz"]
+
+/** The browser origins this endpoint answers; anything else gets no CORS headers, so the browser refuses it. */
+export function allowedOrigins(env: Pick<SponsorEnv, "ALLOWED_ORIGINS">): string[] {
+  const raw = env.ALLOWED_ORIGINS
+  if (raw === undefined || raw.trim() === "") return DEFAULT_ALLOWED_ORIGINS
+  return raw
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => /^https:\/\/[a-z0-9.-]+(:[0-9]+)?$/i.test(origin) || /^http:\/\/(127\.0\.0\.1|localhost)(:[0-9]+)?$/i.test(origin))
+}
+
+/** Adds the CORS headers for an allowed origin; a request from any other origin is answered without them. */
+export function withCors(response: Response, request: Request, env: Pick<SponsorEnv, "ALLOWED_ORIGINS">): Response {
+  const origin = request.headers.get("origin")
+  if (origin === null || !allowedOrigins(env).includes(origin)) return response
+  const headers = new Headers(response.headers)
+  headers.set("access-control-allow-origin", origin)
+  headers.set("access-control-allow-methods", "GET, POST, OPTIONS")
+  headers.set("access-control-allow-headers", "content-type")
+  headers.set("access-control-max-age", "86400")
+  headers.set("vary", "origin")
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+}
+
+export async function handleFetch(request: Request, env: SponsorEnv): Promise<Response> {
+  const url = new URL(request.url)
+  if (request.method === "OPTIONS" && url.pathname === "/") {
+    // The browser's preflight: an allowed origin gets an empty 204 with the CORS headers; any
+    // other origin gets the same 204 without them, which the browser treats as a refusal.
+    return withCors(new Response(null, { status: 204 }), request, env)
+  }
+  if (request.method === "GET" && url.pathname === "/") {
     try {
-      const config = buildWorker(env)
-      return await handleJsonRpc(env, config, request)
+      return withCors(infoResponse(buildWorker(env)), request, env)
     } catch {
-      return Response.json({ error: "the sponsor endpoint is not configured" }, { status: 500 })
+      return withCors(Response.json({ error: "the sponsor endpoint is not configured" }, { status: 500 }), request, env)
     }
-  },
+  }
+  if (request.method !== "POST" || url.pathname !== "/") {
+    return Response.json({ error: "not found" }, { status: 404 })
+  }
+  try {
+    const config = buildWorker(env)
+    return withCors(await handleJsonRpc(env, config, request), request, env)
+  } catch {
+    return withCors(Response.json({ error: "the sponsor endpoint is not configured" }, { status: 500 }), request, env)
+  }
+}
+
+export default {
+  fetch: handleFetch,
 }

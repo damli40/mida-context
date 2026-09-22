@@ -20,7 +20,7 @@ import { Miniflare } from "miniflare"
 import type { Hex } from "viem"
 import type { D1Like } from "../src/budget.js"
 import { operationIdentity } from "../src/policy.js"
-import { resolveGasCeilings } from "../src/worker.js"
+import { DEFAULT_ALLOWED_ORIGINS, allowedOrigins, resolveGasCeilings, withCors } from "../src/worker.js"
 import {
   CAP,
   CHAIN_ID,
@@ -766,5 +766,34 @@ describe("the fixed gas ceilings are env-overridable downward only", () => {
     expect(ceilings.verificationGas).toBe(500_000n)
     expect(ceilings.preVerificationGas).toBe(1_200_000n)
     expect(lines).toHaveLength(2)
+  })
+})
+
+describe("browser origins (CORS) — the owner page is a browser, the CLI is not", () => {
+  const req = (origin?: string, method = "POST") =>
+    new Request("https://sponsor.example/", { method, headers: origin === undefined ? {} : { origin } })
+
+  it("defaults to the owner page origin only, and parses an explicit list", () => {
+    expect(allowedOrigins({})).toEqual(DEFAULT_ALLOWED_ORIGINS)
+    expect(allowedOrigins({ ALLOWED_ORIGINS: " https://app.midacontext.xyz , http://127.0.0.1:8787 " })).toEqual([
+      "https://app.midacontext.xyz",
+      "http://127.0.0.1:8787",
+    ])
+    // an http:// non-loopback origin or junk is dropped, never allowed
+    expect(allowedOrigins({ ALLOWED_ORIGINS: "http://evil.example,not a url" })).toEqual([])
+  })
+
+  it("an allowed origin gets the CORS headers echoing that origin; others and the CLI get none", async () => {
+    const ok = withCors(Response.json({ ok: true }), req("https://app.midacontext.xyz"), {})
+    expect(ok.headers.get("access-control-allow-origin")).toBe("https://app.midacontext.xyz")
+    expect(ok.headers.get("access-control-allow-methods")).toContain("POST")
+    expect(ok.headers.get("vary")).toBe("origin")
+    expect(await ok.json()).toEqual({ ok: true })
+
+    const other = withCors(Response.json({ ok: true }), req("https://evil.example"), {})
+    expect(other.headers.get("access-control-allow-origin")).toBeNull()
+
+    const cli = withCors(Response.json({ ok: true }), req(undefined), {})
+    expect(cli.headers.get("access-control-allow-origin")).toBeNull()
   })
 })
