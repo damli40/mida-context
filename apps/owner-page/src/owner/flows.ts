@@ -420,17 +420,44 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
   }
 }
 
+export interface SignedProjectRow {
+  agent: string
+  projectId: string
+  root: string
+  approvedAt: string
+}
+
+export interface NewProjectRow {
+  agent: string
+  projectId: string
+  root: string
+}
+
+/**
+ * Every row the approve signature will cover: the link's existing entries minus any row the new
+ * entry replaces, plus the new row itself. The approve page renders exactly this set above the
+ * button — a crafted link cannot get a row signed that the owner never saw — so the signer and
+ * the screen share this one derivation.
+ */
+export function signableProjectRows(req: LinkRequest): { existing: SignedProjectRow[]; added: NewProjectRow } | null {
+  if (req.entry === undefined) return null
+  const existing = (req.entries ?? []) as unknown as SignedProjectRow[]
+  return {
+    existing: existing.filter(
+      (e) => !(e.agent === req.entry!.agent && e.projectId === req.entry!.projectId && e.root === req.entry!.root),
+    ),
+    added: req.entry,
+  }
+}
+
 /** The project-list signature: byte-identical canonical form to apps/midad projects.ts. */
 async function signProjectEntry(
   account: LocalAccount,
   req: LinkRequest,
 ): Promise<{ entries: Record<string, unknown>[]; signature: Hex } | undefined> {
-  if (req.entry === undefined) return undefined
-  const existing = (req.entries ?? []) as { agent: string; projectId: string; root: string; approvedAt: string }[]
-  const kept = existing.filter(
-    (e) => !(e.agent === req.entry!.agent && e.projectId === req.entry!.projectId && e.root === req.entry!.root),
-  )
-  const next = [...kept, { ...req.entry, approvedAt: new Date().toISOString() }]
+  const rows = signableProjectRows(req)
+  if (rows === null) return undefined
+  const next = [...rows.existing, { ...rows.added, approvedAt: new Date().toISOString() }]
   const signature = await account.signMessage({ message: canonicalEntries(next) })
   return { entries: next as unknown as Record<string, unknown>[], signature }
 }

@@ -1,5 +1,5 @@
-import { el, parsePageLink, assertRpGate, makeEnv, progressLine, showError, finish, scopeInWords } from "./page.js"
-import { prepareApprove, confirmApprove } from "./flows.js"
+import { el, parsePageLink, assertRpGate, makeEnv, progressLine, showEntriesToSign, showError, finish, scopeInWords } from "./page.js"
+import { prepareApprove, confirmApprove, signableProjectRows } from "./flows.js"
 import { describeError } from "./session.js"
 import { shortAddress } from "./secrets.js"
 
@@ -36,6 +36,16 @@ async function main(): Promise<void> {
     lines.push(`Advisor: ${prep.advice.risk} risk.`, ...prep.advice.warnings.map((w) => `Warning: ${w}`))
     if (prep.alreadyGranted) lines.push("This agent already holds everything it asked for.")
     summary.textContent = lines.join("\n")
+    // Above the button: every project row the signature will cover — the new row named by its
+    // label, plus the count (and the expandable list) of existing rows being re-signed.
+    const rows = signableProjectRows(link.req)
+    if (rows !== null) {
+      showEntriesToSign(el("sign-list"), {
+        added: rows.added,
+        existing: rows.existing,
+        ...(link.req.project !== undefined ? { projectLabel: link.req.project.label } : {}),
+      })
+    }
     if (prep.alreadyGranted) return
     button.disabled = false
     button.addEventListener("click", () => {

@@ -63,6 +63,43 @@ export function assertRpGate(): void {
   }
 }
 
+/**
+ * The rows the approve signature will cover, rendered above the button. The new row shows the
+ * project's label plus a prefix of its id; the existing rows the signature re-covers sit under a
+ * <details> fold that names the count. A crafted link can still ASK for extra rows, but it can no
+ * longer hide them — the DOM lists every row before the passkey is ever asked.
+ */
+export function showEntriesToSign(
+  mount: HTMLElement,
+  view: {
+    added: { agent: string; projectId: string; root: string }
+    existing: readonly { agent: string; projectId: string; root: string; approvedAt: string }[]
+    projectLabel?: string
+  },
+): void {
+  const short = (value: string) => (value.length > 10 ? `${value.slice(0, 10)}…` : value)
+  mount.replaceChildren()
+  const lead = document.createElement("p")
+  lead.textContent = "Approving also signs your approved-projects list. The new row:"
+  mount.appendChild(lead)
+  const added = document.createElement("p")
+  added.className = "sign-row"
+  added.textContent = `“${view.projectLabel ?? view.added.projectId}” — id ${short(view.added.projectId)}`
+  mount.appendChild(added)
+  const details = document.createElement("details")
+  const fold = document.createElement("summary")
+  fold.textContent = `…plus ${view.existing.length} existing row${view.existing.length === 1 ? "" : "s"} your signature re-covers`
+  details.appendChild(fold)
+  const list = document.createElement("ul")
+  for (const row of view.existing) {
+    const li = document.createElement("li")
+    li.textContent = `${row.projectId} — agent ${short(row.agent)} — root ${short(row.root)}`
+    list.appendChild(li)
+  }
+  details.appendChild(list)
+  mount.appendChild(details)
+}
+
 /** The real environment: navigator.credentials, the chain RPC, the sponsor, the hosted store. */
 export function makeEnv(): FlowEnvironment {
   const publicClient = createPublicClient({ chain: chainFor(DEPLOYMENT.chainId), transport: http(RPC_URL) })
