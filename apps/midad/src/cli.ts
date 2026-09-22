@@ -15,11 +15,15 @@ import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeCode, uninstallCodex } from "./install.js"
 import type { InstallTool } from "./install.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
-import { Runtime, NAMESPACE } from "./runtime.js"
-import type { Network, ServiceRuntime } from "./runtime.js"
+import { Runtime, NAMESPACE, ServiceRuntime } from "./runtime.js"
+import type { Network } from "./runtime.js"
 import { siblingEntryArgs } from "./sibling.js"
 import { testnetNetwork } from "./testnet.js"
 import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
+import { loadOwnerMode } from "./keys.js"
+import type { OwnerMode } from "./keys.js"
+import { OwnerLinkOutcome, approvePasskey, initPasskey, revokePasskey } from "./owner-link/flows.js"
+import type { PasskeyDeps } from "./owner-link/flows.js"
 
 /** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. */
 const AGENTS = ["claude-code", "codex", "assistant"]
@@ -95,6 +99,12 @@ export interface CliDeps {
    */
   stdinIsTTY?: boolean
   stdoutIsTTY?: boolean
+  /**
+   * The passkey-owner seams (M3-F2): listener, page opener, chain key read and agent
+   * provisioning, injectable so tests drive a fake page end to end. `print` and `progress`
+   * come from this deps object; everything else defaults to the real thing.
+   */
+  ownerLink?: Omit<PasskeyDeps, "print" | "progress">
 }
 
 /**
@@ -342,6 +352,16 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     case "agent-unidentified":
     case "agent-not-setup":
       return `${agent} is not set up on this machine — run \`mida init\` first`
+    // A passkey home whose owner-address.json is missing: init never finished, and only
+    // `mida init --passkey` resumes it — there is no software path to fall back to.
+    case "no-owner-address":
+      return "this passkey home has no owner yet — run `mida init --passkey`"
+    // The page never came back: a refusal, not a failure — nothing was signed and re-running
+    // the command starts a fresh round with a fresh nonce.
+    case "OWNER_LINK_TIMEOUT":
+      return "the approval page did not come back within 10 minutes — run the command again to try once more"
+    case "OWNER_LINK_CLOSED":
+      return "the local return listener stopped before the page answered — run the command again"
     // The message IS the answer: we built it from the balance, the cost and the shortfall. A
     // MidaError prefixes its own message with "<code>: " — the owner reads the sentence, not
     // the code, so that prefix is stripped here.
@@ -419,9 +439,101 @@ function terminalPrompt(question: string): Promise<string> {
 }
 
 /**
- * One `mida` command end to end: opens the owner runtime in-process (it is the only runtime that
- * can sign as the owner), runs the command, closes. Owner commands run their own dispatch; the
- * agent-facing ones share the socket path's.
+ * The owner commands on a passkey home (M3-F2): `init --passkey`, `approve`, `revoke` — and
+ * `remember`, which has no passkey path yet. None of them may open Runtime: that call creates
+ * owner secrets, and a passkey home is defined by their absence. Every signature goes to the
+ * page; what comes back is verified against the chain before a single file changes.
+ */
+async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: OwnerMode | undefined): Promise<number> {
+  const command = argv[0]!
+  const linkDeps: PasskeyDeps = {
+    print: deps.print,
+    ...(deps.progress !== undefined ? { progress: deps.progress } : {}),
+    ...(deps.ownerLink ?? {}),
+  }
+  try {
+    if (command === "init") {
+      if (argv[1] !== "--passkey") {
+        deps.print("this home already has a passkey owner; a software owner needs a fresh MIDA_HOME")
+        return 2
+      }
+      if (mode === "software") {
+        deps.print("this home already has a software owner key; a passkey owner needs a fresh MIDA_HOME")
+        return 2
+      }
+      const result = await initPasskey(deps.home, deps.network, AGENTS, linkDeps)
+      deps.print(`owner ${result.owner}`)
+      for (const [name, agentId] of Object.entries(result.agents)) deps.print(`agent ${name} ${agentId}`)
+      return 0
+    }
+    if (command === "remember") {
+      deps.print("remember is not available with a passkey owner yet")
+      return 2
+    }
+    const agent = argv[1] ?? ""
+    if (!AGENTS.includes(agent)) {
+      deps.print(USAGE)
+      return 2
+    }
+    const session = await ServiceRuntime.openOwnerSession(deps.home, deps.network)
+    try {
+      session.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
+      if (command === "approve") {
+        const result = await approvePasskey(session, agent, deps.cwd, linkDeps)
+        if (result.listOnly) {
+          deps.print(
+            result.projectAlreadyListed === true
+              ? `${agent} is already approved on chain. This folder was already approved for ${agent}.`
+              : `${agent} is already approved on chain. This folder is now approved for ${agent} too (no transaction).`,
+          )
+        } else {
+          deps.print(
+            `approved ${agent} via your passkey — tx ${result.transactionHashes.join(" ")}` +
+              (result.projectId !== undefined ? ` project ${result.projectId}` : ""),
+          )
+        }
+        if (result.droppedRows !== undefined && result.droppedRows !== 0) {
+          deps.print(
+            result.droppedRows === null
+              ? "the old approved-projects list was invalid; the old list was discarded"
+              : `the old approved-projects list was invalid; ${result.droppedRows} row(s) were dropped`,
+          )
+        }
+      } else {
+        const result = await revokePasskey(session, agent, linkDeps)
+        deps.print(
+          result.nothingToRevoke || result.transactionHashes.length === 0
+            ? "nothing to revoke"
+            : `revoked ${agent} on chain — tx ${result.transactionHashes.join(" ")}`,
+        )
+        for (const name of result.rewrapped) deps.print(`new read key sent to ${name}`)
+      }
+      return 0
+    } finally {
+      await session.close()
+    }
+  } catch (error) {
+    // A page outcome — decline reason, wrong-owner line, mismatch line — is already the exact
+    // line the owner should read; coded errors go through the same mapper as software mode.
+    if (error instanceof OwnerLinkOutcome) {
+      deps.print(error.line)
+      return error.exitCode
+    }
+    deps.print(ownerRefusalLine(command, argv[1] ?? "", error))
+    if (process.env.MIDA_DEBUG === "1") {
+      const e = error as { name?: unknown; shortMessage?: unknown; message?: unknown; details?: unknown }
+      const text = [e.name, e.shortMessage ?? e.message, e.details].filter((part) => typeof part === "string").join(" | ")
+      deps.print(`debug: ${text.split("\n").slice(0, 6).join(" / ").replace(/[0-9a-fA-F]{40,}/g, "<hex>").slice(0, 900)}`)
+    }
+    return 1
+  }
+}
+
+/**
+ * One `mida` command end to end: on a software home it opens the owner runtime in-process (the
+ * only runtime that can sign as the owner); on a passkey home the owner commands go to the page
+ * instead and the agent-facing ones run on a secret-less session. `owner/mode.json` decides —
+ * an old home with secrets and no marker is software, exactly as before.
  */
 export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   if (!validCliArgv(argv)) {
@@ -429,17 +541,49 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     return 2
   }
   const command = argv[0]!
+  // `init` takes one optional word, and only this one.
+  if (command === "init" && (argv.length > 2 || (argv.length === 2 && argv[1] !== "--passkey"))) {
+    deps.print(USAGE)
+    return 2
+  }
   // approve, revoke and remember change who has access or write owner facts, so they ask for a
   // real terminal — stdin and stdout both TTY — before the owner key is even loaded. This is a
-  // speed bump, not a wall: until the passkey work (M3) the owner key is still a file on disk,
-  // and a determined program running as the user can read it or fake a terminal. The check is
-  // here to stop a confused caller from changing authority by accident, not to stop one acting
-  // on purpose.
+  // speed bump, not a wall: on a software home the owner key is a file on disk, and a
+  // determined program running as the user can read it or fake a terminal. The check is here to
+  // stop a confused caller from changing authority by accident, not to stop one acting on
+  // purpose. A passkey home keeps the same check — the page ceremony it leads to is stronger,
+  // not weaker.
   const stdinTTY = deps.stdinIsTTY ?? process.stdin.isTTY === true
   const stdoutTTY = deps.stdoutIsTTY ?? process.stdout.isTTY === true
   if (TERMINAL_COMMANDS.includes(command) && !(stdinTTY && stdoutTTY)) {
     deps.print(NEEDS_TERMINAL_LINE)
     return 2
+  }
+  const mode = loadOwnerMode(deps.home)
+  const passkeyInit = command === "init" && argv[1] === "--passkey"
+  if (OWNER_COMMANDS.includes(command) && (mode === "passkey" || passkeyInit)) {
+    const code = await runPasskeyOwnerCommand(argv, deps, mode)
+    if (code === 0 && (command === "approve" || command === "revoke")) {
+      await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
+    }
+    return code
+  }
+  if (mode === "passkey") {
+    // The agent-facing commands on a passkey home: the same ServiceRuntime the daemon uses —
+    // read surface only, no owner material anywhere in the process.
+    let session: ServiceRuntime
+    try {
+      session = await ServiceRuntime.openOwnerSession(deps.home, deps.network)
+    } catch (error) {
+      deps.print(ownerRefusalLine(command, argv[1] ?? "", error))
+      return 1
+    }
+    try {
+      session.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
+      return await runCliWithRuntime(argv, session, deps.print, { cwd: deps.cwd })
+    } finally {
+      await session.close()
+    }
   }
   const runtime = await Runtime.open(deps.home, deps.network)
   try {

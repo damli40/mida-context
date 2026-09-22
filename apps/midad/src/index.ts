@@ -39,6 +39,23 @@ export { startDaemon } from "./daemon.js"
 export type { DaemonDeps, DaemonHandle } from "./daemon.js"
 export { runDoctor, runDoctorLive } from "./doctor.js"
 export type { DoctorDeps } from "./doctor.js"
+export { startReturnListener, newOwnerNonce } from "./owner-link/listener.js"
+export type { ReturnListener } from "./owner-link/listener.js"
+export { openOwnerLink } from "./owner-link/open.js"
+export type { OpenOwnerLinkDeps } from "./owner-link/open.js"
+export {
+  OWNER_PAGE_ORIGIN,
+  PAGE_MISMATCH_LINE,
+  PASSKEY_IDENTITY_LINE,
+  OwnerLinkOutcome,
+  WRONG_OWNER_LINE,
+  approvePasskey,
+  initPasskey,
+  provisionPasskeyAgents,
+  revokePasskey,
+  runOwnerLinkRound,
+} from "./owner-link/flows.js"
+export type { ApprovePasskeyResult, PasskeyDeps, RevokePasskeyResult } from "./owner-link/flows.js"
 export { buildHandoff, noContextText } from "./handoff.js"
 export type { CapabilityState, HandoffDeps, HandoffResult } from "./handoff.js"
 export { CheckpointCopies, WHATS_NEW_HEADER, buildWhatsNew, readSeen, writeSeen } from "./whatsnew.js"

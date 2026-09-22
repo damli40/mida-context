@@ -186,7 +186,7 @@ function processAlive(pid: number): boolean {
   }
 }
 
-function apiClient(baseUrl: string, deployment: Deployment, account: LocalAccount): ContextApiClient {
+export function apiClient(baseUrl: string, deployment: Deployment, account: LocalAccount): ContextApiClient {
   return new ContextApiClient({ baseUrl, account, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry })
 }
 
@@ -238,6 +238,49 @@ async function daemonApiBaseUrl(home: MidaHome): Promise<string | undefined> {
     throw new Error("midad is running but api-url.json is missing or invalid; restart midad")
   }
   return baseUrl
+}
+
+/**
+ * The Context API address for an owner-facing session, exactly as Runtime.open resolves it: a
+ * configured storage URL wins; else a running daemon's published address; else the home lock
+ * plus a fresh local server. Shared so the passkey session — which has no owner secrets to open
+ * a Runtime with — resolves the same address the same way.
+ */
+async function resolveOwnerApi(
+  home: MidaHome,
+  network: Network,
+  timing?: { lockWaitMs?: number; lockStepMs?: number },
+): Promise<{ apiBaseUrl: string; server?: { baseUrl: string; close(): Promise<void> }; locked: boolean }> {
+  const storageUrl = parseStorageUrl(network.storageUrl)
+  let server: { baseUrl: string; close(): Promise<void> } | undefined
+  let apiBaseUrl: string
+  let locked = false
+  if (storageUrl !== undefined) {
+    apiBaseUrl = storageUrl
+  } else {
+    apiBaseUrl = (await daemonApiBaseUrl(home)) ?? ""
+    if (apiBaseUrl === "") {
+      try {
+        await acquireHomeLock(home, timing?.lockWaitMs ?? 30_000, timing?.lockStepMs ?? 250)
+        locked = true
+      } catch (error) {
+        // The holder may be a daemon mid-start: if it has come up since, use its API instead of failing.
+        const running = await daemonApiBaseUrl(home)
+        if (running === undefined) throw error
+        apiBaseUrl = running
+      }
+    }
+    if (locked) {
+      try {
+        server = await startPersistentApi({ rpcUrl: network.rpcUrl, deployment: network.deployment, dataDir: home.path("data") })
+        apiBaseUrl = server.baseUrl
+      } catch (error) {
+        home.remove(LOCK_FILE)
+        throw error
+      }
+    }
+  }
+  return { apiBaseUrl, server, locked }
 }
 
 /**
@@ -307,6 +350,41 @@ export class ServiceRuntime {
   }
 
   /**
+   * The passkey-owner session (M3-F2): the same Context API resolution and the same read surface
+   * Runtime.open offers owner commands, minus every piece that needs an owner secret — there is
+   * no owner account, no wallet context, no vault. Passkey commands send nothing themselves; the
+   * page does the signing. The owner address comes from owner-address.json — written by
+   * `mida init --passkey` after the chain proved the passkey's key is registered.
+   */
+  static async openOwnerSession(home: MidaHome, network: Network, timing?: { lockWaitMs?: number; lockStepMs?: number }): Promise<ServiceRuntime> {
+    parseSponsorUrl(network.sponsorUrl) // a malformed URL is refused before any work, as in Runtime.open
+    const owner = loadOwnerAddress(home)
+    if (owner === undefined) {
+      const error = new Error("owner-address.json is missing — run `mida init --passkey` first") as Error & { code: string }
+      error.code = "no-owner-address"
+      throw error
+    }
+    const { apiBaseUrl, server, locked } = await resolveOwnerApi(home, network, timing)
+    try {
+      const chain: ChainContext = {
+        publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: http(network.rpcUrl) }),
+        deployment: network.deployment,
+      }
+      return new ServiceRuntime(home, network, owner, chain, apiBaseUrl, async () => {
+        try {
+          await server?.close()
+        } finally {
+          if (locked) home.remove(LOCK_FILE)
+        }
+      })
+    } catch (error) {
+      if (server !== undefined) await server.close()
+      if (locked) home.remove(LOCK_FILE)
+      throw error
+    }
+  }
+
+  /**
    * Rebuilt from disk on every call: a grant or revocation written by the owner command after
    * this runtime opened must be visible on the very next drain pass or handoff, so nothing is
    * cached here.
@@ -353,36 +431,8 @@ export class Runtime extends ServiceRuntime {
   }
 
   static override async open(home: MidaHome, network: Network, timing?: { lockWaitMs?: number; lockStepMs?: number }): Promise<Runtime> {
-    const storageUrl = parseStorageUrl(network.storageUrl)
     const sponsorUrl = parseSponsorUrl(network.sponsorUrl)
-    let server: { baseUrl: string; close(): Promise<void> } | undefined
-    let apiBaseUrl: string
-    let locked = false
-    if (storageUrl !== undefined) {
-      apiBaseUrl = storageUrl
-    } else {
-      apiBaseUrl = await daemonApiBaseUrl(home) ?? ""
-      if (apiBaseUrl === "") {
-        try {
-          await acquireHomeLock(home, timing?.lockWaitMs ?? 30_000, timing?.lockStepMs ?? 250)
-          locked = true
-        } catch (error) {
-          // The holder may be a daemon mid-start: if it has come up since, use its API instead of failing.
-          const running = await daemonApiBaseUrl(home)
-          if (running === undefined) throw error
-          apiBaseUrl = running
-        }
-      }
-      if (locked) {
-        try {
-          server = await startPersistentApi({ rpcUrl: network.rpcUrl, deployment: network.deployment, dataDir: home.path("data") })
-          apiBaseUrl = server.baseUrl
-        } catch (error) {
-          home.remove(LOCK_FILE)
-          throw error
-        }
-      }
-    }
+    const { apiBaseUrl, server, locked } = await resolveOwnerApi(home, network, timing)
     try {
       const secrets = loadOrCreateOwnerSecrets(home)
       const ownerAccount = privateKeyToAccount(secrets.privateKey)

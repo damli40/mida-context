@@ -17,7 +17,7 @@ import { FileAccessRequestStore } from "./request-store.js"
 import type { MidaHome } from "./home.js"
 import {
   clearRevokePending, identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, loadOrCreateSignerKey,
-  markRevokePending, markRevoked, replaceSignerKey, revokePending, saveAgentIdentity, saveGrants, saveOwnerAddress,
+  markRevokePending, markRevoked, replaceSignerKey, revokePending, saveAgentIdentity, saveGrants, saveOwnerAddress, saveOwnerMode,
 } from "./keys.js"
 import type { RevokePendingMarker } from "./keys.js"
 import { approveProject, ensureProjectMarker, removeAgentApprovals } from "./projects.js"
@@ -38,7 +38,7 @@ export async function isCapabilityLive(context: ChainContext, capabilityId: Hex)
 }
 
 /** "Approved" means the chain lists at least one live capability for this owner–agent pair — any permission. */
-async function hasAnyLiveCapability(runtime: ServiceRuntime, agentId: Hex): Promise<boolean> {
+export async function hasAnyLiveCapability(runtime: ServiceRuntime, agentId: Hex): Promise<boolean> {
   for (const id of await runtime.reader.activeCapabilityIds(runtime.owner, agentId)) {
     if (await isCapabilityLive(runtime.chain, id)) return true
   }
@@ -69,7 +69,7 @@ export function expectedScopesFor(purposeId: PurposeId): ScopeInput[] {
  * diff: an agent holding the old single `projects.current` grant is missing exactly the two
  * READ scopes, and only those are asked for.
  */
-async function missingExpectedScopes(runtime: ServiceRuntime, agentId: Hex, purposeId: PurposeId): Promise<RequestedScope[]> {
+export async function missingExpectedScopes(runtime: ServiceRuntime, agentId: Hex, purposeId: PurposeId): Promise<RequestedScope[]> {
   const missing: RequestedScope[] = []
   for (const scope of expandScopeInputs(expectedScopesFor(purposeId))) {
     if (!(await runtime.reader.hasAuthority(runtime.owner, agentId, scope.namespaceId, scope.permissions, scope.provenancePolicy))) {
@@ -80,7 +80,7 @@ async function missingExpectedScopes(runtime: ServiceRuntime, agentId: Hex, purp
 }
 
 /** A signed scope that the chain no longer authorizes — the still-needed part of a pending request. */
-async function ungrantedScopes(runtime: ServiceRuntime, agentId: Hex, scopes: readonly RequestedScope[]): Promise<RequestedScope[]> {
+export async function ungrantedScopes(runtime: ServiceRuntime, agentId: Hex, scopes: readonly RequestedScope[]): Promise<RequestedScope[]> {
   const needed: RequestedScope[] = []
   for (const scope of scopes) {
     if (!(await runtime.reader.hasAuthority(runtime.owner, agentId, scope.namespaceId, scope.permissions, scope.provenancePolicy))) {
@@ -96,7 +96,7 @@ export function purposeFor(name: string): PurposeId {
 }
 
 /** The manifest's scope declarations are the same policy `expected` list the grant comes from. */
-function declarationsFor(purposeId: PurposeId) {
+export function declarationsFor(purposeId: PurposeId) {
   return POLICY_DOCUMENT_V1.purposes[purposeId].expected.map((entry) => ({
     namespace: entry.namespace,
     permissions: [...entry.permissions],
@@ -122,6 +122,9 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
   // The daemon needs the owner's public address to verify the signed approved-projects list and to
   // ask the chain about grants — it never reads owner/secrets.json, so the address is public metadata.
   saveOwnerAddress(home, owner)
+  // The mode marker (M3-F2): every owner command reads it before touching owner material, so a
+  // software-key home and a passkey home can never be mixed by accident.
+  saveOwnerMode(home, "software")
   // With a gas sponsor every send below is paid by the sponsor — a brand-new empty owner wallet
   // inits fine (M3-C), and no wallet needs MON up front: not the owner's, not the operator's, not
   // an agent signer's (M3-D3). But a CONFIGURED URL is not proof the sponsor answers (M3-D6):
@@ -623,7 +626,7 @@ export async function revoke(
  * quietly() swallows only "missing" and "unreadable/corrupt"; EACCES/EPERM propagate, because a permission
  * problem must never silently change which agent gets revoked.
  */
-async function resolveAgentId(runtime: ServiceRuntime, name: string): Promise<Hex> {
+export async function resolveAgentId(runtime: ServiceRuntime, name: string): Promise<Hex> {
   const { home, reader } = runtime
   const quietly = <T>(load: () => T): T | undefined => {
     try {

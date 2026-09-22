@@ -39,7 +39,7 @@ const ENTRY_KEYS: readonly (keyof ProjectApproval)[] = ["agent", "projectId", "r
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 
 /** The bytes the signature actually covers: sorted entries, fixed key order, no whitespace. */
-function canonicalEntries(entries: readonly ProjectApproval[]): string {
+export function canonicalEntries(entries: readonly ProjectApproval[]): string {
   const sorted = [...entries].sort(
     (a, b) => cmp(a.agent, b.agent) || cmp(a.projectId, b.projectId) || cmp(a.root, b.root),
   )
@@ -57,7 +57,7 @@ function asApproval(raw: unknown): ProjectApproval | undefined {
   return record as unknown as ProjectApproval
 }
 
-type ApprovalsFile =
+export type ApprovalsFile =
   | { kind: "missing" }
   | { kind: "unreadable" }
   /** `rows` is the entry count when the file held a countable list, else null — for reporting. */
@@ -69,7 +69,7 @@ type ApprovalsFile =
  * is `unreadable` — a permissions or filesystem problem with a different fix. Anything that
  * parses but fails shape or verification is `bad-signature` — content nobody signed.
  */
-async function readApprovalsFile(home: ServiceRuntime["home"], owner: Address): Promise<ApprovalsFile> {
+export async function readApprovalsFile(home: ServiceRuntime["home"], owner: Address): Promise<ApprovalsFile> {
   let raw: unknown
   try {
     raw = home.readJson(LIST_FILE)
@@ -118,7 +118,7 @@ async function signEntries(runtime: Runtime, entries: readonly ProjectApproval[]
 // serialised so a lost update can never silently drop a row.
 let listWrites: Promise<unknown> = Promise.resolve()
 
-function serializeListWrite<T>(write: () => Promise<T>): Promise<T> {
+export function serializeListWrite<T>(write: () => Promise<T>): Promise<T> {
   const run = listWrites.then(write, write)
   listWrites = run.then(
     () => undefined,
@@ -218,6 +218,21 @@ export async function approveProject(
     const next = [...kept, approval]
     runtime.home.writeSecretJson(LIST_FILE, { entries: next, signature: await signEntries(runtime, next) })
     return { approval, droppedRows: file.kind === "bad-signature" ? file.rows : 0, alreadyListed }
+  })
+}
+
+/**
+ * Writes a list the OWNER PAGE signed (M3-F2): the passkey holds the signing key, so the file
+ * arrives pre-signed. The caller verifies the signature and the entry set before this runs —
+ * this function only serialises the write with the software-mode writers.
+ */
+export async function writeSignedApprovals(
+  home: ServiceRuntime["home"],
+  entries: readonly ProjectApproval[],
+  signature: Hex,
+): Promise<void> {
+  return serializeListWrite(async () => {
+    home.writeSecretJson(LIST_FILE, { entries, signature })
   })
 }
 

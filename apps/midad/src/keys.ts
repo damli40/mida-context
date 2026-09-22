@@ -50,7 +50,34 @@ export function loadOrCreateOwnerSecrets(home: MidaHome): OwnerSecrets {
 }
 
 const OWNER_ADDRESS_FILE = "owner-address.json"
+const OWNER_MODE_FILE = "owner/mode.json"
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/
+
+/**
+ * The owner mode the home was initialized with — software key or passkey. The two never mix in
+ * one `MIDA_HOME`: `init` writes this file, every owner command reads it before touching any
+ * owner material, and a passkey home must never cause `owner/secrets.json` to be created.
+ */
+export type OwnerMode = "software" | "passkey"
+
+export function saveOwnerMode(home: MidaHome, mode: OwnerMode): void {
+  home.writeSecretJson(OWNER_MODE_FILE, { mode })
+}
+
+/**
+ * mode.json is authoritative. A home older than the file is software when it holds an owner key
+ * (that was the only mode that existed); with neither file the home has no owner yet.
+ */
+export function loadOwnerMode(home: MidaHome): OwnerMode | undefined {
+  const record = home.readJson<Record<string, unknown>>(OWNER_MODE_FILE)
+  if (record !== undefined) {
+    if (record.mode !== "software" && record.mode !== "passkey") {
+      throw new Error(`${OWNER_MODE_FILE}: field "mode" is missing or is not "software" or "passkey"`)
+    }
+    return record.mode
+  }
+  return home.has("owner/secrets.json") ? "software" : undefined
+}
 
 /** The owner's public address — written by `mida init`, read by the daemon. Not a secret. */
 export function saveOwnerAddress(home: MidaHome, address: Address): void {
