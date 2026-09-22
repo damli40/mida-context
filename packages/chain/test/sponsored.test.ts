@@ -118,7 +118,9 @@ const PAYMASTER_FIELDS = {
   paymasterPostOpGasLimit: "0x10000",
 }
 const OP_GAS = {
-  callGasLimit: "0x30000",
+  // 0x20000 = 131,072 — under owner.key's EFFECTIVE ceiling (200,000 minus the 40,000 call
+  // overhead the bundler estimate does not count, M3-D6), so the default script sends.
+  callGasLimit: "0x20000",
   verificationGasLimit: "0x40000",
   preVerificationGas: "0x20000",
   paymasterVerificationGasLimit: "0x30000",
@@ -274,7 +276,7 @@ describe("createSponsoredSender", () => {
       expect(receipt.userOpHash).toBe(USER_OP_HASH)
       expect(receipt.transactionHash).toBe(BUNDLE_TX)
       // gasLimit = the sum of the operation's gas fields: what Monad billed the sponsor.
-      expect(receipt.gasLimit).toBe(0x30000n + 0x40000n + 0x20000n + 0x30000n + 0x10000n)
+      expect(receipt.gasLimit).toBe(0x20000n + 0x40000n + 0x20000n + 0x30000n + 0x10000n)
     } finally {
       await env.close()
     }
@@ -417,8 +419,10 @@ describe("createSponsoredSender", () => {
   // answer is GAS_CEILING_EXCEEDED — a local policy refusal, not SponsorDidNotPay, so nothing is
   // sent and sendContract never falls back on it.
 
-  it("a bundler callGasLimit over the kind's ceiling is refused locally — nothing is sent", async () => {
-    // owner.key's ceiling is 200,000; the fake bundler estimates 0x40000 = 262,144.
+  it("a bundler callGasLimit over the kind's effective ceiling is refused locally — nothing is sent", async () => {
+    // owner.key's ceiling is 200,000; the bundler's callGasLimit prices the inner execution only,
+    // so the effective bound is ceiling − CALL_OVERHEAD_GAS = 160,000. The fake bundler estimates
+    // 0x40000 = 262,144 — over the raw ceiling AND the bound.
     const env = await start({ estimateGas: { ...OP_GAS, callGasLimit: "0x40000" } }, { code: "0x", txCount: "0x0" })
     try {
       const sender = createSponsoredSender({
@@ -440,14 +444,46 @@ describe("createSponsoredSender", () => {
     }
   })
 
-  it("a bundler callGasLimit within the kind's ceiling sends", async () => {
-    // owner.key's ceiling is 200,000; the fake bundler's default estimate is 0x30000 = 196,608 —
-    // under it, so the send goes out.
+  it("a bundler callGasLimit within the kind's effective ceiling sends", async () => {
+    // owner.key's effective bound is 160,000; the fake bundler's default estimate is
+    // 0x20000 = 131,072 — under it, so the send goes out.
     const env = await start({ receipt: userOpReceipt(account.address, true) }, { code: "0x", txCount: "0x0" })
     try {
       const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
       await sender.send(call, "owner.key")
       expect(env.sent).toHaveLength(1)
+    } finally {
+      await env.close()
+    }
+  })
+
+  // M3-D6 item 4 — the two sides of the bound, both sides tested: the bundler's callGasLimit is
+  // the inner execution only, so it is checked against ceiling − CALL_OVERHEAD_GAS (160,000 for
+  // owner.key). Exactly at the bound sends; one unit over is refused before anything goes out.
+
+  it("a callGasLimit exactly at ceiling − CALL_OVERHEAD_GAS still sends", async () => {
+    const env = await start(
+      { estimateGas: { ...OP_GAS, callGasLimit: "0x27100" }, receipt: userOpReceipt(account.address, true) },
+      { code: "0x", txCount: "0x0" },
+    )
+    try {
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
+      await sender.send(call, "owner.key")
+      expect(env.sent).toHaveLength(1) // 160,000 == the bound — allowed
+    } finally {
+      await env.close()
+    }
+  })
+
+  it("a callGasLimit one unit over ceiling − CALL_OVERHEAD_GAS is refused", async () => {
+    const env = await start({ estimateGas: { ...OP_GAS, callGasLimit: "0x27101" } }, { code: "0x", txCount: "0x0" })
+    try {
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
+      const error = await sender.send(call, "owner.key").then(() => null, (e: unknown) => e)
+      expect(error).toBeInstanceOf(MidaError)
+      expect((error as MidaError).code).toBe("GAS_CEILING_EXCEEDED")
+      expect((error as Error).message).toContain("160000")
+      expect(env.sent).toHaveLength(0)
     } finally {
       await env.close()
     }

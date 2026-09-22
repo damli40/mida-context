@@ -26,6 +26,16 @@ export const SPONSOR_TIMEOUT_MS = 20_000
 /** Phase 2 — waiting for the receipt of an ACCEPTED operation — gets its own, longer deadline. */
 export const SPONSOR_RECEIPT_TIMEOUT_MS = 120_000
 
+/**
+ * The gas the bundler's `callGasLimit` does NOT count: that field prices the inner execution
+ * only, while GAS_CEILINGS were measured as whole-transaction limits — verification,
+ * pre-verification and paymaster gas ride on top. Comparing the raw numbers let the sponsored
+ * path run tens of thousands of gas more permissive than the self-paid one (M3-D6 item 4), so
+ * the kind's ceiling minus this overhead is the bound `callGasLimit` is checked against —
+ * the same effective whole-transaction ceiling both paths enforce.
+ */
+export const CALL_OVERHEAD_GAS = 40_000n
+
 /** Once the receipt wait runs this long the owner hears one progress line — silence is not pending. */
 export const SPONSOR_RECEIPT_NOTICE_MS = 15_000
 
@@ -176,9 +186,15 @@ export function createSponsoredSender(input: {
         if (typeof prepared.callGasLimit !== "bigint") {
           throw new SponsorDidNotPay("the bundler's gas estimate carried no callGasLimit")
         }
-        const ceiling = GAS_CEILINGS[kind]
-        if (prepared.callGasLimit > ceiling) {
-          throw new MidaError("GAS_CEILING_EXCEEDED", `${kind}: the bundler's callGasLimit ${prepared.callGasLimit} exceeds ceiling ${ceiling}`)
+        // The ceiling check: callGasLimit covers the inner call only (see CALL_OVERHEAD_GAS), so
+        // the bound is the whole-transaction ceiling minus that overhead — the same limit the
+        // self-paid path enforces on its whole-transaction estimate.
+        const bound = GAS_CEILINGS[kind] - CALL_OVERHEAD_GAS
+        if (prepared.callGasLimit > bound) {
+          throw new MidaError(
+            "GAS_CEILING_EXCEEDED",
+            `${kind}: the bundler's callGasLimit ${prepared.callGasLimit} exceeds the effective ceiling ${bound} (ceiling ${GAS_CEILINGS[kind]} minus ${CALL_OVERHEAD_GAS} call overhead)`,
+          )
         }
         // The prepared operation's `signature` is the account's stub, not a real signature — it
         // exists so the estimate has something shaped right to measure. Dropping it here (passing
