@@ -5,11 +5,14 @@ import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
 import { createPublicClient, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
+import { isMidaError } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { chainFor, parseDeployment } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { compileModelChoice } from "@mida/compiler"
-import { RegistryReader } from "@mida/api"
+import { ContextApiClient, DenyOverlay, RegistryReader } from "@mida/api"
+import type { RevocationTarget } from "@mida/api"
+import type { LocalAccount } from "viem"
 import { callDaemon } from "./control.js"
 import type { MidaHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
@@ -56,6 +59,8 @@ interface Shared {
   context?: ChainContext
   reader?: RegistryReader
   ownerAddress?: Address | "missing"
+  /** Agents the "agents" check found live on chain — undefined until that check finished. */
+  approved?: { name: string; agentId: Hex }[]
 }
 
 const problem = (sentence: string, fix: string) => `PROBLEM: ${sentence} — ${fix}`
@@ -112,6 +117,32 @@ function ownerAddressOf(home: MidaHome): Address | "missing" {
 
 const NEEDS_NETWORK = `needs network.json — ${INIT_FIX}`
 const NEEDS_OWNER = `needs the owner key — ${INIT_FIX}`
+
+/** The owner signing key from the saved secrets — read only, never created here. */
+function ownerAccountOf(home: MidaHome): LocalAccount | "missing" {
+  try {
+    const secrets = home.readJson<Record<string, unknown>>("owner/secrets.json")
+    const key = secrets?.privateKey
+    if (typeof key !== "string" || !/^0x[0-9a-f]{64}$/.test(key)) return "missing"
+    return privateKeyToAccount(key as Hex)
+  } catch {
+    return "missing"
+  }
+}
+
+/**
+ * The store URL a call would use right now: network.json's persisted value first (what init
+ * wrote), then the MIDA_STORAGE_URL override — the same precedence the services check reports.
+ * Undefined means the local store — its deny file lives under the home's own data directory.
+ */
+function storageUrlInEffect(home: MidaHome, env: NodeJS.ProcessEnv): string | undefined {
+  const stored = home.readJson<{ storageUrl?: unknown }>("network.json")
+  if (typeof stored?.storageUrl === "string" && stored.storageUrl !== "") return stored.storageUrl
+  const raw = env.MIDA_STORAGE_URL
+  if (raw === "off") return undefined
+  if (raw !== undefined && raw !== "") return raw
+  return undefined
+}
 
 /**
  * The sponsor URL a send would use right now: network.json's persisted value first (what init
@@ -258,6 +289,9 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
     {
       name: "agents",
       run: async () => {
+        // Set before any early return: an empty array really means "nobody is approved", while
+        // undefined (this check threw or never ran) tells the store-denies check it cannot say "ok".
+        shared.approved = []
         const names = listAgentNames(home)
         if (names.length === 0) return [problem("no agents are set up", INIT_FIX)]
         const chain = chainOf(shared)
@@ -279,6 +313,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           const live = views.filter((v) => !v.revoked && (v.expiresAt === 0n || now < v.expiresAt))
           if (live.length > 0) {
             lines.push(`ok: ${name} approved`)
+            shared.approved!.push({ name, agentId: identity!.agentId })
           } else if (views.length === 0 && isRevoked(home, name)) {
             // an agent-level revoke empties the live capability list entirely — the marker says it
             // was revoked, not that it never asked
@@ -298,6 +333,65 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           }
         }
         return lines
+      },
+    },
+    {
+      // M3-D4: the chain saying "approved" is only half the truth — a revoke that failed after its
+      // deny was staged leaves the store refusing an agent the chain approves. One signed call
+      // (or one read of the local store's own deny file) covers every approved agent.
+      name: "store-denies",
+      run: async () => {
+        if (shared.approved === undefined) {
+          return ["note: the agents check did not finish, so the store's deny list cannot be judged"]
+        }
+        if (shared.approved.length === 0) return ["ok: store blocks nobody who is approved"]
+        const chain = chainOf(shared)
+        if (chain === undefined) return [problem("the store's deny list cannot be checked", NEEDS_NETWORK)]
+        const owner = shared.ownerAddress ?? ownerAddressOf(home)
+        if (owner === "missing") return [problem("the store's deny list cannot be checked", NEEDS_OWNER)]
+        const storageUrl = storageUrlInEffect(home, deps.env ?? process.env)
+        let targets: RevocationTarget[]
+        try {
+          if (storageUrl !== undefined) {
+            const account = ownerAccountOf(home)
+            if (account === "missing") return [problem("the store's deny list cannot be checked", NEEDS_OWNER)]
+            const api = new ContextApiClient({
+              baseUrl: storageUrl,
+              account,
+              chainId: chain.context.deployment.chainId,
+              capabilityRegistry: chain.context.deployment.capabilityRegistry,
+              // a hung store must not eat the run cap — two seconds, like the sponsor probe
+              fetch: (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(2_000) }),
+            })
+            targets = (await api.listRevocations("active")).map((intent) => intent.target)
+          } else {
+            // No remote store: the local server's deny file IS the store's state — reading it
+            // directly answers whether the daemon is up or down.
+            const overlay = new DenyOverlay(home.path("data/revocations.json"))
+            targets = (await overlay.list())
+              .filter((intent) => intent.state === "active" && intent.owner === owner.toLowerCase())
+              .map((intent) => intent.target)
+          }
+        } catch (error) {
+          // A store that answered with a refusal is a fault, not an outage — name the code as a
+          // problem; only a call that never got an answer earns the note.
+          if (isMidaError(error)) {
+            return [problem(`the store answered ${error.code} when asked for stale denies`, "re-run `mida doctor` — and if it repeats, the store's signed route is refusing the owner key")]
+          }
+          return ["note: the store could not be reached, so stale denies could not be checked"]
+        }
+        const byAgentId = new Map(shared.approved.map((agent) => [agent.agentId.toLowerCase(), agent.name]))
+        const blocked = new Set<string>()
+        for (const target of targets) {
+          const agentId =
+            target.kind === "agent"
+              ? target.agentId
+              : (await chain.reader.getCapability(target.capabilityId))?.agentId
+          const name = agentId === undefined ? undefined : byAgentId.get(agentId.toLowerCase())
+          if (name !== undefined) blocked.add(name)
+        }
+        if (blocked.size === 0) return ["ok: store blocks nobody who is approved"]
+        return [...blocked].map((name) => problem(`the store still blocks ${name} after a failed revoke`, `run \`mida approve ${name}\``))
       },
     },
     {

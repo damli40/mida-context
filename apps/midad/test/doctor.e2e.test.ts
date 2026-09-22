@@ -5,7 +5,9 @@ import type { Server as HttpServer } from "node:http"
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { privateKeyToAccount } from "viem/accounts"
 import { increaseLocalTime } from "@mida/chain"
+import { ContextApiClient } from "@mida/api"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
@@ -15,6 +17,7 @@ import {
   init,
   installClaudeCode,
   installCodex,
+  loadAgentIdentity,
   loadOrCreateOwnerSecrets,
   requestAccess,
   revoke,
@@ -119,6 +122,7 @@ describe("mida doctor on local Anvil", () => {
     expect(lines).toContain("ok: claude-code approved")
     expect(lines).toContain("ok: codex approved")
     expect(lines).toContain("ok: approved-projects signature valid")
+    expect(lines).toContain("ok: store blocks nobody who is approved")
     expect(lines).toContain("ok: claude-code hooks installed")
     expect(lines).toContain("ok: codex hooks installed")
     expect(lines).toContain("ok: queue empty")
@@ -159,6 +163,58 @@ describe("mida doctor on local Anvil", () => {
     const agentLine = lines.find((line) => line.includes("doomed-agent"))
     expect(agentLine).toContain("revoked")
     expect(agentLine).not.toContain("never asked")
+  }, STEP_TIMEOUT)
+
+  it("a stale store deny on an approved agent is a PROBLEM that names `mida approve` — and approve clears it (M3-D4)", async () => {
+    // The incident's shape, staged the way the vault stages it: an ACTIVE deny intent for codex
+    // whose revoke never landed on chain — doctor must not answer "ok: codex approved" alone.
+    const secrets = loadOrCreateOwnerSecrets(home)
+    const ownerAccount = privateKeyToAccount(secrets.privateKey)
+    const ownerApi = new ContextApiClient({
+      baseUrl: apiServer.baseUrl,
+      account: ownerAccount,
+      chainId: env.deployment.chainId,
+      capabilityRegistry: env.deployment.capabilityRegistry,
+    })
+    const codexId = loadAgentIdentity(home, "codex")!.agentId
+    await ownerApi.requestRevocationDeny({ owner: ownerAccount.address, agentId: codexId })
+
+    const { lines, code } = await doctor()
+    expect(lines).toContain("ok: codex approved")
+    expect(lines).toContain("PROBLEM: the store still blocks codex after a failed revoke — run `mida approve codex`")
+    expect(lines).not.toContain("ok: store blocks nobody who is approved")
+    // claude-code's deny list is clean — only codex's name appears in a store PROBLEM
+    expect(lines.filter((line) => line.startsWith("PROBLEM: the store still blocks"))).toHaveLength(1)
+    expect(code).toBe(1)
+
+    // the fix the line names actually works: approve clears the deny, the next doctor is clean
+    const runtime = await Runtime.open(home, { ...network, storageUrl: apiServer.baseUrl })
+    try {
+      await expect(approve(runtime, "codex")).rejects.toMatchObject({ code: "already-approved" })
+    } finally {
+      await runtime.close()
+    }
+    const after = await doctor()
+    expect(after.lines).toContain("ok: store blocks nobody who is approved")
+  }, STEP_TIMEOUT * 2)
+
+  it("an unreachable store is a note, never the 'ok' line (M3-D4)", async () => {
+    // Point the home's persisted store at a dead port — the check cannot claim the store blocks
+    // nobody when it could not ask, and must not fail the whole run either.
+    const networkFile = home.path("network.json")
+    const original = readFileSync(networkFile, "utf8")
+    const stored = JSON.parse(original) as Record<string, unknown>
+    try {
+      writeFileSync(networkFile, JSON.stringify({ ...stored, storageUrl: "http://127.0.0.1:1" }))
+      const { lines } = await doctor()
+      const storeLine = lines.find((line) => line.includes("stale denies") || line.includes("store blocks"))
+      expect(storeLine).toBeDefined()
+      expect(storeLine).toMatch(/^note:/)
+      expect(lines).not.toContain("ok: store blocks nobody who is approved")
+      expect(lines.some((line) => line.startsWith("PROBLEM: the store still blocks"))).toBe(false)
+    } finally {
+      writeFileSync(networkFile, original)
+    }
   }, STEP_TIMEOUT)
 
   it("(d) an expired grant prints the expiry date (Anvil time travel)", async () => {
