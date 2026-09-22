@@ -572,6 +572,9 @@ export async function readCheckpoints(runtime: ServiceRuntime, name: string, pro
       contextId: object.contextId,
       authorId: object.authorId,
       namespaceId: object.namespaceId,
+      // a migrated record's envelope rides on the stored checkpoint as an ordinary typed field —
+      // dropped nowhere on the way to the renderers
+      ...(envelope.migration === undefined ? {} : { migration: envelope.migration }),
     }]
   })
   return { checkpoints, skipped, milliseconds: Date.now() - started, partial }

@@ -1,7 +1,9 @@
 import { isAbsolute } from "node:path"
 import { isMidaError } from "@mida/protocol"
 import { mergeCheckpoints, renderHandoffReport } from "@mida/checkpoint"
+import type { MigrationEnvelope } from "@mida/checkpoint"
 import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
+import { movedOnSuffix } from "./migration-envelope.js"
 import { checkProject } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { isSafeName } from "./queue.js"
@@ -263,7 +265,23 @@ export async function buildHandoff(
     const newest = merged.provenance.at(-1)
     const savedBy =
       newest === undefined ? "unknown agent" : (input.authorNames[newest.authorId.toLowerCase()] ?? "unknown agent")
-    const rendered = renderHandoffReport(merged, { authorNames: input.authorNames, facts, factsFailed })
+    // A checkpoint the migration moved keeps its original author and save time; the envelope's
+    // move date rides beside them in the saved-by line. The suffix goes on a render-only copy —
+    // merged itself (and the saved-at summary taken from it above) stays untouched.
+    const movedOn = new Map<string, MigrationEnvelope>()
+    for (const stored of outcome.checkpoints) {
+      if (stored.migration !== undefined) movedOn.set(stored.contextId, stored.migration)
+    }
+    const rendered = renderHandoffReport(
+      {
+        ...merged,
+        provenance: merged.provenance.map((row) => {
+          const migration = movedOn.get(row.contextId)
+          return migration === undefined ? row : { ...row, createdAt: `${row.createdAt} ${movedOnSuffix(migration)}` }
+        }),
+      },
+      { authorNames: input.authorNames, facts, factsFailed },
+    )
     return {
       kind: "handoff",
       text: outcome.partial ? `${PARTIAL_LINE}\n\n${rendered.text}` : rendered.text,

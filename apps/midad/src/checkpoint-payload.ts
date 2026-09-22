@@ -1,7 +1,8 @@
 import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
 import { LIMITS, validateCheckpoint } from "@mida/checkpoint"
-import type { Checkpoint } from "@mida/checkpoint"
+import type { Checkpoint, MigrationEnvelope } from "@mida/checkpoint"
+import { validateMigrationEnvelope } from "./migration-envelope.js"
 
 export const CHECKPOINT_TYPE = "mida.checkpoint.v1"
 /**
@@ -37,6 +38,11 @@ export interface CheckpointEnvelope {
   continuesSession: string | null
   compiledBy: string
   checkpoint: Checkpoint
+  /**
+   * Where the record came from — set only on records `mida migrate` moved here, sealed beside
+   * the checkpoint. Omitted entirely on ordinary saves, so their bytes never change.
+   */
+  migration?: MigrationEnvelope
 }
 
 /**
@@ -56,6 +62,20 @@ const DROPPABLE = ["progress", "evidence", "artifacts", "rejected", "decisions"]
 const CUT_TO = 300
 
 /**
+ * A present migration envelope is validated like the checkpoint itself: an invalid one rejects
+ * the whole write with invalid-checkpoint naming the field — the envelope is provenance, and
+ * half of it must not save.
+ */
+function checkedMigration(migration: unknown): MigrationEnvelope | undefined {
+  if (migration === undefined) return undefined
+  const checked = validateMigrationEnvelope(migration)
+  if (!checked.ok) {
+    throw new CheckpointPayloadError("invalid-checkpoint", `invalid migration envelope: ${checked.errors.join("; ")}`, fieldPathsFromErrors(checked.errors))
+  }
+  return checked.value
+}
+
+/**
  * Validates the checkpoint and wraps it in the v1 envelope. If the serialized envelope would exceed
  * the byte cap, the checkpoint is shrunk in the DROPPABLE order — oldest entries first — and any
  * string still longer than 300 chars outside the protected fields is cut to 300 with an ellipsis.
@@ -71,6 +91,7 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
   if (!checked.ok) {
     throw new CheckpointPayloadError("invalid-checkpoint", `invalid checkpoint: ${checked.errors.join("; ")}`, fieldPathsFromErrors(checked.errors))
   }
+  const migration = checkedMigration(input.migration)
   const checkpoint: Checkpoint = {
     ...checked.value,
     progress: [...checked.value.progress],
@@ -88,6 +109,7 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
     continuesSession: input.continuesSession,
     compiledBy: input.compiledBy,
     checkpoint,
+    ...(migration === undefined ? {} : { migration }),
   })
   const bytes = () => Buffer.byteLength(JSON.stringify(envelope()))
 
@@ -147,6 +169,12 @@ export function unwrapCheckpoint(value: unknown): CheckpointEnvelope | null {
   if (typeof record.compiledBy !== "string") return null
   const checked = validateCheckpoint(record.checkpoint)
   if (!checked.ok) return null
+  let migration: MigrationEnvelope | undefined
+  if (record.migration !== undefined) {
+    const checkedEnvelope = validateMigrationEnvelope(record.migration)
+    if (!checkedEnvelope.ok) return null
+    migration = checkedEnvelope.value
+  }
   return {
     type: CHECKPOINT_TYPE,
     projectId: record.projectId,
@@ -154,5 +182,6 @@ export function unwrapCheckpoint(value: unknown): CheckpointEnvelope | null {
     continuesSession: record.continuesSession,
     compiledBy: record.compiledBy,
     checkpoint: checked.value,
+    ...(migration === undefined ? {} : { migration }),
   }
 }

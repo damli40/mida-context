@@ -5,6 +5,7 @@ import type { ContextKind, Hex } from "@mida/protocol"
 import { scrubSecrets } from "@mida/compiler"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { listAgentNames, loadAgentIdentity } from "./keys.js"
+import { movedOnSuffix, validateMigrationEnvelope } from "./migration-envelope.js"
 
 /**
  * The two namespaces `mida remember` may write in M2, in the order the refusal message lists them.
@@ -111,7 +112,11 @@ async function repairFactWraps(runtime: Runtime, nsId: Hex): Promise<void> {
   }
 }
 
-/** The text a fact record carries, whatever shape its value took. */
+/**
+ * The text a fact record carries, whatever shape its value took — plus, for a fact `mida migrate`
+ * moved here, the move date its sealed envelope records. The suffix rides inside the fact text so
+ * every list that prints facts — `mida read`, the handoff's fact block — shows it the same way.
+ */
 function factText(value: unknown): string | null {
   const raw =
     typeof value === "string" ? value
@@ -119,7 +124,12 @@ function factText(value: unknown): string | null {
     : null
   if (raw === null) return null
   const text = oneLine(raw).trim()
-  return text === "" ? null : text
+  if (text === "") return null
+  if (typeof value === "object" && value !== null) {
+    const migration = validateMigrationEnvelope((value as { migration?: unknown }).migration)
+    if (migration.ok) return `${text} ${movedOnSuffix(migration.value)}`
+  }
+  return text
 }
 
 /**

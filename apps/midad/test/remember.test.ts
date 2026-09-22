@@ -5,10 +5,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { generatePrivateKey } from "viem/accounts"
 import { POLICY_DOCUMENT_V1, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
-import { MidaError } from "@mida/protocol"
-import type { PurposeId } from "@mida/protocol"
-import { MidaHome, attemptNamespaceRead, expectedScopesFor, remember, runCliWithRuntime } from "@mida/midad"
-import type { Runtime, ServiceRuntime } from "@mida/midad"
+import { MidaError, OWNER_AUTHOR_ID, PROVENANCE_SOURCE } from "@mida/protocol"
+import type { Hex, PurposeId } from "@mida/protocol"
+import type { ContextObject } from "@mida/sdk"
+import { MidaHome, attemptNamespaceRead, expectedScopesFor, readOwnerFacts, remember, runCliWithRuntime } from "@mida/midad"
+import type { MigrationEnvelope, Runtime, ServiceRuntime } from "@mida/midad"
 
 /**
  * Task 5 rule 1: the grant an agent asks for is read off the grant-advisor policy, not copied
@@ -164,5 +165,80 @@ describe("partial lists reach the owner honestly (M3-D)", () => {
     } finally {
       await fx.close()
     }
+  })
+})
+
+/**
+ * migrate B2: a fact the migration moved keeps its own words, and the fact list shows the move
+ * date — the envelope sits beside `text`/`assertedAt` in the sealed value, and `readOwnerFacts`
+ * renders it as `(moved on <date>)` at the end of the line. An ordinary fact is untouched.
+ */
+const MIGRATION: MigrationEnvelope = {
+  version: 1,
+  originalChainId: "10143",
+  originalContract: "0x1111111111111111111111111111111111111111",
+  originalRecordId: `0x${"22".repeat(32)}`,
+  originalCommitment: `0x${"33".repeat(32)}`,
+  originalAuthor: `0x${"44".repeat(32)}`,
+  originalCreatedAt: "2026-09-18T10:00:00.000Z",
+  migratedAt: "2026-09-25T10:00:00.000Z",
+}
+
+describe("migrated facts in the fact list (migrate B2)", () => {
+  const factObject = (text: string, contextId: Hex, migration?: MigrationEnvelope): ContextObject => ({
+    contextId,
+    owner: `0x${"55".repeat(20)}`,
+    namespace: "preferences.communication",
+    namespaceId: `0x${"77".repeat(32)}` as Hex,
+    authorId: OWNER_AUTHOR_ID,
+    lineageId: `0x${"99".repeat(32)}` as Hex,
+    parentId: `0x${"00".repeat(32)}` as Hex,
+    version: 1,
+    readEpoch: 1n,
+    recordType: "CONTEXT",
+    payload: {
+      v: 1,
+      kind: "PREFERENCE",
+      provenance: { source: "USER_ASSERTED" },
+      value: { text, assertedAt: "2026-09-18T10:00:00.000Z", ...(migration === undefined ? {} : { migration }) },
+    },
+  })
+
+  /** A runtime that serves the given objects per fact namespace and a chain record for each. */
+  const factRuntime = (objects: ContextObject[]): ServiceRuntime =>
+    ({
+      home: new MidaHome(mkdtempSync(join(tmpdir(), "mida-migfact-"))),
+      owner: `0x${"55".repeat(20)}`,
+      agent: () => ({
+        read: async (_owner: string, namespace: string) => (namespace === "preferences.communication" ? objects : []),
+      }),
+      reader: {
+        getRecord: async () => ({ author: OWNER_AUTHOR_ID, provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED, createdAt: 1_758_000_000n }),
+      },
+    }) as unknown as ServiceRuntime
+
+  it("readOwnerFacts appends (moved on <date>) to a migrated fact's text — after its own words", async () => {
+    const runtime = factRuntime([factObject("answers in lowercase", `0x${"66".repeat(32)}` as Hex, MIGRATION)])
+    const facts = await readOwnerFacts(runtime, "claude-code")
+    expect(facts).toHaveLength(1)
+    expect(facts[0]!.text).toBe("answers in lowercase (moved on 2026-09-25)")
+    expect(facts[0]!.contextId).toBe(`0x${"66".repeat(32)}`)
+    expect(facts[0]!.namespace).toBe("preferences.communication")
+  })
+
+  it("an ordinary fact's text is exactly the stored text — no marker", async () => {
+    const runtime = factRuntime([factObject("answers in lowercase", `0x${"66".repeat(32)}` as Hex)])
+    const facts = await readOwnerFacts(runtime, "claude-code")
+    expect(facts).toHaveLength(1)
+    expect(facts[0]!.text).toBe("answers in lowercase")
+    expect(facts[0]!.text).not.toContain("moved on")
+  })
+
+  it("mida read --as prints the move date on the migrated fact's line", async () => {
+    const runtime = factRuntime([factObject("answers in lowercase", `0x${"66".repeat(32)}` as Hex, MIGRATION)])
+    const lines: string[] = []
+    expect(await runCliWithRuntime(["read", "--as", "claude-code", "preferences.communication"], runtime, (line) => lines.push(line))).toBe(0)
+    expect(lines).toContain("What you have told Mida about yourself")
+    expect(lines).toContain("  preferences.communication: answers in lowercase (moved on 2026-09-25)")
   })
 })

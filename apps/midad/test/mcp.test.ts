@@ -306,6 +306,24 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
+  it("mida_read relays a migrated fact's (moved on <date>) marker verbatim — the marker is part of the daemon's line", async () => {
+    const dir = home()
+    const fake = await fakeDaemon(dir, {
+      "/cli": { code: 0, lines: ["What you have told Mida about yourself", "  preferences.communication: answers in lowercase (moved on 2026-09-25)"] },
+    })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_read", { namespace: "preferences.communication" })
+        expect(text).toContain("  preferences.communication: answers in lowercase (moved on 2026-09-25)")
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
   it("mida_read defaults to projects.current and refuses a namespace outside the three", async () => {
     const dir = home()
     const fake = await fakeDaemon(dir, { "/cli": { code: 0, lines: ["projects.current: read 2 object(s)"] } })

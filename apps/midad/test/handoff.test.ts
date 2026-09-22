@@ -8,7 +8,7 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import { ContextApiClient } from "@mida/api"
 import { MidaAgent } from "@mida/sdk"
 import { NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
-import type { HandoffDeps, ProjectCheck, Runtime } from "@mida/midad"
+import type { HandoffDeps, MigrationEnvelope, ProjectCheck, Runtime } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
 
 const runtime = {} as Runtime
@@ -550,5 +550,67 @@ describe("buildHandoff", () => {
     expect(calls).toBe(4) // the first list plus all three retries — still partial
     expect(result).toMatchObject({ kind: "empty", partial: true })
     expect(result.text).toContain("Some saved context could not be loaded yet; what follows may be incomplete.")
+  })
+})
+
+/**
+ * migrate B2: a checkpoint the migration moved keeps its original author and original save
+ * time — the envelope's move date rides beside them in the saved-by line. Everything else in
+ * the report is untouched, and a checkpoint with no envelope renders exactly as before.
+ */
+const MIGRATION: MigrationEnvelope = {
+  version: 1,
+  originalChainId: "10143",
+  originalContract: "0x1111111111111111111111111111111111111111",
+  originalRecordId: `0x${"22".repeat(32)}`,
+  originalCommitment: `0x${"33".repeat(32)}`,
+  originalAuthor: `0x${"44".repeat(32)}`,
+  originalCreatedAt: "2026-09-18T10:00:00.000Z",
+  migratedAt: "2026-09-25T10:00:00.000Z",
+}
+
+describe("migrated checkpoints in the handoff (migrate B2)", () => {
+  it("the saved-by line shows the original author and time plus (moved on <date>)", async () => {
+    const moved = stored(
+      { agent: "codex", createdAt: "2026-09-18T10:00:00.000Z" },
+      { contextId: `0x${"9".repeat(64)}`, authorId: `0x${"e".repeat(64)}`, migration: MIGRATION },
+    )
+    const { d } = deps({ read: async () => ({ checkpoints: [moved], skipped: 0, milliseconds: 1, partial: false }) })
+    const result = await buildHandoff(runtime, { ...input, authorNames: { [`0x${"e".repeat(64)}`]: "codex" } }, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    // original author, original time, then the move date — in that order
+    expect(result.text).toContain("- codex (on-chain author")
+    expect(result.text).toContain("at 2026-09-18T10:00:00.000Z (moved on 2026-09-25)")
+    expect(result.text).toContain(`record ${moved.contextId}`)
+    // the summary's saved-at field keeps the bare timestamp — the suffix belongs to the saved-by line
+    expect(result.savedAt).toBe("2026-09-18T10:00:00.000Z")
+  })
+
+  it("a checkpoint with no envelope renders with no moved-on marker anywhere", async () => {
+    const plain = stored({ createdAt: "2026-09-18T10:00:00.000Z" })
+    const { d } = deps({ read: async () => ({ checkpoints: [plain], skipped: 0, milliseconds: 1, partial: false }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).not.toContain("moved on")
+  })
+
+  it("only the migrated checkpoint's line carries the marker when the read is mixed", async () => {
+    const moved = stored(
+      { eventId: "cp-moved", createdAt: "2026-09-18T10:00:00.000Z" },
+      { sessionId: "s1", contextId: `0x${"8".repeat(64)}`, authorId: `0x${"e".repeat(64)}`, migration: MIGRATION },
+    )
+    const plain = stored(
+      { eventId: "cp-plain", createdAt: "2026-09-18T11:00:00.000Z" },
+      { sessionId: "s1", contextId: `0x${"7".repeat(64)}`, authorId: `0x${"e".repeat(64)}` },
+    )
+    const { d } = deps({ read: async () => ({ checkpoints: [moved, plain], skipped: 0, milliseconds: 1, partial: false }) })
+    const result = await buildHandoff(runtime, { ...input, authorNames: { [`0x${"e".repeat(64)}`]: "codex" } }, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("at 2026-09-18T10:00:00.000Z (moved on 2026-09-25)")
+    expect(result.text).toContain("at 2026-09-18T11:00:00.000Z,")
+    expect(result.text.match(/\(moved on /g)).toHaveLength(1)
   })
 })

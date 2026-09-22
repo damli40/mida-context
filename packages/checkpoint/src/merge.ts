@@ -1,5 +1,28 @@
 import type { Checkpoint } from "./schema.js"
 
+/**
+ * Where a migrated record came from — sealed inside the encrypted payload by `mida migrate`,
+ * validated there (`validateMigrationEnvelope` in apps/midad) and defined here so a
+ * StoredCheckpoint can carry it as an ordinary typed field. Hex fields are `0x${string}` —
+ * structurally the Hex/Address template type — so this package stays dependency-free.
+ */
+export interface MigrationEnvelope {
+  version: 1
+  /** The chain the record was copied from, as a decimal string. */
+  originalChainId: string
+  /** The ContextRegistry the record lived on before the move. */
+  originalContract: `0x${string}`
+  originalRecordId: `0x${string}`
+  /** The old record's on-chain manifestHash. */
+  originalCommitment: `0x${string}`
+  /** The old record's on-chain author id. */
+  originalAuthor: `0x${string}`
+  /** When the record was first written — ISO-8601. */
+  originalCreatedAt: string
+  /** When the move happened — ISO-8601; its day is what "(moved on …)" renders. */
+  migratedAt: string
+}
+
 export interface StoredCheckpoint {
   checkpoint: Checkpoint
   projectId: string
@@ -10,6 +33,8 @@ export interface StoredCheckpoint {
   authorId: string
   /** The chain record's namespace — the context area this checkpoint lives in. */
   namespaceId: string
+  /** Set only on records `mida migrate` moved here — the sealed envelope carried beside the checkpoint. */
+  migration?: MigrationEnvelope
 }
 
 export interface MergedHandoff {

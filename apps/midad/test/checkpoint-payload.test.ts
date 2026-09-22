@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { MAX_PAYLOAD_BYTES, canonicalBytes } from "@mida/protocol"
 import type { ContextPayload } from "@mida/protocol"
 import { MAX_VALUE_BYTES, eventIdFor, unwrapCheckpoint, wrapCheckpoint } from "@mida/midad"
-import type { CheckpointEnvelope } from "@mida/midad"
+import type { CheckpointEnvelope, MigrationEnvelope } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
 
 const wrap = (checkpoint: Parameters<typeof wrapCheckpoint>[0]["checkpoint"]): CheckpointEnvelope =>
@@ -123,5 +123,86 @@ describe("checkpoint payload", () => {
     const cp = sampleCheckpoint({})
     expect(() => wrapCheckpoint({ projectId: "", sessionId: "s", continuesSession: null, compiledBy: "t", checkpoint: cp })).toThrow()
     expect(() => wrapCheckpoint({ projectId: "p", sessionId: "", continuesSession: null, compiledBy: "t", checkpoint: cp })).toThrow()
+  })
+})
+
+/** The migration envelope a moved checkpoint carries beside `checkpoint` (migrate B2). */
+const MIGRATION: MigrationEnvelope = {
+  version: 1,
+  originalChainId: "10143",
+  originalContract: "0x1111111111111111111111111111111111111111",
+  originalRecordId: `0x${"22".repeat(32)}`,
+  originalCommitment: `0x${"33".repeat(32)}`,
+  originalAuthor: `0x${"44".repeat(32)}`,
+  originalCreatedAt: "2026-09-18T10:00:00.000Z",
+  migratedAt: "2026-09-25T10:00:00.000Z",
+}
+
+const INPUT = { projectId: "p", sessionId: "s", continuesSession: null, compiledBy: "t", checkpoint: sampleCheckpoint({ eventId: "cp-snap-01" }) } as const
+
+describe("migration envelope on checkpoints (migrate B2)", () => {
+  it("an ordinary checkpoint serializes byte-identically to before the field existed — and carries no migration key", () => {
+    const wrapped = wrapCheckpoint(INPUT)
+    expect(JSON.stringify(wrapped)).toMatchInlineSnapshot(`"{"type":"mida.checkpoint.v1","projectId":"p","sessionId":"s","continuesSession":null,"compiledBy":"t","checkpoint":{"eventId":"cp-snap-01","agent":"claude-code","source":"hook-compiler","createdAt":"2026-09-21T10:00:00.000Z","objective":"o","nextAction":"n","originalRequest":null,"unresolvedIssue":null,"progress":[],"decisions":[],"rejected":[],"constraints":[],"artifacts":[],"remainingPlan":[],"evidence":[]}}"`)
+    expect("migration" in wrapped).toBe(false)
+    const unwrapped = unwrapCheckpoint({ ...wrapped })
+    expect(unwrapped).not.toBeNull()
+    expect("migration" in unwrapped!).toBe(false)
+  })
+
+  it("wrap and unwrap carry a migration envelope, and wrap(unwrap(x)) reproduces it value-for-value", () => {
+    const wrapped = wrapCheckpoint({ ...INPUT, migration: MIGRATION })
+    expect(wrapped.migration).toEqual(MIGRATION)
+    expect(JSON.stringify(wrapped)).toContain('"migration"')
+    const unwrapped = unwrapCheckpoint({ ...wrapped })
+    expect(unwrapped).not.toBeNull()
+    expect(unwrapped!.migration).toEqual(MIGRATION)
+    // the read → re-save shape migration relies on: unwrap, then wrap again — identical envelope
+    expect(wrapCheckpoint(unwrapped!)).toEqual(wrapped)
+    expect(JSON.stringify(wrapCheckpoint(unwrapped!))).toBe(JSON.stringify(wrapped))
+  })
+
+  it("an invalid migration envelope rejects the whole write with invalid-checkpoint naming the field", () => {
+    const bad = { ...MIGRATION, originalContract: "not-hex" }
+    let thrown: unknown
+    try {
+      wrapCheckpoint({ ...INPUT, migration: bad as MigrationEnvelope })
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toMatchObject({ code: "invalid-checkpoint" })
+    expect((thrown as Error).message).toContain("originalContract")
+    expect(unwrapCheckpoint({ ...wrapCheckpoint(INPUT), migration: bad })).toBeNull()
+  })
+
+  it("the envelope is inside the serialized bytes the value cap measures", () => {
+    const delta =
+      Buffer.byteLength(JSON.stringify(wrapCheckpoint({ ...INPUT, migration: MIGRATION }))) -
+      Buffer.byteLength(JSON.stringify(wrapCheckpoint(INPUT)))
+    // `,"migration":{…}` — the key plus the envelope itself, nothing else
+    expect(delta).toBe(`,"migration":`.length + Buffer.byteLength(JSON.stringify(MIGRATION)))
+  })
+
+  it("the envelope counts toward the cap — its bytes force exactly one droppable entry out", () => {
+    // measure the envelope's wire cost, then land the plain envelope strictly inside
+    // (MAX_VALUE_BYTES - overhead, MAX_VALUE_BYTES] so one progress entry must go
+    const overhead =
+      Buffer.byteLength(JSON.stringify(wrapCheckpoint({ ...INPUT, migration: MIGRATION }))) -
+      Buffer.byteLength(JSON.stringify(wrapCheckpoint(INPUT)))
+    const progress: string[] = []
+    let plain = wrapCheckpoint({ ...INPUT, checkpoint: sampleCheckpoint({ progress }) })
+    while (Buffer.byteLength(JSON.stringify(plain)) + 2004 <= MAX_VALUE_BYTES) {
+      progress.push("x".repeat(2000))
+      plain = wrapCheckpoint({ ...INPUT, checkpoint: sampleCheckpoint({ progress }) })
+    }
+    const room = MAX_VALUE_BYTES - Buffer.byteLength(JSON.stringify(plain))
+    const filler = Math.max(0, room - Math.ceil(overhead / 2))
+    const checkpoint = sampleCheckpoint({ originalRequest: "r".repeat(filler), progress })
+    plain = wrapCheckpoint({ ...INPUT, checkpoint })
+    expect(plain.checkpoint.progress).toHaveLength(progress.length)
+    const moved = wrapCheckpoint({ ...INPUT, checkpoint, migration: MIGRATION })
+    expect(moved.migration).toEqual(MIGRATION)
+    expect(Buffer.byteLength(JSON.stringify(moved))).toBeLessThanOrEqual(MAX_VALUE_BYTES)
+    expect(moved.checkpoint.progress).toHaveLength(progress.length - 1)
   })
 })
