@@ -147,7 +147,7 @@ describe("POST /handoff on local Anvil", () => {
           eventId: input.eventId, agent: input.agent, createdAt: "2026-09-21T12:00:00.000Z",
           objective: "Finish the worker port", nextAction: "Wire the worker pool", progress: ["sess-c work"],
         }),
-        compiledBy: "test", droppedKeys: [], trimmed: [], attempts: 1,
+        compiledBy: "test", droppedKeys: [], trimmed: [], attempts: 1, retried: 0,
         format: "claude-jsonl", messagesKept: 1, messagesTotal: 1, charsSent: 0, modelMs: 0,
       }),
       drainDeps: { homeDir: hookHomeDir },

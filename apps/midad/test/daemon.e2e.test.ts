@@ -113,6 +113,7 @@ describe("the long-running midad", () => {
       droppedKeys: [],
       trimmed: [],
       attempts: 1,
+      retried: 0,
       format: "claude-jsonl",
       messagesKept: 1,
       messagesTotal: 1,
