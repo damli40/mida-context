@@ -1,7 +1,11 @@
 // buildExtractPrompt — C1. When the drainer still holds the session's last
-// checkpoint, the model must see it as something to UPDATE, not a fresh task:
-// its ten content fields land in the prompt before the TRANSCRIPT line, and
-// nothing else (ids, dates, the user's own words) goes back to the model.
+// checkpoint, the model must see it as something to UPDATE, not a fresh task.
+// M3-H: the checkpoint block moved BELOW the transcript so the prompt's head —
+// RULES, the TRANSCRIPT line, the transcript itself — is a byte-exact prefix
+// every compile of the session shares, which is what DeepSeek's and Kimi's
+// automatic prompt caches key on. The first compile's prompt must stay exactly
+// what it was before the move, and the second compile must literally begin
+// with those bytes.
 
 import { describe, expect, it } from "vitest"
 import { CONTENT_FIELDS, type Checkpoint } from "@mida/checkpoint"
@@ -25,19 +29,60 @@ const previous: Checkpoint = {
   evidence: [{ field: "artifacts[0]", ref: "file:src/a.ts" }],
 }
 
+// The first-compile prompt as it stood before the reorder — the no-previous
+// output must stay byte-identical to this, so it is written out in full rather
+// than rebuilt from the constants it would then tautologically match.
+const FIRST_COMPILE_PROMPT = `You are extracting a compact task checkpoint from an AI coding agent's transcript. Another agent will continue this work from your summary alone.
+
+The transcript below is a list of blocks, each headed "L<n> <role>:" where <n> is the 1-based line number in the transcript file and <role> is "user" or "assistant". The FIRST block is the user's original request — it carries the objective and the constraints; read it first and weight it most. The blocks after it are the most recent messages; a line "[… N earlier messages omitted …]" marks messages dropped in between.
+
+Output ONLY a single JSON object — no prose, no code fence — with exactly these fields:
+
+- "objective": string — what the task is trying to achieve (required)
+- "progress": string[] — what is already done
+- "decisions": [{"decision": string, "rationale": string}] — choices made and why
+- "rejected": [{"approach": string, "why": string}] — approaches considered and dropped
+- "constraints": string[] — rules the work must keep obeying
+- "artifacts": string[] — file paths created or modified
+- "unresolvedIssue": string | null — the current blocker or open question
+- "nextAction": string — the single next thing to do (required)
+- "remainingPlan": string[] — every step or requirement in the original request that is NOT finished yet, one entry each, in the request's own words including names of functions, classes and files. Do not summarise several steps into one. If the request lists numbered steps, keep the numbers.
+- "evidence": [{"field": string, "ref": string}] — where each claim came from. Use the block's line number: {"field": "decisions[0]", "ref": "transcript:L12"} (or a range like "transcript:L12-L15"), or a file path like {"field": "artifacts[0]", "ref": "file:src/x.js"}
+
+Rules:
+- Cite an evidence ref for every non-obvious claim.
+- Write null or empty arrays rather than inventing content. Never guess.
+- Never copy secrets, tokens, keys, or long transcript passages. Summarize, do not quote.
+- Keep every string under 500 characters. Be compact.
+
+TRANSCRIPT (possibly truncated, secrets already redacted):
+
+L1 user: do the thing`
+
 describe("buildExtractPrompt", () => {
-  it("without a previous checkpoint the prompt is the extract prompt plus the transcript", () => {
+  it("without a previous checkpoint the prompt is byte-identical to what it was before the reorder", () => {
     const prompt = buildExtractPrompt("L1 user: do the thing")
-    expect(prompt).toBe(`${EXTRACT_PROMPT}\nL1 user: do the thing`)
+    expect(prompt).toBe(FIRST_COMPILE_PROMPT)
     expect(prompt).not.toContain("PREVIOUS CHECKPOINT")
   })
 
-  it("with a previous checkpoint the prompt carries its ten content fields before the TRANSCRIPT line", () => {
+  it("a second compile's prompt starts with the first compile's exact bytes — the cacheable prefix", () => {
+    const transcript = "L1 user: do the thing"
+    const firstCompile = buildExtractPrompt(transcript)
+    const secondCompile = buildExtractPrompt(transcript, previous)
+    expect(secondCompile.startsWith(firstCompile)).toBe(true)
+    expect(secondCompile.length).toBeGreaterThan(firstCompile.length)
+  })
+
+  it("with a previous checkpoint the prompt carries its ten content fields after the transcript", () => {
     const prompt = buildExtractPrompt("L1 user: do the thing", previous)
     const prevAt = prompt.indexOf("PREVIOUS CHECKPOINT")
     const transcriptAt = prompt.indexOf("TRANSCRIPT (possibly truncated")
     expect(prevAt).toBeGreaterThanOrEqual(0)
-    expect(transcriptAt).toBeGreaterThan(prevAt)
+    expect(transcriptAt).toBeGreaterThanOrEqual(0)
+    // the cacheable prefix ends only where the transcript does — the
+    // ever-changing checkpoint block sits after it
+    expect(prevAt).toBeGreaterThan(transcriptAt + "L1 user: do the thing".length)
 
     // the line after the instruction is the checkpoint's JSON, holding exactly
     // the ten model-writable fields in their existing wording

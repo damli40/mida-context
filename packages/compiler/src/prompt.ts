@@ -36,7 +36,11 @@ ${TRANSCRIPT_LINE}
 // When the session already has a checkpoint, the model UPDATES it instead of
 // summarising from nothing — each save stays one moving description of the
 // session rather than another full restatement in new words (C1).
-const PREVIOUS_LEAD = `PREVIOUS CHECKPOINT (your own earlier summary of this same session, as JSON). Update it: keep every entry that is still true, in its existing wording; add what is new; move finished steps out of "remainingPlan" and into "progress"; remove an "unresolvedIssue" that the transcript shows was resolved. Never restate an existing entry in new words. Never drop a decision, rejected approach or constraint unless the transcript shows it was reversed.`
+// The block sits BELOW the transcript (M3-H): DeepSeek and Kimi cache a
+// request's byte-exact prefix, so the part that changes every compile must
+// come last — a second compile's prompt is then literally the first compile's
+// prompt plus this tail, and the whole transcript head stays a cache hit.
+const PREVIOUS_LEAD = `PREVIOUS CHECKPOINT (below the transcript above — your own earlier summary of this same session, as JSON). Update it: keep every entry that is still true, in its existing wording; add what is new; move finished steps out of "remainingPlan" and into "progress"; remove an "unresolvedIssue" that the transcript shows was resolved. Never restate an existing entry in new words. Never drop a decision, rejected approach or constraint unless the transcript shows it was reversed.`
 
 export function buildExtractPrompt(transcriptText: string, previous?: Checkpoint): string {
   if (previous === undefined) return `${EXTRACT_PROMPT}\n${transcriptText}`
@@ -45,5 +49,5 @@ export function buildExtractPrompt(transcriptText: string, previous?: Checkpoint
   // model's earlier output is untrusted text, so it is scrubbed again here.
   const fields: Record<string, unknown> = {}
   for (const key of CONTENT_FIELDS) fields[key] = scrubValue(previous[key])
-  return `${RULES}\n\n${PREVIOUS_LEAD}\n${JSON.stringify(fields)}\n\n${TRANSCRIPT_LINE}\n\n${transcriptText}`
+  return `${EXTRACT_PROMPT}\n${transcriptText}\n\n${PREVIOUS_LEAD}\n${JSON.stringify(fields)}`
 }
