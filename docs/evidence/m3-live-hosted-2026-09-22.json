@@ -1,0 +1,76 @@
+{
+  "date": "2026-09-22",
+  "what": "Live two-agent run through the hosted services on the Sep 22 redeploy (contracts bound to midacontext.xyz), typed by the owner in a real terminal; every transaction paid by the gas sponsor unless stated.",
+  "deployment": {
+    "capabilityRegistry": "0xAbBD06E4D8eE7c5Cc77B6b5D6644210176302213",
+    "contextRegistry": "0xAb1D090669C1A186A4599c302c2129d39E3ad987",
+    "block": 64709785
+  },
+  "owner": "0xf963b1952a87b301d5904c5a9768a1443486c67b",
+  "ownerWalletMon": "0.0000 at doctor time (kept as a fallback)",
+  "steps": [
+    {
+      "step": "mida init",
+      "result": "owner registered, 3 context areas opened, 3 agents registered, assistant granted; no MON needed; sponsor probed before the claim"
+    },
+    {
+      "step": "mida approve codex",
+      "result": "sponsor REFUSED: 'preVerificationGas 547190 is over this endpoint's ceiling of 500000' (our own policy, finally named by M3-D3 item 5); fallback topped up and self-paid",
+      "tx": "0x0bb69d3d93d43fdfe5f17b579ce1da39a72d6837c96b46dec7d5abd2751bacb9",
+      "gas": 831989,
+      "fix": "PRE_VERIFICATION_GAS_CEILING 500k -> 1.2M (commit dd9d831), sponsor redeployed 14:41"
+    },
+    {
+      "step": "mida approve claude-code",
+      "result": "SPONSORED \u2014 first grant the sponsor ever paid",
+      "tx": "0xac69174b71f1605278bc85ccdbde5e9c0f4f86c420d5a80b9d521a219457ce7d",
+      "userOpGas": 1188338
+    },
+    {
+      "step": "Claude Code session (toy task), killed mid-task",
+      "checkpointsSaved": 2,
+      "saves": [
+        {
+          "at": "2026-09-22T13:49:55.998Z",
+          "compileMs": 30858,
+          "saveMs": 8023
+        },
+        {
+          "at": "2026-09-22T13:50:16.115Z",
+          "compileMs": 12694,
+          "saveMs": 6793
+        }
+      ],
+      "compileModel": "deepseek-flash"
+    },
+    {
+      "step": "fresh Codex, prompt 'Continue.'",
+      "handoff": {
+        "at": "2026-09-22T13:50:22.031Z",
+        "checkpoints": 2,
+        "chars": 4664,
+        "ms": 3063,
+        "readMs": 2293
+      },
+      "finished": "src/lru.mjs (KeyedLimiter) + README Usage; npm test 2/2; no timers under src/ (a rule only Claude was told)"
+    },
+    {
+      "step": "mida revoke claude-code",
+      "result": "SPONSORED; chain line first; new read key to assistant and codex",
+      "tx": "0xd1704c14672b2bdcba8e347b4ff011b71b879fcec440da8ecec7dd32a7e107e2"
+    },
+    {
+      "step": "mida read --as claude-code",
+      "result": "refused: CAPABILITY_REVOKED"
+    },
+    {
+      "step": "mida read --as codex",
+      "result": "projects.current: read 2 object(s)"
+    }
+  ],
+  "limits": [
+    "one run, one owner, one scorer",
+    "Codex's own Stop hook was ignored (bad-transcript-path) \u2014 Codex-side capture is parked outside M3; the handoff INTO Codex is unaffected",
+    "the first approve's fallback used the testnet funder present in the owner's shell; a user without a funder would have seen the OWNER_WALLET_LOW sentence (M3-D6 item 1)"
+  ]
+}
