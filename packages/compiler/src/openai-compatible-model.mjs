@@ -92,13 +92,16 @@ if (!(url.protocol === "https:" || loopbackHttp)) {
 
 let input = ""
 process.stdin.setEncoding("utf8")
-for await (const chunk of process.stdin) input += chunk
+try {
+  for await (const chunk of process.stdin) input += chunk
+} catch {
+  fail(`${name}: stdin failed`)
+}
 
-let response
 try {
   const headers = { "content-type": "application/json" }
   if (key !== undefined && key !== "") headers.authorization = `Bearer ${key}`
-  response = await fetch(url, {
+  const response = await fetch(url, {
     method: "POST",
     headers,
     signal: AbortSignal.timeout(timeoutMs),
@@ -108,11 +111,16 @@ try {
       max_tokens: 8000,
     }),
   })
-} catch {
-  fail(`${name}: request failed`)
+  if (response.status !== 200) {
+    // drain the socket so it frees — the body itself is never read as text, never echoed
+    await response.arrayBuffer().catch(() => {})
+    fail(`${name} http ${response.status}`)
+  }
+  // a 200 whose body is not JSON or holds no message content is the controlled failure too
+  const body = await response.json().catch(() => undefined)
+  const content = body?.choices?.[0]?.message?.content
+  if (typeof content !== "string" || content === "") fail(`${name}: response held no content`)
+  process.stdout.write(content)
+} catch (error) {
+  fail(error instanceof Error && error.name === "TimeoutError" ? `${name}: request timed out` : `${name}: request failed`)
 }
-if (response.status !== 200) fail(`${name} http ${response.status}`)
-const body = await response.json()
-const content = body?.choices?.[0]?.message?.content
-if (typeof content !== "string" || content === "") fail(`${name}: response held no content`)
-process.stdout.write(content)
