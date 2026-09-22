@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { createServer as createHttpServer } from "node:http"
+import type { Server as HttpServer } from "node:http"
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -13,6 +15,7 @@ import {
   init,
   installClaudeCode,
   installCodex,
+  loadOrCreateOwnerSecrets,
   requestAccess,
   revoke,
   runDoctor,
@@ -176,6 +179,44 @@ describe("mida doctor on local Anvil", () => {
     expect(lines.some((line) => line.includes("grant expired"))).toBe(true)
     expect(code).toBeGreaterThan(0)
     expect(code).toBeLessThanOrEqual(9)
+  }, STEP_TIMEOUT)
+
+  it("(g) a working sponsor turns the wallet line into 'gas is sponsored'; a dead one restores the balance problem", async () => {
+    // M3-D3 item 3 — the Sep 22 defect: doctor printed "PROBLEM: owner's wallet is below the gas
+    // top-up line" while a sponsor was configured and answering. This home's owner was never
+    // funded — 0 MON — so the ONLY thing that can make the wallet line ok is the sponsor.
+    const sponsor: HttpServer = createHttpServer((_req, res) => {
+      res.setHeader("content-type", "application/json")
+      res.end(JSON.stringify({ name: "mida-gas-sponsor" }))
+    })
+    try {
+      const sponsorUrl = await new Promise<string>((resolve, reject) => {
+        sponsor.once("error", reject)
+        sponsor.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${(sponsor.address() as { port: number }).port}`))
+      })
+      const sponsoredHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-doctor-sponsored-")))
+      loadOrCreateOwnerSecrets(sponsoredHome) // a fresh owner — 0 MON on this chain
+      const deployment = {
+        ...env.deployment,
+        chainId: env.deployment.chainId.toString(),
+        deploymentBlock: env.deployment.deploymentBlock.toString(),
+      }
+      sponsoredHome.writeSecretJson("network.json", { rpcUrl: env.rpcUrl, deployment, sponsorUrl })
+      const up: string[] = []
+      await runDoctor({ home: sponsoredHome, print: (line) => up.push(line), env: {}, daemonProbeMs: 50 })
+      expect(up).toContain("ok: gas is sponsored (wallet holds 0.0000 MON; not needed)")
+      expect(up.some((line) => line.includes("below the gas top-up line"))).toBe(false)
+
+      // Same wallet, sponsor no longer answering: the balance matters again — the self-paid
+      // fallback is what would have to carry the next send.
+      sponsoredHome.writeSecretJson("network.json", { rpcUrl: env.rpcUrl, deployment, sponsorUrl: "http://127.0.0.1:1" })
+      const down: string[] = []
+      await runDoctor({ home: sponsoredHome, print: (line) => down.push(line), env: {}, daemonProbeMs: 50 })
+      expect(down.some((line) => line.startsWith("PROBLEM: owner's wallet is below the gas top-up line"))).toBe(true)
+      expect(down.some((line) => line.includes("gas is sponsored"))).toBe(false)
+    } finally {
+      await new Promise<void>((done) => sponsor.close(() => done()))
+    }
   }, STEP_TIMEOUT)
 
   it("(f) a PATH without the hook commands is a PROBLEM that names the fix (R4-6)", async () => {

@@ -18,7 +18,7 @@ import type { InstallTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
 import { listJobs } from "./queue.js"
-import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI } from "./runtime.js"
+import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon } from "./runtime.js"
 import { cliPackageName, isBundled } from "./sibling.js"
 
 /** The whole run is capped — a check may stall, the report may not. */
@@ -112,6 +112,33 @@ function ownerAddressOf(home: MidaHome): Address | "missing" {
 
 const NEEDS_NETWORK = `needs network.json — ${INIT_FIX}`
 const NEEDS_OWNER = `needs the owner key — ${INIT_FIX}`
+
+/**
+ * The sponsor URL a send would use right now: network.json's persisted value first (what init
+ * wrote), then the MIDA_SPONSOR_URL override — the same precedence the services check reports.
+ * The hosted default is deliberately NOT counted here: a home that never ran init has no
+ * network.json and this check bails earlier anyway, and a default nobody configured must not
+ * make a real network call inside a diagnostic run.
+ */
+function sponsorUrlInEffect(home: MidaHome, env: NodeJS.ProcessEnv): string | undefined {
+  const stored = home.readJson<{ sponsorUrl?: unknown }>("network.json")
+  if (typeof stored?.sponsorUrl === "string" && stored.sponsorUrl !== "") return stored.sponsorUrl
+  const raw = env.MIDA_SPONSOR_URL
+  if (raw === "off") return undefined
+  if (raw !== undefined && raw !== "") return raw
+  return undefined
+}
+
+/** One GET probe — true when the sponsor endpoint answers 2xx. Two seconds, like the sponsor check. */
+async function sponsorReachable(url: string): Promise<boolean> {
+  try {
+    const reply = await fetch(url, { signal: AbortSignal.timeout(2_000) })
+    return reply.ok
+  } catch {
+    return false
+  }
+}
+
 /** The repo's own `bin/` — the missing-hook-command fix for SOURCE-tree runs only (see hookCommandFix). */
 const BIN_DIR = fileURLToPath(new URL("../../../bin/", import.meta.url))
 /** The commands `mida install` writes into the tools' hook settings — bare text on purpose. */
@@ -411,6 +438,15 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         if (chain === undefined) return [problem("wallets cannot be checked", NEEDS_NETWORK)]
         const owner = shared.ownerAddress ?? ownerAddressOf(home)
         if (owner === "missing") return [problem("wallets cannot be checked", NEEDS_OWNER)]
+        // A reachable sponsor pays the gas, so wallet balances stop being a health signal
+        // (M3-D3 — the Sep 22 run printed a low-balance PROBLEM while the sponsor was working).
+        // Only with no sponsor configured, or one that is not answering, does a low wallet
+        // matter again: the self-paid fallback is what would have to carry the next send.
+        const sponsorUrl = sponsorUrlInEffect(home, deps.env ?? process.env)
+        if (sponsorUrl !== undefined && (await sponsorReachable(sponsorUrl))) {
+          const balance = await chain.context.publicClient.getBalance({ address: owner })
+          return [`ok: gas is sponsored (wallet holds ${formatMon(balance)} MON; not needed)`]
+        }
         const lines: string[] = []
         const wallets: { label: string; address: Address }[] = [{ label: "owner", address: owner }]
         for (const name of listAgentNames(home)) {
