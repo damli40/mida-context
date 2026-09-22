@@ -221,8 +221,10 @@ export async function initPasskey(
   const registered = owner !== undefined ? await readOwnerKey(owner) : null
   if (owner !== undefined && registered !== null) {
     deps.print(`owner ${owner} — already registered on chain`)
-    // re-stamp the point too — a home resumed from before the field existed gains it here
+    // re-stamp the point too — a home resumed from before the field existed gains it here,
+    // and a run interrupted between the two writes still ends with a mode
     saveOwnerAddress(home, owner, { x: `0x${registered.qx.toString(16).padStart(64, "0")}`, y: `0x${registered.qy.toString(16).padStart(64, "0")}` })
+    saveOwnerMode(home, "passkey")
   } else {
     const result = await runOwnerLinkRound("signup", { chainId: Number(network.deployment.chainId) }, deps)
     if (result.status !== "success") declined(result)
@@ -383,7 +385,7 @@ export async function provisionPasskeyAgents(
           deps,
         )
         if (result.status !== "success") declined(result)
-        if (result.owner !== owner) mismatch()
+        if (result.owner?.toLowerCase() !== owner.toLowerCase()) mismatch()
         const agent = session.agent(name)
         progress("proving the grant on the chain…")
         const grant = await agent.completeAccessRequest(request, await synthesizeGrantResponse(session, request, result))
@@ -436,7 +438,11 @@ async function synthesizeGrantResponse(
     const receipt = await session.chain.publicClient.getTransactionReceipt({ hash: tx }).catch(() => null)
     if (receipt === null || receipt.status !== "success") continue
     for (const log of parseEventLogs({ abi: capabilityRegistryAbi, eventName: "CapabilityGranted", logs: receipt.logs })) {
-      if (log.address.toLowerCase() === registry && log.args.owner.toLowerCase() === owner && log.args.agentId === request.agentId.toLowerCase()) {
+      if (
+        log.address.toLowerCase() === registry &&
+        log.args.owner.toLowerCase() === owner.toLowerCase() &&
+        log.args.agentId.toLowerCase() === request.agentId.toLowerCase()
+      ) {
         emitted.set(log.args.capabilityId.toLowerCase(), tx)
       }
     }
@@ -597,36 +603,43 @@ export async function approvePasskey(
   const list = wantsProject ? await currentListRows(home, owner) : { file: "missing" as const, entries: [] as ProjectApproval[], droppedRows: null }
   if (list.file === "unreadable") throw codedError("list-unreadable", "the approved-projects list could not be read")
 
-  let request: AccessRequest
+  let request: AccessRequest | undefined
   let pendingRequest = false
   const pending = home.readJson<{ request: AccessRequest }>(`agents/${name}/pending-request.json`)
   if (pending !== undefined) {
     const stored = await new FileAccessRequestStore(home, name).load(pending.request.requestId)
-    if (stored === undefined || stored.consumed) throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
-    request = pending.request
-    pendingRequest = true
-  } else if (missing.length > 0 && live) {
-    // The upgrade path: partially granted agent, no pending request — sign one for the missing scopes.
-    request = await session.agent(name).createAccessRequest({
-      purposeId: identity.purposeId,
-      scopes: missing.map((s) => ({ namespace: namespaceById(s.namespaceId).name, permissions: s.permissions, provenancePolicy: s.provenancePolicy })),
-      capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
-    })
-    home.writeSecretJson(`agents/${name}/pending-request.json`, { request })
-    pendingRequest = true
-  } else if (live && wantsProject) {
-    // Already approved on chain; the folder row still needs the passkey's signature — the
-    // request exists only to carry the entry through the page's approve flow.
-    deps.print(`${name} is already approved on chain; adding this folder needs one passkey touch`)
-    request = await session.agent(name).createAccessRequest({
-      purposeId: identity.purposeId,
-      scopes: expectedScopesFor(identity.purposeId),
-      capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
-    })
-  } else if (live) {
-    throw codedError("already-approved", `agent "${name}" is already approved`)
-  } else {
-    throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
+    if (stored?.consumed) throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
+    if (stored !== undefined) {
+      request = pending.request
+      pendingRequest = true
+    }
+    // undefined means the file is the upgrade path's own — never written to the store — so the
+    // code below rebuilds it rather than stranding the re-run on a "no pending request" refusal
+  }
+  if (request === undefined) {
+    if (missing.length > 0 && live) {
+      // The upgrade path: partially granted agent, no pending request — sign one for the missing scopes.
+      request = await session.agent(name).createAccessRequest({
+        purposeId: identity.purposeId,
+        scopes: missing.map((s) => ({ namespace: namespaceById(s.namespaceId).name, permissions: s.permissions, provenancePolicy: s.provenancePolicy })),
+        capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
+      })
+      home.writeSecretJson(`agents/${name}/pending-request.json`, { request })
+      pendingRequest = true
+    } else if (live && wantsProject) {
+      // Already approved on chain; the folder row still needs the passkey's signature — the
+      // request exists only to carry the entry through the page's approve flow.
+      deps.print(`${name} is already approved on chain; adding this folder needs one passkey touch`)
+      request = await session.agent(name).createAccessRequest({
+        purposeId: identity.purposeId,
+        scopes: expectedScopesFor(identity.purposeId),
+        capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
+      })
+    } else if (live) {
+      throw codedError("already-approved", `agent "${name}" is already approved`)
+    } else {
+      throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
+    }
   }
 
   // Only what the chain does not already authorize is granted — a request whose scopes are all
@@ -660,7 +673,7 @@ export async function approvePasskey(
 
   const result = await runOwnerLinkRound("approve", req, deps)
   if (result.status !== "success") declined(result)
-  if (result.owner !== owner) mismatch()
+  if (result.owner?.toLowerCase() !== owner.toLowerCase()) mismatch()
 
   let granted = 0
   if (needed.length > 0) {
@@ -762,6 +775,7 @@ export async function revokePasskey(
   }
 
   const file = await readApprovalsFile(home, owner)
+  if (file.kind === "unreadable") throw codedError("list-unreadable", "the approved-projects list could not be read")
   const current = file.kind === "signed" ? file.entries : []
   const kept = current.filter((e) => e.agent !== name)
 
@@ -788,7 +802,7 @@ export async function revokePasskey(
     declined(result)
   }
   if (result.status !== "success") declined(result)
-  if (result.owner !== owner) mismatch()
+  if (result.owner?.toLowerCase() !== owner.toLowerCase()) mismatch()
 
   // The chain, not the page, decides whether the revoke landed: every id that was live must be dead.
   session.progress?.("proving the revocation on the chain…")
