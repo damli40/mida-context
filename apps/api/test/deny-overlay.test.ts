@@ -40,4 +40,29 @@ describe("DenyOverlay persistence (§12.5)", () => {
     expect((await reloaded.list()).map((candidate) => candidate.id)).toEqual([intent.id])
     expect(await reloaded.denies({ owner: OWNER, agentId: AGENT, capabilityId: CAPABILITY })).toBe(true)
   })
+
+  it("reconcileOwner reads the chain only for the caller's intents", async () => {
+    const other = "0x9999999999999999999999999999999999999999" as Address
+    const overlay = new DenyOverlay(file())
+    const mine = await overlay.create(OWNER, { kind: "agent", agentId: AGENT }, 4n)
+    const theirs = await overlay.create(other, { kind: "capability", capabilityId: CAPABILITY }, null)
+
+    const reads: string[] = []
+    const reader = {
+      getCapability: async (capabilityId: Hex) => {
+        reads.push(`capability:${capabilityId}`)
+        return { revoked: true }
+      },
+      agentEpoch: async (owner: Address, agentId: Hex) => {
+        reads.push(`epoch:${owner}:${agentId}`)
+        return 9n
+      },
+    }
+    await overlay.reconcileOwner(reader as never, OWNER)
+    // The caller's deny anchored on the epoch advance; the other owner's was never even read.
+    expect(reads).toEqual([`epoch:${OWNER.toLowerCase()}:${AGENT}`])
+    const intents = await overlay.list()
+    expect(intents.find((intent) => intent.id === mine.id)?.state).toBe("anchored")
+    expect(intents.find((intent) => intent.id === theirs.id)?.state).toBe("active")
+  })
 })

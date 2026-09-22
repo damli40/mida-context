@@ -603,8 +603,9 @@ export function createContextApi(options: ContextApiOptions) {
     if (state !== undefined && state !== "active" && state !== "anchored" && state !== "cancelled") {
       throw new MidaError("INVALID_WIRE", "state must be active, anchored or cancelled")
     }
-    // Reconcile before listing so a revocation that already landed reads anchored, not still-active.
-    await overlay.reconcile(chain)
+    // Reconcile before listing so a revocation that already landed reads anchored, not still-active —
+    // scoped to the signer: one caller's request must not read the chain for every owner's intents.
+    await overlay.reconcileOwner(chain, owner)
     const intents = (await overlay.list()).filter((intent) => intent.owner === owner && (state === undefined || intent.state === state))
     return c.json(
       intents.map((intent) => ({
@@ -623,7 +624,7 @@ export function createContextApi(options: ContextApiOptions) {
     const owner = c.get("signer")
     const chain = c.get("chain")
     const id = hex(c.req.param("id"), 32, "id")
-    await overlay.reconcile(chain)
+    await overlay.reconcileOwner(chain, owner)
     const intent = await overlay.reissueNonce(id, owner)
     return c.json({ intentId: intent.id, state: intent.state, cancellationNonce: intent.cancellationNonce })
   })

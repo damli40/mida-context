@@ -174,13 +174,29 @@ export class DenyOverlay {
   /** active → anchored only when Monad shows the matching revocation. Failed or missing transactions leave it active. */
   async reconcile(reader: RegistryReader): Promise<void> {
     for (const intent of await this.#store.list()) {
-      if (intent.state !== "active") continue
-      const anchored =
-        intent.target.kind === "capability"
-          ? (await reader.getCapability(intent.target.capabilityId))?.revoked === true
-          : (await reader.agentEpoch(intent.owner, intent.target.agentId)) > BigInt(intent.agentEpochAtIntent ?? "0")
-      if (anchored) await this.#store.update({ ...intent, state: "anchored", cancellationNonce: null })
+      await this.#reconcileIntent(reader, intent)
     }
+  }
+
+  /**
+   * The same pass narrowed to one owner (M3-D6): a request authenticated as an owner must not
+   * spend chain reads on every other owner's intents — reconcile only what the caller may see.
+   */
+  async reconcileOwner(reader: RegistryReader, owner: Address): Promise<void> {
+    const lower = owner.toLowerCase()
+    for (const intent of await this.#store.list()) {
+      if (intent.owner !== lower) continue
+      await this.#reconcileIntent(reader, intent)
+    }
+  }
+
+  async #reconcileIntent(reader: RegistryReader, intent: RevocationIntent): Promise<void> {
+    if (intent.state !== "active") return
+    const anchored =
+      intent.target.kind === "capability"
+        ? (await reader.getCapability(intent.target.capabilityId))?.revoked === true
+        : (await reader.agentEpoch(intent.owner, intent.target.agentId)) > BigInt(intent.agentEpochAtIntent ?? "0")
+    if (anchored) await this.#store.update({ ...intent, state: "anchored", cancellationNonce: null })
   }
 
   /**
