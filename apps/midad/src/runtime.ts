@@ -410,6 +410,16 @@ export class Runtime extends ServiceRuntime {
     }
   }
 
+  /**
+   * One progress line for a send the owner's context is about to make — "(sponsored)" when that
+   * context carries a sponsor, the old timing hint when the wallet itself pays (M3-D3). Reading
+   * `ownerChain.sponsor` rather than a flag or the network config is what keeps the line true:
+   * it answers for the exact context the send will run through.
+   */
+  sendProgress(what: string): void {
+    this.progress?.(`${what} (${this.ownerChain.sponsor !== undefined ? "sponsored" : "about 5 seconds"})…`)
+  }
+
   /** Builds the agent from its saved identity and the grants it completed before, and keeps it for `agent(name)`. */
   attach(identity: AgentIdentity): MidaAgent {
     const agent = buildAgent(this.home, this.network, this.apiBaseUrl, identity, (line) => this.progress?.(line))

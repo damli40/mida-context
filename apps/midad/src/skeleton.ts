@@ -207,7 +207,7 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
           scopes: missing.map((s) => ({ namespace: namespaceById(s.namespaceId).name, permissions: s.permissions, provenancePolicy: s.provenancePolicy })),
           capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
         })
-        runtime.progress?.(`sending ${name}'s grant (about 5 seconds)…`)
+        runtime.sendProgress(`sending ${name}'s grant`)
         const approval = await vault.approveGrant({ accessRequest: request, manifest: identity.manifest, selection: { kind: "recommended" } })
         const agent = runtime.agent(name)
         await agent.completeAccessRequest(request, approval.response)
@@ -384,7 +384,7 @@ export async function approve(
       rotated.push(nsId)
     }
   }
-  runtime.progress?.("sending the grant (about 5 seconds)…")
+  runtime.sendProgress("sending the grant")
   const approval = await vault.approveGrant({
     accessRequest: pending.request,
     manifest: identity.manifest,
@@ -534,7 +534,7 @@ export async function revoke(runtime: Runtime, name: string): Promise<{ transact
     if (await isCapabilityLive(runtime.ownerChain, id)) anyLive = true
   }
   if (anyLive) {
-    runtime.progress?.("sending the revocation (about 5 seconds)…")
+    runtime.sendProgress("sending the revocation")
     transactionHashes.push((await vault.approveRevocation({ kind: "agent", agentId })).transactionHash)
   }
   // The marker records "this agent was revoked", so it is written whenever the agent was identified and
