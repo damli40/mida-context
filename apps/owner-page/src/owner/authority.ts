@@ -16,7 +16,9 @@ import {
 } from "@mida/protocol"
 import type {
   AccessGrantResponse,
+  AccessRequest,
   Address,
+  GrantAdvice,
   GrantedCapability,
   Hex,
   WebAuthnAuthStruct,
@@ -179,55 +181,17 @@ export class PasskeyVaultAuthority implements VaultAuthority {
     this.#live()
     const { accessRequest } = request
     const { deployment } = this.#write
-    if (
-      decodeUint64(accessRequest.chainId) !== deployment.chainId ||
-      accessRequest.capabilityRegistry.toLowerCase() !== deployment.capabilityRegistry
-    ) {
-      throw new MidaError("INVALID_WIRE", "access request targets a different chain or registry than this authority")
-    }
-    const agentRecord = await readAgentRecord(this.#write, accessRequest.agentId)
-    const history = await ownerHistory({
-      client: this.#publicClient,
-      deployment,
-      owner: this.owner,
-      agentId: accessRequest.agentId,
-    })
-    const now = await latestTimestamp(this.#write)
-    const advice = adviseGrant({ request: accessRequest, manifest: request.manifest, agentRecord, ownerHistory: history, now })
-
-    const selected =
-      request.selection.kind === "recommended"
-        ? { scopes: advice.recommended, expiresAt: decodeUint64(advice.recommendedExpiresAt) }
-        : { scopes: sortScopes(request.selection.scopes), expiresAt: request.selection.expiresAt }
-    if (selected.scopes.length === 0) throw new MidaError("CAPABILITY_DENIED", "nothing was selected to grant")
-    assertFinalSelection({
-      requestedScopes: accessRequest.scopes,
-      requestedExpiresAt: decodeUint64(accessRequest.capabilityExpiresAt),
-      finalScopes: selected.scopes,
-      finalExpiresAt: selected.expiresAt,
-      now,
-    })
-
-    const { agentSignature: _signature, ...unsigned } = accessRequest
-    const requestHash = accessRequestHash(unsigned)
-    const nonce = await this.#readCapability<bigint>("grantNonce", [this.owner])
-    const challenge = grantDigest({
-      chainId: deployment.chainId,
-      capabilityRegistry: deployment.capabilityRegistry,
-      owner: this.owner,
-      agentId: accessRequest.agentId,
-      requestHash,
-      manifestHash: accessRequest.manifestHash,
-      manifestVersion: BigInt(accessRequest.manifestVersion),
-      finalScopes: selected.scopes,
-      expiresAt: selected.expiresAt,
-      grantNonce: nonce,
-    })
-    const auth = this.#grantAssertion(challenge)
+    const prepared = await prepareGrant(
+      { publicClient: this.#publicClient, deployment },
+      this.owner,
+      request,
+      (functionName, args) => this.#readCapability(functionName, args),
+    )
+    const auth = this.#grantAssertion(prepared.challenge)
     const receipt = await this.#sendCapability("grant.batch", "grantBatch", [
       toAccessRequestStruct(accessRequest),
-      selected.scopes,
-      selected.expiresAt,
+      prepared.selected.scopes,
+      prepared.selected.expiresAt,
       auth,
     ])
 
@@ -249,7 +213,7 @@ export class PasskeyVaultAuthority implements VaultAuthority {
       capabilityRegistry: accessRequest.capabilityRegistry,
       requestId: accessRequest.requestId,
       nonce: accessRequest.nonce,
-      requestHash,
+      requestHash: prepared.requestHash,
       owner: this.owner,
       agentId: accessRequest.agentId,
       manifestHash: accessRequest.manifestHash,
@@ -264,7 +228,7 @@ export class PasskeyVaultAuthority implements VaultAuthority {
         await this.publishReaderWraps({ agentId: accessRequest.agentId, namespaceId: capability.namespaceId })
       }
     }
-    return { advice, response, gasUsed: receipt.gasUsed }
+    return { advice: prepared.advice, response, gasUsed: receipt.gasUsed }
   }
 
   /** Publishes one wrap per registered epoch for an agent that holds live exact READ — same as the fake vault. */
@@ -408,4 +372,84 @@ export class PasskeyVaultAuthority implements VaultAuthority {
   async #send(kind: TxKind, abi: Abi, address: Address, functionName: string, args: readonly unknown[]): Promise<TransactionReceipt> {
     return sendSponsoredOnly(this.#write, { address, abi, functionName, args }, kind)
   }
+}
+
+export interface PreparedGrant {
+  /** The grant advice — also what the page shows the owner before the passkey touch. */
+  advice: GrantAdvice
+  /** The scopes+expiry the send will carry. */
+  selected: { scopes: AccessRequest["scopes"]; expiresAt: bigint }
+  /** sha256 of the unsigned request — the requestHash the contract and terminal check. */
+  requestHash: Hex
+  /** The digest the passkey ceremony must sign — the challenge for `assertOwnerPasskey`. */
+  challenge: Hex
+}
+
+/**
+ * Everything approveGrant needs computed BEFORE the passkey touch: the advisor's verdict (which
+ * throws on a bad, expired, or forged request), the selection, and the grant digest the ceremony
+ * must sign. `owner` is the EXPECTED owner (from the link) at prepare time — the flow verifies
+ * the derived address equals it right after the ceremony, before any send. approveGrant re-runs
+ * the same preparation, so a grantNonce that moved between the two reads fails the local
+ * challenge check instead of reverting on chain.
+ */
+export async function prepareGrant(
+  ctx: { publicClient: PublicClient; deployment: Deployment },
+  owner: Address,
+  request: GrantRequest,
+  read: (functionName: string, args: readonly unknown[]) => Promise<unknown> = async (functionName, args) =>
+    ctx.publicClient.readContract({
+      address: ctx.deployment.capabilityRegistry,
+      abi: capabilityRegistryAbi,
+      functionName,
+      args,
+    } as never),
+): Promise<PreparedGrant> {
+  const { accessRequest } = request
+  const { deployment } = ctx
+  if (
+    decodeUint64(accessRequest.chainId) !== deployment.chainId ||
+    accessRequest.capabilityRegistry.toLowerCase() !== deployment.capabilityRegistry
+  ) {
+    throw new MidaError("INVALID_WIRE", "access request targets a different chain or registry than this authority")
+  }
+  const agentRecord = await readAgentRecord(ctx, accessRequest.agentId)
+  const history = await ownerHistory({
+    client: ctx.publicClient,
+    deployment,
+    owner,
+    agentId: accessRequest.agentId,
+  })
+  const now = await latestTimestamp(ctx)
+  const advice = adviseGrant({ request: accessRequest, manifest: request.manifest, agentRecord, ownerHistory: history, now })
+
+  const selected =
+    request.selection.kind === "recommended"
+      ? { scopes: advice.recommended, expiresAt: decodeUint64(advice.recommendedExpiresAt) }
+      : { scopes: sortScopes(request.selection.scopes), expiresAt: request.selection.expiresAt }
+  if (selected.scopes.length === 0) throw new MidaError("CAPABILITY_DENIED", "nothing was selected to grant")
+  assertFinalSelection({
+    requestedScopes: accessRequest.scopes,
+    requestedExpiresAt: decodeUint64(accessRequest.capabilityExpiresAt),
+    finalScopes: selected.scopes,
+    finalExpiresAt: selected.expiresAt,
+    now,
+  })
+
+  const { agentSignature: _signature, ...unsigned } = accessRequest
+  const requestHash = accessRequestHash(unsigned)
+  const nonce = (await read("grantNonce", [owner])) as bigint
+  const challenge = grantDigest({
+    chainId: deployment.chainId,
+    capabilityRegistry: deployment.capabilityRegistry,
+    owner,
+    agentId: accessRequest.agentId,
+    requestHash,
+    manifestHash: accessRequest.manifestHash,
+    manifestVersion: BigInt(accessRequest.manifestVersion),
+    finalScopes: selected.scopes,
+    expiresAt: selected.expiresAt,
+    grantNonce: nonce,
+  })
+  return { advice, selected, requestHash, challenge }
 }

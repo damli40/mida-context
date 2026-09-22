@@ -1,0 +1,75 @@
+body {
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  color: #1a1a1a;
+  background: #fbfaf8;
+  margin: 0;
+}
+main {
+  max-width: 34rem;
+  margin: 0 auto;
+  padding: 2rem 1rem 4rem;
+}
+h1 { font-size: 1.5rem; }
+.pairing {
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1.5rem 0;
+  background: #fff;
+}
+.pairing p { margin: 0 0 0.5rem; font-size: 0.9rem; color: #444; }
+.pairing code {
+  display: block;
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  padding: 0.5rem 0;
+}
+.identity { font-size: 0.9rem; color: #555; }
+#summary {
+  white-space: pre-wrap;
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 1rem;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+button {
+  font-size: 1rem;
+  padding: 0.7rem 1.4rem;
+  border-radius: 8px;
+  border: none;
+  background: #2c5fe3;
+  color: #fff;
+  cursor: pointer;
+  margin-top: 1rem;
+}
+button:disabled { background: #9db4e8; cursor: default; }
+input[type="text"] {
+  font-size: 1rem;
+  padding: 0.5rem;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  width: 100%;
+  box-sizing: border-box;
+}
+label { display: block; font-size: 0.9rem; color: #444; margin-bottom: 0.3rem; }
+#error {
+  color: #a40000;
+  background: #fdecec;
+  border: 1px solid #f2c4c4;
+  border-radius: 8px;
+  padding: 0.8rem;
+  font-size: 0.95rem;
+}
+#progress { padding-left: 1.2rem; font-size: 0.9rem; color: #444; line-height: 1.7; }
+#result-status { font-weight: 600; }
+#result-json {
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 0.8rem;
+}

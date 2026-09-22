@@ -59,6 +59,8 @@ export interface LinkRequest {
   project?: ProjectLabel
   /** Current project-list entries the page re-signs after an approve. */
   entries?: Record<string, unknown>[]
+  /** The new approved-projects row to append (approve): {agent, projectId, root}. */
+  entry?: { agent: string; projectId: string; root: string }
 }
 
 export interface ParsedLink {
@@ -73,7 +75,7 @@ export interface ParsedLink {
 }
 
 const ALLOWED_PARAMS = new Set(["v", "req", "port", "nonce"])
-const ALLOWED_REQ_KEYS = new Set(["chainId", "owner", "request", "manifest", "agentId", "readers", "project", "entries"])
+const ALLOWED_REQ_KEYS = new Set(["chainId", "owner", "request", "manifest", "agentId", "readers", "project", "entries", "entry"])
 
 function fail(reason: string): never {
   throw new LinkError(reason)
@@ -172,7 +174,28 @@ export function parseLinkFragment(fragment: string, flow: FlowName): ParsedLink 
     if (!Array.isArray(decoded.entries) || decoded.entries.length > 256 || !decoded.entries.every(isPlainObject)) {
       fail("the request's entries field is not an array of objects")
     }
+    for (const row of decoded.entries) {
+      const keys = Object.keys(row)
+      if (keys.length !== 4 || !["agent", "projectId", "root", "approvedAt"].every((k) => typeof row[k] === "string" && row[k] !== "")) {
+        fail("an entries row is not the signed {agent, projectId, root, approvedAt} shape")
+      }
+    }
     req.entries = decoded.entries
+  }
+  if (decoded.entry !== undefined) {
+    if (
+      !isPlainObject(decoded.entry) ||
+      Object.keys(decoded.entry).length !== 3 ||
+      typeof decoded.entry.agent !== "string" ||
+      decoded.entry.agent === "" ||
+      typeof decoded.entry.projectId !== "string" ||
+      decoded.entry.projectId === "" ||
+      typeof decoded.entry.root !== "string" ||
+      decoded.entry.root === ""
+    ) {
+      fail("the request's entry field is not {agent, projectId, root}")
+    }
+    req.entry = { agent: decoded.entry.agent, projectId: decoded.entry.projectId, root: decoded.entry.root }
   }
 
   // Per-flow requirements — an approve link with no request, or a revoke link naming no agent,
@@ -192,7 +215,8 @@ export function parseLinkFragment(fragment: string, flow: FlowName): ParsedLink 
 /** What the page hands back to the terminal — and nothing more. See PROTOCOL.md. */
 export interface FlowResult {
   v: 1
-  status: "success" | "cancelled" | "failed"
+  /** "pending" is the sponsor-accepted-but-unconfirmed state — carries the operation hash, never a resend. */
+  status: "success" | "cancelled" | "failed" | "pending"
   nonce: string
   requestHash: Hex
   owner: Address | null

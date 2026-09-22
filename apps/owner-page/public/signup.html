@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mida — sign up</title>
+  <link rel="stylesheet" href="./owner.css">
+  <script src="./signup.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Create your Mida passkey</h1>
+    <p>
+      One passkey becomes your Mida identity — the thing that approves and revokes what agents
+      may read. There is no password and no key file.
+    </p>
+
+    <section class="pairing">
+      <p id="pairing-label">Only approve if this code matches your terminal:</p>
+      <code id="pairing-code">…</code>
+    </section>
+
+    <p class="identity" id="identity-line"></p>
+
+    <p>
+      <label for="owner-name">A name for this passkey (only you see it):</label>
+      <input id="owner-name" type="text" placeholder="Dami's Mida" autocomplete="off">
+    </p>
+
+    <button id="go" type="button">Create my passkey</button>
+
+    <p id="error" hidden></p>
+    <ul id="progress"></ul>
+
+    <section id="result" hidden>
+      <h2 id="result-status"></h2>
+      <pre id="result-json"></pre>
+    </section>
+  </main>
+</body>
+</html>

@@ -56,7 +56,27 @@ await build({
   plugins: [browserEntries],
 })
 
+// The three flow pages — one bundle each, on top of the same browser-safe graph.
+for (const flow of ["signup", "approve", "revoke"]) {
+  await build({
+    entryPoints: [join(appRoot, `src/owner/${flow}.ts`)],
+    bundle: true,
+    format: "iife",
+    platform: "browser",
+    target: "es2022",
+    outfile: join(dist, `${flow}.js`),
+    sourcemap: false,
+    minify: false,
+    logLevel: "info",
+    plugins: [browserEntries],
+  })
+}
+
 await copyFile(join(appRoot, "public/check.html"), join(dist, "check.html"))
 await copyFile(join(appRoot, "public/check.css"), join(dist, "check.css"))
+await copyFile(join(appRoot, "public/owner.css"), join(dist, "owner.css"))
+for (const flow of ["signup", "approve", "revoke"]) {
+  await copyFile(join(appRoot, `public/${flow}.html`), join(dist, `${flow}.html`))
+}
 
-console.log("dist/: check.js, owner-core.js, check.css, check.html")
+console.log("dist/: check.js, owner-core.js, signup.js, approve.js, revoke.js, check.css, owner.css, check.html, signup.html, approve.html, revoke.html")

@@ -5,9 +5,12 @@ export interface OwnerPageEnv {
   ASSETS: { fetch(input: Request | string): Promise<Response> }
 }
 
-/** Both `/` and `/check` serve the one page — the reviewer may point the route at either. */
+/** `/` and `/check` serve the device check; each owner flow gets its own page route. */
 export function assetPathFor(pathname: string): string {
   if (pathname === "" || pathname === "/" || pathname === "/check" || pathname === "/check/") return "/check.html"
+  if (pathname === "/signup" || pathname === "/signup/") return "/signup.html"
+  if (pathname === "/approve" || pathname === "/approve/") return "/approve.html"
+  if (pathname === "/revoke" || pathname === "/revoke/") return "/revoke.html"
   return pathname
 }
 
