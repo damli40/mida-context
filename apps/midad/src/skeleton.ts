@@ -3,7 +3,7 @@ import { MidaError, PERMISSION, decodeUint64, isMidaError, namespaceById, namesp
 import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScope } from "@mida/protocol"
 import { capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
 import type { ChainContext, HistoryScanCursor } from "@mida/chain"
-import { provisionAgent } from "@mida/fake-vault"
+import { DENY_CANCEL_EXPIRY_SECONDS, provisionAgent } from "@mida/fake-vault"
 import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
 import type { StoredCheckpoint } from "@mida/checkpoint"
@@ -335,6 +335,12 @@ export async function approve(
   runtime.progress?.(`asking the chain what ${name} already holds…`)
   const missing = await missingExpectedScopes(runtime, identity.agentId, identity.purposeId)
   const live = await hasAnyLiveCapability(runtime, identity.agentId)
+  // M3-D4: a revoke that failed after its deny was staged leaves the store blocking an agent the
+  // chain approves. The cleanup runs before EVERY branch below because the deny would poison any of
+  // them: the grant path's own wrap publish gets CAPABILITY_DENIED, and the already-approved answer
+  // would tell the owner nothing is wrong while the store still refuses the agent.
+  const cleared = await clearStaleStoreDenies(runtime, identity.agentId)
+  if (cleared > 0) await repairReaderWraps(runtime, undefined, identity.agentId)
   let pending = home.readJson<{ request: AccessRequest }>(`agents/${name}/pending-request.json`)
 
   if (pending === undefined) {
@@ -588,9 +594,49 @@ async function resolveAgentId(runtime: ServiceRuntime, name: string): Promise<He
   throw codedError("agent-unidentified", `agent "${name}" cannot be identified: identity.json, grants.json and a registered signer.json are all missing or unreadable under agents/${name}/`)
 }
 
+/**
+ * M3-D4: a revoke that failed after its deny was staged leaves an `active` intent that silently
+ * locks this agent out of the store while the chain still approves it. Clearing one takes a fresh
+ * owner passkey assertion over a nonce the store hands out NOW — `GET /revocations` withholds
+ * nonces, so `POST /revocations/:id/reissue` mints a new one and retires whatever the failed run
+ * saw. Covers agent-target denies and capability denies that belong to this agent alike. Returns
+ * how many intents were cancelled.
+ */
+async function clearStaleStoreDenies(runtime: Runtime, agentId: Hex): Promise<number> {
+  let intents: Awaited<ReturnType<typeof runtime.ownerApi.listRevocations>>
+  try {
+    intents = await runtime.ownerApi.listRevocations("active")
+  } catch {
+    // The store could not even be asked — the honest line is a note, not silence: a stale deny
+    // may still be there and approve cannot see it. A REFUSED reissue or cancel below still throws.
+    runtime.progress?.("note: could not reach the store to check for stale denies")
+    return 0
+  }
+  let cleared = 0
+  for (const intent of intents) {
+    const forAgent =
+      intent.target.kind === "agent"
+        ? intent.target.agentId.toLowerCase() === agentId.toLowerCase()
+        : (await runtime.reader.getCapability(intent.target.capabilityId))?.agentId.toLowerCase() === agentId.toLowerCase()
+    if (!forAgent) continue
+    const reissued = await runtime.ownerApi.reissueRevocationNonce(intent.intentId)
+    const expiresAt = BigInt(Math.floor(Date.now() / 1000)) + DENY_CANCEL_EXPIRY_SECONDS
+    const assertion = runtime.vault.approveDenyCancellation({
+      revocationIntentId: intent.intentId,
+      apiCancellationNonce: BigInt(reissued.cancellationNonce),
+      expiresAt,
+    })
+    await runtime.ownerApi.cancelRevocation(intent.intentId, { expiresAt, assertion })
+    cleared += 1
+    runtime.progress?.("cleared a stale block at the store left by a failed revoke")
+  }
+  return cleared
+}
+
 export async function repairReaderWraps(
   runtime: Runtime,
   namespaceIds: readonly Hex[] = [NAMESPACE_ID, ...FACT_NAMESPACES.map((ns) => namespaceId(ns))],
+  onlyAgentId?: Hex,
 ): Promise<string[]> {
   const { home, vault, reader, owner } = runtime
   // Who gets a wrap is decided first, so the owner hears how many agents the new key goes to
@@ -601,6 +647,7 @@ export async function repairReaderWraps(
     let identity: ReturnType<typeof loadAgentIdentity>
     try { identity = loadAgentIdentity(home, name) } catch { continue }
     if (identity === undefined) continue
+    if (onlyAgentId !== undefined && identity.agentId.toLowerCase() !== onlyAgentId.toLowerCase()) continue
     const nsIds: Hex[] = []
     for (const nsId of namespaceIds) {
       if (await reader.hasAuthority(owner, identity.agentId, nsId, PERMISSION.READ, 0)) nsIds.push(nsId)

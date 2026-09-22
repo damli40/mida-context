@@ -143,6 +143,10 @@ export class ContextApiClient implements ContextApiRoutes {
   listRevocations(state?: DenyState) {
     return this.request<RevocationIntentView[]>("GET", "/revocations", state === undefined ? {} : { query: { state } })
   }
+
+  reissueRevocationNonce(intentId: Hex) {
+    return this.request<{ intentId: Hex; state: string; cancellationNonce: string }>("POST", `/revocations/${intentId}/reissue`)
+  }
 }
 
 /** Retries `listObjects` performs after the first response still carries `x-mida-partial`. */
@@ -181,4 +185,5 @@ export interface ContextApiRoutes {
   requestRevocationDeny(target: { capabilityId: Hex } | { owner: Address; agentId: Hex }): Promise<{ intentId: Hex; state: string; cancellationNonce: string }>
   cancelRevocation(intentId: Hex, input: { expiresAt: bigint; assertion: WebAuthnAssertionInput }): Promise<{ intentId: Hex; state: string }>
   listRevocations(state?: DenyState): Promise<RevocationIntentView[]>
+  reissueRevocationNonce(intentId: Hex): Promise<{ intentId: Hex; state: string; cancellationNonce: string }>
 }

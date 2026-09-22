@@ -616,6 +616,18 @@ export function createContextApi(options: ContextApiOptions) {
     )
   })
 
+  // M3-D4: GET withholds the nonce, so an owner clearing a stale deny it did not just create
+  // re-arms the intent here. Reconciling first means a revoke that already landed reads anchored
+  // and refuses — the deny that corresponds to a real revocation must never be re-armed.
+  app.post("/revocations/:id/reissue", authenticated(limits.maxRequestBodyBytes), async (c) => {
+    const owner = c.get("signer")
+    const chain = c.get("chain")
+    const id = hex(c.req.param("id"), 32, "id")
+    await overlay.reconcile(chain)
+    const intent = await overlay.reissueNonce(id, owner)
+    return c.json({ intentId: intent.id, state: intent.state, cancellationNonce: intent.cancellationNonce })
+  })
+
   app.post("/revocations/:id/cancel", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const owner = c.get("signer")
     const chain = c.get("chain")

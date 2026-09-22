@@ -258,4 +258,29 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     // an unknown state is a wire error, not a silently empty list
     await expect(ownerClient.request("GET", "/revocations", { query: { state: "pending" } })).rejects.toMatchObject({ code: "INVALID_WIRE" })
   })
+
+  it("POST /revocations/:id/reissue mints a fresh nonce, retires the old one, and refuses non-owners", async () => {
+    // The nonce a deny was created with is returned once, to that caller. An owner clearing a stale
+    // deny it did NOT just stage — a revoke that failed on an earlier run — re-arms the intent here.
+    const intent = await ownerClient.request<{ intentId: Hex; cancellationNonce: string }>("POST", "/revocations", { body: { agentId: agentE.agentId } })
+    const reissued = await ownerClient.reissueRevocationNonce(intent.intentId)
+    expect(reissued).toMatchObject({ intentId: intent.intentId, state: "active" })
+    expect(reissued.cancellationNonce).toMatch(/^[0-9]+$/)
+    expect(reissued.cancellationNonce).not.toBe(intent.cancellationNonce)
+    // a stranger's own intents do not include this one, so there is nothing of theirs to re-arm
+    await expect(strangerClient.reissueRevocationNonce(intent.intentId)).rejects.toMatchObject({ code: "NOT_FOUND" })
+    const now = BigInt(Math.floor(Date.now() / 1000))
+    const cancel = (nonce: string) =>
+      ownerClient.cancelRevocation(intent.intentId, {
+        expiresAt: now + 120n,
+        assertion: vault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: BigInt(nonce), expiresAt: now + 120n }),
+      })
+    // the reissue retired the old ticket — the route verifies the assertion against the STORED
+    // nonce, so an assertion over the retired one no longer verifies: AUTH_INVALID, not a cancel
+    await expect(cancel(intent.cancellationNonce)).rejects.toMatchObject({ code: "AUTH_INVALID" })
+    expect((await cancel(reissued.cancellationNonce)).state).toBe("cancelled")
+    // an anchored intent — capabilityA's real revoke — cannot be re-armed
+    const anchored = (await ownerClient.listRevocations("anchored"))[0]!
+    await expect(ownerClient.reissueRevocationNonce(anchored.intentId)).rejects.toMatchObject({ code: "REPLAY" })
+  })
 })
