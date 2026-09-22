@@ -298,6 +298,9 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       for (const failure of result.failed) {
         deps.print(`could not send the new key to ${failure.name}: ${failure.reason} — run \`mida approve ${failure.name}\``)
       }
+      if (result.repairError !== undefined) {
+        deps.print(`the key repair pass could not run: ${result.repairError} — run \`mida revoke ${agent}\` again to retry it`)
+      }
     }
     return 0
   } catch (error) {

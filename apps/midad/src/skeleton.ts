@@ -550,7 +550,7 @@ export async function readCheckpoints(runtime: ServiceRuntime, name: string, pro
 export async function revoke(
   runtime: Runtime,
   name: string,
-): Promise<{ transactionHashes: Hex[]; sponsored: boolean; rewrapped: string[]; failed: { name: string; reason: string }[] }> {
+): Promise<{ transactionHashes: Hex[]; sponsored: boolean; rewrapped: string[]; failed: { name: string; reason: string }[]; repairError?: string }> {
   const { home, vault, reader, owner } = runtime
   runtime.progress?.(`asking the chain what ${name} already holds…`)
   const agentId = await resolveAgentId(runtime, name)
@@ -577,8 +577,16 @@ export async function revoke(
   if (!neverApproved) markRevoked(home, name)
   // the project-folder approvals go too — the file is re-signed without this agent's rows
   await removeAgentApprovals(runtime, name)
-  const repair = await repairReaderWraps(runtime)
-  return { transactionHashes, sponsored, rewrapped: repair.rewrapped, failed: repair.failed }
+  // Even the repair pass failing wholesale — say the RPC dies between the landed revoke and the
+  // target enumeration — must not throw: a thrown error would print `refused:` for a revocation
+  // that already landed. The failure is reported in the result instead.
+  let repair: { rewrapped: string[]; failed: { name: string; reason: string }[]; repairError?: string }
+  try {
+    repair = await repairReaderWraps(runtime)
+  } catch (error) {
+    repair = { rewrapped: [], failed: [], repairError: wrapFailureReason(error) }
+  }
+  return { transactionHashes, sponsored, rewrapped: repair.rewrapped, failed: repair.failed, repairError: repair.repairError }
 }
 
 /**
