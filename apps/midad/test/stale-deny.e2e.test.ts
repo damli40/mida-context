@@ -132,6 +132,27 @@ describe("M3-D4: `mida approve` clears a stale store deny", () => {
     expect(home.has("agents/codex3/revoke-pending.json")).toBe(true)
   })
 
+  it("a pending revoke older than the stale window is called dropped and names the way out", async () => {
+    await init(runtime, ["codex9"])
+    await requestAccess(runtime, "codex9")
+    await approve(runtime, "codex9")
+    const agentId = loadAgentIdentity(home, "codex9")!.agentId
+    const { intentId } = await runtime.ownerApi.requestRevocationDeny({ owner: runtime.owner, agentId })
+    // The marker is 40 minutes old: a bundler-accepted operation that has not landed by now never will.
+    const at = new Date(Date.now() - 40 * 60_000).toISOString()
+    home.writeSecretJson("agents/codex9/revoke-pending.json", { intentId, userOpHash: `0x${"cd".repeat(32)}`, at })
+
+    progressLines = []
+    await expect(approve(runtime, "codex9")).rejects.toMatchObject({ code: "already-approved" })
+    const line = progressLines.find((l) => l.startsWith("a revoke of codex9 was accepted "))
+    expect(line).toBeDefined()
+    expect(line).toContain("has not landed — run `mida revoke codex9` again")
+    expect(progressLines).not.toContain("a revoke of codex9 is still landing — not cleared")
+    // Still fail-closed: the deny and the marker are left exactly as they were.
+    expect((await runtime.ownerApi.listRevocations("active")).map((intent) => intent.intentId)).toContain(intentId)
+    expect(home.has("agents/codex9/revoke-pending.json")).toBe(true)
+  })
+
   it("once the pending revoke lands the marker is removed and its deny is left to anchor", async () => {
     await init(runtime, ["codex4"])
     await requestAccess(runtime, "codex4")

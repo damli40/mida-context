@@ -657,6 +657,9 @@ async function resolveAgentId(runtime: ServiceRuntime, name: string): Promise<He
  * saw. Covers agent-target denies and capability denies that belong to this agent alike. Returns
  * how many intents were cancelled.
  */
+/** After this long a bundler-accepted revoke that the chain still does not show is treated as dropped, not landing. */
+export const REVOKE_PENDING_STALE_MINUTES = 15
+
 async function clearStaleStoreDenies(runtime: Runtime, agentId: Hex, name: string): Promise<number> {
   let intents: Awaited<ReturnType<typeof runtime.ownerApi.listRevocations>>
   try {
@@ -727,7 +730,16 @@ async function clearStaleStoreDenies(runtime: Runtime, agentId: Hex, name: strin
     if (stillLanding) {
       if (!pendingPrinted) {
         pendingPrinted = true
-        runtime.progress?.(`a revoke of ${name} is still landing — not cleared`)
+        // A bundler-accepted operation lands within minutes or is dropped for good. Past that
+        // window the honest line is not "still landing" but "never landed": the way out is
+        // `mida revoke` again (the grants are still live, so it re-sends) — say so, don't loop.
+        const startedAt = pending === undefined ? Number.NaN : Date.parse(pending.at)
+        const ageMinutes = Number.isFinite(startedAt) ? Math.floor((Date.now() - startedAt) / 60_000) : Number.NaN
+        runtime.progress?.(
+          Number.isFinite(ageMinutes) && ageMinutes >= REVOKE_PENDING_STALE_MINUTES
+            ? `a revoke of ${name} was accepted ${ageMinutes} min ago and has not landed — run \`mida revoke ${name}\` again to re-send it; the store's block is left in place`
+            : `a revoke of ${name} is still landing — not cleared`,
+        )
       }
       continue
     }
