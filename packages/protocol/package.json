@@ -5,6 +5,7 @@
   "type": "module",
   "exports": { ".": "./src/index.ts" },
   "dependencies": {
+    "@noble/hashes": "2.4.0",
     "canonicalize": "4.0.0",
     "viem": "2.56.3"
   },

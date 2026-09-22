@@ -54,9 +54,14 @@ export type { EpochKeyPair } from "@mida/crypto"
 export {
   MidaError,
   NAMESPACE_TREE_VERSION,
+  OwnerLinkError,
+  PAIRING_WORDS,
   PERMISSION,
   POLICY_VERSION,
   accessRequestHash,
+  buildOwnerLink,
+  buildOwnerResult,
+  buildOwnerReturnUrl,
   canonicalizeNamespace,
   decodeUint64,
   encodeUint64,
@@ -64,6 +69,10 @@ export {
   isZeroBytes,
   namespaceById,
   namespaceId,
+  pairingCode,
+  parseOwnerLink,
+  parseOwnerResult,
+  requestHash,
   sortScopes,
   toWebAuthnAuthStruct,
 } from "@mida/protocol"
@@ -85,5 +94,3 @@ export * from "./secrets.js"
 export * from "./webauthn.js"
 export * from "./send.js"
 export * from "./authority.js"
-export * from "./pairing.js"
-export * from "./link.js"

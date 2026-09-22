@@ -22,8 +22,8 @@ import type { CapturedAssertion } from "./webauthn.js"
 import { actionChallenge, assertOwnerPasskey, capturedToAuthStruct, createOwnerPasskey, verifyCapturedAssertion } from "./webauthn.js"
 import { deriveOwnerSecrets, ownerAccount, shortAddress } from "./secrets.js"
 import type { OwnerSecrets } from "./secrets.js"
-import type { FlowResult, LinkRequest, ParsedLink } from "./link.js"
-import { buildResult } from "./link.js"
+import type { OwnerLinkResult as FlowResult, OwnerLinkRequest as LinkRequest, ParsedOwnerLink as ParsedLink } from "@mida/protocol"
+import { buildOwnerResult as buildResult } from "@mida/protocol"
 import {
   assertExpectedOwner,
   describeError,

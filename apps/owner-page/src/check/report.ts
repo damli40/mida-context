@@ -2,6 +2,11 @@ import { base64UrlEncode, bytesToHex } from "./bytes.js"
 import type { CreateCapture } from "./client.js"
 import { parseP256Spki } from "./spki.js"
 import type { SavedTestCredential } from "./storage.js"
+import { assertNoSecretMaterial } from "@mida/protocol"
+
+// The guard lives in @mida/protocol now (owner-link.ts) — the terminal-side result parser uses
+// the same check. Re-exported so existing importers keep working.
+export { assertNoSecretMaterial }
 
 /**
  * The "Copy report" payload: everything a reviewer needs to reproduce the check and nothing that
@@ -57,31 +62,6 @@ export function credentialForReport(saved: SavedTestCredential | null, created: 
     transports: saved?.transports ?? created?.transports ?? null,
     algorithm: saved?.algorithm ?? created?.algorithm ?? null,
     publicKey: saved?.x && saved.y ? { x: saved.x, y: saved.y } : captured !== null ? { x: bytesToHex(captured.x), y: bytesToHex(captured.y) } : null,
-  }
-}
-
-const SECRET_KEY = /(prf|seed|secret|private|key)/i
-
-function isThirtyTwoBytes(value: unknown): boolean {
-  if (value instanceof Uint8Array) return value.length === 32
-  if (Array.isArray(value)) return value.length === 32 && value.every((v) => typeof v === "number")
-  if (typeof value === "string") return /^(0x)?[0-9a-fA-F]{64}$/.test(value)
-  return false
-}
-
-/** Throws on the first 32-byte value found under a secret-looking key, anywhere in the tree. */
-export function assertNoSecretMaterial(value: unknown, path = "report"): void {
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) assertNoSecretMaterial(value[i], `${path}[${i}]`)
-    return
-  }
-  if (value !== null && typeof value === "object") {
-    for (const [key, child] of Object.entries(value)) {
-      if (SECRET_KEY.test(key) && isThirtyTwoBytes(child)) {
-        throw new Error(`report would expose "${path}.${key}" — a 32-byte value under a secret-looking name`)
-      }
-      assertNoSecretMaterial(child, `${path}.${key}`)
-    }
   }
 }
 
