@@ -1,0 +1,613 @@
+[
+  {
+    "type": "constructor",
+    "inputs": [
+      {
+        "name": "capabilityRegistry",
+        "type": "address",
+        "internalType": "contract ICapabilityRegistry"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "CAPABILITY_REGISTRY",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract ICapabilityRegistry"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "exists",
+    "inputs": [
+      {
+        "name": "contextId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "getRecord",
+    "inputs": [
+      {
+        "name": "contextId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "record",
+        "type": "tuple",
+        "internalType": "struct ContextRegistry.ContextRecord",
+        "components": [
+          {
+            "name": "contextId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "owner",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "author",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "namespaceId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "lineageId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "parentId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "manifestHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "ciphertextCommitment",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "evidenceCommitment",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "readEpoch",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "createdAt",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "expiresAt",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "version",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "recordType",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "lineagePolicy",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "kind",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "provenanceSource",
+            "type": "uint8",
+            "internalType": "uint8"
+          }
+        ]
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "latest",
+    "inputs": [
+      {
+        "name": "lineageId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "register",
+    "inputs": [
+      {
+        "name": "owner",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "inputs",
+        "type": "tuple[]",
+        "internalType": "struct ContextRegistry.ContextInput[]",
+        "components": [
+          {
+            "name": "contextId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "objectNonce",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "namespaceId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "expectedParentId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "manifestHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "ciphertextCommitment",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "evidenceCommitment",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "readEpoch",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "expiresAt",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "recordType",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "lineagePolicy",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "kind",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "provenanceSource",
+            "type": "uint8",
+            "internalType": "uint8"
+          }
+        ]
+      }
+    ],
+    "outputs": [
+      {
+        "name": "contextIds",
+        "type": "bytes32[]",
+        "internalType": "bytes32[]"
+      }
+    ],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "event",
+    "name": "ContextRegistered",
+    "inputs": [
+      {
+        "name": "owner",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "namespaceId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "contextId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "record",
+        "type": "tuple",
+        "indexed": false,
+        "internalType": "struct ContextRegistry.ContextRecord",
+        "components": [
+          {
+            "name": "contextId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "owner",
+            "type": "address",
+            "internalType": "address"
+          },
+          {
+            "name": "author",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "namespaceId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "lineageId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "parentId",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "manifestHash",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "ciphertextCommitment",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "evidenceCommitment",
+            "type": "bytes32",
+            "internalType": "bytes32"
+          },
+          {
+            "name": "readEpoch",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "createdAt",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "expiresAt",
+            "type": "uint64",
+            "internalType": "uint64"
+          },
+          {
+            "name": "version",
+            "type": "uint32",
+            "internalType": "uint32"
+          },
+          {
+            "name": "recordType",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "lineagePolicy",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "kind",
+            "type": "uint8",
+            "internalType": "uint8"
+          },
+          {
+            "name": "provenanceSource",
+            "type": "uint8",
+            "internalType": "uint8"
+          }
+        ]
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "ContextSuperseded",
+    "inputs": [
+      {
+        "name": "owner",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "lineageId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "contextId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "parentId",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "version",
+        "type": "uint32",
+        "indexed": false,
+        "internalType": "uint32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "EvidenceRegistered",
+    "inputs": [
+      {
+        "name": "owner",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "namespaceId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "contextId",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "author",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "manifestHash",
+        "type": "bytes32",
+        "indexed": false,
+        "internalType": "bytes32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "error",
+    "name": "AnchorOwnerOnly",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "CapabilityDenied",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ContextIdMismatch",
+    "inputs": [
+      {
+        "name": "expected",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "submitted",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "ContextNotFound",
+    "inputs": [
+      {
+        "name": "contextId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "DuplicateContext",
+    "inputs": [
+      {
+        "name": "contextId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "EmptyBatch",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "EpochRotationRequired",
+    "inputs": [
+      {
+        "name": "namespaceId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "epoch",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "EpochStale",
+    "inputs": [
+      {
+        "name": "namespaceId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "submitted",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "required",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "EvidenceImmutable",
+    "inputs": [
+      {
+        "name": "parentId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "InvalidNamespace",
+    "inputs": [
+      {
+        "name": "namespaceId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "InvalidRecord",
+    "inputs": [
+      {
+        "name": "contextId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "ParentMismatch",
+    "inputs": [
+      {
+        "name": "parentId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "ProvenanceForbidden",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "StaleParent",
+    "inputs": [
+      {
+        "name": "expectedParentId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "currentHead",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "ZeroRegistry",
+    "inputs": []
+  }
+]
