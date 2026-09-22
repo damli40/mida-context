@@ -54,6 +54,25 @@ export function serviceUrl(raw: string | undefined, hosted: string): string | un
 }
 
 /**
+ * Where a service resolves for this home right now, in the order every consumer applies it
+ * (M3-D6 item 3): the environment wins in BOTH directions — a URL replaces the persisted value
+ * and "off" disables it — then network.json (what init persisted; the daemon and drainer read
+ * nothing else), and finally the hosted default the package ships with. "default" means nothing
+ * was ever configured — it is what a fresh init would write, so diagnostic checks must not
+ * probe it as if this home's sends already used it.
+ */
+export function serviceUrlInEffect(
+  raw: string | undefined,
+  stored: unknown,
+  hosted: string,
+): { url: string | undefined; source: "environment" | "off" | "network.json" | "default" } {
+  if (raw === "off") return { url: undefined, source: "off" }
+  if (raw !== undefined && raw !== "") return { url: raw, source: "environment" }
+  if (typeof stored === "string" && stored !== "") return { url: stored, source: "network.json" }
+  return { url: hosted, source: "default" }
+}
+
+/**
  * One GET probe — true when the sponsor endpoint answers 2xx inside two seconds. init and
  * doctor share this so "the sponsor answers" means the same thing on both paths. Reachable is
  * all it proves: willingness to pay is only proven by a real send (M3-D6).

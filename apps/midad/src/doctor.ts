@@ -21,7 +21,7 @@ import type { InstallTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
 import { listJobs } from "./queue.js"
-import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, sponsorReachable } from "./runtime.js"
+import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, serviceUrlInEffect, sponsorReachable } from "./runtime.js"
 import { cliPackageName, isBundled } from "./sibling.js"
 
 /** The whole run is capped — a check may stall, the report may not. */
@@ -131,33 +131,23 @@ function ownerAccountOf(home: MidaHome): LocalAccount | "missing" {
 }
 
 /**
- * The store URL a call would use right now: network.json's persisted value first (what init
- * wrote), then the MIDA_STORAGE_URL override — the same precedence the services check reports.
- * Undefined means the local store — its deny file lives under the home's own data directory.
+ * The service URLs a call would use right now — one shared resolution so the checks and the
+ * services report cannot diverge again (M3-D6 item 3): the environment wins in both directions,
+ * then network.json (what init persisted — the daemon's and drainer's only source), then the
+ * hosted default. The default is a source, not a probe target: nothing this home runs was
+ * configured to it, so "default" resolves to undefined here and only the services check names
+ * it, as what a fresh init would use.
  */
-function storageUrlInEffect(home: MidaHome, env: NodeJS.ProcessEnv): string | undefined {
-  const stored = home.readJson<{ storageUrl?: unknown }>("network.json")
-  if (typeof stored?.storageUrl === "string" && stored.storageUrl !== "") return stored.storageUrl
-  const raw = env.MIDA_STORAGE_URL
-  if (raw === "off") return undefined
-  if (raw !== undefined && raw !== "") return raw
-  return undefined
-}
-
-/**
- * The sponsor URL a send would use right now: network.json's persisted value first (what init
- * wrote), then the MIDA_SPONSOR_URL override — the same precedence the services check reports.
- * The hosted default is deliberately NOT counted here: a home that never ran init has no
- * network.json and this check bails earlier anyway, and a default nobody configured must not
- * make a real network call inside a diagnostic run.
- */
-function sponsorUrlInEffect(home: MidaHome, env: NodeJS.ProcessEnv): string | undefined {
-  const stored = home.readJson<{ sponsorUrl?: unknown }>("network.json")
-  if (typeof stored?.sponsorUrl === "string" && stored.sponsorUrl !== "") return stored.sponsorUrl
-  const raw = env.MIDA_SPONSOR_URL
-  if (raw === "off") return undefined
-  if (raw !== undefined && raw !== "") return raw
-  return undefined
+function serviceUrls(home: MidaHome, env: NodeJS.ProcessEnv) {
+  const stored = home.readJson<{ storageUrl?: unknown; sponsorUrl?: unknown }>("network.json")
+  const storage = serviceUrlInEffect(env.MIDA_STORAGE_URL, stored?.storageUrl, HOSTED_STORAGE_URL)
+  const sponsor = serviceUrlInEffect(env.MIDA_SPONSOR_URL, stored?.sponsorUrl, HOSTED_SPONSOR_URL)
+  return {
+    storageUrl: storage.source === "default" ? undefined : storage.url,
+    sponsorUrl: sponsor.source === "default" ? undefined : sponsor.url,
+    storage,
+    sponsor,
+  }
 }
 
 /** The repo's own `bin/` — the missing-hook-command fix for SOURCE-tree runs only (see hookCommandFix). */
@@ -348,7 +338,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         if (chain === undefined) return [problem("the store's deny list cannot be checked", NEEDS_NETWORK)]
         const owner = shared.ownerAddress ?? ownerAddressOf(home)
         if (owner === "missing") return [problem("the store's deny list cannot be checked", NEEDS_OWNER)]
-        const storageUrl = storageUrlInEffect(home, deps.env ?? process.env)
+        const storageUrl = serviceUrls(home, deps.env ?? process.env).storageUrl
         let targets: RevocationTarget[]
         try {
           if (storageUrl !== undefined) {
@@ -550,10 +540,11 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         // (M3-D3 — the Sep 22 run printed a low-balance PROBLEM while the sponsor was working).
         // Only with no sponsor configured, or one that is not answering, does a low wallet
         // matter again: the self-paid fallback is what would have to carry the next send.
-        const sponsorUrl = sponsorUrlInEffect(home, deps.env ?? process.env)
+        const sponsorUrl = serviceUrls(home, deps.env ?? process.env).sponsorUrl
         if (sponsorUrl !== undefined && (await sponsorReachable(sponsorUrl))) {
           const balance = await chain.context.publicClient.getBalance({ address: owner })
-          return [`ok: gas is sponsored (wallet holds ${formatMon(balance)} MON; not needed)`]
+          // reachable is all the probe proved — the wallet stays funded as the fallback (M3-D6)
+          return [`ok: gas is sponsored by ${hostOf(sponsorUrl)} — wallet holds ${formatMon(balance)} MON (kept as a fallback)`]
         }
         const lines: string[] = []
         const wallets: { label: string; address: Address }[] = [{ label: "owner", address: owner }]
@@ -575,20 +566,19 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
     {
       name: "services",
       run: async () => {
-        // What the Context API and the gas sponsor resolve to right now: the value init
-        // persisted to network.json when one is there, else the env override, else the hosted
-        // default the package ships with. The host only — a path or query could carry a key.
-        const env = deps.env ?? process.env
-        const stored = home.readJson<{ storageUrl?: unknown; sponsorUrl?: unknown }>("network.json")
-        const describe = (label: string, envName: string, raw: string | undefined, persisted: unknown, hosted: string, off: string): string => {
-          if (typeof persisted === "string" && persisted !== "") return `${label}: ${hostOf(persisted)} (network.json)`
-          if (raw === "off") return `${label}: ${off}`
-          if (raw !== undefined && raw !== "") return `${label}: ${hostOf(raw)} (${envName})`
-          return `${label}: ${hostOf(hosted)} (default)`
+        // What the Context API and the gas sponsor resolve to right now — the env override
+        // first in both directions, then the value init persisted to network.json, else the
+        // hosted default the package ships with. The host only — a path or query could carry a key.
+        const { storage, sponsor } = serviceUrls(home, deps.env ?? process.env)
+        const describe = (label: string, envName: string, resolved: { url: string | undefined; source: string }, off: string): string => {
+          if (resolved.source === "off") return `${label}: ${off}`
+          if (resolved.source === "environment") return `${label}: ${hostOf(resolved.url!)} (${envName})`
+          if (resolved.source === "network.json") return `${label}: ${hostOf(resolved.url!)} (network.json)`
+          return `${label}: ${hostOf(resolved.url!)} (default)`
         }
         return [
-          `ok: ${describe("store", "MIDA_STORAGE_URL", env.MIDA_STORAGE_URL, stored?.storageUrl, HOSTED_STORAGE_URL, "off — the local store")}`,
-          `ok: ${describe("sponsor", "MIDA_SPONSOR_URL", env.MIDA_SPONSOR_URL, stored?.sponsorUrl, HOSTED_SPONSOR_URL, "off — sends pay their own gas")}`,
+          `ok: ${describe("store", "MIDA_STORAGE_URL", storage, "off — the local store")}`,
+          `ok: ${describe("sponsor", "MIDA_SPONSOR_URL", sponsor, "off — sends pay their own gas")}`,
         ]
       },
     },
@@ -609,16 +599,21 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
     {
       name: "sponsor",
       run: async () => {
-        // network.json again, not the shared context — the sponsor answer needs no chain at all
-        const stored = home.readJson<{ sponsorUrl?: unknown }>("network.json")
-        const sponsorUrl = typeof stored?.sponsorUrl === "string" ? stored.sponsorUrl : ""
-        if (sponsorUrl === "") return ["ok: no gas sponsor in network.json — the services check shows what init will use"]
+        // the same resolution the send path uses — env first, then network.json — so
+        // MIDA_SPONSOR_URL=off here means what it means there (M3-D6). No chain needed.
+        const sponsor = serviceUrls(home, deps.env ?? process.env).sponsor
+        if (sponsor.source === "off") return ["ok: gas sponsor off — sends pay their own gas"]
+        if (sponsor.source === "default") {
+          return ["ok: no gas sponsor in network.json — the services check shows what init will use"]
+        }
+        const sponsorUrl = sponsor.url!
+        const fix = sponsor.source === "environment" ? "check MIDA_SPONSOR_URL" : "check sponsorUrl in network.json"
         // the HOST is printed, never the URL — its path or query may carry an operator's key
         const host = hostOf(sponsorUrl)
         try {
           const reply = await fetch(sponsorUrl, { signal: AbortSignal.timeout(2_000) })
           if (!reply.ok) {
-            return [problem(`the gas sponsor ${host} answered HTTP ${reply.status}`, "check sponsorUrl in network.json")]
+            return [problem(`the gas sponsor ${host} answered HTTP ${reply.status}`, fix)]
           }
           const body = (await reply.json().catch(() => undefined)) as
             | { limits?: { signingsPerSenderPerDay?: unknown; signingsGlobalPerDay?: unknown; freeCallsPerSenderPerDay?: unknown } }
@@ -626,14 +621,15 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           const limits = body?.limits
           const detail =
             typeof limits?.signingsPerSenderPerDay === "number" && typeof limits?.signingsGlobalPerDay === "number"
-              ? ` (${limits.signingsPerSenderPerDay} signings per address a day, ${limits.signingsGlobalPerDay} a day in total)`
+              ? `; it advertises ${limits.signingsPerSenderPerDay} signings per address a day, ${limits.signingsGlobalPerDay} a day in total`
               : ""
-          return [`ok: gas sponsor ${host} answers${detail}`]
+          // a 2xx proves reachable, never willing — the Sep 22 refusal came from a reachable sponsor
+          return [`ok: gas sponsor reachable at ${host} (willingness is only proven by a real send${detail})`]
         } catch {
           return [
             problem(
               `the gas sponsor ${host} did not answer within 2 s`,
-              "check sponsorUrl in network.json — sends will pay their own gas until it answers",
+              `${fix} — sends will pay their own gas until it answers`,
             ),
           ]
         }

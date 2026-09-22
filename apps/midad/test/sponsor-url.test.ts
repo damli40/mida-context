@@ -96,26 +96,39 @@ describe("Runtime.open with a sponsorUrl", () => {
     }
   }, 60_000)
 
-  it("init on a 0-MON owner with a sponsor configured never runs the funding gate — and says so", async () => {
-    // M3-D3 item 2. The sponsor URL here is unreachable ON PURPOSE: every send falls back to
-    // self-pay (the funder tops the wallet up inside the send guard), so the run exercises the
-    // whole init — owner key, namespaces, an agent registration, the assistant grant — while the
-    // up-front ensureFunded gates for owner, operator and agent signers must stay skipped. The
-    // fallback proving it can still pay is the point: sponsored init must not break it.
+  it("init on a 0-MON owner with a sponsor ANSWERING never runs the funding gate — and says so", async () => {
+    // M3-D3 item 2, tightened by M3-D6 item 2: the gate is skipped because the sponsor ANSWERS,
+    // not because a URL is configured. The endpoint here replies 2xx to the probe but refuses
+    // every operation: init exercises the whole flow — owner key, namespaces, an agent
+    // registration, the assistant grant — on the self-pay fallback, while the up-front
+    // ensureFunded gates stay skipped. The fallback proving it can still pay is the point.
     const env = await localEnvironment()
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-sponsorurl-")))
+    const sponsor = createServer((req, res) => {
+      if (req.method === "GET") {
+        res.setHeader("content-type", "application/json")
+        res.end(JSON.stringify({ name: "mida-gas-sponsor" }))
+        return
+      }
+      res.statusCode = 500
+      res.end("{}")
+    })
     try {
+      const sponsorUrl = await new Promise<string>((resolve, reject) => {
+        sponsor.once("error", reject)
+        sponsor.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${(sponsor.address() as { port: number }).port}`))
+      })
       const runtime = await Runtime.open(home, {
         rpcUrl: env.rpcUrl,
         deployment: env.deployment,
         fund: env.fund,
-        sponsorUrl: "http://127.0.0.1:9",
+        sponsorUrl,
       })
       try {
         const progress: string[] = []
         runtime.progress = (line) => progress.push(line)
         runtime.ensureFunded = async () => {
-          throw new Error("ensureFunded must never run while a sponsor is configured")
+          throw new Error("ensureFunded must never run while the sponsor answers")
         }
         const { init } = await import("@mida/midad")
         await init(runtime, ["assistant"])
@@ -125,6 +138,7 @@ describe("Runtime.open with a sponsorUrl", () => {
         await runtime.close()
       }
     } finally {
+      await new Promise<void>((done) => sponsor.close(() => done()))
       await env.stop()
     }
   }, 300_000)
@@ -136,13 +150,14 @@ describe("the doctor sponsor line", () => {
     for (const server of servers) server.close()
   })
 
-  const doctorLines = async (home: MidaHome): Promise<string[]> => {
+  const doctorLines = async (home: MidaHome, env: NodeJS.ProcessEnv = {}): Promise<string[]> => {
     const lines: string[] = []
-    await runDoctor({ home, print: (line) => lines.push(line), env: {} })
+    await runDoctor({ home, print: (line) => lines.push(line), env })
     return lines
   }
 
-  it("prints the host and the limits the endpoint advertises", async () => {
+  /** A sponsor endpoint that answers the GET probe — reachable, whether or not it would pay. */
+  const answeringSponsor = async (): Promise<string> => {
     const server = createServer((_req, res) => {
       res.setHeader("content-type", "application/json")
       res.end(
@@ -153,14 +168,49 @@ describe("the doctor sponsor line", () => {
       )
     })
     servers.push(server)
-    const baseUrl = await new Promise<string>((resolve) =>
+    return new Promise<string>((resolve) =>
       server.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${(server.address() as { port: number }).port}`)),
     )
+  }
+
+  it("prints the host and the limits the endpoint advertises — as reachability, not willingness (M3-D6)", async () => {
+    const baseUrl = await answeringSponsor()
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-sponsorurl-")))
     home.writeSecretJson("network.json", { sponsorUrl: baseUrl })
     const lines = await doctorLines(home)
-    expect(lines).toContain(`ok: gas sponsor ${new URL(baseUrl).host} answers (30 signings per address a day, 2000 a day in total)`)
+    // a 2xx GET proves the endpoint answers — the Sep 22 refusal came from a reachable sponsor
+    expect(lines).toContain(
+      `ok: gas sponsor reachable at ${new URL(baseUrl).host} (willingness is only proven by a real send; it advertises 30 signings per address a day, 2000 a day in total)`,
+    )
     expect(lines.join("\n")).not.toContain(baseUrl) // host only, never the URL
+  })
+
+  it("MIDA_SPONSOR_URL overrides network.json in both directions (M3-D6)", async () => {
+    const live = await answeringSponsor()
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-sponsorurl-")))
+    // env → a live URL wins over the stored dead one: the probe goes where a send would go
+    home.writeSecretJson("network.json", { sponsorUrl: "http://127.0.0.1:1" })
+    let lines = await doctorLines(home, { MIDA_SPONSOR_URL: live })
+    expect(lines).toContain(
+      `ok: gas sponsor reachable at ${new URL(live).host} (willingness is only proven by a real send; it advertises 30 signings per address a day, 2000 a day in total)`,
+    )
+    expect(lines.some((line) => line.includes("127.0.0.1:1"))).toBe(false)
+    // env → off wins over the stored live one: every send self-pays, so doctor must not probe or claim it
+    home.writeSecretJson("network.json", { sponsorUrl: live })
+    lines = await doctorLines(home, { MIDA_SPONSOR_URL: "off" })
+    expect(lines).toContain("ok: gas sponsor off — sends pay their own gas")
+    expect(lines.some((line) => line.includes("reachable") || line.includes("gas is sponsored"))).toBe(false)
+  })
+
+  it("MIDA_STORAGE_URL overrides network.json the same way (M3-D6)", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-sponsorurl-")))
+    home.writeSecretJson("network.json", { storageUrl: "https://stored.example.com" })
+    let lines = await doctorLines(home, { MIDA_STORAGE_URL: "https://env.example.com" })
+    expect(lines).toContain("ok: store: env.example.com (MIDA_STORAGE_URL)")
+    lines = await doctorLines(home, { MIDA_STORAGE_URL: "off" })
+    expect(lines).toContain("ok: store: off — the local store")
+    lines = await doctorLines(home)
+    expect(lines).toContain("ok: store: stored.example.com (network.json)")
   })
 
   it("an unreachable sponsor is a problem that names the fallback", async () => {

@@ -260,7 +260,9 @@ describe("mida doctor on local Anvil", () => {
       sponsoredHome.writeSecretJson("network.json", { rpcUrl: env.rpcUrl, deployment, sponsorUrl })
       const up: string[] = []
       await runDoctor({ home: sponsoredHome, print: (line) => up.push(line), env: {}, daemonProbeMs: 50 })
-      expect(up).toContain("ok: gas is sponsored (wallet holds 0.0000 MON; not needed)")
+      // M3-D6: reachable names the host and keeps the wallet as a fallback — a 2xx never proved willingness
+      expect(up).toContain(`ok: gas is sponsored by ${new URL(sponsorUrl).host} — wallet holds 0.0000 MON (kept as a fallback)`)
+      expect(up).toContain(`ok: gas sponsor reachable at ${new URL(sponsorUrl).host} (willingness is only proven by a real send)`)
       expect(up.some((line) => line.includes("below the gas top-up line"))).toBe(false)
 
       // Same wallet, sponsor no longer answering: the balance matters again — the self-paid
