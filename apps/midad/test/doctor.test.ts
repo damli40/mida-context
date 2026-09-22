@@ -50,49 +50,148 @@ describe("mida doctor without a chain", () => {
     expect(code).toBeLessThanOrEqual(9)
   })
 
-  it("reports which compile model is active — haiku without a key, kimi with one plus the Moonshot note (R5-8)", async () => {
+  it("names the compile model and where the session text goes — per provider, from the real chain (M3-D5)", async () => {
     const home = new MidaHome(join(dir(), "home"))
-    const haikuLines: string[] = []
-    await runDoctor({ home, print: (line) => haikuLines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
-    expect(haikuLines).toContain("ok: compile model is claude-haiku")
-    expect(haikuLines.some((line) => line.toLowerCase().includes("moonshot"))).toBe(false)
+    const run = async (env: NodeJS.ProcessEnv) => {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env, daemonProbeMs: 50 })
+      return lines
+    }
 
-    const kimiLines: string[] = []
-    await runDoctor({ home, print: (line) => kimiLines.push(line), settings: {}, env: { KIMI_API_KEY: "test-key" }, daemonProbeMs: 50 })
-    expect(kimiLines).toContain("ok: compile model is kimi-k2.7-code-highspeed")
-    // the owner must be told where the session text goes — scrubbed, but still sent off-machine
-    const note = kimiLines.find((line) => line.startsWith("note:") && line.includes("moonshot"))
-    expect(note).toBeDefined()
-    expect(note).toContain("scrub")
-    // the key itself never reaches a doctor line
-    expect(kimiLines.join("\n")).not.toContain("test-key")
-    // with the endpoint unset there is nothing to warn about
-    expect(kimiLines.some((line) => line.includes("not Moonshot"))).toBe(false)
+    // no keys: haiku through the claude CLI, no fallback
+    const haiku = await run({})
+    expect(haiku).toContain("ok: compile model is claude-haiku")
+    const haikuNote = haiku.filter((line) => line.startsWith("note:") && line.includes("transcript text"))
+    expect(haikuNote).toHaveLength(1)
+    expect(haikuNote[0]).toContain("api.anthropic.com")
+    expect(haikuNote[0]).toContain("no fallback")
+
+    // deepseek key alone: the default, falling back to haiku
+    const deepseek = await run({ DEEPSEEK_API_KEY: "test-key" })
+    expect(deepseek).toContain("ok: compile model is deepseek-flash")
+    expect(deepseek).toContain(
+      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to claude-haiku",
+    )
+    expect(deepseek.join("\n")).not.toContain("test-key")
+
+    // both keys: the note names the full real chain
+    const both = await run({ DEEPSEEK_API_KEY: "d", KIMI_API_KEY: "k" })
+    expect(both).toContain(
+      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to kimi, then claude-haiku",
+    )
+
+    // kimi alone: Moonshot is where the text goes
+    const kimi = await run({ KIMI_API_KEY: "test-key" })
+    expect(kimi).toContain("ok: compile model is kimi-k2.7-code-highspeed")
+    expect(kimi).toContain(
+      "note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to claude-haiku",
+    )
+    expect(kimi.join("\n")).not.toContain("test-key")
+    expect(kimi.some((line) => line.includes("not Moonshot"))).toBe(false)
   })
 
-  it("an overridden KIMI_BASE_URL is a PROBLEM that names the host only — never the full URL (R5-5b-3)", async () => {
+  it("a pinned custom is the owner's own endpoint — no vendor, no fallback, unless MIDA_COMPILE_FALLBACK=1 (M3-D5)", async () => {
     const home = new MidaHome(join(dir(), "home"))
-    const env = { KIMI_API_KEY: "test-key", KIMI_BASE_URL: "http://example.com/secret/path?token=abc" }
+    const custom = {
+      MIDA_COMPILE_MODEL: "custom",
+      MIDA_COMPILE_BASE_URL: "http://127.0.0.1:11434/v1",
+      MIDA_COMPILE_MODEL_ID: "qwen-local",
+      DEEPSEEK_API_KEY: "d",
+      KIMI_API_KEY: "k",
+    }
     const lines: string[] = []
-    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env, daemonProbeMs: 50 })
-    const warn = lines.find((line) => line.includes("not Moonshot"))
-    expect(warn).toBeDefined()
-    expect(warn).toContain("PROBLEM:")
-    expect(warn).toContain("compile text is being sent to example.com, not Moonshot")
-    // host only: the path and query that followed the host are never echoed — they may be secret
-    expect(warn).not.toContain("/secret/path")
-    expect(warn).not.toContain("token=abc")
+    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: custom, daemonProbeMs: 50 })
+    expect(lines).toContain("ok: compile model is qwen-local")
+    expect(lines).toContain("note: compile text is sent to 127.0.0.1:11434 (your own endpoint); no fallback")
+    // the custom base URL is itself — never a 'not Moonshot'-style problem
+    expect(lines.some((line) => line.startsWith("PROBLEM:") && line.includes("compile text"))).toBe(false)
 
-    // even an https override is not Moonshot — the problem names its host too
-    const httpsLines: string[] = []
+    // opted-in fallback names the vendors the text could reach
+    const withFallback: string[] = []
     await runDoctor({
       home,
-      print: (line) => httpsLines.push(line),
+      print: (line) => withFallback.push(line),
       settings: {},
-      env: { KIMI_API_KEY: "test-key", KIMI_BASE_URL: "https://evil.example" },
+      env: { ...custom, MIDA_COMPILE_FALLBACK: "1" },
       daemonProbeMs: 50,
     })
-    expect(httpsLines.some((line) => line.includes("compile text is being sent to evil.example, not Moonshot"))).toBe(true)
+    expect(withFallback).toContain(
+      "note: compile text is sent to 127.0.0.1:11434 (your own endpoint); a failed call falls back to deepseek, then kimi, then claude-haiku",
+    )
+
+    // a pinned custom missing its required vars is a PROBLEM — every compile would fail
+    const missing: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => missing.push(line),
+      settings: {},
+      env: { MIDA_COMPILE_MODEL: "custom" },
+      daemonProbeMs: 50,
+    })
+    const missingLine = missing.find((line) => line.startsWith("PROBLEM:") && line.includes("custom"))
+    expect(missingLine).toBeDefined()
+    expect(missingLine).toContain("MIDA_COMPILE_BASE_URL")
+    expect(missingLine).toContain("MIDA_COMPILE_MODEL_ID")
+  })
+
+  it("an overridden provider base URL is a PROBLEM naming the host only — provider-aware, never the full URL (M3-D5)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const run = async (env: NodeJS.ProcessEnv) => {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env, daemonProbeMs: 50 })
+      return lines
+    }
+
+    // kimi override while kimi is in the chain — the old "not Moonshot" problem, provider-aware
+    const kimi = await run({ KIMI_API_KEY: "test-key", KIMI_BASE_URL: "http://example.com/secret/path?token=abc" })
+    const kimiWarn = kimi.find((line) => line.includes("not Moonshot"))
+    expect(kimiWarn).toBeDefined()
+    expect(kimiWarn).toContain("PROBLEM:")
+    expect(kimiWarn).toContain("compile text is being sent to example.com, not Moonshot")
+    expect(kimiWarn).not.toContain("/secret/path")
+    expect(kimiWarn).not.toContain("token=abc")
+
+    // deepseek override — the same problem names DeepSeek
+    const deepseek = await run({ DEEPSEEK_API_KEY: "test-key", DEEPSEEK_BASE_URL: "https://evil.example" })
+    expect(deepseek.some((line) => line.includes("compile text is being sent to evil.example, not DeepSeek"))).toBe(true)
+    // and the note tells the truth about where it actually goes
+    expect(deepseek.some((line) => line.startsWith("note:") && line.includes("evil.example"))).toBe(true)
+
+    // a kimi override with NO kimi in the chain is dormant, not a problem
+    const dormant = await run({ DEEPSEEK_API_KEY: "d", KIMI_BASE_URL: "https://evil.example" })
+    expect(dormant.some((line) => line.includes("not Moonshot"))).toBe(false)
+
+    // a custom endpoint is the user's own — never a problem, no matter the host
+    const custom = await run({
+      MIDA_COMPILE_MODEL: "custom",
+      MIDA_COMPILE_BASE_URL: "https://anything.example.com/v1",
+      MIDA_COMPILE_MODEL_ID: "m",
+    })
+    expect(custom.some((line) => line.startsWith("PROBLEM:") && line.includes("compile text"))).toBe(false)
+    expect(custom.some((line) => line.includes("anything.example.com"))).toBe(true)
+  })
+
+  it("the environment check lists every compile-provider variable — set or unset, never a value (M3-D5)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: { DEEPSEEK_API_KEY: "deepseek-secret-value", MIDA_COMPILE_MODEL: "deepseek" },
+      daemonProbeMs: 50,
+    })
+    const set = lines.find((line) => line.includes("environment — set:"))
+    const unset = lines.find((line) => line.includes("environment — unset:"))
+    expect(set).toBeDefined()
+    expect(unset).toBeDefined()
+    expect(set).toContain("DEEPSEEK_API_KEY")
+    expect(set).toContain("MIDA_COMPILE_MODEL")
+    for (const name of ["DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "DEEPSEEK_TIMEOUT_MS", "KIMI_API_KEY", "MIDA_COMPILE_API_KEY", "MIDA_COMPILE_BASE_URL", "MIDA_COMPILE_MODEL_ID", "MIDA_COMPILE_TIMEOUT_MS", "MIDA_COMPILE_FALLBACK"]) {
+      expect(unset).toContain(name)
+    }
+    // values never reach a doctor line
+    expect(lines.join("\n")).not.toContain("deepseek-secret-value")
   })
 
   it("more than three whats-new timeouts in the last hour is a PROBLEM — fewer stays visible, none is ok", async () => {

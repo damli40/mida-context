@@ -9,7 +9,7 @@ import { isMidaError } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { chainFor, parseDeployment } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
-import { compileModelChoice } from "@mida/compiler"
+import { COMPILE_PROVIDERS, compileModelChoice } from "@mida/compiler"
 import { ContextApiClient, DenyOverlay, RegistryReader } from "@mida/api"
 import type { RevocationTarget } from "@mida/api"
 import type { LocalAccount } from "viem"
@@ -208,10 +208,19 @@ const ENV_VARS = [
   "MIDA_DEPLOYMENTS_DIR",
   "MIDA_DEBUG",
   "MIDA_COMPILE_MODEL",
+  "MIDA_COMPILE_FALLBACK",
+  "MIDA_COMPILE_API_KEY",
+  "MIDA_COMPILE_BASE_URL",
+  "MIDA_COMPILE_MODEL_ID",
+  "MIDA_COMPILE_TIMEOUT_MS",
   "MIDA_CLAUDE_SETTINGS",
   "MIDA_CODEX_CONFIG",
   "MIDA_INNER",
   "MIDA_E2E_MONAD_TESTNET",
+  "DEEPSEEK_API_KEY",
+  "DEEPSEEK_BASE_URL",
+  "DEEPSEEK_MODEL",
+  "DEEPSEEK_TIMEOUT_MS",
   "KIMI_API_KEY",
   "KIMI_BASE_URL",
   "KIMI_MODEL",
@@ -476,29 +485,42 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       name: "compile-model",
       run: async () => {
         // the same resolution the daemon used at start-up — the owner sees which model compiles
-        // sessions and, on the kimi path, that session text leaves the machine for Moonshot's API
+        // sessions, exactly which host the transcript text goes to (secrets are scrubbed first),
+        // and the real fallback chain — all computed from the choice, never hard-coded
         const env = deps.env ?? process.env
         const choice = compileModelChoice(env)
         const lines = [`ok: compile model is ${choice.model.label}`]
-        // M3-D5 note: rewritten provider-aware in the next item — for now the kimi note
-        // prints only when kimi actually leads the chain.
-        if (choice.fallbacks[0] !== undefined && choice.chain[0]?.provider === "kimi") {
+        const head = choice.chain[0]!
+        const rest = choice.chain.slice(1)
+        const nameOf = (entry: (typeof choice.chain)[number]) => (entry.provider === "haiku" ? entry.label : entry.provider)
+        const fallbackClause = rest.length === 0 ? "no fallback" : `a failed call falls back to ${rest.map(nameOf).join(", then ")}`
+        if (head.provider === "custom") {
+          lines.push(`note: compile text is sent to ${head.host ?? "an address that does not parse"} (your own endpoint); ${fallbackClause}`)
+          // a pinned custom without its required vars fails every compile — name the vars, never values
+          const missing = [COMPILE_PROVIDERS.custom.baseVar, COMPILE_PROVIDERS.custom.modelVar].filter((v) => env[v] === undefined || env[v] === "")
+          if (missing.length > 0) {
+            lines.push(problem(`MIDA_COMPILE_MODEL=custom needs ${missing.join(" and ")}`, "set them or unset MIDA_COMPILE_MODEL"))
+          }
+        } else {
+          const via = head.provider === "haiku" ? " via the claude CLI" : ""
           lines.push(
-            `note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to ${choice.fallbacks[0].label}`,
+            `note: ${nameOf(head)} sends the session's transcript text to ${head.host ?? "an address that does not parse"}${via} (secrets are scrubbed first); ${fallbackClause}`,
           )
         }
-        // an overridden endpoint receives the API key and the transcript text — the owner must
-        // see which HOST that is; the full URL is never printed (its path or query may be secret)
-        const override = env.KIMI_BASE_URL
-        if (override !== undefined && override.replace(/\/+$/, "") !== "https://api.moonshot.ai") {
-          let host = "an address that does not parse"
-          try {
-            const parsed = new URL(override).host
-            if (parsed !== "") host = parsed
-          } catch {
-            // a value that is not a URL is still not Moonshot — the placeholder names that
+        // an overridden base URL on a NAMED provider in the chain means the key and the transcript
+        // go somewhere other than the vendor — the owner must see which HOST that is; the full URL
+        // is never printed (its path or query may be secret). A custom base URL is not a problem:
+        // it IS the endpoint the user chose.
+        for (const entry of choice.chain) {
+          if (entry.provider !== "deepseek" && entry.provider !== "kimi") continue
+          const table = COMPILE_PROVIDERS[entry.provider]
+          if (env[table.baseVar] === undefined) continue
+          const vendor = entry.provider === "deepseek" ? "DeepSeek" : "Moonshot"
+          const defaultHost = new URL(table.baseDefault).host
+          const host = entry.host !== undefined && entry.host !== "" ? entry.host : "an address that does not parse"
+          if (host !== defaultHost) {
+            lines.push(problem(`compile text is being sent to ${host}, not ${vendor}`, `unset ${table.baseVar} to compile against ${vendor}`))
           }
-          lines.push(problem(`compile text is being sent to ${host}, not Moonshot`, "unset KIMI_BASE_URL to compile against Moonshot"))
         }
         return lines
       },
