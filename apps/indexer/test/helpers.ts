@@ -9,14 +9,21 @@
 // Because the config file is resolved from cwd, every test that calls
 // createTestIndexer() must run after this module has chdir'd into apps/indexer.
 import { createTestIndexer } from "envio"
+import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 
 const indexerDir = fileURLToPath(new URL("..", import.meta.url))
 process.chdir(indexerDir)
 
 export const CHAIN_ID = 10143
-// Matches config.yaml's start_block — simulate items may not sit below it.
-export const START_BLOCK = 63193282
+// Read from config.yaml's start_block — simulate items may not sit below it. Read, not copied:
+// the Sep 22 redeploy moved the block and a copied constant silently failed every test.
+export const START_BLOCK = (() => {
+  const text = readFileSync(new URL("../config.yaml", import.meta.url), "utf8")
+  const match = /^\s*start_block:\s*(\d+)\s*$/m.exec(text)
+  if (match === null) throw new Error("config.yaml has no start_block")
+  return Number(match[1])
+})()
 
 export const newIndexer = () => createTestIndexer()
 
