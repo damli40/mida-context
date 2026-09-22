@@ -35,7 +35,7 @@ function setup() {
   const flags: { saveFailures: number; checkpoint?: Checkpoint; compileReason?: "model-failed" | "no-json" | "invalid" } = { saveFailures: 0 }
   const compile: typeof compileCheckpoint = async (input) => {
     compileCalls.push(input)
-    if (flags.compileReason !== undefined) return { ok: false, reason: flags.compileReason, detail: "stub", attempts: 1 }
+    if (flags.compileReason !== undefined) return { ok: false, reason: flags.compileReason, detail: "stub", attempts: 1, retried: 0 }
     return {
       ok: true,
       checkpoint: flags.checkpoint ?? sampleCheckpoint({ eventId: input.eventId, agent: input.agent }),
@@ -43,6 +43,7 @@ function setup() {
       droppedKeys: [],
       trimmed: [],
       attempts: 1,
+      retried: 0,
       format: "claude-jsonl",
       messagesKept: 1,
       messagesTotal: 1,
@@ -213,6 +214,7 @@ describe("one drainer at a time", () => {
       droppedKeys: [],
       trimmed: [],
       attempts: 1,
+      retried: 0,
       format: "claude-jsonl",
       messagesKept: 1,
       messagesTotal: 1,
@@ -669,7 +671,7 @@ describe("drainUntilSettled waits out the gap instead of stranding the job", () 
       }
       return {
         ok: true, checkpoint: sampleCheckpoint({ eventId: input.eventId, agent: input.agent }),
-        compiledBy: "stub", droppedKeys: [], trimmed: [], attempts: 1,
+        compiledBy: "stub", droppedKeys: [], trimmed: [], attempts: 1, retried: 0,
         format: "claude-jsonl", messagesKept: 1, messagesTotal: 1, charsSent: 0, modelMs: 0,
       }
     }
@@ -790,6 +792,7 @@ describe("the saved log line carries the compile and save facts (C4)", () => {
       messagesTotal: 1,
       charsSent: 0,
       modelMs: 0,
+      retried: 0,
       cacheHitTokens: 900,
       cacheMissTokens: 100,
     })
@@ -798,6 +801,27 @@ describe("the saved log line carries the compile and save facts (C4)", () => {
     const saved = savedLines(drainLog).at(-1)!
     expect(saved.cacheHit).toBe(900)
     expect(saved.cacheMiss).toBe(100)
+  })
+
+  it("a compile that spent its same-provider shape retry logs retried (M3-H)", async () => {
+    const { job, drain, drainLog } = setup()
+    const compile: typeof compileCheckpoint = async (input) => ({
+      ok: true,
+      checkpoint: sampleCheckpoint({ eventId: input.eventId, agent: input.agent }),
+      compiledBy: "deepseek-flash",
+      droppedKeys: [],
+      trimmed: [],
+      attempts: 1,
+      retried: 1,
+      format: "claude-jsonl",
+      messagesKept: 1,
+      messagesTotal: 1,
+      charsSent: 0,
+      modelMs: 0,
+    })
+    job({ event: "Stop" }, T0)
+    await drain({ compile })
+    expect(savedLines(drainLog).at(-1)!.retried).toBe(1)
   })
 
   it("a compile that reports no cache numbers leaves the fields off the record", async () => {
@@ -836,6 +860,7 @@ describe("an invalid checkpoint is transient twice, then permanent (C3)", () => 
           reason: "invalid",
           detail: "decisions[3].rationale: expected string, got number; evidence: expected array",
           attempts: 1,
+          retried: 0,
           fields: ["decisions[3].rationale", "evidence"],
         }
       }
@@ -846,6 +871,7 @@ describe("an invalid checkpoint is transient twice, then permanent (C3)", () => 
         droppedKeys: [],
         trimmed: [],
         attempts: 1,
+        retried: 0,
         format: "claude-jsonl",
         messagesKept: 1,
         messagesTotal: 1,
@@ -872,7 +898,7 @@ describe("an invalid checkpoint is transient twice, then permanent (C3)", () => 
   it("a third invalid compile in a row is permanent: the job leaves with invalid-checkpoint", async () => {
     const { home, job, drain, drainLog } = setup()
     const compile: typeof compileCheckpoint = async () => ({
-      ok: false, reason: "invalid", detail: "objective: must be non-empty", attempts: 1, fields: ["objective"],
+      ok: false, reason: "invalid", detail: "objective: must be non-empty", attempts: 1, retried: 0, fields: ["objective"],
     })
     job({ event: "Stop" }, T0)
     await drain({ compile, now: () => new Date(T0 + 120_000) })

@@ -382,6 +382,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           compileMeta = {
             compileMs,
             attempts: compiled.attempts,
+            retried: compiled.retried,
             trimmed: compiled.trimmed,
             droppedKeys: compiled.droppedKeys,
             ...(compiled.fellBack !== undefined ? { fellBack: compiled.fellBack } : {}),
@@ -415,6 +416,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           compileMs: compileMeta.compileMs,
           saveMs,
           attempts: compileMeta.attempts,
+          retried: compileMeta.retried,
           reusedCompiled,
           trimmed: compileMeta.trimmed,
           droppedKeys: compileMeta.droppedKeys,
@@ -547,6 +549,8 @@ async function agentApprovedOnChain(home: MidaHome, agent: string, ownerOf: () =
 interface CompileMeta {
   compileMs: number
   attempts: number
+  /** Whether the compile spent its one same-provider shape retry on the primary (0 or 1). */
+  retried: number
   trimmed: string[]
   droppedKeys: string[]
   /** When the compile fell back to the second model: who failed, who wrote, and why. */
@@ -573,6 +577,8 @@ function readCompiled(home: MidaHome, eventId: string): { envelope: CheckpointEn
       meta: {
         compileMs: typeof meta.compileMs === "number" ? meta.compileMs : 0,
         attempts: typeof meta.attempts === "number" ? meta.attempts : 1,
+        // entries written before the field existed read as 0 — no retry was possible then
+        retried: typeof meta.retried === "number" ? meta.retried : 0,
         trimmed: Array.isArray(meta.trimmed) ? meta.trimmed : [],
         droppedKeys: Array.isArray(meta.droppedKeys) ? meta.droppedKeys : [],
         ...(typeof meta.fellBack === "object" && meta.fellBack !== null ? { fellBack: meta.fellBack } : {}),

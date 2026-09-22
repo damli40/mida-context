@@ -70,6 +70,11 @@ export type CompileResult =
       /** Present when the fallback ran: which model failed, which took over, and the failure that triggered it. */
       fellBack?: { from: string; to: string; reason: string }
       /**
+       * Whether the primary provider was re-asked once after a bad SHAPE (invalid/no-json) —
+       * 0 or 1, never more: a transport failure and any fallback provider walk at once.
+       */
+      retried: number
+      /**
        * Prompt-cache counters the provider reported for the call that wrote the checkpoint —
        * only ever present for a model whose stderr is a controlled channel (stderrDetail) and
        * only when the provider reported both numbers. Absent means unknown, not zero.
@@ -82,6 +87,8 @@ export type CompileResult =
       reason: "model-failed" | "no-json" | "invalid"
       detail: string
       attempts: number
+      /** 1 when the primary was re-asked once after a bad shape before the chain walked; else 0. */
+      retried: number
       /** Leading field paths from the validator when reason is "invalid" — names only, safe for logs. */
       fields?: string[]
       /** Present when the fallback ran (and lost too): which model failed and the reason that triggered it. */
@@ -307,13 +314,75 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     hops.length === 0
       ? undefined
       : { from: hops[0]!.from, to: hops[hops.length - 1]!.to, reason: hops.map((h) => h.reason).join("; ") }
-  let lastFail: { reason: "model-failed" | "no-json"; detail: string } = {
+  let lastFail: { reason: "model-failed" | "no-json" | "invalid"; detail: string } = {
     reason: "model-failed",
     detail: "no attempt ran",
   }
   // The unspent fallback providers. Each is shifted out as it runs, so a provider is
   // never tried twice — a later attempt re-runs the primary, never the chain.
   const queue = [...(input.fallbackModels ?? [])]
+  // The primary's one same-provider shape retry (M3-H) — a compile-level flag, so the
+  // worst case any compile can add is exactly one call, across every attempt combined.
+  let retried = 0
+
+  // Turn one candidate object into a checkpoint: pick the model-writable fields, set the
+  // code-owned ones, relativize paths, trim, validate. A bad shape is a per-provider
+  // failure now (the chain can still walk, and the primary gets one retry), so this runs
+  // per model run — once per attempt no longer suffices.
+  const shapeOf = (
+    obj: Record<string, unknown>,
+  ):
+    | { ok: true; checkpoint: Checkpoint; droppedKeys: string[]; trimmed: string[] }
+    | { ok: false; detail: string; fields: string[] } => {
+    // Only the model-writable fields are taken; every other key NAME is
+    // reported in droppedKeys (never its value) so validation stays
+    // strict on what remains. originalRequest is absent from
+    // CONTENT_FIELDS on purpose — a model that returns it gets it
+    // dropped and named like any unknown key (spike bug H1).
+    // The model's own output is scrubbed too: it was told never to copy
+    // secrets, but what it returns is untrusted text and a leaked key in
+    // a progress line would be stored verbatim otherwise.
+    const picked: Record<string, unknown> = {}
+    const droppedKeys: string[] = []
+    for (const k of Object.keys(obj)) {
+      if ((CONTENT_FIELDS as readonly string[]).includes(k)) picked[k] = scrubValue(obj[k])
+      else droppedKeys.push(k)
+    }
+
+    // Fields the model may not write are set by code: the id, the agent
+    // name, the source tag, the timestamp — and the user's own words,
+    // copied verbatim from the transcript, never summarised by a model.
+    picked.eventId = input.eventId
+    picked.agent = input.agent
+    picked.source = "hook-compiler"
+    picked.createdAt = now().toISOString()
+    picked.originalRequest = convo.firstUserMessage
+
+    if (Array.isArray(picked.artifacts)) {
+      picked.artifacts = picked.artifacts.map((a) => (typeof a === "string" ? rel(a) : a))
+    }
+    if (Array.isArray(picked.evidence)) {
+      picked.evidence = picked.evidence.map((e) => {
+        if (e === null || typeof e !== "object") return e
+        const ref = (e as { ref?: unknown }).ref
+        return typeof ref === "string" && ref.startsWith("file:")
+          ? { ...(e as Record<string, unknown>), ref: "file:" + rel(ref.slice(5)) }
+          : e
+      })
+    }
+
+    const trimmed: string[] = []
+    trimFields(picked, trimmed)
+
+    const v = validateCheckpoint(picked)
+    if (!v.ok) {
+      // the drainer may log field NAMES ("decisions[3].rationale") — never
+      // the validator's messages, which can echo the value that failed
+      const fields = [...new Set(v.errors.map((e) => e.split(":")[0]!))]
+      return { ok: false, detail: v.errors.join("; "), fields }
+    }
+    return { ok: true, checkpoint: v.value, droppedKeys, trimmed }
+  }
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     let current = model
@@ -322,17 +391,20 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     // failed end-to-end names every provider it tried, in order.
     const trail: string[] = []
     // Walk the provider chain inside this attempt: a command failure (exit, spawn error,
-    // timeout — a provider's "http 429"/5xx lands as the first) or output holding no usable
-    // JSON both move to the next unspent provider; a usable object leaves the loop for the
-    // validation below.
-    let parsed: Record<string, unknown> | undefined
+    // timeout — a provider's "http 429"/5xx lands as the first), output holding no usable
+    // JSON, or a JSON shape that fails validation all move to the next unspent provider —
+    // except that a bad SHAPE from the primary earns one same-provider retry first: the
+    // repeated prompt is a provider-cache hit, so the second opinion is nearly free.
+    let parsed: { checkpoint: Checkpoint; droppedKeys: string[]; trimmed: string[] } | undefined
     // the cache counters of the run that produced `parsed` — the WRITER's numbers,
     // never an earlier provider's that failed on the way
     let cache: { cacheHitTokens?: number; cacheMissTokens?: number } = {}
+    // the field names of the LAST invalid failure — kept for the terminal report only
+    let invalidFields: string[] | undefined
     for (;;) {
       const run = await runModel(current, prompt)
       modelMs += run.ms
-      let fail: { reason: "model-failed" | "no-json"; detail: string }
+      let fail: { reason: "model-failed" | "no-json" | "invalid"; detail: string }
       if (run.ok) {
         const obj = extractJsonObject(run.stdout)
         // An object holding none of the ten content fields (a "reasoning" object like
@@ -344,17 +416,30 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
             (CONTENT_FIELDS as readonly string[]).includes(k),
           )
         if (hasContent) {
-          parsed = obj as Record<string, unknown>
-          if (run.cacheHitTokens !== undefined && run.cacheMissTokens !== undefined) {
-            cache = { cacheHitTokens: run.cacheHitTokens, cacheMissTokens: run.cacheMissTokens }
+          const checked = shapeOf(obj as Record<string, unknown>)
+          if (checked.ok) {
+            parsed = checked
+            if (run.cacheHitTokens !== undefined && run.cacheMissTokens !== undefined) {
+              cache = { cacheHitTokens: run.cacheHitTokens, cacheMissTokens: run.cacheMissTokens }
+            }
+            break
           }
-          break
+          fail = { reason: "invalid", detail: checked.detail }
+          invalidFields = checked.fields
+        } else {
+          fail = { reason: "no-json", detail: obj === undefined ? "model output held no JSON object" : "first JSON object held no checkpoint fields" }
         }
-        fail = { reason: "no-json", detail: obj === undefined ? "model output held no JSON object" : "first JSON object held no checkpoint fields" }
       } else {
         fail = { reason: "model-failed", detail: run.detail }
       }
       trail.push(`${current.label}: ${fail.detail}`)
+      // One same-provider retry on a bad SHAPE — never on a transport failure — and only
+      // the primary earns it: a fallback's bad answer walks at once. Once per compile, so
+      // the worst case adds exactly one call (M3-H).
+      if ((fail.reason === "invalid" || fail.reason === "no-json") && current === model && retried === 0) {
+        retried = 1
+        continue
+      }
       const next = queue.shift()
       if (next === undefined) {
         lastFail = { reason: fail.reason, detail: trail.join("; ") }
@@ -365,81 +450,44 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
       label = current.label
     }
     if (parsed === undefined) {
+      // A chain that ended on a bad SHAPE is terminal: every provider already had its say
+      // on this transcript, and the outer attempts would only re-ask the same question.
+      if (lastFail.reason === "invalid") {
+        const fb = fellBack()
+        return {
+          ok: false,
+          reason: "invalid",
+          detail: lastFail.detail,
+          attempts: attempt,
+          retried,
+          ...(invalidFields !== undefined ? { fields: invalidFields } : {}),
+          ...(fb !== undefined ? { fellBack: fb } : {}),
+        }
+      }
       if (attempt < attempts) await sleep(backoff[Math.min(attempt - 1, backoff.length - 1)] ?? 0)
       continue
     }
-    {
-      const obj = parsed
-      // Only the model-writable fields are taken; every other key NAME is
-      // reported in droppedKeys (never its value) so validation stays
-      // strict on what remains. originalRequest is absent from
-      // CONTENT_FIELDS on purpose — a model that returns it gets it
-      // dropped and named like any unknown key (spike bug H1).
-      // The model's own output is scrubbed too: it was told never to copy
-      // secrets, but what it returns is untrusted text and a leaked key in
-      // a progress line would be stored verbatim otherwise.
-      const picked: Record<string, unknown> = {}
-      const droppedKeys: string[] = []
-      for (const k of Object.keys(obj)) {
-        if ((CONTENT_FIELDS as readonly string[]).includes(k)) picked[k] = scrubValue(obj[k])
-        else droppedKeys.push(k)
-      }
-
-      // Fields the model may not write are set by code: the id, the agent
-      // name, the source tag, the timestamp — and the user's own words,
-      // copied verbatim from the transcript, never summarised by a model.
-      picked.eventId = input.eventId
-      picked.agent = input.agent
-      picked.source = "hook-compiler"
-      picked.createdAt = now().toISOString()
-      picked.originalRequest = convo.firstUserMessage
-
-      if (Array.isArray(picked.artifacts)) {
-        picked.artifacts = picked.artifacts.map((a) => (typeof a === "string" ? rel(a) : a))
-      }
-      if (Array.isArray(picked.evidence)) {
-        picked.evidence = picked.evidence.map((e) => {
-          if (e === null || typeof e !== "object") return e
-          const ref = (e as { ref?: unknown }).ref
-          return typeof ref === "string" && ref.startsWith("file:")
-            ? { ...(e as Record<string, unknown>), ref: "file:" + rel(ref.slice(5)) }
-            : e
-        })
-      }
-
-      const trimmed: string[] = []
-      trimFields(picked, trimmed)
-
-      const v = validateCheckpoint(picked)
-      // A validation failure is deterministic — the same input would fail
-      // the same way — so it is reported at once and never retried.
-      const fb = fellBack()
-      if (!v.ok) {
-        // the drainer may log field NAMES ("decisions[3].rationale") — never
-        // the validator's messages, which can echo the value that failed
-        const fields = [...new Set(v.errors.map((e) => e.split(":")[0]!))]
-        return { ok: false, reason: "invalid", detail: v.errors.join("; "), attempts: attempt, fields, ...(fb !== undefined ? { fellBack: fb } : {}) }
-      }
-      return {
-        ok: true,
-        checkpoint: v.value,
-        compiledBy: label,
-        droppedKeys,
-        trimmed,
-        attempts: attempt,
-        // fellBack is reported only when a fallback actually wrote the checkpoint — a
-        // fallback that ran and lost before a later primary success would mislabel the save
-        ...(label !== model.label && fb !== undefined ? { fellBack: fb } : {}),
-        format: convo.format,
-        messagesKept: convo.messagesKept,
-        messagesTotal: convo.messagesTotal,
-        charsSent: convo.text.length,
-        modelMs,
-        ...cache,
-      }
+    const fb = fellBack()
+    return {
+      ok: true,
+      checkpoint: parsed.checkpoint,
+      compiledBy: label,
+      droppedKeys: parsed.droppedKeys,
+      trimmed: parsed.trimmed,
+      attempts: attempt,
+      retried,
+      // fellBack is reported only when a fallback actually wrote the checkpoint — a
+      // fallback that ran and lost before a later primary success would mislabel the save
+      ...(label !== model.label && fb !== undefined ? { fellBack: fb } : {}),
+      format: convo.format,
+      messagesKept: convo.messagesKept,
+      messagesTotal: convo.messagesTotal,
+      charsSent: convo.text.length,
+      modelMs,
+      ...cache,
     }
   }
   // a fallback chain that ran and still lost is part of the failure report — the daemon log says so
   const fb = fellBack()
-  return { ok: false, reason: lastFail.reason, detail: lastFail.detail, attempts, ...(fb !== undefined ? { fellBack: fb } : {}) }
+  return { ok: false, reason: lastFail.reason, detail: lastFail.detail, attempts, retried, ...(fb !== undefined ? { fellBack: fb } : {}) }
 }

@@ -38,7 +38,7 @@ describe("M1 drainOnce on local Anvil", () => {
 
   const compile = async (input: CompileInput): Promise<CompileResult> => {
     compileCalls.push(input)
-    if (compileFails) return { ok: false, reason: "model-failed", detail: "exit 3", attempts: 3 }
+    if (compileFails) return { ok: false, reason: "model-failed", detail: "exit 3", attempts: 3, retried: 0 }
     return {
       ok: true,
       checkpoint: sampleCheckpoint({ eventId: input.eventId, agent: input.agent }),
@@ -46,6 +46,7 @@ describe("M1 drainOnce on local Anvil", () => {
       droppedKeys: [],
       trimmed: [],
       attempts: 1,
+      retried: 0,
       format: "claude-jsonl",
       messagesKept: 1,
       messagesTotal: 1,

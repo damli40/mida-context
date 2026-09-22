@@ -25,6 +25,11 @@
 //              the provider's usage line a compile with stderrDetail reads
 //   cache-stats-bad — GOOD on stdout plus a malformed "cache hit=…" line on
 //              stderr: the parse must ignore it and still succeed
+//   shape-flaky — badshape on its FIRST run, good after (counts runs in
+//              FAKE_MODEL_COUNTER): the same-provider shape retry's target
+//   nojson-flaky — "not json" on its FIRST run, good after (same counter)
+//   badshape-count — badshape on every run, counting them: proves the retry
+//              fired once on the primary and never on a fallback
 //
 // The mode comes from argv[2] when present, else FAKE_MODEL_MODE — argv lets a
 // primary and a fallback command differ inside one compile even though both
@@ -62,6 +67,22 @@ process.stdin.on("end", () => {
       "Here is the extracted checkpoint.\n```json\n" + JSON.stringify(obj) + "\n```\nDone.\n",
     )
 
+  // counted() bumps the file named by FAKE_MODEL_COUNTER and returns the run's
+  // 0-based index — how a test proves which provider ran and how many times
+  const counted = () => {
+    const counterFile = process.env.FAKE_MODEL_COUNTER
+    let n = 0
+    if (counterFile) {
+      try {
+        n = Number.parseInt(fs.readFileSync(counterFile, "utf8"), 10) || 0
+      } catch {
+        n = 0
+      }
+      fs.writeFileSync(counterFile, String(n + 1))
+    }
+    return n
+  }
+
   switch (process.argv[2] ?? process.env.FAKE_MODEL_MODE) {
     case "good":
       fenced(GOOD)
@@ -82,18 +103,23 @@ process.stdin.on("end", () => {
       setTimeout(() => process.exit(0), 60_000)
       break
     case "flaky": {
-      const counterFile = process.env.FAKE_MODEL_COUNTER
-      let n = 0
-      if (counterFile) {
-        try {
-          n = Number.parseInt(fs.readFileSync(counterFile, "utf8"), 10) || 0
-        } catch {
-          n = 0
-        }
-        fs.writeFileSync(counterFile, String(n + 1))
-      }
-      if (n === 2) fenced(GOOD)
+      if (counted() === 2) fenced(GOOD)
       else process.exit(3)
+      break
+    }
+    case "shape-flaky": {
+      if (counted() === 0) process.stdout.write('{"objective":5}')
+      else fenced(GOOD)
+      break
+    }
+    case "nojson-flaky": {
+      if (counted() === 0) process.stdout.write("not json")
+      else fenced(GOOD)
+      break
+    }
+    case "badshape-count": {
+      counted()
+      process.stdout.write('{"objective":5}')
       break
     }
     case "grandchild": {

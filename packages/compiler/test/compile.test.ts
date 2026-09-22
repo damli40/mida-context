@@ -85,6 +85,7 @@ describe("compileCheckpoint", () => {
       expect([...r.droppedKeys].sort()).toEqual(["confidence", "notes", "originalRequest"])
       expect(r.checkpoint.source).toBe("hook-compiler")
       expect(r.compiledBy).toBe("fake")
+      expect(r.retried).toBe(0) // a clean first answer never spends the retry
     }
   })
   it("retries a failing model and succeeds on the third try, waiting between tries", async () => {
@@ -101,9 +102,20 @@ describe("compileCheckpoint", () => {
     const r = await compileCheckpoint({ ...base, model: fake("garbage"), sleep: async () => {} })
     expect(r).toMatchObject({ ok: false, reason: "no-json", attempts: 3 })
   })
-  it("does not retry output that parsed but failed validation", async () => {
-    const r = await compileCheckpoint({ ...base, model: fake("badshape"), sleep: async () => {} })
-    expect(r).toMatchObject({ ok: false, reason: "invalid", attempts: 1 })
+  it("an invalid shape gets one same-provider retry, then stays terminal — the outer attempts never re-run (M3-H)", async () => {
+    // badshape-count answers invalid on every call and counts them: call 1 fails, the one
+    // retry fails the same way, and with no fallback the compile reports invalid at once —
+    // attempts is still 1 because the retry happens INSIDE the attempt, in place
+    const counter = path.join(dir, "primary-ran.log")
+    process.env.FAKE_MODEL_COUNTER = counter
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "badshape-count"], label: "fake" },
+      sleep: async () => {},
+    })
+    expect(r).toMatchObject({ ok: false, reason: "invalid", attempts: 1, retried: 1 })
+    if (!r.ok) expect(r.fields).toContain("objective")
+    expect(fs.readFileSync(counter, "utf8")).toBe("2")
   })
   it("kills a hanging model at the timeout", async () => {
     const started = Date.now()
@@ -252,8 +264,84 @@ describe("compileCheckpoint", () => {
     expect(r.ok).toBe(true)
     if (r.ok) {
       expect(r.compiledBy).toBe("kimi-y")
+      expect(r.retried).toBe(1) // M3-H: the no-json primary was re-asked once before the walk
       expect(r.fellBack).toEqual({ from: "deepseek-x", to: "kimi-y", reason: expect.stringContaining("no JSON") })
     }
+  })
+
+  it("a bad-shape answer earns the primary one same-provider retry — retried:1, no fallback (M3-H)", async () => {
+    // shape-flaky is invalid on its first call and good on its second: the retry is a
+    // cache-hit rerun of the identical prompt, so the primary itself writes the checkpoint
+    const counter = path.join(dir, "primary-ran.log")
+    process.env.FAKE_MODEL_COUNTER = counter
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "shape-flaky"], label: "deepseek-x" },
+      fallbackModels: [{ argv: [process.execPath, fixturePath, "good"], label: "kimi-y" }],
+      sleep: async () => {},
+    })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.compiledBy).toBe("deepseek-x")
+      expect(r.retried).toBe(1)
+      expect(r.attempts).toBe(1)
+      expect(r.fellBack).toBeUndefined()
+    }
+    expect(fs.readFileSync(counter, "utf8")).toBe("2") // the fallback never ran
+  })
+
+  it("a bad shape twice in a row walks the chain — retried:1, fellBack keeps the original reason (M3-H)", async () => {
+    const counter = path.join(dir, "primary-ran.log")
+    process.env.FAKE_MODEL_COUNTER = counter
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "badshape-count"], label: "deepseek-x" },
+      fallbackModels: [{ argv: [process.execPath, fixturePath, "good"], label: "kimi-y" }],
+      sleep: async () => {},
+    })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.compiledBy).toBe("kimi-y")
+      expect(r.retried).toBe(1)
+      expect(r.attempts).toBe(1)
+      expect(r.fellBack).toEqual({ from: "deepseek-x", to: "kimi-y", reason: expect.stringContaining("objective") })
+    }
+    expect(fs.readFileSync(counter, "utf8")).toBe("2") // original call + one retry, then the walk
+  })
+
+  it("a transport failure never earns the retry — model-failed walks at once (M3-H)", async () => {
+    // flaky exits 3 on its first run — the shape a provider's "http 429" lands as: one call,
+    // no re-ask, straight to the fallback
+    const counter = path.join(dir, "primary-ran.log")
+    process.env.FAKE_MODEL_COUNTER = counter
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "flaky"], label: "deepseek-x" },
+      fallbackModels: [{ argv: [process.execPath, fixturePath, "good"], label: "kimi-y" }],
+      sleep: async () => {},
+    })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.compiledBy).toBe("kimi-y")
+      expect(r.retried).toBe(0)
+    }
+    expect(fs.readFileSync(counter, "utf8")).toBe("1")
+  })
+
+  it("the retry belongs to the primary alone — a fallback's bad shape is never re-asked (M3-H)", async () => {
+    // badshape-count answers invalid on every call and counts them: as a fallback it must run
+    // exactly once — the worst case a compile can add is the primary's single retry
+    const counter = path.join(dir, "fallback-ran.log")
+    process.env.FAKE_MODEL_COUNTER = counter
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "fail"], label: "deepseek-x" },
+      fallbackModels: [{ argv: [process.execPath, fixturePath, "badshape-count"], label: "kimi-y" }],
+      attempts: 1,
+      sleep: async () => {},
+    })
+    expect(r).toMatchObject({ ok: false, reason: "invalid", attempts: 1, retried: 0 })
+    expect(fs.readFileSync(counter, "utf8")).toBe("1")
   })
 
   it("reads the provider's cache-usage line off a controlled stderr into the result (M3-H)", async () => {
