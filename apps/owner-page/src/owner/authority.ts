@@ -6,10 +6,12 @@ import {
   PERMISSION,
   POLICY_VERSION,
   accessRequestHash,
+  cancelFastRevokeDigest,
   canonicalizeNamespace,
   decodeUint64,
   encodeUint64,
   grantDigest,
+  isMidaError,
   namespaceById,
   namespaceId as toNamespaceId,
   sortScopes,
@@ -38,7 +40,7 @@ import {
   readAgentRecord,
   toMidaError,
 } from "@mida/chain/browser"
-import type { Deployment, SponsoredSender, TxKind } from "@mida/chain/browser"
+import type { Deployment, SponsoredReceipt, SponsoredSender, TxKind } from "@mida/chain/browser"
 import { POLICY_HASH_V1, adviseGrant, assertFinalSelection } from "@mida/grant-advisor"
 import { fakePrfOutput, toAccessRequestStruct } from "@mida/fake-vault/browser"
 import type {
@@ -48,6 +50,7 @@ import type {
   RevokeRequest,
   VaultAuthority,
   VaultContextApi,
+  WebAuthnAssertionWire,
 } from "@mida/fake-vault/browser"
 import { assertionChallenge } from "./webauthn.js"
 import type { CapturedAssertion } from "./webauthn.js"
@@ -85,6 +88,37 @@ export interface PasskeyAuthorityConfig {
   p256PublicKey?: { qx: bigint; qy: bigint }
   /** The ceremony's captured assertion — required by approveGrant, ignored by revocation. */
   assertion?: CapturedAssertion
+  /**
+   * A SECOND ceremony, only ever for undoing a staged deny after a failed revoke send: the flow
+   * wires a `get` over the cancelFastRevokeDigest challenge and returns the wire assertion. When
+   * absent the undo cannot run, the deny stays, and the send error carries the manual-clear line.
+   */
+  signCancelAssertion?: (challenge: Hex) => Promise<WebAuthnAssertionWire>
+}
+
+/**
+ * The store surface M3-D4 lands on merge: requestRevocationDeny gains a cancellationNonce and the
+ * api gains cancelRevocation. This branch's package predates the merge, so the authority reads the
+ * deny through this shape — a pre-merge api simply fails the undo, and the send error carries the
+ * manual-clear line exactly as if cancelRevocation itself had failed.
+ */
+interface CancelCapableApi extends VaultContextApi {
+  requestRevocationDeny(target: { capabilityId: Hex } | { owner: Address; agentId: Hex }): Promise<{ intentId: Hex; cancellationNonce: string }>
+  cancelRevocation(intentId: Hex, input: { expiresAt: bigint; assertion: WebAuthnAssertionWire }): Promise<unknown>
+}
+
+/**
+ * RevokeApproval after the M3-D4 merge carries `sponsored` — the class returns it now so both
+ * sides of the merge compile, and `PageRevokeApproval` is the merge's shape either way.
+ */
+export type PageRevokeApproval = RevokeApproval & { sponsored: boolean }
+
+/** The undo window the store accepts for a deny cancellation — two minutes (§12.5, M3-D4). */
+const DENY_CANCEL_EXPIRY_SECONDS = 120n
+
+/** A sponsored send's receipt carries `userOpHash` — that field, not the network config, says who paid. */
+function isSponsored(receipt: TransactionReceipt): boolean {
+  return (receipt as TransactionReceipt & { userOpHash?: Hex }).userOpHash !== undefined
 }
 
 interface CapabilityView {
@@ -107,6 +141,7 @@ export class PasskeyVaultAuthority implements VaultAuthority {
   readonly #api: VaultContextApi
   readonly #p256PublicKey?: { qx: bigint; qy: bigint }
   readonly #assertion?: CapturedAssertion
+  readonly #signCancelAssertion?: (challenge: Hex) => Promise<WebAuthnAssertionWire>
   #released = false
 
   constructor(config: PasskeyAuthorityConfig) {
@@ -126,6 +161,7 @@ export class PasskeyVaultAuthority implements VaultAuthority {
     this.#api = config.api
     this.#p256PublicKey = config.p256PublicKey
     this.#assertion = config.assertion
+    this.#signCancelAssertion = config.signCancelAssertion
     this.owner = config.account.address.toLowerCase() as Address
   }
 
@@ -273,8 +309,9 @@ export class PasskeyVaultAuthority implements VaultAuthority {
   }
 
   /** §7.3 and §16 steps 13–14: the local deny is posted first, then one sponsored transaction revokes and rotates. */
-  async approveRevocation(request: RevokeRequest): Promise<RevokeApproval> {
+  async approveRevocation(request: RevokeRequest): Promise<PageRevokeApproval> {
     this.#live()
+    const api = this.#api as CancelCapableApi
     if (request.kind === "capability") {
       const capability = await this.#readCapability<CapabilityView>("getCapability", [request.capabilityId])
       if (capability.owner.toLowerCase() !== this.owner) {
@@ -282,15 +319,20 @@ export class PasskeyVaultAuthority implements VaultAuthority {
       }
       const live = await this.#readCapability<boolean>("isCapabilityValid", [request.capabilityId])
       const endsRead = live && (capability.permissions & PERMISSION.READ) !== 0
-      const { intentId } = await this.#api.requestRevocationDeny({ capabilityId: request.capabilityId })
+      const deny = await api.requestRevocationDeny({ capabilityId: request.capabilityId })
+      const label = (request as { name?: string }).name ?? capability.agentId
       if (!endsRead) {
-        const receipt = await this.#sendCapability("revoke.capability", "revoke", [request.capabilityId])
-        return { intentId, transactionHash: receipt.transactionHash, rotated: [] }
+        const receipt = await this.#sendOrUndoDeny(deny, label, () =>
+          this.#sendCapability("revoke.capability", "revoke", [request.capabilityId]),
+        )
+        return { intentId: deny.intentId, transactionHash: receipt.transactionHash, sponsored: isSponsored(receipt), rotated: [] }
       }
       const next = (await this.#readCapability<bigint>("requiredReadEpoch", [this.owner, capability.namespaceId])) + 1n
       const keys = await this.#epochKeys(capability.namespaceId, next)
-      const receipt = await this.#sendCapability("revoke.rotate", "revokeAndRotate", [request.capabilityId, hexOf(keys.publicKey)])
-      return { intentId, transactionHash: receipt.transactionHash, rotated: [{ namespaceId: capability.namespaceId, readEpoch: next }] }
+      const receipt = await this.#sendOrUndoDeny(deny, label, () =>
+        this.#sendCapability("revoke.rotate", "revokeAndRotate", [request.capabilityId, hexOf(keys.publicKey)]),
+      )
+      return { intentId: deny.intentId, transactionHash: receipt.transactionHash, sponsored: isSponsored(receipt), rotated: [{ namespaceId: capability.namespaceId, readEpoch: next }] }
     }
 
     const ids = await this.#readCapability<readonly Hex[]>("activeCapabilityIds", [this.owner, request.agentId])
@@ -303,15 +345,59 @@ export class PasskeyVaultAuthority implements VaultAuthority {
       }
     }
     const rotations: Array<{ namespaceId: Hex; newEpochPublicKey: Hex }> = []
-    const rotated: RevokeApproval["rotated"] = []
+    const rotated: PageRevokeApproval["rotated"] = []
     for (const namespaceId of readNamespaces) {
       const next = (await this.#readCapability<bigint>("requiredReadEpoch", [this.owner, namespaceId])) + 1n
       rotations.push({ namespaceId, newEpochPublicKey: hexOf((await this.#epochKeys(namespaceId, next)).publicKey) })
       rotated.push({ namespaceId, readEpoch: next })
     }
-    const { intentId } = await this.#api.requestRevocationDeny({ owner: this.owner, agentId: request.agentId })
-    const receipt = await this.#sendCapability("revoke.agent", "revokeAgentAndRotate", [request.agentId, rotations])
-    return { intentId, transactionHash: receipt.transactionHash, rotated }
+    const deny = await api.requestRevocationDeny({ owner: this.owner, agentId: request.agentId })
+    const receipt = await this.#sendOrUndoDeny(deny, (request as { name?: string }).name ?? request.agentId, () =>
+      this.#sendCapability("revoke.agent", "revokeAgentAndRotate", [request.agentId, rotations]),
+    )
+    return { intentId: deny.intentId, transactionHash: receipt.transactionHash, sponsored: isSponsored(receipt), rotated }
+  }
+
+  /**
+   * The undo half of "deny first, then send" (§12.5, M3-D4): a send that provably never happened —
+   * simulation or a sponsor refusal — must not leave its deny behind, or the store keeps blocking
+   * an agent the chain still approves. SPONSOR_PENDING is the exception: the bundler accepted the
+   * operation and it may still land, so its deny stays and the error propagates untouched. Any
+   * other failure cancels the intent with a fresh passkey assertion over cancelFastRevokeDigest
+   * (two-minute expiry). When the cancel itself fails the original error still surfaces, carrying
+   * the one line that clears the deny by hand.
+   */
+  async #sendOrUndoDeny(
+    deny: { intentId: Hex; cancellationNonce: string },
+    label: string,
+    send: () => Promise<TransactionReceipt>,
+  ): Promise<TransactionReceipt> {
+    try {
+      return await send()
+    } catch (error) {
+      if (isMidaError(error, "SPONSOR_PENDING")) throw error
+      try {
+        const expiresAt = BigInt(Math.floor(Date.now() / 1000)) + DENY_CANCEL_EXPIRY_SECONDS
+        const challenge = cancelFastRevokeDigest({
+          chainId: this.#deployment.chainId,
+          capabilityRegistry: this.#deployment.capabilityRegistry,
+          owner: this.owner,
+          revocationIntentId: deny.intentId,
+          apiCancellationNonce: BigInt(deny.cancellationNonce),
+          expiresAt,
+        })
+        if (this.#signCancelAssertion === undefined) throw new MidaError("AUTH_INVALID", "no cancel signer was wired")
+        await (this.#api as CancelCapableApi).cancelRevocation(deny.intentId, {
+          expiresAt,
+          assertion: await this.#signCancelAssertion(challenge),
+        })
+      } catch {
+        if (error instanceof Error) {
+          error.message += `\nthe store may still list ${label} as denied — run \`mida approve ${label}\` to clear it`
+        }
+      }
+      throw error
+    }
   }
 
   /** §7.3 expiry: resumes writes after the earliest READ expiry closed the epoch. */

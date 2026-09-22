@@ -13,12 +13,13 @@ import { bytesOf, hexOf } from "@mida/crypto"
 import { capabilityRegistryAbi, readAgentRecord, toMidaError } from "@mida/chain/browser"
 import type { Deployment, SponsoredSender } from "@mida/chain/browser"
 import { manifestBodyHash } from "@mida/grant-advisor"
+import { assertionToWire } from "@mida/fake-vault/browser"
 import type { VaultContextApi } from "@mida/fake-vault/browser"
 import { SponsorPending } from "@mida/chain/browser"
 import type { CredentialsContainerLike } from "../check/client.js"
 import { PasskeyVaultAuthority, prepareGrant } from "./authority.js"
 import type { CapturedAssertion } from "./webauthn.js"
-import { actionChallenge, assertOwnerPasskey, createOwnerPasskey, verifyCapturedAssertion } from "./webauthn.js"
+import { actionChallenge, assertOwnerPasskey, capturedToAuthStruct, createOwnerPasskey, verifyCapturedAssertion } from "./webauthn.js"
 import { deriveOwnerSecrets, ownerAccount, shortAddress } from "./secrets.js"
 import type { OwnerSecrets } from "./secrets.js"
 import type { FlowResult, LinkRequest, ParsedLink } from "./link.js"
@@ -97,6 +98,23 @@ function authorityFor(
     api: env.makeApi(account),
     p256PublicKey: extra.p256PublicKey,
     assertion: extra.assertion,
+    // The deny-undo path (M3-D4): a failed revoke send cancels its staged deny, which takes a
+    // fresh passkey assertion over the cancel digest — a second touch, on the failure path only.
+    signCancelAssertion: async (challenge) => {
+      const stored = loadStoredOwner(env.storage)
+      const again = await assertOwnerPasskey({
+        credentials: env.credentials,
+        rpId: env.deployment.vaultRpId,
+        challenge: bytesOf(challenge, 32),
+        ...(stored?.credentialId !== undefined ? { credentialId: stored.credentialId } : {}),
+        ...(stored?.transports !== undefined ? { transports: stored.transports } : {}),
+      })
+      try {
+        return assertionToWire(capturedToAuthStruct(again.assertion))
+      } finally {
+        again.prfOutput.fill(0)
+      }
+    },
   })
   return { authority, sent }
 }

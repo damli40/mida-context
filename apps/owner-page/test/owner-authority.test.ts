@@ -4,6 +4,7 @@ import type { Address, Hex } from "viem"
 import {
   PERMISSION,
   accessRequestHash,
+  cancelFastRevokeDigest,
   decodeUint64,
   encodeUint64,
   grantDigest,
@@ -12,13 +13,13 @@ import {
   namespaceId,
 } from "@mida/protocol"
 import type { AccessRequest } from "@mida/protocol"
-import { deriveEpochKeyPair, deriveNamespaceSecret, hexOf } from "@mida/crypto"
+import { bytesOf, deriveEpochKeyPair, deriveNamespaceSecret, hexOf } from "@mida/crypto"
 import { capabilityRegistryAbi } from "@mida/chain/browser"
 import type { Deployment, SponsoredReceipt, SponsoredSender, TxKind } from "@mida/chain/browser"
 import { SponsorDidNotPay, SponsorPending } from "@mida/chain/browser"
 import { POLICY_HASH_V1 } from "@mida/grant-advisor"
-import { fakePrfOutput } from "@mida/fake-vault/browser"
-import type { VaultContextApi } from "@mida/fake-vault/browser"
+import { assertionToWire, fakePrfOutput } from "@mida/fake-vault/browser"
+import type { VaultContextApi, WebAuthnAssertionWire } from "@mida/fake-vault/browser"
 import {
   AGENT_ID,
   CHAIN_ID,
@@ -33,7 +34,8 @@ import {
 import { deriveOwnerSecrets, ownerAccount } from "../src/owner/secrets.js"
 import { PasskeyVaultAuthority } from "../src/owner/authority.js"
 import type { CapturedAssertion } from "../src/owner/webauthn.js"
-import { makeAssertion, makeKeyPair } from "./helpers.js"
+import { capturedToAuthStruct, verifyCapturedAssertion } from "../src/owner/webauthn.js"
+import { derSignature, makeAssertion, makeKeyPair } from "./helpers.js"
 
 /**
  * The authority end to end against fakes: the fake chain answers view calls, the fake sponsor
@@ -179,23 +181,34 @@ function capabilityGrantedLog(args: {
   return { topics, data }
 }
 
+/**
+ * The post-M3-D4 store shape — the deny carries a cancellationNonce and the api gains
+ * cancelRevocation. Typed wider than VaultContextApi on purpose: this branch's package predates
+ * the merge, and the fake must speak the merged shape the authority now uses.
+ */
 function fakeApi() {
   const calls: Call[] = []
-  const api: VaultContextApi = {
+  const cancels: { intentId: Hex; expiresAt: bigint; assertion: WebAuthnAssertionWire }[] = []
+  const api = {
     async putObject() {
       calls.push({ what: "api:putObject" })
       return {}
     },
-    async publishEpochWrap(wrap) {
+    async publishEpochWrap(wrap: unknown) {
       calls.push({ what: "api:publishEpochWrap", detail: wrap })
       return { stored: true }
     },
-    async requestRevocationDeny(target) {
+    async requestRevocationDeny(target: { capabilityId: Hex } | { owner: Address; agentId: Hex }) {
       calls.push({ what: "api:requestRevocationDeny", detail: target })
-      return { intentId: `0x${"dd".repeat(32)}` as Hex }
+      return { intentId: `0x${"dd".repeat(32)}` as Hex, cancellationNonce: "7" }
+    },
+    async cancelRevocation(intentId: Hex, input: { expiresAt: bigint; assertion: WebAuthnAssertionWire }) {
+      calls.push({ what: "api:cancelRevocation", detail: intentId })
+      cancels.push({ intentId, expiresAt: input.expiresAt, assertion: input.assertion })
+      return {}
     },
   }
-  return { api, calls }
+  return { api, calls, cancels }
 }
 
 function authority(opts: {
@@ -203,6 +216,7 @@ function authority(opts: {
   sponsor: SponsoredSender
   api: VaultContextApi
   assertion?: CapturedAssertion
+  signCancelAssertion?: (challenge: Hex) => Promise<WebAuthnAssertionWire>
 }) {
   const secrets = deriveOwnerSecrets(PRF.slice())
   const account = ownerAccount(secrets)
@@ -215,6 +229,7 @@ function authority(opts: {
     api: opts.api,
     p256PublicKey: passkeyPoint,
     assertion: opts.assertion,
+    signCancelAssertion: opts.signCancelAssertion,
   })
 }
 
@@ -407,6 +422,126 @@ describe("PasskeyVaultAuthority", () => {
     const rotations = sends[0]!.call.args[1] as { namespaceId: Hex; newEpochPublicKey: Hex }[]
     expect(rotations[0]!.namespaceId).toBe(NS_ID)
     expect(rotations[0]!.newEpochPublicKey).toBe(epochPublicKey(NS_ID, 2n))
+  })
+
+  it("reports the approval as sponsored — the page never self-pays", async () => {
+    const chain = fakeChain({ activeCapabilityIds: () => [] })
+    const { sponsor } = fakeSponsor()
+    const { api } = fakeApi()
+    const auth = authority({ publicClient: chain.publicClient, sponsor, api })
+    const approval = await auth.approveRevocation({ kind: "agent", agentId: AGENT_ID })
+    expect(approval.sponsored).toBe(true)
+  })
+
+  it("a failed revoke send undoes the staged deny — the cancel carries a verifying passkey assertion", async () => {
+    const capabilityId = `0x${"55".repeat(32)}` as Hex
+    const chain = fakeChain({
+      activeCapabilityIds: () => [capabilityId],
+      getCapability: () => ({
+        owner: ownerOfPrf(),
+        agentId: AGENT_ID,
+        namespaceId: NS_ID,
+        permissions: PERMISSION.READ,
+        provenancePolicy: 0,
+        issuedAt: 1n,
+        expiresAt: NOW + 86_400n,
+        agentEpoch: 0n,
+        grantedAtReadEpoch: 1n,
+        revoked: false,
+      }),
+      isCapabilityValid: () => true,
+    })
+    const sendError = new SponsorDidNotPay("quota exhausted")
+    const sponsor: SponsoredSender = {
+      send: async () => {
+        throw sendError
+      },
+    }
+    const { api, cancels } = fakeApi()
+    const auth = authority({
+      publicClient: chain.publicClient,
+      sponsor,
+      api,
+      signCancelAssertion: async (challenge) =>
+        assertionToWire(capturedToAuthStruct(assertionOver(challenge))),
+    })
+    const error = await auth.approveRevocation({ kind: "agent", agentId: AGENT_ID }).catch((e: unknown) => e)
+    expect(error).toBe(sendError)
+    expect(cancels).toHaveLength(1)
+    const cancel = cancels[0]!
+    // The assertion must verify against the cancel digest — recompute it from the recorded
+    // expiry + the deny's cancellation nonce, rebuild the DER signature, run the same checks
+    // the page runs on a ceremony capture.
+    const digest = cancelFastRevokeDigest({
+      chainId: CHAIN_ID,
+      capabilityRegistry: REGISTRY,
+      owner: ownerOfPrf(),
+      revocationIntentId: cancel.intentId,
+      apiCancellationNonce: 7n,
+      expiresAt: cancel.expiresAt,
+    })
+    const captured: CapturedAssertion = {
+      authenticatorData: bytesOf(
+        cancel.assertion.authenticatorData,
+        (cancel.assertion.authenticatorData.length - 2) / 2,
+      ),
+      clientDataJSON: new TextEncoder().encode(cancel.assertion.clientDataJSON),
+      signatureDer: derSignature(BigInt(cancel.assertion.r), BigInt(cancel.assertion.s)),
+    }
+    const verdict = verifyCapturedAssertion({
+      captured,
+      rpId: RP_ID,
+      challenge: bytesOf(digest, 32),
+      publicKey: { x: passkey.x, y: passkey.y },
+    })
+    expect(verdict.ok).toBe(true)
+  })
+
+  it("SPONSOR_PENDING keeps the staged deny — the accepted operation may still land", async () => {
+    const chain = fakeChain({ activeCapabilityIds: () => [] })
+    const pending = new SponsorPending(`0x${"ee".repeat(32)}` as Hex)
+    const sponsor: SponsoredSender = {
+      send: async () => {
+        throw pending
+      },
+    }
+    const { api, calls: apiCalls, cancels } = fakeApi()
+    const auth = authority({
+      publicClient: chain.publicClient,
+      sponsor,
+      api,
+      signCancelAssertion: async (challenge) =>
+        assertionToWire(capturedToAuthStruct(assertionOver(challenge))),
+    })
+    const error = await auth.approveRevocation({ kind: "agent", agentId: AGENT_ID }).catch((e: unknown) => e)
+    expect(error).toBe(pending)
+    expect(cancels).toHaveLength(0)
+    expect(apiCalls.some((c) => c.what === "api:cancelRevocation")).toBe(false)
+  })
+
+  it("a failed cancel still surfaces the original error — with the manual-clear line appended", async () => {
+    const chain = fakeChain({ activeCapabilityIds: () => [] })
+    const sendError = new SponsorDidNotPay("quota exhausted")
+    const sponsor: SponsoredSender = {
+      send: async () => {
+        throw sendError
+      },
+    }
+    const { api } = fakeApi()
+    api.cancelRevocation = async () => {
+      throw new Error("store unreachable")
+    }
+    const auth = authority({
+      publicClient: chain.publicClient,
+      sponsor,
+      api,
+      signCancelAssertion: async (challenge) =>
+        assertionToWire(capturedToAuthStruct(assertionOver(challenge))),
+    })
+    const error = await auth.approveRevocation({ kind: "agent", agentId: AGENT_ID }).catch((e: unknown) => e)
+    expect(error).toBe(sendError)
+    expect((error as Error).message).toContain(`the store may still list ${AGENT_ID} as denied`)
+    expect((error as Error).message).toContain("mida approve")
   })
 
   it("lets SponsorPending propagate with the operation hash — pending, never retried", async () => {
