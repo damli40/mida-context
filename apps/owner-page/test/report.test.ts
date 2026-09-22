@@ -52,9 +52,13 @@ describe("buildReport", () => {
 })
 
 describe("assertNoSecretMaterial", () => {
-  it("refuses a 32-byte value under a prf* key", () => {
+  it("refuses a 32-byte value under a secret-looking key — matched anywhere in the name", () => {
     expect(() => assertNoSecretMaterial({ prfOutput: new Uint8Array(32) })).toThrow(/prfOutput/)
     expect(() => assertNoSecretMaterial({ prfSalt: new Uint8Array(32).fill(1) })).toThrow(/prfSalt/)
+    // The names this codebase actually uses — none of them START with the secret word.
+    expect(() => assertNoSecretMaterial({ evmKey: new Uint8Array(32) })).toThrow(/evmKey/)
+    expect(() => assertNoSecretMaterial({ ownerSeed: new Uint8Array(32) })).toThrow(/ownerSeed/)
+    expect(() => assertNoSecretMaterial({ deep: { prfOutput: new Uint8Array(32) } })).toThrow(/prfOutput/)
   })
 
   it("refuses 32-byte values under secret* and private* keys, nested anywhere", () => {

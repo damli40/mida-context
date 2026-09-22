@@ -14,7 +14,7 @@ import { assertNoSecretMaterial } from "../check/report.js"
  *  - Everything identity-relevant lives inside `req`, so `requestHash = sha256(reqBytes)` covers
  *    all of it — and the same bytes feed the pairing code.
  *  - The result carries no secret material — `buildResult` runs the report sanitiser and refuses
- *    to serialize a 32-byte value under a key named like prf*, seed*, secret*, private*, key.
+ *    to serialize a 32-byte value under a key whose name contains prf, seed, secret, private, key.
  */
 
 export type FlowName = "signup" | "approve" | "revoke"

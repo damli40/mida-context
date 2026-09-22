@@ -6,8 +6,10 @@ import type { SavedTestCredential } from "./storage.js"
 /**
  * The "Copy report" payload: everything a reviewer needs to reproduce the check and nothing that
  * would hand them key material. `assertNoSecretMaterial` is the guard — it refuses to serialize
- * any object that carries a 32-byte value under a key named like `prf*`, `secret*` or `private*`,
- * so a future field added by accident fails loudly instead of leaking the secret it holds.
+ * any object that carries a 32-byte value under a key whose name CONTAINS prf, seed, secret,
+ * private or key, so a future field added by accident fails loudly instead of leaking the secret
+ * it holds. The match is a substring, not a prefix, because the real names are `evmKey` and
+ * `ownerSeed` — neither starts with the secret word.
  */
 
 export type CheckStatus = "pass" | "fail" | "unknown"
@@ -58,7 +60,7 @@ export function credentialForReport(saved: SavedTestCredential | null, created: 
   }
 }
 
-const SECRET_KEY = /^(prf|seed|secret|private|key)/i
+const SECRET_KEY = /(prf|seed|secret|private|key)/i
 
 function isThirtyTwoBytes(value: unknown): boolean {
   if (value instanceof Uint8Array) return value.length === 32
