@@ -62,7 +62,7 @@ export function parseMcpArgs(argv: string[]): { ok: true; args: McpArgs } | { ok
     const flag = argv[i]
     if (flag === "--as" || flag === "--project") {
       const value = argv[i + 1]
-      if (value === undefined || value.startsWith("--")) {
+      if (value === undefined || value === "" || value.startsWith("--")) {
         return { ok: false, error: `${flag} needs a value` }
       }
       if (flag === "--as") agent = value
@@ -121,8 +121,24 @@ export interface McpServerDeps {
   project: string
   /** This server instance's session id — the whats-new seen set is keyed by it. */
   sessionId: string
-  /** False when the daemon could not be brought up at start — every tool then answers degraded. */
+  /** False when the daemon could not be brought up at start — tools then answer degraded. */
   daemonUp: boolean
+}
+
+/**
+ * Is the daemon answering? The boot-time `ensureDaemon` has a 4 s window; a daemon that came up
+ * late must not stay reported down for the server's whole life, so a latched-false verdict earns
+ * one cheap /health re-probe per call — a dead socket refuses fast, so this costs a call almost
+ * nothing; a hung daemon costs it at most HEALTH_PROBE_MS before the degraded line.
+ */
+const HEALTH_PROBE_MS = 500
+
+async function daemonAnswering(deps: McpServerDeps): Promise<boolean> {
+  if (deps.daemonUp) return true
+  const reply = await callDaemon(deps.home, "/health", undefined, { timeoutMs: HEALTH_PROBE_MS })
+  const ok = reply.status !== 0 && (reply.body as { ok?: unknown } | null)?.ok === true
+  if (ok) deps.daemonUp = true
+  return ok
 }
 
 /**
@@ -132,7 +148,7 @@ export interface McpServerDeps {
  * writeSeen the hook performs.
  */
 async function toolHandoff(deps: McpServerDeps) {
-  if (!deps.daemonUp) return degraded("daemon-down")
+  if (!(await daemonAnswering(deps))) return degraded("daemon-down")
   const reply = await callDaemon(
     deps.home,
     "/handoff",
@@ -162,7 +178,7 @@ async function toolHandoff(deps: McpServerDeps) {
  * them, so the note is not repeated. A timeout logs the same whatsnew-timeout line the hook logs.
  */
 async function toolWhatsNew(deps: McpServerDeps) {
-  if (!deps.daemonUp) return degraded("daemon-down")
+  if (!(await daemonAnswering(deps))) return degraded("daemon-down")
   const reply = await callDaemon(
     deps.home,
     "/whatsnew",
@@ -185,7 +201,7 @@ async function toolWhatsNew(deps: McpServerDeps) {
     }
     return toolText(body.note)
   }
-  if (body?.kind === "none") return toolText("Mida: nothing new from other agents since this session started.")
+  if (body?.kind === "none") return toolText("Mida: nothing new since the last check.")
   if (body?.kind === "refused") {
     const reason = typeof body.reason === "string" ? body.reason : "refused"
     if (reason === "not-approved") {
@@ -214,7 +230,7 @@ async function toolWhatsNew(deps: McpServerDeps) {
  * through this path — /cli refuses them before dispatch, and this tool only ever sends `read`.
  */
 async function toolRead(deps: McpServerDeps, args: Record<string, unknown> | undefined) {
-  if (!deps.daemonUp) return degraded("daemon-down")
+  if (!(await daemonAnswering(deps))) return degraded("daemon-down")
   const namespace = args?.namespace
   if (namespace !== undefined && (typeof namespace !== "string" || !(READ_NAMESPACES as readonly string[]).includes(namespace))) {
     return toolText(`refused: namespace must be one of ${READ_NAMESPACES.join(", ")}`)
@@ -234,17 +250,19 @@ async function toolRead(deps: McpServerDeps, args: Record<string, unknown> | und
  * no ids and no path under the home except the socket directory's own name.
  */
 async function toolStatus(deps: McpServerDeps) {
-  if (!deps.daemonUp) return degraded("daemon-down")
+  if (!(await daemonAnswering(deps))) return degraded("daemon-down")
   const health = await callDaemon(deps.home, "/health", undefined, { timeoutMs: STATUS_TIMEOUT_MS })
   if (health.status === 0) return degraded("daemon-down")
   const body = health.body as { ok?: unknown; pid?: unknown; startedAt?: unknown; queueDepth?: unknown } | null
   if (body?.ok !== true) return degraded("bad-reply")
+  // the socket is same-user, but a malformed body is still only printed after a shape check —
+  // a string that is not ISO-shaped never reaches the output
+  const startedAt =
+    typeof body.startedAt === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(body.startedAt) ? body.startedAt : "unknown"
   const lines = [
-    `midad: answering — pid ${typeof body.pid === "number" ? body.pid : "unknown"}, up since ${
-      typeof body.startedAt === "string" ? body.startedAt : "unknown"
-    }, queue ${typeof body.queueDepth === "number" ? body.queueDepth : "unknown"} — socket in ${basename(
-      dirname(socketPathFor(deps.home)),
-    )}`,
+    `midad: answering — pid ${typeof body.pid === "number" ? body.pid : "unknown"}, up since ${startedAt}, queue ${
+      typeof body.queueDepth === "number" ? body.queueDepth : "unknown"
+    } — socket in ${basename(dirname(socketPathFor(deps.home)))}`,
   ]
   const probes = await Promise.all(
     MCP_AGENTS.map((name) => callDaemon(deps.home, "/handoff", { agent: name, cwd: deps.project }, { timeoutMs: STATUS_PROBE_TIMEOUT_MS })),

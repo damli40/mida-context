@@ -259,7 +259,7 @@ describe("mida-mcp tools against a fake daemon", () => {
         expect(first).toContain("did the thing")
         expect(readSeen(dir, "mcp-assistant-test1")).toEqual(new Set(["0xnew-ctx"]))
         const second = await callText(client, "mida_whats_new")
-        expect(second).toBe("Mida: nothing new from other agents since this session started.")
+        expect(second).toBe("Mida: nothing new since the last check.")
       } finally {
         await close()
       }
@@ -396,6 +396,28 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
+  it("a daemon that comes up after the boot window is discovered — the flag is not latched", async () => {
+    // ensureDaemon waited 4 s at start and gave up, but the daemon answers now: the next tool
+    // call re-probes /health once and serves the real answer, not a stale degraded line
+    const dir = home()
+    const fake = await fakeDaemon(dir, {
+      "/health": HEALTH,
+      "/handoff": { kind: "empty", text: "Mida: connected. Nothing has been saved for this project yet.", seen: [] },
+    })
+    try {
+      const d = deps(dir, { daemonUp: false })
+      const { client, close } = await connect(d)
+      try {
+        expect(await callText(client, "mida_handoff")).toBe("Mida: connected. Nothing has been saved for this project yet.")
+        expect(d.daemonUp).toBe(true)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
   it("a daemon that stops answering mid-run still gets the degraded line, not a stack", async () => {
     const dir = home()
     // daemonUp was true at start — the socket then died (no listener at all)
@@ -522,12 +544,14 @@ describe("mida-mcp import graph", () => {
     const graph = reachableFrom("mcp-main.ts")
     // call sites, not mentions — queue.ts has a comment naming loadAgentIdentity to say it must
     // never reach it, and that comment is exactly what this test enforces
-    const signingCall = /(privateKey|signMessage|signTypedData|loadOrCreateOwnerSecrets|loadAgentIdentity|loadGrants)\s*\(/
-    const signingImport = /from\s+["'](viem|ethers|@noble\/curves|@noble\/secp256k1|@mida\/checkpoint|@mida\/owner)/
+    const signingCall = /(privateKey|privateKeyToAccount|signMessage|signTypedData|loadOrCreateOwnerSecrets|loadAgentIdentity|loadGrants)\s*\(/
+    // a leaf module must not import a workspace package either — @mida/* is how key material
+    // would arrive from outside the walked relative graph
+    const signingImport = /from\s+["'](viem|ethers|@noble\/curves|@noble\/secp256k1|@mida\/)/
     for (const file of graph) {
       const text = readFileSync(file, "utf8")
       expect(signingCall.test(text), `${file} calls a signing primitive`).toBe(false)
-      expect(signingImport.test(text), `${file} imports a signing library`).toBe(false)
+      expect(signingImport.test(text), `${file} imports a signing-capable package`).toBe(false)
     }
   })
 })
