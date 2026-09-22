@@ -2,10 +2,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { BaseError } from "viem"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, loadAgentIdentity, runCli } from "@mida/midad"
-import type { Network } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, loadAgentIdentity, runCli, runCliWithRuntime } from "@mida/midad"
+import type { Network, ServiceRuntime } from "@mida/midad"
 
 describe("the crude mida command", () => {
   let env: ScenarioEnvironment
@@ -316,5 +317,62 @@ describe("the crude mida command", () => {
     expect(secrets.length).toBeGreaterThanOrEqual(8)
     const output = lines.join("\n")
     for (const secret of secrets) expect(output.includes(secret)).toBe(false)
+  })
+})
+
+/**
+ * CHAIN-09 — the Sep 22 incident: `mida request claude-code` printed `refused: ERROR` and nothing
+ * else because the chain call had failed with an error Mida did not recognise. Now a chain error
+ * names the setup's contract and the flag that shows why; a debug context appends the masked line.
+ */
+describe("named refusals on agent commands (CHAIN-09)", () => {
+  const REGISTRY = "0xf07d000000000000000000000000000000000042"
+  const stubRuntime = (thrown: unknown) =>
+    ({
+      home: new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-refusal-"))),
+      chain: { deployment: { capabilityRegistry: REGISTRY } },
+      agent: () => {
+        throw thrown
+      },
+    }) as unknown as ServiceRuntime
+
+  it("a chain error prints the contract line, never refused: ERROR", async () => {
+    const lines: string[] = []
+    const code = await runCliWithRuntime(["request", "claude-code"], stubRuntime(new BaseError("boom")), (line) => lines.push(line))
+    expect(code).toBe(1)
+    expect(lines).toEqual([
+      "the chain call failed — this setup's contract is 0xf07d…; run with MIDA_DEBUG=1 to see why",
+    ])
+    expect(lines.join("\n")).not.toContain("ERROR")
+  })
+
+  it("a non-chain error is refused: UNEXPECTED, never refused: ERROR", async () => {
+    const lines: string[] = []
+    const code = await runCliWithRuntime(["request", "claude-code"], stubRuntime(new Error("weird")), (line) => lines.push(line))
+    expect(code).toBe(1)
+    expect(lines).toEqual(["refused: UNEXPECTED"])
+  })
+
+  it("with debug on, the catch also prints exactly one masked debug: line", async () => {
+    const lines: string[] = []
+    const code = await runCliWithRuntime(
+      ["request", "claude-code"],
+      stubRuntime(new BaseError("boom")),
+      (line) => lines.push(line),
+      { debug: true },
+    )
+    expect(code).toBe(1)
+    expect(lines.filter((line) => line.startsWith("debug:"))).toHaveLength(1)
+    expect(lines[0]).toBe("the chain call failed — this setup's contract is 0xf07d…; run with MIDA_DEBUG=1 to see why")
+    expect(lines[1]).toBe("debug: BaseError | boom")
+  })
+
+  it("without debug there is no debug: line and no error message", async () => {
+    const lines: string[] = []
+    await runCliWithRuntime(["request", "claude-code"], stubRuntime(new BaseError("a secret reason")), (line) => lines.push(line), {
+      debug: false,
+    })
+    expect(lines.every((line) => !line.startsWith("debug:"))).toBe(true)
+    expect(lines.join("\n")).not.toContain("a secret reason")
   })
 })

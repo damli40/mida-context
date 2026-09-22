@@ -40,8 +40,8 @@ export interface DaemonDeps {
   drain?: (deps: DrainDeps) => Promise<DrainResult>
   /** Runtime acquisition; defaults to ServiceRuntime.open — the daemon's runtime cannot sign as the owner. */
   openRuntime?: () => Promise<ServiceRuntime>
-  /** The /cli dispatch; defaults to runCliWithRuntime. `cwd` is the folder the client ran in. */
-  runCli?: (argv: string[], runtime: ServiceRuntime, print: (line: string) => void, context?: { cwd?: string }) => Promise<number>
+  /** The /cli dispatch; defaults to runCliWithRuntime. `cwd` is the folder the client ran in; `debug` is its MIDA_DEBUG=1. */
+  runCli?: (argv: string[], runtime: ServiceRuntime, print: (line: string) => void, context?: { cwd?: string; debug?: boolean }) => Promise<number>
   /** Save-loop period; default 15 s. */
   tickMs?: number
   /** Loop pacing; default a real sleep. */
@@ -276,11 +276,13 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         return
       }
       // the client tells the daemon where it ran — `approve` signs that folder's project in;
-      // a relative or oversized value is ignored rather than resolved against the daemon's cwd
+      // a relative or oversized value is ignored rather than resolved against the daemon's cwd.
+      // `debug` is the client's MIDA_DEBUG=1 — only the boolean true counts.
       const cwdRaw = (parsed as { cwd?: unknown } | null)?.cwd
       const cwd = typeof cwdRaw === "string" && isAbsolute(cwdRaw) && cwdRaw.length <= 4096 ? cwdRaw : undefined
+      const debug = (parsed as { debug?: unknown } | null)?.debug === true
       const lines: string[] = []
-      const code = await runCli(argv, runtime, (line) => lines.push(line), { cwd }).catch(() => 1)
+      const code = await runCli(argv, runtime, (line) => lines.push(line), { cwd, debug }).catch(() => 1)
       respond(res, 200, { code, lines })
       return
     }

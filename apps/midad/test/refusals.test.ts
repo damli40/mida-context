@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { BaseError } from "viem"
 import { MidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
@@ -9,8 +10,9 @@ import { MidaHome, historyCursor, ownerRefusalLine } from "@mida/midad"
 
 /**
  * R4-5 — a coded refusal with an obvious next step prints a plain line that names it; every
- * other code keeps `refused: <code>` and a code-less error keeps `refused: ERROR`. A message
- * from a deeper layer is never echoed — except OWNER_WALLET_LOW, whose message we built.
+ * other code keeps `refused: <code>` and a code-less error is named (`UNEXPECTED`, or
+ * `CHAIN_CALL_FAILED` for a chain error) — never the word ERROR (CHAIN-09). A message from a
+ * deeper layer is never echoed — except OWNER_WALLET_LOW, whose message we built.
  */
 
 const coded = (code: string, message = "inner detail never shown"): Error & { code: string } => {
@@ -90,10 +92,23 @@ describe("ownerRefusalLine (R4-5)", () => {
     expect(line).not.toContain("run the same command again")
   })
 
-  it("an unknown code keeps `refused: <code>` and a code-less error keeps `refused: ERROR`", () => {
+  it("an unknown code keeps `refused: <code>` and a code-less error is named, never ERROR (CHAIN-09)", () => {
     expect(ownerRefusalLine("approve", "codex", coded("SOMETHING_NEW"))).toBe("refused: SOMETHING_NEW")
-    expect(ownerRefusalLine("approve", "codex", new Error("a message that is never echoed"))).toBe("refused: ERROR")
-    expect(ownerRefusalLine("approve", "codex", "not even an error")).toBe("refused: ERROR")
+    expect(ownerRefusalLine("approve", "codex", new Error("a message that is never echoed"))).toBe("refused: UNEXPECTED")
+    expect(ownerRefusalLine("approve", "codex", "not even an error")).toBe("refused: UNEXPECTED")
+  })
+
+  it("a chain call failure names the setup's contract and the debug flag (CHAIN-09)", () => {
+    const line = ownerRefusalLine(
+      "approve",
+      "codex",
+      new BaseError("boom"),
+      undefined,
+      "0xf07d000000000000000000000000000000000042",
+    )
+    expect(line).toBe("the chain call failed — this setup's contract is 0xf07d…; run with MIDA_DEBUG=1 to see why")
+    expect(line).not.toContain("ERROR")
+    expect(line).not.toContain("boom")
   })
 })
 

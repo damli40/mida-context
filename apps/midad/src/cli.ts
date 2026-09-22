@@ -9,6 +9,7 @@ import type { Hex } from "@mida/protocol"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { permissionNames } from "@mida/grant-advisor"
 import { callDaemon, ensureDaemon } from "./control.js"
+import { debugLine, refusalCode } from "./debug-line.js"
 import { runDoctor, runDoctorLive } from "./doctor.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
@@ -154,8 +155,8 @@ export async function runCliWithRuntime(
   argv: string[],
   runtime: ServiceRuntime,
   print: (line: string) => void,
-  /** `cwd` is the folder the command ran in — kept for interface parity; owner commands never reach here. */
-  context?: { cwd?: string },
+  /** `cwd` is the folder the command ran in; `debug` is the daemon's pass-through of MIDA_DEBUG=1. */
+  context?: { cwd?: string; debug?: boolean },
 ): Promise<number> {
   const [command = ""] = argv
   if (OWNER_COMMANDS.includes(command)) {
@@ -253,14 +254,19 @@ export async function runCliWithRuntime(
     }
     return 0
   } catch (error) {
-    // The error code only — plus the one plain-English line a code can honestly name.
-    const code = (error as { code?: unknown }).code
+    // The error code only — plus the one plain-English line a code can honestly name. An error
+    // with no code is still named (a chain failure names the contract, anything else UNEXPECTED);
+    // the masked detail line prints only when the caller asked for it (MIDA_DEBUG=1).
+    const code = refusalCode(error)
     if (code === "already-approved") {
       // from `request` the next step really is `approve` — that adds THIS folder, no transaction
       print(`${agent} is already approved on chain. To use it in THIS folder, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`)
+    } else if (code === "CHAIN_CALL_FAILED") {
+      print(`the chain call failed — this setup's contract is ${runtime.chain.deployment.capabilityRegistry.slice(0, 6)}…; run with MIDA_DEBUG=1 to see why`)
     } else {
-      print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
+      print(`refused: ${code}`)
     }
+    if (context?.debug === true) print(debugLine(error))
     return 1
   }
 }
@@ -367,13 +373,11 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     }
     return 0
   } catch (error) {
-    deps.print(ownerRefusalLine(command, agent, error, runtime.owner))
-    // Owner commands run in the owner's own terminal, and a bare "ERROR" leaves them blind. Only
-    // when they ask (MIDA_DEBUG=1): the error's name and first lines, long hex strings masked.
+    deps.print(ownerRefusalLine(command, agent, error, runtime.owner, runtime.chain.deployment.capabilityRegistry))
+    // Owner commands run in the owner's own terminal, and an unnamed failure leaves them blind.
+    // Only when they ask (MIDA_DEBUG=1): the error's name and first lines, long hex strings masked.
     if (process.env.MIDA_DEBUG === "1") {
-      const e = error as { name?: unknown; shortMessage?: unknown; message?: unknown; details?: unknown }
-      const text = [e.name, e.shortMessage ?? e.message, e.details].filter((part) => typeof part === "string").join(" | ")
-      deps.print(`debug: ${text.split("\n").slice(0, 6).join(" / ").replace(/[0-9a-fA-F]{40,}/g, "<hex>").slice(0, 900)}`)
+      deps.print(debugLine(error))
     }
     return 1
   }
@@ -385,8 +389,8 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
  * never echoed because it could carry data. `agent` is the command's subject — for `remember`
  * argv[1] is fact text, but the agent-naming codes cannot surface from remember anyway.
  */
-export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string): string {
-  const code = (error as { code?: unknown }).code
+export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string, capabilityRegistry?: string): string {
+  const code = refusalCode(error)
   switch (code) {
     // The owner saw the preview and answered something other than yes — nothing was signed.
     case "not-approved": return "not approved"
@@ -455,8 +459,14 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
       const short = (a: unknown) => (typeof a === "string" ? `${a.slice(0, 6)}…` : "unknown")
       return `this setup is on contract ${short(detail.saved)}; this version of Mida ships ${short(detail.builtIn)}. \`init\` will not move it — run \`mida migrate\``
     }
+    // A chain error with no code: the line names this setup's contract so a wrong deployment
+    // explains itself, and names the flag that prints the masked detail.
+    case "CHAIN_CALL_FAILED": {
+      const contract = typeof capabilityRegistry === "string" ? `${capabilityRegistry.slice(0, 6)}…` : "unknown"
+      return `the chain call failed — this setup's contract is ${contract}; run with MIDA_DEBUG=1 to see why`
+    }
     default:
-      return `refused: ${typeof code === "string" ? code : "ERROR"}`
+      return `refused: ${code}`
   }
 }
 
@@ -578,11 +588,9 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
       deps.print(error.line)
       return error.exitCode
     }
-    deps.print(ownerRefusalLine(command, argv[1] ?? "", error))
+    deps.print(ownerRefusalLine(command, argv[1] ?? "", error, undefined, deps.network.deployment.capabilityRegistry))
     if (process.env.MIDA_DEBUG === "1") {
-      const e = error as { name?: unknown; shortMessage?: unknown; message?: unknown; details?: unknown }
-      const text = [e.name, e.shortMessage ?? e.message, e.details].filter((part) => typeof part === "string").join(" | ")
-      deps.print(`debug: ${text.split("\n").slice(0, 6).join(" / ").replace(/[0-9a-fA-F]{40,}/g, "<hex>").slice(0, 900)}`)
+      deps.print(debugLine(error))
     }
     return 1
   }
@@ -642,7 +650,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     try {
       session = await ServiceRuntime.openOwnerSession(deps.home, deps.network)
     } catch (error) {
-      deps.print(ownerRefusalLine(command, argv[1] ?? "", error))
+      deps.print(ownerRefusalLine(command, argv[1] ?? "", error, undefined, deps.network.deployment.capabilityRegistry))
       return 1
     }
     try {
@@ -697,8 +705,7 @@ export function runInstall(
     if (argv[0] === "install" && tool === "codex" && outcome === "installed") deps.print(CODEX_TRUST_SENTENCE)
     return 0
   } catch (error) {
-    const code = (error as { code?: unknown }).code
-    deps.print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
+    deps.print(`refused: ${refusalCode(error)}`)
     return 1
   }
 }
@@ -803,7 +810,7 @@ async function main(): Promise<void> {
     process.exitCode = 1
     return
   }
-  const reply = await callDaemon(home, "/cli", { argv, cwd: process.cwd() }, { timeoutMs: CLI_CALL_TIMEOUT_MS })
+  const reply = await callDaemon(home, "/cli", { argv, cwd: process.cwd(), debug: process.env.MIDA_DEBUG === "1" }, { timeoutMs: CLI_CALL_TIMEOUT_MS })
   const body = reply.body as { code?: unknown; lines?: unknown } | null
   if (reply.status === 0 || typeof body?.code !== "number" || !Array.isArray(body.lines)) {
     print("midad did not answer")
