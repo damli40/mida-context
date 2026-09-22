@@ -27,12 +27,12 @@ async function main(): Promise<void> {
   }
 
   // The compile model is chosen once here from the environment (MIDA_COMPILE_MODEL /
-  // KIMI_API_KEY): kimi when it can run, claude-haiku otherwise or as its fallback.
+  // the provider keys): deepseek → kimi → haiku, with the chain as its ordered fallbacks.
   const compileModel = compileModelChoice(process.env)
   const daemon = await startDaemon({
     home,
     network,
-    compile: (input) => compileCheckpoint({ ...input, model: compileModel.model, fallbackModel: compileModel.fallback }),
+    compile: (input) => compileCheckpoint({ ...input, model: compileModel.model, fallbackModels: compileModel.fallbacks }),
     now: () => Date.now(),
     log: (entry) => appendLog(home, "daemon", entry as Record<string, unknown>),
   })

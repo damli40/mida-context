@@ -480,9 +480,11 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         const env = deps.env ?? process.env
         const choice = compileModelChoice(env)
         const lines = [`ok: compile model is ${choice.model.label}`]
-        if (choice.fallback !== undefined) {
+        // M3-D5 note: rewritten provider-aware in the next item — for now the kimi note
+        // prints only when kimi actually leads the chain.
+        if (choice.fallbacks[0] !== undefined && choice.chain[0]?.provider === "kimi") {
           lines.push(
-            `note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to ${choice.fallback.label}`,
+            `note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to ${choice.fallbacks[0].label}`,
           )
         }
         // an overridden endpoint receives the API key and the transcript text — the owner must

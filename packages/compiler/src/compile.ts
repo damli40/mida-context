@@ -39,11 +39,13 @@ export interface CompileInput {
   homeDir: string
   model?: ModelCommand
   /**
-   * Tried once, inside the same attempt, when the primary command itself fails (non-zero exit,
-   * spawn error, timeout). A run that produced output that simply lacks JSON does NOT spend it.
-   * `compiledBy` names whichever model actually wrote the checkpoint.
+   * The ordered fallback chain (M3-D5): providers tried inside the same attempt when the
+   * current command itself fails (non-zero exit — a provider's "http 429"/5xx lands here —
+   * spawn error, timeout) OR answers output that holds no usable JSON — a provider that
+   * cannot produce the checkpoint shape is a fallback trigger too. Each entry runs at most
+   * once per compile; `compiledBy` names whichever model actually wrote the checkpoint.
    */
-  fallbackModel?: ModelCommand
+  fallbackModels?: readonly ModelCommand[]
   /** The session's last saved checkpoint — the model updates it rather than restating from nothing. */
   previous?: Checkpoint
   attempts?: number
@@ -255,7 +257,6 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
 
 export async function compileCheckpoint(input: CompileInput): Promise<CompileResult> {
   const model = input.model ?? DEFAULT_MODEL
-  const fallback = input.fallbackModel
   const attempts = input.attempts ?? 3
   const backoff = input.backoffMs ?? [2000, 8000]
   const now = input.now ?? (() => new Date())
@@ -275,116 +276,140 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
   }
 
   let modelMs = 0
-  let fallbackSpent = false
-  let fellBack: { from: string; to: string; reason: string } | undefined
+  // Every provider hop this compile took, in order — { the provider that failed, who took
+  // over, the failure that triggered the hop }. fellBack reported to the caller is derived
+  // from these, so the drain log always names the real writer, not just "a fallback ran".
+  const hops: { from: string; to: string; reason: string }[] = []
+  const fellBack = (): { from: string; to: string; reason: string } | undefined =>
+    hops.length === 0
+      ? undefined
+      : { from: hops[0]!.from, to: hops[hops.length - 1]!.to, reason: hops.map((h) => h.reason).join("; ") }
   let lastFail: { reason: "model-failed" | "no-json"; detail: string } = {
     reason: "model-failed",
     detail: "no attempt ran",
   }
+  // The unspent fallback providers. Each is shifted out as it runs, so a provider is
+  // never tried twice — a later attempt re-runs the primary, never the chain.
+  const queue = [...(input.fallbackModels ?? [])]
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    let run = await runModel(model, prompt)
-    modelMs += run.ms
-    // A command that failed (exit, spawn error, timeout) falls back ONCE inside the same
-    // attempt — the rate-limited Kimi loses nothing but the call itself. Output that parsed
-    // badly is a content problem, not a command failure, and never spends the fallback.
+    let current = model
     let label = model.label
-    if (!run.ok && fallback !== undefined && !fallbackSpent) {
-      fallbackSpent = true
-      const reason = run.detail
-      run = await runModel(fallback, prompt)
+    // This attempt's failure trail ("<label>: <detail>") — the detail of a chain that
+    // failed end-to-end names every provider it tried, in order.
+    const trail: string[] = []
+    // Walk the provider chain inside this attempt: a command failure (exit, spawn error,
+    // timeout — a provider's "http 429"/5xx lands as the first) or output holding no usable
+    // JSON both move to the next unspent provider; a usable object leaves the loop for the
+    // validation below.
+    let parsed: Record<string, unknown> | undefined
+    for (;;) {
+      const run = await runModel(current, prompt)
       modelMs += run.ms
-      fellBack = { from: model.label, to: fallback.label, reason }
-      if (run.ok) label = fallback.label
-      else run = { ok: false, detail: `${reason}; ${fallback.label}: ${run.detail}`, ms: run.ms }
-    }
-    if (!run.ok) {
-      lastFail = { reason: "model-failed", detail: run.detail }
-    } else {
-      const parsed = extractJsonObject(run.stdout)
-      // An object holding none of the ten content fields (a "reasoning"
-      // object like {"thinking": "…"}) counts as no output — the model may
-      // still be thinking out loud, so the attempt is retried like no-json.
-      const hasContent =
-        parsed !== undefined &&
-        Object.keys(parsed as Record<string, unknown>).some((k) =>
-          (CONTENT_FIELDS as readonly string[]).includes(k),
-        )
-      if (parsed === undefined) {
-        lastFail = { reason: "no-json", detail: "model output held no JSON object" }
-      } else if (!hasContent) {
-        lastFail = { reason: "no-json", detail: "first JSON object held no checkpoint fields" }
+      let fail: { reason: "model-failed" | "no-json"; detail: string }
+      if (run.ok) {
+        const obj = extractJsonObject(run.stdout)
+        // An object holding none of the ten content fields (a "reasoning" object like
+        // {"thinking": "…"}) counts as no output at all — and since a provider that
+        // produces unusable output is a fallback trigger, no-JSON walks the chain too.
+        const hasContent =
+          obj !== undefined &&
+          Object.keys(obj as Record<string, unknown>).some((k) =>
+            (CONTENT_FIELDS as readonly string[]).includes(k),
+          )
+        if (hasContent) {
+          parsed = obj as Record<string, unknown>
+          break
+        }
+        fail = { reason: "no-json", detail: obj === undefined ? "model output held no JSON object" : "first JSON object held no checkpoint fields" }
       } else {
-        // Only the model-writable fields are taken; every other key NAME is
-        // reported in droppedKeys (never its value) so validation stays
-        // strict on what remains. originalRequest is absent from
-        // CONTENT_FIELDS on purpose — a model that returns it gets it
-        // dropped and named like any unknown key (spike bug H1).
-        // The model's own output is scrubbed too: it was told never to copy
-        // secrets, but what it returns is untrusted text and a leaked key in
-        // a progress line would be stored verbatim otherwise.
-        const obj = parsed as Record<string, unknown>
-        const picked: Record<string, unknown> = {}
-        const droppedKeys: string[] = []
-        for (const k of Object.keys(obj)) {
-          if ((CONTENT_FIELDS as readonly string[]).includes(k)) picked[k] = scrubValue(obj[k])
-          else droppedKeys.push(k)
-        }
+        fail = { reason: "model-failed", detail: run.detail }
+      }
+      trail.push(`${current.label}: ${fail.detail}`)
+      const next = queue.shift()
+      if (next === undefined) {
+        lastFail = { reason: fail.reason, detail: trail.join("; ") }
+        break
+      }
+      hops.push({ from: current.label, to: next.label, reason: `${current.label}: ${fail.detail}` })
+      current = next
+      label = current.label
+    }
+    if (parsed === undefined) {
+      if (attempt < attempts) await sleep(backoff[Math.min(attempt - 1, backoff.length - 1)] ?? 0)
+      continue
+    }
+    {
+      const obj = parsed
+      // Only the model-writable fields are taken; every other key NAME is
+      // reported in droppedKeys (never its value) so validation stays
+      // strict on what remains. originalRequest is absent from
+      // CONTENT_FIELDS on purpose — a model that returns it gets it
+      // dropped and named like any unknown key (spike bug H1).
+      // The model's own output is scrubbed too: it was told never to copy
+      // secrets, but what it returns is untrusted text and a leaked key in
+      // a progress line would be stored verbatim otherwise.
+      const picked: Record<string, unknown> = {}
+      const droppedKeys: string[] = []
+      for (const k of Object.keys(obj)) {
+        if ((CONTENT_FIELDS as readonly string[]).includes(k)) picked[k] = scrubValue(obj[k])
+        else droppedKeys.push(k)
+      }
 
-        // Fields the model may not write are set by code: the id, the agent
-        // name, the source tag, the timestamp — and the user's own words,
-        // copied verbatim from the transcript, never summarised by a model.
-        picked.eventId = input.eventId
-        picked.agent = input.agent
-        picked.source = "hook-compiler"
-        picked.createdAt = now().toISOString()
-        picked.originalRequest = convo.firstUserMessage
+      // Fields the model may not write are set by code: the id, the agent
+      // name, the source tag, the timestamp — and the user's own words,
+      // copied verbatim from the transcript, never summarised by a model.
+      picked.eventId = input.eventId
+      picked.agent = input.agent
+      picked.source = "hook-compiler"
+      picked.createdAt = now().toISOString()
+      picked.originalRequest = convo.firstUserMessage
 
-        if (Array.isArray(picked.artifacts)) {
-          picked.artifacts = picked.artifacts.map((a) => (typeof a === "string" ? rel(a) : a))
-        }
-        if (Array.isArray(picked.evidence)) {
-          picked.evidence = picked.evidence.map((e) => {
-            if (e === null || typeof e !== "object") return e
-            const ref = (e as { ref?: unknown }).ref
-            return typeof ref === "string" && ref.startsWith("file:")
-              ? { ...(e as Record<string, unknown>), ref: "file:" + rel(ref.slice(5)) }
-              : e
-          })
-        }
+      if (Array.isArray(picked.artifacts)) {
+        picked.artifacts = picked.artifacts.map((a) => (typeof a === "string" ? rel(a) : a))
+      }
+      if (Array.isArray(picked.evidence)) {
+        picked.evidence = picked.evidence.map((e) => {
+          if (e === null || typeof e !== "object") return e
+          const ref = (e as { ref?: unknown }).ref
+          return typeof ref === "string" && ref.startsWith("file:")
+            ? { ...(e as Record<string, unknown>), ref: "file:" + rel(ref.slice(5)) }
+            : e
+        })
+      }
 
-        const trimmed: string[] = []
-        trimFields(picked, trimmed)
+      const trimmed: string[] = []
+      trimFields(picked, trimmed)
 
-        const v = validateCheckpoint(picked)
-        // A validation failure is deterministic — the same input would fail
-        // the same way — so it is reported at once and never retried.
-        if (!v.ok) {
-          // the drainer may log field NAMES ("decisions[3].rationale") — never
-          // the validator's messages, which can echo the value that failed
-          const fields = [...new Set(v.errors.map((e) => e.split(":")[0]!))]
-          return { ok: false, reason: "invalid", detail: v.errors.join("; "), attempts: attempt, fields, ...(fellBack !== undefined ? { fellBack } : {}) }
-        }
-        return {
-          ok: true,
-          checkpoint: v.value,
-          compiledBy: label,
-          droppedKeys,
-          trimmed,
-          attempts: attempt,
-          // fellBack is reported only when the fallback actually wrote the checkpoint — a fallback
-          // that ran and lost before a later primary success would mislabel the save
-          ...(label !== model.label && fellBack !== undefined ? { fellBack } : {}),
-          format: convo.format,
-          messagesKept: convo.messagesKept,
-          messagesTotal: convo.messagesTotal,
-          charsSent: convo.text.length,
-          modelMs,
-        }
+      const v = validateCheckpoint(picked)
+      // A validation failure is deterministic — the same input would fail
+      // the same way — so it is reported at once and never retried.
+      const fb = fellBack()
+      if (!v.ok) {
+        // the drainer may log field NAMES ("decisions[3].rationale") — never
+        // the validator's messages, which can echo the value that failed
+        const fields = [...new Set(v.errors.map((e) => e.split(":")[0]!))]
+        return { ok: false, reason: "invalid", detail: v.errors.join("; "), attempts: attempt, fields, ...(fb !== undefined ? { fellBack: fb } : {}) }
+      }
+      return {
+        ok: true,
+        checkpoint: v.value,
+        compiledBy: label,
+        droppedKeys,
+        trimmed,
+        attempts: attempt,
+        // fellBack is reported only when a fallback actually wrote the checkpoint — a
+        // fallback that ran and lost before a later primary success would mislabel the save
+        ...(label !== model.label && fb !== undefined ? { fellBack: fb } : {}),
+        format: convo.format,
+        messagesKept: convo.messagesKept,
+        messagesTotal: convo.messagesTotal,
+        charsSent: convo.text.length,
+        modelMs,
       }
     }
-    if (attempt < attempts) await sleep(backoff[Math.min(attempt - 1, backoff.length - 1)] ?? 0)
   }
-  // a fallback that ran and still lost is part of the failure report — the daemon log says so
-  return { ok: false, reason: lastFail.reason, detail: lastFail.detail, attempts, ...(fellBack !== undefined ? { fellBack } : {}) }
+  // a fallback chain that ran and still lost is part of the failure report — the daemon log says so
+  const fb = fellBack()
+  return { ok: false, reason: lastFail.reason, detail: lastFail.detail, attempts, ...(fb !== undefined ? { fellBack: fb } : {}) }
 }
