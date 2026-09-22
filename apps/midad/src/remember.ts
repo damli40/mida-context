@@ -72,7 +72,7 @@ export async function remember(
     await vault.initializeNamespace(namespace)
     await repairFactWraps(runtime, nsId)
   }
-  runtime.progress?.("writing your fact (about 5 seconds)…")
+  runtime.sendProgress("writing your fact")
   const written = await vault.createOwnerContext({
     namespace,
     payload: {

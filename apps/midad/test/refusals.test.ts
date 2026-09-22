@@ -29,11 +29,11 @@ describe("ownerRefusalLine (R4-5)", () => {
   })
 
   it("an agent the chain already approves gets the this-folder line, not refused: ERROR", () => {
-    expect(ownerRefusalLine("approve", "codex", coded("already-approved"))).toBe(
-      "codex is already approved. To let it use THIS folder too, run `mida approve codex` here (no transaction, nothing to pay).",
-    )
+    // from `approve` the line must never say "run mida approve" — that is the command just run (M3-D4)
+    expect(ownerRefusalLine("approve", "codex", coded("already-approved"))).toBe("codex is already approved on chain")
+    // from `request` the next step really is `approve`: it adds THIS folder with no transaction
     expect(ownerRefusalLine("request", "codex", coded("already-approved"))).toBe(
-      "codex is already approved. To let it use THIS folder too, run `mida approve codex` here (no transaction, nothing to pay).",
+      "codex is already approved on chain. To use it in THIS folder, run `mida approve codex` here (no transaction, nothing to pay).",
     )
   })
 
@@ -65,6 +65,29 @@ describe("ownerRefusalLine (R4-5)", () => {
       new MidaError("OWNER_WALLET_LOW", "your wallet holds 0.0500 MON but this transaction needs 0.0832 MON — 0.0332 MON short"),
     )
     expect(line).toBe("your wallet holds 0.0500 MON but this transaction needs 0.0832 MON — 0.0332 MON short")
+  })
+
+  it("SPONSOR_PENDING names the operation and points at a re-run that tells the truth", () => {
+    // The sponsored call was ACCEPTED — the message must never pretend nothing happened, and a
+    // re-run of approve/revoke/init detects the landed work instead of sending a second copy.
+    const error = new MidaError("SPONSOR_PENDING", "inner detail never shown") as MidaError & { userOpHash: Hex }
+    error.userOpHash = `0x${"5a".repeat(32)}`
+    for (const command of ["approve", "revoke", "init"]) {
+      const line = ownerRefusalLine(command, "codex", error)
+      expect(line).toContain("0x5a5a5a5a…") // the operation hash, first 10 chars + ellipsis
+      expect(line).toContain("run the same command again")
+      expect(line).toContain("nothing was sent from your wallet")
+      expect(line).not.toContain("inner detail") // a deeper message is never echoed
+    }
+  })
+
+  it("SPONSOR_PENDING on remember does not promise a blind re-run — a second fact would be written", () => {
+    const error = new MidaError("SPONSOR_PENDING", "inner detail never shown") as MidaError & { userOpHash: Hex }
+    error.userOpHash = `0x${"5a".repeat(32)}`
+    const line = ownerRefusalLine("remember", "", error)
+    expect(line).toContain("0x5a5a5a5a…")
+    expect(line).toContain("mida read --as assistant")
+    expect(line).not.toContain("run the same command again")
   })
 
   it("an unknown code keeps `refused: <code>` and a code-less error keeps `refused: ERROR`", () => {

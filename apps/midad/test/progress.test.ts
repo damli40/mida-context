@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, runCli } from "@mida/midad"
+import { MidaHome, Runtime, init, runCli } from "@mida/midad"
 import type { Network } from "@mida/midad"
 
 /**
@@ -95,5 +95,41 @@ describe("owner command progress lines", () => {
     expect(lines.some((line) => line.startsWith("grant advisor: "))).toBe(true)
     expect(lines.at(-1)).toMatch(/^approved codex tx 0x[0-9a-f]{64} gas \d+$/)
     expect(lines.some((line) => line.endsWith("…"))).toBe(false)
+  }, 300_000)
+})
+
+/**
+ * M3-D3 item 4 — the "(sponsored)" suffix is read off the write context that will send, never
+ * guessed. The sponsor URL here is dead on purpose: every send tries the sponsor first (the
+ * "(sponsored)" line), is refused, and falls back — and the fallback's own line still says the
+ * wallet paid.
+ */
+describe("sponsored progress lines", () => {
+  it("a sponsored send says (sponsored) — and a refusing sponsor still says who ended up paying", async () => {
+    const env = await localEnvironment()
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-progress-sponsor-")))
+    try {
+      const network: Network = {
+        rpcUrl: env.rpcUrl,
+        deployment: env.deployment,
+        fund: env.fund,
+        sponsorUrl: "http://127.0.0.1:9", // unreachable — every send falls back to self-pay
+      }
+      const runtime = await Runtime.open(home, network)
+      try {
+        const lines: string[] = []
+        runtime.progress = (line) => lines.push(line)
+        await init(runtime, ["assistant"])
+        expect(lines).toContain("gas sponsor on — no MON needed")
+        expect(lines).toContain("sending assistant's grant (sponsored)…")
+        expect(
+          lines.some((line) => line.includes("the gas sponsor did not pay") && line.includes("paying from your own wallet")),
+        ).toBe(true)
+      } finally {
+        await runtime.close()
+      }
+    } finally {
+      await env.stop()
+    }
   }, 300_000)
 })

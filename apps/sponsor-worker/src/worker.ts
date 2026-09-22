@@ -91,7 +91,24 @@ interface SponsorConfig {
   freePerSenderDailyLimit: number
   /** The log body — everything the worker may print, already reduced to non-secret fields. */
   log(method: string, refused: string | undefined, sender: string | undefined, ms: number): void
+  /**
+   * The provider's full error plus the operation's gas fields, logged when the provider answers
+   * with an error — the detail the next live refusal needs to explain itself (M3-D3 item 5).
+   * LOG ONLY: none of this is ever returned to the client.
+   */
+  diagnose(method: string, sender: string | undefined, op: Record<string, unknown> | undefined, error: unknown): void
 }
+
+/** The user-operation fields a provider refusal needs to be judged against the ceilings. */
+const OP_GAS_FIELDS = [
+  "callGasLimit",
+  "verificationGasLimit",
+  "preVerificationGas",
+  "maxFeePerGas",
+  "maxPriorityFeePerGas",
+  "paymasterVerificationGasLimit",
+  "paymasterPostOpGasLimit",
+] as const
 
 const built = new WeakMap<SponsorEnv, SponsorConfig>()
 
@@ -190,6 +207,23 @@ export function buildWorker(env: SponsorEnv): SponsorConfig {
       // a policy id, a private key, or a full address or hash.
       console.log(JSON.stringify({ method, refused, sender: sender?.slice(0, 10), ms }))
     },
+    diagnose(method, sender, op, error) {
+      const gas: Record<string, unknown> = {}
+      if (op !== undefined) {
+        for (const field of OP_GAS_FIELDS) {
+          if (op[field] !== undefined) gas[field] = op[field]
+        }
+      }
+      const providerError =
+        error instanceof ProviderError
+          ? { code: error.code, message: error.message, ...(error.data !== undefined ? { data: error.data } : {}) }
+          : error instanceof Error
+            ? { name: error.name, message: error.message }
+            : error
+      // The serialized record goes through the same secret scrubber as the client answer — a
+      // provider message that echoes the key or the policy id is redacted in the log too.
+      console.log(scrub(JSON.stringify({ providerError, gas, method, sender: sender?.slice(0, 10) }), secrets))
+    },
   }
   built.set(env, config)
   return config
@@ -256,14 +290,15 @@ function infoResponse(config: SponsorConfig): Response {
  * No legitimate result carries a top-level `error` object (signatures, receipts, gas prices and
  * entry-point lists all have their own fields), so the shape is safe to recognise anywhere.
  */
-function errorInside(result: unknown): { code: number; message: string } | null {
+function errorInside(result: unknown): { code: number; message: string; data?: unknown } | null {
   if (typeof result !== "object" || result === null) return null
   const error = (result as { error?: unknown }).error
   if (typeof error !== "object" || error === null) return null
-  const { code, message } = error as { code?: unknown; message?: unknown }
+  const { code, message, data } = error as { code?: unknown; message?: unknown; data?: unknown }
   return {
     code: typeof code === "number" ? code : INTERNAL_ERROR,
     message: typeof message === "string" ? message : "the sponsor provider refused the request",
+    ...(data === undefined ? {} : { data }),
   }
 }
 
@@ -293,9 +328,9 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
   const started = Date.now()
   const day = utcDay()
   let sender: string | undefined
+  let op: Record<string, unknown> | undefined
   try {
     let outParams: unknown = params
-    let op: Record<string, unknown> | undefined
     if (USER_OP_METHODS.has(method)) {
       const checked = checkedParams(method, params, config.policy, config.provider.policyContext(required(env, "POLICY_ID")))
       op = checked[0] as Record<string, unknown>
@@ -343,6 +378,7 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
       const resultError = errorInside(result)
       if (resultError !== null) {
         await refundSignBudget(env.DB, { day, sender: sender! })
+        config.diagnose(method, sender, op, resultError)
         config.log(method, `provider-${resultError.code}`, sender, Date.now() - started)
         return jsonRpcError(id ?? null, resultError.code, scrub(resultError.message, config.secrets))
       }
@@ -384,6 +420,7 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
     // The same smuggled-error shape on any other method is an error, not a result to echo.
     const resultError = errorInside(result)
     if (resultError !== null) {
+      config.diagnose(method, sender, op, resultError)
       config.log(method, `provider-${resultError.code}`, sender, Date.now() - started)
       return jsonRpcError(id ?? null, resultError.code, scrub(resultError.message, config.secrets))
     }
@@ -395,6 +432,7 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
       return jsonRpcError(id ?? null, REFUSED, e.refusal.message)
     }
     if (e instanceof ProviderError) {
+      config.diagnose(method, sender, op, e)
       config.log(method, `provider-${e.code}`, sender, Date.now() - started)
       return jsonRpcError(id ?? null, e.code, scrub(e.message, config.secrets))
     }

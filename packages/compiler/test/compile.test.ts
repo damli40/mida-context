@@ -175,7 +175,7 @@ describe("compileCheckpoint", () => {
     const r = await compileCheckpoint({
       ...base,
       model: { argv: [process.execPath, fixturePath, "fail"], label: "kimi-x" },
-      fallbackModel: { argv: [process.execPath, fixturePath, "good"], label: "haiku-y" },
+      fallbackModels: [{ argv: [process.execPath, fixturePath, "good"], label: "haiku-y" }],
       sleep: async () => {},
     })
     expect(r.ok).toBe(true)
@@ -194,7 +194,7 @@ describe("compileCheckpoint", () => {
     const r = await compileCheckpoint({
       ...base,
       model: { argv: [process.execPath, fixturePath, "fail"], label: "kimi-x" },
-      fallbackModel: { argv: [process.execPath, fixturePath, "flaky"], label: "haiku-y" },
+      fallbackModels: [{ argv: [process.execPath, fixturePath, "flaky"], label: "haiku-y" }],
       sleep: async () => {},
     })
     expect(r).toMatchObject({ ok: false, reason: "model-failed", attempts: 3 })
@@ -203,18 +203,57 @@ describe("compileCheckpoint", () => {
     if (!r.ok) expect(r.fellBack).toEqual({ from: "kimi-x", to: "haiku-y", reason: expect.stringContaining("exit 3") })
   })
 
-  it("a primary that answers with no JSON does not spend the fallback — only a command failure does (R5-8)", async () => {
-    const counter = path.join(dir, "fallback-ran.log")
-    process.env.FAKE_MODEL_COUNTER = counter
+  it("a dead primary walks the whole chain — each provider tried at most once, compiledBy names the writer (M3-D5)", async () => {
     const r = await compileCheckpoint({
       ...base,
-      model: { argv: [process.execPath, fixturePath, "garbage"], label: "kimi-x" },
-      fallbackModel: { argv: [process.execPath, fixturePath, "flaky"], label: "haiku-y" },
+      model: { argv: [process.execPath, fixturePath, "fail"], label: "deepseek-x" },
+      fallbackModels: [
+        { argv: [process.execPath, fixturePath, "fail"], label: "kimi-y" },
+        { argv: [process.execPath, fixturePath, "good"], label: "haiku-z" },
+      ],
+      sleep: async () => {},
+    })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      // the drain logs compiledBy + fellBack — both must name the real writer, not the primary
+      expect(r.compiledBy).toBe("haiku-z")
+      expect(r.attempts).toBe(1) // the whole chain ran INSIDE attempt 1
+      expect(r.fellBack).toEqual({ from: "deepseek-x", to: "haiku-z", reason: expect.stringContaining("exit 3") })
+    }
+  })
+
+  it("a whole chain that fails tries each provider once and reports every hop in the reason (M3-D5)", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "fail"], label: "deepseek-x" },
+      fallbackModels: [
+        { argv: [process.execPath, fixturePath, "stderr-fail"], label: "kimi-y", stderrDetail: true },
+        { argv: [process.execPath, fixturePath, "fail"], label: "haiku-z" },
+      ],
+      attempts: 2,
+      sleep: async () => {},
+    })
+    expect(r).toMatchObject({ ok: false, reason: "model-failed", attempts: 2 })
+    if (!r.ok) {
+      expect(r.fellBack).toEqual({ from: "deepseek-x", to: "haiku-z", reason: expect.stringContaining("exit 3") })
+      expect(r.fellBack!.reason).toContain("kimi http 429") // the middle hop's controlled stderr made it in
+      expect(r.detail).toContain("exit 3")
+    }
+  })
+
+  it("a primary that answers with no JSON walks the chain too — an unreliable provider is a fallback trigger (M3-D5)", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "garbage"], label: "deepseek-x" },
+      fallbackModels: [{ argv: [process.execPath, fixturePath, "good"], label: "kimi-y" }],
       attempts: 1,
       sleep: async () => {},
     })
-    expect(r).toMatchObject({ ok: false, reason: "no-json", attempts: 1 })
-    expect(fs.existsSync(counter)).toBe(false) // the fallback never ran
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.compiledBy).toBe("kimi-y")
+      expect(r.fellBack).toEqual({ from: "deepseek-x", to: "kimi-y", reason: expect.stringContaining("no JSON") })
+    }
   })
 
   it("stderrDetail lets a model command's safe stderr line into the failure detail (R5-8)", async () => {

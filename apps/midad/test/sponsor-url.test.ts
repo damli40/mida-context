@@ -95,6 +95,39 @@ describe("Runtime.open with a sponsorUrl", () => {
       await env.stop()
     }
   }, 60_000)
+
+  it("init on a 0-MON owner with a sponsor configured never runs the funding gate — and says so", async () => {
+    // M3-D3 item 2. The sponsor URL here is unreachable ON PURPOSE: every send falls back to
+    // self-pay (the funder tops the wallet up inside the send guard), so the run exercises the
+    // whole init — owner key, namespaces, an agent registration, the assistant grant — while the
+    // up-front ensureFunded gates for owner, operator and agent signers must stay skipped. The
+    // fallback proving it can still pay is the point: sponsored init must not break it.
+    const env = await localEnvironment()
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-sponsorurl-")))
+    try {
+      const runtime = await Runtime.open(home, {
+        rpcUrl: env.rpcUrl,
+        deployment: env.deployment,
+        fund: env.fund,
+        sponsorUrl: "http://127.0.0.1:9",
+      })
+      try {
+        const progress: string[] = []
+        runtime.progress = (line) => progress.push(line)
+        runtime.ensureFunded = async () => {
+          throw new Error("ensureFunded must never run while a sponsor is configured")
+        }
+        const { init } = await import("@mida/midad")
+        await init(runtime, ["assistant"])
+        expect(progress).toContain("gas sponsor on — no MON needed")
+        expect(home.has("agents/assistant/identity.json")).toBe(true)
+      } finally {
+        await runtime.close()
+      }
+    } finally {
+      await env.stop()
+    }
+  }, 300_000)
 })
 
 describe("the doctor sponsor line", () => {
@@ -141,6 +174,6 @@ describe("the doctor sponsor line", () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-sponsorurl-")))
     home.writeSecretJson("network.json", { chainId: 31337 })
     const lines = await doctorLines(home)
-    expect(lines).toContain("ok: no gas sponsor configured — sends pay their own gas")
+    expect(lines).toContain("ok: no gas sponsor in network.json — the services check shows what init will use")
   })
 })

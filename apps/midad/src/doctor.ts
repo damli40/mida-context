@@ -5,11 +5,14 @@ import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
 import { createPublicClient, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
+import { isMidaError } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { chainFor, parseDeployment } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
-import { compileModelChoice } from "@mida/compiler"
-import { RegistryReader } from "@mida/api"
+import { COMPILE_PROVIDERS, compileModelChoice } from "@mida/compiler"
+import { ContextApiClient, DenyOverlay, RegistryReader } from "@mida/api"
+import type { RevocationTarget } from "@mida/api"
+import type { LocalAccount } from "viem"
 import { callDaemon } from "./control.js"
 import type { MidaHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
@@ -18,7 +21,8 @@ import type { InstallTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
 import { listJobs } from "./queue.js"
-import { MIN_BALANCE_WEI } from "./runtime.js"
+import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon } from "./runtime.js"
+import { cliPackageName, isBundled } from "./sibling.js"
 
 /** The whole run is capped — a check may stall, the report may not. */
 const RUN_CAP_MS = 20_000
@@ -55,6 +59,8 @@ interface Shared {
   context?: ChainContext
   reader?: RegistryReader
   ownerAddress?: Address | "missing"
+  /** Agents the "agents" check found live on chain — undefined until that check finished. */
+  approved?: { name: string; agentId: Hex }[]
 }
 
 const problem = (sentence: string, fix: string) => `PROBLEM: ${sentence} — ${fix}`
@@ -111,13 +117,120 @@ function ownerAddressOf(home: MidaHome): Address | "missing" {
 
 const NEEDS_NETWORK = `needs network.json — ${INIT_FIX}`
 const NEEDS_OWNER = `needs the owner key — ${INIT_FIX}`
+
+/** The owner signing key from the saved secrets — read only, never created here. */
+function ownerAccountOf(home: MidaHome): LocalAccount | "missing" {
+  try {
+    const secrets = home.readJson<Record<string, unknown>>("owner/secrets.json")
+    const key = secrets?.privateKey
+    if (typeof key !== "string" || !/^0x[0-9a-f]{64}$/.test(key)) return "missing"
+    return privateKeyToAccount(key as Hex)
+  } catch {
+    return "missing"
+  }
+}
+
 /**
- * The repo's own `bin/` — the fix text for a missing hook command names it, because until the
- * npm package exists the launchers live here and nowhere else.
+ * The store URL a call would use right now: network.json's persisted value first (what init
+ * wrote), then the MIDA_STORAGE_URL override — the same precedence the services check reports.
+ * Undefined means the local store — its deny file lives under the home's own data directory.
  */
+function storageUrlInEffect(home: MidaHome, env: NodeJS.ProcessEnv): string | undefined {
+  const stored = home.readJson<{ storageUrl?: unknown }>("network.json")
+  if (typeof stored?.storageUrl === "string" && stored.storageUrl !== "") return stored.storageUrl
+  const raw = env.MIDA_STORAGE_URL
+  if (raw === "off") return undefined
+  if (raw !== undefined && raw !== "") return raw
+  return undefined
+}
+
+/**
+ * The sponsor URL a send would use right now: network.json's persisted value first (what init
+ * wrote), then the MIDA_SPONSOR_URL override — the same precedence the services check reports.
+ * The hosted default is deliberately NOT counted here: a home that never ran init has no
+ * network.json and this check bails earlier anyway, and a default nobody configured must not
+ * make a real network call inside a diagnostic run.
+ */
+function sponsorUrlInEffect(home: MidaHome, env: NodeJS.ProcessEnv): string | undefined {
+  const stored = home.readJson<{ sponsorUrl?: unknown }>("network.json")
+  if (typeof stored?.sponsorUrl === "string" && stored.sponsorUrl !== "") return stored.sponsorUrl
+  const raw = env.MIDA_SPONSOR_URL
+  if (raw === "off") return undefined
+  if (raw !== undefined && raw !== "") return raw
+  return undefined
+}
+
+/** One GET probe — true when the sponsor endpoint answers 2xx. Two seconds, like the sponsor check. */
+async function sponsorReachable(url: string): Promise<boolean> {
+  try {
+    const reply = await fetch(url, { signal: AbortSignal.timeout(2_000) })
+    return reply.ok
+  } catch {
+    return false
+  }
+}
+
+/** The repo's own `bin/` — the missing-hook-command fix for SOURCE-tree runs only (see hookCommandFix). */
 const BIN_DIR = fileURLToPath(new URL("../../../bin/", import.meta.url))
 /** The commands `mida install` writes into the tools' hook settings — bare text on purpose. */
 const HOOK_COMMANDS = ["mida-hook", "mida-inject"] as const
+
+/**
+ * The fix for a hook command missing from PATH. Running from the npm package, the answer is the
+ * global install — npm links the bins itself, and the package name comes from its own
+ * package.json so nothing but publish/names.json hard-codes it. Running from the source tree
+ * the launchers live in the repo's bin/. The two texts must never cross: a packaged user has no
+ * repo to add to PATH, and a repo run has no package.
+ */
+function hookCommandFix(): string {
+  if (isBundled()) {
+    const name = cliPackageName()
+    return name === undefined ? "reinstall the mida CLI package globally" : `run \`npm i -g ${name}\``
+  }
+  return `add ${BIN_DIR} to your PATH`
+}
+
+/** The HOST of a service URL — the path or query could carry an operator's key, so only the host is ever printed. */
+function hostOf(raw: string): string {
+  try {
+    const host = new URL(raw).host
+    return host === "" ? "an address that does not parse" : host
+  } catch {
+    return "an address that does not parse"
+  }
+}
+
+/** Every environment variable Mida reads — the environment check prints set/unset, never a value. */
+const ENV_VARS = [
+  "MIDA_HOME",
+  "MIDA_STORAGE_URL",
+  "MIDA_SPONSOR_URL",
+  "MIDA_DEPLOYMENTS_DIR",
+  "MIDA_DEBUG",
+  "MIDA_COMPILE_MODEL",
+  "MIDA_COMPILE_FALLBACK",
+  "MIDA_COMPILE_API_KEY",
+  "MIDA_COMPILE_BASE_URL",
+  "MIDA_COMPILE_MODEL_ID",
+  "MIDA_COMPILE_TIMEOUT_MS",
+  "MIDA_CLAUDE_SETTINGS",
+  "MIDA_CODEX_CONFIG",
+  "MIDA_INNER",
+  "MIDA_E2E_MONAD_TESTNET",
+  "DEEPSEEK_API_KEY",
+  "DEEPSEEK_BASE_URL",
+  "DEEPSEEK_MODEL",
+  "DEEPSEEK_TIMEOUT_MS",
+  "KIMI_API_KEY",
+  "KIMI_BASE_URL",
+  "KIMI_MODEL",
+  "KIMI_TIMEOUT_MS",
+  "MONAD_TESTNET_RPC",
+  "DEPLOYER_PRIVATE_KEY",
+  "TESTNET_FUNDING_WEI",
+  "FOUNDRY_BIN",
+  "VAULT_RP_ID",
+] as const
 
 /**
  * Is `command` runnable on the PATH the doctor itself runs with? The PATH is walked directly —
@@ -185,6 +298,9 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
     {
       name: "agents",
       run: async () => {
+        // Set before any early return: an empty array really means "nobody is approved", while
+        // undefined (this check threw or never ran) tells the store-denies check it cannot say "ok".
+        shared.approved = []
         const names = listAgentNames(home)
         if (names.length === 0) return [problem("no agents are set up", INIT_FIX)]
         const chain = chainOf(shared)
@@ -206,6 +322,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           const live = views.filter((v) => !v.revoked && (v.expiresAt === 0n || now < v.expiresAt))
           if (live.length > 0) {
             lines.push(`ok: ${name} approved`)
+            shared.approved!.push({ name, agentId: identity!.agentId })
           } else if (views.length === 0 && isRevoked(home, name)) {
             // an agent-level revoke empties the live capability list entirely — the marker says it
             // was revoked, not that it never asked
@@ -225,6 +342,65 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           }
         }
         return lines
+      },
+    },
+    {
+      // M3-D4: the chain saying "approved" is only half the truth — a revoke that failed after its
+      // deny was staged leaves the store refusing an agent the chain approves. One signed call
+      // (or one read of the local store's own deny file) covers every approved agent.
+      name: "store-denies",
+      run: async () => {
+        if (shared.approved === undefined) {
+          return ["note: the agents check did not finish, so the store's deny list cannot be judged"]
+        }
+        if (shared.approved.length === 0) return ["ok: store blocks nobody who is approved"]
+        const chain = chainOf(shared)
+        if (chain === undefined) return [problem("the store's deny list cannot be checked", NEEDS_NETWORK)]
+        const owner = shared.ownerAddress ?? ownerAddressOf(home)
+        if (owner === "missing") return [problem("the store's deny list cannot be checked", NEEDS_OWNER)]
+        const storageUrl = storageUrlInEffect(home, deps.env ?? process.env)
+        let targets: RevocationTarget[]
+        try {
+          if (storageUrl !== undefined) {
+            const account = ownerAccountOf(home)
+            if (account === "missing") return [problem("the store's deny list cannot be checked", NEEDS_OWNER)]
+            const api = new ContextApiClient({
+              baseUrl: storageUrl,
+              account,
+              chainId: chain.context.deployment.chainId,
+              capabilityRegistry: chain.context.deployment.capabilityRegistry,
+              // a hung store must not eat the run cap — two seconds, like the sponsor probe
+              fetch: (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(2_000) }),
+            })
+            targets = (await api.listRevocations("active")).map((intent) => intent.target)
+          } else {
+            // No remote store: the local server's deny file IS the store's state — reading it
+            // directly answers whether the daemon is up or down.
+            const overlay = new DenyOverlay(home.path("data/revocations.json"))
+            targets = (await overlay.list())
+              .filter((intent) => intent.state === "active" && intent.owner === owner.toLowerCase())
+              .map((intent) => intent.target)
+          }
+        } catch (error) {
+          // A store that answered with a refusal is a fault, not an outage — name the code as a
+          // problem; only a call that never got an answer earns the note.
+          if (isMidaError(error)) {
+            return [problem(`the store answered ${error.code} when asked for stale denies`, "re-run `mida doctor` — and if it repeats, the store's signed route is refusing the owner key")]
+          }
+          return ["note: the store could not be reached, so stale denies could not be checked"]
+        }
+        const byAgentId = new Map(shared.approved.map((agent) => [agent.agentId.toLowerCase(), agent.name]))
+        const blocked = new Set<string>()
+        for (const target of targets) {
+          const agentId =
+            target.kind === "agent"
+              ? target.agentId
+              : (await chain.reader.getCapability(target.capabilityId))?.agentId
+          const name = agentId === undefined ? undefined : byAgentId.get(agentId.toLowerCase())
+          if (name !== undefined) blocked.add(name)
+        }
+        if (blocked.size === 0) return ["ok: store blocks nobody who is approved"]
+        return [...blocked].map((name) => problem(`the store still blocks ${name} after a failed revoke`, `run \`mida approve ${name}\``))
       },
     },
     {
@@ -253,7 +429,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         return HOOK_COMMANDS.map((command) =>
           onPath(env, command)
             ? `ok: ${command} is on the PATH`
-            : problem(`the command \`${command}\` is not on your PATH, so the hooks cannot run`, `add ${BIN_DIR} to your PATH`),
+            : problem(`the command \`${command}\` is not on your PATH, so the hooks cannot run`, hookCommandFix()),
         )
       },
     },
@@ -309,27 +485,42 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       name: "compile-model",
       run: async () => {
         // the same resolution the daemon used at start-up — the owner sees which model compiles
-        // sessions and, on the kimi path, that session text leaves the machine for Moonshot's API
+        // sessions, exactly which host the transcript text goes to (secrets are scrubbed first),
+        // and the real fallback chain — all computed from the choice, never hard-coded
         const env = deps.env ?? process.env
         const choice = compileModelChoice(env)
         const lines = [`ok: compile model is ${choice.model.label}`]
-        if (choice.fallback !== undefined) {
+        const head = choice.chain[0]!
+        const rest = choice.chain.slice(1)
+        const nameOf = (entry: (typeof choice.chain)[number]) => (entry.provider === "haiku" ? entry.label : entry.provider)
+        const fallbackClause = rest.length === 0 ? "no fallback" : `a failed call falls back to ${rest.map(nameOf).join(", then ")}`
+        if (head.provider === "custom") {
+          lines.push(`note: compile text is sent to ${head.host ?? "an address that does not parse"} (your own endpoint); ${fallbackClause}`)
+          // a pinned custom without its required vars fails every compile — name the vars, never values
+          const missing = [COMPILE_PROVIDERS.custom.baseVar, COMPILE_PROVIDERS.custom.modelVar].filter((v) => env[v] === undefined || env[v] === "")
+          if (missing.length > 0) {
+            lines.push(problem(`MIDA_COMPILE_MODEL=custom needs ${missing.join(" and ")}`, "set them or unset MIDA_COMPILE_MODEL"))
+          }
+        } else {
+          const via = head.provider === "haiku" ? " via the claude CLI" : ""
           lines.push(
-            `note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to ${choice.fallback.label}`,
+            `note: ${nameOf(head)} sends the session's transcript text to ${head.host ?? "an address that does not parse"}${via} (secrets are scrubbed first); ${fallbackClause}`,
           )
         }
-        // an overridden endpoint receives the API key and the transcript text — the owner must
-        // see which HOST that is; the full URL is never printed (its path or query may be secret)
-        const override = env.KIMI_BASE_URL
-        if (override !== undefined && override.replace(/\/+$/, "") !== "https://api.moonshot.ai") {
-          let host = "an address that does not parse"
-          try {
-            const parsed = new URL(override).host
-            if (parsed !== "") host = parsed
-          } catch {
-            // a value that is not a URL is still not Moonshot — the placeholder names that
+        // an overridden base URL on a NAMED provider in the chain means the key and the transcript
+        // go somewhere other than the vendor — the owner must see which HOST that is; the full URL
+        // is never printed (its path or query may be secret). A custom base URL is not a problem:
+        // it IS the endpoint the user chose.
+        for (const entry of choice.chain) {
+          if (entry.provider !== "deepseek" && entry.provider !== "kimi") continue
+          const table = COMPILE_PROVIDERS[entry.provider]
+          if (env[table.baseVar] === undefined) continue
+          const vendor = entry.provider === "deepseek" ? "DeepSeek" : "Moonshot"
+          const defaultHost = new URL(table.baseDefault).host
+          const host = entry.host !== undefined && entry.host !== "" ? entry.host : "an address that does not parse"
+          if (host !== defaultHost) {
+            lines.push(problem(`compile text is being sent to ${host}, not ${vendor}`, `unset ${table.baseVar} to compile against ${vendor}`))
           }
-          lines.push(problem(`compile text is being sent to ${host}, not Moonshot`, "unset KIMI_BASE_URL to compile against Moonshot"))
         }
         return lines
       },
@@ -365,6 +556,15 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         if (chain === undefined) return [problem("wallets cannot be checked", NEEDS_NETWORK)]
         const owner = shared.ownerAddress ?? ownerAddressOf(home)
         if (owner === "missing") return [problem("wallets cannot be checked", NEEDS_OWNER)]
+        // A reachable sponsor pays the gas, so wallet balances stop being a health signal
+        // (M3-D3 — the Sep 22 run printed a low-balance PROBLEM while the sponsor was working).
+        // Only with no sponsor configured, or one that is not answering, does a low wallet
+        // matter again: the self-paid fallback is what would have to carry the next send.
+        const sponsorUrl = sponsorUrlInEffect(home, deps.env ?? process.env)
+        if (sponsorUrl !== undefined && (await sponsorReachable(sponsorUrl))) {
+          const balance = await chain.context.publicClient.getBalance({ address: owner })
+          return [`ok: gas is sponsored (wallet holds ${formatMon(balance)} MON; not needed)`]
+        }
         const lines: string[] = []
         const wallets: { label: string; address: Address }[] = [{ label: "owner", address: owner }]
         for (const name of listAgentNames(home)) {
@@ -383,20 +583,48 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       },
     },
     {
+      name: "services",
+      run: async () => {
+        // What the Context API and the gas sponsor resolve to right now: the value init
+        // persisted to network.json when one is there, else the env override, else the hosted
+        // default the package ships with. The host only — a path or query could carry a key.
+        const env = deps.env ?? process.env
+        const stored = home.readJson<{ storageUrl?: unknown; sponsorUrl?: unknown }>("network.json")
+        const describe = (label: string, envName: string, raw: string | undefined, persisted: unknown, hosted: string, off: string): string => {
+          if (typeof persisted === "string" && persisted !== "") return `${label}: ${hostOf(persisted)} (network.json)`
+          if (raw === "off") return `${label}: ${off}`
+          if (raw !== undefined && raw !== "") return `${label}: ${hostOf(raw)} (${envName})`
+          return `${label}: ${hostOf(hosted)} (default)`
+        }
+        return [
+          `ok: ${describe("store", "MIDA_STORAGE_URL", env.MIDA_STORAGE_URL, stored?.storageUrl, HOSTED_STORAGE_URL, "off — the local store")}`,
+          `ok: ${describe("sponsor", "MIDA_SPONSOR_URL", env.MIDA_SPONSOR_URL, stored?.sponsorUrl, HOSTED_SPONSOR_URL, "off — sends pay their own gas")}`,
+        ]
+      },
+    },
+    {
+      name: "environment",
+      run: async () => {
+        // Every variable Mida reads, named set or unset — never a value: DEPLOYER_PRIVATE_KEY,
+        // KIMI_API_KEY and a URL carrying a key must not echo to a pasted report.
+        const env = deps.env ?? process.env
+        const set = ENV_VARS.filter((name) => env[name] !== undefined && env[name] !== "")
+        const unset = ENV_VARS.filter((name) => env[name] === undefined || env[name] === "")
+        return [
+          `ok: environment — set: ${set.length === 0 ? "none" : set.join(", ")}`,
+          `ok: environment — unset: ${unset.length === 0 ? "none" : unset.join(", ")}`,
+        ]
+      },
+    },
+    {
       name: "sponsor",
       run: async () => {
         // network.json again, not the shared context — the sponsor answer needs no chain at all
         const stored = home.readJson<{ sponsorUrl?: unknown }>("network.json")
         const sponsorUrl = typeof stored?.sponsorUrl === "string" ? stored.sponsorUrl : ""
-        if (sponsorUrl === "") return ["ok: no gas sponsor configured — sends pay their own gas"]
+        if (sponsorUrl === "") return ["ok: no gas sponsor in network.json — the services check shows what init will use"]
         // the HOST is printed, never the URL — its path or query may carry an operator's key
-        let host = "an address that does not parse"
-        try {
-          host = new URL(sponsorUrl).host
-          if (host === "") host = "an address that does not parse"
-        } catch {
-          // the placeholder stands
-        }
+        const host = hostOf(sponsorUrl)
         try {
           const reply = await fetch(sponsorUrl, { signal: AbortSignal.timeout(2_000) })
           if (!reply.ok) {

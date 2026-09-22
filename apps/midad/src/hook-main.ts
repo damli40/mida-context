@@ -1,12 +1,9 @@
 import { spawn } from "node:child_process"
-import { fileURLToPath } from "node:url"
 import { resolveHome } from "./home.js"
 import { drainerEnv, extractHookFields, runHook } from "./hook.js"
 import { appendLog } from "./log.js"
+import { siblingEntryArgs } from "./sibling.js"
 
-const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
-const DRAIN_MAIN = fileURLToPath(new URL("./drain-main.ts", import.meta.url))
-const DAEMON_MAIN = fileURLToPath(new URL("./daemon-main.ts", import.meta.url))
 const STDIN_CAP_BYTES = 1_000_000
 const HEAD_BYTES = 64 * 1024
 
@@ -48,21 +45,23 @@ async function main(): Promise<void> {
     stdin,
     home,
     env: process.env,
+    // Built `midad`/`mida-drain` beside this file in dist, or the .ts entries through the
+    // repo's tsx loader — sibling.ts decides; the Mida home is the child's working directory.
     spawnDaemon: () => {
-      const child = spawn(process.execPath, ["--import", "tsx", DAEMON_MAIN], {
+      const child = spawn(process.execPath, siblingEntryArgs("midad"), {
         detached: true,
         stdio: "ignore",
-        cwd: REPO_ROOT,
+        cwd: home.root,
         env: drainerEnv(process.env),
       })
       child.on("error", () => {})
       child.unref()
     },
     spawnDrainer: () => {
-      const child = spawn(process.execPath, ["--import", "tsx", DRAIN_MAIN], {
+      const child = spawn(process.execPath, siblingEntryArgs("mida-drain"), {
         detached: true,
         stdio: "ignore",
-        cwd: REPO_ROOT,
+        cwd: home.root,
         env: drainerEnv(process.env),
       })
       child.on("error", () => {})

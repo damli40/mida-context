@@ -1,5 +1,5 @@
 import { parseDeployment } from "@mida/chain"
-import { compileCheckpoint } from "@mida/compiler"
+import { compileCheckpoint, compileModelChoice } from "@mida/compiler"
 import { drainUntilSettled } from "./drain.js"
 import { resolveHome } from "./home.js"
 import { appendLog } from "./log.js"
@@ -34,9 +34,17 @@ async function main(): Promise<void> {
     return ServiceRuntime.open(home, network)
   }
 
+  // The detached drainer honours the same provider choice the daemon resolves —
+  // a drain that ignored DEEPSEEK_API_KEY or a pin would silently compile with haiku.
+  const compileModel = compileModelChoice(process.env)
+
   // One settle run: it waits out the save gap inside the drain lock rather than leaving a
   // held-back job for a hook that may never come.
-  const result = await drainUntilSettled({ home, open, compile: compileCheckpoint })
+  const result = await drainUntilSettled({
+    home,
+    open,
+    compile: (input) => compileCheckpoint({ ...input, model: compileModel.model, fallbackModels: compileModel.fallbacks }),
+  })
   // drainUntilSettled already wrote the "lock-held" line when another drainer owns the
   // queue — logging "pass" here too would claim a clean pass that never ran
   if (result.lockHeld !== true) appendLog(home, "drain", { outcome: "pass", ...result })

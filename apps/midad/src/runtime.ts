@@ -4,7 +4,7 @@ import type { LocalAccount } from "viem"
 import { MidaError, PERMISSION } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
 import { bytesOf } from "@mida/crypto"
-import { chainFor, createSponsoredSender, createWriteContext } from "@mida/chain"
+import { chainFor, createSponsoredSender, createWriteContext, sendValue } from "@mida/chain"
 import type { ChainContext, Deployment, LocalWriteContext, SendCost } from "@mida/chain"
 import { ContextApiClient, RegistryReader } from "@mida/api"
 import { FakeVaultAuthority } from "@mida/fake-vault"
@@ -38,6 +38,20 @@ export interface Network {
 export const NAMESPACE = "projects.current"
 export const PURPOSE_ID = "project_assistance" as const
 export const AGENT_PERMISSIONS = PERMISSION.READ | PERMISSION.CREATE | PERMISSION.SUPERSEDE_OWN
+/** The hosted services the published CLI defaults to (M3-C): public endpoints, never secrets.
+ *  Defined once in the SDK (connect.ts) so the CLI and integrators share one source of truth. */
+export { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL } from "@mida/sdk"
+
+/**
+ * One env value → the service URL that should be in effect. Unset means the hosted default the
+ * package ships with; the exact string `off` opts back into the local store or self-paid gas;
+ * anything else is taken as the URL itself (the runtime's own URL rules still apply).
+ */
+export function serviceUrl(raw: string | undefined, hosted: string): string | undefined {
+  if (raw === undefined || raw === "") return hosted
+  if (raw === "off") return undefined
+  return raw
+}
 /**
  * Below this balance an account is topped up before it has to send a transaction. 0.15 MON, from
  * the live run on Sep 21: a grant bills about 0.043 MON on Monad (the full gas limit, at ~102 gwei)
@@ -45,6 +59,8 @@ export const AGENT_PERMISSIONS = PERMISSION.READ | PERMISSION.CREATE | PERMISSIO
  * 0.05 line a wallet holding 0.064 was reported "has gas" and then could not pay for one approve.
  */
 export const MIN_BALANCE_WEI = 150_000_000_000_000_000n
+/** The owner wallet's top-up for operator and signer wallets on a network with no funder. */
+export const OWNER_TOP_UP_WEI = 200_000_000_000_000_000n
 /** One service runtime per home: a pid file created exclusively at open and removed at close. */
 const LOCK_FILE = "midad.lock"
 /** Where a running service publishes its Context API address so the owner CLI can reuse it. */
@@ -161,7 +177,7 @@ function buildAgent(
   const sponsorUrl = parseSponsorUrl(network.sponsorUrl)
   if (sponsorUrl !== undefined) {
     // An agent signer holds no MON by design — the sponsored send is how its chain calls get paid.
-    chain.sponsor = createSponsoredSender({ sponsorUrl, rpcUrl: network.rpcUrl, account: signer, deployment: network.deployment })
+    chain.sponsor = createSponsoredSender({ sponsorUrl, rpcUrl: network.rpcUrl, account: signer, deployment: network.deployment, progress })
   }
   chain.progress = progress
   return new MidaAgent({
@@ -359,15 +375,6 @@ export class Runtime extends ServiceRuntime {
         deployment: { ...network.deployment, deploymentBlock: ownerStartBlock },
         account: ownerAccount,
       })
-      if (sponsorUrl !== undefined) {
-        // The owner still signs every call; the sponsor only pays the gas (M3-D).
-        ownerChain.sponsor = createSponsoredSender({
-          sponsorUrl,
-          rpcUrl: network.rpcUrl,
-          account: ownerAccount,
-          deployment: network.deployment,
-        })
-      }
       const ownerApi = apiClient(apiBaseUrl, network.deployment, ownerAccount)
       const vault = new FakeVaultAuthority({ seed: bytesOf(secrets.seed, 32), p256PrivateKey: secrets.p256PrivateKey, chain: ownerChain, api: ownerApi })
       const runtime = new Runtime(home, network, ownerChain, ownerApi, vault, ownerStartBlock, apiBaseUrl, async () => {
@@ -383,6 +390,17 @@ export class Runtime extends ServiceRuntime {
         progress: (line) => runtime.progress?.(line),
       })
       ownerChain.progress = (line) => runtime.progress?.(line)
+      if (sponsorUrl !== undefined) {
+        // The owner still signs every call; the sponsor only pays the gas (M3-D). The progress
+        // line is the same deferred read — a slow receipt wait surfaces on the CLI after open.
+        ownerChain.sponsor = createSponsoredSender({
+          sponsorUrl,
+          rpcUrl: network.rpcUrl,
+          account: ownerAccount,
+          deployment: network.deployment,
+          progress: (line) => runtime.progress?.(line),
+        })
+      }
       for (const name of listAgentNames(home)) runtime.attach(loadAgentIdentity(home, name)!)
       return runtime
     } catch (error) {
@@ -390,6 +408,16 @@ export class Runtime extends ServiceRuntime {
       if (locked) home.remove(LOCK_FILE)
       throw error
     }
+  }
+
+  /**
+   * One progress line for a send the owner's context is about to make — "(sponsored)" when that
+   * context carries a sponsor, the old timing hint when the wallet itself pays (M3-D3). Reading
+   * `ownerChain.sponsor` rather than a flag or the network config is what keeps the line true:
+   * it answers for the exact context the send will run through.
+   */
+  sendProgress(what: string): void {
+    this.progress?.(`${what} (${this.ownerChain.sponsor !== undefined ? "sponsored" : "about 5 seconds"})…`)
   }
 
   /** Builds the agent from its saved identity and the grants it completed before, and keeps it for `agent(name)`. */
@@ -405,12 +433,26 @@ export class Runtime extends ServiceRuntime {
     return agent
   }
 
+  /**
+   * 0.2 MON from the owner wallet to `address` — the top-up for networks that have no funder
+   * (the published CLI ships without a deployer key). The send runs through the owner's own
+   * balance guard, so an owner that cannot afford it fails as OWNER_WALLET_LOW with the real
+   * numbers, and the init refusal prints the owner address, not a bare node error.
+   */
+  async topUpFromOwner(address: Address): Promise<void> {
+    await sendValue(this.ownerChain, { to: address, value: OWNER_TOP_UP_WEI }, "funding")
+  }
+
   async ensureFunded(address: Address, label?: string): Promise<void> {
     const balance = await this.ownerChain.publicClient.getBalance({ address })
     if (balance >= MIN_BALANCE_WEI) return
-    // No funder on this network: a wallet we cannot top up fails its first send with an opaque
-    // node error later — refuse now with the balance, the need and the shortfall named (R4-4).
-    if (this.network.fund === undefined) {
+    // With no funder the owner wallet tops the account up itself (M3-C) — the one account that
+    // cannot top itself up is the owner: below the line that is the refusal the CLI prints the
+    // send-MON instruction for.
+    const fund =
+      this.network.fund ??
+      (address === this.owner ? undefined : (target: Address) => this.topUpFromOwner(target))
+    if (fund === undefined) {
       const whose = label ?? "the wallet"
       throw new MidaError(
         "OWNER_WALLET_LOW",
@@ -418,7 +460,7 @@ export class Runtime extends ServiceRuntime {
       )
     }
     if (label !== undefined) this.progress?.(`topping up ${label}…`)
-    await this.network.fund(address)
+    await fund(address)
   }
 }
 

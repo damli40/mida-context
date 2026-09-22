@@ -8,7 +8,15 @@ import { sha256 } from "@noble/hashes/sha2.js"
 import { concatBytes, randomBytes } from "@noble/hashes/utils.js"
 import type { PublicClient } from "viem"
 
-const ROOT = fileURLToPath(new URL("../../../", import.meta.url))
+let root: string | undefined
+/**
+ * The repo root, resolved on first use — lazy for the same reason DEFAULT_DEPLOYMENTS_DIR is:
+ * this module is bundled into binaries where evaluating fileURLToPath at module scope may not
+ * be safe, and the evidence writers below only ever run from a source checkout anyway.
+ */
+function ROOT(): string {
+  return (root ??= fileURLToPath(new URL("../../../", import.meta.url)))
+}
 export const P256_VERIFIER: Hex = "0x0000000000000000000000000000000000000100"
 export const PRECOMPILE_TRUE: Hex = `0x${"00".repeat(31)}01`
 
@@ -59,8 +67,8 @@ export async function gasFacts(publicClient: PublicClient, transactions: Record<
 /** Local runs write to the gitignored .mida-data/; the Monad testnet run writes the committed docs/evidence/ file. */
 export function evidencePath(network: string, date: Date = new Date()): string {
   return network === "monad-testnet"
-    ? `${ROOT}docs/evidence/monad-testnet-${date.toISOString().slice(0, 10)}.json`
-    : `${ROOT}.mida-data/evidence/${network}.json`
+    ? `${ROOT()}docs/evidence/monad-testnet-${date.toISOString().slice(0, 10)}.json`
+    : `${ROOT()}.mida-data/evidence/${network}.json`
 }
 
 export function writeEvidence(path: string, evidence: ScenarioEvidence): void {

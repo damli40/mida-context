@@ -84,9 +84,8 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
         putObject: async () => undefined,
         publishEpochWrap: async () => undefined,
         requestRevocationDeny: (target) =>
-          ownerClient.request<{ intentId: Hex }>("POST", "/revocations", {
-            body: "capabilityId" in target ? { capabilityId: target.capabilityId } : { agentId: target.agentId },
-          }),
+          ownerClient.requestRevocationDeny(target),
+        cancelRevocation: (intentId, input) => ownerClient.cancelRevocation(intentId, input),
       },
     })
     await vault.registerOwnerKey()
@@ -186,7 +185,7 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     try {
       const cancel = (body: unknown) => ownerClient.request<{ state: string }>("POST", `/revocations/${intent.intentId}/cancel`, { body })
       await expect(cancel({})).rejects.toMatchObject({ code: "AUTH_INVALID" })
-      const otherVault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: `0x${"4e".repeat(32)}`, chain: owner, api: { putObject: async () => undefined, publishEpochWrap: async () => undefined, requestRevocationDeny: async () => ({ intentId: intent.intentId }) } })
+      const otherVault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: `0x${"4e".repeat(32)}`, chain: owner, api: { putObject: async () => undefined, publishEpochWrap: async () => undefined, requestRevocationDeny: async () => ({ intentId: intent.intentId, cancellationNonce: "1" }), cancelRevocation: async () => ({}) } })
       const nonce = BigInt(intent.cancellationNonce)
       const wrongKey = otherVault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: nonce, expiresAt: now + 120n })
       await expect(cancel({ expiresAt: (now + 120n).toString(), assertion: wrongKey })).rejects.toMatchObject({ code: "AUTH_INVALID" })
@@ -236,5 +235,52 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     const assertion = vault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: BigInt(intent.cancellationNonce), expiresAt })
     const cancelled = await ownerClient.request<{ state: string }>("POST", `/revocations/${intent.intentId}/cancel`, { body: { expiresAt: expiresAt.toString(), assertion } })
     expect(cancelled.state).toBe("cancelled")
+  })
+
+  it("GET /revocations lists only the signer's intents, filters by state, and never carries the nonce", async () => {
+    // What exists by now, all owned by this vault's owner: a cancelled capability deny for
+    // capabilityA, an anchored one (the real revoke above), an active agent deny for agentA —
+    // its epoch never bumped, the capability revoke did not anchor it — and a cancelled agent
+    // deny for agentE. The stranger owns none of them.
+    const all = await ownerClient.listRevocations()
+    expect(all.length).toBeGreaterThanOrEqual(4)
+    for (const entry of all) {
+      expect(Object.keys(entry).sort()).toEqual(["agentEpochAtIntent", "intentId", "state", "target"])
+    }
+    const states = await ownerClient.listRevocations("active")
+    expect(states).toHaveLength(1)
+    expect(states[0]).toMatchObject({ state: "active", target: { kind: "agent", agentId: agentA.agentId } })
+    const anchored = await ownerClient.listRevocations("anchored")
+    expect(anchored.every((intent) => intent.state === "anchored")).toBe(true)
+    // another signer's list is empty — no cross-owner leakage
+    expect(await strangerClient.listRevocations()).toEqual([])
+    expect(await strangerClient.listRevocations("active")).toEqual([])
+    // an unknown state is a wire error, not a silently empty list
+    await expect(ownerClient.request("GET", "/revocations", { query: { state: "pending" } })).rejects.toMatchObject({ code: "INVALID_WIRE" })
+  })
+
+  it("POST /revocations/:id/reissue mints a fresh nonce, retires the old one, and refuses non-owners", async () => {
+    // The nonce a deny was created with is returned once, to that caller. An owner clearing a stale
+    // deny it did NOT just stage — a revoke that failed on an earlier run — re-arms the intent here.
+    const intent = await ownerClient.request<{ intentId: Hex; cancellationNonce: string }>("POST", "/revocations", { body: { agentId: agentE.agentId } })
+    const reissued = await ownerClient.reissueRevocationNonce(intent.intentId)
+    expect(reissued).toMatchObject({ intentId: intent.intentId, state: "active" })
+    expect(reissued.cancellationNonce).toMatch(/^[0-9]+$/)
+    expect(reissued.cancellationNonce).not.toBe(intent.cancellationNonce)
+    // a stranger's own intents do not include this one, so there is nothing of theirs to re-arm
+    await expect(strangerClient.reissueRevocationNonce(intent.intentId)).rejects.toMatchObject({ code: "NOT_FOUND" })
+    const now = BigInt(Math.floor(Date.now() / 1000))
+    const cancel = (nonce: string) =>
+      ownerClient.cancelRevocation(intent.intentId, {
+        expiresAt: now + 120n,
+        assertion: vault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: BigInt(nonce), expiresAt: now + 120n }),
+      })
+    // the reissue retired the old ticket — the route verifies the assertion against the STORED
+    // nonce, so an assertion over the retired one no longer verifies: AUTH_INVALID, not a cancel
+    await expect(cancel(intent.cancellationNonce)).rejects.toMatchObject({ code: "AUTH_INVALID" })
+    expect((await cancel(reissued.cancellationNonce)).state).toBe("cancelled")
+    // an anchored intent — capabilityA's real revoke — cannot be re-armed
+    const anchored = (await ownerClient.listRevocations("anchored"))[0]!
+    await expect(ownerClient.reissueRevocationNonce(anchored.intentId)).rejects.toMatchObject({ code: "REPLAY" })
   })
 })

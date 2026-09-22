@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { MidaError, assertHex } from "@mida/protocol"
+import { EMBEDDED_DEPLOYMENTS } from "./deployments.generated.js"
 import type { Address, Hex } from "@mida/protocol"
 import type { Chain } from "viem"
 import { foundry, monadTestnet } from "viem/chains"
@@ -60,7 +61,23 @@ export function parseDeployment(json: unknown): Deployment {
   }
 }
 
-export function loadDeployment(chainId: bigint, directory: string = DEFAULT_DEPLOYMENTS_DIR()): Deployment {
+/**
+ * The deployment record for a chain. An explicit `directory` always wins — that stays the
+ * local-Anvil override (its 31337.json is gitignored and is never embedded). Without one, the
+ * committed record compiled into this package answers first, so a bundled binary needs no
+ * contracts/deployments folder; a chain with no embedded record still falls back to the
+ * source-tree file (the repo's own dev runs).
+ */
+export function loadDeployment(chainId: bigint, directory?: string): Deployment {
+  if (directory === undefined) {
+    const embedded = EMBEDDED_DEPLOYMENTS[chainId.toString()]
+    if (embedded !== undefined) {
+      const deployment = parseDeployment(embedded)
+      if (deployment.chainId !== chainId) wire(`the embedded deployment is for chain ${deployment.chainId}`)
+      return deployment
+    }
+    directory = DEFAULT_DEPLOYMENTS_DIR()
+  }
   const path = `${directory.replace(/\/$/, "")}/${chainId}.json`
   let text: string
   try {

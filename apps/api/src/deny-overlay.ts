@@ -183,6 +183,21 @@ export class DenyOverlay {
     }
   }
 
+  /**
+   * Re-arms an active intent with a fresh cancellation nonce and retires the old ticket (M3-D4).
+   * The creation response is the only other place a nonce leaves the store; an owner clearing a
+   * stale deny it did not just stage — a revoke that failed on an earlier run — needs a new one.
+   * Anything but active refuses: an anchored intent must never be re-armed.
+   */
+  async reissueNonce(id: Hex, owner: Address): Promise<RevocationIntent> {
+    const intent = await this.#store.get(id)
+    if (intent === undefined || intent.owner !== owner.toLowerCase()) throw new MidaError("NOT_FOUND", "revocation intent not found")
+    if (intent.state !== "active") throw new MidaError("REPLAY", "revocation intent is not reissuable")
+    const reissued: RevocationIntent = { ...intent, cancellationNonce: BigInt(hexOf(randomBytes(32))).toString(10) }
+    await this.#store.update(reissued)
+    return { ...reissued }
+  }
+
   /** active → cancelled. The caller must already have verified a fresh P256 assertion over this nonce. */
   async cancel(id: Hex, owner: Address, nonce: bigint): Promise<RevocationIntent> {
     const intent = await this.#store.get(id)

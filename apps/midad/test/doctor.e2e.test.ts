@@ -1,9 +1,13 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { createServer as createHttpServer } from "node:http"
+import type { Server as HttpServer } from "node:http"
 import { tmpdir } from "node:os"
 import { delimiter, join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { privateKeyToAccount } from "viem/accounts"
 import { increaseLocalTime } from "@mida/chain"
+import { ContextApiClient } from "@mida/api"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
@@ -13,6 +17,8 @@ import {
   init,
   installClaudeCode,
   installCodex,
+  loadAgentIdentity,
+  loadOrCreateOwnerSecrets,
   requestAccess,
   revoke,
   runDoctor,
@@ -116,6 +122,7 @@ describe("mida doctor on local Anvil", () => {
     expect(lines).toContain("ok: claude-code approved")
     expect(lines).toContain("ok: codex approved")
     expect(lines).toContain("ok: approved-projects signature valid")
+    expect(lines).toContain("ok: store blocks nobody who is approved")
     expect(lines).toContain("ok: claude-code hooks installed")
     expect(lines).toContain("ok: codex hooks installed")
     expect(lines).toContain("ok: queue empty")
@@ -158,6 +165,58 @@ describe("mida doctor on local Anvil", () => {
     expect(agentLine).not.toContain("never asked")
   }, STEP_TIMEOUT)
 
+  it("a stale store deny on an approved agent is a PROBLEM that names `mida approve` — and approve clears it (M3-D4)", async () => {
+    // The incident's shape, staged the way the vault stages it: an ACTIVE deny intent for codex
+    // whose revoke never landed on chain — doctor must not answer "ok: codex approved" alone.
+    const secrets = loadOrCreateOwnerSecrets(home)
+    const ownerAccount = privateKeyToAccount(secrets.privateKey)
+    const ownerApi = new ContextApiClient({
+      baseUrl: apiServer.baseUrl,
+      account: ownerAccount,
+      chainId: env.deployment.chainId,
+      capabilityRegistry: env.deployment.capabilityRegistry,
+    })
+    const codexId = loadAgentIdentity(home, "codex")!.agentId
+    await ownerApi.requestRevocationDeny({ owner: ownerAccount.address, agentId: codexId })
+
+    const { lines, code } = await doctor()
+    expect(lines).toContain("ok: codex approved")
+    expect(lines).toContain("PROBLEM: the store still blocks codex after a failed revoke — run `mida approve codex`")
+    expect(lines).not.toContain("ok: store blocks nobody who is approved")
+    // claude-code's deny list is clean — only codex's name appears in a store PROBLEM
+    expect(lines.filter((line) => line.startsWith("PROBLEM: the store still blocks"))).toHaveLength(1)
+    expect(code).toBe(1)
+
+    // the fix the line names actually works: approve clears the deny, the next doctor is clean
+    const runtime = await Runtime.open(home, { ...network, storageUrl: apiServer.baseUrl })
+    try {
+      await expect(approve(runtime, "codex")).rejects.toMatchObject({ code: "already-approved" })
+    } finally {
+      await runtime.close()
+    }
+    const after = await doctor()
+    expect(after.lines).toContain("ok: store blocks nobody who is approved")
+  }, STEP_TIMEOUT * 2)
+
+  it("an unreachable store is a note, never the 'ok' line (M3-D4)", async () => {
+    // Point the home's persisted store at a dead port — the check cannot claim the store blocks
+    // nobody when it could not ask, and must not fail the whole run either.
+    const networkFile = home.path("network.json")
+    const original = readFileSync(networkFile, "utf8")
+    const stored = JSON.parse(original) as Record<string, unknown>
+    try {
+      writeFileSync(networkFile, JSON.stringify({ ...stored, storageUrl: "http://127.0.0.1:1" }))
+      const { lines } = await doctor()
+      const storeLine = lines.find((line) => line.includes("stale denies") || line.includes("store blocks"))
+      expect(storeLine).toBeDefined()
+      expect(storeLine).toMatch(/^note:/)
+      expect(lines).not.toContain("ok: store blocks nobody who is approved")
+      expect(lines.some((line) => line.startsWith("PROBLEM: the store still blocks"))).toBe(false)
+    } finally {
+      writeFileSync(networkFile, original)
+    }
+  }, STEP_TIMEOUT)
+
   it("(d) an expired grant prints the expiry date (Anvil time travel)", async () => {
     await increaseLocalTime(env.rpcUrl, 33n * 24n * 60n * 60n)
     const { lines, code } = await doctor()
@@ -176,6 +235,44 @@ describe("mida doctor on local Anvil", () => {
     expect(lines.some((line) => line.includes("grant expired"))).toBe(true)
     expect(code).toBeGreaterThan(0)
     expect(code).toBeLessThanOrEqual(9)
+  }, STEP_TIMEOUT)
+
+  it("(g) a working sponsor turns the wallet line into 'gas is sponsored'; a dead one restores the balance problem", async () => {
+    // M3-D3 item 3 — the Sep 22 defect: doctor printed "PROBLEM: owner's wallet is below the gas
+    // top-up line" while a sponsor was configured and answering. This home's owner was never
+    // funded — 0 MON — so the ONLY thing that can make the wallet line ok is the sponsor.
+    const sponsor: HttpServer = createHttpServer((_req, res) => {
+      res.setHeader("content-type", "application/json")
+      res.end(JSON.stringify({ name: "mida-gas-sponsor" }))
+    })
+    try {
+      const sponsorUrl = await new Promise<string>((resolve, reject) => {
+        sponsor.once("error", reject)
+        sponsor.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${(sponsor.address() as { port: number }).port}`))
+      })
+      const sponsoredHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-doctor-sponsored-")))
+      loadOrCreateOwnerSecrets(sponsoredHome) // a fresh owner — 0 MON on this chain
+      const deployment = {
+        ...env.deployment,
+        chainId: env.deployment.chainId.toString(),
+        deploymentBlock: env.deployment.deploymentBlock.toString(),
+      }
+      sponsoredHome.writeSecretJson("network.json", { rpcUrl: env.rpcUrl, deployment, sponsorUrl })
+      const up: string[] = []
+      await runDoctor({ home: sponsoredHome, print: (line) => up.push(line), env: {}, daemonProbeMs: 50 })
+      expect(up).toContain("ok: gas is sponsored (wallet holds 0.0000 MON; not needed)")
+      expect(up.some((line) => line.includes("below the gas top-up line"))).toBe(false)
+
+      // Same wallet, sponsor no longer answering: the balance matters again — the self-paid
+      // fallback is what would have to carry the next send.
+      sponsoredHome.writeSecretJson("network.json", { rpcUrl: env.rpcUrl, deployment, sponsorUrl: "http://127.0.0.1:1" })
+      const down: string[] = []
+      await runDoctor({ home: sponsoredHome, print: (line) => down.push(line), env: {}, daemonProbeMs: 50 })
+      expect(down.some((line) => line.startsWith("PROBLEM: owner's wallet is below the gas top-up line"))).toBe(true)
+      expect(down.some((line) => line.includes("gas is sponsored"))).toBe(false)
+    } finally {
+      await new Promise<void>((done) => sponsor.close(() => done()))
+    }
   }, STEP_TIMEOUT)
 
   it("(f) a PATH without the hook commands is a PROBLEM that names the fix (R4-6)", async () => {

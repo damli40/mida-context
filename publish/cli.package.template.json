@@ -1,0 +1,23 @@
+{
+  "version": "0.1.0",
+  "description": "Mida — passkey-approved context for AI agents. The mida CLI and the midad local service.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "private": false,
+  "bin": {
+    "mida": "dist/mida.js",
+    "midad": "dist/midad.js",
+    "mida-drain": "dist/mida-drain.js",
+    "mida-hook": "dist/mida-hook.js",
+    "mida-inject": "dist/mida-inject.js"
+  },
+  "exports": {},
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  }
+}

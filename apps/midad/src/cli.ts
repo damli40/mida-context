@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { realpathSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -16,6 +17,8 @@ import type { InstallTool } from "./install.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE } from "./runtime.js"
 import type { Network, ServiceRuntime } from "./runtime.js"
+import { siblingEntryArgs } from "./sibling.js"
+import { testnetNetwork } from "./testnet.js"
 import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
 
 /** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. */
@@ -191,7 +194,8 @@ export async function runCliWithRuntime(
     // The error code only — plus the one plain-English line a code can honestly name.
     const code = (error as { code?: unknown }).code
     if (code === "already-approved") {
-      print(`${agent} is already approved. To let it use THIS folder too, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`)
+      // from `request` the next step really is `approve` — that adds THIS folder, no transaction
+      print(`${agent} is already approved on chain. To use it in THIS folder, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`)
     } else {
       print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
     }
@@ -265,7 +269,11 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       })
       deps.print(
         result.transactionHash === null
-          ? `approved ${agent} for project ${result.projectId}; the on-chain grant was already live`
+          ? // nothing was sent because the chain already approves the agent — the honest answer is
+            // what the folder's list row did, never "run the command you just ran" (M3-D4)
+            result.projectAlreadyListed === true
+            ? `${agent} is already approved on chain. This folder was already approved for ${agent}.`
+            : `${agent} is already approved on chain. This folder is now approved for ${agent} too (no transaction).`
           : `approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}` +
               (result.projectId !== undefined ? ` project ${result.projectId}` : ""),
       )
@@ -279,11 +287,25 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       }
     } else {
       const result = await revoke(runtime, agent)
-      deps.print(`revoked ${agent} tx ${result.transactionHashes.join(" ")}; new key sent to: ${result.rewrapped.join(", ") || "nobody"}`)
+      // The chain answer first, always — the per-agent key lines follow it (M3-D4). A wrap the
+      // store refused is its own line with the reason and the fix, never a "refused" for a revoke
+      // that already landed.
+      deps.print(
+        result.transactionHashes.length === 0
+          ? "nothing to revoke"
+          : `revoked ${agent} on chain${result.sponsored ? " (sponsored)" : ""} — tx ${result.transactionHashes.join(" ")}`,
+      )
+      for (const name of result.rewrapped) deps.print(`new read key sent to ${name}`)
+      for (const failure of result.failed) {
+        deps.print(`could not send the new key to ${failure.name}: ${failure.reason} — run \`mida approve ${failure.name}\``)
+      }
+      if (result.repairError !== undefined) {
+        deps.print(`the key repair pass could not run: ${result.repairError} — run \`mida revoke ${agent}\` again to retry it`)
+      }
     }
     return 0
   } catch (error) {
-    deps.print(ownerRefusalLine(command, agent, error))
+    deps.print(ownerRefusalLine(command, agent, error, runtime.owner))
     // Owner commands run in the owner's own terminal, and a bare "ERROR" leaves them blind. Only
     // when they ask (MIDA_DEBUG=1): the error's name and first lines, long hex strings masked.
     if (process.env.MIDA_DEBUG === "1") {
@@ -301,7 +323,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
  * never echoed because it could carry data. `agent` is the command's subject — for `remember`
  * argv[1] is fact text, but the agent-naming codes cannot surface from remember anyway.
  */
-export function ownerRefusalLine(command: string, agent: string, error: unknown): string {
+export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string): string {
   const code = (error as { code?: unknown }).code
   switch (code) {
     // The owner saw the preview and answered something other than yes — nothing was signed.
@@ -309,7 +331,12 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown)
     case "REQUEST_EXPIRED":
       return `${agent}'s request has expired (a request lasts ${Number(REQUEST_LIFETIME_SECONDS) / 60} minutes): run \`mida request ${agent}\` and approve again`
     case "already-approved":
-      return `${agent} is already approved. To let it use THIS folder too, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`
+      // from `request` the honest next step is `approve` (it adds THIS folder, no transaction);
+      // from `approve` itself this is reached only when no project folder could carry the answer —
+      // the folder variants are printed by the approve branch above, never "run me again" (M3-D4)
+      return command === "request"
+        ? `${agent} is already approved on chain. To use it in THIS folder, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`
+        : `${agent} is already approved on chain`
     case "no-pending-request":
       return `${agent} has no pending request — run \`mida request ${agent}\` first`
     case "agent-unidentified":
@@ -319,6 +346,12 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown)
     // MidaError prefixes its own message with "<code>: " — the owner reads the sentence, not
     // the code, so that prefix is stripped here.
     case "OWNER_WALLET_LOW": {
+      // No funder and no sponsor means the owner wallet itself pays for everything — so the
+      // answer to a failed init is always the address that needs MON, not the wallet that was
+      // short mid-run. `init` resumes: re-running it sends only what has not landed yet.
+      if (command === "init" && ownerAddress !== undefined) {
+        return `your owner wallet cannot pay for the setup — send at least 0.5 testnet MON to this address, then run \`mida init\` again: ${ownerAddress}`
+      }
       if (!(error instanceof Error)) return "refused: OWNER_WALLET_LOW"
       const prefix = "OWNER_WALLET_LOW: "
       return error.message.startsWith(prefix) ? error.message.slice(prefix.length) : error.message
@@ -327,6 +360,22 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown)
       return `this folder cannot hold a project — run \`mida approve ${agent}\` inside the project's folder`
     case "list-unreadable":
       return "the approved-projects list could not be read — check the file's permissions"
+    case "SPONSOR_PENDING": {
+      // The call was accepted by the sponsor but its receipt never confirmed — resending would be
+      // the double-send this error exists to prevent, so the line says where it stands and how to
+      // check. The hash is shortened to 10 characters: enough to find the operation, little enough
+      // that nobody mistakes it for something sensitive. The deeper message is never echoed.
+      const hash = (error as { userOpHash?: unknown }).userOpHash
+      const label = typeof hash === "string" && hash.startsWith("0x") ? ` ${hash.slice(0, 10)}…` : ""
+      const opener = `the sponsored operation${label} was accepted and may still land`
+      // A blind re-run is honest for approve, revoke and init — each asks the chain what already
+      // landed and sends only what is missing. `remember` is the exception: a second run writes a
+      // SECOND fact, so the owner must look first.
+      if (command === "remember") {
+        return `${opener} — check whether the fact is already there with \`mida read --as assistant\` before running it again; nothing was sent from your wallet`
+      }
+      return `${opener} — run the same command again in a minute — it will tell you if it already went through; nothing was sent from your wallet`
+    }
     default:
       return `refused: ${typeof code === "string" ? code : "ERROR"}`
   }
@@ -443,112 +492,121 @@ export function runInstall(
   }
 }
 
-const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
-const DAEMON_MAIN = fileURLToPath(new URL("./daemon-main.ts", import.meta.url))
 /** How long a CLI waits for a spawned daemon to open its runtime — the first open fetches the chain head. */
 const DAEMON_WAIT_MS = 30_000
 const CLI_CALL_TIMEOUT_MS = 120_000
 
-/** The detached daemon spawn: same env stripping as the old drainer — no agent credentials leak. */
-function spawnDaemon(): void {
-  const child = spawn(process.execPath, ["--import", "tsx", DAEMON_MAIN], {
+/**
+ * The detached daemon spawn: same env stripping as the old drainer — no agent credentials leak.
+ * The child is the built `midad` next to this file when the package is bundled, the .ts source
+ * through the repo's tsx loader when it is not (sibling.ts owns that decision), and its working
+ * directory is the Mida home — never the folder the code happens to live in.
+ */
+function spawnDaemon(cwd: string): void {
+  const child = spawn(process.execPath, siblingEntryArgs("midad"), {
     detached: true,
     stdio: "ignore",
-    cwd: REPO_ROOT,
+    cwd,
     env: drainerEnv(process.env),
   })
   child.on("error", () => {})
   child.unref()
 }
 
-/** Entry point for `pnpm mida`. Monad testnet only; needs DEPLOYER_PRIVATE_KEY in the environment as the funder. */
+/** Entry point for the `mida` command. Monad testnet only; a funder is optional (see testnet.ts). */
 async function main(): Promise<void> {
-  const { monadTestnetEnvironment } = await import("@mida/cli")
-  const env = await monadTestnetEnvironment()
-  try {
-    // MIDA_HOME must mean the same folder here as in the daemon and both hooks (they all read it);
-    // when this ignored it, `init` wrote to ~/.mida while the daemon it spawned looked elsewhere.
-    const home = resolveHome(process.env)
-    const network: Network = {
-      rpcUrl: env.rpcUrl,
-      deployment: env.deployment,
-      fund: env.fund,
-      // the hosted Context API and the gas sponsor, when this machine has them — init persists
-      // both to network.json so the daemon and the drainer see them without the variables
-      storageUrl: process.env.MIDA_STORAGE_URL,
-      sponsorUrl: process.env.MIDA_SPONSOR_URL,
-    }
-    const argv = process.argv.slice(2)
-    const print = (line: string) => console.log(line)
+  // MIDA_HOME must mean the same folder here as in the daemon and both hooks (they all read it);
+  // when this ignored it, `init` wrote to ~/.mida while the daemon it spawned looked elsewhere.
+  const home = resolveHome(process.env)
+  const argv = process.argv.slice(2)
+  const print = (line: string) => console.log(line)
 
-    // Owner commands — init, approve, revoke, remember — run in this process on the owner
-    // runtime and are never sent to the daemon socket. `init` still spawns the daemon when one
-    // is not already running; the others reuse a live daemon's Context API or start their own.
-    if (OWNER_COMMANDS.includes(argv[0] ?? "")) {
-      const code = await runCli(argv, { home, network, print, cwd: process.cwd() })
-      if (argv[0] === "init" && code === 0) {
-        const health = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
-        if (health.status === 0) spawnDaemon()
-      }
-      process.exitCode = code
-      return
-    }
+  if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
+    print(USAGE)
+    process.exitCode = argv.length === 0 ? 2 : 0
+    return
+  }
 
-    // install, uninstall and doctor are local commands: they never go through the daemon.
-    // install edits the tool's own config outside the Mida home, and doctor's first check is
-    // whether the daemon is even up — running it through the socket would report on nothing.
-    if (argv[0] === "install" || argv[0] === "uninstall") {
-      // the real settings paths are built here and only here — tests always pass their own
-      process.exitCode = runInstall(argv, {
-        print,
-        claudeSettings: join(homedir(), ".claude", "settings.json"),
-        codexConfig: join(homedir(), ".codex", "config.toml"),
-      })
-      return
-    }
+  // install, uninstall and doctor are local commands: they never go through the daemon.
+  // install edits the tool's own config outside the Mida home, and doctor's first check is
+  // whether the daemon is even up — running it through the socket would report on nothing.
+  if (argv[0] === "install" || argv[0] === "uninstall") {
+    // the real settings paths are built here and only here — tests always pass their own
+    process.exitCode = runInstall(argv, {
+      print,
+      claudeSettings: join(homedir(), ".claude", "settings.json"),
+      codexConfig: join(homedir(), ".codex", "config.toml"),
+    })
+    return
+  }
 
-    if (argv[0] === "doctor") {
-      const settings = {
-        "claude-code": join(homedir(), ".claude", "settings.json"),
-        codex: join(homedir(), ".codex", "config.toml"),
-      }
-      if (argv[1] === "--live") {
-        const tool = argv[2] ?? ""
-        if (argv.length !== 3 || !INSTALL_TOOLS.includes(tool)) {
-          print(USAGE)
-          process.exitCode = 2
-          return
-        }
-        process.exitCode = await runDoctorLive(tool as InstallTool, { home, print })
-        return
-      }
-      if (argv.length !== 1) {
+  if (argv[0] === "doctor") {
+    const settings = {
+      "claude-code": join(homedir(), ".claude", "settings.json"),
+      codex: join(homedir(), ".codex", "config.toml"),
+    }
+    if (argv[1] === "--live") {
+      const tool = argv[2] ?? ""
+      if (argv.length !== 3 || !INSTALL_TOOLS.includes(tool)) {
         print(USAGE)
         process.exitCode = 2
         return
       }
-      process.exitCode = await runDoctor({ home, print, settings })
+      process.exitCode = await runDoctorLive(tool as InstallTool, { home, print })
       return
     }
-
-    const up = await ensureDaemon(home, spawnDaemon, { waitMs: DAEMON_WAIT_MS })
-    if (!up) {
-      print("midad did not start; run `mida init` first")
-      process.exitCode = 1
+    if (argv.length !== 1) {
+      print(USAGE)
+      process.exitCode = 2
       return
     }
-    const reply = await callDaemon(home, "/cli", { argv, cwd: process.cwd() }, { timeoutMs: CLI_CALL_TIMEOUT_MS })
-    const body = reply.body as { code?: unknown; lines?: unknown } | null
-    if (reply.status === 0 || typeof body?.code !== "number" || !Array.isArray(body.lines)) {
-      print("midad did not answer")
-      process.exitCode = 1
-      return
-    }
-    for (const line of body.lines) print(String(line))
-    process.exitCode = body.code
-  } finally {
-    await env.stop()
+    process.exitCode = await runDoctor({ home, print, settings })
+    return
   }
+
+  // Everything below touches the chain, so this is where the network is resolved — deployment
+  // record, hosted service defaults, the optional funder — never earlier: `--help`, `install`
+  // and `doctor` must work with no RPC reachable at all.
+  const network = await testnetNetwork(process.env)
+
+  // Owner commands — init, approve, revoke, remember — run in this process on the owner
+  // runtime and are never sent to the daemon socket. `init` still spawns the daemon when one
+  // is not already running; the others reuse a live daemon's Context API or start their own.
+  if (OWNER_COMMANDS.includes(argv[0] ?? "")) {
+    const code = await runCli(argv, { home, network, print, cwd: process.cwd() })
+    if (argv[0] === "init" && code === 0) {
+      const health = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
+      if (health.status === 0) spawnDaemon(home.root)
+    }
+    process.exitCode = code
+    return
+  }
+
+  const up = await ensureDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS })
+  if (!up) {
+    print("midad did not start; run `mida init` first")
+    process.exitCode = 1
+    return
+  }
+  const reply = await callDaemon(home, "/cli", { argv, cwd: process.cwd() }, { timeoutMs: CLI_CALL_TIMEOUT_MS })
+  const body = reply.body as { code?: unknown; lines?: unknown } | null
+  if (reply.status === 0 || typeof body?.code !== "number" || !Array.isArray(body.lines)) {
+    print("midad did not answer")
+    process.exitCode = 1
+    return
+  }
+  for (const line of body.lines) print(String(line))
+  process.exitCode = body.code
 }
 
-if (process.argv[1] !== undefined && import.meta.url === new URL(`file://${process.argv[1]}`).href) await main()
+// `node dist/mida.js` reaches main through the bin symlink too: argv[1] is the .bin shim path
+// while import.meta.url is the real file, so the comparison must run on realpaths.
+const invoked =
+  process.argv[1] !== undefined && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
+if (invoked) {
+  main().catch((error: unknown) => {
+    const e = error as { message?: unknown }
+    console.error(`mida: ${typeof e.message === "string" ? e.message : String(error)}`)
+    process.exitCode = 1
+  })
+}

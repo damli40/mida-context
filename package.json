@@ -14,6 +14,9 @@
     "contracts:policy-hash": "node contracts/script/gen-policy-hash.mjs",
     "vectors:webauthn": "tsx packages/protocol/scripts/export-webauthn-fixture.ts",
     "chain:abis": "node packages/chain/scripts/gen-abis.mjs",
+    "build:publish": "node scripts/build-publish.mjs",
+    "check:publish": "node scripts/clean-install-check.mjs",
+    "deployments:gen": "node scripts/gen-deployments.mjs",
     "mida": "node --env-file=.env --import tsx apps/midad/src/cli.ts",
     "mida-hook": "node --import tsx apps/midad/src/hook-main.ts",
     "mida-drain": "node --import tsx apps/midad/src/drain-main.ts",
@@ -32,6 +35,7 @@
   },
   "devDependencies": {
     "@types/node": "22.20.1",
+    "esbuild": "0.28.2",
     "fast-check": "4.9.0",
     "permissionless": "0.4.1",
     "tsx": "4.23.13",

@@ -382,6 +382,27 @@ describe("the worker entry", () => {
     })
   })
 
+  it("GET /revocations lists the signer's own denies through the shared app — the nonce never leaves", async () => {
+    // owner denies agent A's capability: POST /revocations checks ownership against the stub chain.
+    const created = await ownerClient.requestRevocationDeny({ capabilityId: CAP_ID })
+    expect(created.state).toBe("active")
+
+    const all = await ownerClient.listRevocations()
+    const mine = all.filter((intent) => intent.intentId === created.intentId)
+    expect(mine).toEqual([
+      {
+        intentId: created.intentId,
+        state: "active",
+        target: { kind: "capability", capabilityId: CAP_ID },
+        agentEpochAtIntent: null,
+      },
+    ])
+    const active = await ownerClient.listRevocations("active")
+    expect(active.every((intent) => intent.state === "active")).toBe(true)
+    // another signer lists only their own intents — nothing of the owner's leaks
+    expect(await clientFor(mf, deniedAccount).listRevocations()).toEqual([])
+  })
+
   it("the rate-limit bindings gate requests per CF-Connecting-IP with 429 and Retry-After", async () => {
     const calls = { signed: [] as string[], unsigned: [] as string[] }
     const limitedEnv: WorkerEnv = {

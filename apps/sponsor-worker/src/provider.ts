@@ -8,10 +8,13 @@
 /** The provider answered with a JSON-RPC error — code/message pass to the client after secret scrubbing. */
 export class ProviderError extends Error {
   readonly code: number
-  constructor(code: number, message: string) {
+  /** The provider error's own `data`, when it sent one — logged for diagnosis, never echoed raw to a client. */
+  readonly data: unknown
+  constructor(code: number, message: string, data?: unknown) {
     super(message)
     this.name = "ProviderError"
     this.code = code
+    this.data = data
   }
 }
 
@@ -48,7 +51,7 @@ export function httpJsonRpcProvider(url: string, options?: ProviderOptions): Spo
       if (!response.ok) {
         throw new ProviderError(-32603, `sponsor provider answered HTTP ${response.status}`)
       }
-      let body: { result?: unknown; error?: { code?: unknown; message?: unknown } }
+      let body: { result?: unknown; error?: { code?: unknown; message?: unknown; data?: unknown } }
       try {
         body = (await response.json()) as typeof body
       } catch {
@@ -57,7 +60,7 @@ export function httpJsonRpcProvider(url: string, options?: ProviderOptions): Spo
       if (body.error) {
         const code = typeof body.error.code === "number" ? body.error.code : -32603
         const message = typeof body.error.message === "string" ? body.error.message : "sponsor provider error"
-        throw new ProviderError(code, message)
+        throw new ProviderError(code, message, body.error.data)
       }
       return body.result
     },

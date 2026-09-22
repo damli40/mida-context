@@ -593,6 +593,41 @@ export function createContextApi(options: ContextApiOptions) {
     return c.json({ intentId: intent.id, state: intent.state, cancellationNonce: intent.cancellationNonce })
   })
 
+  // §12.5 visibility (M3-D4): the signer lists their own intents — the way a failed revoke's stale
+  // deny is ever discovered. `state` narrows to one of the three states; absent lists all. The
+  // cancellation nonce is never in the response: only creating or reissuing a deny returns one.
+  app.get("/revocations", authenticated(limits.maxRequestBodyBytes), async (c) => {
+    const owner = c.get("signer")
+    const chain = c.get("chain")
+    const state = c.req.query("state")
+    if (state !== undefined && state !== "active" && state !== "anchored" && state !== "cancelled") {
+      throw new MidaError("INVALID_WIRE", "state must be active, anchored or cancelled")
+    }
+    // Reconcile before listing so a revocation that already landed reads anchored, not still-active.
+    await overlay.reconcile(chain)
+    const intents = (await overlay.list()).filter((intent) => intent.owner === owner && (state === undefined || intent.state === state))
+    return c.json(
+      intents.map((intent) => ({
+        intentId: intent.id,
+        state: intent.state,
+        target: intent.target,
+        agentEpochAtIntent: intent.agentEpochAtIntent,
+      })),
+    )
+  })
+
+  // M3-D4: GET withholds the nonce, so an owner clearing a stale deny it did not just create
+  // re-arms the intent here. Reconciling first means a revoke that already landed reads anchored
+  // and refuses — the deny that corresponds to a real revocation must never be re-armed.
+  app.post("/revocations/:id/reissue", authenticated(limits.maxRequestBodyBytes), async (c) => {
+    const owner = c.get("signer")
+    const chain = c.get("chain")
+    const id = hex(c.req.param("id"), 32, "id")
+    await overlay.reconcile(chain)
+    const intent = await overlay.reissueNonce(id, owner)
+    return c.json({ intentId: intent.id, state: intent.state, cancellationNonce: intent.cancellationNonce })
+  })
+
   app.post("/revocations/:id/cancel", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const owner = c.get("signer")
     const chain = c.get("chain")

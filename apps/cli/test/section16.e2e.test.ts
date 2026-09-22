@@ -381,7 +381,12 @@ describe("owner passkey verification path inside grantBatch (plan Task 26)", () 
         seed: new Uint8Array(32).fill(0x42),
         p256PrivateKey: P256_KEY,
         chain: alice,
-        api: { putObject: async () => undefined, publishEpochWrap: async () => undefined, requestRevocationDeny: async () => ({ intentId: zeroHash }) },
+        api: {
+          putObject: async () => undefined,
+          publishEpochWrap: async () => undefined,
+          requestRevocationDeny: async () => ({ intentId: zeroHash, cancellationNonce: "1" }),
+          cancelRevocation: async () => ({}),
+        },
       })
       await vault.registerOwnerKey()
       await vault.initializeNamespace("goals.career")

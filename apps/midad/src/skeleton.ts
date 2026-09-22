@@ -1,14 +1,14 @@
 import { privateKeyToAccount } from "viem/accounts"
 import { MidaError, PERMISSION, decodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
 import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScope } from "@mida/protocol"
-import { capabilityRegistryAbi, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
+import { capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
 import type { ChainContext, HistoryScanCursor } from "@mida/chain"
-import { provisionAgent } from "@mida/fake-vault"
+import { DENY_CANCEL_EXPIRY_SECONDS, provisionAgent } from "@mida/fake-vault"
 import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
 import type { StoredCheckpoint } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
-import { NAMESPACE, PURPOSE_ID } from "./runtime.js"
+import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl } from "./runtime.js"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { FACT_NAMESPACES } from "./remember.js"
 import { unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
@@ -121,7 +121,16 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
   // The daemon needs the owner's public address to verify the signed approved-projects list and to
   // ask the chain about grants — it never reads owner/secrets.json, so the address is public metadata.
   saveOwnerAddress(home, owner)
-  await runtime.ensureFunded(owner, "your wallet")
+  // With a gas sponsor every send below is paid by the sponsor — a brand-new empty owner wallet
+  // inits fine (M3-C), and no wallet needs MON up front: not the owner's, not the operator's, not
+  // an agent signer's (M3-D3). Without one the owner pays for everything, so the wallet must hold
+  // gas first: the refusal names the address to fund and a re-run resumes where this one stopped.
+  const sponsorUrl = parseSponsorUrl(network.sponsorUrl)
+  if (sponsorUrl === undefined) {
+    await runtime.ensureFunded(owner, "your wallet")
+  } else {
+    runtime.progress?.("gas sponsor on — no MON needed")
+  }
   const ownerKey = await reader.ownerP256Key(owner)
   if (ownerKey == null || ownerKey.qx === 0n) {
     runtime.progress?.("registering your key on the chain…")
@@ -140,11 +149,29 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
 
   const operatorAccount = privateKeyToAccount(loadOrCreateOperatorSecrets(home).privateKey)
   const operator = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: operatorAccount })
+  if (sponsorUrl !== undefined) {
+    // The operator registers every agent — sponsored too, so an empty wallet still works.
+    operator.sponsor = createSponsoredSender({
+      sponsorUrl,
+      rpcUrl: network.rpcUrl,
+      account: operatorAccount,
+      deployment: network.deployment,
+      progress: (line) => runtime.progress?.(line),
+    })
+  }
+  // The operator pays its own gas only when the sponsor cannot (or is off) — and its top-up
+  // then comes from the owner's wallet, so the failure still prints the send-MON line instead
+  // of a bare node error deep inside a register.
+  operator.beforeSend = makeOwnerBalanceGuard({
+    chain: operator,
+    fund: network.fund ?? ((address) => runtime.topUpFromOwner(address)),
+    progress: (line) => runtime.progress?.(line),
+  })
   const agents: Record<string, Hex> = {}
   for (const name of agentNames) {
     let identity = loadAgentIdentity(home, name)
     if (identity === undefined) {
-      await runtime.ensureFunded(operatorAccount.address, "the operator wallet")
+      if (sponsorUrl === undefined) await runtime.ensureFunded(operatorAccount.address, "the operator wallet")
       // Saved to disk BEFORE the registration transaction: a crash must never leave a registered agent with no key.
       let signerPrivateKey = loadOrCreateSignerKey(home, name)
       // Unless the crash came after registration: then this signer is bound to an agent whose encryption key was
@@ -167,7 +194,9 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
     }
     // An idempotent PUT, run for every agent on every init: a manifest upload lost to a crash is retried here.
     await runtime.ownerApi.putAgentManifest(identity.manifest)
-    await runtime.ensureFunded(privateKeyToAccount(identity.signerPrivateKey).address, `${name}'s wallet`)
+    if (sponsorUrl === undefined) {
+      await runtime.ensureFunded(privateKeyToAccount(identity.signerPrivateKey).address, `${name}'s wallet`)
+    }
     // `assistant` never joins a project, so there is no request/approve round-trip for it: the owner
     // grants its whole READ-only policy grant at init. Missing scopes only — a re-run sends nothing.
     if (identity.purposeId === "general_assistance") {
@@ -178,7 +207,7 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
           scopes: missing.map((s) => ({ namespace: namespaceById(s.namespaceId).name, permissions: s.permissions, provenancePolicy: s.provenancePolicy })),
           capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
         })
-        runtime.progress?.(`sending ${name}'s grant (about 5 seconds)…`)
+        runtime.sendProgress(`sending ${name}'s grant`)
         const approval = await vault.approveGrant({ accessRequest: request, manifest: identity.manifest, selection: { kind: "recommended" } })
         const agent = runtime.agent(name)
         await agent.completeAccessRequest(request, approval.response)
@@ -291,7 +320,7 @@ export async function approve(
   name: string,
   cwd?: string,
   confirm?: (preview: ApprovePreview) => Promise<boolean>,
-): Promise<{ capabilityIds: Hex[]; permissions: number[]; transactionHash: Hex | null; gasUsed: bigint; projectId?: string; droppedRows?: number | null }> {
+): Promise<{ capabilityIds: Hex[]; permissions: number[]; transactionHash: Hex | null; gasUsed: bigint; projectId?: string; projectAlreadyListed?: boolean; droppedRows?: number | null }> {
   const { home, vault, reader, owner } = runtime
   // When a project folder is given its marker is resolved first: a folder that may not hold a
   // project (the owner's home, the filesystem root) is refused with not-a-project before any
@@ -306,19 +335,36 @@ export async function approve(
   runtime.progress?.(`asking the chain what ${name} already holds…`)
   const missing = await missingExpectedScopes(runtime, identity.agentId, identity.purposeId)
   const live = await hasAnyLiveCapability(runtime, identity.agentId)
+  // M3-D4: a revoke that failed after its deny was staged leaves the store blocking an agent the
+  // chain approves. The cleanup runs before EVERY branch below because the deny would poison any of
+  // them: the grant path's own wrap publish gets CAPABILITY_DENIED, and the already-approved answer
+  // would tell the owner nothing is wrong while the store still refuses the agent.
+  const cleared = await clearStaleStoreDenies(runtime, identity.agentId)
+  if (cleared > 0) {
+    const repair = await repairReaderWraps(runtime, undefined, identity.agentId)
+    for (const failure of repair.failed) {
+      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${failure.reason}`)
+    }
+  }
   let pending = home.readJson<{ request: AccessRequest }>(`agents/${name}/pending-request.json`)
+
+  // When the chain already approves the agent there is nothing to send — but if the command ran in
+  // a project folder, the honest next step is the local list row, which is what the owner was asking
+  // for. The result says whether the row was new so the CLI can say "now approved" only when it was.
+  // `assistant` is never listed: it gets no project approval, ever.
+  const alreadyApprovedResult = async () => {
+    if (cwd === undefined || identity.purposeId !== PURPOSE_ID) {
+      throw codedError("already-approved", `agent "${name}" is already approved`)
+    }
+    if (confirm !== undefined && !(await confirm({ kind: "project", agent: name, projectId: marker!.projectId }))) throw notApprovedError()
+    const listed = await approveProject(runtime, { agent: name, cwd })
+    return { capabilityIds: [] as Hex[], permissions: [] as number[], transactionHash: null, gasUsed: 0n, projectId: listed.approval.projectId, projectAlreadyListed: listed.alreadyListed, droppedRows: listed.droppedRows }
+  }
 
   if (pending === undefined) {
     if (missing.length === 0) {
       if (!live) throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
-      // a second project for an already-approved agent needs no new grant — only the list row.
-      // `assistant` is never listed: it gets no project approval, ever.
-      if (cwd !== undefined && identity.purposeId === PURPOSE_ID) {
-        if (confirm !== undefined && !(await confirm({ kind: "project", agent: name, projectId: marker!.projectId }))) throw notApprovedError()
-        const listed = await approveProject(runtime, { agent: name, cwd })
-        return { capabilityIds: [], permissions: [], transactionHash: null, gasUsed: 0n, projectId: listed.approval.projectId, droppedRows: listed.droppedRows }
-      }
-      throw codedError("already-approved", `agent "${name}" is already approved`)
+      return alreadyApprovedResult()
     }
     if (!live) throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
     // The upgrade path: the agent holds part of the grant (a live capability exists) and no request
@@ -337,7 +383,9 @@ export async function approve(
   // Only what the chain does not already authorize is granted — a request whose scopes are all live
   // mints nothing, so a second approve sends no transaction.
   const needed = await ungrantedScopes(runtime, identity.agentId, pending.request.scopes)
-  if (needed.length === 0) throw codedError("already-approved", `agent "${name}" is already approved`)
+  // A pending request whose scopes are all already live is the same answer: nothing to send, but the
+  // folder still gets its list row when there is one — this is the path the Sep-22 incident hit.
+  if (needed.length === 0) return alreadyApprovedResult()
   // The owner sees the ask and the advisor's advice before anything is signed — only an explicit
   // confirm gets past this point. The question and the answer live in the CLI, which injects it.
   if (confirm !== undefined) {
@@ -355,7 +403,7 @@ export async function approve(
       rotated.push(nsId)
     }
   }
-  runtime.progress?.("sending the grant (about 5 seconds)…")
+  runtime.sendProgress("sending the grant")
   const approval = await vault.approveGrant({
     accessRequest: pending.request,
     manifest: identity.manifest,
@@ -365,7 +413,12 @@ export async function approve(
   runtime.progress?.("proving the grant on the chain…")
   const grant = await agent.completeAccessRequest(pending.request, approval.response)
   saveGrants(home, name, [...agent.grants])
-  if (rotated.length > 0) await repairReaderWraps(runtime, rotated)
+  if (rotated.length > 0) {
+    const repair = await repairReaderWraps(runtime, rotated)
+    for (const failure of repair.failed) {
+      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${failure.reason}`)
+    }
+  }
   // A marker left by an earlier revoke must not outlive a fresh approval.
   home.remove(`agents/${name}/revoked.json`)
   home.remove(`agents/${name}/pending-request.json`)
@@ -491,12 +544,18 @@ export async function readCheckpoints(runtime: ServiceRuntime, name: string, pro
  * rotates the read epoch — skipped entirely when the chain shows nothing left to revoke, so a re-run after a
  * crash sends nothing; (2) the local revoked marker; (3) reader wraps republished to every surviving agent.
  * Stage 1 needs no grants.json: the vault's "agent" branch reads the live capability list from Monad itself.
+ * The returned `failed` list is M3-D4: a wrap the store refuses for one agent never aborts the others and
+ * never turns a landed chain revocation into a "refused" answer — the CLI prints the chain result first.
  */
-export async function revoke(runtime: Runtime, name: string): Promise<{ transactionHashes: Hex[]; rewrapped: string[] }> {
+export async function revoke(
+  runtime: Runtime,
+  name: string,
+): Promise<{ transactionHashes: Hex[]; sponsored: boolean; rewrapped: string[]; failed: { name: string; reason: string }[]; repairError?: string }> {
   const { home, vault, reader, owner } = runtime
   runtime.progress?.(`asking the chain what ${name} already holds…`)
   const agentId = await resolveAgentId(runtime, name)
   const transactionHashes: Hex[] = []
+  let sponsored = false
   // The raw list can hold expired or already-revoked ids; the transaction goes out only when at least
   // one id is still valid, so a re-run — or a list that only looks live — sends nothing.
   const listed = await reader.activeCapabilityIds(owner, agentId)
@@ -505,8 +564,10 @@ export async function revoke(runtime: Runtime, name: string): Promise<{ transact
     if (await isCapabilityLive(runtime.ownerChain, id)) anyLive = true
   }
   if (anyLive) {
-    runtime.progress?.("sending the revocation (about 5 seconds)…")
-    transactionHashes.push((await vault.approveRevocation({ kind: "agent", agentId })).transactionHash)
+    runtime.sendProgress("sending the revocation")
+    const approval = await vault.approveRevocation({ kind: "agent", agentId })
+    transactionHashes.push(approval.transactionHash)
+    sponsored = approval.sponsored
   }
   // The marker records "this agent was revoked", so it is written whenever the agent was identified and
   // the chain now shows nothing valid for it — whether this run sent the transaction or a crashed
@@ -516,8 +577,16 @@ export async function revoke(runtime: Runtime, name: string): Promise<{ transact
   if (!neverApproved) markRevoked(home, name)
   // the project-folder approvals go too — the file is re-signed without this agent's rows
   await removeAgentApprovals(runtime, name)
-  const rewrapped = await repairReaderWraps(runtime)
-  return { transactionHashes, rewrapped }
+  // Even the repair pass failing wholesale — say the RPC dies between the landed revoke and the
+  // target enumeration — must not throw: a thrown error would print `refused:` for a revocation
+  // that already landed. The failure is reported in the result instead.
+  let repair: { rewrapped: string[]; failed: { name: string; reason: string }[]; repairError?: string }
+  try {
+    repair = await repairReaderWraps(runtime)
+  } catch (error) {
+    repair = { rewrapped: [], failed: [], repairError: wrapFailureReason(error) }
+  }
+  return { transactionHashes, sponsored, rewrapped: repair.rewrapped, failed: repair.failed, repairError: repair.repairError }
 }
 
 /**
@@ -559,10 +628,63 @@ async function resolveAgentId(runtime: ServiceRuntime, name: string): Promise<He
   throw codedError("agent-unidentified", `agent "${name}" cannot be identified: identity.json, grants.json and a registered signer.json are all missing or unreadable under agents/${name}/`)
 }
 
+/**
+ * M3-D4: a revoke that failed after its deny was staged leaves an `active` intent that silently
+ * locks this agent out of the store while the chain still approves it. Clearing one takes a fresh
+ * owner passkey assertion over a nonce the store hands out NOW — `GET /revocations` withholds
+ * nonces, so `POST /revocations/:id/reissue` mints a new one and retires whatever the failed run
+ * saw. Covers agent-target denies and capability denies that belong to this agent alike. Returns
+ * how many intents were cancelled.
+ */
+async function clearStaleStoreDenies(runtime: Runtime, agentId: Hex): Promise<number> {
+  let intents: Awaited<ReturnType<typeof runtime.ownerApi.listRevocations>>
+  try {
+    intents = await runtime.ownerApi.listRevocations("active")
+  } catch {
+    // The store could not even be asked — the honest line is a note, not silence: a stale deny
+    // may still be there and approve cannot see it. A REFUSED reissue or cancel below still throws.
+    runtime.progress?.("note: could not reach the store to check for stale denies")
+    return 0
+  }
+  let cleared = 0
+  for (const intent of intents) {
+    const forAgent =
+      intent.target.kind === "agent"
+        ? intent.target.agentId.toLowerCase() === agentId.toLowerCase()
+        : (await runtime.reader.getCapability(intent.target.capabilityId))?.agentId.toLowerCase() === agentId.toLowerCase()
+    if (!forAgent) continue
+    try {
+      const reissued = await runtime.ownerApi.reissueRevocationNonce(intent.intentId)
+      const expiresAt = BigInt(Math.floor(Date.now() / 1000)) + DENY_CANCEL_EXPIRY_SECONDS
+      const assertion = runtime.vault.approveDenyCancellation({
+        revocationIntentId: intent.intentId,
+        apiCancellationNonce: BigInt(reissued.cancellationNonce),
+        expiresAt,
+      })
+      await runtime.ownerApi.cancelRevocation(intent.intentId, { expiresAt, assertion })
+    } catch (error) {
+      // REPLAY means the intent anchored or was cancelled in the gap between list and reissue —
+      // a deny whose revocation really landed is not stale, and clearing it would be the bug.
+      if (isMidaError(error) && error.code === "REPLAY") continue
+      throw error
+    }
+    cleared += 1
+    runtime.progress?.("cleared a stale block at the store left by a failed revoke")
+  }
+  return cleared
+}
+
+/** The one-line reason a wrap send failed — a MidaError's own message minus its code prefix. */
+function wrapFailureReason(error: unknown): string {
+  const text = error instanceof MidaError && error.message.startsWith(`${error.code}: `) ? error.message.slice(error.code.length + 2) : error instanceof Error ? error.message : String(error)
+  return text.split("\n")[0]!
+}
+
 export async function repairReaderWraps(
   runtime: Runtime,
   namespaceIds: readonly Hex[] = [NAMESPACE_ID, ...FACT_NAMESPACES.map((ns) => namespaceId(ns))],
-): Promise<string[]> {
+  onlyAgentId?: Hex,
+): Promise<{ rewrapped: string[]; failed: { name: string; reason: string }[] }> {
   const { home, vault, reader, owner } = runtime
   // Who gets a wrap is decided first, so the owner hears how many agents the new key goes to
   // before the sends start — the authority checks run either way.
@@ -572,6 +694,7 @@ export async function repairReaderWraps(
     let identity: ReturnType<typeof loadAgentIdentity>
     try { identity = loadAgentIdentity(home, name) } catch { continue }
     if (identity === undefined) continue
+    if (onlyAgentId !== undefined && identity.agentId.toLowerCase() !== onlyAgentId.toLowerCase()) continue
     const nsIds: Hex[] = []
     for (const nsId of namespaceIds) {
       if (await reader.hasAuthority(owner, identity.agentId, nsId, PERMISSION.READ, 0)) nsIds.push(nsId)
@@ -582,11 +705,18 @@ export async function repairReaderWraps(
     runtime.progress?.(`sending the new key to ${targets.length} agent${targets.length === 1 ? "" : "s"}…`)
   }
   const rewrapped: string[] = []
+  const failed: { name: string; reason: string }[] = []
   for (const target of targets) {
-    for (const nsId of target.nsIds) {
-      await vault.publishReaderWraps({ agentId: target.agentId, namespaceId: nsId })
+    try {
+      for (const nsId of target.nsIds) {
+        await vault.publishReaderWraps({ agentId: target.agentId, namespaceId: nsId })
+      }
+      rewrapped.push(target.name)
+    } catch (error) {
+      // M3-D4: one refused wrap must not abort the pass — the rest still publish, and the caller
+      // names each failure with the reason and the fix instead of one error hiding them all.
+      failed.push({ name: target.name, reason: wrapFailureReason(error) })
     }
-    rewrapped.push(target.name)
   }
-  return rewrapped
+  return { rewrapped, failed }
 }
