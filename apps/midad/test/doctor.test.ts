@@ -369,12 +369,15 @@ describe("mida doctor without a chain", () => {
     await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: { PATH: emptyPath }, daemonProbeMs: 50 })
     const hook = lines.find((line) => line.includes("mida-hook resolves to"))
     const inject = lines.find((line) => line.includes("mida-inject resolves to"))
+    const mcp = lines.find((line) => line.includes("mida-mcp resolves to"))
     expect(hook).toBeDefined()
     expect(inject).toBeDefined()
+    expect(mcp).toBeDefined()
     expect(hook).toContain("ok:")
     expect(inject).toContain("ok:")
+    expect(mcp).toContain("ok:")
     // the resolved path is absolute — the file the settings will name, not a PATH lookup
-    for (const line of [hook, inject]) {
+    for (const line of [hook, inject, mcp]) {
       expect(line).toMatch(/resolves to \//)
     }
     expect(lines.some((line) => line.includes("on your PATH"))).toBe(false)
