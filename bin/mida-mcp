@@ -1,0 +1,8 @@
+#!/bin/sh
+# Development launcher for the local MCP adapter, until the npm package (M3) puts a real
+# `mida-mcp` on the PATH. MCP clients launch it by absolute path — Claude Desktop's config is
+# `{ "command": "<this file>", "args": ["--as", "assistant"] }` — so the loader is named
+# absolutely too; a bare `--import tsx` would not resolve from the client's folder.
+# stdout is the JSON-RPC channel: nothing may print to it but the protocol.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+exec node --import "$ROOT/node_modules/tsx/dist/loader.mjs" "$ROOT/apps/midad/src/mcp-main.ts" "$@"

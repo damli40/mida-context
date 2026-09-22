@@ -6,8 +6,8 @@ import type { HandoffDeps } from "./handoff.js"
 import { agoText } from "./hook-output.js"
 import type { MidaHome } from "./home.js"
 import { checkProject } from "./projects.js"
-import { isSafeName } from "./queue.js"
 import type { ServiceRuntime } from "./runtime.js"
+import { SEEN_MAX, readSeen } from "./seen.js"
 import { authorNamesFor, readCheckpoints } from "./skeleton.js"
 
 /**
@@ -215,36 +215,9 @@ export interface WhatsNewDeps {
   log?: (entry: object) => void
 }
 
-const lastSeenPath = (sessionId: string) => `state/lastseen/${sessionId}.json`
-
-/** How many delivered contextIds a session's seen record keeps — the oldest drop past this. */
-const SEEN_MAX = 300
-
-/**
- * The session's seen set — the foreign contextIds already delivered to it or covered by its
- * handoff — or the empty set when there is no usable record: a missing file, a corrupt one, or
- * the old `{ lastSeen }` watermark shape all mean "never saw anything", so every foreign
- * checkpoint counts as new once and the delivered set then quietens later prompts.
- */
-export function readSeen(home: MidaHome, sessionId: string | undefined): Set<string> {
-  if (sessionId === undefined || !isSafeName(sessionId)) return new Set()
-  try {
-    const stored = home.readJson<{ seen?: unknown }>(lastSeenPath(sessionId))
-    if (!Array.isArray(stored?.seen)) return new Set()
-    return new Set(stored.seen.filter((id): id is string => typeof id === "string"))
-  } catch {
-    return new Set()
-  }
-}
-
-/**
- * Written by the hook only — at session start (the contextIds the handoff covered) and after a
- * delivered note. `seen` is oldest-first; the file keeps at most SEEN_MAX, the oldest dropped.
- */
-export function writeSeen(home: MidaHome, sessionId: string, seen: string[]): void {
-  if (!isSafeName(sessionId)) return
-  home.writeSecretJson(lastSeenPath(sessionId), { seen: seen.slice(-SEEN_MAX) })
-}
+// readSeen/writeSeen live in seen.ts — a leaf module the MCP adapter can import without pulling
+// in this file's key-reading graph. Re-exported so index.ts and existing callers are unchanged.
+export { readSeen, writeSeen } from "./seen.js"
 
 const parse = (iso: string): number => Date.parse(iso)
 

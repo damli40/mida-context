@@ -1,0 +1,68 @@
+import { spawn } from "node:child_process"
+import { randomBytes } from "node:crypto"
+import { realpathSync } from "node:fs"
+import { fileURLToPath } from "node:url"
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
+import { ensureDaemon } from "./control.js"
+import { resolveHome } from "./home.js"
+import { drainerEnv } from "./hook.js"
+import { MCP_USAGE, createMidaMcpServer, parseMcpArgs } from "./mcp.js"
+import { siblingEntryArgs } from "./sibling.js"
+
+/**
+ * `mida-mcp` — the local MCP adapter (M3-G). One stdio MCP server per client launch, a pure
+ * client of the daemon's socket like the hooks: it reports its own launch folder as the project,
+ * carries no keys and signs nothing. Startup mirrors inject-main.ts: the daemon is only expected
+ * (or spawned) once `mida init` has written network.json, and a daemon that cannot come up does
+ * not stop the server — every tool then answers the same degraded line instead of failing.
+ */
+
+/** The session-start hook's budget — the adapter waits the same 4 s for the daemon to come up. */
+const DAEMON_WAIT_MS = 4_000
+
+// Built `midad` beside this file in dist, or the .ts entry through the repo's tsx loader —
+// sibling.ts decides; the Mida home is the child's working directory. Same env-stripping as the
+// hooks: nothing agent-scoped (ANTHROPIC_* and friends) leaks into the daemon.
+function spawnDaemon(cwd: string): void {
+  const child = spawn(process.execPath, siblingEntryArgs("midad"), {
+    detached: true,
+    stdio: "ignore",
+    cwd,
+    env: drainerEnv(process.env),
+  })
+  child.on("error", () => {})
+  child.unref()
+}
+
+async function main(): Promise<void> {
+  // stdout is the JSON-RPC channel — every diagnostic, including the usage refusal, goes to stderr
+  const parsed = parseMcpArgs(process.argv.slice(2))
+  if (!parsed.ok) {
+    process.stderr.write(`mida-mcp: ${parsed.error}\n${MCP_USAGE}\n`)
+    process.exitCode = 2
+    return
+  }
+  const home = resolveHome(process.env)
+  // one session id per server instance — the whats-new seen set lives under it for this process's life
+  const sessionId = `mcp-${parsed.args.agent}-${randomBytes(4).toString("hex")}`
+  const up = home.has("network.json") && (await ensureDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS }))
+  const server = createMidaMcpServer({
+    home,
+    agent: parsed.args.agent,
+    project: parsed.args.project,
+    sessionId,
+    daemonUp: up,
+  })
+  await server.connect(new StdioServerTransport())
+}
+
+// `node dist/mida-mcp.js` reaches main through the bin symlink too: argv[1] is the .bin shim path
+// while import.meta.url is the real file, so the comparison must run on realpaths.
+const invoked = process.argv[1] !== undefined && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
+if (invoked) {
+  main().catch((error: unknown) => {
+    const e = error as { message?: unknown }
+    process.stderr.write(`mida-mcp: ${typeof e.message === "string" ? e.message : String(error)}\n`)
+    process.exitCode = 1
+  })
+}

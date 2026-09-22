@@ -14,6 +14,7 @@ import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeCode, uninstallCodex } from "./install.js"
 import type { InstallTool } from "./install.js"
+import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE, ServiceRuntime } from "./runtime.js"
 import type { Network } from "./runtime.js"
@@ -31,6 +32,8 @@ const AGENTS = ["claude-code", "codex", "assistant"]
 const INSTALL_TOOLS = ["claude-code", "codex"]
 const WITH_AGENT = ["request", "approve", "save-demo", "read", "revoke"]
 const WITH_PROJECT = ["save-demo"]
+/** The namespaces `read --as <agent> <namespace>` may name — the same three the MCP adapter exposes. */
+const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skills", "preferences.communication"]
 export const USAGE =
   "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent>" +
   "   (tool = claude-code | codex; agent = claude-code | codex | assistant — assistant is a stand-in for any other assistant you use)"
@@ -148,6 +151,9 @@ export async function runCliWithRuntime(
   if (!WITH_AGENT.includes(command)) return usage()
   if (WITH_AGENT.includes(command) && !AGENTS.includes(agent)) return usage()
   if (command === "read" && !asFlag && projectId.length === 0) return usage()
+  // `read --as <agent> <namespace>` takes exactly one namespace, from the known set — anything
+  // else on the line is refused rather than silently ignored.
+  if (asFlag && (argv.length > 4 || (argv[3] !== undefined && !READ_AS_NAMESPACES.includes(argv[3])))) return usage()
   if (WITH_PROJECT.includes(command) && projectId.length === 0) return usage()
 
   try {
@@ -168,26 +174,51 @@ export async function runCliWithRuntime(
       print(`saved ${result.contextId} tx ${result.transactionHash} in ${result.milliseconds} ms`)
     } else if (command === "read") {
       if (asFlag) {
-        // `mida read --as <agent>`: what this agent can see, through the real protocol — the owner
-        // facts its grants cover, then a real `projects.current` attempt whose answer (or refusal
-        // code) comes from the server, never a local pre-check.
-        let facts: Awaited<ReturnType<typeof readOwnerFacts>> | null
-        try {
-          facts = await readOwnerFacts(runtime, agent)
-        } catch (error) {
-          // a list the store calls incomplete is not "no facts" — say so, then still run the attempt
-          if (!isMidaError(error, "PARTIAL_READ")) throw error
-          facts = null
-        }
-        if (facts === null) {
-          print("list incomplete — run again")
+        // `mida read --as <agent> [namespace]`: what this agent can see, through the real
+        // protocol. No namespace reads the owner facts its grants cover, then a real
+        // `projects.current` attempt whose answer (or refusal code) comes from the server,
+        // never a local pre-check. A namespace narrows the read to that one area: the fact
+        // namespaces print their owner facts, `projects.current` prints the objects in the
+        // project the caller's folder belongs to — the same lines `read <agent> <projectId>`
+        // produces.
+        const only = argv[3]
+        if (only === "projects.current") {
+          const projectId = context?.cwd === undefined ? null : projectIdFor(context.cwd)
+          if (projectId === null) {
+            print(`projects.current: this folder is not a Mida project — run \`mida approve ${agent}\` here to make it one`)
+          } else {
+            const result = await readCheckpoints(runtime, agent, projectId)
+            print(`${NAMESPACE}: read ${result.checkpoints.length} object(s)`)
+            if (result.partial) print("list incomplete — run again")
+            const authorNames = authorNamesFor(runtime)
+            for (const checkpoint of result.checkpoints) {
+              const author = authorNames[checkpoint.authorId.toLowerCase()] ?? "unknown agent"
+              print(`  ${namespaceLabel(checkpoint.namespaceId)}: ${checkpoint.contextId} written by ${author} (on-chain author ${checkpoint.authorId.slice(0, 10)}…)`)
+            }
+          }
         } else {
-          print("What you have told Mida about yourself")
-          for (const fact of facts) print(`  ${fact.namespace}: ${fact.text}`)
+          let facts: Awaited<ReturnType<typeof readOwnerFacts>> | null
+          try {
+            facts = await readOwnerFacts(runtime, agent)
+          } catch (error) {
+            // a list the store calls incomplete is not "no facts" — say so, then still run the attempt
+            if (!isMidaError(error, "PARTIAL_READ")) throw error
+            facts = null
+          }
+          if (facts === null) {
+            print("list incomplete — run again")
+          } else {
+            print("What you have told Mida about yourself")
+            for (const fact of facts) {
+              if (only === undefined || fact.namespace === only) print(`  ${fact.namespace}: ${fact.text}`)
+            }
+          }
+          if (only === undefined) {
+            const attempt = await attemptNamespaceRead(runtime, agent, NAMESPACE)
+            print(attempt.ok ? `${NAMESPACE}: read ${attempt.objects} object(s)` : `${NAMESPACE}: refused ${attempt.code}`)
+            if (attempt.ok && attempt.partial) print("list incomplete — run again")
+          }
         }
-        const attempt = await attemptNamespaceRead(runtime, agent, NAMESPACE)
-        print(attempt.ok ? `${NAMESPACE}: read ${attempt.objects} object(s)` : `${NAMESPACE}: refused ${attempt.code}`)
-        if (attempt.ok && attempt.partial) print("list incomplete — run again")
       } else {
         const result = await readCheckpoints(runtime, agent, projectId)
         print(`read ${result.checkpoints.length} checkpoint(s) in ${result.milliseconds} ms`)
