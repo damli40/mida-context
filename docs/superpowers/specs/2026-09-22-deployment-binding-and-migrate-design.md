@@ -186,6 +186,17 @@ migration:
   migratedAt: 2026-09-25T…
 ```
 
+**Where it lives (settled by spike S3).** Never inside the strict `Checkpoint` object, which rejects
+unknown keys. For a checkpoint: a `migration` key beside `checkpoint` in the sealed
+`CheckpointEnvelope`. For a fact: beside `text` and `assertedAt` in `payload.value`. For any other
+record: beside the record's own content in `payload.value`. In every case it is inside the
+ciphertext. Every code path that rebuilds a payload must carry the key through; a read → re-save
+that drops it is a defect.
+
+**Size (Dami, Sep 22).** The envelope adds about 442 bytes. The preview checks every record's size
+with its envelope against the cap (65,280 bytes, checkpoint-payload.ts:11). If any would exceed it,
+`migrate` refuses to start and names each such record. Nothing is trimmed and nothing is half-moved.
+
 The on-chain provenance label is the original one (decision 7). Readers that show provenance
 (handoff, `read`, the MCP `read` tool) print "(moved <date>)" after the original attribution.
 
@@ -301,6 +312,7 @@ No contract changes.
 | A record's author is not set up here | `skipped:unknown-author`, listed by author ID and count; the preview shows it before `yes` |
 | A record points at a record that was skipped | it is skipped too (`skipped:dangling-relation`), and listed; never written with a broken link |
 | An area on the old contract has no owner key to decrypt it | stops at step 3 before anything is written, naming the area |
+| A record would exceed the size cap once the envelope is added | refused at the preview, before `yes`; each such record named; nothing written |
 | `--undo` with no backup | refused |
 | Old service will not stop | refused before step 2, naming the process |
 
@@ -339,6 +351,32 @@ No contract changes.
   real one.
 
 ## 11. Not proven yet
+
+**HARD GATE (Dami, Sep 22): no implementation plan is written until spikes S1-S4 each have a
+recorded answer**, run on a local chain, throwaway code under `spikes/` (untracked):
+
+- **S1:** a checkpoint with a `createdAt` days in the past passes the store and chain and reads back intact.
+- **S2:** the owner alone can decrypt every record in every area it owns, including areas no local
+  agent reads and records sealed before a read-epoch rotation.
+- **S3:** the migration envelope fits inside the checkpoint / fact payload, or where it must live instead.
+- **S4:** the chain's logs, filtered by owner, rebuild the complete record set: roots, every
+  superseded version, evidence records and relations.
+
+A NO on any spike sends the affected part of §5 back to design before planning.
+
+**Gate result (Sep 22): PASSED.** All four were run on a local chain, not only read, and each claim
+below was re-checked against the code. Throwaway scripts are in `spikes/1-4` (untracked).
+
+| Spike | Answer | Evidence | What it changes in the design |
+|---|---|---|---|
+| S1 old `createdAt` | **YES** | 7- and 30-day-old checkpoints saved with real transactions, read back identical. The only check on payload time is ISO format (schema.ts:107-113); the 60 s window is on request signing time (auth-pure.ts:21,78). With a fresh checkpoint present, the old ones rank as old (merge.ts) | none |
+| S2 owner decrypts all | **YES** | 4/4 records decrypted with owner material only, from a freshly opened home: an agent checkpoint, facts before and after a revoke-driven epoch rotation, and `goals.personal`, which no agent could read. Area keys are recomputed from `owner/secrets.json`'s seed (fake-vault.ts:184-187, derive.ts:40-42); the store skips agent authorisation for the owner (app.ts:354) | **new function**: "read as owner" (list via owner-signed `GET /objects` → on-chain record check → owner key derivation → `openContextObject`). None exists today; every current read goes through an agent. The store lists one area per request (app.ts:352), so step 3 learns the areas from S4 first |
+| S3 envelope placement | **BESIDE, not inside** | Inside the `Checkpoint` object is rejected (unknown top-level key, schema.ts:94-96). Beside it, in the sealed `CheckpointEnvelope`, the chain and store accept it, but `wrapCheckpoint` / `unwrapCheckpoint` rebuild the envelope from a fixed field list and **silently drop it** (checkpoint-payload.ts:84-91, 150-157). Facts: works today as a sibling of `text`; `factText` ignores unknown fields | §5.3 placement fixed (below). **Plan must add** `migration?` to `CheckpointEnvelope` in both literals, plus a test that a read → re-save round trip keeps it |
+| S4 log enumeration | **YES, relations need decryption** | 8 written / 8 rebuilt from owner-filtered `ContextRegistered` logs: 0 missing, 0 extra, 0 field mismatches, including v1→v2→v3 and an evidence record; a second owner's record correctly excluded. Every write emits `ContextRegistered` with the full record (ContextRegistry.sol:301). Relations exist on chain only as `evidenceCommitment`, a hash; the targets are in the sealed payload (types.ts:33-45) | relations are read after decrypting (S2), in step 3. **New function**: an evidence-record write. The SDK hard-codes `RECORD_TYPE.CONTEXT` (agent.ts:540, fake-vault.ts:451); only a test writes evidence, by calling the contract directly |
+
+**Not tested by the spikes:** epoch rotation by grant expiry and several rotations in a row (same
+derivation, low risk); passkey setups (out of scope); the MCP tools over the live service socket
+(traced, same read functions).
 
 - The hosted store's database may still hold the old objects (unverified). Only option 3 needs it.
 - `saveCheckpoint` accepting a payload with an old `createdAt` and passing the store's checks
