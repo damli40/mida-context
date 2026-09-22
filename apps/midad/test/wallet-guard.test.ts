@@ -141,6 +141,24 @@ describe("makeOwnerBalanceGuard (R4-4/R5-9)", () => {
     expect(message).toContain("0.0832")
     expect(message).toContain("0.0332")
   })
+
+  it("an upper-bound cost (the estimate itself refused to run) is phrased 'up to' (M3-D6)", async () => {
+    // sendContract prices the balance check at the kind's ceiling when the node's own gas
+    // estimate refused — the sentence must not claim a precision the bound does not have.
+    const guard = guardOver([500n])
+    const error = await guard({ payer: PAYER, gasLimit: 9n, fee: EIP1559, upperBound: true }).then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(error).toMatchObject({ code: "OWNER_WALLET_LOW" })
+    expect((error as Error).message).toContain("needs up to")
+    // and the ordinary refusal stays exact — no "up to" where a real estimate priced it
+    const exact = await guardOver([500n])({ payer: PAYER, gasLimit: 9n, fee: EIP1559 }).then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect((exact as Error).message).not.toContain("up to")
+  })
 })
 
 describe("formatMon", () => {

@@ -485,22 +485,26 @@ export function makeOwnerBalanceGuard(input: {
   progress?: (line: string) => void
 }): (cost: SendCost) => Promise<void> {
   const payer = input.chain.account.address
-  const low = (balance: bigint, cost: bigint) =>
+  // `bound` marks the cost as a ceiling-priced upper bound (the node's own estimate refused to
+  // run): the sentence says "up to" rather than claiming the exact figure the estimate refused
+  // to produce (M3-D6 item 1).
+  const low = (balance: bigint, cost: bigint, bound: boolean) =>
     new MidaError(
       "OWNER_WALLET_LOW",
-      `your wallet holds ${formatMon(balance)} MON but this transaction needs ${formatMon(cost)} MON — ${formatMon(cost - balance)} MON short`,
+      `your wallet holds ${formatMon(balance)} MON but this transaction needs ${bound ? "up to " : ""}${formatMon(cost)} MON — ${formatMon(cost - balance)} MON short`,
     )
-  return async ({ gasLimit, fee, value }) => {
+  return async ({ gasLimit, fee, value, upperBound }) => {
     const cost = gasLimit * (fee.maxFeePerGas ?? fee.gasPrice ?? 0n) + (value ?? 0n)
+    const bound = upperBound === true
     let balance = await input.chain.publicClient.getBalance({ address: payer })
     if (balance >= cost) return
-    if (input.fund === undefined) throw low(balance, cost)
+    if (input.fund === undefined) throw low(balance, cost, bound)
     input.progress?.("topping up your wallet…")
     await input.fund(payer)
     // A fixed top-up can under-shoot a big send (a revoke.agent at the ceiling needs more than
     // 0.2 MON) — so after the funder's own wait the balance is read AGAIN; still short is a
     // refusal with the real numbers, never a loop and never a send that dies at the node.
     balance = await input.chain.publicClient.getBalance({ address: payer })
-    if (balance < cost) throw low(balance, cost)
+    if (balance < cost) throw low(balance, cost, bound)
   }
 }

@@ -3,6 +3,7 @@ import {
   agentId as deriveAgentId,
   agentRegistrationTypedData,
   canonicalizeOrigin,
+  isMidaError,
   originHash,
 } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
@@ -11,7 +12,7 @@ import type { Abi, Account, LocalAccount, PublicClient, TransactionReceipt, Wall
 import { capabilityRegistryAbi } from "./abis.js"
 import { chainFor } from "./deployment.js"
 import type { Deployment } from "./deployment.js"
-import { contractGas, valueGas } from "./gas.js"
+import { GAS_CEILINGS, contractGas, valueGas } from "./gas.js"
 import type { TxKind } from "./gas.js"
 import { toMidaError } from "./registry.js"
 import type { ChainContext } from "./registry.js"
@@ -41,6 +42,12 @@ export interface SendCost {
   fee: SendFee
   /** A plain transfer's moved value — part of the payer's total exposure, absent on contract calls. */
   value?: bigint
+  /**
+   * Set when `gasLimit` is a bound, not a measured estimate: the node's own `eth_estimateGas`
+   * refused to run, so the send was priced at the kind's ceiling. A balance guard phrases the
+   * refusal "needs up to X MON" rather than claiming a precision the bound does not have (M3-D6).
+   */
+  upperBound?: boolean
 }
 
 export interface WriteContext extends ChainContext {
@@ -140,6 +147,7 @@ export async function sendContract(
   } catch (error) {
     throw toMidaError(error)
   }
+  let sponsorReason: string | undefined
   if (context.sponsor !== undefined) {
     try {
       return await context.sponsor.send(call, kind)
@@ -159,11 +167,13 @@ export async function sendContract(
           `the gas sponsor did not pay (${error.reason}) and this build cannot fall back to self-pay — fund the wallet or try the sponsor again later`,
         )
       }
+      sponsorReason = error.reason
       context.progress?.(`the gas sponsor did not pay (${error.reason}); paying from your own wallet…`)
       // falls through to the self-paid path — exactly one attempt, never a retry loop
     }
   }
   let gas: bigint
+  let fee: SendFee | undefined
   try {
     // The per-kind ceiling on the self-paid path: the node's estimate is refused over the kind's
     // ceiling, locally, before the send is priced (M3-D). This estimate is deliberately absent
@@ -171,16 +181,20 @@ export async function sendContract(
     // callGasLimit is what gets checked.
     gas = await contractGas(context, call, kind)
   } catch (error) {
-    throw toMidaError(error)
+    // The ceiling refusal stays a ceiling refusal — that is the estimate succeeding with a
+    // number, not the estimate itself being refused.
+    if (isMidaError(error, "GAS_CEILING_EXCEEDED")) throw error
+    ;({ gas, fee } = await estimateAfterRefusal(context, call, kind, sponsorReason, error))
   }
-  let fee: SendFee
-  try {
-    // The fee is estimated ONCE here and forwarded into the send below: the balance guard checks
-    // gasLimit × this maxFeePerGas, the node checks the same product, and no second estimate can
-    // drift between the two reads (R5-9).
-    fee = await estimateSendFee(context)
-  } catch (error) {
-    throw toMidaError(error)
+  if (fee === undefined) {
+    try {
+      // The fee is estimated ONCE here and forwarded into the send below: the balance guard checks
+      // gasLimit × this maxFeePerGas, the node checks the same product, and no second estimate can
+      // drift between the two reads (R5-9).
+      fee = await estimateSendFee(context)
+    } catch (error) {
+      throw toMidaError(error)
+    }
   }
   await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee })
   const hash = await context.walletClient.writeContract({ ...(request as object), gas, ...fee } as never)
@@ -189,6 +203,48 @@ export async function sendContract(
     throw new MidaError("CAPABILITY_DENIED", `${call.functionName} transaction ${hash} reverted on-chain`)
   }
   return { ...receipt, gasLimit: gas }
+}
+
+/**
+ * Recovery for a gas ESTIMATE that itself was refused (M3-D6 item 1). On Monad,
+ * `eth_estimateGas` rejects for a wallet that cannot afford the worst case — before `beforeSend`
+ * could run, so the owner saw the node's raw error instead of the wallet sentence. Here the
+ * balance guard is asked against an UPPER BOUND — the kind's ceiling × the current max fee —
+ * instead. A wallet that cannot pay even the bound refuses with the plain OWNER_WALLET_LOW
+ * sentence (the sponsor's one-line reason kept in front of it); a wallet that CAN pay the
+ * bound — typically because a funder just topped it up — gets the estimate retried, and the
+ * send then runs through the ordinary check with the real numbers.
+ */
+async function estimateAfterRefusal(
+  context: WriteContext,
+  call: { address: Address; abi: Abi; functionName: string; args: readonly unknown[] },
+  kind: TxKind,
+  sponsorReason: string | undefined,
+  error: unknown,
+): Promise<{ gas: bigint; fee: SendFee }> {
+  if (context.beforeSend === undefined) throw toMidaError(error)
+  let fee: SendFee
+  try {
+    fee = await estimateSendFee(context)
+  } catch (feeError) {
+    throw toMidaError(feeError)
+  }
+  try {
+    await context.beforeSend({ payer: context.account.address, gasLimit: GAS_CEILINGS[kind], fee, upperBound: true })
+  } catch (low) {
+    if (isMidaError(low, "OWNER_WALLET_LOW") && sponsorReason !== undefined) {
+      // the sentence stays intact — the sponsor's one-line reason goes in front of it, so the
+      // owner learns both who refused to pay and what their own wallet lacks
+      const sentence = low.message.startsWith(`${low.code}: `) ? low.message.slice(low.code.length + 2) : low.message
+      throw new MidaError("OWNER_WALLET_LOW", `the gas sponsor did not pay (${sponsorReason}); ${sentence}`)
+    }
+    throw low
+  }
+  try {
+    return { gas: await contractGas(context, call, kind), fee }
+  } catch (retried) {
+    throw toMidaError(retried)
+  }
 }
 
 /**

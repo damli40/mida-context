@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest"
 import { MidaError, isMidaError } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { SPONSOR_FALLBACK_TO_SELF_PAY, SponsorDidNotPay, sendContract } from "@mida/chain"
-import type { SponsoredSender, WriteContext } from "@mida/chain"
+import type { SendCost, SponsoredSender, WriteContext } from "@mida/chain"
 
 const ADDRESS: Address = "0x5fbdb2315678afecb367f032d93f642f64180aa3"
 const HASH: Hex = `0x${"ab".repeat(32)}`
@@ -19,19 +19,26 @@ const call = { address: ADDRESS, abi: [], functionName: "register", args: [] } a
 
 function stubContext(over: {
   estimate?: bigint
+  estimateFailures?: number
+  estimateError?: unknown
   sponsor?: SponsoredSender
   progress?: (line: string) => void
-  beforeSend?: () => Promise<void>
+  beforeSend?: (cost: SendCost) => Promise<void>
 }) {
   const sent: { gas?: bigint }[] = []
   let feeEstimates = 0
   let gasEstimates = 0
+  let estimateFailures = over.estimateFailures ?? 0
   const context = {
     account: { address: ADDRESS },
     publicClient: {
       simulateContract: async () => ({ request: { address: ADDRESS, functionName: "register" } }),
       estimateContractGas: async () => {
         gasEstimates += 1
+        if (estimateFailures > 0) {
+          estimateFailures -= 1
+          throw over.estimateError ?? new Error("insufficient funds for gas * price + value")
+        }
         return over.estimate ?? 300_000n
       },
       estimateFeesPerGas: async () => {
@@ -192,5 +199,74 @@ describe("sendContract with a sponsor wired", () => {
     const error = await sendContract(context, call, "context.register").then(() => null, (e: unknown) => e)
     expect(error).toBe(weird)
     expect(sent).toHaveLength(0)
+  })
+
+  it("a refused fallback estimate on a broke wallet answers OWNER_WALLET_LOW — the sponsor reason, then the wallet sentence (M3-D6)", async () => {
+    // The Sep 22 defect: on Monad, eth_estimateGas itself is refused for a wallet that cannot
+    // afford the worst case — it throws BEFORE beforeSend, so the owner saw `refused: ERROR`
+    // instead of the wallet sentence. The fix runs the balance guard against an UPPER BOUND
+    // (the kind's ceiling × the current max fee), and keeps the sponsor's one-line reason in
+    // front of the refusal.
+    const sponsor = successfulSponsor(async () => {
+      throw new SponsorDidNotPay("the sponsor's daily budget is exhausted")
+    })
+    const guarded: SendCost[] = []
+    const { context, sent } = stubContext({
+      sponsor,
+      estimateFailures: 99, // the node refuses the estimate every time — the wallet cannot pay
+      beforeSend: async (cost) => {
+        guarded.push(cost)
+        throw new MidaError(
+          "OWNER_WALLET_LOW",
+          `your wallet holds 0.0000 MON but this transaction needs ${cost.upperBound === true ? "up to " : ""}0.0078 MON — 0.0078 MON short`,
+        )
+      },
+    })
+    const error = await sendContract(context, call, "context.register").then(() => null, (e: unknown) => e)
+    expect(isMidaError(error, "OWNER_WALLET_LOW")).toBe(true)
+    const message = (error as Error).message
+    expect(message).toContain("the gas sponsor did not pay (the sponsor's daily budget is exhausted); your wallet holds")
+    expect(message).toContain("needs up to 0.0078 MON")
+    expect(sent).toHaveLength(0)
+    // the guard was priced at the kind's ceiling and told it is a bound — the real estimate is
+    // the thing that refused to run
+    expect(guarded).toHaveLength(1)
+    expect(guarded[0]!.gasLimit).toBe(650_000n) // context.register's ceiling
+    expect(guarded[0]!.upperBound).toBe(true)
+  })
+
+  it("a refused estimate that a funder covers retries the real estimate — the send still goes out", async () => {
+    const sponsor = successfulSponsor(async () => {
+      throw new SponsorDidNotPay("offline")
+    })
+    const guarded: SendCost[] = []
+    const { context, sent } = stubContext({
+      sponsor,
+      estimateFailures: 1, // the first estimate fails — before the top-up lands
+      beforeSend: async (cost) => {
+        guarded.push(cost)
+      },
+    })
+    const receipt = await sendContract(context, call, "context.register")
+    expect(receipt.transactionHash).toBe(HASH)
+    expect(sent).toHaveLength(1)
+    // guard #1 is the upper-bound probe (ceiling, flagged); guard #2 is the real send's numbers
+    expect(guarded).toHaveLength(2)
+    expect(guarded[0]!.gasLimit).toBe(650_000n)
+    expect(guarded[0]!.upperBound).toBe(true)
+    expect(guarded[1]!.gasLimit).toBe(300_000n)
+    expect(guarded[1]!.upperBound).not.toBe(true)
+  })
+
+  it("the same refused estimate with no sponsor keeps the plain wallet sentence — no sponsor prefix", async () => {
+    const { context } = stubContext({
+      estimateFailures: 99,
+      beforeSend: async () => {
+        throw new MidaError("OWNER_WALLET_LOW", "your wallet holds 0.0000 MON but this transaction needs up to 0.0078 MON — 0.0078 MON short")
+      },
+    })
+    const error = await sendContract(context, call, "context.register").then(() => null, (e: unknown) => e)
+    expect(isMidaError(error, "OWNER_WALLET_LOW")).toBe(true)
+    expect((error as Error).message).not.toContain("gas sponsor")
   })
 })
