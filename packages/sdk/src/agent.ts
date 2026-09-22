@@ -28,6 +28,7 @@ import type {
   ContextPayload,
   GrantedCapability,
   Hex,
+  LineagePolicy,
   PurposeId,
   RecordReference,
   UnsignedAccessRequest,
@@ -92,6 +93,24 @@ export interface ProposalInput {
   tags?: string[]
   note?: string
   extractionConfidence?: number
+}
+
+/**
+ * One record written exactly as given (migrate B1): the payload is sealed verbatim — every
+ * provenance field `create` drops survives — and the record type, kind, lineage policy, expiry,
+ * parent and nonce are all the caller's. The caller predicts the id with `predictContextId`.
+ */
+export interface ReplayInput {
+  namespaceId: Hex
+  payload: ContextPayload
+  recordType: "CONTEXT" | "EVIDENCE"
+  kind: ContextKind
+  lineagePolicy: LineagePolicy
+  expiresAt: bigint
+  /** The parent record's contextId, or the zero hash for a root. */
+  expectedParentId: Hex
+  /** Prepared by the caller; what makes a re-run land on the same id instead of duplicating. */
+  objectNonce: Hex
 }
 
 export interface ContextObject {
@@ -386,6 +405,103 @@ export class MidaAgent {
   /** Always AGENT_INFERRED; the owner decides later whether to confirm it. */
   propose(owner: Address, namespace: string, input: ProposalInput): Promise<ContextObject> {
     return this.create(owner, namespace, { ...input, kind: input.kind ?? "INFERENCE", source: "AGENT_INFERRED" })
+  }
+
+  /** The contextId a `replay` with this nonce will produce — computed before sending. */
+  predictContextId(owner: Address, namespaceId: Hex, objectNonce: Hex): Hex {
+    const { deployment } = this.#chain
+    return deriveContextId({
+      chainId: deployment.chainId,
+      contextRegistry: deployment.contextRegistry,
+      owner: owner.toLowerCase() as Address,
+      authorId: this.agentId,
+      namespaceId: namespaceId.toLowerCase() as Hex,
+      objectNonce,
+    })
+  }
+
+  /**
+   * Writes one record exactly as given (migrate B1). Unlike `#write` it does not rebuild the
+   * payload — `sourceHash`, `sourceUri`, `retrievedAt`, `note`, `extractionConfidence`,
+   * `references` and `tags` all reach the seal — and it adds no provenance restriction of its
+   * own: the ordinary capability and epoch checks apply, and the contract stays the authority.
+   */
+  async replay(owner: Address, input: ReplayInput): Promise<ContextObject> {
+    if (input.payload.kind !== input.kind) {
+      throw new MidaError("INVALID_WIRE", "the payload kind and the record kind disagree")
+    }
+    const ownerAddress = owner.toLowerCase() as Address
+    const namespaceId = input.namespaceId.toLowerCase() as Hex
+    const capability =
+      input.expectedParentId === zeroHash
+        ? this.#requireCapability(ownerAddress, namespaceId, PERMISSION.CREATE)
+        : await this.#supersedeCapability(ownerAddress, namespaceId, input.expectedParentId)
+    const { deployment } = this.#chain
+    const readEpoch = await this.#reader.requiredReadEpoch(ownerAddress, namespaceId)
+    const epochPublicKey = await this.#reader.epochPublicKey(ownerAddress, namespaceId, readEpoch)
+    if (epochPublicKey === null || !(await this.#reader.isWriteEpochValid(ownerAddress, namespaceId, readEpoch))) {
+      throw new MidaError("EPOCH_ROTATION_REQUIRED", "the current read epoch does not accept writes")
+    }
+    const contextId = this.predictContextId(ownerAddress, namespaceId, input.objectNonce)
+    const sealed = sealContextObject({
+      payload: input.payload,
+      binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId, namespaceId, readEpoch },
+      epochPublicKey: bytesOf(epochPublicKey, 32),
+    })
+    await this.#api.putObject({
+      owner: ownerAddress,
+      namespaceId,
+      objectNonce: input.objectNonce,
+      expectedParentId: input.expectedParentId,
+      manifest: sealed.manifest,
+      ciphertext: hexOf(sealed.ciphertext),
+      capabilityId: capability.capabilityId,
+    })
+    const references = input.payload.provenance.references ?? []
+    const receipt = await sendContract(
+      this.#chain,
+      {
+        address: deployment.contextRegistry,
+        abi: contextRegistryAbi,
+        functionName: "register",
+        args: [
+          ownerAddress,
+          [
+            {
+              contextId,
+              objectNonce: input.objectNonce,
+              namespaceId,
+              expectedParentId: input.expectedParentId,
+              manifestHash: sealed.manifestHash,
+              ciphertextCommitment: sealed.ciphertextCommitment,
+              evidenceCommitment: references.length === 0 ? zeroHash : evidenceCommitment(references),
+              readEpoch,
+              expiresAt: input.expiresAt,
+              recordType: RECORD_TYPE[input.recordType],
+              lineagePolicy: LINEAGE_POLICY[input.lineagePolicy],
+              kind: CONTEXT_KIND[input.kind],
+              provenanceSource: PROVENANCE_SOURCE[input.payload.provenance.source],
+            },
+          ],
+        ],
+      },
+      "context.register",
+    )
+    const record = await this.#reader.getRecord(contextId)
+    if (record === null) throw new MidaError("COMMITMENT_MISMATCH", "the registered record is missing after the transaction")
+    return { ...this.#toObject(record, namespaceById(namespaceId).name, input.payload), transactionHash: receipt.transactionHash }
+  }
+
+  /** The grant that lets this agent write under an existing parent: SUPERSEDE_ANY, or SUPERSEDE_OWN on its own lineage. */
+  async #supersedeCapability(owner: Address, namespaceId: Hex, parentId: Hex): Promise<GrantedCapability> {
+    const any = this.#findCapability(owner, namespaceId, PERMISSION.SUPERSEDE_ANY)
+    if (any !== undefined) return any
+    const parent = await this.#reader.getRecord(parentId)
+    if (parent !== null && (await this.#reader.getRecord(parent.lineageId))?.author === this.agentId) {
+      const own = this.#findCapability(owner, namespaceId, PERMISSION.SUPERSEDE_OWN)
+      if (own !== undefined) return own
+    }
+    throw new MidaError("CAPABILITY_DENIED", "no completed grant allows superseding this lineage")
   }
 
   #findCapability(owner: Address, namespaceId: Hex, permission: number): GrantedCapability | undefined {

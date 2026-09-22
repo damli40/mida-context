@@ -10,6 +10,7 @@ import {
 } from "@mida/protocol"
 import type {
   AccessRequest,
+  Address,
   Hex,
   Permission,
   ProvenancePolicy,
@@ -17,9 +18,10 @@ import type {
   SignedAgentCapabilityManifest,
   UnsignedAccessRequest,
 } from "@mida/protocol"
-import { generateX25519KeyPair, hexOf } from "@mida/crypto"
+import { generateX25519KeyPair, hexOf, x25519PublicKey } from "@mida/crypto"
+import type { X25519KeyPair } from "@mida/crypto"
 import { latestTimestamp, registerAgent } from "@mida/chain"
-import type { ChainContext, LocalWriteContext } from "@mida/chain"
+import type { ChainContext, Deployment, LocalWriteContext } from "@mida/chain"
 import { manifestBindingFor, manifestBodyHash } from "@mida/grant-advisor"
 import { randomBytes } from "@noble/hashes/utils.js"
 import type { LocalAccount } from "viem"
@@ -54,15 +56,14 @@ export async function provisionAgent(input: {
   declarations: readonly AgentDeclaration[]
   callbackOrigin: string
   signer?: LocalAccount
+  /** Prepared salt (migrate B1); absent = a fresh random one, exactly as before. */
+  agentSalt?: Hex
+  /** Prepared X25519 encryption pair (migrate B1); absent = a fresh generated pair. */
+  encryption?: X25519KeyPair
 }): Promise<ProvisionedAgent> {
   const { deployment } = input.operator
-  const agentSalt = hexOf(randomBytes(32))
-  const agentId = deriveAgentId({
-    chainId: deployment.chainId,
-    capabilityRegistry: deployment.capabilityRegistry,
-    operator: input.operator.account.address,
-    agentSalt,
-  })
+  const agentSalt = input.agentSalt ?? hexOf(randomBytes(32))
+  const agentId = predictAgentId({ deployment, operator: input.operator.account.address, agentSalt })
   const now = await latestTimestamp(input.operator)
   const body = {
     v: 1 as const,
@@ -84,7 +85,10 @@ export async function provisionAgent(input: {
     manifestBindingFor({ chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, body }) as never,
   )
   const signer = input.signer ?? privateKeyToAccount(generatePrivateKey())
-  const encryption = generateX25519KeyPair()
+  const encryption = input.encryption ?? generateX25519KeyPair()
+  if (input.encryption !== undefined && hexOf(x25519PublicKey(encryption.privateKey)) !== hexOf(encryption.publicKey)) {
+    throw new Error("the prepared encryption pair's public key does not match its private key")
+  }
   const registered = await registerAgent(input.operator, {
     agentSalt,
     signer,
@@ -103,6 +107,16 @@ export async function provisionAgent(input: {
     manifest: { manifest: body, operatorSignature },
     manifestHash,
   }
+}
+
+/** The agentId a `provisionAgent` call with this salt will register — computed before sending (migrate B1). */
+export function predictAgentId(input: { deployment: Deployment; operator: Address; agentSalt: Hex }): Hex {
+  return deriveAgentId({
+    chainId: input.deployment.chainId,
+    capabilityRegistry: input.deployment.capabilityRegistry,
+    operator: input.operator,
+    agentSalt: input.agentSalt,
+  })
 }
 
 /**

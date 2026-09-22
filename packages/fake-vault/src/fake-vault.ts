@@ -406,13 +406,17 @@ export class FakeVaultAuthority implements VaultAuthority {
     expectedParentId?: Hex
     evidenceCommitment?: Hex
     expiresAt?: bigint
+    /** Prepared nonce (migrate B1); absent = a fresh random one, exactly as before. */
+    objectNonce?: Hex
+    /** Record type to anchor (migrate B1); absent = CONTEXT, exactly as before. */
+    recordType?: "CONTEXT" | "EVIDENCE"
   }): Promise<{ contextId: Hex; readEpoch: bigint; manifestHash: Hex; transactionHash: Hex }> {
     const { deployment } = this.#chain
     const namespaceId = toNamespaceId(canonicalizeNamespace(input.namespace))
     const readEpoch = await this.#readCapability<bigint>("requiredReadEpoch", [this.owner, namespaceId])
     const onChain = await this.#readCapability<Hex>("epochPublicKey", [this.owner, namespaceId, readEpoch])
     const keys = await this.#epochKeys(namespaceId, readEpoch, onChain)
-    const objectNonce = hexOf(randomBytes(32))
+    const objectNonce = input.objectNonce ?? hexOf(randomBytes(32))
     const contextId = deriveContextId({
       chainId: deployment.chainId,
       contextRegistry: deployment.contextRegistry,
@@ -448,7 +452,7 @@ export class FakeVaultAuthority implements VaultAuthority {
           evidenceCommitment: input.evidenceCommitment ?? zeroHash,
           readEpoch,
           expiresAt: input.expiresAt ?? 0n,
-          recordType: RECORD_TYPE.CONTEXT,
+          recordType: RECORD_TYPE[input.recordType ?? "CONTEXT"],
           lineagePolicy: LINEAGE_POLICY[input.lineagePolicy ?? "STANDARD"],
           kind: CONTEXT_KIND[input.payload.kind],
           provenanceSource: PROVENANCE_SOURCE[input.payload.provenance.source],
