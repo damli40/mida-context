@@ -1,0 +1,35 @@
+{
+  "date": "2026-09-22",
+  "what": "First real passkey owner: `mida init --passkey` on Dami's Mac (Safari), owner page at https://app.midacontext.xyz, contracts bound to midacontext.xyz, every transaction sponsored. Terminal wrote nothing until the chain confirmed each result.",
+  "owner": "0xb2661c8a9f10cb7d2eb7810d0e792a8ef41d07b1",
+  "home": "~/mida-live/home-passkey (fresh)",
+  "attempt1": "FAILED at the page's first sponsored send: Safari 'Load failed' = the sponsor Worker had no CORS handling (OPTIONS \u2192 404). Fixed bd4bf18 (allowlisted origin, preflight), redeployed, retried.",
+  "attempt2": {
+    "signup": {
+      "pairingCode": "matched",
+      "sponsoredOps": 4,
+      "window": "15:33:10\u201315:33:27 (17 s, sequential: registerP256Key + 3 namespace opens)"
+    },
+    "agentRegistrations": {
+      "sponsoredOps": 3,
+      "window": "15:33:30\u201315:33:49 (19 s, terminal, sequential)"
+    },
+    "approveAssistant": {
+      "pairingCode": "matched",
+      "pageShowed": "agent, operator prefix, 2 scopes, expiry, advisor: low risk",
+      "sponsoredGrant": "15:35:29\u201315:35:33 (4 s)",
+      "gapFromLinkToSend": "~100 s incl. reading, click, passkey touch and the page's own chain reads (not separable from the log)"
+    }
+  },
+  "uxFindings": [
+    "signup's 4 ops should be ONE executeBatch (~5 s instead of 17)",
+    "init's 3 agent registrations should be one batch",
+    "approve page shows no progress between click and return; its pre-send chain reads are sequential from the browser",
+    "identity line printed twice by the terminal",
+    "passkey init prints no 'gas sponsor on' line"
+  ],
+  "limits": [
+    "one run, one machine, one browser (Safari + iCloud Keychain)",
+    "the 100 s approve gap mixes human time with page time \u2014 instrument the page next"
+  ]
+}
