@@ -653,14 +653,21 @@ async function clearStaleStoreDenies(runtime: Runtime, agentId: Hex): Promise<nu
         ? intent.target.agentId.toLowerCase() === agentId.toLowerCase()
         : (await runtime.reader.getCapability(intent.target.capabilityId))?.agentId.toLowerCase() === agentId.toLowerCase()
     if (!forAgent) continue
-    const reissued = await runtime.ownerApi.reissueRevocationNonce(intent.intentId)
-    const expiresAt = BigInt(Math.floor(Date.now() / 1000)) + DENY_CANCEL_EXPIRY_SECONDS
-    const assertion = runtime.vault.approveDenyCancellation({
-      revocationIntentId: intent.intentId,
-      apiCancellationNonce: BigInt(reissued.cancellationNonce),
-      expiresAt,
-    })
-    await runtime.ownerApi.cancelRevocation(intent.intentId, { expiresAt, assertion })
+    try {
+      const reissued = await runtime.ownerApi.reissueRevocationNonce(intent.intentId)
+      const expiresAt = BigInt(Math.floor(Date.now() / 1000)) + DENY_CANCEL_EXPIRY_SECONDS
+      const assertion = runtime.vault.approveDenyCancellation({
+        revocationIntentId: intent.intentId,
+        apiCancellationNonce: BigInt(reissued.cancellationNonce),
+        expiresAt,
+      })
+      await runtime.ownerApi.cancelRevocation(intent.intentId, { expiresAt, assertion })
+    } catch (error) {
+      // REPLAY means the intent anchored or was cancelled in the gap between list and reissue —
+      // a deny whose revocation really landed is not stale, and clearing it would be the bug.
+      if (isMidaError(error) && error.code === "REPLAY") continue
+      throw error
+    }
     cleared += 1
     runtime.progress?.("cleared a stale block at the store left by a failed revoke")
   }
