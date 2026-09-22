@@ -29,11 +29,11 @@ describe("ownerRefusalLine (R4-5)", () => {
   })
 
   it("an agent the chain already approves gets the this-folder line, not refused: ERROR", () => {
-    expect(ownerRefusalLine("approve", "codex", coded("already-approved"))).toBe(
-      "codex is already approved. To let it use THIS folder too, run `mida approve codex` here (no transaction, nothing to pay).",
-    )
+    // from `approve` the line must never say "run mida approve" — that is the command just run (M3-D4)
+    expect(ownerRefusalLine("approve", "codex", coded("already-approved"))).toBe("codex is already approved on chain")
+    // from `request` the next step really is `approve`: it adds THIS folder with no transaction
     expect(ownerRefusalLine("request", "codex", coded("already-approved"))).toBe(
-      "codex is already approved. To let it use THIS folder too, run `mida approve codex` here (no transaction, nothing to pay).",
+      "codex is already approved on chain. To use it in THIS folder, run `mida approve codex` here (no transaction, nothing to pay).",
     )
   })
 

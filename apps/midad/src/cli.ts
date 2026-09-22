@@ -194,7 +194,8 @@ export async function runCliWithRuntime(
     // The error code only — plus the one plain-English line a code can honestly name.
     const code = (error as { code?: unknown }).code
     if (code === "already-approved") {
-      print(`${agent} is already approved on chain`)
+      // from `request` the next step really is `approve` — that adds THIS folder, no transaction
+      print(`${agent} is already approved on chain. To use it in THIS folder, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`)
     } else {
       print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
     }
@@ -330,9 +331,12 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     case "REQUEST_EXPIRED":
       return `${agent}'s request has expired (a request lasts ${Number(REQUEST_LIFETIME_SECONDS) / 60} minutes): run \`mida request ${agent}\` and approve again`
     case "already-approved":
-      // reached only when no project folder could carry the answer — the folder variants are
-      // printed by the approve branch above
-      return `${agent} is already approved on chain`
+      // from `request` the honest next step is `approve` (it adds THIS folder, no transaction);
+      // from `approve` itself this is reached only when no project folder could carry the answer —
+      // the folder variants are printed by the approve branch above, never "run me again" (M3-D4)
+      return command === "request"
+        ? `${agent} is already approved on chain. To use it in THIS folder, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`
+        : `${agent} is already approved on chain`
     case "no-pending-request":
       return `${agent} has no pending request — run \`mida request ${agent}\` first`
     case "agent-unidentified":
