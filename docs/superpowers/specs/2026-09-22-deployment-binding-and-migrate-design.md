@@ -1,7 +1,8 @@
 # Mida — a setup keeps its contract, and `mida migrate` moves it
 
-Date: 2026-09-22 · Status: design, approved section by section in chat; awaiting Dami's review of
-this file · Nothing in this file is built yet.
+Date: 2026-09-22 · Status: design, approved section by section in chat; revised the same day after
+review (manifest, prepare → commit → verify, sealed envelope; decisions 7-8) · awaiting Dami's
+final review · Nothing in this file is built yet.
 
 Fixes issue-register rows **CHAIN-07, 08, 09, 10, 11** (`docs/issue-register.md` §1E). Adds
 benchmark checks **E6** and **H6** (§3 of that file).
@@ -54,8 +55,9 @@ address and the same old-setup/new-contract situation.
 
 1. A setup keeps the contract it was made on. The code's newest contract is used only for a brand
    new setup. Moving is deliberate, through `mida migrate`.
-2. `migrate` moves **everything**: owner, agents, approvals, approved folders, remembered facts and
-   every session checkpoint.
+2. `migrate` moves **everything**: owner, agents, approvals, approved folders, and every record the
+   owner has on the old contract, in every context area, with its version history and links. Not a
+   fixed list of areas (§5.1).
 3. `migrate` works **in place** in the same folder, and switches the saved contract **last**.
 4. Reading old data: **option 1 now**. Read it from the local store, which is what `~/.mida` uses.
    **Option 2** (migrate before repointing the hosted store) goes into the redeploy checklist (§9).
@@ -63,6 +65,15 @@ address and the same old-setup/new-contract situation.
    built only if hosted setups with real data exist before the next redeploy.
 5. The store and sponsor follow the same "saved choice wins" rule as the contract.
 6. An outdated background service is replaced automatically.
+7. **Migration is transport, not a new event. LOCKED (Dami, Sep 22).** Migration metadata is
+   orthogonal to semantic provenance. A migrated `USER_ASSERTED` record stays `USER_ASSERTED`; no
+   record is relabelled `IMPORTED`. A **sealed migration envelope** inside the encrypted record
+   carries an envelope `version`, the original contract, record ID, on-chain commitment, author and
+   `createdAt`, and `migratedAt` (§5.3). Readers render the original author and time plus "moved on
+   [date]". **No public per-record migration receipts in v0.** Accepted limit: only a reader who can
+   decrypt the record sees that it is a copy.
+8. **The migration is driven by a manifest of every source record, and every write is prepare →
+   commit → verify** (review, Sep 22; §5.1-5.2). Verification is per record, never by counts.
 
 ## 3. One rule for which contract and services a setup uses (CHAIN-07, 08, 11)
 
@@ -109,66 +120,143 @@ contract, and they are not stored.
 
 ## 5. `mida migrate` (software-key setups)
 
-Run in a real terminal, like `approve` (the same terminal check). Every step checks the new
-contract before acting, so a crash and a re-run continue where it stopped. Progress lives in
-`migrate/state.json` (step reached, target contract, counts). It never holds decrypted text.
+Run in a real terminal, like `approve` (the same terminal check). Revised after review (Sep 22):
+the plan is built on a **manifest** of every source record, and every write follows
+**prepare → commit → verify**.
+
+### 5.1 Two rules every step obeys
+
+**Schema-independent.** `migrate` never lists context areas in code. It enumerates every record the
+owner has on the old contract from the chain's own log: `ContextRegistered`, `ContextSuperseded` and
+`EvidenceRegistered`, all indexed by owner (ContextRegistry.sol:88-96), scanned from the owner's
+first block (`owner/start-block.json`, as CHAIN-01's fix does). An area added next year migrates with
+no code change.
+
+**Prepare → commit → verify, for every external write.** Every ID Mida creates on chain comes from a
+random value: an agent's salt (packages/fake-vault/src/agents.ts:59), a record's nonce
+(packages/sdk/src/agent.ts:485). If that value is created and sent in one go, a crash after sending
+and before recording leaves an orphan, and the re-run creates a second one. So:
+
+1. **Prepare**: generate the random value (and, for an agent, its keys), compute the ID it will
+   produce (packages/protocol/src/ids.ts:21-55), and write both to `migrate/state.json` before
+   anything is sent. Secret parts go in 0600 files (check D6).
+2. **Commit**: send exactly the prepared value.
+3. **Verify**: read the new contract and confirm the prepared ID exists. Only then mark the item done.
+
+A re-run finds the prepared value, checks whether its ID is already on chain, and either marks it
+done or sends it. It never generates a new one for an item that already has a prepared value. This
+needs one SDK change: `provisionAgent`, `MidaAgent#write` and the owner write path accept a
+caller-supplied salt or nonce (optional; default behaviour unchanged).
+
+### 5.2 The manifest
+
+Built in step 3 and kept in `migrate/state.json`. It is the correctness condition, not a diagnostic.
+It holds no plaintext. One entry per source record:
+
+| Field | Meaning |
+|---|---|
+| `sourceId` | the record's ID on the old contract |
+| `sourceCommitment` | the record's on-chain `manifestHash` on the old contract |
+| `namespace`, `authorId`, `authorName` | where it lives and who wrote it (name from `authorNamesFor`; the owner for facts) |
+| `provenanceSource` | its on-chain label, copied unchanged |
+| `createdAt` | original time: the payload's own for checkpoints, the on-chain record's for facts |
+| `lineageId`, `version`, `parentId` | its place in a version history (`ContextSuperseded`) |
+| `relations` | the other records it points at (`supports` / `derived_from` / `confirmed_from`) |
+| `fingerprint` | HMAC-SHA256 of the decrypted, canonical payload, keyed by a random per-migration key kept in the 0600 state file (a plain hash of a short fact could be guessed) |
+| `preparedNonce`, `targetId` | from 5.1, filled in step 5 |
+| `status` | `pending` / `sent` / `verified` / `skipped:<reason>` |
+
+The source contract has no content address that survives the move: IDs are nonce-based and
+contract-bound (ids.ts:35-55), and re-encryption produces new ciphertext. So the fingerprint is
+computed by `migrate` from the decrypted content, on both sides.
+
+### 5.3 The migration envelope
+
+Every migrated record carries, inside its encrypted payload, next to the original content:
+
+```
+migration:
+  version: 1
+  originalChainId: 10143
+  originalContract: 0xf07d…            # the old ContextRegistry
+  originalRecordId: 0x…                # sourceId
+  originalCommitment: 0x…              # the old record's on-chain manifestHash
+  originalAuthor: 0x…                  # old on-chain author ID (agent ID, or the owner marker)
+  originalCreatedAt: 2026-09-18T…      # as in the manifest
+  migratedAt: 2026-09-25T…
+```
+
+The on-chain provenance label is the original one (decision 7). Readers that show provenance
+(handoff, `read`, the MCP `read` tool) print "(moved <date>)" after the original attribution.
+
+**What `originalCommitment` lets Mida check.** Anyone who can decrypt the migrated record can read
+`originalRecordId` from the old contract and confirm its on-chain commitment equals
+`originalCommitment`. That proves the claimed source exists and was committed exactly so. It holds as
+long as the old contract is readable. It does **not** by itself prove the migrated content equals the
+source content. That second check needs the old ciphertext, and it runs once, in step 6, while the
+local store still has it.
+
+### 5.4 Steps
 
 **Preview, then `yes`:**
 `this setup is on 0xf07d…; it will move to 0xabbd…: 1 owner, 3 agents, 5 approvals, 4 approved
-folders, N facts, M checkpoints; gas paid by sponsor.midacontext.xyz`. Anything other than `yes`
-stops the command with nothing changed.
-
-**Steps:**
+folders, N records in K areas (F facts, C checkpoints, V superseded versions, E evidence records);
+gas paid by sponsor.midacontext.xyz`. Counts come from the manifest. Anything but `yes` stops with
+nothing changed.
 
 1. **Pause capture.** Write `migrate/in-progress` and stop this setup's service. While the marker
-   exists, `inject-main`, `mcp-main` and `ensureDaemon` do not start a service. The hooks keep
-   queuing to `queue/` on disk, so sessions are saved to the new contract after the switch.
+   exists, `inject-main`, `mcp-main` and `ensureDaemon` do not start a service. Hooks keep queuing to
+   `queue/` on disk; those sessions save to the new contract after the switch.
 2. **Back up** `network.json`, `agents/`, `approved-projects.json` and `state/` to
-   `migrate/backup-<ISO date>/`. The old contract is never written to, so this backup plus the old
-   contract is a complete undo.
-3. **Read the old side, in memory only.** Start a local store on `~/.mida/data` for the old
-   contract. Read every checkpoint through an agent holding READ on `projects.current`
-   (`readCheckpoints`, skeleton.ts:525), and every fact through an agent holding READ on
-   `preferences.communication` and `profile.skills` (`readOwnerFacts`, remember.ts:134). Map each
-   checkpoint's on-chain author ID to an agent name with `authorNamesFor`. A re-run reads again,
-   which is safe because the old side does not change.
-4. **Set up the new side:**
-   - owner key and context areas: `init`'s existing chain-first steps (skeleton.ts:145-159), run
-     against the new contract
-   - each agent: **registered fresh**, into `migrate/agents-new/<name>/`. Its on-chain ID will be
-     new, because the ID is computed from the contract address and a random salt
-     (AgentRegistry.sol:66, packages/protocol/src/ids.ts:21-33). `init`'s "identity file exists,
-     skip" shortcut (skeleton.ts:183) is **not** used.
-   - approvals: each agent gets exactly the scopes it holds live on the old contract. Mida signs the
-     agent's access request itself, because the agent keys are local (skeleton.ts:383-389). The owner
-     sees the same preview as `approve`.
-5. **Copy the data:**
-   - **Facts**, oldest first, so their relative order survives. `readOwnerFacts` orders by the
-     on-chain time, which will be the migration time. Before each write, skip it if the same text is
-     already in the same area on the new contract. A plain `remember` has no such check.
-   - **Checkpoints**, each re-saved by the **new identity of the agent that wrote it**, with its
-     original payload and original `createdAt`. Handoffs order by that field (packages/checkpoint/
-     src/merge.ts:45), so order survives. `saveCheckpoint`'s existing check by event ID skips any
-     already moved. A checkpoint whose writer is not set up on this machine is skipped and listed.
-6. **Verify, before anything switches.** Per agent and per area: count on the new contract ≥ count
-   read from the old one. Build one real handoff from the new side and compare its request and
-   decisions with the old side's. Any shortfall stops the command here with the setup unchanged,
-   and prints what is missing.
+   `migrate/backup-<ISO date>/`. The old contract is never written to, so backup + old contract is a
+   complete undo.
+3. **Build the manifest from the old side.** Start a local store on `~/.mida/data` for the old
+   contract. Enumerate every record (5.1). Decrypt each with the owner's keys (see §11: to be proven
+   for areas no local agent reads). Fill every manifest field. Plaintext stays in memory. A re-run
+   rebuilds the source half the same way, because the old side does not change, and keeps the
+   prepared/target half already on disk.
+4. **Set up the new side, prepare → commit → verify:**
+   - owner key and context areas: `init`'s chain-first steps (skeleton.ts:145-159) against the new
+     contract, for **every area that has a record in the manifest**, not a fixed list
+   - each agent: prepared identity (keys + salt + computed agent ID) persisted, then registered,
+     then confirmed. `init`'s "identity file exists, skip" shortcut (skeleton.ts:183) is not used.
+     The mapping `oldAgentId → newAgentId` goes into the manifest.
+   - approvals: each agent gets exactly the scopes it holds live on the old contract, via an access
+     request Mida signs with the prepared agent key (skeleton.ts:383-389). The owner sees `approve`'s
+     preview, one `yes` per agent.
+5. **Copy every record, in dependency order**: roots before their superseding versions (by
+   `version`), and any record before the records that point at it. For each: prepare nonce and target
+   ID → write the original payload plus envelope (5.3), under the original provenance label, by the
+   new identity of its original author (the owner for owner-authored records), with its `relations`
+   rewritten old ID → new ID from the manifest → verify on chain. Supersedes are replayed as
+   supersedes of the new root, so each version history keeps its shape. A record whose author is not
+   set up on this machine is `skipped:unknown-author` and listed. **No "same text already exists"
+   check**: identity is the manifest entry, never text.
+6. **Verify every entry, before anything switches.** For each manifest entry that is not skipped:
+   the target record exists on the new contract; decrypting it gives the same fingerprint; its label,
+   namespace, author mapping, version position and rewritten relations match; its envelope names the
+   right source, and `originalCommitment` equals the old contract's on-chain value for
+   `originalRecordId`. Also: no record exists on the new contract under this owner that the manifest
+   does not account for. Counts are printed as a summary only. Any mismatch stops here with the setup
+   unchanged and lists each failing `sourceId`. A final handoff built from the new side is compared
+   with the old one as a smoke test, not as the proof.
 7. **Switch, the only step that changes how the setup behaves:**
-   - move `migrate/agents-new/*` into `agents/`, replacing the old identity files, which stay in the backup
+   - move the prepared agent identities into `agents/` (old ones stay in the backup)
    - delete what belongs only to the old contract: `agents/*/grants.json` (rewritten by step 4),
      `pending-request.json`, `revoked.json`, `revoke-pending.json`, `requests/`,
-     `state/saved-ids.json`. `approved-projects.json` stays unchanged, because its signature covers
-     no contract address (projects.ts:42-47).
-   - write `network.json` with the new contract, and the old one under `previous`, with `migratedAt`
-   - remove `migrate/in-progress`, start the service, and print
-     `moved to 0xabbd…. Undo with \`mida migrate --undo\`.`
+     `state/saved-ids.json`. `approved-projects.json` stays unchanged: its signature covers no
+     contract address (projects.ts:42-47).
+   - write `network.json` with the new contract, the old one under `previous`, plus `migratedAt`
+     and the path of the kept manifest (`migrate/manifest-<date>.json`, fingerprints and IDs only)
+   - remove `migrate/in-progress`, start the service, print
+     `moved N records to 0xabbd…. Undo with \`mida migrate --undo\`.`
 
 `state/history/*` and `owner/start-block.json` check their own contract and ignore a mismatch
 (skeleton.ts:290, keys.ts:158). They need no step.
 
-**`mida migrate --undo`** restores the newest backup, stops and restarts the service, and says which
-contract the setup is on now. It refuses if no backup exists.
+**`mida migrate --undo`** restores the newest backup, restarts the service, and says which contract
+the setup is on. It refuses if no backup exists. Records already written to the new contract stay
+there, unused; a later `migrate` reuses them through the kept manifest instead of writing them again.
 
 ## 6. An outdated background service is replaced (CHAIN-10)
 
@@ -191,7 +279,12 @@ New: `apps/midad/src/network.ts` (`resolveNetwork`), `apps/midad/src/migrate.ts`
 path, mismatch line), `daemon-main.ts`, `drain-main.ts`, `doctor.ts`, `daemon.ts` (`/health`
 fields, `/shutdown`, `debug` in `/cli`), `control.ts` (`ensureDaemon` comparison, `migrating`
 marker), `inject-main.ts`, `mcp-main.ts`, `skeleton.ts` (`init` refusal), `testnet.ts`,
-`packages/chain/src/registry.ts` (`toMidaError`), `packages/sdk/src/connect.ts`. No contract changes.
+`packages/chain/src/registry.ts` (`toMidaError`), `packages/sdk/src/connect.ts`,
+`packages/sdk/src/agent.ts` and `packages/fake-vault/src/agents.ts` (optional caller-supplied nonce /
+salt, §5.1), the owner write path used by `remember`, the checkpoint and fact payload readers
+(`packages/checkpoint`, `handoff.ts`, `remember.ts`, MCP `read`) to carry and render the envelope.
+New: `apps/midad/src/migrate-manifest.ts` (enumeration, fingerprints, dependency order).
+No contract changes.
 
 ## 8. How it fails, and what happens
 
@@ -201,10 +294,13 @@ marker), `inject-main.ts`, `mcp-main.ts`, `skeleton.ts` (`init` refusal), `testn
 | Already on the target contract | `already on 0xabbd… — nothing to move` |
 | Old store unreadable (e.g. `home-hosted`, whose store now serves the new contract) | says so, offers to move access only; a second `yes` is required |
 | Sponsor does not serve the target contract and the wallets cannot pay | refused before step 1, naming the address to fund and the amount |
-| Crash at any step | re-run continues; nothing is written twice (checked on the new contract each time) |
-| Verify finds a shortfall | stops before the switch; setup unchanged; prints per-agent / per-area gaps |
+| Crash after a transaction is sent but before it is recorded | the prepared salt / nonce is already on disk; the re-run computes its ID, finds it on chain, marks it done. No orphan agent, no duplicate record |
+| Crash before anything is prepared | the re-run prepares fresh values; nothing was sent, so nothing is orphaned |
+| Verify finds any entry wrong (missing, wrong fingerprint, wrong label, wrong relation, wrong envelope, commitment mismatch) or an unaccounted record on the new contract | stops before the switch; setup unchanged; lists each failing `sourceId` and why |
 | Hook fires mid-migration | queued on disk; saved to the new contract after the switch |
-| A checkpoint's writer is not set up here | skipped, listed by author ID and count |
+| A record's author is not set up here | `skipped:unknown-author`, listed by author ID and count; the preview shows it before `yes` |
+| A record points at a record that was skipped | it is skipped too (`skipped:dangling-relation`), and listed; never written with a broken link |
+| An area on the old contract has no owner key to decrypt it | stops at step 3 before anything is written, naming the area |
 | `--undo` with no backup | refused |
 | Old service will not stop | refused before step 2, naming the process |
 
@@ -225,10 +321,20 @@ marker), `inject-main.ts`, `mcp-main.ts`, `skeleton.ts` (`init` refusal), `testn
   `refused: ERROR`. `MIDA_DEBUG=1 mida request` prints exactly one masked `debug:` line.
 - **H6 (new):** service started from folder A, command run from folder B. The service is replaced
   before the command runs. Queue job count is unchanged.
-- **Migrate end to end** on a local chain with two deployments: handoff content, approved folders
-  and fact order match before and after.
-- **H1 (extended):** kill `migrate` at each step boundary, re-run, and check for zero duplicate
-  facts, checkpoints or registrations. `--undo` restores a working old setup.
+- **Migrate end to end** on a local chain with two deployments, with a source seeded to include: a
+  fact in an area `remember` does not use today, a superseded version history (v1→v3), a record with
+  a `derived_from` link, two facts with identical text, and a record by an agent not set up locally.
+  Pass = every non-skipped manifest entry verifies individually; the identical-text facts both
+  arrive; versions and links keep their shape; handoff content, approved folders and fact order
+  match; readers print "moved on [date]" and the original author and time.
+- **Verification catches substitution:** tamper the destination (drop one record and add an
+  unrelated one, keeping the count equal; or add extras so the count exceeds the source). Step 6
+  must fail and name the missing `sourceId`.
+- **Envelope check:** for every migrated record, `originalCommitment` equals the old contract's
+  on-chain commitment for `originalRecordId`; a forged envelope fails.
+- **H1 (extended):** kill `migrate` between prepare and commit, and between commit and verify, for an
+  agent registration, a fact and a checkpoint. Re-run. Zero orphan agents, zero duplicate records.
+  `--undo` restores a working old setup.
 - **Testnet (T):** one real run on a **copy** of `~/.mida` (`cp -R` to a new `MIDA_HOME`) before the
   real one.
 
@@ -241,6 +347,18 @@ marker), `inject-main.ts`, `mcp-main.ts`, `skeleton.ts` (`init` refusal), `testn
   assumed from its policy (sponsor-worker/src/policy.ts:431), not run.
 - Whether `approve`'s preview can take several agents in one confirmation, or needs one `yes` per
   agent, is a plan-time choice. One per agent is the safe default.
+- **The owner can decrypt every area it owns**, including areas no local agent reads. Believed from
+  how areas are initialised (the owner creates each area's key), not checked. If false, step 3 needs
+  a different read path. Second thing the plan tests.
+- **The checkpoint schema accepts the envelope.** `packages/checkpoint/src/schema.ts` validates
+  fields strictly (schema.ts:109). The envelope may need to sit beside the checkpoint in the sealed
+  object rather than inside it. Plan-time choice; either way it is inside the ciphertext.
+- **Enumerating by owner from the log** is assumed to return every record, including evidence
+  records and supersedes. The event shapes are read (ContextRegistry.sol:88-96); a full owner
+  enumeration has not been run. Its cost grows with the owner's age (CHAIN-03).
+- **Caller-supplied nonce and salt** change two SDK signatures. Other callers keep the random
+  default; no protocol or contract change is needed, because the IDs are already computed from these
+  values (ids.ts:21-55).
 
 ## 12. Out of scope
 
