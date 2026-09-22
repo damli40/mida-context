@@ -258,6 +258,37 @@ node agent.mjs
 
 *Status: RUN on local Anvil — `apps/midad/test/connect.e2e.test.ts` executes this exact sequence (connect → request → `mida approve` → create → read → `mida revoke` → refused) against a fresh chain, and `pnpm check:publish` runs and type-checks an SDK consumer installed from the packed tarball. NOT RUN on the live testnet.*
 
+## The compile model: DeepSeek by default — RUN (benchmarked)
+
+Every checkpoint save runs one compile call: the session's transcript text (secrets scrubbed first) goes to a model that returns the compact checkpoint. You choose the provider:
+
+| Provider | You set | Model | Measured on the same transcript |
+|---|---|---|---|
+| **DeepSeek — default** | `DEEPSEEK_API_KEY` | `deepseek-flash` | **7.9 s median**, 15/15 checks, 3/3 runs |
+| Kimi | `KIMI_API_KEY` | `kimi-k2.7-code-highspeed` | 10.4 s median, 15/15, 3/3 |
+| Claude Haiku | nothing — uses your `claude` CLI login | `claude-haiku` | 22.6 s median, 15/15, 3/3 |
+
+With no keys at all the compiler is Haiku through the `claude` CLI — no extra setup, just slower. Set `DEEPSEEK_API_KEY` and DeepSeek takes over: it is roughly 10× cheaper than the others and has no fixed requests-per-minute cap. (DeepSeek charges double during UTC weekday mornings — even at peak it stays far below the alternatives.) If a call fails — rate limit, 5xx, timeout, or output that is not usable JSON — the compile walks to the next provider that is configured, ending at Haiku; each provider is tried at most once per compile and the checkpoint records which one actually wrote it.
+
+`MIDA_COMPILE_MODEL` pins the choice: `deepseek` | `kimi` | `haiku` | `custom`. Per-provider overrides: `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` / `DEEPSEEK_TIMEOUT_MS`, and the same trio for `KIMI_*`. `mida doctor` prints which provider is active, which host the text goes to, and the fallback chain — hosts only, never a full URL (its path could carry a key).
+
+*Measured numbers and method: `docs/evidence/compile-model-speed-deepseek-2026-09-22.json` (DeepSeek) and `docs/evidence/compile-model-speed-2026-09-21.json` (Kimi, Haiku) — same 62-line transcript, 15 must-keep items checked per run. `deepseek-v4-pro` was benchmarked and rejected (~70 s, one no-JSON failure) — it is not offered.*
+
+### Run your own compiler
+
+Point the compile call at any OpenAI-compatible endpoint — a local Ollama-style server is the example:
+
+```bash
+MIDA_COMPILE_MODEL=custom
+MIDA_COMPILE_BASE_URL=http://127.0.0.1:11434/v1
+MIDA_COMPILE_MODEL_ID=<the model name your server serves>
+# MIDA_COMPILE_API_KEY=…   optional — a local server usually needs none
+```
+
+http is allowed only on loopback (`127.0.0.1`, `localhost`, `::1`) — a remote endpoint must be https. Choosing `custom` is a privacy decision: **a failed custom compile has no fallback** — Mida will not silently send your transcript to a vendor — unless you set `MIDA_COMPILE_FALLBACK=1` to opt back into the vendor chain.
+
+The honest limit: Mida cannot judge a custom model's output quality. The benchmark harness under `bench/` (the same transcript + 15 must-keep checks the numbers above come from) is how you check yours before trusting it.
+
 ## Defaults and overrides
 
 | Setting | Default | Override | `"off"` means |
@@ -266,5 +297,6 @@ node agent.mjs
 | Gas sponsor | `https://sponsor.midacontext.xyz` | `MIDA_SPONSOR_URL` | wallets pay their own gas (testnet MON needed) |
 | Mida home | `~/.mida` | `MIDA_HOME` | — |
 | Monad testnet RPC | public endpoint | `MONAD_TESTNET_RPC` | — |
+| Compile model | `deepseek` if `DEEPSEEK_API_KEY` is set, else `kimi`, else `claude-haiku` | `MIDA_COMPILE_MODEL` | — |
 
 `mida doctor` shows which are in effect — host names only, never values that could be secrets.

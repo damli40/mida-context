@@ -1,0 +1,103 @@
+{
+  "date": "2026-09-22",
+  "what": "Same synthetic transcript and 15 must-keep checks as compile-model-speed-2026-09-21.json, run against DeepSeek's two API models through the compiler's OpenAI-compatible model command (3 runs each, 3 s apart, no rate spacing needed).",
+  "limits": [
+    "synthetic 62-line transcript (about 10 KB), not a real session",
+    "3 runs per model",
+    "one scorer (regex checks on named checkpoint fields)",
+    "deepseek-flash is the id DeepSeek's model list returns; the marketing name (V4.1 Flash) is not verified by us",
+    "no mid-session-correction test yet \u2014 that is the M4 dry run"
+  ],
+  "summary": {
+    "deepseek-flash": {
+      "runsOk": 3,
+      "runs": 3,
+      "medianWallMs": 7914,
+      "kept": [
+        "15/15",
+        "15/15",
+        "15/15"
+      ],
+      "leaked": false
+    },
+    "deepseek-v4-pro": {
+      "runsOk": 2,
+      "runs": 3,
+      "medianWallMs": 72743.0,
+      "kept": [
+        "15/15",
+        "15/15"
+      ],
+      "leaked": false
+    }
+  },
+  "rows": [
+    {
+      "model": "deepseek-flash",
+      "run": 1,
+      "ok": true,
+      "wallMs": 11134,
+      "modelMs": 11125,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 6364
+    },
+    {
+      "model": "deepseek-flash",
+      "run": 2,
+      "ok": true,
+      "wallMs": 7914,
+      "modelMs": 7912,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 5107
+    },
+    {
+      "model": "deepseek-flash",
+      "run": 3,
+      "ok": true,
+      "wallMs": 7408,
+      "modelMs": 7406,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 5097
+    },
+    {
+      "model": "deepseek-v4-pro",
+      "run": 1,
+      "ok": true,
+      "wallMs": 77360,
+      "modelMs": 77357,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 5030
+    },
+    {
+      "model": "deepseek-v4-pro",
+      "run": 2,
+      "ok": false,
+      "reason": "no-json",
+      "wallMs": 105020
+    },
+    {
+      "model": "deepseek-v4-pro",
+      "run": 3,
+      "ok": true,
+      "wallMs": 68126,
+      "modelMs": 68122,
+      "kept": 15,
+      "of": 15,
+      "missed": [],
+      "leaked": false,
+      "chars": 4894
+    }
+  ]
+}

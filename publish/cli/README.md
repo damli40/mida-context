@@ -27,7 +27,7 @@ Requires Node 22+. See `docs/quickstart.md` in the repository for the full walkt
 - `MIDA_STORAGE_URL` — Context API endpoint (default: the hosted store; `off` runs a local store)
 - `MIDA_SPONSOR_URL` — gas sponsor endpoint (default: the hosted sponsor; `off` pays own gas)
 - `MONAD_TESTNET_RPC` — RPC endpoint
-- `KIMI_API_KEY`, `KIMI_BASE_URL`, `KIMI_MODEL`, `MIDA_COMPILE_MODEL` — checkpoint compiler
+- `DEEPSEEK_API_KEY` (default provider), `KIMI_API_KEY`, `MIDA_COMPILE_MODEL` (`deepseek`|`kimi`|`haiku`|`custom`), `MIDA_COMPILE_BASE_URL` + `MIDA_COMPILE_MODEL_ID` for your own endpoint — checkpoint compiler
 - `MIDA_CLAUDE_SETTINGS`, `MIDA_CODEX_CONFIG` — hook config file overrides
 - `MIDA_DEBUG=1` — one extra debug line on owner-command refusals
 
