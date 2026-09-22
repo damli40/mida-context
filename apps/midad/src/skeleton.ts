@@ -122,10 +122,15 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
   // ask the chain about grants — it never reads owner/secrets.json, so the address is public metadata.
   saveOwnerAddress(home, owner)
   // With a gas sponsor every send below is paid by the sponsor — a brand-new empty owner wallet
-  // inits fine (M3-C). Without one the owner pays for everything, so the wallet must hold gas
-  // first: the refusal names the address to fund and a re-run resumes where this one stopped.
+  // inits fine (M3-C), and no wallet needs MON up front: not the owner's, not the operator's, not
+  // an agent signer's (M3-D3). Without one the owner pays for everything, so the wallet must hold
+  // gas first: the refusal names the address to fund and a re-run resumes where this one stopped.
   const sponsorUrl = parseSponsorUrl(network.sponsorUrl)
-  if (sponsorUrl === undefined) await runtime.ensureFunded(owner, "your wallet")
+  if (sponsorUrl === undefined) {
+    await runtime.ensureFunded(owner, "your wallet")
+  } else {
+    runtime.progress?.("gas sponsor on — no MON needed")
+  }
   const ownerKey = await reader.ownerP256Key(owner)
   if (ownerKey == null || ownerKey.qx === 0n) {
     runtime.progress?.("registering your key on the chain…")
