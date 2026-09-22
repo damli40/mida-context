@@ -258,6 +258,39 @@ node agent.mjs
 
 *Status: RUN on local Anvil — `apps/midad/test/connect.e2e.test.ts` executes this exact sequence (connect → request → `mida approve` → create → read → `mida revoke` → refused) against a fresh chain, and `pnpm check:publish` runs and type-checks an SDK consumer installed from the packed tarball. NOT RUN on the live testnet.*
 
+## 12. Use Mida from Claude Desktop / Cursor — RUN in tests
+
+Agents that speak MCP instead of hooks — Claude Desktop, Cursor, Codex's MCP support — reach the same daemon through `mida-mcp`: a local, stdio MCP server that is a client of the midad socket, exactly like the hooks. It holds no keys and signs nothing.
+
+Claude Desktop's `claude_desktop_config.json` (Settings → Developer → MCP servers), or Cursor's `.cursor/mcp.json` — the same shape in both:
+
+```json
+{
+  "mcpServers": {
+    "mida": {
+      "command": "<absolute path to mida-mcp>",
+      "args": ["--as", "assistant"]
+    }
+  }
+}
+```
+
+The command is the installed `mida-mcp` bin by absolute path (`which mida-mcp` prints it; from a source checkout it is `<repo>/bin/mida-mcp`). `--as` names which agent identity the server reports — `claude-code`, `codex` or `assistant` (the default); add `"--project", "<dir>"` if the client launches it somewhere other than your project folder. The approval step is the same per-folder command the hooks use:
+
+```bash
+mida request assistant && mida approve assistant
+```
+
+The client then sees four tools — `mida_handoff` (the same text a session-start hook would inject), `mida_whats_new` (the per-prompt note), `mida_read` (a context namespace) and `mida_status` (health plus each agent's verdict for this folder). `mida doctor` prints `ok: mida-mcp resolves to <path>` once the package is installed.
+
+The honest limits:
+
+- **Local only.** It is stdio on this machine, talking to midad's Unix socket — there is no remote MCP endpoint to point a hosted client at.
+- **Read-only.** No write tool exists in this round — a model cannot save, remember, approve or revoke through MCP until the owner decides that is wanted.
+- **ChatGPT web connectors are not supported.** Remote MCP needs a key held in the cloud that can sign for the agent, and Mida's design keeps signing keys on your machine.
+
+*Status: RUN in tests — `apps/midad/test/mcp.test.ts` drives the server over the SDK's in-memory transport against a fake daemon socket, including the not-approved, revoked and daemon-down answers. NOT RUN against a real MCP client.*
+
 ## The compile model: DeepSeek by default — RUN (benchmarked)
 
 Every checkpoint save runs one compile call: the session's transcript text (secrets scrubbed first) goes to a model that returns the compact checkpoint. You choose the provider:
