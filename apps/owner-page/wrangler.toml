@@ -1,0 +1,22 @@
+name = "mida-owner-page"
+main = "src/worker.ts"
+compatibility_date = "2026-09-21"
+
+# The Worker only serves the static bundle produced by `node scripts/build.mjs` — no databases,
+# no secrets, no node imports, so no compatibility flags and no [vars] are needed.
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+# Without this, Cloudflare can answer with the static file before the Worker runs — the security
+# headers (CSP, frame-ancestors, nosniff) live in the Worker, so skipping it strips them off the page.
+run_worker_first = true
+# Without this, /check and /check.html redirect into each other forever (the owner hit that loop live):
+# assets rewrites the extensionless URL to .html and the Worker's own rewrite points it back.
+html_handling = "none"
+
+# Reviewer: enable the real domain by uncommenting this route. The page must be reached on the
+# rpId it registers passkeys for — https://midacontext.xyz — a passkey created on localhost or a
+# workers.dev URL proves nothing about the real design.
+# routes = [
+#   { pattern = "midacontext.xyz/check*", zone_name = "midacontext.xyz" }
+# ]

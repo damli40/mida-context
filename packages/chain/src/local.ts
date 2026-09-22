@@ -5,7 +5,7 @@ import { createServer } from "node:net"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
 import type { Hex } from "@mida/protocol"
-import { loadDeployment } from "./deployment.js"
+import { loadDeployment } from "./deployment-fs.js"
 import type { Deployment } from "./deployment.js"
 
 /** Development tooling for tests and the CLI. Never used against a real network. */

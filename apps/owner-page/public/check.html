@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mida — passkey device check</title>
+  <link rel="stylesheet" href="./check.css">
+  <script src="./check.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Mida passkey device check</h1>
+    <p class="purpose">
+      This page checks what this device and browser can do with a passkey — it is a device check, not the product.
+    </p>
+
+    <section class="challenge">
+      <h2>The challenge the passkey will sign</h2>
+      <p>A fixed, obviously fake 32-byte test value (hex) — not a secret, and not the product's real challenge.</p>
+      <code id="challenge-hex">…</code>
+    </section>
+
+    <section class="actions">
+      <button id="btn-create" type="button">Create a test passkey</button>
+      <button id="btn-use" type="button">Use my test passkey</button>
+      <button id="btn-copy" type="button">Copy report</button>
+      <button id="btn-forget" type="button" class="link">Forget this test passkey</button>
+    </section>
+
+    <p id="note" class="note" role="status"></p>
+
+    <section>
+      <h2>What this device answered</h2>
+      <ul id="checklist">
+        <li data-line="secure-context" class="check unknown">
+          <strong>Secure context &amp; WebAuthn.</strong>
+          <span class="detail">Not checked yet.</span>
+        </li>
+        <li data-line="prf" class="check unknown">
+          <strong>The passkey returns its secret bytes (PRF).</strong>
+          <span class="detail">Not checked yet.</span>
+        </li>
+        <li data-line="algorithm" class="check unknown">
+          <strong>Key type is ES256.</strong>
+          <span class="detail">Not checked yet.</span>
+        </li>
+        <li data-line="public-key" class="check unknown">
+          <strong>The public key was captured.</strong>
+          <span class="detail">Not checked yet.</span>
+        </li>
+        <li data-line="browser-verify" class="check unknown">
+          <strong>The assertion verifies in this browser.</strong>
+          <span class="detail">Not checked yet.</span>
+        </li>
+        <li data-line="chain-verify" class="check unknown">
+          <strong>The same signature verifies on Monad.</strong>
+          <span class="detail">Not checked yet.</span>
+        </li>
+        <li data-line="prompt-count" class="check unknown">
+          <strong>Prompts per click.</strong>
+          <span class="detail">Not checked yet.</span>
+        </li>
+        <li data-line="determinism" class="check unknown">
+          <strong>The same secret every time.</strong>
+          <span class="detail">Not checked yet.</span>
+        </li>
+        <li data-line="environment" class="check unknown">
+          <strong>Browser, OS, authenticator.</strong>
+          <span class="detail">Not checked yet.</span>
+        </li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Report</h2>
+      <p>"Copy report" puts this checklist on your clipboard as JSON. It contains public values only — public key, algorithm, flags, counts, a 4-byte fingerprint of the secret, and your user agent. No secret bytes ever leave this page.</p>
+      <pre id="report-json" class="report"></pre>
+    </section>
+  </main>
+</body>
+</html>

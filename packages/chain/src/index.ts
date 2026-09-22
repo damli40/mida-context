@@ -1,5 +1,6 @@
 export * from "./abis.js"
 export * from "./deployment.js"
+export * from "./deployment-fs.js"
 export * from "./logs.js"
 export * from "./history.js"
 export * from "./registry.js"

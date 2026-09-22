@@ -1,7 +1,4 @@
-import { readFileSync } from "node:fs"
-import { fileURLToPath } from "node:url"
 import { MidaError, assertHex } from "@mida/protocol"
-import { EMBEDDED_DEPLOYMENTS } from "./deployments.generated.js"
 import type { Address, Hex } from "@mida/protocol"
 import type { Chain } from "viem"
 import { foundry, monadTestnet } from "viem/chains"
@@ -20,16 +17,9 @@ export interface Deployment {
 export const LOCAL_CHAIN_ID = 31337n
 export const MONAD_TESTNET_CHAIN_ID = 10143n
 
-let deploymentsDir: string | undefined
-/**
- * The contracts/deployments directory, resolved on first use and cached. It must stay lazy: this module is
- * bundled into the store Worker, where `import.meta.url` is not a parseable URL — evaluating
- * fileURLToPath(new URL(…)) at module scope would throw on startup. The Worker never calls this.
- */
-export function DEFAULT_DEPLOYMENTS_DIR(): string {
-  return (deploymentsDir ??= fileURLToPath(new URL("../../../contracts/deployments/", import.meta.url)))
-}
-
+// The filesystem side of deployment loading (loadDeployment, DEFAULT_DEPLOYMENTS_DIR) lives in
+// deployment-fs.js so this module carries no node: specifier — writes.js, registry.js,
+// sponsored.js and the owner-page browser bundle all import from here.
 function wire(detail: string): never {
   throw new MidaError("INVALID_WIRE", `deployment: ${detail}`)
 }
@@ -59,35 +49,6 @@ export function parseDeployment(json: unknown): Deployment {
     vaultRpId: record.vaultRpId,
     vaultRpIdHash: assertHex(record.vaultRpIdHash.toLowerCase(), 32),
   }
-}
-
-/**
- * The deployment record for a chain. An explicit `directory` always wins — that stays the
- * local-Anvil override (its 31337.json is gitignored and is never embedded). Without one, the
- * committed record compiled into this package answers first, so a bundled binary needs no
- * contracts/deployments folder; a chain with no embedded record still falls back to the
- * source-tree file (the repo's own dev runs).
- */
-export function loadDeployment(chainId: bigint, directory?: string): Deployment {
-  if (directory === undefined) {
-    const embedded = EMBEDDED_DEPLOYMENTS[chainId.toString()]
-    if (embedded !== undefined) {
-      const deployment = parseDeployment(embedded)
-      if (deployment.chainId !== chainId) wire(`the embedded deployment is for chain ${deployment.chainId}`)
-      return deployment
-    }
-    directory = DEFAULT_DEPLOYMENTS_DIR()
-  }
-  const path = `${directory.replace(/\/$/, "")}/${chainId}.json`
-  let text: string
-  try {
-    text = readFileSync(path, "utf8")
-  } catch {
-    throw new MidaError("NOT_FOUND", `no deployment file at ${path}`)
-  }
-  const deployment = parseDeployment(JSON.parse(text))
-  if (deployment.chainId !== chainId) wire(`${path} is for chain ${deployment.chainId}`)
-  return deployment
 }
 
 /** Only the two networks Project 1 targets. Monad testnet comes from viem, never a hand-written object. */

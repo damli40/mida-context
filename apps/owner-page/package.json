@@ -1,20 +1,21 @@
 {
-  "name": "@mida/fake-vault",
+  "name": "@mida/owner-page",
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "exports": {
-    ".": "./src/index.ts",
-    "./browser": "./src/browser.ts"
-  },
   "dependencies": {
+    "@category-labs/mera": "0.2.0",
+    "@mida/api": "workspace:*",
     "@mida/chain": "workspace:*",
     "@mida/crypto": "workspace:*",
+    "@mida/fake-vault": "workspace:*",
     "@mida/grant-advisor": "workspace:*",
     "@mida/protocol": "workspace:*",
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",
-    "ox": "1.7.4",
     "viem": "2.56.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }

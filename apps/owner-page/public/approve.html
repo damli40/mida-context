@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mida — approve an agent</title>
+  <link rel="stylesheet" href="./owner.css">
+  <script src="./approve.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>An agent is asking for access</h1>
+    <p>Read what it wants below. Approving signs the grant with your passkey — one touch.</p>
+
+    <section class="pairing">
+      <p id="pairing-label">Only approve if this code matches your terminal:</p>
+      <code id="pairing-code">…</code>
+    </section>
+
+    <p class="identity" id="identity-line"></p>
+
+    <pre id="summary">Checking the request…</pre>
+
+    <section id="sign-list"></section>
+
+    <button id="go" type="button" disabled>Use your passkey to approve</button>
+
+    <p id="error" hidden></p>
+    <ul id="progress"></ul>
+
+    <section id="result" hidden>
+      <h2 id="result-status"></h2>
+      <pre id="result-json"></pre>
+    </section>
+  </main>
+</body>
+</html>
