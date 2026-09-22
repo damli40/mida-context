@@ -320,7 +320,7 @@ export async function approve(
   name: string,
   cwd?: string,
   confirm?: (preview: ApprovePreview) => Promise<boolean>,
-): Promise<{ capabilityIds: Hex[]; permissions: number[]; transactionHash: Hex | null; gasUsed: bigint; projectId?: string; droppedRows?: number | null }> {
+): Promise<{ capabilityIds: Hex[]; permissions: number[]; transactionHash: Hex | null; gasUsed: bigint; projectId?: string; projectAlreadyListed?: boolean; droppedRows?: number | null }> {
   const { home, vault, reader, owner } = runtime
   // When a project folder is given its marker is resolved first: a folder that may not hold a
   // project (the owner's home, the filesystem root) is refused with not-a-project before any
@@ -348,17 +348,23 @@ export async function approve(
   }
   let pending = home.readJson<{ request: AccessRequest }>(`agents/${name}/pending-request.json`)
 
+  // When the chain already approves the agent there is nothing to send — but if the command ran in
+  // a project folder, the honest next step is the local list row, which is what the owner was asking
+  // for. The result says whether the row was new so the CLI can say "now approved" only when it was.
+  // `assistant` is never listed: it gets no project approval, ever.
+  const alreadyApprovedResult = async () => {
+    if (cwd === undefined || identity.purposeId !== PURPOSE_ID) {
+      throw codedError("already-approved", `agent "${name}" is already approved`)
+    }
+    if (confirm !== undefined && !(await confirm({ kind: "project", agent: name, projectId: marker!.projectId }))) throw notApprovedError()
+    const listed = await approveProject(runtime, { agent: name, cwd })
+    return { capabilityIds: [] as Hex[], permissions: [] as number[], transactionHash: null, gasUsed: 0n, projectId: listed.approval.projectId, projectAlreadyListed: listed.alreadyListed, droppedRows: listed.droppedRows }
+  }
+
   if (pending === undefined) {
     if (missing.length === 0) {
       if (!live) throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
-      // a second project for an already-approved agent needs no new grant — only the list row.
-      // `assistant` is never listed: it gets no project approval, ever.
-      if (cwd !== undefined && identity.purposeId === PURPOSE_ID) {
-        if (confirm !== undefined && !(await confirm({ kind: "project", agent: name, projectId: marker!.projectId }))) throw notApprovedError()
-        const listed = await approveProject(runtime, { agent: name, cwd })
-        return { capabilityIds: [], permissions: [], transactionHash: null, gasUsed: 0n, projectId: listed.approval.projectId, droppedRows: listed.droppedRows }
-      }
-      throw codedError("already-approved", `agent "${name}" is already approved`)
+      return alreadyApprovedResult()
     }
     if (!live) throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
     // The upgrade path: the agent holds part of the grant (a live capability exists) and no request
@@ -377,7 +383,9 @@ export async function approve(
   // Only what the chain does not already authorize is granted — a request whose scopes are all live
   // mints nothing, so a second approve sends no transaction.
   const needed = await ungrantedScopes(runtime, identity.agentId, pending.request.scopes)
-  if (needed.length === 0) throw codedError("already-approved", `agent "${name}" is already approved`)
+  // A pending request whose scopes are all already live is the same answer: nothing to send, but the
+  // folder still gets its list row when there is one — this is the path the Sep-22 incident hit.
+  if (needed.length === 0) return alreadyApprovedResult()
   // The owner sees the ask and the advisor's advice before anything is signed — only an explicit
   // confirm gets past this point. The question and the answer live in the CLI, which injects it.
   if (confirm !== undefined) {

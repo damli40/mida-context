@@ -190,7 +190,7 @@ function codedError(code: "not-a-project", message: string): Error {
 export async function approveProject(
   runtime: Runtime,
   input: { agent: string; cwd: string; homeDir?: string },
-): Promise<{ approval: ProjectApproval; droppedRows: number | null }> {
+): Promise<{ approval: ProjectApproval; droppedRows: number | null; alreadyListed: boolean }> {
   const marker = ensureProjectMarker(input.cwd, input.homeDir)
   const root = realpathSync(marker.markerDir)
   return serializeListWrite(async () => {
@@ -201,6 +201,11 @@ export async function approveProject(
       throw error
     }
     const entries = file.kind === "signed" ? file.entries : []
+    // whether this exact row was already signed in — the caller's message must not claim a folder
+    // was "now approved" when the list already said so
+    const alreadyListed = entries.some(
+      (e) => e.agent === input.agent && e.projectId === marker.projectId && e.root === root,
+    )
     const kept = entries.filter(
       (e) => !(e.agent === input.agent && e.projectId === marker.projectId && e.root === root),
     )
@@ -212,7 +217,7 @@ export async function approveProject(
     }
     const next = [...kept, approval]
     runtime.home.writeSecretJson(LIST_FILE, { entries: next, signature: await signEntries(runtime, next) })
-    return { approval, droppedRows: file.kind === "bad-signature" ? file.rows : 0 }
+    return { approval, droppedRows: file.kind === "bad-signature" ? file.rows : 0, alreadyListed }
   })
 }
 

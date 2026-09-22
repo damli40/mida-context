@@ -273,6 +273,32 @@ describe("the crude mida command", () => {
     expect(await run2("read", "claude-code", "proj-1")).toBe(1)
   }, 300_000)
 
+  it("an already-approved approve says what the folder listing did — never 'run the command you just ran' (M3-D4)", async () => {
+    // The Sep-22 incident's second lie: approve answered "already approved — to use THIS folder,
+    // run mida approve codex here", naming the very command that was just run. Now the line says
+    // whether the folder's list row was added or was already there.
+    const dir = mkdtempSync(join(tmpdir(), "mida-proj-"))
+    const out: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home,
+        network,
+        cwd: dir,
+        print: (line) => out.push(line),
+        progress: (line) => out.push(line),
+        prompt: async () => "yes",
+        stdinIsTTY: true,
+        stdoutIsTTY: true,
+      })
+    expect(await run2("approve", "codex")).toBe(0)
+    expect(out).toContain("codex is already approved on chain. This folder is now approved for codex too (no transaction).")
+    out.length = 0
+    expect(await run2("approve", "codex")).toBe(0)
+    expect(out).toContain("codex is already approved on chain. This folder was already approved for codex.")
+    // and neither answer tells the owner to re-run the command they just ran
+    expect(out.every((line) => !line.includes("run `mida approve codex` here"))).toBe(true)
+  }, 300_000)
+
   it("never prints a secret: no output line contains any key stored in the home folder", () => {
     const secrets: string[] = []
     const walk = (folder: string) => {

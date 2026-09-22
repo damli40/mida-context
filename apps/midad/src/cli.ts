@@ -194,7 +194,7 @@ export async function runCliWithRuntime(
     // The error code only — plus the one plain-English line a code can honestly name.
     const code = (error as { code?: unknown }).code
     if (code === "already-approved") {
-      print(`${agent} is already approved. To let it use THIS folder too, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`)
+      print(`${agent} is already approved on chain`)
     } else {
       print(`refused: ${typeof code === "string" ? code : "ERROR"}`)
     }
@@ -268,7 +268,11 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       })
       deps.print(
         result.transactionHash === null
-          ? `approved ${agent} for project ${result.projectId}; the on-chain grant was already live`
+          ? // nothing was sent because the chain already approves the agent — the honest answer is
+            // what the folder's list row did, never "run the command you just ran" (M3-D4)
+            result.projectAlreadyListed === true
+            ? `${agent} is already approved on chain. This folder was already approved for ${agent}.`
+            : `${agent} is already approved on chain. This folder is now approved for ${agent} too (no transaction).`
           : `approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}` +
               (result.projectId !== undefined ? ` project ${result.projectId}` : ""),
       )
@@ -323,7 +327,9 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     case "REQUEST_EXPIRED":
       return `${agent}'s request has expired (a request lasts ${Number(REQUEST_LIFETIME_SECONDS) / 60} minutes): run \`mida request ${agent}\` and approve again`
     case "already-approved":
-      return `${agent} is already approved. To let it use THIS folder too, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`
+      // reached only when no project folder could carry the answer — the folder variants are
+      // printed by the approve branch above
+      return `${agent} is already approved on chain`
     case "no-pending-request":
       return `${agent} has no pending request — run \`mida request ${agent}\` first`
     case "agent-unidentified":
