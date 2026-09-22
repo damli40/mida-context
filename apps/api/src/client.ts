@@ -7,6 +7,7 @@ import { AUTH_HEADERS, targetOf } from "./auth.js"
 import { errorFromBody } from "./errors.js"
 import type { WebAuthnAssertionInput } from "./verify-assertion.js"
 import type { AnchoredObject, ObjectUploadBody } from "./wire.js"
+import type { DenyState, RevocationTarget } from "./deny-overlay.js"
 
 export interface ContextApiClientOptions {
   baseUrl: string
@@ -138,6 +139,10 @@ export class ContextApiClient implements ContextApiRoutes {
       body: { expiresAt: input.expiresAt.toString(10), assertion: input.assertion },
     })
   }
+
+  listRevocations(state?: DenyState) {
+    return this.request<RevocationIntentView[]>("GET", "/revocations", state === undefined ? {} : { query: { state } })
+  }
 }
 
 /** Retries `listObjects` performs after the first response still carries `x-mida-partial`. */
@@ -153,6 +158,18 @@ export interface ListObjectsResult {
   partial: boolean
 }
 
+/**
+ * What `GET /revocations` returns per intent: everything an owner needs to find and cancel a stale
+ * deny — except the cancellation nonce, which the store only hands out when the deny is created or
+ * its nonce reissued.
+ */
+export interface RevocationIntentView {
+  intentId: Hex
+  state: DenyState
+  target: RevocationTarget
+  agentEpochAtIntent: string | null
+}
+
 export interface ContextApiRoutes {
   putObject(upload: ObjectUploadBody): Promise<{ contextId: Hex; manifestHash: Hex; state: "pending" }>
   listObjects(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }): Promise<ListObjectsResult>
@@ -163,4 +180,5 @@ export interface ContextApiRoutes {
   getEpochWrap(input: { owner: Address; namespaceId: Hex; readEpoch: bigint; agentId: Hex; agentKeyVersion: number; capabilityId: Hex }): Promise<ReaderEpochWrap>
   requestRevocationDeny(target: { capabilityId: Hex } | { owner: Address; agentId: Hex }): Promise<{ intentId: Hex; state: string; cancellationNonce: string }>
   cancelRevocation(intentId: Hex, input: { expiresAt: bigint; assertion: WebAuthnAssertionInput }): Promise<{ intentId: Hex; state: string }>
+  listRevocations(state?: DenyState): Promise<RevocationIntentView[]>
 }

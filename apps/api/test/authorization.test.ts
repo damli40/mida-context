@@ -236,4 +236,26 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     const cancelled = await ownerClient.request<{ state: string }>("POST", `/revocations/${intent.intentId}/cancel`, { body: { expiresAt: expiresAt.toString(), assertion } })
     expect(cancelled.state).toBe("cancelled")
   })
+
+  it("GET /revocations lists only the signer's intents, filters by state, and never carries the nonce", async () => {
+    // What exists by now, all owned by this vault's owner: a cancelled capability deny for
+    // capabilityA, an anchored one (the real revoke above), an active agent deny for agentA —
+    // its epoch never bumped, the capability revoke did not anchor it — and a cancelled agent
+    // deny for agentE. The stranger owns none of them.
+    const all = await ownerClient.listRevocations()
+    expect(all.length).toBeGreaterThanOrEqual(4)
+    for (const entry of all) {
+      expect(Object.keys(entry).sort()).toEqual(["agentEpochAtIntent", "intentId", "state", "target"])
+    }
+    const states = await ownerClient.listRevocations("active")
+    expect(states).toHaveLength(1)
+    expect(states[0]).toMatchObject({ state: "active", target: { kind: "agent", agentId: agentA.agentId } })
+    const anchored = await ownerClient.listRevocations("anchored")
+    expect(anchored.every((intent) => intent.state === "anchored")).toBe(true)
+    // another signer's list is empty — no cross-owner leakage
+    expect(await strangerClient.listRevocations()).toEqual([])
+    expect(await strangerClient.listRevocations("active")).toEqual([])
+    // an unknown state is a wire error, not a silently empty list
+    await expect(ownerClient.request("GET", "/revocations", { query: { state: "pending" } })).rejects.toMatchObject({ code: "INVALID_WIRE" })
+  })
 })
