@@ -135,7 +135,13 @@ export const CALL_OVERHEAD_PER_CALL = 60_000n
 
 /** Monad bills the gas LIMIT, not gas used — every field gets a hard ceiling. */
 export const VERIFICATION_GAS_CEILING = 500_000n
-export const PRE_VERIFICATION_GAS_CEILING = 500_000n
+/**
+ * preVerificationGas grows with calldata bytes. A three-scope grantBatch carrying the signed
+ * manifest and the owner's passkey assertion measured 547,190 on Monad testnet (Sep 22, live) —
+ * the old 500,000 refused every grant while sponsoring everything smaller. 1,200,000 leaves room
+ * for larger manifests; at testnet prices the worst case adds ~0.06 MON to one sponsored op.
+ */
+export const PRE_VERIFICATION_GAS_CEILING = 1_200_000n
 export const PAYMASTER_GAS_CEILING = 300_000n
 /**
  * Beyond the brief's fields: a user operation also names its own fee caps, and the paymaster is

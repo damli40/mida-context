@@ -732,7 +732,7 @@ describe("the fixed gas ceilings are env-overridable downward only", () => {
   it("unset envs give the built-ins", () => {
     const lines: string[] = []
     const ceilings = resolveGasCeilings({}, (line) => lines.push(line))
-    expect(ceilings).toEqual({ verificationGas: 500_000n, preVerificationGas: 500_000n, paymasterGas: 300_000n, fee: 300_000_000_000n })
+    expect(ceilings).toEqual({ verificationGas: 500_000n, preVerificationGas: 1_200_000n, paymasterGas: 300_000n, fee: 300_000_000_000n })
     expect(lines).toEqual([])
   })
 
@@ -750,7 +750,7 @@ describe("the fixed gas ceilings are env-overridable downward only", () => {
       { VERIFICATION_GAS_CEILING: "600000", PAYMASTER_GAS_CEILING: "300001", FEE_CEILING: "500000000000" },
       (line) => lines.push(line),
     )
-    expect(ceilings).toEqual({ verificationGas: 500_000n, preVerificationGas: 500_000n, paymasterGas: 300_000n, fee: 300_000_000_000n })
+    expect(ceilings).toEqual({ verificationGas: 500_000n, preVerificationGas: 1_200_000n, paymasterGas: 300_000n, fee: 300_000_000_000n })
     expect(lines).toHaveLength(3)
     expect(lines.join(" ")).toMatch(/VERIFICATION_GAS_CEILING/)
     expect(lines.join(" ")).toMatch(/PAYMASTER_GAS_CEILING/)
@@ -764,7 +764,7 @@ describe("the fixed gas ceilings are env-overridable downward only", () => {
       (line) => lines.push(line),
     )
     expect(ceilings.verificationGas).toBe(500_000n)
-    expect(ceilings.preVerificationGas).toBe(500_000n)
+    expect(ceilings.preVerificationGas).toBe(1_200_000n)
     expect(lines).toHaveLength(2)
   })
 })

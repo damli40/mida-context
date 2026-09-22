@@ -243,7 +243,7 @@ describe("checkUserOperation — gas ceilings", () => {
   // Boundary: exactly at the ceiling passes, one over refuses and names the field.
   const cases: [field: string, at: string, over: string][] = [
     ["verificationGasLimit", "0x7a120" /* 500_000 */, "0x7a121"],
-    ["preVerificationGas", "0x7a120", "0x7a121"],
+    ["preVerificationGas", "0x124f80" /* 1_200_000 */, "0x124f81"],
     ["paymasterVerificationGasLimit", "0x493e0" /* 300_000 */, "0x493e1"],
     ["paymasterPostOpGasLimit", "0x493e0", "0x493e1"],
     ["maxFeePerGas", "0x45d964b800" /* 300 gwei */, "0x45d964b801"],
