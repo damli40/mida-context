@@ -8,7 +8,7 @@ import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, pro
 import type { ScopeInput } from "@mida/grant-advisor"
 import type { StoredCheckpoint } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
-import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl } from "./runtime.js"
+import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl, sponsorReachable } from "./runtime.js"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { FACT_NAMESPACES } from "./remember.js"
 import { unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
@@ -123,13 +123,20 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
   saveOwnerAddress(home, owner)
   // With a gas sponsor every send below is paid by the sponsor — a brand-new empty owner wallet
   // inits fine (M3-C), and no wallet needs MON up front: not the owner's, not the operator's, not
-  // an agent signer's (M3-D3). Without one the owner pays for everything, so the wallet must hold
-  // gas first: the refusal names the address to fund and a re-run resumes where this one stopped.
+  // an agent signer's (M3-D3). But a CONFIGURED URL is not proof the sponsor answers (M3-D6):
+  // probe it once — the same 2 s GET doctor runs — before telling the owner no MON is needed.
+  // A silent sponsor means every send falls back to self-pay, so the wallets are funded exactly
+  // as if none were set: the refusal names the address to fund and a re-run resumes where this
+  // one stopped.
   const sponsorUrl = parseSponsorUrl(network.sponsorUrl)
-  if (sponsorUrl === undefined) {
-    await runtime.ensureFunded(owner, "your wallet")
-  } else {
+  const sponsorUp = sponsorUrl !== undefined && (await sponsorReachable(sponsorUrl))
+  if (sponsorUp) {
     runtime.progress?.("gas sponsor on — no MON needed")
+  } else {
+    if (sponsorUrl !== undefined) {
+      runtime.progress?.("gas sponsor not answering — this setup needs MON in your wallet")
+    }
+    await runtime.ensureFunded(owner, "your wallet")
   }
   const ownerKey = await reader.ownerP256Key(owner)
   if (ownerKey == null || ownerKey.qx === 0n) {
@@ -171,7 +178,7 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
   for (const name of agentNames) {
     let identity = loadAgentIdentity(home, name)
     if (identity === undefined) {
-      if (sponsorUrl === undefined) await runtime.ensureFunded(operatorAccount.address, "the operator wallet")
+      if (!sponsorUp) await runtime.ensureFunded(operatorAccount.address, "the operator wallet")
       // Saved to disk BEFORE the registration transaction: a crash must never leave a registered agent with no key.
       let signerPrivateKey = loadOrCreateSignerKey(home, name)
       // Unless the crash came after registration: then this signer is bound to an agent whose encryption key was
@@ -194,7 +201,7 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
     }
     // An idempotent PUT, run for every agent on every init: a manifest upload lost to a crash is retried here.
     await runtime.ownerApi.putAgentManifest(identity.manifest)
-    if (sponsorUrl === undefined) {
+    if (!sponsorUp) {
       await runtime.ensureFunded(privateKeyToAccount(identity.signerPrivateKey).address, `${name}'s wallet`)
     }
     // `assistant` never joins a project, so there is no request/approve round-trip for it: the owner

@@ -21,7 +21,7 @@ import type { InstallTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
 import { listJobs } from "./queue.js"
-import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon } from "./runtime.js"
+import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, sponsorReachable } from "./runtime.js"
 import { cliPackageName, isBundled } from "./sibling.js"
 
 /** The whole run is capped — a check may stall, the report may not. */
@@ -158,16 +158,6 @@ function sponsorUrlInEffect(home: MidaHome, env: NodeJS.ProcessEnv): string | un
   if (raw === "off") return undefined
   if (raw !== undefined && raw !== "") return raw
   return undefined
-}
-
-/** One GET probe — true when the sponsor endpoint answers 2xx. Two seconds, like the sponsor check. */
-async function sponsorReachable(url: string): Promise<boolean> {
-  try {
-    const reply = await fetch(url, { signal: AbortSignal.timeout(2_000) })
-    return reply.ok
-  } catch {
-    return false
-  }
 }
 
 /** The repo's own `bin/` — the missing-hook-command fix for SOURCE-tree runs only (see hookCommandFix). */

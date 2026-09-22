@@ -52,6 +52,20 @@ export function serviceUrl(raw: string | undefined, hosted: string): string | un
   if (raw === "off") return undefined
   return raw
 }
+
+/**
+ * One GET probe — true when the sponsor endpoint answers 2xx inside two seconds. init and
+ * doctor share this so "the sponsor answers" means the same thing on both paths. Reachable is
+ * all it proves: willingness to pay is only proven by a real send (M3-D6).
+ */
+export async function sponsorReachable(url: string): Promise<boolean> {
+  try {
+    const reply = await fetch(url, { signal: AbortSignal.timeout(2_000) })
+    return reply.ok
+  } catch {
+    return false
+  }
+}
 /**
  * Below this balance an account is topped up before it has to send a transaction. 0.15 MON, from
  * the live run on Sep 21: a grant bills about 0.043 MON on Monad (the full gas limit, at ~102 gwei)

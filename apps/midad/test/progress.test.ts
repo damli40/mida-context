@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { createServer as createHttpServer } from "node:http"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -100,21 +101,31 @@ describe("owner command progress lines", () => {
 
 /**
  * M3-D3 item 4 — the "(sponsored)" suffix is read off the write context that will send, never
- * guessed. The sponsor URL here is dead on purpose: every send tries the sponsor first (the
- * "(sponsored)" line), is refused, and falls back — and the fallback's own line still says the
- * wallet paid.
+ * guessed. M3-D6 item 2 — init no longer trusts a CONFIGURED sponsor URL: it probes the
+ * endpoint once (the same 2 s GET doctor runs) and only an answering sponsor earns "no MON
+ * needed"; a silent one funds the wallet exactly as the no-sponsor path does.
  */
 describe("sponsored progress lines", () => {
-  it("a sponsored send says (sponsored) — and a refusing sponsor still says who ended up paying", async () => {
+  it("an answering sponsor keeps 'no MON needed' — and a send that falls back still lands", async () => {
     const env = await localEnvironment()
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-progress-sponsor-")))
-    try {
-      const network: Network = {
-        rpcUrl: env.rpcUrl,
-        deployment: env.deployment,
-        fund: env.fund,
-        sponsorUrl: "http://127.0.0.1:9", // unreachable — every send falls back to self-pay
+    // Answers the GET probe but refuses every JSON-RPC operation: reachable ≠ willing, and the
+    // send-time fallback is what carries init once the probe has passed.
+    const sponsor = createHttpServer((req, res) => {
+      if (req.method === "GET") {
+        res.setHeader("content-type", "application/json")
+        res.end(JSON.stringify({ name: "mida-gas-sponsor" }))
+        return
       }
+      res.statusCode = 500
+      res.end("{}")
+    })
+    try {
+      const sponsorUrl = await new Promise<string>((resolve, reject) => {
+        sponsor.once("error", reject)
+        sponsor.listen(0, "127.0.0.1", () => resolve(`http://127.0.0.1:${(sponsor.address() as { port: number }).port}`))
+      })
+      const network: Network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund, sponsorUrl }
       const runtime = await Runtime.open(home, network)
       try {
         const lines: string[] = []
@@ -129,7 +140,58 @@ describe("sponsored progress lines", () => {
         await runtime.close()
       }
     } finally {
+      await new Promise<void>((done) => sponsor.close(() => done()))
       await env.stop()
     }
   }, 300_000)
+
+  it("a silent sponsor with a funder says so, tops the wallet up, and still inits", async () => {
+    const env = await localEnvironment()
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-progress-deadsponsor-")))
+    try {
+      const network: Network = {
+        rpcUrl: env.rpcUrl,
+        deployment: env.deployment,
+        fund: env.fund,
+        sponsorUrl: "http://127.0.0.1:9", // configured but never answers — the Sep 22 shape
+      }
+      const runtime = await Runtime.open(home, network)
+      try {
+        const lines: string[] = []
+        runtime.progress = (line) => lines.push(line)
+        await init(runtime, ["assistant"])
+        expect(lines).toContain("gas sponsor not answering — this setup needs MON in your wallet")
+        expect(lines).not.toContain("gas sponsor on — no MON needed")
+        expect(lines).toContain("topping up your wallet…") // ensureFunded ran, sponsor or not
+      } finally {
+        await runtime.close()
+      }
+    } finally {
+      await env.stop()
+    }
+  }, 300_000)
+
+  it("a silent sponsor with no funder refuses init with the send-MON refusal — not 'no MON needed'", async () => {
+    const env = await localEnvironment()
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-progress-nofund-")))
+    try {
+      const network: Network = {
+        rpcUrl: env.rpcUrl,
+        deployment: env.deployment,
+        sponsorUrl: "http://127.0.0.1:9", // configured, dead — and nobody to top the wallet up
+      }
+      const runtime = await Runtime.open(home, network)
+      try {
+        const lines: string[] = []
+        runtime.progress = (line) => lines.push(line)
+        const error = await init(runtime, ["assistant"]).then(() => null, (e: unknown) => e)
+        expect(lines).toContain("gas sponsor not answering — this setup needs MON in your wallet")
+        expect(error).toMatchObject({ code: "OWNER_WALLET_LOW" })
+      } finally {
+        await runtime.close()
+      }
+    } finally {
+      await env.stop()
+    }
+  }, 120_000)
 })
