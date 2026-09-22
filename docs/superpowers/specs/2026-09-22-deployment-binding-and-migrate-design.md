@@ -193,9 +193,19 @@ record: beside the record's own content in `payload.value`. In every case it is 
 ciphertext. Every code path that rebuilds a payload must carry the key through; a read → re-save
 that drops it is a defect.
 
-**Size (Dami, Sep 22).** The envelope adds about 442 bytes. The preview checks every record's size
-with its envelope against the cap (65,280 bytes, checkpoint-payload.ts:11). If any would exceed it,
-`migrate` refuses to start and names each such record. Nothing is trimmed and nothing is half-moved.
+**Size preflight. LOCKED (Dami, Sep 22).** Before any migration side effect (before step 1, as part
+of building the preview), `migrate` builds every object's **exact destination serialization**: the
+payload with its envelope, encoded exactly as the write will encode it. It checks each against that
+object type's **existing** limit (a checkpoint against `MAX_VALUE_BYTES` = 65,280,
+checkpoint-payload.ts:11; any other record against the protocol's `MAX_PAYLOAD_BYTES` = 65,536). If
+any object exceeds its limit, **the whole migration is refused**, naming every offending object with
+its source ID, its size and its limit. **No record is skipped, and no protocol limit is raised.**
+The envelope is about 442 bytes (spike S3); that figure is for orientation only, never used for the check.
+
+**The envelope is an explicit, supported checkpoint field. LOCKED.** `CheckpointEnvelope` gains
+`migration?: MigrationEnvelope`, and both `wrapCheckpoint` (write) and `unwrapCheckpoint` (read)
+carry it (checkpoint-payload.ts:84-91, 150-157). It is validated when present (all fields, `version`
+= 1) and absent on ordinary checkpoints.
 
 The on-chain provenance label is the original one (decision 7). Readers that show provenance
 (handoff, `read`, the MCP `read` tool) print "(moved <date>)" after the original attribution.
@@ -312,7 +322,7 @@ No contract changes.
 | A record's author is not set up here | `skipped:unknown-author`, listed by author ID and count; the preview shows it before `yes` |
 | A record points at a record that was skipped | it is skipped too (`skipped:dangling-relation`), and listed; never written with a broken link |
 | An area on the old contract has no owner key to decrypt it | stops at step 3 before anything is written, naming the area |
-| A record would exceed the size cap once the envelope is added | refused at the preview, before `yes`; each such record named; nothing written |
+| Any record's exact destination serialization exceeds its existing limit | whole migration refused at the preview, before `yes` and before any side effect; every such record named with size and limit; nothing skipped, no limit raised |
 | `--undo` with no backup | refused |
 | Old service will not stop | refused before step 2, naming the process |
 
@@ -344,6 +354,12 @@ No contract changes.
   must fail and name the missing `sourceId`.
 - **Envelope check:** for every migrated record, `originalCommitment` equals the old contract's
   on-chain commitment for `originalRecordId`; a forged envelope fails.
+- **Envelope survives a round trip:** on the destination, write a migrated checkpoint → read →
+  re-save → read. The envelope is byte-identical at both reads. The same for a fact.
+- **Size preflight:** seed a source checkpoint whose exact destination serialization with envelope is
+  1 byte over `MAX_VALUE_BYTES`. `migrate` refuses before step 1, names that record with its size and
+  limit, and writes nothing: no marker, no backup, no service stop, no transaction. A record exactly
+  at the limit passes.
 - **H1 (extended):** kill `migrate` between prepare and commit, and between commit and verify, for an
   agent registration, a fact and a checkpoint. Re-run. Zero orphan agents, zero duplicate records.
   `--undo` restores a working old setup.
