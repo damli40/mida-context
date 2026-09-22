@@ -222,4 +222,108 @@ describe("MidaAgent replay + caller-supplied randomness (migrate B1)", () => {
     const failure = await second.replay(vault.owner, replayInput).then(() => null, (error: unknown) => error)
     expect(revertName(failure)).toBe("DuplicateContext")
   })
+
+  // ---------- migrate B1b: seal once, send the same bytes on every retry ----------
+
+  /** Counts ContextRegistered events for one contextId — "exactly one chain record", from the chain itself. */
+  const chainRecordCount = async (contextId: Hex): Promise<number> => {
+    const logs = await owner.publicClient.getLogs({ address: deployment.contextRegistry })
+    return parseEventLogs({ abi: contextRegistryAbi, eventName: "ContextRegistered", logs }).filter(
+      (log) => log.args.contextId === contextId,
+    ).length
+  }
+
+  it("sealReplay produces sendable bytes and sendSealed anchors them exactly once", async () => {
+    const input: ReplayInput = { ...replayInput, objectNonce: hexOf(randomBytes(32)) }
+    const sealed = await sdk.sealReplay(vault.owner, input)
+    expect(sealed.contextId).toBe(sdk.predictContextId(vault.owner, CAREER, input.objectNonce))
+    expect(sealed.manifest.ciphertextSize).toBe(sealed.ciphertext.length)
+    const sent = await sdk.sendSealed(vault.owner, sealed)
+    expect(sent.contextId).toBe(sealed.contextId)
+    expect(sent.transactionHash).toBeDefined()
+    const record = await reader.getRecord(sealed.contextId)
+    expect(record).toMatchObject({ manifestHash: sealed.manifestHash, author: agent.agentId })
+    expect(await chainRecordCount(sealed.contextId)).toBe(1)
+  })
+
+  it("sendSealed resends the kept bytes after an upload-only crash — the same manifest anchors once", async () => {
+    const input: ReplayInput = { ...replayInput, objectNonce: hexOf(randomBytes(32)) }
+    const sealed = await sdk.sealReplay(vault.owner, input)
+    // Simulated crash between upload and register: the store PUT lands directly, no transaction.
+    await clientFor(agent.signer, app).putObject({
+      owner: vault.owner,
+      namespaceId: sealed.namespaceId,
+      objectNonce: sealed.onChain.objectNonce,
+      expectedParentId: sealed.onChain.expectedParentId,
+      manifest: sealed.manifest,
+      ciphertext: hexOf(sealed.ciphertext),
+      capabilityId: sdk.grants[0]!.capabilities[0]!.capabilityId,
+    })
+    const sent = await sdk.sendSealed(vault.owner, sealed)
+    expect(sent.contextId).toBe(sealed.contextId)
+    expect(sent.transactionHash).toBeDefined()
+    const record = await reader.getRecord(sealed.contextId)
+    expect(record?.manifestHash).toBe(sealed.manifestHash)
+    expect(await chainRecordCount(sealed.contextId)).toBe(1)
+  })
+
+  it("re-sealing the same input draws new bytes — the kept seal, not a re-seal, is what may be resent", async () => {
+    const input: ReplayInput = { ...replayInput, objectNonce: hexOf(randomBytes(32)) }
+    const first = await sdk.sealReplay(vault.owner, input)
+    const second = await sdk.sealReplay(vault.owner, input)
+    expect(second.contextId).toBe(first.contextId)
+    expect(second.manifestHash).not.toBe(first.manifestHash)
+    await sdk.sendSealed(vault.owner, first)
+    // The store binds the contextId to the first manifestHash, so differently-sealed bytes for the
+    // same id are refused before any transaction — the crash hazard keeping the bytes fixes.
+    await expect(sdk.sendSealed(vault.owner, second)).rejects.toMatchObject({ code: "COMMITMENT_MISMATCH" })
+    expect(await chainRecordCount(first.contextId)).toBe(1)
+  })
+
+  it("sendSealed on an already-anchored identical record returns done — no second transaction", async () => {
+    const input: ReplayInput = { ...replayInput, objectNonce: hexOf(randomBytes(32)) }
+    const sealed = await sdk.sealReplay(vault.owner, input)
+    const first = await sdk.sendSealed(vault.owner, sealed)
+    expect(first.transactionHash).toBeDefined()
+    const second = await sdk.sendSealed(vault.owner, sealed)
+    expect(second.contextId).toBe(sealed.contextId)
+    expect(second.transactionHash).toBeUndefined()
+    expect(await chainRecordCount(sealed.contextId)).toBe(1)
+  })
+
+  it("sealOwnerContext + sendOwnerSealed: the same split for owner records — crash-safe resend, no double anchor", async () => {
+    const payload: ContextPayload = {
+      v: 1,
+      value: "owner fact sealed once",
+      kind: "FACT",
+      provenance: { source: "USER_ASSERTED" },
+    }
+    const objectNonce = hexOf(randomBytes(32))
+    const sealed = await vault.sealOwnerContext({ namespace: "goals.career", payload, objectNonce })
+    // Simulated crash: the owner upload lands, the register never does.
+    await ownerApi.putObject({
+      owner: vault.owner,
+      namespaceId: sealed.namespaceId,
+      objectNonce,
+      expectedParentId: sealed.onChain.expectedParentId,
+      manifest: sealed.manifest,
+      ciphertext: hexOf(sealed.ciphertext),
+    })
+    const sent = await vault.sendOwnerSealed(sealed)
+    expect(sent.contextId).toBe(sealed.contextId)
+    expect(sent.manifestHash).toBe(sealed.manifestHash)
+    expect(sent.transactionHash).toBeDefined()
+    const record = await reader.getRecord(sealed.contextId)
+    expect(record?.manifestHash).toBe(sealed.manifestHash)
+    expect(await chainRecordCount(sealed.contextId)).toBe(1)
+    // Resending the identical sealed record is already done — no second transaction.
+    const again = await vault.sendOwnerSealed(sealed)
+    expect(again.contextId).toBe(sealed.contextId)
+    expect(again.transactionHash).toBeUndefined()
+    expect(await chainRecordCount(sealed.contextId)).toBe(1)
+    // Re-sealing the same input would draw a fresh key and nonce — different manifestHash.
+    const resealed = await vault.sealOwnerContext({ namespace: "goals.career", payload, objectNonce })
+    expect(resealed.contextId).toBe(sealed.contextId)
+    expect(resealed.manifestHash).not.toBe(sealed.manifestHash)
+  })
 })

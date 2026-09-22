@@ -29,6 +29,7 @@ import type {
   GrantedCapability,
   Hex,
   LineagePolicy,
+  ObjectManifest,
   PurposeId,
   RecordReference,
   UnsignedAccessRequest,
@@ -127,6 +128,40 @@ export interface ContextObject {
   payload: ContextPayload
   transactionHash?: Hex
 }
+
+/**
+ * What `sealReplay` produces once and `sendSealed` may send any number of times (migrate B1b): the
+ * exact ciphertext and manifest the store's same-manifest repeat upload accepts, plus every field
+ * `register` needs. Ciphertext only — no plaintext — so a crash between upload and register
+ * resends identical bytes instead of re-sealing (a fresh seal draws a fresh key and a different
+ * manifestHash the store then refuses).
+ */
+export interface SealedRecord {
+  contextId: Hex
+  namespaceId: Hex
+  readEpoch: bigint
+  manifest: ObjectManifest
+  manifestHash: Hex
+  ciphertext: Uint8Array
+  onChain: {
+    recordType: "CONTEXT" | "EVIDENCE"
+    kind: ContextKind
+    lineagePolicy: LineagePolicy
+    expiresAt: bigint
+    expectedParentId: Hex
+    evidenceCommitment: Hex
+    objectNonce: Hex
+    provenanceSource: number
+  }
+}
+
+/**
+ * What `sendSealed` can attest: the anchored record's view plus its transaction — `ContextObject`
+ * minus `payload`, because a `SealedRecord` holds no plaintext to put in it (`replay` recomposes
+ * the full object from its own input). `transactionHash` is absent when the identical record was
+ * already anchored — a resend is done, not sent again.
+ */
+export type SentRecord = Omit<ContextObject, "payload">
 
 export interface MidaAgentConfig {
   agentId: Hex
@@ -425,17 +460,33 @@ export class MidaAgent {
    * payload — `sourceHash`, `sourceUri`, `retrievedAt`, `note`, `extractionConfidence`,
    * `references` and `tags` all reach the seal — and it adds no provenance restriction of its
    * own: the ordinary capability and epoch checks apply, and the contract stays the authority.
+   * Seal once, then send those bytes (migrate B1b).
    */
   async replay(owner: Address, input: ReplayInput): Promise<ContextObject> {
+    const sealed = await this.sealReplay(owner, input)
+    const sent = await this.sendSealed(owner, sealed)
+    return { ...sent, payload: input.payload }
+  }
+
+  /**
+   * Seals a replay exactly once and writes nothing (migrate B1b): the capability, epoch, id and
+   * every byte `sendSealed` needs, frozen so a retry — including after a crash between upload and
+   * register — resends identical bytes. The epoch is checked here and again at send: a seal that
+   * outlives its epoch is refused, never silently resealed under a different epoch.
+   */
+  async sealReplay(owner: Address, input: ReplayInput): Promise<SealedRecord> {
     if (input.payload.kind !== input.kind) {
       throw new MidaError("INVALID_WIRE", "the payload kind and the record kind disagree")
     }
     const ownerAddress = owner.toLowerCase() as Address
     const namespaceId = input.namespaceId.toLowerCase() as Hex
-    const capability =
-      input.expectedParentId === zeroHash
-        ? this.#requireCapability(ownerAddress, namespaceId, PERMISSION.CREATE)
-        : await this.#supersedeCapability(ownerAddress, namespaceId, input.expectedParentId)
+    // Fail fast on the capability the send will need — keeping bytes for a write this agent cannot
+    // make buys nothing.
+    if (input.expectedParentId === zeroHash) {
+      this.#requireCapability(ownerAddress, namespaceId, PERMISSION.CREATE)
+    } else {
+      await this.#supersedeCapability(ownerAddress, namespaceId, input.expectedParentId)
+    }
     const { deployment } = this.#chain
     const readEpoch = await this.#reader.requiredReadEpoch(ownerAddress, namespaceId)
     const epochPublicKey = await this.#reader.epochPublicKey(ownerAddress, namespaceId, readEpoch)
@@ -448,16 +499,57 @@ export class MidaAgent {
       binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId, namespaceId, readEpoch },
       epochPublicKey: bytesOf(epochPublicKey, 32),
     })
+    const references = input.payload.provenance.references ?? []
+    return {
+      contextId,
+      namespaceId,
+      readEpoch,
+      manifest: sealed.manifest,
+      manifestHash: sealed.manifestHash,
+      ciphertext: sealed.ciphertext,
+      onChain: {
+        recordType: input.recordType,
+        kind: input.kind,
+        lineagePolicy: input.lineagePolicy,
+        expiresAt: input.expiresAt,
+        expectedParentId: input.expectedParentId,
+        evidenceCommitment: references.length === 0 ? zeroHash : evidenceCommitment(references),
+        objectNonce: input.objectNonce,
+        provenanceSource: PROVENANCE_SOURCE[input.payload.provenance.source],
+      },
+    }
+  }
+
+  /**
+   * Sends the bytes `sealReplay` produced — the same bytes on every call (migrate B1b). The store
+   * accepts a repeat upload only for an identical manifest, so a resend after an upload-only crash
+   * lands; a record already anchored with this exact manifestHash is done, not sent again; a stale
+   * epoch refuses `EPOCH_ROTATION_REQUIRED` before anything leaves this process.
+   */
+  async sendSealed(owner: Address, sealed: SealedRecord): Promise<SentRecord> {
+    const ownerAddress = owner.toLowerCase() as Address
+    const namespaceId = sealed.namespaceId.toLowerCase() as Hex
+    const capability =
+      sealed.onChain.expectedParentId === zeroHash
+        ? this.#requireCapability(ownerAddress, namespaceId, PERMISSION.CREATE)
+        : await this.#supersedeCapability(ownerAddress, namespaceId, sealed.onChain.expectedParentId)
+    if (!(await this.#reader.isWriteEpochValid(ownerAddress, namespaceId, sealed.readEpoch))) {
+      throw new MidaError("EPOCH_ROTATION_REQUIRED", "the sealed record's read epoch no longer accepts writes")
+    }
     await this.#api.putObject({
       owner: ownerAddress,
       namespaceId,
-      objectNonce: input.objectNonce,
-      expectedParentId: input.expectedParentId,
+      objectNonce: sealed.onChain.objectNonce,
+      expectedParentId: sealed.onChain.expectedParentId,
       manifest: sealed.manifest,
       ciphertext: hexOf(sealed.ciphertext),
       capabilityId: capability.capabilityId,
     })
-    const references = input.payload.provenance.references ?? []
+    const { deployment } = this.#chain
+    const anchored = await this.#reader.getRecord(sealed.contextId)
+    if (anchored !== null && anchored.manifestHash === sealed.manifestHash) {
+      return this.#toSentObject(anchored)
+    }
     const receipt = await sendContract(
       this.#chain,
       {
@@ -468,28 +560,28 @@ export class MidaAgent {
           ownerAddress,
           [
             {
-              contextId,
-              objectNonce: input.objectNonce,
+              contextId: sealed.contextId,
+              objectNonce: sealed.onChain.objectNonce,
               namespaceId,
-              expectedParentId: input.expectedParentId,
+              expectedParentId: sealed.onChain.expectedParentId,
               manifestHash: sealed.manifestHash,
-              ciphertextCommitment: sealed.ciphertextCommitment,
-              evidenceCommitment: references.length === 0 ? zeroHash : evidenceCommitment(references),
-              readEpoch,
-              expiresAt: input.expiresAt,
-              recordType: RECORD_TYPE[input.recordType],
-              lineagePolicy: LINEAGE_POLICY[input.lineagePolicy],
-              kind: CONTEXT_KIND[input.kind],
-              provenanceSource: PROVENANCE_SOURCE[input.payload.provenance.source],
+              ciphertextCommitment: sealed.manifest.ciphertextHash,
+              evidenceCommitment: sealed.onChain.evidenceCommitment,
+              readEpoch: sealed.readEpoch,
+              expiresAt: sealed.onChain.expiresAt,
+              recordType: RECORD_TYPE[sealed.onChain.recordType],
+              lineagePolicy: LINEAGE_POLICY[sealed.onChain.lineagePolicy],
+              kind: CONTEXT_KIND[sealed.onChain.kind],
+              provenanceSource: sealed.onChain.provenanceSource,
             },
           ],
         ],
       },
       "context.register",
     )
-    const record = await this.#reader.getRecord(contextId)
+    const record = await this.#reader.getRecord(sealed.contextId)
     if (record === null) throw new MidaError("COMMITMENT_MISMATCH", "the registered record is missing after the transaction")
-    return { ...this.#toObject(record, namespaceById(namespaceId).name, input.payload), transactionHash: receipt.transactionHash }
+    return this.#toSentObject(record, receipt.transactionHash)
   }
 
   /** The grant that lets this agent write under an existing parent: SUPERSEDE_ANY, or SUPERSEDE_OWN on its own lineage. */
@@ -681,6 +773,23 @@ export class MidaAgent {
       readEpoch: record.readEpoch,
       recordType: record.recordType === RECORD_TYPE.EVIDENCE ? "EVIDENCE" : "CONTEXT",
       payload,
+    }
+  }
+
+  /** The on-chain view `sendSealed` returns — `ContextObject` minus the plaintext it cannot have. */
+  #toSentObject(record: ContextRecordView, transactionHash?: Hex): SentRecord {
+    return {
+      contextId: record.contextId,
+      owner: record.owner,
+      namespace: namespaceById(record.namespaceId).name,
+      namespaceId: record.namespaceId,
+      authorId: record.author,
+      lineageId: record.lineageId,
+      parentId: record.parentId,
+      version: record.version,
+      readEpoch: record.readEpoch,
+      recordType: record.recordType === RECORD_TYPE.EVIDENCE ? "EVIDENCE" : "CONTEXT",
+      ...(transactionHash === undefined ? {} : { transactionHash }),
     }
   }
 }

@@ -26,12 +26,14 @@ import type {
   AccessGrantResponse,
   AccessRequest,
   Address,
+  ContextKind,
   ContextPayload,
   GrantAdvice,
   GrantScope,
   GrantedCapability,
   Hex,
   LineagePolicy,
+  ObjectManifest,
   SignedAgentCapabilityManifest,
   WebAuthnAuthStruct,
 } from "@mida/protocol"
@@ -100,6 +102,33 @@ export interface RevokeApproval {
 
 /** How long the passkey assertion that cancels a just-staged deny stays valid — well under the store's 5-minute cap. */
 export const DENY_CANCEL_EXPIRY_SECONDS = 120n
+
+/**
+ * What `sealOwnerContext` produces once and `sendOwnerSealed` may send any number of times
+ * (migrate B1b): the exact ciphertext and manifest the store's same-manifest repeat upload
+ * accepts, plus every field `register` needs. Ciphertext only — no plaintext — so a crash between
+ * upload and register resends identical bytes instead of re-sealing (a fresh seal draws a fresh
+ * key and a different manifestHash the store then refuses). Structurally the agent SDK's
+ * `SealedRecord`; kept local so this package does not depend on the SDK.
+ */
+export interface SealedRecord {
+  contextId: Hex
+  namespaceId: Hex
+  readEpoch: bigint
+  manifest: ObjectManifest
+  manifestHash: Hex
+  ciphertext: Uint8Array
+  onChain: {
+    recordType: "CONTEXT" | "EVIDENCE"
+    kind: ContextKind
+    lineagePolicy: LineagePolicy
+    expiresAt: bigint
+    expectedParentId: Hex
+    evidenceCommitment: Hex
+    objectNonce: Hex
+    provenanceSource: number
+  }
+}
 
 export interface FakeVaultConfig {
   /** 32 non-zero test bytes standing in for the passkey's PRF secret. Never a production secret. */
@@ -398,7 +427,7 @@ export class FakeVaultAuthority implements VaultAuthority {
     return assertionToWire(this.#assert(challenge))
   }
 
-  /** Owner-authored context (§11.5): ciphertext is uploaded as pending first, then the commitments are anchored. */
+  /** Owner-authored context (§11.5): seal once, then send those bytes (migrate B1b) — ciphertext first, then the anchor. */
   async createOwnerContext(input: {
     namespace: string
     payload: ContextPayload
@@ -411,55 +440,119 @@ export class FakeVaultAuthority implements VaultAuthority {
     /** Record type to anchor (migrate B1); absent = CONTEXT, exactly as before. */
     recordType?: "CONTEXT" | "EVIDENCE"
   }): Promise<{ contextId: Hex; readEpoch: bigint; manifestHash: Hex; transactionHash: Hex }> {
+    const sealed = await this.sealOwnerContext({ ...input, objectNonce: input.objectNonce ?? hexOf(randomBytes(32)) })
+    const sent = await this.sendOwnerSealed(sealed)
+    if (sent.transactionHash === undefined) {
+      // A fresh seal's manifestHash cannot already be on chain, so the done path cannot be reached
+      // here; the guard keeps the signature honest rather than inventing a hash.
+      throw new MidaError("COMMITMENT_MISMATCH", "an identical record is already anchored for this contextId")
+    }
+    return { contextId: sent.contextId, readEpoch: sent.readEpoch, manifestHash: sent.manifestHash, transactionHash: sent.transactionHash }
+  }
+
+  /**
+   * Seals an owner-authored record exactly once and writes nothing (migrate B1b): the current read
+   * epoch, the derived epoch keys, the contextId and every byte `sendOwnerSealed` needs. The
+   * caller supplies `objectNonce` so a re-run predicts the same id.
+   */
+  async sealOwnerContext(input: {
+    namespace: string
+    payload: ContextPayload
+    lineagePolicy?: LineagePolicy
+    expectedParentId?: Hex
+    evidenceCommitment?: Hex
+    expiresAt?: bigint
+    /** Prepared nonce (migrate B1b); required — the caller prepares it so a re-run predicts the same id. */
+    objectNonce: Hex
+    /** Record type to anchor; absent = CONTEXT, exactly as `createOwnerContext`. */
+    recordType?: "CONTEXT" | "EVIDENCE"
+  }): Promise<SealedRecord> {
     const { deployment } = this.#chain
     const namespaceId = toNamespaceId(canonicalizeNamespace(input.namespace))
     const readEpoch = await this.#readCapability<bigint>("requiredReadEpoch", [this.owner, namespaceId])
     const onChain = await this.#readCapability<Hex>("epochPublicKey", [this.owner, namespaceId, readEpoch])
     const keys = await this.#epochKeys(namespaceId, readEpoch, onChain)
-    const objectNonce = input.objectNonce ?? hexOf(randomBytes(32))
     const contextId = deriveContextId({
       chainId: deployment.chainId,
       contextRegistry: deployment.contextRegistry,
       owner: this.owner,
       authorId: OWNER_AUTHOR_ID,
       namespaceId,
-      objectNonce,
+      objectNonce: input.objectNonce,
     })
     const sealed = sealContextObject({
       payload: input.payload,
       binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId, namespaceId, readEpoch },
       epochPublicKey: keys.publicKey,
     })
-    const expectedParentId = input.expectedParentId ?? zeroHash
+    return {
+      contextId,
+      namespaceId,
+      readEpoch,
+      manifest: sealed.manifest,
+      manifestHash: sealed.manifestHash,
+      ciphertext: sealed.ciphertext,
+      onChain: {
+        recordType: input.recordType ?? "CONTEXT",
+        kind: input.payload.kind,
+        lineagePolicy: input.lineagePolicy ?? "STANDARD",
+        expiresAt: input.expiresAt ?? 0n,
+        expectedParentId: input.expectedParentId ?? zeroHash,
+        evidenceCommitment: input.evidenceCommitment ?? zeroHash,
+        objectNonce: input.objectNonce,
+        provenanceSource: PROVENANCE_SOURCE[input.payload.provenance.source],
+      },
+    }
+  }
+
+  /**
+   * Sends the bytes `sealOwnerContext` produced — the same bytes on every call (migrate B1b). The
+   * store accepts a repeat upload only for an identical manifest, so a resend after an
+   * upload-only crash lands; a record already anchored with this exact manifestHash is done, not
+   * sent again (`transactionHash` stays absent); a stale epoch refuses `EPOCH_ROTATION_REQUIRED`
+   * before anything leaves this process.
+   */
+  async sendOwnerSealed(
+    sealed: SealedRecord,
+  ): Promise<{ contextId: Hex; readEpoch: bigint; manifestHash: Hex; transactionHash?: Hex }> {
+    const { deployment } = this.#chain
+    const namespaceId = sealed.namespaceId
+    if (!(await this.#readCapability<boolean>("isWriteEpochValid", [this.owner, namespaceId, sealed.readEpoch]))) {
+      throw new MidaError("EPOCH_ROTATION_REQUIRED", "the sealed record's read epoch no longer accepts writes")
+    }
     await this.#api.putObject({
       owner: this.owner,
       namespaceId,
-      objectNonce,
-      expectedParentId,
+      objectNonce: sealed.onChain.objectNonce,
+      expectedParentId: sealed.onChain.expectedParentId,
       manifest: sealed.manifest,
       ciphertext: hexOf(sealed.ciphertext),
     })
+    const anchored = await this.#readContext<{ manifestHash: Hex }>("getRecord", [sealed.contextId])
+    if (anchored !== null && anchored.manifestHash === sealed.manifestHash) {
+      return { contextId: sealed.contextId, readEpoch: sealed.readEpoch, manifestHash: sealed.manifestHash }
+    }
     const receipt = await this.#send("context.register", contextRegistryAbi, deployment.contextRegistry, "register", [
       this.owner,
       [
         {
-          contextId,
-          objectNonce,
+          contextId: sealed.contextId,
+          objectNonce: sealed.onChain.objectNonce,
           namespaceId,
-          expectedParentId,
+          expectedParentId: sealed.onChain.expectedParentId,
           manifestHash: sealed.manifestHash,
-          ciphertextCommitment: sealed.ciphertextCommitment,
-          evidenceCommitment: input.evidenceCommitment ?? zeroHash,
-          readEpoch,
-          expiresAt: input.expiresAt ?? 0n,
-          recordType: RECORD_TYPE[input.recordType ?? "CONTEXT"],
-          lineagePolicy: LINEAGE_POLICY[input.lineagePolicy ?? "STANDARD"],
-          kind: CONTEXT_KIND[input.payload.kind],
-          provenanceSource: PROVENANCE_SOURCE[input.payload.provenance.source],
+          ciphertextCommitment: sealed.manifest.ciphertextHash,
+          evidenceCommitment: sealed.onChain.evidenceCommitment,
+          readEpoch: sealed.readEpoch,
+          expiresAt: sealed.onChain.expiresAt,
+          recordType: RECORD_TYPE[sealed.onChain.recordType],
+          lineagePolicy: LINEAGE_POLICY[sealed.onChain.lineagePolicy],
+          kind: CONTEXT_KIND[sealed.onChain.kind],
+          provenanceSource: sealed.onChain.provenanceSource,
         },
       ],
     ])
-    return { contextId, readEpoch, manifestHash: sealed.manifestHash, transactionHash: receipt.transactionHash }
+    return { contextId: sealed.contextId, readEpoch: sealed.readEpoch, manifestHash: sealed.manifestHash, transactionHash: receipt.transactionHash }
   }
 
   async #epochKeys(namespaceId: Hex, epoch: bigint, expectedPublicKey?: Hex): Promise<EpochKeyPair> {
@@ -486,6 +579,22 @@ export class FakeVaultAuthority implements VaultAuthority {
       } as never)) as T
     } catch (error) {
       throw toMidaError(error)
+    }
+  }
+
+  /** Context-registry read that treats a missing record as `null` rather than a failure. */
+  async #readContext<T>(functionName: string, args: readonly unknown[]): Promise<T | null> {
+    try {
+      return (await this.#chain.publicClient.readContract({
+        address: this.#chain.deployment.contextRegistry,
+        abi: contextRegistryAbi,
+        functionName,
+        args,
+      } as never)) as T
+    } catch (error) {
+      const mapped = toMidaError(error)
+      if (isMidaError(mapped, "NOT_FOUND")) return null
+      throw mapped
     }
   }
 
