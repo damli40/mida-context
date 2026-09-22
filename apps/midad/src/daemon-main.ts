@@ -1,9 +1,8 @@
-import { parseDeployment } from "@mida/chain"
 import { compileCheckpoint, compileModelChoice } from "@mida/compiler"
 import { startDaemon } from "./daemon.js"
 import { resolveHome } from "./home.js"
 import { appendLog } from "./log.js"
-import type { Network } from "./runtime.js"
+import { serviceNetwork } from "./network.js"
 
 /**
  * The long-running Mida process entry. Like the detached drainer it never loads `.env` — the home
@@ -13,18 +12,18 @@ import type { Network } from "./runtime.js"
  */
 async function main(): Promise<void> {
   const home = resolveHome(process.env)
-  const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown; storageUrl?: unknown; sponsorUrl?: unknown }>("network.json")
-  if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) {
+  // The same resolution every entry point uses: the saved contract, RPC and service URLs —
+  // never the contract this build happens to ship. A home with no usable network.json has
+  // nothing to serve: exit quietly, as before.
+  const network = await serviceNetwork(home, process.env).catch((error: unknown) => {
+    if ((error as { code?: unknown }).code === "network-json-invalid") return undefined
+    throw error
+  })
+  if (network === undefined) {
     process.exit(1)
   }
-  const network: Network = {
-    rpcUrl: stored.rpcUrl,
-    deployment: parseDeployment(stored.deployment),
-    // the daemon holds agent keys only — funding is the owner CLI's job
-    fund: async () => { throw new Error("the daemon cannot fund accounts") },
-    storageUrl: typeof stored.storageUrl === "string" ? stored.storageUrl : undefined,
-    sponsorUrl: typeof stored.sponsorUrl === "string" ? stored.sponsorUrl : undefined,
-  }
+  // the daemon holds agent keys only — funding is the owner CLI's job
+  network.fund = async () => { throw new Error("the daemon cannot fund accounts") }
 
   // The compile model is chosen once here from the environment (MIDA_COMPILE_MODEL /
   // the provider keys): deepseek → kimi → haiku, with the chain as its ordered fallbacks.

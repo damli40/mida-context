@@ -18,9 +18,10 @@ import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE, ServiceRuntime } from "./runtime.js"
 import type { Network } from "./runtime.js"
+import { mismatchLine, resolveNetwork } from "./network.js"
+import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
-import { testnetNetwork } from "./testnet.js"
-import { approve, authorNamesFor, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
+import { approve, authorNamesFor, deploymentMismatchError, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
 import { loadOwnerMode } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
 import { OwnerLinkOutcome, approvePasskey, initPasskey, revokePasskey } from "./owner-link/flows.js"
@@ -63,6 +64,19 @@ export function namespaceLabel(id: string): string {
   } catch {
     return `${id.slice(0, 10)}…`
   }
+}
+
+/**
+ * The command-side read of the one network rule: the home's saved contract, RPC and service
+ * URLs win, and the built-in record only fills a brand-new home. Returns the full resolution —
+ * main needs `mismatch` to warn on stderr and to refuse an `init` that would move the setup.
+ */
+export async function networkForCommand(
+  home: MidaHome,
+  env: Record<string, string | undefined>,
+  deps?: ResolveDeps,
+): Promise<ResolvedNetwork> {
+  return resolveNetwork(home, env, deps)
 }
 
 export interface CliDeps {
@@ -108,6 +122,13 @@ export interface CliDeps {
    * come from this deps object; everything else defaults to the real thing.
    */
   ownerLink?: Omit<PasskeyDeps, "print" | "progress">
+  /**
+   * The resolution the calling entry point ran under (main's `networkForCommand`). When its
+   * `mismatch` is set — the saved setup names another contract than this build ships — `init`
+   * refuses before anything opens the runtime; the other owner commands still run on the saved
+   * contract, because that is where the setup's data lives.
+   */
+  resolvedNetwork?: ResolvedNetwork
 }
 
 /**
@@ -427,6 +448,13 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
       }
       return `${opener} — run the same command again in a minute — it will tell you if it already went through; nothing was sent from your wallet`
     }
+    // The saved setup names another contract than this build ships. Only `mida migrate` may
+    // move it — init refuses rather than rewrite the file (the error carries both addresses).
+    case "deployment-mismatch": {
+      const detail = error as { saved?: unknown; builtIn?: unknown }
+      const short = (a: unknown) => (typeof a === "string" ? `${a.slice(0, 6)}…` : "unknown")
+      return `this setup is on contract ${short(detail.saved)}; this version of Mida ships ${short(detail.builtIn)}. \`init\` will not move it — run \`mida migrate\``
+    }
     default:
       return `refused: ${typeof code === "string" ? code : "ERROR"}`
   }
@@ -592,6 +620,14 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   }
   const mode = loadOwnerMode(deps.home)
   const passkeyInit = command === "init" && argv[1] === "--passkey"
+  // init on a setup saved to another contract refuses before the runtime even opens — the
+  // file is never rewritten; only `mida migrate` may move it. Covers software and passkey
+  // init alike (initPasskey keeps the same check internally for direct callers).
+  if (command === "init" && deps.resolvedNetwork?.mismatch !== undefined) {
+    const mismatch = deps.resolvedNetwork.mismatch
+    deps.print(ownerRefusalLine(command, argv[1] ?? "", deploymentMismatchError(mismatch.saved, mismatch.builtIn)))
+    return 1
+  }
   if (OWNER_COMMANDS.includes(command) && (mode === "passkey" || passkeyInit)) {
     const code = await runPasskeyOwnerCommand(argv, deps, mode)
     if (code === 0 && (command === "approve" || command === "revoke")) {
@@ -739,16 +775,20 @@ async function main(): Promise<void> {
     return
   }
 
-  // Everything below touches the chain, so this is where the network is resolved — deployment
-  // record, hosted service defaults, the optional funder — never earlier: `--help`, `install`
-  // and `doctor` must work with no RPC reachable at all.
-  const network = await testnetNetwork(process.env)
+  // Everything below touches the chain, so this is where the network is resolved — the saved
+  // setup's contract and services when there is one, the built-in record for a first-time home
+  // — never earlier: `--help`, `install` and `doctor` must work with no RPC reachable at all.
+  const resolved = await networkForCommand(home, process.env)
 
   // Owner commands — init, approve, revoke, remember — run in this process on the owner
   // runtime and are never sent to the daemon socket. `init` still spawns the daemon when one
   // is not already running; the others reuse a live daemon's Context API or start their own.
   if (OWNER_COMMANDS.includes(argv[0] ?? "")) {
-    const code = await runCli(argv, { home, network, print, cwd: process.cwd() })
+    // A setup saved on another contract still works — the saved contract is where its data
+    // lives — but the owner is told, on stderr so the command's stdout keeps its shape.
+    const notice = mismatchLine(resolved)
+    if (notice !== undefined) process.stderr.write(`${notice}\n`)
+    const code = await runCli(argv, { home, network: resolved.network, print, cwd: process.cwd(), resolvedNetwork: resolved })
     if (argv[0] === "init" && code === 0) {
       const health = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
       if (health.status === 0) spawnDaemon(home.root)

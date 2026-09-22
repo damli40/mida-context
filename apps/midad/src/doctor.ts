@@ -6,7 +6,7 @@ import { createPublicClient, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { isMidaError } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
-import { chainFor, parseDeployment } from "@mida/chain"
+import { chainFor } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { COMPILE_PROVIDERS, compileModelChoice } from "@mida/compiler"
 import { ContextApiClient, DenyOverlay, RegistryReader } from "@mida/api"
@@ -22,6 +22,8 @@ import type { OwnerMode } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
 import { listJobs } from "./queue.js"
 import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, serviceUrlInEffect, sponsorReachable } from "./runtime.js"
+import { mismatchLine, resolveNetwork } from "./network.js"
+import type { ResolvedNetwork, ServiceSource } from "./network.js"
 import { cliPackageName, isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
 
 /** The whole run is capped — a check may stall, the report may not. */
@@ -54,13 +56,15 @@ interface DoctorLiveDeps extends DoctorDeps {
   startSession?: (tool: InstallTool, cwd: string) => { stop(): void }
 }
 
-/** What the chain checks need; built lazily once network.json has been read. */
+/** What the chain checks need; built lazily once the network has been resolved. */
 interface Shared {
   context?: ChainContext
   reader?: RegistryReader
   ownerAddress?: Address | "missing"
   /** Agents the "agents" check found live on chain — undefined until that check finished. */
   approved?: { name: string; agentId: Hex }[]
+  /** The run's one resolveNetwork result — null once a resolution was tried and refused. */
+  resolved?: ResolvedNetwork | null
 }
 
 const problem = (sentence: string, fix: string) => `PROBLEM: ${sentence} — ${fix}`
@@ -88,15 +92,21 @@ function within<T>(work: Promise<T>, ms: number): Promise<T> {
   })
 }
 
-/** network.json → rpcUrl + deployment, or a refusal-shaped problem. Read only; never written. */
-function readNetwork(home: MidaHome): { rpcUrl: string; deployment: ReturnType<typeof parseDeployment> } | undefined {
+/**
+ * The one resolveNetwork run for the whole report — every check resolves the network the same
+ * way the command, the daemon and the drainer do, so doctor can never again answer about a
+ * different contract than they would use. No chain-id probe: doctor measures the chain itself.
+ * A refusal is cached as null so later checks do not re-resolve; they fall back to the raw file.
+ */
+async function resolveShared(deps: DoctorDeps, shared: Shared): Promise<ResolvedNetwork | undefined> {
+  if (shared.resolved !== undefined) return shared.resolved ?? undefined
   try {
-    const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown }>("network.json")
-    if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) return undefined
-    return { rpcUrl: stored.rpcUrl, deployment: parseDeployment(stored.deployment) }
+    const resolved = await resolveNetwork(deps.home, deps.env ?? process.env, { probeChainId: false })
+    shared.resolved = resolved
   } catch {
-    return undefined
+    shared.resolved = null
   }
+  return shared.resolved ?? undefined
 }
 
 function chainOf(shared: Shared): { context: ChainContext; reader: RegistryReader } | undefined {
@@ -155,15 +165,47 @@ function ownerAccountOf(home: MidaHome): LocalAccount | "missing" {
 }
 
 /**
- * The service URLs a call would use right now — one shared resolution so the checks and the
- * services report cannot diverge again (M3-D6 item 3): the environment wins in both directions,
- * then network.json (what init persisted — the daemon's and drainer's only source), then the
- * hosted default. The default is a source, not a probe target: nothing this home runs was
- * configured to it, so "default" resolves to undefined here and only the services check names
- * it, as what a fresh init would use.
+ * The service URLs a call would use right now — the run's shared resolveNetwork result, so the
+ * checks and the services report cannot diverge again (M3-D6 item 3). Sources the rule reports:
+ * the environment wins in both directions, then the saved file; a saved home that never stored
+ * a service address resolves to "local" — this setup ran the local store and pays its own gas,
+ * so nothing is probed and nothing is reported as hosted. Only a home with no file at all falls
+ * through to "hosted-default". The default is a source, not a probe target: its effective URL
+ * is undefined here and only the services check names it, as what a fresh init would use.
+ *
+ * When the shared resolution refuses (a network.json that is corrupt or missing fields) the
+ * checks still answer from the raw file — a doctor that needed a valid deployment to name a
+ * saved service would hide the one thing the file did record. That fallback keeps the old
+ * "default" source for a file it cannot prove belongs to a working setup.
  */
-function serviceUrls(home: MidaHome, env: NodeJS.ProcessEnv) {
-  const stored = home.readJson<{ storageUrl?: unknown; sponsorUrl?: unknown }>("network.json")
+interface DoctorService {
+  /** The URL a call would use — undefined for "local", "off", and the hosted default. */
+  url: string | undefined
+  source: ServiceSource | "default"
+}
+
+async function doctorServices(
+  deps: DoctorDeps,
+  shared: Shared,
+): Promise<{ storageUrl: string | undefined; sponsorUrl: string | undefined; storage: DoctorService; sponsor: DoctorService }> {
+  const resolved = await resolveShared(deps, shared)
+  if (resolved !== undefined) {
+    const effective = (service: { url: string | undefined; source: ServiceSource }) =>
+      service.source === "environment" || service.source === "network.json" ? service.url : undefined
+    return {
+      storageUrl: effective(resolved.storage),
+      sponsorUrl: effective(resolved.sponsor),
+      storage: resolved.storage,
+      sponsor: resolved.sponsor,
+    }
+  }
+  const env = deps.env ?? process.env
+  let stored: { storageUrl?: unknown; sponsorUrl?: unknown } | undefined
+  try {
+    stored = deps.home.readJson("network.json")
+  } catch {
+    stored = undefined
+  }
   const storage = serviceUrlInEffect(env.MIDA_STORAGE_URL, stored?.storageUrl, HOSTED_STORAGE_URL)
   const sponsor = serviceUrlInEffect(env.MIDA_SPONSOR_URL, stored?.sponsorUrl, HOSTED_SPONSOR_URL)
   return {
@@ -293,14 +335,32 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
     {
       name: "network",
       run: async () => {
-        const network = readNetwork(home)
-        if (network === undefined) return [problem("network.json is missing or unreadable", INIT_FIX)]
+        let resolved: ResolvedNetwork
+        try {
+          resolved = await resolveNetwork(home, deps.env ?? process.env, { probeChainId: false })
+        } catch (error) {
+          shared.resolved = null
+          const code = (error as { code?: unknown }).code
+          // The operator pointed MIDA_DEPLOYMENTS_DIR at a different contract than the setup
+          // saved — doctor names the conflict instead of picking a side.
+          return code === "deployment-conflict"
+            ? [problem("MIDA_DEPLOYMENTS_DIR names a different contract than this setup", "unset MIDA_DEPLOYMENTS_DIR")]
+            : [problem("network.json is missing or unreadable", INIT_FIX)]
+        }
+        shared.resolved = resolved
+        if (!resolved.saved) return [problem("network.json is missing or unreadable", INIT_FIX)]
         shared.context = {
-          publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: http(network.rpcUrl) }),
-          deployment: network.deployment,
+          publicClient: createPublicClient({ chain: chainFor(resolved.network.deployment.chainId), transport: http(resolved.network.rpcUrl) }),
+          deployment: resolved.network.deployment,
         }
         shared.reader = new RegistryReader(shared.context)
-        return ["ok: network.json present"]
+        const short = (a: string) => `${a.slice(0, 6)}…`
+        const lines = ["ok: network.json present", `contract ${short(resolved.network.deployment.capabilityRegistry)}`]
+        // A saved contract that differs from this build's record is a note, not a problem —
+        // the setup still works on the contract it saved.
+        const note = mismatchLine(resolved)
+        if (note !== undefined) lines.push(`note: ${note}`)
+        return lines
       },
     },
     {
@@ -406,7 +466,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         if (chain === undefined) return [problem("the store's deny list cannot be checked", NEEDS_NETWORK)]
         const owner = shared.ownerAddress ?? ownerAddressOf(home)
         if (owner === "missing") return [problem("the store's deny list cannot be checked", needsOwner(home))]
-        const storageUrl = serviceUrls(home, deps.env ?? process.env).storageUrl
+        const storageUrl = (await doctorServices(deps, shared)).storageUrl
         let targets: RevocationTarget[]
         try {
           if (storageUrl !== undefined) {
@@ -631,7 +691,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         // (M3-D3 — the Sep 22 run printed a low-balance PROBLEM while the sponsor was working).
         // Only with no sponsor configured, or one that is not answering, does a low wallet
         // matter again: the self-paid fallback is what would have to carry the next send.
-        const sponsorUrl = serviceUrls(home, deps.env ?? process.env).sponsorUrl
+        const sponsorUrl = (await doctorServices(deps, shared)).sponsorUrl
         if (sponsorUrl !== undefined && (await sponsorReachable(sponsorUrl))) {
           // A passkey owner has no wallet on this machine to call a fallback — only software
           // mode prints the owner balance.
@@ -664,11 +724,15 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       name: "services",
       run: async () => {
         // What the Context API and the gas sponsor resolve to right now — the env override
-        // first in both directions, then the value init persisted to network.json, else the
-        // hosted default the package ships with. The host only — a path or query could carry a key.
-        const { storage, sponsor } = serviceUrls(home, deps.env ?? process.env)
+        // first in both directions, then the value init persisted to network.json. A saved home
+        // that never stored one is "local": this setup ran the local store and pays its own gas,
+        // so no hosted default is named for it. The host only — a path or query could carry a key.
+        const { storage, sponsor } = await doctorServices(deps, shared)
         const describe = (label: string, envName: string, resolved: { url: string | undefined; source: string }, off: string): string => {
           if (resolved.source === "off") return `${label}: ${off}`
+          if (resolved.source === "local") {
+            return label === "store" ? "store: local (this setup saved no store address)" : "sponsor: none — this setup pays its own gas"
+          }
           if (resolved.source === "environment") return `${label}: ${hostOf(resolved.url!)} (${envName})`
           if (resolved.source === "network.json") return `${label}: ${hostOf(resolved.url!)} (network.json)`
           return `${label}: ${hostOf(resolved.url!)} (default)`
@@ -698,9 +762,11 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       run: async () => {
         // the same resolution the send path uses — env first, then network.json — so
         // MIDA_SPONSOR_URL=off here means what it means there (M3-D6). No chain needed.
-        const sponsor = serviceUrls(home, deps.env ?? process.env).sponsor
+        const { sponsor } = await doctorServices(deps, shared)
         if (sponsor.source === "off") return ["ok: gas sponsor off — sends pay their own gas"]
-        if (sponsor.source === "default") {
+        // a saved home that never stored a sponsor pays its own gas — nothing to probe
+        if (sponsor.source === "local") return ["ok: no gas sponsor — this setup pays its own gas"]
+        if (sponsor.source === "default" || sponsor.source === "hosted-default") {
           return ["ok: no gas sponsor in network.json — the services check shows what init will use"]
         }
         const sponsorUrl = sponsor.url!

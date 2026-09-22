@@ -1,10 +1,9 @@
-import { parseDeployment } from "@mida/chain"
 import { compileCheckpoint, compileModelChoice } from "@mida/compiler"
 import { drainUntilSettled } from "./drain.js"
 import { resolveHome } from "./home.js"
 import { appendLog } from "./log.js"
+import { serviceNetwork } from "./network.js"
 import { ServiceRuntime } from "./runtime.js"
-import type { Network } from "./runtime.js"
 
 /**
  * The detached drainer entry. It never loads `.env` — everything it needs is in the home folder:
@@ -17,20 +16,17 @@ import type { Network } from "./runtime.js"
 async function main(): Promise<void> {
   const home = resolveHome(process.env)
   const open = async (): Promise<ServiceRuntime> => {
-    const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown; storageUrl?: unknown; sponsorUrl?: unknown }>("network.json")
-    if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) {
+    // The same resolution the daemon uses — a drain that ran a different contract or store than
+    // the daemon would split the setup's checkpoints in two.
+    const network = await serviceNetwork(home, process.env).catch((error: unknown) => {
+      if ((error as { code?: unknown }).code === "network-json-invalid") return undefined
+      throw error
+    })
+    if (network === undefined) {
       throw new Error("network.json is missing or incomplete; run mida init first")
     }
-    const network: Network = {
-      rpcUrl: stored.rpcUrl,
-      deployment: parseDeployment(stored.deployment),
-      // the drainer holds agent keys only — funding is the owner CLI's job
-      fund: async () => { throw new Error("the drainer cannot fund accounts") },
-      // both URLs the daemon honours — a drain writing to a local store while the CLI writes to
-      // the hosted one would split the checkpoints in two
-      storageUrl: typeof stored.storageUrl === "string" ? stored.storageUrl : undefined,
-      sponsorUrl: typeof stored.sponsorUrl === "string" ? stored.sponsorUrl : undefined,
-    }
+    // the drainer holds agent keys only — funding is the owner CLI's job
+    network.fund = async () => { throw new Error("the drainer cannot fund accounts") }
     return ServiceRuntime.open(home, network)
   }
 

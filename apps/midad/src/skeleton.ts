@@ -10,6 +10,7 @@ import type { StoredCheckpoint } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
 import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl, sponsorReachable } from "./runtime.js"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
+import { resolveNetwork } from "./network.js"
 import { FACT_NAMESPACES } from "./remember.js"
 import { unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
@@ -104,21 +105,47 @@ export function declarationsFor(purposeId: PurposeId) {
   }))
 }
 
+/**
+ * The init refusal when the setup's saved contract is not the one this run resolves to. `saved`
+ * and `builtIn` ride on the error so ownerRefusalLine can name both records without re-resolving.
+ */
+export function deploymentMismatchError(saved: string, builtIn: string): Error {
+  const short = (a: string) => `${a.slice(0, 6)}…`
+  return Object.assign(
+    new Error(`this setup's network.json names contract ${short(saved)}, not the ${short(builtIn)} this run resolves to`),
+    { code: "deployment-mismatch", saved, builtIn },
+  )
+}
+
 /** Spec §5A. Every step first asks the chain or the disk whether it is already done, so running it twice is harmless. */
 export async function init(runtime: Runtime, agentNames: readonly string[]): Promise<{ owner: Address; agents: Record<string, Hex> }> {
   const { home, network, vault, reader, owner } = runtime
-  // The detached drainer never loads .env; init leaves it the public chain coordinates to read back.
-  // chainId/deploymentBlock are bigints, so they go on disk as decimal strings for parseDeployment.
-  const deployment = network.deployment
-  home.writeSecretJson("network.json", {
-    chainId: Number(deployment.chainId),
-    rpcUrl: network.rpcUrl,
-    deployment: { ...deployment, chainId: deployment.chainId.toString(), deploymentBlock: deployment.deploymentBlock.toString() },
-    // absent stays absent — an unset URL serializes as no key, and a later `init` without the
-    // value does not blank one an operator wrote into the file by hand
-    ...(network.storageUrl === undefined ? {} : { storageUrl: network.storageUrl }),
-    ...(network.sponsorUrl === undefined ? {} : { sponsorUrl: network.sponsorUrl }),
-  })
+  if (home.has("network.json")) {
+    // A setup's contract is bound at init: a saved network.json is never rewritten — only
+    // `mida migrate` may move it. When the file names another contract than the one this run
+    // resolves to, init refuses before any chain call; a corrupt file refuses the same way
+    // (network-json-invalid propagates — corrupt is never treated as missing).
+    const resolved = await resolveNetwork(home, process.env, {
+      loadBuiltIn: () => network.deployment,
+      probeChainId: false,
+    })
+    if (resolved.mismatch !== undefined) {
+      throw deploymentMismatchError(resolved.mismatch.saved, resolved.mismatch.builtIn)
+    }
+  } else {
+    // The detached drainer never loads .env; init leaves it the public chain coordinates to read back.
+    // chainId/deploymentBlock are bigints, so they go on disk as decimal strings for parseDeployment.
+    const deployment = network.deployment
+    home.writeSecretJson("network.json", {
+      chainId: Number(deployment.chainId),
+      rpcUrl: network.rpcUrl,
+      deployment: { ...deployment, chainId: deployment.chainId.toString(), deploymentBlock: deployment.deploymentBlock.toString() },
+      // absent stays absent — an unset URL serializes as no key, and a later `init` without the
+      // value does not blank one an operator wrote into the file by hand
+      ...(network.storageUrl === undefined ? {} : { storageUrl: network.storageUrl }),
+      ...(network.sponsorUrl === undefined ? {} : { sponsorUrl: network.sponsorUrl }),
+    })
+  }
   // The daemon needs the owner's public address to verify the signed approved-projects list and to
   // ask the chain about grants — it never reads owner/secrets.json, so the address is public metadata.
   saveOwnerAddress(home, owner)

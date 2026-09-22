@@ -5,6 +5,8 @@ import type { AddressInfo, Server } from "node:net"
 import { createServer as createHttpServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
+import { parseDeployment } from "@mida/chain"
 import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, installClaudeCode, installCodex, loadOrCreateOwnerSecrets, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
@@ -629,5 +631,56 @@ describe("mida doctor on a passkey home", () => {
     } finally {
       await rpc.close()
     }
+  })
+})
+
+// Plan A Task 2: doctor resolves the network through the same rule every other entry point
+// uses. A Sep-22-era network.json — contract + RPC and NO service URLs — means this setup ran
+// the local store and paid its own gas, so doctor must never report or probe the hosted
+// defaults as if the home used them.
+describe("mida doctor on a saved home with no service URLs", () => {
+  const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
+  const X_RAW = JSON.parse(
+    readFileSync(join(REPO_ROOT, "docs/evidence/deployment-10143-vault.mida.xyz-2026-09-17.json"), "utf8"),
+  ) as { capabilityRegistry: string }
+  const Y = parseDeployment(
+    JSON.parse(readFileSync(join(REPO_ROOT, "contracts/deployments/10143.json"), "utf8")),
+  )
+  const X_CAPREG = X_RAW.capabilityRegistry.toLowerCase()
+  const short = (a: string) => `${a.slice(0, 6)}…`
+
+  /** The Sep-22 home: saved before storage/sponsor URLs existed. A dead local port keeps the chain checks instant. */
+  const sep22Home = () => {
+    const home = new MidaHome(join(dir(), "home"))
+    home.writeSecretJson("network.json", { chainId: 10143, rpcUrl: "http://127.0.0.1:1", deployment: X_RAW })
+    return home
+  }
+  const doctorLines = async (home: MidaHome): Promise<string[]> => {
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), env: {}, daemonProbeMs: 50 })
+    return lines
+  }
+
+  it("reports the local store and self-paid gas — never the hosted defaults", async () => {
+    const lines = await doctorLines(sep22Home())
+    expect(lines).toContain("ok: store: local (this setup saved no store address)")
+    expect(lines).toContain("ok: sponsor: none — this setup pays its own gas")
+    // no line may name the hosted store or sponsor — this home was never configured to them
+    const output = lines.join("\n")
+    expect(output).not.toContain("store.midacontext.xyz")
+    expect(output).not.toContain("sponsor.midacontext.xyz")
+    // and the sponsor probe itself is skipped — there is nothing to probe
+    expect(lines.every((line) => !line.includes("gas sponsor reachable") && !line.includes("did not answer"))).toBe(true)
+  })
+
+  it("a setup saved on another contract names both records — a note, not a problem", async () => {
+    const lines = await doctorLines(sep22Home())
+    expect(lines).toContain("ok: network.json present")
+    expect(lines).toContain(`contract ${short(X_CAPREG)}`)
+    expect(lines).toContain(
+      `note: this setup is on contract ${short(X_CAPREG)}; this version of Mida ships ${short(Y.capabilityRegistry.toLowerCase())} — run \`mida migrate\` to move`,
+    )
+    // the mismatch is a note because the setup still works — never a PROBLEM
+    expect(lines.every((line) => !line.startsWith("PROBLEM: MIDA_DEPLOYMENTS_DIR"))).toBe(true)
   })
 })

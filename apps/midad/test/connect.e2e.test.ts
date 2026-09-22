@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { mkdtempSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PERMISSION, PROVENANCE_POLICY } from "@mida/protocol"
@@ -40,6 +40,11 @@ describe("SDK connectAgent ↔ mida approve interop on local Anvil", () => {
 
   step("1. init provisions sdk-agent into a home connectAgent can load", async () => {
     await init(runtime, ["sdk-agent"])
+    // the setup's saved contract is the one init ran on — what connectAgent binds to below
+    const saved = JSON.parse(readFileSync(join(homePath, "network.json"), "utf8")) as {
+      deployment?: { capabilityRegistry?: string }
+    }
+    expect(saved.deployment?.capabilityRegistry).toBe(env.deployment.capabilityRegistry)
     const conn = connectAgent({ name: "sdk-agent", midaHome: homePath, env: {} })
     expect(conn.owner.toLowerCase()).toBe(runtime.owner.toLowerCase())
   })

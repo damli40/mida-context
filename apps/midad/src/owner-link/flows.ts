@@ -60,11 +60,13 @@ import {
   sponsorReachable,
 } from "../runtime.js"
 import type { Network } from "../runtime.js"
+import { resolveNetwork } from "../network.js"
 import { canonicalEntries, ensureProjectMarker, readApprovalsFile, writeSignedApprovals } from "../projects.js"
 import type { ProjectApproval } from "../projects.js"
 import { FileAccessRequestStore } from "../request-store.js"
 import {
   declarationsFor,
+  deploymentMismatchError,
   expectedScopesFor,
   hasAnyLiveCapability,
   isCapabilityLive,
@@ -214,6 +216,18 @@ export async function initPasskey(
   agentNames: readonly string[],
   deps: PasskeyDeps,
 ): Promise<{ owner: Address; agents: Record<string, Hex> }> {
+  if (home.has("network.json")) {
+    // Same binding rule as the software init: a saved network.json is never rewritten, and one
+    // that names another contract than this run resolves to refuses before any chain call —
+    // the key read below included.
+    const resolved = await resolveNetwork(home, process.env, {
+      loadBuiltIn: () => network.deployment,
+      probeChainId: false,
+    })
+    if (resolved.mismatch !== undefined) {
+      throw deploymentMismatchError(resolved.mismatch.saved, resolved.mismatch.builtIn)
+    }
+  }
   const chain = bareChain(network)
   const readOwnerKey = deps.readOwnerKey ?? ((owner: Address) => new RegistryReader(chain).ownerP256Key(owner))
 
@@ -246,16 +260,18 @@ export async function initPasskey(
   // agents — operator registration and manifest uploads need no owner signature. The identity
   // line goes with every passkey command.
   deps.print(PASSKEY_IDENTITY_LINE)
-  const deployment = network.deployment
-  home.writeSecretJson("network.json", {
-    chainId: Number(deployment.chainId),
-    rpcUrl: network.rpcUrl,
-    deployment: { ...deployment, chainId: deployment.chainId.toString(), deploymentBlock: deployment.deploymentBlock.toString() },
-    // absent stays absent — an unset URL serializes as no key, and a later `init` without the
-    // value does not blank one an operator wrote into the file by hand
-    ...(network.storageUrl === undefined ? {} : { storageUrl: network.storageUrl }),
-    ...(network.sponsorUrl === undefined ? {} : { sponsorUrl: network.sponsorUrl }),
-  })
+  if (!home.has("network.json")) {
+    const deployment = network.deployment
+    home.writeSecretJson("network.json", {
+      chainId: Number(deployment.chainId),
+      rpcUrl: network.rpcUrl,
+      deployment: { ...deployment, chainId: deployment.chainId.toString(), deploymentBlock: deployment.deploymentBlock.toString() },
+      // absent stays absent — an unset URL serializes as no key, and a later `init` without the
+      // value does not blank one an operator wrote into the file by hand
+      ...(network.storageUrl === undefined ? {} : { storageUrl: network.storageUrl }),
+      ...(network.sponsorUrl === undefined ? {} : { sponsorUrl: network.sponsorUrl }),
+    })
+  }
 
   const agents =
     deps.provision !== undefined
