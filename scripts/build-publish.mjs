@@ -115,8 +115,10 @@ buildSync({
   logLevel: "info",
 })
 for (const file of readdirSync(cliDist).filter((f) => f.endsWith(".js"))) chmodSync(join(cliDist, file), 0o755)
-// The checkpoint compiler spawns this script by path relative to its own module — it ships
-// byte-for-byte beside the bundles.
+// The checkpoint compiler spawns these scripts by path relative to its own module —
+// openai-compatible-model.mjs is the real call; kimi-model.mjs is the compat shim that execs
+// it. Both ship byte-for-byte beside the bundles.
+copyFileSync(join(ROOT, "packages/compiler/src/openai-compatible-model.mjs"), join(cliDist, "openai-compatible-model.mjs"))
 copyFileSync(join(ROOT, "packages/compiler/src/kimi-model.mjs"), join(cliDist, "kimi-model.mjs"))
 writePackageManifest("cli", names.cli, "cli.package.template.json", cliDeps)
 
