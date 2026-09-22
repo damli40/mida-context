@@ -184,10 +184,10 @@ export function makeOwnerApi(input: {
  */
 export function describeError(error: unknown): string {
   if (error instanceof SponsorPending) {
-    return `The transaction was accepted and may still land — operation ${error.userOpHash}. Nothing was sent twice; check the operation before trying again.`
+    return "accepted, still landing — check again in a minute"
   }
   if (error instanceof SponsorDidNotPay) {
-    return `The gas sponsor did not pay: ${error.reason}. Try again later — this page cannot pay for transactions itself.`
+    return `the gas sponsor refused: ${error.reason}`
   }
   if (isMeraError(error) && error.code === "PRF_UNAVAILABLE") {
     return "This passkey was saved somewhere that cannot hold Mida's secret. Delete it and create it again, choosing iCloud Keychain, Google Password Manager or 1Password — not 'this device' / 'your Chrome profile'."

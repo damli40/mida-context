@@ -1,20 +1,17 @@
-import { MidaError } from "@mida/protocol"
+import { toMidaError } from "@mida/chain/browser"
 import type { Abi, Address, LocalAccount, PublicClient } from "viem"
-import { GAS_CEILINGS, toMidaError } from "@mida/chain/browser"
 import type { Deployment, SponsoredReceipt, SponsoredSender, TxKind } from "@mida/chain/browser"
 
 /**
- * The owner page's ONLY write path. `sendContract` in @mida/chain does the same first two steps
- * (simulate so a revert surfaces as a named error, then the per-kind gas ceiling) but falls back
- * to paying from the user's wallet when the sponsor refuses — correct for the CLI's key-file
- * owner, wrong here: a passkey owner holds no MON, so a fallback send could only fail after the
- * sponsor already refused. SponsorDidNotPay and SponsorPending propagate untouched; the flow
- * shows the first as a plain failure and the second as pending with the operation hash, and
- * never retries on its own.
- *
- * The ceiling check mirrors `contractGas` in packages/chain/src/gas.ts (an unpadded node
- * estimate refused above GAS_CEILINGS[kind]) — the sponsored op carries the bundler's own gas
- * fields, but a call over its kind's ceiling is refused locally before the sponsor sees it.
+ * The owner page's ONLY write path. `sendContract` in @mida/chain does the same first step —
+ * `simulateContract` is an eth_call and needs no balance, so a revert surfaces as a named error
+ * — then hands the call to the sponsored sender, which checks the per-kind ceiling against the
+ * bundler's own callGasLimit. There is deliberately no `estimateContractGas` here: it runs as
+ * the passkey owner, and Monad refuses the estimate for a sender who cannot afford the worst
+ * case — a passkey owner holds 0 MON, so every send would fail before the sponsor was asked.
+ * And there is no self-pay fallback for the same reason. SponsorDidNotPay and SponsorPending
+ * propagate untouched; the flow shows the first as a plain refusal and the second as pending
+ * with the operation hash, and never retries on its own.
  */
 export interface SponsoredWriteContext {
   publicClient: PublicClient
@@ -38,22 +35,6 @@ export async function sendSponsoredOnly(
     } as never)
   } catch (error) {
     throw toMidaError(error)
-  }
-  let estimate: bigint
-  try {
-    estimate = await context.publicClient.estimateContractGas({
-      account: context.account,
-      address: call.address,
-      abi: call.abi,
-      functionName: call.functionName,
-      args: call.args,
-    } as never)
-  } catch (error) {
-    throw toMidaError(error)
-  }
-  const ceiling = GAS_CEILINGS[kind]
-  if (estimate > ceiling) {
-    throw new MidaError("GAS_CEILING_EXCEEDED", `${kind}: estimate ${estimate} exceeds ceiling ${ceiling}`)
   }
   return context.sponsor.send(call, kind)
 }

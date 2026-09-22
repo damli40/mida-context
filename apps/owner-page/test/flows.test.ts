@@ -430,7 +430,7 @@ describe("approve flow", () => {
     const prep = await prepareApprove(env, parsed)
     const result = await confirmApprove(env, parsed, prep)
     expect(result.status).toBe("failed")
-    expect(result.reason).toContain("sponsor did not pay")
+    expect(result.reason).toBe("the gas sponsor refused: quota exhausted")
     expect(sends).toHaveLength(0)
   })
 
@@ -446,6 +446,7 @@ describe("approve flow", () => {
     const result = await confirmApprove(env, parsed, prep)
     expect(result.status).toBe("pending")
     expect(result.operations).toContain(`0x${"ee".repeat(32)}`)
+    expect(result.reason).toBe("accepted, still landing — check again in a minute")
   })
 
   it("an expired request is refused in prepare — the passkey is never asked", async () => {

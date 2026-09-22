@@ -188,6 +188,15 @@ export async function runSignup(env: FlowEnvironment, link: ParsedLink, userName
       publicKey: { x: `0x${bytesToHexString(created.publicKey.x)}` as Hex, y: `0x${bytesToHexString(created.publicKey.y)}` as Hex },
     })
   } catch (error) {
+    if (error instanceof SponsorPending) {
+      return buildResult({
+        ...resultBase(link, null),
+        status: "pending",
+        transactions: sent.map((s) => s.transactionHash),
+        operations: [...sent.map((s) => s.userOpHash), error.userOpHash],
+        reason: describeError(error),
+      })
+    }
     return failure(link, null, error, sent)
   }
 }
@@ -386,7 +395,7 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
         status: "pending",
         transactions: sent.map((s) => s.transactionHash),
         operations: [...sent.map((s) => s.userOpHash), error.userOpHash],
-        reason: "the sponsored operation was accepted but not confirmed in time",
+        reason: describeError(error),
       })
     }
     return failure(link, owner, error, sent)
@@ -516,7 +525,7 @@ export async function confirmRevoke(env: FlowEnvironment, link: ParsedLink, prep
         status: "pending",
         transactions: sent.map((s) => s.transactionHash),
         operations: [...sent.map((s) => s.userOpHash), error.userOpHash],
-        reason: "the sponsored operation was accepted but not confirmed in time",
+        reason: describeError(error),
       })
     }
     return failure(link, owner, error, sent)
