@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest"
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
-import type { Server } from "node:net"
+import type { AddressInfo, Server } from "node:net"
+import { createServer as createHttpServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, installClaudeCode, installCodex, loadOrCreateOwnerSecrets, runDoctor, runDoctorLive, socketPathFor } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, installClaudeCode, installCodex, loadOrCreateOwnerSecrets, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
 
@@ -439,5 +440,140 @@ describe("mida doctor --live", () => {
     })
     expect(code).toBe(2)
     expect(lines).toEqual(["refused: live checks need an interactive terminal"])
+  })
+})
+
+describe("mida doctor on a passkey home", () => {
+  const OWNER = "0x1111111111111111111111111111111111111111" as `0x${string}`
+  const QX = `0x${"ab".repeat(32)}` as `0x${string}`
+  const QY = `0x${"cd".repeat(32)}` as `0x${string}`
+
+  /** A stub JSON-RPC that scripts one answer: the point `ownerP256Key`'s eth_call returns. */
+  async function stubRpc(point: { qx: bigint; qy: bigint } | null): Promise<{ url: string; close(): Promise<void> }> {
+    const pointAnswer =
+      point === null
+        ? `0x${"00".repeat(64)}`
+        : `0x${point.qx.toString(16).padStart(64, "0")}${point.qy.toString(16).padStart(64, "0")}`
+    const server = createHttpServer((req, res) => {
+      let body = ""
+      req.on("data", (chunk) => (body += chunk))
+      req.on("end", () => {
+        const call = JSON.parse(body) as { id: number; method: string }
+        const reply = (result: unknown) => {
+          res.setHeader("content-type", "application/json")
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, result }))
+        }
+        if (call.method === "eth_call") return reply(pointAnswer)
+        if (call.method === "eth_getBalance") return reply("0x0")
+        if (call.method === "eth_chainId") return reply("0x7a69")
+        if (call.method === "eth_blockNumber") return reply("0x64")
+        return reply("0x")
+      })
+    })
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject)
+      server.listen(0, "127.0.0.1", resolve)
+    })
+    const port = (server.address() as AddressInfo).port
+    return { url: `http://127.0.0.1:${port}`, close: () => new Promise<void>((done) => server.close(() => done())) }
+  }
+
+  const DEPLOYMENT = {
+    chainId: "31337",
+    capabilityRegistry: "0x2222222222222222222222222222222222222222",
+    contextRegistry: "0x3333333333333333333333333333333333333333",
+    deploymentBlock: "0",
+    vaultRpId: "vault.mida.xyz",
+    vaultRpIdHash: `0x${"55".repeat(32)}`,
+    policyHashV1: `0x${"44".repeat(32)}`,
+  }
+
+  function passkeyHome(rpcUrl: string, withPublicKey: boolean): MidaHome {
+    const home = new MidaHome(join(dir(), "home"))
+    saveOwnerMode(home, "passkey")
+    saveOwnerAddress(home, OWNER, withPublicKey ? { x: QX, y: QY } : undefined)
+    home.writeSecretJson("network.json", { rpcUrl, deployment: DEPLOYMENT })
+    return home
+  }
+
+  function doctorLines(home: MidaHome, lines: string[]): Promise<number> {
+    return runDoctor({ home, print: (line) => lines.push(line), env: {}, daemonProbeMs: 50 })
+  }
+
+  /** The lines the "owner" check printed — from its first line to the next check's output. */
+  function ownerLines(lines: string[]): string[] {
+    const start = lines.findIndex((line) => line.includes("owner is a passkey") || line.includes("passkey home has no owner"))
+    if (start === -1) return []
+    return lines.slice(start, start + 3)
+  }
+
+  it("reports the passkey owner, the matching on-chain key, and the remember note", async () => {
+    const rpc = await stubRpc({ qx: BigInt(QX), qy: BigInt(QY) })
+    const home = passkeyHome(rpc.url, true)
+    try {
+      const lines: string[] = []
+      await doctorLines(home, lines)
+      expect(ownerLines(lines)).toEqual([
+        `ok: owner is a passkey (address ${OWNER}); no owner key on this machine`,
+        "ok: owner passkey registered on chain (P-256 key matches)",
+        "note: remember is not available with a passkey owner yet",
+      ])
+      expect(lines).toContain("ok: no wallets on this machine — only the passkey page signs owner sends")
+      // doctor must never create or expect a software key
+      expect(() => readFileSync(home.path("owner/secrets.json"), "utf8")).toThrow()
+    } finally {
+      await rpc.close()
+    }
+  })
+
+  it("a registered key with no recorded point still reads ok — just without the match claim", async () => {
+    const rpc = await stubRpc({ qx: BigInt(QX), qy: BigInt(QY) })
+    const home = passkeyHome(rpc.url, false)
+    try {
+      const lines: string[] = []
+      await doctorLines(home, lines)
+      expect(ownerLines(lines)[1]).toBe("ok: owner passkey registered on chain")
+    } finally {
+      await rpc.close()
+    }
+  })
+
+  it("no passkey on chain is a PROBLEM pointing at init --passkey", async () => {
+    const rpc = await stubRpc(null)
+    const home = passkeyHome(rpc.url, true)
+    try {
+      const lines: string[] = []
+      await doctorLines(home, lines)
+      expect(lines).toContain("PROBLEM: the chain holds no passkey for this owner — run `mida init --passkey`")
+    } finally {
+      await rpc.close()
+    }
+  })
+
+  it("a different point on chain is a PROBLEM, not an ok", async () => {
+    const rpc = await stubRpc({ qx: BigInt(`0x${"99".repeat(32)}`), qy: BigInt(QY) })
+    const home = passkeyHome(rpc.url, true)
+    try {
+      const lines: string[] = []
+      await doctorLines(home, lines)
+      expect(lines.some((line) => line.startsWith("PROBLEM: the passkey on chain is not the key this home registered"))).toBe(true)
+      expect(lines.every((line) => !line.includes("P-256 key matches"))).toBe(true)
+    } finally {
+      await rpc.close()
+    }
+  })
+
+  it("a passkey home with no owner address says so and points at init --passkey", async () => {
+    const rpc = await stubRpc(null)
+    const home = new MidaHome(join(dir(), "home"))
+    saveOwnerMode(home, "passkey")
+    home.writeSecretJson("network.json", { rpcUrl: rpc.url, deployment: DEPLOYMENT })
+    try {
+      const lines: string[] = []
+      await doctorLines(home, lines)
+      expect(lines).toContain("PROBLEM: this passkey home has no owner yet — run `mida init --passkey`")
+    } finally {
+      await rpc.close()
+    }
   })
 })

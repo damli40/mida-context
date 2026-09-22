@@ -80,8 +80,24 @@ export function loadOwnerMode(home: MidaHome): OwnerMode | undefined {
 }
 
 /** The owner's public address — written by `mida init`, read by the daemon. Not a secret. */
-export function saveOwnerAddress(home: MidaHome, address: Address): void {
-  home.writeSecretJson(OWNER_ADDRESS_FILE, { address })
+export function saveOwnerAddress(home: MidaHome, address: Address, publicKey?: { x: Hex; y: Hex }): void {
+  home.writeSecretJson(OWNER_ADDRESS_FILE, publicKey === undefined ? { address } : { address, publicKey })
+}
+
+const POINT = /^0x[0-9a-fA-F]{64}$/
+
+/**
+ * The P-256 point the page registered at `init --passkey`, kept so `doctor` can compare it
+ * with the key the chain reports — "registered" is only half the answer if the point differs.
+ * Public material; a missing or malformed field reads as absent, never as a throw.
+ */
+export function loadOwnerPublicKey(home: MidaHome): { x: Hex; y: Hex } | undefined {
+  const record = home.readJson<Record<string, unknown>>(OWNER_ADDRESS_FILE)
+  const key = record?.publicKey
+  if (typeof key !== "object" || key === null || Array.isArray(key)) return undefined
+  const { x, y } = key as Record<string, unknown>
+  if (typeof x !== "string" || !POINT.test(x) || typeof y !== "string" || !POINT.test(y)) return undefined
+  return { x: x.toLowerCase() as Hex, y: y.toLowerCase() as Hex }
 }
 
 export function loadOwnerAddress(home: MidaHome): Address | undefined {

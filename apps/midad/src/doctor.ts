@@ -18,7 +18,8 @@ import type { MidaHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, claudeHooksStatus, codexHooksStatus } from "./install.js"
 import type { InstallTool } from "./install.js"
-import { isRevoked, listAgentNames, loadAgentIdentity } from "./keys.js"
+import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
+import type { OwnerMode } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
 import { listJobs } from "./queue.js"
 import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, serviceUrlInEffect, sponsorReachable } from "./runtime.js"
@@ -103,9 +104,28 @@ function chainOf(shared: Shared): { context: ChainContext; reader: RegistryReade
   return shared.context === undefined || shared.reader === undefined ? undefined : { context: shared.context, reader: shared.reader }
 }
 
-/** The owner address from the saved secrets — read only, never created here. */
+/** The home's owner mode; a malformed mode.json reads as undefined here — the owner check names it. */
+function ownerModeOf(home: MidaHome): OwnerMode | undefined {
+  try {
+    return loadOwnerMode(home)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The owner address — software homes derive it from the saved key, passkey homes from
+ * owner-address.json. Read only, never created here.
+ */
 function ownerAddressOf(home: MidaHome): Address | "missing" {
   try {
+    if (ownerModeOf(home) === "passkey") {
+      try {
+        return loadOwnerAddress(home) ?? "missing"
+      } catch {
+        return "missing"
+      }
+    }
     const secrets = home.readJson<Record<string, unknown>>("owner/secrets.json")
     const key = secrets?.privateKey
     if (typeof key !== "string" || !/^0x[0-9a-f]{64}$/.test(key)) return "missing"
@@ -117,6 +137,11 @@ function ownerAddressOf(home: MidaHome): Address | "missing" {
 
 const NEEDS_NETWORK = `needs network.json — ${INIT_FIX}`
 const NEEDS_OWNER = `needs the owner key — ${INIT_FIX}`
+
+/** The owner-fix line, mode-aware: a passkey home is repaired by the passkey init, not `mida init`. */
+function needsOwner(home: MidaHome): string {
+  return ownerModeOf(home) === "passkey" ? "needs the owner — run `mida init --passkey`" : NEEDS_OWNER
+}
 
 /** The owner signing key from the saved secrets — read only, never created here. */
 function ownerAccountOf(home: MidaHome): LocalAccount | "missing" {
@@ -266,6 +291,32 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       run: async () => {
         const chain = chainOf(shared)
         if (chain === undefined) return [problem("the owner check cannot run", NEEDS_NETWORK)]
+        if (ownerModeOf(home) === "passkey") {
+          let owner: Address | undefined
+          try {
+            owner = loadOwnerAddress(home)
+          } catch {
+            return [problem("owner-address.json is unreadable", "run `mida init --passkey`")]
+          }
+          if (owner === undefined) return [problem("this passkey home has no owner yet", "run `mida init --passkey`")]
+          shared.ownerAddress = owner
+          const lines = [`ok: owner is a passkey (address ${owner}); no owner key on this machine`]
+          const key = await chain.reader.ownerP256Key(owner)
+          if (key === null) {
+            lines.push(problem("the chain holds no passkey for this owner", "run `mida init --passkey`"))
+          } else {
+            // "matches" is claimed only against the point init recorded — an older home without
+            // the field gets the weaker, honest line.
+            const stored = loadOwnerPublicKey(home)
+            if (stored !== undefined && (BigInt(stored.x) !== key.qx || BigInt(stored.y) !== key.qy)) {
+              lines.push(problem("the passkey on chain is not the key this home registered", "the home and the chain disagree — set up a fresh MIDA_HOME with `mida init --passkey`"))
+            } else {
+              lines.push(stored === undefined ? "ok: owner passkey registered on chain" : "ok: owner passkey registered on chain (P-256 key matches)")
+            }
+          }
+          lines.push("note: remember is not available with a passkey owner yet")
+          return lines
+        }
         const owner = ownerAddressOf(home)
         if (owner === "missing") return [problem("the owner key is missing", INIT_FIX)]
         shared.ownerAddress = owner
@@ -293,7 +344,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             continue
           }
           if (owner === "missing") {
-            lines.push(problem(`${name}'s grant cannot be checked`, NEEDS_OWNER))
+            lines.push(problem(`${name}'s grant cannot be checked`, needsOwner(home)))
             continue
           }
           const ids = await chain.reader.activeCapabilityIds(owner, identity!.agentId)
@@ -337,13 +388,19 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         const chain = chainOf(shared)
         if (chain === undefined) return [problem("the store's deny list cannot be checked", NEEDS_NETWORK)]
         const owner = shared.ownerAddress ?? ownerAddressOf(home)
-        if (owner === "missing") return [problem("the store's deny list cannot be checked", NEEDS_OWNER)]
+        if (owner === "missing") return [problem("the store's deny list cannot be checked", needsOwner(home))]
         const storageUrl = serviceUrls(home, deps.env ?? process.env).storageUrl
         let targets: RevocationTarget[]
         try {
           if (storageUrl !== undefined) {
             const account = ownerAccountOf(home)
-            if (account === "missing") return [problem("the store's deny list cannot be checked", NEEDS_OWNER)]
+            if (account === "missing") {
+              // A passkey home holds no key that could sign this call — and needs none: the page
+              // cancels stale denies inside its own approve ceremony. A note, not a problem.
+              return ownerModeOf(home) === "passkey"
+                ? ["note: the deny list is owner-authenticated — the passkey page clears stale denies during approve; this machine cannot read it"]
+                : [problem("the store's deny list cannot be checked", needsOwner(home))]
+            }
             const api = new ContextApiClient({
               baseUrl: storageUrl,
               account,
@@ -387,7 +444,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       name: "approved-projects",
       run: async () => {
         const owner = shared.ownerAddress ?? ownerAddressOf(home)
-        if (owner === "missing") return [problem("the approved-projects list cannot be verified", NEEDS_OWNER)]
+        if (owner === "missing") return [problem("the approved-projects list cannot be verified", needsOwner(home))]
         const status = await approvalsFileStatus(home, owner)
         if (status === "unreadable") {
           // the fix is permissions, not re-approving — re-running approve could not rebuild a
@@ -535,19 +592,25 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         const chain = chainOf(shared)
         if (chain === undefined) return [problem("wallets cannot be checked", NEEDS_NETWORK)]
         const owner = shared.ownerAddress ?? ownerAddressOf(home)
-        if (owner === "missing") return [problem("wallets cannot be checked", NEEDS_OWNER)]
+        if (owner === "missing") return [problem("wallets cannot be checked", needsOwner(home))]
+        const passkey = ownerModeOf(home) === "passkey"
         // A reachable sponsor pays the gas, so wallet balances stop being a health signal
         // (M3-D3 — the Sep 22 run printed a low-balance PROBLEM while the sponsor was working).
         // Only with no sponsor configured, or one that is not answering, does a low wallet
         // matter again: the self-paid fallback is what would have to carry the next send.
         const sponsorUrl = serviceUrls(home, deps.env ?? process.env).sponsorUrl
         if (sponsorUrl !== undefined && (await sponsorReachable(sponsorUrl))) {
+          // A passkey owner has no wallet on this machine to call a fallback — only software
+          // mode prints the owner balance.
+          if (passkey) return [`ok: gas is sponsored by ${hostOf(sponsorUrl)}`]
           const balance = await chain.context.publicClient.getBalance({ address: owner })
           // reachable is all the probe proved — the wallet stays funded as the fallback (M3-D6)
           return [`ok: gas is sponsored by ${hostOf(sponsorUrl)} — wallet holds ${formatMon(balance)} MON (kept as a fallback)`]
         }
         const lines: string[] = []
-        const wallets: { label: string; address: Address }[] = [{ label: "owner", address: owner }]
+        // The passkey's EVM address holds no key material here and funds nothing — only the
+        // agents' wallets can pay, so only they are checked.
+        const wallets: { label: string; address: Address }[] = passkey ? [] : [{ label: "owner", address: owner }]
         for (const name of listAgentNames(home)) {
           const identity = loadAgentIdentity(home, name)
           if (identity !== undefined) {
@@ -560,6 +623,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             lines.push(problem(`${wallet.label}'s wallet is below the gas top-up line`, `${INIT_FIX} to top it up`))
           }
         }
+        if (wallets.length === 0) return ["ok: no wallets on this machine — only the passkey page signs owner sends"]
         return lines.length === 0 ? ["ok: wallets have gas"] : lines
       },
     },

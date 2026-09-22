@@ -218,22 +218,25 @@ export async function initPasskey(
   const readOwnerKey = deps.readOwnerKey ?? ((owner: Address) => new RegistryReader(chain).ownerP256Key(owner))
 
   let owner = loadOwnerAddress(home)
-  if (owner !== undefined && (await readOwnerKey(owner)) !== null) {
+  const registered = owner !== undefined ? await readOwnerKey(owner) : null
+  if (owner !== undefined && registered !== null) {
     deps.print(`owner ${owner} — already registered on chain`)
+    // re-stamp the point too — a home resumed from before the field existed gains it here
+    saveOwnerAddress(home, owner, { x: `0x${registered.qx.toString(16).padStart(64, "0")}`, y: `0x${registered.qy.toString(16).padStart(64, "0")}` })
   } else {
     const result = await runOwnerLinkRound("signup", { chainId: Number(network.deployment.chainId) }, deps)
     if (result.status !== "success") declined(result)
     if (result.owner === null || result.publicKey === undefined) mismatch()
-    const registered = await readOwnerKey(result.owner)
+    const key = await readOwnerKey(result.owner)
     if (
-      registered === null ||
-      registered.qx !== BigInt(result.publicKey.x) ||
-      registered.qy !== BigInt(result.publicKey.y)
+      key === null ||
+      key.qx !== BigInt(result.publicKey.x) ||
+      key.qy !== BigInt(result.publicKey.y)
     ) {
       mismatch()
     }
     owner = result.owner
-    saveOwnerAddress(home, owner)
+    saveOwnerAddress(home, owner, result.publicKey)
     saveOwnerMode(home, "passkey")
   }
 
