@@ -43,7 +43,8 @@ async function measure(hardfork: string) {
       api: {
         putObject: async () => undefined,
         publishEpochWrap: async () => undefined,
-        requestRevocationDeny: async () => ({ intentId: zeroHash }),
+        requestRevocationDeny: async () => ({ intentId: zeroHash, cancellationNonce: "1" }),
+        cancelRevocation: async () => ({}),
       },
     })
     const registry = env.deployment.capabilityRegistry

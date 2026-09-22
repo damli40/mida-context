@@ -1,11 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { zeroHash } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
-import { P256_N, PERMISSION, cancelFastRevokeDigest, namespaceId, sortScopes } from "@mida/protocol"
+import { MidaError, P256_N, PERMISSION, cancelFastRevokeDigest, namespaceId, sortScopes } from "@mida/protocol"
 import type { Hex, ReaderEpochWrap } from "@mida/protocol"
 import { deriveEpochKeyPair, hexOf, unwrapEpochPrivateKey } from "@mida/crypto"
 import {
   ANVIL_PRIVATE_KEYS,
+  SponsorPending,
   capabilityRegistryAbi,
   createWriteContext,
   deployLocal,
@@ -50,8 +51,9 @@ describe("FakeVaultAuthority revocation paths (plan Task 22 review)", () => {
         const ids = await read<readonly Hex[]>("activeCapabilityIds", [target.owner, target.agentId])
         denies.push({ target, stillActive: ids.length })
       }
-      return { intentId: hexOf(randomBytes(32)) }
+      return { intentId: hexOf(randomBytes(32)), cancellationNonce: "1" }
     },
+    cancelRevocation: async () => ({}),
   }
 
   const signedRequest = (
@@ -274,5 +276,142 @@ describe("FakeVaultAuthority revocation paths (plan Task 22 review)", () => {
       })
       expect(unwrapped).toEqual(deriveEpochKeyPair(secret, epoch).privateKey)
     }
+  })
+
+  // --- M3-D4 item 1: a deny whose send never happened must not survive ---
+
+  /** The store's half of the handshake, faithfully: a fresh nonce per intent, and a cancel that verifies exactly like app.ts does. */
+  const denyStore = () => {
+    const intents = new Map<string, { nonce: bigint; cancelled: boolean }>()
+    const cancels: { intentId: Hex; expiresAt: bigint }[] = []
+    const storeApi: VaultContextApi = {
+      putObject: async () => {},
+      publishEpochWrap: async () => {},
+      requestRevocationDeny: async () => {
+        const intentId = hexOf(randomBytes(32))
+        const nonce = BigInt(hexOf(randomBytes(32)))
+        intents.set(intentId, { nonce, cancelled: false })
+        return { intentId, cancellationNonce: nonce.toString(10) }
+      },
+      cancelRevocation: async (intentId, { expiresAt, assertion }) => {
+        cancels.push({ intentId, expiresAt })
+        const intent = intents.get(intentId)
+        if (intent === undefined || intent.cancelled) throw new MidaError("REPLAY", "revocation intent is not cancellable")
+        const verified = WebAuthnP256.verify({
+          challenge: cancelFastRevokeDigest({
+            chainId: deployment.chainId,
+            capabilityRegistry: deployment.capabilityRegistry,
+            owner: vault.owner,
+            revocationIntentId: intentId,
+            apiCancellationNonce: intent.nonce,
+            expiresAt,
+          }),
+          metadata: {
+            authenticatorData: assertion.authenticatorData,
+            clientDataJSON: assertion.clientDataJSON,
+            challengeIndex: Number(assertion.challengeIndex),
+            typeIndex: Number(assertion.typeIndex),
+            userVerificationRequired: true,
+          },
+          publicKey: P256.getPublicKey({ privateKey: P256_KEY }),
+          rpId: "vault.mida.xyz",
+          origin: "https://vault.mida.xyz",
+          signature: { r: assertion.r, s: assertion.s, yParity: 0 },
+        })
+        if (!verified) throw new MidaError("AUTH_INVALID", "cancellation assertion does not verify")
+        intent.cancelled = true
+        return { intentId, state: "cancelled" }
+      },
+    }
+    return { api: storeApi, intents, cancels }
+  }
+
+  /** A write context whose send is refused inside `beforeSend` — provably before any broadcast. */
+  const deadSend = () => {
+    const context = createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[1]!) })
+    context.beforeSend = async () => {
+      throw new MidaError("OWNER_WALLET_LOW", "test: refused before the send")
+    }
+    return context
+  }
+
+  it("undoes its own deny when the send never happened — capability branch", async () => {
+    const store = denyStore()
+    const broken = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: P256_KEY, chain: deadSend(), api: store.api })
+    // a CREATE capability: the skills epoch closed with agentD's expired READ, so a READ grant
+    // would need a rotation first — CREATE grants fine and exercises the same undo path
+    const request = await signedRequest(agentD, [{ namespace: "projects.current", permissions: PERMISSION.CREATE }])
+    const grant = await vault.approveGrant({
+      accessRequest: request,
+      manifest: agentD.manifest,
+      selection: { kind: "custom", scopes: [{ namespaceId: PROJECTS, permissions: PERMISSION.CREATE, provenancePolicy: 0 }], expiresAt: (await latestTimestamp(owner)) + 3_600n },
+    })
+    const capabilityId = grant.response.capabilities[0]!.capabilityId
+
+    const before = BigInt(Math.floor(Date.now() / 1000))
+    const error = await broken.approveRevocation({ kind: "capability", capabilityId }).catch((caught: unknown) => caught)
+    expect(error).toBeInstanceOf(MidaError)
+    expect((error as MidaError).code).toBe("OWNER_WALLET_LOW")
+    expect(store.cancels).toHaveLength(1)
+    // the fake cancelled only after the assertion verified — the signature the vault produced is the real one
+    expect(store.intents.get(store.cancels[0]!.intentId)?.cancelled).toBe(true)
+    expect(store.cancels[0]!.expiresAt).toBeGreaterThanOrEqual(before + 119n)
+    expect(store.cancels[0]!.expiresAt).toBeLessThanOrEqual(before + 121n)
+    // and the capability is still live — had the deny survived, it would have been a lie
+    expect(await read<boolean>("isCapabilityValid", [capabilityId])).toBe(true)
+  })
+
+  it("undoes its own deny when the send never happened — agent branch", async () => {
+    const store = denyStore()
+    const broken = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: P256_KEY, chain: deadSend(), api: store.api })
+    // agentE still holds the live goals.career READ the re-grant test above gave it
+    const error = await broken.approveRevocation({ kind: "agent", agentId: agentE.agentId }).catch((caught: unknown) => caught)
+    expect(error).toBeInstanceOf(MidaError)
+    expect((error as MidaError).code).toBe("OWNER_WALLET_LOW")
+    expect(store.cancels).toHaveLength(1)
+    expect(store.intents.get(store.cancels[0]!.intentId)?.cancelled).toBe(true)
+    expect(await read<bigint>("agentEpoch", [vault.owner, agentE.agentId])).toBe(0n)
+  })
+
+  it("keeps the deny when a sponsored operation was accepted but never confirmed (SponsorPending)", async () => {
+    const store = denyStore()
+    const pending = createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[1]!) })
+    pending.sponsor = {
+      send: async () => {
+        throw new SponsorPending(zeroHash)
+      },
+    }
+    const pendingVault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: P256_KEY, chain: pending, api: store.api })
+    const request = await signedRequest(agentD, [{ namespace: "projects.current", permissions: PERMISSION.CREATE }])
+    const grant = await vault.approveGrant({
+      accessRequest: request,
+      manifest: agentD.manifest,
+      selection: { kind: "custom", scopes: [{ namespaceId: PROJECTS, permissions: PERMISSION.CREATE, provenancePolicy: 0 }], expiresAt: (await latestTimestamp(owner)) + 3_600n },
+    })
+    const capabilityId = grant.response.capabilities[0]!.capabilityId
+    const error = await pendingVault.approveRevocation({ kind: "capability", capabilityId }).catch((caught: unknown) => caught)
+    expect(error).toBeInstanceOf(MidaError)
+    expect((error as MidaError).code).toBe("SPONSOR_PENDING")
+    // the operation may still land — the deny must stay, so nothing was cancelled
+    expect(store.cancels).toHaveLength(0)
+    expect([...store.intents.values()].every((intent) => !intent.cancelled)).toBe(true)
+  })
+
+  it("surfaces the original send error plus the stale-deny note when the cancel itself fails", async () => {
+    const refusing: VaultContextApi = {
+      putObject: async () => {},
+      publishEpochWrap: async () => {},
+      requestRevocationDeny: async () => ({ intentId: hexOf(randomBytes(32)), cancellationNonce: "1" }),
+      cancelRevocation: async () => {
+        throw new MidaError("AUTH_INVALID", "the store refused the cancel")
+      },
+    }
+    const broken = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: P256_KEY, chain: deadSend(), api: refusing })
+    const error = await broken
+      .approveRevocation({ kind: "agent", agentId: agentD.agentId, name: "codex" })
+      .catch((caught: unknown) => caught)
+    expect(error).toBeInstanceOf(MidaError)
+    expect((error as MidaError).code).toBe("OWNER_WALLET_LOW")
+    expect((error as Error).message).toContain("the store may still list codex as denied — run `mida approve codex` to clear it")
   })
 })

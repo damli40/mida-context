@@ -70,8 +70,9 @@ describe("FakeVaultAuthority (plan Task 22)", () => {
     requestRevocationDeny: async (target) => {
       const chainStillAuthorized = await read<boolean>("isAuthorized", [vault.owner, agentA.agentId, CAREER, PERMISSION.READ])
       recorded.denies.push({ target, chainStillAuthorized })
-      return { intentId: hexOf(randomBytes(32)) }
+      return { intentId: hexOf(randomBytes(32)), cancellationNonce: "1" }
     },
+    cancelRevocation: async () => ({}),
   }
 
   const signedRequest = (

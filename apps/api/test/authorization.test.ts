@@ -84,9 +84,8 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
         putObject: async () => undefined,
         publishEpochWrap: async () => undefined,
         requestRevocationDeny: (target) =>
-          ownerClient.request<{ intentId: Hex }>("POST", "/revocations", {
-            body: "capabilityId" in target ? { capabilityId: target.capabilityId } : { agentId: target.agentId },
-          }),
+          ownerClient.requestRevocationDeny(target),
+        cancelRevocation: (intentId, input) => ownerClient.cancelRevocation(intentId, input),
       },
     })
     await vault.registerOwnerKey()
@@ -186,7 +185,7 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     try {
       const cancel = (body: unknown) => ownerClient.request<{ state: string }>("POST", `/revocations/${intent.intentId}/cancel`, { body })
       await expect(cancel({})).rejects.toMatchObject({ code: "AUTH_INVALID" })
-      const otherVault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: `0x${"4e".repeat(32)}`, chain: owner, api: { putObject: async () => undefined, publishEpochWrap: async () => undefined, requestRevocationDeny: async () => ({ intentId: intent.intentId }) } })
+      const otherVault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: `0x${"4e".repeat(32)}`, chain: owner, api: { putObject: async () => undefined, publishEpochWrap: async () => undefined, requestRevocationDeny: async () => ({ intentId: intent.intentId, cancellationNonce: "1" }), cancelRevocation: async () => ({}) } })
       const nonce = BigInt(intent.cancellationNonce)
       const wrongKey = otherVault.approveDenyCancellation({ revocationIntentId: intent.intentId, apiCancellationNonce: nonce, expiresAt: now + 120n })
       await expect(cancel({ expiresAt: (now + 120n).toString(), assertion: wrongKey })).rejects.toMatchObject({ code: "AUTH_INVALID" })

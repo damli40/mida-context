@@ -10,6 +10,7 @@ import {
   RECORD_TYPE,
   accessRequestHash,
   cancelFastRevokeDigest,
+  isMidaError,
   canonicalizeNamespace,
   contextId as deriveContextId,
   decodeUint64,
@@ -85,13 +86,20 @@ export interface GrantApproval {
   gasUsed: bigint
 }
 
-export type RevokeRequest = { kind: "capability"; capabilityId: Hex } | { kind: "agent"; agentId: Hex }
+export type RevokeRequest =
+  | { kind: "capability"; capabilityId: Hex; name?: string }
+  | { kind: "agent"; agentId: Hex; name?: string }
 
 export interface RevokeApproval {
   intentId: Hex
   transactionHash: Hex
+  /** `true` when the receipt is a sponsored user operation's — the line "who paid" stays honest. */
+  sponsored: boolean
   rotated: Array<{ namespaceId: Hex; readEpoch: bigint }>
 }
+
+/** How long the passkey assertion that cancels a just-staged deny stays valid — well under the store's 5-minute cap. */
+export const DENY_CANCEL_EXPIRY_SECONDS = 120n
 
 export interface FakeVaultConfig {
   /** 32 non-zero test bytes standing in for the passkey's PRF secret. Never a production secret. */
@@ -136,6 +144,11 @@ export function toAccessRequestStruct(request: AccessRequest) {
     })),
     agentSignature: request.agentSignature,
   }
+}
+
+/** A sponsored send's receipt carries `userOpHash` — that field, not the network config, says who paid. */
+function isSponsored(receipt: TransactionReceipt): boolean {
+  return (receipt as TransactionReceipt & { userOpHash?: Hex }).userOpHash !== undefined
 }
 
 /**
@@ -324,15 +337,20 @@ export class FakeVaultAuthority implements VaultAuthority {
       }
       const live = await this.#readCapability<boolean>("isCapabilityValid", [request.capabilityId])
       const endsRead = live && (capability.permissions & PERMISSION.READ) !== 0
-      const { intentId } = await this.#api.requestRevocationDeny({ capabilityId: request.capabilityId })
+      const deny = await this.#api.requestRevocationDeny({ capabilityId: request.capabilityId })
+      const label = request.name ?? capability.agentId
       if (!endsRead) {
-        const receipt = await this.#sendCapability("revoke.capability", "revoke", [request.capabilityId])
-        return { intentId, transactionHash: receipt.transactionHash, rotated: [] }
+        const receipt = await this.#sendOrUndoDeny(deny, label, () =>
+          this.#sendCapability("revoke.capability", "revoke", [request.capabilityId]),
+        )
+        return { intentId: deny.intentId, transactionHash: receipt.transactionHash, sponsored: isSponsored(receipt), rotated: [] }
       }
       const next = (await this.#readCapability<bigint>("requiredReadEpoch", [this.owner, capability.namespaceId])) + 1n
       const keys = await this.#epochKeys(capability.namespaceId, next)
-      const receipt = await this.#sendCapability("revoke.rotate", "revokeAndRotate", [request.capabilityId, hexOf(keys.publicKey)])
-      return { intentId, transactionHash: receipt.transactionHash, rotated: [{ namespaceId: capability.namespaceId, readEpoch: next }] }
+      const receipt = await this.#sendOrUndoDeny(deny, label, () =>
+        this.#sendCapability("revoke.rotate", "revokeAndRotate", [request.capabilityId, hexOf(keys.publicKey)]),
+      )
+      return { intentId: deny.intentId, transactionHash: receipt.transactionHash, sponsored: isSponsored(receipt), rotated: [{ namespaceId: capability.namespaceId, readEpoch: next }] }
     }
 
     const ids = await this.#readCapability<readonly Hex[]>("activeCapabilityIds", [this.owner, request.agentId])
@@ -351,9 +369,11 @@ export class FakeVaultAuthority implements VaultAuthority {
       rotations.push({ namespaceId, newEpochPublicKey: hexOf((await this.#epochKeys(namespaceId, next)).publicKey) })
       rotated.push({ namespaceId, readEpoch: next })
     }
-    const { intentId } = await this.#api.requestRevocationDeny({ owner: this.owner, agentId: request.agentId })
-    const receipt = await this.#sendCapability("revoke.agent", "revokeAgentAndRotate", [request.agentId, rotations])
-    return { intentId, transactionHash: receipt.transactionHash, rotated }
+    const deny = await this.#api.requestRevocationDeny({ owner: this.owner, agentId: request.agentId })
+    const receipt = await this.#sendOrUndoDeny(deny, request.name ?? request.agentId, () =>
+      this.#sendCapability("revoke.agent", "revokeAgentAndRotate", [request.agentId, rotations]),
+    )
+    return { intentId: deny.intentId, transactionHash: receipt.transactionHash, sponsored: isSponsored(receipt), rotated }
   }
 
   /** §7.3 expiry: resumes writes after the earliest READ expiry closed the epoch. */
@@ -467,6 +487,37 @@ export class FakeVaultAuthority implements VaultAuthority {
 
   #sendCapability(kind: TxKind, functionName: string, args: readonly unknown[]): Promise<TransactionReceipt> {
     return this.#send(kind, capabilityRegistryAbi, this.#chain.deployment.capabilityRegistry, functionName, args)
+  }
+
+  /**
+   * The undo half of "deny first, then send" (§12.5, M3-D4): a send that provably never happened —
+   * simulation, gas estimate, balance guard or mempool refusal — must not leave its deny behind, or
+   * the store keeps blocking an agent the chain still approves. SPONSOR_PENDING is the exception:
+   * the bundler accepted the operation and it may still land, so its deny stays. When the cancel
+   * itself fails the original error still surfaces, carrying the one line that clears the deny by hand.
+   */
+  async #sendOrUndoDeny(deny: { intentId: Hex; cancellationNonce: string }, label: string, send: () => Promise<TransactionReceipt>): Promise<TransactionReceipt> {
+    try {
+      return await send()
+    } catch (error) {
+      if (isMidaError(error, "SPONSOR_PENDING")) throw error
+      try {
+        const expiresAt = BigInt(Math.floor(Date.now() / 1000)) + DENY_CANCEL_EXPIRY_SECONDS
+        await this.#api.cancelRevocation(deny.intentId, {
+          expiresAt,
+          assertion: this.approveDenyCancellation({
+            revocationIntentId: deny.intentId,
+            apiCancellationNonce: BigInt(deny.cancellationNonce),
+            expiresAt,
+          }),
+        })
+      } catch {
+        if (error instanceof Error) {
+          error.message += `\nthe store may still list ${label} as denied — run \`mida approve ${label}\` to clear it`
+        }
+      }
+      throw error
+    }
   }
 
   #send(kind: TxKind, abi: Abi, address: Address, functionName: string, args: readonly unknown[]): Promise<TransactionReceipt> {
