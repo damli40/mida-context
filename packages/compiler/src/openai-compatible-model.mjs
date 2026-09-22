@@ -82,7 +82,11 @@ try {
 } catch {
   fail(`${name}: ${provider.baseVar} must be https`)
 }
-if (!(url.protocol === "https:" || (url.protocol === "http:" && (isIP(url.hostname) === 4 && url.hostname.startsWith("127.") || url.hostname === "::1" || url.hostname === "localhost")))) {
+// url.hostname keeps IPv6 brackets ("[::1]") — strip them before comparing
+const host = url.hostname.replace(/^\[|\]$/g, "")
+const loopbackHttp =
+  url.protocol === "http:" && (host === "localhost" || host === "::1" || (isIP(host) === 4 && host.startsWith("127.")))
+if (!(url.protocol === "https:" || loopbackHttp)) {
   fail(`${name}: ${provider.baseVar} must be https`)
 }
 

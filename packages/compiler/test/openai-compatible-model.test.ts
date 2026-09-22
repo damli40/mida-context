@@ -237,6 +237,14 @@ describe("openai-compatible-model.mjs — custom provider (your own endpoint)", 
     expect(r.stderr).toBe("custom: MIDA_COMPILE_BASE_URL must be https\n")
   })
 
+  it("a bracketed-IPv6 loopback base passes the endpoint check — [::1] IS ::1", async () => {
+    // nothing listens on [::1]:1, so the request itself must fail — the point is the
+    // refusal is NOT "must be https": the URL check accepted the loopback address
+    const r = await runModel("custom", "p", { MIDA_COMPILE_BASE_URL: "http://[::1]:1/v1", MIDA_COMPILE_MODEL_ID: "m", MIDA_COMPILE_TIMEOUT_MS: "2000" })
+    expect(r.code).toBe(1)
+    expect(r.stderr).not.toContain("must be https")
+  })
+
   it("a failure keeps the '<name> http <status>' contract and never echoes the body", async () => {
     server = await fakeApi({ status: 500, body: { error: `key ${KEY} in body` } })
     const r = await runModel("custom", "p", {
