@@ -10,7 +10,8 @@
     "midad": "dist/midad.js",
     "mida-drain": "dist/mida-drain.js",
     "mida-hook": "dist/mida-hook.js",
-    "mida-inject": "dist/mida-inject.js"
+    "mida-inject": "dist/mida-inject.js",
+    "mida-mcp": "dist/mida-mcp.js"
   },
   "exports": {},
   "files": [
@@ -23,6 +24,7 @@
   },
   "dependencies": {
     "@hono/node-server": "1.19.17",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "@noble/ciphers": "2.4.0",
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",
