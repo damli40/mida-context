@@ -315,7 +315,10 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
   const progress = env.progress ?? (() => {})
   let sent: { transactionHash: Hex; userOpHash: Hex }[] = []
   const req = link.req
-  if (prep.alreadyGranted) {
+  // Nothing to mint AND nothing to sign means the touch was pointless — but an already-approved
+  // agent that still needs a project-list row gets the ceremony anyway: the page is the only
+  // signer a passkey home has (M3-F2).
+  if (prep.alreadyGranted && req.entry === undefined) {
     return failure(link, req.owner ?? null, new MidaError("CAPABILITY_DENIED", "this agent already holds everything it asked for — nothing was sent"), sent)
   }
   try {
@@ -359,34 +362,45 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
       const made = authorityFor(env, secrets, { assertion: asserted.assertion })
       const authority = made.authority
       sent = made.sent
-      // Expired write epochs close a namespace to grants: rotate first, exactly as the CLI does.
-      const rotatedNs: Hex[] = []
-      for (const scope of prep.needed) {
-        if (rotatedNs.includes(scope.namespaceId)) continue
-        const required = await readCapability<bigint>(env, "requiredReadEpoch", [derived, scope.namespaceId])
-        const valid = await readCapability<boolean>(env, "isWriteEpochValid", [derived, scope.namespaceId, required])
-        if (!valid) {
-          progress(`Rotating the ${namespaceById(scope.namespaceId).name} epoch…`)
-          await authority.rotateExpiredEpoch(scope.namespaceId)
-          rotatedNs.push(scope.namespaceId)
+      // M3-D4 item 3, passkey side: a revoke that failed after its deny was staged blocks this
+      // agent at the store while the chain still approves it. Only the page can reach the
+      // owner-authenticated deny list, so the clearing happens here — each stale deny costs one
+      // more passkey touch.
+      const cleared = await authority.clearStaleDenies(prep.accessRequest.agentId, progress)
+      if (cleared > 0) progress(`Cleared ${cleared} stale block${cleared === 1 ? "" : "s"} at the store.`)
+
+      let granted = 0
+      if (!prep.alreadyGranted) {
+        // Expired write epochs close a namespace to grants: rotate first, exactly as the CLI does.
+        const rotatedNs: Hex[] = []
+        for (const scope of prep.needed) {
+          if (rotatedNs.includes(scope.namespaceId)) continue
+          const required = await readCapability<bigint>(env, "requiredReadEpoch", [derived, scope.namespaceId])
+          const valid = await readCapability<boolean>(env, "isWriteEpochValid", [derived, scope.namespaceId, required])
+          if (!valid) {
+            progress(`Rotating the ${namespaceById(scope.namespaceId).name} epoch…`)
+            await authority.rotateExpiredEpoch(scope.namespaceId)
+            rotatedNs.push(scope.namespaceId)
+          }
         }
-      }
-      progress("Sending the grant…")
-      const approval = await authority.approveGrant({
-        accessRequest: prep.accessRequest,
-        manifest: prep.manifest,
-        selection: { kind: "custom", scopes: prep.needed, expiresAt: prep.expiresAt },
-      })
-      // A rotated epoch invalidates every surviving reader's wrap — re-publish for the agents the
-      // terminal named, but only those that still hold READ on chain. A lying list can only waste
-      // reads; it can never re-authorize anyone.
-      for (const nsId of rotatedNs) {
-        for (const reader of req.readers ?? []) {
-          if (reader === prep.accessRequest.agentId) continue
-          const ok = await readCapability<boolean>(env, "hasAuthority", [derived, reader, nsId, PERMISSION.READ, 0])
-          if (ok) {
-            progress(`Sending the new key to a surviving agent…`)
-            await authority.publishReaderWraps({ agentId: reader, namespaceId: nsId })
+        progress("Sending the grant…")
+        const approval = await authority.approveGrant({
+          accessRequest: prep.accessRequest,
+          manifest: prep.manifest,
+          selection: { kind: "custom", scopes: prep.needed, expiresAt: prep.expiresAt },
+        })
+        granted = approval.response.capabilities.length
+        // A rotated epoch invalidates every surviving reader's wrap — re-publish for the agents the
+        // terminal named, but only those that still hold READ on chain. A lying list can only waste
+        // reads; it can never re-authorize anyone.
+        for (const nsId of rotatedNs) {
+          for (const reader of req.readers ?? []) {
+            if (reader === prep.accessRequest.agentId) continue
+            const ok = await readCapability<boolean>(env, "hasAuthority", [derived, reader, nsId, PERMISSION.READ, 0])
+            if (ok) {
+              progress(`Sending the new key to a surviving agent…`)
+              await authority.publishReaderWraps({ agentId: reader, namespaceId: nsId })
+            }
           }
         }
       }
@@ -399,7 +413,7 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
         operations: sent.map((s) => s.userOpHash),
         ...(entry !== undefined ? { entry } : {}),
       })
-      progress(`Granted ${approval.response.capabilities.length} capabilit${approval.response.capabilities.length === 1 ? "y" : "ies"}.`)
+      if (granted > 0) progress(`Granted ${granted} capabilit${granted === 1 ? "y" : "ies"}.`)
       return result
     } finally {
       secrets.release()

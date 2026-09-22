@@ -178,7 +178,15 @@ function fakeSponsor(sends: SendRecord[], receiptLogs: { topics: Hex[]; data: He
   }
 }
 
-function fakeApi(calls: string[]) {
+/** What GET /revocations hands back — the fields clearStaleDenies reads. */
+interface DenyIntent {
+  intentId: Hex
+  state: string
+  target: { kind: "agent"; agentId: Hex } | { kind: "capability"; capabilityId: Hex }
+  agentEpochAtIntent: string | null
+}
+
+function fakeApi(calls: string[], intents: DenyIntent[] = []) {
   return {
     async putObject() {
       calls.push("api:putObject")
@@ -191,6 +199,18 @@ function fakeApi(calls: string[]) {
     async requestRevocationDeny() {
       calls.push("api:requestRevocationDeny")
       return { intentId: `0x${"dd".repeat(32)}` as Hex }
+    },
+    async listRevocations() {
+      calls.push("api:listRevocations")
+      return intents
+    },
+    async reissueRevocationNonce(intentId: Hex) {
+      calls.push(`api:reissueRevocationNonce:${intentId.slice(2, 6)}`)
+      return { intentId, state: "active", cancellationNonce: "7" }
+    },
+    async cancelRevocation(intentId: Hex) {
+      calls.push(`api:cancelRevocation:${intentId.slice(2, 6)}`)
+      return {}
     },
   }
 }
@@ -217,6 +237,7 @@ function makeEnv(opts: {
   fetchManifest?: (h: Hex) => Promise<unknown>
   storage?: ReturnType<typeof fakeStorage>
   releasedSecrets?: OwnerSecrets[]
+  intents?: DenyIntent[]
 }): { env: FlowEnvironment; credentials: ReturnType<typeof fakeCredentials>; storage: ReturnType<typeof fakeStorage> } {
   const credentials = fakeCredentials(passkey, opts.prf ?? PRF.slice())
   const chain = opts.chain ?? fakeChain()
@@ -229,7 +250,7 @@ function makeEnv(opts: {
     storeUrl: "https://store.test",
     storage: store.storage,
     makeSponsor: () => sponsor, // flows wrap it to record receipts into their own `sent` list
-    makeApi: () => fakeApi(opts.apiCalls) as never,
+    makeApi: () => fakeApi(opts.apiCalls, opts.intents ?? []) as never,
     fetchManifest: opts.fetchManifest ?? (async () => { throw new Error("no manifest") }),
     onSecrets: (s) => opts.releasedSecrets?.push(s),
   }
@@ -347,13 +368,19 @@ describe("runSignup", () => {
 })
 
 describe("approve flow", () => {
-  async function setup(opts: { prf?: Uint8Array; sponsor?: ReturnType<typeof fakeSponsor>; releasedSecrets?: OwnerSecrets[] } = {}) {
+  async function setup(opts: {
+    prf?: Uint8Array
+    sponsor?: ReturnType<typeof fakeSponsor>
+    releasedSecrets?: OwnerSecrets[]
+    intents?: DenyIntent[]
+    granted?: () => boolean
+  } = {}) {
     const { manifest, accessRequest } = await approveReq()
     const sends: SendRecord[] = []
     const apiCalls: string[] = []
     // hasAuthority answers false before the grantBatch send and true after — so the scope reads
     // as "needed" at prepare time and the wrap publish sees the live grant after the send.
-    const granted = () => sends.some((s) => s.functionName === "grantBatch")
+    const granted = opts.granted ?? (() => sends.some((s) => s.functionName === "grantBatch"))
     const chain = fakeChain({
       getAgent: () => agentRecordFor(manifestBody()),
       hasAuthority: () => granted(),
@@ -367,6 +394,7 @@ describe("approve flow", () => {
       fetchManifest: async () => manifest,
       prf: opts.prf,
       releasedSecrets: opts.releasedSecrets,
+      intents: opts.intents,
     })
     const req = {
       chainId: Number(CHAIN_ID),
@@ -396,7 +424,8 @@ describe("approve flow", () => {
     // the ceremony signed the grant digest — the challenge handed to the authenticator
     expect(hexOf(credentials.calls[0]!.challenge!)).toBe(prep.challenge)
     expect(sends.map((s) => s.functionName)).toEqual(["grantBatch"])
-    expect(apiCalls).toEqual([`api:publishEpochWrap:${AGENT_ID.slice(2, 6)}:${NS_ID.slice(2, 10)}:1`])
+    // the stale-deny sweep asks the store first (M3-D4 item 3 passkey side), then the wrap publish
+    expect(apiCalls).toEqual(["api:listRevocations", `api:publishEpochWrap:${AGENT_ID.slice(2, 6)}:${NS_ID.slice(2, 10)}:1`])
     expect(result.transactions).toEqual([`0x${"bb".repeat(32)}`])
     expect(result.operations).toEqual([`0x${"cc".repeat(32)}`])
     // the project entry is signed and carries the appended row
@@ -447,6 +476,86 @@ describe("approve flow", () => {
     expect(result.status).toBe("pending")
     expect(result.operations).toContain(`0x${"ee".repeat(32)}`)
     expect(result.reason).toBe("accepted, still landing — check again in a minute")
+  })
+
+  it("an already-approved agent with a project row still gets its one touch — no grant send, the row is signed", async () => {
+    const { env, credentials, sends, apiCalls, req } = await setup({ granted: () => true })
+    const parsed = link("approve", req)
+
+    const prep = await prepareApprove(env, parsed)
+    expect(prep.alreadyGranted).toBe(true)
+    expect(prep.needed).toHaveLength(0)
+
+    const result = await confirmApprove(env, parsed, prep)
+    expect(result.status).toBe("success")
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get"]) // the touch still happens — it signs the row
+    expect(sends).toHaveLength(0) // nothing was minted
+    expect(result.transactions).toEqual([])
+    expect(result.entry?.signature).toMatch(/^0x/)
+    expect((result.entry?.entries as { agent: string }[]).some((e) => e.agent === AGENT_ID)).toBe(true)
+    expect(apiCalls).toEqual(["api:listRevocations"]) // the deny check runs even when no grant will
+  })
+
+  it("a stale deny from a failed revoke is cleared before the grant — one extra passkey touch", async () => {
+    const denyId: Hex = `0x${"dd".repeat(32)}`
+    // agentEpochAtIntent "0" and the chain still on epoch 0 — the revoke never landed, the deny is stale
+    const intents: DenyIntent[] = [
+      { intentId: denyId, state: "active", target: { kind: "agent", agentId: AGENT_ID }, agentEpochAtIntent: "0" },
+    ]
+    const { env, credentials, sends, apiCalls, req } = await setup({ intents })
+    const parsed = link("approve", req)
+    const prep = await prepareApprove(env, parsed)
+
+    const result = await confirmApprove(env, parsed, prep)
+    expect(result.status).toBe("success")
+    // the grant ceremony's get, then a second get for the cancel assertion
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get", "get"])
+    expect(apiCalls.slice(0, 3)).toEqual([
+      "api:listRevocations",
+      `api:reissueRevocationNonce:${denyId.slice(2, 6)}`,
+      `api:cancelRevocation:${denyId.slice(2, 6)}`,
+    ])
+    expect(sends.map((s) => s.functionName)).toEqual(["grantBatch"])
+  })
+
+  it("a deny whose revoke actually landed is left alone — anchored, not stale", async () => {
+    const denyId: Hex = `0x${"dd".repeat(32)}`
+    // agentEpochAtIntent "0" but the chain moved to epoch 1 — the revoke landed, the deny is the record
+    const intents: DenyIntent[] = [
+      { intentId: denyId, state: "active", target: { kind: "agent", agentId: AGENT_ID }, agentEpochAtIntent: "0" },
+    ]
+    const { manifest, accessRequest } = await approveReq()
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const granted = () => sends.some((s) => s.functionName === "grantBatch")
+    const chain = fakeChain({
+      getAgent: () => agentRecordFor(manifestBody()),
+      hasAuthority: () => granted(),
+      agentEpoch: () => 1n, // the revoke landed — epoch moved past the intent's snapshot
+    })
+    const { env, credentials } = makeEnv({
+      sends,
+      apiCalls,
+      chain,
+      receiptLogs: [capabilityGrantedLog(OWNER)],
+      fetchManifest: async () => manifest,
+      intents,
+    })
+    const req = {
+      chainId: Number(CHAIN_ID),
+      owner: OWNER,
+      request: accessRequest,
+      entry: { agent: AGENT_ID, projectId: "proj-1", root: `0x${"33".repeat(32)}` },
+      readers: [AGENT_ID, SURVIVOR],
+    }
+    const parsed = link("approve", req)
+    const prep = await prepareApprove(env, parsed)
+
+    const result = await confirmApprove(env, parsed, prep)
+    expect(result.status).toBe("success")
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get"]) // no second touch — nothing was cleared
+    expect(apiCalls).not.toContain(`api:cancelRevocation:${denyId.slice(2, 6)}`)
+    expect(sends.map((s) => s.functionName)).toEqual(["grantBatch"])
   })
 
   it("an expired request is refused in prepare — the passkey is never asked", async () => {

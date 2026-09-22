@@ -105,6 +105,17 @@ export interface PasskeyAuthorityConfig {
 interface CancelCapableApi extends VaultContextApi {
   requestRevocationDeny(target: { capabilityId: Hex } | { owner: Address; agentId: Hex }): Promise<{ intentId: Hex; cancellationNonce: string }>
   cancelRevocation(intentId: Hex, input: { expiresAt: bigint; assertion: WebAuthnAssertionWire }): Promise<unknown>
+  /** GET /revocations — owner-authenticated; the nonce is withheld, reissue mints a fresh one. */
+  listRevocations(state?: string): Promise<RevocationIntentView[]>
+  reissueRevocationNonce(intentId: Hex): Promise<{ intentId: Hex; state: string; cancellationNonce: string }>
+}
+
+/** What GET /revocations returns per intent — the shape apps/api/src/client.ts declares. */
+interface RevocationIntentView {
+  intentId: Hex
+  state: string
+  target: { kind: "capability"; capabilityId: Hex } | { kind: "agent"; agentId: Hex }
+  agentEpochAtIntent: string | null
 }
 
 /**
@@ -398,6 +409,71 @@ export class PasskeyVaultAuthority implements VaultAuthority {
       }
       throw error
     }
+  }
+
+  /**
+   * M3-D4 item 3, page side: a revoke that failed after its deny was staged leaves an `active`
+   * intent blocking an agent the chain still approves — the software CLI clears those in its
+   * approve; on a passkey home only the page can reach the owner-authenticated deny list, so
+   * the clearing lives here, before the grant. Each cancel is a fresh passkey assertion over a
+   * nonce the store hands out NOW (`reissue`), so every cleared deny is a second ceremony — the
+   * `progress` line tells the owner why the browser is asking again.
+   * A deny whose revocation actually landed is anchored — the chain's epoch moved on or the
+   * capability is dead — and is left for the store's own reconcile, never cancelled here.
+   */
+  async clearStaleDenies(agentId: Hex, progress?: (line: string) => void): Promise<number> {
+    this.#live()
+    const api = this.#api as CancelCapableApi
+    let intents: RevocationIntentView[]
+    try {
+      intents = await api.listRevocations("active")
+    } catch {
+      // The store could not even be asked — same honesty rule as the CLI: a stale deny may
+      // still exist, the grant below will say CAPABILITY_DENIED if it does.
+      progress?.("note: could not reach the store to check for stale denies")
+      return 0
+    }
+    let cleared = 0
+    for (const intent of intents) {
+      if (intent.target.kind === "agent") {
+        if (intent.target.agentId.toLowerCase() !== agentId.toLowerCase()) continue
+        const atIntent = intent.agentEpochAtIntent === null ? null : BigInt(intent.agentEpochAtIntent)
+        if (atIntent !== null) {
+          const epoch = await this.#readCapability<bigint>("agentEpoch", [this.owner, agentId])
+          if (epoch > atIntent) continue // the revoke landed — anchored, not stale
+        }
+      } else {
+        const capability = await this.#readCapability<CapabilityView>("getCapability", [intent.target.capabilityId]).catch(() => null)
+        if (capability === null || capability.agentId.toLowerCase() !== agentId.toLowerCase()) continue
+        const live = await this.#readCapability<boolean>("isCapabilityValid", [intent.target.capabilityId]).catch(() => false)
+        if (!live) continue // the capability is dead — the deny is anchored
+      }
+      progress?.("A failed revoke left a block on this agent — clearing it needs one more passkey touch.")
+      try {
+        const reissued = await api.reissueRevocationNonce(intent.intentId)
+        const expiresAt = BigInt(Math.floor(Date.now() / 1000)) + DENY_CANCEL_EXPIRY_SECONDS
+        const challenge = cancelFastRevokeDigest({
+          chainId: this.#deployment.chainId,
+          capabilityRegistry: this.#deployment.capabilityRegistry,
+          owner: this.owner,
+          revocationIntentId: intent.intentId,
+          apiCancellationNonce: BigInt(reissued.cancellationNonce),
+          expiresAt,
+        })
+        if (this.#signCancelAssertion === undefined) throw new MidaError("AUTH_INVALID", "no cancel signer was wired")
+        await api.cancelRevocation(intent.intentId, {
+          expiresAt,
+          assertion: await this.#signCancelAssertion(challenge),
+        })
+      } catch (error) {
+        // REPLAY means the intent anchored or was cancelled between list and reissue — a deny
+        // whose revocation really landed is not stale, and clearing it would be the bug.
+        if (isMidaError(error) && error.code === "REPLAY") continue
+        throw error
+      }
+      cleared += 1
+    }
+    return cleared
   }
 
   /** §7.3 expiry: resumes writes after the earliest READ expiry closed the epoch. */

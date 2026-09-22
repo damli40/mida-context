@@ -46,7 +46,9 @@ async function main(): Promise<void> {
         ...(link.req.project !== undefined ? { projectLabel: link.req.project.label } : {}),
       })
     }
-    if (prep.alreadyGranted) return
+    // Already granted only ends the page early when there is also no list row to sign — a
+    // folder approval on a passkey home still needs the one touch (M3-F2).
+    if (prep.alreadyGranted && rows === null) return
     button.disabled = false
     button.addEventListener("click", () => {
       void (async () => {
