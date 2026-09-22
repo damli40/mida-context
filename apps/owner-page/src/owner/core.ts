@@ -79,3 +79,9 @@ export type {
   SignedAgentCapabilityManifest,
   WebAuthnAuthStruct,
 } from "@mida/protocol"
+
+// The owner modules themselves — re-exported so the bundle test proves they stay browser-safe too.
+export * from "./secrets.js"
+export * from "./webauthn.js"
+export * from "./send.js"
+export * from "./authority.js"
