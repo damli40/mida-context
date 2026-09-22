@@ -589,6 +589,45 @@ describe("createSponsoredSender", () => {
     }
   })
 
+  it("a viem-shaped dump drops the indented continuation lines after a filtered header (M3-D6)", async () => {
+    // The Sep 22 reason kept `  from:`/`  to:`/`  data:` — the indented block under
+    // "Request Arguments:" survived the header filter and ate the whole 200-char budget.
+    const env = await start(
+      {
+        paymasterError: {
+          code: -32602,
+          message: [
+            "Missing or invalid parameters.",
+            "",
+            "Request Arguments:",
+            "  from:  0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "  to:    0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            `  data:  0x${"ab".repeat(400)}`, // ~800 chars — enough to crowd out the real reason
+            "",
+            "Details: the sponsor will not pay for this call",
+            "URL: http://sponsor.example",
+            "Version: viem@2.x",
+          ].join("\n"),
+        },
+      },
+      { code: "0x", txCount: "0x0" },
+    )
+    try {
+      const sender = createSponsoredSender({ sponsorUrl: env.sponsorUrl, rpcUrl: env.rpcUrl, account, deployment, pollingIntervalMs: 5 })
+      const error = await sender.send(call, "owner.key").then(() => null, (e: unknown) => e)
+      expect(error).toBeInstanceOf(SponsorDidNotPay)
+      const reason = (error as SponsorDidNotPay).reason
+      expect(reason).not.toContain("\n")
+      expect(reason).toContain("Missing or invalid parameters.")
+      expect(reason).toContain("the sponsor will not pay for this call") // the useful part survived the budget
+      expect(reason).not.toContain("from:")
+      expect(reason).not.toContain("to:")
+      expect(reason).not.toContain("0xabab") // the data blob is gone entirely
+    } finally {
+      await env.close()
+    }
+  })
+
   it("a paymaster refusal is still SponsorDidNotPay — nothing was accepted, the fallback is safe", async () => {
     const env = await start({ paymasterError: { code: -32000, message: "refused: the sponsor's daily budget is exhausted" } }, { code: "0x", txCount: "0x0" })
     try {

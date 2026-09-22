@@ -331,12 +331,23 @@ function sponsorReason(error: unknown): string {
     }
   }
   const raw = parts.length === 0 ? String(error) : parts.join(" — ")
-  const line = raw
-    .split("\n")
-    .filter((row) => !/^\s*(URL|Request body|Request Arguments|Docs|Version):/.test(row))
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim()
+  // A filtered header (URL:, Request body:, …) owns the INDENTED block under it — viem writes
+  // the request's from/to/data there, and letting those lines through ate the whole reason
+  // budget on Sep 22. Once a header is dropped, every following indented line goes with it until
+  // the next line that starts in column zero (M3-D6 item 5).
+  const header = /^\s*(URL|Request body|Request Arguments|Docs|Version):/
+  const kept: string[] = []
+  let dropping = false
+  for (const row of raw.split("\n")) {
+    if (header.test(row)) {
+      dropping = true
+      continue
+    }
+    if (dropping && /^\s/.test(row)) continue // a header's indented continuation
+    dropping = false
+    kept.push(row)
+  }
+  const line = kept.join(" ").replace(/\s+/g, " ").trim()
   return line.length > REASON_MAX ? `${line.slice(0, REASON_MAX)}…` : line
 }
 
