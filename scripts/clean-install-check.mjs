@@ -7,6 +7,8 @@
 //     · npx mida --help exits 0 and prints the command list
 //     · npx mida doctor on an empty MIDA_HOME prints checks, never a stack
 //     · npx mida-hook claude-code on empty stdin exits 0 inside 2 s
+//     · npx mida-mcp refuses a bad flag on stderr, and a well-formed launch on an empty home
+//       starts the stdio server and exits cleanly when the client closes stdin
 //     · a 6-line consumer importing the SDK runs under plain node and type-checks with tsc
 //     · the installed packages hold no .ts source, no .env, no test/ dirs, nothing under
 //       brand/, and no 64-hex literal that is not a committed public constant
@@ -91,6 +93,16 @@ check(!/^\s+at\s/m.test(doctorText) && !doctorText.includes("node:internal"), "m
 
 const hook = run(["npx", "--no-install", "mida-hook", "claude-code"], { cwd: project, env, input: "", timeout: 2_000 })
 check(hook.status === 0 && !hook.error, "mida-hook claude-code on empty stdin exits 0 inside 2 s")
+
+// the MCP adapter is a long-lived stdio server — what a spawn can prove is the refusal path and
+// that a well-formed launch comes up even with no daemon to reach, then exits on stdin close
+const mcpBad = run(["npx", "--no-install", "mida-mcp", "--bogus"], { cwd: project, env, input: "", timeout: 10_000 })
+check(
+  mcpBad.status === 2 && (mcpBad.stderr ?? "").includes("usage: mida-mcp") && (mcpBad.stdout ?? "") === "",
+  "mida-mcp --bogus exits 2 with the usage on stderr and a clean stdout",
+)
+const mcp = run(["npx", "--no-install", "mida-mcp", "--as", "assistant"], { cwd: project, env, input: "", timeout: 10_000 })
+check(mcp.status === 0 && !mcp.error, "mida-mcp starts on an empty home and exits when the client closes stdio")
 
 // ---------- 4. SDK consumer: runs under node, type-checks with tsc ----------
 

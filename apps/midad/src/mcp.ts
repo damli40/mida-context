@@ -194,6 +194,15 @@ async function toolWhatsNew(deps: McpServerDeps) {
     if (reason === "revoked") {
       return toolText(`Mida: ${deps.agent}'s access was revoked by the owner. Nothing was shared.`)
     }
+    // the two list-integrity refusals carry their own canonical lines — the same ones the
+    // session-start handoff text uses (they are reproduced, not imported: handoff.ts must stay
+    // out of this module's graph)
+    if (reason === "list-tampered") {
+      return toolText("Mida: the approved-projects list failed its signature check. Nothing was shared. Run `mida doctor`.")
+    }
+    if (reason === "list-unreadable") {
+      return toolText("Mida: the approved-projects list could not be read: check the file's permissions. Nothing was shared. Run `mida doctor`.")
+    }
     return toolText(`Mida: no context available right now (${reason}).`)
   }
   return degraded("bad-reply")
