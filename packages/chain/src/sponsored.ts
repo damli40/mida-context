@@ -1,13 +1,14 @@
 import { MidaError } from "@mida/protocol"
 import { createPublicClient, encodeFunctionData, http } from "viem"
 import type { Abi, Address, Hex, LocalAccount } from "viem"
-import { entryPoint08Address } from "viem/account-abstraction"
+import { entryPoint08Address, prepareUserOperation } from "viem/account-abstraction"
 import type { UserOperationReceipt } from "viem/account-abstraction"
 import { createSmartAccountClient } from "permissionless"
 import { to7702SimpleSmartAccount } from "permissionless/accounts"
 import { createPimlicoClient } from "permissionless/clients/pimlico"
 import { chainFor } from "./deployment.js"
 import type { Deployment } from "./deployment.js"
+import { GAS_CEILINGS } from "./gas.js"
 import type { TxKind } from "./gas.js"
 import { REVERT_CODES, revertNameFromData } from "./registry.js"
 import type { SentReceipt } from "./writes.js"
@@ -76,9 +77,9 @@ export type SponsoredReceipt = SentReceipt & { userOpHash: Hex }
 
 export interface SponsoredSender {
   /**
-   * Sends one contract call as a sponsored user operation. `kind` is already enforced by the
-   * caller's ceiling check before this is asked — it is part of the signature so the seam reads
-   * the same as the self-paid send, and so a future per-kind op-level check needs no new shape.
+   * Sends one contract call as a sponsored user operation. `kind` carries the per-kind gas
+   * ceiling this sender enforces against the bundler's own `callGasLimit` estimate before the
+   * operation is sent (M3-D3) — the owner-side `eth_estimateGas` never runs on this path.
    */
   send(
     call: { address: Address; abi: Abi; functionName: string; args: readonly unknown[] },
@@ -136,7 +137,7 @@ export function createSponsoredSender(input: {
   const timeoutMs = input.timeoutMs ?? SPONSOR_TIMEOUT_MS
 
   return {
-    async send(call, _kind) {
+    async send(call, kind) {
       // Phase 1 — everything up to the bundler answering with a user-operation hash. The
       // deadline is safe here: while no hash exists nothing was provably accepted, so a
       // SponsorDidNotPay lets sendContract send the same call from the owner's wallet.
@@ -164,10 +165,30 @@ export function createSponsoredSender(input: {
               chainId: Number(input.deployment.chainId),
               nonce: await publicClient.getTransactionCount({ address: input.account.address }),
             })
-        return (await bundlerClient.sendUserOperation({
+        // Prepare first, send second (M3-D3): prepareUserOperation fills the operation through the
+        // bundler — eth_estimateUserOperationGas, which the paymaster pays for — so the gas work
+        // never touches the owner's wallet. The returned callGasLimit is what the per-kind ceiling
+        // checks: refuse locally when the bundler's estimate exceeds it, before anything is sent.
+        const prepared = (await prepareUserOperation(bundlerClient as never, {
           calls: [{ to: call.address, value: 0n, data }],
           authorization,
-        })) as Hex
+        } as never)) as { callGasLimit?: bigint }
+        if (typeof prepared.callGasLimit !== "bigint") {
+          throw new SponsorDidNotPay("the bundler's gas estimate carried no callGasLimit")
+        }
+        const ceiling = GAS_CEILINGS[kind]
+        if (prepared.callGasLimit > ceiling) {
+          throw new MidaError("GAS_CEILING_EXCEEDED", `${kind}: the bundler's callGasLimit ${prepared.callGasLimit} exceeds ceiling ${ceiling}`)
+        }
+        // The prepared operation's `signature` is the account's stub, not a real signature — it
+        // exists so the estimate has something shaped right to measure. Dropping it here (passing
+        // undefined) makes sendUserOperation sign the final, fully-filled operation for real;
+        // every other field is already filled, so no second estimate or paymaster call happens.
+        return (await bundlerClient.sendUserOperation({
+          ...prepared,
+          authorization,
+          signature: undefined,
+        } as never)) as Hex
       })()
       let userOpHash: Hex
       try {

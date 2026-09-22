@@ -109,12 +109,19 @@ async function estimateSendFee(context: WriteContext): Promise<SendFee> {
 export const SPONSOR_FALLBACK_TO_SELF_PAY = true
 
 /**
- * Simulates first so a revert surfaces as a named contract error mapped to a protocol code, then
- * estimates the gas and refuses the send when the estimate exceeds the kind's ceiling (Monad bills
- * the limit, not the usage). Within the ceiling the transaction is sent with `gas` set explicitly
- * to the estimate — no padding — and the receipt comes back carrying that limit as `gasLimit`.
- * A receipt with status "reverted" (for example a Monad reserve-balance revert after inclusion)
- * is an error, never a silent success.
+ * Simulates first so a revert surfaces as a named contract error mapped to a protocol code. The
+ * simulate is an `eth_call` carrying no gas field — it runs from a wallet holding nothing, which
+ * is exactly why it may stay on the sponsored path (M3-D3). With a sponsor set the sponsor is
+ * asked next, with NO owner-side `estimateContractGas`: that estimate is `eth_estimateGas` with
+ * the owner as sender, which Monad refuses for a wallet that cannot afford the worst case — the
+ * very wallet a sponsor exists for. The bundler estimates the operation instead, and the kind's
+ * ceiling is checked inside the sponsored sender against the bundler's own `callGasLimit`.
+ *
+ * Only the self-paid path — no sponsor, or a sponsor that refused before accepting — runs the
+ * estimate, the ceiling check and the balance guard: the send is refused above the kind's
+ * ceiling (Monad bills the limit, not the usage), and within it goes out with `gas` set
+ * explicitly to the estimate — no padding. A receipt with status "reverted" (for example a
+ * Monad reserve-balance revert after inclusion) is an error, never a silent success.
  */
 export async function sendContract(
   context: WriteContext,
@@ -133,20 +140,14 @@ export async function sendContract(
   } catch (error) {
     throw toMidaError(error)
   }
-  let gas: bigint
-  try {
-    // The per-kind ceiling runs before the sponsor is asked — a call over its ceiling is refused
-    // locally, never sent to be refused remotely (M3-D).
-    gas = await contractGas(context, call, kind)
-  } catch (error) {
-    throw toMidaError(error)
-  }
   if (context.sponsor !== undefined) {
     try {
       return await context.sponsor.send(call, kind)
     } catch (error) {
       // SPONSOR_PENDING leaves through this line untouched: the operation was accepted and may
       // still land, so a self-paid copy is exactly the double-send this seam must never create.
+      // A GAS_CEILING_EXCEEDED from the sponsored path's own bundler-estimate check leaves the
+      // same way — a local policy refusal, never a fallback candidate.
       if (!(error instanceof SponsorDidNotPay)) throw error
       if (!SPONSOR_FALLBACK_TO_SELF_PAY) {
         // The probe (m3-sponsor-probe step f, Sep 21) measured that a delegated address under
@@ -161,6 +162,16 @@ export async function sendContract(
       context.progress?.(`the gas sponsor did not pay (${error.reason}); paying from your own wallet…`)
       // falls through to the self-paid path — exactly one attempt, never a retry loop
     }
+  }
+  let gas: bigint
+  try {
+    // The per-kind ceiling on the self-paid path: the node's estimate is refused over the kind's
+    // ceiling, locally, before the send is priced (M3-D). This estimate is deliberately absent
+    // from the sponsored path above — the payer there is the sponsor, and the bundler's own
+    // callGasLimit is what gets checked.
+    gas = await contractGas(context, call, kind)
+  } catch (error) {
+    throw toMidaError(error)
   }
   let fee: SendFee
   try {
