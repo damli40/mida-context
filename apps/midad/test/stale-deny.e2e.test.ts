@@ -3,6 +3,8 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { namespaceId } from "@mida/protocol"
+import type { Hex } from "@mida/protocol"
+import { SponsorPending } from "@mida/chain"
 import { expandScopeInputs } from "@mida/grant-advisor"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
@@ -16,6 +18,7 @@ import {
   loadAgentIdentity,
   loadGrants,
   requestAccess,
+  revoke,
   saveGrants,
 } from "@mida/midad"
 import type { Network } from "@mida/midad"
@@ -107,5 +110,70 @@ describe("M3-D4: `mida approve` clears a stale store deny", () => {
     expect(await runtime.ownerApi.listRevocations("active")).toEqual([])
     // The deny was cleared before repair ran, so a fresh wrap publish succeeds under the new grant.
     await expect(runtime.vault.publishReaderWraps({ agentId: identity.agentId, namespaceId: namespaceId("projects.current") })).resolves.toBeDefined()
+  })
+
+  it("a revoke still landing keeps its deny — approve prints the line and clears nothing", async () => {
+    await init(runtime, ["codex3"])
+    await requestAccess(runtime, "codex3")
+    await approve(runtime, "codex3")
+    const agentId = loadAgentIdentity(home, "codex3")!.agentId
+
+    // Stage exactly what a revoke ending SPONSOR_PENDING leaves: the active deny plus the marker.
+    const { intentId } = await runtime.ownerApi.requestRevocationDeny({ owner: runtime.owner, agentId })
+    home.writeSecretJson("agents/codex3/revoke-pending.json", { intentId, userOpHash: `0x${"ab".repeat(32)}`, at: new Date().toISOString() })
+
+    progressLines = []
+    await expect(approve(runtime, "codex3")).rejects.toMatchObject({ code: "already-approved" })
+    expect(progressLines).toContain("a revoke of codex3 is still landing — not cleared")
+    expect(progressLines).not.toContain(CLEARED)
+    // The deny survives: the store still refuses the agent whose revoke may be about to land.
+    expect((await runtime.ownerApi.listRevocations("active")).map((intent) => intent.intentId)).toContain(intentId)
+    await expect(runtime.vault.publishReaderWraps({ agentId, namespaceId: namespaceId("profile.skills") })).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
+    expect(home.has("agents/codex3/revoke-pending.json")).toBe(true)
+  })
+
+  it("once the pending revoke lands the marker is removed and its deny is left to anchor", async () => {
+    await init(runtime, ["codex4"])
+    await requestAccess(runtime, "codex4")
+    await approve(runtime, "codex4")
+    const agentId = loadAgentIdentity(home, "codex4")!.agentId
+
+    const { intentId } = await runtime.ownerApi.requestRevocationDeny({ owner: runtime.owner, agentId })
+    home.writeSecretJson("agents/codex4/revoke-pending.json", { intentId, userOpHash: `0x${"cd".repeat(32)}`, at: new Date().toISOString() })
+
+    // The accepted operation lands for real: the owner-agent epoch moves past the recorded one.
+    await runtime.vault.approveRevocation({ kind: "agent", agentId })
+
+    progressLines = []
+    // codex4 is revoked on chain and holds no pending request, so approve refuses — but only
+    // after the stale-deny pass ran: the marker is gone and its deny was left to anchor.
+    await expect(approve(runtime, "codex4")).rejects.toMatchObject({ code: "no-pending-request" })
+    expect(progressLines).not.toContain("a revoke of codex4 is still landing — not cleared")
+    expect(home.has("agents/codex4/revoke-pending.json")).toBe(false)
+    // The deny the marker guarded was left for reconcile to anchor — never cancelled.
+    const anchored = await runtime.ownerApi.listRevocations("anchored")
+    expect(anchored.map((intent) => intent.intentId)).toContain(intentId)
+    const cancelled = await runtime.ownerApi.listRevocations("cancelled")
+    expect(cancelled.map((intent) => intent.intentId)).not.toContain(intentId)
+  })
+
+  it("a revoke ending SPONSOR_PENDING writes the marker naming the deny's intent", async () => {
+    await init(runtime, ["codex5"])
+    await requestAccess(runtime, "codex5")
+    await approve(runtime, "codex5")
+
+    // The vault's deny stays staged on a pending operation; the error carries the intent id.
+    const pending = new SponsorPending(`0x${"ef".repeat(32)}` as Hex)
+    const intentId = `0x${"12".repeat(32)}` as Hex
+    const stubVault = {
+      ...runtime.vault,
+      approveRevocation: async () => {
+        ;(pending as { intentId?: Hex }).intentId = intentId
+        throw pending
+      },
+    }
+    const stub = { ...runtime, sendProgress: runtime.sendProgress.bind(runtime), vault: stubVault } as unknown as Runtime
+    await expect(revoke(stub, "codex5")).rejects.toMatchObject({ code: "SPONSOR_PENDING" })
+    expect(home.readJson("agents/codex5/revoke-pending.json")).toMatchObject({ intentId, userOpHash: pending.userOpHash })
   })
 })

@@ -500,7 +500,12 @@ export class FakeVaultAuthority implements VaultAuthority {
     try {
       return await send()
     } catch (error) {
-      if (isMidaError(error, "SPONSOR_PENDING")) throw error
+      // The deny stays staged for a pending operation; the caller needs to know which intent it
+      // belongs to so a local marker can guard it until the chain shows the revoke landed.
+      if (isMidaError(error, "SPONSOR_PENDING")) {
+        ;(error as { intentId?: Hex }).intentId = deny.intentId
+        throw error
+      }
       try {
         const expiresAt = BigInt(Math.floor(Date.now() / 1000)) + DENY_CANCEL_EXPIRY_SECONDS
         await this.#api.cancelRevocation(deny.intentId, {

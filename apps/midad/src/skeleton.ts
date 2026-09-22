@@ -16,9 +16,10 @@ import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import { FileAccessRequestStore } from "./request-store.js"
 import type { MidaHome } from "./home.js"
 import {
-  identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, loadOrCreateSignerKey,
-  markRevoked, replaceSignerKey, saveAgentIdentity, saveGrants, saveOwnerAddress,
+  clearRevokePending, identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, loadOrCreateSignerKey,
+  markRevokePending, markRevoked, replaceSignerKey, revokePending, saveAgentIdentity, saveGrants, saveOwnerAddress,
 } from "./keys.js"
+import type { RevokePendingMarker } from "./keys.js"
 import { approveProject, ensureProjectMarker, removeAgentApprovals } from "./projects.js"
 
 /**
@@ -346,7 +347,7 @@ export async function approve(
   // chain approves. The cleanup runs before EVERY branch below because the deny would poison any of
   // them: the grant path's own wrap publish gets CAPABILITY_DENIED, and the already-approved answer
   // would tell the owner nothing is wrong while the store still refuses the agent.
-  const cleared = await clearStaleStoreDenies(runtime, identity.agentId)
+  const cleared = await clearStaleStoreDenies(runtime, identity.agentId, name)
   if (cleared > 0) {
     const repair = await repairReaderWraps(runtime, undefined, identity.agentId)
     for (const failure of repair.failed) {
@@ -572,9 +573,22 @@ export async function revoke(
   }
   if (anyLive) {
     runtime.sendProgress("sending the revocation")
-    const approval = await vault.approveRevocation({ kind: "agent", agentId })
-    transactionHashes.push(approval.transactionHash)
-    sponsored = approval.sponsored
+    try {
+      const approval = await vault.approveRevocation({ kind: "agent", agentId })
+      transactionHashes.push(approval.transactionHash)
+      sponsored = approval.sponsored
+    } catch (error) {
+      // SPONSOR_PENDING means the bundler accepted the revoke and it may still land; its staged
+      // deny stays on purpose. The marker is what stops `mida approve` cancelling that deny inside
+      // the landing window — clearStaleStoreDenies removes it once the chain shows the revoke.
+      if (isMidaError(error, "SPONSOR_PENDING")) {
+        markRevokePending(home, name, {
+          intentId: (error as { intentId?: Hex }).intentId ?? null,
+          userOpHash: (error as { userOpHash?: Hex }).userOpHash ?? null,
+        })
+      }
+      throw error
+    }
   }
   // The marker records "this agent was revoked", so it is written whenever the agent was identified and
   // the chain now shows nothing valid for it — whether this run sent the transaction or a crashed
@@ -643,7 +657,7 @@ async function resolveAgentId(runtime: ServiceRuntime, name: string): Promise<He
  * saw. Covers agent-target denies and capability denies that belong to this agent alike. Returns
  * how many intents were cancelled.
  */
-async function clearStaleStoreDenies(runtime: Runtime, agentId: Hex): Promise<number> {
+async function clearStaleStoreDenies(runtime: Runtime, agentId: Hex, name: string): Promise<number> {
   let intents: Awaited<ReturnType<typeof runtime.ownerApi.listRevocations>>
   try {
     intents = await runtime.ownerApi.listRevocations("active")
@@ -653,13 +667,56 @@ async function clearStaleStoreDenies(runtime: Runtime, agentId: Hex): Promise<nu
     runtime.progress?.("note: could not reach the store to check for stale denies")
     return 0
   }
+  // M3-D6: a revoke that ended SPONSOR_PENDING left a marker next to its deny. While the chain
+  // does not show that revoke landed, clearing the deny would reopen the store inside the landing
+  // window — exactly what fast revocation exists to close. A marker that will not parse fails
+  // closed the same way: a deny left standing beats one cancelled too early.
+  let pending: RevokePendingMarker | undefined
+  try {
+    pending = revokePending(runtime.home, name)
+  } catch {
+    pending = { intentId: null, userOpHash: null, at: "" }
+  }
+  let stillLanding = false
+  let landedIntentId: string | null = null
+  if (pending !== undefined) {
+    const guarded =
+      pending.intentId === null
+        ? intents.find((i) => i.target.kind === "agent" && i.target.agentId.toLowerCase() === agentId.toLowerCase())
+        : intents.find((i) => i.intentId.toLowerCase() === pending.intentId!.toLowerCase())
+    if (guarded === undefined) {
+      // The deny the marker guarded is no longer active — anchored, cancelled or gone — so the
+      // marker's job is done.
+      clearRevokePending(runtime.home, name)
+    } else if (
+      guarded.agentEpochAtIntent !== null &&
+      (await runtime.reader.agentEpoch(runtime.owner, agentId)) > BigInt(guarded.agentEpochAtIntent)
+    ) {
+      // The chain shows the revoke landed; the marker is done and the deny is left for the
+      // store's own reconcile to anchor rather than cancelled here.
+      clearRevokePending(runtime.home, name)
+      landedIntentId = guarded.intentId.toLowerCase()
+    } else {
+      stillLanding = true
+    }
+  }
   let cleared = 0
+  let pendingPrinted = false
   for (const intent of intents) {
     const forAgent =
       intent.target.kind === "agent"
         ? intent.target.agentId.toLowerCase() === agentId.toLowerCase()
         : (await runtime.reader.getCapability(intent.target.capabilityId))?.agentId.toLowerCase() === agentId.toLowerCase()
     if (!forAgent) continue
+    if (stillLanding) {
+      if (!pendingPrinted) {
+        pendingPrinted = true
+        runtime.progress?.(`a revoke of ${name} is still landing — not cleared`)
+      }
+      continue
+    }
+    // The marker's own deny was left for reconcile to anchor once its revoke proved landed.
+    if (landedIntentId !== null && intent.intentId.toLowerCase() === landedIntentId) continue
     try {
       const reissued = await runtime.ownerApi.reissueRevocationNonce(intent.intentId)
       const expiresAt = BigInt(Math.floor(Date.now() / 1000)) + DENY_CANCEL_EXPIRY_SECONDS

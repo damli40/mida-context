@@ -220,3 +220,29 @@ export function isRevoked(home: MidaHome, name: string): boolean {
   assertName(name)
   return home.has(`agents/${name}/revoked.json`)
 }
+
+/**
+ * M3-D6: a revoke whose send ended SPONSOR_PENDING keeps its staged store deny on purpose — the
+ * operation may still land. The marker names that deny's intent so `mida approve` can tell a deny
+ * that is still landing apart from a stale one it should clear.
+ */
+export interface RevokePendingMarker {
+  intentId: string | null
+  userOpHash: string | null
+  at: string
+}
+
+export function markRevokePending(home: MidaHome, name: string, marker: Omit<RevokePendingMarker, "at">): void {
+  assertName(name)
+  home.writeSecretJson(`agents/${name}/revoke-pending.json`, { ...marker, at: new Date().toISOString() })
+}
+
+export function revokePending(home: MidaHome, name: string): RevokePendingMarker | undefined {
+  assertName(name)
+  return home.readJson<RevokePendingMarker>(`agents/${name}/revoke-pending.json`)
+}
+
+export function clearRevokePending(home: MidaHome, name: string): void {
+  assertName(name)
+  home.remove(`agents/${name}/revoke-pending.json`)
+}
