@@ -256,6 +256,42 @@ describe("compileCheckpoint", () => {
     }
   })
 
+  it("reads the provider's cache-usage line off a controlled stderr into the result (M3-H)", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "cache-stats"], label: "deepseek-x", stderrDetail: true },
+    })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.cacheHitTokens).toBe(11)
+      expect(r.cacheMissTokens).toBe(22)
+    }
+  })
+
+  it("without stderrDetail the same command's stderr is never read — no cache fields", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "cache-stats"], label: "deepseek-x" },
+    })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.cacheHitTokens).toBeUndefined()
+      expect(r.cacheMissTokens).toBeUndefined()
+    }
+  })
+
+  it("a malformed cache line is ignored and the compile still succeeds", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "cache-stats-bad"], label: "deepseek-x", stderrDetail: true },
+    })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.cacheHitTokens).toBeUndefined()
+      expect(r.cacheMissTokens).toBeUndefined()
+    }
+  })
+
   it("stderrDetail lets a model command's safe stderr line into the failure detail (R5-8)", async () => {
     const withFlag = await compileCheckpoint({
       ...base,

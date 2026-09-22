@@ -385,6 +385,8 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             trimmed: compiled.trimmed,
             droppedKeys: compiled.droppedKeys,
             ...(compiled.fellBack !== undefined ? { fellBack: compiled.fellBack } : {}),
+            ...(compiled.cacheHitTokens !== undefined ? { cacheHit: compiled.cacheHitTokens } : {}),
+            ...(compiled.cacheMissTokens !== undefined ? { cacheMiss: compiled.cacheMissTokens } : {}),
           }
           deps.home.writeSecretJson(`queue/compiled/${eventId}.json`, { ...envelope, compileMeta })
           reusedCompiled = false
@@ -417,6 +419,10 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           trimmed: compileMeta.trimmed,
           droppedKeys: compileMeta.droppedKeys,
           fellBack: compileMeta.fellBack,
+          // absent means unknown: JSON.stringify drops an undefined field, so a provider that
+          // reported nothing leaves the keys off the record entirely
+          cacheHit: compileMeta.cacheHit,
+          cacheMiss: compileMeta.cacheMiss,
         })
       } catch (error) {
         const code = failureCode(error)
@@ -545,6 +551,9 @@ interface CompileMeta {
   droppedKeys: string[]
   /** When the compile fell back to the second model: who failed, who wrote, and why. */
   fellBack?: { from: string; to: string; reason: string }
+  /** Provider-reported prompt-cache counters — absent when the provider didn't say. */
+  cacheHit?: number
+  cacheMiss?: number
 }
 
 /**
@@ -567,6 +576,8 @@ function readCompiled(home: MidaHome, eventId: string): { envelope: CheckpointEn
         trimmed: Array.isArray(meta.trimmed) ? meta.trimmed : [],
         droppedKeys: Array.isArray(meta.droppedKeys) ? meta.droppedKeys : [],
         ...(typeof meta.fellBack === "object" && meta.fellBack !== null ? { fellBack: meta.fellBack } : {}),
+        ...(typeof meta.cacheHit === "number" ? { cacheHit: meta.cacheHit } : {}),
+        ...(typeof meta.cacheMiss === "number" ? { cacheMiss: meta.cacheMiss } : {}),
       },
     }
   } catch {

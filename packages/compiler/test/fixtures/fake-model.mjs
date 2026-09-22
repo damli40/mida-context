@@ -21,6 +21,10 @@
 //              its stdin and echoes it back with one extra progress item: the
 //              block must reach the model intact and parseable
 //   stderr-fail — writes "kimi http 429" to stderr, exits 1 (stderrDetail tests)
+//   cache-stats — GOOD on stdout plus "cache hit=11 miss=22" on stderr, exit 0:
+//              the provider's usage line a compile with stderrDetail reads
+//   cache-stats-bad — GOOD on stdout plus a malformed "cache hit=…" line on
+//              stderr: the parse must ignore it and still succeed
 //
 // The mode comes from argv[2] when present, else FAKE_MODEL_MODE — argv lets a
 // primary and a fallback command differ inside one compile even though both
@@ -120,6 +124,14 @@ process.stdin.on("end", () => {
     case "stderr-fail":
       process.stderr.write("kimi http 429\n")
       process.exit(1)
+      break
+    case "cache-stats":
+      process.stderr.write("cache hit=11 miss=22\n")
+      fenced(GOOD)
+      break
+    case "cache-stats-bad":
+      process.stderr.write("cache hit=soon miss=later\n")
+      fenced(GOOD)
       break
     case "echo-previous": {
       const lines = input.split("\n")

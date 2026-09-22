@@ -776,6 +776,39 @@ describe("the saved log line carries the compile and save facts (C4)", () => {
     expect(Array.isArray(saved.droppedKeys)).toBe(true)
   })
 
+  it("a compile that reports provider cache numbers logs cacheHit/cacheMiss (M3-H)", async () => {
+    const { job, drain, drainLog } = setup()
+    const compile: typeof compileCheckpoint = async (input) => ({
+      ok: true,
+      checkpoint: sampleCheckpoint({ eventId: input.eventId, agent: input.agent }),
+      compiledBy: "deepseek-flash",
+      droppedKeys: [],
+      trimmed: [],
+      attempts: 1,
+      format: "claude-jsonl",
+      messagesKept: 1,
+      messagesTotal: 1,
+      charsSent: 0,
+      modelMs: 0,
+      cacheHitTokens: 900,
+      cacheMissTokens: 100,
+    })
+    job({ event: "Stop" }, T0)
+    await drain({ compile })
+    const saved = savedLines(drainLog).at(-1)!
+    expect(saved.cacheHit).toBe(900)
+    expect(saved.cacheMiss).toBe(100)
+  })
+
+  it("a compile that reports no cache numbers leaves the fields off the record", async () => {
+    const { job, drain, drainLog } = setup()
+    job({ event: "Stop" }, T0)
+    await drain({ now: () => new Date(T0 + 120_000) })
+    const saved = savedLines(drainLog).at(-1)!
+    expect(saved.cacheHit).toBeUndefined()
+    expect(saved.cacheMiss).toBeUndefined()
+  })
+
   it("a save retried from the compiled cache logs reusedCompiled and the stored metrics", async () => {
     const { job, drain, flags, drainLog } = setup()
     job({ event: "Stop" }, T0)

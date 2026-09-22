@@ -189,6 +189,53 @@ describe("openai-compatible-model.mjs — kimi provider (same code the shim invo
   })
 })
 
+describe("openai-compatible-model.mjs — cache usage on stderr (M3-H)", () => {
+  const okBody = (usage: unknown) => ({ choices: [{ message: { content: "ok" } }], usage })
+
+  it("a deepseek usage object becomes 'cache hit=<n> miss=<m>' on stderr, stdout untouched", async () => {
+    server = await fakeApi({ status: 200, body: okBody({ prompt_cache_hit_tokens: 7, prompt_cache_miss_tokens: 42 }) })
+    const r = await runModel("deepseek", "p", { DEEPSEEK_API_KEY: KEY, DEEPSEEK_BASE_URL: server.url })
+    expect(r.code).toBe(0)
+    expect(r.stdout).toBe("ok")
+    expect(r.stderr).toBe("cache hit=7 miss=42\n")
+  })
+
+  it("kimi accepts the same two names plus its alternates — flat and nested cached_tokens", async () => {
+    // the two deepseek-style names
+    server = await fakeApi({ status: 200, body: okBody({ prompt_cache_hit_tokens: 3, prompt_cache_miss_tokens: 9 }) })
+    const same = await runModel("kimi", "p", { KIMI_API_KEY: KEY, KIMI_BASE_URL: server.url })
+    expect(same.stderr).toBe("cache hit=3 miss=9\n")
+    await server.close()
+
+    // the flat alternate
+    server = await fakeApi({ status: 200, body: okBody({ cached_tokens: 4, prompt_cache_miss_tokens: 9 }) })
+    const flat = await runModel("kimi", "p", { KIMI_API_KEY: KEY, KIMI_BASE_URL: server.url })
+    expect(flat.stderr).toBe("cache hit=4 miss=9\n")
+    await server.close()
+
+    // the nested alternate
+    server = await fakeApi({
+      status: 200,
+      body: okBody({ prompt_tokens_details: { cached_tokens: 6 }, prompt_cache_miss_tokens: 9 }),
+    })
+    const nested = await runModel("kimi", "p", { KIMI_API_KEY: KEY, KIMI_BASE_URL: server.url })
+    expect(nested.stderr).toBe("cache hit=6 miss=9\n")
+  })
+
+  it("no usage object — or one without the fields — prints nothing extra", async () => {
+    server = await fakeApi({ status: 200, body: { choices: [{ message: { content: "ok" } }] } })
+    const none = await runModel("deepseek", "p", { DEEPSEEK_API_KEY: KEY, DEEPSEEK_BASE_URL: server.url })
+    expect(none.code).toBe(0)
+    expect(none.stderr).toBe("")
+    await server.close()
+
+    server = await fakeApi({ status: 200, body: okBody({ prompt_tokens: 50, completion_tokens: 12 }) })
+    const empty = await runModel("deepseek", "p", { DEEPSEEK_API_KEY: KEY, DEEPSEEK_BASE_URL: server.url })
+    expect(empty.code).toBe(0)
+    expect(empty.stderr).toBe("")
+  })
+})
+
 describe("openai-compatible-model.mjs — custom provider (your own endpoint)", () => {
   it("needs no key: no Authorization header is sent when MIDA_COMPILE_API_KEY is unset", async () => {
     server = await fakeApi({ status: 200, body: { choices: [{ message: { content: "ok" } }] } })

@@ -69,6 +69,13 @@ export type CompileResult =
       modelMs: number
       /** Present when the fallback ran: which model failed, which took over, and the failure that triggered it. */
       fellBack?: { from: string; to: string; reason: string }
+      /**
+       * Prompt-cache counters the provider reported for the call that wrote the checkpoint —
+       * only ever present for a model whose stderr is a controlled channel (stderrDetail) and
+       * only when the provider reported both numbers. Absent means unknown, not zero.
+       */
+      cacheHitTokens?: number
+      cacheMissTokens?: number
     }
   | {
       ok: false
@@ -85,7 +92,9 @@ const MAX_STDOUT = 8 * 1024 * 1024
 const DEFAULT_TIMEOUT_MS = 90_000
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
-type ModelRun = { ok: true; stdout: string; ms: number } | { ok: false; detail: string; ms: number }
+type ModelRun =
+  | { ok: true; stdout: string; ms: number; cacheHitTokens?: number; cacheMissTokens?: number }
+  | { ok: false; detail: string; ms: number }
 
 // One bad field must not cost the whole save. Strings over the schema limit
 // are cut to it ending in "…"; arrays over the item limit keep 50 entries —
@@ -148,7 +157,9 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
   const timeoutMs = model.timeoutMs ?? DEFAULT_TIMEOUT_MS
   return new Promise((resolve) => {
     let settled = false
-    const done = (r: { ok: true; stdout: string } | { ok: false; detail: string }) => {
+    const done = (
+      r: { ok: true; stdout: string; cacheHitTokens?: number; cacheMissTokens?: number } | { ok: false; detail: string },
+    ) => {
       if (settled) return
       settled = true
       resolve({ ...r, ms: Date.now() - t0 })
@@ -198,11 +209,23 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
       return ` — ${line.replace(/[^\x20-\x7e]/g, "?").slice(0, 160)}`
     }
 
+    // The controlled channel's second contract (M3-H): a successful provider may report its
+    // prompt-cache counters as "cache hit=<n> miss=<m>". Only a stderrDetail command's stderr
+    // is even piped, and only a line in exactly that shape counts — anything else is ignored.
+    const cacheUsage = (): { cacheHitTokens?: number; cacheMissTokens?: number } => {
+      if (model.stderrDetail !== true) return {}
+      for (const line of stderr.split("\n")) {
+        const match = /^cache hit=(\d+) miss=(\d+)$/.exec(line.trim())
+        if (match !== null) return { cacheHitTokens: Number(match[1]), cacheMissTokens: Number(match[2]) }
+      }
+      return {}
+    }
+
     const settle = () => {
       clearTimeout(timer)
       if (timedOut || exited === null) return
       if (exited.code !== 0) done({ ok: false, detail: `exit ${exited.code} signal ${exited.signal}${stderrNote()}` })
-      else done({ ok: true, stdout })
+      else done({ ok: true, stdout, ...cacheUsage() })
     }
 
     const timer = setTimeout(() => {
@@ -303,6 +326,9 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     // JSON both move to the next unspent provider; a usable object leaves the loop for the
     // validation below.
     let parsed: Record<string, unknown> | undefined
+    // the cache counters of the run that produced `parsed` — the WRITER's numbers,
+    // never an earlier provider's that failed on the way
+    let cache: { cacheHitTokens?: number; cacheMissTokens?: number } = {}
     for (;;) {
       const run = await runModel(current, prompt)
       modelMs += run.ms
@@ -319,6 +345,9 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
           )
         if (hasContent) {
           parsed = obj as Record<string, unknown>
+          if (run.cacheHitTokens !== undefined && run.cacheMissTokens !== undefined) {
+            cache = { cacheHitTokens: run.cacheHitTokens, cacheMissTokens: run.cacheMissTokens }
+          }
           break
         }
         fail = { reason: "no-json", detail: obj === undefined ? "model output held no JSON object" : "first JSON object held no checkpoint fields" }
@@ -406,6 +435,7 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
         messagesTotal: convo.messagesTotal,
         charsSent: convo.text.length,
         modelMs,
+        ...cache,
       }
     }
   }
