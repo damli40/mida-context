@@ -275,6 +275,8 @@ Claude Desktop's `claude_desktop_config.json` (Settings → Developer → MCP se
 }
 ```
 
+Desktop clients start the server **without your shell's environment**. If your Mida home is not the default `~/.mida`, add `"env": { "MIDA_HOME": "<your home dir>" }` next to `"args"`, or the server looks in the wrong home and every tool answers "not approved". The model keys used for compiles live in the daemon, not in this server: start the daemon from a terminal that has them (any `mida` command does), and the MCP server reuses it over the socket; a daemon the client spawns itself would have no keys and could not compile.
+
 The command is the installed `mida-mcp` bin by absolute path (`which mida-mcp` prints it; from a source checkout it is `<repo>/bin/mida-mcp`). `--as` names which agent identity the server reports — `claude-code`, `codex` or `assistant` (the default); add `"--project", "<dir>"` if the client launches it somewhere other than your project folder. The approval step is the same per-folder command the hooks use:
 
 ```bash
