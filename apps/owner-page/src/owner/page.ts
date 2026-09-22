@@ -100,6 +100,37 @@ export function showEntriesToSign(
   mount.appendChild(details)
 }
 
+/**
+ * The revoke counterpart of showEntriesToSign: revoking re-signs the approved-projects list
+ * with the agent's rows removed — the signature covers the surviving rows, so the owner sees
+ * exactly what stays before the passkey is asked.
+ */
+export function showListReSigned(
+  mount: HTMLElement,
+  rows: readonly { agent: string; projectId: string; root: string; approvedAt: string }[],
+): void {
+  const short = (value: string) => (value.length > 10 ? `${value.slice(0, 10)}…` : value)
+  mount.replaceChildren()
+  const lead = document.createElement("p")
+  lead.textContent = "Revoking also re-signs your approved-projects list without this agent's rows."
+  mount.appendChild(lead)
+  const details = document.createElement("details")
+  const fold = document.createElement("summary")
+  fold.textContent =
+    rows.length === 0
+      ? "…no rows remain — the signature covers an empty list"
+      : `…${rows.length} row${rows.length === 1 ? "" : "s"} stay on the list your signature re-covers`
+  details.appendChild(fold)
+  const list = document.createElement("ul")
+  for (const row of rows) {
+    const li = document.createElement("li")
+    li.textContent = `${row.projectId} — agent ${short(row.agent)} — root ${short(row.root)}`
+    list.appendChild(li)
+  }
+  details.appendChild(list)
+  mount.appendChild(details)
+}
+
 /** The real environment: navigator.credentials, the chain RPC, the sponsor, the hosted store. */
 export function makeEnv(): FlowEnvironment {
   const publicClient = createPublicClient({ chain: chainFor(DEPLOYMENT.chainId), transport: http(RPC_URL) })

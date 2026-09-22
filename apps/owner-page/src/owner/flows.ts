@@ -464,6 +464,22 @@ export function signableProjectRows(req: LinkRequest): { existing: SignedProject
   }
 }
 
+/**
+ * The revoke counterpart of signProjectEntry: `req.entries` is already the reduced list (the
+ * terminal filtered the revoked agent's rows out), so the signature covers exactly what was
+ * sent — nothing is added, nothing re-dated. The terminal verifies the returned rows byte for
+ * byte against what it sent, so a crafted link cannot smuggle a row through here either.
+ */
+async function signReducedProjectList(
+  account: LocalAccount,
+  req: LinkRequest,
+): Promise<{ entries: Record<string, unknown>[]; signature: Hex } | undefined> {
+  if (req.entries === undefined) return undefined
+  const rows = req.entries as unknown as SignedProjectRow[]
+  const signature = await account.signMessage({ message: canonicalEntries(rows) })
+  return { entries: rows as unknown as Record<string, unknown>[], signature }
+}
+
 /** The project-list signature: byte-identical canonical form to apps/midad projects.ts. */
 async function signProjectEntry(
   account: LocalAccount,
@@ -524,7 +540,10 @@ export async function confirmRevoke(env: FlowEnvironment, link: ParsedLink, prep
   const progress = env.progress ?? (() => {})
   let sent: { transactionHash: Hex; userOpHash: Hex }[] = []
   const req = link.req
-  if (prep.live.length === 0) {
+  // Nothing live ends the page early only when there is also no list to re-sign — a passkey
+  // terminal cannot sign the reduced approved-projects list itself, so an already-dead agent
+  // whose rows are still on file still costs one touch (M3-F2, same shape as approve).
+  if (prep.live.length === 0 && req.entries === undefined) {
     return failure(link, req.owner ?? null, new MidaError("CAPABILITY_DENIED", "the chain shows nothing live for this agent — nothing was sent"), sent)
   }
   try {
@@ -553,24 +572,30 @@ export async function confirmRevoke(env: FlowEnvironment, link: ParsedLink, prep
       const made = authorityFor(env, secrets, {})
       const authority = made.authority
       sent = made.sent
-      progress("Sending the revocation…")
-      const approval = await authority.approveRevocation({ kind: "agent", agentId: prep.agentId })
-      // Re-wrap the rotated namespaces for the agents that keep READ on chain.
-      for (const rotation of approval.rotated) {
-        for (const reader of req.readers ?? []) {
-          if (reader === prep.agentId) continue
-          const ok = await readCapability<boolean>(env, "hasAuthority", [derived, reader, rotation.namespaceId, PERMISSION.READ, 0])
-          if (ok) {
-            progress("Sending the new key to a surviving agent…")
-            await authority.publishReaderWraps({ agentId: reader, namespaceId: rotation.namespaceId })
+      if (prep.live.length > 0) {
+        progress("Sending the revocation…")
+        const approval = await authority.approveRevocation({ kind: "agent", agentId: prep.agentId })
+        // Re-wrap the rotated namespaces for the agents that keep READ on chain.
+        for (const rotation of approval.rotated) {
+          for (const reader of req.readers ?? []) {
+            if (reader === prep.agentId) continue
+            const ok = await readCapability<boolean>(env, "hasAuthority", [derived, reader, rotation.namespaceId, PERMISSION.READ, 0])
+            if (ok) {
+              progress("Sending the new key to a surviving agent…")
+              await authority.publishReaderWraps({ agentId: reader, namespaceId: rotation.namespaceId })
+            }
           }
         }
       }
+      // The reduced approved-projects list: the terminal sent the rows that survive and the
+      // page re-signs them verbatim — the only signer a passkey home has.
+      const entry = await signReducedProjectList(account, req)
       return buildResult({
         ...resultBase(link, derived),
         status: "success",
         transactions: sent.map((s) => s.transactionHash),
         operations: sent.map((s) => s.userOpHash),
+        ...(entry !== undefined ? { entry } : {}),
       })
     } finally {
       secrets.release()

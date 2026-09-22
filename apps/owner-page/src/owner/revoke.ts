@@ -1,4 +1,4 @@
-import { el, parsePageLink, assertRpGate, makeEnv, showError, finish } from "./page.js"
+import { el, parsePageLink, assertRpGate, makeEnv, showListReSigned, showError, finish } from "./page.js"
 import { prepareRevoke, confirmRevoke } from "./flows.js"
 import { describeError } from "./session.js"
 
@@ -35,7 +35,12 @@ async function main(): Promise<void> {
             "Revoking ends all of this and locks the old keys out of anything it saved.",
           ]
     summary.textContent = lines.join("\n")
-    if (prep.live.length === 0) return
+    // The approved-projects rows the signature re-covers (the terminal already filtered the
+    // revoked agent out) — shown before the passkey is asked, same rule as approve.
+    const keptRows = link.req.entries as { agent: string; projectId: string; root: string; approvedAt: string }[] | undefined
+    if (keptRows !== undefined) showListReSigned(el("sign-list"), keptRows)
+    // Nothing live ends the page early only when there is also no list to re-sign (M3-F2).
+    if (prep.live.length === 0 && keptRows === undefined) return
     button.disabled = false
     button.addEventListener("click", () => {
       void (async () => {

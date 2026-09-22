@@ -763,9 +763,11 @@ export async function revokePasskey(
   const kept = current.filter((e) => e.agent !== name)
 
   if (liveIds.length === 0 && file.kind === "missing") {
-    // Nothing on chain and no signed list — mirror software revoke's never-approved rule.
+    // Nothing on chain and no signed list — mirror software revoke's never-approved rule. A
+    // pending marker left by an earlier revoke that has now landed is retired here too.
     const neverApproved = listed.length === 0 && !isRevoked(home, name) && !home.has(`agents/${name}/grants.json`)
     if (!neverApproved) markRevoked(home, name)
+    clearRevokePending(home, name)
     return { transactionHashes: [], rewrapped: [], nothingToRevoke: true }
   }
 

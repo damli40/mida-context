@@ -650,4 +650,46 @@ describe("revoke flow", () => {
     expect(credentials.calls).toHaveLength(0)
     expect(sends).toHaveLength(0)
   })
+
+  it("a successful revoke also returns the surviving project list, re-signed verbatim", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const { env } = makeEnv({ sends, apiCalls, chain: revokeChain(sends) })
+    // the terminal already filtered the revoked agent's rows out — these are the survivors
+    const kept = [
+      { agent: SURVIVOR, projectId: "proj-1", root: `0x${"33".repeat(32)}`, approvedAt: "2026-09-20T00:00:00.000Z" },
+    ]
+    const parsed = link("revoke", {
+      chainId: Number(CHAIN_ID),
+      owner: OWNER,
+      agentId: AGENT_ID,
+      readers: [AGENT_ID, SURVIVOR],
+      entries: kept,
+    })
+    const prep = await prepareRevoke(env, parsed)
+    const result = await confirmRevoke(env, parsed, prep)
+    expect(result.status).toBe("success")
+    expect(sends.map((s) => s.functionName)).toEqual(["revokeAgentAndRotate"])
+    // the returned entry is exactly the rows sent — nothing added, nothing re-dated
+    expect(result.entry?.signature).toMatch(/^0x/)
+    expect(result.entry?.entries).toEqual(kept)
+  })
+
+  it("an agent with nothing live but rows still on the list gets its one touch — no revoke send, the list is re-signed", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const { env, credentials } = makeEnv({ sends, apiCalls, chain: fakeChain({ activeCapabilityIds: () => [] }) })
+    const kept = [
+      { agent: SURVIVOR, projectId: "proj-1", root: `0x${"33".repeat(32)}`, approvedAt: "2026-09-20T00:00:00.000Z" },
+    ]
+    const parsed = link("revoke", { chainId: Number(CHAIN_ID), owner: OWNER, agentId: AGENT_ID, entries: kept })
+    const prep = await prepareRevoke(env, parsed)
+    expect(prep.live).toHaveLength(0)
+    const result = await confirmRevoke(env, parsed, prep)
+    expect(result.status).toBe("success")
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get"]) // the touch still happens — it signs the list
+    expect(sends).toHaveLength(0) // nothing was revoked — the chain already showed it dead
+    expect(result.entry?.signature).toMatch(/^0x/)
+    expect(result.entry?.entries).toEqual(kept)
+  })
 })
