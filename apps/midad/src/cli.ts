@@ -185,7 +185,7 @@ export async function runCliWithRuntime(
         if (only === "projects.current") {
           const projectId = context?.cwd === undefined ? null : projectIdFor(context.cwd)
           if (projectId === null) {
-            print(`projects.current: this folder is not a Mida project — run \`mida approve ${agent}\` here to make it one`)
+            print(`projects.current: this folder is not a Mida project — run \`mida request ${agent} && mida approve ${agent}\` here to make it one`)
           } else {
             const result = await readCheckpoints(runtime, agent, projectId)
             print(`${NAMESPACE}: read ${result.checkpoints.length} object(s)`)

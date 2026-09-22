@@ -253,10 +253,18 @@ async function toolStatus(deps: McpServerDeps) {
     const b = probes[i]?.body as { kind?: unknown; reason?: unknown } | null
     return b?.kind === "refused" && typeof b.reason === "string" ? b.reason : undefined
   }
-  // A folder-level refusal is the same for every agent — say it once instead of three times.
+  // A refusal that is about the folder or the approval list — not the agent — comes back the
+  // same for all three probes; say it once instead of printing three identical verdicts.
+  const FOLDER_LINES: Record<string, string> = {
+    "not-a-project": "this folder is not a Mida project — no .mida marker found",
+    "folder-mismatch": "this folder's .mida marker belongs to a different folder — it was moved or copied",
+    "list-tampered": "the approved-projects list failed its signature check — run `mida doctor`",
+    "list-unreadable": "the approved-projects list could not be read — check the file's permissions",
+  }
   const folderReasons = new Set(probes.map((_, i) => reason(i)))
-  if (probes.every((p) => p.status !== 0) && folderReasons.size === 1 && folderReasons.has("not-a-project")) {
-    lines.push("this folder is not a Mida project — no .mida marker found")
+  const folderLine = folderReasons.size === 1 ? FOLDER_LINES[[...folderReasons][0] ?? ""] : undefined
+  if (probes.every((p) => p.status !== 0) && folderLine !== undefined) {
+    lines.push(folderLine)
   } else {
     for (let i = 0; i < MCP_AGENTS.length; i += 1) {
       const name = MCP_AGENTS[i]!

@@ -35,7 +35,9 @@ function spawnDaemon(cwd: string): void {
 }
 
 async function main(): Promise<void> {
-  // stdout is the JSON-RPC channel — every diagnostic, including the usage refusal, goes to stderr
+  // stdout is the JSON-RPC channel — a client that dies mid-write must not become an unhandled
+  // stream error, and every diagnostic (including the usage refusal) goes to stderr
+  process.stdout.on("error", () => {})
   const parsed = parseMcpArgs(process.argv.slice(2))
   if (!parsed.ok) {
     process.stderr.write(`mida-mcp: ${parsed.error}\n${MCP_USAGE}\n`)
