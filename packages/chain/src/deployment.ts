@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs"
-import { fileURLToPath } from "node:url"
 import { MidaError, assertHex } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import type { Chain } from "viem"
@@ -19,16 +17,9 @@ export interface Deployment {
 export const LOCAL_CHAIN_ID = 31337n
 export const MONAD_TESTNET_CHAIN_ID = 10143n
 
-let deploymentsDir: string | undefined
-/**
- * The contracts/deployments directory, resolved on first use and cached. It must stay lazy: this module is
- * bundled into the store Worker, where `import.meta.url` is not a parseable URL — evaluating
- * fileURLToPath(new URL(…)) at module scope would throw on startup. The Worker never calls this.
- */
-export function DEFAULT_DEPLOYMENTS_DIR(): string {
-  return (deploymentsDir ??= fileURLToPath(new URL("../../../contracts/deployments/", import.meta.url)))
-}
-
+// The filesystem side of deployment loading (loadDeployment, DEFAULT_DEPLOYMENTS_DIR) lives in
+// deployment-fs.js so this module carries no node: specifier — writes.js, registry.js,
+// sponsored.js and the owner-page browser bundle all import from here.
 function wire(detail: string): never {
   throw new MidaError("INVALID_WIRE", `deployment: ${detail}`)
 }
@@ -58,19 +49,6 @@ export function parseDeployment(json: unknown): Deployment {
     vaultRpId: record.vaultRpId,
     vaultRpIdHash: assertHex(record.vaultRpIdHash.toLowerCase(), 32),
   }
-}
-
-export function loadDeployment(chainId: bigint, directory: string = DEFAULT_DEPLOYMENTS_DIR()): Deployment {
-  const path = `${directory.replace(/\/$/, "")}/${chainId}.json`
-  let text: string
-  try {
-    text = readFileSync(path, "utf8")
-  } catch {
-    throw new MidaError("NOT_FOUND", `no deployment file at ${path}`)
-  }
-  const deployment = parseDeployment(JSON.parse(text))
-  if (deployment.chainId !== chainId) wire(`${path} is for chain ${deployment.chainId}`)
-  return deployment
 }
 
 /** Only the two networks Project 1 targets. Monad testnet comes from viem, never a hand-written object. */

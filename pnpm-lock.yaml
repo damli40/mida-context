@@ -338,12 +338,33 @@ importers:
       '@category-labs/mera':
         specifier: 0.2.0
         version: 0.2.0(viem@2.56.3(typescript@5.9.3)(zod@4.5.4))
+      '@mida/api':
+        specifier: workspace:*
+        version: link:../api
+      '@mida/chain':
+        specifier: workspace:*
+        version: link:../../packages/chain
+      '@mida/crypto':
+        specifier: workspace:*
+        version: link:../../packages/crypto
+      '@mida/fake-vault':
+        specifier: workspace:*
+        version: link:../../packages/fake-vault
+      '@mida/grant-advisor':
+        specifier: workspace:*
+        version: link:../../packages/grant-advisor
+      '@mida/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
       '@noble/curves':
         specifier: 2.4.0
         version: 2.4.0
       '@noble/hashes':
         specifier: 2.4.0
         version: 2.4.0
+      viem:
+        specifier: 2.56.3
+        version: 2.56.3(typescript@5.9.3)(zod@4.5.4)
     devDependencies:
       esbuild:
         specifier: 0.28.2

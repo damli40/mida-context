@@ -3,7 +3,7 @@ import type { Address, Hex, ObjectManifest, ReaderEpochWrap, SignedAgentCapabili
 import { hexOf } from "@mida/crypto"
 import { randomBytes } from "@noble/hashes/utils.js"
 import type { LocalAccount } from "viem"
-import { AUTH_HEADERS, targetOf } from "./auth.js"
+import { AUTH_HEADERS, targetOf } from "./auth-pure.js"
 import { errorFromBody } from "./errors.js"
 import type { WebAuthnAssertionInput } from "./verify-assertion.js"
 import type { AnchoredObject, ObjectUploadBody } from "./wire.js"

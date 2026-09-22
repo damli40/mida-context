@@ -5,8 +5,15 @@
   "type": "module",
   "dependencies": {
     "@category-labs/mera": "0.2.0",
+    "@mida/api": "workspace:*",
+    "@mida/chain": "workspace:*",
+    "@mida/crypto": "workspace:*",
+    "@mida/fake-vault": "workspace:*",
+    "@mida/grant-advisor": "workspace:*",
+    "@mida/protocol": "workspace:*",
     "@noble/curves": "2.4.0",
-    "@noble/hashes": "2.4.0"
+    "@noble/hashes": "2.4.0",
+    "viem": "2.56.3"
   },
   "devDependencies": {
     "esbuild": "0.28.2"
