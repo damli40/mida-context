@@ -20,6 +20,8 @@ import {
   startPersistentApi, unwrapCheckpoint,
 } from "@mida/midad"
 import type { DaemonHandle, Network } from "@mida/midad"
+import { ensureCurrentDaemon } from "../src/control.js"
+import type { CodeIdentity } from "../src/code-identity.js"
 import { sampleCheckpoint } from "./helpers.js"
 
 const STEP_TIMEOUT = 60_000
@@ -98,6 +100,7 @@ describe("the long-running midad", () => {
   let homeDir: string
   let workDir: string
   let transcriptPath: string
+  let codexTranscriptPath: string
   let daemon: DaemonHandle | undefined
   let compileCalls: CompileInput[] = []
   let duringPass: (() => void) | undefined
@@ -122,15 +125,16 @@ describe("the long-running midad", () => {
     }
   }
 
-  const start = () =>
+  const start = (over: { identity?: CodeIdentity; compile?: typeof compile } = {}) =>
     startDaemon({
       home,
       network: { ...network, storageUrl: apiServer.baseUrl },
-      compile,
+      compile: over.compile ?? compile,
       now: () => Date.now(),
       log: (entry) => daemonLogs.push(entry),
       drainDeps: { homeDir },
       tickMs: 30_000, // tests kick explicitly; the tick is only the safety net
+      ...(over.identity === undefined ? {} : { identity: over.identity }),
     })
 
   const poll = async (check: () => boolean | Promise<boolean>, ms = 30_000): Promise<void> => {
@@ -212,6 +216,11 @@ describe("the long-running midad", () => {
     mkdirSync(join(homeDir, ".claude", "projects", "proj"), { recursive: true })
     transcriptPath = join(homeDir, ".claude", "projects", "proj", "transcript.jsonl")
     writeFileSync(transcriptPath, JSON.stringify({ type: "user", message: { content: "Build a thing" } }) + "\n")
+    // codex keeps its grant through test (e)'s claude-code revocation — the jobs tests (f) and (g)
+    // queue must belong to an agent the drain can still approve at that point
+    mkdirSync(join(homeDir, ".codex", "sessions"), { recursive: true })
+    codexTranscriptPath = join(homeDir, ".codex", "sessions", "rollout-test.jsonl")
+    writeFileSync(codexTranscriptPath, JSON.stringify({ type: "user", message: { content: "Build a thing" } }) + "\n")
     daemon = await start()
   }, STEP_TIMEOUT * 4)
 
@@ -346,6 +355,80 @@ describe("the long-running midad", () => {
       expect(await readOwnerFacts(ownerRuntime, "codex")).toEqual(factsBefore)
     } finally {
       await ownerRuntime.close()
+    }
+  }, STEP_TIMEOUT)
+
+  it("(f) H6: a service running other code is replaced — and no queued job is lost", async () => {
+    // the shared daemon gives the home up, then an "old" daemon takes it — one that reports
+    // code living at /a @ 1 while this command's code is /b @ 2
+    await daemon?.close()
+    daemon = undefined
+    const stale = await start({ identity: { codeRoot: "/a", codeCommit: "1" } })
+    expect(stale.alreadyRunning).toBe(false)
+    expect((await callDaemon(home, "/health", undefined, { timeoutMs: 2_000 })).body).toMatchObject({ codeRoot: "/a", codeCommit: "1" })
+
+    // codex jobs: claude-code was revoked on chain by test (e) and would be dropped pre-compile
+    const j1 = job({ agent: "codex", sessionId: "s-h6-one", transcriptPath: codexTranscriptPath })
+    const j2 = job({ agent: "codex", sessionId: "s-h6-two", transcriptPath: codexTranscriptPath })
+
+    let spawned: Promise<DaemonHandle> | undefined
+    const result = await ensureCurrentDaemon(
+      home,
+      () => {
+        // the replacement starts the same way cli.ts's spawnDaemon would — from THIS code
+        spawned = start({ identity: { codeRoot: "/b", codeCommit: "2" } })
+      },
+      { waitMs: STEP_TIMEOUT, self: { codeRoot: "/b", codeCommit: "2" } },
+    )
+
+    expect(result.up).toBe(true)
+    expect(result.replaced).toMatchObject({ codeRoot: "/a", codeCommit: "1" })
+    // the old service is gone: /health now answers with the replacement's identity
+    const health = await callDaemon(home, "/health", undefined, { timeoutMs: 5_000 })
+    expect(health.body).toMatchObject({ codeRoot: "/b", codeCommit: "2" })
+    daemon = await spawned!
+
+    // no job was lost in the handover: each is still queued, or was already saved
+    const queuedIds = new Set(listJobs(home).map((j) => j.id))
+    const savedSessions = new Set((await readThrough("codex", "proj-daemon")).map((e) => e.sessionId))
+    for (const j of [j1, j2]) {
+      expect(queuedIds.has(j.id) || savedSessions.has(j.sessionId)).toBe(true)
+    }
+  }, STEP_TIMEOUT)
+
+  it("(g) POST /shutdown answers ok, waits for the save in flight, then stops answering", async () => {
+    await daemon?.close()
+    daemon = undefined
+    // a compile the test holds open: the drain pass sits inside it until released
+    let releaseCompile: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { releaseCompile = resolve })
+    let calls = 0
+    const gatedCompile = async (input: CompileInput): Promise<CompileResult> => {
+      calls += 1
+      await gate
+      return compile(input)
+    }
+    const held = await start({ compile: gatedCompile })
+    try {
+      job({ agent: "codex", sessionId: "s-shutdown", transcriptPath: codexTranscriptPath })
+      const before = calls
+      await kick()
+      await poll(() => calls > before) // a pass is now in flight inside the gated compile
+
+      const reply = await callDaemon(home, "/shutdown", {}, { timeoutMs: 2_000 })
+      expect(reply.status).toBe(200)
+      expect(reply.body).toEqual({ ok: true })
+      // the save is still in flight: the service keeps answering while close() waits for it
+      expect((await callDaemon(home, "/health", undefined, { timeoutMs: 1_000 })).status).toBe(200)
+
+      releaseCompile!()
+      await poll(async () => (await callDaemon(home, "/health", undefined, { timeoutMs: 500 })).status === 0)
+      // the in-flight save landed before the service went down — nothing was dropped
+      await poll(async () => (await readThrough("codex", "proj-daemon")).some((e) => e.sessionId === "s-shutdown"))
+      expect(listJobs(home).some((j) => j.sessionId === "s-shutdown")).toBe(false)
+    } finally {
+      releaseCompile?.()
+      await held.close() // already closed by /shutdown — close() is idempotent
     }
   }, STEP_TIMEOUT)
 })

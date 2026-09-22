@@ -8,7 +8,7 @@ import { decodeUint64, isMidaError, namespaceById } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { permissionNames } from "@mida/grant-advisor"
-import { callDaemon, ensureDaemon } from "./control.js"
+import { callDaemon, ensureCurrentDaemon } from "./control.js"
 import { debugLine, refusalCode } from "./debug-line.js"
 import { runDoctor, runDoctorLive } from "./doctor.js"
 import { MidaHome, resolveHome } from "./home.js"
@@ -804,11 +804,16 @@ async function main(): Promise<void> {
     return
   }
 
-  const up = await ensureDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS })
-  if (!up) {
-    print("midad did not start; run `mida init` first")
+  const ensured = await ensureCurrentDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS })
+  if (!ensured.up) {
+    print(ensured.refusal ?? "midad did not start; run `mida init` first")
     process.exitCode = 1
     return
+  }
+  if (ensured.replaced !== undefined) {
+    // the service that answered was running other code and has been shut down and restarted —
+    // say so on stderr so the command's stdout keeps its shape
+    process.stderr.write(`restarted the Mida service (it was running code from ${ensured.replaced.codeRoot} @ ${ensured.replaced.codeCommit.slice(0, 7)})\n`)
   }
   const reply = await callDaemon(home, "/cli", { argv, cwd: process.cwd(), debug: process.env.MIDA_DEBUG === "1" }, { timeoutMs: CLI_CALL_TIMEOUT_MS })
   const body = reply.body as { code?: unknown; lines?: unknown } | null

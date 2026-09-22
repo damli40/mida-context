@@ -1,10 +1,11 @@
 import { afterAll, describe, expect, it } from "vitest"
 import { createServer } from "node:net"
 import type { Server, Socket } from "node:net"
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { MidaHome, SOCKET_FILE, callDaemon, ensureDaemon, ensureFallbackSocketDir, fallbackSocketDir, socketPathFor } from "@mida/midad"
+import { ensureCurrentDaemon } from "../src/control.js"
 
 /** A Unix-socket server the test controls by hand; `onRequest` decides what a connection gets. */
 function fakeDaemon(socketPath: string, onRequest: (socket: Socket, data: Buffer) => void): Promise<Server> {
@@ -159,5 +160,217 @@ describe("ensureDaemon", () => {
     expect(up).toBe(false)
     expect(spawned).toBe(1)
     expect(Date.now() - started).toBeLessThan(2_000)
+  })
+})
+
+/**
+ * A fake daemon that speaks just enough HTTP for the identity check: `onRequest` gets the method
+ * and path once the whole request has arrived (headers plus any content-length body). The socket
+ * file is unlinked before binding so a replacement can take the same path.
+ */
+function fakeHttpDaemon(
+  socketPath: string,
+  onRequest: (req: { method: string; path: string }, socket: Socket) => void,
+): Promise<Server> {
+  const server = createServer((socket) => {
+    let buf = Buffer.alloc(0)
+    let fired = false
+    socket.on("data", (chunk) => {
+      if (fired) return
+      buf = Buffer.concat([buf, chunk])
+      const headEnd = buf.indexOf("\r\n\r\n")
+      if (headEnd === -1) return
+      const length = /content-length:\s*(\d+)/i.exec(buf.toString("utf8", 0, headEnd))
+      if (buf.length < headEnd + 4 + (length === null ? 0 : Number(length[1]))) return
+      fired = true
+      const [method = "", path = ""] = buf.toString("utf8", 0, buf.indexOf("\r\n")).split(" ")
+      onRequest({ method, path }, socket)
+    })
+  })
+  rmSync(socketPath, { force: true })
+  return new Promise((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(socketPath, () => resolve(server))
+  })
+}
+
+/** close() on an already-stopped server must not hang the test's cleanup. */
+const closeQuiet = (server: Server | undefined) =>
+  new Promise<void>((done) => {
+    if (server === undefined) return done()
+    try {
+      server.close(() => done())
+    } catch {
+      done()
+    }
+  })
+
+describe("ensureCurrentDaemon", () => {
+  it("a daemon running the same code is used as-is — no shutdown, no spawn", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    const posts: string[] = []
+    const server = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+      if (req.method === "POST") posts.push(req.path)
+      replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "abc1234" })
+    })
+    try {
+      let spawned = 0
+      const result = await ensureCurrentDaemon(home, () => { spawned += 1 }, {
+        waitMs: 2_000,
+        self: { codeRoot: "/code/here", codeCommit: "abc1234" },
+      })
+      expect(result).toEqual({ up: true })
+      expect(spawned).toBe(0)
+      expect(posts).toEqual([])
+    } finally {
+      await closeQuiet(server)
+    }
+  })
+
+  it("a daemon down is spawned and waited for, exactly like ensureDaemon", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    let spawned = 0
+    let server: Server | undefined
+    const result = await ensureCurrentDaemon(home, () => {
+      spawned += 1
+      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+        replyJson(socket, 200, { ok: true, pid: 2, codeRoot: "/code/here", codeCommit: "abc1234" }),
+      ).then((s) => { server = s })
+    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234" } })
+    try {
+      expect(result).toEqual({ up: true })
+      expect(spawned).toBe(1)
+    } finally {
+      await closeQuiet(server)
+    }
+  })
+
+  it("a daemon reporting a different commit gets one /shutdown, then is replaced", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    const posts: string[] = []
+    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+      if (req.method === "POST") {
+        posts.push(req.path)
+        replyJson(socket, 200, { ok: true })
+        if (req.path === "/shutdown") void closeQuiet(oldServer)
+        return
+      }
+      replyJson(socket, 200, { ok: true, pid: 7, codeRoot: "/code/here", codeCommit: "old1234" })
+    })
+    let spawned = 0
+    let replacement: Server | undefined
+    const result = await ensureCurrentDaemon(home, () => {
+      spawned += 1
+      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+        replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "new5678" }),
+      ).then((s) => { replacement = s })
+    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "new5678" } })
+    try {
+      expect(result.up).toBe(true)
+      expect(result.replaced).toEqual({ codeRoot: "/code/here", codeCommit: "old1234", pid: 7 })
+      expect(posts).toEqual(["/shutdown"])
+      expect(spawned).toBe(1)
+    } finally {
+      await closeQuiet(replacement)
+      await closeQuiet(oldServer)
+    }
+  })
+
+  it("a daemon that cannot name its code (no codeRoot in /health) is replaced too", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+      if (req.method === "POST") {
+        replyJson(socket, 200, { ok: true })
+        if (req.path === "/shutdown") void closeQuiet(oldServer)
+        return
+      }
+      // a /health body from before code reporting existed: ok and pid, nothing else
+      replyJson(socket, 200, { ok: true, pid: 9 })
+    })
+    let replacement: Server | undefined
+    const result = await ensureCurrentDaemon(home, () => {
+      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+        replyJson(socket, 200, { ok: true, pid: 10, codeRoot: "/code/here", codeCommit: "abc1234" }),
+      ).then((s) => { replacement = s })
+    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234" } })
+    try {
+      expect(result.up).toBe(true)
+      expect(result.replaced).toMatchObject({ codeRoot: "unknown", codeCommit: "unknown", pid: 9 })
+    } finally {
+      await closeQuiet(replacement)
+      await closeQuiet(oldServer)
+    }
+  })
+
+  it('"unknown" counts as equal only when BOTH sides are unknown', async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    // both sides "unknown" — nothing to compare, so nothing is replaced
+    const sameServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+      replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "unknown" }),
+    )
+    try {
+      const result = await ensureCurrentDaemon(home, () => { throw new Error("must not spawn") }, {
+        waitMs: 2_000,
+        self: { codeRoot: "/code/here", codeCommit: "unknown" },
+      })
+      expect(result).toEqual({ up: true })
+    } finally {
+      await closeQuiet(sameServer)
+    }
+
+    // one side real, one side "unknown" — that IS a difference and the service is replaced
+    const home2 = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    const oldServer = await fakeHttpDaemon(socketPathFor(home2), (req, socket) => {
+      if (req.method === "POST") {
+        replyJson(socket, 200, { ok: true })
+        if (req.path === "/shutdown") void closeQuiet(oldServer)
+        return
+      }
+      replyJson(socket, 200, { ok: true, pid: 3, codeRoot: "/code/here", codeCommit: "unknown" })
+    })
+    let replacement: Server | undefined
+    const result = await ensureCurrentDaemon(home2, () => {
+      void fakeHttpDaemon(socketPathFor(home2), (req, socket) =>
+        replyJson(socket, 200, { ok: true, pid: 4, codeRoot: "/code/here", codeCommit: "abc1234" }),
+      ).then((s) => { replacement = s })
+    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234" } })
+    try {
+      expect(result.up).toBe(true)
+      expect(result.replaced).toMatchObject({ codeCommit: "unknown", pid: 3 })
+    } finally {
+      await closeQuiet(replacement)
+      await closeQuiet(oldServer)
+    }
+  })
+
+  it("a daemon that ignores /shutdown earns a refusal naming the pid, both roots and how to stop it", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    // answers /shutdown politely but never actually stops — the wait must give up, not hang
+    const server = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+      if (req.method === "POST") {
+        replyJson(socket, 200, { ok: true })
+        return
+      }
+      replyJson(socket, 200, { ok: true, pid: 4242, codeRoot: "/old/root", codeCommit: "cafe1234567" })
+    })
+    try {
+      let spawned = 0
+      const started = Date.now()
+      const result = await ensureCurrentDaemon(home, () => { spawned += 1 }, {
+        waitMs: 5_000,
+        shutdownWaitMs: 200,
+        self: { codeRoot: "/new/root", codeCommit: "beef7654321" },
+      })
+      expect(result.up).toBe(false)
+      expect(Date.now() - started).toBeLessThan(3_000)
+      expect(result.refusal).toContain("the Mida service (pid 4242) runs code from /old/root @ cafe123")
+      expect(result.refusal).toContain("this command runs /new/root @ beef765")
+      expect(result.refusal).toContain("did not stop")
+      expect(result.refusal).toContain("kill 4242")
+      // nothing was spawned — the old service never made room
+      expect(spawned).toBe(0)
+    } finally {
+      await closeQuiet(server)
+    }
   })
 })

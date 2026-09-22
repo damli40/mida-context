@@ -4,6 +4,8 @@ import { tmpdir } from "node:os"
 import { dirname, isAbsolute } from "node:path"
 import type { IncomingMessage, Server, ServerResponse } from "node:http"
 import { SOCKET_FILE, callDaemon, ensureFallbackSocketDir, fallbackSocketDir, socketPathFor } from "./control.js"
+import { codeIdentity } from "./code-identity.js"
+import type { CodeIdentity } from "./code-identity.js"
 import { drainUntilSettled } from "./drain.js"
 import type { DrainDeps, DrainResult } from "./drain.js"
 import { buildHandoff } from "./handoff.js"
@@ -56,6 +58,8 @@ export interface DaemonDeps {
   handoffDeps?: Partial<HandoffDeps>
   /** Gate and read overrides for /whatsnew — same role as handoffDeps for the prompt hook. */
   whatsnewDeps?: Partial<WhatsNewDeps>
+  /** The code identity /health reports; default codeIdentity() — tests inject a foreign one. */
+  identity?: CodeIdentity
   /** The fallback socket folder's parent (default tmpdir()); tests inject a private temp dir. */
   socketBase?: string
 }
@@ -123,6 +127,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   const passWaitCapMs = deps.passWaitCapMs ?? PASS_WAIT_CAP_MS
   const drain = deps.drain ?? drainUntilSettled
   const runCli = deps.runCli ?? runCliWithRuntime
+  const identity = deps.identity ?? codeIdentity()
 
   // a socket outside the home lands in the per-user fallback folder — the daemon itself makes it
   // private; an existing folder that is not a real 0700 directory owned by this user refuses the
@@ -232,7 +237,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (req.method === "GET" && req.url === "/health") {
-      respond(res, 200, { ok: true, pid: process.pid, startedAt, queueDepth: listJobs(home).length })
+      respond(res, 200, { ok: true, pid: process.pid, startedAt, queueDepth: listJobs(home).length, codeRoot: identity.codeRoot, codeCommit: identity.codeCommit })
       return
     }
     if (req.method !== "POST") {
@@ -255,6 +260,14 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
     if (req.url === "/kick") {
       schedule()
       respond(res, 200, { ok: true })
+      return
+    }
+    if (req.url === "/shutdown") {
+      respond(res, 200, { ok: true })
+      // exactly what SIGTERM gets from daemon-main: close() lets the pass in flight finish
+      // first, then releases the socket, the lock and the runtime — queued jobs are on disk,
+      // so nothing is lost. The catch keeps a failed close from becoming an unhandled rejection.
+      void close().catch(() => {})
       return
     }
     if (req.url === "/cli") {

@@ -13,6 +13,7 @@ import { ContextApiClient, DenyOverlay, RegistryReader } from "@mida/api"
 import type { RevocationTarget } from "@mida/api"
 import type { LocalAccount } from "viem"
 import { callDaemon } from "./control.js"
+import { codeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, claudeHooksStatus, codexHooksStatus, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, parseMidaCommand } from "./install.js"
@@ -326,10 +327,24 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         if (reply.status === 0) return [problem("midad is not answering", "start the daemon")]
         // any answer at all used to read as healthy — only 200 with { ok: true } is midad;
         // anything else is a problem that names the status it actually got
-        const body = reply.body as { ok?: unknown } | null
-        return reply.status === 200 && body !== null && typeof body === "object" && body.ok === true
-          ? ["ok: midad answers"]
-          : [problem(`midad answered with status ${reply.status}, not ok:true`, "restart midad")]
+        const body = reply.body as { ok?: unknown; codeRoot?: unknown; codeCommit?: unknown } | null
+        if (!(reply.status === 200 && body !== null && typeof body === "object" && body.ok === true)) {
+          return [problem(`midad answered with status ${reply.status}, not ok:true`, "restart midad")]
+        }
+        // an answering midad must also be running THIS code — a service from another checkout
+        // quietly serves agent commands with the wrong build
+        const lines = ["ok: midad answers"]
+        const self = codeIdentity()
+        const codeRoot = typeof body.codeRoot === "string" ? body.codeRoot : undefined
+        const codeCommit = typeof body.codeCommit === "string" ? body.codeCommit : undefined
+        if (codeRoot === undefined || codeCommit === undefined) {
+          lines.push(problem("midad predates code reporting", "run any mida command to replace it"))
+        } else if (codeRoot === self.codeRoot && codeCommit === self.codeCommit) {
+          lines.push(`ok: midad runs ${codeRoot} @ ${codeCommit.slice(0, 7)}; this command runs the same`)
+        } else {
+          lines.push(problem(`midad runs ${codeRoot} @ ${codeCommit.slice(0, 7)}; this command runs ${self.codeRoot} @ ${self.codeCommit.slice(0, 7)}`, "run any mida command to replace it"))
+        }
+        return lines
       },
     },
     {

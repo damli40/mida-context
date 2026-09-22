@@ -4,6 +4,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
+import { codeIdentity } from "./code-identity.js"
+import type { CodeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
 
 export const SOCKET_FILE = "midad.sock"
@@ -154,5 +156,71 @@ export async function ensureDaemon(home: MidaHome, spawn: () => void, options: {
     }
     if (Date.now() >= deadline) return false
     await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
+  }
+}
+
+/** What ensureCurrentDaemon settled: the service is up (or not), who it replaced, or why it refused. */
+export interface EnsureResult {
+  up: boolean
+  /** The service that was shut down to make room for this command's code. */
+  replaced?: {
+    codeRoot: string
+    codeCommit: string
+    pid: number
+  }
+  refusal?: string
+}
+
+/** How long the old service is given to leave after POST /shutdown before the refusal names it. */
+const SHUTDOWN_WAIT_MS = 10_000
+
+/**
+ * ensureDaemon plus the Sep-22 check: an answering service must be running THIS code, not just any
+ * code. The decision table:
+ *
+ * - /health down → exactly what ensureDaemon does (spawn once, poll until waitMs).
+ * - /health up with no codeRoot (a service from before code reporting), a different codeRoot, or a
+ *   different codeCommit → POST /shutdown, then poll /health every 100 ms until it stops answering,
+ *   at most shutdownWaitMs (default 10 s); then spawn and wait as ensureDaemon does.
+ * - "unknown" counts as equal only when BOTH sides are "unknown" — a service that cannot name its
+ *   commit next to a command that can is a difference, and the service is replaced.
+ * - a service that still answers after the shutdown wait earns a refusal naming its pid, both
+ *   identities and the kill that ends it — the command never races two services on one socket.
+ */
+export async function ensureCurrentDaemon(
+  home: MidaHome,
+  spawn: () => void,
+  options: { waitMs: number; shutdownWaitMs?: number; self?: CodeIdentity },
+): Promise<EnsureResult> {
+  const self = options.self ?? codeIdentity()
+  const probe = await callDaemon(home, "/health", undefined, { timeoutMs: Math.min(500, Math.max(1, options.waitMs)) })
+  if (probe.status === 0) {
+    return { up: await ensureDaemon(home, spawn, { waitMs: options.waitMs }) }
+  }
+  const body = probe.body as { codeRoot?: unknown; codeCommit?: unknown; pid?: unknown } | null
+  const codeRoot = typeof body?.codeRoot === "string" ? body.codeRoot : undefined
+  const codeCommit = typeof body?.codeCommit === "string" ? body.codeCommit : undefined
+  const pid = typeof body?.pid === "number" ? body.pid : -1
+  const pidText = typeof body?.pid === "number" ? String(body.pid) : "?"
+  if (codeRoot === self.codeRoot && codeCommit === self.codeCommit) return { up: true }
+
+  const replaced = { codeRoot: codeRoot ?? "unknown", codeCommit: codeCommit ?? "unknown", pid }
+  await callDaemon(home, "/shutdown", {}, { timeoutMs: 2_000 })
+  const shutdownWaitMs = options.shutdownWaitMs ?? SHUTDOWN_WAIT_MS
+  const deadline = Date.now() + shutdownWaitMs
+  for (;;) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) break
+    const reply = await callDaemon(home, "/health", undefined, { timeoutMs: Math.min(500, remaining) })
+    if (reply.status === 0) {
+      const up = await ensureDaemon(home, spawn, { waitMs: options.waitMs })
+      return { up, replaced }
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, remaining))))
+  }
+  const secs = shutdownWaitMs % 1000 === 0 ? String(shutdownWaitMs / 1000) : (shutdownWaitMs / 1000).toFixed(1)
+  return {
+    up: false,
+    refusal: `the Mida service (pid ${pidText}) runs code from ${replaced.codeRoot} @ ${replaced.codeCommit.slice(0, 7)}; this command runs ${self.codeRoot} @ ${self.codeCommit.slice(0, 7)}. It did not stop within ${secs} s — stop it with: kill ${pidText}`,
   }
 }
