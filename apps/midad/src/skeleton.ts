@@ -340,7 +340,12 @@ export async function approve(
   // them: the grant path's own wrap publish gets CAPABILITY_DENIED, and the already-approved answer
   // would tell the owner nothing is wrong while the store still refuses the agent.
   const cleared = await clearStaleStoreDenies(runtime, identity.agentId)
-  if (cleared > 0) await repairReaderWraps(runtime, undefined, identity.agentId)
+  if (cleared > 0) {
+    const repair = await repairReaderWraps(runtime, undefined, identity.agentId)
+    for (const failure of repair.failed) {
+      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${failure.reason}`)
+    }
+  }
   let pending = home.readJson<{ request: AccessRequest }>(`agents/${name}/pending-request.json`)
 
   if (pending === undefined) {
@@ -400,7 +405,12 @@ export async function approve(
   runtime.progress?.("proving the grant on the chain…")
   const grant = await agent.completeAccessRequest(pending.request, approval.response)
   saveGrants(home, name, [...agent.grants])
-  if (rotated.length > 0) await repairReaderWraps(runtime, rotated)
+  if (rotated.length > 0) {
+    const repair = await repairReaderWraps(runtime, rotated)
+    for (const failure of repair.failed) {
+      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${failure.reason}`)
+    }
+  }
   // A marker left by an earlier revoke must not outlive a fresh approval.
   home.remove(`agents/${name}/revoked.json`)
   home.remove(`agents/${name}/pending-request.json`)
@@ -526,12 +536,18 @@ export async function readCheckpoints(runtime: ServiceRuntime, name: string, pro
  * rotates the read epoch — skipped entirely when the chain shows nothing left to revoke, so a re-run after a
  * crash sends nothing; (2) the local revoked marker; (3) reader wraps republished to every surviving agent.
  * Stage 1 needs no grants.json: the vault's "agent" branch reads the live capability list from Monad itself.
+ * The returned `failed` list is M3-D4: a wrap the store refuses for one agent never aborts the others and
+ * never turns a landed chain revocation into a "refused" answer — the CLI prints the chain result first.
  */
-export async function revoke(runtime: Runtime, name: string): Promise<{ transactionHashes: Hex[]; rewrapped: string[] }> {
+export async function revoke(
+  runtime: Runtime,
+  name: string,
+): Promise<{ transactionHashes: Hex[]; sponsored: boolean; rewrapped: string[]; failed: { name: string; reason: string }[] }> {
   const { home, vault, reader, owner } = runtime
   runtime.progress?.(`asking the chain what ${name} already holds…`)
   const agentId = await resolveAgentId(runtime, name)
   const transactionHashes: Hex[] = []
+  let sponsored = false
   // The raw list can hold expired or already-revoked ids; the transaction goes out only when at least
   // one id is still valid, so a re-run — or a list that only looks live — sends nothing.
   const listed = await reader.activeCapabilityIds(owner, agentId)
@@ -541,7 +557,9 @@ export async function revoke(runtime: Runtime, name: string): Promise<{ transact
   }
   if (anyLive) {
     runtime.sendProgress("sending the revocation")
-    transactionHashes.push((await vault.approveRevocation({ kind: "agent", agentId })).transactionHash)
+    const approval = await vault.approveRevocation({ kind: "agent", agentId })
+    transactionHashes.push(approval.transactionHash)
+    sponsored = approval.sponsored
   }
   // The marker records "this agent was revoked", so it is written whenever the agent was identified and
   // the chain now shows nothing valid for it — whether this run sent the transaction or a crashed
@@ -551,8 +569,8 @@ export async function revoke(runtime: Runtime, name: string): Promise<{ transact
   if (!neverApproved) markRevoked(home, name)
   // the project-folder approvals go too — the file is re-signed without this agent's rows
   await removeAgentApprovals(runtime, name)
-  const rewrapped = await repairReaderWraps(runtime)
-  return { transactionHashes, rewrapped }
+  const repair = await repairReaderWraps(runtime)
+  return { transactionHashes, sponsored, rewrapped: repair.rewrapped, failed: repair.failed }
 }
 
 /**
@@ -633,11 +651,17 @@ async function clearStaleStoreDenies(runtime: Runtime, agentId: Hex): Promise<nu
   return cleared
 }
 
+/** The one-line reason a wrap send failed — a MidaError's own message minus its code prefix. */
+function wrapFailureReason(error: unknown): string {
+  const text = error instanceof MidaError && error.message.startsWith(`${error.code}: `) ? error.message.slice(error.code.length + 2) : error instanceof Error ? error.message : String(error)
+  return text.split("\n")[0]!
+}
+
 export async function repairReaderWraps(
   runtime: Runtime,
   namespaceIds: readonly Hex[] = [NAMESPACE_ID, ...FACT_NAMESPACES.map((ns) => namespaceId(ns))],
   onlyAgentId?: Hex,
-): Promise<string[]> {
+): Promise<{ rewrapped: string[]; failed: { name: string; reason: string }[] }> {
   const { home, vault, reader, owner } = runtime
   // Who gets a wrap is decided first, so the owner hears how many agents the new key goes to
   // before the sends start — the authority checks run either way.
@@ -658,11 +682,18 @@ export async function repairReaderWraps(
     runtime.progress?.(`sending the new key to ${targets.length} agent${targets.length === 1 ? "" : "s"}…`)
   }
   const rewrapped: string[] = []
+  const failed: { name: string; reason: string }[] = []
   for (const target of targets) {
-    for (const nsId of target.nsIds) {
-      await vault.publishReaderWraps({ agentId: target.agentId, namespaceId: nsId })
+    try {
+      for (const nsId of target.nsIds) {
+        await vault.publishReaderWraps({ agentId: target.agentId, namespaceId: nsId })
+      }
+      rewrapped.push(target.name)
+    } catch (error) {
+      // M3-D4: one refused wrap must not abort the pass — the rest still publish, and the caller
+      // names each failure with the reason and the fix instead of one error hiding them all.
+      failed.push({ name: target.name, reason: wrapFailureReason(error) })
     }
-    rewrapped.push(target.name)
   }
-  return rewrapped
+  return { rewrapped, failed }
 }

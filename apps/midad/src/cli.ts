@@ -282,7 +282,18 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       }
     } else {
       const result = await revoke(runtime, agent)
-      deps.print(`revoked ${agent} tx ${result.transactionHashes.join(" ")}; new key sent to: ${result.rewrapped.join(", ") || "nobody"}`)
+      // The chain answer first, always — the per-agent key lines follow it (M3-D4). A wrap the
+      // store refused is its own line with the reason and the fix, never a "refused" for a revoke
+      // that already landed.
+      deps.print(
+        result.transactionHashes.length === 0
+          ? "nothing to revoke"
+          : `revoked ${agent} on chain${result.sponsored ? " (sponsored)" : ""} — tx ${result.transactionHashes.join(" ")}`,
+      )
+      for (const name of result.rewrapped) deps.print(`new read key sent to ${name}`)
+      for (const failure of result.failed) {
+        deps.print(`could not send the new key to ${failure.name}: ${failure.reason} — run \`mida approve ${failure.name}\``)
+      }
     }
     return 0
   } catch (error) {

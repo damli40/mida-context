@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, runCli } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, loadAgentIdentity, runCli } from "@mida/midad"
 import type { Network } from "@mida/midad"
 
 describe("the crude mida command", () => {
@@ -225,6 +225,53 @@ describe("the crude mida command", () => {
     const foreign = `0x${"f1".repeat(32)}`
     expect(namespaceLabel(foreign)).toBe("0xf1f1f1f1…")
   })
+
+  it("a refused wrap for one agent never hides the landed revoke — chain line first, then per-agent key lines (M3-D4)", async () => {
+    // The Sep-22 incident: a revoke that failed after staging its deny left codex store-blocked,
+    // and the NEXT revoke's repair pass aborted on codex's refused wrap — assistant never got the
+    // new key and the printed line read "refused" for a revoke that had succeeded on chain.
+    const runtime = await Runtime.open(home, network)
+    try {
+      const codexId = loadAgentIdentity(home, "codex")!.agentId
+      await runtime.ownerApi.requestRevocationDeny({ owner: runtime.owner, agentId: codexId })
+    } finally {
+      await runtime.close()
+    }
+
+    const out: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home,
+        network,
+        print: (line) => out.push(line),
+        progress: (line) => out.push(line),
+        prompt: async () => "yes",
+        stdinIsTTY: true,
+        stdoutIsTTY: true,
+      })
+    // the chain revoke succeeds — the exit code says so even though one wrap is refused
+    expect(await run2("revoke", "claude-code")).toBe(0)
+    // the chain answer leads: before any per-agent key line, and it is not "refused"
+    const chainLine = out.findIndex((line) => line.startsWith("revoked claude-code on chain"))
+    expect(chainLine).toBeGreaterThanOrEqual(0)
+    expect(out[chainLine]).toMatch(/— tx 0x[0-9a-f]{64}/)
+    // assistant got the new key; codex's refused wrap names its fix — and nothing calls the whole
+    // revoke refused
+    expect(out).toContain("new read key sent to assistant")
+    const failedLine = out.find((line) => line.startsWith("could not send the new key to codex:"))
+    expect(failedLine).toBeDefined()
+    expect(failedLine).toContain("run `mida approve codex`")
+    expect(out.every((line) => !line.startsWith("refused:"))).toBe(true)
+    for (const keyLine of ["new read key sent to assistant", failedLine!]) {
+      expect(out.indexOf(keyLine)).toBeGreaterThan(chainLine)
+    }
+
+    // cleanup, by the command the line itself names: approve clears the stale deny
+    expect(await run2("approve", "codex")).toBe(1) // already-approved answer — the deny is gone first
+    expect(out.some((line) => line === "cleared a stale block at the store left by a failed revoke")).toBe(true)
+    // and claude-code's revoke really did land — reads stay refused
+    expect(await run2("read", "claude-code", "proj-1")).toBe(1)
+  }, 300_000)
 
   it("never prints a secret: no output line contains any key stored in the home folder", () => {
     const secrets: string[] = []
