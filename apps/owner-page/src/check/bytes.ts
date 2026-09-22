@@ -29,6 +29,26 @@ export function base64UrlEncode(bytes: Uint8Array): string {
   return out
 }
 
+export function base64UrlDecode(text: string): Uint8Array {
+  const clean = text.replace(/=+$/, "")
+  if (clean.length % 4 === 1) throw new Error("not base64url")
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4))
+  let acc = 0
+  let bits = 0
+  let n = 0
+  for (const ch of clean) {
+    const v = B64URL.indexOf(ch)
+    if (v < 0) throw new Error("not base64url")
+    acc = (acc << 6) | v
+    bits += 6
+    if (bits >= 8) {
+      bits -= 8
+      out[n++] = (acc >> bits) & 0xff
+    }
+  }
+  return out.subarray(0, n)
+}
+
 export function concatBytes(...parts: Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0))
   let off = 0

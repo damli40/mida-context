@@ -11,7 +11,7 @@ import { parseDerSignature } from "../check/der.js"
 import { parseAuthenticatorData } from "../check/authdata.js"
 import { verifyAssertionInBrowser } from "../check/assertion.js"
 import type { BrowserVerification } from "../check/assertion.js"
-import { toBytes } from "../check/bytes.js"
+import { base64UrlDecode, toBytes } from "../check/bytes.js"
 import { OWNER_PRF_SALT } from "./secrets.js"
 
 /**
@@ -173,15 +173,6 @@ export function capturedToAuthStruct(captured: CapturedAssertion): WebAuthnAuthS
     r: signature.r,
     s: signature.s,
   })
-}
-
-export function base64UrlDecode(value: string): Uint8Array {
-  const clean = value.replace(/-/g, "+").replace(/_/g, "/")
-  const padded = clean + "=".repeat((4 - (clean.length % 4)) % 4)
-  const binary = atob(padded)
-  const out = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i)
-  return out
 }
 
 /** The 32-byte challenge an assertion actually signed, read out of its own clientDataJSON. */

@@ -58,7 +58,7 @@ export function credentialForReport(saved: SavedTestCredential | null, created: 
   }
 }
 
-const SECRET_KEY = /^(prf|secret|private)/i
+const SECRET_KEY = /^(prf|seed|secret|private|key)/i
 
 function isThirtyTwoBytes(value: unknown): boolean {
   if (value instanceof Uint8Array) return value.length === 32
