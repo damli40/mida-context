@@ -109,6 +109,12 @@ export interface MigrateDeps {
   target?: Deployment
   /** tests only: throw a `migrate-stopped` error right after persisting this step — a simulated crash */
   stopAfter?: MigrateStep
+  /**
+   * tests only: throw a `migrate-stopped` error right after the Nth send of this kind — the crash
+   * window between a transaction landing and its local bookkeeping that `stopAfter` cannot reach
+   * (it fires only at step boundaries). Production callers never set it.
+   */
+  throwAfterSend?: { kind: "agent" | "record"; nth: number }
   /** starts the local service once the switch (or an undo restore) has landed — the CLI injects the real spawn */
   startService?: () => unknown | Promise<unknown>
 }
@@ -128,8 +134,8 @@ function codedError(code: string, message: string): Error & { code: string } {
   return Object.assign(new Error(`${code}: ${message}`), { code })
 }
 
-function stoppedError(step: MigrateStep): Error & { code: string } {
-  return codedError("migrate-stopped", `simulated crash after step "${step}"`)
+function stoppedError(where: string): Error & { code: string } {
+  return codedError("migrate-stopped", `simulated crash after "${where}"`)
 }
 
 const lower = (hex: string): Hex => hex.toLowerCase() as Hex
@@ -522,6 +528,15 @@ export async function migrate(
   const crashPoint = (step: MigrateStep): void => {
     if (deps.stopAfter === step) throw stoppedError(step)
   }
+  // The test-only send crash: counts actual sends this run and throws immediately after the
+  // configured one — before the verify read and before any status bookkeeping is persisted.
+  const sends = { agent: 0, record: 0 }
+  const sendCrash = (kind: "agent" | "record"): void => {
+    sends[kind] += 1
+    if (deps.throwAfterSend?.kind === kind && sends[kind] === deps.throwAfterSend.nth) {
+      throw stoppedError(`${kind}-send`)
+    }
+  }
   const finishStep = (step: MigrateStep): void => {
     state!.step = step
     saveState()
@@ -767,6 +782,7 @@ export async function migrate(
           if (sent.agentId.toLowerCase() !== map.newAgentId!.toLowerCase()) {
             throw new Error(`agent ${name}: the target registered ${sent.agentId}, not the prepared ${map.newAgentId}`)
           }
+          sendCrash("agent")
         }
         // VERIFY — the chain says who landed; a mismatch is a loud stop, not a skip.
         const record = await runtime.reader.getAgent(map.newAgentId!)
@@ -1013,6 +1029,7 @@ export async function migrate(
       } else {
         await runtime.agent(entry.authorName!).sendSealed(runtime.owner, sealed)
       }
+      sendCrash("record")
       // VERIFY — the record the chain holds is the one the nonce predicted.
       const anchored = await runtime.reader.getRecord(entry.targetId!)
       if (anchored === null || anchored.manifestHash !== sealed.manifestHash) {

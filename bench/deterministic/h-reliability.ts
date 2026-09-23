@@ -15,12 +15,17 @@
 
 import { existsSync, mkdirSync, readFileSync } from "node:fs"
 import { join } from "node:path"
+import { privateKeyToAccount } from "viem/accounts"
+import type { AbiEvent } from "viem"
+import { capabilityRegistryAbi, contextRegistryAbi, deployLocal, getLogsChunked } from "@mida/chain"
 import { compileCheckpoint } from "../../packages/compiler/src/index.js"
 import {
   MAX_VALUE_BYTES, Runtime, approve, approveProject, drainOnce,
-  enqueue, init, readCheckpoints, requestAccess, revoke, saveCheckpoint, wrapCheckpoint,
+  enqueue, init, loadOrCreateOperatorSecrets, loadOwnerAddress, migrate, migrateUndo,
+  readCheckpoints, requestAccess, revoke, saveCheckpoint, wrapCheckpoint,
 } from "../../apps/midad/src/index.js"
-import type { DrainDeps } from "../../apps/midad/src/index.js"
+import type { DrainDeps, Manifest, MidaHome, MigrateDeps } from "../../apps/midad/src/index.js"
+import { seedMigrateUniverse } from "../../apps/midad/test/helpers-migrate.js"
 import {
   STUB_MODEL, assistantText, benchChain, benchDir, benchHome, mark,
   sampleCheckpoint, stubCompile, userLine, writeTranscript,
@@ -85,9 +90,109 @@ async function h1() {
     retry.transactionHash === null &&
     retry.contextId === first.contextId
 
+  // H1 extension (spec §10): `mida migrate` killed between PREPARE and COMMIT, and between
+  // COMMIT and VERIFY — for an agent registration, a fact and a checkpoint. The re-run must
+  // converge with zero orphan agents and zero duplicate records, both counted from the TARGET
+  // contract's logs, and --undo must restore a working old setup. Each case gets its own home
+  // (its own owner, operator and seed) on the one shared target deployment — the migrate leg
+  // switches a home's network.json, so it can never share the group home.
+  const migrateTarget = await deployLocal({ rpcUrl: chain.network.rpcUrl })
+  const MIGRATED_AT = "2026-09-23T12:00:00.000Z"
+  const AGENT_REGISTERED = capabilityRegistryAbi.find((e) => e.type === "event" && e.name === "AgentRegistered") as AbiEvent
+  const CONTEXT_REGISTERED = contextRegistryAbi.find((e) => e.type === "event" && e.name === "ContextRegistered") as AbiEvent
+
+  const runMigrate = (mhome: MidaHome, over: Partial<MigrateDeps> = {}) =>
+    migrate({
+      home: mhome,
+      env: {},
+      confirm: async () => true,
+      print: () => {},
+      now: () => new Date(MIGRATED_AT),
+      target: migrateTarget,
+      startService: () => {},
+      ...over,
+    }).then(
+      (result) => result,
+      (error: unknown) => {
+        if ((error as { code?: unknown })?.code === "migrate-stopped") return { stopped: true as const }
+        throw error
+      },
+    )
+
+  const migrateCase = async (name: string, crashes: Partial<MigrateDeps>[], undo: boolean): Promise<boolean> => {
+    const mhome = benchHome(`h1mig-${name}`)
+    const mrt = await Runtime.open(mhome, chain.network)
+    try {
+      await seedMigrateUniverse(mrt)
+    } finally {
+      await mrt.close()
+    }
+    const owner = loadOwnerAddress(mhome)!
+    const operator = privateKeyToAccount(loadOrCreateOperatorSecrets(mhome).privateKey).address
+    for (const crash of crashes) {
+      const crashed = await runMigrate(mhome, crash)
+      if (!("stopped" in crashed)) return false // the injected crash must actually stop the run
+    }
+    let moved: { outcome: string; lines: string[] } | undefined
+    for (let attempt = 0; attempt < 60 && moved === undefined; attempt += 1) {
+      const result = await runMigrate(mhome)
+      if ("outcome" in result) moved = result
+    }
+    if (moved?.outcome !== "moved") return false
+    const manifest = mhome.readJson<{ manifest: Manifest }>("migrate/state.json")!.manifest
+    const head = await runtime.ownerChain.publicClient.getBlockNumber()
+    const registrations = await getLogsChunked(runtime.ownerChain.publicClient, {
+      address: migrateTarget.capabilityRegistry,
+      event: AGENT_REGISTERED,
+      args: { operator },
+      fromBlock: migrateTarget.deploymentBlock,
+      toBlock: head,
+    })
+    const contexts = await getLogsChunked(runtime.ownerChain.publicClient, {
+      address: migrateTarget.contextRegistry,
+      event: CONTEXT_REGISTERED,
+      args: { owner },
+      fromBlock: migrateTarget.deploymentBlock,
+      toBlock: head,
+    })
+    const expectedAgents = new Set(Object.values(manifest.agentMap).map((map) => map.newAgentId!.toLowerCase()))
+    const expectedIds = new Set(manifest.entries.map((entry) => entry.targetId!.toLowerCase()))
+    const gotIds = new Set(contexts.map((log) => (log.args as { contextId: `0x${string}` }).contextId.toLowerCase()))
+    const converged =
+      registrations.length === expectedAgents.size &&
+      registrations.every((log) => expectedAgents.has((log.args as { agentId: `0x${string}` }).agentId.toLowerCase())) &&
+      contexts.length === expectedIds.size &&
+      gotIds.size === expectedIds.size &&
+      [...gotIds].every((id) => expectedIds.has(id))
+    if (!converged) return false
+    if (!undo) return true
+    const undone = await migrateUndo({
+      home: mhome, env: {}, print: () => {}, now: () => new Date(MIGRATED_AT), startService: () => {},
+    })
+    const net = mhome.readJson<{ deployment: { contextRegistry: string } }>("network.json")!
+    return (
+      undone.outcome === "restored" &&
+      net.deployment.contextRegistry.toLowerCase() === chain.network.deployment.contextRegistry.toLowerCase()
+    )
+  }
+
+  const migrateCrashes: { name: string; crashes: Partial<MigrateDeps>[]; undo?: boolean }[] = [
+    { name: "agent-prepare-commit", crashes: [{ stopAfter: "agents" }] },
+    { name: "agent-commit-verify", crashes: [{ throwAfterSend: { kind: "agent", nth: 1 } }] },
+    { name: "checkpoint-prepare-commit", crashes: [{ stopAfter: "records" }], undo: true },
+    { name: "checkpoint-commit-verify", crashes: [{ throwAfterSend: { kind: "record", nth: 1 } }] },
+    { name: "fact-prepare-commit", crashes: [{ stopAfter: "records" }, { stopAfter: "records" }] },
+    { name: "fact-commit-verify", crashes: [{ throwAfterSend: { kind: "record", nth: 2 } }] },
+  ]
+  const migrateCrash: { name: string; ok: boolean }[] = []
+  for (const c of migrateCrashes) {
+    migrateCrash.push({ name: c.name, ok: await migrateCase(c.name, c.crashes, c.undo === true) })
+  }
+  const migrateConverged = migrateCrash.every((c) => c.ok)
+
   return {
-    pass: initConverged && approveConverged && revokeConverged && saveConverged,
-    value: { initConverged, approveConverged, revokeConverged, saveConverged, doubleApprove },
+    pass: initConverged && approveConverged && revokeConverged && saveConverged && migrateConverged,
+    value: { initConverged, approveConverged, revokeConverged, saveConverged, doubleApprove, migrateCrash },
     limit: null,
   }
 }
