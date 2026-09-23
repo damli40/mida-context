@@ -6,7 +6,7 @@ import type { ContextPayload, Hex } from "@mida/protocol"
 import type { Deployment } from "@mida/chain"
 import { zeroHash } from "viem"
 import type { MigrationEnvelope } from "./migration-envelope.js"
-import { attachEnvelope } from "./migration-envelope.js"
+import { attachEnvelope, validateMigrationEnvelope } from "./migration-envelope.js"
 import { MAX_VALUE_BYTES, unwrapCheckpoint } from "./checkpoint-payload.js"
 import type { SourceRecord } from "./owner-read.js"
 
@@ -26,9 +26,26 @@ export type EntryStatus =
   | "skipped:dangling-relation"
   | "skipped:store-unreadable"
 
+/** A record's TRUE origin — what its destination envelope must name. See `ManifestEntry.origin`. */
+export interface ManifestOrigin {
+  chainId: string
+  contract: `0x${string}`
+  recordId: Hex
+  commitment: Hex
+  author: Hex
+  createdAt: string
+}
+
 export interface ManifestEntry {
   sourceId: Hex
   sourceCommitment: Hex
+  /**
+   * The record's TRUE origin (Task 4b): a valid migration envelope already on the record is
+   * copied verbatim, so a record moved A → B → C still names A; otherwise the immediate source.
+   * `sourceId`/`sourceCommitment`/`createdAt` stay the immediate source's — replay order and
+   * per-record verification key on them; `origin` is what the destination envelope names.
+   */
+  origin: ManifestOrigin
   namespace: string
   authorId: Hex
   /** The local name behind the on-chain author — "owner" for owner-authored, null when unknown. */
@@ -139,23 +156,23 @@ function withPlaceholderReferences(payload: ContextPayload): ContextPayload {
  * measured on its envelope (`payload.value`) against MAX_VALUE_BYTES — the limit
  * `wrapCheckpoint` enforces; every other record on the whole canonical payload against
  * MAX_PAYLOAD_BYTES — the limit `encodePayload` enforces. The migration envelope is attached
- * for real and every reference is rewritten to a 32-byte placeholder, so the byte count is the
- * byte count the destination contract will store.
+ * for real — built from the entry's `origin`, so a re-migrated record still names its first
+ * contract — and every reference is rewritten to a 32-byte placeholder, so the byte count is
+ * the byte count the destination contract will store.
  */
 function measureDestination(
   record: SourceRecord,
-  createdAt: string,
-  source: Deployment,
+  origin: ManifestOrigin,
   migratedAt: string,
 ): { destinationBytes: number; limit: number; envelopeUnplaceable?: true } {
   const envelope: MigrationEnvelope = {
     version: 1,
-    originalChainId: source.chainId.toString(10),
-    originalContract: source.contextRegistry,
-    originalRecordId: lower(record.contextId),
-    originalCommitment: lower(record.manifestHash),
-    originalAuthor: lower(record.authorId),
-    originalCreatedAt: createdAt,
+    originalChainId: origin.chainId,
+    originalContract: origin.contract,
+    originalRecordId: origin.recordId,
+    originalCommitment: origin.commitment,
+    originalAuthor: origin.author,
+    originalCreatedAt: origin.createdAt,
     migratedAt,
   }
   let destination: ContextPayload
@@ -171,6 +188,40 @@ function measureDestination(
     return { destinationBytes: canonicalBytes(destination.value).length, limit: MAX_VALUE_BYTES }
   }
   return { destinationBytes: canonicalBytes(destination).length, limit: MAX_PAYLOAD_BYTES }
+}
+
+/**
+ * The record's TRUE origin (Task 4b). A payload carrying a valid migration envelope was moved
+ * at least once already — its origin is that envelope's, copied verbatim, so moving it again
+ * still names the first contract and the first stating time. A payload with no envelope
+ * originates on the immediate source. A `migration` key that fails validation is never silently
+ * overwritten: `invalid-source-envelope`, naming the record.
+ */
+function originOf(record: SourceRecord, createdAt: string, source: Deployment): ManifestOrigin {
+  const value = record.payload.value
+  if (typeof value === "object" && value !== null && !Array.isArray(value) && "migration" in value) {
+    const checked = validateMigrationEnvelope((value as { migration?: unknown }).migration)
+    if (!checked.ok) {
+      throw manifestError("invalid-source-envelope", `${lower(record.contextId)}: ${checked.errors.join("; ")}`)
+    }
+    const existing = checked.value
+    return {
+      chainId: existing.originalChainId,
+      contract: existing.originalContract,
+      recordId: existing.originalRecordId,
+      commitment: existing.originalCommitment,
+      author: existing.originalAuthor,
+      createdAt: existing.originalCreatedAt,
+    }
+  }
+  return {
+    chainId: source.chainId.toString(10),
+    contract: source.contextRegistry,
+    recordId: lower(record.contextId),
+    commitment: lower(record.manifestHash),
+    author: lower(record.authorId),
+    createdAt,
+  }
 }
 
 /** The in-manifest records an entry must come after: its superseded parent and its references. */
@@ -204,10 +255,12 @@ export function buildManifest(
     const authorId = lower(record.authorId)
     const authorName = authorId === zeroHash ? "owner" : authorNames[authorId] ?? null
     const createdAt = createdAtOf(record)
-    const measured = measureDestination(record, createdAt, source, migratedAt)
+    const origin = originOf(record, createdAt, source)
+    const measured = measureDestination(record, origin, migratedAt)
     return {
       sourceId: lower(record.contextId),
       sourceCommitment: lower(record.manifestHash),
+      origin,
       namespace: record.namespace,
       authorId,
       authorName,

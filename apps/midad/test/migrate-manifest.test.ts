@@ -336,3 +336,88 @@ describe("skipped records", () => {
     expect(order).toEqual([ghost.contextId, dangling.contextId])
   })
 })
+
+describe("origin — the true source of a re-migrated record (B4b)", () => {
+  const ORIGIN_CONTRACT = "0x9999999999999999999999999999999999999999" as const
+
+  /** A record that already moved once: A → B (the immediate source) → C (the target). */
+  function twiceMoved(): SourceRecord {
+    const firstMove: MigrationEnvelope = {
+      version: 1,
+      originalChainId: "1", // a different length than 31337, so the destination size discriminates
+      originalContract: ORIGIN_CONTRACT,
+      originalRecordId: id(0xaaa),
+      originalCommitment: id(0xbbb),
+      originalAuthor: id(0xccc),
+      originalCreatedAt: "2026-09-18T10:00:00.000Z", // when the fact was stated on A
+      migratedAt: "2026-09-25T10:00:00.000Z", // the A → B hop
+    }
+    const payload: ContextPayload = {
+      v: 1,
+      kind: "FACT",
+      provenance: { source: "USER_ASSERTED" },
+      value: { text: "stated on the first contract", assertedAt: "2026-09-18T10:00:00.000Z" },
+    }
+    return record({
+      createdAt: BigInt(Date.parse("2026-09-25T10:00:00.000Z") / 1000), // its on-chain time on B
+      payload: attachEnvelope(payload, firstMove),
+    })
+  }
+
+  it("a record carrying a valid envelope keeps its true origin — entry.origin and the measured envelope name A", () => {
+    const rec = twiceMoved()
+    const manifest = buildManifest([rec], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)
+    const entry = manifest.entries[0]!
+    expect(entry.origin).toEqual({
+      chainId: "1",
+      contract: ORIGIN_CONTRACT,
+      recordId: id(0xaaa),
+      commitment: id(0xbbb),
+      author: id(0xccc),
+      createdAt: "2026-09-18T10:00:00.000Z",
+    })
+    // The immediate source stays in sourceId/createdAt — replay order and verification key on it.
+    expect(entry.sourceId).toBe(rec.contextId)
+    expect(entry.sourceCommitment).toBe(rec.manifestHash)
+    expect(entry.createdAt).toBe("2026-09-25T10:00:00.000Z")
+    // The measured destination envelope names A, not B: the byte count is built on origin.
+    const destination = attachEnvelope(rec.payload, {
+      version: 1,
+      originalChainId: "1",
+      originalContract: ORIGIN_CONTRACT,
+      originalRecordId: id(0xaaa),
+      originalCommitment: id(0xbbb),
+      originalAuthor: id(0xccc),
+      originalCreatedAt: "2026-09-18T10:00:00.000Z",
+      migratedAt: MIGRATED_AT,
+    })
+    expect(entry.destinationBytes).toBe(canonicalBytes(destination).length)
+    // The old behaviour — an envelope built from the immediate source — measures 4 bytes more
+    // ("31337" vs "1"), proving the size above really is the true-origin serialization.
+    const immediateSource = attachEnvelope(rec.payload, expectedEnvelope(rec, entry.createdAt))
+    expect(canonicalBytes(immediateSource).length).not.toBe(entry.destinationBytes)
+  })
+
+  it("a record with no envelope takes the immediate source as its origin", () => {
+    const rec = record()
+    const manifest = buildManifest([rec], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)
+    expect(manifest.entries[0]!.origin).toEqual({
+      chainId: SOURCE.chainId.toString(10),
+      contract: SOURCE.contextRegistry,
+      recordId: rec.contextId,
+      commitment: rec.manifestHash,
+      author: rec.authorId,
+      createdAt: new Date(Number(rec.createdAt) * 1000).toISOString(),
+    })
+  })
+
+  it("a present-but-invalid migration key refuses the manifest, naming the record — never silently overwritten", () => {
+    const rec = record()
+    rec.payload = {
+      ...rec.payload,
+      value: { ...(rec.payload.value as Record<string, unknown>), migration: { version: 2, originalContract: "nope" } },
+    }
+    expect(() => buildManifest([rec], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)).toThrowError(/invalid-source-envelope/)
+    expect(() => buildManifest([rec], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)).toThrowError(new RegExp(rec.contextId))
+  })
+})
