@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
+import { decodePayload, encodePayload } from "@mida/crypto"
 import type { ContextPayload } from "@mida/protocol"
 import {
   MidaHome,
@@ -15,6 +16,7 @@ import {
   readCheckpoints,
   readEnvelope,
   readOwnerFacts,
+  readOwnerUniverse,
   requestAccess,
   saveCheckpoint,
   unwrapCheckpoint,
@@ -111,16 +113,43 @@ describe("attachEnvelope / readEnvelope", () => {
     expect((payload.value as Record<string, unknown>).migration).toBeUndefined()
   })
 
-  it("a string payload value cannot carry an envelope — attachEnvelope throws envelope-unplaceable", () => {
-    const payload: ContextPayload = { v: 1, kind: "FACT", provenance: { source: "USER_ASSERTED" }, value: "just text" }
-    let thrown: unknown
-    try {
-      attachEnvelope(payload, MIGRATION)
-    } catch (error) {
-      thrown = error
+  it("a string payload value carries the envelope beside its content — payload.migration, the value never changed", () => {
+    const payload: ContextPayload = { v: 1, kind: "NONE", provenance: { source: "NONE" }, value: "just text" }
+    const attached = attachEnvelope(payload, MIGRATION)
+    expect(attached.value).toBe("just text")
+    expect(attached.migration).toEqual(MIGRATION)
+    expect(readEnvelope(attached)).toEqual(MIGRATION)
+    // the input is not mutated, and attaching again replaces the sibling — the re-migration path
+    expect(payload.migration).toBeUndefined()
+    const movedAgain = attachEnvelope(attached, { ...MIGRATION, migratedAt: "2026-10-01T00:00:00.000Z" })
+    expect(movedAgain.migration).toEqual({ ...MIGRATION, migratedAt: "2026-10-01T00:00:00.000Z" })
+    expect(movedAgain.value).toBe("just text")
+  })
+
+  it("decodePayload hands the sibling back whole — encode → decode keeps payload.migration", () => {
+    const attached = attachEnvelope(
+      { v: 1, kind: "NONE", provenance: { source: "NONE" }, value: "supporting document" },
+      MIGRATION,
+    )
+    const decoded = decodePayload(encodePayload(attached))
+    expect(decoded.migration).toEqual(MIGRATION)
+    expect(decoded.value).toBe("supporting document")
+  })
+
+  it("a payload carrying the envelope in BOTH places is invalid — readEnvelope throws invalid-migration-envelope", () => {
+    const both: ContextPayload = {
+      v: 1,
+      kind: "FACT",
+      provenance: { source: "USER_ASSERTED" },
+      value: { text: "answers in lowercase", assertedAt: "2026-09-18T10:00:00.000Z", migration: MIGRATION },
+      migration: MIGRATION,
     }
-    expect(thrown).toMatchObject({ code: "envelope-unplaceable" })
-    expect(readEnvelope(payload)).toBeUndefined()
+    expect(() => readEnvelope(both)).toThrowError(/invalid-migration-envelope/)
+  })
+
+  it("attachEnvelope refuses an object-valued payload already carrying the sibling — it would carry the envelope twice", () => {
+    const payload: ContextPayload = { ...factPayload(), migration: MIGRATION }
+    expect(() => attachEnvelope(payload, MIGRATION)).toThrowError(/invalid-migration-envelope/)
   })
 
   it("a checkpoint payload's value is the CheckpointEnvelope — the envelope lands beside checkpoint", () => {
@@ -255,6 +284,39 @@ describe("destination round trip on local Anvil", () => {
     const moved2 = facts2.filter((fact) => fact.text.includes("answers in lowercase"))
     expect(moved2.length).toBeGreaterThanOrEqual(2)
     for (const fact of moved2) expect(fact.text).toContain("(moved on 2026-09-25)")
+  })
+
+  it("a migrated string-valued owner record survives write → read → re-save → read, envelope identical", async () => {
+    const payload = attachEnvelope(
+      { v: 1, kind: "NONE", provenance: { source: "NONE" }, value: "supporting document" },
+      MIGRATION,
+    )
+    const first = await runtime.vault.createOwnerContext({
+      namespace: "preferences.communication",
+      recordType: "EVIDENCE",
+      payload,
+    })
+
+    // first read: the sealed payload carries the envelope BESIDE the string value
+    const universe1 = await readOwnerUniverse(runtime)
+    const stored1 = universe1.find((record) => record.contextId === first.contextId)
+    expect(stored1).toBeDefined()
+    expect(stored1!.payload.value).toBe("supporting document")
+    expect(stored1!.payload.migration).toEqual(MIGRATION)
+    expect(readEnvelope(stored1!.payload)).toEqual(MIGRATION)
+
+    // re-save the payload exactly as it was read — the sibling must ride through the read path
+    const resaved = await runtime.vault.createOwnerContext({
+      namespace: "preferences.communication",
+      recordType: "EVIDENCE",
+      payload: stored1!.payload,
+    })
+    const universe2 = await readOwnerUniverse(runtime)
+    const stored2 = universe2.find((record) => record.contextId === resaved.contextId)
+    expect(stored2).toBeDefined()
+    expect(stored2!.payload.value).toBe("supporting document")
+    expect(stored2!.payload.migration).toEqual(MIGRATION)
+    expect(JSON.stringify(stored2!.payload.migration)).toBe(JSON.stringify(stored1!.payload.migration))
   })
 
   it("an ordinary record written after the migrated ones reads back with no envelope at all", async () => {

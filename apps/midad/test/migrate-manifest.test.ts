@@ -214,6 +214,19 @@ describe("fingerprint", () => {
     const manifest = buildManifest([rec, enveloped], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)
     expect(manifest.entries[0]!.fingerprint).toBe(manifest.entries[1]!.fingerprint)
   })
+
+  it("excludes the envelope wherever it sits — a moved string record fingerprints the same", () => {
+    const rec = record({
+      recordType: 1,
+      payload: { v: 1, kind: "NONE", provenance: { source: "NONE" }, value: "supporting document" },
+    })
+    const enveloped = record({
+      recordType: 1,
+      payload: attachEnvelope(rec.payload, expectedEnvelope(rec, "2026-09-18T10:00:00.000Z")),
+    })
+    const manifest = buildManifest([rec, enveloped], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)
+    expect(manifest.entries[0]!.fingerprint).toBe(manifest.entries[1]!.fingerprint)
+  })
 })
 
 describe("replayOrder", () => {
@@ -279,17 +292,38 @@ describe("preflight — the exact size check", () => {
     expect(rows[0]!.bytes).toBeGreaterThan(MAX_PAYLOAD_BYTES)
   })
 
-  it("a string-valued record cannot carry an envelope → envelope-unplaceable row", () => {
+  it("a string-valued record carries the envelope beside its content — measured with it, no refusal", () => {
     const rec = record({
       recordType: 1,
       payload: { v: 1, kind: "NONE", provenance: { source: "NONE" }, value: "supporting document" },
     })
     const manifest = buildManifest([rec], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)
+    const entry = manifest.entries[0]!
+    // the destination serialization is the payload plus the top-level sibling — exact, never estimated
+    const destination = attachEnvelope(rec.payload, expectedEnvelope(rec, entry.createdAt))
+    expect(entry.destinationBytes).toBe(canonicalBytes(destination).length)
+    expect(entry.limit).toBe(MAX_PAYLOAD_BYTES)
+    expect("envelopeUnplaceable" in entry).toBe(false)
+    expect(preflight(manifest)).toEqual([])
+  })
+
+  it("a string-valued record over MAX_PAYLOAD_BYTES → a too-large row; size is the only refusal left", () => {
+    const rec = record({
+      recordType: 1,
+      payload: { v: 1, kind: "NONE", provenance: { source: "NONE" }, value: "x".repeat(70_000) },
+    })
+    const manifest = buildManifest([rec], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)
     const rows = preflight(manifest)
-    expect(rows.length).toBe(1)
-    expect(rows[0]).toMatchObject({ sourceId: rec.contextId, namespace: rec.namespace, reason: "envelope-unplaceable" })
-    expect(rows[0]!.bytes).toBe(manifest.entries[0]!.destinationBytes)
-    expect(rows[0]!.limit).toBe(manifest.entries[0]!.limit)
+    expect(rows).toEqual([
+      {
+        sourceId: rec.contextId,
+        namespace: rec.namespace,
+        bytes: manifest.entries[0]!.destinationBytes,
+        limit: MAX_PAYLOAD_BYTES,
+        reason: "too-large",
+      },
+    ])
+    expect(rows[0]!.bytes).toBeGreaterThan(MAX_PAYLOAD_BYTES)
   })
 
   it("every oversized record is named — a pass means zero rows, not a shorter list", () => {
@@ -396,6 +430,46 @@ describe("origin — the true source of a re-migrated record (B4b)", () => {
     // ("31337" vs "1"), proving the size above really is the true-origin serialization.
     const immediateSource = attachEnvelope(rec.payload, expectedEnvelope(rec, entry.createdAt))
     expect(canonicalBytes(immediateSource).length).not.toBe(entry.destinationBytes)
+  })
+
+  it("a string-valued record that already moved reads its origin from the sibling envelope", () => {
+    const firstMove: MigrationEnvelope = {
+      version: 1,
+      originalChainId: "1",
+      originalContract: ORIGIN_CONTRACT,
+      originalRecordId: id(0xaaa),
+      originalCommitment: id(0xbbb),
+      originalAuthor: id(0xccc),
+      originalCreatedAt: "2026-09-18T10:00:00.000Z",
+      migratedAt: "2026-09-25T10:00:00.000Z",
+    }
+    const rec = record({
+      recordType: 1,
+      payload: attachEnvelope(
+        { v: 1, kind: "NONE", provenance: { source: "NONE" }, value: "stated on the first contract" },
+        firstMove,
+      ),
+    })
+    const manifest = buildManifest([rec], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)
+    expect(manifest.entries[0]!.origin).toEqual({
+      chainId: "1",
+      contract: ORIGIN_CONTRACT,
+      recordId: id(0xaaa),
+      commitment: id(0xbbb),
+      author: id(0xccc),
+      createdAt: "2026-09-18T10:00:00.000Z",
+    })
+    // the measured destination names A again — the sibling is overwritten, not duplicated
+    const destination = attachEnvelope(rec.payload, { ...firstMove, migratedAt: MIGRATED_AT })
+    expect(manifest.entries[0]!.destinationBytes).toBe(canonicalBytes(destination).length)
+  })
+
+  it("a record carrying the envelope in two places refuses the manifest, naming the record", () => {
+    const rec = record()
+    const envelope = expectedEnvelope(rec, "2026-09-18T10:00:00.000Z")
+    rec.payload = { ...attachEnvelope(rec.payload, envelope), migration: envelope }
+    expect(() => buildManifest([rec], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)).toThrowError(/invalid-source-envelope/)
+    expect(() => buildManifest([rec], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)).toThrowError(new RegExp(rec.contextId))
   })
 
   it("a record with no envelope takes the immediate source as its origin", () => {

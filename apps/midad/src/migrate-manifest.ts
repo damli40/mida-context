@@ -69,12 +69,6 @@ export interface ManifestEntry {
   destinationBytes: number
   /** MAX_VALUE_BYTES for a checkpoint, MAX_PAYLOAD_BYTES for any other record. */
   limit: number
-  /**
-   * Set when the record's `value` cannot carry the envelope (a string value): the envelope was
-   * never attached, so `destinationBytes`/`limit` describe the record as it is — preflight
-   * refuses it under `envelope-unplaceable` rather than measuring a destination that cannot exist.
-   */
-  envelopeUnplaceable?: true
   preparedNonce?: Hex
   targetId?: Hex
   status: EntryStatus
@@ -129,6 +123,9 @@ export function payloadFingerprint(
         : { references: references.map((reference) => ({ ...reference, recordId: sourceIdOf(reference.recordId) })) }),
     },
   }
+  // The envelope is excluded wherever it sits — inside an object value (stripped above) or
+  // beside a string one (this top-level key).
+  delete canonical.migration
   return `0x${bytesToHex(hmac(sha256, hmacKey, canonicalBytes(canonical)))}` as Hex
 }
 
@@ -164,7 +161,7 @@ function measureDestination(
   record: SourceRecord,
   origin: ManifestOrigin,
   migratedAt: string,
-): { destinationBytes: number; limit: number; envelopeUnplaceable?: true } {
+): { destinationBytes: number; limit: number } {
   const envelope: MigrationEnvelope = {
     version: 1,
     originalChainId: origin.chainId,
@@ -175,15 +172,9 @@ function measureDestination(
     originalCreatedAt: origin.createdAt,
     migratedAt,
   }
-  let destination: ContextPayload
-  try {
-    destination = withPlaceholderReferences(attachEnvelope(record.payload, envelope))
-  } catch (error) {
-    if ((error as { code?: string }).code === "envelope-unplaceable") {
-      return { destinationBytes: canonicalBytes(record.payload).length, limit: MAX_PAYLOAD_BYTES, envelopeUnplaceable: true }
-    }
-    throw error
-  }
+  // Every record can carry the envelope — inside an object value or beside a string one — so
+  // every record is measured with it attached.
+  const destination = withPlaceholderReferences(attachEnvelope(record.payload, envelope))
   if (unwrapCheckpoint(destination.value) !== null) {
     return { destinationBytes: canonicalBytes(destination.value).length, limit: MAX_VALUE_BYTES }
   }
@@ -199,8 +190,17 @@ function measureDestination(
  */
 function originOf(record: SourceRecord, createdAt: string, source: Deployment): ManifestOrigin {
   const value = record.payload.value
-  if (typeof value === "object" && value !== null && !Array.isArray(value) && "migration" in value) {
-    const checked = validateMigrationEnvelope((value as { migration?: unknown }).migration)
+  const inner =
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as { migration?: unknown }).migration
+      : undefined
+  const outer = record.payload.migration
+  if (inner !== undefined && outer !== undefined) {
+    throw manifestError("invalid-source-envelope", `${lower(record.contextId)}: migration envelope carried in two places`)
+  }
+  const sealed = inner !== undefined ? inner : outer
+  if (sealed !== undefined) {
+    const checked = validateMigrationEnvelope(sealed)
     if (!checked.ok) {
       throw manifestError("invalid-source-envelope", `${lower(record.contextId)}: ${checked.errors.join("; ")}`)
     }
@@ -280,7 +280,6 @@ export function buildManifest(
       fingerprint: payloadFingerprint(record.payload, hmacKey),
       destinationBytes: measured.destinationBytes,
       limit: measured.limit,
-      ...(measured.envelopeUnplaceable === true ? { envelopeUnplaceable: true as const } : {}),
       status: authorName === null ? ("skipped:unknown-author" as const) : ("pending" as const),
     }
   })
@@ -376,17 +375,16 @@ export function replayOrder(manifest: Manifest): ManifestEntry[] {
 
 /**
  * The refusal list for the whole migration: every entry whose destination bytes exceed its
- * limit, or whose value cannot carry the migration envelope. Empty means the migration may
- * proceed — there is no per-record escape hatch, and no limit is ever raised.
+ * limit. Every record carries its envelope — inside an object value or beside a string one —
+ * so size is the only reason left. Empty means the migration may proceed; there is no
+ * per-record escape hatch, and no limit is ever raised.
  */
 export function preflight(
   manifest: Manifest,
-): { sourceId: Hex; namespace: string; bytes: number; limit: number; reason: "too-large" | "envelope-unplaceable" }[] {
+): { sourceId: Hex; namespace: string; bytes: number; limit: number; reason: "too-large" }[] {
   const rows = []
   for (const entry of manifest.entries) {
-    if (entry.envelopeUnplaceable === true) {
-      rows.push({ sourceId: entry.sourceId, namespace: entry.namespace, bytes: entry.destinationBytes, limit: entry.limit, reason: "envelope-unplaceable" as const })
-    } else if (entry.destinationBytes > entry.limit) {
+    if (entry.destinationBytes > entry.limit) {
       rows.push({ sourceId: entry.sourceId, namespace: entry.namespace, bytes: entry.destinationBytes, limit: entry.limit, reason: "too-large" as const })
     }
   }

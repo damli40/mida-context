@@ -2,8 +2,9 @@ import type { ContextPayload } from "@mida/protocol"
 import type { MigrationEnvelope } from "@mida/checkpoint"
 
 // The type itself is declared in @mida/checkpoint beside StoredCheckpoint — the package that
-// carries it cannot import from this app. Re-exported here so every midad caller imports the
-// envelope, its validator and its placement helpers from one module.
+// carries it cannot import from this app. (@mida/protocol holds an identical declaration for
+// ContextPayload.migration; the two are structurally interchangeable.) Re-exported here so every
+// midad caller imports the envelope, its validator and its placement helpers from one module.
 export type { MigrationEnvelope }
 
 const FIELDS = [
@@ -23,8 +24,8 @@ const HASH = /^0x[0-9a-fA-F]{64}$/
 const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/
 
 /**
- * A plain Error carrying `.code` — `envelope-unplaceable` and `invalid-migration-envelope` are
- * midad-level refusals, not protocol codes, so MidaError's closed union cannot carry them.
+ * A plain Error carrying `.code` — `invalid-migration-envelope` is a midad-level refusal, not a
+ * protocol code, so MidaError's closed union cannot carry it.
  * The message leads with the code, the way MidaError formats it.
  */
 function envelopeError(code: string, detail: string): Error & { code: string } {
@@ -78,33 +79,48 @@ export function validateMigrationEnvelope(input: unknown): { ok: true; value: Mi
   }
 }
 
+/** The object `value`'s own envelope slot — undefined for a string value, which has none. */
+function innerEnvelope(value: ContextPayload["value"]): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined
+  return (value as { migration?: unknown }).migration
+}
+
 /**
  * Seals the envelope into a payload. A checkpoint payload's `value` IS the CheckpointEnvelope,
  * so `value.migration` is `CheckpointEnvelope.migration`; for a fact it lands beside `text` and
- * `assertedAt`. A record whose `value` is a string has nowhere to carry it without changing the
- * value's type — `envelope-unplaceable`, which Task 4's preflight turns into a refusal naming
- * the record. The input payload is never mutated.
+ * `assertedAt`; a record whose `value` is a string carries it beside the content, at
+ * `payload.migration` — the value itself is never changed. Attaching to a payload that already
+ * carries an envelope in the OTHER slot would leave it carried twice: `invalid-migration-envelope`.
+ * The input payload is never mutated.
  */
 export function attachEnvelope(payload: ContextPayload, envelope: MigrationEnvelope): ContextPayload {
   const checked = validateMigrationEnvelope(envelope)
   if (!checked.ok) {
     throw envelopeError("invalid-migration-envelope", `invalid migration envelope: ${checked.errors.join("; ")}`)
   }
-  if (typeof payload.value !== "object" || payload.value === null || Array.isArray(payload.value)) {
-    throw envelopeError("envelope-unplaceable", "a record whose value is a string cannot carry a migration envelope without changing what it is")
+  const value = payload.value
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return { ...payload, migration: checked.value }
   }
-  return { ...payload, value: { ...payload.value, migration: checked.value } }
+  if (payload.migration !== undefined) {
+    throw envelopeError("invalid-migration-envelope", "the payload already carries a migration envelope beside its value")
+  }
+  return { ...payload, value: { ...value, migration: checked.value } }
 }
 
 /**
- * The envelope a sealed payload carries, validated — `undefined` when the key is absent or the
- * value is not an object, and also when the envelope is present but invalid (a malformed
- * envelope must never render as if it were real).
+ * The envelope a sealed payload carries, validated: inside an object `value`, beside a string
+ * one — `undefined` when neither slot holds a valid envelope (a malformed one must never render
+ * as if it were real). A payload carrying the envelope in BOTH places is contradictory —
+ * `invalid-migration-envelope`.
  */
 export function readEnvelope(payload: ContextPayload): MigrationEnvelope | undefined {
-  const value = payload.value
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined
-  const checked = validateMigrationEnvelope((value as { migration?: unknown }).migration)
+  const inner = innerEnvelope(payload.value)
+  const outer = payload.migration
+  if (inner !== undefined && outer !== undefined) {
+    throw envelopeError("invalid-migration-envelope", "the migration envelope is carried in two places")
+  }
+  const checked = validateMigrationEnvelope(inner !== undefined ? inner : outer)
   return checked.ok ? checked.value : undefined
 }
 

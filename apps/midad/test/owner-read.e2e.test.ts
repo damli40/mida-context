@@ -13,8 +13,8 @@ import {
 import type { Hex } from "@mida/protocol"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, Runtime, init, readOwnerUniverse } from "@mida/midad"
-import type { Network, SourceRecord } from "@mida/midad"
+import { MidaHome, Runtime, attachEnvelope, init, readOwnerUniverse } from "@mida/midad"
+import type { MigrationEnvelope, Network, SourceRecord } from "@mida/midad"
 import { seedMigrateUniverse } from "./helpers-migrate.js"
 import type { MigrateSeed } from "./helpers-migrate.js"
 
@@ -159,6 +159,35 @@ describe("readOwnerUniverse on local Anvil (migrate B3)", () => {
     } finally {
       await emptyRuntime.close()
     }
+  })
+
+  it("a string-valued record's migration envelope sits beside the content — the sibling survives the owner read intact", async () => {
+    // The seeded evidence record's `value` is a plain string; a moved record like it carries
+    // the envelope at `payload.migration`, and the read path must hand it back whole.
+    const migration: MigrationEnvelope = {
+      version: 1,
+      originalChainId: network.deployment.chainId.toString(10),
+      originalContract: network.deployment.contextRegistry,
+      originalRecordId: `0x${"55".repeat(32)}`,
+      originalCommitment: `0x${"66".repeat(32)}`,
+      originalAuthor: `0x${"77".repeat(32)}`,
+      originalCreatedAt: "2026-09-18T10:00:00.000Z",
+      migratedAt: "2026-09-25T10:00:00.000Z",
+    }
+    const payload = attachEnvelope(
+      { v: 1, kind: "NONE", provenance: { source: "NONE" }, value: "a plain-text record that moved" },
+      migration,
+    )
+    const written = await runtime.vault.createOwnerContext({
+      namespace: "goals.personal",
+      recordType: "EVIDENCE",
+      payload,
+    })
+    const reread = await readOwnerUniverse(runtime)
+    const found = reread.find((record) => record.contextId === written.contextId)
+    expect(found).toBeDefined()
+    expect(found!.payload.value).toBe("a plain-text record that moved")
+    expect(found!.payload.migration).toEqual(migration)
   })
 
   it("a record on chain whose object is gone from the store throws owner-read-incomplete naming it", async () => {

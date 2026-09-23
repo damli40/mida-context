@@ -35,6 +35,29 @@ export interface RecordReference {
   recordId: Hex
 }
 
+/**
+ * Where a migrated record came from — sealed beside or inside the payload by `mida migrate`.
+ * Declared here because ContextPayload carries it; `@mida/checkpoint` holds an identical
+ * declaration beside StoredCheckpoint (that package stays dependency-free), and the two are
+ * structurally interchangeable.
+ */
+export interface MigrationEnvelope {
+  version: 1
+  /** The chain the record was copied from, as a decimal string. */
+  originalChainId: string
+  /** The ContextRegistry the record lived on before the move. */
+  originalContract: Address
+  originalRecordId: Hex
+  /** The old record's on-chain manifestHash. */
+  originalCommitment: Hex
+  /** The old record's on-chain author id. */
+  originalAuthor: Hex
+  /** When the record was first written — ISO-8601. */
+  originalCreatedAt: string
+  /** When the move happened — ISO-8601; its day is what "(moved on …)" renders. */
+  migratedAt: string
+}
+
 export interface ContextPayload {
   v: 1
   value: string | Record<string, unknown>
@@ -49,6 +72,12 @@ export interface ContextPayload {
     note?: string
   }
   tags?: string[]
+  /**
+   * The migration envelope of a moved record whose `value` is a string — a string cannot carry
+   * the envelope inside, so it sits here, a sibling of `value`. An object `value` carries it at
+   * `value.migration` instead, and an ordinary record carries no `migration` key at all.
+   */
+  migration?: MigrationEnvelope
 }
 
 /** §8.3 */
