@@ -8,6 +8,15 @@ compatibility_date = "2026-09-21"
 # provides inert stubs only.
 compatibility_flags = ["nodejs_compat"]
 
+# Per-IP request budget on EVERY JSON-RPC call — the unmetered pass-through methods
+# (eth_chainId, receipts, the gas-price read) would otherwise spend the provider's request
+# quota for anyone with curl. The worker keys it on CF-Connecting-IP; an absent binding
+# (local dev, tests) means no limit.
+[[ratelimits]]
+name = "LIMITER_RPC"
+namespace_id = "2001"
+simple = { limit = 60, period = 60 }
+
 # No account id, database id, API key or policy id lives in this file.
 # Create the database with `wrangler d1 create mida-gas-sponsor` and paste the returned
 # database_id below, then apply schema.sql with `wrangler d1 execute`.
@@ -32,6 +41,9 @@ PIMLICO_CHAIN_SLUG = "monad-testnet"
 # Daily sponsored-operation budgets; these are the defaults, override as needed.
 PER_SENDER_DAILY_LIMIT = "30"
 GLOBAL_DAILY_LIMIT = "2000"
+# The real money bound: total wei the endpoint may reserve per UTC day — each signing reserves
+# its worst-case cost (gas limits x maxFeePerGas) against it. Default 25 MON, decimal wei.
+DAILY_WEI_BUDGET = "25000000000000000000"
 # ALCHEMY_BASE_URL is required only when PROVIDER = "alchemy".
 
 # Secrets — set with `wrangler secret put`, never commit them:

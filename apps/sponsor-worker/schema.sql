@@ -34,3 +34,12 @@ CREATE TABLE IF NOT EXISTS sponsor_issued (
   calldata_hash TEXT NOT NULL,
   PRIMARY KEY (day, sender, nonce, calldata_hash)
 );
+
+-- The daily spend in wei — the real money bound the count budgets cannot express: each signing
+-- reserves its worst-case cost (every gas limit x maxFeePerGas) and a reservation that would
+-- cross DAILY_WEI_BUDGET is refused. Wei is TEXT because 25 MON overflows SQLite's 64-bit int;
+-- the worker updates it compare-and-swap, so a refused reservation leaves the row untouched.
+CREATE TABLE IF NOT EXISTS spend (
+  day TEXT PRIMARY KEY,
+  wei TEXT NOT NULL
+);

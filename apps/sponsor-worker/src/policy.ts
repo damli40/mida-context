@@ -1,6 +1,7 @@
 import { GAS_CEILINGS, capabilityRegistryAbi, contextRegistryAbi } from "@mida/chain"
 import type { TxKind } from "@mida/chain"
 import { decodeFunctionData, encodeFunctionData, keccak256, toFunctionSelector } from "viem"
+import { recoverAuthorizationAddress } from "viem/utils"
 import type { Address, Hex } from "viem"
 
 /**
@@ -139,16 +140,23 @@ export const VERIFICATION_GAS_CEILING = 500_000n
  * preVerificationGas grows with calldata bytes. A three-scope grantBatch carrying the signed
  * manifest and the owner's passkey assertion measured 547,190 on Monad testnet (Sep 22, live) —
  * the old 500,000 refused every grant while sponsoring everything smaller. 1,200,000 leaves room
- * for larger manifests; at testnet prices the worst case adds ~0.06 MON to one sponsored op.
+ * for larger manifests. The money bound no longer comes from this ceiling alone: each fee field
+ * is also capped at 1.5× the live `fast` gas price, and every signing reserves its worst-case
+ * cost against a daily wei budget — so a big preVerificationGas at an inflated fee is refused by
+ * the live-price cap, and a flood of them is refused by the spend budget.
  */
 export const PRE_VERIFICATION_GAS_CEILING = 1_200_000n
 export const PAYMASTER_GAS_CEILING = 300_000n
 /**
  * Beyond the brief's fields: a user operation also names its own fee caps, and the paymaster is
  * charged gasPrice = min(maxFeePerGas, baseFee + maxPriorityFeePerGas). A huge priority fee would
- * be paid in full — so both fee fields are capped at a generous 300 gwei for Monad testnet.
+ * be paid in full — so both fee fields are capped twice: at this fixed ceiling and at 1.5× the
+ * live `fast` price the provider reports, whichever is lower.
  */
 export const FEE_CEILING = 300_000_000_000n // 300 gwei
+/** Each fee field must stay within this multiple of the live `fast` gas price. */
+const LIVE_FEE_NUMERATOR = 3n
+const LIVE_FEE_DENOMINATOR = 2n
 
 /** The four fixed ceilings an operation is billed against, resolved per deployment. */
 export interface GasCeilings {
@@ -200,6 +208,12 @@ export interface PolicyEnv {
 /** Injected so the policy stays pure — the Worker wires env.RPC_URL here; tests wire a stub. */
 export interface ChainQueries {
   getCode(address: string): Promise<string>
+  /**
+   * The live `fast` gas price in wei, read once per request through the provider's
+   * `pimlico_getUserOperationGasPrice` (the Worker caches it for 30 s per instance). Called only
+   * when the operation carries fee fields — an operation without them skips the read entirely.
+   */
+  gasPrice(): Promise<bigint>
 }
 
 export interface InnerCall {
@@ -292,6 +306,10 @@ export function decodeCalls(callData: unknown, wrapped = false): { kind: "execut
 interface Authorization {
   chainId?: unknown
   address?: unknown
+  nonce?: unknown
+  r?: unknown
+  s?: unknown
+  yParity?: unknown
 }
 
 /**
@@ -328,15 +346,61 @@ function checkAuthorization(auth: Authorization, env: PolicyEnv): void {
   }
 }
 
+/**
+ * The delegation must be signed BY THE SENDER. Before this check an authorization-shaped object
+ * passed on chain id and address alone — the attacker could staple any valid-looking delegation
+ * to a sender that was their own contract, and the sponsor paid for whatever it ran. nonce, r,
+ * s and yParity are required; the authorizer recovered from the signature must equal the sender.
+ */
+async function checkAuthorizationSignature(auth: Authorization, sender: string): Promise<void> {
+  for (const field of ["nonce", "r", "s", "yParity"] as const) {
+    if (auth[field] === undefined || auth[field] === null) {
+      refuse("auth", `refused: the authorization is missing ${field} — the delegation must be signed by the sender`)
+    }
+  }
+  const nonce = quantity(auth.nonce, "eip7702Auth.nonce")
+  const yParity = quantity(auth.yParity, "eip7702Auth.yParity")
+  const chainId = quantity(auth.chainId, "eip7702Auth.chainId")
+  if (nonce === undefined || yParity === undefined || chainId === undefined || !isHex(auth.r) || !isHex(auth.s)) {
+    refuse("auth", "refused: the authorization signature is malformed — the delegation must be signed by the sender")
+  }
+  let authorizer: Address
+  try {
+    authorizer = await recoverAuthorizationAddress({
+      authorization: {
+        address: auth.address as Address,
+        chainId: Number(chainId),
+        nonce: nonce as unknown as number,
+        r: auth.r as Hex,
+        s: auth.s as Hex,
+        yParity: Number(yParity),
+      },
+    })
+  } catch {
+    refuse("auth", "refused: the delegation is not signed by the sender")
+  }
+  if (authorizer!.toLowerCase() !== sender) {
+    refuse("auth", "refused: the delegation is not signed by the sender")
+  }
+}
+
 function emptyField(value: unknown): boolean {
   return value === undefined || value === null || value === "0x" || value === "" || value === ZERO_ADDRESS
 }
 
 /**
  * The whole payment policy for one user operation. Returns null when payable; throws PolicyRefusal
- * with a client-facing message otherwise. `getCode` is only called when no authorization is present.
+ * with a client-facing message otherwise. The sender's code is always read — a signed eip7702Auth
+ * only delegates a plain EOA. `options.requireGasFields` is set on the sign and send paths, where
+ * a missing gas field would skip its ceiling and the spend reservation; the stub and estimate
+ * methods leave it off and keep tolerating partial operations.
  */
-export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: ChainQueries): Promise<Refusal | null> {
+export async function checkUserOperation(
+  op: unknown,
+  env: PolicyEnv,
+  chain: ChainQueries,
+  options?: { requireGasFields?: boolean },
+): Promise<Refusal | null> {
   try {
     if (typeof op !== "object" || op === null || Array.isArray(op)) {
       refuse("params", "refused: the user operation must be a JSON object")
@@ -360,21 +424,30 @@ export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: Cha
     const hasValidEipAuth = eipAuth !== undefined && eipAuth !== null
     const authZeroDelegation =
       eipAuth != null && isAddress(eipAuth.address) && (eipAuth.address as string).toLowerCase() === ZERO_ADDRESS
-    if (!hasValidEipAuth) {
-      let code: string
-      try {
-        code = await chain.getCode(sender)
-      } catch {
-        refuse("auth", "refused: the sender's delegation could not be read — try again, or include an eip7702Auth")
-      }
-      const delegated =
-        isHex(code) &&
-        code.toLowerCase().startsWith(EIP7702_DELEGATION_PREFIX) &&
-        code.length === EIP7702_DELEGATION_PREFIX.length + 40 &&
-        env.allowedImplementations.has(`0x${code.slice(EIP7702_DELEGATION_PREFIX.length)}`.toLowerCase())
-      if (!delegated) {
-        refuse("auth", "refused: the sender is not delegated to an allowed smart-account implementation — include an eip7702Auth")
-      }
+    // An eip7702Auth must be signed by the sender it names — then the sender's code is read
+    // ALWAYS, authorization or not: an authorization only delegates a plain EOA, so a sender
+    // that already runs its own contract code is refused either way.
+    if (hasValidEipAuth) {
+      await checkAuthorizationSignature(eipAuth!, sender)
+    }
+    let code: string
+    try {
+      code = await chain.getCode(sender)
+    } catch {
+      refuse("auth", "refused: the sender's delegation could not be read — try again, or include an eip7702Auth")
+    }
+    const delegated =
+      isHex(code) &&
+      code.toLowerCase().startsWith(EIP7702_DELEGATION_PREFIX) &&
+      code.length === EIP7702_DELEGATION_PREFIX.length + 40 &&
+      env.allowedImplementations.has(`0x${code.slice(EIP7702_DELEGATION_PREFIX.length)}`.toLowerCase())
+    if (!delegated && !(hasValidEipAuth && (code === "0x" || code === ""))) {
+      refuse(
+        "auth",
+        hasValidEipAuth
+          ? "refused: the sender already runs contract code — a signed authorization can only delegate a plain account"
+          : "refused: the sender is not delegated to an allowed smart-account implementation — include an eip7702Auth",
+      )
     }
 
     // Rule 4: factory fields stay empty — except the EIP-7702 marker, bare or right-padded to 20
@@ -444,22 +517,37 @@ export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: Cha
     // Rule 5: Monad bills the gas limit in full, so every gas field is capped — the fixed fields
     // against the deployed ceilings, and callGasLimit against what the decoded calls may bill:
     // the sum of their per-function ceilings plus the account's per-call overhead. A cheap call
-    // can no longer bill like the most expensive one.
-    for (const [field, ceiling] of [
-      ["verificationGasLimit", env.ceilings.verificationGas],
-      ["preVerificationGas", env.ceilings.preVerificationGas],
-      ["paymasterVerificationGasLimit", env.ceilings.paymasterGas],
-      ["paymasterPostOpGasLimit", env.ceilings.paymasterGas],
-      ["maxFeePerGas", env.ceilings.fee],
-      ["maxPriorityFeePerGas", env.ceilings.fee],
+    // can no longer bill like the most expensive one. On the sign and send paths every field is
+    // REQUIRED — a missing field would skip its ceiling and the spend reservation.
+    const strict = options?.requireGasFields === true
+    const paymasterSet = !emptyField(uo.paymaster) || !emptyField(uo.paymasterAndData)
+    const seen = new Map<string, bigint>()
+    for (const [field, ceiling, paymasterField] of [
+      ["verificationGasLimit", env.ceilings.verificationGas, false],
+      ["preVerificationGas", env.ceilings.preVerificationGas, false],
+      ["paymasterVerificationGasLimit", env.ceilings.paymasterGas, true],
+      ["paymasterPostOpGasLimit", env.ceilings.paymasterGas, true],
+      ["maxFeePerGas", env.ceilings.fee, false],
+      ["maxPriorityFeePerGas", env.ceilings.fee, false],
     ] as const) {
       const value = quantity(uo[field], field)
-      if (value !== undefined && value > ceiling) {
+      if (value === undefined) {
+        if (strict && (!paymasterField || paymasterSet)) {
+          refuse("gas", `refused: ${field} is missing — a sponsored operation must carry every gas field`)
+        }
+        continue
+      }
+      seen.set(field, value)
+      if (value > ceiling) {
         refuse("gas", `refused: ${field} ${value} is over this endpoint's ceiling of ${ceiling}`)
       }
     }
     const callGas = quantity(uo.callGasLimit, "callGasLimit")
-    if (callGas !== undefined) {
+    if (callGas === undefined) {
+      if (strict) {
+        refuse("gas", "refused: callGasLimit is missing — a sponsored operation must carry every gas field")
+      }
+    } else {
       let ceiling = CALL_OVERHEAD_PER_CALL * BigInt(calls.length)
       if (!clearing) {
         for (const call of calls) {
@@ -475,11 +563,52 @@ export async function checkUserOperation(op: unknown, env: PolicyEnv, chain: Cha
         refuse("gas", `refused: callGasLimit ${callGas} is over this operation's ceiling of ${ceiling}`)
       }
     }
+
+    // The fee fields are also capped at 1.5× the live `fast` gas price — the fixed ceiling alone
+    // let a caller name 300 gwei whatever the market did. The price is fetched only when the op
+    // carries a fee field, and an unreadable price fails CLOSED: no live price, no sponsorship.
+    const maxFee = seen.get("maxFeePerGas")
+    const maxPriorityFee = seen.get("maxPriorityFeePerGas")
+    if (maxFee !== undefined || maxPriorityFee !== undefined) {
+      let live: bigint
+      try {
+        live = await chain.gasPrice()
+      } catch {
+        refuse("fee", "refused: the gas price could not be checked — try again")
+      }
+      const cap = (live! * LIVE_FEE_NUMERATOR) / LIVE_FEE_DENOMINATOR
+      if (maxFee !== undefined && maxFee > cap) {
+        refuse("fee", `refused: maxFeePerGas ${maxFee} is over 1.5x the live gas price (${cap})`)
+      }
+      if (maxPriorityFee !== undefined && maxPriorityFee > cap) {
+        refuse("fee", `refused: maxPriorityFeePerGas ${maxPriorityFee} is over 1.5x the live gas price (${cap})`)
+      }
+    }
     return null
   } catch (e) {
     if (e instanceof PolicyRefusal) return e.refusal
     throw e
   }
+}
+
+/**
+ * The most an operation can bill the paymaster: every gas limit as sent × maxFeePerGas. This is
+ * what the signing step reserves against the daily wei budget — Monad charges the LIMIT, so the
+ * worst case is the honest one. Fields missing from the op count as zero; on the paths this is
+ * used, the strict gas-field check has already required them.
+ */
+export function operationMaxCostWei(op: Record<string, unknown>): bigint {
+  let units = 0n
+  for (const field of [
+    "callGasLimit",
+    "verificationGasLimit",
+    "preVerificationGas",
+    "paymasterVerificationGasLimit",
+    "paymasterPostOpGasLimit",
+  ]) {
+    units += quantity(op[field], field) ?? 0n
+  }
+  return units * (quantity(op.maxFeePerGas, "maxFeePerGas") ?? 0n)
 }
 
 /**

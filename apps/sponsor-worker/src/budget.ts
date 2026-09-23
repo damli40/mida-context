@@ -72,11 +72,65 @@ export async function consumeSignBudget(
 }
 
 /**
+ * Reserve `wei` of today's sponsorship spend — the count budgets alone could not stop a few ops
+ * billing huge gas at huge fees, so the real money bound lives here. Wei is stored as TEXT
+ * because a 25-MON budget overflows SQLite's 64-bit integer; every change is a compare-and-swap
+ * in JS instead: the UPDATE only applies while the row still holds what was read, so two Workers
+ * racing cannot both squeeze under the cap, and a refused reservation changes nothing — not even
+ * the row's existence. A day with no row spends from zero.
+ */
+export async function reserveSpend(
+  db: D1Like,
+  input: { day: string; wei: bigint; budget: bigint },
+): Promise<{ allowed: boolean; spent: bigint }> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const row = await db.prepare("SELECT wei FROM spend WHERE day = ?").bind(input.day).first<{ wei: string }>()
+    const current = row === null ? 0n : BigInt(row.wei)
+    if (current + input.wei > input.budget) {
+      return { allowed: false, spent: current }
+    }
+    const next = current + input.wei
+    const changes =
+      row === null
+        ? ((await db.prepare("INSERT OR IGNORE INTO spend (day, wei) VALUES (?, ?)").bind(input.day, next.toString()).run()).meta
+            .changes ?? 0)
+        : ((await db.prepare("UPDATE spend SET wei = ? WHERE day = ? AND wei = ?").bind(next.toString(), input.day, row.wei).run())
+            .meta.changes ?? 0)
+    if (changes > 0) {
+      return { allowed: true, spent: next }
+    }
+    // A concurrent reservation moved the row under us — read it again and re-decide.
+  }
+  // Lost every race: refuse rather than guess — under-reporting availability never overspends.
+  const row = await db.prepare("SELECT wei FROM spend WHERE day = ?").bind(input.day).first<{ wei: string }>()
+  return { allowed: false, spent: row === null ? 0n : BigInt(row.wei) }
+}
+
+/**
+ * Give back a wei reservation when the provider never produced a signature — the same
+ * compare-and-swap as reserveSpend, so a refund never underflows the stored total.
+ */
+export async function refundSpend(db: D1Like, input: { day: string; wei: bigint }): Promise<void> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const row = await db.prepare("SELECT wei FROM spend WHERE day = ?").bind(input.day).first<{ wei: string }>()
+    if (row === null) return
+    const current = BigInt(row.wei)
+    const next = current > input.wei ? current - input.wei : 0n
+    const result = await db
+      .prepare("UPDATE spend SET wei = ? WHERE day = ? AND wei = ?")
+      .bind(next.toString(), input.day, row.wei)
+      .run()
+    if ((result.meta.changes ?? 0) > 0) return
+  }
+}
+
+/**
  * Give back a consumed signing when the provider never produced one — a compensating decrement
  * on both counters, never below zero. Only called after `consumeSignBudget` returned allowed,
- * so each decrement undoes exactly one increment.
+ * so each decrement undoes exactly one increment. `wei`, when passed, returns the spend
+ * reservation made alongside the signing.
  */
-export async function refundSignBudget(db: D1Like, input: { day: string; sender: string }): Promise<void> {
+export async function refundSignBudget(db: D1Like, input: { day: string; sender: string; wei?: bigint }): Promise<void> {
   await db
     .prepare(`UPDATE sponsor_sender_signings SET count = MAX(count - 1, 0) WHERE day = ? AND sender = ?`)
     .bind(input.day, input.sender)
@@ -85,6 +139,9 @@ export async function refundSignBudget(db: D1Like, input: { day: string; sender:
     .prepare(`UPDATE sponsor_global_signings SET count = MAX(count - 1, 0) WHERE day = ?`)
     .bind(input.day)
     .run()
+  if (input.wei !== undefined) {
+    await refundSpend(db, { day: input.day, wei: input.wei })
+  }
 }
 
 /**

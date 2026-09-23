@@ -13,11 +13,13 @@ import { monadTestnet } from "viem/chains"
 import {
   ALLOWED_INNER_SELECTORS,
   CALL_OVERHEAD_PER_CALL,
+  FEE_CEILING,
   GAS_KIND_BY_FUNCTION,
   INNER_CALL_GAS,
   checkUserOperation,
   checkedParams,
   decodeCalls,
+  operationMaxCostWei,
 } from "../src/policy.js"
 import type { ChainQueries, PolicyEnv } from "../src/policy.js"
 import { GAS_CEILINGS, capabilityRegistryAbi, contextRegistryAbi } from "@mida/chain"
@@ -29,28 +31,45 @@ import {
   CTX,
   ENTRY_POINT,
   IMPL,
+  SIGNED_AUTH,
+  TEST_SIGNER,
   THIRD_CONTRACT,
   ZERO,
   batchCall,
   executeCall,
   midaCallData,
+  opSignedBy,
   policyEnv,
   randomAddress,
+  randomKey,
   runtimeWrapped,
   validAuth,
   validUserOp,
 } from "./helpers.js"
 
+/**
+ * The live-price stub most tests share: the fixed fee ceiling (300 gwei). The 1.5× live-price
+ * cap then sits at 450 gwei, so the 300-gwei fixed ceiling remains the binding constraint and
+ * the old boundary tests stay boundary tests.
+ */
+const liveFee: ChainQueries["gasPrice"] = async () => FEE_CEILING
+
 const delegated = (impl = IMPL): ChainQueries => ({
   getCode: async () => `0xef0100${impl.slice(2)}`,
+  gasPrice: liveFee,
 })
-const neverCalled: ChainQueries = {
-  getCode: async () => {
-    throw new Error("getCode must not be called when an authorization is present")
-  },
+/**
+ * A plain EOA — `getCode` answers `0x`. This replaces the old `neverCalled` stub, which pinned
+ * the bug this round fixes: it asserted getCode was NEVER called when an authorization was
+ * present, which is exactly what let an unsigned authorization pay for arbitrary code. Now
+ * getCode is always consulted, so tests run against a sender that answers with empty code.
+ */
+const emptyCode: ChainQueries = {
+  getCode: async () => "0x",
+  gasPrice: liveFee,
 }
 
-async function refused(op: Record<string, unknown>, chain: ChainQueries = neverCalled, env: PolicyEnv = policyEnv): Promise<string> {
+async function refused(op: Record<string, unknown>, chain: ChainQueries = emptyCode, env: PolicyEnv = policyEnv): Promise<string> {
   const refusal = await checkUserOperation(op, env, chain)
   expect(refusal).not.toBeNull()
   return refusal!.rule
@@ -91,7 +110,7 @@ const EIP7702_MARKER_PADDED = "0x7702000000000000000000000000000000000000"
 
 describe("checkUserOperation — sender and factory", () => {
   it("accepts a valid operation", async () => {
-    expect(await checkUserOperation(validUserOp(), policyEnv, neverCalled)).toBeNull()
+    expect(await checkUserOperation(validUserOp(), policyEnv, emptyCode)).toBeNull()
   })
 
   it("refuses a malformed sender", async () => {
@@ -100,12 +119,12 @@ describe("checkUserOperation — sender and factory", () => {
   })
 
   it("accepts the EIP-7702 factory marker — bare or 20-byte padded — with a valid authorization", async () => {
-    expect(await checkUserOperation(validUserOp({ factory: EIP7702_MARKER }), policyEnv, neverCalled)).toBeNull()
-    expect(await checkUserOperation(validUserOp({ factory: EIP7702_MARKER_PADDED }), policyEnv, neverCalled)).toBeNull()
+    expect(await checkUserOperation(validUserOp({ factory: EIP7702_MARKER }), policyEnv, emptyCode)).toBeNull()
+    expect(await checkUserOperation(validUserOp({ factory: EIP7702_MARKER_PADDED }), policyEnv, emptyCode)).toBeNull()
   })
 
   it("accepts the packed initCode marker with a valid authorization — and nothing appended", async () => {
-    expect(await checkUserOperation(validUserOp({ initCode: EIP7702_MARKER_PADDED }), policyEnv, neverCalled)).toBeNull()
+    expect(await checkUserOperation(validUserOp({ initCode: EIP7702_MARKER_PADDED }), policyEnv, emptyCode)).toBeNull()
     expect(await refused(validUserOp({ initCode: `${EIP7702_MARKER_PADDED}abcd` }))).toBe("factory")
     expect(await refused(validUserOp({ initCode: EIP7702_MARKER }))).toBe("factory")
   })
@@ -132,7 +151,7 @@ describe("checkUserOperation — sender and factory", () => {
   })
 
   it("accepts empty factory fields", async () => {
-    expect(await checkUserOperation(validUserOp({ factory: ZERO, factoryData: "0x", initCode: "0x" }), policyEnv, neverCalled)).toBeNull()
+    expect(await checkUserOperation(validUserOp({ factory: ZERO, factoryData: "0x", initCode: "0x" }), policyEnv, emptyCode)).toBeNull()
   })
 })
 
@@ -164,7 +183,7 @@ describe("checkUserOperation — operations built by the real account libraries"
       // The signed authorization object, passed through exactly as the library produced it.
       eip7702Auth: await owner.signAuthorization({ contractAddress: IMPL, chainId: 10143, nonce: 0 }),
     })
-    expect(await checkUserOperation(op, policyEnv, neverCalled)).toBeNull()
+    expect(await checkUserOperation(op, policyEnv, emptyCode)).toBeNull()
   })
 
   it("permissionless's to7702SimpleSmartAccount emits no factory — the authorization carries it", async () => {
@@ -179,7 +198,7 @@ describe("checkUserOperation — operations built by the real account libraries"
       factoryData,
       eip7702Auth: await owner.signAuthorization({ contractAddress: IMPL, chainId: 10143, nonce: 0 }),
     })
-    expect(await checkUserOperation(op, policyEnv, neverCalled)).toBeNull()
+    expect(await checkUserOperation(op, policyEnv, emptyCode)).toBeNull()
   })
 })
 
@@ -198,7 +217,9 @@ describe("checkUserOperation — eip7702Auth", () => {
   })
 
   it("refuses the zero address when it accompanies ordinary calls — a clearing authorization buys only the clearing shape", async () => {
-    expect(await refused(validUserOp({ eip7702Auth: validAuth({ address: ZERO }) }))).toBe("auth")
+    // Signed for real this time — it must reach the clearing check itself, not the signature refusal.
+    const zeroAuth = await TEST_SIGNER.signAuthorization({ contractAddress: ZERO, chainId: 10143, nonce: 0 })
+    expect(await refused(validUserOp({ eip7702Auth: zeroAuth }))).toBe("auth")
   })
 
   it("checks an `authorization` field too — the other wire name cannot smuggle a bad auth", async () => {
@@ -210,7 +231,7 @@ describe("checkUserOperation — eip7702Auth", () => {
     // Valid under the other name, but the sender runs whatever code it actually has on-chain:
     // not delegated → refused; delegated to the allowed impl → payable.
     const op = validUserOp({ eip7702Auth: undefined, authorization: validAuth() })
-    expect(await refused(op, { getCode: async () => "0x" })).toBe("auth")
+    expect(await refused(op, { getCode: async () => "0x", gasPrice: liveFee })).toBe("auth")
     expect(await checkUserOperation(op, policyEnv, delegated())).toBeNull()
     // And a zero address under the other name confers no clearing privilege — the self-call is
     // still just a non-Mida call.
@@ -231,11 +252,166 @@ describe("checkUserOperation — eip7702Auth", () => {
   it("with no authorization, the sender must already be delegated to an allowed implementation", async () => {
     const op = validUserOp({ eip7702Auth: undefined })
     expect(await checkUserOperation(op, policyEnv, delegated())).toBeNull()
-    expect(await refused(op, { getCode: async () => "0x" })).toBe("auth")
-    expect(await refused(op, { getCode: async () => "0x6080604052" })).toBe("auth")
+    expect(await refused(op, { getCode: async () => "0x", gasPrice: liveFee })).toBe("auth")
+    expect(await refused(op, { getCode: async () => "0x6080604052", gasPrice: liveFee })).toBe("auth")
     expect(await refused(op, delegated(randomAddress()))).toBe("auth")
-    expect(await refused(op, { getCode: async () => "0xef0100" })).toBe("auth") // prefix with no address
-    expect(await refused(op, { getCode: async () => { throw new Error("rpc down") } })).toBe("auth")
+    expect(await refused(op, { getCode: async () => "0xef0100", gasPrice: liveFee })).toBe("auth") // prefix with no address
+    expect(await refused(op, { getCode: async () => { throw new Error("rpc down") }, gasPrice: liveFee })).toBe("auth")
+  })
+})
+
+describe("checkUserOperation — the delegation must be signed by the sender", () => {
+  it("refuses an authorization signed by a different key", async () => {
+    const stranger = privateKeyToAccount(randomKey())
+    const wrongAuth = await stranger.signAuthorization({ contractAddress: IMPL, chainId: 10143, nonce: 0 })
+    // Signed for real — just not by the sender this operation names.
+    expect(await refused(validUserOp({ eip7702Auth: wrongAuth }))).toBe("auth")
+  })
+
+  it("refuses an authorization missing nonce, r, s or yParity", async () => {
+    for (const field of ["nonce", "r", "s", "yParity"]) {
+      const auth = { ...(SIGNED_AUTH as Record<string, unknown>) }
+      delete auth[field]
+      expect(await refused(validUserOp({ eip7702Auth: auth })), field).toBe("auth")
+    }
+  })
+
+  it("a signature-shaped object recovers a stranger, not the sender — refused", async () => {
+    // validAuth() carries real-looking r/s that sign nothing: recovery yields a random address.
+    expect(await refused(validUserOp({ eip7702Auth: validAuth() }))).toBe("auth")
+  })
+
+  it("a signed authorization only helps an EOA or an allowed delegation — contract code still refuses", async () => {
+    const op = await opSignedBy(randomKey())
+    // Empty code (the plain EOA this authorization will delegate) and an allowed delegation pass.
+    expect(await checkUserOperation(op, policyEnv, emptyCode)).toBeNull()
+    expect(await checkUserOperation(op, policyEnv, delegated())).toBeNull()
+    // A sender that is already its own contract refuses — the signature changes nothing it runs.
+    expect(await refused(op, { getCode: async () => "0x6080604052", gasPrice: liveFee })).toBe("auth")
+    // So does a delegation to an implementation outside the allowlist.
+    expect(await refused(op, delegated(randomAddress()))).toBe("auth")
+    // And a bare delegation prefix with no address.
+    expect(await refused(op, { getCode: async () => "0xef0100", gasPrice: liveFee })).toBe("auth")
+  })
+
+  it("an unreadable sender code refuses even with a valid signature", async () => {
+    const op = await opSignedBy(randomKey())
+    expect(await refused(op, { getCode: async () => { throw new Error("rpc down") }, gasPrice: liveFee })).toBe("auth")
+  })
+
+  it("a zero-address clearing authorization is held to the same signature rule", async () => {
+    // Signed by the sender, it reaches the clearing rule — which pays only the exact shape,
+    // and only when the endpoint opted in. (The full clearing matrix lives in "inner calls".)
+    const zeroAuth = await TEST_SIGNER.signAuthorization({ contractAddress: ZERO, chainId: 10143, nonce: 0 })
+    const clearingOn: PolicyEnv = { ...policyEnv, allowClearing: true }
+    const clearing = validUserOp({ callData: executeCall(TEST_SIGNER.address, 0n, "0x"), eip7702Auth: zeroAuth, callGasLimit: "0xea60" })
+    expect(await checkUserOperation(clearing, clearingOn, delegated())).toBeNull()
+    // Signed by a DIFFERENT key, the same shape refuses on the signature, not the clearing rule.
+    const stranger = privateKeyToAccount(randomKey())
+    const foreignZero = await stranger.signAuthorization({ contractAddress: ZERO, chainId: 10143, nonce: 0 })
+    expect(await refused(validUserOp({ callData: executeCall(TEST_SIGNER.address, 0n, "0x"), eip7702Auth: foreignZero, callGasLimit: "0xea60" }), delegated(), clearingOn)).toBe("auth")
+  })
+})
+
+describe("checkUserOperation — fees are bounded by the live gas price", () => {
+  const gwei = (n: bigint) => n * 1_000_000_000n
+  const live = (wei: bigint): ChainQueries => ({ getCode: async () => "0x", gasPrice: async () => wei })
+
+  it("1.4x the live price pays; 1.6x refuses — and one wei over the 1.5x cap refuses", async () => {
+    const chain = live(gwei(100n)) // cap: 150 gwei
+    expect(await checkUserOperation(validUserOp({ maxFeePerGas: `0x${gwei(140n).toString(16)}` }), policyEnv, chain)).toBeNull()
+    expect(await checkUserOperation(validUserOp({ maxFeePerGas: `0x${gwei(150n).toString(16)}` }), policyEnv, chain)).toBeNull()
+    const over = await checkUserOperation(validUserOp({ maxFeePerGas: `0x${(gwei(150n) + 1n).toString(16)}` }), policyEnv, chain)
+    expect(over?.rule).toBe("fee")
+    const way = await checkUserOperation(validUserOp({ maxFeePerGas: `0x${gwei(160n).toString(16)}` }), policyEnv, chain)
+    expect(way?.rule).toBe("fee")
+    // The priority fee is held to the same cap — the paymaster pays it in full.
+    const prio = await checkUserOperation(validUserOp({ maxPriorityFeePerGas: `0x${(gwei(150n) + 1n).toString(16)}` }), policyEnv, chain)
+    expect(prio?.rule).toBe("fee")
+  })
+
+  it("the fixed FEE_CEILING still binds above the live-price cap", async () => {
+    // Live 400 gwei → 1.5x cap is 600 gwei, but the fixed ceiling still refuses past 300.
+    const chain = live(gwei(400n))
+    expect(await checkUserOperation(validUserOp({ maxFeePerGas: "0x45d964b800" /* 300 gwei */ }), policyEnv, chain)).toBeNull()
+    const refusal = await checkUserOperation(validUserOp({ maxFeePerGas: "0x45d964b801" }), policyEnv, chain)
+    expect(refusal?.rule).toBe("gas")
+    expect(refusal?.message).toContain("maxFeePerGas")
+  })
+
+  it("an unreadable live price fails closed — never a permissive fallback", async () => {
+    const chain: ChainQueries = {
+      getCode: async () => "0x",
+      gasPrice: async () => {
+        throw new Error("provider down")
+      },
+    }
+    const refusal = await checkUserOperation(validUserOp(), policyEnv, chain)
+    expect(refusal?.rule).toBe("fee")
+    expect(refusal?.message).toContain("the gas price could not be checked")
+  })
+
+  it("an operation without fee fields never touches the gas-price read — stub methods keep today's behaviour", async () => {
+    let called = false
+    const chain: ChainQueries = {
+      getCode: async () => "0x",
+      gasPrice: async () => {
+        called = true
+        return 1n
+      },
+    }
+    const op = validUserOp({ maxFeePerGas: undefined, maxPriorityFeePerGas: undefined })
+    expect(await checkUserOperation(op, policyEnv, chain)).toBeNull()
+    expect(called).toBe(false)
+  })
+})
+
+describe("operationMaxCostWei — the worst case an operation can bill", () => {
+  it("is the sum of every gas field times maxFeePerGas, missing fields counting as zero", () => {
+    const op = validUserOp({
+      callGasLimit: "0x30000",
+      verificationGasLimit: "0x40000",
+      preVerificationGas: "0x20000",
+      paymasterVerificationGasLimit: "0x493e0",
+      paymasterPostOpGasLimit: "0x493e0",
+      maxFeePerGas: "0x1000",
+    })
+    const units = 0x30000n + 0x40000n + 0x20000n + 0x493e0n + 0x493e0n
+    expect(operationMaxCostWei(op)).toBe(units * 0x1000n)
+    // No paymaster fields — the default op bills the three core fields only.
+    expect(operationMaxCostWei(validUserOp())).toBe((0x30000n + 0x40000n + 0x20000n) * 0x1000n)
+  })
+})
+
+describe("checkUserOperation — a sponsored operation carries every gas field", () => {
+  const strict = { requireGasFields: true }
+
+  it("each missing gas field refuses on the sign/send path, naming the field", async () => {
+    for (const field of ["callGasLimit", "verificationGasLimit", "preVerificationGas", "maxFeePerGas", "maxPriorityFeePerGas"]) {
+      const refusal = await checkUserOperation(validUserOp({ [field]: undefined }), policyEnv, emptyCode, strict)
+      expect(refusal?.rule, field).toBe("gas")
+      expect(refusal?.message, field).toContain(field)
+    }
+  })
+
+  it("the same missing fields still pass on the stub and estimate paths", async () => {
+    for (const field of ["callGasLimit", "verificationGasLimit", "preVerificationGas", "maxFeePerGas", "maxPriorityFeePerGas"]) {
+      expect(await checkUserOperation(validUserOp({ [field]: undefined }), policyEnv, emptyCode), field).toBeNull()
+    }
+  })
+
+  it("the paymaster gas limits are required only when a paymaster is set", async () => {
+    const paymaster = `0x${"77".repeat(20)}`
+    const missing = validUserOp({ paymaster })
+    expect((await checkUserOperation(missing, policyEnv, emptyCode, strict))?.rule).toBe("gas")
+    const full = validUserOp({ paymaster, paymasterVerificationGasLimit: "0x493e0", paymasterPostOpGasLimit: "0x493e0" })
+    expect(await checkUserOperation(full, policyEnv, emptyCode, strict)).toBeNull()
+    // And a paymasterAndData-only op (Alchemy's shape) is held to the same rule.
+    const alchemy = validUserOp({ paymasterAndData: `0x${"77".repeat(20)}1234` })
+    expect((await checkUserOperation(alchemy, policyEnv, emptyCode, strict))?.rule).toBe("gas")
+    // No paymaster at all — the two limits may stay absent.
+    const none = validUserOp({ paymasterVerificationGasLimit: undefined, paymasterPostOpGasLimit: undefined })
+    expect(await checkUserOperation(none, policyEnv, emptyCode, strict)).toBeNull()
   })
 })
 
@@ -251,8 +427,8 @@ describe("checkUserOperation — gas ceilings", () => {
   ]
   for (const [field, at, over] of cases) {
     it(`${field}: ceiling passes, one over refuses`, async () => {
-      expect(await checkUserOperation(validUserOp({ [field]: at }), policyEnv, neverCalled)).toBeNull()
-      const refusal = await checkUserOperation(validUserOp({ [field]: over }), policyEnv, neverCalled)
+      expect(await checkUserOperation(validUserOp({ [field]: at }), policyEnv, emptyCode)).toBeNull()
+      const refusal = await checkUserOperation(validUserOp({ [field]: over }), policyEnv, emptyCode)
       expect(refusal?.rule).toBe("gas")
       expect(refusal?.message).toContain(field)
     })
@@ -294,8 +470,8 @@ describe("checkUserOperation — callGasLimit is billed per inner function", () 
       const selector = toFunctionSelector(fn as never)
       const op = (callGasLimit: bigint) =>
         validUserOp({ callData: executeCall(registry, 0n, selector), callGasLimit: `0x${callGasLimit.toString(16)}` })
-      expect(await checkUserOperation(op(ceiling + CALL_OVERHEAD_PER_CALL), policyEnv, neverCalled)).toBeNull()
-      const refusal = await checkUserOperation(op(ceiling + CALL_OVERHEAD_PER_CALL + 1n), policyEnv, neverCalled)
+      expect(await checkUserOperation(op(ceiling + CALL_OVERHEAD_PER_CALL), policyEnv, emptyCode)).toBeNull()
+      const refusal = await checkUserOperation(op(ceiling + CALL_OVERHEAD_PER_CALL + 1n), policyEnv, emptyCode)
       expect(refusal?.rule).toBe("gas")
       expect(refusal?.message).toContain("callGasLimit")
     })
@@ -308,14 +484,14 @@ describe("checkUserOperation — callGasLimit is billed per inner function", () 
       { target: CTX, value: 0n, data: midaCallData("register") },
     ])
     const op = (callGasLimit: bigint) => validUserOp({ callData, callGasLimit: `0x${callGasLimit.toString(16)}` })
-    expect(await checkUserOperation(op(970_000n), policyEnv, neverCalled)).toBeNull()
-    expect((await checkUserOperation(op(970_001n), policyEnv, neverCalled))?.rule).toBe("gas")
+    expect(await checkUserOperation(op(970_000n), policyEnv, emptyCode)).toBeNull()
+    expect((await checkUserOperation(op(970_001n), policyEnv, emptyCode))?.rule).toBe("gas")
   })
 
   it("a cheap call can no longer bill like a full agent revoke", async () => {
     // registerP256Key at the old flat 6,000,000 ceiling: refused now.
     const op = validUserOp({ callGasLimit: "0x5b8d80" /* 6_000_000 */ })
-    expect((await checkUserOperation(op, policyEnv, neverCalled))?.rule).toBe("gas")
+    expect((await checkUserOperation(op, policyEnv, emptyCode))?.rule).toBe("gas")
   })
 })
 
@@ -327,7 +503,7 @@ describe("checkUserOperation — inner calls", () => {
         { target: CTX, value: 0n, data: midaCallData("register") },
       ]),
     })
-    expect(await checkUserOperation(op, policyEnv, neverCalled)).toBeNull()
+    expect(await checkUserOperation(op, policyEnv, emptyCode)).toBeNull()
   })
 
   it("one third-contract call inside a batch of valid calls refuses the WHOLE operation", async () => {
@@ -346,7 +522,7 @@ describe("checkUserOperation — inner calls", () => {
   })
 
   it("value 0 passes, 1 wei refuses", async () => {
-    expect(await checkUserOperation(validUserOp({ callData: executeCall(CAP, 0n, midaCallData()) }), policyEnv, neverCalled)).toBeNull()
+    expect(await checkUserOperation(validUserOp({ callData: executeCall(CAP, 0n, midaCallData()) }), policyEnv, emptyCode)).toBeNull()
     expect(await refused(validUserOp({ callData: executeCall(CAP, 1n, midaCallData()) }))).toBe("value")
   })
 
@@ -361,7 +537,7 @@ describe("checkUserOperation — inner calls", () => {
   it("8 inner calls pass, 9 refuse", async () => {
     const call = { target: CAP, value: 0n, data: midaCallData() }
     expect(
-      await checkUserOperation(validUserOp({ callData: batchCall(Array(8).fill(call)) }), policyEnv, neverCalled),
+      await checkUserOperation(validUserOp({ callData: batchCall(Array(8).fill(call)) }), policyEnv, emptyCode),
     ).toBeNull()
     expect(await refused(validUserOp({ callData: batchCall(Array(9).fill(call)) }))).toBe("calldata")
   })
@@ -371,11 +547,14 @@ describe("checkUserOperation — inner calls", () => {
   })
 
   it("the delegation-clearing case is off by default and exact even when enabled", async () => {
-    const sender = randomAddress()
+    const sender = TEST_SIGNER.address
+    // A REAL zero-address authorization signed by the sender — clearing takes the sender's
+    // signature just like every other delegation does now.
+    const zeroAuth = await TEST_SIGNER.signAuthorization({ contractAddress: ZERO, chainId: 10143, nonce: 0 })
     const clearing = validUserOp({
       sender,
       callData: executeCall(sender, 0n, "0x"),
-      eip7702Auth: validAuth({ address: ZERO }),
+      eip7702Auth: zeroAuth,
       // The clearing call buys no function — its ceiling is the per-call overhead alone, 60,000.
       callGasLimit: "0xea60",
     })
@@ -384,14 +563,25 @@ describe("checkUserOperation — inner calls", () => {
     // Default: off. The exact clearing shape is refused until the endpoint opts in.
     expect(await refused(clearing)).toBe("auth")
     // Enabled: the exact shape passes — and still bills only the 60,000 overhead.
-    expect(await checkUserOperation(clearing, clearingOn, neverCalled)).toBeNull()
-    expect((await checkUserOperation(validUserOp({ ...clearing, callGasLimit: "0xea61" }), clearingOn, neverCalled))?.rule).toBe("gas")
+    expect(await checkUserOperation(clearing, clearingOn, delegated())).toBeNull()
+    expect((await checkUserOperation(validUserOp({ ...clearing, callGasLimit: "0xea61" }), clearingOn, delegated()))?.rule).toBe("gas")
 
     // Enabled or not, a zero-address authorization never accompanies an ordinary Mida call —
     // today it would clear the delegation and the calls would still fail on chain at our expense.
     for (const env of [policyEnv, clearingOn]) {
       expect(
-        await refused(validUserOp({ sender, eip7702Auth: validAuth({ address: ZERO }) }), neverCalled, env),
+        await refused(validUserOp({ sender, eip7702Auth: zeroAuth }), emptyCode, env),
+      ).toBe("auth")
+    }
+
+    // And unsigned it never reaches the clearing check at all — the signature check refuses first.
+    for (const env of [policyEnv, clearingOn]) {
+      expect(
+        await refused(
+          validUserOp({ sender, callData: executeCall(sender, 0n, "0x"), eip7702Auth: validAuth({ address: ZERO }), callGasLimit: "0xea60" }),
+          emptyCode,
+          env,
+        ),
       ).toBe("auth")
     }
 
@@ -404,10 +594,10 @@ describe("checkUserOperation — inner calls", () => {
           validUserOp({
             sender,
             callData: batchCall([{ target: sender, value: 0n, data: "0x" as Hex }]),
-            eip7702Auth: validAuth({ address: ZERO }),
+            eip7702Auth: zeroAuth,
             callGasLimit: "0xea60",
           }),
-          neverCalled,
+          emptyCode,
           env,
         ),
       ).toBe("auth")
@@ -416,8 +606,8 @@ describe("checkUserOperation — inner calls", () => {
     for (const env of [policyEnv, clearingOn]) {
       expect(
         await refused(
-          validUserOp({ sender, callData: executeCall(sender, 0n, midaCallData()), eip7702Auth: validAuth({ address: ZERO }) }),
-          neverCalled,
+          validUserOp({ sender, callData: executeCall(sender, 0n, midaCallData()), eip7702Auth: zeroAuth }),
+          emptyCode,
           env,
         ),
       ).toBe("auth")
@@ -426,7 +616,7 @@ describe("checkUserOperation — inner calls", () => {
 
   it("garbage callData is a refusal, never a throw", async () => {
     for (const callData of ["0x", "0x1234", "0xb61d27f6", `0xb61d27f6${"ab".repeat(10)}`, "not-hex", 42, null]) {
-      const refusal = await checkUserOperation(validUserOp({ callData }), policyEnv, neverCalled)
+      const refusal = await checkUserOperation(validUserOp({ callData }), policyEnv, emptyCode)
       expect(refusal).not.toBeNull()
       expect(refusal!.rule).toBe("calldata")
     }

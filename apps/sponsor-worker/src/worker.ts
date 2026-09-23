@@ -1,4 +1,4 @@
-import { consumeFreeCalls, consumeSignBudget, recordIssued, refundSignBudget, utcDay, wasIssued } from "./budget.js"
+import { consumeFreeCalls, consumeSignBudget, recordIssued, refundSignBudget, reserveSpend, utcDay, wasIssued } from "./budget.js"
 import type { D1Like } from "./budget.js"
 import {
   CALL_OVERHEAD_PER_CALL,
@@ -10,6 +10,7 @@ import {
   checkUserOperation,
   checkedParams,
   operationIdentity,
+  operationMaxCostWei,
 } from "./policy.js"
 import type { GasCeilings, PolicyEnv } from "./policy.js"
 import { ProviderError, alchemyProvider, httpJsonRpcProvider, pimlicoProvider } from "./provider.js"
@@ -22,9 +23,16 @@ import type { SponsorProvider } from "./provider.js"
  * msg.sender.
  */
 
+/** The slice of Cloudflare's [[ratelimits]] binding this Worker calls: one `limit` per request. */
+export interface RateLimitBinding {
+  limit(input: { key: string }): Promise<{ success: boolean }>
+}
+
 export interface SponsorEnv {
   /** D1 binding for the daily budget counters. */
   DB: D1Like
+  /** [[ratelimits]] binding — one token per JSON-RPC request, keyed on the caller IP. Absent locally means no limit. */
+  LIMITER_RPC?: RateLimitBinding
   /**
    * Browser origins allowed to call this endpoint (comma-separated). The CLI is not a browser and
    * sends no Origin; the owner page at app.midacontext.xyz is, and Safari reports a blocked
@@ -55,6 +63,11 @@ export interface SponsorEnv {
   GLOBAL_DAILY_LIMIT?: string
   /** Daily allowance for the unsigned methods (stub data, gas estimation) — 120 by default. */
   FREE_PER_SENDER_DAILY_LIMIT?: string
+  /**
+   * The most sponsorship the endpoint spends per UTC day, as a decimal wei string — each signing
+   * reserves its worst-case cost (gas limits × maxFeePerGas) against it. Default 25 MON.
+   */
+  DAILY_WEI_BUDGET?: string
   /**
    * Optional tighter values for the fixed gas ceilings, in wei (decimal or 0x-prefixed). Each may
    * only LOWER its built-in — a value above it is ignored and logged, never applied.
@@ -96,6 +109,10 @@ interface SponsorConfig {
   perSenderDailyLimit: number
   globalDailyLimit: number
   freePerSenderDailyLimit: number
+  /** The UTC-day spend ceiling in wei — reserved per signing against the `spend` D1 table. */
+  dailyWeiBudget: bigint
+  /** The live `fast` gas price in wei — one provider call, cached 30 s per Worker instance. */
+  gasPrice(): Promise<bigint>
   /** The log body — everything the worker may print, already reduced to non-secret fields. */
   log(method: string, refused: string | undefined, sender: string | undefined, ms: number): void
   /**
@@ -137,6 +154,43 @@ function parseLimit(value: string | undefined, fallback: number, name: string): 
   const n = Number(value)
   if (!Number.isInteger(n) || n <= 0) throw new Error(`${name} must be a positive integer`)
   return n
+}
+
+/** A decimal wei string — bigger than Number can hold, so it goes straight to BigInt. */
+function parseWeiBudget(value: string | undefined, fallback: bigint, name: string): bigint {
+  if (value === undefined || value === "") return fallback
+  if (!/^[0-9]+$/.test(value)) throw new Error(`${name} must be a non-negative decimal wei amount`)
+  return BigInt(value)
+}
+
+/** A quantity out of a provider answer — hex or decimal string, number, or bigint; undefined if unrecognisable. */
+function weiQuantity(value: unknown): bigint | undefined {
+  if (typeof value === "bigint") return value >= 0n ? value : undefined
+  if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : undefined
+  if (typeof value === "string") {
+    if (/^0x[0-9a-fA-F]+$/.test(value)) return BigInt(value)
+    if (/^[0-9]+$/.test(value)) return BigInt(value)
+  }
+  return undefined
+}
+
+/**
+ * The provider's live `fast` gas price. The answer is usually a plain wei quantity per tier, but
+ * some versions nest {maxFeePerGas, maxPriorityFeePerGas} — take maxFeePerGas there, falling back
+ * to the priority fee. An unrecognisable shape throws: the fee cap fails closed, never open.
+ */
+async function fetchLiveGasPrice(provider: SponsorProvider): Promise<bigint> {
+  const result = await provider.forward("pimlico_getUserOperationGasPrice", [])
+  const fast = typeof result === "object" && result !== null ? (result as Record<string, unknown>).fast : undefined
+  const raw =
+    typeof fast === "object" && fast !== null
+      ? ((fast as Record<string, unknown>).maxFeePerGas ?? (fast as Record<string, unknown>).maxPriorityFeePerGas)
+      : fast
+  const price = weiQuantity(raw)
+  if (price === undefined) {
+    throw new Error("pimlico_getUserOperationGasPrice returned no usable fast price")
+  }
+  return price
 }
 
 /**
@@ -195,6 +249,21 @@ export function buildWorker(env: SponsorEnv): SponsorConfig {
       .map((raw) => parseAddress(raw.trim(), "ALLOWED_IMPLEMENTATIONS")),
   )
 
+  // One live-price read per request at most, and one per 30 s per Worker instance — the price
+  // read is itself a provider call, so caching is also a cost bound. A failed read is dropped
+  // from the cache so the next request retries instead of pinning the outage.
+  let priceCache: { at: number; promise: Promise<bigint> } | undefined
+  const gasPrice = (): Promise<bigint> => {
+    const now = Date.now()
+    if (priceCache !== undefined && now - priceCache.at < 30_000) return priceCache.promise
+    const entry = { at: now, promise: fetchLiveGasPrice(provider) }
+    priceCache = entry
+    entry.promise.catch(() => {
+      if (priceCache === entry) priceCache = undefined
+    })
+    return entry.promise
+  }
+
   const config: SponsorConfig = {
     provider,
     policy: {
@@ -209,6 +278,8 @@ export function buildWorker(env: SponsorEnv): SponsorConfig {
     perSenderDailyLimit: parseLimit(env.PER_SENDER_DAILY_LIMIT, 30, "PER_SENDER_DAILY_LIMIT"),
     globalDailyLimit: parseLimit(env.GLOBAL_DAILY_LIMIT, 2000, "GLOBAL_DAILY_LIMIT"),
     freePerSenderDailyLimit: parseLimit(env.FREE_PER_SENDER_DAILY_LIMIT, 120, "FREE_PER_SENDER_DAILY_LIMIT"),
+    dailyWeiBudget: parseWeiBudget(env.DAILY_WEI_BUDGET, 25_000_000_000_000_000_000n, "DAILY_WEI_BUDGET"),
+    gasPrice,
     log(method, refused, sender, ms) {
       // method, refusal rule, first 10 chars of the sender, milliseconds — never a body, a key,
       // a policy id, a private key, or a full address or hash.
@@ -273,9 +344,10 @@ function infoResponse(config: SponsorConfig): Response {
       verificationGasLimit: config.policy.ceilings.verificationGas.toString(),
       preVerificationGas: config.policy.ceilings.preVerificationGas.toString(),
       paymasterGas: config.policy.ceilings.paymasterGas.toString(),
-      maxFee: config.policy.ceilings.fee.toString(),
+      maxFee: `${config.policy.ceilings.fee} — and never over 1.5x the live fast gas price`,
       signingsPerSenderPerDay: config.perSenderDailyLimit,
       signingsGlobalPerDay: config.globalDailyLimit,
+      dailyWeiBudget: config.dailyWeiBudget.toString(),
       freeCallsPerSenderPerDay: config.freePerSenderDailyLimit,
     },
     policy: {
@@ -318,6 +390,22 @@ function jsonRpcError(id: unknown, code: number, message: string): Response {
 }
 
 async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Request): Promise<Response> {
+  // The per-IP budget is charged before anything else — every JSON-RPC method, including the
+  // unmetered pass-throughs, costs the provider a request. An absent binding limits nothing,
+  // which is what local dev and the test deployment want.
+  if (env.LIMITER_RPC !== undefined) {
+    const ip = request.headers.get("cf-connecting-ip") ?? "unknown"
+    if (!(await env.LIMITER_RPC.limit({ key: ip })).success) {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: REFUSED, message: "too many requests from this address — try again in a minute" },
+        }),
+        { status: 429, headers: { "content-type": "application/json", "retry-after": "60" } },
+      )
+    }
+  }
   let body: unknown
   try {
     body = await request.json()
@@ -342,9 +430,17 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
       const checked = checkedParams(method, params, config.policy, config.provider.policyContext(required(env, "POLICY_ID")))
       op = checked[0] as Record<string, unknown>
       sender = typeof op.sender === "string" ? op.sender.toLowerCase() : undefined
-      const refusal = await checkUserOperation(op, config.policy, {
-        getCode: (address) => rpcGetCode(env.RPC_URL, address),
-      })
+      const refusal = await checkUserOperation(
+        op,
+        config.policy,
+        {
+          getCode: (address) => rpcGetCode(env.RPC_URL, address),
+          gasPrice: config.gasPrice,
+        },
+        // The sign and send paths commit money — every gas field must be present so no ceiling
+        // or spend reservation can be skipped. Stub and estimate keep tolerating partial ops.
+        { requireGasFields: method === "pm_getPaymasterData" || method === "eth_sendUserOperation" },
+      )
       if (refusal) {
         config.log(method, refusal.rule, sender, Date.now() - started)
         return jsonRpcError(id ?? null, REFUSED, refusal.message)
@@ -373,18 +469,28 @@ async function handleJsonRpc(env: SponsorEnv, config: SponsorConfig, request: Re
             : "refused: the sponsor's daily budget is exhausted — pay gas yourself or try tomorrow",
         )
       }
+      // The count budgets alone could not stop a few ops billing huge gas at huge fees — the
+      // signing also reserves its worst-case cost in wei against the daily spend table. A
+      // refused reservation changes nothing: the count ticks stay (an attempt did happen) and
+      // the spend row is untouched.
+      const cost = operationMaxCostWei(op!)
+      const spend = await reserveSpend(env.DB, { day, wei: cost, budget: config.dailyWeiBudget })
+      if (!spend.allowed) {
+        config.log(method, "budget-wei", sender, Date.now() - started)
+        return jsonRpcError(id ?? null, REFUSED, "refused: the sponsor's daily budget is spent — your wallet can pay instead")
+      }
       let result: unknown
       try {
         result = await config.provider.forward(method, outParams)
       } catch (e) {
-        await refundSignBudget(env.DB, { day, sender: sender! })
+        await refundSignBudget(env.DB, { day, sender: sender!, wei: cost })
         throw e
       }
       // An error-shaped result means no signature exists either — refund exactly like a throw,
       // and answer the client with the scrubbed error, never the provider's raw body.
       const resultError = errorInside(result)
       if (resultError !== null) {
-        await refundSignBudget(env.DB, { day, sender: sender! })
+        await refundSignBudget(env.DB, { day, sender: sender!, wei: cost })
         config.diagnose(method, sender, op, resultError)
         config.log(method, `provider-${resultError.code}`, sender, Date.now() - started)
         return jsonRpcError(id ?? null, resultError.code, scrub(resultError.message, config.secrets))

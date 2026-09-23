@@ -18,9 +18,12 @@ import { fileURLToPath } from "node:url"
 import { build } from "esbuild"
 import { Miniflare } from "miniflare"
 import type { Hex } from "viem"
+import { privateKeyToAccount } from "viem/accounts"
 import type { D1Like } from "../src/budget.js"
-import { operationIdentity } from "../src/policy.js"
-import { DEFAULT_ALLOWED_ORIGINS, allowedOrigins, resolveGasCeilings, withCors } from "../src/worker.js"
+import { reserveSpend } from "../src/budget.js"
+import { operationIdentity, operationMaxCostWei } from "../src/policy.js"
+import { DEFAULT_ALLOWED_ORIGINS, allowedOrigins, handleFetch, resolveGasCeilings, withCors } from "../src/worker.js"
+import type { SponsorEnv } from "../src/worker.js"
 import {
   CAP,
   CHAIN_ID,
@@ -33,10 +36,13 @@ import {
   batchCall,
   executeCall,
   midaCallData,
+  opSignedBy,
   randomAddress,
+  randomKey,
   runtimeWrapped,
   validAuth,
   validUserOp,
+  wireAuth,
 } from "./helpers.js"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -52,13 +58,16 @@ interface RecordedCall {
 async function startFakeProvider(): Promise<{
   url: string
   calls: RecordedCall[]
-  failNext(error: { code: number; message: string; data?: unknown }): void
+  /** Fail the next call — or the next call to `only`, since the worker's own gas-price read can consume an untargeted failure. */
+  failNext(error: { code: number; message: string; data?: unknown }, only?: string): void
   /** Answer with the error nested inside `result` — the provider resolves instead of throwing. */
-  failNextAsResult(error: { code: number; message: string; data?: unknown }): void
+  failNextAsResult(error: { code: number; message: string; data?: unknown }, only?: string): void
+  /** Re-listen on the same port after close() — the worker's bound URL stays valid. */
+  reopen(): Promise<void>
   close(): Promise<void>
 }> {
   const calls: RecordedCall[] = []
-  let failure: { code: number; message: string; data?: unknown; insideResult?: boolean } | null = null
+  let failure: { code: number; message: string; data?: unknown; insideResult?: boolean; only?: string } | null = null
   const server: Server = createServer((req, res) => {
     let raw = ""
     req.on("data", (chunk: Buffer) => (raw += chunk.toString()))
@@ -66,7 +75,7 @@ async function startFakeProvider(): Promise<{
       const { id, method, params } = JSON.parse(raw) as { id: number; method: string; params: unknown }
       calls.push({ method, params })
       res.setHeader("content-type", "application/json")
-      if (failure) {
+      if (failure && (failure.only === undefined || failure.only === method)) {
         const { code, message, data, insideResult } = failure
         failure = null
         const error = { code, message, ...(data === undefined ? {} : { data }) }
@@ -90,8 +99,10 @@ async function startFakeProvider(): Promise<{
         case "eth_supportedEntryPoints":
           return res.end(JSON.stringify({ jsonrpc: "2.0", id, result: [ENTRY_POINT] }))
         case "pimlico_getUserOperationGasPrice":
+          // A realistic fast tier — 100 gwei — so the 1.5× live-price cap sits at 150 gwei,
+          // under the 300-gwei fixed ceiling and far above the ops' tiny default fees.
           return res.end(
-            JSON.stringify({ jsonrpc: "2.0", id, result: { slow: "0x1", standard: "0x1", fast: "0x2" } }),
+            JSON.stringify({ jsonrpc: "2.0", id, result: { slow: "0x1", standard: "0x1", fast: "0x174876e800" } }),
           )
         default:
           return res.end(JSON.stringify({ jsonrpc: "2.0", id, result: null }))
@@ -103,12 +114,13 @@ async function startFakeProvider(): Promise<{
   return {
     url: `http://127.0.0.1:${port}/${PROVIDER_KEY_HINT}`,
     calls,
-    failNext(error) {
-      failure = error
+    failNext(error, only) {
+      failure = { ...error, only }
     },
-    failNextAsResult(error) {
-      failure = { ...error, insideResult: true }
+    failNextAsResult(error, only) {
+      failure = { ...error, insideResult: true, only }
     },
+    reopen: () => new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve)),
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }
 }
@@ -201,6 +213,9 @@ beforeAll(async () => {
       PER_SENDER_DAILY_LIMIT: "30",
       GLOBAL_DAILY_LIMIT: "2000",
       FREE_PER_SENDER_DAILY_LIMIT: "120",
+      // 1e12 wei — orders of magnitude below the 25-MON default so the whole suite's signings
+      // fit, and still large enough that the budget tests can park the counter at its edge.
+      DAILY_WEI_BUDGET: "1000000000000000000",
     },
   })
   db = (await mf.getD1Database("DB")) as unknown as D1Like
@@ -225,6 +240,14 @@ interface RpcReply {
   result?: unknown
   error?: { code: number; message: string }
 }
+
+/**
+ * Provider calls that forward client work — everything except the internal
+ * `pimlico_getUserOperationGasPrice` the policy itself makes to price the fee cap. A refusal
+ * must produce none of these; whether it also triggered the price read depends on the 30 s
+ * cache, so counting it would make the tests timing-dependent.
+ */
+const forwarded = () => provider.calls.filter((call) => call.method !== "pimlico_getUserOperationGasPrice")
 
 async function rpc(method: string, params?: unknown): Promise<RpcReply> {
   const res = await mf.dispatchFetch("http://worker.test/", {
@@ -299,8 +322,8 @@ describe("HTTP and envelope behaviour", () => {
 
 describe("the happy path — a valid Mida operation is paid for", () => {
   it("signs then forwards a valid eth_sendUserOperation; the sender is the user's own address", async () => {
-    const sender = randomAddress()
-    const op = validUserOp({ sender })
+    const op = await opSignedBy(randomKey())
+    const sender = op.sender as string
     const reply = await signAndSend(op)
     expect(reply.error).toBeUndefined()
     expect(reply.result).toBe(`0x${"aa".repeat(32)}`)
@@ -389,13 +412,22 @@ describe("policy refusals arrive as JSON-RPC errors, not 500s and not forwards",
   })
 
   it("a delegation-clearing operation is refused — clearing is off by default", async () => {
-    const sender = randomAddress()
+    const key = randomKey()
+    const signer = privateKeyToAccount(key)
+    // A REAL zero-address authorization signed by the sender — the refusal must come from the
+    // clearing rule itself, not from the new signature check.
+    const zeroAuth = wireAuth(
+      (await signer.signAuthorization({ contractAddress: ZERO, chainId: 10143, nonce: 0 })) as unknown as Record<
+        string,
+        unknown
+      >,
+    )
     const before = provider.calls.length
     const reply = await signOp(
       validUserOp({
-        sender,
-        callData: executeCall(sender, 0n, "0x"),
-        eip7702Auth: validAuth({ address: ZERO }),
+        sender: signer.address,
+        callData: executeCall(signer.address, 0n, "0x"),
+        eip7702Auth: zeroAuth,
         callGasLimit: "0xea60",
       }),
     )
@@ -420,11 +452,12 @@ describe("policy refusals arrive as JSON-RPC errors, not 500s and not forwards",
 
 describe("daily budgets are spent at signing, atomically in D1", () => {
   it("a signing consumes one tick of the sender budget and one of the global budget", async () => {
-    const sender = randomAddress()
+    const op = await opSignedBy(randomKey())
+    const sender = op.sender as string
     const globalBefore =
       (await db.prepare("SELECT count FROM sponsor_global_signings WHERE day = ?").bind(today()).first<{ count: number }>())
         ?.count ?? 0
-    const reply = await signOp(validUserOp({ sender }))
+    const reply = await signOp(op)
     expect(reply.error).toBeUndefined()
     const providerCall = provider.calls.at(-1)!
     expect(providerCall.method).toBe("pm_getPaymasterData")
@@ -443,12 +476,13 @@ describe("daily budgets are spent at signing, atomically in D1", () => {
   })
 
   it("a provider error refunds both counters — a signature that was never produced never spent", async () => {
-    const sender = randomAddress()
+    const op = await opSignedBy(randomKey())
+    const sender = op.sender as string
     const globalBefore =
       (await db.prepare("SELECT count FROM sponsor_global_signings WHERE day = ?").bind(today()).first<{ count: number }>())
         ?.count ?? 0
-    provider.failNext({ code: -32001, message: "paymaster rejected the operation" })
-    const reply = await signOp(validUserOp({ sender }))
+    provider.failNext({ code: -32001, message: "paymaster rejected the operation" }, "pm_getPaymasterData")
+    const reply = await signOp(op)
     expect(reply.error?.code).toBe(-32001)
     const senderRow = await db
       .prepare("SELECT count FROM sponsor_sender_signings WHERE day = ? AND sender = ?")
@@ -463,15 +497,19 @@ describe("daily budgets are spent at signing, atomically in D1", () => {
   })
 
   it("an error inside the RESULT refunds too — a provider that resolves instead of throwing spent nothing", async () => {
-    const sender = randomAddress()
+    const op = await opSignedBy(randomKey())
+    const sender = op.sender as string
     const globalBefore =
       (await db.prepare("SELECT count FROM sponsor_global_signings WHERE day = ?").bind(today()).first<{ count: number }>())
         ?.count ?? 0
-    provider.failNextAsResult({
-      code: -32077,
-      message: `paymaster refused — upstream ${provider.url} policy ${POLICY_ID} invalid`,
-    })
-    const reply = await signOp(validUserOp({ sender }))
+    provider.failNextAsResult(
+      {
+        code: -32077,
+        message: `paymaster refused — upstream ${provider.url} policy ${POLICY_ID} invalid`,
+      },
+      "pm_getPaymasterData",
+    )
+    const reply = await signOp(op)
     // The client gets a safe error — never the provider's raw body.
     expect(reply.error?.code).toBe(-32077)
     expect(reply.error?.message).not.toContain(PROVIDER_KEY_HINT)
@@ -496,30 +534,32 @@ describe("daily budgets are spent at signing, atomically in D1", () => {
   })
 
   it("the 31st signing of the day refuses with the plain budget message and zero provider calls", async () => {
-    const sender = randomAddress()
+    const op = await opSignedBy(randomKey())
+    const sender = op.sender as string
     await db
       .prepare("INSERT INTO sponsor_sender_signings (day, sender, count) VALUES (?, ?, ?)")
       .bind(today(), sender.toLowerCase(), 30)
       .run()
-    const before = provider.calls.length
-    const reply = await signOp(validUserOp({ sender }))
+    const before = forwarded().length
+    const reply = await signOp(op)
     expect(reply.error?.code).toBe(-32000)
     expect(reply.error?.message).toMatch(/30 sponsored signings/)
-    expect(provider.calls.length).toBe(before)
+    expect(forwarded().length).toBe(before)
   })
 
   it("two concurrent signings at count 29 — exactly one is signed", async () => {
-    const sender = randomAddress()
+    const op = await opSignedBy(randomKey())
+    const sender = op.sender as string
     await db
       .prepare("INSERT INTO sponsor_sender_signings (day, sender, count) VALUES (?, ?, ?)")
       .bind(today(), sender.toLowerCase(), 29)
       .run()
-    const before = provider.calls.length
-    const [a, b] = await Promise.all([signOp(validUserOp({ sender })), signOp(validUserOp({ sender }))])
+    const before = forwarded().length
+    const [a, b] = await Promise.all([signOp(op), signOp(op)])
     const succeeded = [a, b].filter((reply) => reply.error === undefined)
     expect(succeeded).toHaveLength(1)
     // The loser never reached the provider — the budget refused it first.
-    expect(provider.calls.length).toBe(before + 1)
+    expect(forwarded().length).toBe(before + 1)
     const row = await db
       .prepare("SELECT count FROM sponsor_sender_signings WHERE day = ? AND sender = ?")
       .bind(today(), sender.toLowerCase())
@@ -538,12 +578,13 @@ describe("daily budgets are spent at signing, atomically in D1", () => {
   })
 
   it("refused signings still tick the sender counter — honest accounting of attempts", async () => {
-    const sender = randomAddress()
+    const op = await opSignedBy(randomKey())
+    const sender = op.sender as string
     await db
       .prepare("INSERT INTO sponsor_sender_signings (day, sender, count) VALUES (?, ?, ?)")
       .bind(today(), sender.toLowerCase(), 30)
       .run()
-    await signOp(validUserOp({ sender }))
+    await signOp(op)
     const row = await db
       .prepare("SELECT count FROM sponsor_sender_signings WHERE day = ? AND sender = ?")
       .bind(today(), sender.toLowerCase())
@@ -554,17 +595,24 @@ describe("daily budgets are spent at signing, atomically in D1", () => {
 
 describe("eth_sendUserOperation only sends what this endpoint signed today", () => {
   it("a send with no prior signing is refused before the provider is called", async () => {
-    const before = provider.calls.length
-    const reply = await sendOp(validUserOp())
+    const before = forwarded().length
+    // A fresh sender: its (sender, nonce, callData) tuple can never collide with an earlier
+    // test's signing the way the shared TEST_SIGNER fixture does.
+    const reply = await sendOp(await opSignedBy(randomKey()))
     expect(reply.error?.code).toBe(-32000)
     expect(reply.error?.message).toMatch(/did not sign|pm_getPaymasterData/)
-    expect(provider.calls.length).toBe(before)
+    expect(forwarded().length).toBe(before)
   })
 
   it("signing one operation does not unlock a different one — the tuple binds sender, nonce and callData", async () => {
-    const sender = randomAddress()
-    expect((await signOp(validUserOp({ sender }))).error).toBeUndefined()
-    const other = validUserOp({ sender, callData: executeCall(CTX, 0n, midaCallData("register")) })
+    const op = await opSignedBy(randomKey())
+    expect((await signOp(op)).error).toBeUndefined()
+    // Same sender, same valid authorization — different callData is a different operation.
+    const other = validUserOp({
+      sender: op.sender,
+      eip7702Auth: op.eip7702Auth,
+      callData: executeCall(CTX, 0n, midaCallData("register")),
+    })
     const reply = await sendOp(other)
     expect(reply.error?.code).toBe(-32000)
     expect(reply.error?.message).toMatch(/did not sign|pm_getPaymasterData/)
@@ -579,7 +627,8 @@ describe("eth_sendUserOperation only sends what this endpoint signed today", () 
   })
 
   it("a send signed at 23:59:59 UTC is still accepted at 00:00:01 — yesterday's record counts", async () => {
-    const op = validUserOp()
+    // Fresh sender — only the yesterday row can unlock this send, not an earlier test's signing.
+    const op = await opSignedBy(randomKey())
     const identity = operationIdentity(op)
     // The signing is recorded under its own UTC day, so a signing that landed just before
     // midnight leaves its row under yesterday — the send that follows must still find it.
@@ -594,7 +643,7 @@ describe("eth_sendUserOperation only sends what this endpoint signed today", () 
   })
 
   it("a signing from the day before yesterday does NOT unlock a send — the window stays one day back", async () => {
-    const op = validUserOp()
+    const op = await opSignedBy(randomKey())
     const identity = operationIdentity(op)
     const twoDaysAgo = new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10)
     await db
@@ -609,9 +658,10 @@ describe("eth_sendUserOperation only sends what this endpoint signed today", () 
 
 describe("the stub and estimate methods are free of the signing budget but rate-limited", () => {
   it("pm_getPaymasterStubData and eth_estimateUserOperationGas never tick a signing counter", async () => {
-    const sender = randomAddress()
-    expect((await stubOp(validUserOp({ sender }))).error).toBeUndefined()
-    expect((await rpc("eth_estimateUserOperationGas", [validUserOp({ sender }), ENTRY_POINT])).error).toBeUndefined()
+    const op = await opSignedBy(randomKey())
+    const sender = op.sender as string
+    expect((await stubOp(op)).error).toBeUndefined()
+    expect((await rpc("eth_estimateUserOperationGas", [op, ENTRY_POINT])).error).toBeUndefined()
     const row = await db
       .prepare("SELECT count FROM sponsor_sender_signings WHERE day = ? AND sender = ?")
       .bind(today(), sender.toLowerCase())
@@ -625,18 +675,19 @@ describe("the stub and estimate methods are free of the signing budget but rate-
   })
 
   it("the 121st free call of the day refuses before the provider is called", async () => {
-    const sender = randomAddress()
+    const op = await opSignedBy(randomKey())
+    const sender = op.sender as string
     await db
       .prepare("INSERT INTO sponsor_free_calls (day, sender, count) VALUES (?, ?, ?)")
       .bind(today(), sender.toLowerCase(), 120)
       .run()
-    const before = provider.calls.length
-    const reply = await stubOp(validUserOp({ sender }))
+    const before = forwarded().length
+    const reply = await stubOp(op)
     expect(reply.error?.code).toBe(-32000)
     expect(reply.error?.message).toMatch(/120 free calls/)
-    const estimate = await rpc("eth_estimateUserOperationGas", [validUserOp({ sender }), ENTRY_POINT])
+    const estimate = await rpc("eth_estimateUserOperationGas", [op, ENTRY_POINT])
     expect(estimate.error?.code).toBe(-32000)
-    expect(provider.calls.length).toBe(before)
+    expect(forwarded().length).toBe(before)
   })
 })
 
@@ -644,10 +695,13 @@ describe("provider failures never leak", () => {
   it("a provider error body that echoes secrets is scrubbed before the client sees it", async () => {
     const op = validUserOp()
     expect((await signOp(op)).error).toBeUndefined()
-    provider.failNext({
-      code: -32099,
-      message: `upstream rejected: key ${provider.url} policy ${POLICY_ID} rpc ${chain.url} invalid`,
-    })
+    provider.failNext(
+      {
+        code: -32099,
+        message: `upstream rejected: key ${provider.url} policy ${POLICY_ID} rpc ${chain.url} invalid`,
+      },
+      "eth_sendUserOperation",
+    )
     const reply = await sendOp(op)
     expect(reply.error?.code).toBe(-32099)
     expect(reply.error?.message).not.toContain(POLICY_ID)
@@ -662,11 +716,14 @@ describe("provider failures never leak", () => {
   // Worker logs — while the client answer stays exactly as scrubbed as before.
   it("the provider's refusal is LOGGED with its full error and the op's gas fields — the client still gets only the scrubbed message", async () => {
     const op = validUserOp()
-    provider.failNext({
-      code: -32602,
-      message: "Missing or invalid parameters.",
-      data: { argument: "paymasterContext", detail: "field not accepted" },
-    })
+    provider.failNext(
+      {
+        code: -32602,
+        message: "Missing or invalid parameters.",
+        data: { argument: "paymasterContext", detail: "field not accepted" },
+      },
+      "pm_getPaymasterData",
+    )
     const reply = await signOp(op)
     // Client side: the provider's `data` never leaves the Worker.
     expect(reply.error?.code).toBe(-32602)
@@ -678,11 +735,12 @@ describe("provider failures never leak", () => {
       (r) =>
         "providerError" in r &&
         r.method === "pm_getPaymasterData" &&
-        r.sender === (op.sender as string).slice(0, 10),
+        (r.providerError as { code?: number }).code === -32602 &&
+        r.sender === (op.sender as string).toLowerCase().slice(0, 10),
     )
     expect(record).toBeDefined()
     expect(record!.method).toBe("pm_getPaymasterData")
-    expect(record!.sender).toBe((op.sender as string).slice(0, 10))
+    expect(record!.sender).toBe((op.sender as string).toLowerCase().slice(0, 10))
     expect(record!.providerError).toMatchObject({
       code: -32602,
       message: "Missing or invalid parameters.",
@@ -703,14 +761,18 @@ describe("provider failures never leak", () => {
 
   it("a provider error smuggled inside `result` is diagnosed the same way", async () => {
     const op = validUserOp()
-    provider.failNextAsResult({ code: -32077, message: "paymaster refused upstream", data: { upstream: "429 too many requests" } })
+    provider.failNextAsResult(
+      { code: -32077, message: "paymaster refused upstream", data: { upstream: "429 too many requests" } },
+      "pm_getPaymasterData",
+    )
     const reply = await signOp(op)
     expect(reply.error?.code).toBe(-32077)
     const record = await findWorkerRecord(
       (r) =>
         "providerError" in r &&
         r.method === "pm_getPaymasterData" &&
-        r.sender === (op.sender as string).slice(0, 10),
+        (r.providerError as { code?: number }).code === -32077 &&
+        r.sender === (op.sender as string).toLowerCase().slice(0, 10),
     )
     expect(record).toBeDefined()
     expect(record!.providerError).toMatchObject({ code: -32077, message: "paymaster refused upstream", data: { upstream: "429 too many requests" } })
@@ -724,7 +786,9 @@ describe("provider failures never leak", () => {
     const reply = await sendOp(op)
     expect(reply.error).toBeDefined()
     expect(reply.error!.code).toBeLessThanOrEqual(-32000)
-    provider = await startFakeProvider()
+    // Re-listen on the SAME port: the worker's bound PROVIDER_URL must keep working for the
+    // tests that follow — a fresh server would move to a port the worker cannot reach.
+    await provider.reopen()
   })
 })
 
@@ -795,5 +859,144 @@ describe("browser origins (CORS) — the owner page is a browser, the CLI is not
 
     const cli = withCors(Response.json({ ok: true }), req(undefined), {})
     expect(cli.headers.get("access-control-allow-origin")).toBeNull()
+  })
+})
+
+describe("the daily wei budget reserves each signing's worst-case cost", () => {
+  const BUDGET = 1_000_000_000_000_000_000n // DAILY_WEI_BUDGET bound into the test worker
+
+  it("the crossing operation is refused — the stored total does not move, the provider never sees it", async () => {
+    const op = await opSignedBy(randomKey())
+    const cost = operationMaxCostWei(op)
+    const prior = (await db.prepare("SELECT wei FROM spend WHERE day = ?").bind(today()).first<{ wei: string }>())?.wei ?? "0"
+    // Park the day exactly one op-cost under the budget: the next op must fit, the one after must not.
+    await db.prepare("INSERT OR REPLACE INTO spend (day, wei) VALUES (?, ?)").bind(today(), (BUDGET - cost).toString()).run()
+
+    try {
+      const before = forwarded().length
+      expect((await signOp(op)).error).toBeUndefined()
+      let row = await db.prepare("SELECT wei FROM spend WHERE day = ?").bind(today()).first<{ wei: string }>()
+      expect(row?.wei).toBe(BUDGET.toString())
+
+      const refused = await signOp(await opSignedBy(randomKey()))
+      expect(refused.error?.code).toBe(-32000)
+      expect(refused.error?.message).toMatch(/daily budget is spent/)
+      // The refused op reserved nothing and was never forwarded — one paymaster call, not two.
+      row = await db.prepare("SELECT wei FROM spend WHERE day = ?").bind(today()).first<{ wei: string }>()
+      expect(row?.wei).toBe(BUDGET.toString())
+      expect(forwarded().length).toBe(before + 1)
+    } finally {
+      // Hand the day back to the other tests as it was found — even when an assertion failed.
+      await db.prepare("INSERT OR REPLACE INTO spend (day, wei) VALUES (?, ?)").bind(today(), prior).run()
+    }
+  })
+
+  it("a provider failure gives the reserved wei back along with the counters", async () => {
+    const op = await opSignedBy(randomKey())
+    const cost = operationMaxCostWei(op)
+    const prior = BigInt((await db.prepare("SELECT wei FROM spend WHERE day = ?").bind(today()).first<{ wei: string }>())?.wei ?? "0")
+    provider.failNext({ code: -32001, message: "paymaster rejected the operation" }, "pm_getPaymasterData")
+    const reply = await signOp(op)
+    expect(reply.error?.code).toBe(-32001)
+    const row = await db.prepare("SELECT wei FROM spend WHERE day = ?").bind(today()).first<{ wei: string }>()
+    expect(BigInt(row?.wei ?? "0")).toBe(prior)
+    expect(cost).toBeGreaterThan(0n)
+  })
+
+  it("reserveSpend treats a missing row as zero and a refused reservation changes nothing", async () => {
+    const day = "2001-01-01" // a UTC day no other test touches — its first row starts at zero
+    expect(await reserveSpend(db, { day, wei: 6n, budget: 10n })).toEqual({ allowed: true, spent: 6n })
+    const crossing = await reserveSpend(db, { day, wei: 5n, budget: 10n })
+    expect(crossing.allowed).toBe(false)
+    const row = await db.prepare("SELECT wei FROM spend WHERE day = ?").bind(day).first<{ wei: string }>()
+    expect(row?.wei).toBe("6")
+    // And a single op bigger than the whole budget never gets a row at all.
+    expect((await reserveSpend(db, { day: "2001-01-02", wei: 11n, budget: 10n })).allowed).toBe(false)
+    expect(await db.prepare("SELECT wei FROM spend WHERE day = ?").bind("2001-01-02").first<{ wei: string }>()).toBeNull()
+  })
+
+  it("a new UTC day starts at zero — yesterday's spend never carries over", async () => {
+    const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10)
+    await db.prepare("INSERT OR REPLACE INTO spend (day, wei) VALUES (?, ?)").bind(yesterday, BUDGET.toString()).run()
+    // Yesterday is full to the brim; today's row is untouched, so a normal op still signs.
+    expect((await signOp(await opSignedBy(randomKey()))).error).toBeUndefined()
+  })
+})
+
+describe("the fee cap tracks the live gas price", () => {
+  it("1.4x the live fast price signs; 1.6x refuses before a paymaster call", async () => {
+    // The fake provider's fast tier is 100 gwei, so the cap is 150 gwei.
+    const before = forwarded().length
+    const ok = await signOp(await opSignedBy(randomKey(), { maxFeePerGas: `0x${(140n * 10n ** 9n).toString(16)}` }))
+    expect(ok.error).toBeUndefined()
+    const over = await signOp(await opSignedBy(randomKey(), { maxFeePerGas: `0x${(160n * 10n ** 9n).toString(16)}` }))
+    expect(over.error?.code).toBe(-32000)
+    expect(over.error?.message).toMatch(/live gas price/)
+    expect(forwarded().length).toBe(before + 1)
+  })
+})
+
+describe("LIMITER_RPC — the per-IP rate limiter gates every JSON-RPC request", () => {
+  // handleFetch is invoked directly with a hand-made env: a fresh config per call, so the
+  // live-price cache starts empty and a provider failure really reaches the price read.
+  const envFor = (limiter: SponsorEnv["LIMITER_RPC"]): SponsorEnv => ({
+    DB: { prepare: () => { throw new Error("D1 must not be touched on these paths") } },
+    PROVIDER_URL: provider.url,
+    POLICY_ID,
+    RPC_URL: chain.url,
+    CHAIN_ID: CHAIN_ID.toString(10),
+    CAPABILITY_REGISTRY: CAP,
+    CONTEXT_REGISTRY: CTX,
+    ALLOWED_IMPLEMENTATIONS: IMPL,
+    LIMITER_RPC: limiter,
+  })
+  const post = (method: string, params?: unknown, ip = "203.0.113.7") =>
+    new Request("https://sponsor.test/", {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": ip },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    })
+
+  it("a denying binding answers 429 before any provider call, keyed on the client IP", async () => {
+    const seen: string[] = []
+    const env = envFor({ limit: async ({ key }) => { seen.push(key); return { success: false } } })
+    const before = provider.calls.length
+    const res = await handleFetch(post("eth_chainId"), env)
+    expect(res.status).toBe(429)
+    expect(seen).toEqual(["203.0.113.7"])
+    const body = (await res.json()) as RpcReply
+    expect(body.error).toBeDefined()
+    expect(provider.calls.length).toBe(before)
+  })
+
+  it("an absent binding limits nothing — and a failed live-price read fails the op closed", async () => {
+    // The same request shape, once through a permissive limiter and once with none at all.
+    provider.failNext({ code: -32010, message: "gas price endpoint down" }, "pimlico_getUserOperationGasPrice")
+    const env = envFor(undefined)
+    const res = await handleFetch(post("pm_getPaymasterData", [validUserOp(), ENTRY_POINT, CHAIN_ID_HEX]), env)
+    const body = (await res.json()) as RpcReply
+    expect(body.error?.code).toBe(-32000)
+    expect(body.error?.message).toMatch(/gas price could not be checked/)
+
+    const open = await handleFetch(post("eth_chainId"), env)
+    expect(open.status).toBe(200)
+    const openBody = (await open.json()) as RpcReply
+    expect(openBody.result).toBe(CHAIN_ID_HEX)
+  })
+})
+
+describe("pm_getPaymasterData and eth_sendUserOperation require every gas field", () => {
+  it("each missing gas field on pm_getPaymasterData refuses, naming the field", async () => {
+    for (const field of ["callGasLimit", "verificationGasLimit", "preVerificationGas", "maxFeePerGas", "maxPriorityFeePerGas"]) {
+      const reply = await signOp(validUserOp({ [field]: undefined }))
+      expect(reply.error?.code, field).toBe(-32000)
+      expect(reply.error?.message, field).toContain(field)
+    }
+  })
+
+  it("the same missing fields still pass on the stub and estimate methods", async () => {
+    const op = await opSignedBy(randomKey(), { verificationGasLimit: undefined, maxFeePerGas: undefined })
+    expect((await stubOp(op)).error).toBeUndefined()
+    expect((await rpc("eth_estimateUserOperationGas", [op, ENTRY_POINT])).error).toBeUndefined()
   })
 })
