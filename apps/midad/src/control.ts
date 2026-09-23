@@ -134,12 +134,27 @@ export function callDaemon(home: MidaHome, path: string, body: unknown, options:
   })
 }
 
+/** The refusal every entry point shares while `migrate/in-progress` exists. */
+export const MIGRATION_REFUSAL =
+  "a migration is in progress — run `mida migrate` to finish it or `mida migrate --undo`"
+
+/** The marker is a plain file under `migrate/` — `home.path` resolves it even before `migrate/` exists. */
+function migrationInProgress(home: MidaHome): boolean {
+  try {
+    return existsSync(home.path("migrate/in-progress"))
+  } catch {
+    return false
+  }
+}
+
 /**
  * Polls `GET /health` every 100 ms until the daemon answers or `waitMs` passes. The first failed
  * check fires `spawn()` — once per call, never more — so callers that arrive while a spawned daemon
- * is still opening its runtime just keep polling.
+ * is still opening its runtime just keep polling. A migration marker short-circuits everything:
+ * no service may start or be considered up while `migrate/in-progress` exists.
  */
 export async function ensureDaemon(home: MidaHome, spawn: () => void, options: { waitMs: number }): Promise<boolean> {
+  if (migrationInProgress(home)) return false
   const deadline = Date.now() + options.waitMs
   let spawned = false
   for (;;) {
@@ -192,6 +207,7 @@ export async function ensureCurrentDaemon(
   spawn: () => void,
   options: { waitMs: number; shutdownWaitMs?: number; self?: CodeIdentity },
 ): Promise<EnsureResult> {
+  if (migrationInProgress(home)) return { up: false, refusal: MIGRATION_REFUSAL }
   const self = options.self ?? codeIdentity()
   const probe = await callDaemon(home, "/health", undefined, { timeoutMs: Math.min(500, Math.max(1, options.waitMs)) })
   if (probe.status === 0) {

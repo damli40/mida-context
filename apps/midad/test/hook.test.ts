@@ -329,6 +329,27 @@ describe("hook-main process", () => {
     expect(jobs[0]).toMatchObject({ agent: "claude-code", sessionId: "s1", event: "Stop" })
   }, 30_000)
 
+  it("a hook during a migration enqueues the job but starts nothing (migrate B6)", () => {
+    const { dir, stdinFor } = setup()
+    const homeDir = join(dir, "hook-home")
+    const home = new MidaHome(homeDir)
+    home.writeSecretJson("migrate/in-progress", { at: "2026-09-23T12:00:00.000Z", target: "0xabc" })
+    const res = spawnSync(process.execPath, ["--import", "tsx", HOOK_MAIN, "claude-code"], {
+      input: stdinFor(),
+      env: { ...process.env, MIDA_HOME: homeDir, HOME: dir },
+      encoding: "utf8",
+      timeout: 20_000,
+      cwd: REPO_ROOT,
+    })
+    expect(res.status).toBe(0)
+    expect(res.stdout).toBe("")
+    const jobs = listJobs(new MidaHome(homeDir))
+    expect(jobs).toHaveLength(1)
+    expect(jobs[0]).toMatchObject({ agent: "claude-code", sessionId: "s1", event: "Stop" })
+    const log = readFileSync(new MidaHome(homeDir).path("logs/hook.jsonl"), "utf8")
+    expect(log).toContain("migration-in-progress")
+  }, 30_000)
+
   it("a payload over 1 MB of junk logs input-too-large, never unreadable-input", () => {
     const { dir } = setup()
     const homeDir = join(dir, "hook-home")

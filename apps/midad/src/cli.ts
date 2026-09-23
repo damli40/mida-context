@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url"
 import { createInterface } from "node:readline"
 import { decodeUint64, isMidaError, namespaceById } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
+import type { Deployment } from "@mida/chain"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { permissionNames } from "@mida/grant-advisor"
 import { callDaemon, ensureCurrentDaemon } from "./control.js"
@@ -25,6 +26,7 @@ import { siblingEntryArgs } from "./sibling.js"
 import { approve, authorNamesFor, deploymentMismatchError, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
 import { loadOwnerMode } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
+import { migrate, migrateUndo } from "./migrate.js"
 import { OwnerLinkOutcome, approvePasskey, initPasskey, revokePasskey } from "./owner-link/flows.js"
 import type { PasskeyDeps } from "./owner-link/flows.js"
 
@@ -37,17 +39,17 @@ const WITH_PROJECT = ["save-demo"]
 /** The namespaces `read --as <agent> <namespace>` may name — the same three the MCP adapter exposes. */
 const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skills", "preferences.communication"]
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent>" +
+  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | migrate [--undo]" +
   "   (tool = claude-code | codex; agent = claude-code | codex | assistant — assistant is a stand-in for any other assistant you use)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
-export const CLI_COMMANDS: readonly string[] = ["init", "remember", ...WITH_AGENT]
+export const CLI_COMMANDS: readonly string[] = ["init", "remember", "migrate", ...WITH_AGENT]
 /**
  * The commands that change who has access. Only `mida` in the owner's own terminal may run them —
  * they open the owner runtime in-process and are never sent to the daemon socket.
  */
-export const OWNER_COMMANDS: readonly string[] = ["init", "approve", "revoke", "remember"]
+export const OWNER_COMMANDS: readonly string[] = ["init", "approve", "revoke", "remember", "migrate"]
 /** The owner commands that must see a real terminal. `init` is exempt: it grants nothing to an agent. */
-const TERMINAL_COMMANDS: readonly string[] = ["approve", "revoke", "remember"]
+const TERMINAL_COMMANDS: readonly string[] = ["approve", "revoke", "remember", "migrate"]
 export const NEEDS_TERMINAL_LINE = "needs-terminal: run this yourself in a terminal window"
 
 /** What the daemon answers when an owner command reaches /cli anyway. */
@@ -130,6 +132,12 @@ export interface CliDeps {
    * contract, because that is where the setup's data lives.
    */
   resolvedNetwork?: ResolvedNetwork
+  /** The environment `mida migrate` resolves its deployments against — tests inject a clean one. */
+  env?: Record<string, string | undefined>
+  /** `mida migrate`'s destination — default: the deployment this build ships; tests inject a local one. */
+  migrateTarget?: Deployment
+  /** What runs after `mida migrate` switches (or `--undo` restores) — default: spawn the daemon. */
+  startService?: () => unknown | Promise<unknown>
 }
 
 /**
@@ -626,6 +634,51 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     deps.print(NEEDS_TERMINAL_LINE)
     return 2
   }
+  // migrate and migrate --undo are owner commands: they open the owner runtime themselves, take
+  // no agent argument, and never go near the daemon socket — a migration even stops the service.
+  if (command === "migrate") {
+    if (argv.length > 2 || (argv.length === 2 && argv[1] !== "--undo")) {
+      deps.print(USAGE)
+      return 2
+    }
+    if (loadOwnerMode(deps.home) === "passkey") {
+      deps.print("migrate moves a software-key setup — a passkey setup has no local owner key to move")
+      return 1
+    }
+    const env = deps.env ?? process.env
+    const drain = deps.drainInput ?? drainBufferedStdin
+    const prompt = deps.prompt ?? terminalPrompt
+    const startService =
+      deps.startService ??
+      (async () => {
+        const health = await callDaemon(deps.home, "/health", undefined, { timeoutMs: 500 })
+        if (health.status === 0) spawnDaemon(deps.home.root)
+      })
+    try {
+      if (argv[1] === "--undo") {
+        const undone = await migrateUndo({ home: deps.home, env, print: deps.print, now: () => new Date(), startService })
+        return undone.outcome === "refused" ? 1 : 0
+      }
+      const result = await migrate({
+        home: deps.home,
+        env,
+        print: deps.print,
+        now: () => new Date(),
+        startService,
+        confirm: async (text) => {
+          deps.print(text)
+          await drain()
+          return (await prompt("Type yes to migrate: ")).trim() === "yes"
+        },
+        ...(deps.migrateTarget === undefined ? {} : { target: deps.migrateTarget }),
+      })
+      return result.outcome === "refused" ? 1 : 0
+    } catch (error) {
+      deps.print(`refused: ${refusalCode(error)}`)
+      if (process.env.MIDA_DEBUG === "1") deps.print(debugLine(error))
+      return 1
+    }
+  }
   const mode = loadOwnerMode(deps.home)
   const passkeyInit = command === "init" && argv[1] === "--passkey"
   // init on a setup saved to another contract refuses before the runtime even opens — the
@@ -795,7 +848,7 @@ async function main(): Promise<void> {
     // lives — but the owner is told, on stderr so the command's stdout keeps its shape.
     const notice = mismatchLine(resolved)
     if (notice !== undefined) process.stderr.write(`${notice}\n`)
-    const code = await runCli(argv, { home, network: resolved.network, print, cwd: process.cwd(), resolvedNetwork: resolved })
+    const code = await runCli(argv, { home, network: resolved.network, print, cwd: process.cwd(), resolvedNetwork: resolved, env: process.env })
     if (argv[0] === "init" && code === 0) {
       const health = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
       if (health.status === 0) spawnDaemon(home.root)

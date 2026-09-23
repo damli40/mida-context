@@ -374,3 +374,64 @@ describe("ensureCurrentDaemon", () => {
     }
   })
 })
+
+describe("the migrate/in-progress marker (migrate B6)", () => {
+  const marked = (): MidaHome => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    home.writeSecretJson("migrate/in-progress", { at: "2026-09-23T12:00:00.000Z", target: "0xabc" })
+    return home
+  }
+
+  it("ensureDaemon returns false fast and never spawns while the marker exists", async () => {
+    const home = marked()
+    let spawned = 0
+    const started = Date.now()
+    const up = await ensureDaemon(home, () => { spawned += 1 }, { waitMs: 3_000 })
+    expect(up).toBe(false)
+    expect(spawned).toBe(0)
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  it("ensureDaemon does not even probe — a socket answering behind the marker changes nothing", async () => {
+    const home = marked()
+    let probed = 0
+    const server = await fakeDaemon(socketPathFor(home), (socket, _data) => {
+      probed += 1
+      replyJson(socket, 200, { ok: true, pid: 1 })
+    })
+    try {
+      const up = await ensureDaemon(home, () => { throw new Error("must not spawn") }, { waitMs: 2_000 })
+      expect(up).toBe(false)
+      expect(probed).toBe(0)
+    } finally {
+      await close(server)
+    }
+  })
+
+  it("ensureCurrentDaemon returns the migration refusal — no probe, no spawn, no shutdown", async () => {
+    const home = marked()
+    const posts: string[] = []
+    let probed = 0
+    const server = await fakeDaemon(socketPathFor(home), (socket, data) => {
+      probed += 1
+      if (data.toString("utf8").startsWith("POST")) posts.push(data.toString("utf8").split(" ")[1] ?? "")
+      replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "abc1234" })
+    })
+    try {
+      let spawned = 0
+      const result = await ensureCurrentDaemon(home, () => { spawned += 1 }, {
+        waitMs: 3_000,
+        self: { codeRoot: "/code/here", codeCommit: "abc1234" },
+      })
+      expect(result).toEqual({
+        up: false,
+        refusal: "a migration is in progress — run `mida migrate` to finish it or `mida migrate --undo`",
+      })
+      expect(spawned).toBe(0)
+      expect(probed).toBe(0)
+      expect(posts).toEqual([])
+    } finally {
+      await close(server)
+    }
+  })
+})

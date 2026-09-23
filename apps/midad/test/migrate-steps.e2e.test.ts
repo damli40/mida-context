@@ -184,7 +184,7 @@ describe("migrate state machine on local Anvil (migrate B5)", () => {
   })
 
   it(
-    "moves the whole seeded universe: one registration, one grant, every record verified — the real home unchanged",
+    "moves the whole seeded universe: one registration, one grant, every record verified — then the switch lands",
     async () => {
       const seeded = await seedHome()
       const result = await untilMoved(seeded)
@@ -203,10 +203,10 @@ describe("migrate state machine on local Anvil (migrate B5)", () => {
       expect(logs.records).toBe(10)
       expect(await evidenceEvents(seeded)).toBe(1)
 
-      // Every entry carries a target id and landed; skipped entries are none for this seed.
+      // Every entry carries a target id, landed and verified; skipped entries are none for this seed.
       const targetReader = new RegistryReader(chain(target))
       for (const entry of manifest.entries) {
-        expect(entry.status).toBe("sent")
+        expect(entry.status).toBe("verified")
         expect(entry.targetId).toMatch(/^0x[0-9a-f]{64}$/)
         const record = await targetReader.getRecord(entry.targetId!)
         expect(record, `no target record for ${entry.sourceId}`).not.toBeNull()
@@ -234,12 +234,11 @@ describe("migrate state machine on local Anvil (migrate B5)", () => {
       expect(v2!.lineageId.toLowerCase()).toBe(v1!.lineageId.toLowerCase())
       expect([v1!.version, v2!.version, v3!.version]).toEqual([1, 2, 3])
 
-      // Decrypt the target side as the owner: envelopes name the SOURCE contract, the source id and
-      // the source commitment — the true origin, not the staging contract.
-      const staging = stagingHome(seeded)
-      const stagingRuntime = await Runtime.open(staging, { rpcUrl: env.rpcUrl, deployment: target })
+      // Decrypt the target side as the owner — post-switch that IS the real home: envelopes name
+      // the SOURCE contract, the source id and the source commitment — the true origin.
+      const switched = await Runtime.open(seeded.home, { rpcUrl: env.rpcUrl, deployment: target })
       try {
-        const moved = await readOwnerUniverse(stagingRuntime)
+        const moved = await readOwnerUniverse(switched)
         expect(moved).toHaveLength(10)
         const byTargetId = new Map(manifest.entries.map((entry) => [entry.targetId!.toLowerCase(), entry]))
         for (const record of moved) {
@@ -265,30 +264,26 @@ describe("migrate state machine on local Anvil (migrate B5)", () => {
         expect(identical.map((entry) => entry.targetId)).toHaveLength(2)
         expect(identical[0]!.targetId).not.toBe(identical[1]!.targetId)
       } finally {
-        await stagingRuntime.close()
+        await switched.close()
       }
 
-      // Rule 8b: the source-revoked agent was granted, copied and re-revoked — nothing live remains.
+      // Rule 8b: the source-revoked agent was granted, copied and re-revoked — nothing live remains,
+      // and the moved-in identity carries the local marker.
       expect(await liveCapabilities(target, seeded.owner, newAgentId)).toBe(0)
-      expect(staging.has("agents/claude-code/revoked.json")).toBe(true)
+      expect(seeded.home.has("agents/claude-code/revoked.json")).toBe(true)
 
-      // The staging home is a working copy: same owner, target deployment, 0600 secrets.
-      const stagingNetwork = staging.readJson<{ deployment: { contextRegistry: string }; rpcUrl: string }>("network.json")!
-      expect(stagingNetwork.deployment.contextRegistry.toLowerCase()).toBe(target.contextRegistry.toLowerCase())
-      expect(stagingNetwork.rpcUrl).toBe(env.rpcUrl)
-      expect(statSync(staging.path("owner/secrets.json")).mode & 0o777).toBe(0o600)
-      expect(statSync(staging.path("owner")).mode & 0o777).toBe(0o700)
-      expect(loadAgentIdentity(staging, "claude-code")!.agentId.toLowerCase()).toBe(newAgentId.toLowerCase())
-
-      // The real home still names the SOURCE contract — the switch is Task 6's, not this task's.
+      // The switched home: the target contract in network.json, the new agent identity live,
+      // owner secrets at 0600, the marker and the staging home gone, the backup kept.
       const realNetwork = seeded.home.readJson<{ deployment: { contextRegistry: string } }>("network.json")!
-      expect(realNetwork.deployment.contextRegistry.toLowerCase()).toBe(source.contextRegistry.toLowerCase())
-      expect(loadAgentIdentity(seeded.home, "claude-code")!.agentId.toLowerCase()).toBe(seeded.seed.agentId.toLowerCase())
-      expect(existsSync(seeded.home.path("migrate/in-progress"))).toBe(true)
+      expect(realNetwork.deployment.contextRegistry.toLowerCase()).toBe(target.contextRegistry.toLowerCase())
+      expect(statSync(seeded.home.path("owner/secrets.json")).mode & 0o777).toBe(0o600)
+      expect(loadAgentIdentity(seeded.home, "claude-code")!.agentId.toLowerCase()).toBe(newAgentId.toLowerCase())
+      expect(existsSync(seeded.home.path("migrate/in-progress"))).toBe(false)
+      expect(existsSync(seeded.home.path("migrate/target"))).toBe(false)
       expect(existsSync(seeded.home.path(`migrate/backup-${MIGRATED_AT}/network.json`))).toBe(true)
 
       // A home already on the target has nothing to move.
-      const again = await runMigrate({ ...seeded, home: staging })
+      const again = await runMigrate(seeded)
       expect(again).toMatchObject({ outcome: "nothing-to-move" })
     },
     TIMEOUT,
@@ -313,7 +308,7 @@ describe("migrate state machine on local Anvil (migrate B5)", () => {
         expect(logs.grantTxs).toBe(1)
         expect(logs.records).toBe(10)
         expect(new Set(logs.recordIds).size).toBe(10)
-        for (const entry of manifest.entries) expect(entry.status).toBe("sent")
+        for (const entry of manifest.entries) expect(entry.status).toBe("verified")
         expect(await liveCapabilities(target, seeded.owner, newAgentId)).toBe(0)
       },
       TIMEOUT,

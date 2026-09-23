@@ -40,6 +40,13 @@ async function main(): Promise<void> {
       return
     }
   }
+  // While `migrate/in-progress` exists a migration owns this setup: the hook still queues its job
+  // (runHook does that before either callback) but must not start a daemon or a drainer.
+  const suppressForMigration = (): boolean => {
+    if (!home.has("migrate/in-progress")) return false
+    appendLog(home, "hook", { agent, outcome: "service-suppressed", reason: "migration-in-progress" })
+    return true
+  }
   await runHook({
     agent,
     stdin,
@@ -48,6 +55,7 @@ async function main(): Promise<void> {
     // Built `midad`/`mida-drain` beside this file in dist, or the .ts entries through the
     // repo's tsx loader — sibling.ts decides; the Mida home is the child's working directory.
     spawnDaemon: () => {
+      if (suppressForMigration()) return
       const child = spawn(process.execPath, siblingEntryArgs("midad"), {
         detached: true,
         stdio: "ignore",
@@ -58,6 +66,7 @@ async function main(): Promise<void> {
       child.unref()
     },
     spawnDrainer: () => {
+      if (suppressForMigration()) return
       const child = spawn(process.execPath, siblingEntryArgs("mida-drain"), {
         detached: true,
         stdio: "ignore",

@@ -300,6 +300,48 @@ describe("the crude mida command", () => {
     expect(out.every((line) => !line.includes("run `mida approve codex` here"))).toBe(true)
   }, 300_000)
 
+  it("migrate is an owner command: a real terminal is required and the daemon socket refuses it", async () => {
+    const out: string[] = []
+    const noTty = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => out.push(line), prompt: async () => "yes",
+        stdinIsTTY: false, stdoutIsTTY: true, env: {}, migrateTarget: env.deployment, startService: () => {},
+      })
+    expect(await noTty("migrate")).toBe(2)
+    expect(await noTty("migrate", "--undo")).toBe(2)
+    expect(out.filter((line) => line === NEEDS_TERMINAL_LINE)).toHaveLength(2)
+    // through the daemon's /cli route it is refused like every owner command
+    const refused: string[] = []
+    const stub = { home: new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-stub-"))) } as unknown as ServiceRuntime
+    expect(await runCliWithRuntime(["migrate"], stub, (line) => refused.push(line))).toBe(2)
+    expect(refused[0]).toContain("mida migrate")
+    expect(await runCliWithRuntime(["migrate", "--undo"], stub, () => {})).toBe(2)
+    // a flag it does not know is usage, not a half-run
+    expect(await run("migrate", "--sideways")).toBe(2)
+  })
+
+  it("mida migrate says there is nothing to move when the saved contract is already the target", async () => {
+    const out: string[] = []
+    const code = await runCli(["migrate"], {
+      home, network, print: (line) => out.push(line),
+      prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      env: {}, migrateTarget: env.deployment, startService: () => {},
+    })
+    expect(code).toBe(0)
+    expect(out.join("\n")).toContain("nothing to move")
+  }, 300_000)
+
+  it("mida migrate --undo refuses when no backup exists", async () => {
+    const out: string[] = []
+    const code = await runCli(["migrate", "--undo"], {
+      home, network, print: (line) => out.push(line),
+      prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      env: {}, migrateTarget: env.deployment, startService: () => {},
+    })
+    expect(code).toBe(1)
+    expect(out.join("\n").toLowerCase()).toContain("backup")
+  }, 300_000)
+
   it("never prints a secret: no output line contains any key stored in the home folder", () => {
     const secrets: string[] = []
     const walk = (folder: string) => {
