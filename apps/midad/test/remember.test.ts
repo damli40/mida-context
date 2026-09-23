@@ -241,4 +241,41 @@ describe("migrated facts in the fact list (migrate B2)", () => {
     expect(lines).toContain("What you have told Mida about yourself")
     expect(lines).toContain("  preferences.communication: answers in lowercase (moved on 2026-09-25)")
   })
+
+  it("orders by the envelope's originalCreatedAt, not the replay's fresh chain stamp (migrate B7b)", async () => {
+    // The target stamps chain createdAt at replay — whole seconds, several records a second —
+    // so it cannot order moved facts. Here the chain times even INVERT the order: the older
+    // fact carries the later stamp. Only the envelope still names which was written first.
+    const older = factObject("written first", `0x${"aa".repeat(32)}` as Hex, {
+      ...MIGRATION,
+      originalCreatedAt: "2026-09-18T10:00:00.000Z",
+    })
+    const newer = factObject("written last", `0x${"bb".repeat(32)}` as Hex, {
+      ...MIGRATION,
+      originalCreatedAt: "2026-09-19T10:00:00.000Z",
+    })
+    const chainTime = new Map<string, bigint>([
+      [older.contextId, 1_758_000_200n],
+      [newer.contextId, 1_758_000_100n],
+    ])
+    const runtime = {
+      home: new MidaHome(mkdtempSync(join(tmpdir(), "mida-migfact-"))),
+      owner: `0x${"55".repeat(20)}`,
+      agent: () => ({
+        read: async (_owner: string, namespace: string) => (namespace === "preferences.communication" ? [older, newer] : []),
+      }),
+      reader: {
+        getRecord: async (contextId: Hex) => ({
+          author: OWNER_AUTHOR_ID,
+          provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED,
+          createdAt: chainTime.get(contextId)!,
+        }),
+      },
+    } as unknown as ServiceRuntime
+    const facts = await readOwnerFacts(runtime, "claude-code")
+    expect(facts.map((fact) => fact.text)).toEqual([
+      "written last (moved on 2026-09-25)",
+      "written first (moved on 2026-09-25)",
+    ])
+  })
 })

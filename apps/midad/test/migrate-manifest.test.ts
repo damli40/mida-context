@@ -261,6 +261,18 @@ describe("replayOrder", () => {
     expect(replayOrder(manifest).length).toBe(2)
     expect(manifest.entries[0]!.status).toBe("pending")
   })
+
+  it("an independent record written after a lineage replays last — the ready set picks earliest createdAt", () => {
+    const v1 = record({ createdAt: 1_758_000_000n })
+    const v2 = record({ parentId: v1.contextId, lineageId: v1.lineageId, version: 2, createdAt: 1_758_000_100n })
+    const v3 = record({ parentId: v2.contextId, lineageId: v1.lineageId, version: 3, createdAt: 1_758_000_200n })
+    const late = record({ createdAt: 1_758_000_300n })
+    // Scrambled input again: the order comes from written time, never manifest position. A FIFO
+    // ready queue would replay `late` before v2 and v3 — it is ready from the start.
+    const manifest = buildManifest([v3, late, v2, v1], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)
+    const order = replayOrder(manifest).map((entry) => entry.sourceId)
+    expect(order).toEqual([v1.contextId, v2.contextId, v3.contextId, late.contextId])
+  })
 })
 
 describe("preflight — the exact size check", () => {

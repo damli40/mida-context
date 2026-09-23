@@ -5,7 +5,7 @@ import type { ContextKind, Hex } from "@mida/protocol"
 import { scrubSecrets } from "@mida/compiler"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { listAgentNames, loadAgentIdentity } from "./keys.js"
-import { movedOnSuffix, validateMigrationEnvelope } from "./migration-envelope.js"
+import { movedOnSuffix, readEnvelope, validateMigrationEnvelope } from "./migration-envelope.js"
 
 /**
  * The two namespaces `mida remember` may write in M2, in the order the refusal message lists them.
@@ -139,12 +139,15 @@ function factText(value: unknown): string | null {
  * who wrote it is never consulted for authority: a record an agent managed to land there (it
  * cannot — the chain refuses, holding READ only) or an owner-authored record carrying an agent
  * provenance is dropped. A namespace the agent has no grant for contributes nothing, and is not an
- * error. Newest first, at most MAX_FACTS.
+ * error. Newest first — by the ORIGINAL stating time, not the chain stamp: a fact `mida migrate`
+ * moved carries its source time in the envelope (`originalCreatedAt`), and the chain's own
+ * `createdAt` stamps at replay, several records to a whole second, so it cannot order moved
+ * records at all. It remains the time for facts that never moved. At most MAX_FACTS.
  */
 export async function readOwnerFacts(runtime: ServiceRuntime, name: string): Promise<OwnerFact[]> {
   const agent = runtime.agent(name)
   const { reader, owner } = runtime
-  const facts: { fact: OwnerFact; createdAt: bigint }[] = []
+  const facts: { fact: OwnerFact; statedAt: number }[] = []
   for (const namespace of FACT_NAMESPACES) {
     let objects
     try {
@@ -162,13 +165,23 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string): Pro
       if (record.provenanceSource !== PROVENANCE_SOURCE.USER_ASSERTED) continue
       const text = factText(object.payload.value)
       if (text === null) continue
+      // The ordering instant in milliseconds: the envelope's originalCreatedAt when the record
+      // moved (readEnvelope checks both slots — inside an object value, beside a string one),
+      // else the chain's createdAt in whole seconds.
+      let statedAt = Number(record.createdAt) * 1000
+      try {
+        const moved = readEnvelope(object.payload)
+        if (moved !== undefined) statedAt = Date.parse(moved.originalCreatedAt)
+      } catch {
+        // a contradictory envelope — carried in both slots — sorts by chain time, never fatal
+      }
       facts.push({
         fact: { text, contextId: object.contextId, namespace, assertedAt: new Date(Number(record.createdAt) * 1000).toISOString() },
-        createdAt: record.createdAt,
+        statedAt,
       })
     }
   }
-  facts.sort((a, b) => Number(b.createdAt - a.createdAt) || b.fact.contextId.localeCompare(a.fact.contextId))
+  facts.sort((a, b) => b.statedAt - a.statedAt || b.fact.contextId.localeCompare(a.fact.contextId))
   return facts.slice(0, MAX_FACTS).map(({ fact }) => fact)
 }
 

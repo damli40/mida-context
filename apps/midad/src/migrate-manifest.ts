@@ -320,6 +320,10 @@ export function buildManifest(
  * a referenced record before the records that point at it. Dependencies are parent links
  * (`parentId`, ordered by `version` within a lineage as well) and `relations`; ids outside the
  * manifest are not dependencies — a reference to a record the owner does not carry stays as-is.
+ * Among the records ready to write, the earliest-written goes first (`createdAt`, ties by
+ * manifest position): dependencies point back in time, so the replay follows the source's
+ * write order whenever the source is consistent — a record a dependency held back still lands
+ * in its written slot instead of trailing every independent record.
  * Skipped entries keep their place in the output: Task 5 lists them, it does not write them.
  * A dependency cycle cannot be replayed — `relation-cycle`, naming the records involved.
  */
@@ -352,17 +356,27 @@ export function replayOrder(manifest: Manifest): ManifestEntry[] {
     for (let i = 1; i < members.length; i++) link(members[i - 1]!, members[i]!)
   }
 
-  // Kahn's algorithm; ties fall back to manifest order so the output is deterministic.
+  // Kahn's algorithm. The ready set always yields the earliest-written entry — smallest
+  // `createdAt`, ties by manifest position — so a record a dependency held back still replays
+  // in its written slot, and the output stays deterministic.
+  const position = new Map(entries.map((entry, index) => [entry, index]))
   const remaining = new Map(entries.map((entry) => [entry, dependencies.get(entry)?.size ?? 0]))
-  const queue = entries.filter((entry) => remaining.get(entry) === 0)
+  const ready = entries.filter((entry) => remaining.get(entry) === 0)
   const ordered: ManifestEntry[] = []
-  while (queue.length > 0) {
-    const entry = queue.shift()!
+  while (ready.length > 0) {
+    let earliest = 0
+    for (let i = 1; i < ready.length; i += 1) {
+      const candidate = ready[i]!
+      const current = ready[earliest]!
+      const sooner = Date.parse(candidate.createdAt) - Date.parse(current.createdAt)
+      if (sooner < 0 || (sooner === 0 && position.get(candidate)! < position.get(current)!)) earliest = i
+    }
+    const entry = ready.splice(earliest, 1)[0]!
     ordered.push(entry)
     for (const dependent of dependents.get(entry) ?? []) {
       const left = remaining.get(dependent)! - 1
       remaining.set(dependent, left)
-      if (left === 0) queue.push(dependent)
+      if (left === 0) ready.push(dependent)
     }
   }
   if (ordered.length !== entries.length) {
