@@ -22,12 +22,13 @@
 //   - failures are written to stderr as "<provider> http <status>" and the process exits 1
 //     with NOTHING on stdout — stderr is the controlled channel; the response body itself is
 //     never echoed.
-//   - on success one more stderr line is allowed: "cache hit=<n> miss=<m>", printed only when
+//   - on success two more stderr lines are allowed: "cache hit=<n> miss=<m>", printed only when
 //     the response's usage object carries the provider's cache counters (deepseek:
 //     prompt_cache_hit_tokens / prompt_cache_miss_tokens; kimi: the same two names, or
 //     cached_tokens / prompt_tokens_details.cached_tokens for the hit — the exact field is
-//     unverified, so any of them counts, and no pair means no line). Nothing else from the
-//     body is ever printed.
+//     unverified, so any of them counts, and no pair means no line), and "tokens in=<p> out=<c>",
+//     printed only when usage carries prompt_tokens and completion_tokens. Nothing else from
+//     the body is ever printed.
 import { isIP } from "node:net"
 
 const PROVIDERS = {
@@ -127,8 +128,8 @@ try {
   const content = body?.choices?.[0]?.message?.content
   if (typeof content !== "string" || content === "") fail(`${name}: response held no content`)
   process.stdout.write(content)
-  // the cache line goes to the controlled stderr channel — numbers only, and only
-  // when the provider actually reported both halves of the pair
+  // the usage lines go to the controlled stderr channel — numbers only, and only
+  // when the provider actually reported both halves of each pair
   const usage = body?.usage
   if (usage !== null && typeof usage === "object") {
     const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined)
@@ -136,6 +137,9 @@ try {
       num(usage.prompt_cache_hit_tokens) ?? num(usage.cached_tokens) ?? num(usage.prompt_tokens_details?.cached_tokens)
     const miss = num(usage.prompt_cache_miss_tokens)
     if (hit !== undefined && miss !== undefined) process.stderr.write(`cache hit=${hit} miss=${miss}\n`)
+    const input = num(usage.prompt_tokens)
+    const output = num(usage.completion_tokens)
+    if (input !== undefined && output !== undefined) process.stderr.write(`tokens in=${input} out=${output}\n`)
   }
 } catch (error) {
   fail(error instanceof Error && error.name === "TimeoutError" ? `${name}: request timed out` : `${name}: request failed`)

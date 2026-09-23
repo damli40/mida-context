@@ -200,6 +200,22 @@ describe("openai-compatible-model.mjs — cache usage on stderr (M3-H)", () => {
     expect(r.stderr).toBe("cache hit=7 miss=42\n")
   })
 
+  it("a full usage object yields all four numbers — the cache line AND 'tokens in=<p> out=<c>' (telemetry)", async () => {
+    server = await fakeApi({
+      status: 200,
+      body: okBody({
+        prompt_tokens: 50,
+        completion_tokens: 12,
+        prompt_cache_hit_tokens: 7,
+        prompt_cache_miss_tokens: 42,
+      }),
+    })
+    const r = await runModel("deepseek", "p", { DEEPSEEK_API_KEY: KEY, DEEPSEEK_BASE_URL: server.url })
+    expect(r.code).toBe(0)
+    expect(r.stdout).toBe("ok")
+    expect(r.stderr).toBe("cache hit=7 miss=42\ntokens in=50 out=12\n")
+  })
+
   it("kimi accepts the same two names plus its alternates — flat and nested cached_tokens", async () => {
     // the two deepseek-style names
     server = await fakeApi({ status: 200, body: okBody({ prompt_cache_hit_tokens: 3, prompt_cache_miss_tokens: 9 }) })
@@ -222,17 +238,25 @@ describe("openai-compatible-model.mjs — cache usage on stderr (M3-H)", () => {
     expect(nested.stderr).toBe("cache hit=6 miss=9\n")
   })
 
-  it("no usage object — or one without the fields — prints nothing extra", async () => {
+  it("no usage object — or one without a complete pair — prints nothing extra", async () => {
     server = await fakeApi({ status: 200, body: { choices: [{ message: { content: "ok" } }] } })
     const none = await runModel("deepseek", "p", { DEEPSEEK_API_KEY: KEY, DEEPSEEK_BASE_URL: server.url })
     expect(none.code).toBe(0)
     expect(none.stderr).toBe("")
     await server.close()
 
-    server = await fakeApi({ status: 200, body: okBody({ prompt_tokens: 50, completion_tokens: 12 }) })
+    // total_tokens alone is neither pair — the lines are pair-or-nothing
+    server = await fakeApi({ status: 200, body: okBody({ total_tokens: 62 }) })
     const empty = await runModel("deepseek", "p", { DEEPSEEK_API_KEY: KEY, DEEPSEEK_BASE_URL: server.url })
     expect(empty.code).toBe(0)
     expect(empty.stderr).toBe("")
+    await server.close()
+
+    // and only one half of the token pair is still nothing
+    server = await fakeApi({ status: 200, body: okBody({ prompt_tokens: 50 }) })
+    const half = await runModel("deepseek", "p", { DEEPSEEK_API_KEY: KEY, DEEPSEEK_BASE_URL: server.url })
+    expect(half.code).toBe(0)
+    expect(half.stderr).toBe("")
   })
 })
 

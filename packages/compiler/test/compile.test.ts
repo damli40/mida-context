@@ -380,6 +380,48 @@ describe("compileCheckpoint", () => {
     }
   })
 
+  it("a full provider usage object lands all four numbers on the result (telemetry)", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "usage-stats"], label: "deepseek-x", stderrDetail: true },
+    })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.cacheHitTokens).toBe(11)
+      expect(r.cacheMissTokens).toBe(22)
+      expect(r.inputTokens).toBe(50)
+      expect(r.outputTokens).toBe(12)
+    }
+  })
+
+  it("token usage travels on its own — a provider with no cache pair still reports in/out", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "token-stats"], label: "kimi-x", stderrDetail: true },
+    })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.inputTokens).toBe(50)
+      expect(r.outputTokens).toBe(12)
+      expect(r.cacheHitTokens).toBeUndefined()
+      expect(r.cacheMissTokens).toBeUndefined()
+    }
+  })
+
+  it("a provider that reports no usage leaves every token field absent — never zero", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "good"], label: "haiku-y", stderrDetail: true },
+    })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.inputTokens).toBeUndefined()
+      expect(r.outputTokens).toBeUndefined()
+      expect(r.cacheHitTokens).toBeUndefined()
+      expect(r.cacheMissTokens).toBeUndefined()
+    }
+  })
+
   it("stderrDetail lets a model command's safe stderr line into the failure detail (R5-8)", async () => {
     const withFlag = await compileCheckpoint({
       ...base,

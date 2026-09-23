@@ -803,6 +803,96 @@ describe("the saved log line carries the compile and save facts (C4)", () => {
     expect(saved.cacheMiss).toBe(100)
   })
 
+  it("a saved line carries the model, its token usage and the save's gas facts (telemetry)", async () => {
+    const { job, drain, drainLog } = setup()
+    const compile: typeof compileCheckpoint = async (input) => ({
+      ok: true,
+      checkpoint: sampleCheckpoint({ eventId: input.eventId, agent: input.agent }),
+      compiledBy: "deepseek-flash",
+      droppedKeys: [],
+      trimmed: [],
+      attempts: 1,
+      format: "claude-jsonl",
+      messagesKept: 1,
+      messagesTotal: 1,
+      charsSent: 0,
+      modelMs: 0,
+      retried: 0,
+      inputTokens: 4000,
+      outputTokens: 320,
+    })
+    const transactionHash = `0x${"ef".repeat(32)}` as Hex
+    const save: typeof saveCheckpoint = async () => ({
+      contextId: `0x${"ab".repeat(32)}` as Hex,
+      transactionHash,
+      milliseconds: 1,
+      duplicate: false,
+      receipt: { gasUsed: "81000", gasLimit: "120000", effectiveGasPrice: "50000000000", sponsored: true },
+    })
+    job({ event: "Stop" }, T0)
+    await drain({ compile, save })
+    const saved = savedLines(drainLog).at(-1)!
+    expect(saved.model).toBe("deepseek-flash")
+    expect(saved.inputTokens).toBe(4000)
+    expect(saved.outputTokens).toBe(320)
+    expect(saved.transactionHash).toBe(transactionHash)
+    // gas values are wei as decimal STRINGS — a bigint must never reach JSON.stringify
+    expect(saved.gasUsed).toBe("81000")
+    expect(saved.gasLimit).toBe("120000")
+    expect(saved.effectiveGasPrice).toBe("50000000000")
+    expect(saved.sponsored).toBe(true)
+  })
+
+  it("a duplicate save leaves every gas key off the record — no transaction was sent", async () => {
+    const { job, drain, drainLog } = setup()
+    const save: typeof saveCheckpoint = async () => ({
+      contextId: `0x${"ab".repeat(32)}` as Hex,
+      transactionHash: null,
+      milliseconds: 1,
+      duplicate: true,
+    })
+    job({ event: "Stop" }, T0)
+    await drain({ save })
+    const saved = savedLines(drainLog).at(-1)!
+    expect(saved.transactionHash).toBeUndefined()
+    expect(saved.gasUsed).toBeUndefined()
+    expect(saved.gasLimit).toBeUndefined()
+    expect(saved.effectiveGasPrice).toBeUndefined()
+    expect(saved.sponsored).toBeUndefined()
+  })
+
+  it("the saved line never carries checkpoint content — numbers and names only", async () => {
+    const { job, drain, drainLog } = setup()
+    const compile: typeof compileCheckpoint = async (input) => ({
+      ok: true,
+      checkpoint: sampleCheckpoint({
+        eventId: input.eventId,
+        agent: input.agent,
+        objective: "MARKED-OBJECTIVE-7f3a must not be logged",
+        nextAction: "MARKED-NEXT-9b2c must not be logged",
+      }),
+      compiledBy: "stub",
+      droppedKeys: [],
+      trimmed: [],
+      attempts: 1,
+      format: "claude-jsonl",
+      messagesKept: 1,
+      messagesTotal: 1,
+      charsSent: 0,
+      modelMs: 0,
+      retried: 0,
+    })
+    job({ event: "Stop" }, T0)
+    await drain({ compile })
+    const log = drainLog()
+    const saved = savedLines(drainLog).at(-1)!
+    expect(log).not.toContain("MARKED-OBJECTIVE-7f3a")
+    expect(log).not.toContain("MARKED-NEXT-9b2c")
+    expect(saved.checkpoint).toBeUndefined()
+    expect(saved.objective).toBeUndefined()
+    expect(saved.nextAction).toBeUndefined()
+  })
+
   it("a compile that spent its same-provider shape retry logs retried (M3-H)", async () => {
     const { job, drain, drainLog } = setup()
     const compile: typeof compileCheckpoint = async (input) => ({

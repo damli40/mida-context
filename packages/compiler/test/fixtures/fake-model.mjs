@@ -23,6 +23,10 @@
 //   stderr-fail — writes "kimi http 429" to stderr, exits 1 (stderrDetail tests)
 //   cache-stats — GOOD on stdout plus "cache hit=11 miss=22" on stderr, exit 0:
 //              the provider's usage line a compile with stderrDetail reads
+//   usage-stats — GOOD on stdout plus "cache hit=11 miss=22" AND
+//              "tokens in=50 out=12" on stderr: a full provider usage object
+//   token-stats — GOOD on stdout plus "tokens in=50 out=12" only: usage
+//              without the cache pair must still carry its own numbers
 //   cache-stats-bad — GOOD on stdout plus a malformed "cache hit=…" line on
 //              stderr: the parse must ignore it and still succeed
 //   shape-flaky — badshape on its FIRST run, good after (counts runs in
@@ -153,6 +157,14 @@ process.stdin.on("end", () => {
       break
     case "cache-stats":
       process.stderr.write("cache hit=11 miss=22\n")
+      fenced(GOOD)
+      break
+    case "usage-stats":
+      process.stderr.write("cache hit=11 miss=22\ntokens in=50 out=12\n")
+      fenced(GOOD)
+      break
+    case "token-stats":
+      process.stderr.write("tokens in=50 out=12\n")
       fenced(GOOD)
       break
     case "cache-stats-bad":

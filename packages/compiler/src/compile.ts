@@ -81,6 +81,13 @@ export type CompileResult =
        */
       cacheHitTokens?: number
       cacheMissTokens?: number
+      /**
+       * Total prompt/completion tokens the provider reported for the call that wrote the
+       * checkpoint — the same usage object the cache counters come from, under the same rule:
+       * controlled stderr only, both numbers or neither. Absent means unknown, not zero.
+       */
+      inputTokens?: number
+      outputTokens?: number
     }
   | {
       ok: false
@@ -100,7 +107,15 @@ const DEFAULT_TIMEOUT_MS = 90_000
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
 type ModelRun =
-  | { ok: true; stdout: string; ms: number; cacheHitTokens?: number; cacheMissTokens?: number }
+  | {
+      ok: true
+      stdout: string
+      ms: number
+      cacheHitTokens?: number
+      cacheMissTokens?: number
+      inputTokens?: number
+      outputTokens?: number
+    }
   | { ok: false; detail: string; ms: number }
 
 // One bad field must not cost the whole save. Strings over the schema limit
@@ -165,7 +180,16 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
   return new Promise((resolve) => {
     let settled = false
     const done = (
-      r: { ok: true; stdout: string; cacheHitTokens?: number; cacheMissTokens?: number } | { ok: false; detail: string },
+      r:
+        | {
+            ok: true
+            stdout: string
+            cacheHitTokens?: number
+            cacheMissTokens?: number
+            inputTokens?: number
+            outputTokens?: number
+          }
+        | { ok: false; detail: string },
     ) => {
       if (settled) return
       settled = true
@@ -217,22 +241,39 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
     }
 
     // The controlled channel's second contract (M3-H): a successful provider may report its
-    // prompt-cache counters as "cache hit=<n> miss=<m>". Only a stderrDetail command's stderr
-    // is even piped, and only a line in exactly that shape counts — anything else is ignored.
-    const cacheUsage = (): { cacheHitTokens?: number; cacheMissTokens?: number } => {
-      if (model.stderrDetail !== true) return {}
+    // prompt-cache counters as "cache hit=<n> miss=<m>" and its total token usage as
+    // "tokens in=<p> out=<c>". Only a stderrDetail command's stderr is even piped, and only
+    // a line in exactly one of those shapes counts — anything else is ignored.
+    const reportedUsage = (): {
+      cacheHitTokens?: number
+      cacheMissTokens?: number
+      inputTokens?: number
+      outputTokens?: number
+    } => {
+      const usage: { cacheHitTokens?: number; cacheMissTokens?: number; inputTokens?: number; outputTokens?: number } = {}
+      if (model.stderrDetail !== true) return usage
       for (const line of stderr.split("\n")) {
-        const match = /^cache hit=(\d+) miss=(\d+)$/.exec(line.trim())
-        if (match !== null) return { cacheHitTokens: Number(match[1]), cacheMissTokens: Number(match[2]) }
+        const trimmed = line.trim()
+        const cache = /^cache hit=(\d+) miss=(\d+)$/.exec(trimmed)
+        if (cache !== null) {
+          usage.cacheHitTokens = Number(cache[1])
+          usage.cacheMissTokens = Number(cache[2])
+          continue
+        }
+        const tokens = /^tokens in=(\d+) out=(\d+)$/.exec(trimmed)
+        if (tokens !== null) {
+          usage.inputTokens = Number(tokens[1])
+          usage.outputTokens = Number(tokens[2])
+        }
       }
-      return {}
+      return usage
     }
 
     const settle = () => {
       clearTimeout(timer)
       if (timedOut || exited === null) return
       if (exited.code !== 0) done({ ok: false, detail: `exit ${exited.code} signal ${exited.signal}${stderrNote()}` })
-      else done({ ok: true, stdout, ...cacheUsage() })
+      else done({ ok: true, stdout, ...reportedUsage() })
     }
 
     const timer = setTimeout(() => {
@@ -396,9 +437,9 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     // except that a bad SHAPE from the primary earns one same-provider retry first: the
     // repeated prompt is a provider-cache hit, so the second opinion is nearly free.
     let parsed: { checkpoint: Checkpoint; droppedKeys: string[]; trimmed: string[] } | undefined
-    // the cache counters of the run that produced `parsed` — the WRITER's numbers,
+    // the usage counters of the run that produced `parsed` — the WRITER's numbers,
     // never an earlier provider's that failed on the way
-    let cache: { cacheHitTokens?: number; cacheMissTokens?: number } = {}
+    let usage: { cacheHitTokens?: number; cacheMissTokens?: number; inputTokens?: number; outputTokens?: number } = {}
     // the field names of the LAST invalid failure — kept for the terminal report only
     let invalidFields: string[] | undefined
     for (;;) {
@@ -419,8 +460,13 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
           const checked = shapeOf(obj as Record<string, unknown>)
           if (checked.ok) {
             parsed = checked
-            if (run.cacheHitTokens !== undefined && run.cacheMissTokens !== undefined) {
-              cache = { cacheHitTokens: run.cacheHitTokens, cacheMissTokens: run.cacheMissTokens }
+            usage = {
+              ...(run.cacheHitTokens !== undefined && run.cacheMissTokens !== undefined
+                ? { cacheHitTokens: run.cacheHitTokens, cacheMissTokens: run.cacheMissTokens }
+                : {}),
+              ...(run.inputTokens !== undefined && run.outputTokens !== undefined
+                ? { inputTokens: run.inputTokens, outputTokens: run.outputTokens }
+                : {}),
             }
             break
           }
@@ -484,7 +530,7 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
       messagesTotal: convo.messagesTotal,
       charsSent: convo.text.length,
       modelMs,
-      ...cache,
+      ...usage,
     }
   }
   // a fallback chain that ran and still lost is part of the failure report — the daemon log says so

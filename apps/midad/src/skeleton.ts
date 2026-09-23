@@ -1,4 +1,5 @@
 import { privateKeyToAccount } from "viem/accounts"
+import { entryPoint08Address } from "viem/account-abstraction"
 import { MidaError, PERMISSION, decodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
 import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScope } from "@mida/protocol"
 import { capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
@@ -494,9 +495,42 @@ function recordSavedId(home: ServiceRuntime["home"], eventId: string, contextId:
   home.writeSecretJson("state/saved-ids.json", { ...readSavedIds(home), [eventId]: contextId })
 }
 
+/** The gas facts a drain's saved line logs — wei as decimal strings, so a bigint never reaches JSON.stringify. */
+export interface SaveReceipt {
+  gasUsed: string
+  gasLimit: string
+  effectiveGasPrice: string
+  /** The path the send actually took — not the configuration. A sponsored save arrives inside a bundle
+   *  addressed to the account-abstraction entrypoint; a self-paid send addresses the registry contract. */
+  sponsored: boolean
+}
+
+/**
+ * The SDK's create keeps only the transaction hash — the gas numbers the drain log needs live on the
+ * mined transaction, so the hash buys one read-back: the receipt for gas used and the price actually
+ * paid, the transaction for the gas limit it was sent with and the contract it went to. A read-back
+ * failure must not fail a save that already landed: the caller just gets no receipt.
+ */
+async function saveReceipt(runtime: ServiceRuntime, transactionHash: Hex): Promise<SaveReceipt | undefined> {
+  try {
+    const [receipt, transaction] = await Promise.all([
+      runtime.chain.publicClient.getTransactionReceipt({ hash: transactionHash }),
+      runtime.chain.publicClient.getTransaction({ hash: transactionHash }),
+    ])
+    return {
+      gasUsed: receipt.gasUsed.toString(),
+      gasLimit: transaction.gas.toString(),
+      effectiveGasPrice: receipt.effectiveGasPrice.toString(),
+      sponsored: transaction.to?.toLowerCase() === entryPoint08Address.toLowerCase(),
+    }
+  } catch {
+    return undefined
+  }
+}
+
 /** Spec §5C steps 4–5: wrap, encrypt, upload and register on Monad under the agent's own key. A second save carrying
  * an eventId this project already has is a drainer retry after a crash — answer with the existing record, send nothing. */
-export async function saveCheckpoint(runtime: ServiceRuntime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean }> {
+export async function saveCheckpoint(runtime: ServiceRuntime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean; receipt?: SaveReceipt }> {
   const envelope = wrapCheckpoint(input)
   const started = Date.now()
   const agent = runtime.agent(name)
@@ -532,7 +566,15 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
     tags: ["mida-checkpoint", envelope.checkpoint.eventId],
   })
   recordSavedId(runtime.home, envelope.checkpoint.eventId, object.contextId)
-  return { contextId: object.contextId, transactionHash: object.transactionHash ?? null, milliseconds: Date.now() - started, duplicate: false }
+  const transactionHash = object.transactionHash ?? null
+  const receipt = transactionHash === null ? undefined : await saveReceipt(runtime, transactionHash)
+  return {
+    contextId: object.contextId,
+    transactionHash,
+    milliseconds: Date.now() - started,
+    duplicate: false,
+    ...(receipt !== undefined ? { receipt } : {}),
+  }
 }
 
 /**

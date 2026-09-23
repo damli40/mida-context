@@ -388,13 +388,15 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             ...(compiled.fellBack !== undefined ? { fellBack: compiled.fellBack } : {}),
             ...(compiled.cacheHitTokens !== undefined ? { cacheHit: compiled.cacheHitTokens } : {}),
             ...(compiled.cacheMissTokens !== undefined ? { cacheMiss: compiled.cacheMissTokens } : {}),
+            ...(compiled.inputTokens !== undefined ? { inputTokens: compiled.inputTokens } : {}),
+            ...(compiled.outputTokens !== undefined ? { outputTokens: compiled.outputTokens } : {}),
           }
           deps.home.writeSecretJson(`queue/compiled/${eventId}.json`, { ...envelope, compileMeta })
           reusedCompiled = false
         }
         const runtime = await openRuntime()
         const saveStart = now().getTime()
-        await save(runtime, job.agent, {
+        const saved = await save(runtime, job.agent, {
           projectId: envelope.projectId,
           sessionId: envelope.sessionId,
           continuesSession: envelope.continuesSession,
@@ -413,6 +415,8 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           sessionId,
           outcome: "saved",
           eventId,
+          // the model that actually wrote the checkpoint — a fallback save names the fallback
+          model: envelope.compiledBy,
           compileMs: compileMeta.compileMs,
           saveMs,
           attempts: compileMeta.attempts,
@@ -425,6 +429,19 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           // reported nothing leaves the keys off the record entirely
           cacheHit: compileMeta.cacheHit,
           cacheMiss: compileMeta.cacheMiss,
+          inputTokens: compileMeta.inputTokens,
+          outputTokens: compileMeta.outputTokens,
+          // a duplicate save sent no transaction: every key below stays absent — the gas fields
+          // describe a transaction that exists, never a zero
+          ...(saved.transactionHash !== null ? { transactionHash: saved.transactionHash } : {}),
+          ...(saved.receipt !== undefined
+            ? {
+                gasUsed: saved.receipt.gasUsed,
+                gasLimit: saved.receipt.gasLimit,
+                effectiveGasPrice: saved.receipt.effectiveGasPrice,
+                sponsored: saved.receipt.sponsored,
+              }
+            : {}),
         })
       } catch (error) {
         const code = failureCode(error)
@@ -558,6 +575,9 @@ interface CompileMeta {
   /** Provider-reported prompt-cache counters — absent when the provider didn't say. */
   cacheHit?: number
   cacheMiss?: number
+  /** Provider-reported total prompt/completion tokens — the same usage object, the same rule. */
+  inputTokens?: number
+  outputTokens?: number
 }
 
 /**
@@ -584,6 +604,8 @@ function readCompiled(home: MidaHome, eventId: string): { envelope: CheckpointEn
         ...(typeof meta.fellBack === "object" && meta.fellBack !== null ? { fellBack: meta.fellBack } : {}),
         ...(typeof meta.cacheHit === "number" ? { cacheHit: meta.cacheHit } : {}),
         ...(typeof meta.cacheMiss === "number" ? { cacheMiss: meta.cacheMiss } : {}),
+        ...(typeof meta.inputTokens === "number" ? { inputTokens: meta.inputTokens } : {}),
+        ...(typeof meta.outputTokens === "number" ? { outputTokens: meta.outputTokens } : {}),
       },
     }
   } catch {
