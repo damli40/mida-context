@@ -639,8 +639,8 @@ describe("the batcher", () => {
     expect((await rig.store.get(fine.meta.contextId))!).toMatchObject({ state: "ANCHORED" })
   })
 
-  it("sizes the first take by the gas budget — 401 saves at the sweep's measured 66,264 per save, not the 480 hard cap", async () => {
-    const rig = makeRig({ cap: 480 })
+  it("sizes the first take by the gas budget — 401 saves at the sweep's measured 66,264 per save, not the 432 hard cap", async () => {
+    const rig = makeRig({ cap: 432 })
     const saves = Array.from({ length: 450 }, () => makeSave())
     for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
 
@@ -651,7 +651,7 @@ describe("the batcher", () => {
   })
 
   it("a submit's real gasUsed re-sizes the next take — 100,000 per save fits 266 — and the log carries both numbers", async () => {
-    const rig = makeRig({ cap: 480 })
+    const rig = makeRig({ cap: 432 })
     rig.chain.gasUsedFor = (batch) => 100_000n * BigInt(batch.length)
     const saves = Array.from({ length: 700 }, () => makeSave())
     for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
@@ -704,7 +704,7 @@ describe("the batcher", () => {
   })
 
   it("a gas refusal still halves when it carries no estimate, and the next success re-learns from gasUsed instead of jumping back to cap", async () => {
-    const rig = makeRig({ cap: 480 })
+    const rig = makeRig({ cap: 432 })
     const saves = Array.from({ length: 401 }, () => makeSave())
     for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
 
@@ -721,14 +721,14 @@ describe("the batcher", () => {
     await rig.batcher.flush()
     expect(rig.chain.submissions[0]!.count).toBe(100)
 
-    // floor(26,600,000 / 200,000) = 133 — the receipt's answer, not the halved 100 and not cap 480.
+    // floor(26,600,000 / 200,000) = 133 — the receipt's answer, not the halved 100 and not cap 432.
     rig.setNow(1_000)
     await rig.batcher.flush()
     expect(rig.chain.submissions[1]!.count).toBe(133)
   })
 
   it("an { exists: true } answer leaves the learned cap where the last receipt put it", async () => {
-    const rig = makeRig({ cap: 480 })
+    const rig = makeRig({ cap: 432 })
     rig.chain.gasUsedFor = (batch) => 100_000n * BigInt(batch.length)
     const first = Array.from({ length: 401 }, () => makeSave())
     for (const { wire, meta } of first) await rig.enqueue(wire, meta.contextId)
@@ -754,12 +754,12 @@ describe("the batcher", () => {
     const third = Array.from({ length: 300 }, () => makeSave())
     for (const { wire, meta } of third) await rig.enqueue(wire, meta.contextId)
     await rig.batcher.flush()
-    // 266 again — the learned cap survived the receipt-less answer; it did not reset to 480.
+    // 266 again — the learned cap survived the receipt-less answer; it did not reset to 432.
     expect(rig.chain.submissions.at(-1)!.count).toBe(266)
   })
 
   it("a gas refusal carrying the node's estimate shrinks to the implied fit — 400 at twice the budget takes 190, not a halving's 200 or a blind retry's 400", async () => {
-    const rig = makeRig({ cap: 480 })
+    const rig = makeRig({ cap: 432 })
     const saves = Array.from({ length: 400 }, () => makeSave())
     for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
 
@@ -780,7 +780,7 @@ describe("the batcher", () => {
   })
 
   it("a refusal whose estimate cannot shrink the take still halves — the next take is always smaller", async () => {
-    const rig = makeRig({ cap: 480 })
+    const rig = makeRig({ cap: 432 })
     const saves = Array.from({ length: 300 }, () => makeSave())
     for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
 

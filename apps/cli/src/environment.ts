@@ -97,7 +97,9 @@ export async function startApiServer(input: {
       chain: createBatcherChain({ rpcUrl: input.rpcUrl, deployment: input.deployment, account: submitter }),
       timer,
       now: () => Date.now(),
-      cap: input.batching?.cap ?? 480,
+      // Hard bound 432 = floor(28,000,000 × 0.95 / 61,457) — the "batch.submit" ceiling at 95%
+      // over the sweep's lowest measured gas per save; the learned budget sizes real takes below it.
+      cap: input.batching?.cap ?? 432,
       waitMs: input.batching?.waitMs ?? 2_000,
       minGapMs: input.batching?.minGapMs ?? 1_000,
       submitter: submitter.address,

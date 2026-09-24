@@ -108,9 +108,11 @@ node --env-file=.env --import tsx scripts/bench-batch-anchor.mts --price-usd <MO
   the run date, so the numbers can be converted to USD later without guessing what price applied.
 - `--saves` sets how many signed saves the batched phase anchors (the direct phase always runs at
   most 20, since it is one transaction per save). `--batch` is how many saves go into each shared
-  transaction when the script submits them itself, capped at 480: Monad refuses any transaction
-  over 30,000,000 gas and the Sep 24 sweep measured about 61,000 gas per save
-  (docs/evidence/batch-anchor-sweep-2026-09-24.json). A real store applies the same rule itself —
+  transaction when the script submits them itself, capped at 432: Monad refuses any transaction
+  over 30,000,000 gas, the submit path's own ceiling budgets 28,000,000, and the Sep 24 sweep's
+  lowest measured per-save cost was 61,457 gas
+  (docs/evidence/batch-anchor-sweep-2026-09-24.json) — floor(28,000,000 × 0.95 / 61,457) = 432.
+  A real store applies the same rule itself —
   its batcher sizes each batch by a gas budget learned from real receipts, not a fixed count.
   `--agents` sets how many throwaway agents split the saves.
 - Before spending anything, the script checks the deployer balance against its own estimate and
