@@ -22,7 +22,7 @@ import { bytesToHex, encodeAbiParameters, keccak256, zeroHash } from "viem"
 import type { AbiEvent, LocalAccount } from "viem"
 import { BATCH_REJECT, MidaError, batchLeafHash, batchSaveStructHash, decodeUint64, isMidaError, merkleProof, merkleRoot } from "@mida/protocol"
 import type { Address, BatchSaveMessage, Hex } from "@mida/protocol"
-import { GAS_CEILINGS, batchAnchorAbi, createWriteContext, getLogsChunked, revertName, sendContract } from "@mida/chain"
+import { GAS_CEILINGS, batchAnchorAbi, createWriteContext, failedBeforeSend, getLogsChunked, revertName, sendContract } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import type { BatchedSaveWire } from "./client.js"
 import type { BatchSaveRow, BatchStore } from "./batch-store.js"
@@ -266,8 +266,8 @@ export class Batcher {
    * The take size the next run uses — the number of saves that fit the gas budget at the per-save
    * cost learned so far, clamped to [1, cap]. A successful submit re-learns it from the receipt's
    * gasUsed; a GAS_CEILING_EXCEEDED refusal re-sizes it from the estimate the refusal carried, or
-   * halves it (floor 1) when the refusal carried none — the batch was too big to send, not
-   * malformed.
+   * halves the refused take (floor 1) when the refusal carried none — the batch was too big to
+   * send, not malformed. Any other pre-send failure halves the refused take the same way.
    */
   #effectiveCap: number
   #lastSubmitAt: number | null = null
@@ -427,15 +427,30 @@ export class Batcher {
           // and the next take shrinks to what the refusal's estimate says would have fit: divided
           // by this take's size it gives the per-save cost the node computed, and fitFor turns that
           // into the largest legal take. A refusal with no estimate — or one whose implied fit
-          // would not shrink the take — halves the cap instead, so the queue drains in smaller
-          // batches instead of wedging behind one it can never push through.
+          // would not shrink the take — halves the TAKE that was refused, so the queue drains in
+          // smaller batches instead of wedging behind one it can never push through.
           const requeued = await this.#store.requeue(batchId)
           const implied =
             error.estimate === undefined ? null : this.#fitFor(ceilDiv(error.estimate, BigInt(taken.length)))
           this.#effectiveCap =
-            implied !== null && implied < taken.length ? implied : Math.max(1, Math.floor(this.#effectiveCap / 2))
+            implied !== null && implied < taken.length ? implied : Math.max(1, Math.floor(taken.length / 2))
           this.#log?.({ event: "batch.too-large", batchId, requeued, cap: this.#effectiveCap })
         }
+        if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
+        return null
+      }
+      if (failedBeforeSend(error)) {
+        // A failure before anything was sent — simulation, estimate, fee or balance guard — is a
+        // size or availability signal, never an ambiguous send: no transaction exists to land
+        // later. The rows requeue and the next take is half of the one just refused — the TAKE is
+        // halved, not the learned cap, so a refusal at 8 rows yields a take of 4 even when the cap
+        // still says 400. A batch of one requeues untouched: a lone pre-send failure is more likely
+        // an RPC outage than an oversized save, and only a measured ceiling refusal earns TOO_LARGE.
+        this.#submitted.delete(batchId.toLowerCase())
+        await this.#journal?.clear(batchId)
+        const requeued = await this.#store.requeue(batchId)
+        if (taken.length > 1) this.#effectiveCap = Math.max(1, Math.floor(taken.length / 2))
+        this.#log?.({ event: "batch.presend-failed", batchId, requeued, cap: this.#effectiveCap, error: String(error) })
         if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
         return null
       }

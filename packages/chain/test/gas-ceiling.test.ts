@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { isMidaError } from "@mida/protocol"
 import type { Address, Hex, MidaError } from "@mida/protocol"
-import { GAS_CEILINGS, sendContract, sendValue } from "@mida/chain"
+import { GAS_CEILINGS, failedBeforeSend, sendContract, sendValue } from "@mida/chain"
 import type { WriteContext } from "@mida/chain"
 
 const ADDRESS: Address = "0x5fbdb2315678afecb367f032d93f642f64180aa3"
@@ -122,6 +122,42 @@ describe("the shared gas ceiling (R3-1)", () => {
     // parsing the message would break on any wording change, so the numbers ride the error itself.
     expect((error as MidaError).estimate).toBe(estimate)
     expect((error as MidaError).ceiling).toBe(GAS_CEILINGS["batch.submit"])
+  })
+
+  it("a simulation failure is marked sent:false — no transaction left the process", async () => {
+    const { context, sent } = stubContext(300_000n)
+    ;(context.publicClient as { simulateContract: unknown }).simulateContract = async () => {
+      throw new Error("execution reverted: BatchExists")
+    }
+    const error = await sendContract(context, { address: ADDRESS, abi: [], functionName: "register", args: [] }, "context.register").then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(failedBeforeSend(error)).toBe(true)
+    expect(sent).toHaveLength(0)
+  })
+
+  it("a ceiling refusal is marked sent:false — the estimate ran before the send", async () => {
+    const { context, sent } = stubContext(GAS_CEILINGS["batch.submit"] + 1n)
+    const error = await sendContract(context, { address: ADDRESS, abi: [], functionName: "submitBatch", args: [] }, "batch.submit").then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(failedBeforeSend(error)).toBe(true)
+    expect(sent).toHaveLength(0)
+  })
+
+  it("a failure after writeContract is NOT marked — the transaction may already have landed", async () => {
+    const { context, sent } = stubContext(300_000n)
+    ;(context.publicClient as { waitForTransactionReceipt: unknown }).waitForTransactionReceipt = async () => {
+      throw new Error("the receipt never arrived")
+    }
+    const error = await sendContract(context, { address: ADDRESS, abi: [], functionName: "register", args: [] }, "context.register").then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(failedBeforeSend(error)).toBe(false)
+    expect(sent).toHaveLength(1) // the send went out — its answer was what got lost
   })
 
   it("the plain value transfer is bounded by its own kind and sent with the explicit estimate", async () => {

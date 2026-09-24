@@ -93,6 +93,23 @@ export function createWriteContext(input: { rpcUrl: string; deployment: Deployme
 export type SentReceipt = TransactionReceipt & { gasLimit: bigint }
 
 /**
+ * `sent === false` on a thrown error marks a failure from BEFORE any transaction left the
+ * process — simulation, gas estimation, the fee estimate, the balance guard. A caller that
+ * requeues work on failure (the batcher) reads it here to tell "nothing was sent", a plain
+ * size or availability signal that is safe to resubmit, from "the send's answer was lost",
+ * where the transaction may already have landed. A failure thrown after `writeContract` —
+ * including the sponsor's own send, whose operation may still be in flight — is never marked.
+ */
+export function failedBeforeSend(error: unknown): boolean {
+  return error instanceof Error && (error as { sent?: boolean }).sent === false
+}
+
+const markUnsent = <T>(error: T): T => {
+  if (error instanceof Error) (error as { sent?: boolean }).sent = false
+  return error
+}
+
+/**
  * The fee a send will offer, estimated once per transaction. viem's EIP-1559 default multiplies
  * the base fee (×1.2) into `maxFeePerGas`, which is exactly the product the node verifies the
  * payer's balance against — so the guard must see THIS number, not the raw gas price (R5-9).
@@ -145,7 +162,9 @@ export async function sendContract(
       args: call.args,
     } as never))
   } catch (error) {
-    throw toMidaError(error)
+    // The simulation failing means nothing was broadcast — the error is marked sent:false so a
+    // retrying caller knows resubmission cannot double-send.
+    throw markUnsent(toMidaError(error))
   }
   let sponsorReason: string | undefined
   if (context.sponsor !== undefined) {
@@ -174,29 +193,36 @@ export async function sendContract(
   }
   let gas: bigint
   let fee: SendFee | undefined
+  // Everything between the simulation and writeContract is still pre-send — estimate, fee, and the
+  // balance guard all run before a transaction can exist. Whatever they throw is marked sent:false;
+  // the sponsor block above is deliberately outside this marking because its send may be in flight.
   try {
-    // The per-kind ceiling on the self-paid path: the node's estimate is refused over the kind's
-    // ceiling, locally, before the send is priced (M3-D). This estimate is deliberately absent
-    // from the sponsored path above — the payer there is the sponsor, and the bundler's own
-    // callGasLimit is what gets checked.
-    gas = await contractGas(context, call, kind)
-  } catch (error) {
-    // The ceiling refusal stays a ceiling refusal — that is the estimate succeeding with a
-    // number, not the estimate itself being refused.
-    if (isMidaError(error, "GAS_CEILING_EXCEEDED")) throw error
-    ;({ gas, fee } = await estimateAfterRefusal(context, call, kind, sponsorReason, error))
-  }
-  if (fee === undefined) {
     try {
-      // The fee is estimated ONCE here and forwarded into the send below: the balance guard checks
-      // gasLimit × this maxFeePerGas, the node checks the same product, and no second estimate can
-      // drift between the two reads (R5-9).
-      fee = await estimateSendFee(context)
+      // The per-kind ceiling on the self-paid path: the node's estimate is refused over the kind's
+      // ceiling, locally, before the send is priced (M3-D). This estimate is deliberately absent
+      // from the sponsored path above — the payer there is the sponsor, and the bundler's own
+      // callGasLimit is what gets checked.
+      gas = await contractGas(context, call, kind)
     } catch (error) {
-      throw toMidaError(error)
+      // The ceiling refusal stays a ceiling refusal — that is the estimate succeeding with a
+      // number, not the estimate itself being refused.
+      if (isMidaError(error, "GAS_CEILING_EXCEEDED")) throw error
+      ;({ gas, fee } = await estimateAfterRefusal(context, call, kind, sponsorReason, error))
     }
+    if (fee === undefined) {
+      try {
+        // The fee is estimated ONCE here and forwarded into the send below: the balance guard checks
+        // gasLimit × this maxFeePerGas, the node checks the same product, and no second estimate can
+        // drift between the two reads (R5-9).
+        fee = await estimateSendFee(context)
+      } catch (error) {
+        throw toMidaError(error)
+      }
+    }
+    await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee })
+  } catch (error) {
+    throw markUnsent(error)
   }
-  await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee })
   const hash = await context.walletClient.writeContract({ ...(request as object), gas, ...fee } as never)
   const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
   if (receipt.status !== "success") {

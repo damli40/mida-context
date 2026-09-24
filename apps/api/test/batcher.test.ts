@@ -575,7 +575,7 @@ describe("the batcher", () => {
 
   it("a gas-ceiling refusal halves the next take until the batch fits — the queue never wedges", async () => {
     const rig = makeRig({ cap: 8 })
-    const saves = [makeSave(), makeSave(), makeSave()]
+    const saves = Array.from({ length: 8 }, () => makeSave())
     for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
 
     // The node refuses any batch above two saves on the gas ceiling — a local policy error, not a
@@ -583,31 +583,32 @@ describe("the batcher", () => {
     rig.chain.failSubmit = (batch) =>
       batch.length > 2 ? new MidaError("GAS_CEILING_EXCEEDED", "submitBatch: estimate exceeds the ceiling") : null
 
-    // cap 8 → take 3, refused: all rows requeue and the next take is capped at 4.
+    // take 8, refused: all rows requeue and the next take is half the REFUSED take — 4.
     await rig.batcher.flush()
     expect(rig.chain.batches.size).toBe(0)
     for (const { meta } of saves) expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "QUEUED", batchId: null })
     expect(await rig.journal.list()).toEqual([])
-    expect(rig.events.find((entry) => entry["event"] === "batch.too-large")).toMatchObject({ requeued: 3, cap: 4 })
+    expect(rig.events.find((entry) => entry["event"] === "batch.too-large")).toMatchObject({ requeued: 8, cap: 4 })
 
-    // take min(4, 3) = 3 — still refused, cap halves again to 2. Refusals don't touch the submit
-    // gap, so the next flush runs at once.
+    // take 4 — still refused, halves again to 2. Refusals don't touch the submit gap, so the next
+    // flush runs at once.
     await rig.batcher.flush()
     expect(rig.chain.batches.size).toBe(0)
-    expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 3, cap: 2 })
+    expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 4, cap: 2 })
 
     // take 2 — fits. The two rows anchor and the cap returns to the configured 8.
+    rig.chain.failSubmit = null
     await rig.batcher.flush()
     expect(rig.chain.submissions).toHaveLength(1)
     expect(rig.chain.submissions[0]!.count).toBe(2)
     for (const { meta } of saves.slice(0, 2)) expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
 
-    // The leftover save goes in a fresh batch — past minGapMs for the successful submit first.
+    // The leftover six go in a fresh batch — past minGapMs for the successful submit first.
     rig.setNow(1_000)
     await rig.batcher.flush()
     expect(rig.chain.submissions).toHaveLength(2)
-    expect(rig.chain.submissions[1]!.count).toBe(1)
-    expect((await rig.store.get(saves[2]!.meta.contextId))!.state).toBe("ANCHORED")
+    expect(rig.chain.submissions[1]!.count).toBe(6)
+    for (const { meta } of saves) expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
   })
 
   it("a singleton batch that still exceeds the gas ceiling is REJECTED TOO_LARGE and the queue moves on", async () => {
@@ -623,11 +624,9 @@ describe("the batcher", () => {
         ? new MidaError("GAS_CEILING_EXCEEDED", "submitBatch: estimate exceeds the ceiling")
         : null
 
-    // take 2 → refused → cap 4; take 2 → refused → cap 2; take 2 → refused → cap 1.
-    for (const cap of [4, 2, 1]) {
-      await rig.batcher.flush()
-      expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 2, cap })
-    }
+    // take 2 → refused → the refused take halves to 1.
+    await rig.batcher.flush()
+    expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 2, cap: 1 })
     // take 1 — the oversized save alone, still refused: rejected store-side, not requeued.
     await rig.batcher.flush()
     expect((await rig.store.get(huge.meta.contextId))!).toMatchObject({ state: "REJECTED", reason: "TOO_LARGE" })
@@ -794,7 +793,47 @@ describe("the batcher", () => {
       return error
     }
     await rig.batcher.flush()
-    expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 300, cap: 200 })
+    // The refused take was 300 — halving IT gives 150, not halving the learned cap (401 → 200).
+    expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 300, cap: 150 })
+  })
+
+  it("a pre-send failure on an 8-row take halves the refused take — the next batch is 4, and nothing was sent", async () => {
+    const rig = makeRig({ cap: 8 })
+    const saves = Array.from({ length: 8 }, () => makeSave())
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+    // sent:false is how sendContract marks a failure from before writeContract — simulation,
+    // estimate, fee, balance guard: no transaction exists, so the failure is never ambiguous.
+    rig.chain.failSubmit = () => Object.assign(new Error("simulation reverted"), { sent: false })
+
+    await rig.batcher.flush()
+    expect(rig.chain.submissions).toHaveLength(0)
+    for (const { meta } of saves) expect((await rig.store.get(meta.contextId))!.state).toBe("QUEUED")
+    expect(rig.events.some((entry) => entry["event"] === "batch.presend-failed")).toBe(true)
+    expect(rig.events.some((entry) => entry["event"] === "batch.submit-failed")).toBe(false)
+
+    rig.chain.failSubmit = null
+    await rig.batcher.flush()
+    expect(rig.chain.submissions[0]!.count).toBe(4) // half the refused take, not half the cap's 400
+    rig.setNow(1_000) // past minGapMs — the first real send set lastSubmitAt
+    await rig.batcher.flush()
+    expect(rig.chain.submissions[1]!.count).toBe(4)
+    for (const { meta } of saves) expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
+  })
+
+  it("a pre-send failure on a batch of one requeues with the normal backoff — an outage is not TOO_LARGE", async () => {
+    const rig = makeRig({ cap: 8 })
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    rig.chain.failSubmit = () => Object.assign(new Error("rpc unreachable"), { sent: false })
+
+    await rig.batcher.flush()
+    expect(rig.chain.submissions).toHaveLength(0)
+    expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "QUEUED", reason: null })
+    expect(rig.timer.pending()).toBe(true) // the wait timer is the backoff
+
+    rig.chain.failSubmit = null
+    await rig.batcher.flush()
+    expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
   })
 
   it("an ambiguous send — recorded, then its answer lost — heals through the next batch's ALREADY_ANCHORED", async () => {
