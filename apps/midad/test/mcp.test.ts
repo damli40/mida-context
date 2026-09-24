@@ -506,6 +506,43 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
+  it("mida_whats_new returns the identity-unreadable text the daemon sent", async () => {
+    const dir = home()
+    const text = "Mida: assistant's identity in this Mida home (/h) exists but could not be read. Nothing was shared. Run `mida doctor`."
+    const fake = await fakeDaemon(dir, { "/whatsnew": { kind: "refused", reason: "identity-unreadable", text } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_whats_new")).toBe(text)
+      } finally {
+        await close()
+      }
+      expect(dir.has("state/lastseen/mcp-assistant-test1.json")).toBe(false)
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("mida_whats_new answers the identity-unreadable line for a reason-only refusal — never 'not set up'", async () => {
+    const dir = home()
+    // same reason-only shape as no-identity — a file that exists but will not load must not
+    // be reported as a missing agent
+    const fake = await fakeDaemon(dir, { "/whatsnew": { kind: "refused", reason: "identity-unreadable" } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_whats_new")).toBe(
+          `Mida: assistant's identity in this Mida home (${dir.root}) exists but could not be read. Nothing was shared. Run \`mida doctor\`.`,
+        )
+      } finally {
+        await close()
+      }
+      expect(dir.has("state/lastseen/mcp-assistant-test1.json")).toBe(false)
+    } finally {
+      await fake.stop()
+    }
+  })
+
   it("mida_read sends ['read','--as',agent,namespace] with the server's own cwd and prints the CLI's lines", async () => {
     const dir = home()
     const project = projectDir()

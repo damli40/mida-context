@@ -1,3 +1,4 @@
+import { statSync } from "node:fs"
 import { isAbsolute } from "node:path"
 import { isMidaError } from "@mida/protocol"
 import { defuse, mergeCheckpoints, renderHandoffReport } from "@mida/checkpoint"
@@ -72,6 +73,8 @@ const revokedText = (agent: string): string =>
   `Mida: ${agent}'s access was revoked by the owner. Nothing was shared.`
 export const noIdentityText = (agent: string, homeRoot: string): string =>
   `Mida: no agent "${agent}" is set up in this Mida home (${homeRoot}). Nothing was shared.`
+export const identityUnreadableText = (agent: string, homeRoot: string): string =>
+  `Mida: ${agent}'s identity in this Mida home (${homeRoot}) exists but could not be read. Nothing was shared. Run \`mida doctor\`.`
 const TAMPERED_TEXT = "Mida: the approved-projects list failed its signature check. Nothing was shared. Run `mida doctor`."
 const UNREADABLE_TEXT = "Mida: the approved-projects list could not be read: check the file's permissions. Nothing was shared. Run `mida doctor`."
 const EMPTY_TEXT = "Mida: connected. Nothing has been saved for this project yet."
@@ -164,7 +167,11 @@ export async function checkAccess(
     return { ok: false, reason: "bad-input", text: noContextText("bad-input") }
   }
   // an agent with no identity here is its own answer — never "not approved", never another
-  // agent's context; a file that exists but cannot load answers the same way
+  // agent's context. Absent and unreadable are different answers: `loadAgentIdentity` is quiet
+  // for a missing file AND for a stat the system refused — `home.has` uses existsSync, which
+  // reports EPERM/EACCES as absent — so a real stat asks again, and only ENOENT (or a path
+  // component that is not a directory) counts as "not set up". A file that is there but will
+  // not load — corrupt, or a refused read — gets its own refusal, not "no agent is set up".
   let identity: ReturnType<typeof loadAgentIdentity>
   try {
     identity = loadAgentIdentity(runtime.home, agent)
@@ -172,7 +179,16 @@ export async function checkAccess(
     identity = undefined
   }
   if (identity === undefined) {
-    return { ok: false, reason: "no-identity", text: noIdentityText(agent, runtime.home.root) }
+    let absent = false
+    try {
+      statSync(runtime.home.path(`agents/${agent}/identity.json`))
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      absent = code === "ENOENT" || code === "ENOTDIR"
+    }
+    return absent
+      ? { ok: false, reason: "no-identity", text: noIdentityText(agent, runtime.home.root) }
+      : { ok: false, reason: "identity-unreadable", text: identityUnreadableText(agent, runtime.home.root) }
   }
   const check = await (deps.checkProject ?? checkProject)(runtime, { agent, cwd: input.cwd })
   if (!check.ok) {

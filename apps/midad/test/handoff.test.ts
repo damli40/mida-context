@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { mkdtempSync } from "node:fs"
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { MidaError, PERMISSION, namespaceId } from "@mida/protocol"
@@ -224,7 +224,7 @@ describe("buildHandoff", () => {
     expect(projectChecked).toBe(false)
   })
 
-  it("an identity file that exists but will not load gets the same no-identity refusal", async () => {
+  it("an identity file that exists but will not load says so — never 'not set up'", async () => {
     home.writeSecretJson("agents/broken/identity.json", { name: "broken" })
     let projectChecked = false
     const result = await checkAccess(runtime, { agent: "broken", cwd: "/tmp/work" }, {
@@ -235,8 +235,26 @@ describe("buildHandoff", () => {
     })
     expect(result).toEqual({
       ok: false,
-      reason: "no-identity",
-      text: `Mida: no agent "broken" is set up in this Mida home (${runtime.home.root}). Nothing was shared.`,
+      reason: "identity-unreadable",
+      text: `Mida: broken's identity in this Mida home (${runtime.home.root}) exists but could not be read. Nothing was shared. Run \`mida doctor\`.`,
+    })
+    expect(projectChecked).toBe(false)
+  })
+
+  it("a corrupt identity file — present but unparseable — gets the same unreadable answer", async () => {
+    mkdirSync(join(home.root, "agents", "corrupt"), { recursive: true })
+    writeFileSync(join(home.root, "agents", "corrupt", "identity.json"), "not json")
+    let projectChecked = false
+    const result = await checkAccess(runtime, { agent: "corrupt", cwd: "/tmp/work" }, {
+      checkProject: async () => {
+        projectChecked = true
+        return OK
+      },
+    })
+    expect(result).toEqual({
+      ok: false,
+      reason: "identity-unreadable",
+      text: `Mida: corrupt's identity in this Mida home (${runtime.home.root}) exists but could not be read. Nothing was shared. Run \`mida doctor\`.`,
     })
     expect(projectChecked).toBe(false)
   })

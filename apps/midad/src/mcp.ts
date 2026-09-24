@@ -265,14 +265,17 @@ async function toolWhatsNew(deps: McpServerDeps) {
     if (reason === "list-unreadable") {
       return toolText("Mida: the approved-projects list could not be read: check the file's permissions. Nothing was shared. Run `mida doctor`.")
     }
-    // the no-identity refusal carries its own line: the daemon's `text` when it sends one —
+    // the two identity refusals carry their own lines: the daemon's `text` when it sends one —
     // a /whatsnew refusal answers reason-only, so the same line is reproduced here the way the
-    // ones above are (handoff.ts stays out of this module's graph)
-    if (reason === "no-identity") {
+    // ones above are (handoff.ts stays out of this module's graph). "identity-unreadable" means
+    // the file is there but will not load — never report that as "not set up".
+    if (reason === "no-identity" || reason === "identity-unreadable") {
       return toolText(
         typeof body.text === "string"
           ? body.text
-          : `Mida: no agent "${deps.agent}" is set up in this Mida home (${deps.home.root}). Nothing was shared.`,
+          : reason === "no-identity"
+            ? `Mida: no agent "${deps.agent}" is set up in this Mida home (${deps.home.root}). Nothing was shared.`
+            : `Mida: ${deps.agent}'s identity in this Mida home (${deps.home.root}) exists but could not be read. Nothing was shared. Run \`mida doctor\`.`,
       )
     }
     return toolText(`Mida: no context available right now (${reason}).`)
