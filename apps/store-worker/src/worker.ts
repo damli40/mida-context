@@ -153,18 +153,20 @@ function batchingOptions(env: WorkerEnv, deployment: Deployment, publicClient: P
     return undefined
   }
   deployment.batchAnchor = batchAnchor
-  // The anchor's deploy block floors the coordinator's historical scans. A non-numeric value is a
-  // configuration error and fails at boot, not inside the object mid-scan.
-  if (env.BATCH_ANCHOR_BLOCK !== undefined && env.BATCH_ANCHOR_BLOCK !== "") {
-    if (!/^(0|[1-9][0-9]*)$/.test(env.BATCH_ANCHOR_BLOCK)) {
-      throw new Error("environment variable BATCH_ANCHOR_BLOCK must be a non-negative integer")
-    }
-    deployment.batchAnchorBlock = BigInt(env.BATCH_ANCHOR_BLOCK)
-  }
   let receiptAccount: LocalAccount | undefined
   let verifyAnchor: (() => Promise<void>) | undefined
   let ownerAllowlist: Address[] | undefined
   if (enabled) {
+    // The anchor's deploy block floors the coordinator's historical scans — only the enabled lane
+    // ever reads it, so a placeholder beside BATCHING_ENABLED="false" stays inert rather than
+    // failing a boot that never asks it anything. Enabled, a non-numeric value is a configuration
+    // error and fails at boot, not inside the object mid-scan.
+    if (env.BATCH_ANCHOR_BLOCK !== undefined && env.BATCH_ANCHOR_BLOCK !== "") {
+      if (!/^(0|[1-9][0-9]*)$/.test(env.BATCH_ANCHOR_BLOCK)) {
+        throw new Error("environment variable BATCH_ANCHOR_BLOCK must be a non-negative integer")
+      }
+      deployment.batchAnchorBlock = BigInt(env.BATCH_ANCHOR_BLOCK)
+    }
     if (env.BATCH_COORDINATOR === undefined) {
       throw new Error("BATCHING_ENABLED=true requires the BATCH_COORDINATOR Durable Object binding")
     }

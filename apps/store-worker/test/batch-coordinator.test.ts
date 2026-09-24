@@ -436,17 +436,38 @@ describe("the batch coordinator Durable Object", () => {
     expect(coordinator).toBeDefined()
   })
 
-  it("BATCH_ANCHOR_BLOCK must be an integer — a non-numeric value fails the object's construction", async () => {
+  it("BATCH_ANCHOR_BLOCK must be an integer while the lane is on — off, a bad value cannot wedge the queue", async () => {
     // No chain override: the constructor builds the real adapter, which is where the env parse
     // lives — the deployment only assembles when BATCHER_PRIVATE_KEY is also valid.
     const keyedEnv: BatchCoordinatorEnv = { ...env, BATCHER_PRIVATE_KEY: `0x${"44".repeat(32)}` }
     expect(
-      () => new BatchCoordinator(new FakeState(), { ...keyedEnv, BATCH_ANCHOR_BLOCK: "soon" }, { store: new FakeStore() }),
+      () =>
+        new BatchCoordinator(
+          new FakeState(),
+          { ...keyedEnv, BATCHING_ENABLED: "true", BATCH_ANCHOR_BLOCK: "soon" },
+          { store: new FakeStore() },
+        ),
     ).toThrow("BATCH_ANCHOR_BLOCK")
+
+    // workerd can still construct the object on a stale alarm after the flag went off — a queued
+    // batch is owed a run either way, so a placeholder block is ignored rather than fatal. The
+    // deployment then floors its scans at deploymentBlock.
+    const off = new FakeState()
+    const offCoordinator = new BatchCoordinator(
+      off,
+      { ...keyedEnv, BATCHING_ENABLED: "false", BATCH_ANCHOR_BLOCK: "soon" },
+      { store: new FakeStore() },
+    )
+    await off.ready
+    expect(offCoordinator).toBeDefined()
 
     // A numeric value constructs: the coordinator's deployment carries it as batchAnchorBlock.
     const ctx = new FakeState()
-    const coordinator = new BatchCoordinator(ctx, { ...keyedEnv, BATCH_ANCHOR_BLOCK: "4242" }, { store: new FakeStore() })
+    const coordinator = new BatchCoordinator(
+      ctx,
+      { ...keyedEnv, BATCHING_ENABLED: "true", BATCH_ANCHOR_BLOCK: "4242" },
+      { store: new FakeStore() },
+    )
     await ctx.ready
     expect(coordinator).toBeDefined()
   })

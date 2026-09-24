@@ -557,10 +557,11 @@ describe("the worker entry", () => {
     }
   })
 
-  it("a non-numeric BATCH_ANCHOR_BLOCK beside a real BATCH_ANCHOR fails the whole worker at boot", async () => {
+  it("a non-numeric BATCH_ANCHOR_BLOCK fails the enabled lane at boot — and is inert while the lane is off", async () => {
     const vars = envVars(rpc.url)
     vars["BATCH_ANCHOR"] = "0x1111111111111111111111111111111111111aa5"
     vars["BATCH_ANCHOR_BLOCK"] = "yesterday"
+    vars["BATCHING_ENABLED"] = "true"
     const bad = await makeWorker(await bundleWorker(), vars)
     try {
       const response = await bad.mf.dispatchFetch("http://worker.test/")
@@ -569,6 +570,19 @@ describe("the worker entry", () => {
     } finally {
       await bad.mf.dispose()
     }
+  })
+
+  it("a placeholder BATCH_ANCHOR_BLOCK beside BATCHING_ENABLED=false boots and serves non-batch routes", async () => {
+    // The shipped wrangler.toml carries BATCH_ANCHOR_BLOCK = "REPLACE_WITH_BATCH_ANCHOR_BLOCK" —
+    // a lane that is off must never read it, or every route 500s on a value nothing will use.
+    const laneEnv: WorkerEnv = {
+      ...env(db, rpc.url),
+      BATCH_ANCHOR: "0x1111111111111111111111111111111111111aa5",
+      BATCH_ANCHOR_BLOCK: "REPLACE_WITH_BATCH_ANCHOR_BLOCK",
+      BATCHING_ENABLED: "false",
+    }
+    expect((await handleRequest(laneEnv, new Request("http://worker.test/"))).status).toBe(200)
+    expect(await (await handleRequest(laneEnv, new Request("http://worker.test/batch/status"))).json()).toMatchObject({ enabled: false })
   })
 
   it("a disabled batch lane needs no receipt key — the store boots and the surface answers off", async () => {

@@ -54,6 +54,13 @@ export interface BatchCoordinatorEnv {
   VAULT_RP_ID_HASH: string
   BATCH_ANCHOR: string
   BATCHER_PRIVATE_KEY: string
+  /**
+   * Read only for the BATCH_ANCHOR_BLOCK check below: a malformed block value refuses the object
+   * while the lane is on, but not after it goes off — workerd can rebuild the object on a stale
+   * alarm, and a queue it owes a batch must not wedge on a placeholder string. The flag gates
+   * nothing else here; admission is the routes' job.
+   */
+  BATCHING_ENABLED?: string
   /** The block BatchAnchor was deployed in — the floor for historical SaveAnchored scans. */
   BATCH_ANCHOR_BLOCK?: string
 }
@@ -119,8 +126,13 @@ export interface BatchCoordinatorOverrides {
 
 function coordinatorDeployment(env: BatchCoordinatorEnv): Deployment {
   const rawAnchorBlock = env.BATCH_ANCHOR_BLOCK
-  if (rawAnchorBlock !== undefined && rawAnchorBlock !== "" && !/^(0|[1-9][0-9]*)$/.test(rawAnchorBlock)) {
-    throw new Error("BATCH_ANCHOR_BLOCK must be a non-negative integer")
+  const numeric = rawAnchorBlock !== undefined && /^(0|[1-9][0-9]*)$/.test(rawAnchorBlock)
+  // A malformed value refuses construction only while the lane is enabled — the worker's own boot
+  // check fails such an env before any notify reaches here. Disabled, the value is ignored: a
+  // missing floor just means historical scans start at deploymentBlock, never below it.
+  if (rawAnchorBlock !== undefined && rawAnchorBlock !== "" && !numeric) {
+    if (env.BATCHING_ENABLED === "true") throw new Error("BATCH_ANCHOR_BLOCK must be a non-negative integer")
+    console.log(JSON.stringify({ component: "batch-coordinator", event: "batch.anchor-block-ignored" }))
   }
   return {
     chainId: BigInt(env.CHAIN_ID),
@@ -134,7 +146,7 @@ function coordinatorDeployment(env: BatchCoordinatorEnv): Deployment {
     // Without it, findAnchoring — the historical contextId scan — starts at the registries'
     // deployment block, thousands of blocks before the anchor existed. Per-batch resolve scans
     // never use this floor: they read only the batch's own block, taken from batchOf.
-    batchAnchorBlock: rawAnchorBlock === undefined || rawAnchorBlock === "" ? undefined : BigInt(rawAnchorBlock),
+    batchAnchorBlock: numeric ? BigInt(rawAnchorBlock) : undefined,
   }
 }
 
