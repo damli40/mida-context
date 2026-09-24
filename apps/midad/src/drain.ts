@@ -24,6 +24,7 @@ import type { ProjectCheck } from "./projects.js"
 import { findProjectMarker, isSafeName, listJobs, moveToBad, removeJob } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
 import type { ServiceRuntime } from "./runtime.js"
+import { followPendingAnchors, pendingAnchors } from "./batching.js"
 import { isCapabilityLive } from "./skeleton.js"
 import { saveCheckpoint } from "./skeleton.js"
 
@@ -110,6 +111,8 @@ interface SessionState {
 
 export interface DrainResult {
   saved: number
+  /** Saves the store queued for a shared batch — not final; the pending ledger owns them until ANCHORED or REJECTED. */
+  queued?: number
   skippedUnchanged: number
   skippedTooSoon: number
   failed: number
@@ -119,7 +122,7 @@ export interface DrainResult {
   lockHeld?: boolean
 }
 
-const emptyResult = (): DrainResult => ({ saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0, earliestDueMs: null })
+const emptyResult = (): DrainResult => ({ saved: 0, queued: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0, earliestDueMs: null })
 
 /**
  * One drain under `queue/drain.lock`: hooks fire often, so a second drainer that finds a live
@@ -162,6 +165,7 @@ export async function drainUntilSettled(deps: DrainDeps): Promise<DrainResult> {
     for (;;) {
       const result = await drainPass(deps, now)
       total.saved += result.saved
+      total.queued = (total.queued ?? 0) + (result.queued ?? 0)
       total.failed += result.failed
       total.skippedUnchanged += result.skippedUnchanged
       total.skippedTooSoon += result.skippedTooSoon
@@ -169,7 +173,7 @@ export async function drainUntilSettled(deps: DrainDeps): Promise<DrainResult> {
       // a job that arrived mid-pass was never listed by it: a pass that saved, or one that left
       // jobs it cannot account for, re-lists and goes again — bounded so a queue that never
       // empties cannot loop the drainer forever
-      if (remaining > 0 && extraPasses < MAX_EXTRA_PASSES && (result.saved > 0 || result.earliestDueMs === null)) {
+      if (remaining > 0 && extraPasses < MAX_EXTRA_PASSES && (result.saved > 0 || (result.queued ?? 0) > 0 || result.earliestDueMs === null)) {
         extraPasses += 1
         continue
       }
@@ -408,10 +412,41 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         for (const field of CONTENT_FIELDS) content[field] = envelope.checkpoint[field]
         deps.home.writeSecretJson(`queue/state/${sessionId}.last.json`, content)
         removeJob(deps.home, job.id)
+        if (saved.batched !== undefined) {
+          counts.queued = (counts.queued ?? 0) + 1
+          // the store took responsibility for the save, so the job is done — but "queued" is all
+          // it is: the pending ledger owns it now, and "saved" is logged only when
+          // followPendingAnchors sees the batch ANCHORED on chain
+          log({
+            sessionId,
+            outcome: "queued",
+            lane: "batched",
+            eventId,
+            contextId: saved.contextId,
+            model: envelope.compiledBy,
+            compileMs: compileMeta.compileMs,
+            saveMs: saved.milliseconds,
+            attempts: compileMeta.attempts,
+            retried: compileMeta.retried,
+            reusedCompiled,
+            trimmed: compileMeta.trimmed,
+            droppedKeys: compileMeta.droppedKeys,
+            fellBack: compileMeta.fellBack,
+            cacheHit: compileMeta.cacheHit,
+            cacheMiss: compileMeta.cacheMiss,
+            inputTokens: compileMeta.inputTokens,
+            outputTokens: compileMeta.outputTokens,
+          })
+          continue
+        }
         counts.saved += 1
         log({
           sessionId,
           outcome: "saved",
+          lane: saved.lane ?? "direct",
+          // laneWhy is set only when the setup asked for batching and the save went direct anyway —
+          // the store was disabled, unreachable, or the lane check itself failed
+          ...(saved.laneWhy !== undefined ? { laneWhy: saved.laneWhy } : {}),
           eventId,
           // the model that actually wrote the checkpoint — a fallback save names the fallback
           model: envelope.compiledBy,
@@ -484,6 +519,17 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         dueSooner(now().getTime() + backoffMs(attempts))
         log({ sessionId, outcome: "failed", reason: code, attempts, ...fields })
       }
+    }
+    // The batched lane's follow-up: every pass asks the store where each ledger-owned save stands.
+    // ANCHORED is logged "saved" here — the only place a batched save earns that outcome — and a
+    // status error leaves the entry untouched, never dropped, never called final. An empty ledger
+    // costs nothing and opens nothing.
+    try {
+      if (pendingAnchors(deps.home).length > 0) {
+        await followPendingAnchors(await openRuntime(), log)
+      }
+    } catch {
+      log({ outcome: "note", reason: "pending-follow-failed" })
     }
   } finally {
     if (opened !== undefined) await opened.close()

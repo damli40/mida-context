@@ -12,6 +12,9 @@ import { COMPILE_PROVIDERS, compileModelChoice } from "@mida/compiler"
 import { ContextApiClient, DenyOverlay, RegistryReader } from "@mida/api"
 import type { RevocationTarget } from "@mida/api"
 import type { LocalAccount } from "viem"
+import { batchClient, batchStatusProbe, decideLane, pendingAnchors, rejectedAnchors } from "./batching.js"
+import type { Lane, PendingAnchor } from "./batching.js"
+import { laneWhyText } from "./batching.js"
 import { callDaemon } from "./control.js"
 import { codeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
@@ -23,8 +26,8 @@ import type { OwnerMode } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
 import { listJobs } from "./queue.js"
 import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, serviceUrlInEffect, sponsorReachable } from "./runtime.js"
-import { mismatchLine, resolveNetwork } from "./network.js"
-import type { ResolvedNetwork, ServiceSource } from "./network.js"
+import { mismatchLine, readSavedNetwork, resolveNetwork } from "./network.js"
+import type { ResolvedNetwork, SavedNetwork, ServiceSource } from "./network.js"
 import { cliPackageName, isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
 
 /** The whole run is capped — a check may stall, the report may not. */
@@ -46,6 +49,12 @@ export interface DoctorDeps {
   daemonProbeMs?: number
   /** Whole-run cap; default 20 s. */
   capMs?: number
+  /**
+   * Asks the store where a pending batched save stands — the default is a signed
+   * `getBatchSave` as the entry's own agent; null means "could not find out", which counts as
+   * still waiting. Injectable so tests script the store's answer.
+   */
+  probeBatchSave?: (entry: PendingAnchor) => Promise<{ state: string; reason: string | null } | null>
 }
 
 interface DoctorLiveDeps extends DoctorDeps {
@@ -70,6 +79,8 @@ interface Shared {
 
 const problem = (sentence: string, fix: string) => `PROBLEM: ${sentence} — ${fix}`
 const INIT_FIX = "run `mida init`"
+/** A batched save still QUEUED or SUBMITTED this long is a stuck-batch report, not a note. */
+const STUCK_ANCHOR_MS = 10 * 60 * 1000
 
 /** A thrown check becomes a PROBLEM line with a stable code — never a raw error message. */
 function stableCode(error: unknown): string {
@@ -240,7 +251,7 @@ function hookCommandFix(): string {
 }
 
 /** The HOST of a service URL — the path or query could carry an operator's key, so only the host is ever printed. */
-function hostOf(raw: string): string {
+export function hostOf(raw: string): string {
   try {
     const host = new URL(raw).host
     return host === "" ? "an address that does not parse" : host
@@ -678,6 +689,95 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         const oldest = jobs.reduce((min, job) => Math.min(min, Date.parse(job.at)), Number.POSITIVE_INFINITY)
         const ageMs = Math.max(0, (deps.now ?? Date.now)() - oldest)
         return [`ok: ${jobs.length} job(s) waiting; oldest ${ageText(ageMs)}`]
+      },
+    },
+    {
+      name: "batching",
+      run: async () => {
+        // The lane line reports what the NEXT save would do — the same decideLane the save path
+        // runs. The flag comes from the raw file (resolution may have failed), the contract and
+        // store from the resolved network so adoption and env overrides match the daemon's view.
+        const resolved = await resolveShared(deps, shared)
+        let saved: SavedNetwork | undefined
+        try {
+          saved = readSavedNetwork(home)
+        } catch {
+          saved = undefined
+        }
+        const deployment = resolved?.network.deployment ?? saved?.deployment
+        const storageUrl = resolved?.network.storageUrl ?? saved?.storageUrl
+        const lane: Lane =
+          deployment === undefined
+            ? { kind: "direct", why: "no-batch-anchor" }
+            : await decideLane({ saved, deployment, storageUrl, status: () => batchStatusProbe(storageUrl ?? "") })
+        const lines: string[] = [
+          lane.kind === "batched"
+            ? `ok: checkpoint saves: batched via ${hostOf(lane.storeUrl)}`
+            : "ok: checkpoint saves: one transaction each",
+        ]
+        // the lane line itself is informational — but a switch turned on that still resolves to
+        // the direct lane is a configuration the owner meant to be different
+        if (lane.kind === "direct" && saved?.batching === true) {
+          lines.push(
+            problem(
+              `batching is on but saves are taking the direct lane: ${laneWhyText(lane.why)}`,
+              "check the store or run `mida batching off`",
+            ),
+          )
+        }
+        for (const entry of rejectedAnchors(home)) {
+          lines.push(
+            problem(
+              `a checkpoint save was rejected on chain (${entry.reason}, session ${entry.sessionId})`,
+              "it was not anchored; check the agent's approval with `mida doctor`",
+            ),
+          )
+        }
+        const pending = pendingAnchors(home)
+        if (pending.length > 0) {
+          const nowMs = (deps.now ?? Date.now)()
+          const young: PendingAnchor[] = []
+          const old: PendingAnchor[] = []
+          for (const entry of pending) {
+            const queuedAt = Date.parse(entry.queuedAt)
+            ;(Number.isNaN(queuedAt) || nowMs - queuedAt >= STUCK_ANCHOR_MS ? old : young).push(entry)
+          }
+          // An old entry the store already reports final is not stuck — the ledger simply has not
+          // been followed since it landed. Asking the store before crying wolf keeps a quiet
+          // setup (no drain pass to run the follow-up) from reporting a stuck batcher forever.
+          const probe =
+            deps.probeBatchSave ??
+            (async (entry: PendingAnchor) => {
+              if (storageUrl === undefined || deployment === undefined) return null
+              const client = batchClient(home, storageUrl, deployment, entry.agent)
+              return client === undefined ? null : await client.getBatchSave(entry.contextId).catch(() => null)
+            })
+          let stuck = 0
+          for (const entry of old) {
+            const answer = await probe(entry)
+            if (answer !== null && answer.state === "ANCHORED") continue
+            if (answer !== null && answer.state === "REJECTED") {
+              lines.push(
+                problem(
+                  `a checkpoint save was rejected on chain (${answer.reason ?? "unknown"}, session ${entry.sessionId})`,
+                  "it was not anchored; check the agent's approval with `mida doctor`",
+                ),
+              )
+              continue
+            }
+            stuck += 1
+          }
+          if (stuck > 0) {
+            lines.push(
+              problem(
+                `${stuck} checkpoint save(s) waiting to anchor for over 10 minutes`,
+                `check the store${storageUrl === undefined ? "" : ` at ${hostOf(storageUrl)}`}`,
+              ),
+            )
+          }
+          if (young.length > 0) lines.push(`note: ${young.length} checkpoint save(s) pending anchor (PENDING_ANCHOR)`)
+        }
+        return lines
       },
     },
     {

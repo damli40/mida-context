@@ -7,8 +7,11 @@ import type { ChainContext, HistoryScanCursor } from "@mida/chain"
 import { DENY_CANCEL_EXPIRY_SECONDS, provisionAgent } from "@mida/fake-vault"
 import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
+import type { BatchReceipt } from "@mida/api"
 import type { StoredCheckpoint } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
+import { addPendingAnchor, laneForSave } from "./batching.js"
+import type { Lane } from "./batching.js"
 import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl, sponsorReachable } from "./runtime.js"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { resolveNetwork } from "./network.js"
@@ -542,7 +545,7 @@ async function saveReceipt(runtime: ServiceRuntime, transactionHash: Hex): Promi
 
 /** Spec §5C steps 4–5: wrap, encrypt, upload and register on Monad under the agent's own key. A second save carrying
  * an eventId this project already has is a drainer retry after a crash — answer with the existing record, send nothing. */
-export async function saveCheckpoint(runtime: ServiceRuntime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean; receipt?: SaveReceipt; receiptMs?: number }> {
+export async function saveCheckpoint(runtime: ServiceRuntime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean; lane?: "direct" | "batched"; laneWhy?: string; batched?: { state: "QUEUED"; receipt: BatchReceipt }; receipt?: SaveReceipt; receiptMs?: number }> {
   const envelope = wrapCheckpoint(input)
   const started = Date.now()
   const agent = runtime.agent(name)
@@ -554,6 +557,20 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
     if (isRevoked(runtime.home, name)) throw new MidaError("CAPABILITY_REVOKED", `agent ${name} has been revoked`)
     return { contextId: known, transactionHash: null, milliseconds: Date.now() - started, duplicate: true }
   }
+  // Which lane this save takes — one shared transaction (batched) or its own (direct). The
+  // decision may throw (an unreadable network.json); a failed decision is still a direct save —
+  // never a dropped save — and the drain log names the reason as laneWhy.
+  let lane: Lane
+  let laneWhy: string | undefined
+  try {
+    lane = await laneForSave(runtime, name)
+    // "switch-off" is the everyday answer and needs no explanation on the line; the other whys
+    // all mean the setup asked for batching and could not get it — worth recording once per save
+    if (lane.kind === "direct" && lane.why !== "switch-off") laneWhy = lane.why
+  } catch (error) {
+    lane = { kind: "direct", why: "switch-off" }
+    laneWhy = typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : "decision-failed"
+  }
   // An agent without READ has nothing readable and proceeds to create; the create itself is what
   // the chain judges. Any OTHER read failure is real and must surface — swallowing it would turn
   // a broken connection into a duplicate write.
@@ -564,12 +581,53 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
     if (!isMidaError(error, "CAPABILITY_DENIED")) throw error
     objects = []
   }
+  if (lane.kind === "batched") {
+    // The batch queue is a second place a save can already exist: an anchored or still-pending
+    // batched row is as much a duplicate as a directly-anchored object. Same denial tolerance as
+    // the direct read — a partial answer is never trusted enough to save on top of.
+    try {
+      const batched = await agent.readBatchedWithStatus(runtime.owner, NAMESPACE)
+      if (batched.partial) {
+        throw new MidaError("PARTIAL_READ", "the batched checkpoint list was incomplete — refusing to risk a duplicate save")
+      }
+      objects = [...objects, ...batched.anchored, ...batched.pending]
+    } catch (error) {
+      if (!isMidaError(error, "CAPABILITY_DENIED")) throw error
+    }
+  }
   const existing = objects
     .map((object) => ({ object, found: unwrapCheckpoint(object.payload.value) }))
     .find(({ found }) => found !== null && found.projectId === envelope.projectId && found.checkpoint.eventId === envelope.checkpoint.eventId)
   if (existing !== undefined) {
     recordSavedId(runtime.home, envelope.checkpoint.eventId, existing.object.contextId)
     return { contextId: existing.object.contextId, transactionHash: null, milliseconds: Date.now() - started, duplicate: true }
+  }
+  if (lane.kind === "batched") {
+    // The store's receipt only means the save was queued — the pending ledger owns it from here
+    // until the chain says ANCHORED or REJECTED. transactionHash stays null: no transaction of
+    // this save's own exists yet, and none may ever.
+    const queued = await agent.createBatched(runtime.owner, NAMESPACE, {
+      value: { ...envelope },
+      kind: "EPISODE",
+      source: "AGENT_INFERRED",
+      tags: ["mida-checkpoint", envelope.checkpoint.eventId],
+    })
+    recordSavedId(runtime.home, envelope.checkpoint.eventId, queued.contextId)
+    addPendingAnchor(runtime.home, {
+      contextId: queued.contextId,
+      eventId: envelope.checkpoint.eventId,
+      sessionId: input.sessionId,
+      agent: name,
+      queuedAt: new Date().toISOString(),
+    })
+    return {
+      contextId: queued.contextId,
+      transactionHash: null,
+      milliseconds: Date.now() - started,
+      duplicate: false,
+      lane: "batched",
+      batched: { state: "QUEUED", receipt: queued.receipt },
+    }
   }
   const object = await agent.create(runtime.owner, NAMESPACE, {
     value: { ...envelope },
@@ -594,6 +652,8 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
     transactionHash,
     milliseconds,
     duplicate: false,
+    lane: "direct",
+    ...(laneWhy !== undefined ? { laneWhy } : {}),
     ...(receipt !== undefined ? { receipt } : {}),
     ...(receiptMs !== undefined ? { receiptMs } : {}),
   }
