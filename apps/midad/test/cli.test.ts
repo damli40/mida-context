@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { mkdtempSync, readFileSync, readdirSync, statSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { BaseError } from "viem"
@@ -445,6 +445,18 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     expect(code).toBe(1)
     expect(lines).toEqual([`Mida: no agent "ghost" is set up in this Mida home (${stub.home.root}). Nothing was shared.`])
     expect(lines.every((line) => !line.startsWith("refused:"))).toBe(true)
+  })
+
+  it("mida read --as <corrupt identity> says the file exists but cannot be read — never 'not set up'", async () => {
+    const stub = stubRuntime(new Error("unreached"))
+    mkdirSync(join(stub.home.root, "agents", "corrupt"), { recursive: true })
+    writeFileSync(join(stub.home.root, "agents", "corrupt", "identity.json"), "not json")
+    const lines: string[] = []
+    const code = await runCliWithRuntime(["read", "--as", "corrupt", "projects.current"], stub, (line) => lines.push(line))
+    expect(code).toBe(1)
+    expect(lines).toEqual([
+      `Mida: corrupt's identity in this Mida home (${stub.home.root}) exists but could not be read. Nothing was shared. Run \`mida doctor\`.`,
+    ])
   })
 
   it("an agent name that cannot be an identity is still usage — never read under it", async () => {

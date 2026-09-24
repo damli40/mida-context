@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { realpathSync } from "node:fs"
+import { realpathSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -13,7 +13,7 @@ import { callDaemon, ensureCurrentDaemon } from "./control.js"
 import { batchStatusProbe, decideLane, laneWhyText } from "./batching.js"
 import { debugLine, refusalCode } from "./debug-line.js"
 import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
-import { noIdentityText } from "./handoff.js"
+import { identityUnreadableText, noIdentityText } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeCode, uninstallCodex } from "./install.js"
@@ -221,6 +221,9 @@ export async function runCliWithRuntime(
         // produces.
         // The same identity gate the other read routes enforce at checkAccess, first: a missing
         // or unloadable identity is its own refusal — never a namespace read under another name.
+        // Absent and unreadable are different answers, exactly as in checkAccess: a stat that
+        // answers ENOENT/ENOTDIR means "not set up"; anything else that leaves no identity —
+        // corrupt JSON, a refused read — means "exists but could not be read".
         let identity: ReturnType<typeof loadAgentIdentity>
         try {
           identity = loadAgentIdentity(runtime.home, agent)
@@ -228,7 +231,14 @@ export async function runCliWithRuntime(
           identity = undefined
         }
         if (identity === undefined) {
-          print(noIdentityText(agent, runtime.home.root))
+          let absent = false
+          try {
+            statSync(runtime.home.path(`agents/${agent}/identity.json`))
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code
+            absent = code === "ENOENT" || code === "ENOTDIR"
+          }
+          print(absent ? noIdentityText(agent, runtime.home.root) : identityUnreadableText(agent, runtime.home.root))
           return 1
         }
         const only = argv[3]
