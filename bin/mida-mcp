@@ -5,4 +5,13 @@
 # absolutely too; a bare `--import tsx` would not resolve from the client's folder.
 # stdout is the JSON-RPC channel: nothing may print to it but the protocol.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-exec node --import "$ROOT/node_modules/tsx/dist/loader.mjs" "$ROOT/apps/midad/src/mcp-main.ts" "$@"
+NODE=$(command -v node 2>/dev/null)
+for candidate in /opt/homebrew/bin/node /usr/local/bin/node "$HOME/.volta/bin/node"; do
+  [ -n "$NODE" ] && break
+  [ -x "$candidate" ] && NODE=$candidate
+done
+if [ -z "$NODE" ]; then
+  echo "mida-mcp: node was not found on PATH or in the usual places — put the absolute path to node in your client's MCP config as the command" >&2
+  exit 127
+fi
+exec "$NODE" --import "$ROOT/node_modules/tsx/dist/loader.mjs" "$ROOT/apps/midad/src/mcp-main.ts" "$@"

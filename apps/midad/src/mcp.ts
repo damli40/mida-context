@@ -1,3 +1,4 @@
+import { statSync } from "node:fs"
 import { basename, dirname, resolve } from "node:path"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from "@modelcontextprotocol/sdk/types.js"
@@ -6,6 +7,7 @@ import type { MidaHome } from "./home.js"
 import { degradedMessage } from "./hook-output.js"
 import type { SessionStartBody } from "./hook-output.js"
 import { appendLog } from "./log.js"
+import { findProjectMarker } from "./queue.js"
 import { writeSeen } from "./seen.js"
 
 /**
@@ -85,6 +87,41 @@ export function parseMcpArgs(argv: string[]): { ok: true; args: McpArgs } | { ok
   const name = agent ?? "assistant"
   if (!AGENT_NAME.test(name)) return { ok: false, error: `bad agent name "${name}" — lower-case letters, digits and "-" only` }
   return { ok: true, args: { agent: name, project: resolve(project ?? process.cwd()), projectGiven: project !== undefined } }
+}
+
+/** "yes", "no", or "blocked" — a refused read is not a missing file. */
+function probe(path: string): "yes" | "no" | "blocked" {
+  try {
+    statSync(path)
+    return "yes"
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    return code === "EPERM" || code === "EACCES" ? "blocked" : "no"
+  }
+}
+
+const blockedLine = (path: string) =>
+  `${path} could not be read (the system refused access). If it is under Desktop, Documents or Downloads, macOS blocks desktop apps from it — move Mida or the project out of those folders.`
+
+/**
+ * Refuses to serve — before a daemon is found or started — when the configured identity is not
+ * registered in this home, or the project folder carries no Mida marker. Desktop clients launch
+ * servers with their own environment and folder, so a wrong MIDA_HOME or a missing --project is
+ * the common failure; naming which one beats every tool answering "not approved". The identity
+ * file is checked for existence only: this module never reads key material (import-graph test).
+ */
+export function startupCheck(home: MidaHome, args: McpArgs): { ok: true } | { ok: false; error: string } {
+  const identityPath = home.path(`agents/${args.agent}/identity.json`)
+  const identity = probe(identityPath)
+  if (identity === "blocked") return { ok: false, error: blockedLine(identityPath) }
+  if (identity === "no") {
+    return { ok: false, error: `no agent "${args.agent}" is set up in the Mida home ${home.root} — check MIDA_HOME in this client's config` }
+  }
+  if (probe(args.project) === "blocked") return { ok: false, error: blockedLine(args.project) }
+  if (findProjectMarker(args.project) === null) {
+    return { ok: false, error: `${args.project} is not a Mida project folder — start the server with --project <your project folder>` }
+  }
+  return { ok: true }
 }
 
 /** The stable tool surface — names and input schemas are API; the report carries them verbatim. */

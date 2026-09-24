@@ -6,7 +6,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { ensureDaemon } from "./control.js"
 import { resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
-import { MCP_USAGE, createMidaMcpServer, parseMcpArgs } from "./mcp.js"
+import { MCP_USAGE, createMidaMcpServer, parseMcpArgs, startupCheck } from "./mcp.js"
 import { siblingEntryArgs } from "./sibling.js"
 
 /**
@@ -45,6 +45,13 @@ async function main(): Promise<void> {
     return
   }
   const home = resolveHome(process.env)
+  const gate = startupCheck(home, parsed.args)
+  if (!gate.ok) {
+    // before ensureDaemon: a wrong MIDA_HOME must not start a key-less daemon in the wrong home
+    process.stderr.write(`mida-mcp: ${gate.error}\n`)
+    process.exitCode = 2
+    return
+  }
   // one session id per server instance — the whats-new seen set lives under it for this process's life
   const sessionId = `mcp-${parsed.args.agent}-${randomBytes(4).toString("hex")}`
   const up = home.has("network.json") && (await ensureDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS }))

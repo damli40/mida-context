@@ -70,7 +70,7 @@ export { CheckpointCopies, WHATS_NEW_HEADER, buildWhatsNew, readSeen, writeSeen 
 export type { WhatsNewDeps, WhatsNewResult } from "./whatsnew.js"
 export { agoText, degradedMessage, hookReply, sessionStartMessage, systemMessage, whatsNewMessage } from "./hook-output.js"
 export type { SessionStartBody } from "./hook-output.js"
-export { AGENT_NAME, MCP_TOOLS, MCP_USAGE, READ_NAMESPACES, createMidaMcpServer, parseMcpArgs } from "./mcp.js"
+export { AGENT_NAME, MCP_TOOLS, MCP_USAGE, READ_NAMESPACES, createMidaMcpServer, parseMcpArgs, startupCheck } from "./mcp.js"
 export type { McpArgs, McpServerDeps, ReadNamespace } from "./mcp.js"
 export {
   CODEX_BLOCK,

@@ -7,8 +7,9 @@
 //     · npx mida --help exits 0 and prints the command list
 //     · npx mida doctor on an empty MIDA_HOME prints checks, never a stack
 //     · npx mida-hook claude-code on empty stdin exits 0 inside 2 s
-//     · npx mida-mcp refuses a bad flag on stderr, and a well-formed launch on an empty home
-//       starts the stdio server and exits cleanly when the client closes stdin
+//     · npx mida-mcp refuses a bad flag on stderr; an empty home refuses at startup (no identity,
+//       before any daemon); a registered identity in a marked project starts the stdio server
+//       and exits cleanly when the client closes stdin
 //     · a 6-line consumer importing the SDK runs under plain node and type-checks with tsc
 //     · the installed packages hold no .ts source, no .env, no test/ dirs, nothing under
 //       brand/, and no 64-hex literal that is not a committed public constant
@@ -94,15 +95,27 @@ check(!/^\s+at\s/m.test(doctorText) && !doctorText.includes("node:internal"), "m
 const hook = run(["npx", "--no-install", "mida-hook", "claude-code"], { cwd: project, env, input: "", timeout: 2_000 })
 check(hook.status === 0 && !hook.error, "mida-hook claude-code on empty stdin exits 0 inside 2 s")
 
-// the MCP adapter is a long-lived stdio server — what a spawn can prove is the refusal path and
-// that a well-formed launch comes up even with no daemon to reach, then exits on stdin close
+// the MCP adapter is a long-lived stdio server — what a spawn can prove is the refusal paths and
+// that a well-formed launch comes up even with no daemon to reach, then exits on stdin close.
+// the startup gate runs first: an empty home has no registered identity, so the launch refuses
+// before a daemon could be spawned — a wrong MIDA_HOME must never start one in the wrong place
 const mcpBad = run(["npx", "--no-install", "mida-mcp", "--bogus"], { cwd: project, env, input: "", timeout: 10_000 })
 check(
   mcpBad.status === 2 && (mcpBad.stderr ?? "").includes("usage: mida-mcp") && (mcpBad.stdout ?? "") === "",
   "mida-mcp --bogus exits 2 with the usage on stderr and a clean stdout",
 )
-const mcp = run(["npx", "--no-install", "mida-mcp", "--as", "assistant"], { cwd: project, env, input: "", timeout: 10_000 })
-check(mcp.status === 0 && !mcp.error, "mida-mcp starts on an empty home and exits when the client closes stdio")
+const mcpEmpty = run(["npx", "--no-install", "mida-mcp", "--as", "assistant"], { cwd: project, env, input: "", timeout: 10_000 })
+check(
+  mcpEmpty.status === 2 && (mcpEmpty.stderr ?? "").includes('no agent "assistant" is set up') && (mcpEmpty.stdout ?? "") === "",
+  "mida-mcp on an empty home refuses at startup, naming the missing identity, on stderr",
+)
+mkdirSync(join(env.MIDA_HOME, "agents", "assistant"), { recursive: true })
+writeFileSync(join(env.MIDA_HOME, "agents", "assistant", "identity.json"), "{}")
+const mcpProject = join(work, "mida-project")
+mkdirSync(join(mcpProject, ".mida"), { recursive: true })
+writeFileSync(join(mcpProject, ".mida", "project.json"), JSON.stringify({ projectId: "p1" }))
+const mcp = run(["npx", "--no-install", "mida-mcp", "--as", "assistant", "--project", mcpProject], { cwd: project, env, input: "", timeout: 10_000 })
+check(mcp.status === 0 && !mcp.error, "mida-mcp starts with a registered identity and a marked project, and exits when the client closes stdio")
 
 // ---------- 4. SDK consumer: runs under node, type-checks with tsc ----------
 
