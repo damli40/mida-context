@@ -49,9 +49,9 @@ chains:
   # an ENVIO_API_TOKEN environment variable at runtime (see README). To index without a
   # token, add `rpc: { url: <endpoint>, for: sync }` here.
   - id: 10143
-    start_block: 64709785
+    start_block: 65178864
     contracts:
       - name: CapabilityRegistry
-        address: "0xabbd06e4d8ee7c5cc77b6b5d6644210176302213"
+        address: "0xadfbebc7a653e4287ae30c87d32d7ad647d7039b"
       - name: ContextRegistry
-        address: "0xab1d090669c1a186a4599c302c2129d39e3ad987"
+        address: "0x75fb6db9af93a8d823e51c488caa913ca711fb78"

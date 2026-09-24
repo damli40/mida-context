@@ -1,9 +1,9 @@
 {
-  "capabilityRegistry": "0xAbBD06E4D8eE7c5Cc77B6b5D6644210176302213",
+  "capabilityRegistry": "0xADFbeBC7A653E4287ae30c87D32D7aD647D7039b",
   "chainId": 10143,
-  "contextRegistry": "0xAb1D090669C1A186A4599c302c2129d39E3ad987",
-  "deploymentBlock": 64709785,
+  "contextRegistry": "0x75fB6dB9af93A8d823e51c488CaA913ca711FB78",
+  "deploymentBlock": 65178864,
   "policyHashV1": "0xfd7cb44154ac443f554cc7f16f8d89da452475b06b71fce6df1cbda2c139dc45",
-  "vaultRpId": "midacontext.xyz",
-  "vaultRpIdHash": "0x505e6777af25acc8c3316b9ba248819ff837066c1895674d937d44c5460eeed5"
+  "vaultRpId": "app.midacontext.xyz",
+  "vaultRpIdHash": "0x57edbac77a11c6055a8332daaa977b3ecf9842bb17bbb7fde936e984adba8d37"
 }

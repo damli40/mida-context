@@ -1,5 +1,5 @@
 /** The one domain a real passkey can be scoped to. A passkey created on localhost proves nothing. */
-export const RP_ID = "midacontext.xyz"
+export const RP_ID = "app.midacontext.xyz"
 export const RP_NAME = "Mida device check"
 
 /**
