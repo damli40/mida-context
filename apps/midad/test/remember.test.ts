@@ -205,9 +205,22 @@ describe("migrated facts in the fact list (migrate B2)", () => {
   })
 
   /** A runtime that serves the given objects per fact namespace and a chain record for each. */
-  const factRuntime = (objects: ContextObject[]): ServiceRuntime =>
-    ({
-      home: new MidaHome(mkdtempSync(join(tmpdir(), "mida-migfact-"))),
+  const factRuntime = (objects: ContextObject[]): ServiceRuntime => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-migfact-")))
+    // `mida read --as` refuses a missing identity before reading — this runtime's home needs one
+    home.writeSecretJson("agents/claude-code/identity.json", {
+      name: "claude-code",
+      agentId: `0x${"aa".repeat(32)}`,
+      signerPrivateKey: generatePrivateKey(),
+      encryptionPrivateKey: `0x${"11".repeat(32)}`,
+      encryptionPublicKey: `0x${"22".repeat(32)}`,
+      callbackOrigin: "https://claude-code.mida.example",
+      purposeId: "project_assistance",
+      manifest: { v: 1 },
+      manifestHash: `0x${"33".repeat(32)}`,
+    })
+    return {
+      home,
       owner: `0x${"55".repeat(20)}`,
       agent: () => ({
         read: async (_owner: string, namespace: string) => (namespace === "preferences.communication" ? objects : []),
@@ -215,7 +228,8 @@ describe("migrated facts in the fact list (migrate B2)", () => {
       reader: {
         getRecord: async () => ({ author: OWNER_AUTHOR_ID, provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED, createdAt: 1_758_000_000n }),
       },
-    }) as unknown as ServiceRuntime
+    } as unknown as ServiceRuntime
+  }
 
   it("readOwnerFacts appends (moved on <date>) to a migrated fact's text — after its own words", async () => {
     const runtime = factRuntime([factObject("answers in lowercase", `0x${"66".repeat(32)}` as Hex, MIGRATION)])

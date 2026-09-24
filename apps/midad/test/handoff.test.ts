@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest"
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { MidaError, PERMISSION, namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import type { Checkpoint } from "@mida/checkpoint"
@@ -7,11 +10,28 @@ import { randomBytes } from "@noble/hashes/utils.js"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import { ContextApiClient } from "@mida/api"
 import { MidaAgent } from "@mida/sdk"
-import { NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
+import { MidaHome, NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
 import type { HandoffDeps, MigrationEnvelope, ProjectCheck, Runtime } from "@mida/midad"
+import { checkAccess } from "../src/handoff.js"
 import { sampleCheckpoint } from "./helpers.js"
 
-const runtime = {} as Runtime
+/**
+ * The access gate reads the identity file from the runtime's home, so the shared runtime carries
+ * a real MidaHome — a well-formed `codex` identity stands in for `mida init`'s registration.
+ */
+const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-handoff-")))
+home.writeSecretJson("agents/codex/identity.json", {
+  name: "codex",
+  agentId: `0x${"1".repeat(64)}`,
+  signerPrivateKey: `0x${"2".repeat(64)}`,
+  encryptionPrivateKey: `0x${"3".repeat(64)}`,
+  encryptionPublicKey: `0x${"4".repeat(64)}`,
+  callbackOrigin: "https://agent.test",
+  purposeId: "test",
+  manifest: {},
+  manifestHash: `0x${"5".repeat(64)}`,
+})
+const runtime = { home } as unknown as Runtime
 
 const OK: ProjectCheck = {
   ok: true,
@@ -186,6 +206,39 @@ describe("buildHandoff", () => {
       })
       expect(calls.checkProject).toBe(0)
     }
+  })
+
+  it("refuses an agent with no identity in this home with its own reason, before the project check", async () => {
+    let projectChecked = false
+    const result = await checkAccess(runtime, { agent: "ghost", cwd: "/tmp/work" }, {
+      checkProject: async () => {
+        projectChecked = true
+        return { ok: false, reason: "not-approved" } as never
+      },
+    })
+    expect(result).toEqual({
+      ok: false,
+      reason: "no-identity",
+      text: `Mida: no agent "ghost" is set up in this Mida home (${runtime.home.root}). Nothing was shared.`,
+    })
+    expect(projectChecked).toBe(false)
+  })
+
+  it("an identity file that exists but will not load gets the same no-identity refusal", async () => {
+    home.writeSecretJson("agents/broken/identity.json", { name: "broken" })
+    let projectChecked = false
+    const result = await checkAccess(runtime, { agent: "broken", cwd: "/tmp/work" }, {
+      checkProject: async () => {
+        projectChecked = true
+        return OK
+      },
+    })
+    expect(result).toEqual({
+      ok: false,
+      reason: "no-identity",
+      text: `Mida: no agent "broken" is set up in this Mida home (${runtime.home.root}). Nothing was shared.`,
+    })
+    expect(projectChecked).toBe(false)
   })
 
   it("an approved agent whose chain grant is gone gets the not-approved line", async () => {
@@ -544,7 +597,7 @@ describe("buildHandoff", () => {
         },
       ],
     })
-    const rt = { owner, agent: () => agent } as unknown as Runtime
+    const rt = { owner, agent: () => agent, home } as unknown as Runtime
     const { d } = deps({ read: readCheckpoints })
     const result = await buildHandoff(rt, input, d)
     expect(calls).toBe(4) // the first list plus all three retries — still partial

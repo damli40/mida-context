@@ -38,8 +38,24 @@ const cp = (
   namespaceId: "0xns",
 })
 
-/** The runtime whats-new needs: a home plus the fields checkAccess touches. */
-const runtimeWith = (dir: MidaHome) => ({ home: dir }) as unknown as ServiceRuntime
+/**
+ * The runtime whats-new needs: a home plus the fields checkAccess touches — and, since the
+ * identity gate runs first, a well-formed identity for the agent under test.
+ */
+const runtimeWith = (dir: MidaHome) => {
+  dir.writeSecretJson("agents/claude-code/identity.json", {
+    name: "claude-code",
+    agentId: `0x${"1".repeat(64)}`,
+    signerPrivateKey: `0x${"2".repeat(64)}`,
+    encryptionPrivateKey: `0x${"3".repeat(64)}`,
+    encryptionPublicKey: `0x${"4".repeat(64)}`,
+    callbackOrigin: "https://agent.test",
+    purposeId: "test",
+    manifest: {},
+    manifestHash: `0x${"5".repeat(64)}`,
+  })
+  return { home: dir } as unknown as ServiceRuntime
+}
 
 const NAMES = { "0xauthorcodex": "codex", "0xauthorclaude": "claude-code" }
 

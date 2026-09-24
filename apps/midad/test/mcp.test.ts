@@ -452,6 +452,60 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
+  it("mida_handoff returns the no-identity refusal's text verbatim", async () => {
+    const dir = home()
+    const text = 'Mida: no agent "assistant" is set up in this Mida home (/h). Nothing was shared.'
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "refused", reason: "no-identity", text } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_handoff")).toBe(text)
+      } finally {
+        await close()
+      }
+      expect(dir.has("state/lastseen/mcp-assistant-test1.json")).toBe(false)
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("mida_whats_new returns the no-identity line the daemon sent", async () => {
+    const dir = home()
+    const text = 'Mida: no agent "assistant" is set up in this Mida home (/h). Nothing was shared.'
+    const fake = await fakeDaemon(dir, { "/whatsnew": { kind: "refused", reason: "no-identity", text } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_whats_new")).toBe(text)
+      } finally {
+        await close()
+      }
+      expect(dir.has("state/lastseen/mcp-assistant-test1.json")).toBe(false)
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("mida_whats_new answers the no-identity line for a reason-only refusal — the real /whatsnew shape", async () => {
+    const dir = home()
+    // buildWhatsNew's refused result carries reason only — the adapter reproduces the line,
+    // naming the server's configured agent and the home the daemon is serving
+    const fake = await fakeDaemon(dir, { "/whatsnew": { kind: "refused", reason: "no-identity" } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_whats_new")).toBe(
+          `Mida: no agent "assistant" is set up in this Mida home (${dir.root}). Nothing was shared.`,
+        )
+      } finally {
+        await close()
+      }
+      expect(dir.has("state/lastseen/mcp-assistant-test1.json")).toBe(false)
+    } finally {
+      await fake.stop()
+    }
+  })
+
   it("mida_read sends ['read','--as',agent,namespace] with the server's own cwd and prints the CLI's lines", async () => {
     const dir = home()
     const project = projectDir()

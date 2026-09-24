@@ -70,6 +70,8 @@ const notApprovedText = (agent: string): string =>
   `Mida: ${agent} is not approved for this project — run \`mida approve ${agent}\` in this folder.`
 const revokedText = (agent: string): string =>
   `Mida: ${agent}'s access was revoked by the owner. Nothing was shared.`
+export const noIdentityText = (agent: string, homeRoot: string): string =>
+  `Mida: no agent "${agent}" is set up in this Mida home (${homeRoot}). Nothing was shared.`
 const TAMPERED_TEXT = "Mida: the approved-projects list failed its signature check. Nothing was shared. Run `mida doctor`."
 const UNREADABLE_TEXT = "Mida: the approved-projects list could not be read: check the file's permissions. Nothing was shared. Run `mida doctor`."
 const EMPTY_TEXT = "Mida: connected. Nothing has been saved for this project yet."
@@ -160,6 +162,17 @@ export async function checkAccess(
   // a relative cwd would be resolved against the DAEMON's working directory — refuse it outright
   if (typeof input.cwd !== "string" || !isAbsolute(input.cwd)) {
     return { ok: false, reason: "bad-input", text: noContextText("bad-input") }
+  }
+  // an agent with no identity here is its own answer — never "not approved", never another
+  // agent's context; a file that exists but cannot load answers the same way
+  let identity: ReturnType<typeof loadAgentIdentity>
+  try {
+    identity = loadAgentIdentity(runtime.home, agent)
+  } catch {
+    identity = undefined
+  }
+  if (identity === undefined) {
+    return { ok: false, reason: "no-identity", text: noIdentityText(agent, runtime.home.root) }
   }
   const check = await (deps.checkProject ?? checkProject)(runtime, { agent, cwd: input.cwd })
   if (!check.ok) {

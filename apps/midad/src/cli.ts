@@ -13,6 +13,7 @@ import { callDaemon, ensureCurrentDaemon } from "./control.js"
 import { batchStatusProbe, decideLane, laneWhyText } from "./batching.js"
 import { debugLine, refusalCode } from "./debug-line.js"
 import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
+import { noIdentityText } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeCode, uninstallCodex } from "./install.js"
@@ -25,7 +26,7 @@ import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag }
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
 import { approve, authorNamesFor, deploymentMismatchError, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
-import { loadOwnerMode } from "./keys.js"
+import { loadAgentIdentity, loadOwnerMode } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
 import { migrate, migrateUndo } from "./migrate.js"
 import { OwnerLinkOutcome, approvePasskey, initPasskey, revokePasskey } from "./owner-link/flows.js"
@@ -39,6 +40,12 @@ const WITH_AGENT = ["request", "approve", "save-demo", "read", "revoke"]
 const WITH_PROJECT = ["save-demo"]
 /** The namespaces `read --as <agent> <namespace>` may name — the same three the MCP adapter exposes. */
 const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skills", "preferences.communication"]
+/**
+ * `read --as` may name any identity this home could hold — the key store's own name rule
+ * (`keys.ts` NAME), not the three names `mida init` provisions by default. A name that cannot
+ * be an identity is still usage, never read under.
+ */
+const READ_AS_NAME = /^[a-z0-9-]+$/
 export const USAGE =
   "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | batching on|off | migrate [--undo]" +
   "   (tool = claude-code | codex; agent = claude-code | codex | assistant — assistant is a stand-in for any other assistant you use)"
@@ -180,7 +187,7 @@ export async function runCliWithRuntime(
     return 2
   }
   if (!WITH_AGENT.includes(command)) return usage()
-  if (WITH_AGENT.includes(command) && !AGENTS.includes(agent)) return usage()
+  if (WITH_AGENT.includes(command) && !AGENTS.includes(agent) && !(asFlag && READ_AS_NAME.test(agent))) return usage()
   if (command === "read" && !asFlag && projectId.length === 0) return usage()
   // `read --as <agent> <namespace>` takes exactly one namespace, from the known set — anything
   // else on the line is refused rather than silently ignored.
@@ -212,6 +219,18 @@ export async function runCliWithRuntime(
         // namespaces print their owner facts, `projects.current` prints the objects in the
         // project the caller's folder belongs to — the same lines `read <agent> <projectId>`
         // produces.
+        // The same identity gate the other read routes enforce at checkAccess, first: a missing
+        // or unloadable identity is its own refusal — never a namespace read under another name.
+        let identity: ReturnType<typeof loadAgentIdentity>
+        try {
+          identity = loadAgentIdentity(runtime.home, agent)
+        } catch {
+          identity = undefined
+        }
+        if (identity === undefined) {
+          print(noIdentityText(agent, runtime.home.root))
+          return 1
+        }
         const only = argv[3]
         if (only === "projects.current") {
           const projectId = context?.cwd === undefined ? null : projectIdFor(context.cwd)
@@ -272,6 +291,8 @@ export async function runCliWithRuntime(
       print(`${agent} is already approved on chain. To use it in THIS folder, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`)
     } else if (code === "CHAIN_CALL_FAILED") {
       print(`the chain call failed — this setup's contract is ${runtime.chain.deployment.capabilityRegistry.slice(0, 6)}…; run with MIDA_DEBUG=1 to see why`)
+    } else if (code === "agent-not-setup") {
+      print(noIdentityText(agent, runtime.home.root))
     } else {
       print(`refused: ${code}`)
     }

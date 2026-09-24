@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { BaseError } from "viem"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, loadAgentIdentity, ownerCommandNotice, runCli, runCliWithRuntime } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, loadAgentIdentity, ownerCommandNotice, runCli, runCliWithRuntime } from "@mida/midad"
 import type { Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 
 describe("the crude mida command", () => {
@@ -436,5 +436,30 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     })
     expect(lines.every((line) => !line.startsWith("debug:"))).toBe(true)
     expect(lines.join("\n")).not.toContain("a secret reason")
+  })
+
+  it("mida read --as <unregistered> prints the no-identity line, not a bare code", async () => {
+    const stub = stubRuntime(new Error("unreached"))
+    const lines: string[] = []
+    const code = await runCliWithRuntime(["read", "--as", "ghost", "projects.current"], stub, (line) => lines.push(line))
+    expect(code).toBe(1)
+    expect(lines).toEqual([`Mida: no agent "ghost" is set up in this Mida home (${stub.home.root}). Nothing was shared.`])
+    expect(lines.every((line) => !line.startsWith("refused:"))).toBe(true)
+  })
+
+  it("an agent name that cannot be an identity is still usage — never read under it", async () => {
+    const lines: string[] = []
+    const code = await runCliWithRuntime(["read", "--as", "a b"], stubRuntime(new Error("unreached")), (line) => lines.push(line))
+    expect(code).toBe(2)
+    expect(lines).toEqual([USAGE])
+  })
+
+  it("a read whose agent's identity is gone prints the same no-identity line", async () => {
+    const notSetup = Object.assign(new Error("gone"), { code: "agent-not-setup" })
+    const stub = stubRuntime(notSetup)
+    const lines: string[] = []
+    const code = await runCliWithRuntime(["read", "codex", "p1"], stub, (line) => lines.push(line))
+    expect(code).toBe(1)
+    expect(lines).toEqual([`Mida: no agent "codex" is set up in this Mida home (${stub.home.root}). Nothing was shared.`])
   })
 })

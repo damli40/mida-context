@@ -578,6 +578,19 @@ describe("a handoff served to a new session becomes its continuesSession link", 
       contextId: `0x${"a1".repeat(32)}`, authorId: `0x${"aa".repeat(32)}`, namespaceId: `0x${"c1".repeat(32)}`,
     }
     const runtime = { home, close: async () => {} } as unknown as Runtime
+    // the handoff's identity gate refuses an agent with no identity file in this home —
+    // a well-formed file stands in for `mida init`'s registration
+    home.writeSecretJson("agents/claude-code/identity.json", {
+      name: "claude-code",
+      agentId: `0x${"1".repeat(64)}`,
+      signerPrivateKey: `0x${"2".repeat(64)}`,
+      encryptionPrivateKey: `0x${"3".repeat(64)}`,
+      encryptionPublicKey: `0x${"4".repeat(64)}`,
+      callbackOrigin: "https://agent.test",
+      purposeId: "test",
+      manifest: {},
+      manifestHash: `0x${"5".repeat(64)}`,
+    })
     const handoff = await buildHandoff(runtime, { agent: "claude-code", cwd, sessionId: "sess-b", authorNames: {} }, {
       checkProject: async () => ({ ok: true, approval: { agent: "claude-code", projectId: "p-1", root: cwd, approvedAt: "2026-09-21T00:00:00.000Z" } }),
       capability: async () => "live",

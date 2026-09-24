@@ -16,6 +16,22 @@ const DRAIN_OK: DrainResult = { saved: 0, skippedUnchanged: 0, skippedTooSoon: 0
  */
 function setup() {
   const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-daemon-")))
+  // the handoff/whats-new routes refuse a missing identity before anything else — the agents
+  // these tests drive need real identity files so the gate passes through to what each test
+  // actually exercises
+  for (const agent of ["codex", "claude-code"]) {
+    home.writeSecretJson(`agents/${agent}/identity.json`, {
+      name: agent,
+      agentId: `0x${"aa".repeat(32)}`,
+      signerPrivateKey: `0x${"bb".repeat(32)}`,
+      encryptionPrivateKey: `0x${"11".repeat(32)}`,
+      encryptionPublicKey: `0x${"22".repeat(32)}`,
+      callbackOrigin: `https://${agent}.mida.example`,
+      purposeId: "project_assistance",
+      manifest: { v: 1 },
+      manifestHash: `0x${"33".repeat(32)}`,
+    })
+  }
   const drainCalls: DrainDeps[] = []
   const logs: object[] = []
   const stubRuntime = { close: async () => home.remove("midad.lock") } as unknown as Runtime

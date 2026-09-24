@@ -235,7 +235,7 @@ async function toolWhatsNew(deps: McpServerDeps) {
     appendLog(deps.home, "hook", { event: "whatsnew-timeout", agent: deps.agent, sessionId: deps.sessionId })
     return degraded("daemon-down")
   }
-  const body = reply.body as { kind?: unknown; note?: unknown; reason?: unknown; seen?: unknown } | null
+  const body = reply.body as { kind?: unknown; note?: unknown; reason?: unknown; seen?: unknown; text?: unknown } | null
   if (body?.kind === "updates" && typeof body.note === "string" && body.note !== "") {
     const seen = Array.isArray(body.seen) ? body.seen.filter((id): id is string => typeof id === "string") : undefined
     if (seen !== undefined) {
@@ -264,6 +264,16 @@ async function toolWhatsNew(deps: McpServerDeps) {
     }
     if (reason === "list-unreadable") {
       return toolText("Mida: the approved-projects list could not be read: check the file's permissions. Nothing was shared. Run `mida doctor`.")
+    }
+    // the no-identity refusal carries its own line: the daemon's `text` when it sends one —
+    // a /whatsnew refusal answers reason-only, so the same line is reproduced here the way the
+    // ones above are (handoff.ts stays out of this module's graph)
+    if (reason === "no-identity") {
+      return toolText(
+        typeof body.text === "string"
+          ? body.text
+          : `Mida: no agent "${deps.agent}" is set up in this Mida home (${deps.home.root}). Nothing was shared.`,
+      )
     }
     return toolText(`Mida: no context available right now (${reason}).`)
   }
