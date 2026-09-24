@@ -405,9 +405,11 @@ export class MidaAgent {
         continue
       }
       const readEpoch = decodeUint64(message.readEpoch)
-      const epochPrivateKey = await epochKeyFor(readEpoch)
       let payload: ContextPayload
       try {
+        // The key fetch is inside the guard too: a row sealed under an epoch this agent has no wrap
+        // for throws there, and must skip the row — not abort the whole batched read.
+        const epochPrivateKey = await epochKeyFor(readEpoch)
         payload = openContextObject({
           manifest: item.save.manifest,
           expectedManifestHash: message.manifestHash.toLowerCase() as Hex,

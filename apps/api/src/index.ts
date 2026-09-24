@@ -1,5 +1,7 @@
 export * from "./auth.js"
 export * from "./authorize.js"
+export * from "./batch-routes.js"
+export * from "./batch-store.js"
 export * from "./chain-budget.js"
 export * from "./chain-views.js"
 export * from "./client.js"

@@ -98,13 +98,17 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
       owner?: Address
       namespaceId?: Hex
       sealKey?: Uint8Array
+      /** Binds/signs a readEpoch other than the live one — the wrap lookup for it fails at read time. */
+      readEpoch?: bigint
       parent?: { contextId: Hex; version: number; rootAuthor: Hex }
     } = {},
   ): Promise<SealedSave> => {
     const saveOwner = input.owner ?? vault.owner
     const saveNamespaceId = input.namespaceId ?? CAREER
-    const readEpoch = await reader.requiredReadEpoch(vault.owner, CAREER)
-    const epochPublicKey = await reader.epochPublicKey(vault.owner, CAREER, readEpoch)
+    const liveEpoch = await reader.requiredReadEpoch(vault.owner, CAREER)
+    const readEpoch = input.readEpoch ?? liveEpoch
+    // The seal always uses the live epoch key; a save may still *claim* another epoch in its binding.
+    const epochPublicKey = await reader.epochPublicKey(vault.owner, CAREER, liveEpoch)
     if (epochPublicKey === null) throw new Error("no epoch public key for the test namespace")
     const objectNonce = hexOf(randomBytes(32))
     const parent = input.parent
@@ -641,6 +645,21 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
     const result = await sdk.readBatchedWithStatus(vault.owner, "goals.career")
     batchItems = []
     expect(result.skipped).toEqual([{ contextId: wrongKey.contextId, reason: "decrypt" }])
+    expect(result.pending).toHaveLength(1)
+    expect(result.pending[0]!.contextId).toBe(good.contextId)
+    expect(result.pending[0]!.payload.value).toBe("opens fine")
+  })
+
+  it("a queued save bound to an epoch with no published wrap is skipped decrypt — the lookup throw is per-item", async () => {
+    // The store served a save claiming readEpoch 99; the namespace never published that epoch key, so
+    // getEpochWrap (inside epochKeyFor) throws EPOCH_STALE. Before the fix that throw aborted the
+    // whole read; now it skips the row like any other undecryptable one.
+    const staleEpoch = await makeSave(agent, { value: "unwrappable epoch", readEpoch: 99n })
+    const good = await makeSave(agent, { value: "opens fine" })
+    batchItems = [queuedItem(staleEpoch), queuedItem(good)]
+    const result = await sdk.readBatchedWithStatus(vault.owner, "goals.career")
+    batchItems = []
+    expect(result.skipped).toEqual([{ contextId: staleEpoch.contextId, reason: "decrypt" }])
     expect(result.pending).toHaveLength(1)
     expect(result.pending[0]!.contextId).toBe(good.contextId)
     expect(result.pending[0]!.payload.value).toBe("opens fine")

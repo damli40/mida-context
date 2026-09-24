@@ -3,7 +3,20 @@ import type { Address, Hex, ReaderEpochWrap, StorageRef } from "@mida/protocol"
 import { contentHash, verifyContent } from "@mida/storage"
 import type { ContextStorage } from "@mida/storage"
 import { REQUEST_WINDOW_SECONDS, SWEEP_MAX_OBJECTS_PER_RUN } from "@mida/api"
-import type { ContextStores, DenyStore, ManifestIndexEntry, NonceStore, ObjectStore, RevocationIntent, StoredObject, WrapKey } from "@mida/api"
+import type {
+  BatchedSaveWire,
+  BatchSaveRow,
+  BatchSaveState,
+  BatchStore,
+  ContextStores,
+  DenyStore,
+  ManifestIndexEntry,
+  NonceStore,
+  ObjectStore,
+  RevocationIntent,
+  StoredObject,
+  WrapKey,
+} from "@mida/api"
 
 /**
  * The slice of the Cloudflare D1 API these stores use, declared structurally so this package needs no Workers
@@ -480,4 +493,186 @@ export class D1DenyStore implements DenyStore {
 /** The three stores the Context API needs, bound to one D1 database — what the worker hands `createContextApi`. */
 export function d1Stores(db: D1Like): ContextStores {
   return { objects: new D1ObjectStore(db), nonces: new D1NonceStore(db), denies: new D1DenyStore(db) }
+}
+
+// ---------- BatchAnchor Task 5: the hosted half of the batch queue ----------
+
+interface BatchRow {
+  context_id: string
+  owner: string
+  namespace_id: string
+  signer: string
+  save_json: string
+  state: string
+  reason: string | null
+  batch_id: string | null
+  position: number | null
+  lineage_id: string | null
+  version: number | null
+  proof_json: string | null
+  received_at: number
+  anchored_at: number | null
+}
+
+function batchRowFrom(row: BatchRow): BatchSaveRow {
+  return {
+    contextId: row.context_id as Hex,
+    owner: row.owner as Address,
+    namespaceId: row.namespace_id as Hex,
+    signer: row.signer as Address,
+    save: JSON.parse(row.save_json) as BatchedSaveWire,
+    state: row.state as BatchSaveState,
+    reason: row.reason,
+    batchId: row.batch_id as Hex | null,
+    position: row.position,
+    lineageId: row.lineage_id as Hex | null,
+    version: row.version,
+    proof: row.proof_json === null ? null : (JSON.parse(row.proof_json) as Hex[]),
+    receivedAt: row.received_at,
+    anchoredAt: row.anchored_at,
+  }
+}
+
+/**
+ * The batch queue on D1. The one rule that matters: `takeQueued` is a single UPDATE ... RETURNING —
+ * the claim and the state flip happen inside one statement, so two workers (or a worker and the
+ * Durable Object alarm) can never take the same row. Sequence and flush marks live in batch_meta as
+ * single-row values for the same reason.
+ */
+export class D1BatchStore implements BatchStore {
+  constructor(readonly db: D1Like) {}
+
+  async insert(row: BatchSaveRow): Promise<"inserted" | "exists"> {
+    const result = await this.db
+      .prepare(
+        `INSERT OR IGNORE INTO batch_saves
+           (context_id, owner, namespace_id, signer, save_json, state, reason,
+            batch_id, position, lineage_id, version, proof_json, received_at, anchored_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        row.contextId.toLowerCase(),
+        row.owner.toLowerCase(),
+        row.namespaceId.toLowerCase(),
+        row.signer.toLowerCase(),
+        JSON.stringify(row.save),
+        row.state,
+        row.reason,
+        row.batchId?.toLowerCase() ?? null,
+        row.position,
+        row.lineageId?.toLowerCase() ?? null,
+        row.version,
+        row.proof === null ? null : JSON.stringify(row.proof),
+        row.receivedAt,
+        row.anchoredAt,
+      )
+      .run()
+    return changes(result) > 0 ? "inserted" : "exists"
+  }
+
+  async get(contextId: Hex): Promise<BatchSaveRow | null> {
+    const row = await this.db
+      .prepare("SELECT * FROM batch_saves WHERE context_id = ?")
+      .bind(contextId.toLowerCase())
+      .first<BatchRow>()
+    return row === null ? null : batchRowFrom(row)
+  }
+
+  async listForReader(owner: Address, namespaceId: Hex): Promise<BatchSaveRow[]> {
+    const { results } = await this.db
+      .prepare(
+        `SELECT * FROM batch_saves
+         WHERE owner = ? AND namespace_id = ? AND state IN ('QUEUED', 'SUBMITTED', 'ANCHORED')
+         ORDER BY received_at, context_id`,
+      )
+      .bind(owner.toLowerCase(), namespaceId.toLowerCase())
+      .all<BatchRow>()
+    return results.map(batchRowFrom)
+  }
+
+  /** One statement: the IN-subselect re-reads state inside the UPDATE, so a row taken by a racing run is invisible here. */
+  async takeQueued(limit: number, batchId: Hex): Promise<BatchSaveRow[]> {
+    const { results } = await this.db
+      .prepare(
+        `UPDATE batch_saves SET state = 'SUBMITTED', batch_id = ?
+         WHERE context_id IN (
+           SELECT context_id FROM batch_saves WHERE state = 'QUEUED' ORDER BY received_at, context_id LIMIT ?
+         )
+         RETURNING *`,
+      )
+      .bind(batchId.toLowerCase(), limit)
+      .all<BatchRow>()
+    return results.map(batchRowFrom).sort((a, b) => a.receivedAt - b.receivedAt || a.contextId.localeCompare(b.contextId))
+  }
+
+  async markAnchored(
+    contextId: Hex,
+    fields: { batchId: Hex; position: number; lineageId: Hex; version: number; proof: Hex[]; anchoredAt: number },
+  ): Promise<void> {
+    await this.db
+      .prepare(
+        `UPDATE batch_saves
+         SET state = 'ANCHORED', batch_id = ?, position = ?, lineage_id = ?, version = ?, proof_json = ?, anchored_at = ?
+         WHERE context_id = ? AND state <> 'ANCHORED'`,
+      )
+      .bind(
+        fields.batchId.toLowerCase(),
+        fields.position,
+        fields.lineageId.toLowerCase(),
+        fields.version,
+        JSON.stringify(fields.proof),
+        fields.anchoredAt,
+        contextId.toLowerCase(),
+      )
+      .run()
+  }
+
+  async markRejected(contextId: Hex, reason: string): Promise<void> {
+    // An anchored row is final: a late-arriving rejection for a save the chain accepted is a bug
+    // signal, not a state change — same first-write-wins rule as markAnchored.
+    await this.db
+      .prepare("UPDATE batch_saves SET state = 'REJECTED', reason = ? WHERE context_id = ? AND state <> 'ANCHORED'")
+      .bind(reason, contextId.toLowerCase())
+      .run()
+  }
+
+  async requeue(batchId: Hex): Promise<number> {
+    const result = await this.db
+      .prepare("UPDATE batch_saves SET state = 'QUEUED', batch_id = NULL WHERE batch_id = ? AND state = 'SUBMITTED'")
+      .bind(batchId.toLowerCase())
+      .run()
+    return changes(result)
+  }
+
+  async nextSequence(): Promise<bigint> {
+    const row = await this.db
+      .prepare(
+        `INSERT INTO batch_meta (key, value) VALUES ('sequence', '1')
+         ON CONFLICT (key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
+         RETURNING value`,
+      )
+      .first<{ value: string }>()
+    if (row === null) throw new MidaError("NOT_FOUND", "the batch sequence row did not return a value")
+    return BigInt(row.value)
+  }
+
+  async countQueued(): Promise<number> {
+    const row = await this.db.prepare("SELECT COUNT(*) AS n FROM batch_saves WHERE state = 'QUEUED'").first<{ n: number }>()
+    return row?.n ?? 0
+  }
+
+  async lastFlush(signer: Address): Promise<number | null> {
+    const row = await this.db
+      .prepare("SELECT value FROM batch_meta WHERE key = ?")
+      .bind(`flush:${signer.toLowerCase()}`)
+      .first<{ value: string }>()
+    return row === null ? null : Number(row.value)
+  }
+
+  async setLastFlush(signer: Address, atMs: number): Promise<void> {
+    await this.db
+      .prepare("INSERT OR REPLACE INTO batch_meta (key, value) VALUES (?, ?)")
+      .bind(`flush:${signer.toLowerCase()}`, String(atMs))
+      .run()
+  }
 }
