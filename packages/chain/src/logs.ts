@@ -49,7 +49,7 @@ export interface DecodedLog {
 
 /** Structural subset of viem's PublicClient used for log scans, so tests can pass a recording fake. */
 export interface LogClient {
-  getBlockNumber(): Promise<bigint>
+  getBlockNumber(parameters?: { cacheTime?: number }): Promise<bigint>
   getLogs(parameters: {
     address: Address
     event: AbiEvent
@@ -94,7 +94,10 @@ export async function getLogsChunked(
   parameters: { address: Address; event: AbiEvent; args?: Record<string, unknown>; fromBlock: bigint; toBlock?: bigint },
   options?: LogScanOptions,
 ): Promise<DecodedLog[]> {
-  const toBlock = parameters.toBlock ?? (await client.getBlockNumber())
+  // cacheTime: 0 — viem answers getBlockNumber from a per-client cache for client.cacheTime ms, and
+  // a receipt wait just before the scan can leave a pre-mining head in it. The scan would then end
+  // before the block that was just mined and miss its logs — a hole that looks like "not anchored".
+  const toBlock = parameters.toBlock ?? (await client.getBlockNumber({ cacheTime: 0 }))
   const windows = blockWindows(parameters.fromBlock, toBlock, clampLogRange(options?.maxRange))
   // One request at a time made a scan grow by about 4,300 sequential requests per day of chain
   // age (Monad: a block every 0.4 s, 100 blocks per request). Windows are fetched a few at a

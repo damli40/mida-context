@@ -133,6 +133,32 @@ describe("chunked log scans (≤1,000 blocks per request, 100 on fallback)", () 
     expect(calls.at(-1)!.toBlock).toBe(1_234n)
     expect(logs).toHaveLength(2)
   })
+
+  it("fetches the head with the cache off — a cached getBlockNumber can sit below the block just mined; an explicit toBlock skips the call", async () => {
+    const event = getAbiItem({ abi: capabilityRegistryAbi, name: "AgentRevoked" }) as AbiEvent
+    const headCalls: Array<{ cacheTime?: number } | undefined> = []
+    const windows: Array<{ fromBlock: bigint; toBlock: bigint }> = []
+    const client: LogClient = {
+      getBlockNumber: async (options) => {
+        headCalls.push(options)
+        // a viem cache answers with the stale head (5n) unless the caller disables it
+        return options?.cacheTime === 0 ? 1_234n : 5n
+      },
+      getLogs: async (parameters) => {
+        windows.push({ fromBlock: parameters.fromBlock, toBlock: parameters.toBlock })
+        return []
+      },
+    }
+    await getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 5n })
+    expect(headCalls).toEqual([{ cacheTime: 0 }])
+    expect(windows.at(-1)!.toBlock).toBe(1_234n)
+
+    headCalls.length = 0
+    windows.length = 0
+    await getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 5n, toBlock: 99n })
+    expect(headCalls).toHaveLength(0)
+    expect(windows.at(-1)!.toBlock).toBe(99n)
+  })
 })
 
 describe("chunked log scans run a few windows at a time", () => {

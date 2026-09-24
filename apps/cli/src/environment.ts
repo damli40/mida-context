@@ -5,22 +5,20 @@ import type { Address, Hex } from "@mida/protocol"
 import {
   ANVIL_PRIVATE_KEYS,
   MONAD_TESTNET_CHAIN_ID,
-  batchAnchorAbi,
   chainFor,
   createWriteContext,
   deployLocal,
   fundLocal,
-  getLogsChunked,
   loadDeployment,
   sendValue,
   startAnvil,
 } from "@mida/chain"
 import type { Deployment, LocalWriteContext } from "@mida/chain"
 import { Batcher, FsBatchJournal, FsBatchStore, RegistryReader, createBatcherChain, createContextApi, createNodeTimer } from "@mida/api"
-import type { AnchoredLog, BatcherChain, BatcherTimer, BatchingOptions, RejectedLog } from "@mida/api"
+import type { BatcherTimer, BatchingOptions } from "@mida/api"
 import { serve } from "@hono/node-server"
 import { createPublicClient, http } from "viem"
-import type { AbiEvent, LocalAccount } from "viem"
+import type { LocalAccount } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { monadTestnet } from "viem/chains"
 
@@ -96,7 +94,7 @@ export async function startApiServer(input: {
     }
     const engine = new Batcher({
       store,
-      chain: freshHeadBatcherChain({ rpcUrl: input.rpcUrl, deployment: input.deployment, account: submitter }),
+      chain: createBatcherChain({ rpcUrl: input.rpcUrl, deployment: input.deployment, account: submitter }),
       timer,
       now: () => Date.now(),
       cap: input.batching?.cap ?? 60,
@@ -128,56 +126,6 @@ export async function startApiServer(input: {
       })
     })
   })
-}
-
-/**
- * createBatcherChain's log scans end at `getBlockNumber()`, which viem answers from a per-client
- * cache for client.cacheTime ms — and the receipt wait inside submitBatch can leave a pre-mining
- * head in that cache. A resolve scan inheriting it misses the batch's own logs and reports a
- * false ROOT_MISMATCH, stranding the rows SUBMITTED. The local lane keeps the adapter's submit and
- * batchOf but re-runs the three scans with `toBlock` pinned to a head fetched with the cache off.
- */
-function freshHeadBatcherChain(input: { rpcUrl: string; deployment: Deployment; account: LocalAccount }): BatcherChain {
-  const { deployment } = input
-  const batchAnchor = deployment.batchAnchor
-  if (batchAnchor === undefined) throw new Error("this deployment has no BatchAnchor")
-  const inner = createBatcherChain(input)
-  const scanClient = createPublicClient({ chain: chainFor(deployment.chainId), transport: http(input.rpcUrl) })
-  const saveAnchored = batchAnchorAbi.find((item) => item.type === "event" && item.name === "SaveAnchored") as AbiEvent
-  const saveRejected = batchAnchorAbi.find((item) => item.type === "event" && item.name === "SaveRejected") as AbiEvent
-  const fromBlock = deployment.batchAnchorBlock ?? deployment.deploymentBlock
-  const head = () => scanClient.getBlockNumber({ cacheTime: 0 })
-  return {
-    submit: inner.submit,
-    batchOf: inner.batchOf,
-    async anchoredLogs(batchId): Promise<AnchoredLog[]> {
-      const logs = await getLogsChunked(scanClient, { address: batchAnchor, event: saveAnchored, args: { batchId }, fromBlock, toBlock: await head() })
-      return logs.map((log) => {
-        const args = log.args as { contextId: Hex; author: Hex; position: number; lineageId: Hex; version: number; leafHash: Hex }
-        return {
-          contextId: args.contextId.toLowerCase() as Hex,
-          agentId: args.author.toLowerCase() as Hex,
-          position: Number(args.position),
-          lineageId: args.lineageId.toLowerCase() as Hex,
-          version: Number(args.version),
-          leafHash: args.leafHash.toLowerCase() as Hex,
-        }
-      })
-    },
-    async rejectedLogs(batchId): Promise<RejectedLog[]> {
-      const logs = await getLogsChunked(scanClient, { address: batchAnchor, event: saveRejected, args: { batchId }, fromBlock, toBlock: await head() })
-      return logs.map((log) => {
-        const args = log.args as { index: number; reason: number }
-        return { index: Number(args.index), reason: Number(args.reason) }
-      })
-    },
-    async findAnchoring(contextId): Promise<Hex | null> {
-      const logs = await getLogsChunked(scanClient, { address: batchAnchor, event: saveAnchored, args: { contextId }, fromBlock, toBlock: await head() })
-      const first = logs[0]
-      if (first === undefined) return null
-      return ((first.args as { batchId: Hex }).batchId).toLowerCase() as Hex
-    },
-  }
 }
 
 /** Fresh Anvil, Deploy.s.sol, and an in-process API server. hardfork "prague" forces the Solidity P256 fallback. `batching` tunes the batch lane's wait window and caps for tests. */
