@@ -10,15 +10,17 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
-import { zeroHash } from "viem"
+import { ContractFunctionExecutionError, ContractFunctionRevertedError, encodeErrorResult, zeroHash } from "viem"
+import type { PublicClient } from "viem"
 import { OWNER_AUTHOR_ID, contextId as deriveContextId, namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { hexOf, manifestHash } from "@mida/crypto"
 import { contentHash } from "@mida/storage"
 import { randomBytes } from "@noble/hashes/utils.js"
+import { contextRegistryAbi } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
-import { BudgetedReader, ChainReadBudgetExceeded, ContextApiClient, MAX_CHAIN_READS_PER_REQUEST, createContextApi } from "@mida/api"
-import type { AnchoredObject, ContextRecordView, ObjectUploadBody, RegistryReader, StoreLimits, StoredObject } from "@mida/api"
+import { BudgetedReader, ChainReadBudgetExceeded, ContextApiClient, MAX_CHAIN_READS_PER_REQUEST, RegistryReader, createContextApi } from "@mida/api"
+import type { AnchoredObject, ContextRecordView, ObjectUploadBody, StoreLimits, StoredObject } from "@mida/api"
 
 const deployment: Deployment = {
   chainId: 31337n,
@@ -368,5 +370,72 @@ describe("the per-request chain-read budget", () => {
     const client = clientFor(app)
     const listed = await client.request<{ objects: AnchoredObject[] }>("GET", `/objects?owner=${owner}&namespaceId=${NAMESPACE}`)
     expect(listed.objects.map((object) => object.contextId)).toEqual([body.manifest.contextId])
+  })
+})
+
+describe("a batched getRecords anchor check", () => {
+  /** A reader whose chain reports Multicall3 (batch size 200) and answers each batch with canned entries. */
+  function multicallReader(entries: unknown[]): RegistryReader {
+    const publicClient = {
+      getCode: async () => "0x6001",
+      multicall: async () => entries,
+    } as unknown as PublicClient
+    return new RegistryReader({ deployment, publicClient })
+  }
+
+  /** The error chain viem stores on a failed multicall entry: execution error wrapping the revert. */
+  function revertEntry(data: Hex, contextId: Hex) {
+    return {
+      status: "failure",
+      error: new ContractFunctionExecutionError(
+        new ContractFunctionRevertedError({ abi: contextRegistryAbi, data, functionName: "getRecord" }),
+        { abi: contextRegistryAbi, args: [contextId], contractAddress: deployment.contextRegistry, functionName: "getRecord" },
+      ),
+    }
+  }
+
+  const notFoundRevert = (contextId: Hex) =>
+    encodeErrorResult({ abi: contextRegistryAbi, errorName: "ContextNotFound", args: [contextId] })
+
+  it("maps a success to its record and a ContextNotFound revert to null — the one failure that means absent", async () => {
+    const record = anchoredRecord(upload(randomBytes(4)))
+    const missing = `0x${"33".repeat(32)}` as Hex
+    const reader = multicallReader([
+      { status: "success", result: record },
+      revertEntry(notFoundRevert(missing), missing),
+    ])
+    const [hit, absent] = await reader.getRecords([record.contextId, missing])
+    expect(hit).toMatchObject({ contextId: record.contextId, owner })
+    expect(absent).toBeNull()
+  })
+
+  it("throws on any other failed entry — a different known revert, an unknown selector, an empty out-of-gas", async () => {
+    const contextId = `0x${"44".repeat(32)}` as Hex
+    // A revert the registry knows but which does NOT mean "not anchored" maps to its own code.
+    const stale = multicallReader([
+      revertEntry(encodeErrorResult({ abi: contextRegistryAbi, errorName: "EpochStale", args: [NAMESPACE, 1n, 2n] }), contextId),
+    ])
+    await expect(stale.getRecords([contextId])).rejects.toMatchObject({ code: "EPOCH_STALE" })
+    // An undecodable selector and a bare empty revert (the out-of-gas shape) surface the raw error.
+    for (const data of ["0xdeadbeef", "0x"] as Hex[]) {
+      const reader = multicallReader([revertEntry(data, contextId)])
+      await expect(reader.getRecords([contextId])).rejects.toBeInstanceOf(ContractFunctionExecutionError)
+    }
+  })
+
+  it("GET /objects errors instead of answering 200 with a list that silently dropped real records", async () => {
+    const reader = multicallReader([revertEntry("0x", `0x${"55".repeat(32)}` as Hex)])
+    const { app, store } = apiFor(reader)
+    const ciphertext = randomBytes(4)
+    const body = upload(ciphertext)
+    await store.putObject(storedObject(body))
+    await store.blobs.put(ciphertext)
+
+    let last: Response | undefined
+    const client = clientFor(app, async (url, init) => (last = await app.request(url, init)))
+    await expect(
+      client.request("GET", `/objects?owner=${owner}&namespaceId=${NAMESPACE}`),
+    ).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
+    expect(last!.status).toBe(500)
   })
 })

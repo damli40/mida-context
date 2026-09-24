@@ -162,9 +162,12 @@ export class RegistryReader {
 
   /**
    * `getRecord` for a batch of contextIds. With Multicall3 the batch is ONE `eth_call` — hundreds of
-   * never-anchored uploads can no longer spend a request's read budget a row at a time. A reverted
-   * item (the `ContextNotFound` of an orphaned upload) comes back as a null entry — "not anchored",
-   * never an error. Chains without Multicall3 fall back to one `getRecord` per id, unchanged.
+   * never-anchored uploads can no longer spend a request's read budget a row at a time. The
+   * `ContextNotFound` revert of an orphaned upload comes back as a null entry — "not anchored",
+   * never an error — and it is the ONLY failure that does: an out-of-gas, an undecodable result or
+   * any other revert throws exactly as `getRecord` throws, so a caller can never read a list that
+   * silently dropped a real record. Chains without Multicall3 fall back to one `getRecord` per id,
+   * unchanged.
    * Callers pass at most `recordBatchSize()` ids per call, so each call costs exactly one unit of
    * read budget — or `contextIds.length` units on the per-row path, identical to `getRecord`.
    */
@@ -187,9 +190,16 @@ export class RegistryReader {
       })),
     })
     return results.map((entry) => {
-      if (entry.status !== "success") return null
-      const record = entry.result as unknown as ContextRecordView
-      return { ...record, owner: lower(record.owner) }
+      if (entry.status === "success") {
+        const record = entry.result as unknown as ContextRecordView
+        return { ...record, owner: lower(record.owner) }
+      }
+      // ContextNotFound is the one failure that means "not anchored". Anything else — an unknown
+      // selector, an empty out-of-gas revert, a decode failure — fails the request the same way a
+      // single `getRecord` would, never returning a shortened list.
+      const mapped = toMidaError(entry.error)
+      if (isMidaError(mapped, "NOT_FOUND")) return null
+      throw mapped
     })
   }
 
