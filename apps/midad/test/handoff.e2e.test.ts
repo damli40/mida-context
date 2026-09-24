@@ -391,7 +391,7 @@ describe("POST /handoff on local Anvil", () => {
     expect(result).toEqual({
       kind: "refused",
       reason: "revoked",
-      text: "Mida: doomed-agent's access was revoked by the owner. Nothing was shared.",
+      text: "Mida: doomed-agent's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
     })
     // the refusal is the server's word, not our message: the same read our builder skipped is
     // attempted here and the API answers CAPABILITY_REVOKED

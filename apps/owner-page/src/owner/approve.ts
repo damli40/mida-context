@@ -35,6 +35,7 @@ async function main(): Promise<void> {
     if (link.req.project !== undefined) lines.push(`for the project "${link.req.project.label}"`)
     lines.push(`Advisor: ${prep.advice.risk} risk.`, ...prep.advice.warnings.map((w) => `Warning: ${w}`))
     if (prep.alreadyGranted) lines.push("This agent already holds everything it asked for.")
+    lines.push("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
     summary.textContent = lines.join("\n")
     // Above the button: every project row the signature will cover — the new row named by its
     // label, plus the count (and the expandable list) of existing rows being re-signed.

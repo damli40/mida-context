@@ -111,7 +111,7 @@ describe("buildHandoff", () => {
     expect(result).toEqual({
       kind: "refused",
       reason: "revoked",
-      text: "Mida: codex's access was revoked by the owner. Nothing was shared.",
+      text: "Mida: codex's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
     })
     expect(calls).toEqual({ checkProject: 1, capability: 0, read: 0, readFacts: 0 })
   })
@@ -276,7 +276,7 @@ describe("buildHandoff", () => {
     expect(result).toEqual({
       kind: "refused",
       reason: "revoked",
-      text: "Mida: codex's access was revoked by the owner. Nothing was shared.",
+      text: "Mida: codex's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
     })
     expect(calls.read).toBe(0)
   })
@@ -291,7 +291,7 @@ describe("buildHandoff", () => {
     expect(result).toEqual({
       kind: "refused",
       reason: "revoked",
-      text: "Mida: codex's access was revoked by the owner. Nothing was shared.",
+      text: "Mida: codex's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
     })
   })
 

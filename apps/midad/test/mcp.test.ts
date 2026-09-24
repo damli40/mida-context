@@ -442,7 +442,7 @@ describe("mida-mcp tools against a fake daemon", () => {
     try {
       const { client, close } = await connect(deps(dir, { agent: "codex" }))
       try {
-        expect(await callText(client, "mida_whats_new")).toBe("Mida: codex's access was revoked by the owner. Nothing was shared.")
+        expect(await callText(client, "mida_whats_new")).toBe("Mida: codex's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.")
       } finally {
         await close()
       }

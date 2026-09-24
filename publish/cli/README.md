@@ -32,6 +32,10 @@ mida request codex && mida approve codex               # type yes
 Work in Claude Code, stop, open Codex in the same folder, and type **Continue.** Revoke any time with
 `mida revoke codex` — future reads are refused; what an agent already read cannot be taken back.
 
+Mida keeps your context encrypted until an approved agent asks for it. When it does, Mida decrypts
+what that agent may read and hands it to the model as plain text. Revoking stops every future read
+through Mida. It cannot make a model forget what it was already shown.
+
 ## Bring your own compile model
 
 A model turns each session into the checkpoint. Default order: DeepSeek (`DEEPSEEK_API_KEY`), then

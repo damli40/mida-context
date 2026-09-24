@@ -179,7 +179,7 @@ describe("mida-mcp against a real midad on local Anvil", () => {
       await ownerRuntime.close()
     }
     expect(await callText(mcp!.client, "mida_handoff")).toBe(
-      "Mida: claude-code's access was revoked by the owner. Nothing was shared.",
+      "Mida: claude-code's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
     )
   }, STEP_TIMEOUT)
 

@@ -72,10 +72,11 @@ describe("the crude mida command", () => {
     const lines: string[] = []
     const asked: string[] = []
     const answers: string[] = []
+    const printedBeforeAsk: (string | undefined)[] = []
     const run2 = (...argv: string[]) =>
       runCli(argv, {
         home, network, print: (line) => lines.push(line),
-        prompt: async (question) => { asked.push(question); return answers.shift() ?? "" },
+        prompt: async (question) => { asked.push(question); printedBeforeAsk.push(lines.at(-1)); return answers.shift() ?? "" },
         stdinIsTTY: true, stdoutIsTTY: true,
       })
     // claude-code is live from the tests above; a fresh ask needs a revoked agent first
@@ -87,6 +88,8 @@ describe("the crude mida command", () => {
     expect(lines.some((line) => line.includes("claude-code is asking for"))).toBe(true)
     expect(lines.some((line) => line.includes("grant advisor"))).toBe(true)
     expect(asked).toEqual(["Type yes to approve: "])
+    // the disclosure is the last thing printed before the ask: plain text now, no recall later
+    expect(printedBeforeAsk[0]).toBe("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
     expect(lines).toContain("not approved")
     // nothing was signed: the pending request is still there, waiting
     expect(home.has("agents/claude-code/pending-request.json")).toBe(true)
@@ -256,6 +259,8 @@ describe("the crude mida command", () => {
     const chainLine = out.findIndex((line) => line.startsWith("revoked claude-code on chain"))
     expect(chainLine).toBeGreaterThanOrEqual(0)
     expect(out[chainLine]).toMatch(/— tx 0x[0-9a-f]{64}/)
+    // right after the tx line: what revoking does and does not do (T7)
+    expect(out[chainLine + 1]).toBe("This stops future reads through Mida. It does not erase what claude-code already read.")
     // assistant got the new key; codex's refused wrap names its fix — and nothing calls the whole
     // revoke refused
     expect(out).toContain("new read key sent to assistant")

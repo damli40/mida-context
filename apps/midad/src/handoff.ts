@@ -70,7 +70,7 @@ const HANDOFF_READ_LIMIT_MS = 7_500
 const notApprovedText = (agent: string): string =>
   `Mida: ${agent} is not approved for this project — run \`mida approve ${agent}\` in this folder.`
 const revokedText = (agent: string): string =>
-  `Mida: ${agent}'s access was revoked by the owner. Nothing was shared.`
+  `Mida: ${agent}'s access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.`
 export const noIdentityText = (agent: string, homeRoot: string): string =>
   `Mida: no agent "${agent}" is set up in this Mida home (${homeRoot}). Nothing was shared.`
 export const identityUnreadableText = (agent: string, homeRoot: string): string =>

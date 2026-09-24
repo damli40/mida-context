@@ -374,6 +374,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
         // Anything the owner typed — or pasted — before this question existed is stale input:
         // drain it so only a line typed against the visible ask can be the answer.
         await drain()
+        deps.print("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
         return (await prompt("Type yes to approve: ")).trim() === "yes"
       })
       deps.print(
@@ -406,6 +407,9 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
           ? "nothing to revoke"
           : `revoked ${agent} on chain${result.sponsored ? " (sponsored)" : ""} — tx ${result.transactionHashes.join(" ")}`,
       )
+      if (result.transactionHashes.length > 0) {
+        deps.print(`This stops future reads through Mida. It does not erase what ${agent} already read.`)
+      }
       for (const name of result.rewrapped) deps.print(`new read key sent to ${name}`)
       for (const failure of result.failed) {
         deps.print(`could not send the new key to ${failure.name}: ${failure.reason} — run \`mida approve ${failure.name}\``)
@@ -683,6 +687,9 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
             ? "nothing to revoke"
             : `revoked ${agent} on chain — tx ${result.transactionHashes.join(" ")}`,
         )
+        if (!result.nothingToRevoke && result.transactionHashes.length > 0) {
+          deps.print(`This stops future reads through Mida. It does not erase what ${agent} already read.`)
+        }
         for (const name of result.rewrapped) deps.print(`new read key sent to ${name}`)
       }
       return 0

@@ -210,10 +210,14 @@ mida revoke codex
 ```
 
 ```
-revoked codex tx 0x<64 hex>; new key sent to: claude-code
+revoked codex on chain — tx 0x<64 hex>
+This stops future reads through Mida. It does not erase what codex already read.
+new read key sent to claude-code
 ```
 
 Codex is refused on its next read or write; the remaining agents keep access through a rotated key.
+
+Mida keeps your context encrypted until an approved agent asks for it. When it does, Mida decrypts what that agent may read and hands it to the model as plain text. Revoking stops every future read through Mida. It cannot make a model forget what it was already shown.
 
 ## 11. The SDK path — RUN on local Anvil
 
@@ -258,30 +262,82 @@ node agent.mjs
 
 *Status: RUN on local Anvil — `apps/midad/test/connect.e2e.test.ts` executes this exact sequence (connect → request → `mida approve` → create → read → `mida revoke` → refused) against a fresh chain, and `pnpm check:publish` runs and type-checks an SDK consumer installed from the packed tarball. NOT RUN on the live testnet.*
 
-## 12. Use Mida from Claude Desktop / Cursor — RUN in tests
+## 12. Use Mida from an MCP client — NOT RUN against any real client
 
-Agents that speak MCP instead of hooks — Claude Desktop, Cursor, Codex's MCP support — reach the same daemon through `mida-mcp`: a local, stdio MCP server that is a client of the midad socket, exactly like the hooks. It holds no keys and signs nothing.
+Agents that speak MCP instead of hooks — Claude Desktop, Cursor, Codex's MCP support, anything else that runs a local stdio server — reach the same daemon through `mida-mcp`: a local MCP server that is a client of the midad socket, exactly like the hooks. It holds no keys and signs nothing.
 
-Claude Desktop's `claude_desktop_config.json` (Settings → Developer → MCP servers), or Cursor's `.cursor/mcp.json` — the same shape in both:
+The disclosure model is the same as everywhere else:
+
+Mida keeps your context encrypted until an approved agent asks for it. When it does, Mida decrypts what that agent may read and hands it to the model as plain text. Revoking stops every future read through Mida. It cannot make a model forget what it was already shown.
+
+**Claude Desktop — NOT RUN.** `claude_desktop_config.json` (Settings → Developer → MCP servers). Desktop clients start the server **without your shell's environment and not in your project folder**, so the home and the project are both explicit:
 
 ```json
 {
   "mcpServers": {
     "mida": {
       "command": "<absolute path to mida-mcp>",
-      "args": ["--as", "assistant"]
+      "args": ["--as", "assistant", "--project", "<absolute path to your project folder>"],
+      "env": { "MIDA_HOME": "<your Mida home, if not ~/.mida>" }
     }
   }
 }
 ```
 
-Desktop clients start the server **without your shell's environment**. If your Mida home is not the default `~/.mida`, add `"env": { "MIDA_HOME": "<your home dir>" }` next to `"args"`, or the server looks in the wrong home and every tool answers "not approved". The model keys used for compiles live in the daemon, not in this server: start the daemon from a terminal that has them (any `mida` command does), and the MCP server reuses it over the socket; a daemon the client spawns itself would have no keys and could not compile.
+**Cursor — NOT RUN.** `.cursor/mcp.json` — the same block, with `--project` set to Cursor's workspace-folder variable:
 
-The command is the installed `mida-mcp` bin by absolute path (`which mida-mcp` prints it; from a source checkout it is `<repo>/bin/mida-mcp`). `--as` names which agent identity the server reports — `claude-code`, `codex` or `assistant` (the default); add `"--project", "<dir>"` if the client launches it somewhere other than your project folder. The approval step is the same per-folder command the hooks use:
+```json
+{
+  "mcpServers": {
+    "mida": {
+      "command": "<absolute path to mida-mcp>",
+      "args": ["--as", "assistant", "--project", "${workspaceFolder}"],
+      "env": { "MIDA_HOME": "<your Mida home, if not ~/.mida>" }
+    }
+  }
+}
+```
+
+**Codex — NOT RUN.** In `$CODEX_HOME/config.toml` (`~/.codex/config.toml` by default):
+
+```toml
+[mcp_servers.mida]
+command = "<absolute path to mida-mcp>"
+args = ["--as", "assistant", "--project", "<absolute path to your project folder>"]
+
+[mcp_servers.mida.env]
+MIDA_HOME = "<your Mida home, if not ~/.mida>"
+```
+
+**Any MCP harness — NOT RUN.** Every stdio config is the same block in a different file: `command` is the absolute path to `node`, `args` is the absolute path to the `mida-mcp` entry followed by `--as assistant --project <absolute project folder>`, and `env.MIDA_HOME` carries the home when it is not `~/.mida`:
+
+```json
+{
+  "command": "<absolute path to node>",
+  "args": ["<absolute path to the mida-mcp entry>", "--as", "assistant", "--project", "<absolute project folder>"],
+  "env": { "MIDA_HOME": "<your Mida home, if not ~/.mida>" }
+}
+```
+
+Cursor keeps that block in `.cursor/mcp.json`, Windsurf in `~/.codeium/windsurf/mcp_config.json`, VS Code in `.vscode/mcp.json`, Zed in `settings.json` under `context_servers`, and Gemini CLI in `~/.gemini/settings.json` under `mcpServers` — check each client's own MCP docs for the exact file. None of them is validated against Mida yet.
+
+The command is the installed `mida-mcp` bin by absolute path (`which mida-mcp` prints it; from a source checkout it is `<repo>/bin/mida-mcp`). `--as` is startup configuration: the default is `assistant`, it can be any agent name registered in the home, and no tool call can change it — the four tools carry no identity field. Revoking `assistant` stops future reads for every client started as `assistant`; in v0 the registered names are `claude-code`, `codex` and `assistant`, so two clients that need separate revocation run under different registered names. The approval step is the same per-folder command the hooks use, run in the project folder:
 
 ```bash
 mida request assistant && mida approve assistant
 ```
+
+The server refuses to start — one line on stderr, exit 2, nothing on stdout — in the two cases that would otherwise read as "not approved" forever:
+
+- `mida-mcp: no agent "<name>" is set up in the Mida home <home> — check MIDA_HOME in this client's config` — the `--as` identity is not registered in the home the config points at (usually a wrong `MIDA_HOME`).
+- `mida-mcp: <dir> is not a Mida project folder — start the server with --project <your project folder>` — the folder the client launched the server in carries no Mida project marker; pass the project explicitly.
+
+**macOS: desktop apps cannot run anything under Desktop, Documents or Downloads.** Install Mida and keep the MCP project folder outside those directories — macOS privacy protection refuses the launch, and the server says so at startup instead of pretending the home is empty:
+
+- `mida-mcp: <mida home>/agents/assistant/identity.json could not be read (the system refused access). If it is under Desktop, Documents or Downloads, macOS blocks desktop apps from it — move Mida or the project out of those folders.`
+- `mida-mcp: <project folder> could not be read (the system refused access). If it is under Desktop, Documents or Downloads, macOS blocks desktop apps from it — move Mida or the project out of those folders.`
+
+The model keys used for compiles live in the daemon, not in this server: start the daemon from a terminal that has them (any `mida` command does), and the MCP server reuses it over the socket; a daemon the client spawns itself would have no keys and could not compile.
 
 The client then sees four tools — `mida_handoff` (the same text a session-start hook would inject), `mida_whats_new` (the per-prompt note), `mida_read` (a context namespace) and `mida_status` (health plus each agent's verdict for this folder). `mida doctor` prints `ok: mida-mcp resolves to <path>` once the package is installed.
 
@@ -289,9 +345,11 @@ The honest limits:
 
 - **Local only.** It is stdio on this machine, talking to midad's Unix socket — there is no remote MCP endpoint to point a hosted client at.
 - **Read-only.** No write tool exists in this round — a model cannot save, remember, approve or revoke through MCP until the owner decides that is wanted.
-- **ChatGPT web connectors are not supported.** Remote MCP needs a key held in the cloud that can sign for the agent, and Mida's design keeps signing keys on your machine.
+- claude.ai web and mobile: not supported in v0 — they only call public HTTPS servers from Anthropic's cloud, and Mida does not run one.
+<!-- revisit if spike S4 passes (plan Task 10) -->
+- **ChatGPT — NOT RUN.** Through OpenAI's Secure MCP Tunnel where your ChatGPT plan allows developer-mode apps.
 
-*Status: RUN in tests — `apps/midad/test/mcp.test.ts` drives the server over the SDK's in-memory transport against a fake daemon socket, including the not-approved, revoked and daemon-down answers. NOT RUN against a real MCP client.*
+*Status: NOT RUN against a real MCP client — `apps/midad/test/mcp.test.ts` drives the server over the SDK's in-memory transport against a fake daemon socket (including the not-approved, revoked and daemon-down answers), and `apps/midad/test/mcp.e2e.test.ts` runs it against a real daemon on a local Anvil chain. No client above has been validated end-to-end.*
 
 ## The compile model: DeepSeek by default — RUN (benchmarked)
 

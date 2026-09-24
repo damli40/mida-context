@@ -254,7 +254,7 @@ async function toolWhatsNew(deps: McpServerDeps) {
       return toolText(`Mida: ${deps.agent} is not approved for this project — run \`mida approve ${deps.agent}\` in this folder.`)
     }
     if (reason === "revoked") {
-      return toolText(`Mida: ${deps.agent}'s access was revoked by the owner. Nothing was shared.`)
+      return toolText(`Mida: ${deps.agent}'s access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.`)
     }
     // the two list-integrity refusals carry their own canonical lines — the same ones the
     // session-start handoff text uses (they are reproduced, not imported: handoff.ts must stay

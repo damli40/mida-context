@@ -33,6 +33,7 @@ async function main(): Promise<void> {
             "This agent can currently:",
             ...prep.live.map((c) => `• ${c.namespaceName} — ${permissionWords(c.permissions)}`),
             "Revoking ends all of this and locks the old keys out of anything it saved.",
+            "It does not erase what the agent already read.",
           ]
     summary.textContent = lines.join("\n")
     // The approved-projects rows the signature re-covers (the terminal already filtered the
