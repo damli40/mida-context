@@ -48,6 +48,7 @@ import type { SealedRecord } from "@mida/sdk"
 import { RegistryReader } from "@mida/api"
 import type { AnchoredObject } from "@mida/api"
 import { MidaHome, resolveHome } from "./home.js"
+import { pendingAnchorsStrict } from "./batching.js"
 import { Runtime, makeOwnerBalanceGuard, parseSponsorUrl, sponsorReachable, NAMESPACE } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { FACT_NAMESPACES } from "./remember.js"
@@ -527,6 +528,27 @@ export async function migrate(
     if (batched) {
       return refuse("this setup has batched checkpoint saves; migrate cannot move them yet", "batched-saves-present")
     }
+  }
+
+  // The local half of the same guard: the chain flag only knows saves the chain already anchored —
+  // a save the store queued but has not submitted yet is invisible to it. The home's own pending
+  // ledger answers that, read STRICTLY: a file that exists but will not parse, or an entry that is
+  // not a known in-flight save, is "unknown" — and unknown means refuse, exactly like the chain
+  // read above. It runs whether or not the source still names a BatchAnchor; a save that was
+  // queued stays queued either way.
+  let pendingBatched: number
+  try {
+    pendingBatched = pendingAnchorsStrict(home).length
+  } catch (error) {
+    const refused = refuse("could not read the local batched-saves ledger; migrate stops rather than guess", "batched-check-failed")
+    if (env.MIDA_DEBUG === "1") say(debugLine(error))
+    return refused
+  }
+  if (pendingBatched > 0) {
+    return refuse(
+      `this setup has ${pendingBatched} batched checkpoint save(s) still waiting on the chain; let the store finish them before migrating`,
+      "batched-saves-pending",
+    )
   }
 
   let persisted: MigrateState | undefined

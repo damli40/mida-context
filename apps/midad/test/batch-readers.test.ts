@@ -7,7 +7,7 @@
 // /batch/status and /batch/flush; the agent and chain are plain objects — no anvil, no server.
 
 import { describe, expect, it } from "vitest"
-import { mkdtempSync } from "node:fs"
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { createServer as createHttpServer } from "node:http"
 import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
@@ -734,15 +734,33 @@ describe("readOwnerUniverse — the batched half of the history", () => {
 })
 
 describe("migrate — the batched-saves guard fails closed", () => {
+  /** One well-formed in-flight entry for state/batch-pending.json — QUEUED means "not final yet". */
+  const PENDING_ENTRY = {
+    contextId: `0x${"cc".repeat(32)}`,
+    eventId: "ev-pending-1",
+    sessionId: "sess-pending-1",
+    agent: "claude-code",
+    queuedAt: "2026-09-24T11:00:00.000Z",
+    state: "QUEUED",
+  }
+
   const migrateDeps = async (over: {
     deploymentRaw: Record<string, unknown>
     hasBatchedSaves?: (owner: Address) => Promise<boolean>
+    /** seeds state/batch-pending.json: a ledger object, or "corrupt-json" for raw unparseable bytes */
+    pendingLedger?: { entries: unknown[] } | "corrupt-json"
   }) => {
     const rpc = await stubRpc()
     const home = new MidaHome(dir())
     saveOwnerMode(home, "software")
     saveOwnerAddress(home, OWNER)
     home.writeSecretJson("network.json", { rpcUrl: rpc.url, deployment: over.deploymentRaw })
+    if (over.pendingLedger === "corrupt-json") {
+      mkdirSync(home.path("state"), { recursive: true })
+      writeFileSync(home.path("state/batch-pending.json"), "{not json")
+    } else if (over.pendingLedger !== undefined) {
+      home.writeSecretJson("state/batch-pending.json", over.pendingLedger)
+    }
     const lines: string[] = []
     const asked: Address[] = []
     const result = await migrate({
@@ -819,6 +837,74 @@ describe("migrate — the batched-saves guard fails closed", () => {
     try {
       expect(result.outcome).toBe("nothing-to-move")
       expect(asked).toHaveLength(0)
+    } finally {
+      await close()
+    }
+  })
+
+  it("a queued save in the local ledger refuses — the chain flag cannot see what was never submitted", async () => {
+    // No batchAnchor at all on this source: the chain guard is skipped, so only the local
+    // ledger can know a save is still in flight. That is the hole this guard exists for.
+    const { result, lines, asked, close } = await migrateDeps({
+      deploymentRaw: DEPLOYMENT_RAW,
+      pendingLedger: { entries: [PENDING_ENTRY] },
+    })
+    try {
+      expect(result).toMatchObject({ outcome: "refused", code: "batched-saves-pending" })
+      expect(lines[0]).toContain("1 batched checkpoint save(s) still waiting on the chain")
+      expect(asked).toHaveLength(0)
+    } finally {
+      await close()
+    }
+  })
+
+  it("a pending ledger refuses even when the chain flag itself is false", async () => {
+    const { result, asked, close } = await migrateDeps({
+      deploymentRaw: DEPLOYMENT_BATCHED_RAW,
+      hasBatchedSaves: async () => false, // nothing anchored yet — the ledger still says QUEUED
+      pendingLedger: { entries: [PENDING_ENTRY] },
+    })
+    try {
+      expect(result).toMatchObject({ outcome: "refused", code: "batched-saves-pending" })
+      expect(asked).toEqual([OWNER])
+    } finally {
+      await close()
+    }
+  })
+
+  it("a pending ledger that will not parse refuses batched-check-failed — corrupt is never 'none'", async () => {
+    const { result, lines, close } = await migrateDeps({
+      deploymentRaw: DEPLOYMENT_RAW,
+      pendingLedger: "corrupt-json",
+    })
+    try {
+      expect(result).toMatchObject({ outcome: "refused", code: "batched-check-failed" })
+      expect(lines).toContain("could not read the local batched-saves ledger; migrate stops rather than guess")
+    } finally {
+      await close()
+    }
+  })
+
+  it("a pending ledger whose entry is not a well-formed in-flight save refuses the same way", async () => {
+    const { result, close } = await migrateDeps({
+      deploymentRaw: DEPLOYMENT_RAW,
+      // parses fine, is an array, but the entry is missing fields — unknown, and unknown refuses
+      pendingLedger: { entries: [{ contextId: `0x${"dd".repeat(32)}` }] },
+    })
+    try {
+      expect(result).toMatchObject({ outcome: "refused", code: "batched-check-failed" })
+    } finally {
+      await close()
+    }
+  })
+
+  it("an empty pending ledger lets the run on to the ordinary answer", async () => {
+    const { result, close } = await migrateDeps({
+      deploymentRaw: DEPLOYMENT_RAW,
+      pendingLedger: { entries: [] },
+    })
+    try {
+      expect(result.outcome).toBe("nothing-to-move")
     } finally {
       await close()
     }

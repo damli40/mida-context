@@ -121,6 +121,25 @@ export function pendingAnchors(home: MidaHome): PendingAnchor[] {
   }
 }
 
+/**
+ * The same ledger read fail-closed, for migrate's "is anything still queued?" — pendingAnchors
+ * forgives a corrupt file because a drain pass can simply try again, but a migration deciding
+ * "nothing pending" off a file it could not read would move on while saves still wait on the
+ * chain. Throws on bad JSON, a non-array `entries`, or an entry whose shape or state is not a
+ * known in-flight one; the caller treats every throw as "unknown", and unknown means refuse.
+ */
+export function pendingAnchorsStrict(home: MidaHome): PendingAnchor[] {
+  const raw = home.readJson<{ entries?: unknown }>(PENDING_FILE) // throws on unparseable JSON
+  if (raw === undefined) return []
+  if (!Array.isArray(raw.entries)) throw new Error(`${PENDING_FILE} is not a pending-ledger file`)
+  return raw.entries.map((entry, index) => {
+    if (!isEntry(entry, PENDING_FIELDS) || (entry.state !== "QUEUED" && entry.state !== "SUBMITTED")) {
+      throw new Error(`${PENDING_FILE} entry ${index} is not a well-formed pending save`)
+    }
+    return entry as unknown as PendingAnchor
+  })
+}
+
 /** The rejected ledger's well-formed entries. */
 export function rejectedAnchors(home: MidaHome): RejectedAnchor[] {
   try {
