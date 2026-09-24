@@ -18,7 +18,7 @@
 
 import { existsSync, readFileSync } from "node:fs"
 import { dirname } from "node:path"
-import { encodeAbiParameters, keccak256, zeroHash } from "viem"
+import { bytesToHex, encodeAbiParameters, keccak256, zeroHash } from "viem"
 import type { AbiEvent, LocalAccount } from "viem"
 import { BATCH_REJECT, MidaError, batchLeafHash, batchSaveStructHash, decodeUint64, merkleProof, merkleRoot } from "@mida/protocol"
 import type { Address, BatchSaveMessage, Hex } from "@mida/protocol"
@@ -57,6 +57,8 @@ export interface BatcherChain {
   submit(batchId: Hex, saves: BatchedSaveWire[]): Promise<{ transactionHash: Hex } | { exists: true }>
   anchoredLogs(batchId: Hex): Promise<AnchoredLog[]>
   rejectedLogs(batchId: Hex): Promise<RejectedLog[]>
+  /** The BatchAnchored event for this batchId — who submitted it and how it split; null if none. */
+  batchAnchored(batchId: Hex): Promise<{ submitter: Address; acceptedCount: number; rejectedCount: number } | null>
   batchOf(batchId: Hex): Promise<{ root: Hex; blockNumber: bigint; acceptedCount: number }>
   /** The batchId that anchored this contextId before, or null — used for ALREADY_ANCHORED rejects. */
   findAnchoring(contextId: Hex): Promise<Hex | null>
@@ -194,8 +196,19 @@ export interface BatcherOptions {
   now: () => number
   cap: number
   waitMs: number
-  /** The batch submitter — batchIds derive from it, so every run's id is recomputable after a crash. */
+  /**
+   * The batch submitter — one ingredient of the batchId and the identity resolve() proves a landed
+   * batch belongs to: submitBatch has no caller check, so an id is never trusted on its own.
+   */
   submitter: Address
+  /**
+   * The 32 random bytes inside each batchId — keccak(submitter, sequence, salt). The salt is what
+   * makes the next id unpredictable: a derivable id can be pre-claimed by a foreign submitBatch,
+   * which would hand that batcher's rows a stranger's outcomes. The journal records the id before
+   * the submit goes out, so recover() never needs to recompute it. Injectable for tests that must
+   * predict (or replay) an id; default is crypto.getRandomValues — present in Workers and Node.
+   */
+  salt?: () => Hex
   log?: (record: Record<string, unknown>) => void
   /** Minimum milliseconds between two real submissions; default 1000. */
   minGapMs?: number
@@ -216,6 +229,7 @@ export class Batcher {
   readonly #waitMs: number
   readonly #minGapMs: number
   readonly #submitter: Address
+  readonly #salt: () => Hex
   readonly #log: ((record: Record<string, unknown>) => void) | undefined
   /** Ordered contextIds of batches this process submitted — the resolve mapping without a journal read. */
   readonly #submitted = new Map<string, Hex[]>()
@@ -232,6 +246,7 @@ export class Batcher {
     this.#waitMs = options.waitMs
     this.#minGapMs = options.minGapMs ?? 1000
     this.#submitter = options.submitter.toLowerCase() as Address
+    this.#salt = options.salt ?? (() => bytesToHex(crypto.getRandomValues(new Uint8Array(32))))
     this.#log = options.log
   }
 
@@ -319,7 +334,10 @@ export class Batcher {
     }
     const sequence = await this.#store.nextSequence()
     const batchId = keccak256(
-      encodeAbiParameters([{ type: "address" }, { type: "uint256" }], [this.#submitter, sequence]),
+      encodeAbiParameters(
+        [{ type: "address" }, { type: "uint256" }, { type: "bytes32" }],
+        [this.#submitter, sequence, this.#salt()],
+      ),
     )
     // The batchId goes into the journal before a single row is marked SUBMITTED, so a crash between
     // the take and the full record still leaves recover() a batchId it can requeue by.
@@ -381,8 +399,30 @@ export class Batcher {
   async #resolveOnce(batchId: Hex): Promise<{ accepted: number; rejected: number }> {
     const batch = await this.#chain.batchOf(batchId)
     if (batch.blockNumber === 0n) throw new MidaError("NOT_FOUND", `batch ${batchId} has not landed on chain`)
+    // Before any row moves the batch must prove it is THIS batcher's: submitBatch has no caller
+    // check, so a batchId found on chain can be a foreign batch pre-claiming the id. Three facts
+    // have to line up — the BatchAnchored event names our submitter, every anchored contextId is
+    // one of the journaled rows, and the event's accepted+rejected count equals the row count.
+    const order = this.#submitted.get(batchId.toLowerCase()) ?? (await this.#journal?.contextIds(batchId)) ?? null
     const anchored = (await this.#chain.anchoredLogs(batchId)).sort((a, b) => a.position - b.position)
     const rejected = await this.#chain.rejectedLogs(batchId)
+    const event = await this.#chain.batchAnchored(batchId)
+    const oursIds = new Set((order ?? []).map((contextId) => contextId.toLowerCase()))
+    const ours =
+      order !== null &&
+      event !== null &&
+      event.submitter.toLowerCase() === this.#submitter &&
+      anchored.every((log) => oursIds.has(log.contextId.toLowerCase())) &&
+      event.acceptedCount + event.rejectedCount === order.length
+    if (!ours) {
+      // Not ours: no row may take this batch's outcomes. The rows come back to QUEUED (a fresh id
+      // next run), the journal entry is cleared and the one log line says exactly what happened.
+      const requeued = await this.#store.requeue(batchId)
+      this.#submitted.delete(batchId.toLowerCase())
+      await this.#journal?.clear(batchId)
+      this.#log?.({ event: "batch.not-ours", batchId, requeued, message: `batch ${batchId} is not ours — requeued` })
+      return { accepted: 0, rejected: 0 }
+    }
     // The log set must be exactly the batch the contract recorded — a hole in it rebuilds the wrong
     // root, and so does a missing tail the count comparison would otherwise wave through.
     if (anchored.length !== Number(batch.acceptedCount)) {
@@ -418,7 +458,6 @@ export class Batcher {
         anchoredAt,
       })
     }
-    const order = this.#submitted.get(batchId.toLowerCase()) ?? (await this.#journal?.contextIds(batchId)) ?? null
     let unmapped = 0
     for (const rejection of rejected) {
       const contextId = order?.[rejection.index]
@@ -495,8 +534,20 @@ export function createBatcherChain(input: { rpcUrl: string; deployment: Deployme
   if (batchAnchor === undefined) throw new MidaError("INVALID_WIRE", "this deployment has no BatchAnchor")
   const fromBlock = deployment.batchAnchorBlock ?? deployment.deploymentBlock
   const context = createWriteContext(input)
+  const batchAnchoredEvent = batchAnchorAbi.find((item) => item.type === "event" && item.name === "BatchAnchored") as AbiEvent
   const saveAnchoredEvent = batchAnchorAbi.find((item) => item.type === "event" && item.name === "SaveAnchored") as AbiEvent
   const saveRejectedEvent = batchAnchorAbi.find((item) => item.type === "event" && item.name === "SaveRejected") as AbiEvent
+  // The block a landed batch was recorded in — the only block its events can live in. A batchId
+  // the chain never saw answers 0 and every per-batch read is empty without a log scan.
+  const batchBlock = async (batchId: Hex): Promise<bigint> => {
+    const [, blockNumber] = (await context.publicClient.readContract({
+      address: batchAnchor,
+      abi: batchAnchorAbi,
+      functionName: "batchOf",
+      args: [batchId],
+    })) as [Hex, bigint, number]
+    return BigInt(blockNumber)
+  }
 
   return {
     async submit(batchId, saves) {
@@ -560,6 +611,25 @@ export function createBatcherChain(input: { rpcUrl: string; deployment: Deployme
         const args = log.args as { index: number; reason: number }
         return { index: Number(args.index), reason: Number(args.reason) }
       })
+    },
+    async batchAnchored(batchId) {
+      const blockNumber = await batchBlock(batchId)
+      if (blockNumber === 0n) return null
+      const logs = await getLogsChunked(context.publicClient, {
+        address: batchAnchor,
+        event: batchAnchoredEvent,
+        args: { batchId },
+        fromBlock: blockNumber,
+        toBlock: blockNumber,
+      })
+      const first = logs[0]
+      if (first === undefined) return null
+      const args = first.args as { submitter: Address; acceptedCount: number; rejectedCount: number }
+      return {
+        submitter: args.submitter.toLowerCase() as Address,
+        acceptedCount: Number(args.acceptedCount),
+        rejectedCount: Number(args.rejectedCount),
+      }
     },
     async batchOf(batchId) {
       const [root, blockNumber, acceptedCount] = (await context.publicClient.readContract({

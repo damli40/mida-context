@@ -258,9 +258,14 @@ class FakeChain implements BatcherChain {
   readonly submissions: Hex[] = []
   private readonly anchoredIn = new Map<string, Hex>()
   private blockCounter = 100n
-  private readonly recorded = new Map<string, { anchored: AnchoredLog[]; rejected: RejectedLog[]; root: Hex; blockNumber: bigint; acceptedCount: number }>()
+  private readonly recorded = new Map<
+    string,
+    { anchored: AnchoredLog[]; rejected: RejectedLog[]; root: Hex; blockNumber: bigint; acceptedCount: number; submitter: Address }
+  >()
   /** Return a BATCH_REJECT code for a submitted-array index, or null to accept. */
   rejectAt: ((index: number) => number | null) | null = null
+  /** Who submit() records as the batch sender — the real chain stores msg.sender. */
+  submitter: Address = SUBMITTER
   failLogs = false
 
   async submit(batchId: Hex, saves: BatchedSaveWire[]): Promise<{ transactionHash: Hex } | { exists: true }> {
@@ -293,6 +298,7 @@ class FakeChain implements BatcherChain {
       root: anchored.length === 0 ? zeroHash : merkleRoot(anchored.map((log) => log.leafHash)),
       blockNumber: this.blockCounter++,
       acceptedCount: anchored.length,
+      submitter: this.submitter,
     })
     return { transactionHash: `0x${"ee".repeat(32)}` as Hex }
   }
@@ -305,6 +311,13 @@ class FakeChain implements BatcherChain {
   async rejectedLogs(batchId: Hex): Promise<RejectedLog[]> {
     if (this.failLogs) throw new Error("log read failed")
     return this.recorded.get(batchId.toLowerCase())?.rejected ?? []
+  }
+
+  async batchAnchored(batchId: Hex): Promise<{ submitter: Address; acceptedCount: number; rejectedCount: number } | null> {
+    if (this.failLogs) throw new Error("log read failed")
+    const batch = this.recorded.get(batchId.toLowerCase())
+    if (batch === undefined) return null
+    return { submitter: batch.submitter, acceptedCount: batch.acceptedCount, rejectedCount: batch.rejected.length }
   }
 
   async batchOf(batchId: Hex): Promise<{ root: Hex; blockNumber: bigint; acceptedCount: number }> {

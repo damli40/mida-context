@@ -7,7 +7,7 @@
 // a contextId it has anchored before), and stores bytes32(0) as the root of an all-rejected batch.
 
 import { describe, expect, it } from "vitest"
-import { zeroHash } from "viem"
+import { encodeAbiParameters, keccak256, zeroHash } from "viem"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { hexOf } from "@mida/crypto"
 import {
@@ -233,6 +233,8 @@ interface RecordedBatch {
   root: Hex
   blockNumber: bigint
   acceptedCount: number
+  /** msg.sender as the contract would store it — the fake lets a test pose as anyone. */
+  submitter: Address
 }
 
 const flipNibble = (hex: Hex): Hex => (hex.endsWith("0") ? `${hex.slice(0, -1)}1` : `${hex.slice(0, -1)}0`) as Hex
@@ -251,6 +253,8 @@ class FakeChain implements BatcherChain {
   blockCounter = 100n
   now: () => number = () => 0
   readonly submitTimes: number[] = []
+  /** Who the next submit() records as the batch's sender — flip it to pose as an attacker. */
+  submitter: Address = SUBMITTER
 
   /** Per-save decision: return a BATCH_REJECT code to reject, null to accept. Runs after the auto-anchored check. */
   rejectWith: (wire: BatchedSaveWire, index: number) => number | null = () => null
@@ -296,6 +300,7 @@ class FakeChain implements BatcherChain {
       root: anchored.length === 0 ? zeroHash : merkleRoot(anchored.map((log) => log.leafHash)),
       blockNumber: this.blockCounter++,
       acceptedCount: anchored.length,
+      submitter: this.submitter,
     })
     this.afterRecord?.()
     return { transactionHash: `0x${"ee".repeat(32)}` as Hex }
@@ -311,6 +316,13 @@ class FakeChain implements BatcherChain {
   async rejectedLogs(batchId: Hex): Promise<RejectedLog[]> {
     if (this.failLogs) throw new Error("log read failed")
     return this.batches.get(batchId.toLowerCase())?.rejected.map((log) => ({ ...log })) ?? []
+  }
+
+  async batchAnchored(batchId: Hex): Promise<{ submitter: Address; acceptedCount: number; rejectedCount: number } | null> {
+    if (this.failLogs) throw new Error("log read failed")
+    const batch = this.batches.get(batchId.toLowerCase())
+    if (batch === undefined) return null
+    return { submitter: batch.submitter, acceptedCount: batch.acceptedCount, rejectedCount: batch.rejected.length }
   }
 
   async batchOf(batchId: Hex): Promise<{ root: Hex; blockNumber: bigint; acceptedCount: number }> {
@@ -336,7 +348,16 @@ interface Rig {
 }
 
 function makeRig(
-  input: { cap?: number; waitMs?: number; minGapMs?: number; store?: MemoryBatchStore; chain?: FakeChain; journal?: BatchJournal } = {},
+  input: {
+    cap?: number
+    waitMs?: number
+    minGapMs?: number
+    store?: MemoryBatchStore
+    chain?: FakeChain
+    journal?: BatchJournal
+    /** Deterministic batchId salt — a test that must predict or replay an id supplies one. */
+    salt?: () => Hex
+  } = {},
 ): Rig {
   const store = input.store ?? new MemoryBatchStore()
   const chain = input.chain ?? new FakeChain()
@@ -354,6 +375,7 @@ function makeRig(
     waitMs: input.waitMs ?? 2_000,
     minGapMs: input.minGapMs ?? 1_000,
     submitter: SUBMITTER,
+    ...(input.salt === undefined ? {} : { salt: input.salt }),
     journal,
     log: (record) => events.push(record),
   })
@@ -502,16 +524,17 @@ describe("the batcher", () => {
   })
 
   it("a resubmitted batchId resolves the existing batch instead of sending again", async () => {
-    const rig = makeRig()
+    // A fixed salt makes the id derivable on purpose: sequence 1 under salt A is the same batchId
+    // twice — the state a crash after nextSequence but before its meta write would leave behind.
+    const salts = [`0x${"aa".repeat(32)}` as Hex, `0x${"aa".repeat(32)}` as Hex, `0x${"bb".repeat(32)}` as Hex]
+    let saltCall = 0
+    const rig = makeRig({ salt: () => salts[saltCall++]! })
     const first = makeSave()
     await rig.enqueue(first.wire, first.meta.contextId)
     await rig.batcher.flush()
     expect(rig.chain.batches.size).toBe(1)
     const batchId = rig.chain.submissions[0]!.batchId
 
-    // Rewind the sequence so the next run recomputes the same batchId — the state a crash after
-    // nextSequence but before its meta write would leave behind. The clock moves past minGapMs so
-    // the second run is allowed to reach the contract at all.
     rig.store.sequence = 0n
     rig.setNow(1_000)
     const second = makeSave()
@@ -520,11 +543,64 @@ describe("the batcher", () => {
 
     expect(rig.chain.attempts).toBe(2)
     expect(rig.chain.batches.size).toBe(1)
-    // The batch the contract already holds is the truth: the first row stays anchored, the new row
-    // — never in that batch — stays SUBMITTED rather than taking a false anchor.
+    // The batch the contract holds names different saves than the fresh journal entry — the journal
+    // cannot prove the batch belongs to these rows, so the new row comes back QUEUED rather than
+    // staying SUBMITTED forever (the first row was already anchored by the first run).
     expect((await rig.store.get(first.meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId })
-    expect((await rig.store.get(second.meta.contextId))!.state).toBe("SUBMITTED")
+    expect((await rig.store.get(second.meta.contextId))!).toMatchObject({ state: "QUEUED", batchId: null })
     expect(await rig.journal.list()).toEqual([])
+
+    // The next run picks a fresh id (salt B) and anchors the requeued row — past minGapMs first.
+    rig.setNow(2_000)
+    await rig.batcher.flush()
+    expect(rig.chain.submissions).toHaveLength(2)
+    expect(rig.chain.submissions[1]!.batchId).not.toBe(batchId)
+    expect((await rig.store.get(second.meta.contextId))!).toMatchObject({ state: "ANCHORED" })
+  })
+
+  it("a foreign batch that pre-claimed the id is not ours — no row takes its outcomes, all requeue and anchor under a fresh id", async () => {
+    const salts = [`0x${"aa".repeat(32)}` as Hex, `0x${"bb".repeat(32)}` as Hex]
+    let saltCall = 0
+    const rig = makeRig({ salt: () => salts[saltCall++]! })
+    const first = makeSave()
+    const second = makeSave()
+    await rig.enqueue(first.wire, first.meta.contextId)
+    await rig.enqueue(second.wire, second.meta.contextId)
+
+    // The attack: the id for (submitter, sequence 1, salt A) is computable ahead of time, and the
+    // contract's submitBatch has no caller check — an attacker lands a junk batch under it first.
+    const ATTACKER = "0x7777777777777777777777777777777777777777" as Address
+    const predictedId = keccak256(
+      encodeAbiParameters([{ type: "address" }, { type: "uint256" }, { type: "bytes32" }], [SUBMITTER, 1n, salts[0]!]),
+    )
+    const junk = makeSave()
+    rig.chain.submitter = ATTACKER
+    rig.chain.rejectWith = () => BATCH_REJECT.BAD_SIGNER // the attacker's save fails on chain
+    await rig.chain.submit(predictedId, [junk.wire])
+    rig.chain.submitter = SUBMITTER
+    rig.chain.rejectWith = () => null
+
+    // Our run hits BatchExists → resolves against THEIR batch — and must take none of its outcomes.
+    const result = await rig.batcher.run()
+    expect(result).toMatchObject({ batchId: predictedId, accepted: 0, rejected: 0 })
+    expect(rig.chain.batches.size).toBe(1) // still only the attacker's
+    for (const { meta } of [first, second]) {
+      expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "QUEUED", batchId: null, reason: null })
+    }
+    expect(await rig.journal.list()).toEqual([])
+    const event = rig.events.find((entry) => entry["event"] === "batch.not-ours")
+    expect(event).toMatchObject({ batchId: predictedId, requeued: 2, message: `batch ${predictedId} is not ours — requeued` })
+
+    // The next run picks a fresh (unsalted-by-the-attacker) id and anchors both rows under it —
+    // past minGapMs first, or the flush only schedules a wakeup.
+    rig.setNow(1_000)
+    await rig.batcher.flush()
+    expect(rig.chain.submissions).toHaveLength(2)
+    const ours = rig.chain.submissions[1]!.batchId
+    expect(ours).not.toBe(predictedId)
+    for (const { meta } of [first, second]) {
+      expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId: ours.toLowerCase() })
+    }
   })
 
   it("a partial batch anchors accepted rows with verifying proofs and names the rejected rows' reasons", async () => {
