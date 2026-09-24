@@ -394,8 +394,17 @@ class FakeChain implements BatcherChain {
     return { root: this.rootOverride ?? batch.root, blockNumber: batch.blockNumber, acceptedCount: batch.acceptedCount }
   }
 
-  async findAnchoring(contextId: Hex): Promise<Hex | null> {
-    return this.anchoredIn.get(contextId.toLowerCase()) ?? null
+  /** How many findAnchorings calls ran — the meter the one-scan-per-resolve test asserts. */
+  anchoringScans = 0
+
+  async findAnchorings(contextIds: Hex[]): Promise<Map<string, Hex>> {
+    this.anchoringScans++
+    const found = new Map<string, Hex>()
+    for (const contextId of contextIds) {
+      const batchId = this.anchoredIn.get(contextId.toLowerCase())
+      if (batchId !== undefined) found.set(contextId.toLowerCase(), batchId)
+    }
+    return found
   }
 }
 
@@ -848,6 +857,31 @@ describe("the batcher", () => {
     })
   })
 
+  it("a batch whose rows all come back ALREADY_ANCHORED heals them with ONE historical scan, not one per row", async () => {
+    const rig = makeRig()
+    const saves = [makeSave(), makeSave(), makeSave()]
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+    rig.chain.afterRecord = () => {
+      throw new Error("the response never arrived")
+    }
+
+    await rig.batcher.flush()
+    // Landed but unseen — all three rows requeued, and the resubmission rejects each ALREADY_ANCHORED.
+    expect(rig.chain.batches.size).toBe(1)
+    rig.chain.afterRecord = null
+    const scansBefore = rig.chain.anchoringScans
+    await rig.batcher.flush()
+
+    // Three ALREADY_ANCHORED rejects answered by a single ranged SaveAnchored scan.
+    expect(rig.chain.anchoringScans - scansBefore).toBe(1)
+    const firstBatchId = rig.chain.submissions[0]!.batchId.toLowerCase()
+    for (const { meta } of saves) {
+      const row = (await rig.store.get(meta.contextId))!
+      expect(row).toMatchObject({ state: "ANCHORED", batchId: firstBatchId })
+      expect(row.state).toBe("ANCHORED")
+    }
+  })
+
   it("a resubmitted batchId resolves the existing batch instead of sending again", async () => {
     // A fixed salt makes the id derivable on purpose: sequence 1 under salt A is the same batchId
     // twice — the state a crash after nextSequence but before its meta write would leave behind.
@@ -1119,7 +1153,7 @@ describe("createBatcherChain's log windows", () => {
   const DEPLOY_BLOCK = 100n
   const HEAD = 5_000n
 
-  it("resolve scans only the batch's own block; findAnchoring still scans from the anchor's deploy block", async () => {
+  it("resolve scans only the batch's own block; findAnchorings still scans from the anchor's deploy block", async () => {
     const { wire, meta } = makeSave()
     const batchId = hexOf(randomBytes(32))
     const leaf = leafOf(meta)
@@ -1235,9 +1269,9 @@ describe("createBatcherChain's log windows", () => {
       expect(await chain.batchAnchored(unknownId)).toBeNull()
       expect(scans).toHaveLength(3)
 
-      // findAnchoring is the historical search for a contextId — it keeps the anchor's deploy
-      // block as its floor and reaches chain head (chunked at MAX_LOG_BLOCK_RANGE = 1000).
-      expect(await chain.findAnchoring(meta.contextId)).toBe(batchId.toLowerCase())
+      // findAnchorings is the historical search for a set of contextIds — it keeps the anchor's
+      // deploy block as its floor and reaches chain head (chunked at MAX_LOG_BLOCK_RANGE = 1000).
+      expect((await chain.findAnchorings([meta.contextId])).get(meta.contextId)).toBe(batchId.toLowerCase())
       expect(scans.slice(3)).toEqual([
         expect.objectContaining({ fromBlock: ANCHOR_BLOCK, toBlock: ANCHOR_BLOCK + 999n }),
         expect.objectContaining({ fromBlock: ANCHOR_BLOCK + 1000n, toBlock: ANCHOR_BLOCK + 1999n }),

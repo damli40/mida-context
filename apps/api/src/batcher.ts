@@ -64,8 +64,12 @@ export interface BatcherChain {
   /** The BatchAnchored event for this batchId — who submitted it and how it split; null if none. */
   batchAnchored(batchId: Hex): Promise<{ submitter: Address; acceptedCount: number; rejectedCount: number } | null>
   batchOf(batchId: Hex): Promise<{ root: Hex; blockNumber: bigint; acceptedCount: number }>
-  /** The batchId that anchored this contextId before, or null — used for ALREADY_ANCHORED rejects. */
-  findAnchoring(contextId: Hex): Promise<Hex | null>
+  /**
+   * The batchIds that anchored these contextIds, in one historical scan for the whole set —
+   * used for ALREADY_ANCHORED rejects. Map keys and values are lowercase; a contextId never
+   * anchored is simply absent.
+   */
+  findAnchorings(contextIds: Hex[]): Promise<Map<string, Hex>>
 }
 
 /**
@@ -436,7 +440,7 @@ export class Batcher {
         return null
       }
       // The send failed ambiguously — the tx may or may not land. Requeue wholesale; if it did land,
-      // the next batch's ALREADY_ANCHORED rejects heal the PARENT-LESS rows through findAnchoring.
+      // the next batch's ALREADY_ANCHORED rejects heal the PARENT-LESS rows through findAnchorings.
       // A parented save resubmitted after its first copy landed comes back STALE_PARENT instead —
       // the lineage head moved to that very copy — and nothing heals it; the rejection loop below
       // logs that case as batch.stale-after-requeue.
@@ -562,14 +566,21 @@ export class Batcher {
       })
     }
     let unmapped = 0
+    // Every ALREADY_ANCHORED row is found in ONE historical scan for the whole batch — the per-row
+    // alternative paid a full deploy-block-to-head log scan for each rejected row.
+    const needsHeal = rejected
+      .filter((rejection) => rejection.reason === BATCH_REJECT.ALREADY_ANCHORED)
+      .map((rejection) => order[rejection.index])
+      .filter((contextId): contextId is Hex => contextId !== undefined)
+    const anchorings = needsHeal.length === 0 ? new Map<string, Hex>() : await this.#chain.findAnchorings(needsHeal)
     for (const rejection of rejected) {
-      const contextId = order?.[rejection.index]
+      const contextId = order[rejection.index]
       if (contextId === undefined) {
         unmapped += 1
         continue
       }
       if (rejection.reason === BATCH_REJECT.ALREADY_ANCHORED) {
-        const healed = await this.#anchorFromEarlierBatch(batchId, contextId, anchoredAt)
+        const healed = await this.#anchorFromEarlierBatch(batchId, contextId, anchoredAt, anchorings)
         if (!healed) await this.#store.markRejected(contextId, rejectName(rejection.reason))
       } else {
         if (rejection.reason === BATCH_REJECT.STALE_PARENT) {
@@ -595,9 +606,9 @@ export class Batcher {
    * A save the contract rejected as ALREADY_ANCHORED is not dead — an earlier batch holds its real
    * proof. Rebuild that batch's leaves under the same root-equality rule and anchor the row there.
    */
-  async #anchorFromEarlierBatch(batchId: Hex, contextId: Hex, anchoredAt: number): Promise<boolean> {
-    const earlier = await this.#chain.findAnchoring(contextId)
-    if (earlier === null || earlier.toLowerCase() === batchId.toLowerCase()) return false
+  async #anchorFromEarlierBatch(batchId: Hex, contextId: Hex, anchoredAt: number, anchorings: Map<string, Hex>): Promise<boolean> {
+    const earlier = anchorings.get(contextId.toLowerCase())
+    if (earlier === undefined || earlier.toLowerCase() === batchId.toLowerCase()) return false
     const logs = (await this.#chain.anchoredLogs(earlier)).sort((a, b) => a.position - b.position)
     const leaves = logs.map((log) => log.leafHash)
     const prior = await this.#chain.batchOf(earlier)
@@ -755,16 +766,24 @@ export function createBatcherChain(input: { rpcUrl: string; deployment: Deployme
       })) as [Hex, bigint, number]
       return { root: root.toLowerCase() as Hex, blockNumber: BigInt(blockNumber), acceptedCount: Number(acceptedCount) }
     },
-    async findAnchoring(contextId) {
+    async findAnchorings(contextIds) {
+      const found = new Map<string, Hex>()
+      if (contextIds.length === 0) return found
+      // contextId is an indexed SaveAnchored arg — viem encodes the array as topic alternatives,
+      // so one chunked scan answers for the whole set.
       const logs = await getLogsChunked(context.publicClient, {
         address: batchAnchor,
         event: saveAnchoredEvent,
-        args: { contextId },
+        args: { contextId: contextIds },
         fromBlock,
       })
-      const first = logs[0]
-      if (first === undefined) return null
-      return ((first.args as { batchId: Hex }).batchId).toLowerCase() as Hex
+      for (const log of logs) {
+        const args = log.args as { contextId: Hex; batchId: Hex }
+        const key = args.contextId.toLowerCase()
+        // Logs arrive in block order — the first hit for a contextId is its earliest anchoring.
+        if (!found.has(key)) found.set(key, args.batchId.toLowerCase() as Hex)
+      }
+      return found
     },
   }
 }
