@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { spawn } from "node:child_process"
-import { existsSync, mkdtempSync, readFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import type { Socket } from "node:net"
 import { tmpdir } from "node:os"
@@ -8,7 +8,7 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
-import { MidaHome, MCP_TOOLS, createMidaMcpServer, parseMcpArgs, readSeen, socketPathFor } from "@mida/midad"
+import { AGENT_NAME, MidaHome, MCP_TOOLS, createMidaMcpServer, parseMcpArgs, readSeen, socketPathFor } from "@mida/midad"
 import type { McpServerDeps } from "@mida/midad"
 
 const BIN_MIDA_MCP = fileURLToPath(new URL("../../../bin/mida-mcp", import.meta.url))
@@ -119,8 +119,43 @@ describe("mida-mcp args", () => {
     expect(parseMcpArgs(["--as", "claude-code"])).toMatchObject({ ok: true, args: { agent: "claude-code" } })
   })
 
-  it("refuses an unknown agent, an unknown flag, a missing value and a positional", () => {
-    for (const argv of [["--as", "bogus"], ["--verbose"], ["-x"], ["--as"], ["--project"], ["positional"], ["--as", "codex", "--extra", "y"]]) {
+  it("accepts any registered-agent-shaped name for --as", () => {
+    const r = parseMcpArgs(["--as", "chatgpt", "--project", "/tmp/p"])
+    expect(r).toEqual({ ok: true, args: { agent: "chatgpt", project: "/tmp/p", projectGiven: true } })
+  })
+
+  it("refuses names outside the agent-name rule", () => {
+    for (const bad of ["../owner", "Assistant", "a/b", "a b", ".", "..", "x".repeat(65), "codex\n"]) {
+      const r = parseMcpArgs(["--as", bad])
+      expect(r.ok, bad).toBe(false)
+      if (!r.ok) expect(r.error).toMatch(/^bad agent name/)
+    }
+  })
+
+  it("refuses --as or --project given twice, even with the same value", () => {
+    expect(parseMcpArgs(["--as", "assistant", "--as", "codex"])).toEqual({ ok: false, error: "--as given twice" })
+    expect(parseMcpArgs(["--as", "assistant", "--as", "assistant"])).toEqual({ ok: false, error: "--as given twice" })
+    expect(parseMcpArgs(["--project", "/a", "--project", "/b"])).toEqual({ ok: false, error: "--project given twice" })
+  })
+
+  it("refuses the --flag=value form rather than guessing", () => {
+    expect(parseMcpArgs(["--as=codex"])).toEqual({ ok: false, error: "unknown flag: --as=codex" })
+  })
+
+  it("marks whether --project was given", () => {
+    const r = parseMcpArgs([])
+    expect(r.ok && r.args.projectGiven).toBe(false)
+    expect(r.ok && r.args.agent).toBe("assistant")
+  })
+
+  it("uses the same name rule as the key store", () => {
+    for (const name of ["assistant", "claude-code", "codex", "chatgpt", "a-1"]) expect(AGENT_NAME.test(name)).toBe(true)
+    for (const name of ["A", "a_b", "a.b", ""]) expect(AGENT_NAME.test(name)).toBe(false)
+  })
+
+  it("refuses an unknown flag, a missing value and a positional", () => {
+    // a well-formed but unregistered name ("bogus") now parses — the startup check refuses it
+    for (const argv of [["--verbose"], ["-x"], ["--as"], ["--project"], ["positional"], ["--as", "codex", "--extra", "y"]]) {
       const parsed = parseMcpArgs(argv)
       expect(parsed.ok).toBe(false)
       if (!parsed.ok) expect(parsed.error).not.toBe("")
@@ -345,6 +380,11 @@ describe("mida-mcp tools against a fake daemon", () => {
 
   it("mida_status prints health plus one line per agent's verdict — no hex, no home path", async () => {
     const dir = home()
+    // the probe list is the agents registered in this home — the same set `listAgentNames` computes
+    for (const name of ["claude-code", "codex", "assistant"]) {
+      mkdirSync(join(dir.root, "agents", name), { recursive: true })
+      writeFileSync(join(dir.root, "agents", name, "identity.json"), "{}")
+    }
     const secret = `0x${"ab".repeat(32)}` // a 64-hex the daemon's answer carries — it must never surface
     const fake = await fakeDaemon(dir, {
       "/health": HEALTH,
@@ -371,9 +411,9 @@ describe("mida-mcp tools against a fake daemon", () => {
       } finally {
         await close()
       }
-      // three /handoff probes — one per provisioned agent, none carrying a session
+      // three /handoff probes — one per registered agent, sorted, none carrying a session
       const probes = fake.requests.filter((r) => r.path === "/handoff")
-      expect(probes.map((r) => r.body?.agent)).toEqual(["claude-code", "codex", "assistant"])
+      expect(probes.map((r) => r.body?.agent)).toEqual(["assistant", "claude-code", "codex"])
       expect(probes.every((r) => r.body?.sessionId === undefined)).toBe(true)
     } finally {
       await fake.stop()

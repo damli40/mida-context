@@ -19,9 +19,12 @@ import { writeSeen } from "./seen.js"
  * must stay out of this module's import graph. mcp.test.ts walks that graph and proves it.
  */
 
-/** The agent names `mida init` provisions and `mida approve` accepts — a closed set. */
-export const MCP_AGENTS = ["claude-code", "codex", "assistant"] as const
-export type McpAgent = (typeof MCP_AGENTS)[number]
+/**
+ * An agent name `--as` may carry: the same characters the key store allows (`keys.ts` NAME), so
+ * a name that passes here can only ever address `agents/<name>/` — never a path. Whether that
+ * agent is registered in this home is the startup check's question, not the parser's.
+ */
+export const AGENT_NAME = /^[a-z0-9-]{1,64}$/
 
 /** The namespaces `mida_read` may name — the same set the daemon's `read --as <agent> <ns>` accepts. */
 export const READ_NAMESPACES = ["projects.current", "profile.skills", "preferences.communication"] as const
@@ -42,12 +45,14 @@ const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${text
 const toolText = (text: string) => ({ content: [{ type: "text" as const, text: capText(text) }] })
 const degraded = (reason: string) => toolText(degradedMessage(reason))
 
-export const MCP_USAGE = "usage: mida-mcp [--as claude-code|codex|assistant] [--project <dir>]"
+export const MCP_USAGE = "usage: mida-mcp [--as <agent>] [--project <dir>]   (agent defaults to assistant)"
 
 export interface McpArgs {
-  agent: McpAgent
-  /** Absolute path — the folder the client launched the server for; reported to the daemon as cwd. */
+  agent: string
+  /** Absolute path — the project folder; reported to the daemon as cwd. */
   project: string
+  /** False when the folder came from the launch cwd. */
+  projectGiven: boolean
 }
 
 /**
@@ -56,8 +61,8 @@ export interface McpArgs {
  * refusal is a plain line for stderr; the process's stdout carries JSON-RPC and stays clean.
  */
 export function parseMcpArgs(argv: string[]): { ok: true; args: McpArgs } | { ok: false; error: string } {
-  let agent = "assistant"
-  let project = process.cwd()
+  let agent: string | undefined
+  let project: string | undefined
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i]
     if (flag === "--as" || flag === "--project") {
@@ -65,17 +70,21 @@ export function parseMcpArgs(argv: string[]): { ok: true; args: McpArgs } | { ok
       if (value === undefined || value === "" || value.startsWith("--")) {
         return { ok: false, error: `${flag} needs a value` }
       }
-      if (flag === "--as") agent = value
-      else project = value
+      if (flag === "--as") {
+        if (agent !== undefined) return { ok: false, error: "--as given twice" }
+        agent = value
+      } else {
+        if (project !== undefined) return { ok: false, error: "--project given twice" }
+        project = value
+      }
       i += 1
     } else {
       return { ok: false, error: `unknown flag: ${flag}` }
     }
   }
-  if (!(MCP_AGENTS as readonly string[]).includes(agent)) {
-    return { ok: false, error: `unknown agent "${agent}" — --as takes ${MCP_AGENTS.join(" | ")}` }
-  }
-  return { ok: true, args: { agent: agent as McpAgent, project: resolve(project) } }
+  const name = agent ?? "assistant"
+  if (!AGENT_NAME.test(name)) return { ok: false, error: `bad agent name "${name}" — lower-case letters, digits and "-" only` }
+  return { ok: true, args: { agent: name, project: resolve(project ?? process.cwd()), projectGiven: project !== undefined } }
 }
 
 /** The stable tool surface — names and input schemas are API; the report carries them verbatim. */
@@ -117,7 +126,7 @@ export const MCP_TOOLS = [
 
 export interface McpServerDeps {
   home: MidaHome
-  agent: McpAgent
+  agent: string
   project: string
   /** This server instance's session id — the whats-new seen set is keyed by it. */
   sessionId: string
@@ -244,10 +253,11 @@ async function toolRead(deps: McpServerDeps, args: Record<string, unknown> | und
 }
 
 /**
- * `mida_status` — /health, then one /handoff probe per provisioned agent so "approved for this
- * folder" means exactly what the real gate answers (project list and chain capability included).
- * The probes run in parallel; their texts are never used — only the verdict. The output carries
- * no ids and no path under the home except the socket directory's own name.
+ * `mida_status` — /health, then one /handoff probe per agent registered in this home (plus this
+ * server's own identity) so "approved for this folder" means exactly what the real gate answers
+ * (project list and chain capability included). The probes run in parallel; their texts are never
+ * used — only the verdict. The output carries no ids and no path under the home except the socket
+ * directory's own name.
  */
 async function toolStatus(deps: McpServerDeps) {
   if (!(await daemonAnswering(deps))) return degraded("daemon-down")
@@ -264,8 +274,14 @@ async function toolStatus(deps: McpServerDeps) {
       typeof body.queueDepth === "number" ? body.queueDepth : "unknown"
     } — socket in ${basename(dirname(socketPathFor(deps.home)))}`,
   ]
+  // the same set keys.ts:listAgentNames computes — reproduced, not imported: keys.ts must stay
+  // out of this module's graph — plus this server's own identity, whose verdict is printed even
+  // when it is not registered here
+  const agents = [
+    ...new Set([deps.agent, ...deps.home.list("agents").filter((name) => AGENT_NAME.test(name) && deps.home.has(`agents/${name}/identity.json`))]),
+  ].sort()
   const probes = await Promise.all(
-    MCP_AGENTS.map((name) => callDaemon(deps.home, "/handoff", { agent: name, cwd: deps.project }, { timeoutMs: STATUS_PROBE_TIMEOUT_MS })),
+    agents.map((name) => callDaemon(deps.home, "/handoff", { agent: name, cwd: deps.project }, { timeoutMs: STATUS_PROBE_TIMEOUT_MS })),
   )
   const reason = (i: number): string | undefined => {
     const b = probes[i]?.body as { kind?: unknown; reason?: unknown } | null
@@ -284,8 +300,8 @@ async function toolStatus(deps: McpServerDeps) {
   if (probes.every((p) => p.status !== 0) && folderLine !== undefined) {
     lines.push(folderLine)
   } else {
-    for (let i = 0; i < MCP_AGENTS.length; i += 1) {
-      const name = MCP_AGENTS[i]!
+    for (let i = 0; i < agents.length; i += 1) {
+      const name = agents[i]!
       const probe = probes[i]!
       const kind = (probe.body as { kind?: unknown } | null)?.kind
       if (probe.status === 0) lines.push(`${name}: no answer from the daemon`)
