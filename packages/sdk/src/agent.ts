@@ -383,7 +383,11 @@ export class MidaAgent {
     if (deployment.batchAnchor === undefined) {
       throw new MidaError("INVALID_WIRE", "this deployment has no BatchAnchor — use readWithStatus()")
     }
-    const { items, partial } = await this.#api.listBatchSaves({ owner: ownerAddress, namespaceId })
+    const { items, partial } = await this.#api.listBatchSaves({
+      owner: ownerAddress,
+      namespaceId,
+      capabilityId: capability.capabilityId,
+    })
     const epochKeyFor = this.#epochKeyResolver(ownerAddress, namespaceId, capability.capabilityId)
     const anchored: ContextObject[] = []
     const pending: (ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex })[] = []

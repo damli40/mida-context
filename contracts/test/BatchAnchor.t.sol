@@ -12,6 +12,7 @@ import {
 } from "../src/MidaTypes.sol";
 import {BatchAnchor} from "../src/BatchAnchor.sol";
 import {BatchMerkle} from "../src/BatchMerkle.sol";
+import {Revocations} from "../src/Revocations.sol";
 import {BatchFixtures} from "./utils/BatchFixtures.sol";
 
 /// @notice Plan Task 2: every accept/reject rule, duplicates, idempotence and the accepted-only root.
@@ -166,6 +167,8 @@ contract BatchAnchorTest is BatchFixtures {
 
     function test_rejectsStaleReadEpoch() public {
         BatchAnchor.SignedSave memory s = _rootSave(alice.owner, "goals.career", "cp-old-epoch", writer.signerKey);
+        // Rotating the epoch by revoking a DIFFERENT agent's READ capability leaves writer's authority
+        // live — the save is reported BAD_EPOCH, which only a still-authorized save can be.
         vm.prank(alice.owner);
         registry.revokeAndRotate(capOther, _epochKey(alice.owner, "goals.career", 2));
         bytes32 id = keccak256("batch-epoch");
@@ -191,8 +194,17 @@ contract BatchAnchorTest is BatchFixtures {
     function test_rejectsRevokedMidBatch() public {
         BatchAnchor.SignedSave memory s1 = _rootSave(alice.owner, "goals.career", "cp-r1", writer.signerKey);
         BatchAnchor.SignedSave memory s2 = _rootSave(alice.owner, "goals.career", "cp-r2", writer.signerKey);
+        // The real revoke path: writer also holds READ, so ending its authority rotates the read epoch
+        // in the same call. Each save then carries a dead capability AND the old epoch — authority is
+        // reported first, so the reason is NO_AUTHORITY, not BAD_EPOCH.
+        _grantExact(alice, writer, _one(_scope("goals.career", PERM_READ, 0)), 0);
+        Revocations.EpochRotation[] memory rotations = new Revocations.EpochRotation[](1);
+        rotations[0] = Revocations.EpochRotation({
+            namespaceId: career,
+            newEpochPublicKey: _epochKey(alice.owner, "goals.career", 2)
+        });
         vm.prank(alice.owner);
-        registry.revoke(capWriter);
+        registry.revokeAgentAndRotate(writer.agentId, rotations);
         bytes32 id = keccak256("batch-revoked");
         _expectRejected(id, 0, 5);
         _expectRejected(id, 1, 5);
@@ -310,9 +322,12 @@ contract BatchAnchorTest is BatchFixtures {
         assertEq(acceptedV, 0);
         assertEq(rootV, bytes32(0));
 
-        // Same lineage but claimed for another owner: the stored head commit binds alice.
+        // Same lineage but claimed for another owner: authority is checked first, so bob grants the
+        // writer the same rights it holds under alice — then the stored head commit, which binds
+        // alice, is what rejects the claim.
         TestOwner memory bob = _ownerWithKey("bob");
         _initEpoch(bob, "goals.career");
+        _grantExact(bob, writer, _one(_scope("goals.career", PERM_CREATE | PERM_SUPERSEDE_OWN, PROV_ALLOW_INFERENCE)), 0);
         BatchAnchor.SignedSave memory wrongOwner = _unsignedRoot(bob.owner, _ns("goals.career"), "cb");
         wrongOwner.parentId = rId;
         wrongOwner.lineageId = rId;

@@ -70,6 +70,7 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
   const posted: BatchedSaveWire[] = []
   let batchItems: BatchedReadItem[] = []
   let batchPartial = false
+  let lastListBatchInput: { owner: Address; namespaceId: Hex; capabilityId?: Hex } | undefined
 
   const clientFor = (account: LocalAccount, target: ApiApp) =>
     new ContextApiClient({
@@ -298,7 +299,10 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
         },
       }
     }
-    agentApi.listBatchSaves = async () => ({ items: batchItems, partial: batchPartial })
+    agentApi.listBatchSaves = async (input) => {
+      lastListBatchInput = input
+      return { items: batchItems, partial: batchPartial }
+    }
     sdk = new MidaAgent({
       agentId: agent.agentId,
       callbackOrigin: agent.callbackOrigin,
@@ -565,28 +569,38 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
     expect(result.skipped).toEqual([{ contextId: badSave.contextId, reason: "ciphertext" }])
   })
 
+  it("readBatchedWithStatus names its capability when listing — the store denies a bare agent without one", async () => {
+    await sdk.readBatchedWithStatus(vault.owner, "goals.career")
+    expect(lastListBatchInput).toEqual({
+      owner: vault.owner.toLowerCase(),
+      namespaceId: CAREER,
+      capabilityId: sdk.grants[0]!.capabilities[0]!.capabilityId,
+    })
+  })
+
   it("the five client methods hit the routes Task 5 will serve", async () => {
-    const calls: { method: string; pathname: string; body?: string }[] = []
+    const calls: { method: string; pathname: string; capabilityId?: string; body?: string }[] = []
     const client = new ContextApiClient({
       baseUrl: "http://mida.test",
       account: agent.signer,
       chainId: deployment.chainId,
       capabilityRegistry: deployment.capabilityRegistry,
       fetch: async (url, init) => {
-        const pathname = new URL(url).pathname
+        const parsed = new URL(url)
         calls.push({
           method: init?.method ?? "GET",
-          pathname,
+          pathname: parsed.pathname,
+          capabilityId: parsed.searchParams.get("capabilityId") ?? undefined,
           body: init?.body === undefined ? undefined : new TextDecoder().decode(init.body as Uint8Array),
         })
         const body =
-          pathname === "/batch/status"
+          parsed.pathname === "/batch/status"
             ? { enabled: true, batchAnchor: batchAnchor() }
-            : pathname === "/batch/flush"
+            : parsed.pathname === "/batch/flush"
               ? { flushed: false, reason: "empty" }
-              : pathname === "/batch/saves" && init?.method === "POST"
+              : parsed.pathname === "/batch/saves" && init?.method === "POST"
                 ? { state: "QUEUED", receipt: { contextId: zeroHash, receivedAt: 1, sequence: "1", signature: `0x${"00".repeat(65)}` } }
-                : pathname === "/batch/saves"
+                : parsed.pathname === "/batch/saves"
                   ? { items: [] }
                   : { state: "REJECTED", reason: "NO_AUTHORITY" }
         return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } })
@@ -596,10 +610,10 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
     const save = await makeSave(agent)
     const postedSave = await client.postBatchSave(save.wire)
     expect(postedSave.state).toBe("QUEUED")
-    const saved = await client.getBatchSave(honestSave.contextId)
+    const saved = await client.getBatchSave(honestSave.contextId, `0x${"dd".repeat(32)}` as Hex)
     expect(saved.state).toBe("REJECTED")
     expect(saved.reason).toBe("NO_AUTHORITY")
-    expect(await client.listBatchSaves({ owner: vault.owner, namespaceId: CAREER })).toEqual({ items: [], partial: false })
+    expect(await client.listBatchSaves({ owner: vault.owner, namespaceId: CAREER, capabilityId: `0x${"cc".repeat(32)}` as Hex })).toEqual({ items: [], partial: false })
     expect(await client.flushBatch()).toEqual({ flushed: false, reason: "empty" })
     expect(calls.map((call) => `${call.method} ${call.pathname}`)).toEqual([
       "GET /batch/status",
@@ -608,6 +622,9 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
       "GET /batch/saves",
       "POST /batch/flush",
     ])
+    // An agent caller names its capability in the query — both batch reads authorize like GET /objects.
+    expect(calls[2]!.capabilityId).toBe(`0x${"dd".repeat(32)}`)
+    expect(calls[3]!.capabilityId).toBe(`0x${"cc".repeat(32)}`)
     // The wire body keeps the uint64 fields as decimal strings — what the store validates against.
     const sentBody = JSON.parse(calls[1]!.body!) as BatchedSaveWire
     expect(sentBody.message.readEpoch).toBe(save.wire.message.readEpoch)

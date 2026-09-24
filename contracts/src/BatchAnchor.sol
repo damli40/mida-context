@@ -12,7 +12,7 @@ import {BatchMerkle} from "./BatchMerkle.sol";
 
 /// @notice Checked, Merkle-batched anchoring for automatic checkpoint saves (spec 2026-09-24 + Amendment A).
 ///         Every save is signed by its agent and checked like ContextRegistry checks a write: signer, shape,
-///         area, read epoch, live authority, lineage. Accepted saves share one root the contract computes
+///         area, live authority, read epoch, lineage. Accepted saves share one root the contract computes
 ///         itself, so a valid proof means "accepted". Reads CapabilityRegistry; never writes it.
 contract BatchAnchor {
     struct SignedSave {
@@ -129,11 +129,6 @@ contract BatchAnchor {
         ) return (BAD_SHAPE, 0);
         if (!CAPABILITY_REGISTRY.isRegisteredNamespace(s.namespaceId)) return (BAD_AREA, 0);
 
-        uint64 required = CAPABILITY_REGISTRY.requiredReadEpoch(s.owner, s.namespaceId);
-        if (s.readEpoch != required || !CAPABILITY_REGISTRY.isWriteEpochValid(s.owner, s.namespaceId, required)) {
-            return (BAD_EPOCH, 0);
-        }
-
         bytes32 contextId = keccak256(
             abi.encode(
                 string("MIDA_BATCH_CONTEXT_V1"), block.chainid, address(this), s.owner, agentId, s.namespaceId, s.parentId,
@@ -141,9 +136,11 @@ contract BatchAnchor {
             )
         );
 
+        // Authority runs before the epoch check: a revoked save signed under a rotated epoch must report
+        // NO_AUTHORITY, not BAD_EPOCH — "stale epoch" means the capability is still live. The OWN-vs-ANY
+        // choice reads the signed rootAuthor, so no lineage lookup is needed to pick it.
         bytes32 lineageId;
         bytes32 rootAuthor;
-        uint32 version;
         if (s.parentId == bytes32(0)) {
             if (s.lineageId != bytes32(0) || s.parentVersion != 0 || s.rootAuthor != bytes32(0)) return (BAD_SHAPE, 0);
             if (!CAPABILITY_REGISTRY.hasAuthority(s.owner, agentId, s.namespaceId, PERM_CREATE, PROV_ALLOW_INFERENCE)) {
@@ -151,14 +148,10 @@ contract BatchAnchor {
             }
             lineageId = contextId;
             rootAuthor = agentId;
-            version = 1;
-            if (_headCommit[lineageId] != bytes32(0)) return (ALREADY_ANCHORED, 0);
         } else {
             lineageId = s.lineageId;
             rootAuthor = s.rootAuthor;
             if (s.parentVersion == 0 || s.parentVersion == type(uint32).max) return (BAD_SHAPE, 0);
-            bytes32 expected = keccak256(abi.encode(s.parentId, s.owner, s.namespaceId, rootAuthor, s.parentVersion));
-            if (_headCommit[lineageId] != expected) return (STALE_PARENT, 0);
             bool allowed = rootAuthor == agentId
                 && CAPABILITY_REGISTRY.hasAuthority(s.owner, agentId, s.namespaceId, PERM_SUPERSEDE_OWN, PROV_ALLOW_INFERENCE);
             if (!allowed) {
@@ -166,6 +159,20 @@ contract BatchAnchor {
                     CAPABILITY_REGISTRY.hasAuthority(s.owner, agentId, s.namespaceId, PERM_SUPERSEDE_ANY, PROV_ALLOW_INFERENCE);
             }
             if (!allowed) return (NO_AUTHORITY, 0);
+        }
+
+        uint64 required = CAPABILITY_REGISTRY.requiredReadEpoch(s.owner, s.namespaceId);
+        if (s.readEpoch != required || !CAPABILITY_REGISTRY.isWriteEpochValid(s.owner, s.namespaceId, required)) {
+            return (BAD_EPOCH, 0);
+        }
+
+        uint32 version;
+        if (s.parentId == bytes32(0)) {
+            version = 1;
+            if (_headCommit[lineageId] != bytes32(0)) return (ALREADY_ANCHORED, 0);
+        } else {
+            bytes32 expected = keccak256(abi.encode(s.parentId, s.owner, s.namespaceId, rootAuthor, s.parentVersion));
+            if (_headCommit[lineageId] != expected) return (STALE_PARENT, 0);
             version = s.parentVersion + 1;
         }
 

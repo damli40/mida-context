@@ -156,16 +156,17 @@ export class ContextApiClient implements ContextApiRoutes {
     return this.request<{ state: "QUEUED"; receipt: BatchReceipt }>("POST", "/batch/saves", { body })
   }
 
-  getBatchSave(contextId: Hex) {
+  getBatchSave(contextId: Hex, capabilityId?: Hex) {
     return this.request<{ state: BatchedItemState | "REJECTED"; reason: string | null; item?: BatchedReadItem }>(
       "GET",
       `/batch/saves/${contextId}`,
+      capabilityId === undefined ? {} : { query: { capabilityId } },
     )
   }
 
-  async listBatchSaves(input: { owner: Address; namespaceId: Hex }): Promise<{ items: BatchedReadItem[]; partial: boolean }> {
+  async listBatchSaves(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }): Promise<{ items: BatchedReadItem[]; partial: boolean }> {
     const { body, response } = await this.#requestRaw<{ items: BatchedReadItem[] }>("GET", "/batch/saves", {
-      query: { owner: input.owner.toLowerCase(), namespaceId: input.namespaceId },
+      query: { owner: input.owner.toLowerCase(), namespaceId: input.namespaceId, ...(input.capabilityId === undefined ? {} : { capabilityId: input.capabilityId }) },
     })
     return { items: body.items, partial: response.headers.get("x-mida-partial") === "true" }
   }
@@ -248,7 +249,7 @@ export interface ContextApiRoutes {
   reissueRevocationNonce(intentId: Hex): Promise<{ intentId: Hex; state: string; cancellationNonce: string }>
   batchStatus(): Promise<{ enabled: boolean; batchAnchor: Address }>
   postBatchSave(body: BatchedSaveWire): Promise<{ state: "QUEUED"; receipt: BatchReceipt }>
-  getBatchSave(contextId: Hex): Promise<{ state: BatchedItemState | "REJECTED"; reason: string | null; item?: BatchedReadItem }>
-  listBatchSaves(input: { owner: Address; namespaceId: Hex }): Promise<{ items: BatchedReadItem[]; partial: boolean }>
+  getBatchSave(contextId: Hex, capabilityId?: Hex): Promise<{ state: BatchedItemState | "REJECTED"; reason: string | null; item?: BatchedReadItem }>
+  listBatchSaves(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }): Promise<{ items: BatchedReadItem[]; partial: boolean }>
   flushBatch(): Promise<{ flushed: boolean; reason?: "empty" | "rate-limited" }>
 }
