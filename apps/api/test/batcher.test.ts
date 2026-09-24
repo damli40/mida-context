@@ -277,6 +277,13 @@ class FakeChain implements BatcherChain {
   /** Throw after recording: the send landed but its answer was lost. */
   afterRecord: (() => void) | null = null
   failLogs = false
+  /**
+   * A lagging log index: batchOf sees the landed batch but every event read answers empty/null —
+   * the state a node can sit in right after the receipt. Missing answers, not wrong ones.
+   */
+  indexLag = false
+  /** Drop the last N anchored logs — a log index that handed back a partial set for the batch. */
+  anchoredDrop = 0
   rootOverride: Hex | null = null
   tamperField: "lineageId" | null = null
 
@@ -324,18 +331,23 @@ class FakeChain implements BatcherChain {
 
   async anchoredLogs(batchId: Hex): Promise<AnchoredLog[]> {
     if (this.failLogs) throw new Error("log read failed")
+    if (this.indexLag) return []
     const batch = this.batches.get(batchId.toLowerCase())
     if (batch === undefined) return []
-    return batch.anchored.map((log) => (this.tamperField === "lineageId" ? { ...log, lineageId: flipNibble(log.lineageId) } : { ...log }))
+    return batch.anchored
+      .slice(0, Math.max(0, batch.anchored.length - this.anchoredDrop))
+      .map((log) => (this.tamperField === "lineageId" ? { ...log, lineageId: flipNibble(log.lineageId) } : { ...log }))
   }
 
   async rejectedLogs(batchId: Hex): Promise<RejectedLog[]> {
     if (this.failLogs) throw new Error("log read failed")
+    if (this.indexLag) return []
     return this.batches.get(batchId.toLowerCase())?.rejected.map((log) => ({ ...log })) ?? []
   }
 
   async batchAnchored(batchId: Hex): Promise<{ submitter: Address; acceptedCount: number; rejectedCount: number } | null> {
     if (this.failLogs) throw new Error("log read failed")
+    if (this.indexLag) return null
     const batch = this.batches.get(batchId.toLowerCase())
     if (batch === undefined) return null
     return { submitter: batch.submitter, acceptedCount: batch.acceptedCount, rejectedCount: batch.rejected.length }
@@ -847,6 +859,41 @@ describe("the batcher", () => {
     for (const { meta } of [first, second]) {
       expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId: ours.toLowerCase() })
     }
+  })
+
+  it("a landed batch whose event the log index has not caught up to is unproven, not foreign — resolve throws, keeps rows SUBMITTED and the journal, and a later resolve anchors", async () => {
+    const rig = makeRig()
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    // The lag window the bug lived in: batchOf already answers for the batch while the index
+    // still returns nothing for its events. The old rule read that as "not ours" and requeued —
+    // paying for a second send of a batch that had already landed.
+    rig.chain.indexLag = true
+
+    await expect(rig.batcher.run()).rejects.toThrowError(/PARTIAL_READ|cannot be proven/)
+    expect((await rig.store.get(meta.contextId))!.state).toBe("SUBMITTED")
+    expect(await rig.journal.list()).toHaveLength(1)
+    expect(rig.events.some((entry) => entry["event"] === "batch.not-ours")).toBe(false)
+    expect(rig.events.some((entry) => entry["event"] === "batch.unproven")).toBe(true)
+
+    // When the index catches up, the journaled batch resolves the row on the very next recover().
+    rig.chain.indexLag = false
+    const batchId = rig.chain.submissions[0]!.batchId
+    await rig.batcher.recover()
+    expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId: batchId.toLowerCase() })
+    expect(await rig.journal.list()).toEqual([])
+  })
+
+  it("an anchored-log set shorter than the batch's acceptedCount throws — a hole in the read is not proof the batch is foreign", async () => {
+    const rig = makeRig()
+    const saves = [makeSave(), makeSave()]
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+    rig.chain.anchoredDrop = 1 // the index hands back one of the batch's two SaveAnchored logs
+
+    await expect(rig.batcher.run()).rejects.toThrowError(BatchRootMismatchError)
+    for (const { meta } of saves) expect((await rig.store.get(meta.contextId))!.state).toBe("SUBMITTED")
+    expect(await rig.journal.list()).toHaveLength(1)
+    expect(rig.events.some((entry) => entry["event"] === "batch.not-ours")).toBe(false)
   })
 
   it("a partial batch anchors accepted rows with verifying proofs and names the rejected rows' reasons", async () => {

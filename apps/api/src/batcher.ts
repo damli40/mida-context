@@ -484,21 +484,23 @@ export class Batcher {
     const batch = await this.#chain.batchOf(batchId)
     if (batch.blockNumber === 0n) throw new MidaError("NOT_FOUND", `batch ${batchId} has not landed on chain`)
     // Before any row moves the batch must prove it is THIS batcher's: submitBatch has no caller
-    // check, so a batchId found on chain can be a foreign batch pre-claiming the id. Three facts
-    // have to line up — the BatchAnchored event names our submitter, every anchored contextId is
-    // one of the journaled rows, and the event's accepted+rejected count equals the row count.
+    // check, so a batchId found on chain can be a foreign batch pre-claiming the id. "Not ours"
+    // is a claim that needs positive evidence — one of three facts: the BatchAnchored event names
+    // a different submitter, an anchored contextId is not one of the journaled rows, or the
+    // event's accepted+rejected count is not the row count. A MISSING answer is never evidence:
+    // right after the receipt, batchOf can see the batch while the RPC's log index still lags,
+    // and calling that lag "foreign" would re-send our own landed batch — gas paid twice, and a
+    // parented save comes back STALE_PARENT with nothing to heal it.
     const order = this.#submitted.get(batchId.toLowerCase()) ?? (await this.#journal?.contextIds(batchId)) ?? null
     const anchored = (await this.#chain.anchoredLogs(batchId)).sort((a, b) => a.position - b.position)
     const rejected = await this.#chain.rejectedLogs(batchId)
     const event = await this.#chain.batchAnchored(batchId)
     const oursIds = new Set((order ?? []).map((contextId) => contextId.toLowerCase()))
-    const ours =
-      order !== null &&
-      event !== null &&
-      event.submitter.toLowerCase() === this.#submitter &&
-      anchored.every((log) => oursIds.has(log.contextId.toLowerCase())) &&
-      event.acceptedCount + event.rejectedCount === order.length
-    if (!ours) {
+    const foreign =
+      (event !== null && event.submitter.toLowerCase() !== this.#submitter) ||
+      (order !== null && anchored.some((log) => !oursIds.has(log.contextId.toLowerCase()))) ||
+      (event !== null && order !== null && event.acceptedCount + event.rejectedCount !== order.length)
+    if (foreign) {
       // Not ours: no row may take this batch's outcomes. The rows come back to QUEUED (a fresh id
       // next run), the journal entry is cleared and the one log line says exactly what happened.
       const requeued = await this.#store.requeue(batchId)
@@ -506,6 +508,20 @@ export class Batcher {
       await this.#journal?.clear(batchId)
       this.#log?.({ event: "batch.not-ours", batchId, requeued, message: `batch ${batchId} is not ours — requeued` })
       return { accepted: 0, rejected: 0 }
+    }
+    // Missing pieces — the BatchAnchored event the index has not caught up to, or a journaled
+    // order that is gone — prove nothing either way. Throw instead of resolving or requeueing:
+    // the rows stay SUBMITTED and the journal stays, so a later resolve()/recover() retries —
+    // the same fail-safe the count check below has always had.
+    if (event === null || order === null) {
+      this.#log?.({
+        event: "batch.unproven",
+        batchId,
+        eventSeen: event !== null,
+        orderSeen: order !== null,
+        message: `batch ${batchId} landed but cannot be proven ours or foreign — resolve retries when the log index catches up`,
+      })
+      throw new MidaError("PARTIAL_READ", `batch ${batchId} cannot be proven ours — the batch's events or journaled order are not all visible yet`)
     }
     // The log set must be exactly the batch the contract recorded — a hole in it rebuilds the wrong
     // root, and so does a missing tail the count comparison would otherwise wave through.
