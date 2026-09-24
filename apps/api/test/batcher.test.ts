@@ -1,0 +1,673 @@
+// BatchAnchor Task 6: the batcher under a manual timer, an in-memory BatchStore and a scripted fake
+// chain. What is proven here: the wait timer is a promise that never moves, the cap and flush run
+// immediately, minGapMs is a hard floor between submissions, and every crash point the journal
+// covers — between journal-write and submit, between submit and resolve — ends with correct row
+// states after recover(). The fake chain mirrors the contract: it computes real leaf hashes and a
+// real Merkle root over accepted saves, rejects like _checkAndApply (including ALREADY_ANCHORED for
+// a contextId it has anchored before), and stores bytes32(0) as the root of an all-rejected batch.
+
+import { describe, expect, it } from "vitest"
+import { zeroHash } from "viem"
+import { randomBytes } from "@noble/hashes/utils.js"
+import { hexOf } from "@mida/crypto"
+import {
+  BATCH_REJECT,
+  batchContextId,
+  batchLeafHash,
+  batchSaveStructHash,
+  merkleRoot,
+  namespaceId,
+  verifyMerkleProof,
+} from "@mida/protocol"
+import type { Address, BatchSaveMessage, Hex } from "@mida/protocol"
+import { BatchRootMismatchError, Batcher, MemoryBatchJournal } from "../src/batcher.js"
+import type { AnchoredLog, BatchJournal, BatcherChain, BatcherTimer, RejectedLog } from "../src/batcher.js"
+import type { BatchedSaveWire } from "../src/client.js"
+import type { BatchSaveRow, BatchStore } from "../src/batch-store.js"
+
+const CHAIN_ID = 31337n
+const BATCH_ANCHOR = "0x1111111111111111111111111111111111111aa5" as Address
+const SUBMITTER = "0x9999999999999999999999999999999999999999" as Address
+const OWNER = "0x2222222222222222222222222222222222222222" as Address
+const SIGNER = "0x3333333333333333333333333333333333333333" as Address
+const AGENT_ID = hexOf(randomBytes(32))
+const NAMESPACE = namespaceId("goals.career")
+
+interface SaveMeta {
+  contextId: Hex
+  agentId: Hex
+  lineageId: Hex
+  version: number
+  structHash: Hex
+}
+
+/** objectNonce → what the contract would compute for this save. The fake chain resolves through it. */
+const metas = new Map<string, SaveMeta>()
+
+function makeSave(overrides: Partial<BatchSaveMessage> = {}): { wire: BatchedSaveWire; meta: SaveMeta } {
+  const message: BatchSaveMessage = {
+    owner: OWNER,
+    namespaceId: NAMESPACE,
+    objectNonce: hexOf(randomBytes(32)),
+    lineageId: zeroHash,
+    parentId: zeroHash,
+    parentVersion: 0,
+    rootAuthor: zeroHash,
+    manifestHash: hexOf(randomBytes(32)),
+    ciphertextCommitment: hexOf(randomBytes(32)),
+    readEpoch: 1n,
+    expiresAt: 0n,
+    kind: 1,
+    provenanceSource: 1,
+    ...overrides,
+  }
+  const contextId = batchContextId({
+    chainId: CHAIN_ID,
+    batchAnchor: BATCH_ANCHOR,
+    owner: message.owner,
+    agentId: AGENT_ID,
+    namespaceId: message.namespaceId,
+    parentId: message.parentId,
+    objectNonce: message.objectNonce,
+  })
+  const meta: SaveMeta = {
+    contextId,
+    agentId: AGENT_ID,
+    // What BatchAnchor._checkAndApply derives: a new lineage roots itself at v1; a replacement
+    // carries the signed lineageId at parentVersion+1.
+    lineageId: message.parentId === zeroHash ? contextId : message.lineageId,
+    version: message.parentId === zeroHash ? 1 : message.parentVersion + 1,
+    structHash: batchSaveStructHash(message),
+  }
+  metas.set(message.objectNonce.toLowerCase(), meta)
+  return {
+    wire: {
+      message: { ...message, readEpoch: message.readEpoch.toString(10), expiresAt: message.expiresAt.toString(10) },
+      signature: `0x${"ab".repeat(65)}` as Hex,
+      manifest: { contextId } as unknown as BatchedSaveWire["manifest"],
+      ciphertext: "0xbeef" as Hex,
+    },
+    meta,
+  }
+}
+
+const leafOf = (meta: SaveMeta): Hex =>
+  batchLeafHash({ contextId: meta.contextId, agentId: meta.agentId, lineageId: meta.lineageId, version: meta.version, structHash: meta.structHash })
+
+function queueRow(wire: BatchedSaveWire, contextId: Hex, receivedAt: number): BatchSaveRow {
+  return {
+    contextId,
+    owner: OWNER,
+    namespaceId: NAMESPACE,
+    signer: SIGNER,
+    save: wire,
+    state: "QUEUED",
+    reason: null,
+    batchId: null,
+    position: null,
+    lineageId: null,
+    version: null,
+    proof: null,
+    receivedAt,
+    anchoredAt: null,
+  }
+}
+
+const byAge = (a: BatchSaveRow, b: BatchSaveRow): number => a.receivedAt - b.receivedAt || a.contextId.localeCompare(b.contextId)
+
+/** The BatchStore the batcher tests run against — same semantics as FsBatchStore, in a Map. */
+class MemoryBatchStore implements BatchStore {
+  readonly rows = new Map<string, BatchSaveRow>()
+  sequence = 0n
+  readonly flushes = new Map<string, number>()
+
+  async insert(row: BatchSaveRow): Promise<"inserted" | "exists"> {
+    const key = row.contextId.toLowerCase()
+    if (this.rows.has(key)) return "exists"
+    this.rows.set(key, { ...row })
+    return "inserted"
+  }
+
+  async get(contextId: Hex): Promise<BatchSaveRow | null> {
+    const row = this.rows.get(contextId.toLowerCase())
+    return row === undefined ? null : { ...row }
+  }
+
+  async listForReader(owner: Address, namespaceId: Hex): Promise<BatchSaveRow[]> {
+    return [...this.rows.values()]
+      .filter((row) => row.state !== "REJECTED" && row.owner === owner.toLowerCase() && row.namespaceId === namespaceId.toLowerCase())
+      .sort(byAge)
+      .map((row) => ({ ...row }))
+  }
+
+  async takeQueued(limit: number, batchId: Hex): Promise<BatchSaveRow[]> {
+    const taken = [...this.rows.values()]
+      .filter((row) => row.state === "QUEUED")
+      .sort(byAge)
+      .slice(0, limit)
+    for (const row of taken) {
+      const stored = this.rows.get(row.contextId.toLowerCase())!
+      stored.state = "SUBMITTED"
+      stored.batchId = batchId.toLowerCase() as Hex
+    }
+    return taken.map((row) => ({ ...row, state: "SUBMITTED" as const, batchId: batchId.toLowerCase() as Hex }))
+  }
+
+  async markAnchored(
+    contextId: Hex,
+    fields: { batchId: Hex; position: number; lineageId: Hex; version: number; proof: Hex[]; anchoredAt: number },
+  ): Promise<void> {
+    const row = this.rows.get(contextId.toLowerCase())
+    if (row === undefined || row.state === "ANCHORED") return
+    row.state = "ANCHORED"
+    row.batchId = fields.batchId.toLowerCase() as Hex
+    row.position = fields.position
+    row.lineageId = fields.lineageId.toLowerCase() as Hex
+    row.version = fields.version
+    row.proof = fields.proof
+    row.anchoredAt = fields.anchoredAt
+  }
+
+  async markRejected(contextId: Hex, reason: string): Promise<void> {
+    const row = this.rows.get(contextId.toLowerCase())
+    if (row === undefined || row.state === "ANCHORED") return
+    row.state = "REJECTED"
+    row.reason = reason
+  }
+
+  async requeue(batchId: Hex): Promise<number> {
+    let count = 0
+    for (const row of this.rows.values()) {
+      if (row.state === "SUBMITTED" && row.batchId === batchId.toLowerCase()) {
+        row.state = "QUEUED"
+        row.batchId = null
+        count++
+      }
+    }
+    return count
+  }
+
+  async nextSequence(): Promise<bigint> {
+    return ++this.sequence
+  }
+
+  async countQueued(): Promise<number> {
+    return [...this.rows.values()].filter((row) => row.state === "QUEUED").length
+  }
+
+  async lastFlush(signer: Address): Promise<number | null> {
+    return this.flushes.get(signer.toLowerCase()) ?? null
+  }
+
+  async setLastFlush(signer: Address, atMs: number): Promise<void> {
+    this.flushes.set(signer.toLowerCase(), atMs)
+  }
+}
+
+/** The timer a test drives by hand: `pendingAt` is the armed instant, `fire()` is the alarm going off. */
+class ManualTimer implements BatcherTimer {
+  pendingAt: number | null = null
+  onFire: () => unknown = () => {}
+
+  set(atMs: number): void {
+    this.pendingAt = atMs
+  }
+
+  clear(): void {
+    this.pendingAt = null
+  }
+
+  pending(): boolean {
+    return this.pendingAt !== null
+  }
+
+  fire(): void {
+    this.pendingAt = null
+    this.onFire()
+  }
+}
+
+interface RecordedBatch {
+  anchored: AnchoredLog[]
+  rejected: RejectedLog[]
+  root: Hex
+  blockNumber: bigint
+  acceptedCount: number
+}
+
+const flipNibble = (hex: Hex): Hex => (hex.endsWith("0") ? `${hex.slice(0, -1)}1` : `${hex.slice(0, -1)}0`) as Hex
+
+/**
+ * The contract, faked faithfully: submitBatch computes real leaves over accepted saves and stores
+ * the real Merkle root; a contextId already anchored anywhere is ALREADY_ANCHORED, and BatchExists
+ * answers { exists: true } for a batchId it has seen. Knobs let a test lie on purpose (rootOverride,
+ * tamperField) or break the world (failSubmit, afterRecord, failLogs) at exact crash points.
+ */
+class FakeChain implements BatcherChain {
+  readonly batches = new Map<string, RecordedBatch>()
+  readonly submissions: { batchId: Hex; count: number }[] = []
+  readonly anchoredIn = new Map<string, Hex>()
+  attempts = 0
+  blockCounter = 100n
+  now: () => number = () => 0
+  readonly submitTimes: number[] = []
+
+  /** Per-save decision: return a BATCH_REJECT code to reject, null to accept. Runs after the auto-anchored check. */
+  rejectWith: (wire: BatchedSaveWire, index: number) => number | null = () => null
+  /** Throw before recording: the send never reached the contract. */
+  failSubmit: (() => Error) | null = null
+  /** Throw after recording: the send landed but its answer was lost. */
+  afterRecord: (() => void) | null = null
+  failLogs = false
+  rootOverride: Hex | null = null
+  tamperField: "lineageId" | null = null
+
+  async submit(batchId: Hex, saves: BatchedSaveWire[]): Promise<{ transactionHash: Hex } | { exists: true }> {
+    this.attempts++
+    this.submitTimes.push(this.now())
+    const key = batchId.toLowerCase() as Hex
+    if (this.batches.has(key)) return { exists: true }
+    if (this.failSubmit !== null) throw this.failSubmit()
+    this.submissions.push({ batchId, count: saves.length })
+    const anchored: AnchoredLog[] = []
+    const rejected: RejectedLog[] = []
+    saves.forEach((wire, index) => {
+      const meta = metas.get(wire.message.objectNonce.toLowerCase())
+      if (meta === undefined) throw new Error("test bug: the fake chain got an undescribed save")
+      const prior = this.anchoredIn.get(meta.contextId.toLowerCase())
+      const reason = prior !== undefined ? BATCH_REJECT.ALREADY_ANCHORED : this.rejectWith(wire, index)
+      if (reason !== null) {
+        rejected.push({ index, reason })
+        return
+      }
+      anchored.push({
+        contextId: meta.contextId,
+        agentId: meta.agentId,
+        position: anchored.length,
+        lineageId: meta.lineageId,
+        version: meta.version,
+        leafHash: leafOf(meta),
+      })
+      this.anchoredIn.set(meta.contextId.toLowerCase(), key)
+    })
+    this.batches.set(key, {
+      anchored,
+      rejected,
+      root: anchored.length === 0 ? zeroHash : merkleRoot(anchored.map((log) => log.leafHash)),
+      blockNumber: this.blockCounter++,
+      acceptedCount: anchored.length,
+    })
+    this.afterRecord?.()
+    return { transactionHash: `0x${"ee".repeat(32)}` as Hex }
+  }
+
+  async anchoredLogs(batchId: Hex): Promise<AnchoredLog[]> {
+    if (this.failLogs) throw new Error("log read failed")
+    const batch = this.batches.get(batchId.toLowerCase())
+    if (batch === undefined) return []
+    return batch.anchored.map((log) => (this.tamperField === "lineageId" ? { ...log, lineageId: flipNibble(log.lineageId) } : { ...log }))
+  }
+
+  async rejectedLogs(batchId: Hex): Promise<RejectedLog[]> {
+    if (this.failLogs) throw new Error("log read failed")
+    return this.batches.get(batchId.toLowerCase())?.rejected.map((log) => ({ ...log })) ?? []
+  }
+
+  async batchOf(batchId: Hex): Promise<{ root: Hex; blockNumber: bigint; acceptedCount: number }> {
+    const batch = this.batches.get(batchId.toLowerCase())
+    if (batch === undefined) return { root: zeroHash, blockNumber: 0n, acceptedCount: 0 }
+    return { root: this.rootOverride ?? batch.root, blockNumber: batch.blockNumber, acceptedCount: batch.acceptedCount }
+  }
+
+  async findAnchoring(contextId: Hex): Promise<Hex | null> {
+    return this.anchoredIn.get(contextId.toLowerCase()) ?? null
+  }
+}
+
+interface Rig {
+  store: MemoryBatchStore
+  chain: FakeChain
+  journal: BatchJournal
+  timer: ManualTimer
+  batcher: Batcher
+  setNow: (ms: number) => void
+  events: Record<string, unknown>[]
+  enqueue: (wire: BatchedSaveWire, contextId: Hex) => Promise<void>
+}
+
+function makeRig(
+  input: { cap?: number; waitMs?: number; minGapMs?: number; store?: MemoryBatchStore; chain?: FakeChain; journal?: BatchJournal } = {},
+): Rig {
+  const store = input.store ?? new MemoryBatchStore()
+  const chain = input.chain ?? new FakeChain()
+  const journal = input.journal ?? new MemoryBatchJournal()
+  const timer = new ManualTimer()
+  const events: Record<string, unknown>[] = []
+  let nowMs = 0
+  chain.now = () => nowMs
+  const batcher = new Batcher({
+    store,
+    chain,
+    timer,
+    now: () => nowMs,
+    cap: input.cap ?? 8,
+    waitMs: input.waitMs ?? 2_000,
+    minGapMs: input.minGapMs ?? 1_000,
+    submitter: SUBMITTER,
+    journal,
+    log: (record) => events.push(record),
+  })
+  timer.onFire = () => void batcher.run()
+  let received = 0
+  return {
+    store,
+    chain,
+    journal,
+    timer,
+    batcher,
+    events,
+    setNow: (ms) => {
+      nowMs = ms
+    },
+    enqueue: async (wire, contextId) => {
+      await store.insert(queueRow(wire, contextId, received++))
+    },
+  }
+}
+
+describe("the batcher", () => {
+  it("the first queued save arms the wait timer once; ten more saves inside the window never move it", async () => {
+    const rig = makeRig({ cap: 20, waitMs: 2_000 })
+    for (let i = 0; i < 11; i++) {
+      const { wire, meta } = makeSave()
+      await rig.enqueue(wire, meta.contextId)
+      await rig.batcher.notify()
+      expect(rig.timer.pendingAt).toBe(2_000)
+    }
+    expect(rig.chain.submissions).toHaveLength(0)
+
+    rig.setNow(2_000)
+    rig.timer.fire()
+    await rig.batcher.run() // the fired wakeup is async through the serializer; run() joins it
+    // ...and the actual submission is observable:
+    expect(rig.chain.submissions).toHaveLength(1)
+    expect(rig.chain.submissions[0]!.count).toBe(11)
+    expect(await rig.store.countQueued()).toBe(0)
+    for (const row of rig.store.rows.values()) expect(row.state).toBe("ANCHORED")
+  })
+
+  it("the cap runs the batch immediately — the third save of a cap-3 rig submits without the timer firing", async () => {
+    const rig = makeRig({ cap: 3 })
+    for (let i = 0; i < 3; i++) {
+      const { wire, meta } = makeSave()
+      await rig.enqueue(wire, meta.contextId)
+      await rig.batcher.notify()
+    }
+    expect(rig.chain.submissions).toHaveLength(1)
+    expect(rig.chain.submissions[0]!.count).toBe(3)
+    for (const row of rig.store.rows.values()) expect(row.state).toBe("ANCHORED")
+  })
+
+  it("flush() runs immediately with a single queued save and drops the pending wait", async () => {
+    const rig = makeRig()
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    await rig.batcher.notify()
+    expect(rig.timer.pendingAt).toBe(2_000)
+
+    await rig.batcher.flush()
+    expect(rig.chain.submissions).toHaveLength(1)
+    expect(rig.timer.pending()).toBe(false)
+    expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
+  })
+
+  it("minGapMs is a hard floor: a flush inside the gap schedules at lastSubmitAt + minGapMs instead of running", async () => {
+    const rig = makeRig({ minGapMs: 1_000, waitMs: 60_000 })
+    const first = makeSave()
+    await rig.enqueue(first.wire, first.meta.contextId)
+    await rig.batcher.flush()
+    expect(rig.chain.submitTimes).toEqual([0])
+
+    // A flush on an empty queue inside the gap does not even arm the timer.
+    rig.setNow(300)
+    await rig.batcher.flush()
+    expect(rig.timer.pending()).toBe(false)
+
+    const second = makeSave()
+    await rig.enqueue(second.wire, second.meta.contextId)
+    await rig.batcher.flush()
+    expect(rig.chain.submissions).toHaveLength(1)
+    expect(rig.timer.pendingAt).toBe(1_000)
+
+    rig.setNow(999)
+    rig.timer.fire()
+    await rig.batcher.run() // whatever ran re-arms inside the still-open gap
+    expect(rig.chain.submissions).toHaveLength(1)
+    expect(rig.timer.pendingAt).toBe(1_000)
+
+    rig.setNow(1_000)
+    rig.timer.fire()
+    await rig.batcher.run()
+    expect(rig.chain.submissions).toHaveLength(2)
+    expect(rig.chain.submitTimes[1]! - rig.chain.submitTimes[0]!).toBeGreaterThanOrEqual(1_000)
+    expect((await rig.store.get(second.meta.contextId))!.state).toBe("ANCHORED")
+  })
+
+  it("a transient submit failure requeues every row, clears the journal and re-arms the timer", async () => {
+    const rig = makeRig()
+    const chain = rig.chain
+    chain.failSubmit = () => new Error("rpc timeout")
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+
+    await rig.batcher.flush()
+    expect(chain.batches.size).toBe(0)
+    expect((await rig.store.get(meta.contextId))!.state).toBe("QUEUED")
+    expect((await rig.store.get(meta.contextId))!.batchId).toBeNull()
+    expect(await rig.journal.list()).toEqual([])
+    expect(rig.timer.pending()).toBe(true)
+
+    chain.failSubmit = null
+    await rig.batcher.flush()
+    expect(chain.submissions).toHaveLength(1)
+    expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
+  })
+
+  it("an ambiguous send — recorded, then its answer lost — heals through the next batch's ALREADY_ANCHORED", async () => {
+    const rig = makeRig()
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    rig.chain.afterRecord = () => {
+      throw new Error("the response never arrived")
+    }
+
+    await rig.batcher.flush()
+    // The batch landed (the fake recorded it) but the batcher saw only a failure: rows requeued.
+    expect(rig.chain.batches.size).toBe(1)
+    expect((await rig.store.get(meta.contextId))!.state).toBe("QUEUED")
+
+    rig.chain.afterRecord = null
+    await rig.batcher.flush()
+    // The resubmission is a NEW batchId; the contract rejects the save ALREADY_ANCHORED, and
+    // resolve() heals the row onto the earlier batch's proof — batchId stays the first batch's.
+    expect(rig.chain.submissions).toHaveLength(2)
+    const row = (await rig.store.get(meta.contextId))!
+    const firstBatchId = rig.chain.submissions[0]!.batchId.toLowerCase()
+    expect(row.state).toBe("ANCHORED")
+    expect(row.batchId).toBe(firstBatchId)
+    expect(row.position).toBe(0)
+    const earlier = await rig.chain.batchOf(firstBatchId as Hex)
+    expect(verifyMerkleProof(leafOf(meta), row.proof!, earlier.root)).toBe(true)
+    expect(await rig.journal.list()).toEqual([])
+  })
+
+  it("a resubmitted batchId resolves the existing batch instead of sending again", async () => {
+    const rig = makeRig()
+    const first = makeSave()
+    await rig.enqueue(first.wire, first.meta.contextId)
+    await rig.batcher.flush()
+    expect(rig.chain.batches.size).toBe(1)
+    const batchId = rig.chain.submissions[0]!.batchId
+
+    // Rewind the sequence so the next run recomputes the same batchId — the state a crash after
+    // nextSequence but before its meta write would leave behind. The clock moves past minGapMs so
+    // the second run is allowed to reach the contract at all.
+    rig.store.sequence = 0n
+    rig.setNow(1_000)
+    const second = makeSave()
+    await rig.enqueue(second.wire, second.meta.contextId)
+    await rig.batcher.flush()
+
+    expect(rig.chain.attempts).toBe(2)
+    expect(rig.chain.batches.size).toBe(1)
+    // The batch the contract already holds is the truth: the first row stays anchored, the new row
+    // — never in that batch — stays SUBMITTED rather than taking a false anchor.
+    expect((await rig.store.get(first.meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId })
+    expect((await rig.store.get(second.meta.contextId))!.state).toBe("SUBMITTED")
+    expect(await rig.journal.list()).toEqual([])
+  })
+
+  it("a partial batch anchors accepted rows with verifying proofs and names the rejected rows' reasons", async () => {
+    const rig = makeRig()
+    rig.chain.rejectWith = (_wire, index) => (index === 1 ? BATCH_REJECT.STALE_PARENT : index === 3 ? BATCH_REJECT.NO_AUTHORITY : null)
+    const saves = [makeSave(), makeSave(), makeSave(), makeSave()]
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+
+    const result = await rig.batcher.run()
+    expect(result).toMatchObject({ accepted: 2, rejected: 2 })
+    const batchId = result!.batchId
+    const batch = await rig.chain.batchOf(batchId)
+
+    const anchoredPositions = [0, 1]
+    for (const [i, acceptedIndex] of [0, 2].entries()) {
+      const row = (await rig.store.get(saves[acceptedIndex]!.meta.contextId))!
+      expect(row).toMatchObject({ state: "ANCHORED", batchId, position: anchoredPositions[i], lineageId: saves[acceptedIndex]!.meta.lineageId, version: 1 })
+      expect(verifyMerkleProof(leafOf(saves[acceptedIndex]!.meta), row.proof!, batch.root)).toBe(true)
+    }
+    expect((await rig.store.get(saves[1]!.meta.contextId))!).toMatchObject({ state: "REJECTED", reason: "STALE_PARENT" })
+    expect((await rig.store.get(saves[3]!.meta.contextId))!).toMatchObject({ state: "REJECTED", reason: "NO_AUTHORITY" })
+  })
+
+  it("a batch where every save is rejected still resolves — the empty leaf set's root is zero", async () => {
+    const rig = makeRig()
+    rig.chain.rejectWith = () => BATCH_REJECT.BAD_EPOCH
+    const saves = [makeSave(), makeSave()]
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+
+    const result = await rig.batcher.run()
+    expect(result).toMatchObject({ accepted: 0, rejected: 2 })
+    expect((await rig.chain.batchOf(result!.batchId)).root).toBe(zeroHash)
+    for (const { meta } of saves) {
+      expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "REJECTED", reason: "BAD_EPOCH" })
+    }
+    expect(await rig.journal.list()).toEqual([])
+  })
+
+  it("logs that do not rebuild to the on-chain root are ROOT_MISMATCH — rows stay SUBMITTED and recoverable", async () => {
+    const rig = makeRig()
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    rig.chain.rootOverride = `0x${"ff".repeat(32)}` as Hex
+
+    await expect(rig.batcher.run()).rejects.toThrowError(BatchRootMismatchError)
+    expect((await rig.store.get(meta.contextId))!.state).toBe("SUBMITTED")
+    expect(await rig.journal.list()).toHaveLength(1)
+    expect(rig.events.some((event) => event["event"] === "batch.root-mismatch")).toBe(true)
+
+    // Once the chain answers honestly again, the journaled batch resolves on the next recover().
+    rig.chain.rootOverride = null
+    const recovered = makeRig({ store: rig.store, chain: rig.chain, journal: rig.journal })
+    await recovered.batcher.recover()
+    expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
+    expect(await rig.journal.list()).toEqual([])
+  })
+
+  it("a logged leaf that contradicts the stored save is a root mismatch, not an anchor", async () => {
+    const rig = makeRig()
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    // The root still rebuilds (leafHash bytes are intact) but the leaf the row recomputes —
+    // with the log's tampered lineageId — does not match it.
+    rig.chain.tamperField = "lineageId"
+
+    await expect(rig.batcher.run()).rejects.toThrowError(BatchRootMismatchError)
+    expect((await rig.store.get(meta.contextId))!.state).toBe("SUBMITTED")
+    expect(rig.events.some((event) => event["event"] === "batch.leaf-mismatch")).toBe(true)
+  })
+
+  it("recover() hands a journaled batch the chain never recorded back to the queue", async () => {
+    const rig = makeRig()
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    // The crash state, made by hand: the row was taken under a batchId and journaled, the send
+    // never went out — the chain has no trace of it.
+    const batchId = `0x${"cc".repeat(32)}` as Hex
+    const taken = await rig.store.takeQueued(8, batchId)
+    await rig.journal.record(batchId, taken.map((row) => row.contextId))
+
+    await rig.batcher.recover()
+    expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "QUEUED", batchId: null })
+    expect(await rig.journal.list()).toEqual([])
+    // A queue that came back arms the wait timer again.
+    expect(rig.timer.pending()).toBe(true)
+  })
+
+  it("a restart between journal-write and submit ends with the rows queued and then anchored", async () => {
+    const store = new MemoryBatchStore()
+    const journal = new MemoryBatchJournal()
+    const chain = new FakeChain()
+    const { wire, meta } = makeSave()
+    await store.insert(queueRow(wire, meta.contextId, 0))
+
+    // The dead process took the row and journaled it; chain.submit never ran.
+    const deadId = `0x${"dd".repeat(32)}` as Hex
+    const taken = await store.takeQueued(8, deadId)
+    await journal.record(deadId, taken.map((row) => row.contextId))
+
+    const rig = makeRig({ store, journal, chain })
+    await rig.batcher.recover()
+    expect((await store.get(meta.contextId))!).toMatchObject({ state: "QUEUED", batchId: null })
+    expect(chain.batches.size).toBe(0)
+
+    await rig.batcher.flush()
+    expect(chain.batches.size).toBe(1)
+    expect((await store.get(meta.contextId))!.state).toBe("ANCHORED")
+  })
+
+  it("a restart between submit and resolve finishes the writeback — rejections map through the journal", async () => {
+    const store = new MemoryBatchStore()
+    const journal = new MemoryBatchJournal()
+    const chain = new FakeChain()
+    chain.rejectWith = (_wire, index) => (index === 1 ? BATCH_REJECT.STALE_PARENT : null)
+    const saves = [makeSave(), makeSave(), makeSave()]
+    for (let i = 0; i < saves.length; i++) await store.insert(queueRow(saves[i]!.wire, saves[i]!.meta.contextId, i))
+
+    // The dead process: submit landed, the resolve's log reads failed, the object died holding
+    // only the journal.
+    chain.failLogs = true
+    const dead = makeRig({ store, journal, chain })
+    await expect(dead.batcher.run()).rejects.toThrowError("log read failed")
+    for (const { meta } of saves) expect((await store.get(meta.contextId))!.state).toBe("SUBMITTED")
+    expect(await journal.list()).toHaveLength(1)
+
+    // The new process knows nothing in memory — the journal is the only map from index to row.
+    chain.failLogs = false
+    const alive = makeRig({ store, journal, chain })
+    await alive.batcher.recover()
+
+    const batchId = chain.submissions[0]!.batchId
+    const batch = await chain.batchOf(batchId)
+    for (const index of [0, 2]) {
+      const row = (await store.get(saves[index]!.meta.contextId))!
+      expect(row).toMatchObject({ state: "ANCHORED", batchId })
+      expect(verifyMerkleProof(leafOf(saves[index]!.meta), row.proof!, batch.root)).toBe(true)
+    }
+    expect((await store.get(saves[1]!.meta.contextId))!).toMatchObject({ state: "REJECTED", reason: "STALE_PARENT" })
+    expect(await journal.list()).toEqual([])
+  })
+
+  it("resolve() on a batchId the chain never saw refuses with NOT_FOUND", async () => {
+    const rig = makeRig()
+    await expect(rig.batcher.resolve(`0x${"00".repeat(32)}` as Hex)).rejects.toMatchObject({ code: "NOT_FOUND" })
+  })
+})

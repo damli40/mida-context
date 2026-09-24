@@ -97,13 +97,20 @@ interface ApiFixture {
   advance: (ms: number) => void
 }
 
-const makeApi = (input: { enabled?: boolean } = {}): ApiFixture => {
+const makeApi = (input: {
+  enabled?: boolean
+  hasAuthority?: (owner: Address, agentId: Hex, namespace: Hex, permission: number, policy: number) => boolean
+} = {}): ApiFixture => {
   const dataDir = mkdtempSync(join(tmpdir(), "mida-batch-routes-"))
   const store = new FsBatchStore(dataDir)
   let nowMs = T0
   const counts = { notified: 0, flushed: 0 }
+  const testReader =
+    input.hasAuthority === undefined
+      ? reader
+      : ({ ...reader, hasAuthority: async (owner: Address, agentId: Hex, namespace: Hex, permission: number, policy: number) => input.hasAuthority!(owner, agentId, namespace, permission, policy) } as unknown as RegistryReader)
   const { app, store: objectStore } = createContextApi({
-    reader,
+    reader: testReader,
     deployment,
     dataDir,
     clock: () => NOW_SECONDS,
@@ -309,6 +316,34 @@ describe("the /batch/* surface", () => {
     const broken = { ...malformed.wire, message: { ...malformed.wire.message, kind: "one" } }
     await expect(agent.client.postBatchSave(broken as unknown as BatchedSaveWire)).rejects.toThrowError()
     expect(agent.seen.at(-1)).toMatchObject({ status: 400, body: { error: { code: "INVALID_WIRE" } } })
+    expect(fixture.counts.notified).toBe(0)
+  })
+
+  it("an agent whose live grant is gone is refused CAPABILITY_DENIED before anything queues — the check mirrors the contract's choice", async () => {
+    // Task 6: anyone can register an agent, so admission re-checks the signer's authority the same
+    // way submitBatch will — a save that could only be rejected on chain never occupies the queue.
+    const calls: number[] = []
+    const fixture = makeApi({
+      hasAuthority: (_owner, _agentId, _namespace, permission) => {
+        calls.push(permission)
+        return false
+      },
+    })
+    const { client, seen } = watchingClient(fixture.app, agentAccount)
+
+    // A fresh lineage asks for CREATE exactly once — the contract's first check.
+    const fresh = await makeSave(agentAccount, AGENT_ID)
+    await expect(client.postBatchSave(fresh.wire)).rejects.toThrowError()
+    expect(seen.at(-1)).toMatchObject({ status: 403, body: { error: { code: "CAPABILITY_DENIED" } } })
+    expect(calls).toEqual([PERMISSION.CREATE])
+    expect(await fixture.store.get(fresh.contextId)).toBeNull()
+
+    // A replacement by an agent that did not author the root asks for SUPERSEDE_ANY.
+    calls.length = 0
+    const replacement = await makeSave(agentAccount, AGENT_ID, { lineageId: hexOf(randomBytes(32)), parentId: hexOf(randomBytes(32)), parentVersion: 1, rootAuthor: hexOf(randomBytes(32)) })
+    await expect(client.postBatchSave(replacement.wire)).rejects.toThrowError()
+    expect(calls).toEqual([PERMISSION.SUPERSEDE_ANY])
+    expect(await fixture.store.get(replacement.contextId)).toBeNull()
     expect(fixture.counts.notified).toBe(0)
   })
 

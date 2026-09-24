@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Address, Hex } from "@mida/protocol"
 import {
+  ANVIL_PRIVATE_KEYS,
   MONAD_TESTNET_CHAIN_ID,
   chainFor,
   createWriteContext,
@@ -13,7 +14,8 @@ import {
   startAnvil,
 } from "@mida/chain"
 import type { Deployment, LocalWriteContext } from "@mida/chain"
-import { RegistryReader, createContextApi } from "@mida/api"
+import { Batcher, FsBatchJournal, FsBatchStore, RegistryReader, createBatcherChain, createContextApi, createNodeTimer } from "@mida/api"
+import type { BatchingOptions } from "@mida/api"
 import { serve } from "@hono/node-server"
 import { createPublicClient, http } from "viem"
 import type { LocalAccount } from "viem"
@@ -31,11 +33,52 @@ export interface ScenarioEnvironment {
   stop(): Promise<void>
 }
 
-/** Runs the Context API as a real HTTP server on a free localhost port. */
-export async function startApiServer(input: { rpcUrl: string; deployment: Deployment }): Promise<{ baseUrl: string; close(): Promise<void> }> {
+/**
+ * Runs the Context API as a real HTTP server on a free localhost port. When the deployment carries
+ * a BatchAnchor the batch lane comes up with it — a real Batcher over the file store, its journal a
+ * JSON file beside `batch/`, `recover()` awaited before the port opens. `batching` tunes the wait
+ * window and caps for tests; `submitter` overrides the account that pays for submitBatch (defaults
+ * to the funded Anvil deployer key — local runs only).
+ */
+export async function startApiServer(input: {
+  rpcUrl: string
+  deployment: Deployment
+  batching?: { cap?: number; waitMs?: number; minGapMs?: number; submitter?: LocalAccount }
+}): Promise<{ baseUrl: string; close(): Promise<void> }> {
   const publicClient = createPublicClient({ chain: chainFor(input.deployment.chainId), transport: http(input.rpcUrl) })
   const reader = new RegistryReader({ publicClient, deployment: input.deployment })
-  const { app } = createContextApi({ reader, deployment: input.deployment, dataDir: mkdtempSync(join(tmpdir(), "mida-api-")) })
+  const dataDir = mkdtempSync(join(tmpdir(), "mida-api-"))
+  let batching: BatchingOptions | undefined
+  if (input.deployment.batchAnchor !== undefined) {
+    const store = new FsBatchStore(dataDir)
+    const submitter = input.batching?.submitter ?? privateKeyToAccount(ANVIL_PRIVATE_KEYS[0]!)
+    const batcher = new Batcher({
+      store,
+      chain: createBatcherChain({ rpcUrl: input.rpcUrl, deployment: input.deployment, account: submitter }),
+      timer: createNodeTimer(() => {
+        void batcher.run().catch((error) => console.log(JSON.stringify({ component: "batcher", event: "timer-run-failed", error: String(error) })))
+      }),
+      now: () => Date.now(),
+      cap: input.batching?.cap ?? 60,
+      waitMs: input.batching?.waitMs ?? 2_000,
+      minGapMs: input.batching?.minGapMs ?? 1_000,
+      submitter: submitter.address,
+      journal: new FsBatchJournal(join(dataDir, "batch-journal.json")),
+      log: (record) => console.log(JSON.stringify({ component: "batcher", ...record })),
+    })
+    await batcher.recover()
+    batching = {
+      enabled: true,
+      batchAnchor: input.deployment.batchAnchor,
+      store,
+      receiptAccount: privateKeyToAccount(ANVIL_PRIVATE_KEYS[1]!),
+      notify: () => {
+        void batcher.notify().catch((error) => console.log(JSON.stringify({ component: "batcher", event: "notify-failed", error: String(error) })))
+      },
+      flush: () => batcher.flush(),
+    }
+  }
+  const { app } = createContextApi({ reader, deployment: input.deployment, dataDir, ...(batching === undefined ? {} : { batching }) })
   return new Promise((resolve) => {
     const server = serve({ fetch: app.fetch, port: 0, hostname: "127.0.0.1" }, (info) => {
       resolve({

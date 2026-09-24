@@ -16,6 +16,7 @@ import {
   CONTEXT_KIND,
   MidaError,
   PERMISSION,
+  PROVENANCE_POLICY,
   PROVENANCE_SOURCE,
   batchContextId,
   batchSaveTypedData,
@@ -240,6 +241,21 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
       return reject(c, 400, "COMMITMENT_MISMATCH", "the ciphertext does not hash to the signed ciphertextCommitment")
     }
     verifyObjectManifest({ manifest: save.manifest, expectedManifestHash: message.manifestHash, ciphertext: ciphertextBytes })
+
+    // Live authority, chosen the way BatchAnchor._checkAndApply chooses it: a new lineage needs
+    // CREATE+ALLOW_INFERENCE; a replacement needs SUPERSEDE_OWN when the signer authored the lineage
+    // root, and SUPERSEDE_ANY either way as the contract's fallback. Queueing a save that can only
+    // be rejected on chain spends everyone's batch — refuse it before a row exists.
+    const hasAuthority = (permission: number): Promise<boolean> =>
+      reader.hasAuthority(save.message.owner, agentId, save.message.namespaceId, permission, PROVENANCE_POLICY.ALLOW_INFERENCE)
+    const allowed =
+      save.message.parentId === zeroHash
+        ? await hasAuthority(PERMISSION.CREATE)
+        : (save.message.rootAuthor.toLowerCase() === agentId.toLowerCase() && (await hasAuthority(PERMISSION.SUPERSEDE_OWN))) ||
+          (await hasAuthority(PERMISSION.SUPERSEDE_ANY))
+    if (!allowed) {
+      return reject(c, 403, "CAPABILITY_DENIED", "the signer holds no live grant covering this save")
+    }
 
     const receivedAt = now()
     const row: BatchSaveRow = {
