@@ -730,6 +730,17 @@ describe("the worker entry", () => {
     expect(JSON.stringify(await refused.json())).toContain("BATCH_OWNER_ALLOWLIST")
     const inert = await handleRequest(laneEnv({ BATCHING_ENABLED: "false", BATCH_OWNER_ALLOWLIST: "not-an-address" }), new Request("http://worker.test/"))
     expect(inert.status).toBe(200)
+
+    // Set-but-empty must NOT silently open the lane: "," and " " both parse to zero addresses
+    // while enabled, so each is a boot error that says the list produced zero addresses.
+    for (const zeroEntries of [",", " "]) {
+      const refusedZero = await handleRequest(laneEnv({ BATCH_OWNER_ALLOWLIST: zeroEntries }), new Request("http://worker.test/"))
+      expect(refusedZero.status).toBe(500)
+      expect(JSON.stringify(await refusedZero.json())).toContain("zero addresses")
+    }
+    // …but only while the lane is on — disabled, the same value is inert.
+    const zeroInert = await handleRequest(laneEnv({ BATCHING_ENABLED: "false", BATCH_OWNER_ALLOWLIST: "," }), new Request("http://worker.test/"))
+    expect(zeroInert.status).toBe(200)
   })
 
   it("the scheduled handler sweeps stale pending uploads and nonces on the real D1", async () => {

@@ -198,14 +198,17 @@ function batchingOptions(env: WorkerEnv, deployment: Deployment, publicClient: P
     // stays inert rather than failing a boot that never asks it anything. Entries may be
     // mixed-case; the wire's owner field is lowercase, so the list is normalized to match.
     const rawList = env.BATCH_OWNER_ALLOWLIST
-    if (typeof rawList === "string" && rawList.trim() !== "") {
+    if (typeof rawList === "string" && rawList !== "") {
       const entries = rawList.split(",").map((entry) => entry.trim()).filter((entry) => entry !== "")
-      if (entries.length > 0) {
-        if (!entries.every((entry) => /^0x[0-9a-fA-F]{40}$/.test(entry))) {
-          throw new Error("environment variable BATCH_OWNER_ALLOWLIST must be a comma-separated list of 0x-prefixed 20-byte addresses")
-        }
-        ownerAllowlist = entries.map((entry) => entry.toLowerCase() as Address)
+      // A SET value that parses to zero addresses ("," or " ") must not silently mean open —
+      // an operator who meant "closed" would get the opposite. Unset or empty stays "no allowlist".
+      if (entries.length === 0) {
+        throw new Error("environment variable BATCH_OWNER_ALLOWLIST is set but produced zero addresses")
       }
+      if (!entries.every((entry) => /^0x[0-9a-fA-F]{40}$/.test(entry))) {
+        throw new Error("environment variable BATCH_OWNER_ALLOWLIST must be a comma-separated list of 0x-prefixed 20-byte addresses")
+      }
+      ownerAllowlist = entries.map((entry) => entry.toLowerCase() as Address)
     }
   }
   const coordinator = (): { fetch(input: string | Request, init?: RequestInit): Promise<Response> } | undefined => {

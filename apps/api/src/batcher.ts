@@ -613,9 +613,9 @@ export class Batcher {
       }
     }
     if (unmapped > 0) {
-      // The submitted order is gone (no journal survived): anchored rows were still marked above,
-      // and the unmapped ones stay SUBMITTED — visible in the status route, retriable when a
-      // journal exists again. They are never guessed at.
+      // order is proven non-null above, so reaching here means a SaveRejected index pointed past
+      // the journaled order — event data that does not line up with the batch this batcher sent.
+      // Those rows stay SUBMITTED (visible in the status route); an index is never guessed at.
       this.#log?.({ event: "batch.unmapped-rejections", batchId, unmapped })
     }
     this.#log?.({ event: "batch.resolved", batchId, accepted: anchored.length, rejected: rejected.length })
