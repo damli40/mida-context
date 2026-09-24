@@ -188,9 +188,11 @@ export async function verifyBatchedItem(input: {
 /**
  * Amendment B.2 pending read: everything checkable without anchor inclusion — bytes, signature,
  * registered author, contextId — plus the one live check that matters most for a not-yet-anchored
- * save: the author must still hold CREATE+INFERENCE right now. A save queued before a revocation
- * must not survive this. Inclusion and freshness are deliberately unchecked: the contract will run
- * them at anchor time.
+ * save: the author's current authority, chosen exactly as `BatchAnchor._checkAndApply` chooses it.
+ * A new lineage needs CREATE+INFERENCE; a replacement needs SUPERSEDE_OWN when the signer authored
+ * the lineage root, SUPERSEDE_ANY otherwise — a save queued before a revocation must not survive
+ * this. Inclusion and freshness are deliberately unchecked: the contract will run them at anchor
+ * time.
  */
 export async function verifyPendingItem(input: {
   item: BatchedReadItem
@@ -203,12 +205,19 @@ export async function verifyPendingItem(input: {
   if (item.state !== "QUEUED" && item.state !== "SUBMITTED") return { ok: false, reason: "not-pending" }
   const checked = await checkSignedSave({ item, chainId, batchAnchor, capabilityRegistry: deployment.capabilityRegistry, client })
   if (!checked.ok) return checked
-  const allowed = await client.readContract({
-    address: deployment.capabilityRegistry,
-    abi: capabilityRegistryAbi,
-    functionName: "hasAuthority",
-    args: [checked.message.owner, checked.agentId, checked.message.namespaceId, PERMISSION.CREATE, PROVENANCE_POLICY.ALLOW_INFERENCE],
-  })
+  const { message, agentId } = checked
+  const hasAuthority = (permission: number): Promise<boolean> =>
+    client.readContract({
+      address: deployment.capabilityRegistry,
+      abi: capabilityRegistryAbi,
+      functionName: "hasAuthority",
+      args: [message.owner, agentId, message.namespaceId, permission, PROVENANCE_POLICY.ALLOW_INFERENCE],
+    })
+  const allowed =
+    message.parentId === zeroHash
+      ? await hasAuthority(PERMISSION.CREATE)
+      : (sameHex(message.rootAuthor, agentId) && (await hasAuthority(PERMISSION.SUPERSEDE_OWN))) ||
+        (await hasAuthority(PERMISSION.SUPERSEDE_ANY))
   if (!allowed) return { ok: false, reason: "no-authority" }
-  return { ok: true, agentId: checked.agentId }
+  return { ok: true, agentId }
 }

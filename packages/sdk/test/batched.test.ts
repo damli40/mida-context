@@ -16,8 +16,8 @@ import {
   merkleProof,
   namespaceId,
 } from "@mida/protocol"
-import type { BatchSaveMessage, ContextPayload, Hex } from "@mida/protocol"
-import { bytesOf, hexOf, sealContextObject } from "@mida/crypto"
+import type { Address, BatchSaveMessage, ContextPayload, Hex } from "@mida/protocol"
+import { bytesOf, generateX25519KeyPair, hexOf, sealContextObject } from "@mida/crypto"
 import {
   ANVIL_PRIVATE_KEYS,
   batchAnchorAbi,
@@ -66,6 +66,7 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
   let agent3: ProvisionedAgent
   let agent2CapabilityId: Hex
   let sdk: MidaAgent
+  let operator: LocalWriteContext
   const posted: BatchedSaveWire[] = []
   let batchItems: BatchedReadItem[] = []
   let batchPartial = false
@@ -85,11 +86,23 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
     return address
   }
 
-  /** Seals and signs one save the way BatchAnchor wants it — parent fields carry a replacement. */
+  /**
+   * Seals and signs one save the way BatchAnchor wants it — parent fields carry a replacement.
+   * `owner`/`namespaceId` file the save under a different scope; `sealKey` seals it under an
+   * epoch public key other than the namespace's, so the ciphertext will not open for readers.
+   */
   const makeSave = async (
     author: ProvisionedAgent,
-    input: { value?: string; parent?: { contextId: Hex; version: number; rootAuthor: Hex } } = {},
+    input: {
+      value?: string
+      owner?: Address
+      namespaceId?: Hex
+      sealKey?: Uint8Array
+      parent?: { contextId: Hex; version: number; rootAuthor: Hex }
+    } = {},
   ): Promise<SealedSave> => {
+    const saveOwner = input.owner ?? vault.owner
+    const saveNamespaceId = input.namespaceId ?? CAREER
     const readEpoch = await reader.requiredReadEpoch(vault.owner, CAREER)
     const epochPublicKey = await reader.epochPublicKey(vault.owner, CAREER, readEpoch)
     if (epochPublicKey === null) throw new Error("no epoch public key for the test namespace")
@@ -98,9 +111,9 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
     const contextId = batchContextId({
       chainId: deployment.chainId,
       batchAnchor: batchAnchor(),
-      owner: vault.owner,
+      owner: saveOwner,
       agentId: author.agentId,
-      namespaceId: CAREER,
+      namespaceId: saveNamespaceId,
       parentId: parent?.contextId ?? zeroHash,
       objectNonce,
     })
@@ -116,14 +129,14 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
         chainId: deployment.chainId,
         contextRegistry: deployment.contextRegistry,
         contextId,
-        namespaceId: CAREER,
+        namespaceId: saveNamespaceId,
         readEpoch,
       },
-      epochPublicKey: bytesOf(epochPublicKey, 32),
+      epochPublicKey: input.sealKey ?? bytesOf(epochPublicKey, 32),
     })
     const message: BatchSaveMessage = {
-      owner: vault.owner,
-      namespaceId: CAREER,
+      owner: saveOwner,
+      namespaceId: saveNamespaceId,
       objectNonce,
       lineageId: parent?.contextId ?? zeroHash,
       parentId: parent?.contextId ?? zeroHash,
@@ -215,6 +228,21 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
     receivedAt: Date.now(),
   })
 
+  /** The owner grants `target` one capability on goals.career — the on-chain flip a verifier sees. */
+  const grantPermissions = async (target: ProvisionedAgent, permissions: number) => {
+    const request = await buildSignedAccessRequest({
+      chain: owner,
+      agent: target,
+      scopes: [{ namespace: "goals.career", permissions, provenancePolicy: PROVENANCE_POLICY.ALLOW_INFERENCE }],
+    })
+    const expiresAt = (await latestTimestamp(owner)) + 7n * 86_400n
+    await vault.approveGrant({
+      accessRequest: request,
+      manifest: target.manifest,
+      selection: { kind: "custom", scopes: request.scopes, expiresAt },
+    })
+  }
+
   // Shared anchored item, produced by the first two tests and reused read-only by later ones.
   let honestSave: SealedSave
   let anchoredItem: BatchedReadItem
@@ -232,7 +260,7 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
     vault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: P256_KEY, chain: owner, api: ownerApi })
     await vault.registerOwnerKey()
     await vault.initializeNamespace("goals.career")
-    const operator = createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[2]!) })
+    operator = createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[2]!) })
     agent = await provisionAgent({
       operator,
       name: "Batcher",
@@ -581,5 +609,79 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
     expect(sentBody.message.readEpoch).toBe(save.wire.message.readEpoch)
     expect(typeof sentBody.message.readEpoch).toBe("string")
     expect(sentBody.signature).toBe(save.wire.signature)
+  })
+
+  it("a queued save filed under another owner is skipped wrong-scope and the good item still reads", async () => {
+    const foreign = await makeSave(agent, { owner: privateKeyToAccount(ANVIL_PRIVATE_KEYS[3]!).address })
+    const good = await makeSave(agent, { value: "in scope" })
+    batchItems = [queuedItem(foreign), queuedItem(good)]
+    const result = await sdk.readBatchedWithStatus(vault.owner, "goals.career")
+    batchItems = []
+    expect(result.skipped).toEqual([{ contextId: foreign.contextId, reason: "wrong-scope" }])
+    expect(result.pending).toHaveLength(1)
+    expect(result.pending[0]!.contextId).toBe(good.contextId)
+    expect(result.pending[0]!.payload.value).toBe("in scope")
+  })
+
+  it("a queued save filed under another namespace of the same owner is skipped wrong-scope", async () => {
+    const foreign = await makeSave(agent, { namespaceId: namespaceId("goals.health") })
+    const good = await makeSave(agent)
+    batchItems = [queuedItem(foreign), queuedItem(good)]
+    const result = await sdk.readBatchedWithStatus(vault.owner, "goals.career")
+    batchItems = []
+    expect(result.skipped).toEqual([{ contextId: foreign.contextId, reason: "wrong-scope" }])
+    expect(result.pending).toHaveLength(1)
+    expect(result.pending[0]!.contextId).toBe(good.contextId)
+  })
+
+  it("a queued save sealed under a different epoch key is skipped decrypt and the good item still reads", async () => {
+    const wrongKey = await makeSave(agent, { sealKey: generateX25519KeyPair().publicKey })
+    const good = await makeSave(agent, { value: "opens fine" })
+    batchItems = [queuedItem(wrongKey), queuedItem(good)]
+    const result = await sdk.readBatchedWithStatus(vault.owner, "goals.career")
+    batchItems = []
+    expect(result.skipped).toEqual([{ contextId: wrongKey.contextId, reason: "decrypt" }])
+    expect(result.pending).toHaveLength(1)
+    expect(result.pending[0]!.contextId).toBe(good.contextId)
+    expect(result.pending[0]!.payload.value).toBe("opens fine")
+  })
+
+  it("a pending replacement by the root author needs SUPERSEDE_OWN — CREATE alone fails no-authority", async () => {
+    const author = await provisionAgent({
+      operator,
+      name: "CreateOnly",
+      purposeId: "career_coaching",
+      declarations: [{ namespace: "goals.career", permissions: ["CREATE"], provenancePolicies: ["ALLOW_INFERENCE"] }],
+      callbackOrigin: "https://create-only.example",
+    })
+    await grantPermissions(author, PERMISSION.CREATE)
+    // The parent need not exist on-chain — a pending replacement only names it and its root author.
+    const save = await makeSave(author, {
+      parent: { contextId: hexOf(randomBytes(32)), version: 1, rootAuthor: author.agentId },
+    })
+    const item = queuedItem(save)
+    expect(await verifyPending(item)).toEqual({ ok: false, reason: "no-authority" })
+    await grantPermissions(author, PERMISSION.SUPERSEDE_OWN)
+    expect(await verifyPending(item)).toEqual({ ok: true, agentId: author.agentId })
+  })
+
+  it("a pending replacement of another agent's lineage needs SUPERSEDE_ANY — SUPERSEDE_OWN fails no-authority", async () => {
+    // agent holds CREATE|SUPERSEDE_OWN|READ — never ANY — and the named root author is someone else.
+    const ownOnly = await makeSave(agent, {
+      parent: { contextId: hexOf(randomBytes(32)), version: 2, rootAuthor: agent2.agentId },
+    })
+    expect(await verifyPending(queuedItem(ownOnly))).toEqual({ ok: false, reason: "no-authority" })
+    const replacer = await provisionAgent({
+      operator,
+      name: "Superseder",
+      purposeId: "career_coaching",
+      declarations: [{ namespace: "goals.career", permissions: ["SUPERSEDE_ANY"], provenancePolicies: ["ALLOW_INFERENCE"] }],
+      callbackOrigin: "https://superseder.example",
+    })
+    await grantPermissions(replacer, PERMISSION.SUPERSEDE_ANY)
+    const save = await makeSave(replacer, {
+      parent: { contextId: hexOf(randomBytes(32)), version: 5, rootAuthor: agent.agentId },
+    })
+    expect(await verifyPending(queuedItem(save))).toEqual({ ok: true, agentId: replacer.agentId })
   })
 })

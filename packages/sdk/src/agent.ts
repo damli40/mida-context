@@ -389,6 +389,13 @@ export class MidaAgent {
     const pending: (ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex })[] = []
     const skipped: { contextId: Hex; reason: string }[] = []
     for (const item of items) {
+      const message = item.save.message
+      // A row the store filed under the wrong owner or namespace is out of scope for this read:
+      // skip it before verification or decryption ever run on it.
+      if (message.owner.toLowerCase() !== ownerAddress || message.namespaceId.toLowerCase() !== namespaceId) {
+        skipped.push({ contextId: item.contextId, reason: "wrong-scope" })
+        continue
+      }
       const verdict =
         item.state === "ANCHORED"
           ? await verifyBatchedItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient, requireLatest: true })
@@ -397,22 +404,29 @@ export class MidaAgent {
         skipped.push({ contextId: item.contextId, reason: verdict.reason })
         continue
       }
-      const message = item.save.message
       const readEpoch = decodeUint64(message.readEpoch)
       const epochPrivateKey = await epochKeyFor(readEpoch)
-      const payload = openContextObject({
-        manifest: item.save.manifest,
-        expectedManifestHash: message.manifestHash.toLowerCase() as Hex,
-        ciphertext: bytesOf(item.save.ciphertext, item.save.manifest.ciphertextSize),
-        epochPrivateKey,
-        binding: {
-          chainId: deployment.chainId,
-          contextRegistry: deployment.contextRegistry,
-          contextId: item.contextId,
-          namespaceId,
-          readEpoch,
-        },
-      })
+      let payload: ContextPayload
+      try {
+        payload = openContextObject({
+          manifest: item.save.manifest,
+          expectedManifestHash: message.manifestHash.toLowerCase() as Hex,
+          ciphertext: bytesOf(item.save.ciphertext, item.save.manifest.ciphertextSize),
+          epochPrivateKey,
+          binding: {
+            chainId: deployment.chainId,
+            contextRegistry: deployment.contextRegistry,
+            contextId: item.contextId,
+            namespaceId,
+            readEpoch,
+          },
+        })
+      } catch {
+        // One row that will not open — sealed under a key this agent cannot unwrap, or bytes that
+        // pass the commitments but fail the AAD — skips the row, not the whole read.
+        skipped.push({ contextId: item.contextId, reason: "decrypt" })
+        continue
+      }
       const base = {
         contextId: item.contextId,
         owner: ownerAddress,
