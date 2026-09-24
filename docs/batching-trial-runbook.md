@@ -127,3 +127,14 @@ benchmark numbers live — per-save charged cost and gas used in both lanes, tra
 rejected count, the largest observed batch, and (with `--store`) latency percentiles. Nothing in
 this runbook states a number on purpose: quote only what the evidence file reports after a real
 run.
+
+## 7. Known limits
+
+**A batch id can be stolen.** The batch id sits in the pending transaction while it waits in the
+mempool, and the contract is immutable — no code change can hide it. Anyone watching can land a
+batch under that id first; our transaction then reverts with `BatchExists`, and Monad bills the
+full gas limit of the reverted transaction anyway. The rows are not lost: the store sees the id
+was taken (`batch.id-taken` in its log), discovers the batch is not ours (`batch.not-ours`), and
+requeues the saves under a fresh id. A single occurrence is noise; **repeated `batch.id-taken` or
+`batch.not-ours` lines mean someone is actively racing the store** — treat that as an incident and
+consider pausing the lane (`BATCHING_ENABLED=false`) rather than paying full gas on doomed sends.

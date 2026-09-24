@@ -466,6 +466,11 @@ export class Batcher {
       if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
       return null
     }
+    // { exists: true } is the BatchExists answer: our batchId was already taken on chain. The id is
+    // visible inside the pending transaction, so anyone can land a batch under it first — Monad then
+    // bills the reverted send's full gas limit. Not an ambiguous send and not a generic failure: the
+    // resolve below proves whose batch it is, and repeated id-taken lines are the attack's signature.
+    if ("exists" in result) this.#log?.({ event: "batch.id-taken", batchId })
     // A real receipt re-teaches the per-save cost, so the next take fits the gas the chain actually
     // charged. { exists: true } carries no receipt — the learned cap stays where the last real
     // measurement put it. gasPerSave is logged as a number: bigint would break JSON.stringify.

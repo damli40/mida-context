@@ -836,6 +836,20 @@ describe("the batcher", () => {
     expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
   })
 
+  it("a taken batchId logs batch.id-taken — the BatchExists collision, distinct from a failed send", async () => {
+    const rig = makeRig()
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    // The fake answers { exists: true }: the id was already on chain — the known collision.
+    rig.chain.reportExists = true
+
+    const result = await rig.batcher.run()
+    expect(result).toMatchObject({ accepted: 1, rejected: 0 })
+    expect(rig.events.find((entry) => entry["event"] === "batch.id-taken")).toMatchObject({ batchId: result!.batchId })
+    expect(rig.events.some((entry) => entry["event"] === "batch.submit-failed")).toBe(false)
+    expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
+  })
+
   it("an ambiguous send — recorded, then its answer lost — heals through the next batch's ALREADY_ANCHORED", async () => {
     const rig = makeRig()
     const { wire, meta } = makeSave()
