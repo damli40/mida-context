@@ -43,6 +43,15 @@ contracts:
       - event: ContextRegistered
       - event: ContextSuperseded
       - event: EvidenceRegistered
+  # BatchAnchor is the batched-checkpoint lane (plan 2026-09-24-batch-anchor Task 9).
+  # The index only counts its events — it never decides a save's validity.
+  - name: BatchAnchor
+    abi_file_path: ./abi/BatchAnchor.json
+    handler: ./src/EventHandlers.ts
+    events:
+      - event: SaveAnchored
+      - event: SaveRejected
+      - event: BatchAnchored
 
 chains:
   # Monad testnet. HyperSync is the default data source for supported chains and needs
@@ -55,3 +64,6 @@ chains:
         address: "0xadfbebc7a653e4287ae30c87d32d7ad647d7039b"
       - name: ContextRegistry
         address: "0x75fb6db9af93a8d823e51c488caa913ca711fb78"
+      - name: BatchAnchor
+        # set on merge from contracts/deployments/10143.json batchAnchor
+        address: "0x0000000000000000000000000000000000000000"
