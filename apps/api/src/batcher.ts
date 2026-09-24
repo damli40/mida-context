@@ -20,7 +20,7 @@ import { existsSync, readFileSync } from "node:fs"
 import { dirname } from "node:path"
 import { bytesToHex, encodeAbiParameters, keccak256, zeroHash } from "viem"
 import type { AbiEvent, LocalAccount } from "viem"
-import { BATCH_REJECT, MidaError, batchLeafHash, batchSaveStructHash, decodeUint64, merkleProof, merkleRoot } from "@mida/protocol"
+import { BATCH_REJECT, MidaError, batchLeafHash, batchSaveStructHash, decodeUint64, isMidaError, merkleProof, merkleRoot } from "@mida/protocol"
 import type { Address, BatchSaveMessage, Hex } from "@mida/protocol"
 import { batchAnchorAbi, createWriteContext, getLogsChunked, revertName, sendContract } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
@@ -233,6 +233,11 @@ export class Batcher {
   readonly #log: ((record: Record<string, unknown>) => void) | undefined
   /** Ordered contextIds of batches this process submitted — the resolve mapping without a journal read. */
   readonly #submitted = new Map<string, Hex[]>()
+  /**
+   * The take size the next run uses. A GAS_CEILING_EXCEEDED refusal halves it (floor 1) — the batch
+   * was too big to send, not malformed — and a successful submit restores the configured cap.
+   */
+  #effectiveCap: number
   #lastSubmitAt: number | null = null
   #tail: Promise<unknown> = Promise.resolve()
 
@@ -247,6 +252,7 @@ export class Batcher {
     this.#minGapMs = options.minGapMs ?? 1000
     this.#submitter = options.submitter.toLowerCase() as Address
     this.#salt = options.salt ?? (() => bytesToHex(crypto.getRandomValues(new Uint8Array(32))))
+    this.#effectiveCap = options.cap
     this.#log = options.log
   }
 
@@ -342,7 +348,7 @@ export class Batcher {
     // The batchId goes into the journal before a single row is marked SUBMITTED, so a crash between
     // the take and the full record still leaves recover() a batchId it can requeue by.
     await this.#journal?.record(batchId, [])
-    const taken = await this.#store.takeQueued(this.#cap, batchId)
+    const taken = await this.#store.takeQueued(this.#effectiveCap, batchId)
     if (taken.length === 0) {
       await this.#journal?.clear(batchId)
       await this.#timer.clear()
@@ -363,6 +369,25 @@ export class Batcher {
     try {
       result = await this.#chain.submit(batchId, taken.map((row) => row.save))
     } catch (error) {
+      if (isMidaError(error, "GAS_CEILING_EXCEEDED")) {
+        this.#submitted.delete(batchId.toLowerCase())
+        await this.#journal?.clear(batchId)
+        if (taken.length === 1) {
+          // A batch of one that still exceeds the ceiling can never shrink — the row is rejected
+          // on the store side so the queue moves on; readers see the plain reason.
+          await this.#store.markRejected(taken[0]!.contextId, "TOO_LARGE")
+          this.#log?.({ event: "batch.too-large", batchId, contextId: taken[0]!.contextId, rejected: "TOO_LARGE" })
+        } else {
+          // The batch was too big to send — a size refusal, not an ambiguous send. The rows go back
+          // and the next take halves the cap, so the queue drains in smaller batches instead of
+          // wedging behind one it can never push through.
+          const requeued = await this.#store.requeue(batchId)
+          this.#effectiveCap = Math.max(1, Math.floor(this.#effectiveCap / 2))
+          this.#log?.({ event: "batch.too-large", batchId, requeued, cap: this.#effectiveCap })
+        }
+        if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
+        return null
+      }
       // The send failed ambiguously — the tx may or may not land. Requeue wholesale; if it did land,
       // the next batch's ALREADY_ANCHORED rejects heal the rows through findAnchoring.
       const requeued = await this.#store.requeue(batchId)
@@ -372,6 +397,7 @@ export class Batcher {
       if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
       return null
     }
+    this.#effectiveCap = this.#cap
     this.#lastSubmitAt = this.#now()
     this.#log?.({ event: "batch.submitted", batchId, saves: taken.length, exists: "exists" in result })
     try {

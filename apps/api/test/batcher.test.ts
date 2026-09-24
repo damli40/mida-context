@@ -16,6 +16,7 @@ import { randomBytes } from "@noble/hashes/utils.js"
 import { hexOf } from "@mida/crypto"
 import {
   BATCH_REJECT,
+  MidaError,
   batchContextId,
   batchLeafHash,
   batchSaveStructHash,
@@ -264,8 +265,8 @@ class FakeChain implements BatcherChain {
 
   /** Per-save decision: return a BATCH_REJECT code to reject, null to accept. Runs after the auto-anchored check. */
   rejectWith: (wire: BatchedSaveWire, index: number) => number | null = () => null
-  /** Throw before recording: the send never reached the contract. */
-  failSubmit: (() => Error) | null = null
+  /** Return an error to throw before recording — sees the saves, so a test can refuse by batch size. */
+  failSubmit: ((saves: BatchedSaveWire[]) => Error | null) | null = null
   /** Throw after recording: the send landed but its answer was lost. */
   afterRecord: (() => void) | null = null
   failLogs = false
@@ -277,7 +278,8 @@ class FakeChain implements BatcherChain {
     this.submitTimes.push(this.now())
     const key = batchId.toLowerCase() as Hex
     if (this.batches.has(key)) return { exists: true }
-    if (this.failSubmit !== null) throw this.failSubmit()
+    const failure = this.failSubmit?.(saves)
+    if (failure != null) throw failure
     this.submissions.push({ batchId, count: saves.length })
     const anchored: AnchoredLog[] = []
     const rejected: RejectedLog[] = []
@@ -499,6 +501,73 @@ describe("the batcher", () => {
     await rig.batcher.flush()
     expect(chain.submissions).toHaveLength(1)
     expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
+  })
+
+  it("a gas-ceiling refusal halves the next take until the batch fits — the queue never wedges", async () => {
+    const rig = makeRig({ cap: 8 })
+    const saves = [makeSave(), makeSave(), makeSave()]
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+
+    // The node refuses any batch above two saves on the gas ceiling — a local policy error, not a
+    // dropped connection.
+    rig.chain.failSubmit = (batch) =>
+      batch.length > 2 ? new MidaError("GAS_CEILING_EXCEEDED", "submitBatch: estimate exceeds the ceiling") : null
+
+    // cap 8 → take 3, refused: all rows requeue and the next take is capped at 4.
+    await rig.batcher.flush()
+    expect(rig.chain.batches.size).toBe(0)
+    for (const { meta } of saves) expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "QUEUED", batchId: null })
+    expect(await rig.journal.list()).toEqual([])
+    expect(rig.events.find((entry) => entry["event"] === "batch.too-large")).toMatchObject({ requeued: 3, cap: 4 })
+
+    // take min(4, 3) = 3 — still refused, cap halves again to 2. Refusals don't touch the submit
+    // gap, so the next flush runs at once.
+    await rig.batcher.flush()
+    expect(rig.chain.batches.size).toBe(0)
+    expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 3, cap: 2 })
+
+    // take 2 — fits. The two rows anchor and the cap returns to the configured 8.
+    await rig.batcher.flush()
+    expect(rig.chain.submissions).toHaveLength(1)
+    expect(rig.chain.submissions[0]!.count).toBe(2)
+    for (const { meta } of saves.slice(0, 2)) expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
+
+    // The leftover save goes in a fresh batch — past minGapMs for the successful submit first.
+    rig.setNow(1_000)
+    await rig.batcher.flush()
+    expect(rig.chain.submissions).toHaveLength(2)
+    expect(rig.chain.submissions[1]!.count).toBe(1)
+    expect((await rig.store.get(saves[2]!.meta.contextId))!.state).toBe("ANCHORED")
+  })
+
+  it("a singleton batch that still exceeds the gas ceiling is REJECTED TOO_LARGE and the queue moves on", async () => {
+    const rig = makeRig({ cap: 8 })
+    const huge = makeSave()
+    const fine = makeSave()
+    await rig.enqueue(huge.wire, huge.meta.contextId)
+    await rig.enqueue(fine.wire, fine.meta.contextId)
+
+    // The node refuses any batch containing the oversized save — it alone cannot fit the ceiling.
+    rig.chain.failSubmit = (batch) =>
+      batch.some((save) => save.message.objectNonce === huge.wire.message.objectNonce)
+        ? new MidaError("GAS_CEILING_EXCEEDED", "submitBatch: estimate exceeds the ceiling")
+        : null
+
+    // take 2 → refused → cap 4; take 2 → refused → cap 2; take 2 → refused → cap 1.
+    for (const cap of [4, 2, 1]) {
+      await rig.batcher.flush()
+      expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 2, cap })
+    }
+    // take 1 — the oversized save alone, still refused: rejected store-side, not requeued.
+    await rig.batcher.flush()
+    expect((await rig.store.get(huge.meta.contextId))!).toMatchObject({ state: "REJECTED", reason: "TOO_LARGE" })
+    expect(await rig.journal.list()).toEqual([])
+
+    // The save behind it drains in the very next run.
+    await rig.batcher.flush()
+    expect(rig.chain.submissions).toHaveLength(1)
+    expect(rig.chain.submissions[0]!.count).toBe(1)
+    expect((await rig.store.get(fine.meta.contextId))!).toMatchObject({ state: "ANCHORED" })
   })
 
   it("an ambiguous send — recorded, then its answer lost — heals through the next batch's ALREADY_ANCHORED", async () => {
