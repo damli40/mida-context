@@ -4,9 +4,9 @@ import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from
 import { createServer } from "node:net"
 import type { Server, Socket } from "node:net"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { MidaHome, listJobs, runHook, socketPathFor } from "@mida/midad"
+import { MidaHome, listJobs, recordCodexHome, runHook, socketPathFor, transcriptPathAllowed } from "@mida/midad"
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 const HOOK_MAIN = fileURLToPath(new URL("../src/hook-main.ts", import.meta.url))
@@ -210,6 +210,22 @@ describe("runHook", () => {
     // the folders are per-agent: codex naming a claude-code transcript is refused
     await hook({ dir, home, stdin: stdinFor({ transcript_path: transcriptPath }), agent: "codex" })
     expect(listJobs(home)).toHaveLength(1)
+  })
+
+  it("accepts a codex rollout under the recorded CODEX_HOME, and still refuses outside it", () => {
+    const user = mkdtempSync(join(tmpdir(), "u-"))
+    const codexHome = mkdtempSync(join(tmpdir(), "ch-"))
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "h-")))
+    const rollout = join(codexHome, "sessions/2026/09/22/rollout-x.jsonl")
+    mkdirSync(dirname(rollout), { recursive: true })
+    writeFileSync(rollout, "{}\n")
+    expect(transcriptPathAllowed(rollout, "codex", user, home)).toBe(false) // not recorded yet
+    recordCodexHome(home, codexHome)
+    expect(transcriptPathAllowed(rollout, "codex", user, home)).toBe(true)
+    expect(transcriptPathAllowed(rollout, "claude-code", user, home)).toBe(false) // roots are per agent
+    const outside = join(codexHome, "history.jsonl")
+    writeFileSync(outside, "{}\n")
+    expect(transcriptPathAllowed(outside, "codex", user, home)).toBe(false) // not under sessions/
   })
 })
 

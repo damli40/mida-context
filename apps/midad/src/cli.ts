@@ -9,6 +9,7 @@ import type { Hex } from "@mida/protocol"
 import type { Deployment } from "@mida/chain"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { permissionNames } from "@mida/grant-advisor"
+import { recordCodexHome, resolveCodexHome } from "./codex-home.js"
 import { callDaemon, ensureCurrentDaemon } from "./control.js"
 import { batchStatusProbe, decideLane, laneWhyText } from "./batching.js"
 import { debugLine, refusalCode } from "./debug-line.js"
@@ -837,7 +838,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
  */
 export function runInstall(
   argv: string[],
-  deps: { print: (line: string) => void; claudeSettings: string; codexConfig: string },
+  deps: { print: (line: string) => void; claudeSettings: string; codexConfig: string; home: MidaHome },
 ): number {
   const tool = argv[1] ?? ""
   if (argv.length !== 2 || !INSTALL_TOOLS.includes(tool)) {
@@ -855,7 +856,12 @@ export function runInstall(
           ? uninstallClaudeCode(settingsPath)
           : uninstallCodex(settingsPath)
     deps.print(outcome === "already-installed" ? "already installed" : outcome === "not-installed" ? "not installed" : outcome)
-    if (argv[0] === "install" && tool === "codex" && outcome === "installed") deps.print(CODEX_TRUST_SENTENCE)
+    if (argv[0] === "install" && tool === "codex") {
+      // the hook and the drain never see Codex's own environment — the home install wrote into
+      // is recorded so <CODEX_HOME>/sessions becomes a trusted transcript root
+      recordCodexHome(deps.home, resolveCodexHome(process.env, homedir()))
+      if (outcome === "installed") deps.print(CODEX_TRUST_SENTENCE)
+    }
     return 0
   } catch (error) {
     deps.print(`refused: ${refusalCode(error)}`)
@@ -906,7 +912,8 @@ async function main(): Promise<void> {
     process.exitCode = runInstall(argv, {
       print,
       claudeSettings: join(homedir(), ".claude", "settings.json"),
-      codexConfig: join(homedir(), ".codex", "config.toml"),
+      codexConfig: join(resolveCodexHome(process.env, homedir()), "config.toml"),
+      home,
     })
     return
   }
@@ -914,7 +921,7 @@ async function main(): Promise<void> {
   if (argv[0] === "doctor") {
     const settings = {
       "claude-code": join(homedir(), ".claude", "settings.json"),
-      codex: join(homedir(), ".codex", "config.toml"),
+      codex: join(resolveCodexHome(process.env, homedir()), "config.toml"),
     }
     if (argv[1] === "--live") {
       const tool = argv[2] ?? ""

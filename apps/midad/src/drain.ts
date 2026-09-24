@@ -264,7 +264,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         }
         // the hook checked this path at enqueue, but the file could have been swapped since —
         // re-check the same rule before the drainer opens it
-        if (!transcriptPathAllowed(job.transcriptPath, job.agent, homeDir)) {
+        if (!transcriptPathAllowed(job.transcriptPath, job.agent, homeDir, deps.home)) {
           moveToBad(deps.home, `${job.id}.json`)
           log({ sessionId, outcome: "bad", reason: "bad-transcript-path" })
           continue

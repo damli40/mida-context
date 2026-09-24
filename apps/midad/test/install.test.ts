@@ -8,6 +8,7 @@ import {
   CODEX_TRUST_SENTENCE,
   HOOK_COMMAND,
   INJECT_COMMAND,
+  MidaHome,
   claudeHooksStatus,
   codexBlock,
   codexHooksStatus,
@@ -16,6 +17,7 @@ import {
   installClaudeCode,
   installCodex,
   parseMidaCommand,
+  recordedCodexHome,
   runInstall,
   uninstallClaudeCode,
   uninstallCodex,
@@ -313,6 +315,32 @@ describe("mida install codex", () => {
     expect(readFileSync(config, "utf8")).toBe(`${codexBlock()}\n`)
   })
 
+  it("installs into CODEX_HOME when set and records the resolved home in the Mida home", () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "mida-codex-home-"))
+    const midaHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-home-")))
+    const config = join(codexHome, "config.toml")
+    const previous = process.env.CODEX_HOME
+    process.env.CODEX_HOME = codexHome
+    const lines: string[] = []
+    let code = -1
+    try {
+      code = runInstall(["install", "codex"], {
+        print: (line) => lines.push(line),
+        claudeSettings: join(dir(), "settings.json"),
+        codexConfig: config,
+        home: midaHome,
+      })
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = previous
+    }
+    expect(code).toBe(0)
+    // the managed block is exactly codexBlock() — an unchanged block never re-asks Codex's trust
+    expect(readFileSync(config, "utf8")).toBe(`${codexBlock()}\n`)
+    expect(readFileSync(midaHome.path("codex-home"), "utf8")).toBe(`${codexHome}\n`)
+    expect(recordedCodexHome(midaHome)).toBe(codexHome)
+  })
+
   it("the managed block carries the whats-new hook on the same inject command, absolutely (R5-7)", () => {
     const block = codexBlock()
     expect(block).toContain("[[hooks.UserPromptSubmit]]")
@@ -440,7 +468,12 @@ describe("the Codex trust reminder", () => {
 
   const install = (config: string, settings: string, argv: string[]) => {
     const lines: string[] = []
-    const code = runInstall(argv, { print: (line) => lines.push(line), claudeSettings: settings, codexConfig: config })
+    const code = runInstall(argv, {
+      print: (line) => lines.push(line),
+      claudeSettings: settings,
+      codexConfig: config,
+      home: new MidaHome(join(dir(), "mida-home")),
+    })
     return { code, lines }
   }
 

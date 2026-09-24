@@ -1,6 +1,7 @@
 import { lstatSync, realpathSync } from "node:fs"
 import { homedir } from "node:os"
 import { isAbsolute, join, relative } from "node:path"
+import { recordedCodexHome } from "./codex-home.js"
 import { callDaemon } from "./control.js"
 import type { MidaHome } from "./home.js"
 import { appendLog } from "./log.js"
@@ -17,34 +18,49 @@ const KNOWN_EVENTS: ReadonlySet<string> = new Set<HookEvent>(["PostToolUse", "St
 const KICK_TIMEOUT_MS = 150
 
 /**
- * Where each agent keeps its session transcripts, relative to the user's home folder. Codex
- * writes session rollouts at `<CODEX_HOME>/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl` — verified
- * against the throwaway CODEX_HOME the spike harness runs — and CODEX_HOME defaults to ~/.codex.
- * An agent with no entry here has no trusted transcript folder at all and is refused outright.
+ * The transcript roots each agent is trusted under, as absolute paths. `claude-code` sessions live
+ * at `<homeDir>/.claude/projects/`; Codex writes session rollouts at
+ * `<CODEX_HOME>/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl` — verified against the throwaway
+ * CODEX_HOME the spike harness runs — so `codex` trusts `<homeDir>/.codex/sessions` plus the
+ * `sessions/` folder under the Codex home `mida install codex` recorded in the Mida home (the
+ * hook and the drain never see Codex's own environment). An agent with no roots has no trusted
+ * transcript folder at all and is refused outright.
  */
-const TRANSCRIPT_DIRS: Readonly<Record<string, string>> = {
-  "claude-code": ".claude/projects",
-  codex: ".codex/sessions",
+export function transcriptRoots(agent: string, homeDir: string, home?: MidaHome): string[] {
+  if (agent === "claude-code") return [join(homeDir, ".claude", "projects")]
+  if (agent === "codex") {
+    const roots = [join(homeDir, ".codex", "sessions")]
+    const recorded = home === undefined ? undefined : recordedCodexHome(home)
+    if (recorded !== undefined) roots.push(join(recorded, "sessions"))
+    return roots
+  }
+  return []
 }
 
 /**
  * The hook must not be an any-file reader: a transcript is only trusted when it is an absolute
  * `.jsonl` path that really is a regular file (never a symlink, checked with lstat) sitting under
- * the agent's transcript folder inside `homeDir` — for `claude-code` that is
- * `<homeDir>/.claude/projects/`. The realpath comparison also catches a symlinked parent folder.
- * An agent with no entry in TRANSCRIPT_DIRS is refused — there is no fallback to the home folder.
+ * one of the agent's transcript roots — for `claude-code` that is `<homeDir>/.claude/projects/`.
+ * The realpath comparison also catches a symlinked parent folder. An agent with no transcript
+ * roots is refused — there is no fallback to the home folder.
  */
-export function transcriptPathAllowed(transcriptPath: unknown, agent: string, homeDir: string): transcriptPath is string {
+export function transcriptPathAllowed(transcriptPath: unknown, agent: string, homeDir: string, home?: MidaHome): transcriptPath is string {
   if (typeof transcriptPath !== "string" || transcriptPath === "") return false
   if (!isAbsolute(transcriptPath) || !transcriptPath.endsWith(".jsonl")) return false
-  const dir = TRANSCRIPT_DIRS[agent]
-  if (dir === undefined) return false
+  const roots = transcriptRoots(agent, homeDir, home)
+  if (roots.length === 0) return false
   try {
     const stat = lstatSync(transcriptPath)
     if (stat.isSymbolicLink() || !stat.isFile()) return false
-    const base = realpathSync(join(homeDir, dir))
-    const inside = relative(base, realpathSync(transcriptPath))
-    return inside !== "" && !inside.startsWith("..") && !isAbsolute(inside)
+    const real = realpathSync(transcriptPath)
+    return roots.some((root) => {
+      try {
+        const inside = relative(realpathSync(root), real)
+        return inside !== "" && !inside.startsWith("..") && !isAbsolute(inside)
+      } catch {
+        return false
+      }
+    })
   } catch {
     return false
   }
@@ -140,7 +156,7 @@ export async function runHook(input: {
       log({ event, sessionId, outcome: "ignored", reason: "bad-agent" })
       return
     }
-    if (!transcriptPathAllowed(record.transcript_path, input.agent, input.homeDir ?? homedir())) {
+    if (!transcriptPathAllowed(record.transcript_path, input.agent, input.homeDir ?? homedir(), input.home)) {
       log({ event, sessionId, outcome: "ignored", reason: "bad-transcript-path" })
       return
     }
