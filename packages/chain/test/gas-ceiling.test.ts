@@ -92,6 +92,24 @@ describe("the shared gas ceiling (R3-1)", () => {
     }
   })
 
+  it('"batch.submit" is its own kind, sized under Monad\'s 30M per-transaction gas limit', () => {
+    // Monad refuses any transaction over 30,000,000 gas; 28M leaves 2M of headroom because the
+    // estimate is taken before inclusion. The Sep 24 sweep measured ~61k gas per save, so a
+    // batch-submit ceiling near the wall is what lets batches grow past the old 60-save cap.
+    expect(GAS_CEILINGS["batch.submit"]).toBe(28_000_000n)
+  })
+
+  it("a batch submit whose estimate crosses the ceiling is refused before send", async () => {
+    const estimate = 29_000_000n // under Monad's 30M wall but over the 28M batch-submit budget
+    const { context, sent } = stubContext(estimate)
+    const error = await sendContract(context, { address: ADDRESS, abi: [], functionName: "submitBatch", args: [] }, "batch.submit").then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(isMidaError(error, "GAS_CEILING_EXCEEDED")).toBe(true)
+    expect(sent).toHaveLength(0)
+  })
+
   it("the plain value transfer is bounded by its own kind and sent with the explicit estimate", async () => {
     const estimate = 21_000n
     const { context, sent } = stubContext(estimate)

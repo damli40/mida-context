@@ -268,7 +268,7 @@ class FakeChain implements BatcherChain {
   submitter: Address = SUBMITTER
   failLogs = false
 
-  async submit(batchId: Hex, saves: BatchedSaveWire[]): Promise<{ transactionHash: Hex } | { exists: true }> {
+  async submit(batchId: Hex, saves: BatchedSaveWire[]): Promise<{ transactionHash: Hex; gasUsed: bigint } | { exists: true }> {
     const key = batchId.toLowerCase() as Hex
     if (this.recorded.has(key)) return { exists: true }
     this.submissions.push(batchId)
@@ -300,7 +300,7 @@ class FakeChain implements BatcherChain {
       acceptedCount: anchored.length,
       submitter: this.submitter,
     })
-    return { transactionHash: `0x${"ee".repeat(32)}` as Hex }
+    return { transactionHash: `0x${"ee".repeat(32)}` as Hex, gasUsed: 60_000n * BigInt(saves.length) }
   }
 
   async anchoredLogs(batchId: Hex): Promise<AnchoredLog[]> {

@@ -53,8 +53,12 @@ export interface RejectedLog {
 
 /** Everything the batcher needs from Monad, and nothing more — fakes implement this in tests. */
 export interface BatcherChain {
-  /** Sends submitBatch; { exists: true } means the contract already holds this batchId (BatchExists). */
-  submit(batchId: Hex, saves: BatchedSaveWire[]): Promise<{ transactionHash: Hex } | { exists: true }>
+  /**
+   * Sends submitBatch; { exists: true } means the contract already holds this batchId
+   * (BatchExists). A real send reports the receipt's gasUsed — the measurement the batcher
+   * re-sizes the next take from. { exists: true } carries no receipt, so it carries no number.
+   */
+  submit(batchId: Hex, saves: BatchedSaveWire[]): Promise<{ transactionHash: Hex; gasUsed: bigint } | { exists: true }>
   anchoredLogs(batchId: Hex): Promise<AnchoredLog[]>
   rejectedLogs(batchId: Hex): Promise<RejectedLog[]>
   /** The BatchAnchored event for this batchId — who submitted it and how it split; null if none. */
@@ -365,7 +369,7 @@ export class Batcher {
       this.#log?.({ event: "batch.journal-failed", batchId, error: String(error) })
       throw error
     }
-    let result: { transactionHash: Hex } | { exists: true }
+    let result: { transactionHash: Hex; gasUsed: bigint } | { exists: true }
     try {
       result = await this.#chain.submit(batchId, taken.map((row) => row.save))
     } catch (error) {
@@ -550,9 +554,9 @@ function leafForRow(log: AnchoredLog, row: BatchSaveRow): Hex {
 
 /**
  * The real chain adapter: viem clients over the deployment's RPC, submitBatch through sendContract.
- * The send runs under the "revoke.agent" ceiling (6M gas) — gas.ts has no batch-submit kind and was
- * outside this task's file list; at the measured ~90k gas per accepted save a batch of 60 still
- * fits, so the wiring caps batches below that rather than weaken the ceiling rule.
+ * The send runs under the "batch.submit" ceiling (28M gas) — sized under Monad's 30M
+ * per-transaction limit rather than the 6M "revoke.agent" ceiling a batch used to borrow — and
+ * reports the receipt's gasUsed so the batcher can size the next take from the real per-save cost.
  */
 export function createBatcherChain(input: { rpcUrl: string; deployment: Deployment; account: LocalAccount }): BatcherChain {
   const { deployment } = input
@@ -597,9 +601,9 @@ export function createBatcherChain(input: { rpcUrl: string; deployment: Deployme
         const receipt = await sendContract(
           context,
           { address: batchAnchor, abi: batchAnchorAbi, functionName: "submitBatch", args: [batchId, signed] },
-          "revoke.agent",
+          "batch.submit",
         )
-        return { transactionHash: receipt.transactionHash }
+        return { transactionHash: receipt.transactionHash, gasUsed: receipt.gasUsed }
       } catch (error) {
         // BatchExists is the crash-recovery path: the earlier send did land. Anything else is a real
         // failure and must stay one — misclassifying it would strand the rows as SUBMITTED.

@@ -267,13 +267,18 @@ class FakeChain implements BatcherChain {
   rejectWith: (wire: BatchedSaveWire, index: number) => number | null = () => null
   /** Return an error to throw before recording — sees the saves, so a test can refuse by batch size. */
   failSubmit: ((saves: BatchedSaveWire[]) => Error | null) | null = null
+  /**
+   * The gasUsed the receipt reports — the measurement the batcher re-sizes its next take from.
+   * Default is a flat 60k per save, near the sweep's ~61k asymptote for large batches.
+   */
+  gasUsedFor: (saves: BatchedSaveWire[]) => bigint = (saves) => 60_000n * BigInt(saves.length)
   /** Throw after recording: the send landed but its answer was lost. */
   afterRecord: (() => void) | null = null
   failLogs = false
   rootOverride: Hex | null = null
   tamperField: "lineageId" | null = null
 
-  async submit(batchId: Hex, saves: BatchedSaveWire[]): Promise<{ transactionHash: Hex } | { exists: true }> {
+  async submit(batchId: Hex, saves: BatchedSaveWire[]): Promise<{ transactionHash: Hex; gasUsed: bigint } | { exists: true }> {
     this.attempts++
     this.submitTimes.push(this.now())
     const key = batchId.toLowerCase() as Hex
@@ -311,7 +316,7 @@ class FakeChain implements BatcherChain {
       submitter: this.submitter,
     })
     this.afterRecord?.()
-    return { transactionHash: `0x${"ee".repeat(32)}` as Hex }
+    return { transactionHash: `0x${"ee".repeat(32)}` as Hex, gasUsed: this.gasUsedFor(saves) }
   }
 
   async anchoredLogs(batchId: Hex): Promise<AnchoredLog[]> {
