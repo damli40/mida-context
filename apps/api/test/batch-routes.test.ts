@@ -100,6 +100,7 @@ interface ApiFixture {
 const makeApi = (input: {
   enabled?: boolean
   hasAuthority?: (owner: Address, agentId: Hex, namespace: Hex, permission: number, policy: number) => boolean
+  ownerAllowlist?: readonly Address[]
 } = {}): ApiFixture => {
   const dataDir = mkdtempSync(join(tmpdir(), "mida-batch-routes-"))
   const store = new FsBatchStore(dataDir)
@@ -119,6 +120,7 @@ const makeApi = (input: {
       batchAnchor: BATCH_ANCHOR,
       store,
       receiptAccount,
+      ...(input.ownerAllowlist === undefined ? {} : { ownerAllowlist: input.ownerAllowlist }),
       notify: () => {
         counts.notified++
       },
@@ -345,6 +347,36 @@ describe("the /batch/* surface", () => {
     expect(calls).toEqual([PERMISSION.SUPERSEDE_ANY])
     expect(await fixture.store.get(replacement.contextId)).toBeNull()
     expect(fixture.counts.notified).toBe(0)
+  })
+
+  it("an owner allowlist admits only listed owners — unlisted get a plain 403 and nothing queues", async () => {
+    const fixture = makeApi({ ownerAllowlist: [OWNER] })
+    const { client, seen } = watchingClient(fixture.app, agentAccount)
+
+    // A save for the listed owner flows through exactly as before.
+    const admitted = await makeSave(agentAccount, AGENT_ID)
+    expect((await client.postBatchSave(admitted.wire)).state).toBe("QUEUED")
+
+    // A save naming any other owner refuses before crypto, chain reads or a row — with the plain line.
+    const other = await makeSave(agentAccount, AGENT_ID, { owner: `0x${"77".repeat(20)}` as Address })
+    await expect(client.postBatchSave(other.wire)).rejects.toThrowError()
+    expect(seen.at(-1)).toMatchObject({ status: 403, body: { error: { code: "OWNER_NOT_ALLOWED" } } })
+    expect(JSON.stringify(seen.at(-1)!.body)).toContain("not open to owner")
+    expect(await fixture.store.get(other.contextId)).toBeNull()
+    expect(fixture.counts.notified).toBe(1) // only the admitted save ever woke the batcher
+  })
+
+  it("the allowlist matches case-insensitively, and an empty list is no gate at all", async () => {
+    // A checksummed-cased entry still matches the wire's lowercase owner field.
+    const mixed = makeApi({ ownerAllowlist: [`0x${"AA".repeat(20)}` as Address] })
+    const mixedClient = clientFor(mixed.app, agentAccount)
+    const lowerOwner = await makeSave(agentAccount, AGENT_ID, { owner: `0x${"aa".repeat(20)}` as Address })
+    expect((await mixedClient.postBatchSave(lowerOwner.wire)).state).toBe("QUEUED")
+
+    const open = makeApi({ ownerAllowlist: [] })
+    const openClient = clientFor(open.app, agentAccount)
+    const anyone = await makeSave(agentAccount, AGENT_ID, { owner: `0x${"78".repeat(20)}` as Address })
+    expect((await openClient.postBatchSave(anyone.wire)).state).toBe("QUEUED")
   })
 
   it("POSTs answer 503 BATCHING_DISABLED while the kill switch is off, and status says so", async () => {

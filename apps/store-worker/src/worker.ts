@@ -48,6 +48,8 @@ export interface WorkerEnv {
   BATCHING_ENABLED?: string
   BATCHER_PRIVATE_KEY?: string
   RECEIPT_PRIVATE_KEY?: string
+  /** Trial gate: comma-separated owner addresses the enabled lane admits (case-insensitive). */
+  BATCH_OWNER_ALLOWLIST?: string
   /** The block BatchAnchor was deployed in — the floor for its historical log scans. */
   BATCH_ANCHOR_BLOCK?: string
   BATCH_COORDINATOR?: DurableObjectNamespaceLike
@@ -161,6 +163,7 @@ function batchingOptions(env: WorkerEnv, deployment: Deployment, publicClient: P
   }
   let receiptAccount: LocalAccount | undefined
   let verifyAnchor: (() => Promise<void>) | undefined
+  let ownerAllowlist: Address[] | undefined
   if (enabled) {
     if (env.BATCH_COORDINATOR === undefined) {
       throw new Error("BATCHING_ENABLED=true requires the BATCH_COORDINATOR Durable Object binding")
@@ -189,6 +192,19 @@ function batchingOptions(env: WorkerEnv, deployment: Deployment, publicClient: P
       })()
       return verdict
     }
+    // The trial gate is read only while the lane is on — a stale value beside BATCHING_ENABLED=false
+    // stays inert rather than failing a boot that never asks it anything. Entries may be
+    // mixed-case; the wire's owner field is lowercase, so the list is normalized to match.
+    const rawList = env.BATCH_OWNER_ALLOWLIST
+    if (typeof rawList === "string" && rawList.trim() !== "") {
+      const entries = rawList.split(",").map((entry) => entry.trim()).filter((entry) => entry !== "")
+      if (entries.length > 0) {
+        if (!entries.every((entry) => /^0x[0-9a-fA-F]{40}$/.test(entry))) {
+          throw new Error("environment variable BATCH_OWNER_ALLOWLIST must be a comma-separated list of 0x-prefixed 20-byte addresses")
+        }
+        ownerAllowlist = entries.map((entry) => entry.toLowerCase() as Address)
+      }
+    }
   }
   const coordinator = (): { fetch(input: string | Request, init?: RequestInit): Promise<Response> } | undefined => {
     const namespace = env.BATCH_COORDINATOR
@@ -200,6 +216,7 @@ function batchingOptions(env: WorkerEnv, deployment: Deployment, publicClient: P
     store: new D1BatchStore(env.DB),
     ...(receiptAccount === undefined ? {} : { receiptAccount }),
     ...(verifyAnchor === undefined ? {} : { verifyAnchor }),
+    ...(ownerAllowlist === undefined ? {} : { ownerAllowlist }),
     notify: () => {
       background(coordinator()?.fetch("https://batcher.internal/notify", { method: "POST" }))
     },

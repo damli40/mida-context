@@ -68,6 +68,9 @@ BATCH_ANCHOR = "0xREPLACE_WITH_BATCH_ANCHOR_ADDRESS"
 # resolution never scans below its own block). Take it from the anchor's deploy transaction.
 BATCH_ANCHOR_BLOCK = "REPLACE_WITH_BATCH_ANCHOR_BLOCK"
 BATCHING_ENABLED = "false"
+# Optional trial gate: comma-separated owner addresses (any case) that the enabled lane will
+# admit to POST /batch/saves — every other owner gets a plain 403. Empty or absent means open.
+#BATCH_OWNER_ALLOWLIST = "0xOWNER_ONE,0xOWNER_TWO"
 
 # Secrets (wrangler secret put …):
 #   RPC_URL              — a URL, may carry an API key

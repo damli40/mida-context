@@ -17,7 +17,7 @@ import { Miniflare } from "miniflare"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import { decodeFunctionData, encodeErrorResult, encodeFunctionResult, zeroHash } from "viem"
 import type { Abi, LocalAccount } from "viem"
-import { OWNER_AUTHOR_ID, PERMISSION, contextId as deriveContextId, namespaceId } from "@mida/protocol"
+import { CONTEXT_KIND, OWNER_AUTHOR_ID, PERMISSION, PROVENANCE_SOURCE, contextId as deriveContextId, namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { hexOf, manifestHash } from "@mida/crypto"
 import { contentHash } from "@mida/storage"
@@ -655,6 +655,67 @@ describe("the worker entry", () => {
     await flaky.client.postBatchSave({} as never).catch(() => {})
     expect(flaky.last()!.status).toBe(400) // back past the gate, judged on the wire
     expect(chain.anchorRegistryReads).toBe(readsBeforeRetry + 1)
+  })
+
+  it("BATCH_OWNER_ALLOWLIST gates admission case-insensitively — and stays inert while the lane is off", async () => {
+    const anchor = "0x1111111111111111111111111111111111111aa5" as Address
+    const coordinator: DurableObjectNamespaceLike = {
+      idFromName: () => "batcher",
+      get: () => ({ fetch: async () => new Response(JSON.stringify({ ok: true })) }),
+    }
+    const laneEnv = (over: Partial<WorkerEnv>): WorkerEnv => ({
+      ...env(db, rpc.url),
+      BATCH_ANCHOR: anchor,
+      BATCHING_ENABLED: "true",
+      BATCHER_PRIVATE_KEY: `0x${"44".repeat(32)}`,
+      RECEIPT_PRIVATE_KEY: `0x${"55".repeat(32)}`,
+      BATCH_COORDINATOR: coordinator,
+      ...over,
+    })
+    // A structurally valid save whose signature is junk: a listed owner gets past the gate and fails
+    // on SIGNER_MISMATCH (400); a blocked owner never reaches crypto — it gets the plain 403.
+    const saveFor = (ownerAddr: string): unknown => ({
+      message: {
+        owner: ownerAddr,
+        namespaceId: NAMESPACE,
+        objectNonce: `0x${"01".repeat(32)}`,
+        lineageId: zeroHash,
+        parentId: zeroHash,
+        parentVersion: 0,
+        rootAuthor: zeroHash,
+        manifestHash: `0x${"02".repeat(32)}`,
+        ciphertextCommitment: `0x${"03".repeat(32)}`,
+        readEpoch: "1",
+        expiresAt: "0",
+        kind: CONTEXT_KIND.EPISODE,
+        provenanceSource: PROVENANCE_SOURCE.AGENT_INFERRED,
+      },
+      signature: `0x${"11".repeat(65)}`,
+      manifest: upload(randomBytes(8)).manifest,
+      ciphertext: "0x12",
+    })
+    const listedLower = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    const blocked = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    // Listed in upper case; the wire's owner is lowercase — the match is case-insensitive.
+    const gated = clientForEnv(laneEnv({ BATCH_OWNER_ALLOWLIST: `0x${"AA".repeat(20)}, 0x${"cC".repeat(20)}` }), ownerAccount)
+    await gated.client.postBatchSave(saveFor(listedLower) as never).catch(() => {})
+    expect(gated.last()!.status).toBe(400) // past the gate — judged on the (junk) signature
+    await gated.client.postBatchSave(saveFor(blocked) as never).catch(() => {})
+    expect(gated.last()).toMatchObject({ status: 403, body: { error: { code: "OWNER_NOT_ALLOWED" } } })
+
+    // An empty value is no gate at all.
+    const open = clientForEnv(laneEnv({ BATCH_OWNER_ALLOWLIST: "" }), ownerAccount)
+    await open.client.postBatchSave(saveFor(blocked) as never).catch(() => {})
+    expect(open.last()!.status).toBe(400)
+
+    // A malformed entry while enabled is a boot error naming the variable; while disabled it is inert.
+    const broken = laneEnv({ BATCH_OWNER_ALLOWLIST: "not-an-address" })
+    const refused = await handleRequest(broken, new Request("http://worker.test/"))
+    expect(refused.status).toBe(500)
+    expect(JSON.stringify(await refused.json())).toContain("BATCH_OWNER_ALLOWLIST")
+    const inert = await handleRequest(laneEnv({ BATCHING_ENABLED: "false", BATCH_OWNER_ALLOWLIST: "not-an-address" }), new Request("http://worker.test/"))
+    expect(inert.status).toBe(200)
   })
 
   it("the scheduled handler sweeps stale pending uploads and nonces on the real D1", async () => {

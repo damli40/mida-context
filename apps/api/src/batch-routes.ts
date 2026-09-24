@@ -52,6 +52,12 @@ export interface BatchingOptions {
    * request and cached by the implementer. A throw refuses the batch surface with its message.
    */
   verifyAnchor?: () => Promise<void>
+  /**
+   * Trial gate: when present and non-empty, POST /batch/saves admits only saves whose signed
+   * owner is on this list (compared case-insensitively — entries are matched against the
+   * wire's lowercase address). Absent or empty leaves admission exactly as it was.
+   */
+  ownerAllowlist?: readonly Address[]
   /** Wake-up for the batcher, called exactly once per accepted save. */
   notify: () => void
   /** Runs one submission round; invoked by POST /batch/flush after its checks pass. */
@@ -206,6 +212,16 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
     const signer = c.get("signer")
     const reader = c.get("chain")
     const save = parseBatchedSave(json(c.get("body")))
+
+    // The trial gate runs before any crypto or chain work: an owner the allowlist does not name
+    // gets the plain refusal whatever else the save would have failed.
+    if (
+      batching.ownerAllowlist !== undefined &&
+      batching.ownerAllowlist.length > 0 &&
+      !batching.ownerAllowlist.some((listed) => listed.toLowerCase() === save.message.owner.toLowerCase())
+    ) {
+      return reject(c, 403, "OWNER_NOT_ALLOWED", `batched saves on this store are not open to owner ${save.message.owner}`)
+    }
 
     const ciphertextBytes = bytesOf(save.ciphertext, (save.ciphertext.length - 2) / 2)
     if (ciphertextBytes.length > limits.maxCiphertextBytes) {
