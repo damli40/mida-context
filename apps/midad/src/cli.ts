@@ -20,7 +20,7 @@ import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE, ServiceRuntime } from "./runtime.js"
 import type { Network } from "./runtime.js"
-import { mismatchLine, resolveNetwork } from "./network.js"
+import { ownerCommandNotice, resolveNetwork } from "./network.js"
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
 import { approve, authorNamesFor, deploymentMismatchError, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
@@ -663,6 +663,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
         home: deps.home,
         env,
         print: deps.print,
+        progress: deps.progress ?? ((line) => process.stderr.write(`${line}\n`)),
         now: () => new Date(),
         startService,
         confirm: async (text) => {
@@ -845,8 +846,9 @@ async function main(): Promise<void> {
   // is not already running; the others reuse a live daemon's Context API or start their own.
   if (OWNER_COMMANDS.includes(argv[0] ?? "")) {
     // A setup saved on another contract still works — the saved contract is where its data
-    // lives — but the owner is told, on stderr so the command's stdout keeps its shape.
-    const notice = mismatchLine(resolved)
+    // lives — but the owner is told, on stderr so the command's stdout keeps its shape. The
+    // line is command-aware: migrate hears what it is moving, not "run mida migrate".
+    const notice = ownerCommandNotice(resolved, argv[0] ?? "")
     if (notice !== undefined) process.stderr.write(`${notice}\n`)
     const code = await runCli(argv, { home, network: resolved.network, print, cwd: process.cwd(), resolvedNetwork: resolved, env: process.env })
     if (argv[0] === "init" && code === 0) {

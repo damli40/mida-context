@@ -6,7 +6,7 @@ export type { Network } from "./runtime.js"
 export { cliPackageName, isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
 export type { SiblingEntry } from "./sibling.js"
 export { funderFor, testnetNetwork } from "./testnet.js"
-export { mismatchLine, resolveNetwork, serviceNetwork } from "./network.js"
+export { mismatchLine, ownerCommandNotice, resolveNetwork, serviceNetwork } from "./network.js"
 export type { ResolveDeps, ResolvedNetwork, ServiceSource } from "./network.js"
 export { startPersistentApi } from "./api-server.js"
 export {

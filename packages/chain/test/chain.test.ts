@@ -7,6 +7,7 @@ import {
   LOG_SCAN_CONCURRENCY,
   MAX_LOG_BLOCK_RANGE,
   REVERT_CODES,
+  SAFE_LOG_BLOCK_RANGE,
   blockWindows,
   capabilityRegistryAbi,
   chainFor,
@@ -106,28 +107,31 @@ describe("network configuration", () => {
   })
 })
 
-describe("chunked log scans (≤100 blocks per request)", () => {
-  it("splits an inclusive range into windows of at most 100 blocks", () => {
-    expect(MAX_LOG_BLOCK_RANGE).toBe(100n)
-    expect(blockWindows(0n, 250n)).toEqual([
+describe("chunked log scans (≤1,000 blocks per request, 100 on fallback)", () => {
+  it("splits an inclusive range into windows of the requested size, capped at 1,000", () => {
+    expect(MAX_LOG_BLOCK_RANGE).toBe(1_000n)
+    expect(SAFE_LOG_BLOCK_RANGE).toBe(100n)
+    expect(blockWindows(0n, 250n)).toEqual([{ fromBlock: 0n, toBlock: 250n }])
+    expect(blockWindows(0n, 250n, 100n)).toEqual([
       { fromBlock: 0n, toBlock: 99n },
       { fromBlock: 100n, toBlock: 199n },
       { fromBlock: 200n, toBlock: 250n },
     ])
     expect(blockWindows(7n, 7n)).toEqual([{ fromBlock: 7n, toBlock: 7n }])
     expect(blockWindows(8n, 7n)).toEqual([])
-    expect(() => blockWindows(0n, 10n, 101n)).toThrow()
+    expect(() => blockWindows(0n, 10n, 1_001n)).toThrow()
+    expect(() => blockWindows(0n, 10n, 0n)).toThrow()
   })
 
-  it("never asks the provider for more than 100 blocks", async () => {
+  it("never asks the provider for more than 1,000 blocks", async () => {
     const event = getAbiItem({ abi: capabilityRegistryAbi, name: "AgentRevoked" }) as AbiEvent
     const { client, calls } = recordingClient(1_234n, (call) => [{ args: {}, blockNumber: call.fromBlock, transactionHash: null, logIndex: 0 }])
     const logs = await getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 5n })
-    expect(calls.length).toBe(13)
-    for (const call of calls) expect(call.toBlock - call.fromBlock + 1n).toBeLessThanOrEqual(100n)
+    expect(calls.length).toBe(2)
+    for (const call of calls) expect(call.toBlock - call.fromBlock + 1n).toBeLessThanOrEqual(1_000n)
     expect(calls[0]!.fromBlock).toBe(5n)
     expect(calls.at(-1)!.toBlock).toBe(1_234n)
-    expect(logs).toHaveLength(13)
+    expect(logs).toHaveLength(2)
   })
 })
 
@@ -147,7 +151,7 @@ describe("chunked log scans run a few windows at a time", () => {
         return [{ args: {}, blockNumber: call.fromBlock, transactionHash: null, logIndex: 0 }]
       },
     }
-    const logs = await getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 0n })
+    const logs = await getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 0n }, { maxRange: 100n })
     expect(logs).toHaveLength(30)
     expect(logs.map((entry) => entry.blockNumber)).toEqual(Array.from({ length: 30 }, (_, i) => BigInt(i * 100)))
     expect(peak).toBeLessThanOrEqual(LOG_SCAN_CONCURRENCY)
@@ -162,8 +166,122 @@ describe("chunked log scans run a few windows at a time", () => {
         return []
       },
     }
-    await expect(getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 0n })).rejects.toThrow("window down")
+    await expect(getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 0n }, { maxRange: 100n })).rejects.toThrow("window down")
   }, 10_000)
+})
+
+describe("adaptive log scan windows (range-limit fallback)", () => {
+  const event = getAbiItem({ abi: capabilityRegistryAbi, name: "AgentRevoked" }) as AbiEvent
+  const entry = (call: { fromBlock: bigint }) => ({ args: {}, blockNumber: call.fromBlock, transactionHash: null, logIndex: 0 })
+
+  it("uses 1,000-block windows against a provider that accepts them, covering every block once", async () => {
+    const { client, calls } = recordingClient(2_500n, (call) => [entry(call)])
+    const logs = await getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 5n })
+    expect(calls.map((call) => [call.fromBlock, call.toBlock])).toEqual([
+      [5n, 1_004n],
+      [1_005n, 2_004n],
+      [2_005n, 2_500n],
+    ])
+    expect(logs).toHaveLength(3)
+    expect(logs.map((log) => log.blockNumber)).toEqual([5n, 1_005n, 2_005n])
+  })
+
+  it("a range refusal re-fetches the refused window in 100-block pieces and shrinks the rest of the scan — same logs, no gaps, no duplicates", async () => {
+    const rangeError = () => Object.assign(new Error("eth_getLogs is limited to a 100 range"), { code: -32614 })
+    const refused: Array<{ fromBlock: bigint; toBlock: bigint }> = []
+    const served: Array<{ fromBlock: bigint; toBlock: bigint }> = []
+    const limited = {
+      getBlockNumber: async () => 1_234n,
+      getLogs: async (call: { fromBlock: bigint; toBlock: bigint }) => {
+        if (call.toBlock - call.fromBlock + 1n > 100n) {
+          refused.push({ fromBlock: call.fromBlock, toBlock: call.toBlock })
+          throw rangeError()
+        }
+        served.push({ fromBlock: call.fromBlock, toBlock: call.toBlock })
+        return [entry(call)]
+      },
+    }
+    const adaptive = await getLogsChunked(limited, { address: deployment.capabilityRegistry, event, fromBlock: 5n })
+
+    const { client: baselineClient } = recordingClient(1_234n, (call) => [entry(call)])
+    const baseline = await getLogsChunked(baselineClient, { address: deployment.capabilityRegistry, event, fromBlock: 5n }, { maxRange: 100n })
+    expect(adaptive).toEqual(baseline)
+
+    // a range refusal is never retried: at most the two starting 1,000-block windows saw one
+    expect(refused.length).toBeGreaterThanOrEqual(1)
+    expect(refused.length).toBeLessThanOrEqual(2)
+    for (const call of refused) expect(call.toBlock - call.fromBlock + 1n).toBeGreaterThan(100n)
+    // the served ranges tile [5, 1234] exactly — a hole could hide a revocation, a duplicate lies
+    const covered = new Set<bigint>()
+    for (const call of served) {
+      expect(call.toBlock - call.fromBlock + 1n).toBeLessThanOrEqual(100n)
+      for (let block = call.fromBlock; block <= call.toBlock; block++) {
+        expect(covered.has(block)).toBe(false)
+        covered.add(block)
+      }
+    }
+    for (let block = 5n; block <= 1_234n; block++) expect(covered.has(block)).toBe(true)
+  })
+
+  it("an HTTP 413 without a matching message counts as a range refusal too", async () => {
+    const served: Array<{ fromBlock: bigint; toBlock: bigint }> = []
+    const client = {
+      getBlockNumber: async () => 250n,
+      getLogs: async (call: { fromBlock: bigint; toBlock: bigint }) => {
+        if (call.toBlock - call.fromBlock + 1n > 100n) {
+          throw Object.assign(new Error("request entity too large"), { status: 413 })
+        }
+        served.push({ fromBlock: call.fromBlock, toBlock: call.toBlock })
+        return [entry(call)]
+      },
+    }
+    const logs = await getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 0n })
+    expect(logs).toHaveLength(3)
+    expect(served.map((call) => [call.fromBlock, call.toBlock])).toEqual([
+      [0n, 99n],
+      [100n, 199n],
+      [200n, 250n],
+    ])
+  })
+
+  it("a non-range error still fails the scan after 3 attempts", async () => {
+    let attempts = 0
+    const client = {
+      getBlockNumber: async () => 499n,
+      getLogs: async (call: { fromBlock: bigint }) => {
+        if (call.fromBlock === 0n) {
+          attempts += 1
+          throw new Error("window down")
+        }
+        return []
+      },
+    }
+    await expect(getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 0n }, { maxRange: 100n })).rejects.toThrow("window down")
+    expect(attempts).toBe(3)
+  }, 10_000)
+
+  it("clamps an out-of-range maxRange to 1..1,000 instead of failing; blockWindows still validates", async () => {
+    const { client, calls } = recordingClient(4n, () => [])
+    await getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 0n, toBlock: 4n }, { maxRange: 5_000n })
+    expect(calls.map((call) => [call.fromBlock, call.toBlock])).toEqual([[0n, 4n]])
+    calls.length = 0
+    await getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 0n, toBlock: 4n }, { maxRange: 0n })
+    expect(calls).toHaveLength(5)
+    expect(() => blockWindows(0n, 10n, 1_001n)).toThrow()
+  })
+
+  it("reports progress in about-5% steps and always ends at (total, total)", async () => {
+    const { client } = recordingClient(2_500n, () => [])
+    const seen: Array<[number, number]> = []
+    await getLogsChunked(client, { address: deployment.capabilityRegistry, event, fromBlock: 5n }, { onProgress: (done, total) => seen.push([done, total]) })
+    expect(seen.at(-1)).toEqual([3, 3])
+    let last = 0
+    for (const [done, total] of seen) {
+      expect(done).toBeGreaterThan(last)
+      expect(done).toBeLessThanOrEqual(total)
+      last = done
+    }
+  })
 })
 
 describe("owner history (§14.6 PREVIOUSLY_REVOKED)", () => {
@@ -308,7 +426,7 @@ describe("the history scan cursor (R4-9)", () => {
       return []
     })
     const { cursor, writes } = memoryCursor(undefined)
-    await expect(ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })).rejects.toThrow("window down")
+    await expect(ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor, maxRange: 100n })).rejects.toThrow("window down")
     expect(calls.length).toBeGreaterThan(0)
     expect(writes).toHaveLength(0)
   }, 15_000)

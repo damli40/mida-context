@@ -1,6 +1,6 @@
 import { createPublicClient, http } from "viem"
 import { monadTestnet } from "viem/chains"
-import { MONAD_TESTNET_CHAIN_ID, chainFor, loadDeployment, parseDeployment } from "@mida/chain"
+import { MAX_LOG_BLOCK_RANGE, MONAD_TESTNET_CHAIN_ID, chainFor, loadDeployment, parseDeployment } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import type { MidaHome } from "./home.js"
 import type { Network } from "./runtime.js"
@@ -54,6 +54,17 @@ function codedError(code: string, message: string): Error {
 /** An env value that is present but empty counts as unset, everywhere this rule reads one. */
 function unset(value: string | undefined): value is undefined | "" {
   return value === undefined || value === ""
+}
+
+/**
+ * MIDA_LOG_BLOCK_RANGE: the eth_getLogs window a history scan opens with — an integer
+ * 1..MAX_LOG_BLOCK_RANGE. Anything else (missing, empty, non-numeric, out of range) is ignored
+ * and the library default stands; a bad value must never crash a command.
+ */
+function parseLogBlockRange(raw: string | undefined): bigint | undefined {
+  if (unset(raw) || !/^\d+$/.test(raw)) return undefined
+  const value = BigInt(raw)
+  return value >= 1n && value <= MAX_LOG_BLOCK_RANGE ? value : undefined
 }
 
 /** "Same contract" = same chainId and the same two registry addresses, compared lowercase. */
@@ -155,12 +166,14 @@ export async function resolveNetwork(
   }
 
   const fund = funderFor(env, rpcUrl, deployment)
+  const logBlockRange = parseLogBlockRange(env.MIDA_LOG_BLOCK_RANGE)
   const network: Network = {
     rpcUrl,
     deployment,
     ...(fund === undefined ? {} : { fund }),
     ...(storage.url === undefined ? {} : { storageUrl: storage.url }),
     ...(sponsor.url === undefined ? {} : { sponsorUrl: sponsor.url }),
+    ...(logBlockRange === undefined ? {} : { logBlockRange }),
   }
   const mismatch =
     saved !== undefined && !sameContract(saved.deployment, builtIn)
@@ -177,11 +190,25 @@ export async function resolveNetwork(
   }
 }
 
+const shortAddress = (a: string): string => `${a.slice(0, 6)}…`
+
 /** One line for owner commands and doctor, or undefined when there is no mismatch. */
 export function mismatchLine(resolved: ResolvedNetwork): string | undefined {
   if (resolved.mismatch === undefined) return undefined
-  const short = (a: string) => `${a.slice(0, 6)}…`
-  return `this setup is on contract ${short(resolved.mismatch.saved)}; this version of Mida ships ${short(resolved.mismatch.builtIn)} — run \`mida migrate\` to move`
+  return `this setup is on contract ${shortAddress(resolved.mismatch.saved)}; this version of Mida ships ${shortAddress(resolved.mismatch.builtIn)} — run \`mida migrate\` to move`
+}
+
+/**
+ * The stderr line an owner command prints when the saved setup sits on another contract than
+ * this build ships. `migrate` IS the move, so it hears what it is about to do — "run mida
+ * migrate" would tell the owner to run the command they are already running.
+ */
+export function ownerCommandNotice(resolved: ResolvedNetwork, command: string): string | undefined {
+  if (resolved.mismatch === undefined) return undefined
+  if (command === "migrate") {
+    return `moving this setup from contract ${shortAddress(resolved.mismatch.saved)} to ${shortAddress(resolved.mismatch.builtIn)}`
+  }
+  return mismatchLine(resolved)
 }
 
 /**

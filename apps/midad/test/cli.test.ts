@@ -5,8 +5,8 @@ import { join } from "node:path"
 import { BaseError } from "viem"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, loadAgentIdentity, runCli, runCliWithRuntime } from "@mida/midad"
-import type { Network, ServiceRuntime } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, loadAgentIdentity, ownerCommandNotice, runCli, runCliWithRuntime } from "@mida/midad"
+import type { Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 
 describe("the crude mida command", () => {
   let env: ScenarioEnvironment
@@ -341,6 +341,26 @@ describe("the crude mida command", () => {
     expect(code).toBe(1)
     expect(out.join("\n").toLowerCase()).toContain("backup")
   }, 300_000)
+
+  it("a mismatched setup tells migrate what it is moving — never 'run mida migrate' — while other commands keep the old notice", () => {
+    const resolved = {
+      network: {}, saved: true, contractSource: "network.json", builtIn: {},
+      mismatch: {
+        saved: "0xaaaa00000000000000000000000000000000aa",
+        builtIn: "0xbbbb00000000000000000000000000000000bb",
+      },
+      storage: { url: undefined, source: "local" },
+      sponsor: { url: undefined, source: "local" },
+    } as unknown as ResolvedNetwork
+    const move = ownerCommandNotice(resolved, "migrate")
+    expect(move).toBe("moving this setup from contract 0xaaaa… to 0xbbbb…")
+    expect(move).not.toContain("mida migrate")
+    // every other owner command still hears the pointer to migrate
+    const other = ownerCommandNotice(resolved, "approve")
+    expect(other).toContain("run `mida migrate`")
+    // and a setup that matches the built-in contract hears nothing at all
+    expect(ownerCommandNotice({ ...resolved, mismatch: undefined } as ResolvedNetwork, "migrate")).toBeUndefined()
+  })
 
   it("never prints a secret: no output line contains any key stored in the home folder", () => {
     const secrets: string[] = []

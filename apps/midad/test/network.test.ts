@@ -155,7 +155,7 @@ describe("resolveNetwork — the contract, the mismatch and the conflict", () =>
       builtIn: Y.capabilityRegistry.toLowerCase(),
     })
     expect(mismatchLine(resolved)).toBe(
-      "this setup is on contract 0xf07d…; this version of Mida ships 0xabbd… — run `mida migrate` to move",
+      `this setup is on contract ${X.capabilityRegistry.slice(0, 6)}…; this version of Mida ships ${Y.capabilityRegistry.slice(0, 6)}… — run \`mida migrate\` to move`,
     )
   })
 
@@ -186,8 +186,8 @@ describe("resolveNetwork — the contract, the mismatch and the conflict", () =>
       (caught: unknown) => caught,
     )
     expect(error).toMatchObject({ code: "deployment-conflict" })
-    expect((error as Error).message).toContain("0xf07d24")
-    expect((error as Error).message).toContain("0xabbd06")
+    expect((error as Error).message).toContain(X.capabilityRegistry.slice(0, 8))
+    expect((error as Error).message).toContain(Y.capabilityRegistry.slice(0, 8))
   })
 })
 

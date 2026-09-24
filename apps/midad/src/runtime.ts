@@ -33,6 +33,12 @@ export interface Network {
    * `bad-sponsor-url` error raised before the lock or any chain call is touched.
    */
   sponsorUrl?: string
+  /**
+   * The eth_getLogs window a history scan opens with (MIDA_LOG_BLOCK_RANGE, an integer
+   * 1..1,000). Absent means the library default — the provider's answer, not this value, has the
+   * final say: a refused window drops the scan to 100-block pieces.
+   */
+  logBlockRange?: bigint
 }
 
 export const NAMESPACE = "projects.current"
@@ -437,7 +443,7 @@ export class Runtime extends ServiceRuntime {
       const secrets = loadOrCreateOwnerSecrets(home)
       const ownerAccount = privateKeyToAccount(secrets.privateKey)
       // An owner has no history before it existed. On a live chain the contract may have been deployed hundreds of
-      // thousands of blocks ago, and ownerHistory would scan all of it in 100-block windows on every approveGrant.
+      // thousands of blocks ago, and ownerHistory would scan all of it on every approveGrant.
       // The first open on this chain therefore records a start block and only the owner's own context scans from
       // it. The head-minus-margin shortcut is valid only for a brand-new owner: if this owner already sent any
       // transaction on this chain, its history could reach back to deploymentBlock, so that is the start.

@@ -117,6 +117,24 @@ export interface MigrateDeps {
   throwAfterSend?: { kind: "agent" | "record"; nth: number }
   /** starts the local service once the switch (or an undo restore) has landed — the CLI injects the real spawn */
   startService?: () => unknown | Promise<unknown>
+  /**
+   * One plain line during a slow step — the chain scans and the sends. The CLI writes these to
+   * stderr so the command's stdout keeps its shape; tests inject a collector.
+   */
+  progress?: (line: string) => void
+}
+
+/**
+ * The stderr narration for one long chain scan: a line about every 5%, prefixed by what is being
+ * read. `total` is a plan, not a promise — a provider that refuses the window size splits the
+ * rest into smaller pieces and the real request count grows past it, so the line says "about".
+ */
+function scanReport(what: string, progress: ((line: string) => void) | undefined): ((done: number, total: number) => void) | undefined {
+  if (progress === undefined) return undefined
+  return (done, total) =>
+    progress(
+      `reading ${what} history: ${total === 0 ? 100 : Math.floor((done * 100) / total)}% (${done.toLocaleString("en-US")} of about ${total.toLocaleString("en-US")} requests)`,
+    )
 }
 
 interface MigrateState {
@@ -378,6 +396,7 @@ async function storeUnreadableManifest(
   sourceNetwork: Network,
   source: Deployment,
   target: Deployment,
+  onProgress?: (done: number, total: number) => void,
 ): Promise<Manifest> {
   const owner = loadOwnerAddress(home)
   if (owner === undefined) throw new Error("owner-address.json is missing — run `mida init` first")
@@ -387,7 +406,7 @@ async function storeUnreadableManifest(
     event: CONTEXT_REGISTERED,
     args: { owner },
     fromBlock: source.deploymentBlock,
-  })
+  }, { maxRange: sourceNetwork.logBlockRange, onProgress })
   const names = authorNamesOf(home)
   const seen = new Set<string>()
   const entries: ManifestEntry[] = []
@@ -557,6 +576,7 @@ export async function migrate(
     if (stagingRuntime === undefined) {
       const stagingNetwork = await resolveNetwork(staging(), env, { loadBuiltIn: () => target })
       stagingRuntime = await Runtime.open(staging(), stagingNetwork.network)
+      stagingRuntime.progress = deps.progress
     }
     return stagingRuntime
   }
@@ -568,8 +588,11 @@ export async function migrate(
   const sourceRecord = async (sourceId: Hex): Promise<SourceRecord> => {
     if (sourceRecords === undefined) {
       const runtime = await Runtime.open(home, sourceNetwork)
+      runtime.progress = deps.progress
       try {
-        sourceRecords = new Map((await readOwnerUniverse(runtime)).map((record) => [record.contextId.toLowerCase(), record]))
+        sourceRecords = new Map(
+          (await readOwnerUniverse(runtime, { onProgress: scanReport("records", deps.progress) })).map((record) => [record.contextId.toLowerCase(), record]),
+        )
       } finally {
         await runtime.close()
       }
@@ -588,13 +611,14 @@ export async function migrate(
         // The store cannot serve the records — enumerate the chain logs so every record is still
         // listed, as skipped:store-unreadable. Fingerprints need plaintext, so they stay zero.
         hmacKey = hexOf(randomBytes(32))
-        manifest = await storeUnreadableManifest(home, sourceNetwork, source, target)
+        manifest = await storeUnreadableManifest(home, sourceNetwork, source, target, scanReport("records", deps.progress))
       } else {
         const runtime = await Runtime.open(home, sourceNetwork)
+        runtime.progress = deps.progress
         try {
           let records: SourceRecord[]
           try {
-            records = await readOwnerUniverse(runtime)
+            records = await readOwnerUniverse(runtime, { onProgress: scanReport("records", deps.progress) })
           } catch (error) {
             if ((error as { code?: unknown }).code === "owner-read-incomplete") {
               return refuse((error as Error).message)
@@ -1122,7 +1146,7 @@ export async function migrate(
         event: CONTEXT_REGISTERED,
         args: { owner: runtime.owner },
         fromBlock: target.deploymentBlock,
-      })
+      }, { maxRange: runtime.network.logBlockRange, onProgress: scanReport("records", deps.progress) })
       for (const log of targetLogs) {
         const id = (log.args as { contextId: Hex }).contextId.toLowerCase()
         if (!targetIds.has(id)) failures.push(`extra record ${id}`)

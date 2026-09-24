@@ -3,7 +3,7 @@ import { getAbiItem } from "viem"
 import type { AbiEvent } from "viem"
 import { capabilityRegistryAbi } from "./abis.js"
 import type { Deployment } from "./deployment.js"
-import { blockWindows, getLogsChunked } from "./logs.js"
+import { blockWindows, clampLogRange, getLogsChunked } from "./logs.js"
 import type { LogClient } from "./logs.js"
 
 const CAPABILITY_REVOKED = getAbiItem({ abi: capabilityRegistryAbi, name: "CapabilityRevoked" }) as AbiEvent
@@ -40,8 +40,12 @@ export async function ownerHistory(input: {
   agentId: Hex
   toBlock?: bigint
   cursor?: HistoryScanCursor
-  /** Called once, before the log scan starts, with the number of requests it will take. */
+  /** The window size the scan opens with — the CLI passes the resolved MIDA_LOG_BLOCK_RANGE. */
+  maxRange?: bigint
+  /** Called once, before the log scan starts, with an ESTIMATE of the requests it will take. */
   onScan?: (requests: number) => void
+  /** Live progress for each log scan — (completed, planned) requests; planned is the same estimate. */
+  onProgress?: (done: number, total: number) => void
 }): Promise<OwnerAgentHistory> {
   const toBlock = input.toBlock ?? (await input.client.getBlockNumber())
   // Ask the contract before scanning anything. `agentEpoch(owner, agentId)` starts at 0, every
@@ -85,10 +89,13 @@ export async function ownerHistory(input: {
       ? cursor.observedThroughBlock + 1n
       : input.deployment.deploymentBlock
   const filter = { owner: input.owner, agentId: input.agentId }
-  input.onScan?.(blockWindows(fromBlock, toBlock).length)
+  // The estimate counts one request per window at the size the scan opens with — a range refusal
+  // splits the rest into smaller pieces, so the real count can grow past it.
+  const maxRange = clampLogRange(input.maxRange)
+  input.onScan?.(blockWindows(fromBlock, toBlock, maxRange).length)
   const logs = [
-    ...(await getLogsChunked(input.client, { address: input.deployment.capabilityRegistry, fromBlock, toBlock, event: CAPABILITY_REVOKED, args: filter })),
-    ...(agentLevelRevokePossible ? await getLogsChunked(input.client, { address: input.deployment.capabilityRegistry, fromBlock, toBlock, event: AGENT_REVOKED, args: filter }) : []),
+    ...(await getLogsChunked(input.client, { address: input.deployment.capabilityRegistry, fromBlock, toBlock, event: CAPABILITY_REVOKED, args: filter }, { maxRange, onProgress: input.onProgress })),
+    ...(agentLevelRevokePossible ? await getLogsChunked(input.client, { address: input.deployment.capabilityRegistry, fromBlock, toBlock, event: AGENT_REVOKED, args: filter }, { maxRange, onProgress: input.onProgress }) : []),
   ]
   const previouslyRevoked = logs.some((log) => same(log.args.owner, input.owner) && same(log.args.agentId, input.agentId))
   // Only a complete scan may move the cursor — a failed window threw above, so what is saved here

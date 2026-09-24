@@ -347,7 +347,13 @@ async function grantAdviceFor(runtime: Runtime, name: string, request: AccessReq
     owner: runtime.owner,
     agentId: request.agentId,
     cursor: historyCursor(runtime.home, request.agentId, runtime.network.deployment.chainId, runtime.network.deployment.capabilityRegistry),
-    onScan: (requests) => runtime.progress?.(`checking ${name}'s history on the chain (${requests} requests)…`),
+    maxRange: runtime.network.logBlockRange,
+    // an estimate: a provider that refuses the window size splits the rest into smaller requests
+    onScan: (requests) => runtime.progress?.(`checking ${name}'s history on the chain (about ${requests} requests)…`),
+    onProgress: (done, total) =>
+      runtime.progress?.(
+        `reading ${name}'s revocations history: ${total === 0 ? 100 : Math.floor((done * 100) / total)}% (${done.toLocaleString("en-US")} of about ${total.toLocaleString("en-US")} requests)`,
+      ),
   })
   const now = await latestTimestamp(runtime.ownerChain)
   return adviseGrant({ request, manifest, agentRecord, ownerHistory: history, now })

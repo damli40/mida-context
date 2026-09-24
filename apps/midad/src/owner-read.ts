@@ -72,7 +72,10 @@ const CONTEXT_REGISTERED = contextRegistryAbi.find(
  * contextIds rather than silently shortening the universe. An owner with no records returns [].
  * Nothing is written anywhere.
  */
-export async function readOwnerUniverse(runtime: Runtime): Promise<SourceRecord[]> {
+export async function readOwnerUniverse(
+  runtime: Runtime,
+  options?: { onProgress?: (done: number, total: number) => void },
+): Promise<SourceRecord[]> {
   const { deployment } = runtime.network
   const logs = await getLogsChunked(runtime.ownerChain.publicClient, {
     address: deployment.contextRegistry,
@@ -81,7 +84,7 @@ export async function readOwnerUniverse(runtime: Runtime): Promise<SourceRecord[
     // The home's recorded first block (loadOwnerStartBlock, resolved at Runtime.open); a brand-new
     // owner's record cannot predate it, and the value never sits below the deployment block.
     fromBlock: runtime.ownerStartBlock,
-  })
+  }, { maxRange: runtime.network.logBlockRange, onProgress: options?.onProgress })
   if (logs.length === 0) return []
 
   // The chain-side universe, in registration order: every contextId the log attributes to this
