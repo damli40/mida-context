@@ -986,6 +986,12 @@ export async function migrate(
       if (identity !== undefined) runtime.attach(identity)
     }
     const byId = new Map(manifest.entries.map((entry) => [entry.sourceId.toLowerCase(), entry]))
+    // The same sponsor probe the earlier steps run, computed once before the loop: a reachable
+    // sponsor pays for every send below, and only a self-paid run tops wallets up. Agent write
+    // contexts carry no `beforeSend` balance guard — the agents step funds each wallet once, so a
+    // multi-record replay drains it and a resume that skips that step dies on the empty wallet.
+    const sponsorUrl = parseSponsorUrl(runtime.network.sponsorUrl)
+    const sponsorUp = sponsorUrl !== undefined && (await sponsorReachable(sponsorUrl))
     for (const entry of replayOrder(manifest)) {
       if (entry.status.startsWith("skipped:") || entry.status === "sent" || entry.status === "verified") continue
       const sealedPath = `migrate/sealed/${entry.sourceId}.json`
@@ -1051,7 +1057,20 @@ export async function migrate(
       if (entry.authorName === "owner") {
         await runtime.vault.sendOwnerSealed(sealed as OwnerSealedRecord)
       } else {
-        await runtime.agent(entry.authorName!).sendSealed(runtime.owner, sealed)
+        const name = entry.authorName!
+        // Before EVERY send, not once per agent: ensureFunded only acts below MIN_BALANCE_WEI,
+        // so this costs one balance read per record and covers the wallet the agents step's
+        // single top-up (or a resume past it) left dry.
+        if (!sponsorUp) {
+          const identity = loadAgentIdentity(stagingHome, name)
+          if (identity !== undefined) {
+            await runtime.ensureFunded(
+              privateKeyToAccount(identity.signerPrivateKey).address,
+              `${name}'s wallet`,
+            )
+          }
+        }
+        await runtime.agent(name).sendSealed(runtime.owner, sealed)
       }
       sendCrash("record")
       // VERIFY — the record the chain holds is the one the nonce predicted.

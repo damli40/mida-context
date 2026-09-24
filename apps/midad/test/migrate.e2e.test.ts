@@ -1,5 +1,6 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { spawnSync } from "node:child_process"
+import { createServer } from "node:http"
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -9,7 +10,7 @@ import type { AbiEvent, PublicClient } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { canonicalBytes } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { capabilityRegistryAbi, chainFor, contextRegistryAbi, deployLocal, getLogsChunked } from "@mida/chain"
+import { capabilityRegistryAbi, chainFor, contextRegistryAbi, deployLocal, fundLocal, getLogsChunked } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import { RegistryReader } from "@mida/api"
 import { localEnvironment } from "@mida/cli"
@@ -28,6 +29,7 @@ import {
   drainOnce,
   init,
   listJobs,
+  loadAgentIdentity,
   loadOrCreateOperatorSecrets,
   loadOwnerAddress,
   migrate,
@@ -35,6 +37,8 @@ import {
   readOwnerFacts,
   readOwnerUniverse,
   requestAccess,
+  revoke,
+  saveCheckpoint,
   wrapCheckpoint,
 } from "@mida/midad"
 import type { HandoffResult, Manifest, MigrateDeps, MigrationEnvelope, OwnerFact, SourceRecord } from "@mida/midad"
@@ -725,6 +729,117 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
       expect(await targetRecords(seeded.owner)).toHaveLength(11)
       const manifest = stateManifest(seeded.home)
       expect(manifest.entries.filter((entry) => entry.status === "verified")).toHaveLength(11)
+    },
+    TIMEOUT,
+  )
+
+  // ── Sep 24 fix: a self-paid agent wallet is topped up before each record it replays ──────────
+  // The real failure: claude-code's wallet was funded once in the agents step, then a dozen
+  // replays drained it and the records step died on `Signer had insufficient balance` — forever,
+  // because a resume skips the agents step. These three tests pin the records-step guard.
+
+  it(
+    "an agent wallet drained mid-replay is topped up before EACH of its remaining records",
+    async () => {
+      const seeded = await seedHome()
+      // A second agent-authored record: re-approve the seed agent, write one more checkpoint,
+      // re-revoke — the replay grant then has to carry both sends from the same wallet.
+      const writer = await Runtime.open(seeded.home, { rpcUrl: env.rpcUrl, deployment: source, fund: env.fund })
+      try {
+        await requestAccess(writer, "claude-code")
+        await approve(writer, "claude-code")
+        await saveCheckpoint(writer, "claude-code", {
+          projectId: "proj-migrate",
+          sessionId: "s2",
+          continuesSession: null,
+          compiledBy: "test",
+          checkpoint: sampleCheckpoint({ eventId: "cp-migrate-02", objective: "a second record the same agent replays" }),
+        })
+        await revoke(writer, "claude-code")
+      } finally {
+        await writer.close()
+      }
+
+      // Crash after the FIRST record send — replay-order first is the seed checkpoint (its
+      // createdAt predates every owner record's), so its sendSealed already landed on the target.
+      const crashed = await runMigrate(seeded.home, { throwAfterSend: { kind: "record", nth: 1 } })
+      expect(crashed).toEqual({ stopped: true })
+      const manifest = stateManifest(seeded.home)
+      const first = manifest.entries.find((e) => e.sourceId.toLowerCase() === seeded.seed.checkpointId.toLowerCase())!
+      expect(await reader().getRecord(first.targetId!)).not.toBeNull()
+
+      // The Sep 24 shape: the agents step funded the wallet once, the replay drained it.
+      const identity = loadAgentIdentity(new MidaHome(seeded.home.path("migrate/target")), "claude-code")!
+      const agentAddress = privateKeyToAccount(identity.signerPrivateKey).address
+      await fundLocal(env.rpcUrl, agentAddress, 0n)
+      expect(await publicClient.getBalance({ address: agentAddress })).toBe(0n)
+
+      // One funding check per agent-authored COMMIT — the resend of the first record plus the
+      // second record's real send — and without them the drained wallet kills the second send.
+      const funded = vi.spyOn(Runtime.prototype, "ensureFunded")
+      try {
+        const result = await untilDone(seeded.home)
+        expect(result).toMatchObject({ outcome: "moved" })
+        const topUps = funded.mock.calls.filter((call) => call[1] === "claude-code's wallet")
+        expect(topUps).toHaveLength(2)
+      } finally {
+        funded.mockRestore()
+      }
+      await assertConverged(seeded)
+    },
+    TIMEOUT,
+  )
+
+  it(
+    "a resume that begins at the records step re-funds the drained agent wallet instead of dying on it",
+    async () => {
+      const seeded = await seedHome()
+      // stopAfter fires inside the first record's PREPARE — the agents step is finished, so the
+      // resume begins at the records step and the agents-step funding never runs again.
+      const crashed = await runMigrate(seeded.home, { stopAfter: "records" })
+      expect(crashed).toEqual({ stopped: true })
+
+      const identity = loadAgentIdentity(new MidaHome(seeded.home.path("migrate/target")), "claude-code")!
+      const agentAddress = privateKeyToAccount(identity.signerPrivateKey).address
+      await fundLocal(env.rpcUrl, agentAddress, 0n)
+
+      const result = await untilDone(seeded.home)
+      expect(result).toMatchObject({ outcome: "moved" })
+      await assertConverged(seeded)
+    },
+    TIMEOUT,
+  )
+
+  it(
+    "a reachable sponsor pays instead — the records step never calls ensureFunded",
+    async () => {
+      const seeded = await seedHome()
+      // Reachable (GET answers 200) but refusing (POST 500): the reachability probe says the
+      // sponsor is up, so no wallet is topped up; every send falls back to self-pay, which lands
+      // because the seed left the owner, operator and agent wallets funded on the local node.
+      const sponsor = createServer((request, response) => {
+        if (request.method === "GET") {
+          response.setHeader("content-type", "application/json")
+          response.end(JSON.stringify({ name: "mida-gas-sponsor" }))
+          return
+        }
+        response.statusCode = 500
+        response.end("{}")
+      })
+      await new Promise<void>((resolve) => sponsor.listen(0, "127.0.0.1", () => resolve()))
+      const address = sponsor.address()
+      const sponsorUrl = `http://127.0.0.1:${typeof address === "object" && address !== null ? address.port : 0}`
+
+      const funded = vi.spyOn(Runtime.prototype, "ensureFunded")
+      try {
+        const result = await untilDone(seeded.home, { env: { MIDA_SPONSOR_URL: sponsorUrl } })
+        expect(result).toMatchObject({ outcome: "moved" })
+        expect(funded).not.toHaveBeenCalled()
+      } finally {
+        funded.mockRestore()
+        await new Promise<void>((resolve) => sponsor.close(() => resolve()))
+      }
+      await assertConverged(seeded)
     },
     TIMEOUT,
   )
