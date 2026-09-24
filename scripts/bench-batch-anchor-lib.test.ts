@@ -156,9 +156,13 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--price-usd", "cheap"])).toThrow(/--price-usd/)
   })
 
-  it(`refuses --batch above ${MAX_BATCH_SIZE} and says why — the "revoke.agent" gas ceiling`, () => {
-    expect(() => parseArgs(["--price-usd", "1", "--batch", String(MAX_BATCH_SIZE + 1)])).toThrow(/revoke\.agent|ceiling/)
+  it(`refuses --batch above ${MAX_BATCH_SIZE} and says why — Monad's per-transaction gas limit`, () => {
+    expect(() => parseArgs(["--price-usd", "1", "--batch", String(MAX_BATCH_SIZE + 1)])).toThrow(/30,000,000|gas/)
     expect(() => parseArgs(["--price-usd", "1", "--batch", "1024"])).toThrow(new RegExp(String(MAX_BATCH_SIZE)))
+  })
+
+  it("accepts --batch at the cap — 480 is under the 30M wall at the sweep's ~61k gas per save", () => {
+    expect(parseArgs(["--price-usd", "1", "--batch", "480"]).batch).toBe(480)
   })
 
   it("refuses non-positive integers for --saves, --batch and --agents", () => {

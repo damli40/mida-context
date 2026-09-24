@@ -59,10 +59,13 @@ export interface BatchCoordinatorEnv {
 }
 
 /**
- * submitBatch rides the 6M "revoke.agent" gas ceiling (gas.ts has no batch kind). At the measured
- * ~90k gas per accepted save (Task 3: batch_256_per_save = 89,547) sixty leaves real headroom.
+ * The hard upper bound on saves per batch. Monad refuses any transaction over 30,000,000 gas
+ * (docs.monad.xyz gas-pricing), and the Sep 24 testnet sweep measured ~61k gas per save at scale
+ * (docs/evidence/batch-anchor-sweep-2026-09-24.json) — 480 sits under the wall with margin. The
+ * batcher sizes each take by a learned gas budget below this bound; the cap only guards a
+ * measurement that lies.
  */
-const BATCH_CAP = 60
+const BATCH_CAP = 480
 const BATCH_WAIT_MS = 2_000
 const BATCH_MIN_GAP_MS = 1_000
 

@@ -9,13 +9,13 @@
 
 /**
  * The largest batch the runner submits in one transaction. The cap is operational, not a
- * contract limit (BatchAnchor.sol's MAX_BATCH is 1024): the store batcher sends submitBatch
- * under the "revoke.agent" ceiling of 6,000,000 gas — gas.ts has no batch-submit kind — and the
- * measured per-save cost leaves a batch of 60 inside it (see the comment above
- * createBatcherChain in apps/api/src/batcher.ts). A larger --batch is refused rather than
- * weakening the ceiling rule.
+ * contract limit (BatchAnchor.sol's MAX_BATCH is 1024): Monad refuses any transaction over
+ * 30,000,000 gas, and the Sep 24 testnet sweep measured ~61k gas per save at scale
+ * (docs/evidence/batch-anchor-sweep-2026-09-24.json) — 480 sits under the wall with margin. The
+ * store's batcher sizes each batch by a learned gas budget under the same rule; a larger
+ * --batch is refused rather than weakening the limit.
  */
-export const MAX_BATCH_SIZE = 60
+export const MAX_BATCH_SIZE = 480
 
 /** Parsed benchmark command line. `--price-usd` is the only required flag. */
 export interface BenchArgs {
@@ -52,10 +52,10 @@ function positiveInt(raw: string, flag: string): number {
 /**
  * Parses `--saves --batch --agents --price-usd --store`. `--price-usd` is required: the evidence
  * ties every wei number to a stated MON price and date, and a benchmark that silently picked a
- * price would produce cost numbers nobody can defend. `--batch` above 60 is refused with the
- * reason — it is the "revoke.agent" 6M gas ceiling the batcher submits under, not the contract's
- * own limit. Unknown flags and stray positionals are refused too: a benchmark that half-read its
- * arguments reports numbers for a run that was not the one asked for.
+ * price would produce cost numbers nobody can defend. `--batch` above 480 is refused with the
+ * reason — it is Monad's 30,000,000-gas per-transaction limit at the sweep's ~61k per save, not
+ * the contract's own limit. Unknown flags and stray positionals are refused too: a benchmark that
+ * half-read its arguments reports numbers for a run that was not the one asked for.
  */
 export function parseArgs(argv: string[]): BenchArgs {
   let saves = 20
@@ -74,7 +74,7 @@ export function parseArgs(argv: string[]): BenchArgs {
         const value = positiveInt(flagValue(argv, i, arg), arg)
         if (value > MAX_BATCH_SIZE) {
           throw new Error(
-            `--batch is capped at ${MAX_BATCH_SIZE}: batches are submitted under the 6,000,000-gas "revoke.agent" ceiling the store batcher uses, and the measured per-save cost only fits ${MAX_BATCH_SIZE} inside it — a larger batch would need a higher ceiling`,
+            `--batch is capped at ${MAX_BATCH_SIZE}: Monad refuses any transaction over 30,000,000 gas and the Sep 24 sweep measured ~61k gas per save, so a larger batch would not fit the per-transaction limit`,
           )
         }
         batch = value

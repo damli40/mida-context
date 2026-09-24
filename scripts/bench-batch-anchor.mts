@@ -482,7 +482,7 @@ async function main(): Promise<void> {
         const receipt = await sendContract(
           deployer,
           { address: batchAnchor, abi: batchAnchorAbi, functionName: "submitBatch", args: [hexOf(randomBytes(32)), contractSaves(chunk)] },
-          "revoke.agent",
+          "batch.submit",
         )
         const anchored = parseEventLogs({ abi: batchAnchorAbi, eventName: "SaveAnchored", logs: receipt.logs }).length
         const rejectedHere = parseEventLogs({ abi: batchAnchorAbi, eventName: "SaveRejected", logs: receipt.logs }).length

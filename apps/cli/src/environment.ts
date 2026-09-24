@@ -97,7 +97,7 @@ export async function startApiServer(input: {
       chain: createBatcherChain({ rpcUrl: input.rpcUrl, deployment: input.deployment, account: submitter }),
       timer,
       now: () => Date.now(),
-      cap: input.batching?.cap ?? 60,
+      cap: input.batching?.cap ?? 480,
       waitMs: input.batching?.waitMs ?? 2_000,
       minGapMs: input.batching?.minGapMs ?? 1_000,
       submitter: submitter.address,

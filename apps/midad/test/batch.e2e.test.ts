@@ -365,7 +365,8 @@ describe("batched checkpoint lane end to end on local Anvil (Task 10)", () => {
         expect(await batching(home, true)).toMatchObject({ code: 0 })
 
         // The window is held while all twenty queue — one release, one submission, one
-        // transaction. Twenty is under the batcher's cap (60), so nothing submits early.
+        // transaction. Twenty is under the batcher's learned gas cap (~401 at the sweep's
+        // measured per-save cost), so nothing submits early.
         env.batcher!.pauseTimer()
         const batchesBefore = (await batchAnchoredEvents()).length
         const contextIds: Hex[] = []
