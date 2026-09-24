@@ -512,6 +512,20 @@ describe("the worker entry", () => {
     }
   })
 
+  it("a non-numeric BATCH_ANCHOR_BLOCK beside a real BATCH_ANCHOR fails the whole worker at boot", async () => {
+    const vars = envVars(rpc.url)
+    vars["BATCH_ANCHOR"] = "0x1111111111111111111111111111111111111aa5"
+    vars["BATCH_ANCHOR_BLOCK"] = "yesterday"
+    const bad = await makeWorker(await bundleWorker(), vars)
+    try {
+      const response = await bad.mf.dispatchFetch("http://worker.test/")
+      expect(response.status).toBe(500)
+      expect(JSON.stringify(await response.json())).toContain("BATCH_ANCHOR_BLOCK")
+    } finally {
+      await bad.mf.dispose()
+    }
+  })
+
   it("the scheduled handler sweeps stale pending uploads and nonces on the real D1", async () => {
     const stores = d1Stores(db)
     // The cron runs on wall-clock time: seed ages relative to Date.now(), not a fixed date.

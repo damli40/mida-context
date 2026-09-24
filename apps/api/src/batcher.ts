@@ -582,11 +582,14 @@ export function createBatcherChain(input: { rpcUrl: string; deployment: Deployme
       }
     },
     async anchoredLogs(batchId) {
+      const blockNumber = await batchBlock(batchId)
+      if (blockNumber === 0n) return []
       const logs = await getLogsChunked(context.publicClient, {
         address: batchAnchor,
         event: saveAnchoredEvent,
         args: { batchId },
-        fromBlock,
+        fromBlock: blockNumber,
+        toBlock: blockNumber,
       })
       return logs.map((log) => {
         const args = log.args as { contextId: Hex; author: Hex; position: number; lineageId: Hex; version: number; leafHash: Hex }
@@ -601,11 +604,14 @@ export function createBatcherChain(input: { rpcUrl: string; deployment: Deployme
       })
     },
     async rejectedLogs(batchId) {
+      const blockNumber = await batchBlock(batchId)
+      if (blockNumber === 0n) return []
       const logs = await getLogsChunked(context.publicClient, {
         address: batchAnchor,
         event: saveRejectedEvent,
         args: { batchId },
-        fromBlock,
+        fromBlock: blockNumber,
+        toBlock: blockNumber,
       })
       return logs.map((log) => {
         const args = log.args as { index: number; reason: number }

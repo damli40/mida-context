@@ -54,6 +54,8 @@ export interface BatchCoordinatorEnv {
   VAULT_RP_ID_HASH: string
   BATCH_ANCHOR: string
   BATCHER_PRIVATE_KEY: string
+  /** The block BatchAnchor was deployed in — the floor for historical SaveAnchored scans. */
+  BATCH_ANCHOR_BLOCK?: string
 }
 
 /**
@@ -113,6 +115,10 @@ export interface BatchCoordinatorOverrides {
 }
 
 function coordinatorDeployment(env: BatchCoordinatorEnv): Deployment {
+  const rawAnchorBlock = env.BATCH_ANCHOR_BLOCK
+  if (rawAnchorBlock !== undefined && rawAnchorBlock !== "" && !/^(0|[1-9][0-9]*)$/.test(rawAnchorBlock)) {
+    throw new Error("BATCH_ANCHOR_BLOCK must be a non-negative integer")
+  }
   return {
     chainId: BigInt(env.CHAIN_ID),
     capabilityRegistry: env.CAPABILITY_REGISTRY as Address,
@@ -122,6 +128,10 @@ function coordinatorDeployment(env: BatchCoordinatorEnv): Deployment {
     vaultRpId: env.VAULT_RP_ID,
     vaultRpIdHash: env.VAULT_RP_ID_HASH as Hex,
     batchAnchor: env.BATCH_ANCHOR.toLowerCase() as Address,
+    // Without it, findAnchoring — the historical contextId scan — starts at the registries'
+    // deployment block, thousands of blocks before the anchor existed. Per-batch resolve scans
+    // never use this floor: they read only the batch's own block, taken from batchOf.
+    batchAnchorBlock: rawAnchorBlock === undefined || rawAnchorBlock === "" ? undefined : BigInt(rawAnchorBlock),
   }
 }
 

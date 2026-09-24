@@ -7,7 +7,11 @@
 // a contextId it has anchored before), and stores bytes32(0) as the root of an all-rejected batch.
 
 import { describe, expect, it } from "vitest"
-import { encodeAbiParameters, keccak256, zeroHash } from "viem"
+import { createServer } from "node:http"
+import type { Server } from "node:http"
+import type { AddressInfo } from "node:net"
+import { decodeFunctionData, encodeAbiParameters, encodeEventTopics, keccak256, zeroHash } from "viem"
+import { privateKeyToAccount } from "viem/accounts"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { hexOf } from "@mida/crypto"
 import {
@@ -20,7 +24,9 @@ import {
   verifyMerkleProof,
 } from "@mida/protocol"
 import type { Address, BatchSaveMessage, Hex } from "@mida/protocol"
-import { BatchRootMismatchError, Batcher, MemoryBatchJournal } from "../src/batcher.js"
+import { batchAnchorAbi } from "@mida/chain"
+import type { Deployment } from "@mida/chain"
+import { BatchRootMismatchError, Batcher, MemoryBatchJournal, createBatcherChain } from "../src/batcher.js"
 import type { AnchoredLog, BatchJournal, BatcherChain, BatcherTimer, RejectedLog } from "../src/batcher.js"
 import type { BatchedSaveWire } from "../src/client.js"
 import type { BatchSaveRow, BatchStore } from "../src/batch-store.js"
@@ -745,5 +751,146 @@ describe("the batcher", () => {
   it("resolve() on a batchId the chain never saw refuses with NOT_FOUND", async () => {
     const rig = makeRig()
     await expect(rig.batcher.resolve(`0x${"00".repeat(32)}` as Hex)).rejects.toMatchObject({ code: "NOT_FOUND" })
+  })
+})
+
+/**
+ * B2: the windows the real adapter opens. A stub JSON-RPC server stands in for the BatchAnchor
+ * contract — it answers batchOf and returns properly-encoded event logs — and records the
+ * fromBlock/toBlock of every eth_getLogs, so the test sees exactly which blocks were scanned.
+ */
+describe("createBatcherChain's log windows", () => {
+  const BATCH_BLOCK = 4_242n
+  const ANCHOR_BLOCK = 3_000n // the anchor's own deploy block, later than the registries'
+  const DEPLOY_BLOCK = 100n
+  const HEAD = 5_000n
+
+  it("resolve scans only the batch's own block; findAnchoring still scans from the anchor's deploy block", async () => {
+    const { wire, meta } = makeSave()
+    const batchId = hexOf(randomBytes(32))
+    const leaf = leafOf(meta)
+    const root = merkleRoot([leaf])
+
+    const eventTopic = (name: "BatchAnchored" | "SaveAnchored" | "SaveRejected"): Hex =>
+      encodeEventTopics({ abi: batchAnchorAbi, eventName: name })[0] as Hex
+    const anchoredTopic = eventTopic("SaveAnchored")
+    const batchTopic = eventTopic("BatchAnchored")
+    const logEntry = (topics: Hex[], data: Hex): Record<string, unknown> => ({
+      address: BATCH_ANCHOR,
+      blockHash: `0x${"44".repeat(32)}`,
+      blockNumber: `0x${BATCH_BLOCK.toString(16)}`,
+      data,
+      logIndex: "0x0",
+      removed: false,
+      topics,
+      transactionHash: `0x${"ee".repeat(32)}`,
+      transactionIndex: "0x0",
+    })
+    // SaveAnchored(owner, contextId, batchId indexed; namespaceId, lineageId, version, author,
+    // position, leafHash in data) — the real encodings, so viem's strict decode sees real args.
+    const saveAnchoredLog = logEntry(
+      encodeEventTopics({ abi: batchAnchorAbi, eventName: "SaveAnchored", args: { owner: OWNER, contextId: meta.contextId, batchId } }) as Hex[],
+      encodeAbiParameters(
+        [{ type: "bytes32" }, { type: "bytes32" }, { type: "uint32" }, { type: "bytes32" }, { type: "uint32" }, { type: "bytes32" }],
+        [NAMESPACE, meta.lineageId, meta.version, meta.agentId, 0, leaf],
+      ),
+    )
+    const batchAnchoredLog = logEntry(
+      encodeEventTopics({ abi: batchAnchorAbi, eventName: "BatchAnchored", args: { batchId } }) as Hex[],
+      encodeAbiParameters(
+        [{ type: "bytes32" }, { type: "uint32" }, { type: "uint32" }, { type: "address" }],
+        [root, 1, 0, SUBMITTER],
+      ),
+    )
+
+    const scans: { fromBlock: bigint; toBlock: bigint; topics: Hex[] }[] = []
+    const server: Server = createServer((req, res) => {
+      let raw = ""
+      req.on("data", (chunk: Buffer) => (raw += chunk.toString()))
+      req.on("end", () => {
+        const { id, method, params } = JSON.parse(raw) as { id: number; method: string; params: unknown[] }
+        const reply = (result: unknown) => {
+          res.setHeader("content-type", "application/json")
+          res.end(JSON.stringify({ jsonrpc: "2.0", id, result }))
+        }
+        if (method === "eth_chainId") return reply(`0x${CHAIN_ID.toString(16)}`)
+        if (method === "eth_blockNumber") return reply(`0x${HEAD.toString(16)}`)
+        if (method === "eth_getLogs") {
+          const [filter] = params as [{ address: string; topics: Hex[]; fromBlock: Hex; toBlock: Hex }]
+          scans.push({ fromBlock: BigInt(filter.fromBlock), toBlock: BigInt(filter.toBlock), topics: filter.topics })
+          if (filter.topics[0] === anchoredTopic) return reply([saveAnchoredLog])
+          if (filter.topics[0] === batchTopic) return reply([batchAnchoredLog])
+          return reply([])
+        }
+        if (method === "eth_call") {
+          const [{ data }] = params as [{ data: Hex }]
+          try {
+            const call = decodeFunctionData({ abi: batchAnchorAbi, data })
+            if (call.functionName === "batchOf") {
+              const queried = (call.args as [Hex])[0]
+              const answer: [Hex, bigint, number] =
+                queried.toLowerCase() === batchId.toLowerCase() ? [root, BATCH_BLOCK, 1] : [zeroHash, 0n, 0]
+              return reply(encodeAbiParameters([{ type: "bytes32" }, { type: "uint64" }, { type: "uint32" }], answer))
+            }
+          } catch {
+            // falls through to unhandled — an undecodable call is an error response, not a crash
+          }
+        }
+        return res.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32601, message: `unhandled ${method}` } }))
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+    const { port } = (server.address() as AddressInfo)
+
+    try {
+      const rpcDeployment: Deployment = {
+        chainId: CHAIN_ID,
+        capabilityRegistry: "0x4444444444444444444444444444444444444444",
+        contextRegistry: "0x5555555555555555555555555555555555555555",
+        deploymentBlock: DEPLOY_BLOCK,
+        policyHashV1: `0x${"11".repeat(32)}`,
+        vaultRpId: "vault.mida.xyz",
+        vaultRpIdHash: `0x${"22".repeat(32)}`,
+        batchAnchor: BATCH_ANCHOR,
+        batchAnchorBlock: ANCHOR_BLOCK,
+      }
+      const chain = createBatcherChain({
+        rpcUrl: `http://127.0.0.1:${port}`,
+        deployment: rpcDeployment,
+        account: privateKeyToAccount(`0x${"33".repeat(32)}`),
+      })
+      const store = new MemoryBatchStore()
+      const journal = new MemoryBatchJournal()
+      // The state resolve() runs against: one SUBMITTED row under the batchId and the journal's
+      // ordered contextIds — what a landed batch leaves behind after a restart.
+      await store.insert({ ...queueRow(wire, meta.contextId, 0), state: "SUBMITTED", batchId: batchId.toLowerCase() as Hex })
+      await journal.record(batchId, [meta.contextId])
+      const batcher = new Batcher({ store, chain, timer: new ManualTimer(), now: () => 0, cap: 8, waitMs: 2_000, submitter: SUBMITTER, journal })
+
+      await batcher.resolve(batchId)
+      expect((await store.get(meta.contextId))!.state).toBe("ANCHORED")
+      // SaveAnchored + SaveRejected + BatchAnchored: three scans, each exactly the batch's block —
+      // never from DEPLOY_BLOCK or ANCHOR_BLOCK, which is what made every resolve a full-history scan.
+      expect(scans).toHaveLength(3)
+      for (const scan of scans) expect(scan).toMatchObject({ fromBlock: BATCH_BLOCK, toBlock: BATCH_BLOCK })
+
+      // A batchId the chain never recorded answers blockNumber 0 — no log request is even made.
+      const unknownId = `0x${"99".repeat(32)}` as Hex
+      expect(await chain.anchoredLogs(unknownId)).toEqual([])
+      expect(await chain.rejectedLogs(unknownId)).toEqual([])
+      expect(await chain.batchAnchored(unknownId)).toBeNull()
+      expect(scans).toHaveLength(3)
+
+      // findAnchoring is the historical search for a contextId — it keeps the anchor's deploy
+      // block as its floor and reaches chain head (chunked at MAX_LOG_BLOCK_RANGE = 1000).
+      expect(await chain.findAnchoring(meta.contextId)).toBe(batchId.toLowerCase())
+      expect(scans.slice(3)).toEqual([
+        expect.objectContaining({ fromBlock: ANCHOR_BLOCK, toBlock: ANCHOR_BLOCK + 999n }),
+        expect.objectContaining({ fromBlock: ANCHOR_BLOCK + 1000n, toBlock: ANCHOR_BLOCK + 1999n }),
+        expect.objectContaining({ fromBlock: ANCHOR_BLOCK + 2000n, toBlock: HEAD }),
+      ])
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
   })
 })

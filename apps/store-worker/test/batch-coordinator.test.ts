@@ -436,6 +436,21 @@ describe("the batch coordinator Durable Object", () => {
     expect(coordinator).toBeDefined()
   })
 
+  it("BATCH_ANCHOR_BLOCK must be an integer — a non-numeric value fails the object's construction", async () => {
+    // No chain override: the constructor builds the real adapter, which is where the env parse
+    // lives — the deployment only assembles when BATCHER_PRIVATE_KEY is also valid.
+    const keyedEnv: BatchCoordinatorEnv = { ...env, BATCHER_PRIVATE_KEY: `0x${"44".repeat(32)}` }
+    expect(
+      () => new BatchCoordinator(new FakeState(), { ...keyedEnv, BATCH_ANCHOR_BLOCK: "soon" }, { store: new FakeStore() }),
+    ).toThrow("BATCH_ANCHOR_BLOCK")
+
+    // A numeric value constructs: the coordinator's deployment carries it as batchAnchorBlock.
+    const ctx = new FakeState()
+    const coordinator = new BatchCoordinator(ctx, { ...keyedEnv, BATCH_ANCHOR_BLOCK: "4242" }, { store: new FakeStore() })
+    await ctx.ready
+    expect(coordinator).toBeDefined()
+  })
+
   it("answers 404 on a path it does not own", async () => {
     const ctx = new FakeState()
     const coordinator = new BatchCoordinator(ctx, env, { store: new FakeStore(), chain: new FakeChain(), submitter: SUBMITTER })

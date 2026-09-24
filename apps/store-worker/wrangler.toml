@@ -64,6 +64,9 @@ VAULT_RP_ID_HASH = "0xREPLACE_WITH_32_BYTE_RP_ID_HASH"
 # does not parse as an address mounts no batch surface at all; "true" without a valid anchor (or
 # without the keys/binding) fails the worker loudly at boot.
 BATCH_ANCHOR = "0xREPLACE_WITH_BATCH_ANCHOR_ADDRESS"
+# The block BatchAnchor was deployed in — the floor its historical log scans start from (per-batch
+# resolution never scans below its own block). Take it from the anchor's deploy transaction.
+BATCH_ANCHOR_BLOCK = "REPLACE_WITH_BATCH_ANCHOR_BLOCK"
 BATCHING_ENABLED = "false"
 
 # Secrets (wrangler secret put …):

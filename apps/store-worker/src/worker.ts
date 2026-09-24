@@ -46,6 +46,8 @@ export interface WorkerEnv {
   BATCHING_ENABLED?: string
   BATCHER_PRIVATE_KEY?: string
   RECEIPT_PRIVATE_KEY?: string
+  /** The block BatchAnchor was deployed in — the floor for its historical log scans. */
+  BATCH_ANCHOR_BLOCK?: string
   BATCH_COORDINATOR?: DurableObjectNamespaceLike
 }
 
@@ -141,6 +143,14 @@ function batchingOptions(env: WorkerEnv, deployment: Deployment): BatchingOption
     return undefined
   }
   deployment.batchAnchor = batchAnchor
+  // The anchor's deploy block floors the coordinator's historical scans. A non-numeric value is a
+  // configuration error and fails at boot, not inside the object mid-scan.
+  if (env.BATCH_ANCHOR_BLOCK !== undefined && env.BATCH_ANCHOR_BLOCK !== "") {
+    if (!/^(0|[1-9][0-9]*)$/.test(env.BATCH_ANCHOR_BLOCK)) {
+      throw new Error("environment variable BATCH_ANCHOR_BLOCK must be a non-negative integer")
+    }
+    deployment.batchAnchorBlock = BigInt(env.BATCH_ANCHOR_BLOCK)
+  }
   const receiptAccount = privateKeyToAccount(hashEnv(env, "RECEIPT_PRIVATE_KEY"))
   if (enabled) {
     if (env.BATCH_COORDINATOR === undefined) {
