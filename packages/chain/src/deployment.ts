@@ -12,6 +12,9 @@ export interface Deployment {
   policyHashV1: Hex
   vaultRpId: string
   vaultRpIdHash: Hex
+  /** Set only after DeployBatchAnchor.s.sol has run beside the registries; both keys or neither. */
+  batchAnchor?: Address
+  batchAnchorBlock?: bigint
 }
 
 export const LOCAL_CHAIN_ID = 31337n
@@ -40,6 +43,8 @@ export function parseDeployment(json: unknown): Deployment {
   const record = json as Record<string, unknown>
   if (typeof record.vaultRpId !== "string" || record.vaultRpId.length === 0) wire("vaultRpId must be a non-empty string")
   if (typeof record.policyHashV1 !== "string" || typeof record.vaultRpIdHash !== "string") wire("hashes must be strings")
+  const hasBatchAnchor = record.batchAnchor !== undefined
+  if (hasBatchAnchor !== (record.batchAnchorBlock !== undefined)) wire("batchAnchor and batchAnchorBlock go together")
   return {
     chainId: integer(record.chainId, "chainId"),
     capabilityRegistry: address(record.capabilityRegistry, "capabilityRegistry"),
@@ -48,6 +53,12 @@ export function parseDeployment(json: unknown): Deployment {
     policyHashV1: assertHex(record.policyHashV1.toLowerCase(), 32),
     vaultRpId: record.vaultRpId,
     vaultRpIdHash: assertHex(record.vaultRpIdHash.toLowerCase(), 32),
+    ...(hasBatchAnchor
+      ? {
+          batchAnchor: address(record.batchAnchor, "batchAnchor"),
+          batchAnchorBlock: integer(record.batchAnchorBlock, "batchAnchorBlock"),
+        }
+      : {}),
   }
 }
 

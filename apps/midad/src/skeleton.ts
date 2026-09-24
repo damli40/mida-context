@@ -135,12 +135,18 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
     }
   } else {
     // The detached drainer never loads .env; init leaves it the public chain coordinates to read back.
-    // chainId/deploymentBlock are bigints, so they go on disk as decimal strings for parseDeployment.
+    // chainId/deploymentBlock/batchAnchorBlock are bigints, so they go on disk as decimal strings for
+    // parseDeployment (absent batchAnchorBlock serializes as no key).
     const deployment = network.deployment
     home.writeSecretJson("network.json", {
       chainId: Number(deployment.chainId),
       rpcUrl: network.rpcUrl,
-      deployment: { ...deployment, chainId: deployment.chainId.toString(), deploymentBlock: deployment.deploymentBlock.toString() },
+      deployment: {
+        ...deployment,
+        chainId: deployment.chainId.toString(),
+        deploymentBlock: deployment.deploymentBlock.toString(),
+        batchAnchorBlock: deployment.batchAnchorBlock?.toString(),
+      },
       // absent stays absent — an unset URL serializes as no key, and a later `init` without the
       // value does not blank one an operator wrote into the file by hand
       ...(network.storageUrl === undefined ? {} : { storageUrl: network.storageUrl }),

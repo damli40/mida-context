@@ -327,6 +327,7 @@ function serializeDeployment(deployment: Deployment): Record<string, unknown> {
     ...deployment,
     chainId: deployment.chainId.toString(10),
     deploymentBlock: deployment.deploymentBlock.toString(10),
+    batchAnchorBlock: deployment.batchAnchorBlock?.toString(10),
   }
 }
 

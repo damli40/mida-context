@@ -265,7 +265,12 @@ export async function initPasskey(
     home.writeSecretJson("network.json", {
       chainId: Number(deployment.chainId),
       rpcUrl: network.rpcUrl,
-      deployment: { ...deployment, chainId: deployment.chainId.toString(), deploymentBlock: deployment.deploymentBlock.toString() },
+      deployment: {
+        ...deployment,
+        chainId: deployment.chainId.toString(),
+        deploymentBlock: deployment.deploymentBlock.toString(),
+        batchAnchorBlock: deployment.batchAnchorBlock?.toString(),
+      },
       // absent stays absent — an unset URL serializes as no key, and a later `init` without the
       // value does not blank one an operator wrote into the file by hand
       ...(network.storageUrl === undefined ? {} : { storageUrl: network.storageUrl }),
