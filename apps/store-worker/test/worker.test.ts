@@ -22,14 +22,14 @@ import type { Address, Hex } from "@mida/protocol"
 import { hexOf, manifestHash } from "@mida/crypto"
 import { contentHash } from "@mida/storage"
 import { randomBytes } from "@noble/hashes/utils.js"
-import { capabilityRegistryAbi, contextRegistryAbi } from "@mida/chain"
+import { batchAnchorAbi, capabilityRegistryAbi, contextRegistryAbi } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import { ContextApiClient } from "@mida/api"
 import type { ContextRecordView, ObjectUploadBody } from "@mida/api"
 import { d1Stores } from "@mida/store-worker"
 import type { D1Like } from "@mida/store-worker"
 import worker, { handleRequest } from "../src/worker.js"
-import type { WorkerEnv } from "../src/worker.js"
+import type { DurableObjectNamespaceLike, WorkerEnv } from "../src/worker.js"
 
 const deployment: Deployment = {
   chainId: 31337n,
@@ -41,7 +41,7 @@ const deployment: Deployment = {
   vaultRpIdHash: "0xb275669f95bfc600063e7cd0d2c3b12039f5067d964f36d9bb8275e09e3a36cb",
 }
 const NAMESPACE = namespaceId("goals.career")
-const ABI: Abi = [...capabilityRegistryAbi, ...contextRegistryAbi]
+const ABI: Abi = [...capabilityRegistryAbi, ...contextRegistryAbi, ...batchAnchorAbi]
 const HERE = dirname(fileURLToPath(import.meta.url))
 
 const ownerAccount = privateKeyToAccount(generatePrivateKey())
@@ -60,10 +60,25 @@ interface StubChain {
   agents: Map<string, unknown>
   capabilities: Map<string, unknown>
   authorityMask: Map<string, number>
+  /** What BatchAnchor.CAPABILITY_REGISTRY() answers — a test points it at the wrong registry. */
+  anchorRegistry: Address
+  /** How many CAPABILITY_REGISTRY() calls the stub has served — the caching assertion's meter. */
+  anchorRegistryReads: number
+  /** Countdown of CAPABILITY_REGISTRY() calls that fail — proves a failed read retries, not latches. */
+  anchorRegistryFails: number
 }
 
 function stubChain(): StubChain {
-  const chain: StubChain = { records: new Map(), signerToAgent: new Map(), agents: new Map(), capabilities: new Map(), authorityMask: new Map() }
+  const chain: StubChain = {
+    records: new Map(),
+    signerToAgent: new Map(),
+    agents: new Map(),
+    capabilities: new Map(),
+    authorityMask: new Map(),
+    anchorRegistry: deployment.capabilityRegistry,
+    anchorRegistryReads: 0,
+    anchorRegistryFails: 0,
+  }
   const agentRecord = (signer: Address) => ({
     operator: owner,
     signer: signer.toLowerCase(),
@@ -157,8 +172,15 @@ async function startStubRpc(chain: StubChain): Promise<{ url: string; close: () 
       }
       const encode = (result: unknown) =>
         reply(encodeFunctionResult({ abi: ABI, functionName: call.functionName, result } as never))
-      const [a0, a1, a2, a3] = call.args
+      const [a0, a1, a2, a3] = call.args ?? [] // a zero-arg getter (CAPABILITY_REGISTRY) has no args tuple
       switch (call.functionName) {
+        case "CAPABILITY_REGISTRY":
+          chain.anchorRegistryReads += 1
+          if (chain.anchorRegistryFails > 0) {
+            chain.anchorRegistryFails -= 1
+            return res.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: "stub RPC: anchor read failed" } }))
+          }
+          return encode(chain.anchorRegistry)
         case "requiredReadEpoch":
           return encode(1n)
         case "isWriteEpochValid":
@@ -270,6 +292,29 @@ function clientFor(mf: Miniflare, account: LocalAccount): ContextApiClient {
     capabilityRegistry: deployment.capabilityRegistry,
     fetch: async (url, init) => (await mf.dispatchFetch(url, init as never)) as unknown as Response,
   })
+}
+
+/**
+ * The same client against a bare env (no Miniflare): requests go straight through handleRequest,
+ * and each response is captured raw so a test can read the error body the client would hide.
+ */
+function clientForEnv(envObj: WorkerEnv, account: LocalAccount): {
+  client: ContextApiClient
+  last: () => { status: number; body: unknown } | undefined
+} {
+  let last: { status: number; body: unknown } | undefined
+  const client = new ContextApiClient({
+    baseUrl: "http://worker.test",
+    account,
+    chainId: deployment.chainId,
+    capabilityRegistry: deployment.capabilityRegistry,
+    fetch: async (url, init) => {
+      const response = await handleRequest(envObj, new Request(url, init))
+      last = { status: response.status, body: await response.clone().json() }
+      return response
+    },
+  })
+  return { client, last: () => last }
 }
 
 function upload(ciphertext: Uint8Array): ObjectUploadBody {
@@ -524,6 +569,92 @@ describe("the worker entry", () => {
     } finally {
       await bad.mf.dispose()
     }
+  })
+
+  it("a disabled batch lane needs no receipt key — the store boots and the surface answers off", async () => {
+    // The boot trap this fixes: the worker used to demand RECEIPT_PRIVATE_KEY whenever BATCH_ANCHOR
+    // parsed, so this env — lane off, no secrets — used to 500 every single route.
+    const laneEnv: WorkerEnv = {
+      ...env(db, rpc.url),
+      BATCH_ANCHOR: "0x1111111111111111111111111111111111111aa5",
+      BATCHING_ENABLED: "false",
+    }
+    expect((await handleRequest(laneEnv, new Request("http://worker.test/"))).status).toBe(200)
+    expect(await (await handleRequest(laneEnv, new Request("http://worker.test/batch/status"))).json()).toMatchObject({ enabled: false })
+
+    const { client, last } = clientForEnv(laneEnv, ownerAccount)
+    // A signed write gets the disabled answer — not a config crash — and a normal route still serves.
+    await client.postBatchSave({} as never).catch(() => {})
+    expect(last()).toMatchObject({ status: 503, body: { error: { code: "BATCHING_DISABLED" } } })
+    // This suite's shared chain/db may already hold anchored records — the point is the route serves.
+    const listed = await client.listObjects({ owner, namespaceId: NAMESPACE })
+    expect(Array.isArray(listed.objects)).toBe(true)
+    expect(listed.partial).toBe(false)
+  })
+
+  it("an enabled lane verifies the anchor's CAPABILITY_REGISTRY lazily once, caches it, and refuses clearly on a mismatch", async () => {
+    const anchor = "0x1111111111111111111111111111111111111aa5" as Address
+    const coordinator: DurableObjectNamespaceLike = {
+      idFromName: () => "batcher",
+      get: () => ({ fetch: async () => new Response(JSON.stringify({ ok: true })) }),
+    }
+    const enabledEnv = (): WorkerEnv => ({
+      ...env(db, rpc.url),
+      BATCH_ANCHOR: anchor,
+      BATCHING_ENABLED: "true",
+      BATCHER_PRIVATE_KEY: `0x${"44".repeat(32)}`,
+      RECEIPT_PRIVATE_KEY: `0x${"55".repeat(32)}`,
+      BATCH_COORDINATOR: coordinator,
+    })
+
+    // Lazy: neither boot nor the unsigned discovery probe touches the chain for this check.
+    const { client, last } = clientForEnv(enabledEnv(), ownerAccount)
+    const readsBefore = chain.anchorRegistryReads
+    expect((await client.batchStatus()).enabled).toBe(true)
+    expect(chain.anchorRegistryReads).toBe(readsBefore)
+
+    // The first gated request runs the check once and proceeds — the junk save then fails on the
+    // wire (400 INVALID_WIRE), which proves it got past the anchor gate.
+    await client.postBatchSave({} as never).catch(() => {})
+    expect(last()!.status).toBe(400)
+    expect(chain.anchorRegistryReads).toBe(readsBefore + 1)
+
+    // The verdict is cached: a second gated request costs no second read.
+    await client.postBatchSave({} as never).catch(() => {})
+    expect(chain.anchorRegistryReads).toBe(readsBefore + 1)
+
+    // A different deployment's anchor reports a different registry — a fresh env object means a
+    // fresh check, and the whole batch surface (writes AND reads) refuses by name.
+    chain.anchorRegistry = "0x6666666666666666666666666666666666666666" as Address
+    try {
+      const bad = clientForEnv(enabledEnv(), ownerAccount)
+      await bad.client.postBatchSave({} as never).catch(() => {})
+      expect(bad.last()).toMatchObject({ status: 503, body: { error: { code: "BATCH_ANCHOR_UNVERIFIED" } } })
+      const message = JSON.stringify(bad.last()!.body)
+      expect(message).toContain(anchor)
+      expect(message).toContain("6666666666666666666666666666666666666666")
+
+      // The refusal latches: even reads refuse, without spending another chain call.
+      const readsAtMismatch = chain.anchorRegistryReads
+      await bad.client.listBatchSaves({ owner, namespaceId: NAMESPACE }).catch(() => {})
+      expect(bad.last()).toMatchObject({ status: 503, body: { error: { code: "BATCH_ANCHOR_UNVERIFIED" } } })
+      expect(chain.anchorRegistryReads).toBe(readsAtMismatch)
+    } finally {
+      chain.anchorRegistry = deployment.capabilityRegistry
+    }
+
+    // A read that never reached the contract is not a verdict: the request refuses, and the next
+    // gated request asks the chain again instead of latching the outage. The flag stays up for the
+    // whole first request — however many times the transport retries inside it.
+    chain.anchorRegistryFails = Number.MAX_SAFE_INTEGER
+    const flaky = clientForEnv(enabledEnv(), ownerAccount)
+    await flaky.client.postBatchSave({} as never).catch(() => {})
+    expect(flaky.last()).toMatchObject({ status: 503, body: { error: { code: "BATCH_ANCHOR_UNVERIFIED" } } })
+    chain.anchorRegistryFails = 0
+    const readsBeforeRetry = chain.anchorRegistryReads
+    await flaky.client.postBatchSave({} as never).catch(() => {})
+    expect(flaky.last()!.status).toBe(400) // back past the gate, judged on the wire
+    expect(chain.anchorRegistryReads).toBe(readsBeforeRetry + 1)
   })
 
   it("the scheduled handler sweeps stale pending uploads and nonces on the real D1", async () => {

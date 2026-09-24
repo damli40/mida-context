@@ -3,9 +3,11 @@
 
 import { AsyncLocalStorage } from "node:async_hooks"
 import { createPublicClient, http } from "viem"
+import type { LocalAccount } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { assertHex } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
+import { batchAnchorAbi } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import { AUTH_HEADERS, MANIFEST_VERIFY_CACHE_SECONDS, MAX_CHAIN_READS_PER_REQUEST, RegistryReader, SWEEP_MAX_OBJECTS_PER_RUN, createContextApi } from "@mida/api"
 import type { BatchingOptions, StoreLimits } from "@mida/api"
@@ -117,6 +119,9 @@ export function deploymentFromEnv(env: WorkerEnv): Deployment {
   }
 }
 
+/** The slice of viem's PublicClient the batch lane uses — one readContract for the anchor check. */
+type PublicClientLike = ReturnType<typeof createPublicClient>
+
 interface Built {
   app: ReturnType<typeof createContextApi>["app"]
   reader: RegistryReader
@@ -127,12 +132,15 @@ interface Built {
 
 /**
  * The Task 6 batch lane. The surface mounts whenever BATCH_ANCHOR parses as an address — under the
- * kill switch the routes answer 503/{ enabled: false } rather than 404ing. Turning
- * BATCHING_ENABLED on without a valid anchor, a receipt key, the coordinator binding or a batcher
- * key fails the whole worker at boot instead of half-working mid-queue. notify is fire-and-forget
- * into the single "batcher" object (covered by the request's waitUntil); flush is awaited.
+ * kill switch the routes answer 503/{ enabled: false } rather than 404ing, and a missing receipt
+ * key then means exactly that: only BATCHING_ENABLED="true" requires the secrets, the coordinator
+ * binding and the batcher key — a disabled lane must never take the whole store down. notify is
+ * fire-and-forget into the single "batcher" object (covered by the request's waitUntil); flush is
+ * awaited. While enabled, the first batch request also proves the anchor contract's own
+ * CAPABILITY_REGISTRY() is this deployment's — a wrong contract refuses the surface (cached; a
+ * failed read retries rather than latching a verdict it never reached).
  */
-function batchingOptions(env: WorkerEnv, deployment: Deployment): BatchingOptions | undefined {
+function batchingOptions(env: WorkerEnv, deployment: Deployment, publicClient: PublicClientLike): BatchingOptions | undefined {
   const enabled = env.BATCHING_ENABLED === "true"
   const batchAnchor =
     typeof env.BATCH_ANCHOR === "string" && /^0x[0-9a-fA-F]{40}$/.test(env.BATCH_ANCHOR)
@@ -151,12 +159,36 @@ function batchingOptions(env: WorkerEnv, deployment: Deployment): BatchingOption
     }
     deployment.batchAnchorBlock = BigInt(env.BATCH_ANCHOR_BLOCK)
   }
-  const receiptAccount = privateKeyToAccount(hashEnv(env, "RECEIPT_PRIVATE_KEY"))
+  let receiptAccount: LocalAccount | undefined
+  let verifyAnchor: (() => Promise<void>) | undefined
   if (enabled) {
     if (env.BATCH_COORDINATOR === undefined) {
       throw new Error("BATCHING_ENABLED=true requires the BATCH_COORDINATOR Durable Object binding")
     }
     hashEnv(env, "BATCHER_PRIVATE_KEY") // the coordinator reads it again at first use; fail at boot, not mid-queue
+    receiptAccount = privateKeyToAccount(hashEnv(env, "RECEIPT_PRIVATE_KEY"))
+    let verdict: Promise<void> | undefined
+    verifyAnchor = () => {
+      verdict ??= (async () => {
+        let onchain: unknown
+        try {
+          onchain = await publicClient.readContract({
+            address: batchAnchor,
+            abi: batchAnchorAbi,
+            functionName: "CAPABILITY_REGISTRY",
+          })
+        } catch (error) {
+          verdict = undefined // a read that never reached the contract is not a verdict — retry next time
+          throw new Error(`the batch anchor could not be verified against the chain: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        if (typeof onchain !== "string" || onchain.toLowerCase() !== deployment.capabilityRegistry) {
+          throw new Error(
+            `BATCH_ANCHOR ${batchAnchor} reports CAPABILITY_REGISTRY ${String(onchain)}, not this deployment's ${deployment.capabilityRegistry} — the batch surface refuses to run against the wrong contract`,
+          )
+        }
+      })()
+      return verdict
+    }
   }
   const coordinator = (): { fetch(input: string | Request, init?: RequestInit): Promise<Response> } | undefined => {
     const namespace = env.BATCH_COORDINATOR
@@ -166,7 +198,8 @@ function batchingOptions(env: WorkerEnv, deployment: Deployment): BatchingOption
     enabled,
     batchAnchor,
     store: new D1BatchStore(env.DB),
-    receiptAccount,
+    ...(receiptAccount === undefined ? {} : { receiptAccount }),
+    ...(verifyAnchor === undefined ? {} : { verifyAnchor }),
     notify: () => {
       background(coordinator()?.fetch("https://batcher.internal/notify", { method: "POST" }))
     },
@@ -194,7 +227,7 @@ function buildWorker(env: WorkerEnv): Built {
   const publicClient = createPublicClient({ transport: http(rpcUrl) })
   const reader = new RegistryReader({ publicClient, deployment })
   const stores = d1Stores(env.DB)
-  const batching = batchingOptions(env, deployment)
+  const batching = batchingOptions(env, deployment, publicClient)
   const { app, limits } = createContextApi({ reader, deployment, stores, ...(batching === undefined ? {} : { batching }) })
   built = { env, value: { app, reader, stores, deployment, limits } }
   return built.value

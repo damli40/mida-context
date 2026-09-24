@@ -41,8 +41,17 @@ export interface BatchingOptions {
   enabled: boolean
   batchAnchor: Address
   store: BatchStore
-  /** Signs admission receipts; a store key, unrelated to any chain identity. */
-  receiptAccount: LocalAccount
+  /**
+   * Signs admission receipts; a store key, unrelated to any chain identity. Only the enabled lane
+   * ever signs — with `enabled: false` the field may be absent entirely (the worker keeps the
+   * secret optional then so a missing one cannot take the whole store down).
+   */
+  receiptAccount?: LocalAccount
+  /**
+   * Proves batchAnchor is the contract this deployment expects — run lazily on the first batch
+   * request and cached by the implementer. A throw refuses the batch surface with its message.
+   */
+  verifyAnchor?: () => Promise<void>
   /** Wake-up for the batcher, called exactly once per accepted save. */
   notify: () => void
   /** Runs one submission round; invoked by POST /batch/flush after its checks pass. */
@@ -174,11 +183,26 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
   const { batching, deployment, limits, overlay, authenticated, json } = deps
   const now = () => batching.now?.() ?? Date.now()
 
+  // When the lane is on, every batch route first asks verifyAnchor — the once-only, cached check
+  // that BATCH_ANCHOR really is the deployment's anchor contract. A failure (mismatch or an
+  // unreadable chain) refuses the surface rather than trust state from the wrong contract.
+  const anchorRefusal = async (c: Context<BatchRouteEnv>): Promise<Response | null> => {
+    if (batching.verifyAnchor === undefined) return null
+    try {
+      await batching.verifyAnchor()
+      return null
+    } catch (error) {
+      return reject(c, 503, "BATCH_ANCHOR_UNVERIFIED", error instanceof Error ? error.message : String(error))
+    }
+  }
+
   // Public: the only fact a would-be submitter needs is whether this store batches, and where.
   app.get("/batch/status", (c) => c.json({ enabled: batching.enabled, batchAnchor: batching.batchAnchor }))
 
   app.post("/batch/saves", authenticated(limits.maxRequestBodyBytes), async (c) => {
     if (!batching.enabled) return reject(c, 503, "BATCHING_DISABLED", "batched saves are not enabled on this store")
+    const saveRefusal = await anchorRefusal(c)
+    if (saveRefusal !== null) return saveRefusal
     const signer = c.get("signer")
     const reader = c.get("chain")
     const save = parseBatchedSave(json(c.get("body")))
@@ -284,7 +308,13 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
         ["MIDA_BATCH_RECEIPT_V1", contextId, BigInt(receivedAt), sequence],
       ),
     )
-    const signature = await batching.receiptAccount.signMessage({ message: { raw: receiptDigest } })
+    const receiptAccount = batching.receiptAccount
+    if (receiptAccount === undefined) {
+      // Enabled without a receipt key is a construction bug — the worker refuses that env at boot —
+      // but a hand-rolled BatchingOptions can still reach here; refuse rather than sign nothing.
+      throw new Error("batching is enabled but no receipt account was configured")
+    }
+    const signature = await receiptAccount.signMessage({ message: { raw: receiptDigest } })
     const receipt: BatchReceipt = { contextId, receivedAt, sequence: sequence.toString(10), signature }
     batching.notify() // once, after the row exists — a refused save never wakes the batcher
     return c.json({ state: "QUEUED" as const, receipt }, 201)
@@ -293,6 +323,8 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
   // Same authorization as GET /objects: the owner reads freely; anyone else needs a live READ grant
   // on the area. Anchored and pending rows list; REJECTED rows never do.
   app.get("/batch/saves", authenticated(limits.maxRequestBodyBytes), async (c) => {
+    const listRefusal = await anchorRefusal(c)
+    if (listRefusal !== null) return listRefusal
     const signer = c.get("signer")
     const reader = c.get("chain")
     const owner = address(c.req.query("owner"), "owner")
@@ -306,6 +338,8 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
   })
 
   app.get("/batch/saves/:contextId", authenticated(limits.maxRequestBodyBytes), async (c) => {
+    const getRefusal = await anchorRefusal(c)
+    if (getRefusal !== null) return getRefusal
     const signer = c.get("signer")
     const reader = c.get("chain")
     const contextId = hex(c.req.param("contextId"), 32, "contextId")
@@ -331,6 +365,8 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
   // owner key may ask — a stranger cannot even learn whether the queue holds anything.
   app.post("/batch/flush", authenticated(limits.maxRequestBodyBytes), async (c) => {
     if (!batching.enabled) return reject(c, 503, "BATCHING_DISABLED", "batched saves are not enabled on this store")
+    const flushRefusal = await anchorRefusal(c)
+    if (flushRefusal !== null) return flushRefusal
     const signer = c.get("signer")
     const reader = c.get("chain")
     const isAgent = (await reader.agentIdOfSigner(signer)) !== null
