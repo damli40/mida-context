@@ -210,7 +210,10 @@ describe("M1 drainOnce on local Anvil", () => {
     const codexSessions = join(homeDir, ".codex", "sessions", "2026", "09", "21")
     mkdirSync(codexSessions, { recursive: true })
     const codexTranscript = join(codexSessions, "rollout-s-codex.jsonl")
-    writeFileSync(codexTranscript, JSON.stringify({ type: "user", cwd: workDir, message: { content: "codex session" } }) + "\n")
+    writeFileSync(codexTranscript, [
+      JSON.stringify({ timestamp: "2026-09-21T10:00:00.000Z", type: "session_meta", payload: { cwd: workDir } }),
+      JSON.stringify({ timestamp: "2026-09-21T10:00:01.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "codex session" }] } }),
+    ].join("\n") + "\n")
     job({ agent: "codex", sessionId: "s-codex", transcriptPath: codexTranscript })
     const result = await drain()
     expect(result.saved).toBe(0)
@@ -228,7 +231,7 @@ describe("M1 drainOnce on local Anvil", () => {
     }
     // the dropped job was not kept, so nothing from before approval is saved — a grown
     // transcript on a new job is what saves
-    appendFileSync(codexTranscript, JSON.stringify({ type: "assistant", cwd: workDir, message: { content: [{ type: "text", text: "codex step" }] } }) + "\n")
+    appendFileSync(codexTranscript, JSON.stringify({ timestamp: "2026-09-21T10:00:02.000Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "codex step" }] } }) + "\n")
     job({ agent: "codex", sessionId: "s-codex", transcriptPath: codexTranscript })
     const after = await drain()
     expect(after.saved).toBe(1)

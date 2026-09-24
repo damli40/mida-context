@@ -469,7 +469,10 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
       const transcript = join(sessionsDir, "rollout-hook.jsonl")
       writeFileSync(
         transcript,
-        JSON.stringify({ type: "user", cwd: workDir, message: { content: "hook fired mid-migration" } }) + "\n",
+        [
+          JSON.stringify({ timestamp: "2026-09-23T10:00:00.000Z", type: "session_meta", payload: { cwd: workDir } }),
+          JSON.stringify({ timestamp: "2026-09-23T10:00:01.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hook fired mid-migration" }] } }),
+        ].join("\n") + "\n",
       )
 
       // Interrupt mid-flight — the marker is up, so no service may start.

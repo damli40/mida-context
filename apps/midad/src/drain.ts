@@ -11,7 +11,7 @@ import type { Checkpoint } from "@mida/checkpoint"
 import { chainFor, parseDeployment } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { RegistryReader } from "@mida/api"
-import { readConversation } from "@mida/compiler"
+import { readTranscriptFor } from "@mida/compiler"
 import type { compileCheckpoint } from "@mida/compiler"
 import { CheckpointPayloadError, eventIdFor, unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
@@ -291,10 +291,11 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           removeJob(deps.home, job.id)
           continue
         }
-        // a transcript that is not the Claude Code format is not sent to the model in M1 —
-        // the file might have been swapped for one since the path check passed
-        const convo = readConversation(job.transcriptPath)
-        if (convo.format === "unknown-tail") {
+        // the reader is chosen by the agent that wrote the transcript — an agent with no
+        // reader, or a file in no known format (it might have been swapped for one since
+        // the path check passed), is not sent to the model
+        const convo = readTranscriptFor(job.agent, job.transcriptPath)
+        if (convo === null || convo.format === "unknown-tail") {
           moveToBad(deps.home, `${job.id}.json`)
           writeState(deps.home, sessionId, terminal)
           log({ sessionId, outcome: "bad", reason: "unknown-transcript-format" })

@@ -220,7 +220,7 @@ describe("the long-running midad", () => {
     // queue must belong to an agent the drain can still approve at that point
     mkdirSync(join(homeDir, ".codex", "sessions"), { recursive: true })
     codexTranscriptPath = join(homeDir, ".codex", "sessions", "rollout-test.jsonl")
-    writeFileSync(codexTranscriptPath, JSON.stringify({ type: "user", message: { content: "Build a thing" } }) + "\n")
+    writeFileSync(codexTranscriptPath, JSON.stringify({ timestamp: "2026-09-21T10:00:00.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Build a thing" }] } }) + "\n")
     daemon = await start()
   }, STEP_TIMEOUT * 4)
 
