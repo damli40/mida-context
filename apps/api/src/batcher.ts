@@ -436,7 +436,10 @@ export class Batcher {
         return null
       }
       // The send failed ambiguously — the tx may or may not land. Requeue wholesale; if it did land,
-      // the next batch's ALREADY_ANCHORED rejects heal the rows through findAnchoring.
+      // the next batch's ALREADY_ANCHORED rejects heal the PARENT-LESS rows through findAnchoring.
+      // A parented save resubmitted after its first copy landed comes back STALE_PARENT instead —
+      // the lineage head moved to that very copy — and nothing heals it; the rejection loop below
+      // logs that case as batch.stale-after-requeue.
       const requeued = await this.#store.requeue(batchId)
       this.#submitted.delete(batchId.toLowerCase())
       await this.#journal?.clear(batchId)
@@ -569,6 +572,12 @@ export class Batcher {
         const healed = await this.#anchorFromEarlierBatch(batchId, contextId, anchoredAt)
         if (!healed) await this.#store.markRejected(contextId, rejectName(rejection.reason))
       } else {
+        if (rejection.reason === BATCH_REJECT.STALE_PARENT) {
+          // A parented save whose lineage head moved before it landed has no heal — ALREADY_ANCHORED's
+          // earlier-batch proof only exists for a parent-less save whose own contextId anchored. The
+          // row is REJECTED; the event keeps this known unhealed case visible rather than silent.
+          this.#log?.({ event: "batch.stale-after-requeue", batchId, contextId })
+        }
         await this.#store.markRejected(contextId, rejectName(rejection.reason))
       }
     }

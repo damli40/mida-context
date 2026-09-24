@@ -3,8 +3,9 @@
 // immediately, minGapMs is a hard floor between submissions, and every crash point the journal
 // covers — between journal-write and submit, between submit and resolve — ends with correct row
 // states after recover(). The fake chain mirrors the contract: it computes real leaf hashes and a
-// real Merkle root over accepted saves, rejects like _checkAndApply (including ALREADY_ANCHORED for
-// a contextId it has anchored before), and stores bytes32(0) as the root of an all-rejected batch.
+// real Merkle root over accepted saves, rejects like _checkAndApply (ALREADY_ANCHORED only for a
+// parent-less save whose lineage already has a head, STALE_PARENT for a parented save whose lineage
+// moved), and stores bytes32(0) as the root of an all-rejected batch.
 
 import { describe, expect, it } from "vitest"
 import { createServer } from "node:http"
@@ -20,6 +21,7 @@ import {
   batchContextId,
   batchLeafHash,
   batchSaveStructHash,
+  headCommit,
   merkleRoot,
   namespaceId,
   verifyMerkleProof,
@@ -248,14 +250,18 @@ const flipNibble = (hex: Hex): Hex => (hex.endsWith("0") ? `${hex.slice(0, -1)}1
 
 /**
  * The contract, faked faithfully: submitBatch computes real leaves over accepted saves and stores
- * the real Merkle root; a contextId already anchored anywhere is ALREADY_ANCHORED, and BatchExists
- * answers { exists: true } for a batchId it has seen. Knobs let a test lie on purpose (rootOverride,
+ * the real Merkle root; lineage rejection follows _checkAndApply exactly — ALREADY_ANCHORED only
+ * when a parent-less save's own lineage already has a head, STALE_PARENT when a parented save's
+ * lineage head moved (kept as real head commits in `heads`) — and BatchExists answers
+ * { exists: true } for a batchId it has seen. Knobs let a test lie on purpose (rootOverride,
  * tamperField) or break the world (failSubmit, afterRecord, failLogs) at exact crash points.
  */
 class FakeChain implements BatcherChain {
   readonly batches = new Map<string, RecordedBatch>()
   readonly submissions: { batchId: Hex; count: number }[] = []
   readonly anchoredIn = new Map<string, Hex>()
+  /** lineageId → the head commit the contract's _headCommit would hold for it. */
+  readonly heads = new Map<string, Hex>()
   attempts = 0
   blockCounter = 100n
   now: () => number = () => 0
@@ -300,8 +306,25 @@ class FakeChain implements BatcherChain {
     saves.forEach((wire, index) => {
       const meta = metas.get(wire.message.objectNonce.toLowerCase())
       if (meta === undefined) throw new Error("test bug: the fake chain got an undescribed save")
-      const prior = this.anchoredIn.get(meta.contextId.toLowerCase())
-      const reason = prior !== undefined ? BATCH_REJECT.ALREADY_ANCHORED : this.rejectWith(wire, index)
+      // The contract's check order: signer/shape/area/authority/epoch first — rejectWith scripts
+      // those — then lineage. A parent-less save is ALREADY_ANCHORED only when its own lineage
+      // (lineageId == contextId) already has a head; a parented save is STALE_PARENT when the
+      // lineage head no longer equals the commit of its signed (parentId, parentVersion).
+      let reason = this.rejectWith(wire, index)
+      if (reason === null) {
+        if (wire.message.parentId === zeroHash) {
+          if (this.heads.has(meta.lineageId.toLowerCase())) reason = BATCH_REJECT.ALREADY_ANCHORED
+        } else {
+          const expected = headCommit({
+            contextId: wire.message.parentId,
+            owner: wire.message.owner,
+            namespaceId: wire.message.namespaceId,
+            rootAuthor: wire.message.rootAuthor,
+            version: wire.message.parentVersion,
+          })
+          if (this.heads.get(meta.lineageId.toLowerCase()) !== expected) reason = BATCH_REJECT.STALE_PARENT
+        }
+      }
       if (reason !== null) {
         rejected.push({ index, reason })
         return
@@ -315,6 +338,18 @@ class FakeChain implements BatcherChain {
         leafHash: leafOf(meta),
       })
       this.anchoredIn.set(meta.contextId.toLowerCase(), key)
+      // The contract writes the lineage head commit on every accepted save — the agent as
+      // rootAuthor for a new lineage, the signed rootAuthor for a replacement.
+      this.heads.set(
+        meta.lineageId.toLowerCase(),
+        headCommit({
+          contextId: meta.contextId,
+          owner: wire.message.owner,
+          namespaceId: wire.message.namespaceId,
+          rootAuthor: wire.message.parentId === zeroHash ? meta.agentId : wire.message.rootAuthor,
+          version: meta.version,
+        }),
+      )
     })
     this.batches.set(key, {
       anchored,
@@ -779,6 +814,38 @@ describe("the batcher", () => {
     const earlier = await rig.chain.batchOf(firstBatchId as Hex)
     expect(verifyMerkleProof(leafOf(meta), row.proof!, earlier.root)).toBe(true)
     expect(await rig.journal.list()).toEqual([])
+  })
+
+  it("a parented save resubmitted after an ambiguous send is STALE_PARENT — unhealed, logged as batch.stale-after-requeue", async () => {
+    const rig = makeRig()
+    // A v1 root and a child signed against it. The contract's rule: a parented save whose lineage
+    // head moved is STALE_PARENT, never ALREADY_ANCHORED — even when it is the save's own earlier
+    // copy that moved the head.
+    const root = makeSave()
+    const child = makeSave({ parentId: root.meta.contextId, parentVersion: 1, lineageId: root.meta.contextId, rootAuthor: AGENT_ID })
+    await rig.enqueue(root.wire, root.meta.contextId)
+    await rig.enqueue(child.wire, child.meta.contextId)
+    rig.chain.afterRecord = () => {
+      throw new Error("the response never arrived")
+    }
+
+    await rig.batcher.flush()
+    // The batch landed but the batcher saw only a failure — both rows requeued.
+    expect(rig.chain.batches.size).toBe(1)
+    expect((await rig.store.get(child.meta.contextId))!.state).toBe("QUEUED")
+
+    rig.chain.afterRecord = null
+    await rig.batcher.flush()
+    // The resubmission lands under a fresh batchId: the root is ALREADY_ANCHORED and heals onto the
+    // first batch's proof; the child is STALE_PARENT — nothing heals it, and the log names the row.
+    expect(rig.chain.submissions).toHaveLength(2)
+    const rootRow = (await rig.store.get(root.meta.contextId))!
+    expect(rootRow).toMatchObject({ state: "ANCHORED", batchId: rig.chain.submissions[0]!.batchId.toLowerCase() })
+    expect((await rig.store.get(child.meta.contextId))!).toMatchObject({ state: "REJECTED", reason: "STALE_PARENT" })
+    expect(rig.events.find((entry) => entry["event"] === "batch.stale-after-requeue")).toMatchObject({
+      batchId: rig.chain.submissions[1]!.batchId,
+      contextId: child.meta.contextId,
+    })
   })
 
   it("a resubmitted batchId resolves the existing batch instead of sending again", async () => {
