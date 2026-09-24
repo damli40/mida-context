@@ -42,11 +42,48 @@ export interface ContextRecordView {
 const lower = <T extends string>(value: T) => value.toLowerCase() as T
 
 /**
+ * Canonical Multicall3 deployment — verified present on Monad testnet. One aggregate3 `eth_call`
+ * answers a whole batch of `getRecord` checks; chains without it (local rigs, test chains) take the
+ * per-row path unchanged.
+ */
+export const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11" as const
+
+/** The most contextIds one batched `getRecords` asks about — one Multicall3 `eth_call` per batch. */
+export const RECORDS_PER_MULTICALL = 200
+
+/**
  * Every Monad read the Context API and SDK make. Nothing here is cached: each call reads current chain state, so no
  * local value can make Monad authorization true (§12, `currentlyAllowedByMonad`).
  */
 export class RegistryReader {
+  #recordBatchSize: number | undefined
+  #recordBatchSizeProbe: Promise<number> | undefined
+
   constructor(readonly context: ChainContext) {}
+
+  /**
+   * The probed batch size once known, undefined while unprobed. Lets a BudgetedReader return a
+   * cached answer without charging the request for a chain read that does not happen.
+   */
+  get knownRecordBatchSize(): number | undefined {
+    return this.#recordBatchSize
+  }
+
+  /**
+   * The most contextIds one `getRecords` call answers in a single chain read: RECORDS_PER_MULTICALL
+   * when the chain carries Multicall3, 1 where it does not. Probed once per reader with `getCode`
+   * and cached; a chain that cannot answer the probe cannot run a multicall either, so a failed
+   * probe also resolves to 1 — the per-row path — rather than breaking reads on an RPC that does
+   * not serve `eth_getCode`.
+   */
+  recordBatchSize(): Promise<number> {
+    if (this.#recordBatchSize !== undefined) return Promise.resolve(this.#recordBatchSize)
+    this.#recordBatchSizeProbe ??= this.context.publicClient
+      .getCode({ address: MULTICALL3_ADDRESS })
+      .then((code) => (this.#recordBatchSize = code === undefined || code === "0x" ? 1 : RECORDS_PER_MULTICALL))
+      .catch(() => (this.#recordBatchSize = 1))
+    return this.#recordBatchSizeProbe
+  }
 
   now(): Promise<bigint> {
     return latestTimestamp(this.context)
@@ -121,6 +158,39 @@ export class RegistryReader {
       if (isMidaError(mapped, "NOT_FOUND")) return null
       throw mapped
     }
+  }
+
+  /**
+   * `getRecord` for a batch of contextIds. With Multicall3 the batch is ONE `eth_call` — hundreds of
+   * never-anchored uploads can no longer spend a request's read budget a row at a time. A reverted
+   * item (the `ContextNotFound` of an orphaned upload) comes back as a null entry — "not anchored",
+   * never an error. Chains without Multicall3 fall back to one `getRecord` per id, unchanged.
+   * Callers pass at most `recordBatchSize()` ids per call, so each call costs exactly one unit of
+   * read budget — or `contextIds.length` units on the per-row path, identical to `getRecord`.
+   */
+  async getRecords(contextIds: readonly Hex[]): Promise<(ContextRecordView | null)[]> {
+    if (contextIds.length === 0) return []
+    if ((await this.recordBatchSize()) === 1) {
+      return Promise.all(contextIds.map((contextId) => this.getRecord(contextId)))
+    }
+    const results = await this.context.publicClient.multicall({
+      // batchSize 0 disables viem's calldata chunking (default 1024 bytes): the whole batch is a
+      // single aggregate3 eth_call, which is what one unit of read budget pays for.
+      batchSize: 0,
+      multicallAddress: MULTICALL3_ADDRESS,
+      allowFailure: true,
+      contracts: contextIds.map((contextId) => ({
+        address: this.context.deployment.contextRegistry,
+        abi: contextRegistryAbi,
+        functionName: "getRecord",
+        args: [contextId],
+      })),
+    })
+    return results.map((entry) => {
+      if (entry.status !== "success") return null
+      const record = entry.result as unknown as ContextRecordView
+      return { ...record, owner: lower(record.owner) }
+    })
   }
 
   async #capability<T>(functionName: string, args: readonly unknown[]): Promise<T> {

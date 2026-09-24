@@ -303,6 +303,28 @@ function contractSuite(
       }
     })
 
+    it("the admission-time pending sum counts only uploads since the given cutoff", async () => {
+      const { stores, cleanup } = await make()
+      try {
+        // 30 stale orphans of 8 bytes = 240 pending bytes the chain never anchored — over a
+        // 100-byte cap while they count.
+        const stale = new Date(Date.now() - 3 * 86_400_000).toISOString()
+        for (let i = 0; i < 30; i++) {
+          const orphan = fakeObject(OWNER)
+          orphan.object.manifest.ciphertextSize = 8
+          orphan.object.uploadedAt = stale
+          await stores.objects.putObject(orphan.object)
+        }
+        const candidate = fakeObject(OWNER)
+        // No cutoff: every unmarked row counts, and 240 + 64 refuses the admission.
+        expect(await stores.objects.putObjectWithinPending(candidate.object, 100, candidate.ciphertext)).toBe("over-cap")
+        // The app's 24 h quota window drops the stale orphans from the sum and the row lands.
+        expect(await stores.objects.putObjectWithinPending(candidate.object, 100, candidate.ciphertext, new Date(Date.now() - 86_400_000))).toBe("stored")
+      } finally {
+        await cleanup()
+      }
+    })
+
     it("sweeps pending objects past 24 h and expired nonces, and never an anchored object", async () => {
       const { stores, cleanup } = await make()
       try {

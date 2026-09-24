@@ -57,12 +57,15 @@ export interface ObjectStore {
    * first upload crashed between the writes; a different manifest for the same contextId throws
    * COMMITMENT_MISMATCH, as `putObject` does, and a refused or mismatched PUT writes no blob at all.
    * `blob` must hash to `object.manifest.ciphertextHash` — anything else is CONTENT_HASH_MISMATCH.
+   * `pendingSince` bounds which unmarked rows count toward the sum: only uploads at or after it.
+   * The app passes its quota-window cutoff so orphaned uploads past the window cannot block new
+   * writes at admission time; omitting it counts every unmarked row, the strictest reading.
    * D1 evaluates the sum and the insert in a single statement inside one batch with the blob insert,
    * so two Worker instances cannot both squeeze under the cap; the file-backed store performs the
    * same check synchronously — atomic inside one Node process, but not across processes sharing a
    * directory, which the README documents as single-process.
    */
-  putObjectWithinPending(object: StoredObject, maxPendingBytes: number, blob: Uint8Array): Promise<"stored" | "repeat" | "over-cap">
+  putObjectWithinPending(object: StoredObject, maxPendingBytes: number, blob: Uint8Array, pendingSince?: Date): Promise<"stored" | "repeat" | "over-cap">
   putWrap(wrap: ReaderEpochWrap): Promise<void>
   getWrap(key: WrapKey): Promise<ReaderEpochWrap | undefined>
   /**

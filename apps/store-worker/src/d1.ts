@@ -165,13 +165,16 @@ export class D1ObjectStore implements ObjectStore {
       .sort((a, b) => (a.uploadedAt === b.uploadedAt ? (a.contextId < b.contextId ? -1 : 1) : a.uploadedAt < b.uploadedAt ? -1 : 1))
   }
 
-  async putObjectWithinPending(object: StoredObject, maxPendingBytes: number, blob: Uint8Array): Promise<"stored" | "repeat" | "over-cap"> {
+  async putObjectWithinPending(object: StoredObject, maxPendingBytes: number, blob: Uint8Array, pendingSince?: Date): Promise<"stored" | "repeat" | "over-cap"> {
     verifyContent(object.manifest.ciphertextHash, blob)
     // The row and its blob land in ONE batch — a sweep can never land between them and delete the
     // blob of a row about to exist. The blob insert follows the row insert and writes only when a
     // matching row is there afterwards ("stored" or "repeat"), so a refused or mismatched PUT leaves
     // no orphan blob behind. Inside one transaction the ordering is cosmetic; the guard — not the
-    // order — is what stops a blob the quota did not admit.
+    // order — is what stops a blob the quota did not admit. `pendingSince` restricts the pending sum
+    // to uploads at or after it — the app's quota-window cutoff, so orphans past the window cannot
+    // block new writes here either; omitted, every unmarked row counts as before.
+    const pendingFilter = pendingSince === undefined ? "" : "AND uploaded_at >= ?"
     const inserted = await this.db.batch([
       this.db
         .prepare(
@@ -179,7 +182,7 @@ export class D1ObjectStore implements ObjectStore {
              (context_id, owner, uploader, namespace_id, author_id, object_nonce, expected_parent_id, manifest, manifest_hash, ciphertext_hash, size, uploaded_at, anchored_at)
            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
            WHERE NOT EXISTS (SELECT 1 FROM objects WHERE context_id = ?)
-             AND (SELECT COALESCE(SUM(size), 0) FROM objects WHERE uploader = ? AND anchored_at IS NULL) + ? <= ?`,
+             AND (SELECT COALESCE(SUM(size), 0) FROM objects WHERE uploader = ? AND anchored_at IS NULL ${pendingFilter}) + ? <= ?`,
         )
         .bind(
           object.contextId.toLowerCase(),
@@ -197,6 +200,7 @@ export class D1ObjectStore implements ObjectStore {
           object.anchoredAt,
           object.contextId.toLowerCase(),
           object.uploader.toLowerCase(),
+          ...(pendingSince === undefined ? [] : [pendingSince.toISOString()]),
           object.manifest.ciphertextSize,
           maxPendingBytes,
         ),

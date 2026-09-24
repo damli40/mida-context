@@ -144,7 +144,9 @@ function storedObject(body: ObjectUploadBody): StoredObject {
     expectedParentId: body.expectedParentId,
     manifest: body.manifest,
     manifestHash: manifestHash(body.manifest),
-    uploadedAt: new Date().toISOString(),
+    // Rows are stamped on the app's injected clock, not the wall clock: the pending quota only
+    // counts uploads inside its 24 h window, and a wall-clock row is months stale next to NOW.
+    uploadedAt: new Date(Number(NOW) * 1000).toISOString(),
     anchoredAt: null,
   }
 }
@@ -285,6 +287,42 @@ describe("upload-abuse limits", () => {
     expect(last!.headers.get("retry-after")).toBe("5")
     // Authorization spent its reads first; the re-check spent at most 16 of what remained.
     expect(recordCalls.length).toBeLessThanOrEqual(16)
+  })
+
+  it("orphaned uploads older than 24h do not count toward the pending-bytes quota; fresh ones still do", async () => {
+    const records = new Map<Hex, ContextRecordView>()
+    const base = stubReader(records)
+    const recordCalls: Hex[] = []
+    const reader = {
+      ...base,
+      getRecord: async (id: Hex) => {
+        recordCalls.push(id)
+        return base.getRecord(id)
+      },
+    } as RegistryReader
+    const { app, store } = apiFor(reader, { maxPendingBytesPerSigner: 100 })
+    const { client, seen } = watchingClient(app)
+
+    // 30 stale orphans of 8 bytes = 240 pending bytes the chain never anchored. Past the 24 h
+    // quota window they stop counting — before the fix they blocked every new upload forever.
+    const stale = new Date((Number(NOW) - 3 * 86_400) * 1000).toISOString()
+    for (let i = 0; i < 30; i++) {
+      const orphan = storedObject(upload(randomBytes(8)))
+      orphan.uploadedAt = stale
+      await store.putObject(orphan)
+    }
+    const admitted = await client.putObject(upload(randomBytes(60)))
+    expect(admitted.state).toBe("pending")
+    expect(recordCalls).toEqual([]) // the stale orphans are not even scanned
+
+    // A fresh unmarked upload still counts: 60 + 60 + 50 > 100 refuses, and only the two fresh
+    // rows are re-checked against Monad — the stale orphans stay out of the scan.
+    const fresh = storedObject(upload(randomBytes(50)))
+    await store.putObject(fresh)
+    await expect(client.putObject(upload(randomBytes(60)))).rejects.toThrowError(/429/)
+    expect(seen.status).toBe(429)
+    expect(seen.body).toContain("maxPendingBytesPerSigner")
+    expect(new Set(recordCalls)).toEqual(new Set([admitted.contextId, fresh.manifest.contextId]))
   })
 
   it("two simultaneous PUTs that together exceed the pending cap admit exactly one", async () => {

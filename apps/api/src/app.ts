@@ -65,6 +65,16 @@ export const PENDING_CHECK_BATCH = 8
 export const PENDING_CHECK_MAX_READS = 16
 
 /**
+ * An unmarked upload only counts against the pending-bytes quota for this long. Stale orphans —
+ * uploads whose anchor transaction never landed — would otherwise sit in the quota sum forever and
+ * block every new PUT. Age is safe HERE because the quota only bounds storage cost; it is never
+ * safe in the read path, where an unmarked row must be checked against Monad however old it is —
+ * the anchored_at mark is only written on a verified read, so an old row can still hold a real
+ * record.
+ */
+export const PENDING_QUOTA_WINDOW_SECONDS = 86_400
+
+/**
  * Per-IP request limiting, injected by the deployment. The hosted Worker's [[ratelimits]] bindings adapt
  * to it; a self-hosted Node server may pass its own (or none — the README says a reverse proxy is needed
  * then). `signed` tells the limiter which bucket the request counts against.
@@ -277,13 +287,16 @@ export function createContextApi(options: ContextApiOptions) {
     }
 
     // 7. quotas: a signer may not use the store as free hosting. Only rows never marked anchored count
-    // against the byte cap — an uploader's anchored history is skipped entirely. Each unmarked row is
-    // re-checked against Monad oldest-first, 8 at a time and at most 16 reads — and never more than
-    // what authorization left of this request's chain budget. A confirmed anchor marks the row once,
-    // permanently, and frees its bytes. Rows left unchecked still count as pending, so a flood of
-    // unconfirmed uploads cannot hide behind the read budget.
+    // against the byte cap — an uploader's anchored history is skipped entirely, and so are rows older
+    // than the quota window: an orphaned upload past PENDING_QUOTA_WINDOW_SECONDS costs storage, not
+    // quota, or it would block new PUTs forever. Each remaining unmarked row is re-checked against
+    // Monad oldest-first, 8 at a time and at most 16 reads — and never more than what authorization
+    // left of this request's chain budget. A confirmed anchor marks the row once, permanently, and
+    // frees its bytes. Rows left unchecked still count as pending, so a flood of unconfirmed uploads
+    // cannot hide behind the read budget.
     const alreadyStored = (await store.getObject(manifest.contextId))?.manifestHash === committedManifestHash
-    const unmarked = await store.pendingByUploader(signer)
+    const pendingSince = new Date((Number(clock()) - PENDING_QUOTA_WINDOW_SECONDS) * 1000)
+    const unmarked = (await store.pendingByUploader(signer)).filter((object) => Date.parse(object.uploadedAt) >= pendingSince.getTime())
     let pendingBytes =
       (alreadyStored ? 0 : ciphertext.length) +
       unmarked.reduce((total, other) => (other.contextId === manifest.contextId ? total : total + other.manifest.ciphertextSize), 0)
@@ -332,11 +345,12 @@ export function createContextApi(options: ContextApiOptions) {
         expectedParentId: upload.expectedParentId,
         manifest,
         manifestHash: committedManifestHash,
-        uploadedAt: new Date().toISOString(),
+        uploadedAt: new Date(Number(clock()) * 1000).toISOString(),
         anchoredAt: null,
       },
       limits.maxPendingBytesPerSigner,
       ciphertext,
+      pendingSince,
     )
     if (admission === "over-cap") {
       return quotaExceeded(c, "maxPendingBytesPerSigner", "unanchored ciphertext reached the cap while this PUT was in flight")
@@ -356,30 +370,45 @@ export function createContextApi(options: ContextApiOptions) {
     }
     const objects: AnchoredObject[] = []
     const anchoredNow = new Date(Number(clock()) * 1000).toISOString()
-    let partial = false
-    for (const stored of await store.listObjects(owner, namespaceId)) {
-      // anchored_at records the first verified match; a Monad record cannot be un-registered, so only
-      // an unmarked row asks the chain — and the first match is marked once, permanently. Every check
-      // that decides who may read (capability, epoch, deny overlay) still runs per request above.
-      if (stored.anchoredAt === null) {
-        // One read per unmarked row, bounded by what authorization left of the request budget. A row
-        // the budget cannot reach stays unexamined and unserved — flagged below, retried later: every
-        // row verified in this pass was marked, so a retry spends reads only on rows not yet seen.
-        if (chain.remaining <= 0) {
-          partial = true
-          continue
-        }
-        if (!isAnchored(stored, await chain.getRecord(stored.contextId))) continue
-        await store.markAnchored(stored.contextId, anchoredNow)
+    const stored = await store.listObjects(owner, namespaceId)
+    // anchored_at records the first verified match; a Monad record cannot be un-registered, so only
+    // an unmarked row asks the chain — and the first match is marked once, permanently. Every check
+    // that decides who may read (capability, epoch, deny overlay) still runs per request above. Age
+    // never filters this path: an old unmarked row can still hold a real record, so it is checked
+    // and served like any other.
+    const unmarked = stored.filter((object) => object.anchoredAt === null)
+    // recordBatchSize is the rows one chain read checks: RECORDS_PER_MULTICALL on a chain with
+    // Multicall3 — one eth_call answers the batch, so hundreds of never-anchored uploads cannot
+    // drain the request budget a row at a time — and 1 where it is absent, which is the per-row
+    // scan. Ask for it only when a batch could still run: the first probe is itself a chain read
+    // (a getCode), and a spent budget must answer partial, not throw.
+    const batchSize = unmarked.length === 0 || chain.remaining <= 0 ? 1 : await chain.recordBatchSize()
+    const verified = new Set<Hex>()
+    let checked = 0
+    while (checked < unmarked.length && chain.remaining > 0) {
+      const batch = unmarked.slice(checked, checked + batchSize)
+      const records = await chain.getRecords(batch.map((object) => object.contextId))
+      for (let index = 0; index < batch.length; index++) {
+        const candidate = batch[index]!
+        if (!isAnchored(candidate, records[index] ?? null)) continue
+        await store.markAnchored(candidate.contextId, anchoredNow)
+        verified.add(candidate.contextId)
       }
+      checked += batch.length
+    }
+    // Rows the budget could not reach stay unexamined and unserved — flagged below, retried later:
+    // every row verified in this pass was marked, so a retry spends reads only on rows not yet seen.
+    const partial = checked < unmarked.length
+    for (const object of stored) {
+      if (object.anchoredAt === null && !verified.has(object.contextId)) continue
       objects.push({
-        contextId: stored.contextId,
-        owner: stored.owner,
-        namespaceId: stored.namespaceId,
-        authorId: stored.authorId,
-        manifest: stored.manifest,
-        manifestHash: stored.manifestHash,
-        ciphertext: hexOf(await store.blobs.get(stored.manifest.ciphertextHash)),
+        contextId: object.contextId,
+        owner: object.owner,
+        namespaceId: object.namespaceId,
+        authorId: object.authorId,
+        manifest: object.manifest,
+        manifestHash: object.manifestHash,
+        ciphertext: hexOf(await store.blobs.get(object.manifest.ciphertextHash)),
       })
     }
     return c.json({ objects }, 200, partial ? { "x-mida-partial": "true" } : {})

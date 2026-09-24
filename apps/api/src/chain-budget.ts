@@ -1,5 +1,5 @@
 import type { Address, AgentRecord, Hex } from "@mida/protocol"
-import { RegistryReader } from "./chain-views.js"
+import { RECORDS_PER_MULTICALL, RegistryReader } from "./chain-views.js"
 import type { CapabilityView, ContextRecordView } from "./chain-views.js"
 
 /**
@@ -38,6 +38,7 @@ export class BudgetedReader extends RegistryReader {
   readonly #inner: RegistryReader
   readonly #limit: number
   #spent = 0
+  #batchSize: number | undefined
 
   constructor(inner: RegistryReader, limit: number = MAX_CHAIN_READS_PER_REQUEST) {
     super(inner.context)
@@ -107,5 +108,30 @@ export class BudgetedReader extends RegistryReader {
 
   override getRecord(contextId: Hex): Promise<ContextRecordView | null> {
     return this.#read(() => this.#inner.getRecord(contextId))
+  }
+
+  override recordBatchSize(): Promise<number> {
+    if (this.#batchSize !== undefined) return Promise.resolve(this.#batchSize)
+    // Stand-in readers in tests implement only what a test needs: one with no `getRecords` checks
+    // rows one read at a time; one with `getRecords` but no `recordBatchSize` batches the full 200.
+    if (typeof this.#inner.recordBatchSize !== "function") {
+      this.#batchSize = typeof this.#inner.getRecords === "function" ? RECORDS_PER_MULTICALL : 1
+      return Promise.resolve(this.#batchSize)
+    }
+    // The probe's getCode is itself a chain read — charged once, to the request that triggers it.
+    // Once the inner reader has the answer cached it costs this request nothing.
+    if (this.#inner.knownRecordBatchSize !== undefined) {
+      this.#batchSize = this.#inner.knownRecordBatchSize
+      return Promise.resolve(this.#batchSize)
+    }
+    return this.#read(async () => (this.#batchSize = await this.#inner.recordBatchSize()))
+  }
+
+  override getRecords(contextIds: readonly Hex[]): Promise<(ContextRecordView | null)[]> {
+    // A stand-in with no `getRecords` pays one read per row — accounting identical to `getRecord`.
+    if (typeof this.#inner.getRecords !== "function") {
+      return Promise.all(contextIds.map((contextId) => this.getRecord(contextId)))
+    }
+    return this.#read(() => this.#inner.getRecords(contextIds))
   }
 }

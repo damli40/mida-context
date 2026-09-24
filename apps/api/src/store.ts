@@ -79,7 +79,7 @@ export class ApiStore implements ObjectStore {
       .sort((a, b) => (a.uploadedAt === b.uploadedAt ? (a.contextId < b.contextId ? -1 : 1) : a.uploadedAt < b.uploadedAt ? -1 : 1))
   }
 
-  async putObjectWithinPending(object: StoredObject, maxPendingBytes: number, blob: Uint8Array): Promise<"stored" | "repeat" | "over-cap"> {
+  async putObjectWithinPending(object: StoredObject, maxPendingBytes: number, blob: Uint8Array, pendingSince?: Date): Promise<"stored" | "repeat" | "over-cap"> {
     verifyContent(object.manifest.ciphertextHash, blob)
     const path = join(this.#dir, "objects", `${object.contextId}.json`)
     const existing = readJson<StoredObject>(path)
@@ -96,8 +96,15 @@ export class ApiStore implements ObjectStore {
     // is why the README documents one process per data directory.
     let pending = object.manifest.ciphertextSize
     const uploader = object.uploader.toLowerCase()
+    const pendingSinceMs = pendingSince?.getTime()
     for (const other of this.#allObjectsSync()) {
-      if (other.uploader.toLowerCase() === uploader && other.anchoredAt === null) pending += other.manifest.ciphertextSize
+      if (
+        other.uploader.toLowerCase() === uploader &&
+        other.anchoredAt === null &&
+        (pendingSinceMs === undefined || Date.parse(other.uploadedAt) >= pendingSinceMs)
+      ) {
+        pending += other.manifest.ciphertextSize
+      }
     }
     if (pending > maxPendingBytes) return "over-cap"
     // The row lands before the blob here: this process's sweeps re-check references at delete time,

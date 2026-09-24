@@ -136,7 +136,9 @@ function storedObject(body: ObjectUploadBody): StoredObject {
     expectedParentId: body.expectedParentId,
     manifest: body.manifest,
     manifestHash: manifestHash(body.manifest),
-    uploadedAt: new Date().toISOString(),
+    // Rows are stamped on the app's injected clock, not the wall clock: the pending quota only
+    // counts uploads inside its 24 h window, and a wall-clock row is months stale next to NOW.
+    uploadedAt: new Date(Number(NOW) * 1000).toISOString(),
     anchoredAt: null,
   }
 }
@@ -267,5 +269,104 @@ describe("the per-request chain-read budget", () => {
     expect(incomplete.objects).toHaveLength(20) // 5 new objects per call × 4 calls
     // the flag is a first-class field — it cannot hide as a non-enumerable property anymore
     expect(JSON.parse(JSON.stringify(incomplete))).toEqual({ objects: expect.any(Array), partial: true })
+  })
+
+  it("a batch-capable reader checks 189 unmarked rows in one read: orphans cannot make lists partial forever", async () => {
+    const records = new Map<Hex, ContextRecordView>()
+    const base = stubReader(records)
+    const batchCalls: Hex[][] = []
+    // A stand-in implementing getRecords: the app must check a whole batch per read instead of
+    // one row per read.
+    const reader = {
+      ...base,
+      getRecords: async (ids: Hex[]) => {
+        batchCalls.push(ids)
+        return ids.map((id) => records.get(id.toLowerCase() as Hex) ?? null)
+      },
+    } as RegistryReader
+    const { app, store } = apiFor(reader)
+
+    // The failing home's shape: 12 real anchored objects and 177 uploads whose anchor transaction
+    // never landed — every row unmarked. Per-row, the 30-read budget could never reach the end of
+    // the orphans, so the list stayed partial on every read.
+    for (let i = 0; i < 12; i++) {
+      const ciphertext = randomBytes(4)
+      const body = upload(ciphertext)
+      await store.putObject(storedObject(body))
+      await store.blobs.put(ciphertext)
+      records.set(body.manifest.contextId, anchoredRecord(body))
+    }
+    for (let i = 0; i < 177; i++) {
+      await store.putObject(storedObject(upload(randomBytes(4))))
+    }
+
+    const responses: Response[] = []
+    const client = clientFor(app, async (url, init) => {
+      const response = await app.request(url, init)
+      responses.push(response)
+      return response
+    })
+    const listed = await client.request<{ objects: AnchoredObject[] }>("GET", `/objects?owner=${owner}&namespaceId=${NAMESPACE}`)
+    expect(listed.objects).toHaveLength(12)
+    expect(responses[0]!.headers.get("x-mida-partial")).toBeNull()
+    // 189 unmarked rows answered inside ONE batch read — never more than one call per 200 rows.
+    expect(batchCalls.length).toBeLessThanOrEqual(Math.ceil(189 / 200))
+    expect(batchCalls[0]).toHaveLength(189)
+  })
+
+  it("a reader without batch support keeps the per-row behaviour: partial while the budget is short", async () => {
+    const records = new Map<Hex, ContextRecordView>()
+    const recordCalls: Hex[] = []
+    const { app, store } = apiFor(stubReader(records, recordCalls))
+    // Same data — 12 anchored + 177 orphans — but the orphans sort first, so the whole 30-read
+    // budget is spent on rows that will never anchor: the fallback path must behave as before.
+    const stale = new Date((Number(NOW) - 1_000) * 1000).toISOString()
+    for (let i = 0; i < 177; i++) {
+      const orphan = storedObject(upload(randomBytes(4)))
+      orphan.uploadedAt = stale
+      await store.putObject(orphan)
+    }
+    for (let i = 0; i < 12; i++) {
+      const ciphertext = randomBytes(4)
+      const body = upload(ciphertext)
+      await store.putObject(storedObject(body))
+      await store.blobs.put(ciphertext)
+      records.set(body.manifest.contextId, anchoredRecord(body))
+    }
+
+    const responses: Response[] = []
+    const client = clientFor(app, async (url, init) => {
+      const response = await app.request(url, init)
+      responses.push(response)
+      return response
+    })
+    const listed = await client.request<{ objects: AnchoredObject[] }>("GET", `/objects?owner=${owner}&namespaceId=${NAMESPACE}`)
+    expect(responses[0]!.headers.get("x-mida-partial")).toBe("true")
+    expect(listed.objects).toHaveLength(0)
+    expect(recordCalls).toHaveLength(MAX_CHAIN_READS_PER_REQUEST)
+  })
+
+  it("serves an old never-read anchored object: the read path ignores upload age", async () => {
+    const records = new Map<Hex, ContextRecordView>()
+    const base = stubReader(records)
+    const reader = {
+      ...base,
+      getRecords: async (ids: Hex[]) => ids.map((id) => records.get(id.toLowerCase() as Hex) ?? null),
+    } as RegistryReader
+    const { app, store } = apiFor(reader)
+    // Uploaded three days before the app's clock and never read since. Age is a quota concern,
+    // never a read concern: an unmarked row can still hold a real record, so it is checked and
+    // served like any other.
+    const ciphertext = randomBytes(4)
+    const body = upload(ciphertext)
+    const old = storedObject(body)
+    old.uploadedAt = new Date((Number(NOW) - 3 * 86_400) * 1000).toISOString()
+    await store.putObject(old)
+    await store.blobs.put(ciphertext)
+    records.set(body.manifest.contextId, anchoredRecord(body))
+
+    const client = clientFor(app)
+    const listed = await client.request<{ objects: AnchoredObject[] }>("GET", `/objects?owner=${owner}&namespaceId=${NAMESPACE}`)
+    expect(listed.objects.map((object) => object.contextId)).toEqual([body.manifest.contextId])
   })
 })
