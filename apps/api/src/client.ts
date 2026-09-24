@@ -1,5 +1,5 @@
 import { httpRequestTypedData } from "@mida/protocol"
-import type { Address, Hex, ObjectManifest, ReaderEpochWrap, SignedAgentCapabilityManifest } from "@mida/protocol"
+import type { Address, BatchSaveMessage, Hex, ObjectManifest, ReaderEpochWrap, SignedAgentCapabilityManifest } from "@mida/protocol"
 import { hexOf } from "@mida/crypto"
 import { randomBytes } from "@noble/hashes/utils.js"
 import type { LocalAccount } from "viem"
@@ -147,6 +147,32 @@ export class ContextApiClient implements ContextApiRoutes {
   reissueRevocationNonce(intentId: Hex) {
     return this.request<{ intentId: Hex; state: string; cancellationNonce: string }>("POST", `/revocations/${intentId}/reissue`)
   }
+
+  batchStatus() {
+    return this.request<{ enabled: boolean; batchAnchor: Address }>("GET", "/batch/status", { signed: false })
+  }
+
+  postBatchSave(body: BatchedSaveWire) {
+    return this.request<{ state: "QUEUED"; receipt: BatchReceipt }>("POST", "/batch/saves", { body })
+  }
+
+  getBatchSave(contextId: Hex) {
+    return this.request<{ state: BatchedItemState | "REJECTED"; reason: string | null; item?: BatchedReadItem }>(
+      "GET",
+      `/batch/saves/${contextId}`,
+    )
+  }
+
+  async listBatchSaves(input: { owner: Address; namespaceId: Hex }): Promise<{ items: BatchedReadItem[]; partial: boolean }> {
+    const { body, response } = await this.#requestRaw<{ items: BatchedReadItem[] }>("GET", "/batch/saves", {
+      query: { owner: input.owner.toLowerCase(), namespaceId: input.namespaceId },
+    })
+    return { items: body.items, partial: response.headers.get("x-mida-partial") === "true" }
+  }
+
+  flushBatch() {
+    return this.request<{ flushed: boolean; reason?: "empty" | "rate-limited" }>("POST", "/batch/flush")
+  }
 }
 
 /** Retries `listObjects` performs after the first response still carries `x-mida-partial`. */
@@ -174,6 +200,40 @@ export interface RevocationIntentView {
   agentEpochAtIntent: string | null
 }
 
+/** Wire form of `BatchSaveMessage`: the two uint64 fields travel as base-10 strings, everything else verbatim. */
+export type BatchedSaveMessageWire = Omit<BatchSaveMessage, "readEpoch" | "expiresAt"> & {
+  readEpoch: string
+  expiresAt: string
+}
+
+export interface BatchedSaveWire {
+  message: BatchedSaveMessageWire
+  signature: Hex
+  manifest: ObjectManifest
+  ciphertext: Hex
+}
+
+export type BatchedItemState = "QUEUED" | "SUBMITTED" | "ANCHORED"
+
+export interface BatchedReadItem {
+  state: BatchedItemState
+  save: BatchedSaveWire
+  contextId: Hex
+  receivedAt: number
+  batchId?: Hex
+  position?: number
+  lineageId?: Hex
+  version?: number
+  proof?: Hex[]
+}
+
+export interface BatchReceipt {
+  contextId: Hex
+  receivedAt: number
+  sequence: string
+  signature: Hex
+}
+
 export interface ContextApiRoutes {
   putObject(upload: ObjectUploadBody): Promise<{ contextId: Hex; manifestHash: Hex; state: "pending" }>
   listObjects(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }): Promise<ListObjectsResult>
@@ -186,4 +246,9 @@ export interface ContextApiRoutes {
   cancelRevocation(intentId: Hex, input: { expiresAt: bigint; assertion: WebAuthnAssertionInput }): Promise<{ intentId: Hex; state: string }>
   listRevocations(state?: DenyState): Promise<RevocationIntentView[]>
   reissueRevocationNonce(intentId: Hex): Promise<{ intentId: Hex; state: string; cancellationNonce: string }>
+  batchStatus(): Promise<{ enabled: boolean; batchAnchor: Address }>
+  postBatchSave(body: BatchedSaveWire): Promise<{ state: "QUEUED"; receipt: BatchReceipt }>
+  getBatchSave(contextId: Hex): Promise<{ state: BatchedItemState | "REJECTED"; reason: string | null; item?: BatchedReadItem }>
+  listBatchSaves(input: { owner: Address; namespaceId: Hex }): Promise<{ items: BatchedReadItem[]; partial: boolean }>
+  flushBatch(): Promise<{ flushed: boolean; reason?: "empty" | "rate-limited" }>
 }
