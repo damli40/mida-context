@@ -1,7 +1,6 @@
 import { defuse } from "@mida/checkpoint"
-import type { StoredCheckpoint } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
-import { capabilityState, checkAccess } from "./handoff.js"
+import { PENDING_ANCHOR_LINE, capabilityState, checkAccess } from "./handoff.js"
 import type { HandoffDeps } from "./handoff.js"
 import { agoText } from "./hook-output.js"
 import type { MidaHome } from "./home.js"
@@ -9,6 +8,7 @@ import { checkProject } from "./projects.js"
 import type { ServiceRuntime } from "./runtime.js"
 import { SEEN_MAX, readSeen } from "./seen.js"
 import { authorNamesFor, readCheckpoints } from "./skeleton.js"
+import type { StoredCheckpoint } from "./skeleton.js"
 
 /**
  * What the UserPromptSubmit hook asks the daemon: did any OTHER session save to this project
@@ -236,6 +236,10 @@ function updateLine(
   const before = new Set(baseline?.checkpoint.artifacts ?? [])
   const files = checkpoint.artifacts.filter((a) => !before.has(a)).map(defuse)
   if (files.length > 0) parts.push(`files: ${files.join(", ")}`)
+  // A save the store queued but Monad has not anchored is never described as saved — it carries
+  // the same marker the handoff prints, so the note claims no more than the chain has proven.
+  // Pushed as a part so the "saved a checkpoint" fallback can never apply to it either.
+  if (newest.anchor === "PENDING_ANCHOR") parts.push(PENDING_ANCHOR_LINE)
   const body = parts.length === 0 ? "saved a checkpoint" : parts.join("; ")
   return `- ${defuse(name)} (${agoText(checkpoint.createdAt, now)}): ${body}`
 }

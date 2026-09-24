@@ -47,18 +47,22 @@ export interface SourceRecord {
 }
 
 interface ReadFailure {
-  contextId: Hex
+  /** Absent only when the gap is not one record — e.g. the store cannot serve the batch table at all. */
+  contextId?: Hex
   reason: string
 }
 
 /**
  * A plain Error carrying `.code` and `.contextIds` — `owner-read-incomplete` is a midad-level
  * refusal, not a protocol code, so MidaError's closed union cannot carry it. The message leads
- * with the code, the way MidaError formats it, and names every contextId that could not be read.
+ * with the code, the way MidaError formats it, and names every contextId that could not be read;
+ * a failure that is not about one record names only its reason.
  */
 function ownerReadIncomplete(failures: readonly ReadFailure[]): Error & { code: string; contextIds: Hex[] } {
-  const contextIds = [...new Set(failures.map((failure) => failure.contextId))]
-  const detail = failures.map((failure) => `${failure.contextId} (${failure.reason})`).join("; ")
+  const contextIds = [...new Set(failures.flatMap((failure) => (failure.contextId === undefined ? [] : [failure.contextId])))]
+  const detail = failures
+    .map((failure) => (failure.contextId === undefined ? failure.reason : `${failure.contextId} (${failure.reason})`))
+    .join("; ")
   return Object.assign(
     new Error(`owner-read-incomplete: ${failures.length} record(s) could not be read back completely: ${detail}`),
     { code: "owner-read-incomplete", contextIds },
@@ -91,7 +95,9 @@ interface AnchoredSave {
  * proof to the on-chain batch root — then opened with the owner-derived epoch key. The store's
  * word is trusted nowhere: a row the log never named, a log whose row is missing, a row that
  * disagrees with its log, and a list the store marks partial all land in `failures` rather than
- * shortening the universe quietly. `requireLatest` is off — history keeps superseded versions.
+ * shortening the universe quietly. A store without the batch surface cannot even prove "nothing
+ * to read" — `hasBatchedSaves(owner)` answers that instead, and any answer but a clean "none"
+ * fails the read closed. `requireLatest` is off — history keeps superseded versions.
  */
 async function readBatchedUniverse(
   runtime: Runtime,
@@ -101,6 +107,32 @@ async function readBatchedUniverse(
   const { deployment } = runtime.network
   const batchAnchor = deployment.batchAnchor
   if (batchAnchor === undefined) return []
+  // Whether this store serves the batch table for THIS anchor at all — the same question the
+  // /batch/status route answers for the agent-side reader. A store without the routes (a local
+  // store, a pre-batch host) or one answering for another anchor cannot prove "nothing to read":
+  // its silence says nothing about what the chain holds. Only the contract's own flag can — it
+  // is set on the owner's first accepted batched save and no store outage clears it. The check
+  // fails closed: a thrown read is "unknown", and unknown is never treated as "none".
+  const status = await runtime.ownerApi.batchStatus().catch(() => null)
+  if (typeof status?.batchAnchor !== "string" || status.batchAnchor.toLowerCase() !== batchAnchor.toLowerCase()) {
+    let has: boolean
+    try {
+      has = (await runtime.ownerChain.publicClient.readContract({
+        address: batchAnchor,
+        abi: batchAnchorAbi,
+        functionName: "hasBatchedSaves",
+        args: [runtime.owner],
+      } as never)) as boolean
+    } catch (error) {
+      throw ownerReadIncomplete([
+        { reason: `the chain could not say whether batched saves exist: ${error instanceof Error ? error.message : String(error)}` },
+      ])
+    }
+    if (has) {
+      throw ownerReadIncomplete([{ reason: "batched saves exist on chain but this store serves none" }])
+    }
+    return []
+  }
   const logs = await getLogsChunked(runtime.ownerChain.publicClient, {
     address: batchAnchor,
     event: SAVE_ANCHORED,

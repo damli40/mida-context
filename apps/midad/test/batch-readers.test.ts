@@ -106,6 +106,22 @@ async function stubStore(status: { enabled: boolean; batchAnchor: string } = { e
   }
 }
 
+/** A store that 404s every route — a local or pre-batch host with no batch surface at all. */
+async function noBatchStore(): Promise<{ url: string; close(): Promise<void> }> {
+  const server = createHttpServer((_req, res) => {
+    res.statusCode = 404
+    res.end(JSON.stringify({ code: "not-found" }))
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  return {
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    close: () => new Promise<void>((done) => server.close(() => done())),
+  }
+}
+
 /** The JSON-RPC calls resolveNetwork's chainId probe makes. */
 async function stubRpc(): Promise<{ url: string; close(): Promise<void> }> {
   const server = createHttpServer((req, res) => {
@@ -145,15 +161,31 @@ function writeIdentity(home: MidaHome, name: string, agentId: Hex = MY_AGENT_ID)
   })
 }
 
-/** The ServiceRuntime shape readCheckpoints reads — agent and store are injected fakes. */
-function fakeRuntime(home: MidaHome, over: { network?: Network; apiBaseUrl?: string; agent?: unknown } = {}): ServiceRuntime {
+/** The ServiceRuntime shape readCheckpoints reads — agent, store and chain are injected fakes. */
+function fakeRuntime(home: MidaHome, over: {
+  network?: Network
+  apiBaseUrl?: string
+  agent?: unknown
+  /** What `BatchAnchor.hasBatchedSaves(owner)` answers; absent makes the chain read throw. */
+  hasBatchedSaves?: (owner: Address) => Promise<boolean>
+} = {}): ServiceRuntime {
   return {
     home,
     owner: OWNER,
     network: over.network,
     apiBaseUrl: over.apiBaseUrl ?? "http://127.0.0.1:1",
     agent: () => over.agent,
-    chain: { deployment: over.network?.deployment },
+    chain: {
+      deployment: over.network?.deployment,
+      publicClient: {
+        readContract: async ({ functionName, args }: { functionName: string; args: [Address] }) => {
+          if (functionName === "hasBatchedSaves" && over.hasBatchedSaves !== undefined) {
+            return over.hasBatchedSaves(args[0])
+          }
+          throw new Error(`unexpected chain read ${functionName}`)
+        },
+      },
+    },
     close: async () => {},
   } as unknown as ServiceRuntime
 }
@@ -351,20 +383,13 @@ describe("readCheckpoints — the batched lane's records merge in, marked", () =
     }
   })
 
-  it("a store that serves no batch surface is not treated as a missing batch table", async () => {
-    // the deployment carries an anchor, but this store answers no /batch/status — a local or
-    // pre-batch host — so there is no table to miss and nothing is partial
-    const store = createHttpServer((_req, res) => {
-      res.statusCode = 404
-      res.end(JSON.stringify({ code: "not-found" }))
-    })
-    await new Promise<void>((resolve, reject) => {
-      store.once("error", reject)
-      store.listen(0, "127.0.0.1", resolve)
-    })
-    const url = `http://127.0.0.1:${(store.address() as AddressInfo).port}`
+  it("a store with no batch surface skips the table when the chain says this owner has none", async () => {
+    // the deployment carries an anchor and this store answers no /batch/status — a local or
+    // pre-batch host. hasBatchedSaves is the contract's own flag: false means there really is
+    // no table to miss, so the read is complete and the batch read never runs.
+    const store = await noBatchStore()
     try {
-      const home = batchedHome(url)
+      const home = batchedHome(store.url)
       let batchedReads = 0
       const agent = {
         readWithStatus: async () => ({ objects: [], partial: false }),
@@ -373,12 +398,89 @@ describe("readCheckpoints — the batched lane's records merge in, marked", () =
           return emptyBatched
         },
       }
-      const runtime = fakeRuntime(home, { network: batchedNetwork(url), apiBaseUrl: url, agent })
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent,
+        hasBatchedSaves: async () => false,
+      })
       const result = await readCheckpoints(runtime, "claude-code", "p-1")
       expect(result.partial).toBe(false)
       expect(batchedReads).toBe(0)
     } finally {
-      await new Promise<void>((done) => store.close(() => done()))
+      await store.close()
+    }
+  })
+
+  it("a store with no batch surface while the chain holds batched saves marks the read partial", async () => {
+    // the contract's flag proves a batch table exists somewhere — a store that cannot serve it
+    // must not answer as if the batch side were empty
+    const store = await noBatchStore()
+    try {
+      const home = batchedHome(store.url)
+      let batchedReads = 0
+      const agent = {
+        readWithStatus: async () => ({ objects: [], partial: false }),
+        readBatchedWithStatus: async () => {
+          batchedReads += 1
+          return emptyBatched
+        },
+      }
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent,
+        hasBatchedSaves: async () => true,
+      })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1")
+      expect(result.partial).toBe(true)
+      expect(batchedReads).toBe(0)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("a store with no batch surface whose chain check fails marks the read partial — unknown is never none", async () => {
+    const store = await noBatchStore()
+    try {
+      const home = batchedHome(store.url)
+      const agent = {
+        readWithStatus: async () => ({ objects: [], partial: false }),
+        readBatchedWithStatus: async () => emptyBatched,
+      }
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent,
+        hasBatchedSaves: async () => {
+          throw new Error("rpc went away")
+        },
+      })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1")
+      expect(result.partial).toBe(true)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("a batch status answering for a DIFFERENT anchor is no surface either — the flag still decides", async () => {
+    const store = await stubStore({ enabled: true, batchAnchor: `0x${"99".repeat(20)}` })
+    try {
+      const home = batchedHome(store.url)
+      const agent = {
+        readWithStatus: async () => ({ objects: [], partial: false }),
+        readBatchedWithStatus: async () => emptyBatched,
+      }
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent,
+        hasBatchedSaves: async () => true,
+      })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1")
+      expect(result.partial).toBe(true)
+    } finally {
+      await store.close()
     }
   })
 })
@@ -519,6 +621,13 @@ describe("readOwnerUniverse — the batched half of the history", () => {
     batchRoot?: Hex
     /** Receives the event name of every getLogs call — which scans ran. */
     logCalls?: string[]
+    /**
+     * What `GET /batch/status` answers; "absent" makes the call throw — a store with no batch
+     * surface at all. Defaults to serving this deployment's anchor.
+     */
+    batchStatus?: { enabled: boolean; batchAnchor: Address } | "absent"
+    /** What `BatchAnchor.hasBatchedSaves(owner)` answers; absent means the call throws. */
+    hasBatchedSaves?: boolean | Error
   }): Runtime {
     const deployment = over.deployment ?? DEPLOYMENT_BATCHED
     const publicClient = {
@@ -531,6 +640,11 @@ describe("readOwnerUniverse — the batched half of the history", () => {
       readContract: async ({ functionName }: { functionName: string }) => {
         if (functionName === "agentIdOfSigner") return MY_AGENT_ID
         if (functionName === "batchOf" && over.batchRoot !== undefined) return [over.batchRoot, BLOCK]
+        if (functionName === "hasBatchedSaves") {
+          if (over.hasBatchedSaves instanceof Error) throw over.hasBatchedSaves
+          if (over.hasBatchedSaves === undefined) throw new Error(`unexpected chain read ${functionName}`)
+          return over.hasBatchedSaves
+        }
         throw new Error(`unexpected chain read ${functionName}`)
       },
     }
@@ -542,6 +656,11 @@ describe("readOwnerUniverse — the batched half of the history", () => {
       ownerApi: {
         listObjects: async () => ({ objects: [], partial: false }),
         listBatchSaves: async () => ({ items: over.items ?? [], partial: over.partial ?? false }),
+        batchStatus: async () => {
+          const status = over.batchStatus ?? { enabled: true, batchAnchor: ANCHOR }
+          if (status === "absent") throw new Error("no such route")
+          return status
+        },
       },
       vault: { deriveNamespaceSecret: async () => SECRET },
       reader: {},
@@ -581,6 +700,36 @@ describe("readOwnerUniverse — the batched half of the history", () => {
     const runtime = fakeOwnerRuntime({ deployment: DEPLOYMENT, logCalls: asked })
     await expect(readOwnerUniverse(runtime)).resolves.toEqual([])
     expect(asked).toEqual(["ContextRegistered"])
+  })
+
+  it("a store with no batch surface and no batched saves on chain → the read stays complete", async () => {
+    // the contract's flag is what may say "nothing to miss" — not the store's missing routes
+    const runtime = fakeOwnerRuntime({ batchStatus: "absent", hasBatchedSaves: false })
+    await expect(readOwnerUniverse(runtime)).resolves.toEqual([])
+  })
+
+  it("a store with no batch surface while the chain holds batched saves → owner-read-incomplete naming why", async () => {
+    const runtime = fakeOwnerRuntime({ batchStatus: "absent", hasBatchedSaves: true })
+    const failure = await readOwnerUniverse(runtime).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ code: "owner-read-incomplete" })
+    expect((failure as Error).message).toContain("batched saves exist on chain but this store serves none")
+  })
+
+  it("a store with no batch surface whose chain check fails → owner-read-incomplete, never 'nothing to miss'", async () => {
+    const runtime = fakeOwnerRuntime({ batchStatus: "absent", hasBatchedSaves: new Error("rpc went away") })
+    const failure = await readOwnerUniverse(runtime).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ code: "owner-read-incomplete" })
+    expect((failure as Error).message).toContain("the chain could not say whether batched saves exist")
+  })
+
+  it("a batch status answering for a DIFFERENT anchor is no surface either — the flag still decides", async () => {
+    const runtime = fakeOwnerRuntime({
+      batchStatus: { enabled: true, batchAnchor: `0x${"99".repeat(20)}` as Address },
+      hasBatchedSaves: true,
+    })
+    const failure = await readOwnerUniverse(runtime).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ code: "owner-read-incomplete" })
+    expect((failure as Error).message).toContain("batched saves exist on chain but this store serves none")
   })
 })
 

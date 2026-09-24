@@ -2,7 +2,7 @@ import { privateKeyToAccount } from "viem/accounts"
 import { entryPoint08Address } from "viem/account-abstraction"
 import { MidaError, PERMISSION, decodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
 import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScope } from "@mida/protocol"
-import { capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
+import { batchAnchorAbi, capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
 import type { ChainContext, HistoryScanCursor } from "@mida/chain"
 import { DENY_CANCEL_EXPIRY_SECONDS, provisionAgent } from "@mida/fake-vault"
 import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
@@ -692,7 +692,10 @@ const FLUSH_POLL_MS = 250
  * save is never mistaken for an anchored one. A pending save from a DIFFERENT agent triggers the
  * store flush (Amendment B.4): `POST /batch/flush` once, then re-reads every 250 ms until those
  * saves anchor or `flushWaitMs` runs out — never a wait when every pending save is the reader's
- * own. A batched list the store cannot serve leaves `partial` set rather than hiding the gap.
+ * own. A batched list the store cannot serve leaves `partial` set rather than hiding the gap —
+ * and when the store serves no batch surface for this anchor at all, the contract's own
+ * `hasBatchedSaves(owner)` flag decides whether there is a table to miss: only a confirmed
+ * "none" keeps the read complete, anything else is partial too.
  */
 export async function readCheckpoints(
   runtime: ServiceRuntime,
@@ -737,9 +740,12 @@ export async function readCheckpoints(
   const batchAnchor = deployment?.batchAnchor
   if (batchAnchor !== undefined && deployment !== undefined) {
     // The batch table exists only where the store serves it for THIS anchor: the status probe is
-    // what decideLane itself asks. A local store or a pre-batch host answers nothing and has no
-    // table to miss — skipping is honest, not a gap; a store that answers for another anchor can
-    // never hold this deployment's saves either.
+    // what decideLane itself asks. But a store that answers nothing — a local store, a pre-batch
+    // host — or one answering for another anchor says nothing about what the CHAIN holds: its
+    // silence is not proof of an empty table. Only the contract's own hasBatchedSaves flag can
+    // say "nothing to miss" — it is set the moment the owner has an accepted batched save and no
+    // store outage clears it. A "true", or a read that fails, marks the answer partial rather
+    // than letting a route-less store hide batched saves.
     const status = await batchStatusProbe(runtime.apiBaseUrl)
     if (status !== null && status.batchAnchor.toLowerCase() === batchAnchor.toLowerCase()) {
       const readBatched = async () => {
@@ -791,6 +797,20 @@ export async function readCheckpoints(
             (a, b) => Date.parse(a.checkpoint.createdAt) - Date.parse(b.checkpoint.createdAt) || a.contextId.localeCompare(b.contextId),
           )
         }
+      }
+    } else {
+      // No batch surface for this anchor on this store — ask the chain whether there is a table
+      // to miss at all. Fail closed: a thrown read is "unknown", and unknown is never "none".
+      try {
+        const has = (await runtime.chain.publicClient.readContract({
+          address: batchAnchor,
+          abi: batchAnchorAbi,
+          functionName: "hasBatchedSaves",
+          args: [runtime.owner],
+        } as never)) as boolean
+        if (has) partial = true
+      } catch {
+        partial = true
       }
     }
   }

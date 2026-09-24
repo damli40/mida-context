@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs"
 import { writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { StoredCheckpoint } from "@mida/checkpoint"
+import type { StoredCheckpoint } from "../src/skeleton.js"
 import type { ServiceRuntime } from "@mida/midad"
 import {
   CheckpointCopies,
@@ -88,6 +88,46 @@ describe("buildWhatsNew", () => {
     expect(out.updates).toEqual([{ agent: "codex", savedAt: iso(5) }])
     // the proposed set keeps what was already delivered and adds this checkpoint's id
     expect(out.seen).toEqual(["0xprior-delivery", foreign.contextId])
+  })
+
+  it("a pending-anchor checkpoint carries the marker in its line and is never described as saved", async () => {
+    const dir = home()
+    const pending: StoredCheckpoint = {
+      ...cp("other-session", "0xauthorCodex", iso(5), { progress: ["queued before the anchor"] }),
+      anchor: "PENDING_ANCHOR",
+    }
+    const out = await buildWhatsNew(runtimeWith(dir), { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }, baseDeps([pending]))
+    expect(out.kind).toBe("updates")
+    if (out.kind !== "updates") return
+    expect(out.note).toContain("queued before the anchor")
+    expect(out.note).toContain("PENDING_ANCHOR: not yet anchored on Monad; may still be rejected")
+    expect(out.note).not.toContain("saved")
+  })
+
+  it("a pending checkpoint with nothing else to show still carries the marker — never 'saved a checkpoint'", async () => {
+    const dir = home()
+    const pending: StoredCheckpoint = {
+      ...cp("other-session", "0xauthorCodex", iso(5), { nextAction: "" }),
+      anchor: "PENDING_ANCHOR",
+    }
+    const out = await buildWhatsNew(runtimeWith(dir), { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }, baseDeps([pending]))
+    expect(out.kind).toBe("updates")
+    if (out.kind !== "updates") return
+    expect(out.note).toContain("PENDING_ANCHOR: not yet anchored on Monad; may still be rejected")
+    expect(out.note).not.toContain("saved")
+  })
+
+  it("an anchored checkpoint renders exactly as before — no marker", async () => {
+    const dir = home()
+    const anchored: StoredCheckpoint = {
+      ...cp("other-session", "0xauthorCodex", iso(5), { progress: ["real update"] }),
+      anchor: "ANCHORED",
+    }
+    const out = await buildWhatsNew(runtimeWith(dir), { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }, baseDeps([anchored]))
+    expect(out.kind).toBe("updates")
+    if (out.kind !== "updates") return
+    expect(out.note).toContain("real update")
+    expect(out.note).not.toContain("PENDING_ANCHOR")
   })
 
   it("a foreign checkpoint already in the seen set answers none", async () => {
