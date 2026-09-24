@@ -252,6 +252,7 @@ describe("mida doctor on local Anvil", () => {
         ...env.deployment,
         chainId: env.deployment.chainId.toString(),
         deploymentBlock: env.deployment.deploymentBlock.toString(),
+        batchAnchorBlock: env.deployment.batchAnchorBlock?.toString(),
       }
       sponsoredHome.writeSecretJson("network.json", { rpcUrl: env.rpcUrl, deployment, sponsorUrl })
       const up: string[] = []
