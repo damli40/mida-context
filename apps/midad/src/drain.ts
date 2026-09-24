@@ -395,7 +395,6 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           reusedCompiled = false
         }
         const runtime = await openRuntime()
-        const saveStart = now().getTime()
         const saved = await save(runtime, job.agent, {
           projectId: envelope.projectId,
           sessionId: envelope.sessionId,
@@ -403,7 +402,6 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           compiledBy: envelope.compiledBy,
           checkpoint: envelope.checkpoint,
         })
-        const saveMs = now().getTime() - saveStart
         writeState(deps.home, sessionId, terminal)
         // the saved checkpoint's content fields are the next compile's `previous`
         const content: Record<string, unknown> = {}
@@ -418,7 +416,9 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           // the model that actually wrote the checkpoint — a fallback save names the fallback
           model: envelope.compiledBy,
           compileMs: compileMeta.compileMs,
-          saveMs,
+          // the save's own measurement: a wall-clock span here would fold in the receipt
+          // read-back, which is reported separately as receiptMs
+          saveMs: saved.milliseconds,
           attempts: compileMeta.attempts,
           retried: compileMeta.retried,
           reusedCompiled,
@@ -434,6 +434,9 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           // a duplicate save sent no transaction: every key below stays absent — the gas fields
           // describe a transaction that exists, never a zero
           ...(saved.transactionHash !== null ? { transactionHash: saved.transactionHash } : {}),
+          // the read-back's own cost, present whenever one was attempted — even one that
+          // failed and left no receipt — so it is visible instead of hidden inside saveMs
+          ...(saved.receiptMs !== undefined ? { receiptMs: saved.receiptMs } : {}),
           ...(saved.receipt !== undefined
             ? {
                 gasUsed: saved.receipt.gasUsed,

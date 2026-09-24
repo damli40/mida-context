@@ -843,6 +843,30 @@ describe("the saved log line carries the compile and save facts (C4)", () => {
     expect(saved.sponsored).toBe(true)
   })
 
+  it("a slow receipt read-back lands on receiptMs — saveMs stays the save's own time (telemetry)", async () => {
+    const { job, drain, drainLog } = setup()
+    // the fake clock stands still except where the stub moves it: 5 ms for the save itself,
+    // then 250 ms inside its receipt read-back — the old wall-clock saveMs would report 255
+    let clock = T0 + 120_000
+    const save: typeof saveCheckpoint = async () => {
+      clock += 5
+      const milliseconds = clock - (T0 + 120_000)
+      clock += 250
+      return {
+        contextId: `0x${"ab".repeat(32)}` as Hex,
+        transactionHash: `0x${"ef".repeat(32)}` as Hex,
+        milliseconds,
+        duplicate: false,
+        receiptMs: 250,
+      }
+    }
+    job({ event: "Stop" }, T0)
+    expect((await drain({ save, now: () => new Date(clock) })).saved).toBe(1)
+    const saved = savedLines(drainLog).at(-1)!
+    expect(saved.saveMs).toBe(5)
+    expect(saved.receiptMs).toBe(250)
+  })
+
   it("a duplicate save leaves every gas key off the record — no transaction was sent", async () => {
     const { job, drain, drainLog } = setup()
     const save: typeof saveCheckpoint = async () => ({
@@ -859,6 +883,8 @@ describe("the saved log line carries the compile and save facts (C4)", () => {
     expect(saved.gasLimit).toBeUndefined()
     expect(saved.effectiveGasPrice).toBeUndefined()
     expect(saved.sponsored).toBeUndefined()
+    // no transaction means no read-back was attempted, so there is no receiptMs either
+    expect(saved.receiptMs).toBeUndefined()
   })
 
   it("the saved line never carries checkpoint content — numbers and names only", async () => {

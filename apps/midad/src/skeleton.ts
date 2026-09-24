@@ -530,7 +530,7 @@ async function saveReceipt(runtime: ServiceRuntime, transactionHash: Hex): Promi
 
 /** Spec §5C steps 4–5: wrap, encrypt, upload and register on Monad under the agent's own key. A second save carrying
  * an eventId this project already has is a drainer retry after a crash — answer with the existing record, send nothing. */
-export async function saveCheckpoint(runtime: ServiceRuntime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean; receipt?: SaveReceipt }> {
+export async function saveCheckpoint(runtime: ServiceRuntime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean; receipt?: SaveReceipt; receiptMs?: number }> {
   const envelope = wrapCheckpoint(input)
   const started = Date.now()
   const agent = runtime.agent(name)
@@ -567,13 +567,23 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
   })
   recordSavedId(runtime.home, envelope.checkpoint.eventId, object.contextId)
   const transactionHash = object.transactionHash ?? null
-  const receipt = transactionHash === null ? undefined : await saveReceipt(runtime, transactionHash)
+  // the save's own latency ends when the create lands — the read-back below is telemetry,
+  // so it is timed apart as receiptMs and never counted into milliseconds
+  const milliseconds = Date.now() - started
+  let receipt: SaveReceipt | undefined
+  let receiptMs: number | undefined
+  if (transactionHash !== null) {
+    const receiptStart = Date.now()
+    receipt = await saveReceipt(runtime, transactionHash)
+    receiptMs = Date.now() - receiptStart
+  }
   return {
     contextId: object.contextId,
     transactionHash,
-    milliseconds: Date.now() - started,
+    milliseconds,
     duplicate: false,
     ...(receipt !== undefined ? { receipt } : {}),
+    ...(receiptMs !== undefined ? { receiptMs } : {}),
   }
 }
 
