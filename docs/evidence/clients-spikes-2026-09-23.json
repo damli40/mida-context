@@ -1,0 +1,49 @@
+{
+  "spec": "docs/superpowers/specs/2026-09-22-client-adapters-design.md",
+  "plan": "docs/superpowers/plans/2026-09-22-client-adapters.md",
+  "code": "mida-context-live at fc72c24 (unchanged; spikes run on today's code)",
+  "home": "~/mida-live/home-v2 (doctor Sep 23: assistant approved, codex approved, claude-code revoked from the Sep 22 demo, gas sponsored)",
+  "S2_codex_cli": {
+    "ranBy": "Claude",
+    "at": "2026-09-23T01:36:31Z",
+    "command": "codex exec \"Add a one-line HTML comment at the very end of README.md that says: spike S2 was here. Change nothing else.\"",
+    "env": "CODEX_HOME=~/mida-live/codex-home; hosted-env-v2.sh sourced (puts mida-live/bin on PATH, MIDA_HOME=home-v2)",
+    "project": "~/mida-live/toy4",
+    "taskDone": true,
+    "stopHook": {
+      "fired": true,
+      "hookLog": "{\"agent\":\"codex\",\"event\":\"Stop\",\"outcome\":\"ignored\",\"reason\":\"bad-transcript-path\"}",
+      "verdict": "D5a CONFIRMED live: the rollout was at ~/mida-live/codex-home/sessions/2026/09/23/rollout-…jsonl, outside the only allowed folder ~/.codex/sessions; nothing was queued, so the reader problem (D5b) was never reached"
+    },
+    "sessionStartHandoff": "Mida's handoff WAS injected: rollout line 9, role developer, text starts 'MIDA HANDOFF'",
+    "rollout": {
+      "lines": 37,
+      "bytes": 105684,
+      "recordTypes": ["session_meta", "event_msg", "response_item", "world_state", "turn_context", "token_usage_record"],
+      "responseItemPayloadTypes": ["message", "reasoning", "custom_tool_call", "custom_tool_call_output"],
+      "beforeFirstRealPrompt": [
+        "L3 message developer '<skills_instructions>…'",
+        "L4 message developer 'You are `/root`, the primary agent…'",
+        "L5 message developer '<multi_agent_mode>…'",
+        "L6 message USER '<recommended_plugins>…'  <- injected by Codex as a user message",
+        "L9 message developer 'MIDA HANDOFF…'  <- Mida's own injection"
+      ],
+      "firstRealPrompt": "L10 message user 'Add a one-line HTML comment…'",
+      "differencesFromPlan": [
+        "tool calls are custom_tool_call {name, input} / custom_tool_call_output {output: array of {type,text}}, not function_call",
+        "no <environment_context> or AGENTS.md message in this version; a <recommended_plugins> USER message instead",
+        "reasoning is encrypted (encrypted_content), summary empty",
+        "extra record types world_state and token_usage_record"
+      ]
+    },
+    "flushTiming": "final assistant message written 01:36:50.748Z, Stop hook logged 01:36:50.935Z, task_complete written 01:36:50.938Z — the conversation was on disk before Stop fired; only the task_complete marker came after (n=1)",
+    "fixture": "packages/compiler/test/fixtures/codex-rollout-real.jsonl (37 lines; paths rewritten to /tmp/toy and /Users/dev, strings over 1,500 chars trimmed, encrypted_content dropped, key-shaped strings scrubbed; UNTRACKED)",
+    "planUpdated": "Task 6: custom_tool_call handling, output-as-array, <recommended_plugins> and MIDA HANDOFF in INJECTED_PREFIXES, real-fixture test regex"
+  },
+  "S1_claude_desktop": {
+    "status": "CONFIGURED, NOT YET RUN",
+    "config": "mcpServers.mida = { command: ~/Desktop/mida-context-live/bin/mida-mcp, args: [--as, assistant, --project, ~/mida-live/toy4], env: { MIDA_HOME: ~/mida-live/home-v2 } }; original config backed up in the session scratchpad",
+    "next": "Dami quits and reopens Claude Desktop and asks the question"
+  },
+  "S3_chatgpt_tunnel": { "status": "NOT RUN — needs tunnel id, CONTROL_PLANE_API_KEY, developer mode" }
+}
