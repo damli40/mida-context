@@ -8,7 +8,7 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
-import { AGENT_NAME, MidaHome, MCP_TOOLS, createMidaMcpServer, parseMcpArgs, readSeen, socketPathFor, startupCheck } from "@mida/midad"
+import { AGENT_NAME, MidaHome, MCP_TOOLS, READ_NAMESPACES, createMidaMcpServer, parseMcpArgs, readSeen, socketPathFor, startupCheck } from "@mida/midad"
 import type { McpServerDeps } from "@mida/midad"
 
 const BIN_MIDA_MCP = fileURLToPath(new URL("../../../bin/mida-mcp", import.meta.url))
@@ -782,6 +782,50 @@ describe("mida-mcp tools against a fake daemon", () => {
       }
     } finally {
       await fake.stop()
+    }
+  })
+
+  it("only ever sends read-shaped requests to the daemon — every tool, every namespace", async () => {
+    const dir = home()
+    const fake = await fakeDaemon(dir, {
+      "/health": HEALTH,
+      "/handoff": { kind: "empty", text: "Mida: connected. Nothing has been saved for this project yet.", seen: [] },
+      "/whatsnew": { kind: "none" },
+      "/cli": { code: 0, lines: ["projects.current: read 0 object(s)"] },
+    })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        await callText(client, "mida_handoff")
+        await callText(client, "mida_whats_new")
+        await callText(client, "mida_status")
+        for (const namespace of READ_NAMESPACES) await callText(client, "mida_read", { namespace })
+      } finally {
+        await close()
+      }
+      // the daemon's socket also accepts /kick, /shutdown and /cli argv like `request` or
+      // `save-demo` — the adapter's restraint is what keeps it read-only, so every recorded
+      // request is pinned, not just the ones a test happened to look at
+      expect(fake.requests.length).toBeGreaterThan(0)
+      for (const req of fake.requests) {
+        expect(["/health", "/handoff", "/whatsnew", "/cli"]).toContain(req.path)
+        if (req.path === "/cli") expect((req.body?.argv as string[]).slice(0, 3)).toEqual(["read", "--as", "assistant"])
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("no tool schema carries an identity, home or project field", async () => {
+    const { client, close } = await connect(deps(home(), { daemonUp: false }))
+    try {
+      const { tools } = await client.listTools()
+      for (const tool of tools) {
+        const props = Object.keys((tool.inputSchema as { properties?: object }).properties ?? {})
+        for (const p of props) expect(p).not.toMatch(/^(as|agent|identity|home|project|cwd|mida_home)$/i)
+      }
+    } finally {
+      await close()
     }
   })
 })
