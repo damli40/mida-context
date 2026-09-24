@@ -22,7 +22,7 @@ import { bytesToHex, encodeAbiParameters, keccak256, zeroHash } from "viem"
 import type { AbiEvent, LocalAccount } from "viem"
 import { BATCH_REJECT, MidaError, batchLeafHash, batchSaveStructHash, decodeUint64, isMidaError, merkleProof, merkleRoot } from "@mida/protocol"
 import type { Address, BatchSaveMessage, Hex } from "@mida/protocol"
-import { batchAnchorAbi, createWriteContext, getLogsChunked, revertName, sendContract } from "@mida/chain"
+import { GAS_CEILINGS, batchAnchorAbi, createWriteContext, getLogsChunked, revertName, sendContract } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import type { BatchedSaveWire } from "./client.js"
 import type { BatchSaveRow, BatchStore } from "./batch-store.js"
@@ -184,6 +184,9 @@ const REJECT_NAMES = new Map<number, string>(Object.entries(BATCH_REJECT).map(([
 
 const rejectName = (reason: number): string => REJECT_NAMES.get(reason) ?? `UNKNOWN_${reason}`
 
+/** Integer division that rounds up — a per-save gas cost must never round a fraction away. */
+const ceilDiv = (a: bigint, b: bigint): bigint => (a + b - 1n) / b
+
 /** Thrown when the logs a chain adapter returns cannot be the batch the contract recorded. */
 export class BatchRootMismatchError extends Error {
   readonly code = "ROOT_MISMATCH" as const
@@ -198,7 +201,24 @@ export interface BatcherOptions {
   chain: BatcherChain
   timer: BatcherTimer
   now: () => number
+  /**
+   * The hard upper bound on saves per batch — never exceeded no matter what the gas math says.
+   * The take a run actually uses is usually smaller: the number of saves that fit the gas budget
+   * at the per-save cost learned so far.
+   */
   cap: number
+  /**
+   * The gas budget each take is sized against; default is the "batch.submit" ceiling. Takes are
+   * planned at 95% of it so estimate drift between sizing and sending does not turn a legal take
+   * into a refusal.
+   */
+  gasBudget?: bigint
+  /**
+   * The per-save gas the first take assumes; default 66,264, the Sep 24 testnet sweep's measured
+   * 60-save figure (docs/evidence/batch-anchor-sweep-2026-09-24.json). The first real receipt
+   * replaces it.
+   */
+  initialGasPerSave?: bigint
   waitMs: number
   /**
    * The batch submitter — one ingredient of the batchId and the identity resolve() proves a landed
@@ -230,6 +250,7 @@ export class Batcher {
   readonly #journal: BatchJournal | undefined
   readonly #now: () => number
   readonly #cap: number
+  readonly #gasBudget: bigint
   readonly #waitMs: number
   readonly #minGapMs: number
   readonly #submitter: Address
@@ -238,8 +259,11 @@ export class Batcher {
   /** Ordered contextIds of batches this process submitted — the resolve mapping without a journal read. */
   readonly #submitted = new Map<string, Hex[]>()
   /**
-   * The take size the next run uses. A GAS_CEILING_EXCEEDED refusal halves it (floor 1) — the batch
-   * was too big to send, not malformed — and a successful submit restores the configured cap.
+   * The take size the next run uses — the number of saves that fit the gas budget at the per-save
+   * cost learned so far, clamped to [1, cap]. A successful submit re-learns it from the receipt's
+   * gasUsed; a GAS_CEILING_EXCEEDED refusal re-sizes it from the estimate the refusal carried, or
+   * halves it (floor 1) when the refusal carried none — the batch was too big to send, not
+   * malformed.
    */
   #effectiveCap: number
   #lastSubmitAt: number | null = null
@@ -252,21 +276,34 @@ export class Batcher {
     this.#journal = options.journal
     this.#now = options.now
     this.#cap = options.cap
+    this.#gasBudget = options.gasBudget ?? GAS_CEILINGS["batch.submit"]
     this.#waitMs = options.waitMs
     this.#minGapMs = options.minGapMs ?? 1000
     this.#submitter = options.submitter.toLowerCase() as Address
     this.#salt = options.salt ?? (() => bytesToHex(crypto.getRandomValues(new Uint8Array(32))))
-    this.#effectiveCap = options.cap
+    this.#effectiveCap = this.#fitFor(options.initialGasPerSave ?? 66_264n)
     this.#log = options.log
   }
 
   /**
-   * One new save arrived. At cap the batch goes now; below it the first save arms the wait window
-   * and every later save in the window leaves the armed timer exactly where it is.
+   * How many saves fit the gas budget at a per-save cost: floor(gasBudget × 95% / gasPerSave),
+   * clamped to [1, cap]. The 5% margin absorbs drift between the estimate a take was sized from
+   * and the one the send is actually priced at; the cap is the bound a lying measurement cannot
+   * cross. A non-positive per-save figure carries no information — the hard cap is the answer.
+   */
+  #fitFor(gasPerSave: bigint): number {
+    if (gasPerSave <= 0n) return this.#cap
+    const fit = (this.#gasBudget * 95n) / 100n / gasPerSave
+    return Math.min(this.#cap, Math.max(1, Number(fit)))
+  }
+
+  /**
+   * One new save arrived. At the learned cap the batch goes now; below it the first save arms the
+   * wait window and every later save in the window leaves the armed timer exactly where it is.
    */
   notify(): Promise<void> {
     return this.#serialize(async () => {
-      if ((await this.#store.countQueued()) >= this.#cap) {
+      if ((await this.#store.countQueued()) >= this.#effectiveCap) {
         await this.#runOnce()
       } else if (!(await this.#timer.pending())) {
         await this.#timer.set(this.#now() + this.#waitMs)
@@ -383,10 +420,16 @@ export class Batcher {
           this.#log?.({ event: "batch.too-large", batchId, contextId: taken[0]!.contextId, rejected: "TOO_LARGE" })
         } else {
           // The batch was too big to send — a size refusal, not an ambiguous send. The rows go back
-          // and the next take halves the cap, so the queue drains in smaller batches instead of
-          // wedging behind one it can never push through.
+          // and the next take shrinks to what the refusal's estimate says would have fit: divided
+          // by this take's size it gives the per-save cost the node computed, and fitFor turns that
+          // into the largest legal take. A refusal with no estimate — or one whose implied fit
+          // would not shrink the take — halves the cap instead, so the queue drains in smaller
+          // batches instead of wedging behind one it can never push through.
           const requeued = await this.#store.requeue(batchId)
-          this.#effectiveCap = Math.max(1, Math.floor(this.#effectiveCap / 2))
+          const implied =
+            error.estimate === undefined ? null : this.#fitFor(ceilDiv(error.estimate, BigInt(taken.length)))
+          this.#effectiveCap =
+            implied !== null && implied < taken.length ? implied : Math.max(1, Math.floor(this.#effectiveCap / 2))
           this.#log?.({ event: "batch.too-large", batchId, requeued, cap: this.#effectiveCap })
         }
         if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
@@ -401,9 +444,20 @@ export class Batcher {
       if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
       return null
     }
-    this.#effectiveCap = this.#cap
+    // A real receipt re-teaches the per-save cost, so the next take fits the gas the chain actually
+    // charged. { exists: true } carries no receipt — the learned cap stays where the last real
+    // measurement put it. gasPerSave is logged as a number: bigint would break JSON.stringify.
+    const gasPerSave = "exists" in result ? null : ceilDiv(result.gasUsed, BigInt(taken.length))
+    if (gasPerSave !== null) this.#effectiveCap = this.#fitFor(gasPerSave)
     this.#lastSubmitAt = this.#now()
-    this.#log?.({ event: "batch.submitted", batchId, saves: taken.length, exists: "exists" in result })
+    this.#log?.({
+      event: "batch.submitted",
+      batchId,
+      saves: taken.length,
+      exists: "exists" in result,
+      cap: this.#effectiveCap,
+      gasPerSave: gasPerSave === null ? null : Number(gasPerSave),
+    })
     try {
       const counts = await this.#resolveOnce(batchId)
       this.#submitted.delete(batchId.toLowerCase())

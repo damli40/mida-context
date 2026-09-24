@@ -60,7 +60,12 @@ export type TxKind = keyof typeof GAS_CEILINGS
 function checked(kind: TxKind, estimate: bigint): bigint {
   const ceiling = GAS_CEILINGS[kind]
   if (estimate > ceiling) {
-    throw new MidaError("GAS_CEILING_EXCEEDED", `${kind}: estimate ${estimate} exceeds ceiling ${ceiling}`)
+    // The numbers ride the error: a caller that re-sizes (the batcher shrinking a refused take)
+    // reads them here instead of parsing them back out of the message text.
+    const error = new MidaError("GAS_CEILING_EXCEEDED", `${kind}: estimate ${estimate} exceeds ceiling ${ceiling}`)
+    error.estimate = estimate
+    error.ceiling = ceiling
+    throw error
   }
   return estimate
 }

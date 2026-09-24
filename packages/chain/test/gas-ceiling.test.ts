@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { isMidaError } from "@mida/protocol"
-import type { Address, Hex } from "@mida/protocol"
+import type { Address, Hex, MidaError } from "@mida/protocol"
 import { GAS_CEILINGS, sendContract, sendValue } from "@mida/chain"
 import type { WriteContext } from "@mida/chain"
 
@@ -108,6 +108,20 @@ describe("the shared gas ceiling (R3-1)", () => {
     )
     expect(isMidaError(error, "GAS_CEILING_EXCEEDED")).toBe(true)
     expect(sent).toHaveLength(0)
+  })
+
+  it("a refusal carries the estimate and ceiling it compared, so a caller re-sizes from numbers not text", async () => {
+    const estimate = 29_000_000n
+    const { context } = stubContext(estimate)
+    const error = await sendContract(context, { address: ADDRESS, abi: [], functionName: "submitBatch", args: [] }, "batch.submit").then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(isMidaError(error, "GAS_CEILING_EXCEEDED")).toBe(true)
+    // The batcher divides estimate by its take to learn the per-save cost the node computed —
+    // parsing the message would break on any wording change, so the numbers ride the error itself.
+    expect((error as MidaError).estimate).toBe(estimate)
+    expect((error as MidaError).ceiling).toBe(GAS_CEILINGS["batch.submit"])
   })
 
   it("the plain value transfer is bounded by its own kind and sent with the explicit estimate", async () => {

@@ -45,6 +45,13 @@ export type MidaErrorCode = (typeof MIDA_ERROR_CODES)[number]
 
 export class MidaError extends Error {
   readonly code: MidaErrorCode
+  /**
+   * GAS_CEILING_EXCEEDED only: the estimate that was refused and the ceiling it was compared
+   * against. A caller that re-sizes — the batcher shrinking a refused take — reads the numbers
+   * here rather than parsing them back out of the message text.
+   */
+  estimate?: bigint
+  ceiling?: bigint
 
   constructor(code: MidaErrorCode, detail?: string) {
     super(detail === undefined ? code : `${code}: ${detail}`)

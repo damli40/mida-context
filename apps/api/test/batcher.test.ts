@@ -267,6 +267,8 @@ class FakeChain implements BatcherChain {
   rejectWith: (wire: BatchedSaveWire, index: number) => number | null = () => null
   /** Return an error to throw before recording — sees the saves, so a test can refuse by batch size. */
   failSubmit: ((saves: BatchedSaveWire[]) => Error | null) | null = null
+  /** Answer { exists: true } after recording — the batch landed, but its answer carries no receipt. */
+  reportExists = false
   /**
    * The gasUsed the receipt reports — the measurement the batcher re-sizes its next take from.
    * Default is a flat 60k per save, near the sweep's ~61k asymptote for large batches.
@@ -316,6 +318,7 @@ class FakeChain implements BatcherChain {
       submitter: this.submitter,
     })
     this.afterRecord?.()
+    if (this.reportExists) return { exists: true }
     return { transactionHash: `0x${"ee".repeat(32)}` as Hex, gasUsed: this.gasUsedFor(saves) }
   }
 
@@ -370,6 +373,10 @@ function makeRig(
     journal?: BatchJournal
     /** Deterministic batchId salt — a test that must predict or replay an id supplies one. */
     salt?: () => Hex
+    /** The gas budget the batcher sizes takes against; default is the "batch.submit" ceiling. */
+    gasBudget?: bigint
+    /** The per-save gas assumed before the first real receipt; default is the sweep's 66,264. */
+    initialGasPerSave?: bigint
   } = {},
 ): Rig {
   const store = input.store ?? new MemoryBatchStore()
@@ -389,6 +396,8 @@ function makeRig(
     minGapMs: input.minGapMs ?? 1_000,
     submitter: SUBMITTER,
     ...(input.salt === undefined ? {} : { salt: input.salt }),
+    gasBudget: input.gasBudget,
+    initialGasPerSave: input.initialGasPerSave,
     journal,
     log: (record) => events.push(record),
   })
@@ -573,6 +582,163 @@ describe("the batcher", () => {
     expect(rig.chain.submissions).toHaveLength(1)
     expect(rig.chain.submissions[0]!.count).toBe(1)
     expect((await rig.store.get(fine.meta.contextId))!).toMatchObject({ state: "ANCHORED" })
+  })
+
+  it("sizes the first take by the gas budget — 401 saves at the sweep's measured 66,264 per save, not the 480 hard cap", async () => {
+    const rig = makeRig({ cap: 480 })
+    const saves = Array.from({ length: 450 }, () => makeSave())
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+
+    await rig.batcher.flush()
+    // floor(28,000,000 × 0.95 / 66,264) = 401 — the budget fit, below the configured cap.
+    expect(rig.chain.submissions).toHaveLength(1)
+    expect(rig.chain.submissions[0]!.count).toBe(401)
+  })
+
+  it("a submit's real gasUsed re-sizes the next take — 100,000 per save fits 266 — and the log carries both numbers", async () => {
+    const rig = makeRig({ cap: 480 })
+    rig.chain.gasUsedFor = (batch) => 100_000n * BigInt(batch.length)
+    const saves = Array.from({ length: 700 }, () => makeSave())
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+
+    await rig.batcher.flush()
+    expect(rig.chain.submissions[0]!.count).toBe(401)
+    expect(rig.events.filter((entry) => entry["event"] === "batch.submitted").at(-1)).toMatchObject({
+      saves: 401,
+      cap: 266,
+      gasPerSave: 100_000,
+    })
+
+    rig.setNow(1_000)
+    await rig.batcher.flush()
+    // floor(26,600,000 / 100,000) = 266 — what the first batch's receipt taught, not the cap.
+    expect(rig.chain.submissions[1]!.count).toBe(266)
+  })
+
+  it("a lighter measured save never grows a take past the hard cap", async () => {
+    const rig = makeRig({ cap: 50 })
+    rig.chain.gasUsedFor = (batch) => 1_000n * BigInt(batch.length) // a suspiciously light receipt — fit ≈ 26,600
+    const saves = Array.from({ length: 120 }, () => makeSave())
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+
+    await rig.batcher.flush()
+    expect(rig.chain.submissions[0]!.count).toBe(50)
+    rig.setNow(1_000)
+    await rig.batcher.flush()
+    // The learned fit clamps back to the hard cap — a lying measurement can't widen a batch.
+    expect(rig.chain.submissions[1]!.count).toBe(50)
+  })
+
+  it("notify() runs the batch the moment the queue reaches the learned cap, not the hard cap", async () => {
+    // initialGasPerSave 1,000,000 seeds a learned cap of floor(26,600,000 / 1,000,000) = 26.
+    const rig = makeRig({ cap: 100, initialGasPerSave: 1_000_000n })
+    for (let i = 0; i < 25; i++) {
+      const { wire, meta } = makeSave()
+      await rig.enqueue(wire, meta.contextId)
+      await rig.batcher.notify()
+    }
+    // 25 < the learned 26 — the batch still waits on the timer even though the hard cap is 100.
+    expect(rig.chain.submissions).toHaveLength(0)
+    expect(rig.timer.pendingAt).toBe(2_000)
+
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    await rig.batcher.notify()
+    expect(rig.chain.submissions).toHaveLength(1)
+    expect(rig.chain.submissions[0]!.count).toBe(26)
+  })
+
+  it("a gas refusal still halves when it carries no estimate, and the next success re-learns from gasUsed instead of jumping back to cap", async () => {
+    const rig = makeRig({ cap: 480 })
+    const saves = Array.from({ length: 401 }, () => makeSave())
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+
+    // Refuse anything above ten saves without attaching the node's estimate — the halving fallback.
+    rig.chain.failSubmit = (batch) =>
+      batch.length > 10 ? new MidaError("GAS_CEILING_EXCEEDED", "submitBatch: estimate exceeds the ceiling") : null
+    await rig.batcher.flush()
+    expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 401, cap: 200 })
+    await rig.batcher.flush()
+    expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 200, cap: 100 })
+
+    rig.chain.failSubmit = null
+    rig.chain.gasUsedFor = (batch) => 200_000n * BigInt(batch.length)
+    await rig.batcher.flush()
+    expect(rig.chain.submissions[0]!.count).toBe(100)
+
+    // floor(26,600,000 / 200,000) = 133 — the receipt's answer, not the halved 100 and not cap 480.
+    rig.setNow(1_000)
+    await rig.batcher.flush()
+    expect(rig.chain.submissions[1]!.count).toBe(133)
+  })
+
+  it("an { exists: true } answer leaves the learned cap where the last receipt put it", async () => {
+    const rig = makeRig({ cap: 480 })
+    rig.chain.gasUsedFor = (batch) => 100_000n * BigInt(batch.length)
+    const first = Array.from({ length: 401 }, () => makeSave())
+    for (const { wire, meta } of first) await rig.enqueue(wire, meta.contextId)
+    await rig.batcher.flush()
+    expect(rig.chain.submissions[0]!.count).toBe(401) // the receipt taught cap = 266
+
+    // The next batch lands as a resubmit — the fake records it (the send DID land) but answers
+    // exists:true, which carries no receipt to re-size from.
+    rig.chain.reportExists = true
+    rig.setNow(1_000)
+    const second = Array.from({ length: 300 }, () => makeSave())
+    for (const { wire, meta } of second) await rig.enqueue(wire, meta.contextId)
+    await rig.batcher.flush()
+    expect(rig.chain.batches.size).toBe(2)
+    expect(rig.events.filter((entry) => entry["event"] === "batch.submitted").at(-1)).toMatchObject({
+      exists: true,
+      cap: 266,
+      gasPerSave: null,
+    })
+
+    rig.chain.reportExists = false
+    rig.setNow(2_000)
+    const third = Array.from({ length: 300 }, () => makeSave())
+    for (const { wire, meta } of third) await rig.enqueue(wire, meta.contextId)
+    await rig.batcher.flush()
+    // 266 again — the learned cap survived the receipt-less answer; it did not reset to 480.
+    expect(rig.chain.submissions.at(-1)!.count).toBe(266)
+  })
+
+  it("a gas refusal carrying the node's estimate shrinks to the implied fit — 400 at twice the budget takes 190, not a halving's 200 or a blind retry's 400", async () => {
+    const rig = makeRig({ cap: 480 })
+    const saves = Array.from({ length: 400 }, () => makeSave())
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+
+    // The refusal carries what checked() attached: this take would have cost 2× the budget —
+    // 140,000 per save — so the next take is floor(26,600,000 / 140,000) = 190 exactly.
+    rig.chain.failSubmit = () => {
+      const error = new MidaError("GAS_CEILING_EXCEEDED", "batch.submit: estimate 56000000 exceeds ceiling 28000000")
+      error.estimate = 56_000_000n
+      error.ceiling = 28_000_000n
+      return error
+    }
+    await rig.batcher.flush()
+    expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 400, cap: 190 })
+
+    rig.chain.failSubmit = null
+    await rig.batcher.flush()
+    expect(rig.chain.submissions[0]!.count).toBe(190)
+  })
+
+  it("a refusal whose estimate cannot shrink the take still halves — the next take is always smaller", async () => {
+    const rig = makeRig({ cap: 480 })
+    const saves = Array.from({ length: 300 }, () => makeSave())
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+
+    // An estimate too small to be this batch's real one implies a fit above the take itself —
+    // the batcher halves rather than trusting a number that would not make progress.
+    rig.chain.failSubmit = () => {
+      const error = new MidaError("GAS_CEILING_EXCEEDED", "batch.submit: estimate exceeds ceiling")
+      error.estimate = 100n
+      error.ceiling = 28_000_000n
+      return error
+    }
+    await rig.batcher.flush()
+    expect(rig.events.filter((entry) => entry["event"] === "batch.too-large").at(-1)).toMatchObject({ requeued: 300, cap: 200 })
   })
 
   it("an ambiguous send — recorded, then its answer lost — heals through the next batch's ALREADY_ANCHORED", async () => {
