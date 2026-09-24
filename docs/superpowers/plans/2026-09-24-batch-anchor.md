@@ -923,7 +923,7 @@ Rules the tests pin:
 
 **Files:**
 - Create: `apps/midad/src/batching.ts`, `apps/midad/test/batching.test.ts`
-- Modify: `apps/midad/src/network.ts` (`SavedNetwork.batching?: boolean`, L79-84), `apps/midad/src/skeleton.ts` (`saveCheckpoint`, L539), `apps/midad/src/drain.ts`, `apps/midad/src/doctor.ts`, `apps/midad/src/cli.ts`
+- Modify: `apps/midad/src/network.ts` (`SavedNetwork.batching?: boolean`, L79-84; adopt the shipped `batchAnchor`, behaviour 0), `apps/midad/src/skeleton.ts` (`saveCheckpoint`, L539), `apps/midad/src/drain.ts`, `apps/midad/src/doctor.ts`, `apps/midad/src/cli.ts`
 
 **Interfaces — Produces:**
 - `type Lane = { kind: "batched"; storeUrl: string; batchAnchor: Address } | { kind: "direct"; why: "switch-off" | "no-batch-anchor" | "local-store" | "store-disabled" | "store-unreachable" }`
@@ -933,6 +933,7 @@ Rules the tests pin:
 - `saveCheckpoint` return gains `batched?: { state: "QUEUED"; receipt: BatchReceipt }` (existing fields unchanged; `transactionHash: null` when batched)
 
 Behaviour:
+0. **Adopt the shipped BatchAnchor for older setups.** A home's `network.json` deployment written before BatchAnchor existed has no `batchAnchor`. In `resolveNetwork` (network.ts), when the saved deployment has no `batchAnchor` AND its `capabilityRegistry` equals the built-in deployment's (no mismatch), take `batchAnchor` + `batchAnchorBlock` from the built-in deployment (additive only; never replace any other field, never when there is a mismatch, and never write it back to `network.json` implicitly). Test: an old-shape `network.json` + a built-in with `batchAnchor` resolves with the built-in address; with a different `capabilityRegistry` it resolves without it.
 1. `decideLane` → `direct` unless ALL hold: `saved.batching === true`; `deployment.batchAnchor` set; `storageUrl` set; `status()` returns `enabled: true` with the same `batchAnchor`. A status error → `direct` / `store-unreachable` (the save still happens directly, and the drain log line says `lane: "direct", laneWhy: "store-unreachable"`).
 2. `saveCheckpoint`: after the duplicate check (L561-566), batched lane → `agent.createBatched(...)` with the same arguments as `agent.create` (L568-573); `recordSavedId`; append a pending entry; return `{ contextId, transactionHash: null, milliseconds, duplicate: false, batched: { state: "QUEUED", receipt } }`. When the lane is batched the duplicate check also looks at `readBatchedWithStatus` (anchored + pending).
 3. `drain.ts`: after a batched save the capture job is removed as after a direct save (the save is now owned by the pending ledger) and the log line is `outcome: "queued"`, `contextId`, `lane: "batched"`. At the end of every `drainPass`, `followPendingAnchors`: `getBatchSave` per entry; ANCHORED → remove, log `outcome: "saved"`, `lane: "batched"`, `batchId`; REJECTED → move to the rejected ledger, log `outcome: "failed"`, `reason: "batch-rejected:<REASON>"`; else update `state`; a status error leaves the entry untouched (never dropped).
