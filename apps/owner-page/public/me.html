@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Your Mida</title>
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/home.css">
+  <link rel="stylesheet" href="/me.css">
+  <script src="/me.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap header-row">
+      <a class="brand" href="/" aria-label="Mida home"><svg xmlns="http://www.w3.org/2000/svg" viewBox="3.57 10.50 276.08 79.00" class="lockup" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="11.0" stroke-linecap="round"><path d="M28.0 16.0A40.0 40.0 0 0 0 28.0 84.0"/><path d="M72.0 16.0A40.0 40.0 0 0 1 72.0 84.0"/></g><circle cx="50" cy="50" r="14.0" fill="currentColor"/><g transform="translate(122.43 73.00) scale(0.4600)"><path d="M108.56 -99.57V0.00H88.59V-64.76L61.91 0.00H46.79L19.97 -64.76V0.00H0.00V-99.57H22.68L54.35 -25.53L86.02 -99.57ZM126.11 -100.14Q126.11 -105.14 129.60 -108.49Q133.10 -111.84 138.37 -111.84Q143.65 -111.84 147.15 -108.49Q150.64 -105.14 150.64 -100.14Q150.64 -95.15 147.15 -91.80Q143.65 -88.45 138.37 -88.45Q133.10 -88.45 129.60 -91.80Q126.11 -95.15 126.11 -100.14ZM148.22 -79.03V0.00H128.25V-79.03ZM199.00 -80.31Q206.70 -80.31 213.69 -76.96Q220.68 -73.61 224.82 -68.05V-105.56H245.08V0.00H224.82V-11.70Q221.11 -5.85 214.41 -2.28Q207.70 1.28 198.86 1.28Q188.87 1.28 180.60 -3.85Q172.33 -8.99 167.55 -18.33Q162.77 -27.67 162.77 -39.80Q162.77 -51.78 167.55 -61.06Q172.33 -70.33 180.60 -75.32Q188.87 -80.31 199.00 -80.31ZM203.99 -62.77Q198.43 -62.77 193.72 -60.06Q189.02 -57.35 186.09 -52.14Q183.17 -46.93 183.17 -39.80Q183.17 -32.67 186.09 -27.32Q189.02 -21.97 193.79 -19.12Q198.57 -16.26 203.99 -16.26Q209.56 -16.26 214.41 -19.04Q219.26 -21.83 222.11 -27.03Q224.96 -32.24 224.96 -39.51Q224.96 -46.79 222.11 -52.00Q219.26 -57.20 214.41 -59.99Q209.56 -62.77 203.99 -62.77ZM295.58 -80.31Q304.42 -80.31 311.06 -76.75Q317.69 -73.18 321.68 -67.76V-79.03H341.80V0.00H321.68V-11.55Q317.83 -5.99 311.06 -2.35Q304.28 1.28 295.44 1.28Q285.45 1.28 277.25 -3.85Q269.04 -8.99 264.27 -18.33Q259.49 -27.67 259.49 -39.80Q259.49 -51.78 264.27 -61.06Q269.04 -70.33 277.25 -75.32Q285.45 -80.31 295.58 -80.31ZM300.71 -62.77Q295.15 -62.77 290.44 -60.06Q285.73 -57.35 282.81 -52.14Q279.89 -46.93 279.89 -39.80Q279.89 -32.67 282.81 -27.32Q285.73 -21.97 290.51 -19.12Q295.29 -16.26 300.71 -16.26Q306.28 -16.26 311.13 -19.04Q315.98 -21.83 318.83 -27.03Q321.68 -32.24 321.68 -39.51Q321.68 -46.79 318.83 -52.00Q315.98 -57.20 311.13 -59.99Q306.28 -62.77 300.71 -62.77Z" fill="currentColor"/></g></svg></a>
+      <nav class="site-nav" aria-label="Account">
+        <span class="sec-note" id="nav-state" hidden>Signed in with your passkey</span>
+        <a class="btn btn-secondary btn-small" href="/me" id="sign-out" hidden>Sign out</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main" class="me">
+    <div class="wrap">
+      <div id="sign-in">
+        <div class="me-head">
+          <div>
+            <p class="eyebrow">Your Mida</p>
+            <h1 class="me-title">Who can read your context, and who wrote it.</h1>
+            <p class="owner-line">Sign in with the passkey you registered to see every agent, its grants, and the records they wrote — read from Monad and decrypted on this device.</p>
+          </div>
+        </div>
+        <p id="error" class="me-error" hidden></p>
+        <button id="go" class="btn btn-primary" type="button">Sign in with passkey</button>
+        <ul id="progress" class="me-progress"></ul>
+      </div>
+      <div id="me-root" hidden></div>
+    </div>
+  </main>
+</body>
+</html>

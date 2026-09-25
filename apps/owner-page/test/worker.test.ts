@@ -11,15 +11,19 @@ describe("assetPathFor", () => {
     expect(assetPathFor("/approve")).toBe("/approve.html")
     expect(assetPathFor("/revoke")).toBe("/revoke.html")
     expect(assetPathFor("/approve/")).toBe("/approve.html")
+    expect(assetPathFor("/me")).toBe("/me.html")
+    expect(assetPathFor("/me/")).toBe("/me.html")
     expect(assetPathFor("/owner.css")).toBe("/owner.css")
     expect(assetPathFor("/approve.js")).toBe("/approve.js")
     // an unknown route is passed through — the assets layer 404s it, the page never guesses
     expect(assetPathFor("/admin")).toBe("/admin")
+    // /me/config.json is answered by the Worker itself, never an asset lookup
+    expect(assetPathFor("/me/config.json")).toBe("/me/config.json")
   })
 })
 
 describe("Content-Security-Policy", () => {
-  it("connect-src is exactly the four allowed origins; no forms, no frames, no inline script", () => {
+  it("connect-src is exactly the five allowed origins; no forms, no frames, no inline script", () => {
     const directives = Object.fromEntries(
       CONTENT_SECURITY_POLICY.split(";").map((d) => {
         const [name, ...rest] = d.trim().split(/\s+/)
@@ -27,7 +31,7 @@ describe("Content-Security-Policy", () => {
       }),
     )
     expect(directives["connect-src"]).toBe(
-      "'self' https://testnet-rpc.monad.xyz https://store.midacontext.xyz https://sponsor.midacontext.xyz",
+      "'self' https://testnet-rpc.monad.xyz https://store.midacontext.xyz https://sponsor.midacontext.xyz https://indexer.dev.hyperindex.xyz",
     )
     expect(directives["form-action"]).toBe("'none'")
     expect(directives["frame-ancestors"]).toBe("'none'")
@@ -79,5 +83,51 @@ describe("the home page at /", () => {
     const { env, asked } = fakeAssets()
     await worker.fetch(new Request("https://app.midacontext.xyz/check"), env)
     expect(asked).toEqual(["/check.html"])
+  })
+})
+
+describe("/me", () => {
+  function fakeAssets(indexUrl?: string): { env: OwnerPageEnv; asked: string[] } {
+    const asked: string[] = []
+    const env: OwnerPageEnv = {
+      ASSETS: {
+        async fetch(input: Request | string) {
+          const path = new URL(typeof input === "string" ? input : input.url).pathname
+          asked.push(path)
+          const type = path.endsWith(".html") ? "text/html; charset=utf-8" : "text/css"
+          return new Response(`body of ${path}`, { status: 200, headers: { "content-type": type } })
+        },
+      },
+      ...(indexUrl === undefined ? {} : { INDEX_GRAPHQL_URL: indexUrl }),
+    }
+    return { env, asked }
+  }
+
+  it("routes /me and /me/ to me.html under the same security headers", async () => {
+    const { env, asked } = fakeAssets()
+    const me = await worker.fetch(new Request("https://app.midacontext.xyz/me"), env)
+    const meSlash = await worker.fetch(new Request("https://app.midacontext.xyz/me/"), env)
+    expect(asked).toEqual(["/me.html", "/me.html"])
+    expect(me.status).toBe(200)
+    expect(await me.text()).toBe("body of /me.html")
+    expect(me.headers.get("Content-Security-Policy")).toBe(CONTENT_SECURITY_POLICY)
+    expect(meSlash.headers.get("Content-Security-Policy")).toBe(CONTENT_SECURITY_POLICY)
+  })
+
+  it("serves the index URL from INDEX_GRAPHQL_URL at /me/config.json", async () => {
+    const indexUrl = "https://indexer.dev.hyperindex.xyz/abc123/v1/graphql"
+    const { env, asked } = fakeAssets(indexUrl)
+    const res = await worker.fetch(new Request("https://app.midacontext.xyz/me/config.json"), env)
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ indexUrl })
+    // the config answer is the Worker's own — it never reaches the assets binding
+    expect(asked).toEqual([])
+    expect(res.headers.get("Content-Security-Policy")).toBe(CONTENT_SECURITY_POLICY)
+  })
+
+  it("answers indexUrl: null when the env var is unset — the page falls back to chain logs", async () => {
+    const { env } = fakeAssets()
+    const res = await worker.fetch(new Request("https://app.midacontext.xyz/me/config.json"), env)
+    expect(await res.json()).toEqual({ indexUrl: null })
   })
 })

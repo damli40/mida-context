@@ -7,7 +7,7 @@ describe("securityHeaders", () => {
     const headers = securityHeaders(true)
     expect(headers["Content-Security-Policy"]).toBe(
       "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; " +
-        "connect-src 'self' https://testnet-rpc.monad.xyz https://store.midacontext.xyz https://sponsor.midacontext.xyz; " +
+        "connect-src 'self' https://testnet-rpc.monad.xyz https://store.midacontext.xyz https://sponsor.midacontext.xyz https://indexer.dev.hyperindex.xyz; " +
         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
     )
     expect(headers["Referrer-Policy"]).toBe("no-referrer")
@@ -24,10 +24,12 @@ describe("securityHeaders", () => {
 })
 
 describe("assetPathFor", () => {
-  it("serves the home page at root and the device check at /check", () => {
+  it("serves the home page at root, the device check at /check, and the owner view at /me", () => {
     expect(assetPathFor("/")).toBe("/index.html")
     expect(assetPathFor("/check")).toBe("/check.html")
     expect(assetPathFor("/check/")).toBe("/check.html")
+    expect(assetPathFor("/me")).toBe("/me.html")
+    expect(assetPathFor("/me/")).toBe("/me.html")
   })
 
   it("passes real asset paths through", () => {
