@@ -36,6 +36,27 @@ Mida keeps your context encrypted until an approved agent asks for it. When it d
 what that agent may read and hands it to the model as plain text. Revoking stops every future read
 through Mida. It cannot make a model forget what it was already shown.
 
+## MCP clients — one identity each
+
+Desktop clients that speak MCP read your context through `mida-mcp`, and **each client connects under
+its own identity** so it can be approved and revoked alone. `mida install <client>` registers the
+identity and merges one entry into the client's MCP config, then you approve it in the project folder:
+
+```sh
+mida install claude-desktop   # merges mida-claude-desktop into claude_desktop_config.json
+mida approve claude-desktop
+mida install cursor           # writes .cursor/mcp.json in the current workspace
+mida approve cursor
+```
+
+The Codex app (which is also the ChatGPT desktop app) and the Codex CLI share the `codex` identity
+through the Codex hooks — no MCP entry is needed for either. Browser ChatGPT is not supported in v0.
+
+`mida revoke <client>` isolates one client; `mida uninstall <client>` removes only the MCP config
+entry — the identity stays until revoked. `mida approve --all` approves every pending request after
+one typed `yes`; `mida revoke --all` revokes every approved agent the same way. In passkey mode the
+page still signs once **per agent** — batch approvals ask the terminal once, never the page once.
+
 ## Bring your own compile model
 
 A model turns each session into the checkpoint. Default order: DeepSeek (`DEEPSEEK_API_KEY`), then

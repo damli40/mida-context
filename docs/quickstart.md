@@ -39,7 +39,7 @@ mida --help
 Expected output:
 
 ```
-usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | batching on|off | migrate [--undo]   (tool = claude-code | codex | claude-desktop | cursor; agent = claude-code | codex | assistant — or the identity a client installs)
+usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]   (tool = claude-code | codex | claude-desktop | cursor; agent = claude-code | codex | assistant — or the identity a client installs)
 ```
 
 *Status: RUN — `pnpm check:publish` installs the packed tarball into a fresh folder outside the repo and runs `npx mida --help` to exit 0 with this text. The `-g` global-install variant links the same bins through npm's standard path.*
@@ -214,7 +214,16 @@ This stops future reads through Mida. It does not erase what codex already read.
 new read key sent to claude-code
 ```
 
-Codex is refused on its next read or write; the remaining agents keep access through a rotated key.
+Codex is refused on its next read or write; the remaining agents keep access through a rotated key. Revoking one client isolates exactly that client — `mida revoke claude-desktop` stops Claude Desktop and leaves Cursor untouched.
+
+The batch forms save a repeated round: `mida approve --all` lists every pending request, asks for one typed `yes`, then approves each in turn — a failure names its agent and does not stop the rest. `mida revoke --all` is the same shape for every agent that holds an approval:
+
+```bash
+mida approve --all     # one list of every pending request, one yes
+mida revoke --all      # one list of every approved agent, one yes
+```
+
+In passkey mode the same commands exist, but the passkey still signs once **per agent** — the batch asks the terminal once, never the page once.
 
 Mida keeps your context encrypted until an approved agent asks for it. When it does, Mida decrypts what that agent may read and hands it to the model as plain text. Revoking stops every future read through Mida. It cannot make a model forget what it was already shown.
 
