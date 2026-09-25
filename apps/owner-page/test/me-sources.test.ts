@@ -751,3 +751,43 @@ describe("loadMe — provenance only rides on verified rows", () => {
     expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("unverified")
   })
 })
+
+describe("loadMe — one BatchAnchor, the deployment's", () => {
+  it("a store advertising a different batch contract marks every batched row unverified and says so", async () => {
+    const { state, ports } = world()
+    const { item, contextId, root } = await makeBatchedItem()
+    const queued = await makeBatchedItem({ anchored: false })
+    state.batched.set(NS, [item, queued.item])
+    state.batchRoots.set(BATCH_ID, root) // the proof even verifies — the contract is still not ours
+    state.batchStatus = { enabled: true, batchAnchor: `0x${"55".repeat(20)}` as Address }
+    const data = await loadMe(OWNER, ports)
+    // The anchored item AND the still-queued one — the wrong contract makes both unverifiable.
+    const batchedRows = data.records.filter((r) => r.lane === "batched")
+    expect(batchedRows).toHaveLength(2)
+    expect(batchedRows.every((r) => r.state === "unverified")).toBe(true)
+    expect(contextId).toBe(queued.contextId) // same fixture nonce — the pair differs only by state
+    expect(data.incomplete.some((t) => t.includes("the store serves a different batch contract"))).toBe(true)
+  })
+
+  it("a store advertising the deployment's anchor leaves verification alone", async () => {
+    const { state, ports } = world()
+    const { item, contextId, root } = await makeBatchedItem()
+    state.batched.set(NS, [item])
+    state.batchRoots.set(BATCH_ID, root)
+    // batchStatus already returns ANCHOR = DEPLOYMENT.batchAnchor — no notice, normal verdict
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("anchored")
+    expect(data.incomplete.some((t) => t.includes("different batch contract"))).toBe(false)
+  })
+
+  it("a batchStatus failure is not a mismatch — verification still runs on the deployment anchor", async () => {
+    const { state, ports } = world()
+    const { item, contextId, root } = await makeBatchedItem()
+    state.batched.set(NS, [item])
+    state.batchRoots.set(BATCH_ID, root)
+    state.batchStatus = new Error("status unreadable")
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("anchored")
+    expect(data.incomplete.some((t) => t.includes("different batch contract"))).toBe(false)
+  })
+})

@@ -450,9 +450,14 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
   const nowSeconds =
     latestSeconds === null || !Number.isFinite(latestSeconds) ? null : BigInt(Math.floor(latestSeconds))
   const batchingOn = batchStatus === null ? null : batchStatus.enabled
-  // The store's advertised anchor is the domain its agents actually signed under; the baked-in
-  // deployment anchor is the fallback when the status call itself failed.
-  const batchAnchor: Address | null = batchStatus?.batchAnchor ?? DEPLOYMENT.batchAnchor ?? null
+  // The deployment's BatchAnchor is the only contract this page can check — roots are read from
+  // it and signatures are recovered under its domain. A store advertising a different address
+  // anchors its batches to a contract this deployment does not run: flag it, and nothing the
+  // store calls "anchored" can be believed here.
+  const batchAnchor: Address | null = DEPLOYMENT.batchAnchor ?? null
+  const storeAnchor = batchStatus?.batchAnchor ?? null
+  const anchorMismatch = storeAnchor !== null && (batchAnchor === null || !sameHex(storeAnchor, batchAnchor))
+  if (anchorMismatch) note("the store serves a different batch contract — batched rows are shown as unverified")
   if (denies === null) note("the store's pending-revocation list could not be read — 'can read' may overstate access")
   const deniedAgents = new Set<string>()
   const deniedCapabilities = new Set<string>()
@@ -821,7 +826,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
     // A signed save that names another owner is not this owner's record at all — the store
     // filed it wrong or it was never meant for this page. Unverified, whatever the proof says.
     const ownerMismatch = message !== null && !sameHex(message.owner, ownerKey)
-    if (ownerMismatch) {
+    if (anchorMismatch || ownerMismatch) {
       state = "unverified"
     } else if (item.state === "ANCHORED") {
       const batchId = item.batchId ?? (indexRow?.batchId as Hex | undefined) ?? null
