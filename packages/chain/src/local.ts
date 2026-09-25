@@ -92,8 +92,9 @@ export async function startAnvil(options: { hardfork?: string } = {}): Promise<L
 }
 
 /**
- * Deploys with contracts/script/Deploy.s.sol and returns the parsed deployment file. Every local Anvil writes the
- * same deployments/31337.json, so deployments from parallel test files are serialized with a directory lock.
+ * Deploys with contracts/script/Deploy.s.sol, then DeployBatchAnchor.s.sol beside it, and returns the
+ * parsed deployment file (batchAnchor + batchAnchorBlock set). Every local Anvil writes the same
+ * deployments/31337.json, so deployments from parallel test files are serialized with a directory lock.
  */
 export async function deployLocal(options: { rpcUrl: string; privateKey?: Hex }): Promise<Deployment> {
   const privateKey = options.privateKey ?? ANVIL_PRIVATE_KEYS[0]!
@@ -115,6 +116,13 @@ export async function deployLocal(options: { rpcUrl: string; privateKey?: Hex })
       { cwd: CONTRACTS_DIR(), encoding: "utf8", env: { ...process.env, VAULT_RP_ID: process.env.VAULT_RP_ID ?? "vault.mida.xyz" } },
     )
     if (result.status !== 0) throw new Error(`forge script failed:\n${result.stdout}\n${result.stderr}`)
+    const anchorResult = spawnSync(
+      `${FOUNDRY_BIN}/forge`,
+      ["script", "script/DeployBatchAnchor.s.sol", "--rpc-url", options.rpcUrl, "--broadcast", "--private-key", privateKey],
+      { cwd: CONTRACTS_DIR(), encoding: "utf8" },
+    )
+    if (anchorResult.status !== 0)
+      throw new Error(`forge script DeployBatchAnchor failed:\n${anchorResult.stdout}\n${anchorResult.stderr}`)
     return loadDeployment(31337n)
   } finally {
     rmdirSync(lockDir)

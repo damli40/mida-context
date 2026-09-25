@@ -30,6 +30,7 @@ import type {
 } from "@mida/protocol"
 import { bytesOf, deriveEpochKeyPair, generateX25519KeyPair, hexOf, openContextObject } from "@mida/crypto"
 import {
+  batchAnchorAbi,
   chainFor,
   contextRegistryAbi,
   createSponsoredSender,
@@ -47,6 +48,7 @@ import type { SealedRecord } from "@mida/sdk"
 import { RegistryReader } from "@mida/api"
 import type { AnchoredObject } from "@mida/api"
 import { MidaHome, resolveHome } from "./home.js"
+import { pendingAnchorsStrict } from "./batching.js"
 import { Runtime, makeOwnerBalanceGuard, parseSponsorUrl, sponsorReachable, NAMESPACE } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { FACT_NAMESPACES } from "./remember.js"
@@ -68,6 +70,7 @@ import {
 } from "./keys.js"
 import type { AgentIdentity } from "./keys.js"
 import { callDaemon } from "./control.js"
+import { debugLine } from "./debug-line.js"
 import { readOwnerUniverse } from "./owner-read.js"
 import type { SourceRecord } from "./owner-read.js"
 import { buildManifest, payloadFingerprint, preflight, replayOrder } from "./migrate-manifest.js"
@@ -122,6 +125,12 @@ export interface MigrateDeps {
    * stderr so the command's stdout keeps its shape; tests inject a collector.
    */
   progress?: (line: string) => void
+  /**
+   * tests only: stands in for the `BatchAnchor.hasBatchedSaves(owner)` chain read on the source
+   * deployment. Production reads the contract; the guard that consumes the answer is identical
+   * either way — true refuses, a thrown read refuses, and only a clean false lets the run on.
+   */
+  hasBatchedSaves?: (owner: Address) => Promise<boolean>
 }
 
 /**
@@ -327,6 +336,7 @@ function serializeDeployment(deployment: Deployment): Record<string, unknown> {
     ...deployment,
     chainId: deployment.chainId.toString(10),
     deploymentBlock: deployment.deploymentBlock.toString(10),
+    batchAnchorBlock: deployment.batchAnchorBlock?.toString(10),
   }
 }
 
@@ -469,16 +479,16 @@ async function storeUnreadableManifest(
 
 export async function migrate(
   deps: MigrateDeps,
-): Promise<{ outcome: "moved" | "refused" | "nothing-to-move"; lines: string[] }> {
+): Promise<{ outcome: "moved" | "refused" | "nothing-to-move"; code?: string; lines: string[] }> {
   const { home, env, confirm, now } = deps
   const lines: string[] = []
   const say = (line: string): void => {
     lines.push(line)
     deps.print(line)
   }
-  const refuse = (line: string): { outcome: "refused"; lines: string[] } => {
+  const refuse = (line: string, code?: string): { outcome: "refused"; code?: string; lines: string[] } => {
     say(line)
-    return { outcome: "refused", lines }
+    return { outcome: "refused", ...(code === undefined ? {} : { code }), lines }
   }
 
   // ── Rule 0: refusals before any side effect ──────────────────────────────────
@@ -491,6 +501,55 @@ export async function migrate(
   const sourceNetwork = resolved.network
   const source = sourceNetwork.deployment
   const target = deps.target ?? resolved.builtIn
+
+  // The BatchAnchor guard (BatchAnchor plan §7.4), right after the source resolves and before
+  // anything else is touched: batched saves live on a contract this migrator cannot move, so a
+  // setup that has any refuses. The read FAILS CLOSED — a thrown call, or an owner address that
+  // cannot be loaded to ask the question, is "unknown", never "none".
+  if (source.batchAnchor !== undefined) {
+    let batched: boolean
+    try {
+      const owner = loadOwnerAddress(home)
+      if (owner === undefined) throw new Error("owner-address.json is missing — cannot ask the chain about batched saves")
+      batched =
+        deps.hasBatchedSaves === undefined
+          ? ((await createPublicClient({ chain: chainFor(source.chainId), transport: http(sourceNetwork.rpcUrl) }).readContract({
+              address: source.batchAnchor,
+              abi: batchAnchorAbi,
+              functionName: "hasBatchedSaves",
+              args: [owner],
+            } as never)) as boolean)
+          : await deps.hasBatchedSaves(owner)
+    } catch (error) {
+      const refused = refuse("could not check for batched saves; migrate stops rather than guess", "batched-check-failed")
+      if (env.MIDA_DEBUG === "1") say(debugLine(error))
+      return refused
+    }
+    if (batched) {
+      return refuse("this setup has batched checkpoint saves; migrate cannot move them yet", "batched-saves-present")
+    }
+  }
+
+  // The local half of the same guard: the chain flag only knows saves the chain already anchored —
+  // a save the store queued but has not submitted yet is invisible to it. The home's own pending
+  // ledger answers that, read STRICTLY: a file that exists but will not parse, or an entry that is
+  // not a known in-flight save, is "unknown" — and unknown means refuse, exactly like the chain
+  // read above. It runs whether or not the source still names a BatchAnchor; a save that was
+  // queued stays queued either way.
+  let pendingBatched: number
+  try {
+    pendingBatched = pendingAnchorsStrict(home).length
+  } catch (error) {
+    const refused = refuse("could not read the local batched-saves ledger; migrate stops rather than guess", "batched-check-failed")
+    if (env.MIDA_DEBUG === "1") say(debugLine(error))
+    return refused
+  }
+  if (pendingBatched > 0) {
+    return refuse(
+      `this setup has ${pendingBatched} batched checkpoint save(s) still waiting on the chain; let the store finish them before migrating`,
+      "batched-saves-pending",
+    )
+  }
 
   let persisted: MigrateState | undefined
   if (home.has("migrate/state.json")) {
@@ -591,7 +650,11 @@ export async function migrate(
       runtime.progress = deps.progress
       try {
         sourceRecords = new Map(
-          (await readOwnerUniverse(runtime, { onProgress: scanReport("records", deps.progress) })).map((record) => [record.contextId.toLowerCase(), record]),
+          (await readOwnerUniverse(runtime, { onProgress: scanReport("records", deps.progress) }))
+            // the batched guard refused before this ran whenever batched saves exist — the
+            // filter only restates that; it never drops a record a run could reach
+            .filter((record) => record.lane !== "batched")
+            .map((record) => [record.contextId.toLowerCase(), record]),
         )
       } finally {
         await runtime.close()
@@ -618,7 +681,8 @@ export async function migrate(
         try {
           let records: SourceRecord[]
           try {
-            records = await readOwnerUniverse(runtime, { onProgress: scanReport("records", deps.progress) })
+            records = (await readOwnerUniverse(runtime, { onProgress: scanReport("records", deps.progress) }))
+              .filter((record) => record.lane !== "batched")
           } catch (error) {
             if ((error as { code?: unknown }).code === "owner-read-incomplete") {
               return refuse((error as Error).message)

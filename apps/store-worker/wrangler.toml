@@ -35,6 +35,18 @@ binding = "DB"
 database_name = "mida-context-store"
 database_id = "REPLACE_WITH_D1_DATABASE_ID" # placeholder — NOT a real id; do not commit one
 
+# BatchAnchor: one Durable Object, looked up as idFromName("batcher"), owns the batch queue. Its
+# storage alarm is the wait timer and its storage is the crash journal — both survive eviction.
+# Binding the class is safe while the lane is off: nothing instantiates the object until the
+# worker forwards a notify/flush, which only happens once BATCHING_ENABLED is "true".
+[[durable_objects.bindings]]
+name = "BATCH_COORDINATOR"
+class_name = "BatchCoordinator"
+
+[[migrations]]
+tag = "batch-coordinator-v1"
+new_sqlite_classes = ["BatchCoordinator"]
+
 # Deployment configuration — every value the Worker needs comes from the environment, never
 # from a file (there is no filesystem; packages/chain/src/deployment.ts loadDeployment would
 # try to read one). Replace each placeholder for your network; these are NOT real values.
@@ -47,5 +59,20 @@ POLICY_HASH_V1 = "0xREPLACE_WITH_32_BYTE_POLICY_HASH"
 VAULT_RP_ID = "REPLACE_WITH_VAULT_RP_ID"
 VAULT_RP_ID_HASH = "0xREPLACE_WITH_32_BYTE_RP_ID_HASH"
 
-# RPC_URL is a URL and may carry an API key — set it as a secret, not a var:
-#   wrangler secret put RPC_URL
+# BatchAnchor lane — OFF by default. To switch it on: deploy BatchAnchor, put its address in
+# BATCH_ANCHOR, set BATCHING_ENABLED = "true", and set the two secrets below. A BATCH_ANCHOR that
+# does not parse as an address mounts no batch surface at all; "true" without a valid anchor (or
+# without the keys/binding) fails the worker loudly at boot.
+BATCH_ANCHOR = "0xREPLACE_WITH_BATCH_ANCHOR_ADDRESS"
+# The block BatchAnchor was deployed in — the floor its historical log scans start from (per-batch
+# resolution never scans below its own block). Take it from the anchor's deploy transaction.
+BATCH_ANCHOR_BLOCK = "REPLACE_WITH_BATCH_ANCHOR_BLOCK"
+BATCHING_ENABLED = "false"
+# Optional trial gate: comma-separated owner addresses (any case) that the enabled lane will
+# admit to POST /batch/saves — every other owner gets a plain 403. Empty or absent means open.
+#BATCH_OWNER_ALLOWLIST = "0xOWNER_ONE,0xOWNER_TWO"
+
+# Secrets (wrangler secret put …):
+#   RPC_URL              — a URL, may carry an API key
+#   BATCHER_PRIVATE_KEY  — the funded account that pays for submitBatch; also the batchId seed
+#   RECEIPT_PRIVATE_KEY  — signs the store's admission receipts; unrelated to any chain identity

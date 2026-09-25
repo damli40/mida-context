@@ -25,6 +25,8 @@ type GlobalStats {
 
 # One row per distinct owner address seen in any owner-bearing event.
 # An "owner" is an address, not a person — one team can be many addresses.
+# batchedSaves counts SaveAnchored events for this owner (the batched lane);
+# those saves never appear in ContextRecord and never count in records.
 type Owner {
   id: ID!
   firstSeenBlock: Int!
@@ -32,6 +34,18 @@ type Owner {
   revocations: Int!
   records: Int!
   p256Registered: Boolean!
+  batchedSaves: Int!
+}
+
+# Singleton row (id is always "global"): counts for the BatchAnchor lane.
+# "batches" is BatchAnchored events; "anchoredSaves"/"rejectedSaves" are the
+# per-save SaveAnchored/SaveRejected log lines — never derived from the batch
+# summary's own accepted/rejected fields, so the summary cannot double-count.
+type BatchStats {
+  id: ID!
+  batches: Int!
+  anchoredSaves: Int!
+  rejectedSaves: Int!
 }
 
 # One row per distinct operator address seen registering an agent.

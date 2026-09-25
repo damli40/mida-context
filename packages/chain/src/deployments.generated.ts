@@ -11,6 +11,8 @@ export const EMBEDDED_DEPLOYMENTS: Record<string, unknown> = {
   "deploymentBlock": 65178864,
   "policyHashV1": "0xfd7cb44154ac443f554cc7f16f8d89da452475b06b71fce6df1cbda2c139dc45",
   "vaultRpId": "app.midacontext.xyz",
-  "vaultRpIdHash": "0x57edbac77a11c6055a8332daaa977b3ecf9842bb17bbb7fde936e984adba8d37"
+  "vaultRpIdHash": "0x57edbac77a11c6055a8332daaa977b3ecf9842bb17bbb7fde936e984adba8d37",
+  "batchAnchor": "0xe5dcf76B1109906A16587cD2FE02c1e6f4a7a9E1",
+  "batchAnchorBlock": 65373247
 },
 }

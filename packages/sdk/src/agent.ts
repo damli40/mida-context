@@ -9,6 +9,7 @@ import {
   RECORD_TYPE,
   accessRequestTypedData,
   assertCanonicalScopes,
+  batchContextId,
   canonicalJson,
   canonicalizeNamespace,
   canonicalizeOrigin,
@@ -24,6 +25,7 @@ import type {
   AccessGrantResponse,
   AccessRequest,
   Address,
+  BatchSaveMessage,
   ContextKind,
   ContextPayload,
   GrantedCapability,
@@ -40,11 +42,12 @@ import type { LocalWriteContext } from "@mida/chain"
 import { assertGrantResponseWithinRequest, expandScopeInputs } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
 import { RegistryReader } from "@mida/api"
-import type { AnchoredObject, ContextApiRoutes, ContextRecordView } from "@mida/api"
+import type { AnchoredObject, BatchReceipt, BatchedSaveWire, ContextApiRoutes, ContextRecordView } from "@mida/api"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { parseEventLogs, zeroHash } from "viem"
 import { MemoryAccessRequestStore } from "./request-store.js"
 import type { AccessRequestStore } from "./request-store.js"
+import { signBatchSave, verifyBatchedItem, verifyPendingItem } from "./batched.js"
 
 /** §13.2 allows up to 600 seconds; the SDK uses 300 so a request stays valid through a normal consent screen. */
 export const REQUEST_LIFETIME_SECONDS = 300n
@@ -328,46 +331,7 @@ export class MidaAgent {
     const capability = this.#requireCapability(ownerAddress, namespaceId, PERMISSION.READ)
     const { deployment } = this.#chain
     const { objects, partial } = await this.#api.listObjects({ owner: ownerAddress, namespaceId, capabilityId: capability.capabilityId })
-    // The agent record's key version is needed only to unwrap an epoch key — and only a non-empty
-    // list has objects to open, so an empty (or empty-and-partial) read spends no chain call here.
-    let agentRecord: Promise<Awaited<ReturnType<typeof readAgentRecord>>> | undefined
-    const agent = () => (agentRecord ??= readAgentRecord(this.#chain, this.agentId))
-    // Each distinct epoch key is fetched exactly once, also under concurrency: the map holds
-    // the in-flight promise, so workers reading objects on the same epoch share one call.
-    const epochKeys = new Map<bigint, Promise<Uint8Array>>()
-    const epochKeyFor = (readEpoch: bigint): Promise<Uint8Array> => {
-      let pending = epochKeys.get(readEpoch)
-      if (pending === undefined) {
-        pending = agent().then((record) =>
-          this.#api
-            .getEpochWrap({
-              owner: ownerAddress,
-              namespaceId,
-              readEpoch,
-              agentId: this.agentId,
-              agentKeyVersion: record.encryptionKeyVersion,
-              capabilityId: capability.capabilityId,
-            })
-            .then((wrap) =>
-              unwrapEpochPrivateKey({
-                wrap,
-                agentEncryptionPrivateKey: this.#encryptionPrivateKey,
-                binding: {
-                  chainId: deployment.chainId,
-                  capabilityRegistry: deployment.capabilityRegistry,
-                  owner: ownerAddress,
-                  namespaceId,
-                  readEpoch,
-                  agentId: this.agentId,
-                  agentKeyVersion: record.encryptionKeyVersion,
-                },
-              }),
-            ),
-        )
-        epochKeys.set(readEpoch, pending)
-      }
-      return pending
-    }
+    const epochKeyFor = this.#epochKeyResolver(ownerAddress, namespaceId, capability.capabilityId)
     const readObject = async (object: AnchoredObject): Promise<ContextObject> => {
       const record = await this.#verifiedRecord(ownerAddress, namespaceId, object)
       const epochPrivateKey = await epochKeyFor(record.readEpoch)
@@ -398,6 +362,105 @@ export class MidaAgent {
     return { objects: results, partial }
   }
 
+  /**
+   * The batched counterpart of `readWithStatus` (Task 4): lists the store's batch rows and verifies
+   * each one itself — an anchored row only survives if its proof reaches the on-chain batch root
+   * and it is the lineage's current head; a queued/submitted row is checked for everything except
+   * inclusion and comes back marked `PENDING_ANCHOR` with its author agentId. The store's word for
+   * a row's state is never trusted; every authority check reads the contracts.
+   */
+  async readBatchedWithStatus(owner: Address, namespace: string): Promise<{
+    anchored: ContextObject[]
+    pending: (ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex })[]
+    skipped: { contextId: Hex; reason: string }[]
+    partial: boolean
+  }> {
+    const ownerAddress = owner.toLowerCase() as Address
+    const name = canonicalizeNamespace(namespace)
+    const namespaceId = toNamespaceId(name)
+    const capability = this.#requireCapability(ownerAddress, namespaceId, PERMISSION.READ)
+    const { deployment } = this.#chain
+    if (deployment.batchAnchor === undefined) {
+      throw new MidaError("INVALID_WIRE", "this deployment has no BatchAnchor — use readWithStatus()")
+    }
+    const { items, partial } = await this.#api.listBatchSaves({
+      owner: ownerAddress,
+      namespaceId,
+      capabilityId: capability.capabilityId,
+    })
+    const epochKeyFor = this.#epochKeyResolver(ownerAddress, namespaceId, capability.capabilityId)
+    const anchored: ContextObject[] = []
+    const pending: (ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex })[] = []
+    const skipped: { contextId: Hex; reason: string }[] = []
+    for (const item of items) {
+      const message = item.save.message
+      // A row the store filed under the wrong owner or namespace is out of scope for this read:
+      // skip it before verification or decryption ever run on it.
+      if (message.owner.toLowerCase() !== ownerAddress || message.namespaceId.toLowerCase() !== namespaceId) {
+        skipped.push({ contextId: item.contextId, reason: "wrong-scope" })
+        continue
+      }
+      const verdict =
+        item.state === "ANCHORED"
+          ? await verifyBatchedItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient, requireLatest: true })
+          : await verifyPendingItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient })
+      if (!verdict.ok) {
+        skipped.push({ contextId: item.contextId, reason: verdict.reason })
+        continue
+      }
+      const readEpoch = decodeUint64(message.readEpoch)
+      let payload: ContextPayload
+      try {
+        // The key fetch is inside the guard too: a row sealed under an epoch this agent has no wrap
+        // for throws there, and must skip the row — not abort the whole batched read.
+        const epochPrivateKey = await epochKeyFor(readEpoch)
+        payload = openContextObject({
+          manifest: item.save.manifest,
+          expectedManifestHash: message.manifestHash.toLowerCase() as Hex,
+          ciphertext: bytesOf(item.save.ciphertext, item.save.manifest.ciphertextSize),
+          epochPrivateKey,
+          binding: {
+            chainId: deployment.chainId,
+            contextRegistry: deployment.contextRegistry,
+            contextId: item.contextId,
+            namespaceId,
+            readEpoch,
+          },
+        })
+      } catch {
+        // One row that will not open — sealed under a key this agent cannot unwrap, or bytes that
+        // pass the commitments but fail the AAD — skips the row, not the whole read.
+        skipped.push({ contextId: item.contextId, reason: "decrypt" })
+        continue
+      }
+      const base = {
+        contextId: item.contextId,
+        owner: ownerAddress,
+        namespace: name,
+        namespaceId,
+        authorId: verdict.agentId,
+        parentId: message.parentId,
+        readEpoch,
+        recordType: "CONTEXT" as const,
+        payload,
+      }
+      if (item.state === "ANCHORED") {
+        // lineageId and version passed through the Merkle proof, so they are contract values here.
+        anchored.push({ ...base, lineageId: item.lineageId!, version: item.version! })
+      } else {
+        // Nothing is anchored yet: derive the would-be head fields from the signed message itself.
+        pending.push({
+          ...base,
+          lineageId: message.parentId === zeroHash ? item.contextId : message.lineageId,
+          version: message.parentVersion + 1,
+          anchor: "PENDING_ANCHOR",
+          authorAgentId: verdict.agentId,
+        })
+      }
+    }
+    return { anchored, pending, skipped, partial }
+  }
+
   async create(owner: Address, namespace: string, input: CreateContextInput): Promise<ContextObject> {
     const ownerAddress = owner.toLowerCase() as Address
     const name = canonicalizeNamespace(namespace)
@@ -410,6 +473,92 @@ export class MidaAgent {
       input,
       capability: this.#requireCapability(ownerAddress, namespaceId, PERMISSION.CREATE),
     })
+  }
+
+  /**
+   * The BatchAnchor write path (Task 4): seals the same checkpoint shape as `create` — a new
+   * STANDARD-lineage CONTEXT record, always AGENT_INFERRED — but signs it for the batch queue
+   * instead of calling `contexts.register`. The signature is the whole authorization; no
+   * transaction leaves this method.
+   */
+  async createBatched(
+    owner: Address,
+    namespace: string,
+    input: CreateContextInput,
+  ): Promise<{ contextId: Hex; state: "QUEUED"; receipt: BatchReceipt }> {
+    const ownerAddress = owner.toLowerCase() as Address
+    const name = canonicalizeNamespace(namespace)
+    const namespaceId = toNamespaceId(name)
+    this.#requireCapability(ownerAddress, namespaceId, PERMISSION.CREATE)
+    if (input.source !== "AGENT_INFERRED") {
+      throw new MidaError("PROVENANCE_FORBIDDEN", "a batched save is the checkpoint shape — always AGENT_INFERRED")
+    }
+    if (!Object.hasOwn(CONTEXT_KIND, input.kind) || (input.kind as string) === "NONE") {
+      throw new MidaError("INVALID_WIRE", `unknown context kind ${String(input.kind)}`)
+    }
+    const { deployment } = this.#chain
+    const batchAnchor = deployment.batchAnchor
+    if (batchAnchor === undefined) {
+      throw new MidaError("INVALID_WIRE", "this deployment has no BatchAnchor — use create()")
+    }
+    const readEpoch = await this.#reader.requiredReadEpoch(ownerAddress, namespaceId)
+    const epochPublicKey = await this.#reader.epochPublicKey(ownerAddress, namespaceId, readEpoch)
+    if (epochPublicKey === null || !(await this.#reader.isWriteEpochValid(ownerAddress, namespaceId, readEpoch))) {
+      throw new MidaError("EPOCH_ROTATION_REQUIRED", "the current read epoch does not accept writes")
+    }
+    const objectNonce = hexOf(randomBytes(32))
+    const contextId = batchContextId({
+      chainId: deployment.chainId,
+      batchAnchor,
+      owner: ownerAddress,
+      agentId: this.agentId,
+      namespaceId,
+      parentId: zeroHash,
+      objectNonce,
+    })
+    const references = input.references ?? []
+    const payload: ContextPayload = {
+      v: 1,
+      value: input.value,
+      kind: input.kind,
+      provenance: {
+        source: input.source,
+        ...(references.length === 0 ? {} : { references }),
+        ...(input.note === undefined ? {} : { note: input.note }),
+        ...(input.extractionConfidence === undefined ? {} : { extractionConfidence: input.extractionConfidence }),
+      },
+      ...(input.tags === undefined ? {} : { tags: input.tags }),
+    }
+    // CREATE needs only the public epoch key, exactly as #write.
+    const sealed = sealContextObject({
+      payload,
+      binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId, namespaceId, readEpoch },
+      epochPublicKey: bytesOf(epochPublicKey, 32),
+    })
+    const message: BatchSaveMessage = {
+      owner: ownerAddress,
+      namespaceId,
+      objectNonce,
+      lineageId: zeroHash,
+      parentId: zeroHash,
+      parentVersion: 0,
+      rootAuthor: zeroHash,
+      manifestHash: sealed.manifestHash,
+      ciphertextCommitment: sealed.ciphertextCommitment,
+      readEpoch,
+      expiresAt: input.expiresAt ?? 0n,
+      kind: CONTEXT_KIND[input.kind],
+      provenanceSource: PROVENANCE_SOURCE.AGENT_INFERRED,
+    }
+    const signature = await signBatchSave({ account: this.#chain.account, chainId: deployment.chainId, batchAnchor, message })
+    const wire: BatchedSaveWire = {
+      message: { ...message, readEpoch: encodeUint64(readEpoch), expiresAt: encodeUint64(message.expiresAt) },
+      signature,
+      manifest: sealed.manifest,
+      ciphertext: hexOf(sealed.ciphertext),
+    }
+    const { receipt } = await this.#api.postBatchSave(wire)
+    return { contextId, state: "QUEUED", receipt }
   }
 
   /** §11.6: SUPERSEDE_ANY on another author's STANDARD lineage, SUPERSEDE_OWN (or ANY) on this agent's own lineage. */
@@ -611,6 +760,53 @@ export class MidaAgent {
     const capability = this.#findCapability(owner, namespaceId, permission)
     if (capability === undefined) throw new MidaError("CAPABILITY_DENIED", "no completed grant covers this owner, namespace and permission")
     return capability
+  }
+
+  /**
+   * The epoch-key fetch `readWithStatus` and `readBatchedWithStatus` share. The agent record's key
+   * version is needed only to unwrap an epoch key — and only a non-empty list has objects to open,
+   * so an empty read spends no chain call here. Each distinct epoch key is fetched exactly once,
+   * also under concurrency: the map holds the in-flight promise, so workers on the same epoch share
+   * one call.
+   */
+  #epochKeyResolver(ownerAddress: Address, namespaceId: Hex, capabilityId: Hex): (readEpoch: bigint) => Promise<Uint8Array> {
+    const { deployment } = this.#chain
+    let agentRecord: Promise<Awaited<ReturnType<typeof readAgentRecord>>> | undefined
+    const agent = () => (agentRecord ??= readAgentRecord(this.#chain, this.agentId))
+    const epochKeys = new Map<bigint, Promise<Uint8Array>>()
+    return (readEpoch: bigint): Promise<Uint8Array> => {
+      let pending = epochKeys.get(readEpoch)
+      if (pending === undefined) {
+        pending = agent().then((record) =>
+          this.#api
+            .getEpochWrap({
+              owner: ownerAddress,
+              namespaceId,
+              readEpoch,
+              agentId: this.agentId,
+              agentKeyVersion: record.encryptionKeyVersion,
+              capabilityId,
+            })
+            .then((wrap) =>
+              unwrapEpochPrivateKey({
+                wrap,
+                agentEncryptionPrivateKey: this.#encryptionPrivateKey,
+                binding: {
+                  chainId: deployment.chainId,
+                  capabilityRegistry: deployment.capabilityRegistry,
+                  owner: ownerAddress,
+                  namespaceId,
+                  readEpoch,
+                  agentId: this.agentId,
+                  agentKeyVersion: record.encryptionKeyVersion,
+                },
+              }),
+            ),
+        )
+        epochKeys.set(readEpoch, pending)
+      }
+      return pending
+    }
   }
 
   async #verifiedRecord(owner: Address, namespaceId: Hex, object: AnchoredObject): Promise<ContextRecordView> {

@@ -1,3 +1,6 @@
+import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs"
+import { dirname } from "node:path"
+import { randomBytes } from "node:crypto"
 import { createPublicClient, http } from "viem"
 import { monadTestnet } from "viem/chains"
 import { MAX_LOG_BLOCK_RANGE, MONAD_TESTNET_CHAIN_ID, chainFor, loadDeployment, parseDeployment } from "@mida/chain"
@@ -76,11 +79,13 @@ function sameContract(a: Deployment, b: Deployment): boolean {
   )
 }
 
-interface SavedNetwork {
+export interface SavedNetwork {
   rpcUrl: string
   deployment: Deployment
   storageUrl?: string
   sponsorUrl?: string
+  /** The batched-lane switch `mida batching on|off` writes; absent means off. */
+  batching?: boolean
 }
 
 /**
@@ -89,9 +94,9 @@ interface SavedNetwork {
  * parseDeployment refuses is a `network-json-invalid` refusal — corrupt is never treated as
  * missing, and a broken file never silently falls back to the built-in record.
  */
-function readSavedNetwork(home: MidaHome): SavedNetwork | undefined {
+export function readSavedNetwork(home: MidaHome): SavedNetwork | undefined {
   if (!home.has("network.json")) return undefined
-  let stored: { rpcUrl?: unknown; deployment?: unknown; storageUrl?: unknown; sponsorUrl?: unknown } | undefined
+  let stored: { rpcUrl?: unknown; deployment?: unknown; storageUrl?: unknown; sponsorUrl?: unknown; batching?: unknown } | undefined
   try {
     stored = home.readJson("network.json")
   } catch {
@@ -111,6 +116,7 @@ function readSavedNetwork(home: MidaHome): SavedNetwork | undefined {
     deployment,
     storageUrl: typeof stored.storageUrl === "string" && stored.storageUrl !== "" ? stored.storageUrl : undefined,
     sponsorUrl: typeof stored.sponsorUrl === "string" && stored.sponsorUrl !== "" ? stored.sponsorUrl : undefined,
+    ...(typeof stored.batching === "boolean" ? { batching: stored.batching } : {}),
   }
 }
 
@@ -133,7 +139,18 @@ export async function resolveNetwork(
     )
   }
 
-  const deployment = saved?.deployment ?? builtIn
+  // An older saved deployment predates BatchAnchor — the contract that anchors many saves in one
+  // transaction — so it carries no `batchAnchor` field. When the saved deployment is provably the
+  // SAME deployment the built-in record describes (same chain, same two registries) the shipped
+  // anchor and its block are adopted into the resolved deployment — additive only, no other saved
+  // field is replaced, a mismatched contract adopts nothing, and network.json is never rewritten.
+  const deployment =
+    saved !== undefined &&
+    saved.deployment.batchAnchor === undefined &&
+    builtIn.batchAnchor !== undefined &&
+    sameContract(saved.deployment, builtIn)
+      ? { ...saved.deployment, batchAnchor: builtIn.batchAnchor, batchAnchorBlock: builtIn.batchAnchorBlock }
+      : saved?.deployment ?? builtIn
   const envRpc = env.MONAD_TESTNET_RPC
   const rpcUrl = !unset(envRpc) ? envRpc : saved?.rpcUrl ?? monadTestnet.rpcUrls.default.http[0]
 
@@ -221,4 +238,161 @@ export async function serviceNetwork(
 ): Promise<Network | undefined> {
   if (!home.has("network.json")) return undefined
   return (await resolveNetwork(home, env, { probeChainId: false })).network
+}
+
+/**
+ * Writes `batching` into network.json while leaving every other byte untouched. When the flag
+ * already exists only its value token is replaced in place; when it does not, the flag is
+ * inserted as the file's first key at the file's own indentation, so field order, spacing and the
+ * whole deployment block survive byte-for-byte. Only a file whose shape the surgical edit cannot
+ * honour — a non-canonical layout — is rewritten whole (its values still preserved). A missing or
+ * unparsable file is a refusal, never a rewrite.
+ */
+export function setBatchingFlag(home: MidaHome, on: boolean): void {
+  const file = home.path("network.json")
+  let text: string
+  try {
+    text = readFileSync(file, "utf8")
+  } catch {
+    throw codedError("network-json-invalid", "network.json is missing or unreadable")
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw codedError("network-json-invalid", "network.json could not be parsed")
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw codedError("network-json-invalid", "network.json is not a JSON object")
+  }
+  const value = on ? "true" : "false"
+  const span = batchingSpan(text)
+  let next: string | undefined
+  if (Object.hasOwn(parsed, "batching")) {
+    if (span?.kind === "replace") next = text.slice(0, span.start) + value + text.slice(span.end)
+    // a "batching" the scanner cannot place (an escaped key) falls to the full rewrite below —
+    // inserting a second raw key would lose to it, because JSON.parse keeps the last duplicate
+  } else if (span?.kind === "insert-pair") {
+    next = text.slice(0, span.at) + span.leading + `"batching": ${value},` + span.leading + text.slice(span.at + span.leading.length)
+  } else if (span?.kind === "insert-value") {
+    next = text.slice(0, span.at) + `"batching": ${value}` + text.slice(span.at)
+  }
+  // a surgical splice that does not leave batching === on — a second top-level "batching" key
+  // later in the object would still win the parse — falls back to the whole-file rewrite
+  if (next !== undefined) {
+    const check = JSON.parse(next) as { batching?: unknown }
+    if (check.batching !== on) next = undefined
+  }
+  next ??= JSON.stringify({ ...(parsed as Record<string, unknown>), batching: on }, null, 2)
+  writeFileAtomic(file, next)
+}
+
+/**
+ * Where the top-level `"batching"` key sits inside a JSON object's raw text. `replace` is the
+ * existing value's span; `insert-pair` splices `"batching": <v>,` before the first key, reusing
+ * that key's leading whitespace so the file keeps its own layout; `insert-value` is the empty
+ * object. Keys are matched as raw text at depth 1 only — a `"batching"` nested inside another
+ * field is never touched. null when the text is not a well-formed object; the caller then
+ * rewrites the file whole.
+ */
+function batchingSpan(
+  text: string,
+): { kind: "replace"; start: number; end: number } | { kind: "insert-pair"; at: number; leading: string } | { kind: "insert-value"; at: number } | null {
+  const open = text.indexOf("{")
+  if (open === -1) return null
+  const n = text.length
+  let i = open + 1
+  const ws = (): void => {
+    while (i < n && (text[i] === " " || text[i] === "\t" || text[i] === "\n" || text[i] === "\r")) i += 1
+  }
+  const skipString = (): void => {
+    i += 1 // opening quote
+    while (i < n && text[i] !== '"') {
+      if (text[i] === "\\") i += 1
+      i += 1
+    }
+    i += 1 // closing quote (i === n when unterminated — the callers' checks fail next)
+  }
+  const skipValue = (): boolean => {
+    ws()
+    const ch = text[i]
+    if (ch === '"') {
+      skipString()
+      return true
+    }
+    if (ch === "{" || ch === "[") {
+      const stack: string[] = []
+      for (; i < n; i += 1) {
+        const c = text[i]
+        if (c === '"') {
+          skipString()
+          i -= 1 // the loop's own step moves past the closing quote
+        } else if (c === "{") {
+          stack.push("}")
+        } else if (c === "[") {
+          stack.push("]")
+        } else if (c === "}" || c === "]") {
+          if (stack.pop() !== c) return false
+          if (stack.length === 0) {
+            i += 1
+            return true
+          }
+        }
+      }
+      return false
+    }
+    // a scalar: consume until the next structural character or whitespace
+    while (i < n && text[i] !== "," && text[i] !== "}" && text[i] !== "]" && text[i] !== " " && text[i] !== "\t" && text[i] !== "\n" && text[i] !== "\r") i += 1
+    return true
+  }
+  ws()
+  if (i >= n) return null
+  if (text[i] === "}") return { kind: "insert-value", at: open + 1 }
+  if (text[i] !== '"') return null
+  const leading = text.slice(open + 1, i) // the whitespace before the first key — reused on insert
+  for (;;) {
+    if (text[i] !== '"') return null
+    const keyStart = i + 1
+    skipString()
+    const name = text.slice(keyStart, i - 1)
+    ws()
+    if (text[i] !== ":") return null
+    i += 1
+    ws()
+    const valueStart = i
+    if (!skipValue()) return null
+    if (name === "batching") return { kind: "replace", start: valueStart, end: i }
+    ws()
+    if (text[i] === ",") {
+      i += 1
+      ws()
+      continue
+    }
+    if (text[i] === "}") return { kind: "insert-pair", at: open + 1, leading }
+    return null
+  }
+}
+
+/** The same durability writeSecretJson gives: a 0600 temp file, fsync, rename, folder fsync. */
+function writeFileAtomic(file: string, text: string): void {
+  const temp = `${file}.${randomBytes(6).toString("hex")}.tmp`
+  try {
+    const fd = openSync(temp, "wx", 0o600)
+    try {
+      writeSync(fd, text)
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(temp, file)
+  } catch (error) {
+    rmSync(temp, { force: true })
+    throw error
+  }
+  const folder = openSync(dirname(file), "r")
+  try {
+    fsyncSync(folder)
+  } finally {
+    closeSync(folder)
+  }
 }

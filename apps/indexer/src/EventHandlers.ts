@@ -17,7 +17,7 @@
 //   EvidenceRegistered counts in evidenceRecords — evidence is never double-counted.
 // - All ids and addresses are stored lowercase.
 import { indexer } from "envio"
-import type { Agent, AgentGrantBook, EvmOnEventContext, GlobalStats, Owner } from "envio"
+import type { Agent, AgentGrantBook, BatchStats, EvmOnEventContext, GlobalStats, Owner } from "envio"
 
 type Context = EvmOnEventContext
 type EventId = { transaction: { hash: string }; logIndex: number }
@@ -91,6 +91,7 @@ const ensureOwner = async (context: Context, address: string, block: number) => 
     revocations: 0,
     records: 0,
     p256Registered: false,
+    batchedSaves: 0,
   }
   return { owner, isNew: true }
 }
@@ -543,6 +544,70 @@ indexer.onEvent(
       namespaceId: event.params.namespaceId,
       contextId: event.params.contextId,
     })
+    saveStats(context, event, stats)
+  },
+)
+
+// ---------------------------------------------------------------------------
+// BatchAnchor — batched checkpoint saves. The index only COUNTS these events;
+// it never decides validity (the contract already did) and no save lands in
+// ContextRecord, because batched saves never touch ContextRegistry.
+// SaveAnchored / SaveRejected are the per-save log lines; BatchAnchored is the
+// batch summary. The save counters move on the per-save lines only — the
+// summary's acceptedCount/rejectedCount are never added, so one batch can
+// never count its saves twice.
+// ---------------------------------------------------------------------------
+
+const BATCH_STATS_ID = "global"
+
+const zeroBatchStats = (): BatchStats => ({
+  id: BATCH_STATS_ID,
+  batches: 0,
+  anchoredSaves: 0,
+  rejectedSaves: 0,
+})
+
+const getBatchStats = async (context: Context): Promise<Mutable<BatchStats>> => ({
+  ...((await context.BatchStats.get(BATCH_STATS_ID)) ?? zeroBatchStats()),
+})
+
+indexer.onEvent(
+  { contract: "BatchAnchor", event: "SaveAnchored" },
+  async ({ event, context }) => {
+    if (await alreadyProcessed(context, event)) return
+    const stats = await getStats(context)
+    const batchStats = await getBatchStats(context)
+    const owner = lc(event.params.owner)
+
+    const { owner: ownerRow, isNew } = await ensureOwner(context, owner, event.block.number)
+    if (isNew) stats.owners += 1
+    context.Owner.set({ ...ownerRow, batchedSaves: ownerRow.batchedSaves + 1 })
+    batchStats.anchoredSaves += 1
+    context.BatchStats.set(batchStats)
+    saveStats(context, event, stats)
+  },
+)
+
+indexer.onEvent(
+  { contract: "BatchAnchor", event: "SaveRejected" },
+  async ({ event, context }) => {
+    if (await alreadyProcessed(context, event)) return
+    const stats = await getStats(context)
+    const batchStats = await getBatchStats(context)
+    batchStats.rejectedSaves += 1
+    context.BatchStats.set(batchStats)
+    saveStats(context, event, stats)
+  },
+)
+
+indexer.onEvent(
+  { contract: "BatchAnchor", event: "BatchAnchored" },
+  async ({ event, context }) => {
+    if (await alreadyProcessed(context, event)) return
+    const stats = await getStats(context)
+    const batchStats = await getBatchStats(context)
+    batchStats.batches += 1
+    context.BatchStats.set(batchStats)
     saveStats(context, event, stats)
   },
 )

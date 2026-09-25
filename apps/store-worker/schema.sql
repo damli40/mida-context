@@ -96,3 +96,35 @@ CREATE TABLE IF NOT EXISTS manifest_puts (
   count INTEGER NOT NULL CHECK (count > 0),
   PRIMARY KEY (signer, day)
 );
+
+-- BatchAnchor batched saves. Amendment A.4: the ciphertext travels inside save_json (the whole
+-- signed BatchedSaveWire), never in objects — the objects sweep must never touch these bytes.
+-- States: QUEUED (admitted, awaiting a batch) → SUBMITTED (claimed by an in-flight batch, batch_id
+-- set) → ANCHORED (contract accepted; position/lineage/version/proof filled) or REJECTED (contract
+-- refused; reason names the code). REJECTED rows stay for direct status lookups but never list.
+CREATE TABLE IF NOT EXISTS batch_saves (
+  context_id TEXT PRIMARY KEY,      -- the contract's batch context id, lowercase
+  owner TEXT NOT NULL,
+  namespace_id TEXT NOT NULL,
+  signer TEXT NOT NULL,             -- the request signer (the agent that uploaded), lowercase
+  save_json TEXT NOT NULL,          -- JSON BatchedSaveWire: message, signature, manifest, ciphertext
+  state TEXT NOT NULL CHECK (state IN ('QUEUED', 'SUBMITTED', 'ANCHORED', 'REJECTED')),
+  reason TEXT,                      -- rejection reason for REJECTED rows, else NULL
+  batch_id TEXT,                    -- batch that claimed/anchored this save, lowercase
+  position INTEGER,                 -- index inside the batch's accepted leaves
+  lineage_id TEXT,
+  version INTEGER,
+  proof_json TEXT,                  -- JSON Hex[] Merkle proof, filled at ANCHORED
+  received_at INTEGER NOT NULL,     -- ms since epoch the store admitted the save
+  anchored_at INTEGER               -- ms since epoch the anchor was observed, NULL until then
+);
+CREATE INDEX IF NOT EXISTS batch_saves_state ON batch_saves (state, received_at);
+CREATE INDEX IF NOT EXISTS batch_saves_owner_ns ON batch_saves (owner, namespace_id, state);
+CREATE INDEX IF NOT EXISTS batch_saves_batch ON batch_saves (batch_id);
+
+-- Monotonic receipt sequence (key 'sequence', decimal string) and per-signer last-flush marks
+-- (key 'flush:<signer>', ms decimal). Single row updates keep both race-free across workers.
+CREATE TABLE IF NOT EXISTS batch_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);

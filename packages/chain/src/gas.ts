@@ -46,6 +46,12 @@ export const GAS_CEILINGS = {
   // revokeAgentAndRotate. Ceiling 6,000,000 — loops over every area the agent reads.
   // Measured tx.gas 122,926 for a two-scope agent.
   "revoke.agent": 6_000_000n,
+  // submitBatch (BatchAnchor). Ceiling 28,000,000 — Monad refuses any transaction over
+  // 30,000,000 gas (docs.monad.xyz gas-pricing), and the 2M margin covers drift between the
+  // estimate taken before inclusion and the gas the send is finally priced at. The Sep 24
+  // testnet sweep (docs/evidence/batch-anchor-sweep-2026-09-24.json) measured ~61k gas per save
+  // at scale, so this ceiling — not the contract's MAX_BATCH of 1024 — is what bounds a batch.
+  "batch.submit": 28_000_000n,
 } as const
 
 /** The named kind every transaction send must declare; a send with no kind does not compile. */
@@ -54,7 +60,12 @@ export type TxKind = keyof typeof GAS_CEILINGS
 function checked(kind: TxKind, estimate: bigint): bigint {
   const ceiling = GAS_CEILINGS[kind]
   if (estimate > ceiling) {
-    throw new MidaError("GAS_CEILING_EXCEEDED", `${kind}: estimate ${estimate} exceeds ceiling ${ceiling}`)
+    // The numbers ride the error: a caller that re-sizes (the batcher shrinking a refused take)
+    // reads them here instead of parsing them back out of the message text.
+    const error = new MidaError("GAS_CEILING_EXCEEDED", `${kind}: estimate ${estimate} exceeds ceiling ${ceiling}`)
+    error.estimate = estimate
+    error.ceiling = ceiling
+    throw error
   }
   return estimate
 }

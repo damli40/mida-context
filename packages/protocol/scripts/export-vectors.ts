@@ -6,21 +6,28 @@
 import { mkdirSync, writeFileSync } from "node:fs"
 import { dirname } from "node:path"
 import { fileURLToPath } from "node:url"
-import { hashTypedData, keccak256, stringToBytes } from "viem"
+import { hashTypedData, keccak256, stringToBytes, toHex, zeroHash } from "viem"
 import type { Address, Hex } from "viem"
 import {
   NAMESPACE_TREE_V1,
+  BATCH_SAVE_TYPEHASH,
   accessRequestHash,
   agentId,
   agentRegistrationTypedData,
+  batchContextId,
+  batchLeafHash,
+  batchSaveDigest,
+  batchSaveStructHash,
   canonicalReferences,
   capabilityId,
   contextId,
   evidenceCommitment,
   grantDigest,
   hashString,
+  headCommit,
   httpRequestTypedData,
   manifestBindingTypedData,
+  merkleRoot,
   namespaceId,
   originHash,
   p256RotationDigest,
@@ -28,7 +35,7 @@ import {
   signerRotationTypedData,
   sortScopes,
 } from "../src/index.js"
-import type { UnsignedAccessRequest } from "../src/index.js"
+import type { BatchSaveMessage, UnsignedAccessRequest } from "../src/index.js"
 
 const out = process.argv[2] ?? fileURLToPath(new URL("../../../contracts/test/vectors/ids-v1.json", import.meta.url))
 
@@ -186,3 +193,82 @@ const vectors = {
 mkdirSync(dirname(out), { recursive: true })
 writeFileSync(out, `${JSON.stringify(vectors, null, 2)}\n`)
 console.log(`wrote ${out}`)
+
+// --- batch-v1.json: fixed-input vectors for the BatchAnchor parity tests (BatchParity.t.sol) ---
+
+const batchOut = fileURLToPath(new URL("../../../contracts/test/vectors/batch-v1.json", import.meta.url))
+
+const BATCH_CHAIN_ID = 10143n
+const BATCH_ANCHOR: Address = "0x1111111111111111111111111111111111111111"
+const BATCH_AGENT_ID = keccak256(toHex("agent"))
+const BATCH_NAMESPACE_ID = keccak256(toHex("ns"))
+const BATCH_OBJECT_NONCE = keccak256(toHex("nonce"))
+
+const batchMessage: BatchSaveMessage = {
+  owner: OWNER,
+  namespaceId: BATCH_NAMESPACE_ID,
+  objectNonce: BATCH_OBJECT_NONCE,
+  lineageId: zeroHash,
+  parentId: zeroHash,
+  parentVersion: 0,
+  rootAuthor: zeroHash,
+  manifestHash: keccak256(toHex("m")),
+  ciphertextCommitment: keccak256(toHex("c")),
+  readEpoch: 1n,
+  expiresAt: 0n,
+  kind: 5,
+  provenanceSource: 3,
+}
+
+const batchContext = batchContextId({
+  chainId: BATCH_CHAIN_ID,
+  batchAnchor: BATCH_ANCHOR,
+  owner: OWNER,
+  agentId: BATCH_AGENT_ID,
+  namespaceId: BATCH_NAMESPACE_ID,
+  parentId: zeroHash,
+  objectNonce: BATCH_OBJECT_NONCE,
+})
+const batchStructHash = batchSaveStructHash(batchMessage)
+const batchLeaves = Array.from({ length: 5 }, (_, i) => keccak256(toHex(`leaf-${i}`)))
+
+const batchVectors = {
+  chainId: Number(BATCH_CHAIN_ID),
+  batchAnchor: BATCH_ANCHOR,
+  owner: OWNER,
+  agentId: BATCH_AGENT_ID,
+  namespaceId: BATCH_NAMESPACE_ID,
+  objectNonce: BATCH_OBJECT_NONCE,
+  parentId: zeroHash,
+  message: {
+    owner: batchMessage.owner,
+    namespaceId: batchMessage.namespaceId,
+    objectNonce: batchMessage.objectNonce,
+    lineageId: batchMessage.lineageId,
+    parentId: batchMessage.parentId,
+    parentVersion: batchMessage.parentVersion,
+    rootAuthor: batchMessage.rootAuthor,
+    manifestHash: batchMessage.manifestHash,
+    ciphertextCommitment: batchMessage.ciphertextCommitment,
+    readEpoch: batchMessage.readEpoch.toString(),
+    expiresAt: batchMessage.expiresAt.toString(),
+    kind: batchMessage.kind,
+    provenanceSource: batchMessage.provenanceSource,
+  },
+  typehash: BATCH_SAVE_TYPEHASH,
+  structHash: batchStructHash,
+  digest: batchSaveDigest({ chainId: BATCH_CHAIN_ID, batchAnchor: BATCH_ANCHOR, message: batchMessage }),
+  contextId: batchContext,
+  leafHash: batchLeafHash({
+    contextId: batchContext, agentId: BATCH_AGENT_ID, lineageId: batchContext, version: 1, structHash: batchStructHash,
+  }),
+  headCommit: headCommit({
+    contextId: batchContext, owner: OWNER, namespaceId: BATCH_NAMESPACE_ID, rootAuthor: BATCH_AGENT_ID, version: 1,
+  }),
+  leaves: batchLeaves,
+  root: merkleRoot(batchLeaves),
+}
+
+mkdirSync(dirname(batchOut), { recursive: true })
+writeFileSync(batchOut, `${JSON.stringify(batchVectors, null, 2)}\n`)
+console.log(`wrote ${batchOut}`)

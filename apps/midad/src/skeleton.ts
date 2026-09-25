@@ -2,13 +2,16 @@ import { privateKeyToAccount } from "viem/accounts"
 import { entryPoint08Address } from "viem/account-abstraction"
 import { MidaError, PERMISSION, decodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
 import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScope } from "@mida/protocol"
-import { capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
+import { batchAnchorAbi, capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
 import type { ChainContext, HistoryScanCursor } from "@mida/chain"
 import { DENY_CANCEL_EXPIRY_SECONDS, provisionAgent } from "@mida/fake-vault"
 import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
-import type { StoredCheckpoint } from "@mida/checkpoint"
+import type { BatchReceipt } from "@mida/api"
+import type { StoredCheckpoint as CheckpointRecord } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
+import { addPendingAnchor, batchClient, batchStatusProbe, laneForSave } from "./batching.js"
+import type { Lane } from "./batching.js"
 import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl, sponsorReachable } from "./runtime.js"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { resolveNetwork } from "./network.js"
@@ -135,12 +138,18 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
     }
   } else {
     // The detached drainer never loads .env; init leaves it the public chain coordinates to read back.
-    // chainId/deploymentBlock are bigints, so they go on disk as decimal strings for parseDeployment.
+    // chainId/deploymentBlock/batchAnchorBlock are bigints, so they go on disk as decimal strings for
+    // parseDeployment (absent batchAnchorBlock serializes as no key).
     const deployment = network.deployment
     home.writeSecretJson("network.json", {
       chainId: Number(deployment.chainId),
       rpcUrl: network.rpcUrl,
-      deployment: { ...deployment, chainId: deployment.chainId.toString(), deploymentBlock: deployment.deploymentBlock.toString() },
+      deployment: {
+        ...deployment,
+        chainId: deployment.chainId.toString(),
+        deploymentBlock: deployment.deploymentBlock.toString(),
+        batchAnchorBlock: deployment.batchAnchorBlock?.toString(),
+      },
       // absent stays absent — an unset URL serializes as no key, and a later `init` without the
       // value does not blank one an operator wrote into the file by hand
       ...(network.storageUrl === undefined ? {} : { storageUrl: network.storageUrl }),
@@ -536,7 +545,7 @@ async function saveReceipt(runtime: ServiceRuntime, transactionHash: Hex): Promi
 
 /** Spec §5C steps 4–5: wrap, encrypt, upload and register on Monad under the agent's own key. A second save carrying
  * an eventId this project already has is a drainer retry after a crash — answer with the existing record, send nothing. */
-export async function saveCheckpoint(runtime: ServiceRuntime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean; receipt?: SaveReceipt; receiptMs?: number }> {
+export async function saveCheckpoint(runtime: ServiceRuntime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean; lane?: "direct" | "batched"; laneWhy?: string; batched?: { state: "QUEUED"; receipt: BatchReceipt }; receipt?: SaveReceipt; receiptMs?: number }> {
   const envelope = wrapCheckpoint(input)
   const started = Date.now()
   const agent = runtime.agent(name)
@@ -548,6 +557,20 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
     if (isRevoked(runtime.home, name)) throw new MidaError("CAPABILITY_REVOKED", `agent ${name} has been revoked`)
     return { contextId: known, transactionHash: null, milliseconds: Date.now() - started, duplicate: true }
   }
+  // Which lane this save takes — one shared transaction (batched) or its own (direct). The
+  // decision may throw (an unreadable network.json); a failed decision is still a direct save —
+  // never a dropped save — and the drain log names the reason as laneWhy.
+  let lane: Lane
+  let laneWhy: string | undefined
+  try {
+    lane = await laneForSave(runtime, name)
+    // "switch-off" is the everyday answer and needs no explanation on the line; the other whys
+    // all mean the setup asked for batching and could not get it — worth recording once per save
+    if (lane.kind === "direct" && lane.why !== "switch-off") laneWhy = lane.why
+  } catch (error) {
+    lane = { kind: "direct", why: "switch-off" }
+    laneWhy = typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : "decision-failed"
+  }
   // An agent without READ has nothing readable and proceeds to create; the create itself is what
   // the chain judges. Any OTHER read failure is real and must surface — swallowing it would turn
   // a broken connection into a duplicate write.
@@ -558,12 +581,53 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
     if (!isMidaError(error, "CAPABILITY_DENIED")) throw error
     objects = []
   }
+  if (lane.kind === "batched") {
+    // The batch queue is a second place a save can already exist: an anchored or still-pending
+    // batched row is as much a duplicate as a directly-anchored object. Same denial tolerance as
+    // the direct read — a partial answer is never trusted enough to save on top of.
+    try {
+      const batched = await agent.readBatchedWithStatus(runtime.owner, NAMESPACE)
+      if (batched.partial) {
+        throw new MidaError("PARTIAL_READ", "the batched checkpoint list was incomplete — refusing to risk a duplicate save")
+      }
+      objects = [...objects, ...batched.anchored, ...batched.pending]
+    } catch (error) {
+      if (!isMidaError(error, "CAPABILITY_DENIED")) throw error
+    }
+  }
   const existing = objects
     .map((object) => ({ object, found: unwrapCheckpoint(object.payload.value) }))
     .find(({ found }) => found !== null && found.projectId === envelope.projectId && found.checkpoint.eventId === envelope.checkpoint.eventId)
   if (existing !== undefined) {
     recordSavedId(runtime.home, envelope.checkpoint.eventId, existing.object.contextId)
     return { contextId: existing.object.contextId, transactionHash: null, milliseconds: Date.now() - started, duplicate: true }
+  }
+  if (lane.kind === "batched") {
+    // The store's receipt only means the save was queued — the pending ledger owns it from here
+    // until the chain says ANCHORED or REJECTED. transactionHash stays null: no transaction of
+    // this save's own exists yet, and none may ever.
+    const queued = await agent.createBatched(runtime.owner, NAMESPACE, {
+      value: { ...envelope },
+      kind: "EPISODE",
+      source: "AGENT_INFERRED",
+      tags: ["mida-checkpoint", envelope.checkpoint.eventId],
+    })
+    recordSavedId(runtime.home, envelope.checkpoint.eventId, queued.contextId)
+    addPendingAnchor(runtime.home, {
+      contextId: queued.contextId,
+      eventId: envelope.checkpoint.eventId,
+      sessionId: input.sessionId,
+      agent: name,
+      queuedAt: new Date().toISOString(),
+    })
+    return {
+      contextId: queued.contextId,
+      transactionHash: null,
+      milliseconds: Date.now() - started,
+      duplicate: false,
+      lane: "batched",
+      batched: { state: "QUEUED", receipt: queued.receipt },
+    }
   }
   const object = await agent.create(runtime.owner, NAMESPACE, {
     value: { ...envelope },
@@ -588,6 +652,8 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
     transactionHash,
     milliseconds,
     duplicate: false,
+    lane: "direct",
+    ...(laneWhy !== undefined ? { laneWhy } : {}),
     ...(receipt !== undefined ? { receipt } : {}),
     ...(receiptMs !== undefined ? { receiptMs } : {}),
   }
@@ -606,22 +672,54 @@ export function authorNamesFor(runtime: ServiceRuntime): Record<string, string> 
   return names
 }
 
-/** Spec §5D steps 2–3: a full protocol read as this agent, then keep only this project's valid v1 envelopes. */
-export async function readCheckpoints(runtime: ServiceRuntime, name: string, projectId: string): Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number; partial: boolean }> {
+/**
+ * A stored checkpoint plus where it stands with the chain: "ANCHORED" once Monad holds the save —
+ * every direct save, and a batched save whose batch landed — and "PENDING_ANCHOR" while a batched
+ * save has passed every check that needs no anchor but could still be rejected. Optional because
+ * the field only exists on records this reader produces; a mocked read that predates it still
+ * typechecks, and absent means the record never came from the batched lane.
+ */
+export type StoredCheckpoint = CheckpointRecord & { anchor?: "ANCHORED" | "PENDING_ANCHOR" }
+
+/** How long a read waits for a foreign-agent pending save to anchor after asking for the flush. */
+const FLUSH_WAIT_MS = 3_000
+const FLUSH_POLL_MS = 250
+
+/**
+ * Spec §5D steps 2–3, plus the BatchAnchor read (plan Task 8): a full protocol read as this agent,
+ * then — whenever the deployment carries a BatchAnchor, whether or not batching is switched on —
+ * the batch table's anchored and verified-pending saves merged in, marked `anchor` so a pending
+ * save is never mistaken for an anchored one. A pending save from a DIFFERENT agent triggers the
+ * store flush (Amendment B.4): `POST /batch/flush` once, then re-reads every 250 ms until those
+ * saves anchor or `flushWaitMs` runs out — never a wait when every pending save is the reader's
+ * own. A batched list the store cannot serve leaves `partial` set rather than hiding the gap —
+ * and when the store serves no batch surface for this anchor at all, the contract's own
+ * `hasBatchedSaves(owner)` flag decides whether there is a table to miss: only a confirmed
+ * "none" keeps the read complete, anything else is partial too.
+ */
+export async function readCheckpoints(
+  runtime: ServiceRuntime,
+  name: string,
+  projectId: string,
+  options?: { flushWaitMs?: number },
+): Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number; partial: boolean }> {
   if (typeof projectId !== "string" || projectId === "") throw codedError("bad-input", "projectId must be a non-empty string")
   const started = Date.now()
+  const agent = runtime.agent(name)
   // readWithStatus, not read: a partial list still yields its checkpoints — the caller flags them
   // rather than the read throwing away work that did verify (M3-D).
-  const { objects, partial } = await runtime.agent(name).readWithStatus(runtime.owner, NAMESPACE)
+  const { objects, partial: directPartial } = await agent.readWithStatus(runtime.owner, NAMESPACE)
+  let partial = directPartial
   let skipped = 0
-  const checkpoints = objects.flatMap((object) => {
+  const checkpoints: StoredCheckpoint[] = []
+  const collect = (object: ContextObject, anchor: "ANCHORED" | "PENDING_ANCHOR"): void => {
     const envelope = unwrapCheckpoint(object.payload.value)
     if (envelope === null) {
       skipped += 1
-      return []
+      return
     }
-    if (envelope.projectId !== projectId) return []
-    return [{
+    if (envelope.projectId !== projectId) return
+    checkpoints.push({
       checkpoint: envelope.checkpoint,
       projectId: envelope.projectId,
       sessionId: envelope.sessionId,
@@ -630,11 +728,92 @@ export async function readCheckpoints(runtime: ServiceRuntime, name: string, pro
       contextId: object.contextId,
       authorId: object.authorId,
       namespaceId: object.namespaceId,
+      anchor,
       // a migrated record's envelope rides on the stored checkpoint as an ordinary typed field —
       // dropped nowhere on the way to the renderers
       ...(envelope.migration === undefined ? {} : { migration: envelope.migration }),
-    }]
-  })
+    })
+  }
+  for (const object of objects) collect(object, "ANCHORED")
+
+  const deployment = runtime.network?.deployment
+  const batchAnchor = deployment?.batchAnchor
+  if (batchAnchor !== undefined && deployment !== undefined) {
+    // The batch table exists only where the store serves it for THIS anchor: the status probe is
+    // what decideLane itself asks. But a store that answers nothing — a local store, a pre-batch
+    // host — or one answering for another anchor says nothing about what the CHAIN holds: its
+    // silence is not proof of an empty table. Only the contract's own hasBatchedSaves flag can
+    // say "nothing to miss" — it is set the moment the owner has an accepted batched save and no
+    // store outage clears it. A "true", or a read that fails, marks the answer partial rather
+    // than letting a route-less store hide batched saves.
+    const status = await batchStatusProbe(runtime.apiBaseUrl)
+    if (status !== null && status.batchAnchor.toLowerCase() === batchAnchor.toLowerCase()) {
+      const readBatched = async () => {
+        try {
+          return await agent.readBatchedWithStatus(runtime.owner, NAMESPACE)
+        } catch {
+          return null
+        }
+      }
+      let batched = await readBatched()
+      if (batched === null) {
+        // The batch table did not answer though the surface is there — the merged list is
+        // incomplete, so partial it is; nothing here may pretend the batch side was empty.
+        partial = true
+      } else {
+        let myAgentId: Hex | undefined
+        try {
+          myAgentId = loadAgentIdentity(runtime.home, name)?.agentId
+        } catch {
+          myAgentId = undefined
+        }
+        const foreign = batched.pending.filter(
+          (item) => myAgentId === undefined || item.authorAgentId.toLowerCase() !== myAgentId.toLowerCase(),
+        )
+        if (foreign.length > 0) {
+          // Agent switch (Amendment B.4): ask the store to anchor the queue now — once per read.
+          // "empty" and "rate-limited" are ordinary answers, and a failed flush must not fail the
+          // read: the pending saves are still shown, marked.
+          const client = batchClient(runtime.home, runtime.apiBaseUrl, deployment, name)
+          await client?.flushBatch().catch(() => undefined)
+          const waiting = new Set(foreign.map((item) => item.contextId))
+          const deadline = Date.now() + (options?.flushWaitMs ?? FLUSH_WAIT_MS)
+          while (Date.now() < deadline && batched.pending.some((item) => waiting.has(item.contextId))) {
+            await new Promise((resolve) => setTimeout(resolve, Math.min(FLUSH_POLL_MS, deadline - Date.now())))
+            const again = await readBatched()
+            if (again !== null) batched = again
+          }
+        }
+        skipped += batched.skipped.length
+        if (batched.partial) partial = true
+        const directCount = checkpoints.length
+        for (const object of batched.anchored) collect(object, "ANCHORED")
+        for (const item of batched.pending) collect(item, "PENDING_ANCHOR")
+        // Batched items merged: sort the list on the key mergeCheckpoints uses (createdAt then
+        // contextId). Untouched when the batched side added nothing, so a deployment without
+        // reachable batched saves keeps the store's own order exactly.
+        if (checkpoints.length > directCount) {
+          checkpoints.sort(
+            (a, b) => Date.parse(a.checkpoint.createdAt) - Date.parse(b.checkpoint.createdAt) || a.contextId.localeCompare(b.contextId),
+          )
+        }
+      }
+    } else {
+      // No batch surface for this anchor on this store — ask the chain whether there is a table
+      // to miss at all. Fail closed: a thrown read is "unknown", and unknown is never "none".
+      try {
+        const has = (await runtime.chain.publicClient.readContract({
+          address: batchAnchor,
+          abi: batchAnchorAbi,
+          functionName: "hasBatchedSaves",
+          args: [runtime.owner],
+        } as never)) as boolean
+        if (has) partial = true
+      } catch {
+        partial = true
+      }
+    }
+  }
   return { checkpoints, skipped, milliseconds: Date.now() - started, partial }
 }
 

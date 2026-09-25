@@ -26,6 +26,7 @@ export const extractAbi = (constName, source = readFileSync(abiSourceUrl, "utf8"
 export const buildAbiJson = () => ({
   CapabilityRegistry: `${JSON.stringify(extractAbi("capabilityRegistryAbi"), null, 2)}\n`,
   ContextRegistry: `${JSON.stringify(extractAbi("contextRegistryAbi"), null, 2)}\n`,
+  BatchAnchor: `${JSON.stringify(extractAbi("batchAnchorAbi"), null, 2)}\n`,
 })
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href

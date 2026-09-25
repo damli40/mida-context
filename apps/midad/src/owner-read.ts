@@ -1,8 +1,9 @@
-import { namespaceById } from "@mida/protocol"
+import { LINEAGE_POLICY, RECORD_TYPE, decodeUint64, namespaceById } from "@mida/protocol"
 import type { ContextPayload, Hex, RecordReference } from "@mida/protocol"
 import { bytesOf, deriveEpochKeyPair, openContextObject } from "@mida/crypto"
-import { contextRegistryAbi, getLogsChunked } from "@mida/chain"
-import type { ContextRecordView } from "@mida/api"
+import { batchAnchorAbi, contextRegistryAbi, getLogsChunked } from "@mida/chain"
+import type { BatchedReadItem, ContextRecordView } from "@mida/api"
+import { verifyBatchedItem } from "@mida/sdk"
 import type { AbiEvent } from "viem"
 import type { Runtime } from "./runtime.js"
 
@@ -34,21 +35,34 @@ export interface SourceRecord {
   payload: ContextPayload
   /** `payload.provenance.references` — the only place record-to-record links exist. */
   references: RecordReference[]
+  /**
+   * Which lane anchored the record: "direct" is a ContextRegistry registration of its own,
+   * "batched" is a save the BatchAnchor contract accepted inside a shared transaction. Optional
+   * on the type so hand-built records in older tests still satisfy the shape — every record this
+   * reader returns carries it.
+   */
+  lane?: "direct" | "batched"
+  /** The batch a batched save anchored in — absent on direct records. */
+  batchId?: Hex
 }
 
 interface ReadFailure {
-  contextId: Hex
+  /** Absent only when the gap is not one record — e.g. the store cannot serve the batch table at all. */
+  contextId?: Hex
   reason: string
 }
 
 /**
  * A plain Error carrying `.code` and `.contextIds` — `owner-read-incomplete` is a midad-level
  * refusal, not a protocol code, so MidaError's closed union cannot carry it. The message leads
- * with the code, the way MidaError formats it, and names every contextId that could not be read.
+ * with the code, the way MidaError formats it, and names every contextId that could not be read;
+ * a failure that is not about one record names only its reason.
  */
 function ownerReadIncomplete(failures: readonly ReadFailure[]): Error & { code: string; contextIds: Hex[] } {
-  const contextIds = [...new Set(failures.map((failure) => failure.contextId))]
-  const detail = failures.map((failure) => `${failure.contextId} (${failure.reason})`).join("; ")
+  const contextIds = [...new Set(failures.flatMap((failure) => (failure.contextId === undefined ? [] : [failure.contextId])))]
+  const detail = failures
+    .map((failure) => (failure.contextId === undefined ? failure.reason : `${failure.contextId} (${failure.reason})`))
+    .join("; ")
   return Object.assign(
     new Error(`owner-read-incomplete: ${failures.length} record(s) could not be read back completely: ${detail}`),
     { code: "owner-read-incomplete", contextIds },
@@ -59,6 +73,209 @@ const CONTEXT_REGISTERED = contextRegistryAbi.find(
   (entry) => entry.type === "event" && entry.name === "ContextRegistered",
 ) as AbiEvent
 
+const SAVE_ANCHORED = batchAnchorAbi.find(
+  (entry) => entry.type === "event" && entry.name === "SaveAnchored",
+) as AbiEvent
+
+/** The fields of one `SaveAnchored` log this reader keeps — the contract's own attestation. */
+interface AnchoredSave {
+  contextId: Hex
+  namespaceId: Hex
+  lineageId: Hex
+  version: number
+  batchId: Hex
+  author: Hex
+  blockNumber: bigint
+}
+
+/**
+ * The batched lane's half of the universe (BatchAnchor plan §7.3): the owner's `SaveAnchored`
+ * logs are the chain's list of what the contract accepted inside shared transactions, and each
+ * one's store row is verified through the §7.1 checks — commitments, signature→agent, Merkle
+ * proof to the on-chain batch root — then opened with the owner-derived epoch key. The store's
+ * word is trusted nowhere: a row the log never named, a log whose row is missing, a row that
+ * disagrees with its log, and a list the store marks partial all land in `failures` rather than
+ * shortening the universe quietly. A store without the batch surface cannot even prove "nothing
+ * to read" — `hasBatchedSaves(owner)` answers that instead, and any answer but a clean "none"
+ * fails the read closed. `requireLatest` is off — history keeps superseded versions.
+ */
+async function readBatchedUniverse(
+  runtime: Runtime,
+  failures: ReadFailure[],
+  onProgress?: (done: number, total: number) => void,
+): Promise<(SourceRecord & { lane: "batched" })[]> {
+  const { deployment } = runtime.network
+  const batchAnchor = deployment.batchAnchor
+  if (batchAnchor === undefined) return []
+  // Whether this store serves the batch table for THIS anchor at all — the same question the
+  // /batch/status route answers for the agent-side reader. A store without the routes (a local
+  // store, a pre-batch host) or one answering for another anchor cannot prove "nothing to read":
+  // its silence says nothing about what the chain holds. Only the contract's own flag can — it
+  // is set on the owner's first accepted batched save and no store outage clears it. The check
+  // fails closed: a thrown read is "unknown", and unknown is never treated as "none".
+  const status = await runtime.ownerApi.batchStatus().catch(() => null)
+  if (typeof status?.batchAnchor !== "string" || status.batchAnchor.toLowerCase() !== batchAnchor.toLowerCase()) {
+    let has: boolean
+    try {
+      has = (await runtime.ownerChain.publicClient.readContract({
+        address: batchAnchor,
+        abi: batchAnchorAbi,
+        functionName: "hasBatchedSaves",
+        args: [runtime.owner],
+      } as never)) as boolean
+    } catch (error) {
+      throw ownerReadIncomplete([
+        { reason: `the chain could not say whether batched saves exist: ${error instanceof Error ? error.message : String(error)}` },
+      ])
+    }
+    if (has) {
+      throw ownerReadIncomplete([{ reason: "batched saves exist on chain but this store serves none" }])
+    }
+    return []
+  }
+  const logs = await getLogsChunked(runtime.ownerChain.publicClient, {
+    address: batchAnchor,
+    event: SAVE_ANCHORED,
+    args: { owner: runtime.owner },
+    // The anchor's own deployment block — a batched save cannot predate the contract.
+    fromBlock: deployment.batchAnchorBlock ?? 0n,
+  }, { maxRange: runtime.network.logBlockRange, onProgress })
+  if (logs.length === 0) return []
+
+  const byNamespace = new Map<Hex, AnchoredSave[]>()
+  const anchoredIds = new Set<Hex>()
+  for (const log of logs) {
+    const args = log.args as { contextId: Hex; namespaceId: Hex; lineageId: Hex; version: number; batchId: Hex; author: Hex }
+    const contextId = args.contextId.toLowerCase() as Hex
+    anchoredIds.add(contextId)
+    const namespaceId = args.namespaceId.toLowerCase() as Hex
+    const list = byNamespace.get(namespaceId) ?? []
+    list.push({
+      contextId,
+      namespaceId,
+      lineageId: args.lineageId.toLowerCase() as Hex,
+      version: args.version,
+      batchId: args.batchId.toLowerCase() as Hex,
+      author: args.author.toLowerCase() as Hex,
+      blockNumber: log.blockNumber ?? 0n,
+    })
+    byNamespace.set(namespaceId, list)
+  }
+
+  const records: (SourceRecord & { lane: "batched" })[] = []
+  // Anchoring block timestamps, fetched once per block — a batched record's createdAt is when the
+  // chain recorded it, the same thing a direct record's createdAt means.
+  const blockTimes = new Map<bigint, bigint>()
+  for (const [nsId, nsLogs] of byNamespace) {
+    let namespace: string
+    try {
+      namespace = namespaceById(nsId).name
+    } catch {
+      // An unknown namespace cannot be listed or decrypted — every save in it is unreadable.
+      for (const save of nsLogs) failures.push({ contextId: save.contextId, reason: "namespace is not in the frozen tree" })
+      continue
+    }
+    let items: BatchedReadItem[]
+    let partial: boolean
+    try {
+      const listed = await runtime.ownerApi.listBatchSaves({ owner: runtime.owner, namespaceId: nsId })
+      items = listed.items
+      partial = listed.partial
+    } catch {
+      // The store could not serve this namespace's batch table — every logged save is unreadable.
+      for (const save of nsLogs) failures.push({ contextId: save.contextId, reason: "the store's batch list could not be served" })
+      continue
+    }
+    const rows = new Map<Hex, BatchedReadItem>()
+    for (const item of items) {
+      const contextId = item.contextId.toLowerCase() as Hex
+      rows.set(contextId, item)
+      // A row the store calls ANCHORED that the chain never logged for this owner: the two
+      // sources disagree, so the record cannot be certified — named, never trusted.
+      if (item.state === "ANCHORED" && !anchoredIds.has(contextId)) {
+        failures.push({ contextId, reason: "anchored in the store's batch table but not in the owner's SaveAnchored logs" })
+      }
+    }
+    const namespaceSecret = await runtime.vault.deriveNamespaceSecret(nsId)
+    for (const save of nsLogs) {
+      try {
+        const item = rows.get(save.contextId)
+        if (item === undefined) throw new Error("anchored on chain but not in the store's batch table")
+        const verdict = await verifyBatchedItem({
+          item,
+          chainId: deployment.chainId,
+          deployment,
+          client: runtime.ownerChain.publicClient,
+          requireLatest: false,
+        })
+        if (!verdict.ok) throw new Error(`verification failed: ${verdict.reason}`)
+        // The row must be the row the log described — batch, lineage, version and author are the
+        // chain's own emitted values, not the store's claim about them.
+        if (
+          item.batchId?.toLowerCase() !== save.batchId ||
+          item.lineageId?.toLowerCase() !== save.lineageId ||
+          item.version !== save.version ||
+          verdict.agentId.toLowerCase() !== save.author
+        ) {
+          throw new Error("the store's batch row does not match its SaveAnchored log")
+        }
+        const message = item.save.message
+        const readEpoch = decodeUint64(message.readEpoch)
+        const epochKeys = deriveEpochKeyPair(namespaceSecret, readEpoch)
+        const payload = openContextObject({
+          manifest: item.save.manifest,
+          expectedManifestHash: message.manifestHash.toLowerCase() as Hex,
+          ciphertext: bytesOf(item.save.ciphertext, item.save.manifest.ciphertextSize),
+          epochPrivateKey: epochKeys.privateKey,
+          binding: {
+            chainId: deployment.chainId,
+            contextRegistry: deployment.contextRegistry,
+            contextId: item.contextId,
+            namespaceId: nsId,
+            readEpoch,
+          },
+        })
+        let createdAt = blockTimes.get(save.blockNumber)
+        if (createdAt === undefined) {
+          if (save.blockNumber === 0n) throw new Error("the SaveAnchored log carried no block number")
+          createdAt = (await runtime.ownerChain.publicClient.getBlock({ blockNumber: save.blockNumber })).timestamp
+          blockTimes.set(save.blockNumber, createdAt)
+        }
+        records.push({
+          contextId: item.contextId,
+          namespaceId: nsId,
+          namespace,
+          authorId: verdict.agentId,
+          // Amendment A.5: the contract accepts CONTEXT records on STANDARD lineages only.
+          recordType: RECORD_TYPE.CONTEXT,
+          kind: message.kind,
+          provenanceSource: message.provenanceSource,
+          lineagePolicy: LINEAGE_POLICY.STANDARD,
+          lineageId: save.lineageId,
+          parentId: message.parentId,
+          version: save.version,
+          readEpoch,
+          createdAt,
+          expiresAt: decodeUint64(message.expiresAt),
+          manifestHash: message.manifestHash.toLowerCase() as Hex,
+          payload,
+          references: payload.provenance.references ?? [],
+          lane: "batched",
+          batchId: save.batchId,
+        })
+      } catch (error) {
+        failures.push({ contextId: save.contextId, reason: `failed to read back: ${error instanceof Error ? error.message : String(error)}` })
+      }
+    }
+    // A partial batch list cannot certify the namespace — unexamined rows may hide anchored
+    // saves, so every save the chain logged there is named.
+    if (partial) {
+      for (const save of nsLogs) failures.push({ contextId: save.contextId, reason: "the store's batch list was partial" })
+    }
+  }
+  return records
+}
+
 /**
  * Every record the owner has on this contract, decrypted (migrate B3). Enumeration starts from
  * the owner's own `ContextRegistered` logs — the chain's complete index of registrations for this
@@ -66,6 +283,8 @@ const CONTEXT_REGISTERED = contextRegistryAbi.find(
  * can read. Each namespace's objects come from an owner-signed `listObjects` (the store skips
  * agent authorization for the owner), each object is re-checked against the chain record, and the
  * payload is opened with a namespace/epoch key derived from the owner seed — the spike-2 path.
+ * When the deployment carries a BatchAnchor its `SaveAnchored` logs add the batched half: same
+ * completeness rules, verified through the §7.1 checks, marked `lane: "batched"`.
  *
  * Completeness is the point: a chain record with no object, a listed object with no chain record,
  * a failed decrypt, or a `partial` store list all throw `owner-read-incomplete` naming the
@@ -85,7 +304,13 @@ export async function readOwnerUniverse(
     // owner's record cannot predate it, and the value never sits below the deployment block.
     fromBlock: runtime.ownerStartBlock,
   }, { maxRange: runtime.network.logBlockRange, onProgress: options?.onProgress })
-  if (logs.length === 0) return []
+
+  const failures: ReadFailure[] = []
+  const batched = await readBatchedUniverse(runtime, failures, options?.onProgress)
+  if (logs.length === 0) {
+    if (failures.length > 0) throw ownerReadIncomplete(failures)
+    return batched
+  }
 
   // The chain-side universe, in registration order: every contextId the log attributes to this
   // owner, and the record tuple the registry emitted with it.
@@ -105,7 +330,6 @@ export async function readOwnerUniverse(
     ids.add(contextId)
   }
 
-  const failures: ReadFailure[] = []
   const decrypted = new Map<Hex, SourceRecord>()
 
   for (const [nsId, chainIds] of byNamespace) {
@@ -202,6 +426,9 @@ export async function readOwnerUniverse(
 
   if (failures.length > 0) throw ownerReadIncomplete(failures)
 
-  // Registration order — the chain's own ordering of the owner's history.
-  return ordered.map(({ contextId }) => decrypted.get(contextId)!)
+  // Registration order — the chain's own ordering of the owner's history — then the batched
+  // items in their SaveAnchored order: the two lanes come from different contracts, so each
+  // lane keeps its own sequence rather than interleaving on block numbers that mean different
+  // things on different tables.
+  return [...ordered.map(({ contextId }) => ({ ...decrypted.get(contextId)!, lane: "direct" as const })), ...batched]
 }

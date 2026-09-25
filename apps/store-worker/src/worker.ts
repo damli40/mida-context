@@ -1,18 +1,30 @@
 // The hosted Mida context store: the same createContextApi that runs on a laptop, served as a Cloudflare Worker.
 // It holds ciphertext only — the keys never reach it — and anyone can run the identical server themselves.
 
+import { AsyncLocalStorage } from "node:async_hooks"
 import { createPublicClient, http } from "viem"
+import type { LocalAccount } from "viem"
+import { privateKeyToAccount } from "viem/accounts"
 import { assertHex } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
+import { batchAnchorAbi } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import { AUTH_HEADERS, MANIFEST_VERIFY_CACHE_SECONDS, MAX_CHAIN_READS_PER_REQUEST, RegistryReader, SWEEP_MAX_OBJECTS_PER_RUN, createContextApi } from "@mida/api"
-import type { StoreLimits } from "@mida/api"
-import { d1Stores, runSweep } from "./index.js"
+import type { BatchingOptions, StoreLimits } from "@mida/api"
+import { D1BatchStore, d1Stores, runSweep } from "./index.js"
 import type { D1Like } from "./d1.js"
+
+export { BatchCoordinator } from "./batch-coordinator.js"
 
 /** The slice of Cloudflare's rate-limit binding this worker calls: one `limit` per request. */
 export interface RateLimitBinding {
   limit(input: { key: string }): Promise<{ success: boolean }>
+}
+
+/** The slice of a Durable Object namespace binding the worker calls to reach the batcher. */
+export interface DurableObjectNamespaceLike {
+  idFromName(name: string): unknown
+  get(id: unknown): { fetch(input: string | Request, init?: RequestInit): Promise<Response> }
 }
 
 /** Environment bindings. No file paths, no secrets in wrangler.toml — RPC_URL goes in as a secret. */
@@ -29,10 +41,41 @@ export interface WorkerEnv {
   POLICY_HASH_V1: string
   VAULT_RP_ID: string
   VAULT_RP_ID_HASH: string
+  // BatchAnchor (Task 6): the batched-save lane. Off unless BATCHING_ENABLED === "true"; the batch
+  // surface mounts whenever BATCH_ANCHOR parses as an address, so the kill switch can answer
+  // { enabled: false } instead of 404ing. BATCHER_PRIVATE_KEY and RECEIPT_PRIVATE_KEY are secrets.
+  BATCH_ANCHOR?: string
+  BATCHING_ENABLED?: string
+  BATCHER_PRIVATE_KEY?: string
+  RECEIPT_PRIVATE_KEY?: string
+  /** Trial gate: comma-separated owner addresses the enabled lane admits (case-insensitive). */
+  BATCH_OWNER_ALLOWLIST?: string
+  /** The block BatchAnchor was deployed in — the floor for its historical log scans. */
+  BATCH_ANCHOR_BLOCK?: string
+  BATCH_COORDINATOR?: DurableObjectNamespaceLike
 }
 
 interface ExecutionContextLike {
   waitUntil(promise: Promise<unknown>): void
+}
+
+/**
+ * The request's execution context, tracked so a route's fire-and-forget wakeup — the notify fetch
+ * into the coordinator — can ride the request's waitUntil instead of floating: an un-awaited
+ * subrequest can be cancelled the moment the response returns, and a cancelled notify strands the
+ * queue until a flush. Under Node (tests, local runs) nothing tracks a request and the promise
+ * simply runs, rejection swallowed — the alarm inside the DO is the real guarantee either way.
+ */
+const requestScope = new AsyncLocalStorage<ExecutionContextLike>()
+
+function background(promise: Promise<unknown> | undefined): void {
+  if (promise === undefined) return
+  const ctx = requestScope.getStore()
+  if (ctx === undefined) {
+    void promise.catch(() => {})
+    return
+  }
+  ctx.waitUntil(promise)
 }
 
 function required(env: WorkerEnv, key: keyof WorkerEnv): string {
@@ -78,12 +121,117 @@ export function deploymentFromEnv(env: WorkerEnv): Deployment {
   }
 }
 
+/** The slice of viem's PublicClient the batch lane uses — one readContract for the anchor check. */
+type PublicClientLike = ReturnType<typeof createPublicClient>
+
 interface Built {
   app: ReturnType<typeof createContextApi>["app"]
   reader: RegistryReader
   stores: ReturnType<typeof d1Stores>
   deployment: Deployment
   limits: StoreLimits
+}
+
+/**
+ * The Task 6 batch lane. The surface mounts whenever BATCH_ANCHOR parses as an address — under the
+ * kill switch the routes answer 503/{ enabled: false } rather than 404ing, and a missing receipt
+ * key then means exactly that: only BATCHING_ENABLED="true" requires the secrets, the coordinator
+ * binding and the batcher key — a disabled lane must never take the whole store down. notify is
+ * fire-and-forget into the single "batcher" object (covered by the request's waitUntil); flush is
+ * awaited. While enabled, the first batch request also proves the anchor contract's own
+ * CAPABILITY_REGISTRY() is this deployment's — a wrong contract refuses the surface (cached; a
+ * failed read retries rather than latching a verdict it never reached).
+ */
+function batchingOptions(env: WorkerEnv, deployment: Deployment, publicClient: PublicClientLike): BatchingOptions | undefined {
+  const enabled = env.BATCHING_ENABLED === "true"
+  const batchAnchor =
+    typeof env.BATCH_ANCHOR === "string" && /^0x[0-9a-fA-F]{40}$/.test(env.BATCH_ANCHOR)
+      ? (env.BATCH_ANCHOR.toLowerCase() as Address)
+      : undefined
+  if (batchAnchor === undefined) {
+    if (enabled) throw new Error("BATCHING_ENABLED=true requires BATCH_ANCHOR to be a 0x-prefixed 20-byte address")
+    return undefined
+  }
+  deployment.batchAnchor = batchAnchor
+  let receiptAccount: LocalAccount | undefined
+  let verifyAnchor: (() => Promise<void>) | undefined
+  let ownerAllowlist: Address[] | undefined
+  if (enabled) {
+    // The anchor's deploy block floors the coordinator's historical scans — only the enabled lane
+    // ever reads it, so a placeholder beside BATCHING_ENABLED="false" stays inert rather than
+    // failing a boot that never asks it anything. Enabled, a non-numeric value is a configuration
+    // error and fails at boot, not inside the object mid-scan.
+    if (env.BATCH_ANCHOR_BLOCK !== undefined && env.BATCH_ANCHOR_BLOCK !== "") {
+      if (!/^(0|[1-9][0-9]*)$/.test(env.BATCH_ANCHOR_BLOCK)) {
+        throw new Error("environment variable BATCH_ANCHOR_BLOCK must be a non-negative integer")
+      }
+      deployment.batchAnchorBlock = BigInt(env.BATCH_ANCHOR_BLOCK)
+    }
+    if (env.BATCH_COORDINATOR === undefined) {
+      throw new Error("BATCHING_ENABLED=true requires the BATCH_COORDINATOR Durable Object binding")
+    }
+    hashEnv(env, "BATCHER_PRIVATE_KEY") // the coordinator reads it again at first use; fail at boot, not mid-queue
+    receiptAccount = privateKeyToAccount(hashEnv(env, "RECEIPT_PRIVATE_KEY"))
+    let verdict: Promise<void> | undefined
+    verifyAnchor = () => {
+      verdict ??= (async () => {
+        let onchain: unknown
+        try {
+          onchain = await publicClient.readContract({
+            address: batchAnchor,
+            abi: batchAnchorAbi,
+            functionName: "CAPABILITY_REGISTRY",
+          })
+        } catch (error) {
+          verdict = undefined // a read that never reached the contract is not a verdict — retry next time
+          throw new Error(`the batch anchor could not be verified against the chain: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        if (typeof onchain !== "string" || onchain.toLowerCase() !== deployment.capabilityRegistry) {
+          throw new Error(
+            `BATCH_ANCHOR ${batchAnchor} reports CAPABILITY_REGISTRY ${String(onchain)}, not this deployment's ${deployment.capabilityRegistry} — the batch surface refuses to run against the wrong contract`,
+          )
+        }
+      })()
+      return verdict
+    }
+    // The trial gate is read only while the lane is on — a stale value beside BATCHING_ENABLED=false
+    // stays inert rather than failing a boot that never asks it anything. Entries may be
+    // mixed-case; the wire's owner field is lowercase, so the list is normalized to match.
+    const rawList = env.BATCH_OWNER_ALLOWLIST
+    if (typeof rawList === "string" && rawList !== "") {
+      const entries = rawList.split(",").map((entry) => entry.trim()).filter((entry) => entry !== "")
+      // A SET value that parses to zero addresses ("," or " ") must not silently mean open —
+      // an operator who meant "closed" would get the opposite. Unset or empty stays "no allowlist".
+      if (entries.length === 0) {
+        throw new Error("environment variable BATCH_OWNER_ALLOWLIST is set but produced zero addresses")
+      }
+      if (!entries.every((entry) => /^0x[0-9a-fA-F]{40}$/.test(entry))) {
+        throw new Error("environment variable BATCH_OWNER_ALLOWLIST must be a comma-separated list of 0x-prefixed 20-byte addresses")
+      }
+      ownerAllowlist = entries.map((entry) => entry.toLowerCase() as Address)
+    }
+  }
+  const coordinator = (): { fetch(input: string | Request, init?: RequestInit): Promise<Response> } | undefined => {
+    const namespace = env.BATCH_COORDINATOR
+    return namespace === undefined ? undefined : namespace.get(namespace.idFromName("batcher"))
+  }
+  return {
+    enabled,
+    batchAnchor,
+    store: new D1BatchStore(env.DB),
+    ...(receiptAccount === undefined ? {} : { receiptAccount }),
+    ...(verifyAnchor === undefined ? {} : { verifyAnchor }),
+    ...(ownerAllowlist === undefined ? {} : { ownerAllowlist }),
+    notify: () => {
+      background(coordinator()?.fetch("https://batcher.internal/notify", { method: "POST" }))
+    },
+    flush: async () => {
+      const stub = coordinator()
+      if (stub === undefined) throw new Error("the batch coordinator is not bound")
+      const response = await stub.fetch("https://batcher.internal/flush", { method: "POST" })
+      if (!response.ok) throw new Error(`the batch coordinator answered ${response.status}`)
+    },
+  }
 }
 
 let built: { env: WorkerEnv; value: Built } | undefined
@@ -101,7 +249,8 @@ function buildWorker(env: WorkerEnv): Built {
   const publicClient = createPublicClient({ transport: http(rpcUrl) })
   const reader = new RegistryReader({ publicClient, deployment })
   const stores = d1Stores(env.DB)
-  const { app, limits } = createContextApi({ reader, deployment, stores })
+  const batching = batchingOptions(env, deployment, publicClient)
+  const { app, limits } = createContextApi({ reader, deployment, stores, ...(batching === undefined ? {} : { batching }) })
   built = { env, value: { app, reader, stores, deployment, limits } }
   return built.value
 }
@@ -148,7 +297,7 @@ const RATE_LIMIT_SIGNED_PER_MINUTE = 120
 const RATE_LIMIT_UNSIGNED_PER_MINUTE = 20
 
 /** Exported for tests: the same request path `fetch` runs, with logging and CORS wrapped around the app. */
-export async function handleRequest(env: WorkerEnv, request: Request): Promise<Response> {
+export async function handleRequest(env: WorkerEnv, request: Request, ctx?: ExecutionContextLike): Promise<Response> {
   const started = Date.now()
   const url = new URL(request.url)
   const path = pathTemplate(url.pathname)
@@ -201,7 +350,7 @@ export async function handleRequest(env: WorkerEnv, request: Request): Promise<R
       bytes = payload.length
       return withCors(new Response(payload, { status, headers: { "content-type": "application/json" } }))
     }
-    const response = await app.fetch(request)
+    const response = await (ctx === undefined ? app.fetch(request) : requestScope.run(ctx, () => app.fetch(request)))
     const body = await response.arrayBuffer()
     status = response.status
     bytes = body.byteLength
@@ -216,8 +365,8 @@ export async function handleRequest(env: WorkerEnv, request: Request): Promise<R
 }
 
 export default {
-  async fetch(request: Request, env: WorkerEnv): Promise<Response> {
-    return handleRequest(env, request)
+  async fetch(request: Request, env: WorkerEnv, ctx: ExecutionContextLike): Promise<Response> {
+    return handleRequest(env, request, ctx)
   },
 
   /** Every-15-minutes cron: sweep pending uploads past 24 h and expired nonces, ≤25 object rows a run. */

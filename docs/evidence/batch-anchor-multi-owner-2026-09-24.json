@@ -1,0 +1,53 @@
+{
+  "date": "2026-09-24",
+  "chainId": 10143,
+  "batchAnchor": "0xe5dcf76b1109906a16587cd2fe02c1e6f4a7a9e1",
+  "monPriceUsd": 0.027,
+  "owners": 20,
+  "notes": [
+    "charged = gasLimit x effectiveGasPrice",
+    "one agent per owner; M1/M2 one save per owner per batch (worst case for cold reads); M3 same size from one owner as the baseline",
+    "throwaway multi-owner build (worktree mida-context-sweep)"
+  ],
+  "rows": [
+    {
+      "case": "M1 20 owners, first batch ever",
+      "saves": 20,
+      "anchored": 20,
+      "rejected": 0,
+      "gasLimit": "3323413",
+      "gasUsed": "3323413",
+      "gasUsedPerSave": "166170",
+      "chargedWei": "338988126000000000",
+      "chargedWeiPerSave": "16949406300000000",
+      "effectiveGasPrice": "102000000000",
+      "transactionHash": "0x74e49535283a275d878d169f7fe074bbd41ed68c82196e4781809bb019b2259b"
+    },
+    {
+      "case": "M2 20 owners, returning",
+      "saves": 20,
+      "anchored": 20,
+      "rejected": 0,
+      "gasLimit": "2916519",
+      "gasUsed": "2916519",
+      "gasUsedPerSave": "145825",
+      "chargedWei": "297484938000000000",
+      "chargedWeiPerSave": "14874246900000000",
+      "effectiveGasPrice": "102000000000",
+      "transactionHash": "0xf2557b37bb744e33cd954758bb648d12756ddee6fcdbd85866236f2cdbd9b938"
+    },
+    {
+      "case": "M3 1 owner, 20 saves",
+      "saves": 20,
+      "anchored": 20,
+      "rejected": 0,
+      "gasLimit": "1384536",
+      "gasUsed": "1384536",
+      "gasUsedPerSave": "69226",
+      "chargedWei": "141222672000000000",
+      "chargedWeiPerSave": "7061133600000000",
+      "effectiveGasPrice": "102000000000",
+      "transactionHash": "0xa6dfb036c6eafbb90a584e6b492d436cb925e8b8ec8859937c39aaa438398a13"
+    }
+  ]
+}

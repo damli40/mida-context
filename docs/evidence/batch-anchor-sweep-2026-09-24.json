@@ -1,0 +1,23 @@
+{
+  "date": "2026-09-24",
+  "chainId": 10143,
+  "batchAnchor": "0xe5dcf76b1109906a16587cd2fe02c1e6f4a7a9e1",
+  "monPriceUsd": 0.027,
+  "agents": 4,
+  "perTxGasMax": "30000000",
+  "notes": [
+    "RECONSTRUCTED from the run's terminal output, copied verbatim: the script crashed writing this file (chainId is a BigInt, JSON.stringify refused it) after all four submissions landed. Charged MON is the 4-decimal figure the script printed; exact wei was not captured.",
+    "charged = gasLimit x effectiveGasPrice; the direct phase is skipped in a sweep (direct numbers: batch-anchor-benchmark-2026-09-24.json)",
+    "one owner; 3054 saves signed, round-robin across 4 agents; sizes over 30M gas were estimated only, never submitted",
+    "throwaway sweep build (worktree mida-context-sweep, detached at 0541550 plus uncommitted sweep changes)"
+  ],
+  "rows": [
+    { "size": 60,   "submitted": true,  "estimate": "3975882",  "gasUsed": "3975870",  "gasUsedPerSave": "66264", "anchored": 60,  "rejected": 0, "chargedMon": "0.4055", "chargedMonPerSave": "0.0067" },
+    { "size": 120,  "submitted": true,  "estimate": "7615282",  "gasUsed": "7594937",  "gasUsedPerSave": "63291", "anchored": 120, "rejected": 0, "chargedMon": "0.7746", "chargedMonPerSave": "0.0064" },
+    { "size": 250,  "submitted": true,  "estimate": "15502649", "gasUsed": "15482304", "gasUsedPerSave": "61929", "anchored": 250, "rejected": 0, "chargedMon": "1.5791", "chargedMonPerSave": "0.0063" },
+    { "size": 400,  "submitted": true,  "estimate": "24603295", "gasUsed": "24582962", "gasUsedPerSave": "61457", "anchored": 400, "rejected": 0, "chargedMon": "2.5074", "chargedMonPerSave": "0.0062" },
+    { "size": 500,  "submitted": false, "estimate": "30669615", "estimatePerSave": "61339", "reason": "over 30M per-tx gas" },
+    { "size": 700,  "submitted": false, "estimate": "42803311", "estimatePerSave": "61147", "reason": "over 30M per-tx gas" },
+    { "size": 1024, "submitted": false, "estimate": "62458661", "estimatePerSave": "60994", "reason": "over 30M per-tx gas" }
+  ]
+}

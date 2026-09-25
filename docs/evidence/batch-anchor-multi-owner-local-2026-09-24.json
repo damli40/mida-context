@@ -1,0 +1,22 @@
+{
+  "date": "2026-09-24",
+  "where": "local Foundry EVM (forge test --isolate), NOT Monad — Ethereum gas schedule; per-save gas excludes the 21k transaction base cost and calldata",
+  "source": "contracts/test/MultiOwnerGas.t.sol (run: forge test --root contracts --isolate --match-contract MultiOwnerGasTest -vv) + contracts/test/BatchAnchorGas.t.sol direct_per_save",
+  "calibration": "case a (one owner, new saves) measured 66,110 locally vs 66,264 on Monad testnet at batch 60 (batch-anchor-sweep-2026-09-24.json)",
+  "gasPerSave": {
+    "a_one_owner_32_new": 66110,
+    "b_32_owners_first_batch_ever": 156410,
+    "c_32_owners_returning": 136223,
+    "d_one_owner_32_updates": 50347,
+    "e_32_owners_updates": 121098,
+    "f_batch_of_1_returning_owner": 231191,
+    "f_batch_of_2_two_owners": 181714,
+    "f_batch_of_4_four_owners": 156945,
+    "f_batch_of_8_one_owner": 81558,
+    "direct_one_by_one": 332843
+  },
+  "notes": [
+    "direct_one_by_one comes from BatchAnchorGas.t.sol, whose timing window also includes some test-side save construction; the batched cases here build saves before the timer",
+    "each 'many owners' case uses one agent per owner, one save per owner per batch: the worst case for cold storage reads"
+  ]
+}

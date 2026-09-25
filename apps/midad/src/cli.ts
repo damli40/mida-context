@@ -10,8 +10,9 @@ import type { Deployment } from "@mida/chain"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { permissionNames } from "@mida/grant-advisor"
 import { callDaemon, ensureCurrentDaemon } from "./control.js"
+import { batchStatusProbe, decideLane, laneWhyText } from "./batching.js"
 import { debugLine, refusalCode } from "./debug-line.js"
-import { runDoctor, runDoctorLive } from "./doctor.js"
+import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeCode, uninstallCodex } from "./install.js"
@@ -20,7 +21,7 @@ import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE, ServiceRuntime } from "./runtime.js"
 import type { Network } from "./runtime.js"
-import { ownerCommandNotice, resolveNetwork } from "./network.js"
+import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag } from "./network.js"
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
 import { approve, authorNamesFor, deploymentMismatchError, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
@@ -39,17 +40,17 @@ const WITH_PROJECT = ["save-demo"]
 /** The namespaces `read --as <agent> <namespace>` may name — the same three the MCP adapter exposes. */
 const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skills", "preferences.communication"]
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | migrate [--undo]" +
+  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | batching on|off | migrate [--undo]" +
   "   (tool = claude-code | codex; agent = claude-code | codex | assistant — assistant is a stand-in for any other assistant you use)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
-export const CLI_COMMANDS: readonly string[] = ["init", "remember", "migrate", ...WITH_AGENT]
+export const CLI_COMMANDS: readonly string[] = ["init", "remember", "migrate", "batching", ...WITH_AGENT]
 /**
  * The commands that change who has access. Only `mida` in the owner's own terminal may run them —
  * they open the owner runtime in-process and are never sent to the daemon socket.
  */
-export const OWNER_COMMANDS: readonly string[] = ["init", "approve", "revoke", "remember", "migrate"]
+export const OWNER_COMMANDS: readonly string[] = ["init", "approve", "revoke", "remember", "migrate", "batching"]
 /** The owner commands that must see a real terminal. `init` is exempt: it grants nothing to an agent. */
-const TERMINAL_COMMANDS: readonly string[] = ["approve", "revoke", "remember", "migrate"]
+const TERMINAL_COMMANDS: readonly string[] = ["approve", "revoke", "remember", "migrate", "batching"]
 export const NEEDS_TERMINAL_LINE = "needs-terminal: run this yourself in a terminal window"
 
 /** What the daemon answers when an owner command reaches /cli anyway. */
@@ -361,6 +362,8 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
             : `the old approved-projects list was invalid; ${result.droppedRows} row(s) were dropped`,
         )
       }
+    } else if (command === "batching") {
+      return await runBatching(runtime, argv[1], deps)
     } else {
       const result = await revoke(runtime, agent)
       // The chain answer first, always — the per-agent key lines follow it (M3-D4). A wrap the
@@ -389,6 +392,60 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     }
     return 1
   }
+}
+
+/**
+ * `mida batching on|off` — the switch for the batched checkpoint lane (the shared-transaction
+ * save). `on` first runs the same lane check the save path runs, pretending the flag is already
+ * set, and refuses with the plain reason when the lane would still be direct — a flag that
+ * changes nothing is not written. A confirmed `on` writes only `batching: true`, leaving every
+ * other network.json byte alone; the daemon picks the flag up on its next save. `off` writes
+ * `batching: false` — saves already queued still finish, because the pending ledger owns them.
+ */
+async function runBatching(runtime: ServiceRuntime, arg: string | undefined, deps: CliDeps): Promise<number> {
+  if (arg !== "on" && arg !== "off") {
+    deps.print(USAGE)
+    return 2
+  }
+  let saved
+  try {
+    saved = readSavedNetwork(runtime.home)
+  } catch {
+    deps.print(`batching cannot be turned ${arg}: network.json could not be read`)
+    return 1
+  }
+  if (saved === undefined) {
+    deps.print(`batching cannot be turned ${arg}: there is no network.json to switch — run \`mida init\` first`)
+    return 1
+  }
+  if (arg === "off") {
+    setBatchingFlag(runtime.home, false)
+    deps.print("batching is off; saves already queued will still finish")
+    return 0
+  }
+  const lane = await decideLane({
+    saved: { ...saved, batching: true },
+    deployment: runtime.network.deployment,
+    storageUrl: runtime.network.storageUrl,
+    status: () => batchStatusProbe(runtime.network.storageUrl ?? ""),
+  })
+  if (lane.kind === "direct") {
+    deps.print(`batching cannot be turned on: ${laneWhyText(lane.why)}`)
+    return 1
+  }
+  deps.print(
+    `automatic checkpoint saves will be anchored in shared batches via ${hostOf(lane.storeUrl)}; grants, revokes and facts are unaffected; saves are usable at once and marked PENDING_ANCHOR until anchored`,
+  )
+  const prompt = deps.prompt ?? terminalPrompt
+  const drain = deps.drainInput ?? drainBufferedStdin
+  await drain()
+  if ((await prompt("Type yes to turn batching on: ")).trim() !== "yes") {
+    deps.print("not approved")
+    return 1
+  }
+  setBatchingFlag(runtime.home, true)
+  deps.print("batching is on")
+  return 0
 }
 
 /**
@@ -547,6 +604,17 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
       deps.print("remember is not available with a passkey owner yet")
       return 2
     }
+    if (command === "batching") {
+      // the switch needs no owner signature — it only rewrites a flag in network.json — so a
+      // passkey home runs it on a secret-less session like the agent-facing commands
+      const session = await ServiceRuntime.openOwnerSession(deps.home, deps.network)
+      try {
+        session.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
+        return await runBatching(session, argv[1], deps)
+      } finally {
+        await session.close()
+      }
+    }
     const agent = argv[1] ?? ""
     if (!AGENTS.includes(agent)) {
       deps.print(USAGE)
@@ -692,7 +760,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   }
   if (OWNER_COMMANDS.includes(command) && (mode === "passkey" || passkeyInit)) {
     const code = await runPasskeyOwnerCommand(argv, deps, mode)
-    if (code === 0 && (command === "approve" || command === "revoke")) {
+    if (code === 0 && (command === "approve" || command === "revoke" || command === "batching")) {
       await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
     }
     return code
@@ -721,7 +789,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     const command = argv[0]!
     if (!OWNER_COMMANDS.includes(command)) return await runCliWithRuntime(argv, runtime, deps.print, { cwd: deps.cwd })
     const code = await runOwnerCommand(argv, runtime, deps)
-    if (code === 0 && (command === "approve" || command === "revoke")) {
+    if (code === 0 && (command === "approve" || command === "revoke" || command === "batching")) {
       await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
     }
     return code

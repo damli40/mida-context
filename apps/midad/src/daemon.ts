@@ -12,6 +12,7 @@ import { buildHandoff } from "./handoff.js"
 import type { HandoffDeps } from "./handoff.js"
 import { CheckpointCopies, buildWhatsNew } from "./whatsnew.js"
 import type { WhatsNewDeps } from "./whatsnew.js"
+import { pendingAnchors } from "./batching.js"
 import { FLUSH_EVENTS } from "./hook.js"
 import type { MidaHome } from "./home.js"
 import { loadAgentIdentity } from "./keys.js"
@@ -188,6 +189,12 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
               // the on-chain author is the agent's identity; without one the name still tells who saved
               authorId: loadAgentIdentity(home, agent)?.agentId ?? agent,
               namespaceId: NAMESPACE_ID,
+              // a just-queued batched save is not anchored — the copy must not call it final;
+              // a duplicate answer is pending too when the original still sits in the ledger
+              anchor:
+                saved.lane === "batched" || pendingAnchors(home).some((entry) => entry.contextId === saved.contextId)
+                  ? "PENDING_ANCHOR"
+                  : "ANCHORED",
             })
             return saved
           },

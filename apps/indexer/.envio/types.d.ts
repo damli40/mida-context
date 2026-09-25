@@ -647,6 +647,12 @@ type Entities = {
     readonly "id": string;
     readonly "activeCapabilityIds": readonly string[];
   };
+  "BatchStats": {
+    readonly "id": string;
+    readonly "batches": number;
+    readonly "anchoredSaves": number;
+    readonly "rejectedSaves": number;
+  };
   "ContextRecord": {
     readonly "id": string;
     readonly "owner": string;
@@ -713,6 +719,7 @@ type Entities = {
     readonly "revocations": number;
     readonly "records": number;
     readonly "p256Registered": boolean;
+    readonly "batchedSaves": number;
   };
   "ProcessedEvent": {
     readonly "id": string;
@@ -1023,6 +1030,62 @@ declare module "envio" {
       readonly srcAddress: Address;
     };
   };
+  "BatchAnchor": {
+    "SaveAnchored": {
+      /** The name of the event. */
+      readonly eventName: "SaveAnchored";
+      /** The name of the contract that emitted this event. */
+      readonly contractName: "BatchAnchor";
+      /** The unique identifier of the blockchain network where this event occurred. */
+      readonly chainId: 10143;
+      /** The parameters or arguments associated with this event. */
+      readonly params: { readonly owner: Address; readonly contextId: string; readonly batchId: string; readonly namespaceId: string; readonly lineageId: string; readonly version: bigint; readonly author: string; readonly position: bigint; readonly leafHash: string };
+      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
+      readonly block: EvmBlock;
+      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
+      readonly transaction: EvmTransaction;
+      /** The index of this event's log within the block. */
+      readonly logIndex: number;
+      /** The address of the contract that emitted this event. */
+      readonly srcAddress: Address;
+    };
+    "SaveRejected": {
+      /** The name of the event. */
+      readonly eventName: "SaveRejected";
+      /** The name of the contract that emitted this event. */
+      readonly contractName: "BatchAnchor";
+      /** The unique identifier of the blockchain network where this event occurred. */
+      readonly chainId: 10143;
+      /** The parameters or arguments associated with this event. */
+      readonly params: { readonly batchId: string; readonly index: bigint; readonly reason: bigint };
+      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
+      readonly block: EvmBlock;
+      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
+      readonly transaction: EvmTransaction;
+      /** The index of this event's log within the block. */
+      readonly logIndex: number;
+      /** The address of the contract that emitted this event. */
+      readonly srcAddress: Address;
+    };
+    "BatchAnchored": {
+      /** The name of the event. */
+      readonly eventName: "BatchAnchored";
+      /** The name of the contract that emitted this event. */
+      readonly contractName: "BatchAnchor";
+      /** The unique identifier of the blockchain network where this event occurred. */
+      readonly chainId: 10143;
+      /** The parameters or arguments associated with this event. */
+      readonly params: { readonly batchId: string; readonly root: string; readonly acceptedCount: bigint; readonly rejectedCount: bigint; readonly submitter: Address };
+      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
+      readonly block: EvmBlock;
+      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
+      readonly transaction: EvmTransaction;
+      /** The index of this event's log within the block. */
+      readonly logIndex: number;
+      /** The address of the contract that emitted this event. */
+      readonly srcAddress: Address;
+    };
+  };
       }; eventFilters: {
   "CapabilityRegistry": {
     "AgentRegistered": { readonly params: { readonly agentId?: SingleOrMultiple<string>; readonly operator?: SingleOrMultiple<Address>; readonly signer?: SingleOrMultiple<Address> } };
@@ -1043,6 +1106,11 @@ declare module "envio" {
     "ContextSuperseded": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly lineageId?: SingleOrMultiple<string>; readonly contextId?: SingleOrMultiple<string> } };
     "EvidenceRegistered": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly namespaceId?: SingleOrMultiple<string>; readonly contextId?: SingleOrMultiple<string> } };
   };
+  "BatchAnchor": {
+    "SaveAnchored": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly contextId?: SingleOrMultiple<string>; readonly batchId?: SingleOrMultiple<string> } };
+    "SaveRejected": { readonly params: { readonly batchId?: SingleOrMultiple<string> } };
+    "BatchAnchored": { readonly params: { readonly batchId?: SingleOrMultiple<string> } };
+  };
       } };
       entities: Entities;
       perChainEntities: never;
@@ -1052,6 +1120,7 @@ declare module "envio" {
 
   export type Agent = Entities["Agent"];
   export type AgentGrantBook = Entities["AgentGrantBook"];
+  export type BatchStats = Entities["BatchStats"];
   export type ContextRecord = Entities["ContextRecord"];
   export type GlobalStats = Entities["GlobalStats"];
   export type Grant = Entities["Grant"];

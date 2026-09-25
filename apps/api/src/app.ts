@@ -28,6 +28,8 @@ import { createMiddleware } from "hono/factory"
 import { isAddressEqual, zeroHash } from "viem"
 import { AUTH_HEADERS, assertAuthHeaderShape, authenticateRequest } from "./auth.js"
 import { authorizeAgent } from "./authorize.js"
+import { mountBatchRoutes } from "./batch-routes.js"
+import type { BatchingOptions } from "./batch-routes.js"
 import { BudgetedReader, ChainReadBudgetExceeded, isChainReadBudgetExceeded } from "./chain-budget.js"
 import type { ContextRecordView, RegistryReader } from "./chain-views.js"
 import { DenyOverlay } from "./deny-overlay.js"
@@ -96,6 +98,11 @@ export interface ContextApiOptions {
   limiter?: RequestLimiter
   /** Wall-clock seconds for request freshness. Chain time decides capability expiry. */
   clock?: () => bigint
+  /**
+   * The batched-save lane (BatchAnchor). Absent: no /batch/* surface exists and every pre-batch
+   * behaviour is unchanged. Present: the routes mount, gated inside by `batching.enabled`.
+   */
+  batching?: BatchingOptions
 }
 
 type Env = { Variables: { signer: Address; body: Uint8Array; chain: BudgetedReader } }
@@ -690,6 +697,11 @@ export function createContextApi(options: ContextApiOptions) {
     const cancelled = await overlay.cancel(intent.id, owner, nonce)
     return c.json({ intentId: cancelled.id, state: cancelled.state })
   })
+
+  // Batched-save routes exist only when configured; `enabled` inside can still refuse POSTs.
+  if (options.batching !== undefined) {
+    mountBatchRoutes(app, { batching: options.batching, deployment, limits, overlay, authenticated, json })
+  }
 
   return { app, overlay, store, limits }
 }

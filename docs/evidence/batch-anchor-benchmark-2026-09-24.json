@@ -1,0 +1,27 @@
+{
+  "date": "2026-09-24",
+  "chainId": 10143,
+  "batchAnchor": "0xe5dcf76b1109906a16587cd2fe02c1e6f4a7a9e1",
+  "contextRegistry": "0x75fb6db9af93a8d823e51c488caa913ca711fb78",
+  "monPriceUsd": 0.027,
+  "direct": {
+    "saves": 20,
+    "txs": 20,
+    "chargedWeiPerSave": "32940532800000000",
+    "gasUsedPerSave": "322946"
+  },
+  "batched": {
+    "saves": 600,
+    "txs": 10,
+    "batchSize": 60,
+    "chargedWeiPerSave": "6727942270000000",
+    "gasUsedPerSave": "65960",
+    "rejected": 0
+  },
+  "maxSavesPerTxObserved": 60,
+  "notes": [
+    "setup (owner key, namespace epochs, agent registration, grants, funding transfers) is excluded from the measured phases",
+    "charged = gasLimit × effectiveGasPrice — Monad bills the reserved gas limit, not the gas used",
+    "batched saves were submitted directly by the deployer in --batch-sized transactions"
+  ]
+}

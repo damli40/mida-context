@@ -197,6 +197,12 @@ importers:
         specifier: workspace:*
         version: link:packages/storage
     devDependencies:
+      '@noble/curves':
+        specifier: 2.4.0
+        version: 2.4.0
+      '@noble/hashes':
+        specifier: 2.4.0
+        version: 2.4.0
       '@types/node':
         specifier: 22.20.1
         version: 22.20.1

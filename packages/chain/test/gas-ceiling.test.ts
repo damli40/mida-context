@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { isMidaError } from "@mida/protocol"
-import type { Address, Hex } from "@mida/protocol"
-import { GAS_CEILINGS, sendContract, sendValue } from "@mida/chain"
+import type { Address, Hex, MidaError } from "@mida/protocol"
+import { GAS_CEILINGS, failedBeforeSend, sendContract, sendValue } from "@mida/chain"
 import type { WriteContext } from "@mida/chain"
 
 const ADDRESS: Address = "0x5fbdb2315678afecb367f032d93f642f64180aa3"
@@ -90,6 +90,74 @@ describe("the shared gas ceiling (R3-1)", () => {
       expect(typeof ceiling, kind).toBe("bigint")
       expect(ceiling, kind).toBeGreaterThanOrEqual(21_000n)
     }
+  })
+
+  it('"batch.submit" is its own kind, sized under Monad\'s 30M per-transaction gas limit', () => {
+    // Monad refuses any transaction over 30,000,000 gas; 28M leaves 2M of headroom because the
+    // estimate is taken before inclusion. The Sep 24 sweep measured ~61k gas per save, so a
+    // batch-submit ceiling near the wall is what lets batches grow past the old 60-save cap.
+    expect(GAS_CEILINGS["batch.submit"]).toBe(28_000_000n)
+  })
+
+  it("a batch submit whose estimate crosses the ceiling is refused before send", async () => {
+    const estimate = 29_000_000n // under Monad's 30M wall but over the 28M batch-submit budget
+    const { context, sent } = stubContext(estimate)
+    const error = await sendContract(context, { address: ADDRESS, abi: [], functionName: "submitBatch", args: [] }, "batch.submit").then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(isMidaError(error, "GAS_CEILING_EXCEEDED")).toBe(true)
+    expect(sent).toHaveLength(0)
+  })
+
+  it("a refusal carries the estimate and ceiling it compared, so a caller re-sizes from numbers not text", async () => {
+    const estimate = 29_000_000n
+    const { context } = stubContext(estimate)
+    const error = await sendContract(context, { address: ADDRESS, abi: [], functionName: "submitBatch", args: [] }, "batch.submit").then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(isMidaError(error, "GAS_CEILING_EXCEEDED")).toBe(true)
+    // The batcher divides estimate by its take to learn the per-save cost the node computed —
+    // parsing the message would break on any wording change, so the numbers ride the error itself.
+    expect((error as MidaError).estimate).toBe(estimate)
+    expect((error as MidaError).ceiling).toBe(GAS_CEILINGS["batch.submit"])
+  })
+
+  it("a simulation failure is marked sent:false — no transaction left the process", async () => {
+    const { context, sent } = stubContext(300_000n)
+    ;(context.publicClient as { simulateContract: unknown }).simulateContract = async () => {
+      throw new Error("execution reverted: BatchExists")
+    }
+    const error = await sendContract(context, { address: ADDRESS, abi: [], functionName: "register", args: [] }, "context.register").then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(failedBeforeSend(error)).toBe(true)
+    expect(sent).toHaveLength(0)
+  })
+
+  it("a ceiling refusal is marked sent:false — the estimate ran before the send", async () => {
+    const { context, sent } = stubContext(GAS_CEILINGS["batch.submit"] + 1n)
+    const error = await sendContract(context, { address: ADDRESS, abi: [], functionName: "submitBatch", args: [] }, "batch.submit").then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(failedBeforeSend(error)).toBe(true)
+    expect(sent).toHaveLength(0)
+  })
+
+  it("a failure after writeContract is NOT marked — the transaction may already have landed", async () => {
+    const { context, sent } = stubContext(300_000n)
+    ;(context.publicClient as { waitForTransactionReceipt: unknown }).waitForTransactionReceipt = async () => {
+      throw new Error("the receipt never arrived")
+    }
+    const error = await sendContract(context, { address: ADDRESS, abi: [], functionName: "register", args: [] }, "context.register").then(
+      () => null,
+      (e: unknown) => e,
+    )
+    expect(failedBeforeSend(error)).toBe(false)
+    expect(sent).toHaveLength(1) // the send went out — its answer was what got lost
   })
 
   it("the plain value transfer is bounded by its own kind and sent with the explicit estimate", async () => {
