@@ -306,6 +306,12 @@ describe("renderMe", () => {
     expect(status!.textContent).not.toContain("index")
   })
 
+  it("a row whose chain check could not run says 'could not check Monad just now' — never 'not on Monad'", () => {
+    const root = renderMe(data({ records: [record({ state: "unknown" })] }), fakeDoc()) as unknown as FakeEl
+    expect(root.textContent).toContain("could not check Monad just now")
+    expect(root.textContent).not.toContain("not on Monad")
+  })
+
   it("shows the newest 20 records and pages the rest with 'Show 20 more'", () => {
     const many = Array.from({ length: 25 }, (_, i) =>
       record({ contextId: `0x${String(i).padStart(2, "0")}${"cc".repeat(31)}` as Hex, createdAt: 1_700_000_000_000 + i }),

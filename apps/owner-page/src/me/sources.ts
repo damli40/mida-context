@@ -724,12 +724,15 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
   )
 
   // Direct lane: one getRecords batch answers "is this contextId on ContextRegistry, and does it
-  // say what the store says". A throw marks every direct row unverified rather than dropping it.
+  // say what the store says". A throw marks every direct row UNKNOWN — the check never ran, so
+  // nothing was disproven — rather than dropping the rows or calling them unverified.
   let chainRecords: Map<string, ContextRecordView> | null = null
+  let directCheckFailed = false
   if (listedObjects.length > 0) {
     const found = await safe(() => ports.chain.getRecords(listedObjects.map((o) => o.contextId)))
     if (found === null) {
-      note("the chain record check failed — direct records show unverified; reload")
+      directCheckFailed = true
+      note("the chain record check failed — direct records could not be checked against Monad; reload")
     } else {
       chainRecords = new Map()
       for (const record of found) {
@@ -748,7 +751,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
       area: areaName(object.namespaceId),
       readEpoch: record?.readEpoch ?? uint64Of(object.manifest?.readEpoch),
       lane: "direct",
-      state: record !== null && directMatches(record, object, ownerKey) ? "anchored" : "unverified",
+      state: directCheckFailed ? "unknown" : record !== null && directMatches(record, object, ownerKey) ? "anchored" : "unverified",
       authorId: object.authorId,
       authorName: await nameFor(object.authorId),
       source: record?.provenanceSource ?? indexRecord?.provenanceSource ?? null,
@@ -810,6 +813,9 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
       const lineageId = item.lineageId ?? (indexRow?.lineageId as Hex | undefined) ?? null
       const version = item.version ?? indexRow?.version ?? null
       let anchored = false
+      // null = the chain answered "no such root"; "failed" = the read itself never returned.
+      // Only the second is "unknown" — a thrown read must not read as "not on Monad".
+      let root: Hex | null | "failed" = null
       if (
         message !== null &&
         batchId !== null &&
@@ -818,8 +824,12 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
         Array.isArray(item.proof) &&
         batchedCommitmentsMatch(item, message)
       ) {
-        const root = await safe(() => ports.chain.batchRoot(batchId))
-        if (root !== null) {
+        try {
+          root = await ports.chain.batchRoot(batchId)
+        } catch {
+          root = "failed"
+        }
+        if (root !== null && root !== "failed") {
           try {
             const structHash = batchSaveStructHash(message)
             // Each candidate agentId produces a different leaf; whichever one the on-chain root
@@ -844,7 +854,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
           }
         }
       }
-      state = anchored ? "anchored" : "unverified"
+      state = anchored ? "anchored" : root === "failed" ? "unknown" : "unverified"
     }
     const rowNamespace = message?.namespaceId ?? (indexRow?.namespaceId as Hex | undefined) ?? listedUnder
     records.push({

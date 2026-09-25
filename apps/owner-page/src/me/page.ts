@@ -331,6 +331,9 @@ function renderRecordRow(doc: Document, row: RecordRow, open: OpenRow | undefine
   tr.appendChild(anchor)
   if (row.state === "pending") {
     anchor.appendChild(elOf(doc, "span", "badge b-warn", "Pending anchor"))
+  } else if (row.state === "unknown") {
+    // The check itself never ran — this is not a verdict, so it must not wear "not on Monad".
+    anchor.appendChild(elOf(doc, "span", "badge b-warn", "could not check Monad just now"))
   } else if (row.state === "unverified") {
     anchor.appendChild(elOf(doc, "span", "badge b-bad", "not on Monad — unverified"))
   } else {

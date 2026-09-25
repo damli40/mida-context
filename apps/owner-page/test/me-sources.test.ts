@@ -171,7 +171,9 @@ function world() {
     validCaps: new Map<string, boolean>([[CAP_ID.toLowerCase(), true]]),
     capabilities: new Map<string, CapabilityView>([[CAP_ID.toLowerCase(), capabilityView()]]),
     chainRecords: new Map<string, ContextRecordView>(),
+    getRecordsError: null as Error | null,
     batchRoots: new Map<string, Hex>(),
+    batchRootsError: null as Error | null,
     grantLogs: [] as GrantLog[],
     grantLogsError: null as Error | null,
     agentRecords: new Map<string, AgentRecord>([[AGENT_ID.toLowerCase(), AGENT_RECORD]]),
@@ -225,9 +227,13 @@ function world() {
       getCapability: async (capabilityId) => state.capabilities.get(capabilityId.toLowerCase()) ?? null,
       getRecords: async (ids) => {
         state.getRecordsCalls.push([...ids])
+        if (state.getRecordsError !== null) throw state.getRecordsError
         return ids.map((id) => state.chainRecords.get(id.toLowerCase()) ?? null)
       },
-      batchRoot: async (batchId) => state.batchRoots.get(batchId.toLowerCase()) ?? null,
+      batchRoot: async (batchId) => {
+        if (state.batchRootsError !== null) throw state.batchRootsError
+        return state.batchRoots.get(batchId.toLowerCase()) ?? null
+      },
       ownerGrantLogs: async () => {
         if (state.grantLogsError !== null) throw state.grantLogsError
         return state.grantLogs
@@ -631,5 +637,51 @@ describe("loadMe — a grant row is only live when the chain's capability agrees
     expect(data.source).toBe("chain-logs")
     const grant = data.agents.find((a) => a.agentId === AGENT_ID)!.grants[0]!
     expect(grant.status).toEqual({ label: "Unverified", flagged: true })
+  })
+})
+
+describe("loadMe — a failed chain check is 'unknown', never 'unverified'", () => {
+  it("a getRecords RPC failure marks direct rows unknown — the check never ran", async () => {
+    const { state, ports } = world()
+    const { obj, record } = makeDirectObject()
+    state.objects.set(NS_SKILLS, [obj])
+    state.chainRecords.set(record.contextId, record) // a matching record EXISTS — the read just failed
+    state.getRecordsError = new Error("rpc down")
+    const data = await loadMe(OWNER, ports)
+    const row = data.records.find((r) => r.contextId === obj.contextId)
+    expect(row).toBeDefined()
+    expect(row!.state).toBe("unknown")
+    expect(data.incomplete.some((t) => t.includes("chain record check failed"))).toBe(true)
+  })
+
+  it("a getRecords that answered 'no record' stays unverified — the check completed", async () => {
+    const { state, ports } = world()
+    const { obj } = makeDirectObject()
+    state.objects.set(NS_SKILLS, [obj])
+    // the RPC answered; the contextId is simply not on ContextRegistry — a verdict, not a failure
+    const data = await loadMe(OWNER, ports)
+    const row = data.records.find((r) => r.contextId === obj.contextId)
+    expect(row!.state).toBe("unverified")
+  })
+
+  it("a batchRoot RPC failure marks the ANCHORED batched row unknown", async () => {
+    const { state, ports } = world()
+    const { item, contextId, root } = await makeBatchedItem()
+    state.batched.set(NS, [item])
+    state.batchRoots.set(BATCH_ID, root) // the root exists — the read just failed
+    state.batchRootsError = new Error("rpc down")
+    const data = await loadMe(OWNER, ports)
+    const row = data.records.find((r) => r.contextId === contextId)
+    expect(row!.state).toBe("unknown")
+  })
+
+  it("a batchRoot answering 'no such root' stays unverified — the check completed", async () => {
+    const { state, ports } = world()
+    const { item, contextId } = await makeBatchedItem()
+    state.batched.set(NS, [item])
+    // batchRoots holds nothing for BATCH_ID — the chain answered null: the batch is not on Monad
+    const data = await loadMe(OWNER, ports)
+    const row = data.records.find((r) => r.contextId === contextId)
+    expect(row!.state).toBe("unverified")
   })
 })

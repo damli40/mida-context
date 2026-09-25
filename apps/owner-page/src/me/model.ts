@@ -1,7 +1,9 @@
 export type Hex = `0x${string}`
 export interface Chips { read: boolean; write: boolean; updateOwn: boolean; updateAny: boolean }
 export type Lane = "direct" | "batched"
-export type AnchorState = "anchored" | "pending" | "unverified"
+// "unverified" means the chain answered and the record is not what it claimed; "unknown" means
+// the chain check itself could not run — a failed read must never read as "not on Monad".
+export type AnchorState = "anchored" | "pending" | "unverified" | "unknown"
 export type Badge = { kind: "you" | "agent" | "claimed" | "unknown"; text: string }
 
 // Bit values are PERMISSION in packages/protocol/src/constants.ts:1 — duplicated here on purpose so
