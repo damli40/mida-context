@@ -550,12 +550,43 @@ describe("mida-mcp startup gate", () => {
   }, 30_000)
 })
 
+/** The eleven field names mida_save accepts — the ten content fields plus the optional verbatim ask. */
+const SAVE_FIELDS = [
+  "objective",
+  "progress",
+  "decisions",
+  "rejected",
+  "constraints",
+  "artifacts",
+  "unresolvedIssue",
+  "nextAction",
+  "remainingPlan",
+  "evidence",
+  "originalRequest",
+]
+const CONTENT_FIELDS = SAVE_FIELDS.slice(0, 10)
+
+/** A save-shaped argument set — every field present so a forged identity key would stand out. */
+const SAVE_ARGS: Record<string, unknown> = {
+  objective: "o",
+  progress: [],
+  decisions: [],
+  rejected: [],
+  constraints: [],
+  artifacts: [],
+  unresolvedIssue: null,
+  nextAction: "n",
+  remainingPlan: [],
+  evidence: [],
+  originalRequest: "the user's ask, word for word",
+}
+
 describe("mida-mcp tools against a fake daemon", () => {
-  it("lists exactly the four stable tools, with the pinned input schemas", async () => {
+  it("lists exactly the five stable tools, with the pinned input schemas", async () => {
     const { client, close } = await connect(deps(home(), { daemonUp: false }))
     try {
       const listed = await client.listTools()
-      expect(listed.tools.map((t) => t.name)).toEqual(["mida_handoff", "mida_whats_new", "mida_read", "mida_status"])
+      expect(listed.tools.map((t) => t.name)).toEqual(["mida_handoff", "mida_whats_new", "mida_read", "mida_status", "mida_save"])
       expect(listed.tools.map((t) => t.inputSchema)).toEqual(MCP_TOOLS.map((t) => t.inputSchema))
       const read = listed.tools.find((t) => t.name === "mida_read")!
       expect(read.inputSchema).toEqual({
@@ -569,6 +600,16 @@ describe("mida-mcp tools against a fake daemon", () => {
         },
         additionalProperties: false,
       })
+      const save = listed.tools.find((t) => t.name === "mida_save")!
+      const schema = save.inputSchema as { properties: Record<string, unknown>; required?: string[]; additionalProperties?: unknown }
+      // exactly the checkpoint's ten content fields plus the optional originalRequest — and nothing else:
+      // no eventId, agent, source or createdAt to forge, no sessionId or projectId to steer
+      expect(Object.keys(schema.properties).sort()).toEqual([...SAVE_FIELDS].sort())
+      expect([...(schema.required ?? [])].sort()).toEqual([...CONTENT_FIELDS].sort())
+      expect(schema.additionalProperties).toBe(false)
+      // the description tells the model when to call it — the brief's two moments
+      expect(save.description).toMatch(/asks? to save|asks? you to save|to save context|save context|hand off/i)
+      expect(save.description).toMatch(/before .*finish/i)
     } finally {
       await close()
     }
@@ -894,11 +935,65 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
+  it("mida_save posts {agent, cwd, fields} to /save and prints the daemon's saved line verbatim", async () => {
+    const dir = home()
+    const project = projectDir()
+    const fake = await fakeDaemon(dir, {
+      "/save": { kind: "saved", text: "Mida: checkpoint saved as claude-desktop (record 0xabcd…)." },
+    })
+    try {
+      const { client, close } = await connect(deps(dir, { agent: "claude-desktop", project }))
+      try {
+        expect(await callText(client, "mida_save", SAVE_ARGS)).toBe("Mida: checkpoint saved as claude-desktop (record 0xabcd…).")
+      } finally {
+        await close()
+      }
+      const sent = fake.requests.filter((r) => r.path === "/save")
+      expect(sent).toHaveLength(1)
+      // the adapter contributes only who it is and where it runs — the model's fields go verbatim,
+      // so a field the daemon does not know still reaches its validator and gets named
+      expect(sent[0]!.body).toEqual({ agent: "claude-desktop", cwd: project, fields: SAVE_ARGS })
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("mida_save prints the daemon's refusal text verbatim — the rate-limit line and the field-name line alike", async () => {
+    const dir = home()
+    const fake = await fakeDaemon(dir, {
+      "/save": (body) =>
+        typeof body?.fields === "object" && body.fields !== null && "surprise" in (body.fields as Record<string, unknown>)
+          ? { kind: "refused", reason: "invalid-shape", text: "Mida: these fields are not part of a checkpoint: surprise", fields: ["surprise"] }
+          : { kind: "refused", reason: "rate-limited", text: "Mida: claude-desktop may save once per minute in a project — the next save is allowed in 60 s." },
+    })
+    try {
+      const { client, close } = await connect(deps(dir, { agent: "claude-desktop" }))
+      try {
+        expect(await callText(client, "mida_save", SAVE_ARGS)).toBe(
+          "Mida: claude-desktop may save once per minute in a project — the next save is allowed in 60 s.",
+        )
+        expect(await callText(client, "mida_save", { ...SAVE_ARGS, surprise: "x" })).toBe(
+          "Mida: these fields are not part of a checkpoint: surprise",
+        )
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
   it("every tool answers the degraded line when the daemon could not start — no stack, no protocol error", async () => {
     const { client, close } = await connect(deps(home(), { daemonUp: false }))
     try {
-      for (const name of ["mida_handoff", "mida_whats_new", "mida_read", "mida_status"]) {
-        const text = await callText(client, name)
+      for (const [name, args] of [
+        ["mida_handoff", {}],
+        ["mida_whats_new", {}],
+        ["mida_read", {}],
+        ["mida_status", {}],
+        ["mida_save", SAVE_ARGS],
+      ] as const) {
+        const text = await callText(client, name, args)
         expect(text).toBe(DEGRADED)
         expect(text).not.toMatch(/^\s+at\s/m)
         expect(text).not.toContain("node:internal")
@@ -950,12 +1045,13 @@ describe("mida-mcp tools against a fake daemon", () => {
 
   it("a malformed daemon answer is a bad-reply degraded line, never a stack", async () => {
     const dir = home()
-    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff" }, "/cli": { lines: "nope" } })
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff" }, "/cli": { lines: "nope" }, "/save": { kind: "saved" } })
     try {
       const { client, close } = await connect(deps(dir))
       try {
         expect(await callText(client, "mida_handoff")).toBe("Mida: could not load context (bad-reply) — working without it")
         expect(await callText(client, "mida_read")).toBe("Mida: could not load context (bad-reply) — working without it")
+        expect(await callText(client, "mida_save", SAVE_ARGS)).toBe("Mida: could not load context (bad-reply) — working without it")
       } finally {
         await close()
       }
@@ -982,14 +1078,17 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
-  it("an unknown tool name is a protocol error, and no write or owner tool exists to call", async () => {
+  it("an unknown tool name is a protocol error, and no owner tool exists to call", async () => {
     const { client, close } = await connect(deps(home(), { daemonUp: false }))
     try {
       const listed = await client.listTools()
-      for (const name of ["save", "remember", "approve", "revoke", "mida_save", "mida_approve"]) {
+      // mida_save is the one write the owner decided MCP clients may have; every operation that
+      // changes WHO has access stays absent — no tool to approve, revoke, request or remember
+      for (const name of ["remember", "approve", "revoke", "request", "mida_approve", "mida_revoke", "mida_remember", "mida_request"]) {
         expect(listed.tools.some((t) => t.name === name)).toBe(false)
       }
-      await expect(client.callTool({ name: "mida_save", arguments: {} })).rejects.toThrow()
+      await expect(client.callTool({ name: "mida_approve", arguments: {} })).rejects.toThrow()
+      await expect(client.callTool({ name: "mida_revoke", arguments: {} })).rejects.toThrow()
     } finally {
       await close()
     }
@@ -1015,32 +1114,41 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
-  it("only ever sends read-shaped requests to the daemon — every tool, every namespace", async () => {
+  it("only ever sends read routes and the one save route to the daemon — every tool, every namespace", async () => {
     const dir = home()
+    const project = projectDir()
     const fake = await fakeDaemon(dir, {
       "/health": HEALTH,
       "/handoff": { kind: "empty", text: "Mida: connected. Nothing has been saved for this project yet.", seen: [] },
       "/whatsnew": { kind: "none" },
       "/cli": { code: 0, lines: ["projects.current: read 0 object(s)"] },
+      "/save": { kind: "saved", text: "Mida: checkpoint saved." },
     })
     try {
-      const { client, close } = await connect(deps(dir))
+      const { client, close } = await connect(deps(dir, { project }))
       try {
         await callText(client, "mida_handoff")
         await callText(client, "mida_whats_new")
         await callText(client, "mida_status")
         for (const namespace of READ_NAMESPACES) await callText(client, "mida_read", { namespace })
+        await callText(client, "mida_save", SAVE_ARGS)
       } finally {
         await close()
       }
       // the daemon's socket also accepts /kick, /shutdown and /cli argv like `request` or
-      // `save-demo` — the adapter's restraint is what keeps it read-only, so every recorded
-      // request is pinned, not just the ones a test happened to look at
+      // `approve` — the adapter's restraint is what keeps it to reads plus this one gated write,
+      // so every recorded request is pinned, not just the ones a test happened to look at
       expect(fake.requests.length).toBeGreaterThan(0)
       for (const req of fake.requests) {
-        expect(["/health", "/handoff", "/whatsnew", "/cli"]).toContain(req.path)
+        expect(["/health", "/handoff", "/whatsnew", "/cli", "/save"]).toContain(req.path)
         if (req.path === "/cli") expect((req.body?.argv as string[]).slice(0, 3)).toEqual(["read", "--as", "assistant"])
+        // the save body is exactly {agent, cwd, fields} — no sessionId, no projectId, nothing else
+        if (req.path === "/save") {
+          expect(Object.keys(req.body ?? {}).sort()).toEqual(["agent", "cwd", "fields"])
+          expect(Object.keys((req.body?.fields ?? {}) as Record<string, unknown>).sort()).toEqual([...SAVE_FIELDS].sort())
+        }
       }
+      expect(fake.requests.some((r) => r.path === "/save")).toBe(true)
     } finally {
       await fake.stop()
     }
@@ -1067,7 +1175,7 @@ describe("mida-mcp import graph", () => {
    * sign — keys.ts, skeleton.ts, runtime.ts and everything that depends on them.
    */
   const FORBIDDEN =
-    /(^|\/)(keys|skeleton|runtime|cli|remember|projects|drain|drain-main|daemon|daemon-main|doctor|install|testnet|api-server|request-store|checkpoint-payload|hook-main|inject-main|whatsnew|handoff)\.ts$|owner-link/
+    /(^|\/)(keys|skeleton|runtime|cli|remember|projects|drain|drain-main|daemon|daemon-main|doctor|install|testnet|api-server|request-store|checkpoint-payload|hook-main|inject-main|whatsnew|handoff|mcp-save)\.ts$|owner-link/
 
   const reachableFrom = (entry: string): Set<string> => {
     const found = new Set<string>()

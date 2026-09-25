@@ -11,14 +11,17 @@ import { findProjectMarker } from "./queue.js"
 import { writeSeen } from "./seen.js"
 
 /**
- * The local MCP adapter (M3-G): a stdio MCP server that is a pure client of the daemon's Unix
- * socket, exactly like the hooks. It holds no keys, signs nothing and exposes only read tools —
- * `read --as` through /cli, /handoff, /whatsnew, /health. The daemon keeps every gate: project
- * approval, capability and revocation are answered there, never here.
+ * The local MCP adapter (M3-G + in-5): a stdio MCP server that is a pure client of the daemon's
+ * Unix socket, exactly like the hooks. It holds no keys and signs nothing. Its tools are reads —
+ * `read --as` through /cli, /handoff, /whatsnew, /health — plus the one write the owner decided
+ * every client may have, `mida_save`, which forwards the model's checkpoint fields to the daemon's
+ * POST /save. The daemon keeps every gate — identity, project approval, the CREATE grant and
+ * revocation are answered there, never here — and seals, stores and signs the checkpoint itself.
  *
  * The import discipline is the security boundary: this file may only reach leaf modules. Anything
- * that loads keys or can sign — keys.ts, skeleton.ts, runtime.ts, cli.ts, remember.ts and friends —
- * must stay out of this module's import graph. mcp.test.ts walks that graph and proves it.
+ * that loads keys or can sign — keys.ts, skeleton.ts, runtime.ts, cli.ts, remember.ts, mcp-save.ts
+ * and friends — must stay out of this module's import graph. mcp.test.ts walks that graph and
+ * proves it.
  */
 
 /**
@@ -39,6 +42,8 @@ const WHATS_NEW_TIMEOUT_MS = 1_500
 const READ_TIMEOUT_MS = 30_000
 const STATUS_TIMEOUT_MS = 2_000
 const STATUS_PROBE_TIMEOUT_MS = 8_000
+/** A save is a real chain transaction through the daemon's gates — the read budget would cut it short. */
+const SAVE_TIMEOUT_MS = 60_000
 
 /** Every tool result is capped like the handoff text: 8 000 chars, cut with the same `…` marker. */
 const TOOL_TEXT_CAP = 8_000
@@ -182,6 +187,63 @@ export const MCP_TOOLS = [
     name: "mida_status",
     description: "Whether the local midad daemon is answering and which agents are approved for this folder.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "mida_save",
+    description:
+      "Save a checkpoint of your work on this project so another approved agent can pick it up. Call it when the user asks to save context or hand off, and before you finish a task. The daemon signs it as this client's own identity after the owner's approval gates pass — one save per minute at most.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        objective: { type: "string", description: "What the work is trying to achieve — one or two sentences." },
+        progress: { type: "array", items: { type: "string" }, description: "What has been done so far, newest last." },
+        decisions: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { decision: { type: "string" }, rationale: { type: "string" } },
+            required: ["decision", "rationale"],
+            additionalProperties: false,
+          },
+          description: "Decisions taken and why — the reasoning another agent must not re-litigate.",
+        },
+        rejected: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { approach: { type: "string" }, why: { type: "string" } },
+            required: ["approach", "why"],
+            additionalProperties: false,
+          },
+          description: "Approaches considered and turned down, with the reason.",
+        },
+        constraints: { type: "array", items: { type: "string" }, description: "Rules, deadlines and hard limits the work must respect." },
+        artifacts: { type: "array", items: { type: "string" }, description: "Files, commands or resources the work produced or touched." },
+        unresolvedIssue: {
+          type: ["string", "null"],
+          description: "The open problem blocking progress, or null when none is.",
+        },
+        nextAction: { type: "string", description: "The single next step the continuing agent should take." },
+        remainingPlan: { type: "array", items: { type: "string" }, description: "The steps still ahead, in order." },
+        evidence: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { field: { type: "string" }, ref: { type: "string" } },
+            required: ["field", "ref"],
+            additionalProperties: false,
+          },
+          description: "Where claims above can be checked — a field name and the file, url or command that backs it.",
+        },
+        originalRequest: {
+          type: "string",
+          maxLength: 6000,
+          description: "The user's own ask, word for word — optional, at most 6,000 characters.",
+        },
+      },
+      required: ["objective", "progress", "decisions", "rejected", "constraints", "artifacts", "unresolvedIssue", "nextAction", "remainingPlan", "evidence"],
+      additionalProperties: false,
+    },
   },
 ] as const
 
@@ -394,6 +456,26 @@ async function toolStatus(deps: McpServerDeps) {
 }
 
 /**
+ * `mida_save` — POST /save with the model's checkpoint fields exactly as sent: the adapter adds
+ * only who it is (`agent`) and where it ran (`cwd`). The daemon decides everything — a field it
+ * does not know reaches its validator and is named in the refusal, and the saved or refused text
+ * comes back verbatim. The tool's own timeout is wide: a direct save is a real transaction.
+ */
+async function toolSave(deps: McpServerDeps, args: Record<string, unknown> | undefined) {
+  if (!(await daemonAnswering(deps))) return degraded("daemon-down")
+  const reply = await callDaemon(
+    deps.home,
+    "/save",
+    { agent: deps.agent, cwd: deps.project, fields: args ?? {} },
+    { timeoutMs: SAVE_TIMEOUT_MS },
+  )
+  if (reply.status === 0) return degraded("daemon-down")
+  const body = reply.body as { kind?: unknown; text?: unknown } | null
+  if ((body?.kind !== "saved" && body?.kind !== "refused") || typeof body.text !== "string") return degraded("bad-reply")
+  return toolText(body.text)
+}
+
+/**
  * Builds the MCP server. The caller wires the transport — stdio in `mida-mcp`, an in-memory pair
  * in tests. `daemonUp` is decided once at start: when the daemon could not come up, the server
  * still answers so the client sees a working MCP endpoint whose tools all say the same degraded
@@ -405,7 +487,7 @@ export function createMidaMcpServer(deps: McpServerDeps): Server {
     {
       capabilities: { tools: {} },
       instructions:
-        "Mida read-only adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status — and that is all: there are deliberately no write tools here (no save, no remember, no approve, no revoke), because a model must not be able to write context through MCP without the owner having decided that.",
+        "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status, and it can save a checkpoint with mida_save — the daemon validates, gates, scrubs and signs that write. Owner operations stay deliberately absent: there is no approve, revoke, request or remember here, because a model must never be able to change who has access through MCP.",
     },
   )
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [...MCP_TOOLS] }))
@@ -420,6 +502,8 @@ export function createMidaMcpServer(deps: McpServerDeps): Server {
         return toolRead(deps, args)
       case "mida_status":
         return toolStatus(deps)
+      case "mida_save":
+        return toolSave(deps, args)
       default:
         throw new McpError(ErrorCode.InvalidParams, `unknown tool: ${request.params.name}`)
     }

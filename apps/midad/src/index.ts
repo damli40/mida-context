@@ -67,6 +67,8 @@ export {
 export type { ApprovePasskeyResult, PasskeyDeps, RevokePasskeyResult } from "./owner-link/flows.js"
 export { buildHandoff, noContextText } from "./handoff.js"
 export type { CapabilityState, HandoffDeps, HandoffResult } from "./handoff.js"
+export { buildMcpSave, mcpSaveSessionId } from "./mcp-save.js"
+export type { McpSaveDeps, McpSaveResult } from "./mcp-save.js"
 export { CheckpointCopies, WHATS_NEW_HEADER, buildWhatsNew, readSeen, writeSeen } from "./whatsnew.js"
 export type { WhatsNewDeps, WhatsNewResult } from "./whatsnew.js"
 export { agoText, degradedMessage, hookReply, sessionStartMessage, systemMessage, whatsNewMessage } from "./hook-output.js"

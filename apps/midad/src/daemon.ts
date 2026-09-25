@@ -12,6 +12,8 @@ import { buildHandoff } from "./handoff.js"
 import type { HandoffDeps } from "./handoff.js"
 import { CheckpointCopies, buildWhatsNew } from "./whatsnew.js"
 import type { WhatsNewDeps } from "./whatsnew.js"
+import { buildMcpSave } from "./mcp-save.js"
+import type { McpSaveDeps } from "./mcp-save.js"
 import { pendingAnchors } from "./batching.js"
 import { FLUSH_EVENTS } from "./hook.js"
 import type { MidaHome } from "./home.js"
@@ -59,6 +61,8 @@ export interface DaemonDeps {
   handoffDeps?: Partial<HandoffDeps>
   /** Gate and read overrides for /whatsnew — same role as handoffDeps for the prompt hook. */
   whatsnewDeps?: Partial<WhatsNewDeps>
+  /** Gate and save overrides for /save (mida_save) — same role as handoffDeps. */
+  mcpSaveDeps?: Partial<McpSaveDeps>
   /** The code identity /health reports; default codeIdentity() — tests inject a foreign one. */
   identity?: CodeIdentity
   /** The fallback socket folder's parent (default tmpdir()); tests inject a private temp dir. */
@@ -149,6 +153,10 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   // daemon memory. The handoff's read and every drain save seed it, so the first prompt of a
   // session is already warm; a stale or absent copy refreshes behind the prompt's back.
   const copies = new CheckpointCopies(() => deps.now())
+
+  // POST /save's rate map: the last admitted save time per identity+project, for the life of this
+  // daemon — a restart resets it, but the chain-side gates and the save id's dedup still apply
+  const lastMcpSaves = new Map<string, number>()
 
   const startedAt = new Date(deps.now()).toISOString()
   let stopped = false
@@ -380,6 +388,47 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         kind: result.kind,
         reason: result.kind === "refused" ? result.reason : null,
         updates: result.kind === "updates" ? result.updates.length : 0,
+        ms: deps.now() - started,
+      })
+      respond(res, 200, result)
+      return
+    }
+    // mida-mcp's one write: the model's checkpoint fields through the same gates and save path the
+    // drain uses — identity, folder approval, CREATE grant and revocation are decided here, never
+    // in the adapter, which holds no keys. Owner operations stay unreachable: there is no route for
+    // them and the service runtime could not sign them anyway.
+    if (req.url === "/save") {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(body.toString("utf8"))
+      } catch {
+        parsed = undefined
+      }
+      const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
+      const started = deps.now()
+      const result = await buildMcpSave(runtime, record, { lastSaves: lastMcpSaves, now: deps.now, ...deps.mcpSaveDeps })
+      if (result.kind === "saved") {
+        // the new checkpoint enters the same copy the drain's saves seed — another session's
+        // whats-new sees it without a new chain read
+        copies.noteSaved(typeof record.agent === "string" ? record.agent : "", {
+          checkpoint: result.checkpoint,
+          projectId: result.projectId,
+          sessionId: result.sessionId,
+          continuesSession: null,
+          compiledBy: typeof record.agent === "string" ? record.agent : "",
+          contextId: result.contextId,
+          authorId:
+            typeof record.agent === "string" ? (loadAgentIdentity(home, record.agent)?.agentId ?? record.agent) : "",
+          namespaceId: NAMESPACE_ID,
+          anchor: result.lane === "batched" || pendingAnchors(home).some((entry) => entry.contextId === result.contextId) ? "PENDING_ANCHOR" : "ANCHORED",
+        })
+      }
+      deps.log({
+        event: "mcp-save",
+        agent: isSafeName(record.agent) ? record.agent : null,
+        kind: result.kind,
+        reason: result.kind === "refused" ? result.reason : null,
+        duplicate: result.kind === "saved" ? result.duplicate : null,
         ms: deps.now() - started,
       })
       respond(res, 200, result)
