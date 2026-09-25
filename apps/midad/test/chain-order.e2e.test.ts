@@ -339,4 +339,87 @@ describe("chain order decides 'current', never the checkpoint's claimed clock (i
     },
     STEP_TIMEOUT,
   )
+
+  it(
+    "a migration envelope can only age its record — a forged 2099 never wins, a moved save keeps its past (in-2 I0)",
+    async () => {
+      const { runtime } = await newHome()
+      try {
+        const workDir = join(mkdtempSync(join(tmpdir(), "mida-order-work-")), "work")
+        mark(workDir, "proj-order-envelope")
+        for (const name of AGENTS) await approve(runtime, name, workDir)
+
+        const migration = (originalCreatedAt: string) => ({
+          version: 1 as const,
+          originalChainId: "31337",
+          originalContract: `0x${"1".repeat(40)}` as `0x${string}`,
+          originalRecordId: `0x${"2".repeat(64)}` as `0x${string}`,
+          originalCommitment: `0x${"3".repeat(64)}` as `0x${string}`,
+          originalAuthor: `0x${"4".repeat(64)}` as `0x${string}`,
+          originalCreatedAt,
+          migratedAt: new Date().toISOString(),
+        })
+
+        // The envelope is validated for shape only — its dates are claims inside the encrypted
+        // payload, and an agent can write one into its own save. Ordering caps the claim at the
+        // time Monad actually recorded for the record: older is allowed, newer is not. Three
+        // saves share one session: (1) a save claiming a 2099 original — the chain placed it
+        // FIRST, so capping it can never crown it; (2) the honest newest save; (3) a save whose
+        // envelope honestly reports a 2023 original — Monad stamped it last, but its real place
+        // is far behind the others.
+        const forged = await saveCheckpoint(runtime, "claude-code", {
+          ...envelope("proj-order-envelope", sampleCheckpoint({
+            eventId: "cp-env-01",
+            agent: "claude-code",
+            createdAt: new Date().toISOString(),
+            objective: "OBJECTIVE-FORGED-ENVELOPE",
+          }), "s-envelope"),
+          migration: migration("2099-01-01T00:00:00.000Z"),
+        })
+        expect(forged.lane).toBe("direct")
+
+        const latest = await saveCheckpoint(runtime, "codex", envelope("proj-order-envelope", sampleCheckpoint({
+          eventId: "cp-env-02",
+          agent: "codex",
+          createdAt: new Date().toISOString(),
+          objective: "OBJECTIVE-HONEST-LATEST",
+        }), "s-envelope"))
+        expect(latest.lane).toBe("direct")
+
+        const moved = await saveCheckpoint(runtime, "claude-code", {
+          ...envelope("proj-order-envelope", sampleCheckpoint({
+            eventId: "cp-env-03",
+            agent: "claude-code",
+            createdAt: new Date().toISOString(),
+            objective: "OBJECTIVE-MOVED-OLDER",
+          }), "s-envelope"),
+          migration: migration("2023-10-01T00:00:00.000Z"),
+        })
+        expect(moved.lane).toBe("direct")
+
+        // the envelopes reached the stored records — the reads carry them
+        const read = await readCheckpoints(runtime, "codex", "proj-order-envelope")
+        const forgedCp = read.checkpoints.find((cp) => cp.contextId === forged.contextId)
+        expect(forgedCp?.migration?.originalCreatedAt).toBe("2099-01-01T00:00:00.000Z")
+        const movedCp = read.checkpoints.find((cp) => cp.contextId === moved.contextId)
+        expect(movedCp?.migration?.originalCreatedAt).toBe("2023-10-01T00:00:00.000Z")
+        // and the list itself orders on the effective instant: the 2023 original sorts first,
+        // the chain's replay order forged→honest follows
+        const honestCp = read.checkpoints.find((cp) => cp.contextId === latest.contextId)
+        expect([movedCp, forgedCp, honestCp].map((cp) => read.checkpoints.indexOf(cp!))).toEqual([0, 1, 2])
+
+        const handoff = await buildHandoff(runtime, { agent: "codex", cwd: workDir, authorNames: {}, sessionId: "s-fresh" })
+        expect(handoff.kind).toBe("handoff")
+        if (handoff.kind !== "handoff") return
+        expect(objectiveLine(handoff.text)).toBe("OBJECTIVE-HONEST-LATEST")
+        expect(handoff.text).not.toContain("Objective: OBJECTIVE-FORGED-ENVELOPE")
+        expect(handoff.text).not.toContain("Objective: OBJECTIVE-MOVED-OLDER")
+        // the reported save time is Monad's stamp too — never the envelope's claimed 2099
+        expect(handoff.savedAt).not.toContain("2099")
+      } finally {
+        await runtime.close()
+      }
+    },
+    STEP_TIMEOUT,
+  )
 })

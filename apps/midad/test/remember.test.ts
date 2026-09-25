@@ -258,8 +258,10 @@ describe("migrated facts in the fact list (migrate B2)", () => {
 
   it("orders by the envelope's originalCreatedAt, not the replay's fresh chain stamp (migrate B7b)", async () => {
     // The target stamps chain createdAt at replay — whole seconds, several records a second —
-    // so it cannot order moved facts. Here the chain times even INVERT the order: the older
-    // fact carries the later stamp. Only the envelope still names which was written first.
+    // so it cannot order moved facts. Here the chain times postdate both envelopes (honest:
+    // the replay happens after the original writes) yet INVERT the order — the older fact
+    // carries the later stamp. Only the envelope still names which was written first. The cap
+    // is what keeps this honest: an envelope may only pull its record older, never newer.
     const older = factObject("written first", `0x${"aa".repeat(32)}` as Hex, {
       ...MIGRATION,
       originalCreatedAt: "2026-09-18T10:00:00.000Z",
@@ -269,8 +271,8 @@ describe("migrated facts in the fact list (migrate B2)", () => {
       originalCreatedAt: "2026-09-19T10:00:00.000Z",
     })
     const chainTime = new Map<string, bigint>([
-      [older.contextId, 1_758_000_200n],
-      [newer.contextId, 1_758_000_100n],
+      [older.contextId, 1_790_000_100n],
+      [newer.contextId, 1_790_000_000n],
     ])
     const runtime = {
       home: new MidaHome(mkdtempSync(join(tmpdir(), "mida-migfact-"))),

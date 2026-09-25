@@ -323,9 +323,11 @@ export async function buildWhatsNew(
     const checkpoints = entry?.checkpoints ?? []
     // Per foreign author: the newest checkpoint the session has NOT seen is the line; the
     // newest one it HAS seen is the baseline the artifact diff is measured against. "Newest" is
-    // Monad's placement — the record's chain time, then its position in the chain's order — never
-    // the writer's own createdAt claim; a record with neither can neither lead a line nor serve
-    // as a baseline, but it still lands in the covered set so it is never offered either.
+    // the record's effective instant — Monad's stamp, a moved record lowered toward its
+    // envelope's originalCreatedAt — then its position in the chain's order; never the writer's
+    // own createdAt claim on a chain-placed record. A record with neither can neither lead a
+    // line nor serve as a baseline, but it still lands in the covered set so it is never
+    // offered either.
     const perAuthor = new Map<string, { newest?: StoredCheckpoint; baseline?: StoredCheckpoint }>()
     const foreignIds: { id: string; at: number }[] = []
     for (const cp of checkpoints) {

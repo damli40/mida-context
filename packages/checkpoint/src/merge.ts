@@ -43,7 +43,11 @@ export interface StoredCheckpoint {
    * never orders anything: every comparison in this file runs on this field when it exists.
    */
   chain?: { at: bigint; block?: bigint; index?: number }
-  /** Set only on records `mida migrate` moved here — the sealed envelope carried beside the checkpoint. */
+  /**
+   * Set only on records `mida migrate` moved here — the sealed envelope carried beside the
+   * checkpoint. It is encrypted content the writer controls, so `orderTime` trusts it only
+   * downward: a forged originalCreatedAt can age its own record, never make it newer.
+   */
   migration?: MigrationEnvelope
 }
 
@@ -80,19 +84,29 @@ export interface MergedHandoff {
  * The instant a checkpoint is ordered by, in milliseconds: Monad's stamp whenever the record
  * carries its chain placement — the checkpoint's own createdAt claim only when the chain never
  * placed it (pending saves never reach the merge at all; this is for hand-built records).
+ * A record `mida migrate` moved sorts by min(its envelope's originalCreatedAt, that stamp):
+ * the envelope is writer-controlled encrypted content, so it may only AGE the record it rides
+ * on — a claim dated past the chain stamp collapses back to the stamp, and a forged "newer"
+ * original can never win an ordering. A genuinely older moved record keeps its real place.
  */
-export const orderTime = (s: StoredCheckpoint): number =>
-  s.chain === undefined ? Date.parse(s.checkpoint.createdAt) : Number(s.chain.at) * 1000
+export const orderTime = (s: StoredCheckpoint): number => {
+  const at = s.chain === undefined ? Date.parse(s.checkpoint.createdAt) : Number(s.chain.at) * 1000
+  if (s.migration === undefined) return at
+  const original = Date.parse(s.migration.originalCreatedAt)
+  return Number.isNaN(original) ? at : Math.min(original, at)
+}
 
 /** The ISO stamp a record is reported with — Monad's when carried, else the writer's claim. */
 export const recordedAt = (s: StoredCheckpoint): string =>
   s.chain === undefined ? s.checkpoint.createdAt : new Date(Number(s.chain.at) * 1000).toISOString()
 
 /**
- * The order Monad wrote the saves in: chain stamp, then block, then log index — the contextId
- * only ever breaks a tie between records that carry none of those. A record the chain placed
- * sorts after an unplaced one at the same instant (absent fields order first); a pending save
- * never enters this comparison — the handoff keeps it out of the merge entirely.
+ * The order Monad wrote the saves in: each record's effective instant (its chain stamp, moved
+ * records lowered toward their migration envelope's originalCreatedAt — see `orderTime`), then
+ * block, then log index — the contextId only ever breaks a tie between records that carry none
+ * of those. A record the chain placed sorts after an unplaced one at the same instant (absent
+ * fields order first); a pending save never enters this comparison — the handoff keeps it out
+ * of the merge entirely.
  */
 export const compareChainOrder = (a: StoredCheckpoint, b: StoredCheckpoint): number => {
   const time = orderTime(a) - orderTime(b)

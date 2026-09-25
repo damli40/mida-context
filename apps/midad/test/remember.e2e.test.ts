@@ -292,4 +292,45 @@ describe("mida remember on local Anvil", () => {
     const numbered = facts.filter((f) => /^numbered fact \d+$/.test(f.text))
     expect(numbered.length).toBeGreaterThanOrEqual(20 - already)
   }, STEP_TIMEOUT)
+
+  it("a fact carrying a forged migration envelope dated 2099 sorts no newer than its chain stamp (in-2 I0)", async () => {
+    // The envelope is validated for shape only — its dates are claims inside the encrypted
+    // payload. Ordering caps the claim at the record's own chain createdAt, so a forged envelope
+    // can make a fact look older than it is, never newer.
+    await runtime.vault.createOwnerContext({
+      namespace: SKILLS,
+      payload: {
+        v: 1,
+        value: {
+          text: "a forged-migration fact claiming 2099",
+          assertedAt: "2020-01-01T00:00:00.000Z",
+          migration: {
+            version: 1,
+            originalChainId: "31337",
+            originalContract: `0x${"1".repeat(40)}`,
+            originalRecordId: `0x${"2".repeat(64)}`,
+            originalCommitment: `0x${"3".repeat(64)}`,
+            originalAuthor: `0x${"4".repeat(64)}`,
+            originalCreatedAt: "2099-01-01T00:00:00.000Z",
+            migratedAt: new Date().toISOString(),
+          },
+        },
+        kind: "FACT",
+        provenance: { source: "USER_ASSERTED" },
+        tags: ["mida-fact"],
+      },
+    })
+    await increaseLocalTime(env.rpcUrl, 2n)
+    expect((await remember(runtime, "an honest fact written after the forgery", { namespace: SKILLS })).kind).toBe("remembered")
+
+    const facts = await readOwnerFacts(runtime, "codex")
+    const forged = facts.findIndex((f) => f.text.includes("forged-migration fact"))
+    const honest = facts.findIndex((f) => f.text === "an honest fact written after the forgery")
+    expect(forged, "the forged fact never reached the reader").toBeGreaterThanOrEqual(0)
+    expect(honest, "the honest fact never reached the reader").toBeGreaterThanOrEqual(0)
+    // newest-first: the honest fact must list ABOVE the record claiming 2099
+    expect(honest).toBeLessThan(forged)
+    // the envelope still renders its moved-on marker — only the ordering claim is capped
+    expect(facts[forged]!.text).toContain("(moved on ")
+  }, STEP_TIMEOUT)
 })

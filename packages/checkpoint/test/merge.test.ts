@@ -230,6 +230,99 @@ describe("mergeCheckpoints", () => {
     expect(same.provenance.map((row) => row.contextId)).toEqual([first.contextId, second.contextId])
   })
 
+  it("a migration envelope dated 2099 cannot make its save the session's newest (I0)", () => {
+    // The envelope is encrypted content the saver controls — the same untrusted channel as
+    // checkpoint.createdAt. A save replayed at Monad's time S may CLAIM its original record is
+    // far newer; the ordering stamp is min(claim, S), so a forged envelope can only age the
+    // save that carries it — the chain-later save stays the session's newest.
+    const forged = stored({
+      sessionId: "s-1", at: "2026-09-21T10:00:00.000Z", objective: "forged-envelope save", progress: ["p"],
+      chain: { at: 1_700_000_000n, block: 5n, index: 0 },
+    })
+    forged.migration = {
+      version: 1,
+      originalChainId: "31337",
+      originalContract: `0x${"1".repeat(40)}`,
+      originalRecordId: `0x${"2".repeat(64)}`,
+      originalCommitment: `0x${"3".repeat(64)}`,
+      originalAuthor: `0x${"4".repeat(64)}`,
+      originalCreatedAt: "2099-01-01T00:00:00.000Z",
+      migratedAt: "2026-09-21T12:00:00.000Z",
+    }
+    const honest = stored({
+      sessionId: "s-1", at: "2026-09-21T11:00:00.000Z", objective: "chain-latest save", progress: ["p"],
+      chain: { at: 1_700_000_100n, block: 9n, index: 0 },
+    })
+    const m = mergeCheckpoints([forged, honest])!
+    expect(m.objective).toBe("chain-latest save")
+    // provenance keeps the chain's own order: the forged save is the earlier record
+    expect(m.provenance.map((p) => p.contextId)).toEqual([forged.contextId, honest.contextId])
+  })
+
+  it("a moved save whose original predates its replay keeps its original position (I0)", () => {
+    // The honest direction of the same rule: the replay mined AFTER an unrelated newer save,
+    // but the record itself is older — its ordering stamp is the original time, not the replay's.
+    const moved = stored({
+      sessionId: "s-moved", at: "2026-09-21T12:00:00.000Z", objective: "moved older record", progress: ["p"],
+      chain: { at: 1_700_000_200n, block: 9n, index: 0 },
+    })
+    moved.migration = {
+      version: 1,
+      originalChainId: "31337",
+      originalContract: `0x${"1".repeat(40)}`,
+      originalRecordId: `0x${"2".repeat(64)}`,
+      originalCommitment: `0x${"3".repeat(64)}`,
+      originalAuthor: `0x${"4".repeat(64)}`,
+      originalCreatedAt: "2023-10-01T00:00:00.000Z", // the record's real age — long before its replay
+      migratedAt: "2023-11-14T22:13:20.000Z",
+    }
+    const honest = stored({
+      sessionId: "s-honest", at: "2026-09-21T11:00:00.000Z", objective: "honest later save", progress: ["p"],
+      chain: { at: 1_700_000_100n, block: 7n, index: 0 },
+    })
+    // The replay landed AFTER the honest save on chain — chain time alone would crown the move.
+    expect(moved.chain!.at > honest.chain!.at).toBe(true)
+    const m = mergeCheckpoints([moved, honest])!
+    expect(m.objective).toBe("honest later save")
+    expect(m.otherSessions[0]).toMatchObject({ sessionId: "s-moved" })
+  })
+
+  it("moved records replayed in the same chain second keep their original order (I0)", () => {
+    // Two moved records, one replay second and block: original order survives, whether it is
+    // carried by the envelopes or by the chain's own (block, index) replay placement.
+    const older = stored({
+      sessionId: "s-first-written", at: "2026-09-21T10:00:00.000Z", objective: "originally-older save", progress: ["p"],
+      chain: { at: 1_700_000_000n, block: 5n, index: 0 },
+    })
+    older.migration = {
+      version: 1,
+      originalChainId: "31337",
+      originalContract: `0x${"1".repeat(40)}`,
+      originalRecordId: `0x${"2".repeat(64)}`,
+      originalCommitment: `0x${"3".repeat(64)}`,
+      originalAuthor: `0x${"4".repeat(64)}`,
+      originalCreatedAt: "2023-10-01T00:00:00.000Z",
+      migratedAt: "2023-11-14T22:13:20.000Z",
+    }
+    const newer = stored({
+      sessionId: "s-second-written", at: "2026-09-21T10:30:00.000Z", objective: "originally-newer save", progress: ["p"],
+      chain: { at: 1_700_000_000n, block: 5n, index: 1 },
+    })
+    newer.migration = {
+      version: 1,
+      originalChainId: "31337",
+      originalContract: `0x${"1".repeat(40)}`,
+      originalRecordId: `0x${"5".repeat(64)}`,
+      originalCommitment: `0x${"6".repeat(64)}`,
+      originalAuthor: `0x${"4".repeat(64)}`,
+      originalCreatedAt: "2023-10-02T00:00:00.000Z",
+      migratedAt: "2023-11-14T22:13:20.000Z",
+    }
+    const m = mergeCheckpoints([older, newer])!
+    expect(m.objective).toBe("originally-newer save")
+    expect(m.otherSessions[0]).toMatchObject({ sessionId: "s-first-written" })
+  })
+
   it("same-second saves in different blocks order by block number", () => {
     const block5 = stored({ sessionId: "s-5", at: "2026-09-21T10:00:00.000Z", objective: "block-5 save", progress: ["p"], chain: { at: 1_700_000_000n, block: 5n, index: 0 } })
     block5.contextId = `0x${"1".repeat(64)}`

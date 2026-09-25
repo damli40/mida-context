@@ -166,13 +166,16 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string): Pro
       if (record.provenanceSource !== PROVENANCE_SOURCE.USER_ASSERTED) continue
       const text = factText(object.payload.value)
       if (text === null) continue
-      // The ordering instant in milliseconds: the envelope's originalCreatedAt when the record
-      // moved (readEnvelope checks both slots — inside an object value, beside a string one),
-      // else the chain's createdAt in whole seconds.
+      // The ordering instant in milliseconds: the chain's createdAt in whole seconds, lowered
+      // toward the envelope's originalCreatedAt when the record moved (readEnvelope checks both
+      // slots — inside an object value, beside a string one). The envelope is sealed inside the
+      // encrypted payload — a claim the record's owner could write — so it may only AGE the
+      // fact: min(claim, chain stamp). A forged originalCreatedAt in the future collapses to
+      // the chain stamp and can never make its record newer than Monad placed it (in-2 I0).
       let statedAt = Number(record.createdAt) * 1000
       try {
         const moved = readEnvelope(object.payload)
-        if (moved !== undefined) statedAt = Date.parse(moved.originalCreatedAt)
+        if (moved !== undefined) statedAt = Math.min(Date.parse(moved.originalCreatedAt), statedAt)
       } catch {
         // a contradictory envelope — carried in both slots — sorts by chain time, never fatal
       }

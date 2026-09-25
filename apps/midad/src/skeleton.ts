@@ -763,6 +763,7 @@ export async function readCheckpoints(
 
   const deployment = runtime.network?.deployment
   const batchAnchor = deployment?.batchAnchor
+  let mergedBatched = false
   if (batchAnchor !== undefined && deployment !== undefined) {
     // The batch table exists only where the store serves it for THIS anchor: the status probe is
     // what decideLane itself asks. But a store that answers nothing — a local store, a pre-batch
@@ -814,12 +815,7 @@ export async function readCheckpoints(
         const directCount = checkpoints.length
         for (const object of batched.anchored) collect(object, "ANCHORED")
         for (const item of batched.pending) collect(item, "PENDING_ANCHOR")
-        // Batched items merged: sort the list on the order mergeCheckpoints uses — Monad's
-        // placement, contextId only at the bottom. Untouched when the batched side added
-        // nothing, so a deployment without reachable batched saves keeps the store's own order.
-        if (checkpoints.length > directCount) {
-          checkpoints.sort(compareChainOrder)
-        }
+        mergedBatched = checkpoints.length > directCount
       }
     } else {
       // No batch surface for this anchor on this store — ask the chain whether there is a table
@@ -836,6 +832,16 @@ export async function readCheckpoints(
         partial = true
       }
     }
+  }
+  // Sort on the order mergeCheckpoints uses — each record's effective instant (its chain stamp,
+  // moved records lowered toward their envelope's originalCreatedAt), then Monad's placement,
+  // contextId only at the bottom. Batched items merging is the common trigger, but a read that
+  // carries a migration envelope needs the same sort without it: a moved universe's records
+  // were all stamped at replay, so the store's own order cannot keep their real places — and
+  // that holds whether the store offers no batch surface at all or its batch read failed.
+  // A plain deployment keeps the store's order untouched.
+  if (mergedBatched || checkpoints.some((cp) => cp.migration !== undefined)) {
+    checkpoints.sort(compareChainOrder)
   }
   return { checkpoints, skipped, milliseconds: Date.now() - started, partial }
 }
