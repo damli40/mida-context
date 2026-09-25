@@ -101,10 +101,24 @@ machine may show the old state until its next chain check).
   `EventHandlers.ts:453-498`).
 - The GraphQL endpoint must allow the `app.midacontext.xyz` origin (CORS).
 
-### 6.3 Hosting the index
-Envio Cloud after the Sep 30 public push (`apps/indexer/README.md`). **Unverified:** that Envio Cloud /
-HyperSync serves Monad **testnet** (their examples use mainnet 143). Check this first — if it does not,
-the fallback column of §3 is what the page shows, and the Envio bounty needs another plan (§9).
+### 6.3 Hosting the index (researched Sep 25; sources in the session log)
+- **Monad testnet is supported.** Envio's chain page: "Chain ID: 10143 … HyperSync Endpoint:
+  https://monad-testnet.hypersync.xyz … Support Level: First-class support across HyperIndex, HyperSync,
+  and HyperRPC" (docs.envio.dev/docs/HyperIndex/monad-testnet → envio.dev/chains/monad-testnet), with a
+  "Deploy … on Envio Cloud" button.
+- **Envio Cloud free "Development" plan:** 30-day maximum life, deleted after 7 days with no queries,
+  soft limits 100,000 events / 5 GB (docs.envio.dev hosted-service-billing). ⇒ deploy no earlier than
+  **Sep 28** so it lives through judging (Oct 14–27), and query it at least weekly. Re-deploy before
+  day 30 if judging runs late.
+- **Deploy:** GitHub App, push-to-deploy from a chosen branch (docs.envio.dev hosted-service-deployment).
+  Endpoint: `https://indexer.dev.hyperindex.xyz/<deployment-id>/v1/graphql`; no API key to query.
+- **Unverified, test on the first deploy:** (1) our versions — `envio 3.11.0`, `pnpm 12.4.1`, Node 25 —
+  against the docs' stated requirements (HyperIndex ≥2.21.5, "2.29.x unsupported", pnpm 10.32.0,
+  Node ≥24; v3 is not mentioned either way); (2) **CORS** — Envio does not document it; Hasura's
+  default allows all origins, and Envio's opt-in IP/domain whitelist is a separate mechanism. Check the
+  `Access-Control-Allow-Origin` header from `app.midacontext.xyz` before building the page against it.
+- **Fallback if Envio Cloud fails:** self-host (Envio's Docker Compose example: Postgres + Hasura; a
+  HyperSync API token is required when self-hosting) — more work, but CORS is then ours to set.
 
 ## 7. Tests (each fails first)
 - Worker: `/me` route + CSP string includes exactly the one new origin.
@@ -124,7 +138,7 @@ Approve from `/me` (still the terminal's link flow); editing or deleting records
 (the contract is).
 
 ## 9. Not proven yet / risks
-- **Envio Cloud on Monad testnet** — unverified; decides whether the bounty stands (§6.3).
+- **Envio Cloud on Monad testnet** — the chain is supported (§6.3); our tool versions and CORS are not yet proven — a test deploy decides.
 - **Store list completeness** — the store lists what it holds; a record whose upload never reached the
   store (the Sep 24 "177 never-anchored uploads" class) cannot appear. The page says "records held by
   the store", not "all your records".
