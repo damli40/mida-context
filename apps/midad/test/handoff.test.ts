@@ -31,6 +31,18 @@ home.writeSecretJson("agents/codex/identity.json", {
   manifest: {},
   manifestHash: `0x${"5".repeat(64)}`,
 })
+// a general-assistance identity, registered but never approvable for a project folder (I2)
+home.writeSecretJson("agents/assistant/identity.json", {
+  name: "assistant",
+  agentId: `0x${"6".repeat(64)}`,
+  signerPrivateKey: `0x${"7".repeat(64)}`,
+  encryptionPrivateKey: `0x${"8".repeat(64)}`,
+  encryptionPublicKey: `0x${"9".repeat(64)}`,
+  callbackOrigin: "https://agent.test",
+  purposeId: "general_assistance",
+  manifest: {},
+  manifestHash: `0x${"a".repeat(64)}`,
+})
 const runtime = { home } as unknown as Runtime
 
 const OK: ProjectCheck = {
@@ -99,6 +111,27 @@ describe("buildHandoff", () => {
       kind: "refused",
       reason: "not-approved",
       text: "Mida: codex is not approved for this project — run `mida approve codex` in this folder.",
+    })
+  })
+
+  it("a general-assistance identity gets the install-a-client line — never 'run mida approve' (I2)", async () => {
+    const { calls, d } = deps({ checkProject: async () => ({ ok: false, reason: "not-approved" }) })
+    const result = await buildHandoff(runtime, { ...input, agent: "assistant" }, d)
+    expect(result).toEqual({
+      kind: "refused",
+      reason: "general-assistance",
+      text: "Mida: assistant is a general assistant and cannot read project context — run `mida install <client>`.",
+    })
+    expect(calls).toEqual({ checkProject: 1, capability: 0, read: 0, readFacts: 0 })
+  })
+
+  it("a revoked marker on a general-assistance identity still answers revoked — the owner said why", async () => {
+    const { d } = deps({ checkProject: async () => ({ ok: false, reason: "not-approved" }), isRevoked: () => true })
+    const result = await buildHandoff(runtime, { ...input, agent: "assistant" }, d)
+    expect(result).toEqual({
+      kind: "refused",
+      reason: "revoked",
+      text: "Mida: assistant's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
     })
   })
 

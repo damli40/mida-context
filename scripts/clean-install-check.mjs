@@ -104,17 +104,29 @@ check(
   mcpBad.status === 2 && (mcpBad.stderr ?? "").includes("usage: mida-mcp") && (mcpBad.stdout ?? "") === "",
   "mida-mcp --bogus exits 2 with the usage on stderr and a clean stdout",
 )
-const mcpEmpty = run(["npx", "--no-install", "mida-mcp", "--as", "assistant"], { cwd: project, env, input: "", timeout: 10_000 })
+// --as is required, and `assistant` is never a valid client identity — each client carries its
+// own (mida install <client> provisions it), so both launch forms refuse before any daemon work
+const mcpNoAs = run(["npx", "--no-install", "mida-mcp"], { cwd: project, env, input: "", timeout: 10_000 })
 check(
-  mcpEmpty.status === 2 && (mcpEmpty.stderr ?? "").includes('no agent "assistant" is set up') && (mcpEmpty.stdout ?? "") === "",
+  mcpNoAs.status === 2 && (mcpNoAs.stderr ?? "").includes("--as") && (mcpNoAs.stdout ?? "") === "",
+  "mida-mcp without --as refuses at startup, on stderr",
+)
+const mcpAssistant = run(["npx", "--no-install", "mida-mcp", "--as", "assistant"], { cwd: project, env, input: "", timeout: 10_000 })
+check(
+  mcpAssistant.status === 2 && (mcpAssistant.stderr ?? "").includes("general assistant") && (mcpAssistant.stdout ?? "") === "",
+  "mida-mcp --as assistant refuses — a general assistant never reads project context",
+)
+const mcpEmpty = run(["npx", "--no-install", "mida-mcp", "--as", "testclient"], { cwd: project, env, input: "", timeout: 10_000 })
+check(
+  mcpEmpty.status === 2 && (mcpEmpty.stderr ?? "").includes('no agent "testclient" is set up') && (mcpEmpty.stdout ?? "") === "",
   "mida-mcp on an empty home refuses at startup, naming the missing identity, on stderr",
 )
-mkdirSync(join(env.MIDA_HOME, "agents", "assistant"), { recursive: true })
-writeFileSync(join(env.MIDA_HOME, "agents", "assistant", "identity.json"), "{}")
+mkdirSync(join(env.MIDA_HOME, "agents", "testclient"), { recursive: true })
+writeFileSync(join(env.MIDA_HOME, "agents", "testclient", "identity.json"), "{}")
 const mcpProject = join(work, "mida-project")
 mkdirSync(join(mcpProject, ".mida"), { recursive: true })
 writeFileSync(join(mcpProject, ".mida", "project.json"), JSON.stringify({ projectId: "p1" }))
-const mcp = run(["npx", "--no-install", "mida-mcp", "--as", "assistant", "--project", mcpProject], { cwd: project, env, input: "", timeout: 10_000 })
+const mcp = run(["npx", "--no-install", "mida-mcp", "--as", "testclient", "--project", mcpProject], { cwd: project, env, input: "", timeout: 10_000 })
 check(mcp.status === 0 && !mcp.error, "mida-mcp starts with a registered identity and a marked project, and exits when the client closes stdio")
 
 // ---------- 4. SDK consumer: runs under node, type-checks with tsc ----------

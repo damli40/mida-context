@@ -63,11 +63,11 @@ async function main(): Promise<void> {
     return
   }
   // one session id per server instance — the whats-new seen set lives under it for this process's life
-  const sessionId = `mcp-${parsed.args.agent}-${randomBytes(4).toString("hex")}`
+  const sessionId = `mcp-${gate.agent}-${randomBytes(4).toString("hex")}`
   const up = home.has("network.json") && (await ensureDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS }))
   const server = createMidaMcpServer({
     home,
-    agent: parsed.args.agent,
+    agent: gate.agent,
     project: parsed.args.project,
     sessionId,
     daemonUp: up,

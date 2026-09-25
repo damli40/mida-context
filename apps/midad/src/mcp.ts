@@ -47,10 +47,11 @@ const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${text
 const toolText = (text: string) => ({ content: [{ type: "text" as const, text: capText(text) }] })
 const degraded = (reason: string) => toolText(degradedMessage(reason))
 
-export const MCP_USAGE = "usage: mida-mcp [--as <agent>] [--project <dir>]   (agent defaults to assistant)"
+export const MCP_USAGE = "usage: mida-mcp --as <client> [--project <dir>]   (--as is required — each client carries its own identity)"
 
 export interface McpArgs {
-  agent: string
+  /** Undefined when the launch named no identity — the startup check turns that into a refusal. */
+  agent: string | undefined
   /** Absolute path — the project folder; reported to the daemon as cwd. */
   project: string
   /** False when the folder came from the launch cwd. */
@@ -58,9 +59,11 @@ export interface McpArgs {
 }
 
 /**
- * The launch contract: `--as <agent>` (default `assistant`) and `--project <dir>` (default the
- * process cwd) are the only flags — anything else, or a flag without its value, is refused. The
- * refusal is a plain line for stderr; the process's stdout carries JSON-RPC and stays clean.
+ * The launch contract: `--as <client>` and `--project <dir>` (default the process cwd) are the
+ * only flags — anything else, or a flag without its value, is refused. `--as` may stay absent
+ * here so the refusal can name this home's known identities; the startup check is what rejects
+ * it — a client that does not name its identity would silently share `assistant`.
+ * The refusal is a plain line for stderr; the process's stdout carries JSON-RPC and stays clean.
  */
 export function parseMcpArgs(argv: string[]): { ok: true; args: McpArgs } | { ok: false; error: string } {
   let agent: string | undefined
@@ -84,9 +87,8 @@ export function parseMcpArgs(argv: string[]): { ok: true; args: McpArgs } | { ok
       return { ok: false, error: `unknown flag: ${flag}` }
     }
   }
-  const name = agent ?? "assistant"
-  if (!AGENT_NAME.test(name)) return { ok: false, error: `bad agent name "${name}" — lower-case letters, digits and "-" only` }
-  return { ok: true, args: { agent: name, project: resolve(project ?? process.cwd()), projectGiven: project !== undefined } }
+  if (agent !== undefined && !AGENT_NAME.test(agent)) return { ok: false, error: `bad agent name "${agent}" — lower-case letters, digits and "-" only` }
+  return { ok: true, args: { agent, project: resolve(project ?? process.cwd()), projectGiven: project !== undefined } }
 }
 
 /** "yes", "no", or "blocked" — a refused read is not a missing file. */
@@ -110,19 +112,39 @@ const blockedLine = (path: string) =>
  * the common failure; naming which one beats every tool answering "not approved". The identity
  * file is checked for existence only: this module never reads key material (import-graph test).
  */
-export function startupCheck(home: MidaHome, args: McpArgs): { ok: true } | { ok: false; error: string } {
-  const identityPath = home.path(`agents/${args.agent}/identity.json`)
+export function startupCheck(home: MidaHome, args: McpArgs): { ok: true; agent: string } | { ok: false; error: string } {
+  // --as is required: a client that does not name its identity would silently share one. The
+  // refusal lists the identities this home already holds so the fix is one edit to the client's
+  // config — and `mida install <client>` provisions a fresh one when none of these fits.
+  if (args.agent === undefined) {
+    const names = home
+      .list("agents")
+      .filter((name) => AGENT_NAME.test(name) && home.has(`agents/${name}/identity.json`))
+      .sort()
+    return {
+      ok: false,
+      error: `mida-mcp needs --as <client>: the client's own identity. This home knows: ${names.length === 0 ? "none yet" : names.join(", ")} — give each client its own: mida install <client>`,
+    }
+  }
+  // assistant is the general-assistance stand-in — it can never hold a project approval, so a
+  // client configured with it would refuse at the project gate forever. The fix is a client
+  // identity, not an approve loop.
+  if (args.agent === "assistant") {
+    return { ok: false, error: "assistant is a general assistant and cannot read project context — run: mida install <client>" }
+  }
+  const agent = args.agent
+  const identityPath = home.path(`agents/${agent}/identity.json`)
   const identity = probe(identityPath)
   if (identity === "blocked") return { ok: false, error: blockedLine(identityPath) }
   if (identity === "no") {
-    return { ok: false, error: `no agent "${args.agent}" is set up in the Mida home ${home.root} — check MIDA_HOME in this client's config` }
+    return { ok: false, error: `no agent "${agent}" is set up in the Mida home ${home.root} — check MIDA_HOME in this client's config` }
   }
   if (probe(args.project) === "blocked") return { ok: false, error: blockedLine(args.project) }
   const marker = findProjectMarker(args.project)
   if (marker === null || marker.projectId === null) {
     return { ok: false, error: `${args.project} is not a Mida project folder — start the server with --project <your project folder>` }
   }
-  return { ok: true }
+  return { ok: true, agent }
 }
 
 /** The stable tool surface — names and input schemas are API; the report carries them verbatim. */
@@ -251,6 +273,10 @@ async function toolWhatsNew(deps: McpServerDeps) {
   if (body?.kind === "none") return toolText("Mida: nothing new since the last check.")
   if (body?.kind === "refused") {
     const reason = typeof body.reason === "string" ? body.reason : "refused"
+    if (reason === "general-assistance") {
+      // reproduced like the refusals above — the whats-new refusal carries reason only
+      return toolText(`Mida: ${deps.agent} is a general assistant and cannot read project context — run \`mida install <client>\`.`)
+    }
     if (reason === "not-approved") {
       return toolText(`Mida: ${deps.agent} is not approved for this project — run \`mida approve ${deps.agent}\` in this folder.`)
     }
@@ -358,6 +384,7 @@ async function toolStatus(deps: McpServerDeps) {
       if (probe.status === 0) lines.push(`${name}: no answer from the daemon`)
       else if (kind === "handoff" || kind === "empty") lines.push(`${name}: approved for this folder`)
       else if (reason(i) === "revoked") lines.push(`${name}: access revoked by the owner`)
+      else if (reason(i) === "general-assistance") lines.push(`${name}: a general assistant — it cannot read project context`)
       else if (reason(i) === "not-approved") lines.push(`${name}: not approved for this folder`)
       else lines.push(`${name}: cannot tell (${reason(i) ?? "bad reply"})`)
     }

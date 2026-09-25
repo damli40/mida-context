@@ -104,11 +104,11 @@ const deps = (dir: MidaHome, over: Partial<McpServerDeps> = {}): McpServerDeps =
 const DEGRADED = "Mida: could not load context (daemon-down) — working without it"
 
 describe("mida-mcp args", () => {
-  it("defaults to assistant and the process cwd", () => {
+  it("no --as parses with the agent unset — the startup gate, not the parser, refuses it", () => {
     const parsed = parseMcpArgs([])
     expect(parsed.ok).toBe(true)
     if (parsed.ok) {
-      expect(parsed.args.agent).toBe("assistant")
+      expect(parsed.args.agent).toBeUndefined()
       expect(parsed.args.project).toBe(process.cwd())
     }
   })
@@ -149,7 +149,9 @@ describe("mida-mcp args", () => {
   it("marks whether --project was given", () => {
     const r = parseMcpArgs([])
     expect(r.ok && r.args.projectGiven).toBe(false)
-    expect(r.ok && r.args.agent).toBe("assistant")
+    expect(r.ok && r.args.agent).toBeUndefined()
+    const given = parseMcpArgs(["--as", "cursor", "--project", "/tmp/p"])
+    expect(given.ok && given.args.projectGiven).toBe(true)
   })
 
   it("uses the same name rule as the key store", () => {
@@ -241,6 +243,36 @@ describe("mida-mcp startup gate", () => {
     writeFileSync(join(home.root, "agents", agent, "identity.json"), "{}")
   }
 
+  it("refuses a launch with no --as at all, listing the identities this home knows (I2)", () => {
+    const home = makeHome()
+    register(home, "codex")
+    register(home, "claude-desktop")
+    const r = startupCheck(home, { agent: undefined, project: makeProject(), projectGiven: true })
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.error).toContain("--as")
+      expect(r.error).toContain("claude-desktop")
+      expect(r.error).toContain("codex")
+      expect(r.error).toContain("mida install")
+    }
+  })
+
+  it("an empty home still answers the missing --as — 'none yet', never a silent default", () => {
+    const r = startupCheck(makeHome(), { agent: undefined, project: makeProject(), projectGiven: true })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error).toContain("none yet")
+  })
+
+  it("refuses --as assistant even when the identity is registered — it can never hold a project approval (I2)", () => {
+    const home = makeHome()
+    register(home, "assistant")
+    const r = startupCheck(home, { agent: "assistant", project: makeProject(), projectGiven: true })
+    expect(r).toEqual({
+      ok: false,
+      error: "assistant is a general assistant and cannot read project context — run: mida install <client>",
+    })
+  })
+
   it("refuses an agent with no identity in this home, naming the home", () => {
     const home = makeHome()
     const r = startupCheck(home, { agent: "chatgpt", project: makeProject(), projectGiven: true })
@@ -249,16 +281,16 @@ describe("mida-mcp startup gate", () => {
 
   it("refuses a launch folder that is not a Mida project when --project was not given", () => {
     const home = makeHome()
-    register(home, "assistant")
-    const r = startupCheck(home, { agent: "assistant", project: "/", projectGiven: false })
+    register(home, "codex")
+    const r = startupCheck(home, { agent: "codex", project: "/", projectGiven: false })
     expect(r).toEqual({ ok: false, error: "/ is not a Mida project folder — start the server with --project <your project folder>" })
   })
 
   it("refuses an explicit --project that is not a Mida project either", () => {
     const home = makeHome()
-    register(home, "assistant")
+    register(home, "codex")
     const dir = mkdtempSync(join(tmpdir(), "mida-noproj-"))
-    const r = startupCheck(home, { agent: "assistant", project: dir, projectGiven: true })
+    const r = startupCheck(home, { agent: "codex", project: dir, projectGiven: true })
     expect(r).toEqual({ ok: false, error: `${dir} is not a Mida project folder — start the server with --project <your project folder>` })
   })
 
@@ -266,37 +298,37 @@ describe("mida-mcp startup gate", () => {
     // .mida/project.json exists but holds no project id — findProjectMarker returns
     // { projectId: null } for it, and a null id must not slip past the gate
     const home = makeHome()
-    register(home, "assistant")
+    register(home, "codex")
     const dir = mkdtempSync(join(tmpdir(), "mida-nullid-"))
     mkdirSync(join(dir, ".mida"))
     writeFileSync(join(dir, ".mida", "project.json"), "{}")
-    const r = startupCheck(home, { agent: "assistant", project: dir, projectGiven: true })
+    const r = startupCheck(home, { agent: "codex", project: dir, projectGiven: true })
     expect(r).toEqual({ ok: false, error: `${dir} is not a Mida project folder — start the server with --project <your project folder>` })
   })
 
-  it("passes a registered agent in a marked project", () => {
+  it("passes a registered client identity in a marked project", () => {
     const home = makeHome()
-    register(home, "assistant")
-    expect(startupCheck(home, { agent: "assistant", project: makeProject(), projectGiven: true })).toEqual({ ok: true })
+    register(home, "claude-desktop")
+    expect(startupCheck(home, { agent: "claude-desktop", project: makeProject(), projectGiven: true })).toEqual({ ok: true, agent: "claude-desktop" })
   })
 
   it("never reads the identity file (existence only)", () => {
     const home = makeHome()
-    register(home, "assistant")
-    chmodSync(join(home.root, "agents", "assistant", "identity.json"), 0o000)
-    expect(startupCheck(home, { agent: "assistant", project: makeProject(), projectGiven: true })).toEqual({ ok: true })
+    register(home, "codex")
+    chmodSync(join(home.root, "agents", "codex", "identity.json"), 0o000)
+    expect(startupCheck(home, { agent: "codex", project: makeProject(), projectGiven: true })).toEqual({ ok: true, agent: "codex" })
   })
 
   // root ignores permission bits, so on a root run nothing can be "blocked" — the probe always sees the file
   it.skipIf(process.getuid?.() === 0)("a project folder the system refuses is the blocked line, not 'not a project'", () => {
     const home = makeHome()
-    register(home, "assistant")
+    register(home, "codex")
     const parent = mkdtempSync(join(tmpdir(), "mida-blocked-"))
     const project = join(parent, "proj")
     mkdirSync(project)
     chmodSync(parent, 0o000)
     try {
-      const r = startupCheck(home, { agent: "assistant", project, projectGiven: true })
+      const r = startupCheck(home, { agent: "codex", project, projectGiven: true })
       expect(r.ok).toBe(false)
       if (!r.ok) expect(r.error).toBe(`${project} could not be read (the system refused access). If it is under Desktop, Documents or Downloads, macOS blocks desktop apps from it — move Mida or the project out of those folders.`)
     } finally {
@@ -306,11 +338,11 @@ describe("mida-mcp startup gate", () => {
 
   it.skipIf(process.getuid?.() === 0)("an identity folder the system refuses is the blocked line, not 'no agent'", () => {
     const home = makeHome()
-    register(home, "assistant")
-    const agentDir = join(home.root, "agents", "assistant")
+    register(home, "codex")
+    const agentDir = join(home.root, "agents", "codex")
     chmodSync(agentDir, 0o000)
     try {
-      const r = startupCheck(home, { agent: "assistant", project: makeProject(), projectGiven: true })
+      const r = startupCheck(home, { agent: "codex", project: makeProject(), projectGiven: true })
       expect(r.ok).toBe(false)
       if (!r.ok) expect(r.error).toBe(`${join(agentDir, "identity.json")} could not be read (the system refused access). If it is under Desktop, Documents or Downloads, macOS blocks desktop apps from it — move Mida or the project out of those folders.`)
     } finally {
@@ -318,8 +350,29 @@ describe("mida-mcp startup gate", () => {
     }
   })
 
-  it("refuses before spawning a daemon: the real entry exits 2, stdout empty, no socket", async () => {
-    const home = makeHome() // empty home: no identity
+  it("the real entry refuses a launch with no --as, naming the identities in this home (I2)", async () => {
+    const home = makeHome()
+    register(home, "codex")
+    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--project", makeProject()], {
+      env: { ...process.env, MIDA_HOME: home.root },
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (b) => (stdout += b))
+    child.stderr.on("data", (b) => (stderr += b))
+    const code = await new Promise((r) => child.on("exit", r))
+    expect(code).toBe(2)
+    expect(stdout).toBe("")
+    expect(stderr).toContain("--as")
+    expect(stderr).toContain("codex")
+    expect(stderr).toContain("mida install")
+    expect(existsSync(join(home.root, "midad.sock"))).toBe(false)
+  })
+
+  it("the real entry refuses --as assistant with the install-a-client line — never 'approve assistant' (I2)", async () => {
+    const home = makeHome()
+    register(home, "assistant") // registered, so 'no agent' cannot be the reason — the purpose is
     const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "assistant", "--project", makeProject()], {
       env: { ...process.env, MIDA_HOME: home.root },
       stdio: ["pipe", "pipe", "pipe"],
@@ -331,13 +384,31 @@ describe("mida-mcp startup gate", () => {
     const code = await new Promise((r) => child.on("exit", r))
     expect(code).toBe(2)
     expect(stdout).toBe("")
-    expect(stderr).toContain(`no agent "assistant" is set up in the Mida home ${home.root}`)
+    expect(stderr).toContain("assistant is a general assistant and cannot read project context — run: mida install <client>")
+    expect(stderr).not.toContain("approve")
+    expect(existsSync(join(home.root, "midad.sock"))).toBe(false)
+  })
+
+  it("refuses before spawning a daemon: the real entry exits 2, stdout empty, no socket", async () => {
+    const home = makeHome() // empty home: no identity
+    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "nobody", "--project", makeProject()], {
+      env: { ...process.env, MIDA_HOME: home.root },
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (b) => (stdout += b))
+    child.stderr.on("data", (b) => (stderr += b))
+    const code = await new Promise((r) => child.on("exit", r))
+    expect(code).toBe(2)
+    expect(stdout).toBe("")
+    expect(stderr).toContain(`no agent "nobody" is set up in the Mida home ${home.root}`)
     expect(existsSync(join(home.root, "midad.sock"))).toBe(false)
   })
 
   it("a MIDA_HOME that does not exist is refused before a folder is created there (F6)", async () => {
     const missing = join(mkdtempSync(join(tmpdir(), "mida-nohome-")), "home")
-    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "assistant", "--project", makeProject()], {
+    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "codex", "--project", makeProject()], {
       env: { ...process.env, MIDA_HOME: missing },
       stdio: ["pipe", "pipe", "pipe"],
     })
@@ -356,7 +427,7 @@ describe("mida-mcp startup gate", () => {
     const dir = mkdtempSync(join(tmpdir(), "mida-homefile-"))
     const file = join(dir, "home")
     writeFileSync(file, "x")
-    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "assistant", "--project", makeProject()], {
+    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "codex", "--project", makeProject()], {
       env: { ...process.env, MIDA_HOME: file },
       stdio: ["pipe", "pipe", "pipe"],
     })
@@ -642,6 +713,26 @@ describe("mida-mcp tools against a fake daemon", () => {
       try {
         expect(await callText(client, "mida_whats_new")).toBe(
           `Mida: assistant's identity in this Mida home (${dir.root}) exists but could not be read. Nothing was shared. Run \`mida doctor\`.`,
+        )
+      } finally {
+        await close()
+      }
+      expect(dir.has("state/lastseen/mcp-assistant-test1.json")).toBe(false)
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("mida_whats_new answers the install-a-client line for a general-assistance refusal — never 'approve assistant' (I2)", async () => {
+    const dir = home()
+    // a general-assistance identity can never hold a project approval, so the refusal must
+    // point at `mida install`, not at an approve that can only loop
+    const fake = await fakeDaemon(dir, { "/whatsnew": { kind: "refused", reason: "general-assistance" } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_whats_new")).toBe(
+          "Mida: assistant is a general assistant and cannot read project context — run `mida install <client>`.",
         )
       } finally {
         await close()

@@ -69,6 +69,8 @@ const HANDOFF_READ_LIMIT_MS = 7_500
 
 const notApprovedText = (agent: string): string =>
   `Mida: ${agent} is not approved for this project — run \`mida approve ${agent}\` in this folder.`
+const generalAssistanceText = (agent: string): string =>
+  `Mida: ${agent} is a general assistant and cannot read project context — run \`mida install <client>\`.`
 const revokedText = (agent: string): string =>
   `Mida: ${agent}'s access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.`
 export const noIdentityText = (agent: string, homeRoot: string): string =>
@@ -135,6 +137,15 @@ export function projectCheckRefusal(
     try {
       if ((isRevokedDep ?? ((name) => isRevoked(runtime.home, name)))(agent)) {
         return { reason: "revoked", text: revokedText(agent) }
+      }
+    } catch { /* fall through to not-approved */ }
+    // A general-assistance identity can never hold a project row — telling the owner to run
+    // `mida approve <agent>` would loop forever, so the line names the real fix instead: a
+    // client identity provisioned by `mida install <client>`. An identity that cannot be read
+    // keeps the plain not-approved answer.
+    try {
+      if (loadAgentIdentity(runtime.home, agent)?.purposeId === "general_assistance") {
+        return { reason: "general-assistance", text: generalAssistanceText(agent) }
       }
     } catch { /* fall through to not-approved */ }
   }
