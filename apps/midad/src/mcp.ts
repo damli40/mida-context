@@ -123,7 +123,8 @@ export function startupCheck(home: MidaHome, args: McpArgs): { ok: true; agent: 
       .sort()
     return {
       ok: false,
-      error: `mida-mcp needs --as <client>: the client's own identity. This home knows: ${names.length === 0 ? "none yet" : names.join(", ")} — give each client its own: mida install <client>`,
+      // no program name here — the entry point prefixes mida-mcp: once when it prints this
+      error: `needs --as <client>: the client's own identity. This home knows: ${names.length === 0 ? "none yet" : names.join(", ")} — give each client its own: mida install <client>`,
     }
   }
   // assistant is the general-assistance stand-in — it can never hold a project approval, so a

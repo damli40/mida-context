@@ -178,6 +178,8 @@ describe("the crude mida command", () => {
     expect(entry.env).toEqual({ MIDA_HOME: home.root })
     expect(loadAgentIdentity(home, "cursor")?.name).toBe("cursor")
     expect(lines).toContain("next: run `mida approve cursor` in this folder")
+    // the per-workspace config carries personal absolute paths — the owner is told not to commit it
+    expect(lines.filter((line) => line.includes(".cursor/mcp.json") && line.includes("commit"))).toHaveLength(1)
   }, 300_000)
 
   it("install <client> asks for a real terminal like approve, a non-client is usage, the daemon refuses it", async () => {
@@ -577,6 +579,40 @@ describe("the crude mida command", () => {
     // claude-code's approve landed, so the daemon was poked even though the batch exits 1
     expect(kicks).toHaveLength(1)
     home.remove("agents/cursor/pending-request.json")
+  }, 300_000)
+
+  it("approve --all says 'was already approved' when the folder's row was already there (G14)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mida-proj-"))
+    const lines: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, cwd: dir, print: (line) => lines.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // a real pending request for codex, kept before the single approve consumes it
+    expect(await run2("revoke", "codex")).toBe(0)
+    expect(await run2("request", "codex")).toBe(0)
+    const identity = loadAgentIdentity(home, "codex")!
+    const original = home.readJson<{ request: AccessRequest }>("agents/codex/pending-request.json")!.request
+    expect(await run2("approve", "codex")).toBe(0) // chain grant + this folder's list row
+    // file a second, fresh-signed request for scopes codex already holds: the batch's listOnly
+    // arm runs, and with the row already written "now approved" would be a lie
+    const { agentSignature: _dropped, ...unsigned } = original
+    const now = BigInt(Math.floor(Date.now() / 1000))
+    const fresh = {
+      ...unsigned,
+      requestId: `0x${"ff".repeat(32)}` as Hex,
+      nonce: `0x${"ff".repeat(32)}` as Hex,
+      issuedAt: encodeUint64(now - 10n),
+      requestExpiresAt: encodeUint64(now + 300n),
+    }
+    const request = { ...fresh, agentSignature: await privateKeyToAccount(identity.signerPrivateKey).signTypedData(accessRequestTypedData(fresh)) }
+    await new FileAccessRequestStore(home, "codex").save(request)
+    home.writeSecretJson("agents/codex/pending-request.json", { request })
+    lines.length = 0
+    expect(await run2("approve", "--all")).toBe(0)
+    expect(lines).toContain("codex is already approved on chain. This folder was already approved for codex.")
+    expect(lines.every((line) => !line.includes("is now approved for codex"))).toBe(true)
   }, 300_000)
 
   it("revoke --all lists every approved agent, asks once, and revokes each (I4)", async () => {

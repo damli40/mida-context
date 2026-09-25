@@ -11,7 +11,7 @@ import type { Checkpoint } from "@mida/checkpoint"
 import { chainFor, parseDeployment } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { RegistryReader } from "@mida/api"
-import { readTranscriptFor } from "@mida/compiler"
+import { readTranscriptFor, scrubSecrets } from "@mida/compiler"
 import type { compileCheckpoint } from "@mida/compiler"
 import { CheckpointPayloadError, eventIdFor, unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
@@ -48,6 +48,8 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000
 const TMP_MAX_AGE_MS = 60 * 60 * 1000
 const LOG_MAX_BYTES = 5 * 1024 * 1024
 const LOG_KEEP_BYTES = 1024 * 1024
+/** How much of a failed provider answer a drain log line may quote — scrubbed first, then cut. */
+const LOG_SAMPLE_CHARS = 120
 
 /**
  * Stable failure codes. PERMANENT means this transcript state can never save — the job leaves the
@@ -486,14 +488,14 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         const code = failureCode(error)
         // field names are safe to log; values, validator messages and error.message are not
         const fields = error instanceof CheckpointPayloadError && error.fields !== undefined ? { fields: error.fields } : {}
-        // the compiler's scrubbed ≤200-char prefix of the last provider answer — already safe
-        // to log; absent when the failure had no answer to quote
-        const sample =
-          error instanceof DrainFailure && error.sample !== undefined
-            ? { sample: error.sample }
-            : error instanceof CheckpointPayloadError && error.sample !== undefined
-              ? { sample: error.sample }
-              : {}
+        // a prefix of the last provider answer belongs on the TERMINAL failure only — re-quoting
+        // it on every retry would repeat provider output once per attempt. Scrubbed and capped
+        // again here rather than trusting the bound upstream set.
+        const rawSample =
+          error instanceof DrainFailure ? error.sample
+            : error instanceof CheckpointPayloadError ? error.sample
+              : undefined
+        const sample = rawSample === undefined ? {} : { sample: scrubSecrets(rawSample).slice(0, LOG_SAMPLE_CHARS) }
         if (PERMANENT_FAILURES.has(code)) {
           if (code === "not-approved" || code === "revoked") {
             // every queued job for this agent fails the same way — remove them all, like not-approved
@@ -526,7 +528,8 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           failedAt: now().toISOString(),
         })
         dueSooner(now().getTime() + backoffMs(attempts))
-        log({ sessionId, outcome: "failed", reason: code, attempts, ...fields, ...sample })
+        // transient: no sample — it is quoted once, on the terminal "bad" line above
+        log({ sessionId, outcome: "failed", reason: code, attempts, ...fields })
       }
     }
     // The batched lane's follow-up: every pass asks the store where each ledger-owned save stands.

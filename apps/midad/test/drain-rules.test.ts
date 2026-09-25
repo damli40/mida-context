@@ -459,7 +459,7 @@ describe("a failed save does not buy a new model call", () => {
     expect(held).toMatchObject({ skippedTooSoon: 1, failed: 0 })
   })
 
-  it("a no-json compile failure logs a sample of the provider's last answer (F4)", async () => {
+  it("a transient failure's retry line carries no sample — only the final attempt quotes one (G14)", async () => {
     const { job, drain, flags, drainLog } = setup()
     flags.compileReason = "no-json"
     flags.compileSample = "I cannot comply; the key is [REDACTED] — padding"
@@ -472,23 +472,32 @@ describe("a failed save does not buy a new model call", () => {
       .map((l) => JSON.parse(l) as Record<string, unknown>)
       .find((r) => r.outcome === "failed")
     expect(failed?.reason).toBe("no-json")
-    expect(failed?.sample).toBe("I cannot comply; the key is [REDACTED] — padding")
+    // the same sample re-quoted on every retry would repeat provider output eight times a day
+    expect(failed?.sample).toBeUndefined()
   })
 
-  it("an invalid compile's sample lands on the failed line too (F4)", async () => {
-    const { job, drain, flags, drainLog } = setup()
+  it("an invalid compile's sample lands once — on the terminal line, scrubbed and capped (G14)", async () => {
+    const { home, job, drain, flags, drainLog } = setup()
     flags.compileReason = "invalid"
-    flags.compileSample = '{"objective":5}'
+    // a 64-hex key inside the cap window and padding past it: scrub first, then cut at 120
+    flags.compileSample = `${"y".repeat(80)} ${"ab".repeat(32)} ${"z".repeat(200)}`
     job({ event: "Stop" }, T0)
-    const result = await drain({ now: () => new Date(T0 + 120_000) })
-    expect(result.failed).toBe(1)
-    const failed = drainLog()
+    // invalid-checkpoint gives up after three attempts — each drain call jumps past the backoff
+    for (let i = 1; i <= 3; i++) {
+      await drain({ now: () => new Date(T0 + 120_000 + i * 3_600_000) })
+    }
+    expect(listJobs(home)).toHaveLength(0)
+    const records = drainLog()
       .trim()
       .split("\n")
       .map((l) => JSON.parse(l) as Record<string, unknown>)
-      .find((r) => r.outcome === "failed")
-    expect(failed?.reason).toBe("invalid-checkpoint")
-    expect(failed?.sample).toBe('{"objective":5}')
+    const retried = records.filter((r) => r.outcome === "failed")
+    const terminal = records.find((r) => r.outcome === "bad")
+    expect(retried.length).toBeGreaterThan(0)
+    expect(retried.every((r) => r.sample === undefined)).toBe(true)
+    expect(terminal?.reason).toBe("invalid-checkpoint")
+    expect(terminal?.sample).toBe(`${"y".repeat(80)} [REDACTED] ${"z".repeat(28)}`)
+    expect((terminal?.sample as string).length).toBe(120)
   })
 })
 

@@ -375,6 +375,8 @@ describe("mida-mcp startup gate", () => {
     expect(stderr).toContain("--as")
     expect(stderr).toContain("codex")
     expect(stderr).toContain("mida install")
+    // the prefix is the entry's own — the message must not repeat it (G14)
+    expect(stderr.match(/mida-mcp/g)).toHaveLength(1)
     expect(existsSync(join(home.root, "midad.sock"))).toBe(false)
   })
 

@@ -458,6 +458,9 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       } else {
         deps.print(outcome === "already-installed" ? "already installed" : "installed")
       }
+      // the per-workspace mcp.json carries personal absolute paths (the launcher, the home) —
+      // committing it would leak the machine's layout to anyone reading the repo
+      if (client === "cursor") deps.print("heads-up: .cursor/mcp.json holds absolute paths from this machine — do not commit it")
       deps.print(`next: run \`mida approve ${client}\` in this folder`)
     } else if (command === "batching") {
       return await runBatching(runtime, argv[1], deps)
@@ -584,7 +587,10 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
       approved.push(name)
       deps.print(
         result.transactionHash === null
-          ? `${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`
+          ? // "now approved" only when this batch actually wrote the row — a re-list is not a grant
+            result.projectAlreadyListed === true
+            ? `${name} is already approved on chain. This folder was already approved for ${name}.`
+            : `${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`
           : `approved ${name} tx ${result.transactionHash}`,
       )
     } catch (error) {
@@ -975,6 +981,7 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
         } else {
           deps.print(outcome === "already-installed" ? "already installed" : "installed")
         }
+        if (client === "cursor") deps.print("heads-up: .cursor/mcp.json holds absolute paths from this machine — do not commit it")
         deps.print(`next: run \`mida approve ${client}\` in this folder`)
         return 0
       } finally {
@@ -1083,7 +1090,9 @@ async function passkeyApproveAll(session: ServiceRuntime, deps: CliDeps, linkDep
       approved.push(name)
       deps.print(
         result.listOnly
-          ? `${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`
+          ? result.projectAlreadyListed === true
+            ? `${name} is already approved on chain. This folder was already approved for ${name}.`
+            : `${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`
           : `approved ${name} via your passkey — tx ${result.transactionHashes.join(" ")}`,
       )
     } catch (error) {
