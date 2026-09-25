@@ -1,4 +1,4 @@
-import { defuse } from "@mida/checkpoint"
+import { compareChainOrder, defuse, orderTime, recordedAt } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
 import { PENDING_ANCHOR_LINE, capabilityState, checkAccess } from "./handoff.js"
 import type { HandoffDeps } from "./handoff.js"
@@ -219,8 +219,6 @@ export interface WhatsNewDeps {
 // in this file's key-reading graph. Re-exported so index.ts and existing callers are unchanged.
 export { readSeen, writeSeen } from "./seen.js"
 
-const parse = (iso: string): number => Date.parse(iso)
-
 /** One note line per updating agent: name, age, the progress tail, the next action, new files. */
 function updateLine(
   name: string,
@@ -241,7 +239,9 @@ function updateLine(
   // Pushed as a part so the "saved a checkpoint" fallback can never apply to it either.
   if (newest.anchor === "PENDING_ANCHOR") parts.push(PENDING_ANCHOR_LINE)
   const body = parts.length === 0 ? "saved a checkpoint" : parts.join("; ")
-  return `- ${defuse(name)} (${agoText(checkpoint.createdAt, now)}): ${body}`
+  // the age shown is Monad's stamp when the record carries one — the writer's own clock claim
+  // is what renders only for a record the chain never placed
+  return `- ${defuse(name)} (${agoText(recordedAt(newest), now)}): ${body}`
 }
 
 /** Header plus as many lines as fit, newest first; leftovers collapse into a count line. */
@@ -322,27 +322,28 @@ export async function buildWhatsNew(
     }
     const checkpoints = entry?.checkpoints ?? []
     // Per foreign author: the newest checkpoint the session has NOT seen is the line; the
-    // newest one it HAS seen is the baseline the artifact diff is measured against. A
-    // checkpoint whose createdAt will not parse can neither be ordered into the note nor serve
-    // as a baseline — but it still lands in the covered set so it is never offered either.
+    // newest one it HAS seen is the baseline the artifact diff is measured against. "Newest" is
+    // Monad's placement — the record's chain time, then its position in the chain's order — never
+    // the writer's own createdAt claim; a record with neither can neither lead a line nor serve
+    // as a baseline, but it still lands in the covered set so it is never offered either.
     const perAuthor = new Map<string, { newest?: StoredCheckpoint; baseline?: StoredCheckpoint }>()
     const foreignIds: { id: string; at: number }[] = []
     for (const cp of checkpoints) {
       if (cp.sessionId === input.sessionId) continue
-      const at = parse(cp.checkpoint.createdAt)
+      const at = orderTime(cp)
       foreignIds.push({ id: cp.contextId, at: Number.isNaN(at) ? 0 : at })
       if (Number.isNaN(at)) continue
       const bucket = perAuthor.get(cp.authorId) ?? {}
       if (!seen.has(cp.contextId)) {
-        if (bucket.newest === undefined || at > parse(bucket.newest.checkpoint.createdAt)) bucket.newest = cp
-      } else if (bucket.baseline === undefined || at > parse(bucket.baseline.checkpoint.createdAt)) {
+        if (bucket.newest === undefined || compareChainOrder(cp, bucket.newest) > 0) bucket.newest = cp
+      } else if (bucket.baseline === undefined || compareChainOrder(cp, bucket.baseline) > 0) {
         bucket.baseline = cp
       }
       perAuthor.set(cp.authorId, bucket)
     }
     const updates = [...perAuthor.entries()]
       .flatMap(([authorId, bucket]) => (bucket.newest === undefined ? [] : [{ authorId, ...bucket, newest: bucket.newest }]))
-      .sort((a, b) => parse(b.newest.checkpoint.createdAt) - parse(a.newest.checkpoint.createdAt))
+      .sort((a, b) => compareChainOrder(b.newest, a.newest))
     if (updates.length === 0) return { kind: "none" }
     const names = deps.authorNames ?? authorNamesFor(runtime)
     const lines = updates.map((u) =>
@@ -364,7 +365,7 @@ export async function buildWhatsNew(
       note: buildNote(lines),
       updates: updates.map((u) => ({
         agent: names[u.authorId.toLowerCase()] ?? "unknown agent",
-        savedAt: u.newest.checkpoint.createdAt,
+        savedAt: recordedAt(u.newest),
       })),
       seen: proposed,
     }

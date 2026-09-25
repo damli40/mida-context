@@ -1,7 +1,7 @@
 import { statSync } from "node:fs"
 import { isAbsolute } from "node:path"
 import { isMidaError } from "@mida/protocol"
-import { defuse, mergeCheckpoints, renderHandoffReport } from "@mida/checkpoint"
+import { compareChainOrder, defuse, mergeCheckpoints, renderHandoffReport } from "@mida/checkpoint"
 import type { MigrationEnvelope } from "@mida/checkpoint"
 import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { movedOnSuffix } from "./migration-envelope.js"
@@ -349,7 +349,7 @@ export async function buildHandoff(
     // shown marked counts as covered — the session saw it, whatever the chain later decides.
     const covered = outcome.checkpoints
       .filter((cp) => cp.sessionId !== input.sessionId)
-      .sort((a, b) => Date.parse(a.checkpoint.createdAt) - Date.parse(b.checkpoint.createdAt))
+      .sort(compareChainOrder)
       .map((cp) => cp.contextId)
     // A partial read still produces a handoff — the served checkpoints are real — but both
     // channels must say the list was incomplete: the model text opens with PARTIAL_LINE, the
@@ -369,10 +369,9 @@ export async function buildHandoff(
       // Nothing anchored yet, but pending saves exist — the handoff is the marked blocks alone,
       // inside the same fence. The preamble here never says "saved"; the owner line's "from" is
       // provenance of the newest covered record, still true of a pending one.
-      const newestPending = pending
-        .slice()
-        .sort((a, b) => Date.parse(a.checkpoint.createdAt) - Date.parse(b.checkpoint.createdAt))
-        .at(-1)
+      // Pending saves carry no chain placement — this orders on the writer's claim alone, which
+      // is all a not-yet-anchored record has; it only picks whose line renders, never "current".
+      const newestPending = pending.slice().sort(compareChainOrder).at(-1)
       return {
         kind: "handoff",
         text: `${outcome.partial ? `${PARTIAL_LINE}\n\n` : ""}${HANDOFF_HEAD}\n\n${pendingText}\n\n${HANDOFF_TAIL}`,

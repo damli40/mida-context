@@ -8,6 +8,7 @@ import { DENY_CANCEL_EXPIRY_SECONDS, provisionAgent } from "@mida/fake-vault"
 import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
 import type { BatchReceipt } from "@mida/api"
+import { compareChainOrder } from "@mida/checkpoint"
 import type { StoredCheckpoint as CheckpointRecord } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
 import { addPendingAnchor, batchClient, batchStatusProbe, laneForSave } from "./batching.js"
@@ -751,6 +752,8 @@ export async function readCheckpoints(
       authorId: object.authorId,
       namespaceId: object.namespaceId,
       anchor,
+      // Monad's placement of the save, when the SDK recovered one — pending saves carry none.
+      ...(object.chain === undefined ? {} : { chain: object.chain }),
       // a migrated record's envelope rides on the stored checkpoint as an ordinary typed field —
       // dropped nowhere on the way to the renderers
       ...(envelope.migration === undefined ? {} : { migration: envelope.migration }),
@@ -811,13 +814,11 @@ export async function readCheckpoints(
         const directCount = checkpoints.length
         for (const object of batched.anchored) collect(object, "ANCHORED")
         for (const item of batched.pending) collect(item, "PENDING_ANCHOR")
-        // Batched items merged: sort the list on the key mergeCheckpoints uses (createdAt then
-        // contextId). Untouched when the batched side added nothing, so a deployment without
-        // reachable batched saves keeps the store's own order exactly.
+        // Batched items merged: sort the list on the order mergeCheckpoints uses — Monad's
+        // placement, contextId only at the bottom. Untouched when the batched side added
+        // nothing, so a deployment without reachable batched saves keeps the store's own order.
         if (checkpoints.length > directCount) {
-          checkpoints.sort(
-            (a, b) => Date.parse(a.checkpoint.createdAt) - Date.parse(b.checkpoint.createdAt) || a.contextId.localeCompare(b.contextId),
-          )
+          checkpoints.sort(compareChainOrder)
         }
       }
     } else {

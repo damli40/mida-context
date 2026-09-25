@@ -594,6 +594,20 @@ function livePorts(env: FlowEnvironment, session: MeSession, indexUrl: string | 
         } as never)) as { root: Hex }
         return batch.root === zeroHash ? null : batch.root
       },
+      batchBlock: async (batchId) => {
+        if (deployment.batchAnchor === undefined) return null
+        const batch = (await context.publicClient.readContract({
+          address: deployment.batchAnchor,
+          abi: batchAnchorAbi,
+          functionName: "batchOf",
+          args: [batchId],
+        } as never)) as { root: Hex; blockNumber: bigint }
+        return batch.root === zeroHash ? null : batch.blockNumber
+      },
+      blockTime: async (block) => {
+        const found = await context.publicClient.getBlock({ blockNumber: block })
+        return Number(found.timestamp)
+      },
       ownerGrantLogs: (owner) => ownerGrantLogs(context, owner),
       agentIdOfSigner: (signer) => reader.agentIdOfSigner(signer),
       getAgent: (agentId) => reader.getAgent(agentId),

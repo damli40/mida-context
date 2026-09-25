@@ -2,11 +2,20 @@ import { describe, expect, it } from "vitest"
 import { mergeCheckpoints, type StoredCheckpoint } from "../src/index.js"
 
 let n = 0
-function stored(over: Partial<StoredCheckpoint["checkpoint"]> & { sessionId?: string; continuesSession?: string | null; at: string }): StoredCheckpoint {
+function stored(
+  over: Partial<StoredCheckpoint["checkpoint"]> & {
+    sessionId?: string
+    continuesSession?: string | null
+    at: string
+    /** Monad's own placement of the save — what the SDK's reads carry on `ContextObject.chain`. */
+    chain?: { at: bigint; block?: bigint; index?: number }
+  },
+): StoredCheckpoint {
   n += 1
-  const { sessionId = "s1", continuesSession = null, at, ...cp } = over
+  const { sessionId = "s1", continuesSession = null, at, chain, ...cp } = over
   return {
     projectId: "p", sessionId, continuesSession, compiledBy: "test", contextId: `0x${n.toString(16).padStart(64, "0")}`, authorId: "0xa", namespaceId: `0x${"c".repeat(64)}`,
+    ...(chain === undefined ? {} : { chain }),
     checkpoint: { eventId: `event-${n}xxxx`, agent: "claude-code", source: "hook-compiler", createdAt: at,
       objective: "", originalRequest: null, progress: [], decisions: [], rejected: [], constraints: [], artifacts: [],
       unresolvedIssue: null, nextAction: "", remainingPlan: [], evidence: [], ...cp },
@@ -187,6 +196,46 @@ describe("mergeCheckpoints", () => {
     expect(m.objective).toBe("new job")
     expect(m.otherSessions).toHaveLength(1)
     expect(m.otherSessions[0]).toMatchObject({ sessionId: "old-work", objective: "old job" })
+  })
+
+  it("Monad's stamp decides 'newest', not the checkpoint's claim — an earlier save dated 2099 loses", () => {
+    // The saver's own createdAt is untrusted content: this checkpoint landed FIRST on chain yet
+    // claims 2099. Ordering by the claim would let it displace the save Monad recorded later.
+    const m = mergeCheckpoints([
+      stored({ sessionId: "old-on-chain", at: "2099-01-01T00:00:00.000Z", objective: "earlier save, forged clock", progress: ["p"], chain: { at: 1_000n, block: 5n, index: 0 } }),
+      stored({ sessionId: "new-on-chain", at: "2026-09-21T10:00:00.000Z", objective: "truly latest save", progress: ["p"], chain: { at: 2_000n, block: 9n, index: 0 } }),
+    ])!
+    expect(m.objective).toBe("truly latest save")
+    expect(m.otherSessions[0]).toMatchObject({ sessionId: "old-on-chain" })
+    // provenance's stamp is Monad's too — the claim stays only inside the checkpoint payload
+    expect(m.provenance.at(-1)!.createdAt).toBe("1970-01-01T00:33:20.000Z")
+  })
+
+  it("same-second saves order by chain order — block, then log index — never the contextId", () => {
+    // Both landed in the same second; the contextIds are arranged so the old contextId tie-break
+    // picks the chain-EARLIER save. Chain order must win either way the ids fall.
+    const earlier = stored({ sessionId: "s-earlier", at: "2026-09-21T10:00:00.000Z", objective: "chain-earlier", progress: ["p"], chain: { at: 1_700_000_000n, block: 5n, index: 1 } })
+    earlier.contextId = `0x${"1".repeat(64)}`
+    const later = stored({ sessionId: "s-later", at: "2026-09-21T10:00:00.000Z", objective: "chain-later", progress: ["p"], chain: { at: 1_700_000_000n, block: 5n, index: 4 } })
+    later.contextId = `0x${"f".repeat(64)}`
+    expect(mergeCheckpoints([earlier, later])!.objective).toBe("chain-later")
+
+    // and the same within one session — member order follows (block, index) too
+    const first = stored({ at: "2026-09-21T10:00:00.000Z", nextAction: "chain-earlier action", chain: { at: 1_700_000_000n, block: 5n, index: 1 } })
+    first.contextId = `0x${"f".repeat(64)}`
+    const second = stored({ at: "2026-09-21T10:00:00.000Z", nextAction: "chain-later action", chain: { at: 1_700_000_000n, block: 5n, index: 4 } })
+    second.contextId = `0x${"1".repeat(64)}`
+    const same = mergeCheckpoints([first, second])!
+    expect(same.nextAction).toBe("chain-later action")
+    expect(same.provenance.map((row) => row.contextId)).toEqual([first.contextId, second.contextId])
+  })
+
+  it("same-second saves in different blocks order by block number", () => {
+    const block5 = stored({ sessionId: "s-5", at: "2026-09-21T10:00:00.000Z", objective: "block-5 save", progress: ["p"], chain: { at: 1_700_000_000n, block: 5n, index: 0 } })
+    block5.contextId = `0x${"1".repeat(64)}`
+    const block9 = stored({ sessionId: "s-9", at: "2026-09-21T10:00:00.000Z", objective: "block-9 save", progress: ["p"], chain: { at: 1_700_000_000n, block: 9n, index: 0 } })
+    block9.contextId = `0x${"f".repeat(64)}`
+    expect(mergeCheckpoints([block5, block9])!.objective).toBe("block-9 save")
   })
 
   it("equal timestamps give identical output regardless of input order (A11)", () => {

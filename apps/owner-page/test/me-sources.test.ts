@@ -185,6 +185,11 @@ function world() {
     getRecordsError: null as Error | null,
     batchRoots: new Map<string, Hex>(),
     batchRootsError: null as Error | null,
+    // Monad's own placement answers: batchId → the block its anchor mined in, block → its timestamp
+    batchBlocks: new Map<string, number>(),
+    batchBlocksError: null as Error | null,
+    blockTimes: new Map<number, number>(),
+    blockTimesError: null as Error | null,
     grantLogs: [] as GrantLog[],
     grantLogsError: null as Error | null,
     agentRecords: new Map<string, AgentRecord>([[AGENT_ID.toLowerCase(), AGENT_RECORD]]),
@@ -253,6 +258,15 @@ function world() {
       batchRoot: async (batchId) => {
         if (state.batchRootsError !== null) throw state.batchRootsError
         return state.batchRoots.get(batchId.toLowerCase()) ?? null
+      },
+      batchBlock: async (batchId) => {
+        if (state.batchBlocksError !== null) throw state.batchBlocksError
+        const found = state.batchBlocks.get(batchId.toLowerCase())
+        return found === undefined ? null : BigInt(found)
+      },
+      blockTime: async (block) => {
+        if (state.blockTimesError !== null) throw state.blockTimesError
+        return state.blockTimes.get(Number(block)) ?? null
       },
       ownerGrantLogs: async () => {
         if (state.grantLogsError !== null) throw state.grantLogsError
@@ -330,8 +344,8 @@ async function makeBatchedItem(opts: { anchored?: boolean; owner?: Address } = {
   return { item, contextId, root, leaf }
 }
 
-function makeDirectObject() {
-  const contextId = `0x${"dd".repeat(32)}` as Hex
+function makeDirectObject(over: { contextId?: Hex; createdAt?: bigint } = {}) {
+  const contextId = over.contextId ?? (`0x${"dd".repeat(32)}` as Hex)
   const epochKeys = deriveEpochKeyPair(SECRET, 1n)
   const sealed = sealContextObject({
     payload: { v: 1, value: { text: "prefers short answers" }, kind: "PREFERENCE", provenance: { source: "USER_ASSERTED" } },
@@ -364,7 +378,7 @@ function makeDirectObject() {
     ciphertextCommitment: sealed.ciphertextCommitment,
     evidenceCommitment: zeroHash,
     readEpoch: 1n,
-    createdAt: BigInt(NOW - 3600),
+    createdAt: over.createdAt ?? BigInt(NOW - 3600),
     expiresAt: 0n,
     version: 1,
     recordType: 0,
@@ -450,6 +464,57 @@ describe("loadMe — direct records re-verify on ContextRegistry", () => {
     expect(row!.source).toBe(1)
     expect(row!.tx).toBe(TX3)
     expect(row!.readEpoch).toBe(1n)
+  })
+})
+
+describe("loadMe — the record list orders by Monad's placement", () => {
+  it("a same-second tie breaks by chain order (block, log index) — never the random contextId", async () => {
+    const { state, ports } = world()
+    // Both records carry the same chain second; the chain placed `a` after `b`, and the
+    // contextIds are arranged so the old contextId tie-break names the wrong one first.
+    const a = makeDirectObject() // 0xdd.. — larger id, chain-LATER (logIndex 7)
+    const b = makeDirectObject({ contextId: `0x${"1c".padEnd(64, "0")}` as Hex, createdAt: BigInt(NOW) })
+    a.record.createdAt = BigInt(NOW)
+    state.objects.set(NS_SKILLS, [a.obj, b.obj])
+    state.chainRecords.set(a.obj.contextId.toLowerCase(), a.record)
+    state.chainRecords.set(b.obj.contextId.toLowerCase(), b.record)
+    state.countsResult = {
+      Owner_by_pk: { records: 2, batchedSaves: 0 },
+      ContextRecord: [
+        { id: a.obj.contextId, namespaceId: NS_SKILLS, provenanceSource: 1, createdAt: String(NOW), txHash: TX1, registeredBlock: 90 },
+        { id: b.obj.contextId, namespaceId: NS_SKILLS, provenanceSource: 1, createdAt: String(NOW), txHash: TX2, registeredBlock: 90 },
+      ],
+      TimelineEntry: [
+        { kind: "context_registered", contextId: a.obj.contextId, block: 90, logIndex: 7 },
+        { kind: "context_registered", contextId: b.obj.contextId, block: 90, logIndex: 3 },
+        // a same-contextId entry of another kind never overrides the register event's placement
+        { kind: "context_superseded", contextId: a.obj.contextId, block: 95, logIndex: 0 },
+      ],
+    }
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.map((r) => r.contextId)).toEqual([a.obj.contextId, b.obj.contextId])
+  })
+
+  it("an anchored batched row sorts by its anchor block's time, not the store's receivedAt", async () => {
+    const { state, ports } = world()
+    const { item, contextId, root } = await makeBatchedItem()
+    // receivedAt says the store queued it AFTER the direct save's chain time — but the batch
+    // anchored in a LATER block, and Monad's stamp is the one that orders the list.
+    item.receivedAt = (NOW - 60) * 1000
+    const direct = makeDirectObject({ createdAt: BigInt(NOW - 30) })
+    state.objects.set(NS_SKILLS, [direct.obj])
+    state.chainRecords.set(direct.obj.contextId.toLowerCase(), direct.record)
+    state.batched.set(NS, [item])
+    state.batchRoots.set(BATCH_ID, root)
+    state.batchedResult = {
+      BatchedSave: [{ id: contextId, namespaceId: NS, batchId: BATCH_ID, position: 0, lineageId: contextId, version: 1, agentId: AGENT_ID, block: 150, txHash: TX2 }],
+      Agent: [{ id: AGENT_ID, signer: AGENT_KEY.address }],
+    }
+    state.blockTimes.set(150, NOW)
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.map((r) => r.contextId)).toEqual([contextId, direct.obj.contextId])
+    const batchedRow = data.records[0]!
+    expect(batchedRow.createdAt).toBe(NOW * 1000)
   })
 })
 

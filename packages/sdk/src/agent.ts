@@ -37,17 +37,19 @@ import type {
   UnsignedAccessRequest,
 } from "@mida/protocol"
 import { bytesOf, hexOf, manifestHash, openContextObject, sealContextObject, unwrapEpochPrivateKey } from "@mida/crypto"
-import { capabilityRegistryAbi, contextRegistryAbi, latestTimestamp, readAgentRecord, sendContract } from "@mida/chain"
-import type { LocalWriteContext } from "@mida/chain"
+import { blockTimeCache, capabilityRegistryAbi, contextRegistryAbi, latestTimestamp, readAgentRecord, recordPlacements, sendContract } from "@mida/chain"
+import type { LocalWriteContext, RecordPlacement } from "@mida/chain"
 import { assertGrantResponseWithinRequest, expandScopeInputs } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
 import { RegistryReader } from "@mida/api"
 import type { AnchoredObject, BatchReceipt, BatchedSaveWire, ContextApiRoutes, ContextRecordView } from "@mida/api"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { parseEventLogs, zeroHash } from "viem"
+import type { TransactionReceipt } from "viem"
 import { MemoryAccessRequestStore } from "./request-store.js"
 import type { AccessRequestStore } from "./request-store.js"
 import { signBatchSave, verifyBatchedItem, verifyPendingItem } from "./batched.js"
+import type { BatchedVerdict, PendingVerdict } from "./batched.js"
 
 /** §13.2 allows up to 600 seconds; the SDK uses 300 so a request stays valid through a normal consent screen. */
 export const REQUEST_LIFETIME_SECONDS = 300n
@@ -130,6 +132,16 @@ export interface ContextObject {
   recordType: "CONTEXT" | "EVIDENCE"
   payload: ContextPayload
   transactionHash?: Hex
+  /**
+   * Monad's own placement of the save — set only on records the chain has actually recorded.
+   * `at` is the timestamp the chain stamped (the ContextRegistry row's createdAt for a direct
+   * save, the anchor block's time for a batched one); `block` and `index` are its position in
+   * the chain's order — the log index for a direct save, the batch's own position for a batched
+   * one. Absent entirely when no chain fact places the record — a pending batched save above
+   * all — and `block`/`index` are absent when only the stamp could be recovered. Whatever an
+   * object claims inside its own payload never reaches this field.
+   */
+  chain?: { at: bigint; block?: bigint; index?: number }
 }
 
 /**
@@ -184,6 +196,19 @@ export interface MidaAgentConfig {
 }
 
 const AGENT_SOURCES: ReadonlySet<string> = new Set(["AGENT_INFERRED", "IMPORTED", "EXTERNAL_ATTESTATION"])
+
+/**
+ * The ContextRegistered log's placement inside a register receipt — the block and intra-block
+ * index the chain recorded for exactly this contextId. A receipt that somehow carries no matching
+ * log leaves the position absent; `at` (the record's chain-stored createdAt) is still set by the
+ * caller.
+ */
+function receiptPlacement(receipt: TransactionReceipt, contextId: Hex): RecordPlacement | undefined {
+  const log = parseEventLogs({ abi: contextRegistryAbi, eventName: "ContextRegistered", logs: receipt.logs }).find(
+    (entry) => (entry.args as { contextId?: Hex }).contextId?.toLowerCase() === contextId.toLowerCase(),
+  )
+  return log === undefined || log.blockNumber === null ? undefined : { block: log.blockNumber, index: log.logIndex }
+}
 
 /** §13.1 agent/server SDK. Every authority it relies on is re-read from Monad; nothing the API returns is trusted alone. */
 export class MidaAgent {
@@ -331,6 +356,16 @@ export class MidaAgent {
     const capability = this.#requireCapability(ownerAddress, namespaceId, PERMISSION.READ)
     const { deployment } = this.#chain
     const { objects, partial } = await this.#api.listObjects({ owner: ownerAddress, namespaceId, capabilityId: capability.capabilityId })
+    // Monad's own placement of every record: `at` is already chain truth on the record itself
+    // (the contract stores block.timestamp as createdAt); the block and log index come from one
+    // owner-scoped ContextRegistered scan. A failed scan degrades only the same-second tie-break
+    // — the stamp each object carries is still the contract's, never the writer's claim.
+    const placements =
+      objects.length === 0
+        ? new Map<string, RecordPlacement>()
+        : await recordPlacements({ client: this.#chain.publicClient, deployment, owner: ownerAddress, namespaceId }).catch(
+            () => new Map<string, RecordPlacement>(),
+          )
     const epochKeyFor = this.#epochKeyResolver(ownerAddress, namespaceId, capability.capabilityId)
     const readObject = async (object: AnchoredObject): Promise<ContextObject> => {
       const record = await this.#verifiedRecord(ownerAddress, namespaceId, object)
@@ -343,7 +378,10 @@ export class MidaAgent {
         binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: record.contextId, namespaceId, readEpoch: record.readEpoch },
       })
       await this.#verifyReferences(ownerAddress, record, payload)
-      return this.#toObject(record, name, payload)
+      return this.#toObject(record, name, payload, {
+        at: record.createdAt,
+        ...(placements.get(record.contextId.toLowerCase()) ?? {}),
+      })
     }
     // Workers pull indexes in list order and results land by index, so the output order is
     // identical to the sequential loop; a failing object still fails the whole read.
@@ -389,6 +427,9 @@ export class MidaAgent {
       capabilityId: capability.capabilityId,
     })
     const epochKeyFor = this.#epochKeyResolver(ownerAddress, namespaceId, capability.capabilityId)
+    // The anchor transaction's block time is Monad's stamp for every save in that batch — one
+    // block lookup per distinct batch, shared across the rows it anchored.
+    const blockTime = blockTimeCache(this.#chain.publicClient)
     const anchored: ContextObject[] = []
     const pending: (ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex })[] = []
     const skipped: { contextId: Hex; reason: string }[] = []
@@ -400,7 +441,10 @@ export class MidaAgent {
         skipped.push({ contextId: item.contextId, reason: "wrong-scope" })
         continue
       }
-      const verdict =
+      // The declared union matters: without it the ternary's inferred union collapses — the
+      // anchored ok-member is a subtype of the pending one and TS discards it, taking the
+      // anchorBlock verdict knew about with it.
+      const verdict: BatchedVerdict | PendingVerdict =
         item.state === "ANCHORED"
           ? await verifyBatchedItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient, requireLatest: true })
           : await verifyPendingItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient })
@@ -445,8 +489,14 @@ export class MidaAgent {
         payload,
       }
       if (item.state === "ANCHORED") {
-        // lineageId and version passed through the Merkle proof, so they are contract values here.
-        anchored.push({ ...base, lineageId: item.lineageId!, version: item.version! })
+        // lineageId and version passed through the Merkle proof, so they are contract values
+        // here. `anchorBlock` came back inside the verdict — the same `batchOf` answer — and its
+        // position inside the batch is the save's place in the chain's order.
+        const chain =
+          verdict.anchorBlock !== undefined
+            ? { at: await blockTime(verdict.anchorBlock), block: verdict.anchorBlock, index: item.position }
+            : undefined
+        anchored.push({ ...base, lineageId: item.lineageId!, version: item.version!, ...(chain === undefined ? {} : { chain }) })
       } else {
         // Nothing is anchored yet: derive the would-be head fields from the signed message itself.
         pending.push({
@@ -697,7 +747,8 @@ export class MidaAgent {
     const { deployment } = this.#chain
     const anchored = await this.#reader.getRecord(sealed.contextId)
     if (anchored !== null && anchored.manifestHash === sealed.manifestHash) {
-      return this.#toSentObject(anchored)
+      // already on chain — the stamp is still the record's own; only the log position is unknown
+      return this.#toSentObject(anchored, undefined, { at: anchored.createdAt })
     }
     const receipt = await sendContract(
       this.#chain,
@@ -730,7 +781,10 @@ export class MidaAgent {
     )
     const record = await this.#reader.getRecord(sealed.contextId)
     if (record === null) throw new MidaError("COMMITMENT_MISMATCH", "the registered record is missing after the transaction")
-    return this.#toSentObject(record, receipt.transactionHash)
+    return this.#toSentObject(record, receipt.transactionHash, {
+      at: record.createdAt,
+      ...receiptPlacement(receipt, sealed.contextId),
+    })
   }
 
   /** The grant that lets this agent write under an existing parent: SUPERSEDE_ANY, or SUPERSEDE_OWN on its own lineage. */
@@ -953,10 +1007,13 @@ export class MidaAgent {
     )
     const record = await this.#reader.getRecord(contextId)
     if (record === null) throw new MidaError("COMMITMENT_MISMATCH", "the registered record is missing after the transaction")
-    return { ...this.#toObject(record, args.name, payload), transactionHash: receipt.transactionHash }
+    return {
+      ...this.#toObject(record, args.name, payload, { at: record.createdAt, ...receiptPlacement(receipt, contextId) }),
+      transactionHash: receipt.transactionHash,
+    }
   }
 
-  #toObject(record: ContextRecordView, name: string, payload: ContextPayload): ContextObject {
+  #toObject(record: ContextRecordView, name: string, payload: ContextPayload, chain?: ContextObject["chain"]): ContextObject {
     return {
       contextId: record.contextId,
       owner: record.owner,
@@ -969,11 +1026,12 @@ export class MidaAgent {
       readEpoch: record.readEpoch,
       recordType: record.recordType === RECORD_TYPE.EVIDENCE ? "EVIDENCE" : "CONTEXT",
       payload,
+      ...(chain === undefined ? {} : { chain }),
     }
   }
 
   /** The on-chain view `sendSealed` returns — `ContextObject` minus the plaintext it cannot have. */
-  #toSentObject(record: ContextRecordView, transactionHash?: Hex): SentRecord {
+  #toSentObject(record: ContextRecordView, transactionHash?: Hex, chain?: ContextObject["chain"]): SentRecord {
     return {
       contextId: record.contextId,
       owner: record.owner,
@@ -986,6 +1044,7 @@ export class MidaAgent {
       readEpoch: record.readEpoch,
       recordType: record.recordType === RECORD_TYPE.EVIDENCE ? "EVIDENCE" : "CONTEXT",
       ...(transactionHash === undefined ? {} : { transactionHash }),
+      ...(chain === undefined ? {} : { chain }),
     }
   }
 }

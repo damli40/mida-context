@@ -34,9 +34,16 @@ export type BatchedVerifyReason =
 /** Every way `verifyPendingItem` can refuse, in the order the checks run. */
 export type PendingVerifyReason = "not-pending" | "ciphertext" | "manifest" | "signature" | "author" | "no-authority"
 
-export type BatchedVerdict = { ok: true; agentId: Hex } | { ok: false; reason: BatchedVerifyReason }
+/**
+ * `anchorBlock` is the block `batchOf` reports for the save's batch — the block the anchor
+ * transaction mined in, read from the contract during verification, never the store's word.
+ */
+export type BatchedVerdict = { ok: true; agentId: Hex; anchorBlock: bigint } | { ok: false; reason: BatchedVerifyReason }
 
-export type PendingVerdict = { ok: true; agentId: Hex } | { ok: false; reason: PendingVerifyReason }
+// `anchorBlock?: never` keeps the pending ok-member from swallowing the anchored one: pending
+// has no anchor block by definition, and without the marker `BatchedVerdict`'s ok-member is a
+// subtype of this one — unions built from both would silently reduce the anchored member away.
+export type PendingVerdict = { ok: true; agentId: Hex; anchorBlock?: never } | { ok: false; reason: PendingVerifyReason }
 
 /**
  * §BatchAnchor write path: the agent signs one `MidaBatchSaveV1` typed message per save under the
@@ -182,7 +189,7 @@ export async function verifyBatchedItem(input: {
     })
     if (!sameHex(head, expected)) return { ok: false, reason: "stale" }
   }
-  return { ok: true, agentId }
+  return { ok: true, agentId, anchorBlock: blockNumber }
 }
 
 /**

@@ -146,6 +146,29 @@ describe("buildWhatsNew", () => {
     expect(out.note).not.toContain("PENDING_ANCHOR")
   })
 
+  it("a save that lies about its clock does not head the note — Monad's placement picks the update", async () => {
+    const dir = home()
+    // Same author, both unseen: the future-dated claim has the EARLIER chain placement, so the
+    // note must name the save Monad recorded last — never the one claiming 2099.
+    const forged: StoredCheckpoint = {
+      ...cp("other-session", "0xauthorCodex", "2099-01-01T00:00:00.000Z", { progress: ["forged clock"] }),
+      chain: { at: BigInt(Math.floor(NOW / 1000) - 600), block: 10n, index: 0 },
+    }
+    const latest: StoredCheckpoint = {
+      ...cp("other-session", "0xauthorCodex", iso(2), { progress: ["the real latest work"] }),
+      // the chain's stamp deliberately differs from the claim — savedAt must be the chain's
+      chain: { at: BigInt(Math.floor(NOW / 1000) - 300), block: 11n, index: 0 },
+    }
+    const out = await buildWhatsNew(runtimeWith(dir), { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }, baseDeps([forged, latest]))
+    expect(out.kind).toBe("updates")
+    if (out.kind !== "updates") return
+    expect(out.note).toContain("the real latest work")
+    expect(out.note).not.toContain("forged clock")
+    expect(out.updates).toEqual([
+      { agent: "codex", savedAt: new Date((Math.floor(NOW / 1000) - 300) * 1000).toISOString() },
+    ])
+  })
+
   it("a foreign checkpoint already in the seen set answers none", async () => {
     const dir = home()
     const old = cp("other", "0xauthorCodex", iso(20))

@@ -33,6 +33,16 @@ export interface StoredCheckpoint {
   authorId: string
   /** The chain record's namespace — the context area this checkpoint lives in. */
   namespaceId: string
+  /**
+   * Monad's own placement of the save — carried by every record the SDK's reads return. `at` is
+   * the timestamp the chain stamped (the registry row's createdAt for a direct save, the anchor
+   * block's time for a batched one); `block` and `index` are its position in the chain's order
+   * (log index for a direct save, batch position for a batched one). Absent for a save the chain
+   * has not placed — a pending batched save, or a fixture built by hand — and `block`/`index`
+   * absent when only the stamp was recoverable. `checkpoint.createdAt` is the writer's claim and
+   * never orders anything: every comparison in this file runs on this field when it exists.
+   */
+  chain?: { at: bigint; block?: bigint; index?: number }
   /** Set only on records `mida migrate` moved here — the sealed envelope carried beside the checkpoint. */
   migration?: MigrationEnvelope
 }
@@ -66,9 +76,45 @@ export interface MergedHandoff {
   carriedForwardFromEarlierSave: boolean
 }
 
-const byTime = (a: StoredCheckpoint, b: StoredCheckpoint) =>
-  Date.parse(a.checkpoint.createdAt) - Date.parse(b.checkpoint.createdAt) ||
-  a.contextId.localeCompare(b.contextId)
+/**
+ * The instant a checkpoint is ordered by, in milliseconds: Monad's stamp whenever the record
+ * carries its chain placement — the checkpoint's own createdAt claim only when the chain never
+ * placed it (pending saves never reach the merge at all; this is for hand-built records).
+ */
+export const orderTime = (s: StoredCheckpoint): number =>
+  s.chain === undefined ? Date.parse(s.checkpoint.createdAt) : Number(s.chain.at) * 1000
+
+/** The ISO stamp a record is reported with — Monad's when carried, else the writer's claim. */
+export const recordedAt = (s: StoredCheckpoint): string =>
+  s.chain === undefined ? s.checkpoint.createdAt : new Date(Number(s.chain.at) * 1000).toISOString()
+
+/**
+ * The order Monad wrote the saves in: chain stamp, then block, then log index — the contextId
+ * only ever breaks a tie between records that carry none of those. A record the chain placed
+ * sorts after an unplaced one at the same instant (absent fields order first); a pending save
+ * never enters this comparison — the handoff keeps it out of the merge entirely.
+ */
+export const compareChainOrder = (a: StoredCheckpoint, b: StoredCheckpoint): number => {
+  const time = orderTime(a) - orderTime(b)
+  if (time !== 0) return time
+  const aBlock = a.chain?.block
+  const bBlock = b.chain?.block
+  if (aBlock !== undefined || bBlock !== undefined) {
+    if (aBlock === undefined) return -1
+    if (bBlock === undefined) return 1
+    if (aBlock !== bBlock) return aBlock < bBlock ? -1 : 1
+  }
+  const aIndex = a.chain?.index
+  const bIndex = b.chain?.index
+  if (aIndex !== undefined || bIndex !== undefined) {
+    if (aIndex === undefined) return -1
+    if (bIndex === undefined) return 1
+    if (aIndex !== bIndex) return aIndex - bIndex
+  }
+  return a.contextId.localeCompare(b.contextId)
+}
+
+const byTime = compareChainOrder
 
 // Dedupe key: JSON with object keys sorted, so two items that differ only in
 // key order ({decision, rationale} vs {rationale, decision}) collapse to one.
@@ -130,7 +176,7 @@ function mergedField<K extends ScalarKey>(cps: Checkpoint[], key: K, fallback: C
 }
 
 interface SessionChain {
-  checkpoints: StoredCheckpoint[] // members, sorted by createdAt then contextId
+  checkpoints: StoredCheckpoint[] // members, sorted by the chain's order, then contextId
   newest: StoredCheckpoint
   missing: boolean // a continuesSession link pointed at a session with no checkpoints
 }
@@ -186,13 +232,11 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
   for (const s of sorted) if (!visited.has(s.sessionId) && !targeted.has(s.sessionId)) buildChain(s.sessionId)
   for (const s of sorted) if (!visited.has(s.sessionId)) buildChain(s.sessionId)
 
-  // Newest chain first; equal timestamps break by contextId so input order
-  // never decides. A chain counts as WORKING when any of its checkpoints has
+  // Newest chain first by the chain's own order; equal placements break by contextId so input
+  // order never decides. A chain counts as WORKING when any of its checkpoints has
   // real content — a session that only asked a question must not displace
   // the session that did the work.
-  const byNewest = (a: SessionChain, b: SessionChain) =>
-    Date.parse(b.newest.checkpoint.createdAt) - Date.parse(a.newest.checkpoint.createdAt) ||
-    a.newest.contextId.localeCompare(b.newest.contextId)
+  const byNewest = (a: SessionChain, b: SessionChain) => compareChainOrder(b.newest, a.newest)
   const isWorking = (c: SessionChain) =>
     c.checkpoints.some(
       (s) =>
@@ -248,7 +292,7 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
     constraints: mergedList("constraints"),
     artifacts: mergedList("artifacts"),
     progress: mergedList("progress"),
-    provenance: scope.map((s) => ({ agent: s.checkpoint.agent, authorId: s.authorId, createdAt: s.checkpoint.createdAt, contextId: s.contextId, compiledBy: s.compiledBy })),
+    provenance: scope.map((s) => ({ agent: s.checkpoint.agent, authorId: s.authorId, createdAt: recordedAt(s), contextId: s.contextId, compiledBy: s.compiledBy })),
     otherSessions: ordered
       .filter((c) => c !== chosen)
       .slice(0, 5)
@@ -256,7 +300,7 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
         sessionId: c.newest.sessionId,
         agent: c.newest.checkpoint.agent,
         authorId: c.newest.authorId,
-        lastSavedAt: c.newest.checkpoint.createdAt,
+        lastSavedAt: recordedAt(c.newest),
         objective: c.newest.checkpoint.objective,
       })),
     missingEarlierSession: chosen.missing,

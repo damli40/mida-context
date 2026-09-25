@@ -404,7 +404,10 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
     anchoredItem = item!
     expect(anchoredItem.lineageId).toBe(honestSave.contextId)
     expect(anchoredItem.version).toBe(1)
-    expect(await verify(anchoredItem)).toEqual({ ok: true, agentId: agent.agentId })
+    const verdict = await verify(anchoredItem)
+    expect(verdict).toMatchObject({ ok: true, agentId: agent.agentId })
+    // the anchor block came back inside the verdict — the same batchOf answer that proved the root
+    expect(verdict.ok && verdict.anchorBlock > 0n).toBe(true)
   })
 
   it("one ciphertext byte flipped fails at the ciphertext check", async () => {
@@ -498,8 +501,8 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
     const v2Item = second.items.get(v2.contextId)!
     expect(v2Item.version).toBe(2)
     expect(await verify(v1Item, true)).toEqual({ ok: false, reason: "stale" })
-    expect(await verify(v1Item, false)).toEqual({ ok: true, agentId: agent.agentId })
-    expect(await verify(v2Item, true)).toEqual({ ok: true, agentId: agent.agentId })
+    expect(await verify(v1Item, false)).toMatchObject({ ok: true, agentId: agent.agentId })
+    expect(await verify(v2Item, true)).toMatchObject({ ok: true, agentId: agent.agentId })
   })
 
   it("an honest pending save verifies — QUEUED and SUBMITTED both count", async () => {

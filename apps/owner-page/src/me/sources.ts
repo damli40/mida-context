@@ -95,7 +95,16 @@ export const COUNTS_QUERY = `query MeCounts($owner: String!, $limit: Int!) {
     namespaceId
     provenanceSource
     createdAt
+    registeredBlock
     txHash
+  }
+  // one-condition where only — Hasura parses more, but the page's own shape guard reads commas
+  // naively; the kind filter runs client-side instead, and contextId rows are all we keep anyway
+  TimelineEntry(where: { owner: { _eq: $owner } }, limit: $limit) {
+    kind
+    contextId
+    block
+    logIndex
   }
 }`
 
@@ -149,6 +158,10 @@ export interface MePorts {
     getCapability(capabilityId: Hex): Promise<CapabilityView | null>
     getRecords(ids: Hex[]): Promise<(ContextRecordView | null)[]>
     batchRoot(batchId: Hex): Promise<Hex | null>
+    /** The block a batch anchored in (`batchOf().blockNumber`) — null when no such batch exists. */
+    batchBlock(batchId: Hex): Promise<bigint | null>
+    /** Monad's timestamp for a block, in seconds — null when the block could not be read. */
+    blockTime(block: bigint): Promise<number | null>
     ownerGrantLogs(owner: Address): Promise<GrantLog[]>
     agentIdOfSigner(signer: Address): Promise<Hex | null>
     getAgent(agentId: Hex): Promise<AgentRecord | null>
@@ -194,6 +207,15 @@ export interface RecordRow {
   ciphertext: Hex
   manifest: unknown
   createdAt: number
+  /**
+   * Monad's placement of the record when it is known: `at` is the chain's own stamp in
+   * milliseconds (the registry row's createdAt for a direct record, the anchor block's time for
+   * a batched one); `block`/`index` are its position in the chain's order. Absent for records
+   * the chain has not placed — pending saves and unverifiable rows — and `block`/`index` absent
+   * when only the stamp was recoverable. Ordering runs on this field; the writer's or store's
+   * own clock claims never do.
+   */
+  chain?: { at: number; block?: number; index?: number }
 }
 
 export interface MeData {
@@ -250,6 +272,10 @@ interface IndexBatchedSave {
   lineageId: string
   version: number
   agentId: string
+  /** The block the batch anchored in — the batch's place in the chain's order. */
+  block?: number
+  /** The save's position inside its batch — its order within the anchor block. */
+  position?: number
   txHash: string
 }
 
@@ -258,7 +284,17 @@ interface IndexRecord {
   namespaceId: string
   provenanceSource: number
   createdAt: string
+  /** The block the record registered in — the index's report of the chain's placement. */
+  registeredBlock?: number
   txHash: string
+}
+
+/** One timeline row — `context_registered` entries give a direct record its exact chain place. */
+interface IndexPlacement {
+  kind: string
+  contextId: string | null
+  block: number
+  logIndex: number
 }
 
 /** Envio's `_meta` view — one row per indexed chain, the index's own progress report. */
@@ -283,6 +319,7 @@ interface BatchedAnswer {
 interface CountsAnswer {
   Owner_by_pk?: { records: number; batchedSaves: number } | null
   ContextRecord?: IndexRecord[]
+  TimelineEntry?: IndexPlacement[]
 }
 
 // Wire shapes lifted off the route types so this module never re-declares the API's wire format.
@@ -515,6 +552,8 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
   const indexBatched = new Map<string, IndexBatchedSave>()
   const signerToAgent = new Map<string, Hex>()
   const indexRecords = new Map<string, IndexRecord>()
+  // contextId → the chain's placement of its ContextRegistered event (block + log index).
+  const timelineByContext = new Map<string, { block: number; index: number }>()
   let source: MeData["source"] = "index"
   let agentsUnavailable: string | null = null
   // The lag is measured against Monad's own block number — the index's self-reported lag is only
@@ -588,6 +627,13 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
           if (!isString(record.id) || !isString(record.namespaceId)) continue
           indexRecords.set(lower(record.id), record)
           areaIds.add(lower(record.namespaceId))
+        }
+        // context_registered timeline rows give each direct record its exact place in the chain —
+        // block and log index — for the same-second tie the block alone cannot break.
+        for (const entry of countsAnswer.TimelineEntry ?? []) {
+          if (entry.kind !== "context_registered") continue
+          if (!isString(entry.contextId) || !isNumber(entry.block) || !isNumber(entry.logIndex)) continue
+          timelineByContext.set(lower(entry.contextId), { block: entry.block, index: entry.logIndex })
         }
         if (countsAnswer.Owner_by_pk === null || countsAnswer.Owner_by_pk === undefined) {
           ownerCounts = { records: 0, batchedSaves: 0 } // no Owner row = nothing indexed yet
@@ -823,6 +869,27 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
   for (const object of listedObjects) {
     const record = chainRecords?.get(lower(object.contextId)) ?? null
     const indexRecord = indexRecords.get(lower(object.contextId))
+    const placement = timelineByContext.get(lower(object.contextId))
+    const createdAt =
+      record !== null
+        ? Number(record.createdAt) * 1000
+        : indexRecord !== undefined
+          ? (secondsOf(indexRecord.createdAt) ?? 0) * 1000
+          : 0
+    // The row's place in the chain's order, when any part of it is known: the stamp above is
+    // already Monad's (the chain record's word first, the index's report as the only fallback);
+    // the block and log index ride alongside whenever the index observed the register event.
+    const chain =
+      createdAt === 0
+        ? undefined
+        : {
+            at: createdAt,
+            ...(placement !== undefined
+              ? { block: placement.block, index: placement.index }
+              : indexRecord !== undefined && isNumber(indexRecord.registeredBlock)
+                ? { block: indexRecord.registeredBlock }
+                : {}),
+          }
     records.push({
       contextId: object.contextId,
       namespaceId: object.namespaceId,
@@ -839,12 +906,8 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
       batchId: null,
       ciphertext: object.ciphertext,
       manifest: object.manifest,
-      createdAt:
-        record !== null
-          ? Number(record.createdAt) * 1000
-          : indexRecord !== undefined
-            ? (secondsOf(indexRecord.createdAt) ?? 0) * 1000
-            : 0,
+      createdAt,
+      ...(chain === undefined ? {} : { chain }),
     })
   }
 
@@ -865,6 +928,24 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
     }
     return cached
   }
+
+  // The anchor block (and its timestamp) is the chain's placement for every save in one batch —
+  // looked up once per batchId/block and shared across its rows; a failed read degrades the
+  // row's chain field, never the page.
+  const memo = <K, V>(fn: (key: K) => Promise<V>) => {
+    const cache = new Map<string, Promise<V>>()
+    return (key: K): Promise<V> => {
+      const id = String(key)
+      let hit = cache.get(id)
+      if (hit === undefined) {
+        hit = fn(key)
+        cache.set(id, hit)
+      }
+      return hit
+    }
+  }
+  const anchorBlockOf = memo((batchId: Hex) => safe(() => ports.chain.batchBlock(batchId)))
+  const blockTimeOf = memo((block: bigint) => safe(() => ports.chain.blockTime(block)))
 
   for (const { item, namespaceId: listedUnder } of listedBatched) {
     const message = wireMessageOf(item)
@@ -950,6 +1031,25 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
         state = "unverified"
       }
     }
+    // An anchored save's stamp is the anchor block's own timestamp — the store's receivedAt is
+    // the queue's clock, which never orders the list. The position inside the batch is the
+    // save's order within that block; the index's row supplies it when the store's item didn't.
+    let chain: RecordRow["chain"] | undefined
+    if (state === "anchored") {
+      const batchIdForBlock = (item.batchId ?? indexRow?.batchId ?? null) as Hex | null
+      const anchorBlock =
+        batchIdForBlock !== null
+          ? (await anchorBlockOf(batchIdForBlock)) ?? (indexRow?.block !== undefined ? BigInt(indexRow.block) : null)
+          : null
+      if (anchorBlock !== null) {
+        const at = await blockTimeOf(anchorBlock)
+        // A stamp we could not read orders nothing — better no placement than a guessed one.
+        if (at !== null) {
+          const position = item.position ?? indexRow?.position
+          chain = { at: at * 1000, block: Number(anchorBlock), ...(position === undefined ? {} : { index: position }) }
+        }
+      }
+    }
     const rowNamespace = message?.namespaceId ?? (indexRow?.namespaceId as Hex | undefined) ?? listedUnder
     records.push({
       contextId: item.contextId,
@@ -965,7 +1065,8 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
       batchId: item.batchId ?? (indexRow?.batchId as Hex | undefined) ?? null,
       ciphertext: item.save.ciphertext,
       manifest: item.save.manifest,
-      createdAt: isNumber(item.receivedAt) ? item.receivedAt : 0,
+      createdAt: chain?.at ?? (isNumber(item.receivedAt) ? item.receivedAt : 0),
+      ...(chain === undefined ? {} : { chain }),
     })
   }
 
@@ -974,7 +1075,29 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
   const recordsUnavailable =
     areaIds.size > 0 && objectsFailed === areaIds.size && batchedFailed === areaIds.size
 
-  records.sort((a, b) => b.createdAt - a.createdAt || (a.contextId < b.contextId ? -1 : a.contextId > b.contextId ? 1 : 0))
+  // Monad's order, newest first: the chain's stamp, then block, then the record's position in
+  // it. A record the chain never placed sorts behind placed ones at the same instant; only when
+  // nothing but the instant is known does the contextId break the tie — a random id never
+  // outranks a real placement.
+  records.sort((a, b) => {
+    const t = (b.chain?.at ?? b.createdAt) - (a.chain?.at ?? a.createdAt)
+    if (t !== 0) return t
+    const aBlock = a.chain?.block
+    const bBlock = b.chain?.block
+    if (aBlock !== undefined || bBlock !== undefined) {
+      if (aBlock === undefined) return 1
+      if (bBlock === undefined) return -1
+      if (aBlock !== bBlock) return bBlock - aBlock
+    }
+    const aIndex = a.chain?.index
+    const bIndex = b.chain?.index
+    if (aIndex !== undefined || bIndex !== undefined) {
+      if (aIndex === undefined) return 1
+      if (bIndex === undefined) return -1
+      if (aIndex !== bIndex) return bIndex - aIndex
+    }
+    return a.contextId < b.contextId ? -1 : a.contextId > b.contextId ? 1 : 0
+  })
   const agentList = [...agents.values()].sort(
     (a, b) => a.name.localeCompare(b.name) || (a.agentId < b.agentId ? -1 : 1),
   )

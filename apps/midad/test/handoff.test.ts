@@ -542,6 +542,27 @@ describe("buildHandoff", () => {
     expect(result.seen).toEqual([foreign.contextId])
   })
 
+  it("the covered set and savedAt follow Monad's placement, not the checkpoint's claimed clock", async () => {
+    // The saver's createdAt is untrusted content: an earlier chain save claiming 2099 must not
+    // head the handoff or reorder the covered set. `chain` is what the SDK's reads carry.
+    const forgedClock = stored(
+      { eventId: "cp-forged", agent: "claude-code", createdAt: "2099-01-01T00:00:00.000Z", objective: "earlier save, forged clock" },
+      { sessionId: "s-earlier", contextId: `0x${"1".repeat(64)}`, chain: { at: 1_000n, block: 5n, index: 0 } },
+    )
+    const realLatest = stored(
+      { eventId: "cp-latest", agent: "codex", createdAt: "2026-09-21T10:00:00.000Z", objective: "truly latest save" },
+      { sessionId: "s-later", contextId: `0x${"2".repeat(64)}`, chain: { at: 2_000n, block: 9n, index: 0 } },
+    )
+    const { d } = deps({ read: async () => ({ checkpoints: [forgedClock, realLatest], skipped: 0, milliseconds: 1, partial: false }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("Objective: truly latest save")
+    expect(result.savedAt).toBe(new Date(2_000 * 1_000).toISOString())
+    // covered ids arrive oldest-chain-first, so the seen set caps the right end
+    expect(result.seen).toEqual([forgedClock.contextId, realLatest.contextId])
+  })
+
   it("an author id the runtime does not know renders as 'unknown agent', never undefined", async () => {
     const foreign = stored({}, { authorId: `0x${"f".repeat(64)}` })
     const { d } = deps({ read: async () => ({ checkpoints: [foreign], skipped: 0, milliseconds: 1, partial: false }) })
