@@ -723,16 +723,20 @@ describe("F3 — surviving agents always get the new key", () => {
       agentRow({ agentId: AGENT_ID, name: "codex", grants: [grantRow()] }),
       agentRow({ agentId: SURVIVOR_A, name: "claude-code", grants: [grantRow({ capabilityId: `0x${"56".repeat(32)}` as Hex })] }),
     ]
-    // the same contract the boot path keeps: repairOffered survives the reload, and the repair
-    // callback re-reads the world before asking the chain who still holds READ
+    // the same contract the boot path keeps: repairOffered survives the reload, the repair
+    // callback re-reads the world, and the epochs the revoke was built against gate the action
     let repairOffered = false
+    let repairEpochs: { namespaceId: Hex; epoch: bigint }[] = []
     const render = (): void => {
       const root = renderMe(meData({ agents }), doc) as unknown as FakeEl
       mount.replaceChildren(root)
       wireRevokePanels(root as unknown as HTMLElement, doc, agents, {
         run: async (agent, progress) => {
           const result = await revokeFromMe({ ...env, progress }, { signedInOwner: OWNER, agentId: agent.agentId, agents })
-          if (result.status === "pending" || result.rewrapFailed.length > 0) repairOffered = true
+          if (result.status === "pending" || result.rewrapFailed.length > 0) {
+            repairOffered = true
+            repairEpochs = result.epochsAtRevoke
+          }
           return result
         },
         reload: () => {
@@ -740,7 +744,8 @@ describe("F3 — surviving agents always get the new key", () => {
         },
         repair: !repairOffered
           ? undefined
-          : (progress) => repairReaderWrapsFromMe({ ...env, progress }, { signedInOwner: OWNER, agents }),
+          : (progress) =>
+              repairReaderWrapsFromMe({ ...env, progress }, { signedInOwner: OWNER, agents, epochsAtRevoke: repairEpochs }),
       })
     }
     render()
@@ -750,11 +755,20 @@ describe("F3 — surviving agents always get the new key", () => {
     await vi.waitFor(() => {
       expect(mount.querySelector("[data-repair-wraps]")).not.toBeNull()
     })
+    // clicking while the chain still reports the pre-rotation epoch is refused in words — the
+    // repair never opens a ceremony on the old key
     mount.querySelector("[data-repair-run]")!.click()
     await vi.waitFor(() => {
-      // the survivor got the current epoch's wrap; the revoked agent was skipped by the chain's
+      expect(mount.textContent).toContain("Waiting for the revoke to land on Monad")
+    })
+    expect(wraps).toHaveLength(0)
+    // the pending transaction lands — the chain's required epoch moves, and the next click runs
+    sends.push({ functionName: "revokeAgentAndRotate", kind: "revoke.agent" })
+    mount.querySelector("[data-repair-run]")!.click()
+    await vi.waitFor(() => {
+      // the survivor got the NEW epoch's wrap; the revoked agent was skipped by the chain's
       // own hasAuthority check
-      expect(wraps.some((w) => w.agentId === SURVIVOR_A && w.namespaceId === NS_ID)).toBe(true)
+      expect(wraps.some((w) => w.agentId === SURVIVOR_A && w.namespaceId === NS_ID && w.readEpoch === "2")).toBe(true)
     })
     expect(wraps.some((w) => w.agentId === AGENT_ID)).toBe(false)
     // a clean run retires the action
@@ -829,5 +843,86 @@ describe("H1 — no revoke or repair without the complete agent list", () => {
     ).rejects.toThrow("Revoke needs the full agent list")
     expect(credentials.calls).toHaveLength(0)
     expect(wraps).toHaveLength(0)
+  })
+})
+
+// --- H2: repair is allowed only once the chain reports the rotation it is fixing --------------
+
+describe("H2 — repair waits for the rotation to land", () => {
+  function grantRow(over: Partial<AgentRow["grants"][number]> = {}): AgentRow["grants"][number] {
+    return {
+      namespaceId: NS_ID,
+      area: "preferences.communication",
+      permissions: PERMISSION.READ,
+      capabilityId: CAP_ID,
+      status: { label: "Can read", flagged: false },
+      approvedTx: null,
+      ...over,
+    }
+  }
+
+  it("the revoke result carries the read epoch it was built against, per rotated area", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends) })
+    const result = await revokeFromMe(env, {
+      signedInOwner: OWNER,
+      agentId: AGENT_ID,
+      agents: [agentRow({ agentId: AGENT_ID, grants: [grantRow()] }), agentRow({ agentId: SURVIVOR_A, grants: [grantRow()] })],
+    })
+    expect(result.status).toBe("success")
+    // the snapshot is the chain's word at build time — repair waits for strictly higher
+    expect(result.epochsAtRevoke).toEqual([{ namespaceId: NS_ID, epoch: 1n }])
+  })
+
+  it("a repair during the pending window refuses — no ceremony, no old-epoch wraps", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const sponsor = {
+      async send(): Promise<SponsoredReceipt> {
+        throw new SponsorPending(`0x${"ee".repeat(32)}` as Hex)
+      },
+    }
+    // the sponsor never recorded the send, so the fake chain still reports epoch 1 — the
+    // pending window exactly as Monad would answer it.
+    const { env, credentials } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends), sponsor })
+    const agents = [agentRow({ agentId: AGENT_ID, grants: [grantRow()] }), agentRow({ agentId: SURVIVOR_A, grants: [grantRow()] })]
+    const result = await revokeFromMe(env, { signedInOwner: OWNER, agentId: AGENT_ID, agents })
+    expect(result.status).toBe("pending")
+    await expect(
+      repairReaderWrapsFromMe(env, { signedInOwner: OWNER, agents, epochsAtRevoke: result.epochsAtRevoke }),
+    ).rejects.toThrow("Waiting for the revoke to land on Monad")
+    // one passkey prompt total — the revoke's; the refused repair never opened a ceremony and
+    // never re-sent an epoch-1 wrap
+    expect(credentials.calls).toHaveLength(1)
+    expect(wraps).toHaveLength(0)
+  })
+
+  it("once the chain reports the newer epoch the same repair publishes wraps for it", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const sponsor = {
+      async send(): Promise<SponsoredReceipt> {
+        throw new SponsorPending(`0x${"ee".repeat(32)}` as Hex)
+      },
+    }
+    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends), sponsor })
+    const agents = [agentRow({ agentId: AGENT_ID, grants: [grantRow()] }), agentRow({ agentId: SURVIVOR_A, grants: [grantRow()] })]
+    const result = await revokeFromMe(env, { signedInOwner: OWNER, agentId: AGENT_ID, agents })
+    expect(result.status).toBe("pending")
+    // the pending transaction lands — the chain's required epoch moves to 2
+    sends.push({ functionName: "revokeAgentAndRotate", kind: "revoke.agent" })
+    const outcome = await repairReaderWrapsFromMe(env, {
+      signedInOwner: OWNER,
+      agents,
+      epochsAtRevoke: result.epochsAtRevoke,
+    })
+    expect(outcome.failed).toHaveLength(0)
+    expect(outcome.rewrapped).toEqual([SURVIVOR_A])
+    // the wrap the survivor actually needed — the post-rotation epoch — was published
+    expect(wraps.some((w) => w.agentId === SURVIVOR_A && w.readEpoch === "2")).toBe(true)
   })
 })

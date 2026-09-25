@@ -30,6 +30,7 @@ import type { OwnerLinkResult as FlowResult } from "@mida/protocol"
 import { chipsFor, isTxHash, provenanceBadge } from "./model.js"
 import type { Badge } from "./model.js"
 import { repairReaderWrapsFromMe, revokeFromMe } from "./revoke.js"
+import type { MeRevokeResult } from "./revoke.js"
 import { boundedScanClient, scanWithDeadline } from "./logscan.js"
 import { AGENT_LIST_UNAVAILABLE, BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
 import type { AgentRow, GrantLog, MeData, MePorts, RecordRow } from "./sources.js"
@@ -846,8 +847,10 @@ function boot(): void {
       const storeHandle = revocableStore(ports.store)
       ports.store = storeHandle.port
       // The repair action lives across reloads: set when a revoke ends pending or leaves a
-      // reader un-wrapped, cleared when a repair run finishes clean.
+      // reader un-wrapped, cleared when a repair run finishes clean. The epochs the revoke was
+      // built against travel with it — until the chain passes them, the action waits.
       let repairOffered = false
+      let repairEpochs: MeRevokeResult["epochsAtRevoke"] = []
       // Every render is a fresh read; after a revoke lands (or goes pending) the same refresh
       // runs again — the page re-reads, it does not assume.
       const refresh = async (): Promise<void> => {
@@ -868,7 +871,10 @@ function boot(): void {
                 agentsUnavailable: fresh.agentsUnavailable,
               },
             )
-            if (result.status === "pending" || result.rewrapFailed.length > 0) repairOffered = true
+            if (result.status === "pending" || result.rewrapFailed.length > 0) {
+              repairOffered = true
+              repairEpochs = result.epochsAtRevoke
+            }
             return result
           },
           reload: refresh,
@@ -882,6 +888,7 @@ function boot(): void {
                     signedInOwner: session.owner,
                     agents: fresh.agents,
                     agentsUnavailable: fresh.agentsUnavailable,
+                    epochsAtRevoke: repairEpochs,
                   },
                 )
                 if (outcome.failed.length === 0) repairOffered = false
