@@ -121,6 +121,29 @@ function isScaffolding(obj: TranscriptLine, text: string): boolean {
   return CLAUDE_SCAFFOLD_PREFIXES.some((pre) => t.startsWith(pre))
 }
 
+// A custom slash command's real ask hides inside its echo: Claude Code logs
+// `/brainstorm build a login page` as <command-name>/<command-message>/
+// <command-args>, so the request is "/name args". Returns null for a built-in —
+// the commands Claude Code answers with a <local-command-caveat> or
+// <local-command-stdout>/<stderr> block carry no user ask — and for a bare
+// echo whose <command-args> is empty or absent (e.g. /compact, /clear).
+function slashCommandRequest(text: string): string | null {
+  const t = text.trim()
+  if (!t.startsWith("<command-name>")) return null
+  const name = /^<command-name>\s*(\/\S+)\s*<\/command-name>/.exec(t)?.[1]
+  if (name === undefined) return null
+  if (
+    t.includes("<local-command-caveat>") ||
+    t.includes("<local-command-stdout>") ||
+    t.includes("<local-command-stderr>")
+  ) {
+    return null
+  }
+  const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(t)?.[1]?.trim()
+  if (args === undefined || args === "") return null
+  return `${name} ${args}`
+}
+
 // The request text of one user line: the string content, or the joined
 // `text` parts of array content. Returns "" for a bare tool_result (or
 // anything without real text) so the caller keeps looking at later lines.
@@ -219,8 +242,16 @@ export function readConversation(
     let picked = false
     if (firstUserMessage === null && obj.type === "user") {
       const t = userRequestText(obj.message?.content)
-      if (t && !isScaffolding(obj, t)) {
-        firstUserMessage = hardCut(scrubSecrets(t), FIRST_USER_CHARS)
+      // A slash-command echo is scaffolding-shaped, but a custom command's
+      // <command-args> ARE the ask — try that extraction before the
+      // scaffolding test drops the line. isMeta/isCompactSummary lines never
+      // yield a request either way.
+      const request =
+        t !== "" && obj.isMeta !== true && obj.isCompactSummary !== true
+          ? (slashCommandRequest(t) ?? (isScaffolding(obj, t) ? null : t))
+          : null
+      if (request !== null) {
+        firstUserMessage = hardCut(scrubSecrets(request), FIRST_USER_CHARS)
         picked = true
       }
     }
