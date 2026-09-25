@@ -6,8 +6,10 @@ import { BaseError } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, loadAgentIdentity, loadOrCreateOwnerSecrets, ownerCommandNotice, runCli, runCliWithRuntime } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, loadAgentIdentity, loadOrCreateOwnerSecrets, ownerCommandNotice, runCli, runCliWithRuntime, FileAccessRequestStore } from "@mida/midad"
 import type { Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
+import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
+import type { AccessRequest, Hex } from "@mida/protocol"
 
 describe("the crude mida command", () => {
   let env: ScenarioEnvironment
@@ -508,6 +510,49 @@ describe("the crude mida command", () => {
     expect(lines.at(-1)).toBe("approved: codex; failed: cursor (no-pending-request)")
     expect(home.has("agents/codex/pending-request.json")).toBe(false)
     home.remove("agents/cursor/pending-request.json")
+  }, 300_000)
+
+  it("approve --all runs the grant advisor per agent and never sends an expired request", async () => {
+    const lines: string[] = []
+    const asked: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async (question) => { asked.push(question); return "yes" },
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // a real pending request for claude-code — then its validity window is moved into the past
+    // and it is re-signed with the agent's own signer key, so the advisor's freshness check is
+    // the only thing that refuses it
+    expect(await run2("revoke", "claude-code")).toBe(0)
+    expect(await run2("request", "claude-code")).toBe(0)
+    const identity = loadAgentIdentity(home, "claude-code")!
+    const original = home.readJson<{ request: AccessRequest }>("agents/claude-code/pending-request.json")!.request
+    const { agentSignature: _dropped, ...unsigned } = original
+    const now = BigInt(Math.floor(Date.now() / 1000))
+    const stale = {
+      ...unsigned,
+      requestId: `0x${"ee".repeat(32)}` as Hex,
+      issuedAt: encodeUint64(now - 400n),
+      requestExpiresAt: encodeUint64(now - 300n),
+    }
+    const expired = { ...stale, agentSignature: await privateKeyToAccount(identity.signerPrivateKey).signTypedData(accessRequestTypedData(stale)) }
+    await new FileAccessRequestStore(home, "claude-code").save(expired)
+    home.writeSecretJson("agents/claude-code/pending-request.json", { request: expired })
+
+    // the expired request is named and excluded BEFORE the ask — no prompt, nothing signed
+    expect(await run2("approve", "--all")).toBe(1)
+    expect(asked).toHaveLength(0)
+    expect(lines.some((line) => line.includes("claude-code") && line.includes("has expired") && line.includes("`mida request claude-code`"))).toBe(true)
+    expect(lines.at(-1)).toBe("approved: none; failed: claude-code (REQUEST_EXPIRED)")
+    // and the stale request still waits — nothing consumed it
+    expect(home.has("agents/claude-code/pending-request.json")).toBe(true)
+
+    // a fresh request passes the advisor; its verdict is part of the one combined list
+    expect(await run2("request", "claude-code")).toBe(0)
+    expect(await run2("approve", "--all")).toBe(0)
+    expect(lines.some((line) => line.startsWith("grant advisor:"))).toBe(true)
+    expect(lines.at(-1)).toBe("approved: claude-code")
   }, 300_000)
 
   it("a partial approve --all still kicks the daemon — one agent's grant landed", async () => {

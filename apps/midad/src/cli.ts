@@ -27,7 +27,7 @@ import type { Network } from "./runtime.js"
 import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag } from "./network.js"
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
-import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint } from "./skeleton.js"
+import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, pendingApprovalAdvice, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint } from "./skeleton.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerMode } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
 import { migrate, migrateUndo } from "./migrate.js"
@@ -497,16 +497,19 @@ function pendingAgents(home: MidaHome): string[] {
  * a wrong grant.
  */
 function printPendingApprovals(deps: CliDeps, home: MidaHome, agents: string[], projectId: string | undefined): void {
-  for (const name of agents) {
-    deps.print(`${name} is asking for:`)
-    if (projectId !== undefined) deps.print(`  project ${projectId} (this folder)`)
-    const pending = home.readJson<{ request?: { scopes?: RequestedScope[]; capabilityExpiresAt?: string } }>(`agents/${name}/pending-request.json`)?.request
-    for (const scope of pending?.scopes ?? []) {
-      deps.print(`  ${namespaceLabel(scope.namespaceId)}: ${permissionNames(scope.permissions).join(" + ")}`)
-    }
-    if (pending?.capabilityExpiresAt !== undefined) {
-      deps.print(`  until ${new Date(Number(decodeUint64(pending.capabilityExpiresAt)) * 1000).toISOString()}`)
-    }
+  for (const name of agents) printPendingAsk(deps, home, name, projectId)
+}
+
+/** One agent's ask inside the combined preview — the same lines a single approve shows. */
+function printPendingAsk(deps: CliDeps, home: MidaHome, name: string, projectId: string | undefined): void {
+  deps.print(`${name} is asking for:`)
+  if (projectId !== undefined) deps.print(`  project ${projectId} (this folder)`)
+  const pending = home.readJson<{ request?: { scopes?: RequestedScope[]; capabilityExpiresAt?: string } }>(`agents/${name}/pending-request.json`)?.request
+  for (const scope of pending?.scopes ?? []) {
+    deps.print(`  ${namespaceLabel(scope.namespaceId)}: ${permissionNames(scope.permissions).join(" + ")}`)
+  }
+  if (pending?.capabilityExpiresAt !== undefined) {
+    deps.print(`  until ${new Date(Number(decodeUint64(pending.capabilityExpiresAt)) * 1000).toISOString()}`)
   }
 }
 
@@ -525,7 +528,30 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
   // The marker resolves before the list, exactly as a single approve resolves it before the ask:
   // a folder that may not hold a project refuses here, before any signature.
   const marker = deps.cwd === undefined ? undefined : ensureProjectMarker(deps.cwd)
-  printPendingApprovals(deps, runtime.home, agents, marker?.projectId)
+  // Each pending agent gets the same gate a single approve runs before its prompt — the ask, then
+  // the grant advisor's verdict, printed into this one list. A request that fails the advisor's
+  // current-request checks (expired, consumed, stale signature) is named here and excluded before
+  // the prompt — nothing is ever sent for it.
+  const ready: string[] = []
+  const failed: string[] = []
+  for (const name of agents) {
+    printPendingAsk(deps, runtime.home, name, marker?.projectId)
+    try {
+      const advice = await pendingApprovalAdvice(runtime, name)
+      deps.print(`grant advisor: ${advice.risk} risk; recommends ${advice.recommended.length} scope(s) until ${new Date(Number(decodeUint64(advice.recommendedExpiresAt)) * 1000).toISOString()}`)
+      for (const warning of advice.warnings) deps.print(`  ${warning.severity}: ${warning.messageKey}`)
+      ready.push(name)
+    } catch (error) {
+      deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry))
+      failed.push(`${name} (${refusalCode(error)})`)
+    }
+  }
+  // Every pending request failed the gate — there is nothing left to confirm, so the batch ends
+  // with the verdict instead of an ask.
+  if (ready.length === 0) {
+    deps.print(`approved: none${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
+    return 1
+  }
   deps.print("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
   const prompt = deps.prompt ?? terminalPrompt
   const drain = deps.drainInput ?? drainBufferedStdin
@@ -535,8 +561,7 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
     return 1
   }
   const approved: string[] = []
-  const failed: string[] = []
-  for (const name of agents) {
+  for (const name of ready) {
     try {
       const result = await approve(runtime, name, deps.cwd)
       approved.push(name)

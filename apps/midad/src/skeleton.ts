@@ -368,6 +368,28 @@ async function grantAdviceFor(runtime: Runtime, name: string, request: AccessReq
   return adviseGrant({ request, manifest, agentRecord, ownerHistory: history, now })
 }
 
+/**
+ * approve --all's per-agent gate, run while the combined list prints: the same checks a single
+ * approve makes before its prompt, in the same order — the pending file must name a request the
+ * store still holds (not consumed, never replayed), then the grant advisor must accept it
+ * (freshness, signature, manifest, all of assertRequestIsCurrent). Whatever fails throws the
+ * coded refusal the batch names in its verdict and the agent is excluded before the one typed
+ * yes — an expired or stale request is never carried to the signing step.
+ */
+export async function pendingApprovalAdvice(runtime: Runtime, name: string): Promise<GrantAdvice> {
+  const { home } = runtime
+  const identity = loadAgentIdentity(home, name)
+  const pending = home.readJson<{ request?: AccessRequest }>(`agents/${name}/pending-request.json`)
+  if (identity === undefined || pending?.request === undefined) {
+    throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
+  }
+  const stored = await new FileAccessRequestStore(home, name).load(pending.request.requestId)
+  if (stored === undefined || stored.consumed) {
+    throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
+  }
+  return grantAdviceFor(runtime, name, pending.request, identity.manifest)
+}
+
 /** Spec §5B steps 3–4: the owner approves the pending request on-chain; the agent checks the result and keeps the grant. */
 export async function approve(
   runtime: Runtime,
