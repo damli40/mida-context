@@ -6,7 +6,7 @@ import { BaseError } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, loadAgentIdentity, loadOrCreateOwnerSecrets, ownerCommandNotice, runCli, runCliWithRuntime, FileAccessRequestStore } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, ownerCommandNotice, runCli, runCliWithRuntime, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
 import type { Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
@@ -607,7 +607,7 @@ describe("the crude mida command", () => {
     asked.length = 0
     expect(await run2("revoke", "--all")).toBe(0)
     expect(asked).toHaveLength(0)
-    expect(lines.at(-1)).toBe("nothing to revoke — no agent holds an approval")
+    expect(lines.at(-1)).toBe("nothing to revoke — no agent in this Mida home holds an approval")
   }, 300_000)
 
   it("revoke --all with anything but yes revokes nobody (I4)", async () => {
@@ -665,6 +665,66 @@ describe("the crude mida command", () => {
     // codex's revoke really landed even though cursor's failed — marker written, daemon poked
     expect(home.has("agents/codex/revoked.json")).toBe(true)
     expect(kicks).toHaveLength(1)
+  }, 300_000)
+
+  it("revoke --all scans every agents folder — a stray grant is listed, an expired grant is not, a broken identity is named", async () => {
+    const lines: string[] = []
+    const asked: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async (question) => { asked.push(question); return "yes" },
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    const owner = loadOwnerAddress(home)!
+    const grant = (agentId: Hex, expiresAt: string) => [
+      {
+        owner,
+        agentId,
+        requestId: `0x${"33".repeat(32)}`,
+        capabilities: [
+          {
+            namespaceId: `0x${"55".repeat(32)}`,
+            permissions: 1,
+            provenancePolicy: 0,
+            expiresAt,
+            capabilityId: `0x${"66".repeat(32)}`,
+            transactionHash: `0x${"77".repeat(32)}`,
+          },
+        ],
+      },
+    ]
+    // stray: no identity.json at all — grants.json alone must still put it on the list
+    home.writeSecretJson("agents/stray/grants.json", grant(`0x${"44".repeat(32)}` as Hex, "0"))
+    // stale: a loadable identity, but its only grant record expired long ago — not an approval
+    saveAgentIdentity(home, {
+      name: "stale",
+      agentId: `0x${"88".repeat(32)}` as Hex,
+      signerPrivateKey: `0x${"99".repeat(32)}` as Hex,
+      encryptionPrivateKey: `0x${"aa".repeat(32)}` as Hex,
+      encryptionPublicKey: `0x${"bb".repeat(32)}` as Hex,
+      callbackOrigin: "https://stale.mida.example",
+      purposeId: "project_assistance",
+      manifest: {} as never,
+      manifestHash: `0x${"cc".repeat(32)}` as Hex,
+    })
+    home.writeSecretJson("agents/stale/grants.json", grant(`0x${"88".repeat(32)}` as Hex, "1700000000"))
+    // cursor's folder survives the earlier test empty — an agent whose identity cannot be loaded
+    // is reported by name, never silently dropped from the scan
+    expect(home.has("agents/cursor/identity.json")).toBe(false)
+
+    expect(await run2("revoke", "--all")).toBe(1)
+    expect(lines).toContain("stray holds an approval")
+    expect(lines).not.toContain("stale holds an approval")
+    expect(lines).toContain("cursor is not set up on this machine — run `mida init` first")
+    expect(asked).toEqual(["Type yes to revoke all: "])
+    // stray's listed grant turns out to hold nothing on chain — reported, not counted as revoked
+    expect(lines).toContain("stray: nothing to revoke")
+    expect(lines.at(-1)).toBe("revoked: none; failed: cursor (agent-unidentified)")
+    home.remove("agents/stray/grants.json")
+    home.remove("agents/stray/revoked.json")
+    home.remove("agents/stale/grants.json")
+    home.remove("agents/stale/identity.json")
   }, 300_000)
 
   it("never prints a secret: no output line contains any key stored in the home folder", () => {

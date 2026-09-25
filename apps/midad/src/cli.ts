@@ -28,7 +28,7 @@ import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag }
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
 import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, pendingApprovalAdvice, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint } from "./skeleton.js"
-import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerMode } from "./keys.js"
+import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOwnerMode } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
 import { migrate, migrateUndo } from "./migrate.js"
 import { OwnerLinkOutcome, approvePasskey, initPasskey, provisionPasskeyAgents, revokePasskey } from "./owner-link/flows.js"
@@ -588,22 +588,57 @@ async function kickDaemonNow(deps: CliDeps): Promise<void> {
 }
 
 /**
- * The agents `revoke --all` lists: every registered identity that still holds an approval — a live
+ * The agents `revoke --all` lists: every `agents/*` folder that still holds an approval — a live
  * capability on chain, or a grants.json left by a grant that completed while no revoked marker says
- * it was taken back. The chain answers first; the local file only adds an agent the chain cannot
- * show (a signed grant that was never proved, or one already dead the folder never heard about).
- * A resolveAgentId failure propagates: a permission problem must never silently drop an agent from
- * the list the owner is about to confirm.
+ * it was taken back and whose last listed expiry is still ahead. Scanning the folders themselves —
+ * not only the names with a readable identity.json — is what lets a damaged or partially written
+ * folder still be checked: resolveAgentId falls back to signer.json and grants.json, and a folder
+ * it cannot identify at all is returned in `unidentifiable` so the owner sees the name rather than
+ * the agent silently vanishing from the batch. The chain answers first; the local file only adds
+ * an agent the chain cannot show (a signed grant that was never proved, or one already dead the
+ * folder never heard about), and only while some capability in it has not expired. A chain or
+ * permission error propagates: a temporary failure must never silently drop an agent from the
+ * list the owner is about to confirm.
  */
-async function approvedAgents(runtime: ServiceRuntime): Promise<string[]> {
+async function approvedAgents(runtime: ServiceRuntime): Promise<{ held: string[]; unidentifiable: { name: string; error: unknown }[] }> {
+  const { home } = runtime
   const held: string[] = []
-  for (const name of listAgentNames(runtime.home)) {
-    const agentId = await resolveAgentId(runtime, name)
-    if (await hasAnyLiveCapability(runtime, agentId) || (runtime.home.has(`agents/${name}/grants.json`) && !isRevoked(runtime.home, name))) {
-      held.push(name)
+  const unidentifiable: { name: string; error: unknown }[] = []
+  const now = BigInt(Math.floor(Date.now() / 1000))
+  for (const name of home.list("agents").filter((entry) => READ_AS_NAME.test(entry)).sort()) {
+    let agentId: Hex
+    try {
+      agentId = await resolveAgentId(runtime, name)
+    } catch (error) {
+      // "agent-unidentified" means the folder's local evidence ran out — report it by name and go
+      // on. Anything else (a chain read, a permission problem) stays a hard failure.
+      if (refusalCode(error) !== "agent-unidentified") throw error
+      unidentifiable.push({ name, error })
+      continue
     }
+    if (await hasAnyLiveCapability(runtime, agentId)) {
+      held.push(name)
+      continue
+    }
+    if (!home.has(`agents/${name}/grants.json`) || isRevoked(home, name)) continue
+    // The file's record counts only while some capability in it could still be live — an
+    // all-expired grants.json is not "holds an approval". A file that cannot be read or parsed
+    // cannot prove expiry either, so it still counts; the revoke itself then answers honestly.
+    let fileShowsHeld = true
+    try {
+      fileShowsHeld = loadGrants(home, name).some((grant) =>
+        grant.capabilities.some((capability) => {
+          const expiresAt = decodeUint64(capability.expiresAt)
+          return expiresAt === 0n || expiresAt > now
+        }),
+      )
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === "EACCES" || code === "EPERM") throw error
+    }
+    if (fileShowsHeld) held.push(name)
   }
-  return held
+  return { held, unidentifiable }
 }
 
 /**
@@ -613,12 +648,22 @@ async function approvedAgents(runtime: ServiceRuntime): Promise<string[]> {
  * agent still runs; the last line is the verdict. Nobody approved says so and exits 0.
  */
 async function revokeAll(runtime: Runtime, deps: CliDeps): Promise<number> {
-  const agents = await approvedAgents(runtime)
-  if (agents.length === 0) {
-    deps.print("nothing to revoke — no agent holds an approval")
+  const scan = await approvedAgents(runtime)
+  if (scan.held.length === 0 && scan.unidentifiable.length === 0) {
+    deps.print("nothing to revoke — no agent in this Mida home holds an approval")
     return 0
   }
-  for (const name of agents) deps.print(`${name} holds an approval`)
+  for (const name of scan.held) deps.print(`${name} holds an approval`)
+  const failed: string[] = []
+  for (const { name, error } of scan.unidentifiable) {
+    deps.print(ownerRefusalLine("revoke", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry))
+    failed.push(`${name} (${refusalCode(error)})`)
+  }
+  const revoked: string[] = []
+  if (scan.held.length === 0) {
+    deps.print(`revoked: none; failed: ${failed.join(", ")}`)
+    return 1
+  }
   const prompt = deps.prompt ?? terminalPrompt
   const drain = deps.drainInput ?? drainBufferedStdin
   await drain()
@@ -626,18 +671,18 @@ async function revokeAll(runtime: Runtime, deps: CliDeps): Promise<number> {
     deps.print("not revoked")
     return 1
   }
-  const revoked: string[] = []
-  const failed: string[] = []
-  for (const name of agents) {
+  for (const name of scan.held) {
     try {
       const result = await revoke(runtime, name)
-      revoked.push(name)
       // the same per-agent lines a single revoke prints — the chain answer first, always (M3-D4)
-      deps.print(
-        result.transactionHashes.length === 0
-          ? `${name}: nothing to revoke`
-          : `revoked ${name} on chain${result.sponsored ? " (sponsored)" : ""} — tx ${result.transactionHashes.join(" ")}`,
-      )
+      if (result.transactionHashes.length === 0) {
+        deps.print(`${name}: nothing to revoke`)
+      } else {
+        // only an agent whose approval actually went away counts under "revoked:" — a
+        // nothing-to-revoke answer is reported, not counted
+        revoked.push(name)
+        deps.print(`revoked ${name} on chain${result.sponsored ? " (sponsored)" : ""} — tx ${result.transactionHashes.join(" ")}`)
+      }
       if (result.transactionHashes.length > 0) {
         deps.print(`This stops future reads through Mida. It does not erase what ${name} already read.`)
       }
@@ -1033,12 +1078,22 @@ async function passkeyApproveAll(session: ServiceRuntime, deps: CliDeps, linkDep
  * never once for the batch. A declined or failed agent names itself and the next still runs.
  */
 async function passkeyRevokeAll(session: ServiceRuntime, deps: CliDeps, linkDeps: PasskeyDeps): Promise<number> {
-  const agents = await approvedAgents(session)
-  if (agents.length === 0) {
-    deps.print("nothing to revoke — no agent holds an approval")
+  const scan = await approvedAgents(session)
+  if (scan.held.length === 0 && scan.unidentifiable.length === 0) {
+    deps.print("nothing to revoke — no agent in this Mida home holds an approval")
     return 0
   }
-  for (const name of agents) deps.print(`${name} holds an approval`)
+  for (const name of scan.held) deps.print(`${name} holds an approval`)
+  const failed: string[] = []
+  for (const { name, error } of scan.unidentifiable) {
+    deps.print(ownerRefusalLine("revoke", name, error, undefined, deps.network.deployment.capabilityRegistry))
+    failed.push(`${name} (${refusalCode(error)})`)
+  }
+  const revoked: string[] = []
+  if (scan.held.length === 0) {
+    deps.print(`revoked: none; failed: ${failed.join(", ")}`)
+    return 1
+  }
   const prompt = deps.prompt ?? terminalPrompt
   const drain = deps.drainInput ?? drainBufferedStdin
   await drain()
@@ -1046,17 +1101,15 @@ async function passkeyRevokeAll(session: ServiceRuntime, deps: CliDeps, linkDeps
     deps.print("not revoked")
     return 1
   }
-  const revoked: string[] = []
-  const failed: string[] = []
-  for (const name of agents) {
+  for (const name of scan.held) {
     try {
       const result = await revokePasskey(session, name, linkDeps)
-      revoked.push(name)
-      deps.print(
-        result.nothingToRevoke || result.transactionHashes.length === 0
-          ? `${name}: nothing to revoke`
-          : `revoked ${name} on chain — tx ${result.transactionHashes.join(" ")}`,
-      )
+      if (result.nothingToRevoke || result.transactionHashes.length === 0) {
+        deps.print(`${name}: nothing to revoke`)
+      } else {
+        revoked.push(name)
+        deps.print(`revoked ${name} on chain — tx ${result.transactionHashes.join(" ")}`)
+      }
       if (!result.nothingToRevoke && result.transactionHashes.length > 0) {
         deps.print(`This stops future reads through Mida. It does not erase what ${name} already read.`)
       }

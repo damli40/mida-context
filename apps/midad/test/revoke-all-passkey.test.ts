@@ -129,6 +129,6 @@ describe("mida revoke --all on a passkey home (I4)", () => {
       ownerLink: { openLink: async () => { throw new Error("the page must never open") } },
     })
     expect(code).toBe(0)
-    expect(lines).toContain("nothing to revoke — no agent holds an approval")
+    expect(lines).toContain("nothing to revoke — no agent in this Mida home holds an approval")
   }, 120_000)
 })
