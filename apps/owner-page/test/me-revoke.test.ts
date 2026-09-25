@@ -1,0 +1,645 @@
+import { describe, expect, it, vi } from "vitest"
+import type { Address, Hex } from "viem"
+import { PERMISSION, buildOwnerLink, namespaceById, namespaceId } from "@mida/protocol"
+import type { OwnerLinkResult as FlowResult } from "@mida/protocol"
+import { deriveEpochKeyPair, deriveNamespaceSecret, hexOf } from "@mida/crypto"
+import { SponsorDidNotPay, SponsorPending } from "@mida/chain/browser"
+import type { Deployment, SponsoredReceipt, TxKind } from "@mida/chain/browser"
+import { POLICY_HASH_V1 } from "@mida/grant-advisor"
+import { fakePrfOutput } from "@mida/fake-vault/browser"
+import { AGENT_ID, CHAIN_ID, NOW, REGISTRY, agentRecordFor, manifestBody } from "../../../packages/grant-advisor/test/fixtures.js"
+import { deriveOwnerSecrets, ownerAccount } from "../src/owner/secrets.js"
+import type { OwnerSecrets } from "../src/owner/secrets.js"
+import type { CredentialsContainerLike } from "../src/check/client.js"
+import { makeAssertion, makeKeyPair } from "./helpers.js"
+import type { FlowEnvironment } from "../src/owner/flows.js"
+import { readersAfterRevoke } from "../src/me/model.js"
+import { renderMe, wireRevokePanels } from "../src/me/page.js"
+import { revokeFromMe } from "../src/me/revoke.js"
+import { BLOCKED_AT_STORE_TEXT } from "../src/me/sources.js"
+import type { AgentRow, MeData } from "../src/me/sources.js"
+
+/**
+ * Task 6 — revoke straight from /me, without a terminal link. revokeFromMe builds the same
+ * request the terminal would (owner = the signed-in address, readers = every other agent the
+ * page verified holds live READ), parses it through the shared owner-link validation, then runs
+ * the same prepareRevoke → confirmRevoke pair. These tests drive it end to end against the same
+ * fakes flows.test.ts uses, plus the page wiring: the panel, the click, and the re-read after
+ * the result — a row is never flipped locally.
+ */
+
+const PRF = new Uint8Array(32).map((_, i) => i + 1)
+const RP_ID = "midacontext.xyz"
+const NS_ID = namespaceId("preferences.communication")
+const NONCE = "0123456789abcdef"
+const SURVIVOR_A: Hex = `0x${"77".repeat(32)}`
+const SURVIVOR_B: Hex = `0x${"88".repeat(32)}`
+// readLive on the page but refused by the chain's own hasAuthority recheck — the stale row case.
+const STALE: Hex = `0x${"99".repeat(32)}`
+const NONREADER: Hex = `0x${"aa".repeat(32)}`
+const CAP_ID: Hex = `0x${"55".repeat(32)}`
+
+const DEPLOYMENT: Deployment = {
+  chainId: CHAIN_ID,
+  capabilityRegistry: REGISTRY,
+  contextRegistry: "0x9999999999999999999999999999999999999999",
+  deploymentBlock: 0n,
+  policyHashV1: POLICY_HASH_V1,
+  vaultRpId: RP_ID,
+  vaultRpIdHash: `0x${"aa".repeat(32)}`,
+}
+
+const passkey = makeKeyPair()
+const passkeyPoint = { qx: BigInt(hexOf(passkey.x)), qy: BigInt(hexOf(passkey.y)) }
+
+function ownerOf(prf: Uint8Array): Address {
+  return ownerAccount(deriveOwnerSecrets(prf.slice())).address.toLowerCase() as Address
+}
+const OWNER = ownerOf(PRF)
+
+function epochKey(nsId: Hex, epoch: bigint, prf: Uint8Array = PRF): Hex {
+  const secrets = deriveOwnerSecrets(prf.slice())
+  const node = namespaceById(nsId)
+  const nsSecret = deriveNamespaceSecret(fakePrfOutput(secrets.ownerSeed, node.domain), node.id)
+  return hexOf(deriveEpochKeyPair(nsSecret, epoch).publicKey)
+}
+
+// --- fakes — the same shapes flows.test.ts drives --------------------------------------------
+
+function fakeCredentials(key: ReturnType<typeof makeKeyPair>, prfOutput: Uint8Array) {
+  const calls: { kind: "create" | "get"; challenge?: Uint8Array }[] = []
+  const rawId = new TextEncoder().encode("owner-credential")
+  const prf = prfOutput
+  const toBuf = (bytes: Uint8Array) => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+  const container: CredentialsContainerLike = {
+    async create() {
+      calls.push({ kind: "create" })
+      throw new Error("revoke never creates a credential")
+    },
+    async get(options) {
+      const request = options!.publicKey as { challenge: Uint8Array }
+      calls.push({ kind: "get", challenge: request.challenge })
+      const assertion = makeAssertion(key.privateKey, { challenge: request.challenge, rpId: RP_ID })
+      return {
+        type: "public-key",
+        rawId,
+        response: {
+          authenticatorData: toBuf(assertion.authenticatorData),
+          clientDataJSON: toBuf(assertion.clientDataJSON),
+          signature: toBuf(assertion.signatureDer),
+        },
+        getClientExtensionResults: () => ({ prf: { results: { first: prf } } }),
+      }
+    },
+  }
+  return { container, calls }
+}
+
+interface SendRecord {
+  functionName: string
+  kind: TxKind
+}
+
+/** Captured readContract args for the reads that matter to the assertions below. */
+interface ChainReads {
+  active: unknown[][]
+  authority: unknown[][]
+}
+
+function fakeChain(handlers: Record<string, (args: readonly unknown[]) => unknown> = {}) {
+  const calls: string[] = []
+  const defaults: Record<string, (args: readonly unknown[]) => unknown> = {
+    getAgent: () => agentRecordFor(manifestBody()),
+    agentEpoch: () => 0n,
+    grantNonce: () => 0n,
+    hasAuthority: () => false,
+    requiredReadEpoch: () => 1n,
+    isWriteEpochValid: () => true,
+    ownerP256Key: () => [passkeyPoint.qx, passkeyPoint.qy],
+    activeCapabilityIds: () => [],
+    isCapabilityValid: () => true,
+    epochPublicKey: (args) => epochKey(args[1] as Hex, args[2] as bigint),
+    ...handlers,
+  }
+  const publicClient = {
+    async readContract(input: { functionName: string; args: readonly unknown[] }) {
+      calls.push(`read:${input.functionName}`)
+      const handler = defaults[input.functionName]
+      if (handler === undefined) throw new Error(`no fake for ${input.functionName}`)
+      return handler(input.args)
+    },
+    async simulateContract(input: { functionName: string }) {
+      calls.push(`simulate:${input.functionName}`)
+      return { request: {} }
+    },
+    async estimateContractGas() {
+      return 100_000n
+    },
+    async getBlock() {
+      return { timestamp: NOW }
+    },
+    async getBlockNumber() {
+      return 100n
+    },
+    async getLogs() {
+      return []
+    },
+  }
+  return { publicClient: publicClient as never, calls }
+}
+
+function fakeSponsor(sends: SendRecord[]) {
+  return {
+    async send(call: { functionName: string }, kind: TxKind) {
+      sends.push({ functionName: call.functionName, kind })
+      return {
+        transactionHash: `0x${"bb".repeat(32)}` as Hex,
+        gasUsed: 100n,
+        gasLimit: 200_000n,
+        userOpHash: `0x${"cc".repeat(32)}` as Hex,
+        logs: [],
+      } as unknown as SponsoredReceipt
+    },
+  }
+}
+
+/** The fields the assertions read off the wire wrap — the object itself is the full signed shape. */
+interface WrapRecord {
+  agentId: Hex
+  namespaceId: Hex
+  /** uint64 on the wire — a decimal string, not a bigint. */
+  readEpoch: string
+}
+
+function fakeApi(calls: string[], wraps: WrapRecord[]) {
+  return {
+    async publishEpochWrap(wrap: WrapRecord) {
+      calls.push("api:publishEpochWrap")
+      wraps.push(wrap)
+      return { stored: true }
+    },
+    async requestRevocationDeny() {
+      calls.push("api:requestRevocationDeny")
+      return { intentId: `0x${"dd".repeat(32)}` as Hex }
+    },
+    async listRevocations() {
+      calls.push("api:listRevocations")
+      return []
+    },
+    async reissueRevocationNonce(intentId: Hex) {
+      calls.push(`api:reissueRevocationNonce:${intentId.slice(2, 6)}`)
+      return { intentId, state: "active", cancellationNonce: "7" }
+    },
+    async cancelRevocation(intentId: Hex) {
+      calls.push(`api:cancelRevocation:${intentId.slice(2, 6)}`)
+      return {}
+    },
+  }
+}
+
+function fakeStorage() {
+  const map = new Map<string, string>()
+  return {
+    map,
+    storage: {
+      getItem: (k: string) => map.get(k) ?? null,
+      setItem: (k: string, v: string) => void map.set(k, v),
+      removeItem: (k: string) => void map.delete(k),
+    },
+  }
+}
+
+function makeEnv(opts: {
+  sends: SendRecord[]
+  apiCalls: string[]
+  wraps: WrapRecord[]
+  chain?: ReturnType<typeof fakeChain>
+  sponsor?: { send: (call: { functionName: string }, kind: TxKind) => Promise<SponsoredReceipt> }
+  releasedSecrets?: OwnerSecrets[]
+}): { env: FlowEnvironment; credentials: ReturnType<typeof fakeCredentials> } {
+  const credentials = fakeCredentials(passkey, PRF.slice())
+  const chain = opts.chain ?? fakeChain()
+  const sponsor = opts.sponsor ?? fakeSponsor(opts.sends)
+  const store = fakeStorage()
+  const env: FlowEnvironment = {
+    credentials: credentials.container,
+    publicClient: chain.publicClient,
+    deployment: DEPLOYMENT,
+    storeUrl: "https://store.test",
+    storage: store.storage,
+    makeSponsor: () => sponsor,
+    makeApi: () => fakeApi(opts.apiCalls, opts.wraps) as never,
+    fetchManifest: async () => {
+      throw new Error("revoke never fetches a manifest")
+    },
+    onSecrets: (s) => opts.releasedSecrets?.push(s),
+  }
+  return { env, credentials }
+}
+
+/**
+ * One live READ grant on NS_ID for the revoked agent; two survivors keep READ on chain (the
+ * post-send hasAuthority check), a stale reader is refused by that same recheck, and a
+ * non-reader never enters the request's reader list at all.
+ */
+function revokeChain(sends: SendRecord[], reads?: ChainReads) {
+  return fakeChain({
+    activeCapabilityIds: (args) => {
+      reads?.active.push([...args])
+      return [CAP_ID]
+    },
+    // after the rotate send lands, the required read epoch is 2 — wraps publish for epochs 1 and 2
+    requiredReadEpoch: () => (sends.some((s) => s.functionName === "revokeAgentAndRotate") ? 2n : 1n),
+    getCapability: () => ({
+      owner: OWNER,
+      agentId: AGENT_ID,
+      namespaceId: NS_ID,
+      permissions: PERMISSION.READ,
+      provenancePolicy: 0,
+      issuedAt: 1n,
+      expiresAt: NOW + 86_400n,
+      agentEpoch: 0n,
+      grantedAtReadEpoch: 1n,
+      revoked: false,
+    }),
+    hasAuthority: (args) => {
+      reads?.authority.push([...args])
+      return args[1] === SURVIVOR_A || args[1] === SURVIVOR_B
+    },
+    epochPublicKey: (args) => epochKey(args[1] as Hex, args[2] as bigint),
+  })
+}
+
+// --- /me rows and a mount for the page-wiring tests --------------------------------------------
+
+function agentRow(over: Partial<AgentRow> = {}): AgentRow {
+  return {
+    agentId: AGENT_ID,
+    name: "codex",
+    grants: [],
+    revokedTx: null,
+    blockedAtStore: false,
+    readLive: true,
+    ...over,
+  }
+}
+
+function meData(over: Partial<MeData> = {}): MeData {
+  return {
+    owner: OWNER,
+    agents: [agentRow()],
+    records: [],
+    incomplete: [],
+    source: "index",
+    lag: { text: "9 s behind Monad", stale: false },
+    batchingOn: true,
+    counts: null,
+    ...over,
+  }
+}
+
+// A minimal DOM faithful to the small surface the page uses — the convention every render test
+// in this package keeps (me-page.test.ts, entries-signing.test.ts).
+class FakeEl {
+  readonly tag: string
+  children: FakeEl[] = []
+  parent: FakeEl | null = null
+  readonly attrs = new Map<string, string>()
+  readonly listeners = new Map<string, (() => void)[]>()
+  hidden = false
+  disabled = false
+  #text = ""
+
+  constructor(tag: string) {
+    this.tag = tag
+  }
+
+  get textContent(): string {
+    return this.#text + this.children.map((c) => c.textContent).join("")
+  }
+  set textContent(value: string) {
+    this.#text = value
+    this.children = []
+  }
+
+  get className(): string {
+    return this.attrs.get("class") ?? ""
+  }
+  set className(value: string) {
+    this.attrs.set("class", value)
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attrs.set(name, value)
+  }
+  getAttribute(name: string): string | null {
+    return this.attrs.get(name) ?? null
+  }
+  hasAttribute(name: string): boolean {
+    return this.attrs.has(name)
+  }
+
+  appendChild(child: FakeEl): FakeEl {
+    child.parent = this
+    this.children.push(child)
+    return child
+  }
+  replaceChildren(...nodes: FakeEl[]): void {
+    for (const node of nodes) node.parent = this
+    this.children = [...nodes]
+  }
+  remove(): void {
+    if (this.parent !== null) {
+      const index = this.parent.children.indexOf(this)
+      if (index !== -1) this.parent.children.splice(index, 1)
+      this.parent = null
+    }
+    this.children = []
+  }
+
+  addEventListener(type: string, fn: () => void): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn])
+  }
+  click(): void {
+    for (const fn of this.listeners.get("click") ?? []) fn()
+  }
+
+  matches(sel: string): boolean {
+    const parts = sel.match(/[a-zA-Z][\w-]*|\.[\w-]+|\[[^\]]*\]/g) ?? []
+    for (const part of parts) {
+      if (part.startsWith(".")) {
+        if (!(this.attrs.get("class") ?? "").split(/\s+/).includes(part.slice(1))) return false
+      } else if (part.startsWith("[")) {
+        const inner = part.slice(1, -1)
+        const eq = inner.indexOf("=")
+        if (eq === -1) {
+          if (!this.attrs.has(inner)) return false
+        } else {
+          const name = inner.slice(0, eq).trim()
+          const value = inner.slice(eq + 1).trim().replace(/^["']|["']$/g, "")
+          if (this.attrs.get(name) !== value) return false
+        }
+      } else if (this.tag !== part.toLowerCase()) {
+        return false
+      }
+    }
+    return parts.length > 0
+  }
+
+  *walk(): Generator<FakeEl> {
+    for (const child of this.children) {
+      yield child
+      yield* child.walk()
+    }
+  }
+  querySelectorAll(sel: string): FakeEl[] {
+    return [...this.walk()].filter((el) => el.matches(sel))
+  }
+  querySelector(sel: string): FakeEl | null {
+    return this.querySelectorAll(sel)[0] ?? null
+  }
+}
+
+function fakeDoc(): Document {
+  return { createElement: (tag: string) => new FakeEl(tag) } as unknown as Document
+}
+
+// --- the flow ----------------------------------------------------------------------------------
+
+describe("revokeFromMe", () => {
+  it("builds the request from the signed-in owner — never a row value — with every other live reader", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const reads: ChainReads = { active: [], authority: [] }
+    const releasedSecrets: OwnerSecrets[] = []
+    const { env, credentials } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends, reads), releasedSecrets })
+    const agents = [
+      agentRow({ agentId: AGENT_ID }),
+      agentRow({ agentId: SURVIVOR_A }),
+      agentRow({ agentId: SURVIVOR_B }),
+      agentRow({ agentId: NONREADER, readLive: false }),
+    ]
+    const result = await revokeFromMe(env, { signedInOwner: OWNER, agentId: AGENT_ID, agents })
+    expect(result.status).toBe("success")
+    // requestHash is sha256 of the exact normalized request bytes — rebuilding the request the
+    // protocol helper would produce pins chainId, owner, agentId AND the reader list at once:
+    // a different owner, agent, or readers array cannot produce this hash.
+    const expected = buildOwnerLink({
+      origin: "https://me.test",
+      flow: "revoke",
+      req: {
+        chainId: Number(CHAIN_ID),
+        owner: OWNER,
+        agentId: AGENT_ID,
+        readers: readersAfterRevoke(agents, AGENT_ID),
+      },
+      nonce: NONCE,
+    })
+    expect(result.requestHash).toBe(expected.requestHash)
+    // the chain reads ran against the signed-in owner and the clicked row's agent — the request
+    // carries no other identity (prepareRevoke and approveRevocation both read this pair)
+    expect(reads.active).toEqual([
+      [OWNER, AGENT_ID],
+      [OWNER, AGENT_ID],
+    ])
+    expect(result.owner).toBe(OWNER)
+    expect(result.nonce).toMatch(/^[0-9a-f]{16}$/)
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get"])
+    expect(releasedSecrets[0]?.released).toBe(true)
+  })
+
+  it("re-keys every surviving READ agent on the rotated area — never the revoked agent or one without READ", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const reads: ChainReads = { active: [], authority: [] }
+    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends, reads) })
+    const agents = [
+      agentRow({ agentId: AGENT_ID }),
+      agentRow({ agentId: SURVIVOR_A }),
+      agentRow({ agentId: SURVIVOR_B }),
+      agentRow({ agentId: NONREADER, readLive: false }),
+      agentRow({ agentId: STALE }),
+    ]
+    const result = await revokeFromMe(env, { signedInOwner: OWNER, agentId: AGENT_ID, agents })
+    expect(result.status).toBe("success")
+    expect(sends.map((s) => s.functionName)).toEqual(["revokeAgentAndRotate"])
+    // the store deny lands before the chain send — the pending state exists before Monad answers
+    expect(apiCalls[0]).toBe("api:requestRevocationDeny")
+    // the reader list the flow worked was exactly the three named survivors — each re-checked
+    // against the chain (the flow's check, then publishReaderWraps' own) — and nobody else was
+    // ever queried: not the revoked agent, not the row without live READ.
+    expect(reads.authority.map((a) => a[1])).toEqual([SURVIVOR_A, SURVIVOR_A, SURVIVOR_B, SURVIVOR_B, STALE])
+    for (const args of reads.authority) expect(args.slice(2)).toEqual([NS_ID, PERMISSION.READ, 0])
+    // publishReaderWraps ran once per surviving reader for the one rotated area, publishing a
+    // wrap for every registered epoch; the stale row the chain refused got nothing, and the
+    // revoked agent got nothing.
+    expect(wraps.map((w) => ({ agentId: w.agentId, namespaceId: w.namespaceId, readEpoch: w.readEpoch }))).toEqual([
+      { agentId: SURVIVOR_A, namespaceId: NS_ID, readEpoch: "1" },
+      { agentId: SURVIVOR_A, namespaceId: NS_ID, readEpoch: "2" },
+      { agentId: SURVIVOR_B, namespaceId: NS_ID, readEpoch: "1" },
+      { agentId: SURVIVOR_B, namespaceId: NS_ID, readEpoch: "2" },
+    ])
+    expect(wraps.some((w) => w.agentId === AGENT_ID)).toBe(false)
+    expect(wraps.some((w) => w.agentId === NONREADER)).toBe(false)
+    expect(wraps.some((w) => w.agentId === STALE)).toBe(false)
+  })
+
+  it("a request with no entries completes without a project-list signature", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends) })
+    const result = await revokeFromMe(env, {
+      signedInOwner: OWNER,
+      agentId: AGENT_ID,
+      agents: [agentRow({ agentId: AGENT_ID }), agentRow({ agentId: SURVIVOR_A })],
+    })
+    expect(result.status).toBe("success")
+    expect(result.entry).toBeUndefined()
+    expect(sends.map((s) => s.functionName)).toEqual(["revokeAgentAndRotate"])
+  })
+
+  it("a pending sponsor answers status pending with the operation hash — the deny stays staged", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const sponsor = {
+      async send(): Promise<SponsoredReceipt> {
+        throw new SponsorPending(`0x${"ee".repeat(32)}` as Hex)
+      },
+    }
+    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends), sponsor })
+    const result = await revokeFromMe(env, {
+      signedInOwner: OWNER,
+      agentId: AGENT_ID,
+      agents: [agentRow({ agentId: AGENT_ID }), agentRow({ agentId: SURVIVOR_A })],
+    })
+    expect(result.status).toBe("pending")
+    expect(result.operations).toContain(`0x${"ee".repeat(32)}`)
+    // the deny was posted before the send and is NOT undone for a pending operation — it is the
+    // pending state the page will read back.
+    expect(apiCalls).toEqual(["api:requestRevocationDeny"])
+    expect(sends).toHaveLength(0)
+  })
+})
+
+// --- the panel and the click -------------------------------------------------------------------
+
+describe("/me revoke panel", () => {
+  it("the confirm panel carries the exact disclosure sentence", () => {
+    const root = renderMe(meData({ agents: [agentRow({ name: "codex" })] }), fakeDoc()) as unknown as FakeEl
+    const panel = root.querySelector("[data-confirm-panel]")
+    expect(panel).not.toBeNull()
+    expect(panel!.hidden).toBe(true) // closed until the row's own Revoke is clicked
+    const disclosure = panel!.querySelector("[data-revoke-disclosure]")
+    expect(disclosure).not.toBeNull()
+    expect(disclosure!.textContent).toBe(
+      "This stops future reads through Mida. It does not erase what codex already read.",
+    )
+  })
+
+  it("Revoke opens the panel; Confirm runs the flow; a pending result re-reads as blocked at the store", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const sponsor = {
+      async send(): Promise<SponsoredReceipt> {
+        throw new SponsorPending(`0x${"ee".repeat(32)}` as Hex)
+      },
+    }
+    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends), sponsor })
+    const doc = fakeDoc()
+    const mount = new FakeEl("div")
+    let agents = [
+      agentRow({ agentId: AGENT_ID, name: "codex" }),
+      agentRow({ agentId: SURVIVOR_A, name: "claude-code" }),
+    ]
+    let seen: FlowResult | undefined
+    let reloads = 0
+    // reload stands in for loadMe: a pending send leaves the store deny staged, so the re-read
+    // reports the row blocked at the store — exactly what loadMe would produce.
+    const render = (): void => {
+      const root = renderMe(meData({ agents }), doc) as unknown as FakeEl
+      mount.replaceChildren(root)
+      wireRevokePanels(root as unknown as HTMLElement, agents, {
+        run: (agent, progress) =>
+          revokeFromMe({ ...env, progress }, { signedInOwner: OWNER, agentId: agent.agentId, agents }).then((r) => {
+            seen = r
+            return r
+          }),
+        reload: () => {
+          reloads += 1
+          agents = [
+            agentRow({ agentId: AGENT_ID, name: "codex", readLive: false, blockedAtStore: true }),
+            agentRow({ agentId: SURVIVOR_A, name: "claude-code" }),
+          ]
+          render()
+        },
+      })
+    }
+    render()
+    const revoke = mount
+      .querySelectorAll("[data-revoke-agent]")
+      .find((b) => b.getAttribute("data-revoke-agent") === AGENT_ID)
+    expect(revoke).not.toBeNull()
+    revoke!.click()
+    const panel = mount.querySelector("[data-confirm-panel]")
+    expect(panel!.hidden).toBe(false)
+    const confirm = panel!.querySelector("[data-revoke-confirm]")
+    expect(confirm).not.toBeNull()
+    confirm!.click()
+    await vi.waitFor(() => {
+      expect(mount.textContent).toContain(BLOCKED_AT_STORE_TEXT)
+    })
+    expect(seen?.status).toBe("pending")
+    expect(reloads).toBe(1)
+    // the row is re-read, not flipped locally: the first agent's row now shows the store block
+    const row = mount.querySelectorAll(".agent")[0]!
+    expect(row.textContent).toContain(BLOCKED_AT_STORE_TEXT)
+    expect(row.textContent).not.toContain("Can read")
+    expect(apiCalls).toEqual(["api:requestRevocationDeny"])
+  })
+
+  it("a refused sponsor leaves the row able to read and the panel shows the reason", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const sponsor = {
+      async send(): Promise<SponsoredReceipt> {
+        throw new SponsorDidNotPay("quota exhausted")
+      },
+    }
+    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends), sponsor })
+    const doc = fakeDoc()
+    const mount = new FakeEl("div")
+    const agents = [agentRow({ agentId: AGENT_ID, name: "codex" })]
+    let seen: FlowResult | undefined
+    let reloads = 0
+    const root = renderMe(meData({ agents }), doc) as unknown as FakeEl
+    mount.replaceChildren(root)
+    wireRevokePanels(root as unknown as HTMLElement, agents, {
+      run: (agent, progress) =>
+        revokeFromMe({ ...env, progress }, { signedInOwner: OWNER, agentId: agent.agentId, agents }).then((r) => {
+          seen = r
+          return r
+        }),
+      reload: () => {
+        reloads += 1
+      },
+    })
+    mount.querySelector("[data-revoke-agent]")!.click()
+    mount.querySelector("[data-revoke-confirm]")!.click()
+    await vi.waitFor(() => {
+      expect(seen).not.toBeUndefined()
+      expect(seen!.status).toBe("failed")
+    })
+    expect(reloads).toBe(0) // nothing landed — the page does not re-read as if it had
+    // the panel carries the reason and the row still reads "Can read"
+    const status = mount.querySelector("[data-revoke-status]")
+    expect(status!.hidden).toBe(false)
+    expect(status!.textContent).toContain("quota exhausted")
+    expect(mount.querySelector(".agent")!.textContent).toContain("Can read")
+  })
+})

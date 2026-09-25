@@ -26,8 +26,10 @@ import type { FlowEnvironment } from "../owner/flows.js"
 import { assertRpGate, el, makeEnv, progressLine, showError } from "../owner/page.js"
 import { describeError } from "../owner/session.js"
 import { shortAddress } from "../owner/secrets.js"
+import type { OwnerLinkResult as FlowResult } from "@mida/protocol"
 import { chipsFor, isTxHash, provenanceBadge } from "./model.js"
 import type { Badge } from "./model.js"
+import { revokeFromMe } from "./revoke.js"
 import { BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
 import type { AgentRow, GrantLog, MeData, MePorts, RecordRow } from "./sources.js"
 import { signIn } from "./session.js"
@@ -222,12 +224,47 @@ function renderAgent(doc: Document, agent: AgentRow): HTMLElement {
   if (revokedRow) {
     box.appendChild(elOf(doc, "p", "revoke-note", "Refused since revocation. Anything it read before then stays with it."))
   }
-  // The confirm panel and its send wiring are Task 6 — the button names the agent it acts on.
+  // The button names the agent it acts on; the confirm panel is its sibling, spanning the row —
+  // rendered closed and opened by the click wiring in wireRevokePanels.
   if (agent.readLive || agent.blockedAtStore || agent.grants.some((g) => g.status.label === "Can read")) {
     const revoke = elOf(doc, "button", "btn btn-danger btn-small", "Revoke")
     revoke.setAttribute("type", "button")
     revoke.setAttribute("data-revoke-agent", agent.agentId)
     box.appendChild(revoke)
+
+    const panel = elOf(doc, "div", "confirm")
+    panel.setAttribute("data-confirm-panel", agent.agentId)
+    panel.hidden = true
+    const ask = elOf(doc, "p")
+    ask.appendChild(elOf(doc, "strong", undefined, `Revoke ${agent.name}?`))
+    ask.appendChild(elOf(doc, "span", undefined, " Your passkey signs the revoke; the sponsor pays the gas."))
+    panel.appendChild(ask)
+    // The disclosure sentence is pinned verbatim by the spec — its own node so the text is exact.
+    const disclosure = elOf(
+      doc,
+      "p",
+      undefined,
+      `This stops future reads through Mida. It does not erase what ${agent.name} already read.`,
+    )
+    disclosure.setAttribute("data-revoke-disclosure", "")
+    panel.appendChild(disclosure)
+    const actions = elOf(doc, "div", "confirm-actions")
+    const cancel = elOf(doc, "button", "btn btn-secondary btn-small", "Cancel")
+    cancel.setAttribute("type", "button")
+    cancel.setAttribute("data-revoke-cancel", "")
+    const confirm = elOf(doc, "button", "btn btn-primary btn-small", "Confirm with passkey")
+    confirm.setAttribute("type", "button")
+    confirm.setAttribute("data-revoke-confirm", "")
+    actions.appendChild(cancel)
+    actions.appendChild(confirm)
+    panel.appendChild(actions)
+    // Progress and failure text live inside the panel — the sign-in block's progress list is
+    // hidden once the dashboard renders, so the flow's own lines are written here instead.
+    const status = elOf(doc, "p", "revoke-note")
+    status.setAttribute("data-revoke-status", "")
+    status.hidden = true
+    panel.appendChild(status)
+    row.appendChild(panel)
   }
   return row
 }
@@ -416,6 +453,65 @@ export function renderMe(data: MeData, doc: Document, open?: OpenRow): HTMLEleme
   return root
 }
 
+/**
+ * Task 6 — the click wiring behind each agent's confirm panel. `run` is the flow call the boot
+ * path binds to revokeFromMe with the session's owner; `reload` is the loadMe re-read. A success
+ * or a pending sponsor answer re-reads the world — the row is never flipped locally; a failure
+ * or a dismissed prompt keeps the row as it was and writes the reason into the panel.
+ */
+export function wireRevokePanels(
+  root: HTMLElement,
+  agents: readonly AgentRow[],
+  opts: {
+    run: (agent: AgentRow, progress: (line: string) => void) => Promise<FlowResult>
+    reload: () => Promise<void> | void
+  },
+): void {
+  const agentsById = new Map(agents.map((a) => [a.agentId.toLowerCase(), a]))
+  for (const button of Array.from(root.querySelectorAll<HTMLElement>("[data-revoke-agent]"))) {
+    const id = (button.getAttribute("data-revoke-agent") ?? "").toLowerCase()
+    const agent = agentsById.get(id)
+    const panel = Array.from(root.querySelectorAll<HTMLElement>("[data-confirm-panel]")).find(
+      (p) => (p.getAttribute("data-confirm-panel") ?? "").toLowerCase() === id,
+    )
+    const cancel = panel?.querySelector<HTMLButtonElement>("[data-revoke-cancel]")
+    const confirm = panel?.querySelector<HTMLButtonElement>("[data-revoke-confirm]")
+    const status = panel?.querySelector<HTMLElement>("[data-revoke-status]")
+    if (agent === undefined || panel === undefined || confirm === undefined || confirm === null) continue
+    const note = (text: string): void => {
+      if (status === undefined || status === null) return
+      status.textContent = text
+      status.hidden = false
+    }
+    button.addEventListener("click", () => {
+      panel.hidden = false
+      button.hidden = true
+    })
+    cancel?.addEventListener("click", () => {
+      panel.hidden = true
+      button.hidden = false
+    })
+    confirm.addEventListener("click", () => {
+      confirm.disabled = true
+      if (cancel) cancel.disabled = true
+      void (async () => {
+        try {
+          const result = await opts.run(agent, note)
+          if (result.status === "success" || result.status === "pending") {
+            await opts.reload()
+            return
+          }
+          note(result.reason ?? "The revoke did not complete.")
+        } catch (error) {
+          note(describeError(error))
+        }
+        confirm.disabled = false
+        if (cancel) cancel.disabled = false
+      })()
+    })
+  }
+}
+
 // --- live ports: chain views, the store client, the index's GraphQL -----------------------------
 
 const CAPABILITY_GRANTED = capabilityRegistryAbi.find(
@@ -557,12 +653,13 @@ async function readIndexUrl(): Promise<string | null> {
   }
 }
 
-function armTeardown(session: MeSession, root: HTMLElement): void {
+function armTeardown(session: MeSession): void {
   let hiddenAt: number | null = null
   const end = (): void => {
     session.end()
-    // Plaintext leaves the page with the keys — the cells remain, their content does not.
-    for (const node of Array.from(root.querySelectorAll("[data-decrypted]"))) {
+    // Plaintext leaves the page with the keys — the cells remain, their content does not. The
+    // query runs against the live tree: a revoke refresh has replaced the first render.
+    for (const node of Array.from(el("me-root").querySelectorAll("[data-decrypted]"))) {
       node.textContent = "cleared — sign in again to read"
     }
     el("sign-in").hidden = false
@@ -596,14 +693,28 @@ function boot(): void {
       // released before signIn returns, whatever the record list turns out to hold.
       const session = await signIn(env, NAMESPACE_TREE_V1.map((node) => node.id))
       progressLine("Signed in — reading agents, grants and records…")
-      const data = await loadMe(session.owner, livePorts(env, session, indexUrl))
-      const root = renderMe(data, document, (row) => session.open(row))
+      const ports = livePorts(env, session, indexUrl)
+      // Every render is a fresh read; after a revoke lands (or goes pending) the same refresh
+      // runs again — the page re-reads, it does not assume.
+      const refresh = async (): Promise<void> => {
+        const data = await loadMe(session.owner, ports)
+        const root = renderMe(data, document, (row) => session.open(row))
+        el("me-root").replaceChildren(root)
+        wireRevokePanels(root, data.agents, {
+          run: (agent, progress) =>
+            revokeFromMe(
+              { ...env, progress },
+              { signedInOwner: session.owner, agentId: agent.agentId, agents: data.agents },
+            ),
+          reload: refresh,
+        })
+      }
+      await refresh()
       el("sign-in").hidden = true
-      el("me-root").replaceChildren(root)
       el("me-root").hidden = false
       el("nav-state").hidden = false
       el("sign-out").hidden = false
-      armTeardown(session, root)
+      armTeardown(session)
     })().catch((error: unknown) => {
       showError(describeError(error))
       button.disabled = false
