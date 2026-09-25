@@ -1,0 +1,811 @@
+/**
+ * /me Task 3 — the data gatherer behind the owner page.
+ *
+ * Three sources, kept honest about which spoke: the Envio index first (grants, revocations,
+ * batch anchors, totals), chain logs as the fallback when the index is absent or fails, and the
+ * store's object/batched-save lists as the list of records. Verification is per lane: every
+ * direct object is re-read on ContextRegistry (matching fields → "anchored", missing or
+ * mismatched → "unverified"); every ANCHORED batched item re-derives its Merkle leaf — the save
+ * signature recovers the signer, agentIdOfSigner names the agent — and the proof is checked
+ * against the on-chain batch root. A batched contextId never reaches ContextRegistry.
+ *
+ * The chain port carries two reads beyond the plan's printed shape, both already consumed by
+ * design: getAgent (the index's Agent row does not store capabilityManifestHash — agent names
+ * live behind it) and agentIdOfSigner (BatchedReadItem carries no agentId, and the Merkle leaf
+ * cannot be rebuilt without it). Nothing here throws out of loadMe — a failure degrades to
+ * "unverified", a line in `incomplete`, or the shortened agent id, never a blank page.
+ */
+
+import { recoverTypedDataAddress, zeroHash } from "viem"
+import {
+  batchLeafHash,
+  batchSaveStructHash,
+  batchSaveTypedData,
+  decodeUint64,
+  namespaceById,
+  namespaceId,
+  verifyMerkleProof,
+} from "@mida/protocol"
+import type { Address, AgentRecord, BatchSaveMessage, Hex } from "@mida/protocol"
+import { bytesOf, ciphertextHash, manifestHash } from "@mida/crypto"
+import type { ContextApiRoutes, ContextRecordView } from "@mida/api/browser"
+import { DEPLOYMENT } from "../owner/core.js"
+import { grantStatus, isTxHash, lagText } from "./model.js"
+import type { AnchorState, Lane } from "./model.js"
+
+// ---------------------------------------------------------------------------------------------
+// GraphQL documents — exported so Task 5's index adapter reuses them verbatim.
+// Hasura-style Envio queries: entity names as declared in apps/indexer/schema.graphql.
+
+export const AGENTS_QUERY = `query MeAgents($owner: String!) {
+  Grant(where: { owner: { _eq: $owner } }) {
+    id
+    agent
+    namespaceId
+    permissions
+    provenancePolicy
+    expiresAt
+    grantedBlock
+    revokedBlock
+    revokedBy
+    txHash
+  }
+  Revocation(where: { owner: { _eq: $owner } }) {
+    id
+    kind
+    agentId
+    namespaceId
+    capabilityId
+    block
+    txHash
+  }
+  GlobalStats(id: "global") {
+    lastTimestamp
+  }
+}`
+
+export const BATCHED_QUERY = `query MeBatched($owner: String!, $agents: [String!]) {
+  BatchedSave(where: { owner: { _eq: $owner } }) {
+    id
+    namespaceId
+    batchId
+    position
+    lineageId
+    version
+    agentId
+    block
+    txHash
+  }
+  Agent(where: { id: { _in: $agents } }) {
+    id
+    signer
+  }
+}`
+
+export const COUNTS_QUERY = `query MeCounts($owner: String!) {
+  Owner(id: $owner) {
+    records
+    batchedSaves
+  }
+  ContextRecord(where: { owner: { _eq: $owner } }) {
+    id
+    namespaceId
+    provenanceSource
+    createdAt
+    txHash
+  }
+}`
+
+/** The exact banner a truncated store list earns — pinned by the plan. */
+export const PARTIAL_LIST_TEXT = "list incomplete — the store ran out of chain reads; reload"
+/** The exact agent-state wording for a store deny — pinned by the plan, rendered by the page. */
+export const BLOCKED_AT_STORE_TEXT = "blocked at the store · revoke pending on Monad"
+
+const INDEX_TIMEOUT_MS = 6_000
+// The three owner areas flows.ts opens on setup — duplicated there and here on purpose: this
+// module stays import-light, and the fallback needs the list even when every index call is down.
+const OWNER_NAMESPACE_IDS = ["projects.current", "preferences.communication", "profile.skills"].map((name) =>
+  namespaceId(name),
+)
+
+// ---------------------------------------------------------------------------------------------
+// Ports and rows — the plan's Task 3 interface, plus the two chain reads named above.
+
+export interface GrantLog {
+  kind: "granted" | "revoked"
+  agentId: Hex
+  capabilityId: Hex | null
+  namespaceId: Hex | null
+  permissions: number | null
+  block: number
+  txHash: Hex
+}
+
+export interface MePorts {
+  index: { query<T>(gql: string, vars: Record<string, unknown>): Promise<T> } | null
+  store: Pick<ContextApiRoutes, "listObjects" | "listBatchSaves" | "listRevocations" | "batchStatus" | "getAgentManifest">
+  chain: {
+    isCapabilityValid(capabilityId: Hex): Promise<boolean>
+    getRecords(ids: Hex[]): Promise<(ContextRecordView | null)[]>
+    batchRoot(batchId: Hex): Promise<Hex | null>
+    ownerGrantLogs(owner: Address): Promise<GrantLog[]>
+    agentIdOfSigner(signer: Address): Promise<Hex | null>
+    getAgent(agentId: Hex): Promise<AgentRecord | null>
+    latestTimestamp(): Promise<number>
+  }
+}
+
+export interface AgentRow {
+  agentId: Hex
+  name: string
+  grants: {
+    namespaceId: Hex
+    area: string
+    permissions: number
+    capabilityId: Hex
+    status: ReturnType<typeof grantStatus>
+    approvedTx: Hex | null
+  }[]
+  revokedTx: Hex | null
+  blockedAtStore: boolean
+  readLive: boolean
+}
+
+export interface RecordRow {
+  contextId: Hex
+  namespaceId: Hex
+  area: string
+  readEpoch: bigint
+  lane: Lane
+  state: AnchorState
+  authorId: Hex
+  authorName: string
+  source: number | null
+  tx: Hex | null
+  batchId: Hex | null
+  ciphertext: Hex
+  manifest: unknown
+  createdAt: number
+}
+
+export interface MeData {
+  owner: Address
+  agents: AgentRow[]
+  records: RecordRow[]
+  incomplete: string[]
+  source: "index" | "chain-logs"
+  lag: { text: string; stale: boolean }
+  batchingOn: boolean | null
+  counts: { records: number; youSaid: number; pending: number } | null
+}
+
+// ---------------------------------------------------------------------------------------------
+// Index answer shapes — only the fields the queries ask for.
+
+interface IndexGrant {
+  id: string
+  agent: string
+  namespaceId: string
+  permissions: number
+  grantedBlock: number
+  revokedBlock: number | null
+  txHash: string
+}
+
+interface IndexRevocation {
+  kind: string
+  agentId: string
+  capabilityId: string | null
+  block: number
+  txHash: string
+}
+
+interface IndexBatchedSave {
+  id: string
+  namespaceId: string
+  batchId: string
+  lineageId: string
+  version: number
+  agentId: string
+  txHash: string
+}
+
+interface IndexRecord {
+  id: string
+  namespaceId: string
+  provenanceSource: number
+  createdAt: string
+  txHash: string
+}
+
+interface AgentsAnswer {
+  Grant?: IndexGrant[]
+  Revocation?: IndexRevocation[]
+  GlobalStats?: { lastTimestamp: string | number } | null
+}
+
+interface BatchedAnswer {
+  BatchedSave?: IndexBatchedSave[]
+  Agent?: { id: string; signer: string }[]
+}
+
+interface CountsAnswer {
+  Owner?: { records: number; batchedSaves: number } | null
+  ContextRecord?: IndexRecord[]
+}
+
+// Wire shapes lifted off the route types so this module never re-declares the API's wire format.
+type StoreObject = Awaited<ReturnType<ContextApiRoutes["listObjects"]>>["objects"][number]
+type StoreBatchedItem = Awaited<ReturnType<ContextApiRoutes["listBatchSaves"]>>["items"][number]
+
+interface GrantSeed {
+  agentId: Hex
+  capabilityId: Hex
+  namespaceId: Hex
+  permissions: number
+  indexSaysLive: boolean
+  approvedTx: Hex | null
+  block: number
+}
+
+const lower = (value: string) => value.toLowerCase()
+const sameHex = (a: string, b: string) => lower(a) === lower(b)
+
+function shortId(id: string): string {
+  return `${id.slice(0, 6)}…${id.slice(-4)}`
+}
+
+function areaName(id: unknown): string {
+  if (typeof id !== "string") return "unknown area"
+  try {
+    return namespaceById(id as Hex).name
+  } catch {
+    return id
+  }
+}
+
+const isString = (v: unknown): v is string => typeof v === "string"
+const isNumber = (v: unknown): v is number => typeof v === "number"
+
+/**
+ * The primary index answer is trusted only after it proves its shape — a malformed Grant or
+ * Revocation row means this index answer cannot be the source of truth for the agents list, so
+ * the whole answer is discarded and the chain-log fallback runs instead. Half-parsed state must
+ * never mix with log-derived grants, so this check runs before any row is consumed.
+ */
+function isAgentsAnswer(value: unknown): value is AgentsAnswer {
+  if (value === null || typeof value !== "object") return false
+  const answer = value as AgentsAnswer
+  for (const grant of answer.Grant ?? []) {
+    if (
+      !isString(grant.id) ||
+      !isString(grant.agent) ||
+      !isString(grant.namespaceId) ||
+      !isNumber(grant.permissions) ||
+      !isNumber(grant.grantedBlock) ||
+      !(grant.revokedBlock === null || isNumber(grant.revokedBlock)) ||
+      !isString(grant.txHash)
+    ) {
+      return false
+    }
+  }
+  for (const revocation of answer.Revocation ?? []) {
+    if (
+      !isString(revocation.agentId) ||
+      !isNumber(revocation.block) ||
+      !isString(revocation.txHash) ||
+      !(revocation.capabilityId === null || isString(revocation.capabilityId))
+    ) {
+      return false
+    }
+  }
+  return true
+}
+
+async function safe<T>(fn: () => Promise<T>): Promise<T | null> {
+  try {
+    return await fn()
+  } catch {
+    return null
+  }
+}
+
+function secondsOf(value: unknown): number | null {
+  const n = typeof value === "string" || typeof value === "number" ? Number(value) : Number.NaN
+  return Number.isFinite(n) ? n : null
+}
+
+function uint64Of(value: unknown): bigint {
+  try {
+    return decodeUint64(value as string)
+  } catch {
+    return 0n
+  }
+}
+
+/**
+ * One index call with a six-second ceiling. The fetch adapter passes AbortSignal.timeout(6000)
+ * to fetch so the request itself aborts; this races the same deadline on the caller side, so a
+ * hung query can never stall the page past six seconds either.
+ */
+function queryIndex<T>(index: NonNullable<MePorts["index"]>, gql: string, vars: Record<string, unknown>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const signal = AbortSignal.timeout(INDEX_TIMEOUT_MS)
+    const fail = () => reject(new Error("index query timed out"))
+    signal.addEventListener("abort", fail, { once: true })
+    index.query<T>(gql, vars).then(
+      (value) => {
+        signal.removeEventListener("abort", fail)
+        resolve(value)
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", fail)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      },
+    )
+  })
+}
+
+/**
+ * A store object counts as anchored only when the chain record for its contextId exists and
+ * agrees on owner, namespace, author and both commitments — the manifest and ciphertext the
+ * page later decrypts must be the bytes the record committed to.
+ */
+function directMatches(record: ContextRecordView, object: StoreObject, ownerKey: string): boolean {
+  if (!sameHex(record.owner, ownerKey)) return false
+  if (!sameHex(record.namespaceId, object.namespaceId)) return false
+  if (!sameHex(record.author, object.authorId)) return false
+  try {
+    if (!sameHex(record.manifestHash, manifestHash(object.manifest))) return false
+    const bytes = bytesOf(object.ciphertext, (object.ciphertext.length - 2) / 2)
+    if (!sameHex(record.ciphertextCommitment, ciphertextHash(bytes))) return false
+  } catch {
+    return false
+  }
+  return true
+}
+
+/** The ciphertext and manifest must be the bytes the signed save committed to. */
+function batchedCommitmentsMatch(item: StoreBatchedItem, message: BatchSaveMessage): boolean {
+  try {
+    const bytes = bytesOf(item.save.ciphertext, (item.save.ciphertext.length - 2) / 2)
+    if (!sameHex(ciphertextHash(bytes), message.ciphertextCommitment)) return false
+    return sameHex(manifestHash(item.save.manifest), message.manifestHash)
+  } catch {
+    return false
+  }
+}
+
+function wireMessageOf(item: StoreBatchedItem): BatchSaveMessage | null {
+  try {
+    return {
+      ...item.save.message,
+      readEpoch: decodeUint64(item.save.message.readEpoch),
+      expiresAt: decodeUint64(item.save.message.expiresAt),
+    }
+  } catch {
+    return null
+  }
+}
+
+export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
+  const ownerKey = lower(owner)
+  const incomplete: string[] = []
+  const note = (text: string) => {
+    if (!incomplete.includes(text)) incomplete.push(text)
+  }
+
+  // Three independent facts start together: the store's batching flag, its pending denies, and
+  // the chain clock the index lag is measured against.
+  const [batchStatus, denies, chainSeconds] = await Promise.all([
+    safe(() => ports.store.batchStatus()),
+    safe(() => ports.store.listRevocations("active")),
+    safe(() => ports.chain.latestTimestamp()),
+  ])
+  const batchingOn = batchStatus === null ? null : batchStatus.enabled
+  // The store's advertised anchor is the domain its agents actually signed under; the baked-in
+  // deployment anchor is the fallback when the status call itself failed.
+  const batchAnchor: Address | null = batchStatus?.batchAnchor ?? DEPLOYMENT.batchAnchor ?? null
+  if (denies === null) note("the store's pending-revocation list could not be read — 'can read' may overstate access")
+  const deniedAgents = new Set<string>()
+  const deniedCapabilities = new Set<string>()
+  for (const intent of Array.isArray(denies) ? denies : []) {
+    if (intent?.target?.kind === "agent" && isString(intent.target.agentId)) {
+      deniedAgents.add(lower(intent.target.agentId))
+    } else if (intent?.target?.kind === "capability" && isString(intent.target.capabilityId)) {
+      deniedCapabilities.add(lower(intent.target.capabilityId))
+    }
+  }
+
+  // --- agents: the index first, chain logs when the index cannot answer ----------------------
+  const grantSeeds: GrantSeed[] = []
+  const revokeByAgent = new Map<string, { block: number; txHash: Hex }>()
+  const rememberRevoke = (agentId: string, block: number, txHash: string) => {
+    const key = lower(agentId)
+    const prev = revokeByAgent.get(key)
+    // Transaction fields only ever travel onward when they are renderable links (model.isTxHash).
+    if (isTxHash(txHash) && (prev === undefined || block >= prev.block)) revokeByAgent.set(key, { block, txHash })
+  }
+
+  const areaIds = new Set<string>(OWNER_NAMESPACE_IDS.map(lower))
+  const indexBatched = new Map<string, IndexBatchedSave>()
+  const signerToAgent = new Map<string, Hex>()
+  const indexRecords = new Map<string, IndexRecord>()
+  let source: MeData["source"] = "index"
+  let lastTimestamp: number | null = null
+  let ownerCounts: { records: number; batchedSaves: number } | null = null
+  let youSaidCount = 0
+
+  if (ports.index !== null) {
+    const raw = await safe(() => queryIndex<AgentsAnswer>(ports.index!, AGENTS_QUERY, { owner: ownerKey }))
+    const primary = raw !== null && isAgentsAnswer(raw) ? raw : null
+    if (primary === null) {
+      source = "chain-logs"
+    } else {
+      lastTimestamp = secondsOf(primary.GlobalStats?.lastTimestamp)
+      for (const grant of primary.Grant ?? []) {
+        grantSeeds.push({
+          agentId: grant.agent as Hex,
+          capabilityId: grant.id as Hex,
+          namespaceId: grant.namespaceId as Hex,
+          permissions: grant.permissions,
+          indexSaysLive: grant.revokedBlock === null,
+          approvedTx: isTxHash(grant.txHash) ? grant.txHash : null,
+          block: grant.grantedBlock,
+        })
+        areaIds.add(lower(grant.namespaceId))
+      }
+      for (const revocation of primary.Revocation ?? []) rememberRevoke(revocation.agentId, revocation.block, revocation.txHash)
+      const agentIds = [...new Set(grantSeeds.map((g) => lower(g.agentId)))]
+      // Secondary queries degrade their own corner of the page rather than dropping to the
+      // fallback: the agents list already came from the index and stays index-sourced.
+      const [batchedAnswer, countsAnswer] = await Promise.all([
+        safe(() => queryIndex<BatchedAnswer>(ports.index!, BATCHED_QUERY, { owner: ownerKey, agents: agentIds })),
+        safe(() => queryIndex<CountsAnswer>(ports.index!, COUNTS_QUERY, { owner: ownerKey })),
+      ])
+      if (batchedAnswer === null) {
+        note("the index's batch detail could not be read — batch transaction links may be missing")
+      } else {
+        for (const row of batchedAnswer.BatchedSave ?? []) {
+          if (!isString(row.id) || !isString(row.namespaceId)) continue
+          indexBatched.set(lower(row.id), row)
+          areaIds.add(lower(row.namespaceId))
+        }
+        for (const agent of batchedAnswer.Agent ?? []) {
+          if (!isString(agent.id) || !isString(agent.signer)) continue
+          signerToAgent.set(lower(agent.signer), agent.id as Hex)
+        }
+      }
+      if (countsAnswer === null) {
+        note("the index's totals could not be read — counts are hidden")
+      } else {
+        for (const record of countsAnswer.ContextRecord ?? []) {
+          if (!isString(record.id) || !isString(record.namespaceId)) continue
+          indexRecords.set(lower(record.id), record)
+          areaIds.add(lower(record.namespaceId))
+        }
+        if (countsAnswer.Owner === null || countsAnswer.Owner === undefined) {
+          ownerCounts = { records: 0, batchedSaves: 0 } // no Owner row = nothing indexed yet
+        } else if (isNumber(countsAnswer.Owner.records) && isNumber(countsAnswer.Owner.batchedSaves)) {
+          ownerCounts = { records: countsAnswer.Owner.records, batchedSaves: countsAnswer.Owner.batchedSaves }
+        } else {
+          note("the index's totals could not be read — counts are hidden")
+        }
+        youSaidCount = (countsAnswer.ContextRecord ?? []).filter((r) => r.provenanceSource === 1 || r.provenanceSource === 2).length
+      }
+    }
+  } else {
+    source = "chain-logs"
+  }
+
+  if (source === "chain-logs") {
+    const logs = await safe(() => ports.chain.ownerGrantLogs(owner))
+    if (logs === null) {
+      note("the grant log scan failed — the agent list may be incomplete")
+    } else {
+      const byCapability = new Map<string, GrantSeed>()
+      for (const log of [...logs].sort((a, b) => a.block - b.block)) {
+        if (
+          log?.kind !== "granted" ||
+          !isString(log.capabilityId) ||
+          !isString(log.namespaceId) ||
+          !isString(log.agentId) ||
+          !isNumber(log.block) ||
+          !isString(log.txHash)
+        )
+          continue
+        byCapability.set(lower(log.capabilityId), {
+          agentId: log.agentId,
+          capabilityId: log.capabilityId,
+          namespaceId: log.namespaceId,
+          permissions: log.permissions ?? 0,
+          indexSaysLive: true,
+          approvedTx: isTxHash(log.txHash) ? log.txHash : null,
+          block: log.block,
+        })
+      }
+      for (const log of logs) {
+        if (log?.kind !== "revoked" || !isString(log.agentId) || !isNumber(log.block) || !isString(log.txHash)) continue
+        rememberRevoke(log.agentId, log.block, log.txHash)
+        if (isString(log.capabilityId)) {
+          // A CapabilityRevoked log ends that one grant.
+          const grant = byCapability.get(lower(log.capabilityId))
+          if (grant !== undefined && grant.block <= log.block) grant.indexSaysLive = false
+        } else {
+          // An AgentRevoked log ends every grant the owner-agent pair had at that block.
+          for (const grant of byCapability.values()) {
+            if (sameHex(grant.agentId, log.agentId) && grant.block <= log.block) grant.indexSaysLive = false
+          }
+        }
+      }
+      grantSeeds.push(...byCapability.values())
+      for (const seed of grantSeeds) areaIds.add(lower(seed.namespaceId))
+    }
+  }
+
+  // --- agent names: chain agent record → content-addressed manifest → name -------------------
+  const nameCache = new Map<string, Promise<string>>()
+  const nameFor = (agentId: Hex): Promise<string> => {
+    const key = lower(agentId)
+    if (key === zeroHash) return Promise.resolve("you") // OWNER_AUTHOR_ID: the owner wrote it
+    let cached = nameCache.get(key)
+    if (cached === undefined) {
+      cached = (async () => {
+        const record = await safe(() => ports.chain.getAgent(agentId))
+        const hash = record?.capabilityManifestHash
+        if (hash !== undefined) {
+          const manifest = await safe(() => ports.store.getAgentManifest(hash))
+          const name = manifest?.manifest?.name
+          if (typeof name === "string" && name.length > 0) return name
+        }
+        return shortId(agentId)
+      })()
+      nameCache.set(key, cached)
+    }
+    return cached
+  }
+
+  // --- grant truth: the index or the logs said it, the chain is asked ------------------------
+  const agents = new Map<string, AgentRow>()
+  for (const seed of grantSeeds) {
+    const chainSaysValid = await safe(() => ports.chain.isCapabilityValid(seed.capabilityId))
+    const status = grantStatus({ indexSaysLive: seed.indexSaysLive, chainSaysValid })
+    let row = agents.get(lower(seed.agentId))
+    if (row === undefined) {
+      row = {
+        agentId: seed.agentId,
+        name: "",
+        grants: [],
+        revokedTx: revokeByAgent.get(lower(seed.agentId))?.txHash ?? null,
+        blockedAtStore: false,
+        readLive: false,
+      }
+      agents.set(lower(seed.agentId), row)
+    }
+    row.grants.push({
+      namespaceId: seed.namespaceId,
+      area: areaName(seed.namespaceId),
+      permissions: seed.permissions,
+      capabilityId: seed.capabilityId,
+      status,
+      approvedTx: seed.approvedTx,
+    })
+  }
+  for (const row of agents.values()) {
+    // An agent-level deny blocks it outright; a capability-level deny on one of its grants blocks
+    // the same way — the store refuses reads either way while the revoke is pending on Monad.
+    row.blockedAtStore =
+      deniedAgents.has(lower(row.agentId)) || row.grants.some((g) => deniedCapabilities.has(lower(g.capabilityId)))
+    row.readLive =
+      !row.blockedAtStore && row.grants.some((g) => (g.permissions & 1) !== 0 && g.status.label === "Can read")
+    row.name = await nameFor(row.agentId)
+  }
+
+  // --- records: the store lists what it holds; the chain decides what is anchored ------------
+  const listedObjects: StoreObject[] = []
+  const listedBatched: { item: StoreBatchedItem; namespaceId: Hex }[] = []
+  let anyPartial = false
+  await Promise.all(
+    [...areaIds].map(async (id) => {
+      const nsId = id as Hex
+      const [objects, batched] = await Promise.all([
+        safe(() => ports.store.listObjects({ owner, namespaceId: nsId })),
+        safe(() => ports.store.listBatchSaves({ owner, namespaceId: nsId })),
+      ])
+      if (objects === null) {
+        note(`the store could not list ${areaName(nsId)} — those records may be missing`)
+      } else {
+        if (objects.partial) {
+          anyPartial = true
+          note(PARTIAL_LIST_TEXT)
+        }
+        for (const object of Array.isArray(objects.objects) ? objects.objects : []) {
+          if (
+            isString(object?.contextId) &&
+            isString(object?.namespaceId) &&
+            isString(object?.authorId) &&
+            isString(object?.ciphertext)
+          ) {
+            listedObjects.push(object)
+          } else {
+            note("a store row was malformed and skipped")
+          }
+        }
+      }
+      if (batched === null) {
+        note(`the store could not list batched saves for ${areaName(nsId)} — those records may be missing`)
+      } else {
+        if (batched.partial) {
+          anyPartial = true
+          note(PARTIAL_LIST_TEXT)
+        }
+        for (const item of Array.isArray(batched.items) ? batched.items : []) {
+          if (isString(item?.contextId) && item?.save !== undefined) {
+            listedBatched.push({ item, namespaceId: nsId })
+          } else {
+            note("a store row was malformed and skipped")
+          }
+        }
+      }
+    }),
+  )
+
+  // Direct lane: one getRecords batch answers "is this contextId on ContextRegistry, and does it
+  // say what the store says". A throw marks every direct row unverified rather than dropping it.
+  let chainRecords: Map<string, ContextRecordView> | null = null
+  if (listedObjects.length > 0) {
+    const found = await safe(() => ports.chain.getRecords(listedObjects.map((o) => o.contextId)))
+    if (found === null) {
+      note("the chain record check failed — direct records show unverified; reload")
+    } else {
+      chainRecords = new Map()
+      for (const record of found) {
+        if (record !== null) chainRecords.set(lower(record.contextId), record)
+      }
+    }
+  }
+
+  const records: RecordRow[] = []
+  for (const object of listedObjects) {
+    const record = chainRecords?.get(lower(object.contextId)) ?? null
+    const indexRecord = indexRecords.get(lower(object.contextId))
+    records.push({
+      contextId: object.contextId,
+      namespaceId: object.namespaceId,
+      area: areaName(object.namespaceId),
+      readEpoch: record?.readEpoch ?? uint64Of(object.manifest?.readEpoch),
+      lane: "direct",
+      state: record !== null && directMatches(record, object, ownerKey) ? "anchored" : "unverified",
+      authorId: object.authorId,
+      authorName: await nameFor(object.authorId),
+      source: record?.provenanceSource ?? indexRecord?.provenanceSource ?? null,
+      tx: indexRecord !== undefined && isTxHash(indexRecord.txHash) ? indexRecord.txHash : null,
+      batchId: null,
+      ciphertext: object.ciphertext,
+      manifest: object.manifest,
+      createdAt:
+        record !== null
+          ? Number(record.createdAt) * 1000
+          : indexRecord !== undefined
+            ? (secondsOf(indexRecord.createdAt) ?? 0) * 1000
+            : 0,
+    })
+  }
+
+  // Batched lane: the contextId belongs to BatchAnchor's Merkle root, never to ContextRegistry.
+  // The author is recovered from the save's own signature — the same derivation the contract ran
+  // at anchor — resolved to an agentId by the chain, with the index's Agent signer map and
+  // BatchedSave row as fallback sources when that read fails.
+  const resolvedAgentOfSigner = new Map<string, Promise<Hex | null>>()
+  const agentOfSigner = (signer: Address): Promise<Hex | null> => {
+    const key = lower(signer)
+    let cached = resolvedAgentOfSigner.get(key)
+    if (cached === undefined) {
+      cached = (async () => {
+        const fromChain = await safe(() => ports.chain.agentIdOfSigner(signer))
+        return fromChain ?? signerToAgent.get(key) ?? null
+      })()
+      resolvedAgentOfSigner.set(key, cached)
+    }
+    return cached
+  }
+
+  for (const { item, namespaceId: listedUnder } of listedBatched) {
+    const message = wireMessageOf(item)
+    const candidates: Hex[] = []
+    if (message !== null && batchAnchor !== null) {
+      const signer = await safe(() =>
+        recoverTypedDataAddress({
+          ...batchSaveTypedData({ chainId: DEPLOYMENT.chainId, batchAnchor, message }),
+          signature: item.save.signature,
+        } as never),
+      )
+      if (signer !== null) {
+        const agentId = await agentOfSigner(signer as Address)
+        if (agentId !== null) candidates.push(agentId)
+      }
+    }
+    const indexRow = indexBatched.get(lower(item.contextId))
+    if (indexRow !== undefined && !candidates.some((c) => sameHex(c, indexRow.agentId))) {
+      candidates.push(indexRow.agentId as Hex)
+    }
+
+    let state: AnchorState = "pending"
+    let authorId: Hex = candidates[0] ?? zeroHash
+    if (item.state === "ANCHORED") {
+      const batchId = item.batchId ?? (indexRow?.batchId as Hex | undefined) ?? null
+      const lineageId = item.lineageId ?? (indexRow?.lineageId as Hex | undefined) ?? null
+      const version = item.version ?? indexRow?.version ?? null
+      let anchored = false
+      if (
+        message !== null &&
+        batchId !== null &&
+        lineageId !== null &&
+        version !== null &&
+        Array.isArray(item.proof) &&
+        batchedCommitmentsMatch(item, message)
+      ) {
+        const root = await safe(() => ports.chain.batchRoot(batchId))
+        if (root !== null) {
+          try {
+            const structHash = batchSaveStructHash(message)
+            // Each candidate agentId produces a different leaf; whichever one the on-chain root
+            // accepts is the verified author. A wrong candidate can only fail the proof — the
+            // check is fail-closed, never fail-open.
+            for (const candidate of candidates) {
+              const leaf = batchLeafHash({
+                contextId: item.contextId,
+                agentId: candidate,
+                lineageId,
+                version,
+                structHash,
+              })
+              if (verifyMerkleProof(leaf, item.proof, root)) {
+                anchored = true
+                authorId = candidate
+                break
+              }
+            }
+          } catch {
+            anchored = false
+          }
+        }
+      }
+      state = anchored ? "anchored" : "unverified"
+    }
+    const rowNamespace = message?.namespaceId ?? (indexRow?.namespaceId as Hex | undefined) ?? listedUnder
+    records.push({
+      contextId: item.contextId,
+      namespaceId: rowNamespace,
+      area: areaName(rowNamespace),
+      readEpoch: message?.readEpoch ?? 0n,
+      lane: "batched",
+      state,
+      authorId,
+      authorName: authorId === zeroHash ? "an agent" : await nameFor(authorId),
+      source: message?.provenanceSource ?? null,
+      tx: indexRow !== undefined && isTxHash(indexRow.txHash) ? indexRow.txHash : null,
+      batchId: item.batchId ?? (indexRow?.batchId as Hex | undefined) ?? null,
+      ciphertext: item.save.ciphertext,
+      manifest: item.save.manifest,
+      createdAt: isNumber(item.receivedAt) ? item.receivedAt : 0,
+    })
+  }
+
+  records.sort((a, b) => b.createdAt - a.createdAt || (a.contextId < b.contextId ? -1 : a.contextId > b.contextId ? 1 : 0))
+  const agentList = [...agents.values()].sort(
+    (a, b) => a.name.localeCompare(b.name) || (a.agentId < b.agentId ? -1 : 1),
+  )
+
+  const pending = records.filter((r) => r.lane === "batched" && r.state === "pending").length
+  const counts =
+    source === "index" && ownerCounts !== null && !anyPartial
+      ? { records: ownerCounts.records + ownerCounts.batchedSaves, youSaid: youSaidCount, pending }
+      : null
+  const lag =
+    chainSeconds === null || !Number.isFinite(chainSeconds)
+      ? { text: "chain clock unavailable", stale: true }
+      : lagText(lastTimestamp, chainSeconds)
+
+  return { owner, agents: agentList, records, incomplete, source, lag, batchingOn, counts }
+}
