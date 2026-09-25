@@ -304,11 +304,13 @@ read-only adapter: four tools (`mida_handoff`, `mida_whats_new`, `mida_read`, `m
 no write tools.
 
 ```json
-{ "mcpServers": { "mida": { "command": "/absolute/path/to/mida-mcp", "args": ["--as", "assistant"] } } }
+{ "mcpServers": { "mida-claude-desktop": { "command": "/absolute/path/to/mida-mcp", "args": ["--as", "claude-desktop", "--project", "/path/to/project"] } } }
 ```
 
 Desktop apps start it without your shell environment, so pass a non-default `MIDA_HOME` in `"env"`.
-Run `mida request assistant && mida approve assistant` in the project folder once first. Details:
+Each client gets its own identity: `mida install claude-desktop` writes this entry for you, then
+`mida approve claude-desktop` in the project folder approves it. (`assistant` is the
+general-assistant identity — it reads what you `mida remember`, never project context.) Details:
 [`docs/quickstart.md` §12](docs/quickstart.md).
 
 **The SDK** (`mida-context-sdk`, not yet on npm) lets your own program act as an agent:

@@ -9,6 +9,7 @@ import { checkProject } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { isSafeName } from "./queue.js"
 import { readOwnerFacts } from "./remember.js"
+import type { MidaHome } from "./home.js"
 import type { ServiceRuntime } from "./runtime.js"
 import { isCapabilityLive, readCheckpoints } from "./skeleton.js"
 
@@ -69,8 +70,21 @@ const HANDOFF_READ_LIMIT_MS = 7_500
 
 const notApprovedText = (agent: string): string =>
   `Mida: ${agent} is not approved for this project — run \`mida approve ${agent}\` in this folder.`
-const generalAssistanceText = (agent: string): string =>
+export const generalAssistanceText = (agent: string): string =>
   `Mida: ${agent} is a general assistant and cannot read project context — run \`mida install <client>\`.`
+
+/**
+ * The one question every "run `mida approve <agent>`" hint must ask first: a general-assistance
+ * identity gets its whole grant at init and can never hold a project row, so approve-advice for it
+ * is an endless loop. An identity that cannot be read answers false — the plain hint stands.
+ */
+export function isGeneralAssistant(home: MidaHome, agent: string): boolean {
+  try {
+    return loadAgentIdentity(home, agent)?.purposeId === "general_assistance"
+  } catch {
+    return false
+  }
+}
 const revokedText = (agent: string): string =>
   `Mida: ${agent}'s access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.`
 export const noIdentityText = (agent: string, homeRoot: string): string =>
@@ -143,11 +157,9 @@ export function projectCheckRefusal(
     // `mida approve <agent>` would loop forever, so the line names the real fix instead: a
     // client identity provisioned by `mida install <client>`. An identity that cannot be read
     // keeps the plain not-approved answer.
-    try {
-      if (loadAgentIdentity(runtime.home, agent)?.purposeId === "general_assistance") {
-        return { reason: "general-assistance", text: generalAssistanceText(agent) }
-      }
-    } catch { /* fall through to not-approved */ }
+    if (isGeneralAssistant(runtime.home, agent)) {
+      return { reason: "general-assistance", text: generalAssistanceText(agent) }
+    }
   }
   return { reason: check.reason, text: notApprovedText(agent) }
 }

@@ -6,7 +6,7 @@ import { BaseError } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, ownerCommandNotice, runCli, runCliWithRuntime, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
 import type { Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
@@ -854,7 +854,7 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
   })
 
   /** A loadable identity file — the fields loadAgentIdentity checks, nothing more. */
-  const writeIdentity = (home: MidaHome, name: string) => {
+  const writeIdentity = (home: MidaHome, name: string, purposeId = "project_assistance") => {
     const key = `0x${"ab".repeat(32)}`
     mkdirSync(join(home.root, "agents", name), { recursive: true })
     writeFileSync(
@@ -867,7 +867,7 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
         encryptionPublicKey: key,
         manifestHash: key,
         callbackOrigin: "http://localhost",
-        purposeId: "project_assistance",
+        purposeId,
         manifest: {},
       }),
     )
@@ -917,5 +917,47 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     )
     expect(code).toBe(1)
     expect(lines).toEqual(["Mida: reader is not approved for this project — run `mida approve reader` in this folder."])
+  })
+
+  it("read --as assistant projects.current names the real fix, never request+approve assistant (G8)", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-g8-")))
+    writeIdentity(home, "assistant", "general_assistance")
+    const stub = { home, owner: "0x0000000000000000000000000000000000000001" } as unknown as ServiceRuntime
+    const lines: string[] = []
+    // a folder with no .mida marker anywhere — the "make it one" hint must not loop the owner
+    // into approving an identity that can never hold a project row
+    const code = await runCliWithRuntime(
+      ["read", "--as", "assistant", "projects.current"],
+      stub,
+      (line) => lines.push(line),
+      { cwd: mkdtempSync(join(tmpdir(), "mida-g8-unmarked-")) },
+    )
+    expect(lines).toEqual(["Mida: assistant is a general assistant and cannot read project context — run `mida install <client>`."])
+    expect(code).toBe(0)
+  })
+
+  it("request assistant answers the general-assistant line — never 'run mida approve assistant' (G8)", async () => {
+    const already = Object.assign(new Error("already approved"), { code: "already-approved" })
+    // the chain answers "nothing live" so the request reaches the already-approved throw
+    const stub = Object.assign(stubRuntime(already), { reader: { activeCapabilityIds: async () => [] } })
+    writeIdentity(stub.home, "assistant", "general_assistance")
+    const lines: string[] = []
+    const code = await runCliWithRuntime(["request", "assistant"], stub, (line) => lines.push(line))
+    expect(code).toBe(1)
+    expect(lines).toEqual(["Mida: assistant is a general assistant and cannot read project context — run `mida install <client>`."])
+  })
+
+  it("ownerRefusalLine's already-approved arm names the real fix for assistant too (G8)", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-g8-")))
+    writeIdentity(home, "assistant", "general_assistance")
+    const already = Object.assign(new Error("already approved"), { code: "already-approved" })
+    expect(ownerRefusalLine("request", "assistant", already, undefined, undefined, home)).toBe(
+      "Mida: assistant is a general assistant and cannot read project context — run `mida install <client>`.",
+    )
+    // a real project-context agent keeps the approve hint
+    writeIdentity(home, "codex")
+    expect(ownerRefusalLine("request", "codex", already, undefined, undefined, home)).toBe(
+      "codex is already approved on chain. To use it in THIS folder, run `mida approve codex` here (no transaction, nothing to pay).",
+    )
   })
 })

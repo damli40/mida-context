@@ -14,7 +14,7 @@ import { callDaemon, ensureCurrentDaemon } from "./control.js"
 import { batchStatusProbe, decideLane, laneWhyText } from "./batching.js"
 import { debugLine, refusalCode } from "./debug-line.js"
 import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
-import { identityUnreadableText, noIdentityText, projectCheckRefusal } from "./handoff.js"
+import { generalAssistanceText, identityUnreadableText, isGeneralAssistant, noIdentityText, projectCheckRefusal } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installMcpClient, uninstallClaudeCode, uninstallCodex, uninstallMcpClient } from "./install.js"
@@ -257,7 +257,13 @@ export async function runCliWithRuntime(
           const cwd = context?.cwd
           const projectId = cwd === undefined ? null : projectIdFor(cwd)
           if (cwd === undefined || projectId === null) {
-            print(`projects.current: this folder is not a Mida project — run \`mida request ${agent} && mida approve ${agent}\` here to make it one`)
+            // A general-assistance identity can never hold a project row — the "make it one" hint
+            // would send the owner into a request/approve loop that can only answer already-approved
+            print(
+              isGeneralAssistant(runtime.home, agent)
+                ? generalAssistanceText(agent)
+                : `projects.current: this folder is not a Mida project — run \`mida request ${agent} && mida approve ${agent}\` here to make it one`,
+            )
           } else {
             // a marker names the project but grants nothing: the owner-signed list must approve
             // THIS folder for THIS agent — the same gate the handoff runs, answered with the
@@ -317,8 +323,14 @@ export async function runCliWithRuntime(
     // the masked detail line prints only when the caller asked for it (MIDA_DEBUG=1).
     const code = refusalCode(error)
     if (code === "already-approved") {
-      // from `request` the next step really is `approve` — that adds THIS folder, no transaction
-      print(`${agent} is already approved on chain. To use it in THIS folder, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`)
+      // from `request` the next step really is `approve` — that adds THIS folder, no transaction.
+      // For the general-assistance identity that hint loops: it can never hold a project row,
+      // so approve can only ever answer already-approved again.
+      print(
+        isGeneralAssistant(runtime.home, agent)
+          ? generalAssistanceText(agent)
+          : `${agent} is already approved on chain. To use it in THIS folder, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`,
+      )
     } else if (code === "CHAIN_CALL_FAILED") {
       print(`the chain call failed — this setup's contract is ${runtime.chain.deployment.capabilityRegistry.slice(0, 6)}…; run with MIDA_DEBUG=1 to see why`)
     } else if (code === "agent-not-setup") {
@@ -470,7 +482,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     }
     return 0
   } catch (error) {
-    deps.print(ownerRefusalLine(command, agent, error, runtime.owner, runtime.chain.deployment.capabilityRegistry))
+    deps.print(ownerRefusalLine(command, agent, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
     // Owner commands run in the owner's own terminal, and an unnamed failure leaves them blind.
     // Only when they ask (MIDA_DEBUG=1): the error's name and first lines, long hex strings masked.
     if (process.env.MIDA_DEBUG === "1") {
@@ -542,7 +554,7 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
       for (const warning of advice.warnings) deps.print(`  ${warning.severity}: ${warning.messageKey}`)
       ready.push(name)
     } catch (error) {
-      deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry))
+      deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
       failed.push(`${name} (${refusalCode(error)})`)
     }
   }
@@ -571,7 +583,7 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
           : `approved ${name} tx ${result.transactionHash}`,
       )
     } catch (error) {
-      deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry))
+      deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
       failed.push(`${name} (${refusalCode(error)})`)
     }
   }
@@ -656,7 +668,7 @@ async function revokeAll(runtime: Runtime, deps: CliDeps): Promise<number> {
   for (const name of scan.held) deps.print(`${name} holds an approval`)
   const failed: string[] = []
   for (const { name, error } of scan.unidentifiable) {
-    deps.print(ownerRefusalLine("revoke", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry))
+    deps.print(ownerRefusalLine("revoke", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
     failed.push(`${name} (${refusalCode(error)})`)
   }
   const revoked: string[] = []
@@ -694,7 +706,7 @@ async function revokeAll(runtime: Runtime, deps: CliDeps): Promise<number> {
         deps.print(`the key repair pass could not run: ${result.repairError} — run \`mida revoke ${name}\` again to retry it`)
       }
     } catch (error) {
-      deps.print(ownerRefusalLine("revoke", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry))
+      deps.print(ownerRefusalLine("revoke", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
       failed.push(`${name} (${refusalCode(error)})`)
     }
   }
@@ -763,7 +775,7 @@ async function runBatching(runtime: ServiceRuntime, arg: string | undefined, dep
  * never echoed because it could carry data. `agent` is the command's subject — for `remember`
  * argv[1] is fact text, but the agent-naming codes cannot surface from remember anyway.
  */
-export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string, capabilityRegistry?: string): string {
+export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string, capabilityRegistry?: string, home?: MidaHome): string {
   const code = refusalCode(error)
   switch (code) {
     // The owner saw the preview and answered something other than yes — nothing was signed.
@@ -771,6 +783,9 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     case "REQUEST_EXPIRED":
       return `${agent}'s request has expired (a request lasts ${Number(REQUEST_LIFETIME_SECONDS) / 60} minutes): run \`mida request ${agent}\` and approve again`
     case "already-approved":
+      // A general-assistance identity can never hold a project row — pointing at `approve` here
+      // would send the owner round a loop that can only ever answer already-approved again.
+      if (home !== undefined && isGeneralAssistant(home, agent)) return generalAssistanceText(agent)
       // from `request` the honest next step is `approve` (it adds THIS folder, no transaction);
       // from `approve` itself this is reached only when no project folder could carry the answer —
       // the folder variants are printed by the approve branch above, never "run me again" (M3-D4)
@@ -1021,7 +1036,7 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
       deps.print(error.line)
       return error.exitCode
     }
-    deps.print(ownerRefusalLine(command, argv[1] ?? "", error, undefined, deps.network.deployment.capabilityRegistry))
+    deps.print(ownerRefusalLine(command, argv[1] ?? "", error, undefined, deps.network.deployment.capabilityRegistry, deps.home))
     if (process.env.MIDA_DEBUG === "1") {
       deps.print(debugLine(error))
     }
@@ -1063,7 +1078,7 @@ async function passkeyApproveAll(session: ServiceRuntime, deps: CliDeps, linkDep
       )
     } catch (error) {
       // A page outcome already IS the line the owner reads; a coded error goes through the mapper.
-      deps.print(error instanceof OwnerLinkOutcome ? error.line : ownerRefusalLine("approve", name, error, undefined, deps.network.deployment.capabilityRegistry))
+      deps.print(error instanceof OwnerLinkOutcome ? error.line : ownerRefusalLine("approve", name, error, undefined, deps.network.deployment.capabilityRegistry, session.home))
       failed.push(`${name} (${error instanceof OwnerLinkOutcome ? error.kind : refusalCode(error)})`)
     }
   }
@@ -1086,7 +1101,7 @@ async function passkeyRevokeAll(session: ServiceRuntime, deps: CliDeps, linkDeps
   for (const name of scan.held) deps.print(`${name} holds an approval`)
   const failed: string[] = []
   for (const { name, error } of scan.unidentifiable) {
-    deps.print(ownerRefusalLine("revoke", name, error, undefined, deps.network.deployment.capabilityRegistry))
+    deps.print(ownerRefusalLine("revoke", name, error, undefined, deps.network.deployment.capabilityRegistry, session.home))
     failed.push(`${name} (${refusalCode(error)})`)
   }
   const revoked: string[] = []
@@ -1116,7 +1131,7 @@ async function passkeyRevokeAll(session: ServiceRuntime, deps: CliDeps, linkDeps
       for (const other of result.rewrapped) deps.print(`new read key sent to ${other}`)
     } catch (error) {
       // A page outcome already IS the line the owner reads; a coded error goes through the mapper.
-      deps.print(error instanceof OwnerLinkOutcome ? error.line : ownerRefusalLine("revoke", name, error, undefined, deps.network.deployment.capabilityRegistry))
+      deps.print(error instanceof OwnerLinkOutcome ? error.line : ownerRefusalLine("revoke", name, error, undefined, deps.network.deployment.capabilityRegistry, session.home))
       failed.push(`${name} (${error instanceof OwnerLinkOutcome ? error.kind : refusalCode(error)})`)
     }
   }
@@ -1208,7 +1223,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   // init alike (initPasskey keeps the same check internally for direct callers).
   if (command === "init" && deps.resolvedNetwork?.mismatch !== undefined) {
     const mismatch = deps.resolvedNetwork.mismatch
-    deps.print(ownerRefusalLine(command, argv[1] ?? "", deploymentMismatchError(mismatch.saved, mismatch.builtIn)))
+    deps.print(ownerRefusalLine(command, argv[1] ?? "", deploymentMismatchError(mismatch.saved, mismatch.builtIn), undefined, undefined, deps.home))
     return 1
   }
   if (OWNER_COMMANDS.includes(command) && (mode === "passkey" || passkeyInit)) {
@@ -1225,7 +1240,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     try {
       session = await ServiceRuntime.openOwnerSession(deps.home, deps.network)
     } catch (error) {
-      deps.print(ownerRefusalLine(command, argv[1] ?? "", error, undefined, deps.network.deployment.capabilityRegistry))
+      deps.print(ownerRefusalLine(command, argv[1] ?? "", error, undefined, deps.network.deployment.capabilityRegistry, deps.home))
       return 1
     }
     try {
