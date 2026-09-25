@@ -20,6 +20,7 @@ import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installMcpClient, uninstallClaudeCode, uninstallCodex, uninstallMcpClient } from "./install.js"
 import type { InstallTool, McpClientTool } from "./install.js"
 import { checkProject, ensureProjectMarker } from "./projects.js"
+import type { ProjectCheck } from "./projects.js"
 import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE, ServiceRuntime } from "./runtime.js"
@@ -306,6 +307,17 @@ export async function runCliWithRuntime(
           }
         }
       } else {
+        // the same gate `read --as <agent> projects.current` runs (G12): a project id names
+        // the list to read but grants nothing — the owner-signed list must approve THIS
+        // folder for THIS agent, answered with the handoff's own refusal text. The daemon
+        // accepts a /cli body that carries no cwd, and a call that names no folder cannot
+        // hold a folder approval — it gets the same not-approved answer, never the ids.
+        const cwd = context?.cwd
+        const check: ProjectCheck = cwd === undefined ? { ok: false, reason: "not-approved" } : await checkProject(runtime, { agent, cwd })
+        if (!check.ok) {
+          print(projectCheckRefusal(runtime, agent, check).text)
+          return 1
+        }
         const result = await readCheckpoints(runtime, agent, projectId)
         print(`read ${result.checkpoints.length} checkpoint(s) in ${result.milliseconds} ms`)
         if (result.partial) print("list incomplete — run again")

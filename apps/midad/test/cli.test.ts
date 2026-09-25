@@ -15,16 +15,21 @@ describe("the crude mida command", () => {
   let env: ScenarioEnvironment
   let network: Network
   let home: MidaHome
+  // the folder the owner-commands "run in" — `approve` writes this folder's row into the
+  // owner-signed approved-projects list, which is exactly what `read <agent> <projectId>`
+  // checks for since the G12 gate landed
+  let projectDir: string
   const lines: string[] = []
   // the prompt dep stands in for a human typing at the terminal — every approve here answers yes —
   // and the terminal deps stand in for the real TTY the owner commands refuse to run without
   const run = (...argv: string[]) =>
-    runCli(argv, { home, network, print: (line) => lines.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
+    runCli(argv, { home, network, cwd: projectDir, print: (line) => lines.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
 
   beforeAll(async () => {
     env = await localEnvironment()
     network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-")))
+    projectDir = mkdtempSync(join(tmpdir(), "mida-cli-proj-"))
   }, 120_000)
   afterAll(async () => {
     await env?.stop()
@@ -48,7 +53,11 @@ describe("the crude mida command", () => {
     expect(await run("revoke", "claude-code")).toBe(0)
     expect(await run("read", "claude-code", "proj-1")).toBe(1)
     expect(await run("read", "codex", "proj-1")).toBe(0)
-    expect(lines.some((line) => line.includes("CAPABILITY_REVOKED"))).toBe(true)
+    // the G12 folder gate answers before the chain is asked — and the marker revoke left behind
+    // turns the not-approved answer into the honest "the owner revoked this" line
+    expect(lines).toContain(
+      "Mida: claude-code's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
+    )
   }, 300_000)
 
   it("kicks the daemon after a successful approve and revoke so the service notices, and never otherwise", async () => {
@@ -280,8 +289,10 @@ describe("the crude mida command", () => {
 
   it("mida read labels every item with the context area it lives in (R5-3)", async () => {
     const lines: string[] = []
+    // run in the folder the shared `run` helper approves agents into — the G12 folder gate
+    // reads the approved-projects row the last `run("approve", "claude-code")` wrote there
     const run2 = (...argv: string[]) =>
-      runCli(argv, { home, network, print: (line) => lines.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
+      runCli(argv, { home, network, cwd: projectDir, print: (line) => lines.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
     // a fact from the remember test above, labelled with its area
     expect(await run2("read", "--as", "claude-code")).toBe(0)
     expect(lines).toContain("  preferences.communication: prefers short answers")
@@ -649,9 +660,11 @@ describe("the crude mida command", () => {
   it("revoke --all with anything but yes revokes nobody (I4)", async () => {
     const lines: string[] = []
     const asked: string[] = []
+    // run in the folder the shared `run` helper approves agents into — the re-approve below
+    // writes this folder's row, which the end-of-test read needs to pass the G12 gate
     const run2 = (...argv: string[]) =>
       runCli(argv, {
-        home, network, print: (line) => lines.push(line),
+        home, network, cwd: projectDir, print: (line) => lines.push(line),
         // yes to a single agent's own ask; the batch question is the one this test declines
         prompt: async (question) => { asked.push(question); return question === "Type yes to revoke all: " ? "no" : "yes" },
         stdinIsTTY: true, stdoutIsTTY: true,
@@ -883,8 +896,13 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
   it("a read whose agent's identity is gone prints the same no-identity line", async () => {
     const notSetup = Object.assign(new Error("gone"), { code: "agent-not-setup" })
     const stub = stubRuntime(notSetup)
+    // the G12 folder gate runs first, so the read must come from a folder this home approved
+    // for codex — only then does the missing-identity answer reach the caller
+    Object.assign(stub, { owner: privateKeyToAccount(loadOrCreateOwnerSecrets(stub.home).privateKey).address })
+    const folder = mkdtempSync(join(tmpdir(), "mida-g12-approved-"))
+    await approveProject(stub as unknown as Runtime, { agent: "codex", cwd: folder })
     const lines: string[] = []
-    const code = await runCliWithRuntime(["read", "codex", "p1"], stub, (line) => lines.push(line))
+    const code = await runCliWithRuntime(["read", "codex", "p1"], stub, (line) => lines.push(line), { cwd: folder })
     expect(code).toBe(1)
     expect(lines).toEqual([`Mida: no agent "codex" is set up in this Mida home (${stub.home.root}). Nothing was shared.`])
   })
@@ -951,6 +969,57 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
       (line) => lines.push(line),
       { cwd: other },
     )
+    expect(code).toBe(1)
+    expect(lines).toEqual(["Mida: reader is not approved for this project — run `mida approve reader` in this folder."])
+  })
+
+  it("read <agent> <projectId> refuses when this folder is not approved for the agent (G12)", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-g12-")))
+    writeIdentity(home, "reader")
+    // the stub carries no store or reader: a skipped folder gate falls into readCheckpoints,
+    // which throws on the bare stub and the catch prints "refused: …" — this fails loudly
+    const stub = { home, owner: "0x0000000000000000000000000000000000000001" } as unknown as ServiceRuntime
+    const lines: string[] = []
+    const code = await runCliWithRuntime(
+      ["read", "reader", "p1"],
+      stub,
+      (line) => lines.push(line),
+      { cwd: markedFolder("p1") },
+    )
+    expect(code).toBe(1)
+    expect(lines).toEqual(["Mida: reader is not approved for this project — run `mida approve reader` in this folder."])
+  })
+
+  it("an approval for a different folder does not open read <agent> <projectId> (G12)", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-g12-")))
+    writeIdentity(home, "reader")
+    const owner = privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey).address
+    const stub = { home, owner } as unknown as ServiceRuntime
+    // approve the agent on one folder…
+    const approved = mkdtempSync(join(tmpdir(), "mida-g12-approved-"))
+    await approveProject(stub as unknown as Runtime, { agent: "reader", cwd: approved })
+    const marker = JSON.parse(readFileSync(join(approved, ".mida", "project.json"), "utf8")) as { projectId: string }
+    // …then read that same project id from a different folder that carries it — folder-mismatch
+    const other = markedFolder(marker.projectId)
+    const lines: string[] = []
+    const code = await runCliWithRuntime(
+      ["read", "reader", marker.projectId],
+      stub,
+      (line) => lines.push(line),
+      { cwd: other },
+    )
+    expect(code).toBe(1)
+    expect(lines).toEqual(["Mida: reader is not approved for this project — run `mida approve reader` in this folder."])
+  })
+
+  it("read <agent> <projectId> with no caller folder names no folder to approve — the same refusal (G12)", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-g12-")))
+    writeIdentity(home, "reader")
+    const stub = { home, owner: "0x0000000000000000000000000000000000000001" } as unknown as ServiceRuntime
+    const lines: string[] = []
+    // the daemon accepts a /cli body that carries no cwd and passes undefined through — a call
+    // that names no folder cannot hold a folder approval, so it gets the same not-approved line
+    const code = await runCliWithRuntime(["read", "reader", "p1"], stub, (line) => lines.push(line))
     expect(code).toBe(1)
     expect(lines).toEqual(["Mida: reader is not approved for this project — run `mida approve reader` in this folder."])
   })
