@@ -131,6 +131,71 @@ describe("the crude mida command", () => {
     expect(order).toEqual(["drain", "prompt"])
   }, 300_000)
 
+  it("install claude-desktop registers its own identity, files the pending request and writes the client config (I1)", async () => {
+    const lines: string[] = []
+    const work = mkdtempSync(join(tmpdir(), "mida-desktop-work-"))
+    mkdirSync(join(work, ".mida"))
+    writeFileSync(join(work, ".mida", "project.json"), JSON.stringify({ projectId: "p-desktop" }))
+    const config = join(mkdtempSync(join(tmpdir(), "mida-desktop-cfg-")), "claude_desktop_config.json")
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+        cwd: work, claudeDesktopConfig: config,
+      })
+    expect(await run2("install", "claude-desktop")).toBe(0)
+    // the identity is the client's own — a project-context agent, never `assistant`
+    const identity = loadAgentIdentity(home, "claude-desktop")
+    expect(identity?.name).toBe("claude-desktop")
+    expect(identity?.purposeId).not.toBe("general_assistance")
+    // the pending request is what `mida approve claude-desktop` in this folder completes
+    expect(home.has("agents/claude-desktop/pending-request.json")).toBe(true)
+    const entry = JSON.parse(readFileSync(config, "utf8")).mcpServers["mida-claude-desktop"]
+    expect(entry.args).toEqual(["--as", "claude-desktop", "--project", work])
+    expect(entry.env).toEqual({ MIDA_HOME: home.root })
+    expect(lines).toContain("next: run `mida approve claude-desktop` in this folder")
+    // a re-run is a no-op: same file, no new identity, no second request
+    expect(await run2("install", "claude-desktop")).toBe(0)
+    expect(lines.filter((line) => line === "already installed")).toHaveLength(1)
+    // the registered client name is a real approve target even though it is not a built-in agent
+    expect(await run2("approve", "claude-desktop")).toBe(0)
+    expect(lines.some((line) => line.startsWith("approved claude-desktop"))).toBe(true)
+  }, 300_000)
+
+  it("install cursor writes <cwd>/.cursor/mcp.json with ${workspaceFolder} and its own identity (I1)", async () => {
+    const lines: string[] = []
+    const work = mkdtempSync(join(tmpdir(), "mida-cursor-work-"))
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true, cwd: work,
+      })
+    expect(await run2("install", "cursor")).toBe(0)
+    const entry = JSON.parse(readFileSync(join(work, ".cursor", "mcp.json"), "utf8")).mcpServers["mida-cursor"]
+    expect(entry.args).toEqual(["--as", "cursor", "--project", "${workspaceFolder}"])
+    expect(entry.env).toEqual({ MIDA_HOME: home.root })
+    expect(loadAgentIdentity(home, "cursor")?.name).toBe("cursor")
+    expect(lines).toContain("next: run `mida approve cursor` in this folder")
+  }, 300_000)
+
+  it("install <client> asks for a real terminal like approve, a non-client is usage, the daemon refuses it", async () => {
+    const out: string[] = []
+    expect(await runCli(["install", "cursor"], {
+      home, network, print: (line) => out.push(line),
+      prompt: async () => "yes", stdinIsTTY: false, stdoutIsTTY: true,
+      cwd: mkdtempSync(join(tmpdir(), "mida-cursor-work-")),
+    })).toBe(2)
+    expect(out).toEqual([NEEDS_TERMINAL_LINE])
+    // there is no chatgpt client — the ChatGPT desktop app is the Codex app and runs as `codex`
+    expect(await run("install", "chatgpt")).toBe(2)
+    expect(lines.at(-1)).toBe(USAGE)
+    // through the daemon's /cli route it is refused like every owner command
+    const refused: string[] = []
+    const stub = { home: new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-stub-"))) } as unknown as ServiceRuntime
+    expect(await runCliWithRuntime(["install", "cursor"], stub, (line) => refused.push(line))).toBe(2)
+    expect(refused[0]).toContain("mida install")
+  })
+
   it("MIDA_DEBUG=1 prints a masked debug line on failure; unset prints nothing extra (R4-8)", async () => {
     const hex = `0x${"ab".repeat(40)}`
     const failingPrompt = async () => {

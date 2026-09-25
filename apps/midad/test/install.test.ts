@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { basename, isAbsolute, join } from "node:path"
 import {
   CODEX_BLOCK,
   CODEX_BLOCK_V1,
@@ -12,16 +12,19 @@ import {
   claudeHooksStatus,
   codexBlock,
   codexHooksStatus,
+  cursorMcpConfigPath,
   hookCommand,
   injectCommand,
   installClaudeCode,
   installCodex,
+  installMcpClient,
   parseMidaCommand,
   recordCodexHome,
   recordedCodexHome,
   runInstall,
   uninstallClaudeCode,
   uninstallCodex,
+  uninstallMcpClient,
 } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-install-"))
@@ -555,5 +558,176 @@ describe("the Codex trust reminder", () => {
     expect(removed.lines).not.toContain(CODEX_TRUST_SENTENCE)
     const claude = install(config, settings, ["install", "claude-code"])
     expect(claude.lines).not.toContain(CODEX_TRUST_SENTENCE)
+  })
+})
+
+/**
+ * The MCP clients (Task 11, I1): `mida install claude-desktop|cursor` merges one mcpServers entry
+ * — the mida-mcp launcher, the client's own `--as` identity, this home in env — into the client's
+ * config. Every other server and key is kept as parsed; the first change leaves a one-time
+ * `.mida-backup`. The identity half (init + requestAccess) lives in the owner command, tested in
+ * cli.test.ts — here the file behaviour is proven on its own.
+ */
+describe("installMcpClient — the client adapters", () => {
+  it("merges mida-claude-desktop into an existing config: other servers byte-equal, backup once, re-run a no-op", () => {
+    const config = join(dir(), "claude_desktop_config.json")
+    const original = `${JSON.stringify({ mcpServers: { other: { command: "/usr/local/bin/other", args: ["--serve"] } }, theme: "dark" }, null, 4)}\n`
+    writeFileSync(config, original)
+    const home = join(dir(), "mida-home")
+    const work = join(dir(), "work")
+    expect(installMcpClient("claude-desktop", config, home, work)).toBe("installed")
+    const parsed = JSON.parse(readFileSync(config, "utf8"))
+    // everything already in the file is still there, exactly as parsed
+    expect(parsed.theme).toBe("dark")
+    expect(parsed.mcpServers.other).toEqual({ command: "/usr/local/bin/other", args: ["--serve"] })
+    const entry = parsed.mcpServers["mida-claude-desktop"]
+    // an absolute launcher the client can spawn with no Mida PATH, its own identity, this home
+    expect(isAbsolute(entry.command)).toBe(true)
+    expect(basename(entry.command)).toMatch(/^mida-mcp/)
+    expect(entry.args).toEqual(["--as", "claude-desktop", "--project", work])
+    expect(entry.env).toEqual({ MIDA_HOME: home })
+    // the pre-install bytes are kept once — a later install never rewrites the backup
+    expect(readFileSync(`${config}.mida-backup`, "utf8")).toBe(original)
+    const afterInstall = readFileSync(config, "utf8")
+    expect(installMcpClient("claude-desktop", config, home, work)).toBe("already-installed")
+    expect(readFileSync(config, "utf8")).toBe(afterInstall)
+  })
+
+  it("writes the config when none exists, creating the folder — no backup, nothing to keep", () => {
+    const config = join(dir(), "Claude", "claude_desktop_config.json")
+    expect(installMcpClient("claude-desktop", config, join(dir(), "home"), dir())).toBe("installed")
+    const parsed = JSON.parse(readFileSync(config, "utf8"))
+    expect(Object.keys(parsed)).toEqual(["mcpServers"])
+    expect(Object.keys(parsed.mcpServers)).toEqual(["mida-claude-desktop"])
+    expect(existsSync(`${config}.mida-backup`)).toBe(false)
+  })
+
+  it("cursor writes <cwd>/.cursor/mcp.json with the literal ${workspaceFolder} — Cursor resolves it per window", () => {
+    const work = dir()
+    const home = join(dir(), "mida-home")
+    const config = cursorMcpConfigPath(work)
+    expect(config).toBe(join(work, ".cursor", "mcp.json"))
+    expect(installMcpClient("cursor", config, home, work)).toBe("installed")
+    const entry = JSON.parse(readFileSync(config, "utf8")).mcpServers["mida-cursor"]
+    expect(entry.args).toEqual(["--as", "cursor", "--project", "${workspaceFolder}"])
+    expect(entry.env).toEqual({ MIDA_HOME: home })
+    expect(isAbsolute(entry.command)).toBe(true)
+  })
+
+  it("each client carries its own identity — no entry ever says --as assistant", () => {
+    const home = join(dir(), "mida-home")
+    const desktopConfig = join(dir(), "claude_desktop_config.json")
+    const cursorConfig = join(dir(), "mcp.json")
+    installMcpClient("claude-desktop", desktopConfig, home, dir())
+    installMcpClient("cursor", cursorConfig, home, dir())
+    const desktop = JSON.parse(readFileSync(desktopConfig, "utf8")).mcpServers["mida-claude-desktop"]
+    const cursor = JSON.parse(readFileSync(cursorConfig, "utf8")).mcpServers["mida-cursor"]
+    expect(desktop.args).toContain("claude-desktop")
+    expect(cursor.args).toContain("cursor")
+    for (const entry of [desktop, cursor]) expect(entry.args).not.toContain("assistant")
+  })
+
+  it("a mcpServers that is not an object — or any unreadable config — is refused whole, file untouched", () => {
+    for (const bad of ["not json {", "[1,2]", JSON.stringify({ mcpServers: [1] })]) {
+      const config = join(dir(), "claude_desktop_config.json")
+      writeFileSync(config, bad)
+      expect(() => installMcpClient("claude-desktop", config, join(dir(), "home"), dir())).toThrowError(/cannot be read/)
+      expect(readFileSync(config, "utf8")).toBe(bad)
+      expect(() => uninstallMcpClient("claude-desktop", config)).toThrowError(/cannot be read/)
+      expect(readFileSync(config, "utf8")).toBe(bad)
+    }
+  })
+
+  it("a changed entry is rewritten — an install from an older checkout's path is ours to update", () => {
+    const config = join(dir(), "mcp.json")
+    installMcpClient("cursor", config, join(dir(), "home"), dir())
+    const parsed = JSON.parse(readFileSync(config, "utf8"))
+    parsed.mcpServers["mida-cursor"].args = ["--as", "assistant"]
+    writeFileSync(config, JSON.stringify(parsed))
+    expect(installMcpClient("cursor", config, join(dir(), "home"), dir())).toBe("installed")
+    expect(JSON.parse(readFileSync(config, "utf8")).mcpServers["mida-cursor"].args).toEqual([
+      "--as", "cursor", "--project", "${workspaceFolder}",
+    ])
+  })
+})
+
+describe("uninstallMcpClient", () => {
+  it("removes only Mida's entry — other servers and other keys stay", () => {
+    const config = join(dir(), "claude_desktop_config.json")
+    writeFileSync(config, JSON.stringify({ mcpServers: { other: { command: "/x" } }, theme: 1 }))
+    installMcpClient("claude-desktop", config, join(dir(), "home"), dir())
+    expect(uninstallMcpClient("claude-desktop", config)).toBe("uninstalled")
+    expect(JSON.parse(readFileSync(config, "utf8"))).toEqual({ mcpServers: { other: { command: "/x" } }, theme: 1 })
+    expect(uninstallMcpClient("claude-desktop", config)).toBe("not-installed")
+    // one client's entry never touches the other's
+    installMcpClient("claude-desktop", config, join(dir(), "home"), dir())
+    expect(uninstallMcpClient("cursor", config)).toBe("not-installed")
+    expect("mida-claude-desktop" in JSON.parse(readFileSync(config, "utf8")).mcpServers).toBe(true)
+  })
+
+  it("drops an emptied mcpServers install created, and keeps one the file already had", () => {
+    // install created the whole file — mcpServers was ours, so it goes
+    const fresh = join(dir(), "mcp.json")
+    installMcpClient("cursor", fresh, join(dir(), "home"), dir())
+    expect(uninstallMcpClient("cursor", fresh)).toBe("uninstalled")
+    expect(JSON.parse(readFileSync(fresh, "utf8"))).toEqual({})
+    // mcpServers was already in the file the first install saw — the emptied object stays
+    const owned = join(dir(), "mcp.json")
+    writeFileSync(owned, JSON.stringify({ mcpServers: {} }))
+    installMcpClient("cursor", owned, join(dir(), "home"), dir())
+    expect(uninstallMcpClient("cursor", owned)).toBe("uninstalled")
+    expect(JSON.parse(readFileSync(owned, "utf8"))).toEqual({ mcpServers: {} })
+  })
+
+  it("a missing file is not-installed and writes nothing", () => {
+    const config = join(dir(), "claude_desktop_config.json")
+    expect(uninstallMcpClient("claude-desktop", config)).toBe("not-installed")
+    expect(existsSync(config)).toBe(false)
+  })
+})
+
+describe("runInstall for the clients", () => {
+  const run = (argv: string[], extra: Record<string, unknown> = {}) => {
+    const lines: string[] = []
+    const code = runInstall(argv, {
+      print: (line) => lines.push(line),
+      claudeSettings: join(dir(), "settings.json"),
+      codexConfig: join(dir(), "config.toml"),
+      home: new MidaHome(join(dir(), "mida-home")),
+      ...extra,
+    })
+    return { code, lines }
+  }
+
+  it("uninstall <client> removes only the entry and says the identity stays behind", () => {
+    const config = join(dir(), "claude_desktop_config.json")
+    const midaHome = join(dir(), "mida-home")
+    installMcpClient("claude-desktop", config, midaHome, dir())
+    const { code, lines } = run(["uninstall", "claude-desktop"], { claudeDesktopConfig: config })
+    expect(code).toBe(0)
+    expect(lines[0]).toBe("uninstalled")
+    expect(lines.some((line) => line.includes("identity") && line.includes("`mida revoke claude-desktop`"))).toBe(true)
+    expect("mcpServers" in JSON.parse(readFileSync(config, "utf8"))).toBe(false)
+  })
+
+  it("uninstall cursor resolves <cwd>/.cursor/mcp.json", () => {
+    const work = dir()
+    installMcpClient("cursor", cursorMcpConfigPath(work), join(dir(), "home"), work)
+    const { code, lines } = run(["uninstall", "cursor"], { cwd: work })
+    expect(code).toBe(0)
+    expect(lines[0]).toBe("uninstalled")
+    expect(JSON.parse(readFileSync(cursorMcpConfigPath(work), "utf8"))).toEqual({})
+  })
+
+  it("install <client> is refused here — the identity half belongs to the owner command", () => {
+    for (const client of ["claude-desktop", "cursor"]) {
+      const { code, lines } = run(["install", client], { cwd: dir() })
+      expect(code).toBe(2)
+      expect(lines.some((line) => line.includes("owner command"))).toBe(true)
+    }
+    // and an uninstalled client still answers cleanly
+    const { code, lines } = run(["uninstall", "cursor"], { cwd: dir() })
+    expect(code).toBe(0)
+    expect(lines).toEqual(["not installed"])
   })
 })

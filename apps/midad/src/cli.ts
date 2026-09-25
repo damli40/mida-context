@@ -17,8 +17,8 @@ import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
 import { identityUnreadableText, noIdentityText, projectCheckRefusal } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
-import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeCode, uninstallCodex } from "./install.js"
-import type { InstallTool } from "./install.js"
+import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installMcpClient, uninstallClaudeCode, uninstallCodex, uninstallMcpClient } from "./install.js"
+import type { InstallTool, McpClientTool } from "./install.js"
 import { checkProject } from "./projects.js"
 import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
@@ -28,16 +28,18 @@ import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag }
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
 import { approve, authorNamesFor, deploymentMismatchError, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
-import { loadAgentIdentity, loadOwnerMode } from "./keys.js"
+import { listAgentNames, loadAgentIdentity, loadOwnerMode } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
 import { migrate, migrateUndo } from "./migrate.js"
-import { OwnerLinkOutcome, approvePasskey, initPasskey, revokePasskey } from "./owner-link/flows.js"
+import { OwnerLinkOutcome, approvePasskey, initPasskey, provisionPasskeyAgents, revokePasskey } from "./owner-link/flows.js"
 import type { PasskeyDeps } from "./owner-link/flows.js"
 
 /** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. */
 const AGENTS = ["claude-code", "codex", "assistant"]
 /** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. Only the real tools can be installed or doctored. */
-const INSTALL_TOOLS = ["claude-code", "codex"]
+const HOOK_TOOLS = ["claude-code", "codex"]
+/** install takes a hook tool or an MCP client; `doctor --live` only ever checks the hook tools. */
+const INSTALL_TOOLS = [...HOOK_TOOLS, ...MCP_CLIENT_TOOLS]
 const WITH_AGENT = ["request", "approve", "save-demo", "read", "revoke"]
 const WITH_PROJECT = ["save-demo"]
 /** The namespaces `read --as <agent> <namespace>` may name — the same three the MCP adapter exposes. */
@@ -50,16 +52,17 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
 const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
 export const USAGE =
   "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | batching on|off | migrate [--undo]" +
-  "   (tool = claude-code | codex; agent = claude-code | codex | assistant — assistant is a stand-in for any other assistant you use)"
+  "   (tool = claude-code | codex | claude-desktop | cursor; agent = claude-code | codex | assistant — or the identity a client installs)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
-export const CLI_COMMANDS: readonly string[] = ["init", "remember", "migrate", "batching", ...WITH_AGENT]
+export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", ...WITH_AGENT]
 /**
  * The commands that change who has access. Only `mida` in the owner's own terminal may run them —
- * they open the owner runtime in-process and are never sent to the daemon socket.
+ * they open the owner runtime in-process and are never sent to the daemon socket. `install` for
+ * an MCP client belongs here: it registers that client's identity on the chain.
  */
-export const OWNER_COMMANDS: readonly string[] = ["init", "approve", "revoke", "remember", "migrate", "batching"]
+export const OWNER_COMMANDS: readonly string[] = ["init", "install", "approve", "revoke", "remember", "migrate", "batching"]
 /** The owner commands that must see a real terminal. `init` is exempt: it grants nothing to an agent. */
-const TERMINAL_COMMANDS: readonly string[] = ["approve", "revoke", "remember", "migrate", "batching"]
+const TERMINAL_COMMANDS: readonly string[] = ["install", "approve", "revoke", "remember", "migrate", "batching"]
 export const NEEDS_TERMINAL_LINE = "needs-terminal: run this yourself in a terminal window"
 
 /** What the daemon answers when an owner command reaches /cli anyway. */
@@ -148,6 +151,8 @@ export interface CliDeps {
   migrateTarget?: Deployment
   /** What runs after `mida migrate` switches (or `--undo` restores) — default: spawn the daemon. */
   startService?: () => unknown | Promise<unknown>
+  /** Claude Desktop's config file — `mida install claude-desktop` merges into it. Tests inject a temp path. */
+  claudeDesktopConfig?: string
 }
 
 /**
@@ -189,7 +194,11 @@ export async function runCliWithRuntime(
     return 2
   }
   if (!WITH_AGENT.includes(command)) return usage()
-  if (WITH_AGENT.includes(command) && !AGENTS.includes(agent) && !(asFlag && READ_AS_NAME.test(agent))) return usage()
+  // A client identity this home registered (claude-desktop, cursor, …) is a valid target for
+  // request/read even though it was never in init's built-in list — `read --as` keeps the wider
+  // name-shape gate, which the identity file check on the read path still stands behind.
+  const known = AGENTS.includes(agent) || listAgentNames(runtime.home).includes(agent)
+  if (WITH_AGENT.includes(command) && !known && !(asFlag && READ_AS_NAME.test(agent))) return usage()
   if (command === "read" && !asFlag && projectId.length === 0) return usage()
   // `read --as <agent> <namespace>` takes exactly one namespace, from the known set — anything
   // else on the line is refused rather than silently ignored.
@@ -334,7 +343,9 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     deps.print(USAGE)
     return 2
   }
-  if ((command === "approve" || command === "revoke") && !AGENTS.includes(agent)) return usage()
+  // An installed client's identity (claude-desktop, cursor) is a real approve/revoke target —
+  // `install <client>` registered it, so the name is checked against the home, not only AGENTS.
+  if ((command === "approve" || command === "revoke") && agent !== "--all" && !AGENTS.includes(agent) && !listAgentNames(runtime.home).includes(agent)) return usage()
   if (command === "remember" && argv.slice(1).join(" ").trim().length === 0) return usage()
 
   try {
@@ -405,6 +416,29 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
             : `the old approved-projects list was invalid; ${result.droppedRows} row(s) were dropped`,
         )
       }
+    } else if (command === "install") {
+      const tool = argv[1] ?? ""
+      if (argv.length !== 2 || !MCP_CLIENT_TOOLS.includes(tool)) return usage()
+      const client = tool as McpClientTool
+      // the identity comes first — provisioning is init's per-agent pass over this one name, so
+      // install is idempotent the same way init is: an existing identity is kept, a missing one
+      // registers on chain as a project-context agent (never `assistant`)
+      await init(runtime, [client])
+      // the pending request is what `mida approve <client>` completes — file one if none waits
+      if (!runtime.home.has(`agents/${client}/pending-request.json`)) {
+        try {
+          await requestAccess(runtime, client)
+        } catch (error) {
+          if (refusalCode(error) !== "already-approved") throw error
+        }
+      }
+      const cwd = deps.cwd ?? process.cwd()
+      const configPath = client === "cursor"
+        ? cursorMcpConfigPath(cwd)
+        : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
+      const outcome = installMcpClient(client, configPath, runtime.home.root, cwd)
+      deps.print(outcome === "already-installed" ? "already installed" : "installed")
+      deps.print(`next: run \`mida approve ${client}\` in this folder`)
     } else if (command === "batching") {
       return await runBatching(runtime, argv[1], deps)
     } else {
@@ -661,8 +695,40 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
         await session.close()
       }
     }
+    if (command === "install") {
+      const tool = argv[1] ?? ""
+      if (argv.length !== 2 || !MCP_CLIENT_TOOLS.includes(tool)) {
+        deps.print(USAGE)
+        return 2
+      }
+      const client = tool as McpClientTool
+      // registering a project-context agent needs no passkey round — the operator carries the
+      // manifest — so install is one provision pass, exactly like the software path's init call
+      const installSession = await ServiceRuntime.openOwnerSession(deps.home, deps.network)
+      try {
+        installSession.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
+        await provisionPasskeyAgents(installSession, [client], linkDeps)
+        if (!deps.home.has(`agents/${client}/pending-request.json`)) {
+          try {
+            await requestAccess(installSession, client)
+          } catch (error) {
+            if (refusalCode(error) !== "already-approved") throw error
+          }
+        }
+        const cwd = deps.cwd ?? process.cwd()
+        const configPath = client === "cursor"
+          ? cursorMcpConfigPath(cwd)
+          : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
+        const outcome = installMcpClient(client, configPath, deps.home.root, cwd)
+        deps.print(outcome === "already-installed" ? "already installed" : "installed")
+        deps.print(`next: run \`mida approve ${client}\` in this folder`)
+        return 0
+      } finally {
+        await installSession.close()
+      }
+    }
     const agent = argv[1] ?? ""
-    if (!AGENTS.includes(agent)) {
+    if (agent !== "--all" && !AGENTS.includes(agent) && !listAgentNames(deps.home).includes(agent)) {
       deps.print(USAGE)
       return 2
     }
@@ -855,12 +921,43 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
  */
 export function runInstall(
   argv: string[],
-  deps: { print: (line: string) => void; claudeSettings: string; codexConfig: string; home: MidaHome },
+  deps: {
+    print: (line: string) => void
+    claudeSettings: string
+    codexConfig: string
+    home: MidaHome
+    cwd?: string
+    claudeDesktopConfig?: string
+  },
 ): number {
   const tool = argv[1] ?? ""
   if (argv.length !== 2 || !INSTALL_TOOLS.includes(tool)) {
     deps.print(USAGE)
     return 2
+  }
+  // An MCP client is not a hook tool: its install registers an identity and is an owner command
+  // (main routes it there); its uninstall only removes Mida's entry from the client's MCP config.
+  if (MCP_CLIENT_TOOLS.includes(tool)) {
+    const client = tool as McpClientTool
+    if (argv[0] === "install") {
+      deps.print(`mida install ${client} is an owner command — run it in your own terminal`)
+      return 2
+    }
+    const cwd = deps.cwd ?? process.cwd()
+    const configPath = client === "cursor"
+      ? cursorMcpConfigPath(cwd)
+      : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
+    try {
+      const outcome = uninstallMcpClient(client, configPath)
+      deps.print(outcome === "not-installed" ? "not installed" : outcome)
+      if (outcome === "uninstalled") {
+        deps.print(`the ${client} identity and its approvals are unchanged — \`mida revoke ${client}\` revokes access`)
+      }
+      return 0
+    } catch (error) {
+      deps.print(`refused: ${refusalCode(error)}`)
+      return 1
+    }
   }
   const settingsPath = tool === "claude-code" ? deps.claudeSettings : deps.codexConfig
   try {
@@ -935,13 +1032,16 @@ async function main(): Promise<void> {
   // install, uninstall and doctor are local commands: they never go through the daemon.
   // install edits the tool's own config outside the Mida home, and doctor's first check is
   // whether the daemon is even up — running it through the socket would report on nothing.
-  if (argv[0] === "install" || argv[0] === "uninstall") {
+  // `install <client>` is the exception: it registers the client's identity on the chain, so it
+  // falls through to the owner commands like approve.
+  if (argv[0] === "uninstall" || (argv[0] === "install" && !(argv.length === 2 && MCP_CLIENT_TOOLS.includes(argv[1] ?? "")))) {
     // the real settings paths are built here and only here — tests always pass their own
     process.exitCode = runInstall(argv, {
       print,
       claudeSettings: join(homedir(), ".claude", "settings.json"),
       codexConfig: join(resolveCodexHome(process.env, homedir()), "config.toml"),
       home,
+      claudeDesktopConfig: claudeDesktopConfigPath(homedir()),
     })
     return
   }
@@ -955,7 +1055,7 @@ async function main(): Promise<void> {
     }
     if (argv[1] === "--live") {
       const tool = argv[2] ?? ""
-      if (argv.length !== 3 || !INSTALL_TOOLS.includes(tool)) {
+      if (argv.length !== 3 || !HOOK_TOOLS.includes(tool)) {
         print(USAGE)
         process.exitCode = 2
         return

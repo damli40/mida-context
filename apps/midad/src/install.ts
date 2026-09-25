@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
-import { basename, dirname, isAbsolute } from "node:path"
+import { basename, dirname, isAbsolute, join } from "node:path"
 import { randomBytes } from "node:crypto"
+import { fileURLToPath } from "node:url"
+import { isDeepStrictEqual } from "node:util"
 import { isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
 import type { SiblingEntry } from "./sibling.js"
 
@@ -25,6 +27,105 @@ export const INJECT_COMMAND = {
 } as const
 
 export type InstallTool = keyof typeof HOOK_COMMAND
+
+/** The MCP clients — each connects over mida-mcp with its own identity, never a hook. */
+export const MCP_CLIENT_TOOLS: readonly string[] = ["claude-desktop", "cursor"]
+export type McpClientTool = "claude-desktop" | "cursor"
+
+/** The one server entry each client's mcpServers map carries. */
+export const MCP_SERVER_NAME: Record<McpClientTool, string> = {
+  "claude-desktop": "mida-claude-desktop",
+  "cursor": "mida-cursor",
+}
+
+/** Claude Desktop's config lives under the account, not the project — overridable in tests. */
+export const claudeDesktopConfigPath = (homeDir: string): string =>
+  join(homeDir, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+
+/** Cursor reads <project>/.cursor/mcp.json — the install cwd is the workspace. */
+export const cursorMcpConfigPath = (cwd: string): string => join(cwd, ".cursor", "mcp.json")
+
+/**
+ * The mcp launcher. Bundled the dist file is the executable entry; from source the sh launcher
+ * is the path a client can spawn without a Mida PATH.
+ */
+function mcpServerCommand(): string {
+  if (isBundled()) return siblingEntryPath("mida-mcp")
+  return fileURLToPath(new URL("../../../bin/mida-mcp", import.meta.url))
+}
+
+/** The entry written into the client's mcpServers — absolute launcher, own identity, its home. */
+function mcpServerEntry(client: McpClientTool, homeRoot: string, cwd: string): Record<string, unknown> {
+  return {
+    command: mcpServerCommand(),
+    // Cursor substitutes ${workspaceFolder} itself; Claude Desktop has no workspace variable, so
+    // its project is the folder `mida install` ran in
+    args: ["--as", client, "--project", client === "cursor" ? "${workspaceFolder}" : cwd],
+    env: { MIDA_HOME: homeRoot },
+  }
+}
+
+/**
+ * Reads the client's MCP config. A missing file is an empty config; a file that is not a JSON
+ * object — or whose mcpServers is not an object — is refused whole rather than rewritten.
+ */
+function readMcpConfig(configPath: string): { text: string; config: Record<string, unknown> } | "absent" {
+  if (!existsSync(configPath)) return "absent"
+  const text = readFileSync(configPath, "utf8")
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw settingsUnreadable()
+  }
+  if (!isPlainObject(parsed)) throw settingsUnreadable()
+  if ("mcpServers" in parsed && !isPlainObject(parsed.mcpServers)) throw settingsUnreadable()
+  return { text, config: parsed }
+}
+
+/**
+ * Merges Mida's server entry into the client's MCP config. Everything else in the file is kept
+ * as parsed — other servers, other keys. A backup of the pre-install bytes is taken once, and
+ * re-running with the same entry changes nothing.
+ */
+export function installMcpClient(client: McpClientTool, configPath: string, homeRoot: string, cwd: string): InstallOutcome {
+  const name = MCP_SERVER_NAME[client]
+  const entry = mcpServerEntry(client, homeRoot, cwd)
+  const read = readMcpConfig(configPath)
+  if (read === "absent") {
+    mkdirSync(dirname(configPath), { recursive: true })
+    writeFileAtomic(configPath, `${JSON.stringify({ mcpServers: { [name]: entry } }, null, 2)}\n`)
+    return "installed"
+  }
+  const { text, config } = read
+  const servers = (config.mcpServers ?? {}) as Record<string, unknown>
+  if (isDeepStrictEqual(servers[name], entry)) return "already-installed"
+  const backup = `${configPath}.mida-backup`
+  if (!existsSync(backup)) writeFileSync(backup, text)
+  servers[name] = entry
+  config.mcpServers = servers
+  writeFileAtomic(configPath, `${JSON.stringify(config, null, detectIndent(text))}\n`)
+  return "installed"
+}
+
+/**
+ * Removes only Mida's server entry — the client's identity and its approvals stay behind.
+ * mcpServers itself goes only when it is empty and was not in the pre-install backup.
+ */
+export function uninstallMcpClient(client: McpClientTool, configPath: string): UninstallOutcome {
+  const name = MCP_SERVER_NAME[client]
+  const read = readMcpConfig(configPath)
+  if (read === "absent") return "not-installed"
+  const { text, config } = read
+  const servers = config.mcpServers as Record<string, unknown>
+  if (!(name in servers)) return "not-installed"
+  delete servers[name]
+  if (Object.keys(servers).length === 0 && !existedBeforeInstall(configPath, ["mcpServers"])) {
+    delete config.mcpServers
+  }
+  writeFileAtomic(configPath, `${JSON.stringify(config, null, detectIndent(text))}\n`)
+  return "uninstalled"
+}
 
 /** Characters safe to leave unquoted in a command line — anything else is double-quoted. */
 const BARE_TOKEN = /^[A-Za-z0-9_@%+=:,./-]+$/
