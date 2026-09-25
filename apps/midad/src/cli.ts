@@ -14,11 +14,12 @@ import { callDaemon, ensureCurrentDaemon } from "./control.js"
 import { batchStatusProbe, decideLane, laneWhyText } from "./batching.js"
 import { debugLine, refusalCode } from "./debug-line.js"
 import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
-import { identityUnreadableText, noIdentityText } from "./handoff.js"
+import { identityUnreadableText, noIdentityText, projectCheckRefusal } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, installClaudeCode, installCodex, uninstallClaudeCode, uninstallCodex } from "./install.js"
 import type { InstallTool } from "./install.js"
+import { checkProject } from "./projects.js"
 import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE, ServiceRuntime } from "./runtime.js"
@@ -244,10 +245,19 @@ export async function runCliWithRuntime(
         }
         const only = argv[3]
         if (only === "projects.current") {
-          const projectId = context?.cwd === undefined ? null : projectIdFor(context.cwd)
-          if (projectId === null) {
+          const cwd = context?.cwd
+          const projectId = cwd === undefined ? null : projectIdFor(cwd)
+          if (cwd === undefined || projectId === null) {
             print(`projects.current: this folder is not a Mida project — run \`mida request ${agent} && mida approve ${agent}\` here to make it one`)
           } else {
+            // a marker names the project but grants nothing: the owner-signed list must approve
+            // THIS folder for THIS agent — the same gate the handoff runs, answered with the
+            // handoff's own refusal text (F7)
+            const check = await checkProject(runtime, { agent, cwd })
+            if (!check.ok) {
+              print(projectCheckRefusal(runtime, agent, check).text)
+              return 1
+            }
             const result = await readCheckpoints(runtime, agent, projectId)
             print(`${NAMESPACE}: read ${result.checkpoints.length} object(s)`)
             if (result.partial) print("list incomplete — run again")

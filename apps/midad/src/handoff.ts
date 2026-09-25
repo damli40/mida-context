@@ -116,6 +116,32 @@ export function noContextText(code: string): string {
 const refused = (reason: string, text: string): HandoffResult => ({ kind: "refused", reason, text })
 
 /**
+ * The refusal a failed project check carries — one mapping shared by checkAccess and the CLI's
+ * `read --as <agent> projects.current` (F7): same gate, same answer. A revoked agent's project
+ * row is gone, so `not-approved` consults the marker `mida revoke` left behind to say why access
+ * really ended (R4-3); a marker that cannot be read leaves the not-approved answer standing.
+ */
+export function projectCheckRefusal(
+  runtime: ServiceRuntime,
+  agent: string,
+  check: Exclude<ProjectCheck, { ok: true }>,
+  isRevokedDep?: (name: string) => boolean,
+): { reason: string; text: string } {
+  if (check.reason === "list-tampered") return { reason: "list-tampered", text: TAMPERED_TEXT }
+  if (check.reason === "list-unreadable") return { reason: "list-unreadable", text: UNREADABLE_TEXT }
+  // a failed check names no cause the owner could act on — the generic line, not a guess
+  if (check.reason === "check-failed") return { reason: "check-failed", text: noContextText("check-failed") }
+  if (check.reason === "not-approved") {
+    try {
+      if ((isRevokedDep ?? ((name) => isRevoked(runtime.home, name)))(agent)) {
+        return { reason: "revoked", text: revokedText(agent) }
+      }
+    } catch { /* fall through to not-approved */ }
+  }
+  return { reason: check.reason, text: notApprovedText(agent) }
+}
+
+/**
  * Asks the chain — never a local flag — whether the agent currently holds a live capability.
  * Two chain signals both mean "revoked": a capability record marked revoked, or a granted
  * capability whose captured agent epoch the owner has moved past (the agent-level revoke
@@ -191,23 +217,7 @@ export async function checkAccess(
       : { ok: false, reason: "identity-unreadable", text: identityUnreadableText(agent, runtime.home.root) }
   }
   const check = await (deps.checkProject ?? checkProject)(runtime, { agent, cwd: input.cwd })
-  if (!check.ok) {
-    if (check.reason === "list-tampered") return { ok: false, reason: "list-tampered", text: TAMPERED_TEXT }
-    if (check.reason === "list-unreadable") return { ok: false, reason: "list-unreadable", text: UNREADABLE_TEXT }
-    // a failed check names no cause the owner could act on — the generic line, not a guess
-    if (check.reason === "check-failed") return { ok: false, reason: "check-failed", text: noContextText("check-failed") }
-    // A revoked agent's project row is gone, so the project check answers not-approved first —
-    // the marker `mida revoke` left behind says why access really ended (R4-3). A marker that
-    // cannot be read leaves the not-approved answer standing, never a crash.
-    if (check.reason === "not-approved") {
-      try {
-        if ((deps.isRevoked ?? ((name) => isRevoked(runtime.home, name)))(agent)) {
-          return { ok: false, reason: "revoked", text: revokedText(agent) }
-        }
-      } catch { /* fall through to not-approved */ }
-    }
-    return { ok: false, reason: check.reason, text: notApprovedText(agent) }
-  }
+  if (!check.ok) return { ok: false, ...projectCheckRefusal(runtime, agent, check, deps.isRevoked) }
   const state = await (deps.capability ?? capabilityState)(runtime, agent)
   if (state === "revoked") return { ok: false, reason: "revoked", text: revokedText(agent) }
   if (state !== "live") return { ok: false, reason: "not-approved", text: notApprovedText(agent) }

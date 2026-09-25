@@ -3,9 +3,10 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileS
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { BaseError } from "viem"
+import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, loadAgentIdentity, ownerCommandNotice, runCli, runCliWithRuntime } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, loadAgentIdentity, loadOrCreateOwnerSecrets, ownerCommandNotice, runCli, runCliWithRuntime } from "@mida/midad"
 import type { Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 
 describe("the crude mida command", () => {
@@ -478,5 +479,71 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     const code = await runCliWithRuntime(["read", "codex", "p1"], stub, (line) => lines.push(line))
     expect(code).toBe(1)
     expect(lines).toEqual([`Mida: no agent "codex" is set up in this Mida home (${stub.home.root}). Nothing was shared.`])
+  })
+
+  /** A loadable identity file — the fields loadAgentIdentity checks, nothing more. */
+  const writeIdentity = (home: MidaHome, name: string) => {
+    const key = `0x${"ab".repeat(32)}`
+    mkdirSync(join(home.root, "agents", name), { recursive: true })
+    writeFileSync(
+      join(home.root, "agents", name, "identity.json"),
+      JSON.stringify({
+        name,
+        agentId: key,
+        signerPrivateKey: key,
+        encryptionPrivateKey: key,
+        encryptionPublicKey: key,
+        manifestHash: key,
+        callbackOrigin: "http://localhost",
+        purposeId: "project_assistance",
+        manifest: {},
+      }),
+    )
+  }
+  /** A folder carrying a project marker with the given id. */
+  const markedFolder = (projectId: string) => {
+    const dir = mkdtempSync(join(tmpdir(), "mida-f7-proj-"))
+    mkdirSync(join(dir, ".mida"))
+    writeFileSync(join(dir, ".mida", "project.json"), JSON.stringify({ projectId }))
+    return dir
+  }
+
+  it("read --as projects.current refuses when this folder is not approved for the agent (F7)", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-f7-")))
+    writeIdentity(home, "reader")
+    // the stub carries no store or reader: if the refusal were skipped, readCheckpoints would
+    // throw and the catch would print "refused: …" — the assertion would fail loudly
+    const stub = { home, owner: "0x0000000000000000000000000000000000000001" } as unknown as ServiceRuntime
+    const lines: string[] = []
+    const code = await runCliWithRuntime(
+      ["read", "--as", "reader", "projects.current"],
+      stub,
+      (line) => lines.push(line),
+      { cwd: markedFolder("p1") },
+    )
+    expect(code).toBe(1)
+    expect(lines).toEqual(["Mida: reader is not approved for this project — run `mida approve reader` in this folder."])
+  })
+
+  it("an approval for a different folder does not open this folder's checkpoint list (F7)", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-f7-")))
+    writeIdentity(home, "reader")
+    const owner = privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey).address
+    const stub = { home, owner } as unknown as ServiceRuntime
+    // approve the agent on one folder…
+    const approved = mkdtempSync(join(tmpdir(), "mida-f7-approved-"))
+    await approveProject(stub as unknown as Runtime, { agent: "reader", cwd: approved })
+    const marker = JSON.parse(readFileSync(join(approved, ".mida", "project.json"), "utf8")) as { projectId: string }
+    // …then read from a different folder that carries the same project id — folder-mismatch
+    const other = markedFolder(marker.projectId)
+    const lines: string[] = []
+    const code = await runCliWithRuntime(
+      ["read", "--as", "reader", "projects.current"],
+      stub,
+      (line) => lines.push(line),
+      { cwd: other },
+    )
+    expect(code).toBe(1)
+    expect(lines).toEqual(["Mida: reader is not approved for this project — run `mida approve reader` in this folder."])
   })
 })
