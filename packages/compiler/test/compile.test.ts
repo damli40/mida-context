@@ -131,6 +131,14 @@ describe("compileCheckpoint", () => {
     expect(r.ok && r.checkpoint.originalRequest).toBe("Build a rate limiter in 3 steps")
   })
 
+  it("an agent with no transcript reader is refused, never parsed through another format (F9)", async () => {
+    // "gemini" has no reader — before this fix the code fell back to the Claude reader,
+    // so a transcript in an unknown format was silently read as Claude Code's
+    await expect(compileCheckpoint({ ...base, agent: "gemini", model: fake("good") })).rejects.toThrow(
+      /no transcript reader/,
+    )
+  })
+
   it("stores the user's request by code and drops the model's own originalRequest", async () => {
     const r = await compileCheckpoint({ ...base, model: fake("extra") })
     expect(r.ok).toBe(true)

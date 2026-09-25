@@ -89,7 +89,7 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
       : "Mida: connected — nothing saved for this project yet"
   }
   if (body.kind === "refused" && body.reason === "revoked") {
-    return systemMessage(`Mida: ${agent} has no access to this project (revoked by the owner)`)
+    return systemMessage(`Mida: ${agent} has no access to this project (revoked by the owner). Revoking stops future reads; it cannot recall what this agent already read.`)
   }
   if (body.kind === "refused" && body.reason === "not-approved") {
     return systemMessage(`Mida: ${agent} has no access to this project (not approved yet — run: mida request ${agent})`)

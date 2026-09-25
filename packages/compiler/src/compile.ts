@@ -11,7 +11,7 @@ import { CONTENT_FIELDS, LIMITS, validateCheckpoint, type Checkpoint } from "@mi
 import { extractJsonObject } from "./extract-json.js"
 import { buildExtractPrompt } from "./prompt.js"
 import { scrubSecrets, scrubValue } from "./scrub.js"
-import { readConversation, type Conversation } from "./transcript-claude.js"
+import type { Conversation } from "./transcript-claude.js"
 import { readTranscriptFor } from "./transcript-codex.js"
 
 export interface ModelCommand {
@@ -342,9 +342,16 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
   const now = input.now ?? (() => new Date())
   const sleep = input.sleep ?? defaultSleep
 
-  // The reader matches the agent that wrote the transcript — the drain already refused
-  // agents with no reader; a direct caller naming one keeps the old reader unchanged.
-  const convo = readTranscriptFor(input.agent, input.transcriptPath) ?? readConversation(input.transcriptPath)
+  // The reader matches the agent that wrote the transcript. The drain refuses agents with
+  // no reader before this is ever called; a direct caller naming one is refused here too —
+  // never quietly parsed through another agent's format. The code is the drain's own
+  // permanent "unknown-transcript-format" reason, so a thrown refusal maps to it.
+  const convo = readTranscriptFor(input.agent, input.transcriptPath)
+  if (convo === null) {
+    const error = new Error(`no transcript reader for agent "${input.agent}"`) as Error & { code: string }
+    error.code = "unknown-transcript-format"
+    throw error
+  }
   const prompt = buildExtractPrompt(convo.text, input.previous)
 
   // Stored paths must not leak the local folder layout: a path under the

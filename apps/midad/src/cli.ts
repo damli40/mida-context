@@ -47,7 +47,7 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
  * (`keys.ts` NAME), not the three names `mida init` provisions by default. A name that cannot
  * be an identity is still usage, never read under.
  */
-const READ_AS_NAME = /^[a-z0-9-]+$/
+const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
 export const USAGE =
   "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | batching on|off | migrate [--undo]" +
   "   (tool = claude-code | codex; agent = claude-code | codex | assistant — assistant is a stand-in for any other assistant you use)"

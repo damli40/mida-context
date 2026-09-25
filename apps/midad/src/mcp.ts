@@ -118,7 +118,8 @@ export function startupCheck(home: MidaHome, args: McpArgs): { ok: true } | { ok
     return { ok: false, error: `no agent "${args.agent}" is set up in the Mida home ${home.root} — check MIDA_HOME in this client's config` }
   }
   if (probe(args.project) === "blocked") return { ok: false, error: blockedLine(args.project) }
-  if (findProjectMarker(args.project) === null) {
+  const marker = findProjectMarker(args.project)
+  if (marker === null || marker.projectId === null) {
     return { ok: false, error: `${args.project} is not a Mida project folder — start the server with --project <your project folder>` }
   }
   return { ok: true }

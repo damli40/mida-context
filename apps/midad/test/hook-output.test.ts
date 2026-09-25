@@ -121,9 +121,11 @@ describe("sessionStartMessage", () => {
     expect(line).not.toContain("nothing saved")
   })
 
-  it("refused revoked names the agent and the owner", () => {
+  it("refused revoked names the agent, the owner, and what revocation cannot undo (F9)", () => {
+    // the disclosure sentence: a model this agent already read keeps what it saw — the line
+    // must not imply revocation reaches into the past
     expect(sessionStartMessage({ kind: "refused", reason: "revoked", text: "x" }, "codex", NOW)).toBe(
-      "Mida: codex has no access to this project (revoked by the owner)",
+      "Mida: codex has no access to this project (revoked by the owner). Revoking stops future reads; it cannot recall what this agent already read.",
     )
   })
 

@@ -10,8 +10,33 @@ for candidate in /opt/homebrew/bin/node /usr/local/bin/node "$HOME/.volta/bin/no
   [ -n "$NODE" ] && break
   [ -x "$candidate" ] && NODE=$candidate
 done
+if [ -z "$NODE" ] && [ -d "$HOME/.nvm/versions/node" ]; then
+  # nvm keeps one folder per installed version ("v22.1.0", …) — the newest by version order
+  # wins, not ls's name order (v9 > v10 alphabetically)
+  NVM_VER=$(ls "$HOME/.nvm/versions/node" 2>/dev/null | grep '^v[0-9]' | sort -t. -k1.2n -k2n -k3n | tail -1)
+  if [ -n "$NVM_VER" ] && [ -x "$HOME/.nvm/versions/node/$NVM_VER/bin/node" ]; then
+    NODE="$HOME/.nvm/versions/node/$NVM_VER/bin/node"
+  fi
+fi
 if [ -z "$NODE" ]; then
   echo "mida-mcp: node was not found on PATH or in the usual places — put the absolute path to node in your client's MCP config as the command" >&2
+  exit 127
+fi
+# --import needs node 20.6+ (or 18.19+): a client holding an older node gets one line instead
+# of node's own "bad option: --import" buried in a protocol channel
+NODE_VER=$("$NODE" --version 2>/dev/null)
+NODE_VER=${NODE_VER#v}
+NODE_MAJOR=${NODE_VER%%.*}
+NODE_REST=${NODE_VER#*.}
+NODE_MINOR=${NODE_REST%%.*}
+case "$NODE_MAJOR" in ""|*[!0-9]*) NODE_MAJOR=0 ;; esac
+case "$NODE_MINOR" in ""|*[!0-9]*) NODE_MINOR=0 ;; esac
+NODE_OK=false
+if [ "$NODE_MAJOR" -gt 20 ]; then NODE_OK=true; fi
+if [ "$NODE_MAJOR" -eq 20 ] && [ "$NODE_MINOR" -ge 6 ]; then NODE_OK=true; fi
+if [ "$NODE_MAJOR" -eq 18 ] && [ "$NODE_MINOR" -ge 19 ]; then NODE_OK=true; fi
+if [ "$NODE_OK" = false ]; then
+  echo "mida-mcp: node v${NODE_VER} at ${NODE} is too old — mida-mcp needs node 20.6+ (or 18.19+) for --import" >&2
   exit 127
 fi
 exec "$NODE" --import "$ROOT/node_modules/tsx/dist/loader.mjs" "$ROOT/apps/midad/src/mcp-main.ts" "$@"

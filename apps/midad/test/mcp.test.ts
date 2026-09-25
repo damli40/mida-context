@@ -8,7 +8,7 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
-import { AGENT_NAME, MidaHome, MCP_TOOLS, READ_NAMESPACES, createMidaMcpServer, parseMcpArgs, readSeen, socketPathFor, startupCheck } from "@mida/midad"
+import { AGENT_NAME, MidaHome, MCP_TOOLS, READ_NAMESPACES, createMidaMcpServer, loadAgentIdentity, parseMcpArgs, readSeen, socketPathFor, startupCheck } from "@mida/midad"
 import type { McpServerDeps } from "@mida/midad"
 
 const BIN_MIDA_MCP = fileURLToPath(new URL("../../../bin/mida-mcp", import.meta.url))
@@ -157,6 +157,16 @@ describe("mida-mcp args", () => {
     for (const name of ["A", "a_b", "a.b", ""]) expect(AGENT_NAME.test(name)).toBe(false)
   })
 
+  it("the three agent-name gates agree: 64 chars pass, 65 refuse (F9)", () => {
+    // the MCP flag rule (mcp.ts AGENT_NAME)
+    expect(AGENT_NAME.test("a".repeat(64))).toBe(true)
+    expect(AGENT_NAME.test("a".repeat(65))).toBe(false)
+    // the key store's rule (keys.ts NAME) — exercised through loadAgentIdentity
+    expect(() => loadAgentIdentity(home(), "a".repeat(65))).toThrow("bad agent name")
+    expect(loadAgentIdentity(home(), "a".repeat(64))).toBeUndefined() // a valid name that is simply absent
+    // the read --as rule (cli.ts READ_AS_NAME) is covered in cli.test.ts's read suite
+  })
+
   it("refuses an unknown flag, a missing value and a positional", () => {
     // a well-formed but unregistered name ("bogus") now parses — the startup check refuses it
     for (const argv of [["--verbose"], ["-x"], ["--as"], ["--project"], ["positional"], ["--as", "codex", "--extra", "y"]]) {
@@ -248,6 +258,18 @@ describe("mida-mcp startup gate", () => {
     const home = makeHome()
     register(home, "assistant")
     const dir = mkdtempSync(join(tmpdir(), "mida-noproj-"))
+    const r = startupCheck(home, { agent: "assistant", project: dir, projectGiven: true })
+    expect(r).toEqual({ ok: false, error: `${dir} is not a Mida project folder — start the server with --project <your project folder>` })
+  })
+
+  it("a marker file that carries no projectId is refused like a missing marker (F9)", () => {
+    // .mida/project.json exists but holds no project id — findProjectMarker returns
+    // { projectId: null } for it, and a null id must not slip past the gate
+    const home = makeHome()
+    register(home, "assistant")
+    const dir = mkdtempSync(join(tmpdir(), "mida-nullid-"))
+    mkdirSync(join(dir, ".mida"))
+    writeFileSync(join(dir, ".mida", "project.json"), "{}")
     const r = startupCheck(home, { agent: "assistant", project: dir, projectGiven: true })
     expect(r).toEqual({ ok: false, error: `${dir} is not a Mida project folder — start the server with --project <your project folder>` })
   })
@@ -369,6 +391,61 @@ describe("mida-mcp startup gate", () => {
     expect(res.status).toBe(2)
     expect(res.stdout).toBe("")
     expect(res.stderr).toBe(`mida-mcp: no agent "nobody" is set up in the Mida home ${dir.root} — check MIDA_HOME in this client's config\n`)
+  }, 30_000)
+
+  /** A fake `node` that answers --version with `ver` and reports which version ran on stderr. */
+  const fakeNode = (binDir: string, ver: string) => {
+    mkdirSync(binDir, { recursive: true })
+    writeFileSync(
+      join(binDir, "node"),
+      `#!/bin/sh\nif [ "$1" = "--version" ]; then echo "v${ver}"; exit 0; fi\necho "fake-node v${ver} ran" >&2\nexit 0\n`,
+      { mode: 0o755 },
+    )
+  }
+
+  it("a node too old for --import is refused with one line, not a cryptic tsx error (F9)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mida-oldnode-"))
+    fakeNode(dir, "10.0.0")
+    const res = await new Promise<{ status: number | null; stdout: string; stderr: string }>((done, reject) => {
+      const child = spawn(BIN_MIDA_MCP, ["--as", "nobody"], {
+        env: { HOME: mkdtempSync(join(tmpdir(), "mida-home-")), PATH: `${dir}:/usr/bin:/bin`, MIDA_HOME: makeHome().root },
+        cwd: "/tmp",
+      })
+      let stdout = ""
+      let stderr = ""
+      child.stdout.on("data", (d: Buffer) => (stdout += d.toString("utf8")))
+      child.stderr.on("data", (d: Buffer) => (stderr += d.toString("utf8")))
+      child.on("error", reject)
+      child.on("exit", (code) => done({ status: code, stdout, stderr }))
+    })
+    expect(res.status).toBe(127)
+    expect(res.stdout).toBe("")
+    expect(res.stderr).toContain("too old")
+    expect(res.stderr).toContain("v10.0.0")
+  }, 30_000)
+
+  // the nvm fallback only runs when PATH and the hardcoded candidates all miss — on a machine
+  // where /opt/homebrew/bin/node (or the others) exists this test cannot observe the nvm path
+  it.skipIf(
+    ["/opt/homebrew/bin/node", "/usr/local/bin/node", join(process.env.HOME ?? "/nonexistent", ".volta/bin/node")].some((c) => existsSync(c)),
+  )("the launcher picks the newest nvm node when PATH and the usual spots have none (F9)", async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "mida-nvm-"))
+    fakeNode(join(homeDir, ".nvm", "versions", "node", "v18.19.0", "bin"), "18.19.0")
+    fakeNode(join(homeDir, ".nvm", "versions", "node", "v22.1.0", "bin"), "22.1.0")
+    const res = await new Promise<{ status: number | null; stdout: string; stderr: string }>((done, reject) => {
+      const child = spawn(BIN_MIDA_MCP, ["--as", "nobody"], {
+        env: { HOME: homeDir, PATH: "/usr/bin:/bin", MIDA_HOME: makeHome().root },
+        cwd: "/tmp",
+      })
+      let stdout = ""
+      let stderr = ""
+      child.stdout.on("data", (d: Buffer) => (stdout += d.toString("utf8")))
+      child.stderr.on("data", (d: Buffer) => (stderr += d.toString("utf8")))
+      child.on("error", reject)
+      child.on("exit", (code) => done({ status: code, stdout, stderr }))
+    })
+    expect(res.status).toBe(0)
+    expect(res.stderr).toBe("fake-node v22.1.0 ran\n")
   }, 30_000)
 })
 

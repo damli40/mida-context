@@ -34,7 +34,7 @@ import type { AccessRequestStore, StoredAccessRequest } from "./request-store.js
 export const HOSTED_STORAGE_URL = "https://store.midacontext.xyz"
 export const HOSTED_SPONSOR_URL = "https://sponsor.midacontext.xyz"
 
-const AGENT_NAME = /^[a-z0-9-]+$/
+const AGENT_NAME = /^[a-z0-9-]{1,64}$/
 const HEX_KEY = /^0x[0-9a-fA-F]{64}$/
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/
 

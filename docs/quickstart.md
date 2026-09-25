@@ -309,12 +309,18 @@ args = ["--as", "assistant", "--project", "<absolute path to your project folder
 MIDA_HOME = "<your Mida home, if not ~/.mida>"
 ```
 
-**Any MCP harness — NOT RUN.** Every stdio config is the same block in a different file: `command` is the absolute path to `node`, `args` is the absolute path to the `mida-mcp` entry followed by `--as assistant --project <absolute project folder>`, and `env.MIDA_HOME` carries the home when it is not `~/.mida`:
+**Any MCP harness — NOT RUN.** Every stdio config is the same block in a different file. The simplest form points `command` at the launcher itself — `<repo>/bin/mida-mcp` finds node for you (PATH, then the usual install spots, then the newest `~/.nvm` version). For a harness that insists on `node` as the command, the entry is TypeScript in a source checkout, so the tsx loader must be named before it:
 
 ```json
 {
   "command": "<absolute path to node>",
-  "args": ["<absolute path to the mida-mcp entry>", "--as", "assistant", "--project", "<absolute project folder>"],
+  "args": [
+    "--import",
+    "<repo>/node_modules/tsx/dist/loader.mjs",
+    "<repo>/apps/midad/src/mcp-main.ts",
+    "--as", "assistant",
+    "--project", "<absolute project folder>"
+  ],
   "env": { "MIDA_HOME": "<your Mida home, if not ~/.mida>" }
 }
 ```

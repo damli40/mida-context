@@ -472,6 +472,19 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     expect(lines).toEqual([USAGE])
   })
 
+  it("the read --as name rule matches the MCP and key-store cap: 65 chars is usage, 64 proceeds (F9)", async () => {
+    const stub = stubRuntime(new Error("unreached"))
+    const lines: string[] = []
+    const over = await runCliWithRuntime(["read", "--as", "a".repeat(65), "projects.current"], stub, (line) => lines.push(line))
+    expect(over).toBe(2)
+    expect(lines).toEqual([USAGE])
+    lines.length = 0
+    const at = await runCliWithRuntime(["read", "--as", "a".repeat(64), "projects.current"], stub, (line) => lines.push(line))
+    // 64 chars is a legal name that is simply unregistered — the identity gate answers, not usage
+    expect(at).toBe(1)
+    expect(lines).toEqual([`Mida: no agent "${"a".repeat(64)}" is set up in this Mida home (${stub.home.root}). Nothing was shared.`])
+  })
+
   it("a read whose agent's identity is gone prints the same no-identity line", async () => {
     const notSetup = Object.assign(new Error("gone"), { code: "agent-not-setup" })
     const stub = stubRuntime(notSetup)

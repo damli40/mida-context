@@ -22,7 +22,7 @@ export interface AgentIdentity {
 }
 
 const KEY = /^0x[0-9a-f]{64}$/
-const NAME = /^[a-z0-9-]+$/
+const NAME = /^[a-z0-9-]{1,64}$/
 const DECIMAL = /^(0|[1-9][0-9]*)$/
 
 function assertKeys(file: string, record: Record<string, unknown> | undefined, fields: string[]): void {

@@ -223,7 +223,7 @@ describe("inject-main process", () => {
     try {
       const res = await run(["codex"], sessionStart(), revoked.dir.root)
       const out = envelope(res.stdout)
-      expect(out.systemMessage).toBe("Mida: codex has no access to this project (revoked by the owner)")
+      expect(out.systemMessage).toBe("Mida: codex has no access to this project (revoked by the owner). Revoking stops future reads; it cannot recall what this agent already read.")
       expect(out.hookSpecificOutput.additionalContext).toBe("REFUSED-TEXT")
     } finally {
       await close(revoked.server)
