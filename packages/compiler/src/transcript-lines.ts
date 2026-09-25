@@ -91,16 +91,23 @@ export function readTranscriptLines(path: string): TranscriptLines {
  * fits. When the middle was never read the true omitted count is unknowable —
  * only the lines that were read but did not fit are counted, and the marker
  * says so.
+ *
+ * `pinIdx` names the block the reader took firstUserMessage from. The pin must
+ * follow THAT line — a transcript can hold an earlier user-role block that
+ * carries no request (Claude Code scaffolding, a bare tool_result), and
+ * pinning it would headline the file with text that is not the request.
+ * Absent or out of range, the first user block is pinned as before.
  */
 export function fitMessages(
   msgs: { role: string; block: string }[],
   maxChars: number,
   truncated: boolean,
+  pinIdx?: number,
 ): { text: string; messagesKept: number; omitted: number } {
-  const pinIdx = msgs.findIndex((m) => m.role === "user")
+  const pin = pinIdx !== undefined && pinIdx >= 0 && pinIdx < msgs.length ? pinIdx : msgs.findIndex((m) => m.role === "user")
   const headCap = Math.min(FIRST_USER_CHARS, Math.max(0, maxChars - 200))
-  const head = pinIdx >= 0 ? cut(msgs[pinIdx]!.block, headCap) : null
-  const rest = msgs.filter((_, i) => i !== pinIdx)
+  const head = pin >= 0 ? cut(msgs[pin]!.block, headCap) : null
+  const rest = msgs.filter((_, i) => i !== pin)
 
   const budget = Math.max(0, maxChars - (head ? head.length + 2 : 0) - MARKER_RESERVE)
   const keptTail: { role: string; block: string }[] = []

@@ -26,10 +26,13 @@
 // scrubTranscript call for this format).
 //
 // The result also carries firstUserMessage: the first `user` line whose
-// content is a plain string or has a `text` part (a bare `tool_result` does
-// not count — resumed sessions open with tool output, not the request). It
-// is scrubbed and hard-capped at 6,000 chars *including* the ellipsis, so it
-// always fits the schema's originalRequest cap. unknown-tail → null.
+// content is a plain string or has a `text` part AND is not Claude Code
+// scaffolding — a bare `tool_result` does not count (resumed sessions open
+// with tool output, not the request), and neither do isMeta/isCompactSummary
+// lines or the injected <local-command-caveat>/<command-name>/… tags a
+// /compact puts ahead of the human's words. It is scrubbed and hard-capped at
+// 6,000 chars *including* the ellipsis, so it always fits the schema's
+// originalRequest cap. unknown-tail → null.
 //
 // Reads are bounded: the file is opened once and never loaded whole (see
 // transcript-lines.ts). A transcript no bigger than HEAD_BYTES + TAIL_BYTES
@@ -71,6 +74,10 @@ export interface Conversation {
 interface TranscriptLine {
   type?: string
   cwd?: unknown
+  /** Claude Code's own bookkeeping flag — caveat and command-echo lines carry it. */
+  isMeta?: unknown
+  /** Set on the condensed-history line Claude Code writes into the transcript at compact time. */
+  isCompactSummary?: unknown
   message?: { content?: unknown }
 }
 
@@ -86,6 +93,33 @@ interface ContentPart {
 }
 
 const isPart = (p: unknown): p is ContentPart => p !== null && typeof p === "object"
+
+// Claude Code injects its own user-role lines around the human's words — the
+// /compact caveat, slash-command echoes, hook and reminder blocks. A line that
+// opens with one of these tags is the tool's scaffolding, never the request.
+const CLAUDE_SCAFFOLD_PREFIXES = [
+  "<local-command-caveat>",
+  "<command-name>",
+  "<command-message>",
+  "<command-args>",
+  "<local-command-stdout>",
+  "<local-command-stderr>",
+  "<bash-input>",
+  "<bash-stdout>",
+  "<bash-stderr>",
+  "<system-reminder>",
+  "<user-prompt-submit-hook>",
+]
+
+// A user line is scaffolding when the transcript itself flags it — isMeta marks
+// Claude Code bookkeeping, isCompactSummary the compacted-history note — or when
+// its text opens with one of the injected tags. Scaffolding still renders as an
+// ordinary block; it only may never become firstUserMessage.
+function isScaffolding(obj: TranscriptLine, text: string): boolean {
+  if (obj.isMeta === true || obj.isCompactSummary === true) return true
+  const t = text.trimStart()
+  return CLAUDE_SCAFFOLD_PREFIXES.some((pre) => t.startsWith(pre))
+}
 
 // The request text of one user line: the string content, or the joined
 // `text` parts of array content. Returns "" for a bare tool_result (or
@@ -167,6 +201,9 @@ export function readConversation(
   const cwds: string[] = []
   let messagesTotal = 0
   let firstUserMessage: string | null = null
+  // the index in `msgs` of the block firstUserMessage came from — fitMessages
+  // pins exactly it, not whichever user block happens to render first
+  let pinIdx: number | undefined
   for (const { label, text: line } of lines) {
     if (!line.trim()) continue
     let obj: TranscriptLine
@@ -179,12 +216,19 @@ export function readConversation(
     if (typeof folder === "string" && folder !== "" && !cwds.includes(folder)) cwds.push(folder)
     if (obj?.type !== "user" && obj?.type !== "assistant") continue
     messagesTotal++
+    let picked = false
     if (firstUserMessage === null && obj.type === "user") {
       const t = userRequestText(obj.message?.content)
-      if (t) firstUserMessage = hardCut(scrubSecrets(t), FIRST_USER_CHARS)
+      if (t && !isScaffolding(obj, t)) {
+        firstUserMessage = hardCut(scrubSecrets(t), FIRST_USER_CHARS)
+        picked = true
+      }
     }
     const block = renderMessage(label, obj)
-    if (block) msgs.push({ role: obj.type, block })
+    if (block) {
+      msgs.push({ role: obj.type, block })
+      if (picked) pinIdx = msgs.length - 1
+    }
   }
 
   if (messagesTotal === 0) {
@@ -200,7 +244,7 @@ export function readConversation(
     }
   }
 
-  const fitted = fitMessages(msgs, maxChars, truncated)
+  const fitted = fitMessages(msgs, maxChars, truncated, pinIdx)
   return {
     format: "claude-jsonl",
     text: fitted.text,
