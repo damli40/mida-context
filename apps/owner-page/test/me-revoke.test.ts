@@ -986,3 +986,49 @@ describe("H3 — a failed read for one reader is recorded, the rest still re-key
     expect(shouldOfferRepair(make({}))).toBe(false)
   })
 })
+
+// --- H4: repair's reader set is filtered, not chain-trusted -----------------------------------
+
+describe("H4 — repair never re-keys the revoked agent or a store-blocked one", () => {
+  function grantRow(over: Partial<AgentRow["grants"][number]> = {}): AgentRow["grants"][number] {
+    return {
+      namespaceId: NS_ID,
+      area: "preferences.communication",
+      permissions: PERMISSION.READ,
+      capabilityId: CAP_ID,
+      status: { label: "Can read", flagged: false },
+      approvedTx: null,
+      ...over,
+    }
+  }
+
+  it("the revoked agent and a store-blocked row get no wrap even while the chain still says READ", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const reads: ChainReads = { active: [], authority: [] }
+    // The window where the chain's answer cannot be trusted: the revoke has landed (epoch
+    // moved to 2) but this read replica still reports the revoked agent holding READ — and a
+    // store-blocked row looks equally readable. Neither must be offered a wrap.
+    const chain = revokeChain(sends, reads, [AGENT_ID, SURVIVOR_A, STALE])
+    sends.push({ functionName: "revokeAgentAndRotate", kind: "revoke.agent" })
+    const { env } = makeEnv({ sends, apiCalls, wraps, chain })
+    const agents = [
+      agentRow({ agentId: AGENT_ID, grants: [grantRow()] }),
+      agentRow({ agentId: SURVIVOR_A, grants: [grantRow()] }),
+      agentRow({ agentId: STALE, grants: [grantRow()], blockedAtStore: true }),
+    ]
+    const outcome = await repairReaderWrapsFromMe(env, {
+      signedInOwner: OWNER,
+      agents,
+      epochsAtRevoke: [{ namespaceId: NS_ID, epoch: 1n }],
+      excludeAgentIds: [AGENT_ID],
+    })
+    expect(outcome.rewrapped).toEqual([SURVIVOR_A])
+    expect(wraps.some((w) => w.agentId === AGENT_ID)).toBe(false)
+    expect(wraps.some((w) => w.agentId === STALE)).toBe(false)
+    expect(wraps.some((w) => w.agentId === SURVIVOR_A && w.readEpoch === "2")).toBe(true)
+    // the excluded ids were never even asked about — exclusion is by list, not by chain verdict
+    expect(reads.authority.map((a) => a[1])).toEqual([SURVIVOR_A, SURVIVOR_A])
+  })
+})

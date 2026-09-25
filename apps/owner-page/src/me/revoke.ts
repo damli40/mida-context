@@ -140,8 +140,11 @@ export function shouldOfferRepair(result: MeRevokeResult): boolean {
 
 /**
  * The repair action: for every agent the page knows and every area any grant touches, the chain
- * decides who still holds READ and the current epoch's wrap is published to each of them. The
- * revoked agent's checks simply fail — it needs no exclusion.
+ * decides who still holds READ and the current epoch's wrap is published to each of them — with
+ * two exclusions the chain cannot be trusted to make. The agent whose revoke prompted this
+ * repair is never a reader again (during the pending window the chain may still report it
+ * holding READ), and a row blocked at the store has a deny staged that a wrap would not undo.
+ * Both are excluded by list, before any chain answer is read.
  */
 export async function repairReaderWrapsFromMe(
   env: FlowEnvironment,
@@ -149,6 +152,8 @@ export async function repairReaderWrapsFromMe(
     signedInOwner: Address
     agents: readonly AgentRow[]
     agentsUnavailable?: boolean
+    /** Agents never offered a wrap no matter what the chain answers — first the revoked one. */
+    excludeAgentIds?: readonly Hex[]
     /**
      * The watermark revokeFromMe recorded. Until the chain reports a higher requiredReadEpoch
      * for every one of these areas the revoke has not landed, and a repair would republish the
@@ -166,12 +171,16 @@ export async function repairReaderWrapsFromMe(
     const current = await requiredReadEpoch(env, input.signedInOwner, namespaceId)
     if (current <= epoch) throw new Error(WAITING_ON_REVOKE)
   }
+  const excluded = new Set<string>()
+  for (const id of input.excludeAgentIds ?? []) excluded.add(id.toLowerCase())
+  for (const agent of input.agents) if (agent.blockedAtStore) excluded.add(agent.agentId.toLowerCase())
+  const readers = input.agents.filter((agent) => !excluded.has(agent.agentId.toLowerCase()))
   const namespaceIds = [
     ...new Set(input.agents.flatMap((agent) => agent.grants.map((grant) => grant.namespaceId.toLowerCase() as Hex))),
   ]
   return repairReaderWraps(env, {
     owner: input.signedInOwner,
-    agents: input.agents.map((agent) => agent.agentId),
+    agents: readers.map((agent) => agent.agentId),
     namespaceIds,
   })
 }

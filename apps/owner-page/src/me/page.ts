@@ -851,6 +851,9 @@ function boot(): void {
       // built against travel with it — until the chain passes them, the action waits.
       let repairOffered = false
       let repairEpochs: MeRevokeResult["epochsAtRevoke"] = []
+      // The agent whose revoke prompted the repair — never a repair target, whatever the chain
+      // reports for it while the transaction is pending.
+      let repairExcluded: Hex[] = []
       // Every render is a fresh read; after a revoke lands (or goes pending) the same refresh
       // runs again — the page re-reads, it does not assume.
       const refresh = async (): Promise<void> => {
@@ -876,6 +879,7 @@ function boot(): void {
             if (shouldOfferRepair(result)) {
               repairOffered = true
               repairEpochs = result.epochsAtRevoke
+              repairExcluded = [agent.agentId]
             }
             return result
           },
@@ -891,6 +895,7 @@ function boot(): void {
                     agents: fresh.agents,
                     agentsUnavailable: fresh.agentsUnavailable,
                     epochsAtRevoke: repairEpochs,
+                    excludeAgentIds: repairExcluded,
                   },
                 )
                 if (outcome.failed.length === 0) repairOffered = false
