@@ -58,4 +58,24 @@ describe("readCodexConversation", () => {
     expect(readTranscriptFor("codex", fx("codex-rollout-synthetic.jsonl"))?.format).toBe("codex-jsonl")
     expect(readTranscriptFor("gemini", fx("codex-rollout-synthetic.jsonl"))).toBeNull()
   })
+
+  // F1: a part is scrubbed whole BEFORE the 600-char cut — a secret that starts
+  // inside the cut and ends past it must never leave a prefix fragment behind.
+  it("a secret straddling the 600-char cut is scrubbed whole, not truncated first", () => {
+    const key = "ab".repeat(32)
+    // 539 filler chars + a space put the key's first hex char at index 540 — its
+    // last four sit past the 600-char cut the old order applied before scrubbing.
+    const output = `${"x".repeat(539)} ${key}`
+    const p = join(mkdtempSync(join(tmpdir(), "cx-")), "t.jsonl")
+    writeFileSync(
+      p,
+      JSON.stringify({
+        type: "response_item",
+        payload: { type: "function_call_output", output },
+      }) + "\n",
+    )
+    const c = readCodexConversation(p)
+    expect(c.text).not.toMatch(/[0-9a-f]{16,}/)
+    expect(c.text).toContain("[REDACTED]")
+  })
 })

@@ -12,8 +12,10 @@
 // Rendering matches the Claude reader: each kept record becomes one block
 // headed "L<n> <role>:" with the real line number ("~n" inside a tail
 // window), tool calls render as "tool:" and their outputs as "tool-result:",
-// parts are cut at PART_CHARS and every rendered line is scrubbed. Reasoning
-// records are dropped entirely — S2 saw them carry only encrypted_content.
+// and every part is scrubbed BEFORE it is cut at PART_CHARS — the other order
+// leaves a secret straddling the boundary as an unredactable fragment.
+// Reasoning records are dropped entirely — S2 saw them carry only
+// encrypted_content.
 // A file with no Codex conversation records answers the unknown-tail shape,
 // same as the Claude reader's fallback.
 
@@ -142,7 +144,9 @@ export function readCodexConversation(
       if (role === "user" && firstUserMessage === null && text)
         firstUserMessage = hardCut(scrubSecrets(text), FIRST_USER_CHARS)
       const body = parts
-        .map((t) => scrubSecrets(cut(t, PART_CHARS)))
+        // scrub before the cut: a secret straddling the boundary would otherwise
+        // no longer match the scrubber and most of it would reach the model
+        .map((t) => cut(scrubSecrets(t), PART_CHARS))
         .filter((t) => t.length)
         .join("\n")
       if (body) msgs.push({ role, block: `L${label} ${role}:\n${body}` })
@@ -153,13 +157,13 @@ export function readCodexConversation(
       messagesTotal++
       const detail = callDetail(p.type === "function_call" ? p.arguments : p.input)
       const name = typeof p.name === "string" ? p.name : "?"
-      msgs.push({ role: "tool", block: `L${label} tool:\n${scrubSecrets(cut(`${name} ${detail}`.trimEnd(), PART_CHARS))}` })
+      msgs.push({ role: "tool", block: `L${label} tool:\n${cut(scrubSecrets(`${name} ${detail}`.trimEnd()), PART_CHARS)}` })
       continue
     }
 
     if (p.type === "function_call_output" || p.type === "custom_tool_call_output") {
       messagesTotal++
-      msgs.push({ role: "tool-result", block: `L${label} tool-result:\n${scrubSecrets(cut(outputText(p.output), PART_CHARS))}` })
+      msgs.push({ role: "tool-result", block: `L${label} tool-result:\n${cut(scrubSecrets(outputText(p.output)), PART_CHARS)}` })
       continue
     }
     // reasoning (encrypted_content is never rendered), compacted and every
