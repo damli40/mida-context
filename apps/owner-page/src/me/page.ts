@@ -299,7 +299,7 @@ function renderAgents(doc: Document, data: MeData): HTMLElement {
   return sec
 }
 
-type OpenRow = (row: RecordRow) => { ok: true; text: string } | { ok: false }
+type OpenRow = (row: RecordRow) => { ok: true; text: string; provenanceSource: number | null } | { ok: false }
 
 function renderRecordRow(doc: Document, row: RecordRow, open: OpenRow | undefined): HTMLElement {
   const tr = elOf(doc, "tr")
@@ -322,6 +322,19 @@ function renderRecordRow(doc: Document, row: RecordRow, open: OpenRow | undefine
   const whoWrap = elOf(doc, "div", "who")
   const badge = provenanceBadge(row)
   whoWrap.appendChild(elOf(doc, "span", `badge ${BADGE_CLASS[badge.kind]}`, badge.text))
+  // The decrypted payload's own provenance label is checked against the row's verified source —
+  // for an anchored row that is the chain record's (or the proof-verified signed message's)
+  // provenance. A disagreement means the bytes inside do not match what Monad recorded.
+  if (
+    opened !== undefined &&
+    opened.ok &&
+    row.state === "anchored" &&
+    row.source !== null &&
+    opened.provenanceSource !== null &&
+    opened.provenanceSource !== row.source
+  ) {
+    whoWrap.appendChild(elOf(doc, "span", "badge b-bad", "the record's own label disagrees with Monad"))
+  }
   who.appendChild(whoWrap)
 
   tr.appendChild(elOf(doc, "td", undefined, formatWhen(row.createdAt)))

@@ -1,8 +1,8 @@
 import { bytesOf, deriveEpochKeyPair, deriveNamespaceSecret, manifestHash, openContextObject } from "@mida/crypto"
 import type { EpochKeyPair } from "@mida/crypto"
 import { fakePrfOutput } from "@mida/fake-vault/browser"
-import { MidaError, namespaceById } from "@mida/protocol"
-import type { Address, ContextPayload, Hex, ObjectManifest } from "@mida/protocol"
+import { MidaError, PROVENANCE_SOURCE, namespaceById } from "@mida/protocol"
+import type { Address, ContextPayload, Hex, ObjectManifest, ProvenanceSource } from "@mida/protocol"
 import type { LocalAccount } from "viem"
 import type { Deployment } from "@mida/chain/browser"
 import type { FlowEnvironment } from "../owner/flows.js"
@@ -43,13 +43,18 @@ export interface MeSession {
    * Decrypt one record row in the browser — pure local crypto, no network. The manifest's own
    * consistency checks run again here; the chain-commitment check already happened in sources.ts.
    */
+  /**
+   * provenanceSource is the payload's OWN claim, returned as the numeric PROVENANCE_SOURCE code
+   * so the page can cross-check it against the chain record — null when the payload's source is
+   * not a known key.
+   */
   open(row: {
     namespaceId: Hex
     readEpoch: bigint
     contextId: Hex
     manifest: unknown
     ciphertext: Hex
-  }): { ok: true; text: string } | { ok: false }
+  }): { ok: true; text: string; provenanceSource: number | null } | { ok: false }
   /** Overwrite every kept key byte and close the session. Idempotent. */
   end(): void
 }
@@ -142,7 +147,7 @@ function makeSession(deployment: Deployment, owner: Address, signer: LocalAccoun
             readEpoch: row.readEpoch,
           },
         })
-        return { ok: true, text: payloadText(payload) }
+        return { ok: true, text: payloadText(payload), provenanceSource: payloadSource(payload) }
       } catch {
         return { ok: false }
       }
@@ -170,6 +175,13 @@ function asObjectManifest(value: unknown): ObjectManifest | null {
   if (typeof value !== "object" || value === null) return null
   const manifest = value as ObjectManifest
   return manifest.v === 1 ? manifest : null
+}
+
+/** The payload's own provenance claim as its numeric code — null when it names no known source. */
+function payloadSource(payload: ContextPayload): number | null {
+  const source = payload.provenance?.source
+  if (typeof source !== "string" || !(source in PROVENANCE_SOURCE)) return null
+  return PROVENANCE_SOURCE[source as ProvenanceSource]
 }
 
 /** The payload's displayable text — a bare string, a record's `text` field, else the JSON itself. */

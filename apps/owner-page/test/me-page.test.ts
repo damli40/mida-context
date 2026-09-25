@@ -199,7 +199,7 @@ function data(over: Partial<MeData> = {}): MeData {
   }
 }
 
-const openText = (text: string) => () => ({ ok: true as const, text })
+const openText = (text: string, provenanceSource: number | null = null) => () => ({ ok: true as const, text, provenanceSource })
 
 // --- the render contract ----------------------------------------------------------------------
 
@@ -316,6 +316,23 @@ describe("renderMe", () => {
     expect(root.textContent).not.toContain("You said")
     expect(root.textContent).not.toContain("inferred")
     expect(all(root, ".badge").filter((b) => b.textContent === "Source unknown")).toHaveLength(3)
+  })
+
+  it("a decrypted payload whose provenance label disagrees with the chain is flagged on the row", () => {
+    // chain says USER_ASSERTED (1); the bytes inside claim AGENT_INFERRED (3)
+    const flagged = renderMe(
+      data({ records: [record({ state: "anchored", source: 1 })] }),
+      fakeDoc(),
+      openText("body", 3),
+    ) as unknown as FakeEl
+    expect(flagged.textContent).toContain("the record's own label disagrees with Monad")
+
+    // agreement flags nothing, and neither does a row the chain never confirmed — Monad has not
+    // spoken for it, so there is nothing to disagree with
+    const agreed = renderMe(data({ records: [record({ state: "anchored", source: 3 })] }), fakeDoc(), openText("body", 3)) as unknown as FakeEl
+    expect(agreed.textContent).not.toContain("disagrees with Monad")
+    const unchecked = renderMe(data({ records: [record({ state: "unverified", source: 1 })] }), fakeDoc(), openText("body", 3)) as unknown as FakeEl
+    expect(unchecked.textContent).not.toContain("disagrees with Monad")
   })
 
   it("a row whose chain check could not run says 'could not check Monad just now' — never 'not on Monad'", () => {

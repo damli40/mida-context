@@ -46,7 +46,7 @@ function namespaceSecretOf(prf: Uint8Array, nsId: Hex): Uint8Array {
 }
 
 /** A real sealed row under the epoch key this passkey's seed derives — the store's shape back. */
-function sealRow(opts: { prf?: Uint8Array; nsId?: Hex; epoch?: bigint; text?: string } = {}) {
+function sealRow(opts: { prf?: Uint8Array; nsId?: Hex; epoch?: bigint; text?: string; source?: "USER_ASSERTED" | "AGENT_INFERRED" } = {}) {
   const nsId = opts.nsId ?? NS
   const epoch = opts.epoch ?? 1n
   const keys = deriveEpochKeyPair(namespaceSecretOf(opts.prf ?? PRF, nsId), epoch)
@@ -55,7 +55,7 @@ function sealRow(opts: { prf?: Uint8Array; nsId?: Hex; epoch?: bigint; text?: st
       v: 1,
       value: { text: opts.text ?? "remembered across tools" },
       kind: "PREFERENCE",
-      provenance: { source: "USER_ASSERTED" },
+      provenance: { source: opts.source ?? "USER_ASSERTED" },
     },
     binding: {
       chainId: DEPLOYMENT.chainId,
@@ -175,6 +175,7 @@ describe("me session", () => {
       expect(session.open(sealRow({ nsId, text: `body for ${nsId.slice(2, 8)}` }))).toEqual({
         ok: true,
         text: `body for ${nsId.slice(2, 8)}`,
+        provenanceSource: 1,
       })
     }
     // The only chain read was the owner-key check — never a write.
@@ -185,7 +186,20 @@ describe("me session", () => {
   it("opens a row sealed under this passkey's epoch key", async () => {
     const { env } = makeEnv()
     const session = await signIn(env, [NS])
-    expect(session.open(sealRow({ text: "the checkpoint body" }))).toEqual({ ok: true, text: "the checkpoint body" })
+    expect(session.open(sealRow({ text: "the checkpoint body" }))).toEqual({ ok: true, text: "the checkpoint body", provenanceSource: 1 })
+    session.end()
+  })
+
+  it("open returns the payload's own provenance claim as its numeric code", async () => {
+    const { env } = makeEnv()
+    const session = await signIn(env, [NS])
+    // USER_ASSERTED=1 sealed in above; a payload that claims agent inference must answer 3 —
+    // the page cross-checks this against the chain record's provenanceSource.
+    expect(session.open(sealRow({ source: "AGENT_INFERRED" }))).toEqual({
+      ok: true,
+      text: "remembered across tools",
+      provenanceSource: 3,
+    })
     session.end()
   })
 
@@ -207,7 +221,7 @@ describe("me session", () => {
     const { env } = makeEnv()
     const session = await signIn(env, [NS])
     const row = sealRow()
-    expect(session.open(row)).toEqual({ ok: true, text: "remembered across tools" })
+    expect(session.open(row)).toEqual({ ok: true, text: "remembered across tools", provenanceSource: 1 })
 
     const kept = session.secretBuffers
     // The namespace secret, plus the epoch private key open() derived lazily.
