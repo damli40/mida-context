@@ -97,8 +97,13 @@ check(hook.status === 0 && !hook.error, "mida-hook claude-code on empty stdin ex
 
 // the MCP adapter is a long-lived stdio server — what a spawn can prove is the refusal paths and
 // that a well-formed launch comes up even with no daemon to reach, then exits on stdin close.
-// the startup gate runs first: an empty home has no registered identity, so the launch refuses
-// before a daemon could be spawned — a wrong MIDA_HOME must never start one in the wrong place
+// the marker check runs before the startup gate: a folder without network.json is not a Mida
+// home at all, so this fixture writes one — an empty object is enough; the daemon spawn it
+// triggers exits on the malformed file rather than doing real chain work.
+mkdirSync(env.MIDA_HOME, { recursive: true })
+writeFileSync(join(env.MIDA_HOME, "network.json"), "{}\n")
+// an empty home has no registered identity, so the launches below refuse at the gate — a wrong
+// MIDA_HOME must never start a key-less daemon in the wrong place
 const mcpBad = run(["npx", "--no-install", "mida-mcp", "--bogus"], { cwd: project, env, input: "", timeout: 10_000 })
 check(
   mcpBad.status === 2 && (mcpBad.stderr ?? "").includes("usage: mida-mcp") && (mcpBad.stdout ?? "") === "",
