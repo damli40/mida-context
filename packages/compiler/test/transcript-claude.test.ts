@@ -247,6 +247,45 @@ describe("readConversation", () => {
     expect(r.firstUserMessage).toBe("/review")
   })
 
+  // K4: a real prompt may OPEN on an injected block — the reminder is
+  // scaffolding but the words after it are the ask. Strip the leading blocks,
+  // keep the rest, for the request pick and the rendered conversation alike.
+  it("a prompt that opens on a reminder keeps the user's own words (K4)", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "<system-reminder>The user opened src/parser.ts in the editor.</system-reminder>\n\nRefactor the parser to stream input" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "done" }] } }),
+    ])
+    const r = readConversation(t)
+    expect(r.firstUserMessage).toBe("Refactor the parser to stream input")
+    expect(r.text).toContain("Refactor the parser")
+    expect(r.text).not.toContain("system-reminder")
+    expect(r.text).not.toContain("The user opened src/parser.ts")
+  })
+
+  it("a tool_result part next to a reminder still renders (K4)", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "do the thing" } }),
+      JSON.stringify({
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            { type: "text", text: "<system-reminder>context note</system-reminder>" },
+            { type: "tool_result", tool_use_id: "t1", content: "RESULT-KEPT output" },
+          ],
+        },
+      }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "ok" }] } }),
+    ])
+    const r = readConversation(t)
+    expect(r.firstUserMessage).toBe("do the thing")
+    expect(r.text).toContain("RESULT-KEPT output")
+    expect(r.text).not.toContain("context note")
+    expect(r.text).not.toContain("system-reminder")
+  })
+
   it("the pin follows the picked line even when an earlier user block renders", () => {
     const dir = tmpdir()
     // A bare tool_result user line renders a block but carries no request text —

@@ -103,8 +103,9 @@ interface ContentPart {
 const isPart = (p: unknown): p is ContentPart => p !== null && typeof p === "object"
 
 // Claude Code injects its own user-role lines around the human's words — the
-// /compact caveat, slash-command echoes, hook and reminder blocks. A line that
-// opens with one of these tags is the tool's scaffolding, never the request.
+// /compact caveat, slash-command echoes, hook and reminder blocks. Text that
+// OPENS on one of these tags is scaffolding up to that tag's close; whatever
+// follows it is still the user's.
 const CLAUDE_SCAFFOLD_PREFIXES = [
   "<local-command-caveat>",
   "<command-name>",
@@ -119,14 +120,28 @@ const CLAUDE_SCAFFOLD_PREFIXES = [
   "<user-prompt-submit-hook>",
 ]
 
-// A line whose text opens with an injected tag is the tool's scaffolding —
-// never the request, and dropped from the rendered conversation entirely:
-// what the model gets is the human's conversation, not Claude Code's plumbing.
+// The scaffold prefixes as bare tag names, for block stripping below.
+const CLAUDE_SCAFFOLD_TAGS = new Set(CLAUDE_SCAFFOLD_PREFIXES.map((p) => p.slice(1, -1)))
+const SCAFFOLD_OPEN = /^<([a-z][a-z0-9-]*)(?:\s[^>]*)?>/
+
+// Strip leading injected <tag>…</tag> blocks (plus whitespace between) from a
+// user text. A real prompt may OPEN on a <system-reminder> — the reminder is
+// scaffolding but the words after it are the ask, so the block goes and the
+// rest stays. Returns "" when the text was scaffolding all the way down — the
+// whole line is then plumbing, never the request and never rendered — or when
+// an unclosed scaffold tag swallows the remainder.
 // (The isCompactSummary line is NOT in this set — the condensed history is
 // real session context and still renders; it just may not be the request.)
-function isScaffoldText(text: string): boolean {
-  const t = text.trimStart()
-  return CLAUDE_SCAFFOLD_PREFIXES.some((pre) => t.startsWith(pre))
+function stripLeadingScaffolds(text: string): string {
+  let t = text.trimStart()
+  for (;;) {
+    const open = SCAFFOLD_OPEN.exec(t)?.[1]
+    if (open === undefined || !CLAUDE_SCAFFOLD_TAGS.has(open)) return t
+    const close = `</${open}>`
+    const end = t.indexOf(close)
+    if (end === -1) return ""
+    t = t.slice(end + close.length).trimStart()
+  }
 }
 
 // Claude Code's own commands. An echo of one is never the user's ask — args or
@@ -178,6 +193,21 @@ function userRequestText(content: unknown): string {
   return ""
 }
 
+// The user's own words on one line, ready to be the request: each text part
+// with its leading injected blocks stripped, parts that empty out dropped.
+// "" means the line held no text or nothing but scaffolding.
+function userVisibleText(content: unknown): string {
+  if (typeof content === "string") return stripLeadingScaffolds(content)
+  if (Array.isArray(content)) {
+    return content
+      .filter((p): p is ContentPart => isPart(p) && p.type === "text" && typeof p.text === "string")
+      .map((p) => stripLeadingScaffolds(p.text as string))
+      .filter((t) => t !== "")
+      .join("\n")
+  }
+  return ""
+}
+
 // tool_result content is either a string or an array of {type:"text"} parts.
 function toolResultText(content: unknown): string {
   if (typeof content === "string") return content
@@ -195,13 +225,20 @@ function toolResultText(content: unknown): string {
 // unknowable. Returns null when the message renders to nothing (empty content).
 function renderMessage(label: string, obj: TranscriptLine): string | null {
   const content = obj.message?.content
+  const isUser = obj.type === "user"
   const parts: string[] = []
+  // a user text keeps its words after a leading injected block — the reminder
+  // goes, the ask stays; a part that was all scaffolding contributes nothing
+  const pushText = (text: string) => {
+    const t = isUser ? stripLeadingScaffolds(text) : text
+    if (t !== "") parts.push(t)
+  }
   if (typeof content === "string") {
-    parts.push(content)
+    pushText(content)
   } else if (Array.isArray(content)) {
     for (const p of content) {
       if (!isPart(p)) continue
-      if (p.type === "text" && typeof p.text === "string") parts.push(p.text)
+      if (p.type === "text" && typeof p.text === "string") pushText(p.text)
       else if (p.type === "thinking" && typeof p.thinking === "string")
         // scrub before the cut, like the Codex reader: a secret straddling
         // the 1,000-char boundary would otherwise leak an unredactable fragment
@@ -300,7 +337,7 @@ export function readConversation(
       const meta = obj.isMeta === true || obj.isCompactSummary === true
       const request =
         userText !== "" && !meta
-          ? (slashCommandRequest(userText, neighbourLocalCommand(i)) ?? (isScaffoldText(userText) ? null : userText))
+          ? (slashCommandRequest(userText, neighbourLocalCommand(i)) ?? (userVisibleText(obj.message?.content) || null))
           : null
       if (request !== null) {
         firstUserMessage = hardCut(scrubSecrets(request), FIRST_USER_CHARS)
@@ -309,10 +346,10 @@ export function readConversation(
         openedWithScaffolding = true
       }
     }
-    // Scaffolding is dropped from the rendered conversation too, not only
-    // from the request pick: isMeta bookkeeping lines and any user line whose
-    // text opens with an injected tag render nothing at all.
-    const dropped = isUser && (obj.isMeta === true || (userText !== "" && isScaffoldText(userText)))
+    // isMeta bookkeeping lines render nothing at all; other scaffolding drops
+    // itself — a user line whose text parts all strip to nothing produces no
+    // block, while a reminder next to a tool_result leaves the result behind.
+    const dropped = isUser && obj.isMeta === true
     const block = dropped ? null : renderMessage(label, obj)
     if (block) {
       msgs.push({ role: obj.type, block })
