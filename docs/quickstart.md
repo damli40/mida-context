@@ -359,7 +359,7 @@ Cursor's `--project` is written as the literal `${workspaceFolder}`, which Curso
 
 Windsurf keeps that block in `~/.codeium/windsurf/mcp_config.json`, VS Code in `.vscode/mcp.json`, Zed in `settings.json` under `context_servers`, and Gemini CLI in `~/.gemini/settings.json` under `mcpServers` — check each client's own MCP docs for the exact file. None of them is validated against Mida yet.
 
-`--as` is startup configuration: it names one registered identity and no tool call can change it — the four tools carry no identity field. Revoking is per client: `mida revoke claude-desktop` stops Claude Desktop's reads and leaves Cursor untouched; `mida approve --all` and `mida revoke --all` act on every agent at once after one confirmation (in passkey mode the page asks once per agent — signatures are never batched). `mida uninstall <client>` removes only the config entry — the identity and its approvals stay until `mida revoke <client>`.
+`--as` is startup configuration: it names one registered identity and no tool call can change it — the tools carry no identity field. Revoking is per client: `mida revoke claude-desktop` stops Claude Desktop's reads and writes and leaves Cursor untouched; `mida approve --all` and `mida revoke --all` act on every agent at once after one confirmation (in passkey mode the page asks once per agent — signatures are never batched). `mida uninstall <client>` removes only the config entry — the identity and its approvals stay until `mida revoke <client>`.
 
 The server refuses to start — one line on stderr, exit 2, nothing on stdout — in the cases that would otherwise read as "not approved" forever:
 
@@ -375,17 +375,20 @@ The server refuses to start — one line on stderr, exit 2, nothing on stdout �
 
 The model keys used for compiles live in the daemon, not in this server: start the daemon from a terminal that has them (any `mida` command does), and the MCP server reuses it over the socket; a daemon the client spawns itself would have no keys and could not compile.
 
-The client then sees four tools — `mida_handoff` (the same text a session-start hook would inject), `mida_whats_new` (the per-prompt note), `mida_read` (a context namespace) and `mida_status` (health plus each agent's verdict for this folder). `mida doctor` prints `ok: mida-mcp resolves to <path>` once the package is installed.
+The client then sees five tools — `mida_handoff` (the same text a session-start hook would inject), `mida_whats_new` (the per-prompt note), `mida_read` (a context namespace), `mida_status` (health plus each agent's verdict for this folder) and `mida_save`. `mida doctor` prints `ok: mida-mcp resolves to <path>` once the package is installed.
+
+`mida_save` is the one write: the model fills the ten checkpoint fields (objective, progress, decisions, rejected, constraints, artifacts, unresolvedIssue, nextAction, remainingPlan, evidence — plus an optional `originalRequest` carrying the user's own words, up to 6,000 characters) and sends them to the daemon over the socket. The adapter still holds no keys — `midad` validates the shape and names any field it does not know, scrubs secrets with the same scrubber the transcript compiler uses, checks the same gates a read passes (registered MCP identity → this folder is approved for it → the chain grant includes CREATE on the project area → not revoked), then seals, stores and registers the checkpoint signed as the client's own identity. Every save by one client in one project chains under one stable session id, so a later handoff merges them as a single history. A client the owner approved for READ only gets the actionable line instead: `<name> can read but not write here — run \`mida request <name>\` and \`mida approve <name>\` to add write access`. The approval a client needs is the one `mida approve <client>` already grants — its access request asks for READ | CREATE | SUPERSEDE_OWN on the project area.
 
 The honest limits:
 
 - **Local only.** It is stdio on this machine, talking to midad's Unix socket — there is no remote MCP endpoint to point a hosted client at.
-- **Read-only.** No write tool exists in this round — a model cannot save, remember, approve or revoke through MCP until the owner decides that is wanted.
+- **One save per minute per client per project.** The daemon enforces it (a looping model cannot spend the sponsor's gas); a refused save says when the next one is allowed.
+- **No owner operations.** A model cannot approve, revoke, request or remember through MCP — there is no tool and no socket route for those; only the checkpoint write above.
 - claude.ai web and mobile: not supported in v0 — they only call public HTTPS servers from Anthropic's cloud, and Mida does not run one.
 <!-- revisit if spike S4 passes (plan Task 10) -->
 - **ChatGPT in the browser — NOT RUN, and not supported in v0.** The ChatGPT desktop app is the Codex app above. Browser ChatGPT has no local stdio transport Mida can serve.
 
-*Status: NOT RUN against a real MCP client — `apps/midad/test/mcp.test.ts` drives the server over the SDK's in-memory transport against a fake daemon socket (including the not-approved, revoked and daemon-down answers), and `apps/midad/test/mcp.e2e.test.ts` runs it against a real daemon on a local Anvil chain. No client above has been validated end-to-end.*
+*Status: NOT RUN against a real MCP client — `apps/midad/test/mcp.test.ts` drives the server over the SDK's in-memory transport against a fake daemon socket (including the not-approved, revoked and daemon-down answers), `apps/midad/test/mcp.e2e.test.ts` runs the reads against a real daemon on a local Anvil chain, and `apps/midad/test/mcp-save.e2e.test.ts` runs `mida_save` end to end the same way (a real save another agent's handoff then sees, the READ-only / unapproved / revoked / bad-shape / rate-limit refusals, and secret scrubbing before sealing). No client above has been validated end-to-end.*
 
 ## The compile model: DeepSeek by default — RUN (benchmarked)
 
