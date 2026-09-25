@@ -191,7 +191,9 @@ function renderMessage(label: string, obj: TranscriptLine): string | null {
       if (!isPart(p)) continue
       if (p.type === "text" && typeof p.text === "string") parts.push(p.text)
       else if (p.type === "thinking" && typeof p.thinking === "string")
-        parts.push(`[thinking] ${cut(p.thinking, THINKING_CHARS)}`)
+        // scrub before the cut, like the Codex reader: a secret straddling
+        // the 1,000-char boundary would otherwise leak an unredactable fragment
+        parts.push(`[thinking] ${cut(scrubSecrets(p.thinking), THINKING_CHARS)}`)
       else if (p.type === "tool_use") {
         let input = ""
         try {

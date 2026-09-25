@@ -282,6 +282,25 @@ describe("readConversation", () => {
     expect(r.text).not.toContain("EARLY-RESULT")
   })
 
+  // G10: thinking parts are scrubbed BEFORE the 1,000-char cut — a secret
+  // straddling the boundary would otherwise lose enough characters to stop
+  // matching the scrub patterns and leak a fragment.
+  it("a secret straddling the thinking cut is scrubbed whole (G10)", () => {
+    const dir = tmpdir()
+    const key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "the request" } }),
+      // 951 chars of filler put the key across the 1,000-char thinking cut
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "thinking", thinking: `${"x".repeat(950)} ${key}` }] } }),
+    ])
+    const r = readConversation(t)
+    expect(r.text).toContain("[REDACTED]")
+    expect(r.text).not.toContain(key)
+    // a fragment is a leak too — the cut must not split the key into a
+    // string too short for the scrubber to recognise
+    expect(r.text).not.toContain(key.slice(0, 20))
+  })
+
   it("no user/assistant lines → unknown-tail fallback (G1)", () => {
     const dir = tmpdir()
     const t = writeTranscript(dir, [
