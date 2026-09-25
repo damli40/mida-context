@@ -149,16 +149,22 @@ describe("renderHandoff", () => {
     expect(text).toContain("- claude-code (on-chain author 0xclaudeau…)")
     expect(text).not.toContain("claims")
   })
-  it("renders owner facts under the exact heading, each named as yours with its record id", () => {
+  it("renders owner facts under the exact heading, each named as yours with short id and chain date", () => {
     const withFacts = renderHandoff(base, {
       facts: [
-        { text: "answers in lowercase", contextId: "0xfact01" },
-        { text: "prefers pnpm", contextId: "0xfact02" },
+        { text: "answers in lowercase", contextId: "0xfact0123456789", assertedAt: "2025-09-16T05:20:00.000Z" },
+        { text: "prefers pnpm", contextId: "0xfact0245678912", assertedAt: "2026-09-21T10:00:00.000Z" },
       ],
     })
     expect(withFacts).toContain("What you have told Mida about yourself")
-    expect(withFacts).toContain("- stated by you: answers in lowercase (record 0xfact01)")
-    expect(withFacts).toContain("- stated by you: prefers pnpm (record 0xfact02)")
+    // the first 8 hex characters of the context id, then the record's chain stamp — the full
+    // 64-hex id is never shown
+    expect(withFacts).toContain("- stated by you: answers in lowercase (id fact0123, 2025-09-16 05:20 UTC)")
+    expect(withFacts).toContain("- stated by you: prefers pnpm (id fact0245, 2026-09-21 10:00 UTC)")
+    expect(withFacts).not.toContain("0xfact0123456789")
+    // a fact with no chain date (a caller that cannot name one) keeps the full record id
+    const undated = renderHandoff(base, { facts: [{ text: "x", contextId: "0xundated1" }] })
+    expect(undated).toContain("- stated by you: x (record 0xundated1)")
     // the section sits ahead of progress: facts are kept while progress is trimmed
     expect(withFacts.indexOf("What you have told Mida about yourself")).toBeLessThan(withFacts.indexOf("Progress:"))
     for (const option of [{}, { facts: [] as { text: string; contextId: string }[] }]) {

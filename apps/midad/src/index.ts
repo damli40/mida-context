@@ -23,7 +23,7 @@ export {
   expectedScopesFor,
   purposeFor,
 } from "./skeleton.js"
-export { attemptNamespaceRead, readOwnerFacts, remember, FACT_NAMESPACES, MAX_FACTS } from "./remember.js"
+export { attemptNamespaceRead, factShortId, factStamp, readOwnerFacts, remember, FACT_NAMESPACES, MAX_FACTS } from "./remember.js"
 export type { OwnerFact, RememberResult } from "./remember.js"
 export * from "./checkpoint-payload.js"
 export * from "./migration-envelope.js"

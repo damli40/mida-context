@@ -425,7 +425,8 @@ describe("buildHandoff", () => {
     expect(withFacts.factsFailed).toBeNull()
     expect(withFacts.text).toContain("What you have told Mida about yourself")
     expect(withFacts.text).toContain("- stated by you: answers in lowercase")
-    expect(withFacts.text).toContain(`(record ${fact.contextId})`)
+    expect(withFacts.text).toContain(`(id 77777777, 2026-09-21 10:00 UTC)`)
+    expect(withFacts.text).not.toContain(`(record ${fact.contextId})`)
     expect(withFacts.text).not.toContain("(Your saved preferences could not be read for this session.)")
 
     // a fact read that throws — other than "no grant" — never sinks the handoff (A14)

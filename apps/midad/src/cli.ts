@@ -22,7 +22,7 @@ import type { InstallTool, McpClientTool } from "./install.js"
 import { checkProject, ensureProjectMarker } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { projectIdFor } from "./queue.js"
-import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
+import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, factShortId, factStamp, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE, ServiceRuntime } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag } from "./network.js"
@@ -297,7 +297,10 @@ export async function runCliWithRuntime(
           } else {
             print("What you have told Mida about yourself")
             for (const fact of facts) {
-              if (only === undefined || fact.namespace === only) print(`  ${fact.namespace}: ${fact.text}`)
+              // every fact names itself: short id (what --replaces takes) + the record's chain date
+              if (only === undefined || fact.namespace === only) {
+                print(`  ${fact.namespace}: ${fact.text} (id ${factShortId(fact.contextId)}, ${factStamp(fact.assertedAt)})`)
+              }
             }
           }
           if (only === undefined) {

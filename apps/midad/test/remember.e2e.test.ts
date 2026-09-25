@@ -263,7 +263,10 @@ describe("mida remember on local Anvil", () => {
     const lowercase = facts.find((f) => f.text === "i answer in lowercase")
     expect(lowercase).toBeDefined()
     expect(result.text).toContain("What you have told Mida about yourself")
-    expect(result.text).toContain(`- stated by you: i answer in lowercase (record ${lowercase!.contextId})`)
+    const short = lowercase!.contextId.slice(2, 10)
+    const stamp = `${lowercase!.assertedAt.slice(0, 16).replace("T", " ")} UTC`
+    expect(result.text).toContain(`- stated by you: i answer in lowercase (id ${short}, ${stamp})`)
+    expect(result.text).not.toContain(`(record ${lowercase!.contextId})`)
     expect(result.text).not.toContain("confirmed by the owner, never asserted")
     expect(result.facts).toBeGreaterThanOrEqual(3)
 

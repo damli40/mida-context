@@ -48,6 +48,17 @@ export function defuse(text: string): string {
     .join("\n")
 }
 
+/**
+ * One fact's stamp, appended to its line: the first 8 hex characters of the context id (the id an
+ * owner names in `mida remember --replaces`) and the date the chain stamped on the record,
+ * "YYYY-MM-DD HH:MM UTC". A fact that cannot name its chain date falls back to the full record
+ * id so the line still identifies something.
+ */
+const factStamp = (f: { contextId: string; assertedAt?: string }): string =>
+  f.assertedAt === undefined
+    ? `record ${defuse(f.contextId)}`
+    : `id ${defuse(f.contextId.replace(/^0x/i, "").slice(0, 8))}, ${defuse(f.assertedAt.slice(0, 16).replace("T", " "))} UTC`
+
 /** What the rendered text's size came out as — the daemon logs this and the owner sees `cut`. */
 export interface RenderedHandoff {
   text: string
@@ -66,7 +77,7 @@ export function renderHandoff(
   options: {
     maxChars?: number
     authorNames?: Record<string, string>
-    facts?: { text: string; contextId: string }[]
+    facts?: { text: string; contextId: string; assertedAt?: string }[]
     factsFailed?: string | null
   } = {},
 ): string {
@@ -83,7 +94,7 @@ export function renderHandoffReport(
   options: {
     maxChars?: number
     authorNames?: Record<string, string>
-    facts?: { text: string; contextId: string }[]
+    facts?: { text: string; contextId: string; assertedAt?: string }[]
     factsFailed?: string | null
   } = {},
 ): RenderedHandoff {
@@ -128,7 +139,7 @@ export function renderHandoffReport(
     if (options.facts !== undefined && options.facts.length > 0) {
       parts.push(
         `What you have told Mida about yourself\n${options.facts
-          .map((f) => `- stated by you: ${defuse(f.text)} (record ${defuse(f.contextId)})`)
+          .map((f) => `- stated by you: ${defuse(f.text)} (${factStamp(f)})`)
           .join("\n")}`,
       )
     }

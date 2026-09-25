@@ -253,7 +253,9 @@ describe("migrated facts in the fact list (migrate B2)", () => {
     const lines: string[] = []
     expect(await runCliWithRuntime(["read", "--as", "claude-code", "preferences.communication"], runtime, (line) => lines.push(line))).toBe(0)
     expect(lines).toContain("What you have told Mida about yourself")
-    expect(lines).toContain("  preferences.communication: answers in lowercase (moved on 2026-09-25)")
+    // the moved-on marker rides inside the fact's own words; id and chain stamp follow it — the
+    // fake record's createdAt of 1,758,000,000 s is 2025-09-16 05:20 UTC
+    expect(lines).toContain("  preferences.communication: answers in lowercase (moved on 2026-09-25) (id 66666666, 2025-09-16 05:20 UTC)")
   })
 
   it("orders by the envelope's originalCreatedAt, not the replay's fresh chain stamp (migrate B7b)", async () => {

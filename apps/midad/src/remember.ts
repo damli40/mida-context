@@ -19,6 +19,11 @@ const MAX_FACT_CHARS = 2_000
 /** At most this many facts are shown to a receiving agent, newest first. */
 export const MAX_FACTS = 20
 
+/** The id an owner types or reads back: the first 8 hex characters of the context id. */
+export const factShortId = (contextId: string): string => contextId.replace(/^0x/i, "").slice(0, 8)
+/** A chain instant as the owner sees it: "YYYY-MM-DD HH:MM UTC" from the record's ISO stamp. */
+export const factStamp = (iso: string): string => `${iso.slice(0, 16).replace("T", " ")} UTC`
+
 const KIND_FOR: Record<FactNamespace, ContextKind> = {
   "preferences.communication": "PREFERENCE",
   "profile.skills": "FACT",
