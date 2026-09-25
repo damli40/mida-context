@@ -294,15 +294,26 @@ export function readConversation(
     }
   }
 
-  // True when a user line within two lines of index i carries the
-  // caveat/stdout block Claude Code emits around a built-in command.
+  // A command echo is local plumbing when Claude Code's own bookkeeping sits at
+  // the exact places it writes it: a <local-command-caveat> on the line right
+  // BEFORE the echo (i−1), or a <local-command-stdout> right AFTER it (i+1 or
+  // i+2 — a line can sit between the echo and its output).
+  // Anything wider hides real commands: the previous built-in's stdout would
+  // otherwise count as this echo's neighbour and a custom command following it
+  // would vanish. And a line on the other side of the head/tail cut is never a
+  // neighbour — "~" labels mark the tail window, so the boundary is checked
+  // before anything is compared.
+  const inSameWindow = (i: number, j: number): boolean =>
+    j >= 0 && j < entries.length && entries[j]!.label.startsWith("~") === entries[i]!.label.startsWith("~")
+  const userTextAt = (j: number): string => {
+    const other = entries[j]?.obj
+    if (other?.type !== "user") return ""
+    return userRequestText(other.message?.content)
+  }
   const neighbourLocalCommand = (i: number): boolean => {
-    for (let j = Math.max(0, i - 2); j <= Math.min(entries.length - 1, i + 2); j++) {
-      if (j === i) continue
-      const other = entries[j]!.obj
-      if (other?.type !== "user") continue
-      const t = userRequestText(other.message?.content)
-      if (t.includes("<local-command-caveat>") || t.includes("<local-command-stdout>")) return true
+    if (inSameWindow(i, i - 1) && userTextAt(i - 1).includes("<local-command-caveat>")) return true
+    for (const j of [i + 1, i + 2]) {
+      if (inSameWindow(i, j) && userTextAt(j).includes("<local-command-stdout>")) return true
     }
     return false
   }
