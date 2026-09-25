@@ -102,18 +102,6 @@
 .revoke-box { display: grid; gap: 10px; justify-items: start; }
 @media (min-width: 900px) { .revoke-box { justify-items: end; text-align: right; max-width: 280px; } }
 .revoke-note { margin: 0; font-size: .75rem; color: var(--muted); line-height: 1.45; }
-.btn-danger { background: transparent; color: var(--bad-fg); border-color: var(--bad-fg); }
-.btn-danger:hover { background: var(--bad-bg); }
-
-/* Confirm panel (Task 6 wires the revoke confirm into this) */
-.confirm {
-  grid-column: 1 / -1; border: 1px solid var(--line-strong); border-radius: 12px;
-  padding: 20px 22px; background: var(--surface); display: grid; gap: 14px;
-}
-@media (min-width: 900px) { .confirm { grid-template-columns: 1fr auto; align-items: center; } }
-.confirm p { margin: 0; color: var(--fg-2); font-size: .9375rem; line-height: 1.55; }
-.confirm strong { color: var(--fg); }
-.confirm-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 
 /* Records table */
 .records { width: 100%; border-collapse: collapse; font-size: .9rem; }

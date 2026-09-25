@@ -22,15 +22,12 @@ import { ContextApiClient, RegistryReader } from "@mida/api/browser"
 import { NAMESPACE_TREE_V1 } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { DEPLOYMENT, STORE_URL } from "../owner/core.js"
-import type { FlowEnvironment, ReaderRepairResult } from "../owner/flows.js"
+import type { FlowEnvironment } from "../owner/flows.js"
 import { assertRpGate, el, makeEnv, progressLine, showError } from "../owner/page.js"
 import { describeError } from "../owner/session.js"
 import { shortAddress } from "../owner/secrets.js"
-import type { OwnerLinkResult as FlowResult } from "@mida/protocol"
 import { chipsFor, isTxHash, provenanceBadge } from "./model.js"
 import type { Badge } from "./model.js"
-import { repairReaderWrapsFromMe, revokeFromMe, shouldOfferRepair } from "./revoke.js"
-import type { MeRevokeResult } from "./revoke.js"
 import { boundedScanClient, scanWithDeadline } from "./logscan.js"
 import { BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
 import type { AgentRow, GrantLog, MeData, MePorts, RecordRow } from "./sources.js"
@@ -248,48 +245,9 @@ function renderAgent(doc: Document, agent: AgentRow, source: MeData["source"]): 
   if (revokedRow) {
     box.appendChild(elOf(doc, "p", "revoke-note", "Refused since revocation. Anything it read before then stays with it."))
   }
-  // The button names the agent it acts on; the confirm panel is its sibling, spanning the row —
-  // rendered closed and opened by the click wiring in wireRevokePanels.
-  if (agent.readLive || agent.blockedAtStore || agent.grants.some((g) => g.status.label === "Can read")) {
-    const revoke = elOf(doc, "button", "btn btn-danger btn-small", "Revoke")
-    revoke.setAttribute("type", "button")
-    revoke.setAttribute("data-revoke-agent", agent.agentId)
-    box.appendChild(revoke)
-
-    const panel = elOf(doc, "div", "confirm")
-    panel.setAttribute("data-confirm-panel", agent.agentId)
-    panel.hidden = true
-    const ask = elOf(doc, "p")
-    ask.appendChild(elOf(doc, "strong", undefined, `Revoke ${agent.name}?`))
-    ask.appendChild(elOf(doc, "span", undefined, " Your passkey signs the revoke; the sponsor pays the gas."))
-    panel.appendChild(ask)
-    // The disclosure sentence is pinned verbatim by the spec — its own node so the text is exact.
-    const disclosure = elOf(
-      doc,
-      "p",
-      undefined,
-      `This stops future reads through Mida. It does not erase what ${agent.name} already read.`,
-    )
-    disclosure.setAttribute("data-revoke-disclosure", "")
-    panel.appendChild(disclosure)
-    const actions = elOf(doc, "div", "confirm-actions")
-    const cancel = elOf(doc, "button", "btn btn-secondary btn-small", "Cancel")
-    cancel.setAttribute("type", "button")
-    cancel.setAttribute("data-revoke-cancel", "")
-    const confirm = elOf(doc, "button", "btn btn-primary btn-small", "Confirm with passkey")
-    confirm.setAttribute("type", "button")
-    confirm.setAttribute("data-revoke-confirm", "")
-    actions.appendChild(cancel)
-    actions.appendChild(confirm)
-    panel.appendChild(actions)
-    // Progress and failure text live inside the panel — the sign-in block's progress list is
-    // hidden once the dashboard renders, so the flow's own lines are written here instead.
-    const status = elOf(doc, "p", "revoke-note")
-    status.setAttribute("data-revoke-status", "")
-    status.hidden = true
-    panel.appendChild(status)
-    row.appendChild(panel)
-  }
+  // Read-only build: where the revoke button stood, the row names the terminal command instead.
+  // A revoke rotates the area key, and the terminal is where the re-key is guaranteed to run.
+  box.appendChild(elOf(doc, "p", "revoke-note", `To revoke: run mida revoke ${agent.name} in your terminal.`))
   return row
 }
 
@@ -302,6 +260,14 @@ function renderAgents(doc: Document, data: MeData): HTMLElement {
   agentsTitle.setAttribute("id", "agents-title")
   head.appendChild(agentsTitle)
   head.appendChild(elOf(doc, "p", "sec-note", "Access is enforced by the contract on Monad, not by this page."))
+  sec.appendChild(
+    elOf(
+      doc,
+      "p",
+      "sec-note",
+      "This page is read-only. Revoking happens in your terminal, where your other agents get the new key.",
+    ),
+  )
   if (data.agentsUnavailable !== null) {
     sec.appendChild(elOf(doc, "p", "agent-meta", data.agentsUnavailable))
     return sec
@@ -506,121 +472,6 @@ export function renderMe(data: MeData, doc: Document, open?: OpenRow): HTMLEleme
   return root
 }
 
-/**
- * Task 6 — the click wiring behind each agent's confirm panel. `run` is the flow call the boot
- * path binds to revokeFromMe with the session's owner; `reload` is the loadMe re-read. ANY result
- * carrying a transaction — success, pending, or a failure after the send landed — re-reads the
- * world; the row is never flipped locally and a revoke that reached Monad can never leave "Can
- * read" on the screen. A failure that sent nothing keeps the row and writes the reason into the
- * panel. `repair`, when present, mounts the "send the new key to the remaining agents" action —
- * offered after a revoke that ended pending or with per-reader wrap failures.
- */
-export function wireRevokePanels(
-  root: HTMLElement,
-  doc: Document,
-  agents: readonly AgentRow[],
-  opts: {
-    run: (agent: AgentRow, progress: (line: string) => void) => Promise<FlowResult>
-    reload: () => Promise<void> | void
-    repair?: (progress: (line: string) => void) => Promise<ReaderRepairResult>
-  },
-): void {
-  const agentsById = new Map(agents.map((a) => [a.agentId.toLowerCase(), a]))
-  for (const button of Array.from(root.querySelectorAll<HTMLElement>("[data-revoke-agent]"))) {
-    const id = (button.getAttribute("data-revoke-agent") ?? "").toLowerCase()
-    const agent = agentsById.get(id)
-    const panel = Array.from(root.querySelectorAll<HTMLElement>("[data-confirm-panel]")).find(
-      (p) => (p.getAttribute("data-confirm-panel") ?? "").toLowerCase() === id,
-    )
-    const cancel = panel?.querySelector<HTMLButtonElement>("[data-revoke-cancel]")
-    const confirm = panel?.querySelector<HTMLButtonElement>("[data-revoke-confirm]")
-    const status = panel?.querySelector<HTMLElement>("[data-revoke-status]")
-    if (agent === undefined || panel === undefined || confirm === undefined || confirm === null) continue
-    const note = (text: string): void => {
-      if (status === undefined || status === null) return
-      status.textContent = text
-      status.hidden = false
-    }
-    button.addEventListener("click", () => {
-      panel.hidden = false
-      button.hidden = true
-    })
-    cancel?.addEventListener("click", () => {
-      panel.hidden = true
-      button.hidden = false
-    })
-    confirm.addEventListener("click", () => {
-      confirm.disabled = true
-      if (cancel) cancel.disabled = true
-      void (async () => {
-        try {
-          const result = await opts.run(agent, note)
-          const sentAnything = result.transactions.length > 0 || result.operations.length > 0
-          if (result.status === "success" || result.status === "pending" || sentAnything) {
-            await opts.reload()
-            return
-          }
-          note(result.reason ?? "The revoke did not complete.")
-        } catch (error) {
-          note(describeError(error))
-        }
-        confirm.disabled = false
-        if (cancel) cancel.disabled = false
-      })()
-    })
-  }
-  if (opts.repair !== undefined) mountRepairBox(root, doc, opts.repair)
-}
-
-/**
- * The repair strip under the agent list — mounted only when a previous revoke ended pending or
- * left a reader un-wrapped. One passkey touch re-sends the current epoch's wrap to every agent
- * the chain still says holds READ.
- */
-function mountRepairBox(
-  root: HTMLElement,
-  doc: Document,
-  run: (progress: (line: string) => void) => Promise<ReaderRepairResult>,
-): void {
-  const sec = root.querySelector('[aria-labelledby="agents-title"]')
-  if (sec === null) return
-  const box = elOf(doc, "div", "confirm")
-  box.setAttribute("data-repair-wraps", "")
-  box.appendChild(
-    elOf(doc, "p", undefined, "Some agents may be missing the new key after that revoke — the chain decides who still holds READ."),
-  )
-  const button = elOf(doc, "button", "btn btn-secondary btn-small", "Send the new key to the remaining agents")
-  button.setAttribute("type", "button")
-  button.setAttribute("data-repair-run", "")
-  const status = elOf(doc, "p", "revoke-note")
-  status.hidden = true
-  box.appendChild(button)
-  box.appendChild(status)
-  const note = (text: string): void => {
-    status.textContent = text
-    status.hidden = false
-  }
-  button.addEventListener("click", () => {
-    button.disabled = true
-    void (async () => {
-      try {
-        const outcome = await run(note)
-        if (outcome.failed.length === 0) {
-          note("The new key reached every surviving agent.")
-          box.hidden = true // the action's job is done — take it off the page
-        } else {
-          note(`${outcome.failed.length} agent${outcome.failed.length === 1 ? "" : "s"} could not be reached — try again or check the store.`)
-          button.disabled = false
-        }
-      } catch (error) {
-        note(describeError(error))
-        button.disabled = false
-      }
-    })()
-  })
-  sec.appendChild(box)
-}
-
 // --- live ports: chain views, the store client, the index's GraphQL -----------------------------
 
 const CAPABILITY_GRANTED = capabilityRegistryAbi.find(
@@ -812,17 +663,14 @@ export function armTeardown(session: Pick<MeSession, "end">, dropSigner: () => v
     }
     session.end()
     dropSigner()
-    // Plaintext leaves the page with the keys — the cells remain, their content does not. The
-    // query runs against the live tree: a revoke refresh has replaced the first render.
+    // Plaintext leaves the page with the keys — the cells remain, their content does not.
+    // The query runs against the live tree — a refresh may have replaced the first render.
     for (const node of Array.from(el("me-root").querySelectorAll("[data-decrypted]"))) {
       node.textContent = "cleared — sign in again to read"
     }
-    // Nothing on a signed-out page may act on the owner's behalf: no revokes, no repair, no
-    // paging through the records list.
-    for (const sel of ["[data-revoke-agent]", "[data-revoke-confirm]", "[data-more]", "[data-repair-run]"]) {
-      for (const node of Array.from(el("me-root").querySelectorAll(sel))) {
-        ;(node as HTMLButtonElement).disabled = true
-      }
+    // The records pager is the only control left on a signed-out page — disable it too.
+    for (const node of Array.from(el("me-root").querySelectorAll("[data-more]"))) {
+      ;(node as HTMLButtonElement).disabled = true
     }
     el("sign-in").hidden = false
     el<HTMLButtonElement>("go").disabled = false
@@ -867,62 +715,11 @@ function boot(): void {
       // cannot issue owner-signed calls on a leftover key.
       const storeHandle = revocableStore(ports.store)
       ports.store = storeHandle.port
-      // The repair action lives across reloads: set when a revoke ends pending or leaves a
-      // reader un-wrapped, cleared when a repair run finishes clean. The epochs the revoke was
-      // built against travel with it — until the chain passes them, the action waits.
-      let repairOffered = false
-      let repairEpochs: MeRevokeResult["epochsAtRevoke"] = []
-      // The agent whose revoke prompted the repair — never a repair target, whatever the chain
-      // reports for it while the transaction is pending.
-      let repairExcluded: Hex[] = []
-      // Every render is a fresh read; after a revoke lands (or goes pending) the same refresh
-      // runs again — the page re-reads, it does not assume.
+      // Every render is a fresh read — the page re-reads, it does not assume.
       const refresh = async (): Promise<void> => {
         const data = await loadMe(session.owner, ports)
         const root = renderMe(data, document, (row) => session.open(row))
         el("me-root").replaceChildren(root)
-        wireRevokePanels(root, document, data.agents, {
-          run: async (agent, progress) => {
-            // The reader list is built from a fresh read at click time — the rendered rows can
-            // be minutes stale, and an agent the render missed would keep its old wraps.
-            const fresh = await loadMe(session.owner, ports)
-            const result = await revokeFromMe(
-              { ...env, progress },
-              {
-                signedInOwner: session.owner,
-                agentId: agent.agentId,
-                agents: fresh.agents,
-                agentsUnavailable: fresh.agentsUnavailable !== null,
-              },
-            )
-            // Any outcome that reached Monad without finishing the job offers the repair —
-            // pending, a failure after the send, or a success that left a reader un-wrapped.
-            if (shouldOfferRepair(result)) {
-              repairOffered = true
-              repairEpochs = result.epochsAtRevoke
-              repairExcluded = [agent.agentId]
-            }
-            return result
-          },
-          reload: refresh,
-          repair: !repairOffered
-            ? undefined
-            : async (progress) => {
-                const fresh = await loadMe(session.owner, ports)
-                const outcome = await repairReaderWrapsFromMe(
-                  { ...env, progress },
-                  {
-                    signedInOwner: session.owner,
-                    agents: fresh.agents,
-                    agentsUnavailable: fresh.agentsUnavailable !== null,
-                    epochsAtRevoke: repairEpochs,
-                    excludeAgentIds: repairExcluded,
-                  },
-                )
-                if (outcome.failed.length === 0) repairOffered = false
-                return outcome
-              },
-        })
       }
       await refresh()
       el("sign-in").hidden = true

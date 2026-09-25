@@ -58,4 +58,13 @@ describe("me browser bundle", () => {
   it("bundles src/me/page.ts with zero node: imports and no require() calls", async () => {
     expectBrowserSafe(await bundleCode("src/me/page.ts"))
   })
+
+  it("ships no revoke machinery — /me is read-only in this build", async () => {
+    // src/me/revoke.ts stays in the repo for the post-hackathon return of the in-page revoke;
+    // what matters is that page.ts no longer imports it, so none of the revoke path — the
+    // confirm step or the wrap republish — can reach the bundle.
+    const code = await bundleCode("src/me/page.ts")
+    expect(code).not.toContain("confirmRevoke")
+    expect(code).not.toContain("publishReaderWraps")
+  })
 })

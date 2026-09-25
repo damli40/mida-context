@@ -2,7 +2,7 @@
 
 **What this document is.** A plain-language runbook for `app.midacontext.xyz/me` — the page where
 an owner signs in with their passkey and sees every agent that can read their context, every recent
-record and who wrote it, and can revoke an agent on the spot. Written for someone who has never
+record and who wrote it. Written for someone who has never
 read the contracts. It covers what each number on the page is *claimed* to be and where it comes
 from, how to deploy and keep alive the index the page prefers to read, and what the page cannot
 show you.
@@ -11,6 +11,12 @@ show you.
 contracts have ever emitted) for the fast answer, then double-checks every grant and record against
 Monad itself — so the page can be slow to load, and anything it could not verify says so out loud
 instead of looking confirmed.
+
+**Read-only in this build.** `/me` shows who can read your context but never revokes — for that,
+run `mida revoke <agent>` in the terminal (or use the passkey revoke page it links to). Review
+found a browser revoke could strand the other agents without the rotated key when the repair step
+lived only in page memory, so the action stays in the terminal, where the re-key is guaranteed to
+run.
 
 ---
 
@@ -39,7 +45,7 @@ A quick vocabulary pass, then the table.
 | The summary counts | The index, labelled "per the index" | — | Hidden entirely when the index is down or a list came back partial — a partial list never produces a confident count |
 | "≈ N s behind Monad" | The index's own progress report (`_meta`: how far the source chain has moved vs how far the index has processed it), converted at Monad's ~0.4 s cadence | — | Past 150 blocks (~60 s) the badge flags the index stale; an index that cannot report progress reads "index unavailable", and no configured index URL at all reads "index not configured" |
 | "Batching is on" | The store's own status answer | — | "unknown" |
-| "blocked at the store · revoke pending on Monad" | The store's active deny list — a revoke cuts store access the moment you confirm, before the chain transaction lands | — | This row can never read "Can read" |
+| "blocked at the store · revoke pending on Monad" | The store's active deny list — a revoke cuts store access the moment it is confirmed in the terminal, before the chain transaction lands | — | This row can never read "Can read" |
 
 Two rules hold across the whole table: **every figure names where it came from**, and **a row the
 page could not verify says so** instead of looking complete. If a source fails, you see a labelled

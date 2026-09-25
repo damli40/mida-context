@@ -435,12 +435,68 @@ describe("renderMe", () => {
   })
 })
 
+// --- read-only: revoking lives in the terminal, not on this page --------------------------------
+
+describe("/me is read-only — revoking happens in the terminal", () => {
+  it("no button or link carries 'revoke', and no revoke/repair control exists anywhere", () => {
+    // two live readers so the rows exercise the spot the button used to occupy
+    const root = renderMe(
+      data({ agents: [agent(), agent({ agentId: `0x${"22".repeat(32)}` as Hex, name: "codex" })] }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    for (const node of root.walk()) {
+      if (node.tag === "button" || node.tag === "a") {
+        expect(node.textContent.toLowerCase(), `a <${node.tag}> must not offer revoking`).not.toContain("revoke")
+      }
+    }
+    for (const sel of [
+      "[data-revoke-agent]",
+      "[data-confirm-panel]",
+      "[data-revoke-cancel]",
+      "[data-revoke-confirm]",
+      "[data-revoke-disclosure]",
+      "[data-revoke-status]",
+      "[data-repair-wraps]",
+      "[data-repair-run]",
+    ]) {
+      expect(all(root, sel), `${sel} must not be rendered`).toHaveLength(0)
+    }
+  })
+
+  it("every agent row names the terminal command that revokes it", () => {
+    const revoked = agent({
+      agentId: `0x${"33".repeat(32)}` as Hex,
+      name: "old-agent",
+      readLive: false,
+      revokedTx: TX,
+      grants: [grant({ status: { label: "Revoked", flagged: false, unchecked: false } })],
+    })
+    const agents = [agent(), agent({ agentId: `0x${"22".repeat(32)}` as Hex, name: "codex" }), revoked]
+    const root = renderMe(data({ agents }), fakeDoc()) as unknown as FakeEl
+    const rows = all(root, ".agent")
+    expect(rows).toHaveLength(3)
+    // live or already revoked, the pointer is the same plain sentence — never a control
+    for (const [i, a] of agents.entries()) {
+      expect(rows[i]!.textContent).toContain(`To revoke: run mida revoke ${a.name} in your terminal.`)
+    }
+  })
+
+  it("the agents section states the page is read-only, and why the terminal owns revoking", () => {
+    const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
+    const sec = root.querySelector('[aria-labelledby="agents-title"]')
+    expect(sec).not.toBeNull()
+    expect(sec!.textContent).toContain(
+      "This page is read-only. Revoking happens in your terminal, where your other agents get the new key.",
+    )
+  })
+})
+
 // --- teardown: the five-minute hidden-tab rule and sign-out cleanup -----------------------------
 
 /**
  * The boot path's DOM surface, faked: armTeardown reads document/window globals through el(),
- * so the tests stub both. me-root carries a decrypted cell, a Revoke button and the pager —
- * the three things sign-out must neutralise.
+ * so the tests stub both. me-root carries a decrypted cell and the pager — the two things
+ * sign-out must neutralise.
  */
 function stubPageDom() {
   const els = new Map<string, FakeEl>()
@@ -470,24 +526,21 @@ describe("teardown — the five-minute rule runs while hidden, and sign-out disa
     const decrypted = new FakeEl("p")
     decrypted.setAttribute("data-decrypted", "1")
     decrypted.textContent = "the secret body"
-    const revoke = new FakeEl("button")
-    revoke.setAttribute("data-revoke-agent", "0x11")
     const more = new FakeEl("button")
     more.setAttribute("data-more", "")
     const root = dom.els.get("me-root")!
     root.appendChild(decrypted)
-    root.appendChild(revoke)
     root.appendChild(more)
     const ended = { n: 0 }
     const dropped = { n: 0 }
     armTeardown({ end: () => void (ended.n += 1) }, () => void (dropped.n += 1))
-    return { dom, decrypted, revoke, more, ended, dropped }
+    return { dom, decrypted, more, ended, dropped }
   }
 
   it("hidden for five minutes ends the session even if the tab never comes back", () => {
     vi.useFakeTimers()
     try {
-      const { dom, decrypted, revoke, more, ended, dropped } = harness()
+      const { dom, decrypted, more, ended, dropped } = harness()
       dom.doc.hidden = true
       dom.fire(dom.docListeners, "visibilitychange")
       // still alive just under the limit, dead once it passes — no visibility return needed
@@ -497,7 +550,6 @@ describe("teardown — the five-minute rule runs while hidden, and sign-out disa
       expect(ended.n).toBe(1)
       expect(dropped.n).toBe(1)
       expect(decrypted.textContent).toBe("cleared — sign in again to read")
-      expect(revoke.disabled).toBe(true)
       expect(more.disabled).toBe(true)
       expect(dom.els.get("sign-in")!.hidden).toBe(false)
     } finally {
@@ -530,12 +582,11 @@ describe("teardown — the five-minute rule runs while hidden, and sign-out disa
 
   it("sign-out ends immediately: keys wiped, controls dead, store signer dropped — and end is idempotent", () => {
     try {
-      const { dom, decrypted, revoke, more, ended, dropped } = harness()
+      const { dom, decrypted, more, ended, dropped } = harness()
       dom.els.get("sign-out")!.click()
       expect(ended.n).toBe(1)
       expect(dropped.n).toBe(1)
       expect(decrypted.textContent).toBe("cleared — sign in again to read")
-      expect(revoke.disabled).toBe(true)
       expect(more.disabled).toBe(true)
       expect(dom.els.get("go")!.disabled).toBe(false)
       dom.fire(dom.winListeners, "pagehide") // a later pagehide does not end twice

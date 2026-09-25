@@ -1,9 +1,8 @@
-import { describe, expect, it, vi } from "vitest"
+import { describe, expect, it } from "vitest"
 import type { Address, Hex } from "viem"
 import { PERMISSION, buildOwnerLink, namespaceById, namespaceId } from "@mida/protocol"
-import type { OwnerLinkResult as FlowResult } from "@mida/protocol"
 import { deriveEpochKeyPair, deriveNamespaceSecret, hexOf } from "@mida/crypto"
-import { SponsorDidNotPay, SponsorPending } from "@mida/chain/browser"
+import { SponsorPending } from "@mida/chain/browser"
 import type { Deployment, SponsoredReceipt, TxKind } from "@mida/chain/browser"
 import { POLICY_HASH_V1 } from "@mida/grant-advisor"
 import { fakePrfOutput } from "@mida/fake-vault/browser"
@@ -14,19 +13,17 @@ import type { CredentialsContainerLike } from "../src/check/client.js"
 import { makeAssertion, makeKeyPair } from "./helpers.js"
 import type { FlowEnvironment } from "../src/owner/flows.js"
 import { readersAfterRevoke } from "../src/me/model.js"
-import { renderMe, wireRevokePanels } from "../src/me/page.js"
 import { repairReaderWrapsFromMe, revokeFromMe, shouldOfferRepair } from "../src/me/revoke.js"
 import type { MeRevokeResult } from "../src/me/revoke.js"
-import { BLOCKED_AT_STORE_TEXT } from "../src/me/sources.js"
-import type { AgentRow, MeData } from "../src/me/sources.js"
+import type { AgentRow } from "../src/me/sources.js"
 
 /**
  * Task 6 — revoke straight from /me, without a terminal link. revokeFromMe builds the same
  * request the terminal would (owner = the signed-in address, readers = every other agent the
  * page verified holds live READ), parses it through the shared owner-link validation, then runs
- * the same prepareRevoke → confirmRevoke pair. These tests drive it end to end against the same
- * fakes flows.test.ts uses, plus the page wiring: the panel, the click, and the re-read after
- * the result — a row is never flipped locally.
+ * the same prepareRevoke → confirmRevoke pair. The /me page itself ships read-only in this
+ * build — no button, no panel, no wiring imports this module — but the module and its tests
+ * stay in the repo for the in-page revoke's post-hackathon return.
  */
 
 const PRF = new Uint8Array(32).map((_, i) => i + 1)
@@ -280,7 +277,7 @@ function revokeChain(
   })
 }
 
-// --- /me rows and a mount for the page-wiring tests --------------------------------------------
+// --- /me rows the flow reads -------------------------------------------------------------------
 
 function agentRow(over: Partial<AgentRow> = {}): AgentRow {
   return {
@@ -293,129 +290,6 @@ function agentRow(over: Partial<AgentRow> = {}): AgentRow {
     unverified: false,
     ...over,
   }
-}
-
-function meData(over: Partial<MeData> = {}): MeData {
-  return {
-    owner: OWNER,
-    agents: [agentRow()],
-    records: [],
-    incomplete: [],
-    agentsUnavailable: null,
-    recordsUnavailable: false,
-    source: "index",
-    lag: { text: "9 s behind Monad", stale: false },
-    batchingOn: true,
-    batchedListComplete: true,
-    counts: null,
-    ...over,
-  }
-}
-
-// A minimal DOM faithful to the small surface the page uses — the convention every render test
-// in this package keeps (me-page.test.ts, entries-signing.test.ts).
-class FakeEl {
-  readonly tag: string
-  children: FakeEl[] = []
-  parent: FakeEl | null = null
-  readonly attrs = new Map<string, string>()
-  readonly listeners = new Map<string, (() => void)[]>()
-  hidden = false
-  disabled = false
-  #text = ""
-
-  constructor(tag: string) {
-    this.tag = tag
-  }
-
-  get textContent(): string {
-    return this.#text + this.children.map((c) => c.textContent).join("")
-  }
-  set textContent(value: string) {
-    this.#text = value
-    this.children = []
-  }
-
-  get className(): string {
-    return this.attrs.get("class") ?? ""
-  }
-  set className(value: string) {
-    this.attrs.set("class", value)
-  }
-
-  setAttribute(name: string, value: string): void {
-    this.attrs.set(name, value)
-  }
-  getAttribute(name: string): string | null {
-    return this.attrs.get(name) ?? null
-  }
-  hasAttribute(name: string): boolean {
-    return this.attrs.has(name)
-  }
-
-  appendChild(child: FakeEl): FakeEl {
-    child.parent = this
-    this.children.push(child)
-    return child
-  }
-  replaceChildren(...nodes: FakeEl[]): void {
-    for (const node of nodes) node.parent = this
-    this.children = [...nodes]
-  }
-  remove(): void {
-    if (this.parent !== null) {
-      const index = this.parent.children.indexOf(this)
-      if (index !== -1) this.parent.children.splice(index, 1)
-      this.parent = null
-    }
-    this.children = []
-  }
-
-  addEventListener(type: string, fn: () => void): void {
-    this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn])
-  }
-  click(): void {
-    for (const fn of this.listeners.get("click") ?? []) fn()
-  }
-
-  matches(sel: string): boolean {
-    const parts = sel.match(/[a-zA-Z][\w-]*|\.[\w-]+|\[[^\]]*\]/g) ?? []
-    for (const part of parts) {
-      if (part.startsWith(".")) {
-        if (!(this.attrs.get("class") ?? "").split(/\s+/).includes(part.slice(1))) return false
-      } else if (part.startsWith("[")) {
-        const inner = part.slice(1, -1)
-        const eq = inner.indexOf("=")
-        if (eq === -1) {
-          if (!this.attrs.has(inner)) return false
-        } else {
-          const name = inner.slice(0, eq).trim()
-          const value = inner.slice(eq + 1).trim().replace(/^["']|["']$/g, "")
-          if (this.attrs.get(name) !== value) return false
-        }
-      } else if (this.tag !== part.toLowerCase()) {
-        return false
-      }
-    }
-    return parts.length > 0
-  }
-
-  *walk(): Generator<FakeEl> {
-    for (const child of this.children) {
-      yield child
-      yield* child.walk()
-    }
-  }
-  querySelectorAll(sel: string): FakeEl[] {
-    return [...this.walk()].filter((el) => el.matches(sel))
-  }
-  querySelector(sel: string): FakeEl | null {
-    return this.querySelectorAll(sel)[0] ?? null
-  }
-}
-
-function fakeDoc(): Document {
-  return { createElement: (tag: string) => new FakeEl(tag) } as unknown as Document
 }
 
 // --- the flow ----------------------------------------------------------------------------------
@@ -540,141 +414,10 @@ describe("revokeFromMe", () => {
   })
 })
 
-// --- the panel and the click -------------------------------------------------------------------
-
-describe("/me revoke panel", () => {
-  it("the confirm panel carries the exact disclosure sentence", () => {
-    const root = renderMe(meData({ agents: [agentRow({ name: "codex" })] }), fakeDoc()) as unknown as FakeEl
-    const panel = root.querySelector("[data-confirm-panel]")
-    expect(panel).not.toBeNull()
-    expect(panel!.hidden).toBe(true) // closed until the row's own Revoke is clicked
-    const disclosure = panel!.querySelector("[data-revoke-disclosure]")
-    expect(disclosure).not.toBeNull()
-    expect(disclosure!.textContent).toBe(
-      "This stops future reads through Mida. It does not erase what codex already read.",
-    )
-  })
-
-  it("Revoke opens the panel; Confirm runs the flow; a pending result re-reads as blocked at the store", async () => {
-    const sends: SendRecord[] = []
-    const apiCalls: string[] = []
-    const wraps: WrapRecord[] = []
-    const sponsor = {
-      async send(): Promise<SponsoredReceipt> {
-        throw new SponsorPending(`0x${"ee".repeat(32)}` as Hex)
-      },
-    }
-    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends), sponsor })
-    const doc = fakeDoc()
-    const mount = new FakeEl("div")
-    let agents = [
-      agentRow({ agentId: AGENT_ID, name: "codex" }),
-      agentRow({ agentId: SURVIVOR_A, name: "claude-code" }),
-    ]
-    let seen: FlowResult | undefined
-    let reloads = 0
-    // reload stands in for loadMe: a pending send leaves the store deny staged, so the re-read
-    // reports the row blocked at the store — exactly what loadMe would produce.
-    const render = (): void => {
-      const root = renderMe(meData({ agents }), doc) as unknown as FakeEl
-      mount.replaceChildren(root)
-      wireRevokePanels(root as unknown as HTMLElement, doc, agents, {
-        run: (agent, progress) =>
-          revokeFromMe({ ...env, progress }, { signedInOwner: OWNER, agentId: agent.agentId, agents }).then((r) => {
-            seen = r
-            return r
-          }),
-        reload: () => {
-          reloads += 1
-          agents = [
-            agentRow({ agentId: AGENT_ID, name: "codex", readLive: false, blockedAtStore: true }),
-            agentRow({ agentId: SURVIVOR_A, name: "claude-code" }),
-          ]
-          render()
-        },
-      })
-    }
-    render()
-    const revoke = mount
-      .querySelectorAll("[data-revoke-agent]")
-      .find((b) => b.getAttribute("data-revoke-agent") === AGENT_ID)
-    expect(revoke).not.toBeNull()
-    revoke!.click()
-    const panel = mount.querySelector("[data-confirm-panel]")
-    expect(panel!.hidden).toBe(false)
-    const confirm = panel!.querySelector("[data-revoke-confirm]")
-    expect(confirm).not.toBeNull()
-    confirm!.click()
-    await vi.waitFor(() => {
-      expect(mount.textContent).toContain(BLOCKED_AT_STORE_TEXT)
-    })
-    expect(seen?.status).toBe("pending")
-    expect(reloads).toBe(1)
-    // the row is re-read, not flipped locally: the first agent's row now shows the store block
-    const row = mount.querySelectorAll(".agent")[0]!
-    expect(row.textContent).toContain(BLOCKED_AT_STORE_TEXT)
-    expect(row.textContent).not.toContain("Can read")
-    expect(apiCalls).toEqual(["api:requestRevocationDeny"])
-  })
-
-  it("a refused sponsor leaves the row able to read and the panel shows the reason", async () => {
-    const sends: SendRecord[] = []
-    const apiCalls: string[] = []
-    const wraps: WrapRecord[] = []
-    const sponsor = {
-      async send(): Promise<SponsoredReceipt> {
-        throw new SponsorDidNotPay("quota exhausted")
-      },
-    }
-    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends), sponsor })
-    const doc = fakeDoc()
-    const mount = new FakeEl("div")
-    const agents = [agentRow({ agentId: AGENT_ID, name: "codex" })]
-    let seen: FlowResult | undefined
-    let reloads = 0
-    const root = renderMe(meData({ agents }), doc) as unknown as FakeEl
-    mount.replaceChildren(root)
-    wireRevokePanels(root as unknown as HTMLElement, doc, agents, {
-      run: (agent, progress) =>
-        revokeFromMe({ ...env, progress }, { signedInOwner: OWNER, agentId: agent.agentId, agents }).then((r) => {
-          seen = r
-          return r
-        }),
-      reload: () => {
-        reloads += 1
-      },
-    })
-    mount.querySelector("[data-revoke-agent]")!.click()
-    mount.querySelector("[data-revoke-confirm]")!.click()
-    await vi.waitFor(() => {
-      expect(seen).not.toBeUndefined()
-      expect(seen!.status).toBe("failed")
-    })
-    expect(reloads).toBe(0) // nothing landed — the page does not re-read as if it had
-    // the panel carries the reason and the row still reads "Can read"
-    const status = mount.querySelector("[data-revoke-status]")
-    expect(status!.hidden).toBe(false)
-    expect(status!.textContent).toContain("quota exhausted")
-    expect(mount.querySelector(".agent")!.textContent).toContain("Can read")
-  })
-})
-
-// --- F3: surviving readers, partial wrap failures, the repair action, tx-bearing reload ------
+// --- F3: surviving readers, partial wrap failures ----------------------------------------------
 
 describe("F3 — surviving agents always get the new key", () => {
   const UNVERIFIED: Hex = `0x${"66".repeat(32)}`
-
-  function grantRow(over: Partial<AgentRow["grants"][number]> = {}): AgentRow["grants"][number] {
-    return {
-      namespaceId: NS_ID,
-      area: "preferences.communication",
-      permissions: PERMISSION.READ,
-      capabilityId: CAP_ID,
-      status: { label: "Can read", flagged: false, unchecked: false },
-      approvedTx: null,
-      ...over,
-    }
-  }
 
   it("a row the page could not verify is still offered to the chain — and re-wrapped when the chain says READ", async () => {
     const sends: SendRecord[] = []
@@ -717,105 +460,6 @@ describe("F3 — surviving agents always get the new key", () => {
     expect(result.rewrapFailed[0]!.reason).toContain("store write refused")
   })
 
-  it("a pending revoke offers the repair action — running it re-wraps the survivors", async () => {
-    const sends: SendRecord[] = []
-    const apiCalls: string[] = []
-    const wraps: WrapRecord[] = []
-    const sponsor = {
-      async send(): Promise<SponsoredReceipt> {
-        throw new SponsorPending(`0x${"ee".repeat(32)}` as Hex)
-      },
-    }
-    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends), sponsor })
-    const doc = fakeDoc()
-    const mount = new FakeEl("div")
-    const agents = [
-      agentRow({ agentId: AGENT_ID, name: "codex", grants: [grantRow()] }),
-      agentRow({ agentId: SURVIVOR_A, name: "claude-code", grants: [grantRow({ capabilityId: `0x${"56".repeat(32)}` as Hex })] }),
-    ]
-    // the same contract the boot path keeps: repairOffered survives the reload, the repair
-    // callback re-reads the world, and the epochs the revoke was built against gate the action
-    let repairOffered = false
-    let repairEpochs: { namespaceId: Hex; epoch: bigint }[] = []
-    const render = (): void => {
-      const root = renderMe(meData({ agents }), doc) as unknown as FakeEl
-      mount.replaceChildren(root)
-      wireRevokePanels(root as unknown as HTMLElement, doc, agents, {
-        run: async (agent, progress) => {
-          const result = await revokeFromMe({ ...env, progress }, { signedInOwner: OWNER, agentId: agent.agentId, agents })
-          if (result.status === "pending" || result.rewrapFailed.length > 0) {
-            repairOffered = true
-            repairEpochs = result.epochsAtRevoke
-          }
-          return result
-        },
-        reload: () => {
-          render()
-        },
-        repair: !repairOffered
-          ? undefined
-          : (progress) =>
-              repairReaderWrapsFromMe({ ...env, progress }, { signedInOwner: OWNER, agents, epochsAtRevoke: repairEpochs }),
-      })
-    }
-    render()
-    expect(mount.querySelector("[data-repair-wraps]")).toBeNull() // nothing offered before a revoke
-    mount.querySelector("[data-revoke-agent]")!.click()
-    mount.querySelector("[data-revoke-confirm]")!.click()
-    await vi.waitFor(() => {
-      expect(mount.querySelector("[data-repair-wraps]")).not.toBeNull()
-    })
-    // clicking while the chain still reports the pre-rotation epoch is refused in words — the
-    // repair never opens a ceremony on the old key
-    mount.querySelector("[data-repair-run]")!.click()
-    await vi.waitFor(() => {
-      expect(mount.textContent).toContain("Waiting for the revoke to land on Monad")
-    })
-    expect(wraps).toHaveLength(0)
-    // the pending transaction lands — the chain's required epoch moves, and the next click runs
-    sends.push({ functionName: "revokeAgentAndRotate", kind: "revoke.agent" })
-    mount.querySelector("[data-repair-run]")!.click()
-    await vi.waitFor(() => {
-      // the survivor got the NEW epoch's wrap; the revoked agent was skipped by the chain's
-      // own hasAuthority check
-      expect(wraps.some((w) => w.agentId === SURVIVOR_A && w.namespaceId === NS_ID && w.readEpoch === "2")).toBe(true)
-    })
-    expect(wraps.some((w) => w.agentId === AGENT_ID)).toBe(false)
-    // a clean run retires the action
-    await vi.waitFor(() => {
-      expect(mount.querySelector("[data-repair-wraps]")!.hidden).toBe(true)
-    })
-  })
-
-  it("a revoke result carrying a transaction — even a failed one — re-reads the page", async () => {
-    const doc = fakeDoc()
-    const mount = new FakeEl("div")
-    const agents = [agentRow({ agentId: AGENT_ID, name: "codex" })]
-    const root = renderMe(meData({ agents }), doc) as unknown as FakeEl
-    mount.replaceChildren(root)
-    let reloads = 0
-    wireRevokePanels(root as unknown as HTMLElement, doc, agents, {
-      run: async () =>
-        ({
-          v: 1,
-          status: "failed",
-          nonce: NONCE,
-          requestHash: `0x${"ab".repeat(32)}` as Hex,
-          owner: OWNER,
-          transactions: [`0x${"bb".repeat(32)}` as Hex],
-          operations: [],
-          reason: "the send landed; a later step failed",
-        }) satisfies FlowResult,
-      reload: () => {
-        reloads += 1
-      },
-    })
-    mount.querySelector("[data-revoke-agent]")!.click()
-    mount.querySelector("[data-revoke-confirm]")!.click()
-    await vi.waitFor(() => {
-      expect(reloads).toBe(1)
-    })
-  })
 })
 
 // --- H1: a revoke without a complete agent list would rotate the key for nobody ---------------
