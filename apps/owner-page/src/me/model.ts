@@ -3,7 +3,10 @@ export interface Chips { read: boolean; write: boolean; updateOwn: boolean; upda
 export type Lane = "direct" | "batched"
 // "unverified" means the chain answered and the record is not what it claimed; "unknown" means
 // the chain check itself could not run — a failed read must never read as "not on Monad".
-export type AnchorState = "anchored" | "pending" | "unverified" | "unknown"
+// "blocked" is a pending save whose author can no longer write: the store's deny list names them
+// (a revoke is pending on Monad, or the store already holds the row HELD) or Monad's authority
+// is gone — the save is parked or dead, never merely "waiting".
+export type AnchorState = "anchored" | "pending" | "unverified" | "unknown" | "blocked"
 export type Badge = { kind: "you" | "agent" | "unknown"; text: string }
 
 // Bit values are PERMISSION in packages/protocol/src/constants.ts:1 — duplicated here on purpose so

@@ -324,6 +324,10 @@ function renderRecordRow(doc: Document, row: RecordRow, open: OpenRow | undefine
   tr.appendChild(anchor)
   if (row.state === "pending") {
     anchor.appendChild(elOf(doc, "span", "badge b-warn", "Pending anchor"))
+  } else if (row.state === "blocked") {
+    // The store holds it or Monad already refuses it — a pending revoke or a dead grant, not a
+    // queue delay. It stays out of "pending" so the owner never mistakes it for a slow anchor.
+    anchor.appendChild(elOf(doc, "span", "badge b-bad", "Blocked — author denied or no longer authorized"))
   } else if (row.state === "unknown") {
     // The check itself never ran — this is not a verdict, so it must not wear "not on Monad".
     anchor.appendChild(elOf(doc, "span", "badge b-warn", "could not check Monad just now"))
@@ -611,6 +615,8 @@ function livePorts(env: FlowEnvironment, session: MeSession, indexUrl: string | 
       ownerGrantLogs: (owner) => ownerGrantLogs(context, owner),
       agentIdOfSigner: (signer) => reader.agentIdOfSigner(signer),
       getAgent: (agentId) => reader.getAgent(agentId),
+      hasAuthority: (owner, agentId, namespaceId, permission, provenancePolicy) =>
+        reader.hasAuthority(owner, agentId, namespaceId, permission, provenancePolicy),
       latestTimestamp: async () => Number(await latestTimestamp(context)),
       latestBlock: () => context.publicClient.getBlockNumber(),
     },

@@ -18,6 +18,8 @@
 
 import { recoverTypedDataAddress, zeroHash } from "viem"
 import {
+  PERMISSION,
+  PROVENANCE_POLICY,
   batchLeafHash,
   batchSaveStructHash,
   batchSaveTypedData,
@@ -165,6 +167,13 @@ export interface MePorts {
     ownerGrantLogs(owner: Address): Promise<GrantLog[]>
     agentIdOfSigner(signer: Address): Promise<Hex | null>
     getAgent(agentId: Hex): Promise<AgentRecord | null>
+    /**
+     * Monad's live write authority for one agent relationship — the same question the contract
+     * asks at anchor time. The pending-row label runs it so a save whose author lost its grant
+     * (a revoke that landed, or one still pending under an already-rotated epoch) reads "blocked",
+     * never "waiting".
+     */
+    hasAuthority(owner: Address, agentId: Hex, namespaceId: Hex, permission: number, provenancePolicy: number): Promise<boolean>
     latestTimestamp(): Promise<number>
     /** eth_blockNumber — the lag owed to the owner is measured against this, not the index's say-so. */
     latestBlock(): Promise<bigint>
@@ -947,6 +956,48 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
   const anchorBlockOf = memo((batchId: Hex) => safe(() => ports.chain.batchBlock(batchId)))
   const blockTimeOf = memo((block: bigint) => safe(() => ports.chain.blockTime(block)))
 
+  // --- pending verdicts: a queued/held save is judged by the same two questions the batcher ---
+  // re-asks every tick — is the author on the store's deny list, and does Monad still grant the
+  // write. A row that fails either is "blocked", never merely "waiting". null means the Monad
+  // read itself failed: the check did not run, so the row is "unknown", not acquitted.
+  const pendingWriteAllowed = async (
+    message: BatchSaveMessage,
+    author: Hex,
+    nsId: Hex,
+  ): Promise<boolean | null> => {
+    const ask = (permission: number) =>
+      safe(() =>
+        ports.chain.hasAuthority(owner, author, nsId, permission, PROVENANCE_POLICY.ALLOW_INFERENCE),
+      )
+    if (message.parentId === zeroHash) return await ask(PERMISSION.CREATE)
+    // Replacement: SUPERSEDE_OWN when the author opened the lineage; SUPERSEDE_ANY otherwise —
+    // the same disjunction BatchAnchor applies at anchor time.
+    const own = sameHex(message.rootAuthor, author) ? await ask(PERMISSION.SUPERSEDE_OWN) : false
+    if (own === true) return true
+    const any = await ask(PERMISSION.SUPERSEDE_ANY)
+    if (any === true) return true
+    return own === null || any === null ? null : false
+  }
+
+  // A capability-level deny names a grant, not an agent — the capability row is the only link
+  // from it to the author this page can test. Memoized: the list is short and shared by rows.
+  const deniedCapabilityOf = memo((capabilityId: string) =>
+    safe(() => ports.chain.getCapability(capabilityId as Hex)),
+  )
+  const capabilityDenyHits = async (candidates: Hex[], nsId: Hex): Promise<boolean> => {
+    for (const capabilityId of deniedCapabilities) {
+      const capability = await deniedCapabilityOf(capabilityId)
+      if (
+        capability !== null &&
+        candidates.some((id) => sameHex(capability.agentId, id)) &&
+        sameHex(capability.namespaceId, nsId)
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
   for (const { item, namespaceId: listedUnder } of listedBatched) {
     const message = wireMessageOf(item)
     const candidates: Hex[] = []
@@ -1029,6 +1080,30 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
         state = "unknown"
       } else {
         state = "unverified"
+      }
+    } else {
+      // QUEUED/SUBMITTED is still in line; HELD is the store's own verdict that the author is
+      // denied. The batcher re-asks the same two questions every tick — deny list and Monad's
+      // authority — so this label runs them too: a save that can never anchor must never read
+      // as merely "waiting to be anchored".
+      const saveNamespace =
+        message?.namespaceId ?? (indexRow?.namespaceId as Hex | undefined) ?? listedUnder
+      const denied =
+        item.state === "HELD" ||
+        candidates.some((id) => deniedAgents.has(lower(id))) ||
+        (await capabilityDenyHits(candidates, saveNamespace))
+      if (denied) {
+        state = "blocked"
+      } else {
+        const author = candidates[0]
+        if (message === null || author === undefined) {
+          // No author or decoded message to judge — the row is genuinely just waiting.
+          state = "pending"
+        } else {
+          const allowed = await pendingWriteAllowed(message, author, saveNamespace)
+          // A Monad read that never returned means the check did not run — "unknown", not a pass.
+          state = allowed === null ? "unknown" : allowed ? "pending" : "blocked"
+        }
       }
     }
     // An anchored save's stamp is the anchor block's own timestamp — the store's receivedAt is

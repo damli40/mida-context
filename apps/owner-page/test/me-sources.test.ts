@@ -194,6 +194,9 @@ function world() {
     grantLogsError: null as Error | null,
     agentRecords: new Map<string, AgentRecord>([[AGENT_ID.toLowerCase(), AGENT_RECORD]]),
     signerAgents: new Map<string, Hex>([[AGENT_KEY.address.toLowerCase(), AGENT_ID]]),
+    // pending-row write checks — key: `${agentId}:${permission}`; absent means authorized
+    authorities: new Map<string, boolean>(),
+    authorityError: null as Error | null,
     chainTime: NOW + 5,
     // Monad's own head — the lag the page owes the owner is measured against this, never
     // against the index's self-reported sourceBlock
@@ -274,6 +277,10 @@ function world() {
       },
       agentIdOfSigner: async (signer) => state.signerAgents.get(signer.toLowerCase()) ?? null,
       getAgent: async (agentId) => state.agentRecords.get(agentId.toLowerCase()) ?? null,
+      hasAuthority: async (_owner, agentId, _namespaceId, permission) => {
+        if (state.authorityError !== null) throw state.authorityError
+        return state.authorities.get(`${agentId.toLowerCase()}:${permission}`) ?? true
+      },
       latestTimestamp: async () => state.chainTime,
       latestBlock: async () => {
         if (state.chainBlockError !== null) throw state.chainBlockError
@@ -285,15 +292,19 @@ function world() {
 }
 
 /** One sealed, signed batched save — the same fixture shape verifyBatchedItem passes on. */
-async function makeBatchedItem(opts: { anchored?: boolean; owner?: Address } = {}) {
+async function makeBatchedItem(
+  opts: { anchored?: boolean; owner?: Address; agentId?: Hex; key?: typeof AGENT_KEY; nonce?: Hex } = {},
+) {
   const anchored = opts.anchored ?? true
   const owner = opts.owner ?? OWNER
-  const objectNonce = `0x${"99".repeat(32)}` as Hex
+  const agent = opts.agentId ?? AGENT_ID
+  const key = opts.key ?? AGENT_KEY
+  const objectNonce = opts.nonce ?? (`0x${"99".repeat(32)}` as Hex)
   const contextId = batchContextId({
     chainId: DEPLOYMENT.chainId,
     batchAnchor: ANCHOR,
     owner,
-    agentId: AGENT_ID,
+    agentId: agent,
     namespaceId: NS,
     parentId: zeroHash,
     objectNonce,
@@ -325,12 +336,12 @@ async function makeBatchedItem(opts: { anchored?: boolean; owner?: Address } = {
     kind: CONTEXT_KIND.EPISODE,
     provenanceSource: PROVENANCE_SOURCE.AGENT_INFERRED,
   }
-  const signature = await AGENT_KEY.signTypedData(
+  const signature = await key.signTypedData(
     batchSaveTypedData({ chainId: DEPLOYMENT.chainId, batchAnchor: ANCHOR, message }) as never,
   )
   // A new lineage's contract lineageId is the new record's own contextId.
   const lineageId = contextId
-  const leaf = batchLeafHash({ contextId, agentId: AGENT_ID, lineageId, version: 1, structHash: batchSaveStructHash(message) })
+  const leaf = batchLeafHash({ contextId, agentId: agent, lineageId, version: 1, structHash: batchSaveStructHash(message) })
   const leaves = [leaf, `0x${"de".repeat(32)}` as Hex]
   const root = merkleRoot(leaves)
   const proof = merkleProof(leaves, 0)
@@ -991,5 +1002,105 @@ describe("loadMe — one BatchAnchor, the deployment's", () => {
     const data = await loadMe(OWNER, ports)
     expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("anchored")
     expect(data.incomplete.some((t) => t.includes("different batch contract"))).toBe(false)
+  })
+})
+
+describe("loadMe — a pending save reads blocked when its author cannot write", () => {
+  // in-3 I7: while a revoke is pending on Monad the store hold (HELD) or the deny list makes the
+  // row "blocked", never "pending"; the same goes for an author Monad itself no longer grants.
+
+  it("a QUEUED save by a deny-listed agent reads blocked", async () => {
+    const { state, ports } = world()
+    const { item, contextId } = await makeBatchedItem({ anchored: false })
+    state.batched.set(NS, [item])
+    state.denies = [
+      { intentId: `0x${"09".repeat(32)}`, state: "active", target: { kind: "agent", agentId: AGENT_ID }, agentEpochAtIntent: null } as RevocationIntentView,
+    ]
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("blocked")
+    // Blocked is not pending — the headline count must not claim it is still waiting.
+    expect(data.counts?.pending).toBe(0)
+  })
+
+  it("a HELD save reads blocked on the store's own verdict, deny list or not", async () => {
+    const { state, ports } = world()
+    const { item, contextId } = await makeBatchedItem({ anchored: false })
+    item.state = "HELD"
+    state.batched.set(NS, [item])
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("blocked")
+  })
+
+  it("a QUEUED save whose author lost Monad authority reads blocked", async () => {
+    const { state, ports } = world()
+    const { item, contextId } = await makeBatchedItem({ anchored: false })
+    state.batched.set(NS, [item])
+    // The revoke already landed: CREATE is dead for this owner+agent+namespace.
+    state.authorities.set(`${AGENT_ID.toLowerCase()}:2`, false) // PERMISSION.CREATE
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("blocked")
+  })
+
+  it("a QUEUED save by a live, authorized agent still reads pending", async () => {
+    const { state, ports } = world()
+    const { item, contextId } = await makeBatchedItem({ anchored: false })
+    state.batched.set(NS, [item])
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("pending")
+    expect(data.counts?.pending).toBe(1)
+  })
+
+  it("an unrelated agent's QUEUED save stays pending beside a denied one", async () => {
+    const { state, ports } = world()
+    const OTHER_KEY = privateKeyToAccount(`0x${"b6".repeat(32)}` as Hex)
+    const denied = await makeBatchedItem({ anchored: false })
+    const other = await makeBatchedItem({
+      anchored: false,
+      key: OTHER_KEY,
+      agentId: OTHER_ID,
+      nonce: `0x${"88".repeat(32)}` as Hex,
+    })
+    state.signerAgents.set(OTHER_KEY.address.toLowerCase(), OTHER_ID)
+    state.batched.set(NS, [denied.item, other.item])
+    state.denies = [
+      { intentId: `0x${"09".repeat(32)}`, state: "active", target: { kind: "agent", agentId: AGENT_ID }, agentEpochAtIntent: null } as RevocationIntentView,
+    ]
+    const data = await loadMe(OWNER, ports)
+    const rows = data.records.filter((r) => r.lane === "batched")
+    expect(rows.find((r) => r.contextId === denied.contextId)!.state).toBe("blocked")
+    expect(rows.find((r) => r.contextId === other.contextId)!.state).toBe("pending")
+  })
+
+  it("a capability-level deny blocks the save of the agent it names", async () => {
+    const { state, ports } = world()
+    const { item, contextId } = await makeBatchedItem({ anchored: false })
+    state.batched.set(NS, [item])
+    state.denies = [
+      { intentId: `0x${"09".repeat(32)}`, state: "active", target: { kind: "capability", capabilityId: CAP_ID }, agentEpochAtIntent: null } as RevocationIntentView,
+    ]
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("blocked")
+  })
+
+  it("a capability deny for another agent does not block this save", async () => {
+    const { state, ports } = world()
+    const { item, contextId } = await makeBatchedItem({ anchored: false })
+    state.batched.set(NS, [item])
+    // CAP2_ID belongs to a different agent — the deny row resolves away from this author.
+    state.capabilities.set(CAP2_ID.toLowerCase(), capabilityView({ agentId: OTHER_ID }))
+    state.denies = [
+      { intentId: `0x${"09".repeat(32)}`, state: "active", target: { kind: "capability", capabilityId: CAP2_ID }, agentEpochAtIntent: null } as RevocationIntentView,
+    ]
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("pending")
+  })
+
+  it("a hasAuthority RPC failure reads unknown — the check never ran", async () => {
+    const { state, ports } = world()
+    const { item, contextId } = await makeBatchedItem({ anchored: false })
+    state.batched.set(NS, [item])
+    state.authorityError = new Error("rpc down")
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("unknown")
   })
 })
