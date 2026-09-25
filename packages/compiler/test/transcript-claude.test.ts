@@ -383,6 +383,49 @@ describe("readConversation", () => {
     expect(r.text).toContain("SUMMARY-MIDDLE-MARKER")
   })
 
+  // L8: a custom slash command that is NOT the pinned request is still a user
+  // turn — rendered "/name args" — while built-ins stay hidden. The echo's raw
+  // tags never reach the model either way.
+  it("a later custom slash command renders as a user turn; built-ins stay hidden (L8)", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "build the parser" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "started" }] } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "<command-message>brainstorm</command-message>\n<command-name>/brainstorm</command-name>\n<command-args>the retry policy</command-args>" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "brainstormed" }] } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "<command-message>model</command-message>\n<command-name>/model</command-name>\n<command-args>sonnet</command-args>" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "switched" }] } }),
+    ])
+    const r = readConversation(t)
+    expect(r.firstUserMessage).toBe("build the parser")
+    expect(r.text).toContain("user:\n/brainstorm the retry policy")
+    expect(r.text).not.toContain("/model")
+    expect(r.text).not.toContain("command-name")
+  })
+
+  // L8b: IDE-injected context blocks strip like every other scaffold — they
+  // can precede the ask but can never BE it, and an absolute path from one
+  // must never land in the saved request.
+  it("IDE-injected file and selection blocks strip off the request (L8)", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "<ide_opened_file>/Users/x/proj/src/a.ts</ide_opened_file>\n<ide_selection>the retry loop</ide_selection>\nfix the flaky reconnect" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "fixing" }] } }),
+    ])
+    const r = readConversation(t)
+    expect(r.firstUserMessage).toBe("fix the flaky reconnect")
+    expect(r.text).not.toContain("/Users/x/proj")
+    // and a line that is ONLY an IDE block is plumbing, not the request
+    const dir2 = tmpdir()
+    const only = writeTranscript(dir2, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "<ide_opened_file>/abs/secret-path.ts</ide_opened_file>" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "the real ask" } }),
+    ])
+    const r2 = readConversation(only)
+    expect(r2.firstUserMessage).toBe("the real ask")
+    expect(r2.openedWithScaffolding).toBe(true)
+  })
+
   // L4: a prompt that QUOTES the command tag in prose is not a command echo —
   // the tag has to open the line (after leading whitespace) for the line to be
   // plumbing. Otherwise the user's words would be replaced by the quoted name.

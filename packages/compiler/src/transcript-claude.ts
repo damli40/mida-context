@@ -131,11 +131,16 @@ const CLAUDE_SCAFFOLD_PREFIXES = [
   "<bash-stderr>",
   "<system-reminder>",
   "<user-prompt-submit-hook>",
+  // IDE-injected context — a file path or selection is bookkeeping, never the
+  // user's words, and must not become the saved request (L8)
+  "<ide_opened_file>",
+  "<ide_selection>",
 ]
 
 // The scaffold prefixes as bare tag names, for block stripping below.
 const CLAUDE_SCAFFOLD_TAGS = new Set(CLAUDE_SCAFFOLD_PREFIXES.map((p) => p.slice(1, -1)))
-const SCAFFOLD_OPEN = /^<([a-z][a-z0-9-]*)(?:\s[^>]*)?>/
+// Tag names can carry underscores (ide_opened_file) — the class must too.
+const SCAFFOLD_OPEN = /^<([a-z][a-z0-9_-]*)(?:\s[^>]*)?>/
 
 // Strip leading injected <tag>…</tag> blocks (plus whitespace between) from a
 // user text. A real prompt may OPEN on a <system-reminder> — the reminder is
@@ -395,11 +400,21 @@ export function readConversation(
     // itself — a user line whose text parts all strip to nothing produces no
     // block, while a reminder next to a tool_result leaves the result behind.
     const dropped = isUser && (obj.isMeta === true || obj.isCompactSummary === true)
+    // A custom slash command that is NOT the pinned request is still a user
+    // turn — rendered as "/name args" so the model sees the ask, never the raw
+    // echo tags (L8). Built-ins return null from the same check and stay
+    // hidden, and a picked echo already rendered once as the pinned request.
+    const laterCommand =
+      !picked && !dropped && userText !== ""
+        ? slashCommandRequest(userText, neighbourLocalCommand(i))
+        : null
     const block = picked
       ? `L${label} user:\n${scrubSecrets(requestText!)}`
       : dropped
         ? null
-        : renderMessage(label, obj)
+        : laterCommand !== null
+          ? `L${label} user:\n${scrubSecrets(laterCommand)}`
+          : renderMessage(label, obj)
     if (block) {
       msgs.push({ role: obj.type, block })
       if (picked) pinIdx = msgs.length - 1
