@@ -27,8 +27,8 @@ import type { Network } from "./runtime.js"
 import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag } from "./network.js"
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
-import { approve, authorNamesFor, deploymentMismatchError, init, readCheckpoints, requestAccess, revoke, saveCheckpoint } from "./skeleton.js"
-import { listAgentNames, loadAgentIdentity, loadOwnerMode } from "./keys.js"
+import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint } from "./skeleton.js"
+import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerMode } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
 import { migrate, migrateUndo } from "./migrate.js"
 import { OwnerLinkOutcome, approvePasskey, initPasskey, provisionPasskeyAgents, revokePasskey } from "./owner-link/flows.js"
@@ -51,7 +51,7 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
  */
 const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | batching on|off | migrate [--undo]" +
+  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]" +
   "   (tool = claude-code | codex | claude-desktop | cursor; agent = claude-code | codex | assistant — or the identity a client installs)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
 export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", ...WITH_AGENT]
@@ -444,6 +444,9 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       deps.print(`next: run \`mida approve ${client}\` in this folder`)
     } else if (command === "batching") {
       return await runBatching(runtime, argv[1], deps)
+    } else if (command === "revoke" && agent === "--all") {
+      if (argv.length !== 2) return usage()
+      return await revokeAll(runtime, deps)
     } else {
       const result = await revoke(runtime, agent)
       // The chain answer first, always — the per-agent key lines follow it (M3-D4). A wrap the
@@ -548,6 +551,76 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
     }
   }
   deps.print(`approved: ${approved.length === 0 ? "none" : approved.join(", ")}${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
+  return failed.length === 0 ? 0 : 1
+}
+
+/**
+ * The agents `revoke --all` lists: every registered identity that still holds an approval — a live
+ * capability on chain, or a grants.json left by a grant that completed while no revoked marker says
+ * it was taken back. The chain answers first; the local file only adds an agent the chain cannot
+ * show (a signed grant that was never proved, or one already dead the folder never heard about).
+ * A resolveAgentId failure propagates: a permission problem must never silently drop an agent from
+ * the list the owner is about to confirm.
+ */
+async function approvedAgents(runtime: ServiceRuntime): Promise<string[]> {
+  const held: string[] = []
+  for (const name of listAgentNames(runtime.home)) {
+    const agentId = await resolveAgentId(runtime, name)
+    if (await hasAnyLiveCapability(runtime, agentId) || (runtime.home.has(`agents/${name}/grants.json`) && !isRevoked(runtime.home, name))) {
+      held.push(name)
+    }
+  }
+  return held
+}
+
+/**
+ * `mida revoke --all`: the approved agents are listed, one typed yes confirms the batch, then each
+ * revoke runs in turn — the whole-agent revoke `mida revoke <agent>` performs, with its chain line,
+ * its "stops future reads" note and its per-agent key lines. A failure names itself and the next
+ * agent still runs; the last line is the verdict. Nobody approved says so and exits 0.
+ */
+async function revokeAll(runtime: Runtime, deps: CliDeps): Promise<number> {
+  const agents = await approvedAgents(runtime)
+  if (agents.length === 0) {
+    deps.print("nothing to revoke — no agent holds an approval")
+    return 0
+  }
+  for (const name of agents) deps.print(`${name} holds an approval`)
+  const prompt = deps.prompt ?? terminalPrompt
+  const drain = deps.drainInput ?? drainBufferedStdin
+  await drain()
+  if ((await prompt("Type yes to revoke all: ")).trim() !== "yes") {
+    deps.print("not revoked")
+    return 1
+  }
+  const revoked: string[] = []
+  const failed: string[] = []
+  for (const name of agents) {
+    try {
+      const result = await revoke(runtime, name)
+      revoked.push(name)
+      // the same per-agent lines a single revoke prints — the chain answer first, always (M3-D4)
+      deps.print(
+        result.transactionHashes.length === 0
+          ? `${name}: nothing to revoke`
+          : `revoked ${name} on chain${result.sponsored ? " (sponsored)" : ""} — tx ${result.transactionHashes.join(" ")}`,
+      )
+      if (result.transactionHashes.length > 0) {
+        deps.print(`This stops future reads through Mida. It does not erase what ${name} already read.`)
+      }
+      for (const other of result.rewrapped) deps.print(`new read key sent to ${other}`)
+      for (const failure of result.failed) {
+        deps.print(`could not send the new key to ${failure.name}: ${failure.reason} — run \`mida approve ${failure.name}\``)
+      }
+      if (result.repairError !== undefined) {
+        deps.print(`the key repair pass could not run: ${result.repairError} — run \`mida revoke ${name}\` again to retry it`)
+      }
+    } catch (error) {
+      deps.print(ownerRefusalLine("revoke", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry))
+      failed.push(`${name} (${refusalCode(error)})`)
+    }
+  }
+  deps.print(`revoked: ${revoked.length === 0 ? "none" : revoked.join(", ")}${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
   return failed.length === 0 ? 0 : 1
 }
 
@@ -840,6 +913,12 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
               : `the old approved-projects list was invalid; ${result.droppedRows} row(s) were dropped`,
           )
         }
+      } else if (command === "revoke" && agent === "--all") {
+        if (argv.length !== 2) {
+          deps.print(USAGE)
+          return 2
+        }
+        return await passkeyRevokeAll(session, deps, linkDeps)
       } else {
         const result = await revokePasskey(session, agent, linkDeps)
         deps.print(
@@ -910,6 +989,50 @@ async function passkeyApproveAll(session: ServiceRuntime, deps: CliDeps, linkDep
     }
   }
   deps.print(`approved: ${approved.length === 0 ? "none" : approved.join(", ")}${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
+  return failed.length === 0 ? 0 : 1
+}
+
+/**
+ * `mida revoke --all` on a passkey home: the approved agents are listed, one terminal yes confirms
+ * the batch, then ONE owner-link round per agent — the passkey is asked once per revocation and
+ * never once for the batch. A declined or failed agent names itself and the next still runs.
+ */
+async function passkeyRevokeAll(session: ServiceRuntime, deps: CliDeps, linkDeps: PasskeyDeps): Promise<number> {
+  const agents = await approvedAgents(session)
+  if (agents.length === 0) {
+    deps.print("nothing to revoke — no agent holds an approval")
+    return 0
+  }
+  for (const name of agents) deps.print(`${name} holds an approval`)
+  const prompt = deps.prompt ?? terminalPrompt
+  const drain = deps.drainInput ?? drainBufferedStdin
+  await drain()
+  if ((await prompt("Type yes to revoke all: ")).trim() !== "yes") {
+    deps.print("not revoked")
+    return 1
+  }
+  const revoked: string[] = []
+  const failed: string[] = []
+  for (const name of agents) {
+    try {
+      const result = await revokePasskey(session, name, linkDeps)
+      revoked.push(name)
+      deps.print(
+        result.nothingToRevoke || result.transactionHashes.length === 0
+          ? `${name}: nothing to revoke`
+          : `revoked ${name} on chain — tx ${result.transactionHashes.join(" ")}`,
+      )
+      if (!result.nothingToRevoke && result.transactionHashes.length > 0) {
+        deps.print(`This stops future reads through Mida. It does not erase what ${name} already read.`)
+      }
+      for (const other of result.rewrapped) deps.print(`new read key sent to ${other}`)
+    } catch (error) {
+      // A page outcome already IS the line the owner reads; a coded error goes through the mapper.
+      deps.print(error instanceof OwnerLinkOutcome ? error.line : ownerRefusalLine("revoke", name, error, undefined, deps.network.deployment.capabilityRegistry))
+      failed.push(`${name} (${error instanceof OwnerLinkOutcome ? "declined" : refusalCode(error)})`)
+    }
+  }
+  deps.print(`revoked: ${revoked.length === 0 ? "none" : revoked.join(", ")}${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
   return failed.length === 0 ? 0 : 1
 }
 

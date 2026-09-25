@@ -510,6 +510,90 @@ describe("the crude mida command", () => {
     home.remove("agents/cursor/pending-request.json")
   }, 300_000)
 
+  it("revoke --all lists every approved agent, asks once, and revokes each (I4)", async () => {
+    const lines: string[] = []
+    const asked: string[] = []
+    let lastBeforeAsk: string | undefined
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async (question) => { asked.push(question); lastBeforeAsk = lines.at(-1); return "yes" },
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // every agent that still holds an approval: the four project agents above plus assistant,
+    // whose general-assistance grant init sent at the start of this file
+    expect(await run2("revoke", "--all")).toBe(0)
+    expect(asked).toEqual(["Type yes to revoke all: "])
+    for (const name of ["assistant", "claude-code", "claude-desktop", "codex", "cursor"]) {
+      expect(lines).toContain(`${name} holds an approval`)
+      expect(lines.some((line) => line.startsWith(`revoked ${name} on chain`))).toBe(true)
+      expect(lines).toContain(`This stops future reads through Mida. It does not erase what ${name} already read.`)
+    }
+    // the whole list printed before the single ask — nothing was revoked sight-unseen
+    expect(lastBeforeAsk).toBe("cursor holds an approval")
+    expect(lines.at(-1)).toBe("revoked: assistant, claude-code, claude-desktop, codex, cursor")
+    // and a revocation is real: claude-code's read is refused now
+    expect(await run2("read", "claude-code", "proj-1")).toBe(1)
+    // a second run finds nobody approved — exit 0, no prompt at all
+    asked.length = 0
+    expect(await run2("revoke", "--all")).toBe(0)
+    expect(asked).toHaveLength(0)
+    expect(lines.at(-1)).toBe("nothing to revoke — no agent holds an approval")
+  }, 300_000)
+
+  it("revoke --all with anything but yes revokes nobody (I4)", async () => {
+    const lines: string[] = []
+    const asked: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        // yes to a single agent's own ask; the batch question is the one this test declines
+        prompt: async (question) => { asked.push(question); return question === "Type yes to revoke all: " ? "no" : "yes" },
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // re-approve one agent so the list is not empty — everything was revoked above
+    expect(await run2("request", "claude-code")).toBe(0)
+    expect(await run2("approve", "claude-code")).toBe(0)
+    asked.length = 0
+    expect(await run2("revoke", "--all")).toBe(1)
+    expect(asked).toEqual(["Type yes to revoke all: "])
+    expect(lines).toContain("claude-code holds an approval")
+    expect(lines).toContain("not revoked")
+    expect(lines.some((line) => line.startsWith("revoked "))).toBe(false)
+    // still really approved: no marker, and the read still goes through
+    expect(home.has("agents/claude-code/revoked.json")).toBe(false)
+    expect(await run2("read", "claude-code", "proj-1")).toBe(0)
+    // restore the all-revoked state the next test builds on
+    expect(await run2("revoke", "claude-code")).toBe(0)
+  }, 300_000)
+
+  it("revoke --all continues past a failing agent — the summary names both (I4)", async () => {
+    const lines: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async (question) => {
+          // cursor's records vanish between the batch's list and its turn — the batch must survive it
+          if (question === "Type yes to revoke all: ") {
+            for (const file of ["identity.json", "signer.json", "grants.json"]) home.remove(`agents/cursor/${file}`)
+          }
+          return "yes"
+        },
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // codex is really approved again; cursor is listed off the grants.json its revoke left —
+    // clearing the marker is exactly what `mida approve` does when it re-grants
+    expect(await run2("request", "codex")).toBe(0)
+    expect(await run2("approve", "codex")).toBe(0)
+    home.remove("agents/cursor/revoked.json")
+    expect(await run2("revoke", "--all")).toBe(1)
+    expect(lines.some((line) => line.startsWith("revoked codex on chain"))).toBe(true)
+    expect(lines).toContain("cursor is not set up on this machine — run `mida init` first")
+    expect(lines.at(-1)).toBe("revoked: codex; failed: cursor (agent-unidentified)")
+    // codex's revoke really landed even though cursor's failed
+    expect(home.has("agents/codex/revoked.json")).toBe(true)
+  }, 300_000)
+
   it("never prints a secret: no output line contains any key stored in the home folder", () => {
     const secrets: string[] = []
     const walk = (folder: string) => {
