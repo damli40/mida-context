@@ -400,7 +400,12 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     picked.agent = input.agent
     picked.source = "hook-compiler"
     picked.createdAt = now().toISOString()
-    picked.originalRequest = convo.firstUserMessage
+    // A transcript whose first user line is absent or was skipped as
+    // scaffolding yields no fresh pick — the previous checkpoint's request
+    // stands rather than being blanked out by one bad compile window.
+    const earlier = input.previous?.originalRequest
+    picked.originalRequest =
+      convo.firstUserMessage ?? (typeof earlier === "string" && earlier !== "" ? earlier : null)
 
     if (Array.isArray(picked.artifacts)) {
       picked.artifacts = picked.artifacts.map((a) => (typeof a === "string" ? rel(a) : a))

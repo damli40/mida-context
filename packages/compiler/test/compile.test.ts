@@ -77,6 +77,60 @@ afterEach(() => {
 })
 
 describe("compileCheckpoint", () => {
+  it("keeps the previous checkpoint's originalRequest when this transcript yields none (F3)", async () => {
+    // a resumed session can open on a bare tool_result — no user line carries a
+    // request, so the pick is empty and the earlier request must survive
+    const resumed = path.join(dir, "resumed.jsonl")
+    fs.writeFileSync(
+      resumed,
+      [
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "resumed output" }] } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "continuing" }] } }),
+      ].join("\n"),
+    )
+    const previous: Checkpoint = {
+      eventId: "evt-earlier",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: new Date().toISOString(),
+      objective: "earlier work",
+      originalRequest: "the earlier real request",
+      progress: [],
+      decisions: [],
+      rejected: [],
+      constraints: [],
+      artifacts: [],
+      unresolvedIssue: null,
+      nextAction: "next",
+      remainingPlan: [],
+      evidence: [],
+    }
+    const r = await compileCheckpoint({ ...base, transcriptPath: resumed, model: fake("good"), previous })
+    expect(r.ok && r.checkpoint.originalRequest).toBe("the earlier real request")
+  })
+
+  it("a fresh first user message wins over the previous checkpoint's originalRequest (F3)", async () => {
+    const previous: Checkpoint = {
+      eventId: "evt-earlier",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: new Date().toISOString(),
+      objective: "earlier work",
+      originalRequest: "the earlier real request",
+      progress: [],
+      decisions: [],
+      rejected: [],
+      constraints: [],
+      artifacts: [],
+      unresolvedIssue: null,
+      nextAction: "next",
+      remainingPlan: [],
+      evidence: [],
+    }
+    const r = await compileCheckpoint({ ...base, model: fake("good"), previous })
+    expect(r.ok && r.checkpoint.originalRequest).toBe("Build a rate limiter in 3 steps")
+  })
+
   it("stores the user's request by code and drops the model's own originalRequest", async () => {
     const r = await compileCheckpoint({ ...base, model: fake("extra") })
     expect(r.ok).toBe(true)
