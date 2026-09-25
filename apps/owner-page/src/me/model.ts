@@ -36,9 +36,16 @@ export function lagText(blocksBehind: number | null): { text: string; stale: boo
   return { text: `≈ ${seconds} s behind Monad`, stale: blocks > STALE_INDEX_BLOCKS }
 }
 
-export function readersAfterRevoke(agents: readonly { agentId: Hex; readLive: boolean }[], revoking: Hex): Hex[] {
+/**
+ * Every OTHER agent the page knows about, whatever state its rows showed — "could not verify" is
+ * a reason to ask the chain, not to skip the agent. confirmRevoke re-checks hasAuthority(READ)
+ * per rotated area before any wrap publishes, so a stale or unverifiable row can waste a read,
+ * never grant one; a row the page failed to check could still be a live reader the rotate locks
+ * out if it is left off the list.
+ */
+export function readersAfterRevoke(agents: readonly { agentId: Hex }[], revoking: Hex): Hex[] {
   const r = revoking.toLowerCase()
-  return agents.filter((a) => a.readLive && a.agentId.toLowerCase() !== r).map((a) => a.agentId)
+  return agents.filter((a) => a.agentId.toLowerCase() !== r).map((a) => a.agentId)
 }
 
 export interface GrantTruth { indexSaysLive: boolean; chainSaysValid: boolean | null }

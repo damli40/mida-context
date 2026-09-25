@@ -15,7 +15,7 @@ import { makeAssertion, makeKeyPair } from "./helpers.js"
 import type { FlowEnvironment } from "../src/owner/flows.js"
 import { readersAfterRevoke } from "../src/me/model.js"
 import { renderMe, wireRevokePanels } from "../src/me/page.js"
-import { revokeFromMe } from "../src/me/revoke.js"
+import { repairReaderWrapsFromMe, revokeFromMe } from "../src/me/revoke.js"
 import { BLOCKED_AT_STORE_TEXT } from "../src/me/sources.js"
 import type { AgentRow, MeData } from "../src/me/sources.js"
 
@@ -171,10 +171,11 @@ interface WrapRecord {
   readEpoch: string
 }
 
-function fakeApi(calls: string[], wraps: WrapRecord[]) {
+function fakeApi(calls: string[], wraps: WrapRecord[], failFor: Set<Hex> = new Set()) {
   return {
     async publishEpochWrap(wrap: WrapRecord) {
       calls.push("api:publishEpochWrap")
+      if (failFor.has(wrap.agentId)) throw new Error("store write refused")
       wraps.push(wrap)
       return { stored: true }
     },
@@ -216,6 +217,7 @@ function makeEnv(opts: {
   chain?: ReturnType<typeof fakeChain>
   sponsor?: { send: (call: { functionName: string }, kind: TxKind) => Promise<SponsoredReceipt> }
   releasedSecrets?: OwnerSecrets[]
+  wrapFailsFor?: Set<Hex>
 }): { env: FlowEnvironment; credentials: ReturnType<typeof fakeCredentials> } {
   const credentials = fakeCredentials(passkey, PRF.slice())
   const chain = opts.chain ?? fakeChain()
@@ -228,7 +230,7 @@ function makeEnv(opts: {
     storeUrl: "https://store.test",
     storage: store.storage,
     makeSponsor: () => sponsor,
-    makeApi: () => fakeApi(opts.apiCalls, opts.wraps) as never,
+    makeApi: () => fakeApi(opts.apiCalls, opts.wraps, opts.wrapFailsFor) as never,
     fetchManifest: async () => {
       throw new Error("revoke never fetches a manifest")
     },
@@ -239,10 +241,10 @@ function makeEnv(opts: {
 
 /**
  * One live READ grant on NS_ID for the revoked agent; two survivors keep READ on chain (the
- * post-send hasAuthority check), a stale reader is refused by that same recheck, and a
- * non-reader never enters the request's reader list at all.
+ * post-send hasAuthority check), and the chain's own recheck refuses everyone else — the
+ * request's reader list names every agent the page knows, whatever its rows claimed.
  */
-function revokeChain(sends: SendRecord[], reads?: ChainReads) {
+function revokeChain(sends: SendRecord[], reads?: ChainReads, liveReaders: readonly Hex[] = [SURVIVOR_A, SURVIVOR_B]) {
   return fakeChain({
     activeCapabilityIds: (args) => {
       reads?.active.push([...args])
@@ -264,7 +266,7 @@ function revokeChain(sends: SendRecord[], reads?: ChainReads) {
     }),
     hasAuthority: (args) => {
       reads?.authority.push([...args])
-      return args[1] === SURVIVOR_A || args[1] === SURVIVOR_B
+      return liveReaders.includes(args[1] as Hex)
     },
     epochPublicKey: (args) => epochKey(args[1] as Hex, args[2] as bigint),
   })
@@ -468,10 +470,11 @@ describe("revokeFromMe", () => {
     expect(sends.map((s) => s.functionName)).toEqual(["revokeAgentAndRotate"])
     // the store deny lands before the chain send — the pending state exists before Monad answers
     expect(apiCalls[0]).toBe("api:requestRevocationDeny")
-    // the reader list the flow worked was exactly the three named survivors — each re-checked
-    // against the chain (the flow's check, then publishReaderWraps' own) — and nobody else was
-    // ever queried: not the revoked agent, not the row without live READ.
-    expect(reads.authority.map((a) => a[1])).toEqual([SURVIVOR_A, SURVIVOR_A, SURVIVOR_B, SURVIVOR_B, STALE])
+    // the reader list the flow worked was every other agent the page knows — each re-checked
+    // against the chain (the flow's check, then publishReaderWraps' own). NONREADER and STALE
+    // are offered to the chain even though the page marked them unreadable/unverifiable; the
+    // chain's answer is what keeps their wraps unpublished.
+    expect(reads.authority.map((a) => a[1])).toEqual([SURVIVOR_A, SURVIVOR_A, SURVIVOR_B, SURVIVOR_B, NONREADER, STALE])
     for (const args of reads.authority) expect(args.slice(2)).toEqual([NS_ID, PERMISSION.READ, 0])
     // publishReaderWraps ran once per surviving reader for the one rotated area, publishing a
     // wrap for every registered epoch; the stale row the chain refused got nothing, and the
@@ -564,7 +567,7 @@ describe("/me revoke panel", () => {
     const render = (): void => {
       const root = renderMe(meData({ agents }), doc) as unknown as FakeEl
       mount.replaceChildren(root)
-      wireRevokePanels(root as unknown as HTMLElement, agents, {
+      wireRevokePanels(root as unknown as HTMLElement, doc, agents, {
         run: (agent, progress) =>
           revokeFromMe({ ...env, progress }, { signedInOwner: OWNER, agentId: agent.agentId, agents }).then((r) => {
             seen = r
@@ -620,7 +623,7 @@ describe("/me revoke panel", () => {
     let reloads = 0
     const root = renderMe(meData({ agents }), doc) as unknown as FakeEl
     mount.replaceChildren(root)
-    wireRevokePanels(root as unknown as HTMLElement, agents, {
+    wireRevokePanels(root as unknown as HTMLElement, doc, agents, {
       run: (agent, progress) =>
         revokeFromMe({ ...env, progress }, { signedInOwner: OWNER, agentId: agent.agentId, agents }).then((r) => {
           seen = r
@@ -642,5 +645,150 @@ describe("/me revoke panel", () => {
     expect(status!.hidden).toBe(false)
     expect(status!.textContent).toContain("quota exhausted")
     expect(mount.querySelector(".agent")!.textContent).toContain("Can read")
+  })
+})
+
+// --- F3: surviving readers, partial wrap failures, the repair action, tx-bearing reload ------
+
+describe("F3 — surviving agents always get the new key", () => {
+  const UNVERIFIED: Hex = `0x${"66".repeat(32)}`
+
+  function grantRow(over: Partial<AgentRow["grants"][number]> = {}): AgentRow["grants"][number] {
+    return {
+      namespaceId: NS_ID,
+      area: "preferences.communication",
+      permissions: PERMISSION.READ,
+      capabilityId: CAP_ID,
+      status: { label: "Can read", flagged: false },
+      approvedTx: null,
+      ...over,
+    }
+  }
+
+  it("a row the page could not verify is still offered to the chain — and re-wrapped when the chain says READ", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends, undefined, [UNVERIFIED]) })
+    const agents = [
+      agentRow({ agentId: AGENT_ID }),
+      // the page could not check this one — readLive false, no verdict — and yet it is a live
+      // reader on chain, so it must receive the rotated key or the revoke silently locks it out
+      agentRow({ agentId: UNVERIFIED, readLive: false }),
+    ]
+    const result = await revokeFromMe(env, { signedInOwner: OWNER, agentId: AGENT_ID, agents })
+    expect(result.status).toBe("success")
+    expect(wraps.some((w) => w.agentId === UNVERIFIED)).toBe(true)
+    expect(result.rewrapFailed).toEqual([])
+  })
+
+  it("one reader's publish failing never stops the rest — the failure is named on the result", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const { env } = makeEnv({
+      sends,
+      apiCalls,
+      wraps,
+      chain: revokeChain(sends),
+      wrapFailsFor: new Set<Hex>([SURVIVOR_A]),
+    })
+    const agents = [agentRow({ agentId: AGENT_ID }), agentRow({ agentId: SURVIVOR_A }), agentRow({ agentId: SURVIVOR_B })]
+    const result = await revokeFromMe(env, { signedInOwner: OWNER, agentId: AGENT_ID, agents })
+    // the revoke landed and the flow completed — a wrap failure is reported, not fatal
+    expect(result.status).toBe("success")
+    expect(sends.map((s) => s.functionName)).toEqual(["revokeAgentAndRotate"])
+    // SURVIVOR_B was still processed after SURVIVOR_A's publish threw
+    expect(wraps.map((w) => w.agentId)).toEqual([SURVIVOR_B, SURVIVOR_B])
+    expect(result.rewrapFailed).toHaveLength(1)
+    expect(result.rewrapFailed[0]!.agentId).toBe(SURVIVOR_A)
+    expect(result.rewrapFailed[0]!.namespaceId).toBe(NS_ID)
+    expect(result.rewrapFailed[0]!.reason).toContain("store write refused")
+  })
+
+  it("a pending revoke offers the repair action — running it re-wraps the survivors", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const sponsor = {
+      async send(): Promise<SponsoredReceipt> {
+        throw new SponsorPending(`0x${"ee".repeat(32)}` as Hex)
+      },
+    }
+    const { env } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends), sponsor })
+    const doc = fakeDoc()
+    const mount = new FakeEl("div")
+    const agents = [
+      agentRow({ agentId: AGENT_ID, name: "codex", grants: [grantRow()] }),
+      agentRow({ agentId: SURVIVOR_A, name: "claude-code", grants: [grantRow({ capabilityId: `0x${"56".repeat(32)}` as Hex })] }),
+    ]
+    // the same contract the boot path keeps: repairOffered survives the reload, and the repair
+    // callback re-reads the world before asking the chain who still holds READ
+    let repairOffered = false
+    const render = (): void => {
+      const root = renderMe(meData({ agents }), doc) as unknown as FakeEl
+      mount.replaceChildren(root)
+      wireRevokePanels(root as unknown as HTMLElement, doc, agents, {
+        run: async (agent, progress) => {
+          const result = await revokeFromMe({ ...env, progress }, { signedInOwner: OWNER, agentId: agent.agentId, agents })
+          if (result.status === "pending" || result.rewrapFailed.length > 0) repairOffered = true
+          return result
+        },
+        reload: () => {
+          render()
+        },
+        repair: !repairOffered
+          ? undefined
+          : (progress) => repairReaderWrapsFromMe({ ...env, progress }, { signedInOwner: OWNER, agents }),
+      })
+    }
+    render()
+    expect(mount.querySelector("[data-repair-wraps]")).toBeNull() // nothing offered before a revoke
+    mount.querySelector("[data-revoke-agent]")!.click()
+    mount.querySelector("[data-revoke-confirm]")!.click()
+    await vi.waitFor(() => {
+      expect(mount.querySelector("[data-repair-wraps]")).not.toBeNull()
+    })
+    mount.querySelector("[data-repair-run]")!.click()
+    await vi.waitFor(() => {
+      // the survivor got the current epoch's wrap; the revoked agent was skipped by the chain's
+      // own hasAuthority check
+      expect(wraps.some((w) => w.agentId === SURVIVOR_A && w.namespaceId === NS_ID)).toBe(true)
+    })
+    expect(wraps.some((w) => w.agentId === AGENT_ID)).toBe(false)
+    // a clean run retires the action
+    await vi.waitFor(() => {
+      expect(mount.querySelector("[data-repair-wraps]")!.hidden).toBe(true)
+    })
+  })
+
+  it("a revoke result carrying a transaction — even a failed one — re-reads the page", async () => {
+    const doc = fakeDoc()
+    const mount = new FakeEl("div")
+    const agents = [agentRow({ agentId: AGENT_ID, name: "codex" })]
+    const root = renderMe(meData({ agents }), doc) as unknown as FakeEl
+    mount.replaceChildren(root)
+    let reloads = 0
+    wireRevokePanels(root as unknown as HTMLElement, doc, agents, {
+      run: async () =>
+        ({
+          v: 1,
+          status: "failed",
+          nonce: NONCE,
+          requestHash: `0x${"ab".repeat(32)}` as Hex,
+          owner: OWNER,
+          transactions: [`0x${"bb".repeat(32)}` as Hex],
+          operations: [],
+          reason: "the send landed; a later step failed",
+        }) satisfies FlowResult,
+      reload: () => {
+        reloads += 1
+      },
+    })
+    mount.querySelector("[data-revoke-agent]")!.click()
+    mount.querySelector("[data-revoke-confirm]")!.click()
+    await vi.waitFor(() => {
+      expect(reloads).toBe(1)
+    })
   })
 })

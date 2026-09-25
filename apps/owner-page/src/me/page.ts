@@ -22,14 +22,14 @@ import { ContextApiClient, RegistryReader } from "@mida/api/browser"
 import { NAMESPACE_TREE_V1 } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { DEPLOYMENT, STORE_URL } from "../owner/core.js"
-import type { FlowEnvironment } from "../owner/flows.js"
+import type { FlowEnvironment, ReaderRepairResult } from "../owner/flows.js"
 import { assertRpGate, el, makeEnv, progressLine, showError } from "../owner/page.js"
 import { describeError } from "../owner/session.js"
 import { shortAddress } from "../owner/secrets.js"
 import type { OwnerLinkResult as FlowResult } from "@mida/protocol"
 import { chipsFor, isTxHash, provenanceBadge } from "./model.js"
 import type { Badge } from "./model.js"
-import { revokeFromMe } from "./revoke.js"
+import { repairReaderWrapsFromMe, revokeFromMe } from "./revoke.js"
 import { boundedScanClient, scanWithDeadline } from "./logscan.js"
 import { AGENT_LIST_UNAVAILABLE, BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
 import type { AgentRow, GrantLog, MeData, MePorts, RecordRow } from "./sources.js"
@@ -466,16 +466,21 @@ export function renderMe(data: MeData, doc: Document, open?: OpenRow): HTMLEleme
 
 /**
  * Task 6 — the click wiring behind each agent's confirm panel. `run` is the flow call the boot
- * path binds to revokeFromMe with the session's owner; `reload` is the loadMe re-read. A success
- * or a pending sponsor answer re-reads the world — the row is never flipped locally; a failure
- * or a dismissed prompt keeps the row as it was and writes the reason into the panel.
+ * path binds to revokeFromMe with the session's owner; `reload` is the loadMe re-read. ANY result
+ * carrying a transaction — success, pending, or a failure after the send landed — re-reads the
+ * world; the row is never flipped locally and a revoke that reached Monad can never leave "Can
+ * read" on the screen. A failure that sent nothing keeps the row and writes the reason into the
+ * panel. `repair`, when present, mounts the "send the new key to the remaining agents" action —
+ * offered after a revoke that ended pending or with per-reader wrap failures.
  */
 export function wireRevokePanels(
   root: HTMLElement,
+  doc: Document,
   agents: readonly AgentRow[],
   opts: {
     run: (agent: AgentRow, progress: (line: string) => void) => Promise<FlowResult>
     reload: () => Promise<void> | void
+    repair?: (progress: (line: string) => void) => Promise<ReaderRepairResult>
   },
 ): void {
   const agentsById = new Map(agents.map((a) => [a.agentId.toLowerCase(), a]))
@@ -508,7 +513,8 @@ export function wireRevokePanels(
       void (async () => {
         try {
           const result = await opts.run(agent, note)
-          if (result.status === "success" || result.status === "pending") {
+          const sentAnything = result.transactions.length > 0 || result.operations.length > 0
+          if (result.status === "success" || result.status === "pending" || sentAnything) {
             await opts.reload()
             return
           }
@@ -521,6 +527,56 @@ export function wireRevokePanels(
       })()
     })
   }
+  if (opts.repair !== undefined) mountRepairBox(root, doc, opts.repair)
+}
+
+/**
+ * The repair strip under the agent list — mounted only when a previous revoke ended pending or
+ * left a reader un-wrapped. One passkey touch re-sends the current epoch's wrap to every agent
+ * the chain still says holds READ.
+ */
+function mountRepairBox(
+  root: HTMLElement,
+  doc: Document,
+  run: (progress: (line: string) => void) => Promise<ReaderRepairResult>,
+): void {
+  const sec = root.querySelector('[aria-labelledby="agents-title"]')
+  if (sec === null) return
+  const box = elOf(doc, "div", "confirm")
+  box.setAttribute("data-repair-wraps", "")
+  box.appendChild(
+    elOf(doc, "p", undefined, "Some agents may be missing the new key after that revoke — the chain decides who still holds READ."),
+  )
+  const button = elOf(doc, "button", "btn btn-secondary btn-small", "Send the new key to the remaining agents")
+  button.setAttribute("type", "button")
+  button.setAttribute("data-repair-run", "")
+  const status = elOf(doc, "p", "revoke-note")
+  status.hidden = true
+  box.appendChild(button)
+  box.appendChild(status)
+  const note = (text: string): void => {
+    status.textContent = text
+    status.hidden = false
+  }
+  button.addEventListener("click", () => {
+    button.disabled = true
+    void (async () => {
+      try {
+        const outcome = await run(note)
+        if (outcome.failed.length === 0) {
+          note("The new key reached every surviving agent.")
+          box.hidden = true // the action's job is done — take it off the page
+        } else {
+          note(`${outcome.failed.length} agent${outcome.failed.length === 1 ? "" : "s"} could not be reached — try again or check the store.`)
+          button.disabled = false
+        }
+      } catch (error) {
+        note(describeError(error))
+        button.disabled = false
+      }
+    })()
+  })
+  sec.appendChild(box)
 }
 
 // --- live ports: chain views, the store client, the index's GraphQL -----------------------------
@@ -707,19 +763,39 @@ function boot(): void {
       const session = await signIn(env, NAMESPACE_TREE_V1.map((node) => node.id))
       progressLine("Signed in — reading agents, grants and records…")
       const ports = livePorts(env, session, indexUrl)
+      // The repair action lives across reloads: set when a revoke ends pending or leaves a
+      // reader un-wrapped, cleared when a repair run finishes clean.
+      let repairOffered = false
       // Every render is a fresh read; after a revoke lands (or goes pending) the same refresh
       // runs again — the page re-reads, it does not assume.
       const refresh = async (): Promise<void> => {
         const data = await loadMe(session.owner, ports)
         const root = renderMe(data, document, (row) => session.open(row))
         el("me-root").replaceChildren(root)
-        wireRevokePanels(root, data.agents, {
-          run: (agent, progress) =>
-            revokeFromMe(
+        wireRevokePanels(root, document, data.agents, {
+          run: async (agent, progress) => {
+            // The reader list is built from a fresh read at click time — the rendered rows can
+            // be minutes stale, and an agent the render missed would keep its old wraps.
+            const fresh = await loadMe(session.owner, ports)
+            const result = await revokeFromMe(
               { ...env, progress },
-              { signedInOwner: session.owner, agentId: agent.agentId, agents: data.agents },
-            ),
+              { signedInOwner: session.owner, agentId: agent.agentId, agents: fresh.agents },
+            )
+            if (result.status === "pending" || result.rewrapFailed.length > 0) repairOffered = true
+            return result
+          },
           reload: refresh,
+          repair: !repairOffered
+            ? undefined
+            : async (progress) => {
+                const fresh = await loadMe(session.owner, ports)
+                const outcome = await repairReaderWrapsFromMe(
+                  { ...env, progress },
+                  { signedInOwner: session.owner, agents: fresh.agents },
+                )
+                if (outcome.failed.length === 0) repairOffered = false
+                return outcome
+              },
         })
       }
       await refresh()

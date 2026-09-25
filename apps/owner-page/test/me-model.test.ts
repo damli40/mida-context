@@ -39,9 +39,11 @@ describe("lagText", () => {
   })
 })
 describe("readersAfterRevoke", () => {
-  it("every other agent with live READ, never the revoked one", () => {
+  it("every other agent the page knows — even unverified ones; the chain re-checks READ", () => {
     const a = ("0x" + "1".repeat(64)) as `0x${string}`, b = ("0x" + "2".repeat(64)) as `0x${string}`, c = ("0x" + "3".repeat(64)) as `0x${string}`
-    expect(readersAfterRevoke([{ agentId: a, readLive: true }, { agentId: b, readLive: true }, { agentId: c, readLive: false }], a)).toEqual([b])
+    // c is whatever non-live state — Unverified, blocked at the store — and must still be
+    // offered to the chain: a live reader skipped here keeps only dead wraps after the rotate.
+    expect(readersAfterRevoke([{ agentId: a }, { agentId: b }, { agentId: c }], a)).toEqual([b, c])
   })
 })
 describe("grantStatus", () => {

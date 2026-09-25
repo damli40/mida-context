@@ -536,7 +536,17 @@ export async function prepareRevoke(env: FlowEnvironment, link: ParsedLink): Pro
   return { agentId, live }
 }
 
-export async function confirmRevoke(env: FlowEnvironment, link: ParsedLink, prep: PreparedRevoke): Promise<FlowResult> {
+/** Which readers the post-revoke re-wrap failed to reach — /me's repair action reads this. */
+export interface RewrapSink {
+  failed: { agentId: Hex; namespaceId: Hex; reason: string }[]
+}
+
+export async function confirmRevoke(
+  env: FlowEnvironment,
+  link: ParsedLink,
+  prep: PreparedRevoke,
+  rewrap?: RewrapSink,
+): Promise<FlowResult> {
   const progress = env.progress ?? (() => {})
   let sent: { transactionHash: Hex; userOpHash: Hex }[] = []
   const req = link.req
@@ -575,14 +585,21 @@ export async function confirmRevoke(env: FlowEnvironment, link: ParsedLink, prep
       if (prep.live.length > 0) {
         progress("Sending the revocation…")
         const approval = await authority.approveRevocation({ kind: "agent", agentId: prep.agentId })
-        // Re-wrap the rotated namespaces for the agents that keep READ on chain.
+        // Re-wrap the rotated namespaces for the agents that keep READ on chain. One reader's
+        // publish failing must not stop the rest — each failure is named so the page can offer
+        // its repair action; the revoke itself already landed.
         for (const rotation of approval.rotated) {
           for (const reader of req.readers ?? []) {
-            if (reader === prep.agentId) continue
+            if (reader.toLowerCase() === prep.agentId.toLowerCase()) continue
             const ok = await readCapability<boolean>(env, "hasAuthority", [derived, reader, rotation.namespaceId, PERMISSION.READ, 0])
-            if (ok) {
-              progress("Sending the new key to a surviving agent…")
+            if (!ok) continue
+            progress("Sending the new key to a surviving agent…")
+            try {
               await authority.publishReaderWraps({ agentId: reader, namespaceId: rotation.namespaceId })
+            } catch (error) {
+              const reason = describeError(error)
+              progress(`the new key did not reach one surviving agent — ${reason}`)
+              rewrap?.failed.push({ agentId: reader, namespaceId: rotation.namespaceId, reason })
             }
           }
         }
@@ -613,6 +630,76 @@ export async function confirmRevoke(env: FlowEnvironment, link: ParsedLink, prep
       })
     }
     return failure(link, owner, error, sent)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /me — repair: send the rotated key to the agents that still hold READ
+// ---------------------------------------------------------------------------
+
+export interface ReaderRepairResult {
+  /** agentIds that received fresh wraps for every area where the chain says they hold READ. */
+  rewrapped: Hex[]
+  /** (agent, area) pairs whose authority check or publish failed — each named for the page. */
+  failed: { agentId: Hex; namespaceId: Hex; reason: string }[]
+}
+
+/**
+ * One passkey touch, then every (agent, area) pair is handled independently: the chain's
+ * hasAuthority decides who still holds READ, publishReaderWraps sends each of them the current
+ * epoch's wrap, and one failure never stops the rest. This is the /me counterpart of midad's
+ * repairReaderWraps — same idea, nothing imported from the terminal.
+ */
+export async function repairReaderWraps(
+  env: FlowEnvironment,
+  input: { owner: Address; agents: readonly Hex[]; namespaceIds: readonly Hex[] },
+): Promise<ReaderRepairResult> {
+  const progress = env.progress ?? (() => {})
+  progress("Waiting for the passkey prompt — use the passkey you signed up with.")
+  const asserted = await assertOwnerPasskey({
+    credentials: env.credentials,
+    rpId: env.deployment.vaultRpId,
+    challenge: actionChallenge("me.rewrap", new Uint8Array(0)),
+    credentialId: loadStoredOwner(env.storage)?.credentialId,
+    transports: loadStoredOwner(env.storage)?.transports,
+  })
+  const secrets = deriveOwnerSecrets(asserted.prfOutput)
+  const account = ownerAccount(secrets)
+  const derived = account.address.toLowerCase() as Address
+  try {
+    const { registeredKey } = await assertExpectedOwner({
+      derived,
+      expected: input.owner,
+      stored: loadStoredOwner(env.storage),
+      publicClient: env.publicClient,
+      deployment: env.deployment,
+    })
+    if (registeredKey === null) {
+      throw new MidaError("AUTH_INVALID", `this owner (${shortAddress(derived)}) has not signed up yet`)
+    }
+    const { authority } = authorityFor(env, secrets, {})
+    const result: ReaderRepairResult = { rewrapped: [], failed: [] }
+    const wrapped = new Set<string>()
+    for (const agentId of input.agents) {
+      for (const namespaceId of input.namespaceIds) {
+        try {
+          const ok = await readCapability<boolean>(env, "hasAuthority", [derived, agentId, namespaceId, PERMISSION.READ, 0])
+          if (!ok) continue
+          await authority.publishReaderWraps({ agentId, namespaceId })
+          wrapped.add(agentId.toLowerCase())
+        } catch (error) {
+          const reason = describeError(error)
+          progress(`the new key did not reach ${agentId.slice(0, 10)}… on one area — ${reason}`)
+          result.failed.push({ agentId, namespaceId, reason })
+        }
+      }
+    }
+    result.rewrapped = input.agents.filter((a) => wrapped.has(a.toLowerCase()))
+    if (result.failed.length === 0) progress("The new key reached every surviving agent.")
+    return result
+  } finally {
+    secrets.release()
+    env.onSecrets?.(secrets)
   }
 }
 
