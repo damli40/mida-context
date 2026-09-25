@@ -352,7 +352,16 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     error.code = "unknown-transcript-format"
     throw error
   }
-  const prompt = buildExtractPrompt(convo.text, input.previous)
+  // The pinned first block is the user's original request only when the
+  // transcript opened on the human's own words. A Claude transcript that
+  // opened on /compact plumbing or a resumed tool_result pins a CONTINUATION
+  // line — calling it the original request was the lie that made live saves
+  // answer in prose and fail no-json. Codex's pre-request lines are boilerplate
+  // its reader already drops, so its first real user message is still the ask.
+  const originalRequestCaptured =
+    convo.firstUserMessage !== null &&
+    (convo.format !== "claude-jsonl" || !convo.openedWithScaffolding)
+  const prompt = buildExtractPrompt(convo.text, input.previous, originalRequestCaptured)
 
   // Stored paths must not leak the local folder layout: a path under the
   // project cwd becomes relative; a path still absolute under the user's

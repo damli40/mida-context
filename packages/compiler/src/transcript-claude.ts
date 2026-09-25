@@ -319,6 +319,9 @@ export function readConversation(
   // the index in `msgs` of the block firstUserMessage came from — fitMessages
   // pins exactly it, not whichever user block happens to render first
   let pinIdx: number | undefined
+  // the isCompactSummary line's text, pinned beside the request as its own
+  // labelled block rather than left to the newest-first fill
+  let compactSummary: { label: string; text: string } | null = null
   for (let i = 0; i < entries.length; i++) {
     const { label, obj } = entries[i]!
     if (obj === null) continue
@@ -329,28 +332,42 @@ export function readConversation(
     const isUser = obj.type === "user"
     const userText = isUser ? userRequestText(obj.message?.content) : ""
     let picked = false
+    let requestText: string | null = null
     if (firstUserMessage === null && isUser) {
       // A slash-command echo is scaffolding-shaped, but a custom command's
       // <command-args> ARE the ask — try that extraction before the
       // scaffolding test drops the line. isMeta/isCompactSummary lines never
       // yield a request either way.
       const meta = obj.isMeta === true || obj.isCompactSummary === true
-      const request =
+      requestText =
         userText !== "" && !meta
           ? (slashCommandRequest(userText, neighbourLocalCommand(i)) ?? (userVisibleText(obj.message?.content) || null))
           : null
-      if (request !== null) {
-        firstUserMessage = hardCut(scrubSecrets(request), FIRST_USER_CHARS)
+      if (requestText !== null) {
+        firstUserMessage = hardCut(scrubSecrets(requestText), FIRST_USER_CHARS)
         picked = true
       } else {
         openedWithScaffolding = true
       }
     }
-    // isMeta bookkeeping lines render nothing at all; other scaffolding drops
+    // The /compact summary is real context, not conversation: it renders as
+    // its own labelled block pinned beside the request, never competing with
+    // the newest turns for the budget. The LAST one wins — a session compacted
+    // twice keeps only its newest condensed history.
+    if (isUser && obj.isCompactSummary === true) {
+      compactSummary = { label, text: userText }
+    }
+    // The pinned block renders the REQUEST text — a picked command echo shows
+    // "/name args", never its raw tags. isMeta bookkeeping lines and the
+    // summary line render nothing in the fill; other scaffolding drops
     // itself — a user line whose text parts all strip to nothing produces no
     // block, while a reminder next to a tool_result leaves the result behind.
-    const dropped = isUser && obj.isMeta === true
-    const block = dropped ? null : renderMessage(label, obj)
+    const dropped = isUser && (obj.isMeta === true || obj.isCompactSummary === true)
+    const block = picked
+      ? `L${label} user:\n${scrubSecrets(requestText!)}`
+      : dropped
+        ? null
+        : renderMessage(label, obj)
     if (block) {
       msgs.push({ role: obj.type, block })
       if (picked) pinIdx = msgs.length - 1
@@ -371,7 +388,11 @@ export function readConversation(
     }
   }
 
-  const fitted = fitMessages(msgs, maxChars, truncated, pinIdx)
+  const summaryBlock =
+    compactSummary === null
+      ? null
+      : `L${compactSummary.label} user — Summary of the earlier session (from /compact):\n${hardCut(scrubSecrets(compactSummary.text), FIRST_USER_CHARS)}`
+  const fitted = fitMessages(msgs, maxChars, truncated, pinIdx, summaryBlock)
   return {
     format: "claude-jsonl",
     text: fitted.text,

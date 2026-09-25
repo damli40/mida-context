@@ -3,11 +3,16 @@
 import { CONTENT_FIELDS, type Checkpoint } from "@mida/checkpoint"
 import { scrubValue } from "./scrub.js"
 
-const RULES = `You are extracting a compact task checkpoint from an AI coding agent's transcript. Another agent will continue this work from your summary alone.
+const RULES_HEAD = `You are extracting a compact task checkpoint from an AI coding agent's transcript. Another agent will continue this work from your summary alone.`
 
-The transcript below is a list of blocks, each headed "L<n> <role>:" where <n> is the 1-based line number in the transcript file and <role> is "user" or "assistant". The FIRST block is the user's original request — it carries the objective and the constraints; read it first and weight it most. The blocks after it are the most recent messages; a line "[… N earlier messages omitted …]" marks messages dropped in between.
+const REQUEST_PRESENT = `The transcript below is a list of blocks, each headed "L<n> <role>:" where <n> is the 1-based line number in the transcript file and <role> is "user" or "assistant". The FIRST block is the user's original request — it carries the objective and the constraints; read it first and weight it most. The blocks after it are the most recent messages; a line "[… N earlier messages omitted …]" marks messages dropped in between.`
 
-Output ONLY a single JSON object — no prose, no code fence — with exactly these fields:
+// For a transcript that opened on scaffolding (post-/compact, resumed) or
+// held no user ask at all, the first block is NOT the original request —
+// claiming it is anyway taught the model to answer in prose and fail no-json.
+const REQUEST_ABSENT = `The transcript below is a list of blocks, each headed "L<n> <role>:" where <n> is the 1-based line number in the transcript file and <role> is "user" or "assistant". No original request was captured; infer the task from the conversation and the summary. The blocks are the most recent messages; a line "[… N earlier messages omitted …]" marks messages dropped in between.`
+
+const RULES_TAIL = `Output ONLY a single JSON object — no prose, no code fence — with exactly these fields:
 
 - "objective": string — what the task is trying to achieve (required)
 - "progress": string[] — what is already done
@@ -26,9 +31,26 @@ Rules:
 - Never copy secrets, tokens, keys, or long transcript passages. Summarize, do not quote.
 - Keep every string under 500 characters. Be compact.`
 
+const RULES = `${RULES_HEAD}
+
+${REQUEST_PRESENT}
+
+${RULES_TAIL}`
+
+const RULES_NO_REQUEST = `${RULES_HEAD}
+
+${REQUEST_ABSENT}
+
+${RULES_TAIL}`
+
 const TRANSCRIPT_LINE = "TRANSCRIPT (possibly truncated, secrets already redacted):"
 
 export const EXTRACT_PROMPT = `${RULES}
+
+${TRANSCRIPT_LINE}
+`
+
+const EXTRACT_PROMPT_NO_REQUEST = `${RULES_NO_REQUEST}
 
 ${TRANSCRIPT_LINE}
 `
@@ -42,12 +64,17 @@ ${TRANSCRIPT_LINE}
 // prompt plus this tail, and the whole transcript head stays a cache hit.
 const PREVIOUS_LEAD = `PREVIOUS CHECKPOINT (below the transcript above — your own earlier summary of this same session, as JSON). Update it: keep every entry that is still true, in its existing wording; add what is new; move finished steps out of "remainingPlan" and into "progress"; remove an "unresolvedIssue" that the transcript shows was resolved. Never restate an existing entry in new words. Never drop a decision, rejected approach or constraint unless the transcript shows it was reversed.`
 
-export function buildExtractPrompt(transcriptText: string, previous?: Checkpoint): string {
-  if (previous === undefined) return `${EXTRACT_PROMPT}\n${transcriptText}`
+export function buildExtractPrompt(
+  transcriptText: string,
+  previous?: Checkpoint,
+  originalRequestCaptured = true,
+): string {
+  const extractPrompt = originalRequestCaptured ? EXTRACT_PROMPT : EXTRACT_PROMPT_NO_REQUEST
+  if (previous === undefined) return `${extractPrompt}\n${transcriptText}`
   // Only the ten content fields go back to the model — never the id, the
   // source tag, the timestamp, or the user's verbatim originalRequest. The
   // model's earlier output is untrusted text, so it is scrubbed again here.
   const fields: Record<string, unknown> = {}
   for (const key of CONTENT_FIELDS) fields[key] = scrubValue(previous[key])
-  return `${EXTRACT_PROMPT}\n${transcriptText}\n\n${PREVIOUS_LEAD}\n${JSON.stringify(fields)}`
+  return `${extractPrompt}\n${transcriptText}\n\n${PREVIOUS_LEAD}\n${JSON.stringify(fields)}`
 }

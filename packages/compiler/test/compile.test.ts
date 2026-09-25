@@ -169,6 +169,27 @@ describe("compileCheckpoint", () => {
     expect(fresh.ok && fresh.checkpoint.originalRequest).toBe("keep going on the parser work")
   })
 
+  // K5: a transcript that opened on /compact plumbing and holds no request
+  // must not tell the model "the first block is the user's original request" —
+  // that lie is what made live saves answer in prose and fail no-json.
+  it("a scaffolding-only transcript sends the 'no original request' wording, never the request lie (K5)", async () => {
+    const scaffolded = path.join(dir, "scaffolded.jsonl")
+    fs.writeFileSync(
+      scaffolded,
+      [
+        JSON.stringify({ type: "user", message: { role: "user", content: "<local-command-caveat>Caveat: local command output follows.</local-command-caveat>" } }),
+        JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: "condensed summary of the earlier session" } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "continuing" }] } }),
+      ].join("\n"),
+    )
+    process.env.FAKE_MODEL_STDIN_LOG = stdinLogPath
+    const r = await compileCheckpoint({ ...base, transcriptPath: scaffolded, model: fake("good") })
+    expect(r.ok).toBe(true)
+    const stdin = fs.readFileSync(stdinLogPath, "utf8")
+    expect(stdin).toContain("No original request was captured")
+    expect(stdin).not.toContain("The FIRST block is the user's original request")
+  })
+
   it("an agent with no transcript reader is refused, never parsed through another format (F9)", async () => {
     // "gemini" has no reader — before this fix the code fell back to the Claude reader,
     // so a transcript in an unknown format was silently read as Claude Code's

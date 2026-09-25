@@ -98,19 +98,28 @@ export function readTranscriptLines(path: string): TranscriptLines {
  * pinning it would headline the file with text that is not the request.
  * Absent or out of range, NOTHING is pinned: with no real request picked, the
  * first user block is not a stand-in for one.
+ *
+ * `extraPinned` is a second already-rendered block the reader needs to keep —
+ * the /compact session summary. It sits right after the pinned request and
+ * before the omitted marker, costs its length out of the budget, and the
+ * newest-first fill never touches it.
  */
 export function fitMessages(
   msgs: { role: string; block: string }[],
   maxChars: number,
   truncated: boolean,
   pinIdx?: number,
+  extraPinned?: string | null,
 ): { text: string; messagesKept: number; omitted: number } {
   const pin = pinIdx !== undefined && pinIdx >= 0 && pinIdx < msgs.length ? pinIdx : -1
   const headCap = Math.min(FIRST_USER_CHARS, Math.max(0, maxChars - 200))
   const head = pin >= 0 ? cut(msgs[pin]!.block, headCap) : null
   const rest = msgs.filter((_, i) => i !== pin)
 
-  const budget = Math.max(0, maxChars - (head ? head.length + 2 : 0) - MARKER_RESERVE)
+  const budget = Math.max(
+    0,
+    maxChars - (head ? head.length + 2 : 0) - (extraPinned ? extraPinned.length + 2 : 0) - MARKER_RESERVE,
+  )
   const keptTail: { role: string; block: string }[] = []
   let used = 0
   for (let i = rest.length - 1; i >= 0; i--) {
@@ -123,9 +132,14 @@ export function fitMessages(
 
   const blocks: string[] = []
   if (head) blocks.push(head)
+  if (extraPinned) blocks.push(extraPinned)
   if (truncated) blocks.push(`[… earlier messages omitted …]`)
   else if (omitted) blocks.push(`[… ${omitted} earlier messages omitted …]`)
   for (const m of keptTail) blocks.push(m.block)
 
-  return { text: blocks.join("\n\n"), messagesKept: (head ? 1 : 0) + keptTail.length, omitted }
+  return {
+    text: blocks.join("\n\n"),
+    messagesKept: (head ? 1 : 0) + (extraPinned ? 1 : 0) + keptTail.length,
+    omitted,
+  }
 }

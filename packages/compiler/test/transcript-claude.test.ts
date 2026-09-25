@@ -209,6 +209,39 @@ describe("readConversation", () => {
     ])
     const r = readConversation(t)
     expect(r.firstUserMessage).toBe("/brainstorm build a login page")
+    // the pinned first block renders the REQUEST text — the raw echo tags
+    // never reach the model
+    expect(r.text.startsWith("L1 user:\n/brainstorm build a login page")).toBe(true)
+    expect(r.text).not.toContain("command-name")
+  })
+
+  // K5: the /compact summary is the extractor's best record of the earlier
+  // session. It renders as its own labelled block, capped at 6,000 chars,
+  // right after the pinned request and before the newer turns — and the
+  // newest-first fill may never push it out.
+  it("a /compact transcript pins its session summary beside the request (K5)", () => {
+    const dir = tmpdir()
+    const summary = "SUMMARY-START " + "s".repeat(15_000)
+    const lines = [
+      JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: summary } }),
+    ]
+    // ~42 KB of newer turns behind the summary
+    for (let i = 0; i < 42; i++) {
+      lines.push(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `turn-${i} ` + "t".repeat(1_000) }] } }))
+    }
+    const t = writeTranscript(dir, lines)
+    const r = readConversation(t)
+    expect(r.text).toContain("Summary of the earlier session (from /compact)")
+    expect(r.text).toContain("SUMMARY-START")
+    expect(r.text.length).toBeLessThanOrEqual(40_000)
+    // capped at 6,000 — the middle of the 15 KB summary never renders
+    expect(r.text).not.toContain("s".repeat(7_000))
+    // the newest turns still fit behind it, newest-first
+    expect(r.text).toContain("turn-41")
+    // and the summary sits ahead of them, not dropped or pushed to the tail
+    expect(r.text.indexOf("Summary of the earlier session (from /compact)")).toBeLessThan(
+      r.text.indexOf("turn-41"),
+    )
   })
 
   // G1 flip-side: built-in commands are never the request, args or not. The

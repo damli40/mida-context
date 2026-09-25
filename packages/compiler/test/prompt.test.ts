@@ -100,6 +100,16 @@ describe("buildExtractPrompt", () => {
     expect(json.originalRequest).toBeUndefined()
   })
 
+  // K5: a transcript that opened on scaffolding and yielded no request must
+  // not be described as having one — the model infers the task instead.
+  it("when no original request was captured the prompt says so — it never calls the first block one", () => {
+    const prompt = buildExtractPrompt("L1 user: keep going", undefined, false)
+    expect(prompt).toContain("No original request was captured")
+    expect(prompt).toContain("infer the task from the conversation and the summary")
+    expect(prompt).not.toContain("The FIRST block is the user's original request")
+    expect(prompt).not.toContain("PREVIOUS CHECKPOINT")
+  })
+
   it("a secret sitting in the previous checkpoint is scrubbed before it reaches the model", () => {
     const leaky = { ...previous, progress: ["set sk-live-abcdefgh12345678 in env"] }
     const prompt = buildExtractPrompt("text", leaky)
