@@ -39,11 +39,46 @@ const INJECTED_PREFIXES = [
   "<environment_context>",
   "<user_instructions>",
   "<recommended_plugins>",
+  "<user_shell_command>",
+  "<turn_aborted>",
   "# AGENTS.md instructions",
   "<INSTRUCTIONS>",
   "MIDA HANDOFF",
-  "Mida:",
+  "Mida update since you last checked:",
 ]
+
+// Mida's own hook and MCP output lands in a Codex rollout as user-role text
+// opening "Mida: ". Only the shapes Mida itself prints are skipped — a human
+// prompt that happens to start "Mida:" is kept.
+const MIDA_HOOK_PATTERNS = [
+  /^Mida: could not load context\b/,
+  /^Mida: handoff loaded\b/,
+  /^Mida: connected\b/,
+  /^Mida: nothing new\b/,
+  /^Mida: no context available\b/,
+  /^Mida: no agent\b/,
+  /^Mida: the approved-projects list\b/,
+  /^Mida: updates? from\b/,
+  /^Mida: \S+ has no access to this project\b/,
+  /^Mida: \S+ is not approved for this project\b/,
+  /^Mida: \S+'s access was revoked\b/,
+  /^Mida: \S+'s identity in this Mida home\b/,
+]
+
+// Codex injects whole <tag>…</tag> blocks as user messages (the prefix list
+// above names the ones seen so far). Any user text that is one complete tagged
+// block is scaffolding by shape — the human cannot produce it through the
+// input box — so an unknown tag fails closed instead of becoming the request.
+const TAG_BLOCK = /^<[A-Za-z][A-Za-z0-9_-]*>[\s\S]*<\/[A-Za-z][A-Za-z0-9_-]*>$/
+
+function isInjectedUserText(text: string): boolean {
+  const t = text.trim()
+  if (INJECTED_PREFIXES.some((pre) => t.startsWith(pre))) return true
+  if (MIDA_HOOK_PATTERNS.some((re) => re.test(t))) return true
+  const open = /^<([A-Za-z][A-Za-z0-9_-]*)>/.exec(t)?.[1]
+  if (open === undefined) return false
+  return TAG_BLOCK.test(t) && t.endsWith(`</${open}>`)
+}
 
 // Content part types that carry renderable text in a Codex message record.
 const TEXT_PARTS = new Set(["input_text", "output_text"])
@@ -139,7 +174,7 @@ export function readCodexConversation(
       if (role !== "user" && role !== "assistant") continue
       const parts = messageParts(p.content)
       const text = parts.join("\n")
-      if (role === "user" && INJECTED_PREFIXES.some((pre) => text.trimStart().startsWith(pre))) continue
+      if (role === "user" && isInjectedUserText(text)) continue
       messagesTotal++
       if (role === "user" && firstUserMessage === null && text)
         firstUserMessage = hardCut(scrubSecrets(text), FIRST_USER_CHARS)

@@ -78,4 +78,47 @@ describe("readCodexConversation", () => {
     expect(c.text).not.toMatch(/[0-9a-f]{16,}/)
     expect(c.text).toContain("[REDACTED]")
   })
+
+  // F5 helpers: one user-role response_item line holding the given text.
+  const userLine = (text: string) =>
+    JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text }] },
+    })
+  const rollout = (...texts: string[]) => {
+    const p = join(mkdtempSync(join(tmpdir(), "cx-")), "t.jsonl")
+    writeFileSync(p, texts.map(userLine).join("\n") + "\n")
+    return p
+  }
+
+  it.each(["<user_shell_command>", "<turn_aborted>"])("%s output is scaffolding, not the request", (tag) => {
+    const c = readCodexConversation(rollout(`${tag}\nrunning a thing\n</${tag.slice(1)}`, "the real ask"))
+    expect(c.firstUserMessage).toBe("the real ask")
+    expect(c.text).not.toContain("running a thing")
+  })
+
+  it("an unknown <tag>…</tag> block fails closed instead of becoming the request", () => {
+    const c = readCodexConversation(rollout("<future_scaffolding>\ninjected by a later Codex\n</future_scaffolding>", "the real ask"))
+    expect(c.firstUserMessage).toBe("the real ask")
+    expect(c.text).not.toContain("injected by a later Codex")
+  })
+
+  it("Mida's own injected lines are skipped, but a human prompt opening 'Mida:' is kept", () => {
+    const c = readCodexConversation(
+      rollout(
+        "Mida: handoff loaded — 2 checkpoints from claude-code",
+        "Mida update since you last checked:\n- codex: did the thing",
+        "MIDA HANDOFF\nobjective: earlier work",
+        "Mida: please refactor the parser",
+      ),
+    )
+    expect(c.firstUserMessage).toBe("Mida: please refactor the parser")
+    expect(c.text).not.toContain("handoff loaded")
+    expect(c.text).not.toContain("update since you last checked")
+  })
+
+  it("a <tag> opener with no matching close is kept — only complete blocks are scaffolding", () => {
+    const c = readCodexConversation(rollout("<note> do not forget the parser edge case", "second ask"))
+    expect(c.firstUserMessage).toBe("<note> do not forget the parser edge case")
+  })
 })
