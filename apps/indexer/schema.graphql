@@ -48,6 +48,23 @@ type BatchStats {
   rejectedSaves: Int!
 }
 
+# One row per save anchored inside a batch (id = contextId). Written from the
+# per-save SaveAnchored log line — never from the BatchAnchored summary, so a
+# re-delivered event cannot write a second row. Batched saves never appear in
+# ContextRecord; this is where a reader checks a batched record's anchoring.
+type BatchedSave {
+  id: ID!
+  owner: String! @index
+  namespaceId: String!
+  batchId: String!
+  position: Int!
+  lineageId: String!
+  version: Int!
+  agentId: String!
+  block: Int!
+  txHash: String!
+}
+
 # One row per distinct operator address seen registering an agent.
 type Operator {
   id: ID!
@@ -127,6 +144,7 @@ type ContextRecord {
   readEpoch: BigInt!
   createdAt: BigInt!
   expiresAt: BigInt!
+  provenanceSource: Int!
   supersededBy: String
   supersededBlock: Int
   registeredBlock: Int!

@@ -288,6 +288,22 @@ describe("context events", () => {
     expect((await idx.Owner.get(OWNER))?.records).toBe(1)
   })
 
+  it("ContextRegistered stores the record's provenanceSource", async () => {
+    const idx = newIndexer()
+    const record = { ...contextRecordTuple(1, 0n), provenanceSource: 1n }
+    await run(idx, [
+      item(
+        "ContextRegistry",
+        "ContextRegistered",
+        { owner: OWNER, namespaceId: NAMESPACE, contextId: record.contextId, record },
+        { tx: 1, block: B },
+      ),
+    ])
+
+    const row = await idx.ContextRecord.get(record.contextId)
+    expect(row?.provenanceSource).toBe(1)
+  })
+
   it("an evidence write is not double-counted as a context record", async () => {
     const idx = newIndexer()
     const record = contextRecordTuple(1, 1n)
