@@ -2,12 +2,12 @@
 // It holds ciphertext only — the keys never reach it — and anyone can run the identical server themselves.
 
 import { AsyncLocalStorage } from "node:async_hooks"
-import { createPublicClient, http } from "viem"
+import { createPublicClient } from "viem"
 import type { LocalAccount } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { assertHex } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
-import { batchAnchorAbi } from "@mida/chain"
+import { batchAnchorAbi, rpcTransport } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import { AUTH_HEADERS, MANIFEST_VERIFY_CACHE_SECONDS, MAX_CHAIN_READS_PER_REQUEST, RegistryReader, SWEEP_MAX_OBJECTS_PER_RUN, createContextApi } from "@mida/api"
 import type { BatchingOptions, StoreLimits } from "@mida/api"
@@ -246,7 +246,7 @@ function buildWorker(env: WorkerEnv): Built {
   } catch {
     throw new Error(`environment variable RPC_URL must be an absolute URL`)
   }
-  const publicClient = createPublicClient({ transport: http(rpcUrl) })
+  const publicClient = createPublicClient({ transport: rpcTransport(rpcUrl) })
   const reader = new RegistryReader({ publicClient, deployment })
   const stores = d1Stores(env.DB)
   const batching = batchingOptions(env, deployment, publicClient)

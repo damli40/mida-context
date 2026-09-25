@@ -1,10 +1,10 @@
-import { createPublicClient, http } from "viem"
+import { createPublicClient } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import type { LocalAccount } from "viem"
 import { MidaError, PERMISSION } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
 import { bytesOf } from "@mida/crypto"
-import { chainFor, createSponsoredSender, createWriteContext, sendValue } from "@mida/chain"
+import { chainFor, createSponsoredSender, createWriteContext, rpcTransport, sendValue } from "@mida/chain"
 import type { ChainContext, Deployment, LocalWriteContext, SendCost } from "@mida/chain"
 import { ContextApiClient, RegistryReader } from "@mida/api"
 import { FakeVaultAuthority } from "@mida/fake-vault"
@@ -336,7 +336,7 @@ export class ServiceRuntime {
       const apiBaseUrl = storageUrl ?? server!.baseUrl
       home.writeSecretJson(API_URL_FILE, { baseUrl: apiBaseUrl })
       const chain: ChainContext = {
-        publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: http(network.rpcUrl) }),
+        publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: rpcTransport(network.rpcUrl) }),
         deployment: network.deployment,
       }
       return new ServiceRuntime(home, network, owner, chain, apiBaseUrl, async () => {
@@ -373,7 +373,7 @@ export class ServiceRuntime {
     const { apiBaseUrl, server, locked } = await resolveOwnerApi(home, network, timing)
     try {
       const chain: ChainContext = {
-        publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: http(network.rpcUrl) }),
+        publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: rpcTransport(network.rpcUrl) }),
         deployment: network.deployment,
       }
       return new ServiceRuntime(home, network, owner, chain, apiBaseUrl, async () => {

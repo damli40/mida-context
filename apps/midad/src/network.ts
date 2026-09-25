@@ -1,9 +1,9 @@
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs"
 import { dirname } from "node:path"
 import { randomBytes } from "node:crypto"
-import { createPublicClient, http } from "viem"
+import { createPublicClient } from "viem"
 import { monadTestnet } from "viem/chains"
-import { MAX_LOG_BLOCK_RANGE, MONAD_TESTNET_CHAIN_ID, chainFor, loadDeployment, parseDeployment } from "@mida/chain"
+import { MAX_LOG_BLOCK_RANGE, MONAD_TESTNET_CHAIN_ID, chainFor, loadDeployment, parseDeployment, rpcTransport } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import type { MidaHome } from "./home.js"
 import type { Network } from "./runtime.js"
@@ -175,7 +175,7 @@ export async function resolveNetwork(
   if (deps?.probeChainId ?? true) {
     // The same one RPC call testnetNetwork makes, against the RESOLVED deployment: a wrong-RPC
     // mistake writes registrations to the wrong chain and nothing afterwards explains why.
-    const probe = createPublicClient({ chain: chainFor(deployment.chainId), transport: http(rpcUrl) })
+    const probe = createPublicClient({ chain: chainFor(deployment.chainId), transport: rpcTransport(rpcUrl) })
     const chainId = await probe.getChainId()
     if (BigInt(chainId) !== deployment.chainId) {
       throw new Error(`RPC ${rpcUrl} is chain ${chainId}, not Monad testnet ${deployment.chainId}`)

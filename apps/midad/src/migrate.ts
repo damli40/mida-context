@@ -1,6 +1,6 @@
 import { chmodSync, copyFileSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs"
 import { dirname } from "node:path"
-import { createPublicClient, http, zeroHash } from "viem"
+import { createPublicClient, zeroHash } from "viem"
 import type { AbiEvent } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { randomBytes } from "@noble/hashes/utils.js"
@@ -39,6 +39,7 @@ import {
   latestTimestamp,
   parseDeployment,
   registerAgent,
+  rpcTransport,
 } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import { predictAgentId } from "@mida/fake-vault"
@@ -410,7 +411,7 @@ async function storeUnreadableManifest(
 ): Promise<Manifest> {
   const owner = loadOwnerAddress(home)
   if (owner === undefined) throw new Error("owner-address.json is missing — run `mida init` first")
-  const client = createPublicClient({ chain: chainFor(source.chainId), transport: http(sourceNetwork.rpcUrl) })
+  const client = createPublicClient({ chain: chainFor(source.chainId), transport: rpcTransport(sourceNetwork.rpcUrl) })
   const logs = await getLogsChunked(client, {
     address: source.contextRegistry,
     event: CONTEXT_REGISTERED,
@@ -513,7 +514,7 @@ export async function migrate(
       if (owner === undefined) throw new Error("owner-address.json is missing — cannot ask the chain about batched saves")
       batched =
         deps.hasBatchedSaves === undefined
-          ? ((await createPublicClient({ chain: chainFor(source.chainId), transport: http(sourceNetwork.rpcUrl) }).readContract({
+          ? ((await createPublicClient({ chain: chainFor(source.chainId), transport: rpcTransport(sourceNetwork.rpcUrl) }).readContract({
               address: source.batchAnchor,
               abi: batchAnchorAbi,
               functionName: "hasBatchedSaves",
@@ -888,7 +889,7 @@ export async function migrate(
 
     // ── Rule 7: approvals — the live scopes the source shows, or a replay grant for a revoked agent ──
     const sourceReader = new RegistryReader({
-      publicClient: createPublicClient({ chain: chainFor(source.chainId), transport: http(sourceNetwork.rpcUrl) }),
+      publicClient: createPublicClient({ chain: chainFor(source.chainId), transport: rpcTransport(sourceNetwork.rpcUrl) }),
       deployment: source,
     })
     const sourceRevoked = new Set<string>()
@@ -1590,7 +1591,7 @@ export async function migrateUndo(deps: MigrateUndoDeps): Promise<{ outcome: "re
           : new RegistryReader({
               publicClient: createPublicClient({
                 chain: chainFor(parseDeployment(sourceNet.deployment).chainId),
-                transport: http(typeof sourceNet.rpcUrl === "string" ? sourceNet.rpcUrl : resolved.network.rpcUrl),
+                transport: rpcTransport(typeof sourceNet.rpcUrl === "string" ? sourceNet.rpcUrl : resolved.network.rpcUrl),
               }),
               deployment: parseDeployment(sourceNet.deployment),
             })

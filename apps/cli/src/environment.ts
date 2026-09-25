@@ -10,6 +10,7 @@ import {
   deployLocal,
   fundLocal,
   loadDeployment,
+  rpcTransport,
   sendValue,
   startAnvil,
 } from "@mida/chain"
@@ -17,7 +18,7 @@ import type { Deployment, LocalWriteContext } from "@mida/chain"
 import { Batcher, DenyOverlay, FsBatchJournal, FsBatchStore, RegistryReader, createBatcherChain, createBatchDenyGate, createContextApi, createNodeTimer, fileStores } from "@mida/api"
 import type { BatcherTimer, BatchingOptions } from "@mida/api"
 import { serve } from "@hono/node-server"
-import { createPublicClient, http } from "viem"
+import { createPublicClient } from "viem"
 import type { LocalAccount } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { monadTestnet } from "viem/chains"
@@ -53,7 +54,7 @@ export async function startApiServer(input: {
   deployment: Deployment
   batching?: { cap?: number; waitMs?: number; minGapMs?: number; submitter?: LocalAccount }
 }): Promise<{ baseUrl: string; close(): Promise<void>; batcher?: { pauseTimer(): void; resumeTimer(): void } }> {
-  const publicClient = createPublicClient({ chain: chainFor(input.deployment.chainId), transport: http(input.rpcUrl) })
+  const publicClient = createPublicClient({ chain: chainFor(input.deployment.chainId), transport: rpcTransport(input.rpcUrl) })
   const reader = new RegistryReader({ publicClient, deployment: input.deployment })
   const dataDir = mkdtempSync(join(tmpdir(), "mida-api-"))
   const stores = fileStores(dataDir)

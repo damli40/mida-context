@@ -14,9 +14,10 @@
 // already queued is owed a batch either way.
 
 import { privateKeyToAccount } from "viem/accounts"
-import { createPublicClient, http } from "viem"
+import { createPublicClient } from "viem"
 import type { LocalAccount } from "viem"
 import type { Address, Hex } from "@mida/protocol"
+import { rpcTransport } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import { Batcher, DenyOverlay, RegistryReader, createBatcherChain, createBatchDenyGate } from "@mida/api"
 import type { BatchAttempt, BatchJournal, BatcherChain, BatcherTimer, BatchRowGate, BatchStore } from "@mida/api"
@@ -199,7 +200,7 @@ export class BatchCoordinator {
         : (overrides.gate ??
           createBatchDenyGate({
             reader: new RegistryReader({
-              publicClient: createPublicClient({ transport: http(env.RPC_URL) }),
+              publicClient: createPublicClient({ transport: rpcTransport(env.RPC_URL) }),
               deployment: coordinatorDeployment(env),
             }),
             overlay: new DenyOverlay(new D1DenyStore(env.DB)),

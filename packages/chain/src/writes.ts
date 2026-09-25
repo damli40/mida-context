@@ -7,7 +7,7 @@ import {
   originHash,
 } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
-import { createPublicClient, createWalletClient, http } from "viem"
+import { createPublicClient, createWalletClient } from "viem"
 import type { Abi, Account, LocalAccount, PublicClient, TransactionReceipt, WalletClient } from "viem"
 import { capabilityRegistryAbi } from "./abis.js"
 import { chainFor } from "./deployment.js"
@@ -18,6 +18,7 @@ import { toMidaError } from "./registry.js"
 import type { ChainContext } from "./registry.js"
 import { SponsorDidNotPay } from "./sponsored.js"
 import type { SponsoredSender } from "./sponsored.js"
+import { rpcTransport } from "./transport.js"
 
 /**
  * The fee fields a send carries — the answer of `estimateFeesPerGas`, forwarded verbatim into
@@ -84,8 +85,8 @@ export function createWriteContext(input: { rpcUrl: string; deployment: Deployme
   return {
     deployment: input.deployment,
     account: input.account,
-    publicClient: createPublicClient({ chain, transport: http(input.rpcUrl) }),
-    walletClient: createWalletClient({ chain, account: input.account, transport: http(input.rpcUrl) }),
+    publicClient: createPublicClient({ chain, transport: rpcTransport(input.rpcUrl) }),
+    walletClient: createWalletClient({ chain, account: input.account, transport: rpcTransport(input.rpcUrl) }),
   }
 }
 

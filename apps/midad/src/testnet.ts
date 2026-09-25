@@ -1,8 +1,8 @@
-import { createPublicClient, http } from "viem"
+import { createPublicClient } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { monadTestnet } from "viem/chains"
 import type { Hex } from "@mida/protocol"
-import { MONAD_TESTNET_CHAIN_ID, chainFor, createWriteContext, loadDeployment, sendValue } from "@mida/chain"
+import { MONAD_TESTNET_CHAIN_ID, chainFor, createWriteContext, loadDeployment, rpcTransport, sendValue } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import type { Network } from "./runtime.js"
 import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, serviceUrl } from "./runtime.js"
@@ -61,7 +61,7 @@ export function funderFor(
 export async function testnetNetwork(env: Record<string, string | undefined>): Promise<Network> {
   const rpcUrl = env.MONAD_TESTNET_RPC ?? monadTestnet.rpcUrls.default.http[0]
   const deployment = loadDeployment(MONAD_TESTNET_CHAIN_ID, env.MIDA_DEPLOYMENTS_DIR)
-  const probe = createPublicClient({ chain: chainFor(deployment.chainId), transport: http(rpcUrl) })
+  const probe = createPublicClient({ chain: chainFor(deployment.chainId), transport: rpcTransport(rpcUrl) })
   const chainId = await probe.getChainId()
   if (BigInt(chainId) !== deployment.chainId) {
     throw new Error(`RPC ${rpcUrl} is chain ${chainId}, not Monad testnet ${deployment.chainId}`)

@@ -1,6 +1,6 @@
 import { realpathSync } from "node:fs"
 import { basename } from "node:path"
-import { createPublicClient, http, parseEventLogs, verifyMessage } from "viem"
+import { createPublicClient, parseEventLogs, verifyMessage } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import {
   MidaError,
@@ -23,7 +23,7 @@ import type {
   OwnerLinkRequest,
   OwnerLinkResult,
 } from "@mida/protocol"
-import { capabilityRegistryAbi, chainFor, createSponsoredSender, createWriteContext } from "@mida/chain"
+import { capabilityRegistryAbi, chainFor, createSponsoredSender, createWriteContext, rpcTransport } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { RegistryReader } from "@mida/api"
 import { provisionAgent } from "@mida/fake-vault"
@@ -207,7 +207,7 @@ function mismatch(): never {
 /** The chain read every passkey check needs — a bare context, no lock, no secrets. */
 function bareChain(network: Network): ChainContext {
   return {
-    publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: http(network.rpcUrl) }),
+    publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: rpcTransport(network.rpcUrl) }),
     deployment: network.deployment,
   }
 }

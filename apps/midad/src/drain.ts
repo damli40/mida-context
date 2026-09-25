@@ -1,14 +1,14 @@
 import * as fs from "node:fs"
 import { statSync } from "node:fs"
 import { homedir } from "node:os"
-import { createPublicClient, http } from "viem"
+import { createPublicClient } from "viem"
 import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
 import { isMidaError } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
 import { CONTENT_FIELDS, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint } from "@mida/checkpoint"
-import { chainFor, parseDeployment } from "@mida/chain"
+import { chainFor, parseDeployment, rpcTransport } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { RegistryReader } from "@mida/api"
 import { readTranscriptFor, scrubSecrets } from "@mida/compiler"
@@ -634,7 +634,7 @@ async function agentApprovedOnChain(home: MidaHome, agent: string, ownerOf: () =
   }
   const deployment = parseDeployment(stored.deployment)
   const context: ChainContext = {
-    publicClient: createPublicClient({ chain: chainFor(deployment.chainId), transport: http(stored.rpcUrl) }),
+    publicClient: createPublicClient({ chain: chainFor(deployment.chainId), transport: rpcTransport(stored.rpcUrl) }),
     deployment,
   }
   const reader = new RegistryReader(context)

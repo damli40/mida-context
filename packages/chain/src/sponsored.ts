@@ -1,5 +1,5 @@
 import { MidaError } from "@mida/protocol"
-import { createPublicClient, encodeFunctionData, http } from "viem"
+import { createPublicClient, encodeFunctionData } from "viem"
 import type { Abi, Address, Hex, LocalAccount } from "viem"
 import { entryPoint08Address, prepareUserOperation } from "viem/account-abstraction"
 import type { UserOperationReceipt } from "viem/account-abstraction"
@@ -11,6 +11,7 @@ import type { Deployment } from "./deployment.js"
 import { GAS_CEILINGS } from "./gas.js"
 import type { TxKind } from "./gas.js"
 import { REVERT_CODES, revertNameFromData } from "./registry.js"
+import { rpcTransport } from "./transport.js"
 import type { SentReceipt } from "./writes.js"
 
 /**
@@ -123,10 +124,10 @@ export function createSponsoredSender(input: {
   progress?: (line: string) => void
 }): SponsoredSender {
   const chain = chainFor(input.deployment.chainId)
-  const publicClient = createPublicClient({ chain, transport: http(input.rpcUrl) })
+  const publicClient = createPublicClient({ chain, transport: rpcTransport(input.rpcUrl) })
   const pimlico = createPimlicoClient({
     chain,
-    transport: http(input.sponsorUrl),
+    transport: rpcTransport(input.sponsorUrl),
     entryPoint: { address: entryPoint08Address, version: "0.8" },
   })
   // The 7702 account and bundler client are built on first use — constructing a sender must stay
@@ -137,7 +138,7 @@ export function createSponsoredSender(input: {
       createSmartAccountClient({
         account: await to7702SimpleSmartAccount({ client: publicClient, owner: input.account }),
         chain,
-        bundlerTransport: http(input.sponsorUrl),
+        bundlerTransport: rpcTransport(input.sponsorUrl),
         paymaster: pimlico,
         userOperation: {
           estimateFeesPerGas: async () => (await pimlico.getUserOperationGasPrice()).fast,
