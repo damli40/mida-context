@@ -750,6 +750,15 @@ export class MidaAgent {
       // already on chain — the stamp is still the record's own; only the log position is unknown
       return this.#toSentObject(anchored, undefined, { at: anchored.createdAt })
     }
+    // in-3 I6, same question as #write's: the upload is in, but a deny the owner staged since is
+    // known only to the store — ask it before a register transaction exists. WRITE_DENIED is a
+    // pending revoke (the sealed bytes stay sendable once it clears), CAPABILITY_REVOKED a landed one.
+    await this.#api.writeAuthority({
+      owner: ownerAddress,
+      namespaceId,
+      capabilityId: capability.capabilityId,
+      expectedParentId: sealed.onChain.expectedParentId,
+    })
     const receipt = await sendContract(
       this.#chain,
       {
@@ -975,6 +984,17 @@ export class MidaAgent {
       manifest: sealed.manifest,
       ciphertext: hexOf(sealed.ciphertext),
       capabilityId: args.capability.capabilityId,
+    })
+    // in-3 I6: the upload passed the store's gates, but a revoke the owner staged while the bytes
+    // were in flight is invisible to the contract — only the store knows. The last question before
+    // a transaction goes out is therefore the store's: WRITE_DENIED means the deny is still pending
+    // (the write parks, the deny may yet clear); CAPABILITY_REVOKED means it landed (the write is
+    // dead). Neither answer lets a register leave this process.
+    await this.#api.writeAuthority({
+      owner: args.owner,
+      namespaceId: args.namespaceId,
+      capabilityId: args.capability.capabilityId,
+      expectedParentId: args.expectedParentId,
     })
     const receipt = await sendContract(
       this.#chain,

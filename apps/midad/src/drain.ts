@@ -63,6 +63,7 @@ const PERMANENT_FAILURES = new Set([
   "not-a-project",
   "not-approved",
   "revoked",
+  "denied-pending-revoke",
   "list-tampered",
   "list-unreadable",
   "folder-mismatch",
@@ -501,14 +502,19 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
               : undefined
         const sample = rawSample === undefined ? {} : { sample: scrubSecrets(rawSample).slice(0, LOG_SAMPLE_CHARS) }
         if (PERMANENT_FAILURES.has(code)) {
-          if (code === "not-approved" || code === "revoked") {
+          if (code === "not-approved" || code === "revoked" || code === "denied-pending-revoke") {
             // every queued job for this agent fails the same way — remove them all, like not-approved
             for (const other of listJobs(deps.home)) if (other.agent === job.agent) removeJob(deps.home, other.id)
           } else {
             moveToBad(deps.home, `${job.id}.json`)
           }
-          // terminal state records the real transcript stats: an identical job later skips as unchanged
-          writeState(deps.home, sessionId, terminalState(job.transcriptPath, now().toISOString()))
+          // terminal state records the real transcript stats: an identical job later skips as
+          // unchanged — except denied-pending-revoke, whose deny may still clear. Terminalising
+          // it would make the same transcript read as already-saved forever; leaving the state
+          // untouched lets a later job save it once the store opens again (in-3 I6).
+          if (code !== "denied-pending-revoke") {
+            writeState(deps.home, sessionId, terminalState(job.transcriptPath, now().toISOString()))
+          }
           log({ sessionId, outcome: "bad", reason: code, ...fields, ...sample })
           continue
         }
@@ -587,6 +593,9 @@ class DrainFailure extends Error {
 function failureCode(error: unknown): string {
   if (error instanceof DrainFailure) return error.code
   if (error instanceof CheckpointPayloadError) return error.code
+  // the store refused the write while the owner's revoke is still pending — the job is dropped
+  // but the transcript state is left unsaved, not terminal, so it can save once the deny clears
+  if (isMidaError(error, "WRITE_DENIED")) return "denied-pending-revoke"
   // the chain's own "revoked" stays distinct from "not approved" — the cause is different (R4-3)
   if (isMidaError(error, "CAPABILITY_REVOKED")) return "revoked"
   if (isMidaError(error, "CAPABILITY_DENIED") || isMidaError(error, "CAPABILITY_EXPIRED")) return "not-approved"

@@ -365,6 +365,48 @@ export function createContextApi(options: ContextApiOptions) {
     return c.json({ contextId: manifest.contextId, manifestHash: committedManifestHash, state: "pending" })
   })
 
+  /**
+   * The pre-register question a direct save asks (in-3 I6): the upload happened already — may the
+   * agent register NOW? Two refusals mean different things downstream, so they are kept distinct:
+   * a deny the owner staged that Monad has not seen yet answers WRITE_DENIED — the revoke is
+   * pending and may still be cancelled, so the write is parked, not dead; a revoke the chain
+   * itself shows (authorizeAgent's checks) stays CAPABILITY_REVOKED, the terminal kind. Everything
+   * else mirrors the PUT's authority section exactly — same permission derivation, same fallback —
+   * so this route's "ok" is the answer `register` would get on chain.
+   */
+  app.get("/write-authority", authenticated(limits.maxRequestBodyBytes), async (c) => {
+    const signer = c.get("signer")
+    const chain = c.get("chain")
+    const owner = address(c.req.query("owner"), "owner")
+    const namespaceId = hex(c.req.query("namespaceId"), 32, "namespaceId")
+    namespaceById(namespaceId)
+    const capabilityId = hex(c.req.query("capabilityId"), 32, "capabilityId")
+    const expectedParentId = c.req.query("expectedParentId") === undefined ? zeroHash : hex(c.req.query("expectedParentId"), 32, "expectedParentId")
+    const agentId = await chain.agentIdOfSigner(signer)
+    if (agentId === null) throw new MidaError("CAPABILITY_DENIED", "signer is not the current signer of a registered agent")
+    await overlay.reconcileOwner(chain, owner)
+    if (await overlay.deniesRelationship(chain, { owner, agentId, namespaceId })) {
+      throw new MidaError("WRITE_DENIED", "a revocation the owner staged is still pending on Monad — the write is refused, not registered")
+    }
+    const base = { reader: chain, overlay, signer, owner, capabilityId, namespaceId }
+    if (expectedParentId === zeroHash) {
+      await authorizeAgent({ ...base, permission: PERMISSION.CREATE })
+    } else {
+      const parent = await chain.getRecord(expectedParentId)
+      if (parent === null || parent.owner !== owner || parent.namespaceId !== namespaceId) {
+        throw new MidaError("NOT_FOUND", "expected parent is not a record of this owner and namespace")
+      }
+      const ownLineage = (await chain.getRecord(parent.lineageId))?.author === agentId
+      try {
+        await authorizeAgent({ ...base, permission: PERMISSION.SUPERSEDE_ANY })
+      } catch (error) {
+        if (!ownLineage || !isMidaError(error, "CAPABILITY_DENIED")) throw error
+        await authorizeAgent({ ...base, permission: PERMISSION.SUPERSEDE_OWN })
+      }
+    }
+    return c.json({ ok: true })
+  })
+
   // ---------- §12.3 object read ----------
   app.get("/objects", authenticated(limits.maxRequestBodyBytes), async (c) => {
     const signer = c.get("signer")

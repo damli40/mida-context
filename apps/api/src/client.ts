@@ -77,6 +77,22 @@ export class ContextApiClient implements ContextApiRoutes {
     return this.request<{ contextId: Hex; manifestHash: Hex; state: "pending" }>("PUT", "/objects", { body: upload })
   }
 
+  /**
+   * The pre-register question (in-3 I6): may this signer register for `owner`/`namespaceId` with
+   * this capability right now? Answers 200 or throws the store's code — WRITE_DENIED while the
+   * owner's revoke is only staged (pending on Monad), CAPABILITY_REVOKED once it has landed.
+   */
+  writeAuthority(input: { owner: Address; namespaceId: Hex; capabilityId: Hex; expectedParentId?: Hex }) {
+    return this.request<{ ok: true }>("GET", "/write-authority", {
+      query: {
+        owner: input.owner.toLowerCase(),
+        namespaceId: input.namespaceId,
+        capabilityId: input.capabilityId,
+        ...(input.expectedParentId === undefined ? {} : { expectedParentId: input.expectedParentId }),
+      },
+    })
+  }
+
   async listObjects(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }): Promise<ListObjectsResult> {
     const query = { owner: input.owner.toLowerCase(), namespaceId: input.namespaceId, ...(input.capabilityId === undefined ? {} : { capabilityId: input.capabilityId }) }
     const seen = new Set<string>()
@@ -242,6 +258,7 @@ export interface BatchReceipt {
 
 export interface ContextApiRoutes {
   putObject(upload: ObjectUploadBody): Promise<{ contextId: Hex; manifestHash: Hex; state: "pending" }>
+  writeAuthority(input: { owner: Address; namespaceId: Hex; capabilityId: Hex; expectedParentId?: Hex }): Promise<{ ok: true }>
   listObjects(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }): Promise<ListObjectsResult>
   getManifest(contextId: Hex, capabilityId?: Hex): Promise<{ manifest: ObjectManifest; manifestHash: Hex }>
   putAgentManifest(envelope: SignedAgentCapabilityManifest): Promise<{ bodyHash: Hex; envelopeHash: Hex }>
