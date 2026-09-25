@@ -296,6 +296,11 @@ class FakeChain implements BatcherChain {
   indexLag = false
   /** Drop the last N anchored logs — a log index that handed back a partial set for the batch. */
   anchoredDrop = 0
+  /**
+   * The BatchAnchored event alone is missing — the index serves the batch's SaveAnchored logs but
+   * not its event yet. Narrower than indexLag, which blanks every event read.
+   */
+  eventLag = false
   rootOverride: Hex | null = null
   tamperField: "lineageId" | null = null
 
@@ -393,7 +398,7 @@ class FakeChain implements BatcherChain {
 
   async batchAnchored(batchId: Hex): Promise<{ submitter: Address; acceptedCount: number; rejectedCount: number } | null> {
     if (this.failLogs) throw new Error("log read failed")
-    if (this.indexLag) return null
+    if (this.indexLag || this.eventLag) return null
     const batch = this.batches.get(batchId.toLowerCase())
     if (batch === undefined) return null
     return { submitter: batch.submitter, acceptedCount: batch.acceptedCount, rejectedCount: batch.rejected.length }
@@ -1357,16 +1362,40 @@ describe("the batcher", () => {
     expect(rig.events.filter((entry) => entry["event"] === "batch.unproven-stale")).toHaveLength(2)
   })
 
-  it("an anchored-log set shorter than the batch's acceptedCount throws — a hole in the read is not proof the batch is foreign", async () => {
+  it("a dropped anchored log under a MISSING BatchAnchored event is unproven — never foreign and never a wrong-root resolve", async () => {
     const rig = makeRig()
     const saves = [makeSave(), makeSave()]
     for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
-    rig.chain.anchoredDrop = 1 // the index hands back one of the batch's two SaveAnchored logs
+    // The index's partial answer: one of the batch's two SaveAnchored logs and no BatchAnchored
+    // event at all. Pre-R1 code read a missing event as "not ours" and requeued the rows — a
+    // second paid send of a batch that had already landed. The dropped log matters too: with the
+    // event visible the count check would catch the hole, so both halves of the guard get
+    // exercised here.
+    rig.chain.anchoredDrop = 1
+    rig.chain.eventLag = true
 
-    await expect(rig.batcher.run()).rejects.toThrowError(BatchRootMismatchError)
+    await expect(rig.batcher.run()).rejects.toThrowError(/PARTIAL_READ|cannot be proven/)
     for (const { meta } of saves) expect((await rig.store.get(meta.contextId))!.state).toBe("SUBMITTED")
     expect(await rig.journal.list()).toHaveLength(1)
+    expect(rig.events.some((entry) => entry["event"] === "batch.unproven")).toBe(true)
     expect(rig.events.some((entry) => entry["event"] === "batch.not-ours")).toBe(false)
+    expect(rig.events.some((entry) => entry["event"] === "batch.root-mismatch")).toBe(false)
+
+    // With the event visible the dropped log still stops the resolve — the count check stands
+    // between a partial read and a wrongly-built proof.
+    const batchId = rig.chain.submissions[0]!.batchId
+    rig.chain.eventLag = false
+    await expect(rig.batcher.resolve(batchId)).rejects.toThrowError(BatchRootMismatchError)
+    expect((await rig.store.get(saves[0]!.meta.contextId))!.state).toBe("SUBMITTED")
+
+    // And once the index is whole the journaled batch resolves on a retry — no restart.
+    rig.chain.anchoredDrop = 0
+    rig.setNow(11_000)
+    await rig.batcher.run()
+    for (const { meta } of saves) {
+      expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId: batchId.toLowerCase() })
+    }
+    expect(await rig.journal.list()).toEqual([])
   })
 
   it("a partial batch anchors accepted rows with verifying proofs and names the rejected rows' reasons", async () => {
