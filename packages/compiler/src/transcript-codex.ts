@@ -66,15 +66,24 @@ const MIDA_HOOK_PATTERNS = [
 ]
 
 // Codex injects whole <tag>…</tag> blocks as user messages (the prefix list
-// above names the ones seen so far). Any user text that is one complete tagged
-// block is scaffolding by shape — the human cannot produce it through the
-// input box — so an unknown tag fails closed instead of becoming the request.
+// above names the ones seen so far). A complete tagged block can never be the
+// REQUEST — the human's ask does not arrive as one matched tag pair — so an
+// unknown tag fails closed on the pick (G9). It still RENDERS, though: a
+// prompt the human wrote as a tag is still a prompt, and dropping it would
+// hide real words from the model.
 const TAG_BLOCK = /^<[A-Za-z][A-Za-z0-9_-]*>[\s\S]*<\/[A-Za-z][A-Za-z0-9_-]*>$/
 
+// Named Codex/Mida scaffolding only — these user texts leave the conversation
+// entirely; everything else renders.
 function isInjectedUserText(text: string): boolean {
   const t = text.trim()
   if (INJECTED_PREFIXES.some((pre) => t.startsWith(pre))) return true
-  if (MIDA_HOOK_PATTERNS.some((re) => re.test(t))) return true
+  return MIDA_HOOK_PATTERNS.some((re) => re.test(t))
+}
+
+// One whole <x>…</x> block, same tag at both ends: not the request, but kept.
+function isWholeTagBlock(text: string): boolean {
+  const t = text.trim()
   const open = /^<([A-Za-z][A-Za-z0-9_-]*)>/.exec(t)?.[1]
   if (open === undefined) return false
   return TAG_BLOCK.test(t) && t.endsWith(`</${open}>`)
@@ -187,8 +196,13 @@ export function readCodexConversation(
       messagesTotal++
       let picked = false
       if (role === "user" && firstUserMessage === null && text) {
-        firstUserMessage = hardCut(scrubSecrets(text), FIRST_USER_CHARS)
-        picked = true
+        if (isWholeTagBlock(text)) {
+          // the block stays in the conversation; only the pick is barred
+          openedWithScaffolding = true
+        } else {
+          firstUserMessage = hardCut(scrubSecrets(text), FIRST_USER_CHARS)
+          picked = true
+        }
       }
       const body = parts
         // scrub before the cut: a secret straddling the boundary would otherwise

@@ -97,10 +97,16 @@ describe("readCodexConversation", () => {
     expect(c.text).not.toContain("running a thing")
   })
 
-  it("an unknown <tag>…</tag> block fails closed instead of becoming the request", () => {
+  // G9: the whole-tag rule governs the REQUEST PICK only — a prompt the human
+  // wrote as a tag is still a prompt, so it stays in the rendered conversation.
+  // Only the named Codex/Mida scaffolding is dropped from rendering entirely.
+  it("an unknown <tag>…</tag> block is never the request but still renders", () => {
     const c = readCodexConversation(rollout("<future_scaffolding>\ninjected by a later Codex\n</future_scaffolding>", "the real ask"))
     expect(c.firstUserMessage).toBe("the real ask")
-    expect(c.text).not.toContain("injected by a later Codex")
+    expect(c.text).toContain("injected by a later Codex")
+    // it is not pinned either — it carries no request
+    expect(c.text.startsWith("L1 user:")).toBe(false)
+    expect(c.text.startsWith("L2 user:")).toBe(true)
   })
 
   it("Mida's own injected lines are skipped, but a human prompt opening 'Mida:' is kept", () => {
