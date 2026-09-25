@@ -3,7 +3,7 @@
 Date: 2026-09-25 · Status: design approved by Dami (mockup `docs/design/me-mockup/`, approved Sep 25);
 this written spec awaits Dami's read · Nothing here is built yet.
 
-**Decision Sep 26 (Dami): /me ships READ-ONLY for the hackathon.** Three review rounds of the built page found
+**Decision Sep 25 (Dami): /me ships READ-ONLY for the hackathon.** Three review rounds of the built page found
 that revoking from the browser can leave surviving agents without the rotated key (a pending revoke's repair
 lived only in page memory; a lagging index misses a just-approved agent). §5 is deferred: revoke stays in the
 terminal (`mida revoke`) and on the passkey revoke page. The revoke code stays in the repo for later.
