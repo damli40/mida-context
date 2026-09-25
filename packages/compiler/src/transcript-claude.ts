@@ -132,7 +132,9 @@ const SCAFFOLD_OPEN = /^<([a-z][a-z0-9-]*)(?:\s[^>]*)?>/
 // an unclosed scaffold tag swallows the remainder.
 // (The isCompactSummary line is NOT in this set — the condensed history is
 // real session context and still renders; it just may not be the request.)
-function stripLeadingScaffolds(text: string): string {
+// Exported so compile.ts can run a saved previous request through the same
+// test the reader uses — an empty return means the text was all scaffolding.
+export function stripLeadingScaffolds(text: string): string {
   let t = text.trimStart()
   for (;;) {
     const open = SCAFFOLD_OPEN.exec(t)?.[1]

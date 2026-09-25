@@ -11,6 +11,7 @@ import { CONTENT_FIELDS, LIMITS, validateCheckpoint, type Checkpoint } from "@mi
 import { extractJsonObject } from "./extract-json.js"
 import { buildExtractPrompt } from "./prompt.js"
 import { scrubSecrets, scrubValue } from "./scrub.js"
+import { stripLeadingScaffolds } from "./transcript-claude.js"
 import type { Conversation } from "./transcript-claude.js"
 import { readTranscriptFor } from "./transcript-codex.js"
 
@@ -433,10 +434,14 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     // starts with the user's own message replaces it. When there is no
     // earlier request, the continuation's pick is still the best verbatim
     // record — it lands rather than null.
+    // The kept earlier value is itself re-checked with the reader's
+    // scaffolding test: a .last.json saved before that test existed can hold
+    // caveat or command-echo text, and keeping it would lock the bad pick in
+    // for every later save (L3).
     const earlier = input.previous?.originalRequest
+    const kept = typeof earlier === "string" && stripLeadingScaffolds(earlier) !== "" ? earlier : null
     const fresh = convo.openedWithScaffolding ? null : convo.firstUserMessage
-    picked.originalRequest =
-      fresh ?? (typeof earlier === "string" && earlier !== "" ? earlier : convo.firstUserMessage)
+    picked.originalRequest = fresh ?? kept ?? convo.firstUserMessage
 
     if (Array.isArray(picked.artifacts)) {
       picked.artifacts = picked.artifacts.map((a) => (typeof a === "string" ? rel(a) : a))
