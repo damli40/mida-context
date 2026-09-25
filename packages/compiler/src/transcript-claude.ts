@@ -129,18 +129,31 @@ function isScaffoldText(text: string): boolean {
   return CLAUDE_SCAFFOLD_PREFIXES.some((pre) => t.startsWith(pre))
 }
 
+// Claude Code's own commands. An echo of one is never the user's ask — args or
+// not: "/model sonnet" and "/compact focus on parser" are the tool's plumbing.
+const BUILTIN_COMMANDS = new Set([
+  "compact", "clear", "model", "init", "help", "cost", "resume", "config",
+  "login", "logout", "memory", "mcp", "permissions", "doctor", "status",
+  "agents", "hooks", "context", "export", "exit", "rewind", "statusline",
+  "add-dir", "bug", "vim", "terminal-setup", "ide", "upgrade",
+  "release-notes", "privacy-settings", "output-style", "todos",
+])
+
 // A custom slash command's real ask hides inside its echo: Claude Code logs
 // `/brainstorm build a login page` as <command-name>/<command-message>/
-// <command-args>, so the request is "/name args". The real echo puts
-// <command-message> FIRST, so the name tag is searched anywhere in the line,
-// not only at the start. Returns null for a built-in — the commands Claude
-// Code answers with a <local-command-caveat> or <local-command-stdout>/<stderr>
-// block carry no user ask — and for a bare echo whose <command-args> is empty
-// or absent (e.g. /compact, /clear).
-function slashCommandRequest(text: string): string | null {
+// <command-args>, so the request is "/name args" — or just "/name" when the
+// command takes no arguments. The real echo puts <command-message> FIRST, so
+// the name tag is searched anywhere in the line, not only at the start.
+// Returns null for a built-in, whether the name list catches it or the plumbing
+// does: Claude Code answers built-ins with a <local-command-caveat> or
+// <local-command-stdout>/<stderr> block on a NEIGHBOURING user line, so the
+// caller also passes whether such a line sits within two lines of this one.
+function slashCommandRequest(text: string, neighbourLocalCommand: boolean): string | null {
   const name = /<command-name>\s*(\/\S+)\s*<\/command-name>/.exec(text)?.[1]
   if (name === undefined) return null
+  if (BUILTIN_COMMANDS.has(name.slice(1))) return null
   if (
+    neighbourLocalCommand ||
     text.includes("<local-command-caveat>") ||
     text.includes("<local-command-stdout>") ||
     text.includes("<local-command-stderr>")
@@ -148,8 +161,7 @@ function slashCommandRequest(text: string): string | null {
     return null
   }
   const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(text)?.[1]?.trim()
-  if (args === undefined || args === "") return null
-  return `${name} ${args}`
+  return args === undefined || args === "" ? name : `${name} ${args}`
 }
 
 // The request text of one user line: the string content, or the joined
@@ -228,6 +240,36 @@ export function readConversation(
   // read once end to end; anything bigger gets only its head and tail windows.
   const { lines, truncated, head: headWindow, tail: tailWindow } = readTranscriptLines(transcriptPath)
 
+  // Every line parsed up front, so a command echo can be judged against its
+  // NEIGHBOURING user lines: Claude Code writes a built-in's caveat/stdout on
+  // their own lines next to the echo, never inside it.
+  const entries: { label: string; obj: TranscriptLine | null }[] = []
+  for (const { label, text: line } of lines) {
+    if (!line.trim()) {
+      entries.push({ label, obj: null })
+      continue
+    }
+    try {
+      const obj = JSON.parse(line) as TranscriptLine | null
+      entries.push({ label, obj: obj !== null && typeof obj === "object" ? obj : null })
+    } catch {
+      entries.push({ label, obj: null }) // truncated or non-JSON line — skip
+    }
+  }
+
+  // True when a user line within two lines of index i carries the
+  // caveat/stdout block Claude Code emits around a built-in command.
+  const neighbourLocalCommand = (i: number): boolean => {
+    for (let j = Math.max(0, i - 2); j <= Math.min(entries.length - 1, i + 2); j++) {
+      if (j === i) continue
+      const other = entries[j]!.obj
+      if (other?.type !== "user") continue
+      const t = userRequestText(other.message?.content)
+      if (t.includes("<local-command-caveat>") || t.includes("<local-command-stdout>")) return true
+    }
+    return false
+  }
+
   // messagesTotal counts every user/assistant line read (even ones that
   // render empty); msgs holds only those that produced a rendered block.
   const msgs: { role: string; block: string }[] = []
@@ -240,17 +282,12 @@ export function readConversation(
   // the index in `msgs` of the block firstUserMessage came from — fitMessages
   // pins exactly it, not whichever user block happens to render first
   let pinIdx: number | undefined
-  for (const { label, text: line } of lines) {
-    if (!line.trim()) continue
-    let obj: TranscriptLine
-    try {
-      obj = JSON.parse(line)
-    } catch {
-      continue // truncated or non-JSON line — skip
-    }
-    const folder = obj?.cwd
+  for (let i = 0; i < entries.length; i++) {
+    const { label, obj } = entries[i]!
+    if (obj === null) continue
+    const folder = obj.cwd
     if (typeof folder === "string" && folder !== "" && !cwds.includes(folder)) cwds.push(folder)
-    if (obj?.type !== "user" && obj?.type !== "assistant") continue
+    if (obj.type !== "user" && obj.type !== "assistant") continue
     messagesTotal++
     const isUser = obj.type === "user"
     const userText = isUser ? userRequestText(obj.message?.content) : ""
@@ -262,7 +299,9 @@ export function readConversation(
       // yield a request either way.
       const meta = obj.isMeta === true || obj.isCompactSummary === true
       const request =
-        userText !== "" && !meta ? (slashCommandRequest(userText) ?? (isScaffoldText(userText) ? null : userText)) : null
+        userText !== "" && !meta
+          ? (slashCommandRequest(userText, neighbourLocalCommand(i)) ?? (isScaffoldText(userText) ? null : userText))
+          : null
       if (request !== null) {
         firstUserMessage = hardCut(scrubSecrets(request), FIRST_USER_CHARS)
         picked = true
