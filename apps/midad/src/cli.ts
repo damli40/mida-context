@@ -550,8 +550,16 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
       failed.push(`${name} (${refusalCode(error)})`)
     }
   }
+  // A partial batch still changed the chain for its successes — the daemon must hear it even
+  // though the exit code below is 1 (runCli's own kick fires only on a clean 0)
+  if (approved.length > 0 && failed.length > 0) await kickDaemonNow(deps)
   deps.print(`approved: ${approved.length === 0 ? "none" : approved.join(", ")}${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
   return failed.length === 0 ? 0 : 1
+}
+
+/** The daemon poke `runCli` sends after a clean approve/revoke — a partial `--all` exits 1 but still changed the chain for its successes, so the batch kicks itself in exactly that case. */
+async function kickDaemonNow(deps: CliDeps): Promise<void> {
+  await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
 }
 
 /**
@@ -620,6 +628,7 @@ async function revokeAll(runtime: Runtime, deps: CliDeps): Promise<number> {
       failed.push(`${name} (${refusalCode(error)})`)
     }
   }
+  if (revoked.length > 0 && failed.length > 0) await kickDaemonNow(deps)
   deps.print(`revoked: ${revoked.length === 0 ? "none" : revoked.join(", ")}${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
   return failed.length === 0 ? 0 : 1
 }
@@ -988,6 +997,7 @@ async function passkeyApproveAll(session: ServiceRuntime, deps: CliDeps, linkDep
       failed.push(`${name} (${error instanceof OwnerLinkOutcome ? "declined" : refusalCode(error)})`)
     }
   }
+  if (approved.length > 0 && failed.length > 0) await kickDaemonNow(deps)
   deps.print(`approved: ${approved.length === 0 ? "none" : approved.join(", ")}${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
   return failed.length === 0 ? 0 : 1
 }
@@ -1032,6 +1042,7 @@ async function passkeyRevokeAll(session: ServiceRuntime, deps: CliDeps, linkDeps
       failed.push(`${name} (${error instanceof OwnerLinkOutcome ? "declined" : refusalCode(error)})`)
     }
   }
+  if (revoked.length > 0 && failed.length > 0) await kickDaemonNow(deps)
   deps.print(`revoked: ${revoked.length === 0 ? "none" : revoked.join(", ")}${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
   return failed.length === 0 ? 0 : 1
 }

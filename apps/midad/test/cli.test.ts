@@ -510,6 +510,30 @@ describe("the crude mida command", () => {
     home.remove("agents/cursor/pending-request.json")
   }, 300_000)
 
+  it("a partial approve --all still kicks the daemon — one agent's grant landed", async () => {
+    const kicks: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: () => {}, kickDaemon: () => kicks.push("x"),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // claude-code re-requested for a real approval; cursor's stale file fails the store lookup
+    expect(await run2("revoke", "claude-code")).toBe(0)
+    expect(await run2("request", "claude-code")).toBe(0)
+    home.writeSecretJson("agents/cursor/pending-request.json", {
+      request: {
+        requestId: `0x${"cd".repeat(32)}`,
+        scopes: [{ namespaceId: `0x${"11".repeat(32)}`, permissions: 1, provenancePolicy: 0 }],
+        capabilityExpiresAt: "1999999999",
+      },
+    })
+    kicks.length = 0
+    expect(await run2("approve", "--all")).toBe(1)
+    // claude-code's approve landed, so the daemon was poked even though the batch exits 1
+    expect(kicks).toHaveLength(1)
+    home.remove("agents/cursor/pending-request.json")
+  }, 300_000)
+
   it("revoke --all lists every approved agent, asks once, and revokes each (I4)", async () => {
     const lines: string[] = []
     const asked: string[] = []
@@ -569,9 +593,11 @@ describe("the crude mida command", () => {
 
   it("revoke --all continues past a failing agent — the summary names both (I4)", async () => {
     const lines: string[] = []
+    const kicks: string[] = []
     const run2 = (...argv: string[]) =>
       runCli(argv, {
         home, network, print: (line) => lines.push(line),
+        kickDaemon: () => kicks.push("x"),
         prompt: async (question) => {
           // cursor's records vanish between the batch's list and its turn — the batch must survive it
           if (question === "Type yes to revoke all: ") {
@@ -586,12 +612,14 @@ describe("the crude mida command", () => {
     expect(await run2("request", "codex")).toBe(0)
     expect(await run2("approve", "codex")).toBe(0)
     home.remove("agents/cursor/revoked.json")
+    kicks.length = 0
     expect(await run2("revoke", "--all")).toBe(1)
     expect(lines.some((line) => line.startsWith("revoked codex on chain"))).toBe(true)
     expect(lines).toContain("cursor is not set up on this machine — run `mida init` first")
     expect(lines.at(-1)).toBe("revoked: codex; failed: cursor (agent-unidentified)")
-    // codex's revoke really landed even though cursor's failed
+    // codex's revoke really landed even though cursor's failed — marker written, daemon poked
     expect(home.has("agents/codex/revoked.json")).toBe(true)
+    expect(kicks).toHaveLength(1)
   }, 300_000)
 
   it("never prints a secret: no output line contains any key stored in the home folder", () => {
