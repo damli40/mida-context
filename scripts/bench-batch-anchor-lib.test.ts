@@ -156,9 +156,9 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--price-usd", "cheap"])).toThrow(/--price-usd/)
   })
 
-  it(`refuses --batch above ${MAX_BATCH_SIZE} and says why — Monad's per-transaction gas limit`, () => {
-    expect(() => parseArgs(["--price-usd", "1", "--batch", "433"])).toThrow(/30,000,000|gas/)
-    expect(() => parseArgs(["--price-usd", "1", "--batch", String(MAX_BATCH_SIZE + 1)])).toThrow(/30,000,000|gas/)
+  it(`refuses --batch above ${MAX_BATCH_SIZE} and says why — the 28M batch.submit budget, not the 30M wall`, () => {
+    expect(() => parseArgs(["--price-usd", "1", "--batch", "433"])).toThrow(/28,000,000/)
+    expect(() => parseArgs(["--price-usd", "1", "--batch", String(MAX_BATCH_SIZE + 1)])).toThrow(/28,000,000/)
     expect(() => parseArgs(["--price-usd", "1", "--batch", "1024"])).toThrow(new RegExp(String(MAX_BATCH_SIZE)))
   })
 

@@ -69,9 +69,13 @@ export interface BatchCoordinatorEnv {
  * The hard upper bound on saves per batch. Monad refuses any transaction over 30,000,000 gas
  * (docs.monad.xyz gas-pricing) and the "batch.submit" ceiling budgets 28,000,000 — at the sweep's
  * lowest measured per-save cost (61,457 gas; docs/evidence/batch-anchor-sweep-2026-09-24.json)
- * the bound is floor(28,000,000 × 0.95 / 61,457) = 432. 480 only LOOKED safe (~29.5M): it crosses
- * the ceiling the estimate is checked against. The batcher sizes each take by a learned gas
- * budget below this bound; the cap only guards a measurement that lies.
+ * the bound is floor(28,000,000 × 0.95 / 61,457) = 432. That per-save figure is a ONE-OWNER
+ * number: a batch of first-time owners runs ~166k gas per save on testnet
+ * (docs/evidence/batch-anchor-multi-owner-2026-09-24.json), so a full 432 of those would not
+ * fit — mixed/new-owner batches are kept inside the budget by the learned gas sizing and the
+ * refusal shrink, not by this bound. 480 only LOOKED safe (~29.5M): it crosses the ceiling the
+ * estimate is checked against. The batcher sizes each take by a learned gas budget below this
+ * bound; the cap only guards a measurement that lies.
  */
 const BATCH_CAP = 432
 const BATCH_WAIT_MS = 2_000

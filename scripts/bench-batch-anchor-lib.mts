@@ -9,13 +9,16 @@
 
 /**
  * The largest batch the runner submits in one transaction. The cap is operational, not a
- * contract limit (BatchAnchor.sol's MAX_BATCH is 1024): Monad refuses any transaction over
- * 30,000,000 gas, and the "batch.submit" ceiling budgets 28,000,000 — at the Sep 24 sweep's
- * lowest measured per-save cost (61,457 gas; docs/evidence/batch-anchor-sweep-2026-09-24.json)
- * the bound is floor(28,000,000 × 0.95 / 61,457) = 432. The earlier 480 was wrong: ~29.5M at
- * the same rate crosses the ceiling the estimate is checked against. The store's batcher sizes
- * each batch by a learned gas budget under the same rule; a larger --batch is refused rather
- * than weakening the limit.
+ * contract limit (BatchAnchor.sol's MAX_BATCH is 1024): the "batch.submit" ceiling budgets
+ * 28,000,000 gas under Monad's 30,000,000 per-transaction wall, and the bound is sized on
+ * ONE-OWNER saves — floor(28,000,000 × 0.95 / 61,457) = 432 at the Sep 24 sweep's lowest
+ * measured per-save cost (docs/evidence/batch-anchor-sweep-2026-09-24.json). A batch of
+ * first-time owners costs far more per save (~166k measured on testnet,
+ * docs/evidence/batch-anchor-multi-owner-2026-09-24.json), so mixed/new-owner batches are
+ * kept inside the budget by the batcher's learned gas sizing and refusal shrink, not by this
+ * bound. The earlier 480 was wrong: ~29.5M at the same rate crosses the ceiling the estimate
+ * is checked against. The store's batcher sizes each batch by a learned gas budget under the
+ * same rule; a larger --batch is refused rather than weakening the limit.
  */
 export const MAX_BATCH_SIZE = 432
 
@@ -55,9 +58,11 @@ function positiveInt(raw: string, flag: string): number {
  * Parses `--saves --batch --agents --price-usd --store`. `--price-usd` is required: the evidence
  * ties every wei number to a stated MON price and date, and a benchmark that silently picked a
  * price would produce cost numbers nobody can defend. `--batch` above 432 is refused with the
- * reason — it is Monad's 30,000,000-gas per-transaction limit at the sweep's ~61k per save, not
- * the contract's own limit. Unknown flags and stray positionals are refused too: a benchmark that
- * half-read its arguments reports numbers for a run that was not the one asked for.
+ * reason — it exceeds the 28,000,000-gas "batch.submit" budget at 95% for the sweep's lowest
+ * measured per-save cost, not the contract's own limit (a 433-save batch at ~61k gas per save
+ * would still fit Monad's 30M transaction wall, which is why the wall is not the reason). Unknown
+ * flags and stray positionals are refused too: a benchmark that half-read its arguments reports
+ * numbers for a run that was not the one asked for.
  */
 export function parseArgs(argv: string[]): BenchArgs {
   let saves = 20
@@ -76,7 +81,7 @@ export function parseArgs(argv: string[]): BenchArgs {
         const value = positiveInt(flagValue(argv, i, arg), arg)
         if (value > MAX_BATCH_SIZE) {
           throw new Error(
-            `--batch is capped at ${MAX_BATCH_SIZE}: Monad refuses any transaction over 30,000,000 gas and the Sep 24 sweep measured ~61k gas per save, so a larger batch would not fit the per-transaction limit`,
+            `--batch is capped at ${MAX_BATCH_SIZE}: the batch.submit budget is 28,000,000 gas and the Sep 24 sweep's lowest measured cost was 61,457 gas per save, so floor(28,000,000 × 0.95 / 61,457) = 432 — a larger batch exceeds the submit budget`,
           )
         }
         batch = value

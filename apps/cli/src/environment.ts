@@ -98,7 +98,9 @@ export async function startApiServer(input: {
       timer,
       now: () => Date.now(),
       // Hard bound 432 = floor(28,000,000 × 0.95 / 61,457) — the "batch.submit" ceiling at 95%
-      // over the sweep's lowest measured gas per save; the learned budget sizes real takes below it.
+      // over the sweep's lowest measured gas per save, a ONE-OWNER figure. First-time-owner
+      // saves run ~166k gas each on testnet (docs/evidence/batch-anchor-multi-owner-2026-09-24.json),
+      // so mixed/new-owner batches rely on the learned budget and refusal shrink, not this bound.
       cap: input.batching?.cap ?? 432,
       waitMs: input.batching?.waitMs ?? 2_000,
       minGapMs: input.batching?.minGapMs ?? 1_000,
