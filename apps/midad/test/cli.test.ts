@@ -433,6 +433,83 @@ describe("the crude mida command", () => {
     expect(ownerCommandNotice({ ...resolved, mismatch: undefined } as ResolvedNetwork, "migrate")).toBeUndefined()
   })
 
+  it("approve --all lists every pending request, asks once, and approves each (I3)", async () => {
+    const lines: string[] = []
+    const asked: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async (question) => { asked.push(question); return "yes" },
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // two pending: claude-code is still revoked from the revoke test above, so a request files
+    // a fresh one; cursor's pending request is the one `mida install cursor` left behind
+    expect(await run2("request", "claude-code")).toBe(0)
+    expect(home.has("agents/cursor/pending-request.json")).toBe(true)
+    expect(await run2("approve", "--all")).toBe(0)
+    // one list, then the single shared ask — never a per-agent prompt
+    expect(asked).toEqual(["Type yes to approve all: "])
+    expect(lines.filter((line) => line.endsWith("is asking for:")).length).toBe(2)
+    expect(lines.filter((line) => line.startsWith("It will see this context as plain text.")).length).toBe(1)
+    expect(lines.some((line) => line.startsWith("approved claude-code"))).toBe(true)
+    expect(lines.some((line) => line.startsWith("approved cursor"))).toBe(true)
+    expect(lines.at(-1)).toBe("approved: claude-code, cursor")
+    // both pending files are consumed — nothing waits anymore
+    expect(home.has("agents/claude-code/pending-request.json")).toBe(false)
+    expect(home.has("agents/cursor/pending-request.json")).toBe(false)
+    // and the nothing-pending answer is honest: exit 0, no prompt at all
+    asked.length = 0
+    expect(await run2("approve", "--all")).toBe(0)
+    expect(asked).toHaveLength(0)
+    expect(lines.at(-1)).toBe("nothing to approve — no agent has a pending request")
+  }, 300_000)
+
+  it("approve --all with anything but yes approves nobody (I3)", async () => {
+    const lines: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async () => "no",
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // a fresh pending request for a revoked agent — claude-code was approved above, so revoke first
+    expect(await run2("revoke", "claude-code")).toBe(0)
+    expect(await run2("request", "claude-code")).toBe(0)
+    expect(await run2("approve", "--all")).toBe(1)
+    expect(lines).toContain("not approved")
+    expect(lines.some((line) => line.startsWith("approved claude-code"))).toBe(false)
+    expect(home.has("agents/claude-code/pending-request.json")).toBe(true)
+    // restore: a yes approves it for real
+    expect(await run("approve", "claude-code")).toBe(0)
+  }, 300_000)
+
+  it("approve --all continues past a failing agent — the summary names both (I3)", async () => {
+    const lines: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async () => "yes",
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // codex real-pending (it is live, so revoke+request); cursor gets a stale file whose
+    // requestId the store never held — approve refuses it with no-pending-request
+    expect(await run2("revoke", "codex")).toBe(0)
+    expect(await run2("request", "codex")).toBe(0)
+    home.writeSecretJson("agents/cursor/pending-request.json", {
+      request: {
+        requestId: `0x${"ab".repeat(32)}`,
+        scopes: [{ namespaceId: `0x${"11".repeat(32)}`, permissions: 1, provenancePolicy: 0 }],
+        capabilityExpiresAt: "1999999999",
+      },
+    })
+    expect(await run2("approve", "--all")).toBe(1)
+    expect(lines.some((line) => line.startsWith("approved codex"))).toBe(true)
+    expect(lines).toContain("cursor has no pending request — run `mida request cursor` first")
+    expect(lines.at(-1)).toBe("approved: codex; failed: cursor (no-pending-request)")
+    expect(home.has("agents/codex/pending-request.json")).toBe(false)
+    home.remove("agents/cursor/pending-request.json")
+  }, 300_000)
+
   it("never prints a secret: no output line contains any key stored in the home folder", () => {
     const secrets: string[] = []
     const walk = (folder: string) => {

@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createInterface } from "node:readline"
 import { decodeUint64, isMidaError, namespaceById } from "@mida/protocol"
-import type { Hex } from "@mida/protocol"
+import type { Hex, RequestedScope } from "@mida/protocol"
 import type { Deployment } from "@mida/chain"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { permissionNames } from "@mida/grant-advisor"
@@ -19,7 +19,7 @@ import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installMcpClient, uninstallClaudeCode, uninstallCodex, uninstallMcpClient } from "./install.js"
 import type { InstallTool, McpClientTool } from "./install.js"
-import { checkProject } from "./projects.js"
+import { checkProject, ensureProjectMarker } from "./projects.js"
 import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, readOwnerFacts, remember } from "./remember.js"
 import { Runtime, NAMESPACE, ServiceRuntime } from "./runtime.js"
@@ -51,7 +51,7 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
  */
 const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | batching on|off | migrate [--undo]" +
+  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | batching on|off | migrate [--undo]" +
   "   (tool = claude-code | codex | claude-desktop | cursor; agent = claude-code | codex | assistant — or the identity a client installs)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
 export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", ...WITH_AGENT]
@@ -374,6 +374,9 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
         deps.print(`refused: ${result.code}`)
       }
       return result.kind === "remembered" ? 0 : 1
+    } else if (command === "approve" && agent === "--all") {
+      if (argv.length !== 2) return usage()
+      return await approveAll(runtime, deps)
     } else if (command === "approve") {
       const prompt = deps.prompt ?? terminalPrompt
       const drain = deps.drainInput ?? drainBufferedStdin
@@ -472,6 +475,80 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     }
     return 1
   }
+}
+
+/**
+ * The agents `approve --all` lists: every registered identity whose pending request is still
+ * waiting — the file `mida request` or `mida install` left for the owner to answer. Sorted by
+ * listAgentNames, so the list reads the same on every run.
+ */
+function pendingAgents(home: MidaHome): string[] {
+  return listAgentNames(home).filter((name) => home.has(`agents/${name}/pending-request.json`))
+}
+
+/**
+ * The combined preview `approve --all` prints before its single ask: per pending agent the same
+ * "is asking for" scope lines a single approve shows, plus the project this folder holds. This
+ * reads the pending file only — each approve re-checks everything against the chain before it
+ * signs, so a request that went stale between the list and its turn lands in `failed`, never in
+ * a wrong grant.
+ */
+function printPendingApprovals(deps: CliDeps, home: MidaHome, agents: string[], projectId: string | undefined): void {
+  for (const name of agents) {
+    deps.print(`${name} is asking for:`)
+    if (projectId !== undefined) deps.print(`  project ${projectId} (this folder)`)
+    const pending = home.readJson<{ request?: { scopes?: RequestedScope[]; capabilityExpiresAt?: string } }>(`agents/${name}/pending-request.json`)?.request
+    for (const scope of pending?.scopes ?? []) {
+      deps.print(`  ${namespaceLabel(scope.namespaceId)}: ${permissionNames(scope.permissions).join(" + ")}`)
+    }
+    if (pending?.capabilityExpiresAt !== undefined) {
+      deps.print(`  until ${new Date(Number(decodeUint64(pending.capabilityExpiresAt)) * 1000).toISOString()}`)
+    }
+  }
+}
+
+/**
+ * `mida approve --all`: one combined list, one typed yes, then each approve runs in turn — the
+ * batch ask already covered every agent, so each approve signs without asking again. A failure
+ * names itself and the next agent still runs; the last line is the verdict. Nothing pending says
+ * so and exits 0 — the answer "everyone is approved" is honest without a transaction.
+ */
+async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
+  const agents = pendingAgents(runtime.home)
+  if (agents.length === 0) {
+    deps.print("nothing to approve — no agent has a pending request")
+    return 0
+  }
+  // The marker resolves before the list, exactly as a single approve resolves it before the ask:
+  // a folder that may not hold a project refuses here, before any signature.
+  const marker = deps.cwd === undefined ? undefined : ensureProjectMarker(deps.cwd)
+  printPendingApprovals(deps, runtime.home, agents, marker?.projectId)
+  deps.print("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
+  const prompt = deps.prompt ?? terminalPrompt
+  const drain = deps.drainInput ?? drainBufferedStdin
+  await drain()
+  if ((await prompt("Type yes to approve all: ")).trim() !== "yes") {
+    deps.print("not approved")
+    return 1
+  }
+  const approved: string[] = []
+  const failed: string[] = []
+  for (const name of agents) {
+    try {
+      const result = await approve(runtime, name, deps.cwd)
+      approved.push(name)
+      deps.print(
+        result.transactionHash === null
+          ? `${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`
+          : `approved ${name} tx ${result.transactionHash}`,
+      )
+    } catch (error) {
+      deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry))
+      failed.push(`${name} (${refusalCode(error)})`)
+    }
+  }
+  deps.print(`approved: ${approved.length === 0 ? "none" : approved.join(", ")}${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
+  return failed.length === 0 ? 0 : 1
 }
 
 /**
@@ -735,6 +812,13 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
     const session = await ServiceRuntime.openOwnerSession(deps.home, deps.network)
     try {
       session.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
+      if (command === "approve" && agent === "--all") {
+        if (argv.length !== 2) {
+          deps.print(USAGE)
+          return 2
+        }
+        return await passkeyApproveAll(session, deps, linkDeps)
+      }
       if (command === "approve") {
         const result = await approvePasskey(session, agent, deps.cwd, linkDeps)
         if (result.listOnly) {
@@ -785,6 +869,48 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
     }
     return 1
   }
+}
+
+/**
+ * `mida approve --all` on a passkey home: the same combined list and one terminal yes as the
+ * software path, then ONE owner-link round per agent — the passkey is asked once per signature
+ * and never once for the batch. A declined or failed agent names itself and the next still runs.
+ */
+async function passkeyApproveAll(session: ServiceRuntime, deps: CliDeps, linkDeps: PasskeyDeps): Promise<number> {
+  const agents = pendingAgents(session.home)
+  if (agents.length === 0) {
+    deps.print("nothing to approve — no agent has a pending request")
+    return 0
+  }
+  const marker = deps.cwd === undefined ? undefined : ensureProjectMarker(deps.cwd)
+  printPendingApprovals(deps, session.home, agents, marker?.projectId)
+  deps.print("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
+  const prompt = deps.prompt ?? terminalPrompt
+  const drain = deps.drainInput ?? drainBufferedStdin
+  await drain()
+  if ((await prompt("Type yes to approve all: ")).trim() !== "yes") {
+    deps.print("not approved")
+    return 1
+  }
+  const approved: string[] = []
+  const failed: string[] = []
+  for (const name of agents) {
+    try {
+      const result = await approvePasskey(session, name, deps.cwd, linkDeps)
+      approved.push(name)
+      deps.print(
+        result.listOnly
+          ? `${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`
+          : `approved ${name} via your passkey — tx ${result.transactionHashes.join(" ")}`,
+      )
+    } catch (error) {
+      // A page outcome already IS the line the owner reads; a coded error goes through the mapper.
+      deps.print(error instanceof OwnerLinkOutcome ? error.line : ownerRefusalLine("approve", name, error, undefined, deps.network.deployment.capabilityRegistry))
+      failed.push(`${name} (${error instanceof OwnerLinkOutcome ? "declined" : refusalCode(error)})`)
+    }
+  }
+  deps.print(`approved: ${approved.length === 0 ? "none" : approved.join(", ")}${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
+  return failed.length === 0 ? 0 : 1
 }
 
 /**
