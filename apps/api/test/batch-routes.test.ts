@@ -84,6 +84,10 @@ const reader = {
   getCapability: async (id: Hex) => (id === READ_CAP ? readCapability : null),
   agentEpoch: async () => 0n,
   now: async () => NOW_SECONDS,
+  // Every fixture save seals under epoch 1 — the admission gate asks the chain for the current
+  // write epoch and whether it still accepts writes, so the fake answers both.
+  requiredReadEpoch: async () => 1n,
+  isWriteEpochValid: async () => true,
   hasAuthority: async () => true,
   ownerP256Key: async (owner: Address) => (owner.toLowerCase() === OWNER ? { qx: 1n, qy: 2n } : null),
 } as unknown as RegistryReader
