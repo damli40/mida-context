@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { spawn } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import type { Socket } from "node:net"
 import { tmpdir } from "node:os"
@@ -203,9 +203,11 @@ describe("mida-mcp args", () => {
   }, 20_000)
 
   it("the real entry starts and stays alive on stdio even with no daemon to reach", async () => {
-    // a home with no network.json can never have a daemon — the server must still come up.
-    // it only gets that far when the startup gate passes: a registered identity and a marked project
+    // the marker makes this a real home, but the empty network.json means no usable daemon —
+    // the spawned midad dies on it and the server must still come up. it only gets that far
+    // when the startup gate passes: a registered identity and a marked project
     const dir = home()
+    dir.writeSecretJson("network.json", {})
     mkdirSync(join(dir.root, "agents", "codex"), { recursive: true })
     writeFileSync(join(dir.root, "agents", "codex", "identity.json"), "{}")
     const project = projectDir()
@@ -231,7 +233,13 @@ describe("mida-mcp args", () => {
 })
 
 describe("mida-mcp startup gate", () => {
-  const makeHome = () => new MidaHome(mkdtempSync(join(tmpdir(), "mida-gate-")))
+  // a real home so the spawned entry reaches the gate — the marker check (G11) refuses a
+  // folder that exists but has no network.json before startupCheck is even consulted
+  const makeHome = () => {
+    const dir = new MidaHome(mkdtempSync(join(tmpdir(), "mida-gate-")))
+    dir.writeSecretJson("network.json", {})
+    return dir
+  }
   const makeProject = () => {
     const dir = mkdtempSync(join(tmpdir(), "mida-proj-"))
     mkdirSync(join(dir, ".mida"))
@@ -436,6 +444,26 @@ describe("mida-mcp startup gate", () => {
     const code = await new Promise((r) => child.on("exit", r))
     expect(code).toBe(2)
     expect(stderr).toContain("is not a folder")
+  }, 20_000)
+
+  it("an existing folder that is not a Mida home is refused — no network.json, mode untouched (G11)", async () => {
+    // mkdtemp lands 0700 already; widen it so the test can prove the refusal did not chmod
+    const dir = mkdtempSync(join(tmpdir(), "mida-nothome-"))
+    chmodSync(dir, 0o755)
+    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "codex", "--project", makeProject()], {
+      env: { ...process.env, MIDA_HOME: dir },
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (b) => (stdout += b))
+    child.stderr.on("data", (b) => (stderr += b))
+    const code = await new Promise((r) => child.on("exit", r))
+    expect(code).toBe(2)
+    expect(stdout).toBe("")
+    expect(stderr).toContain("not a Mida home")
+    expect(stderr).toContain(dir)
+    expect(statSync(dir).mode & 0o777).toBe(0o755)
   }, 20_000)
 
   // the launcher's node fallback only matters when a candidate path exists — /opt/homebrew, /usr/local, ~/.volta

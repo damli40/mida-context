@@ -14,7 +14,9 @@ import { randomBytes } from "node:crypto"
  * value is refused with a plain message, never silently pointed somewhere else.
  *
  * `mustExist` is for entry points that must never CREATE the home: the MCP adapter refuses a
- * mistyped MIDA_HOME rather than let the constructor mkdir/chmod the wrong folder first.
+ * mistyped MIDA_HOME rather than let the constructor mkdir/chmod the wrong folder first —
+ * and a folder that exists but is no Mida home (init's network.json is missing) is refused
+ * too, mode untouched, since chmod would be the wrong folder's first mutation.
  */
 export function resolveHome(
   env: { MIDA_HOME?: string | undefined } = process.env,
@@ -45,6 +47,10 @@ function assertHomeExists(root: string): void {
     throw new Error(`the Mida home ${root} could not be read (${code ?? "unknown error"})`)
   }
   if (!stat.isDirectory()) throw new Error(`the Mida home ${root} is not a folder`)
+  // init writes network.json; a folder without it is not a Mida home the adapter may adopt
+  if (!existsSync(join(root, "network.json"))) {
+    throw new Error(`the folder ${root} is not a Mida home — it has no network.json; check MIDA_HOME or run \`mida init\` first`)
+  }
 }
 
 /** One folder that holds everything Mida keeps on this machine. Secrets in it are readable by the user only. */
