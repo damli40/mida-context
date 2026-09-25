@@ -159,13 +159,19 @@ const BUILTIN_COMMANDS = new Set([
 // A custom slash command's real ask hides inside its echo: Claude Code logs
 // `/brainstorm build a login page` as <command-name>/<command-message>/
 // <command-args>, so the request is "/name args" — or just "/name" when the
-// command takes no arguments. The real echo puts <command-message> FIRST, so
-// the name tag is searched anywhere in the line, not only at the start.
+// command takes no arguments. A line counts as an echo only when, after
+// leading whitespace, it OPENS on <command-message> or <command-name> — a
+// prompt that merely quotes the tags mid-sentence is the user's prose, and
+// their words stay the request (L4). The real echo can put <command-message>
+// FIRST, so the name tag is searched anywhere in the line, not only at the
+// start.
 // Returns null for a built-in, whether the name list catches it or the plumbing
 // does: Claude Code answers built-ins with a <local-command-caveat> or
 // <local-command-stdout>/<stderr> block on a NEIGHBOURING user line, so the
-// caller also passes whether such a line sits within two lines of this one.
+// caller also passes whether one sits at the neighbouring positions.
 function slashCommandRequest(text: string, neighbourLocalCommand: boolean): string | null {
+  const trimmed = text.trimStart()
+  if (!trimmed.startsWith("<command-message>") && !trimmed.startsWith("<command-name>")) return null
   const name = /<command-name>\s*(\/\S+)\s*<\/command-name>/.exec(text)?.[1]
   if (name === undefined) return null
   if (BUILTIN_COMMANDS.has(name.slice(1))) return null

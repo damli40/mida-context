@@ -334,6 +334,27 @@ describe("readConversation", () => {
     expect(r.text).toContain("L~1 user:\n/brainstorm plan the migration")
   })
 
+  // L4: a prompt that QUOTES the command tag in prose is not a command echo —
+  // the tag has to open the line (after leading whitespace) for the line to be
+  // plumbing. Otherwise the user's words would be replaced by the quoted name.
+  it("a prompt quoting a command tag mid-sentence is the request, not an echo (L4)", () => {
+    const dir = tmpdir()
+    const prose = "when the transcript logs <command-name>/brainstorm</command-name> mid-line, is that an echo?"
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: prose } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "good question" }] } }),
+    ])
+    const r = readConversation(t)
+    expect(r.firstUserMessage).toBe(prose)
+    // and a real echo still resolves after leading whitespace
+    const dir2 = tmpdir()
+    const indented = writeTranscript(dir2, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "   <command-message>review</command-message>\n<command-name>/review</command-name>" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "reviewing" }] } }),
+    ])
+    expect(readConversation(indented).firstUserMessage).toBe("/review")
+  })
+
   it("a custom command without arguments still names itself as the request", () => {
     const dir = tmpdir()
     const t = writeTranscript(dir, [
