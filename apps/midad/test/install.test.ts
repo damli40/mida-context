@@ -17,6 +17,7 @@ import {
   installClaudeCode,
   installCodex,
   parseMidaCommand,
+  recordCodexHome,
   recordedCodexHome,
   runInstall,
   uninstallClaudeCode,
@@ -339,6 +340,58 @@ describe("mida install codex", () => {
     expect(readFileSync(config, "utf8")).toBe(`${codexBlock()}\n`)
     expect(readFileSync(midaHome.path("codex-home"), "utf8")).toBe(`${codexHome}\n`)
     expect(recordedCodexHome(midaHome)).toBe(codexHome)
+  })
+
+  /** runInstall under a pinned CODEX_HOME, collecting printed lines. */
+  const runCodexInstall = (argv: string[], codexHome: string, midaHome: MidaHome, lines: string[]) => {
+    const previous = process.env.CODEX_HOME
+    process.env.CODEX_HOME = codexHome
+    try {
+      return runInstall(argv, {
+        print: (line) => lines.push(line),
+        claudeSettings: join(dir(), "settings.json"),
+        codexConfig: join(codexHome, "config.toml"),
+        home: midaHome,
+      })
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_HOME
+      else process.env.CODEX_HOME = previous
+    }
+  }
+
+  it("installing under a different CODEX_HOME names the home that stops being trusted (F8)", () => {
+    const homeA = mkdtempSync(join(tmpdir(), "mida-codex-a-"))
+    const homeB = mkdtempSync(join(tmpdir(), "mida-codex-b-"))
+    const midaHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-home-")))
+    recordCodexHome(midaHome, homeA)
+    const lines: string[] = []
+    expect(runCodexInstall(["install", "codex"], homeB, midaHome, lines)).toBe(0)
+    // the record moved to the new home…
+    expect(recordedCodexHome(midaHome)).toBe(homeB)
+    // …and the owner heard which home is no longer trusted
+    expect(lines.some((line) => line.includes(homeA) && line.includes("no longer trusted"))).toBe(true)
+  })
+
+  it("re-installing under the recorded home prints no move line (F8)", () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "mida-codex-same-"))
+    const midaHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-home-")))
+    recordCodexHome(midaHome, codexHome)
+    const lines: string[] = []
+    expect(runCodexInstall(["install", "codex"], codexHome, midaHome, lines)).toBe(0)
+    expect(lines.every((line) => !line.includes("no longer trusted"))).toBe(true)
+    expect(recordedCodexHome(midaHome)).toBe(codexHome)
+  })
+
+  it("uninstall clears the recorded home — nothing stays trusted (F8)", () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "mida-codex-off-"))
+    const midaHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-home-")))
+    const lines: string[] = []
+    expect(runCodexInstall(["install", "codex"], codexHome, midaHome, lines)).toBe(0)
+    expect(recordedCodexHome(midaHome)).toBe(codexHome)
+    lines.length = 0
+    expect(runCodexInstall(["uninstall", "codex"], codexHome, midaHome, lines)).toBe(0)
+    expect(recordedCodexHome(midaHome)).toBeUndefined()
+    expect(midaHome.has("codex-home")).toBe(false)
   })
 
   it("the managed block carries the whats-new hook on the same inject command, absolutely (R5-7)", () => {

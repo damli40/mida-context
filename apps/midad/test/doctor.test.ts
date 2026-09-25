@@ -1,15 +1,20 @@
 import { describe, expect, it } from "vitest"
+import { spawn } from "node:child_process"
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import type { AddressInfo, Server } from "node:net"
 import { createServer as createHttpServer } from "node:http"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { parseDeployment } from "@mida/chain"
-import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, installClaudeCode, installCodex, loadOrCreateOwnerSecrets, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, installClaudeCode, installCodex, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
+
+const repo = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
+const tsxLoader = join(repo, "node_modules/tsx/dist/loader.mjs")
+const cliMainPath = join(repo, "apps/midad/src/cli.ts")
 
 /** A stub listener on the home's control socket that answers every request with `status` + JSON `body`. */
 async function stubDaemon(home: MidaHome, status: number, body: unknown): Promise<Server> {
@@ -469,6 +474,33 @@ describe("mida doctor without a chain", () => {
     expect(lines).toContain("ok: claude-code hooks installed")
     expect(lines).toContain("ok: codex hooks installed")
   })
+
+  // F8: the codex config doctor checks is the home `mida install codex` RECORDED — a
+  // CODEX_HOME exported into the shell afterwards must not redirect the check. The real
+  // `mida doctor` entry is spawned because the resolution lives in main's settings wiring.
+  it("the real doctor checks the recorded Codex home, not the shell's CODEX_HOME (F8)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    // the recorded home holds a complete managed block…
+    const recorded = mkdtempSync(join(tmpdir(), "mida-codex-recorded-"))
+    installCodex(join(recorded, "config.toml"))
+    recordCodexHome(home, recorded)
+    // …while the shell's CODEX_HOME points at a home with NO hooks
+    const elsewhere = mkdtempSync(join(tmpdir(), "mida-codex-elsewhere-"))
+    const res = await new Promise<{ status: number | null; stdout: string; stderr: string }>((done, reject) => {
+      const child = spawn(process.execPath, ["--import", tsxLoader, cliMainPath, "doctor"], {
+        env: { HOME: mkdtempSync(join(tmpdir(), "mida-doctor-home-")), MIDA_HOME: home.root, CODEX_HOME: elsewhere, PATH: process.env.PATH ?? "" },
+        cwd: "/tmp",
+      })
+      let stdout = ""
+      let stderr = ""
+      child.stdout.on("data", (b: Buffer) => (stdout += b.toString("utf8")))
+      child.stderr.on("data", (b: Buffer) => (stderr += b.toString("utf8")))
+      child.on("error", reject)
+      child.on("exit", (code) => done({ status: code, stdout, stderr }))
+    })
+    expect(res.stdout).toContain("ok: codex hooks installed")
+    expect(res.stdout).not.toContain("codex hooks are not installed")
+  }, 60_000)
 })
 
 describe("mida doctor --live", () => {

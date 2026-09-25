@@ -9,7 +9,7 @@ import type { Hex } from "@mida/protocol"
 import type { Deployment } from "@mida/chain"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { permissionNames } from "@mida/grant-advisor"
-import { recordCodexHome, resolveCodexHome } from "./codex-home.js"
+import { clearCodexHome, recordCodexHome, recordedCodexHome, resolveCodexHome, trustedCodexHome } from "./codex-home.js"
 import { callDaemon, ensureCurrentDaemon } from "./control.js"
 import { batchStatusProbe, decideLane, laneWhyText } from "./batching.js"
 import { debugLine, refusalCode } from "./debug-line.js"
@@ -875,9 +875,20 @@ export function runInstall(
     deps.print(outcome === "already-installed" ? "already installed" : outcome === "not-installed" ? "not installed" : outcome)
     if (argv[0] === "install" && tool === "codex") {
       // the hook and the drain never see Codex's own environment — the home install wrote into
-      // is recorded so <CODEX_HOME>/sessions becomes a trusted transcript root
-      recordCodexHome(deps.home, resolveCodexHome(process.env, homedir()))
+      // is recorded so <CODEX_HOME>/sessions becomes a trusted transcript root. When the record
+      // moves, the owner is told which home stops being trusted (F8).
+      const previous = recordedCodexHome(deps.home)
+      const resolved = resolveCodexHome(process.env, homedir())
+      recordCodexHome(deps.home, resolved)
+      if (previous !== undefined && previous !== resolved) {
+        deps.print(`the Codex home moved: ${previous} is no longer trusted — rollouts under it are not read`)
+      }
       if (outcome === "installed") deps.print(CODEX_TRUST_SENTENCE)
+    }
+    if (argv[0] === "uninstall" && tool === "codex") {
+      // with the managed block gone no Codex home is trusted for transcripts — the record
+      // clears whatever the shell's CODEX_HOME happens to say now
+      clearCodexHome(deps.home)
     }
     return 0
   } catch (error) {
@@ -938,7 +949,9 @@ async function main(): Promise<void> {
   if (argv[0] === "doctor") {
     const settings = {
       "claude-code": join(homedir(), ".claude", "settings.json"),
-      codex: join(resolveCodexHome(process.env, homedir()), "config.toml"),
+      // doctor checks the home install recorded — a CODEX_HOME exported since must not
+      // redirect the check away from where the hooks actually live (F8)
+      codex: join(trustedCodexHome(home, process.env, homedir()), "config.toml"),
     }
     if (argv[1] === "--live") {
       const tool = argv[2] ?? ""

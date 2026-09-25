@@ -58,3 +58,21 @@ export function recordedCodexHome(home: MidaHome): string | undefined {
     return undefined
   }
 }
+
+/**
+ * Removes the recorded Codex home — `mida uninstall codex` calls it: with Mida's block gone
+ * from the config, no Codex home is trusted for transcripts until an install records one again.
+ */
+export function clearCodexHome(home: MidaHome): void {
+  home.remove("codex-home")
+}
+
+/**
+ * The Codex home every operation but install trusts: the home install RECORDED wins over the
+ * shell's current CODEX_HOME — doctor, the hook and the drain run in processes that may carry a
+ * different (or no) CODEX_HOME than the one install wrote into, and a later export must not
+ * redirect them. The environment only speaks when nothing is recorded.
+ */
+export function trustedCodexHome(home: MidaHome, env: NodeJS.ProcessEnv, homeDir: string): string {
+  return recordedCodexHome(home) ?? resolveCodexHome(env, homeDir)
+}
