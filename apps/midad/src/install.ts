@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { basename, dirname, isAbsolute, join } from "node:path"
 import { randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
@@ -84,11 +84,26 @@ function readMcpConfig(configPath: string): { text: string; config: Record<strin
 }
 
 /**
+ * Ours only when the entry runs this client's identity out of this Mida home — an entry that
+ * shares the mida-<client> name but was written by anything else (or points at another home)
+ * is the user's server, and neither install nor uninstall may touch it.
+ */
+function isMidaServerEntry(value: unknown, client: McpClientTool, homeRoot: string | undefined): boolean {
+  if (!isPlainObject(value)) return false
+  const args = value.args
+  if (!Array.isArray(args) || args[0] !== "--as" || args[1] !== client) return false
+  return homeRoot === undefined || (isPlainObject(value.env) && value.env.MIDA_HOME === homeRoot)
+}
+
+/**
  * Merges Mida's server entry into the client's MCP config. Everything else in the file is kept
  * as parsed — other servers, other keys. A backup of the pre-install bytes is taken once, and
- * re-running with the same entry changes nothing.
+ * re-running with the same entry changes nothing. An existing entry under our name is rewritten
+ * only when it is recognisably Mida's (this client's --as, this home's MIDA_HOME); anything else
+ * refuses rather than overwrite a server someone else owns. An ours-but-stale entry reports
+ * what moved — re-installing from another folder or checkout is silent about nothing.
  */
-export function installMcpClient(client: McpClientTool, configPath: string, homeRoot: string, cwd: string): InstallOutcome {
+export function installMcpClient(client: McpClientTool, configPath: string, homeRoot: string, cwd: string): McpInstallOutcome {
   const name = MCP_SERVER_NAME[client]
   const entry = mcpServerEntry(client, homeRoot, cwd)
   const read = readMcpConfig(configPath)
@@ -99,26 +114,38 @@ export function installMcpClient(client: McpClientTool, configPath: string, home
   }
   const { text, config } = read
   const servers = (config.mcpServers ?? {}) as Record<string, unknown>
-  if (isDeepStrictEqual(servers[name], entry)) return "already-installed"
+  const existing = servers[name]
+  if (isDeepStrictEqual(existing, entry)) return "already-installed"
+  if (existing !== undefined && !isMidaServerEntry(existing, client, homeRoot)) {
+    throw new Error(`a server named ${name} exists and is not Mida's — rename it or remove it`)
+  }
   const backup = `${configPath}.mida-backup`
   if (!existsSync(backup)) writeFileSync(backup, text)
   servers[name] = entry
   config.mcpServers = servers
   writeFileAtomic(configPath, `${JSON.stringify(config, null, detectIndent(text))}\n`)
-  return "installed"
+  if (existing === undefined) return "installed"
+  // name the field that moved: the project folder first, else the launcher path (a moved checkout)
+  const projectOf = (value: unknown): unknown =>
+    isPlainObject(value) && Array.isArray(value.args) ? value.args[value.args.indexOf("--project") + 1] : undefined
+  const from = projectOf(existing) !== projectOf(entry) ? projectOf(existing) : (existing as { command?: unknown }).command
+  const to = projectOf(existing) !== projectOf(entry) ? projectOf(entry) : entry.command
+  return { moved: { from: String(from), to: String(to) } }
 }
 
 /**
  * Removes only Mida's server entry — the client's identity and its approvals stay behind.
- * mcpServers itself goes only when it is empty and was not in the pre-install backup.
+ * mcpServers itself goes only when it is empty and was not in the pre-install backup. A config
+ * with no mcpServers key, or a same-name entry that is not Mida's, is simply "not-installed":
+ * there is nothing of ours to remove.
  */
-export function uninstallMcpClient(client: McpClientTool, configPath: string): UninstallOutcome {
+export function uninstallMcpClient(client: McpClientTool, configPath: string, homeRoot?: string): UninstallOutcome {
   const name = MCP_SERVER_NAME[client]
   const read = readMcpConfig(configPath)
   if (read === "absent") return "not-installed"
   const { text, config } = read
-  const servers = config.mcpServers as Record<string, unknown>
-  if (!(name in servers)) return "not-installed"
+  const servers = (config.mcpServers ?? {}) as Record<string, unknown>
+  if (!isMidaServerEntry(servers[name], client, homeRoot)) return "not-installed"
   delete servers[name]
   if (Object.keys(servers).length === 0 && !existedBeforeInstall(configPath, ["mcpServers"])) {
     delete config.mcpServers
@@ -227,6 +254,8 @@ const CLAUDE_EVENTS: readonly string[] = ["SessionStart", "UserPromptSubmit", "P
 
 export type InstallOutcome = "installed" | "already-installed"
 export type UninstallOutcome = "uninstalled" | "not-installed"
+/** An MCP install that overwrote our own stale entry reports what moved (project folder or launcher path). */
+export type McpInstallOutcome = InstallOutcome | { moved: { from: string; to: string } }
 
 function settingsUnreadable(): Error {
   const error = new Error("the settings file cannot be read safely") as Error & { code: string }
@@ -256,11 +285,16 @@ function detectIndent(text: string): string | number {
   return match === null ? 2 : match[1]!
 }
 
-/** Same-folder temp file, then rename — a crash never leaves a half-written settings file. */
+/**
+ * Same-folder temp file, then rename — a crash never leaves a half-written settings file. The
+ * existing file's mode is copied onto the temp before the rename: a 0600 client config must not
+ * come back 0644 just because Mida edited it.
+ */
 function writeFileAtomic(file: string, text: string): void {
   const temp = `${file}.${randomBytes(6).toString("hex")}.tmp`
   try {
     writeFileSync(temp, text)
+    if (existsSync(file)) chmodSync(temp, statSync(file).mode & 0o777)
     renameSync(temp, file)
   } catch (error) {
     rmSync(temp, { force: true })

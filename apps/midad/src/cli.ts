@@ -17,7 +17,7 @@ import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
 import { generalAssistanceText, identityUnreadableText, isGeneralAssistant, noIdentityText, projectCheckRefusal } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
-import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installMcpClient, uninstallClaudeCode, uninstallCodex, uninstallMcpClient } from "./install.js"
+import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installMcpClient, uninstallClaudeCode, uninstallCodex, uninstallMcpClient } from "./install.js"
 import type { InstallTool, McpClientTool } from "./install.js"
 import { checkProject, ensureProjectMarker } from "./projects.js"
 import { projectIdFor } from "./queue.js"
@@ -452,7 +452,12 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
         ? cursorMcpConfigPath(cwd)
         : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
       const outcome = installMcpClient(client, configPath, runtime.home.root, cwd)
-      deps.print(outcome === "already-installed" ? "already installed" : "installed")
+      if (typeof outcome === "object") {
+        deps.print("installed")
+        deps.print(`the ${MCP_SERVER_NAME[client]} entry moved from ${outcome.moved.from} to ${outcome.moved.to}`)
+      } else {
+        deps.print(outcome === "already-installed" ? "already installed" : "installed")
+      }
       deps.print(`next: run \`mida approve ${client}\` in this folder`)
     } else if (command === "batching") {
       return await runBatching(runtime, argv[1], deps)
@@ -964,7 +969,12 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
           ? cursorMcpConfigPath(cwd)
           : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
         const outcome = installMcpClient(client, configPath, deps.home.root, cwd)
-        deps.print(outcome === "already-installed" ? "already installed" : "installed")
+        if (typeof outcome === "object") {
+          deps.print("installed")
+          deps.print(`the ${MCP_SERVER_NAME[client]} entry moved from ${outcome.moved.from} to ${outcome.moved.to}`)
+        } else {
+          deps.print(outcome === "already-installed" ? "already installed" : "installed")
+        }
         deps.print(`next: run \`mida approve ${client}\` in this folder`)
         return 0
       } finally {
@@ -1301,7 +1311,7 @@ export function runInstall(
       ? cursorMcpConfigPath(cwd)
       : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
     try {
-      const outcome = uninstallMcpClient(client, configPath)
+      const outcome = uninstallMcpClient(client, configPath, deps.home.root)
       deps.print(outcome === "not-installed" ? "not installed" : outcome)
       if (outcome === "uninstalled") {
         deps.print(`the ${client} identity and its approvals are unchanged — \`mida revoke ${client}\` revokes access`)
