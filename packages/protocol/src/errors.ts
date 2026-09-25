@@ -39,6 +39,10 @@ export const MIDA_ERROR_CODES = [
   "PARTIAL_READ",
   "SPONSOR_FAILED",
   "SPONSOR_PENDING",
+  // A write the store refused while the owner's revoke is still pending on Monad: distinct from
+  // CAPABILITY_REVOKED (the chain already shows the revocation) so a caller can drop the job
+  // without treating the transcript as permanently dead — the deny may still be cancelled.
+  "WRITE_DENIED",
 ] as const
 
 export type MidaErrorCode = (typeof MIDA_ERROR_CODES)[number]

@@ -255,6 +255,23 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
     const agentId = await reader.agentIdOfSigner(signer)
     if (agentId === null) return reject(c, 400, "NOT_AN_AGENT", "the request signer is not a registered agent")
 
+    // The same two gates PUT /objects runs before it stores bytes (app.ts §12.2 steps 5–6). A save
+    // sealed under a superseded read epoch can never anchor — the contract rejects it BAD_EPOCH —
+    // so it is refused here instead of occupying a queue slot; and a deny the owner staged on this
+    // agent or any of its capabilities in this area must stop the save NOW, while the revoke is
+    // still pending on Monad — a queued row would otherwise anchor inside the landing window (in-3 I4).
+    const required = await reader.requiredReadEpoch(save.message.owner, save.message.namespaceId)
+    if (message.readEpoch !== required) {
+      return reject(c, 409, "EPOCH_STALE", `save uses epoch ${message.readEpoch}; epoch ${required} is required`)
+    }
+    if (!(await reader.isWriteEpochValid(save.message.owner, save.message.namespaceId, required))) {
+      return reject(c, 409, "EPOCH_ROTATION_REQUIRED", "the current epoch no longer accepts writes")
+    }
+    await overlay.reconcileOwner(reader, save.message.owner)
+    if (await overlay.deniesRelationship(reader, { owner: save.message.owner, agentId, namespaceId: save.message.namespaceId })) {
+      return reject(c, 403, "WRITE_DENIED", "a revocation the owner staged is still pending on Monad — the save is refused, not queued")
+    }
+
     // The id the contract will compute: the recovered agentId inside, so a manifest claiming a
     // contextId the signed fields cannot produce fails here as a commitment mismatch.
     const contextId = batchContextId({
