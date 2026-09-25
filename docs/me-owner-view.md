@@ -9,8 +9,8 @@ show you.
 
 **The one-sentence version.** `/me` asks a public index (a pre-computed list of everything our
 contracts have ever emitted) for the fast answer, then double-checks every grant and record against
-Monad itself — so the page can be slow to load but can never be confidently wrong: anything it
-could not verify says so out loud.
+Monad itself — so the page can be slow to load, and anything it could not verify says so out loud
+instead of looking confirmed.
 
 ---
 
@@ -34,10 +34,10 @@ A quick vocabulary pass, then the table.
 | The list of agents and their grants | The index | **Every grant is re-read on chain** before it may say "Can read" — revoked and expired grants cannot slip through a stale index | Chain logs (slower; the badge says "from chain logs") |
 | An agent's name | Its manifest, fetched from the store | — | The shortened agent id — never blank |
 | The records list and their text | The store's two lanes: records that went on chain directly, and saves waiting inside shared batches | Direct rows: re-read on `ContextRegistry`. Batched rows: a Merkle proof checked against the batch's root on chain — **never** `ContextRegistry` (batched saves are not in it) | The row says "not on Monad — unverified". If the store could only return part of a list, the page shows "list incomplete — the store ran out of chain reads; reload" and hides the counts |
-| "You said" vs "&lt;agent&gt; inferred" | The record's provenance field (the contract only accepts "the user said this" when the owner signed it) | The decrypted record must agree | "Source unknown". A batched save still waiting in the queue is only a claim — it reads "&lt;agent&gt; claimed" |
-| How a record reached Monad ("direct" / "batched" / "pending") | The index (`BatchedSave` / `ContextRecord` rows) | The chain | "pending" comes straight from the store's batch queue |
-| The summary counts | The index, labelled "per the index at block N" | — | Hidden entirely when the index is down or a list came back partial — a partial list never produces a confident count |
-| "N s behind Monad" | The index's latest timestamp vs the chain's latest block | — | Over 60 s behind → the badge says so |
+| "You said" vs "&lt;agent&gt; inferred" | The record's provenance field (the contract only accepts "the user said this" when the owner signed it) | The decrypted record must agree — a mismatch flags the row: "the record's own label disagrees with Monad" | "Source unknown" — that includes every row the chain did not confirm, so a batched save still in the queue shows no provenance claim at all |
+| How a record reached Monad ("direct" / "batched" / "pending") | The store's own lists: which lane it filed the save under, and for batched saves the Merkle proof it serves with each one | The proof is checked against the batch's root on the deployment's `BatchAnchor` contract — a store that advertises a different batch contract is named ("the store serves a different batch contract") and its batched rows read unverified | "pending" is the store's queue position; a failed or partial store list hides the pending count rather than guessing it |
+| The summary counts | The index, labelled "per the index" | — | Hidden entirely when the index is down or a list came back partial — a partial list never produces a confident count |
+| "≈ N s behind Monad" | The index's own progress report (`_meta`: how far the source chain has moved vs how far the index has processed it), converted at Monad's ~0.4 s cadence | — | Past 150 blocks (~60 s) the badge flags the index stale; an index that cannot report progress reads "index unavailable", and no configured index URL at all reads "index not configured" |
 | "Batching is on" | The store's own status answer | — | "unknown" |
 | "blocked at the store · revoke pending on Monad" | The store's active deny list — a revoke cuts store access the moment you confirm, before the chain transaction lands | — | This row can never read "Can read" |
 
@@ -102,7 +102,10 @@ before relying on the index:
 1. **Our tool versions.** We pin `envio 3.11.0`, pnpm 12.4.1 and Node 25. Envio's docs name older
    requirements and do not say whether v3 deploys cleanly — the first deploy is the test. If the
    hosted build rejects our versions, the fallback is self-hosting (Envio's Docker Compose example:
-   Postgres + Hasura; needs a HyperSync API token).
+   Postgres + Hasura; needs a HyperSync API token). A self-hosted index lives on a different origin,
+   and the page's Content Security Policy only allows `indexer.dev.hyperindex.xyz` — so self-hosting
+   also means adding the new origin to `connect-src` in `apps/owner-page/src/headers.ts` and
+   redeploying the Worker, or the browser refuses the page's requests to it.
 2. **CORS.** Envio does not document whether its hosted endpoint answers browser cross-origin
    requests. From a session on `app.midacontext.xyz`, confirm the response carries an
    `Access-Control-Allow-Origin` header that lets the page read it. If it does not, the page cannot
@@ -125,5 +128,8 @@ before relying on the index:
 - **"Can read" is the chain's answer, not the index's.** A grant the index calls live but the chain
   calls invalid shows as "Expired or revoked on Monad", flagged — the index is a scoreboard, not a
   referee.
+- **"Records saved" counts versions, not distinct records.** The index's `Owner.records` field
+  increments once per record *version* written on chain, so a record saved three times moves the
+  tile by three. Read it as "writes the chain has seen", not "how many records exist".
 - **A revoke shown as "pending on Monad" is already effective at the store.** The moment the passkey
   confirms, the store refuses that agent — the chain transaction only makes it permanent.

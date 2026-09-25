@@ -356,6 +356,24 @@ describe("renderMe", () => {
     expect(unchecked.textContent).not.toContain("disagrees with Monad")
   })
 
+  it("an unset index URL reads 'index not configured' — the badge never claims 'unreachable'", () => {
+    const root = renderMe(
+      data({ source: "chain-logs", lag: { text: "index not configured", stale: true } }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    expect(root.textContent).toContain("index not configured")
+    expect(root.textContent).not.toContain("unreachable")
+  })
+
+  it("a failed index reads 'index unavailable' on the badge", () => {
+    const root = renderMe(
+      data({ source: "chain-logs", lag: { text: "index unavailable", stale: true } }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    expect(root.textContent).toContain("index unavailable")
+    expect(root.textContent).not.toContain("index not configured")
+  })
+
   it("a row whose chain check could not run says 'could not check Monad just now' — never 'not on Monad'", () => {
     const root = renderMe(data({ records: [record({ state: "unknown" })] }), fakeDoc()) as unknown as FakeEl
     expect(root.textContent).toContain("could not check Monad just now")

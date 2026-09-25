@@ -121,10 +121,13 @@ function renderHead(doc: Document, data: MeData): HTMLElement {
   const source = elOf(doc, "p", "source")
   const stale = data.lag.stale || data.source === "chain-logs"
   source.appendChild(elOf(doc, "span", stale ? "dot dot-stale" : "dot"))
+  // The lag text already carries the reason the index is not speaking — "index not configured"
+  // when no URL was set, "index unavailable" when it failed to answer — so the badge only names
+  // what the page actually read, and never claims "unreachable" for an index that does not exist.
   const text =
     data.source === "index"
       ? `Read from the Envio index · ${data.lag.text}`
-      : `Read from chain logs — the index was unreachable · ${data.lag.text}`
+      : `Read from chain logs · ${data.lag.text}`
   source.appendChild(elOf(doc, "span", undefined, text))
   head.appendChild(source)
   return head
