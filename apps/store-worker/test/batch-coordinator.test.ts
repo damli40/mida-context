@@ -326,7 +326,7 @@ class FakeChain implements BatcherChain {
     return { root: batch.root, blockNumber: batch.blockNumber, acceptedCount: batch.acceptedCount }
   }
 
-  async findAnchorings(contextIds: Hex[]): Promise<Map<string, Hex>> {
+  async findAnchorings(contextIds: Hex[], _oldestReceivedAtMs: number): Promise<Map<string, Hex>> {
     const found = new Map<string, Hex>()
     for (const contextId of contextIds) {
       const batchId = this.anchoredIn.get(contextId.toLowerCase())

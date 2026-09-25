@@ -65,11 +65,13 @@ export interface BatcherChain {
   batchAnchored(batchId: Hex): Promise<{ submitter: Address; acceptedCount: number; rejectedCount: number } | null>
   batchOf(batchId: Hex): Promise<{ root: Hex; blockNumber: bigint; acceptedCount: number }>
   /**
-   * The batchIds that anchored these contextIds, in one historical scan for the whole set —
-   * used for ALREADY_ANCHORED rejects. Map keys and values are lowercase; a contextId never
-   * anchored is simply absent.
+   * The batchIds that anchored these contextIds, in one bounded historical scan for the whole
+   * set — used for ALREADY_ANCHORED/STALE_PARENT heals. `oldestReceivedAtMs` is the oldest
+   * receivedAt among the rows being healed: a save cannot anchor before it reached the queue, so
+   * the scan only needs the window that age implies. Map keys and values are lowercase; a
+   * contextId never anchored is simply absent.
    */
-  findAnchorings(contextIds: Hex[]): Promise<Map<string, Hex>>
+  findAnchorings(contextIds: Hex[], oldestReceivedAtMs: number): Promise<Map<string, Hex>>
 }
 
 /**
@@ -762,7 +764,10 @@ export class Batcher {
       .filter((rejection) => healable.has(rejection.reason))
       .map((rejection) => order[rejection.index])
       .filter((contextId): contextId is Hex => contextId !== undefined)
-    const anchorings = needsHeal.length === 0 ? new Map<string, Hex>() : await this.#chain.findAnchorings(needsHeal)
+    const anchorings =
+      needsHeal.length === 0
+        ? new Map<string, Hex>()
+        : await this.#chain.findAnchorings(needsHeal, await this.#oldestReceivedAt(needsHeal))
     for (const rejection of rejected) {
       const contextId = order[rejection.index]
       if (contextId === undefined) {
@@ -791,6 +796,20 @@ export class Batcher {
     }
     this.#log?.({ event: "batch.resolved", batchId, accepted: anchored.length, rejected: rejected.length })
     return { accepted: anchored.length, rejected: rejected.length }
+  }
+
+  /**
+   * The oldest receivedAt among the rows a heal scan covers — a save cannot anchor before it
+   * reached the queue, so the scan never needs blocks older than that. 0 when no row answers:
+   * an unknown age widens back to the deploy-block floor rather than guessing.
+   */
+  async #oldestReceivedAt(contextIds: Hex[]): Promise<number> {
+    let oldest: number | null = null
+    for (const contextId of contextIds) {
+      const row = await this.#store.get(contextId)
+      if (row !== null && (oldest === null || row.receivedAt < oldest)) oldest = row.receivedAt
+    }
+    return oldest ?? 0
   }
 
   /**
@@ -840,8 +859,9 @@ function leafForRow(log: AnchoredLog, row: BatchSaveRow): Hex {
  * per-transaction limit rather than the 6M "revoke.agent" ceiling a batch used to borrow — and
  * reports the receipt's gasUsed so the batcher can size the next take from the real per-save cost.
  */
-export function createBatcherChain(input: { rpcUrl: string; deployment: Deployment; account: LocalAccount }): BatcherChain {
+export function createBatcherChain(input: { rpcUrl: string; deployment: Deployment; account: LocalAccount; now?: () => number }): BatcherChain {
   const { deployment } = input
+  const now = input.now ?? (() => Date.now())
   const batchAnchor = deployment.batchAnchor
   if (batchAnchor === undefined) throw new MidaError("INVALID_WIRE", "this deployment has no BatchAnchor")
   const fromBlock = deployment.batchAnchorBlock ?? deployment.deploymentBlock
@@ -958,22 +978,33 @@ export function createBatcherChain(input: { rpcUrl: string; deployment: Deployme
       })) as [Hex, bigint, number]
       return { root: root.toLowerCase() as Hex, blockNumber: BigInt(blockNumber), acceptedCount: Number(acceptedCount) }
     },
-    async findAnchorings(contextIds) {
+    async findAnchorings(contextIds, oldestReceivedAtMs) {
       const found = new Map<string, Hex>()
       if (contextIds.length === 0) return found
-      // contextId is an indexed SaveAnchored arg — viem encodes the array as topic alternatives,
-      // so one chunked scan answers for the whole set.
-      const logs = await getLogsChunked(context.publicClient, {
-        address: batchAnchor,
-        event: saveAnchoredEvent,
-        args: { contextId: contextIds },
-        fromBlock,
-      })
-      for (const log of logs) {
-        const args = log.args as { contextId: Hex; batchId: Hex }
-        const key = args.contextId.toLowerCase()
-        // Logs arrive in block order — the first hit for a contextId is its earliest anchoring.
-        if (!found.has(key)) found.set(key, args.batchId.toLowerCase() as Hex)
+      const head = await context.publicClient.getBlockNumber({ cacheTime: 0 })
+      // A save cannot anchor before it reached the queue, so the scan only needs the blocks the
+      // oldest row could have landed in: ~400 ms per block on Monad, doubled for block-time
+      // drift, plus 2,000 blocks of slack — but never below the anchor's own deploy block.
+      const ageMs = Math.max(0, now() - oldestReceivedAtMs)
+      const lookback = BigInt(Math.ceil(ageMs / 400)) * 2n + 2_000n
+      const scanFrom = head - lookback > fromBlock ? head - lookback : fromBlock
+      // contextId is an indexed SaveAnchored arg — viem encodes the array as topic alternatives.
+      // A single overlong alternatives list can trip RPC limits, so ids are grouped at 50 per
+      // request; every group scans the same bounded window.
+      for (let i = 0; i < contextIds.length; i += 50) {
+        const logs = await getLogsChunked(context.publicClient, {
+          address: batchAnchor,
+          event: saveAnchoredEvent,
+          args: { contextId: contextIds.slice(i, i + 50) },
+          fromBlock: scanFrom,
+          toBlock: head,
+        })
+        for (const log of logs) {
+          const args = log.args as { contextId: Hex; batchId: Hex }
+          const key = args.contextId.toLowerCase()
+          // Logs arrive in block order — the first hit for a contextId is its earliest anchoring.
+          if (!found.has(key)) found.set(key, args.batchId.toLowerCase() as Hex)
+        }
       }
       return found
     },

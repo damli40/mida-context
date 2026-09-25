@@ -407,9 +407,12 @@ class FakeChain implements BatcherChain {
 
   /** How many findAnchorings calls ran — the meter the one-scan-per-resolve test asserts. */
   anchoringScans = 0
+  /** The oldest-receivedAt bound the last heal scan was handed — the batcher's age computation. */
+  lastOldestReceivedAt = -1
 
-  async findAnchorings(contextIds: Hex[]): Promise<Map<string, Hex>> {
+  async findAnchorings(contextIds: Hex[], oldestReceivedAtMs: number): Promise<Map<string, Hex>> {
     this.anchoringScans++
+    this.lastOldestReceivedAt = oldestReceivedAtMs
     const found = new Map<string, Hex>()
     for (const contextId of contextIds) {
       const batchId = this.anchoredIn.get(contextId.toLowerCase())
@@ -1008,6 +1011,29 @@ describe("the batcher", () => {
     }
   })
 
+  it("the heal scan is bounded by the oldest receivedAt among the rows it heals", async () => {
+    const rig = makeRig()
+    // Two rows queued at different ages — the scan must be bounded by the EARLIEST, the one a
+    // younger row's age would wrongly exclude.
+    const a = makeSave()
+    await rig.store.insert(queueRow(a.wire, a.meta.contextId, 4_000))
+    const b = makeSave()
+    await rig.store.insert(queueRow(b.wire, b.meta.contextId, 9_000))
+    // Ambiguous send + unreadable probe → requeue → resubmit rejects ALREADY_ANCHORED → heal scan.
+    rig.chain.afterRecord = () => {
+      throw new Error("the response never arrived")
+    }
+    rig.chain.failLogs = true
+    await rig.batcher.flush()
+    rig.chain.afterRecord = null
+    rig.chain.failLogs = false
+    await rig.batcher.flush()
+
+    expect(rig.chain.lastOldestReceivedAt).toBe(4_000)
+    expect((await rig.store.get(a.meta.contextId))!.state).toBe("ANCHORED")
+    expect((await rig.store.get(b.meta.contextId))!.state).toBe("ANCHORED")
+  })
+
   it("a resubmitted batchId resolves the existing batch instead of sending again", async () => {
     // A fixed salt makes the id derivable on purpose: sequence 1 under salt A is the same batchId
     // twice — the state a crash after nextSequence but before its meta write would leave behind.
@@ -1547,14 +1573,91 @@ describe("createBatcherChain's log windows", () => {
       expect(await chain.batchAnchored(unknownId)).toBeNull()
       expect(scans).toHaveLength(3)
 
-      // findAnchorings is the historical search for a set of contextIds — it keeps the anchor's
-      // deploy block as its floor and reaches chain head (chunked at MAX_LOG_BLOCK_RANGE = 1000).
-      expect((await chain.findAnchorings([meta.contextId])).get(meta.contextId)).toBe(batchId.toLowerCase())
+      // findAnchorings is the historical search for a set of contextIds. A row old enough to
+      // predate any reasonable window — here "received at 0" — scans the anchor's deploy block
+      // up to head (chunked at MAX_LOG_BLOCK_RANGE = 1000): the floor never goes lower.
+      expect((await chain.findAnchorings([meta.contextId], 0)).get(meta.contextId)).toBe(batchId.toLowerCase())
       expect(scans.slice(3)).toEqual([
         expect.objectContaining({ fromBlock: ANCHOR_BLOCK, toBlock: ANCHOR_BLOCK + 999n }),
         expect.objectContaining({ fromBlock: ANCHOR_BLOCK + 1000n, toBlock: ANCHOR_BLOCK + 1999n }),
         expect.objectContaining({ fromBlock: ANCHOR_BLOCK + 2000n, toBlock: HEAD }),
       ])
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it("findAnchorings bounds the scan by the oldest row's age and groups the contextId filter at 50", async () => {
+    // A head far enough from the anchor that a bounded window lands strictly between them:
+    // the scan must open NEITHER at the deploy block NOR at head itself.
+    const FAR_HEAD = 100_000n
+    const NOW = 10_000_000
+    const scans: { fromBlock: bigint; toBlock: bigint; topics: Hex[] }[] = []
+    const server: Server = createServer((req, res) => {
+      let raw = ""
+      req.on("data", (chunk: Buffer) => (raw += chunk.toString()))
+      req.on("end", () => {
+        const { id, method, params } = JSON.parse(raw) as { id: number; method: string; params: unknown[] }
+        const reply = (result: unknown) => {
+          res.setHeader("content-type", "application/json")
+          res.end(JSON.stringify({ jsonrpc: "2.0", id, result }))
+        }
+        if (method === "eth_chainId") return reply(`0x${CHAIN_ID.toString(16)}`)
+        if (method === "eth_blockNumber") return reply(`0x${FAR_HEAD.toString(16)}`)
+        if (method === "eth_getLogs") {
+          const [filter] = params as [{ topics: Hex[]; fromBlock: Hex; toBlock: Hex }]
+          scans.push({ fromBlock: BigInt(filter.fromBlock), toBlock: BigInt(filter.toBlock), topics: filter.topics })
+          return reply([])
+        }
+        return res.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32601, message: `unhandled ${method}` } }))
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+    const { port } = (server.address() as AddressInfo)
+
+    try {
+      const rpcDeployment: Deployment = {
+        chainId: CHAIN_ID,
+        capabilityRegistry: "0x4444444444444444444444444444444444444444",
+        contextRegistry: "0x5555555555555555555555555555555555555555",
+        deploymentBlock: DEPLOY_BLOCK,
+        policyHashV1: `0x${"11".repeat(32)}`,
+        vaultRpId: "vault.mida.xyz",
+        vaultRpIdHash: `0x${"22".repeat(32)}`,
+        batchAnchor: BATCH_ANCHOR,
+        batchAnchorBlock: ANCHOR_BLOCK,
+      }
+      const chain = createBatcherChain({
+        rpcUrl: `http://127.0.0.1:${port}`,
+        deployment: rpcDeployment,
+        account: privateKeyToAccount(`0x${"33".repeat(32)}`),
+        now: () => NOW,
+      })
+
+      // A row received 10 minutes ago: ceil(600,000/400) × 2 + 2,000 = 5,000 blocks of lookback —
+      // the scan starts at head − 5,000 = 95,000, not the deploy block at 3,000.
+      const ids = Array.from({ length: 120 }, () => hexOf(randomBytes(32)))
+      await chain.findAnchorings(ids, NOW - 600_000)
+      const scanFrom = FAR_HEAD - 5_000n
+      // Six 1,000-block windows (95,000…100,000 inclusive) × three filter groups (50+50+20).
+      expect(scans).toHaveLength(18)
+      for (const scan of scans) {
+        expect(scan.fromBlock).toBeGreaterThanOrEqual(scanFrom)
+        expect(scan.toBlock).toBeLessThanOrEqual(FAR_HEAD)
+      }
+      expect(Math.min(...scans.map((scan) => Number(scan.fromBlock)))).toBe(Number(scanFrom))
+      // Every request in the first window carries one filter group — at most 50 alternatives.
+      const groupSizes = scans
+        .filter((scan) => scan.fromBlock === scanFrom)
+        .map((scan) => ((scan.topics.find(Array.isArray) as Hex[] | undefined) ?? []).length)
+        .sort((a, b) => a - b)
+      expect(groupSizes).toEqual([20, 50, 50])
+
+      // A row old enough that its age window reaches past the anchor's deploy block still
+      // floors there — 30M ms old asks for a 152,000-block lookback under a 100,000-block chain.
+      scans.length = 0
+      await chain.findAnchorings([ids[0]!], NOW - 30_000_000)
+      expect(Math.min(...scans.map((scan) => Number(scan.fromBlock)))).toBe(Number(ANCHOR_BLOCK))
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()))
     }
