@@ -836,7 +836,7 @@ describe("the batcher", () => {
     for (const { meta } of saves) expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
   })
 
-  it("a pre-send failure on a batch of one requeues with the normal backoff — an outage is not TOO_LARGE", async () => {
+  it("a pre-send failure on a batch of one requeues with the 2 s backoff — an outage is not TOO_LARGE", async () => {
     const rig = makeRig({ cap: 8 })
     const { wire, meta } = makeSave()
     await rig.enqueue(wire, meta.contextId)
@@ -845,11 +845,79 @@ describe("the batcher", () => {
     await rig.batcher.flush()
     expect(rig.chain.submissions).toHaveLength(0)
     expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "QUEUED", reason: null })
-    expect(rig.timer.pending()).toBe(true) // the wait timer is the backoff
+    expect(rig.timer.pendingAt).toBe(2_000) // the first backoff pause
 
     rig.chain.failSubmit = null
+    rig.setNow(2_000) // inside the pause a flush would not submit either
     await rig.batcher.flush()
     expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
+  })
+
+  it("a pre-send failure under the learned cap keeps the cap — a 3-row take during an RPC blip is not a size signal", async () => {
+    const rig = makeRig({ cap: 8 })
+    const saves = [makeSave(), makeSave(), makeSave()]
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+    rig.chain.failSubmit = () => Object.assign(new MidaError("OWNER_WALLET_LOW", "the gas sponsor did not pay"), { sent: false })
+
+    await rig.batcher.run()
+    expect(rig.chain.submissions).toHaveLength(0)
+    // Cap untouched, rows back in queue, and the log carries the failure's code.
+    expect(rig.events.find((entry) => entry["event"] === "batch.presend-failed")).toMatchObject({ requeued: 3, cap: 8, code: "OWNER_WALLET_LOW" })
+    for (const { meta } of saves) expect((await rig.store.get(meta.contextId))!.state).toBe("QUEUED")
+
+    rig.chain.failSubmit = null
+    rig.setNow(2_000)
+    await rig.batcher.run()
+    expect(rig.chain.submissions[0]!.count).toBe(3) // all three again — not the 1 a halved cap would have taken
+  })
+
+  it("repeated pre-send failures under the cap back off 2 s doubling to 60 s — and a run inside the pause submits nothing", async () => {
+    const rig = makeRig({ cap: 8 })
+    const saves = [makeSave(), makeSave(), makeSave()]
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+    rig.chain.failSubmit = () => Object.assign(new Error("rpc timeout"), { sent: false })
+
+    let now = 0
+    const backoffs: number[] = []
+    for (let i = 0; i < 7; i++) {
+      await rig.batcher.run()
+      backoffs.push(rig.timer.pendingAt! - now)
+      if (i === 0) {
+        // A run inside the pause is a no-op — the wakeup stays at the pause's end.
+        rig.setNow(1_000)
+        await rig.batcher.run()
+        expect(rig.chain.attempts).toBe(1)
+        expect(rig.timer.pendingAt).toBe(2_000)
+      }
+      now = rig.timer.pendingAt!
+      rig.setNow(now)
+    }
+    expect(backoffs).toEqual([2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000])
+    expect(rig.chain.submissions).toHaveLength(0)
+    expect(backoffs.map((b, i) => rig.events.filter((e) => e["event"] === "batch.presend-failed")[i]!["backoffMs"])).toEqual(backoffs)
+  })
+
+  it("a successful submission resets the pre-send backoff — the next failure starts at 2 s again", async () => {
+    // waitMs set far from the backoff figures so a plain wait-window retry could not fake them.
+    const rig = makeRig({ cap: 8, waitMs: 7_000 })
+    const saves = [makeSave(), makeSave(), makeSave()]
+    for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+    rig.chain.failSubmit = () => Object.assign(new Error("rpc timeout"), { sent: false })
+
+    await rig.batcher.run() // backoff 2 s → until 2,000
+    rig.setNow(2_000)
+    await rig.batcher.run() // backoff 4 s → until 6,000
+    rig.setNow(6_000)
+    rig.chain.failSubmit = null
+    await rig.batcher.run() // lands — the streak is over
+    expect(rig.chain.submissions[0]!.count).toBe(3) // the cap never moved
+
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    rig.chain.failSubmit = () => Object.assign(new Error("rpc timeout"), { sent: false })
+    rig.setNow(7_000) // past minGapMs after the send at 6,000
+    await rig.batcher.run()
+    expect(rig.timer.pendingAt).toBe(9_000) // 2 s again — neither 8 s nor the 7 s wait window
   })
 
   it("a taken batchId logs batch.id-taken — the BatchExists collision, distinct from a failed send", async () => {

@@ -323,9 +323,18 @@ export class Batcher {
    * cost learned so far, clamped to [1, cap]. A successful submit re-learns it from the receipt's
    * gasUsed; a GAS_CEILING_EXCEEDED refusal re-sizes it from the estimate the refusal carried, or
    * halves the refused take (floor 1) when the refusal carried none — the batch was too big to
-   * send, not malformed. Any other pre-send failure halves the refused take the same way.
+   * send, not malformed. Any other pre-send failure shrinks it only when the refused take was AT
+   * this cap; a smaller take says nothing about size.
    */
   #effectiveCap: number
+  /**
+   * Pre-send failure backoff: a sent:false failure on a take under the learned cap carries no size
+   * signal — an RPC blip, a nonce stall — so the cap stays and submits pause instead: 2 s doubling
+   * to 60 s, reset by a real send. #backoffUntil is the instant the pause ends; #presendBackoffMs
+   * is the delay the NEXT failure doubles from (0 = no streak).
+   */
+  #backoffUntil = 0
+  #presendBackoffMs = 0
   #lastSubmitAt: number | null = null
   #tail: Promise<unknown> = Promise.resolve()
 
@@ -517,6 +526,11 @@ export class Batcher {
       if ((await this.#store.countQueued()) > 0) await this.#timer.set(gapEnd)
       return null
     }
+    if (now < this.#backoffUntil) {
+      // A pre-send failure streak asked for a pause — the only legal move is a wakeup at its end.
+      if ((await this.#store.countQueued()) > 0) await this.#timer.set(this.#backoffUntil)
+      return null
+    }
     const sequence = await this.#store.nextSequence()
     const batchId = keccak256(
       encodeAbiParameters(
@@ -576,17 +590,34 @@ export class Batcher {
         return null
       }
       if (failedBeforeSend(error)) {
-        // A failure before anything was sent — simulation, estimate, fee or balance guard — is a
-        // size or availability signal, never an ambiguous send: no transaction exists to land
-        // later. The rows requeue and the next take is half of the one just refused — the TAKE is
-        // halved, not the learned cap, so a refusal at 8 rows yields a take of 4 even when the cap
-        // still says 400. A batch of one requeues untouched: a lone pre-send failure is more likely
-        // an RPC outage than an oversized save, and only a measured ceiling refusal earns TOO_LARGE.
+        // A failure before anything was sent — simulation, estimate, fee or balance guard — is
+        // never an ambiguous send: no transaction exists to land later. The rows requeue. What
+        // happens to the cap depends on whether size was even a plausible cause: a take refused AT
+        // the learned cap halves the refused take (the TAKE is halved into the cap, so a refusal
+        // at 8 rows yields a take of 4 even when the cap still says 400); a take under the cap
+        // says nothing about size — an RPC blip, a nonce stall — so the cap stays and submits
+        // back off exponentially instead, 2 s doubling to 60 s until a real send resets it.
         await this.#forgetBatch(batchId)
         const requeued = await this.#store.requeue(batchId)
-        if (taken.length > 1) this.#effectiveCap = Math.max(1, Math.floor(taken.length / 2))
-        this.#log?.({ event: "batch.presend-failed", batchId, requeued, cap: this.#effectiveCap, error: String(error) })
-        if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
+        const code = error instanceof MidaError ? error.code : null
+        if (taken.length >= this.#effectiveCap) {
+          this.#effectiveCap = Math.max(1, Math.floor(taken.length / 2))
+          this.#log?.({ event: "batch.presend-failed", batchId, requeued, cap: this.#effectiveCap, code, error: String(error) })
+          if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
+        } else {
+          this.#presendBackoffMs = Math.min(this.#presendBackoffMs === 0 ? 2_000 : this.#presendBackoffMs * 2, 60_000)
+          this.#backoffUntil = now + this.#presendBackoffMs
+          this.#log?.({
+            event: "batch.presend-failed",
+            batchId,
+            requeued,
+            cap: this.#effectiveCap,
+            code,
+            backoffMs: this.#presendBackoffMs,
+            error: String(error),
+          })
+          await this.#timer.set(this.#backoffUntil)
+        }
         return null
       }
       // The send failed AFTER a transaction went out — its outcome is unknown, so before calling
@@ -646,6 +677,9 @@ export class Batcher {
     // measurement put it. gasPerSave is logged as a number: bigint would break JSON.stringify.
     const gasPerSave = "exists" in result ? null : ceilDiv(result.gasUsed, BigInt(taken.length))
     if (gasPerSave !== null) this.#effectiveCap = this.#fitFor(gasPerSave)
+    // The RPC answered — whatever a pre-send failure streak was blaming (blip, nonce stall) is over.
+    this.#presendBackoffMs = 0
+    this.#backoffUntil = 0
     this.#lastSubmitAt = this.#now()
     this.#log?.({
       event: "batch.submitted",
