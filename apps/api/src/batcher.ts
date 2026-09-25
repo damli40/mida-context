@@ -25,6 +25,7 @@ import type { Address, BatchSaveMessage, Hex } from "@mida/protocol"
 import { GAS_CEILINGS, batchAnchorAbi, createWriteContext, failedBeforeSend, getLogsChunked, revertName, sendContract } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import type { BatchedSaveWire } from "./client.js"
+import type { BatchGateVerdict, BatchRowGate } from "./batch-deny.js"
 import type { BatchSaveRow, BatchStore } from "./batch-store.js"
 import { writeJsonAtomic } from "./secure-fs.js"
 
@@ -299,6 +300,15 @@ export interface BatcherOptions {
    * process submitted. Without one, recovery sees only this process's own submissions.
    */
   journal?: BatchJournal
+  /**
+   * The per-row authority check run at send time and on every held-row re-check (in-3 I5):
+   * a row whose author sits on the store's active deny list is HELD instead of submitted — the
+   * deny overlay is the only thing that knows a revoke is pending on Monad, and the contract
+   * cannot see it. Held rows are re-checked each run: still denied → keep holding; no deny and no
+   * live authority → REJECTED with the reason the contract would have given; deny cleared and
+   * authority live → back to QUEUED and sent. Absent, the batcher submits exactly as before.
+   */
+  gate?: BatchRowGate
 }
 
 export class Batcher {
@@ -313,6 +323,7 @@ export class Batcher {
   readonly #minGapMs: number
   readonly #submitter: Address
   readonly #salt: () => Hex
+  readonly #gate: BatchRowGate | undefined
   readonly #log: ((record: Record<string, unknown>) => void) | undefined
   /** Ordered contextIds of batches this process submitted — the resolve mapping without a journal read. */
   readonly #submitted = new Map<string, Hex[]>()
@@ -351,6 +362,7 @@ export class Batcher {
     this.#submitter = options.submitter.toLowerCase() as Address
     this.#salt = options.salt ?? (() => bytesToHex(crypto.getRandomValues(new Uint8Array(32))))
     this.#effectiveCap = this.#fitFor(options.initialGasPerSave ?? 66_264n)
+    this.#gate = options.gate
     this.#log = options.log
   }
 
@@ -423,6 +435,9 @@ export class Batcher {
           this.#log?.({ event: "batch.recover-failed", batchId, error: String(error) })
         }
       }
+      // Rows held before the crash get their verdict pass now — a deny that cleared or a revoke
+      // that landed while the process was down must not wait for the first timer tick.
+      await this.#recheckHeld()
       if ((await this.#store.countQueued()) > 0 && !(await this.#timer.pending())) {
         await this.#timer.set(this.#now() + this.#waitMs)
       }
@@ -447,9 +462,39 @@ export class Batcher {
       // must never leave the wakeup disarmed: the empty-queue path clears the timer, so without
       // the finally a submitted-but-unproven batch on a quiet queue would never retry.
       await this.#retryInFlight()
+      // Held rows re-check on every run too — a deny that cleared or a revoke that landed must
+      // move the row even on a quiet queue (the retry timer is what guarantees a next run).
+      await this.#recheckHeld()
       return await this.#attemptSubmit()
     } finally {
       await this.#ensureRetryTimer()
+    }
+  }
+
+  /**
+   * The per-tick held-row re-check (in-3 I5). One verdict per row, straight from the gate:
+   * still denied → stays HELD; no deny and no live authority → REJECTED with NO_AUTHORITY, the
+   * same name the contract reports; deny cleared with authority live → back to QUEUED, eligible
+   * for this run's take. A gate error holds the row — a failed check is never a send.
+   */
+  async #recheckHeld(): Promise<void> {
+    if (this.#gate === undefined) return
+    for (const row of await this.#store.listHeld()) {
+      let verdict: BatchGateVerdict
+      try {
+        verdict = await this.#gate.check(row)
+      } catch (error) {
+        this.#log?.({ event: "batch.hold-check-failed", contextId: row.contextId, error: String(error) })
+        continue
+      }
+      if (verdict === "hold") continue
+      if (verdict === "reject") {
+        await this.#store.markRejected(row.contextId, "NO_AUTHORITY")
+        this.#log?.({ event: "batch.held-rejected", contextId: row.contextId, reason: "NO_AUTHORITY" })
+      } else {
+        await this.#store.releaseHeld(row.contextId)
+        this.#log?.({ event: "batch.released", contextId: row.contextId })
+      }
     }
   }
 
@@ -493,7 +538,11 @@ export class Batcher {
    */
   async #ensureRetryTimer(): Promise<void> {
     const inFlight = this.#submitted.size > 0 || ((await this.#journal?.list()) ?? []).length > 0
-    if (inFlight && !(await this.#timer.pending())) await this.#timer.set(this.#now() + RETRY_EVERY_MS)
+    // Held rows get the same cadence: a deny that clears or a revoke that lands must move the row
+    // on the next run even when nothing else is queued — without this a held row on an empty
+    // queue would wait for the next save or restart to be re-checked at all.
+    const held = this.#gate === undefined ? 0 : (await this.#store.listHeld()).length
+    if ((inFlight || held > 0) && !(await this.#timer.pending())) await this.#timer.set(this.#now() + RETRY_EVERY_MS)
   }
 
   /** Stamps a submit/re-resolve attempt — the in-memory map mirrors the journal's record. */
@@ -547,7 +596,45 @@ export class Batcher {
       await this.#timer.clear()
       return null
     }
-    const contextIds = taken.map((row) => row.contextId)
+    // The send-time gate (in-3 I5): a save may have been admitted before the owner staged the
+    // revoke, so admission answers are stale by now and each row is checked again. "hold" parks
+    // the row in HELD — the revoke is still pending on Monad and may yet land or be cancelled,
+    // so neither anchor nor death is the right answer — and #recheckHeld gives it a fresh verdict
+    // every run. "reject" marks it NO_AUTHORITY, the name the contract would report. A gate that
+    // cannot answer is never a send: the row is held and the next run asks again.
+    const send: BatchSaveRow[] = []
+    for (const row of taken) {
+      if (this.#gate !== undefined) {
+        let verdict: BatchGateVerdict
+        try {
+          verdict = await this.#gate.check(row)
+        } catch (error) {
+          this.#log?.({ event: "batch.gate-check-failed", contextId: row.contextId, error: String(error) })
+          verdict = "hold"
+        }
+        if (verdict === "hold") {
+          await this.#store.hold(row.contextId)
+          this.#log?.({ event: "batch.held", contextId: row.contextId })
+          continue
+        }
+        if (verdict === "reject") {
+          await this.#store.markRejected(row.contextId, "NO_AUTHORITY")
+          this.#log?.({ event: "batch.held-rejected", contextId: row.contextId, reason: "NO_AUTHORITY" })
+          continue
+        }
+      }
+      send.push(row)
+    }
+    if (send.length === 0) {
+      // The whole take parked or died — the empty journal entry goes, and a still-queued tail
+      // keeps its wakeup exactly as the other no-submit paths arm it.
+      await this.#journal?.clear(batchId)
+      if ((await this.#store.countQueued()) > 0 && !(await this.#timer.pending())) {
+        await this.#timer.set(now + this.#waitMs)
+      }
+      return null
+    }
+    const contextIds = send.map((row) => row.contextId)
     this.#submitted.set(batchId.toLowerCase(), contextIds)
     try {
       await this.#journal?.record(batchId, contextIds)
@@ -563,15 +650,15 @@ export class Batcher {
     }
     let result: { transactionHash: Hex; gasUsed: bigint } | { exists: true }
     try {
-      result = await this.#chain.submit(batchId, taken.map((row) => row.save))
+      result = await this.#chain.submit(batchId, send.map((row) => row.save))
     } catch (error) {
       if (isMidaError(error, "GAS_CEILING_EXCEEDED")) {
         await this.#forgetBatch(batchId)
-        if (taken.length === 1) {
+        if (send.length === 1) {
           // A batch of one that still exceeds the ceiling can never shrink — the row is rejected
           // on the store side so the queue moves on; readers see the plain reason.
-          await this.#store.markRejected(taken[0]!.contextId, "TOO_LARGE")
-          this.#log?.({ event: "batch.too-large", batchId, contextId: taken[0]!.contextId, rejected: "TOO_LARGE" })
+          await this.#store.markRejected(send[0]!.contextId, "TOO_LARGE")
+          this.#log?.({ event: "batch.too-large", batchId, contextId: send[0]!.contextId, rejected: "TOO_LARGE" })
         } else {
           // The batch was too big to send — a size refusal, not an ambiguous send. The rows go back
           // and the next take shrinks to what the refusal's estimate says would have fit: divided
@@ -581,9 +668,9 @@ export class Batcher {
           // smaller batches instead of wedging behind one it can never push through.
           const requeued = await this.#store.requeue(batchId)
           const implied =
-            error.estimate === undefined ? null : this.#fitFor(ceilDiv(error.estimate, BigInt(taken.length)))
+            error.estimate === undefined ? null : this.#fitFor(ceilDiv(error.estimate, BigInt(send.length)))
           this.#effectiveCap =
-            implied !== null && implied < taken.length ? implied : Math.max(1, Math.floor(taken.length / 2))
+            implied !== null && implied < send.length ? implied : Math.max(1, Math.floor(send.length / 2))
           this.#log?.({ event: "batch.too-large", batchId, requeued, cap: this.#effectiveCap })
         }
         if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
@@ -600,8 +687,8 @@ export class Batcher {
         await this.#forgetBatch(batchId)
         const requeued = await this.#store.requeue(batchId)
         const code = error instanceof MidaError ? error.code : null
-        if (taken.length >= this.#effectiveCap) {
-          this.#effectiveCap = Math.max(1, Math.floor(taken.length / 2))
+        if (send.length >= this.#effectiveCap) {
+          this.#effectiveCap = Math.max(1, Math.floor(send.length / 2))
           this.#log?.({ event: "batch.presend-failed", batchId, requeued, cap: this.#effectiveCap, code, error: String(error) })
           if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
         } else {
@@ -675,7 +762,7 @@ export class Batcher {
     // A real receipt re-teaches the per-save cost, so the next take fits the gas the chain actually
     // charged. { exists: true } carries no receipt — the learned cap stays where the last real
     // measurement put it. gasPerSave is logged as a number: bigint would break JSON.stringify.
-    const gasPerSave = "exists" in result ? null : ceilDiv(result.gasUsed, BigInt(taken.length))
+    const gasPerSave = "exists" in result ? null : ceilDiv(result.gasUsed, BigInt(send.length))
     if (gasPerSave !== null) this.#effectiveCap = this.#fitFor(gasPerSave)
     // The RPC answered — whatever a pre-send failure streak was blaming (blip, nonce stall) is over.
     this.#presendBackoffMs = 0
@@ -684,7 +771,7 @@ export class Batcher {
     this.#log?.({
       event: "batch.submitted",
       batchId,
-      saves: taken.length,
+      saves: send.length,
       exists: "exists" in result,
       cap: this.#effectiveCap,
       gasPerSave: gasPerSave === null ? null : Number(gasPerSave),

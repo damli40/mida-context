@@ -1,5 +1,6 @@
 export * from "./auth.js"
 export * from "./authorize.js"
+export * from "./batch-deny.js"
 export * from "./batch-routes.js"
 export * from "./batch-store.js"
 export * from "./batcher.js"

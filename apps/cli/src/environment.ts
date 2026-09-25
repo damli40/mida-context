@@ -14,7 +14,7 @@ import {
   startAnvil,
 } from "@mida/chain"
 import type { Deployment, LocalWriteContext } from "@mida/chain"
-import { Batcher, FsBatchJournal, FsBatchStore, RegistryReader, createBatcherChain, createContextApi, createNodeTimer } from "@mida/api"
+import { Batcher, DenyOverlay, FsBatchJournal, FsBatchStore, RegistryReader, createBatcherChain, createBatchDenyGate, createContextApi, createNodeTimer, fileStores } from "@mida/api"
 import type { BatcherTimer, BatchingOptions } from "@mida/api"
 import { serve } from "@hono/node-server"
 import { createPublicClient, http } from "viem"
@@ -56,6 +56,7 @@ export async function startApiServer(input: {
   const publicClient = createPublicClient({ chain: chainFor(input.deployment.chainId), transport: http(input.rpcUrl) })
   const reader = new RegistryReader({ publicClient, deployment: input.deployment })
   const dataDir = mkdtempSync(join(tmpdir(), "mida-api-"))
+  const stores = fileStores(dataDir)
   let batching: BatchingOptions | undefined
   let batcher: { pauseTimer(): void; resumeTimer(): void } | undefined
   if (input.deployment.batchAnchor !== undefined) {
@@ -95,6 +96,10 @@ export async function startApiServer(input: {
     const engine = new Batcher({
       store,
       chain: createBatcherChain({ rpcUrl: input.rpcUrl, deployment: input.deployment, account: submitter }),
+      // The send-time deny gate (in-3 I5): a second overlay over the SAME deny store the API
+      // serves — FileDenyStore keeps its intents in memory, so two stores over one file would
+      // not see each other's writes. What the routes stage is what the next tick holds.
+      gate: createBatchDenyGate({ reader, overlay: new DenyOverlay(stores.denies) }),
       timer,
       now: () => Date.now(),
       // Hard bound 432 = floor(28,000,000 × 0.95 / 61,457) — the "batch.submit" ceiling at 95%
@@ -120,7 +125,7 @@ export async function startApiServer(input: {
       flush: () => engine.flush(),
     }
   }
-  const { app } = createContextApi({ reader, deployment: input.deployment, dataDir, ...(batching === undefined ? {} : { batching }) })
+  const { app } = createContextApi({ reader, deployment: input.deployment, stores, ...(batching === undefined ? {} : { batching }) })
   return new Promise((resolve) => {
     const server = serve({ fetch: app.fetch, port: 0, hostname: "127.0.0.1" }, (info) => {
       resolve({

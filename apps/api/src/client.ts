@@ -214,7 +214,12 @@ export interface BatchedSaveWire {
   ciphertext: Hex
 }
 
-export type BatchedItemState = "QUEUED" | "SUBMITTED" | "ANCHORED"
+/**
+ * "HELD" is the in-3 store-side hold: the row's author is on the active deny list, so the batcher
+ * keeps it off the send path while the revoke is pending on Monad — it re-joins QUEUED when the
+ * deny clears with the grant still valid, or becomes REJECTED once the revoke lands.
+ */
+export type BatchedItemState = "QUEUED" | "SUBMITTED" | "ANCHORED" | "HELD"
 
 export interface BatchedReadItem {
   state: BatchedItemState

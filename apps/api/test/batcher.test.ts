@@ -196,6 +196,23 @@ class MemoryBatchStore implements BatchStore {
     return count
   }
 
+  async listHeld(): Promise<BatchSaveRow[]> {
+    return [...this.rows.values()].filter((row) => row.state === "HELD").sort(byAge).map((row) => ({ ...row }))
+  }
+
+  async hold(contextId: Hex): Promise<void> {
+    const row = this.rows.get(contextId.toLowerCase())
+    if (row === undefined || row.state === "ANCHORED" || row.state === "REJECTED") return
+    row.state = "HELD"
+    row.batchId = null
+  }
+
+  async releaseHeld(contextId: Hex): Promise<void> {
+    const row = this.rows.get(contextId.toLowerCase())
+    if (row === undefined || row.state !== "HELD") return
+    row.state = "QUEUED"
+  }
+
   async nextSequence(): Promise<bigint> {
     return ++this.sequence
   }

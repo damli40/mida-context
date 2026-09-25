@@ -236,6 +236,23 @@ class FakeStore implements BatchStore {
     return count
   }
 
+  async listHeld(): Promise<BatchSaveRow[]> {
+    return [...this.rows.values()].filter((row) => row.state === "HELD").sort(byAge).map((row) => ({ ...row }))
+  }
+
+  async hold(contextId: Hex): Promise<void> {
+    const row = this.rows.get(contextId.toLowerCase())
+    if (row === undefined || row.state === "ANCHORED" || row.state === "REJECTED") return
+    row.state = "HELD"
+    row.batchId = null
+  }
+
+  async releaseHeld(contextId: Hex): Promise<void> {
+    const row = this.rows.get(contextId.toLowerCase())
+    if (row === undefined || row.state !== "HELD") return
+    row.state = "QUEUED"
+  }
+
   async nextSequence(): Promise<bigint> {
     return ++this.sequence
   }
@@ -343,7 +360,7 @@ describe("the batch coordinator Durable Object", () => {
     const ctx = new FakeState()
     const store = new FakeStore()
     const chain = new FakeChain()
-    const coordinator = new BatchCoordinator(ctx, env, { store, chain, submitter: SUBMITTER, cap: 8, waitMs: 2_000, minGapMs: 1_000, now: () => 10_000 })
+    const coordinator = new BatchCoordinator(ctx, env, { store, chain, gate: null, submitter: SUBMITTER, cap: 8, waitMs: 2_000, minGapMs: 1_000, now: () => 10_000 })
     await ctx.ready
 
     const { wire, meta } = makeSave()
@@ -373,7 +390,7 @@ describe("the batch coordinator Durable Object", () => {
     const ctx = new FakeState()
     const store = new FakeStore()
     const chain = new FakeChain()
-    const coordinator = new BatchCoordinator(ctx, env, { store, chain, submitter: SUBMITTER, cap: 8 })
+    const coordinator = new BatchCoordinator(ctx, env, { store, chain, gate: null, submitter: SUBMITTER, cap: 8 })
     await ctx.ready
 
     const { wire, meta } = makeSave()
@@ -401,7 +418,7 @@ describe("the batch coordinator Durable Object", () => {
     const taken = await store.takeQueued(8, deadId)
     await ctx.storage.put(`journal/${deadId}`, taken.map((row) => row.contextId))
 
-    const coordinator = new BatchCoordinator(ctx, env, { store, chain, submitter: SUBMITTER, cap: 8 })
+    const coordinator = new BatchCoordinator(ctx, env, { store, chain, gate: null, submitter: SUBMITTER, cap: 8 })
     await ctx.ready
     expect((await store.get(meta.contextId))!).toMatchObject({ state: "QUEUED", batchId: null })
     expect([...(await ctx.storage.list({ prefix: "journal/" })).keys()]).toHaveLength(0)
@@ -416,7 +433,7 @@ describe("the batch coordinator Durable Object", () => {
     const chain = new FakeChain()
     chain.rejectAt = (index) => (index === 1 ? 7 : null)
     const dead = new FakeState()
-    const deadCoordinator = new BatchCoordinator(dead, env, { store, chain, submitter: SUBMITTER, cap: 8 })
+    const deadCoordinator = new BatchCoordinator(dead, env, { store, chain, gate: null, submitter: SUBMITTER, cap: 8 })
     await dead.ready
     const saves = [makeSave(), makeSave()]
     await store.enqueue(saves[0]!.wire, saves[0]!.meta.contextId)
@@ -432,7 +449,7 @@ describe("the batch coordinator Durable Object", () => {
     // finishes the writeback — the rejected index resolves through the journaled order, not memory.
     chain.failLogs = false
     const alive = new FakeState(dead.storage)
-    const coordinator = new BatchCoordinator(alive, env, { store, chain, submitter: SUBMITTER, cap: 8 })
+    const coordinator = new BatchCoordinator(alive, env, { store, chain, gate: null, submitter: SUBMITTER, cap: 8 })
     await alive.ready
 
     expect((await store.get(saves[0]!.meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId: chain.submissions[0]!.toLowerCase() })
@@ -479,7 +496,7 @@ describe("the batch coordinator Durable Object", () => {
 
   it("answers 404 on a path it does not own", async () => {
     const ctx = new FakeState()
-    const coordinator = new BatchCoordinator(ctx, env, { store: new FakeStore(), chain: new FakeChain(), submitter: SUBMITTER })
+    const coordinator = new BatchCoordinator(ctx, env, { store: new FakeStore(), chain: new FakeChain(), gate: null, submitter: SUBMITTER })
     await ctx.ready
     expect((await coordinator.fetch(post("/healthz"))).status).toBe(404)
   })

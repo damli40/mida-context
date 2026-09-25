@@ -582,7 +582,7 @@ export class D1BatchStore implements BatchStore {
     const { results } = await this.db
       .prepare(
         `SELECT * FROM batch_saves
-         WHERE owner = ? AND namespace_id = ? AND state IN ('QUEUED', 'SUBMITTED', 'ANCHORED')
+         WHERE owner = ? AND namespace_id = ? AND state IN ('QUEUED', 'SUBMITTED', 'ANCHORED', 'HELD')
          ORDER BY received_at, context_id`,
       )
       .bind(owner.toLowerCase(), namespaceId.toLowerCase())
@@ -642,6 +642,30 @@ export class D1BatchStore implements BatchStore {
       .bind(batchId.toLowerCase())
       .run()
     return changes(result)
+  }
+
+  async listHeld(): Promise<BatchSaveRow[]> {
+    const { results } = await this.db
+      .prepare("SELECT * FROM batch_saves WHERE state = 'HELD' ORDER BY received_at, context_id")
+      .all<BatchRow>()
+    return results.map(batchRowFrom)
+  }
+
+  async hold(contextId: Hex): Promise<void> {
+    // Only an in-flight state may hold: an anchored or rejected row is final — same
+    // first-write-wins rule as markAnchored/markRejected — and the batch tag clears so a
+    // requeue-by-batch can never revive the row behind the hold's back.
+    await this.db
+      .prepare("UPDATE batch_saves SET state = 'HELD', batch_id = NULL WHERE context_id = ? AND state IN ('QUEUED', 'SUBMITTED')")
+      .bind(contextId.toLowerCase())
+      .run()
+  }
+
+  async releaseHeld(contextId: Hex): Promise<void> {
+    await this.db
+      .prepare("UPDATE batch_saves SET state = 'QUEUED' WHERE context_id = ? AND state = 'HELD'")
+      .bind(contextId.toLowerCase())
+      .run()
   }
 
   async nextSequence(): Promise<bigint> {

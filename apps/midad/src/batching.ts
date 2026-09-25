@@ -82,7 +82,8 @@ export interface PendingAnchor {
   sessionId: string
   agent: string
   queuedAt: string
-  state: "QUEUED" | "SUBMITTED"
+  /** HELD is still in-flight: the store is holding the save while a revoke is pending (in-3 I5). */
+  state: "QUEUED" | "SUBMITTED" | "HELD"
   /** Stale-epoch resubmissions already spent on this save — the cap is MAX_EPOCH_RETRIES. */
   retries?: number
 }
@@ -118,7 +119,7 @@ export function pendingAnchors(home: MidaHome): PendingAnchor[] {
     if (!Array.isArray(raw?.entries)) return []
     return raw.entries
       .filter((entry): entry is Record<string, string> => isEntry(entry, PENDING_FIELDS))
-      .filter((entry) => entry.state === "QUEUED" || entry.state === "SUBMITTED")
+      .filter((entry) => entry.state === "QUEUED" || entry.state === "SUBMITTED" || entry.state === "HELD")
       .map((entry) => entry as unknown as PendingAnchor)
   } catch {
     // a corrupt ledger cannot decide anything — the entries it held are simply unknown to this run
@@ -138,7 +139,7 @@ export function pendingAnchorsStrict(home: MidaHome): PendingAnchor[] {
   if (raw === undefined) return []
   if (!Array.isArray(raw.entries)) throw new Error(`${PENDING_FILE} is not a pending-ledger file`)
   return raw.entries.map((entry, index) => {
-    if (!isEntry(entry, PENDING_FIELDS) || (entry.state !== "QUEUED" && entry.state !== "SUBMITTED")) {
+    if (!isEntry(entry, PENDING_FIELDS) || (entry.state !== "QUEUED" && entry.state !== "SUBMITTED" && entry.state !== "HELD")) {
       throw new Error(`${PENDING_FILE} entry ${index} is not a well-formed pending save`)
     }
     return entry as unknown as PendingAnchor

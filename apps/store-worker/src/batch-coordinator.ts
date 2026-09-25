@@ -14,12 +14,13 @@
 // already queued is owed a batch either way.
 
 import { privateKeyToAccount } from "viem/accounts"
+import { createPublicClient, http } from "viem"
 import type { LocalAccount } from "viem"
 import type { Address, Hex } from "@mida/protocol"
 import type { Deployment } from "@mida/chain"
-import { Batcher, createBatcherChain } from "@mida/api"
-import type { BatchAttempt, BatchJournal, BatcherChain, BatcherTimer, BatchStore } from "@mida/api"
-import { D1BatchStore } from "./d1.js"
+import { Batcher, DenyOverlay, RegistryReader, createBatcherChain, createBatchDenyGate } from "@mida/api"
+import type { BatchAttempt, BatchJournal, BatcherChain, BatcherTimer, BatchRowGate, BatchStore } from "@mida/api"
+import { D1BatchStore, D1DenyStore } from "./d1.js"
 import type { D1Like } from "./d1.js"
 
 /**
@@ -135,6 +136,12 @@ export function alarmTimer(storage: DurableObjectStorageLike): BatcherTimer {
 export interface BatchCoordinatorOverrides {
   chain?: BatcherChain
   store?: BatchStore
+  /**
+   * The send-time deny gate (in-3 I5). Built from env when omitted — a D1DenyStore over the same
+   * `denies` table the API's overlay writes, and a RegistryReader on the same RPC. Pass `null` to
+   * run a fake-chain test without it (the gate would otherwise RPC-check every taken row).
+   */
+  gate?: BatchRowGate | null
   submitter?: Address
   cap?: number
   waitMs?: number
@@ -182,11 +189,27 @@ export class BatchCoordinator {
       }
       account = privateKeyToAccount(env.BATCHER_PRIVATE_KEY as Hex)
     }
+    // The gate the batcher consults at send time and on every held-row re-check. In production it
+    // shares the denies table and the RPC the routes use; a deny staged through POST /revocations
+    // is what the next tick sees. D1 reads are live queries, so a second store instance over the
+    // same table is the same state — unlike the file store, which caches.
+    const gate =
+      overrides.gate === null
+        ? undefined
+        : (overrides.gate ??
+          createBatchDenyGate({
+            reader: new RegistryReader({
+              publicClient: createPublicClient({ transport: http(env.RPC_URL) }),
+              deployment: coordinatorDeployment(env),
+            }),
+            overlay: new DenyOverlay(new D1DenyStore(env.DB)),
+          }))
     this.#batcher = new Batcher({
       store: overrides.store ?? new D1BatchStore(env.DB),
       chain:
         overrides.chain ??
         createBatcherChain({ rpcUrl: env.RPC_URL, deployment: coordinatorDeployment(env), account: account as LocalAccount }),
+      ...(gate === undefined ? {} : { gate }),
       timer: alarmTimer(ctx.storage),
       now: overrides.now ?? (() => Date.now()),
       cap: overrides.cap ?? BATCH_CAP,

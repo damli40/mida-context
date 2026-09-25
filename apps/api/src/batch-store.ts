@@ -25,7 +25,13 @@ function readJson<T>(path: string): T | undefined {
   }
 }
 
-export type BatchSaveState = "QUEUED" | "SUBMITTED" | "ANCHORED" | "REJECTED"
+/**
+ * QUEUED → SUBMITTED → ANCHORED | REJECTED, plus HELD — the in-3 state for a save whose author is
+ * on the store's active deny list. A held row is off the send path (`takeQueued` never returns it)
+ * but not dead: every batcher tick re-checks it — deny still active → stays HELD; the revoke
+ * landed → REJECTED; the deny cleared and the grant still valid → back to QUEUED and sent.
+ */
+export type BatchSaveState = "QUEUED" | "SUBMITTED" | "ANCHORED" | "REJECTED" | "HELD"
 
 export interface BatchSaveRow {
   contextId: Hex
@@ -53,7 +59,7 @@ export interface BatchStore {
   /** Returns "exists" when a row with this contextId is already stored — any state. */
   insert(row: BatchSaveRow): Promise<"inserted" | "exists">
   get(contextId: Hex): Promise<BatchSaveRow | null>
-  /** QUEUED + SUBMITTED + ANCHORED for one owner/namespace, oldest first. REJECTED never lists. */
+  /** QUEUED + SUBMITTED + ANCHORED + HELD for one owner/namespace, oldest first. REJECTED never lists. */
   listForReader(owner: Address, namespaceId: Hex): Promise<BatchSaveRow[]>
   /** Atomically moves up to `limit` QUEUED rows to SUBMITTED under `batchId`, oldest first. */
   takeQueued(limit: number, batchId: Hex): Promise<BatchSaveRow[]>
@@ -64,6 +70,12 @@ export interface BatchStore {
   markRejected(contextId: Hex, reason: string): Promise<void>
   /** SUBMITTED rows of `batchId` go back to QUEUED (a failed submission retried whole). */
   requeue(batchId: Hex): Promise<number>
+  /** Every HELD row, oldest first — the batcher's per-tick deny re-check set. */
+  listHeld(): Promise<BatchSaveRow[]>
+  /** A QUEUED or SUBMITTED row goes HELD; the batch tag clears so a requeue-by-batch never revives it. */
+  hold(contextId: Hex): Promise<void>
+  /** A HELD row returns to QUEUED — the deny cleared and Monad still authorizes the save. */
+  releaseHeld(contextId: Hex): Promise<void>
   /** Monotonic receipt sequence — counts every accepted save, never reused. */
   nextSequence(): Promise<bigint>
   countQueued(): Promise<number>
@@ -259,6 +271,33 @@ export class FsBatchStore implements BatchStore {
         }
       }
       return count
+    })
+  }
+
+  listHeld(): Promise<BatchSaveRow[]> {
+    return Promise.resolve(
+      this.#rows()
+        .filter((row) => row.state === "HELD")
+        .sort(byAge),
+    )
+  }
+
+  hold(contextId: Hex): Promise<void> {
+    return this.#mutate(() => {
+      const row = this.#readRow(contextId)
+      if (row === undefined || row.state === "ANCHORED" || row.state === "REJECTED") return
+      row.state = "HELD"
+      row.batchId = null
+      this.#writeRow(row)
+    })
+  }
+
+  releaseHeld(contextId: Hex): Promise<void> {
+    return this.#mutate(() => {
+      const row = this.#readRow(contextId)
+      if (row === undefined || row.state !== "HELD") return
+      row.state = "QUEUED"
+      this.#writeRow(row)
     })
   }
 
