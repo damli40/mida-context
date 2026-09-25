@@ -50,6 +50,7 @@ import {
   cut,
   hardCut,
   fitMessages,
+  lastCompactSummaryLine,
   readTranscriptLines,
 } from "./transcript-lines.js"
 
@@ -404,6 +405,27 @@ export function readConversation(
       messagesKept: 0,
       messagesTotal: 0,
       omitted: 0,
+    }
+  }
+
+  // The head/tail windows see only part of a truncated file — a /compact that
+  // ran more than TAIL_BYTES before the end leaves its summary in the unread
+  // middle. One streamed pass finds the LAST isCompactSummary line wherever it
+  // sits (a line over SUMMARY_LINE_BYTES is skipped, not read whole). It is the
+  // file's true last summary, so it replaces whatever the windows pinned — and
+  // its label is the real line number even when the windows never saw the line.
+  // A file that fit the windows was already read end to end, so the windows'
+  // pick IS the last summary — no second pass.
+  const scannedSummary = truncated ? lastCompactSummaryLine(transcriptPath) : null
+  if (scannedSummary !== null) {
+    try {
+      const obj = JSON.parse(scannedSummary.text) as TranscriptLine | null
+      if (obj !== null && typeof obj === "object" && obj.type === "user" && obj.isCompactSummary === true) {
+        compactSummary = { label: scannedSummary.label, text: userRequestText(obj.message?.content) }
+      }
+    } catch {
+      // the scan already parsed this line once; a second failure just leaves
+      // whatever the windows found
     }
   }
 

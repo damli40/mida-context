@@ -11,6 +11,7 @@
 // fills the remaining maxChars from the most recent message backwards.
 
 import fs from "node:fs"
+import { StringDecoder } from "node:string_decoder"
 
 export const HEAD_BYTES = 64 * 1024 // bounded head — the first user message lives at the top
 export const TAIL_BYTES = 60_000 // tail window — the newest messages live at the bottom
@@ -81,6 +82,73 @@ export function readTranscriptLines(path: string): TranscriptLines {
     tailLines.forEach((line, idx) => lines.push({ label: `~${idx + 1}`, text: line }))
   }
   return { lines, truncated, head, tail }
+}
+
+/** Chunk size for the whole-file scan below — bounded, never the file at once. */
+const SCAN_CHUNK_BYTES = 64 * 1024
+/** A compact-summary line longer than this is skipped, not retained. */
+export const SUMMARY_LINE_BYTES = 400 * 1024
+
+/**
+ * One streamed pass over the whole file — SCAN_CHUNK_BYTES at a time, the line
+ * under construction dropped the moment it passes SUMMARY_LINE_BYTES — for the
+ * LAST line whose parsed JSON carries `"isCompactSummary": true`. A summary
+ * written more than TAIL_BYTES before the end sits in the unread middle of a
+ * truncated transcript, invisible to the head/tail windows; this finds it
+ * anyway without ever loading the file whole. Returns the line and its real
+ * 1-based number, or null.
+ */
+export function lastCompactSummaryLine(path: string): { label: string; text: string } | null {
+  const fd = fs.openSync(path, "r")
+  try {
+    const size = fs.fstatSync(fd).size
+    const buf = Buffer.allocUnsafe(SCAN_CHUNK_BYTES)
+    const decoder = new StringDecoder("utf8")
+    let position = 0
+    let lineNo = 0
+    let piece = "" // the line so far — emptied the moment it outgrows the cap
+    let overflow = false // the line under construction already passed the cap
+    let found: { label: string; text: string } | null = null
+    const finish = (text: string, tooLong: boolean): void => {
+      lineNo += 1
+      if (tooLong || text.length > SUMMARY_LINE_BYTES) return
+      if (!text.includes('"isCompactSummary"')) return
+      try {
+        const obj = JSON.parse(text) as { isCompactSummary?: unknown } | null
+        if (obj !== null && typeof obj === "object" && obj.isCompactSummary === true) {
+          found = { label: `${lineNo}`, text }
+        }
+      } catch {
+        // a line that merely mentions the flag inside a value is not the summary
+      }
+    }
+    while (position < size) {
+      const n = fs.readSync(fd, buf, 0, Math.min(SCAN_CHUNK_BYTES, size - position), position)
+      if (n <= 0) break // the file shrank between stat and read
+      position += n
+      const text = decoder.write(buf.subarray(0, n))
+      let start = 0
+      for (let i = 0; i < text.length; i++) {
+        if (text.charCodeAt(i) !== 10) continue
+        finish(overflow ? "" : piece + text.slice(start, i), overflow)
+        piece = ""
+        overflow = false
+        start = i + 1
+      }
+      const rest = text.slice(start)
+      if (overflow || piece.length + rest.length > SUMMARY_LINE_BYTES) {
+        piece = ""
+        overflow = true
+      } else {
+        piece += rest
+      }
+    }
+    piece += decoder.end()
+    if (piece !== "" || overflow) finish(piece, overflow) // a final line without its newline counts
+    return found
+  } finally {
+    fs.closeSync(fd)
+  }
 }
 
 /**

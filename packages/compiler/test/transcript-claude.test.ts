@@ -334,6 +334,32 @@ describe("readConversation", () => {
     expect(r.text).toContain("L~1 user:\n/brainstorm plan the migration")
   })
 
+  // L5: the head/tail windows never see the middle of a truncated file, so a
+  // /compact that ran more than ~60 KB before the end used to lose its summary
+  // entirely. The streamed scan finds it — and labels it with its REAL line
+  // number, which the tail window could not have known.
+  it("pins a /compact summary sitting in the unread middle of a large transcript (L5)", () => {
+    const dir = tmpdir()
+    const pad = "x".repeat(4_000)
+    const lines: string[] = [
+      JSON.stringify({ type: "user", message: { role: "user", content: "build the parser" } }),
+    ]
+    for (let i = 0; i < 35; i++) {
+      lines.push(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `step ${i} ${pad}` }] } }))
+    }
+    const summaryLineNo = lines.length + 1 // the next push is the summary's real line number
+    lines.push(JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: "SUMMARY-MIDDLE-MARKER condensed history of the session" } }))
+    for (let i = 0; i < 35; i++) {
+      lines.push(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `later ${i} ${pad}` }] } }))
+      lines.push(JSON.stringify({ type: "user", message: { role: "user", content: `next ${i}` } }))
+    }
+    const t = writeTranscript(dir, lines)
+    expect(fs.statSync(t).size).toBeGreaterThan(250_000) // genuinely truncated
+    const r = readConversation(t)
+    expect(r.text).toContain(`L${summaryLineNo} user — Summary of the earlier session (from /compact):`)
+    expect(r.text).toContain("SUMMARY-MIDDLE-MARKER")
+  })
+
   // L4: a prompt that QUOTES the command tag in prose is not a command echo —
   // the tag has to open the line (after leading whitespace) for the line to be
   // plumbing. Otherwise the user's words would be replaced by the quoted name.
@@ -521,6 +547,7 @@ describe("readConversation", () => {
     const t = writeTranscript(dir, lines)
 
     let bytesRead = 0
+    let maxRead = 0
     const readFilePaths: unknown[] = []
     const origReadFileSync = fs.readFileSync
     const origReadSync = fs.readSync
@@ -533,6 +560,7 @@ describe("readConversation", () => {
     fs.readSync = (...args: Parameters<typeof fs.readSync>) => {
       const n = origReadSync(...args)
       bytesRead += n
+      maxRead = Math.max(maxRead, n)
       return n
     }
     let r: ReturnType<typeof readConversation>
@@ -544,7 +572,10 @@ describe("readConversation", () => {
     }
 
     expect(readFilePaths).not.toContain(t)
-    expect(bytesRead).toBeLessThanOrEqual(64 * 1024 + 60_000)
+    // the head+tail windows plus ONE streamed pass hunting the last /compact
+    // summary — every read still bounded to a chunk, so memory stays flat
+    expect(bytesRead).toBeLessThanOrEqual(64 * 1024 + 60_000 + fs.statSync(t).size)
+    expect(maxRead).toBeLessThanOrEqual(64 * 1024)
     expect(r.format).toBe("claude-jsonl")
     expect(r.firstUserMessage).toBe("FIRST-REQUEST build the thing")
     expect(r.text).toContain("FIRST-REQUEST")
