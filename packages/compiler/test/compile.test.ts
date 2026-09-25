@@ -131,6 +131,44 @@ describe("compileCheckpoint", () => {
     expect(r.ok && r.checkpoint.originalRequest).toBe("Build a rate limiter in 3 steps")
   })
 
+  it("a continuation after /compact keeps the earlier request — its first user line is not a fresh ask (G3)", async () => {
+    // Claude Code's post-compact transcript opens with the condensed-history
+    // line (isCompactSummary) before the first real user text — that text
+    // continues the earlier session, it does not restate the request.
+    const resumed = path.join(dir, "compacted.jsonl")
+    fs.writeFileSync(
+      resumed,
+      [
+        JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: "condensed summary of the earlier session" } }),
+        JSON.stringify({ type: "user", message: { role: "user", content: "keep going on the parser work" } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "on it" }] } }),
+      ].join("\n"),
+    )
+    const previous: Checkpoint = {
+      eventId: "evt-earlier",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: new Date().toISOString(),
+      objective: "earlier work",
+      originalRequest: "the earlier real request",
+      progress: [],
+      decisions: [],
+      rejected: [],
+      constraints: [],
+      artifacts: [],
+      unresolvedIssue: null,
+      nextAction: "next",
+      remainingPlan: [],
+      evidence: [],
+    }
+    const r = await compileCheckpoint({ ...base, transcriptPath: resumed, model: fake("good"), previous })
+    expect(r.ok && r.checkpoint.originalRequest).toBe("the earlier real request")
+    // with no earlier checkpoint the continuation's own first line still lands —
+    // it is the user's verbatim words, better than null
+    const fresh = await compileCheckpoint({ ...base, transcriptPath: resumed, model: fake("good") })
+    expect(fresh.ok && fresh.checkpoint.originalRequest).toBe("keep going on the parser work")
+  })
+
   it("an agent with no transcript reader is refused, never parsed through another format (F9)", async () => {
     // "gemini" has no reader — before this fix the code fell back to the Claude reader,
     // so a transcript in an unknown format was silently read as Claude Code's

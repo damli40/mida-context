@@ -148,6 +148,9 @@ export function readCodexConversation(
   const cwds: string[] = []
   let messagesTotal = 0
   let firstUserMessage: string | null = null
+  // set when a user message is skipped before the pick — the rollout opened on
+  // injected context, so its first real message continues work, not asks it
+  let openedWithScaffolding = false
   // the index in `msgs` of the block firstUserMessage came from — fitMessages
   // pins exactly it, not whichever user block happens to render first
   let pinIdx: number | undefined
@@ -177,7 +180,10 @@ export function readCodexConversation(
       if (role !== "user" && role !== "assistant") continue
       const parts = messageParts(p.content)
       const text = parts.join("\n")
-      if (role === "user" && isInjectedUserText(text)) continue
+      if (role === "user" && isInjectedUserText(text)) {
+        if (firstUserMessage === null) openedWithScaffolding = true
+        continue
+      }
       messagesTotal++
       let picked = false
       if (role === "user" && firstUserMessage === null && text) {
@@ -220,6 +226,7 @@ export function readCodexConversation(
       format: "unknown-tail",
       text: scrubTranscript(tailText),
       firstUserMessage: null,
+      openedWithScaffolding: false,
       cwds,
       messagesKept: 0,
       messagesTotal: 0,
@@ -232,6 +239,7 @@ export function readCodexConversation(
     format: "codex-jsonl",
     text: fitted.text,
     firstUserMessage,
+    openedWithScaffolding,
     cwds,
     messagesKept: fitted.messagesKept,
     messagesTotal,

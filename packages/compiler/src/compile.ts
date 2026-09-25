@@ -417,10 +417,17 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     picked.createdAt = now().toISOString()
     // A transcript whose first user line is absent or was skipped as
     // scaffolding yields no fresh pick — the previous checkpoint's request
-    // stands rather than being blanked out by one bad compile window.
+    // stands rather than being blanked out by one bad compile window. The
+    // same holds when the transcript OPENED on scaffolding (post-compact or
+    // resumed): its first real user line is a continuation, not a fresh ask,
+    // so it does not displace the earlier request. Only a transcript that
+    // starts with the user's own message replaces it. When there is no
+    // earlier request, the continuation's pick is still the best verbatim
+    // record — it lands rather than null.
     const earlier = input.previous?.originalRequest
+    const fresh = convo.openedWithScaffolding ? null : convo.firstUserMessage
     picked.originalRequest =
-      convo.firstUserMessage ?? (typeof earlier === "string" && earlier !== "" ? earlier : null)
+      fresh ?? (typeof earlier === "string" && earlier !== "" ? earlier : convo.firstUserMessage)
 
     if (Array.isArray(picked.artifacts)) {
       picked.artifacts = picked.artifacts.map((a) => (typeof a === "string" ? rel(a) : a))

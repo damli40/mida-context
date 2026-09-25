@@ -60,6 +60,14 @@ export interface Conversation {
   text: string // "L<n> <role>:" blocks, ≤ maxChars
   firstUserMessage: string | null // verbatim, scrubbed, ≤ 6000 chars incl. "…"
   /**
+   * True when a user-role line was skipped before firstUserMessage was picked
+   * — the transcript opened on injected context, a compact summary, a command
+   * echo or a resumed tool_result. That makes this compile's pick a
+   * CONTINUATION line, not the session's original ask (G3): compile.ts keeps
+   * the previous checkpoint's originalRequest over it.
+   */
+  openedWithScaffolding: boolean
+  /**
    * Every distinct working folder the transcript itself records — Claude Code stamps a `cwd`
    * field on each line — unique, in first-seen order. A file whose lines record none answers []:
    * "no record", never a guess.
@@ -224,6 +232,9 @@ export function readConversation(
   const cwds: string[] = []
   let messagesTotal = 0
   let firstUserMessage: string | null = null
+  // set when a user line is skipped before the pick — the transcript opened on
+  // scaffolding, so its first real user line is a continuation, not the ask
+  let openedWithScaffolding = false
   // the index in `msgs` of the block firstUserMessage came from — fitMessages
   // pins exactly it, not whichever user block happens to render first
   let pinIdx: number | undefined
@@ -253,6 +264,8 @@ export function readConversation(
       if (request !== null) {
         firstUserMessage = hardCut(scrubSecrets(request), FIRST_USER_CHARS)
         picked = true
+      } else {
+        openedWithScaffolding = true
       }
     }
     // Scaffolding is dropped from the rendered conversation too, not only
@@ -272,6 +285,7 @@ export function readConversation(
       format: "unknown-tail",
       text: scrubTranscript(tailText),
       firstUserMessage: null,
+      openedWithScaffolding: false,
       cwds,
       messagesKept: 0,
       messagesTotal: 0,
@@ -284,6 +298,7 @@ export function readConversation(
     format: "claude-jsonl",
     text: fitted.text,
     firstUserMessage,
+    openedWithScaffolding,
     cwds,
     messagesKept: fitted.messagesKept,
     messagesTotal,
