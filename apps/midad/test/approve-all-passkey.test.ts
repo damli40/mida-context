@@ -122,8 +122,9 @@ describe("mida approve --all on a passkey home (I3)", () => {
     expect(constraintsIndex).toBeGreaterThan(0)
     expect(lines.slice(0, constraintsIndex).filter((line) => line.endsWith("is asking for:")).length).toBe(2)
     expect(lines.filter((line) => line.startsWith("It will see this context as plain text.")).length).toBe(1)
-    // both agents failed at the chain proof and both are named
-    expect(lines.at(-1)).toBe("approved: none; failed: codex (declined), cursor (declined)")
+    // both agents failed at the chain proof and both are named — a claimed success the chain
+    // cannot prove is a page mismatch (possible tampering), never a decline
+    expect(lines.at(-1)).toBe("approved: none; failed: codex (page-mismatch), cursor (page-mismatch)")
 
     // a non-yes answer asks the page nothing at all
     rounds.length = 0
@@ -135,6 +136,73 @@ describe("mida approve --all on a passkey home (I3)", () => {
     // both pending requests are still waiting
     expect(home.has("agents/codex/pending-request.json")).toBe(true)
     expect(home.has("agents/cursor/pending-request.json")).toBe(true)
+  }, 120_000)
+
+  it("the verdict names what the page actually did — declined, pending, mismatch and failed are different words", async () => {
+    const home = new MidaHome(join(mkdtempSync(join(tmpdir(), "mida-pkall-kinds-")), "home"))
+    saveOwnerMode(home, "passkey")
+    home.writeSecretJson("owner-address.json", { address: OWNER })
+    // the batch runs in the sorted order listAgentNames returns — the page answers each differently
+    for (const name of ["claude-code", "codex", "cursor", "zzz-agent"]) {
+      await saveAgentIdentity(home, await identity(name))
+      await pendingRequest(home, name)
+    }
+    const lines: string[] = []
+    let resolveResult: ((r: OwnerLinkResult) => void) | undefined
+    let round = 0
+    const code = await runCli(["approve", "--all"], {
+      home,
+      network: { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund },
+      print: (line) => lines.push(line),
+      prompt: async () => "yes",
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      ownerLink: {
+        startListener: async () => ({
+          port: 4702,
+          result: new Promise<OwnerLinkResult>((resolve) => {
+            resolveResult = resolve
+          }),
+          close: () => {},
+        }),
+        openLink: async (link) => {
+          const params = new URLSearchParams(link.url.split("#")[1]!)
+          const base = {
+            v: 1 as const,
+            nonce: params.get("nonce")!,
+            requestHash: requestHash(link.requestBytes),
+            owner: OWNER,
+            transactions: [],
+          }
+          round += 1
+          if (round === 1) {
+            // the owner pressed decline on the page
+            resolveResult!({ ...base, status: "cancelled", operations: [], reason: "you said no" })
+          } else if (round === 2) {
+            // the sponsor accepted the operation — it may still land
+            resolveResult!({ ...base, status: "pending", operations: [`0x${"dd".repeat(32)}`] })
+          } else if (round === 3) {
+            // a claimed success the chain cannot prove — possible tampering
+            resolveResult!({ ...base, status: "success", operations: [] })
+          } else {
+            // the page itself reports the operation failed
+            resolveResult!({ ...base, status: "failed", operations: [], reason: "the sponsor rejected it" })
+          }
+        },
+      },
+    } satisfies CliDeps)
+    expect(code).toBe(1)
+    expect(round).toBe(4)
+    expect(lines).toContain("you said no")
+    expect(lines).toContain("the approval page returned something that does not match this request")
+    expect(lines.some((line) => line.includes("may still land"))).toBe(true)
+    expect(lines.at(-1)).toBe(
+      "approved: none; failed: claude-code (declined), codex (pending), cursor (page-mismatch), zzz-agent (failed)",
+    )
+    // nothing was consumed — every pending request is still waiting for its own re-run
+    for (const name of ["claude-code", "codex", "cursor", "zzz-agent"]) {
+      expect(home.has(`agents/${name}/pending-request.json`)).toBe(true)
+    }
   }, 120_000)
 
   it("nothing pending says so without opening the page", async () => {

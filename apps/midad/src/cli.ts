@@ -994,7 +994,7 @@ async function passkeyApproveAll(session: ServiceRuntime, deps: CliDeps, linkDep
     } catch (error) {
       // A page outcome already IS the line the owner reads; a coded error goes through the mapper.
       deps.print(error instanceof OwnerLinkOutcome ? error.line : ownerRefusalLine("approve", name, error, undefined, deps.network.deployment.capabilityRegistry))
-      failed.push(`${name} (${error instanceof OwnerLinkOutcome ? "declined" : refusalCode(error)})`)
+      failed.push(`${name} (${error instanceof OwnerLinkOutcome ? error.kind : refusalCode(error)})`)
     }
   }
   if (approved.length > 0 && failed.length > 0) await kickDaemonNow(deps)
@@ -1039,7 +1039,7 @@ async function passkeyRevokeAll(session: ServiceRuntime, deps: CliDeps, linkDeps
     } catch (error) {
       // A page outcome already IS the line the owner reads; a coded error goes through the mapper.
       deps.print(error instanceof OwnerLinkOutcome ? error.line : ownerRefusalLine("revoke", name, error, undefined, deps.network.deployment.capabilityRegistry))
-      failed.push(`${name} (${error instanceof OwnerLinkOutcome ? "declined" : refusalCode(error)})`)
+      failed.push(`${name} (${error instanceof OwnerLinkOutcome ? error.kind : refusalCode(error)})`)
     }
   }
   if (revoked.length > 0 && failed.length > 0) await kickDaemonNow(deps)

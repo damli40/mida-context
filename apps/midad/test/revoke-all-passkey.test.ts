@@ -98,8 +98,9 @@ describe("mida revoke --all on a passkey home (I4)", () => {
     }
     expect(rounds).toHaveLength(3)
     expect(rounds[0]).toContain("/revoke#")
-    // every agent failed at the chain proof — the fake page sent no revocation — and all are named
-    expect(lines.at(-1)).toBe("revoked: none; failed: assistant (declined), claude-code (declined), codex (declined)")
+    // every agent failed at the chain proof — the fake page sent no revocation — and all are
+    // named; a success the chain cannot prove is a page mismatch (possible tampering), not a decline
+    expect(lines.at(-1)).toBe("revoked: none; failed: assistant (page-mismatch), claude-code (page-mismatch), codex (page-mismatch)")
 
     // a non-yes answer asks the page nothing at all — and revokes nothing either
     rounds.length = 0

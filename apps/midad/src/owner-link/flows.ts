@@ -95,13 +95,23 @@ export const PAGE_MISMATCH_LINE = "the approval page returned something that doe
 export const REVOKE_LANDING_LINE = (name: string) => `a revoke of ${name} is still landing — wait, then approve again`
 
 /**
+ * What a page outcome means for the batch summary's `(…)` label: `declined` is the owner saying
+ * no, `page-mismatch` is an answer that did not match the request or failed the chain proof
+ * (possible tampering), `pending` is a sponsored operation that may still land, and `failed` is
+ * the page itself reporting the operation could not be done.
+ */
+export type OwnerLinkOutcomeKind = "declined" | "page-mismatch" | "pending" | "failed"
+
+/**
  * A command outcome the CLI prints verbatim — the page's decline reason, the wrong-owner line,
- * or the mismatch line — carrying the exit code the brief fixes for each case.
+ * or the mismatch line — carrying the exit code the brief fixes for each case and the kind the
+ * batch summary names it by.
  */
 export class OwnerLinkOutcome extends Error {
   constructor(
     readonly line: string,
     readonly exitCode: number,
+    readonly kind: OwnerLinkOutcomeKind,
   ) {
     super(line)
     this.name = "OwnerLinkOutcome"
@@ -162,7 +172,7 @@ export async function runOwnerLinkRound(
     deps.print(PASSKEY_IDENTITY_LINE)
     const result = await listener.result
     if (result.nonce !== nonce || result.requestHash !== link.requestHash) {
-      throw new OwnerLinkOutcome(PAGE_MISMATCH_LINE, 1)
+      throw new OwnerLinkOutcome(PAGE_MISMATCH_LINE, 1, "page-mismatch")
     }
     return result
   } finally {
@@ -178,17 +188,20 @@ function declined(result: OwnerLinkResult): never {
     throw new OwnerLinkOutcome(
       `the sponsored operation${label} was accepted and may still land — run the same command again in a minute — it will tell you if it already went through; nothing was sent from your wallet`,
       1,
+      "pending",
     )
   }
   const reason = result.reason ?? "the page did not finish"
   // The page detects a passkey that derives a different owner and reports it in the reason;
   // the brief's fixed line replaces it so the owner always reads the same words.
-  if (/different Mida owner/.test(reason)) throw new OwnerLinkOutcome(WRONG_OWNER_LINE, 2)
-  throw new OwnerLinkOutcome(reason, 2)
+  if (/different Mida owner/.test(reason)) throw new OwnerLinkOutcome(WRONG_OWNER_LINE, 2, "declined")
+  // The page's own verdict decides the label: a "failed" status is an operation failure, not a
+  // decline — the batch summary must not call it one.
+  throw new OwnerLinkOutcome(reason, 2, result.status === "failed" ? "failed" : "declined")
 }
 
 function mismatch(): never {
-  throw new OwnerLinkOutcome(PAGE_MISMATCH_LINE, 1)
+  throw new OwnerLinkOutcome(PAGE_MISMATCH_LINE, 1, "page-mismatch")
 }
 
 /** The chain read every passkey check needs — a bare context, no lock, no secrets. */
@@ -745,7 +758,7 @@ async function guardRevokePending(session: ServiceRuntime, name: string, live: b
     clearRevokePending(session.home, name)
     return
   }
-  throw new OwnerLinkOutcome(REVOKE_LANDING_LINE(name), 1)
+  throw new OwnerLinkOutcome(REVOKE_LANDING_LINE(name), 1, "pending")
 }
 
 function namespaceName(id: Hex): string {
