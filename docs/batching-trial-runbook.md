@@ -132,9 +132,10 @@ run.
 
 **A batch id can be stolen.** The batch id sits in the pending transaction while it waits in the
 mempool, and the contract is immutable — no code change can hide it. Anyone watching can land a
-batch under that id first; our transaction then reverts with `BatchExists`, and Monad bills the
-full gas limit of the reverted transaction anyway. The rows are not lost: the store sees the id
-was taken (`batch.id-taken` in its log), discovers the batch is not ours (`batch.not-ours`), and
-requeues the saves under a fresh id. A single occurrence is noise; **repeated `batch.id-taken` or
-`batch.not-ours` lines mean someone is actively racing the store** — treat that as an incident and
-consider pausing the lane (`BATCHING_ENABLED=false`) rather than paying full gas on doomed sends.
+batch under that id first; our send then either fails its simulation with `BatchExists` or lands
+a transaction that reverts on chain — and Monad bills the full gas limit of the reverted
+transaction either way. The rows are not lost: the store probes the id on chain, finds the foreign
+batch, and logs `batch.id-taken` (with the foreign submitter when the send reverted) before
+requeueing the saves under a fresh id. A single occurrence is noise; **repeated `batch.id-taken`
+lines mean someone is actively racing the store** — treat that as an incident and consider pausing
+the lane (`BATCHING_ENABLED=false`) rather than paying full gas on doomed sends.

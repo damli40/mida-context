@@ -282,6 +282,12 @@ class FakeChain implements BatcherChain {
   gasUsedFor: (saves: BatchedSaveWire[]) => bigint = (saves) => 60_000n * BigInt(saves.length)
   /** Throw after recording: the send landed but its answer was lost. */
   afterRecord: (() => void) | null = null
+  /**
+   * Revert on a seen batchId instead of answering { exists: true } — a front-run that lands AFTER
+   * our simulation passed, so our transaction reverts on chain and the send throws the generic
+   * post-send error, the way a stolen id actually shows up.
+   */
+  revertOnExists = false
   failLogs = false
   /**
    * A lagging log index: batchOf sees the landed batch but every event read answers empty/null —
@@ -297,7 +303,12 @@ class FakeChain implements BatcherChain {
     this.attempts++
     this.submitTimes.push(this.now())
     const key = batchId.toLowerCase() as Hex
-    if (this.batches.has(key)) return { exists: true }
+    if (this.batches.has(key)) {
+      if (this.revertOnExists) {
+        throw new MidaError("CAPABILITY_DENIED", `submitBatch transaction ${`0x${"00".repeat(32)}`} reverted on-chain`)
+      }
+      return { exists: true }
+    }
     const failure = this.failSubmit?.(saves)
     if (failure != null) throw failure
     this.submissions.push({ batchId, count: saves.length })
@@ -566,6 +577,8 @@ describe("the batcher", () => {
     expect((await rig.store.get(meta.contextId))!.batchId).toBeNull()
     expect(await rig.journal.list()).toEqual([])
     expect(rig.timer.pending()).toBe(true)
+    // Nothing on chain and nothing provable — the failure stayed on the ambiguous path.
+    expect(rig.events.some((entry) => entry["event"] === "batch.submit-failed")).toBe(true)
 
     chain.failSubmit = null
     await rig.batcher.flush()
@@ -850,7 +863,7 @@ describe("the batcher", () => {
     expect((await rig.store.get(meta.contextId))!.state).toBe("ANCHORED")
   })
 
-  it("an ambiguous send — recorded, then its answer lost — heals through the next batch's ALREADY_ANCHORED", async () => {
+  it("an ambiguous send — recorded, then its answer lost — is probed, proven ours, and resolved in place", async () => {
     const rig = makeRig()
     const { wire, meta } = makeSave()
     await rig.enqueue(wire, meta.contextId)
@@ -858,12 +871,38 @@ describe("the batcher", () => {
       throw new Error("the response never arrived")
     }
 
+    // The batch landed and the post-send probe proves it: batchOf sees it and the BatchAnchored
+    // event names our submitter — so the run resolves it directly instead of re-sending.
     await rig.batcher.flush()
-    // The batch landed (the fake recorded it) but the batcher saw only a failure: rows requeued.
+    expect(rig.chain.batches.size).toBe(1)
+    expect(rig.chain.submissions).toHaveLength(1)
+    const row = (await rig.store.get(meta.contextId))!
+    const batchId = rig.chain.submissions[0]!.batchId.toLowerCase()
+    expect(row).toMatchObject({ state: "ANCHORED", batchId, position: 0 })
+    const batch = await rig.chain.batchOf(batchId as Hex)
+    expect(verifyMerkleProof(leafOf(meta), row.proof!, batch.root)).toBe(true)
+    expect(await rig.journal.list()).toEqual([])
+    expect(rig.events.some((entry) => entry["event"] === "batch.submit-failed")).toBe(false)
+  })
+
+  it("an ambiguous send whose probe cannot read the chain requeues, and the resubmit heals through ALREADY_ANCHORED", async () => {
+    const rig = makeRig()
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    // The send landed but its answer is lost AND the log reads fail — the probe cannot prove
+    // anything, so the batcher falls back to the ambiguous path: requeue, resubmit, heal.
+    rig.chain.afterRecord = () => {
+      throw new Error("the response never arrived")
+    }
+    rig.chain.failLogs = true
+
+    await rig.batcher.flush()
     expect(rig.chain.batches.size).toBe(1)
     expect((await rig.store.get(meta.contextId))!.state).toBe("QUEUED")
+    expect(rig.events.some((entry) => entry["event"] === "batch.submit-failed")).toBe(true)
 
     rig.chain.afterRecord = null
+    rig.chain.failLogs = false
     await rig.batcher.flush()
     // The resubmission is a NEW batchId; the contract rejects the save ALREADY_ANCHORED, and
     // resolve() heals the row onto the earlier batch's proof — batchId stays the first batch's.
@@ -945,14 +984,17 @@ describe("the batcher", () => {
     const rig = makeRig()
     const saves = [makeSave(), makeSave(), makeSave()]
     for (const { wire, meta } of saves) await rig.enqueue(wire, meta.contextId)
+    // The answer is lost AND the landed-batch probe cannot read the index — the rows requeue.
     rig.chain.afterRecord = () => {
       throw new Error("the response never arrived")
     }
+    rig.chain.failLogs = true
 
     await rig.batcher.flush()
     // Landed but unseen — all three rows requeued, and the resubmission rejects each ALREADY_ANCHORED.
     expect(rig.chain.batches.size).toBe(1)
     rig.chain.afterRecord = null
+    rig.chain.failLogs = false
     const scansBefore = rig.chain.anchoringScans
     await rig.batcher.flush()
 
@@ -1044,6 +1086,77 @@ describe("the batcher", () => {
     for (const { meta } of [first, second]) {
       expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId: ours.toLowerCase() })
     }
+  })
+
+  it("a send that reverted on-chain against a foreign batch is a stolen id — batch.id-taken, rows requeue under a fresh id", async () => {
+    const salts = [`0x${"aa".repeat(32)}` as Hex, `0x${"bb".repeat(32)}` as Hex]
+    let saltCall = 0
+    const rig = makeRig({ salt: () => salts[saltCall++]! })
+    const first = makeSave()
+    const second = makeSave()
+    await rig.enqueue(first.wire, first.meta.contextId)
+    await rig.enqueue(second.wire, second.meta.contextId)
+
+    // The front-run lands AFTER our simulation passed: the id for (submitter, sequence 1, salt A)
+    // was computable, an attacker landed a junk batch under it, and our send reverts on chain —
+    // the generic post-send failure, not the simulation's { exists: true }.
+    const ATTACKER = "0x7777777777777777777777777777777777777777" as Address
+    const predictedId = keccak256(
+      encodeAbiParameters([{ type: "address" }, { type: "uint256" }, { type: "bytes32" }], [SUBMITTER, 1n, salts[0]!]),
+    )
+    const junk = makeSave()
+    rig.chain.submitter = ATTACKER
+    rig.chain.rejectWith = () => BATCH_REJECT.BAD_SIGNER // the attacker's save fails on chain
+    await rig.chain.submit(predictedId, [junk.wire])
+    rig.chain.submitter = SUBMITTER
+    rig.chain.rejectWith = () => null
+    rig.chain.revertOnExists = true
+
+    await rig.batcher.run()
+    // The probe found the batch under the id and its event names a foreign submitter — that is a
+    // stolen id, not an ambiguous send: our reverted transaction put nothing on chain.
+    expect(rig.events.find((entry) => entry["event"] === "batch.id-taken")).toMatchObject({ batchId: predictedId, submitter: ATTACKER })
+    expect(rig.events.some((entry) => entry["event"] === "batch.submit-failed")).toBe(false)
+    expect(rig.chain.submissions).toHaveLength(1) // still only the attacker's send
+    for (const { meta } of [first, second]) {
+      expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "QUEUED", batchId: null })
+    }
+    expect(await rig.journal.list()).toEqual([])
+
+    // The very next run re-sends under a fresh id — nothing of ours ever touched the stolen one.
+    rig.setNow(1_000)
+    await rig.batcher.flush()
+    expect(rig.chain.submissions).toHaveLength(2)
+    const ours = rig.chain.submissions[1]!.batchId
+    expect(ours).not.toBe(predictedId)
+    for (const { meta } of [first, second]) {
+      expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId: ours.toLowerCase() })
+    }
+  })
+
+  it("a send that failed ambiguously while the batch is on chain but unprovable keeps rows SUBMITTED — the journaled batch resolves later", async () => {
+    const rig = makeRig()
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    // The send landed, its answer is lost, and the log index has not caught up: the probe finds
+    // the batch but cannot prove it ours or foreign — the resolve throws and the rows wait.
+    rig.chain.afterRecord = () => {
+      throw new Error("the response never arrived")
+    }
+    rig.chain.indexLag = true
+
+    await expect(rig.batcher.run()).rejects.toThrowError(/PARTIAL_READ|cannot be proven/)
+    expect((await rig.store.get(meta.contextId))!.state).toBe("SUBMITTED")
+    expect(await rig.journal.list()).toHaveLength(1)
+    expect(rig.events.some((entry) => entry["event"] === "batch.submit-failed")).toBe(false)
+    expect(rig.events.some((entry) => entry["event"] === "batch.unproven")).toBe(true)
+
+    rig.chain.indexLag = false
+    rig.chain.afterRecord = null
+    const batchId = rig.chain.submissions[0]!.batchId
+    await rig.batcher.recover()
+    expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId: batchId.toLowerCase() })
+    expect(await rig.journal.list()).toEqual([])
   })
 
   it("a landed batch whose event the log index has not caught up to is unproven, not foreign — resolve throws, keeps rows SUBMITTED and the journal, and a later resolve anchors", async () => {

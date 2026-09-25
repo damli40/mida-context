@@ -587,6 +587,43 @@ export class Batcher {
         if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
         return null
       }
+      // The send failed AFTER a transaction went out — its outcome is unknown, so before calling
+      // it ambiguous, look at what the chain actually holds under this batchId. A landed batch
+      // with a FOREIGN submitter is a stolen id: our transaction reverted on it, nothing of ours
+      // exists, and the rows requeue under a fresh id right now. A landed batch that is ours — or
+      // one the index cannot yet prove either way — resolves in place; a missing batch is the
+      // genuinely ambiguous send.
+      let probe: { landed: boolean; submitter: Address | null } | null = null
+      try {
+        const landed = (await this.#chain.batchOf(batchId)).blockNumber !== 0n
+        const event = landed ? await this.#chain.batchAnchored(batchId) : null
+        probe = { landed, submitter: event === null ? null : (event.submitter.toLowerCase() as Address) }
+      } catch {
+        // The probe itself failed — the send's outcome stays unknown.
+      }
+      if (probe !== null && probe.landed && probe.submitter !== null && probe.submitter !== this.#submitter) {
+        await this.#forgetBatch(batchId)
+        const requeued = await this.#store.requeue(batchId)
+        this.#log?.({ event: "batch.id-taken", batchId, submitter: probe.submitter, requeued })
+        if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
+        return null
+      }
+      if (probe !== null && probe.landed) {
+        // The send landed despite the error — or its event is still unindexed. Resolve in place;
+        // an unproven resolve keeps the batch journaled, and the retry loop re-attempts it.
+        try {
+          const counts = await this.#resolveOnce(batchId)
+          await this.#forgetBatch(batchId)
+          if ((await this.#store.countQueued()) > 0 && !(await this.#timer.pending())) {
+            await this.#timer.set(this.#now() + this.#waitMs)
+          }
+          return { batchId, ...counts }
+        } catch (resolveError) {
+          this.#log?.({ event: "batch.resolve-failed", batchId, error: String(resolveError) })
+          if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
+          throw resolveError
+        }
+      }
       // The send failed ambiguously — the tx may or may not land. Requeue wholesale; if it did land,
       // the next batch's ALREADY_ANCHORED and STALE_PARENT rejects heal the rows through
       // findAnchorings — a parented save resubmitted after its first copy landed comes back
