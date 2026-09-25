@@ -44,9 +44,13 @@ function freshNonce(): string {
 }
 
 /**
- * The revoke result plus what the wire format cannot carry: which readers the post-rotate
- * re-wrap failed to reach. In-browser only — the field never leaves the page.
+ * The one refusal the revoke path must make itself: rotating the key against an agent list that
+ * never loaded hands the new epoch to nobody and still reports success. A complete list always
+ * contains the clicked agent, so an empty list is an unavailable list, whatever the flag says.
  */
+export const REVOKE_NEEDS_LIST =
+  "Revoke needs the full agent list — the index and chain scan are unavailable; try again shortly"
+
 export interface MeRevokeResult extends FlowResult {
   rewrapFailed: { agentId: Hex; namespaceId: Hex; reason: string }[]
 }
@@ -60,8 +64,12 @@ export interface MeRevokeResult extends FlowResult {
  */
 export async function revokeFromMe(
   env: FlowEnvironment,
-  input: { signedInOwner: Address; agentId: Hex; agents: readonly AgentRow[] },
+  input: { signedInOwner: Address; agentId: Hex; agents: readonly AgentRow[]; agentsUnavailable?: boolean },
 ): Promise<MeRevokeResult> {
+  if (input.agentsUnavailable === true || input.agents.length === 0) {
+    // A plain Error — the panel shows this sentence verbatim.
+    throw new Error(REVOKE_NEEDS_LIST)
+  }
   const built = buildOwnerLink({
     origin: typeof location === "undefined" ? FALLBACK_ORIGIN : location.origin,
     flow: "revoke",
@@ -87,8 +95,13 @@ export async function revokeFromMe(
  */
 export async function repairReaderWrapsFromMe(
   env: FlowEnvironment,
-  input: { signedInOwner: Address; agents: readonly AgentRow[] },
+  input: { signedInOwner: Address; agents: readonly AgentRow[]; agentsUnavailable?: boolean },
 ): Promise<ReaderRepairResult> {
+  if (input.agentsUnavailable === true || input.agents.length === 0) {
+    // "Zero known agents" is a failed load, not an empty world — never claim "reached every
+    // surviving agent" for a list we could not read.
+    throw new Error(REVOKE_NEEDS_LIST)
+  }
   const namespaceIds = [
     ...new Set(input.agents.flatMap((agent) => agent.grants.map((grant) => grant.namespaceId.toLowerCase() as Hex))),
   ]

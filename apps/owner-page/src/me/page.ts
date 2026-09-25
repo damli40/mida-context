@@ -861,7 +861,12 @@ function boot(): void {
             const fresh = await loadMe(session.owner, ports)
             const result = await revokeFromMe(
               { ...env, progress },
-              { signedInOwner: session.owner, agentId: agent.agentId, agents: fresh.agents },
+              {
+                signedInOwner: session.owner,
+                agentId: agent.agentId,
+                agents: fresh.agents,
+                agentsUnavailable: fresh.agentsUnavailable,
+              },
             )
             if (result.status === "pending" || result.rewrapFailed.length > 0) repairOffered = true
             return result
@@ -873,7 +878,11 @@ function boot(): void {
                 const fresh = await loadMe(session.owner, ports)
                 const outcome = await repairReaderWrapsFromMe(
                   { ...env, progress },
-                  { signedInOwner: session.owner, agents: fresh.agents },
+                  {
+                    signedInOwner: session.owner,
+                    agents: fresh.agents,
+                    agentsUnavailable: fresh.agentsUnavailable,
+                  },
                 )
                 if (outcome.failed.length === 0) repairOffered = false
                 return outcome

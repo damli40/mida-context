@@ -793,3 +793,41 @@ describe("F3 — surviving agents always get the new key", () => {
     })
   })
 })
+
+// --- H1: a revoke without a complete agent list would rotate the key for nobody ---------------
+
+describe("H1 — no revoke or repair without the complete agent list", () => {
+  it("refuses to rotate when the click-time reload could not list agents", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const { env, credentials } = makeEnv({ sends, apiCalls, wraps, chain: revokeChain(sends) })
+    // the fresh load failed to enumerate — an empty list is not "no readers"
+    await expect(
+      revokeFromMe(env, { signedInOwner: OWNER, agentId: AGENT_ID, agents: [], agentsUnavailable: true }),
+    ).rejects.toThrow("Revoke needs the full agent list — the index and chain scan are unavailable; try again shortly")
+    expect(credentials.calls).toHaveLength(0)
+    expect(sends).toHaveLength(0)
+    expect(apiCalls).toHaveLength(0)
+  })
+
+  it("an empty list with no flag still refuses — the clicked agent cannot be missing from a true list", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const { env } = makeEnv({ sends, apiCalls, wraps: [], chain: revokeChain(sends) })
+    await expect(
+      revokeFromMe(env, { signedInOwner: OWNER, agentId: AGENT_ID, agents: [] }),
+    ).rejects.toThrow("Revoke needs the full agent list")
+    expect(sends).toHaveLength(0)
+  })
+
+  it("repair with zero known agents refuses — it never claims to reach 'every surviving agent'", async () => {
+    const wraps: WrapRecord[] = []
+    const { env, credentials } = makeEnv({ sends: [], apiCalls: [], wraps })
+    await expect(
+      repairReaderWrapsFromMe(env, { signedInOwner: OWNER, agents: [], agentsUnavailable: true }),
+    ).rejects.toThrow("Revoke needs the full agent list")
+    expect(credentials.calls).toHaveLength(0)
+    expect(wraps).toHaveLength(0)
+  })
+})
