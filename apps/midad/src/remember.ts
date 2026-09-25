@@ -2,6 +2,7 @@ import { privateKeyToAccount } from "viem/accounts"
 import { ContextApiClient } from "@mida/api"
 import { MidaError, OWNER_AUTHOR_ID, PERMISSION, PROVENANCE_SOURCE, isMidaError, namespaceId } from "@mida/protocol"
 import type { ContextKind, Hex } from "@mida/protocol"
+import type { ContextObject } from "@mida/sdk"
 import { scrubSecrets } from "@mida/compiler"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { listAgentNames, loadAgentIdentity } from "./keys.js"
@@ -147,7 +148,7 @@ function factText(value: unknown): string | null {
 export async function readOwnerFacts(runtime: ServiceRuntime, name: string): Promise<OwnerFact[]> {
   const agent = runtime.agent(name)
   const { reader, owner } = runtime
-  const facts: { fact: OwnerFact; statedAt: number }[] = []
+  const facts: { fact: OwnerFact; statedAt: number; chain?: ContextObject["chain"] }[] = []
   for (const namespace of FACT_NAMESPACES) {
     let objects
     try {
@@ -178,10 +179,35 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string): Pro
       facts.push({
         fact: { text, contextId: object.contextId, namespace, assertedAt: new Date(Number(record.createdAt) * 1000).toISOString() },
         statedAt,
+        // Monad's own placement of the record — the tie-break below; an object read without
+        // chain placement simply has none and loses a same-second tie to a placed one.
+        chain: object.chain,
       })
     }
   }
-  facts.sort((a, b) => b.statedAt - a.statedAt || b.fact.contextId.localeCompare(a.fact.contextId))
+  // Newest first by the original stating time; a same-second tie breaks by the order Monad
+  // actually wrote the records in — block, then log index — so a slow or lying clock can never
+  // reorder what the chain already fixed. contextId is the last resort only, for records that
+  // carry no placement at all.
+  facts.sort((a, b) => {
+    const time = b.statedAt - a.statedAt
+    if (time !== 0) return time
+    const aBlock = a.chain?.block
+    const bBlock = b.chain?.block
+    if (aBlock !== undefined || bBlock !== undefined) {
+      if (aBlock === undefined) return 1
+      if (bBlock === undefined) return -1
+      if (aBlock !== bBlock) return aBlock < bBlock ? 1 : -1
+    }
+    const aIndex = a.chain?.index
+    const bIndex = b.chain?.index
+    if (aIndex !== undefined || bIndex !== undefined) {
+      if (aIndex === undefined) return 1
+      if (bIndex === undefined) return -1
+      if (aIndex !== bIndex) return bIndex - aIndex
+    }
+    return b.fact.contextId.localeCompare(a.fact.contextId)
+  })
   return facts.slice(0, MAX_FACTS).map(({ fact }) => fact)
 }
 
