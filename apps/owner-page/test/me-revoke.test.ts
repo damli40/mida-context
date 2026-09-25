@@ -15,7 +15,8 @@ import { makeAssertion, makeKeyPair } from "./helpers.js"
 import type { FlowEnvironment } from "../src/owner/flows.js"
 import { readersAfterRevoke } from "../src/me/model.js"
 import { renderMe, wireRevokePanels } from "../src/me/page.js"
-import { repairReaderWrapsFromMe, revokeFromMe } from "../src/me/revoke.js"
+import { repairReaderWrapsFromMe, revokeFromMe, shouldOfferRepair } from "../src/me/revoke.js"
+import type { MeRevokeResult } from "../src/me/revoke.js"
 import { BLOCKED_AT_STORE_TEXT } from "../src/me/sources.js"
 import type { AgentRow, MeData } from "../src/me/sources.js"
 
@@ -244,7 +245,13 @@ function makeEnv(opts: {
  * post-send hasAuthority check), and the chain's own recheck refuses everyone else — the
  * request's reader list names every agent the page knows, whatever its rows claimed.
  */
-function revokeChain(sends: SendRecord[], reads?: ChainReads, liveReaders: readonly Hex[] = [SURVIVOR_A, SURVIVOR_B]) {
+function revokeChain(
+  sends: SendRecord[],
+  reads?: ChainReads,
+  liveReaders: readonly Hex[] = [SURVIVOR_A, SURVIVOR_B],
+  /** agents whose hasAuthority read fails outright — one dead RPC read must not stop the rest. */
+  unreadableReaders: readonly Hex[] = [],
+) {
   return fakeChain({
     activeCapabilityIds: (args) => {
       reads?.active.push([...args])
@@ -266,6 +273,7 @@ function revokeChain(sends: SendRecord[], reads?: ChainReads, liveReaders: reado
     }),
     hasAuthority: (args) => {
       reads?.authority.push([...args])
+      if (unreadableReaders.includes(args[1] as Hex)) throw new Error("RPC refused the read")
       return liveReaders.includes(args[1] as Hex)
     },
     epochPublicKey: (args) => epochKey(args[1] as Hex, args[2] as bigint),
@@ -924,5 +932,57 @@ describe("H2 — repair waits for the rotation to land", () => {
     expect(outcome.rewrapped).toEqual([SURVIVOR_A])
     // the wrap the survivor actually needed — the post-rotation epoch — was published
     expect(wraps.some((w) => w.agentId === SURVIVOR_A && w.readEpoch === "2")).toBe(true)
+  })
+})
+
+// --- H3: one dead chain read never silences the other readers ---------------------------------
+
+describe("H3 — a failed read for one reader is recorded, the rest still re-keyed", () => {
+  it("a reader whose authority check throws lands on rewrapFailed and the loop reaches the rest", async () => {
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const wraps: WrapRecord[] = []
+    const reads: ChainReads = { active: [], authority: [] }
+    // SURVIVOR_A's hasAuthority read dies on the wire; SURVIVOR_B still answers live.
+    const chain = revokeChain(sends, reads, [SURVIVOR_B], [SURVIVOR_A])
+    const { env } = makeEnv({ sends, apiCalls, wraps, chain })
+    const agents = [
+      agentRow({ agentId: AGENT_ID }),
+      agentRow({ agentId: SURVIVOR_A }),
+      agentRow({ agentId: SURVIVOR_B }),
+    ]
+    const result = await revokeFromMe(env, { signedInOwner: OWNER, agentId: AGENT_ID, agents })
+    // the revoke itself landed — a dead read on one reader is that reader's failure, not the flow's
+    expect(result.status).toBe("success")
+    expect(result.rewrapFailed).toHaveLength(1)
+    expect(result.rewrapFailed[0]!.agentId).toBe(SURVIVOR_A)
+    expect(result.rewrapFailed[0]!.namespaceId).toBe(NS_ID)
+    expect(result.rewrapFailed[0]!.reason).toContain("RPC refused")
+    expect(wraps.some((w) => w.agentId === SURVIVOR_B && w.readEpoch === "2")).toBe(true)
+    expect(wraps.some((w) => w.agentId === SURVIVOR_A)).toBe(false)
+  })
+
+  it("repair is offered for ANY non-success result that sent a transaction — not only pending", () => {
+    const tx = `0x${"bb".repeat(32)}` as Hex
+    const make = (over: Partial<MeRevokeResult>): MeRevokeResult => ({
+      v: 1,
+      status: "success",
+      nonce: NONCE,
+      requestHash: `0x${"ab".repeat(32)}` as Hex,
+      owner: OWNER,
+      transactions: [],
+      operations: [],
+      rewrapFailed: [],
+      epochsAtRevoke: [],
+      ...over,
+    })
+    // the send landed and a later step failed — Monad changed; the page must offer the fix
+    expect(shouldOfferRepair(make({ status: "failed", transactions: [tx] }))).toBe(true)
+    expect(shouldOfferRepair(make({ status: "pending", operations: [`0x${"ee".repeat(32)}` as Hex] }))).toBe(true)
+    expect(shouldOfferRepair(make({ status: "success", rewrapFailed: [{ agentId: SURVIVOR_A, namespaceId: NS_ID, reason: "x" }] }))).toBe(true)
+    // nothing sent and nothing failed — there is nothing to repair
+    expect(shouldOfferRepair(make({ status: "failed" }))).toBe(false)
+    expect(shouldOfferRepair(make({ status: "cancelled" }))).toBe(false)
+    expect(shouldOfferRepair(make({}))).toBe(false)
   })
 })

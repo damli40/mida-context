@@ -29,7 +29,7 @@ import { shortAddress } from "../owner/secrets.js"
 import type { OwnerLinkResult as FlowResult } from "@mida/protocol"
 import { chipsFor, isTxHash, provenanceBadge } from "./model.js"
 import type { Badge } from "./model.js"
-import { repairReaderWrapsFromMe, revokeFromMe } from "./revoke.js"
+import { repairReaderWrapsFromMe, revokeFromMe, shouldOfferRepair } from "./revoke.js"
 import type { MeRevokeResult } from "./revoke.js"
 import { boundedScanClient, scanWithDeadline } from "./logscan.js"
 import { AGENT_LIST_UNAVAILABLE, BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
@@ -871,7 +871,9 @@ function boot(): void {
                 agentsUnavailable: fresh.agentsUnavailable,
               },
             )
-            if (result.status === "pending" || result.rewrapFailed.length > 0) {
+            // Any outcome that reached Monad without finishing the job offers the repair —
+            // pending, a failure after the send, or a success that left a reader un-wrapped.
+            if (shouldOfferRepair(result)) {
               repairOffered = true
               repairEpochs = result.epochsAtRevoke
             }

@@ -127,6 +127,18 @@ export async function revokeFromMe(
 }
 
 /**
+ * Whether the page should offer its repair action for this outcome. Any non-success that still
+ * reached the wire — pending, or a failure after the send landed — means Monad may have changed
+ * while the fix never ran; a success that left readers un-wrapped needs it too. Only a clean
+ * success or a result that sent nothing needs nothing.
+ */
+export function shouldOfferRepair(result: MeRevokeResult): boolean {
+  if (result.rewrapFailed.length > 0) return true
+  if (result.status === "success" || result.status === "cancelled") return false
+  return result.transactions.length > 0 || result.operations.length > 0
+}
+
+/**
  * The repair action: for every agent the page knows and every area any grant touches, the chain
  * decides who still holds READ and the current epoch's wrap is published to each of them. The
  * revoked agent's checks simply fail — it needs no exclusion.

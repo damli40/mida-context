@@ -586,15 +586,15 @@ export async function confirmRevoke(
         progress("Sending the revocation…")
         const approval = await authority.approveRevocation({ kind: "agent", agentId: prep.agentId })
         // Re-wrap the rotated namespaces for the agents that keep READ on chain. One reader's
-        // publish failing must not stop the rest — each failure is named so the page can offer
-        // its repair action; the revoke itself already landed.
+        // authority read or publish failing must not stop the rest — each failure is named so
+        // the page can offer its repair action; the revoke itself already landed.
         for (const rotation of approval.rotated) {
           for (const reader of req.readers ?? []) {
             if (reader.toLowerCase() === prep.agentId.toLowerCase()) continue
-            const ok = await readCapability<boolean>(env, "hasAuthority", [derived, reader, rotation.namespaceId, PERMISSION.READ, 0])
-            if (!ok) continue
-            progress("Sending the new key to a surviving agent…")
             try {
+              const ok = await readCapability<boolean>(env, "hasAuthority", [derived, reader, rotation.namespaceId, PERMISSION.READ, 0])
+              if (!ok) continue
+              progress("Sending the new key to a surviving agent…")
               await authority.publishReaderWraps({ agentId: reader, namespaceId: rotation.namespaceId })
             } catch (error) {
               const reason = describeError(error)
