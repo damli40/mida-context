@@ -37,8 +37,8 @@ import type { AnchorState, Lane } from "./model.js"
 // GraphQL documents — exported so Task 5's index adapter reuses them verbatim.
 // Hasura-style Envio queries: entity names as declared in apps/indexer/schema.graphql.
 
-export const AGENTS_QUERY = `query MeAgents($owner: String!) {
-  Grant(where: { owner: { _eq: $owner } }) {
+export const AGENTS_QUERY = `query MeAgents($owner: String!, $limit: Int!) {
+  Grant(where: { owner: { _eq: $owner } }, limit: $limit) {
     id
     agent
     namespaceId
@@ -50,7 +50,7 @@ export const AGENTS_QUERY = `query MeAgents($owner: String!) {
     revokedBy
     txHash
   }
-  Revocation(where: { owner: { _eq: $owner } }) {
+  Revocation(where: { owner: { _eq: $owner } }, limit: $limit) {
     id
     kind
     agentId
@@ -67,8 +67,8 @@ export const AGENTS_QUERY = `query MeAgents($owner: String!) {
   }
 }`
 
-export const BATCHED_QUERY = `query MeBatched($owner: String!, $agents: [String!]) {
-  BatchedSave(where: { owner: { _eq: $owner } }) {
+export const BATCHED_QUERY = `query MeBatched($owner: String!, $agents: [String!], $limit: Int!) {
+  BatchedSave(where: { owner: { _eq: $owner } }, limit: $limit) {
     id
     namespaceId
     batchId
@@ -79,18 +79,18 @@ export const BATCHED_QUERY = `query MeBatched($owner: String!, $agents: [String!
     block
     txHash
   }
-  Agent(where: { id: { _in: $agents } }) {
+  Agent(where: { id: { _in: $agents } }, limit: $limit) {
     id
     signer
   }
 }`
 
-export const COUNTS_QUERY = `query MeCounts($owner: String!) {
+export const COUNTS_QUERY = `query MeCounts($owner: String!, $limit: Int!) {
   Owner_by_pk(id: $owner) {
     records
     batchedSaves
   }
-  ContextRecord(where: { owner: { _eq: $owner } }) {
+  ContextRecord(where: { owner: { _eq: $owner } }, limit: $limit) {
     id
     namespaceId
     provenanceSource
@@ -111,6 +111,13 @@ export const AGENT_LIST_UNAVAILABLE = "Agent list unavailable — the index is d
  * the agents sentence names what is actually missing.
  */
 export const AGENT_LIST_NO_INDEX = "Agent list unavailable — index not configured and the chain scan did not finish"
+/**
+ * Same unavailability, third cause: the index answered but reports `isReady: false` — it is
+ * mid-sync, so its Grant rows are not a list at all, and the chain scan also failed.
+ */
+export const AGENT_LIST_SYNCING = "Agent list unavailable — the index is still catching up and the chain scan did not finish"
+/** The banner when an index answer fills the query's page — more rows may exist unsent. */
+export const INDEX_LIMIT_TEXT = "list may be incomplete — the index has more rows than the page asked for"
 /** The exact agent-state wording for a store deny — pinned by the plan, rendered by the page. */
 export const BLOCKED_AT_STORE_TEXT = "blocked at the store · revoke pending on Monad"
 
@@ -146,6 +153,8 @@ export interface MePorts {
     agentIdOfSigner(signer: Address): Promise<Hex | null>
     getAgent(agentId: Hex): Promise<AgentRecord | null>
     latestTimestamp(): Promise<number>
+    /** eth_blockNumber — the lag owed to the owner is measured against this, not the index's say-so. */
+    latestBlock(): Promise<bigint>
   }
 }
 
@@ -364,7 +373,9 @@ function secondsOf(value: unknown): number | null {
  * sourceBlock how far the chain has got — their difference IS the lag, measured in blocks. A
  * missing row or unreadable numbers mean the index answered but cannot say how fresh it is.
  */
-function metaRowOf(meta: AgentsAnswer["_meta"]): { blocksBehind: number; isReady: boolean } | null {
+function metaRowOf(
+  meta: AgentsAnswer["_meta"],
+): { progressBlock: number; blocksBehind: number; isReady: boolean } | null {
   const rows = Array.isArray(meta) ? meta : meta != null && typeof meta === "object" ? [meta] : []
   const chainId = Number(DEPLOYMENT.chainId)
   for (const row of rows) {
@@ -373,7 +384,7 @@ function metaRowOf(meta: AgentsAnswer["_meta"]): { blocksBehind: number; isReady
     const progress = Number(row.progressBlock)
     const source = Number(row.sourceBlock)
     if (!Number.isFinite(progress) || !Number.isFinite(source)) return null
-    return { blocksBehind: source - progress, isReady: row.isReady !== false }
+    return { progressBlock: progress, blocksBehind: source - progress, isReady: row.isReady !== false }
   }
   return null
 }
@@ -451,22 +462,25 @@ function wireMessageOf(item: StoreBatchedItem): BatchSaveMessage | null {
   }
 }
 
-export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
+export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promise<MeData> {
   const ownerKey = lower(owner)
   const incomplete: string[] = []
   const note = (text: string) => {
     if (!incomplete.includes(text)) incomplete.push(text)
   }
 
-  // Two independent facts start together: the store's batching flag, its pending denies, and the
-  // chain clock — the clock is what tells an expired grant apart from a revoked one.
-  const [batchStatus, denies, latestSeconds] = await Promise.all([
+  // Independent facts start together: the store's batching flag, its pending denies, the chain
+  // clock — the clock tells an expired grant apart from a revoked one — and the chain's own
+  // block number, which is what the index's progress is measured against.
+  const [batchStatus, denies, latestSeconds, chainTip] = await Promise.all([
     safe(() => ports.store.batchStatus()),
     safe(() => ports.store.listRevocations("active")),
     safe(() => ports.chain.latestTimestamp()),
+    safe(() => ports.chain.latestBlock()),
   ])
   const nowSeconds =
     latestSeconds === null || !Number.isFinite(latestSeconds) ? null : BigInt(Math.floor(latestSeconds))
+  const chainBlock = chainTip === null ? null : Number(chainTip)
   const batchingOn = batchStatus === null ? null : batchStatus.enabled
   // The deployment's BatchAnchor is the only contract this page can check — roots are read from
   // it and signatures are recovered under its domain. A store advertising a different address
@@ -503,20 +517,36 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
   const indexRecords = new Map<string, IndexRecord>()
   let source: MeData["source"] = "index"
   let agentsUnavailable: string | null = null
-  // The lag is the index's own progress report (`_meta`), in blocks — null when the index
-  // answered but could not say how fresh it is.
+  // The lag is measured against Monad's own block number — the index's self-reported lag is only
+  // the fallback when the chain could not be asked. Null when the index cannot say how fresh it is.
   let indexLag: number | null = null
+  // isReady === false means the index answered but is still catching up: its Grant rows are a
+  // partial scan, not a list, so they are never consumed — the chain-log scan runs instead.
+  let indexSyncing = false
   let ownerCounts: { records: number; batchedSaves: number } | null = null
   let youSaidCount = 0
 
   if (ports.index !== null) {
-    const raw = await safe(() => queryIndex<AgentsAnswer>(ports.index!, AGENTS_QUERY, { owner: ownerKey }))
+    const raw = await safe(() => queryIndex<AgentsAnswer>(ports.index!, AGENTS_QUERY, { owner: ownerKey, limit }))
     const primary = raw !== null && isAgentsAnswer(raw) ? raw : null
+    const meta = primary === null ? null : metaRowOf(primary._meta)
     if (primary === null) {
       source = "chain-logs"
+    } else if (meta !== null && !meta.isReady) {
+      source = "chain-logs"
+      indexSyncing = true
     } else {
-      indexLag = metaRowOf(primary._meta)?.blocksBehind ?? null
-      for (const grant of primary.Grant ?? []) {
+      indexLag =
+        meta === null
+          ? null
+          : chainBlock !== null
+            ? chainBlock - meta.progressBlock
+            : meta.blocksBehind
+      const grants = primary.Grant ?? []
+      const revocations = primary.Revocation ?? []
+      // A page-sized answer may be only the first page — the banner warns, it never hides.
+      if (grants.length >= limit || revocations.length >= limit) note(INDEX_LIMIT_TEXT)
+      for (const grant of grants) {
         grantSeeds.push({
           agentId: grant.agent as Hex,
           capabilityId: grant.id as Hex,
@@ -528,17 +558,18 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
         })
         areaIds.add(lower(grant.namespaceId))
       }
-      for (const revocation of primary.Revocation ?? []) rememberRevoke(revocation.agentId, revocation.block, revocation.txHash)
+      for (const revocation of revocations) rememberRevoke(revocation.agentId, revocation.block, revocation.txHash)
       const agentIds = [...new Set(grantSeeds.map((g) => lower(g.agentId)))]
       // Secondary queries degrade their own corner of the page rather than dropping to the
       // fallback: the agents list already came from the index and stays index-sourced.
       const [batchedAnswer, countsAnswer] = await Promise.all([
-        safe(() => queryIndex<BatchedAnswer>(ports.index!, BATCHED_QUERY, { owner: ownerKey, agents: agentIds })),
-        safe(() => queryIndex<CountsAnswer>(ports.index!, COUNTS_QUERY, { owner: ownerKey })),
+        safe(() => queryIndex<BatchedAnswer>(ports.index!, BATCHED_QUERY, { owner: ownerKey, agents: agentIds, limit })),
+        safe(() => queryIndex<CountsAnswer>(ports.index!, COUNTS_QUERY, { owner: ownerKey, limit })),
       ])
       if (batchedAnswer === null) {
         note("the index's batch detail could not be read — batch transaction links may be missing")
       } else {
+        if ((batchedAnswer.BatchedSave ?? []).length >= limit) note(INDEX_LIMIT_TEXT)
         for (const row of batchedAnswer.BatchedSave ?? []) {
           if (!isString(row.id) || !isString(row.namespaceId)) continue
           indexBatched.set(lower(row.id), row)
@@ -552,6 +583,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
       if (countsAnswer === null) {
         note("the index's totals could not be read — counts are hidden")
       } else {
+        if ((countsAnswer.ContextRecord ?? []).length >= limit) note(INDEX_LIMIT_TEXT)
         for (const record of countsAnswer.ContextRecord ?? []) {
           if (!isString(record.id) || !isString(record.namespaceId)) continue
           indexRecords.set(lower(record.id), record)
@@ -576,8 +608,13 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
     if (logs === null) {
       // No agent source answered — the page must say the list is missing, never "no agents".
       // The blame is exact: a configured index that failed is "down"; no index URL at all was
-      // never asked, so it is "not configured".
-      agentsUnavailable = ports.index === null ? AGENT_LIST_NO_INDEX : AGENT_LIST_UNAVAILABLE
+      // never asked; an index mid-sync is still catching up, not down.
+      agentsUnavailable =
+        ports.index === null
+          ? AGENT_LIST_NO_INDEX
+          : indexSyncing
+            ? AGENT_LIST_SYNCING
+            : AGENT_LIST_UNAVAILABLE
       note("the grant log scan failed — the agent list may be incomplete")
     } else {
       const byCapability = new Map<string, GrantSeed>()
@@ -947,14 +984,17 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
     source === "index" && ownerCounts !== null && !anyPartial
       ? { records: ownerCounts.records + ownerCounts.batchedSaves, youSaid: youSaidCount, pending }
       : null
-  // The lag line names which source is speaking: no index configured at all, an index that
-  // failed to answer, or the index's own progress report.
+  // The lag line names which source is speaking: no index configured at all, an index that is
+  // still catching up, an index that failed to answer, or the progress measured against Monad's
+  // own block number.
   const lag =
     ports.index === null
       ? { text: "index not configured", stale: true }
-      : source === "chain-logs"
-        ? { text: "index unavailable", stale: true }
-        : lagText(indexLag)
+      : indexSyncing
+        ? { text: "index still catching up", stale: true }
+        : source === "chain-logs"
+          ? { text: "index unavailable", stale: true }
+          : lagText(indexLag)
 
   return { owner, agents: agentList, records, incomplete, agentsUnavailable, recordsUnavailable, source, lag, batchingOn, batchedListComplete, counts }
 }

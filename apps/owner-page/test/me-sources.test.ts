@@ -23,7 +23,16 @@ import type { Address, AgentRecord, BatchSaveMessage, Hex, SignedAgentCapability
 import { deriveEpochKeyPair, hexOf, sealContextObject } from "@mida/crypto"
 import type { AnchoredObject, BatchedReadItem, CapabilityView, ContextRecordView, RevocationIntentView } from "@mida/api"
 import { DEPLOYMENT } from "../src/owner/core.js"
-import { AGENTS_QUERY, AGENT_LIST_NO_INDEX, AGENT_LIST_UNAVAILABLE, BATCHED_QUERY, COUNTS_QUERY, loadMe } from "../src/me/sources.js"
+import {
+  AGENTS_QUERY,
+  AGENT_LIST_NO_INDEX,
+  AGENT_LIST_SYNCING,
+  AGENT_LIST_UNAVAILABLE,
+  BATCHED_QUERY,
+  COUNTS_QUERY,
+  INDEX_LIMIT_TEXT,
+  loadMe,
+} from "../src/me/sources.js"
 import type { GrantLog, MePorts } from "../src/me/sources.js"
 
 const OWNER = `0x${"11".repeat(20)}` as Address
@@ -181,14 +190,20 @@ function world() {
     agentRecords: new Map<string, AgentRecord>([[AGENT_ID.toLowerCase(), AGENT_RECORD]]),
     signerAgents: new Map<string, Hex>([[AGENT_KEY.address.toLowerCase(), AGENT_ID]]),
     chainTime: NOW + 5,
+    // Monad's own head — the lag the page owes the owner is measured against this, never
+    // against the index's self-reported sourceBlock
+    chainBlock: 1000n,
+    chainBlockError: null as Error | null,
+    queries: [] as { gql: string; vars: Record<string, unknown> }[],
   }
 
   const ports: MePorts = {
     index: state.indexAbsent
       ? null
       : {
-          query: async <T>(gql: string): Promise<T> => {
+          query: async <T>(gql: string, vars: Record<string, unknown> = {}): Promise<T> => {
             if (state.indexFails) throw new Error("index down")
+            state.queries.push({ gql, vars })
             checkQueryShape(gql)
             const answer =
               gql === AGENTS_QUERY ? state.agentsResult
@@ -246,6 +261,10 @@ function world() {
       agentIdOfSigner: async (signer) => state.signerAgents.get(signer.toLowerCase()) ?? null,
       getAgent: async (agentId) => state.agentRecords.get(agentId.toLowerCase()) ?? null,
       latestTimestamp: async () => state.chainTime,
+      latestBlock: async () => {
+        if (state.chainBlockError !== null) throw state.chainBlockError
+        return state.chainBlock
+      },
     },
   }
   return { state, ports }
@@ -506,6 +525,76 @@ describe("the index queries are Hasura-shaped", () => {
     const data = await loadMe(OWNER, ports)
     expect(data.lag.stale).toBe(true)
     expect(data.lag.text).toBe("≈ 160 s behind Monad")
+  })
+
+  it("the lag is measured against Monad's block number, not the index's self-report", async () => {
+    const { state, ports } = world()
+    // The index claims the head is 1000 and it is 1 behind — but Monad's real head is 2200,
+    // so the honest lag is 1201 blocks, far past the stale line the self-report hides.
+    state.agentsResult = {
+      ...(state.agentsResult as object),
+      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: true }],
+    }
+    state.chainBlock = 2200n
+    const data = await loadMe(OWNER, ports)
+    expect(data.lag.stale).toBe(true)
+    expect(data.lag.text).toBe("≈ 480 s behind Monad") // 1201 × ~0.4 s
+  })
+
+  it("a dead block-number read falls back to the index's own progress report", async () => {
+    const { state, ports } = world()
+    state.chainBlockError = new Error("rpc down")
+    const data = await loadMe(OWNER, ports)
+    // progress 999 vs sourceBlock 1000 — the index's own 1-block claim is all the page has
+    expect(data.lag).toEqual({ text: "≈ 0 s behind Monad", stale: false })
+  })
+
+  it("isReady === false means still catching up — the index's Grant rows are not a list at all", async () => {
+    const { state, ports } = world()
+    state.agentsResult = {
+      ...(state.agentsResult as object),
+      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: false }],
+    }
+    // the chain-log scan DID finish — the agents come from Monad's own events, and the
+    // mid-sync index's Grant row (AGENT_ID) must not appear as if it were the list
+    state.grantLogs = [
+      { kind: "granted", agentId: OTHER_ID, capabilityId: CAP2_ID, namespaceId: NS, permissions: 1, block: 100, txHash: TX1 },
+    ]
+    const data = await loadMe(OWNER, ports)
+    expect(data.source).toBe("chain-logs")
+    expect(data.agents.map((a) => a.agentId)).toEqual([OTHER_ID])
+    expect(data.lag.text).toBe("index still catching up")
+  })
+
+  it("isReady === false plus a failed log scan leaves the list unavailable — catching up, not 'no agents'", async () => {
+    const { state, ports } = world()
+    state.agentsResult = {
+      ...(state.agentsResult as object),
+      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: false }],
+    }
+    state.grantLogsError = new Error("rpc down")
+    const data = await loadMe(OWNER, ports)
+    expect(data.agentsUnavailable).toBe(AGENT_LIST_SYNCING)
+    expect(data.agents).toEqual([])
+  })
+
+  it("a page-sized answer earns the may-be-incomplete banner — and the row limit goes out in the query", async () => {
+    const { state, ports } = world()
+    // Two grants where the page asked for one — a full page means the index may have more.
+    state.agentsResult = {
+      Grant: [grantRow(), grantRow({ id: CAP2_ID, agent: OTHER_ID })],
+      Revocation: [],
+      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: true }],
+    }
+    const data = await loadMe(OWNER, ports, 1)
+    expect(state.queries.find((q) => q.gql === AGENTS_QUERY)!.vars.limit).toBe(1)
+    expect(state.queries.find((q) => q.gql === COUNTS_QUERY)!.vars.limit).toBe(1)
+    expect(data.incomplete).toContain(INDEX_LIMIT_TEXT)
+    // the banner warns — it does not hide the rows that did arrive
+    expect(data.agents).toHaveLength(2)
+    // and a short answer earns no banner
+    const calm = await loadMe(OWNER, ports)
+    expect(calm.incomplete).not.toContain(INDEX_LIMIT_TEXT)
   })
 })
 

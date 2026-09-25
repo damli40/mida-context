@@ -180,7 +180,9 @@ function asObjectManifest(value: unknown): ObjectManifest | null {
 /** The payload's own provenance claim as its numeric code — null when it names no known source. */
 function payloadSource(payload: ContextPayload): number | null {
   const source = payload.provenance?.source
-  if (typeof source !== "string" || !(source in PROVENANCE_SOURCE)) return null
+  // `in` would also admit prototype keys ("toString", "constructor") and hand back a function as
+  // a "source code" — the membership test has to be own-keys only.
+  if (typeof source !== "string" || !Object.hasOwn(PROVENANCE_SOURCE, source)) return null
   return PROVENANCE_SOURCE[source as ProvenanceSource]
 }
 

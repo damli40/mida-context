@@ -203,6 +203,21 @@ describe("me session", () => {
     session.end()
   })
 
+  it("a payload naming a prototype key as its source answers null — never a borrowed function", async () => {
+    const { env } = makeEnv()
+    const session = await signIn(env, [NS])
+    // "toString" is not a provenance source, but `source in PROVENANCE_SOURCE` says yes for any
+    // Object.prototype key — and would return Object.prototype.toString as the "code". Only an
+    // own-key check is safe here.
+    const opened = session.open(sealRow({ source: "toString" as "USER_ASSERTED" }))
+    expect(opened.ok).toBe(true)
+    if (opened.ok) {
+      expect(opened.provenanceSource).toBeNull()
+      expect(typeof opened.provenanceSource).not.toBe("function")
+    }
+    session.end()
+  })
+
   it("a row that will not open is { ok: false }, never a guess", async () => {
     const { env } = makeEnv()
     const session = await signIn(env, [NS])

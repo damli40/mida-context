@@ -747,6 +747,7 @@ function livePorts(env: FlowEnvironment, session: MeSession, indexUrl: string | 
       agentIdOfSigner: (signer) => reader.agentIdOfSigner(signer),
       getAgent: (agentId) => reader.getAgent(agentId),
       latestTimestamp: async () => Number(await latestTimestamp(context)),
+      latestBlock: () => context.publicClient.getBlockNumber(),
     },
   }
 }
