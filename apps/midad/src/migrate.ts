@@ -411,7 +411,7 @@ async function storeUnreadableManifest(
 ): Promise<Manifest> {
   const owner = loadOwnerAddress(home)
   if (owner === undefined) throw new Error("owner-address.json is missing — run `mida init` first")
-  const client = createPublicClient({ chain: chainFor(source.chainId), transport: rpcTransport(sourceNetwork.rpcUrl) })
+  const client = createPublicClient({ chain: chainFor(source.chainId), batch: { multicall: true }, transport: rpcTransport(sourceNetwork.rpcUrl) })
   const logs = await getLogsChunked(client, {
     address: source.contextRegistry,
     event: CONTEXT_REGISTERED,
@@ -514,7 +514,7 @@ export async function migrate(
       if (owner === undefined) throw new Error("owner-address.json is missing — cannot ask the chain about batched saves")
       batched =
         deps.hasBatchedSaves === undefined
-          ? ((await createPublicClient({ chain: chainFor(source.chainId), transport: rpcTransport(sourceNetwork.rpcUrl) }).readContract({
+          ? ((await createPublicClient({ chain: chainFor(source.chainId), batch: { multicall: true }, transport: rpcTransport(sourceNetwork.rpcUrl) }).readContract({
               address: source.batchAnchor,
               abi: batchAnchorAbi,
               functionName: "hasBatchedSaves",
@@ -889,7 +889,7 @@ export async function migrate(
 
     // ── Rule 7: approvals — the live scopes the source shows, or a replay grant for a revoked agent ──
     const sourceReader = new RegistryReader({
-      publicClient: createPublicClient({ chain: chainFor(source.chainId), transport: rpcTransport(sourceNetwork.rpcUrl) }),
+      publicClient: createPublicClient({ chain: chainFor(source.chainId), batch: { multicall: true }, transport: rpcTransport(sourceNetwork.rpcUrl) }),
       deployment: source,
     })
     const sourceRevoked = new Set<string>()
@@ -1591,6 +1591,7 @@ export async function migrateUndo(deps: MigrateUndoDeps): Promise<{ outcome: "re
           : new RegistryReader({
               publicClient: createPublicClient({
                 chain: chainFor(parseDeployment(sourceNet.deployment).chainId),
+                batch: { multicall: true },
                 transport: rpcTransport(typeof sourceNet.rpcUrl === "string" ? sourceNet.rpcUrl : resolved.network.rpcUrl),
               }),
               deployment: parseDeployment(sourceNet.deployment),

@@ -7,7 +7,7 @@ import { createServer } from "node:http"
 import type { AddressInfo } from "node:net"
 import { describe, expect, it } from "vitest"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
-import { createPublicClient, encodeErrorResult, http } from "viem"
+import { createPublicClient, decodeFunctionData, encodeErrorResult, encodeFunctionResult, http, parseAbi } from "viem"
 import type { Address, Hex } from "viem"
 import { MidaError } from "@mida/protocol"
 import {
@@ -41,6 +41,16 @@ const deployment: Deployment = {
 }
 
 type RpcHandler = (params: unknown[]) => unknown
+
+/**
+ * The Monad Multicall3 address. Public clients batch plain eth_calls through aggregate3 (in-6 R2),
+ * so the fake chain answers it the way the real contract does: every inner call succeeds with the
+ * same 32 zero bytes a plain eth_call would have returned.
+ */
+const MULTICALL3 = "0xca11bde05977b3631167028862be2a173976ca11"
+const aggregate3 = parseAbi([
+  "function aggregate3((address target, bool allowFailure, bytes callData)[] calls) view returns ((bool success, bytes returnData)[])",
+])[0]!
 
 /** A JSON-RPC server on an ephemeral localhost port; `methods[method]` answers, anything else -32601. */
 async function rpcServer(methods: Record<string, RpcHandler>): Promise<{ url: string; close(): Promise<void> }> {
@@ -223,7 +233,18 @@ async function start(script: SponsorScript, chain: { code: string; txCount: stri
     eth_getCode: () => chain.code,
     eth_getTransactionCount: () => chain.txCount,
     // EntryPoint.getNonce(sender, key) — the account's user-op nonce, zero on a fresh address.
-    eth_call: () => `0x${"0".repeat(64)}`,
+    // A call aimed at Multicall3 (in-6 R2 batching) is unpacked and each inner call answered the same.
+    eth_call: (params) => {
+      const call = (params as [{ to?: string; data?: Hex }])[0]
+      if (call.to?.toLowerCase() !== MULTICALL3) return `0x${"0".repeat(64)}`
+      const decoded = decodeFunctionData({ abi: [aggregate3], data: call.data! })
+      const calls = decoded.args[0] as readonly unknown[]
+      return encodeFunctionResult({
+        abi: [aggregate3],
+        functionName: "aggregate3",
+        result: calls.map(() => ({ success: true, returnData: `0x${"0".repeat(64)}` as Hex })),
+      })
+    },
     eth_blockNumber: () => "0x1",
   })
   return {

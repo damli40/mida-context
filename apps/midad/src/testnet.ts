@@ -61,7 +61,7 @@ export function funderFor(
 export async function testnetNetwork(env: Record<string, string | undefined>): Promise<Network> {
   const rpcUrl = env.MONAD_TESTNET_RPC ?? monadTestnet.rpcUrls.default.http[0]
   const deployment = loadDeployment(MONAD_TESTNET_CHAIN_ID, env.MIDA_DEPLOYMENTS_DIR)
-  const probe = createPublicClient({ chain: chainFor(deployment.chainId), transport: rpcTransport(rpcUrl) })
+  const probe = createPublicClient({ chain: chainFor(deployment.chainId), batch: { multicall: true }, transport: rpcTransport(rpcUrl) })
   const chainId = await probe.getChainId()
   if (BigInt(chainId) !== deployment.chainId) {
     throw new Error(`RPC ${rpcUrl} is chain ${chainId}, not Monad testnet ${deployment.chainId}`)

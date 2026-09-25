@@ -85,7 +85,7 @@ export function createWriteContext(input: { rpcUrl: string; deployment: Deployme
   return {
     deployment: input.deployment,
     account: input.account,
-    publicClient: createPublicClient({ chain, transport: rpcTransport(input.rpcUrl) }),
+    publicClient: createPublicClient({ chain, batch: { multicall: true }, transport: rpcTransport(input.rpcUrl) }),
     walletClient: createWalletClient({ chain, account: input.account, transport: rpcTransport(input.rpcUrl) }),
   }
 }

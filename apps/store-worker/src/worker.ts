@@ -246,7 +246,7 @@ function buildWorker(env: WorkerEnv): Built {
   } catch {
     throw new Error(`environment variable RPC_URL must be an absolute URL`)
   }
-  const publicClient = createPublicClient({ transport: rpcTransport(rpcUrl) })
+  const publicClient = createPublicClient({ batch: { multicall: true }, transport: rpcTransport(rpcUrl) })
   const reader = new RegistryReader({ publicClient, deployment })
   const stores = d1Stores(env.DB)
   const batching = batchingOptions(env, deployment, publicClient)

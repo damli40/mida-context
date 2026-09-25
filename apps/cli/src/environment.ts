@@ -54,7 +54,7 @@ export async function startApiServer(input: {
   deployment: Deployment
   batching?: { cap?: number; waitMs?: number; minGapMs?: number; submitter?: LocalAccount }
 }): Promise<{ baseUrl: string; close(): Promise<void>; batcher?: { pauseTimer(): void; resumeTimer(): void } }> {
-  const publicClient = createPublicClient({ chain: chainFor(input.deployment.chainId), transport: rpcTransport(input.rpcUrl) })
+  const publicClient = createPublicClient({ chain: chainFor(input.deployment.chainId), batch: { multicall: true }, transport: rpcTransport(input.rpcUrl) })
   const reader = new RegistryReader({ publicClient, deployment: input.deployment })
   const dataDir = mkdtempSync(join(tmpdir(), "mida-api-"))
   const stores = fileStores(dataDir)

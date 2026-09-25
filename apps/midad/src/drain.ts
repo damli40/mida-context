@@ -634,7 +634,7 @@ async function agentApprovedOnChain(home: MidaHome, agent: string, ownerOf: () =
   }
   const deployment = parseDeployment(stored.deployment)
   const context: ChainContext = {
-    publicClient: createPublicClient({ chain: chainFor(deployment.chainId), transport: rpcTransport(stored.rpcUrl) }),
+    publicClient: createPublicClient({ chain: chainFor(deployment.chainId), batch: { multicall: true }, transport: rpcTransport(stored.rpcUrl) }),
     deployment,
   }
   const reader = new RegistryReader(context)

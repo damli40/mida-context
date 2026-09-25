@@ -124,7 +124,7 @@ export function createSponsoredSender(input: {
   progress?: (line: string) => void
 }): SponsoredSender {
   const chain = chainFor(input.deployment.chainId)
-  const publicClient = createPublicClient({ chain, transport: rpcTransport(input.rpcUrl) })
+  const publicClient = createPublicClient({ chain, batch: { multicall: true }, transport: rpcTransport(input.rpcUrl) })
   const pimlico = createPimlicoClient({
     chain,
     transport: rpcTransport(input.sponsorUrl),

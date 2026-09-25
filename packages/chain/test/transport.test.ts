@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { createPublicClient } from "viem"
-import { foundry } from "viem/chains"
-import { rpcTransport, rpcTransportProbe } from "@mida/chain"
+import { createPublicClient, decodeFunctionData, encodeFunctionResult, parseAbi } from "viem"
+import type { Hex } from "viem"
+import { foundry, monadTestnet } from "viem/chains"
+import { createWriteContext, rpcTransport, rpcTransportProbe } from "@mida/chain"
+import type { Deployment } from "@mida/chain"
 
 const ok = (body: { id?: number }) =>
   new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id ?? 1, result: "0x7a69" }), {
@@ -74,5 +76,94 @@ describe("rpcTransport rate limit (in-6 R1)", () => {
     )
     expect(rpcTransportProbe.sentAt).toHaveLength(20)
     expect(peakPerSecond(rpcTransportProbe.sentAt)).toBeLessThanOrEqual(10)
+  }, 30_000)
+})
+
+// ---------------------------------------------------------------------------
+// in-6 R2 — one multicall request instead of one request per read
+// ---------------------------------------------------------------------------
+
+const MULTICALL3 = "0xca11bde05977b3631167028862be2a173976ca11"
+const aggregate3 = parseAbi([
+  "function aggregate3((address target, bool allowFailure, bytes callData)[] calls) view returns ((bool success, bytes returnData)[])",
+])[0]!
+const answerAbi = parseAbi(["function answer() view returns (uint256)"])
+
+const MONAD_DEPLOYMENT: Deployment = {
+  chainId: 10143n,
+  capabilityRegistry: "0x00000000000000000000000000000000000000a1",
+  contextRegistry: "0x00000000000000000000000000000000000000b2",
+  deploymentBlock: 1n,
+  policyHashV1: `0x${"11".repeat(32)}`,
+  vaultRpId: "vault.mida.xyz",
+  vaultRpIdHash: `0x${"22".repeat(32)}`,
+}
+const LOCAL_DEPLOYMENT: Deployment = { ...MONAD_DEPLOYMENT, chainId: 31337n }
+
+/** The account slot createWriteContext wants; reads never sign, so the key is filler. */
+const ACCOUNT = { address: "0x00000000000000000000000000000000000000cc", type: "json-rpc" } as never
+
+/**
+ * A fetch stand-in that speaks eth_call: a call aimed at Multicall3 is decoded, each inner call
+ * answered 42 and the aggregate result re-encoded — any other target answers 42 directly.
+ */
+function multicallAwareFetch(seen: { targets: string[] }) {
+  return vi.fn(async (_url: unknown, init?: { body?: string }) => {
+    const body = JSON.parse(String(init?.body))
+    const params = body.params as [{ to?: string; data?: Hex }]
+    const call = params[0]
+    let result: Hex
+    if (call.to?.toLowerCase() === MULTICALL3) {
+      seen.targets.push(MULTICALL3)
+      const decoded = decodeFunctionData({ abi: [aggregate3], data: call.data! })
+      const calls = decoded.args[0] as readonly { target: string; callData: Hex }[]
+      result = encodeFunctionResult({
+        abi: [aggregate3],
+        functionName: "aggregate3",
+        result: calls.map(() => ({ success: true, returnData: encodeFunctionResult({ abi: answerAbi, functionName: "answer", result: 42n }) as Hex })),
+      })
+    } else {
+      seen.targets.push(call.to ?? "")
+      result = encodeFunctionResult({ abi: answerAbi, functionName: "answer", result: 42n }) as Hex
+    }
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id ?? 1, result }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })
+  })
+}
+
+describe("multicall batching (in-6 R2)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    rpcTransportProbe.reset()
+  })
+
+  const threeReads = async (deployment: Deployment) => {
+    const ctx = createWriteContext({ rpcUrl: "http://r2.test", deployment, account: ACCOUNT })
+    return Promise.all(
+      Array.from({ length: 3 }, () =>
+        ctx.publicClient.readContract({ address: deployment.contextRegistry, abi: answerAbi, functionName: "answer" }),
+      ),
+    )
+  }
+
+  it("a Monad-chain public client batches 3 reads into ONE HTTP request through Multicall3", async () => {
+    const seen = { targets: [] as string[] }
+    vi.stubGlobal("fetch", multicallAwareFetch(seen))
+    const answers = await threeReads(MONAD_DEPLOYMENT)
+    expect(answers).toEqual([42n, 42n, 42n])
+    // one aggregate3 eth_call, aimed at the Monad testnet Multicall3 address — not 3 plain calls
+    expect(rpcTransportProbe.sentAt).toHaveLength(1)
+    expect(seen.targets).toEqual([MULTICALL3])
+  }, 30_000)
+
+  it("a chain with no Multicall3 (the local e2e chain) falls back to plain calls — same answers", async () => {
+    const seen = { targets: [] as string[] }
+    vi.stubGlobal("fetch", multicallAwareFetch(seen))
+    const answers = await threeReads(LOCAL_DEPLOYMENT)
+    expect(answers).toEqual([42n, 42n, 42n])
+    expect(rpcTransportProbe.sentAt).toHaveLength(3)
+    expect(seen.targets.every((t) => t !== MULTICALL3)).toBe(true)
   }, 30_000)
 })

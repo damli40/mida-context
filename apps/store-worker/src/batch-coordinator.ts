@@ -200,7 +200,7 @@ export class BatchCoordinator {
         : (overrides.gate ??
           createBatchDenyGate({
             reader: new RegistryReader({
-              publicClient: createPublicClient({ transport: rpcTransport(env.RPC_URL) }),
+              publicClient: createPublicClient({ batch: { multicall: true }, transport: rpcTransport(env.RPC_URL) }),
               deployment: coordinatorDeployment(env),
             }),
             overlay: new DenyOverlay(new D1DenyStore(env.DB)),

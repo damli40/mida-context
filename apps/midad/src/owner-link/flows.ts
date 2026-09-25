@@ -207,7 +207,7 @@ function mismatch(): never {
 /** The chain read every passkey check needs — a bare context, no lock, no secrets. */
 function bareChain(network: Network): ChainContext {
   return {
-    publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: rpcTransport(network.rpcUrl) }),
+    publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), batch: { multicall: true }, transport: rpcTransport(network.rpcUrl) }),
     deployment: network.deployment,
   }
 }

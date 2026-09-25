@@ -376,7 +376,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         shared.resolved = resolved
         if (!resolved.saved) return [problem("network.json is missing or unreadable", INIT_FIX)]
         shared.context = {
-          publicClient: createPublicClient({ chain: chainFor(resolved.network.deployment.chainId), transport: rpcTransport(resolved.network.rpcUrl) }),
+          publicClient: createPublicClient({ chain: chainFor(resolved.network.deployment.chainId), batch: { multicall: true }, transport: rpcTransport(resolved.network.rpcUrl) }),
           deployment: resolved.network.deployment,
         }
         shared.reader = new RegistryReader(shared.context)

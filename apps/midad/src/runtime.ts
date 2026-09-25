@@ -336,7 +336,7 @@ export class ServiceRuntime {
       const apiBaseUrl = storageUrl ?? server!.baseUrl
       home.writeSecretJson(API_URL_FILE, { baseUrl: apiBaseUrl })
       const chain: ChainContext = {
-        publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: rpcTransport(network.rpcUrl) }),
+        publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), batch: { multicall: true }, transport: rpcTransport(network.rpcUrl) }),
         deployment: network.deployment,
       }
       return new ServiceRuntime(home, network, owner, chain, apiBaseUrl, async () => {
@@ -373,7 +373,7 @@ export class ServiceRuntime {
     const { apiBaseUrl, server, locked } = await resolveOwnerApi(home, network, timing)
     try {
       const chain: ChainContext = {
-        publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), transport: rpcTransport(network.rpcUrl) }),
+        publicClient: createPublicClient({ chain: chainFor(network.deployment.chainId), batch: { multicall: true }, transport: rpcTransport(network.rpcUrl) }),
         deployment: network.deployment,
       }
       return new ServiceRuntime(home, network, owner, chain, apiBaseUrl, async () => {
