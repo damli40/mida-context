@@ -339,6 +339,22 @@ describe("the crude mida command", () => {
         stdinIsTTY: true,
         stdoutIsTTY: true,
       })
+    // M2: the post-revoke read must reach past the folder gate, so it runs in the
+    // approved folder with its own marker's project id — a bare `read` would be
+    // refused as not-approved whether the revoke had landed or not
+    const projectId = (JSON.parse(readFileSync(join(projectDir, ".mida", "project.json"), "utf8")) as { projectId: string }).projectId
+    const readInProject = (...argv: string[]) =>
+      runCli(argv, {
+        home,
+        network,
+        cwd: projectDir,
+        print: (line) => out.push(line),
+        prompt: async () => "yes",
+        stdinIsTTY: true,
+        stdoutIsTTY: true,
+      })
+    // sanity: the same read succeeds while the grant and the folder row are live
+    expect(await readInProject("read", "claude-code", projectId)).toBe(0)
     // the chain revoke succeeds — the exit code says so even though one wrap is refused
     expect(await run2("revoke", "claude-code")).toBe(0)
     // the chain answer leads: before any per-agent key line, and it is not "refused"
@@ -361,8 +377,15 @@ describe("the crude mida command", () => {
     // cleanup, by the command the line itself names: approve clears the stale deny
     expect(await run2("approve", "codex")).toBe(1) // already-approved answer — the deny is gone first
     expect(out.some((line) => line === "cleared a stale block at the store left by a failed revoke")).toBe(true)
-    // and claude-code's revoke really did land — reads stay refused
-    expect(await run2("read", "claude-code", "proj-1")).toBe(1)
+    // and claude-code's revoke really did land — the same read that succeeded above is
+    // refused now, with the line the landed revoke's marker produces. The revoke removes
+    // the folder's approval row, so the refusal arrives through checkProject's
+    // not-approved + revoked-marker answer — which only exists because the chain revoke
+    // ran — never the plain not-approved line a folder gate failure would print (M2)
+    expect(await readInProject("read", "claude-code", projectId)).toBe(1)
+    expect(out.at(-1)).toBe(
+      "Mida: claude-code's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
+    )
   }, 300_000)
 
   it("an already-approved approve says what the folder listing did — never 'run the command you just ran' (M3-D4)", async () => {
@@ -641,6 +664,19 @@ describe("the crude mida command", () => {
         prompt: async (question) => { asked.push(question); lastBeforeAsk = lines.at(-1); return "yes" },
         stdinIsTTY: true, stdoutIsTTY: true,
       })
+    // M2: the post-revoke read below must reach past the folder gate, so it runs in the
+    // approved folder with its own marker's project id. claude-code is already approved
+    // on chain — this approve only writes THIS folder's row (no transaction) — and the
+    // same read must succeed BEFORE the revoke, so the refusal afterwards can only be
+    // the landed revoke, never a folder gate that was never open
+    const projectId = (JSON.parse(readFileSync(join(projectDir, ".mida", "project.json"), "utf8")) as { projectId: string }).projectId
+    const readInProject = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, cwd: projectDir, print: (line) => lines.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await run("approve", "claude-code")).toBe(0)
+    expect(await readInProject("read", "claude-code", projectId)).toBe(0)
     // every agent that still holds an approval: the four project agents above plus assistant,
     // whose general-assistance grant init sent at the start of this file
     expect(await run2("revoke", "--all")).toBe(0)
@@ -653,8 +689,13 @@ describe("the crude mida command", () => {
     // the whole list printed before the single ask — nothing was revoked sight-unseen
     expect(lastBeforeAsk).toBe("cursor holds an approval")
     expect(lines.at(-1)).toBe("revoked: assistant, claude-code, claude-desktop, codex, cursor")
-    // and a revocation is real: claude-code's read is refused now
-    expect(await run2("read", "claude-code", "proj-1")).toBe(1)
+    // and a revocation is real: the same read that just succeeded is refused now, with
+    // the revoked-agent line the landed revoke's folder marker produces — never the
+    // plain not-approved answer a folder gate failure would print (M2)
+    expect(await readInProject("read", "claude-code", projectId)).toBe(1)
+    expect(lines.at(-1)).toBe(
+      "Mida: claude-code's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
+    )
     // a second run finds nobody approved — exit 0, no prompt at all
     asked.length = 0
     expect(await run2("revoke", "--all")).toBe(0)
