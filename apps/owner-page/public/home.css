@@ -1,0 +1,475 @@
+/* Mida home page.
+   Palette: the logo's two colours, Ink and Ivory, plus warm grays mixed between them. No accent colour.
+   Shape rule: interactive things (buttons) are full pills, content blocks are 12px. Nothing else.
+   No JavaScript. The CSP allows only same-origin styles, so every style lives in this file. */
+
+:root {
+  --ink: #14130F;
+  --ivory: #FAF9F5;
+
+  --bg: var(--ivory);
+  --fg: var(--ink);
+  --fg-2: #3B3831;
+  --muted: #5E5A51;
+  --line: #E2DED3;
+  --line-strong: #C9C4B7;
+  --surface: #F1EFE8;
+  --btn-hover: #2E2C26;
+
+  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", system-ui, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --gutter: 16px;
+  --radius: 12px;
+  --header-h: 68px;
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: var(--ink);
+    --fg: var(--ivory);
+    --fg-2: #DAD6CB;
+    --muted: #A9A498;
+    --line: #2C2A24;
+    --line-strong: #45423A;
+    --surface: #1C1B17;
+    --btn-hover: #E4E1D8;
+  }
+}
+
+@media (min-width: 768px) { :root { --gutter: 32px; } }
+@media (min-width: 1280px) { :root { --gutter: 48px; } }
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  scroll-behavior: smooth;
+  scroll-padding-top: calc(var(--header-h) + 16px);
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 1.0625rem;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+h1, h2, h3 { margin: 0; font-weight: 600; color: var(--fg); text-wrap: balance; }
+p { margin: 0; text-wrap: pretty; }
+ul, dl, dd { margin: 0; padding: 0; }
+ul { list-style: none; }
+figure { margin: 0; }
+svg { display: block; }
+code, pre { font-family: var(--mono); }
+a { color: inherit; }
+
+:focus-visible {
+  outline: 2px solid var(--fg);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+.skip {
+  position: absolute;
+  left: var(--gutter);
+  top: -100px;
+  z-index: 20;
+  padding: .6rem 1rem;
+  background: var(--fg);
+  color: var(--bg);
+  border-radius: 999px;
+  text-decoration: none;
+  font-weight: 600;
+}
+.skip:focus { top: 12px; }
+
+.wrap {
+  width: 100%;
+  max-width: 1240px;
+  margin-inline: auto;
+  padding-inline: var(--gutter);
+}
+
+/* Header (z-index scale: header 10, skip link 20) */
+
+.site-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+.header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: var(--header-h);
+}
+.brand {
+  display: inline-flex;
+  flex: none;
+  color: var(--fg);
+  padding-block: 8px;
+}
+.lockup { height: 24px; width: auto; }
+
+.site-nav { display: flex; align-items: center; gap: 32px; }
+.site-nav ul { display: none; gap: 28px; }
+.site-nav ul a {
+  text-decoration: none;
+  color: var(--muted);
+  font-size: .9375rem;
+  white-space: nowrap;
+  transition: color .2s ease;
+}
+.site-nav ul a:hover { color: var(--fg); }
+@media (min-width: 1024px) { .site-nav ul { display: flex; } }
+
+/* Buttons */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 12px 22px;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 1rem;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  text-decoration: none;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: transform .18s var(--ease-out), background-color .2s ease, border-color .2s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+.btn:active { transform: scale(.98); }
+.btn:focus-visible { border-radius: 999px; }
+
+.btn-primary { background: var(--fg); color: var(--bg); }
+.btn-primary:hover { background: var(--btn-hover); }
+
+.btn-secondary { background: transparent; color: var(--fg); border-color: var(--line-strong); }
+.btn-secondary:hover { background: var(--surface); border-color: var(--muted); }
+
+.btn-small { min-height: 40px; padding: 8px 16px; font-size: .875rem; }
+
+.btn-icon { width: 20px; height: 20px; flex: none; }
+
+.text-link {
+  color: var(--fg);
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 5px;
+  text-decoration-color: var(--line-strong);
+  transition: text-decoration-color .2s ease;
+}
+.text-link:hover { text-decoration-color: currentColor; }
+
+/* Shared type */
+
+h2 {
+  font-size: clamp(1.875rem, 1.6vw + 1.3rem, 2.75rem);
+  line-height: 1.1;
+  letter-spacing: -.028em;
+}
+h3 {
+  font-size: 1.125rem;
+  line-height: 1.35;
+  letter-spacing: -.01em;
+}
+.section-lede {
+  margin-top: 20px;
+  max-width: 34rem;
+  font-size: 1.125rem;
+  color: var(--fg-2);
+}
+
+.band { padding-block: 80px; border-top: 1px solid var(--line); }
+@media (min-width: 1024px) { .band { padding-block: 120px; } }
+
+/* Hero: left-aligned copy, the animated mark on the right */
+
+.hero { padding-block: 48px 72px; }
+.hero-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 48px;
+}
+.hero h1 {
+  font-size: clamp(2.5rem, 3.6vw + 1.2rem, 4.5rem);
+  line-height: 1.03;
+  letter-spacing: -.04em;
+  max-width: 15ch;
+}
+.lede {
+  margin-top: 24px;
+  max-width: 33rem;
+  font-size: clamp(1.125rem, .4vw + 1rem, 1.3125rem);
+  line-height: 1.5;
+  color: var(--fg-2);
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 36px;
+}
+
+.hero-mark {
+  display: grid;
+  justify-items: start;
+  gap: 32px;
+}
+.mark {
+  width: 112px;
+  height: auto;
+  color: var(--fg);
+  overflow: visible;
+}
+.mark-labels {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  justify-content: start;
+  gap: 24px;
+  font-size: .8125rem;
+  line-height: 1.35;
+  color: var(--muted);
+}
+.mark-labels span:nth-child(2) { color: var(--fg); font-weight: 600; }
+
+@media (min-width: 1024px) {
+  .hero { padding-block: 88px 120px; }
+  .hero-grid { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); align-items: center; gap: 64px; }
+  .hero-mark { justify-items: center; gap: 44px; }
+  .mark { width: clamp(200px, 20vw, 280px); }
+  .mark-labels {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    width: 100%;
+    max-width: 440px;
+    gap: 12px;
+    white-space: nowrap;
+    padding-top: 16px;
+    border-top: 1px solid var(--line);
+  }
+  /* every label centred in an equal column, so the three centres are evenly spaced and the middle one sits under the dot */
+  .mark-labels span { text-align: center; }
+}
+
+/* Problem: one large statement, pushed right for asymmetric white space */
+
+.statement {
+  margin-top: 28px;
+  max-width: 40rem;
+  font-size: clamp(1.375rem, 1.3vw + 1rem, 2rem);
+  line-height: 1.38;
+  letter-spacing: -.015em;
+  color: var(--fg-2);
+}
+@media (min-width: 1024px) {
+  .problem .wrap { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); gap: 64px; }
+  .statement { margin-top: 0; }
+}
+
+/* Demo: stacked heading, then the literal commands */
+
+.demo-head p { margin-top: 20px; max-width: 34rem; font-size: 1.125rem; color: var(--fg-2); }
+.code {
+  margin: 0;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: clamp(.875rem, .3vw + .8rem, 1.0625rem);
+  line-height: 1.9;
+  overflow-x: auto;
+  white-space: pre;
+  tab-size: 2;
+}
+.c-prompt, .c-note { color: var(--muted); }
+.demo-code { margin-top: 40px; }
+@media (min-width: 1024px) {
+  .demo-code { margin-left: 33.333%; padding: 32px 40px; }
+}
+
+/* How it works: a word per step, then what happens */
+
+.steps { margin-top: 48px; }
+.steps > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  padding-block: 28px;
+  border-top: 1px solid var(--line);
+}
+.steps dt {
+  font-size: clamp(1.5rem, 1.2vw + 1.1rem, 2.125rem);
+  font-weight: 600;
+  letter-spacing: -.03em;
+  line-height: 1.1;
+}
+.steps dd { color: var(--fg-2); max-width: 38rem; }
+@media (min-width: 768px) {
+  .steps > div { grid-template-columns: minmax(0, 4fr) minmax(0, 8fr); gap: 40px; align-items: baseline; }
+  .steps dd { font-size: 1.125rem; }
+}
+
+/* For people: copy on the left, four facts in an offset two-by-two on the right */
+
+.people-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 48px;
+}
+.people-copy .btn { margin-top: 32px; }
+.facts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0 40px;
+}
+.facts li { padding-block: 22px; border-top: 1px solid var(--line-strong); }
+.facts p { margin-top: 6px; color: var(--fg-2); font-size: 1rem; }
+@media (min-width: 640px) {
+  .facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .facts li:nth-child(even) { transform: translateY(32px); }
+}
+@media (min-width: 1024px) {
+  .people-grid { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 80px; align-items: start; }
+}
+
+/* For teams: stacked heading, then a 2fr / 1fr / 1fr grid led by the ownership point */
+
+.teams-head .section-lede { max-width: 42rem; }
+.teams-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  margin-top: 48px;
+}
+.teams-grid li { padding: 24px 0 0; border-top: 1px solid var(--line-strong); }
+.teams-grid p { margin-top: 8px; color: var(--fg-2); }
+.teams-grid .teams-lead {
+  padding: 28px;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--fg);
+  color: var(--bg);
+}
+.teams-lead h3 { color: var(--bg); font-size: clamp(1.375rem, 1vw + 1rem, 1.75rem); letter-spacing: -.02em; }
+.teams-grid .teams-lead p { color: var(--bg); opacity: .82; font-size: 1.0625rem; max-width: 28rem; }
+.teams-cta { margin-top: 40px; }
+@media (prefers-color-scheme: dark) {
+  /* In dark mode a full ivory block glares; keep the emphasis with a raised surface instead. */
+  .teams-grid .teams-lead { background: var(--surface); color: var(--fg); border: 1px solid var(--line-strong); }
+  .teams-lead h3 { color: var(--fg); }
+  .teams-grid .teams-lead p { color: var(--fg-2); opacity: 1; }
+}
+@media (min-width: 768px) {
+  .teams-grid { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr); gap: 32px; align-items: start; }
+  .teams-grid .teams-lead { padding: 36px; min-height: 240px; display: flex; flex-direction: column; justify-content: flex-end; }
+}
+
+/* Install: a tinted band in the same theme, commands on the right */
+
+.install { background: var(--surface); }
+.install .code { background: var(--bg); }
+.install .text-link { display: inline-block; margin-top: 24px; }
+.install-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 40px;
+}
+@media (min-width: 1024px) {
+  .install-grid { grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 80px; align-items: center; }
+  .install-code { padding: 32px 40px; font-size: 1.125rem; }
+}
+
+/* Closing */
+
+.closing-row { display: grid; gap: 32px; justify-items: start; }
+.closing h2 { max-width: 18ch; font-size: clamp(2rem, 2.8vw + 1rem, 3.5rem); letter-spacing: -.035em; }
+@media (min-width: 1024px) {
+  .closing-row { grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
+}
+
+/* Footer */
+
+.site-footer { border-top: 1px solid var(--line); padding-block: 32px 40px; }
+.footer-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px 32px;
+  font-size: .875rem;
+  color: var(--muted);
+}
+.footer-brand { display: inline-flex; align-items: center; gap: 12px; }
+.footer-mark { width: 20px; height: auto; color: var(--fg); }
+.footer-links { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+.footer-links a { color: var(--muted); text-decoration: none; }
+.footer-links a:hover { color: var(--fg); text-decoration: underline; text-underline-offset: 4px; }
+
+/* Motion. Only the hero moves on load: copy rises in sequence, the arcs draw in, the dot settles,
+   then breathes slowly. It says "you, then every AI, held around your context". Everything stops
+   under prefers-reduced-motion. */
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes draw {
+  from { stroke-dashoffset: 101; }
+  to { stroke-dashoffset: 0; }
+}
+@keyframes settle {
+  0% { opacity: 0; transform: scale(.4); }
+  70% { opacity: 1; transform: scale(1.04); }
+  100% { opacity: 1; transform: scale(1); }
+}
+@keyframes breathe {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(.9); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .reveal { animation: rise .9s var(--ease-out) both; }
+  .r1 { animation-delay: .05s; }
+  .r2 { animation-delay: .16s; }
+  .r3 { animation-delay: .27s; }
+
+  .mark .arc {
+    stroke-dasharray: 100 120;
+    animation: draw 1.2s cubic-bezier(.65, 0, .35, 1) .4s both;
+  }
+  .mark .dot {
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: settle .8s var(--ease-out) 1.2s both, breathe 7s ease-in-out 2.4s infinite;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+  .btn:active { transform: none; }
+}

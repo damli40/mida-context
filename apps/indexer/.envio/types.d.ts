@@ -653,6 +653,18 @@ type Entities = {
     readonly "anchoredSaves": number;
     readonly "rejectedSaves": number;
   };
+  "BatchedSave": {
+    readonly "id": string;
+    readonly "owner": string;
+    readonly "namespaceId": string;
+    readonly "batchId": string;
+    readonly "position": number;
+    readonly "lineageId": string;
+    readonly "version": number;
+    readonly "agentId": string;
+    readonly "block": number;
+    readonly "txHash": string;
+  };
   "ContextRecord": {
     readonly "id": string;
     readonly "owner": string;
@@ -666,6 +678,7 @@ type Entities = {
     readonly "readEpoch": bigint;
     readonly "createdAt": bigint;
     readonly "expiresAt": bigint;
+    readonly "provenanceSource": number;
     readonly "supersededBy": string | undefined;
     readonly "supersededBlock": number | undefined;
     readonly "registeredBlock": number;
@@ -756,6 +769,118 @@ declare module "envio" {
       evm: { chains: {
   "monadTestnet": { id: 10143 };
       }; contracts: {
+  "BatchAnchor": {
+    "SaveAnchored": {
+      /** The name of the event. */
+      readonly eventName: "SaveAnchored";
+      /** The name of the contract that emitted this event. */
+      readonly contractName: "BatchAnchor";
+      /** The unique identifier of the blockchain network where this event occurred. */
+      readonly chainId: 10143;
+      /** The parameters or arguments associated with this event. */
+      readonly params: { readonly owner: Address; readonly contextId: string; readonly batchId: string; readonly namespaceId: string; readonly lineageId: string; readonly version: bigint; readonly author: string; readonly position: bigint; readonly leafHash: string };
+      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
+      readonly block: EvmBlock;
+      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
+      readonly transaction: EvmTransaction;
+      /** The index of this event's log within the block. */
+      readonly logIndex: number;
+      /** The address of the contract that emitted this event. */
+      readonly srcAddress: Address;
+    };
+    "SaveRejected": {
+      /** The name of the event. */
+      readonly eventName: "SaveRejected";
+      /** The name of the contract that emitted this event. */
+      readonly contractName: "BatchAnchor";
+      /** The unique identifier of the blockchain network where this event occurred. */
+      readonly chainId: 10143;
+      /** The parameters or arguments associated with this event. */
+      readonly params: { readonly batchId: string; readonly index: bigint; readonly reason: bigint };
+      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
+      readonly block: EvmBlock;
+      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
+      readonly transaction: EvmTransaction;
+      /** The index of this event's log within the block. */
+      readonly logIndex: number;
+      /** The address of the contract that emitted this event. */
+      readonly srcAddress: Address;
+    };
+    "BatchAnchored": {
+      /** The name of the event. */
+      readonly eventName: "BatchAnchored";
+      /** The name of the contract that emitted this event. */
+      readonly contractName: "BatchAnchor";
+      /** The unique identifier of the blockchain network where this event occurred. */
+      readonly chainId: 10143;
+      /** The parameters or arguments associated with this event. */
+      readonly params: { readonly batchId: string; readonly root: string; readonly acceptedCount: bigint; readonly rejectedCount: bigint; readonly submitter: Address };
+      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
+      readonly block: EvmBlock;
+      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
+      readonly transaction: EvmTransaction;
+      /** The index of this event's log within the block. */
+      readonly logIndex: number;
+      /** The address of the contract that emitted this event. */
+      readonly srcAddress: Address;
+    };
+  };
+  "ContextRegistry": {
+    "ContextRegistered": {
+      /** The name of the event. */
+      readonly eventName: "ContextRegistered";
+      /** The name of the contract that emitted this event. */
+      readonly contractName: "ContextRegistry";
+      /** The unique identifier of the blockchain network where this event occurred. */
+      readonly chainId: 10143;
+      /** The parameters or arguments associated with this event. */
+      readonly params: { readonly owner: Address; readonly namespaceId: string; readonly contextId: string; readonly record: { readonly contextId: string; readonly owner: Address; readonly author: string; readonly namespaceId: string; readonly lineageId: string; readonly parentId: string; readonly manifestHash: string; readonly ciphertextCommitment: string; readonly evidenceCommitment: string; readonly readEpoch: bigint; readonly createdAt: bigint; readonly expiresAt: bigint; readonly version: bigint; readonly recordType: bigint; readonly lineagePolicy: bigint; readonly kind: bigint; readonly provenanceSource: bigint } };
+      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
+      readonly block: EvmBlock;
+      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
+      readonly transaction: EvmTransaction;
+      /** The index of this event's log within the block. */
+      readonly logIndex: number;
+      /** The address of the contract that emitted this event. */
+      readonly srcAddress: Address;
+    };
+    "ContextSuperseded": {
+      /** The name of the event. */
+      readonly eventName: "ContextSuperseded";
+      /** The name of the contract that emitted this event. */
+      readonly contractName: "ContextRegistry";
+      /** The unique identifier of the blockchain network where this event occurred. */
+      readonly chainId: 10143;
+      /** The parameters or arguments associated with this event. */
+      readonly params: { readonly owner: Address; readonly lineageId: string; readonly contextId: string; readonly parentId: string; readonly version: bigint };
+      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
+      readonly block: EvmBlock;
+      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
+      readonly transaction: EvmTransaction;
+      /** The index of this event's log within the block. */
+      readonly logIndex: number;
+      /** The address of the contract that emitted this event. */
+      readonly srcAddress: Address;
+    };
+    "EvidenceRegistered": {
+      /** The name of the event. */
+      readonly eventName: "EvidenceRegistered";
+      /** The name of the contract that emitted this event. */
+      readonly contractName: "ContextRegistry";
+      /** The unique identifier of the blockchain network where this event occurred. */
+      readonly chainId: 10143;
+      /** The parameters or arguments associated with this event. */
+      readonly params: { readonly owner: Address; readonly namespaceId: string; readonly contextId: string; readonly author: string; readonly manifestHash: string };
+      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
+      readonly block: EvmBlock;
+      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
+      readonly transaction: EvmTransaction;
+      /** The index of this event's log within the block. */
+      readonly logIndex: number;
+      /** The address of the contract that emitted this event. */
+      readonly srcAddress: Address;
+    };
+  };
   "CapabilityRegistry": {
     "AgentRegistered": {
       /** The name of the event. */
@@ -974,119 +1099,17 @@ declare module "envio" {
       readonly srcAddress: Address;
     };
   };
-  "ContextRegistry": {
-    "ContextRegistered": {
-      /** The name of the event. */
-      readonly eventName: "ContextRegistered";
-      /** The name of the contract that emitted this event. */
-      readonly contractName: "ContextRegistry";
-      /** The unique identifier of the blockchain network where this event occurred. */
-      readonly chainId: 10143;
-      /** The parameters or arguments associated with this event. */
-      readonly params: { readonly owner: Address; readonly namespaceId: string; readonly contextId: string; readonly record: { readonly contextId: string; readonly owner: Address; readonly author: string; readonly namespaceId: string; readonly lineageId: string; readonly parentId: string; readonly manifestHash: string; readonly ciphertextCommitment: string; readonly evidenceCommitment: string; readonly readEpoch: bigint; readonly createdAt: bigint; readonly expiresAt: bigint; readonly version: bigint; readonly recordType: bigint; readonly lineagePolicy: bigint; readonly kind: bigint; readonly provenanceSource: bigint } };
-      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
-      readonly block: EvmBlock;
-      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
-      readonly transaction: EvmTransaction;
-      /** The index of this event's log within the block. */
-      readonly logIndex: number;
-      /** The address of the contract that emitted this event. */
-      readonly srcAddress: Address;
-    };
-    "ContextSuperseded": {
-      /** The name of the event. */
-      readonly eventName: "ContextSuperseded";
-      /** The name of the contract that emitted this event. */
-      readonly contractName: "ContextRegistry";
-      /** The unique identifier of the blockchain network where this event occurred. */
-      readonly chainId: 10143;
-      /** The parameters or arguments associated with this event. */
-      readonly params: { readonly owner: Address; readonly lineageId: string; readonly contextId: string; readonly parentId: string; readonly version: bigint };
-      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
-      readonly block: EvmBlock;
-      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
-      readonly transaction: EvmTransaction;
-      /** The index of this event's log within the block. */
-      readonly logIndex: number;
-      /** The address of the contract that emitted this event. */
-      readonly srcAddress: Address;
-    };
-    "EvidenceRegistered": {
-      /** The name of the event. */
-      readonly eventName: "EvidenceRegistered";
-      /** The name of the contract that emitted this event. */
-      readonly contractName: "ContextRegistry";
-      /** The unique identifier of the blockchain network where this event occurred. */
-      readonly chainId: 10143;
-      /** The parameters or arguments associated with this event. */
-      readonly params: { readonly owner: Address; readonly namespaceId: string; readonly contextId: string; readonly author: string; readonly manifestHash: string };
-      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
-      readonly block: EvmBlock;
-      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
-      readonly transaction: EvmTransaction;
-      /** The index of this event's log within the block. */
-      readonly logIndex: number;
-      /** The address of the contract that emitted this event. */
-      readonly srcAddress: Address;
-    };
-  };
-  "BatchAnchor": {
-    "SaveAnchored": {
-      /** The name of the event. */
-      readonly eventName: "SaveAnchored";
-      /** The name of the contract that emitted this event. */
-      readonly contractName: "BatchAnchor";
-      /** The unique identifier of the blockchain network where this event occurred. */
-      readonly chainId: 10143;
-      /** The parameters or arguments associated with this event. */
-      readonly params: { readonly owner: Address; readonly contextId: string; readonly batchId: string; readonly namespaceId: string; readonly lineageId: string; readonly version: bigint; readonly author: string; readonly position: bigint; readonly leafHash: string };
-      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
-      readonly block: EvmBlock;
-      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
-      readonly transaction: EvmTransaction;
-      /** The index of this event's log within the block. */
-      readonly logIndex: number;
-      /** The address of the contract that emitted this event. */
-      readonly srcAddress: Address;
-    };
-    "SaveRejected": {
-      /** The name of the event. */
-      readonly eventName: "SaveRejected";
-      /** The name of the contract that emitted this event. */
-      readonly contractName: "BatchAnchor";
-      /** The unique identifier of the blockchain network where this event occurred. */
-      readonly chainId: 10143;
-      /** The parameters or arguments associated with this event. */
-      readonly params: { readonly batchId: string; readonly index: bigint; readonly reason: bigint };
-      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
-      readonly block: EvmBlock;
-      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
-      readonly transaction: EvmTransaction;
-      /** The index of this event's log within the block. */
-      readonly logIndex: number;
-      /** The address of the contract that emitted this event. */
-      readonly srcAddress: Address;
-    };
-    "BatchAnchored": {
-      /** The name of the event. */
-      readonly eventName: "BatchAnchored";
-      /** The name of the contract that emitted this event. */
-      readonly contractName: "BatchAnchor";
-      /** The unique identifier of the blockchain network where this event occurred. */
-      readonly chainId: 10143;
-      /** The parameters or arguments associated with this event. */
-      readonly params: { readonly batchId: string; readonly root: string; readonly acceptedCount: bigint; readonly rejectedCount: bigint; readonly submitter: Address };
-      /** The block in which this event was recorded. Configurable via `field_selection` in config.yaml. */
-      readonly block: EvmBlock;
-      /** The transaction that triggered this event. Configurable via `field_selection` in config.yaml. */
-      readonly transaction: EvmTransaction;
-      /** The index of this event's log within the block. */
-      readonly logIndex: number;
-      /** The address of the contract that emitted this event. */
-      readonly srcAddress: Address;
-    };
-  };
       }; eventFilters: {
+  "BatchAnchor": {
+    "SaveAnchored": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly contextId?: SingleOrMultiple<string>; readonly batchId?: SingleOrMultiple<string> } };
+    "SaveRejected": { readonly params: { readonly batchId?: SingleOrMultiple<string> } };
+    "BatchAnchored": { readonly params: { readonly batchId?: SingleOrMultiple<string> } };
+  };
+  "ContextRegistry": {
+    "ContextRegistered": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly namespaceId?: SingleOrMultiple<string>; readonly contextId?: SingleOrMultiple<string> } };
+    "ContextSuperseded": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly lineageId?: SingleOrMultiple<string>; readonly contextId?: SingleOrMultiple<string> } };
+    "EvidenceRegistered": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly namespaceId?: SingleOrMultiple<string>; readonly contextId?: SingleOrMultiple<string> } };
+  };
   "CapabilityRegistry": {
     "AgentRegistered": { readonly params: { readonly agentId?: SingleOrMultiple<string>; readonly operator?: SingleOrMultiple<Address>; readonly signer?: SingleOrMultiple<Address> } };
     "AgentRevoked": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly agentId?: SingleOrMultiple<string> } };
@@ -1101,16 +1124,6 @@ declare module "envio" {
     "P256KeyRegistered": { readonly params: { readonly owner?: SingleOrMultiple<Address> } };
     "ReadEpochRequired": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly namespaceId?: SingleOrMultiple<string> } };
   };
-  "ContextRegistry": {
-    "ContextRegistered": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly namespaceId?: SingleOrMultiple<string>; readonly contextId?: SingleOrMultiple<string> } };
-    "ContextSuperseded": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly lineageId?: SingleOrMultiple<string>; readonly contextId?: SingleOrMultiple<string> } };
-    "EvidenceRegistered": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly namespaceId?: SingleOrMultiple<string>; readonly contextId?: SingleOrMultiple<string> } };
-  };
-  "BatchAnchor": {
-    "SaveAnchored": { readonly params: { readonly owner?: SingleOrMultiple<Address>; readonly contextId?: SingleOrMultiple<string>; readonly batchId?: SingleOrMultiple<string> } };
-    "SaveRejected": { readonly params: { readonly batchId?: SingleOrMultiple<string> } };
-    "BatchAnchored": { readonly params: { readonly batchId?: SingleOrMultiple<string> } };
-  };
       } };
       entities: Entities;
       perChainEntities: never;
@@ -1121,6 +1134,7 @@ declare module "envio" {
   export type Agent = Entities["Agent"];
   export type AgentGrantBook = Entities["AgentGrantBook"];
   export type BatchStats = Entities["BatchStats"];
+  export type BatchedSave = Entities["BatchedSave"];
   export type ContextRecord = Entities["ContextRecord"];
   export type GlobalStats = Entities["GlobalStats"];
   export type Grant = Entities["Grant"];

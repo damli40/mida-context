@@ -20,3 +20,9 @@ html_handling = "none"
 # routes = [
 #   { pattern = "midacontext.xyz/check*", zone_name = "midacontext.xyz" }
 # ]
+
+# Envio Cloud's free plan deletes a dev deployment after 7 days with no queries — one tiny GraphQL
+# POST a day keeps the /me index alive through judging. The handler is `scheduled()` in
+# src/worker.ts; it does nothing unless INDEX_GRAPHQL_URL is set.
+[triggers]
+crons = ["17 6 * * *"]

@@ -65,5 +65,7 @@ chains:
       - name: ContextRegistry
         address: "0x75fb6db9af93a8d823e51c488caa913ca711fb78"
       - name: BatchAnchor
-        # set on merge from contracts/deployments/10143.json batchAnchor
-        address: "0x0000000000000000000000000000000000000000"
+        # contracts/deployments/10143.json batchAnchor. Deployed later than the
+        # other two contracts, so it scans from its own start_block (batchAnchorBlock).
+        address: "0xe5dcf76b1109906a16587cd2fe02c1e6f4a7a9e1"
+        start_block: 65373247
