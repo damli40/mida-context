@@ -78,5 +78,9 @@ await copyFile(join(appRoot, "public/owner.css"), join(dist, "owner.css"))
 for (const flow of ["signup", "approve", "revoke"]) {
   await copyFile(join(appRoot, `public/${flow}.html`), join(dist, `${flow}.html`))
 }
+// The public home page at `/`: static HTML and CSS, no script, plus the brand favicons.
+for (const file of ["index.html", "home.css", "favicon.svg", "favicon.ico", "apple-touch-icon.png"]) {
+  await copyFile(join(appRoot, `public/${file}`), join(dist, file))
+}
 
-console.log("dist/: check.js, owner-core.js, signup.js, approve.js, revoke.js, check.css, owner.css, check.html, signup.html, approve.html, revoke.html")
+console.log("dist/: index.html, home.css, favicons, check.js, owner-core.js, signup.js, approve.js, revoke.js, check.css, owner.css, check.html, signup.html, approve.html, revoke.html")
