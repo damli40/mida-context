@@ -298,7 +298,8 @@ describe("the crude mida command", () => {
       runCli(argv, { home, network, cwd: projectDir, print: (line) => lines.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
     // a fact from the remember test above, labelled with its area
     expect(await run2("read", "--as", "claude-code")).toBe(0)
-    expect(lines).toContain("  preferences.communication: prefers short answers")
+    // every fact line names itself since in-4 I8: its short id and the chain's stamp follow the text
+    expect(lines.some((line) => /^  preferences\.communication: prefers short answers \(id [0-9a-f]{8}, \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\)$/.test(line))).toBe(true)
     // checkpoints carry their area too — resolved from the record's namespace id.
     // The project id read must be THIS folder's marker id (L1) — anything else mismatches.
     const projectId = (JSON.parse(readFileSync(join(projectDir, ".mida", "project.json"), "utf8")) as { projectId: string }).projectId

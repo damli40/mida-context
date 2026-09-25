@@ -39,7 +39,7 @@ mida --help
 Expected output:
 
 ```
-usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]   (tool = claude-code | codex | claude-desktop | cursor; agent = claude-code | codex | assistant — or the identity a client installs)
+usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]   (tool = claude-code | codex | claude-desktop | cursor; agent = claude-code | codex | assistant — or the identity a client installs)
 ```
 
 *Status: RUN — `pnpm check:publish` installs the packed tarball into a fresh folder outside the repo and runs `npx mida --help` to exit 0 with this text. The `-g` global-install variant links the same bins through npm's standard path.*
@@ -227,7 +227,38 @@ In passkey mode the same commands exist, but the passkey still signs once **per 
 
 Mida keeps your context encrypted until an approved agent asks for it. When it does, Mida decrypts what that agent may read and hands it to the model as plain text. Revoking stops every future read through Mida. It cannot make a model forget what it was already shown.
 
-## 11. The SDK path — RUN on local Anvil
+## 11. Remember a fact — and replace one — RUN on local Anvil
+
+`mida remember` writes an owner-signed fact — the chain records you, not any agent, as its author — into a context area every approved agent may read. In your own terminal (it is an owner command, like `approve` — it never runs through the daemon):
+
+```bash
+mida remember "I prefer Python"
+```
+
+```
+area: preferences.communication (agents with READ on this area will see it)
+Type yes to remember:
+remembered 0x<64 hex> in preferences.communication
+```
+
+Type `yes` at the ask. Facts live in `preferences.communication` (the default shown above) or `profile.skills`. Every fact `mida read --as <agent>` prints carries the date the chain stamped on its record and a short id — the first 8 hex characters of the record's id:
+
+```
+What you have told Mida about yourself
+  preferences.communication: I prefer Python (id a1b2c3d4, 2026-09-27 14:03 UTC)
+```
+
+When a fact changes, replace it instead of stacking a second opinion. `--replaces` names the old fact by its short id; the new fact is written through the registry's supersede path, so the chain itself records new-replaces-old and the old record stays anchored as history:
+
+```bash
+mida remember --replaces a1b2c3d4 "I prefer TypeScript now"
+```
+
+The same preview and typed-`yes` ask apply. Afterwards the handoff an agent receives lists only the current fact — `I prefer TypeScript now` with its own date — while `mida read --as <agent>` keeps both lines, marking the old one `(replaced by e5f6a7b8 on 2026-09-27 14:12 UTC)`. An id that names no fact, or more than one, refuses before the ask; so does an id that names a fact already replaced.
+
+*Status: RUN on local Anvil — `apps/midad/test/fact-replace.e2e.test.ts` writes Python, replaces it with TypeScript through the real `runCli` path, then checks the chain's parent/lineage record, the handoff's single-fact output and the `read --as` history marker.*
+
+## 12. The SDK path — RUN on local Anvil
 
 Everything above is driven by the CLI. The same lifecycle — request, approve, write, read, revoke — is reachable from your own process through `mida-context-sdk`. Install it next to the CLI (`npm i mida-context-sdk`, or the packed tarball), then:
 
@@ -270,7 +301,7 @@ node agent.mjs
 
 *Status: RUN on local Anvil — `apps/midad/test/connect.e2e.test.ts` executes this exact sequence (connect → request → `mida approve` → create → read → `mida revoke` → refused) against a fresh chain, and `pnpm check:publish` runs and type-checks an SDK consumer installed from the packed tarball. NOT RUN on the live testnet.*
 
-## 12. Use Mida from an MCP client — NOT RUN against any real client
+## 13. Use Mida from an MCP client — NOT RUN against any real client
 
 Agents that speak MCP instead of hooks — Claude Desktop and Cursor — reach the same daemon through `mida-mcp`: a local MCP server that is a client of the midad socket, exactly like the hooks. It holds no keys and signs nothing.
 

@@ -1,4 +1,5 @@
 import { privateKeyToAccount } from "viem/accounts"
+import { zeroHash } from "viem"
 import { ContextApiClient } from "@mida/api"
 import { MidaError, OWNER_AUTHOR_ID, PERMISSION, PROVENANCE_SOURCE, isMidaError, namespaceId } from "@mida/protocol"
 import type { ContextKind, Hex } from "@mida/protocol"
@@ -34,6 +35,12 @@ export interface OwnerFact {
   contextId: Hex
   namespace: string
   assertedAt: string
+  /**
+   * Set when a newer fact superseded this record on chain — the child's context id and its chain
+   * stamp, what `mida read --as` prints as "(replaced by <short-id> on <date>)". The record is
+   * never removed: a superseded fact stays anchored as history.
+   */
+  replacedBy?: { contextId: Hex; assertedAt: string }
 }
 
 export type RememberResult =
@@ -54,9 +61,11 @@ const oneLine = (text: string): string => text.replace(/\s+/g, " ")
 export async function remember(
   runtime: Runtime,
   fact: string,
-  options: { namespace?: string } = {},
+  options: { namespace?: string; replaces?: { contextId: Hex; namespace: FactNamespace } } = {},
 ): Promise<RememberResult> {
-  const namespace = options.namespace ?? DEFAULT_FACT_NAMESPACE
+  // A replacement writes into the fact it supersedes — the parent's namespace, never the default:
+  // the registry's _supersede reverts on a namespace mismatch, so the parent decides.
+  const namespace = options.replaces?.namespace ?? options.namespace ?? DEFAULT_FACT_NAMESPACE
   if (!(FACT_NAMESPACES as readonly string[]).includes(namespace)) {
     return refuse("namespace-not-enabled", `facts live in ${FACT_NAMESPACES.join(" and ")} only`)
   }
@@ -82,6 +91,9 @@ export async function remember(
   runtime.sendProgress("writing your fact")
   const written = await vault.createOwnerContext({
     namespace,
+    // The registry's supersede path: the new fact names the old record as its expected parent,
+    // so the chain itself records new-replaces-old and the old record stays anchored as history.
+    ...(options.replaces === undefined ? {} : { expectedParentId: options.replaces.contextId }),
     payload: {
       v: 1,
       value: { text, assertedAt: new Date().toISOString() },
@@ -149,11 +161,20 @@ function factText(value: unknown): string | null {
  * moved carries its source time in the envelope (`originalCreatedAt`), and the chain's own
  * `createdAt` stamps at replay, several records to a whole second, so it cannot order moved
  * records at all. It remains the time for facts that never moved. At most MAX_FACTS.
+ *
+ * A record `mida remember --replaces` superseded is still anchored — the registry keeps it as
+ * history. `history: true` returns every fact with `replacedBy` annotated on superseded ones
+ * (what `mida read --as` prints); the default returns only lineage heads, which is what the
+ * handoff's current-facts list must be.
  */
-export async function readOwnerFacts(runtime: ServiceRuntime, name: string): Promise<OwnerFact[]> {
+export async function readOwnerFacts(runtime: ServiceRuntime, name: string, options: { history?: boolean } = {}): Promise<OwnerFact[]> {
   const agent = runtime.agent(name)
   const { reader, owner } = runtime
   const facts: { fact: OwnerFact; statedAt: number; chain?: ContextObject["chain"] }[] = []
+  // parentId → the record that superseded it, over every object the read returned — the chain's
+  // own supersession link, so a replaced fact is marked by what Monad recorded, never by a
+  // payload claim.
+  const supersededBy = new Map<string, { contextId: Hex; createdAt: bigint }>()
   for (const namespace of FACT_NAMESPACES) {
     let objects
     try {
@@ -167,6 +188,7 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string): Pro
       // The chain's record decides who said this — never a field inside the encrypted payload.
       const record = await reader.getRecord(object.contextId)
       if (record === null) continue
+      if (record.parentId !== zeroHash) supersededBy.set(record.parentId.toLowerCase(), { contextId: record.contextId, createdAt: record.createdAt })
       if (record.author !== OWNER_AUTHOR_ID) continue
       if (record.provenanceSource !== PROVENANCE_SOURCE.USER_ASSERTED) continue
       const text = factText(object.payload.value)
@@ -193,11 +215,18 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string): Pro
       })
     }
   }
+  // Mark every fact the chain shows as superseded — the marker is the child's id and its own
+  // chain stamp. The default view then keeps only lineage heads; the history view keeps them all.
+  for (const { fact } of facts) {
+    const child = supersededBy.get(fact.contextId.toLowerCase())
+    if (child !== undefined) fact.replacedBy = { contextId: child.contextId, assertedAt: new Date(Number(child.createdAt) * 1000).toISOString() }
+  }
+  const shown = options.history === true ? facts : facts.filter(({ fact }) => fact.replacedBy === undefined)
   // Newest first by the original stating time; a same-second tie breaks by the order Monad
   // actually wrote the records in — block, then log index — so a slow or lying clock can never
   // reorder what the chain already fixed. contextId is the last resort only, for records that
   // carry no placement at all.
-  facts.sort((a, b) => {
+  shown.sort((a, b) => {
     const time = b.statedAt - a.statedAt
     if (time !== 0) return time
     const aBlock = a.chain?.block
@@ -216,7 +245,57 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string): Pro
     }
     return b.fact.contextId.localeCompare(a.fact.contextId)
   })
-  return facts.slice(0, MAX_FACTS).map(({ fact }) => fact)
+  return shown.slice(0, MAX_FACTS).map(({ fact }) => fact)
+}
+
+/** What `--replaces <short-id>` resolves to — the fact it will write against, or why it refuses. */
+export type FactIdResolution =
+  | { kind: "ok"; contextId: Hex; namespace: FactNamespace }
+  | { kind: "refused"; code: string; message: string }
+
+/**
+ * What `mida remember --replaces <short-id>` writes against, answered before the owner is asked
+ * "Type yes". The candidate set is the same chain-side rule `readOwnerFacts` prints:
+ * owner-authored (author id zero) USER_ASSERTED records in the two fact namespaces, read off
+ * Monad's records, never payload claims. A prefix matches against every candidate's context id —
+ * zero matches and more than one are different refusals — and a fact the chain already shows a
+ * child for is refused rather than re-superseded: it is history, and the chain's own answer
+ * (StaleParent) would name nothing the owner can act on. A listing the store marks incomplete
+ * refuses outright rather than resolving half the set.
+ */
+export async function resolveFactId(runtime: Runtime, shortId: string): Promise<FactIdResolution> {
+  const prefix = shortId.trim().toLowerCase().replace(/^0x/, "")
+  if (!/^[0-9a-f]{1,64}$/.test(prefix)) {
+    return { kind: "refused", code: "bad-fact-id", message: `a fact id is hexadecimal — the "id" part printed on a \`mida read --as\` line` }
+  }
+  const candidates: { contextId: Hex; namespace: FactNamespace }[] = []
+  const superseded = new Set<string>()
+  let partial = false
+  for (const namespace of FACT_NAMESPACES) {
+    const listed = await runtime.ownerApi.listObjects({ owner: runtime.owner, namespaceId: namespaceId(namespace) })
+    partial = partial || listed.partial
+    const records = await runtime.reader.getRecords(listed.objects.map((object) => object.contextId))
+    for (const [index, record] of records.entries()) {
+      if (record === null) continue
+      if (record.parentId !== zeroHash) superseded.add(record.parentId.toLowerCase())
+      if (record.author !== OWNER_AUTHOR_ID) continue
+      if (record.provenanceSource !== PROVENANCE_SOURCE.USER_ASSERTED) continue
+      candidates.push({ contextId: listed.objects[index]!.contextId, namespace })
+    }
+  }
+  if (partial) return { kind: "refused", code: "list-incomplete", message: "the store could not verify the whole fact list — run the command again" }
+  const matches = candidates.filter((candidate) => candidate.contextId.slice(2).toLowerCase().startsWith(prefix))
+  if (matches.length === 0) {
+    return { kind: "refused", code: "unknown-fact-id", message: `no remembered fact has an id starting with "${prefix}" — \`mida read --as <agent>\` lists them` }
+  }
+  if (matches.length > 1) {
+    return { kind: "refused", code: "ambiguous-fact-id", message: `"${prefix}" names ${matches.length} facts — use more characters` }
+  }
+  const match = matches[0]!
+  if (superseded.has(match.contextId.toLowerCase())) {
+    return { kind: "refused", code: "fact-already-replaced", message: "that fact was already replaced — it stays as history" }
+  }
+  return { kind: "ok", contextId: match.contextId, namespace: match.namespace }
 }
 
 /**

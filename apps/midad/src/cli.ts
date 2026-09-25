@@ -22,7 +22,8 @@ import type { InstallTool, McpClientTool } from "./install.js"
 import { checkProject, ensureProjectMarker } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { projectIdFor } from "./queue.js"
-import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, factShortId, factStamp, readOwnerFacts, remember } from "./remember.js"
+import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, factShortId, factStamp, readOwnerFacts, remember, resolveFactId } from "./remember.js"
+import type { FactNamespace } from "./remember.js"
 import { Runtime, NAMESPACE, ServiceRuntime } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag } from "./network.js"
@@ -52,7 +53,7 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
  */
 const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]" +
+  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]" +
   "   (tool = claude-code | codex | claude-desktop | cursor; agent = claude-code | codex | assistant — or the identity a client installs)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
 export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", ...WITH_AGENT]
@@ -286,7 +287,8 @@ export async function runCliWithRuntime(
         } else {
           let facts: Awaited<ReturnType<typeof readOwnerFacts>> | null
           try {
-            facts = await readOwnerFacts(runtime, agent)
+            // the owner's own list keeps history: a superseded fact prints with its replacement
+            facts = await readOwnerFacts(runtime, agent, { history: true })
           } catch (error) {
             // a list the store calls incomplete is not "no facts" — say so, then still run the attempt
             if (!isMidaError(error, "PARTIAL_READ")) throw error
@@ -297,9 +299,11 @@ export async function runCliWithRuntime(
           } else {
             print("What you have told Mida about yourself")
             for (const fact of facts) {
-              // every fact names itself: short id (what --replaces takes) + the record's chain date
+              // every fact names itself: short id (what --replaces takes) + the record's chain
+              // date; a fact the chain shows superseded carries its replacement's id and date
               if (only === undefined || fact.namespace === only) {
-                print(`  ${fact.namespace}: ${fact.text} (id ${factShortId(fact.contextId)}, ${factStamp(fact.assertedAt)})`)
+                const replaced = fact.replacedBy === undefined ? "" : ` (replaced by ${factShortId(fact.replacedBy.contextId)} on ${factStamp(fact.replacedBy.assertedAt)})`
+                print(`  ${fact.namespace}: ${fact.text} (id ${factShortId(fact.contextId)}, ${factStamp(fact.assertedAt)})${replaced}`)
               }
             }
           }
@@ -380,7 +384,12 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
   // An installed client's identity (claude-desktop, cursor) is a real approve/revoke target —
   // `install <client>` registered it, so the name is checked against the home, not only AGENTS.
   if ((command === "approve" || command === "revoke") && agent !== "--all" && !AGENTS.includes(agent) && !listAgentNames(runtime.home).includes(agent)) return usage()
-  if (command === "remember" && argv.slice(1).join(" ").trim().length === 0) return usage()
+  // `remember` needs a fact; `remember --replaces` needs an id to name AND a fact after it.
+  if (command === "remember") {
+    const replaces = argv[1] === "--replaces"
+    const tail = argv.slice(replaces ? 3 : 1).join(" ").trim()
+    if ((replaces && (argv[2] ?? "").trim().length === 0) || tail.length === 0) return usage()
+  }
 
   try {
     if (command === "init") {
@@ -388,9 +397,23 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       deps.print(`owner ${result.owner}`)
       for (const [name, agentId] of Object.entries(result.agents)) deps.print(`agent ${name} ${agentId}`)
     } else if (command === "remember") {
+      const replaceId = argv[1] === "--replaces" ? (argv[2] ?? "") : undefined
+      let replaces: { contextId: Hex; namespace: FactNamespace } | undefined
+      if (replaceId !== undefined) {
+        // The target is resolved BEFORE the ask — an id that names no fact or several facts
+        // refuses here, without spending a signature prompt on it.
+        const resolved = await resolveFactId(runtime, replaceId)
+        if (resolved.kind === "refused") {
+          deps.print(`refused: ${resolved.code} — ${resolved.message}`)
+          return 1
+        }
+        replaces = { contextId: resolved.contextId, namespace: resolved.namespace }
+        deps.print(`replaces: fact ${factShortId(resolved.contextId)} in ${resolved.namespace} — the old fact stays readable as history`)
+      }
       // The owner sees WHICH context area the fact will land in before the ask — answering the
-      // "which namespace does this belong to" question — and sees it again after the write.
-      const area = `area: ${DEFAULT_FACT_NAMESPACE} (agents with READ on this area will see it)`
+      // "which namespace does this belong to" question — and sees it again after the write. A
+      // replacement lands where its parent lives, so that namespace is the one named.
+      const area = `area: ${replaces?.namespace ?? DEFAULT_FACT_NAMESPACE} (agents with READ on this area will see it)`
       deps.print(area)
       const prompt = deps.prompt ?? terminalPrompt
       const drain = deps.drainInput ?? drainBufferedStdin
@@ -400,7 +423,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
         deps.print("not approved")
         return 1
       }
-      const result = await remember(runtime, argv.slice(1).join(" "))
+      const result = await remember(runtime, argv.slice(replaceId === undefined ? 1 : 3).join(" "), replaces === undefined ? {} : { replaces })
       if (result.kind === "remembered") {
         deps.print(`area: ${result.namespace} (agents with READ on this area will see it)`)
         deps.print(`remembered ${result.contextId} in ${result.namespace}`)
