@@ -1197,7 +1197,9 @@ describe("the drainer hands the session's previous checkpoint to the compiler (C
 
     expect(compileCalls.length).toBe(2)
     expect(compileCalls[1]!.previous?.originalRequest).toBe("Build a rate limiter in 3 steps")
-    expect(saveCalls[1]!.checkpoint.originalRequest).toBe("Build a rate limiter in 3 steps")
+    expect((saveCalls[1] as { checkpoint: Checkpoint }).checkpoint.originalRequest).toBe(
+      "Build a rate limiter in 3 steps",
+    )
   })
 
   it("a corrupt .last.json is ignored with a previous-unreadable log line, and the save still happens", async () => {
