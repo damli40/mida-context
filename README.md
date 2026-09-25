@@ -424,7 +424,8 @@ mainnet are not measured.
 | MCP read-only adapter | ✅ In tests; not yet run against a real MCP client |
 | SDK | ✅ On a local chain; not yet on npm |
 | Handoff **from Codex to Claude Code** | ❌ Codex sessions are not captured yet |
-| Moving a setup to a new contract deployment (`mida migrate`) | 🚧 In progress |
+| Moving a setup to a new contract deployment (`mida migrate`) | ✅ Used on the maintainer's own setup, Sep 24: 13 records moved and re-read from the new contract |
+| Batched saves — many agent-signed saves in one Monad transaction, one Merkle root | ✅ Built and measured on testnet: up to 80% cheaper per save for one busy user, ~55% when a batch mixes 20 users ([evidence](docs/evidence/batch-anchor-multi-owner-2026-09-24.json)); **off by default** |
 | npm packages | 🚧 Not published yet |
 | Security audit | ❌ None |
 
@@ -451,5 +452,4 @@ Development: `pnpm install`, then `pnpm test` (the whole suite) and `pnpm typech
 Issues and pull requests are welcome once the repository is public. Please run `pnpm test` and
 `pnpm typecheck` before opening one.
 
-**License: not chosen yet.** Until a license file is added, no rights are granted to use, copy or
-modify this code.
+**License: [MIT](LICENSE).**
