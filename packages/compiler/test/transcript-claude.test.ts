@@ -198,11 +198,12 @@ describe("readConversation", () => {
 
   // G1: a custom slash command records the real ask inside <command-args> —
   // `/brainstorm build a login page` must surface as that request, not be
-  // dropped as command-echo scaffolding.
+  // dropped as command-echo scaffolding. The real echo puts <command-message>
+  // FIRST: the parser must find <command-name> anywhere in the line.
   it("a slash command's arguments are the user's request (G1)", () => {
     const dir = tmpdir()
     const t = writeTranscript(dir, [
-      JSON.stringify({ type: "user", message: { role: "user", content: "<command-name>/brainstorm</command-name>\n<command-message>brainstorm</command-message>\n<command-args>build a login page</command-args>" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "<command-message>brainstorm</command-message>\n<command-name>/brainstorm</command-name>\n<command-args>build a login page</command-args>" } }),
       JSON.stringify({ type: "user", isMeta: true, message: { role: "user", content: "You are a brainstorming assistant. The user wants: build a login page" } }),
       JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "here are ideas" }] } }),
     ])

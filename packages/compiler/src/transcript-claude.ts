@@ -131,23 +131,23 @@ function isScaffoldText(text: string): boolean {
 
 // A custom slash command's real ask hides inside its echo: Claude Code logs
 // `/brainstorm build a login page` as <command-name>/<command-message>/
-// <command-args>, so the request is "/name args". Returns null for a built-in —
-// the commands Claude Code answers with a <local-command-caveat> or
-// <local-command-stdout>/<stderr> block carry no user ask — and for a bare
-// echo whose <command-args> is empty or absent (e.g. /compact, /clear).
+// <command-args>, so the request is "/name args". The real echo puts
+// <command-message> FIRST, so the name tag is searched anywhere in the line,
+// not only at the start. Returns null for a built-in — the commands Claude
+// Code answers with a <local-command-caveat> or <local-command-stdout>/<stderr>
+// block carry no user ask — and for a bare echo whose <command-args> is empty
+// or absent (e.g. /compact, /clear).
 function slashCommandRequest(text: string): string | null {
-  const t = text.trim()
-  if (!t.startsWith("<command-name>")) return null
-  const name = /^<command-name>\s*(\/\S+)\s*<\/command-name>/.exec(t)?.[1]
+  const name = /<command-name>\s*(\/\S+)\s*<\/command-name>/.exec(text)?.[1]
   if (name === undefined) return null
   if (
-    t.includes("<local-command-caveat>") ||
-    t.includes("<local-command-stdout>") ||
-    t.includes("<local-command-stderr>")
+    text.includes("<local-command-caveat>") ||
+    text.includes("<local-command-stdout>") ||
+    text.includes("<local-command-stderr>")
   ) {
     return null
   }
-  const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(t)?.[1]?.trim()
+  const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(text)?.[1]?.trim()
   if (args === undefined || args === "") return null
   return `${name} ${args}`
 }
