@@ -18,7 +18,7 @@ import type { LocalAccount } from "viem"
 import type { Address, Hex } from "@mida/protocol"
 import type { Deployment } from "@mida/chain"
 import { Batcher, createBatcherChain } from "@mida/api"
-import type { BatchJournal, BatcherChain, BatcherTimer, BatchStore } from "@mida/api"
+import type { BatchAttempt, BatchJournal, BatcherChain, BatcherTimer, BatchStore } from "@mida/api"
 import { D1BatchStore } from "./d1.js"
 import type { D1Like } from "./d1.js"
 
@@ -78,11 +78,13 @@ const BATCH_WAIT_MS = 2_000
 const BATCH_MIN_GAP_MS = 1_000
 
 const JOURNAL_PREFIX = "journal/"
+const ATTEMPT_PREFIX = "journal-attempts/"
 
 /**
  * The in-flight journal on ctx.storage: one key per in-flight batchId holding the submitted
  * array's ordered contextIds — the only map from a SaveRejected.index back to a row after a
- * restart, and the only list recover() has of batches a dead object left behind.
+ * restart, and the only list recover() has of batches a dead object left behind. Attempt records
+ * live under a second prefix so the list/contextIds shape old entries already stored is unchanged.
  */
 export class DurableObjectBatchJournal implements BatchJournal {
   constructor(readonly storage: DurableObjectStorageLike) {}
@@ -100,8 +102,19 @@ export class DurableObjectBatchJournal implements BatchJournal {
     return (await this.storage.get<Hex[]>(`${JOURNAL_PREFIX}${batchId.toLowerCase()}`)) ?? null
   }
 
+  async attempt(batchId: Hex): Promise<BatchAttempt | null> {
+    return (await this.storage.get<BatchAttempt>(`${ATTEMPT_PREFIX}${batchId.toLowerCase()}`)) ?? null
+  }
+
+  async noteAttempt(batchId: Hex, atMs: number): Promise<void> {
+    const key = `${ATTEMPT_PREFIX}${batchId.toLowerCase()}`
+    const prev = await this.storage.get<BatchAttempt>(key)
+    await this.storage.put(key, { firstAt: prev?.firstAt ?? atMs, lastAt: atMs, count: (prev?.count ?? 0) + 1 })
+  }
+
   async clear(batchId: Hex): Promise<void> {
     await this.storage.delete(`${JOURNAL_PREFIX}${batchId.toLowerCase()}`)
+    await this.storage.delete(`${ATTEMPT_PREFIX}${batchId.toLowerCase()}`)
   }
 }
 

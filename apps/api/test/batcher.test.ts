@@ -1069,6 +1069,87 @@ describe("the batcher", () => {
     expect(await rig.journal.list()).toEqual([])
   })
 
+  it("an unproven batch is retried by the timer without a restart — the armed wakeup re-resolves it once the index catches up", async () => {
+    const rig = makeRig()
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    rig.chain.indexLag = true
+
+    await expect(rig.batcher.run()).rejects.toThrowError(/PARTIAL_READ|cannot be proven/)
+    expect((await rig.store.get(meta.contextId))!.state).toBe("SUBMITTED")
+
+    // Inside the 10 s eligibility window a run does not touch the batch — but on a quiet queue it
+    // still re-arms a wakeup, so the retry is not hostage to new traffic or a process restart.
+    rig.setNow(2_000)
+    rig.timer.fire()
+    await rig.batcher.run()
+    expect((await rig.store.get(meta.contextId))!.state).toBe("SUBMITTED")
+    expect(rig.timer.pendingAt).toBe(32_000) // now + the 30 s retry cadence
+
+    // Past eligibility the next armed run re-resolves it — same batcher, no restart, no re-send.
+    rig.chain.indexLag = false
+    rig.setNow(32_000)
+    rig.timer.fire()
+    await rig.batcher.run()
+    const batchId = rig.chain.submissions[0]!.batchId
+    expect((await rig.store.get(meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId: batchId.toLowerCase() })
+    expect(await rig.journal.list()).toEqual([])
+    expect(rig.chain.submissions).toHaveLength(1)
+    expect(rig.timer.pending()).toBe(false)
+  })
+
+  it("re-resolution touches at most one in-flight batch per run, oldest first", async () => {
+    const rig = makeRig()
+    const first = makeSave()
+    await rig.enqueue(first.wire, first.meta.contextId)
+    rig.chain.indexLag = true
+    await expect(rig.batcher.run()).rejects.toThrowError(/PARTIAL_READ/)
+
+    // A second batch goes in flight later — its first attempt is newer, so the older one wins.
+    const second = makeSave()
+    await rig.enqueue(second.wire, second.meta.contextId)
+    rig.setNow(2_000)
+    await expect(rig.batcher.run()).rejects.toThrowError(/PARTIAL_READ/)
+    expect(rig.chain.submissions).toHaveLength(2)
+    expect(await rig.journal.list()).toHaveLength(2)
+
+    rig.chain.indexLag = false
+    rig.setNow(20_000)
+    await rig.batcher.run()
+    // Only the oldest in-flight batch re-resolved; the second is still waiting for a run.
+    expect((await rig.store.get(first.meta.contextId))!).toMatchObject({ state: "ANCHORED", batchId: rig.chain.submissions[0]!.batchId.toLowerCase() })
+    expect((await rig.store.get(second.meta.contextId))!).toMatchObject({ state: "SUBMITTED" })
+    expect(await rig.journal.list()).toEqual([rig.chain.submissions[1]!.batchId.toLowerCase()])
+
+    // The next run's retry resolves the second.
+    rig.setNow(21_000)
+    await rig.batcher.run()
+    expect((await rig.store.get(second.meta.contextId))!).toMatchObject({ state: "ANCHORED" })
+    expect(await rig.journal.list()).toEqual([])
+  })
+
+  it("a batch unproven for over an hour logs batch.unproven-stale on every retry attempt — the operator's alert", async () => {
+    const rig = makeRig()
+    const { wire, meta } = makeSave()
+    await rig.enqueue(wire, meta.contextId)
+    rig.chain.indexLag = true
+    await expect(rig.batcher.run()).rejects.toThrowError(/PARTIAL_READ/)
+    const batchId = rig.chain.submissions[0]!.batchId
+
+    // 61 minutes of quiet queue with the index still lagging — each attempt surfaces the batch.
+    rig.setNow(3_660_000)
+    await rig.batcher.run()
+    const stale = rig.events.find((entry) => entry["event"] === "batch.unproven-stale")
+    expect(stale).toMatchObject({ batchId, rows: 1 })
+    expect(stale?.["ageMs"] as number).toBeGreaterThan(3_600_000)
+    // And still never guessed: the row is SUBMITTED until the chain proves it.
+    expect((await rig.store.get(meta.contextId))!.state).toBe("SUBMITTED")
+
+    rig.setNow(3_700_000)
+    await rig.batcher.run()
+    expect(rig.events.filter((entry) => entry["event"] === "batch.unproven-stale")).toHaveLength(2)
+  })
+
   it("an anchored-log set shorter than the batch's acceptedCount throws — a hole in the read is not proof the batch is foreign", async () => {
     const rig = makeRig()
     const saves = [makeSave(), makeSave()]

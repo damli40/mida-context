@@ -73,6 +73,20 @@ export interface BatcherChain {
 }
 
 /**
+ * Attempt bookkeeping for an in-flight batch — the clock the unproven-retry cadence and the
+ * batch.unproven-stale alert run on. Persisted beside the batch's ordered contextIds so a restart
+ * does not reset the hour the operator's alert counts.
+ */
+export interface BatchAttempt {
+  /** ms since epoch when the batch's first submit went out. */
+  firstAt: number
+  /** ms since epoch of the most recent submit or re-resolve attempt. */
+  lastAt: number
+  /** How many submit/resolve attempts the batch has seen. */
+  count: number
+}
+
+/**
  * The crash-recovery journal: which batchIds are in flight and, for each, the ordered contextIds of
  * the submitted array (the only map from SaveRejected.index back to a row). `record` is called with
  * an empty list BEFORE the rows are even taken, then again with the real list BEFORE submit — a
@@ -83,12 +97,17 @@ export interface BatchJournal {
   list(): Promise<Hex[]>
   record(batchId: Hex, contextIds: Hex[]): Promise<void>
   contextIds(batchId: Hex): Promise<Hex[] | null>
+  /** The attempt record for a journaled batch — null for one written before tracking existed. */
+  attempt(batchId: Hex): Promise<BatchAttempt | null>
+  /** Stamps a submit/re-resolve attempt: creates the record, else moves lastAt and bumps count. */
+  noteAttempt(batchId: Hex, atMs: number): Promise<void>
   clear(batchId: Hex): Promise<void>
 }
 
 /** Journal for tests and embedded use — process memory only, so it cannot recover a real restart. */
 export class MemoryBatchJournal implements BatchJournal {
   readonly batches = new Map<string, Hex[]>()
+  readonly attempts = new Map<string, BatchAttempt>()
   async list(): Promise<Hex[]> {
     return [...this.batches.keys()] as Hex[]
   }
@@ -98,8 +117,18 @@ export class MemoryBatchJournal implements BatchJournal {
   async contextIds(batchId: Hex): Promise<Hex[] | null> {
     return this.batches.get(batchId.toLowerCase())?.slice() ?? null
   }
+  async attempt(batchId: Hex): Promise<BatchAttempt | null> {
+    const attempt = this.attempts.get(batchId.toLowerCase())
+    return attempt === undefined ? null : { ...attempt }
+  }
+  async noteAttempt(batchId: Hex, atMs: number): Promise<void> {
+    const key = batchId.toLowerCase()
+    const prev = this.attempts.get(key)
+    this.attempts.set(key, { firstAt: prev?.firstAt ?? atMs, lastAt: atMs, count: (prev?.count ?? 0) + 1 })
+  }
   async clear(batchId: Hex): Promise<void> {
     this.batches.delete(batchId.toLowerCase())
+    this.attempts.delete(batchId.toLowerCase())
   }
 }
 
@@ -116,21 +145,24 @@ export class FsBatchJournal implements BatchJournal {
     this.#path = path
   }
 
-  #read(): Record<string, Hex[]> {
-    if (!existsSync(this.#path)) return {}
+  #read(): { batches: Record<string, Hex[]>; attempts: Record<string, BatchAttempt> } {
+    if (!existsSync(this.#path)) return { batches: {}, attempts: {} }
     try {
-      const parsed = JSON.parse(readFileSync(this.#path, "utf8")) as { batches?: Record<string, Hex[]> }
-      return parsed.batches ?? {}
+      const parsed = JSON.parse(readFileSync(this.#path, "utf8")) as {
+        batches?: Record<string, Hex[]>
+        attempts?: Record<string, BatchAttempt>
+      }
+      return { batches: parsed.batches ?? {}, attempts: parsed.attempts ?? {} }
     } catch {
-      return {}
+      return { batches: {}, attempts: {} }
     }
   }
 
-  #mutate<T>(fn: (batches: Record<string, Hex[]>) => T): Promise<T> {
+  #mutate<T>(fn: (state: { batches: Record<string, Hex[]>; attempts: Record<string, BatchAttempt> }) => T): Promise<T> {
     const run = this.#tail.then(() => {
-      const batches = this.#read()
-      const result = fn(batches)
-      writeJsonAtomic(dirname(this.#path), this.#path, { batches })
+      const state = this.#read()
+      const result = fn(state)
+      writeJsonAtomic(dirname(this.#path), this.#path, state)
       return result
     })
     this.#tail = run.then(
@@ -141,22 +173,35 @@ export class FsBatchJournal implements BatchJournal {
   }
 
   async list(): Promise<Hex[]> {
-    return Object.keys(this.#read()) as Hex[]
+    return Object.keys(this.#read().batches) as Hex[]
   }
 
   record(batchId: Hex, contextIds: Hex[]): Promise<void> {
-    return this.#mutate((batches) => {
-      batches[batchId.toLowerCase()] = [...contextIds]
+    return this.#mutate((state) => {
+      state.batches[batchId.toLowerCase()] = [...contextIds]
     })
   }
 
   async contextIds(batchId: Hex): Promise<Hex[] | null> {
-    return this.#read()[batchId.toLowerCase()]?.slice() ?? null
+    return this.#read().batches[batchId.toLowerCase()]?.slice() ?? null
+  }
+
+  async attempt(batchId: Hex): Promise<BatchAttempt | null> {
+    return this.#read().attempts[batchId.toLowerCase()] ?? null
+  }
+
+  noteAttempt(batchId: Hex, atMs: number): Promise<void> {
+    return this.#mutate((state) => {
+      const key = batchId.toLowerCase()
+      const prev = state.attempts[key]
+      state.attempts[key] = { firstAt: prev?.firstAt ?? atMs, lastAt: atMs, count: (prev?.count ?? 0) + 1 }
+    })
   }
 
   clear(batchId: Hex): Promise<void> {
-    return this.#mutate((batches) => {
-      delete batches[batchId.toLowerCase()]
+    return this.#mutate((state) => {
+      delete state.batches[batchId.toLowerCase()]
+      delete state.attempts[batchId.toLowerCase()]
     })
   }
 }
@@ -187,6 +232,13 @@ export function createNodeTimer(fire: () => void): BatcherTimer {
 const REJECT_NAMES = new Map<number, string>(Object.entries(BATCH_REJECT).map(([name, code]) => [code, name]))
 
 const rejectName = (reason: number): string => REJECT_NAMES.get(reason) ?? `UNKNOWN_${reason}`
+
+/** A journaled in-flight batch is eligible for re-resolution once its last attempt is this old. */
+const RETRY_AFTER_MS = 10_000
+/** While any batch is in flight a wakeup stays armed at most this far out — a quiet queue still retries. */
+const RETRY_EVERY_MS = 30_000
+/** An in-flight batch unproven this long logs batch.unproven-stale on every attempt — the operator's alert. */
+const UNPROVEN_STALE_MS = 3_600_000
 
 /** Integer division that rounds up — a per-save gas cost must never round a fraction away. */
 const ceilDiv = (a: bigint, b: bigint): bigint => (a + b - 1n) / b
@@ -262,6 +314,8 @@ export class Batcher {
   readonly #log: ((record: Record<string, unknown>) => void) | undefined
   /** Ordered contextIds of batches this process submitted — the resolve mapping without a journal read. */
   readonly #submitted = new Map<string, Hex[]>()
+  /** Attempt bookkeeping for in-flight batches — mirrors the journal so a journal-less batcher retries too. */
+  readonly #attempts = new Map<string, BatchAttempt>()
   /**
    * The take size the next run uses — the number of saves that fit the gas budget at the per-save
    * cost learned so far, clamped to [1, cap]. A successful submit re-learns it from the receipt's
@@ -331,6 +385,7 @@ export class Batcher {
   resolve(batchId: Hex): Promise<void> {
     return this.#serialize(async () => {
       await this.#resolveOnce(batchId)
+      await this.#forgetBatch(batchId)
     })
   }
 
@@ -351,8 +406,7 @@ export class Batcher {
             const requeued = await this.#store.requeue(batchId as Hex)
             this.#log?.({ event: "batch.requeued", batchId, requeued })
           }
-          await this.#journal?.clear(batchId as Hex)
-          this.#submitted.delete(batchId)
+          await this.#forgetBatch(batchId as Hex)
         } catch (error) {
           // One bad batch must not starve the rest — log it loudly and keep going.
           this.#log?.({ event: "batch.recover-failed", batchId, error: String(error) })
@@ -361,6 +415,7 @@ export class Batcher {
       if ((await this.#store.countQueued()) > 0 && !(await this.#timer.pending())) {
         await this.#timer.set(this.#now() + this.#waitMs)
       }
+      await this.#ensureRetryTimer()
     })
   }
 
@@ -375,6 +430,83 @@ export class Batcher {
   }
 
   async #runOnce(): Promise<{ batchId: Hex; accepted: number; rejected: number } | null> {
+    try {
+      // First duty of every run — before the gap and take rules: one journaled in-flight batch
+      // gets a re-resolution attempt. And whatever the run does afterwards, an in-flight batch
+      // must never leave the wakeup disarmed: the empty-queue path clears the timer, so without
+      // the finally a submitted-but-unproven batch on a quiet queue would never retry.
+      await this.#retryInFlight()
+      return await this.#attemptSubmit()
+    } finally {
+      await this.#ensureRetryTimer()
+    }
+  }
+
+  /**
+   * One journaled in-flight batch gets a re-resolve — at most one per run (each attempt is a
+   * burst of chain reads, so a backlog drains one run at a time), and only one whose last attempt
+   * is older than RETRY_AFTER_MS, oldest first so the longest-stuck batch is served before newer
+   * ones. A batch past UNPROVEN_STALE_MS logs batch.unproven-stale on every attempt — the row
+   * count and age are what the operator pages on. A failed attempt is a log line, never a failed
+   * run, and never a guessed outcome: the rows stay SUBMITTED until the chain proves them.
+   */
+  async #retryInFlight(): Promise<void> {
+    const inFlight = new Set<string>([...this.#submitted.keys(), ...((await this.#journal?.list()) ?? []).map((id) => id.toLowerCase())])
+    if (inFlight.size === 0) return
+    const now = this.#now()
+    const candidates: { batchId: string; attempt: BatchAttempt | null }[] = []
+    for (const batchId of inFlight) candidates.push({ batchId, attempt: await this.#attemptOf(batchId) })
+    // Oldest first: a batch with no attempt record (journaled before tracking existed) sorts first.
+    candidates.sort((a, b) => (a.attempt?.firstAt ?? 0) - (b.attempt?.firstAt ?? 0))
+    const due = candidates.find((candidate) => candidate.attempt === null || now - candidate.attempt.lastAt > RETRY_AFTER_MS)
+    if (due === undefined) return
+    const batchId = due.batchId as Hex
+    const firstAt = due.attempt?.firstAt ?? now
+    if (now - firstAt > UNPROVEN_STALE_MS) {
+      const rows = this.#submitted.get(due.batchId)?.length ?? (await this.#journal?.contextIds(batchId))?.length ?? 0
+      this.#log?.({ event: "batch.unproven-stale", batchId, ageMs: now - firstAt, rows, attempts: (due.attempt?.count ?? 0) + 1 })
+    }
+    await this.#noteAttempt(batchId, now)
+    try {
+      await this.#resolveOnce(batchId)
+      await this.#forgetBatch(batchId)
+    } catch (error) {
+      this.#log?.({ event: "batch.retry-failed", batchId, error: String(error) })
+    }
+  }
+
+  /**
+   * While any batch is in flight a wakeup stays armed — the wait timer belongs to queued saves, so
+   * an unproven batch on a quiet queue arms its own retry cadence. Never moves an armed timer:
+   * whatever already wakes the object runs the retry check too.
+   */
+  async #ensureRetryTimer(): Promise<void> {
+    const inFlight = this.#submitted.size > 0 || ((await this.#journal?.list()) ?? []).length > 0
+    if (inFlight && !(await this.#timer.pending())) await this.#timer.set(this.#now() + RETRY_EVERY_MS)
+  }
+
+  /** Stamps a submit/re-resolve attempt — the in-memory map mirrors the journal's record. */
+  async #noteAttempt(batchId: Hex, atMs: number): Promise<void> {
+    const key = batchId.toLowerCase()
+    const prev = this.#attempts.get(key) ?? (await this.#journal?.attempt(batchId)) ?? null
+    this.#attempts.set(key, { firstAt: prev?.firstAt ?? atMs, lastAt: atMs, count: (prev?.count ?? 0) + 1 })
+    await this.#journal?.noteAttempt(batchId, atMs)
+  }
+
+  /** The attempt record for an in-flight batch — memory first, the journal for what a restart left. */
+  async #attemptOf(batchId: string): Promise<BatchAttempt | null> {
+    return this.#attempts.get(batchId) ?? (await this.#journal?.attempt(batchId as Hex)) ?? null
+  }
+
+  /** Forgets an in-flight batch everywhere — submitted map, attempt record, journal entry. */
+  async #forgetBatch(batchId: Hex): Promise<void> {
+    const key = batchId.toLowerCase()
+    this.#submitted.delete(key)
+    this.#attempts.delete(key)
+    await this.#journal?.clear(batchId)
+  }
+
+  async #attemptSubmit(): Promise<{ batchId: Hex; accepted: number; rejected: number } | null> {
     const now = this.#now()
     const gapEnd = this.#lastSubmitAt === null ? Number.NEGATIVE_INFINITY : this.#lastSubmitAt + this.#minGapMs
     if (now < gapEnd) {
@@ -403,10 +535,13 @@ export class Batcher {
     this.#submitted.set(batchId.toLowerCase(), contextIds)
     try {
       await this.#journal?.record(batchId, contextIds)
+      // The first attempt stamp — the clock the unproven retry cadence and stale alert run on.
+      await this.#noteAttempt(batchId, this.#now())
     } catch (error) {
       // The journal is the recovery path — without it these rows would be stranded as SUBMITTED.
       await this.#store.requeue(batchId)
       this.#submitted.delete(batchId.toLowerCase())
+      this.#attempts.delete(batchId.toLowerCase())
       this.#log?.({ event: "batch.journal-failed", batchId, error: String(error) })
       throw error
     }
@@ -415,8 +550,7 @@ export class Batcher {
       result = await this.#chain.submit(batchId, taken.map((row) => row.save))
     } catch (error) {
       if (isMidaError(error, "GAS_CEILING_EXCEEDED")) {
-        this.#submitted.delete(batchId.toLowerCase())
-        await this.#journal?.clear(batchId)
+        await this.#forgetBatch(batchId)
         if (taken.length === 1) {
           // A batch of one that still exceeds the ceiling can never shrink — the row is rejected
           // on the store side so the queue moves on; readers see the plain reason.
@@ -446,8 +580,7 @@ export class Batcher {
         // halved, not the learned cap, so a refusal at 8 rows yields a take of 4 even when the cap
         // still says 400. A batch of one requeues untouched: a lone pre-send failure is more likely
         // an RPC outage than an oversized save, and only a measured ceiling refusal earns TOO_LARGE.
-        this.#submitted.delete(batchId.toLowerCase())
-        await this.#journal?.clear(batchId)
+        await this.#forgetBatch(batchId)
         const requeued = await this.#store.requeue(batchId)
         if (taken.length > 1) this.#effectiveCap = Math.max(1, Math.floor(taken.length / 2))
         this.#log?.({ event: "batch.presend-failed", batchId, requeued, cap: this.#effectiveCap, error: String(error) })
@@ -459,8 +592,7 @@ export class Batcher {
       // findAnchorings — a parented save resubmitted after its first copy landed comes back
       // STALE_PARENT (the lineage head moved to that very copy) and heals the same way.
       const requeued = await this.#store.requeue(batchId)
-      this.#submitted.delete(batchId.toLowerCase())
-      await this.#journal?.clear(batchId)
+      await this.#forgetBatch(batchId)
       this.#log?.({ event: "batch.submit-failed", batchId, requeued, error: String(error) })
       if (!(await this.#timer.pending())) await this.#timer.set(this.#now() + this.#waitMs)
       return null
@@ -486,8 +618,7 @@ export class Batcher {
     })
     try {
       const counts = await this.#resolveOnce(batchId)
-      this.#submitted.delete(batchId.toLowerCase())
-      await this.#journal?.clear(batchId)
+      await this.#forgetBatch(batchId)
       if ((await this.#store.countQueued()) > 0 && !(await this.#timer.pending())) {
         await this.#timer.set(this.#now() + this.#waitMs)
       }
@@ -530,8 +661,7 @@ export class Batcher {
       // Not ours: no row may take this batch's outcomes. The rows come back to QUEUED (a fresh id
       // next run), the journal entry is cleared and the one log line says exactly what happened.
       const requeued = await this.#store.requeue(batchId)
-      this.#submitted.delete(batchId.toLowerCase())
-      await this.#journal?.clear(batchId)
+      await this.#forgetBatch(batchId)
       this.#log?.({ event: "batch.not-ours", batchId, requeued, message: `batch ${batchId} is not ours — requeued` })
       return { accepted: 0, rejected: 0 }
     }
