@@ -172,13 +172,16 @@ function renderSummary(doc: Document, data: MeData): HTMLElement {
   return bento
 }
 
-function grantStatusText(grant: AgentRow["grants"][number]): string | null {
+function grantStatusText(grant: AgentRow["grants"][number], source: MeData["source"]): string | null {
   const { label, flagged } = grant.status
   if (label === "Can read" && !flagged) return null
-  return flagged ? `${label} — the index disagrees with the chain` : label
+  if (!flagged) return label
+  // In chain-log mode there is no index to disagree — name the listing that actually spoke.
+  const listing = source === "index" ? "the index" : "the grant log"
+  return `${label} — ${listing} disagrees with the chain`
 }
 
-function renderAgent(doc: Document, agent: AgentRow): HTMLElement {
+function renderAgent(doc: Document, agent: AgentRow, source: MeData["source"]): HTMLElement {
   const allRevoked = agent.grants.length > 0 && agent.grants.every((g) => g.status.label === "Revoked")
   const flagged = agent.grants.find((g) => g.status.flagged)
   const revokedRow = !agent.readLive && !agent.blockedAtStore && allRevoked
@@ -211,7 +214,7 @@ function renderAgent(doc: Document, agent: AgentRow): HTMLElement {
       chips.appendChild(elOf(doc, "span", `chip ${on ? "chip-on" : "chip-off"}`, label))
     }
     grantRow.appendChild(chips)
-    const statusText = grantStatusText(grant)
+    const statusText = grantStatusText(grant, source)
     if (statusText !== null) grantRow.appendChild(elOf(doc, "span", "grant-status", statusText))
     grants.appendChild(grantRow)
   }
@@ -293,7 +296,7 @@ function renderAgents(doc: Document, data: MeData): HTMLElement {
     sec.appendChild(elOf(doc, "p", "agent-meta", "No agents have been granted access yet."))
     return sec
   }
-  for (const agent of data.agents) sec.appendChild(renderAgent(doc, agent))
+  for (const agent of data.agents) sec.appendChild(renderAgent(doc, agent, data.source))
   return sec
 }
 
@@ -689,6 +692,7 @@ function livePorts(env: FlowEnvironment, session: MeSession, indexUrl: string | 
           functionName: "isCapabilityValid",
           args: [capabilityId],
         } as never)) as boolean,
+      getCapability: (capabilityId) => reader.getCapability(capabilityId),
       getRecords: (ids) => reader.getRecords(ids),
       batchRoot: async (batchId) => {
         if (deployment.batchAnchor === undefined) return null

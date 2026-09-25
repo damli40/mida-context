@@ -28,7 +28,7 @@ import {
 } from "@mida/protocol"
 import type { Address, AgentRecord, BatchSaveMessage, Hex } from "@mida/protocol"
 import { bytesOf, ciphertextHash, manifestHash } from "@mida/crypto"
-import type { ContextApiRoutes, ContextRecordView } from "@mida/api/browser"
+import type { CapabilityView, ContextApiRoutes, ContextRecordView } from "@mida/api/browser"
 import { DEPLOYMENT } from "../owner/core.js"
 import { grantStatus, isTxHash, lagText } from "./model.js"
 import type { AnchorState, Lane } from "./model.js"
@@ -134,6 +134,7 @@ export interface MePorts {
   store: Pick<ContextApiRoutes, "listObjects" | "listBatchSaves" | "listRevocations" | "batchStatus" | "getAgentManifest">
   chain: {
     isCapabilityValid(capabilityId: Hex): Promise<boolean>
+    getCapability(capabilityId: Hex): Promise<CapabilityView | null>
     getRecords(ids: Hex[]): Promise<(ContextRecordView | null)[]>
     batchRoot(batchId: Hex): Promise<Hex | null>
     ownerGrantLogs(owner: Address): Promise<GrantLog[]>
@@ -260,8 +261,10 @@ interface GrantSeed {
   agentId: Hex
   capabilityId: Hex
   namespaceId: Hex
+  /** The index's claim — the chain's capability row, not this field, supplies what is shown. */
   permissions: number
-  indexSaysLive: boolean
+  /** What the listing claimed — an index Grant row's revokedBlock, or a grant log line. */
+  sourceSaysLive: boolean
   approvedTx: Hex | null
   block: number
 }
@@ -432,11 +435,15 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
     if (!incomplete.includes(text)) incomplete.push(text)
   }
 
-  // Two independent facts start together: the store's batching flag and its pending denies.
-  const [batchStatus, denies] = await Promise.all([
+  // Two independent facts start together: the store's batching flag, its pending denies, and the
+  // chain clock — the clock is what tells an expired grant apart from a revoked one.
+  const [batchStatus, denies, latestSeconds] = await Promise.all([
     safe(() => ports.store.batchStatus()),
     safe(() => ports.store.listRevocations("active")),
+    safe(() => ports.chain.latestTimestamp()),
   ])
+  const nowSeconds =
+    latestSeconds === null || !Number.isFinite(latestSeconds) ? null : BigInt(Math.floor(latestSeconds))
   const batchingOn = batchStatus === null ? null : batchStatus.enabled
   // The store's advertised anchor is the domain its agents actually signed under; the baked-in
   // deployment anchor is the fallback when the status call itself failed.
@@ -487,7 +494,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
           capabilityId: grant.id as Hex,
           namespaceId: grant.namespaceId as Hex,
           permissions: grant.permissions,
-          indexSaysLive: grant.revokedBlock === null,
+          sourceSaysLive: grant.revokedBlock === null,
           approvedTx: isTxHash(grant.txHash) ? grant.txHash : null,
           block: grant.grantedBlock,
         })
@@ -559,7 +566,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
           capabilityId: log.capabilityId,
           namespaceId: log.namespaceId,
           permissions: log.permissions ?? 0,
-          indexSaysLive: true,
+          sourceSaysLive: true,
           approvedTx: isTxHash(log.txHash) ? log.txHash : null,
           block: log.block,
         })
@@ -570,11 +577,11 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
         if (isString(log.capabilityId)) {
           // A CapabilityRevoked log ends that one grant.
           const grant = byCapability.get(lower(log.capabilityId))
-          if (grant !== undefined && grant.block <= log.block) grant.indexSaysLive = false
+          if (grant !== undefined && grant.block <= log.block) grant.sourceSaysLive = false
         } else {
           // An AgentRevoked log ends every grant the owner-agent pair had at that block.
           for (const grant of byCapability.values()) {
-            if (sameHex(grant.agentId, log.agentId) && grant.block <= log.block) grant.indexSaysLive = false
+            if (sameHex(grant.agentId, log.agentId) && grant.block <= log.block) grant.sourceSaysLive = false
           }
         }
       }
@@ -606,10 +613,34 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
   }
 
   // --- grant truth: the index or the logs said it, the chain is asked ------------------------
+  // getCapability answers who the grant is for and when it ends; isCapabilityValid answers
+  // whether it works right now. Both reads run together, and the row only claims "Can read"
+  // when the capability's owner/agent/area all match the listing.
   const agents = new Map<string, AgentRow>()
   for (const seed of grantSeeds) {
-    const chainSaysValid = await safe(() => ports.chain.isCapabilityValid(seed.capabilityId))
-    const status = grantStatus({ indexSaysLive: seed.indexSaysLive, chainSaysValid })
+    const [capability, chainSaysValid] = await Promise.all([
+      safe(() => ports.chain.getCapability(seed.capabilityId)),
+      safe(() => ports.chain.isCapabilityValid(seed.capabilityId)),
+    ])
+    const capMatches =
+      capability !== null &&
+      sameHex(capability.owner, ownerKey) &&
+      sameHex(capability.agentId, seed.agentId) &&
+      sameHex(capability.namespaceId, seed.namespaceId)
+    const status = grantStatus({
+      sourceSaysLive: seed.sourceSaysLive,
+      capability: capability === null ? null : {
+        owner: capability.owner,
+        agentId: capability.agentId,
+        namespaceId: capability.namespaceId,
+        expiresAt: capability.expiresAt,
+      },
+      chainSaysValid,
+      owner: ownerKey,
+      agentId: seed.agentId,
+      namespaceId: seed.namespaceId,
+      nowSeconds,
+    })
     let row = agents.get(lower(seed.agentId))
     if (row === undefined) {
       row = {
@@ -625,7 +656,9 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
     row.grants.push({
       namespaceId: seed.namespaceId,
       area: areaName(seed.namespaceId),
-      permissions: seed.permissions,
+      // Permission bits come from the chain's capability row; the listing's claim only shows on
+      // a row the chain could not confirm.
+      permissions: capMatches && capability !== null ? capability.permissions : seed.permissions,
       capabilityId: seed.capabilityId,
       status,
       approvedTx: seed.approvedTx,

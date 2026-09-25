@@ -21,7 +21,7 @@ import {
 } from "@mida/protocol"
 import type { Address, AgentRecord, BatchSaveMessage, Hex, SignedAgentCapabilityManifest } from "@mida/protocol"
 import { deriveEpochKeyPair, hexOf, sealContextObject } from "@mida/crypto"
-import type { AnchoredObject, BatchedReadItem, ContextRecordView, RevocationIntentView } from "@mida/api"
+import type { AnchoredObject, BatchedReadItem, CapabilityView, ContextRecordView, RevocationIntentView } from "@mida/api"
 import { DEPLOYMENT } from "../src/owner/core.js"
 import { AGENTS_QUERY, BATCHED_QUERY, COUNTS_QUERY, loadMe } from "../src/me/sources.js"
 import type { GrantLog, MePorts } from "../src/me/sources.js"
@@ -80,6 +80,23 @@ function grantRow(over: Record<string, unknown> = {}) {
     revokedBlock: null,
     revokedBy: null,
     txHash: TX1,
+    ...over,
+  }
+}
+
+/** The chain's capability row for CAP_ID — matching owner, agent and area, never expiring. */
+function capabilityView(over: Partial<CapabilityView> = {}): CapabilityView {
+  return {
+    owner: OWNER,
+    agentId: AGENT_ID,
+    namespaceId: NS,
+    permissions: 3,
+    provenancePolicy: 1,
+    issuedAt: 1n,
+    expiresAt: 0n,
+    agentEpoch: 0n,
+    grantedAtReadEpoch: 0n,
+    revoked: false,
     ...over,
   }
 }
@@ -152,6 +169,7 @@ function world() {
     manifestsError: null as Error | null,
     // chain answers
     validCaps: new Map<string, boolean>([[CAP_ID.toLowerCase(), true]]),
+    capabilities: new Map<string, CapabilityView>([[CAP_ID.toLowerCase(), capabilityView()]]),
     chainRecords: new Map<string, ContextRecordView>(),
     batchRoots: new Map<string, Hex>(),
     grantLogs: [] as GrantLog[],
@@ -204,6 +222,7 @@ function world() {
     },
     chain: {
       isCapabilityValid: async (capabilityId) => state.validCaps.get(capabilityId.toLowerCase()) ?? false,
+      getCapability: async (capabilityId) => state.capabilities.get(capabilityId.toLowerCase()) ?? null,
       getRecords: async (ids) => {
         state.getRecordsCalls.push([...ids])
         return ids.map((id) => state.chainRecords.get(id.toLowerCase()) ?? null)
@@ -411,15 +430,17 @@ describe("loadMe — incomplete lists and index contradictions stay visible", ()
     expect(data.counts).toBeNull()
   })
 
-  it("a grant the index calls live but the chain calls invalid is flagged, not live", async () => {
+  it("a grant the index calls live but the chain calls revoked is flagged, not live", async () => {
     const { state, ports } = world()
     state.validCaps.set(CAP_ID, false)
+    state.capabilities.set(CAP_ID.toLowerCase(), capabilityView({ revoked: true }))
     const data = await loadMe(OWNER, ports)
     const agent = data.agents.find((a) => a.agentId === AGENT_ID)
     expect(agent).toBeDefined()
     const grant = agent!.grants.find((g) => g.capabilityId === CAP_ID)
     expect(grant).toBeDefined()
-    expect(grant!.status.label).toBe("Expired or revoked on Monad")
+    // The capability never expires, so dead-on-chain means revoked — not the vague old label.
+    expect(grant!.status.label).toBe("Revoked")
     expect(grant!.status.flagged).toBe(true)
     expect(agent!.readLive).toBe(false)
   })
@@ -519,6 +540,7 @@ describe("loadMe — chain-log fallback and names", () => {
     ]
     state.validCaps.set(CAP_ID, true)
     state.validCaps.set(CAP2_ID, false)
+    state.capabilities.set(CAP2_ID.toLowerCase(), capabilityView({ agentId: OTHER_ID, revoked: true }))
     const data = await loadMe(OWNER, ports)
     expect(data.source).toBe("chain-logs")
     expect(data.counts).toBeNull()
@@ -551,5 +573,63 @@ describe("loadMe — chain-log fallback and names", () => {
     const agent = data.agents.find((a) => a.agentId === AGENT_ID)
     expect(agent!.name).toBe("0xaaaa…aaaa")
     expect(agent!.name.length).toBeGreaterThan(0)
+  })
+})
+
+describe("loadMe — a grant row is only live when the chain's capability agrees", () => {
+  it("a capability naming another owner, agent or area is Unverified — even when isCapabilityValid says true", async () => {
+    for (const field of ["owner", "agentId", "namespaceId"] as const) {
+      const { state, ports } = world()
+      // The chain row for this capabilityId answers about a DIFFERENT grant — the listing's id
+      // pointed at the wrong row, so nothing it claims can stand in for this grant.
+      const foreign = `0x${"99".repeat(field === "owner" ? 20 : 32)}`
+      state.capabilities.set(CAP_ID.toLowerCase(), capabilityView({ [field]: foreign }))
+      const data = await loadMe(OWNER, ports)
+      const grant = data.agents.find((a) => a.agentId === AGENT_ID)!.grants[0]!
+      expect(grant.status, `mismatched ${field} must never read live`).toEqual({ label: "Unverified", flagged: true })
+      expect(data.agents[0]!.readLive).toBe(false)
+    }
+  })
+
+  it("a capabilityId the chain cannot return at all is Unverified, never Can read", async () => {
+    const { state, ports } = world()
+    state.capabilities.delete(CAP_ID.toLowerCase()) // getCapability answers null — no row to match
+    const data = await loadMe(OWNER, ports)
+    expect(data.agents[0]!.grants[0]!.status).toEqual({ label: "Unverified", flagged: true })
+    expect(data.agents[0]!.readLive).toBe(false)
+  })
+
+  it("the permission bits come from the chain's capability row, not the listing's claim", async () => {
+    const { state, ports } = world()
+    // The index row claims READ | CREATE (3); the chain's capability says READ only (1).
+    state.capabilities.set(CAP_ID.toLowerCase(), capabilityView({ permissions: 1 }))
+    const data = await loadMe(OWNER, ports)
+    const grant = data.agents[0]!.grants[0]!
+    expect(grant.status.label).toBe("Can read")
+    expect(grant.permissions).toBe(1)
+  })
+
+  it("an expired grant reads Expired — a wall-clock fact, not a vague revoke and not 'the index disagrees' wording", async () => {
+    const { state, ports } = world()
+    state.validCaps.set(CAP_ID, false)
+    // expiresAt is in the past on the chain clock (chainTime = NOW + 5).
+    state.capabilities.set(CAP_ID.toLowerCase(), capabilityView({ expiresAt: BigInt(NOW) }))
+    const data = await loadMe(OWNER, ports)
+    const grant = data.agents[0]!.grants[0]!
+    expect(grant.status.label).toBe("Expired")
+    expect(grant.status.label).not.toContain("revoked")
+  })
+
+  it("in chain-log mode the same checks run — a mismatched capability is Unverified there too", async () => {
+    const { state, ports } = world()
+    state.indexFails = true
+    state.grantLogs = [
+      { kind: "granted", agentId: AGENT_ID, capabilityId: CAP_ID, namespaceId: NS, permissions: 3, block: 100, txHash: TX1 },
+    ]
+    state.capabilities.set(CAP_ID.toLowerCase(), capabilityView({ agentId: OTHER_ID }))
+    const data = await loadMe(OWNER, ports)
+    expect(data.source).toBe("chain-logs")
+    const grant = data.agents.find((a) => a.agentId === AGENT_ID)!.grants[0]!
+    expect(grant.status).toEqual({ label: "Unverified", flagged: true })
   })
 })

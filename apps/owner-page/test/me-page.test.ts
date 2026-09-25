@@ -291,6 +291,21 @@ describe("renderMe", () => {
     expect(root.textContent).not.toContain("No agents have been granted access")
   })
 
+  it("a flagged grant names the listing that spoke — the index, or in chain-log mode the grant log, never the index", () => {
+    const flagged = agent({ readLive: false, grants: [grant({ status: { label: "Revoked", flagged: true } })] })
+    const fromIndex = renderMe(data({ agents: [flagged] }), fakeDoc()) as unknown as FakeEl
+    expect(fromIndex.querySelector(".grant-status")!.textContent).toBe("Revoked — the index disagrees with the chain")
+
+    const fromLogs = renderMe(
+      data({ source: "chain-logs", lag: { text: "index unavailable", stale: true }, agents: [flagged] }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    const status = fromLogs.querySelector(".grant-status")
+    expect(status).not.toBeNull()
+    expect(status!.textContent).toBe("Revoked — the grant log disagrees with the chain")
+    expect(status!.textContent).not.toContain("index")
+  })
+
   it("shows the newest 20 records and pages the rest with 'Show 20 more'", () => {
     const many = Array.from({ length: 25 }, (_, i) =>
       record({ contextId: `0x${String(i).padStart(2, "0")}${"cc".repeat(31)}` as Hex, createdAt: 1_700_000_000_000 + i }),

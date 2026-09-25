@@ -48,9 +48,45 @@ export function readersAfterRevoke(agents: readonly { agentId: Hex }[], revoking
   return agents.filter((a) => a.agentId.toLowerCase() !== r).map((a) => a.agentId)
 }
 
-export interface GrantTruth { indexSaysLive: boolean; chainSaysValid: boolean | null }
-export function grantStatus(t: GrantTruth): { label: "Can read" | "Revoked" | "Expired or revoked on Monad" | "Unverified"; flagged: boolean } {
-  if (t.chainSaysValid === null) return { label: "Unverified", flagged: true }
-  if (t.chainSaysValid) return { label: "Can read", flagged: !t.indexSaysLive }
-  return t.indexSaysLive ? { label: "Expired or revoked on Monad", flagged: true } : { label: "Revoked", flagged: false }
+export type GrantLabel = "Can read" | "Revoked" | "Expired" | "Expired or revoked on Monad" | "Unverified"
+
+export interface GrantTruth {
+  /** What the discovery source claimed — the index row, or a grant log in chain-log mode. */
+  sourceSaysLive: boolean
+  /**
+   * The chain's capability row — null when the getCapability read itself failed. A row whose
+   * owner/agent/namespace does not match the listing is not a fact about this grant at all:
+   * "Unverified", never live.
+   */
+  capability: {
+    owner: string
+    agentId: string
+    namespaceId: string
+    /** uint64 seconds — 0 means the grant never expires. */
+    expiresAt: bigint
+  } | null
+  /** isCapabilityValid's answer — null when that read failed. */
+  chainSaysValid: boolean | null
+  owner: string
+  agentId: string
+  namespaceId: string
+  /** The chain clock (latest block timestamp) — expiry is a timestamp comparison, not a vote. */
+  nowSeconds: bigint | null
+}
+
+export function grantStatus(t: GrantTruth): { label: GrantLabel; flagged: boolean } {
+  const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
+  const cap = t.capability
+  if (cap === null || t.chainSaysValid === null) return { label: "Unverified", flagged: true }
+  if (!same(cap.owner, t.owner) || !same(cap.agentId, t.agentId) || !same(cap.namespaceId, t.namespaceId)) {
+    return { label: "Unverified", flagged: true }
+  }
+  if (t.chainSaysValid) return { label: "Can read", flagged: !t.sourceSaysLive }
+  // Dead on chain: expiry is the only cause that is a wall-clock fact — name it exactly; when
+  // the clock could not be read, "expired or revoked" is the honest label.
+  if (t.nowSeconds === null) {
+    return t.sourceSaysLive ? { label: "Expired or revoked on Monad", flagged: true } : { label: "Revoked", flagged: false }
+  }
+  if (cap.expiresAt !== 0n && cap.expiresAt <= t.nowSeconds) return { label: "Expired", flagged: t.sourceSaysLive }
+  return { label: "Revoked", flagged: t.sourceSaysLive }
 }
