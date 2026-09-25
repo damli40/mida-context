@@ -7,6 +7,11 @@ export interface OwnerPageEnv {
   INDEX_GRAPHQL_URL?: string
 }
 
+/** The one slice of a scheduled event's execution context this Worker uses. */
+interface ScheduledContextLike {
+  waitUntil(promise: Promise<unknown>): void
+}
+
 /** `/` serves the public home page, `/check` the device check; each owner flow gets its own page route. */
 export function assetPathFor(pathname: string): string {
   if (pathname === "" || pathname === "/") return "/index.html"
@@ -41,5 +46,27 @@ export default {
     const isHtml = (headers.get("content-type") ?? "").includes("text/html") || path.endsWith(".html")
     for (const [name, value] of Object.entries(securityHeaders(isHtml))) headers.set(name, value)
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
+  },
+
+  /**
+   * The daily cron (`[triggers]` in wrangler.toml). Envio Cloud's free plan deletes a dev
+   * deployment after 7 days with no queries, so this POSTs the smallest useful one to keep the
+   * /me index alive. The promise rides waitUntil — a floating fetch can be cancelled when the
+   * handler returns — and it can never reject: a failed keep-alive is not worth a retry, and a
+   * rejected waitUntil would mark the whole invocation failed.
+   */
+  async scheduled(_event: { cron: string }, env: OwnerPageEnv, ctx: ScheduledContextLike): Promise<void> {
+    const indexUrl = env.INDEX_GRAPHQL_URL
+    if (!indexUrl) return
+    ctx.waitUntil(
+      fetch(indexUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query: "{ GlobalStats(limit: 1) { lastBlock } }" }),
+      }).then(
+        () => undefined,
+        () => undefined,
+      ),
+    )
   },
 }

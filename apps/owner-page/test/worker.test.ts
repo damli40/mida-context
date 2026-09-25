@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import worker, { assetPathFor, type OwnerPageEnv } from "../src/worker.js"
 import { CONTENT_SECURITY_POLICY, securityHeaders } from "../src/headers.js"
 
@@ -129,5 +129,73 @@ describe("/me", () => {
     const { env } = fakeAssets()
     const res = await worker.fetch(new Request("https://app.midacontext.xyz/me/config.json"), env)
     expect(await res.json()).toEqual({ indexUrl: null })
+  })
+})
+
+describe("the daily index keep-alive", () => {
+  // Envio Cloud's free plan deletes a dev deployment after 7 days with no queries, so the Worker
+  // pings the index once a day (the cron itself is [triggers] in wrangler.toml; this tests what
+  // the ping does). It must never throw — a missed day is harmless, a retry storm is not — and it
+  // must do nothing at all when no index is configured.
+  const cron = { cron: "17 6 * * *" }
+  const indexUrl = "https://indexer.dev.hyperindex.xyz/abc123/v1/graphql"
+
+  function keepAliveEnv(index?: string): OwnerPageEnv {
+    return {
+      ASSETS: { async fetch() { return new Response("unused — scheduled never touches assets") } },
+      ...(index === undefined ? {} : { INDEX_GRAPHQL_URL: index }),
+    }
+  }
+
+  // The ctx Cloudflare hands a scheduled event: work the handler wants to outlive its return rides
+  // waitUntil. Capturing those promises is also how the test proves the ping is not left floating —
+  // an un-awaited subrequest can be cancelled the moment the handler returns.
+  function ctxCapture(): { ctx: { waitUntil(p: Promise<unknown>): void }; pings: Promise<unknown>[] } {
+    const pings: Promise<unknown>[] = []
+    return { ctx: { waitUntil: (p) => void pings.push(p) }, pings }
+  }
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  it("POSTs one tiny GlobalStats query to the configured index URL, held open by waitUntil", async () => {
+    const calls: { url: string; method?: string; body?: unknown }[] = []
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), method: init?.method, body: init?.body })
+      return new Response("{}")
+    })
+    const { ctx, pings } = ctxCapture()
+
+    await worker.scheduled(cron, keepAliveEnv(indexUrl), ctx)
+    expect(pings).toHaveLength(1)
+    await Promise.all(pings)
+
+    expect(calls).toEqual([
+      { url: indexUrl, method: "POST", body: JSON.stringify({ query: "{ GlobalStats(limit: 1) { lastBlock } }" }) },
+    ])
+  })
+
+  it("swallows a failed ping — a keep-alive is never worth a retry", async () => {
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("offline")
+    })
+    const { ctx, pings } = ctxCapture()
+
+    await expect(worker.scheduled(cron, keepAliveEnv(indexUrl), ctx)).resolves.toBeUndefined()
+    expect(pings).toHaveLength(1)
+    // a rejected waitUntil promise would mark the whole scheduled invocation failed
+    await expect(Promise.all(pings)).resolves.toBeDefined()
+  })
+
+  it("does nothing when INDEX_GRAPHQL_URL is unset", async () => {
+    const calls: unknown[] = []
+    vi.stubGlobal("fetch", async () => {
+      calls.push(1)
+      return new Response("{}")
+    })
+    const { ctx, pings } = ctxCapture()
+
+    await worker.scheduled(cron, keepAliveEnv(), ctx)
+    expect(pings).toEqual([])
+    expect(calls).toEqual([])
   })
 })
