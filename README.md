@@ -51,7 +51,7 @@ public blockchain (Monad testnet).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/architecture/mida-architecture-dark.svg">
-  <img alt="How one checkpoint travels: an agent's session events go to the local Mida service, which captures them, has your chosen model summarise them into a checkpoint, encrypts it, stores the ciphertext, and registers its author and fingerprint on Monad. The next agent receives the checkpoint at session start. You approve and revoke agents on Monad." src="docs/architecture/mida-architecture-light.svg" width="100%">
+  <img alt="How one checkpoint travels: an agent's session events go to the local Mida service, which captures them, has your chosen model summarise them into a checkpoint, encrypts it, stores the ciphertext, and registers its author and fingerprint on Monad. The next agent receives the checkpoint at session start. You approve and revoke agents on Monad. An optional batching lane, off by default, anchors many agent-signed saves in one Monad transaction under one Merkle root." src="docs/architecture/mida-architecture-light.svg" width="100%">
 </picture>
 
 <sub>Editable source: [`docs/architecture/mida-architecture.excalidraw`](docs/architecture/mida-architecture.excalidraw) (open it at excalidraw.com).</sub>
