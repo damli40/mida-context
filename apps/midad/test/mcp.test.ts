@@ -313,6 +313,38 @@ describe("mida-mcp startup gate", () => {
     expect(existsSync(join(home.root, "midad.sock"))).toBe(false)
   })
 
+  it("a MIDA_HOME that does not exist is refused before a folder is created there (F6)", async () => {
+    const missing = join(mkdtempSync(join(tmpdir(), "mida-nohome-")), "home")
+    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "assistant", "--project", makeProject()], {
+      env: { ...process.env, MIDA_HOME: missing },
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (b) => (stdout += b))
+    child.stderr.on("data", (b) => (stderr += b))
+    const code = await new Promise((r) => child.on("exit", r))
+    expect(code).toBe(2)
+    expect(stdout).toBe("")
+    expect(stderr).toContain(missing)
+    expect(existsSync(missing)).toBe(false)
+  }, 20_000)
+
+  it("a MIDA_HOME that is a file is refused too — nothing is created or chmodded (F6)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mida-homefile-"))
+    const file = join(dir, "home")
+    writeFileSync(file, "x")
+    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "assistant", "--project", makeProject()], {
+      env: { ...process.env, MIDA_HOME: file },
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    let stderr = ""
+    child.stderr.on("data", (b) => (stderr += b))
+    const code = await new Promise((r) => child.on("exit", r))
+    expect(code).toBe(2)
+    expect(stderr).toContain("is not a folder")
+  }, 20_000)
+
   // the launcher's node fallback only matters when a candidate path exists — /opt/homebrew, /usr/local, ~/.volta
   it.skipIf(
     !["/opt/homebrew/bin/node", "/usr/local/bin/node", join(process.env.HOME ?? "/nonexistent", ".volta/bin/node")].some((c) => existsSync(c)),

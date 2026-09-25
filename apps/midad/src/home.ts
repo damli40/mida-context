@@ -1,6 +1,6 @@
 import {
   chmodSync, closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync,
-  realpathSync, renameSync, rmSync, writeSync,
+  realpathSync, renameSync, rmSync, statSync, writeSync,
 } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
@@ -12,14 +12,39 @@ import { randomBytes } from "node:crypto"
  * would resolve against a different working directory in the CLI, the daemon and the hooks,
  * which is exactly how `init` and the daemon once disagreed about where the home was. A bad
  * value is refused with a plain message, never silently pointed somewhere else.
+ *
+ * `mustExist` is for entry points that must never CREATE the home: the MCP adapter refuses a
+ * mistyped MIDA_HOME rather than let the constructor mkdir/chmod the wrong folder first.
  */
-export function resolveHome(env: { MIDA_HOME?: string | undefined } = process.env): MidaHome {
+export function resolveHome(
+  env: { MIDA_HOME?: string | undefined } = process.env,
+  options: { mustExist?: boolean } = {},
+): MidaHome {
   const root = env.MIDA_HOME
-  if (root === undefined) return new MidaHome()
+  if (root === undefined) {
+    if (options.mustExist === true) assertHomeExists(join(homedir(), ".mida"))
+    return new MidaHome()
+  }
   if (root === "" || !isAbsolute(root)) {
     throw new Error("MIDA_HOME must be an absolute path (or unset for the default ~/.mida)")
   }
+  if (options.mustExist === true) assertHomeExists(root)
   return new MidaHome(root)
+}
+
+/** The stat check mustExist needs — before any mkdir/chmod the constructor would run. */
+function assertHomeExists(root: string): void {
+  let stat
+  try {
+    stat = statSync(root)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      throw new Error(`the Mida home ${root} does not exist — run \`mida init\` first`)
+    }
+    throw new Error(`the Mida home ${root} could not be read (${code ?? "unknown error"})`)
+  }
+  if (!stat.isDirectory()) throw new Error(`the Mida home ${root} is not a folder`)
 }
 
 /** One folder that holds everything Mida keeps on this machine. Secrets in it are readable by the user only. */

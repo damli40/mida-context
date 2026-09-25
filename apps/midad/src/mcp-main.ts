@@ -44,7 +44,17 @@ async function main(): Promise<void> {
     process.exitCode = 2
     return
   }
-  const home = resolveHome(process.env)
+  let home
+  try {
+    // the adapter never creates the home: a mistyped MIDA_HOME is refused before the
+    // MidaHome constructor could mkdir/chmod the wrong folder (F6)
+    home = resolveHome(process.env, { mustExist: true })
+  } catch (error) {
+    const e = error as { message?: unknown }
+    process.stderr.write(`mida-mcp: ${typeof e.message === "string" ? e.message : String(error)}\n`)
+    process.exitCode = 2
+    return
+  }
   const gate = startupCheck(home, parsed.args)
   if (!gate.ok) {
     // before ensureDaemon: a wrong MIDA_HOME must not start a key-less daemon in the wrong home
