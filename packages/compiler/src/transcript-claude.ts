@@ -56,6 +56,18 @@ import {
 
 const THINKING_CHARS = 1_000
 
+// A /compact summary carries its newest state — pending tasks, current work,
+// the next step — at the END, so a one-sided cut kept the stale opening and
+// dropped exactly what the next session needs. Keep both ends: the first
+// 2,000 and the last 4,000 chars joined by a marked gap (~6,050 total, the
+// same ~6 KB the request cap budgets for).
+const SUMMARY_HEAD_CHARS = 2_000
+const SUMMARY_TAIL_CHARS = 4_000
+const cutSummary = (s: string): string =>
+  s.length <= SUMMARY_HEAD_CHARS + SUMMARY_TAIL_CHARS
+    ? s
+    : `${s.slice(0, SUMMARY_HEAD_CHARS)}\n[… middle of the summary cut …]\n${s.slice(-SUMMARY_TAIL_CHARS)}`
+
 export interface Conversation {
   format: "claude-jsonl" | "codex-jsonl" | "unknown-tail"
   text: string // "L<n> <role>:" blocks, ≤ maxChars
@@ -432,7 +444,7 @@ export function readConversation(
   const summaryBlock =
     compactSummary === null
       ? null
-      : `L${compactSummary.label} user — Summary of the earlier session (from /compact):\n${hardCut(scrubSecrets(compactSummary.text), FIRST_USER_CHARS)}`
+      : `L${compactSummary.label} user — Summary of the earlier session (from /compact):\n${cutSummary(scrubSecrets(compactSummary.text))}`
   const fitted = fitMessages(msgs, maxChars, truncated, pinIdx, summaryBlock)
   return {
     format: "claude-jsonl",

@@ -244,6 +244,29 @@ describe("readConversation", () => {
     )
   })
 
+  // L6: the summary's newest state — pending tasks, the next step — sits at
+  // its END, so a head-only cut lost exactly what a resumed session needs.
+  // The cut keeps the first 2,000 and the last 4,000 chars with a marked gap.
+  it("a long summary keeps both its start and its end across the cut (L6)", () => {
+    const dir = tmpdir()
+    const summary =
+      "SUMMARY-OPEN the session began here\n" +
+      "middle ".repeat(2_000) +
+      "\nNEXT-STEP-MARKER wire the drain next"
+    expect(summary.length).toBeGreaterThan(6_000) // genuinely over the cap
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "build the parser" } }),
+      JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: summary } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "continuing" }] } }),
+    ])
+    const r = readConversation(t)
+    expect(r.text).toContain("SUMMARY-OPEN")
+    expect(r.text).toContain("NEXT-STEP-MARKER wire the drain next")
+    expect(r.text).toContain("[… middle of the summary cut …]")
+    // and the cut really happened — the joined head+tail is ~6 KB, not 15
+    expect(r.text).not.toContain("middle ".repeat(1_500))
+  })
+
   // G1 flip-side: built-in commands are never the request, args or not. The
   // real shape puts the caveat and the stdout on their OWN user lines —
   // neighbouring the echo, not inside it — and none of them carry isMeta.
