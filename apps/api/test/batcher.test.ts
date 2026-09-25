@@ -878,36 +878,67 @@ describe("the batcher", () => {
     expect(await rig.journal.list()).toEqual([])
   })
 
-  it("a parented save resubmitted after an ambiguous send is STALE_PARENT — unhealed, logged as batch.stale-after-requeue", async () => {
+  it("a parented save resubmitted after an ambiguous send heals STALE_PARENT — its own earlier copy already anchored", async () => {
     const rig = makeRig()
     // A v1 root and a child signed against it. The contract's rule: a parented save whose lineage
     // head moved is STALE_PARENT, never ALREADY_ANCHORED — even when it is the save's own earlier
-    // copy that moved the head.
+    // copy that moved the head. That copy still holds a valid proof, so the rejection heals the
+    // same way ALREADY_ANCHORED does.
     const root = makeSave()
     const child = makeSave({ parentId: root.meta.contextId, parentVersion: 1, lineageId: root.meta.contextId, rootAuthor: AGENT_ID })
     await rig.enqueue(root.wire, root.meta.contextId)
     await rig.enqueue(child.wire, child.meta.contextId)
+    // The send lands both saves, then its answer is lost AND the index cannot confirm the batch
+    // (failLogs makes the landed-batch probe fail too) — the rows requeue and face the rejections.
     rig.chain.afterRecord = () => {
       throw new Error("the response never arrived")
     }
+    rig.chain.failLogs = true
 
     await rig.batcher.flush()
-    // The batch landed but the batcher saw only a failure — both rows requeued.
     expect(rig.chain.batches.size).toBe(1)
     expect((await rig.store.get(child.meta.contextId))!.state).toBe("QUEUED")
 
     rig.chain.afterRecord = null
+    rig.chain.failLogs = false
     await rig.batcher.flush()
-    // The resubmission lands under a fresh batchId: the root is ALREADY_ANCHORED and heals onto the
-    // first batch's proof; the child is STALE_PARENT — nothing heals it, and the log names the row.
+    // The resubmission lands under a fresh batchId: the root is ALREADY_ANCHORED and the child is
+    // STALE_PARENT — both heal onto the first batch, which holds the real proofs.
     expect(rig.chain.submissions).toHaveLength(2)
-    const rootRow = (await rig.store.get(root.meta.contextId))!
-    expect(rootRow).toMatchObject({ state: "ANCHORED", batchId: rig.chain.submissions[0]!.batchId.toLowerCase() })
-    expect((await rig.store.get(child.meta.contextId))!).toMatchObject({ state: "REJECTED", reason: "STALE_PARENT" })
-    expect(rig.events.find((entry) => entry["event"] === "batch.stale-after-requeue")).toMatchObject({
+    const firstBatchId = rig.chain.submissions[0]!.batchId.toLowerCase()
+    const earlier = await rig.chain.batchOf(firstBatchId as Hex)
+    for (const [position, save] of [root, child].entries()) {
+      const row = (await rig.store.get(save.meta.contextId))!
+      expect(row).toMatchObject({ state: "ANCHORED", batchId: firstBatchId, position })
+      expect(verifyMerkleProof(leafOf(save.meta), row.proof!, earlier.root)).toBe(true)
+    }
+    expect(rig.events.some((entry) => entry["event"] === "batch.stale-parent")).toBe(false)
+    expect(rig.events.some((entry) => entry["event"] === "batch.stale-after-requeue")).toBe(false)
+    expect(await rig.journal.list()).toEqual([])
+  })
+
+  it("a parented save that truly lost its lineage stays REJECTED STALE_PARENT — no earlier anchoring exists to heal it", async () => {
+    const rig = makeRig()
+    const root = makeSave()
+    const childA = makeSave({ parentId: root.meta.contextId, parentVersion: 1, lineageId: root.meta.contextId, rootAuthor: AGENT_ID })
+    const childB = makeSave({ parentId: root.meta.contextId, parentVersion: 1, lineageId: root.meta.contextId, rootAuthor: AGENT_ID })
+    await rig.enqueue(root.wire, root.meta.contextId)
+    await rig.enqueue(childA.wire, childA.meta.contextId)
+    await rig.batcher.flush()
+
+    // childB signed the same parent — but childA already moved the lineage head, and childB never
+    // anchored anywhere: the historical scan finds nothing, the rejection stands, and the log
+    // names the row.
+    rig.setNow(1_000)
+    await rig.enqueue(childB.wire, childB.meta.contextId)
+    await rig.batcher.flush()
+
+    expect((await rig.store.get(childB.meta.contextId))!).toMatchObject({ state: "REJECTED", reason: "STALE_PARENT" })
+    expect(rig.events.find((entry) => entry["event"] === "batch.stale-parent")).toMatchObject({
       batchId: rig.chain.submissions[1]!.batchId,
-      contextId: child.meta.contextId,
+      contextId: childB.meta.contextId,
     })
+    expect(rig.chain.anchoringScans).toBeGreaterThan(0) // the heal scan ran — and found nothing
   })
 
   it("a batch whose rows all come back ALREADY_ANCHORED heals them with ONE historical scan, not one per row", async () => {

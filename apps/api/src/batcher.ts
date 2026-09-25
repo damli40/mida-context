@@ -455,10 +455,9 @@ export class Batcher {
         return null
       }
       // The send failed ambiguously — the tx may or may not land. Requeue wholesale; if it did land,
-      // the next batch's ALREADY_ANCHORED rejects heal the PARENT-LESS rows through findAnchorings.
-      // A parented save resubmitted after its first copy landed comes back STALE_PARENT instead —
-      // the lineage head moved to that very copy — and nothing heals it; the rejection loop below
-      // logs that case as batch.stale-after-requeue.
+      // the next batch's ALREADY_ANCHORED and STALE_PARENT rejects heal the rows through
+      // findAnchorings — a parented save resubmitted after its first copy landed comes back
+      // STALE_PARENT (the lineage head moved to that very copy) and heals the same way.
       const requeued = await this.#store.requeue(batchId)
       this.#submitted.delete(batchId.toLowerCase())
       await this.#journal?.clear(batchId)
@@ -586,10 +585,14 @@ export class Batcher {
       })
     }
     let unmapped = 0
-    // Every ALREADY_ANCHORED row is found in ONE historical scan for the whole batch — the per-row
-    // alternative paid a full deploy-block-to-head log scan for each rejected row.
+    // Both resubmission rejections heal the same way: ALREADY_ANCHORED (a parent-less save whose
+    // lineage already has a head) and STALE_PARENT (a parented save whose own earlier copy moved
+    // the head) both mean a proof for this contextId may already exist on chain. ONE historical
+    // scan covers the whole batch's healable rejects — the per-row alternative paid a full log
+    // scan for each rejected row.
+    const healable = new Set<number>([BATCH_REJECT.ALREADY_ANCHORED, BATCH_REJECT.STALE_PARENT])
     const needsHeal = rejected
-      .filter((rejection) => rejection.reason === BATCH_REJECT.ALREADY_ANCHORED)
+      .filter((rejection) => healable.has(rejection.reason))
       .map((rejection) => order[rejection.index])
       .filter((contextId): contextId is Hex => contextId !== undefined)
     const anchorings = needsHeal.length === 0 ? new Map<string, Hex>() : await this.#chain.findAnchorings(needsHeal)
@@ -599,16 +602,17 @@ export class Batcher {
         unmapped += 1
         continue
       }
-      if (rejection.reason === BATCH_REJECT.ALREADY_ANCHORED) {
+      if (healable.has(rejection.reason)) {
         const healed = await this.#anchorFromEarlierBatch(batchId, contextId, anchoredAt, anchorings)
-        if (!healed) await this.#store.markRejected(contextId, rejectName(rejection.reason))
-      } else {
-        if (rejection.reason === BATCH_REJECT.STALE_PARENT) {
-          // A parented save whose lineage head moved before it landed has no heal — ALREADY_ANCHORED's
-          // earlier-batch proof only exists for a parent-less save whose own contextId anchored. The
-          // row is REJECTED; the event keeps this known unhealed case visible rather than silent.
-          this.#log?.({ event: "batch.stale-after-requeue", batchId, contextId })
+        if (!healed) {
+          // A STALE_PARENT no historical anchoring heals is a real lineage conflict — the only
+          // case the row stays REJECTED, so it is the only case the log names.
+          if (rejection.reason === BATCH_REJECT.STALE_PARENT) {
+            this.#log?.({ event: "batch.stale-parent", batchId, contextId })
+          }
+          await this.#store.markRejected(contextId, rejectName(rejection.reason))
         }
+      } else {
         await this.#store.markRejected(contextId, rejectName(rejection.reason))
       }
     }
@@ -623,8 +627,9 @@ export class Batcher {
   }
 
   /**
-   * A save the contract rejected as ALREADY_ANCHORED is not dead — an earlier batch holds its real
-   * proof. Rebuild that batch's leaves under the same root-equality rule and anchor the row there.
+   * A save the contract rejected as ALREADY_ANCHORED or STALE_PARENT is not dead — an earlier batch
+   * may hold its real proof (the resubmitted copy of a send that already landed). Rebuild that
+   * batch's leaves under the same root-equality rule and anchor the row there.
    */
   async #anchorFromEarlierBatch(batchId: Hex, contextId: Hex, anchoredAt: number, anchorings: Map<string, Hex>): Promise<boolean> {
     const earlier = anchorings.get(contextId.toLowerCase())
