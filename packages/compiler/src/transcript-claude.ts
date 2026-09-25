@@ -295,7 +295,17 @@ function renderMessage(label: string, obj: TranscriptLine): string | null {
 
 export function readConversation(
   transcriptPath: string,
-  options: { maxChars?: number } = {},
+  options: {
+    maxChars?: number
+    /**
+     * The earlier checkpoint's originalRequest, already re-checked for
+     * scaffolding by the caller. When this file opened on scaffolding — or
+     * pinned no request of its own — its own firstUserMessage is a
+     * continuation line, so the kept request heads the render instead and the
+     * file's pick competes for the tail like any other message (M1).
+     */
+    preferRequest?: string | null
+  } = {},
 ): Conversation {
   const { maxChars = 40_000 } = options
 
@@ -421,11 +431,23 @@ export function readConversation(
     }
   }
 
+  // The kept earlier request rendered as the head block — it is not a line in
+  // this file, so its heading names it instead of an L<n> label. The same
+  // keep-over-continuation rule compile.ts uses for the saved field decides
+  // here: the kept request heads the render only when the file opened on
+  // scaffolding or pinned no request at all.
+  const keptHead =
+    options.preferRequest !== undefined &&
+    options.preferRequest !== null &&
+    (openedWithScaffolding || firstUserMessage === null)
+      ? `user — original request (kept from the earlier checkpoint):\n${hardCut(scrubSecrets(options.preferRequest), FIRST_USER_CHARS)}`
+      : null
+
   if (messagesTotal === 0) {
     const tailText = (tailWindow ?? headWindow.subarray(Math.max(0, headWindow.length - TAIL_BYTES))).toString("utf8")
     return {
       format: "unknown-tail",
-      text: scrubTranscript(tailText),
+      text: keptHead === null ? scrubTranscript(tailText) : `${keptHead}\n\n${scrubTranscript(tailText)}`,
       firstUserMessage: null,
       openedWithScaffolding: false,
       cwds,
@@ -460,7 +482,7 @@ export function readConversation(
     compactSummary === null
       ? null
       : `L${compactSummary.label} user — Summary of the earlier session (from /compact):\n${cutSummary(scrubSecrets(compactSummary.text))}`
-  const fitted = fitMessages(msgs, maxChars, truncated, pinIdx, summaryBlock)
+  const fitted = fitMessages(msgs, maxChars, truncated, keptHead === null ? pinIdx : undefined, summaryBlock, keptHead)
   return {
     format: "claude-jsonl",
     text: fitted.text,

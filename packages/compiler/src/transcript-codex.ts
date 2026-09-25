@@ -148,7 +148,18 @@ function outputText(output: unknown): string {
 
 export function readCodexConversation(
   transcriptPath: string,
-  options: { maxChars?: number } = {},
+  options: {
+    maxChars?: number
+    /**
+     * The earlier checkpoint's originalRequest, already re-checked for
+     * scaffolding by the caller. When this rollout opened on injected
+     * scaffolding — or pinned no request of its own — its own
+     * firstUserMessage is a continuation line, so the kept request heads the
+     * render instead and the file's pick competes for the tail like any
+     * other message (M1).
+     */
+    preferRequest?: string | null
+  } = {},
 ): Conversation {
   const { maxChars = 40_000 } = options
   const { lines, truncated, head: headWindow, tail: tailWindow } = readTranscriptLines(transcriptPath)
@@ -234,11 +245,23 @@ export function readCodexConversation(
     // other payload type are bookkeeping — skipped.
   }
 
+  // The kept earlier request rendered as the head block — it is not a line in
+  // this file, so its heading names it instead of an L<n> label. The same
+  // keep-over-continuation rule compile.ts uses for the saved field decides
+  // here: the kept request heads the render only when the file opened on
+  // scaffolding or pinned no request at all.
+  const keptHead =
+    options.preferRequest !== undefined &&
+    options.preferRequest !== null &&
+    (openedWithScaffolding || firstUserMessage === null)
+      ? `user — original request (kept from the earlier checkpoint):\n${hardCut(scrubSecrets(options.preferRequest), FIRST_USER_CHARS)}`
+      : null
+
   if (messagesTotal === 0) {
     const tailText = (tailWindow ?? headWindow.subarray(Math.max(0, headWindow.length - TAIL_BYTES))).toString("utf8")
     return {
       format: "unknown-tail",
-      text: scrubTranscript(tailText),
+      text: keptHead === null ? scrubTranscript(tailText) : `${keptHead}\n\n${scrubTranscript(tailText)}`,
       firstUserMessage: null,
       openedWithScaffolding: false,
       cwds,
@@ -248,7 +271,7 @@ export function readCodexConversation(
     }
   }
 
-  const fitted = fitMessages(msgs, maxChars, truncated, pinIdx)
+  const fitted = fitMessages(msgs, maxChars, truncated, keptHead === null ? pinIdx : undefined, null, keptHead)
   return {
     format: "codex-jsonl",
     text: fitted.text,
@@ -264,9 +287,16 @@ export function readCodexConversation(
 /**
  * The reader a job's transcript needs, chosen by the agent that wrote it.
  * An agent with no reader answers null — the caller refuses, never guesses.
+ * `preferRequest` is the earlier checkpoint's kept originalRequest — the
+ * reader renders it as the head block when the file's own pick is a
+ * continuation, so the prompt's "first block" claim is true (M1).
  */
-export function readTranscriptFor(agent: string, path: string): Conversation | null {
-  if (agent === "codex") return readCodexConversation(path)
-  if (agent === "claude-code") return readConversation(path)
+export function readTranscriptFor(
+  agent: string,
+  path: string,
+  options: { maxChars?: number; preferRequest?: string | null } = {},
+): Conversation | null {
+  if (agent === "codex") return readCodexConversation(path, options)
+  if (agent === "claude-code") return readConversation(path, options)
   return null
 }

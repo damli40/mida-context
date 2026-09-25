@@ -343,27 +343,31 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
   const now = input.now ?? (() => new Date())
   const sleep = input.sleep ?? defaultSleep
 
+  // A saved earlier request rides into the read so the READER can render it as
+  // the first block when the file's own pick is a continuation — the prompt
+  // calls the first block "the user's original request", so the request it
+  // names must actually sit there (M1). The kept value is itself re-checked
+  // with the reader's scaffolding test first: a .last.json saved before the
+  // test existed can hold caveat or command-echo text, and keeping it would
+  // lock the bad pick into every later save (L3).
+  const earlier = input.previous?.originalRequest
+  const kept = typeof earlier === "string" && stripLeadingScaffolds(earlier) !== "" ? earlier : null
   // The reader matches the agent that wrote the transcript. The drain refuses agents with
   // no reader before this is ever called; a direct caller naming one is refused here too —
   // never quietly parsed through another agent's format. The code is the drain's own
   // permanent "unknown-transcript-format" reason, so a thrown refusal maps to it.
-  const convo = readTranscriptFor(input.agent, input.transcriptPath)
+  const convo = readTranscriptFor(input.agent, input.transcriptPath, { preferRequest: kept })
   if (convo === null) {
     const error = new Error(`no transcript reader for agent "${input.agent}"`) as Error & { code: string }
     error.code = "unknown-transcript-format"
     throw error
   }
-  // The request this compile pins, decided once so the prompt wording and the
-  // saved field can never disagree. A transcript that opened on scaffolding
-  // (post-compact, a /clear, a resumed tool_result) yields a CONTINUATION line,
-  // not the session's ask — a kept earlier request beats it. That kept value is
-  // itself re-checked with the reader's scaffolding test: a .last.json saved
-  // before the test existed can hold caveat or command-echo text, and keeping
-  // it would lock the bad pick into every later save (L3). With no earlier
-  // request the continuation pick is still the best verbatim record — it lands
-  // rather than null.
-  const earlier = input.previous?.originalRequest
-  const kept = typeof earlier === "string" && stripLeadingScaffolds(earlier) !== "" ? earlier : null
+  // The request this compile pins, decided once so the prompt wording, the
+  // rendered first block and the saved field can never disagree. A transcript
+  // that opened on scaffolding (post-compact, a /clear, a resumed tool_result)
+  // yields a CONTINUATION line, not the session's ask — a kept earlier request
+  // beats it. With no earlier request the continuation pick is still the best
+  // verbatim record — it lands rather than null.
   const fresh = convo.openedWithScaffolding ? null : convo.firstUserMessage
   const pinnedRequest = fresh ?? kept ?? convo.firstUserMessage
 

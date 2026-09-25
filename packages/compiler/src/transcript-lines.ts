@@ -171,6 +171,12 @@ export function lastCompactSummaryLine(path: string): { label: string; text: str
  * the /compact session summary. It sits right after the pinned request and
  * before the omitted marker, costs its length out of the budget, and the
  * newest-first fill never touches it.
+ *
+ * `leadPinned` is a rendered head block that is NOT a line in this file —
+ * the earlier checkpoint's kept originalRequest (M1). It takes the head
+ * slot whole (the caller already capped it), and the file's own pinIdx
+ * pick is then an ordinary message that competes for the tail like every
+ * other, never silently dropped.
  */
 export function fitMessages(
   msgs: { role: string; block: string }[],
@@ -178,10 +184,12 @@ export function fitMessages(
   truncated: boolean,
   pinIdx?: number,
   extraPinned?: string | null,
+  leadPinned?: string | null,
 ): { text: string; messagesKept: number; omitted: number } {
-  const pin = pinIdx !== undefined && pinIdx >= 0 && pinIdx < msgs.length ? pinIdx : -1
+  const lead = leadPinned ?? null
+  const pin = lead === null && pinIdx !== undefined && pinIdx >= 0 && pinIdx < msgs.length ? pinIdx : -1
   const headCap = Math.min(FIRST_USER_CHARS, Math.max(0, maxChars - 200))
-  const head = pin >= 0 ? cut(msgs[pin]!.block, headCap) : null
+  const head = lead ?? (pin >= 0 ? cut(msgs[pin]!.block, headCap) : null)
   const rest = msgs.filter((_, i) => i !== pin)
 
   const budget = Math.max(
