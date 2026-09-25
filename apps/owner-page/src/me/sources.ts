@@ -101,6 +101,11 @@ export const COUNTS_QUERY = `query MeCounts($owner: String!) {
 
 /** The exact banner a truncated store list earns — pinned by the plan. */
 export const PARTIAL_LIST_TEXT = "list incomplete — the store ran out of chain reads; reload"
+/**
+ * The exact wording when no agent source answered — the index failed and the bounded chain-log
+ * scan failed or ran out of time. Pinned by the plan; the page shows it in place of the count.
+ */
+export const AGENT_LIST_UNAVAILABLE = "Agent list unavailable — the index is down and the chain scan did not finish"
 /** The exact agent-state wording for a store deny — pinned by the plan, rendered by the page. */
 export const BLOCKED_AT_STORE_TEXT = "blocked at the store · revoke pending on Monad"
 
@@ -176,6 +181,8 @@ export interface MeData {
   agents: AgentRow[]
   records: RecordRow[]
   incomplete: string[]
+  /** True when no agent source answered — the agents list is absent, not empty. */
+  agentsUnavailable: boolean
   source: "index" | "chain-logs"
   lag: { text: string; stale: boolean }
   batchingOn: boolean | null
@@ -460,6 +467,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
   const signerToAgent = new Map<string, Hex>()
   const indexRecords = new Map<string, IndexRecord>()
   let source: MeData["source"] = "index"
+  let agentsUnavailable = false
   // The lag is the index's own progress report (`_meta`), in blocks — null when the index
   // answered but could not say how fresh it is.
   let indexLag: number | null = null
@@ -531,6 +539,8 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
   if (source === "chain-logs") {
     const logs = await safe(() => ports.chain.ownerGrantLogs(owner))
     if (logs === null) {
+      // No agent source answered — the page must say the list is missing, never "no agents".
+      agentsUnavailable = true
       note("the grant log scan failed — the agent list may be incomplete")
     } else {
       const byCapability = new Map<string, GrantSeed>()
@@ -841,5 +851,5 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
         ? { text: "index unavailable", stale: true }
         : lagText(indexLag)
 
-  return { owner, agents: agentList, records, incomplete, source, lag, batchingOn, counts }
+  return { owner, agents: agentList, records, incomplete, agentsUnavailable, source, lag, batchingOn, counts }
 }

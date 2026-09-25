@@ -190,6 +190,7 @@ function data(over: Partial<MeData> = {}): MeData {
     agents: [agent()],
     records: [record()],
     incomplete: [],
+    agentsUnavailable: false,
     source: "index",
     lag: { text: "9 s behind Monad", stale: false },
     batchingOn: true,
@@ -275,6 +276,19 @@ describe("renderMe", () => {
     expect(row!.textContent).toContain(BLOCKED_AT_STORE_TEXT)
     // and it must never be described as able to read
     expect(row!.textContent).not.toContain("Can read")
+  })
+
+  it("a failed agent load reads 'Agent list unavailable' — never '0 agents' or 'none granted'", () => {
+    const root = renderMe(
+      data({ agents: [], agentsUnavailable: true, counts: null }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    const unavailable = "Agent list unavailable — the index is down and the chain scan did not finish"
+    // once on the summary tile in place of the count, once where the list would be
+    const hits = all(root, ".agent-meta").concat(all(root, ".n")).filter((el) => el.textContent.includes(unavailable))
+    expect(hits.length).toBeGreaterThanOrEqual(2)
+    expect(root.textContent).not.toContain("0 agents can read")
+    expect(root.textContent).not.toContain("No agents have been granted access")
   })
 
   it("shows the newest 20 records and pages the rest with 'Show 20 more'", () => {

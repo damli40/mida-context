@@ -290,6 +290,7 @@ function meData(over: Partial<MeData> = {}): MeData {
     agents: [agentRow()],
     records: [],
     incomplete: [],
+    agentsUnavailable: false,
     source: "index",
     lag: { text: "9 s behind Monad", stale: false },
     batchingOn: true,

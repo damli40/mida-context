@@ -30,7 +30,8 @@ import type { OwnerLinkResult as FlowResult } from "@mida/protocol"
 import { chipsFor, isTxHash, provenanceBadge } from "./model.js"
 import type { Badge } from "./model.js"
 import { revokeFromMe } from "./revoke.js"
-import { BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
+import { boundedScanClient, scanWithDeadline } from "./logscan.js"
+import { AGENT_LIST_UNAVAILABLE, BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
 import type { AgentRow, GrantLog, MeData, MePorts, RecordRow } from "./sources.js"
 import { signIn } from "./session.js"
 import type { MeSession } from "./session.js"
@@ -140,9 +141,15 @@ function renderSummary(doc: Document, data: MeData): HTMLElement {
       (a.revokedTx !== null || (a.grants.length > 0 && a.grants.every((g) => g.status.label === "Revoked"))),
   ).length
   const lead = elOf(doc, "div", "tile tile-lead")
-  const headline = `${live} agent${live === 1 ? "" : "s"} can read your context right now.`
-  lead.appendChild(elOf(doc, "p", "n", revoked === 0 ? headline : `${headline} ${revoked} was revoked.`))
-  lead.appendChild(elOf(doc, "p", "l", "Revoking stops future reads. It cannot recall what an agent already read."))
+  if (data.agentsUnavailable) {
+    // No agent source answered — a count would invent certainty the page does not have.
+    lead.appendChild(elOf(doc, "p", "n", AGENT_LIST_UNAVAILABLE))
+    lead.appendChild(elOf(doc, "p", "l", "The agent list could not be loaded at all."))
+  } else {
+    const headline = `${live} agent${live === 1 ? "" : "s"} can read your context right now.`
+    lead.appendChild(elOf(doc, "p", "n", revoked === 0 ? headline : `${headline} ${revoked} was revoked.`))
+    lead.appendChild(elOf(doc, "p", "l", "Revoking stops future reads. It cannot recall what an agent already read."))
+  }
   bento.appendChild(lead)
   // The three figures are the index's totals — absent entirely when the index could not vouch
   // for them or a store list came back partial (the banner says why).
@@ -278,6 +285,10 @@ function renderAgents(doc: Document, data: MeData): HTMLElement {
   agentsTitle.setAttribute("id", "agents-title")
   head.appendChild(agentsTitle)
   head.appendChild(elOf(doc, "p", "sec-note", "Access is enforced by the contract on Monad, not by this page."))
+  if (data.agentsUnavailable) {
+    sec.appendChild(elOf(doc, "p", "agent-meta", AGENT_LIST_UNAVAILABLE))
+    return sec
+  }
   if (data.agents.length === 0) {
     sec.appendChild(elOf(doc, "p", "agent-meta", "No agents have been granted access yet."))
     return sec
@@ -531,9 +542,13 @@ const AGENT_REVOKED = capabilityRegistryAbi.find(
  * live until the contract read caught it.
  */
 async function ownerGrantLogs(context: ChainContext, owner: Address): Promise<GrantLog[]> {
+  // The index-down path is bounded: at most LOG_SCAN_IN_FLIGHT requests in the air across all
+  // three event scans, and the whole scan abandoned at LOG_SCAN_TIMEOUT_MS — past it, the
+  // page reports the agent list unavailable rather than hanging on the RPC.
+  const client = boundedScanClient(context.publicClient)
   const scan = (event: AbiEvent) =>
     getLogsChunked(
-      context.publicClient,
+      client,
       {
         address: context.deployment.capabilityRegistry,
         event,
@@ -542,11 +557,9 @@ async function ownerGrantLogs(context: ChainContext, owner: Address): Promise<Gr
       },
       {},
     )
-  const [granted, capabilityRevokes, agentRevokes] = await Promise.all([
-    scan(CAPABILITY_GRANTED),
-    scan(CAPABILITY_REVOKED),
-    scan(AGENT_REVOKED),
-  ])
+  const [granted, capabilityRevokes, agentRevokes] = await scanWithDeadline(
+    Promise.all([scan(CAPABILITY_GRANTED), scan(CAPABILITY_REVOKED), scan(AGENT_REVOKED)]),
+  )
   const out: GrantLog[] = []
   const hex = (value: unknown): Hex | null => (typeof value === "string" && value.startsWith("0x") ? (value.toLowerCase() as Hex) : null)
   for (const log of granted) {

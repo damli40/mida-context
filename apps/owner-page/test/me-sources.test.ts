@@ -475,6 +475,39 @@ describe("the index queries are Hasura-shaped", () => {
   })
 })
 
+describe("loadMe — the agent list can be missing, not just empty", () => {
+  it("index down AND the log scan failed → agentsUnavailable, never an empty-list fiction", async () => {
+    const { state, ports } = world()
+    state.indexFails = true
+    state.grantLogsError = new Error("rpc down")
+    const data = await loadMe(OWNER, ports)
+    expect(data.agentsUnavailable).toBe(true)
+    expect(data.agents).toEqual([])
+    expect(data.source).toBe("chain-logs")
+  })
+
+  it("index absent AND the log scan failed → still unavailable", async () => {
+    const { state, ports } = world()
+    state.grantLogsError = new Error("rpc down")
+    ports.index = null // indexUrl unset — nothing configured to query
+    const data = await loadMe(OWNER, ports)
+    expect(data.agentsUnavailable).toBe(true)
+    expect(data.lag.text).toBe("index not configured")
+  })
+
+  it("a capability whose chain check threw stays in the list as Unverified — never dropped", async () => {
+    const { ports } = world()
+    ports.chain.isCapabilityValid = () => Promise.reject(new Error("rpc down"))
+    const data = await loadMe(OWNER, ports)
+    const agent = data.agents.find((a) => a.agentId === AGENT_ID)
+    expect(agent).toBeDefined()
+    expect(agent!.grants[0]!.status.label).toBe("Unverified")
+    // and it cannot count as able to read
+    expect(agent!.readLive).toBe(false)
+    expect(data.agentsUnavailable).toBe(false)
+  })
+})
+
 describe("loadMe — chain-log fallback and names", () => {
   it("when the index is down, agents come from ownerGrantLogs", async () => {
     const { state, ports } = world()
