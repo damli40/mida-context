@@ -60,8 +60,9 @@ export function recordedCodexHome(home: MidaHome): string | undefined {
 }
 
 /**
- * Removes the recorded Codex home — `mida uninstall codex` calls it: with Mida's block gone
- * from the config, no Codex home is trusted for transcripts until an install records one again.
+ * Removes the recorded Codex home — `mida uninstall codex` calls it once the managed block is
+ * gone from the recorded home's config. What is trusted for transcripts afterwards is the
+ * default again — `<homeDir>/.codex/sessions`, the same root a home that never recorded uses.
  */
 export function clearCodexHome(home: MidaHome): void {
   home.remove("codex-home")

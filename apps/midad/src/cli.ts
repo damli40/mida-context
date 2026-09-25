@@ -1297,7 +1297,15 @@ export function runInstall(
       return 1
     }
   }
-  const settingsPath = tool === "claude-code" ? deps.claudeSettings : deps.codexConfig
+  // uninstall codex edits the config under the Codex home install RECORDED — the shell's
+  // CODEX_HOME may be a different folder entirely by now, and editing that would report
+  // "not installed" while the managed block stays in place and the record clears anyway.
+  const settingsPath =
+    tool === "claude-code"
+      ? deps.claudeSettings
+      : argv[0] === "uninstall" && recordedCodexHome(deps.home) !== undefined
+        ? join(recordedCodexHome(deps.home)!, "config.toml")
+        : deps.codexConfig
   try {
     const outcome =
       argv[0] === "install"
@@ -1321,8 +1329,8 @@ export function runInstall(
       if (outcome === "installed") deps.print(CODEX_TRUST_SENTENCE)
     }
     if (argv[0] === "uninstall" && tool === "codex") {
-      // with the managed block gone no Codex home is trusted for transcripts — the record
-      // clears whatever the shell's CODEX_HOME happens to say now
+      // the record clears only after the edit under the recorded home ran — a refused config
+      // keeps it, because the trust the record describes was never lifted
       clearCodexHome(deps.home)
     }
     return 0

@@ -21,18 +21,17 @@ const KICK_TIMEOUT_MS = 150
  * The transcript roots each agent is trusted under, as absolute paths. `claude-code` sessions live
  * at `<homeDir>/.claude/projects/`; Codex writes session rollouts at
  * `<CODEX_HOME>/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl` — verified against the throwaway
- * CODEX_HOME the spike harness runs — so `codex` trusts `<homeDir>/.codex/sessions` plus the
- * `sessions/` folder under the Codex home `mida install codex` recorded in the Mida home (the
- * hook and the drain never see Codex's own environment). An agent with no roots has no trusted
- * transcript folder at all and is refused outright.
+ * CODEX_HOME the spike harness runs — so `codex` trusts the `sessions/` folder under the Codex
+ * home `mida install codex` recorded in the Mida home, or `<homeDir>/.codex/sessions` while
+ * nothing is recorded. The record REPLACES the default rather than adding to it: trusting both
+ * would keep reading rollouts under a home the install's own "moved" message says is no longer
+ * trusted. An agent with no roots has no trusted transcript folder at all and is refused outright.
  */
 export function transcriptRoots(agent: string, homeDir: string, home?: MidaHome): string[] {
   if (agent === "claude-code") return [join(homeDir, ".claude", "projects")]
   if (agent === "codex") {
-    const roots = [join(homeDir, ".codex", "sessions")]
     const recorded = home === undefined ? undefined : recordedCodexHome(home)
-    if (recorded !== undefined) roots.push(join(recorded, "sessions"))
-    return roots
+    return [join(recorded ?? join(homeDir, ".codex"), "sessions")]
   }
   return []
 }

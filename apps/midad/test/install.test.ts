@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { basename, isAbsolute, join } from "node:path"
+import { basename, dirname, isAbsolute, join } from "node:path"
 import {
   CODEX_BLOCK,
   CODEX_BLOCK_V1,
@@ -22,6 +22,7 @@ import {
   recordCodexHome,
   recordedCodexHome,
   runInstall,
+  transcriptPathAllowed,
   uninstallClaudeCode,
   uninstallCodex,
   uninstallMcpClient,
@@ -395,6 +396,53 @@ describe("mida install codex", () => {
     expect(runCodexInstall(["uninstall", "codex"], codexHome, midaHome, lines)).toBe(0)
     expect(recordedCodexHome(midaHome)).toBeUndefined()
     expect(midaHome.has("codex-home")).toBe(false)
+  })
+
+  it("uninstall codex edits the config under the RECORDED home, not the shell's CODEX_HOME (G7)", () => {
+    const homeA = mkdtempSync(join(tmpdir(), "mida-codex-a-"))
+    const homeB = mkdtempSync(join(tmpdir(), "mida-codex-b-"))
+    const midaHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-home-")))
+    const lines: string[] = []
+    expect(runCodexInstall(["install", "codex"], homeA, midaHome, lines)).toBe(0)
+    expect(recordedCodexHome(midaHome)).toBe(homeA)
+    lines.length = 0
+    // the shell's CODEX_HOME is a different folder by uninstall time — the managed block lives
+    // under homeA, so that is the config edited, and only after the edit does the record clear
+    expect(runCodexInstall(["uninstall", "codex"], homeB, midaHome, lines)).toBe(0)
+    expect(lines).toContain("uninstalled")
+    expect(readFileSync(join(homeA, "config.toml"), "utf8")).not.toContain("mida hooks")
+    expect(recordedCodexHome(midaHome)).toBeUndefined()
+  })
+
+  it("a codex uninstall that refuses the recorded config keeps the record (G7)", () => {
+    const homeA = mkdtempSync(join(tmpdir(), "mida-codex-a-"))
+    const homeB = mkdtempSync(join(tmpdir(), "mida-codex-b-"))
+    const midaHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-home-")))
+    // markers without a valid close are a tampered block — the edit under homeA is refused,
+    // and the record must survive it: the trust it describes was never lifted
+    writeFileSync(join(homeA, "config.toml"), `${CODEX_BLOCK_V1.slice(0, -12)}\n`)
+    recordCodexHome(midaHome, homeA)
+    const lines: string[] = []
+    expect(runCodexInstall(["uninstall", "codex"], homeB, midaHome, lines)).toBe(1)
+    expect(lines.some((line) => line.includes("refused"))).toBe(true)
+    expect(recordedCodexHome(midaHome)).toBe(homeA)
+  })
+
+  it("the move line is true — the old Codex home really stops being trusted (G7)", () => {
+    const userHome = mkdtempSync(join(tmpdir(), "mida-user-"))
+    const defaultCodex = join(userHome, ".codex")
+    const homeB = mkdtempSync(join(tmpdir(), "mida-codex-b-"))
+    const midaHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-home-")))
+    // as an install under the default home recorded it
+    recordCodexHome(midaHome, defaultCodex)
+    const rollout = join(defaultCodex, "sessions", "2026", "09", "25", "rollout-x.jsonl")
+    mkdirSync(dirname(rollout), { recursive: true })
+    writeFileSync(rollout, "{}\n")
+    expect(transcriptPathAllowed(rollout, "codex", userHome, midaHome)).toBe(true)
+    const lines: string[] = []
+    expect(runCodexInstall(["install", "codex"], homeB, midaHome, lines)).toBe(0)
+    expect(lines.some((line) => line.includes(defaultCodex) && line.includes("no longer trusted"))).toBe(true)
+    expect(transcriptPathAllowed(rollout, "codex", userHome, midaHome)).toBe(false)
   })
 
   it("the managed block carries the whats-new hook on the same inject command, absolutely (R5-7)", () => {
