@@ -3,8 +3,12 @@
 // whole. A transcript no bigger than HEAD_BYTES + TAIL_BYTES is read in one
 // shot; a bigger one gets the first HEAD_BYTES (the original request lives at
 // the top) and the last TAIL_BYTES (the newest messages live at the bottom),
-// and the middle is never touched — messagesTotal and cwds then count only
-// the lines that were read.
+// and only the windowed lines are parsed — messagesTotal and cwds then count
+// only the lines that were read. A truncated file still gets ONE streamed
+// pass over the middle (lastCompactSummaryLine below — bounded chunks, the
+// line under construction dropped past a cap) to find the last /compact
+// summary wherever it sits; the middle is never held in memory or read as
+// conversation.
 //
 // Also shared here: the small render helpers both readers use — cut/hardCut,
 // the part/first-message caps, and the budgeted pin-first-user assembly that

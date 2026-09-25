@@ -38,9 +38,12 @@
 // transcript-lines.ts). A transcript no bigger than HEAD_BYTES + TAIL_BYTES
 // is read in one shot — byte-for-byte the old behaviour. A bigger one gets
 // the first HEAD_BYTES (the original request lives at the top) and the last
-// TAIL_BYTES (the newest messages live at the bottom), and the middle is
-// never touched: messagesTotal and cwds then count only the lines that were
-// read.
+// TAIL_BYTES (the newest messages live at the bottom); only the windowed
+// lines are parsed, so messagesTotal and cwds then count only the lines that
+// were read. A truncated file still gets one streamed pass over the middle —
+// lastCompactSummaryLine, bounded chunks — to find the last /compact summary
+// wherever it sits; the middle is never held in memory or read as
+// conversation.
 
 import { scrubSecrets, scrubTranscript, scrubValue } from "./scrub.js"
 import {
