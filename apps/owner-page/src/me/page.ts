@@ -149,7 +149,13 @@ function renderSummary(doc: Document, data: MeData): HTMLElement {
     lead.appendChild(elOf(doc, "p", "n", AGENT_LIST_UNAVAILABLE))
     lead.appendChild(elOf(doc, "p", "l", "The agent list could not be loaded at all."))
   } else {
-    const headline = `${live} agent${live === 1 ? "" : "s"} can read your context right now.`
+    // Agents whose chain check could not run are not "0 can read" — count them as unchecked so
+    // the headline never rounds an unknown down to a negative.
+    const unchecked = data.agents.filter((a) => a.unverified).length
+    const headline =
+      unchecked > 0
+        ? `${live} agent${live === 1 ? "" : "s"} · ${unchecked} could not be checked just now`
+        : `${live} agent${live === 1 ? "" : "s"} can read your context right now.`
     lead.appendChild(elOf(doc, "p", "n", revoked === 0 ? headline : `${headline} ${revoked} was revoked.`))
     lead.appendChild(elOf(doc, "p", "l", "Revoking stops future reads. It cannot recall what an agent already read."))
   }

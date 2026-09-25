@@ -290,6 +290,7 @@ function agentRow(over: Partial<AgentRow> = {}): AgentRow {
     revokedTx: null,
     blockedAtStore: false,
     readLive: true,
+    unverified: false,
     ...over,
   }
 }

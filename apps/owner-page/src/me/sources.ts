@@ -158,6 +158,11 @@ export interface AgentRow {
   revokedTx: Hex | null
   blockedAtStore: boolean
   readLive: boolean
+  /**
+   * At least one grant's chain check could not run — the agent is not known-live, but "not
+   * verified" must still count in the headline rather than collapsing into "0 agents can read".
+   */
+  unverified: boolean
 }
 
 export interface RecordRow {
@@ -660,6 +665,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
         revokedTx: revokeByAgent.get(lower(seed.agentId))?.txHash ?? null,
         blockedAtStore: false,
         readLive: false,
+        unverified: false,
       }
       agents.set(lower(seed.agentId), row)
     }
@@ -681,6 +687,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
       deniedAgents.has(lower(row.agentId)) || row.grants.some((g) => deniedCapabilities.has(lower(g.capabilityId)))
     row.readLive =
       !row.blockedAtStore && row.grants.some((g) => (g.permissions & 1) !== 0 && g.status.label === "Can read")
+    row.unverified = row.grants.some((g) => g.status.label === "Unverified")
     row.name = await nameFor(row.agentId)
   }
 

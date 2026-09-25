@@ -532,8 +532,9 @@ describe("loadMe — the agent list can be missing, not just empty", () => {
     const agent = data.agents.find((a) => a.agentId === AGENT_ID)
     expect(agent).toBeDefined()
     expect(agent!.grants[0]!.status.label).toBe("Unverified")
-    // and it cannot count as able to read
+    // and it cannot count as able to read — but it counts as an agent we could not check
     expect(agent!.readLive).toBe(false)
+    expect(agent!.unverified).toBe(true)
     expect(data.agentsUnavailable).toBe(false)
   })
 })

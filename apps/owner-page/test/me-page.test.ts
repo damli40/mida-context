@@ -160,6 +160,7 @@ function agent(over: Partial<AgentRow> = {}): AgentRow {
     revokedTx: null,
     blockedAtStore: false,
     readLive: true,
+    unverified: false,
     ...over,
   }
 }
@@ -290,6 +291,24 @@ describe("renderMe", () => {
     expect(hits.length).toBeGreaterThanOrEqual(2)
     expect(root.textContent).not.toContain("0 agents can read")
     expect(root.textContent).not.toContain("No agents have been granted access")
+  })
+
+  it("agents the chain could not be asked about are counted, not rounded down to '0 can read'", () => {
+    // two rows exist, the reads for both failed — "0 agents can read" would be a false negative
+    const unverifiable = agent({ readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true } })] })
+    const another = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true } })] })
+    const root = renderMe(data({ agents: [unverifiable, another] }), fakeDoc()) as unknown as FakeEl
+    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
+    expect(lead).not.toBeNull()
+    expect(lead!.textContent).toBe("0 agents · 2 could not be checked just now")
+    expect(root.textContent).not.toContain("0 agents can read")
+  })
+
+  it("a mixed list counts both figures — live readers and the unchecked tail", () => {
+    const unknown = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true } })] })
+    const root = renderMe(data({ agents: [agent(), unknown] }), fakeDoc()) as unknown as FakeEl
+    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
+    expect(lead!.textContent).toBe("1 agent · 1 could not be checked just now")
   })
 
   it("a flagged grant names the listing that spoke — the index, or in chain-log mode the grant log, never the index", () => {
