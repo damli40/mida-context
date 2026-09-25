@@ -23,10 +23,17 @@ export function isTxHash(value: unknown): value is Hex {
   return typeof value === "string" && /^0x[0-9a-f]{64}$/.test(value)
 }
 
-export function lagText(indexTimestampSec: number | null, chainTimestampSec: number): { text: string; stale: boolean } {
-  if (indexTimestampSec === null) return { text: "index unavailable", stale: true }
-  const behind = Math.max(0, chainTimestampSec - indexTimestampSec)
-  return { text: `${behind} s behind Monad`, stale: behind > 60 }
+// Monad's ~0.4 s block cadence — the index's lag is a block count (Envio `_meta`:
+// sourceBlock − progressBlock), rendered as seconds so the owner reads "how stale" not "how
+// many blocks". Past STALE_INDEX_BLOCKS the badge flags the index stale.
+const SECONDS_PER_BLOCK = 0.4
+export const STALE_INDEX_BLOCKS = 150
+
+export function lagText(blocksBehind: number | null): { text: string; stale: boolean } {
+  if (blocksBehind === null || !Number.isFinite(blocksBehind)) return { text: "index unavailable", stale: true }
+  const blocks = Math.max(0, blocksBehind)
+  const seconds = Math.round(blocks * SECONDS_PER_BLOCK)
+  return { text: `≈ ${seconds} s behind Monad`, stale: blocks > STALE_INDEX_BLOCKS }
 }
 
 export function readersAfterRevoke(agents: readonly { agentId: Hex; readLive: boolean }[], revoking: Hex): Hex[] {

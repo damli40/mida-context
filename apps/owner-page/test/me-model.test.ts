@@ -31,10 +31,11 @@ describe("isTxHash", () => {
   })
 })
 describe("lagText", () => {
-  it("reports seconds behind and flags > 60 s", () => {
-    expect(lagText(1000, 1009)).toEqual({ text: "9 s behind Monad", stale: false })
-    expect(lagText(1000, 1100).stale).toBe(true)
-    expect(lagText(null, 1100)).toEqual({ text: "index unavailable", stale: true })
+  it("reads the index's block lag as seconds (~0.4 s/block) and flags > 150 blocks", () => {
+    expect(lagText(23)).toEqual({ text: "≈ 9 s behind Monad", stale: false })
+    expect(lagText(200).stale).toBe(true)
+    expect(lagText(150).stale).toBe(false)
+    expect(lagText(null)).toEqual({ text: "index unavailable", stale: true })
   })
 })
 describe("readersAfterRevoke", () => {

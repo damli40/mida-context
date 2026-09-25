@@ -84,6 +84,45 @@ function grantRow(over: Record<string, unknown> = {}) {
   }
 }
 
+// --- Hasura strictness ------------------------------------------------------------------------
+// Envio serves Hasura-flavoured GraphQL: a LIST field takes where/limit/order_by/offset/
+// distinct_on and answers an ARRAY; a single row is `<Entity>_by_pk(id: ...)`. The fake index
+// enforces both halves — a query calling a list field with `id:` is rejected before it is
+// answered, and an answer carrying an object where an array belongs is rejected too — so the
+// old `GlobalStats(id: "global")` / `Owner(id: $owner)` forms can never pass here.
+const LIST_FIELD_ARGS = new Set(["where", "limit", "order_by", "offset", "distinct_on"])
+
+function checkQueryShape(gql: string): void {
+  for (const match of gql.matchAll(/([A-Za-z_]\w*)\s*\(([^()]*)\)/g)) {
+    const field = match[1]!
+    const args = match[2]!
+    // the operation header itself — `query MeAgents($owner: ...)` — is not a field call
+    const before = gql.slice(0, match.index).trimEnd()
+    if (/(^|\s)(query|mutation|subscription)$/.test(before)) continue
+    for (const arg of args.split(",")) {
+      const name = arg.split(":")[0]!.trim()
+      if (name.length === 0) continue
+      if (name === "id") {
+        if (!field.endsWith("_by_pk")) throw new Error(`${field} is a list field — id: is not a valid argument (use ${field}_by_pk or where)`)
+      } else if (!LIST_FIELD_ARGS.has(name)) {
+        throw new Error(`${field} called with non-Hasura argument "${name}"`)
+      }
+    }
+  }
+}
+
+function checkAnswerShape(answer: unknown): void {
+  if (answer === null || typeof answer !== "object") return
+  for (const [key, value] of Object.entries(answer)) {
+    if (value === undefined || value === null) continue
+    if (key.endsWith("_by_pk")) {
+      if (typeof value !== "object" || Array.isArray(value)) throw new Error(`${key} must answer one object, not an array`)
+    } else if (!Array.isArray(value)) {
+      throw new Error(`${key} is a list field — it must answer an array`)
+    }
+  }
+}
+
 function world() {
   const state = {
     // spies
@@ -94,11 +133,11 @@ function world() {
     agentsResult: {
       Grant: [grantRow()],
       Revocation: [] as unknown[],
-      GlobalStats: { lastTimestamp: String(NOW) },
+      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: true }],
     } as unknown,
     batchedResult: { BatchedSave: [] as unknown[], Agent: [{ id: AGENT_ID, signer: AGENT_KEY.address }] } as unknown,
     countsResult: {
-      Owner: { records: 1, batchedSaves: 1 },
+      Owner_by_pk: { records: 1, batchedSaves: 1 },
       ContextRecord: [] as unknown[],
     } as unknown,
     // store answers
@@ -128,10 +167,15 @@ function world() {
       : {
           query: async <T>(gql: string): Promise<T> => {
             if (state.indexFails) throw new Error("index down")
-            if (gql === AGENTS_QUERY) return state.agentsResult as T
-            if (gql === BATCHED_QUERY) return state.batchedResult as T
-            if (gql === COUNTS_QUERY) return state.countsResult as T
-            throw new Error(`unexpected index query: ${gql.slice(0, 40)}`)
+            checkQueryShape(gql)
+            const answer =
+              gql === AGENTS_QUERY ? state.agentsResult
+              : gql === BATCHED_QUERY ? state.batchedResult
+              : gql === COUNTS_QUERY ? state.countsResult
+              : null
+            if (answer === null) throw new Error(`unexpected index query: ${gql.slice(0, 40)}`)
+            checkAnswerShape(answer)
+            return answer as T
           },
         },
     store: {
@@ -344,7 +388,7 @@ describe("loadMe — direct records re-verify on ContextRegistry", () => {
     state.objects.set(NS_SKILLS, [obj])
     state.chainRecords.set(record.contextId, record)
     state.countsResult = {
-      Owner: { records: 1, batchedSaves: 0 },
+      Owner_by_pk: { records: 1, batchedSaves: 0 },
       ContextRecord: [{ id: record.contextId, namespaceId: NS_SKILLS, provenanceSource: 1, createdAt: String(NOW - 3600), txHash: TX3 }],
     }
     const data = await loadMe(OWNER, ports)
@@ -391,6 +435,43 @@ describe("loadMe — incomplete lists and index contradictions stay visible", ()
     expect(agent!.readLive).toBe(false)
     // The chain still says the grant is valid — the page shows both facts, not a merged fiction.
     expect(agent!.grants[0]!.status.label).toBe("Can read")
+  })
+})
+
+describe("the index queries are Hasura-shaped", () => {
+  it("every exported query uses only where/limit/order_by on list fields, id: only on _by_pk, and _meta for progress", () => {
+    for (const gql of [AGENTS_QUERY, BATCHED_QUERY, COUNTS_QUERY]) {
+      expect(() => checkQueryShape(gql)).not.toThrow()
+    }
+    // the regression this guard exists for: a list field must never be called with id:
+    expect(() => checkQueryShape(`query X { GlobalStats(id: "global") { lastTimestamp } }`)).toThrow(/list field/)
+    expect(() => checkQueryShape(`query X($owner: String!) { Owner(id: $owner) { records } }`)).toThrow(/list field/)
+    // and the allowed forms do pass: _by_pk, where/limit/order_by, and the bare _meta list
+    expect(() => checkQueryShape(`query X($owner: String!) { Owner_by_pk(id: $owner) { records } }`)).not.toThrow()
+    expect(() => checkQueryShape(`query X { _meta { chainId progressBlock sourceBlock isReady } }`)).not.toThrow()
+  })
+
+  it("index lag comes from _meta's own progress — blocks behind, read as seconds at ~0.4 s/block", async () => {
+    const { state, ports } = world()
+    state.agentsResult = {
+      ...(state.agentsResult as object),
+      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 1000 - 25, sourceBlock: 1000, isReady: true }],
+    }
+    const data = await loadMe(OWNER, ports)
+    // 25 blocks at ~0.4 s/block ≈ 10 s
+    expect(data.lag).toEqual({ text: "≈ 10 s behind Monad", stale: false })
+    expect(data.source).toBe("index")
+  })
+
+  it("an index more than 150 blocks behind reports stale", async () => {
+    const { state, ports } = world()
+    state.agentsResult = {
+      ...(state.agentsResult as object),
+      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 1000 - 400, sourceBlock: 1000, isReady: true }],
+    }
+    const data = await loadMe(OWNER, ports)
+    expect(data.lag.stale).toBe(true)
+    expect(data.lag.text).toBe("≈ 160 s behind Monad")
   })
 })
 

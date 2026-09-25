@@ -59,8 +59,11 @@ export const AGENTS_QUERY = `query MeAgents($owner: String!) {
     block
     txHash
   }
-  GlobalStats(id: "global") {
-    lastTimestamp
+  _meta {
+    chainId
+    progressBlock
+    sourceBlock
+    isReady
   }
 }`
 
@@ -83,7 +86,7 @@ export const BATCHED_QUERY = `query MeBatched($owner: String!, $agents: [String!
 }`
 
 export const COUNTS_QUERY = `query MeCounts($owner: String!) {
-  Owner(id: $owner) {
+  Owner_by_pk(id: $owner) {
     records
     batchedSaves
   }
@@ -218,10 +221,18 @@ interface IndexRecord {
   txHash: string
 }
 
+/** Envio's `_meta` view — one row per indexed chain, the index's own progress report. */
+interface IndexMeta {
+  chainId: number | string
+  progressBlock: number | string
+  sourceBlock: number | string
+  isReady?: boolean
+}
+
 interface AgentsAnswer {
   Grant?: IndexGrant[]
   Revocation?: IndexRevocation[]
-  GlobalStats?: { lastTimestamp: string | number } | null
+  _meta?: IndexMeta[] | IndexMeta | null
 }
 
 interface BatchedAnswer {
@@ -230,7 +241,7 @@ interface BatchedAnswer {
 }
 
 interface CountsAnswer {
-  Owner?: { records: number; batchedSaves: number } | null
+  Owner_by_pk?: { records: number; batchedSaves: number } | null
   ContextRecord?: IndexRecord[]
 }
 
@@ -315,6 +326,25 @@ function secondsOf(value: unknown): number | null {
   return Number.isFinite(n) ? n : null
 }
 
+/**
+ * The `_meta` row for this deployment's chain: progressBlock is how far the index has read,
+ * sourceBlock how far the chain has got — their difference IS the lag, measured in blocks. A
+ * missing row or unreadable numbers mean the index answered but cannot say how fresh it is.
+ */
+function metaRowOf(meta: AgentsAnswer["_meta"]): { blocksBehind: number; isReady: boolean } | null {
+  const rows = Array.isArray(meta) ? meta : meta != null && typeof meta === "object" ? [meta] : []
+  const chainId = Number(DEPLOYMENT.chainId)
+  for (const row of rows) {
+    if (row === null || typeof row !== "object") continue
+    if (Number(row.chainId) !== chainId) continue
+    const progress = Number(row.progressBlock)
+    const source = Number(row.sourceBlock)
+    if (!Number.isFinite(progress) || !Number.isFinite(source)) return null
+    return { blocksBehind: source - progress, isReady: row.isReady !== false }
+  }
+  return null
+}
+
 function uint64Of(value: unknown): bigint {
   try {
     return decodeUint64(value as string)
@@ -395,12 +425,10 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
     if (!incomplete.includes(text)) incomplete.push(text)
   }
 
-  // Three independent facts start together: the store's batching flag, its pending denies, and
-  // the chain clock the index lag is measured against.
-  const [batchStatus, denies, chainSeconds] = await Promise.all([
+  // Two independent facts start together: the store's batching flag and its pending denies.
+  const [batchStatus, denies] = await Promise.all([
     safe(() => ports.store.batchStatus()),
     safe(() => ports.store.listRevocations("active")),
-    safe(() => ports.chain.latestTimestamp()),
   ])
   const batchingOn = batchStatus === null ? null : batchStatus.enabled
   // The store's advertised anchor is the domain its agents actually signed under; the baked-in
@@ -432,7 +460,9 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
   const signerToAgent = new Map<string, Hex>()
   const indexRecords = new Map<string, IndexRecord>()
   let source: MeData["source"] = "index"
-  let lastTimestamp: number | null = null
+  // The lag is the index's own progress report (`_meta`), in blocks — null when the index
+  // answered but could not say how fresh it is.
+  let indexLag: number | null = null
   let ownerCounts: { records: number; batchedSaves: number } | null = null
   let youSaidCount = 0
 
@@ -442,7 +472,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
     if (primary === null) {
       source = "chain-logs"
     } else {
-      lastTimestamp = secondsOf(primary.GlobalStats?.lastTimestamp)
+      indexLag = metaRowOf(primary._meta)?.blocksBehind ?? null
       for (const grant of primary.Grant ?? []) {
         grantSeeds.push({
           agentId: grant.agent as Hex,
@@ -484,10 +514,10 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
           indexRecords.set(lower(record.id), record)
           areaIds.add(lower(record.namespaceId))
         }
-        if (countsAnswer.Owner === null || countsAnswer.Owner === undefined) {
+        if (countsAnswer.Owner_by_pk === null || countsAnswer.Owner_by_pk === undefined) {
           ownerCounts = { records: 0, batchedSaves: 0 } // no Owner row = nothing indexed yet
-        } else if (isNumber(countsAnswer.Owner.records) && isNumber(countsAnswer.Owner.batchedSaves)) {
-          ownerCounts = { records: countsAnswer.Owner.records, batchedSaves: countsAnswer.Owner.batchedSaves }
+        } else if (isNumber(countsAnswer.Owner_by_pk.records) && isNumber(countsAnswer.Owner_by_pk.batchedSaves)) {
+          ownerCounts = { records: countsAnswer.Owner_by_pk.records, batchedSaves: countsAnswer.Owner_by_pk.batchedSaves }
         } else {
           note("the index's totals could not be read — counts are hidden")
         }
@@ -802,10 +832,14 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
     source === "index" && ownerCounts !== null && !anyPartial
       ? { records: ownerCounts.records + ownerCounts.batchedSaves, youSaid: youSaidCount, pending }
       : null
+  // The lag line names which source is speaking: no index configured at all, an index that
+  // failed to answer, or the index's own progress report.
   const lag =
-    chainSeconds === null || !Number.isFinite(chainSeconds)
-      ? { text: "chain clock unavailable", stale: true }
-      : lagText(lastTimestamp, chainSeconds)
+    ports.index === null
+      ? { text: "index not configured", stale: true }
+      : source === "chain-logs"
+        ? { text: "index unavailable", stale: true }
+        : lagText(indexLag)
 
   return { owner, agents: agentList, records, incomplete, source, lag, batchingOn, counts }
 }
