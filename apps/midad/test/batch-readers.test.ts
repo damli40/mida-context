@@ -486,7 +486,28 @@ describe("readCheckpoints — the batched lane's records merge in, marked", () =
 })
 
 describe("buildHandoff — a pending save is marked, never called saved", () => {
-  const runtime = {} as ServiceRuntime
+  // checkAccess's identity gate answers before any stubbed dep is consulted, so the runtime
+  // needs a real home holding a loadable codex identity — every answer after it is stubbed.
+  const handoffHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-batch-handoff-")))
+  {
+    const key = `0x${"cd".repeat(32)}`
+    mkdirSync(join(handoffHome.root, "agents", "codex"), { recursive: true })
+    writeFileSync(
+      join(handoffHome.root, "agents", "codex", "identity.json"),
+      JSON.stringify({
+        name: "codex",
+        agentId: key,
+        signerPrivateKey: key,
+        encryptionPrivateKey: key,
+        encryptionPublicKey: key,
+        manifestHash: key,
+        callbackOrigin: "http://localhost",
+        purposeId: "project_assistance",
+        manifest: {},
+      }),
+    )
+  }
+  const runtime = { home: handoffHome } as unknown as ServiceRuntime
   const input = { agent: "codex", cwd: "/tmp/work", authorNames: { [OTHER_AGENT_ID.toLowerCase()]: "claude-code" } }
   const deps = (checkpoints: StoredCheckpoint[]): HandoffDeps => ({
     checkProject: async () => ({ ok: true, approval: { agent: "codex", projectId: "p1", root: "/tmp/work", approvedAt: "2026-09-21T00:00:00.000Z" } }),
