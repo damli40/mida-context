@@ -194,6 +194,7 @@ function data(over: Partial<MeData> = {}): MeData {
     source: "index",
     lag: { text: "9 s behind Monad", stale: false },
     batchingOn: true,
+    batchedListComplete: true,
     counts: { records: 31, youSaid: 9, pending: 2 },
     ...over,
   }
@@ -304,6 +305,26 @@ describe("renderMe", () => {
     expect(status).not.toBeNull()
     expect(status!.textContent).toBe("Revoked — the grant log disagrees with the chain")
     expect(status!.textContent).not.toContain("index")
+  })
+
+  it("count tiles name their source — index figures 'per the index', the pending figure 'per the store'", () => {
+    const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
+    expect(root.querySelector('[data-count="records"]')!.textContent).toContain("per the index")
+    expect(root.querySelector('[data-count="youSaid"]')!.textContent).toContain("per the index")
+    const pending = root.querySelector('[data-count="pending"]')
+    expect(pending).not.toBeNull()
+    expect(pending!.textContent).toContain("waiting to be anchored")
+    expect(pending!.textContent).toContain("per the store")
+    // no invented block number anywhere in the figures
+    expect(root.textContent).not.toMatch(/block \d/i)
+  })
+
+  it("the pending tile hides outright when the store's batched list could not be fully read", () => {
+    const root = renderMe(data({ batchedListComplete: false }), fakeDoc()) as unknown as FakeEl
+    expect(root.querySelector('[data-count="pending"]')).toBeNull()
+    expect(root.textContent).not.toContain("waiting to be anchored")
+    // the index's own figures still show — they do not depend on the store list
+    expect(root.querySelector('[data-count="records"]')).not.toBeNull()
   })
 
   it("provenance badges only ever ride on anchored rows — unverified and pending read Source unknown", () => {

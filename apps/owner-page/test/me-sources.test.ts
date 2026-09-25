@@ -160,6 +160,7 @@ function world() {
     // store answers
     objects: new Map<string, AnchoredObject[]>(),
     batched: new Map<string, BatchedReadItem[]>(),
+    batchedListError: null as Error | null,
     objectPartial: false,
     batchedPartial: false,
     denies: [] as RevocationIntentView[],
@@ -203,10 +204,10 @@ function world() {
         objects: state.objects.get(ns.toLowerCase()) ?? [],
         partial: state.objectPartial,
       }),
-      listBatchSaves: async ({ namespaceId: ns }) => ({
-        items: state.batched.get(ns.toLowerCase()) ?? [],
-        partial: state.batchedPartial,
-      }),
+      listBatchSaves: async ({ namespaceId: ns }) => {
+        if (state.batchedListError !== null) throw state.batchedListError
+        return { items: state.batched.get(ns.toLowerCase()) ?? [], partial: state.batchedPartial }
+      },
       listRevocations: async () => {
         if (state.deniesError !== null) throw state.deniesError
         return state.denies
@@ -685,6 +686,30 @@ describe("loadMe — a failed chain check is 'unknown', never 'unverified'", () 
     const data = await loadMe(OWNER, ports)
     const row = data.records.find((r) => r.contextId === contextId)
     expect(row!.state).toBe("unverified")
+  })
+})
+
+describe("loadMe — the pending figure is a store fact", () => {
+  it("a failed listBatchSaves marks the pending figure incomplete — the tile must not show", async () => {
+    const { state, ports } = world()
+    state.batchedListError = new Error("store down")
+    const data = await loadMe(OWNER, ports)
+    expect(data.batchedListComplete).toBe(false)
+  })
+
+  it("a partial listBatchSaves also marks it incomplete", async () => {
+    const { state, ports } = world()
+    state.batchedPartial = true
+    const data = await loadMe(OWNER, ports)
+    expect(data.batchedListComplete).toBe(false)
+    expect(data.counts).toBeNull()
+  })
+
+  it("a clean batched list keeps the pending figure", async () => {
+    const { state, ports } = world()
+    const data = await loadMe(OWNER, ports)
+    expect(data.batchedListComplete).toBe(true)
+    expect(data.counts!.pending).toBe(0)
   })
 })
 

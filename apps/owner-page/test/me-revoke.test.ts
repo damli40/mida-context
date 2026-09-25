@@ -296,6 +296,7 @@ function meData(over: Partial<MeData> = {}): MeData {
     source: "index",
     lag: { text: "9 s behind Monad", stale: false },
     batchingOn: true,
+    batchedListComplete: true,
     counts: null,
     ...over,
   }

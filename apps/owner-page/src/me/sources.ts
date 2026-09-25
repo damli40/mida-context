@@ -187,6 +187,11 @@ export interface MeData {
   source: "index" | "chain-logs"
   lag: { text: string; stale: boolean }
   batchingOn: boolean | null
+  /**
+   * False when any listBatchSaves call failed or came back partial — the pending figure is a
+   * store fact, and an incomplete store list means it cannot be shown.
+   */
+  batchedListComplete: boolean
   counts: { records: number; youSaid: number; pending: number } | null
 }
 
@@ -678,6 +683,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
   const listedObjects: StoreObject[] = []
   const listedBatched: { item: StoreBatchedItem; namespaceId: Hex }[] = []
   let anyPartial = false
+  let batchedListComplete = true
   await Promise.all(
     [...areaIds].map(async (id) => {
       const nsId = id as Hex
@@ -706,9 +712,11 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
         }
       }
       if (batched === null) {
+        batchedListComplete = false
         note(`the store could not list batched saves for ${areaName(nsId)} — those records may be missing`)
       } else {
         if (batched.partial) {
+          batchedListComplete = false
           anyPartial = true
           note(PARTIAL_LIST_TEXT)
         }
@@ -901,5 +909,5 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
         ? { text: "index unavailable", stale: true }
         : lagText(indexLag)
 
-  return { owner, agents: agentList, records, incomplete, agentsUnavailable, source, lag, batchingOn, counts }
+  return { owner, agents: agentList, records, incomplete, agentsUnavailable, source, lag, batchingOn, batchedListComplete, counts }
 }

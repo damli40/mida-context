@@ -150,14 +150,16 @@ function renderSummary(doc: Document, data: MeData): HTMLElement {
     lead.appendChild(elOf(doc, "p", "l", "Revoking stops future reads. It cannot recall what an agent already read."))
   }
   bento.appendChild(lead)
-  // The three figures are the index's totals — absent entirely when the index could not vouch
-  // for them or a store list came back partial (the banner says why).
+  // Each figure names its own source: records and "stated by you" are the index's totals, while
+  // "waiting to be anchored" is counted from the store's batched list — and is hidden outright
+  // when that list could not be fully read. The group is absent entirely when the index could
+  // not vouch for its side or a store list came back partial (the banner says why).
   if (data.counts !== null) {
     const tiles: [keyof typeof data.counts, string][] = [
-      ["records", "records saved"],
-      ["youSaid", "stated by you"],
-      ["pending", "waiting to be anchored"],
+      ["records", "records saved — per the index"],
+      ["youSaid", "stated by you — per the index"],
     ]
+    if (data.batchedListComplete) tiles.push(["pending", "waiting to be anchored — per the store"])
     for (const [key, label] of tiles) {
       const tile = elOf(doc, "div", "tile")
       tile.setAttribute("data-count", key)
@@ -165,8 +167,6 @@ function renderSummary(doc: Document, data: MeData): HTMLElement {
       tile.appendChild(elOf(doc, "p", "l", label))
       bento.appendChild(tile)
     }
-    const src = elOf(doc, "p", "tile-src", `Figures from the Envio index · ${data.lag.text}`)
-    lead.appendChild(src)
   }
   return bento
 }
@@ -430,7 +430,7 @@ function renderAnchor(doc: Document, data: MeData): HTMLElement {
   const cards: [string, string, string, number][] = [
     ["b-neutral", "One save, one transaction", "Records written directly. Grants, revokes and your own facts always go this way.", direct],
     ["b-info", "Batched", "Checkpoints anchored in shared batches: one transaction, one Merkle root, every signature re-checked by the contract.", batched],
-    ["b-warn", "Pending anchor", "Saved and checked, usable in handoffs, not yet on Monad. The contract can still reject them.", pending],
+    ["b-warn", "Pending anchor", "The store's queue: saved and checked, usable in handoffs, not yet on Monad. The contract can still reject them.", pending],
   ]
   for (const [cls, badge, blurb, count] of cards) {
     const card = elOf(doc, "div", "anchor-card")
