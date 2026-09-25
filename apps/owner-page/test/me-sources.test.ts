@@ -23,7 +23,7 @@ import type { Address, AgentRecord, BatchSaveMessage, Hex, SignedAgentCapability
 import { deriveEpochKeyPair, hexOf, sealContextObject } from "@mida/crypto"
 import type { AnchoredObject, BatchedReadItem, CapabilityView, ContextRecordView, RevocationIntentView } from "@mida/api"
 import { DEPLOYMENT } from "../src/owner/core.js"
-import { AGENTS_QUERY, BATCHED_QUERY, COUNTS_QUERY, loadMe } from "../src/me/sources.js"
+import { AGENTS_QUERY, AGENT_LIST_NO_INDEX, AGENT_LIST_UNAVAILABLE, BATCHED_QUERY, COUNTS_QUERY, loadMe } from "../src/me/sources.js"
 import type { GrantLog, MePorts } from "../src/me/sources.js"
 
 const OWNER = `0x${"11".repeat(20)}` as Address
@@ -160,6 +160,7 @@ function world() {
     // store answers
     objects: new Map<string, AnchoredObject[]>(),
     batched: new Map<string, BatchedReadItem[]>(),
+    objectsError: null as Error | null,
     batchedListError: null as Error | null,
     objectPartial: false,
     batchedPartial: false,
@@ -200,10 +201,13 @@ function world() {
           },
         },
     store: {
-      listObjects: async ({ namespaceId: ns }) => ({
-        objects: state.objects.get(ns.toLowerCase()) ?? [],
-        partial: state.objectPartial,
-      }),
+      listObjects: async ({ namespaceId: ns }) => {
+        if (state.objectsError !== null) throw state.objectsError
+        return {
+          objects: state.objects.get(ns.toLowerCase()) ?? [],
+          partial: state.objectPartial,
+        }
+      },
       listBatchSaves: async ({ namespaceId: ns }) => {
         if (state.batchedListError !== null) throw state.batchedListError
         return { items: state.batched.get(ns.toLowerCase()) ?? [], partial: state.batchedPartial }
@@ -511,17 +515,20 @@ describe("loadMe — the agent list can be missing, not just empty", () => {
     state.indexFails = true
     state.grantLogsError = new Error("rpc down")
     const data = await loadMe(OWNER, ports)
-    expect(data.agentsUnavailable).toBe(true)
+    // the flag carries its own sentence — the page shows the reason, not a boolean
+    expect(data.agentsUnavailable).toBe(AGENT_LIST_UNAVAILABLE)
     expect(data.agents).toEqual([])
     expect(data.source).toBe("chain-logs")
   })
 
-  it("index absent AND the log scan failed → still unavailable", async () => {
+  it("index absent AND the log scan failed → still unavailable, and the banner says the index was never configured", async () => {
     const { state, ports } = world()
     state.grantLogsError = new Error("rpc down")
     ports.index = null // indexUrl unset — nothing configured to query
     const data = await loadMe(OWNER, ports)
-    expect(data.agentsUnavailable).toBe(true)
+    expect(data.agentsUnavailable).toBe(AGENT_LIST_NO_INDEX)
+    // "the index is down" would be the wrong blame — nothing was ever pointed at an index
+    expect(data.agentsUnavailable).toContain("index not configured")
     expect(data.lag.text).toBe("index not configured")
   })
 
@@ -535,7 +542,7 @@ describe("loadMe — the agent list can be missing, not just empty", () => {
     // and it cannot count as able to read — but it counts as an agent we could not check
     expect(agent!.readLive).toBe(false)
     expect(agent!.unverified).toBe(true)
-    expect(data.agentsUnavailable).toBe(false)
+    expect(data.agentsUnavailable).toBeNull()
   })
 })
 
@@ -596,16 +603,19 @@ describe("loadMe — a grant row is only live when the chain's capability agrees
       state.capabilities.set(CAP_ID.toLowerCase(), capabilityView({ [field]: foreign }))
       const data = await loadMe(OWNER, ports)
       const grant = data.agents.find((a) => a.agentId === AGENT_ID)!.grants[0]!
-      expect(grant.status, `mismatched ${field} must never read live`).toEqual({ label: "Unverified", flagged: true })
+      // the chain ANSWERED — with a row for a different grant: a disagreement, not a dead read
+      expect(grant.status, `mismatched ${field} must never read live`).toEqual({ label: "Unverified", flagged: true, unchecked: false })
       expect(data.agents[0]!.readLive).toBe(false)
     }
   })
 
   it("a capabilityId the chain cannot return at all is Unverified, never Can read", async () => {
     const { state, ports } = world()
-    state.capabilities.delete(CAP_ID.toLowerCase()) // getCapability answers null — no row to match
+    state.capabilities.delete(CAP_ID.toLowerCase()) // getCapability answers null — the read failed
     const data = await loadMe(OWNER, ports)
-    expect(data.agents[0]!.grants[0]!.status).toEqual({ label: "Unverified", flagged: true })
+    // nothing came back from Monad — the row is unchecked, which is a different claim than "the
+    // index disagrees"
+    expect(data.agents[0]!.grants[0]!.status).toEqual({ label: "Unverified", flagged: true, unchecked: true })
     expect(data.agents[0]!.readLive).toBe(false)
   })
 
@@ -628,6 +638,8 @@ describe("loadMe — a grant row is only live when the chain's capability agrees
     const grant = data.agents[0]!.grants[0]!
     expect(grant.status.label).toBe("Expired")
     expect(grant.status.label).not.toContain("revoked")
+    // the index has no expiry awareness — an aged-out grant is never an index disagreement
+    expect(grant.status.flagged).toBe(false)
   })
 
   it("in chain-log mode the same checks run — a mismatched capability is Unverified there too", async () => {
@@ -640,7 +652,7 @@ describe("loadMe — a grant row is only live when the chain's capability agrees
     const data = await loadMe(OWNER, ports)
     expect(data.source).toBe("chain-logs")
     const grant = data.agents.find((a) => a.agentId === AGENT_ID)!.grants[0]!
-    expect(grant.status).toEqual({ label: "Unverified", flagged: true })
+    expect(grant.status).toEqual({ label: "Unverified", flagged: true, unchecked: false })
   })
 })
 
@@ -687,6 +699,41 @@ describe("loadMe — a failed chain check is 'unknown', never 'unverified'", () 
     const data = await loadMe(OWNER, ports)
     const row = data.records.find((r) => r.contextId === contextId)
     expect(row!.state).toBe("unverified")
+  })
+
+  it("a batched row whose author lookup failed reads 'could not check', not 'unverified'", async () => {
+    const { state, ports } = world()
+    const { item, contextId, root } = await makeBatchedItem()
+    state.batched.set(NS, [item])
+    state.batchRoots.set(BATCH_ID, root) // the root exists — the proof could run if the author were known
+    // the chain cannot name the signer, and the index offers no fallback row or signer map —
+    // the leaf can never be built, so the check itself never ran
+    ports.chain.agentIdOfSigner = () => Promise.reject(new Error("rpc down"))
+    state.batchedResult = { BatchedSave: [], Agent: [] }
+    const data = await loadMe(OWNER, ports)
+    const row = data.records.find((r) => r.contextId === contextId)
+    expect(row!.state).toBe("unknown")
+  })
+})
+
+describe("loadMe — a failed listing is not an empty store", () => {
+  it("every store listing call failing leaves recordsUnavailable — the empty list is a lie there", async () => {
+    const { state, ports } = world()
+    state.objectsError = new Error("store down")
+    state.batchedListError = new Error("store down")
+    const data = await loadMe(OWNER, ports)
+    expect(data.records).toEqual([])
+    expect(data.recordsUnavailable).toBe(true)
+  })
+
+  it("one lane failing while the other listed leaves recordsUnavailable false", async () => {
+    const { state, ports } = world()
+    state.batchedListError = new Error("store down")
+    const { obj } = makeDirectObject()
+    state.objects.set(NS_SKILLS, [obj])
+    const data = await loadMe(OWNER, ports)
+    expect(data.recordsUnavailable).toBe(false)
+    expect(data.records.length).toBe(1)
   })
 })
 

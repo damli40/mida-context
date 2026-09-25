@@ -79,19 +79,30 @@ export interface GrantTruth {
   nowSeconds: bigint | null
 }
 
-export function grantStatus(t: GrantTruth): { label: GrantLabel; flagged: boolean } {
+export function grantStatus(t: GrantTruth): { label: GrantLabel; flagged: boolean; unchecked: boolean } {
   const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
   const cap = t.capability
-  if (cap === null || t.chainSaysValid === null) return { label: "Unverified", flagged: true }
+  // The chain read produced nothing — threw or answered null — so no chain answer exists to
+  // compare the listing to. "Unverified" here means could-not-check, a different claim than
+  // "the index disagrees"; the page picks its wording off `unchecked`.
+  if (cap === null || t.chainSaysValid === null) return { label: "Unverified", flagged: true, unchecked: true }
+  // The chain ANSWERED — with a row for a different grant. That is a disagreement between the
+  // listing and Monad, not an unreachable chain.
   if (!same(cap.owner, t.owner) || !same(cap.agentId, t.agentId) || !same(cap.namespaceId, t.namespaceId)) {
-    return { label: "Unverified", flagged: true }
+    return { label: "Unverified", flagged: true, unchecked: false }
   }
-  if (t.chainSaysValid) return { label: "Can read", flagged: !t.sourceSaysLive }
+  if (t.chainSaysValid) return { label: "Can read", flagged: !t.sourceSaysLive, unchecked: false }
   // Dead on chain: expiry is the only cause that is a wall-clock fact — name it exactly; when
   // the clock could not be read, "expired or revoked" is the honest label.
   if (t.nowSeconds === null) {
-    return t.sourceSaysLive ? { label: "Expired or revoked on Monad", flagged: true } : { label: "Revoked", flagged: false }
+    return t.sourceSaysLive
+      ? { label: "Expired or revoked on Monad", flagged: true, unchecked: false }
+      : { label: "Revoked", flagged: false, unchecked: false }
   }
-  if (cap.expiresAt !== 0n && cap.expiresAt <= t.nowSeconds) return { label: "Expired", flagged: t.sourceSaysLive }
-  return { label: "Revoked", flagged: t.sourceSaysLive }
+  if (cap.expiresAt !== 0n && cap.expiresAt <= t.nowSeconds) {
+    // The index has no notion of expiry — an aged-out grant is a chain clock fact, never an
+    // index disagreement, so it is not flagged.
+    return { label: "Expired", flagged: false, unchecked: false }
+  }
+  return { label: "Revoked", flagged: t.sourceSaysLive, unchecked: false }
 }

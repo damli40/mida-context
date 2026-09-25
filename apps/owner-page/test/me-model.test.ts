@@ -76,32 +76,39 @@ describe("grantStatus", () => {
   })
 
   it("the chain wins over the listing", () => {
-    expect(grantStatus(truth())).toEqual({ label: "Can read", flagged: false })
+    expect(grantStatus(truth())).toEqual({ label: "Can read", flagged: false, unchecked: false })
     // dead on chain, expiry is 0 → revoked, and the live-claiming listing is flagged
-    expect(grantStatus(truth({ chainSaysValid: false }))).toEqual({ label: "Revoked", flagged: true })
-    expect(grantStatus(truth({ sourceSaysLive: false, chainSaysValid: false }))).toEqual({ label: "Revoked", flagged: false })
-    // either chain read failing is unverifiable, never live or dead on the page's say-so
-    expect(grantStatus(truth({ chainSaysValid: null }))).toEqual({ label: "Unverified", flagged: true })
-    expect(grantStatus(truth({ capability: null, chainSaysValid: true }))).toEqual({ label: "Unverified", flagged: true })
+    expect(grantStatus(truth({ chainSaysValid: false }))).toEqual({ label: "Revoked", flagged: true, unchecked: false })
+    expect(grantStatus(truth({ sourceSaysLive: false, chainSaysValid: false }))).toEqual({ label: "Revoked", flagged: false, unchecked: false })
+    // either chain read failing is unverifiable — the check itself never ran, which is a Monad
+    // failure to check, not an index disagreement
+    expect(grantStatus(truth({ chainSaysValid: null }))).toEqual({ label: "Unverified", flagged: true, unchecked: true })
+    expect(grantStatus(truth({ capability: null, chainSaysValid: true }))).toEqual({ label: "Unverified", flagged: true, unchecked: true })
   })
 
-  it("a capability that names a different owner, agent or area can never say Can read", () => {
+  it("a capability that names a different owner, agent or area can never say Can read — the chain answered, and it disagrees", () => {
     for (const field of ["owner", "agentId", "namespaceId"] as const) {
       const foreign = `0x${"99".repeat(field === "owner" ? 20 : 32)}`
-      expect(grantStatus(truth({ capability: cap({ [field]: foreign }) }))).toEqual({ label: "Unverified", flagged: true })
+      // the check RAN — the listing pointed at a different capability's row: a disagreement,
+      // not an unreachable Monad
+      expect(grantStatus(truth({ capability: cap({ [field]: foreign }) }))).toEqual({ label: "Unverified", flagged: true, unchecked: false })
     }
   })
 
-  it("expired is a wall-clock fact: the contract is dead once timestamp >= expiresAt", () => {
-    expect(grantStatus(truth({ chainSaysValid: false, capability: cap({ expiresAt: NOW_S - 1n }) })).label).toBe("Expired")
+  it("expired is a wall-clock fact: the contract is dead once timestamp >= expiresAt — and the index never tracks expiry, so it is never flagged", () => {
+    // a live-claiming listing whose grant aged out is NOT an index disagreement — the index has
+    // no expiry awareness; the row reads Expired, unflagged
+    expect(grantStatus(truth({ chainSaysValid: false, capability: cap({ expiresAt: NOW_S - 1n }) })))
+      .toEqual({ label: "Expired", flagged: false, unchecked: false })
     // exactly at expiry the grant is already dead — Monad requires block.timestamp < expiresAt
-    expect(grantStatus(truth({ chainSaysValid: false, capability: cap({ expiresAt: NOW_S }) })).label).toBe("Expired")
+    expect(grantStatus(truth({ chainSaysValid: false, capability: cap({ expiresAt: NOW_S }) })))
+      .toEqual({ label: "Expired", flagged: false, unchecked: false })
     // invalid with expiry still in the future is a revoke, not an expiry
-    expect(grantStatus(truth({ chainSaysValid: false, capability: cap({ expiresAt: NOW_S + 60n }) }))).toEqual({ label: "Revoked", flagged: true })
+    expect(grantStatus(truth({ chainSaysValid: false, capability: cap({ expiresAt: NOW_S + 60n }) }))).toEqual({ label: "Revoked", flagged: true, unchecked: false })
     expect(grantStatus(truth({ sourceSaysLive: false, chainSaysValid: false, capability: cap({ expiresAt: NOW_S - 1n }) })))
-      .toEqual({ label: "Expired", flagged: false })
+      .toEqual({ label: "Expired", flagged: false, unchecked: false })
     // no chain clock → the honest label admits both causes
     expect(grantStatus(truth({ chainSaysValid: false, capability: cap({ expiresAt: NOW_S - 1n }), nowSeconds: null })))
-      .toEqual({ label: "Expired or revoked on Monad", flagged: true })
+      .toEqual({ label: "Expired or revoked on Monad", flagged: true, unchecked: false })
   })
 })

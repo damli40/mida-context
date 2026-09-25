@@ -106,6 +106,11 @@ export const PARTIAL_LIST_TEXT = "list incomplete — the store ran out of chain
  * scan failed or ran out of time. Pinned by the plan; the page shows it in place of the count.
  */
 export const AGENT_LIST_UNAVAILABLE = "Agent list unavailable — the index is down and the chain scan did not finish"
+/**
+ * Same unavailability, different blame: no index URL was ever configured, so nothing was "down" —
+ * the agents sentence names what is actually missing.
+ */
+export const AGENT_LIST_NO_INDEX = "Agent list unavailable — index not configured and the chain scan did not finish"
 /** The exact agent-state wording for a store deny — pinned by the plan, rendered by the page. */
 export const BLOCKED_AT_STORE_TEXT = "blocked at the store · revoke pending on Monad"
 
@@ -187,8 +192,16 @@ export interface MeData {
   agents: AgentRow[]
   records: RecordRow[]
   incomplete: string[]
-  /** True when no agent source answered — the agents list is absent, not empty. */
-  agentsUnavailable: boolean
+  /**
+   * Null when the list is complete; otherwise the banner sentence itself — the flag carries
+   * its own blame so the page never re-derives which source failed.
+   */
+  agentsUnavailable: string | null
+  /**
+   * True when every store listing call failed — then `records: []` is a dead lookup, not an
+   * empty store, and the page must not read it as "the store holds no records".
+   */
+  recordsUnavailable: boolean
   source: "index" | "chain-logs"
   lag: { text: string; stale: boolean }
   batchingOn: boolean | null
@@ -489,7 +502,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
   const signerToAgent = new Map<string, Hex>()
   const indexRecords = new Map<string, IndexRecord>()
   let source: MeData["source"] = "index"
-  let agentsUnavailable = false
+  let agentsUnavailable: string | null = null
   // The lag is the index's own progress report (`_meta`), in blocks — null when the index
   // answered but could not say how fresh it is.
   let indexLag: number | null = null
@@ -562,7 +575,9 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
     const logs = await safe(() => ports.chain.ownerGrantLogs(owner))
     if (logs === null) {
       // No agent source answered — the page must say the list is missing, never "no agents".
-      agentsUnavailable = true
+      // The blame is exact: a configured index that failed is "down"; no index URL at all was
+      // never asked, so it is "not configured".
+      agentsUnavailable = ports.index === null ? AGENT_LIST_NO_INDEX : AGENT_LIST_UNAVAILABLE
       note("the grant log scan failed — the agent list may be incomplete")
     } else {
       const byCapability = new Map<string, GrantSeed>()
@@ -696,6 +711,10 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
   const listedBatched: { item: StoreBatchedItem; namespaceId: Hex }[] = []
   let anyPartial = false
   let batchedListComplete = true
+  // A listing that threw is a hole, not an empty answer — count them per lane so "records: []"
+  // can be told apart from "the store never produced a list".
+  let objectsFailed = 0
+  let batchedFailed = 0
   await Promise.all(
     [...areaIds].map(async (id) => {
       const nsId = id as Hex
@@ -704,6 +723,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
         safe(() => ports.store.listBatchSaves({ owner, namespaceId: nsId })),
       ])
       if (objects === null) {
+        objectsFailed += 1
         note(`the store could not list ${areaName(nsId)} — those records may be missing`)
       } else {
         if (objects.partial) {
@@ -725,6 +745,7 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
       }
       if (batched === null) {
         batchedListComplete = false
+        batchedFailed += 1
         note(`the store could not list batched saves for ${areaName(nsId)} — those records may be missing`)
       } else {
         if (batched.partial) {
@@ -881,7 +902,16 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
           }
         }
       }
-      state = anchored ? "anchored" : root === "failed" ? "unknown" : "unverified"
+      if (anchored) {
+        state = "anchored"
+      } else if (root === "failed" || (root !== null && candidates.length === 0)) {
+        // The root read never returned, or no author candidate could be established (the signer
+        // lookup failed and the index named nobody) — either way the proof check never ran, so
+        // this is "could not check", never a verdict of unverified.
+        state = "unknown"
+      } else {
+        state = "unverified"
+      }
     }
     const rowNamespace = message?.namespaceId ?? (indexRow?.namespaceId as Hex | undefined) ?? listedUnder
     records.push({
@@ -902,6 +932,11 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
     })
   }
 
+  // Both lanes failing for every namespace means records:[] is a dead store lookup, not an
+  // empty store — the page must say it could not load the list, not claim the store is empty.
+  const recordsUnavailable =
+    areaIds.size > 0 && objectsFailed === areaIds.size && batchedFailed === areaIds.size
+
   records.sort((a, b) => b.createdAt - a.createdAt || (a.contextId < b.contextId ? -1 : a.contextId > b.contextId ? 1 : 0))
   const agentList = [...agents.values()].sort(
     (a, b) => a.name.localeCompare(b.name) || (a.agentId < b.agentId ? -1 : 1),
@@ -921,5 +956,5 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
         ? { text: "index unavailable", stale: true }
         : lagText(indexLag)
 
-  return { owner, agents: agentList, records, incomplete, agentsUnavailable, source, lag, batchingOn, batchedListComplete, counts }
+  return { owner, agents: agentList, records, incomplete, agentsUnavailable, recordsUnavailable, source, lag, batchingOn, batchedListComplete, counts }
 }

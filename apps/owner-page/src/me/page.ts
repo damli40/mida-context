@@ -32,7 +32,7 @@ import type { Badge } from "./model.js"
 import { repairReaderWrapsFromMe, revokeFromMe, shouldOfferRepair } from "./revoke.js"
 import type { MeRevokeResult } from "./revoke.js"
 import { boundedScanClient, scanWithDeadline } from "./logscan.js"
-import { AGENT_LIST_UNAVAILABLE, BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
+import { BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
 import type { AgentRow, GrantLog, MeData, MePorts, RecordRow } from "./sources.js"
 import { signIn } from "./session.js"
 import type { MeSession } from "./session.js"
@@ -144,9 +144,11 @@ function renderSummary(doc: Document, data: MeData): HTMLElement {
       (a.revokedTx !== null || (a.grants.length > 0 && a.grants.every((g) => g.status.label === "Revoked"))),
   ).length
   const lead = elOf(doc, "div", "tile tile-lead")
-  if (data.agentsUnavailable) {
-    // No agent source answered — a count would invent certainty the page does not have.
-    lead.appendChild(elOf(doc, "p", "n", AGENT_LIST_UNAVAILABLE))
+  if (data.agentsUnavailable !== null) {
+    // No agent source answered — a count would invent certainty the page does not have. The
+    // flag carries its own sentence so the blame is exact ("the index is down" vs "not
+    // configured").
+    lead.appendChild(elOf(doc, "p", "n", data.agentsUnavailable))
     lead.appendChild(elOf(doc, "p", "l", "The agent list could not be loaded at all."))
   } else {
     // Agents whose chain check could not run are not "0 can read" — count them as unchecked so
@@ -182,9 +184,12 @@ function renderSummary(doc: Document, data: MeData): HTMLElement {
 }
 
 function grantStatusText(grant: AgentRow["grants"][number], source: MeData["source"]): string | null {
-  const { label, flagged } = grant.status
+  const { label, flagged, unchecked } = grant.status
   if (label === "Can read" && !flagged) return null
   if (!flagged) return label
+  // A chain read that never returned is a check that did not run — not a disagreement between
+  // the listing and Monad. Blame Monad, not the index.
+  if (unchecked) return `${label} — could not check Monad just now`
   // In chain-log mode there is no index to disagree — name the listing that actually spoke.
   const listing = source === "index" ? "the index" : "the grant log"
   return `${label} — ${listing} disagrees with the chain`
@@ -297,8 +302,8 @@ function renderAgents(doc: Document, data: MeData): HTMLElement {
   agentsTitle.setAttribute("id", "agents-title")
   head.appendChild(agentsTitle)
   head.appendChild(elOf(doc, "p", "sec-note", "Access is enforced by the contract on Monad, not by this page."))
-  if (data.agentsUnavailable) {
-    sec.appendChild(elOf(doc, "p", "agent-meta", AGENT_LIST_UNAVAILABLE))
+  if (data.agentsUnavailable !== null) {
+    sec.appendChild(elOf(doc, "p", "agent-meta", data.agentsUnavailable))
     return sec
   }
   if (data.agents.length === 0) {
@@ -384,7 +389,16 @@ function renderRecords(doc: Document, data: MeData, open: OpenRow | undefined): 
     ),
   )
   if (data.records.length === 0) {
-    sec.appendChild(elOf(doc, "p", "agent-meta", "The store holds no records for this owner."))
+    // "Empty" is only a claim when a listing actually answered empty — a store that failed
+    // every call produced no list at all, and the page says so.
+    sec.appendChild(
+      elOf(
+        doc,
+        "p",
+        "agent-meta",
+        data.recordsUnavailable ? "could not load records from the store" : "The store holds no records for this owner.",
+      ),
+    )
     return sec
   }
   const table = elOf(doc, "table", "records")
@@ -877,7 +891,7 @@ function boot(): void {
                 signedInOwner: session.owner,
                 agentId: agent.agentId,
                 agents: fresh.agents,
-                agentsUnavailable: fresh.agentsUnavailable,
+                agentsUnavailable: fresh.agentsUnavailable !== null,
               },
             )
             // Any outcome that reached Monad without finishing the job offers the repair —
@@ -899,7 +913,7 @@ function boot(): void {
                   {
                     signedInOwner: session.owner,
                     agents: fresh.agents,
-                    agentsUnavailable: fresh.agentsUnavailable,
+                    agentsUnavailable: fresh.agentsUnavailable !== null,
                     epochsAtRevoke: repairEpochs,
                     excludeAgentIds: repairExcluded,
                   },

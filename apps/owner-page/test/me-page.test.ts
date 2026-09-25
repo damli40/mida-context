@@ -6,7 +6,7 @@ import { namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { HIDDEN_LIMIT_MS, armTeardown, renderMe, revocableStore } from "../src/me/page.js"
 import type { AgentRow, MeData, MePorts, RecordRow } from "../src/me/sources.js"
-import { BLOCKED_AT_STORE_TEXT, PARTIAL_LIST_TEXT } from "../src/me/sources.js"
+import { AGENT_LIST_UNAVAILABLE, BLOCKED_AT_STORE_TEXT, PARTIAL_LIST_TEXT } from "../src/me/sources.js"
 
 /**
  * Task 5's page tests. The plan prescribes a jsdom environment pragma, but jsdom is not a
@@ -146,7 +146,7 @@ function grant(over: Partial<Grant> = {}): Grant {
     area: "projects.current",
     permissions: 1 | 2 | 4,
     capabilityId: CAP,
-    status: { label: "Can read", flagged: false },
+    status: { label: "Can read", flagged: false, unchecked: false },
     approvedTx: TX,
     ...over,
   }
@@ -191,7 +191,8 @@ function data(over: Partial<MeData> = {}): MeData {
     agents: [agent()],
     records: [record()],
     incomplete: [],
-    agentsUnavailable: false,
+    agentsUnavailable: null,
+    recordsUnavailable: false,
     source: "index",
     lag: { text: "9 s behind Monad", stale: false },
     batchingOn: true,
@@ -282,7 +283,7 @@ describe("renderMe", () => {
 
   it("a failed agent load reads 'Agent list unavailable' — never '0 agents' or 'none granted'", () => {
     const root = renderMe(
-      data({ agents: [], agentsUnavailable: true, counts: null }),
+      data({ agents: [], agentsUnavailable: AGENT_LIST_UNAVAILABLE, counts: null }),
       fakeDoc(),
     ) as unknown as FakeEl
     const unavailable = "Agent list unavailable — the index is down and the chain scan did not finish"
@@ -295,8 +296,8 @@ describe("renderMe", () => {
 
   it("agents the chain could not be asked about are counted, not rounded down to '0 can read'", () => {
     // two rows exist, the reads for both failed — "0 agents can read" would be a false negative
-    const unverifiable = agent({ readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true } })] })
-    const another = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true } })] })
+    const unverifiable = agent({ readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
+    const another = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
     const root = renderMe(data({ agents: [unverifiable, another] }), fakeDoc()) as unknown as FakeEl
     const lead = root.querySelector(".tile-lead")!.querySelector(".n")
     expect(lead).not.toBeNull()
@@ -305,14 +306,35 @@ describe("renderMe", () => {
   })
 
   it("a mixed list counts both figures — live readers and the unchecked tail", () => {
-    const unknown = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true } })] })
+    const unknown = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
     const root = renderMe(data({ agents: [agent(), unknown] }), fakeDoc()) as unknown as FakeEl
     const lead = root.querySelector(".tile-lead")!.querySelector(".n")
     expect(lead!.textContent).toBe("1 agent · 1 could not be checked just now")
   })
 
+  it("a grant whose chain check never ran says 'could not check Monad just now', not an index disagreement", () => {
+    const unreachable = agent({
+      readLive: false,
+      grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })],
+    })
+    const root = renderMe(data({ agents: [unreachable] }), fakeDoc()) as unknown as FakeEl
+    const status = root.querySelector(".grant-status")
+    expect(status).not.toBeNull()
+    expect(status!.textContent).toBe("Unverified — could not check Monad just now")
+    expect(status!.textContent).not.toContain("disagrees")
+  })
+
+  it("a store that failed every listing says 'could not load records' — never 'holds no records'", () => {
+    const root = renderMe(data({ records: [], recordsUnavailable: true }), fakeDoc()) as unknown as FakeEl
+    expect(root.textContent).toContain("could not load records from the store")
+    expect(root.textContent).not.toContain("The store holds no records")
+    // and a store that answered empty stays "holds no records" — the two are not interchangeable
+    const empty = renderMe(data({ records: [], recordsUnavailable: false }), fakeDoc()) as unknown as FakeEl
+    expect(empty.textContent).toContain("The store holds no records")
+  })
+
   it("a flagged grant names the listing that spoke — the index, or in chain-log mode the grant log, never the index", () => {
-    const flagged = agent({ readLive: false, grants: [grant({ status: { label: "Revoked", flagged: true } })] })
+    const flagged = agent({ readLive: false, grants: [grant({ status: { label: "Revoked", flagged: true, unchecked: false } })] })
     const fromIndex = renderMe(data({ agents: [flagged] }), fakeDoc()) as unknown as FakeEl
     expect(fromIndex.querySelector(".grant-status")!.textContent).toBe("Revoked — the index disagrees with the chain")
 

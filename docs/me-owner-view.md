@@ -33,7 +33,7 @@ A quick vocabulary pass, then the table.
 | Your address (the header) | Derived in the browser from your passkey | The owner key registered on chain | Sign-in refuses — the page never guesses |
 | The list of agents and their grants | The index | **Every grant is re-read on chain** before it may say "Can read" — revoked and expired grants cannot slip through a stale index | Chain logs (slower; the badge says "from chain logs") |
 | An agent's name | Its manifest, fetched from the store | — | The shortened agent id — never blank |
-| The records list and their text | The store's two lanes: records that went on chain directly, and saves waiting inside shared batches | Direct rows: re-read on `ContextRegistry`. Batched rows: a Merkle proof checked against the batch's root on chain — **never** `ContextRegistry` (batched saves are not in it) | The row says "not on Monad — unverified". If the store could only return part of a list, the page shows "list incomplete — the store ran out of chain reads; reload" and hides the counts |
+| The records list and their text | The store's two lanes: records that went on chain directly, and saves waiting inside shared batches | Direct rows: re-read on `ContextRegistry`. Batched rows: a Merkle proof checked against the batch's root on chain — **never** `ContextRegistry` (batched saves are not in it) | "not on Monad — unverified" when the chain answered and disagreed; "could not check Monad just now" when the check itself never ran (a dead RPC, or a batched save whose author nobody could name). If every store listing fails, the section reads "could not load records from the store" — never an empty-list claim; a partial list shows "list incomplete — the store ran out of chain reads; reload" and hides the counts |
 | "You said" vs "&lt;agent&gt; inferred" | The record's provenance field (the contract only accepts "the user said this" when the owner signed it) | The decrypted record must agree — a mismatch flags the row: "the record's own label disagrees with Monad" | "Source unknown" — that includes every row the chain did not confirm, so a batched save still in the queue shows no provenance claim at all |
 | How a record reached Monad ("direct" / "batched" / "pending") | The store's own lists: which lane it filed the save under, and for batched saves the Merkle proof it serves with each one | The proof is checked against the batch's root on the deployment's `BatchAnchor` contract — a store that advertises a different batch contract is named ("the store serves a different batch contract") and its batched rows read unverified | "pending" is the store's queue position; a failed or partial store list hides the pending count rather than guessing it |
 | The summary counts | The index, labelled "per the index" | — | Hidden entirely when the index is down or a list came back partial — a partial list never produces a confident count |
@@ -126,8 +126,11 @@ before relying on the index:
   public index, but it is a wider allowance than "our index only", and we say so rather than hide
   it.
 - **"Can read" is the chain's answer, not the index's.** A grant the index calls live but the chain
-  calls invalid shows as "Expired or revoked on Monad", flagged — the index is a scoreboard, not a
-  referee.
+  calls dead shows as "Revoked — the index disagrees with the chain" (or "Expired or revoked on
+  Monad" when the chain clock itself could not be read). An expired grant reads "Expired",
+  unflagged — the index never tracks expiry, so there is no disagreement to flag. And a grant
+  whose chain read never returned shows "Unverified — could not check Monad just now": that is
+  Monad failing to answer, not the index disagreeing.
 - **"Records saved" counts versions, not distinct records.** The index's `Owner.records` field
   increments once per record *version* written on chain, so a record saved three times moves the
   tile by three. Read it as "writes the chain has seen", not "how many records exist".
