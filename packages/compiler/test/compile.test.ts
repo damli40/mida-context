@@ -156,6 +156,23 @@ describe("compileCheckpoint", () => {
     const r = await compileCheckpoint({ ...base, model: fake("garbage"), sleep: async () => {} })
     expect(r).toMatchObject({ ok: false, reason: "no-json", attempts: 3 })
   })
+  it("a no-json failure carries a scrubbed, 200-char-bounded sample of the provider's last answer (F4)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("prose-secret"), attempts: 1, sleep: async () => {} })
+    expect(r).toMatchObject({ ok: false, reason: "no-json" })
+    if (!r.ok) {
+      expect(r.sample).toBeDefined()
+      expect(r.sample!.length).toBeLessThanOrEqual(200)
+      expect(r.sample).not.toContain("sk-live-abcdefgh12345678")
+      expect(r.sample).toContain("[REDACTED]")
+    }
+  })
+  it("an invalid failure carries the same sample; a transport failure carries none", async () => {
+    const invalid = await compileCheckpoint({ ...base, model: fake("badshape"), attempts: 1, sleep: async () => {} })
+    expect(invalid).toMatchObject({ ok: false, reason: "invalid", sample: '{"objective":5}' })
+    const transport = await compileCheckpoint({ ...base, model: fake("fail"), attempts: 1, sleep: async () => {} })
+    expect(transport).toMatchObject({ ok: false, reason: "model-failed" })
+    if (!transport.ok) expect(transport.sample).toBeUndefined()
+  })
   it("an invalid shape gets one same-provider retry, then stays terminal — the outer attempts never re-run (M3-H)", async () => {
     // badshape-count answers invalid on every call and counts them: call 1 fails, the one
     // retry fails the same way, and with no fallback the compile reports invalid at once —

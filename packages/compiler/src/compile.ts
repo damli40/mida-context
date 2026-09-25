@@ -10,7 +10,7 @@ import path from "node:path"
 import { CONTENT_FIELDS, LIMITS, validateCheckpoint, type Checkpoint } from "@mida/checkpoint"
 import { extractJsonObject } from "./extract-json.js"
 import { buildExtractPrompt } from "./prompt.js"
-import { scrubValue } from "./scrub.js"
+import { scrubSecrets, scrubValue } from "./scrub.js"
 import { readConversation, type Conversation } from "./transcript-claude.js"
 import { readTranscriptFor } from "./transcript-codex.js"
 
@@ -99,11 +99,19 @@ export type CompileResult =
       retried: number
       /** Leading field paths from the validator when reason is "invalid" — names only, safe for logs. */
       fields?: string[]
+      /**
+       * The first SAMPLE_CHARS of the LAST provider's raw answer, secret-scrubbed — present when
+       * the terminal failure had an answer to show (no-json/invalid), so a failed drain log can
+       * show what an unusable answer looked like without quoting the whole output.
+       */
+      sample?: string
       /** Present when the fallback ran (and lost too): which model failed and the reason that triggered it. */
       fellBack?: { from: string; to: string; reason: string }
     }
 
 const MAX_STDOUT = 8 * 1024 * 1024
+/** How much of a failed provider's answer a failure result may quote — scrubbed first, then cut. */
+const SAMPLE_CHARS = 200
 const DEFAULT_TIMEOUT_MS = 90_000
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 
@@ -358,7 +366,7 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     hops.length === 0
       ? undefined
       : { from: hops[0]!.from, to: hops[hops.length - 1]!.to, reason: hops.map((h) => h.reason).join("; ") }
-  let lastFail: { reason: "model-failed" | "no-json" | "invalid"; detail: string } = {
+  let lastFail: { reason: "model-failed" | "no-json" | "invalid"; detail: string; sample?: string } = {
     reason: "model-failed",
     detail: "no attempt ran",
   }
@@ -453,8 +461,13 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     for (;;) {
       const run = await runModel(current, prompt)
       modelMs += run.ms
-      let fail: { reason: "model-failed" | "no-json" | "invalid"; detail: string }
+      let fail: { reason: "model-failed" | "no-json" | "invalid"; detail: string; sample?: string }
       if (run.ok) {
+        // the answer arrived but was unusable — quote a bounded, scrubbed prefix of it on the
+        // failure so a no-json/invalid drain log shows what the provider actually said. Scrub
+        // the whole answer BEFORE the cut (F1's rule): a secret straddling char 200 must never
+        // leave a fragment in the log.
+        const sample = scrubSecrets(run.stdout).slice(0, SAMPLE_CHARS)
         const obj = extractJsonObject(run.stdout)
         // An object holding none of the ten content fields (a "reasoning" object like
         // {"thinking": "…"}) counts as no output at all — and since a provider that
@@ -478,10 +491,10 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
             }
             break
           }
-          fail = { reason: "invalid", detail: checked.detail }
+          fail = { reason: "invalid", detail: checked.detail, sample }
           invalidFields = checked.fields
         } else {
-          fail = { reason: "no-json", detail: obj === undefined ? "model output held no JSON object" : "first JSON object held no checkpoint fields" }
+          fail = { reason: "no-json", detail: obj === undefined ? "model output held no JSON object" : "first JSON object held no checkpoint fields", sample }
         }
       } else {
         fail = { reason: "model-failed", detail: run.detail }
@@ -496,7 +509,7 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
       }
       const next = queue.shift()
       if (next === undefined) {
-        lastFail = { reason: fail.reason, detail: trail.join("; ") }
+        lastFail = { reason: fail.reason, detail: trail.join("; "), ...(fail.sample !== undefined ? { sample: fail.sample } : {}) }
         break
       }
       hops.push({ from: current.label, to: next.label, reason: `${current.label}: ${fail.detail}` })
@@ -515,6 +528,7 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
           attempts: attempt,
           retried,
           ...(invalidFields !== undefined ? { fields: invalidFields } : {}),
+          ...(lastFail.sample !== undefined ? { sample: lastFail.sample } : {}),
           ...(fb !== undefined ? { fellBack: fb } : {}),
         }
       }
@@ -543,5 +557,13 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
   }
   // a fallback chain that ran and still lost is part of the failure report — the daemon log says so
   const fb = fellBack()
-  return { ok: false, reason: lastFail.reason, detail: lastFail.detail, attempts, retried, ...(fb !== undefined ? { fellBack: fb } : {}) }
+  return {
+    ok: false,
+    reason: lastFail.reason,
+    detail: lastFail.detail,
+    attempts,
+    retried,
+    ...(lastFail.sample !== undefined ? { sample: lastFail.sample } : {}),
+    ...(fb !== undefined ? { fellBack: fb } : {}),
+  }
 }

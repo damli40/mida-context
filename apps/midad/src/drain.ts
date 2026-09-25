@@ -374,8 +374,8 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             // a fallback that ran and still lost belongs in the log — "model-failed" alone
             // would hide that the second model was tried too
             if (compiled.fellBack !== undefined) log({ sessionId, outcome: "note", reason: "compile-fallback-failed", fellBack: compiled.fellBack })
-            if (compiled.reason === "invalid") throw new CheckpointPayloadError("invalid-checkpoint", "the compiler produced an invalid checkpoint", compiled.fields)
-            throw new DrainFailure(compiled.reason)
+            if (compiled.reason === "invalid") throw new CheckpointPayloadError("invalid-checkpoint", "the compiler produced an invalid checkpoint", compiled.fields, compiled.sample)
+            throw new DrainFailure(compiled.reason, compiled.sample)
           }
           envelope = wrapCheckpoint({
             projectId,
@@ -486,6 +486,14 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         const code = failureCode(error)
         // field names are safe to log; values, validator messages and error.message are not
         const fields = error instanceof CheckpointPayloadError && error.fields !== undefined ? { fields: error.fields } : {}
+        // the compiler's scrubbed ≤200-char prefix of the last provider answer — already safe
+        // to log; absent when the failure had no answer to quote
+        const sample =
+          error instanceof DrainFailure && error.sample !== undefined
+            ? { sample: error.sample }
+            : error instanceof CheckpointPayloadError && error.sample !== undefined
+              ? { sample: error.sample }
+              : {}
         if (PERMANENT_FAILURES.has(code)) {
           if (code === "not-approved" || code === "revoked") {
             // every queued job for this agent fails the same way — remove them all, like not-approved
@@ -495,7 +503,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           }
           // terminal state records the real transcript stats: an identical job later skips as unchanged
           writeState(deps.home, sessionId, terminalState(job.transcriptPath, now().toISOString()))
-          log({ sessionId, outcome: "bad", reason: code, ...fields })
+          log({ sessionId, outcome: "bad", reason: code, ...fields, ...sample })
           continue
         }
         // transient: keep the job, count the attempt, and hold the session until the backoff passes
@@ -505,7 +513,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         if (attempts >= MAX_ATTEMPTS || invalidGaveUp) {
           moveToBad(deps.home, `${job.id}.json`)
           writeState(deps.home, sessionId, terminalState(job.transcriptPath, now().toISOString()))
-          log({ sessionId, outcome: "bad", reason: invalidGaveUp ? "invalid-checkpoint" : "gave-up", ...fields })
+          log({ sessionId, outcome: "bad", reason: invalidGaveUp ? "invalid-checkpoint" : "gave-up", ...fields, ...sample })
           continue
         }
         writeState(deps.home, sessionId, {
@@ -518,7 +526,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           failedAt: now().toISOString(),
         })
         dueSooner(now().getTime() + backoffMs(attempts))
-        log({ sessionId, outcome: "failed", reason: code, attempts, ...fields })
+        log({ sessionId, outcome: "failed", reason: code, attempts, ...fields, ...sample })
       }
     }
     // The batched lane's follow-up: every pass asks the store where each ledger-owned save stands.
@@ -554,7 +562,11 @@ function removalReason(home: MidaHome, agent: string, reason: string): string {
 
 /** A transient failure raised inside the drain pass, carrying the stable code the log uses. */
 class DrainFailure extends Error {
-  constructor(readonly code: "model-failed" | "no-json") {
+  constructor(
+    readonly code: "model-failed" | "no-json",
+    /** A bounded, already-scrubbed prefix of the provider's last answer — the compiler supplies it. */
+    readonly sample?: string,
+  ) {
     super(code)
     this.name = "DrainFailure"
   }

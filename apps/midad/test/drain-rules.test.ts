@@ -32,10 +32,19 @@ function setup() {
   writeFileSync(join(cwd, ".mida", "project.json"), JSON.stringify({ projectId: "p-1" }))
   const compileCalls: CompileInput[] = []
   const saveCalls: unknown[] = []
-  const flags: { saveFailures: number; checkpoint?: Checkpoint; compileReason?: "model-failed" | "no-json" | "invalid" } = { saveFailures: 0 }
+  const flags: { saveFailures: number; checkpoint?: Checkpoint; compileReason?: "model-failed" | "no-json" | "invalid"; compileSample?: string } = { saveFailures: 0 }
   const compile: typeof compileCheckpoint = async (input) => {
     compileCalls.push(input)
-    if (flags.compileReason !== undefined) return { ok: false, reason: flags.compileReason, detail: "stub", attempts: 1, retried: 0 }
+    if (flags.compileReason !== undefined) {
+      return {
+        ok: false,
+        reason: flags.compileReason,
+        detail: "stub",
+        attempts: 1,
+        retried: 0,
+        ...(flags.compileSample !== undefined ? { sample: flags.compileSample } : {}),
+      }
+    }
     return {
       ok: true,
       checkpoint: flags.checkpoint ?? sampleCheckpoint({ eventId: input.eventId, agent: input.agent }),
@@ -448,6 +457,38 @@ describe("a failed save does not buy a new model call", () => {
     // inside the backoff the job waits untouched
     const held = await drain({ now: () => new Date(T0 + 120_000 + 30_000) })
     expect(held).toMatchObject({ skippedTooSoon: 1, failed: 0 })
+  })
+
+  it("a no-json compile failure logs a sample of the provider's last answer (F4)", async () => {
+    const { job, drain, flags, drainLog } = setup()
+    flags.compileReason = "no-json"
+    flags.compileSample = "I cannot comply; the key is [REDACTED] — padding"
+    job({ event: "Stop" }, T0)
+    const result = await drain({ now: () => new Date(T0 + 120_000) })
+    expect(result.failed).toBe(1)
+    const failed = drainLog()
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((r) => r.outcome === "failed")
+    expect(failed?.reason).toBe("no-json")
+    expect(failed?.sample).toBe("I cannot comply; the key is [REDACTED] — padding")
+  })
+
+  it("an invalid compile's sample lands on the failed line too (F4)", async () => {
+    const { job, drain, flags, drainLog } = setup()
+    flags.compileReason = "invalid"
+    flags.compileSample = '{"objective":5}'
+    job({ event: "Stop" }, T0)
+    const result = await drain({ now: () => new Date(T0 + 120_000) })
+    expect(result.failed).toBe(1)
+    const failed = drainLog()
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((r) => r.outcome === "failed")
+    expect(failed?.reason).toBe("invalid-checkpoint")
+    expect(failed?.sample).toBe('{"objective":5}')
   })
 })
 

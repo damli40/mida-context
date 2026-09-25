@@ -18,11 +18,14 @@ export class CheckpointPayloadError extends Error {
   readonly code: PayloadErrorCode
   /** Leading field paths from the validator — names only, never values; safe for logs. */
   readonly fields?: string[]
-  constructor(code: PayloadErrorCode, message: string, fields?: string[]) {
+  /** A bounded, already-scrubbed prefix of the provider's last answer — the compiler supplies it. */
+  readonly sample?: string
+  constructor(code: PayloadErrorCode, message: string, fields?: string[], sample?: string) {
     super(message)
     this.name = "CheckpointPayloadError"
     this.code = code
     this.fields = fields
+    this.sample = sample
   }
 }
 

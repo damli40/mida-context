@@ -34,6 +34,8 @@
 //   nojson-flaky — "not json" on its FIRST run, good after (same counter)
 //   badshape-count — badshape on every run, counting them: proves the retry
 //              fired once on the primary and never on a fallback
+//   prose-secret — prints a long paragraph holding a key shape and no JSON:
+//              the failure sample must carry it scrubbed and cut to 200 chars
 //
 // The mode comes from argv[2] when present, else FAKE_MODEL_MODE — argv lets a
 // primary and a fallback command differ inside one compile even though both
@@ -126,6 +128,9 @@ process.stdin.on("end", () => {
       process.stdout.write('{"objective":5}')
       break
     }
+    case "prose-secret":
+      process.stdout.write("I cannot help with that; the key is sk-live-abcdefgh12345678 — " + "padding ".repeat(60))
+      break
     case "grandchild": {
       const g = spawn(process.execPath, ["-e", "setTimeout(()=>{},60000)"], {
         stdio: ["ignore", "inherit", "ignore"],
