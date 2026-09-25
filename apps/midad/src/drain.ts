@@ -410,9 +410,13 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           checkpoint: envelope.checkpoint,
         })
         writeState(deps.home, sessionId, terminal)
-        // the saved checkpoint's content fields are the next compile's `previous`
+        // the saved checkpoint's content fields — and its verbatim
+        // originalRequest — are the next compile's `previous`: without the
+        // request in the file, a post-/compact save can never keep the
+        // session's first ask
         const content: Record<string, unknown> = {}
         for (const field of CONTENT_FIELDS) content[field] = envelope.checkpoint[field]
+        content.originalRequest = envelope.checkpoint.originalRequest
         deps.home.writeSecretJson(`queue/state/${sessionId}.last.json`, content)
         removeJob(deps.home, job.id)
         if (saved.batched !== undefined) {
@@ -711,12 +715,18 @@ function acquireDrainLock(home: MidaHome, now: () => Date): { release: () => voi
   return null
 }
 
+// The keys a `.last.json` may hold: the ten content fields plus the verbatim
+// originalRequest the next compile needs to keep the session's first ask.
+// The request stays code-side — buildExtractPrompt sends the content fields
+// only — but it must round-trip through the file or it is lost between saves.
+const PREVIOUS_KEYS = new Set<string>([...CONTENT_FIELDS, "originalRequest"])
+
 /**
- * The session's last saved checkpoint, kept as its ten content fields at
- * `queue/state/<sessionId>.last.json`, becomes the next compile's `previous`.
- * The file is drainer-written but still untrusted input: it must hold only the
- * content fields and pass validation, or the compile starts from nothing and
- * the pass logs `previous-unreadable`.
+ * The session's last saved checkpoint, kept as its ten content fields plus its
+ * verbatim originalRequest at `queue/state/<sessionId>.last.json`, becomes the
+ * next compile's `previous`. The file is drainer-written but still untrusted
+ * input: it must hold only those keys and pass validation, or the compile
+ * starts from nothing and the pass logs `previous-unreadable`.
  */
 function readPrevious(home: MidaHome, sessionId: string): { checkpoint?: Checkpoint; unreadable: boolean } {
   let raw: unknown
@@ -728,7 +738,7 @@ function readPrevious(home: MidaHome, sessionId: string): { checkpoint?: Checkpo
   if (raw === undefined) return { unreadable: false }
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { unreadable: true }
   const record = raw as Record<string, unknown>
-  if (Object.keys(record).some((k) => !(CONTENT_FIELDS as readonly string[]).includes(k))) return { unreadable: true }
+  if (Object.keys(record).some((k) => !PREVIOUS_KEYS.has(k))) return { unreadable: true }
   // the placeholders below are never seen by the model — buildExtractPrompt
   // sends the ten content fields only — but validation needs a full record
   const checked = validateCheckpoint({
