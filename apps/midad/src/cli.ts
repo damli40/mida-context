@@ -318,6 +318,13 @@ export async function runCliWithRuntime(
           print(projectCheckRefusal(runtime, agent, check).text)
           return 1
         }
+        // The approval names THIS folder's project: an agent approved for project A may not
+        // list another project's checkpoints by passing B's id on the command line — the
+        // folder gate alone would have let that through (L1).
+        if (projectId !== check.approval.projectId) {
+          print(`project-mismatch: this folder is approved for ${check.approval.projectId}, not ${projectId}`)
+          return 1
+        }
         const result = await readCheckpoints(runtime, agent, projectId)
         print(`read ${result.checkpoints.length} checkpoint(s) in ${result.milliseconds} ms`)
         if (result.partial) print("list incomplete — run again")

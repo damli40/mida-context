@@ -45,14 +45,17 @@ describe("the crude mida command", () => {
     expect(await run("init")).toBe(0)
     expect(await run("request", "claude-code")).toBe(0)
     expect(await run("approve", "claude-code")).toBe(0)
-    expect(await run("save-demo", "claude-code", "proj-1")).toBe(0)
-    expect(await run("read", "codex", "proj-1")).toBe(1)
+    // approve wrote this folder's marker — reads name ITS project id; any other
+    // id answers project-mismatch before the store is ever asked (L1)
+    const projectId = (JSON.parse(readFileSync(join(projectDir, ".mida", "project.json"), "utf8")) as { projectId: string }).projectId
+    expect(await run("save-demo", "claude-code", projectId)).toBe(0)
+    expect(await run("read", "codex", projectId)).toBe(1)
     expect(await run("request", "codex")).toBe(0)
     expect(await run("approve", "codex")).toBe(0)
-    expect(await run("read", "codex", "proj-1")).toBe(0)
+    expect(await run("read", "codex", projectId)).toBe(0)
     expect(await run("revoke", "claude-code")).toBe(0)
-    expect(await run("read", "claude-code", "proj-1")).toBe(1)
-    expect(await run("read", "codex", "proj-1")).toBe(0)
+    expect(await run("read", "claude-code", projectId)).toBe(1)
+    expect(await run("read", "codex", projectId)).toBe(0)
     // the G12 folder gate answers before the chain is asked — and the marker revoke left behind
     // turns the not-approved answer into the honest "the owner revoked this" line
     expect(lines).toContain(
@@ -296,10 +299,12 @@ describe("the crude mida command", () => {
     // a fact from the remember test above, labelled with its area
     expect(await run2("read", "--as", "claude-code")).toBe(0)
     expect(lines).toContain("  preferences.communication: prefers short answers")
-    // checkpoints carry their area too — resolved from the record's namespace id
-    expect(await run2("save-demo", "claude-code", "proj-areas")).toBe(0)
+    // checkpoints carry their area too — resolved from the record's namespace id.
+    // The project id read must be THIS folder's marker id (L1) — anything else mismatches.
+    const projectId = (JSON.parse(readFileSync(join(projectDir, ".mida", "project.json"), "utf8")) as { projectId: string }).projectId
+    expect(await run2("save-demo", "claude-code", projectId)).toBe(0)
     lines.length = 0
-    expect(await run2("read", "claude-code", "proj-areas")).toBe(0)
+    expect(await run2("read", "claude-code", projectId)).toBe(0)
     expect(lines.some((line) => /^  projects\.current: 0x[0-9a-f]{64} written by /.test(line))).toBe(true)
   }, 300_000)
 
@@ -678,9 +683,11 @@ describe("the crude mida command", () => {
     expect(lines).toContain("claude-code holds an approval")
     expect(lines).toContain("not revoked")
     expect(lines.some((line) => line.startsWith("revoked "))).toBe(false)
-    // still really approved: no marker, and the read still goes through
+    // still really approved: no marker, and the read still goes through — naming
+    // the folder's own project id, the only id the L1 gate accepts here
     expect(home.has("agents/claude-code/revoked.json")).toBe(false)
-    expect(await run2("read", "claude-code", "proj-1")).toBe(0)
+    const projectId = (JSON.parse(readFileSync(join(projectDir, ".mida", "project.json"), "utf8")) as { projectId: string }).projectId
+    expect(await run2("read", "claude-code", projectId)).toBe(0)
     // restore the all-revoked state the next test builds on
     expect(await run2("revoke", "claude-code")).toBe(0)
   }, 300_000)
@@ -901,8 +908,11 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     Object.assign(stub, { owner: privateKeyToAccount(loadOrCreateOwnerSecrets(stub.home).privateKey).address })
     const folder = mkdtempSync(join(tmpdir(), "mida-g12-approved-"))
     await approveProject(stub as unknown as Runtime, { agent: "codex", cwd: folder })
+    // the read names the folder's own project id — any other id is refused by the
+    // L1 mismatch gate before the missing-identity answer could ever be reached
+    const marker = JSON.parse(readFileSync(join(folder, ".mida", "project.json"), "utf8")) as { projectId: string }
     const lines: string[] = []
-    const code = await runCliWithRuntime(["read", "codex", "p1"], stub, (line) => lines.push(line), { cwd: folder })
+    const code = await runCliWithRuntime(["read", "codex", marker.projectId], stub, (line) => lines.push(line), { cwd: folder })
     expect(code).toBe(1)
     expect(lines).toEqual([`Mida: no agent "codex" is set up in this Mida home (${stub.home.root}). Nothing was shared.`])
   })
@@ -1022,6 +1032,30 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     const code = await runCliWithRuntime(["read", "reader", "p1"], stub, (line) => lines.push(line))
     expect(code).toBe(1)
     expect(lines).toEqual(["Mida: reader is not approved for this project — run `mida approve reader` in this folder."])
+  })
+
+  it("read <agent> <projectId> naming a different project's id is refused — the approval is for THIS folder's project (L1)", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-l1-")))
+    writeIdentity(home, "reader")
+    const owner = privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey).address
+    // no store or reader on the stub: if the gate let the call through, readCheckpoints
+    // would throw and the catch's "refused: …" line would fail the assertion loudly
+    const stub = { home, owner } as unknown as ServiceRuntime
+    // approved in folder A — its list row carries A's marker project id…
+    const approved = mkdtempSync(join(tmpdir(), "mida-l1-approved-"))
+    await approveProject(stub as unknown as Runtime, { agent: "reader", cwd: approved })
+    const marker = JSON.parse(readFileSync(join(approved, ".mida", "project.json"), "utf8")) as { projectId: string }
+    const lines: string[] = []
+    // …then a read from that approved folder naming project B's id is refused, and
+    // nothing about B — no checkpoint ids, no authors — is ever printed
+    const code = await runCliWithRuntime(
+      ["read", "reader", "p-other"],
+      stub,
+      (line) => lines.push(line),
+      { cwd: approved },
+    )
+    expect(code).toBe(1)
+    expect(lines).toEqual([`project-mismatch: this folder is approved for ${marker.projectId}, not p-other`])
   })
 
   it("read --as assistant projects.current names the real fix, never request+approve assistant (G8)", async () => {
