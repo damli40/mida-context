@@ -249,6 +249,66 @@ describe("compileCheckpoint", () => {
     expect(stdin).not.toContain("The FIRST block is the user's original request")
   })
 
+  // L7: the "no original request" wording belongs only to compiles that pinned
+  // NO request. A /clear or /model opener sets openedWithScaffolding, but the
+  // real prompt after it is still pinned — so the normal wording applies. A
+  // valid earlier request in `previous` counts as pinned too.
+  it("a /clear opener followed by a real prompt still gets the request-present wording (L7)", async () => {
+    const cleared = path.join(dir, "cleared.jsonl")
+    fs.writeFileSync(
+      cleared,
+      [
+        JSON.stringify({ type: "user", message: { role: "user", content: "<command-name>/clear</command-name>\n<command-message>clear</command-message>" } }),
+        JSON.stringify({ type: "user", message: { role: "user", content: "now build the websocket retry" } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "on it" }] } }),
+      ].join("\n"),
+    )
+    process.env.FAKE_MODEL_STDIN_LOG = stdinLogPath
+    const r = await compileCheckpoint({ ...base, transcriptPath: cleared, model: fake("good") })
+    expect(r.ok).toBe(true)
+    const stdin = fs.readFileSync(stdinLogPath, "utf8")
+    expect(stdin).toContain("The FIRST block is the user's original request")
+    expect(stdin).not.toContain("No original request was captured")
+    expect(r.ok && r.checkpoint.originalRequest).toBe("now build the websocket retry")
+
+    // and a kept earlier request pins too: the same K5 scaffolding-only
+    // transcript plus a real previous request sends the normal wording
+    const previous: Checkpoint = {
+      eventId: "evt-earlier",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: new Date().toISOString(),
+      objective: "earlier work",
+      originalRequest: "the earlier real request",
+      progress: [],
+      decisions: [],
+      rejected: [],
+      constraints: [],
+      artifacts: [],
+      unresolvedIssue: null,
+      nextAction: "next",
+      remainingPlan: [],
+      evidence: [],
+    }
+    const scaffolded = path.join(dir, "scaffolded.jsonl")
+    fs.writeFileSync(
+      scaffolded,
+      [
+        JSON.stringify({ type: "user", message: { role: "user", content: "<local-command-caveat>Caveat: local command output follows.</local-command-caveat>" } }),
+        JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: "condensed summary of the earlier session" } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "continuing" }] } }),
+      ].join("\n"),
+    )
+    // the log APPENDS — assert on this compile's prompt, not both
+    const offset = fs.readFileSync(stdinLogPath, "utf8").length
+    const kept = await compileCheckpoint({ ...base, transcriptPath: scaffolded, model: fake("good"), previous })
+    expect(kept.ok).toBe(true)
+    const keptStdin = fs.readFileSync(stdinLogPath, "utf8").slice(offset)
+    expect(keptStdin).toContain("The FIRST block is the user's original request")
+    expect(keptStdin).not.toContain("No original request was captured")
+    expect(kept.ok && kept.checkpoint.originalRequest).toBe("the earlier real request")
+  })
+
   it("an agent with no transcript reader is refused, never parsed through another format (F9)", async () => {
     // "gemini" has no reader — before this fix the code fell back to the Claude reader,
     // so a transcript in an unknown format was silently read as Claude Code's

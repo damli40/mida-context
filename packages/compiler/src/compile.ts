@@ -353,16 +353,25 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     error.code = "unknown-transcript-format"
     throw error
   }
-  // The pinned first block is the user's original request only when the
-  // transcript opened on the human's own words. A Claude transcript that
-  // opened on /compact plumbing or a resumed tool_result pins a CONTINUATION
-  // line — calling it the original request was the lie that made live saves
-  // answer in prose and fail no-json. Codex's pre-request lines are boilerplate
-  // its reader already drops, so its first real user message is still the ask.
-  const originalRequestCaptured =
-    convo.firstUserMessage !== null &&
-    (convo.format !== "claude-jsonl" || !convo.openedWithScaffolding)
-  const prompt = buildExtractPrompt(convo.text, input.previous, originalRequestCaptured)
+  // The request this compile pins, decided once so the prompt wording and the
+  // saved field can never disagree. A transcript that opened on scaffolding
+  // (post-compact, a /clear, a resumed tool_result) yields a CONTINUATION line,
+  // not the session's ask — a kept earlier request beats it. That kept value is
+  // itself re-checked with the reader's scaffolding test: a .last.json saved
+  // before the test existed can hold caveat or command-echo text, and keeping
+  // it would lock the bad pick into every later save (L3). With no earlier
+  // request the continuation pick is still the best verbatim record — it lands
+  // rather than null.
+  const earlier = input.previous?.originalRequest
+  const kept = typeof earlier === "string" && stripLeadingScaffolds(earlier) !== "" ? earlier : null
+  const fresh = convo.openedWithScaffolding ? null : convo.firstUserMessage
+  const pinnedRequest = fresh ?? kept ?? convo.firstUserMessage
+
+  // "No original request was captured" is the honest wording only when NOTHING
+  // is pinned — a /clear or /model opener followed by a real prompt still pins
+  // that prompt, and a valid earlier request pins too (L7). Saying it anyway
+  // was the lie that taught the model to answer in prose and fail no-json.
+  const prompt = buildExtractPrompt(convo.text, input.previous, pinnedRequest !== null)
 
   // Stored paths must not leak the local folder layout: a path under the
   // project cwd becomes relative; a path still absolute under the user's
@@ -425,23 +434,9 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     picked.agent = input.agent
     picked.source = "hook-compiler"
     picked.createdAt = now().toISOString()
-    // A transcript whose first user line is absent or was skipped as
-    // scaffolding yields no fresh pick — the previous checkpoint's request
-    // stands rather than being blanked out by one bad compile window. The
-    // same holds when the transcript OPENED on scaffolding (post-compact or
-    // resumed): its first real user line is a continuation, not a fresh ask,
-    // so it does not displace the earlier request. Only a transcript that
-    // starts with the user's own message replaces it. When there is no
-    // earlier request, the continuation's pick is still the best verbatim
-    // record — it lands rather than null.
-    // The kept earlier value is itself re-checked with the reader's
-    // scaffolding test: a .last.json saved before that test existed can hold
-    // caveat or command-echo text, and keeping it would lock the bad pick in
-    // for every later save (L3).
-    const earlier = input.previous?.originalRequest
-    const kept = typeof earlier === "string" && stripLeadingScaffolds(earlier) !== "" ? earlier : null
-    const fresh = convo.openedWithScaffolding ? null : convo.firstUserMessage
-    picked.originalRequest = fresh ?? kept ?? convo.firstUserMessage
+    // The request decided before the prompt was built — fresh pick, kept
+    // earlier request, or the transcript's continuation line, in that order.
+    picked.originalRequest = pinnedRequest
 
     if (Array.isArray(picked.artifacts)) {
       picked.artifacts = picked.artifacts.map((a) => (typeof a === "string" ? rel(a) : a))
