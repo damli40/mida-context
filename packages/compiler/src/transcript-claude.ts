@@ -111,12 +111,12 @@ const CLAUDE_SCAFFOLD_PREFIXES = [
   "<user-prompt-submit-hook>",
 ]
 
-// A user line is scaffolding when the transcript itself flags it — isMeta marks
-// Claude Code bookkeeping, isCompactSummary the compacted-history note — or when
-// its text opens with one of the injected tags. Scaffolding still renders as an
-// ordinary block; it only may never become firstUserMessage.
-function isScaffolding(obj: TranscriptLine, text: string): boolean {
-  if (obj.isMeta === true || obj.isCompactSummary === true) return true
+// A line whose text opens with an injected tag is the tool's scaffolding —
+// never the request, and dropped from the rendered conversation entirely:
+// what the model gets is the human's conversation, not Claude Code's plumbing.
+// (The isCompactSummary line is NOT in this set — the condensed history is
+// real session context and still renders; it just may not be the request.)
+function isScaffoldText(text: string): boolean {
   const t = text.trimStart()
   return CLAUDE_SCAFFOLD_PREFIXES.some((pre) => t.startsWith(pre))
 }
@@ -239,23 +239,27 @@ export function readConversation(
     if (typeof folder === "string" && folder !== "" && !cwds.includes(folder)) cwds.push(folder)
     if (obj?.type !== "user" && obj?.type !== "assistant") continue
     messagesTotal++
+    const isUser = obj.type === "user"
+    const userText = isUser ? userRequestText(obj.message?.content) : ""
     let picked = false
-    if (firstUserMessage === null && obj.type === "user") {
-      const t = userRequestText(obj.message?.content)
+    if (firstUserMessage === null && isUser) {
       // A slash-command echo is scaffolding-shaped, but a custom command's
       // <command-args> ARE the ask — try that extraction before the
       // scaffolding test drops the line. isMeta/isCompactSummary lines never
       // yield a request either way.
+      const meta = obj.isMeta === true || obj.isCompactSummary === true
       const request =
-        t !== "" && obj.isMeta !== true && obj.isCompactSummary !== true
-          ? (slashCommandRequest(t) ?? (isScaffolding(obj, t) ? null : t))
-          : null
+        userText !== "" && !meta ? (slashCommandRequest(userText) ?? (isScaffoldText(userText) ? null : userText)) : null
       if (request !== null) {
         firstUserMessage = hardCut(scrubSecrets(request), FIRST_USER_CHARS)
         picked = true
       }
     }
-    const block = renderMessage(label, obj)
+    // Scaffolding is dropped from the rendered conversation too, not only
+    // from the request pick: isMeta bookkeeping lines and any user line whose
+    // text opens with an injected tag render nothing at all.
+    const dropped = isUser && (obj.isMeta === true || (userText !== "" && isScaffoldText(userText)))
+    const block = dropped ? null : renderMessage(label, obj)
     if (block) {
       msgs.push({ role: obj.type, block })
       if (picked) pinIdx = msgs.length - 1

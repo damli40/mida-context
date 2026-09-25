@@ -148,6 +148,9 @@ export function readCodexConversation(
   const cwds: string[] = []
   let messagesTotal = 0
   let firstUserMessage: string | null = null
+  // the index in `msgs` of the block firstUserMessage came from — fitMessages
+  // pins exactly it, not whichever user block happens to render first
+  let pinIdx: number | undefined
   for (const { label, text: line } of lines) {
     if (!line.trim()) continue
     let obj: { type?: unknown; payload?: unknown }
@@ -176,15 +179,21 @@ export function readCodexConversation(
       const text = parts.join("\n")
       if (role === "user" && isInjectedUserText(text)) continue
       messagesTotal++
-      if (role === "user" && firstUserMessage === null && text)
+      let picked = false
+      if (role === "user" && firstUserMessage === null && text) {
         firstUserMessage = hardCut(scrubSecrets(text), FIRST_USER_CHARS)
+        picked = true
+      }
       const body = parts
         // scrub before the cut: a secret straddling the boundary would otherwise
         // no longer match the scrubber and most of it would reach the model
         .map((t) => cut(scrubSecrets(t), PART_CHARS))
         .filter((t) => t.length)
         .join("\n")
-      if (body) msgs.push({ role, block: `L${label} ${role}:\n${body}` })
+      if (body) {
+        msgs.push({ role, block: `L${label} ${role}:\n${body}` })
+        if (picked) pinIdx = msgs.length - 1
+      }
       continue
     }
 
@@ -218,7 +227,7 @@ export function readCodexConversation(
     }
   }
 
-  const fitted = fitMessages(msgs, maxChars, truncated)
+  const fitted = fitMessages(msgs, maxChars, truncated, pinIdx)
   return {
     format: "codex-jsonl",
     text: fitted.text,

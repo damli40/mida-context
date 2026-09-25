@@ -96,7 +96,8 @@ export function readTranscriptLines(path: string): TranscriptLines {
  * follow THAT line — a transcript can hold an earlier user-role block that
  * carries no request (Claude Code scaffolding, a bare tool_result), and
  * pinning it would headline the file with text that is not the request.
- * Absent or out of range, the first user block is pinned as before.
+ * Absent or out of range, NOTHING is pinned: with no real request picked, the
+ * first user block is not a stand-in for one.
  */
 export function fitMessages(
   msgs: { role: string; block: string }[],
@@ -104,7 +105,7 @@ export function fitMessages(
   truncated: boolean,
   pinIdx?: number,
 ): { text: string; messagesKept: number; omitted: number } {
-  const pin = pinIdx !== undefined && pinIdx >= 0 && pinIdx < msgs.length ? pinIdx : msgs.findIndex((m) => m.role === "user")
+  const pin = pinIdx !== undefined && pinIdx >= 0 && pinIdx < msgs.length ? pinIdx : -1
   const headCap = Math.min(FIRST_USER_CHARS, Math.max(0, maxChars - 200))
   const head = pin >= 0 ? cut(msgs[pin]!.block, headCap) : null
   const rest = msgs.filter((_, i) => i !== pin)
