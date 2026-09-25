@@ -306,6 +306,18 @@ describe("renderMe", () => {
     expect(status!.textContent).not.toContain("index")
   })
 
+  it("provenance badges only ever ride on anchored rows — unverified and pending read Source unknown", () => {
+    const rows = [
+      record({ state: "unverified", source: 1, contextId: `0x${"d1".repeat(32)}` as Hex }),
+      record({ lane: "batched", state: "pending", source: 3, contextId: `0x${"d2".repeat(32)}` as Hex }),
+      record({ state: "unknown", source: 2, contextId: `0x${"d3".repeat(32)}` as Hex }),
+    ]
+    const root = renderMe(data({ records: rows }), fakeDoc()) as unknown as FakeEl
+    expect(root.textContent).not.toContain("You said")
+    expect(root.textContent).not.toContain("inferred")
+    expect(all(root, ".badge").filter((b) => b.textContent === "Source unknown")).toHaveLength(3)
+  })
+
   it("a row whose chain check could not run says 'could not check Monad just now' — never 'not on Monad'", () => {
     const root = renderMe(data({ records: [record({ state: "unknown" })] }), fakeDoc()) as unknown as FakeEl
     expect(root.textContent).toContain("could not check Monad just now")

@@ -247,12 +247,14 @@ function world() {
 }
 
 /** One sealed, signed batched save — the same fixture shape verifyBatchedItem passes on. */
-async function makeBatchedItem(opts: { anchored: boolean } = { anchored: true }) {
+async function makeBatchedItem(opts: { anchored?: boolean; owner?: Address } = {}) {
+  const anchored = opts.anchored ?? true
+  const owner = opts.owner ?? OWNER
   const objectNonce = `0x${"99".repeat(32)}` as Hex
   const contextId = batchContextId({
     chainId: DEPLOYMENT.chainId,
     batchAnchor: ANCHOR,
-    owner: OWNER,
+    owner,
     agentId: AGENT_ID,
     namespaceId: NS,
     parentId: zeroHash,
@@ -271,7 +273,7 @@ async function makeBatchedItem(opts: { anchored: boolean } = { anchored: true })
     epochPublicKey: epochKeys.publicKey,
   })
   const message: BatchSaveMessage = {
-    owner: OWNER,
+    owner,
     namespaceId: NS,
     objectNonce,
     lineageId: zeroHash,
@@ -295,11 +297,11 @@ async function makeBatchedItem(opts: { anchored: boolean } = { anchored: true })
   const root = merkleRoot(leaves)
   const proof = merkleProof(leaves, 0)
   const item: BatchedReadItem = {
-    state: opts.anchored ? "ANCHORED" : "QUEUED",
+    state: anchored ? "ANCHORED" : "QUEUED",
     save: { message: { ...message, readEpoch: "1", expiresAt: "0" }, signature, manifest: sealed.manifest, ciphertext: hexOf(sealed.ciphertext) },
     contextId,
     receivedAt: (NOW - 60) * 1000,
-    ...(opts.anchored ? { batchId: BATCH_ID, position: 0, lineageId, version: 1, proof } : {}),
+    ...(anchored ? { batchId: BATCH_ID, position: 0, lineageId, version: 1, proof } : {}),
   }
   return { item, contextId, root, leaf }
 }
@@ -683,5 +685,44 @@ describe("loadMe — a failed chain check is 'unknown', never 'unverified'", () 
     const data = await loadMe(OWNER, ports)
     const row = data.records.find((r) => r.contextId === contextId)
     expect(row!.state).toBe("unverified")
+  })
+})
+
+describe("loadMe — provenance only rides on verified rows", () => {
+  it("an unverified direct row never borrows the index's provenance claim", async () => {
+    const { state, ports } = world()
+    const { obj } = makeDirectObject()
+    state.objects.set(NS_SKILLS, [obj])
+    // The index claims the owner said it — the chain holds no such record, so the row carries
+    // no provenance at all.
+    state.countsResult = {
+      Owner_by_pk: { records: 1, batchedSaves: 0 },
+      ContextRecord: [{ id: obj.contextId, namespaceId: NS_SKILLS, provenanceSource: 1, createdAt: String(NOW - 3600), txHash: TX3 }],
+    }
+    const data = await loadMe(OWNER, ports)
+    const row = data.records.find((r) => r.contextId === obj.contextId)
+    expect(row!.state).toBe("unverified")
+    expect(row!.source).toBeNull()
+  })
+
+  it("an ANCHORED batched save whose signed message names another owner is unverified, whatever the proof", async () => {
+    const { state, ports } = world()
+    const foreignOwner = `0x${"33".repeat(20)}` as Address
+    const { item, contextId, root } = await makeBatchedItem({ owner: foreignOwner })
+    state.batched.set(NS, [item])
+    state.batchRoots.set(BATCH_ID, root) // the Merkle proof verifies — the row still is not ours
+    const data = await loadMe(OWNER, ports)
+    const row = data.records.find((r) => r.contextId === contextId)
+    expect(row).toBeDefined()
+    expect(row!.state).toBe("unverified")
+  })
+
+  it("a QUEUED batched save naming another owner is unverified, not pending", async () => {
+    const { state, ports } = world()
+    const foreignOwner = `0x${"33".repeat(20)}` as Address
+    const { item, contextId } = await makeBatchedItem({ anchored: false, owner: foreignOwner })
+    state.batched.set(NS, [item])
+    const data = await loadMe(OWNER, ports)
+    expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("unverified")
   })
 })

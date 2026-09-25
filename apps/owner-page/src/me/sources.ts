@@ -754,7 +754,9 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
       state: directCheckFailed ? "unknown" : record !== null && directMatches(record, object, ownerKey) ? "anchored" : "unverified",
       authorId: object.authorId,
       authorName: await nameFor(object.authorId),
-      source: record?.provenanceSource ?? indexRecord?.provenanceSource ?? null,
+      // Provenance is the chain record's word or nothing — the index's claim is never borrowed
+      // for a row the chain did not confirm.
+      source: record?.provenanceSource ?? null,
       tx: indexRecord !== undefined && isTxHash(indexRecord.txHash) ? indexRecord.txHash : null,
       batchId: null,
       ciphertext: object.ciphertext,
@@ -808,7 +810,12 @@ export async function loadMe(owner: Address, ports: MePorts): Promise<MeData> {
 
     let state: AnchorState = "pending"
     let authorId: Hex = candidates[0] ?? zeroHash
-    if (item.state === "ANCHORED") {
+    // A signed save that names another owner is not this owner's record at all — the store
+    // filed it wrong or it was never meant for this page. Unverified, whatever the proof says.
+    const ownerMismatch = message !== null && !sameHex(message.owner, ownerKey)
+    if (ownerMismatch) {
+      state = "unverified"
+    } else if (item.state === "ANCHORED") {
       const batchId = item.batchId ?? (indexRow?.batchId as Hex | undefined) ?? null
       const lineageId = item.lineageId ?? (indexRow?.lineageId as Hex | undefined) ?? null
       const version = item.version ?? indexRow?.version ?? null

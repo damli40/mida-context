@@ -51,7 +51,6 @@ const HIDDEN_LIMIT_MS = 5 * 60 * 1000
 const BADGE_CLASS: Record<Badge["kind"], string> = {
   you: "b-ok",
   agent: "b-info",
-  claimed: "b-warn",
   unknown: "b-neutral",
 }
 
