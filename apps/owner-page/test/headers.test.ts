@@ -24,8 +24,8 @@ describe("securityHeaders", () => {
 })
 
 describe("assetPathFor", () => {
-  it("serves the one page at root and /check", () => {
-    expect(assetPathFor("/")).toBe("/check.html")
+  it("serves the home page at root and the device check at /check", () => {
+    expect(assetPathFor("/")).toBe("/index.html")
     expect(assetPathFor("/check")).toBe("/check.html")
     expect(assetPathFor("/check/")).toBe("/check.html")
   })
