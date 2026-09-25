@@ -38,5 +38,11 @@ export function errorFromBody(status: number, body: unknown): Error {
   if (error !== undefined && (MIDA_ERROR_CODES as readonly string[]).includes(error.code)) {
     return new MidaError(error.code, error.message.replace(new RegExp(`^${error.code}: `), ""))
   }
-  return new Error(`Context API returned HTTP ${status}`)
+  // A route-level refusal that is not a protocol code — NOT_AN_AGENT, SIGNER_MISMATCH,
+  // ALREADY_QUEUED — travels in the same { error: { code, message } } envelope. Keep the wire
+  // name on the thrown error so a caller can still tell the store's own "this save cannot go"
+  // from a transport failure; flattened to the bare status, every refusal looks retryable.
+  return Object.assign(new Error(`Context API returned HTTP ${status}${error === undefined ? "" : `: ${error.message}`}`), {
+    ...(error === undefined ? {} : { code: String(error.code), status }),
+  })
 }

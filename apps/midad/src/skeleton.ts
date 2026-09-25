@@ -11,8 +11,9 @@ import type { BatchReceipt } from "@mida/api"
 import { compareChainOrder } from "@mida/checkpoint"
 import type { StoredCheckpoint as CheckpointRecord } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
-import { addPendingAnchor, batchClient, batchStatusProbe, laneForSave } from "./batching.js"
+import { addPendingAnchor, batchClient, batchStatusProbe, keepPendingPlaintext, laneForSave } from "./batching.js"
 import type { Lane } from "./batching.js"
+import { readSavedIds, recordSavedId } from "./saved-ids.js"
 import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl, sponsorReachable } from "./runtime.js"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { resolveNetwork } from "./network.js"
@@ -509,29 +510,8 @@ export async function approve(
   }
 }
 
-/**
- * The local index of eventIds already saved, at `state/saved-ids.json` — outside `queue/`, whose
- * sweeper would carry any .json it finds there to `queue/bad/` (CAP-25). It is a cache, not the
- * truth: a miss still asks the chain, a corrupt file is rebuilt by reading as usual, and a
- * leftover index under `queue/` is ignored — never migrated.
- */
-function readSavedIds(home: ServiceRuntime["home"]): Record<string, Hex> {
-  try {
-    const raw = home.readJson<Record<string, unknown>>("state/saved-ids.json")
-    if (raw === undefined || typeof raw !== "object" || Array.isArray(raw)) return {}
-    const index: Record<string, Hex> = {}
-    for (const [eventId, contextId] of Object.entries(raw)) {
-      if (typeof contextId === "string" && /^0x[0-9a-f]{64}$/.test(contextId)) index[eventId] = contextId as Hex
-    }
-    return index
-  } catch {
-    return {}
-  }
-}
-
-function recordSavedId(home: ServiceRuntime["home"], eventId: string, contextId: Hex): void {
-  home.writeSecretJson("state/saved-ids.json", { ...readSavedIds(home), [eventId]: contextId })
-}
+// The saved-id index moved to saved-ids.ts so batching.ts — which skeleton already imports —
+// can keep it pointed at a resubmitted save's fresh contextId without an import cycle.
 
 /** The gas facts a drain's saved line logs — wei as decimal strings, so a bigint never reaches JSON.stringify. */
 export interface SaveReceipt {
@@ -629,12 +609,17 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
     // The store's receipt only means the save was queued — the pending ledger owns it from here
     // until the chain says ANCHORED or REJECTED. transactionHash stays null: no transaction of
     // this save's own exists yet, and none may ever.
-    const queued = await agent.createBatched(runtime.owner, NAMESPACE, {
+    const create = {
       value: { ...envelope },
-      kind: "EPISODE",
-      source: "AGENT_INFERRED",
+      kind: "EPISODE" as const,
+      source: "AGENT_INFERRED" as const,
       tags: ["mida-checkpoint", envelope.checkpoint.eventId],
-    })
+    }
+    const queued = await agent.createBatched(runtime.owner, NAMESPACE, create)
+    // The plaintext stays in the home from this moment (in-2 I3): a stale-epoch rejection is
+    // only recoverable while the bytes that produced the save exist to re-seal. Written before
+    // the pending entry so an entry always implies its plaintext — the reverse is a swept orphan.
+    keepPendingPlaintext(runtime.home, queued.contextId, create)
     recordSavedId(runtime.home, envelope.checkpoint.eventId, queued.contextId)
     addPendingAnchor(runtime.home, {
       contextId: queued.contextId,

@@ -8,7 +8,7 @@
 // happens could only have come from a flush, not the timer.
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { mkdtempSync } from "node:fs"
+import { existsSync, mkdtempSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createPublicClient, http } from "viem"
@@ -431,6 +431,96 @@ describe("batched checkpoint lane end to end on local Anvil (Task 10)", () => {
           expect(item.proof, `no Merkle proof stored for ${item.contextId}`).toBeDefined()
           expect(verifyMerkleProof(event.leafHash, item.proof!, root), `Merkle proof failed for ${item.contextId}`).toBe(true)
         }
+      } finally {
+        await runtime.close()
+      }
+    },
+    STEP_TIMEOUT,
+  )
+
+  it(
+    "8. an epoch rotation under a queued save: re-sealed, resubmitted and ANCHORED — never a lost checkpoint (in-2 I3)",
+    async () => {
+      const { home, runtime } = await newHome()
+      try {
+        expect(await batching(home, true)).toMatchObject({ code: 0 })
+
+        // codex queues under the current read epoch while the batch window is held; the owner
+        // then revokes claude-code, which rotates the namespace's key version. codex is still
+        // authorized — but its queued save is sealed under the rotated-away epoch, so the
+        // contract rejects it BAD_EPOCH. The follow-up must re-seal the kept plaintext under
+        // the current epoch and resubmit — codex silently losing its checkpoint is the bug.
+        env.batcher!.pauseTimer()
+        let contextId!: Hex
+        const input = envelope("proj-b8", sampleCheckpoint({ eventId: "cp-b8-01", objective: "codex's surviving checkpoint" }))
+        try {
+          const saved = await saveCheckpoint(runtime, "codex", input)
+          expect(saved.batched?.state).toBe("QUEUED")
+          contextId = saved.contextId
+          // the pending save's plaintext rides inside the home from the moment it is queued —
+          // a secret file, user-only (0600), named for the save it can rebuild
+          const kept = home.path(`state/batch-plaintext/${contextId}.json`)
+          expect(existsSync(kept), "no kept plaintext for the queued save").toBe(true)
+          expect(statSync(kept).mode & 0o777).toBe(0o600)
+
+          const revoked = await revoke(runtime, "claude-code")
+          // codex's reader wraps must be republished for the rotated epoch — a failed wrap would
+          // fail the reads below for the wrong reason
+          expect(revoked.failed).toEqual([])
+        } finally {
+          env.batcher!.resumeTimer()
+        }
+
+        // first submission rejects BAD_EPOCH; the follow-up resubmits and the next batch anchors
+        const settled = await settlePending(runtime, home, 20_000)
+        expect(settled).toMatchObject({ anchored: 1, rejected: 0, left: 0 })
+
+        // the checkpoint landed — re-sealed under a fresh contextId, never the stale one
+        const read = await readCheckpoints(runtime, "codex", "proj-b8")
+        const landed = read.checkpoints.find((cp) => cp.checkpoint.eventId === "cp-b8-01")
+        expect(landed, "codex's checkpoint is not readable").toBeDefined()
+        expect(landed!.anchor).toBe("ANCHORED")
+        expect(landed!.checkpoint).toEqual(input.checkpoint)
+        expect(landed!.contextId).not.toBe(contextId)
+
+        // the stale-epoch answer was a retry, not a refusal — no rejected-ledger entry, and the
+        // kept plaintext went away with the anchor it made possible
+        expect(rejectedAnchors(home)).toEqual([])
+        expect(home.list("state/batch-plaintext").filter((name) => name.endsWith(".json"))).toEqual([])
+      } finally {
+        await runtime.close()
+      }
+    },
+    STEP_TIMEOUT,
+  )
+
+  it(
+    "9. a revoked author's rejected save is never resubmitted — and its kept plaintext is gone (in-2 I3)",
+    async () => {
+      const { home, runtime } = await newHome()
+      try {
+        expect(await batching(home, true)).toMatchObject({ code: 0 })
+
+        env.batcher!.pauseTimer()
+        let contextId!: Hex
+        try {
+          const saved = await saveCheckpoint(runtime, "claude-code", envelope("proj-b9", sampleCheckpoint({ eventId: "cp-b9-01" })))
+          expect(saved.batched?.state).toBe("QUEUED")
+          contextId = saved.contextId
+          expect(existsSync(home.path(`state/batch-plaintext/${contextId}.json`))).toBe(true)
+          await revoke(runtime, "claude-code")
+        } finally {
+          env.batcher!.resumeTimer()
+        }
+
+        // authority rejections are never retried: the row stays refused, no second QUEUED row
+        // for the save appears at the store, and the plaintext died with the final answer
+        const settled = await settlePending(runtime, home)
+        expect(settled).toMatchObject({ anchored: 0, rejected: 1, left: 0 })
+        expect(rejectedAnchors(home)).toMatchObject([{ contextId, reason: "NO_AUTHORITY" }])
+        expect(existsSync(home.path(`state/batch-plaintext/${contextId}.json`))).toBe(false)
+        const { items } = await runtime.ownerApi.listBatchSaves({ owner: runtime.owner, namespaceId: namespaceId(NAMESPACE) })
+        expect(items.filter((item) => item.state === "QUEUED" || item.state === "SUBMITTED")).toEqual([])
       } finally {
         await runtime.close()
       }

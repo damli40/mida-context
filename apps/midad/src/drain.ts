@@ -24,7 +24,7 @@ import type { ProjectCheck } from "./projects.js"
 import { findProjectMarker, isSafeName, listJobs, moveToBad, removeJob } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
 import type { ServiceRuntime } from "./runtime.js"
-import { followPendingAnchors, pendingAnchors } from "./batching.js"
+import { followPendingAnchors, pendingAnchors, sweepPendingPlaintexts } from "./batching.js"
 import { isCapabilityLive } from "./skeleton.js"
 import { saveCheckpoint } from "./skeleton.js"
 
@@ -541,6 +541,10 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
     // status error leaves the entry untouched, never dropped, never called final. An empty ledger
     // costs nothing and opens nothing.
     try {
+      // Housekeeping runs on every pass, ledger empty or not: a kept plaintext whose pending
+      // entry is gone — a crash between the two queue writes — is an orphan no resubmission
+      // will ever name again.
+      sweepPendingPlaintexts(deps.home)
       if (pendingAnchors(deps.home).length > 0) {
         await followPendingAnchors(await openRuntime(), log)
       }

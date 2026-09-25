@@ -1,13 +1,16 @@
 import { privateKeyToAccount } from "viem/accounts"
 import type { ContextApiClient } from "@mida/api"
 import type { Deployment } from "@mida/chain"
+import type { CreateContextInput } from "@mida/sdk"
+import { PERMISSION, PROVENANCE_POLICY, namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import type { MidaHome } from "./home.js"
-import { loadAgentIdentity } from "./keys.js"
+import { isRevoked, loadAgentIdentity } from "./keys.js"
 import { readSavedNetwork } from "./network.js"
 import type { SavedNetwork } from "./network.js"
-import { apiClient } from "./runtime.js"
+import { NAMESPACE, apiClient } from "./runtime.js"
 import type { ServiceRuntime } from "./runtime.js"
+import { recordSavedId } from "./saved-ids.js"
 
 /**
  * The batched checkpoint lane (BatchAnchor): many agents' saves share one Monad transaction while
@@ -80,6 +83,8 @@ export interface PendingAnchor {
   agent: string
   queuedAt: string
   state: "QUEUED" | "SUBMITTED"
+  /** Stale-epoch resubmissions already spent on this save — the cap is MAX_EPOCH_RETRIES. */
+  retries?: number
 }
 
 /** A save the contract refused — the permanent record a doctor run reports. */
@@ -179,6 +184,70 @@ function setPendingAnchorState(home: MidaHome, contextId: Hex, state: PendingAnc
   home.writeSecretJson(PENDING_FILE, { entries })
 }
 
+/** Counts a resubmission attempt on the entry — kept through failed tries so the cap still holds. */
+function setPendingAnchorRetries(home: MidaHome, contextId: Hex, retries: number): void {
+  const entries = pendingAnchors(home)
+  const entry = entries.find((candidate) => candidate.contextId === contextId)
+  if (entry === undefined) return
+  entry.retries = retries
+  home.writeSecretJson(PENDING_FILE, { entries })
+}
+
+/**
+ * The plaintext a batched save keeps for a stale-epoch retry (in-2 I3): the same createBatched
+ * input the queue call used — the checkpoint envelope, kind, source and tags — at
+ * `state/batch-plaintext/<contextId>.json`. Written the moment a save is queued, held while the
+ * pending ledger owns it, and dropped the instant the chain answers final: anchored, refused,
+ * or retries spent. writeSecretJson gives it the home's 0600 atomic write, and its content is
+ * never logged — the ledgers and the drain log carry contextIds and eventIds only.
+ */
+const PENDING_PLAINTEXT_DIR = "state/batch-plaintext"
+
+const pendingPlaintextPath = (contextId: Hex): string => `${PENDING_PLAINTEXT_DIR}/${contextId.toLowerCase()}.json`
+
+/** Rejection names a resubmission can fix: the signature was sealed under a rotated-away epoch. */
+const EPOCH_RETRYABLE = new Set(["BAD_EPOCH", "EPOCH_STALE"])
+/** A stale-epoch save is re-sealed and resubmitted at most this many times, then it is refused. */
+const MAX_EPOCH_RETRIES = 3
+
+export function keepPendingPlaintext(home: MidaHome, contextId: Hex, input: Record<string, unknown>): void {
+  home.writeSecretJson(pendingPlaintextPath(contextId), input)
+}
+
+/** The kept createBatched input for one pending save — undefined when absent, corrupt, or shapeless. */
+export function pendingPlaintext(home: MidaHome, contextId: Hex): Record<string, unknown> | undefined {
+  try {
+    const raw = home.readJson<Record<string, unknown>>(pendingPlaintextPath(contextId))
+    return typeof raw === "object" && raw !== null && !Array.isArray(raw) && raw.value !== undefined ? raw : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Drops the kept plaintext — its whole job is the window between queue and the chain's answer. */
+export function dropPendingPlaintext(home: MidaHome, contextId: Hex): void {
+  home.remove(pendingPlaintextPath(contextId))
+}
+
+/**
+ * Housekeeping: a plaintext file whose contextId no pending entry names is an orphan — a crash
+ * between the queue writes, or a leftover an older follow-up could not finish. Nothing in the
+ * ledger can ever reference it again, and a plaintext checkpoint is never kept past its save.
+ */
+export function sweepPendingPlaintexts(home: MidaHome): number {
+  const ids = new Set(pendingAnchors(home).map((entry) => entry.contextId.toLowerCase()))
+  let swept = 0
+  for (const name of home.list(PENDING_PLAINTEXT_DIR)) {
+    if (!name.endsWith(".json")) continue
+    const id = name.slice(0, -".json".length).toLowerCase()
+    if (!ids.has(id)) {
+      home.remove(`${PENDING_PLAINTEXT_DIR}/${name}`)
+      swept += 1
+    }
+  }
+  return swept
+}
+
 /** Moves a refused save from the pending ledger to the rejected one — both files in one call. */
 function recordRejectedAnchor(home: MidaHome, entry: PendingAnchor, reason: string): void {
   const rejected = rejectedAnchors(home)
@@ -253,11 +322,103 @@ export async function laneForSave(runtime: ServiceRuntime, agentName: string): P
 }
 
 /**
+ * What a stale-epoch resubmission came back with. `requeued` — the save is queued again under a
+ * fresh contextId; `retry-later` — nothing final happened, the entry waits for the next pass;
+ * `refused` — the save is dead: its author lost authority, its plaintext is gone or unreadable,
+ * or the resubmission itself was refused outright.
+ */
+type ResubmitOutcome = "requeued" | "retry-later" | "refused"
+
+/**
+ * Re-seals a BAD_EPOCH/EPOCH_STALE save under the current epoch and POSTs it again (in-2 I3).
+ * The contract checks authority before epoch, so the stale answer itself proves a grant was
+ * live at submit — but the owner's revoke may have landed since, so the chain is asked again:
+ * no live CREATE grant, no local identity, a revoked marker or no readable plaintext all mean
+ * the save is refused, never retried. A successful re-queue moves the pending entry, its kept
+ * plaintext and the saved-id index onto the fresh contextId — the resubmission carries a new
+ * random nonce, so the old id stays rejected at the store and only the new one is followed.
+ */
+async function resubmitStaleEpoch(
+  runtime: ServiceRuntime,
+  entry: PendingAnchor,
+  reason: string,
+  log: (record: Record<string, unknown>) => void,
+): Promise<ResubmitOutcome> {
+  const home = runtime.home
+  const identity = loadAgentIdentity(home, entry.agent)
+  if (identity === undefined || isRevoked(home, entry.agent)) return "refused"
+  const input = pendingPlaintext(home, entry.contextId)
+  if (input === undefined) return "refused"
+  try {
+    const allowed = await runtime.reader.hasAuthority(
+      runtime.owner,
+      identity.agentId,
+      namespaceId(NAMESPACE),
+      PERMISSION.CREATE,
+      PROVENANCE_POLICY.ALLOW_INFERENCE,
+    )
+    if (!allowed) return "refused"
+  } catch {
+    // authority unknown is never a final answer — the next pass asks again
+    return "retry-later"
+  }
+  const retries = (entry.retries ?? 0) + 1
+  // The try covers the POST alone: only an answer from the store may classify the outcome —
+  // a local ledger write failing (an fs error, whose .code is a string too) must throw through
+  // to the pass rather than masquerade as a store refusal.
+  const requeue = () => runtime.agent(entry.agent).createBatched(runtime.owner, NAMESPACE, input as unknown as CreateContextInput)
+  let queued: Awaited<ReturnType<typeof requeue>>
+  try {
+    queued = await requeue()
+  } catch (error) {
+    // The wire code decides. errorFromBody keeps it on the thrown error for protocol codes and
+    // the batch route's own codes alike (CAPABILITY_DENIED, NOT_AN_AGENT, SIGNER_MISMATCH,
+    // ALREADY_QUEUED, ...): each is the store's judgement on this save — refused, never
+    // retried. The two exceptions wait instead of refusing: a rotation still in progress
+    // accepts no writes at all, and an answer that never arrived carries no code at all — the
+    // entry waits for the next pass, unspent. Only EPOCH_STALE, answering the resubmission
+    // itself with the very condition being retried, spends one against the cap.
+    const code = (error as { code?: unknown }).code
+    if (code === "EPOCH_ROTATION_REQUIRED" || typeof code !== "string") return "retry-later"
+    if (code !== "EPOCH_STALE") return "refused"
+    setPendingAnchorRetries(home, entry.contextId, retries)
+    return retries >= MAX_EPOCH_RETRIES ? "refused" : "retry-later"
+  }
+  // Entry first: a crash after the POST leaves the new save untracked — it still anchors —
+  // rather than the stale id retrying again and queueing a second copy of the checkpoint.
+  removePendingAnchor(home, entry.contextId)
+  dropPendingPlaintext(home, entry.contextId)
+  keepPendingPlaintext(home, queued.contextId, input)
+  addPendingAnchor(home, {
+    contextId: queued.contextId,
+    eventId: entry.eventId,
+    sessionId: entry.sessionId,
+    agent: entry.agent,
+    queuedAt: new Date().toISOString(),
+    retries,
+  })
+  recordSavedId(home, entry.eventId, queued.contextId)
+  log({
+    sessionId: entry.sessionId,
+    agent: entry.agent,
+    eventId: entry.eventId,
+    outcome: "requeued",
+    lane: "batched",
+    contextId: queued.contextId,
+    previousContextId: entry.contextId,
+    reason: `batch-rejected:${reason}`,
+    attempts: retries,
+  })
+  return "requeued"
+}
+
+/**
  * The ledger's follow-up, run at the end of every drain pass: asks the store where each
  * queued/submitted save stands. ANCHORED is the only moment a batched save may be logged "saved";
- * REJECTED moves it to the rejected ledger and logs the contract's reason; anything else keeps it
- * waiting — and a status error leaves the entry exactly as it was, never dropped and never logged
- * as final.
+ * REJECTED for a stale epoch is re-sealed and resubmitted (up to MAX_EPOCH_RETRIES, only while
+ * the author still holds CREATE); every other REJECTED moves it to the rejected ledger and logs
+ * the contract's reason; anything else keeps it waiting — and a status error leaves the entry
+ * exactly as it was, never dropped and never logged as final.
  */
 export async function followPendingAnchors(
   runtime: ServiceRuntime,
@@ -275,6 +436,7 @@ export async function followPendingAnchors(
     }
     if (answer.state === "ANCHORED") {
       removePendingAnchor(runtime.home, entry.contextId)
+      dropPendingPlaintext(runtime.home, entry.contextId)
       counts.anchored += 1
       log({
         sessionId: entry.sessionId,
@@ -287,6 +449,15 @@ export async function followPendingAnchors(
       })
     } else if (answer.state === "REJECTED") {
       const reason = answer.reason ?? "unknown"
+      const retried =
+        EPOCH_RETRYABLE.has(reason) &&
+        (entry.retries ?? 0) < MAX_EPOCH_RETRIES &&
+        (await resubmitStaleEpoch(runtime, entry, reason, log))
+      if (retried === "requeued" || retried === "retry-later") {
+        counts.waiting += 1
+        continue
+      }
+      dropPendingPlaintext(runtime.home, entry.contextId)
       recordRejectedAnchor(runtime.home, entry, reason)
       counts.rejected += 1
       log({
