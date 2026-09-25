@@ -1,0 +1,638 @@
+import { describe, expect, it, vi } from "vitest"
+import { readdirSync, readFileSync } from "node:fs"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
+import { namespaceId } from "@mida/protocol"
+import type { Address, Hex } from "@mida/protocol"
+import { HIDDEN_LIMIT_MS, armTeardown, renderMe, revocableStore } from "../src/me/page.js"
+import type { AgentRow, MeData, MePorts, RecordRow } from "../src/me/sources.js"
+import { AGENT_LIST_UNAVAILABLE, BLOCKED_AT_STORE_TEXT, PARTIAL_LIST_TEXT } from "../src/me/sources.js"
+
+/**
+ * Task 5's page tests. The plan prescribes a jsdom environment pragma, but jsdom is not a
+ * devDependency and its tarball tree is not installable in this environment — so this file uses
+ * the repo's existing fake-element convention (entries-signing.test.ts), extended just enough to
+ * cover the render path: textContent with real DOM semantics (set replaces children, get folds
+ * the subtree), class/attribute matching, and click dispatch for the pager. The unsafe-API guard
+ * below reads every file under src/me/ and is the XSS backstop the fake DOM cannot be.
+ */
+
+// --- a minimal DOM faithful to the small surface renderMe uses -------------------------------
+
+class FakeEl {
+  readonly tag: string
+  children: FakeEl[] = []
+  parent: FakeEl | null = null
+  readonly attrs = new Map<string, string>()
+  readonly listeners = new Map<string, (() => void)[]>()
+  hidden = false
+  disabled = false
+  #text = ""
+
+  constructor(tag: string) {
+    this.tag = tag
+  }
+
+  // Faithful textContent: setting replaces children with the string; reading folds the subtree.
+  get textContent(): string {
+    return this.#text + this.children.map((c) => c.textContent).join("")
+  }
+  set textContent(value: string) {
+    this.#text = value
+    this.children = []
+  }
+
+  get className(): string {
+    return this.attrs.get("class") ?? ""
+  }
+  set className(value: string) {
+    this.attrs.set("class", value)
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attrs.set(name, value)
+  }
+  getAttribute(name: string): string | null {
+    return this.attrs.get(name) ?? null
+  }
+  hasAttribute(name: string): boolean {
+    return this.attrs.has(name)
+  }
+
+  appendChild(child: FakeEl): FakeEl {
+    child.parent = this
+    this.children.push(child)
+    return child
+  }
+  replaceChildren(...nodes: FakeEl[]): void {
+    for (const node of nodes) node.parent = this
+    this.children = [...nodes]
+  }
+  remove(): void {
+    if (this.parent !== null) {
+      const index = this.parent.children.indexOf(this)
+      if (index !== -1) this.parent.children.splice(index, 1)
+      this.parent = null
+    }
+    this.children = []
+  }
+
+  addEventListener(type: string, fn: () => void): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn])
+  }
+  click(): void {
+    for (const fn of this.listeners.get("click") ?? []) fn()
+  }
+
+  matches(sel: string): boolean {
+    // Compound selector only: tag, .cls, [attr], [attr="v"] in any combination (no combinators).
+    const parts = sel.match(/[a-zA-Z][\w-]*|\.[\w-]+|\[[^\]]*\]/g) ?? []
+    for (const part of parts) {
+      if (part.startsWith(".")) {
+        if (!(this.attrs.get("class") ?? "").split(/\s+/).includes(part.slice(1))) return false
+      } else if (part.startsWith("[")) {
+        const inner = part.slice(1, -1)
+        const eq = inner.indexOf("=")
+        if (eq === -1) {
+          if (!this.attrs.has(inner)) return false
+        } else {
+          const name = inner.slice(0, eq).trim()
+          const value = inner.slice(eq + 1).trim().replace(/^["']|["']$/g, "")
+          if (this.attrs.get(name) !== value) return false
+        }
+      } else if (this.tag !== part.toLowerCase()) {
+        return false
+      }
+    }
+    return parts.length > 0
+  }
+
+  *walk(): Generator<FakeEl> {
+    for (const child of this.children) {
+      yield child
+      yield* child.walk()
+    }
+  }
+  querySelectorAll(sel: string): FakeEl[] {
+    return [...this.walk()].filter((el) => el.matches(sel))
+  }
+  querySelector(sel: string): FakeEl | null {
+    return this.querySelectorAll(sel)[0] ?? null
+  }
+}
+
+function fakeDoc(): Document {
+  return { createElement: (tag: string) => new FakeEl(tag) } as unknown as Document
+}
+
+function all(root: FakeEl, sel: string): FakeEl[] {
+  return root.querySelectorAll(sel)
+}
+
+// --- fixtures ---------------------------------------------------------------------------------
+
+const OWNER = `0x${"aa".repeat(20)}` as Address
+const AGENT = `0x${"11".repeat(32)}` as Hex
+const CAP = `0x${"44".repeat(32)}` as Hex
+const NS = namespaceId("projects.current")
+const TX = `0x${"7a".repeat(32)}` as Hex
+const CTX = `0x${"cc".repeat(32)}` as Hex
+
+type Grant = AgentRow["grants"][number]
+
+function grant(over: Partial<Grant> = {}): Grant {
+  return {
+    namespaceId: NS,
+    area: "projects.current",
+    permissions: 1 | 2 | 4,
+    capabilityId: CAP,
+    status: { label: "Can read", flagged: false, unchecked: false },
+    approvedTx: TX,
+    ...over,
+  }
+}
+
+function agent(over: Partial<AgentRow> = {}): AgentRow {
+  return {
+    agentId: AGENT,
+    name: "claude-code",
+    grants: [grant()],
+    revokedTx: null,
+    blockedAtStore: false,
+    readLive: true,
+    unverified: false,
+    ...over,
+  }
+}
+
+function record(over: Partial<RecordRow> = {}): RecordRow {
+  return {
+    contextId: CTX,
+    namespaceId: NS,
+    area: "projects.current",
+    readEpoch: 1n,
+    lane: "direct",
+    state: "anchored",
+    authorId: AGENT,
+    authorName: "claude-code",
+    source: 3,
+    tx: TX,
+    batchId: null,
+    ciphertext: "0x12",
+    manifest: {},
+    createdAt: 1_700_000_000_000,
+    ...over,
+  }
+}
+
+function data(over: Partial<MeData> = {}): MeData {
+  return {
+    owner: OWNER,
+    agents: [agent()],
+    records: [record()],
+    incomplete: [],
+    agentsUnavailable: null,
+    recordsUnavailable: false,
+    source: "index",
+    lag: { text: "9 s behind Monad", stale: false },
+    batchingOn: true,
+    batchedListComplete: true,
+    counts: { records: 31, youSaid: 9, pending: 2 },
+    ...over,
+  }
+}
+
+const openText = (text: string, provenanceSource: number | null = null) => () => ({ ok: true as const, text, provenanceSource })
+
+// --- the render contract ----------------------------------------------------------------------
+
+describe("renderMe", () => {
+  it("an agent named like an attack renders as literal text and creates no element", () => {
+    const evil = '<img src=x onerror=alert(1)>'
+    const root = renderMe(data({ agents: [agent({ name: evil })] }), fakeDoc()) as unknown as FakeEl
+    const name = root.querySelector(".agent-name")
+    expect(name).not.toBeNull()
+    expect(name!.textContent).toBe(evil)
+    expect(all(root, "img")).toHaveLength(0)
+    expect(all(root, "script")).toHaveLength(0)
+  })
+
+  it("a record body that is markup renders literally, never as elements", () => {
+    const root = renderMe(data(), fakeDoc(), openText("<b>x</b> <i>y</i>")) as unknown as FakeEl
+    const cell = root.querySelector(".rec-what")
+    expect(cell).not.toBeNull()
+    expect(cell!.textContent).toBe("<b>x</b> <i>y</i>")
+    expect(all(root, "b")).toHaveLength(0)
+    expect(all(root, "i")).toHaveLength(0)
+    // the decrypted cell is marked so a hidden-too-long/pagehide teardown can wipe it
+    expect(cell!.getAttribute("data-decrypted")).toBe("1")
+  })
+
+  it("a tx value that is not a 32-byte hash renders no link; a real hash links", () => {
+    // every tx field in this fixture is malformed — no <a> may exist anywhere
+    const bad = data({
+      agents: [agent({ grants: [grant({ approvedTx: "not-a-hash" as Hex })], revokedTx: "also-not" as Hex })],
+      records: [record({ tx: "0xZZZ-not-a-hash" as Hex })],
+    })
+    const rootBad = renderMe(bad, fakeDoc()) as unknown as FakeEl
+    expect(all(rootBad, "a")).toHaveLength(0)
+
+    const ok = renderMe(data(), fakeDoc()) as unknown as FakeEl
+    const links = all(ok, "a.tx")
+    expect(links.length).toBeGreaterThan(0)
+    for (const link of links) {
+      expect(link.getAttribute("href")!.endsWith(TX)).toBe(true)
+      expect(link.getAttribute("target")).toBe("_blank")
+      expect(link.getAttribute("rel")).toBe("noopener noreferrer")
+    }
+  })
+
+  it("an incomplete list shows the banner and hides the index counts", () => {
+    const root = renderMe(
+      data({ incomplete: [PARTIAL_LIST_TEXT], counts: null }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    const banners = all(root, ".me-banner")
+    expect(banners.length).toBe(1)
+    expect(banners[0]!.textContent).toBe(PARTIAL_LIST_TEXT)
+    // the counts the index would have supplied are absent — no tile may carry a figure
+    expect(all(root, "[data-count]")).toHaveLength(0)
+  })
+
+  it("complete data shows the three count tiles with their figures", () => {
+    const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
+    const tiles = all(root, "[data-count]")
+    expect(tiles).toHaveLength(3)
+    const texts = tiles.map((t) => t.textContent)
+    expect(texts.some((t) => t.includes("31"))).toBe(true)
+    expect(texts.some((t) => t.includes("9"))).toBe(true)
+    expect(texts.some((t) => t.includes("2"))).toBe(true)
+  })
+
+  it("a store-denied agent reads 'blocked at the store · revoke pending on Monad'", () => {
+    const root = renderMe(
+      data({ agents: [agent({ blockedAtStore: true, readLive: false })] }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    const row = root.querySelector(".agent")
+    expect(row).not.toBeNull()
+    expect(row!.textContent).toContain(BLOCKED_AT_STORE_TEXT)
+    // and it must never be described as able to read
+    expect(row!.textContent).not.toContain("Can read")
+  })
+
+  it("a failed agent load reads 'Agent list unavailable' — never '0 agents' or 'none granted'", () => {
+    const root = renderMe(
+      data({ agents: [], agentsUnavailable: AGENT_LIST_UNAVAILABLE, counts: null }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    const unavailable = "Agent list unavailable — the index is down and the chain scan did not finish"
+    // once on the summary tile in place of the count, once where the list would be
+    const hits = all(root, ".agent-meta").concat(all(root, ".n")).filter((el) => el.textContent.includes(unavailable))
+    expect(hits.length).toBeGreaterThanOrEqual(2)
+    expect(root.textContent).not.toContain("0 agents can read")
+    expect(root.textContent).not.toContain("No agents have been granted access")
+  })
+
+  it("agents the chain could not be asked about are counted, not rounded down to '0 can read'", () => {
+    // two rows exist, the reads for both failed — "0 agents can read" would be a false negative
+    const unverifiable = agent({ readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
+    const another = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
+    const root = renderMe(data({ agents: [unverifiable, another] }), fakeDoc()) as unknown as FakeEl
+    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
+    expect(lead).not.toBeNull()
+    expect(lead!.textContent).toBe("0 agents · 2 could not be checked just now")
+    expect(root.textContent).not.toContain("0 agents can read")
+  })
+
+  it("a mixed list counts both figures — live readers and the unchecked tail", () => {
+    const unknown = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
+    const root = renderMe(data({ agents: [agent(), unknown] }), fakeDoc()) as unknown as FakeEl
+    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
+    expect(lead!.textContent).toBe("1 agent · 1 could not be checked just now")
+  })
+
+  it("a grant whose chain check never ran says 'could not check Monad just now', not an index disagreement", () => {
+    const unreachable = agent({
+      readLive: false,
+      grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })],
+    })
+    const root = renderMe(data({ agents: [unreachable] }), fakeDoc()) as unknown as FakeEl
+    const status = root.querySelector(".grant-status")
+    expect(status).not.toBeNull()
+    expect(status!.textContent).toBe("Unverified — could not check Monad just now")
+    expect(status!.textContent).not.toContain("disagrees")
+  })
+
+  it("a store that failed every listing says 'could not load records' — never 'holds no records'", () => {
+    const root = renderMe(data({ records: [], recordsUnavailable: true }), fakeDoc()) as unknown as FakeEl
+    expect(root.textContent).toContain("could not load records from the store")
+    expect(root.textContent).not.toContain("The store holds no records")
+    // and a store that answered empty stays "holds no records" — the two are not interchangeable
+    const empty = renderMe(data({ records: [], recordsUnavailable: false }), fakeDoc()) as unknown as FakeEl
+    expect(empty.textContent).toContain("The store holds no records")
+  })
+
+  it("a flagged grant names the listing that spoke — the index, or in chain-log mode the grant log, never the index", () => {
+    const flagged = agent({ readLive: false, grants: [grant({ status: { label: "Revoked", flagged: true, unchecked: false } })] })
+    const fromIndex = renderMe(data({ agents: [flagged] }), fakeDoc()) as unknown as FakeEl
+    expect(fromIndex.querySelector(".grant-status")!.textContent).toBe("Revoked — the index disagrees with the chain")
+
+    const fromLogs = renderMe(
+      data({ source: "chain-logs", lag: { text: "index unavailable", stale: true }, agents: [flagged] }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    const status = fromLogs.querySelector(".grant-status")
+    expect(status).not.toBeNull()
+    expect(status!.textContent).toBe("Revoked — the grant log disagrees with the chain")
+    expect(status!.textContent).not.toContain("index")
+  })
+
+  it("count tiles name their source — index figures 'per the index', the pending figure 'per the store'", () => {
+    const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
+    expect(root.querySelector('[data-count="records"]')!.textContent).toContain("per the index")
+    expect(root.querySelector('[data-count="youSaid"]')!.textContent).toContain("per the index")
+    const pending = root.querySelector('[data-count="pending"]')
+    expect(pending).not.toBeNull()
+    expect(pending!.textContent).toContain("waiting to be anchored")
+    expect(pending!.textContent).toContain("per the store")
+    // no invented block number anywhere in the figures
+    expect(root.textContent).not.toMatch(/block \d/i)
+  })
+
+  it("the pending tile hides outright when the store's batched list could not be fully read", () => {
+    const root = renderMe(data({ batchedListComplete: false }), fakeDoc()) as unknown as FakeEl
+    expect(root.querySelector('[data-count="pending"]')).toBeNull()
+    expect(root.textContent).not.toContain("waiting to be anchored")
+    // the index's own figures still show — they do not depend on the store list
+    expect(root.querySelector('[data-count="records"]')).not.toBeNull()
+  })
+
+  it("provenance badges only ever ride on anchored rows — unverified and pending read Source unknown", () => {
+    const rows = [
+      record({ state: "unverified", source: 1, contextId: `0x${"d1".repeat(32)}` as Hex }),
+      record({ lane: "batched", state: "pending", source: 3, contextId: `0x${"d2".repeat(32)}` as Hex }),
+      record({ state: "unknown", source: 2, contextId: `0x${"d3".repeat(32)}` as Hex }),
+    ]
+    const root = renderMe(data({ records: rows }), fakeDoc()) as unknown as FakeEl
+    expect(root.textContent).not.toContain("You said")
+    expect(root.textContent).not.toContain("inferred")
+    expect(all(root, ".badge").filter((b) => b.textContent === "Source unknown")).toHaveLength(3)
+  })
+
+  it("a decrypted payload whose provenance label disagrees with the chain is flagged on the row", () => {
+    // chain says USER_ASSERTED (1); the bytes inside claim AGENT_INFERRED (3)
+    const flagged = renderMe(
+      data({ records: [record({ state: "anchored", source: 1 })] }),
+      fakeDoc(),
+      openText("body", 3),
+    ) as unknown as FakeEl
+    expect(flagged.textContent).toContain("the record's own label disagrees with Monad")
+
+    // agreement flags nothing, and neither does a row the chain never confirmed — Monad has not
+    // spoken for it, so there is nothing to disagree with
+    const agreed = renderMe(data({ records: [record({ state: "anchored", source: 3 })] }), fakeDoc(), openText("body", 3)) as unknown as FakeEl
+    expect(agreed.textContent).not.toContain("disagrees with Monad")
+    const unchecked = renderMe(data({ records: [record({ state: "unverified", source: 1 })] }), fakeDoc(), openText("body", 3)) as unknown as FakeEl
+    expect(unchecked.textContent).not.toContain("disagrees with Monad")
+  })
+
+  it("an unset index URL reads 'index not configured' — the badge never claims 'unreachable'", () => {
+    const root = renderMe(
+      data({ source: "chain-logs", lag: { text: "index not configured", stale: true } }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    expect(root.textContent).toContain("index not configured")
+    expect(root.textContent).not.toContain("unreachable")
+  })
+
+  it("a failed index reads 'index unavailable' on the badge", () => {
+    const root = renderMe(
+      data({ source: "chain-logs", lag: { text: "index unavailable", stale: true } }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    expect(root.textContent).toContain("index unavailable")
+    expect(root.textContent).not.toContain("index not configured")
+  })
+
+  it("a row whose chain check could not run says 'could not check Monad just now' — never 'not on Monad'", () => {
+    const root = renderMe(data({ records: [record({ state: "unknown" })] }), fakeDoc()) as unknown as FakeEl
+    expect(root.textContent).toContain("could not check Monad just now")
+    expect(root.textContent).not.toContain("not on Monad")
+  })
+
+  it("shows the newest 20 records and pages the rest with 'Show 20 more'", () => {
+    const many = Array.from({ length: 25 }, (_, i) =>
+      record({ contextId: `0x${String(i).padStart(2, "0")}${"cc".repeat(31)}` as Hex, createdAt: 1_700_000_000_000 + i }),
+    )
+    const root = renderMe(data({ records: many }), fakeDoc(), openText("body")) as unknown as FakeEl
+    expect(all(root, "[data-row]")).toHaveLength(20)
+    const more = all(root, "[data-more]")
+    expect(more).toHaveLength(1)
+    more[0]!.click()
+    expect(all(root, "[data-row]")).toHaveLength(25)
+    expect(all(root, "[data-more]")).toHaveLength(0) // no more pages
+  })
+})
+
+// --- read-only: revoking lives in the terminal, not on this page --------------------------------
+
+describe("/me is read-only — revoking happens in the terminal", () => {
+  it("no button or link carries 'revoke', and no revoke/repair control exists anywhere", () => {
+    // two live readers so the rows exercise the spot the button used to occupy
+    const root = renderMe(
+      data({ agents: [agent(), agent({ agentId: `0x${"22".repeat(32)}` as Hex, name: "codex" })] }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    for (const node of root.walk()) {
+      if (node.tag === "button" || node.tag === "a") {
+        expect(node.textContent.toLowerCase(), `a <${node.tag}> must not offer revoking`).not.toContain("revoke")
+      }
+    }
+    for (const sel of [
+      "[data-revoke-agent]",
+      "[data-confirm-panel]",
+      "[data-revoke-cancel]",
+      "[data-revoke-confirm]",
+      "[data-revoke-disclosure]",
+      "[data-revoke-status]",
+      "[data-repair-wraps]",
+      "[data-repair-run]",
+    ]) {
+      expect(all(root, sel), `${sel} must not be rendered`).toHaveLength(0)
+    }
+  })
+
+  it("every agent row names the terminal command that revokes it", () => {
+    const revoked = agent({
+      agentId: `0x${"33".repeat(32)}` as Hex,
+      name: "old-agent",
+      readLive: false,
+      revokedTx: TX,
+      grants: [grant({ status: { label: "Revoked", flagged: false, unchecked: false } })],
+    })
+    const agents = [agent(), agent({ agentId: `0x${"22".repeat(32)}` as Hex, name: "codex" }), revoked]
+    const root = renderMe(data({ agents }), fakeDoc()) as unknown as FakeEl
+    const rows = all(root, ".agent")
+    expect(rows).toHaveLength(3)
+    // live or already revoked, the pointer is the same plain sentence — never a control
+    for (const [i, a] of agents.entries()) {
+      expect(rows[i]!.textContent).toContain(`To revoke: run mida revoke ${a.name} in your terminal.`)
+    }
+  })
+
+  it("the agents section states the page is read-only, and why the terminal owns revoking", () => {
+    const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
+    const sec = root.querySelector('[aria-labelledby="agents-title"]')
+    expect(sec).not.toBeNull()
+    expect(sec!.textContent).toContain(
+      "This page is read-only. Revoking happens in your terminal, where your other agents get the new key.",
+    )
+  })
+})
+
+// --- teardown: the five-minute hidden-tab rule and sign-out cleanup -----------------------------
+
+/**
+ * The boot path's DOM surface, faked: armTeardown reads document/window globals through el(),
+ * so the tests stub both. me-root carries a decrypted cell and the pager — the two things
+ * sign-out must neutralise.
+ */
+function stubPageDom() {
+  const els = new Map<string, FakeEl>()
+  for (const id of ["me-root", "sign-in", "go", "sign-out"]) els.set(id, new FakeEl("div"))
+  const docListeners = new Map<string, (() => void)[]>()
+  const winListeners = new Map<string, (() => void)[]>()
+  const doc = {
+    hidden: false,
+    getElementById: (id: string) => els.get(id) ?? null,
+    createElement: (tag: string) => new FakeEl(tag),
+    addEventListener: (type: string, fn: () => void) => docListeners.set(type, [...(docListeners.get(type) ?? []), fn]),
+  }
+  const win = {
+    addEventListener: (type: string, fn: () => void) => winListeners.set(type, [...(winListeners.get(type) ?? []), fn]),
+  }
+  const fire = (map: Map<string, (() => void)[]>, type: string): void => {
+    for (const fn of map.get(type) ?? []) fn()
+  }
+  return { els, doc, win, docListeners, winListeners, fire }
+}
+
+describe("teardown — the five-minute rule runs while hidden, and sign-out disarms the page", () => {
+  function harness() {
+    const dom = stubPageDom()
+    vi.stubGlobal("document", dom.doc)
+    vi.stubGlobal("window", dom.win)
+    const decrypted = new FakeEl("p")
+    decrypted.setAttribute("data-decrypted", "1")
+    decrypted.textContent = "the secret body"
+    const more = new FakeEl("button")
+    more.setAttribute("data-more", "")
+    const root = dom.els.get("me-root")!
+    root.appendChild(decrypted)
+    root.appendChild(more)
+    const ended = { n: 0 }
+    const dropped = { n: 0 }
+    armTeardown({ end: () => void (ended.n += 1) }, () => void (dropped.n += 1))
+    return { dom, decrypted, more, ended, dropped }
+  }
+
+  it("hidden for five minutes ends the session even if the tab never comes back", () => {
+    vi.useFakeTimers()
+    try {
+      const { dom, decrypted, more, ended, dropped } = harness()
+      dom.doc.hidden = true
+      dom.fire(dom.docListeners, "visibilitychange")
+      // still alive just under the limit, dead once it passes — no visibility return needed
+      vi.advanceTimersByTime(HIDDEN_LIMIT_MS - 1000)
+      expect(ended.n).toBe(0)
+      vi.advanceTimersByTime(2000)
+      expect(ended.n).toBe(1)
+      expect(dropped.n).toBe(1)
+      expect(decrypted.textContent).toBe("cleared — sign in again to read")
+      expect(more.disabled).toBe(true)
+      expect(dom.els.get("sign-in")!.hidden).toBe(false)
+    } finally {
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it("coming back before five minutes cancels the timer — the session survives", () => {
+    vi.useFakeTimers()
+    try {
+      const { dom, ended } = harness()
+      dom.doc.hidden = true
+      dom.fire(dom.docListeners, "visibilitychange")
+      vi.advanceTimersByTime(HIDDEN_LIMIT_MS - 1000)
+      dom.doc.hidden = false
+      dom.fire(dom.docListeners, "visibilitychange")
+      vi.advanceTimersByTime(HIDDEN_LIMIT_MS + 60_000)
+      expect(ended.n).toBe(0)
+      // and a second hidden stretch runs the full clock again
+      dom.doc.hidden = true
+      dom.fire(dom.docListeners, "visibilitychange")
+      vi.advanceTimersByTime(HIDDEN_LIMIT_MS + 1000)
+      expect(ended.n).toBe(1)
+    } finally {
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it("sign-out ends immediately: keys wiped, controls dead, store signer dropped — and end is idempotent", () => {
+    try {
+      const { dom, decrypted, more, ended, dropped } = harness()
+      dom.els.get("sign-out")!.click()
+      expect(ended.n).toBe(1)
+      expect(dropped.n).toBe(1)
+      expect(decrypted.textContent).toBe("cleared — sign in again to read")
+      expect(more.disabled).toBe(true)
+      expect(dom.els.get("go")!.disabled).toBe(false)
+      dom.fire(dom.winListeners, "pagehide") // a later pagehide does not end twice
+      expect(ended.n).toBe(1)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe("revocableStore — the signer dies with the session", () => {
+  it("calls pass through until drop, then every method refuses", async () => {
+    const calls: string[] = []
+    const store = {
+      listObjects: async () => {
+        calls.push("listObjects")
+        return { objects: [], partial: false }
+      },
+      listBatchSaves: async () => ({ items: [], partial: false }),
+      listRevocations: async () => [],
+      batchStatus: async () => ({ enabled: true, batchAnchor: `0x${"44".repeat(20)}` as Address }),
+      getAgentManifest: async () => {
+        throw new Error("unneeded")
+      },
+    }
+    const { port, drop } = revocableStore(store as unknown as MePorts["store"])
+    await port.listObjects({ owner: OWNER, namespaceId: NS })
+    expect(calls).toEqual(["listObjects"])
+    drop()
+    await expect(port.listObjects({ owner: OWNER, namespaceId: NS })).rejects.toThrow(/signed out/)
+    await expect(port.batchStatus()).rejects.toThrow(/signed out/)
+    expect(calls).toEqual(["listObjects"]) // nothing reached the client after the drop
+  })
+})
+
+// --- the source-level guard: no markup-writing API under src/me/ -------------------------------
+
+describe("src/me rendering guard", () => {
+  it("no file under src/me/ writes markup — textContent only", () => {
+    const meDir = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "me")
+    const files = readdirSync(meDir).filter((name) => name.endsWith(".ts"))
+    expect(files.length).toBeGreaterThan(0)
+    const banned = /\binnerHTML\b|\bouterHTML\b|\binsertAdjacentHTML\b|\bdocument\.write\b/
+    for (const file of files) {
+      const source = readFileSync(join(meDir, file), "utf8")
+      expect(source, `${file} must render with textContent only`).not.toMatch(banned)
+    }
+  })
+})

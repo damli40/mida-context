@@ -25,6 +25,18 @@ export const START_BLOCK = (() => {
   return Number(match[1])
 })()
 
+// BatchAnchor carries its own contract-level start_block (it deployed later than
+// the other contracts). Simulate items for it may not sit below that block either.
+// Read from config.yaml, not copied — same reason as START_BLOCK above.
+export const BATCH_ANCHOR_START_BLOCK = (() => {
+  const text = readFileSync(new URL("../config.yaml", import.meta.url), "utf8")
+  // "- name: BatchAnchor" appears twice — the top-level contracts list has no
+  // start_block, so anchor inside `chains:` where the per-contract one lives.
+  const match = /chains:[\s\S]*?- name: BatchAnchor[\s\S]*?start_block:\s*(\d+)/.exec(text)
+  if (match === null) return START_BLOCK
+  return Number(match[1])
+})()
+
 export const newIndexer = () => createTestIndexer()
 
 export const addr = (n: number) => `0x${n.toString(16).padStart(40, "0")}`

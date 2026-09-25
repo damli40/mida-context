@@ -11,4 +11,4 @@ Requires Node 22+. The `mida` CLI (package `mida-context`) provisions agents and
 
 ## License
 
-UNLICENSED — a placeholder until the owner picks a licence. See LICENSE.
+MIT — see LICENSE.

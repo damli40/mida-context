@@ -92,5 +92,4 @@ are in effect — host names only, never a value that could be a secret.
 
 ## License
 
-Not chosen yet (the package says UNLICENSED). Until a license is added, no rights are granted to use,
-copy or modify this code.
+MIT — see LICENSE.

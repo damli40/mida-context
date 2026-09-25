@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import {
-  START_BLOCK,
+  BATCH_ANCHOR_START_BLOCK,
   addr,
   bytes32,
   item,
@@ -13,7 +13,7 @@ const OWNER = addr(0x1001)
 const OWNER2 = addr(0x1002)
 const SUBMITTER = addr(0x9999)
 const BATCH = bytes32(0x7001)
-const B = START_BLOCK + 300
+const B = BATCH_ANCHOR_START_BLOCK + 300
 
 // One accepted save, as BatchAnchor emits it inside submitBatch.
 const saveAnchored = (opts: {
@@ -122,9 +122,12 @@ describe("BatchAnchor counts", () => {
   it("a re-delivered SaveAnchored does not count twice", async () => {
     const idx = newIndexer()
     const save = saveAnchored({ tx: 1, block: B, logIndex: 0 })
-    await run(idx, [save])
     // Same txHash + logIndex = same event identity, later block = reorg replay.
+    // One batch, not two runs: envio resumes a test indexer at prevEndBlock + 1
+    // and refuses to resume past a contract's own start_block, so a second
+    // process() call on this indexer throws before any handler runs.
     await run(idx, [
+      save,
       { ...save, block: { number: B + 7, timestamp: 1_700_000_000 + B + 7 } },
     ])
 
@@ -142,5 +145,19 @@ describe("BatchAnchor counts", () => {
     ])
     expect((await idx.Owner.get(mixedOwner.toLowerCase()))?.batchedSaves).toBe(1)
     expect(await idx.Owner.get(mixedOwner)).toBeUndefined()
+  })
+
+  it("writes one BatchedSave per anchored save, keyed by contextId", async () => {
+    const indexer = newIndexer()
+    await run(indexer, [saveAnchored({ tx: 1, block: B, contextId: bytes32(0x5001) }), saveAnchored({ tx: 1, block: B, logIndex: 1, contextId: bytes32(0x5002) })])
+    const row = await indexer.BatchedSave.get(bytes32(0x5001))
+    expect(row).toMatchObject({ owner: OWNER, batchId: BATCH, namespaceId: bytes32(0x5001), agentId: bytes32(0x4001), position: 0, version: 1, block: B, txHash: txHash(1) })
+    expect(await indexer.BatchedSave.get(bytes32(0x5002))).toBeDefined()
+  })
+  it("a replayed SaveAnchored does not duplicate or overwrite the BatchedSave", async () => {
+    const indexer = newIndexer()
+    const e = saveAnchored({ tx: 1, block: B })
+    await run(indexer, [e, e])
+    expect((await indexer.Owner.get(OWNER))?.batchedSaves).toBe(1)
   })
 })

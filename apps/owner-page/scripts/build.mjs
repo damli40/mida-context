@@ -72,11 +72,29 @@ for (const flow of ["signup", "approve", "revoke"]) {
   })
 }
 
+// The owner view at /me — same browser-safe graph and the same bare-specifier redirect.
+await build({
+  entryPoints: [join(appRoot, "src/me/page.ts")],
+  bundle: true,
+  format: "iife",
+  platform: "browser",
+  target: "es2022",
+  outfile: join(dist, "me.js"),
+  sourcemap: false,
+  minify: false,
+  logLevel: "info",
+  plugins: [browserEntries],
+})
+
 await copyFile(join(appRoot, "public/check.html"), join(dist, "check.html"))
 await copyFile(join(appRoot, "public/check.css"), join(dist, "check.css"))
 await copyFile(join(appRoot, "public/owner.css"), join(dist, "owner.css"))
 for (const flow of ["signup", "approve", "revoke"]) {
   await copyFile(join(appRoot, `public/${flow}.html`), join(dist, `${flow}.html`))
 }
+// The public home page at `/`, the owner view at `/me`, plus the brand favicons.
+for (const file of ["index.html", "home.css", "me.html", "me.css", "favicon.svg", "favicon.ico", "apple-touch-icon.png"]) {
+  await copyFile(join(appRoot, `public/${file}`), join(dist, file))
+}
 
-console.log("dist/: check.js, owner-core.js, signup.js, approve.js, revoke.js, check.css, owner.css, check.html, signup.html, approve.html, revoke.html")
+console.log("dist/: index.html, home.css, me.html, me.css, favicons, check.js, owner-core.js, signup.js, approve.js, revoke.js, me.js, check.css, owner.css, check.html, signup.html, approve.html, revoke.html")

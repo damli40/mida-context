@@ -476,6 +476,7 @@ indexer.onEvent(
         readEpoch: record.readEpoch,
         createdAt: record.createdAt,
         expiresAt: record.expiresAt,
+        provenanceSource: Number(record.provenanceSource),
         supersededBy: undefined,
         supersededBlock: undefined,
         registeredBlock: event.block.number,
@@ -581,8 +582,30 @@ indexer.onEvent(
 
     const { owner: ownerRow, isNew } = await ensureOwner(context, owner, event.block.number)
     if (isNew) stats.owners += 1
-    context.Owner.set({ ...ownerRow, batchedSaves: ownerRow.batchedSaves + 1 })
-    batchStats.anchoredSaves += 1
+
+    // One row per anchored save, keyed on contextId — the leaf's identity. A
+    // second event carrying the same contextId (a replayed log, or a duplicated
+    // leaf inside one batch) must not write a second row or move the counters:
+    // they count saves, not log lines.
+    const contextId = lc(event.params.contextId)
+    if (!(await context.BatchedSave.get(contextId))) {
+      context.BatchedSave.set({
+        id: contextId,
+        owner,
+        namespaceId: lc(event.params.namespaceId),
+        batchId: lc(event.params.batchId),
+        position: Number(event.params.position),
+        lineageId: lc(event.params.lineageId),
+        version: Number(event.params.version),
+        agentId: lc(event.params.author),
+        block: event.block.number,
+        txHash: lc(event.transaction.hash),
+      })
+      context.Owner.set({ ...ownerRow, batchedSaves: ownerRow.batchedSaves + 1 })
+      batchStats.anchoredSaves += 1
+    } else {
+      context.Owner.set(ownerRow)
+    }
     context.BatchStats.set(batchStats)
     saveStats(context, event, stats)
   },

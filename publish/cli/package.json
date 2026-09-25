@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Mida — passkey-approved context for AI agents. The mida CLI and the midad local service.",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "private": false,
   "bin": {
     "mida": "dist/mida.js",
