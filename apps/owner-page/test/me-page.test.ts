@@ -1,11 +1,11 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { readdirSync, readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
-import { renderMe } from "../src/me/page.js"
-import type { AgentRow, MeData, RecordRow } from "../src/me/sources.js"
+import { HIDDEN_LIMIT_MS, armTeardown, renderMe, revocableStore } from "../src/me/page.js"
+import type { AgentRow, MeData, MePorts, RecordRow } from "../src/me/sources.js"
 import { BLOCKED_AT_STORE_TEXT, PARTIAL_LIST_TEXT } from "../src/me/sources.js"
 
 /**
@@ -373,6 +373,142 @@ describe("renderMe", () => {
     more[0]!.click()
     expect(all(root, "[data-row]")).toHaveLength(25)
     expect(all(root, "[data-more]")).toHaveLength(0) // no more pages
+  })
+})
+
+// --- teardown: the five-minute hidden-tab rule and sign-out cleanup -----------------------------
+
+/**
+ * The boot path's DOM surface, faked: armTeardown reads document/window globals through el(),
+ * so the tests stub both. me-root carries a decrypted cell, a Revoke button and the pager —
+ * the three things sign-out must neutralise.
+ */
+function stubPageDom() {
+  const els = new Map<string, FakeEl>()
+  for (const id of ["me-root", "sign-in", "go", "sign-out"]) els.set(id, new FakeEl("div"))
+  const docListeners = new Map<string, (() => void)[]>()
+  const winListeners = new Map<string, (() => void)[]>()
+  const doc = {
+    hidden: false,
+    getElementById: (id: string) => els.get(id) ?? null,
+    createElement: (tag: string) => new FakeEl(tag),
+    addEventListener: (type: string, fn: () => void) => docListeners.set(type, [...(docListeners.get(type) ?? []), fn]),
+  }
+  const win = {
+    addEventListener: (type: string, fn: () => void) => winListeners.set(type, [...(winListeners.get(type) ?? []), fn]),
+  }
+  const fire = (map: Map<string, (() => void)[]>, type: string): void => {
+    for (const fn of map.get(type) ?? []) fn()
+  }
+  return { els, doc, win, docListeners, winListeners, fire }
+}
+
+describe("teardown — the five-minute rule runs while hidden, and sign-out disarms the page", () => {
+  function harness() {
+    const dom = stubPageDom()
+    vi.stubGlobal("document", dom.doc)
+    vi.stubGlobal("window", dom.win)
+    const decrypted = new FakeEl("p")
+    decrypted.setAttribute("data-decrypted", "1")
+    decrypted.textContent = "the secret body"
+    const revoke = new FakeEl("button")
+    revoke.setAttribute("data-revoke-agent", "0x11")
+    const more = new FakeEl("button")
+    more.setAttribute("data-more", "")
+    const root = dom.els.get("me-root")!
+    root.appendChild(decrypted)
+    root.appendChild(revoke)
+    root.appendChild(more)
+    const ended = { n: 0 }
+    const dropped = { n: 0 }
+    armTeardown({ end: () => void (ended.n += 1) }, () => void (dropped.n += 1))
+    return { dom, decrypted, revoke, more, ended, dropped }
+  }
+
+  it("hidden for five minutes ends the session even if the tab never comes back", () => {
+    vi.useFakeTimers()
+    try {
+      const { dom, decrypted, revoke, more, ended, dropped } = harness()
+      dom.doc.hidden = true
+      dom.fire(dom.docListeners, "visibilitychange")
+      // still alive just under the limit, dead once it passes — no visibility return needed
+      vi.advanceTimersByTime(HIDDEN_LIMIT_MS - 1000)
+      expect(ended.n).toBe(0)
+      vi.advanceTimersByTime(2000)
+      expect(ended.n).toBe(1)
+      expect(dropped.n).toBe(1)
+      expect(decrypted.textContent).toBe("cleared — sign in again to read")
+      expect(revoke.disabled).toBe(true)
+      expect(more.disabled).toBe(true)
+      expect(dom.els.get("sign-in")!.hidden).toBe(false)
+    } finally {
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it("coming back before five minutes cancels the timer — the session survives", () => {
+    vi.useFakeTimers()
+    try {
+      const { dom, ended } = harness()
+      dom.doc.hidden = true
+      dom.fire(dom.docListeners, "visibilitychange")
+      vi.advanceTimersByTime(HIDDEN_LIMIT_MS - 1000)
+      dom.doc.hidden = false
+      dom.fire(dom.docListeners, "visibilitychange")
+      vi.advanceTimersByTime(HIDDEN_LIMIT_MS + 60_000)
+      expect(ended.n).toBe(0)
+      // and a second hidden stretch runs the full clock again
+      dom.doc.hidden = true
+      dom.fire(dom.docListeners, "visibilitychange")
+      vi.advanceTimersByTime(HIDDEN_LIMIT_MS + 1000)
+      expect(ended.n).toBe(1)
+    } finally {
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it("sign-out ends immediately: keys wiped, controls dead, store signer dropped — and end is idempotent", () => {
+    try {
+      const { dom, decrypted, revoke, more, ended, dropped } = harness()
+      dom.els.get("sign-out")!.click()
+      expect(ended.n).toBe(1)
+      expect(dropped.n).toBe(1)
+      expect(decrypted.textContent).toBe("cleared — sign in again to read")
+      expect(revoke.disabled).toBe(true)
+      expect(more.disabled).toBe(true)
+      expect(dom.els.get("go")!.disabled).toBe(false)
+      dom.fire(dom.winListeners, "pagehide") // a later pagehide does not end twice
+      expect(ended.n).toBe(1)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe("revocableStore — the signer dies with the session", () => {
+  it("calls pass through until drop, then every method refuses", async () => {
+    const calls: string[] = []
+    const store = {
+      listObjects: async () => {
+        calls.push("listObjects")
+        return { objects: [], partial: false }
+      },
+      listBatchSaves: async () => ({ items: [], partial: false }),
+      listRevocations: async () => [],
+      batchStatus: async () => ({ enabled: true, batchAnchor: `0x${"44".repeat(20)}` as Address }),
+      getAgentManifest: async () => {
+        throw new Error("unneeded")
+      },
+    }
+    const { port, drop } = revocableStore(store as unknown as MePorts["store"])
+    await port.listObjects({ owner: OWNER, namespaceId: NS })
+    expect(calls).toEqual(["listObjects"])
+    drop()
+    await expect(port.listObjects({ owner: OWNER, namespaceId: NS })).rejects.toThrow(/signed out/)
+    await expect(port.batchStatus()).rejects.toThrow(/signed out/)
+    expect(calls).toEqual(["listObjects"]) // nothing reached the client after the drop
   })
 })
 

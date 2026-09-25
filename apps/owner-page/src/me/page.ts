@@ -46,7 +46,7 @@ const RECORD_PAGE = 20
 const COULD_NOT_OPEN = "could not be opened with this passkey"
 
 /** Tab hidden longer than this ends the session and clears the page's plaintext. */
-const HIDDEN_LIMIT_MS = 5 * 60 * 1000
+export const HIDDEN_LIMIT_MS = 5 * 60 * 1000
 
 const BADGE_CLASS: Record<Badge["kind"], string> = {
   you: "b-ok",
@@ -741,14 +741,63 @@ async function readIndexUrl(): Promise<string | null> {
   }
 }
 
-function armTeardown(session: MeSession): void {
+/**
+ * The store port wrapped so teardown can cut it dead: the client inside signs every read as the
+ * owner, and once the session ends a signed-out page must not issue owner-signed calls on a
+ * leftover key. drop() releases the reference — the signer it held becomes unreachable.
+ */
+export function revocableStore(store: MePorts["store"]): { port: MePorts["store"]; drop: () => void } {
+  let live: MePorts["store"] | null = store
+  const need = (): MePorts["store"] => {
+    if (live === null) throw new Error("signed out — the store signer was dropped")
+    return live
+  }
+  return {
+    port: {
+      // `async` so a dead port rejects instead of throwing synchronously at the call site.
+      listObjects: async (input) => need().listObjects(input),
+      listBatchSaves: async (input) => need().listBatchSaves(input),
+      listRevocations: async (state) => need().listRevocations(state),
+      batchStatus: async () => need().batchStatus(),
+      getAgentManifest: async (hash) => need().getAgentManifest(hash),
+    },
+    drop: () => {
+      live = null
+    },
+  }
+}
+
+/**
+ * Everything that must happen when the owner leaves: keys overwritten, plaintext cleared, the
+ * store signer dropped, and every control that could act on the owner's behalf disabled. The
+ * five-minute rule is a real timer armed on visibilitychange→hidden — a hidden tab that never
+ * comes back still loses its session; the elapsed check on return stays as the backstop for a
+ * throttled timer.
+ */
+export function armTeardown(session: Pick<MeSession, "end">, dropSigner: () => void): void {
   let hiddenAt: number | null = null
+  let hideTimer: ReturnType<typeof setTimeout> | null = null
+  let ended = false
   const end = (): void => {
+    if (ended) return
+    ended = true
+    if (hideTimer !== null) {
+      clearTimeout(hideTimer)
+      hideTimer = null
+    }
     session.end()
+    dropSigner()
     // Plaintext leaves the page with the keys — the cells remain, their content does not. The
     // query runs against the live tree: a revoke refresh has replaced the first render.
     for (const node of Array.from(el("me-root").querySelectorAll("[data-decrypted]"))) {
       node.textContent = "cleared — sign in again to read"
+    }
+    // Nothing on a signed-out page may act on the owner's behalf: no revokes, no repair, no
+    // paging through the records list.
+    for (const sel of ["[data-revoke-agent]", "[data-revoke-confirm]", "[data-more]", "[data-repair-run]"]) {
+      for (const node of Array.from(el("me-root").querySelectorAll(sel))) {
+        ;(node as HTMLButtonElement).disabled = true
+      }
     }
     el("sign-in").hidden = false
     el<HTMLButtonElement>("go").disabled = false
@@ -758,8 +807,15 @@ function armTeardown(session: MeSession): void {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       hiddenAt = Date.now()
-    } else if (hiddenAt !== null && Date.now() - hiddenAt > HIDDEN_LIMIT_MS) {
-      end()
+      if (hideTimer === null) hideTimer = setTimeout(end, HIDDEN_LIMIT_MS)
+    } else {
+      if (hideTimer !== null) {
+        clearTimeout(hideTimer)
+        hideTimer = null
+      }
+      // A hidden-tab timer can be throttled past the limit — the elapsed check is the backstop.
+      if (hiddenAt !== null && Date.now() - hiddenAt > HIDDEN_LIMIT_MS) end()
+      hiddenAt = null
     }
   })
 }
@@ -782,6 +838,10 @@ function boot(): void {
       const session = await signIn(env, NAMESPACE_TREE_V1.map((node) => node.id))
       progressLine("Signed in — reading agents, grants and records…")
       const ports = livePorts(env, session, indexUrl)
+      // The store client signs every read as the owner — teardown drops it so a signed-out page
+      // cannot issue owner-signed calls on a leftover key.
+      const storeHandle = revocableStore(ports.store)
+      ports.store = storeHandle.port
       // The repair action lives across reloads: set when a revoke ends pending or leaves a
       // reader un-wrapped, cleared when a repair run finishes clean.
       let repairOffered = false
@@ -822,7 +882,7 @@ function boot(): void {
       el("me-root").hidden = false
       el("nav-state").hidden = false
       el("sign-out").hidden = false
-      armTeardown(session)
+      armTeardown(session, storeHandle.drop)
     })().catch((error: unknown) => {
       showError(describeError(error))
       button.disabled = false
