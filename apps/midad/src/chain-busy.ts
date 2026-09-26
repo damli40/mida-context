@@ -1,33 +1,40 @@
-import { isChainBusy } from "@mida/chain"
+import { chainErrorKind } from "@mida/chain"
 import { isMidaError } from "@mida/protocol"
-import { BaseError, ContractFunctionRevertedError, InsufficientFundsError } from "viem"
+import { BaseError, InsufficientFundsError } from "viem"
 
 /**
- * "The chain could not be asked", as one test every refusal boundary shares (in-6 R4):
+ * The refusal reason a thrown chain error earns, shared by every boundary that names one
+ * (in-11 R-8). `chain-busy` is the reason from in-6 R4 — "the chain could not be asked" —
+ * but narrowed to failures a retry can honestly change: rate limits, 5xx, dropped
+ * connections, timeouts, and the store's own CHAIN_UNAVAILABLE. Two failures the old
+ * catch-all mislabeled as busy get their own reasons:
  *
- * - the transport's own ChainBusyError, wherever viem wrapped it (isChainBusy walks `cause`);
- * - the store's CHAIN_UNAVAILABLE answer, whether it arrives as a MidaError or a plain error
- *   whose `code` was preserved — and the same code nested inside another error's cause;
- * - any viem failure with NO contract revert inside: a wrapped revert is the chain answering
- *   "no" and keeps its real name, but a transport-level failure means Monad was unreachable.
+ * - `chain-misconfigured` — the RPC answered but found no Mida contract at the configured
+ *   address (a wrong-network rpcUrl or stale deployment): the owner fixes the setup,
+ *   not the timing;
+ * - `rpc-auth` — the provider refused the credential (HTTP 401/403): the owner fixes the
+ *   key, not the timing.
  *
- * What this must never catch: an actual CAPABILITY_DENIED — the chain answered "no grant" and
- * the refusal is real. Busy means unreachable, not refused.
+ * `undefined` means the error names itself — a real contract refusal like CAPABILITY_DENIED
+ * or a wrapped revert — and callers keep their existing fallback.
+ */
+export type ChainRefusalReason = "chain-busy" | "chain-misconfigured" | "rpc-auth"
+
+export function chainRefusalReason(error: unknown): ChainRefusalReason | undefined {
+  const kind = chainErrorKind(error)
+  if (kind === "busy") return "chain-busy"
+  if (kind === "misconfigured") return "chain-misconfigured"
+  if (kind === "rpc-auth") return "rpc-auth"
+  return undefined
+}
+
+/**
+ * True only for a chain that genuinely could not be asked (in-6 R4). Misconfiguration and
+ * refused credentials are NOT busy — "it tries again next session" is the wrong advice for
+ * either, so they answer `false` here and carry their own reasons via chainRefusalReason.
  */
 export function isChainBusyError(error: unknown): boolean {
-  if (isChainBusy(error)) return true
-  for (
-    let current = error;
-    current !== null && typeof current === "object";
-    current = (current as { cause?: unknown }).cause
-  ) {
-    const code = (current as { code?: unknown }).code
-    if (code === "CHAIN_UNAVAILABLE" || code === "CHAIN_BUSY") return true
-  }
-  return (
-    error instanceof BaseError &&
-    error.walk((cause) => cause instanceof ContractFunctionRevertedError) === null
-  )
+  return chainErrorKind(error) === "busy"
 }
 
 /**

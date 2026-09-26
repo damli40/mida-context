@@ -4,7 +4,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from "@modelcontextprotocol/sdk/types.js"
 import { callDaemon, socketPathFor } from "./control.js"
 import type { MidaHome } from "./home.js"
-import { CHAIN_BUSY_TEXT, degradedMessage } from "./hook-output.js"
+import { CHAIN_REFUSAL_TEXT, degradedMessage } from "./hook-output.js"
 import type { SessionStartBody } from "./hook-output.js"
 import { appendLog } from "./log.js"
 import { findProjectMarker } from "./queue.js"
@@ -356,10 +356,11 @@ async function toolWhatsNew(deps: McpServerDeps) {
     if (reason === "revoked") {
       return toolText(`Mida: ${deps.agent}'s access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.`)
     }
-    // the chain could not be asked — the same line the hook prints (imported, unlike the
-    // refusal lines above: hook-output.ts is a leaf this adapter may already reach)
-    if (reason === "chain-busy") {
-      return toolText(CHAIN_BUSY_TEXT)
+    // the chain could not answer honestly — the same line the hook prints for each reason
+    // (imported, unlike the refusal lines above: hook-output.ts is a leaf this adapter may
+    // already reach). Busy, misconfigured and refused-key each get their own wording (R-8).
+    if (reason === "chain-busy" || reason === "chain-misconfigured" || reason === "rpc-auth") {
+      return toolText(CHAIN_REFUSAL_TEXT[reason])
     }
     // the two list-integrity refusals carry their own canonical lines — the same ones the
     // session-start handoff text uses (they are reproduced, not imported: handoff.ts must stay

@@ -1,4 +1,9 @@
 import { http } from "viem"
+import {
+  ContractFunctionZeroDataError,
+  HttpRequestError,
+  TimeoutError,
+} from "viem"
 
 /**
  * The one chain transport every Mida process uses. `http(rpcUrl)` alone lets a session start or a
@@ -80,6 +85,61 @@ export function isChainBusy(error: unknown): boolean {
     if (current instanceof ChainBusyError) return true
   }
   return false
+}
+
+/**
+ * What a thrown chain error actually is, so every surface names it honestly (in-11 R-8):
+ *
+ * - `busy` — the RPC could not answer: stayed rate-limited, answered 408/429/5xx, dropped the
+ *   connection (an HttpRequestError with no status), timed out, or reported an RPC-level
+ *   overload code (-32005 limit exceeded / -32603 provider-internal). Waiting and retrying is
+ *   honest advice — the same set the transport's own retry treats as transient.
+ * - `misconfigured` — the RPC answered but the call returned "0x" (no contract at the
+ *   configured address): a wrong-network rpcUrl or a stale deployment. The fix is
+ *   MONAD_TESTNET_RPC / network.json, not a retry.
+ * - `rpc-auth` — the provider refused the key (HTTP 401/403). The fix is the provider
+ *   credential, not a retry.
+ * - `undefined` — anything else: a real contract answer (a revert), a decode failure, a local
+ *   fault. Not renamed — callers keep their own fallback rather than lie.
+ *
+ * The walk also honours codes a store already computed: a CHAIN_UNAVAILABLE /
+ * CHAIN_MISCONFIGURED / RPC_AUTH_REJECTED answer classifies the same as the raw transport
+ * shape it was wrapped from, so a hosted store's answer and a local call get one name.
+ */
+export type ChainErrorKind = "busy" | "misconfigured" | "rpc-auth"
+
+export function chainErrorKind(error: unknown): ChainErrorKind | undefined {
+  let sawZeroData = false
+  let sawAuth = false
+  let sawBusy = false
+  for (
+    let current = error;
+    current !== null && typeof current === "object";
+    current = (current as { cause?: unknown }).cause
+  ) {
+    if (current instanceof ChainBusyError) return "busy"
+    const code = (current as { code?: unknown }).code
+    if (code === "CHAIN_BUSY" || code === "CHAIN_UNAVAILABLE" || code === "CHAIN_READ_BUDGET_EXHAUSTED") {
+      return "busy"
+    }
+    if (code === "CHAIN_MISCONFIGURED") return "misconfigured"
+    if (code === "RPC_AUTH_REJECTED") return "rpc-auth"
+    if (current instanceof ContractFunctionZeroDataError) sawZeroData = true
+    if (current instanceof HttpRequestError) {
+      const status = current.status
+      if (status === 401 || status === 403) sawAuth = true
+      // 408/429/5xx is exactly transientAnswer's set; no status means the request never
+      // reached a server (DNS, refused socket) — the same failure a retry can change.
+      else if (status === undefined || status === 408 || status === 429 || status >= 500) sawBusy = true
+    }
+    if (current instanceof TimeoutError) sawBusy = true
+    if (code === -32005 || code === -32603) sawBusy = true
+  }
+  // a zero-data answer is definitive misconfiguration; auth and transport signals follow
+  if (sawZeroData) return "misconfigured"
+  if (sawAuth) return "rpc-auth"
+  if (sawBusy) return "busy"
+  return undefined
 }
 
 /** The Sep 25 live answer worded it "requests limited to 15/sec"; providers say it a few ways. */

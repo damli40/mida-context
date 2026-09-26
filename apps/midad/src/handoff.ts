@@ -4,8 +4,8 @@ import { isMidaError } from "@mida/protocol"
 import { isReadDeadlineError } from "@mida/chain"
 import { compareChainOrder, defuse, handoffHeader, mergeCheckpoints, renderHandoffReport } from "@mida/checkpoint"
 import type { MigrationEnvelope } from "@mida/checkpoint"
-import { isChainBusyError } from "./chain-busy.js"
-import { CHAIN_BUSY_TEXT } from "./hook-output.js"
+import { chainRefusalReason } from "./chain-busy.js"
+import { CHAIN_REFUSAL_TEXT } from "./hook-output.js"
 import { CODING_CLIENTS } from "./install.js"
 import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { movedOnSuffix } from "./migration-envelope.js"
@@ -393,8 +393,10 @@ export async function buildHandoff(
       if (isMidaError(error, "CAPABILITY_DENIED") || isMidaError(error, "CAPABILITY_EXPIRED")) {
         return refused("not-approved", notApprovedText(agent))
       }
-      // the chain could not be ASKED — a refusal, but it names the busy RPC, never "not approved"
-      if (isChainBusyError(error)) return refused("chain-busy", CHAIN_BUSY_TEXT)
+      // the chain could not be ASKED — a refusal, but it names the real cause (a busy,
+      // misconfigured or refused-key RPC), never "not approved" (in-11 R-8)
+      const chainReason = chainRefusalReason(error)
+      if (chainReason !== undefined) return refused(chainReason, CHAIN_REFUSAL_TEXT[chainReason])
       return refused("read-failed", noContextText("read-failed"))
     }
     const facts = factOutcome.status === "ok" ? factOutcome.facts : []
@@ -515,7 +517,8 @@ export async function buildHandoff(
   } catch (error) {
     // a chain answer that never arrived gets its own reason — the capability check's throw is
     // how a rate-limited RPC used to reach "internal" (and, at the store, "not-approved")
-    if (isChainBusyError(error)) return refused("chain-busy", CHAIN_BUSY_TEXT)
+    const chainReason = chainRefusalReason(error)
+    if (chainReason !== undefined) return refused(chainReason, CHAIN_REFUSAL_TEXT[chainReason])
     if (isReadDeadlineError(error)) return refused("read-slow", noContextText("read-slow"))
     return refused("internal", noContextText("internal"))
   }

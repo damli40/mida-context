@@ -10,10 +10,10 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
-import { BaseError, HttpRequestError } from "viem"
+import { BaseError, ContractFunctionExecutionError, ContractFunctionZeroDataError, HttpRequestError } from "viem"
 import { MidaError, namespaceId } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
-import { ChainBusyError } from "@mida/chain"
+import { ChainBusyError, capabilityRegistryAbi } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import { ContextApiClient, RegistryReader, createContextApi } from "@mida/api"
 import { ChainReadBudgetExceeded } from "../src/chain-budget.js"
@@ -44,10 +44,42 @@ describe("toErrorBody (in-6 R4)", () => {
     }
   })
 
-  it("any viem chain failure answers 503 CHAIN_UNAVAILABLE — the chain could not be asked", () => {
+  it("a genuinely unreachable transport answers 503 CHAIN_UNAVAILABLE — the chain could not be asked", () => {
+    for (const error of [
+      new HttpRequestError({ url: "http://rpc.test", status: 503, body: {}, details: "unavailable" }),
+      new HttpRequestError({ url: "http://rpc.test", status: 429, body: {}, details: "limited" }),
+      new HttpRequestError({ url: "http://rpc.test" }), // no status: never reached a server
+    ]) {
+      const { status, body } = toErrorBody(error)
+      expect(status).toBe(503)
+      expect(body.error.code).toBe("CHAIN_UNAVAILABLE")
+    }
+  })
+
+  // in-11 R-8 — a setup the owner must fix is not "unavailable": the RPC answered but found no
+  // contract, or the provider refused the key. Both are non-retryable 502s with their own codes.
+  it("an RPC that answered but found no contract answers 502 CHAIN_MISCONFIGURED", () => {
+    const error = new ContractFunctionExecutionError(
+      new ContractFunctionZeroDataError({ functionName: "getAgent" }),
+      { abi: capabilityRegistryAbi, functionName: "getAgent", args: [], contractAddress: "0x2222222222222222222222222222222222222222" } as never,
+    )
+    const { status, body } = toErrorBody(error)
+    expect(status).toBe(502)
+    expect(body.error.code).toBe("CHAIN_MISCONFIGURED")
+  })
+
+  it("an RPC that refused the credential (401/403) answers 502 RPC_AUTH_REJECTED", () => {
+    for (const s of [401, 403]) {
+      const { status, body } = toErrorBody(new HttpRequestError({ url: "http://rpc.test", status: s, body: {}, details: "no" }))
+      expect(status, `status ${s}`).toBe(502)
+      expect(body.error.code).toBe("RPC_AUTH_REJECTED")
+    }
+  })
+
+  it("a viem failure that is none of those — the chain answered something unexpected — is 500 INTERNAL_ERROR, not a 503 that lies 'unreachable'", () => {
     const { status, body } = toErrorBody(new BaseError("request failed"))
-    expect(status).toBe(503)
-    expect(body.error.code).toBe("CHAIN_UNAVAILABLE")
+    expect(status).toBe(500)
+    expect(body.error.code).toBe("INTERNAL_ERROR")
   })
 
   it("the request's own chain-read budget error answers 503 CHAIN_UNAVAILABLE too", () => {

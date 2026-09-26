@@ -47,6 +47,13 @@ export const MIDA_ERROR_CODES = [
   // of its own Monad read budget. Still a refusal (fail closed, no data served), but retryable
   // and never an authorization answer: the Sep 25 incident was exactly this wearing DENIED.
   "CHAIN_UNAVAILABLE",
+  // The RPC answered but the configured address held no Mida contract (the call returned "0x"):
+  // a wrong-network rpcUrl or a stale deployment. Not retryable — the fix is the setup, and the
+  // caller must hear that instead of "busy" (in-11 R-8).
+  "CHAIN_MISCONFIGURED",
+  // The RPC provider refused the credential (HTTP 401/403). Not retryable — the fix is the key
+  // in the provider URL, and the caller must hear that instead of "busy" (in-11 R-8).
+  "RPC_AUTH_REJECTED",
   // A failure no more honest name exists for. Anything thrown that is not a protocol error used
   // to be flattened to CAPABILITY_DENIED — an infrastructure fault impersonating an authorization
   // answer. It gets its own non-authorization code instead.

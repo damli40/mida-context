@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { BaseError, ContractFunctionExecutionError, ContractFunctionRevertedError, HttpRequestError } from "viem"
+import { BaseError, ContractFunctionExecutionError, ContractFunctionRevertedError, ContractFunctionZeroDataError, HttpRequestError } from "viem"
 import { ChainBusyError } from "@mida/chain"
 import { MidaError } from "@mida/protocol"
 import { contextRegistryAbi } from "@mida/chain"
@@ -19,19 +19,31 @@ describe("refusalCode (CHAIN-09)", () => {
   })
 
   it("a chain that could not be asked is chain-busy, never an authorization code (in-6 R4)", () => {
-    // a bare viem transport failure, a wrapped ChainBusyError, and the store's CHAIN_UNAVAILABLE
-    expect(refusalCode(new BaseError("request failed"))).toBe("chain-busy")
+    // a transport failure that never reached a server, a wrapped ChainBusyError, and the
+    // store's CHAIN_UNAVAILABLE — the shapes "could not be asked" actually arrives in
+    expect(refusalCode(new HttpRequestError({ url: "http://rpc.test" }))).toBe("chain-busy")
+    expect(refusalCode(new HttpRequestError({ url: "http://rpc.test", status: 503, body: {}, details: "down" }))).toBe("chain-busy")
     expect(refusalCode(new HttpRequestError({ url: "http://rpc.test", cause: new ChainBusyError() }))).toBe("chain-busy")
     expect(refusalCode(new MidaError("CHAIN_UNAVAILABLE", "busy"))).toBe("chain-busy")
     expect(refusalCode(new ChainBusyError())).toBe("chain-busy")
   })
 
-  it("a real contract revert still says CHAIN_CALL_FAILED — the chain answered, it was not unreachable", () => {
+  it("not-busy chain failures keep their own names (in-11 R-8): wrong setup, refused key, and a revert", () => {
+    // the RPC answered but found no contract, or refused the credential — never "busy"
+    const zeroData = new ContractFunctionExecutionError(
+      new ContractFunctionZeroDataError({ functionName: "getRecord" }),
+      { abi: contextRegistryAbi, args: [`0x${"1".repeat(64)}`], contractAddress: "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512", functionName: "getRecord" },
+    )
+    expect(refusalCode(zeroData)).toBe("chain-misconfigured")
+    expect(refusalCode(new HttpRequestError({ url: "http://rpc.test", status: 401, body: {}, details: "no" }))).toBe("rpc-auth")
+    expect(refusalCode(new HttpRequestError({ url: "http://rpc.test", status: 403, body: {}, details: "no" }))).toBe("rpc-auth")
     const reverted = new ContractFunctionExecutionError(
       new ContractFunctionRevertedError({ abi: contextRegistryAbi, functionName: "getRecord" }),
       { abi: contextRegistryAbi, args: [`0x${"1".repeat(64)}`], contractAddress: "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512", functionName: "getRecord" },
     )
     expect(refusalCode(reverted)).toBe("CHAIN_CALL_FAILED")
+    // a bare viem error carries no transport signal — it names CHAIN_CALL_FAILED, not busy
+    expect(refusalCode(new BaseError("request failed"))).toBe("CHAIN_CALL_FAILED")
   })
 
   it("a plain error, a non-error and nothing at all are UNEXPECTED, never ERROR", () => {

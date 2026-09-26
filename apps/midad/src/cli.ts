@@ -368,6 +368,10 @@ export async function runCliWithRuntime(
     } else if (code === "chain-busy") {
       // the chain could not be asked at all — the same owner-facing line ownerRefusalLine prints
       print("Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again")
+    } else if (code === "chain-misconfigured") {
+      print("the RPC answered but found no Mida contract — check MONAD_TESTNET_RPC or this setup's network.json; nothing was sent or decided")
+    } else if (code === "rpc-auth") {
+      print("the RPC provider refused the key — check the provider URL in MONAD_TESTNET_RPC or network.json; nothing was sent or decided")
     } else if (code === "CHAIN_CALL_FAILED") {
       print(`the chain call failed — this setup's contract is ${runtime.chain.deployment.capabilityRegistry.slice(0, 6)}…; run with MIDA_DEBUG=1 to see why`)
     } else if (code === "agent-not-setup") {
@@ -927,6 +931,12 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     // nothing was signed, sent or decided, and a moment later the same command answers for real.
     case "chain-busy":
       return "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again"
+    // Not busy — a setup the owner must fix: the RPC answered but the configured address held
+    // no Mida contract, or the provider refused the credential (in-11 R-8).
+    case "chain-misconfigured":
+      return "the RPC answered but found no Mida contract — check MONAD_TESTNET_RPC or this setup's network.json; nothing was sent or decided"
+    case "rpc-auth":
+      return "the RPC provider refused the key — check the provider URL in MONAD_TESTNET_RPC or network.json; nothing was sent or decided"
     // A chain error with no code: the line names this setup's contract so a wrong deployment
     // explains itself, and names the flag that prints the masked detail.
     case "CHAIN_CALL_FAILED": {

@@ -383,4 +383,22 @@ describe("transient retries (in-9 R-6)", () => {
       vi.unstubAllGlobals()
     }
   }, 30_000)
+
+  // in-11 R-8 — the review's exact probe: one transient 502 through a real client call still
+  // resolves (retryCount: 0 disables viem's retry; this layer's fetchFn retry absorbs it).
+  it("a single 502 followed by a good answer still resolves a real client call", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      calls += 1
+      if (calls === 1) return new Response("Bad Gateway", { status: 502 })
+      const body = JSON.parse(String(init?.body)) as { id: number }
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x10" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://r8.test") })
+    await expect(client.getBlockNumber({ cacheTime: 0 })).resolves.toBe(16n)
+    expect(calls).toBe(2)
+  }, 30_000)
 })

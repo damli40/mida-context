@@ -64,6 +64,28 @@ export const CHAIN_BUSY_TEXT =
   "Mida: Monad is busy right now — context not loaded; working without it (it tries again next session)"
 
 /**
+ * The two failures that are NOT busy (in-11 R-8): the RPC answered but found no contract at
+ * the configured address — a setup to fix, not a wait — and the provider refused the key.
+ * Same shape as CHAIN_BUSY_TEXT so a hook line never promises a retry that cannot help.
+ */
+export const CHAIN_MISCONFIGURED_TEXT =
+  "Mida: the RPC answered but found no Mida contract — check MONAD_TESTNET_RPC or network.json; context not loaded, working without it"
+
+export const RPC_AUTH_TEXT =
+  "Mida: the RPC provider refused the key — check the provider URL in MONAD_TESTNET_RPC or network.json; context not loaded, working without it"
+
+/**
+ * The owner-facing line for each chain-refusal reason — one wording on every surface. Keyed by
+ * the literal reason strings chain-busy.ts returns; kept import-free so this file stays a leaf
+ * the MCP adapter may reach (mcp.test.ts walks that graph).
+ */
+export const CHAIN_REFUSAL_TEXT = {
+  "chain-busy": CHAIN_BUSY_TEXT,
+  "chain-misconfigured": CHAIN_MISCONFIGURED_TEXT,
+  "rpc-auth": RPC_AUTH_TEXT,
+} as const
+
+/**
  * The human-facing line for a SessionStart outcome. The model-facing text is not touched here —
  * it travels separately inside the envelope.
  */
@@ -105,6 +127,10 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
   // a busy chain is not a denial: the owner hears what happened and that the next session retries
   if (body.kind === "refused" && body.reason === "chain-busy") {
     return systemMessage(CHAIN_BUSY_TEXT)
+  }
+  // a misconfigured or refused-key RPC is not busy either: the owner hears what to fix
+  if (body.kind === "refused" && (body.reason === "chain-misconfigured" || body.reason === "rpc-auth")) {
+    return systemMessage(CHAIN_REFUSAL_TEXT[body.reason])
   }
   return degradedMessage(typeof body.reason === "string" ? body.reason : "no-answer")
 }

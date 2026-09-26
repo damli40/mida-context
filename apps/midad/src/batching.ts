@@ -5,7 +5,7 @@ import type { CreateContextInput } from "@mida/sdk"
 import { PERMISSION, PROVENANCE_POLICY, namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import type { MidaHome } from "./home.js"
-import { isChainBusyError } from "./chain-busy.js"
+import { chainRefusalReason } from "./chain-busy.js"
 import { isRevoked, loadAgentIdentity } from "./keys.js"
 import { readSavedNetwork } from "./network.js"
 import type { SavedNetwork } from "./network.js"
@@ -382,7 +382,9 @@ async function resubmitStaleEpoch(
     // EPOCH_ROTATION_REQUIRED waits the same way (a rotation accepts no writes at all), and an
     // answer that never arrived carries no code. Only EPOCH_STALE — the very condition being
     // retried answering the resubmission itself — spends one against the cap.
-    if (isChainBusyError(error)) return "retry-later"
+    // chainRefusalReason covers all three "could not judge" answers — busy, the store's
+    // CHAIN_MISCONFIGURED and RPC_AUTH_REJECTED: a wrong setup never deletes a save either (R-8)
+    if (chainRefusalReason(error) !== undefined) return "retry-later"
     const code = (error as { code?: unknown }).code
     if (code === "INTERNAL_ERROR" || code === "WRITE_DENIED") return "retry-later"
     const status = (error as { status?: unknown }).status

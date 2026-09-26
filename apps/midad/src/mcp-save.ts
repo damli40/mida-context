@@ -7,11 +7,11 @@ import type { Checkpoint } from "@mida/checkpoint"
 import { scrubValue } from "@mida/compiler"
 import { PERMISSION, PROVENANCE_POLICY, isMidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { isChainBusyError } from "./chain-busy.js"
+import { chainRefusalReason } from "./chain-busy.js"
 import { CheckpointPayloadError, fieldPathsFromErrors } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import { capabilityState, noContextText, projectCheckRefusal } from "./handoff.js"
-import { CHAIN_BUSY_TEXT } from "./hook-output.js"
+import { CHAIN_REFUSAL_TEXT } from "./hook-output.js"
 import type { CapabilityState } from "./handoff.js"
 import { MCP_CLIENT_TOOLS } from "./install.js"
 import { isRevoked, loadAgentIdentity, revokePending } from "./keys.js"
@@ -199,7 +199,8 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
     canCreate = await askAuthority(identity.agentId, PERMISSION.CREATE, PROVENANCE_POLICY.ALLOW_INFERENCE)
   } catch (error) {
     // a chain that could not be asked is not a failed check — it names itself (in-6 R4)
-    if (isChainBusyError(error)) return refused("chain-busy", CHAIN_BUSY_TEXT)
+    const chainReason = chainRefusalReason(error)
+    if (chainReason !== undefined) return refused(chainReason, CHAIN_REFUSAL_TEXT[chainReason])
     return refused("check-failed", noContextText("check-failed"))
   }
   if (!canCreate) {
@@ -208,7 +209,8 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
     try {
       state = await capability(runtime, agent)
     } catch (error) {
-      if (isChainBusyError(error)) return refused("chain-busy", CHAIN_BUSY_TEXT)
+      const chainReason = chainRefusalReason(error)
+      if (chainReason !== undefined) return refused(chainReason, CHAIN_REFUSAL_TEXT[chainReason])
       throw error
     }
     if (state === "revoked") return refused("revoked", revokedText(agent))
@@ -217,7 +219,8 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
         return refused("read-only", readOnlyText(agent))
       }
     } catch (error) {
-      if (isChainBusyError(error)) return refused("chain-busy", CHAIN_BUSY_TEXT)
+      const chainReason = chainRefusalReason(error)
+      if (chainReason !== undefined) return refused(chainReason, CHAIN_REFUSAL_TEXT[chainReason])
       return refused("check-failed", noContextText("check-failed"))
     }
     return refused("not-approved", notApprovedText(agent))
@@ -319,8 +322,9 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
     if ((error as { code?: unknown }).code === "agent-not-setup") {
       return refused("no-identity", noIdentityText(agent, runtime.home.root))
     }
-    // a send or read that died on a busy chain is a refusal, not "not-approved" (in-6 R4)
-    if (isChainBusyError(error)) return refused("chain-busy", CHAIN_BUSY_TEXT)
+    // a send or read that died on a chain that could not answer is a refusal, not "not-approved" (in-6 R4)
+    const chainReason = chainRefusalReason(error)
+    if (chainReason !== undefined) return refused(chainReason, CHAIN_REFUSAL_TEXT[chainReason])
     if (isMidaError(error)) return refused(error.code, noContextText(error.code))
     throw error
   }

@@ -1,8 +1,6 @@
 import { MIDA_ERROR_CODES, MidaError, isMidaError } from "@mida/protocol"
 import type { MidaErrorCode } from "@mida/protocol"
-import { isChainBusy } from "@mida/chain"
-import { BaseError } from "viem"
-import { isChainReadBudgetExceeded } from "./chain-budget.js"
+import { chainErrorKind } from "@mida/chain"
 
 export interface ApiErrorBody {
   error: { code: MidaErrorCode; message: string }
@@ -25,6 +23,8 @@ const STATUS: Partial<Record<MidaErrorCode, number>> = {
   STALE_PARENT: 409,
   REQUEST_CONSUMED: 409,
   PAYLOAD_TOO_LARGE: 413,
+  CHAIN_MISCONFIGURED: 502,
+  RPC_AUTH_REJECTED: 502,
   CHAIN_UNAVAILABLE: 503,
   INTERNAL_ERROR: 500,
 }
@@ -34,15 +34,25 @@ export function statusFor(code: MidaErrorCode): number {
 }
 
 /**
- * Unknown failures never leak internals and never read as authorization (in-6 R4). A chain that
- * could not be asked — the transport's ChainBusyError, any viem failure, this request's own
- * Monad read budget — answers 503 CHAIN_UNAVAILABLE; anything else is 500 INTERNAL_ERROR. Both
- * still return no data (fail closed), but a client can now tell "Monad was unreachable" from
- * "the chain said no" — the Sep 25 incident was a busy RPC wearing CAPABILITY_DENIED.
+ * Unknown failures never leak internals and never read as authorization (in-6 R4). The chain
+ * error's kind picks the answer (in-11 R-8): a genuinely unreachable RPC — rate-limited, 5xx,
+ * dropped, timed out, or this request's own Monad read budget — is 503 CHAIN_UNAVAILABLE and
+ * retryable; an RPC that answered "no contract here" is 502 CHAIN_MISCONFIGURED and a provider
+ * that refused the key is 502 RPC_AUTH_REJECTED, neither retryable. A viem failure that is none
+ * of those — the chain answered something unexpected — is 500 INTERNAL_ERROR rather than a 503
+ * that would lie "unreachable". All still return no data (fail closed): the Sep 25 incident was
+ * a busy RPC wearing CAPABILITY_DENIED.
  */
 export function toErrorBody(error: unknown): { status: number; body: ApiErrorBody } {
   if (isMidaError(error)) return { status: statusFor(error.code), body: { error: { code: error.code, message: error.message } } }
-  if (isChainBusy(error) || error instanceof BaseError || isChainReadBudgetExceeded(error)) {
+  const kind = chainErrorKind(error)
+  if (kind === "misconfigured") {
+    return { status: 502, body: { error: { code: "CHAIN_MISCONFIGURED", message: "the RPC answered but found no Mida contract — check MONAD_TESTNET_RPC / network.json" } } }
+  }
+  if (kind === "rpc-auth") {
+    return { status: 502, body: { error: { code: "RPC_AUTH_REJECTED", message: "the RPC provider refused the key — check the provider URL" } } }
+  }
+  if (kind === "busy") {
     return { status: 503, body: { error: { code: "CHAIN_UNAVAILABLE", message: "the chain could not answer right now — retry in a moment" } } }
   }
   return { status: 500, body: { error: { code: "INTERNAL_ERROR", message: "internal error; request denied" } } }

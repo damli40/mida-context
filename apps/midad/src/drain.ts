@@ -14,7 +14,7 @@ import { RegistryReader, StoreHttpError } from "@mida/api"
 import { readTranscriptFor, scrubSecrets } from "@mida/compiler"
 import { devinSessionStat } from "@mida/compiler"
 import type { OpenDevinDb, compileCheckpoint } from "@mida/compiler"
-import { isChainBusyError, isWalletLow } from "./chain-busy.js"
+import { chainRefusalReason, isWalletLow } from "./chain-busy.js"
 import { CheckpointPayloadError, eventIdFor, unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import { devinDbPathAllowed } from "./devin-facts.js"
@@ -631,10 +631,12 @@ function failureCode(error: unknown): string {
   // proxy error page. Named so it can never read as chain trouble; transient like chain-error:
   // the job waits out the backoff, the bytes stay (in-11 R-3).
   if (error instanceof StoreHttpError) return "store-error"
-  // the chain could not be asked — the transport's own busy error, the store's CHAIN_UNAVAILABLE
-  // or a viem failure. Transient: the job waits out the backoff like chain-error, but the log
-  // names what actually happened — never "not-approved" (Sep 25's wrong label).
-  if (isChainBusyError(error)) return "chain-busy"
+  // the chain could not be asked — or it answered "wrong setup" / "refused key". All three are
+  // transient (the job waits out the backoff, the bytes stay) but the log names what actually
+  // happened: chain-busy, chain-misconfigured or rpc-auth — never "not-approved" (Sep 25's
+  // wrong label), and misconfiguration no longer wears "busy" (in-11 R-8).
+  const chainReason = chainRefusalReason(error)
+  if (chainReason !== undefined) return chainReason
   if (error instanceof Error) {
     const code = (error as { code?: unknown }).code
     if (typeof code === "string" && PERMANENT_FAILURES.has(code)) return code

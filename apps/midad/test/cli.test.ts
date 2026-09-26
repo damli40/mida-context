@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { BaseError } from "viem"
+import { BaseError, HttpRequestError } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
@@ -901,14 +901,24 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     expect(lines.join("\n")).not.toContain("ERROR")
   })
 
-  it("a bare viem failure — the chain could not be asked — is the busy line, never 'not approved' (in-6 R4)", async () => {
+  it("a transport failure — the chain could not be asked — is the busy line, never 'not approved' (in-6 R4)", async () => {
     const lines: string[] = []
-    const code = await runCliWithRuntime(["request", "claude-code"], stubRuntime(new BaseError("boom")), (line) => lines.push(line))
+    // the real shape a network failure arrives in: an HttpRequestError with no status
+    const code = await runCliWithRuntime(["request", "claude-code"], stubRuntime(new HttpRequestError({ url: "http://rpc.test" })), (line) => lines.push(line))
     expect(code).toBe(1)
     expect(lines).toEqual([
       "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again",
     ])
     expect(lines.join("\n")).not.toContain("not approved")
+  })
+
+  it("a viem failure that carries no transport signal names the contract, not 'busy' (in-11 R-8)", async () => {
+    const lines: string[] = []
+    const code = await runCliWithRuntime(["request", "claude-code"], stubRuntime(new BaseError("boom")), (line) => lines.push(line))
+    expect(code).toBe(1)
+    expect(lines).toEqual([
+      "the chain call failed — this setup's contract is 0xf07d…; run with MIDA_DEBUG=1 to see why",
+    ])
   })
 
   it("a non-chain error is refused: UNEXPECTED, never refused: ERROR", async () => {
@@ -928,7 +938,7 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     )
     expect(code).toBe(1)
     expect(lines.filter((line) => line.startsWith("debug:"))).toHaveLength(1)
-    expect(lines[0]).toBe("Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again")
+    expect(lines[0]).toBe("the chain call failed — this setup's contract is 0xf07d…; run with MIDA_DEBUG=1 to see why")
     expect(lines[1]).toBe("debug: BaseError | boom")
   })
 

@@ -1,5 +1,5 @@
 import { BaseError } from "viem"
-import { isChainBusyError } from "./chain-busy.js"
+import { chainRefusalReason } from "./chain-busy.js"
 
 /**
  * The refusal code an error earns at the `mida` command's printing boundary: its own string
@@ -9,8 +9,10 @@ import { isChainBusyError } from "./chain-busy.js"
  * here and only here: `toMidaError` and its callers keep their behaviour.
  */
 export function refusalCode(error: unknown): string {
-  // before the code read: CHAIN_BUSY and CHAIN_UNAVAILABLE both normalize to the one reason
-  if (isChainBusyError(error)) return "chain-busy"
+  // before the code read: a chain that could not answer names its real reason — busy,
+  // misconfigured or refused-key (in-11 R-8)
+  const chainReason = chainRefusalReason(error)
+  if (chainReason !== undefined) return chainReason
   const code = (error as { code?: unknown } | null | undefined)?.code
   if (typeof code === "string" && code !== "") return code
   if (error instanceof BaseError) return "CHAIN_CALL_FAILED"
