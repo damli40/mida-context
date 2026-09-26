@@ -989,6 +989,21 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
             : `${ids.length} record(s) could not be read back — nothing was written`
       return `${head}${named}${why}`
     }
+    // Two records Monad registered disagree with each other — the throw sites name the lineage
+    // and the record ids and nothing else, so the line short-forms them and asks the owner to
+    // report a state the chain should never produce (ex-3 E-2).
+    case "export-inconsistent": {
+      const detail = error as { lineage?: unknown; contextIds?: unknown }
+      const ids = (Array.isArray(detail.contextIds) ? detail.contextIds : []).filter((id): id is string => typeof id === "string")
+      const shortId = (id: string) => `${id.slice(0, 6)}…${id.slice(-4)}`
+      const what =
+        typeof detail.lineage === "string" && ids.length === 2
+          ? `lineage ${shortId(detail.lineage)} holds two records claiming the same parent — ${shortId(ids[0]!)} and ${shortId(ids[1]!)}`
+          : error instanceof Error
+            ? error.message
+            : "two records disagree"
+      return `the export found a chain state that should be impossible on Monad — ${what}; please report it`
+    }
     case "chain-busy":
       return partway === undefined
         ? "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again"

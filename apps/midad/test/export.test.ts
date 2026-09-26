@@ -459,6 +459,18 @@ describe("mida export — dispatch and refusals", () => {
     expect(message).toContain(childA.contextId)
     expect(message).toContain(childB.contextId)
     expect(existsSync(dest)).toBe(false)
+    // ex-3 E-2: the line the CLI prints — not error.message — is the contract. It names the
+    // lineage and both records in short form, says this should be impossible on Monad, and
+    // asks the owner to report it.
+    const line = ownerRefusalLine("export", "", thrown, undefined, network.deployment.capabilityRegistry)
+    const shortOf = (id: string) => `${id.slice(0, 6)}…${id.slice(-4)}`
+    expect(line).toContain(shortOf(parent.lineageId))
+    expect(line).toContain(shortOf(childA.contextId))
+    expect(line).toContain(shortOf(childB.contextId))
+    expect(line).not.toContain(childA.contextId)
+    expect(line).toContain("impossible")
+    expect(line).toContain("report")
+    expect(line).not.toContain("export-inconsistent")
   })
 
   it("the universe is scanned only up to the block the export names — the head is read first", async () => {

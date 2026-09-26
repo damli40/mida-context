@@ -247,7 +247,10 @@ function write0600(path: string, data: string | Uint8Array): void {
 function enumName(table: Record<string, number>, value: number, what: string, contextId: Hex): string {
   const name = Object.keys(table).find((key) => table[key] === value)
   if (name === undefined) {
-    throw codedError("export-inconsistent", `record ${contextId} carries a ${what} value (${value}) this build does not know`)
+    throw Object.assign(
+      codedError("export-inconsistent", `record ${contextId} carries a ${what} value (${value}) this build does not know`),
+      { contextIds: [contextId] },
+    )
   }
   return name
 }
@@ -274,9 +277,14 @@ function supersededByMap(records: readonly SourceRecord[]): Map<string, Hex> {
       const parent = record.parentId.toLowerCase()
       if (childOf.has(parent)) {
         const first = childOf.get(parent)!
-        throw codedError(
-          "export-inconsistent",
-          `lineage ${lineage}: records ${first.contextId} and ${record.contextId} both name ${record.parentId} as parent`,
+        // lineage + both contextIds ride on the error so the CLI's printed line can name the
+        // records in short form without re-parsing this message (ex-3 E-2).
+        throw Object.assign(
+          codedError(
+            "export-inconsistent",
+            `lineage ${lineage}: records ${first.contextId} and ${record.contextId} both name ${record.parentId} as parent`,
+          ),
+          { lineage, contextIds: [first.contextId, record.contextId] },
         )
       }
       childOf.set(parent, record)
