@@ -1,18 +1,23 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { createServer } from "node:http"
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { readScopeProbe, rpcTransportProbe } from "@mida/chain"
-import { localEnvironment } from "@mida/cli"
+import { fileURLToPath } from "node:url"
+import { MULTICALL3_ADDRESS, chainFor, readScopeProbe, rpcTransportProbe } from "@mida/chain"
+import type { Hex } from "@mida/protocol"
+import { localEnvironment, startApiServer } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
-  MidaHome, Runtime, approve, callDaemon, init, requestAccess, saveCheckpoint,
-  startDaemon, startPersistentApi,
+  MidaHome, Runtime, approve, authorNamesFor, buildHandoff, callDaemon, init, requestAccess,
+  runCli, saveCheckpoint, startDaemon, startPersistentApi,
 } from "@mida/midad"
 import type { DaemonHandle, HandoffResult, Network } from "@mida/midad"
+import { followPendingAnchors, pendingAnchors } from "../src/batching.js"
 import { sampleCheckpoint } from "./helpers.js"
 
 const STEP_TIMEOUT = 60_000
+const MULTICALL3_FIXTURE = fileURLToPath(new URL("./fixtures/multicall3-runtime.hex", import.meta.url))
 
 const mark = (folder: string, projectId: string) => {
   mkdirSync(join(folder, ".mida"), { recursive: true })
@@ -20,23 +25,147 @@ const mark = (folder: string, projectId: string) => {
 }
 
 /**
+ * The Multicall3 runtime bytes, verbatim — comment lines (starting with `#`) dropped, the rest
+ * joined. Verified Monad-testnet code; viem's shipped creation bytecode deploys empty on a
+ * default Anvil, so the real bytes live in the fixture.
+ */
+const multicall3Code = (): Hex =>
+  readFileSync(MULTICALL3_FIXTURE, "utf8")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+    .join("") as Hex
+
+const anvilRpc = async (rpcUrl: string, method: string, params: unknown[]): Promise<unknown> => {
+  const res = await fetch(rpcUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+  })
+  const body = (await res.json()) as { result?: unknown; error?: unknown }
+  if (body.error !== undefined) throw new Error(`${method}: ${JSON.stringify(body.error)}`)
+  return body.result
+}
+
+/**
+ * A loopback JSON-RPC forwarder: POSTs arrive on its own port and are relayed verbatim to the
+ * node. The store's public client is built on THIS url while every client-side reader keeps the
+ * node's real one — so a fetch spy can split "store-side" from "client-side" by the request's
+ * target, which survives viem's multicall scheduler firing the aggregate call from a context
+ * that carries no caller frames (a stack sniff cannot attribute batched calls).
+ */
+const startRpcProxy = async (upstream: string): Promise<{ url: string; close(): Promise<void> }> =>
+  new Promise((resolve) => {
+    // Bound at creation, before any measurement spy wraps globalThis.fetch — a forwarded POST
+    // must not be counted as a second, client-side request by the tally.
+    const forward = globalThis.fetch
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on("data", (chunk: Buffer) => chunks.push(chunk))
+      req.on("end", () => {
+        void forward(upstream, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: Buffer.concat(chunks),
+        })
+          .then(async (response) => {
+            res.writeHead(response.status, { "content-type": "application/json" })
+            res.end(await response.text())
+          })
+          .catch((error: unknown) => {
+            res.writeHead(502)
+            res.end(String(error))
+          })
+      })
+    })
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address()
+      if (typeof address !== "object" || address === null) throw new Error("rpc proxy has no port")
+      resolve({
+        url: `http://127.0.0.1:${address.port}`,
+        close: () => new Promise((done) => server.close(() => done())),
+      })
+    })
+  })
+
+/**
+ * Counts every JSON-RPC request to the node while `run` executes, split by which side of the
+ * store boundary sent it: the store's client is aimed at `storeRpcUrl` (the proxy above),
+ * everything else at the node's real `rpcUrl`. One request = one tally row; a multicall
+ * eth_call is one row (its `to` is Multicall3, its `data` the aggregate3 selector).
+ */
+const tallyRequests = async <T>(
+  rpcUrl: string,
+  storeRpcUrl: string,
+  run: () => Promise<T>,
+): Promise<{ result: T; tally: Map<string, number> }> => {
+  const realFetch = globalThis.fetch
+  const tally = new Map<string, number>()
+  globalThis.fetch = (async (input: unknown, init?: { body?: unknown }) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url
+    const side = url.startsWith(storeRpcUrl) ? "store" : url.startsWith(rpcUrl) ? "client" : undefined
+    if (side !== undefined) {
+      let what = "?"
+      try {
+        const body = JSON.parse(String(init?.body)) as { method?: string; params?: { to?: string; data?: string }[] }
+        const first = body.params?.[0]
+        what =
+          body.method === "eth_call"
+            ? first?.to?.toLowerCase() === MULTICALL3_ADDRESS.toLowerCase()
+              ? "eth_call:multicall3"
+              : `eth_call:${String(first?.data ?? "").slice(0, 10)}`
+            : String(body.method)
+      } catch {
+        // not JSON — still one request
+      }
+      const key = `${side} ${what}`
+      tally.set(key, (tally.get(key) ?? 0) + 1)
+    }
+    return realFetch(input as never, init as never)
+  }) as typeof fetch
+  try {
+    return { result: await run(), tally }
+  } finally {
+    globalThis.fetch = realFetch
+  }
+}
+
+/**
  * The R2 measurement: how many HTTP requests one session-start handoff costs on the local chain
  * with three saved checkpoints. The daemon runs in-process, so rpcTransportProbe counts every
- * chain call the handoff makes — the project check, the capability questions and the read. The
- * local chain carries no Multicall3, so every call must still resolve one by one (the fallback
- * proof) and the printed count is what the report compares before/after enabling batching.
+ * chain call the handoff makes — the project check, the capability questions and the read.
+ * Since in-13b M-3 this Anvil carries the real Multicall3 runtime at the canonical address and
+ * the local chain object declares it, so every chain-aware batched client — the store's
+ * included — aggregates reads exactly as it does on Monad testnet.
  */
 describe("the RPC request count of one session-start handoff (in-6 R2)", () => {
   let env: ScenarioEnvironment
   let apiServer: { baseUrl: string; close(): Promise<void> }
+  let batchApi: { baseUrl: string; close(): Promise<void> }
+  let rpcProxy: { url: string; close(): Promise<void> }
   let home: MidaHome
   let daemon: DaemonHandle | undefined
   let workDir: string
 
   beforeAll(async () => {
-    env = await localEnvironment()
+    env = await localEnvironment({ batching: { waitMs: 200 } })
+    // in-13b M-3: production carries Multicall3; put the verified runtime code on this Anvil,
+    // then declare it on the shared local chain object. viem resolves chain.contracts.multicall3
+    // per batched call, so every client built by this file — env's own API server included —
+    // engages `batch: { multicall: true }` from this point.
+    await anvilRpc(env.rpcUrl, "anvil_setCode", [MULTICALL3_ADDRESS, multicall3Code()])
+    const installed = (await anvilRpc(env.rpcUrl, "eth_getCode", [MULTICALL3_ADDRESS, "latest"])) as string
+    expect(installed.length, "anvil_setCode did not install the Multicall3 runtime").toBeGreaterThan(2)
+    const localChain = chainFor(env.deployment.chainId) as { contracts?: Record<string, unknown> }
+    localChain.contracts = { ...(localChain.contracts ?? {}), multicall3: { address: MULTICALL3_ADDRESS } }
+    // The store side of every measured handoff is aimed at the proxy so the request split is
+    // attributable by URL, not by call-stack luck.
+    rpcProxy = await startRpcProxy(env.rpcUrl)
     const network: Network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
-    apiServer = await startPersistentApi({ rpcUrl: env.rpcUrl, deployment: env.deployment, dataDir: mkdtempSync(join(tmpdir(), "mida-reqcount-data-")) })
+    apiServer = await startPersistentApi({ rpcUrl: rpcProxy.url, deployment: env.deployment, dataDir: mkdtempSync(join(tmpdir(), "mida-reqcount-data-")) })
+    // A second store with the batch lane live, also reading through the proxy — the batched
+    // saves the scaling measurement needs are staged and anchored by this one.
+    batchApi = await startApiServer({ rpcUrl: rpcProxy.url, deployment: env.deployment, batching: { waitMs: 200 } })
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-reqcount-e2e-")))
     workDir = mkdtempSync(join(tmpdir(), "mida-reqcount-work-"))
     mark(workDir, "proj-reqcount")
@@ -72,21 +201,28 @@ describe("the RPC request count of one session-start handoff (in-6 R2)", () => {
   afterAll(async () => {
     await daemon?.close()
     await apiServer?.close()
+    await batchApi?.close()
+    await rpcProxy?.close()
     await env?.stop()
   }, 120_000)
 
   it("one handoff resolves with 3 checkpoints, and its request count is recorded", async () => {
     rpcTransportProbe.reset()
     readScopeProbe.reset()
-    const result = (await callDaemon(home, "/handoff", { agent: "codex", cwd: workDir }, { timeoutMs: STEP_TIMEOUT })).body as HandoffResult
+    const { result, tally } = await tallyRequests(env.rpcUrl, rpcProxy.url, async () =>
+      (await callDaemon(home, "/handoff", { agent: "codex", cwd: workDir }, { timeoutMs: STEP_TIMEOUT })).body as HandoffResult,
+    )
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
     expect(result.checkpoints).toBe(3)
     const count = rpcTransportProbe.sentAt.length
+    const store = [...tally.keys()].filter((key) => key.startsWith("store ")).reduce((n, key) => n + tally.get(key)!, 0)
+    const client = [...tally.keys()].filter((key) => key.startsWith("client ")).reduce((n, key) => n + tally.get(key)!, 0)
     console.log(
-      `in-6 R2 / in-9 R5: one session-start handoff made ${count} HTTP request(s) on the local chain ` +
-        `(read scope: ${readScopeProbe.hits} shared calls, ${readScopeProbe.misses} new questions)`,
+      `in-6 R2 / in-9 R5 / in-13b M-3: one session-start handoff made ${count} HTTP request(s) on the local chain ` +
+        `(store ${store} / client ${client}; read scope: ${readScopeProbe.hits} shared calls, ${readScopeProbe.misses} new questions)`,
     )
+    console.log(`in-13b M-3 [3] breakdown: ${[...tally.entries()].sort().map(([key, n]) => `${key}=${n}`).join(" ")}`)
     // in-9 R-5: one operation asks each distinct question once. The repeated capability,
     // agent-record and block lookups (~30 of ~47 requests before the fix) collapse to one
     // wire call apiece; what remains is the per-object record reads and the capability gate.
@@ -138,4 +274,82 @@ describe("the RPC request count of one session-start handoff (in-6 R2)", () => {
       globalThis.fetch = realFetch
     }
   }, STEP_TIMEOUT * 3)
+
+  /**
+   * in-13b M-3 — the reviewer's scaling measurement re-run the way production now reads: saves
+   * on the batched lane (`mida batching on`, each settled through followPendingAnchors), the
+   * store read through a chain-aware multicall client aimed at the RPC proxy, and Multicall3
+   * installed on the Anvil. Records the wire-request count per handoff at 5, 10 and 20 anchored batched
+   * checkpoints, split by which side of the store boundary sent each request. There is no count
+   * assertion — the numbers are the deliverable; the daemon is closed first so its ticks cannot
+   * land inside a measured window.
+   */
+  it("handoff wire requests at 5/10/20 batched checkpoints, split store/client (in-13b M-3)", async () => {
+    await daemon?.close()
+    daemon = undefined
+    const batchNetwork: Network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund, storageUrl: batchApi.baseUrl }
+    const batchHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-reqcount-batch-")))
+    const batchDir = mkdtempSync(join(tmpdir(), "mida-reqcount-batchwork-"))
+    mark(batchDir, "proj-reqcount-batch")
+    const runtime2 = await Runtime.open(batchHome, batchNetwork)
+    try {
+      await init(runtime2, ["claude-code", "codex"])
+      for (const name of ["claude-code", "codex"] as const) {
+        await requestAccess(runtime2, name)
+        await approve(runtime2, name, batchDir)
+      }
+      const code = await runCli(["batching", "on"], {
+        home: batchHome,
+        network: batchNetwork,
+        print: () => {},
+        stdinIsTTY: true,
+        stdoutIsTTY: true,
+        prompt: async () => "yes",
+        drainInput: () => {},
+        kickDaemon: () => {},
+      })
+      expect(code).toBe(0)
+      const settle = async () => {
+        const deadline = Date.now() + 30_000
+        while (Date.now() < deadline && pendingAnchors(batchHome).length > 0) {
+          await followPendingAnchors(runtime2, () => {})
+          if (pendingAnchors(batchHome).length > 0) await new Promise((resolve) => setTimeout(resolve, 200))
+        }
+        expect(pendingAnchors(batchHome), "a batched save never anchored").toHaveLength(0)
+      }
+      let saved = 0
+      for (const target of [5, 10, 20]) {
+        for (; saved < target; saved++) {
+          const agent = saved % 2 === 0 ? "claude-code" : "codex"
+          const save = await saveCheckpoint(runtime2, agent, {
+            projectId: "proj-reqcount-batch",
+            sessionId: `s-${saved}`,
+            continuesSession: null,
+            compiledBy: "test",
+            checkpoint: sampleCheckpoint({ eventId: `cp-rcb-${String(saved).padStart(4, "0")}`, agent, objective: `o-${saved}` }),
+          })
+          expect(save.lane, `save ${saved} did not take the batched lane`).toBe("batched")
+          await settle()
+        }
+        rpcTransportProbe.reset()
+        readScopeProbe.reset()
+        const { result, tally } = await tallyRequests(env.rpcUrl, rpcProxy.url, () =>
+          buildHandoff(runtime2, { agent: "codex", cwd: batchDir, authorNames: authorNamesFor(runtime2) }),
+        )
+        expect(result.kind).toBe("handoff")
+        if (result.kind !== "handoff") return
+        expect(result.checkpoints).toBe(target)
+        const count = rpcTransportProbe.sentAt.length
+        const store = [...tally.keys()].filter((key) => key.startsWith("store ")).reduce((n, key) => n + tally.get(key)!, 0)
+        const client = [...tally.keys()].filter((key) => key.startsWith("client ")).reduce((n, key) => n + tally.get(key)!, 0)
+        console.log(
+          `in-13b M-3: handoff with ${target} anchored batched checkpoints -> ${count} wire request(s) ` +
+            `(store ${store} / client ${client}; read scope: ${readScopeProbe.hits} shared calls, ${readScopeProbe.misses} new questions)`,
+        )
+        console.log(`in-13b M-3 [${target}] breakdown: ${[...tally.entries()].sort().map(([key, n]) => `${key}=${n}`).join(" ")}`)
+      }
+    } finally {
+      await runtime2.close()
+    }
+  }, STEP_TIMEOUT * 10)
 })
