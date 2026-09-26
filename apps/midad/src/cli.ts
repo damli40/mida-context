@@ -17,7 +17,8 @@ import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
 import { generalAssistanceText, identityUnreadableText, isGeneralAssistant, noIdentityText, projectCheckRefusal } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
-import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installMcpClient, uninstallClaudeCode, uninstallCodex, uninstallMcpClient } from "./install.js"
+import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installDevin, installMcpClient, uninstallClaudeCode, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
+import { resolveDevinConfigPath } from "./devin-facts.js"
 import type { InstallTool, McpClientTool } from "./install.js"
 import { checkProject, ensureProjectMarker } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
@@ -37,9 +38,9 @@ import { OwnerLinkOutcome, approvePasskey, initPasskey, provisionPasskeyAgents, 
 import type { PasskeyDeps } from "./owner-link/flows.js"
 
 /** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. */
-const AGENTS = ["claude-code", "codex", "assistant"]
+const AGENTS = ["claude-code", "codex", "devin", "assistant"]
 /** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. Only the real tools can be installed or doctored. */
-const HOOK_TOOLS = ["claude-code", "codex"]
+const HOOK_TOOLS = ["claude-code", "codex", "devin"]
 /** install takes a hook tool or an MCP client; `doctor --live` only ever checks the hook tools. */
 const INSTALL_TOOLS = [...HOOK_TOOLS, ...MCP_CLIENT_TOOLS]
 const WITH_AGENT = ["request", "approve", "save-demo", "read", "revoke"]
@@ -54,7 +55,7 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
 const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
 export const USAGE =
   "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]" +
-  "   (tool = claude-code | codex | claude-desktop | cursor; agent = claude-code | codex | assistant — or the identity a client installs)"
+  "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or the identity a client installs)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
 export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", ...WITH_AGENT]
 /**
@@ -1352,6 +1353,7 @@ export function runInstall(
     home: MidaHome
     cwd?: string
     claudeDesktopConfig?: string
+    devinConfig?: string
   },
 ): number {
   const tool = argv[1] ?? ""
@@ -1389,18 +1391,17 @@ export function runInstall(
   const settingsPath =
     tool === "claude-code"
       ? deps.claudeSettings
-      : argv[0] === "uninstall" && recordedCodexHome(deps.home) !== undefined
-        ? join(recordedCodexHome(deps.home)!, "config.toml")
-        : deps.codexConfig
+      : tool === "devin"
+        ? (deps.devinConfig ?? resolveDevinConfigPath(process.env, homedir()))
+        : argv[0] === "uninstall" && recordedCodexHome(deps.home) !== undefined
+          ? join(recordedCodexHome(deps.home)!, "config.toml")
+          : deps.codexConfig
+  const run =
+    argv[0] === "install"
+      ? (p: string) => (tool === "claude-code" ? installClaudeCode(p) : tool === "devin" ? installDevin(p) : installCodex(p))
+      : (p: string) => (tool === "claude-code" ? uninstallClaudeCode(p) : tool === "devin" ? uninstallDevin(p) : uninstallCodex(p))
   try {
-    const outcome =
-      argv[0] === "install"
-        ? tool === "claude-code"
-          ? installClaudeCode(settingsPath)
-          : installCodex(settingsPath)
-        : tool === "claude-code"
-          ? uninstallClaudeCode(settingsPath)
-          : uninstallCodex(settingsPath)
+    const outcome = run(settingsPath)
     deps.print(outcome === "already-installed" ? "already installed" : outcome === "not-installed" ? "not installed" : outcome)
     if (argv[0] === "install" && tool === "codex") {
       // the hook and the drain never see Codex's own environment — the home install wrote into
@@ -1474,6 +1475,7 @@ async function main(): Promise<void> {
       codexConfig: join(resolveCodexHome(process.env, homedir()), "config.toml"),
       home,
       claudeDesktopConfig: claudeDesktopConfigPath(homedir()),
+      devinConfig: resolveDevinConfigPath(process.env, homedir()),
     })
     return
   }

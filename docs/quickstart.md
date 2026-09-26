@@ -39,7 +39,7 @@ mida --help
 Expected output:
 
 ```
-usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]   (tool = claude-code | codex | claude-desktop | cursor; agent = claude-code | codex | assistant — or the identity a client installs)
+usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or the identity a client installs)
 ```
 
 *Status: RUN — `pnpm check:publish` installs the packed tarball into a fresh folder outside the repo and runs `npx mida --help` to exit 0 with this text. The `-g` global-install variant links the same bins through npm's standard path.*
@@ -50,19 +50,21 @@ usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | 
 mida init
 ```
 
-What it does: generates your owner wallet and one identity per agent (`claude-code`, `codex`, `assistant`), registers them on Monad testnet, and starts the local daemon (`midad`). With the sponsor on — the default — every send is paid by the sponsor; your wallets can stay empty.
+What it does: generates your owner wallet and one identity per agent (`claude-code`, `codex`, `devin`, `assistant`), registers them on Monad testnet, and starts the local daemon (`midad`). With the sponsor on — the default — every send is paid by the sponsor; your wallets can stay empty.
 
 Expected output:
 
 ```
 registering your key on the chain…
-opening 3 context areas (3 transactions)…
+opening 4 context areas (4 transactions)…
 registering claude-code on the chain…
 registering codex on the chain…
+registering devin on the chain…
 registering assistant on the chain…
 owner 0x<40 hex>
 agent claude-code 0x<64 hex>
 agent codex 0x<64 hex>
+agent devin 0x<64 hex>
 agent assistant 0x<64 hex>
 ```
 
@@ -389,6 +391,22 @@ The honest limits:
 - **ChatGPT in the browser — NOT RUN, and not supported in v0.** The ChatGPT desktop app is the Codex app above. Browser ChatGPT has no local stdio transport Mida can serve.
 
 *Status: NOT RUN against a real MCP client — `apps/midad/test/mcp.test.ts` drives the server over the SDK's in-memory transport against a fake daemon socket (including the not-approved, revoked and daemon-down answers), `apps/midad/test/mcp.e2e.test.ts` runs the reads against a real daemon on a local Anvil chain, and `apps/midad/test/mcp-save.e2e.test.ts` runs `mida_save` end to end the same way (a real save another agent's handoff then sees, the READ-only / unapproved / revoked / bad-shape / rate-limit refusals, and secret scrubbing before sealing). No client above has been validated end-to-end.*
+
+## 14. Devin — a third hook client — NOT RUN
+
+Devin is a hook client like Codex, not an MCP client: `mida install devin` merges Mida's hook block into `~/.config/devin/config.json` (under `"hooks"`, the same shape as Claude Code's block — session start and prompts run `mida-inject devin`; `PostToolUse`, `Stop`, `PostCompaction` and `SessionEnd` run `mida-hook devin`) and the `devin` identity `mida init` provisioned is its own — `mida approve devin` / `mida revoke devin` act on it alone. There is no trust step.
+
+```bash
+mida install devin
+mida approve devin
+```
+
+Devin's hooks have no transcript file and no `cwd` in the payload: the project folder comes from `DEVIN_PROJECT_DIR`, and sessions are read back from Devin's SQLite store `~/.local/share/devin/cli/sessions.db` (read-only; `MIDA_DEVIN_DB` points elsewhere in tests). Two consequences worth knowing:
+
+- **Devin also replays other clients' hooks.** It imports `~/.claude/settings.json` and would run Mida's Claude Code entries under its own environment — which is why every Mida hook entry for a non-devin agent exits silently when `DEVIN_PROJECT_DIR` is set. A Devin session can never be saved under `claude-code`'s name.
+- **Node 22.13+ is required** for the database read (`node:sqlite`). On an older Node, `mida doctor` prints a `PROBLEM:` line and devin save jobs end `bad` with reason `devin-needs-node-22.13`.
+
+*Status: NOT RUN against a real Devin — every test uses synthetic payloads and a synthetic SQLite file (`apps/midad/test/devin.e2e.test.ts`, `apps/midad/test/drain-devin.test.ts`, `packages/compiler/test/transcript-devin.test.ts`). No real `~/.config/devin` or `~/.local/share/devin` was touched.*
 
 ## The compile model: DeepSeek by default — RUN (benchmarked)
 

@@ -13,18 +13,22 @@ import {
   codexBlock,
   codexHooksStatus,
   cursorMcpConfigPath,
+  devinHooksStatus,
   hookCommand,
   injectCommand,
   installClaudeCode,
   installCodex,
+  installDevin,
   installMcpClient,
   parseMidaCommand,
   recordCodexHome,
   recordedCodexHome,
+  resolveDevinConfigPath,
   runInstall,
   transcriptPathAllowed,
   uninstallClaudeCode,
   uninstallCodex,
+  uninstallDevin,
   uninstallMcpClient,
 } from "@mida/midad"
 
@@ -783,6 +787,206 @@ describe("uninstallMcpClient", () => {
     writeFileSync(config, JSON.stringify(original))
     expect(uninstallMcpClient("claude-desktop", config)).toBe("not-installed")
     expect(JSON.parse(readFileSync(config, "utf8"))).toEqual(original)
+  })
+})
+
+describe("mida install devin", () => {
+  const devinEvents = {
+    inject: ["SessionStart", "UserPromptSubmit"],
+    hook: ["PostToolUse", "Stop", "PostCompaction", "SessionEnd"],
+  }
+  const devinConfig = () => {
+    const path = join(dir(), ".config", "devin", "config.json")
+    mkdirSync(dirname(path), { recursive: true })
+    return path
+  }
+  const commandOf = (config: string, event: string) =>
+    (JSON.parse(readFileSync(config, "utf8")) as {
+      hooks: Record<string, { hooks: { command: string }[] }[]>
+    }).hooks[event]![0]!.hooks[0]!.command
+
+  it("the legacy constants keep the bare devin text, and the resolved commands parse back as devin", () => {
+    expect(HOOK_COMMAND.devin).toBe("mida-hook devin")
+    expect(INJECT_COMMAND.devin).toBe("mida-inject devin")
+    for (const [command, kind] of [
+      [hookCommand("devin"), "hook"],
+      [injectCommand("devin"), "inject"],
+    ] as const) {
+      expect(command.endsWith(" devin")).toBe(true)
+      expect(command).not.toBe(`mida-${kind} devin`) // never the bare name
+      const parsed = parseMidaCommand(command)
+      expect(parsed).toMatchObject({ kind, tool: "devin" })
+    }
+  })
+
+  it("installs Devin's own six events into a missing config — never Claude's event set", () => {
+    const config = devinConfig()
+    expect(installDevin(config)).toBe("installed")
+    const parsed = JSON.parse(readFileSync(config, "utf8")) as {
+      hooks: Record<string, { hooks: { type: string; command: string }[] }[]>
+    }
+    for (const event of devinEvents.inject) expect(commandOf(config, event)).toBe(injectCommand("devin"))
+    for (const event of devinEvents.hook) expect(commandOf(config, event)).toBe(hookCommand("devin"))
+    // Devin has no StopFailure/PreCompact — those are Claude's events and must not appear
+    expect(Object.keys(parsed.hooks).sort()).toEqual(
+      [...devinEvents.inject, ...devinEvents.hook].sort(),
+    )
+    // every command parses as this client's own tool — none can be read as claude-code's
+    for (const element of Object.values(parsed.hooks).flat()) {
+      for (const hook of element.hooks) {
+        expect(parseMidaCommand(hook.command)?.tool).toBe("devin")
+      }
+    }
+    expect(existsSync(`${config}.mida-backup`)).toBe(false)
+  })
+
+  it("keeps every other key and every non-Mida hook, backing up the original once", () => {
+    const config = devinConfig()
+    const original = {
+      theme: "dark",
+      hooks: {
+        PostToolUse: [{ hooks: [{ type: "command", command: "lint --fix" }] }],
+        PreToolUse: [{ hooks: [{ type: "command", command: "guard" }] }],
+      },
+    }
+    writeFileSync(config, `${JSON.stringify(original, null, 2)}\n`)
+    expect(installDevin(config)).toBe("installed")
+    expect(readFileSync(`${config}.mida-backup`, "utf8")).toBe(`${JSON.stringify(original, null, 2)}\n`)
+    const parsed = JSON.parse(readFileSync(config, "utf8")) as {
+      theme: string
+      hooks: Record<string, { hooks: { command: string }[] }[]>
+    }
+    expect(parsed.theme).toBe("dark")
+    // the user's entries are untouched; ours appended after them
+    expect(parsed.hooks.PostToolUse![0]).toEqual(original.hooks.PostToolUse[0])
+    expect(parsed.hooks.PostToolUse![1]).toEqual({ hooks: [{ type: "command", command: hookCommand("devin") }] })
+    // an event Devin fires but Mida does not manage keeps only the user's entries
+    expect(parsed.hooks.PreToolUse).toEqual(original.hooks.PreToolUse)
+  })
+
+  it("a claude-code command sitting in Devin's config is NOT ours — it is left alone, not rewritten or counted", () => {
+    const config = devinConfig()
+    // an imported/foreign entry that happens to name another Mida client
+    const original = {
+      hooks: {
+        PostToolUse: [{ hooks: [{ type: "command", command: hookCommand("claude-code") }] }],
+      },
+    }
+    writeFileSync(config, JSON.stringify(original))
+    expect(devinHooksStatus(config)).toBe("incomplete")
+    expect(installDevin(config)).toBe("installed")
+    const parsed = JSON.parse(readFileSync(config, "utf8")) as {
+      hooks: Record<string, { hooks: { command: string }[] }[]>
+    }
+    // the claude entry survives verbatim; our devin entry was appended beside it
+    expect(parsed.hooks.PostToolUse).toHaveLength(2)
+    expect(parsed.hooks.PostToolUse![0]!.hooks[0]!.command).toBe(hookCommand("claude-code"))
+    expect(parsed.hooks.PostToolUse![1]!.hooks[0]!.command).toBe(hookCommand("devin"))
+  })
+
+  it("is idempotent — a second install is already-installed and byte-identical", () => {
+    const config = devinConfig()
+    expect(installDevin(config)).toBe("installed")
+    const before = readFileSync(config, "utf8")
+    expect(installDevin(config)).toBe("already-installed")
+    expect(readFileSync(config, "utf8")).toBe(before)
+  })
+
+  it("a bare-name devin block reads outdated and is rewritten in place — the versioned upgrade", () => {
+    const config = devinConfig()
+    const legacy = {
+      hooks: {
+        SessionStart: [{ hooks: [{ type: "command", command: INJECT_COMMAND.devin }] }],
+        UserPromptSubmit: [{ hooks: [{ type: "command", command: INJECT_COMMAND.devin }] }],
+        PostToolUse: [{ hooks: [{ type: "command", command: HOOK_COMMAND.devin }] }],
+        Stop: [{ hooks: [{ type: "command", command: HOOK_COMMAND.devin }] }],
+        PostCompaction: [{ hooks: [{ type: "command", command: HOOK_COMMAND.devin }] }],
+        SessionEnd: [{ hooks: [{ type: "command", command: HOOK_COMMAND.devin }] }],
+      },
+    }
+    writeFileSync(config, JSON.stringify(legacy))
+    expect(devinHooksStatus(config)).toBe("outdated")
+    expect(installDevin(config)).toBe("installed")
+    for (const event of devinEvents.inject) expect(commandOf(config, event)).toBe(injectCommand("devin"))
+    for (const event of devinEvents.hook) expect(commandOf(config, event)).toBe(hookCommand("devin"))
+    expect(devinHooksStatus(config)).toBe("installed")
+  })
+
+  it("statuses: absent on a missing file, incomplete on a partial install, unreadable on bad JSON", () => {
+    const missing = devinConfig()
+    expect(devinHooksStatus(missing)).toBe("absent")
+    const partial = devinConfig()
+    writeFileSync(partial, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: hookCommand("devin") }] }] } }))
+    expect(devinHooksStatus(partial)).toBe("incomplete")
+    const bad = devinConfig()
+    writeFileSync(bad, "{ hooks: not json")
+    expect(devinHooksStatus(bad)).toBe("unreadable")
+  })
+
+  it("uninstall removes only Mida's entries — user hooks and other keys survive", () => {
+    const config = devinConfig()
+    const original = {
+      theme: "dark",
+      hooks: { PostToolUse: [{ hooks: [{ type: "command", command: "lint" }] }] },
+    }
+    writeFileSync(config, `${JSON.stringify(original, null, 2)}\n`)
+    installDevin(config)
+    expect(uninstallDevin(config)).toBe("uninstalled")
+    const parsed = JSON.parse(readFileSync(config, "utf8"))
+    // back to the original shape: theme kept, the user's PostToolUse entry kept,
+    // install-created event keys dropped
+    expect(parsed).toEqual(original)
+    expect(uninstallDevin(config)).toBe("not-installed")
+  })
+
+  it("isolation both ways: claude settings get no devin commands; devin config gets no claude commands", () => {
+    const settings = join(dir(), "settings.json")
+    installClaudeCode(settings)
+    const claudeText = readFileSync(settings, "utf8")
+    expect(claudeText).not.toContain(" devin")
+    const config = devinConfig()
+    installDevin(config)
+    const devinText = readFileSync(config, "utf8")
+    expect(devinText).not.toContain(" claude-code")
+    // and a claude command never parses as a devin command — one cannot be run as the other
+    expect(parseMidaCommand(`mida-hook claude-code`)?.tool).toBe("claude-code")
+    expect(parseMidaCommand(`mida-hook devin`)?.tool).toBe("devin")
+  })
+
+  it("resolveDevinConfigPath: MIDA_DEVIN_CONFIG wins, else ~/.config/devin/config.json", () => {
+    const home = dir()
+    expect(resolveDevinConfigPath({}, home)).toBe(join(home, ".config", "devin", "config.json"))
+    expect(resolveDevinConfigPath({ MIDA_DEVIN_CONFIG: "/tmp/x.json" }, home)).toBe("/tmp/x.json")
+  })
+
+  it("runInstall routes install/uninstall devin to the devin config, with no Codex trust sentence", () => {
+    const config = devinConfig()
+    const lines: string[] = []
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const code = runInstall(["install", "devin"], {
+      print: (line) => lines.push(line),
+      claudeSettings: join(dir(), "settings.json"),
+      codexConfig: join(dir(), "config.toml"),
+      devinConfig: config,
+      home,
+    })
+    expect(code).toBe(0)
+    expect(lines).toEqual(["installed"])
+    expect(existsSync(config)).toBe(true)
+    // no trust reminder — that sentence is Codex's alone
+    expect(lines.some((line) => line.includes("trust"))).toBe(false)
+    lines.length = 0
+    expect(
+      runInstall(["uninstall", "devin"], {
+        print: (line) => lines.push(line),
+        claudeSettings: join(dir(), "settings.json"),
+        codexConfig: join(dir(), "config.toml"),
+        devinConfig: config,
+        home,
+      }),
+    ).toBe(0)
+    expect(lines).toEqual(["uninstalled"])
+    expect(JSON.parse(readFileSync(config, "utf8"))).toEqual({})
   })
 })
 

@@ -43,9 +43,10 @@ describe("owner command progress lines", () => {
     expect(await run("init")).toBe(0)
     const at = (fragment: string) => progressLines.findIndex((line) => line === fragment)
     expect(at("registering your key on the chain…")).toBeGreaterThanOrEqual(0)
-    expect(at("opening 3 context areas (3 transactions)…")).toBeGreaterThan(at("registering your key on the chain…"))
-    expect(at("registering claude-code on the chain…")).toBeGreaterThan(at("opening 3 context areas (3 transactions)…"))
+    expect(at("opening 4 context areas (4 transactions)…")).toBeGreaterThan(at("registering your key on the chain…"))
+    expect(at("registering claude-code on the chain…")).toBeGreaterThan(at("opening 4 context areas (4 transactions)…"))
     expect(at("registering codex on the chain…")).toBeGreaterThan(at("registering claude-code on the chain…"))
+    expect(at("registering devin on the chain…")).toBeGreaterThan(at("registering codex on the chain…"))
   }, 300_000)
 
   it("approve narrates the reads and the send, in order", async () => {

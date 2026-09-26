@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url"
 import { isDeepStrictEqual } from "node:util"
 import { isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
 import type { SiblingEntry } from "./sibling.js"
+import { DEVIN_INSTALLED_EVENTS } from "./devin-facts.js"
 
 /**
  * The hook command text is exact and carries nothing else — no environment variable, no
@@ -20,10 +21,12 @@ import type { SiblingEntry } from "./sibling.js"
 export const HOOK_COMMAND = {
   "claude-code": "mida-hook claude-code",
   "codex": "mida-hook codex",
+  "devin": "mida-hook devin",
 } as const
 export const INJECT_COMMAND = {
   "claude-code": "mida-inject claude-code",
   "codex": "mida-inject codex",
+  "devin": "mida-inject devin",
 } as const
 
 export type InstallTool = keyof typeof HOOK_COMMAND
@@ -216,7 +219,7 @@ export function parseMidaCommand(command: unknown): ParsedHookCommand | null {
   const tokens = commandTokens(command)
   if (tokens.length < 2) return null
   const tool = tokens[tokens.length - 1]
-  if (tool !== "claude-code" && tool !== "codex") return null
+  if (tool === undefined || !(tool in HOOK_COMMAND)) return null
   for (const [index, token] of tokens.slice(0, -1).entries()) {
     for (const kind of ["hook", "inject"] as const) {
       if (!ENTRY_FILES[kind].includes(basename(token))) continue
@@ -236,21 +239,28 @@ export function parseMidaCommand(command: unknown): ParsedHookCommand | null {
   return null
 }
 
-/** Claude Code events: the inject command on session start and on every prompt, the capture hook on the five save events. */
-function eventCommands(): Readonly<Record<string, string>> {
-  const inject = injectCommand("claude-code")
-  const hook = hookCommand("claude-code")
-  return {
-    SessionStart: inject,
-    UserPromptSubmit: inject,
-    PostToolUse: hook,
-    Stop: hook,
-    StopFailure: hook,
-    PreCompact: hook,
-    SessionEnd: hook,
-  }
+/**
+ * The event set each JSON-configured hook client gets. Claude Code's list is its own;
+ * Devin's comes from devin-facts (PostCompaction, never PreCompact/StopFailure — Devin has
+ * no such events). The two never share a list: a Devin config must not inherit Claude's
+ * event assumptions.
+ */
+const JSON_HOOK_EVENTS: Record<"claude-code" | "devin", readonly string[]> = {
+  "claude-code": ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "StopFailure", "PreCompact", "SessionEnd"],
+  devin: DEVIN_INSTALLED_EVENTS,
 }
-const CLAUDE_EVENTS: readonly string[] = ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "StopFailure", "PreCompact", "SessionEnd"]
+type JsonHookTool = keyof typeof JSON_HOOK_EVENTS
+
+/** The command each event carries: the inject command on the two prompt events, the capture hook on the rest. */
+function eventCommands(tool: JsonHookTool): Readonly<Record<string, string>> {
+  const inject = injectCommand(tool)
+  const hook = hookCommand(tool)
+  const commands: Record<string, string> = {}
+  for (const event of JSON_HOOK_EVENTS[tool]) {
+    commands[event] = kindFor(event) === "inject" ? inject : hook
+  }
+  return commands
+}
 
 export type InstallOutcome = "installed" | "already-installed"
 export type UninstallOutcome = "uninstalled" | "not-installed"
@@ -305,9 +315,10 @@ function writeFileAtomic(file: string, text: string): void {
 /**
  * Reads and validates the settings file. Missing is not an error — it means "create it". Invalid
  * JSON, a non-object top level, a `hooks` that is not an object, or an event key that is not an
- * array all refuse: the user's file is never "repaired" by writing over it.
+ * array all refuse: the user's file is never "repaired" by writing over it. The event list is
+ * the tool's own — a non-array entry under an event the tool manages refuses the file.
  */
-function readSettings(settingsPath: string): { text: string; settings: Record<string, unknown> } | "absent" {
+function readSettings(settingsPath: string, events: readonly string[]): { text: string; settings: Record<string, unknown> } | "absent" {
   if (!existsSync(settingsPath)) return "absent"
   const text = readFileSync(settingsPath, "utf8")
   let parsed: unknown
@@ -319,25 +330,27 @@ function readSettings(settingsPath: string): { text: string; settings: Record<st
   if (!isPlainObject(parsed)) throw settingsUnreadable()
   if ("hooks" in parsed && !isPlainObject(parsed.hooks)) throw settingsUnreadable()
   const hooks = (parsed.hooks ?? {}) as Record<string, unknown>
-  for (const event of CLAUDE_EVENTS) {
+  for (const event of events) {
     if (event in hooks && !Array.isArray(hooks[event])) throw settingsUnreadable()
   }
   return { text, settings: parsed }
 }
 
 /**
- * Adds Mida's hook entries to Claude Code's settings.json, one new element appended per event;
- * existing elements are never edited, reordered or removed. Idempotent by exact command string —
- * with all six present it prints-and-does nothing ("already installed"). The first change ever
- * leaves `settings.json.mida-backup` holding the pre-install bytes; a later install never
+ * Adds Mida's hook entries to a JSON-configured client's settings file (Claude Code's
+ * settings.json, Devin's config.json), one new element appended per event; existing elements
+ * are never edited, reordered or removed. Idempotent by exact command string — with every
+ * event present it prints-and-does nothing ("already installed"). The first change ever
+ * leaves `<file>.mida-backup` holding the pre-install bytes; a later install never
  * overwrites an existing backup.
  */
-export function installClaudeCode(settingsPath: string): InstallOutcome {
-  const commands = eventCommands()
-  const read = readSettings(settingsPath)
+function installJsonHooks(settingsPath: string, tool: JsonHookTool): InstallOutcome {
+  const commands = eventCommands(tool)
+  const events = JSON_HOOK_EVENTS[tool]
+  const read = readSettings(settingsPath, events)
   if (read === "absent") {
     const hooks: Record<string, unknown> = {}
-    for (const event of CLAUDE_EVENTS) hooks[event] = [hookElement(commands[event]!)]
+    for (const event of events) hooks[event] = [hookElement(commands[event]!)]
     mkdirSync(dirname(settingsPath), { recursive: true })
     writeFileAtomic(settingsPath, `${JSON.stringify({ hooks }, null, 2)}\n`)
     return "installed"
@@ -345,11 +358,12 @@ export function installClaudeCode(settingsPath: string): InstallOutcome {
   const { text, settings } = read
   const hooks = (settings.hooks ?? {}) as Record<string, unknown>
   // For each event: rewrite any Mida command of the right kind that is not the current text
-  // (a bare `mida-hook claude-code` from an older install) and append where none exists. An
-  // element is ours to rewrite only when its command parses as Mida's — user entries are
-  // never edited, reordered or removed.
+  // (a bare `mida-hook <tool>` from an older install) and append where none exists. An
+  // element is ours to rewrite only when its command parses as Mida's FOR THIS TOOL — a
+  // `mida-hook claude-code` line inside Devin's config is a foreign entry and stays put;
+  // user entries are never edited, reordered or removed.
   let changed = false
-  for (const event of CLAUDE_EVENTS) {
+  for (const event of events) {
     const expected = commands[event]!
     let present = false
     for (const element of (hooks[event] ?? []) as unknown[]) {
@@ -360,7 +374,7 @@ export function installClaudeCode(settingsPath: string): InstallOutcome {
           present = true
         } else {
           const parsed = parseMidaCommand(hook.command)
-          if (parsed !== null && parsed.tool === "claude-code" && parsed.kind === kindFor(event)) {
+          if (parsed !== null && parsed.tool === tool && parsed.kind === kindFor(event)) {
             hook.command = expected
             present = true
             changed = true
@@ -383,24 +397,35 @@ export function installClaudeCode(settingsPath: string): InstallOutcome {
   return "installed"
 }
 
+/** `mida install claude-code` — the JSON installer over Claude Code's settings.json. */
+export function installClaudeCode(settingsPath: string): InstallOutcome {
+  return installJsonHooks(settingsPath, "claude-code")
+}
+
+/** `mida install devin` — the same installer over Devin's own config, its own events. */
+export function installDevin(configPath: string): InstallOutcome {
+  return installJsonHooks(configPath, "devin")
+}
+
 /** Which sibling an event's command must invoke — inject on the two prompt events, hook on the rest. */
 const kindFor = (event: string): "hook" | "inject" =>
   event === "SessionStart" || event === "UserPromptSubmit" ? "inject" : "hook"
 
 /**
- * Doctor's read-only view: "installed" only when all six events carry the exact current
+ * Doctor's read-only view: "installed" only when every event carries the exact current
  * command; "outdated" when every event is covered but at least one entry is an older form
- * (the bare name) — `mida install claude-code` rewrites it in place. "incomplete" covers a
+ * (the bare name) — `mida install <tool>` rewrites it in place. "incomplete" covers a
  * missing hooks key and a partial install alike; an unreadable file is reported, never repaired.
  */
-export function claudeHooksStatus(settingsPath: string): "installed" | "outdated" | "incomplete" | "absent" | "unreadable" {
+function jsonHooksStatus(settingsPath: string, tool: JsonHookTool): "installed" | "outdated" | "incomplete" | "absent" | "unreadable" {
   try {
-    const read = readSettings(settingsPath)
+    const events = JSON_HOOK_EVENTS[tool]
+    const read = readSettings(settingsPath, events)
     if (read === "absent") return "absent"
     const hooks = (read.settings.hooks ?? {}) as Record<string, unknown>
-    const commands = eventCommands()
+    const commands = eventCommands(tool)
     let stale = 0
-    for (const event of CLAUDE_EVENTS) {
+    for (const event of events) {
       let exact = false
       let ours = false
       for (const element of (hooks[event] ?? []) as unknown[]) {
@@ -408,7 +433,7 @@ export function claudeHooksStatus(settingsPath: string): "installed" | "outdated
         if (isPlainObject(element) && Array.isArray(element.hooks)) {
           for (const hook of element.hooks as unknown[]) {
             const parsed = isPlainObject(hook) ? parseMidaCommand(hook.command) : null
-            if (parsed !== null && parsed.tool === "claude-code" && parsed.kind === kindFor(event)) ours = true
+            if (parsed !== null && parsed.tool === tool && parsed.kind === kindFor(event)) ours = true
           }
         }
       }
@@ -421,13 +446,23 @@ export function claudeHooksStatus(settingsPath: string): "installed" | "outdated
   }
 }
 
+export function claudeHooksStatus(settingsPath: string): ReturnType<typeof jsonHooksStatus> {
+  return jsonHooksStatus(settingsPath, "claude-code")
+}
+
+export function devinHooksStatus(configPath: string): ReturnType<typeof jsonHooksStatus> {
+  return jsonHooksStatus(configPath, "devin")
+}
+
 /**
  * Every Mida command string the settings file carries — doctor stats the paths inside them.
  * "absent" when there is no file, "unreadable" when it cannot be parsed.
  */
 export function midaCommandsInClaudeSettings(settingsPath: string): string[] | "absent" | "unreadable" {
   try {
-    const read = readSettings(settingsPath)
+    // every event name any JSON-configured tool manages: a non-array entry under one of them
+    // is a malformed file and refuses, same rule install/status apply
+    const read = readSettings(settingsPath, [...JSON_HOOK_EVENTS["claude-code"], ...JSON_HOOK_EVENTS.devin])
     if (read === "absent") return "absent"
     const hooks = (read.settings.hooks ?? {}) as Record<string, unknown>
     const commands: string[] = []
@@ -444,6 +479,11 @@ export function midaCommandsInClaudeSettings(settingsPath: string): string[] | "
   } catch {
     return "unreadable"
   }
+}
+
+/** The same listing over Devin's config — the walk is identical, only the file differs. */
+export function midaCommandsInDevinConfig(configPath: string): string[] | "absent" | "unreadable" {
+  return midaCommandsInClaudeSettings(configPath)
 }
 
 /** Ours whatever form it takes — the bare name from an older install or an absolute path. */
@@ -476,7 +516,7 @@ function existedBeforeInstall(settingsPath: string, path: readonly string[]): bo
  * an empty array that was already there stays. Same for a now-empty `hooks` object.
  */
 export function uninstallClaudeCode(settingsPath: string): UninstallOutcome {
-  const read = readSettings(settingsPath)
+  const read = readSettings(settingsPath, [...JSON_HOOK_EVENTS["claude-code"], ...JSON_HOOK_EVENTS.devin])
   if (read === "absent") return "not-installed"
   const { text, settings } = read
   const hooks = (settings.hooks ?? {}) as Record<string, unknown>
@@ -509,6 +549,11 @@ export function uninstallClaudeCode(settingsPath: string): UninstallOutcome {
   }
   writeFileAtomic(settingsPath, `${JSON.stringify(settings, null, detectIndent(text))}\n`)
   return "uninstalled"
+}
+
+/** `mida uninstall devin` — the same removal over Devin's config: only Mida's entries go. */
+export function uninstallDevin(configPath: string): UninstallOutcome {
+  return uninstallClaudeCode(configPath)
 }
 
 /**

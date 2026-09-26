@@ -25,7 +25,7 @@ const run = (
   extraEnv: NodeJS.ProcessEnv = {},
 ): Promise<{ status: number | null; stdout: string; stderr: string }> =>
   new Promise((resolve, reject) => {
-    const env = { ...process.env, MIDA_HOME: homeDir, ...extraEnv }
+    const env: NodeJS.ProcessEnv = { ...process.env, MIDA_HOME: homeDir, ...extraEnv }
     // tests run under Devin inherit DEVIN_PROJECT_DIR — delete it so only the guard tests see it
     if (extraEnv.DEVIN_PROJECT_DIR === undefined) delete env.DEVIN_PROJECT_DIR
     const child = spawn(process.execPath, ["--import", "tsx", INJECT_MAIN, ...args], {
