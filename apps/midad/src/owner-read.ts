@@ -5,6 +5,7 @@ import { batchAnchorAbi, contextRegistryAbi, getLogsChunked } from "@mida/chain"
 import type { BatchedReadItem, ContextRecordView } from "@mida/api"
 import { verifyBatchedItem } from "@mida/sdk"
 import type { AbiEvent } from "viem"
+import { chainRefusalReason } from "./chain-busy.js"
 import type { Runtime } from "./runtime.js"
 
 /**
@@ -73,24 +74,57 @@ export interface ReadOwnerUniverseOptions {
 interface ReadFailure {
   /** Absent only when the gap is not one record — e.g. the store cannot serve the batch table at all. */
   contextId?: Hex
+  /**
+   * A short stable reason — either a fixed phrase this module mints or a machine-style code.
+   * NEVER a wrapped error's own message: an RPC failure's message can carry the provider URL,
+   * which may embed the API key, and this string is printed to the owner.
+   */
   reason: string
 }
 
 /**
- * A plain Error carrying `.code` and `.contextIds` — `owner-read-incomplete` is a midad-level
- * refusal, not a protocol code, so MidaError's closed union cannot carry it. The message leads
- * with the code, the way MidaError formats it, and names every contextId that could not be read;
- * a failure that is not about one record names only its reason.
+ * A plain Error carrying `.code`, `.contextIds` and `.reasons` — `owner-read-incomplete` is a
+ * midad-level refusal, not a protocol code, so MidaError's closed union cannot carry it. The
+ * caller builds the refusal line from the ids and reasons — the message is detail for logs.
  */
-function ownerReadIncomplete(failures: readonly ReadFailure[]): Error & { code: string; contextIds: Hex[] } {
+function ownerReadIncomplete(failures: readonly ReadFailure[]): Error & { code: string; contextIds: Hex[]; reasons: string[] } {
   const contextIds = [...new Set(failures.flatMap((failure) => (failure.contextId === undefined ? [] : [failure.contextId])))]
+  const reasons = [...new Set(failures.map((failure) => failure.reason))]
   const detail = failures
     .map((failure) => (failure.contextId === undefined ? failure.reason : `${failure.contextId} (${failure.reason})`))
     .join("; ")
   return Object.assign(
     new Error(`owner-read-incomplete: ${failures.length} record(s) could not be read back completely: ${detail}`),
-    { code: "owner-read-incomplete", contextIds },
+    { code: "owner-read-incomplete", contextIds, reasons },
   )
+}
+
+/**
+ * The stable reason a read gap reports. Prefers a reason the throw site attached itself,
+ * then a machine-style `error.code` (ENOENT, NOT_FOUND — a code, not a sentence), else a
+ * generic marker — never `error.message`, which can carry an RPC URL with a key in its path.
+ */
+function gapReason(error: unknown): string {
+  const marked = (error as { reason?: unknown }).reason
+  if (typeof marked === "string" && marked !== "") return marked
+  const code = (error as { code?: unknown }).code
+  if (typeof code === "string" && /^[A-Za-z0-9_-]+$/.test(code)) return code
+  return "read-back-failed"
+}
+
+/** A thrown error carrying the stable reason its read gap should report. */
+function readGap(reason: string): Error {
+  return Object.assign(new Error(reason), { reason })
+}
+
+/**
+ * Rethrows the error unchanged when it is a chain/RPC failure — those carry their own
+ * refusal names (chain-busy, rpc-auth, chain-misconfigured) and must surface as that
+ * refusal, not be flattened into a per-record gap. Returns without throwing for everything
+ * else, so a catch site can call it first and then record `gapReason(error)`.
+ */
+function rethrowChainError(error: unknown): void {
+  if (chainRefusalReason(error) !== undefined) throw error
 }
 
 const CONTEXT_REGISTERED = contextRegistryAbi.find(
@@ -149,9 +183,10 @@ async function readBatchedUniverse(
         args: [runtime.owner],
       } as never)) as boolean
     } catch (error) {
-      throw ownerReadIncomplete([
-        { reason: `the chain could not say whether batched saves exist: ${error instanceof Error ? error.message : String(error)}` },
-      ])
+      // A chain/RPC failure keeps its own refusal name (chain-busy, rpc-auth …) — rethrown
+      // so the printed line names that, never the provider's message.
+      rethrowChainError(error)
+      throw ownerReadIncomplete([{ reason: "the chain could not say whether batched saves exist" }])
     }
     if (has) {
       throw ownerReadIncomplete([{ reason: "batched saves exist on chain but this store serves none" }])
@@ -206,7 +241,8 @@ async function readBatchedUniverse(
       const listed = await runtime.ownerApi.listBatchSaves({ owner: runtime.owner, namespaceId: nsId })
       items = listed.items
       partial = listed.partial
-    } catch {
+    } catch (error) {
+      rethrowChainError(error)
       // The store could not serve this namespace's batch table — every logged save is unreadable.
       for (const save of nsLogs) failures.push({ contextId: save.contextId, reason: "the store's batch list could not be served" })
       continue
@@ -225,7 +261,7 @@ async function readBatchedUniverse(
     for (const save of nsLogs) {
       try {
         const item = rows.get(save.contextId)
-        if (item === undefined) throw new Error("anchored on chain but not in the store's batch table")
+        if (item === undefined) throw readGap("not-in-batch-table")
         const verdict = await verifyBatchedItem({
           item,
           chainId: deployment.chainId,
@@ -233,7 +269,8 @@ async function readBatchedUniverse(
           client: runtime.ownerChain.publicClient,
           requireLatest: false,
         })
-        if (!verdict.ok) throw new Error(`verification failed: ${verdict.reason}`)
+        // verdict.reason is a fixed code (root-mismatch, bad-member-proof, …) — safe to carry.
+        if (!verdict.ok) throw readGap(`batch-verify-${verdict.reason}`)
         // The row must be the row the log described — batch, lineage, version and author are the
         // chain's own emitted values, not the store's claim about them.
         if (
@@ -242,7 +279,7 @@ async function readBatchedUniverse(
           item.version !== save.version ||
           verdict.agentId.toLowerCase() !== save.author
         ) {
-          throw new Error("the store's batch row does not match its SaveAnchored log")
+          throw readGap("batch-row-mismatch")
         }
         const message = item.save.message
         const readEpoch = decodeUint64(message.readEpoch)
@@ -263,7 +300,7 @@ async function readBatchedUniverse(
         })
         let createdAt = blockTimes.get(save.blockNumber)
         if (createdAt === undefined) {
-          if (save.blockNumber === 0n) throw new Error("the SaveAnchored log carried no block number")
+          if (save.blockNumber === 0n) throw readGap("no-anchor-block")
           createdAt = (await runtime.ownerChain.publicClient.getBlock({ blockNumber: save.blockNumber })).timestamp
           blockTimes.set(save.blockNumber, createdAt)
         }
@@ -293,7 +330,8 @@ async function readBatchedUniverse(
             : {}),
         })
       } catch (error) {
-        failures.push({ contextId: save.contextId, reason: `failed to read back: ${error instanceof Error ? error.message : String(error)}` })
+        rethrowChainError(error)
+        failures.push({ contextId: save.contextId, reason: gapReason(error) })
       }
     }
     // A partial batch list cannot certify the namespace — unexamined rows may hide anchored
@@ -377,7 +415,8 @@ export async function readOwnerUniverse(
       const listed = await runtime.ownerApi.listObjects({ owner: runtime.owner, namespaceId: nsId })
       objects = listed.objects
       partial = listed.partial
-    } catch {
+    } catch (error) {
+      rethrowChainError(error)
       // The store could not serve this namespace at all — every record in it is unreadable.
       for (const contextId of chainIds) failures.push({ contextId, reason: "the store's object list could not be served" })
       continue
@@ -405,7 +444,7 @@ export async function readOwnerUniverse(
           record.namespaceId.toLowerCase() !== nsId ||
           record.manifestHash.toLowerCase() !== object.manifestHash.toLowerCase()
         ) {
-          throw new Error("the store object does not match its chain record")
+          throw readGap("chain-row-mismatch")
         }
         const epochKeys = deriveEpochKeyPair(namespaceSecret, record.readEpoch)
         const ciphertext = bytesOf(object.ciphertext, object.manifest.ciphertextSize)
@@ -444,7 +483,8 @@ export async function readOwnerUniverse(
           ...(keepEncrypted ? { encrypted: { manifest: object.manifest, ciphertext } } : {}),
         })
       } catch (error) {
-        failures.push({ contextId, reason: `failed to read back: ${error instanceof Error ? error.message : String(error)}` })
+        rethrowChainError(error)
+        failures.push({ contextId, reason: gapReason(error) })
       }
     }
     for (const contextId of chainIds) {

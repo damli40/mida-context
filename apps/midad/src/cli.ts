@@ -937,10 +937,22 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     }
     // The chain could not be asked at all — a busy or down RPC, never an authorization answer:
     // nothing was signed, sent or decided, and a moment later the same command answers for real.
-    // export's owner read could not certify every record — the error's own message names each
-    // contextId it could not read, which is exactly what the owner needs to see.
-    case "owner-read-incomplete":
-      return error instanceof Error ? error.message : "refused: owner-read-incomplete"
+    // export's owner read could not certify every record. The line is built from the error's
+    // contextIds and reason CODES — never its message or a deeper layer's, which can carry a
+    // provider URL with an API key in its path.
+    case "owner-read-incomplete": {
+      const detail = error as { contextIds?: unknown; reasons?: unknown }
+      const ids = (Array.isArray(detail.contextIds) ? detail.contextIds : []).filter((id): id is string => typeof id === "string")
+      const reasons = (Array.isArray(detail.reasons) ? detail.reasons : []).filter((r): r is string => typeof r === "string")
+      const named =
+        ids.length === 0 ? "" : `: ${ids.slice(0, 10).join(", ")}${ids.length > 10 ? `, and ${ids.length - 10} more` : ""}`
+      const why = reasons.length === 0 ? "" : ` (${reasons.join("; ")})`
+      const head =
+        ids.length === 0
+          ? "the owner read could not verify every record — nothing was written"
+          : `${ids.length} record(s) could not be read back — nothing was written`
+      return `${head}${named}${why}`
+    }
     case "chain-busy":
       return "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again"
     // Not busy — a setup the owner must fix: the RPC answered but the configured address held
@@ -1339,7 +1351,9 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
       })
       return result.outcome === "refused" ? 1 : 0
     } catch (error) {
-      deps.print(`refused: ${refusalCode(error)}`)
+      // Same refusal surface as every other owner command — a chain failure prints the
+      // honest chain-busy/misconfigured line, never a provider message (ex-2 X-3).
+      deps.print(ownerRefusalLine("migrate", "", error, undefined, deps.network.deployment.capabilityRegistry, deps.home))
       if (process.env.MIDA_DEBUG === "1") deps.print(debugLine(error))
       return 1
     }

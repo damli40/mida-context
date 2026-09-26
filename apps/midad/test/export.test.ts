@@ -10,7 +10,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { keccak256, zeroHash } from "viem"
+import { HttpRequestError, keccak256, zeroHash } from "viem"
 import { OWNER_AUTHOR_ID, canonicalBytes, namespaceId } from "@mida/protocol"
 import type { Hex, ObjectManifest } from "@mida/protocol"
 import {
@@ -27,6 +27,7 @@ import {
   peekJobs,
   runCli,
   runCliWithRuntime,
+  readOwnerUniverse,
   runHook,
   saveOwnerAddress,
   saveOwnerMode,
@@ -252,12 +253,93 @@ describe("mida export — dispatch and refusals", () => {
   it("owner-read-incomplete prints through ownerRefusalLine naming the contextIds", () => {
     const id = `0x${"ab".repeat(32)}`
     const error = Object.assign(
-      new Error(`owner-read-incomplete: 1 record(s) could not be read back completely: ${id} (the store's object list could not be served)`),
-      { code: "owner-read-incomplete" },
+      new Error(`owner-read-incomplete: 1 record(s) could not be read back completely: ${id} (object-list-unavailable)`),
+      { code: "owner-read-incomplete", contextIds: [id], reasons: ["object-list-unavailable"] },
     )
-    // the cli catch routes thrown errors through ownerRefusalLine — the line is the message,
-    // which names every contextId the read could not certify
-    expect(ownerRefusalLine("export", "", error)).toContain(id)
+    // the cli catch routes thrown errors through ownerRefusalLine — the line names every
+    // contextId the read could not certify, never the deeper layer's own message
+    const line = ownerRefusalLine("export", "", error)
+    expect(line).toContain(id)
+    expect(line).toContain("object-list-unavailable")
+  })
+
+  it("owner-read-incomplete prints the first ten contextIds then a count of the rest", () => {
+    const ids = Array.from({ length: 12 }, (_, i) => `0x${(i + 1).toString(16).padStart(64, "0")}`)
+    const error = Object.assign(new Error("owner-read-incomplete"), {
+      code: "owner-read-incomplete",
+      contextIds: ids,
+      reasons: ["read-back-failed"],
+    })
+    const line = ownerRefusalLine("export", "", error)
+    expect(line).toContain(ids[0]!)
+    expect(line).toContain(ids[9]!)
+    expect(line).not.toContain(ids[10]!)
+    expect(line).toContain("and 2 more")
+  })
+
+  it("a 429 on a chain read reports chain-busy — never the RPC URL or the key in its path", async () => {
+    // The provider-key-in-URL-path shape (Alchemy/QuickNode): viem strips user:password only.
+    const contextId = `0x${"0f".repeat(32)}` as Hex
+    const manifest = fakeManifest(contextId)
+    const runtime = {
+      owner: OWNER,
+      ownerStartBlock: 0n,
+      network,
+      ownerChain: {
+        publicClient: {
+          getBlockNumber: async () => 10n,
+          getLogs: async () => [{ args: { contextId, record: { namespaceId: NS_PROJECTS } }, blockNumber: 1n }],
+        },
+      },
+      ownerApi: {
+        listObjects: async () => ({
+          objects: [{ contextId, manifestHash: keccak256(canonicalBytes(manifest)), manifest, ciphertext: "0x01020304" }],
+          partial: false,
+        }),
+      },
+      vault: { deriveNamespaceSecret: async () => new Uint8Array(32) },
+      reader: {
+        getRecord: async () => {
+          throw new HttpRequestError({
+            url: "https://monad-testnet.example-rpc.io/v2/SECRET-RPC-KEY-123",
+            status: 429,
+            body: { method: "eth_call" },
+            details: "Too Many Requests",
+          })
+        },
+      },
+    } as unknown as Runtime
+    const thrown = await readOwnerUniverse(runtime, { keepEncrypted: true }).catch((error: unknown) => error)
+    expect(thrown).toBeDefined()
+    const line = ownerRefusalLine("export", "", thrown, undefined, network.deployment.capabilityRegistry)
+    expect(line).toContain("busy")
+    expect(line).not.toContain("SECRET-RPC-KEY-123")
+    expect(line).not.toContain("http")
+  })
+
+  it("a chain record whose store object is missing names the contextId — and no deeper message", async () => {
+    const contextId = `0x${"0e".repeat(32)}` as Hex
+    const runtime = {
+      owner: OWNER,
+      ownerStartBlock: 0n,
+      network,
+      ownerChain: {
+        publicClient: {
+          getBlockNumber: async () => 10n,
+          getLogs: async () => [{ args: { contextId, record: { namespaceId: NS_PROJECTS } }, blockNumber: 1n }],
+        },
+      },
+      ownerApi: { listObjects: async () => ({ objects: [], partial: false }) },
+      vault: { deriveNamespaceSecret: async () => new Uint8Array(32) },
+      reader: { getRecord: async () => null },
+    } as unknown as Runtime
+    const thrown = await readOwnerUniverse(runtime, { keepEncrypted: true }).catch((error: unknown) => error)
+    expect((thrown as { code?: string }).code).toBe("owner-read-incomplete")
+    const line = ownerRefusalLine("export", "", thrown, undefined, network.deployment.capabilityRegistry)
+    expect(line).toContain(contextId)
+    expect(line).toContain("no object in the store")
+    // no wrapped error text — just the ids and the read's own reason codes
+    expect(line).not.toContain("Error")
   })
 
   it("owner-read-incomplete through exportRecords throws naming the contextIds and leaves nothing", async () => {
