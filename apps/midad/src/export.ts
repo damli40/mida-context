@@ -588,6 +588,8 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
 
     const temp = `${dest}.partial-${randomBytes(6).toString("hex")}`
     mkdirSync(temp, { mode: 0o700 })
+    // Set false only if the post-rename parent fsync fails — reported as a warning below.
+    let parentFlushed = true
     // FIRST file: the marker proves a leftover is a half-written Mida export — the next run's
     // sweep deletes only folders that carry it. And while the folder exists, a signal must
     // delete it before the process exits — Ctrl-C mid-write must not leave plaintext.
@@ -644,11 +646,18 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
       } catch {
         // leave it — it carries no data
       }
-      const parent = openSync(dirname(dest), "r")
+      // The rename made the export complete — flushing the parent's directory entry is the
+      // last durability step and strictly best effort: a filesystem that refuses a directory
+      // fsync (or the open) must not report failure over a finished folder, nor delete it.
       try {
-        fsyncSync(parent)
-      } finally {
-        closeSync(parent)
+        const parent = openSync(dirname(dest), "r")
+        try {
+          fsyncSync(parent)
+        } finally {
+          closeSync(parent)
+        }
+      } catch {
+        parentFlushed = false
       }
     } catch (error) {
       // The staged folder holds plaintext — whatever failed, it leaves nothing behind.
@@ -660,6 +669,9 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
     }
 
     deps.print(`Exported ${records.length} record${records.length === 1 ? "" : "s"} (${namespaces.size} namespace${namespaces.size === 1 ? "" : "s"}) to ${dest}.`)
+    if (!parentFlushed) {
+      deps.print("warning: the folder's parent directory could not be flushed to disk — the export is complete, but a power loss in the next moments could lose the rename")
+    }
     if (queued > 0) {
       deps.print(`${queued} save${queued === 1 ? "" : "s"} still queued on this laptop ${queued === 1 ? "is" : "are"} not in the export — ${queued === 1 ? "it has" : "they have"} not reached Monad yet`)
     }

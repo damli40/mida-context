@@ -6,7 +6,7 @@
 
 import { describe, expect, it } from "vitest"
 import { spawn } from "node:child_process"
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -390,6 +390,39 @@ describe("mida export — dispatch and refusals", () => {
       expect(readdirSync(cwd).filter((name) => name.includes(".partial-"))).toEqual([])
       // and the runtime was still closed
       expect(closed.n).toBe(1)
+    }
+  })
+
+  it("a parent that refuses the post-rename fsync still reports success — one warning, complete folder", async () => {
+    // The export succeeded the moment the rename landed. A filesystem that refuses to open
+    // the parent directory for fsync (here mode 0300: writable and enterable, not readable)
+    // must not print a refusal over a finished folder — ex-2 X-2.
+    const home = ownerHome()
+    const cwd = tempDir()
+    const parent = join(cwd, "locked-parent")
+    mkdirSync(parent)
+    const dest = join(parent, "backup")
+    chmodSync(parent, 0o300)
+    const lines: string[] = []
+    try {
+      const result = await exportRecords({
+        home,
+        network,
+        folder: dest,
+        cwd,
+        print: (line) => lines.push(line),
+        openRuntime: async () => fakeRuntime(home),
+        readUniverse: async () => [fixtureRecord()],
+      })
+      expect(result).toMatchObject({ outcome: "exported", records: 1 })
+      expect(existsSync(join(dest, "records.json"))).toBe(true)
+      expect(lines[0]).toBe(`Exported 1 record (1 namespace) to ${dest}.`)
+      expect(lines.every((line) => !line.startsWith("refused"))).toBe(true)
+      const warnings = lines.filter((line) => line.startsWith("warning:"))
+      expect(warnings).toHaveLength(1)
+      expect(warnings[0]).toContain("directory")
+    } finally {
+      chmodSync(parent, 0o700)
     }
   })
 
