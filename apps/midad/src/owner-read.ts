@@ -1,5 +1,5 @@
 import { LINEAGE_POLICY, RECORD_TYPE, decodeUint64, namespaceById } from "@mida/protocol"
-import type { ContextPayload, Hex, RecordReference } from "@mida/protocol"
+import type { ContextPayload, Hex, ObjectManifest, RecordReference } from "@mida/protocol"
 import { bytesOf, deriveEpochKeyPair, openContextObject } from "@mida/crypto"
 import { batchAnchorAbi, contextRegistryAbi, getLogsChunked } from "@mida/chain"
 import type { BatchedReadItem, ContextRecordView } from "@mida/api"
@@ -44,6 +44,30 @@ export interface SourceRecord {
   lane?: "direct" | "batched"
   /** The batch a batched save anchored in — absent on direct records. */
   batchId?: Hex
+  /**
+   * The store's own encrypted copy of this record, attached only when the caller asked for it
+   * (`{ keepEncrypted: true }`). The manifest object and ciphertext bytes are exactly what the
+   * store served — re-verified against the chain commitment before decryption, so what is kept
+   * here is the bytes the chain actually committed to. A batched record also carries
+   * `batchItem`: the store's whole row, which holds the signed save message, its signature and
+   * the Merkle proof a verifier folds against `BatchAnchor.batchOf(batchId).root`. Absent by
+   * default: callers that only need the plaintext (migrate) keep their memory footprint.
+   */
+  encrypted?: SourceEncrypted
+}
+
+/** What `keepEncrypted` keeps — the store's bytes, never anything decrypted or derived. */
+export interface SourceEncrypted {
+  manifest: ObjectManifest
+  ciphertext: Uint8Array
+  /** The store's batch row — present only on batched records. */
+  batchItem?: BatchedReadItem
+}
+
+export interface ReadOwnerUniverseOptions {
+  onProgress?: (done: number, total: number) => void
+  /** When true, every returned record also carries the store's encrypted bytes under `encrypted`. */
+  keepEncrypted?: boolean
 }
 
 interface ReadFailure {
@@ -103,6 +127,7 @@ async function readBatchedUniverse(
   runtime: Runtime,
   failures: ReadFailure[],
   onProgress?: (done: number, total: number) => void,
+  keepEncrypted = false,
 ): Promise<(SourceRecord & { lane: "batched" })[]> {
   const { deployment } = runtime.network
   const batchAnchor = deployment.batchAnchor
@@ -222,10 +247,11 @@ async function readBatchedUniverse(
         const message = item.save.message
         const readEpoch = decodeUint64(message.readEpoch)
         const epochKeys = deriveEpochKeyPair(namespaceSecret, readEpoch)
+        const ciphertext = bytesOf(item.save.ciphertext, item.save.manifest.ciphertextSize)
         const payload = openContextObject({
           manifest: item.save.manifest,
           expectedManifestHash: message.manifestHash.toLowerCase() as Hex,
-          ciphertext: bytesOf(item.save.ciphertext, item.save.manifest.ciphertextSize),
+          ciphertext,
           epochPrivateKey: epochKeys.privateKey,
           binding: {
             chainId: deployment.chainId,
@@ -262,6 +288,9 @@ async function readBatchedUniverse(
           references: payload.provenance.references ?? [],
           lane: "batched",
           batchId: save.batchId,
+          ...(keepEncrypted
+            ? { encrypted: { manifest: item.save.manifest, ciphertext, batchItem: item } }
+            : {}),
         })
       } catch (error) {
         failures.push({ contextId: save.contextId, reason: `failed to read back: ${error instanceof Error ? error.message : String(error)}` })
@@ -293,7 +322,7 @@ async function readBatchedUniverse(
  */
 export async function readOwnerUniverse(
   runtime: Runtime,
-  options?: { onProgress?: (done: number, total: number) => void },
+  options?: ReadOwnerUniverseOptions,
 ): Promise<SourceRecord[]> {
   const { deployment } = runtime.network
   const logs = await getLogsChunked(runtime.ownerChain.publicClient, {
@@ -305,8 +334,9 @@ export async function readOwnerUniverse(
     fromBlock: runtime.ownerStartBlock,
   }, { maxRange: runtime.network.logBlockRange, onProgress: options?.onProgress })
 
+  const keepEncrypted = options?.keepEncrypted === true
   const failures: ReadFailure[] = []
-  const batched = await readBatchedUniverse(runtime, failures, options?.onProgress)
+  const batched = await readBatchedUniverse(runtime, failures, options?.onProgress, keepEncrypted)
   if (logs.length === 0) {
     if (failures.length > 0) throw ownerReadIncomplete(failures)
     return batched
@@ -378,10 +408,11 @@ export async function readOwnerUniverse(
           throw new Error("the store object does not match its chain record")
         }
         const epochKeys = deriveEpochKeyPair(namespaceSecret, record.readEpoch)
+        const ciphertext = bytesOf(object.ciphertext, object.manifest.ciphertextSize)
         const payload = openContextObject({
           manifest: object.manifest,
           expectedManifestHash: record.manifestHash,
-          ciphertext: bytesOf(object.ciphertext, object.manifest.ciphertextSize),
+          ciphertext,
           epochPrivateKey: epochKeys.privateKey,
           binding: {
             chainId: deployment.chainId,
@@ -409,6 +440,8 @@ export async function readOwnerUniverse(
           manifestHash: record.manifestHash,
           payload,
           references: payload.provenance.references ?? [],
+          lane: "direct",
+          ...(keepEncrypted ? { encrypted: { manifest: object.manifest, ciphertext } } : {}),
         })
       } catch (error) {
         failures.push({ contextId, reason: `failed to read back: ${error instanceof Error ? error.message : String(error)}` })
