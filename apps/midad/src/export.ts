@@ -9,6 +9,7 @@ import type { Checkpoint, StoredCheckpoint } from "@mida/checkpoint"
 import type { MidaHome } from "./home.js"
 import { loadOwnerAddress, loadOwnerMode } from "./keys.js"
 import { peekJobs } from "./queue.js"
+import { pendingAnchorsStrict } from "./batching.js"
 import { readOwnerUniverse } from "./owner-read.js"
 import type { SourceRecord } from "./owner-read.js"
 import { Runtime } from "./runtime.js"
@@ -36,7 +37,7 @@ import type { CheckpointEnvelope } from "./checkpoint-payload.js"
  */
 
 export type ExportResult =
-  | { outcome: "exported"; records: number; namespaces: number; folder: string; queued: number }
+  | { outcome: "exported"; records: number; namespaces: number; folder: string; queued: number; batchedPending: number }
   | { outcome: "refused"; code: string }
 
 export interface ExportDeps {
@@ -438,6 +439,7 @@ function readme(input: {
   blockNumber: bigint
   blockTime: bigint
   queued: number
+  batchedPending: number
 }): string {
   const { entries, network } = input
   const namespaces = new Map<string, number>()
@@ -519,6 +521,9 @@ Decrypting needs the owner's per-area keys — not included, by design.
   captures the hooks took that have not reached Monad yet — they are not chain records, so an
   export cannot certify them. When the count is not 0, let the Mida service finish (or run
   \`mida doctor\`) and export again.
+- **Batched saves still waiting for Monad: ${input.batchedPending}.** \`state/batch-pending.json\`
+  in your Mida home holds saves the store accepted but the chain has not anchored yet — the same
+  reason they cannot be in this folder. A non-zero count means export again after they land.
 - **Keys.** None — not your owner key, not any agent's key, not the per-area decryption keys.
   records.json and records.md are plaintext: keep this folder private, or delete it when you are done.
 `
@@ -585,6 +590,16 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
     const blockNumber = await runtime.chain.publicClient.getBlockNumber({ cacheTime: 0 })
     const block = await runtime.chain.publicClient.getBlock({ blockNumber })
     const queued = peekJobs(home).length
+    // Two different waits, counted separately: queue/ is hook captures not yet saved, and
+    // state/batch-pending.json is saves the store accepted but Monad has not anchored. The
+    // ledger is read strictly — a file that will not parse means "unknown", and unknown is
+    // never "0 waiting", so the export refuses rather than print a count it cannot stand by.
+    let batchedPending: number
+    try {
+      batchedPending = pendingAnchorsStrict(home).length
+    } catch {
+      return refuse(deps, "batch-ledger-unreadable", "the batched-saves ledger could not be read — export cannot say what is still waiting on Monad")
+    }
 
     const temp = `${dest}.partial-${randomBytes(6).toString("hex")}`
     mkdirSync(temp, { mode: 0o700 })
@@ -631,6 +646,7 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
           blockNumber,
           blockTime: block.timestamp,
           queued,
+          batchedPending,
         }),
       )
       // The one moment the destination matters again: if it appeared while we wrote, refuse and
@@ -672,10 +688,12 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
     if (!parentFlushed) {
       deps.print("warning: the folder's parent directory could not be flushed to disk — the export is complete, but a power loss in the next moments could lose the rename")
     }
-    if (queued > 0) {
-      deps.print(`${queued} save${queued === 1 ? "" : "s"} still queued on this laptop ${queued === 1 ? "is" : "are"} not in the export — ${queued === 1 ? "it has" : "they have"} not reached Monad yet`)
+    if (queued > 0 || batchedPending > 0) {
+      deps.print(
+        `${queued} save${queued === 1 ? "" : "s"} ${queued === 1 ? "is" : "are"} still queued on this laptop and ${batchedPending} batched save${batchedPending === 1 ? "" : "s"} ${batchedPending === 1 ? "is" : "are"} waiting for Monad; they are not in this export. Run export again after they land.`,
+      )
     }
-    return { outcome: "exported", records: records.length, namespaces: namespaces.size, folder: dest, queued }
+    return { outcome: "exported", records: records.length, namespaces: namespaces.size, folder: dest, queued, batchedPending }
   } finally {
     await runtime.close()
   }

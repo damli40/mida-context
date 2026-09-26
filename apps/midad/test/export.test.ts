@@ -552,12 +552,67 @@ describe("mida export — the written folder", () => {
 
   it("the queued-saves count is printed and lands in the README when > 0", async () => {
     const { dest, lines } = await exportWith([fixtureRecord()], { queue: 2 })
-    expect(lines[1]).toBe("2 saves still queued on this laptop are not in the export — they have not reached Monad yet")
+    expect(lines[1]).toBe("2 saves are still queued on this laptop and 0 batched saves are waiting for Monad; they are not in this export. Run export again after they land.")
     const readme = readFileSync(join(dest, "README.md"), "utf8")
     expect(readme).toContain("Saves still queued on this laptop: 2")
     expect(readme).toContain("ContextRegistry: " + network.deployment.contextRegistry)
     expect(readme).toContain("export block: 42")
     expect(readme).toContain("contains no keys")
+  })
+
+  it("a batched save still waiting for Monad is counted separately from the hook queue", async () => {
+    // ex-2 X-4: queue/ jobs and the store-accepted pending ledger are different waits —
+    // the README and the summary name each count, never one hiding behind the other.
+    const home = ownerHome()
+    const cwd = tempDir()
+    enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+    home.writeSecretJson("state/batch-pending.json", {
+      entries: [
+        { contextId: nextId(), eventId: "e1", sessionId: "s1", agent: "claude-code", queuedAt: new Date(1_700_000_000_000).toISOString(), state: "QUEUED" },
+        { contextId: nextId(), eventId: "e2", sessionId: "s1", agent: "claude-code", queuedAt: new Date(1_700_000_000_000).toISOString(), state: "HELD" },
+      ],
+    })
+    const { lines, print } = collect()
+    const dest = join(cwd, "backup")
+    const result = await exportRecords({
+      home,
+      network,
+      folder: dest,
+      cwd,
+      print,
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [fixtureRecord()],
+    })
+    expect(result).toMatchObject({ outcome: "exported", queued: 1, batchedPending: 2 })
+    const readme = readFileSync(join(dest, "README.md"), "utf8")
+    expect(readme).toContain("Saves still queued on this laptop: 1")
+    expect(readme).toContain("Batched saves still waiting for Monad: 2")
+    expect(lines).toContain(
+      "1 save is still queued on this laptop and 2 batched saves are waiting for Monad; they are not in this export. Run export again after they land.",
+    )
+  })
+
+  it("a batched-saves ledger that will not parse refuses — export cannot claim what is still waiting", async () => {
+    // Fail closed, the way migrate does: an unreadable ledger means "unknown", and unknown
+    // is never "0 batched saves waiting".
+    const home = ownerHome()
+    const cwd = tempDir()
+    mkdirSync(join(home.root, "state"), { recursive: true })
+    writeFileSync(join(home.root, "state", "batch-pending.json"), "not json")
+    const { lines, print } = collect()
+    const dest = join(cwd, "backup")
+    const result = await exportRecords({
+      home,
+      network,
+      folder: dest,
+      cwd,
+      print,
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [fixtureRecord()],
+    })
+    expect(result.outcome).toBe("refused")
+    expect(lines.some((line) => line.includes("batched"))).toBe(true)
+    expect(existsSync(dest)).toBe(false)
   })
 
   it("records.md groups by area, newest first, with author, flags and the plaintext warning", async () => {
