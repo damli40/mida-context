@@ -17,3 +17,7 @@ export * from "./registry.js"
 export * from "./gas.js"
 export * from "./writes.js"
 export * from "./sponsored.js"
+// transport.js is already inside this graph (writes.js and sponsored.js import rpcTransport) and
+// is browser-safe — fetch, URL and viem's http, no node builtins. The owner page's @mida/api
+// error mapper needs isChainBusy/ChainBusyError from here (in-9: it crashed both bundles).
+export * from "./transport.js"
