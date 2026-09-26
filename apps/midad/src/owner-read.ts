@@ -82,10 +82,11 @@ export interface ReadOwnerUniverseOptions {
    */
   toBlock?: bigint
   /**
-   * Receives the contextIds of store rows whose chain registration landed AFTER `toBlock` —
-   * saves that arrived while the read was running. They are newer than the read: excluded
-   * from the result and counted here, never reported as inconsistencies. Only consulted when
-   * `toBlock` is set; a row with no registration anywhere still fails the read.
+   * Receives the contextIds of saves the chain registered AFTER `toBlock` — whether found as
+   * a store row the bounded scan predates or as a post-bound registration the store never
+   * listed. They are newer than the read: excluded from the result and counted here, never
+   * reported as inconsistencies. Only consulted when `toBlock` is set; a store row with no
+   * registration anywhere still fails the read.
    */
   afterHead?: Set<Hex>
 }
@@ -245,7 +246,18 @@ async function readBatchedUniverse(
     fromBlock: deployment.batchAnchorBlock ?? 0n,
     ...(toBlock === undefined ? {} : { toBlock }),
   }, { maxRange: runtime.network.logBlockRange, onProgress })
-  if (logs.length === 0) return []
+
+  // SaveAnchored ids after the bound — scanned on demand when a store row misses (fresh each
+  // time, so a registration that lands mid-read is still seen), and consulted once more at the
+  // end so `afterHead` counts every save the chain registered post-bound, whether or not the
+  // store ever listed its row.
+  const anchoredAfterHead = async (): Promise<Set<Hex>> =>
+    toBlock === undefined ? new Set() : idsLoggedAfter(runtime, batchAnchor, SAVE_ANCHORED, toBlock)
+
+  if (logs.length === 0) {
+    for (const id of await anchoredAfterHead()) afterHead?.add(id)
+    return []
+  }
 
   const byNamespace = new Map<Hex, AnchoredSave[]>()
   const anchoredIds = new Set<Hex>()
@@ -266,11 +278,6 @@ async function readBatchedUniverse(
     })
     byNamespace.set(namespaceId, list)
   }
-
-  // SaveAnchored ids after the bound — scanned lazily, only if a store row needs the check.
-  let lateAnchors: Set<Hex> | undefined
-  const anchoredAfterHead = async (): Promise<Set<Hex>> =>
-    (lateAnchors ??= toBlock === undefined ? new Set() : await idsLoggedAfter(runtime, batchAnchor, SAVE_ANCHORED, toBlock))
 
   const records: (SourceRecord & { lane: "batched" })[] = []
   // Anchoring block timestamps, fetched once per block — a batched record's createdAt is when the
@@ -399,6 +406,8 @@ async function readBatchedUniverse(
       for (const save of nsLogs) failures.push({ contextId: save.contextId, reason: "the store's batch list was partial" })
     }
   }
+  // Post-bound anchors the store never showed still count as "landed after the bound".
+  for (const id of await anchoredAfterHead()) afterHead?.add(id)
   return records
 }
 
@@ -436,8 +445,19 @@ export async function readOwnerUniverse(
 
   const keepEncrypted = options?.keepEncrypted === true
   const failures: ReadFailure[] = []
+
+  // ContextRegistered ids after the bound — scanned on demand when a store row misses (fresh
+  // each time, so a registration that lands mid-read is still seen), and consulted once more
+  // at the end so `afterHead` counts every save the chain registered post-bound, whether or
+  // not the store ever listed its row.
+  const registeredAfterHead = async (): Promise<Set<Hex>> =>
+    options?.toBlock === undefined
+      ? new Set()
+      : idsLoggedAfter(runtime, deployment.contextRegistry, CONTEXT_REGISTERED, options.toBlock)
+
   const batched = await readBatchedUniverse(runtime, failures, options?.onProgress, keepEncrypted, options?.toBlock, options?.afterHead)
   if (logs.length === 0) {
+    for (const id of await registeredAfterHead()) options?.afterHead?.add(id)
     if (failures.length > 0) throw ownerReadIncomplete(failures)
     return batched
   }
@@ -464,13 +484,6 @@ export async function readOwnerUniverse(
   }
 
   const decrypted = new Map<Hex, SourceRecord>()
-
-  // ContextRegistered ids after the bound — scanned lazily, only if a store row needs the check.
-  let lateRegistrations: Set<Hex> | undefined
-  const registeredAfterHead = async (): Promise<Set<Hex>> =>
-    (lateRegistrations ??= options?.toBlock === undefined
-      ? new Set()
-      : await idsLoggedAfter(runtime, deployment.contextRegistry, CONTEXT_REGISTERED, options.toBlock))
 
   for (const [nsId, chainIds] of byNamespace) {
     let namespace: string
@@ -578,6 +591,9 @@ export async function readOwnerUniverse(
   }
 
   if (failures.length > 0) throw ownerReadIncomplete(failures)
+
+  // Post-bound registrations the store never showed still count as "landed after the bound".
+  for (const id of await registeredAfterHead()) options?.afterHead?.add(id)
 
   // Registration order — the chain's own ordering of the owner's history — then the batched
   // items in their SaveAnchored order: the two lanes come from different contracts, so each

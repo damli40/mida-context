@@ -420,7 +420,7 @@ describe("mida export — dispatch and refusals", () => {
       createdAt: 100n,
       expiresAt: 0n,
     }
-    const fake = (lateRegistered: boolean): Runtime =>
+    const fake = (lateRegistered: boolean, bounded = true): Runtime =>
       ({
         owner: OWNER,
         ownerStartBlock: 0n,
@@ -434,7 +434,7 @@ describe("mida export — dispatch and refusals", () => {
               if (fromBlock > 42n) {
                 return lateRegistered ? [{ args: { contextId: lateId }, blockNumber: 45n, logIndex: 0 }] : []
               }
-              return [{ args: { contextId: oldId, record: { namespaceId: NS_PROJECTS } }, blockNumber: 10n, logIndex: 0 }]
+              return bounded ? [{ args: { contextId: oldId, record: { namespaceId: NS_PROJECTS } }, blockNumber: 10n, logIndex: 0 }] : []
             },
           },
         },
@@ -461,6 +461,13 @@ describe("mida export — dispatch and refusals", () => {
     // is still the inconsistency it always was.
     const missing = await readOwnerUniverse(fake(false), { keepEncrypted: true, toBlock: 42n }).catch((error: unknown) => error)
     expect(missing).toMatchObject({ code: "owner-read-incomplete", contextIds: [lateId] })
+
+    // With NOTHING at or below the bound the store list is never consulted — but the save that
+    // landed after the export block is still counted: the count is "registered after the bound",
+    // not merely "rows the store happened to show".
+    const emptyUniverse = new Set<Hex>()
+    await expect(readOwnerUniverse(fake(true, false), { keepEncrypted: true, toBlock: 42n, afterHead: emptyUniverse })).resolves.toEqual([])
+    expect([...emptyUniverse]).toEqual([lateId])
   })
 
   it("owner-read-incomplete through exportRecords throws naming the contextIds and leaves nothing", async () => {
