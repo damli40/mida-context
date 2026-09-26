@@ -308,7 +308,12 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
       // everything else identical, so stripping the marker and the new record ids must reproduce
       // the pre-move text exactly.
       const normalize = (text: string): string =>
-        text.replace(/ \(moved on \d{4}-\d{2}-\d{2}\)/g, "").replace(/0x[0-9a-fA-F]+/g, "0x*")
+        text
+          .replace(/ \(moved on \d{4}-\d{2}-\d{2}\)/g, "")
+          // a fact's stamp renders `id <8 hex>` WITHOUT the 0x prefix — mask it too, since the
+          // moved records carry new target ids the same way the Saved-by `record 0x…` ids do
+          .replace(/id [0-9a-fA-F]{8}\b/g, "id *")
+          .replace(/0x[0-9a-fA-F]+/g, "0x*")
       expect(normalize(handoffAfter.text)).toBe(normalize(handoffBefore.text))
     },
     TIMEOUT,

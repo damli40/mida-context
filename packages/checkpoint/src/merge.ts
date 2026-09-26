@@ -39,8 +39,9 @@ export interface StoredCheckpoint {
    * block's time for a batched one); `block` and `index` are its position in the chain's order
    * (log index for a direct save, batch position for a batched one). Absent for a save the chain
    * has not placed — a pending batched save, or a fixture built by hand — and `block`/`index`
-   * absent when only the stamp was recoverable. `checkpoint.createdAt` is the writer's claim and
-   * never orders anything: every comparison in this file runs on this field when it exists.
+   * absent when only the stamp was recoverable. `checkpoint.createdAt` is the writer's own
+   * claim: `orderTime` trusts it only downward — it may age its own record, never make it
+   * newer than the chain's placement (in-11 R-10).
    */
   chain?: { at: bigint; block?: bigint; index?: number }
   /**
@@ -89,16 +90,22 @@ export interface MergedHandoff {
 }
 
 /**
- * The instant a checkpoint is ordered by, in milliseconds: Monad's stamp whenever the record
- * carries its chain placement — the checkpoint's own createdAt claim only when the chain never
- * placed it (pending saves never reach the merge at all; this is for hand-built records).
- * A record `mida migrate` moved sorts by min(its envelope's originalCreatedAt, that stamp):
- * the envelope is writer-controlled encrypted content, so it may only AGE the record it rides
- * on — a claim dated past the chain stamp collapses back to the stamp, and a forged "newer"
- * original can never win an ordering. A genuinely older moved record keeps its real place.
+ * The effective instant a checkpoint is ordered and displayed by, in milliseconds: the earliest
+ * of {the checkpoint's own `createdAt`, the chain's placement stamp, a migration envelope's
+ * `originalCreatedAt`} — whichever terms exist. The chain's stamp is Monad's word and caps every
+ * claim; the two other terms are writer-controlled encrypted content, so they may only AGE the
+ * record they ride on — a claim or envelope dated past the stamp collapses back to it, and a
+ * forged "newer" original can never win an ordering (in-11 R-10). The writer's own `createdAt`
+ * joining the same min is what a moved record needs to display the day it was written rather
+ * than the move day: the claim travels inside the sealed payload, so a migrated record keeps
+ * the exact instant it showed before the move, and the same rule means an unmoved record
+ * displays when it was written rather than when Monad happened to confirm it.
  */
 export const orderTime = (s: StoredCheckpoint): number => {
-  const at = s.chain === undefined ? Date.parse(s.checkpoint.createdAt) : Number(s.chain.at) * 1000
+  const claim = Date.parse(s.checkpoint.createdAt)
+  if (s.chain === undefined) return claim
+  let at = Number(s.chain.at) * 1000
+  if (!Number.isNaN(claim)) at = Math.min(claim, at)
   if (s.migration === undefined) return at
   const original = Date.parse(s.migration.originalCreatedAt)
   return Number.isNaN(original) ? at : Math.min(original, at)
@@ -106,16 +113,17 @@ export const orderTime = (s: StoredCheckpoint): number => {
 
 /**
  * The ISO stamp a record is reported with — its EFFECTIVE instant, the same one `orderTime`
- * sorts by (in-11 R-10): Monad's stamp when carried, lowered toward a moved record's
- * originalCreatedAt — a record `mida migrate` copied on Sep 24 displays when it was written,
- * not the move day. A record with no chain placement keeps the writer's claim.
+ * sorts by (in-11 R-10): the earliest of its own `createdAt`, its chain stamp and a moved
+ * record's `originalCreatedAt`. A record `mida migrate` copied on Sep 24 displays the same day
+ * it showed before the move — when it was written, not the move day. A record with no chain
+ * placement keeps the writer's claim.
  */
 export const recordedAt = (s: StoredCheckpoint): string =>
   s.chain === undefined ? s.checkpoint.createdAt : new Date(orderTime(s)).toISOString()
 
 /**
- * The order Monad wrote the saves in: each record's effective instant (its chain stamp, moved
- * records lowered toward their migration envelope's originalCreatedAt — see `orderTime`), then
+ * The order Monad wrote the saves in: each record's effective instant (the earliest of its own
+ * createdAt, its chain stamp and a moved record's envelope originalCreatedAt — see `orderTime`), then
  * block, then log index — the contextId only ever breaks a tie between records that carry none
  * of those. A record the chain placed sorts after an unplaced one at the same instant (absent
  * fields order first); a pending save never enters this comparison — the handoff keeps it out
@@ -308,10 +316,11 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
   }
 
   // The header's "saved <time>" is the newest CONFIRMED stamp in the merge — the largest
-  // EFFECTIVE instant any chain-placed record carries (in-11 R-10: a migrated save's min of
-  // original write and move stamp — the header says when the work was saved, not when it was
-  // copied). A record with no chain placement (a hand-built one; pending saves never reach the
-  // merge) cannot set it, and cannot suppress it either.
+  // EFFECTIVE instant any chain-placed record carries (in-11 R-10: the earliest of the save's
+  // own createdAt, its chain stamp and a moved record's originalCreatedAt — the header says
+  // when the work was saved, not when it was copied). A record with no chain placement (a
+  // hand-built one; pending saves never reach the merge) cannot set it, and cannot suppress
+  // it either.
   const savedAt = scope.reduce<number | undefined>(
     (max, s) => (s.chain === undefined ? max : max === undefined || orderTime(s) > max ? orderTime(s) : max),
     undefined,

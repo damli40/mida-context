@@ -416,7 +416,7 @@ describe("mergeCheckpoints", () => {
     expect(m.savedAt).toBe("2026-09-21T10:00:00.000Z")
   })
 
-  it("an unmoved record beside a moved one keeps its own stamp — only the moved time is lowered (R-10)", () => {
+  it("an unmoved record beside a moved one shows its own write claim — only the moved time is lowered by the envelope (R-10)", () => {
     const moved = stored({
       sessionId: "s-moved", at: "2026-09-24T10:00:00.000Z", objective: "moved save", progress: ["p"],
       chain: { at: 1_800_000_000n, block: 9n, index: 0 },
@@ -427,9 +427,9 @@ describe("mergeCheckpoints", () => {
       chain: { at: 1_800_000_100n, block: 10n, index: 0 },
     })
     const m = mergeCheckpoints([moved, honest])!
-    // the honest save is newer: header + its own provenance carry its real stamp, while the
-    // moved save's row shows its original write day in the other-sessions list
-    expect(m.savedAt).toBe(new Date(1_800_000_100_000).toISOString())
+    // the honest save is newer: header + its row show its own write claim (an honest claim
+    // predates its anchor), while the moved save's row shows its original write day instead
+    expect(m.savedAt).toBe("2026-09-24T11:00:00.000Z")
     expect(m.otherSessions[0]!.sessionId).toBe("s-moved")
     expect(m.otherSessions[0]!.lastSavedAt).toBe("2026-09-21T10:00:00.000Z")
   })
@@ -441,7 +441,20 @@ describe("mergeCheckpoints", () => {
     })
     moved.migration = envelope("2099-01-01T00:00:00.000Z")
     const m = mergeCheckpoints([moved])!
-    // the envelope may only AGE its record — a claim past the chain stamp collapses to it
+    // the envelope may only AGE its record — the 2099 claim collapses to the record's own
+    // honest createdAt, and nothing is displayed past the chain stamp
+    expect(m.provenance[0]!.createdAt).toBe("2026-09-24T10:00:00.000Z")
+    expect(m.savedAt).toBe("2026-09-24T10:00:00.000Z")
+  })
+
+  it("a checkpoint's own forged-future createdAt collapses to the chain stamp (R-10)", () => {
+    // The writer's claim joins the same only-ages rule as the envelope: a save stamped Jan 2027
+    // that claims 2099 displays Monad's stamp — never the claim.
+    const forged = stored({
+      sessionId: "s-forged", at: "2099-01-01T00:00:00.000Z", objective: "forged clock", progress: ["p"],
+      chain: { at: 1_800_000_000n, block: 9n, index: 0 },
+    })
+    const m = mergeCheckpoints([forged])!
     expect(m.provenance[0]!.createdAt).toBe(new Date(1_800_000_000_000).toISOString())
     expect(m.savedAt).toBe(new Date(1_800_000_000_000).toISOString())
   })
