@@ -651,6 +651,71 @@ describe("followPendingAnchors — the ledger's follow-up", () => {
         await store.close()
       }
     })
+
+    // in-12 N-3: finality is an ALLOWLIST of authority answers now — under the old "any string
+    // code but EPOCH_STALE" rule, every one of these wiped the pending entry and its plaintext.
+    describe("the final-code allowlist — a store error page can never delete the save (in-12 N-3)", () => {
+      const waitsUnspent: [string, () => unknown][] = [
+        ["a StoreHttpError 429 rate-limit page", () => new StoreHttpError(429, "<html>rate limited</html>")],
+        ["a StoreHttpError 403 challenge page", () => new StoreHttpError(403, "<html>Attention Required</html>")],
+        ["a StoreHttpError 404 plain-text page", () => new StoreHttpError(404, "404 Not Found")],
+        ["the store's own RATE_LIMITED limiter", () => new MidaError("RATE_LIMITED" as never, "too many requests")],
+        ["the store's CHAIN_MISCONFIGURED", () => new MidaError("CHAIN_MISCONFIGURED" as never, "no contract")],
+        ["the store's RPC_AUTH_REJECTED", () => new MidaError("RPC_AUTH_REJECTED" as never, "refused key")],
+        ["an error carrying no code at all", () => new TypeError("fetch failed")],
+        ["a code this build does not know", () => new MidaError("FUTURE_STORE_CODE" as never, "new refusal")],
+      ]
+      for (const [label, thrown] of waitsUnspent) {
+        it(`${label} waits unspent — entry, plaintext and retry budget all kept`, async () => {
+          const store = await stubStore()
+          try {
+            const home = await homeWithStaleRejected(store)
+            const { runtime, logged } = resubmitWith(store, home, thrown)
+            const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+            expect(counts).toEqual({ anchored: 0, rejected: 0, waiting: 1 })
+            expect(rejectedAnchors(home)).toHaveLength(0)
+            expect(pendingAnchors(home)).toEqual([expect.objectContaining({ contextId: CONTEXT_ID })])
+            expect(pendingAnchors(home)[0]!.retries ?? 0).toBe(0)
+            expect(pendingPlaintext(home, CONTEXT_ID)).toBeDefined()
+            expect(logged).toHaveLength(0)
+          } finally {
+            await store.close()
+          }
+        })
+      }
+
+      for (const code of ["CAPABILITY_DENIED", "CAPABILITY_REVOKED", "CAPABILITY_EXPIRED", "NOT_AN_AGENT", "SIGNER_MISMATCH", "ALREADY_QUEUED"] as const) {
+        it(`a ${code} answer is final — the save is judged, its plaintext dropped`, async () => {
+          const store = await stubStore()
+          try {
+            const home = await homeWithStaleRejected(store)
+            const { runtime, logged } = resubmitWith(store, home, () => new MidaError(code as never, "the store judged the save"))
+            const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+            expect(counts).toEqual({ anchored: 0, rejected: 1, waiting: 0 })
+            expect(rejectedAnchors(home)).toEqual([expect.objectContaining({ contextId: CONTEXT_ID })])
+            expect(pendingAnchors(home)).toHaveLength(0)
+            expect(pendingPlaintext(home, CONTEXT_ID)).toBeUndefined()
+            expect(logged).toEqual([expect.objectContaining({ outcome: "failed" })])
+          } finally {
+            await store.close()
+          }
+        })
+      }
+
+      it("EPOCH_STALE answering the resubmission itself spends one retry against the cap", async () => {
+        const store = await stubStore()
+        try {
+          const home = await homeWithStaleRejected(store)
+          const { runtime, logged } = resubmitWith(store, home, () => new MidaError("EPOCH_STALE" as never, "still stale"))
+          const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+          expect(counts.waiting).toBe(1)
+          expect(pendingAnchors(home)[0]!.retries).toBe(1)
+          expect(pendingPlaintext(home, CONTEXT_ID)).toBeDefined()
+        } finally {
+          await store.close()
+        }
+      })
+    })
   })
 })
 

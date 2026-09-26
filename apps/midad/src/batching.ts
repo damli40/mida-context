@@ -5,7 +5,6 @@ import type { CreateContextInput } from "@mida/sdk"
 import { PERMISSION, PROVENANCE_POLICY, namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import type { MidaHome } from "./home.js"
-import { chainRefusalReason } from "./chain-busy.js"
 import { isRevoked, loadAgentIdentity } from "./keys.js"
 import { readSavedNetwork } from "./network.js"
 import type { SavedNetwork } from "./network.js"
@@ -212,6 +211,29 @@ const EPOCH_RETRYABLE = new Set(["BAD_EPOCH", "EPOCH_STALE"])
 /** A stale-epoch save is re-sealed and resubmitted at most this many times, then it is refused. */
 const MAX_EPOCH_RETRIES = 3
 
+/**
+ * The wire codes a resubmission may treat as the store judging the SAVE (in-12 N-3) — and only
+ * these. Each is an authority answer the contract itself would reproduce for the same signed
+ * fields: the signer holds no live grant or is not an agent at all (CAPABILITY_DENIED /
+ * CAPABILITY_REVOKED / CAPABILITY_EXPIRED / NOT_AN_AGENT), the signature does not recover to the
+ * request signer (SIGNER_MISMATCH), or a save with that contextId is already stored
+ * (ALREADY_QUEUED). EVERYTHING else is "asked but could not judge": the store's own
+ * CHAIN_UNAVAILABLE / CHAIN_MISCONFIGURED / RPC_AUTH_REJECTED / INTERNAL_ERROR, its RATE_LIMITED
+ * and QUOTA_EXCEEDED limiters, WRITE_DENIED (a staged deny can still be cancelled),
+ * EPOCH_ROTATION_REQUIRED, an HTML error page at ANY status (StoreHttpError's STORE_UNREACHABLE
+ * on a 403/404/429/5xx alike — the allowlist is what makes a bare error page non-final), and an
+ * error that never carried a code at all. Non-final answers wait for the next pass unspent —
+ * the retry cap is spent only on EPOCH_STALE, the very condition being resubmitted.
+ */
+const RESUBMIT_FINAL = new Set([
+  "CAPABILITY_DENIED",
+  "CAPABILITY_REVOKED",
+  "CAPABILITY_EXPIRED",
+  "NOT_AN_AGENT",
+  "SIGNER_MISMATCH",
+  "ALREADY_QUEUED",
+])
+
 export function keepPendingPlaintext(home: MidaHome, contextId: Hex, input: Record<string, unknown>): void {
   home.writeSecretJson(pendingPlaintextPath(contextId), input)
 }
@@ -373,26 +395,19 @@ async function resubmitStaleEpoch(
   try {
     queued = await requeue()
   } catch (error) {
-    // Only an answer that judges the SAVE may end it (in-11 R-7) — a wire code like
-    // CAPABILITY_DENIED, NOT_AN_AGENT, SIGNER_MISMATCH or ALREADY_QUEUED is the store's
-    // judgement and refuses, never retried. Everything that means "asked but could not say"
-    // waits for the next pass unspent, plaintext kept: the store's own CHAIN_UNAVAILABLE and
-    // INTERNAL_ERROR, any 5xx page, whatever the busy test recognises, and WRITE_DENIED — a
-    // staged deny can still be cancelled, so it parks the resubmission like a pending answer.
-    // EPOCH_ROTATION_REQUIRED waits the same way (a rotation accepts no writes at all), and an
-    // answer that never arrived carries no code. Only EPOCH_STALE — the very condition being
-    // retried answering the resubmission itself — spends one against the cap.
-    // chainRefusalReason covers all three "could not judge" answers — busy, the store's
-    // CHAIN_MISCONFIGURED and RPC_AUTH_REJECTED: a wrong setup never deletes a save either (R-8)
-    if (chainRefusalReason(error) !== undefined) return "retry-later"
+    // The allowlist (in-12 N-3): only a code in RESUBMIT_FINAL is the store judging the save —
+    // before it, "any string code but EPOCH_STALE" was final, so a Cloudflare error page's
+    // STORE_UNREACHABLE or the store's own RATE_LIMITED deleted the kept plaintext. Every other
+    // outcome — a bare StoreHttpError at any status, a code that means "could not judge", a
+    // code this build does not know at all, a thrown value carrying no code — waits unspent.
     const code = (error as { code?: unknown }).code
-    if (code === "INTERNAL_ERROR" || code === "WRITE_DENIED") return "retry-later"
-    const status = (error as { status?: unknown }).status
-    if (typeof status === "number" && status >= 500 && status < 600) return "retry-later"
-    if (code === "EPOCH_ROTATION_REQUIRED" || typeof code !== "string") return "retry-later"
-    if (code !== "EPOCH_STALE") return "refused"
-    setPendingAnchorRetries(home, entry.contextId, retries)
-    return retries >= MAX_EPOCH_RETRIES ? "refused" : "retry-later"
+    if (typeof code === "string" && RESUBMIT_FINAL.has(code)) return "refused"
+    if (code === "EPOCH_STALE") {
+      // the very condition being retried answering the resubmission itself — one spent
+      setPendingAnchorRetries(home, entry.contextId, retries)
+      return retries >= MAX_EPOCH_RETRIES ? "refused" : "retry-later"
+    }
+    return "retry-later"
   }
   // Entry first: a crash after the POST leaves the new save untracked — it still anchors —
   // rather than the stale id retrying again and queueing a second copy of the checkpoint.
