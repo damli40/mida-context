@@ -355,7 +355,7 @@ Cursor's `--project` is written as the literal `${workspaceFolder}`, which Curso
 }
 ```
 
-**The Codex app and Codex CLI — NOT RUN.** No MCP entry is needed: the Codex app (which is also the ChatGPT desktop app) and the Codex CLI share the `codex` identity through the Codex hooks `mida install codex` already writes. Browser ChatGPT is not supported in v0.
+**Codex CLI — NOT RUN.** No MCP entry is needed: the Codex CLI uses the `codex` identity through the hooks `mida install codex` already writes (section 4). The old Codex app is now a tab inside the ChatGPT desktop app — whether Mida's plain config hooks fire there is untested, so the app is not a supported client in v0. Browser ChatGPT is not supported either.
 
 **Any MCP harness — NOT RUN.** Every stdio config is the same block in a different file: `command` names the `mida-mcp` launcher by absolute path (`<repo>/bin/mida-mcp` from a source checkout finds node for you — PATH, then the usual install spots, then the newest `~/.nvm` version), `args` is `["--as", "<a registered client identity>", "--project", "<project folder>"]`, `env` carries `MIDA_HOME`. Any registered name works — `mida-mcp` refuses `--as` values it cannot serve, so the identity must exist in the home first.
 
@@ -388,7 +388,7 @@ The honest limits:
 - **No owner operations.** A model cannot approve, revoke, request or remember through MCP — there is no tool and no socket route for those; only the checkpoint write above.
 - claude.ai web and mobile: not supported in v0 — they only call public HTTPS servers from Anthropic's cloud, and Mida does not run one.
 <!-- revisit if spike S4 passes (plan Task 10) -->
-- **ChatGPT in the browser — NOT RUN, and not supported in v0.** The ChatGPT desktop app is the Codex app above. Browser ChatGPT has no local stdio transport Mida can serve.
+- **ChatGPT — NOT RUN, and not supported in v0.** Browser ChatGPT has no local stdio transport Mida can serve. The ChatGPT desktop app now hosts the old Codex app as a tab — whether plain config hooks fire there is untested, so it is not a supported client in v0 either.
 
 *Status: NOT RUN against a real MCP client — `apps/midad/test/mcp.test.ts` drives the server over the SDK's in-memory transport against a fake daemon socket (including the not-approved, revoked and daemon-down answers), `apps/midad/test/mcp.e2e.test.ts` runs the reads against a real daemon on a local Anvil chain, and `apps/midad/test/mcp-save.e2e.test.ts` runs `mida_save` end to end the same way (a real save another agent's handoff then sees, the READ-only / unapproved / revoked / bad-shape / rate-limit refusals, and secret scrubbing before sealing). No client above has been validated end-to-end.*
 
