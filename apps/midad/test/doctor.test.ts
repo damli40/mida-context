@@ -358,7 +358,7 @@ describe("mida doctor without a chain", () => {
       env: { ANTHROPIC_API_KEY: "sk-ant-secret-value", ANTHROPIC_AUTH_TOKEN: "tok-secret" },
       daemonProbeMs: 50,
     })
-    const note = lines.find((line) => line.startsWith("note:"))
+    const note = lines.find((line) => line.startsWith("note:") && line.includes("ANTHROPIC_API_KEY"))
     expect(note).toBeDefined()
     expect(note).toContain("ANTHROPIC_API_KEY")
     expect(note).toContain("ANTHROPIC_AUTH_TOKEN")
@@ -714,5 +714,50 @@ describe("mida doctor on a saved home with no service URLs", () => {
     )
     // the mismatch is a note because the setup still works — never a PROBLEM
     expect(lines.every((line) => !line.startsWith("PROBLEM: MIDA_DEPLOYMENTS_DIR"))).toBe(true)
+  })
+})
+
+// in-6 R7: `mida doctor` names the RPC the process resolves — host and source only, because the
+// URL's path or query can carry a provider's API key and doctor output is quoted into reports.
+describe("mida doctor names the chain RPC — host and source only", () => {
+  const X_RAW = JSON.parse(
+    readFileSync(join(repo, "docs/evidence/deployment-10143-vault.mida.xyz-2026-09-17.json"), "utf8"),
+  ) as { capabilityRegistry: string }
+
+  const doctorLines = async (home: MidaHome, env: Record<string, string | undefined>): Promise<string[]> => {
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), env, daemonProbeMs: 50 })
+    return lines
+  }
+
+  it("a saved rpcUrl prints its host as (network.json) — and a key in the path never leaks", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    home.writeSecretJson("network.json", {
+      rpcUrl: "http://127.0.0.1:1/v2/SECRET-API-KEY-0001?token=abcdef",
+      deployment: X_RAW,
+    })
+    const lines = await doctorLines(home, {})
+    expect(lines).toContain("ok: chain RPC 127.0.0.1:1 (network.json)")
+    const output = lines.join("\n")
+    expect(output).not.toContain("SECRET-API-KEY-0001")
+    expect(output).not.toContain("abcdef")
+    expect(output).not.toContain("/v2/")
+  })
+
+  it("MONAD_TESTNET_RPC beats the saved file and prints (environment)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    home.writeSecretJson("network.json", { rpcUrl: "http://127.0.0.1:1", deployment: X_RAW })
+    const lines = await doctorLines(home, { MONAD_TESTNET_RPC: "https://provider.example/rpc/KEY-0002" })
+    expect(lines).toContain("ok: chain RPC provider.example (environment)")
+    expect(lines.join("\n")).not.toContain("KEY-0002")
+  })
+
+  it("a home with no network.json names the public default and prints the rate note", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines = await doctorLines(home, {})
+    expect(lines).toContain("ok: chain RPC testnet-rpc.monad.xyz (public default)")
+    expect(lines).toContain(
+      "note: the public Monad RPC allows about 15 requests a second; a provider URL in MONAD_TESTNET_RPC or network.json raises that",
+    )
   })
 })

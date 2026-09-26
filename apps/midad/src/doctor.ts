@@ -374,14 +374,23 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             : [problem("network.json is missing or unreadable", INIT_FIX)]
         }
         shared.resolved = resolved
-        if (!resolved.saved) return [problem("network.json is missing or unreadable", INIT_FIX)]
+        // The host only — an RPC URL's path or query can carry a provider's key, and doctor
+        // output gets quoted into reports. This prints even when network.json is missing so a
+        // first-time setup still sees which RPC a fixed home would use.
+        const rpcLines = [`ok: chain RPC ${hostOf(resolved.network.rpcUrl)} (${resolved.rpcSource})`]
+        if (resolved.rpcSource === "public default") {
+          rpcLines.push(
+            "note: the public Monad RPC allows about 15 requests a second; a provider URL in MONAD_TESTNET_RPC or network.json raises that",
+          )
+        }
+        if (!resolved.saved) return [problem("network.json is missing or unreadable", INIT_FIX), ...rpcLines]
         shared.context = {
           publicClient: createPublicClient({ chain: chainFor(resolved.network.deployment.chainId), batch: { multicall: true }, transport: rpcTransport(resolved.network.rpcUrl) }),
           deployment: resolved.network.deployment,
         }
         shared.reader = new RegistryReader(shared.context)
         const short = (a: string) => `${a.slice(0, 6)}…`
-        const lines = ["ok: network.json present", `contract ${short(resolved.network.deployment.capabilityRegistry)}`]
+        const lines = ["ok: network.json present", `contract ${short(resolved.network.deployment.capabilityRegistry)}`, ...rpcLines]
         // A saved contract that differs from this build's record is a note, not a problem —
         // the setup still works on the contract it saved.
         const note = mismatchLine(resolved)

@@ -8,7 +8,7 @@ import { isMidaError } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
 import { CONTENT_FIELDS, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint } from "@mida/checkpoint"
-import { chainFor, parseDeployment, rpcTransport } from "@mida/chain"
+import { chainFor, rpcTransport } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { RegistryReader } from "@mida/api"
 import { readTranscriptFor, scrubSecrets } from "@mida/compiler"
@@ -20,6 +20,7 @@ import type { MidaHome } from "./home.js"
 import { FLUSH_EVENTS, transcriptPathAllowed } from "./hook.js"
 import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { appendLog } from "./log.js"
+import { resolveNetwork } from "./network.js"
 import { checkProject as checkProjectAgainstList } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { findProjectMarker, isSafeName, listJobs, moveToBad, removeJob } from "./queue.js"
@@ -627,7 +628,12 @@ function failureCode(error: unknown): string {
  * missing file proves nothing. A runtime that cannot open or has no owner throws — "cannot
  * determine" is transient — and only the chain's own "no live capability" is permanent.
  */
-async function agentApprovedOnChain(home: MidaHome, agent: string, ownerOf: () => Promise<Address | undefined>): Promise<boolean> {
+export async function agentApprovedOnChain(
+  home: MidaHome,
+  agent: string,
+  ownerOf: () => Promise<Address | undefined>,
+  env: Record<string, string | undefined> = process.env,
+): Promise<boolean> {
   const identity = loadAgentIdentity(home, agent)
   if (identity === undefined) return false
   let owner = loadGrants(home, agent)[0]?.owner
@@ -635,13 +641,12 @@ async function agentApprovedOnChain(home: MidaHome, agent: string, ownerOf: () =
     owner = await ownerOf()
     if (typeof owner !== "string") throw new Error(`cannot determine the owner for ${agent}'s approval check`)
   }
-  const stored = home.readJson<{ rpcUrl?: unknown; deployment?: unknown }>("network.json")
-  if (typeof stored?.rpcUrl !== "string" || stored.deployment === undefined) {
-    throw new Error("network.json is missing or incomplete; run mida init first")
-  }
-  const deployment = parseDeployment(stored.deployment)
+  // The same resolveNetwork every entry point uses — MONAD_TESTNET_RPC, then network.json, then
+  // the public default — so the drainer answers about the same RPC the daemon it serves does.
+  const resolved = await resolveNetwork(home, env, { probeChainId: false })
+  const deployment = resolved.network.deployment
   const context: ChainContext = {
-    publicClient: createPublicClient({ chain: chainFor(deployment.chainId), batch: { multicall: true }, transport: rpcTransport(stored.rpcUrl) }),
+    publicClient: createPublicClient({ chain: chainFor(deployment.chainId), batch: { multicall: true }, transport: rpcTransport(resolved.network.rpcUrl) }),
     deployment,
   }
   const reader = new RegistryReader(context)

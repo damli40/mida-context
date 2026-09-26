@@ -35,6 +35,8 @@ export type ServiceSource = "environment" | "off" | "network.json" | "local" | "
 export interface ResolvedNetwork {
   network: Network // what the process must use
   saved: boolean // true when network.json existed
+  /** Where the effective rpcUrl came from — a source word, never the URL itself. */
+  rpcSource: "environment" | "network.json" | "public default"
   contractSource: "network.json" | "built-in" | "deployments-dir"
   builtIn: Deployment // the record this code ships (or MIDA_DEPLOYMENTS_DIR's)
   /** set when saved and the built-in record names a different contract */
@@ -153,6 +155,11 @@ export async function resolveNetwork(
       : saved?.deployment ?? builtIn
   const envRpc = env.MONAD_TESTNET_RPC
   const rpcUrl = !unset(envRpc) ? envRpc : saved?.rpcUrl ?? monadTestnet.rpcUrls.default.http[0]
+  const rpcSource: ResolvedNetwork["rpcSource"] = !unset(envRpc)
+    ? "environment"
+    : saved !== undefined
+      ? "network.json"
+      : "public default"
 
   // One resolution shared by store and sponsor: the environment wins in both directions, then
   // the saved file — and only a FIRST-time home falls through to the hosted default. A home
@@ -199,6 +206,7 @@ export async function resolveNetwork(
   return {
     network,
     saved: saved !== undefined,
+    rpcSource,
     contractSource: saved !== undefined ? "network.json" : deploymentsDir !== undefined ? "deployments-dir" : "built-in",
     builtIn,
     ...(mismatch === undefined ? {} : { mismatch }),
