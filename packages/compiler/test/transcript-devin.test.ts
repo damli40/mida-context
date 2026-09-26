@@ -331,6 +331,34 @@ describe("readDevinConversation — the chain the job asked for", () => {
     expect(convo.openedWithScaffolding).toBe(true)
   })
 
+  itSqlite("a MIDA HANDOFF stored as is_user_input is still not the user — it never pins, renders or re-saves", () => {
+    const db = makeDevinDb([{ id: "calm-otter", mainChainId: 4 }], [
+      { nodeId: 1, chatMessage: system("root") },
+      // Devin stored Mida's injected handoff as a real user input — the flag must not save it
+      { nodeId: 2, parentNodeId: 1, chatMessage: user("MIDA HANDOFF\n## What matters\nhandoff text that must not survive") },
+      { nodeId: 3, parentNodeId: 2, chatMessage: user("the real ask") },
+      { nodeId: 4, parentNodeId: 3, chatMessage: assistant("sure") },
+    ])
+    const convo = readDevinConversation(db, { sessionId: "calm-otter" })
+    expect(convo.firstUserMessage).toBe("the real ask")
+    expect(convo.text).not.toContain("MIDA HANDOFF")
+    expect(convo.text).not.toContain("handoff text that must not survive")
+    expect(convo.openedWithScaffolding).toBe(true)
+  })
+
+  itSqlite("a Mida whats-new note stored as is_user_input is still not the user", () => {
+    const db = makeDevinDb([{ id: "calm-otter", mainChainId: 4 }], [
+      { nodeId: 1, chatMessage: system("root") },
+      { nodeId: 2, parentNodeId: 1, chatMessage: user("Mida update since you last checked (2 new)\nwhats-new text that must not survive") },
+      { nodeId: 3, parentNodeId: 2, chatMessage: user("the real ask") },
+      { nodeId: 4, parentNodeId: 3, chatMessage: assistant("sure") },
+    ])
+    const convo = readDevinConversation(db, { sessionId: "calm-otter" })
+    expect(convo.firstUserMessage).toBe("the real ask")
+    expect(convo.text).not.toContain("whats-new text that must not survive")
+    expect(convo.openedWithScaffolding).toBe(true)
+  })
+
   itSqlite("tool calls and results render capped like the Codex reader; thinking stays out", () => {
     const long = "x".repeat(2_000)
     const db = makeDevinDb([{ id: "bald-swordfish", mainChainId: 5 }], [

@@ -23,6 +23,7 @@ import { scrubSecrets, scrubTranscript, scrubValue } from "./scrub.js"
 import { readConversation } from "./transcript-claude.js"
 import type { Conversation } from "./transcript-claude.js"
 import { readDevinConversation } from "./transcript-devin.js"
+import { isInjectedUserText } from "./transcript-injected.js"
 import {
   FIRST_USER_CHARS,
   PART_CHARS,
@@ -33,56 +34,17 @@ import {
   readTranscriptLines,
 } from "./transcript-lines.js"
 
-// User-role messages Codex or Mida inject ahead of the real request — a kept
-// user message whose joined text opens with one of these is scaffolding, not
-// the human's words.
-const INJECTED_PREFIXES = [
-  "<environment_context>",
-  "<user_instructions>",
-  "<recommended_plugins>",
-  "<user_shell_command>",
-  "<turn_aborted>",
-  "# AGENTS.md instructions",
-  "<INSTRUCTIONS>",
-  "MIDA HANDOFF",
-  // the header grew a parenthetical in in-8 — matching on the shared stem keeps the older and
-  // the newer note both recognised as Mida's own injection
-  "Mida update since you last checked",
-]
+// The injected-prefix and Mida-hook lists this reader filters on live in
+// transcript-injected.ts, shared with the Devin reader — isInjectedUserText is
+// imported above.
 
-// Mida's own hook and MCP output lands in a Codex rollout as user-role text
-// opening "Mida: ". Only the shapes Mida itself prints are skipped — a human
-// prompt that happens to start "Mida:" is kept.
-const MIDA_HOOK_PATTERNS = [
-  /^Mida: could not load context\b/,
-  /^Mida: handoff loaded\b/,
-  /^Mida: connected\b/,
-  /^Mida: nothing new\b/,
-  /^Mida: no context available\b/,
-  /^Mida: no agent\b/,
-  /^Mida: the approved-projects list\b/,
-  /^Mida: updates? from\b/,
-  /^Mida: \S+ has no access to this project\b/,
-  /^Mida: \S+ is not approved for this project\b/,
-  /^Mida: \S+'s access was revoked\b/,
-  /^Mida: \S+'s identity in this Mida home\b/,
-]
-
-// Codex injects whole <tag>…</tag> blocks as user messages (the prefix list
-// above names the ones seen so far). A complete tagged block can never be the
+// Codex injects whole <tag>…</tag> blocks as user messages (the shared prefix
+// list names the ones seen so far). A complete tagged block can never be the
 // REQUEST — the human's ask does not arrive as one matched tag pair — so an
 // unknown tag fails closed on the pick (G9). It still RENDERS, though: a
 // prompt the human wrote as a tag is still a prompt, and dropping it would
 // hide real words from the model.
 const TAG_BLOCK = /^<[A-Za-z][A-Za-z0-9_-]*>[\s\S]*<\/[A-Za-z][A-Za-z0-9_-]*>$/
-
-// Named Codex/Mida scaffolding only — these user texts leave the conversation
-// entirely; everything else renders.
-function isInjectedUserText(text: string): boolean {
-  const t = text.trim()
-  if (INJECTED_PREFIXES.some((pre) => t.startsWith(pre))) return true
-  return MIDA_HOOK_PATTERNS.some((re) => re.test(t))
-}
 
 // One whole <x>…</x> block, same tag at both ends: not the request, but kept.
 function isWholeTagBlock(text: string): boolean {

@@ -15,6 +15,7 @@ import { createRequire } from "node:module"
 import { scrubSecrets, scrubValue } from "./scrub.js"
 import { cutSummary } from "./transcript-claude.js"
 import type { Conversation } from "./transcript-claude.js"
+import { isInjectedUserText } from "./transcript-injected.js"
 import { FIRST_USER_CHARS, PART_CHARS, cut, fitMessages, hardCut } from "./transcript-lines.js"
 
 /**
@@ -444,13 +445,20 @@ export function readDevinConversation(
 
   // The original request: the first is_user_input user message of the chain the
   // links ended on — kept verbatim across compactions like the Claude reader's
-  // originalRequest.
+  // originalRequest. Mida's own injected text never qualifies: Devin can store
+  // a hook's handoff or whats-new note AS is_user_input, and letting it pin
+  // would make Mida's words "the request" and save them again (in-10 R-13) —
+  // the check runs on the text, so the flag cannot rescue it.
   let earliestRequest: string | null = null
   let earliestRequestNode: DevinNodeRow | null = null
   let openedWithScaffolding = false
   for (const n of requestChain) {
     const msg = parseMessage(n.chatMessage)
     if (msg?.role !== "user") continue
+    if (typeof msg.content === "string" && isInjectedUserText(msg.content)) {
+      openedWithScaffolding = true // Mida's own injection sat before the owner's words
+      continue
+    }
     if (isUserInput(msg)) {
       if (typeof msg.content === "string" && msg.content !== "") {
         earliestRequest = msg.content
@@ -476,6 +484,9 @@ export function readDevinConversation(
     if (msg === null || msg.role === "system") continue
     const label = String(n.nodeId)
     if (msg.role === "user") {
+      // Mida's own injected text leaves the conversation entirely, whatever
+      // is_user_input says — it is not the owner and not even bookkeeping
+      if (typeof msg.content === "string" && isInjectedUserText(msg.content)) continue
       messagesTotal++
       if (!isUserInput(msg)) continue // system-injected: bookkeeping, not the owner
       if (typeof msg.content !== "string" || msg.content === "") continue
