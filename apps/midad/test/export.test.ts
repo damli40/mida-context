@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest"
 import { spawn } from "node:child_process"
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { hostname, tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { HttpRequestError, keccak256, zeroHash } from "viem"
@@ -1164,7 +1164,7 @@ describe("mida export — an interrupted or left-behind staging folder", () => {
     mkdirSync(join(leftover, "encrypted"), { recursive: true })
     writeFileSync(
       join(leftover, ".mida-export-staging"),
-      JSON.stringify({ dest: join(cwd, "backup"), pid: 2 ** 30, startedAt: "2026-09-25T00:00:00.000Z" }),
+      JSON.stringify({ dest: join(cwd, "backup"), pid: 2 ** 30, host: hostname(), pidStarted: "the dead writer's start", startedAt: "2026-09-25T00:00:00.000Z" }),
     )
     writeFileSync(join(leftover, "records.json"), "{\"never-finished\":true}")
     const { lines, print } = collect()
@@ -1192,7 +1192,7 @@ describe("mida export — an interrupted or left-behind staging folder", () => {
     mkdirSync(leftover)
     writeFileSync(
       join(leftover, ".mida-export-staging"),
-      JSON.stringify({ dest: join(cwd, "backup"), pid: 2 ** 30, startedAt: "2026-09-25T00:00:00.000Z" }),
+      JSON.stringify({ dest: join(cwd, "backup"), pid: 2 ** 30, host: hostname(), pidStarted: "the dead writer's start", startedAt: "2026-09-25T00:00:00.000Z" }),
     )
     writeFileSync(join(leftover, "records.json"), "{\"never-finished\":true}")
     const { lines, print } = collect()
@@ -1220,7 +1220,7 @@ describe("mida export — an interrupted or left-behind staging folder", () => {
     mkdirSync(victim)
     writeFileSync(
       join(victim, ".mida-export-staging"),
-      JSON.stringify({ dest: join(cwd, "backup"), pid: 2 ** 30, startedAt: "2026-09-25T00:00:00.000Z" }),
+      JSON.stringify({ dest: join(cwd, "backup"), pid: 2 ** 30, host: hostname(), pidStarted: "the dead writer's start", startedAt: "2026-09-25T00:00:00.000Z" }),
     )
     writeFileSync(join(victim, "keep.txt"), "important")
     symlinkSync(victim, join(cwd, "backup.partial-cafebabe0000"))
@@ -1240,17 +1240,18 @@ describe("mida export — an interrupted or left-behind staging folder", () => {
     expect(lines.every((line) => !line.includes("partial"))).toBe(true)
   })
 
-  it("a .partial-* whose marker names a LIVE pid is left alone — another export is writing it", async () => {
+  it("a .partial-* whose marker names a LIVE pid on a DIFFERENT destination is kept and named", async () => {
     // Concurrency: the sweep must never delete a folder whose writer is still running —
-    // named for THIS export's destination so the old sweep would have removed it outright.
-    // process.pid is the only live pid this test can rely on.
+    // the marker's dest names THIS export's folder, so it is swept on the parent's scan, and
+    // a kept leftover holding plaintext is always announced. process.pid is the only live
+    // pid this test can rely on; the start-time lookup is injected to match the marker.
     const home = ownerHome()
     const cwd = tempDir()
     const live = join(cwd, "backup2.partial-0ffee0ffee00")
     mkdirSync(live)
     writeFileSync(
       join(live, ".mida-export-staging"),
-      JSON.stringify({ dest: join(cwd, "backup"), pid: process.pid, startedAt: new Date().toISOString() }),
+      JSON.stringify({ dest: join(cwd, "backup"), pid: process.pid, host: hostname(), pidStarted: "the writer's start", startedAt: new Date().toISOString() }),
     )
     const { lines, print } = collect()
     const result = await exportRecords({
@@ -1261,23 +1262,33 @@ describe("mida export — an interrupted or left-behind staging folder", () => {
       print,
       openRuntime: async () => fakeRuntime(home),
       readUniverse: async () => [fixtureRecord()],
+      sweep: { pidStarted: () => "the writer's start" },
     })
     expect(result.outcome).toBe("exported")
     expect(existsSync(join(live, ".mida-export-staging"))).toBe(true)
-    expect(lines.every((line) => !line.includes("leftover"))).toBe(true)
+    expect(lines.some((line) => line.includes("backup2.partial-0ffee0ffee00") && line.includes("kept"))).toBe(true)
   })
 
   it("a .partial-* whose marker is not the JSON shape is left alone — and nothing is reported", async () => {
     const home = ownerHome()
     const cwd = tempDir()
-    for (const content of ["staged\n", "{not json", JSON.stringify({ pid: "oops" }), JSON.stringify({ dest: "/x", pid: -1 })]) {
+    // The last shape is a marker a pre-G-2 export wrote — no host, no process start time.
+    // It cannot prove whose writer it names, so it is not this build's marker to act on:
+    // kept, silently, like every other unparseable one.
+    for (const content of [
+      "staged\n",
+      "{not json",
+      JSON.stringify({ pid: "oops" }),
+      JSON.stringify({ dest: "/x", pid: -1 }),
+      JSON.stringify({ dest: "/x", pid: 2 ** 30, startedAt: "2026-09-25T00:00:00.000Z" }),
+    ]) {
       const leftover = join(cwd, `backup.partial-${Math.random().toString(16).slice(2, 14).padStart(12, "0")}`)
       mkdirSync(leftover)
       writeFileSync(join(leftover, ".mida-export-staging"), content)
     }
     const { lines, print } = collect()
     const before = readdirSync(cwd).filter((name) => name.includes(".partial-")).length
-    expect(before).toBe(4)
+    expect(before).toBe(5)
     const result = await exportRecords({
       home,
       network,
@@ -1288,8 +1299,91 @@ describe("mida export — an interrupted or left-behind staging folder", () => {
       readUniverse: async () => [fixtureRecord()],
     })
     expect(result.outcome).toBe("exported")
-    expect(readdirSync(cwd).filter((name) => name.includes(".partial-"))).toHaveLength(4)
+    expect(readdirSync(cwd).filter((name) => name.includes(".partial-"))).toHaveLength(5)
     expect(lines.every((line) => !line.includes("leftover"))).toBe(true)
+  })
+
+  // ex-4 G-2 — a pid alone cannot prove a writer alive: the marker now records the host and
+  // the writer process's own start time (`ps -o lstart=`), so a REUSED pid does not protect a
+  // dead writer's plaintext, and a marker naming another machine is never deleted.
+  it("a leftover whose marker pid was REUSED is removed — the start time does not match", async () => {
+    const home = ownerHome()
+    const cwd = tempDir()
+    const leftover = join(cwd, "backup.partial-abc123abc123")
+    mkdirSync(leftover)
+    // process.pid is alive — but the marker's recorded start time belongs to the dead writer
+    // that used to hold this pid; the process carrying the number now is not the exporter.
+    writeFileSync(
+      join(leftover, ".mida-export-staging"),
+      JSON.stringify({ dest: join(cwd, "backup"), pid: process.pid, host: hostname(), pidStarted: "the dead writer's start", startedAt: "2026-09-25T00:00:00.000Z" }),
+    )
+    const { lines, print } = collect()
+    const result = await exportRecords({
+      home,
+      network,
+      folder: join(cwd, "backup"),
+      cwd,
+      print,
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [fixtureRecord()],
+      sweep: { pidStarted: (pid) => (pid === process.pid ? "this very process" : undefined) },
+    })
+    expect(result.outcome).toBe("exported")
+    expect(existsSync(leftover)).toBe(false)
+    expect(lines.some((line) => line.includes("backup.partial-abc123abc123") && line.includes("leftover"))).toBe(true)
+  })
+
+  it("a leftover whose marker names ANOTHER MACHINE is kept and named — never deleted", async () => {
+    // A shared or synced folder can hold a staging directory a still-running export on a
+    // different host owns — its dead-looking local pid means nothing across machines.
+    const home = ownerHome()
+    const cwd = tempDir()
+    const leftover = join(cwd, "backup.partial-baadf00d1234")
+    mkdirSync(leftover)
+    writeFileSync(
+      join(leftover, ".mida-export-staging"),
+      JSON.stringify({ dest: join(cwd, "backup"), pid: 2 ** 30, host: "dami-laptop", pidStarted: "its writer's start", startedAt: "2026-09-25T00:00:00.000Z" }),
+    )
+    writeFileSync(join(leftover, "records.json"), "{\"still-writing\":true}")
+    const { lines, print } = collect()
+    const result = await exportRecords({
+      home,
+      network,
+      folder: join(cwd, "backup"),
+      cwd,
+      print,
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [fixtureRecord()],
+    })
+    expect(result.outcome).toBe("exported")
+    expect(existsSync(join(leftover, "records.json"))).toBe(true)
+    expect(lines.some((line) => line.includes("backup.partial-baadf00d1234") && line.includes("dami-laptop"))).toBe(true)
+  })
+
+  it("a leftover whose writer is TRULY LIVE — same machine, pid alive, same start time — is kept and named", async () => {
+    const home = ownerHome()
+    const cwd = tempDir()
+    const live = join(cwd, "backup.partial-0ffee0ffee00")
+    mkdirSync(live)
+    writeFileSync(
+      join(live, ".mida-export-staging"),
+      JSON.stringify({ dest: join(cwd, "backup"), pid: process.pid, host: hostname(), pidStarted: "the writer's start", startedAt: new Date().toISOString() }),
+    )
+    const { lines, print } = collect()
+    const result = await exportRecords({
+      home,
+      network,
+      folder: join(cwd, "backup2"),
+      cwd,
+      print,
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [fixtureRecord()],
+      sweep: { pidStarted: (pid) => (pid === process.pid ? "the writer's start" : undefined) },
+    })
+    expect(result.outcome).toBe("exported")
+    expect(existsSync(join(live, ".mida-export-staging"))).toBe(true)
+    // kept leftovers are NAMED on the output — plaintext the sweep refuses to touch is never silent
+    expect(lines.some((line) => line.includes("backup.partial-0ffee0ffee00"))).toBe(true)
   })
 
   it("a look-alike .partial-* folder WITHOUT the staging marker is left alone", async () => {

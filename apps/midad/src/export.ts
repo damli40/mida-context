@@ -1,5 +1,7 @@
 import { randomBytes } from "node:crypto"
+import { execFileSync } from "node:child_process"
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeSync } from "node:fs"
+import { hostname } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { zeroHash } from "viem"
 import { CONTEXT_KIND, OWNER_AUTHOR_ID, PROVENANCE_SOURCE, RECORD_TYPE, canonicalBytes } from "@mida/protocol"
@@ -33,8 +35,10 @@ import type { CheckpointEnvelope } from "./checkpoint-payload.js"
  * folder `<folder>.partial-<random>` holds plaintext for the duration of the write, so it is
  * deleted on every path out: a rejected promise runs the catch, Ctrl-C (SIGINT, SIGTERM, SIGHUP)
  * runs a synchronous process-level cleanup, and a kill -9 or power cut is covered by the JSON
- * marker file — the next export into the same parent removes every stale `.partial-*` sibling
- * whose writer is dead before writing. The rename to <folder> happens once, at the end.
+ * marker file — it names the writer's host, pid and that process's start time, so the next
+ * export into the same parent removes only `.partial-*` siblings whose writer is provably
+ * gone: a live writer (same machine, same pid, same start time) is kept and named, and so is
+ * anything staged on another machine. The rename to <folder> happens once, at the end.
  */
 
 export type ExportResult =
@@ -72,6 +76,11 @@ export interface ExportDeps {
     toBlock: bigint,
     afterHead: Set<Hex>,
   ) => Promise<SourceRecord[]>
+  /**
+   * Test seam: the host/process facts the leftover sweep decides on — production uses
+   * os.hostname(), kill(pid, 0) and `ps -o lstart= -p <pid>`. See SweepProbes.
+   */
+  sweep?: SweepProbes
   /** Test seam: stop the export right after this step, as if the write had failed there. */
   stopAfter?: "staged" | "files"
 }
@@ -151,13 +160,19 @@ const PARTIAL_SUFFIX = /\.partial-[0-9a-f]{12}$/
 
 /**
  * The marker written FIRST inside every staging folder: JSON naming the destination, the
- * writer's pid and the start time. The sweep below deletes a leftover only when this parses —
- * and only when the pid it names is dead: a live pid means another export is staging right
- * now, and its half-written folder is not this run's to take.
+ * writer's pid, the machine it runs on (`host`) and that process's own start time
+ * (`pidStarted` — the `ps -o lstart=` string). The sweep below deletes a leftover only when
+ * this parses AND its writer is provably gone: the marker's host must be this machine, and
+ * its pid must be dead or running under a different start time — a pid alive with the
+ * recorded start time IS the writer, still working; a pid alive with another start time is a
+ * stranger that inherited the dead writer's number. A marker a previous format wrote — no
+ * host, no start time — never parses as this shape, so its folder is never swept by mistake.
  */
 interface StagingMarker {
   dest: string
   pid: number
+  host: string
+  pidStarted: string
   startedAt: string
 }
 
@@ -165,8 +180,12 @@ function readStagingMarker(dir: string): StagingMarker | undefined {
   try {
     const marker: unknown = JSON.parse(readFileSync(join(dir, STAGING_MARKER), "utf8"))
     if (typeof marker !== "object" || marker === null) return undefined
-    const { dest, pid, startedAt } = marker as { dest?: unknown; pid?: unknown; startedAt?: unknown }
+    const { dest, pid, host, pidStarted, startedAt } = marker as {
+      dest?: unknown; pid?: unknown; host?: unknown; pidStarted?: unknown; startedAt?: unknown
+    }
     if (typeof dest !== "string" || typeof startedAt !== "string") return undefined
+    if (typeof host !== "string" || host === "") return undefined
+    if (typeof pidStarted !== "string" || pidStarted === "") return undefined
     // Only a positive integer may reach process.kill — anything else is not a marker we wrote.
     if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return undefined
     return marker as StagingMarker
@@ -186,6 +205,32 @@ function processAlive(pid: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM"
   }
+}
+
+/**
+ * `ps -o lstart= -p <pid>` — the start time of the process that pid currently names, as one
+ * comparable string. Pids get reused, so "pid is alive" alone cannot prove a staging writer
+ * still runs; equality between this answer and the marker's `pidStarted` is the proof.
+ * undefined means the lookup failed — never proof of death.
+ */
+function pidStartedAt(pid: number): string | undefined {
+  try {
+    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" }).trim()
+    return out === "" ? undefined : out
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The host/process facts the sweep decides on — injectable so tests never depend on the real
+ * process table. `pidStarted` answering undefined means "cannot check": a leftover that cannot
+ * be proven dead is kept, never deleted on a guess.
+ */
+export interface SweepProbes {
+  host?: string
+  pidAlive?: (pid: number) => boolean
+  pidStarted?: (pid: number) => string | undefined
 }
 
 /**
@@ -238,11 +283,19 @@ function unwatchStaging(dir: string): void {
  * behind — a kill -9 or a power cut can never run that process's own cleanup, so the next run
  * removes them before writing. Each candidate must survive three checks before deletion:
  * lstat says it is a real directory (a symlink — even one whose target holds a marker — and
- * every non-directory stay untouched), the JSON marker parses, and the marker's pid is dead.
- * One printed line per folder actually removed — nothing is ever reported that was not
- * removed.
+ * every non-directory stay untouched), the JSON marker parses, and the marker's writer is
+ * provably gone — the marker's `host` must be this machine (a folder staged on another host
+ * is never this run's to delete, however dead its pid looks here), and its pid must either be
+ * dead or alive under a DIFFERENT start time than the marker recorded (a reused pid is a
+ * stranger, not the writer). A pid alive with the recorded start is a live export mid-write.
+ * Every folder the sweep decides is not safe to remove — another host's, a live writer's, one
+ * whose writer cannot be checked — is kept AND named in one printed line; every folder
+ * removed is printed too. Nothing is ever silent while it still holds plaintext.
  */
-function sweepLeftoverStaging(dest: string, print: (line: string) => void): void {
+function sweepLeftoverStaging(dest: string, print: (line: string) => void, probes: SweepProbes = {}): void {
+  const host = probes.host ?? hostname()
+  const pidAlive = probes.pidAlive ?? processAlive
+  const pidStarted = probes.pidStarted ?? pidStartedAt
   const parent = dirname(dest)
   let names: string[]
   try {
@@ -257,7 +310,24 @@ function sweepLeftoverStaging(dest: string, print: (line: string) => void): void
       const info = lstatSync(dir)
       if (info.isSymbolicLink() || !info.isDirectory()) continue
       const marker = readStagingMarker(dir)
-      if (marker === undefined || processAlive(marker.pid)) continue
+      if (marker === undefined) continue
+      if (marker.host !== host) {
+        print(`kept a leftover half-written export: ${name} — its marker names ${marker.host}, not this machine`)
+        continue
+      }
+      if (pidAlive(marker.pid)) {
+        const started = pidStarted(marker.pid)
+        if (started === undefined) {
+          print(`kept a leftover half-written export: ${name} — pid ${marker.pid} is alive but its start time could not be checked`)
+          continue
+        }
+        if (started === marker.pidStarted) {
+          print(`kept a leftover half-written export: ${name} — pid ${marker.pid} is still writing it`)
+          continue
+        }
+        // The pid is alive but started at a different time than the marker's writer: the
+        // writer is dead and a stranger owns the number now — the leftover is ours to remove.
+      }
       rmSync(dir, { recursive: true, force: true })
       print(`removed a leftover half-written export: ${name} — it held plaintext`)
     } catch {
@@ -635,7 +705,9 @@ Mida; the readable files are what this machine decrypted from them.
 
 The folder is written in one move: everything is staged in a sibling \`…​.partial-…​\` folder and
 renamed into place at the end — if an export is interrupted by a crash or power loss, the next
-export into the same parent folder removes the leftover.
+export into the same parent folder removes the leftover, but only once its writer is provably
+gone: the staging marker records the writer's machine, pid and that process's start time, so a
+leftover still being written — on this machine or another — is kept and named instead.
 
 ## What is inside
 
@@ -775,8 +847,9 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
 
   // A kill -9 or a power cut can never run the cleanup below — the next export that reaches this
   // point removes every stale half-written `.partial-*` sibling first. Only real folders carrying
-  // our marker with a dead writer are touched — symlinks, look-alikes and live exports stay.
-  sweepLeftoverStaging(dest, deps.print)
+  // our marker with a provably-gone writer are touched — symlinks, look-alikes, live exports and
+  // other machines' staging stay, and a kept leftover is named on the output.
+  sweepLeftoverStaging(dest, deps.print, deps.sweep)
 
   const runtime = await (deps.openRuntime ?? ((h, n) => Runtime.open(h, n, undefined, "load-only")))(home, network)
   try {
@@ -828,11 +901,21 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
     // Set false only if the post-rename parent fsync fails — reported as a warning below.
     let parentFlushed = true
     // FIRST file: the marker proves a leftover is a half-written Mida export — JSON naming the
-    // destination, this pid and the start time, so the next run's sweep removes a leftover
-    // only when the writer is dead, never a live export's working folder. And while the folder
-    // exists, a signal must delete it before the process exits — Ctrl-C mid-write must not
-    // leave plaintext.
-    write0600(join(temp, STAGING_MARKER), `${JSON.stringify({ dest, pid: process.pid, startedAt: exportedAt })}\n`)
+    // destination, this host, this pid and THIS PROCESS's start time, so the next run's sweep
+    // removes a leftover only when the writer is provably gone — never a live export's working
+    // folder, never a pid a dead writer used to hold, never another machine's staging. And
+    // while the folder exists, a signal must delete it before the process exits — Ctrl-C
+    // mid-write must not leave plaintext.
+    write0600(
+      join(temp, STAGING_MARKER),
+      `${JSON.stringify({
+        dest,
+        pid: process.pid,
+        host: deps.sweep?.host ?? hostname(),
+        pidStarted: deps.sweep?.pidStarted?.(process.pid) ?? pidStartedAt(process.pid) ?? "",
+        startedAt: exportedAt,
+      })}\n`,
+    )
     watchStaging(temp)
     try {
       if (deps.stopAfter === "staged") throw codedError("export-stopped", `the export stopped after staging ${temp}`)
