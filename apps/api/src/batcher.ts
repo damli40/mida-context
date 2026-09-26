@@ -306,7 +306,9 @@ export interface BatcherOptions {
    * deny overlay is the only thing that knows a revoke is pending on Monad, and the contract
    * cannot see it. Held rows are re-checked each run: still denied → keep holding; no deny and no
    * live authority → REJECTED with the reason the contract would have given; deny cleared and
-   * authority live → back to QUEUED and sent. Absent, the batcher submits exactly as before.
+   * authority live → back to QUEUED and sent. A check that cannot complete parks the row back
+   * in QUEUED (in-11 R-9) — only an affirmative verdict may hold it. Absent, the batcher
+   * submits exactly as before.
    */
   gate?: BatchRowGate
 }
@@ -472,18 +474,53 @@ export class Batcher {
   }
 
   /**
+   * One gate check per distinct question in a pass (in-11 R-9): rows identical on every field
+   * the verdict can read — owner / signer / namespace / parent / rootAuthor — ask the same
+   * thing, so their verdicts share one promise. The key is finer than (owner, signer) on
+   * purpose: an owner denied on one capability must never lend its "hold" to a row in another
+   * namespace, and a supersede's answer depends on which parent's author it is. A rejected
+   * check is evicted, never served twice: a failed check is not an answer.
+   */
+  #gateCheck(row: BatchSaveRow, cache: Map<string, Promise<BatchGateVerdict>>): Promise<BatchGateVerdict> {
+    const gate = this.#gate
+    if (gate === undefined) return Promise.resolve("send")
+    const message = row.save.message
+    const key = [
+      row.owner,
+      row.signer,
+      row.namespaceId,
+      message.parentId,
+      message.rootAuthor,
+    ]
+      .map((part) => part.toLowerCase())
+      .join("|")
+    const cached = cache.get(key)
+    if (cached !== undefined) return cached
+    const pending = gate.check(row)
+    cache.set(key, pending)
+    pending.catch(() => {
+      if (cache.get(key) === pending) cache.delete(key)
+    })
+    return pending
+  }
+
+  /**
    * The per-tick held-row re-check (in-3 I5). One verdict per row, straight from the gate:
    * still denied → stays HELD; no deny and no live authority → REJECTED with NO_AUTHORITY, the
    * same name the contract reports; deny cleared with authority live → back to QUEUED, eligible
-   * for this run's take. A gate error holds the row — a failed check is never a send.
+   * for this run's take. A failed check is not an affirmative deny — the row releases to QUEUED
+   * (in-11 R-9), so an honest save never sits under the "denied or unauthorized" marker on a
+   * verdict the gate never gave; the next take re-checks it before it can be sent.
    */
   async #recheckHeld(): Promise<void> {
     if (this.#gate === undefined) return
+    const cache = new Map<string, Promise<BatchGateVerdict>>()
     for (const row of await this.#store.listHeld()) {
       let verdict: BatchGateVerdict
       try {
-        verdict = await this.#gate.check(row)
+        verdict = await this.#gateCheck(row, cache)
       } catch (error) {
+        await this.#store.releaseHeld(row.contextId)
         this.#log?.({ event: "batch.hold-check-failed", contextId: row.contextId, error: String(error) })
         continue
       }
@@ -601,16 +638,20 @@ export class Batcher {
     // the row in HELD — the revoke is still pending on Monad and may yet land or be cancelled,
     // so neither anchor nor death is the right answer — and #recheckHeld gives it a fresh verdict
     // every run. "reject" marks it NO_AUTHORITY, the name the contract would report. A gate that
-    // cannot answer is never a send: the row is held and the next run asks again.
+    // cannot answer is never a send — but it is also never a hold (in-11 R-9): only an
+    // affirmative deny/no-authority answer may park a save, so a failed check returns the row
+    // to QUEUED and the next take asks again.
     const send: BatchSaveRow[] = []
+    const gateCache = new Map<string, Promise<BatchGateVerdict>>()
     for (const row of taken) {
       if (this.#gate !== undefined) {
         let verdict: BatchGateVerdict
         try {
-          verdict = await this.#gate.check(row)
+          verdict = await this.#gateCheck(row, gateCache)
         } catch (error) {
+          await this.#store.requeueRow(row.contextId)
           this.#log?.({ event: "batch.gate-check-failed", contextId: row.contextId, error: String(error) })
-          verdict = "hold"
+          continue
         }
         if (verdict === "hold") {
           try {

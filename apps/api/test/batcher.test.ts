@@ -107,8 +107,8 @@ const leafOf = (meta: SaveMeta): Hex =>
 function queueRow(wire: BatchedSaveWire, contextId: Hex, receivedAt: number): BatchSaveRow {
   return {
     contextId,
-    owner: OWNER,
-    namespaceId: NAMESPACE,
+    owner: wire.message.owner.toLowerCase() as Address,
+    namespaceId: wire.message.namespaceId.toLowerCase() as Hex,
     signer: SIGNER,
     save: wire,
     state: "QUEUED",
@@ -1579,7 +1579,10 @@ describe("the batcher", () => {
       }
     }
     const store = new HoldFailsStore()
-    const parked = makeSave()
+    // A different namespace puts the two rows in different gate-question groups (in-11 R-9
+    // memoizes verdicts by owner/signer/namespace/parent/rootAuthor), so the fake's per-row
+    // verdicts stay honest.
+    const parked = makeSave({ namespaceId: namespaceId("goals.school") })
     const clean = makeSave()
     const rig = makeRig({
       store,
@@ -1598,6 +1601,68 @@ describe("the batcher", () => {
     // SUBMITTED under a batchId the journal no longer names.
     expect((await store.get(parked.meta.contextId))!.state).toBe("QUEUED")
     expect(rig.events.some((event) => event.event === "batch.hold-failed")).toBe(true)
+  })
+
+  it("a gate check that cannot complete leaves the row QUEUED — only an affirmative answer may hold (in-11 R-9)", async () => {
+    // A failed check (read budget spent, RPC busy) is not a deny: the row stays in the queue and
+    // the next take asks again. Before R-9 it was HELD — the owner saw "denied or unauthorized"
+    // for a save that was merely unchecked.
+    const flaky = makeSave()
+    const clean = makeSave()
+    const rig = makeRig({
+      gate: {
+        check: async (row) => {
+          if (row.contextId.toLowerCase() === flaky.meta.contextId.toLowerCase()) throw new Error("CHAIN_READ_BUDGET_EXHAUSTED")
+          return "send"
+        },
+      },
+    })
+    await rig.enqueue(flaky.wire, flaky.meta.contextId)
+    await rig.enqueue(clean.wire, clean.meta.contextId)
+
+    const outcome = await rig.batcher.run()
+    expect(outcome).not.toBeNull()
+    expect((await rig.store.get(clean.meta.contextId))!.state).toBe("ANCHORED")
+    expect((await rig.store.get(flaky.meta.contextId))!.state).toBe("QUEUED")
+    expect(await rig.store.listHeld()).toHaveLength(0)
+    expect(rig.events.some((event) => event.event === "batch.gate-check-failed")).toBe(true)
+  })
+
+  it("rows identical on owner, signer, namespace and write-shape share one gate check per take (in-11 R-9)", async () => {
+    let checks = 0
+    const rig = makeRig({
+      gate: {
+        check: async () => {
+          checks += 1
+          return "send"
+        },
+      },
+    })
+    for (let i = 0; i < 5; i++) {
+      const { wire, meta } = makeSave()
+      await rig.enqueue(wire, meta.contextId)
+    }
+    await rig.batcher.run()
+    expect(rig.chain.submissions[0]!.count).toBe(5)
+    expect(checks).toBe(1)
+  })
+
+  it("a held row whose re-check cannot run releases to QUEUED rather than sitting under a deny it never earned (in-11 R-9)", async () => {
+    const { wire, meta } = makeSave()
+    const store = new MemoryBatchStore()
+    await store.insert({ ...queueRow(wire, meta.contextId, 0), state: "HELD" })
+    const rig = makeRig({
+      store,
+      gate: {
+        check: async () => {
+          throw new Error("CHAIN_READ_BUDGET_EXHAUSTED")
+        },
+      },
+    })
+    await rig.batcher.run()
+    expect((await store.get(meta.contextId))!.state).toBe("QUEUED")
+    expect(rig.chain.submissions).toHaveLength(0)
+    expect(rig.events.some((event) => event.event === "batch.hold-check-failed")).toBe(true)
   })
 
   it("resolve() on a batchId the chain never saw refuses with NOT_FOUND", async () => {

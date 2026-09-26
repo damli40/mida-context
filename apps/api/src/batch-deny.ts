@@ -12,6 +12,11 @@
 // row must survive a cancellation. The authority computation is the exact one POST /batch/saves
 // admission runs (batch-routes.ts), so a row's release answer is the answer the contract would
 // give it on-chain.
+//
+// in-11 R-9: the check opens on the overlay's LOCAL list, not the chain — an owner with no active
+// intent answers "send" without a single Monad read, and the contract remains the authority
+// decider it always was. The chain work below only ever runs for an owner a pending deny could
+// actually cover.
 
 import { zeroHash } from "viem"
 import { PERMISSION, PROVENANCE_POLICY } from "@mida/protocol"
@@ -23,6 +28,11 @@ import type { DenyOverlay } from "./deny-overlay.js"
 export type BatchGateVerdict = "send" | "hold" | "reject"
 
 export interface BatchRowGate {
+  /**
+   * One row's verdict. The batcher memoizes calls within a pass keyed on the fields a verdict
+   * may read — owner, signer, namespaceId, save.message.parentId, save.message.rootAuthor — so
+   * an implementation must not answer from anything else (in-11 R-9).
+   */
   check(row: BatchSaveRow): Promise<BatchGateVerdict>
 }
 
@@ -35,6 +45,15 @@ export function createBatchDenyGate(input: { reader: RegistryReader; overlay: De
   const { reader, overlay } = input
   return {
     async check(row: BatchSaveRow): Promise<BatchGateVerdict> {
+      // The gate exists for the pending-deny window only: with no active intent for this owner
+      // the overlay holds nothing that could hold the row, and Monad itself decides authority
+      // on submit — spending chain reads here would only burn the hosted invocation's bounded
+      // read budget on rows that were never in doubt (in-11 R-9). A deny for another owner is
+      // equally out of scope.
+      const ownerDenied = (await overlay.list()).some(
+        (intent) => intent.state === "active" && intent.owner === row.owner.toLowerCase(),
+      )
+      if (!ownerDenied) return "send"
       const agentId = await reader.agentIdOfSigner(row.signer)
       // The signer no longer resolves to an agent — the contract derives its author the same way,
       // so this save could only ever come back rejected; refusing to send is the same answer.
