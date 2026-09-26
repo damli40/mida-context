@@ -482,6 +482,68 @@ describe("saveCheckpoint — the batched lane", () => {
     expect(result.laneWhy).toBeUndefined()
     expect(result.batched).toBeUndefined()
   })
+
+  // in-14 F-3: the store can hold the save already (an earlier POST landed, its answer died
+  // on the wire) — it answers ALREADY_QUEUED with the id it holds. That is a queued save,
+  // not an error: the drain records the ledgers under that id and never posts it again.
+  it("a store already holding the save answers ALREADY_QUEUED with its id — queued, ledgers written, never re-posted", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      let posts = 0
+      const agent = {
+        findDuplicate: async () => undefined,
+        createBatched: async () => {
+          posts += 1
+          const error = new MidaError("ALREADY_QUEUED" as never, "the store already holds this save")
+          ;(error as { contextId?: Hex }).contextId = CONTEXT_ID
+          throw error
+        },
+        create: async () => {
+          throw new Error("unreachable")
+        },
+      }
+      const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
+      const result = await saveCheckpoint(runtime, "claude-code", saveInput)
+      expect(result).toMatchObject({ contextId: CONTEXT_ID, transactionHash: null, duplicate: false, lane: "batched" })
+      expect(result.batched).toMatchObject({ state: "QUEUED" })
+      // the ledgers own the save under the id the store holds — plaintext kept for resubmits
+      expect(pendingAnchors(home)).toEqual([
+        expect.objectContaining({ contextId: CONTEXT_ID, eventId: EVENT_ID, sessionId: SESSION_ID, agent: "claude-code", state: "QUEUED" }),
+      ])
+      expect(pendingPlaintext(home, CONTEXT_ID)).toBeDefined()
+      expect((home.readJson<Record<string, string>>("state/saved-ids.json") ?? {})[EVENT_ID]).toBe(CONTEXT_ID)
+      // and the drain asking again for the same eventId answers duplicate — never a second POST
+      const again = await saveCheckpoint(runtime, "claude-code", saveInput)
+      expect(again.duplicate).toBe(true)
+      expect(again.contextId).toBe(CONTEXT_ID)
+      expect(posts).toBe(1)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("ALREADY_QUEUED carrying no id cannot be followed — the save surfaces as an error, nothing written", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const agent = {
+        findDuplicate: async () => undefined,
+        createBatched: async () => {
+          throw new MidaError("ALREADY_QUEUED" as never, "no id to follow")
+        },
+        create: async () => {
+          throw new Error("unreachable")
+        },
+      }
+      const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
+      await expect(saveCheckpoint(runtime, "claude-code", saveInput)).rejects.toMatchObject({ code: "ALREADY_QUEUED" })
+      expect(pendingAnchors(home)).toHaveLength(0)
+      expect(pendingPlaintext(home, CONTEXT_ID)).toBeUndefined()
+    } finally {
+      await store.close()
+    }
+  })
 })
 
 describe("followPendingAnchors — the ledger's follow-up", () => {
@@ -842,6 +904,103 @@ describe("followPendingAnchors — the ledger's follow-up", () => {
         }
       })
     })
+
+    // in-14 F-3: BATCHING_DISABLED and OWNER_NOT_ALLOWED mean the batched lane itself is
+    // closed — to this owner or entirely. Re-POSTing the same bytes there once an hour can
+    // never land. The resubmit takes the DIRECT lane instead: the ordinary one-transaction
+    // save from the kept plaintext.
+    describe("a resubmission that meets a closed lane lands through the direct lane (in-14 F-3)", () => {
+      const DIRECT_ID = `0x${"e1".repeat(32)}` as Hex
+      const DIRECT_TX = `0x${"9a".repeat(32)}` as Hex
+
+      const directResubmitRuntime = (store: Awaited<ReturnType<typeof stubStore>>, home: MidaHome, over: { thrown: () => unknown; create?: (input: unknown) => Promise<unknown> }) => {
+        const created: unknown[] = []
+        const runtime = {
+          ...fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url }),
+          agent: () => ({
+            createBatched: async () => {
+              throw over.thrown()
+            },
+            create: async (_owner: Address, _namespace: string, input: unknown) => {
+              created.push(input)
+              if (over.create !== undefined) return over.create(input)
+              return { contextId: DIRECT_ID, transactionHash: DIRECT_TX }
+            },
+          }),
+          reader: { hasAuthority: async () => true },
+        } as unknown as ServiceRuntime
+        return { runtime, created }
+      }
+
+      for (const code of ["BATCHING_DISABLED", "OWNER_NOT_ALLOWED"] as const) {
+        it(`a ${code} answer resubmits through the direct lane — the save lands, not stuck`, async () => {
+          const store = await stubStore()
+          try {
+            const home = await homeWithStaleRejected(store)
+            const { runtime, created } = directResubmitRuntime(store, home, { thrown: () => new MidaError(code as never, "the batched lane is closed") })
+            const logged: Record<string, unknown>[] = []
+            const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+            expect(counts).toEqual({ anchored: 1, rejected: 0, waiting: 0 })
+            // the kept createBatched input went to create — same envelope, kind, source, tags
+            expect(created).toEqual([{ value: { type: "mida-checkpoint" }, kind: "EPISODE", source: "AGENT_INFERRED", tags: [] }])
+            // the save is done: pending entry gone, plaintext spent, saved id is the new record's
+            expect(pendingAnchors(home)).toHaveLength(0)
+            expect(pendingPlaintext(home, CONTEXT_ID)).toBeUndefined()
+            expect(rejectedAnchors(home)).toHaveLength(0)
+            expect((home.readJson<Record<string, string>>("state/saved-ids.json") ?? {})[EVENT_ID]).toBe(DIRECT_ID)
+            expect(logged).toEqual([
+              expect.objectContaining({ outcome: "saved", lane: "direct", contextId: DIRECT_ID, previousContextId: CONTEXT_ID, transactionHash: DIRECT_TX }),
+            ])
+          } finally {
+            await store.close()
+          }
+        })
+      }
+
+      it("a direct-lane resubmit that cannot get an answer waits — nothing final recorded", async () => {
+        const store = await stubStore()
+        try {
+          const home = await homeWithStaleRejected(store)
+          const { runtime } = directResubmitRuntime(store, home, {
+            thrown: () => new MidaError("BATCHING_DISABLED" as never, "closed"),
+            create: async () => {
+              throw new TypeError("fetch failed")
+            },
+          })
+          const logged: Record<string, unknown>[] = []
+          const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+          expect(counts).toEqual({ anchored: 0, rejected: 0, waiting: 1 })
+          expect(pendingAnchors(home)).toEqual([expect.objectContaining({ contextId: CONTEXT_ID })])
+          expect(rejectedAnchors(home)).toHaveLength(0)
+          expect(pendingPlaintext(home, CONTEXT_ID)).toBeDefined()
+          expect(logged).toHaveLength(0)
+        } finally {
+          await store.close()
+        }
+      })
+
+      it("a direct-lane refusal on authority grounds is final — the save is judged, plaintext dropped", async () => {
+        const store = await stubStore()
+        try {
+          const home = await homeWithStaleRejected(store)
+          const { runtime } = directResubmitRuntime(store, home, {
+            thrown: () => new MidaError("OWNER_NOT_ALLOWED" as never, "closed"),
+            create: async () => {
+              throw new MidaError("CAPABILITY_DENIED" as never, "no live grant")
+            },
+          })
+          const logged: Record<string, unknown>[] = []
+          const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+          expect(counts).toEqual({ anchored: 0, rejected: 1, waiting: 0 })
+          expect(pendingAnchors(home)).toHaveLength(0)
+          expect(rejectedAnchors(home)).toEqual([expect.objectContaining({ contextId: CONTEXT_ID, reason: "BAD_EPOCH" })])
+          expect(pendingPlaintext(home, CONTEXT_ID)).toBeUndefined()
+          expect(logged).toEqual([expect.objectContaining({ outcome: "failed", reason: "batch-rejected:BAD_EPOCH" })])
+        } finally {
+          await store.close()
+        }
+      })
+    })
   })
 })
 
@@ -1033,7 +1192,12 @@ describe("doctor — the batching check", () => {
       stuckAt: "2026-09-24T11:00:00.000Z",
     })
     const lines = await doctorLines(home)
-    expect(lines).toContain("PROBLEM: a checkpoint save (cp-batched-1, session s1) cannot be resubmitted: the save does not fit in a batch — run `mida batching off` and save again; it retries once an hour meanwhile")
+    // in-14 F-3: a deterministic refusal can NEVER land — the line must say so, name where the
+    // save's text is kept on this laptop, and name it a bug to report. `mida batching off` is
+    // never the fix: the same bytes take the direct lane malformed too.
+    expect(lines).toContain(
+      `PROBLEM: a checkpoint save (cp-batched-1, session s1) cannot be resubmitted: the save does not fit in a batch — its text is kept on this laptop at ${home.path("state/batch-plaintext/" + CONTEXT_ID.toLowerCase() + ".json")} — the save can never land as it is; this is a bug to report; it retries once an hour meanwhile`,
+    )
     // it is not ALSO reported as silently pending or probed as a stuck batch
     expect(lines.every((line) => !line.includes("pending anchor"))).toBe(true)
     expect(lines.every((line) => !line.includes("waiting to anchor"))).toBe(true)
@@ -1055,6 +1219,34 @@ describe("doctor — the batching check", () => {
       expect(problem).toBeDefined()
       expect(problem).toContain(words)
       expect(problem).toContain("retries once an hour")
+    }
+  })
+
+  // in-14 F-3: the line's fix clause splits by what the code means. A closed LANE
+  // (BATCHING_DISABLED, OWNER_NOT_ALLOWED) heals itself — the resubmit goes out on the save's
+  // own transaction. A save the store judged AS COMPOSED can never land: `mida batching off`
+  // is the wrong advice (the same bytes fail the direct lane too) — the line says the text is
+  // kept on this laptop, where, and that this is a bug to report.
+  it("a closed lane says the save goes out on its own transaction — a refused-as-composed save names its kept text and the bug report", async () => {
+    for (const code of ["BATCHING_DISABLED", "OWNER_NOT_ALLOWED"] as const) {
+      const home = batchedHome("http://127.0.0.1:1", false)
+      addPendingAnchor(home, { contextId: CONTEXT_ID, eventId: EVENT_ID, sessionId: SESSION_ID, agent: "claude-code", queuedAt: "2026-09-24T10:00:00.000Z", stuck: code, stuckAt: "2026-09-24T11:00:00.000Z" })
+      const lines = await doctorLines(home)
+      const problem = lines.find((line) => line.startsWith("PROBLEM: a checkpoint save"))
+      expect(problem).toBeDefined()
+      expect(problem).toContain("resent on its own transaction")
+      // the save still lands — nothing here needs the switch
+      expect(problem).not.toContain("mida batching off")
+    }
+    for (const code of ["TOO_LARGE", "BAD_SHAPE", "COMMITMENT_MISMATCH", "INVALID_WIRE"] as const) {
+      const home = batchedHome("http://127.0.0.1:1", false)
+      addPendingAnchor(home, { contextId: CONTEXT_ID, eventId: EVENT_ID, sessionId: SESSION_ID, agent: "claude-code", queuedAt: "2026-09-24T10:00:00.000Z", stuck: code, stuckAt: "2026-09-24T11:00:00.000Z" })
+      const lines = await doctorLines(home)
+      const problem = lines.find((line) => line.startsWith("PROBLEM: a checkpoint save"))
+      expect(problem).toBeDefined()
+      expect(problem).toContain("its text is kept on this laptop at " + home.path("state/batch-plaintext/" + CONTEXT_ID.toLowerCase() + ".json"))
+      expect(problem).toContain("bug to report")
+      expect(problem).not.toContain("mida batching off")
     }
   })
 })

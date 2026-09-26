@@ -155,7 +155,8 @@ describe("batched checkpoint lane end to end on local Anvil (Task 10)", () => {
         expect(saved.batched?.state).toBe("QUEUED")
         expect(saved.transactionHash).toBeNull()
         // the store's receipt proves it took responsibility for the save — never that it anchored
-        expect(saved.batched?.receipt.contextId).toBe(saved.contextId)
+        // (in-14 F-3: the receipt is optional — an ALREADY_QUEUED answer carries none)
+        expect(saved.batched?.receipt?.contextId).toBe(saved.contextId)
 
         // the saving agent's own immediate read: verified content, marked PENDING_ANCHOR — and
         // because the pending item is the reader's own, no flush was asked for

@@ -988,8 +988,9 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
   // in-13 M-4: a save the store cannot accept is stuck between ledgers — already refused at the
   // store, so it never reaches a PENDING_ANCHOR block, and still waiting for its hourly retry,
   // so it is not a rejected anchor either. The queued-saves note is the one place it stays
-  // visible.
-  it("a batch save the store cannot accept counts in the note — nowhere else names it (in-13 M-4)", async () => {
+  // visible. in-14 F-3: it is NOT "a newer save this record may be behind" — nothing says it is
+  // newer than the record shown, and it may never land at all. It gets its own short line.
+  it("a batch save the store cannot accept gets its own line — never 'newer saves … may be behind them' (in-14 F-3)", async () => {
     const dir = queueHome()
     const contextId = `0x${"ee".repeat(32)}` as Hex
     addPendingAnchor(dir, { contextId, eventId: "cp-stuck-1", sessionId: "sess-stuck", agent: "claude-code", queuedAt: "2026-09-25T10:00:00.000Z", stuck: "TOO_LARGE", stuckAt: "2026-09-25T11:00:00.000Z" })
@@ -998,9 +999,23 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
-    expect(result.text).toContain("Mida note: 1 newer save(s) from claude-code have not reached Monad yet; this record may be behind them.")
+    expect(result.text).toContain("Mida note: 1 save could not be sent to Monad: see `mida doctor`.")
+    expect(result.text).not.toContain("newer save(s)")
     // agent names only — the kept plaintext's session id is never quoted into the note
     expect(result.text).not.toContain("sess-stuck")
+  })
+
+  it("a queued job and a stuck save each get their own clause in the same note", async () => {
+    const dir = queueHome()
+    job(dir)
+    const contextId = `0x${"ee".repeat(32)}` as Hex
+    addPendingAnchor(dir, { contextId, eventId: "cp-stuck-2", sessionId: "sess-stuck2", agent: "claude-code", queuedAt: "2026-09-25T10:00:00.000Z", stuck: "BAD_SHAPE", stuckAt: "2026-09-25T11:00:00.000Z" })
+    keepPendingPlaintext(dir, contextId, { value: { type: "mida.checkpoint.v1", projectId: "p1", sessionId: "sess-stuck2" }, kind: "EPISODE", source: "AGENT_INFERRED", tags: [] })
+    const { d } = deps(reads)
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("Mida note: 1 newer save(s) from claude-code have not reached Monad yet; this record may be behind them. 1 save could not be sent to Monad: see `mida doctor`.")
   })
 
   it("a pending batch save that is NOT stuck, or a stuck save for another project, adds nothing", async () => {

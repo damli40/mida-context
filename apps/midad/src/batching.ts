@@ -220,19 +220,28 @@ function setPendingAnchorStuck(home: MidaHome, contextId: Hex, code: string): vo
  * What a stuck code means in plain words and what the operator can do about it — the line
  * doctor prints. Every RESUBMIT_STUCK member must have an entry: an unknown code here would
  * only mean the store moved faster than this build, and the generic pair still tells the truth.
+ * in-14 F-3: the fix splits on what the code judges. A closed LANE (BATCHING_DISABLED,
+ * OWNER_NOT_ALLOWED) heals itself — the resubmit goes out on the save's own transaction, so
+ * `mida batching off` is optional hygiene, not the fix. A save judged AS COMPOSED can never
+ * land: the same bytes fail the direct lane just as malformed, so the line names where the
+ * kept text sits and calls it a bug to report — never `mida batching off`.
  */
-const RESUBMIT_STUCK_TEXT: Record<string, { what: string; fix: string }> = {
-  BATCHING_DISABLED: { what: "the store is no longer offering batching", fix: "run `mida batching off`" },
-  OWNER_NOT_ALLOWED: { what: "the save's owner is not allowed to write to this store", fix: "check the store's write policy or run `mida batching off`" },
-  TOO_LARGE: { what: "the save does not fit in a batch", fix: "run `mida batching off` and save again" },
-  BAD_SHAPE: { what: "the save's fields are malformed for a batched save", fix: "run `mida batching off` and save again" },
-  COMMITMENT_MISMATCH: { what: "the save's sealed content does not match its commitment", fix: "run `mida batching off` and save again" },
-  INVALID_WIRE: { what: "the save's wire format is not valid for this store", fix: "upgrade mida or run `mida batching off`" },
+const RESUBMIT_STUCK_TEXT: Record<string, { what: string; fix: (keptAt?: string) => string }> = {
+  BATCHING_DISABLED: { what: "the store is no longer offering batching", fix: () => "it is being resent on its own transaction — no action needed" },
+  OWNER_NOT_ALLOWED: { what: "the save's owner is not allowed to write to this store", fix: () => "it is being resent on its own transaction — no action needed" },
+  TOO_LARGE: { what: "the save does not fit in a batch", fix: (keptAt) => `its text is kept on this laptop at ${keptAt ?? "the kept-plaintext ledger"} — the save can never land as it is; this is a bug to report` },
+  BAD_SHAPE: { what: "the save's fields are malformed for a batched save", fix: (keptAt) => `its text is kept on this laptop at ${keptAt ?? "the kept-plaintext ledger"} — the save can never land as it is; this is a bug to report` },
+  COMMITMENT_MISMATCH: { what: "the save's sealed content does not match its commitment", fix: (keptAt) => `its text is kept on this laptop at ${keptAt ?? "the kept-plaintext ledger"} — the save can never land as it is; this is a bug to report` },
+  INVALID_WIRE: { what: "the save's wire format is not valid for this store", fix: (keptAt) => `its text is kept on this laptop at ${keptAt ?? "the kept-plaintext ledger"} — the save can never land as it is; this is a bug to report` },
 }
 
-/** doctor's sentence for one stuck save — never the raw wire code alone. */
-export function resubmitStuckText(code: string): { what: string; fix: string } {
-  return RESUBMIT_STUCK_TEXT[code] ?? { what: `the store refuses the save as composed (${code})`, fix: "run `mida batching off` and save again" }
+/** doctor's sentence for one stuck save — never the raw wire code alone. `keptAt` is the kept plaintext's path. */
+export function resubmitStuckText(code: string, keptAt?: string): { what: string; fix: string } {
+  const entry = RESUBMIT_STUCK_TEXT[code]
+  if (entry === undefined) {
+    return { what: `the store refuses the save as composed (${code})`, fix: `its text is kept on this laptop at ${keptAt ?? "the kept-plaintext ledger"} — the save can never land as it is; this is a bug to report` }
+  }
+  return { what: entry.what, fix: entry.fix(keptAt) }
 }
 
 /**
@@ -245,7 +254,8 @@ export function resubmitStuckText(code: string): { what: string; fix: string } {
  */
 const PENDING_PLAINTEXT_DIR = "state/batch-plaintext"
 
-const pendingPlaintextPath = (contextId: Hex): string => `${PENDING_PLAINTEXT_DIR}/${contextId.toLowerCase()}.json`
+/** The kept-plaintext file's home-relative path — doctor names it on a save that can never land (in-14 F-3). */
+export const pendingPlaintextPath = (contextId: Hex): string => `${PENDING_PLAINTEXT_DIR}/${contextId.toLowerCase()}.json`
 
 /** Rejection names a resubmission can fix: the signature was sealed under a rotated-away epoch. */
 const EPOCH_RETRYABLE = new Set(["BAD_EPOCH", "EPOCH_STALE"])
@@ -282,6 +292,14 @@ const RESUBMIT_STUCK = new Set([
   "COMMITMENT_MISMATCH",
   "INVALID_WIRE",
 ])
+
+/**
+ * in-14 F-3: the two codes that close the batched LANE itself rather than judging one save —
+ * the store stopped offering batching, or this owner may not write there. The same bytes
+ * re-POSTed can never land, so the resubmit takes the direct lane instead, and doctor phrases
+ * the mark as a closed lane, not a save that cannot be resubmitted.
+ */
+export const RESUBMIT_LANE_CLOSED = new Set(["BATCHING_DISABLED", "OWNER_NOT_ALLOWED"])
 
 /** A stuck save is worth one fresh attempt an hour, not one POST per drain pass. */
 const RESUBMIT_STUCK_INTERVAL_MS = 60 * 60 * 1000
@@ -415,9 +433,10 @@ export async function laneForSave(runtime: ServiceRuntime, agentName: string): P
  * What a stale-epoch resubmission came back with. `requeued` — the save is queued again under a
  * fresh contextId; `retry-later` — nothing final happened, the entry waits for the next pass;
  * `refused` — the save is dead: its author lost authority, its plaintext is gone or unreadable,
- * or the resubmission itself was refused outright.
+ * or the resubmission itself was refused outright. `landed` — the batched lane answered closed
+ * (in-14 F-3), the resubmit went out on the save's own transaction instead, and it anchored.
  */
-type ResubmitOutcome = "requeued" | "retry-later" | "refused"
+type ResubmitOutcome = "requeued" | "retry-later" | "refused" | "landed"
 
 /**
  * Re-seals a BAD_EPOCH/EPOCH_STALE save under the current epoch and POSTs it again (in-2 I3).
@@ -490,6 +509,12 @@ async function resubmitStaleEpoch(
       if (typeof attempted !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(attempted)) return "retry-later"
       queued = { contextId: attempted.toLowerCase() as Hex }
     } else {
+      // in-14 F-3: BATCHING_DISABLED / OWNER_NOT_ALLOWED close the batched LANE itself — the same
+      // bytes re-POSTed there can never land, so the resubmit takes the direct lane instead: the
+      // ordinary one-transaction save, built from the kept plaintext.
+      if (RESUBMIT_LANE_CLOSED.has(code as string)) {
+        return await resubmitOnClosedLane(runtime, entry, input, code as string, reason, log)
+      }
       if (typeof code === "string" && RESUBMIT_STUCK.has(code)) setPendingAnchorStuck(home, entry.contextId, code)
       return "retry-later"
     }
@@ -520,6 +545,52 @@ async function resubmitStaleEpoch(
     attempts: retries,
   })
   return "requeued"
+}
+
+/**
+ * in-14 F-3: the batched lane answered BATCHING_DISABLED or OWNER_NOT_ALLOWED — closed, to
+ * everyone or to this owner, so the same bytes re-POSTed there can never land. The resubmit
+ * takes the DIRECT lane: the ordinary one-transaction `create` on the kept plaintext, the same
+ * path a non-batched save runs. A landed save is done — ledger, plaintext and the saved-id index
+ * all move onto the new record's id and the pass logs "saved" on the direct lane. An authority
+ * refusal there is as final as on the batched lane; anything else marks the entry stuck on the
+ * lane's answer — the mark names why the batched retry is pointless, and its hourly gate keeps a
+ * struggling direct lane from being POSTed on every pass.
+ */
+async function resubmitOnClosedLane(
+  runtime: ServiceRuntime,
+  entry: PendingAnchor,
+  input: unknown,
+  laneCode: string,
+  reason: string,
+  log: (record: Record<string, unknown>) => void,
+): Promise<ResubmitOutcome> {
+  const home = runtime.home
+  let created: { contextId: Hex; transactionHash?: Hex | null }
+  try {
+    created = await runtime.agent(entry.agent).create(runtime.owner, NAMESPACE, input as unknown as CreateContextInput)
+  } catch (error) {
+    const code = (error as { code?: unknown }).code
+    // an authority verdict on the direct lane judges the save itself — as final as on the batched one
+    if (typeof code === "string" && RESUBMIT_AUTHORITY_FINAL.has(code)) return "refused"
+    setPendingAnchorStuck(home, entry.contextId, laneCode)
+    return "retry-later"
+  }
+  removePendingAnchor(home, entry.contextId)
+  dropPendingPlaintext(home, entry.contextId)
+  recordSavedId(home, entry.eventId, created.contextId)
+  log({
+    sessionId: entry.sessionId,
+    agent: entry.agent,
+    eventId: entry.eventId,
+    outcome: "saved",
+    lane: "direct",
+    contextId: created.contextId,
+    previousContextId: entry.contextId,
+    transactionHash: created.transactionHash ?? null,
+    reason: `batch-rejected:${reason}`,
+  })
+  return "landed"
 }
 
 /**
@@ -566,6 +637,11 @@ export async function followPendingAnchors(
         (await resubmitStaleEpoch(runtime, entry, reason, log))
       if (retried === "requeued" || retried === "retry-later") {
         counts.waiting += 1
+        continue
+      }
+      // a closed lane bounced the resubmit onto the save's own transaction and it anchored
+      if (retried === "landed") {
+        counts.anchored += 1
         continue
       }
       dropPendingPlaintext(runtime.home, entry.contextId)

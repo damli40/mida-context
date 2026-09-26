@@ -12,7 +12,7 @@ import { COMPILE_PROVIDERS, compileModelChoice, devinSqliteAvailable } from "@mi
 import { ContextApiClient, DenyOverlay, RegistryReader, StoreHttpError } from "@mida/api"
 import type { RevocationTarget } from "@mida/api"
 import type { LocalAccount } from "viem"
-import { batchClient, batchStatusProbe, decideLane, pendingAnchors, rejectedAnchors } from "./batching.js"
+import { RESUBMIT_LANE_CLOSED, batchClient, batchStatusProbe, decideLane, pendingAnchors, pendingPlaintextPath, rejectedAnchors } from "./batching.js"
 import type { Lane, PendingAnchor } from "./batching.js"
 import { laneWhyText, resubmitStuckText } from "./batching.js"
 import { callDaemon } from "./control.js"
@@ -783,10 +783,14 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             live.push(entry)
             continue
           }
-          const text = resubmitStuckText(entry.stuck)
+          // in-14 F-3: the fix clause names the kept plaintext's file so a save that can never
+          // land still shows the owner where its text sits on this laptop; a code that closes
+          // the batched LANE is phrased as that — the save itself is being resent directly
+          const text = resubmitStuckText(entry.stuck, home.path(pendingPlaintextPath(entry.contextId)))
+          const verb = RESUBMIT_LANE_CLOSED.has(entry.stuck) ? "cannot go through the batch lane" : "cannot be resubmitted"
           lines.push(
             problem(
-              `a checkpoint save (${entry.eventId}, session ${entry.sessionId}) cannot be resubmitted: ${text.what}`,
+              `a checkpoint save (${entry.eventId}, session ${entry.sessionId}) ${verb}: ${text.what}`,
               `${text.fix}; it retries once an hour meanwhile`,
             ),
           )

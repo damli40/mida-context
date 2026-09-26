@@ -161,20 +161,26 @@ function queuedSavesNote(home: MidaHome, projectId: string): string | null {
   // the store, plaintext kept for the hourly retry — so no queue job names it and no
   // PENDING_ANCHOR block reaches the handoff. Its project comes from the kept plaintext's
   // envelope (the entry alone never carried one), and an unreadable plaintext only loses that
-  // save's count, never the note itself.
+  // save's count, never the note itself. in-14 F-3: a stuck save is NOT a "newer save this
+  // record may be behind" — nothing says it is newer than the record shown, and it may never
+  // land at all. It gets its own short clause pointing at doctor.
+  let stuck = 0
   for (const entry of pendingAnchors(home)) {
     if (entry.stuck === undefined || !isSafeName(entry.agent)) continue
     const value = pendingPlaintext(home, entry.contextId)?.value
     if (typeof value !== "object" || value === null || (value as { projectId?: unknown }).projectId !== projectId) continue
-    const sessions = perAgent.get(entry.agent) ?? new Set<string>()
-    sessions.add(entry.sessionId)
-    perAgent.set(entry.agent, sessions)
+    stuck += 1
   }
-  if (perAgent.size === 0) return null
-  const parts = [...perAgent.entries()].map(([name, sessions], index) =>
-    index === 0 ? `${sessions.size} newer save(s) from ${name}` : `${sessions.size} from ${name}`,
-  )
-  return `Mida note: ${parts.join(", ")} have not reached Monad yet; this record may be behind them${lastTryFailed ? " (the last try failed; Mida keeps retrying)" : ""}.`
+  if (perAgent.size === 0 && stuck === 0) return null
+  const clauses: string[] = []
+  if (perAgent.size > 0) {
+    const parts = [...perAgent.entries()].map(([name, sessions], index) =>
+      index === 0 ? `${sessions.size} newer save(s) from ${name}` : `${sessions.size} from ${name}`,
+    )
+    clauses.push(`${parts.join(", ")} have not reached Monad yet; this record may be behind them${lastTryFailed ? " (the last try failed; Mida keeps retrying)" : ""}`)
+  }
+  if (stuck > 0) clauses.push(`${stuck} save${stuck === 1 ? "" : "s"} could not be sent to Monad: see \`mida doctor\``)
+  return `Mida note: ${clauses.join(". ")}.`
 }
 
 /** The generic refusal line — the only text a session-start hook prints on its own failures. */

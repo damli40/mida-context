@@ -548,7 +548,7 @@ async function saveReceipt(runtime: ServiceRuntime, transactionHash: Hex): Promi
 
 /** Spec §5C steps 4–5: wrap, encrypt, upload and register on Monad under the agent's own key. A second save carrying
  * an eventId this project already has is a drainer retry after a crash — answer with the existing record, send nothing. */
-export async function saveCheckpoint(runtime: ServiceRuntime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean; lane?: "direct" | "batched"; laneWhy?: string; batched?: { state: "QUEUED"; receipt: BatchReceipt }; receipt?: SaveReceipt; receiptMs?: number }> {
+export async function saveCheckpoint(runtime: ServiceRuntime, name: string, input: Omit<CheckpointEnvelope, "type">): Promise<{ contextId: Hex; transactionHash: Hex | null; milliseconds: number; duplicate: boolean; lane?: "direct" | "batched"; laneWhy?: string; batched?: { state: "QUEUED"; receipt?: BatchReceipt }; receipt?: SaveReceipt; receiptMs?: number }> {
   const envelope = wrapCheckpoint(input)
   const started = Date.now()
   const agent = runtime.agent(name)
@@ -611,7 +611,19 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
       source: "AGENT_INFERRED" as const,
       tags: ["mida-checkpoint", envelope.checkpoint.eventId],
     }
-    const queued = await agent.createBatched(runtime.owner, NAMESPACE, create)
+    // in-14 F-3: ALREADY_QUEUED is the queued answer through the error channel — an earlier POST
+    // of this save landed at the store and its answer died on the wire. The SDK attaches the
+    // attempted contextId to the error; with it the save is followed under the id the store
+    // holds, exactly like a receipt. Without it the save cannot be followed and surfaces.
+    let queued: { contextId: Hex; receipt?: BatchReceipt }
+    try {
+      queued = await agent.createBatched(runtime.owner, NAMESPACE, create)
+    } catch (error) {
+      if ((error as { code?: unknown }).code !== "ALREADY_QUEUED") throw error
+      const held = (error as { contextId?: unknown }).contextId
+      if (typeof held !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(held)) throw error
+      queued = { contextId: held.toLowerCase() as Hex }
+    }
     // The plaintext stays in the home from this moment (in-2 I3): a stale-epoch rejection is
     // only recoverable while the bytes that produced the save exist to re-seal. Written before
     // the pending entry so an entry always implies its plaintext — the reverse is a swept orphan.
@@ -630,7 +642,8 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
       milliseconds: Date.now() - started,
       duplicate: false,
       lane: "batched",
-      batched: { state: "QUEUED", receipt: queued.receipt },
+      // the ALREADY_QUEUED path carries no receipt — the store never wrote one for this POST
+      batched: { state: "QUEUED", ...(queued.receipt !== undefined ? { receipt: queued.receipt } : {}) },
     }
   }
   const object = await agent.create(runtime.owner, NAMESPACE, {
