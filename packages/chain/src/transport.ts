@@ -174,6 +174,30 @@ async function busyAnswer(response: Response): Promise<boolean> {
   })
 }
 
+/**
+ * in-13b M-6 — the one exception to N-9's never-resend: a rate-limit answer is the node's own
+ * proof that the request was never processed. HTTP 429 refuses the whole POST before dispatch.
+ * A JSON-RPC error naming a rate limit refuses only the item carrying it, so a resend is safe
+ * only when EVERY `eth_sendRawTransaction` item in the request carries one — matched by id, so
+ * a mixed answer cannot launder a send the node did see through a sibling's refusal. Every
+ * other answer (a 5xx, "already known", a dropped socket) keeps N-9's rule: the transaction
+ * may already sit in the mempool and a resend cannot be told apart from a first send.
+ */
+async function sendsDeniedByRateLimit(response: Response, sendIds: readonly unknown[]): Promise<boolean> {
+  if (response.status === 429) return true
+  let data: unknown
+  try {
+    data = await response.clone().json()
+  } catch {
+    return false
+  }
+  const items = (Array.isArray(data) ? data : [data]) as ({ id?: unknown; error?: { message?: unknown } } | null)[]
+  return sendIds.every((id) => {
+    const message = items.find((item) => item?.id === id)?.error?.message
+    return typeof message === "string" && BUSY_MESSAGE.test(message)
+  })
+}
+
 const RETRY_DELAYS_MS = [250, 500, 1_000] as const
 
 /**
@@ -246,16 +270,22 @@ export function rpcTransport(url: string) {
       // A deliberately stopped request is never retried — viem's own timeout aborts the signal
       // too, and a retry would burn a limiter slot on an answer nobody is waiting for (in-12 N-9).
       const abortError = () => new DOMException("the request was deliberately stopped", "AbortError")
-      // Nor is a submission resent: a 5xx or a dropped socket after eth_sendRawTransaction does
-      // NOT mean the transaction never landed — the honest next answer to a resend is "already
-      // known", and the caller cannot tell that apart from a refusal (in-12 N-9). Reads and every
-      // idempotent method keep the transient/rate-limit retries below.
+      // Nor is a submission resent on an ambiguous answer: a 5xx or a dropped socket after
+      // eth_sendRawTransaction does NOT mean the transaction never landed — the honest next
+      // answer to a resend is "already known", and the caller cannot tell that apart from a
+      // refusal (in-12 N-9). The one exception is a rate limit — the node's own proof it never
+      // ran the send — which stays resendable through `sendsDeniedByRateLimit` (in-13b M-6).
+      // Reads and every idempotent method keep the transient/rate-limit retries below.
       let resendable = true
+      const sendIds: unknown[] = []
       try {
         const parsed: unknown = JSON.parse(String(init?.body ?? "null"))
         const calls = Array.isArray(parsed) ? parsed : [parsed]
-        if (calls.some((call) => (call as { method?: unknown } | null)?.method === "eth_sendRawTransaction")) {
-          resendable = false
+        for (const call of calls) {
+          if ((call as { method?: unknown } | null)?.method === "eth_sendRawTransaction") {
+            resendable = false
+            sendIds.push((call as { id?: unknown }).id)
+          }
         }
       } catch {
         // an unparseable body stays resendable — the wire will decide what it is
@@ -273,7 +303,10 @@ export function rpcTransport(url: string) {
           await sleep(RETRY_DELAYS_MS[attempt]!)
           continue
         }
-        if (resendable && (await busyAnswer(response))) {
+        if (
+          (await busyAnswer(response)) &&
+          (resendable || (await sendsDeniedByRateLimit(response, sendIds)))
+        ) {
           if (attempt >= RETRY_DELAYS_MS.length) throw new ChainBusyError()
           if (init?.signal?.aborted) throw abortError()
           await sleep(RETRY_DELAYS_MS[attempt]!)

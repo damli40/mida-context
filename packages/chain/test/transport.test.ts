@@ -490,4 +490,96 @@ describe("aborted and non-idempotent requests (in-12 N-9)", () => {
     await expect(client.request({ method: "eth_chainId" }, { retryCount: 0 })).resolves.toBe("0x7a69")
     expect(calls).toBe(2)
   }, 30_000)
+
+  it("in-13b M-6: an HTTP 429 on eth_sendRawTransaction IS resent — the node never processed it", async () => {
+    const methods: string[] = []
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      const body = JSON.parse(String(init?.body)) as { method: string; id: number }
+      methods.push(body.method)
+      if (methods.length === 1) return new Response("slow down", { status: 429 })
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: `0x${"ab".repeat(32)}` }), { status: 200, headers: { "content-type": "application/json" } })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://n9-429.test") })
+    await expect(
+      client.request({ method: "eth_sendRawTransaction", params: ["0x02"] }, { retryCount: 0 }),
+    ).resolves.toBe(`0x${"ab".repeat(32)}`)
+    // exactly one resend — the second send carried the same transaction
+    expect(methods).toEqual(["eth_sendRawTransaction", "eth_sendRawTransaction"])
+  }, 30_000)
+
+  it("in-13b M-6: a JSON-RPC rate-limit error on eth_sendRawTransaction IS resent — same guarantee, different shape", async () => {
+    const methods: string[] = []
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      const body = JSON.parse(String(init?.body)) as { method: string; id: number }
+      methods.push(body.method)
+      if (methods.length === 1) return limited(body)
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: `0x${"cd".repeat(32)}` }), { status: 200, headers: { "content-type": "application/json" } })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://n9-json429.test") })
+    await expect(
+      client.request({ method: "eth_sendRawTransaction", params: ["0x02"] }, { retryCount: 0 }),
+    ).resolves.toBe(`0x${"cd".repeat(32)}`)
+    expect(methods).toEqual(["eth_sendRawTransaction", "eth_sendRawTransaction"])
+  }, 30_000)
+
+  it("in-13b M-6: a send that stays rate-limited surfaces chain-busy — ChainBusyError after 3 retries", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      calls += 1
+      return new Response("slow down", { status: 429 })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://n9-always429.test") })
+    const error = await client.request({ method: "eth_sendRawTransaction", params: ["0x02"] }, { retryCount: 0 }).then(() => null, (e: unknown) => e as Error)
+    expect(isChainBusy(error)).toBe(true)
+    expect(calls).toBe(4) // 1 try + 3 retries
+  }, 30_000)
+
+  it("in-13b M-6: an HTTP 408 on eth_sendRawTransaction is NOT resent — the node may hold it", async () => {
+    const methods: string[] = []
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      const body = JSON.parse(String(init?.body)) as { method: string; id: number }
+      methods.push(body.method)
+      if (methods.length === 1) return new Response("timeout", { status: 408 })
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: { code: -32000, message: "already known" } }), { status: 200, headers: { "content-type": "application/json" } })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://n9-408.test") })
+    const error = await client.request({ method: "eth_sendRawTransaction", params: ["0x02"] }, { retryCount: 0 }).then(() => null, (e: unknown) => e as Error)
+    expect(error).not.toBeNull()
+    await new Promise((r) => setTimeout(r, 2_000))
+    expect(methods).toEqual(["eth_sendRawTransaction"])
+  }, 30_000)
+
+  it("in-13b M-6: any other JSON-RPC error on eth_sendRawTransaction is NOT resent — only a rate-limit answer proves refusal", async () => {
+    const methods: string[] = []
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      const body = JSON.parse(String(init?.body)) as { method: string; id: number }
+      methods.push(body.method)
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: { code: -32000, message: "nonce too low" } }), { status: 200, headers: { "content-type": "application/json" } })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://n9-err.test") })
+    const error = await client.request({ method: "eth_sendRawTransaction", params: ["0x02"] }, { retryCount: 0 }).then(() => null, (e: unknown) => e as Error)
+    expect(error).not.toBeNull()
+    await new Promise((r) => setTimeout(r, 2_000))
+    expect(methods).toEqual(["eth_sendRawTransaction"])
+  }, 30_000)
+
+  it("in-13b M-6: a rate-limit carried by ANOTHER item's answer does not resend the transaction — attribution by id", async () => {
+    // The send's own item answered "already known" — the node DID see it — while a different
+    // response item carries the rate limit. Resending on the strength of the sibling's answer
+    // would double-submit a transaction that already landed.
+    const methods: string[] = []
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      const body = JSON.parse(String(init?.body)) as { method: string; id: number }
+      methods.push(body.method)
+      return new Response(JSON.stringify([
+        { jsonrpc: "2.0", id: body.id, error: { code: -32000, message: "already known" } },
+        { jsonrpc: "2.0", id: 999, error: { code: -32005, message: "requests limited to 15/sec" } },
+      ]), { status: 200, headers: { "content-type": "application/json" } })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://n9-mixed.test") })
+    await client.request({ method: "eth_sendRawTransaction", params: ["0x02"] }, { retryCount: 0 }).then(() => null, () => null)
+    await new Promise((r) => setTimeout(r, 2_000))
+    // whatever viem makes of the mixed answer, the send went out exactly once
+    expect(methods).toEqual(["eth_sendRawTransaction"])
+  }, 30_000)
 })
