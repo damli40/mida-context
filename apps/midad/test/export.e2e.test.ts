@@ -496,7 +496,7 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
     expect(md).toContain("## projects.current (4)")
     expect(md).toContain("## goals.career (1)")
     expect(md).toContain("the superseding checkpoint")
-    expect(md).toContain("contains no keys")
+    expect(md).toContain("contains no Mida keys")
     expect(md).toContain(`superseded → ${saved.cp2.contextId}`)
 
     const readme = readFileSync(join(dest, "README.md"), "utf8")
@@ -507,7 +507,7 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
     expect(readme).toContain("5 direct, 1 batched")
     expect(readme).toContain("Saves still queued on this laptop: 0")
     expect(readme).toContain("Batched saves still waiting for Monad: 0")
-    expect(readme).toContain("contains no keys")
+    expect(readme).toContain("contains no Mida keys")
     expect(readme).toContain(`chain id: ${env.deployment.chainId}`)
     expect(readme).toContain(`ContextRegistry: ${env.deployment.contextRegistry}`)
     expect(readme).toContain(`BatchAnchor: ${batchAnchor}`)

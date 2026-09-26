@@ -638,7 +638,7 @@ describe("mida export — the written folder", () => {
     expect(readme).toContain("Saves still queued on this laptop: 2")
     expect(readme).toContain("ContextRegistry: " + network.deployment.contextRegistry)
     expect(readme).toContain("export block: 42")
-    expect(readme).toContain("contains no keys")
+    expect(readme).toContain("contains no Mida keys")
   })
 
   it("a batched save still waiting for Monad is counted separately from the hook queue", async () => {
@@ -742,7 +742,7 @@ describe("mida export — the written folder", () => {
     const new_ = fixtureRecord({ createdAt: 1_700_000_000n })
     const { dest } = await exportWith([new_, old])
     const md = readFileSync(join(dest, "records.md"), "utf8")
-    expect(md).toContain("contains no keys")
+    expect(md).toContain("contains no Mida keys")
     expect(md).toContain("## projects.current (2)")
     const firstAt = md.indexOf(new_.contextId)
     const secondAt = md.indexOf(old.contextId)

@@ -478,7 +478,7 @@ function recordsMarkdown(entries: ExportEntry[], records: readonly SourceRecord[
   const lines: string[] = [
     "# Mida export — readable records",
     "",
-    "This file lists your records in readable form. It contains no keys. Anyone who can read it can read your context.",
+    "This file lists your records in readable form. It contains no Mida keys — but anything you saved as a credential appears here in readable form. Anyone who can read it can read your context.",
     "",
     `Exported ${exportedAt} — ${entries.length} record${entries.length === 1 ? "" : "s"} in ${byNamespace.size} context area${byNamespace.size === 1 ? "" : "s"}.`,
     "",
@@ -539,12 +539,14 @@ function readme(input: {
   const d = network.deployment
   return `# Mida export
 
-This folder holds your records in readable form. It contains no keys. Anyone who can read it can read your context.
+This folder holds your records in readable form. It contains no Mida keys — but anything you saved
+as a credential appears here in readable form, so keep the folder private or delete it when you are
+done.
 
 \`mida export\` wrote this folder on ${input.exportedAt}. It is a leaving-Mida package: every record
 Monad attributes to your owner account, decrypted so you can read it, plus the exact manifest and
-ciphertext bytes the store serves — so what this folder claims can be checked against the chain
-itself, without trusting Mida or this machine.
+ciphertext bytes the store serves. The encrypted files can be checked against Monad without trusting
+Mida; the readable files are what this machine decrypted from them.
 
 ## What is inside
 

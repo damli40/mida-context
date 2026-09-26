@@ -418,20 +418,20 @@ mida export ~/mida-backup
 Exported 5 records (3 namespaces) to /home/you/mida-backup.
 ```
 
-The folder is created fresh — it refuses to overwrite anything that already exists, writes into a sibling `…​.partial-…​` folder first, and only renames it into place when every file is done. A failure mid-export deletes the partial folder, so a failed run never leaves half-written plaintext behind. Folder mode is 0700, every file 0600.
+The folder is created fresh — it refuses to overwrite anything that already exists, writes into a sibling `…​.partial-…​` folder first, and only renames it into place when every file is done. A failure mid-export deletes the partial folder, so a failed run never leaves half-written plaintext behind; if the machine loses power mid-export, the next export removes the leftover. Folder mode is 0700, every file 0600.
 
 What is inside:
 
-- `records.json` — every record, machine-readable: who wrote it (you, or the agent's name), when Monad stamped it, which lineage it sits in and whether a newer record superseded it, plus the decrypted content.
+- `records.json` — every record, machine-readable: who wrote it (you, or the agent's name), when Monad stamped it, which lineage it sits in, whether a newer record superseded it, and — for checkpoints — which one a handoff would continue from, plus the decrypted content.
 - `records.md` — the same records readable, grouped by context area, newest first.
-- `encrypted/` — the exact manifest and ciphertext bytes the store serves for each record, so what the folder claims can be checked against Monad itself. `README.md` inside the folder gives the recipe: hash the manifest file and compare it to the record's on-chain `manifestHash` (`ContextRegistry.getRecord` for a direct save, the BatchAnchor row for a batched one), then hash the ciphertext file against the manifest.
+- `encrypted/` — the exact manifest and ciphertext bytes the store serves for each record. The encrypted files can be checked against Monad without trusting Mida — `README.md` inside the folder gives the recipe: hash the manifest file and compare it to the record's on-chain `manifestHash` (`ContextRegistry.getRecord` for a direct save, the BatchAnchor row for a batched one), then hash the ciphertext file against the manifest. The readable files are what this machine decrypted from them.
 - `README.md` — what the folder is, the counts, the chain and contract addresses it came from, and the check above.
 
-Two honest warnings, printed inside the folder too: **the readable files are plaintext — anyone who can read the folder can read your context — and the folder contains no keys**, so losing it loses nothing cryptographic. Saves still queued on this laptop (taken by hooks, not yet on Monad) are not in the export; the command prints a line naming the count when it is not zero.
+Two honest warnings, printed inside the folder too: **the readable files are plaintext — anyone who can read the folder can read your context — and the folder contains no Mida keys**, so losing it loses nothing cryptographic. Anything you saved as a credential appears here in readable form. Saves still queued on this laptop (taken by hooks, not yet on Monad) and batched saves still waiting for their anchor are not in the export — neither is chain-certified; the command prints a line naming both counts when either is not zero.
 
-`export` is an owner command: it runs only in your own terminal, never through the daemon, and no agent can reach it (it is not an MCP tool and no hook can trigger it). A passkey setup refuses — export needs the local software owner key to decrypt, and a passkey home holds none.
+`export` is an owner command — it refuses Mida's tools and agent identities (it is not an MCP tool and no hook can trigger it), but a program running as you, with a shell, can run it: the terminal check is a speed bump, and the owner key is a file on your disk until passkey export exists. A passkey setup refuses — export needs the local software owner key to decrypt, and a passkey home holds none.
 
-*Status: RUN on local Anvil — `apps/midad/test/export.e2e.test.ts` exports a five-record universe (two agents, a superseded checkpoint, an owner fact, a second-namespace record, one batched save) through the real CLI, then executes the README's own hash recipe against the chain. `apps/midad/test/export.test.ts` covers every refusal and the staging cleanup.*
+*Status: RUN on local Anvil — `apps/midad/test/export.e2e.test.ts` exports a six-record universe (two agents, a superseded checkpoint plus a newer plain-create checkpoint, an owner fact, a second-namespace record, one batched save) through the real CLI, then executes the README's own hash recipe against the chain. `apps/midad/test/export.test.ts` covers every refusal and the staging cleanup.*
 
 ## The compile model: DeepSeek by default — RUN (benchmarked)
 
