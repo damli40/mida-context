@@ -1,8 +1,11 @@
 // in-11 R-8 — "busy" only when it is busy. The old classifier called ANY viem error without a
 // contract revert "chain-busy": a call to an address with no contract (wrong RPC / wrong
 // deployment) and a provider that rejected the key (HTTP 401) both told the owner "wait, it
-// tries again" when the real fix was the setup. The classifier now names three reasons —
+// tries again" when the real fix was the setup. The classifier now names the reasons —
 // chain-busy, chain-misconfigured, rpc-auth — and stays silent on everything else.
+// in-12 N-8 adds the store-* pair: when the STORE is whose RPC broke (its own CHAIN_MISCONFIGURED
+// / RPC_AUTH_REJECTED code), the reason names the store operator's problem — never the owner's
+// local MONAD_TESTNET_RPC.
 
 import { describe, expect, it } from "vitest"
 import {
@@ -39,8 +42,16 @@ describe("chainRefusalReason: misconfiguration is not busy", () => {
     expect(chainRefusalReason(error)).toBe("chain-misconfigured")
   })
 
-  it("the store's own CHAIN_MISCONFIGURED answer names the same reason", () => {
-    expect(chainRefusalReason(new MidaError("CHAIN_MISCONFIGURED", "no contract"))).toBe("chain-misconfigured")
+  it("the store's own CHAIN_MISCONFIGURED answer names the store's problem, not the owner's (in-12 N-8)", () => {
+    // the literal code exists only in the store's error mapper — carrying it means the store's
+    // Monad connection found no contract; the owner's rpcUrl was never asked
+    expect(chainRefusalReason(new MidaError("CHAIN_MISCONFIGURED", "no contract"))).toBe("store-misconfigured")
+  })
+
+  it("a store error still names the store when another layer wraps it", () => {
+    expect(chainRefusalReason(new Error("read failed", { cause: new MidaError("CHAIN_MISCONFIGURED", "no contract") }))).toBe(
+      "store-misconfigured",
+    )
   })
 })
 
@@ -55,8 +66,8 @@ describe("chainRefusalReason: a refused credential is not busy", () => {
     expect(chainRefusalReason(httpStatus(403))).toBe("rpc-auth")
   })
 
-  it("the store's own RPC_AUTH_REJECTED answer names the same reason", () => {
-    expect(chainRefusalReason(new MidaError("RPC_AUTH_REJECTED", "bad key"))).toBe("rpc-auth")
+  it("the store's own RPC_AUTH_REJECTED answer names the store's problem, not the owner's (in-12 N-8)", () => {
+    expect(chainRefusalReason(new MidaError("RPC_AUTH_REJECTED", "bad key"))).toBe("store-rpc-auth")
   })
 })
 

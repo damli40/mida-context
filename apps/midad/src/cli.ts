@@ -372,6 +372,11 @@ export async function runCliWithRuntime(
       print("the RPC answered but found no Mida contract — check MONAD_TESTNET_RPC or this setup's network.json; nothing was sent or decided")
     } else if (code === "rpc-auth") {
       print("the RPC provider refused the key — check the provider URL in MONAD_TESTNET_RPC or network.json; nothing was sent or decided")
+    } else if (code === "store-misconfigured") {
+      // the store's own Monad connection is broken — the owner's RPC setup was never asked (in-12 N-8)
+      print("the store's connection to Monad is misconfigured — the store operator must fix it; nothing was sent or decided")
+    } else if (code === "store-rpc-auth") {
+      print("the store's RPC key was refused — the store operator must fix it; nothing was sent or decided")
     } else if (code === "CHAIN_CALL_FAILED") {
       print(`the chain call failed — this setup's contract is ${runtime.chain.deployment.capabilityRegistry.slice(0, 6)}…; run with MIDA_DEBUG=1 to see why`)
     } else if (code === "agent-not-setup") {
@@ -937,6 +942,12 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
       return "the RPC answered but found no Mida contract — check MONAD_TESTNET_RPC or this setup's network.json; nothing was sent or decided"
     case "rpc-auth":
       return "the RPC provider refused the key — check the provider URL in MONAD_TESTNET_RPC or network.json; nothing was sent or decided"
+    // The same failures when the STORE reported them: whose RPC broke is the store's, so the
+    // advice names the store operator, not this setup's MONAD_TESTNET_RPC (in-12 N-8).
+    case "store-misconfigured":
+      return "the store's connection to Monad is misconfigured — the store operator must fix it; nothing was sent or decided"
+    case "store-rpc-auth":
+      return "the store's RPC key was refused — the store operator must fix it; nothing was sent or decided"
     // A chain error with no code: the line names this setup's contract so a wrong deployment
     // explains itself, and names the flag that prints the masked detail.
     case "CHAIN_CALL_FAILED": {

@@ -358,9 +358,10 @@ async function toolWhatsNew(deps: McpServerDeps) {
     }
     // the chain could not answer honestly — the same line the hook prints for each reason
     // (imported, unlike the refusal lines above: hook-output.ts is a leaf this adapter may
-    // already reach). Busy, misconfigured and refused-key each get their own wording (R-8).
-    if (reason === "chain-busy" || reason === "chain-misconfigured" || reason === "rpc-auth") {
-      return toolText(CHAIN_REFUSAL_TEXT[reason])
+    // already reach). Busy, a local misconfiguration, a refused key, and the store's own
+    // versions of those each get their own wording (R-8, in-12 N-8).
+    if (reason in CHAIN_REFUSAL_TEXT) {
+      return toolText(CHAIN_REFUSAL_TEXT[reason as keyof typeof CHAIN_REFUSAL_TEXT])
     }
     // the two list-integrity refusals carry their own canonical lines — the same ones the
     // session-start handoff text uses (they are reproduced, not imported: handoff.ts must stay

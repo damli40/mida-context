@@ -12,7 +12,7 @@ import { HttpRequestError } from "viem"
 import { ContextApiClient } from "@mida/api"
 import { MidaAgent } from "@mida/sdk"
 import { ChainBusyError } from "@mida/chain"
-import { CHAIN_BUSY_TEXT, MidaHome, NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
+import { CHAIN_BUSY_TEXT, STORE_CHAIN_MISCONFIGURED_TEXT, STORE_RPC_AUTH_TEXT, MidaHome, NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
 import type { HandoffDeps, MigrationEnvelope, ProjectCheck, Runtime } from "@mida/midad"
 import { checkAccess } from "../src/handoff.js"
 import { enqueue } from "../src/queue.js"
@@ -792,6 +792,23 @@ describe("a busy chain is never reported as not-approved (in-6 R4)", () => {
     })
     const result = await buildHandoff(runtime, input, d)
     expect(result).toEqual({ kind: "refused", reason: "chain-busy", text: CHAIN_BUSY_TEXT })
+  })
+
+  it("the store's CHAIN_MISCONFIGURED / RPC_AUTH_REJECTED answers blame the store's Monad connection (in-12 N-8)", async () => {
+    // the literal codes exist only in the store's error mapper — the owner's rpcUrl was never
+    // asked, so the refusal must send the owner to the store operator, not to their own config
+    for (const [code, reason, text] of [
+      ["CHAIN_MISCONFIGURED", "store-misconfigured", STORE_CHAIN_MISCONFIGURED_TEXT],
+      ["RPC_AUTH_REJECTED", "store-rpc-auth", STORE_RPC_AUTH_TEXT],
+    ] as const) {
+      const { d } = deps({
+        read: async () => {
+          throw new MidaError(code, "the store's chain answer")
+        },
+      })
+      const result = await buildHandoff(runtime, input, d)
+      expect(result, code).toEqual({ kind: "refused", reason, text })
+    }
   })
 
   it("a real refusal still says not-approved — the distinction is preserved", async () => {

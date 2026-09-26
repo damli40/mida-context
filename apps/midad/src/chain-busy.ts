@@ -13,19 +13,47 @@ import { BaseError, InsufficientFundsError } from "viem"
  *   address (a wrong-network rpcUrl or stale deployment): the owner fixes the setup,
  *   not the timing;
  * - `rpc-auth` — the provider refused the credential (HTTP 401/403): the owner fixes the
- *   key, not the timing.
+ *   key, not the timing;
+ * - `store-misconfigured` / `store-rpc-auth` — the same two failures, but reported by the
+ *   STORE, meaning it is the store's connection to Monad that is broken. Only the store
+ *   mints the literal codes CHAIN_MISCONFIGURED and RPC_AUTH_REJECTED (its errors.ts);
+ *   a local failure always arrives as a viem error shape, so carrying the code is the
+ *   reliable tell that the advice must name the store operator, not the owner's
+ *   MONAD_TESTNET_RPC (in-12 N-8).
  *
  * `undefined` means the error names itself — a real contract refusal like CAPABILITY_DENIED
  * or a wrapped revert — and callers keep their existing fallback.
  */
-export type ChainRefusalReason = "chain-busy" | "chain-misconfigured" | "rpc-auth"
+export type ChainRefusalReason =
+  | "chain-busy"
+  | "chain-misconfigured"
+  | "rpc-auth"
+  | "store-misconfigured"
+  | "store-rpc-auth"
 
 export function chainRefusalReason(error: unknown): ChainRefusalReason | undefined {
   const kind = chainErrorKind(error)
   if (kind === "busy") return "chain-busy"
-  if (kind === "misconfigured") return "chain-misconfigured"
-  if (kind === "rpc-auth") return "rpc-auth"
+  if (kind === "misconfigured") return chainFailureFromStore(error) ? "store-misconfigured" : "chain-misconfigured"
+  if (kind === "rpc-auth") return chainFailureFromStore(error) ? "store-rpc-auth" : "rpc-auth"
   return undefined
+}
+
+/**
+ * True when the failure carries a code only the store's error mapper mints — its Monad
+ * connection's problem, never the owner's local rpcUrl. The walk follows `cause` so a
+ * store error wrapped by the SDK or the client still names the right owner.
+ */
+export function chainFailureFromStore(error: unknown): boolean {
+  for (
+    let current: unknown = error;
+    current !== undefined && current !== null && typeof current === "object";
+    current = (current as { cause?: unknown }).cause
+  ) {
+    const code = (current as { code?: unknown }).code
+    if (code === "CHAIN_MISCONFIGURED" || code === "RPC_AUTH_REJECTED") return true
+  }
+  return false
 }
 
 /**

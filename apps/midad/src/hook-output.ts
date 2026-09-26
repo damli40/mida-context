@@ -75,6 +75,17 @@ export const RPC_AUTH_TEXT =
   "Mida: the RPC provider refused the key — check the provider URL in MONAD_TESTNET_RPC or network.json; context not loaded, working without it"
 
 /**
+ * The SAME two failures when the STORE reported them (in-12 N-8): then it is the store's
+ * connection to Monad that is misconfigured or whose key was refused — telling the owner to
+ * inspect their own MONAD_TESTNET_RPC would send them fixing a setup that was never asked.
+ */
+export const STORE_CHAIN_MISCONFIGURED_TEXT =
+  "Mida: the store's connection to Monad is misconfigured — the store operator must fix it; context not loaded, working without it"
+
+export const STORE_RPC_AUTH_TEXT =
+  "Mida: the store's RPC key was refused — the store operator must fix it; context not loaded, working without it"
+
+/**
  * The owner-facing line for each chain-refusal reason — one wording on every surface. Keyed by
  * the literal reason strings chain-busy.ts returns; kept import-free so this file stays a leaf
  * the MCP adapter may reach (mcp.test.ts walks that graph).
@@ -83,6 +94,8 @@ export const CHAIN_REFUSAL_TEXT = {
   "chain-busy": CHAIN_BUSY_TEXT,
   "chain-misconfigured": CHAIN_MISCONFIGURED_TEXT,
   "rpc-auth": RPC_AUTH_TEXT,
+  "store-misconfigured": STORE_CHAIN_MISCONFIGURED_TEXT,
+  "store-rpc-auth": STORE_RPC_AUTH_TEXT,
 } as const
 
 /**
@@ -124,13 +137,11 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
   if (body.kind === "refused" && body.reason === "not-approved") {
     return systemMessage(`Mida: ${agent} has no access to this project (not approved yet — run: mida approve ${agent} in this folder)`)
   }
-  // a busy chain is not a denial: the owner hears what happened and that the next session retries
-  if (body.kind === "refused" && body.reason === "chain-busy") {
-    return systemMessage(CHAIN_BUSY_TEXT)
-  }
-  // a misconfigured or refused-key RPC is not busy either: the owner hears what to fix
-  if (body.kind === "refused" && (body.reason === "chain-misconfigured" || body.reason === "rpc-auth")) {
-    return systemMessage(CHAIN_REFUSAL_TEXT[body.reason])
+  // a chain refusal is not a denial: each reason — busy, a local setup to fix, or the store's
+  // own connection (store-*) — carries its line in CHAIN_REFUSAL_TEXT so the owner hears whose
+  // RPC actually broke (in-12 N-8)
+  if (body.kind === "refused" && body.reason !== undefined && body.reason in CHAIN_REFUSAL_TEXT) {
+    return systemMessage(CHAIN_REFUSAL_TEXT[body.reason as keyof typeof CHAIN_REFUSAL_TEXT])
   }
   return degradedMessage(typeof body.reason === "string" ? body.reason : "no-answer")
 }

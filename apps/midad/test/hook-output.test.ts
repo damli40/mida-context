@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { agoText, hookReply, sessionStartMessage, whatsNewMessage } from "@mida/midad"
+import { agoText, hookReply, sessionStartMessage, whatsNewMessage, STORE_CHAIN_MISCONFIGURED_TEXT, STORE_RPC_AUTH_TEXT } from "@mida/midad"
 
 const NOW = Date.parse("2026-09-21T12:00:00.000Z")
 
@@ -140,6 +140,17 @@ describe("sessionStartMessage", () => {
     // line must say the chain could not be asked and that the next session tries again.
     expect(sessionStartMessage({ kind: "refused", reason: "chain-busy", text: "x" }, "codex", NOW)).toBe(
       "Mida: Monad is busy right now — context not loaded; working without it (it tries again next session)",
+    )
+  })
+
+  it("a store-originated chain refusal names the store's Monad connection, never the owner's rpcUrl (in-12 N-8)", () => {
+    // CHAIN_MISCONFIGURED / RPC_AUTH_REJECTED minted by the store mean the STORE's connection is
+    // broken — the owner's own RPC setup was never asked, so the line must not point at it
+    expect(sessionStartMessage({ kind: "refused", reason: "store-misconfigured", text: "x" }, "codex", NOW)).toBe(
+      STORE_CHAIN_MISCONFIGURED_TEXT,
+    )
+    expect(sessionStartMessage({ kind: "refused", reason: "store-rpc-auth", text: "x" }, "codex", NOW)).toBe(
+      STORE_RPC_AUTH_TEXT,
     )
   })
 
