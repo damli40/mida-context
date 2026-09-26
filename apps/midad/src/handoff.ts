@@ -13,6 +13,7 @@ import { checkProject } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { isSafeName, peekJobs, projectIdFor } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
+import { pendingAnchors, pendingPlaintext } from "./batching.js"
 import { readOwnerFacts } from "./remember.js"
 import type { MidaHome } from "./home.js"
 import type { ServiceRuntime } from "./runtime.js"
@@ -155,6 +156,19 @@ function queuedSavesNote(home: MidaHome, projectId: string): string | null {
       const state = home.readJson<{ attempts?: unknown }>(`queue/state/${job.sessionId}.json`)
       if (typeof state?.attempts === "number" && state.attempts > 0) lastTryFailed = true
     } catch { /* keep the count, drop the clause */ }
+  }
+  // in-13 M-4: a batched save the store refused as composed sits between ledgers — rejected at
+  // the store, plaintext kept for the hourly retry — so no queue job names it and no
+  // PENDING_ANCHOR block reaches the handoff. Its project comes from the kept plaintext's
+  // envelope (the entry alone never carried one), and an unreadable plaintext only loses that
+  // save's count, never the note itself.
+  for (const entry of pendingAnchors(home)) {
+    if (entry.stuck === undefined || !isSafeName(entry.agent)) continue
+    const value = pendingPlaintext(home, entry.contextId)?.value
+    if (typeof value !== "object" || value === null || (value as { projectId?: unknown }).projectId !== projectId) continue
+    const sessions = perAgent.get(entry.agent) ?? new Set<string>()
+    sessions.add(entry.sessionId)
+    perAgent.set(entry.agent, sessions)
   }
   if (perAgent.size === 0) return null
   const parts = [...perAgent.entries()].map(([name, sessions], index) =>

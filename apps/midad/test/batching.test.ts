@@ -676,7 +676,9 @@ describe("followPendingAnchors — the ledger's follow-up", () => {
         })
       }
 
-      for (const code of ["CAPABILITY_DENIED", "CAPABILITY_REVOKED", "CAPABILITY_EXPIRED", "NOT_AN_AGENT", "SIGNER_MISMATCH", "ALREADY_QUEUED"] as const) {
+      // in-13 M-4: ALREADY_QUEUED leaves the final set — the store already holding the save is
+      // the successful POST's answer through the error channel, tested below.
+      for (const code of ["CAPABILITY_DENIED", "CAPABILITY_REVOKED", "CAPABILITY_EXPIRED", "NOT_AN_AGENT", "SIGNER_MISMATCH"] as const) {
         it(`a ${code} answer is final — the save is judged, its plaintext dropped`, async () => {
           const store = await stubStore()
           try {
@@ -703,6 +705,138 @@ describe("followPendingAnchors — the ledger's follow-up", () => {
           expect(counts.waiting).toBe(1)
           expect(pendingAnchors(home)[0]!.retries).toBe(1)
           expect(pendingPlaintext(home, CONTEXT_ID)).toBeDefined()
+        } finally {
+          await store.close()
+        }
+      })
+    })
+
+    // in-13 M-4: the resubmission's answer is one of four classes, not two. The allowlist above
+    // is only the authority class — under the old code ALREADY_QUEUED deleted the kept plaintext
+    // (recorded as a refusal while the save sat queued at the store), and a "will not change"
+    // answer burned a POST on every drain pass forever, silently.
+    describe("the resubmission answer's other three classes (in-13 M-4)", () => {
+      const RESUBMIT_ID = `0x${"dd".repeat(32)}` as Hex
+
+      const carryingContextId = (error: Error, contextId: Hex): Error => {
+        ;(error as { contextId?: Hex }).contextId = contextId
+        return error
+      }
+
+      it("ALREADY_QUEUED is a successful POST wearing an error — the save is followed under the id the store holds", async () => {
+        const store = await stubStore()
+        try {
+          const home = await homeWithStaleRejected(store)
+          const { runtime, logged } = resubmitWith(store, home, () => carryingContextId(new MidaError("ALREADY_QUEUED" as never, "the store already holds this save"), RESUBMIT_ID))
+          const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+          // exactly the successful-POST bookkeeping: pending entry, kept plaintext and the
+          // saved-id index all move onto the contextId the resubmission attempted — and nothing
+          // is ever recorded or logged as failed.
+          expect(counts).toEqual({ anchored: 0, rejected: 0, waiting: 1 })
+          expect(rejectedAnchors(home)).toHaveLength(0)
+          expect(pendingAnchors(home)).toEqual([
+            expect.objectContaining({ contextId: RESUBMIT_ID, eventId: EVENT_ID, sessionId: SESSION_ID, agent: "claude-code", state: "QUEUED" }),
+          ])
+          expect(pendingPlaintext(home, RESUBMIT_ID)).toBeDefined()
+          expect(pendingPlaintext(home, CONTEXT_ID)).toBeUndefined()
+          expect((home.readJson<Record<string, string>>("state/saved-ids.json") ?? {})[EVENT_ID]).toBe(RESUBMIT_ID)
+          expect(logged).toEqual([expect.objectContaining({ outcome: "requeued", contextId: RESUBMIT_ID, previousContextId: CONTEXT_ID })])
+        } finally {
+          await store.close()
+        }
+      })
+
+      it("ALREADY_QUEUED carrying no attempted id cannot be followed — the save waits unjudged", async () => {
+        const store = await stubStore()
+        try {
+          const home = await homeWithStaleRejected(store)
+          const { runtime, logged } = resubmitWith(store, home, () => new MidaError("ALREADY_QUEUED" as never, "no id to follow"))
+          const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+          expect(counts).toEqual({ anchored: 0, rejected: 0, waiting: 1 })
+          expect(rejectedAnchors(home)).toHaveLength(0)
+          expect(pendingAnchors(home)).toEqual([expect.objectContaining({ contextId: CONTEXT_ID })])
+          expect(pendingPlaintext(home, CONTEXT_ID)).toBeDefined()
+          expect(logged).toHaveLength(0)
+        } finally {
+          await store.close()
+        }
+      })
+
+      for (const code of ["BATCHING_DISABLED", "OWNER_NOT_ALLOWED", "TOO_LARGE", "BAD_SHAPE", "COMMITMENT_MISMATCH", "INVALID_WIRE"] as const) {
+        it(`a ${code} answer marks the save stuck — plaintext kept, entry kept, nothing final recorded`, async () => {
+          const store = await stubStore()
+          try {
+            const home = await homeWithStaleRejected(store)
+            const { runtime, logged } = resubmitWith(store, home, () => new MidaError(code as never, "the store judged the save as composed"))
+            const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+            expect(counts).toEqual({ anchored: 0, rejected: 0, waiting: 1 })
+            expect(rejectedAnchors(home)).toHaveLength(0)
+            const [entry] = pendingAnchors(home)
+            expect(entry).toMatchObject({ contextId: CONTEXT_ID, stuck: code })
+            expect(typeof entry?.stuckAt).toBe("string")
+            expect(pendingPlaintext(home, CONTEXT_ID)).toBeDefined()
+            expect(logged).toHaveLength(0)
+          } finally {
+            await store.close()
+          }
+        })
+      }
+
+      it("a marked save re-POSTs at most once an hour — the passes inside the hour send nothing", async () => {
+        const store = await stubStore()
+        try {
+          const home = await homeWithStaleRejected(store)
+          let posts = 0
+          const runtime = {
+            ...fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url }),
+            agent: () => ({
+              createBatched: async () => {
+                posts += 1
+                throw new MidaError("BAD_SHAPE" as never, "malformed")
+              },
+            }),
+            reader: { hasAuthority: async () => true },
+          } as unknown as ServiceRuntime
+          const first = await followPendingAnchors(runtime, () => {})
+          expect(posts).toBe(1) // the attempt that marked it
+          expect(first.waiting).toBe(1)
+          const second = await followPendingAnchors(runtime, () => {})
+          expect(posts).toBe(1) // inside the hour: the store is asked, the save is not re-POSTed
+          expect(second.waiting).toBe(1)
+          expect(store.paths.filter((p) => p.startsWith("GET /batch/saves/")).length).toBeGreaterThan(0)
+          expect(pendingAnchors(home)[0]).toMatchObject({ contextId: CONTEXT_ID, stuck: "BAD_SHAPE" })
+        } finally {
+          await store.close()
+        }
+      })
+
+      it("an hour after the last attempt the save is tried again — a fresh stuck answer re-stamps the wait", async () => {
+        const store = await stubStore()
+        try {
+          const home = await homeWithStaleRejected(store)
+          const hourAgo = new Date(Date.now() - 61 * 60 * 1000).toISOString()
+          addPendingAnchor(home, { contextId: CONTEXT_ID, eventId: EVENT_ID, sessionId: SESSION_ID, agent: "claude-code", queuedAt: "2026-09-24T10:00:00.000Z", stuck: "BAD_SHAPE", stuckAt: hourAgo })
+          let posts = 0
+          const runtime = {
+            ...fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url }),
+            agent: () => ({
+              createBatched: async () => {
+                posts += 1
+                throw new MidaError("BAD_SHAPE" as never, "still malformed")
+              },
+            }),
+            reader: { hasAuthority: async () => true },
+          } as unknown as ServiceRuntime
+          const counts = await followPendingAnchors(runtime, () => {})
+          expect(posts).toBe(1)
+          expect(counts.waiting).toBe(1)
+          const [entry] = pendingAnchors(home)
+          expect(entry).toMatchObject({ stuck: "BAD_SHAPE" })
+          expect(Date.parse(entry!.stuckAt!)).toBeGreaterThan(Date.parse(hourAgo))
+          // and the pass right after does not POST again — the fresh stamp opened a new hour
+          const again = await followPendingAnchors(runtime, () => {})
+          expect(posts).toBe(1)
+          expect(again.waiting).toBe(1)
         } finally {
           await store.close()
         }
@@ -885,6 +1019,43 @@ describe("doctor — the batching check", () => {
     // the store says it was rejected — the rejection problem, not the stuck one
     const rejected = await doctorLines(home, { now: () => NOW, probeBatchSave: async () => ({ state: "REJECTED", reason: "READ_EPOCH_STALE" }) })
     expect(rejected).toContain("PROBLEM: a checkpoint save was rejected on chain (READ_EPOCH_STALE, session s1) — it was not anchored; check the agent's approval with `mida doctor`")
+  })
+
+  it("a save the store cannot accept is a PROBLEM naming the save, the plain reason and the fix (in-13 M-4)", async () => {
+    const home = batchedHome("http://127.0.0.1:1", false)
+    addPendingAnchor(home, {
+      contextId: CONTEXT_ID,
+      eventId: EVENT_ID,
+      sessionId: SESSION_ID,
+      agent: "claude-code",
+      queuedAt: "2026-09-24T10:00:00.000Z",
+      stuck: "TOO_LARGE",
+      stuckAt: "2026-09-24T11:00:00.000Z",
+    })
+    const lines = await doctorLines(home)
+    expect(lines).toContain("PROBLEM: a checkpoint save (cp-batched-1, session s1) cannot be resubmitted: the save does not fit in a batch — run `mida batching off` and save again; it retries once an hour meanwhile")
+    // it is not ALSO reported as silently pending or probed as a stuck batch
+    expect(lines.every((line) => !line.includes("pending anchor"))).toBe(true)
+    expect(lines.every((line) => !line.includes("waiting to anchor"))).toBe(true)
+  })
+
+  it("every stuck code has a plain-words line — never the raw wire code alone", async () => {
+    for (const [code, words] of [
+      ["BATCHING_DISABLED", "no longer offering batching"],
+      ["OWNER_NOT_ALLOWED", "not allowed to write"],
+      ["TOO_LARGE", "does not fit"],
+      ["BAD_SHAPE", "malformed"],
+      ["COMMITMENT_MISMATCH", "does not match"],
+      ["INVALID_WIRE", "not valid"],
+    ] as const) {
+      const home = batchedHome("http://127.0.0.1:1", false)
+      addPendingAnchor(home, { contextId: CONTEXT_ID, eventId: EVENT_ID, sessionId: SESSION_ID, agent: "claude-code", queuedAt: "2026-09-24T10:00:00.000Z", stuck: code, stuckAt: "2026-09-24T11:00:00.000Z" })
+      const lines = await doctorLines(home)
+      const problem = lines.find((line) => line.startsWith("PROBLEM: a checkpoint save"))
+      expect(problem).toBeDefined()
+      expect(problem).toContain(words)
+      expect(problem).toContain("retries once an hour")
+    }
   })
 })
 

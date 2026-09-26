@@ -15,6 +15,7 @@ import { ChainBusyError } from "@mida/chain"
 import { CHAIN_BUSY_TEXT, STORE_CHAIN_MISCONFIGURED_TEXT, STORE_RPC_AUTH_TEXT, MidaHome, NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
 import type { HandoffDeps, MigrationEnvelope, ProjectCheck, Runtime } from "@mida/midad"
 import { checkAccess } from "../src/handoff.js"
+import { addPendingAnchor, keepPendingPlaintext } from "../src/batching.js"
 import { enqueue } from "../src/queue.js"
 import { sampleCheckpoint } from "./helpers.js"
 
@@ -977,6 +978,38 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
 
   it("an empty queue adds no note", async () => {
     const dir = queueHome()
+    const { d } = deps(reads)
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).not.toContain("Mida note:")
+  })
+
+  // in-13 M-4: a save the store cannot accept is stuck between ledgers — already refused at the
+  // store, so it never reaches a PENDING_ANCHOR block, and still waiting for its hourly retry,
+  // so it is not a rejected anchor either. The queued-saves note is the one place it stays
+  // visible.
+  it("a batch save the store cannot accept counts in the note — nowhere else names it (in-13 M-4)", async () => {
+    const dir = queueHome()
+    const contextId = `0x${"ee".repeat(32)}` as Hex
+    addPendingAnchor(dir, { contextId, eventId: "cp-stuck-1", sessionId: "sess-stuck", agent: "claude-code", queuedAt: "2026-09-25T10:00:00.000Z", stuck: "TOO_LARGE", stuckAt: "2026-09-25T11:00:00.000Z" })
+    keepPendingPlaintext(dir, contextId, { value: { type: "mida.checkpoint.v1", projectId: "p1", sessionId: "sess-stuck" }, kind: "EPISODE", source: "AGENT_INFERRED", tags: [] })
+    const { d } = deps(reads)
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("Mida note: 1 newer save(s) from claude-code have not reached Monad yet; this record may be behind them.")
+    // agent names only — the kept plaintext's session id is never quoted into the note
+    expect(result.text).not.toContain("sess-stuck")
+  })
+
+  it("a pending batch save that is NOT stuck, or a stuck save for another project, adds nothing", async () => {
+    const dir = queueHome()
+    const stillTrying = `0x${"ef".repeat(32)}` as Hex
+    const otherProject = `0x${"f0".repeat(32)}` as Hex
+    addPendingAnchor(dir, { contextId: stillTrying, eventId: "cp-queued-1", sessionId: "sess-q1", agent: "claude-code", queuedAt: "2026-09-25T10:00:00.000Z" })
+    addPendingAnchor(dir, { contextId: otherProject, eventId: "cp-stuck-other", sessionId: "sess-so", agent: "claude-code", queuedAt: "2026-09-25T10:00:00.000Z", stuck: "BAD_SHAPE", stuckAt: "2026-09-25T11:00:00.000Z" })
+    keepPendingPlaintext(dir, otherProject, { value: { type: "mida.checkpoint.v1", projectId: "other-project", sessionId: "sess-so" }, kind: "EPISODE", source: "AGENT_INFERRED", tags: [] })
     const { d } = deps(reads)
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")

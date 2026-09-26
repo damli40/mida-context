@@ -812,7 +812,19 @@ export class MidaAgent {
       manifest: sealed.manifest,
       ciphertext: hexOf(sealed.ciphertext),
     }
-    const { receipt } = await this.#api.postBatchSave(wire)
+    let receipt: BatchReceipt
+    try {
+      ;({ receipt } = await this.#api.postBatchSave(wire))
+    } catch (error) {
+      // ALREADY_QUEUED is the queued answer through the error channel: the store already holds
+      // the save this POST attempted, but the 409 body does not echo which contextId that is.
+      // The attempted id rides on the error so a resubmitting caller (the midad drain) can keep
+      // following the save it already has instead of treating the answer as a refusal (in-13 M-4).
+      if ((error as { code?: unknown }).code === "ALREADY_QUEUED") {
+        ;(error as { contextId?: Hex }).contextId = contextId
+      }
+      throw error
+    }
     return { contextId, state: "QUEUED", receipt }
   }
 

@@ -14,7 +14,7 @@ import type { RevocationTarget } from "@mida/api"
 import type { LocalAccount } from "viem"
 import { batchClient, batchStatusProbe, decideLane, pendingAnchors, rejectedAnchors } from "./batching.js"
 import type { Lane, PendingAnchor } from "./batching.js"
-import { laneWhyText } from "./batching.js"
+import { laneWhyText, resubmitStuckText } from "./batching.js"
 import { callDaemon } from "./control.js"
 import { codeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
@@ -774,12 +774,28 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             ),
           )
         }
-        const pending = pendingAnchors(home)
-        if (pending.length > 0) {
+        // in-13 M-4: a save the store already judged unchangeable is not "pending" — it was
+        // refused as composed and is waiting out its hourly retry. Each is a named PROBLEM so
+        // it never reads as an ordinary stuck batch or a quietly young anchor.
+        const live: PendingAnchor[] = []
+        for (const entry of pendingAnchors(home)) {
+          if (entry.stuck === undefined) {
+            live.push(entry)
+            continue
+          }
+          const text = resubmitStuckText(entry.stuck)
+          lines.push(
+            problem(
+              `a checkpoint save (${entry.eventId}, session ${entry.sessionId}) cannot be resubmitted: ${text.what}`,
+              `${text.fix}; it retries once an hour meanwhile`,
+            ),
+          )
+        }
+        if (live.length > 0) {
           const nowMs = (deps.now ?? Date.now)()
           const young: PendingAnchor[] = []
           const old: PendingAnchor[] = []
-          for (const entry of pending) {
+          for (const entry of live) {
             const queuedAt = Date.parse(entry.queuedAt)
             ;(Number.isNaN(queuedAt) || nowMs - queuedAt >= STUCK_ANCHOR_MS ? old : young).push(entry)
           }
