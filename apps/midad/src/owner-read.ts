@@ -247,12 +247,15 @@ async function readBatchedUniverse(
     ...(toBlock === undefined ? {} : { toBlock }),
   }, { maxRange: runtime.network.logBlockRange, onProgress })
 
-  // SaveAnchored ids after the bound — scanned on demand when a store row misses (fresh each
-  // time, so a registration that lands mid-read is still seen), and consulted once more at the
-  // end so `afterHead` counts every save the chain registered post-bound, whether or not the
-  // store ever listed its row.
-  const anchoredAfterHead = async (): Promise<Set<Hex>> =>
-    toBlock === undefined ? new Set() : idsLoggedAfter(runtime, batchAnchor, SAVE_ANCHORED, toBlock)
+  // SaveAnchored ids after the bound — scanned ONCE, lazily, at the freshest head the call
+  // sees; every store row the bounded scan never logged is judged by the same answer, and the
+  // same set counts the post-bound saves the store never listed. One range scan per read, not
+  // one per missed row (ex-4 G-3).
+  let postBoundScan: Promise<Set<Hex>> | undefined
+  const anchoredAfterHead = (): Promise<Set<Hex>> =>
+    (postBoundScan ??= toBlock === undefined
+      ? Promise.resolve(new Set())
+      : idsLoggedAfter(runtime, batchAnchor, SAVE_ANCHORED, toBlock))
 
   if (logs.length === 0) {
     for (const id of await anchoredAfterHead()) afterHead?.add(id)
@@ -280,6 +283,9 @@ async function readBatchedUniverse(
   }
 
   const records: (SourceRecord & { lane: "batched" })[] = []
+  // Anchored store rows the bounded log scan never named — judged once, after every namespace's
+  // list is in, against the shared post-bound scan.
+  const missedAnchored = new Set<Hex>()
   // Anchoring block timestamps, fetched once per block — a batched record's createdAt is when the
   // chain recorded it, the same thing a direct record's createdAt means.
   const blockTimes = new Map<bigint, bigint>()
@@ -308,17 +314,11 @@ async function readBatchedUniverse(
     for (const item of items) {
       const contextId = item.contextId.toLowerCase() as Hex
       rows.set(contextId, item)
-      // A row the store calls ANCHORED that the chain never logged for this owner: the two
-      // sources disagree, so the record cannot be certified — named, never trusted. Unless
-      // the anchor landed after the bound: then the save is newer than the read, counted
-      // through `afterHead` and left out.
-      if (item.state === "ANCHORED" && !anchoredIds.has(contextId)) {
-        if ((await anchoredAfterHead()).has(contextId)) {
-          afterHead?.add(contextId)
-          continue
-        }
-        failures.push({ contextId, reason: "anchored in the store's batch table but not in the owner's SaveAnchored logs" })
-      }
+      // A row the store calls ANCHORED that the chain never logged for this owner is judged
+      // once every namespace's list is in, by the shared post-bound scan below: an anchor that
+      // landed after the bound is newer than the read — counted through `afterHead` — and a
+      // row the chain never anchored anywhere stays a refusal, named, never trusted.
+      if (item.state === "ANCHORED" && !anchoredIds.has(contextId)) missedAnchored.add(contextId)
     }
     const namespaceSecret = await runtime.vault.deriveNamespaceSecret(nsId)
     for (const save of nsLogs) {
@@ -406,8 +406,16 @@ async function readBatchedUniverse(
       for (const save of nsLogs) failures.push({ contextId: save.contextId, reason: "the store's batch list was partial" })
     }
   }
-  // Post-bound anchors the store never showed still count as "landed after the bound".
-  for (const id of await anchoredAfterHead()) afterHead?.add(id)
+  // The one post-bound scan decides every missed store row and the after-head count: a row
+  // the post-bound scan names anchored "landed after the read started" — left out and counted
+  // — while a row the chain never anchored anywhere is the inconsistency it always was.
+  const postBoundAnchors = await anchoredAfterHead()
+  for (const contextId of missedAnchored) {
+    if (!postBoundAnchors.has(contextId)) {
+      failures.push({ contextId, reason: "anchored in the store's batch table but not in the owner's SaveAnchored logs" })
+    }
+  }
+  for (const id of postBoundAnchors) afterHead?.add(id)
   return records
 }
 
@@ -446,14 +454,15 @@ export async function readOwnerUniverse(
   const keepEncrypted = options?.keepEncrypted === true
   const failures: ReadFailure[] = []
 
-  // ContextRegistered ids after the bound — scanned on demand when a store row misses (fresh
-  // each time, so a registration that lands mid-read is still seen), and consulted once more
-  // at the end so `afterHead` counts every save the chain registered post-bound, whether or
-  // not the store ever listed its row.
-  const registeredAfterHead = async (): Promise<Set<Hex>> =>
-    options?.toBlock === undefined
-      ? new Set()
-      : idsLoggedAfter(runtime, deployment.contextRegistry, CONTEXT_REGISTERED, options.toBlock)
+  // ContextRegistered ids after the bound — scanned ONCE, lazily, at the freshest head the
+  // call sees; every store row the bounded scan never logged is judged by the same answer,
+  // and the same set counts the post-bound registrations the store never listed. One range
+  // scan per read, not one per missed row (ex-4 G-3).
+  let postBoundScan: Promise<Set<Hex>> | undefined
+  const registeredAfterHead = (): Promise<Set<Hex>> =>
+    (postBoundScan ??= options?.toBlock === undefined
+      ? Promise.resolve(new Set())
+      : idsLoggedAfter(runtime, deployment.contextRegistry, CONTEXT_REGISTERED, options.toBlock))
 
   const batched = await readBatchedUniverse(runtime, failures, options?.onProgress, keepEncrypted, options?.toBlock, options?.afterHead)
   if (logs.length === 0) {
@@ -484,6 +493,9 @@ export async function readOwnerUniverse(
   }
 
   const decrypted = new Map<Hex, SourceRecord>()
+  // Store rows the bounded log scan never named — judged once, after every namespace's list
+  // is in, against the shared post-bound scan.
+  const missedRows = new Set<Hex>()
 
   for (const [nsId, chainIds] of byNamespace) {
     let namespace: string
@@ -512,13 +524,10 @@ export async function readOwnerUniverse(
       const contextId = object.contextId.toLowerCase() as Hex
       seen.add(contextId)
       if (!chainRecords.has(contextId)) {
-        // Registered after the bound — the save is newer than this read, not an inconsistency:
-        // left out and counted through `afterHead`. The chain saying nothing anywhere stays a refusal.
-        if ((await registeredAfterHead()).has(contextId)) {
-          options?.afterHead?.add(contextId)
-          continue
-        }
-        failures.push({ contextId, reason: "in the store but not in the owner's ContextRegistered logs" })
+        // Registered after the bound? — judged once every namespace's list is in, by the
+        // shared post-bound scan below: the save is newer than this read, not an
+        // inconsistency. The chain saying nothing anywhere stays a refusal.
+        missedRows.add(contextId)
         continue
       }
       if (!chainIds.has(contextId)) {
@@ -590,10 +599,19 @@ export async function readOwnerUniverse(
     }
   }
 
+  // The one post-bound scan decides every missed store row and the after-head count: a row
+  // the scan names registered "landed after the read started" — left out and counted — while
+  // a row the chain never registered anywhere is the inconsistency it always was.
+  const postBound = await registeredAfterHead()
+  for (const contextId of missedRows) {
+    if (postBound.has(contextId)) options?.afterHead?.add(contextId)
+    else failures.push({ contextId, reason: "in the store but not in the owner's ContextRegistered logs" })
+  }
+
   if (failures.length > 0) throw ownerReadIncomplete(failures)
 
   // Post-bound registrations the store never showed still count as "landed after the bound".
-  for (const id of await registeredAfterHead()) options?.afterHead?.add(id)
+  for (const id of postBound) options?.afterHead?.add(id)
 
   // Registration order — the chain's own ordering of the owner's history — then the batched
   // items in their SaveAnchored order: the two lanes come from different contracts, so each

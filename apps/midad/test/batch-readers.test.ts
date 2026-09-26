@@ -747,6 +747,27 @@ describe("readOwnerUniverse — the batched half of the history", () => {
     expect([...afterHead]).toEqual([late.contextId])
   })
 
+  it("three anchored store rows the bound never logged cost ONE post-bound scan", async () => {
+    // ex-4 G-3, batched lane: every missed ANCHORED row is judged by a single SaveAnchored
+    // scan past the bound — not one fresh range scan per row.
+    const old = await makeAnchored()
+    const late = [await makeAnchored(), await makeAnchored(), await makeAnchored()]
+    const logCalls: string[] = []
+    const runtime = fakeOwnerRuntime({
+      logs: { SaveAnchored: [old.log] },
+      lateLogs: { SaveAnchored: late.map((entry) => entry.log) },
+      items: [old.item, ...late.map((entry) => entry.item)],
+      batchRoot: old.leaf,
+      logCalls,
+    })
+    const afterHead = new Set<Hex>()
+    const records = await readOwnerUniverse(runtime, { keepEncrypted: true, toBlock: 100n, afterHead })
+    expect(records.map((record) => record.contextId)).toEqual([old.contextId])
+    expect([...afterHead].sort()).toEqual(late.map((entry) => entry.contextId).sort())
+    // one bounded SaveAnchored scan + the single post-bound re-check — never one scan per row
+    expect(logCalls.filter((name) => name === "SaveAnchored")).toHaveLength(2)
+  })
+
   it("a batched row with no SaveAnchored anywhere still refuses — the bound is not an excuse", async () => {
     const old = await makeAnchored()
     const late = await makeAnchored()

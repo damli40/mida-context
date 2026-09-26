@@ -470,6 +470,82 @@ describe("mida export — dispatch and refusals", () => {
     expect([...emptyUniverse]).toEqual([lateId])
   })
 
+  it("missed store rows are re-checked in ONE fresh-head scan — a row one block past the bound counts, three rows cost one scan", async () => {
+    // ex-4 G-3: the store's RPC can sit a block or two ahead of the exporter's bound. Every
+    // store row the bounded scan never logged is re-checked against ONE post-bound scan at the
+    // freshest head — today each missed row re-scans the whole range itself. Three rows
+    // registered at 43 (one block past the bound of 42) count as "landed after", never refused,
+    // and cost exactly one scan.
+    const SECRET = new Uint8Array(32).fill(7)
+    const oldId = `0x${"0a".repeat(32)}` as Hex
+    const lateIds = [`0x${"0b".repeat(32)}` as Hex, `0x${"0c".repeat(32)}` as Hex, `0x${"0d".repeat(32)}` as Hex]
+    const sealed = sealContextObject({
+      payload: { v: 1, value: { text: "the record the bound knows" }, kind: "EPISODE", provenance: { source: "AGENT_INFERRED" } },
+      binding: {
+        chainId: network.deployment.chainId,
+        contextRegistry: network.deployment.contextRegistry,
+        contextId: oldId,
+        namespaceId: NS_PROJECTS,
+        readEpoch: 1n,
+      },
+      epochPublicKey: deriveEpochKeyPair(SECRET, 1n).publicKey,
+    })
+    const chainRow = {
+      owner: OWNER,
+      namespaceId: NS_PROJECTS,
+      manifestHash: sealed.manifestHash,
+      author: OWNER_AUTHOR_ID,
+      recordType: 0,
+      kind: CONTEXT_KIND.EPISODE,
+      provenanceSource: PROVENANCE_SOURCE.AGENT_INFERRED,
+      lineagePolicy: 0,
+      lineageId: oldId,
+      parentId: zeroHash,
+      version: 1,
+      readEpoch: 1n,
+      createdAt: 100n,
+      expiresAt: 0n,
+    }
+    let postBoundScans = 0
+    const runtime = {
+      owner: OWNER,
+      ownerStartBlock: 0n,
+      network,
+      ownerChain: {
+        publicClient: {
+          getBlockNumber: async () => 50n,
+          getLogs: async ({ event, fromBlock }: { event: { name: string }; fromBlock: bigint }) => {
+            if (event.name !== "ContextRegistered") return []
+            // A post-bound query: fromBlock past the export's head. This is the re-check —
+            // counted here so the test can prove it ran once for all three rows.
+            if (fromBlock > 42n) {
+              postBoundScans += 1
+              return lateIds.map((contextId, index) => ({ args: { contextId }, blockNumber: 43n, logIndex: index }))
+            }
+            return [{ args: { contextId: oldId, record: { namespaceId: NS_PROJECTS } }, blockNumber: 10n, logIndex: 0 }]
+          },
+        },
+      },
+      ownerApi: {
+        listObjects: async () => ({
+          objects: [
+            { contextId: oldId, manifestHash: sealed.manifestHash, manifest: sealed.manifest, ciphertext: hexOf(sealed.ciphertext) },
+            ...lateIds.map((contextId) => ({ contextId, manifestHash: zeroHash, manifest: {}, ciphertext: "0x" })),
+          ],
+          partial: false,
+        }),
+      },
+      vault: { deriveNamespaceSecret: async () => SECRET },
+      reader: { getRecord: async (id: Hex) => (id === oldId ? chainRow : null) },
+    } as unknown as Runtime
+
+    const afterHead = new Set<Hex>()
+    const records = await readOwnerUniverse(runtime, { keepEncrypted: true, toBlock: 42n, afterHead })
+    expect(records.map((record) => record.contextId)).toEqual([oldId])
+    expect([...afterHead].sort()).toEqual([...lateIds].sort())
+    expect(postBoundScans).toBe(1)
+  })
+
   it("owner-read-incomplete through exportRecords throws naming the contextIds and leaves nothing", async () => {
     const home = ownerHome()
     const cwd = tempDir()
