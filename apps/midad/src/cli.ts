@@ -862,8 +862,38 @@ async function runBatching(runtime: ServiceRuntime, arg: string | undefined, dep
  * never echoed because it could carry data. `agent` is the command's subject — for `remember`
  * argv[1] is fact text, but the agent-naming codes cannot surface from remember anyway.
  */
+/**
+ * Whether a `mida migrate` (or `--undo`) run may already have sent transactions, judged from
+ * the persisted state file — the only record that survives a crash mid-send. `step` names the
+ * last FINISHED phase and sends begin inside target-setup, so a step at or past "manifest"
+ * means "nothing was sent" would be a false claim; a completed move ("switched") counts too —
+ * its sends happened, and an undone-or-failed re-run still must not claim otherwise. An
+ * unreadable state file fails closed to mid-run: never claim "nothing was sent" when the one
+ * ledger that could prove it cannot be read.
+ */
+const migrateMayHaveSent = (home: MidaHome | undefined): boolean => {
+  if (home === undefined) return false
+  let step: unknown
+  try {
+    const state = home.readJson<{ step?: unknown }>("migrate/state.json")
+    if (state === undefined) return false
+    step = state.step
+  } catch {
+    return true
+  }
+  return typeof step !== "string" || !["preview", "paused", "backed-up"].includes(step)
+}
+
 export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string, capabilityRegistry?: string, home?: MidaHome): string {
   const code = refusalCode(error)
+  // The "nothing was sent/written" claims are true only before migrate's first transaction —
+  // once the persisted step passes the no-send prefix the honest line says the move stopped
+  // partway and names the two real routes: a re-run resumes from the state file, --undo
+  // restores the backup (ex-3 E-1).
+  const partway =
+    command === "migrate" && migrateMayHaveSent(home)
+      ? "the move stopped partway — run `mida migrate` again to resume it, or `mida migrate --undo` to go back"
+      : undefined
   switch (code) {
     // The owner saw the preview and answered something other than yes — nothing was signed.
     case "not-approved": return "not approved"
@@ -952,25 +982,37 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
         ids.length === 0 ? "" : `: ${ids.slice(0, 10).join(", ")}${ids.length > 10 ? `, and ${ids.length - 10} more` : ""}`
       const why = reasons.length === 0 ? "" : ` (${reasons.join("; ")})`
       const head =
-        ids.length === 0
-          ? "the owner read could not verify every record — nothing was written"
-          : `${ids.length} record(s) could not be read back — nothing was written`
+        partway !== undefined
+          ? `${ids.length === 0 ? "the owner read" : `${ids.length} record(s)`} could not be read back — ${partway}`
+          : ids.length === 0
+            ? "the owner read could not verify every record — nothing was written"
+            : `${ids.length} record(s) could not be read back — nothing was written`
       return `${head}${named}${why}`
     }
     case "chain-busy":
-      return "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again"
+      return partway === undefined
+        ? "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again"
+        : `Monad is busy right now — ${partway}`
     // Not busy — a setup the owner must fix: the RPC answered but the configured address held
     // no Mida contract, or the provider refused the credential (in-11 R-8).
     case "chain-misconfigured":
-      return "the RPC answered but found no Mida contract — check MONAD_TESTNET_RPC or this setup's network.json; nothing was sent or decided"
+      return partway === undefined
+        ? "the RPC answered but found no Mida contract — check MONAD_TESTNET_RPC or this setup's network.json; nothing was sent or decided"
+        : `the RPC answered but found no Mida contract — check MONAD_TESTNET_RPC or this setup's network.json; ${partway}`
     case "rpc-auth":
-      return "the RPC provider refused the key — check the provider URL in MONAD_TESTNET_RPC or network.json; nothing was sent or decided"
+      return partway === undefined
+        ? "the RPC provider refused the key — check the provider URL in MONAD_TESTNET_RPC or network.json; nothing was sent or decided"
+        : `the RPC provider refused the key — check the provider URL in MONAD_TESTNET_RPC or network.json; ${partway}`
     // The same failures when the STORE reported them: whose RPC broke is the store's, so the
     // advice names the store operator, not this setup's MONAD_TESTNET_RPC (in-12 N-8).
     case "store-misconfigured":
-      return "the store's connection to Monad is misconfigured — the store operator must fix it; nothing was sent or decided"
+      return partway === undefined
+        ? "the store's connection to Monad is misconfigured — the store operator must fix it; nothing was sent or decided"
+        : `the store's connection to Monad is misconfigured — the store operator must fix it; ${partway}`
     case "store-rpc-auth":
-      return "the store's RPC key was refused — the store operator must fix it; nothing was sent or decided"
+      return partway === undefined
+        ? "the store's RPC key was refused — the store operator must fix it; nothing was sent or decided"
+        : `the store's RPC key was refused — the store operator must fix it; ${partway}`
     // A chain error with no code: the line names this setup's contract so a wrong deployment
     // explains itself, and names the flag that prints the masked detail.
     case "CHAIN_CALL_FAILED": {

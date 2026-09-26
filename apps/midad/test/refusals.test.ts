@@ -126,6 +126,62 @@ describe("ownerRefusalLine (R4-5)", () => {
     expect(line).not.toContain("boom")
     expect(line).not.toContain("busy")
   })
+
+  // ex-3 E-1 — the "nothing was sent/written/decided" claims are only true before migrate's
+  // first transaction. migrate/state.json records the last FINISHED step and sends begin
+  // inside target-setup, so a persisted step at or past "manifest" means a failed run may
+  // already have moved records — the honest line says the move stopped partway and names the
+  // real next steps: a plain re-run (the state file resumes) and `mida migrate --undo` (the
+  // backup migrate itself wrote).
+  it("migrate: a chain error before any send keeps the 'nothing was sent' line", () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-refuse-")))
+    expect(ownerRefusalLine("migrate", "", coded("chain-busy"), undefined, undefined, home)).toBe(
+      "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again",
+    )
+    // …and the same holds while the persisted step is still in the no-send prefix.
+    for (const step of ["preview", "paused", "backed-up"]) {
+      home.writeSecretJson("migrate/state.json", { version: 1, step })
+      expect(ownerRefusalLine("migrate", "", coded("chain-busy"), undefined, undefined, home)).toBe(
+        "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again",
+      )
+    }
+  })
+
+  it("migrate: a chain error after the first send must not claim 'nothing was sent'", () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-refuse-")))
+    home.writeSecretJson("migrate/state.json", { version: 1, step: "records" })
+    const line = ownerRefusalLine("migrate", "", coded("chain-busy"), undefined, undefined, home)
+    expect(line).toContain("busy")
+    expect(line).not.toContain("nothing was sent")
+    expect(line).not.toContain("nothing was written")
+    expect(line).not.toContain("nothing was decided")
+    expect(line).toContain("`mida migrate`")
+    expect(line).toContain("--undo")
+  })
+
+  it("migrate: a read gap in the replay step gets the partway line — 'nothing was written' is false", () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-refuse-")))
+    home.writeSecretJson("migrate/state.json", { version: 1, step: "records" })
+    const error = Object.assign(coded("owner-read-incomplete"), {
+      contextIds: [`0x${"cd".repeat(32)}`],
+      reasons: ["read-back-failed"],
+    })
+    const line = ownerRefusalLine("migrate", "", error, undefined, undefined, home)
+    expect(line).toContain("could not be read back")
+    expect(line).not.toContain("nothing was written")
+    expect(line).toContain("`mida migrate`")
+    expect(line).toContain("--undo")
+  })
+
+  it("migrate: an unreadable state.json fails closed — no 'nothing was sent' claim", () => {
+    // The persisted step is the only proof of how far a run got; a file that will not parse
+    // must not earn the pre-send wording.
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-refuse-")))
+    mkdirSync(home.path("migrate"), { recursive: true })
+    writeFileSync(home.path("migrate/state.json"), "not json")
+    const line = ownerRefusalLine("migrate", "", coded("chain-busy"), undefined, undefined, home)
+    expect(line).not.toContain("nothing was sent")
+  })
 })
 
 /**
