@@ -10,7 +10,8 @@ import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { movedOnSuffix } from "./migration-envelope.js"
 import { checkProject } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
-import { isSafeName } from "./queue.js"
+import { isSafeName, peekJobs, projectIdFor } from "./queue.js"
+import type { CaptureJob } from "./queue.js"
 import { readOwnerFacts } from "./remember.js"
 import type { MidaHome } from "./home.js"
 import type { ServiceRuntime } from "./runtime.js"
@@ -112,6 +113,50 @@ export const PARTIAL_LINE = "Some saved context could not be loaded yet; what fo
 export const PENDING_ANCHOR_LINE = "PENDING_ANCHOR: not yet anchored on Monad; may still be rejected"
 const HANDOFF_BEGIN = "=== BEGIN MIDA HANDOFF DATA ==="
 const HANDOFF_TAIL = "=== END MIDA HANDOFF DATA ==="
+
+/** The queued-job scan reads at most this many files — a flooded queue costs one bounded look. */
+const QUEUE_NOTE_SCAN_LIMIT = 200
+
+/**
+ * H4 — the handoff says when Mida's own newer saves have not left this machine yet. One bounded,
+ * strictly read-only look at the hook queue: jobs belonging to THIS project (a folder with no
+ * `.mida` marker, or a marker that cannot be read, tells us nothing and is skipped) are counted
+ * per agent, and a session state showing a failed drain attempt adds the retry clause. The note
+ * reports what is queued — it never removes, re-orders, waits on or triggers a job, and a queue
+ * that cannot be read degrades to no line at all, never a refused handoff.
+ */
+function queuedSavesNote(home: MidaHome, projectId: string): string | null {
+  let jobs: CaptureJob[]
+  try {
+    jobs = peekJobs(home, QUEUE_NOTE_SCAN_LIMIT)
+  } catch {
+    return null
+  }
+  const perAgent = new Map<string, number>()
+  let lastTryFailed = false
+  for (const job of jobs) {
+    if (!isSafeName(job.agent)) continue
+    let jobProject: string | null
+    try {
+      jobProject = projectIdFor(job.cwd)
+    } catch {
+      continue
+    }
+    if (jobProject !== projectId) continue
+    perAgent.set(job.agent, (perAgent.get(job.agent) ?? 0) + 1)
+    // the drainer records a failed try on the session's own state file — read-only, and an
+    // unreadable or malformed state only loses the retry clause, never the count
+    try {
+      const state = home.readJson<{ attempts?: unknown }>(`queue/state/${job.sessionId}.json`)
+      if (typeof state?.attempts === "number" && state.attempts > 0) lastTryFailed = true
+    } catch { /* keep the count, drop the clause */ }
+  }
+  if (perAgent.size === 0) return null
+  const parts = [...perAgent.entries()].map(([name, count], index) =>
+    index === 0 ? `${count} newer save(s) from ${name}` : `${count} from ${name}`,
+  )
+  return `Mida note: ${parts.join(", ")} have not reached Monad yet; this record may be behind them${lastTryFailed ? " (the last try failed; Mida keeps retrying)" : ""}.`
+}
 
 /** The generic refusal line — the only text a session-start hook prints on its own failures. */
 export function noContextText(code: string): string {
@@ -294,6 +339,10 @@ export async function buildHandoff(
       ? "Here the current state is the files and git: check git status / git diff before changing anything."
       : undefined
 
+    // Mida's own undelivered saves are newer work this record cannot know — one read-only count,
+    // after access is granted and scoped to this project. Never a queue control.
+    const pendingSavesNote = queuedSavesNote(runtime.home, check.projectId) ?? undefined
+
     const now = deps.now ?? (() => Date.now())
     const readStarted = now()
     // `settled` never rejects, so a read that finishes or fails after the deadline is discarded
@@ -337,8 +386,9 @@ export async function buildHandoff(
     const facts = factOutcome.status === "ok" ? factOutcome.facts : []
     const factsFailed = factOutcome.status === "ok" ? null : factOutcome.status === "slow" ? "facts-read-slow" : "facts-read-failed"
     // A pending batched save is usable at once but is never described as saved (Amendment B.3):
-    // it stays OUT of the merge — every merged section reads as anchored state, the fence calls
-    // it "saved working state" — and renders as its own marked block inside the fence instead.
+    // it stays OUT of the merge — every merged section reads as anchored state, and the header's
+    // save time counts anchored records only — and renders as its own marked block inside the
+    // fence instead.
     const pending = outcome.checkpoints.filter((cp) => cp.anchor === "PENDING_ANCHOR")
     const merged = mergeCheckpoints(outcome.checkpoints.filter((cp) => cp.anchor !== "PENDING_ANCHOR"))
     const pendingText = pending.map((cp) => pendingBlock(cp, input.authorNames)).join("\n\n")
@@ -371,7 +421,7 @@ export async function buildHandoff(
       // Pending saves carry no chain placement — this orders on the writer's claim alone, which
       // is all a not-yet-anchored record has; it only picks whose line renders, never "current".
       const newestPending = pending.slice().sort(compareChainOrder).at(-1)
-      const preamble = [handoffHeader(null), adapterNote].filter((line): line is string => line !== undefined).join("\n")
+      const preamble = [handoffHeader(null), adapterNote, pendingSavesNote].filter((line): line is string => line !== undefined).join("\n")
       return {
         kind: "handoff",
         text: `${outcome.partial ? `${PARTIAL_LINE}\n\n` : ""}${preamble}\n${HANDOFF_BEGIN}\n\n${pendingText}\n\n${HANDOFF_TAIL}`,
@@ -422,7 +472,7 @@ export async function buildHandoff(
           return migration === undefined ? row : { ...row, createdAt: `${row.createdAt} ${movedOnSuffix(migration)}` }
         }),
       },
-      { authorNames: input.authorNames, facts, factsFailed, adapterNote, now },
+      { authorNames: input.authorNames, facts, factsFailed, adapterNote, pendingSavesNote, now },
     )
     const text = (() => {
       if (pending.length === 0) return rendered.text

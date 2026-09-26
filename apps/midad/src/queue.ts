@@ -63,6 +63,27 @@ export function listJobs(home: MidaHome): CaptureJob[] {
   return jobs
 }
 
+/**
+ * The same listing as listJobs but strictly read-only, for a caller that only reports on the
+ * queue — the handoff's "newer saves have not reached Monad" line. A file that will not parse
+ * is skipped in place, never moved aside: reporting must not reorder, quarantine or otherwise
+ * touch the drainer's work list. `limit` bounds the files READ, oldest first — a flooded queue
+ * costs one bounded look, not an unbounded one. A queue folder that cannot be listed at all
+ * still throws — the caller decides whether that is a refused answer or a quietly missing note.
+ */
+export function peekJobs(home: MidaHome, limit = Number.POSITIVE_INFINITY): CaptureJob[] {
+  const jobs: CaptureJob[] = []
+  for (const name of home.list("queue").filter((n) => n.endsWith(".json")).sort().slice(0, limit)) {
+    try {
+      const job = asJob(home.readJson<unknown>(`queue/${name}`), name.slice(0, -".json".length))
+      if (job !== undefined) jobs.push(job)
+    } catch {
+      // skipped where it sits — a read-only view leaves even a corrupt file exactly as found
+    }
+  }
+  return jobs
+}
+
 export function removeJob(home: MidaHome, id: string): void {
   home.remove(`queue/${id}.json`)
 }

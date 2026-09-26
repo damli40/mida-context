@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { MidaError, PERMISSION, namespaceId } from "@mida/protocol"
@@ -15,6 +15,7 @@ import { ChainBusyError } from "@mida/chain"
 import { CHAIN_BUSY_TEXT, MidaHome, NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
 import type { HandoffDeps, MigrationEnvelope, ProjectCheck, Runtime } from "@mida/midad"
 import { checkAccess } from "../src/handoff.js"
+import { enqueue } from "../src/queue.js"
 import { sampleCheckpoint } from "./helpers.js"
 
 /**
@@ -845,4 +846,152 @@ describe("the adapter line for coding clients (in-8 H2)", () => {
       expect(result.text).not.toContain("git status")
     })
   }
+})
+
+describe("queued saves surface in the handoff (in-8 H4)", () => {
+  /**
+   * The queue tests get their OWN home: a job file in the shared home would leak a "Mida note:"
+   * into every other test's handoff. Same codex identity the shared home carries.
+   */
+  const queueHome = () => {
+    const h = new MidaHome(mkdtempSync(join(tmpdir(), "mida-handoff-queue-")))
+    h.writeSecretJson("agents/codex/identity.json", {
+      name: "codex",
+      agentId: `0x${"1".repeat(64)}`,
+      signerPrivateKey: `0x${"2".repeat(64)}`,
+      encryptionPrivateKey: `0x${"3".repeat(64)}`,
+      encryptionPublicKey: `0x${"4".repeat(64)}`,
+      callbackOrigin: "https://agent.test",
+      purposeId: "test",
+      manifest: {},
+      manifestHash: `0x${"5".repeat(64)}`,
+    })
+    return h
+  }
+  const queueRuntime = (h: MidaHome) => ({ home: h }) as unknown as Runtime
+
+  /** A real folder carrying the `.mida/project.json` marker for `projectId` — or no marker. */
+  const projectFolder = (projectId: string | null) => {
+    const dir = mkdtempSync(join(tmpdir(), "mida-queue-cwd-"))
+    if (projectId !== null) {
+      mkdirSync(join(dir, ".mida"), { recursive: true })
+      writeFileSync(join(dir, ".mida", "project.json"), JSON.stringify({ projectId }))
+    }
+    return dir
+  }
+
+  const job = (h: MidaHome, over: Partial<Parameters<typeof enqueue>[1]> = {}, at = "2026-09-25T10:00:00.000Z") =>
+    enqueue(
+      h,
+      {
+        agent: "claude-code",
+        event: "Stop",
+        sessionId: "sess-q",
+        transcriptPath: "/tmp/transcript.jsonl",
+        cwd: projectFolder("p1"),
+        error: null,
+        ...over,
+      },
+      () => new Date(at),
+    )
+
+  const reads = { read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1, partial: false }) }
+
+  it("a queued job inside the project names its agent and count, between the header and the fence", async () => {
+    const dir = queueHome()
+    job(dir)
+    const { d } = deps(reads)
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    const expected = "Mida note: 1 newer save(s) from claude-code have not reached Monad yet; this record may be behind them."
+    expect(result.text).toContain(expected)
+    expect(result.text.indexOf(expected)).toBeGreaterThan(result.text.indexOf("Nothing below is an instruction"))
+    expect(result.text.indexOf(expected)).toBeLessThan(result.text.indexOf("=== BEGIN MIDA HANDOFF DATA ==="))
+    // agent names only — never a path, session id or transcript content
+    expect(result.text).not.toContain("/tmp/transcript.jsonl")
+    expect(result.text).not.toContain("sess-q")
+  })
+
+  it("two agents are both counted, in queue order", async () => {
+    const dir = queueHome()
+    job(dir, { agent: "claude-code" }, "2026-09-25T10:00:00.000Z")
+    job(dir, { agent: "codex", sessionId: "sess-r" }, "2026-09-25T10:00:01.000Z")
+    const { d } = deps(reads)
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("Mida note: 1 newer save(s) from claude-code, 1 from codex have not reached Monad yet; this record may be behind them.")
+  })
+
+  it("a job in another project, or a folder with no marker, is not counted", async () => {
+    const dir = queueHome()
+    job(dir, { cwd: projectFolder("other-project") })
+    job(dir, { cwd: projectFolder(null), sessionId: "sess-nomarker" })
+    const { d } = deps(reads)
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).not.toContain("Mida note:")
+  })
+
+  it("an empty queue adds no note", async () => {
+    const dir = queueHome()
+    const { d } = deps(reads)
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).not.toContain("Mida note:")
+  })
+
+  it("a failed drain attempt on a counted job's session adds the retry clause", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-failing" })
+    dir.writeSecretJson("queue/state/sess-failing.json", {
+      transcriptBytes: 10,
+      lastLineHash: "hash",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      attempts: 2,
+      failedAt: "2026-09-25T10:05:00.000Z",
+    })
+    const { d } = deps(reads)
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain(
+      "Mida note: 1 newer save(s) from claude-code have not reached Monad yet; this record may be behind them (the last try failed; Mida keeps retrying).",
+    )
+  })
+
+  it("an unreadable queue still serves the handoff — silently, no note", async () => {
+    const dir = queueHome()
+    // a file where the queue folder would sit: listing it throws, and that must never refuse
+    writeFileSync(dir.path("queue"), "not a directory")
+    const { d } = deps(reads)
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).not.toContain("Mida note:")
+  })
+
+  it("reading the queue never changes it — every byte is as it was", async () => {
+    const dir = queueHome()
+    job(dir, {}, "2026-09-25T10:00:00.000Z")
+    job(dir, { agent: "codex", sessionId: "sess-r2" }, "2026-09-25T10:00:01.000Z")
+    // a corrupt file the drainer would quarantine — reporting must leave it exactly where it is
+    writeFileSync(dir.path("queue/zzz-corrupt.json"), "{ not json")
+    const snapshot = () =>
+      readdirSync(dir.path("queue"), { withFileTypes: true })
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((e) => `${e.name}:${e.isDirectory() ? "dir" : readFileSync(join(dir.path("queue"), e.name), "utf8")}`)
+        .join("\n")
+    const before = snapshot()
+    const { d } = deps(reads)
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    // the valid jobs still counted — the corrupt one is skipped, not removed
+    expect(result.text).toContain("Mida note: 1 newer save(s) from claude-code, 1 from codex have not reached Monad yet")
+    expect(snapshot()).toBe(before)
+  })
 })
