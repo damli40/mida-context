@@ -185,10 +185,13 @@ function measureDestination(
  * The record's TRUE origin (Task 4b). A payload carrying a valid migration envelope was moved
  * at least once already — its origin is that envelope's, copied verbatim, so moving it again
  * still names the first contract and the first stating time. A payload with no envelope
- * originates on the immediate source. A `migration` key that fails validation is never silently
+ * originates on the immediate source — and its `createdAt` is the source chain's record stamp,
+ * never the writer's own claim: the envelope is the one channel through which a sealed time
+ * could order the moved record on the target, so a slow or forged clock must not ride it into
+ * `originalCreatedAt` (in-13b M-1). A `migration` key that fails validation is never silently
  * overwritten: `invalid-source-envelope`, naming the record.
  */
-function originOf(record: SourceRecord, createdAt: string, source: Deployment): ManifestOrigin {
+function originOf(record: SourceRecord, source: Deployment): ManifestOrigin {
   const value = record.payload.value
   const inner =
     typeof value === "object" && value !== null && !Array.isArray(value)
@@ -220,7 +223,7 @@ function originOf(record: SourceRecord, createdAt: string, source: Deployment): 
     recordId: lower(record.contextId),
     commitment: lower(record.manifestHash),
     author: lower(record.authorId),
-    createdAt,
+    createdAt: iso(record.createdAt),
   }
 }
 
@@ -255,7 +258,7 @@ export function buildManifest(
     const authorId = lower(record.authorId)
     const authorName = authorId === zeroHash ? "owner" : authorNames[authorId] ?? null
     const createdAt = createdAtOf(record)
-    const origin = originOf(record, createdAt, source)
+    const origin = originOf(record, source)
     const measured = measureDestination(record, origin, migratedAt)
     return {
       sourceId: lower(record.contextId),

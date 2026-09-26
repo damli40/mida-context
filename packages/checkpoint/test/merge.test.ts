@@ -346,6 +346,56 @@ describe("mergeCheckpoints", () => {
     expect(m.otherSessions[0]).toMatchObject({ sessionId: "s-first-written" })
   })
 
+  it("a move whose envelopes carry the SOURCE chain stamps keeps the chain's order — slow clock and forged claim lose (in-13b M-1)", () => {
+    // The reviewer probe (zz-rv12-migrate-order) with the fixed rule: buildManifest now seals
+    // the record's source chain stamp as originalCreatedAt, not the checkpoint's own claim.
+    // A's writer ran two minutes slow but landed after B on the source — s-a was current there
+    // and must stay current after the move; F forged a 2027 claim but landed before B — s-b was
+    // current and must stay current.
+    const sec = (iso: string) => BigInt(Math.floor(Date.parse(iso) / 1000))
+    const move = (s: StoredCheckpoint, originalCreatedAt: string, replay: { at: string; block: bigint; index: number }): StoredCheckpoint => {
+      s.chain = { at: sec(replay.at), block: replay.block, index: replay.index }
+      s.migration = {
+        version: 1,
+        originalChainId: "31337",
+        originalContract: `0x${"1".repeat(40)}`,
+        originalRecordId: s.contextId as `0x${string}`,
+        originalCommitment: `0x${"9".repeat(64)}`,
+        originalAuthor: `0x${"4".repeat(64)}`,
+        originalCreatedAt,
+        migratedAt: "2026-09-26T12:00:10.000Z",
+      }
+      return s
+    }
+    // The slow clock: A claims 09:58:10 but the chain stamped it 10:00:10 — after B's 10:00:06.
+    const slowSource = mergeCheckpoints([
+      stored({ sessionId: "s-b", at: "2026-09-20T10:00:05.000Z", objective: "real-clock save", progress: ["p"], chain: { at: sec("2026-09-20T10:00:06.000Z"), block: 100n, index: 0 } }),
+      stored({ sessionId: "s-a", at: "2026-09-20T09:58:10.000Z", objective: "slow-clock save", progress: ["p"], chain: { at: sec("2026-09-20T10:00:10.000Z"), block: 110n, index: 0 } }),
+    ])!
+    expect(slowSource.headSessionId).toBe("s-a")
+    const slowMoved = mergeCheckpoints([
+      move(stored({ sessionId: "s-b", at: "2026-09-20T10:00:05.000Z", objective: "real-clock save", progress: ["p"] }), "2026-09-20T10:00:06.000Z", { at: "2026-09-26T12:00:01.000Z", block: 5001n, index: 0 }),
+      move(stored({ sessionId: "s-a", at: "2026-09-20T09:58:10.000Z", objective: "slow-clock save", progress: ["p"] }), "2026-09-20T10:00:10.000Z", { at: "2026-09-26T12:00:02.000Z", block: 5002n, index: 0 }),
+    ])!
+    // Before M-1 the envelope carried A's claim — 09:58:10 — and B became "current".
+    expect(slowMoved.headSessionId).toBe("s-a")
+    expect(slowMoved.savedAt).toBe("2026-09-20T10:00:10.000Z")
+
+    // The forged clock: F claims 2027 but the chain stamped it first. Its envelope now carries
+    // that stamp — not the 2027 claim that would have crowned it the newest after the move.
+    const forgedSource = mergeCheckpoints([
+      stored({ sessionId: "s-f", at: "2027-01-01T00:00:00.000Z", objective: "forged-clock save", progress: ["p"], chain: { at: sec("2026-09-20T10:00:00.000Z"), block: 90n, index: 0 } }),
+      stored({ sessionId: "s-b", at: "2026-09-20T10:00:05.000Z", objective: "real-clock save", progress: ["p"], chain: { at: sec("2026-09-20T10:00:06.000Z"), block: 100n, index: 0 } }),
+    ])!
+    expect(forgedSource.headSessionId).toBe("s-b")
+    const forgedMoved = mergeCheckpoints([
+      move(stored({ sessionId: "s-f", at: "2027-01-01T00:00:00.000Z", objective: "forged-clock save", progress: ["p"] }), "2026-09-20T10:00:00.000Z", { at: "2026-09-26T12:00:01.000Z", block: 5001n, index: 0 }),
+      move(stored({ sessionId: "s-b", at: "2026-09-20T10:00:05.000Z", objective: "real-clock save", progress: ["p"] }), "2026-09-20T10:00:06.000Z", { at: "2026-09-26T12:00:02.000Z", block: 5002n, index: 0 }),
+    ])!
+    expect(forgedMoved.headSessionId).toBe("s-b")
+    expect(forgedMoved.savedAt).toBe("2026-09-20T10:00:06.000Z")
+  })
+
   it("same-second saves in different blocks order by block number", () => {
     const block5 = stored({ sessionId: "s-5", at: "2026-09-21T10:00:00.000Z", objective: "block-5 save", progress: ["p"], chain: { at: 1_700_000_000n, block: 5n, index: 0 } })
     block5.contextId = `0x${"1".repeat(64)}`

@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { createPublicClient, http } from "viem"
+import { createPublicClient, http, zeroHash } from "viem"
 import type { AbiEvent, PublicClient } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { canonicalBytes } from "@mida/protocol"
@@ -227,10 +227,12 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
       let factsBefore: OwnerFact[]
       let handoffBefore: HandoffResult
       let foldersBefore: unknown
+      let universeBefore: SourceRecord[]
       try {
         factsBefore = await readOwnerFacts(runtime, "codex")
         handoffBefore = await buildHandoff(runtime, { agent: "codex", cwd: workDir, authorNames: authorNamesFor(runtime) })
         foldersBefore = seeded.home.readJson<unknown>("approved-projects.json")
+        universeBefore = await readOwnerUniverse(runtime)
       } finally {
         await runtime.close()
       }
@@ -305,6 +307,41 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
       expect(v2.lineageId.toLowerCase()).toBe(v1.lineageId.toLowerCase())
       expect(v3.lineageId.toLowerCase()).toBe(v1.lineageId.toLowerCase())
 
+      // in-13b M-1 — "current" survives the move per lineage. On the source each record's
+      // instant is its chain stamp; on the target a moved record's instant is the earliest of
+      // its envelope's originalCreatedAt and its replay stamp — the same effective instant
+      // mergeCheckpoints and readOwnerFacts order by. For every lineage, the newest member
+      // before the move must still be the newest member after it.
+      const effectiveAt = (record: SourceRecord): number => {
+        const recordEnvelope = readEnvelope(record.payload)
+        const stamp = Number(record.createdAt) * 1000
+        if (recordEnvelope === undefined) return stamp
+        const original = Date.parse(recordEnvelope.originalCreatedAt)
+        return Number.isNaN(original) ? stamp : Math.min(original, stamp)
+      }
+      const currentByLineage = (records: SourceRecord[]): Map<string, string> => {
+        const current = new Map<string, { id: string; at: number; version: number }>()
+        for (const record of records) {
+          const key = record.lineageId.toLowerCase()
+          const at = effectiveAt(record)
+          const held = current.get(key)
+          if (held === undefined || at > held.at || (at === held.at && record.version > held.version)) {
+            current.set(key, { id: record.contextId.toLowerCase(), at, version: record.version })
+          }
+        }
+        return new Map([...current].map(([key, held]) => [key, held.id]))
+      }
+      const headsBefore = currentByLineage(universeBefore)
+      const headsAfter = currentByLineage(universeAfter)
+      expect(headsAfter.size).toBe(headsBefore.size)
+      for (const [lineageId, sourceId] of headsBefore) {
+        const targetLineage = lineageId === zeroHash ? lineageId : targetIdOf(lineageId as Hex).toLowerCase()
+        expect(
+          headsAfter.get(targetLineage),
+          `lineage ${lineageId} moved its current record`,
+        ).toBe(targetIdOf(sourceId as Hex).toLowerCase())
+      }
+
       // The referrer still points at the evidence — at the evidence's TARGET id, not the source's.
       const referrer = onTarget(seeded.seed.referrerId)
       expect(referrer.references).toHaveLength(1)
@@ -336,6 +373,60 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
           .replace(/\b\d{2}:\d{2} UTC\b/g, "<time>")
           .replace(/\((just now|\d+ \w+ ago)\)/g, "(<ago>)")
       expect(normalize(handoffAfter.text)).toBe(normalize(handoffBefore.text))
+    },
+    TIMEOUT,
+  )
+
+  it(
+    "a writer's slow or forged createdAt claim cannot reorder the move — the source's current stays current (in-13b M-1)",
+    async () => {
+      const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-migrate-")))
+      const workDir = projectDir("proj-migrate")
+      const now = Date.now()
+      let handoffBefore!: HandoffResult
+      const runtime = await Runtime.open(home, { rpcUrl: env.rpcUrl, deployment: source, fund: env.fund })
+      try {
+        await init(runtime, ["claude-code"])
+        await requestAccess(runtime, "claude-code")
+        await approve(runtime, "claude-code", workDir, async () => true)
+        const save = (sessionId: string, eventId: string, claim: string, objective: string) =>
+          saveCheckpoint(runtime, "claude-code", {
+            projectId: "proj-migrate",
+            sessionId,
+            continuesSession: null,
+            compiledBy: "test",
+            checkpoint: sampleCheckpoint({ eventId, createdAt: claim, objective }),
+          })
+        // Landing order on the source chain: the honest clock first, the forged 2027 claim
+        // second, the two-minutes-slow clock LAST — by the chain's own stamps s-slow is the
+        // newest checkpoint and owns the handoff head before the move.
+        await save("s-real", "cp-clock-01", new Date(now).toISOString(), "real-clock session")
+        await save("s-forged", "cp-clock-02", "2027-06-01T00:00:00.000Z", "forged-clock session")
+        await save("s-slow", "cp-clock-03", new Date(now - 120_000).toISOString(), "slow-clock session")
+        handoffBefore = await buildHandoff(runtime, { agent: "claude-code", cwd: workDir, authorNames: authorNamesFor(runtime) })
+      } finally {
+        await runtime.close()
+      }
+      if (handoffBefore.kind !== "handoff") throw new Error(`handoff did not build on the source: ${handoffBefore.kind}`)
+      expect(handoffBefore.text).toContain("Objective: slow-clock session")
+
+      const moved = await untilDone(home)
+      expect(moved).toMatchObject({ outcome: "moved" })
+
+      const runtime2 = await Runtime.open(home, { rpcUrl: env.rpcUrl, deployment: target, fund: env.fund })
+      let handoffAfter!: HandoffResult
+      try {
+        handoffAfter = await buildHandoff(runtime2, { agent: "claude-code", cwd: workDir, authorNames: authorNamesFor(runtime2) })
+      } finally {
+        await runtime2.close()
+      }
+      if (handoffAfter.kind !== "handoff") throw new Error(`handoff did not build on the target: ${handoffAfter.kind}`)
+      // Same head on both sides: the slow-clock save landed last on the source and keeps the
+      // newest effective instant through the move. On the buggy code the forged claim went into
+      // the envelope (2027, collapsing onto its replay stamp) and crowned s-forged; without the
+      // forged save, the slow claim would have lost to s-real — both reviewer cases.
+      expect(handoffAfter.savedAt).toBe(handoffBefore.savedAt)
+      expect(handoffAfter.text).toContain("Objective: slow-clock session")
     },
     TIMEOUT,
   )

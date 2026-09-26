@@ -814,9 +814,10 @@ export async function readCheckpoints(
       }
     }
   }
-  // Sort on the order mergeCheckpoints uses — each record's effective instant (the earliest of
-  // its own createdAt claim, its chain stamp and a moved record's envelope originalCreatedAt),
-  // then Monad's placement, contextId only at the bottom. Batched items merging is the common trigger, but a read that
+  // Sort on the order mergeCheckpoints uses — each record's effective instant (its chain stamp,
+  // except a moved record's, which is the earliest of its envelope originalCreatedAt and its
+  // replay's stamp; a writer's own createdAt claim only counts for a record with no chain
+  // placement at all), then Monad's placement, contextId only at the bottom. Batched items merging is the common trigger, but a read that
   // carries a migration envelope needs the same sort without it: a moved universe's records
   // were all stamped at replay, so the store's own order cannot keep their real places — and
   // that holds whether the store offers no batch surface at all or its batch read failed.

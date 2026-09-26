@@ -176,6 +176,35 @@ describe("buildManifest", () => {
     expect(manifest.entries[1]!.createdAt).toBe(new Date(1_758_000_000 * 1000).toISOString())
   })
 
+  it("in-13b M-1: the envelope's originalCreatedAt is the SOURCE chain stamp — a skewed claim cannot order the move", () => {
+    // A checkpoint's own createdAt is writer-controlled content: a clock two minutes slow or a
+    // forged 2027 claim must not become the record's ordering time on the target. The manifest
+    // entry still carries the claim (it is only the replay-order slot), but `origin` — what the
+    // sealed envelope names as originalCreatedAt — is the chain record's stamp. For every
+    // record, checkpoint or not.
+    const chainStamp = 1_758_000_000n
+    const stampIso = new Date(Number(chainStamp) * 1000).toISOString()
+    for (const claim of ["2026-09-01T08:00:00.000Z", "2027-06-01T00:00:00.000Z"]) {
+      const cp = record({
+        authorId: AGENT,
+        createdAt: chainStamp,
+        payload: checkpointPayload({
+          type: "mida.checkpoint.v1",
+          projectId: "proj",
+          sessionId: "s",
+          continuesSession: null,
+          compiledBy: "test",
+          checkpoint: sampleCheckpoint({ createdAt: claim }),
+        }),
+      })
+      const manifest = buildManifest([cp], AUTHORS, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)
+      const entry = manifest.entries[0]!
+      expect(entry.origin.createdAt, `claim ${claim}`).toBe(stampIso)
+      // the claim itself stays untouched inside the content — only the envelope moves to the stamp
+      expect(entry.createdAt).toBe(claim)
+    }
+  })
+
   it("lists a record's references as relations, carrying the source ids", () => {
     const evidence = record({ recordType: 1 })
     const referrer = record({
