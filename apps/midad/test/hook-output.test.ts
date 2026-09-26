@@ -135,6 +135,14 @@ describe("sessionStartMessage", () => {
     )
   })
 
+  it("refused chain-busy says Monad is busy — never 'not approved' (in-6 R4)", () => {
+    // Sep 25: a rate-limited RPC produced "no access" for an approved agent. The owner-facing
+    // line must say the chain could not be asked and that the next session tries again.
+    expect(sessionStartMessage({ kind: "refused", reason: "chain-busy", text: "x" }, "codex", NOW)).toBe(
+      "Mida: Monad is busy right now — context not loaded; working without it (it tries again next session)",
+    )
+  })
+
   it("any other refusal or a missing body degrades with the short reason", () => {
     expect(sessionStartMessage({ kind: "refused", reason: "read-slow", text: "x" }, "codex", NOW)).toBe(
       "Mida: could not load context (read-slow) — working without it",

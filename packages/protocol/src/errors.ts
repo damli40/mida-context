@@ -43,6 +43,14 @@ export const MIDA_ERROR_CODES = [
   // CAPABILITY_REVOKED (the chain already shows the revocation) so a caller can drop the job
   // without treating the transcript as permanently dead — the deny may still be cancelled.
   "WRITE_DENIED",
+  // The chain could not be asked at all — a rate-limited or down RPC, or a request that ran out
+  // of its own Monad read budget. Still a refusal (fail closed, no data served), but retryable
+  // and never an authorization answer: the Sep 25 incident was exactly this wearing DENIED.
+  "CHAIN_UNAVAILABLE",
+  // A failure no more honest name exists for. Anything thrown that is not a protocol error used
+  // to be flattened to CAPABILITY_DENIED — an infrastructure fault impersonating an authorization
+  // answer. It gets its own non-authorization code instead.
+  "INTERNAL_ERROR",
 ] as const
 
 export type MidaErrorCode = (typeof MIDA_ERROR_CODES)[number]

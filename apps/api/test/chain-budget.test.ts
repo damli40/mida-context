@@ -173,7 +173,8 @@ describe("the per-request chain-read budget", () => {
     let last: Response | undefined
     const client = clientFor(app, async (url, init) => (last = await app.request(url, init)))
     const body = upload(randomBytes(4))
-    await expect(client.putObject(body)).rejects.toThrowError(/503/)
+    // the wire answer is CHAIN_UNAVAILABLE now (in-6 R4) — still 503 with Retry-After on the wire
+    await expect(client.putObject(body)).rejects.toMatchObject({ code: "CHAIN_UNAVAILABLE" })
     expect(last!.status).toBe(503)
     expect(last!.headers.get("retry-after")).toBe("5")
     // Zero partial writes: no object row, no ciphertext blob.
@@ -433,9 +434,11 @@ describe("a batched getRecords anchor check", () => {
 
     let last: Response | undefined
     const client = clientFor(app, async (url, init) => (last = await app.request(url, init)))
+    // in-6 R4: an unanswered chain read is 503 CHAIN_UNAVAILABLE — still an error, never data,
+    // but no longer wearing an authorization code (a busy RPC is not a denial)
     await expect(
       client.request("GET", `/objects?owner=${owner}&namespaceId=${NAMESPACE}`),
-    ).rejects.toMatchObject({ code: "CAPABILITY_DENIED" })
-    expect(last!.status).toBe(500)
+    ).rejects.toMatchObject({ code: "CHAIN_UNAVAILABLE" })
+    expect(last!.status).toBe(503)
   })
 })

@@ -13,6 +13,7 @@ import type { ChainContext } from "@mida/chain"
 import { RegistryReader } from "@mida/api"
 import { readTranscriptFor, scrubSecrets } from "@mida/compiler"
 import type { compileCheckpoint } from "@mida/compiler"
+import { isChainBusyError, isWalletLow } from "./chain-busy.js"
 import { CheckpointPayloadError, eventIdFor, unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import type { MidaHome } from "./home.js"
@@ -602,6 +603,12 @@ function failureCode(error: unknown): string {
   // a refused send is transient: the ceiling may pass on retry after the queue settles or the
   // estimate changes — the job stays and the usual backoff applies (R3-1)
   if (isMidaError(error, "GAS_CEILING_EXCEEDED")) return "gas-ceiling"
+  // a wallet that cannot pay is transient like a chain hiccup — funding refills it (in-6 R4)
+  if (isWalletLow(error)) return "wallet-low"
+  // the chain could not be asked — the transport's own busy error, the store's CHAIN_UNAVAILABLE
+  // or a viem failure. Transient: the job waits out the backoff like chain-error, but the log
+  // names what actually happened — never "not-approved" (Sep 25's wrong label).
+  if (isChainBusyError(error)) return "chain-busy"
   if (error instanceof Error) {
     const code = (error as { code?: unknown }).code
     if (typeof code === "string" && PERMANENT_FAILURES.has(code)) return code

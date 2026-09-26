@@ -3,6 +3,8 @@ import { isAbsolute } from "node:path"
 import { isMidaError } from "@mida/protocol"
 import { compareChainOrder, defuse, mergeCheckpoints, renderHandoffReport } from "@mida/checkpoint"
 import type { MigrationEnvelope } from "@mida/checkpoint"
+import { isChainBusyError } from "./chain-busy.js"
+import { CHAIN_BUSY_TEXT } from "./hook-output.js"
 import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { movedOnSuffix } from "./migration-envelope.js"
 import { checkProject } from "./projects.js"
@@ -334,6 +336,8 @@ export async function buildHandoff(
       if (isMidaError(error, "CAPABILITY_DENIED") || isMidaError(error, "CAPABILITY_EXPIRED")) {
         return refused("not-approved", notApprovedText(agent))
       }
+      // the chain could not be ASKED — a refusal, but it names the busy RPC, never "not approved"
+      if (isChainBusyError(error)) return refused("chain-busy", CHAIN_BUSY_TEXT)
       return refused("read-failed", noContextText("read-failed"))
     }
     const facts = factOutcome.status === "ok" ? factOutcome.facts : []
@@ -448,7 +452,10 @@ export async function buildHandoff(
       oversized: rendered.oversized,
       partial: outcome.partial,
     }
-  } catch {
+  } catch (error) {
+    // a chain answer that never arrived gets its own reason — the capability check's throw is
+    // how a rate-limited RPC used to reach "internal" (and, at the store, "not-approved")
+    if (isChainBusyError(error)) return refused("chain-busy", CHAIN_BUSY_TEXT)
     return refused("internal", noContextText("internal"))
   }
 }

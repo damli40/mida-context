@@ -703,6 +703,24 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
+  it("mida_whats_new answers the busy-chain line for a chain-busy refusal (in-6 R4)", async () => {
+    const dir = home()
+    const fake = await fakeDaemon(dir, { "/whatsnew": { kind: "refused", reason: "chain-busy" } })
+    try {
+      const { client, close } = await connect(deps(dir, { agent: "codex" }))
+      try {
+        expect(await callText(client, "mida_whats_new")).toBe(
+          "Mida: Monad is busy right now — context not loaded; working without it (it tries again next session)",
+        )
+      } finally {
+        await close()
+      }
+      expect(dir.has("state/lastseen/mcp-assistant-test1.json")).toBe(false)
+    } finally {
+      await fake.stop()
+    }
+  })
+
   it("mida_handoff returns the no-identity refusal's text verbatim", async () => {
     const dir = home()
     const text = 'Mida: no agent "assistant" is set up in this Mida home (/h). Nothing was shared.'

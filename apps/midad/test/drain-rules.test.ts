@@ -4,6 +4,8 @@ import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unli
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { spawnSync } from "node:child_process"
+import { HttpRequestError, InsufficientFundsError } from "viem"
+import { ChainBusyError } from "@mida/chain"
 import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
@@ -526,6 +528,57 @@ describe("the owner-signed project list gates every save", () => {
     expect(listJobs(home)).toHaveLength(0)
     expect(drainLog()).toContain('"reason":"revoked"')
     expect(drainLog()).not.toContain('"reason":"not-approved"')
+  })
+
+  it("a chain-busy save is transient — the job stays queued, logged chain-busy, never not-approved (in-6 R4)", async () => {
+    // Sep 25: a rate-limited RPC could surface as "not-approved" and drop the job. The drain
+    // must treat "the chain could not be asked" like chain-error: keep the job, back off.
+    const { home, job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw new HttpRequestError({ url: "http://rpc.test", cause: new ChainBusyError() })
+      },
+    })
+    expect(drainLog()).toContain('"reason":"chain-busy"')
+    expect(drainLog()).not.toContain('"reason":"not-approved"')
+    // transient: still queued for the backoff retry — never moved to bad, never removed
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("the store's CHAIN_UNAVAILABLE inside a save maps to chain-busy too (in-6 R4)", async () => {
+    const { home, job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw new MidaError("CHAIN_UNAVAILABLE", "the store could not reach Monad")
+      },
+    })
+    expect(drainLog()).toContain('"reason":"chain-busy"')
+    expect(listJobs(home)).toHaveLength(1)
+  })
+
+  it("a low owner wallet logs wallet-low and stays queued — funding refills it (in-6 R4)", async () => {
+    const { home, job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw new MidaError("OWNER_WALLET_LOW", "the owner wallet holds 0.01 MON; the send needs 0.2")
+      },
+    })
+    expect(drainLog()).toContain('"reason":"wallet-low"')
+    expect(listJobs(home)).toHaveLength(1)
+    // viem's own insufficient-funds error names the same condition
+    const again = setup()
+    again.job()
+    await again.drain({
+      save: async () => {
+        throw new InsufficientFundsError()
+      },
+    })
+    expect(again.drainLog()).toContain('"reason":"wallet-low"')
+    expect(listJobs(again.home)).toHaveLength(1)
   })
 
   it("a chain-level refusal for a revoked agent also logs revoked, not not-approved (R4-3)", async () => {

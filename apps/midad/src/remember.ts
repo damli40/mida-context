@@ -2,6 +2,7 @@ import { privateKeyToAccount } from "viem/accounts"
 import { zeroHash } from "viem"
 import { ContextApiClient } from "@mida/api"
 import { MidaError, OWNER_AUTHOR_ID, PERMISSION, PROVENANCE_SOURCE, isMidaError, namespaceId } from "@mida/protocol"
+import { isChainBusyError } from "./chain-busy.js"
 import type { ContextKind, Hex } from "@mida/protocol"
 import type { ContextObject } from "@mida/sdk"
 import { scrubSecrets } from "@mida/compiler"
@@ -327,6 +328,8 @@ export async function attemptNamespaceRead(
     const listed = await api.listObjects({ owner: runtime.owner, namespaceId: nsId, ...(capabilityId === undefined ? {} : { capabilityId }) })
     return { ok: true, objects: listed.objects.length, partial: listed.partial }
   } catch (error) {
+    // "the chain could not be asked" gets the same reason everywhere (in-6 R4)
+    if (isChainBusyError(error)) return { ok: false, code: "chain-busy" }
     if (error instanceof MidaError) return { ok: false, code: error.code }
     throw error
   }

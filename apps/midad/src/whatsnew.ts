@@ -1,5 +1,6 @@
 import { compareChainOrder, defuse, orderTime, recordedAt } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
+import { isChainBusyError } from "./chain-busy.js"
 import { PENDING_ANCHOR_LINE, capabilityState, checkAccess } from "./handoff.js"
 import type { HandoffDeps } from "./handoff.js"
 import { agoText } from "./hook-output.js"
@@ -371,7 +372,8 @@ export async function buildWhatsNew(
       })),
       seen: proposed,
     }
-  } catch {
-    return { kind: "refused", reason: "internal" }
+  } catch (error) {
+    // a chain that could not be asked is its own refusal — the same chain-busy the handoff logs
+    return { kind: "refused", reason: isChainBusyError(error) ? "chain-busy" : "internal" }
   }
 }

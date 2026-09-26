@@ -171,7 +171,9 @@ export function createContextApi(options: ContextApiOptions) {
     // A request that runs out of chain reads is refused as retryable — the platform's own
     // subrequest ceiling (which would surface as a bare 500) is never reached.
     if (isChainReadBudgetExceeded(error)) {
-      return c.json({ error: { code: error.code, message: error.message } }, 503, { "retry-after": "5" })
+      // the wire code is CHAIN_UNAVAILABLE (in-6 R4): the budget is a chain answer that never
+      // came — retryable, never an authorization refusal — and the header still asks for a pause
+      return c.json({ error: { code: "CHAIN_UNAVAILABLE", message: error.message } }, 503, { "retry-after": "5" })
     }
     const { status, body } = toErrorBody(error)
     return c.json(body, status as 400)

@@ -3,6 +3,8 @@ import { mkdtempSync } from "node:fs"
 import { writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { HttpRequestError } from "viem"
+import { ChainBusyError } from "@mida/chain"
 import type { StoredCheckpoint } from "../src/skeleton.js"
 import type { ServiceRuntime } from "@mida/midad"
 import {
@@ -576,6 +578,18 @@ describe("the daemon's checkpoint copy", () => {
     t += 31_000
     await buildWhatsNew(runtimeWith(dir), input, deps)
     expect(calls).toBe(2) // past 30 s the verdict is stale — asked again
+  })
+
+  it("a rate-limited chain refuses chain-busy — never not-approved, never internal (in-6 R4)", async () => {
+    const dir = home()
+    const busy = () => new HttpRequestError({ url: "http://rpc.test", cause: new ChainBusyError() })
+    const deps = baseDeps([], {
+      capability: async () => {
+        throw busy()
+      },
+    })
+    const out = await buildWhatsNew(runtimeWith(dir), { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }, deps)
+    expect(out).toEqual({ kind: "refused", reason: "chain-busy" })
   })
 })
 

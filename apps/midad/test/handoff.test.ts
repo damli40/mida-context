@@ -8,9 +8,11 @@ import type { Checkpoint } from "@mida/checkpoint"
 import type { StoredCheckpoint } from "@mida/checkpoint"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
+import { HttpRequestError } from "viem"
 import { ContextApiClient } from "@mida/api"
 import { MidaAgent } from "@mida/sdk"
-import { MidaHome, NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
+import { ChainBusyError } from "@mida/chain"
+import { CHAIN_BUSY_TEXT, MidaHome, NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
 import type { HandoffDeps, MigrationEnvelope, ProjectCheck, Runtime } from "@mida/midad"
 import { checkAccess } from "../src/handoff.js"
 import { sampleCheckpoint } from "./helpers.js"
@@ -738,5 +740,60 @@ describe("migrated checkpoints in the handoff (migrate B2)", () => {
     expect(result.text).toContain("at 2026-09-18T10:00:00.000Z (moved on 2026-09-25)")
     expect(result.text).toContain("at 2026-09-18T11:00:00.000Z,")
     expect(result.text.match(/\(moved on /g)).toHaveLength(1)
+  })
+})
+
+describe("a busy chain is never reported as not-approved (in-6 R4)", () => {
+  // Sep 25: the public RPC's "requests limited to 15/sec" left an approved agent reported as
+  // "not approved". A chain that could not be asked gets its own refusal — reason chain-busy.
+  const busy = () => new HttpRequestError({ url: "http://rpc.test", cause: new ChainBusyError() })
+
+  it("a rate-limited capability check refuses chain-busy, never not-approved", async () => {
+    const { d } = deps({
+      capability: async () => {
+        throw busy()
+      },
+    })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toEqual({ kind: "refused", reason: "chain-busy", text: CHAIN_BUSY_TEXT })
+  })
+
+  it("a rate-limited checkpoint read refuses chain-busy, not read-failed", async () => {
+    const { d } = deps({
+      read: async () => {
+        throw busy()
+      },
+    })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toEqual({ kind: "refused", reason: "chain-busy", text: CHAIN_BUSY_TEXT })
+  })
+
+  it("the store's CHAIN_UNAVAILABLE answer maps to chain-busy as well", async () => {
+    const { d } = deps({
+      read: async () => {
+        throw new MidaError("CHAIN_UNAVAILABLE", "the store could not reach Monad")
+      },
+    })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toEqual({ kind: "refused", reason: "chain-busy", text: CHAIN_BUSY_TEXT })
+  })
+
+  it("a real refusal still says not-approved — the distinction is preserved", async () => {
+    // the chain answered and the answer is "no grant": that is not a busy chain
+    const { d } = deps({
+      read: async () => {
+        throw new MidaError("CAPABILITY_DENIED", "no grant")
+      },
+    })
+    const denied = await buildHandoff(runtime, input, d)
+    expect(denied.kind).toBe("refused")
+    if (denied.kind !== "refused") return
+    expect(denied.reason).toBe("not-approved")
+    // and a capability check that answers "none" is the same answer, not a busy chain
+    const { d: none } = deps({ capability: async () => "none" as const })
+    const noGrant = await buildHandoff(runtime, input, none)
+    expect(noGrant.kind).toBe("refused")
+    if (noGrant.kind !== "refused") return
+    expect(noGrant.reason).toBe("not-approved")
   })
 })

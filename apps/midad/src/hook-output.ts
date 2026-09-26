@@ -56,6 +56,14 @@ export function degradedMessage(reason: string): string {
 }
 
 /**
+ * The one line every surface prints when the chain could not be ASKED (in-6 R4): owner-facing
+ * in the hook's systemMessage, model-facing as the daemon's refused text, reproduced again in
+ * mida-mcp — one wording everywhere so "the RPC was busy" can never come out as "not approved".
+ */
+export const CHAIN_BUSY_TEXT =
+  "Mida: Monad is busy right now — context not loaded; working without it (it tries again next session)"
+
+/**
  * The human-facing line for a SessionStart outcome. The model-facing text is not touched here —
  * it travels separately inside the envelope.
  */
@@ -93,6 +101,10 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
   }
   if (body.kind === "refused" && body.reason === "not-approved") {
     return systemMessage(`Mida: ${agent} has no access to this project (not approved yet — run: mida request ${agent})`)
+  }
+  // a busy chain is not a denial: the owner hears what happened and that the next session retries
+  if (body.kind === "refused" && body.reason === "chain-busy") {
+    return systemMessage(CHAIN_BUSY_TEXT)
   }
   return degradedMessage(typeof body.reason === "string" ? body.reason : "no-answer")
 }

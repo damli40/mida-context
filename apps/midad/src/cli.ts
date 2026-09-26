@@ -904,6 +904,10 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
       const short = (a: unknown) => (typeof a === "string" ? `${a.slice(0, 6)}…` : "unknown")
       return `this setup is on contract ${short(detail.saved)}; this version of Mida ships ${short(detail.builtIn)}. \`init\` will not move it — run \`mida migrate\``
     }
+    // The chain could not be asked at all — a busy or down RPC, never an authorization answer:
+    // nothing was signed, sent or decided, and a moment later the same command answers for real.
+    case "chain-busy":
+      return "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again"
     // A chain error with no code: the line names this setup's contract so a wrong deployment
     // explains itself, and names the flag that prints the masked detail.
     case "CHAIN_CALL_FAILED": {
