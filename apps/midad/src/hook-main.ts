@@ -30,10 +30,11 @@ async function main(): Promise<void> {
   let stdin = text
   if (oversized) {
     const fields = extractHookFields(text.slice(0, HEAD_BYTES))
-    if (
+    // Devin's payload has no transcript_path — its required fields end at session_id
+    const complete =
       fields.hook_event_name !== undefined && fields.session_id !== undefined &&
-      fields.transcript_path !== undefined
-    ) {
+      (agent === "devin" || fields.transcript_path !== undefined)
+    if (complete) {
       stdin = JSON.stringify(fields)
     } else {
       appendLog(home, "hook", { agent, outcome: "ignored", reason: "input-too-large" })

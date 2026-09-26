@@ -279,6 +279,115 @@ describe("runHook", () => {
   })
 })
 
+describe("runHook — devin payload", () => {
+  /**
+   * Devin's hook stdin carries session_id + prompt_id and per-event fields — never a
+   * transcript_path or a cwd (devin-facts.ts). The project folder is DEVIN_PROJECT_DIR's
+   * payload; the session lives in the sessions database MIDA_DEVIN_DB names in tests.
+   */
+  function devinSetup() {
+    const dir = mkdtempSync(join(tmpdir(), "mida-devin-hook-"))
+    const home = new MidaHome(join(dir, "home"))
+    const dbPath = join(dir, "sessions.db")
+    writeFileSync(dbPath, "synthetic-db")
+    const work = join(dir, "work")
+    mkdirSync(work, { recursive: true })
+    const env = { DEVIN_PROJECT_DIR: work, MIDA_DEVIN_DB: dbPath }
+    const stdinFor = (over: Record<string, unknown> = {}) =>
+      JSON.stringify({ hook_event_name: "Stop", session_id: "bald-swordfish", prompt_id: "p1", ...over })
+    return { dir, home, dbPath, work, env, stdinFor }
+  }
+
+  const devinHook = (input: { home: MidaHome; stdin: string; env: NodeJS.ProcessEnv; spawned?: () => void }) =>
+    runHook({ agent: "devin", stdin: input.stdin, home: input.home, env: input.env, spawnDrainer: input.spawned ?? (() => {}) })
+
+  it("a devin Stop event enqueues a job pointing at the sessions db and the env's project dir", async () => {
+    const { dir, home, dbPath, work, env, stdinFor } = devinSetup()
+    await devinHook({ home, stdin: stdinFor(), env })
+    const jobs = listJobs(home)
+    expect(jobs).toHaveLength(1)
+    expect(jobs[0]).toMatchObject({ agent: "devin", event: "Stop", sessionId: "bald-swordfish", transcriptPath: dbPath, cwd: work })
+  })
+
+  it("PostToolUse, PostCompaction and SessionEnd enqueue; SessionEnd's reason rides as the job's error", async () => {
+    const { home, env, stdinFor } = devinSetup()
+    await devinHook({ home, stdin: stdinFor({ hook_event_name: "PostToolUse", tool_name: "exec" }), env })
+    await devinHook({ home, stdin: stdinFor({ hook_event_name: "PostCompaction", summary: null }), env })
+    await devinHook({ home, stdin: stdinFor({ hook_event_name: "SessionEnd", reason: "user_requested" }), env })
+    const jobs = listJobs(home)
+    expect(jobs.map((j) => j.event)).toEqual(["PostToolUse", "PostCompaction", "SessionEnd"])
+    expect(jobs[2]!.error).toBe("user_requested")
+  })
+
+  it("Claude's event names are NOT Devin's — PreCompact and StopFailure log unknown-event, never a job", async () => {
+    const { home, env, stdinFor } = devinSetup()
+    await devinHook({ home, stdin: stdinFor({ hook_event_name: "PreCompact" }), env })
+    await devinHook({ home, stdin: stdinFor({ hook_event_name: "StopFailure" }), env })
+    // and the inject-side events are not save events either
+    await devinHook({ home, stdin: stdinFor({ hook_event_name: "SessionStart" }), env })
+    await devinHook({ home, stdin: stdinFor({ hook_event_name: "UserPromptSubmit" }), env })
+    expect(listJobs(home)).toHaveLength(0)
+    const log = readFileSync(home.path("logs/hook.jsonl"), "utf8")
+    expect(log.match(/"reason":"unknown-event"/g)).toHaveLength(4)
+  })
+
+  it("a missing sessions db enqueues nothing and says so in the log", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mida-devin-hook-"))
+    const home = new MidaHome(join(dir, "home"))
+    const env = { DEVIN_PROJECT_DIR: join(dir, "work"), MIDA_DEVIN_DB: join(dir, "sessions.db") }
+    await devinHook({ home, stdin: devinSetup().stdinFor(), env })
+    expect(listJobs(home)).toHaveLength(0)
+    expect(readFileSync(home.path("logs/hook.jsonl"), "utf8")).toContain("devin-db-missing")
+  })
+
+  it("a session id that is not a safe name is rejected before the queue", async () => {
+    const { home, env, stdinFor } = devinSetup()
+    // Devin slugs are two words like "bald-swordfish"; anything path- or SQL-shaped never reaches the db read
+    await devinHook({ home, stdin: stdinFor({ session_id: "a';b" }), env })
+    expect(listJobs(home)).toHaveLength(0)
+    expect(readFileSync(home.path("logs/hook.jsonl"), "utf8")).toContain("bad-session-id")
+  })
+
+  it("cwd falls back to the hook's own process cwd when DEVIN_PROJECT_DIR is absent", async () => {
+    const { dir, home, dbPath, stdinFor } = devinSetup()
+    await devinHook({ home, stdin: stdinFor(), env: { MIDA_DEVIN_DB: dbPath } })
+    expect(listJobs(home)[0]!.cwd).toBe(process.cwd())
+  })
+
+  it("mida-hook devin spawned as a process enqueues the job from the payload fields alone", () => {
+    const { dir, home, dbPath, work, stdinFor } = devinSetup()
+    const homeDir = join(dir, "hook-home")
+    const res = spawnSync(process.execPath, ["--import", "tsx", HOOK_MAIN, "devin"], {
+      input: stdinFor(),
+      env: { ...cleanEnv(), MIDA_HOME: homeDir, DEVIN_PROJECT_DIR: work, MIDA_DEVIN_DB: dbPath },
+      encoding: "utf8",
+      timeout: 20_000,
+      cwd: REPO_ROOT,
+    })
+    expect(res.status).toBe(0)
+    expect(res.stdout).toBe("")
+    const jobs = listJobs(new MidaHome(homeDir))
+    expect(jobs).toHaveLength(1)
+    expect(jobs[0]).toMatchObject({ agent: "devin", sessionId: "bald-swordfish", transcriptPath: dbPath, cwd: work })
+  }, 30_000)
+
+  it("an oversized devin payload still enqueues — salvage never asks for a transcript_path it does not have", () => {
+    const { dir, dbPath, work, stdinFor } = devinSetup()
+    const homeDir = join(dir, "hook-home")
+    const res = spawnSync(process.execPath, ["--import", "tsx", HOOK_MAIN, "devin"], {
+      input: stdinFor({ padding: "x".repeat(2 * 1024 * 1024) }),
+      env: { ...cleanEnv(), MIDA_HOME: homeDir, DEVIN_PROJECT_DIR: work, MIDA_DEVIN_DB: dbPath },
+      encoding: "utf8",
+      timeout: 20_000,
+      cwd: REPO_ROOT,
+    })
+    expect(res.status).toBe(0)
+    const jobs = listJobs(new MidaHome(homeDir))
+    expect(jobs).toHaveLength(1)
+    expect(jobs[0]).toMatchObject({ agent: "devin", sessionId: "bald-swordfish" })
+  }, 30_000)
+})
+
 /** A socket server the test controls: `onRequest` decides what a connection gets back. */
 function fakeDaemon(socketPath: string, onRequest: (socket: Socket, data: Buffer) => void): Promise<Server> {
   const server = createServer((socket) => {

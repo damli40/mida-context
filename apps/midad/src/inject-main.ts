@@ -63,6 +63,17 @@ function degraded(reason: string): string {
 }
 
 /**
+ * The project folder a hook payload names. Claude Code sends `cwd` in the JSON; Devin's
+ * payload has no cwd field — its hooks get the folder from the DEVIN_PROJECT_DIR env var it
+ * sets on every hook process (devin-facts.ts). A non-devin entry under that env never reaches
+ * here — the foreign-client guard exits first — so the env fallback only ever serves devin.
+ */
+function payloadCwd(record: Record<string, unknown>): string {
+  if (typeof record.cwd === "string" && record.cwd !== "") return record.cwd
+  return process.env.DEVIN_PROJECT_DIR ?? process.cwd()
+}
+
+/**
  * The UserPromptSubmit hook — the "what's new" note. It goes straight to the socket: no daemon
  * boot, no health probe, one call with a 1.5 s ceiling. Silence is the contract for every
  * non-update answer — nothing new, a refusal, a timeout or a dead daemon all print nothing and
@@ -72,7 +83,7 @@ function degraded(reason: string): string {
 async function whatsNew(home: MidaHome, agent: string | undefined, record: Record<string, unknown>): Promise<void> {
   try {
     if (!isSafeName(agent)) return
-    const cwd = typeof record.cwd === "string" && record.cwd !== "" ? record.cwd : process.cwd()
+    const cwd = payloadCwd(record)
     const sessionId = typeof record.session_id === "string" ? record.session_id : undefined
     const reply = await callDaemon(home, "/whatsnew", { agent, cwd, sessionId }, { timeoutMs: WHATS_NEW_TIMEOUT_MS })
     if (reply.status !== 200) {
@@ -151,7 +162,7 @@ async function main(): Promise<void> {
   }
   // anything that is not a session start — another hook event, or no event at all — stays silent
   if (record.hook_event_name !== "SessionStart") return
-  const cwd = typeof record.cwd === "string" && record.cwd !== "" ? record.cwd : process.cwd()
+  const cwd = payloadCwd(record)
   // before `init` wrote network.json no daemon can exist — the spawn would die on the same check
   const up = home.has("network.json") && (await ensureDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS }))
   if (!up) {

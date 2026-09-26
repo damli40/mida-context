@@ -13,8 +13,10 @@ import type { HookEvent } from "./hook.js"
 export interface CaptureJob {
   id: string
   agent: string
-  event: HookEvent
+  /** A Claude Code save event, or Devin's `PostCompaction` — the one devin-only save event. */
+  event: HookEvent | "PostCompaction"
   sessionId: string
+  /** The session's capture source — a transcript file, or the Devin sessions database. */
   transcriptPath: string
   cwd: string
   error: string | null
@@ -91,7 +93,7 @@ function asJob(raw: unknown, id: string): CaptureJob | undefined {
   return {
     id, // the filename is canonical: it is what removeJob/moveToBad address
     agent: r.agent,
-    event: r.event as HookEvent,
+    event: r.event as HookEvent | "PostCompaction",
     sessionId: r.sessionId,
     transcriptPath: r.transcriptPath,
     cwd: r.cwd,

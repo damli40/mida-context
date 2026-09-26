@@ -3,6 +3,7 @@ import { homedir } from "node:os"
 import { isAbsolute, join, relative } from "node:path"
 import { recordedCodexHome } from "./codex-home.js"
 import { callDaemon } from "./control.js"
+import { DEVIN_SAVE_EVENTS, devinDbPathAllowed, resolveDevinDbPath } from "./devin-facts.js"
 import type { MidaHome } from "./home.js"
 import { appendLog } from "./log.js"
 import { enqueue, isSafeName } from "./queue.js"
@@ -11,9 +12,11 @@ import { enqueue, isSafeName } from "./queue.js"
 export type HookEvent = "PostToolUse" | "Stop" | "StopFailure" | "PreCompact" | "SessionEnd"
 
 /** Events that mean "save now": the session is ending or about to lose context, so the 60 s gap is ignored. */
-export const FLUSH_EVENTS: ReadonlySet<HookEvent> = new Set<HookEvent>(["Stop", "StopFailure", "PreCompact", "SessionEnd"])
+export const FLUSH_EVENTS: ReadonlySet<string> = new Set(["Stop", "StopFailure", "PreCompact", "SessionEnd", "PostCompaction"])
 
 const KNOWN_EVENTS: ReadonlySet<string> = new Set<HookEvent>(["PostToolUse", "Stop", "StopFailure", "PreCompact", "SessionEnd"])
+/** Devin's own save events — PostCompaction replaces Claude's PreCompact; it has no StopFailure. */
+const DEVIN_KNOWN_EVENTS: ReadonlySet<string> = new Set(DEVIN_SAVE_EVENTS)
 /** The kick must never slow the hook down: a daemon that does not answer inside 150 ms is treated as down. */
 const KICK_TIMEOUT_MS = 150
 
@@ -150,7 +153,8 @@ export async function runHook(input: {
       log({ event, sessionId, outcome: "ignored", reason: "foreign-client" })
       return
     }
-    if (event === null || !KNOWN_EVENTS.has(event)) {
+    const knownEvents = input.agent === "devin" ? DEVIN_KNOWN_EVENTS : KNOWN_EVENTS
+    if (event === null || !knownEvents.has(event)) {
       log({ event, sessionId, outcome: "ignored", reason: "unknown-event" })
       return
     }
@@ -164,18 +168,42 @@ export async function runHook(input: {
       log({ event, sessionId, outcome: "ignored", reason: "bad-agent" })
       return
     }
-    if (!transcriptPathAllowed(record.transcript_path, input.agent, input.homeDir ?? homedir(), input.home)) {
-      log({ event, sessionId, outcome: "ignored", reason: "bad-transcript-path" })
-      return
+    let job
+    if (input.agent === "devin") {
+      // Devin's payload is session_id + prompt_id and per-event fields — no transcript_path
+      // and no cwd (devin-facts.ts). The session lives in the sessions database resolved from
+      // the hook's own env, and the project folder is DEVIN_PROJECT_DIR's whole payload.
+      const homeDir = input.homeDir ?? homedir()
+      const dbPath = resolveDevinDbPath(input.env, homeDir)
+      if (!devinDbPathAllowed(dbPath, input.env, homeDir)) {
+        log({ event, sessionId, outcome: "ignored", reason: "devin-db-missing" })
+        return
+      }
+      job = enqueue(input.home, {
+        agent: input.agent,
+        event: event as HookEvent | "PostCompaction",
+        sessionId,
+        transcriptPath: dbPath,
+        cwd: input.env.DEVIN_PROJECT_DIR ?? process.cwd(),
+        error:
+          typeof record.error === "string" ? record.error
+          : event === "SessionEnd" && typeof record.reason === "string" ? record.reason
+          : null,
+      })
+    } else {
+      if (!transcriptPathAllowed(record.transcript_path, input.agent, input.homeDir ?? homedir(), input.home)) {
+        log({ event, sessionId, outcome: "ignored", reason: "bad-transcript-path" })
+        return
+      }
+      job = enqueue(input.home, {
+        agent: input.agent,
+        event: event as HookEvent,
+        sessionId,
+        transcriptPath: record.transcript_path,
+        cwd: typeof record.cwd === "string" && record.cwd !== "" ? record.cwd : process.cwd(),
+        error: typeof record.error === "string" ? record.error : null,
+      })
     }
-    const job = enqueue(input.home, {
-      agent: input.agent,
-      event: event as HookEvent,
-      sessionId,
-      transcriptPath: record.transcript_path,
-      cwd: typeof record.cwd === "string" && record.cwd !== "" ? record.cwd : process.cwd(),
-      error: typeof record.error === "string" ? record.error : null,
-    })
     log({ event, sessionId, outcome: "enqueued", jobId: job.id })
     const reply = await callDaemon(input.home, "/kick", {}, { timeoutMs: KICK_TIMEOUT_MS })
     if (reply.status === 0) {

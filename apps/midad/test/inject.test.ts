@@ -338,6 +338,92 @@ describe("inject-main process", () => {
   }, 30_000)
 })
 
+/**
+ * A socket server like fakeDaemon that also records the JSON body of each request — the devin
+ * tests assert the folder Mida forwards came from DEVIN_PROJECT_DIR, not a payload `cwd`
+ * (Devin's hook payload has none).
+ */
+const captureDaemon = (dir: MidaHome, handoffBody: unknown): Promise<{ server: Server; bodies: Record<string, unknown>[] }> =>
+  new Promise((resolve, reject) => {
+    const bodies: Record<string, unknown>[] = []
+    const s = createServer((socket: Socket) => {
+      socket.on("data", (data) => {
+        const text = data.toString("utf8")
+        const path = text.split(" ")[1]
+        const bodyText = text.slice(text.indexOf("\r\n\r\n") + 4)
+        if (bodyText) {
+          try { bodies.push(JSON.parse(bodyText) as Record<string, unknown>) } catch { /* not JSON */ }
+        }
+        const payload = JSON.stringify(path === "/handoff" || path === "/whatsnew" ? handoffBody : { ok: true, pid: 1 })
+        socket.end(`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(payload)}\r\nconnection: close\r\n\r\n${payload}`)
+      })
+    })
+    s.once("error", reject)
+    s.listen(socketPathFor(dir), () => resolve({ server: s, bodies }))
+  })
+
+describe("inject-main process — devin payload", () => {
+  // Devin's hook stdin is session_id + prompt_id + per-event fields: no cwd, no
+  // transcript_path. The project folder arrives on the environment as DEVIN_PROJECT_DIR.
+  const devinSessionStart = () => JSON.stringify({ hook_event_name: "SessionStart", session_id: "s1", prompt_id: "p9", source: "startup" })
+  const devinPrompt = () => JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "s1", prompt_id: "p9", prompt: "go on" })
+
+  it("a devin SessionStart answers the envelope and forwards DEVIN_PROJECT_DIR as the project cwd", async () => {
+    const dir = home()
+    dir.writeSecretJson("network.json", { rpcUrl: "http://127.0.0.1:1", deployment: {} })
+    const { server, bodies } = await captureDaemon(dir, { kind: "empty", text: "Mida: connected. Nothing has been saved for this project yet." })
+    try {
+      const res = await run(["devin"], devinSessionStart(), dir.root, { DEVIN_PROJECT_DIR: "/tmp/devin-work" })
+      expect(res.status).toBe(0)
+      const out = envelope(res.stdout)
+      expect(out.hookSpecificOutput.hookEventName).toBe("SessionStart")
+      expect(out.hookSpecificOutput.additionalContext).toContain("Nothing has been saved")
+      const handoff = bodies.find((b) => typeof b.agent === "string")
+      expect(handoff).toMatchObject({ agent: "devin", cwd: "/tmp/devin-work", sessionId: "s1" })
+    } finally {
+      await close(server)
+    }
+  }, 30_000)
+
+  it("a devin UserPromptSubmit forwards DEVIN_PROJECT_DIR and prints the update envelope", async () => {
+    const dir = home()
+    const { server, bodies } = await captureDaemon(dir, {
+      kind: "updates",
+      note: "Mida update since you last checked:\n- codex: did the thing",
+      updates: [{ agent: "codex", savedAt: new Date().toISOString() }],
+      seen: ["0xseen"],
+    })
+    try {
+      const res = await run(["devin"], devinPrompt(), dir.root, { DEVIN_PROJECT_DIR: "/tmp/devin-work" })
+      expect(res.status).toBe(0)
+      const out = envelope(res.stdout)
+      expect(out.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit")
+      expect(out.hookSpecificOutput.additionalContext).toContain("did the thing")
+      expect(bodies[0]).toMatchObject({ agent: "devin", cwd: "/tmp/devin-work", sessionId: "s1" })
+    } finally {
+      await close(server)
+    }
+  }, 30_000)
+
+  it("an unknown or malformed devin payload prints nothing and never crashes", async () => {
+    for (const input of [
+      JSON.stringify({ hook_event_name: "PreToolUse", session_id: "s1", tool_name: "exec" }),
+      JSON.stringify({ hook_event_name: "PermissionRequest", session_id: "s1" }),
+      JSON.stringify({ event: "SessionStart" }), // no hook_event_name at all
+      "not json{",
+    ]) {
+      const res = await run(["devin"], input, home().root, { DEVIN_PROJECT_DIR: "/tmp/devin-work" })
+      expect(res.status).toBe(0)
+      expect(res.stderr).toBe("")
+      // a malformed payload may print the bad-input envelope; an unknown event prints nothing
+      if (res.stdout !== "") {
+        const out = envelope(res.stdout)
+        expect(out.systemMessage).toContain("could not load context")
+      }
+    }
+  }, 60_000)
+})
+
 describe("inject-main process — foreign-client guard", () => {
   // Devin runs the hooks it imported from other clients' config with DEVIN_PROJECT_DIR set on
   // the process. A mida-inject entry for any agent but devin firing there is a replay: no
