@@ -36,6 +36,22 @@ function originOf(url: string): string {
   }
 }
 
+/**
+ * The shared bucket exists for the public Monad RPC's ~15 requests/second. A loopback endpoint
+ * is a local chain (Anvil in tests and dev) — it has no shared quota, and holding its sends to
+ * 10/second stalls receipt polling and batch writes enough to time out real flows (in-9, the
+ * batch.e2e and chain-order.e2e timeouts). An explicit MIDA_RPC_MAX_PER_SECOND overrides the
+ * exemption so a test can still watch the limiter work on any origin it likes.
+ */
+function isLoopbackOrigin(origin: string): boolean {
+  try {
+    const host = new URL(origin).hostname
+    return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1"
+  } catch {
+    return false
+  }
+}
+
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
 // ---------------------------------------------------------------------------
@@ -132,13 +148,19 @@ export const rpcTransportProbe = {
  */
 export function rpcTransport(url: string) {
   const origin = originOf(url)
+  const loopback = isLoopbackOrigin(origin)
+  // Exempt or not, every send is admitted into rpcTransportProbe so request counts stay true.
+  const admit = () =>
+    loopback && process.env.MIDA_RPC_MAX_PER_SECOND === undefined
+      ? Promise.resolve(rpcTransportProbe.sentAt.push(Date.now()) as unknown as void)
+      : takeTurn(origin)
   return http(url, {
     // R3's retry lives inside this fetchFn; viem's transport-level retry would multiply it.
     retryCount: 0,
     fetchFn: async (input: string | URL | Request, init?: RequestInit) => {
       for (let attempt = 0; ; attempt += 1) {
         // every attempt is one HTTP request — the bucket counts retries too
-        await takeTurn(origin)
+        await admit()
         const response = await fetch(input, init)
         if (!(await busyAnswer(response))) return response
         if (attempt >= RETRY_DELAYS_MS.length) throw new ChainBusyError()

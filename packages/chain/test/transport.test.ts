@@ -179,6 +179,51 @@ const limited = (body: { id?: number }) =>
     { status: 200, headers: { "Content-Type": "application/json" } },
   )
 
+// ---------------------------------------------------------------------------
+// in-9 — a loopback RPC has no shared public quota; the limiter must not slow local Anvil
+// ---------------------------------------------------------------------------
+
+describe("loopback exemption (in-9)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.unstubAllEnvs()
+    rpcTransportProbe.reset()
+  })
+
+  it("127.0.0.1 sends are admitted without waiting — 30 concurrent reads all leave at once", async () => {
+    vi.stubGlobal("fetch", stubFetch())
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://127.0.0.1:8545") })
+    const started = Date.now()
+    const results = await Promise.all(
+      Array.from({ length: 30 }, () => client.request({ method: "eth_chainId" })),
+    )
+    // under the limiter this takes ~3 s; a loopback RPC answers as fast as the calls arrive
+    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(results.every((r) => r === "0x7a69")).toBe(true)
+    // every send is still recorded — request-count tests keep working on the local chain
+    expect(rpcTransportProbe.sentAt).toHaveLength(30)
+  }, 30_000)
+
+  it("localhost and [::1] are exempt the same way", async () => {
+    vi.stubGlobal("fetch", stubFetch())
+    for (const url of ["http://localhost:8545", "http://[::1]:8545"]) {
+      const client = createPublicClient({ chain: foundry, transport: rpcTransport(url) })
+      const started = Date.now()
+      await Promise.all(Array.from({ length: 15 }, () => client.request({ method: "eth_chainId" })))
+      expect(Date.now() - started).toBeLessThan(1_000)
+    }
+    expect(rpcTransportProbe.sentAt).toHaveLength(30)
+  }, 30_000)
+
+  it("an explicit MIDA_RPC_MAX_PER_SECOND still limits a loopback origin", async () => {
+    vi.stubEnv("MIDA_RPC_MAX_PER_SECOND", "5")
+    vi.stubGlobal("fetch", stubFetch())
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://127.0.0.1:8545") })
+    await Promise.all(Array.from({ length: 15 }, () => client.request({ method: "eth_chainId" })))
+    expect(peakPerSecond(rpcTransportProbe.sentAt)).toBeLessThanOrEqual(5)
+  }, 30_000)
+})
+
 describe("rate-limit retries (in-6 R3)", () => {
   afterEach(() => {
     vi.unstubAllGlobals()
