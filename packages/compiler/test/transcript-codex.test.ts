@@ -114,6 +114,7 @@ describe("readCodexConversation", () => {
       rollout(
         "Mida: handoff loaded — 2 checkpoints from claude-code",
         "Mida update since you last checked:\n- codex: did the thing",
+        "Mida update since you last checked (what other sessions reported at the time — check the current state before acting on it):\n- codex: did another thing",
         "MIDA HANDOFF\nobjective: earlier work",
         "Mida: please refactor the parser",
       ),

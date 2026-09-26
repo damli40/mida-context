@@ -389,7 +389,7 @@ describe("inject-main process — devin payload", () => {
     const dir = home()
     const { server, bodies } = await captureDaemon(dir, {
       kind: "updates",
-      note: "Mida update since you last checked:\n- codex: did the thing",
+      note: "Mida update since you last checked (what other sessions reported at the time — check the current state before acting on it):\n- codex: did the thing",
       updates: [{ agent: "codex", savedAt: new Date().toISOString() }],
       seen: ["0xseen"],
     })
@@ -478,7 +478,7 @@ describe("inject-main process — UserPromptSubmit", () => {
     const savedAt = new Date(Date.now() - 40_000).toISOString()
     const daemon = await whatsnewDaemon(dir, {
       kind: "updates",
-      note: "Mida update since you last checked:\n- codex: did the thing",
+      note: "Mida update since you last checked (what other sessions reported at the time — check the current state before acting on it):\n- codex: did the thing",
       updates: [{ agent: "codex", savedAt }],
       seen: ["0xearlier", "0xnew-delivered"],
     })

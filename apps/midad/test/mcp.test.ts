@@ -669,7 +669,7 @@ describe("mida-mcp tools against a fake daemon", () => {
       "/whatsnew": (body) =>
         readSeen(dir, typeof body?.sessionId === "string" ? body.sessionId : undefined).has("0xnew-ctx")
           ? { kind: "none" }
-          : { kind: "updates", note: "Mida update since you last checked:\n- codex: did the thing", updates: [{ agent: "codex", savedAt: "2026-09-22T10:01:00Z" }], seen: ["0xnew-ctx"] },
+          : { kind: "updates", note: "Mida update since you last checked (what other sessions reported at the time — check the current state before acting on it):\n- codex: did the thing", updates: [{ agent: "codex", savedAt: "2026-09-22T10:01:00Z" }], seen: ["0xnew-ctx"] },
     })
     try {
       const { client, close } = await connect(deps(dir))

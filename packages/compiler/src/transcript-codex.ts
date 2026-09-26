@@ -45,7 +45,9 @@ const INJECTED_PREFIXES = [
   "# AGENTS.md instructions",
   "<INSTRUCTIONS>",
   "MIDA HANDOFF",
-  "Mida update since you last checked:",
+  // the header grew a parenthetical in in-8 — matching on the shared stem keeps the older and
+  // the newer note both recognised as Mida's own injection
+  "Mida update since you last checked",
 ]
 
 // Mida's own hook and MCP output lands in a Codex rollout as user-role text

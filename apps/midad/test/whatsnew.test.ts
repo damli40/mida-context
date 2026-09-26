@@ -95,7 +95,9 @@ describe("buildWhatsNew", () => {
     const out = await buildWhatsNew(runtimeWith(dir), { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }, baseDeps([foreign]))
     expect(out.kind).toBe("updates")
     if (out.kind !== "updates") return
-    expect(out.note).toContain("Mida update since you last checked:")
+    // the header says what the note IS: reports from other sessions at their save time — never
+    // a claim about the world now (in-8 H3)
+    expect(out.note).toContain("Mida update since you last checked (what other sessions reported at the time — check the current state before acting on it):")
     expect(out.note).toContain("codex")
     expect(out.note).toContain("5 min ago")
     expect(out.note).toContain("fixed the retry loop")
@@ -389,7 +391,20 @@ describe("buildWhatsNew", () => {
     expect(out.kind).toBe("updates")
     if (out.kind !== "updates") return
     expect(out.note.length).toBeLessThanOrEqual(600)
-    expect(out.note).toContain("Mida update since you last checked:")
+    expect(out.note).toContain("Mida update since you last checked (what other sessions reported at the time — check the current state before acting on it):")
+  })
+
+  it("the note opens with the honesty header — and the 600 limit counts it (in-8 H3)", async () => {
+    const dir = home()
+    const out = await buildWhatsNew(
+      runtimeWith(dir),
+      { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
+      baseDeps([cp("other", "0xauthorCodex", iso(5), { progress: ["recent work"] })]),
+    )
+    expect(out.kind).toBe("updates")
+    if (out.kind !== "updates") return
+    expect(out.note.startsWith("Mida update since you last checked (what other sessions reported at the time — check the current state before acting on it):")).toBe(true)
+    expect(out.note.length).toBeLessThanOrEqual(600)
   })
 
   it("a failed refresh answers none on an absent copy and logs the failure — it never refuses", async () => {

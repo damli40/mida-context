@@ -32,7 +32,7 @@ import type { StoredCheckpoint } from "./skeleton.js"
 
 /** The whole note, header included, must fit in this — it is injected into a running prompt. */
 const NOTE_LIMIT_CHARS = 600
-export const WHATS_NEW_HEADER = "Mida update since you last checked:"
+export const WHATS_NEW_HEADER = "Mida update since you last checked (what other sessions reported at the time — check the current state before acting on it):"
 
 /** A copy older than this refreshes behind the request that noticed — the request answers from it anyway. */
 const COPY_STALE_MS = 20_000

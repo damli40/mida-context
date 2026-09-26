@@ -462,7 +462,7 @@ describe("startDaemon", () => {
       expect(reply.status).toBe(200)
       const body = reply.body as { kind: string; note: string; updates: { agent: string }[]; seen: string[] }
       expect(body.kind).toBe("updates")
-      expect(body.note).toContain("Mida update since you last checked:")
+      expect(body.note).toContain("Mida update since you last checked (what other sessions reported at the time — check the current state before acting on it):")
       expect(body.note).toContain("codex")
       expect(body.updates).toEqual([{ agent: "codex", savedAt: "2026-09-21T11:30:00.000Z" }])
       // the proposed set keeps what was already delivered and adds the reported checkpoint's id
