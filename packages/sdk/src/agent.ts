@@ -150,10 +150,13 @@ export interface ContextObject {
    * inside it, then the save's own position inside the transaction (the log index for a direct
    * save, the batch's own position for a batched one). Absent entirely when no chain fact
    * places the record — a pending batched save above all — and `block`/`transaction`/`index`
-   * are absent when only the stamp could be recovered. Whatever an object claims inside its
-   * own payload never reaches this field.
+   * are absent when only the stamp could be recovered. `batchId` names the one batch that
+   * anchored a batched-lane save: two rows sharing it share one transaction, so their `index`
+   * values are positions in the same ordering and comparable without asking the chain for the
+   * transaction index (in-14 F-1). Whatever an object claims inside its own payload never
+   * reaches this field.
    */
-  chain?: { at: bigint; block?: bigint; transaction?: number; index?: number }
+  chain?: { at: bigint; block?: bigint; transaction?: number; index?: number; batchId?: Hex }
 }
 
 /**
@@ -538,10 +541,16 @@ export class MidaAgent {
       if (item.state === "ANCHORED") {
         // lineageId and version passed through the Merkle proof, so they are contract values
         // here. `anchorBlock` came back inside the verdict — the same `batchOf` answer — and its
-        // position inside the batch is the save's place in the chain's order.
+        // position inside the batch is the save's place in the chain's order. `batchId` rides
+        // along so a same-batch tie orders on positions without a placement scan (in-14 F-1).
         const chain =
           verdict.anchorBlock !== undefined
-            ? { at: await blockTime(verdict.anchorBlock), block: verdict.anchorBlock, index: item.position }
+            ? {
+                at: await blockTime(verdict.anchorBlock),
+                block: verdict.anchorBlock,
+                index: item.position,
+                ...(item.batchId === undefined ? {} : { batchId: item.batchId }),
+              }
             : undefined
         return { kind: "anchored", object: { ...base, lineageId: item.lineageId!, version: item.version!, ...(chain === undefined ? {} : { chain }) } }
       }

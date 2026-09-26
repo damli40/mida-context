@@ -833,11 +833,31 @@ export async function readCheckpoints(
     const tied = new Map<bigint, Hex[]>()
     for (const [second, members] of bySecond) {
       if (members.length < 2) continue
-      // a second whose members already all carry a full placement orders itself — only a
-      // missing block or transaction index means the lanes were never scanned together
-      if (members.some((cp) => cp.chain!.block === undefined || cp.chain!.transaction === undefined)) {
-        tied.set(second, members.map((cp) => cp.contextId as Hex))
-      }
+      // A second needs the scan only when some pair inside it cannot be ordered without one
+      // (in-14 F-1): a member the chain never placed can never compare; a same-block pair
+      // orders by their two transaction indexes, or — when both rows carry ONE batch's id —
+      // by batch position, which is already the order the transaction wrote them in.
+      // Positions in DIFFERENT batches share the same index space, so that pair still needs
+      // the anchoring transactions read. A group whose only ties sit inside a single batch
+      // orders itself at zero chain cost, and its positions survive a scan the rest of the
+      // read never asked for.
+      const needsScan = members.some((cp, i) =>
+        members.slice(i + 1).some((other) => {
+          const a = cp.chain!
+          const b = other.chain!
+          if (a.block === undefined || b.block === undefined) return true
+          if (a.block !== b.block) return false
+          if (a.transaction !== undefined && b.transaction !== undefined) return false
+          return !(
+            a.batchId !== undefined &&
+            b.batchId !== undefined &&
+            a.batchId.toLowerCase() === b.batchId.toLowerCase() &&
+            a.index !== undefined &&
+            b.index !== undefined
+          )
+        }),
+      )
+      if (needsScan) tied.set(second, members.map((cp) => cp.contextId as Hex))
     }
     if (tied.size > 0) {
       const placements = await recordPlacementsNear({
@@ -860,6 +880,9 @@ export async function readCheckpoints(
                   block: placement.block,
                   ...(placement.transaction === undefined ? {} : { transaction: placement.transaction }),
                   index: placement.index,
+                  // the batch membership survives the stamp — a scan that ran for the group
+                  // must not erase the lane's own fact
+                  ...(cp.chain!.batchId === undefined ? {} : { batchId: cp.chain!.batchId }),
                 }
         }
       }

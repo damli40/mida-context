@@ -179,6 +179,8 @@ function fakeRuntime(home: MidaHome, over: {
     direct?: Map<string, { block: bigint; logIndex: number; transactionIndex: number }>
     batched?: Map<string, { block: bigint; position: number; transactionIndex: number }>
   }
+  /** Replaces the publicClient wholesale — for tests that count or fail every chain call. */
+  client?: unknown
 } = {}): ServiceRuntime {
   return {
     home,
@@ -188,7 +190,7 @@ function fakeRuntime(home: MidaHome, over: {
     agent: () => over.agent,
     chain: {
       deployment: over.network?.deployment,
-      publicClient: {
+      publicClient: over.client ?? {
         readContract: async ({ functionName, args }: { functionName: string; args: [Address] }) => {
           if (functionName === "hasBatchedSaves" && over.hasBatchedSaves !== undefined) {
             return over.hasBatchedSaves(args[0])
@@ -243,7 +245,11 @@ const ENVELOPE = (eventId: string) =>
   })
 
 /** A ContextObject-shaped row the way agent.readBatchedWithStatus returns it. */
-const anchoredObject = (contextId: Hex, eventId: string, chain?: { at: bigint; block?: bigint; index?: number }) => ({
+const anchoredObject = (
+  contextId: Hex,
+  eventId: string,
+  chain?: { at: bigint; block?: bigint; index?: number; batchId?: Hex },
+) => ({
   contextId,
   owner: OWNER,
   namespace: "goals.career",
@@ -653,6 +659,195 @@ describe("readCheckpoints — a same-second tie across the two lanes (in-13 M-5)
       expect(result.checkpoints.map((cp) => cp.contextId)).toEqual([directId, batchedId])
       expect(result.checkpoints[0]!.chain).toEqual({ at: SECOND })
       expect(result.checkpoints[1]!.chain).toEqual({ at: SECOND })
+    } finally {
+      await store.close()
+    }
+  })
+})
+
+describe("readCheckpoints — a same-batch tie orders by position with no chain calls (in-14 F-1)", () => {
+  /**
+   * Converted from .devin/briefs/probes/zz-rv13-batch-tie.test.ts. Two saves anchored by ONE
+   * batch already carry their order — the batch position is authoritative. The in-13 M-5 rule
+   * re-scanned ANY same-second group holding a batched member (batched rows carry no
+   * transaction index), so a same-batch pair cost ~4 chain calls per read, and a scan that
+   * failed or came back partial threw the positions away and let the contextId decide. The
+   * scan now runs only where some pair inside the second cannot be ordered without it —
+   * different lanes, or different batches in one block. `batchId`, which the SDK now carries
+   * on the row's chain placement, is what says two rows belong to one batch.
+   */
+  const SECOND = 1_500n
+  const BATCH_A = `0x${"b1".repeat(32)}` as Hex
+  const BATCH_B = `0x${"b2".repeat(32)}` as Hex
+  const tsOf = (n: bigint) => 2_000n - (1_000n - n)
+
+  /**
+   * The ordinary tie-scan fake from `fakeRuntime`, wrapped so every chain call is counted —
+   * `fail` makes the underlying calls throw, so a scan that must not run is provably never
+   * attempted.
+   */
+  const countingClient = (
+    home: MidaHome,
+    scan?: {
+      direct?: Map<string, { block: bigint; logIndex: number; transactionIndex: number }>
+      batched?: Map<string, { block: bigint; position: number; transactionIndex: number }>
+    },
+    fail = false,
+  ) => {
+    const calls = { chainCalls: 0 }
+    const tick = () => {
+      calls.chainCalls += 1
+      if (fail) throw new Error("chain down")
+    }
+    const delegate = (
+      fakeRuntime(home, { tieScan: { head: 1_000n, tsOf, ...(scan ?? {}) } }).chain as {
+        publicClient: {
+          getBlock: (p?: unknown) => Promise<unknown>
+          getLogs: (p?: unknown) => Promise<unknown>
+          getBlockNumber: () => Promise<bigint>
+        }
+      }
+    ).publicClient
+    const client = {
+      readContract: async () => {
+        tick()
+        throw new Error("unexpected chain read")
+      },
+      getBlock: async (parameters?: unknown) => {
+        tick()
+        return delegate.getBlock(parameters)
+      },
+      getLogs: async (parameters?: unknown) => {
+        tick()
+        return delegate.getLogs(parameters)
+      },
+      getBlockNumber: async () => {
+        tick()
+        return delegate.getBlockNumber()
+      },
+    }
+    return { calls, client }
+  }
+
+  const oneBatch = (earlier: Hex, later: Hex) => ({
+    readWithStatus: async () => ({ objects: [], partial: false }),
+    readBatchedWithStatus: async () => ({
+      ...emptyBatched,
+      anchored: [
+        // listed newest-first, and "later" sorts before "earlier" on the contextId —
+        // the position order must beat both
+        anchoredObject(later, "later-pos1", { at: SECOND, block: 500n, index: 1, batchId: BATCH_A }),
+        anchoredObject(earlier, "earlier-pos0", { at: SECOND, block: 500n, index: 0, batchId: BATCH_A }),
+      ],
+    }),
+  })
+
+  it("two members of one batch order by position — zero chain calls", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const earlier = `0x${"f1".repeat(32)}` as Hex // position 0; id-sorts LAST on purpose
+      const later = `0x${"a1".repeat(32)}` as Hex // position 1; id-sorts FIRST on purpose
+      const { calls, client } = countingClient(home)
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent: oneBatch(earlier, later),
+        client,
+      })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1")
+      expect(calls.chainCalls, "a same-batch tie paid for a placement scan").toBe(0)
+      expect(result.checkpoints.map((cp) => cp.contextId)).toEqual([earlier, later])
+      expect(result.checkpoints[0]!.chain).toEqual({ at: SECOND, block: 500n, index: 0, batchId: BATCH_A })
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("the same tie with the chain down still orders by position — the scan is never attempted", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const earlier = `0x${"f2".repeat(32)}` as Hex
+      const later = `0x${"a2".repeat(32)}` as Hex
+      const { calls, client } = countingClient(home, undefined, true)
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent: oneBatch(earlier, later),
+        client,
+      })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1")
+      expect(calls.chainCalls).toBe(0)
+      expect(result.checkpoints.map((cp) => cp.contextId)).toEqual([earlier, later])
+      expect(result.checkpoints[0]!.chain).toEqual({ at: SECOND, block: 500n, index: 0, batchId: BATCH_A })
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("a same-second tie across the two lanes still scans — their placements really are missing", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const directId = `0x${"a3".repeat(32)}` as Hex // id-sorts first — the scan's answer must beat it
+      const batchedId = `0x${"f3".repeat(32)}` as Hex
+      const { calls, client } = countingClient(home, {
+        direct: new Map([[directId, { block: 500n, logIndex: 40, transactionIndex: 2 }]]),
+        batched: new Map([[batchedId, { block: 500n, position: 0, transactionIndex: 5 }]]),
+      })
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent: {
+          readWithStatus: async () => ({ objects: [anchoredObject(directId, "cp-direct", { at: SECOND })], partial: false }),
+          readBatchedWithStatus: async () => ({
+            ...emptyBatched,
+            anchored: [anchoredObject(batchedId, "cp-batched", { at: SECOND, block: 500n, index: 0, batchId: BATCH_A })],
+          }),
+        },
+        client,
+      })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1")
+      expect(calls.chainCalls, "a mixed-lane tie must still pay for the scan").toBeGreaterThan(0)
+      // direct tx 2 before batched tx 5 — the direct save really is earlier this time
+      expect(result.checkpoints.map((cp) => cp.contextId)).toEqual([directId, batchedId])
+      expect(result.checkpoints[1]!.chain).toEqual({ at: SECOND, block: 500n, index: 0, transaction: 5, batchId: BATCH_A })
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("two batches anchored in one block still scan — positions alone cannot order them", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const firstTx = `0x${"a4".repeat(32)}` as Hex // batch A anchored in tx 2 — really earlier
+      const secondTx = `0x${"f4".repeat(32)}` as Hex // batch B anchored in tx 5 — really later
+      const { calls, client } = countingClient(home, {
+        batched: new Map([
+          [firstTx, { block: 500n, position: 0, transactionIndex: 2 }],
+          [secondTx, { block: 500n, position: 0, transactionIndex: 5 }],
+        ]),
+      })
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent: {
+          readWithStatus: async () => ({ objects: [], partial: false }),
+          readBatchedWithStatus: async () => ({
+            ...emptyBatched,
+            anchored: [
+              anchoredObject(secondTx, "cp-batchB", { at: SECOND, block: 500n, index: 0, batchId: BATCH_B }),
+              anchoredObject(firstTx, "cp-batchA", { at: SECOND, block: 500n, index: 0, batchId: BATCH_A }),
+            ],
+          }),
+        },
+        client,
+      })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1")
+      expect(calls.chainCalls, "positions in different batches need the anchoring transaction").toBeGreaterThan(0)
+      expect(result.checkpoints.map((cp) => cp.contextId)).toEqual([firstTx, secondTx])
     } finally {
       await store.close()
     }

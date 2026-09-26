@@ -40,11 +40,14 @@ export interface StoredCheckpoint {
    * chain's order (block, then the anchoring transaction's index inside it, then the save's own
    * position — log index for a direct save, batch position for a batched one). Absent for a save
    * the chain has not placed — a pending batched save, or a fixture built by hand — and
-   * `block`/`transaction`/`index` absent when only the stamp was recoverable. `checkpoint.createdAt`
+   * `block`/`transaction`/`index` absent when only the stamp was recoverable. `batchId` is set
+   * only on a batched-lane save and names the batch that anchored it: two records sharing one
+   * `batchId` anchored in one transaction, so their `index` positions order them without
+   * asking the chain (in-14 F-1). `checkpoint.createdAt`
    * is the writer's own claim: it is encrypted content and never enters the ordering or the
    * displayed time — the chain's stamp decides both (in-12 N-1).
    */
-  chain?: { at: bigint; block?: bigint; transaction?: number; index?: number }
+  chain?: { at: bigint; block?: bigint; transaction?: number; index?: number; batchId?: `0x${string}` }
   /**
    * Set only on records `mida migrate` moved here — the sealed envelope carried beside the
    * checkpoint. It is the ONE exception to chain-time ordering: a moved record orders and
