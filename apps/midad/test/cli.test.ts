@@ -643,7 +643,10 @@ describe("the crude mida command", () => {
       ...unsigned,
       requestId: `0x${"ff".repeat(32)}` as Hex,
       nonce: `0x${"ff".repeat(32)}` as Hex,
-      issuedAt: encodeUint64(now - 10n),
+      // grantAdviceFor validates the window against the CHAIN's last block timestamp, not the
+      // wall clock — a fresh anvil block can lag `now` by more than a small margin, and then
+      // issuedAt lands in the chain's future and the request reads as out-of-window
+      issuedAt: encodeUint64(now - 120n),
       requestExpiresAt: encodeUint64(now + 300n),
     }
     const request = { ...fresh, agentSignature: await privateKeyToAccount(identity.signerPrivateKey).signTypedData(accessRequestTypedData(fresh)) }
