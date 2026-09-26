@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { zeroHash } from "viem"
 import { CONTEXT_KIND, OWNER_AUTHOR_ID, PROVENANCE_SOURCE, RECORD_TYPE, canonicalBytes } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { orderTime } from "@mida/checkpoint"
+import { mergeCheckpoints, orderTime } from "@mida/checkpoint"
 import type { Checkpoint, StoredCheckpoint } from "@mida/checkpoint"
 import type { MidaHome } from "./home.js"
 import { loadOwnerAddress, loadOwnerMode } from "./keys.js"
@@ -76,10 +76,16 @@ export interface ExportEntry {
   lineageId: Hex
   version: number
   parentId: Hex
-  /** True on the highest version in the record's lineage — the record a read would answer with. */
-  current: boolean
-  /** The record that replaced this one, or null. */
+  /** True when a later version in the same lineage exists — a read would answer with that one. */
+  superseded: boolean
+  /** The record that replaced this one (names it in parentId), or null. */
   supersededBy: Hex | null
+  /**
+   * Checkpoints only: the record a handoff for this project would treat as its newest —
+   * mergeCheckpoints's chosen chain head, ordered by the chain's own stamps, never the
+   * writer's claim. False on every non-checkpoint record.
+   */
+  newestCheckpoint: boolean
   lane: "direct" | "batched"
   batchId: Hex | null
   /** The read epoch the record was sealed under — a decimal string. */
@@ -265,19 +271,61 @@ function supersededByMap(records: readonly SourceRecord[]): Map<string, Hex> {
   return supersededBy
 }
 
-/** The highest version in each lineage — the records a reader would call current. */
-function currentIds(records: readonly SourceRecord[]): Set<string> {
+/** The highest-version contextIds in each lineage — the records a plain read would answer with. */
+function latestInLineage(records: readonly SourceRecord[]): Set<string> {
   const byLineage = new Map<string, number>()
   for (const record of records) {
     const key = (record.lineageId === zeroHash ? record.contextId : record.lineageId).toLowerCase()
     byLineage.set(key, Math.max(byLineage.get(key) ?? -1, record.version))
   }
-  const current = new Set<string>()
+  const latest = new Set<string>()
   for (const record of records) {
     const key = (record.lineageId === zeroHash ? record.contextId : record.lineageId).toLowerCase()
-    if (record.version === byLineage.get(key)) current.add(record.contextId.toLowerCase())
+    if (record.version === byLineage.get(key)) latest.add(record.contextId.toLowerCase())
   }
-  return current
+  return latest
+}
+
+/**
+ * The checkpoint a handoff would call newest in each project — mergeCheckpoints's own pick
+ * (the chosen chain's head). Only records carrying a checkpoint envelope take part, grouped
+ * by projectId exactly as a handoff for that project would see them; each record is rebuilt
+ * as the StoredCheckpoint the merge consumes, with Monad's own placement as its order.
+ */
+function newestCheckpointIds(records: readonly SourceRecord[]): Set<string> {
+  const byProject = new Map<string, StoredCheckpoint[]>()
+  for (const record of records) {
+    const envelope = unwrapCheckpoint(record.payload.value)
+    if (envelope === null) continue
+    const stored: StoredCheckpoint = {
+      checkpoint: envelope.checkpoint,
+      projectId: envelope.projectId,
+      sessionId: envelope.sessionId,
+      continuesSession: envelope.continuesSession,
+      compiledBy: envelope.compiledBy,
+      contextId: record.contextId,
+      authorId: record.authorId,
+      namespaceId: record.namespaceId,
+      chain: {
+        at: record.createdAt,
+        ...(record.chain?.block === undefined ? {} : { block: record.chain.block }),
+        ...(record.chain?.index === undefined ? {} : { index: record.chain.index }),
+      },
+      ...(envelope.migration === undefined ? {} : { migration: envelope.migration }),
+    }
+    const list = byProject.get(envelope.projectId)
+    if (list === undefined) byProject.set(envelope.projectId, [stored])
+    else list.push(stored)
+  }
+  const newest = new Set<string>()
+  for (const checkpoints of byProject.values()) {
+    // provenance is the chosen chain in chain order — its last row is the head a handoff
+    // for this project would continue from.
+    const merged = mergeCheckpoints(checkpoints)
+    const head = merged?.provenance.at(-1)?.contextId
+    if (head !== undefined) newest.add(head.toLowerCase())
+  }
+  return newest
 }
 
 /**
@@ -301,7 +349,8 @@ function entryFor(
   record: SourceRecord,
   names: Record<string, string>,
   supersededBy: Map<string, Hex>,
-  current: Set<string>,
+  latest: Set<string>,
+  newestCheckpoints: Set<string>,
   now: Date,
 ): ExportEntry {
   const authorName =
@@ -323,8 +372,11 @@ function entryFor(
     lineageId: record.lineageId,
     version: record.version,
     parentId: record.parentId,
-    current: current.has(record.contextId.toLowerCase()),
+    // superseded = a later version exists in the lineage — whether the link was a supersede
+    // (supersededBy names it) or the chain simply holds a higher version.
+    superseded: supersededBy.has(record.contextId.toLowerCase()) || !latest.has(record.contextId.toLowerCase()),
     supersededBy: supersededBy.get(record.contextId.toLowerCase()) ?? null,
+    newestCheckpoint: newestCheckpoints.has(record.contextId.toLowerCase()),
     lane: record.lane ?? "direct",
     batchId: record.batchId ?? null,
     readEpoch: record.readEpoch.toString(10),
@@ -407,15 +459,18 @@ function recordsMarkdown(entries: ExportEntry[], records: readonly SourceRecord[
     lines.push(`## ${namespace} (${group.length})`, "")
     const newestFirst = [...group].sort((a, b) => b.entry.writtenAt.localeCompare(a.entry.writtenAt) || a.entry.contextId.localeCompare(b.entry.contextId))
     for (const { entry, record } of newestFirst) {
+      // Honest labels only: a record is superseded (a later version exists) or it is the
+      // checkpoint a handoff would continue from — there is no "current" flag to overclaim.
       const flags = [
-        entry.current ? "current" : `superseded → ${entry.supersededBy ?? "unknown"}`,
+        ...(entry.superseded ? [entry.supersededBy === null ? "superseded" : `superseded → ${entry.supersededBy}`] : []),
+        ...(entry.newestCheckpoint ? ["newest checkpoint"] : []),
         ...(entry.expired ? ["expired"] : []),
         ...(entry.lane === "batched" ? [`batched in ${entry.batchId}`] : []),
       ]
       lines.push(
         `### ${entry.kind} — ${entry.writtenAt} — by ${entry.author.name}`,
         "",
-        `\`${entry.contextId}\` · v${entry.version} · ${entry.recordType} · ${flags.join(" · ")}`,
+        `\`${entry.contextId}\` · v${entry.version} · ${entry.recordType}${flags.length === 0 ? "" : ` · ${flags.join(" · ")}`}`,
         "",
         ...contentLines(record),
         "",
@@ -583,8 +638,9 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
     const names = authorNamesFor(runtime)
     const now = deps.now?.() ?? new Date()
     const supersededBy = supersededByMap(records)
-    const current = currentIds(records)
-    const entries = records.map((record) => entryFor(record, names, supersededBy, current, now))
+    const latest = latestInLineage(records)
+    const newestCheckpoints = newestCheckpointIds(records)
+    const entries = records.map((record) => entryFor(record, names, supersededBy, latest, newestCheckpoints, now))
     const namespaces = new Set(entries.map((entry) => entry.namespace))
     const exportedAt = now.toISOString()
     const blockNumber = await runtime.chain.publicClient.getBlockNumber({ cacheTime: 0 })

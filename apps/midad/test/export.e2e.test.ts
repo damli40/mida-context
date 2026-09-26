@@ -85,11 +85,16 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
   const saved = {
     cp1: undefined as unknown as { contextId: Hex },
     cp2: undefined as unknown as { contextId: Hex },
+    cp3: undefined as unknown as { contextId: Hex },
     fact: undefined as unknown as { contextId: Hex },
     career: undefined as unknown as { contextId: Hex },
     batched: undefined as unknown as { contextId: Hex },
     checkpoint1: envelope("proj-export", sampleCheckpoint({ eventId: "cp-export-01", objective: "the first checkpoint" })),
     checkpoint2: envelope("proj-export", sampleCheckpoint({ eventId: "cp-export-02", objective: "the superseding checkpoint" })),
+    // A third save through the real path — a plain `create`, the way every checkpoint lands
+    // (supersede is never used for checkpoints). It is a new session in the same project:
+    // the merge's own ordering must pick it as the newest checkpoint, not cp2.
+    checkpoint3: envelope("proj-export", sampleCheckpoint({ eventId: "cp-export-04", objective: "the third checkpoint" }), "s2"),
     checkpointB: envelope("proj-export-b", sampleCheckpoint({ eventId: "cp-export-03", objective: "the batched checkpoint" })),
     factText: "the owner exports with one command",
     careerText: "codex wrote this in goals.career",
@@ -175,6 +180,12 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
     saved.cp1 = cp1
     saved.cp2 = cp2
 
+    // 2b. a third checkpoint through the REAL save path — another `create`, a new lineage,
+    // newer on chain than the superseding cp2
+    const cp3 = await saveCheckpoint(runtime, "claude-code", saved.checkpoint3)
+    expect(cp3.lane).toBe("direct")
+    saved.cp3 = cp3
+
     // 3. an owner `remember` fact
     const fact = await remember(runtime, saved.factText)
     if (fact.kind !== "remembered") throw new Error("the owner fact was refused")
@@ -254,7 +265,7 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
         stdoutIsTTY: true,
       })
       expect(code).toBe(0)
-      expect(lines).toContain(`Exported 5 records (3 namespaces) to ${dest}.`)
+      expect(lines).toContain(`Exported 6 records (3 namespaces) to ${dest}.`)
 
       entries = JSON.parse(readFileSync(join(dest, "records.json"), "utf8")) as ExportEntry[]
 
@@ -275,11 +286,11 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
         fromBlock: env.deployment.batchAnchorBlock ?? env.deployment.deploymentBlock,
         toBlock: head,
       })
-      expect(directLogs).toHaveLength(4)
+      expect(directLogs).toHaveLength(5)
       expect(batchedLogs).toHaveLength(1)
       expect(entries).toHaveLength(directLogs.length + batchedLogs.length)
       const ids = new Set(entries.map((entry) => entry.contextId.toLowerCase()))
-      for (const id of [saved.cp1, saved.cp2, saved.fact, saved.career, saved.batched].map((s) => s.contextId.toLowerCase())) {
+      for (const id of [saved.cp1, saved.cp2, saved.cp3, saved.fact, saved.career, saved.batched].map((s) => s.contextId.toLowerCase())) {
         expect(ids.has(id), `record ${id} missing from records.json`).toBe(true)
       }
     },
@@ -290,7 +301,7 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
     // keepEncrypted off is the readOwnerUniverse migrate has always called: no manifest or
     // ciphertext is retained, so a plaintext-only caller's memory use does not change.
     const universe = await readOwnerUniverse(runtime)
-    expect(universe).toHaveLength(5)
+    expect(universe).toHaveLength(6)
     for (const record of universe) expect(record.encrypted).toBeUndefined()
     const kept = await readOwnerUniverse(runtime, { keepEncrypted: true })
     for (const record of kept) expect(record.encrypted?.manifest.contextId).toBe(record.contextId)
@@ -312,9 +323,9 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
   it("supersession and authorship come out right: cp1 superseded by cp2, authors named", () => {
     const cp1 = entryFor(saved.cp1.contextId)
     const cp2 = entryFor(saved.cp2.contextId)
-    expect(cp1.current).toBe(false)
+    expect(cp1.superseded).toBe(true)
     expect(cp1.supersededBy).toBe(cp2.contextId)
-    expect(cp2.current).toBe(true)
+    expect(cp2.superseded).toBe(false)
     expect(cp2.supersededBy).toBeNull()
     expect(cp2.parentId).toBe(cp1.contextId)
     expect(cp2.version).toBe(2)
@@ -326,6 +337,23 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
     expect(cp1.lane).toBe("direct")
     expect(cp1.expiresAt).toBeNull()
     expect(cp1.expired).toBe(false)
+  })
+
+  it("newestCheckpoint is the merge's own pick — the later plain create, not the superseded chain's head", () => {
+    // proj-export holds cp1→cp2 (one lineage, a real supersede) plus cp3 (a plain create,
+    // a second session, newer on chain). The handoff would continue from cp3 — the merge's
+    // ordering decides, never the "current" flag that used to mark every checkpoint.
+    expect(entryFor(saved.cp3.contextId).newestCheckpoint).toBe(true)
+    expect(entryFor(saved.cp1.contextId).newestCheckpoint).toBe(false)
+    expect(entryFor(saved.cp2.contextId).newestCheckpoint).toBe(false)
+    // the batched checkpoint is its own project's only save — it is that project's newest
+    expect(entryFor(saved.batched.contextId).newestCheckpoint).toBe(true)
+    // non-checkpoint records never carry the flag
+    expect(entryFor(saved.fact.contextId).newestCheckpoint).toBe(false)
+    expect(entryFor(saved.career.contextId).newestCheckpoint).toBe(false)
+    const md = readFileSync(join(dest, "records.md"), "utf8")
+    expect(md).toContain("newest checkpoint")
+    expect(md).not.toMatch(/· current/)
   })
 
   it("the README's own recipe holds for every record — manifest, ciphertext, chain", async () => {
@@ -392,19 +420,20 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
 
   it("records.md renders the content, and the README tells the truth about counts", () => {
     const md = readFileSync(join(dest, "records.md"), "utf8")
-    expect(md).toContain("## projects.current (3)")
+    expect(md).toContain("## projects.current (4)")
     expect(md).toContain("## goals.career (1)")
     expect(md).toContain("the superseding checkpoint")
     expect(md).toContain("contains no keys")
     expect(md).toContain(`superseded → ${saved.cp2.contextId}`)
 
     const readme = readFileSync(join(dest, "README.md"), "utf8")
-    expect(readme).toContain("5 records in 3 context areas")
-    expect(readme).toContain("- projects.current: 3")
+    expect(readme).toContain("6 records in 3 context areas")
+    expect(readme).toContain("- projects.current: 4")
     expect(readme).toContain("- preferences.communication: 1")
     expect(readme).toContain("- goals.career: 1")
-    expect(readme).toContain("4 direct, 1 batched")
+    expect(readme).toContain("5 direct, 1 batched")
     expect(readme).toContain("Saves still queued on this laptop: 0")
+    expect(readme).toContain("Batched saves still waiting for Monad: 0")
     expect(readme).toContain("contains no keys")
     expect(readme).toContain(`chain id: ${env.deployment.chainId}`)
     expect(readme).toContain(`ContextRegistry: ${env.deployment.contextRegistry}`)

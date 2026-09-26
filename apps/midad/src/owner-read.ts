@@ -46,6 +46,12 @@ export interface SourceRecord {
   /** The batch a batched save anchored in — absent on direct records. */
   batchId?: Hex
   /**
+   * Monad's own placement of the save — the same fields the handoff's merge orders by:
+   * `at` is the chain's stamp, `block` the placing block, and `index` the save's position
+   * within it (log index for a direct save, batch position for a batched one).
+   */
+  chain?: { at: bigint; block?: bigint; index?: number }
+  /**
    * The store's own encrypted copy of this record, attached only when the caller asked for it
    * (`{ keepEncrypted: true }`). The manifest object and ciphertext bytes are exactly what the
    * store served — re-verified against the chain commitment before decryption, so what is kept
@@ -325,6 +331,9 @@ async function readBatchedUniverse(
           references: payload.provenance.references ?? [],
           lane: "batched",
           batchId: save.batchId,
+          // The batch's position in the anchor order — block for the anchor block, index for
+          // the save's position inside the batch (the merge's tiebreak fields).
+          chain: { at: createdAt, block: save.blockNumber === 0n ? undefined : save.blockNumber, index: item.position },
           ...(keepEncrypted
             ? { encrypted: { manifest: item.save.manifest, ciphertext, batchItem: item } }
             : {}),
@@ -381,9 +390,11 @@ export async function readOwnerUniverse(
   }
 
   // The chain-side universe, in registration order: every contextId the log attributes to this
-  // owner, and the record tuple the registry emitted with it.
+  // owner, the record tuple the registry emitted with it, and the log's own placement — the
+  // block and index the handoff's merge orders by.
   const ordered: { contextId: Hex; record: ContextRecordView }[] = []
   const chainRecords = new Map<Hex, ContextRecordView>()
+  const placements = new Map<Hex, { block?: bigint; index?: number }>()
   const byNamespace = new Map<Hex, Set<Hex>>()
   for (const log of logs) {
     const args = log.args as unknown as { contextId: Hex; record: ContextRecordView }
@@ -391,6 +402,7 @@ export async function readOwnerUniverse(
     if (chainRecords.has(contextId)) continue
     const record = args.record
     chainRecords.set(contextId, record)
+    placements.set(contextId, { block: log.blockNumber ?? undefined, index: log.logIndex ?? undefined })
     ordered.push({ contextId, record })
     const namespaceId = record.namespaceId.toLowerCase() as Hex
     let ids = byNamespace.get(namespaceId)
@@ -480,6 +492,8 @@ export async function readOwnerUniverse(
           payload,
           references: payload.provenance.references ?? [],
           lane: "direct",
+          // The registration log's own placement — the merge's tiebreak fields.
+          chain: { at: record.createdAt, ...placements.get(contextId) },
           ...(keepEncrypted ? { encrypted: { manifest: object.manifest, ciphertext } } : {}),
         })
       } catch (error) {

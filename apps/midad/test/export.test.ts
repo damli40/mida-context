@@ -31,8 +31,10 @@ import {
   runHook,
   saveOwnerAddress,
   saveOwnerMode,
+  wrapCheckpoint,
 } from "@mida/midad"
 import type { ExportEntry, Network, Runtime, SourceRecord } from "@mida/midad"
+import { sampleCheckpoint } from "./helpers.js"
 
 const OWNER = `0x${"ab".repeat(20)}` as const
 const NS_PROJECTS = namespaceId("projects.current")
@@ -502,9 +504,9 @@ describe("mida export — the written folder", () => {
     expect(entries).toHaveLength(2)
     const first = entries.find((e) => e.contextId === v1.contextId)!
     const second = entries.find((e) => e.contextId === v2.contextId)!
-    expect(first.current).toBe(false)
+    expect(first.superseded).toBe(true)
     expect(first.supersededBy).toBe(v2.contextId)
-    expect(second.current).toBe(true)
+    expect(second.superseded).toBe(false)
     expect(second.supersededBy).toBeNull()
     expect(first.author).toEqual({ id: OWNER_AUTHOR_ID, name: "you" })
     expect(first.recordType).toBe("CONTEXT")
@@ -516,6 +518,53 @@ describe("mida export — the written folder", () => {
     expect(first.writtenAt).toBe("2023-11-14T22:13:20.000Z")
     expect(first.chainTime).toBe("2023-11-14T22:13:20.000Z")
     expect((first.payload as { value: { text: string } }).value.text).toContain("secret text")
+  })
+
+  it("two checkpoints saved by plain creates — only the chain-later one is newestCheckpoint", async () => {
+    // ex-2 X-5: the real save path creates a NEW lineage per checkpoint, so "current" was
+    // true on every one. newestCheckpoint is the merge's pick — the same ordering the
+    // handoff uses (orderTime: the chain's stamp, never the writer's claim). The first
+    // save claims a LATER createdAt on purpose: the claim must not win.
+    const checkpoint = (eventId: string, sessionId: string, claimedAt: string) => ({
+      v: 1 as const,
+      value: { ...wrapCheckpoint({
+        projectId: "proj-x",
+        sessionId,
+        continuesSession: null,
+        compiledBy: "t",
+        checkpoint: sampleCheckpoint({ eventId, createdAt: claimedAt }),
+      }) } as Record<string, unknown>,
+      kind: "EPISODE" as const,
+      provenance: { source: "AGENT_INFERRED" as const },
+    })
+    const first = fixtureRecord({
+      kind: 5,
+      createdAt: 1_700_000_000n,
+      payload: checkpoint("cp-unit-01", "s1", "2026-09-25T10:00:00.000Z"), // claims the later day — a lie
+    })
+    const second = fixtureRecord({
+      kind: 5,
+      createdAt: 1_700_000_100n,
+      payload: checkpoint("cp-unit-02", "s2", "2026-09-20T10:00:00.000Z"), // claims the earlier day — honest
+    })
+    const { dest } = await exportWith([first, second])
+    const entries = JSON.parse(readFileSync(join(dest, "records.json"), "utf8")) as ExportEntry[]
+    const e1 = entries.find((e) => e.contextId === first.contextId)!
+    const e2 = entries.find((e) => e.contextId === second.contextId)!
+    expect(e1.newestCheckpoint).toBe(false)
+    expect(e2.newestCheckpoint).toBe(true)
+    // neither was superseded — plain creates link nothing
+    expect(e1.superseded).toBe(false)
+    expect(e2.superseded).toBe(false)
+    // and a non-checkpoint record never carries the flag
+    const { dest: dest2 } = await exportWith([fixtureRecord()])
+    const fact = JSON.parse(readFileSync(join(dest2, "records.json"), "utf8")) as ExportEntry[]
+    expect(fact[0]!.newestCheckpoint).toBe(false)
+    // records.md uses the honest labels only — "current" must not appear as a flag
+    // (the namespace is named projects.current, so match the flag separator, not the word)
+    const md = readFileSync(join(dest, "records.md"), "utf8")
+    expect(md).toContain("newest checkpoint")
+    expect(md).not.toMatch(/· current/)
   })
 
   it("the encrypted files are the store's bytes — manifest hashes to manifestHash", async () => {
