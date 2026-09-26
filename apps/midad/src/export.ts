@@ -16,6 +16,7 @@ import { Runtime } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { authorNamesFor } from "./skeleton.js"
 import { movedOnSuffix, readEnvelope } from "./migration-envelope.js"
+import type { MigrationEnvelope } from "./migration-envelope.js"
 import { unwrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 
@@ -95,6 +96,13 @@ export interface ExportEntry {
   manifestHash: Hex
   /** The decrypted payload, exactly as read back — plaintext. */
   payload: unknown
+  /**
+   * "unreadable" only: the record carried a migration envelope this build could not read (a
+   * payload carrying it in both slots is contradictory). The record still exports — the
+   * decrypted payload is preserved as-is and writtenAt is Monad's stamp, not the envelope's
+   * claim. Absent on every ordinary record.
+   */
+  envelope?: "unreadable"
 }
 
 function codedError(code: string, message: string): Error {
@@ -329,12 +337,27 @@ function newestCheckpointIds(records: readonly SourceRecord[]): Set<string> {
 }
 
 /**
+ * readEnvelope that never throws `invalid-migration-envelope` at the owner: a payload carrying
+ * the envelope in both slots is contradictory — the record still exports, flagged "unreadable",
+ * and nothing from the envelope is trusted. One malformed record must never block the owner
+ * from leaving. Any other error still propagates.
+ */
+function envelopeOf(record: SourceRecord): { migration?: MigrationEnvelope; unreadable: boolean } {
+  try {
+    return { migration: readEnvelope(record.payload), unreadable: false }
+  } catch (error) {
+    if ((error as { code?: unknown }).code === "invalid-migration-envelope") return { unreadable: true }
+    throw error
+  }
+}
+
+/**
  * writtenAt by the in-12 merge rule (packages/checkpoint merge.ts orderTime): the chain's stamp
  * decides, and a migrated record keeps the earlier of its original write day and its replay's
- * stamp — never the writer's own claim, and never a day after Monad saw it.
+ * stamp — never the writer's own claim, and never a day after Monad saw it. An unreadable
+ * envelope claims nothing — writtenAt is the chain stamp, plain.
  */
-function writtenAtMs(record: SourceRecord): number {
-  const migration = readEnvelope(record.payload)
+function writtenAtMs(record: SourceRecord, migration: MigrationEnvelope | undefined): number {
   return orderTime({
     checkpoint: {} as Checkpoint,
     chain: { at: record.createdAt },
@@ -357,6 +380,7 @@ function entryFor(
     record.authorId.toLowerCase() === OWNER_AUTHOR_ID.toLowerCase()
       ? "you"
       : names[record.authorId.toLowerCase()] ?? record.authorId
+  const { migration, unreadable } = envelopeOf(record)
   return {
     contextId: record.contextId,
     namespace: record.namespace,
@@ -365,7 +389,7 @@ function entryFor(
     kind: enumName(CONTEXT_KIND, record.kind, "kind", record.contextId),
     source: enumName(PROVENANCE_SOURCE, record.provenanceSource, "provenance source", record.contextId),
     author: { id: record.authorId, name: authorName },
-    writtenAt: msIso(writtenAtMs(record)),
+    writtenAt: msIso(writtenAtMs(record, migration)),
     chainTime: iso(record.createdAt),
     expiresAt: record.expiresAt === 0n ? null : iso(record.expiresAt),
     expired: record.expiresAt !== 0n && record.expiresAt * 1_000n <= BigInt(now.getTime()),
@@ -383,6 +407,7 @@ function entryFor(
     references: record.references.map((reference) => ({ relation: reference.relation, recordId: reference.recordId })),
     manifestHash: record.manifestHash,
     payload: record.payload,
+    ...(unreadable ? { envelope: "unreadable" as const } : {}),
   }
 }
 
@@ -429,8 +454,11 @@ function contentLines(record: SourceRecord): string[] {
   }
   // A moved record carries its provenance as a sealed envelope — the same "(moved on …)" marker
   // every Mida list appends, plus where it originally lived, so the export keeps attribution.
-  const migration = readEnvelope(record.payload)
-  if (migration !== undefined) {
+  // An unreadable envelope claims nothing: the flag in the header line already names it.
+  const { migration, unreadable } = envelopeOf(record)
+  if (unreadable) {
+    raw.push("(its migration envelope could not be read — the payload above is exactly as stored)")
+  } else if (migration !== undefined) {
     raw.push(
       `${movedOnSuffix(migration)} — originally record ${migration.originalRecordId} on contract ${migration.originalContract}, chain ${migration.originalChainId}`,
     )
@@ -466,6 +494,7 @@ function recordsMarkdown(entries: ExportEntry[], records: readonly SourceRecord[
         ...(entry.newestCheckpoint ? ["newest checkpoint"] : []),
         ...(entry.expired ? ["expired"] : []),
         ...(entry.lane === "batched" ? [`batched in ${entry.batchId}`] : []),
+        ...(entry.envelope === "unreadable" ? ["migration envelope unreadable"] : []),
       ]
       lines.push(
         `### ${entry.kind} — ${entry.writtenAt} — by ${entry.author.name}`,
@@ -495,6 +524,8 @@ function readme(input: {
   blockTime: bigint
   queued: number
   batchedPending: number
+  /** contextIds whose migration envelope could not be read — named so the export is honest. */
+  unreadableIds: string[]
 }): string {
   const { entries, network } = input
   const namespaces = new Map<string, number>()
@@ -581,8 +612,17 @@ Decrypting needs the owner's per-area keys — not included, by design.
   reason they cannot be in this folder. A non-zero count means export again after they land.
 - **Keys.** None — not your owner key, not any agent's key, not the per-area decryption keys.
   records.json and records.md are plaintext: keep this folder private, or delete it when you are done.
-`
-}
+${input.unreadableIds.length === 0 ? "" : `
+## Records with an unreadable migration envelope
+
+${input.unreadableIds.length === 1 ? "This record" : "These records"} carried a migration envelope this build could
+not read. ${input.unreadableIds.length === 1 ? "It" : "They"} exported anyway — the decrypted payload is in records.json
+exactly as stored, \`envelope\` is "unreadable", and \`writtenAt\` is Monad's own stamp, never the
+envelope's claim.
+
+${input.unreadableIds.map((id) => `- \`${id}\``).join("\n")}
+`}
+`}
 
 /**
  * `mida export <folder>` end to end. Order of gates, each refusing before anything is written:
@@ -599,6 +639,11 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
   }
   if (mode === undefined || loadOwnerAddress(home) === undefined) {
     return refuse(deps, "no-owner", "this home has no owner yet — run `mida init` first")
+  }
+  // The key must already exist — export opens the runtime load-only so a missing secrets file
+  // is a refusal, never a freshly minted owner key in a home that lost one.
+  if (!home.has("owner/secrets.json")) {
+    return refuse(deps, "no-owner-key", "no owner key on this machine — export needs the local software owner key")
   }
   if (typeof deps.folder !== "string" || deps.folder.trim() === "") {
     return refuse(deps, "no-folder", "export needs a folder to write to: mida export <folder>")
@@ -621,7 +666,7 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
   // touched.
   sweepLeftoverStaging(dest, deps.print)
 
-  const runtime = await (deps.openRuntime ?? Runtime.open)(home, network)
+  const runtime = await (deps.openRuntime ?? ((h, n) => Runtime.open(h, n, undefined, "load-only")))(home, network)
   try {
     // readOwnerUniverse's progress is the log scan's (block ranges), not a record count — say so.
     const onProgress = (done: number, total: number): void => {
@@ -641,6 +686,7 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
     const latest = latestInLineage(records)
     const newestCheckpoints = newestCheckpointIds(records)
     const entries = records.map((record) => entryFor(record, names, supersededBy, latest, newestCheckpoints, now))
+    const unreadableIds = entries.filter((entry) => entry.envelope === "unreadable").map((entry) => entry.contextId)
     const namespaces = new Set(entries.map((entry) => entry.namespace))
     const exportedAt = now.toISOString()
     const blockNumber = await runtime.chain.publicClient.getBlockNumber({ cacheTime: 0 })
@@ -703,6 +749,7 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
           blockTime: block.timestamp,
           queued,
           batchedPending,
+          unreadableIds,
         }),
       )
       // The one moment the destination matters again: if it appeared while we wrote, refuse and
@@ -747,6 +794,11 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
     if (queued > 0 || batchedPending > 0) {
       deps.print(
         `${queued} save${queued === 1 ? "" : "s"} ${queued === 1 ? "is" : "are"} still queued on this laptop and ${batchedPending} batched save${batchedPending === 1 ? "" : "s"} ${batchedPending === 1 ? "is" : "are"} waiting for Monad; they are not in this export. Run export again after they land.`,
+      )
+    }
+    if (unreadableIds.length > 0) {
+      deps.print(
+        `warning: ${unreadableIds.length} record${unreadableIds.length === 1 ? "" : "s"} carried an unreadable migration envelope and exported as-is (marked in records.json): ${unreadableIds.join(", ")}`,
       )
     }
     return { outcome: "exported", records: records.length, namespaces: namespaces.size, folder: dest, queued, batchedPending }

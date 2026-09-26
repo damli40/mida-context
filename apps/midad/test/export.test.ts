@@ -33,7 +33,7 @@ import {
   saveOwnerMode,
   wrapCheckpoint,
 } from "@mida/midad"
-import type { ExportEntry, Network, Runtime, SourceRecord } from "@mida/midad"
+import type { ExportEntry, MigrationEnvelope, Network, Runtime, SourceRecord } from "@mida/midad"
 import { sampleCheckpoint } from "./helpers.js"
 
 const OWNER = `0x${"ab".repeat(20)}` as const
@@ -55,11 +55,16 @@ const network: Network = {
 const tempHome = (): MidaHome => new MidaHome(mkdtempSync(join(tmpdir(), "mida-export-")))
 const tempDir = (): string => mkdtempSync(join(tmpdir(), "mida-export-cwd-"))
 
-/** A software-owner home — owner-mode marker plus address — so the owner gates pass. */
+/** A software-owner home — owner-mode marker, address and key — so the owner gates pass. */
 function ownerHome(): MidaHome {
   const home = tempHome()
   saveOwnerMode(home, "software")
   saveOwnerAddress(home, OWNER)
+  home.writeSecretJson("owner/secrets.json", {
+    privateKey: `0x${"11".repeat(32)}`,
+    seed: `0x${"22".repeat(32)}`,
+    p256PrivateKey: `0x${"33".repeat(32)}`,
+  })
   return home
 }
 
@@ -210,6 +215,33 @@ describe("mida export — dispatch and refusals", () => {
     expect(lines).toEqual(["export supports software-key setups only in this version"])
     expect(home.has("owner/secrets.json")).toBe(false)
     expect(existsSync(join(cwd, "backup"))).toBe(false)
+  })
+
+  it("an owner address with no owner key refuses — export never mints one", async () => {
+    // ex-2 X-8a: a software home whose owner-address.json exists but owner/secrets.json does
+    // not must refuse — the runtime open must not mint a fresh key into the home.
+    const home = tempHome()
+    saveOwnerMode(home, "software")
+    saveOwnerAddress(home, OWNER)
+    const cwd = tempDir()
+    const lines: string[] = []
+    let opens = 0
+    const result = await exportRecords({
+      home,
+      network,
+      folder: join(cwd, "backup"),
+      cwd,
+      print: (line) => lines.push(line),
+      openRuntime: async () => {
+        opens += 1
+        return fakeRuntime(home)
+      },
+    })
+    expect(result).toEqual({ outcome: "refused", code: "no-owner-key" })
+    expect(lines).toEqual(["no owner key on this machine — export needs the local software owner key"])
+    // the refusal came before the runtime open, and nothing was minted
+    expect(opens).toBe(0)
+    expect(home.has("owner/secrets.json")).toBe(false)
   })
 
   it("an existing destination refuses — an empty dir, a file, and even a dangling symlink", async () => {
@@ -662,6 +694,47 @@ describe("mida export — the written folder", () => {
     expect(result.outcome).toBe("refused")
     expect(lines.some((line) => line.includes("batched"))).toBe(true)
     expect(existsSync(dest)).toBe(false)
+  })
+
+  it("a record carrying its migration envelope in both slots still exports — marked unreadable, never fatal", async () => {
+    // ex-2 X-8b: readEnvelope throws invalid-migration-envelope on the contradictory shape,
+    // which used to abort the whole export. The record leaves with its decrypted payload
+    // as-is, envelope "unreadable", writtenAt = the chain stamp — and it is named in
+    // records.json, records.md, the README and the printed summary.
+    const migration = {
+      version: 1,
+      originalChainId: "143",
+      originalContract: `0x${"55".repeat(20)}`,
+      originalRecordId: `0x${"66".repeat(32)}`,
+      originalCommitment: `0x${"77".repeat(32)}`,
+      originalAuthor: `0x${"88".repeat(32)}`,
+      originalCreatedAt: "2024-01-01T00:00:00.000Z",
+      migratedAt: "2024-06-01T00:00:00.000Z",
+    } as const as MigrationEnvelope
+    const bad = fixtureRecord({
+      payload: {
+        v: 1,
+        value: { text: "a moved fact", migration },
+        kind: "FACT",
+        provenance: { source: "USER_ASSERTED" },
+        migration,
+      },
+    })
+    const good = fixtureRecord()
+    const { dest, lines, result } = await exportWith([bad, good])
+    expect(result).toMatchObject({ outcome: "exported", records: 2 })
+    const entries = JSON.parse(readFileSync(join(dest, "records.json"), "utf8")) as ExportEntry[]
+    const entry = entries.find((e) => e.contextId === bad.contextId)!
+    expect(entry.envelope).toBe("unreadable")
+    expect(entry.writtenAt).toBe(entry.chainTime)
+    expect((entry.payload as { value: { text: string } }).value.text).toBe("a moved fact")
+    expect(entries.find((e) => e.contextId === good.contextId)!.envelope).toBeUndefined()
+    const md = readFileSync(join(dest, "records.md"), "utf8")
+    expect(md).toContain("migration envelope unreadable")
+    const readme = readFileSync(join(dest, "README.md"), "utf8")
+    expect(readme).toContain(bad.contextId)
+    expect(readme).toContain("unreadable")
+    expect(lines.some((line) => line.includes(bad.contextId))).toBe(true)
   })
 
   it("records.md groups by area, newest first, with author, flags and the plaintext warning", async () => {

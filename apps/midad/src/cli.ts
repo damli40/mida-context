@@ -888,6 +888,10 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     // `mida init --passkey` resumes it — there is no software path to fall back to.
     case "no-owner-address":
       return "this passkey home has no owner yet — run `mida init --passkey`"
+    // A software home with an owner address but no owner/secrets.json — export refuses to mint
+    // one; the same line its own refusal prints.
+    case "no-owner-key":
+      return "no owner key on this machine — export needs the local software owner key"
     // The page never came back: a refusal, not a failure — nothing was signed and re-running
     // the command starts a fresh round with a fresh nonce.
     case "OWNER_LINK_TIMEOUT":

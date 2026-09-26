@@ -30,6 +30,12 @@ const network = {
 const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-sigint-home-")))
 saveOwnerMode(home, "software")
 saveOwnerAddress(home, OWNER)
+// The no-owner-key gate checks existence only — the injected runtime never reads the file.
+home.writeSecretJson("owner/secrets.json", {
+  privateKey: `0x${"11".repeat(32)}`,
+  seed: `0x${"22".repeat(32)}`,
+  p256PrivateKey: `0x${"33".repeat(32)}`,
+})
 
 // Enough records and payload that the staged write takes seconds — a real window for the signal.
 const bigText = "P".repeat(128 * 1024)

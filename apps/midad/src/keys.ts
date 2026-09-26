@@ -38,15 +38,24 @@ function assertName(name: string): void {
 }
 
 export function loadOrCreateOwnerSecrets(home: MidaHome): OwnerSecrets {
+  const existing = loadOwnerSecrets(home)
+  if (existing !== undefined) return existing
+  const created: OwnerSecrets = { privateKey: generatePrivateKey(), seed: hexOf(randomBytes(32)), p256PrivateKey: hexOf(p256.utils.randomSecretKey()) }
+  home.writeSecretJson("owner/secrets.json", created)
+  return created
+}
+
+/**
+ * The read-only counterpart: undefined when `owner/secrets.json` is absent, the validated
+ * secrets when present — and never a created file. Callers that must not mint an owner key
+ * (export's runtime open) load with this.
+ */
+export function loadOwnerSecrets(home: MidaHome): OwnerSecrets | undefined {
   const file = "owner/secrets.json"
   const existing = home.readJson<Record<string, unknown>>(file)
-  if (existing !== undefined) {
-    assertKeys(file, existing, ["privateKey", "seed", "p256PrivateKey"])
-    return existing as unknown as OwnerSecrets
-  }
-  const created: OwnerSecrets = { privateKey: generatePrivateKey(), seed: hexOf(randomBytes(32)), p256PrivateKey: hexOf(p256.utils.randomSecretKey()) }
-  home.writeSecretJson(file, created)
-  return created
+  if (existing === undefined) return undefined
+  assertKeys(file, existing, ["privateKey", "seed", "p256PrivateKey"])
+  return existing as unknown as OwnerSecrets
 }
 
 const OWNER_ADDRESS_FILE = "owner-address.json"
