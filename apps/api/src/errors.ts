@@ -47,10 +47,10 @@ export function toErrorBody(error: unknown): { status: number; body: ApiErrorBod
   if (isMidaError(error)) return { status: statusFor(error.code), body: { error: { code: error.code, message: error.message } } }
   const kind = chainErrorKind(error)
   if (kind === "misconfigured") {
-    return { status: 502, body: { error: { code: "CHAIN_MISCONFIGURED", message: "the RPC answered but found no Mida contract — check MONAD_TESTNET_RPC / network.json" } } }
+    return { status: 502, body: { error: { code: "CHAIN_MISCONFIGURED", message: "the RPC answered but found no Mida contract — check the store's RPC_URL setting" } } }
   }
   if (kind === "rpc-auth") {
-    return { status: 502, body: { error: { code: "RPC_AUTH_REJECTED", message: "the RPC provider refused the key — check the provider URL" } } }
+    return { status: 502, body: { error: { code: "RPC_AUTH_REJECTED", message: "the RPC provider refused the key — check the store's RPC_URL setting" } } }
   }
   if (kind === "busy") {
     return { status: 503, body: { error: { code: "CHAIN_UNAVAILABLE", message: "the chain could not answer right now — retry in a moment" } } }

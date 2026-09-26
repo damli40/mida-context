@@ -58,7 +58,7 @@ describe("toErrorBody (in-6 R4)", () => {
 
   // in-11 R-8 — a setup the owner must fix is not "unavailable": the RPC answered but found no
   // contract, or the provider refused the key. Both are non-retryable 502s with their own codes.
-  it("an RPC that answered but found no contract answers 502 CHAIN_MISCONFIGURED", () => {
+  it("an RPC that answered but found no contract answers 502 CHAIN_MISCONFIGURED, naming the store's RPC_URL", () => {
     const error = new ContractFunctionExecutionError(
       new ContractFunctionZeroDataError({ functionName: "getAgent" }),
       { abi: capabilityRegistryAbi, functionName: "getAgent", args: [], contractAddress: "0x2222222222222222222222222222222222222222" } as never,
@@ -66,13 +66,20 @@ describe("toErrorBody (in-6 R4)", () => {
     const { status, body } = toErrorBody(error)
     expect(status).toBe(502)
     expect(body.error.code).toBe("CHAIN_MISCONFIGURED")
+    // in-13b M-7: the store is a Worker — its RPC endpoint is the RPC_URL variable, and a
+    // message naming MONAD_TESTNET_RPC / network.json sends the operator looking in the
+    // wrong place (those are the owner's-side settings, which the store never reads).
+    expect(body.error.message).toContain("RPC_URL")
+    expect(body.error.message).not.toContain("MONAD_TESTNET_RPC")
+    expect(body.error.message).not.toContain("network.json")
   })
 
-  it("an RPC that refused the credential (401/403) answers 502 RPC_AUTH_REJECTED", () => {
+  it("an RPC that refused the credential (401/403) answers 502 RPC_AUTH_REJECTED, naming the store's RPC_URL", () => {
     for (const s of [401, 403]) {
       const { status, body } = toErrorBody(new HttpRequestError({ url: "http://rpc.test", status: s, body: {}, details: "no" }))
       expect(status, `status ${s}`).toBe(502)
       expect(body.error.code).toBe("RPC_AUTH_REJECTED")
+      expect(body.error.message).toContain("RPC_URL")
     }
   })
 
