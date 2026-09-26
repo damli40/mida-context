@@ -92,4 +92,50 @@ describe("the RPC request count of one session-start handoff (in-6 R2)", () => {
     // wire call apiece; what remains is the per-object record reads and the capability gate.
     expect(count).toBeLessThanOrEqual(30)
   }, STEP_TIMEOUT)
+
+  /**
+   * in-9 R-1, the promotion of the review probe's mining case: before the fix the placements
+   * scan walked ContextRegistered logs from deploymentBlock on every read — 42 eth_getLogs
+   * calls after 20k mined blocks and a `read-slow` refusal at 12.3 s. Now the same handoff
+   * must still answer `handoff` with at most a bounded tie-scan (≤3 getLogs; usually 0 —
+   * the three checkpoints were saved seconds apart).
+   */
+  it("the same handoff 20k and 120k blocks past deployment — still `handoff`, no log scan (in-9 R-1)", async () => {
+    const realFetch = globalThis.fetch
+    let getLogs = 0
+    const spy = () => {
+      getLogs = 0
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+        if (url.startsWith(env.rpcUrl) && typeof init?.body === "string") {
+          try {
+            const parsed = JSON.parse(init.body) as unknown
+            for (const m of Array.isArray(parsed) ? parsed : [parsed]) {
+              if ((m as { method?: unknown }).method === "eth_getLogs") getLogs += 1
+            }
+          } catch { /* not JSON — nothing to count */ }
+        }
+        return realFetch(input, init)
+      }) as typeof fetch
+    }
+    try {
+      for (const blocks of [20_000, 120_000]) {
+        const res = await realFetch(env.rpcUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "anvil_mine", params: [`0x${blocks.toString(16)}`, "0x0"] }),
+        })
+        expect(res.status).toBe(200)
+        spy()
+        const result = (await callDaemon(home, "/handoff", { agent: "codex", cwd: workDir }, { timeoutMs: STEP_TIMEOUT })).body as HandoffResult
+        globalThis.fetch = realFetch
+        expect(result.kind).toBe("handoff")
+        console.log(`in-9 R-1: handoff at +${blocks} blocks made ${getLogs} eth_getLogs request(s)`)
+        // ≤3 = the bounded same-second-tie window; the old code needed 42+ at 20k blocks
+        expect(getLogs).toBeLessThanOrEqual(3)
+      }
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  }, STEP_TIMEOUT * 3)
 })
