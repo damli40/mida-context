@@ -9,7 +9,7 @@ import type { Address, Hex } from "@mida/protocol"
 import { chainFor, rpcTransport } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { COMPILE_PROVIDERS, compileModelChoice, devinSqliteAvailable } from "@mida/compiler"
-import { ContextApiClient, DenyOverlay, RegistryReader } from "@mida/api"
+import { ContextApiClient, DenyOverlay, RegistryReader, StoreHttpError } from "@mida/api"
 import type { RevocationTarget } from "@mida/api"
 import type { LocalAccount } from "viem"
 import { batchClient, batchStatusProbe, decideLane, pendingAnchors, rejectedAnchors } from "./batching.js"
@@ -539,6 +539,12 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           if (isMidaError(error)) {
             return [problem(`the store answered ${error.code} when asked for stale denies`, "re-run `mida doctor` — and if it repeats, the store's signed route is refusing the owner key")]
           }
+          // a plain-text 404 means the deployed store has no revocations routes at all — the
+          // same predates answer the store-write-check probe names (in-11 R-3). A StoreHttpError
+          // can only come from the remote call above, so storageUrl is set here.
+          if (error instanceof StoreHttpError && error.status === 404 && storageUrl !== undefined) {
+            return [`note: the store at ${hostOf(storageUrl)} predates the pending-revoke check — redeploy the store to enable the pending-revoke check`]
+          }
           return ["note: the store could not be reached, so stale denies could not be checked"]
         }
         const byAgentId = new Map(shared.approved.map((agent) => [agent.agentId.toLowerCase(), agent.name]))
@@ -891,6 +897,26 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           `ok: ${describe("store", "MIDA_STORAGE_URL", storage, "off — the local store")}`,
           `ok: ${describe("sponsor", "MIDA_SPONSOR_URL", sponsor, "off — sends pay their own gas")}`,
         ]
+      },
+    },
+    {
+      // in-11 R-3: a store deployed before in-3 has no GET /write-authority. Saves still work —
+      // the client falls back to the pre-in-3 flow — but the pending-revoke check is absent and
+      // the owner should be told to redeploy. The probe is unsigned on purpose: any answer other
+      // than 404 (a coded 401 as surely as a 200) proves the route exists.
+      name: "store-write-check",
+      run: async () => {
+        const storageUrl = (await doctorServices(deps, shared)).storageUrl
+        // a local store is this code — the route exists by definition, nothing to probe
+        if (storageUrl === undefined) return ["ok: the local store has the pending-revoke check"]
+        try {
+          const response = await fetch(`${storageUrl.replace(/\/+$/, "")}/write-authority`, { signal: AbortSignal.timeout(2_000) })
+          return response.status === 404
+            ? [`note: the store at ${hostOf(storageUrl)} predates the pending-revoke check — redeploy the store to enable the pending-revoke check`]
+            : [`ok: the store at ${hostOf(storageUrl)} answers the pending-revoke check`]
+        } catch {
+          return [`note: the store at ${hostOf(storageUrl)} could not be reached to check for the pending-revoke check`]
+        }
       },
     },
     {

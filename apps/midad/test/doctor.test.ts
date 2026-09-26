@@ -831,3 +831,51 @@ describe("mida doctor names the chain RPC — host and source only", () => {
     )
   })
 })
+
+// in-11 R-3: the hosted store deployed before in-3 has no /write-authority. Saves still work —
+// the client proceeds as the pre-in-3 client did — but the owner needs the note telling them to
+// redeploy for the pending-revoke check. The probe is unsigned: only a 404 means "no route".
+describe("mida doctor names a store that predates the pending-revoke check", () => {
+  const X_RAW = JSON.parse(
+    readFileSync(join(repo, "docs/evidence/deployment-10143-vault.mida.xyz-2026-09-17.json"), "utf8"),
+  ) as { capabilityRegistry: string }
+
+  const stubStore = async (status: number, body: string, contentType = "text/plain"): Promise<{ url: string; host: string; close: () => Promise<void> }> => {
+    const server = createHttpServer((request, response) => {
+      response.writeHead(status, { "content-type": contentType })
+      response.end(body)
+    })
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen))
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    return { url, host: new URL(url).host, close: () => new Promise((done) => server.close(() => done())) }
+  }
+
+  const doctorLines = async (storageUrl: string): Promise<string[]> => {
+    const home = new MidaHome(join(dir(), "home"))
+    home.writeSecretJson("network.json", { rpcUrl: "http://127.0.0.1:1", deployment: X_RAW, storageUrl })
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), env: {}, daemonProbeMs: 50 })
+    return lines
+  }
+
+  it("a 404 on /write-authority prints the redeploy note naming the store host", async () => {
+    const store = await stubStore(404, "404 Not Found")
+    try {
+      const lines = await doctorLines(store.url)
+      expect(lines).toContain(`note: the store at ${store.host} predates the pending-revoke check — redeploy the store to enable the pending-revoke check`)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("any other answer proves the route exists — a coded refusal counts", async () => {
+    const store = await stubStore(401, JSON.stringify({ error: { code: "AUTH_INVALID", message: "missing signature" } }), "application/json")
+    try {
+      const lines = await doctorLines(store.url)
+      expect(lines).toContain(`ok: the store at ${store.host} answers the pending-revoke check`)
+      expect(lines.every((line) => !line.includes("predates the pending-revoke check"))).toBe(true)
+    } finally {
+      await store.close()
+    }
+  })
+})

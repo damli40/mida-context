@@ -10,7 +10,7 @@ import { CONTENT_FIELDS, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint } from "@mida/checkpoint"
 import { chainFor, rpcTransport } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
-import { RegistryReader } from "@mida/api"
+import { RegistryReader, StoreHttpError } from "@mida/api"
 import { readTranscriptFor, scrubSecrets } from "@mida/compiler"
 import { devinSessionStat } from "@mida/compiler"
 import type { OpenDevinDb, compileCheckpoint } from "@mida/compiler"
@@ -627,6 +627,10 @@ function failureCode(error: unknown): string {
   if (isMidaError(error, "GAS_CEILING_EXCEEDED")) return "gas-ceiling"
   // a wallet that cannot pay is transient like a chain hiccup — funding refills it (in-6 R4)
   if (isWalletLow(error)) return "wallet-low"
+  // the store answered with bytes that are not a Mida body — an old deploy's plain-text 404, a
+  // proxy error page. Named so it can never read as chain trouble; transient like chain-error:
+  // the job waits out the backoff, the bytes stay (in-11 R-3).
+  if (error instanceof StoreHttpError) return "store-error"
   // the chain could not be asked — the transport's own busy error, the store's CHAIN_UNAVAILABLE
   // or a viem failure. Transient: the job waits out the backoff like chain-error, but the log
   // names what actually happened — never "not-approved" (Sep 25's wrong label).

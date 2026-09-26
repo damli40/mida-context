@@ -6,6 +6,7 @@ import { join } from "node:path"
 import { spawnSync } from "node:child_process"
 import { HttpRequestError, InsufficientFundsError } from "viem"
 import { ChainBusyError } from "@mida/chain"
+import { StoreHttpError } from "@mida/api"
 import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
@@ -557,6 +558,24 @@ describe("the owner-signed project list gates every save", () => {
     })
     expect(drainLog()).toContain('"reason":"chain-busy"')
     expect(listJobs(home)).toHaveLength(1)
+  })
+
+  it("a store answering non-JSON is store-error — named, transient, never chain-error (in-11 R-3)", async () => {
+    // The old store's plain-text 404 on a route it lacks used to surface as a bare SyntaxError,
+    // which the drain could only file as chain-error and retry eight times before dropping the
+    // save. StoreHttpError carries the status, and the drain names it.
+    const { home, job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw new StoreHttpError(404, "404 Not Found")
+      },
+    })
+    expect(drainLog()).toContain('"reason":"store-error"')
+    expect(drainLog()).not.toContain('"reason":"chain-error"')
+    // transient: the job stays queued for the backoff retry — never moved to bad, never removed
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
   })
 
   it("a low owner wallet logs wallet-low and stays queued — funding refills it (in-6 R4)", async () => {

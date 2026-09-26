@@ -75,7 +75,18 @@ export class ContextApiClient implements ContextApiRoutes {
       ...(method === "GET" || method === "HEAD" ? {} : { body }),
     })
     const text = await response.text()
-    const parsed: unknown = text.length === 0 ? null : JSON.parse(text)
+    let parsed: unknown = null
+    if (text.length > 0) {
+      try {
+        parsed = JSON.parse(text)
+      } catch {
+        // Bytes that are not a Mida body — a route the deployed store does not have answering
+        // Hono's plain-text 404, a proxy or Cloudflare error page. The caller gets the status to
+        // route on, never a bare SyntaxError the drain could only file as "chain-error"
+        // (in-11 R-3).
+        throw new StoreHttpError(response.status, text)
+      }
+    }
     if (!response.ok) throw errorFromBody(response.status, parsed)
     return { body: parsed as T, response }
   }
@@ -97,6 +108,16 @@ export class ContextApiClient implements ContextApiRoutes {
         capabilityId: input.capabilityId,
         ...(input.expectedParentId === undefined ? {} : { expectedParentId: input.expectedParentId }),
       },
+    }).catch((error: unknown) => {
+      // A store deployed before in-3 has no /write-authority route and answers Hono's bare
+      // plain-text 404 — that is "the check does not exist yet", not a refusal: proceed exactly
+      // as the pre-in-3 client did and say so once per process (in-11 R-3). Only the bare-status
+      // 404 earns this — a coded NOT_FOUND body is the current store giving a real answer.
+      if (error instanceof StoreHttpError && error.status === 404) {
+        noteStorePredatesWriteCheck(this.#options.baseUrl)
+        return { ok: true as const }
+      }
+      throw error
     })
   }
 
@@ -197,6 +218,38 @@ export class ContextApiClient implements ContextApiRoutes {
   flushBatch() {
     return this.request<{ flushed: boolean; reason?: "empty" | "rate-limited" }>("POST", "/batch/flush")
   }
+}
+
+/**
+ * The store answered HTTP `status` with bytes that are not a Mida body — an old deploy's
+ * plain-text 404 on a route it does not have, a proxy or Cloudflare error page (in-11 R-3).
+ * Carries the status so a caller can route on it; the drain reads `code` for a stable name.
+ * This replaced the bare `SyntaxError` a JSON.parse used to leave, which the drain could only
+ * file as an anonymous "chain-error" and retry eight times before dropping the save.
+ */
+export class StoreHttpError extends Error {
+  readonly code = "STORE_UNREACHABLE"
+  constructor(
+    readonly status: number,
+    body: string,
+  ) {
+    super(`Context API returned HTTP ${status}${body.length === 0 ? "" : ` with a non-JSON body: ${body.slice(0, 120)}`}`)
+    this.name = "StoreHttpError"
+  }
+}
+
+/** The one named line an old store earns per process, no matter how many saves ask it. */
+let storePredatesWriteCheckLogged = false
+function noteStorePredatesWriteCheck(baseUrl: string): void {
+  if (storePredatesWriteCheckLogged) return
+  storePredatesWriteCheckLogged = true
+  let host = baseUrl
+  try {
+    host = new URL(baseUrl).host
+  } catch {
+    // an unparseable base URL is quoted as given — the host name is courtesy, not data
+  }
+  console.warn(`store-predates-write-check: ${host} has no GET /write-authority — redeploy the store to enable the pending-revoke check`)
 }
 
 /** Retries `listObjects` performs after the first response still carries `x-mida-partial`. */
