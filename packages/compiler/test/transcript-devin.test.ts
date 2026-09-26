@@ -101,6 +101,17 @@ const user = (content: string, isUserInput = true) => ({ role: "user", content, 
 const injectedUser = (content: string) => ({ role: "user", content, metadata: { is_user_input: false } })
 const assistant = (content: string) => ({ role: "assistant", content, metadata: {} })
 const system = (content: string) => ({ role: "system", content, metadata: {} })
+
+// The LIVE compaction shape, probed on a real Devin CLI v3000.11.3 session Sep 26 (not
+// verifiable from the repo): after a compaction the new chain's ROOT is the summarizer's own
+// system prompt, fed the old chain verbatim as an injected user input. The summary itself is
+// the assistant node a few nodes later whose NODE metadata carries an integer summarized_from
+// pointing at the old-chain node the summary cut at; a system node right after re-injects it
+// for the continuing model and carries the same mark. The root carries no summarized_from.
+const SUMMARIZER_PROMPT = "You are a Summarizer that summarizes conversation history. Produce sections 1-9."
+const summarizerInput = (chain: string) => `<conversation>${chain} VERBATIM: everything that happened</conversation>`
+const continuation = (summary: string) =>
+  `You are continuing work from a previous conversation thread. Below is a summary of it:\n${summary}`
 const tool = (content: string) => ({ role: "tool", content, tool_call_id: "tc-1" })
 const assistantWithCalls = (content: string, toolCalls: unknown[]) => ({
   role: "assistant",
@@ -206,35 +217,88 @@ describe("readDevinConversation — the chain the job asked for", () => {
     expect(convo.messagesTotal).toBe(4)
   })
 
-  itSqlite("two compactions: the current chain's prefix pins as the summary, the earliest chain keeps the request", () => {
-    const db = makeDevinDb([{ id: "bald-swordfish", mainChainId: 22, workingDirectory: "/work/proj" }], [
+  itSqlite("two compactions in the live shape: the summarized_from output pins, and the request follows the links to the first chain", () => {
+    const db = makeDevinDb([{ id: "bald-swordfish", mainChainId: 135, workingDirectory: "/work/proj" }], [
       // chain 1 — the session's start, compacted away
-      { nodeId: 1, chatMessage: system("system prompt") },
-      { nodeId: 2, parentNodeId: 1, chatMessage: user("the original ask") },
-      { nodeId: 3, parentNodeId: 2, chatMessage: assistant("early work") },
-      // chain 2 — first compaction root, itself compacted later
-      { nodeId: 10, chatMessage: system("SUMMARY ONE of the session"), metadata: { is_system_prefix: 1, summarized_from: 3 } },
-      { nodeId: 11, parentNodeId: 10, chatMessage: user("keep going") },
-      { nodeId: 12, parentNodeId: 11, chatMessage: assistant("more work") },
+      { nodeId: 0, chatMessage: system("you are devin"), metadata: { is_system_prefix: 1 } },
+      { nodeId: 1, parentNodeId: 0, chatMessage: user("the original ask") },
+      { nodeId: 2, parentNodeId: 1, chatMessage: assistant("early work") },
+      { nodeId: 3, parentNodeId: 2, chatMessage: assistant("the branch point the first summary cut at") },
+      { nodeId: 4, parentNodeId: 3, chatMessage: assistant("old chain continues past the cut") },
+      // chain 2 — first compaction: root is the summarizer's prompt, the summary pair
+      // carries summarized_from, then ordinary turns resume
+      { nodeId: 110, chatMessage: system(SUMMARIZER_PROMPT), metadata: { is_system_prefix: 1 } },
+      { nodeId: 111, parentNodeId: 110, chatMessage: injectedUser(summarizerInput("CHAIN ONE")) },
+      { nodeId: 112, parentNodeId: 111, chatMessage: assistant("SUMMARY ONE of the session"), metadata: { summarized_from: 3 } },
+      { nodeId: 113, parentNodeId: 112, chatMessage: system(continuation("SUMMARY ONE of the session")), metadata: { summarized_from: 3 } },
+      { nodeId: 114, parentNodeId: 113, chatMessage: user("keep going") },
+      { nodeId: 115, parentNodeId: 114, chatMessage: assistant("more work — the second cut point") },
+      { nodeId: 116, parentNodeId: 115, chatMessage: assistant("chain two continues past the cut") },
       // chain 3 — second compaction, this is the live chain
-      { nodeId: 20, chatMessage: system("SUMMARY TWO the newest state"), metadata: { is_system_prefix: 1, summarized_from: 12 } },
-      { nodeId: 21, parentNodeId: 20, chatMessage: user("one more thing") },
-      { nodeId: 22, parentNodeId: 21, chatMessage: assistant("wrapping up") },
+      { nodeId: 130, chatMessage: system(SUMMARIZER_PROMPT), metadata: { is_system_prefix: 1 } },
+      { nodeId: 131, parentNodeId: 130, chatMessage: injectedUser(summarizerInput("CHAIN TWO")) },
+      { nodeId: 132, parentNodeId: 131, chatMessage: assistant("SUMMARY TWO the newest state"), metadata: { summarized_from: 115 } },
+      { nodeId: 133, parentNodeId: 132, chatMessage: system(continuation("SUMMARY TWO the newest state")), metadata: { summarized_from: 115 } },
+      { nodeId: 134, parentNodeId: 133, chatMessage: user("one more thing") },
+      { nodeId: 135, parentNodeId: 134, chatMessage: assistant("wrapping up") },
     ])
     const convo = readDevinConversation(db, { sessionId: "bald-swordfish" })
     expect(convo.format).toBe("devin-sqlite")
-    // the request survives compaction, headed by its kept-from-the-earlier-chain label
+    // the request survived two compactions by following each chain's summarized_from
+    // link back to the chain it cut from — chain 3 → chain 2 → chain 1
     expect(convo.firstUserMessage).toBe("the original ask")
     expect(convo.text).toContain("user — original request (kept from the earlier chain):\nthe original ask")
-    // the LIVE chain's prefix pins — not the older summary
-    expect(convo.text).toContain("N20 system — Summary of the earlier session (from compaction):")
+    // the pinned summary is the live chain's summarized_from ASSISTANT node — the
+    // summarizer's output, labelled for what it is
+    expect(convo.text).toContain("N132 assistant — Summary of the earlier session (from compaction):")
     expect(convo.text).toContain("SUMMARY TWO the newest state")
+    // the summarizer's own prompt, the verbatim histories it was fed, the earlier
+    // summary's chain and the re-injection never render as turns
+    expect(convo.text).not.toContain("You are a Summarizer")
+    expect(convo.text).not.toContain("VERBATIM")
     expect(convo.text).not.toContain("SUMMARY ONE")
-    // earlier chains render nothing else
     expect(convo.text).not.toContain("early work")
     expect(convo.text).not.toContain("more work")
-    expect(convo.text).toContain("N21 user:\none more thing")
-    expect(convo.text).toContain("N22 assistant:\nwrapping up")
+    expect(convo.text).not.toContain("keep going")
+    expect(convo.text).toContain("N134 user:\none more thing")
+    expect(convo.text).toContain("N135 assistant:\nwrapping up")
+  })
+
+  itSqlite("a later root whose chain carries no summarized_from is NOT a compaction — no summary block", () => {
+    const db = makeDevinDb([{ id: "calm-otter", mainChainId: 32, workingDirectory: "/work/proj" }], [
+      { nodeId: 0, chatMessage: system("you are devin"), metadata: { is_system_prefix: 1 } },
+      { nodeId: 1, parentNodeId: 0, chatMessage: user("the original ask") },
+      { nodeId: 2, parentNodeId: 1, chatMessage: assistant("work") },
+      // a second root that is some other run (a helper sub-agent call), not a compaction:
+      // is_system_prefix alone must never pin a summary — the live probe saw roots like
+      // this outnumber real compactions two to one
+      { nodeId: 30, chatMessage: system("You are a helper sub-agent. Search the repo for X."), metadata: { is_system_prefix: 1 } },
+      { nodeId: 31, parentNodeId: 30, chatMessage: injectedUser("search for X") },
+      { nodeId: 32, parentNodeId: 31, chatMessage: assistant("found X in a.ts") },
+    ])
+    const convo = readDevinConversation(db, { sessionId: "calm-otter" })
+    expect(convo.format).toBe("devin-sqlite")
+    expect(convo.text).not.toContain("Summary of the earlier session")
+    expect(convo.text).not.toContain("You are a helper sub-agent")
+    expect(convo.text).toContain("found X in a.ts")
+    // with no link to follow, the lowest-root rule still finds the request
+    expect(convo.firstUserMessage).toBe("the original ask")
+  })
+
+  itSqlite("no summarized_from assistant: the system re-injection's content pins instead", () => {
+    const db = makeDevinDb([{ id: "calm-otter", mainChainId: 5, workingDirectory: "/work/proj" }], [
+      { nodeId: 0, chatMessage: system("you are devin"), metadata: { is_system_prefix: 1 } },
+      { nodeId: 1, parentNodeId: 0, chatMessage: user("the original ask") },
+      { nodeId: 2, parentNodeId: 1, chatMessage: assistant("work") },
+      { nodeId: 3, chatMessage: system(SUMMARIZER_PROMPT), metadata: { is_system_prefix: 1 } },
+      { nodeId: 4, parentNodeId: 3, chatMessage: injectedUser(summarizerInput("CHAIN ONE")) },
+      // the assistant node came back empty — the system re-injection still carries the text
+      { nodeId: 5, parentNodeId: 4, chatMessage: system(continuation("THE SUMMARY via the system node")), metadata: { summarized_from: 2 } },
+    ])
+    const convo = readDevinConversation(db, { sessionId: "calm-otter" })
+    expect(convo.text).toContain("Summary of the earlier session (from compaction):")
+    expect(convo.text).toContain("THE SUMMARY via the system node")
+    expect(convo.firstUserMessage).toBe("the original ask")
   })
 
   itSqlite("an abandoned side branch is ignored — the chain walk never leaves its path", () => {

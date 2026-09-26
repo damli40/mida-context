@@ -216,9 +216,8 @@ export function devinSessionStat(
 // The conversation a job asks for is ONE chain in the node graph: walk
 // parent_node_id from sessions.main_chain_id back to its root — every other
 // node (side branches, earlier compacted chains) is ignored for rendering.
-// The earliest chain still owns the original request, and a chain that opens
-// on a system prefix following an earlier chain pins its root's content the
-// way the Claude reader pins a /compact summary.
+// The earliest chain still owns the original request, and a compaction's
+// summary is pinned beside it the way the Claude reader pins a /compact block.
 //
 // A wrong guess about Devin's internals must degrade to "current chain only",
 // never to a crash or out-of-order text: a broken parent link ends the walk,
@@ -362,35 +361,94 @@ export function readDevinConversation(
   for (const n of nodes) byId.set(n.nodeId, n)
   const chain = chainFor(byId, session.mainChainId)
   if (chain.length === 0) return empty
-  const root = chain[0]!
-  const rootMsg = parseMessage(root.chatMessage)
-  const rootMeta = parseNodeMeta(root.metadata)
 
-  // Compaction: the current chain opens on a system prefix that follows an
-  // earlier chain — witnessed by another (lower) root in the session or by the
-  // root's own summarized_from link. Its content is the condensed history and
-  // is pinned beside the request like the Claude reader's /compact block.
-  const summarizedFrom = intOf(rootMeta.summarized_from)
-  const isPrefix = rootMeta.is_system_prefix === 1 || rootMeta.is_system_prefix === true
-  const earlierRootExists = nodes.some((n) => n.parentNodeId === null && n.nodeId < root.nodeId)
-  const isCompactionRoot =
-    rootMsg?.role === "system" && (summarizedFrom !== null || (isPrefix && earlierRootExists))
+  // Compaction, the shape probed on a live session (Devin CLI v3000.11.3, Sep 26):
+  // the new chain's ROOT is the summarizer's own system prompt and the next node is
+  // the old chain verbatim fed to it — neither carries the summary. The summary
+  // rides a few nodes later on the pair whose NODE metadata holds an integer
+  // summarized_from pointing at the old-chain node where the summary cut: an
+  // assistant node holding the text and a system node re-injecting it for the
+  // continuing model. The LAST summarized_from node marks the cut — everything up
+  // to it is the summarizer's bookkeeping and never renders as a turn. A chain
+  // with no summarized_from node is not a compaction at all, whatever its root
+  // looks like: helper runs (sub-agents) root on is_system_prefix too, and the
+  // probe saw them outnumber real compactions — pinning one would label a foreign
+  // prompt as "the summary".
+  let cutIdx = -1
+  let summaryAssistant: { nodeId: number; role: string; content: string } | null = null
+  let summarySystem: { nodeId: number; role: string; content: string } | null = null
+  for (let i = 0; i < chain.length; i++) {
+    const n = chain[i]!
+    if (intOf(parseNodeMeta(n.metadata).summarized_from) === null) continue
+    cutIdx = i
+    const msg = parseMessage(n.chatMessage)
+    if (typeof msg?.content !== "string" || msg.content === "") continue
+    if (msg.role === "assistant") summaryAssistant = { nodeId: n.nodeId, role: "assistant", content: msg.content }
+    else if (msg.role === "system") summarySystem = { nodeId: n.nodeId, role: "system", content: msg.content }
+  }
+  // the summary text is the last summarized_from assistant node with content;
+  // when none carried it, the system re-injection's content is the same text
+  const summaryPick = summaryAssistant ?? summarySystem
   const summaryBlock =
-    isCompactionRoot && typeof rootMsg?.content === "string" && rootMsg.content !== ""
-      ? `N${root.nodeId} system — Summary of the earlier session (from compaction):\n${cutSummary(scrubSecrets(rootMsg.content))}`
-      : null
+    summaryPick === null
+      ? null
+      : `N${summaryPick.nodeId} ${summaryPick.role} — Summary of the earlier session (from compaction):\n${cutSummary(scrubSecrets(summaryPick.content))}`
 
-  // The original request: the first is_user_input user message of the EARLIEST
-  // chain — the chain rooted at the session's lowest root — kept verbatim
-  // across compactions like the Claude reader's originalRequest.
-  const earliestRootId = nodes
-    .filter((n) => n.parentNodeId === null)
-    .reduce<number | null>((low, n) => (low === null || n.nodeId < low ? n.nodeId : low), null)
-  const earliestChain = earliestRootId === null ? [] : chainRootedAt(byId, nodes, earliestRootId)
+  // The original request lives at the END of the link path: each compacted
+  // chain's summarized_from points at the earlier chain it cut from, so follow
+  // them until a chain carries no link of its own — that chain's first
+  // is_user_input is the ask. A live chain with no link was never compacted and
+  // falls back to the lowest-root rule; a dangling or cyclic link degrades to
+  // the earliest chain the path could reach.
+  const rootIdOf = (n: DevinNodeRow): number | null => {
+    const seen = new Set<number>()
+    let cur: DevinNodeRow | undefined = n
+    while (cur !== undefined && !seen.has(cur.nodeId)) {
+      seen.add(cur.nodeId)
+      if (cur.parentNodeId === null) return cur.nodeId
+      cur = byId.get(cur.parentNodeId)
+    }
+    return null
+  }
+  const lastLinkTarget = (rows: DevinNodeRow[]): number | null => {
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const target = intOf(parseNodeMeta(rows[i]!.metadata).summarized_from)
+      if (target !== null) return target
+    }
+    return null
+  }
+  const lowestRootChain = (): DevinNodeRow[] => {
+    const rootId = nodes
+      .filter((n) => n.parentNodeId === null)
+      .reduce<number | null>((low, n) => (low === null || n.nodeId < low ? n.nodeId : low), null)
+    return rootId === null ? [] : chainRootedAt(byId, nodes, rootId)
+  }
+  let requestChain: DevinNodeRow[]
+  {
+    let rows = chain
+    const seenRoots = new Set<number>()
+    for (;;) {
+      const target = lastLinkTarget(rows)
+      const targetNode = target === null ? undefined : byId.get(target)
+      const targetRoot = targetNode === undefined ? null : rootIdOf(targetNode)
+      if (targetRoot === null || seenRoots.has(targetRoot)) {
+        // no readable link of its own: this chain ends the path — and when it is
+        // the live chain itself, the lowest root is the earliest chain
+        requestChain = rows === chain ? lowestRootChain() : rows
+        break
+      }
+      seenRoots.add(targetRoot)
+      rows = chainRootedAt(byId, nodes, targetRoot)
+    }
+  }
+
+  // The original request: the first is_user_input user message of the chain the
+  // links ended on — kept verbatim across compactions like the Claude reader's
+  // originalRequest.
   let earliestRequest: string | null = null
   let earliestRequestNode: DevinNodeRow | null = null
   let openedWithScaffolding = false
-  for (const n of earliestChain) {
+  for (const n of requestChain) {
     const msg = parseMessage(n.chatMessage)
     if (msg?.role !== "user") continue
     if (isUserInput(msg)) {
@@ -404,13 +462,16 @@ export function readDevinConversation(
   }
   const firstUserMessage = earliestRequest === null ? null : hardCut(scrubSecrets(earliestRequest), FIRST_USER_CHARS)
 
-  // Render the CURRENT chain only — side branches and earlier chains are not
-  // this conversation. messagesTotal counts every user/assistant/tool node in
-  // it, rendered or not (system and thinking never render).
+  // Render only the turns AFTER the compaction cut — the summarizer's prompt,
+  // the verbatim history it was fed and the summary pair are bookkeeping, not
+  // turns — and only the current chain, since side branches and earlier chains
+  // are not this conversation. Without a summarized_from node the whole live
+  // chain renders (cutIdx stays -1). messagesTotal counts every
+  // user/assistant/tool node rendered, dropped or skipped within that slice.
   const msgs: { role: string; block: string }[] = []
   let messagesTotal = 0
   let pinIdx: number | undefined
-  for (const n of chain) {
+  for (const n of chain.slice(cutIdx + 1)) {
     const msg = parseMessage(n.chatMessage)
     if (msg === null || msg.role === "system") continue
     const label = String(n.nodeId)
