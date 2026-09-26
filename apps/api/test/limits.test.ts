@@ -282,7 +282,7 @@ describe("upload-abuse limits", () => {
     }
     let last: Response | undefined
     const client = clientFor(app, async (url, init) => (last = await app.request(url, init)))
-    await expect(client.putObject(upload(randomBytes(4)))).rejects.toThrowError(/503/)
+    await expect(client.putObject(upload(randomBytes(4)))).rejects.toMatchObject({ code: "CHAIN_UNAVAILABLE" })
     expect(last!.status).toBe(503)
     expect(last!.headers.get("retry-after")).toBe("5")
     // Authorization spent its reads first; the re-check spent at most 16 of what remained.
