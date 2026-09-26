@@ -34,6 +34,7 @@ import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability,
 import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOwnerMode } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
 import { migrate, migrateUndo } from "./migrate.js"
+import { exportRecords } from "./export.js"
 import { OwnerLinkOutcome, approvePasskey, initPasskey, provisionPasskeyAgents, revokePasskey } from "./owner-link/flows.js"
 import type { PasskeyDeps } from "./owner-link/flows.js"
 
@@ -59,22 +60,24 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
  */
 const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]" +
+  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo] | export <folder>" +
   "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or the identity a client installs)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
-export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", ...WITH_AGENT]
+export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", "export", ...WITH_AGENT]
 /**
  * The commands that change who has access. Only `mida` in the owner's own terminal may run them —
  * they open the owner runtime in-process and are never sent to the daemon socket. `install` for
  * an MCP client belongs here: it registers that client's identity on the chain.
  */
-export const OWNER_COMMANDS: readonly string[] = ["init", "install", "approve", "revoke", "remember", "migrate", "batching"]
+export const OWNER_COMMANDS: readonly string[] = ["init", "install", "approve", "revoke", "remember", "migrate", "batching", "export"]
 /** The owner commands that must see a real terminal. `init` is exempt: it grants nothing to an agent. */
-const TERMINAL_COMMANDS: readonly string[] = ["install", "approve", "revoke", "remember", "migrate", "batching"]
+const TERMINAL_COMMANDS: readonly string[] = ["install", "approve", "revoke", "remember", "migrate", "batching", "export"]
 export const NEEDS_TERMINAL_LINE = "needs-terminal: run this yourself in a terminal window"
 
 /** What the daemon answers when an owner command reaches /cli anyway. */
 export function ownerOnlyLine(command: string): string {
+  // export changes nothing — it decrypts everything — but it is the owner's command all the same
+  if (command === "export") return "export runs only in your own terminal: mida export <folder>"
   return `This changes who has access, so it only runs in your own terminal: mida ${command}`
 }
 
@@ -934,6 +937,10 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     }
     // The chain could not be asked at all — a busy or down RPC, never an authorization answer:
     // nothing was signed, sent or decided, and a moment later the same command answers for real.
+    // export's owner read could not certify every record — the error's own message names each
+    // contextId it could not read, which is exactly what the owner needs to see.
+    case "owner-read-incomplete":
+      return error instanceof Error ? error.message : "refused: owner-read-incomplete"
     case "chain-busy":
       return "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again"
     // Not busy — a setup the owner must fix: the RPC answered but the configured address held
@@ -1027,6 +1034,12 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
     if (command === "remember") {
       deps.print("remember is not available with a passkey owner yet")
       return 2
+    }
+    // The export block above normally returns first; this is the refusal a reorder must keep —
+    // a passkey home holds no local owner key, so there is nothing to decrypt with here.
+    if (command === "export") {
+      deps.print("export supports software-key setups only in this version")
+      return 1
     }
     if (command === "batching") {
       // the switch needs no owner signature — it only rewrites a flag in network.json — so a
@@ -1327,6 +1340,36 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
       return result.outcome === "refused" ? 1 : 0
     } catch (error) {
       deps.print(`refused: ${refusalCode(error)}`)
+      if (process.env.MIDA_DEBUG === "1") deps.print(debugLine(error))
+      return 1
+    }
+  }
+  // export is an owner command that opens the owner runtime itself: it decrypts every record the
+  // chain attributes to the owner, so a passkey home (which holds no local owner key) refuses,
+  // and it is never sent to the daemon socket — a daemon answer would mean an agent asked.
+  if (command === "export") {
+    // `--as` anywhere on the line means an agent tried to drive the owner's own command.
+    if (argv.includes("--as")) {
+      deps.print("export is the owner's own command — agents never export")
+      return 1
+    }
+    if (argv.length !== 2) {
+      deps.print(USAGE)
+      return 2
+    }
+    try {
+      const result = await exportRecords({
+        home: deps.home,
+        network: deps.network,
+        folder: argv[1]!,
+        cwd: deps.cwd ?? process.cwd(),
+        print: deps.print,
+        progress: deps.progress ?? ((line) => process.stderr.write(`${line}\n`)),
+        now: () => new Date(),
+      })
+      return result.outcome === "refused" ? 1 : 0
+    } catch (error) {
+      deps.print(ownerRefusalLine("export", "", error, undefined, deps.network.deployment.capabilityRegistry, deps.home))
       if (process.env.MIDA_DEBUG === "1") deps.print(debugLine(error))
       return 1
     }
