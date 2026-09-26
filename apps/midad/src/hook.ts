@@ -51,10 +51,10 @@ export function transcriptPathAllowed(transcriptPath: unknown, agent: string, ho
   try {
     const stat = lstatSync(transcriptPath)
     if (stat.isSymbolicLink() || !stat.isFile()) return false
-    const real = realpathSync(transcriptPath)
+    const real = realpathSync.native(transcriptPath)
     return roots.some((root) => {
       try {
-        const inside = relative(realpathSync(root), real)
+        const inside = relative(realpathSync.native(root), real)
         return inside !== "" && !inside.startsWith("..") && !isAbsolute(inside)
       } catch {
         return false

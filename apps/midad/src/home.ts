@@ -80,7 +80,7 @@ export class MidaHome {
     // a symlink inside the home pointing out must not smuggle a write or a read with it.
     let ancestor = full
     while (!existsSync(ancestor)) ancestor = dirname(ancestor)
-    const fromRealRoot = relative(realpathSync(this.root), realpathSync(ancestor))
+    const fromRealRoot = relative(realpathSync.native(this.root), realpathSync.native(ancestor))
     if (fromRealRoot === ".." || fromRealRoot.startsWith(`..${sep}`) || isAbsolute(fromRealRoot)) {
       throw new Error(`path escapes the Mida home: ${relativePath}`)
     }

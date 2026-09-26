@@ -16,7 +16,7 @@ export interface CodeIdentity {
 }
 
 // four levels up: src/code-identity.ts -> src -> apps/midad -> apps -> the repository root
-const CODE_ROOT = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", ".."))
+const CODE_ROOT = realpathSync.native(resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", ".."))
 
 const commitAt = (root: string): string => {
   try {
@@ -40,7 +40,7 @@ let cached: CodeIdentity | undefined
  */
 export function codeIdentity(root?: string): CodeIdentity {
   if (root !== undefined) {
-    const resolved = realpathSync(root)
+    const resolved = realpathSync.native(root)
     return { codeRoot: resolved, codeCommit: commitAt(resolved) }
   }
   cached ??= { codeRoot: CODE_ROOT, codeCommit: commitAt(CODE_ROOT) }

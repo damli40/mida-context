@@ -1550,9 +1550,11 @@ async function main(): Promise<void> {
 }
 
 // `node dist/mida.js` reaches main through the bin symlink too: argv[1] is the .bin shim path
-// while import.meta.url is the real file, so the comparison must run on realpaths.
+// while import.meta.url is the real file, so the comparison must run on realpaths — .native on
+// both, since either side can carry the case the path was typed in (in-6 R6).
 const invoked =
-  process.argv[1] !== undefined && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
+  process.argv[1] !== undefined &&
+  realpathSync.native(process.argv[1]) === realpathSync.native(fileURLToPath(import.meta.url))
 if (invoked) {
   main().catch((error: unknown) => {
     const e = error as { message?: unknown }

@@ -20,6 +20,12 @@ import type { Runtime, ServiceRuntime } from "./runtime.js"
  * refusal reason and never throws — a missing file is `not-approved`, a file that will not read
  * or parse is `list-unreadable`, one that parses but fails shape or signature is `list-tampered`,
  * and there is no "treat corrupt as empty" path.
+ *
+ * Every realpath here is `realpathSync.native` (in-6 R6): plain realpathSync keeps the case a
+ * path was TYPED in on macOS, so `~/documents/notes` and `~/Documents/Notes`
+ * compared unequal — the approved folder answered "not approved" while approve insisted it was.
+ * Rows written before the fix may carry the typed-case root, so comparisons canonicalise the
+ * stored side too (a stored root that no longer exists simply cannot match).
  */
 
 export interface ProjectApproval {
@@ -37,6 +43,20 @@ const LIST_FILE = "approved-projects.json"
 const ENTRY_KEYS: readonly (keyof ProjectApproval)[] = ["agent", "projectId", "root", "approvedAt"]
 
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
+
+/**
+ * One root equality for stored-row comparisons: `realRoot` is already the `.native` canonical
+ * form; `stored` may be a pre-fix typed-case realpath. Canonicalising the stored side bridges
+ * the two; a stored root that no longer exists cannot be canonicalised and is not a match.
+ */
+export function sameProjectRoot(stored: string, realRoot: string): boolean {
+  if (stored === realRoot) return true
+  try {
+    return realpathSync.native(stored) === realRoot
+  } catch {
+    return false
+  }
+}
 
 /** The bytes the signature actually covers: sorted entries, fixed key order, no whitespace. */
 export function canonicalEntries(entries: readonly ProjectApproval[]): string {
@@ -143,13 +163,13 @@ export function ensureProjectMarker(cwd: string, homeDir: string = homedir()): {
   }
   let realCwd: string
   try {
-    realCwd = realpathSync(cwd)
+    realCwd = realpathSync.native(cwd)
   } catch {
     throw codedError("not-a-project", "not a project folder")
   }
   let realHome: string
   try {
-    realHome = realpathSync(homeDir)
+    realHome = realpathSync.native(homeDir)
   } catch {
     realHome = resolve(homeDir)
   }
@@ -192,7 +212,7 @@ export async function approveProject(
   input: { agent: string; cwd: string; homeDir?: string },
 ): Promise<{ approval: ProjectApproval; droppedRows: number | null; alreadyListed: boolean }> {
   const marker = ensureProjectMarker(input.cwd, input.homeDir)
-  const root = realpathSync(marker.markerDir)
+  const root = realpathSync.native(marker.markerDir)
   return serializeListWrite(async () => {
     const file = await readApprovalsFile(runtime.home, runtime.owner)
     if (file.kind === "unreadable") {
@@ -202,12 +222,13 @@ export async function approveProject(
     }
     const entries = file.kind === "signed" ? file.entries : []
     // whether this exact row was already signed in — the caller's message must not claim a folder
-    // was "now approved" when the list already said so
+    // was "now approved" when the list already said so. The stored side is canonicalised too, so
+    // a pre-fix typed-case row dedupes instead of duplicating.
     const alreadyListed = entries.some(
-      (e) => e.agent === input.agent && e.projectId === marker.projectId && e.root === root,
+      (e) => e.agent === input.agent && e.projectId === marker.projectId && sameProjectRoot(e.root, root),
     )
     const kept = entries.filter(
-      (e) => !(e.agent === input.agent && e.projectId === marker.projectId && e.root === root),
+      (e) => !(e.agent === input.agent && e.projectId === marker.projectId && sameProjectRoot(e.root, root)),
     )
     const approval: ProjectApproval = {
       agent: input.agent,
@@ -266,7 +287,7 @@ export async function checkProject(runtime: ServiceRuntime, input: { agent: stri
     if (marker === null || marker.projectId === null) return { ok: false, reason: "not-a-project" }
     let root: string
     try {
-      root = realpathSync(marker.markerDir)
+      root = realpathSync.native(marker.markerDir)
     } catch {
       return { ok: false, reason: "not-a-project" }
     }
@@ -275,7 +296,7 @@ export async function checkProject(runtime: ServiceRuntime, input: { agent: stri
     if (file.kind === "bad-signature") return { ok: false, reason: "list-tampered" }
     const entries = file.kind === "signed" ? file.entries : []
     const mine = entries.filter((e) => e.agent === input.agent && e.projectId === marker.projectId)
-    const match = mine.find((e) => e.root === root)
+    const match = mine.find((e) => sameProjectRoot(e.root, root))
     if (match !== undefined) return { ok: true, approval: match }
     return { ok: false, reason: mine.length > 0 ? "folder-mismatch" : "not-approved" }
   } catch {

@@ -5,7 +5,7 @@ import { join } from "node:path"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import type { Hex } from "@mida/protocol"
 import {
-  MidaHome, approveProject, approvalsFileStatus, checkProject, loadOrCreateOwnerSecrets, removeAgentApprovals,
+  MidaHome, approveProject, approvalsFileStatus, canonicalEntries, checkProject, loadOrCreateOwnerSecrets, removeAgentApprovals,
 } from "@mida/midad"
 import type { ProjectApproval, Runtime } from "@mida/midad"
 
@@ -237,6 +237,50 @@ describe("folder-mismatch beats not-approved", () => {
     const { approval } = await approveProject(runtime, { agent: "codex", cwd: link })
     expect(approval.root).toBe(realpathSync(real))
     expect(await checkProject(runtime, { agent: "codex", cwd: real })).toMatchObject({ ok: true })
+  })
+})
+
+describe("the same folder is the same folder, whatever its letter case (in-6 R6)", () => {
+  // realpathSync keeps the case a path was TYPED in on macOS; realpathSync.native returns the
+  // real case. Approving `~/Documents/Notes` then opening `~/documents/notes`
+  // used to answer folder-mismatch → "not approved" while approve said "already approved".
+  const caseInsensitive = (() => {
+    const probe = mkdtempSync(join(realpathSync(tmpdir()), "mida-CiSe-"))
+    return existsSync(probe.toLowerCase())
+  })()
+
+  it.skipIf(!caseInsensitive)("approve through one case and check through the other approves", async () => {
+    const { dir, runtime } = setup()
+    const work = join(dir, "MiXeD-WoRk")
+    mark(work, "p-1")
+    const lower = join(dir, "mixed-work")
+    await approveProject(runtime, { agent: "claude-code", cwd: lower })
+    // opened through the real case — and approved through the typed one — is the same project
+    expect(await checkProject(runtime, { agent: "claude-code", cwd: work })).toMatchObject({ ok: true })
+    expect(await checkProject(runtime, { agent: "claude-code", cwd: lower })).toMatchObject({ ok: true })
+  })
+
+  it.skipIf(!caseInsensitive)("a row written before this fix — root in typed case — still matches its real folder", async () => {
+    const { dir, home, runtime } = setup()
+    const work = join(dir, "ReAl-WoRk")
+    mark(work, "p-1")
+    // a pre-fix file holds realpathSync output — the case the path was typed in
+    const row: ProjectApproval = { agent: "claude-code", projectId: "p-1", root: realpathSync(join(dir, "real-work")), approvedAt: "x" }
+    const key = privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey)
+    const signature = await key.signMessage({ message: canonicalEntries([row]) })
+    home.writeSecretJson(LIST, { entries: [row], signature })
+    expect(await checkProject(runtime, { agent: "claude-code", cwd: work })).toMatchObject({ ok: true })
+  })
+
+  it("a stored root that no longer exists is skipped by the canonical compare, not fatal", async () => {
+    const { dir, home, runtime, workDir } = setup()
+    mark(workDir, "p-1")
+    const row: ProjectApproval = { agent: "claude-code", projectId: "p-1", root: join(dir, "deleted-folder"), approvedAt: "x" }
+    const key = privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey)
+    const signature = await key.signMessage({ message: canonicalEntries([row]) })
+    home.writeSecretJson(LIST, { entries: [row], signature })
+    // same agent + projectId under a root that cannot be canonicalised — folder-mismatch, no throw
+    expect(await checkProject(runtime, { agent: "claude-code", cwd: workDir })).toEqual({ ok: false, reason: "folder-mismatch" })
   })
 })
 

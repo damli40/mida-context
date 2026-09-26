@@ -61,7 +61,7 @@ import {
 } from "../runtime.js"
 import type { Network } from "../runtime.js"
 import { resolveNetwork } from "../network.js"
-import { canonicalEntries, ensureProjectMarker, readApprovalsFile, writeSignedApprovals } from "../projects.js"
+import { canonicalEntries, ensureProjectMarker, readApprovalsFile, sameProjectRoot, writeSignedApprovals } from "../projects.js"
 import type { ProjectApproval } from "../projects.js"
 import { FileAccessRequestStore } from "../request-store.js"
 import {
@@ -633,7 +633,7 @@ export async function approvePasskey(
   await guardRevokePending(session, name, live)
 
   const wantsProject = marker !== undefined && identity.purposeId === PURPOSE_ID
-  const root = marker === undefined ? undefined : realpathSync(marker.markerDir)
+  const root = marker === undefined ? undefined : realpathSync.native(marker.markerDir)
   const list = wantsProject ? await currentListRows(home, owner) : { file: "missing" as const, entries: [] as ProjectApproval[], droppedRows: null }
   if (list.file === "unreadable") throw codedError("list-unreadable", "the approved-projects list could not be read")
 
@@ -703,7 +703,11 @@ export async function approvePasskey(
     req.entries = list.entries as unknown as Record<string, unknown>[]
     req.entry = added
   }
-  const projectAlreadyListed = list.entries.some((e) => e.agent === name && e.projectId === marker?.projectId && e.root === root)
+  // sameProjectRoot on the stored side: a row written before the realpathSync.native fix may
+  // carry the case the path was typed in — it is still "already listed", not a second row
+  const projectAlreadyListed = list.entries.some(
+    (e) => e.agent === name && e.projectId === marker?.projectId && root !== undefined && sameProjectRoot(e.root, root),
+  )
 
   const result = await runOwnerLinkRound("approve", req, deps)
   if (result.status !== "success") declined(result)

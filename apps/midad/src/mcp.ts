@@ -1,4 +1,4 @@
-import { statSync } from "node:fs"
+import { realpathSync, statSync } from "node:fs"
 import { basename, dirname, resolve } from "node:path"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from "@modelcontextprotocol/sdk/types.js"
@@ -93,7 +93,17 @@ export function parseMcpArgs(argv: string[]): { ok: true; args: McpArgs } | { ok
     }
   }
   if (agent !== undefined && !AGENT_NAME.test(agent)) return { ok: false, error: `bad agent name "${agent}" — lower-case letters, digits and "-" only` }
-  return { ok: true, args: { agent, project: resolve(project ?? process.cwd()), projectGiven: project !== undefined } }
+  // the folder reported to the daemon is canonicalised: a --project typed in another case must
+  // land on the same approved root (in-6 R6); a path that cannot be resolved stays the resolve()
+  // form and the startup check names what is wrong with it
+  const resolved = resolve(project ?? process.cwd())
+  let projectRoot = resolved
+  try {
+    projectRoot = realpathSync.native(resolved)
+  } catch {
+    /* keep the resolved form — the marker check below reports a missing folder plainly */
+  }
+  return { ok: true, args: { agent, project: projectRoot, projectGiven: project !== undefined } }
 }
 
 /** "yes", "no", or "blocked" — a refused read is not a missing file. */
