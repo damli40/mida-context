@@ -78,8 +78,10 @@ export class RegistryReader {
    */
   recordBatchSize(): Promise<number> {
     if (this.#recordBatchSize !== undefined) return Promise.resolve(this.#recordBatchSize)
-    this.#recordBatchSizeProbe ??= this.context.publicClient
-      .getCode({ address: MULTICALL3_ADDRESS })
+    // Promise.resolve().then(...) so a client without getCode — a custom transport, a test rig —
+    // throws INSIDE the chain and lands on the same fallback as an RPC that refuses the call.
+    this.#recordBatchSizeProbe ??= Promise.resolve()
+      .then(() => this.context.publicClient.getCode({ address: MULTICALL3_ADDRESS }))
       .then((code) => (this.#recordBatchSize = code === undefined || code === "0x" ? 1 : RECORDS_PER_MULTICALL))
       .catch(() => (this.#recordBatchSize = 1))
     return this.#recordBatchSizeProbe

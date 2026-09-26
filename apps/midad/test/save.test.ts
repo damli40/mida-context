@@ -20,7 +20,7 @@ const input = {
 }
 
 /** A Runtime-shaped stub: saveCheckpoint only needs owner, home and agent(name). */
-function fakeRuntime(home: MidaHome, agent: { read: () => Promise<unknown[]>; create: () => Promise<{ contextId: Hex; transactionHash: Hex | null }> }): Runtime {
+function fakeRuntime(home: MidaHome, agent: { findDuplicate: () => Promise<Hex | undefined>; create: () => Promise<{ contextId: Hex; transactionHash: Hex | null }> }): Runtime {
   return {
     home,
     owner: OWNER,
@@ -31,12 +31,12 @@ function fakeRuntime(home: MidaHome, agent: { read: () => Promise<unknown[]>; cr
 describe("saveCheckpoint duplicate detection", () => {
   it("a saved-ids index hit answers duplicate without any chain read", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-save-")))
-    let reads = 0
+    let checks = 0
     let creates = 0
     const runtime = fakeRuntime(home, {
-      read: async () => {
-        reads += 1
-        return []
+      findDuplicate: async () => {
+        checks += 1
+        return undefined
       },
       create: async () => {
         creates += 1
@@ -45,21 +45,21 @@ describe("saveCheckpoint duplicate detection", () => {
     })
     const first = await saveCheckpoint(runtime, "claude-code", input)
     expect(first.duplicate).toBe(false)
-    expect(reads).toBe(1)
+    expect(checks).toBe(1)
     expect(creates).toBe(1)
 
     const second = await saveCheckpoint(runtime, "claude-code", input)
     expect(second.duplicate).toBe(true)
     expect(second.contextId).toBe(CONTEXT_ID)
-    expect(reads).toBe(1)   // the index answered — the namespace was never read again
+    expect(checks).toBe(1)   // the index answered — the namespace was never checked again
     expect(creates).toBe(1)
   })
 
-  it("a namespace read that fails with an ordinary error rejects — it must not pretend empty", async () => {
+  it("a duplicate check that fails with an ordinary error rejects — it must not pretend empty", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-save-")))
     let creates = 0
     const runtime = fakeRuntime(home, {
-      read: async () => {
+      findDuplicate: async () => {
         throw new Error("rpc unreachable")
       },
       create: async () => {
@@ -75,7 +75,7 @@ describe("saveCheckpoint duplicate detection", () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-save-")))
     let creates = 0
     const runtime = fakeRuntime(home, {
-      read: async () => {
+      findDuplicate: async () => {
         throw new MidaError("CAPABILITY_DENIED", "no read")
       },
       create: async () => {

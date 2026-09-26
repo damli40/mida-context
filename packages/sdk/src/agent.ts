@@ -17,6 +17,7 @@ import {
   decodeUint64,
   encodeUint64,
   evidenceCommitment,
+  isMidaError,
   namespaceById,
   namespaceId as toNamespaceId,
   originHash,
@@ -569,6 +570,150 @@ export class MidaAgent {
       else skipped.push(outcome.skipped)
     }
     return { anchored, pending, skipped, partial }
+  }
+
+  /**
+   * The duplicate check behind a save (in-12 N-6): whether this owner+namespace already holds a
+   * record whose decrypted payload satisfies `match`. Opening a row is local work — the epoch
+   * keys are fetched once per epoch and shared — so every listed row is opened and judged, and
+   * chain verification runs ONLY on the (normally zero or one) rows whose payload claims the
+   * match. That ordering is safe because a row the store invented cannot reach `match`: without
+   * the epoch key it cannot produce ciphertext that opens under the contextId binding, so a
+   * payload that opens was sealed honestly. A claimed match is then verified against Monad
+   * exactly as the full reads verify it — the store's word never decides "duplicate" — and a
+   * match whose record is not really there is skipped, not believed. A partial list still
+   * refuses outright: an incomplete view can never answer "not a duplicate" honestly. Returns
+   * the matching record's contextId, or undefined.
+   */
+  async findDuplicate(
+    owner: Address,
+    namespace: string,
+    match: (value: unknown) => boolean,
+    options?: { batched?: boolean },
+  ): Promise<Hex | undefined> {
+    const ownerAddress = owner.toLowerCase() as Address
+    const name = canonicalizeNamespace(namespace)
+    const namespaceId = toNamespaceId(name)
+    const capability = this.#requireCapability(ownerAddress, namespaceId, PERMISSION.READ)
+    const { deployment } = this.#chain
+    const epochKeyFor = this.#epochKeyResolver(ownerAddress, namespaceId, capability.capabilityId)
+
+    // The anchored lane: open each object against its own manifest first, then verify only a
+    // matching payload. A row that will not open fails the check the same way the full read's
+    // commitment check failed it — loudly, so a corrupt row can never look like "no duplicate".
+    const { objects, partial } = await this.#api.listObjects({ owner: ownerAddress, namespaceId, capabilityId: capability.capabilityId })
+    if (partial) {
+      throw new MidaError("PARTIAL_READ", `the store could not verify the whole ${name} list — try again in a moment`)
+    }
+    // Pass 1 is local work except the epoch-key fetches — workers let keys for DIFFERENT epochs
+    // leave together so Multicall3 can fold them into one eth_call. Verdicts land by index, so the
+    // candidate order stays the store's list order.
+    const matched = new Array<boolean>(objects.length).fill(false)
+    let nextObject = 0
+    const openWorker = async (): Promise<void> => {
+      while (nextObject < objects.length) {
+        const index = nextObject
+        nextObject += 1
+        const object = objects[index]!
+        const readEpoch = decodeUint64(object.manifest.readEpoch)
+        const epochPrivateKey = await epochKeyFor(readEpoch)
+        const payload = openContextObject({
+          manifest: object.manifest,
+          expectedManifestHash: object.manifestHash,
+          ciphertext: bytesOf(object.ciphertext, object.manifest.ciphertextSize),
+          epochPrivateKey,
+          binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: object.contextId, namespaceId, readEpoch },
+        })
+        matched[index] = match(payload.value)
+      }
+    }
+    const openWorkers: Promise<void>[] = []
+    for (let i = 0; i < Math.min(READ_CONCURRENCY, objects.length); i += 1) openWorkers.push(openWorker())
+    await Promise.all(openWorkers)
+    const candidates = objects.filter((_, index) => matched[index])
+    // Pass 2 is one batched chain read for every claimed match. A claimed match the chain never
+    // anchored is not a duplicate — the bytes are genuine (they opened) but no save with them
+    // landed, so the store cannot conjure a duplicate by replaying them. A record that IS there
+    // but disagrees is the contradiction the same checks #verifiedRecord runs throw on.
+    const records = await this.#reader.getRecords(candidates.map((object) => object.contextId))
+    for (const [index, record] of records.entries()) {
+      const object = candidates[index]!
+      if (record === null) continue
+      if (
+        object.manifest.contextId !== object.contextId ||
+        record.owner !== ownerAddress ||
+        record.namespaceId !== namespaceId ||
+        record.manifestHash !== manifestHash(object.manifest) ||
+        record.ciphertextCommitment !== object.manifest.ciphertextHash
+      ) {
+        throw new MidaError("COMMITMENT_MISMATCH", `object ${object.contextId} does not match its Monad commitments`)
+      }
+      return object.contextId
+    }
+
+    if (options?.batched === true && deployment.batchAnchor !== undefined) {
+      // Same denial tolerance as a direct read: an agent the store will not authorize for the
+      // batch list has nothing to find there, and the save's own signature is what gets judged.
+      try {
+        const { items, partial: batchedPartial } = await this.#api.listBatchSaves({
+          owner: ownerAddress,
+          namespaceId,
+          capabilityId: capability.capabilityId,
+        })
+        if (batchedPartial) {
+          throw new MidaError("PARTIAL_READ", "the batched list was incomplete — refusing to risk a duplicate save")
+        }
+        // Same two passes as the anchored lane: opening is local work done by workers so the
+        // epoch-key reads leave together; only a row whose decrypted payload claims the match is
+        // worth a chain verification, and the matched rows' proofs are asked for together so
+        // Multicall3 folds them. A row that will not open — sealed under an epoch this agent has
+        // no wrap for, or bytes that fail the AAD — is skipped like the full batched read skips it.
+        const batchedMatch = new Array<boolean>(items.length).fill(false)
+        let nextItem = 0
+        const batchedOpenWorker = async (): Promise<void> => {
+          while (nextItem < items.length) {
+            const index = nextItem
+            nextItem += 1
+            const item = items[index]!
+            const message = item.save.message
+            if (message.owner.toLowerCase() !== ownerAddress || message.namespaceId.toLowerCase() !== namespaceId) continue
+            try {
+              const readEpoch = decodeUint64(message.readEpoch)
+              const epochPrivateKey = await epochKeyFor(readEpoch)
+              const payload = openContextObject({
+                manifest: item.save.manifest,
+                expectedManifestHash: message.manifestHash.toLowerCase() as Hex,
+                ciphertext: bytesOf(item.save.ciphertext, item.save.manifest.ciphertextSize),
+                epochPrivateKey,
+                binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: item.contextId, namespaceId, readEpoch },
+              })
+              batchedMatch[index] = match(payload.value)
+            } catch {
+              // unopenable — skipped
+            }
+          }
+        }
+        const batchedOpenWorkers: Promise<void>[] = []
+        for (let i = 0; i < Math.min(READ_CONCURRENCY, items.length); i += 1) batchedOpenWorkers.push(batchedOpenWorker())
+        await Promise.all(batchedOpenWorkers)
+        const matchedItems = items.filter((_, index) => batchedMatch[index])
+        const verdicts = await Promise.all(
+          matchedItems.map((item) =>
+            item.state === "ANCHORED"
+              ? verifyBatchedItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient, requireLatest: true })
+              : item.state === "QUEUED" || item.state === "SUBMITTED"
+                ? verifyPendingItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient })
+                : Promise.resolve(null),
+          ),
+        )
+        for (const [index, verdict] of verdicts.entries()) {
+          if (verdict !== null && verdict.ok) return matchedItems[index]!.contextId
+        }
+      } catch (error) {
+        if (!isMidaError(error, "CAPABILITY_DENIED")) throw error
+      }
+    }
+    return undefined
   }
 
   async create(owner: Address, namespace: string, input: CreateContextInput): Promise<ContextObject> {

@@ -30,7 +30,6 @@ import {
   saveCheckpoint,
   saveOwnerAddress,
   saveOwnerMode,
-  wrapCheckpoint,
 } from "@mida/midad"
 import type { DoctorDeps, DrainDeps, Network, ServiceRuntime } from "@mida/midad"
 import {
@@ -356,8 +355,7 @@ describe("saveCheckpoint — the batched lane", () => {
       const home = batchedHome(store.url)
       const calls: Record<string, unknown>[] = []
       const agent = {
-        read: async () => [],
-        readBatchedWithStatus: async () => ({ anchored: [], pending: [], skipped: [], partial: false }),
+        findDuplicate: async () => undefined,
         createBatched: async (_owner: Address, _namespace: string, input: Record<string, unknown>) => {
           calls.push(input)
           return { contextId: CONTEXT_ID, state: "QUEUED" as const, receipt }
@@ -394,16 +392,9 @@ describe("saveCheckpoint — the batched lane", () => {
     try {
       const home = batchedHome(store.url)
       const earlier = `0x${"bb".repeat(32)}` as Hex
-      const envelope = wrapCheckpoint({ ...saveInput })
       let creates = 0
       const agent = {
-        read: async () => [],
-        readBatchedWithStatus: async () => ({
-          anchored: [],
-          pending: [{ contextId: earlier, payload: { value: envelope }, anchor: "PENDING_ANCHOR" as const, authorAgentId: `0x${"aa".repeat(32)}` as Hex }],
-          skipped: [],
-          partial: false,
-        }),
+        findDuplicate: async () => earlier,
         createBatched: async () => {
           creates += 1
           return { contextId: CONTEXT_ID, state: "QUEUED" as const, receipt }
@@ -428,8 +419,9 @@ describe("saveCheckpoint — the batched lane", () => {
     try {
       const home = batchedHome(store.url)
       const agent = {
-        read: async () => [],
-        readBatchedWithStatus: async () => ({ anchored: [], pending: [], skipped: [], partial: true }),
+        findDuplicate: async () => {
+          throw new MidaError("PARTIAL_READ", "the batched checkpoint list was incomplete — refusing to risk a duplicate save")
+        },
         createBatched: async () => {
           throw new Error("must not queue on a partial read")
         },
@@ -449,7 +441,7 @@ describe("saveCheckpoint — the batched lane", () => {
     try {
       const home = batchedHome(store.url)
       const agent = {
-        read: async () => [],
+        findDuplicate: async () => undefined,
         create: async () => ({ contextId: CONTEXT_ID, transactionHash: `0x${"ee".repeat(32)}` as Hex }),
       }
       const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
@@ -468,7 +460,7 @@ describe("saveCheckpoint — the batched lane", () => {
     const home = new MidaHome(dir())
     writeFileSync(home.path("network.json"), "not json {") // readSavedNetwork throws network-json-invalid
     const agent = {
-      read: async () => [],
+      findDuplicate: async () => undefined,
       create: async () => ({ contextId: CONTEXT_ID, transactionHash: null }),
     }
     const runtime = fakeRuntime(home, { network: batchedNetwork("http://127.0.0.1:1"), agent })
@@ -481,7 +473,7 @@ describe("saveCheckpoint — the batched lane", () => {
   it("batching absent → the direct lane exactly as before, no laneWhy", async () => {
     const home = new MidaHome(dir()) // no network.json at all
     const agent = {
-      read: async () => [],
+      findDuplicate: async () => undefined,
       create: async () => ({ contextId: CONTEXT_ID, transactionHash: null }),
     }
     const runtime = fakeRuntime(home, { agent })

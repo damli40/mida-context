@@ -574,38 +574,32 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
     lane = { kind: "direct", why: "switch-off" }
     laneWhy = typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : "decision-failed"
   }
-  // An agent without READ has nothing readable and proceeds to create; the create itself is what
-  // the chain judges. Any OTHER read failure is real and must surface — swallowing it would turn
-  // a broken connection into a duplicate write.
-  let objects: ContextObject[]
+  // The duplicate check asks one question — does this project already hold this eventId — and the
+  // answer lives inside the sealed payload, so it opens every row locally (the epoch key fetch is
+  // shared per epoch) and spends chain verification only on a row that claims the match (in-12
+  // N-6): a burst of N earlier batched saves no longer re-verifies all N rows per save. On the
+  // batched lane the batch queue is a second place a save can already exist — an anchored or
+  // still-pending row is as much a duplicate as a directly-anchored one. An agent without READ
+  // has nothing readable and proceeds to create (the create itself is what the chain judges);
+  // any OTHER read failure is real and must surface — swallowing it would turn a broken
+  // connection into a duplicate write.
+  let existing: Hex | undefined
   try {
-    // The duplicate check compares eventIds, not order — placements: false skips even the
-    // bounded same-second tie scan (in-9 R-1).
-    objects = await agent.read(runtime.owner, NAMESPACE, { placements: false })
+    existing = await agent.findDuplicate(
+      runtime.owner,
+      NAMESPACE,
+      (value) => {
+        const found = unwrapCheckpoint(value)
+        return found !== null && found.projectId === envelope.projectId && found.checkpoint.eventId === envelope.checkpoint.eventId
+      },
+      { batched: lane.kind === "batched" },
+    )
   } catch (error) {
     if (!isMidaError(error, "CAPABILITY_DENIED")) throw error
-    objects = []
   }
-  if (lane.kind === "batched") {
-    // The batch queue is a second place a save can already exist: an anchored or still-pending
-    // batched row is as much a duplicate as a directly-anchored object. Same denial tolerance as
-    // the direct read — a partial answer is never trusted enough to save on top of.
-    try {
-      const batched = await agent.readBatchedWithStatus(runtime.owner, NAMESPACE)
-      if (batched.partial) {
-        throw new MidaError("PARTIAL_READ", "the batched checkpoint list was incomplete — refusing to risk a duplicate save")
-      }
-      objects = [...objects, ...batched.anchored, ...batched.pending]
-    } catch (error) {
-      if (!isMidaError(error, "CAPABILITY_DENIED")) throw error
-    }
-  }
-  const existing = objects
-    .map((object) => ({ object, found: unwrapCheckpoint(object.payload.value) }))
-    .find(({ found }) => found !== null && found.projectId === envelope.projectId && found.checkpoint.eventId === envelope.checkpoint.eventId)
   if (existing !== undefined) {
-    recordSavedId(runtime.home, envelope.checkpoint.eventId, existing.object.contextId)
-    return { contextId: existing.object.contextId, transactionHash: null, milliseconds: Date.now() - started, duplicate: true }
+    recordSavedId(runtime.home, envelope.checkpoint.eventId, existing)
+    return { contextId: existing, transactionHash: null, milliseconds: Date.now() - started, duplicate: true }
   }
   if (lane.kind === "batched") {
     // The store's receipt only means the save was queued — the pending ledger owns it from here

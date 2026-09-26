@@ -632,16 +632,16 @@ describe("the owner-signed project list gates every save", () => {
 describe("the saved-ids index lives outside the queue and survives every pass (CAP-25)", () => {
   it("three passes record three eventIds, and re-running the first event makes zero chain reads", async () => {
     const { home, homeDir, transcriptPath, cwd, compile, checkProject } = setup()
-    // a stub "chain" that counts its reads: the index must answer the duplicate before any read
-    let reads = 0
+    // a stub "chain" that counts its duplicate checks: the index must answer before any check
+    let checks = 0
     let creates = 0
     const runtime = {
       home,
       owner: `0x${"11".repeat(20)}`,
       agent: () => ({
-        read: async () => {
-          reads += 1
-          return []
+        findDuplicate: async () => {
+          checks += 1
+          return undefined
         },
         create: async () => {
           creates += 1
@@ -663,9 +663,9 @@ describe("the saved-ids index lives outside the queue and survives every pass (C
     // post-crash retry — and the index must answer it without a chain read
     home.remove("queue/state/s1.json")
     enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath, cwd, error: null })
-    const readsBefore = reads
+    const checksBefore = checks
     expect((await pass()).saved).toBe(1)
-    expect(reads).toBe(readsBefore)
+    expect(checks).toBe(checksBefore)
     expect(creates).toBe(3)
   })
 })
