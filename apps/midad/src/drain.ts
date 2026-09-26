@@ -12,10 +12,12 @@ import { chainFor, rpcTransport } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { RegistryReader } from "@mida/api"
 import { readTranscriptFor, scrubSecrets } from "@mida/compiler"
-import type { compileCheckpoint } from "@mida/compiler"
+import { devinSessionStat } from "@mida/compiler"
+import type { OpenDevinDb, compileCheckpoint } from "@mida/compiler"
 import { isChainBusyError, isWalletLow } from "./chain-busy.js"
 import { CheckpointPayloadError, eventIdFor, unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
+import { devinDbPathAllowed } from "./devin-facts.js"
 import type { MidaHome } from "./home.js"
 import { FLUSH_EVENTS, transcriptPathAllowed } from "./hook.js"
 import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
@@ -71,6 +73,10 @@ const PERMANENT_FAILURES = new Set([
   "folder-mismatch",
   "check-failed",
   "transcript-project-mismatch",
+  // the devin sessions-db failures — none of them is fixed by waiting
+  "devin-needs-node-22.13",
+  "devin-session-not-found",
+  "devin-db-unreadable",
 ])
 /**
  * A checkpoint the validator rejects is usually fixed by a fresh model call, so
@@ -94,6 +100,10 @@ export interface DrainDeps {
   homeDir?: string
   /** The chain save — injectable so rule tests never need a chain. Defaults to saveCheckpoint. */
   save?: typeof saveCheckpoint
+  /** The env the devin db path resolves against — injected in tests; defaults to the process env. */
+  env?: NodeJS.ProcessEnv
+  /** Opens the devin sessions database — injectable so tests can model node:sqlite absence or a synthetic file's opener. */
+  openDevinDb?: OpenDevinDb
   /** The owner's approval check — injectable in tests. Defaults to a read-only chain lookup. */
   isApproved?: (agent: string) => Promise<boolean>
   /**
@@ -268,8 +278,13 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           continue
         }
         // the hook checked this path at enqueue, but the file could have been swapped since —
-        // re-check the same rule before the drainer opens it
-        if (!transcriptPathAllowed(job.transcriptPath, job.agent, homeDir, deps.home)) {
+        // re-check the same rule before the drainer opens it. A devin job's "transcript" is
+        // the sessions database — the check is the configured-path rule, not a .jsonl root.
+        const sourceOk =
+          job.agent === "devin"
+            ? devinDbPathAllowed(job.transcriptPath, deps.env ?? process.env, homeDir)
+            : transcriptPathAllowed(job.transcriptPath, job.agent, homeDir, deps.home)
+        if (!sourceOk) {
           moveToBad(deps.home, `${job.id}.json`)
           log({ sessionId, outcome: "bad", reason: "bad-transcript-path" })
           continue
@@ -285,8 +300,12 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         const projectId = project.approval.projectId
 
         // size and last line come from ONE open descriptor — a growing transcript cannot show
-        // the drainer a size and a tail from different moments
-        const { bytes: transcriptBytes, lastLine } = tailOf(job.transcriptPath)
+        // the drainer a size and a tail from different moments. A devin session has no file:
+        // its fingerprint is (main_chain_id, max node_id, node count) from one database read.
+        const { bytes: transcriptBytes, lastLine } =
+          job.agent === "devin"
+            ? devinFingerprintOf(job.transcriptPath, sessionId, deps.openDevinDb)
+            : tailOf(job.transcriptPath)
         const lastLineHash = bytesToHex(sha256(utf8ToBytes(lastLine)))
         const state = readState(deps.home, sessionId)
         const stateMatches = state !== undefined && state.transcriptBytes === transcriptBytes && state.lastLineHash === lastLineHash
@@ -298,8 +317,9 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         }
         // the reader is chosen by the agent that wrote the transcript — an agent with no
         // reader, or a file in no known format (it might have been swapped for one since
-        // the path check passed), is not sent to the model
-        const convo = readTranscriptFor(job.agent, job.transcriptPath)
+        // the path check passed), is not sent to the model. A devin job reads its session
+        // from the sessions database — the reader needs the session id to pick the rows.
+        const convo = readTranscriptFor(job.agent, job.transcriptPath, { sessionId })
         if (convo === null || convo.format === "unknown-tail") {
           moveToBad(deps.home, `${job.id}.json`)
           writeState(deps.home, sessionId, terminal)
@@ -369,6 +389,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           const compiled = await deps.compile({
             transcriptPath: job.transcriptPath,
             agent: job.agent,
+            sessionId: job.sessionId,
             eventId,
             cwd: job.cwd,
             homeDir,
@@ -515,7 +536,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           // it would make the same transcript read as already-saved forever; leaving the state
           // untouched lets a later job save it once the store opens again (in-3 I6).
           if (code !== "denied-pending-revoke") {
-            writeState(deps.home, sessionId, terminalState(job.transcriptPath, now().toISOString()))
+            writeState(deps.home, sessionId, terminalStateFor(job, now().toISOString(), deps.openDevinDb))
           }
           log({ sessionId, outcome: "bad", reason: code, ...fields, ...sample })
           continue
@@ -526,7 +547,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         const invalidGaveUp = code === "invalid-checkpoint" && attempts >= INVALID_CHECKPOINT_MAX_ATTEMPTS
         if (attempts >= MAX_ATTEMPTS || invalidGaveUp) {
           moveToBad(deps.home, `${job.id}.json`)
-          writeState(deps.home, sessionId, terminalState(job.transcriptPath, now().toISOString()))
+          writeState(deps.home, sessionId, terminalStateFor(job, now().toISOString(), deps.openDevinDb))
           log({ sessionId, outcome: "bad", reason: invalidGaveUp ? "invalid-checkpoint" : "gave-up", ...fields, ...sample })
           continue
         }
@@ -882,6 +903,38 @@ function terminalState(path: string, savedAt: string): SessionState {
   } catch {
     return { transcriptBytes: 0, lastLineHash: "", savedAt }
   }
+}
+
+/**
+ * A devin session's fingerprint in the SessionState shape: node count stands in for
+ * transcriptBytes and `${main_chain_id}:${max_node_id}` for the last line — the three
+ * fields that change exactly when the session changes, so an untouched session still
+ * skips as unchanged and a grown one never does.
+ */
+function devinFingerprintOf(
+  dbPath: string,
+  sessionId: string,
+  openDevinDb?: OpenDevinDb,
+): { bytes: number; lastLine: string } {
+  const stat = devinSessionStat(dbPath, sessionId, openDevinDb)
+  return { bytes: stat.nodeCount, lastLine: `${stat.mainChainId ?? "none"}:${stat.maxNodeId}` }
+}
+
+/** terminalState, for whichever capture source the job's agent uses. */
+function terminalStateFor(
+  job: CaptureJob,
+  savedAt: string,
+  openDevinDb?: OpenDevinDb,
+): SessionState {
+  if (job.agent === "devin") {
+    try {
+      const { bytes, lastLine } = devinFingerprintOf(job.transcriptPath, job.sessionId, openDevinDb)
+      return { transcriptBytes: bytes, lastLineHash: bytesToHex(sha256(utf8ToBytes(lastLine))), savedAt }
+    } catch {
+      return { transcriptBytes: 0, lastLineHash: "", savedAt }
+    }
+  }
+  return terminalState(job.transcriptPath, savedAt)
 }
 
 /** How much of a transcript's tail is read to find its last line. */

@@ -72,7 +72,7 @@ const cutSummary = (s: string): string =>
     : `${s.slice(0, SUMMARY_HEAD_CHARS)}\n[… middle of the summary cut …]\n${s.slice(-SUMMARY_TAIL_CHARS)}`
 
 export interface Conversation {
-  format: "claude-jsonl" | "codex-jsonl" | "unknown-tail"
+  format: "claude-jsonl" | "codex-jsonl" | "devin-sqlite" | "unknown-tail"
   text: string // "L<n> <role>:" blocks, ≤ maxChars
   firstUserMessage: string | null // verbatim, scrubbed, ≤ 6000 chars incl. "…"
   /**

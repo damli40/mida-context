@@ -294,7 +294,7 @@ export function readCodexConversation(
 export function readTranscriptFor(
   agent: string,
   path: string,
-  options: { maxChars?: number; preferRequest?: string | null } = {},
+  options: { maxChars?: number; preferRequest?: string | null; sessionId?: string } = {},
 ): Conversation | null {
   if (agent === "codex") return readCodexConversation(path, options)
   if (agent === "claude-code") return readConversation(path, options)

@@ -107,6 +107,7 @@ export {
 } from "./install.js"
 export type { InstallOutcome, InstallTool, McpClientTool, UninstallOutcome } from "./install.js"
 export {
+  DEVIN_DB_SCHEMA,
   DEVIN_EVENTS,
   DEVIN_INJECT_EVENTS,
   DEVIN_INSTALLED_EVENTS,

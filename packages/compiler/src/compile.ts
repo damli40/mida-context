@@ -36,6 +36,8 @@ export const DEFAULT_MODEL: ModelCommand = {
 export interface CompileInput {
   transcriptPath: string
   agent: string
+  /** The hook payload's session id — the devin reader picks its rows out of the sessions database by it. */
+  sessionId?: string
   eventId: string
   cwd: string
   homeDir: string
@@ -356,7 +358,7 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
   // no reader before this is ever called; a direct caller naming one is refused here too —
   // never quietly parsed through another agent's format. The code is the drain's own
   // permanent "unknown-transcript-format" reason, so a thrown refusal maps to it.
-  const convo = readTranscriptFor(input.agent, input.transcriptPath, { preferRequest: kept })
+  const convo = readTranscriptFor(input.agent, input.transcriptPath, { preferRequest: kept, sessionId: input.sessionId })
   if (convo === null) {
     const error = new Error(`no transcript reader for agent "${input.agent}"`) as Error & { code: string }
     error.code = "unknown-transcript-format"

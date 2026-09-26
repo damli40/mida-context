@@ -91,6 +91,22 @@ export function devinDbPathAllowed(dbPath: unknown, env: NodeJS.ProcessEnv, home
 export const DEVIN_NODE_SQLITE_MIN = "22.13"
 
 /**
+ * The sessions database schema, observed Sep 25. `sessions.id` is a two-word slug
+ * (`bald-swordfish`) expected to equal the hook payload's session_id — NOT verified;
+ * a miss ends cleanly as `devin-session-not-found`. `message_nodes` is one row per
+ * message; `main_chain_id` names the newest node of the live conversation and
+ * `parent_node_id` walks it back to its root. The compiler's reader
+ * (packages/compiler/src/transcript-devin.ts) depends on these column names.
+ */
+export const DEVIN_DB_SCHEMA = `CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT NOT NULL, backend_type TEXT NOT NULL,
+  model TEXT NOT NULL, agent_mode TEXT NOT NULL, created_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL,
+  title TEXT, main_chain_id INTEGER, shell_last_seen_index INTEGER DEFAULT 0, cogs_json TEXT,
+  workspace_dirs TEXT, hidden INTEGER NOT NULL DEFAULT 0, metadata TEXT);
+CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+  node_id INTEGER NOT NULL, parent_node_id INTEGER, chat_message TEXT NOT NULL, created_at INTEGER NOT NULL,
+  metadata TEXT, FOREIGN KEY (session_id) REFERENCES sessions(id), UNIQUE(session_id, node_id));`
+
+/**
  * The payload fields Devin's hooks send on stdin (local inspection, Sep 25): `session_id`
  * and `prompt_id` on every event; `source` on SessionStart, `prompt` on UserPromptSubmit,
  * `tool_name`/`tool_input` on tool events, `reason` on SessionEnd, `summary` on
