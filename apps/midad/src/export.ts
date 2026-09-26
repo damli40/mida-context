@@ -385,9 +385,12 @@ function write0600(path: string, data: string | Uint8Array): void {
 function enumName(table: Record<string, number>, value: number, what: string, contextId: Hex): string {
   const name = Object.keys(table).find((key) => table[key] === value)
   if (name === undefined) {
+    // `unknownField`/`unknownValue` ride on the error so the printed line can say plainly that
+    // this version of mida does not recognise the value — this build's gap, not a chain anomaly
+    // (ex-4 G-4).
     throw Object.assign(
       codedError("export-inconsistent", `record ${contextId} carries a ${what} value (${value}) this build does not know`),
-      { contextIds: [contextId] },
+      { contextIds: [contextId], unknownField: what, unknownValue: value },
     )
   }
   return name

@@ -1002,20 +1002,24 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
             : `${ids.length} record(s) could not be read back — nothing was written`
       return `${head}${named}${why}`
     }
-    // Two records Monad registered disagree with each other — the throw sites name the lineage
-    // and the record ids and nothing else, so the line short-forms them and asks the owner to
-    // report a state the chain should never produce (ex-3 E-2).
+    // Two records Monad registered disagree with each other — that throw names the lineage and
+    // the record ids, so the line short-forms them and asks the owner to report a state the
+    // chain should never produce (ex-3 E-2). Every other export-inconsistent producer is the
+    // unknown-enum throw — this version of mida meeting a value newer than it, not a chain
+    // anomaly — so the line says plainly what mida does not recognise and names the fix:
+    // update mida (ex-4 G-4). The chain is never blamed for it.
     case "export-inconsistent": {
-      const detail = error as { lineage?: unknown; contextIds?: unknown }
+      const detail = error as { lineage?: unknown; contextIds?: unknown; unknownField?: unknown; unknownValue?: unknown }
       const ids = (Array.isArray(detail.contextIds) ? detail.contextIds : []).filter((id): id is string => typeof id === "string")
       const shortId = (id: string) => `${id.slice(0, 6)}…${id.slice(-4)}`
-      const what =
-        typeof detail.lineage === "string" && ids.length === 2
-          ? `lineage ${shortId(detail.lineage)} holds two records claiming the same parent — ${shortId(ids[0]!)} and ${shortId(ids[1]!)}`
-          : error instanceof Error
-            ? error.message
-            : "two records disagree"
-      return `the export found a chain state that should be impossible on Monad — ${what}; please report it`
+      if (typeof detail.lineage === "string" && ids.length === 2) {
+        return `the export found a chain state that should be impossible on Monad — lineage ${shortId(detail.lineage)} holds two records claiming the same parent — ${shortId(ids[0]!)} and ${shortId(ids[1]!)}; please report it`
+      }
+      const field = typeof detail.unknownField === "string" ? `${detail.unknownField} ` : ""
+      const value =
+        typeof detail.unknownValue === "number" || typeof detail.unknownValue === "bigint" ? ` (${String(detail.unknownValue)})` : ""
+      const who = typeof ids[0] === "string" ? `record ${shortId(ids[0])}` : "a record"
+      return `${who} carries a ${field}value${value} this version of mida does not recognise — update mida and run the export again`
     }
     case "chain-busy":
       return partway === undefined

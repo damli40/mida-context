@@ -395,7 +395,8 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
         return { name: name!, type: type! }
       })
       const domainMatch = /\{ name: "([^"]+)", version: "([^"]+)", chainId: <the chain id above>, verifyingContract: <the BatchAnchor above> \}/.exec(readmeText)
-      expect(domainMatch, "README must carry the EIP-712 domain").toBeDefined()
+      // not toBeDefined — that check passes on null, and a null match means the README lost its domain
+      expect(domainMatch, "README must carry the EIP-712 domain").not.toBeNull()
       const leafTag = /\["([A-Z0-9_]+)", contextId, agentId/.exec(readmeText)?.[1]
       expect(leafTag, "README must carry the batch-leaf tag").toBeDefined()
 

@@ -636,6 +636,35 @@ describe("mida export — dispatch and refusals", () => {
     expect(line).not.toContain("export-inconsistent")
   })
 
+  it("an enum value this build does not know names the record in short form and says update mida — never blames the chain", async () => {
+    // ex-4 G-4: a kind/provenance value newer than this build is mida's gap, not an
+    // impossible chain state — the line says so plainly, names the record as 0x1234…abcd,
+    // and names the fix. It must not call the state impossible or blame Monad.
+    const record = fixtureRecord({ kind: 9 })
+    const home = ownerHome()
+    const cwd = tempDir()
+    const dest = join(cwd, "backup")
+    const thrown = await exportRecords({
+      home,
+      network,
+      folder: dest,
+      cwd,
+      print: () => {},
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [record],
+    }).catch((error: unknown) => error)
+    expect((thrown as { code?: unknown }).code).toBe("export-inconsistent")
+    const line = ownerRefusalLine("export", "", thrown, undefined, network.deployment.capabilityRegistry)
+    const shortId = `${record.contextId.slice(0, 6)}…${record.contextId.slice(-4)}`
+    expect(line).toContain(shortId)
+    expect(line).not.toContain(record.contextId) // the full id is never the printed form
+    expect(line).toContain("kind")
+    expect(line).toContain("does not recognise")
+    expect(line).toContain("update mida")
+    expect(line).not.toContain("impossible")
+    expect(line).not.toContain("Monad")
+  })
+
   it("the universe is scanned only up to the block the export names — the head is read first", async () => {
     // ex-2 X-9: the README's "export block" must bound the scan. fakeRuntime's chain answers 42 —
     // the read must receive exactly that as toBlock, not whatever head the chain has moved to.
