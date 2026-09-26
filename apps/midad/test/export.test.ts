@@ -5,9 +5,11 @@
 // point — can reach an export. The real-chain end to end lives in export.e2e.test.ts.
 
 import { describe, expect, it } from "vitest"
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
+import { spawn } from "node:child_process"
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 import { keccak256, zeroHash } from "viem"
 import { OWNER_AUTHOR_ID, canonicalBytes, namespaceId } from "@mida/protocol"
 import type { Hex, ObjectManifest } from "@mida/protocol"
@@ -516,5 +518,99 @@ describe("mida export — no agent path reaches it", () => {
       spawnDrainer: () => {},
     })
     expect(peekJobs(home)).toHaveLength(0)
+  })
+})
+
+describe("mida export — an interrupted or left-behind staging folder", () => {
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
+  const tsxLoader = join(repoRoot, "node_modules/tsx/dist/loader.mjs")
+  const childScript = join(dirname(fileURLToPath(import.meta.url)), "export-sigint-child.ts")
+
+  it("a SIGINT mid-write deletes the staged folder and exits 130 — the real Ctrl-C path", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "mida-export-sigint-"))
+    // A real child process, a real signal, the real exportRecords: an in-process test cannot
+    // reproduce "the OS kills the process mid-write".
+    const child = spawn(
+      process.execPath,
+      ["--import", tsxLoader, childScript, cwd],
+      { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"] },
+    )
+    let stderr = ""
+    child.stderr!.on("data", (chunk) => {
+      stderr += String(chunk)
+    })
+    const exited = new Promise<number | null>((done) => child.on("exit", (code) => done(code)))
+    try {
+      const deadline = Date.now() + 120_000
+      let staged: string | undefined
+      while (staged === undefined && Date.now() < deadline) {
+        staged = readdirSync(cwd).find((name) => name.includes(".partial-"))
+        if (staged === undefined) await new Promise((resolve) => setTimeout(resolve, 2))
+      }
+      expect(staged, `no staged folder appeared; child stderr: ${stderr.slice(0, 400)}`).toBeDefined()
+      const stagedDir = staged!
+      // Signal once the plaintext file itself exists — the instant Ctrl-C is most dangerous —
+      // or well into the encrypted-file phase on a machine where that file never gets far.
+      while (
+        !existsSync(join(cwd, stagedDir, "records.json")) &&
+        Date.now() < deadline &&
+        !(existsSync(join(cwd, stagedDir, "encrypted")) && readdirSync(join(cwd, stagedDir, "encrypted")).length >= 1200)
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 1))
+      }
+      child.kill("SIGINT")
+      const code = await exited
+      expect(code).toBe(130)
+      const left = readdirSync(cwd)
+      expect(left.filter((name) => name.includes(".partial-"))).toEqual([])
+      expect(left).not.toContain("backup")
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  }, 120_000)
+
+  it("a leftover .partial-* folder with the staging marker is deleted and reported — kill -9 or a power cut", async () => {
+    const home = ownerHome()
+    const cwd = tempDir()
+    // What a killed export leaves: the marker (written first) plus half-finished content.
+    const leftover = join(cwd, "backup.partial-deadbeef")
+    mkdirSync(join(leftover, "encrypted"), { recursive: true })
+    writeFileSync(join(leftover, ".mida-export-staging"), "staged\n")
+    writeFileSync(join(leftover, "records.json"), "{\"never-finished\":true}")
+    const { lines, print } = collect()
+    const result = await exportRecords({
+      home,
+      network,
+      folder: join(cwd, "backup"),
+      cwd,
+      print,
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [fixtureRecord()],
+    })
+    expect(result.outcome).toBe("exported")
+    expect(existsSync(leftover)).toBe(false)
+    expect(lines.some((line) => line.includes("backup.partial-deadbeef") && line.includes("leftover"))).toBe(true)
+    expect(existsSync(join(cwd, "backup", "records.json"))).toBe(true)
+  })
+
+  it("a look-alike .partial-* folder WITHOUT the staging marker is left alone", async () => {
+    const home = ownerHome()
+    const cwd = tempDir()
+    // Same name shape, never ours: no marker file means export must not delete it.
+    const lookalike = join(cwd, "backup.partial-cafebabe")
+    mkdirSync(lookalike)
+    writeFileSync(join(lookalike, "notes.txt"), "somebody else's folder")
+    const { print } = collect()
+    const result = await exportRecords({
+      home,
+      network,
+      folder: join(cwd, "backup"),
+      cwd,
+      print,
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [fixtureRecord()],
+    })
+    expect(result.outcome).toBe("exported")
+    expect(readFileSync(join(lookalike, "notes.txt"), "utf8")).toBe("somebody else's folder")
   })
 })

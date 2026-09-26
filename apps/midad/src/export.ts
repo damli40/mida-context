@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto"
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync, renameSync, rmSync, writeSync } from "node:fs"
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { zeroHash } from "viem"
 import { CONTEXT_KIND, OWNER_AUTHOR_ID, PROVENANCE_SOURCE, RECORD_TYPE, canonicalBytes } from "@mida/protocol"
@@ -28,9 +28,11 @@ import type { CheckpointEnvelope } from "./checkpoint-payload.js"
  *
  * Never in the folder: the owner seed, the owner P-256 key, any agent key, any epoch or
  * namespace key — only payloads (decrypted) and store bytes (still encrypted). The temp sibling
- * folder `<folder>.partial-<random>` holds plaintext for the duration of the write, so ANY
- * failure deletes it before the error is reported; the rename to <folder> happens once, at the
- * end.
+ * folder `<folder>.partial-<random>` holds plaintext for the duration of the write, so it is
+ * deleted on every path out: a rejected promise runs the catch, Ctrl-C (SIGINT, SIGTERM, SIGHUP)
+ * runs a synchronous process-level cleanup, and a kill -9 or power cut is covered by the marker
+ * file the next export's sweep removes before writing. The rename to <folder> happens once, at
+ * the end.
  */
 
 export type ExportResult =
@@ -96,6 +98,86 @@ function codedError(code: string, message: string): Error {
 function refuse(deps: ExportDeps, code: string, line: string): ExportResult {
   deps.print(line)
   return { outcome: "refused", code }
+}
+
+/**
+ * Written FIRST inside every `<dest>.partial-*` staging folder — proof that a leftover is a
+ * half-written Mida export holding plaintext. The next run's sweep deletes only folders that
+ * carry it; a folder without it is somebody else's and stays untouched.
+ */
+const STAGING_MARKER = ".mida-export-staging"
+
+/**
+ * Every staging folder this process is still writing. While the set is non-empty, SIGINT,
+ * SIGTERM and SIGHUP get handlers that delete the folders synchronously and exit with the
+ * conventional code — a bare exit would leave plaintext on disk, and an async cleanup would
+ * never run. Handlers are removed the moment the set empties, so a finished export leaves the
+ * process untouched.
+ */
+const stagingFolders = new Set<string>()
+const STAGING_SIGNALS = { SIGINT: 130, SIGHUP: 129, SIGTERM: 143 } as const
+
+const stagingHandlers = {
+  SIGINT: () => onStagingSignal("SIGINT"),
+  SIGHUP: () => onStagingSignal("SIGHUP"),
+  SIGTERM: () => onStagingSignal("SIGTERM"),
+} as const
+
+function onStagingSignal(signal: keyof typeof STAGING_SIGNALS): void {
+  for (const dir of stagingFolders) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // best effort — the marker still names it for the next run's sweep
+    }
+  }
+  process.exit(STAGING_SIGNALS[signal])
+}
+
+function watchStaging(dir: string): void {
+  if (stagingFolders.size === 0) {
+    for (const signal of Object.keys(stagingHandlers) as (keyof typeof stagingHandlers)[]) {
+      process.on(signal, stagingHandlers[signal])
+    }
+  }
+  stagingFolders.add(dir)
+}
+
+function unwatchStaging(dir: string): void {
+  stagingFolders.delete(dir)
+  if (stagingFolders.size === 0) {
+    for (const signal of Object.keys(stagingHandlers) as (keyof typeof stagingHandlers)[]) {
+      process.removeListener(signal, stagingHandlers[signal])
+    }
+  }
+}
+
+/**
+ * Deletes sibling `<dest>.partial-*` folders a previous export left behind — a kill -9 or a
+ * power cut can never run this process's own cleanup, so the NEXT run removes them before
+ * writing. The marker file is the proof the folder is ours and half-written: without it, the
+ * folder stays untouched. One printed line per removed folder — it held plaintext.
+ */
+function sweepLeftoverStaging(dest: string, print: (line: string) => void): void {
+  const parent = dirname(dest)
+  const prefix = `${basename(dest)}.partial-`
+  let names: string[]
+  try {
+    names = readdirSync(parent)
+  } catch {
+    return // the parent cannot be listed — a run that needs it fails on its own write
+  }
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue
+    const dir = join(parent, name)
+    try {
+      if (!statSync(dir).isDirectory() || !existsSync(join(dir, STAGING_MARKER))) continue
+      rmSync(dir, { recursive: true, force: true })
+      print(`removed a leftover half-written export: ${name} — it held plaintext`)
+    } catch {
+      // leave it — a leftover is better than a wrongly deleted folder
+    }
+  }
 }
 
 /** lstat that tolerates absence — a symlink (even a broken one) counts as existing. */
@@ -474,6 +556,11 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
     return refuse(deps, "export-parent-missing", `the folder's parent does not exist: ${dirname(dest)}`)
   }
 
+  // A kill -9 or a power cut can never run the cleanup below — the next export that reaches this
+  // point removes a leftover half-written folder first. Only folders carrying our marker are
+  // touched.
+  sweepLeftoverStaging(dest, deps.print)
+
   const runtime = await (deps.openRuntime ?? Runtime.open)(home, network)
   try {
     // readOwnerUniverse's progress is the log scan's (block ranges), not a record count — say so.
@@ -501,9 +588,19 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
 
     const temp = `${dest}.partial-${randomBytes(6).toString("hex")}`
     mkdirSync(temp, { mode: 0o700 })
+    // FIRST file: the marker proves a leftover is a half-written Mida export — the next run's
+    // sweep deletes only folders that carry it. And while the folder exists, a signal must
+    // delete it before the process exits — Ctrl-C mid-write must not leave plaintext.
+    write0600(join(temp, STAGING_MARKER), `${exportedAt}\n`)
+    watchStaging(temp)
     try {
       if (deps.stopAfter === "staged") throw codedError("export-stopped", `the export stopped after staging ${temp}`)
       mkdirSync(join(temp, "encrypted"), { mode: 0o700 })
+      // A process-level signal handler cannot interrupt synchronous work — Node dispatches it at
+      // the next event-loop turn, which would be AFTER the rename and the unwatch. The write
+      // therefore yields periodically so a queued SIGINT/SIGTERM/SIGHUP runs its cleanup while
+      // the staging folder still exists.
+      let written = 0
       for (const record of records) {
         const encrypted = record.encrypted!
         const id = record.contextId.toLowerCase()
@@ -512,10 +609,15 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
         if (encrypted.batchItem !== undefined) {
           write0600(join(temp, "encrypted", `${id}.batched.json`), `${JSON.stringify(encrypted.batchItem, bigintJson, 2)}\n`)
         }
+        written += 1
+        if (written % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve))
       }
+      await new Promise<void>((resolve) => setImmediate(resolve))
       write0600(join(temp, "records.json"), `${JSON.stringify(entries, bigintJson, 2)}\n`)
+      await new Promise<void>((resolve) => setImmediate(resolve))
       write0600(join(temp, "records.md"), recordsMarkdown(entries, records, exportedAt))
       if (deps.stopAfter === "files") throw codedError("export-stopped", `the export stopped after writing the record files`)
+      await new Promise<void>((resolve) => setImmediate(resolve))
       write0600(
         join(temp, "README.md"),
         readme({
@@ -535,6 +637,13 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
         throw codedError("export-exists", `the folder ${dest} appeared while the export was running`)
       }
       renameSync(temp, dest)
+      // The marker's job ended with the rename — a finished export is not a staging folder.
+      // Best effort: a stubborn marker is a hidden timestamp file, nothing more.
+      try {
+        rmSync(join(dest, STAGING_MARKER))
+      } catch {
+        // leave it — it carries no data
+      }
       const parent = openSync(dirname(dest), "r")
       try {
         fsyncSync(parent)
@@ -545,6 +654,9 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
       // The staged folder holds plaintext — whatever failed, it leaves nothing behind.
       rmSync(temp, { recursive: true, force: true })
       throw error
+    } finally {
+      // Staging is over on every path: a signal from here on must not exit a finished export.
+      unwatchStaging(temp)
     }
 
     deps.print(`Exported ${records.length} record${records.length === 1 ? "" : "s"} (${namespaces.size} namespace${namespaces.size === 1 ? "" : "s"}) to ${dest}.`)
