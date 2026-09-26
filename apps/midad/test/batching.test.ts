@@ -13,7 +13,9 @@ import { join } from "node:path"
 import { parseDeployment } from "@mida/chain"
 import { POLICY_HASH_V1 } from "@mida/grant-advisor"
 import type { compileCheckpoint } from "@mida/compiler"
+import { StoreHttpError } from "@mida/api"
 import type { BatchReceipt } from "@mida/api"
+import { MidaError } from "@mida/protocol"
 import type { Address, Hex, SignedAgentCapabilityManifest } from "@mida/protocol"
 import {
   MidaHome,
@@ -35,8 +37,10 @@ import {
   addPendingAnchor,
   decideLane,
   followPendingAnchors,
+  keepPendingPlaintext,
   laneWhyText,
   pendingAnchors,
+  pendingPlaintext,
   rejectedAnchors,
 } from "../src/batching.js"
 import { setBatchingFlag } from "../src/network.js"
@@ -574,6 +578,79 @@ describe("followPendingAnchors — the ledger's follow-up", () => {
     } finally {
       await store.close()
     }
+  })
+
+  // in-11 R-7: a stale-epoch resubmission met by a store that could not say — busy, 5xx, a
+  // pending deny — must wait for the next pass unspent, not be recorded as finally rejected
+  // with its recoverable plaintext deleted.
+  describe("a stale-epoch resubmission that cannot get an answer waits unspent (in-11 R-7)", () => {
+    const homeWithStaleRejected = async (store: Awaited<ReturnType<typeof stubStore>>) => {
+      const home = new MidaHome(dir())
+      writeIdentity(home, "claude-code")
+      addPendingAnchor(home, { contextId: CONTEXT_ID, eventId: EVENT_ID, sessionId: SESSION_ID, agent: "claude-code", queuedAt: "2026-09-24T10:00:00.000Z" })
+      keepPendingPlaintext(home, CONTEXT_ID, { value: { type: "mida-checkpoint" }, kind: "EPISODE", source: "AGENT_INFERRED", tags: [] })
+      store.saves.set(CONTEXT_ID, { state: "REJECTED", reason: "BAD_EPOCH" })
+      return home
+    }
+
+    const resubmitWith = (store: Awaited<ReturnType<typeof stubStore>>, home: MidaHome, thrown: () => unknown) => {
+      const runtime = {
+        ...fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url }),
+        agent: () => ({ createBatched: async () => { throw thrown() } }),
+        reader: { hasAuthority: async () => true },
+      } as unknown as ServiceRuntime
+      const logged: Record<string, unknown>[] = []
+      return { runtime, logged }
+    }
+
+    for (const code of ["CHAIN_UNAVAILABLE", "INTERNAL_ERROR", "WRITE_DENIED"] as const) {
+      it(`a ${code} answer to the resubmission keeps the save waiting and the plaintext kept`, async () => {
+        const store = await stubStore()
+        try {
+          const home = await homeWithStaleRejected(store)
+          const { runtime, logged } = resubmitWith(store, home, () => new MidaError(code, "the answer never came"))
+          const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+          expect(counts).toEqual({ anchored: 0, rejected: 0, waiting: 1 })
+          // never recorded as rejected — and the retry cap is not spent on a non-answer
+          expect(rejectedAnchors(home)).toHaveLength(0)
+          expect(pendingAnchors(home)).toEqual([expect.objectContaining({ contextId: CONTEXT_ID })])
+          expect(pendingAnchors(home)[0]!.retries ?? 0).toBe(0)
+          expect(pendingPlaintext(home, CONTEXT_ID)).toBeDefined()
+          expect(logged).toHaveLength(0)
+        } finally {
+          await store.close()
+        }
+      })
+    }
+
+    it("a 5xx page with no Mida body waits unspent — any 5xx counts", async () => {
+      const store = await stubStore()
+      try {
+        const home = await homeWithStaleRejected(store)
+        const { runtime, logged } = resubmitWith(store, home, () => new StoreHttpError(503, "Service Unavailable"))
+        const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+        expect(counts.waiting).toBe(1)
+        expect(rejectedAnchors(home)).toHaveLength(0)
+        expect(pendingPlaintext(home, CONTEXT_ID)).toBeDefined()
+      } finally {
+        await store.close()
+      }
+    })
+
+    it("a store refusal that judges the save is still final — CAPABILITY_DENIED refuses", async () => {
+      const store = await stubStore()
+      try {
+        const home = await homeWithStaleRejected(store)
+        const { runtime, logged } = resubmitWith(store, home, () => new MidaError("CAPABILITY_DENIED", "no live grant"))
+        const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+        expect(counts).toEqual({ anchored: 0, rejected: 1, waiting: 0 })
+        expect(rejectedAnchors(home)).toEqual([expect.objectContaining({ contextId: CONTEXT_ID, reason: "BAD_EPOCH" })])
+        expect(pendingPlaintext(home, CONTEXT_ID)).toBeUndefined()
+        expect(logged).toEqual([expect.objectContaining({ outcome: "failed", reason: "batch-rejected:BAD_EPOCH" })])
+      } finally {
+        await store.close()
+      }
+    })
   })
 })
 

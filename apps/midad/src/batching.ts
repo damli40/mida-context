@@ -5,6 +5,7 @@ import type { CreateContextInput } from "@mida/sdk"
 import { PERMISSION, PROVENANCE_POLICY, namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import type { MidaHome } from "./home.js"
+import { isChainBusyError } from "./chain-busy.js"
 import { isRevoked, loadAgentIdentity } from "./keys.js"
 import { readSavedNetwork } from "./network.js"
 import type { SavedNetwork } from "./network.js"
@@ -372,14 +373,20 @@ async function resubmitStaleEpoch(
   try {
     queued = await requeue()
   } catch (error) {
-    // The wire code decides. errorFromBody keeps it on the thrown error for protocol codes and
-    // the batch route's own codes alike (CAPABILITY_DENIED, NOT_AN_AGENT, SIGNER_MISMATCH,
-    // ALREADY_QUEUED, ...): each is the store's judgement on this save — refused, never
-    // retried. The two exceptions wait instead of refusing: a rotation still in progress
-    // accepts no writes at all, and an answer that never arrived carries no code at all — the
-    // entry waits for the next pass, unspent. Only EPOCH_STALE, answering the resubmission
-    // itself with the very condition being retried, spends one against the cap.
+    // Only an answer that judges the SAVE may end it (in-11 R-7) — a wire code like
+    // CAPABILITY_DENIED, NOT_AN_AGENT, SIGNER_MISMATCH or ALREADY_QUEUED is the store's
+    // judgement and refuses, never retried. Everything that means "asked but could not say"
+    // waits for the next pass unspent, plaintext kept: the store's own CHAIN_UNAVAILABLE and
+    // INTERNAL_ERROR, any 5xx page, whatever the busy test recognises, and WRITE_DENIED — a
+    // staged deny can still be cancelled, so it parks the resubmission like a pending answer.
+    // EPOCH_ROTATION_REQUIRED waits the same way (a rotation accepts no writes at all), and an
+    // answer that never arrived carries no code. Only EPOCH_STALE — the very condition being
+    // retried answering the resubmission itself — spends one against the cap.
+    if (isChainBusyError(error)) return "retry-later"
     const code = (error as { code?: unknown }).code
+    if (code === "INTERNAL_ERROR" || code === "WRITE_DENIED") return "retry-later"
+    const status = (error as { status?: unknown }).status
+    if (typeof status === "number" && status >= 500 && status < 600) return "retry-later"
     if (code === "EPOCH_ROTATION_REQUIRED" || typeof code !== "string") return "retry-later"
     if (code !== "EPOCH_STALE") return "refused"
     setPendingAnchorRetries(home, entry.contextId, retries)
