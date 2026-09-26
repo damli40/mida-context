@@ -75,6 +75,12 @@ export interface ReadOwnerUniverseOptions {
   onProgress?: (done: number, total: number) => void
   /** When true, every returned record also carries the store's encrypted bytes under `encrypted`. */
   keepEncrypted?: boolean
+  /**
+   * Scan no further than this block — export reads the head first, then bounds every log scan
+   * to it, so the block number it reports is a true upper bound on what the folder holds.
+   * Absent means "to the chain's current head".
+   */
+  toBlock?: bigint
 }
 
 interface ReadFailure {
@@ -168,6 +174,7 @@ async function readBatchedUniverse(
   failures: ReadFailure[],
   onProgress?: (done: number, total: number) => void,
   keepEncrypted = false,
+  toBlock?: bigint,
 ): Promise<(SourceRecord & { lane: "batched" })[]> {
   const { deployment } = runtime.network
   const batchAnchor = deployment.batchAnchor
@@ -205,6 +212,7 @@ async function readBatchedUniverse(
     args: { owner: runtime.owner },
     // The anchor's own deployment block — a batched save cannot predate the contract.
     fromBlock: deployment.batchAnchorBlock ?? 0n,
+    ...(toBlock === undefined ? {} : { toBlock }),
   }, { maxRange: runtime.network.logBlockRange, onProgress })
   if (logs.length === 0) return []
 
@@ -379,11 +387,12 @@ export async function readOwnerUniverse(
     // The home's recorded first block (loadOwnerStartBlock, resolved at Runtime.open); a brand-new
     // owner's record cannot predate it, and the value never sits below the deployment block.
     fromBlock: runtime.ownerStartBlock,
+    ...(options?.toBlock === undefined ? {} : { toBlock: options.toBlock }),
   }, { maxRange: runtime.network.logBlockRange, onProgress: options?.onProgress })
 
   const keepEncrypted = options?.keepEncrypted === true
   const failures: ReadFailure[] = []
-  const batched = await readBatchedUniverse(runtime, failures, options?.onProgress, keepEncrypted)
+  const batched = await readBatchedUniverse(runtime, failures, options?.onProgress, keepEncrypted, options?.toBlock)
   if (logs.length === 0) {
     if (failures.length > 0) throw ownerReadIncomplete(failures)
     return batched

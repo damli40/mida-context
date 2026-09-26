@@ -525,14 +525,19 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
     }
     for (const file of files.slice(0, 3)) expect(statSync(file).mode & 0o777).toBe(0o600)
 
-    // Every secret in hex AND base64 form, against the raw bytes of every exported file —
-    // a key that leaked into ANY field of ANY file fails here.
+    // Every secret in every encoding a leak might take — raw bytes, hex (bare, 0x-prefixed,
+    // uppercase), base64 (padded, unpadded) and base64url — against the raw bytes of every
+    // exported file. A key that leaked into ANY field of ANY file fails here.
     const needles: Buffer[] = []
     for (const secret of secretBytes) {
+      const b64 = Buffer.from(secret).toString("base64")
       needles.push(Buffer.from(secret))
       needles.push(Buffer.from(hexOf(secret).slice(2), "utf8"))
       needles.push(Buffer.from(hexOf(secret), "utf8"))
-      needles.push(Buffer.from(Buffer.from(secret).toString("base64"), "utf8"))
+      needles.push(Buffer.from(hexOf(secret).slice(2).toUpperCase(), "utf8"))
+      needles.push(Buffer.from(b64, "utf8"))
+      needles.push(Buffer.from(b64.replace(/=+$/, ""), "utf8"))
+      needles.push(Buffer.from(Buffer.from(secret).toString("base64url"), "utf8"))
     }
     for (const file of files) {
       const bytes = readFileSync(file)

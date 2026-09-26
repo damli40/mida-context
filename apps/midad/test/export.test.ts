@@ -11,12 +11,15 @@ import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { HttpRequestError, keccak256, zeroHash } from "viem"
+import { Client } from "@modelcontextprotocol/sdk/client/index.js"
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { OWNER_AUTHOR_ID, canonicalBytes, namespaceId } from "@mida/protocol"
 import type { Hex, ObjectManifest } from "@mida/protocol"
 import {
   CLI_COMMANDS,
   MCP_TOOLS,
   MidaHome,
+  createMidaMcpServer,
   NEEDS_TERMINAL_LINE,
   OWNER_COMMANDS,
   USAGE,
@@ -74,6 +77,10 @@ function fakeRuntime(home: MidaHome, closed: { n: number } = { n: 0 }): Runtime 
     home,
     network,
     owner: OWNER,
+    // The real runtime holds the owner's key material in memory (the vault carries the seed and
+    // the passkey-shaped key) — the fake carries the same file's contents so a leak of anything
+    // the runtime holds is inside the no-secret scan's reach.
+    secrets: home.readJson("owner/secrets.json"),
     apiBaseUrl: "http://store.test",
     chain: {
       publicClient: {
@@ -427,6 +434,57 @@ describe("mida export — dispatch and refusals", () => {
     }
   })
 
+  it("a lineage with two children on one parent refuses — naming the lineage and both records", async () => {
+    // ex-2 X-9: `export-inconsistent` must say WHICH lineage and WHICH two records disagree —
+    // a refusal that names nothing cannot be investigated.
+    const parent = fixtureRecord()
+    const childA = fixtureRecord({ lineageId: parent.lineageId, parentId: parent.contextId, version: 2 })
+    const childB = fixtureRecord({ lineageId: parent.lineageId, parentId: parent.contextId, version: 3 })
+    const home = ownerHome()
+    const cwd = tempDir()
+    const dest = join(cwd, "backup")
+    const thrown = await exportRecords({
+      home,
+      network,
+      folder: dest,
+      cwd,
+      print: () => {},
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [parent, childA, childB],
+    }).catch((error: unknown) => error)
+    expect(thrown).toBeInstanceOf(Error)
+    expect((thrown as { code?: unknown }).code).toBe("export-inconsistent")
+    const message = (thrown as Error).message
+    expect(message).toContain(parent.lineageId)
+    expect(message).toContain(childA.contextId)
+    expect(message).toContain(childB.contextId)
+    expect(existsSync(dest)).toBe(false)
+  })
+
+  it("the universe is scanned only up to the block the export names — the head is read first", async () => {
+    // ex-2 X-9: the README's "export block" must bound the scan. fakeRuntime's chain answers 42 —
+    // the read must receive exactly that as toBlock, not whatever head the chain has moved to.
+    const home = ownerHome()
+    const cwd = tempDir()
+    const dest = join(cwd, "backup")
+    let seenToBlock = -1n
+    const result = await exportRecords({
+      home,
+      network,
+      folder: dest,
+      cwd,
+      print: () => {},
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async (_rt, _progress, toBlock) => {
+        seenToBlock = toBlock
+        return [fixtureRecord()]
+      },
+    })
+    expect(result.outcome).toBe("exported")
+    expect(seenToBlock).toBe(42n)
+    expect(readFileSync(join(dest, "README.md"), "utf8")).toContain("export block: 42")
+  })
+
   it("a parent that refuses the post-rename fsync still reports success — one warning, complete folder", async () => {
     // The export succeeded the moment the rename landed. A filesystem that refuses to open
     // the parent directory for fsync (here mode 0300: writable and enterable, not readable)
@@ -753,7 +811,11 @@ describe("mida export — the written folder", () => {
   })
 
   it("no file in the export carries any secret the home holds", async () => {
-    const secrets = [`0x${"77".repeat(32)}`, `0x${"88".repeat(64)}`]
+    // ex-2 X-9: the planted secrets are 0x7a…/0xff… — letters in the hex so the uppercase form is
+    // distinct, and 0xff so base64url ('_') genuinely differs from base64 ('/'). fakeRuntime
+    // loads the file, so the scan covers secrets the runtime under test really holds — a leak in
+    // ANY encoding of ANY byte fails.
+    const secrets = [`0x${"7a".repeat(32)}`, `0x${"ff".repeat(32)}`]
     const home = ownerHome()
     const cwd = tempDir()
     // drop secrets where the real home keeps them — the export must not touch them
@@ -769,21 +831,51 @@ describe("mida export — the written folder", () => {
       readUniverse: async () => [fixtureRecord()],
     })
     expect(result.outcome).toBe("exported")
+    const needles: Buffer[] = []
+    for (const secret of secrets) {
+      const raw = Buffer.from(secret.slice(2), "hex")
+      needles.push(raw)                                                        // the raw key bytes
+      needles.push(Buffer.from(secret.slice(2), "utf8"))                       // bare hex
+      needles.push(Buffer.from(secret, "utf8"))                                // 0x-prefixed hex
+      needles.push(Buffer.from(secret.slice(2).toUpperCase(), "utf8"))         // uppercase hex
+      needles.push(Buffer.from(raw.toString("base64"), "utf8"))                // padded base64
+      needles.push(Buffer.from(raw.toString("base64url"), "utf8"))             // base64url
+      needles.push(Buffer.from(raw.toString("base64").replace(/=+$/, ""), "utf8")) // unpadded base64
+    }
     const files = [join(dest, "README.md"), join(dest, "records.json"), join(dest, "records.md")]
     for (const name of readdirSync(join(dest, "encrypted"))) files.push(join(dest, "encrypted", name))
     for (const file of files) {
       const bytes = readFileSync(file)
-      for (const secret of secrets) {
-        expect(bytes.includes(secret.slice(2))).toBe(false)
-        expect(bytes.includes(Buffer.from(secret.slice(2), "hex").toString("base64"))).toBe(false)
+      for (const needle of needles) {
+        expect(bytes.includes(needle), `${file} contains key material`).toBe(false)
       }
     }
   })
 })
 
 describe("mida export — no agent path reaches it", () => {
-  it("the MCP tool list has no export tool", () => {
+  it("the MCP server lists no export tool and refuses an export-named call as unknown", async () => {
+    // Both halves of the guard: nothing named export is advertised, and actually calling one is
+    // the protocol's unknown-tool refusal — a server that added a handler would fail this.
     expect(MCP_TOOLS.map((tool) => tool.name).every((name) => !name.includes("export"))).toBe(true)
+    const server = createMidaMcpServer({
+      home: tempHome(),
+      agent: "codex",
+      project: tempDir(),
+      sessionId: "s-export",
+      daemonUp: false,
+    })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    const client = new Client({ name: "export-probe", version: "0" })
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)])
+    try {
+      const listed = await client.listTools()
+      expect(listed.tools.some((tool) => tool.name.includes("export"))).toBe(false)
+      await expect(client.callTool({ name: "mida_export", arguments: {} })).rejects.toThrow(/unknown tool/)
+    } finally {
+      await client.close()
+      await server.close()
+    }
   })
 
   it("the daemon's /cli route refuses it as an owner command", async () => {
@@ -810,6 +902,10 @@ describe("mida export — no agent path reaches it", () => {
       spawnDrainer: () => {},
     })
     expect(peekJobs(home)).toHaveLength(0)
+    // The refusal is the specific one — "unknown event is ignored" — not silence: a hook that
+    // enqueued on any event name would land a different outcome here (or a job above).
+    const hookLog = readFileSync(home.path("logs/hook.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line))
+    expect(hookLog.at(-1)).toMatchObject({ event: "export", outcome: "ignored", reason: "unknown-event" })
   })
 })
 

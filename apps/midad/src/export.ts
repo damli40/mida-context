@@ -52,8 +52,11 @@ export interface ExportDeps {
   now?: () => Date
   /** Test seam: the owner-runtime opener. Default: Runtime.open — which needs owner/secrets.json. */
   openRuntime?: (home: MidaHome, network: Network) => Promise<Runtime>
-  /** Test seam: the owner read. Default: readOwnerUniverse with keepEncrypted on. */
-  readUniverse?: (runtime: Runtime, onProgress: (done: number, total: number) => void) => Promise<SourceRecord[]>
+  /**
+   * Test seam: the owner read. Default: readOwnerUniverse with keepEncrypted on. `toBlock` is
+   * the already-read head — the universe must be scanned no further than it.
+   */
+  readUniverse?: (runtime: Runtime, onProgress: (done: number, total: number) => void, toBlock: bigint) => Promise<SourceRecord[]>
   /** Test seam: stop the export right after this step, as if the write had failed there. */
   stopAfter?: "staged" | "files"
 }
@@ -270,7 +273,11 @@ function supersededByMap(records: readonly SourceRecord[]): Map<string, Hex> {
       if (record.parentId === zeroHash) continue
       const parent = record.parentId.toLowerCase()
       if (childOf.has(parent)) {
-        throw codedError("export-inconsistent", `lineage ${lineage} has two records naming ${record.parentId} as parent`)
+        const first = childOf.get(parent)!
+        throw codedError(
+          "export-inconsistent",
+          `lineage ${lineage}: records ${first.contextId} and ${record.contextId} both name ${record.parentId} as parent`,
+        )
       }
       childOf.set(parent, record)
     }
@@ -687,9 +694,17 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
     const onProgress = (done: number, total: number): void => {
       deps.progress?.(`scanning the chain's record log — ${done} of ${total}`)
     }
+    // The export block is read FIRST and the scans stop at it: the README states this number as
+    // the upper bound of everything the folder holds, so the bound must be taken before the scan,
+    // not after — otherwise a save landing mid-scan could make the stated block newer than the
+    // data it claims to bound.
+    const blockNumber = await runtime.chain.publicClient.getBlockNumber({ cacheTime: 0 })
+    const block = await runtime.chain.publicClient.getBlock({ blockNumber })
     deps.progress?.("reading every record the chain attributes to you…")
-    const read = deps.readUniverse ?? ((rt, progress) => readOwnerUniverse(rt, { keepEncrypted: true, onProgress: progress }))
-    const records = await read(runtime, onProgress)
+    const read =
+      deps.readUniverse ??
+      ((rt, progress, toBlock) => readOwnerUniverse(rt, { keepEncrypted: true, onProgress: progress, toBlock }))
+    const records = await read(runtime, onProgress, blockNumber)
     for (const record of records) {
       if (record.encrypted === undefined) {
         throw codedError("export-incomplete", `record ${record.contextId} came back without its encrypted store bytes`)
@@ -704,8 +719,6 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
     const unreadableIds = entries.filter((entry) => entry.envelope === "unreadable").map((entry) => entry.contextId)
     const namespaces = new Set(entries.map((entry) => entry.namespace))
     const exportedAt = now.toISOString()
-    const blockNumber = await runtime.chain.publicClient.getBlockNumber({ cacheTime: 0 })
-    const block = await runtime.chain.publicClient.getBlock({ blockNumber })
     const queued = peekJobs(home).length
     // Two different waits, counted separately: queue/ is hook captures not yet saved, and
     // state/batch-pending.json is saves the store accepted but Monad has not anchored. The
