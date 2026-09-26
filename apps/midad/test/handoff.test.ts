@@ -924,6 +924,29 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     expect(result.text).toContain("Mida note: 1 newer save(s) from claude-code, 1 from codex have not reached Monad yet; this record may be behind them.")
   })
 
+  it("several queued jobs from one session count once — the drain merges them into one save (in-11 R-14)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-multi" })
+    job(dir, { sessionId: "sess-multi", event: "SessionEnd" }, "2026-09-25T10:00:01.000Z")
+    job(dir, { sessionId: "sess-other" }, "2026-09-25T10:00:02.000Z")
+    const { d } = deps(reads)
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("Mida note: 2 newer save(s) from claude-code have not reached Monad yet")
+    expect(result.text).not.toContain("3 newer save(s)")
+  })
+
+  it("a brand-new project's empty handoff still carries the queued-saves note", async () => {
+    const dir = queueHome()
+    job(dir)
+    const { d } = deps({ read: async () => ({ checkpoints: [], skipped: 0, milliseconds: 1, partial: false }) })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("empty")
+    expect(result.text).toContain("Nothing has been saved for this project yet")
+    expect(result.text).toContain("Mida note: 1 newer save(s) from claude-code have not reached Monad yet; this record may be behind them.")
+  })
+
   it("a job in another project, or a folder with no marker, is not counted", async () => {
     const dir = queueHome()
     job(dir, { cwd: projectFolder("other-project") })

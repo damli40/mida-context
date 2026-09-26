@@ -122,7 +122,9 @@ const QUEUE_NOTE_SCAN_LIMIT = 200
  * H4 — the handoff says when Mida's own newer saves have not left this machine yet. One bounded,
  * strictly read-only look at the hook queue: jobs belonging to THIS project (a folder with no
  * `.mida` marker, or a marker that cannot be read, tells us nothing and is skipped) are counted
- * per agent, and a session state showing a failed drain attempt adds the retry clause. The note
+ * per agent, and a session state showing a failed drain attempt adds the retry clause. The count
+ * is distinct SESSIONS, not jobs — the drain merges a session's jobs into one save, so counting
+ * jobs would overstate what is behind (in-11 R-14). The note
  * reports what is queued — it never removes, re-orders, waits on or triggers a job, and a queue
  * that cannot be read degrades to no line at all, never a refused handoff.
  */
@@ -133,7 +135,7 @@ function queuedSavesNote(home: MidaHome, projectId: string): string | null {
   } catch {
     return null
   }
-  const perAgent = new Map<string, number>()
+  const perAgent = new Map<string, Set<string>>()
   let lastTryFailed = false
   for (const job of jobs) {
     if (!isSafeName(job.agent)) continue
@@ -144,7 +146,9 @@ function queuedSavesNote(home: MidaHome, projectId: string): string | null {
       continue
     }
     if (jobProject !== projectId) continue
-    perAgent.set(job.agent, (perAgent.get(job.agent) ?? 0) + 1)
+    const sessions = perAgent.get(job.agent) ?? new Set<string>()
+    sessions.add(job.sessionId)
+    perAgent.set(job.agent, sessions)
     // the drainer records a failed try on the session's own state file — read-only, and an
     // unreadable or malformed state only loses the retry clause, never the count
     try {
@@ -153,8 +157,8 @@ function queuedSavesNote(home: MidaHome, projectId: string): string | null {
     } catch { /* keep the count, drop the clause */ }
   }
   if (perAgent.size === 0) return null
-  const parts = [...perAgent.entries()].map(([name, count], index) =>
-    index === 0 ? `${count} newer save(s) from ${name}` : `${count} from ${name}`,
+  const parts = [...perAgent.entries()].map(([name, sessions], index) =>
+    index === 0 ? `${sessions.size} newer save(s) from ${name}` : `${sessions.size} from ${name}`,
   )
   return `Mida note: ${parts.join(", ")} have not reached Monad yet; this record may be behind them${lastTryFailed ? " (the last try failed; Mida keeps retrying)" : ""}.`
 }
@@ -420,9 +424,13 @@ export async function buildHandoff(
     // owner's line adds "(incomplete — try again in a moment)", the daemon log records it.
     if (merged === null) {
       if (pending.length === 0) {
+        // A brand-new project is exactly where the queued-saves note matters most: the record is
+        // empty AND undelivered saves sit in the queue — the model must hear both halves (R-14).
         return {
           kind: "empty",
-          text: outcome.partial ? `Mida: connected. ${PARTIAL_LINE}` : EMPTY_TEXT,
+          text: [outcome.partial ? `Mida: connected. ${PARTIAL_LINE}` : EMPTY_TEXT, pendingSavesNote]
+            .filter((line): line is string => line !== undefined)
+            .join("\n"),
           facts: facts.length,
           factsFailed,
           readMs,
@@ -494,7 +502,7 @@ export async function buildHandoff(
       if (pending.length === 0) return rendered.text
       // inside the fence, before the END line — the marked pending blocks sit beside the merged
       // sections, each under its own "not yet anchored" marker; the header's save time is the
-      // anchored merge's chain stamp, which is exactly what it claims to be
+      // anchored merge's newest effective instant, which is exactly what it claims to be
       return rendered.text.includes(`\n\n${HANDOFF_TAIL}`)
         ? rendered.text.replace(`\n\n${HANDOFF_TAIL}`, `\n\n${pendingText}\n\n${HANDOFF_TAIL}`)
         : `${rendered.text}\n\n${pendingText}`
