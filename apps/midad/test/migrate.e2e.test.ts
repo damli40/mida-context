@@ -263,7 +263,13 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
       }
       expect(handoffAfter.text).toContain(MOVED_ON)
       expect(handoffAfter.text).toContain("claude-code")
-      expect(handoffAfter.text).toContain("2026-09-21T10:00:00.000Z")
+      // the moved record's displayed instant is its ORIGINAL write time — the stamp the source
+      // chain put on the record, carried by the sealed envelope (in-12 N-1: not the checkpoint's
+      // createdAt claim, which is untrusted writer content and never renders)
+      const sourceStamp = await new RegistryReader({ publicClient, deployment: source }).getRecord(seeded.seed.checkpointId)
+      expect(sourceStamp).not.toBeNull()
+      const originalWriteInstant = new Date(Number(sourceStamp!.createdAt) * 1000).toISOString()
+      expect(handoffAfter.text).toContain(originalWriteInstant)
       expect(handoffAfter.savedBy).toBe(handoffBefore.savedBy)
       expect(handoffAfter.savedAt).toBe(handoffBefore.savedAt)
 

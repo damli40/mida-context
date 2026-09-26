@@ -29,8 +29,9 @@ const ageText = (savedMs: number, nowMs: number): string => {
 /**
  * The guidance ahead of the fence — built per render, never a fixed string. The save time is
  * `savedAtUtc`: the merge's newest effective chain-placed instant — a migrated save reports
- * when it was written, not the move day (in-11 R-10) — NOT a writer's own createdAt claim, so a
- * null or unparseable value renders the honest "not yet confirmed" form rather than a guess.
+ * when it was written, not the move day (in-12 N-1 keeps in-11 R-10) — NOT a writer's own
+ * createdAt claim, so a null or unparseable value renders the honest "not yet confirmed"
+ * form rather than a guess.
  * `nowMs` is an injectable clock (milliseconds) so the age wording is testable. Exported because
  * the daemon's pending-only handoff needs the same honest preamble when no merge exists at all.
  */

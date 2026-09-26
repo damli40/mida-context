@@ -230,11 +230,34 @@ describe("mergeCheckpoints", () => {
     expect(same.provenance.map((row) => row.contextId)).toEqual([first.contextId, second.contextId])
   })
 
+  it("a save carrying an older claim that landed LATER on chain is the current one (in-12 N-1)", () => {
+    // A real compile stamps the writer's clock before the write is sent — a queued hook save
+    // drained late, or a machine clock a minute slow, carries an honest claim that predates
+    // its own anchor. Ordering on the claim would crown the save that landed EARLIER; the
+    // chain's own stamp is the only clock that decides.
+    const landedFirst = stored({
+      sessionId: "s-first", at: "2026-09-21T14:15:00.000Z", objective: "landed first", progress: ["p"],
+      chain: { at: 1_790_000_100n, block: 100n, index: 0 },
+    })
+    const landedLast = stored({
+      // written 5 seconds earlier than it reports? no — CLAIMS two minutes earlier, lands LATER
+      sessionId: "s-last", at: "2026-09-21T14:13:00.000Z", objective: "landed last — the current save", progress: ["p"],
+      chain: { at: 1_790_000_105n, block: 110n, index: 0 },
+    })
+    for (const order of [[landedFirst, landedLast], [landedLast, landedFirst]] as const) {
+      const m = mergeCheckpoints([...order])!
+      expect(m.objective).toBe("landed last — the current save")
+      expect(m.otherSessions[0]).toMatchObject({ sessionId: "s-first" })
+    }
+    // and the header reports the chain stamp, not either writer's clock
+    expect(mergeCheckpoints([landedFirst, landedLast])!.savedAt).toBe(new Date(1_790_000_105_000).toISOString())
+  })
+
   it("a migration envelope dated 2099 cannot make its save the session's newest (I0)", () => {
     // The envelope is encrypted content the saver controls — the same untrusted channel as
     // checkpoint.createdAt. A save replayed at Monad's time S may CLAIM its original record is
-    // far newer; the ordering stamp is min(claim, S), so a forged envelope can only age the
-    // save that carries it — the chain-later save stays the session's newest.
+    // far newer; the ordering stamp is min(envelope original, S), so a forged envelope can only
+    // age the save that carries it — the chain-later save stays the session's newest.
     const forged = stored({
       sessionId: "s-1", at: "2026-09-21T10:00:00.000Z", objective: "forged-envelope save", progress: ["p"],
       chain: { at: 1_700_000_000n, block: 5n, index: 0 },
@@ -416,7 +439,7 @@ describe("mergeCheckpoints", () => {
     expect(m.savedAt).toBe("2026-09-21T10:00:00.000Z")
   })
 
-  it("an unmoved record beside a moved one shows its own write claim — only the moved time is lowered by the envelope (R-10)", () => {
+  it("an unmoved record beside a moved one shows its chain stamp — only the moved time is lowered by the envelope (R-10 + N-1)", () => {
     const moved = stored({
       sessionId: "s-moved", at: "2026-09-24T10:00:00.000Z", objective: "moved save", progress: ["p"],
       chain: { at: 1_800_000_000n, block: 9n, index: 0 },
@@ -427,9 +450,11 @@ describe("mergeCheckpoints", () => {
       chain: { at: 1_800_000_100n, block: 10n, index: 0 },
     })
     const m = mergeCheckpoints([moved, honest])!
-    // the honest save is newer: header + its row show its own write claim (an honest claim
-    // predates its anchor), while the moved save's row shows its original write day instead
-    expect(m.savedAt).toBe("2026-09-24T11:00:00.000Z")
+    // the honest save is newer: header + its row show Monad's own stamp — the writer's claim
+    // never enters an unmoved record's time — while the moved save's row shows its original
+    // write day instead
+    expect(m.savedAt).toBe(new Date(1_800_000_100_000).toISOString())
+    expect(m.provenance.at(-1)!.createdAt).toBe(new Date(1_800_000_100_000).toISOString())
     expect(m.otherSessions[0]!.sessionId).toBe("s-moved")
     expect(m.otherSessions[0]!.lastSavedAt).toBe("2026-09-21T10:00:00.000Z")
   })
@@ -441,15 +466,15 @@ describe("mergeCheckpoints", () => {
     })
     moved.migration = envelope("2099-01-01T00:00:00.000Z")
     const m = mergeCheckpoints([moved])!
-    // the envelope may only AGE its record — the 2099 claim collapses to the record's own
-    // honest createdAt, and nothing is displayed past the chain stamp
-    expect(m.provenance[0]!.createdAt).toBe("2026-09-24T10:00:00.000Z")
-    expect(m.savedAt).toBe("2026-09-24T10:00:00.000Z")
+    // the envelope may only AGE its record — the 2099 claim collapses to the replay's own
+    // chain stamp, and nothing is displayed past it
+    expect(m.provenance[0]!.createdAt).toBe(new Date(1_800_000_000_000).toISOString())
+    expect(m.savedAt).toBe(new Date(1_800_000_000_000).toISOString())
   })
 
   it("a checkpoint's own forged-future createdAt collapses to the chain stamp (R-10)", () => {
-    // The writer's claim joins the same only-ages rule as the envelope: a save stamped Jan 2027
-    // that claims 2099 displays Monad's stamp — never the claim.
+    // The writer's claim never enters an unmoved record's time at all (N-1): a save stamped
+    // Jan 2027 that claims 2099 displays Monad's stamp — never the claim.
     const forged = stored({
       sessionId: "s-forged", at: "2099-01-01T00:00:00.000Z", objective: "forged clock", progress: ["p"],
       chain: { at: 1_800_000_000n, block: 9n, index: 0 },
