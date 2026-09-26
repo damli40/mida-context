@@ -435,11 +435,13 @@ describe("a batched getRecords anchor check", () => {
     let last: Response | undefined
     const client = clientFor(app, async (url, init) => (last = await app.request(url, init)))
     // in-6 R4: an unanswered chain read is 503 CHAIN_UNAVAILABLE — still an error, never data,
-    // but no longer wearing an authorization code (a busy RPC is not a denial)
+    // but no longer wearing an authorization code (a busy RPC is not a denial). in-11 R-8
+    // narrows that mapping: a bare revert is the chain ANSWERING — an honest 500 INTERNAL_ERROR,
+    // not an availability problem.
     await expect(
       client.request("GET", `/objects?owner=${owner}&namespaceId=${NAMESPACE}`),
-    ).rejects.toMatchObject({ code: "CHAIN_UNAVAILABLE" })
-    expect(last!.status).toBe(503)
+    ).rejects.toMatchObject({ code: "INTERNAL_ERROR" })
+    expect(last!.status).toBe(500)
   })
 })
 
