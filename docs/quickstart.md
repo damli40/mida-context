@@ -50,7 +50,7 @@ usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | 
 mida init
 ```
 
-What it does: generates your owner wallet and one identity per agent (`claude-code`, `codex`, `devin`, `assistant`), registers them on Monad testnet, and starts the local daemon (`midad`). With the sponsor on — the default — every send is paid by the sponsor; your wallets can stay empty.
+What it does: generates your owner wallet and one identity per agent (`claude-code`, `codex`, `assistant`), registers them on Monad testnet, and starts the local daemon (`midad`). With the sponsor on — the default — every send is paid by the sponsor; your wallets can stay empty. (Devin is not among them: `mida install devin` registers that identity when you install the tool.)
 
 Expected output:
 
@@ -59,12 +59,10 @@ registering your key on the chain…
 opening 3 context areas (3 transactions)…
 registering claude-code on the chain…
 registering codex on the chain…
-registering devin on the chain…
 registering assistant on the chain…
 owner 0x<40 hex>
 agent claude-code 0x<64 hex>
 agent codex 0x<64 hex>
-agent devin 0x<64 hex>
 agent assistant 0x<64 hex>
 ```
 
@@ -394,7 +392,7 @@ The honest limits:
 
 ## 14. Devin — a third hook client — NOT RUN
 
-Devin is a hook client like Codex, not an MCP client: `mida install devin` merges Mida's hook block into `~/.config/devin/config.json` (under `"hooks"`, the same shape as Claude Code's block — session start and prompts run `mida-inject devin`; `PostToolUse`, `Stop`, `PostCompaction` and `SessionEnd` run `mida-hook devin`) and the `devin` identity `mida init` provisioned is its own — `mida approve devin` / `mida revoke devin` act on it alone. There is no trust step.
+Devin is a hook client like Codex, not an MCP client: `mida install devin` merges Mida's hook block into `~/.config/devin/config.json` (under `"hooks"`, the same shape as Claude Code's block — session start and prompts run `mida-inject devin`; `PostToolUse`, `Stop`, `PostCompaction` and `SessionEnd` run `mida-hook devin`). `mida install devin` is an owner command — it also registers the `devin` identity on the chain (one transaction), so no separate `mida init` step provisions it — and the identity is its own: `mida approve devin` / `mida revoke devin` act on it alone. There is no trust step.
 
 ```bash
 mida install devin

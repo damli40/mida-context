@@ -46,7 +46,9 @@ describe("owner command progress lines", () => {
     expect(at("opening 3 context areas (3 transactions)…")).toBeGreaterThan(at("registering your key on the chain…"))
     expect(at("registering claude-code on the chain…")).toBeGreaterThan(at("opening 3 context areas (3 transactions)…"))
     expect(at("registering codex on the chain…")).toBeGreaterThan(at("registering claude-code on the chain…"))
-    expect(at("registering devin on the chain…")).toBeGreaterThan(at("registering codex on the chain…"))
+    // devin is not an init identity since c8ddd1f — `mida install devin` registers it; init's
+    // third identity is assistant
+    expect(at("registering assistant on the chain…")).toBeGreaterThan(at("registering codex on the chain…"))
   }, 300_000)
 
   it("approve narrates the reads and the send, in order", async () => {

@@ -111,7 +111,10 @@ describe("ownerRefusalLine (R4-5)", () => {
     expect(line).not.toContain("boom")
   })
 
-  it("a bare viem failure — the chain could not be asked — is the busy line, never an authorization answer (in-6 R4)", () => {
+  // in-11 R-8 narrowed "busy" to failures a retry can honestly change — a bare viem failure
+  // carries no such signal, so it is the honest chain-call-failed line, not "try again in a
+  // moment" and never an authorization answer (in-6 R4 still: no code leaks, never "ERROR")
+  it("a bare viem failure names the setup's contract and the debug flag — not 'busy' (in-11 R-8)", () => {
     const line = ownerRefusalLine(
       "approve",
       "codex",
@@ -119,8 +122,9 @@ describe("ownerRefusalLine (R4-5)", () => {
       undefined,
       "0xf07d000000000000000000000000000000000042",
     )
-    expect(line).toBe("Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again")
+    expect(line).toBe("the chain call failed — this setup's contract is 0xf07d…; run with MIDA_DEBUG=1 to see why")
     expect(line).not.toContain("boom")
+    expect(line).not.toContain("busy")
   })
 })
 
