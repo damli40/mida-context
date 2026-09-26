@@ -226,7 +226,9 @@ describe("migrated facts in the fact list (migrate B2)", () => {
         read: async (_owner: string, namespace: string) => (namespace === "preferences.communication" ? objects : []),
       }),
       reader: {
-        getRecord: async () => ({ author: OWNER_AUTHOR_ID, provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED, createdAt: 1_758_000_000n }),
+        // a real RegistryRecord always carries parentId (zeroHash on a root); readOwnerFacts
+        // dereferences it, so the stub has to answer like the chain does
+        getRecord: async () => ({ author: OWNER_AUTHOR_ID, provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED, createdAt: 1_758_000_000n, parentId: `0x${"00".repeat(32)}` }),
       },
     } as unknown as ServiceRuntime
   }
@@ -287,6 +289,7 @@ describe("migrated facts in the fact list (migrate B2)", () => {
           author: OWNER_AUTHOR_ID,
           provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED,
           createdAt: chainTime.get(contextId)!,
+          parentId: `0x${"00".repeat(32)}`,
         }),
       },
     } as unknown as ServiceRuntime
