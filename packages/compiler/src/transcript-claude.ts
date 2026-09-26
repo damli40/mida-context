@@ -66,7 +66,8 @@ const THINKING_CHARS = 1_000
 // same ~6 KB the request cap budgets for).
 const SUMMARY_HEAD_CHARS = 2_000
 const SUMMARY_TAIL_CHARS = 4_000
-const cutSummary = (s: string): string =>
+/** Two-ended summary cut shared by the devin reader's compaction pin — keep both ends. */
+export const cutSummary = (s: string): string =>
   s.length <= SUMMARY_HEAD_CHARS + SUMMARY_TAIL_CHARS
     ? s
     : `${s.slice(0, SUMMARY_HEAD_CHARS)}\n[… middle of the summary cut …]\n${s.slice(-SUMMARY_TAIL_CHARS)}`

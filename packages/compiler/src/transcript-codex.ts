@@ -22,6 +22,7 @@
 import { scrubSecrets, scrubTranscript, scrubValue } from "./scrub.js"
 import { readConversation } from "./transcript-claude.js"
 import type { Conversation } from "./transcript-claude.js"
+import { readDevinConversation } from "./transcript-devin.js"
 import {
   FIRST_USER_CHARS,
   PART_CHARS,
@@ -298,5 +299,6 @@ export function readTranscriptFor(
 ): Conversation | null {
   if (agent === "codex") return readCodexConversation(path, options)
   if (agent === "claude-code") return readConversation(path, options)
+  if (agent === "devin") return readDevinConversation(path, options)
   return null
 }

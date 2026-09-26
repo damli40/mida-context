@@ -12,6 +12,10 @@
 // silent skip.
 
 import { createRequire } from "node:module"
+import { scrubSecrets, scrubValue } from "./scrub.js"
+import { cutSummary } from "./transcript-claude.js"
+import type { Conversation } from "./transcript-claude.js"
+import { FIRST_USER_CHARS, PART_CHARS, cut, fitMessages, hardCut } from "./transcript-lines.js"
 
 /**
  * The narrow slice of node:sqlite's DatabaseSync this file uses — declared here
@@ -191,5 +195,271 @@ export function devinSessionStat(
     } catch {
       // a close that fails leaves nothing behind — the handle was read-only
     }
+  }
+}
+
+// ── the reader ─────────────────────────────────────────────────────────────
+// The conversation a job asks for is ONE chain in the node graph: walk
+// parent_node_id from sessions.main_chain_id back to its root — every other
+// node (side branches, earlier compacted chains) is ignored for rendering.
+// The earliest chain still owns the original request, and a chain that opens
+// on a system prefix following an earlier chain pins its root's content the
+// way the Claude reader pins a /compact summary.
+//
+// A wrong guess about Devin's internals must degrade to "current chain only",
+// never to a crash or out-of-order text: a broken parent link ends the walk,
+// an unparseable chat_message row is skipped, and a session with no
+// main_chain_id answers unknown-tail like an unreadable file.
+
+/** The chat_message JSON, typed only as far as the reader looks. */
+interface DevinChatMessage {
+  role?: unknown
+  content?: unknown
+  metadata?: unknown
+  tool_calls?: unknown
+  tool_call_id?: unknown
+  thinking?: unknown
+  phase?: unknown
+}
+
+const parseMessage = (raw: string): DevinChatMessage | null => {
+  try {
+    const obj = JSON.parse(raw) as DevinChatMessage | null
+    return obj !== null && typeof obj === "object" ? obj : null
+  } catch {
+    return null // a truncated or non-JSON row — skip it, never read as conversation
+  }
+}
+
+const parseNodeMeta = (raw: string | null): Record<string, unknown> => {
+  if (raw === null) return {}
+  try {
+    const obj = JSON.parse(raw) as Record<string, unknown> | null
+    return obj !== null && typeof obj === "object" && !Array.isArray(obj) ? obj : {}
+  } catch {
+    return {}
+  }
+}
+
+/** metadata.is_user_input === true — the ONLY mark of the owner speaking. */
+const isUserInput = (msg: DevinChatMessage): boolean => {
+  const meta = msg.metadata
+  return (
+    typeof meta === "object" && meta !== null &&
+    (meta as Record<string, unknown>).is_user_input === true
+  )
+}
+
+/** One tool call on an assistant message — name + arguments, capped like the Codex reader. */
+const toolCallBlock = (label: string, call: unknown): string | null => {
+  if (typeof call !== "object" || call === null) return null
+  const c = call as Record<string, unknown>
+  const name = typeof c.name === "string" && c.name !== "" ? c.name : "?"
+  let detail = ""
+  try {
+    // scrubValue before stringify — a secret under a sensitive key name survives
+    // the string-level scrub once JSON-escaped
+    detail = JSON.stringify(scrubValue(c.arguments ?? null)) ?? ""
+  } catch {
+    detail = ""
+  }
+  const body = cut(scrubSecrets(`${name} ${detail}`.trimEnd()), PART_CHARS)
+  return body === "" ? null : `N${label} tool:\n${body}`
+}
+
+/**
+ * The chain root→tip for one tip node id. A missing or cyclic parent ends the
+ * walk at whatever was collected — the chain simply reads shorter, never wrong.
+ */
+function chainFor(byId: Map<number, DevinNodeRow>, tipId: number): DevinNodeRow[] {
+  const chain: DevinNodeRow[] = []
+  const seen = new Set<number>()
+  let cur = byId.get(tipId)
+  while (cur !== undefined && !seen.has(cur.nodeId)) {
+    seen.add(cur.nodeId)
+    chain.unshift(cur)
+    cur = cur.parentNodeId === null ? undefined : byId.get(cur.parentNodeId)
+  }
+  return chain
+}
+
+/** Every node whose root-ward walk ends at `rootId` — the chain that root heads. */
+function chainRootedAt(byId: Map<number, DevinNodeRow>, nodes: DevinNodeRow[], rootId: number): DevinNodeRow[] {
+  const rootOf = (n: DevinNodeRow): number | null => {
+    const seen = new Set<number>()
+    let cur: DevinNodeRow | undefined = n
+    while (cur !== undefined && !seen.has(cur.nodeId)) {
+      seen.add(cur.nodeId)
+      if (cur.parentNodeId === null) return cur.nodeId
+      cur = byId.get(cur.parentNodeId)
+    }
+    return null // a broken link: this node belongs to no readable chain
+  }
+  return nodes.filter((n) => rootOf(n) === rootId).sort((a, b) => a.nodeId - b.nodeId)
+}
+
+/**
+ * The session's conversation as the normalized Conversation type. `dbPath` is the
+ * sessions database; `sessionId` picks the session — a miss raises
+ * DevinSessionNotFoundError, whose code the drain files as permanent.
+ */
+export function readDevinConversation(
+  dbPath: string,
+  options: {
+    maxChars?: number
+    /** The earlier checkpoint's kept originalRequest — heads the render when the store holds none. */
+    preferRequest?: string | null
+    /** The session the job named — required; the store is read only for its rows. */
+    sessionId?: string
+    open?: OpenDevinDb
+  } = {},
+): Conversation {
+  const { maxChars = 40_000 } = options
+  const open = options.open ?? openDevinDb
+  const sessionId = options.sessionId ?? ""
+  const db = open(dbPath)
+  let session: DevinSessionRow
+  let nodes: DevinNodeRow[]
+  try {
+    session = readSession(db, sessionId)
+    nodes = readNodes(db, sessionId)
+  } finally {
+    try {
+      db.close()
+    } catch {
+      // see above — read-only close, nothing to lose
+    }
+  }
+
+  const cwds = session.workingDirectory === null ? [] : [session.workingDirectory]
+  const empty: Conversation = {
+    format: "unknown-tail",
+    text: "",
+    firstUserMessage: null,
+    openedWithScaffolding: false,
+    cwds,
+    messagesKept: 0,
+    messagesTotal: 0,
+    omitted: 0,
+  }
+  if (session.mainChainId === null) return empty
+
+  const byId = new Map<number, DevinNodeRow>()
+  for (const n of nodes) byId.set(n.nodeId, n)
+  const chain = chainFor(byId, session.mainChainId)
+  if (chain.length === 0) return empty
+  const root = chain[0]!
+  const rootMsg = parseMessage(root.chatMessage)
+  const rootMeta = parseNodeMeta(root.metadata)
+
+  // Compaction: the current chain opens on a system prefix that follows an
+  // earlier chain — witnessed by another (lower) root in the session or by the
+  // root's own summarized_from link. Its content is the condensed history and
+  // is pinned beside the request like the Claude reader's /compact block.
+  const summarizedFrom = intOf(rootMeta.summarized_from)
+  const isPrefix = rootMeta.is_system_prefix === 1 || rootMeta.is_system_prefix === true
+  const earlierRootExists = nodes.some((n) => n.parentNodeId === null && n.nodeId < root.nodeId)
+  const isCompactionRoot =
+    rootMsg?.role === "system" && (summarizedFrom !== null || (isPrefix && earlierRootExists))
+  const summaryBlock =
+    isCompactionRoot && typeof rootMsg?.content === "string" && rootMsg.content !== ""
+      ? `N${root.nodeId} system — Summary of the earlier session (from compaction):\n${cutSummary(scrubSecrets(rootMsg.content))}`
+      : null
+
+  // The original request: the first is_user_input user message of the EARLIEST
+  // chain — the chain rooted at the session's lowest root — kept verbatim
+  // across compactions like the Claude reader's originalRequest.
+  const earliestRootId = nodes
+    .filter((n) => n.parentNodeId === null)
+    .reduce<number | null>((low, n) => (low === null || n.nodeId < low ? n.nodeId : low), null)
+  const earliestChain = earliestRootId === null ? [] : chainRootedAt(byId, nodes, earliestRootId)
+  let earliestRequest: string | null = null
+  let earliestRequestNode: DevinNodeRow | null = null
+  let openedWithScaffolding = false
+  for (const n of earliestChain) {
+    const msg = parseMessage(n.chatMessage)
+    if (msg?.role !== "user") continue
+    if (isUserInput(msg)) {
+      if (typeof msg.content === "string" && msg.content !== "") {
+        earliestRequest = msg.content
+        earliestRequestNode = n
+      }
+      break // the first real input decides; an empty one still ends the search
+    }
+    openedWithScaffolding = true // an injected user turn sat before the owner's first words
+  }
+  const firstUserMessage = earliestRequest === null ? null : hardCut(scrubSecrets(earliestRequest), FIRST_USER_CHARS)
+
+  // Render the CURRENT chain only — side branches and earlier chains are not
+  // this conversation. messagesTotal counts every user/assistant/tool node in
+  // it, rendered or not (system and thinking never render).
+  const msgs: { role: string; block: string }[] = []
+  let messagesTotal = 0
+  let pinIdx: number | undefined
+  for (const n of chain) {
+    const msg = parseMessage(n.chatMessage)
+    if (msg === null || msg.role === "system") continue
+    const label = String(n.nodeId)
+    if (msg.role === "user") {
+      messagesTotal++
+      if (!isUserInput(msg)) continue // system-injected: bookkeeping, not the owner
+      if (typeof msg.content !== "string" || msg.content === "") continue
+      const picked = n === earliestRequestNode
+      const body = picked ? scrubSecrets(msg.content) : cut(scrubSecrets(msg.content), PART_CHARS)
+      msgs.push({ role: "user", block: `N${label} user:\n${body}` })
+      if (picked) pinIdx = msgs.length - 1
+      continue
+    }
+    if (msg.role === "assistant") {
+      messagesTotal++
+      if (typeof msg.content === "string" && msg.content !== "") {
+        msgs.push({ role: "assistant", block: `N${label} assistant:\n${cut(scrubSecrets(msg.content), PART_CHARS)}` })
+      }
+      if (Array.isArray(msg.tool_calls)) {
+        for (const call of msg.tool_calls) {
+          const block = toolCallBlock(label, call)
+          if (block !== null) msgs.push({ role: "tool", block })
+        }
+      }
+      continue
+    }
+    if (msg.role === "tool") {
+      messagesTotal++
+      if (typeof msg.content === "string" && msg.content !== "") {
+        msgs.push({ role: "tool-result", block: `N${label} tool-result:\n${cut(scrubSecrets(msg.content), PART_CHARS)}` })
+      }
+      continue
+    }
+    // thinking, unknown roles and parse failures: bookkeeping — left out.
+  }
+
+  // The request's place in the render: when it lives in the current chain it is
+  // the pinned block itself; across a compaction it is not a block at all, so it
+  // takes the lead slot labelled for what it is — exactly the way the kept
+  // earlier-checkpoint request heads a scaffolded file (M1).
+  const ownRequest =
+    firstUserMessage !== null && pinIdx === undefined
+      ? `user — original request (kept from the earlier chain):\n${firstUserMessage}`
+      : null
+  const keptHead =
+    ownRequest ??
+    (options.preferRequest !== undefined &&
+    options.preferRequest !== null &&
+    (openedWithScaffolding || firstUserMessage === null)
+      ? `user — original request (kept from the earlier checkpoint):\n${hardCut(scrubSecrets(options.preferRequest), FIRST_USER_CHARS)}`
+      : null)
+
+  if (msgs.length === 0 && summaryBlock === null && keptHead === null) return empty
+
+  const fitted = fitMessages(msgs, maxChars, false, keptHead === null ? pinIdx : undefined, summaryBlock, keptHead)
+  return {
+    format: "devin-sqlite",
+    text: fitted.text,
+    firstUserMessage,
+    openedWithScaffolding,
+    cwds,
+    messagesKept: fitted.messagesKept,
+    messagesTotal,
+    omitted: fitted.omitted,
   }
 }
