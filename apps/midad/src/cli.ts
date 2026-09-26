@@ -357,6 +357,9 @@ export async function runCliWithRuntime(
           ? generalAssistanceText(agent)
           : `${agent} is already approved on chain. To use it in THIS folder, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`,
       )
+    } else if (code === "chain-busy") {
+      // the chain could not be asked at all — the same owner-facing line ownerRefusalLine prints
+      print("Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again")
     } else if (code === "CHAIN_CALL_FAILED") {
       print(`the chain call failed — this setup's contract is ${runtime.chain.deployment.capabilityRegistry.slice(0, 6)}…; run with MIDA_DEBUG=1 to see why`)
     } else if (code === "agent-not-setup") {

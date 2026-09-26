@@ -98,7 +98,20 @@ describe("ownerRefusalLine (R4-5)", () => {
     expect(ownerRefusalLine("approve", "codex", "not even an error")).toBe("refused: UNEXPECTED")
   })
 
-  it("a chain call failure names the setup's contract and the debug flag (CHAIN-09)", () => {
+  it("a coded CHAIN_CALL_FAILED names the setup's contract and the debug flag (CHAIN-09)", () => {
+    const line = ownerRefusalLine(
+      "approve",
+      "codex",
+      coded("CHAIN_CALL_FAILED"),
+      undefined,
+      "0xf07d000000000000000000000000000000000042",
+    )
+    expect(line).toBe("the chain call failed — this setup's contract is 0xf07d…; run with MIDA_DEBUG=1 to see why")
+    expect(line).not.toContain("ERROR")
+    expect(line).not.toContain("boom")
+  })
+
+  it("a bare viem failure — the chain could not be asked — is the busy line, never an authorization answer (in-6 R4)", () => {
     const line = ownerRefusalLine(
       "approve",
       "codex",
@@ -106,8 +119,7 @@ describe("ownerRefusalLine (R4-5)", () => {
       undefined,
       "0xf07d000000000000000000000000000000000042",
     )
-    expect(line).toBe("the chain call failed — this setup's contract is 0xf07d…; run with MIDA_DEBUG=1 to see why")
-    expect(line).not.toContain("ERROR")
+    expect(line).toBe("Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again")
     expect(line).not.toContain("boom")
   })
 })

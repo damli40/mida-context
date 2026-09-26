@@ -861,14 +861,26 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
       },
     }) as unknown as ServiceRuntime
 
-  it("a chain error prints the contract line, never refused: ERROR", async () => {
+  it("a coded chain error prints the contract line, never refused: ERROR", async () => {
     const lines: string[] = []
-    const code = await runCliWithRuntime(["request", "claude-code"], stubRuntime(new BaseError("boom")), (line) => lines.push(line))
+    const thrown = new Error("chain refused") as Error & { code: string }
+    thrown.code = "CHAIN_CALL_FAILED"
+    const code = await runCliWithRuntime(["request", "claude-code"], stubRuntime(thrown), (line) => lines.push(line))
     expect(code).toBe(1)
     expect(lines).toEqual([
       "the chain call failed — this setup's contract is 0xf07d…; run with MIDA_DEBUG=1 to see why",
     ])
     expect(lines.join("\n")).not.toContain("ERROR")
+  })
+
+  it("a bare viem failure — the chain could not be asked — is the busy line, never 'not approved' (in-6 R4)", async () => {
+    const lines: string[] = []
+    const code = await runCliWithRuntime(["request", "claude-code"], stubRuntime(new BaseError("boom")), (line) => lines.push(line))
+    expect(code).toBe(1)
+    expect(lines).toEqual([
+      "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again",
+    ])
+    expect(lines.join("\n")).not.toContain("not approved")
   })
 
   it("a non-chain error is refused: UNEXPECTED, never refused: ERROR", async () => {
@@ -888,7 +900,7 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     )
     expect(code).toBe(1)
     expect(lines.filter((line) => line.startsWith("debug:"))).toHaveLength(1)
-    expect(lines[0]).toBe("the chain call failed — this setup's contract is 0xf07d…; run with MIDA_DEBUG=1 to see why")
+    expect(lines[0]).toBe("Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again")
     expect(lines[1]).toBe("debug: BaseError | boom")
   })
 
