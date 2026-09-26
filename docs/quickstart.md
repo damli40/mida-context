@@ -406,6 +406,33 @@ Devin's hooks have no transcript file and no `cwd` in the payload: the project f
 
 *Status: NOT RUN against a real Devin — every test uses synthetic payloads and a synthetic SQLite file (`apps/midad/test/devin.e2e.test.ts`, `apps/midad/test/drain-devin.test.ts`, `packages/compiler/test/transcript-devin.test.ts`). No real `~/.config/devin` or `~/.local/share/devin` was touched.*
 
+## 15. Leaving Mida — RUN on local Anvil
+
+One command writes everything the chain attributes to you into a folder you choose:
+
+```bash
+mida export ~/mida-backup
+```
+
+```
+Exported 5 records (3 namespaces) to /home/you/mida-backup.
+```
+
+The folder is created fresh — it refuses to overwrite anything that already exists, writes into a sibling `…​.partial-…​` folder first, and only renames it into place when every file is done. A failure mid-export deletes the partial folder, so a failed run never leaves half-written plaintext behind. Folder mode is 0700, every file 0600.
+
+What is inside:
+
+- `records.json` — every record, machine-readable: who wrote it (you, or the agent's name), when Monad stamped it, which lineage it sits in and whether a newer record superseded it, plus the decrypted content.
+- `records.md` — the same records readable, grouped by context area, newest first.
+- `encrypted/` — the exact manifest and ciphertext bytes the store serves for each record, so what the folder claims can be checked against Monad itself. `README.md` inside the folder gives the recipe: hash the manifest file and compare it to the record's on-chain `manifestHash` (`ContextRegistry.getRecord` for a direct save, the BatchAnchor row for a batched one), then hash the ciphertext file against the manifest.
+- `README.md` — what the folder is, the counts, the chain and contract addresses it came from, and the check above.
+
+Two honest warnings, printed inside the folder too: **the readable files are plaintext — anyone who can read the folder can read your context — and the folder contains no keys**, so losing it loses nothing cryptographic. Saves still queued on this laptop (taken by hooks, not yet on Monad) are not in the export; the command prints a line naming the count when it is not zero.
+
+`export` is an owner command: it runs only in your own terminal, never through the daemon, and no agent can reach it (it is not an MCP tool and no hook can trigger it). A passkey setup refuses — export needs the local software owner key to decrypt, and a passkey home holds none.
+
+*Status: RUN on local Anvil — `apps/midad/test/export.e2e.test.ts` exports a five-record universe (two agents, a superseded checkpoint, an owner fact, a second-namespace record, one batched save) through the real CLI, then executes the README's own hash recipe against the chain. `apps/midad/test/export.test.ts` covers every refusal and the staging cleanup.*
+
 ## The compile model: DeepSeek by default — RUN (benchmarked)
 
 Every checkpoint save runs one compile call: the session's transcript text (secrets scrubbed first) goes to a model that returns the compact checkpoint. You choose the provider:
