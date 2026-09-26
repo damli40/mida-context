@@ -131,7 +131,7 @@ describe("sessionStartMessage", () => {
 
   it("refused not-approved names the agent and the fix", () => {
     expect(sessionStartMessage({ kind: "refused", reason: "not-approved", text: "x" }, "claude-code", NOW)).toBe(
-      "Mida: claude-code has no access to this project (not approved yet — run: mida request claude-code)",
+      "Mida: claude-code has no access to this project (not approved yet — run: mida approve claude-code in this folder)",
     )
   })
 

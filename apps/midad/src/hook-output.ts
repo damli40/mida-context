@@ -100,7 +100,7 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
     return systemMessage(`Mida: ${agent} has no access to this project (revoked by the owner). Revoking stops future reads; it cannot recall what this agent already read.`)
   }
   if (body.kind === "refused" && body.reason === "not-approved") {
-    return systemMessage(`Mida: ${agent} has no access to this project (not approved yet — run: mida request ${agent})`)
+    return systemMessage(`Mida: ${agent} has no access to this project (not approved yet — run: mida approve ${agent} in this folder)`)
   }
   // a busy chain is not a denial: the owner hears what happened and that the next session retries
   if (body.kind === "refused" && body.reason === "chain-busy") {

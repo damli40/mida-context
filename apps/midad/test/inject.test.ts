@@ -232,7 +232,7 @@ describe("inject-main process", () => {
     try {
       const res = await run(["claude-code"], sessionStart(), pending.dir.root)
       const out = envelope(res.stdout)
-      expect(out.systemMessage).toBe("Mida: claude-code has no access to this project (not approved yet — run: mida request claude-code)")
+      expect(out.systemMessage).toBe("Mida: claude-code has no access to this project (not approved yet — run: mida approve claude-code in this folder)")
     } finally {
       await close(pending.server)
     }
