@@ -38,13 +38,23 @@ function setup() {
   return { dir, home, transcriptPath, cwd, stdinFor }
 }
 
-const hook = (input: { dir: string; home: MidaHome; stdin: string; agent?: string; spawned?: () => void }) =>
+const hook = (input: {
+  dir: string
+  home: MidaHome
+  stdin: string
+  agent?: string
+  parentBasename?: () => string | undefined
+  spawned?: () => void
+}) =>
   runHook({
     agent: input.agent ?? "claude-code",
     stdin: input.stdin,
     home: input.home,
     homeDir: input.dir,
     env: {},
+    // the injected parent lookup — tests never spawn `ps` for real; an undefined answer is
+    // "the lookup failed", and the foreign-client guard proceeds (in-13 M-8)
+    parentBasename: input.parentBasename ?? (() => undefined),
     spawnDrainer: input.spawned ?? (() => {}),
   })
 
@@ -75,6 +85,7 @@ describe("runHook", () => {
       home,
       homeDir: dir,
       env: { MIDA_INNER: "1" },
+      parentBasename: () => undefined,
       spawnDrainer: () => { spawned += 1 },
     })
     expect(spawned).toBe(0)
@@ -236,6 +247,7 @@ describe("runHook", () => {
         home,
         homeDir: dir,
         env: { DEVIN_PROJECT_DIR: join(dir, "work") },
+        parentBasename: () => undefined,
         spawnDrainer: () => { spawned += 1 },
       })
       expect(spawned).toBe(0)
@@ -257,6 +269,57 @@ describe("runHook", () => {
       home,
       homeDir: dir,
       env: {},
+      parentBasename: () => undefined,
+      spawnDrainer: () => {},
+    })
+    expect(listJobs(home)).toHaveLength(1)
+  })
+
+  it("a non-devin hook whose parent process is devin is ignored — the env wall's backup (in-13 M-8)", async () => {
+    const { dir, home, stdinFor } = setup()
+    // The Sep 26 live probe found Devin launches MCP children without DEVIN_PROJECT_DIR, so
+    // the parent's executable basename is the wall that still names it — the injected lookup
+    // answers devin here, and a claude-code entry under it is a replay: no job, one log line.
+    let spawned = 0
+    await runHook({
+      agent: "claude-code",
+      stdin: stdinFor(),
+      home,
+      homeDir: dir,
+      env: {},
+      parentBasename: () => "devin",
+      spawnDrainer: () => { spawned += 1 },
+    })
+    expect(spawned).toBe(0)
+    expect(listJobs(home)).toHaveLength(0)
+    const log = readFileSync(home.path("logs/hook.jsonl"), "utf8")
+    expect(log).toContain('"outcome":"ignored"')
+    expect(log).toContain('"reason":"foreign-client"')
+  })
+
+  it("the same payload under a Cursor parent still enqueues — the wall names devin alone", async () => {
+    const { dir, home, stdinFor } = setup()
+    await runHook({
+      agent: "claude-code",
+      stdin: stdinFor(),
+      home,
+      homeDir: dir,
+      env: {},
+      parentBasename: () => "Cursor",
+      spawnDrainer: () => {},
+    })
+    expect(listJobs(home)).toHaveLength(1)
+  })
+
+  it("a failed parent lookup still enqueues — a replay guard never decides on an unknown parent", async () => {
+    const { dir, home, stdinFor } = setup()
+    await runHook({
+      agent: "claude-code",
+      stdin: stdinFor(),
+      home,
+      homeDir: dir,
+      env: {},
+      parentBasename: () => undefined,
       spawnDrainer: () => {},
     })
     expect(listJobs(home)).toHaveLength(1)
@@ -299,7 +362,7 @@ describe("runHook — devin payload", () => {
   }
 
   const devinHook = (input: { home: MidaHome; stdin: string; env: NodeJS.ProcessEnv; spawned?: () => void }) =>
-    runHook({ agent: "devin", stdin: input.stdin, home: input.home, env: input.env, spawnDrainer: input.spawned ?? (() => {}) })
+    runHook({ agent: "devin", stdin: input.stdin, home: input.home, env: input.env, parentBasename: () => undefined, spawnDrainer: input.spawned ?? (() => {}) })
 
   it("a devin Stop event enqueues a job pointing at the sessions db and the env's project dir", async () => {
     const { dir, home, dbPath, work, env, stdinFor } = devinSetup()
@@ -416,6 +479,7 @@ describe("runHook kicks the daemon instead of spawning a drainer", () => {
         home,
         homeDir: dir,
         env: {},
+        parentBasename: () => undefined,
         spawnDaemon: () => { daemonSpawns += 1 },
         spawnDrainer: () => { drainerSpawns += 1 },
       })
@@ -440,6 +504,7 @@ describe("runHook kicks the daemon instead of spawning a drainer", () => {
         home,
         homeDir: dir,
         env: {},
+        parentBasename: () => undefined,
         spawnDaemon: () => { daemonSpawns += 1 },
         spawnDrainer: () => { drainerSpawns += 1 },
       })
@@ -462,6 +527,7 @@ describe("runHook kicks the daemon instead of spawning a drainer", () => {
       home,
       homeDir: dir,
       env: {},
+      parentBasename: () => undefined,
       spawnDaemon: () => { daemonSpawns += 1; throw new Error("spawn refused") },
       spawnDrainer: () => { drainerSpawns += 1 },
     })

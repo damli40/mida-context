@@ -115,6 +115,8 @@ export {
   DEVIN_PROJECT_DIR_ENV,
   DEVIN_SAVE_EVENTS,
   devinDbPathAllowed,
+  foreignClientReplayReason,
+  parentProcessBasename,
   resolveDevinConfigPath,
   resolveDevinDbPath,
 } from "./devin-facts.js"

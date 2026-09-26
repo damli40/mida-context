@@ -8,7 +8,7 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
-import { AGENT_NAME, MidaHome, MCP_TOOLS, READ_NAMESPACES, createMidaMcpServer, loadAgentIdentity, parseMcpArgs, readSeen, socketPathFor, startupCheck } from "@mida/midad"
+import { AGENT_NAME, MidaHome, MCP_TOOLS, READ_NAMESPACES, createMidaMcpServer, foreignClientReplayReason, loadAgentIdentity, parseMcpArgs, readSeen, socketPathFor, startupCheck } from "@mida/midad"
 import type { McpServerDeps } from "@mida/midad"
 
 const BIN_MIDA_MCP = fileURLToPath(new URL("../../../bin/mida-mcp", import.meta.url))
@@ -622,6 +622,52 @@ describe("mida-mcp startup gate", () => {
     expect(res.status).toBe(0)
     expect(res.stderr).toBe("fake-node v22.1.0 ran\n")
   }, 30_000)
+})
+
+describe("mida-mcp — the parent-process wall of the foreign-client guard (in-13 M-8)", () => {
+  // Live probe, Sep 26 — not verifiable from this repo: Devin starts the MCP servers it finds
+  // in a project's .mcp.json AND .cursor/mcp.json and in Claude Code's user-level config, it
+  // sets no DEVIN_PROJECT_DIR (or any marker of its own) on those children, and its initialize
+  // names the generic rmcp library — but the MCP child's parent process is still the devin
+  // binary (`ps -o comm= -p <ppid>` → /Users/you/.local/bin/devin). The env wall alone
+  // cannot see that replay; the parent's basename can. The lookup is an injectable function —
+  // a spawned child cannot be handed a fake parent, and these tests never spawn `ps` for
+  // real, so the wall is exercised at the predicate every entry calls.
+  it("a devin parent + --as cursor is refused", () => {
+    expect(foreignClientReplayReason("cursor", {}, () => "devin")).toBe("the parent process is devin")
+  })
+
+  it("a devin parent + --as devin is served", () => {
+    expect(foreignClientReplayReason("devin", {}, () => "devin")).toBeNull()
+  })
+
+  it("a Cursor parent + --as cursor is served", () => {
+    expect(foreignClientReplayReason("cursor", {}, () => "Cursor")).toBeNull()
+  })
+
+  it("a failed parent lookup is served — a replay guard never decides on an unknown parent", () => {
+    expect(foreignClientReplayReason("cursor", {}, () => undefined)).toBeNull()
+  })
+
+  it("DEVIN_PROJECT_DIR answers first — the parent is never asked once the env wall fires", () => {
+    let asked = false
+    const reason = foreignClientReplayReason("cursor", { DEVIN_PROJECT_DIR: "/w" }, () => {
+      asked = true
+      return "devin"
+    })
+    expect(reason).toBe("DEVIN_PROJECT_DIR is set")
+    expect(asked).toBe(false)
+  })
+
+  it("--as devin never asks either — the lookup is lazy", () => {
+    let asked = false
+    const reason = foreignClientReplayReason("devin", {}, () => {
+      asked = true
+      return "devin"
+    })
+    expect(reason).toBeNull()
+    expect(asked).toBe(false)
+  })
 })
 
 /** The eleven field names mida_save accepts — the ten content fields plus the optional verbatim ask. */

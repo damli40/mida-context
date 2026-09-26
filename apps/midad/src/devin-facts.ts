@@ -1,5 +1,6 @@
+import { spawnSync } from "node:child_process"
 import { lstatSync, realpathSync } from "node:fs"
-import { isAbsolute, join } from "node:path"
+import { basename, isAbsolute, join } from "node:path"
 
 /**
  * Devin CLI facts the code depends on — from Devin docs / local inspection, Sep 25
@@ -41,6 +42,48 @@ export const DEVIN_INSTALLED_EVENTS: readonly string[] = [...DEVIN_INJECT_EVENTS
  * other agent firing under it is Devin replaying that client's imported config.
  */
 export const DEVIN_PROJECT_DIR_ENV = "DEVIN_PROJECT_DIR"
+
+/**
+ * The executable basename of the process that spawned this one — `ps -o comm=` exactly as the
+ * Sep 26 live probe read it (`/Users/you/.local/bin/devin` → `devin`). Answers `undefined`
+ * on any failure: no `ps` on the PATH, a non-zero exit, an empty answer, a lookup that
+ * throws. A failed lookup must be tellable apart from a real answer, because this feeds a
+ * replay guard — not a permission check — and an unanswerable parent may never refuse a
+ * real client.
+ */
+export function parentProcessBasename(pid: number = process.ppid): string | undefined {
+  try {
+    const result = spawnSync("ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8", timeout: 1_000 })
+    if (result.error !== undefined || result.status !== 0 || typeof result.stdout !== "string") return undefined
+    const name = basename(result.stdout.trim())
+    return name === "" ? undefined : name
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Why this Mida entry is a replay under another client's identity — or null when it is not.
+ * The first wall is DEVIN_PROJECT_DIR_ENV, set on every hook process Devin spawns (in-7 D1).
+ * The second wall (in-13 M-8) is the parent process's basename: the Sep 26 live probe showed
+ * Devin also starts the MCP servers it finds in other clients' config files (`.mcp.json`,
+ * `.cursor/mcp.json`, Claude Code's user-level config) WITHOUT the variable — and with a
+ * generic rmcp clientInfo that names nothing — but the child's parent is still the devin
+ * binary. Both walls enforce the one rule: inside Devin's environment only `devin` may act,
+ * so an entry named for any other client is a replay, not that client's session. The parent
+ * lookup is injectable AND lazy — it never runs once `--as devin` or the env wall has
+ * settled the question — and `undefined` proceeds, since this is a replay guard, not the
+ * permission check.
+ */
+export function foreignClientReplayReason(
+  agent: string | undefined,
+  env: NodeJS.ProcessEnv,
+  parentBasename: () => string | undefined,
+): string | null {
+  if (agent === "devin") return null
+  if (env[DEVIN_PROJECT_DIR_ENV] !== undefined) return "DEVIN_PROJECT_DIR is set"
+  return parentBasename()?.toLowerCase() === "devin" ? "the parent process is devin" : null
+}
 
 /**
  * User-level hook config: `~/.config/devin/config.json` under a "hooks" key, in the same

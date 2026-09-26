@@ -6,7 +6,7 @@ import type { Server, Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { MidaHome, readSeen, socketPathFor, writeSeen } from "@mida/midad"
+import { MidaHome, foreignClientReplayReason, readSeen, socketPathFor, writeSeen } from "@mida/midad"
 
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 const INJECT_MAIN = fileURLToPath(new URL("../src/inject-main.ts", import.meta.url))
@@ -469,6 +469,16 @@ describe("inject-main process — foreign-client guard", () => {
       await close(server)
     }
   }, 30_000)
+
+  // in-13 M-8 — the same second wall the MCP entry gained: a spawned inject child cannot be
+  // handed a fake parent and these tests never spawn `ps` for real, so the wall is exercised
+  // at the predicate the entry calls (mcp.test.ts holds the full matrix).
+  it("the parent-process wall: a devin parent refuses a non-devin entry; every other answer serves", () => {
+    expect(foreignClientReplayReason("claude-code", {}, () => "devin")).toBe("the parent process is devin")
+    expect(foreignClientReplayReason("devin", {}, () => "devin")).toBeNull()
+    expect(foreignClientReplayReason("claude-code", {}, () => "Cursor")).toBeNull()
+    expect(foreignClientReplayReason("claude-code", {}, () => undefined)).toBeNull()
+  })
 })
 
 describe("inject-main process — UserPromptSubmit", () => {

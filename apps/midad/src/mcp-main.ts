@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { ensureDaemon } from "./control.js"
 import { resolveHome } from "./home.js"
+import { foreignClientReplayReason, parentProcessBasename } from "./devin-facts.js"
 import { drainerEnv } from "./hook.js"
 import { MCP_USAGE, createMidaMcpServer, parseMcpArgs, startupCheck } from "./mcp.js"
 import { siblingEntryArgs } from "./sibling.js"
@@ -45,14 +46,19 @@ async function main(): Promise<void> {
     return
   }
   // Same foreign-client guard as the hook and inject entries (in-7 D1): Devin imports other
-  // clients' MCP config and launches it under its own environment — DEVIN_PROJECT_DIR is set on
-  // every process it spawns — so an entry for any other client is a replay, not that client's
-  // session. One stderr line, exit 2, before the home is resolved or the daemon is touched:
-  // otherwise a replayed entry could read and mida_save under cursor or claude-desktop's
-  // identity (in-10 R-12).
-  if (parsed.args.agent !== "devin" && process.env.DEVIN_PROJECT_DIR !== undefined) {
+  // clients' MCP config and launches it under its own environment, so an entry for any other
+  // client is a replay, not that client's session. One stderr line, exit 2, before the home
+  // is resolved or the daemon is touched: otherwise a replayed entry could read and
+  // mida_save under cursor or claude-desktop's identity (in-10 R-12). The second wall is the
+  // parent process's basename (in-13 M-8): the Sep 26 live probe showed Devin launches MCP
+  // children WITHOUT DEVIN_PROJECT_DIR or any env mark of its own — the parent is the only
+  // thing left that names it. The lookup is lazy — it never runs once --as devin or the env
+  // wall answered — and a failed lookup proceeds, because this is a replay guard, not the
+  // permission check.
+  const replay = foreignClientReplayReason(parsed.args.agent, process.env, parentProcessBasename)
+  if (replay !== null) {
     process.stderr.write(
-      `mida-mcp: DEVIN_PROJECT_DIR is set — inside Devin's environment only --as devin may serve (got ${parsed.args.agent === undefined ? "no --as" : `--as ${parsed.args.agent}`})\n`,
+      `mida-mcp: ${replay} — inside Devin's environment only --as devin may serve (got ${parsed.args.agent === undefined ? "no --as" : `--as ${parsed.args.agent}`})\n`,
     )
     process.exitCode = 2
     return

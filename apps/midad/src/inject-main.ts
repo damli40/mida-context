@@ -5,6 +5,7 @@ import type { SessionStartBody } from "./hook-output.js"
 import { degradedMessage, hookReply, sessionStartMessage, whatsNewMessage } from "./hook-output.js"
 import { resolveHome } from "./home.js"
 import type { MidaHome } from "./home.js"
+import { foreignClientReplayReason, parentProcessBasename } from "./devin-facts.js"
 import { drainerEnv } from "./hook.js"
 import { appendLog } from "./log.js"
 import { isSafeName } from "./queue.js"
@@ -132,11 +133,13 @@ async function main(): Promise<void> {
     }
   }
   const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
-  // Same guard as the save hook: inside Devin's environment (DEVIN_PROJECT_DIR is set on every
-  // hook process it spawns) a Mida entry for any other client is Devin replaying that client's
-  // imported hooks — no handoff, no what's-new note, no output, one log line. It sits before the
-  // whats-new dispatch so a replayed prompt can never reach the daemon.
-  if (agent !== "devin" && process.env.DEVIN_PROJECT_DIR !== undefined) {
+  // Same guard as the save hook, second wall included (in-13 M-8): inside Devin's environment —
+  // DEVIN_PROJECT_DIR on a hook process, or a devin parent process for the launches that carry
+  // no marker — a Mida entry for any other client is Devin replaying that client's imported
+  // hooks: no handoff, no what's-new note, no output, one log line. It sits before the
+  // whats-new dispatch so a replayed prompt can never reach the daemon, and a failed parent
+  // lookup proceeds (a replay guard, not the permission check).
+  if (foreignClientReplayReason(agent, process.env, parentProcessBasename) !== null) {
     appendLog(home, "hook", {
       agent: agent ?? null,
       event: typeof record.hook_event_name === "string" ? record.hook_event_name : null,
