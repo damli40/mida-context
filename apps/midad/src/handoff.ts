@@ -5,6 +5,7 @@ import { compareChainOrder, defuse, handoffHeader, mergeCheckpoints, renderHando
 import type { MigrationEnvelope } from "@mida/checkpoint"
 import { isChainBusyError } from "./chain-busy.js"
 import { CHAIN_BUSY_TEXT } from "./hook-output.js"
+import { CODING_CLIENTS } from "./install.js"
 import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { movedOnSuffix } from "./migration-envelope.js"
 import { checkProject } from "./projects.js"
@@ -286,6 +287,13 @@ export async function buildHandoff(
     if (!access.ok) return refused(access.reason, access.text)
     const check = access.approval
 
+    // A coding client's "current state" is concrete — its workspace — so its handoff names where
+    // to check. Every other identity gets the header's generic words only. The line stays out of
+    // the checkpoint package: "files" and "git" are adapter knowledge, not core vocabulary.
+    const adapterNote = CODING_CLIENTS.includes(agent)
+      ? "Here the current state is the files and git: check git status / git diff before changing anything."
+      : undefined
+
     const now = deps.now ?? (() => Date.now())
     const readStarted = now()
     // `settled` never rejects, so a read that finishes or fails after the deadline is discarded
@@ -363,9 +371,10 @@ export async function buildHandoff(
       // Pending saves carry no chain placement — this orders on the writer's claim alone, which
       // is all a not-yet-anchored record has; it only picks whose line renders, never "current".
       const newestPending = pending.slice().sort(compareChainOrder).at(-1)
+      const preamble = [handoffHeader(null), adapterNote].filter((line): line is string => line !== undefined).join("\n")
       return {
         kind: "handoff",
-        text: `${outcome.partial ? `${PARTIAL_LINE}\n\n` : ""}${handoffHeader(null)}\n${HANDOFF_BEGIN}\n\n${pendingText}\n\n${HANDOFF_TAIL}`,
+        text: `${outcome.partial ? `${PARTIAL_LINE}\n\n` : ""}${preamble}\n${HANDOFF_BEGIN}\n\n${pendingText}\n\n${HANDOFF_TAIL}`,
         checkpoints: outcome.checkpoints.length,
         facts: facts.length,
         factsFailed,
@@ -413,7 +422,7 @@ export async function buildHandoff(
           return migration === undefined ? row : { ...row, createdAt: `${row.createdAt} ${movedOnSuffix(migration)}` }
         }),
       },
-      { authorNames: input.authorNames, facts, factsFailed },
+      { authorNames: input.authorNames, facts, factsFailed, adapterNote, now },
     )
     const text = (() => {
       if (pending.length === 0) return rendered.text

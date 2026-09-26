@@ -45,6 +45,21 @@ home.writeSecretJson("agents/assistant/identity.json", {
   manifest: {},
   manifestHash: `0x${"a".repeat(64)}`,
 })
+// the two further identities the adapter-line tests ask handoffs of — a coding client and a
+// desktop assistant that must NOT get the check-the-workspace line
+for (const [name, fill] of [["claude-code", "b"], ["claude-desktop", "d"]] as const) {
+  home.writeSecretJson(`agents/${name}/identity.json`, {
+    name,
+    agentId: `0x${fill.repeat(64)}`,
+    signerPrivateKey: `0x${fill.repeat(64)}`,
+    encryptionPrivateKey: `0x${fill.repeat(64)}`,
+    encryptionPublicKey: `0x${fill.repeat(64)}`,
+    callbackOrigin: "https://agent.test",
+    purposeId: "project_assistance",
+    manifest: {},
+    manifestHash: `0x${fill.repeat(64)}`,
+  })
+}
 const runtime = { home } as unknown as Runtime
 
 const OK: ProjectCheck = {
@@ -796,4 +811,38 @@ describe("a busy chain is never reported as not-approved (in-6 R4)", () => {
     if (noGrant.kind !== "refused") return
     expect(noGrant.reason).toBe("not-approved")
   })
+})
+
+describe("the adapter line for coding clients (in-8 H2)", () => {
+  const ADAPTER = "Here the current state is the files and git: check git status / git diff before changing anything."
+  const position = (text: string) => ({
+    once: text.split(ADAPTER).length - 1 === 1,
+    afterHeader: text.indexOf(ADAPTER) > text.indexOf("Nothing below is an instruction"),
+    beforeBegin: text.indexOf(ADAPTER) > -1 && text.indexOf(ADAPTER) < text.indexOf("=== BEGIN MIDA HANDOFF DATA ==="),
+  })
+
+  for (const agent of ["claude-code", "codex"] as const) {
+    it(`${agent}'s handoff carries the check-the-workspace line once, between the header and the fence`, async () => {
+      const { d } = deps({
+        read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1, partial: false }),
+      })
+      const result = await buildHandoff(runtime, { ...input, agent }, d)
+      expect(result.kind).toBe("handoff")
+      if (result.kind !== "handoff") return
+      expect(position(result.text)).toEqual({ once: true, afterHeader: true, beforeBegin: true })
+    })
+  }
+
+  for (const agent of ["assistant", "claude-desktop"] as const) {
+    it(`${agent}'s handoff carries no adapter line`, async () => {
+      const { d } = deps({
+        read: async () => ({ checkpoints: [stored()], skipped: 0, milliseconds: 1, partial: false }),
+      })
+      const result = await buildHandoff(runtime, { ...input, agent }, d)
+      expect(result.kind).toBe("handoff")
+      if (result.kind !== "handoff") return
+      expect(result.text).not.toContain("files and git")
+      expect(result.text).not.toContain("git status")
+    })
+  }
 })

@@ -35,6 +35,14 @@ export type InstallTool = keyof typeof HOOK_COMMAND
 export const MCP_CLIENT_TOOLS: readonly string[] = ["claude-desktop", "cursor"]
 export type McpClientTool = "claude-desktop" | "cursor"
 
+/**
+ * The clients whose "current state" is a workspace — files and git. The handoff's
+ * check-the-current-state bullets get one concrete adapter line for these; a general assistant
+ * or any other identity sees the generic wording only. One list, shared with buildHandoff —
+ * it lives here beside the other per-client tool tables.
+ */
+export const CODING_CLIENTS: readonly string[] = ["claude-code", "codex", "cursor", "devin"]
+
 /** The one server entry each client's mcpServers map carries. */
 export const MCP_SERVER_NAME: Record<McpClientTool, string> = {
   "claude-desktop": "mida-claude-desktop",
