@@ -217,7 +217,9 @@ export const rpcTransportProbe = {
 /**
  * The transport to put in every public and wallet client: `rpcTransport(url)` in place of
  * `http(url)`. The rate limit key is the URL's origin, so two transports aimed at one host share
- * one bucket — the daemon, drainer and CLI cannot double-spend the host's allowance.
+ * one bucket — inside ONE process. The bucket is per process, not global: a `mida` CLI running
+ * beside the daemon has its own, so N processes can still reach N× the host's allowance (in-11
+ * R-15 — the old comment claimed they could not).
  */
 export function rpcTransport(url: string) {
   const origin = originOf(url)
