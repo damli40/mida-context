@@ -38,7 +38,16 @@ import type { CheckpointEnvelope } from "./checkpoint-payload.js"
  */
 
 export type ExportResult =
-  | { outcome: "exported"; records: number; namespaces: number; folder: string; queued: number; batchedPending: number }
+  | {
+      outcome: "exported"
+      records: number
+      namespaces: number
+      folder: string
+      queued: number
+      batchedPending: number
+      /** Saves the chain registered after the export block — left out, counted here. */
+      landedAfter: number
+    }
   | { outcome: "refused"; code: string }
 
 export interface ExportDeps {
@@ -54,9 +63,15 @@ export interface ExportDeps {
   openRuntime?: (home: MidaHome, network: Network) => Promise<Runtime>
   /**
    * Test seam: the owner read. Default: readOwnerUniverse with keepEncrypted on. `toBlock` is
-   * the already-read head — the universe must be scanned no further than it.
+   * the already-read head — the universe must be scanned no further than it — and `afterHead`
+   * collects the contextIds of store rows whose registration came after it.
    */
-  readUniverse?: (runtime: Runtime, onProgress: (done: number, total: number) => void, toBlock: bigint) => Promise<SourceRecord[]>
+  readUniverse?: (
+    runtime: Runtime,
+    onProgress: (done: number, total: number) => void,
+    toBlock: bigint,
+    afterHead: Set<Hex>,
+  ) => Promise<SourceRecord[]>
   /** Test seam: stop the export right after this step, as if the write had failed there. */
   stopAfter?: "staged" | "files"
 }
@@ -590,6 +605,8 @@ function readme(input: {
   blockTime: bigint
   queued: number
   batchedPending: number
+  /** Saves Monad registered after the export block — newer than this folder, left out. */
+  landedAfter: number
   /** contextIds whose migration envelope could not be read — named so the export is honest. */
   unreadableIds: string[]
 }): string {
@@ -695,6 +712,9 @@ Decrypting needs the owner's per-area keys — not included, by design.
 - **Batched saves still waiting for Monad: ${input.batchedPending}.** \`state/batch-pending.json\`
   in your Mida home holds saves the store accepted but the chain has not anchored yet — the same
   reason they cannot be in this folder. A non-zero count means export again after they land.
+- **Saves that landed after the export began: ${input.landedAfter}.** A save Monad registered
+  after the export block above is newer than this folder — left out, not lost. A non-zero
+  count means run \`mida export\` again to include it.
 - **Keys.** None — not your owner key, not any agent's key, not the per-area decryption keys.
   records.json and records.md are plaintext: keep this folder private, or delete it when you are done.
 ${input.unreadableIds.length === 0 ? "" : `
@@ -764,10 +784,12 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
     const blockNumber = await runtime.chain.publicClient.getBlockNumber({ cacheTime: 0 })
     const block = await runtime.chain.publicClient.getBlock({ blockNumber })
     deps.progress?.("reading every record the chain attributes to you…")
+    const landedAfterHead = new Set<Hex>()
     const read =
       deps.readUniverse ??
-      ((rt, progress, toBlock) => readOwnerUniverse(rt, { keepEncrypted: true, onProgress: progress, toBlock }))
-    const records = await read(runtime, onProgress, blockNumber)
+      ((rt, progress, toBlock, afterHead) =>
+        readOwnerUniverse(rt, { keepEncrypted: true, onProgress: progress, toBlock, afterHead }))
+    const records = await read(runtime, onProgress, blockNumber, landedAfterHead)
     for (const record of records) {
       if (record.encrypted === undefined) {
         throw codedError("export-incomplete", `record ${record.contextId} came back without its encrypted store bytes`)
@@ -842,6 +864,7 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
           blockTime: block.timestamp,
           queued,
           batchedPending,
+          landedAfter: landedAfterHead.size,
           unreadableIds,
         }),
       )
@@ -894,7 +917,20 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
         `warning: ${unreadableIds.length} record${unreadableIds.length === 1 ? "" : "s"} carried an unreadable migration envelope and exported as-is (marked in records.json): ${unreadableIds.join(", ")}`,
       )
     }
-    return { outcome: "exported", records: records.length, namespaces: namespaces.size, folder: dest, queued, batchedPending }
+    if (landedAfterHead.size > 0) {
+      deps.print(
+        `${landedAfterHead.size} save${landedAfterHead.size === 1 ? "" : "s"} landed after the export started; run export again to include them`,
+      )
+    }
+    return {
+      outcome: "exported",
+      records: records.length,
+      namespaces: namespaces.size,
+      folder: dest,
+      queued,
+      batchedPending,
+      landedAfter: landedAfterHead.size,
+    }
   } finally {
     await runtime.close()
   }

@@ -4,7 +4,7 @@ import { bytesOf, deriveEpochKeyPair, openContextObject } from "@mida/crypto"
 import { batchAnchorAbi, contextRegistryAbi, getLogsChunked } from "@mida/chain"
 import type { BatchedReadItem, ContextRecordView } from "@mida/api"
 import { verifyBatchedItem } from "@mida/sdk"
-import type { AbiEvent } from "viem"
+import type { AbiEvent, Address } from "viem"
 import { chainRefusalReason } from "./chain-busy.js"
 import type { Runtime } from "./runtime.js"
 
@@ -81,6 +81,13 @@ export interface ReadOwnerUniverseOptions {
    * Absent means "to the chain's current head".
    */
   toBlock?: bigint
+  /**
+   * Receives the contextIds of store rows whose chain registration landed AFTER `toBlock` —
+   * saves that arrived while the read was running. They are newer than the read: excluded
+   * from the result and counted here, never reported as inconsistencies. Only consulted when
+   * `toBlock` is set; a row with no registration anywhere still fails the read.
+   */
+  afterHead?: Set<Hex>
 }
 
 interface ReadFailure {
@@ -147,6 +154,29 @@ const SAVE_ANCHORED = batchAnchorAbi.find(
   (entry) => entry.type === "event" && entry.name === "SaveAnchored",
 ) as AbiEvent
 
+/**
+ * The contextIds an event logs for this owner from `bound + 1` upward — one extra scan, run
+ * lazily the first time a store row names a record the bounded scan never logged. A row whose
+ * registration landed after the bound is newer than the read: excluded and counted, never an
+ * inconsistency. A row the chain still has not registered anywhere stays a failure.
+ */
+async function idsLoggedAfter(
+  runtime: Runtime,
+  address: Address,
+  event: AbiEvent,
+  bound: bigint,
+): Promise<Set<Hex>> {
+  const logs = await getLogsChunked(runtime.ownerChain.publicClient, {
+    address,
+    event,
+    args: { owner: runtime.owner },
+    fromBlock: bound + 1n,
+  }, { maxRange: runtime.network.logBlockRange })
+  const ids = new Set<Hex>()
+  for (const log of logs) ids.add((log.args as { contextId: Hex }).contextId.toLowerCase() as Hex)
+  return ids
+}
+
 /** The fields of one `SaveAnchored` log this reader keeps — the contract's own attestation. */
 interface AnchoredSave {
   contextId: Hex
@@ -175,6 +205,7 @@ async function readBatchedUniverse(
   onProgress?: (done: number, total: number) => void,
   keepEncrypted = false,
   toBlock?: bigint,
+  afterHead?: Set<Hex>,
 ): Promise<(SourceRecord & { lane: "batched" })[]> {
   const { deployment } = runtime.network
   const batchAnchor = deployment.batchAnchor
@@ -236,6 +267,11 @@ async function readBatchedUniverse(
     byNamespace.set(namespaceId, list)
   }
 
+  // SaveAnchored ids after the bound — scanned lazily, only if a store row needs the check.
+  let lateAnchors: Set<Hex> | undefined
+  const anchoredAfterHead = async (): Promise<Set<Hex>> =>
+    (lateAnchors ??= toBlock === undefined ? new Set() : await idsLoggedAfter(runtime, batchAnchor, SAVE_ANCHORED, toBlock))
+
   const records: (SourceRecord & { lane: "batched" })[] = []
   // Anchoring block timestamps, fetched once per block — a batched record's createdAt is when the
   // chain recorded it, the same thing a direct record's createdAt means.
@@ -266,8 +302,14 @@ async function readBatchedUniverse(
       const contextId = item.contextId.toLowerCase() as Hex
       rows.set(contextId, item)
       // A row the store calls ANCHORED that the chain never logged for this owner: the two
-      // sources disagree, so the record cannot be certified — named, never trusted.
+      // sources disagree, so the record cannot be certified — named, never trusted. Unless
+      // the anchor landed after the bound: then the save is newer than the read, counted
+      // through `afterHead` and left out.
       if (item.state === "ANCHORED" && !anchoredIds.has(contextId)) {
+        if ((await anchoredAfterHead()).has(contextId)) {
+          afterHead?.add(contextId)
+          continue
+        }
         failures.push({ contextId, reason: "anchored in the store's batch table but not in the owner's SaveAnchored logs" })
       }
     }
@@ -370,10 +412,12 @@ async function readBatchedUniverse(
  * When the deployment carries a BatchAnchor its `SaveAnchored` logs add the batched half: same
  * completeness rules, verified through the §7.1 checks, marked `lane: "batched"`.
  *
- * Completeness is the point: a chain record with no object, a listed object with no chain record,
- * a failed decrypt, or a `partial` store list all throw `owner-read-incomplete` naming the
- * contextIds rather than silently shortening the universe. An owner with no records returns [].
- * Nothing is written anywhere.
+ * Completeness is the point: a chain record with no object, a listed object with no chain record
+ * at or before the bound, a failed decrypt, or a `partial` store list all throw
+ * `owner-read-incomplete` naming the contextIds rather than silently shortening the universe.
+ * The exception is a store row the chain registered only after `toBlock`: that save is newer
+ * than the read, so it is left out and reported through `afterHead` instead. An owner with no
+ * records returns []. Nothing is written anywhere.
  */
 export async function readOwnerUniverse(
   runtime: Runtime,
@@ -392,7 +436,7 @@ export async function readOwnerUniverse(
 
   const keepEncrypted = options?.keepEncrypted === true
   const failures: ReadFailure[] = []
-  const batched = await readBatchedUniverse(runtime, failures, options?.onProgress, keepEncrypted, options?.toBlock)
+  const batched = await readBatchedUniverse(runtime, failures, options?.onProgress, keepEncrypted, options?.toBlock, options?.afterHead)
   if (logs.length === 0) {
     if (failures.length > 0) throw ownerReadIncomplete(failures)
     return batched
@@ -421,6 +465,13 @@ export async function readOwnerUniverse(
 
   const decrypted = new Map<Hex, SourceRecord>()
 
+  // ContextRegistered ids after the bound — scanned lazily, only if a store row needs the check.
+  let lateRegistrations: Set<Hex> | undefined
+  const registeredAfterHead = async (): Promise<Set<Hex>> =>
+    (lateRegistrations ??= options?.toBlock === undefined
+      ? new Set()
+      : await idsLoggedAfter(runtime, deployment.contextRegistry, CONTEXT_REGISTERED, options.toBlock))
+
   for (const [nsId, chainIds] of byNamespace) {
     let namespace: string
     try {
@@ -448,6 +499,12 @@ export async function readOwnerUniverse(
       const contextId = object.contextId.toLowerCase() as Hex
       seen.add(contextId)
       if (!chainRecords.has(contextId)) {
+        // Registered after the bound — the save is newer than this read, not an inconsistency:
+        // left out and counted through `afterHead`. The chain saying nothing anywhere stays a refusal.
+        if ((await registeredAfterHead()).has(contextId)) {
+          options?.afterHead?.add(contextId)
+          continue
+        }
         failures.push({ contextId, reason: "in the store but not in the owner's ContextRegistered logs" })
         continue
       }

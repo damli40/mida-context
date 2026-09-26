@@ -642,6 +642,12 @@ describe("readOwnerUniverse — the batched half of the history", () => {
   function fakeOwnerRuntime(over: {
     deployment?: typeof DEPLOYMENT_BATCHED | typeof DEPLOYMENT
     logs?: Record<string, readonly unknown[]>
+    /**
+     * Answers for an after-head getLogs scan — one whose fromBlock is past the bound (these
+     * tests bound reads at block 100, so a fromBlock > 100 is the post-bound query). Keyed by
+     * event name like `logs`.
+     */
+    lateLogs?: Record<string, readonly unknown[]>
     items?: BatchedReadItem[]
     partial?: boolean
     /** What `batchOf(batchId)` answers — [root, anchoredBlock]; absent means the call throws. */
@@ -660,8 +666,9 @@ describe("readOwnerUniverse — the batched half of the history", () => {
     const publicClient = {
       getBlockNumber: async () => 200n,
       getBlock: async ({ blockNumber }: { blockNumber: bigint }) => ({ timestamp: BLOCK_TIME, number: blockNumber }),
-      getLogs: async ({ event }: { event: { name?: string } }) => {
+      getLogs: async ({ event, fromBlock }: { event: { name?: string }; fromBlock?: bigint }) => {
         over.logCalls?.push(event.name ?? "?")
+        if (fromBlock !== undefined && fromBlock > 100n) return over.lateLogs?.[event.name ?? ""] ?? []
         return over.logs?.[event.name ?? ""] ?? []
       },
       readContract: async ({ functionName }: { functionName: string }) => {
@@ -720,6 +727,37 @@ describe("readOwnerUniverse — the batched half of the history", () => {
     const { contextId, log } = await makeAnchored()
     const runtime = fakeOwnerRuntime({ logs: { SaveAnchored: [log] }, items: [] })
     await expect(readOwnerUniverse(runtime)).rejects.toMatchObject({ code: "owner-read-incomplete", contextIds: [contextId] })
+  })
+
+  it("a batched save anchored after the bound is newer than the read — counted, not refused", async () => {
+    // ex-3 E-4: two ANCHORED rows sit in the store's batch table; the bounded SaveAnchored
+    // scan (toBlock 100) knows only the first. The second's log landed after the bound, so
+    // the after-head scan finds it: the row is excluded and reported, not an inconsistency.
+    const old = await makeAnchored()
+    const late = await makeAnchored()
+    const runtime = fakeOwnerRuntime({
+      logs: { SaveAnchored: [old.log] },
+      lateLogs: { SaveAnchored: [late.log] },
+      items: [old.item, late.item],
+      batchRoot: old.leaf,
+    })
+    const afterHead = new Set<Hex>()
+    const records = await readOwnerUniverse(runtime, { keepEncrypted: true, toBlock: 100n, afterHead })
+    expect(records.map((record) => record.contextId)).toEqual([old.contextId])
+    expect([...afterHead]).toEqual([late.contextId])
+  })
+
+  it("a batched row with no SaveAnchored anywhere still refuses — the bound is not an excuse", async () => {
+    const old = await makeAnchored()
+    const late = await makeAnchored()
+    const runtime = fakeOwnerRuntime({
+      logs: { SaveAnchored: [old.log] },
+      lateLogs: {},
+      items: [old.item, late.item],
+      batchRoot: old.leaf,
+    })
+    const failure = await readOwnerUniverse(runtime, { toBlock: 100n }).catch((error: unknown) => error)
+    expect(failure).toMatchObject({ code: "owner-read-incomplete", contextIds: [late.contextId] })
   })
 
   it("no batchAnchor on the deployment → the SaveAnchored scan never runs", async () => {

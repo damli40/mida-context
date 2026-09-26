@@ -13,8 +13,9 @@ import { fileURLToPath } from "node:url"
 import { HttpRequestError, keccak256, zeroHash } from "viem"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
-import { OWNER_AUTHOR_ID, canonicalBytes, namespaceId } from "@mida/protocol"
+import { CONTEXT_KIND, OWNER_AUTHOR_ID, PROVENANCE_SOURCE, canonicalBytes, namespaceId } from "@mida/protocol"
 import type { Hex, ObjectManifest } from "@mida/protocol"
+import { deriveEpochKeyPair, hexOf, sealContextObject } from "@mida/crypto"
 import {
   CLI_COMMANDS,
   MCP_TOOLS,
@@ -383,6 +384,85 @@ describe("mida export — dispatch and refusals", () => {
     expect(line).not.toContain("Error")
   })
 
+  it("a store row registered after the export block is newer than the read — excluded and counted, never refused", async () => {
+    // ex-3 E-4: the bounded scan stops at the export block (42). A save whose ContextRegistered
+    // log landed at 45 — after the bound but before the store list was read — is found by the
+    // after-head scan: excluded and counted, not reported inconsistent. A row with no
+    // registration anywhere still refuses.
+    const SECRET = new Uint8Array(32).fill(7)
+    const readEpoch = 1n
+    const oldId = `0x${"0a".repeat(32)}` as Hex
+    const lateId = `0x${"0b".repeat(32)}` as Hex
+    const sealed = sealContextObject({
+      payload: { v: 1, value: { text: "the record the bound knows" }, kind: "EPISODE", provenance: { source: "AGENT_INFERRED" } },
+      binding: {
+        chainId: network.deployment.chainId,
+        contextRegistry: network.deployment.contextRegistry,
+        contextId: oldId,
+        namespaceId: NS_PROJECTS,
+        readEpoch,
+      },
+      epochPublicKey: deriveEpochKeyPair(SECRET, readEpoch).publicKey,
+    })
+    const chainRow = {
+      owner: OWNER,
+      namespaceId: NS_PROJECTS,
+      manifestHash: sealed.manifestHash,
+      author: OWNER_AUTHOR_ID,
+      recordType: 0,
+      kind: CONTEXT_KIND.EPISODE,
+      provenanceSource: PROVENANCE_SOURCE.AGENT_INFERRED,
+      lineagePolicy: 0,
+      lineageId: oldId,
+      parentId: zeroHash,
+      version: 1,
+      readEpoch: 1n,
+      createdAt: 100n,
+      expiresAt: 0n,
+    }
+    const fake = (lateRegistered: boolean): Runtime =>
+      ({
+        owner: OWNER,
+        ownerStartBlock: 0n,
+        network,
+        ownerChain: {
+          publicClient: {
+            getBlockNumber: async () => 50n,
+            getLogs: async ({ event, fromBlock }: { event: { name: string }; fromBlock: bigint }) => {
+              if (event.name !== "ContextRegistered") return []
+              // The after-head scan asks from the bound upward — the late save's log answers there.
+              if (fromBlock > 42n) {
+                return lateRegistered ? [{ args: { contextId: lateId }, blockNumber: 45n, logIndex: 0 }] : []
+              }
+              return [{ args: { contextId: oldId, record: { namespaceId: NS_PROJECTS } }, blockNumber: 10n, logIndex: 0 }]
+            },
+          },
+        },
+        ownerApi: {
+          listObjects: async () => ({
+            objects: [
+              { contextId: oldId, manifestHash: sealed.manifestHash, manifest: sealed.manifest, ciphertext: hexOf(sealed.ciphertext) },
+              { contextId: lateId, manifestHash: zeroHash, manifest: {}, ciphertext: "0x" },
+            ],
+            partial: false,
+          }),
+        },
+        vault: { deriveNamespaceSecret: async () => SECRET },
+        reader: { getRecord: async (id: Hex) => (id === oldId ? chainRow : null) },
+      }) as unknown as Runtime
+
+    const afterHead = new Set<Hex>()
+    const records = await readOwnerUniverse(fake(true), { keepEncrypted: true, toBlock: 42n, afterHead })
+    expect(records.map((record) => record.contextId)).toEqual([oldId])
+    expect([...afterHead]).toEqual([lateId])
+    expect(records[0]!.payload.value).toEqual({ text: "the record the bound knows" })
+
+    // …and the same store row with NO registration at or before the head — and none after —
+    // is still the inconsistency it always was.
+    const missing = await readOwnerUniverse(fake(false), { keepEncrypted: true, toBlock: 42n }).catch((error: unknown) => error)
+    expect(missing).toMatchObject({ code: "owner-read-incomplete", contextIds: [lateId] })
+  })
+
   it("owner-read-incomplete through exportRecords throws naming the contextIds and leaves nothing", async () => {
     const home = ownerHome()
     const cwd = tempDir()
@@ -495,6 +575,35 @@ describe("mida export — dispatch and refusals", () => {
     expect(result.outcome).toBe("exported")
     expect(seenToBlock).toBe(42n)
     expect(readFileSync(join(dest, "README.md"), "utf8")).toContain("export block: 42")
+  })
+
+  it("a save that landed after the export started is excluded from the folder, counted, and announced", async () => {
+    // ex-3 E-4: the read reports a store row whose registration came after the export block
+    // through `afterHead` — the export leaves it out of the folder and says so in the README
+    // and the printed summary, with the honest next step.
+    const home = ownerHome()
+    const cwd = tempDir()
+    const dest = join(cwd, "backup")
+    const lateId = `0x${"0b".repeat(32)}` as Hex
+    const lines: string[] = []
+    const result = await exportRecords({
+      home,
+      network,
+      folder: dest,
+      cwd,
+      print: (line) => lines.push(line),
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async (_runtime, _progress, _toBlock, afterHead) => {
+        afterHead.add(lateId)
+        return [fixtureRecord()]
+      },
+    })
+    expect(result).toMatchObject({ outcome: "exported", records: 1, landedAfter: 1 })
+    expect(lines).toContain("1 save landed after the export started; run export again to include them")
+    const readme = readFileSync(join(dest, "README.md"), "utf8")
+    expect(readme).toContain("Saves that landed after the export began: 1")
+    const entries = JSON.parse(readFileSync(join(dest, "records.json"), "utf8")) as { contextId: string }[]
+    expect(entries.map((entry) => entry.contextId)).not.toContain(lateId)
   })
 
   it("a parent that refuses the post-rename fsync still reports success — one warning, complete folder", async () => {
