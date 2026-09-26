@@ -771,11 +771,16 @@ describe("mida export — the written folder", () => {
     const { dest: dest2 } = await exportWith([fixtureRecord()])
     const fact = JSON.parse(readFileSync(join(dest2, "records.json"), "utf8")) as ExportEntry[]
     expect(fact[0]!.newestCheckpoint).toBe(false)
-    // records.md uses the honest labels only — "current" must not appear as a flag
-    // (the namespace is named projects.current, so match the flag separator, not the word)
+    // records.md names the flag by what it is — the checkpoint the handoff opens with —
+    // never "newest" (a newer session with no real work is not flagged) and never "current"
+    // (the namespace is projects.current, so match the flag separator, not the word).
     const md = readFileSync(join(dest, "records.md"), "utf8")
-    expect(md).toContain("newest checkpoint")
+    expect(md).toContain("the checkpoint the handoff opens with")
+    expect(md).not.toContain("newest checkpoint")
     expect(md).not.toMatch(/· current/)
+    // and the README's field list explains newestCheckpoint the same way
+    const readme = readFileSync(join(dest, "README.md"), "utf8")
+    expect(readme).toContain("the checkpoint the handoff opens with")
   })
 
   it("the encrypted files are the store's bytes — manifest hashes to manifestHash", async () => {
@@ -913,6 +918,12 @@ describe("mida export — the written folder", () => {
     const readme = readFileSync(join(dest, "README.md"), "utf8")
     expect(readme).toContain(bad.contextId)
     expect(readme).toContain("unreadable")
+    // ex-3 E-5: writtenAt honestly ignores the unreadable envelope — but the section must
+    // not claim the envelope is trusted nowhere: newestCheckpoint still follows the
+    // handoff's rule, which reads the envelope inside the checkpoint.
+    expect(readme).toContain("Monad's own stamp")
+    expect(readme).toContain("the handoff's rule")
+    expect(readme).not.toContain("never the envelope's claim")
     expect(lines.some((line) => line.includes(bad.contextId))).toBe(true)
   })
 
@@ -932,26 +943,85 @@ describe("mida export — the written folder", () => {
   })
 
   it("no file in the export carries any secret the home holds", async () => {
-    // ex-2 X-9: the planted secrets are 0x7a…/0xff… — letters in the hex so the uppercase form is
-    // distinct, and 0xff so base64url ('_') genuinely differs from base64 ('/'). fakeRuntime
-    // loads the file, so the scan covers secrets the runtime under test really holds — a leak in
-    // ANY encoding of ANY byte fails.
+    // ex-2 X-9 / ex-3 E-5: the planted secrets are 0x7a…/0xff… — letters in the hex so the
+    // uppercase form is distinct, and 0xff so base64url ('_') genuinely differs from base64
+    // ('/'). The runtime export reads REALLY holds them: the vault answers the namespace-secret
+    // call with the home's seed bytes, so the decrypt path runs on the planted material and a
+    // leak of it — in ANY encoding of ANY byte — fails a needle below.
     const secrets = [`0x${"7a".repeat(32)}`, `0x${"ff".repeat(32)}`]
     const home = ownerHome()
     const cwd = tempDir()
     // drop secrets where the real home keeps them — the export must not touch them
     home.writeSecretJson("owner/secrets.json", { privateKey: secrets[0], seed: secrets[1], p256PrivateKey: secrets[0] })
     const dest = join(cwd, "backup")
+    // One real record sealed under epoch keys derived from the planted seed — the export's own
+    // readOwnerUniverse decrypts it, so the home's key material is genuinely in play.
+    const seedBytes = new Uint8Array(Buffer.from(secrets[1]!.slice(2), "hex"))
+    const readEpoch = 1n
+    const contextId = `0x${"0c".repeat(32)}` as Hex
+    const sealed = sealContextObject({
+      payload: { v: 1, value: { text: "a note sealed under the planted seed" }, kind: "FACT", provenance: { source: "USER_ASSERTED" } },
+      binding: {
+        chainId: network.deployment.chainId,
+        contextRegistry: network.deployment.contextRegistry,
+        contextId,
+        namespaceId: NS_PROJECTS,
+        readEpoch,
+      },
+      epochPublicKey: deriveEpochKeyPair(seedBytes, readEpoch).publicKey,
+    })
+    const chainRow = {
+      owner: OWNER,
+      namespaceId: NS_PROJECTS,
+      manifestHash: sealed.manifestHash,
+      author: OWNER_AUTHOR_ID,
+      recordType: 0,
+      kind: CONTEXT_KIND.FACT,
+      provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED,
+      lineagePolicy: 0,
+      lineageId: contextId,
+      parentId: zeroHash,
+      version: 1,
+      readEpoch: 1n,
+      createdAt: 100n,
+      expiresAt: 0n,
+    }
+    let vaultCalls = 0
+    const runtime = {
+      ...fakeRuntime(home),
+      ownerStartBlock: 0n,
+      ownerChain: {
+        publicClient: {
+          getBlockNumber: async () => 42n,
+          getLogs: async () => [{ args: { contextId, record: { namespaceId: NS_PROJECTS } }, blockNumber: 10n, logIndex: 0 }],
+        },
+      },
+      ownerApi: {
+        listObjects: async () => ({
+          objects: [{ contextId, manifestHash: sealed.manifestHash, manifest: sealed.manifest, ciphertext: hexOf(sealed.ciphertext) }],
+          partial: false,
+        }),
+      },
+      vault: {
+        deriveNamespaceSecret: async () => {
+          vaultCalls += 1
+          return seedBytes
+        },
+      },
+      reader: { getRecord: async () => chainRow },
+    }
     const result = await exportRecords({
       home,
       network,
       folder: dest,
       cwd,
       print: () => {},
-      openRuntime: async () => fakeRuntime(home),
-      readUniverse: async () => [fixtureRecord()],
+      openRuntime: async () => runtime as unknown as Runtime,
     })
     expect(result.outcome).toBe("exported")
+    // the decrypt path really ran against the planted seed — a scan that never touched the
+    // runtime's key material would be proof of nothing.
+    expect(vaultCalls).toBe(1)
     const needles: Buffer[] = []
     for (const secret of secrets) {
       const raw = Buffer.from(secret.slice(2), "hex")

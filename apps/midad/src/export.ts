@@ -100,9 +100,10 @@ export interface ExportEntry {
   /** The record that replaced this one (names it in parentId), or null. */
   supersededBy: Hex | null
   /**
-   * Checkpoints only: the record a handoff for this project would treat as its newest —
-   * mergeCheckpoints's chosen chain head, ordered by the chain's own stamps, never the
-   * writer's claim. False on every non-checkpoint record.
+   * Checkpoints only: the checkpoint the handoff opens with — the head of the
+   * working-session chain mergeCheckpoints chooses, so a newer session with no real work
+   * is not flagged. Ordered by the chain's own stamps, never the writer's claim. False on
+   * every non-checkpoint record.
    */
   newestCheckpoint: boolean
   lane: "direct" | "batched"
@@ -118,7 +119,8 @@ export interface ExportEntry {
    * "unreadable" only: the record carried a migration envelope this build could not read (a
    * payload carrying it in both slots is contradictory). The record still exports — the
    * decrypted payload is preserved as-is and writtenAt is Monad's stamp, not the envelope's
-   * claim. Absent on every ordinary record.
+   * claim. `newestCheckpoint` is unaffected: on a checkpoint it follows the handoff's rule,
+   * which reads the envelope inside the checkpoint itself. Absent on every ordinary record.
    */
   envelope?: "unreadable"
 }
@@ -376,7 +378,7 @@ function latestInLineage(records: readonly SourceRecord[]): Set<string> {
 }
 
 /**
- * The checkpoint a handoff would call newest in each project — mergeCheckpoints's own pick
+ * The checkpoint the handoff opens with in each project — mergeCheckpoints's own pick
  * (the chosen chain's head). Only records carrying a checkpoint envelope take part, grouped
  * by projectId exactly as a handoff for that project would see them; each record is rebuilt
  * as the StoredCheckpoint the merge consumes, with Monad's own placement as its order.
@@ -572,7 +574,7 @@ function recordsMarkdown(entries: ExportEntry[], records: readonly SourceRecord[
       // checkpoint a handoff would continue from — there is no "current" flag to overclaim.
       const flags = [
         ...(entry.superseded ? [entry.supersededBy === null ? "superseded" : `superseded → ${entry.supersededBy}`] : []),
-        ...(entry.newestCheckpoint ? ["newest checkpoint"] : []),
+        ...(entry.newestCheckpoint ? ["the checkpoint the handoff opens with"] : []),
         ...(entry.expired ? ["expired"] : []),
         ...(entry.lane === "batched" ? [`batched in ${entry.batchId}`] : []),
         ...(entry.envelope === "unreadable" ? ["migration envelope unreadable"] : []),
@@ -638,6 +640,9 @@ export into the same parent folder removes the leftover.
 ## What is inside
 
 - \`records.json\` — every record, machine-readable. Times are ISO-8601 UTC; bigints are decimal strings.
+  On checkpoint records, \`newestCheckpoint\` marks the checkpoint the handoff opens with — the
+  head of the working-session chain the handoff chooses, so a newer session with no real work
+  is not flagged.
 - \`records.md\` — the same records readable, grouped by context area, newest first.
 - \`encrypted/<contextId>.manifest.json\` — the manifest the store serves for that record, in the
   canonical JSON form the protocol hashes (\`canonicalBytes\`, packages/protocol/src/wire.ts — RFC 8785).
@@ -722,8 +727,10 @@ ${input.unreadableIds.length === 0 ? "" : `
 
 ${input.unreadableIds.length === 1 ? "This record" : "These records"} carried a migration envelope this build could
 not read. ${input.unreadableIds.length === 1 ? "It" : "They"} exported anyway — the decrypted payload is in records.json
-exactly as stored, \`envelope\` is "unreadable", and \`writtenAt\` is Monad's own stamp, never the
-envelope's claim.
+exactly as stored and \`envelope\` is "unreadable". \`writtenAt\` is Monad's own stamp — the
+unreadable envelope's dates are not trusted for it. On a checkpoint, \`newestCheckpoint\` still
+follows the handoff's rule: the handoff reads the envelope inside the checkpoint, and the flag
+answers the same question it would.
 
 ${input.unreadableIds.map((id) => `- \`${id}\``).join("\n")}
 `}
