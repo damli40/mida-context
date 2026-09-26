@@ -22,6 +22,18 @@ const home = () => new MidaHome(mkdtempSync(join(tmpdir(), "mida-mcp-")))
 const projectDir = () => mkdtempSync(join(tmpdir(), "mida-mcp-project-"))
 
 /**
+ * The environment a spawned mida-mcp entry sees. DEVIN_PROJECT_DIR is removed: when these
+ * tests run under Devin they inherit it, and the foreign-client guard would then refuse every
+ * non-devin --as for a reason the test never stated — the variable reaches a child only when
+ * the test names it.
+ */
+const spawnEnv = (extra: Record<string, string>): NodeJS.ProcessEnv => {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...extra }
+  if (extra.DEVIN_PROJECT_DIR === undefined) delete env.DEVIN_PROJECT_DIR
+  return env
+}
+
+/**
  * A socket server the test controls, same shape as inject.test.ts's fake — plus routing per path
  * and a record of what the adapter sent. A route value is the JSON body to answer, a function of
  * the parsed request body, or `{ silent: true }` for a daemon that accepts but never answers.
@@ -183,7 +195,7 @@ describe("mida-mcp args", () => {
       // bin/mida-mcp pins the tsx loader absolutely, so a client may launch it from any cwd —
       // /tmp stands in for wherever an MCP host happens to run it from
       const child = spawn(BIN_MIDA_MCP, ["--bogus"], {
-        env: { ...process.env, MIDA_HOME: home().root },
+        env: spawnEnv({ MIDA_HOME: home().root }),
         cwd: "/tmp",
       })
       let stdout = ""
@@ -215,7 +227,7 @@ describe("mida-mcp args", () => {
     writeFileSync(join(project, ".mida", "project.json"), JSON.stringify({ projectId: "p1" }))
     const res = await new Promise<{ status: number | null; stderr: string }>((done, reject) => {
       const child = spawn(BIN_MIDA_MCP, ["--as", "codex", "--project", project], {
-        env: { ...process.env, MIDA_HOME: dir.root },
+        env: spawnEnv({ MIDA_HOME: dir.root }),
         cwd: "/tmp",
       })
       let stderr = ""
@@ -362,7 +374,7 @@ describe("mida-mcp startup gate", () => {
     const home = makeHome()
     register(home, "codex")
     const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--project", makeProject()], {
-      env: { ...process.env, MIDA_HOME: home.root },
+      env: spawnEnv({ MIDA_HOME: home.root }),
       stdio: ["pipe", "pipe", "pipe"],
     })
     let stdout = ""
@@ -384,7 +396,7 @@ describe("mida-mcp startup gate", () => {
     const home = makeHome()
     register(home, "assistant") // registered, so 'no agent' cannot be the reason — the purpose is
     const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "assistant", "--project", makeProject()], {
-      env: { ...process.env, MIDA_HOME: home.root },
+      env: spawnEnv({ MIDA_HOME: home.root }),
       stdio: ["pipe", "pipe", "pipe"],
     })
     let stdout = ""
@@ -402,7 +414,7 @@ describe("mida-mcp startup gate", () => {
   it("refuses before spawning a daemon: the real entry exits 2, stdout empty, no socket", async () => {
     const home = makeHome() // empty home: no identity
     const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "nobody", "--project", makeProject()], {
-      env: { ...process.env, MIDA_HOME: home.root },
+      env: spawnEnv({ MIDA_HOME: home.root }),
       stdio: ["pipe", "pipe", "pipe"],
     })
     let stdout = ""
@@ -416,10 +428,72 @@ describe("mida-mcp startup gate", () => {
     expect(existsSync(join(home.root, "midad.sock"))).toBe(false)
   })
 
+  // Devin imports other clients' MCP config and launches them under its own environment —
+  // DEVIN_PROJECT_DIR is set on every process it spawns. A mida-mcp for cursor or
+  // claude-desktop running there is a replay, not that client's session: it must exit before
+  // the home is resolved or the daemon is touched, so nothing reads or saves under the wrong
+  // identity (in-10 R-12). Same guard as the hook and inject entries (in-7 D1).
+  it("under DEVIN_PROJECT_DIR the real entry refuses --as cursor: one stderr line, exit 2, no socket", async () => {
+    const home = makeHome()
+    register(home, "cursor") // registered and the project marked — the guard is the only refusal
+    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "cursor", "--project", makeProject()], {
+      env: spawnEnv({ MIDA_HOME: home.root, DEVIN_PROJECT_DIR: makeProject() }),
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    child.stdin.end() // if the guard missed, the live server would hold the process open
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (b) => (stdout += b))
+    child.stderr.on("data", (b) => (stderr += b))
+    const code = await new Promise((r) => child.on("exit", r))
+    expect(code).toBe(2)
+    expect(stdout).toBe("")
+    expect(stderr.trim().split("\n")).toHaveLength(1)
+    expect(stderr).toContain("DEVIN_PROJECT_DIR")
+    expect(existsSync(join(home.root, "midad.sock"))).toBe(false)
+  })
+
+  it("under DEVIN_PROJECT_DIR the real entry refuses --as claude-desktop the same way", async () => {
+    const home = makeHome()
+    register(home, "claude-desktop")
+    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "claude-desktop", "--project", makeProject()], {
+      env: spawnEnv({ MIDA_HOME: home.root, DEVIN_PROJECT_DIR: makeProject() }),
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    child.stdin.end()
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (b) => (stdout += b))
+    child.stderr.on("data", (b) => (stderr += b))
+    const code = await new Promise((r) => child.on("exit", r))
+    expect(code).toBe(2)
+    expect(stdout).toBe("")
+    expect(stderr.trim().split("\n")).toHaveLength(1)
+    expect(stderr).toContain("DEVIN_PROJECT_DIR")
+    expect(existsSync(join(home.root, "midad.sock"))).toBe(false)
+  })
+
+  it("under DEVIN_PROJECT_DIR --as devin passes the guard — the startup gate still decides", async () => {
+    const home = makeHome() // devin is NOT registered: the refusal must come from the gate, not the guard
+    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "devin", "--project", makeProject()], {
+      env: spawnEnv({ MIDA_HOME: home.root, DEVIN_PROJECT_DIR: makeProject() }),
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (b) => (stdout += b))
+    child.stderr.on("data", (b) => (stderr += b))
+    const code = await new Promise((r) => child.on("exit", r))
+    expect(code).toBe(2)
+    expect(stdout).toBe("")
+    expect(stderr).toContain(`no agent "devin" is set up in the Mida home ${home.root}`)
+    expect(stderr).not.toContain("DEVIN_PROJECT_DIR")
+  })
+
   it("a MIDA_HOME that does not exist is refused before a folder is created there (F6)", async () => {
     const missing = join(mkdtempSync(join(tmpdir(), "mida-nohome-")), "home")
     const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "codex", "--project", makeProject()], {
-      env: { ...process.env, MIDA_HOME: missing },
+      env: spawnEnv({ MIDA_HOME: missing }),
       stdio: ["pipe", "pipe", "pipe"],
     })
     let stdout = ""
@@ -438,7 +512,7 @@ describe("mida-mcp startup gate", () => {
     const file = join(dir, "home")
     writeFileSync(file, "x")
     const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "codex", "--project", makeProject()], {
-      env: { ...process.env, MIDA_HOME: file },
+      env: spawnEnv({ MIDA_HOME: file }),
       stdio: ["pipe", "pipe", "pipe"],
     })
     let stderr = ""
@@ -453,7 +527,7 @@ describe("mida-mcp startup gate", () => {
     const dir = mkdtempSync(join(tmpdir(), "mida-nothome-"))
     chmodSync(dir, 0o755)
     const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "codex", "--project", makeProject()], {
-      env: { ...process.env, MIDA_HOME: dir },
+      env: spawnEnv({ MIDA_HOME: dir }),
       stdio: ["pipe", "pipe", "pipe"],
     })
     let stdout = ""

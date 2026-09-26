@@ -44,6 +44,19 @@ async function main(): Promise<void> {
     process.exitCode = 2
     return
   }
+  // Same foreign-client guard as the hook and inject entries (in-7 D1): Devin imports other
+  // clients' MCP config and launches it under its own environment — DEVIN_PROJECT_DIR is set on
+  // every process it spawns — so an entry for any other client is a replay, not that client's
+  // session. One stderr line, exit 2, before the home is resolved or the daemon is touched:
+  // otherwise a replayed entry could read and mida_save under cursor or claude-desktop's
+  // identity (in-10 R-12).
+  if (parsed.args.agent !== "devin" && process.env.DEVIN_PROJECT_DIR !== undefined) {
+    process.stderr.write(
+      `mida-mcp: DEVIN_PROJECT_DIR is set — inside Devin's environment only --as devin may serve (got ${parsed.args.agent === undefined ? "no --as" : `--as ${parsed.args.agent}`})\n`,
+    )
+    process.exitCode = 2
+    return
+  }
   let home
   try {
     // the adapter never creates the home: a mistyped MIDA_HOME is refused before the
