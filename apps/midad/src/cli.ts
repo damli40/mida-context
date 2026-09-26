@@ -863,37 +863,50 @@ async function runBatching(runtime: ServiceRuntime, arg: string | undefined, dep
  * argv[1] is fact text, but the agent-naming codes cannot surface from remember anyway.
  */
 /**
- * Whether a `mida migrate` (or `--undo`) run may already have sent transactions, judged from
- * the persisted state file — the only record that survives a crash mid-send. `step` names the
- * last FINISHED phase and sends begin inside target-setup, so a step at or past "manifest"
- * means "nothing was sent" would be a false claim; a completed move ("switched") counts too —
- * its sends happened, and an undone-or-failed re-run still must not claim otherwise. An
- * unreadable state file fails closed to mid-run: never claim "nothing was sent" when the one
- * ledger that could prove it cannot be read.
+ * Where the last `mida migrate` run stopped, in migrate.ts's own terms — the persisted
+ * migrate/state.json step is the only record that survives a crash mid-send. `step` names
+ * the last FINISHED phase and sends begin inside target-setup: "none" is no file or a
+ * pre-send step (preview/paused/backed-up), "finished" is "switched" — the last step a
+ * completed move writes, whose sends are done and whose failure wording must never read like
+ * a stopped run — and everything else, including a file that will not parse, is "mid-run":
+ * fail closed, never claim "nothing was sent" on a guess.
  */
-const migrateMayHaveSent = (home: MidaHome | undefined): boolean => {
-  if (home === undefined) return false
+type MigrateProgress = "none" | "mid-run" | "finished"
+
+const migrateProgress = (home: MidaHome | undefined): MigrateProgress => {
+  if (home === undefined) return "none"
   let step: unknown
   try {
     const state = home.readJson<{ step?: unknown }>("migrate/state.json")
-    if (state === undefined) return false
+    if (state === undefined) return "none"
     step = state.step
   } catch {
-    return true
+    return "mid-run"
   }
-  return typeof step !== "string" || !["preview", "paused", "backed-up"].includes(step)
+  if (step === "switched") return "finished"
+  return typeof step !== "string" || !["preview", "paused", "backed-up"].includes(step) ? "mid-run" : "none"
 }
 
-export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string, capabilityRegistry?: string, home?: MidaHome): string {
+export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string, capabilityRegistry?: string, home?: MidaHome, undo = false): string {
   const code = refusalCode(error)
   // The "nothing was sent/written" claims are true only before migrate's first transaction —
-  // once the persisted step passes the no-send prefix the honest line says the move stopped
-  // partway and names the two real routes: a re-run resumes from the state file, --undo
-  // restores the backup (ex-3 E-1).
+  // the state file tells the three cases apart (ex-4 G-1): no move started keeps the plain
+  // claim; a mid-run move names resume and --undo; a FINISHED move ("switched") is neither —
+  // the failure is a new run that had sent nothing when it stopped. An --undo failure is its
+  // own line: it names the undo route and never points at resuming the move.
+  const progress = command === "migrate" ? migrateProgress(home) : "none"
   const partway =
-    command === "migrate" && migrateMayHaveSent(home)
-      ? "the move stopped partway — run `mida migrate` again to resume it, or `mida migrate --undo` to go back"
-      : undefined
+    command !== "migrate"
+      ? undefined
+      : undo
+        ? progress === "none"
+          ? undefined
+          : "the undo stopped before it finished — run `mida migrate --undo` again to go back"
+        : progress === "finished"
+          ? "the move already finished — this run had sent nothing when it stopped; run `mida migrate` again to retry, or `mida migrate --undo` to go back"
+          : progress === "mid-run"
+            ? "the move stopped partway — run `mida migrate` again to resume it, or `mida migrate --undo` to go back"
+            : undefined
   switch (code) {
     // The owner saw the preview and answered something other than yes — nothing was signed.
     case "not-approved": return "not approved"
@@ -1414,7 +1427,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     } catch (error) {
       // Same refusal surface as every other owner command — a chain failure prints the
       // honest chain-busy/misconfigured line, never a provider message (ex-2 X-3).
-      deps.print(ownerRefusalLine("migrate", "", error, undefined, deps.network.deployment.capabilityRegistry, deps.home))
+      deps.print(ownerRefusalLine("migrate", "", error, undefined, deps.network.deployment.capabilityRegistry, deps.home, argv[1] === "--undo"))
       if (process.env.MIDA_DEBUG === "1") deps.print(debugLine(error))
       return 1
     }

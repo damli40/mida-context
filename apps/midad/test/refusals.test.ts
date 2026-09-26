@@ -182,6 +182,37 @@ describe("ownerRefusalLine (R4-5)", () => {
     const line = ownerRefusalLine("migrate", "", coded("chain-busy"), undefined, undefined, home)
     expect(line).not.toContain("nothing was sent")
   })
+
+  // ex-4 G-1 — "switched" is migrate's own word for a FINISHED move (the last step finishStep
+  // writes). A home left in that state is not a stopped run: the line must not say "stopped
+  // partway" and must not send the owner back to resume what is already done. The real failure
+  // mode was Dami's own home: a finished Sep-24 move made every later migrate error read as
+  // if the move had died mid-run.
+  it("migrate: a chain error on a home whose move already FINISHED never says 'stopped partway'", () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-refuse-")))
+    home.writeSecretJson("migrate/state.json", { version: 1, step: "switched" })
+    const line = ownerRefusalLine("migrate", "", coded("chain-busy"), undefined, undefined, home)
+    expect(line).not.toContain("stopped partway")
+    expect(line).not.toContain("resume")
+    expect(line).toContain("finished")
+  })
+
+  it("migrate --undo: a chain error names the undo route — never 'run `mida migrate` again'", () => {
+    // A failed undo is a failed undo — the move's own state cannot turn it into a migrate
+    // failure, and the fix is the same command, not a resume.
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-refuse-")))
+    home.writeSecretJson("migrate/state.json", { version: 1, step: "switched" })
+    const line = ownerRefusalLine("migrate", "", coded("chain-busy"), undefined, undefined, home, true)
+    expect(line).toContain("`mida migrate --undo`")
+    expect(line).not.toContain("run `mida migrate` again")
+    expect(line).not.toContain("resume")
+    // a mid-run move under --undo gets the same undo line — not the migrate partway wording
+    home.writeSecretJson("migrate/state.json", { version: 1, step: "records" })
+    const mid = ownerRefusalLine("migrate", "", coded("chain-busy"), undefined, undefined, home, true)
+    expect(mid).toContain("`mida migrate --undo`")
+    expect(mid).not.toContain("stopped partway")
+    expect(mid).not.toContain("run `mida migrate` again")
+  })
 })
 
 /**
