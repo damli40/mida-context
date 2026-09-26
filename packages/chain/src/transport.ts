@@ -27,8 +27,18 @@ interface Bucket {
 }
 const buckets = new Map<string, Bucket>()
 
+/**
+ * The MIDA_RPC_MAX_PER_SECOND override — read through `globalThis.process`, never a bare
+ * `process` reference: inside a browser bundle `process` is not defined at all and any bare
+ * read throws ReferenceError the moment the transport runs (in-12 N-2 — the owner page's
+ * sponsored sender reaches this file). Missing there means "no override"; Node still reads it.
+ */
+function envOverride(): string | undefined {
+  return (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.MIDA_RPC_MAX_PER_SECOND
+}
+
 function maxPerSecond(): number {
-  const raw = process.env.MIDA_RPC_MAX_PER_SECOND
+  const raw = envOverride()
   const value = raw === undefined ? Number.NaN : Number(raw)
   return Number.isInteger(value) && value > 0 ? value : DEFAULT_MAX_PER_SECOND
 }
@@ -226,32 +236,53 @@ export function rpcTransport(url: string) {
   const loopback = isLoopbackOrigin(origin)
   // Exempt or not, every send is admitted into rpcTransportProbe so request counts stay true.
   const admit = () =>
-    loopback && process.env.MIDA_RPC_MAX_PER_SECOND === undefined
+    loopback && envOverride() === undefined
       ? Promise.resolve(rpcTransportProbe.sentAt.push(Date.now()) as unknown as void)
       : takeTurn(origin)
   return http(url, {
     // R3's retry lives inside this fetchFn; viem's transport-level retry would multiply it.
     retryCount: 0,
     fetchFn: async (input: string | URL | Request, init?: RequestInit) => {
+      // A deliberately stopped request is never retried — viem's own timeout aborts the signal
+      // too, and a retry would burn a limiter slot on an answer nobody is waiting for (in-12 N-9).
+      const abortError = () => new DOMException("the request was deliberately stopped", "AbortError")
+      // Nor is a submission resent: a 5xx or a dropped socket after eth_sendRawTransaction does
+      // NOT mean the transaction never landed — the honest next answer to a resend is "already
+      // known", and the caller cannot tell that apart from a refusal (in-12 N-9). Reads and every
+      // idempotent method keep the transient/rate-limit retries below.
+      let resendable = true
+      try {
+        const parsed: unknown = JSON.parse(String(init?.body ?? "null"))
+        const calls = Array.isArray(parsed) ? parsed : [parsed]
+        if (calls.some((call) => (call as { method?: unknown } | null)?.method === "eth_sendRawTransaction")) {
+          resendable = false
+        }
+      } catch {
+        // an unparseable body stays resendable — the wire will decide what it is
+      }
       for (let attempt = 0; ; attempt += 1) {
+        if (init?.signal?.aborted) throw abortError()
         // every attempt is one HTTP request — the bucket counts retries too
         await admit()
         let response: Response
         try {
           response = await fetch(input, init)
         } catch (error) {
-          if (attempt >= RETRY_DELAYS_MS.length) throw error
+          if (init?.signal?.aborted) throw error
+          if (!resendable || attempt >= RETRY_DELAYS_MS.length) throw error
           await sleep(RETRY_DELAYS_MS[attempt]!)
           continue
         }
-        if (await busyAnswer(response)) {
+        if (resendable && (await busyAnswer(response))) {
           if (attempt >= RETRY_DELAYS_MS.length) throw new ChainBusyError()
+          if (init?.signal?.aborted) throw abortError()
           await sleep(RETRY_DELAYS_MS[attempt]!)
           continue
         }
-        if (!transientAnswer(response.status)) return response
+        if (!resendable || !transientAnswer(response.status)) return response
         // Out of retries: hand the last answer back so viem reports the real status.
         if (attempt >= RETRY_DELAYS_MS.length) return response
+        if (init?.signal?.aborted) throw abortError()
         await sleep(RETRY_DELAYS_MS[attempt]!)
       }
     },

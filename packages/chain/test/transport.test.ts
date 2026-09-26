@@ -402,3 +402,92 @@ describe("transient retries (in-9 R-6)", () => {
     expect(calls).toBe(2)
   }, 30_000)
 })
+
+// ---------------------------------------------------------------------------
+// in-12 N-9 — a deliberately stopped request and a transaction submission are never retried
+// ---------------------------------------------------------------------------
+
+describe("aborted and non-idempotent requests (in-12 N-9)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    rpcTransportProbe.reset()
+  })
+
+  it("a request aborted by viem's own timeout is never retried — one fetch call, one limiter slot", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn((_u: unknown, init?: { signal?: AbortSignal }) => {
+      calls += 1
+      // answer only if still wanted; a hang lets viem's timeout fire the abort
+      return new Promise<Response>((resolve, reject) => {
+        if (init?.signal?.aborted) return reject(new DOMException("aborted", "AbortError"))
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
+        setTimeout(() => resolve(new Response('{"jsonrpc":"2.0","id":1,"result":"0x1"}', { status: 200, headers: { "content-type": "application/json" } })), 5_000)
+      })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://n9-abort.test") })
+    const error = await client.request({ method: "eth_chainId" }, { retryCount: 0, signal: AbortSignal.timeout(150) }).then(() => null, (e: unknown) => e as Error)
+    expect(error).not.toBeNull()
+    const callsAtReject = calls
+    // the old code slept 250/500/1000 ms and sent again on the dead signal — nothing may follow
+    await new Promise((r) => setTimeout(r, 2_000))
+    expect(calls).toBe(callsAtReject)
+    expect(rpcTransportProbe.sentAt.length).toBe(1)
+  }, 30_000)
+
+  it("a request that aborts between retries stops instead of sending again", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      calls += 1
+      return new Response("bad gateway", { status: 502 })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://n9-mid.test") })
+    // the first send answers 502 inside the window — the retry check finds the signal already dead
+    const error = await client.request({ method: "eth_chainId" }, { retryCount: 0, signal: AbortSignal.timeout(50) }).then(() => null, (e: unknown) => e as Error)
+    expect(error).not.toBeNull()
+    await new Promise((r) => setTimeout(r, 1_000))
+    expect(calls).toBe(1)
+  }, 30_000)
+
+  it("eth_sendRawTransaction is never resent after a 5xx — one wire send, the 502 surfaces", async () => {
+    const methods: string[] = []
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      const body = JSON.parse(String(init?.body)) as { method: string; id: number }
+      methods.push(body.method)
+      if (methods.length === 1) return new Response("bad gateway", { status: 502 })
+      // the classic resend answer — reachable only if the transport resends, which N-9 forbids
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: { code: -32000, message: "already known" } }), { status: 200, headers: { "content-type": "application/json" } })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://n9-send.test") })
+    const error = await client.request({ method: "eth_sendRawTransaction", params: ["0x02"] }, { retryCount: 0 }).then(() => null, (e: unknown) => e as Error)
+    expect(error).not.toBeNull()
+    await new Promise((r) => setTimeout(r, 2_000))
+    expect(methods).toEqual(["eth_sendRawTransaction"])
+  }, 30_000)
+
+  it("a dropped socket after eth_sendRawTransaction is not resent either — the send may have landed", async () => {
+    const methods: string[] = []
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      const body = JSON.parse(String(init?.body)) as { method: string; id: number }
+      methods.push(body.method)
+      if (methods.length === 1) throw new TypeError("socket hang up")
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, error: { code: -32000, message: "already known" } }), { status: 200, headers: { "content-type": "application/json" } })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://n9-sock.test") })
+    await expect(client.request({ method: "eth_sendRawTransaction", params: ["0x02"] }, { retryCount: 0 })).rejects.toThrow()
+    await new Promise((r) => setTimeout(r, 2_000))
+    expect(methods).toEqual(["eth_sendRawTransaction"])
+  }, 30_000)
+
+  it("other methods in the same batch keep their retries — only the send is not resendable", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      calls += 1
+      if (calls === 1) return new Response("bad gateway", { status: 502 })
+      const body = JSON.parse(String(init?.body)) as { id: number }
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: "0x7a69" }), { status: 200, headers: { "content-type": "application/json" } })
+    }))
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://n9-read.test") })
+    await expect(client.request({ method: "eth_chainId" }, { retryCount: 0 })).resolves.toBe("0x7a69")
+    expect(calls).toBe(2)
+  }, 30_000)
+})
