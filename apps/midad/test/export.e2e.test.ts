@@ -11,23 +11,26 @@ import { createHash } from "node:crypto"
 import { mkdtempSync, readdirSync, readFileSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { keccak256, recoverTypedDataAddress } from "viem"
+import {
+  concat,
+  encodeAbiParameters,
+  keccak256,
+  recoverTypedDataAddress,
+  stringToBytes,
+  zeroHash,
+} from "viem"
 import type { AbiEvent, Hex } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import {
   PERMISSION,
   PROVENANCE_POLICY,
-  batchLeafHash,
-  batchSaveStructHash,
-  batchSaveTypedData,
-  canonicalBytes,
   namespaceId,
-  verifyMerkleProof,
 } from "@mida/protocol"
 import type { Address, BatchSaveMessage } from "@mida/protocol"
 import { deriveEpochKeyPair, hexOf } from "@mida/crypto"
 import {
   batchAnchorAbi,
+  capabilityRegistryAbi,
   contextRegistryAbi,
   createWriteContext,
   getLogsChunked,
@@ -377,35 +380,100 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
         continue
       }
 
-      // Batched: no getRecord row — the store's batch row verifies against BatchAnchor instead.
+      // Batched: no getRecord row — the store's batch row verifies against BatchAnchor
+      // instead. This follows the README's recipe with plain viem only — keccak256,
+      // encodeAbiParameters, EIP-712 typed-data hashing and contract reads — so the recipe
+      // is proven to stand alone for a verifier without this codebase.
       const row = JSON.parse(readFileSync(join(dest, "encrypted", `${id}.batched.json`), "utf8"))
       const message: BatchSaveMessage = {
         ...row.save.message,
         readEpoch: BigInt(row.save.message.readEpoch),
         expiresAt: BigInt(row.save.message.expiresAt),
       }
-      // 4. the save's own manifestHash field names the same commitment
+      // 6. the save's own manifestHash field names the same commitment
       expect(message.manifestHash).toBe(entry.manifestHash)
-      // 1. struct hash, 2. leaf hash — agentId is whoever signed the save, proven on chain
-      const structHash = batchSaveStructHash(message)
-      const signer = await recoverTypedDataAddress({
-        ...batchSaveTypedData({ chainId: env.deployment.chainId, batchAnchor, message }),
-        signature: row.save.signature,
-      } as never)
-      const agentId = await runtime.reader.agentIdOfSigner(signer)
-      expect(agentId).not.toBeNull()
-      const leaf = batchLeafHash({ contextId: entry.contextId, agentId: agentId!, lineageId: row.lineageId, version: row.version, structHash })
-      // 3. the batch's on-chain root admits the leaf under the store's proof — and the
-      //    SaveAnchored log for this contextId carries that same leaf
+
+      // 1. struct hash: typeHash over the literal type string, then abi-encode(typeHash ‖ fields)
+      const typeHash = keccak256(stringToBytes(
+        "MidaBatchSaveV1(address owner,bytes32 namespaceId,bytes32 objectNonce,bytes32 lineageId,bytes32 parentId,uint32 parentVersion,bytes32 rootAuthor,bytes32 manifestHash,bytes32 ciphertextCommitment,uint64 readEpoch,uint64 expiresAt,uint8 kind,uint8 provenanceSource)",
+      ))
+      const structHash = keccak256(encodeAbiParameters(
+        [
+          { type: "bytes32" }, { type: "address" }, { type: "bytes32" }, { type: "bytes32" },
+          { type: "bytes32" }, { type: "bytes32" }, { type: "uint32" }, { type: "bytes32" },
+          { type: "bytes32" }, { type: "bytes32" }, { type: "uint64" }, { type: "uint64" },
+          { type: "uint8" }, { type: "uint8" },
+        ],
+        [
+          typeHash, message.owner, message.namespaceId, message.objectNonce, message.lineageId,
+          message.parentId, message.parentVersion, message.rootAuthor, message.manifestHash,
+          message.ciphertextCommitment, message.readEpoch, message.expiresAt, message.kind,
+          message.provenanceSource,
+        ],
+      ))
+
+      // 2. signer: recover over the EIP-712 digest (domain "Mida Batch Anchor", version "1",
+      //    this chain, this BatchAnchor), then agentIdOfSigner on the CapabilityRegistry
+      const eip712 = {
+        domain: {
+          name: "Mida Batch Anchor",
+          version: "1",
+          chainId: env.deployment.chainId,
+          verifyingContract: batchAnchor,
+        },
+        types: {
+          MidaBatchSaveV1: [
+            { name: "owner", type: "address" },
+            { name: "namespaceId", type: "bytes32" },
+            { name: "objectNonce", type: "bytes32" },
+            { name: "lineageId", type: "bytes32" },
+            { name: "parentId", type: "bytes32" },
+            { name: "parentVersion", type: "uint32" },
+            { name: "rootAuthor", type: "bytes32" },
+            { name: "manifestHash", type: "bytes32" },
+            { name: "ciphertextCommitment", type: "bytes32" },
+            { name: "readEpoch", type: "uint64" },
+            { name: "expiresAt", type: "uint64" },
+            { name: "kind", type: "uint8" },
+            { name: "provenanceSource", type: "uint8" },
+          ],
+        },
+        primaryType: "MidaBatchSaveV1" as const,
+        message: { ...message } as Record<string, unknown>,
+      }
+      const signer = await recoverTypedDataAddress({ ...eip712, signature: row.save.signature })
+      const agentId = await runtime.chain.publicClient.readContract({
+        address: env.deployment.capabilityRegistry,
+        abi: capabilityRegistryAbi,
+        functionName: "agentIdOfSigner",
+        args: [signer],
+      })
+      expect(agentId).not.toBe(zeroHash)
+
+      // 3. leaf: abi-encode("MIDA_BATCH_LEAF_V1" ‖ contextId ‖ agentId ‖ lineageId ‖ version ‖ structHash)
+      const leaf = keccak256(encodeAbiParameters(
+        [{ type: "string" }, { type: "bytes32" }, { type: "bytes32" }, { type: "bytes32" }, { type: "uint32" }, { type: "bytes32" }],
+        ["MIDA_BATCH_LEAF_V1", entry.contextId, agentId, row.lineageId, row.version, structHash],
+      ))
+
+      // 4. the batch's on-chain root admits the leaf under the store's proof —
+      //    keccak256(min ‖ max) per level, sorted pairs
       const [root] = await runtime.chain.publicClient.readContract({
         address: batchAnchor,
         abi: batchAnchorAbi,
         functionName: "batchOf",
         args: [row.batchId],
       })
-      expect(verifyMerkleProof(leaf, row.proof, root)).toBe(true)
+      let node = leaf
+      for (const sibling of row.proof as Hex[]) {
+        node = BigInt(node) < BigInt(sibling) ? keccak256(concat([node, sibling])) : keccak256(concat([sibling, node]))
+      }
+      expect(node.toLowerCase()).toBe((root as Hex).toLowerCase())
+
+      // 5. the SaveAnchored log for this contextId carries that same leaf, batch, lineage,
+      //    version and author
       const head = await runtime.chain.publicClient.getBlockNumber({ cacheTime: 0 })
-      const anchoredLogs = await getLogsChunked(runtime.chain.publicClient, {
+      const anchoredLogs = await runtime.chain.publicClient.getLogs({
         address: batchAnchor,
         event: SAVE_ANCHORED,
         args: { batchId: row.batchId },
@@ -414,7 +482,12 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
       })
       const log = anchoredLogs.find((l) => (l.args as { contextId: Hex }).contextId.toLowerCase() === id)
       expect(log, `no SaveAnchored log for ${id}`).toBeDefined()
-      expect((log!.args as unknown as { leafHash: Hex }).leafHash).toBe(leaf)
+      const logArgs = log!.args as unknown as { leafHash: Hex; lineageId: Hex; version: number; author: Hex; position: number }
+      expect(logArgs.leafHash).toBe(leaf)
+      expect(logArgs.lineageId).toBe(row.lineageId)
+      expect(logArgs.version).toBe(row.version)
+      expect(logArgs.author.toLowerCase()).toBe(agentId.toLowerCase())
+      expect(logArgs.position).toBe(row.position)
     }
   })
 

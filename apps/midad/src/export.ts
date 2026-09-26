@@ -587,17 +587,30 @@ For a record whose \`lane\` is "direct" (a ContextRegistry save of its own):
 For a record whose \`lane\` is "batched" there is no \`getRecord\` row — the BatchAnchor committed
 the batch, not the save. \`encrypted/<contextId>.batched.json\` holds the store's row:
 \`save.message\`, \`save.signature\`, \`batchId\`, \`position\`, \`lineageId\`, \`version\`, \`proof\`.
+Inside \`save.message\`, \`readEpoch\` and \`expiresAt\` are decimal strings — parse them to
+integers; \`parentVersion\`, \`kind\` and \`provenanceSource\` are already numbers. The steps need
+only a keccak256, an ABI encoder and an EIP-712 hasher — no Mida code.
 
-1. \`batchSaveStructHash(save.message)\` (packages/protocol/src/batch.ts) — the EIP-712
-   MidaBatchSaveV1 struct hash, domain-separated by chain id and the BatchAnchor address.
-2. \`batchLeafHash({contextId, agentId, lineageId, version, structHash})\` — \`agentId\` is the
-   signer's agent id: recover who signed \`save.signature\` over the EIP-712 hash of \`save.message\`,
-   then \`CapabilityRegistry.agentIdOfSigner(signer)\`.
-3. \`BatchAnchor.batchOf(batchId)\` returns the batch's Merkle root;
-   \`verifyMerkleProof(leafHash, proof, root)\` — keccak256 over sorted pairs — must hold. The leaf
-   is also in the batch's own \`SaveAnchored\` log for this contextId; it must equal the recomputed leaf.
-4. \`save.message.manifestHash\` must equal the record's \`manifestHash\`; the manifest and ciphertext
-   files then check exactly as for a direct save.
+1. The struct hash. \`typeHash = keccak256("MidaBatchSaveV1(address owner,bytes32 namespaceId,bytes32 objectNonce,bytes32 lineageId,bytes32 parentId,uint32 parentVersion,bytes32 rootAuthor,bytes32 manifestHash,bytes32 ciphertextCommitment,uint64 readEpoch,uint64 expiresAt,uint8 kind,uint8 provenanceSource)")\`.
+   Then \`structHash = keccak256(abiEncode([bytes32, address, bytes32, bytes32, bytes32, bytes32, uint32, bytes32, bytes32, bytes32, uint64, uint64, uint8, uint8], [typeHash, owner, namespaceId, objectNonce, lineageId, parentId, parentVersion, rootAuthor, manifestHash, ciphertextCommitment, readEpoch, expiresAt, kind, provenanceSource]))\`
+   — the message's own fields, in that order.
+2. The signer. The signature is over the EIP-712 digest \`keccak256(0x1901 ‖ domainSeparator ‖ structHash)\`
+   where the domain is \`{ name: "Mida Batch Anchor", version: "1", chainId: <the chain id above>, verifyingContract: <the BatchAnchor above> }\`
+   (standard \`EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)\`).
+   Recover the signing address from \`save.signature\` over that digest, then read
+   \`agentId = CapabilityRegistry.agentIdOfSigner(signer)\` — the agent the chain attributes the
+   signature to.
+3. The leaf. \`leafHash = keccak256(abiEncode([string, bytes32, bytes32, bytes32, uint32, bytes32], ["MIDA_BATCH_LEAF_V1", contextId, agentId, lineageId, version, structHash]))\`
+   — the record's contextId, the agentId from step 2, and the row's own lineageId and version.
+4. The root. \`BatchAnchor.batchOf(batchId)\` returns \`(root, blockNumber, acceptedCount)\`.
+   Fold the row's \`proof\` onto the leaf: for each sibling, \`node = keccak256(min(node, sibling) ‖ max(node, sibling))\`
+   (byte order decides the pair order — sorted, so a proof can never be replayed in the wrong
+   position). The final node must equal \`root\`.
+5. The anchor log. The batch's \`SaveAnchored\` event for this contextId carries a \`leafHash\`
+   field — it must equal the leaf computed in step 3, and its \`batchId\`, \`lineageId\`,
+   \`version\` and \`author\` (= agentId) must match the row's.
+6. \`save.message.manifestHash\` must equal the record's \`manifestHash\` in records.json; the
+   manifest and ciphertext files then check exactly as for a direct save.
 
 Decrypting needs the owner's per-area keys — not included, by design.
 
