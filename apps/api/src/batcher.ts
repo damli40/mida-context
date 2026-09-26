@@ -613,7 +613,17 @@ export class Batcher {
           verdict = "hold"
         }
         if (verdict === "hold") {
-          await this.#store.hold(row.contextId)
+          try {
+            await this.#store.hold(row.contextId)
+          } catch (error) {
+            // A failed hold write must not take the take down (in-11 R-2: a D1 whose schema
+            // predates HELD throws SQLITE_CONSTRAINT_CHECK here, and before this catch one row's
+            // throw aborted the whole batch — recovery then retried the same row forever). The row
+            // goes back to QUEUED and is re-checked next run; the rest of the take still submits.
+            await this.#store.requeueRow(row.contextId)
+            this.#log?.({ event: "batch.hold-failed", contextId: row.contextId, error: String(error) })
+            continue
+          }
           this.#log?.({ event: "batch.held", contextId: row.contextId })
           continue
         }

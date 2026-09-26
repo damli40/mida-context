@@ -236,6 +236,13 @@ class FakeStore implements BatchStore {
     return count
   }
 
+  async requeueRow(contextId: Hex): Promise<void> {
+    const row = this.rows.get(contextId.toLowerCase())
+    if (row === undefined || row.state !== "SUBMITTED") return
+    row.state = "QUEUED"
+    row.batchId = null
+  }
+
   async listHeld(): Promise<BatchSaveRow[]> {
     return [...this.rows.values()].filter((row) => row.state === "HELD").sort(byAge).map((row) => ({ ...row }))
   }

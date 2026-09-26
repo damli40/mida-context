@@ -70,6 +70,11 @@ export interface BatchStore {
   markRejected(contextId: Hex, reason: string): Promise<void>
   /** SUBMITTED rows of `batchId` go back to QUEUED (a failed submission retried whole). */
   requeue(batchId: Hex): Promise<number>
+  /**
+   * One SUBMITTED row goes back to QUEUED, its batch tag cleared — a row the take could not
+   * check or could not hold retries on a later take instead of dying with its batch (in-11 R-2/R-9).
+   */
+  requeueRow(contextId: Hex): Promise<void>
   /** Every HELD row, oldest first — the batcher's per-tick deny re-check set. */
   listHeld(): Promise<BatchSaveRow[]>
   /** A QUEUED or SUBMITTED row goes HELD; the batch tag clears so a requeue-by-batch never revives it. */
@@ -271,6 +276,16 @@ export class FsBatchStore implements BatchStore {
         }
       }
       return count
+    })
+  }
+
+  requeueRow(contextId: Hex): Promise<void> {
+    return this.#mutate(() => {
+      const row = this.#readRow(contextId)
+      if (row === undefined || row.state !== "SUBMITTED") return
+      row.state = "QUEUED"
+      row.batchId = null
+      this.#writeRow(row)
     })
   }
 

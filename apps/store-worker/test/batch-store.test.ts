@@ -32,19 +32,23 @@ beforeAll(async () => {
     modules: [{ type: "ESModule", path: "worker.mjs", contents: "export default { fetch: () => new Response('unused') }" }],
     compatibilityDate: "2026-08-06",
     compatibilityFlags: ["nodejs_compat"],
-    d1Databases: ["DB"],
+    d1Databases: ["DB", "LEGACY_DB"],
   })
   db = (await mf.getD1Database("DB")) as unknown as D1Like
-  const statements = readFileSync(join(HERE, "..", "schema.sql"), "utf8")
+  await db.batch(statementsOf(join(HERE, "..", "schema.sql")).map((sql) => db.prepare(sql)))
+  store = new D1BatchStore(db)
+})
+
+/** The schema/migration file's executable statements — comments stripped, semicolon-split. */
+function statementsOf(file: string): string[] {
+  return readFileSync(file, "utf8")
     .split("\n")
     .map((line) => line.replace(/--.*$/, ""))
     .join("\n")
     .split(";")
     .map((statement) => statement.trim())
     .filter((statement) => statement.length > 0)
-  await db.batch(statements.map((sql) => db.prepare(sql)))
-  store = new D1BatchStore(db)
-})
+}
 
 afterAll(async () => {
   await mf?.dispose()
@@ -229,5 +233,55 @@ describe("D1BatchStore", () => {
     await store.markRejected(rows[0]!.contextId, "NO_AUTHORITY")
     await store.takeQueued(1, hexOf(randomBytes(32))) // claims rows[1]
     expect(await store.countQueued()).toBe(before + 1)
+  })
+
+  // in-11 R-2: the deployed schema's CHECK refused 'HELD' — D1BatchStore.hold wrote a state the
+  // table could not hold, so one row's hold aborted its whole batch on every retry.
+  it("a taken row can be HELD, listed as held, and released back to QUEUED", async () => {
+    const row = fakeRow()
+    await store.insert(row)
+    await store.takeQueued(1_000, hexOf(randomBytes(32)))
+    await store.hold(row.contextId)
+    expect((await store.get(row.contextId))?.state).toBe("HELD")
+    expect((await store.listHeld()).map((held) => held.contextId)).toContain(row.contextId.toLowerCase())
+    await store.releaseHeld(row.contextId)
+    expect((await store.get(row.contextId))?.state).toBe("QUEUED")
+  })
+
+  it("migration 0001 upgrades a database whose batch_saves CHECK predates HELD", async () => {
+    const legacy = (await mf.getD1Database("LEGACY_DB")) as unknown as D1Like
+    // The table exactly as the deployed schema.sql created it — the CHECK without 'HELD'.
+    await legacy
+      .prepare(
+        `CREATE TABLE batch_saves (
+          context_id TEXT PRIMARY KEY,
+          owner TEXT NOT NULL,
+          namespace_id TEXT NOT NULL,
+          signer TEXT NOT NULL,
+          save_json TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('QUEUED', 'SUBMITTED', 'ANCHORED', 'REJECTED')),
+          reason TEXT,
+          batch_id TEXT,
+          position INTEGER,
+          lineage_id TEXT,
+          version INTEGER,
+          proof_json TEXT,
+          received_at INTEGER NOT NULL,
+          anchored_at INTEGER
+        )`,
+      )
+      .run()
+    const legacyStore = new D1BatchStore(legacy)
+    const row = fakeRow({ owner: `0x${"9".repeat(40)}` as Address, namespaceId: namespaceId("legacy.migration") })
+    await legacyStore.insert(row)
+    await legacyStore.takeQueued(1_000, hexOf(randomBytes(32)))
+    // The defect as deployed: holding a taken row is a hard SQLITE_CONSTRAINT_CHECK.
+    await expect(legacyStore.hold(row.contextId)).rejects.toThrow()
+    await legacy.batch(statementsOf(join(HERE, "..", "migrations", "0001_batch_saves_held.sql")).map((sql) => legacy.prepare(sql)))
+    await legacyStore.hold(row.contextId)
+    expect((await legacyStore.get(row.contextId))?.state).toBe("HELD")
+    expect((await legacyStore.listHeld()).map((held) => held.contextId)).toContain(row.contextId.toLowerCase())
+    await legacyStore.releaseHeld(row.contextId)
+    expect((await legacyStore.get(row.contextId))?.state).toBe("QUEUED")
   })
 })

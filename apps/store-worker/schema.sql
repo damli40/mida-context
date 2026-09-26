@@ -101,14 +101,19 @@ CREATE TABLE IF NOT EXISTS manifest_puts (
 -- signed BatchedSaveWire), never in objects — the objects sweep must never touch these bytes.
 -- States: QUEUED (admitted, awaiting a batch) → SUBMITTED (claimed by an in-flight batch, batch_id
 -- set) → ANCHORED (contract accepted; position/lineage/version/proof filled) or REJECTED (contract
--- refused; reason names the code). REJECTED rows stay for direct status lookups but never list.
+-- refused; reason names the code), plus HELD — parked off the send path while the author's deny
+-- is pending on Monad; every batcher tick re-checks it (in-3 I5). REJECTED rows stay for direct
+-- status lookups but never list.
+-- On a database created before HELD existed (state CHECK without it — SQLite cannot ALTER a
+-- CHECK), run the migration once at redeploy:
+--   wrangler d1 execute mida-context-store --remote --file=migrations/0001_batch_saves_held.sql
 CREATE TABLE IF NOT EXISTS batch_saves (
   context_id TEXT PRIMARY KEY,      -- the contract's batch context id, lowercase
   owner TEXT NOT NULL,
   namespace_id TEXT NOT NULL,
   signer TEXT NOT NULL,             -- the request signer (the agent that uploaded), lowercase
   save_json TEXT NOT NULL,          -- JSON BatchedSaveWire: message, signature, manifest, ciphertext
-  state TEXT NOT NULL CHECK (state IN ('QUEUED', 'SUBMITTED', 'ANCHORED', 'REJECTED')),
+  state TEXT NOT NULL CHECK (state IN ('QUEUED', 'SUBMITTED', 'ANCHORED', 'REJECTED', 'HELD')),
   reason TEXT,                      -- rejection reason for REJECTED rows, else NULL
   batch_id TEXT,                    -- batch that claimed/anchored this save, lowercase
   position INTEGER,                 -- index inside the batch's accepted leaves

@@ -644,6 +644,13 @@ export class D1BatchStore implements BatchStore {
     return changes(result)
   }
 
+  async requeueRow(contextId: Hex): Promise<void> {
+    await this.db
+      .prepare("UPDATE batch_saves SET state = 'QUEUED', batch_id = NULL WHERE context_id = ? AND state = 'SUBMITTED'")
+      .bind(contextId.toLowerCase())
+      .run()
+  }
+
   async listHeld(): Promise<BatchSaveRow[]> {
     const { results } = await this.db
       .prepare("SELECT * FROM batch_saves WHERE state = 'HELD' ORDER BY received_at, context_id")

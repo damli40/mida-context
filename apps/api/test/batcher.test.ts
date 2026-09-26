@@ -31,6 +31,7 @@ import { batchAnchorAbi } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import { BatchRootMismatchError, Batcher, MemoryBatchJournal, createBatcherChain } from "../src/batcher.js"
 import type { AnchoredLog, BatchJournal, BatcherChain, BatcherTimer, RejectedLog } from "../src/batcher.js"
+import type { BatchRowGate } from "../src/batch-deny.js"
 import type { BatchedSaveWire } from "../src/client.js"
 import type { BatchSaveRow, BatchStore } from "../src/batch-store.js"
 
@@ -194,6 +195,13 @@ class MemoryBatchStore implements BatchStore {
       }
     }
     return count
+  }
+
+  async requeueRow(contextId: Hex): Promise<void> {
+    const row = this.rows.get(contextId.toLowerCase())
+    if (row === undefined || row.state !== "SUBMITTED") return
+    row.state = "QUEUED"
+    row.batchId = null
   }
 
   async listHeld(): Promise<BatchSaveRow[]> {
@@ -469,6 +477,8 @@ function makeRig(
     gasBudget?: bigint
     /** The per-save gas assumed before the first real receipt; default is the sweep's 66,264. */
     initialGasPerSave?: bigint
+    /** The send-time deny gate (in-3 I5) — omitted, the batcher submits without it. */
+    gate?: BatchRowGate
   } = {},
 ): Rig {
   const store = input.store ?? new MemoryBatchStore()
@@ -490,6 +500,7 @@ function makeRig(
     ...(input.salt === undefined ? {} : { salt: input.salt }),
     gasBudget: input.gasBudget,
     initialGasPerSave: input.initialGasPerSave,
+    ...(input.gate === undefined ? {} : { gate: input.gate }),
     journal,
     log: (record) => events.push(record),
   })
@@ -1552,6 +1563,41 @@ describe("the batcher", () => {
     }
     expect((await store.get(saves[1]!.meta.contextId))!).toMatchObject({ state: "REJECTED", reason: "STALE_PARENT" })
     expect(await journal.list()).toEqual([])
+  })
+
+  it("a row whose hold write fails goes back to QUEUED and the rest of the take still submits (in-11 R-2)", async () => {
+    // The deployed D1 schema refused 'HELD' with SQLITE_CONSTRAINT_CHECK — hold() threw, the whole
+    // take died, and recovery retried the same row forever. The failed row requeues; it must not
+    // take the rest of the batch down with it.
+    class HoldFailsStore extends MemoryBatchStore {
+      failOn: string | null = null
+      override async hold(contextId: Hex): Promise<void> {
+        if (this.failOn !== null && contextId.toLowerCase() === this.failOn) {
+          throw new Error("D1_ERROR: CHECK constraint failed")
+        }
+        return super.hold(contextId)
+      }
+    }
+    const store = new HoldFailsStore()
+    const parked = makeSave()
+    const clean = makeSave()
+    const rig = makeRig({
+      store,
+      gate: { check: async (row) => (row.contextId.toLowerCase() === parked.meta.contextId.toLowerCase() ? "hold" : "send") },
+    })
+    store.failOn = parked.meta.contextId.toLowerCase()
+    await rig.enqueue(parked.wire, parked.meta.contextId)
+    await rig.enqueue(clean.wire, clean.meta.contextId)
+
+    const outcome = await rig.batcher.run()
+    expect(outcome).not.toBeNull()
+    expect(rig.chain.submissions).toHaveLength(1)
+    expect(rig.chain.submissions[0]!.count).toBe(1)
+    expect((await store.get(clean.meta.contextId))!.state).toBe("ANCHORED")
+    // The row the store could not hold is QUEUED again — re-checked next run, never stuck
+    // SUBMITTED under a batchId the journal no longer names.
+    expect((await store.get(parked.meta.contextId))!.state).toBe("QUEUED")
+    expect(rig.events.some((event) => event.event === "batch.hold-failed")).toBe(true)
   })
 
   it("resolve() on a batchId the chain never saw refuses with NOT_FOUND", async () => {
