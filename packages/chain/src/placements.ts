@@ -3,6 +3,7 @@ import type { AbiEvent } from "viem"
 import type { Address, Hex } from "@mida/protocol"
 import { contextRegistryAbi } from "./abis.js"
 import type { Deployment } from "./deployment.js"
+import { chainFor } from "./deployment.js"
 import { getLogsChunked } from "./logs.js"
 import type { LogClient } from "./logs.js"
 
@@ -60,6 +61,104 @@ export async function recordPlacements(input: {
 /** The narrow slice of viem's PublicClient a block-time lookup needs. */
 export interface BlockClient {
   getBlock(parameters: { blockNumber: bigint }): Promise<{ timestamp: bigint }>
+}
+
+// ---------------------------------------------------------------------------
+// in-9 R-1 — the bounded placement scan for same-second ties
+// ---------------------------------------------------------------------------
+
+/**
+ * The narrow slice of viem's PublicClient the tie-break scan needs: log windows plus the latest
+ * block's number and timestamp, which is what anchors a record's second back to a block.
+ */
+export interface TieScanClient extends LogClient {
+  getBlock(parameters?: { blockTag?: "latest" }): Promise<{ number: bigint | null; timestamp: bigint }>
+}
+
+/** The window a same-second tie opens around its estimated block — ±64 blocks, never the history. */
+export const PLACEMENT_TIE_SPAN = 64n
+
+/**
+ * contextId → placement, recovered ONLY for records whose chain stamps share a second — the one
+ * case where `createdAt` alone cannot order them (in-9 R-1). The event sits in a block whose
+ * timestamp is that second, so the record's stamp plus the head block estimate where to look:
+ * estimate = head − (head's age at that second × this chain's blocks/second), scanned ±SPAN.
+ * One getLogs per disjoint window; overlapping windows merge, so a handful of ties costs 1–3
+ * requests. A miss is a miss — the caller falls back to the contextId tie-break, never to a
+ * whole-history scan.
+ */
+export async function recordPlacementsNear(input: {
+  client: TieScanClient
+  deployment: Deployment
+  owner: Address
+  namespaceId?: Hex
+  /** The tied second (the records' shared `createdAt`) → the contextIds stamped with it. */
+  tied: ReadonlyMap<bigint, readonly Hex[]>
+}): Promise<Map<string, RecordPlacement>> {
+  const map = new Map<string, RecordPlacement>()
+  if (input.tied.size === 0) return map
+  const head = await input.client.getBlock({ blockTag: "latest" })
+  if (head.number === null) return map
+  // Blocks per second for the estimate: the chain's own blockTime when viem knows it (Monad is
+  // 400 ms), else a one-block-per-second guess — only the estimate's aim depends on it, and a
+  // bad aim just means a window that finds nothing.
+  let msPerBlock = 1_000n
+  try {
+    const blockTime = chainFor(input.deployment.chainId).blockTime
+    if (blockTime !== undefined && blockTime > 0) msPerBlock = BigInt(blockTime)
+  } catch {
+    // an unknown chain keeps the guess
+  }
+  // One ±SPAN window per tied second; adjacent windows merge into one scan.
+  const windows: { fromBlock: bigint; toBlock: bigint; contextIds: Set<string> }[] = []
+  for (const [second, contextIds] of input.tied) {
+    const age = head.timestamp > second ? head.timestamp - second : 0n
+    const estimate = head.number - (age * 1_000n) / msPerBlock
+    const fromBlock =
+      estimate - PLACEMENT_TIE_SPAN > input.deployment.deploymentBlock ? estimate - PLACEMENT_TIE_SPAN : input.deployment.deploymentBlock
+    if (fromBlock > head.number) continue // the estimate lands past the head — nothing to scan
+    const toBlock = estimate + PLACEMENT_TIE_SPAN < head.number ? estimate + PLACEMENT_TIE_SPAN : head.number
+    const ids = new Set(contextIds.map((id) => id.toLowerCase()))
+    const overlapping = windows.find((w) => w.fromBlock <= toBlock && fromBlock <= w.toBlock)
+    if (overlapping === undefined) {
+      windows.push({ fromBlock, toBlock, contextIds: ids })
+    } else {
+      if (fromBlock < overlapping.fromBlock) overlapping.fromBlock = fromBlock
+      if (toBlock > overlapping.toBlock) overlapping.toBlock = toBlock
+      for (const id of ids) overlapping.contextIds.add(id)
+    }
+  }
+  const args =
+    input.namespaceId === undefined
+      ? ({ owner: input.owner } as Record<string, unknown>)
+      : { owner: input.owner, namespaceId: input.namespaceId }
+  const pages = await Promise.all(
+    windows.map((window) =>
+      input.client.getLogs({
+        address: input.deployment.contextRegistry,
+        event: CONTEXT_REGISTERED,
+        args: { ...args, contextId: [...window.contextIds] },
+        fromBlock: window.fromBlock,
+        toBlock: window.toBlock,
+        strict: true,
+      }),
+    ),
+  )
+  for (const logs of pages) {
+    for (const log of logs) {
+      const decoded = log as DecodedLogForPlacement
+      const contextId = decoded.args.contextId
+      if (typeof contextId !== "string" || decoded.blockNumber === null || decoded.logIndex === null) continue
+      map.set(contextId.toLowerCase(), { block: decoded.blockNumber, index: decoded.logIndex })
+    }
+  }
+  return map
+}
+
+interface DecodedLogForPlacement {
+  args: Record<string, unknown>
+  blockNumber: bigint | null
+  logIndex: number | null
 }
 
 /**

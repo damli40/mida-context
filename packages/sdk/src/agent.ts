@@ -37,7 +37,7 @@ import type {
   UnsignedAccessRequest,
 } from "@mida/protocol"
 import { bytesOf, hexOf, manifestHash, openContextObject, sealContextObject, unwrapEpochPrivateKey } from "@mida/crypto"
-import { blockTimeCache, capabilityRegistryAbi, contextRegistryAbi, latestTimestamp, readAgentRecord, recordPlacements, sendContract } from "@mida/chain"
+import { blockTimeCache, capabilityRegistryAbi, contextRegistryAbi, latestTimestamp, readAgentRecord, recordPlacementsNear, sendContract } from "@mida/chain"
 import type { LocalWriteContext, RecordPlacement } from "@mida/chain"
 import { assertGrantResponseWithinRequest, expandScopeInputs } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
@@ -91,6 +91,15 @@ export interface CreateContextInput {
 }
 
 export type SupersedeContextInput = CreateContextInput
+
+export interface ReadOptions {
+  /**
+   * `false` skips the same-second placement scan entirely — for a read that never orders its
+   * objects (the save duplicate-check). Default: records stamped in the same second get one
+   * bounded ±64-block log scan per disjoint window to recover (block, index).
+   */
+  placements?: boolean
+}
 
 export interface ProposalInput {
   value: ContextPayload["value"]
@@ -340,32 +349,36 @@ export class MidaAgent {
    * were complete — `read` refuses it outright; callers that can carry the flag use
    * `readWithStatus` instead.
    */
-  async read(owner: Address, namespace: string): Promise<ContextObject[]> {
-    const { objects, partial } = await this.readWithStatus(owner, namespace)
+  async read(owner: Address, namespace: string, options?: ReadOptions): Promise<ContextObject[]> {
+    const { objects, partial } = await this.readWithStatus(owner, namespace, options)
     if (partial) {
       throw new MidaError("PARTIAL_READ", `the store could not verify the whole ${namespace} list — try again in a moment`)
     }
     return objects
   }
 
-  /** `read` plus the store's completeness flag, for callers that can surface it downstream (M3-D). */
-  async readWithStatus(owner: Address, namespace: string): Promise<{ objects: ContextObject[]; partial: boolean }> {
+  /**
+   * `read` plus the store's completeness flag, for callers that can surface it downstream (M3-D).
+   *
+   * Placement policy (in-9 R-1): `chain.at` is already chain truth on every record — the
+   * contract stores `block.timestamp` as createdAt — so no log scan runs for it. The event
+   * log's (block, index) is needed ONLY to order records stamped in the same second, and only
+   * then does the read scan: a bounded ±64-block window around the block that second implies,
+   * one getLogs per disjoint window. `{ placements: false }` skips even that (the save
+   * duplicate-check needs no ordering at all); a missed window falls back to the contextId
+   * tie-break, never to a whole-history scan.
+   */
+  async readWithStatus(
+    owner: Address,
+    namespace: string,
+    options?: ReadOptions,
+  ): Promise<{ objects: ContextObject[]; partial: boolean }> {
     const ownerAddress = owner.toLowerCase() as Address
     const name = canonicalizeNamespace(namespace)
     const namespaceId = toNamespaceId(name)
     const capability = this.#requireCapability(ownerAddress, namespaceId, PERMISSION.READ)
     const { deployment } = this.#chain
     const { objects, partial } = await this.#api.listObjects({ owner: ownerAddress, namespaceId, capabilityId: capability.capabilityId })
-    // Monad's own placement of every record: `at` is already chain truth on the record itself
-    // (the contract stores block.timestamp as createdAt); the block and log index come from one
-    // owner-scoped ContextRegistered scan. A failed scan degrades only the same-second tie-break
-    // — the stamp each object carries is still the contract's, never the writer's claim.
-    const placements =
-      objects.length === 0
-        ? new Map<string, RecordPlacement>()
-        : await recordPlacements({ client: this.#chain.publicClient, deployment, owner: ownerAddress, namespaceId }).catch(
-            () => new Map<string, RecordPlacement>(),
-          )
     const epochKeyFor = this.#epochKeyResolver(ownerAddress, namespaceId, capability.capabilityId)
     const readObject = async (object: AnchoredObject): Promise<ContextObject> => {
       const record = await this.#verifiedRecord(ownerAddress, namespaceId, object)
@@ -378,10 +391,7 @@ export class MidaAgent {
         binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: record.contextId, namespaceId, readEpoch: record.readEpoch },
       })
       await this.#verifyReferences(ownerAddress, record, payload)
-      return this.#toObject(record, name, payload, {
-        at: record.createdAt,
-        ...(placements.get(record.contextId.toLowerCase()) ?? {}),
-      })
+      return this.#toObject(record, name, payload, { at: record.createdAt })
     }
     // Workers pull indexes in list order and results land by index, so the output order is
     // identical to the sequential loop; a failing object still fails the whole read.
@@ -397,6 +407,33 @@ export class MidaAgent {
     const workers: Promise<void>[] = []
     for (let i = 0; i < Math.min(READ_CONCURRENCY, objects.length); i += 1) workers.push(worker())
     await Promise.all(workers)
+    // Only a same-second tie needs the event log: group the returned records by their chain
+    // stamp, and ask for placements of the seconds that genuinely tie. A failed or missed scan
+    // degrades only the tie-break — the stamp each object carries is still the contract's.
+    if (options?.placements !== false && results.length > 1) {
+      const bySecond = new Map<bigint, Hex[]>()
+      for (const object of results) {
+        const at = object.chain?.at
+        if (at === undefined) continue
+        const list = bySecond.get(at)
+        if (list === undefined) bySecond.set(at, [object.contextId])
+        else list.push(object.contextId)
+      }
+      const tied = new Map([...bySecond].filter((entry) => entry[1].length > 1))
+      if (tied.size > 0) {
+        const placements = await recordPlacementsNear({
+          client: this.#chain.publicClient,
+          deployment,
+          owner: ownerAddress,
+          namespaceId,
+          tied,
+        }).catch(() => new Map<string, RecordPlacement>())
+        for (const object of results) {
+          const placement = placements.get(object.contextId.toLowerCase())
+          if (placement !== undefined && object.chain !== undefined) object.chain = { ...object.chain, ...placement }
+        }
+      }
+    }
     return { objects: results, partial }
   }
 

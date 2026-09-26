@@ -579,7 +579,9 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
   // a broken connection into a duplicate write.
   let objects: ContextObject[]
   try {
-    objects = await agent.read(runtime.owner, NAMESPACE)
+    // The duplicate check compares eventIds, not order — placements: false skips even the
+    // bounded same-second tie scan (in-9 R-1).
+    objects = await agent.read(runtime.owner, NAMESPACE, { placements: false })
   } catch (error) {
     if (!isMidaError(error, "CAPABILITY_DENIED")) throw error
     objects = []
