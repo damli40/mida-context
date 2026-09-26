@@ -959,10 +959,12 @@ describe("mida install devin", () => {
     expect(resolveDevinConfigPath({ MIDA_DEVIN_CONFIG: "/tmp/x.json" }, home)).toBe("/tmp/x.json")
   })
 
-  it("runInstall routes install/uninstall devin to the devin config, with no Codex trust sentence", () => {
+  it("runInstall refuses install devin — the identity half makes it an owner command (in-9) — while uninstall stays local", () => {
     const config = devinConfig()
     const lines: string[] = []
     const home = new MidaHome(join(dir(), "mida-home"))
+    // the install half moved to the owner command: it provisions the devin identity, so the
+    // local config-only path refuses it exactly like install <mcp-client>
     const code = runInstall(["install", "devin"], {
       print: (line) => lines.push(line),
       claudeSettings: join(dir(), "settings.json"),
@@ -970,12 +972,12 @@ describe("mida install devin", () => {
       devinConfig: config,
       home,
     })
-    expect(code).toBe(0)
-    expect(lines).toEqual(["installed"])
-    expect(existsSync(config)).toBe(true)
-    // no trust reminder — that sentence is Codex's alone
-    expect(lines.some((line) => line.includes("trust"))).toBe(false)
+    expect(code).toBe(2)
+    expect(lines.some((line) => line.includes("owner command"))).toBe(true)
+    expect(existsSync(config)).toBe(false)
     lines.length = 0
+    // uninstall is config-only — no identity work — so it stays local
+    installDevin(config)
     expect(
       runInstall(["uninstall", "devin"], {
         print: (line) => lines.push(line),
@@ -1026,7 +1028,7 @@ describe("runInstall for the clients", () => {
   })
 
   it("install <client> is refused here — the identity half belongs to the owner command", () => {
-    for (const client of ["claude-desktop", "cursor"]) {
+    for (const client of ["claude-desktop", "cursor", "devin"]) {
       const { code, lines } = run(["install", client], { cwd: dir() })
       expect(code).toBe(2)
       expect(lines.some((line) => line.includes("owner command"))).toBe(true)

@@ -6,7 +6,7 @@ import { BaseError } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
 import type { Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
@@ -192,6 +192,31 @@ describe("the crude mida command", () => {
     expect(lines).toContain("next: run `mida approve cursor` in this folder")
     // the per-workspace config carries personal absolute paths — the owner is told not to commit it
     expect(lines.filter((line) => line.includes(".cursor/mcp.json") && line.includes("commit"))).toHaveLength(1)
+  }, 300_000)
+
+  it("install devin provisions the identity and writes the hook config — init alone registers no devin (in-9)", async () => {
+    // A fresh home: `init` must NOT register a devin identity for an owner who never asked —
+    // and `mida install devin` is where one comes from (the in-7 default-list change reversed).
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-devincli-")))
+    const config = join(mkdtempSync(join(tmpdir(), "mida-devincfg-")), "config.json")
+    const out: string[] = []
+    const run3 = (...argv: string[]) =>
+      runCli(argv, {
+        home: fresh, network, cwd: projectDir, print: (line) => out.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true, devinConfig: config,
+      })
+    expect(await run3("init")).toBe(0)
+    expect(loadAgentIdentity(fresh, "devin")).toBeUndefined()
+
+    expect(await run3("install", "devin")).toBe(0)
+    // the install did the provisioning AND the hook edit — `mida approve devin` completes it
+    expect(loadAgentIdentity(fresh, "devin")?.name).toBe("devin")
+    expect(fresh.has("agents/devin/pending-request.json")).toBe(true)
+    expect(devinHooksStatus(config)).toBe("installed")
+    expect(out).toContain("next: run `mida approve devin` in this folder")
+    // and the provisioned name is a real approve target even though it is not a default agent
+    expect(await run3("approve", "devin")).toBe(0)
+    expect(out.some((line) => line.startsWith("approved devin"))).toBe(true)
   }, 300_000)
 
   it("install <client> asks for a real terminal like approve, a non-client is usage, the daemon refuses it", async () => {

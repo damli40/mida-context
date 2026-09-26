@@ -37,9 +37,14 @@ import { migrate, migrateUndo } from "./migrate.js"
 import { OwnerLinkOutcome, approvePasskey, initPasskey, provisionPasskeyAgents, revokePasskey } from "./owner-link/flows.js"
 import type { PasskeyDeps } from "./owner-link/flows.js"
 
-/** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. */
-const AGENTS = ["claude-code", "codex", "devin", "assistant"]
-/** The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use. Only the real tools can be installed or doctored. */
+/**
+ * The agents `mida init` provisions — `assistant` is a stand-in for any other assistant you use.
+ * in-9: `devin` is deliberately absent — `mida init` on a machine that never runs Devin must not
+ * register a devin identity (an on-chain transaction) for it. `mida install devin` is the
+ * provision pass: an owner command exactly like `install <mcp-client>`.
+ */
+const AGENTS = ["claude-code", "codex", "assistant"]
+/** Only the real tools can be installed or doctored. */
 const HOOK_TOOLS = ["claude-code", "codex", "devin"]
 /** install takes a hook tool or an MCP client; `doctor --live` only ever checks the hook tools. */
 const INSTALL_TOOLS = [...HOOK_TOOLS, ...MCP_CLIENT_TOOLS]
@@ -156,6 +161,8 @@ export interface CliDeps {
   startService?: () => unknown | Promise<unknown>
   /** Claude Desktop's config file — `mida install claude-desktop` merges into it. Tests inject a temp path. */
   claudeDesktopConfig?: string
+  /** Devin's config file — `mida install devin` merges the hook block into it. Tests inject a temp path. */
+  devinConfig?: string
 }
 
 /**
@@ -482,20 +489,28 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       }
     } else if (command === "install") {
       const tool = argv[1] ?? ""
-      if (argv.length !== 2 || !MCP_CLIENT_TOOLS.includes(tool)) return usage()
-      const client = tool as McpClientTool
+      // devin is a hook tool, not an MCP client — but its install provisions an identity (in-9:
+      // init no longer registers one by default), so it is an owner command all the same.
+      if (argv.length !== 2 || !(MCP_CLIENT_TOOLS.includes(tool) || tool === "devin")) return usage()
       // the identity comes first — provisioning is init's per-agent pass over this one name, so
       // install is idempotent the same way init is: an existing identity is kept, a missing one
       // registers on chain as a project-context agent (never `assistant`)
-      await init(runtime, [client])
+      await init(runtime, [tool])
       // the pending request is what `mida approve <client>` completes — file one if none waits
-      if (!runtime.home.has(`agents/${client}/pending-request.json`)) {
+      if (!runtime.home.has(`agents/${tool}/pending-request.json`)) {
         try {
-          await requestAccess(runtime, client)
+          await requestAccess(runtime, tool)
         } catch (error) {
           if (refusalCode(error) !== "already-approved") throw error
         }
       }
+      if (tool === "devin") {
+        const outcome = installDevin(deps.devinConfig ?? resolveDevinConfigPath(process.env, homedir()))
+        deps.print(outcome === "already-installed" ? "already installed" : "installed")
+        deps.print(`next: run \`mida approve devin\` in this folder`)
+        return 0
+      }
+      const client = tool as McpClientTool
       const cwd = deps.cwd ?? process.cwd()
       const configPath = client === "cursor"
         ? cursorMcpConfigPath(cwd)
@@ -1005,24 +1020,31 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
     }
     if (command === "install") {
       const tool = argv[1] ?? ""
-      if (argv.length !== 2 || !MCP_CLIENT_TOOLS.includes(tool)) {
+      // devin too (in-9): the hook tool's install is where its identity comes from now.
+      if (argv.length !== 2 || !(MCP_CLIENT_TOOLS.includes(tool) || tool === "devin")) {
         deps.print(USAGE)
         return 2
       }
-      const client = tool as McpClientTool
       // registering a project-context agent needs no passkey round — the operator carries the
       // manifest — so install is one provision pass, exactly like the software path's init call
       const installSession = await ServiceRuntime.openOwnerSession(deps.home, deps.network)
       try {
         installSession.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
-        await provisionPasskeyAgents(installSession, [client], linkDeps)
-        if (!deps.home.has(`agents/${client}/pending-request.json`)) {
+        await provisionPasskeyAgents(installSession, [tool], linkDeps)
+        if (!deps.home.has(`agents/${tool}/pending-request.json`)) {
           try {
-            await requestAccess(installSession, client)
+            await requestAccess(installSession, tool)
           } catch (error) {
             if (refusalCode(error) !== "already-approved") throw error
           }
         }
+        if (tool === "devin") {
+          const outcome = installDevin(deps.devinConfig ?? resolveDevinConfigPath(process.env, homedir()))
+          deps.print(outcome === "already-installed" ? "already installed" : "installed")
+          deps.print(`next: run \`mida approve devin\` in this folder`)
+          return 0
+        }
+        const client = tool as McpClientTool
         const cwd = deps.cwd ?? process.cwd()
         const configPath = client === "cursor"
           ? cursorMcpConfigPath(cwd)
@@ -1361,14 +1383,16 @@ export function runInstall(
     deps.print(USAGE)
     return 2
   }
-  // An MCP client is not a hook tool: its install registers an identity and is an owner command
-  // (main routes it there); its uninstall only removes Mida's entry from the client's MCP config.
+  // An install that registers an identity is an owner command (main routes it there): the MCP
+  // clients' identities, and — since in-9 — devin's, which init no longer provisions by default.
+  if (argv[0] === "install" && (MCP_CLIENT_TOOLS.includes(tool) || tool === "devin")) {
+    deps.print(`mida install ${tool} is an owner command — run it in your own terminal`)
+    return 2
+  }
+  // An MCP client is not a hook tool: its uninstall only removes Mida's entry from the client's
+  // MCP config; the identity and its approvals are untouched either way.
   if (MCP_CLIENT_TOOLS.includes(tool)) {
     const client = tool as McpClientTool
-    if (argv[0] === "install") {
-      deps.print(`mida install ${client} is an owner command — run it in your own terminal`)
-      return 2
-    }
     const cwd = deps.cwd ?? process.cwd()
     const configPath = client === "cursor"
       ? cursorMcpConfigPath(cwd)
@@ -1465,9 +1489,10 @@ async function main(): Promise<void> {
   // install, uninstall and doctor are local commands: they never go through the daemon.
   // install edits the tool's own config outside the Mida home, and doctor's first check is
   // whether the daemon is even up — running it through the socket would report on nothing.
-  // `install <client>` is the exception: it registers the client's identity on the chain, so it
-  // falls through to the owner commands like approve.
-  if (argv[0] === "uninstall" || (argv[0] === "install" && !(argv.length === 2 && MCP_CLIENT_TOOLS.includes(argv[1] ?? "")))) {
+  // `install <client>` and `install devin` are the exception: they register the tool's identity
+  // on the chain (in-9: devin's install is its provision pass), so they fall through to the
+  // owner commands like approve.
+  if (argv[0] === "uninstall" || (argv[0] === "install" && !(argv.length === 2 && (MCP_CLIENT_TOOLS.includes(argv[1] ?? "") || argv[1] === "devin")))) {
     // the real settings paths are built here and only here — tests always pass their own
     process.exitCode = runInstall(argv, {
       print,
