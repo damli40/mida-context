@@ -34,6 +34,7 @@ import {
   loadOwnerAddress,
   migrate,
   migrateUndo,
+  readEnvelope,
   readOwnerFacts,
   readOwnerUniverse,
   requestAccess,
@@ -263,15 +264,21 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
       }
       expect(handoffAfter.text).toContain(MOVED_ON)
       expect(handoffAfter.text).toContain("claude-code")
-      // the moved record's displayed instant is its ORIGINAL write time — the stamp the source
-      // chain put on the record, carried by the sealed envelope (in-12 N-1: not the checkpoint's
-      // createdAt claim, which is untrusted writer content and never renders)
-      const sourceStamp = await new RegistryReader({ publicClient, deployment: source }).getRecord(seeded.seed.checkpointId)
-      expect(sourceStamp).not.toBeNull()
-      const originalWriteInstant = new Date(Number(sourceStamp!.createdAt) * 1000).toISOString()
+      // The moved record's displayed instant is its ORIGINAL write day — the time the owner
+      // sealed into the migration envelope, read back off the TARGET record itself (in-12 N-1:
+      // on the source the same record displays its chain stamp, so before/after instants
+      // legitimately differ; the envelope is the only place a writer's claim participates).
+      const movedHead = universeAfter.find(
+        (record) =>
+          record.contextId.toLowerCase() ===
+          manifest.entries.find((entry) => entry.sourceId.toLowerCase() === seeded.seed.checkpointId.toLowerCase())!.targetId!.toLowerCase(),
+      )!
+      const envelope = readEnvelope(movedHead.payload)
+      expect(envelope).not.toBeUndefined()
+      const originalWriteInstant = new Date(Date.parse(envelope!.originalCreatedAt)).toISOString()
       expect(handoffAfter.text).toContain(originalWriteInstant)
       expect(handoffAfter.savedBy).toBe(handoffBefore.savedBy)
-      expect(handoffAfter.savedAt).toBe(handoffBefore.savedAt)
+      expect(handoffAfter.savedAt).toBe(originalWriteInstant)
 
       // "What moved", read back off the TARGET contract — never a value the test seeded itself.
       expect(universeAfter).toHaveLength(10)
@@ -310,9 +317,13 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
       const shape = (facts: OwnerFact[]) => facts.map((fact) => ({ namespace: fact.namespace, text: fact.text }))
       expect(shape(factsAfter)).toEqual(shape(factsBefore).map((fact) => ({ ...fact, text: `${fact.text} ${MOVED_ON}` })))
 
-      // The handoff text: original author and original save time, plus the "(moved on …)" marker —
-      // everything else identical, so stripping the marker and the new record ids must reproduce
-      // the pre-move text exactly.
+      // The handoff text: original author, plus the "(moved on …)" marker — everything else
+      // identical, so stripping the marker, the new record ids and the rendered instants must
+      // reproduce the pre-move text exactly. Times are masked rather than compared (in-12 N-1):
+      // on the source every record displays its chain stamp, while on the target a moved record
+      // displays min(envelope originalCreatedAt, target stamp) — the original write day, asserted
+      // precisely against the envelope above — so "saved …", "as they were at …", per-fact
+      // instants and relative ages legitimately differ.
       const normalize = (text: string): string =>
         text
           .replace(/ \(moved on \d{4}-\d{2}-\d{2}\)/g, "")
@@ -320,6 +331,10 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
           // moved records carry new target ids the same way the Saved-by `record 0x…` ids do
           .replace(/id [0-9a-fA-F]{8}\b/g, "id *")
           .replace(/0x[0-9a-fA-F]+/g, "0x*")
+          .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g, "<iso>")
+          .replace(/\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC/g, "<day-time>")
+          .replace(/\b\d{2}:\d{2} UTC\b/g, "<time>")
+          .replace(/\((just now|\d+ \w+ ago)\)/g, "(<ago>)")
       expect(normalize(handoffAfter.text)).toBe(normalize(handoffBefore.text))
     },
     TIMEOUT,
