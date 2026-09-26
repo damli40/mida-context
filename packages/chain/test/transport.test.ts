@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { createPublicClient, decodeFunctionData, encodeFunctionResult, parseAbi } from "viem"
 import type { Hex } from "viem"
 import { foundry, monadTestnet } from "viem/chains"
-import { createWriteContext, rpcTransport, rpcTransportProbe } from "@mida/chain"
+import { ChainBusyError, createWriteContext, isChainBusy, rpcTransport, rpcTransportProbe } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 
 const ok = (body: { id?: number }) =>
@@ -165,5 +165,86 @@ describe("multicall batching (in-6 R2)", () => {
     expect(answers).toEqual([42n, 42n, 42n])
     expect(rpcTransportProbe.sentAt).toHaveLength(3)
     expect(seen.targets.every((t) => t !== MULTICALL3)).toBe(true)
+  }, 30_000)
+})
+
+// ---------------------------------------------------------------------------
+// in-6 R3 — a rate-limited answer is retried, then named ChainBusyError
+// ---------------------------------------------------------------------------
+
+/** The Sep 25 live answer: a 200 holding a JSON-RPC rate-limit error. */
+const limited = (body: { id?: number }) =>
+  new Response(
+    JSON.stringify({ jsonrpc: "2.0", id: body.id ?? 1, error: { code: -32005, message: "requests limited to 15/sec" } }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  )
+
+describe("rate-limit retries (in-6 R3)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    rpcTransportProbe.reset()
+  })
+
+  const call = () => {
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport("http://r3.test") })
+    return client.request({ method: "eth_chainId" })
+  }
+
+  it("two rate-limited answers then success → the call succeeds; each attempt is one HTTP request", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      calls += 1
+      const body = JSON.parse(String(init?.body))
+      return calls <= 2 ? limited(body) : ok(body)
+    }))
+    await expect(call()).resolves.toBe("0x7a69")
+    expect(calls).toBe(3)
+    expect(rpcTransportProbe.sentAt).toHaveLength(3)
+  }, 30_000)
+
+  it("an HTTP 429 is retried the same way — then succeeds", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      calls += 1
+      if (calls === 1) return new Response("slow down", { status: 429 })
+      const body = JSON.parse(String(init?.body))
+      return ok(body)
+    }))
+    await expect(call()).resolves.toBe("0x7a69")
+    expect(calls).toBe(2)
+  }, 30_000)
+
+  it("always rate-limited → ChainBusyError after exactly 3 retries, delays 250/500/1000 ms", async () => {
+    const fetchAt: number[] = []
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      fetchAt.push(Date.now())
+      const body = JSON.parse(String(init?.body))
+      return limited(body)
+    }))
+    const error = await call().then(() => null, (e) => e as Error)
+    // viem wraps the fetchFn failure in HttpRequestError — the typed error is down the cause chain
+    expect(isChainBusy(error)).toBe(true)
+    expect(error).not.toBeInstanceOf(ChainBusyError)
+    expect(fetchAt).toHaveLength(4) // 1 try + 3 retries
+    const gaps = fetchAt.slice(1).map((t, i) => t - fetchAt[i]!)
+    expect(gaps[0]).toBeGreaterThanOrEqual(240)
+    expect(gaps[1]).toBeGreaterThanOrEqual(490)
+    expect(gaps[2]).toBeGreaterThanOrEqual(990)
+  }, 30_000)
+
+  it("a non-busy RPC error is NOT retried by this layer", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      calls += 1
+      const body = JSON.parse(String(init?.body))
+      return new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: body.id ?? 1, error: { code: -32602, message: "invalid params" } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      )
+    }))
+    await expect(call()).rejects.toThrow()
+    expect(calls).toBe(1)
+    expect(isChainBusy(await call().then(() => null, (e) => e))).toBe(false)
+    expect(calls).toBe(2)
   }, 30_000)
 })
