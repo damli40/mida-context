@@ -55,10 +55,11 @@ export interface MergedHandoff {
   // The newest session in the chosen chain — the session a handoff recipient continues.
   headSessionId: string
   /**
-   * The save time the handoff header reports: Monad's stamp on the newest chain-placed record
-   * the merge covered, ISO-8601. `checkpoint.createdAt` is the writer's own claim and never
-   * fills this — when no merged record carries a chain placement (a fixture, or a merge made
-   * of hand-built records) it is null and the header says "not yet confirmed" instead.
+   * The save time the handoff header reports: the newest EFFECTIVE instant among chain-placed
+   * records the merge covered, ISO-8601 — a migrated save reports when it was written, not the
+   * move day (in-11 R-10). `checkpoint.createdAt` is the writer's own claim and never fills
+   * this — when no merged record carries a chain placement (a fixture, or a merge made of
+   * hand-built records) it is null and the header says "not yet confirmed" instead.
    */
   savedAt: string | null
   originalRequest: string | null
@@ -103,9 +104,14 @@ export const orderTime = (s: StoredCheckpoint): number => {
   return Number.isNaN(original) ? at : Math.min(original, at)
 }
 
-/** The ISO stamp a record is reported with — Monad's when carried, else the writer's claim. */
+/**
+ * The ISO stamp a record is reported with — its EFFECTIVE instant, the same one `orderTime`
+ * sorts by (in-11 R-10): Monad's stamp when carried, lowered toward a moved record's
+ * originalCreatedAt — a record `mida migrate` copied on Sep 24 displays when it was written,
+ * not the move day. A record with no chain placement keeps the writer's claim.
+ */
 export const recordedAt = (s: StoredCheckpoint): string =>
-  s.chain === undefined ? s.checkpoint.createdAt : new Date(Number(s.chain.at) * 1000).toISOString()
+  s.chain === undefined ? s.checkpoint.createdAt : new Date(orderTime(s)).toISOString()
 
 /**
  * The order Monad wrote the saves in: each record's effective instant (its chain stamp, moved
@@ -302,16 +308,18 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
   }
 
   // The header's "saved <time>" is the newest CONFIRMED stamp in the merge — the largest
-  // chain.at any scoped record carries. A record with no chain placement (a hand-built one;
-  // pending saves never reach the merge) cannot set it, and cannot suppress it either.
-  const savedAt = scope.reduce<bigint | undefined>(
-    (max, s) => (s.chain === undefined ? max : max === undefined || s.chain.at > max ? s.chain.at : max),
+  // EFFECTIVE instant any chain-placed record carries (in-11 R-10: a migrated save's min of
+  // original write and move stamp — the header says when the work was saved, not when it was
+  // copied). A record with no chain placement (a hand-built one; pending saves never reach the
+  // merge) cannot set it, and cannot suppress it either.
+  const savedAt = scope.reduce<number | undefined>(
+    (max, s) => (s.chain === undefined ? max : max === undefined || orderTime(s) > max ? orderTime(s) : max),
     undefined,
   )
 
   return {
     headSessionId: chosen.newest.sessionId,
-    savedAt: savedAt === undefined ? null : new Date(Number(savedAt) * 1000).toISOString(),
+    savedAt: savedAt === undefined ? null : new Date(savedAt).toISOString(),
     originalRequest: cps.find((c) => c.originalRequest !== null)?.originalRequest ?? null,
     objective: mergedField(cps, "objective", ""),
     remainingPlan: mergedField(cps, "remainingPlan", []),

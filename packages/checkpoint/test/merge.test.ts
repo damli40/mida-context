@@ -389,4 +389,60 @@ describe("mergeCheckpoints", () => {
   it("savedAt is null when no merged record carries a chain placement", () => {
     expect(mergeCheckpoints([stored({ at: "2026-09-21T10:00:00Z" })])!.savedAt).toBeNull()
   })
+
+  // in-11 R-10 — every displayed time is the same effective instant the ordering already uses:
+  // min(originalCreatedAt, chain stamp). Since the owner migrated live on Sep 24, the raw stamp
+  // would print the MOVE day on every older fact; the effective instant prints the write day.
+  const envelope = (originalCreatedAt: string): StoredCheckpoint["migration"] => ({
+    version: 1,
+    originalChainId: "31337",
+    originalContract: `0x${"1".repeat(40)}`,
+    originalRecordId: `0x${"2".repeat(64)}`,
+    originalCommitment: `0x${"3".repeat(64)}`,
+    originalAuthor: `0x${"4".repeat(64)}`,
+    originalCreatedAt,
+    migratedAt: "2026-09-24T12:00:00.000Z",
+  })
+
+  it("a moved record's provenance reports when it was written, not the replay day (R-10)", () => {
+    const moved = stored({
+      sessionId: "s-moved", at: "2026-09-24T10:00:00.000Z", objective: "moved save", progress: ["p"],
+      chain: { at: 1_800_000_000n, block: 9n, index: 0 },
+    })
+    moved.migration = envelope("2026-09-21T10:00:00.000Z")
+    const m = mergeCheckpoints([moved])!
+    expect(m.provenance[0]!.createdAt).toBe("2026-09-21T10:00:00.000Z")
+    // and the header's "saved" line reports the same original instant, not the replay stamp
+    expect(m.savedAt).toBe("2026-09-21T10:00:00.000Z")
+  })
+
+  it("an unmoved record beside a moved one keeps its own stamp — only the moved time is lowered (R-10)", () => {
+    const moved = stored({
+      sessionId: "s-moved", at: "2026-09-24T10:00:00.000Z", objective: "moved save", progress: ["p"],
+      chain: { at: 1_800_000_000n, block: 9n, index: 0 },
+    })
+    moved.migration = envelope("2026-09-21T10:00:00.000Z")
+    const honest = stored({
+      sessionId: "s-honest", at: "2026-09-24T11:00:00.000Z", objective: "honest save", progress: ["p"],
+      chain: { at: 1_800_000_100n, block: 10n, index: 0 },
+    })
+    const m = mergeCheckpoints([moved, honest])!
+    // the honest save is newer: header + its own provenance carry its real stamp, while the
+    // moved save's row shows its original write day in the other-sessions list
+    expect(m.savedAt).toBe(new Date(1_800_000_100_000).toISOString())
+    expect(m.otherSessions[0]!.sessionId).toBe("s-moved")
+    expect(m.otherSessions[0]!.lastSavedAt).toBe("2026-09-21T10:00:00.000Z")
+  })
+
+  it("a forged-future envelope cannot make a moved record look newer than its replay (R-10)", () => {
+    const moved = stored({
+      sessionId: "s-moved", at: "2026-09-24T10:00:00.000Z", objective: "moved save", progress: ["p"],
+      chain: { at: 1_800_000_000n, block: 9n, index: 0 },
+    })
+    moved.migration = envelope("2099-01-01T00:00:00.000Z")
+    const m = mergeCheckpoints([moved])!
+    // the envelope may only AGE its record — a claim past the chain stamp collapses to it
+    expect(m.provenance[0]!.createdAt).toBe(new Date(1_800_000_000_000).toISOString())
+    expect(m.savedAt).toBe(new Date(1_800_000_000_000).toISOString())
+  })
 })

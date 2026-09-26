@@ -216,7 +216,9 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string, opti
         // a contradictory envelope — carried in both slots — sorts by chain time, never fatal
       }
       facts.push({
-        fact: { text, contextId: object.contextId, namespace, assertedAt: new Date(Number(record.createdAt) * 1000).toISOString() },
+        // The stamp every reader prints is the same effective instant the sort uses — a moved
+        // fact shows when it was stated, not the replay day (in-11 R-10).
+        fact: { text, contextId: object.contextId, namespace, assertedAt: new Date(statedAt).toISOString() },
         statedAt,
         // Monad's own placement of the record — the tie-break below; an object read without
         // chain placement simply has none and loses a same-second tie to a placed one.

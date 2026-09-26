@@ -260,6 +260,32 @@ describe("migrated facts in the fact list (migrate B2)", () => {
     expect(lines).toContain("  preferences.communication: answers in lowercase (moved on 2026-09-25) (id 66666666, 2025-09-16 05:20 UTC)")
   })
 
+  it("a moved fact's stamp is when it was stated, not the replay day (in-11 R-10)", async () => {
+    // The record replayed onto the new contract on Sep 25 (chain stamp), but the fact itself
+    // was stated Sep 18 — the envelope's originalCreatedAt. assertedAt must print the write
+    // day, or every migrated fact wears the migration's date.
+    const moved = factObject("answers in lowercase", `0x${"66".repeat(32)}` as Hex, MIGRATION)
+    const runtime = {
+      home: new MidaHome(mkdtempSync(join(tmpdir(), "mida-migfact-"))),
+      owner: `0x${"55".repeat(20)}`,
+      agent: () => ({
+        read: async (_owner: string, namespace: string) => (namespace === "preferences.communication" ? [moved] : []),
+      }),
+      reader: {
+        getRecord: async () => ({
+          author: OWNER_AUTHOR_ID,
+          provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED,
+          createdAt: 1_800_000_000n, // the replay's stamp — later than the original write
+          parentId: `0x${"00".repeat(32)}`,
+        }),
+      },
+    } as unknown as ServiceRuntime
+    const facts = await readOwnerFacts(runtime, "claude-code")
+    expect(facts).toHaveLength(1)
+    expect(facts[0]!.assertedAt).toBe("2026-09-18T10:00:00.000Z")
+    expect(facts[0]!.text).toBe("answers in lowercase (moved on 2026-09-25)")
+  })
+
   it("orders by the envelope's originalCreatedAt, not the replay's fresh chain stamp (migrate B7b)", async () => {
     // The target stamps chain createdAt at replay — whole seconds, several records a second —
     // so it cannot order moved facts. Here the chain times postdate both envelopes (honest:
