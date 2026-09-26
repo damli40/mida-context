@@ -12,6 +12,17 @@ const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url))
 const HOOK_MAIN = fileURLToPath(new URL("../src/hook-main.ts", import.meta.url))
 
 /**
+ * The environment a spawned hook sees. DEVIN_PROJECT_DIR is removed: when these tests run under
+ * Devin the var leaks through process.env, and the foreign-client guard would (correctly) ignore
+ * every claude-code/codex payload. Tests about the guard set it back explicitly.
+ */
+const cleanEnv = (): NodeJS.ProcessEnv => {
+  const env = { ...process.env }
+  delete env.DEVIN_PROJECT_DIR
+  return env
+}
+
+/**
  * `dir` plays the user's real home folder (injected as `homeDir`): the transcript must sit under
  * its `.claude/projects/` for a `claude-code` hook, exactly where Claude Code keeps sessions.
  */
@@ -212,6 +223,45 @@ describe("runHook", () => {
     expect(listJobs(home)).toHaveLength(1)
   })
 
+  it("a non-devin hook running inside Devin's environment is ignored — no job, no spawn, one log line", async () => {
+    const { dir, home, stdinFor } = setup()
+    // Devin imports other clients' installed hooks and runs them itself; DEVIN_PROJECT_DIR is
+    // set on every hook process it spawns. A claude-code entry firing there is a replay, not a
+    // real Claude Code session — nothing may be queued under claude-code's name.
+    for (const agent of ["claude-code", "codex"]) {
+      let spawned = 0
+      await runHook({
+        agent,
+        stdin: stdinFor(),
+        home,
+        homeDir: dir,
+        env: { DEVIN_PROJECT_DIR: join(dir, "work") },
+        spawnDrainer: () => { spawned += 1 },
+      })
+      expect(spawned).toBe(0)
+    }
+    expect(listJobs(home)).toHaveLength(0)
+    const lines = readFileSync(home.path("logs/hook.jsonl"), "utf8").trim().split("\n")
+    expect(lines).toHaveLength(2)
+    for (const line of lines) {
+      expect(line).toContain('"outcome":"ignored"')
+      expect(line).toContain('"reason":"foreign-client"')
+    }
+  })
+
+  it("the same payload without DEVIN_PROJECT_DIR still enqueues — the guard reads the injected env", async () => {
+    const { dir, home, stdinFor } = setup()
+    await runHook({
+      agent: "claude-code",
+      stdin: stdinFor(),
+      home,
+      homeDir: dir,
+      env: {},
+      spawnDrainer: () => {},
+    })
+    expect(listJobs(home)).toHaveLength(1)
+  })
+
   it("accepts a codex rollout under the recorded CODEX_HOME, and still refuses outside it", () => {
     const user = mkdtempSync(join(tmpdir(), "u-"))
     const codexHome = mkdtempSync(join(tmpdir(), "ch-"))
@@ -319,7 +369,7 @@ describe("hook-main process", () => {
     const started = Date.now()
     const res = spawnSync(process.execPath, ["--import", "tsx", HOOK_MAIN, "claude-code"], {
       input: stdinFor(),
-      env: { ...process.env, MIDA_HOME: homeDir, HOME: dir },
+      env: { ...cleanEnv(), MIDA_HOME: homeDir, HOME: dir },
       encoding: "utf8",
       timeout: 20_000,
       cwd: REPO_ROOT,
@@ -334,7 +384,7 @@ describe("hook-main process", () => {
     const homeDir = join(dir, "hook-home")
     const res = spawnSync(process.execPath, ["--import", "tsx", HOOK_MAIN, "claude-code"], {
       input: stdinFor({ padding: "x".repeat(2 * 1024 * 1024) }),
-      env: { ...process.env, MIDA_HOME: homeDir, HOME: dir },
+      env: { ...cleanEnv(), MIDA_HOME: homeDir, HOME: dir },
       encoding: "utf8",
       timeout: 20_000,
       cwd: REPO_ROOT,
@@ -352,7 +402,7 @@ describe("hook-main process", () => {
     home.writeSecretJson("migrate/in-progress", { at: "2026-09-23T12:00:00.000Z", target: "0xabc" })
     const res = spawnSync(process.execPath, ["--import", "tsx", HOOK_MAIN, "claude-code"], {
       input: stdinFor(),
-      env: { ...process.env, MIDA_HOME: homeDir, HOME: dir },
+      env: { ...cleanEnv(), MIDA_HOME: homeDir, HOME: dir },
       encoding: "utf8",
       timeout: 20_000,
       cwd: REPO_ROOT,
@@ -366,12 +416,29 @@ describe("hook-main process", () => {
     expect(log).toContain("migration-in-progress")
   }, 30_000)
 
+  it("mida-hook claude-code with DEVIN_PROJECT_DIR set queues nothing, prints nothing, logs foreign-client", () => {
+    const { dir, stdinFor } = setup()
+    const homeDir = join(dir, "hook-home")
+    const res = spawnSync(process.execPath, ["--import", "tsx", HOOK_MAIN, "claude-code"], {
+      input: stdinFor(),
+      env: { ...cleanEnv(), MIDA_HOME: homeDir, HOME: dir, DEVIN_PROJECT_DIR: join(dir, "work") },
+      encoding: "utf8",
+      timeout: 20_000,
+      cwd: REPO_ROOT,
+    })
+    expect(res.status).toBe(0)
+    expect(res.stdout).toBe("")
+    expect(listJobs(new MidaHome(homeDir))).toHaveLength(0)
+    const log = readFileSync(new MidaHome(homeDir).path("logs/hook.jsonl"), "utf8")
+    expect(log).toContain('"reason":"foreign-client"')
+  }, 30_000)
+
   it("a payload over 1 MB of junk logs input-too-large, never unreadable-input", () => {
     const { dir } = setup()
     const homeDir = join(dir, "hook-home")
     const res = spawnSync(process.execPath, ["--import", "tsx", HOOK_MAIN, "claude-code"], {
       input: "z".repeat(2 * 1024 * 1024),
-      env: { ...process.env, MIDA_HOME: homeDir, HOME: dir },
+      env: { ...cleanEnv(), MIDA_HOME: homeDir, HOME: dir },
       encoding: "utf8",
       timeout: 20_000,
       cwd: REPO_ROOT,

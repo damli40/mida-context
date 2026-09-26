@@ -121,6 +121,20 @@ async function main(): Promise<void> {
     }
   }
   const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
+  // Same guard as the save hook: inside Devin's environment (DEVIN_PROJECT_DIR is set on every
+  // hook process it spawns) a Mida entry for any other client is Devin replaying that client's
+  // imported hooks — no handoff, no what's-new note, no output, one log line. It sits before the
+  // whats-new dispatch so a replayed prompt can never reach the daemon.
+  if (agent !== "devin" && process.env.DEVIN_PROJECT_DIR !== undefined) {
+    appendLog(home, "hook", {
+      agent: agent ?? null,
+      event: typeof record.hook_event_name === "string" ? record.hook_event_name : null,
+      sessionId: typeof record.session_id === "string" ? record.session_id : null,
+      outcome: "ignored",
+      reason: "foreign-client",
+    })
+    return
+  }
   // the prompt hook is a different contract — silent always, even on bad input or a bad name:
   // it dispatches before the checks that print SessionStart-shaped refusals
   if (record.hook_event_name === "UserPromptSubmit") {

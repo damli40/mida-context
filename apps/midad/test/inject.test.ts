@@ -18,10 +18,18 @@ const home = () => new MidaHome(mkdtempSync(join(tmpdir(), "mida-inject-")))
  * a synchronous spawn would freeze this process's event loop and the fake daemon below could
  * never answer the child's socket calls.
  */
-const run = (args: string[], input: string, homeDir: string): Promise<{ status: number | null; stdout: string; stderr: string }> =>
+const run = (
+  args: string[],
+  input: string,
+  homeDir: string,
+  extraEnv: NodeJS.ProcessEnv = {},
+): Promise<{ status: number | null; stdout: string; stderr: string }> =>
   new Promise((resolve, reject) => {
+    const env = { ...process.env, MIDA_HOME: homeDir, ...extraEnv }
+    // tests run under Devin inherit DEVIN_PROJECT_DIR — delete it so only the guard tests see it
+    if (extraEnv.DEVIN_PROJECT_DIR === undefined) delete env.DEVIN_PROJECT_DIR
     const child = spawn(process.execPath, ["--import", "tsx", INJECT_MAIN, ...args], {
-      env: { ...process.env, MIDA_HOME: homeDir },
+      env,
       cwd: REPO_ROOT,
     })
     let stdout = ""
@@ -324,6 +332,53 @@ describe("inject-main process", () => {
       const res = await run(["codex"], sessionStart(), dir.root)
       expect(res.status).toBe(0)
       expect(dir.has("state/lastseen/s1.json")).toBe(false)
+    } finally {
+      await close(server)
+    }
+  }, 30_000)
+})
+
+describe("inject-main process — foreign-client guard", () => {
+  // Devin runs the hooks it imported from other clients' config with DEVIN_PROJECT_DIR set on
+  // the process. A mida-inject entry for any agent but devin firing there is a replay: no
+  // socket call, no output, one log line.
+  it("a SessionStart inside Devin prints nothing and never reaches the daemon", async () => {
+    const { dir, server } = await liveDaemon(handoffBody())
+    try {
+      const res = await run(["claude-code"], sessionStart(), dir.root, { DEVIN_PROJECT_DIR: "/tmp/work" })
+      expect(res.status).toBe(0)
+      expect(res.stderr).toBe("")
+      expect(res.stdout).toBe("")
+      const log = readFileSync(dir.path("logs/hook.jsonl"), "utf8")
+      expect(log).toContain('"reason":"foreign-client"')
+    } finally {
+      await close(server)
+    }
+  }, 30_000)
+
+  it("a UserPromptSubmit inside Devin prints nothing and never reaches the daemon", async () => {
+    const dir = home()
+    let requests = 0
+    const daemon = await whatsnewDaemon(dir, { kind: "updates", note: "N", updates: [], seen: [] })
+    daemon.server.on("connection", () => { requests += 1 })
+    try {
+      const res = await run(["codex"], promptSubmit(), dir.root, { DEVIN_PROJECT_DIR: "/tmp/work" })
+      expect(res.status).toBe(0)
+      expect(res.stderr).toBe("")
+      expect(res.stdout).toBe("")
+      expect(readFileSync(dir.path("logs/hook.jsonl"), "utf8")).toContain('"reason":"foreign-client"')
+    } finally {
+      await daemon.stop()
+    }
+  }, 30_000)
+
+  it("a devin entry inside Devin's environment is NOT guarded — it runs normally", async () => {
+    const { dir, server } = await liveDaemon({ kind: "empty", text: "Mida: connected. Nothing has been saved for this project yet." })
+    try {
+      const res = await run(["devin"], sessionStart(), dir.root, { DEVIN_PROJECT_DIR: "/tmp/work" })
+      expect(res.status).toBe(0)
+      const out = envelope(res.stdout)
+      expect(out.systemMessage).toBe("Mida: connected — nothing saved for this project yet")
     } finally {
       await close(server)
     }

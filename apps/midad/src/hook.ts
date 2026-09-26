@@ -141,6 +141,15 @@ export async function runHook(input: {
     const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
     event = typeof record.hook_event_name === "string" ? record.hook_event_name : null
     sessionId = typeof record.session_id === "string" ? record.session_id : null
+    // Devin imports other clients' hook config and replays it under its own environment, which
+    // sets DEVIN_PROJECT_DIR on every hook process it spawns. A Mida entry for any agent but
+    // devin firing there is a replay, not that client's real session — nothing may be queued or
+    // saved under the wrong identity. The env comes from the caller, never process.env, so the
+    // decision does not depend on who spawned the test or drainer.
+    if (input.agent !== "devin" && input.env.DEVIN_PROJECT_DIR !== undefined) {
+      log({ event, sessionId, outcome: "ignored", reason: "foreign-client" })
+      return
+    }
     if (event === null || !KNOWN_EVENTS.has(event)) {
       log({ event, sessionId, outcome: "ignored", reason: "unknown-event" })
       return
