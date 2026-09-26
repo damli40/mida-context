@@ -320,7 +320,7 @@ export function batchClient(
 ): ContextApiClient | undefined {
   const identity = loadAgentIdentity(home, agentName)
   if (identity === undefined) return undefined
-  return apiClient(baseUrl, deployment, privateKeyToAccount(identity.signerPrivateKey))
+  return apiClient(baseUrl, deployment, privateKeyToAccount(identity.signerPrivateKey), undefined, home)
 }
 
 /**

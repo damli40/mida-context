@@ -53,6 +53,31 @@ describe("a new client against a store that predates the write check (in-11 R-3)
     warn.mockRestore()
   })
 
+  it("a provided warn sink receives the line instead of stderr — the daemon's log (in-12 N-7)", async () => {
+    vi.resetModules()
+    const { ContextApiClient: FreshClient } = await import("../src/client.js")
+    const sink: string[] = []
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const client = new FreshClient({
+      baseUrl: "https://store.example",
+      account: ACCOUNT,
+      chainId: 10143n,
+      capabilityRegistry: "0x2222222222222222222222222222222222222222",
+      fetch: async () => plainText(404, "404 Not Found"),
+      warn: (message) => sink.push(message),
+    })
+    try {
+      await expect(client.writeAuthority({ owner: OWNER, namespaceId: NAMESPACE, capabilityId: CAPABILITY })).resolves.toEqual({ ok: true })
+      expect(sink).toHaveLength(1)
+      expect(sink[0]).toContain("store-predates-write-check")
+      expect(sink[0]).toContain("store.example")
+      // and stderr stays clean — the sink owns the line
+      expect(warn).not.toHaveBeenCalled()
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
   it("a coded JSON 404 is the current store giving a real answer — never the compat path", async () => {
     const client = makeClient(
       async () => new Response(JSON.stringify({ error: { code: "NOT_FOUND", message: "no such capability" } }), { status: 404, headers: { "content-type": "application/json" } }),

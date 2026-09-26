@@ -11,6 +11,7 @@ import { FakeVaultAuthority } from "@mida/fake-vault"
 import { MidaAgent } from "@mida/sdk"
 import type { MidaHome } from "./home.js"
 import { callDaemon } from "./control.js"
+import { daemonWarning } from "./log.js"
 import { FileAccessRequestStore } from "./request-store.js"
 import { listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerStartBlock, saveOwnerStartBlock } from "./keys.js"
 import type { AgentIdentity } from "./keys.js"
@@ -192,8 +193,23 @@ function processAlive(pid: number): boolean {
   }
 }
 
-export function apiClient(baseUrl: string, deployment: Deployment, account: LocalAccount, readScope?: string): ContextApiClient {
-  return new ContextApiClient({ baseUrl, account, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, ...(readScope === undefined ? {} : { readScope }) })
+export function apiClient(
+  baseUrl: string,
+  deployment: Deployment,
+  account: LocalAccount,
+  readScope?: string,
+  home?: MidaHome,
+): ContextApiClient {
+  return new ContextApiClient({
+    baseUrl,
+    account,
+    chainId: deployment.chainId,
+    capabilityRegistry: deployment.capabilityRegistry,
+    ...(readScope === undefined ? {} : { readScope }),
+    // a client built inside midad reports its compat warnings to the daemon log, not the
+    // stderr of a detached process (in-12 N-7); a home-less caller keeps console.warn
+    ...(home === undefined ? {} : { warn: daemonWarning(home) }),
+  })
 }
 
 /** A coded refusal — an agent-facing command that hits this must never print a bare `ERROR`. */
@@ -229,7 +245,7 @@ function buildAgent(
     callbackOrigin: identity.callbackOrigin,
     encryptionPrivateKey: bytesOf(identity.encryptionPrivateKey, 32),
     chain,
-    api: apiClient(apiBaseUrl, network.deployment, signer, reads?.id),
+    api: apiClient(apiBaseUrl, network.deployment, signer, reads?.id, home),
     requests: new FileAccessRequestStore(home, identity.name),
     grants: loadGrants(home, identity.name),
   })
@@ -503,7 +519,7 @@ export class Runtime extends ServiceRuntime {
         deployment: { ...network.deployment, deploymentBlock: ownerStartBlock },
         account: ownerAccount,
       })
-      const ownerApi = apiClient(apiBaseUrl, network.deployment, ownerAccount)
+      const ownerApi = apiClient(apiBaseUrl, network.deployment, ownerAccount, undefined, home)
       const vault = new FakeVaultAuthority({ seed: bytesOf(secrets.seed, 32), p256PrivateKey: secrets.p256PrivateKey, chain: ownerChain, api: ownerApi })
       const runtime = new Runtime(home, network, ownerChain, ownerApi, vault, ownerStartBlock, apiBaseUrl, async () => {
         await server?.close()

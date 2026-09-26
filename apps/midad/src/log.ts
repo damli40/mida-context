@@ -15,3 +15,13 @@ export function appendLog(home: MidaHome, name: "hook" | "drain" | "daemon", rec
     // a log that cannot be written must not break capture
   }
 }
+
+/**
+ * The store client's `warn` sink for daemon-side callers (in-12 N-7): a line like
+ * "store-predates-write-check" fired inside midad lands on stderr of a detached daemon —
+ * read by no one — so the client takes a sink and this one writes it to the daemon log the
+ * owner actually reads, with the client's own wording kept in `detail`.
+ */
+export function daemonWarning(home: MidaHome): (message: string) => void {
+  return (message) => appendLog(home, "daemon", { event: "store-warning", detail: message })
+}

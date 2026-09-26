@@ -3,6 +3,7 @@ import { zeroHash } from "viem"
 import { ContextApiClient } from "@mida/api"
 import { MidaError, OWNER_AUTHOR_ID, PERMISSION, PROVENANCE_SOURCE, isMidaError, namespaceId } from "@mida/protocol"
 import { chainRefusalReason } from "./chain-busy.js"
+import { daemonWarning } from "./log.js"
 import type { ContextKind, Hex } from "@mida/protocol"
 import type { ContextObject } from "@mida/sdk"
 import { scrubSecrets } from "@mida/compiler"
@@ -328,6 +329,7 @@ export async function attemptNamespaceRead(
     account: signer,
     chainId: runtime.network.deployment.chainId,
     capabilityRegistry: runtime.network.deployment.capabilityRegistry,
+    warn: daemonWarning(runtime.home),
   })
   const nsId = namespaceId(namespace)
   const capabilityId = runtime

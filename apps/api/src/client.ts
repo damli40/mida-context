@@ -22,6 +22,12 @@ export interface ContextApiClientOptions {
    * requests. Never set on a client that outlives one operation.
    */
   readScope?: string
+  /**
+   * Where the store's compat warnings land (in-12 N-7): default stderr — right for a bare
+   * script — while the daemon passes its own log so the line reaches a log someone reads.
+   * Once per process either way.
+   */
+  warn?: (message: string) => void
 }
 
 /**
@@ -114,7 +120,7 @@ export class ContextApiClient implements ContextApiRoutes {
       // as the pre-in-3 client did and say so once per process (in-11 R-3). Only the bare-status
       // 404 earns this — a coded NOT_FOUND body is the current store giving a real answer.
       if (error instanceof StoreHttpError && error.status === 404) {
-        noteStorePredatesWriteCheck(this.#options.baseUrl)
+        noteStorePredatesWriteCheck(this.#options.baseUrl, this.#options.warn ?? console.warn)
         return { ok: true as const }
       }
       throw error
@@ -240,7 +246,7 @@ export class StoreHttpError extends Error {
 
 /** The one named line an old store earns per process, no matter how many saves ask it. */
 let storePredatesWriteCheckLogged = false
-function noteStorePredatesWriteCheck(baseUrl: string): void {
+function noteStorePredatesWriteCheck(baseUrl: string, warn: (message: string) => void): void {
   if (storePredatesWriteCheckLogged) return
   storePredatesWriteCheckLogged = true
   let host = baseUrl
@@ -249,7 +255,7 @@ function noteStorePredatesWriteCheck(baseUrl: string): void {
   } catch {
     // an unparseable base URL is quoted as given — the host name is courtesy, not data
   }
-  console.warn(`store-predates-write-check: ${host} has no GET /write-authority — redeploy the store to enable the pending-revoke check`)
+  warn(`store-predates-write-check: ${host} has no GET /write-authority — redeploy the store to enable the pending-revoke check`)
 }
 
 /** Retries `listObjects` performs after the first response still carries `x-mida-partial`. */

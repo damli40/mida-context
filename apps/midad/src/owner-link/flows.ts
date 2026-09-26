@@ -353,7 +353,7 @@ export async function provisionPasskeyAgents(
 
   // Once the agent is registered its manifest envelope is self-authenticating — the operator
   // may carry it exactly as the owner would.
-  const api = apiClient(session.apiBaseUrl, network.deployment, operatorAccount)
+  const api = apiClient(session.apiBaseUrl, network.deployment, operatorAccount, undefined, home)
 
   const ensureFunded = async (address: Address, label: string): Promise<void> => {
     if (sponsorUp) return
