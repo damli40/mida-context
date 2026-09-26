@@ -972,10 +972,14 @@ describe("mida export — an interrupted or left-behind staging folder", () => {
   it("a leftover .partial-* folder with the staging marker is deleted and reported — kill -9 or a power cut", async () => {
     const home = ownerHome()
     const cwd = tempDir()
-    // What a killed export leaves: the marker (written first) plus half-finished content.
-    const leftover = join(cwd, "backup.partial-deadbeef")
+    // What a killed export leaves: the JSON marker (written first) plus half-finished content.
+    // pid 2**30 names no process on any supported platform — a dead writer.
+    const leftover = join(cwd, "backup.partial-deadbeef1234")
     mkdirSync(join(leftover, "encrypted"), { recursive: true })
-    writeFileSync(join(leftover, ".mida-export-staging"), "staged\n")
+    writeFileSync(
+      join(leftover, ".mida-export-staging"),
+      JSON.stringify({ dest: join(cwd, "backup"), pid: 2 ** 30, startedAt: "2026-09-25T00:00:00.000Z" }),
+    )
     writeFileSync(join(leftover, "records.json"), "{\"never-finished\":true}")
     const { lines, print } = collect()
     const result = await exportRecords({
@@ -989,8 +993,117 @@ describe("mida export — an interrupted or left-behind staging folder", () => {
     })
     expect(result.outcome).toBe("exported")
     expect(existsSync(leftover)).toBe(false)
-    expect(lines.some((line) => line.includes("backup.partial-deadbeef") && line.includes("leftover"))).toBe(true)
+    expect(lines.some((line) => line.includes("backup.partial-deadbeef1234") && line.includes("leftover"))).toBe(true)
     expect(existsSync(join(cwd, "backup", "records.json"))).toBe(true)
+  })
+
+  it("a leftover from a DIFFERENT destination in the same parent is removed — the sweep covers the parent", async () => {
+    // ex-3 E-3: a Ctrl-C'd `export backup` must not survive the next `export backup2` — the
+    // sweep is over the parent's `.partial-*` folders, not just the same destination's.
+    const home = ownerHome()
+    const cwd = tempDir()
+    const leftover = join(cwd, "backup.partial-deadbeef1234")
+    mkdirSync(leftover)
+    writeFileSync(
+      join(leftover, ".mida-export-staging"),
+      JSON.stringify({ dest: join(cwd, "backup"), pid: 2 ** 30, startedAt: "2026-09-25T00:00:00.000Z" }),
+    )
+    writeFileSync(join(leftover, "records.json"), "{\"never-finished\":true}")
+    const { lines, print } = collect()
+    const result = await exportRecords({
+      home,
+      network,
+      folder: join(cwd, "backup2"),
+      cwd,
+      print,
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [fixtureRecord()],
+    })
+    expect(result.outcome).toBe("exported")
+    expect(existsSync(leftover)).toBe(false)
+    expect(lines.some((line) => line.includes("backup.partial-deadbeef1234") && line.includes("leftover"))).toBe(true)
+    expect(existsSync(join(cwd, "backup2", "records.json"))).toBe(true)
+  })
+
+  it("a symlinked .partial-* is never followed or removed — the folder it points at is untouched", async () => {
+    // lstat, not stat: a symlink that LOOKS like staging — even one whose target carries a
+    // marker — must not have its target deleted, and nothing may be reported.
+    const home = ownerHome()
+    const cwd = tempDir()
+    const victim = join(cwd, "victim")
+    mkdirSync(victim)
+    writeFileSync(
+      join(victim, ".mida-export-staging"),
+      JSON.stringify({ dest: join(cwd, "backup"), pid: 2 ** 30, startedAt: "2026-09-25T00:00:00.000Z" }),
+    )
+    writeFileSync(join(victim, "keep.txt"), "important")
+    symlinkSync(victim, join(cwd, "backup.partial-cafebabe0000"))
+    const { lines, print } = collect()
+    const result = await exportRecords({
+      home,
+      network,
+      folder: join(cwd, "backup"),
+      cwd,
+      print,
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [fixtureRecord()],
+    })
+    expect(result.outcome).toBe("exported")
+    expect(readFileSync(join(victim, "keep.txt"), "utf8")).toBe("important")
+    expect(lstatSync(join(cwd, "backup.partial-cafebabe0000")).isSymbolicLink()).toBe(true)
+    expect(lines.every((line) => !line.includes("partial"))).toBe(true)
+  })
+
+  it("a .partial-* whose marker names a LIVE pid is left alone — another export is writing it", async () => {
+    // Concurrency: the sweep must never delete a folder whose writer is still running —
+    // named for THIS export's destination so the old sweep would have removed it outright.
+    // process.pid is the only live pid this test can rely on.
+    const home = ownerHome()
+    const cwd = tempDir()
+    const live = join(cwd, "backup2.partial-0ffee0ffee00")
+    mkdirSync(live)
+    writeFileSync(
+      join(live, ".mida-export-staging"),
+      JSON.stringify({ dest: join(cwd, "backup"), pid: process.pid, startedAt: new Date().toISOString() }),
+    )
+    const { lines, print } = collect()
+    const result = await exportRecords({
+      home,
+      network,
+      folder: join(cwd, "backup2"),
+      cwd,
+      print,
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [fixtureRecord()],
+    })
+    expect(result.outcome).toBe("exported")
+    expect(existsSync(join(live, ".mida-export-staging"))).toBe(true)
+    expect(lines.every((line) => !line.includes("leftover"))).toBe(true)
+  })
+
+  it("a .partial-* whose marker is not the JSON shape is left alone — and nothing is reported", async () => {
+    const home = ownerHome()
+    const cwd = tempDir()
+    for (const content of ["staged\n", "{not json", JSON.stringify({ pid: "oops" }), JSON.stringify({ dest: "/x", pid: -1 })]) {
+      const leftover = join(cwd, `backup.partial-${Math.random().toString(16).slice(2, 14).padStart(12, "0")}`)
+      mkdirSync(leftover)
+      writeFileSync(join(leftover, ".mida-export-staging"), content)
+    }
+    const { lines, print } = collect()
+    const before = readdirSync(cwd).filter((name) => name.includes(".partial-")).length
+    expect(before).toBe(4)
+    const result = await exportRecords({
+      home,
+      network,
+      folder: join(cwd, "backup"),
+      cwd,
+      print,
+      openRuntime: async () => fakeRuntime(home),
+      readUniverse: async () => [fixtureRecord()],
+    })
+    expect(result.outcome).toBe("exported")
+    expect(readdirSync(cwd).filter((name) => name.includes(".partial-"))).toHaveLength(4)
+    expect(lines.every((line) => !line.includes("leftover"))).toBe(true)
   })
 
   it("a look-alike .partial-* folder WITHOUT the staging marker is left alone", async () => {

@@ -418,7 +418,7 @@ mida export ~/mida-backup
 Exported 5 records (3 namespaces) to /home/you/mida-backup.
 ```
 
-The folder is created fresh — it refuses to overwrite anything that already exists, writes into a sibling `…​.partial-…​` folder first, and only renames it into place when every file is done. A failure mid-export deletes the partial folder, so a failed run never leaves half-written plaintext behind; if the machine loses power mid-export, the next export removes the leftover. Folder mode is 0700, every file 0600.
+The folder is created fresh — it refuses to overwrite anything that already exists, writes into a sibling `…​.partial-…​` folder first, and only renames it into place when every file is done. A failure mid-export deletes the partial folder, so a failed run never leaves half-written plaintext behind; if an export is interrupted by a crash or power loss, the next export into the same parent folder removes the leftover. Folder mode is 0700, every file 0600.
 
 What is inside:
 
