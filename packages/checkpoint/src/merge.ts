@@ -54,6 +54,13 @@ export interface StoredCheckpoint {
 export interface MergedHandoff {
   // The newest session in the chosen chain — the session a handoff recipient continues.
   headSessionId: string
+  /**
+   * The save time the handoff header reports: Monad's stamp on the newest chain-placed record
+   * the merge covered, ISO-8601. `checkpoint.createdAt` is the writer's own claim and never
+   * fills this — when no merged record carries a chain placement (a fixture, or a merge made
+   * of hand-built records) it is null and the header says "not yet confirmed" instead.
+   */
+  savedAt: string | null
   originalRequest: string | null
   objective: string
   remainingPlan: string[]
@@ -294,8 +301,17 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
     return distinct(items) as Checkpoint[K]
   }
 
+  // The header's "saved <time>" is the newest CONFIRMED stamp in the merge — the largest
+  // chain.at any scoped record carries. A record with no chain placement (a hand-built one;
+  // pending saves never reach the merge) cannot set it, and cannot suppress it either.
+  const savedAt = scope.reduce<bigint | undefined>(
+    (max, s) => (s.chain === undefined ? max : max === undefined || s.chain.at > max ? s.chain.at : max),
+    undefined,
+  )
+
   return {
     headSessionId: chosen.newest.sessionId,
+    savedAt: savedAt === undefined ? null : new Date(Number(savedAt) * 1000).toISOString(),
     originalRequest: cps.find((c) => c.originalRequest !== null)?.originalRequest ?? null,
     objective: mergedField(cps, "objective", ""),
     remainingPlan: mergedField(cps, "remainingPlan", []),

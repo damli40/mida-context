@@ -536,21 +536,24 @@ describe("buildHandoff — a pending save is marked, never called saved", () => 
     // the marker sits directly above the block's own "from" line
     expect(insideFence).toContain(`${PENDING_ANCHOR_LINE}\nfrom claude-code`)
     expect(insideFence).toContain("objective: the pending objective")
-    // the pending record is never described as saved — the preamble drops the word entirely
+    // nothing here carries a chain stamp — the header's save time is the honest unconfirmed
+    // form, and no part of the text calls the pending record "saved"
+    expect(result.text.startsWith("MIDA HANDOFF — save time not yet confirmed on Monad")).toBe(true)
     expect(result.text).not.toContain("saved working state")
     expect(result.text).not.toContain("Saved by")
   })
 
-  it("an anchored-only read carries no pending marker and keeps the saved-state preamble", async () => {
-    const result = await buildHandoff(runtime, input, deps([stored({ anchor: "ANCHORED" })]))
+  it("an anchored-only read carries no pending marker and its header names the chain's save time", async () => {
+    const result = await buildHandoff(runtime, input, deps([stored({ anchor: "ANCHORED", chain: { at: 1_700_000_000n } })]))
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
     expect(result.text).not.toContain("PENDING_ANCHOR")
-    expect(result.text).toContain("is saved working state")
+    // the header's save time is the chain's own stamp — 1_700_000_000 s = 2023-11-14 22:13 UTC
+    expect(result.text.startsWith("MIDA HANDOFF — saved 2023-11-14 22:13 UTC (")).toBe(true)
   })
 
-  it("a mixed read marks only the pending block — the merge keeps its saved-state meaning", async () => {
-    const anchored = stored({ contextId: `0x${"3".repeat(64)}` as Hex, anchor: "ANCHORED" })
+  it("a mixed read marks only the pending block — the header keeps the anchored merge's chain time", async () => {
+    const anchored = stored({ contextId: `0x${"3".repeat(64)}` as Hex, anchor: "ANCHORED", chain: { at: 1_700_000_000n } })
     const pending = stored({ contextId: `0x${"4".repeat(64)}` as Hex, anchor: "PENDING_ANCHOR" })
     const result = await buildHandoff(runtime, input, deps([anchored, pending]))
     expect(result.kind).toBe("handoff")
@@ -559,6 +562,9 @@ describe("buildHandoff — a pending save is marked, never called saved", () => 
     expect(insideFence).toContain(`${PENDING_ANCHOR_LINE}\nfrom claude-code`)
     // the marker appears once — over the pending block, never in the merged sections
     expect(result.text.split(PENDING_ANCHOR_LINE)).toHaveLength(2)
+    // the header's save time is the anchored merge's chain stamp — the pending block sits
+    // inside the fence under its own marker, not under the confirmed save time
+    expect(result.text.startsWith("MIDA HANDOFF — saved 2023-11-14 22:13 UTC (")).toBe(true)
     expect(result.text).not.toContain("is saved working state")
     // the pending contextId is marked-covered but the "Saved by" line names only anchored authors
     expect(result.seen).toContain(pending.contextId)

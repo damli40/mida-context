@@ -375,4 +375,18 @@ describe("mergeCheckpoints", () => {
       { ...stored({ at: "2026-09-21T10:01:00Z" }), projectId: "other" },
     ])).toThrow(/one project/)
   })
+
+  it("savedAt is the newest merged record's chain stamp — the writer's own createdAt never fills it (in-8 H1)", () => {
+    const m = mergeCheckpoints([
+      stored({ at: "2026-09-21T10:00:00Z", objective: "old", chain: { at: 1_000n } }),
+      stored({ at: "2026-09-21T11:00:00Z", objective: "new", chain: { at: 2_000n } }),
+    ])!
+    // 2_000 seconds after the epoch — Monad's own placement of the newest record, not either
+    // checkpoint's self-reported createdAt
+    expect(m.savedAt).toBe(new Date(2_000_000).toISOString())
+  })
+
+  it("savedAt is null when no merged record carries a chain placement", () => {
+    expect(mergeCheckpoints([stored({ at: "2026-09-21T10:00:00Z" })])!.savedAt).toBeNull()
+  })
 })

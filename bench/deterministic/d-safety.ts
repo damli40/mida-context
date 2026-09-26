@@ -125,7 +125,9 @@ async function d3() {
   // the renderer's own fences are the only ones allowed: a forged fence that
   // survived verbatim would push the count past one
   const realFences = count("=== BEGIN MIDA HANDOFF DATA ===") === 1 && count("=== END MIDA HANDOFF DATA ===") === 1
-  const headers = text.split("\n").filter((l) => l === "MIDA HANDOFF").length === 1
+  // the header's first line is the only line that may carry the "MIDA HANDOFF" words — every
+  // forged copy is rewritten to "MIDA-HANDOFF (quoted)" and cannot reach the phrase
+  const headers = text.split("\n").filter((l) => l.startsWith("MIDA HANDOFF")).length === 1
   const planHeadings = text.split("\n").filter((l) => l.startsWith("Remaining plan:")).length === 1
   // every non-fence forged line must appear ONLY in its defused form
   const nonFence = forged.slice(2)
