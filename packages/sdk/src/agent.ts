@@ -467,16 +467,19 @@ export class MidaAgent {
     // The anchor transaction's block time is Monad's stamp for every save in that batch — one
     // block lookup per distinct batch, shared across the rows it anchored.
     const blockTime = blockTimeCache(this.#chain.publicClient)
-    const anchored: ContextObject[] = []
-    const pending: (ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex })[] = []
-    const skipped: { contextId: Hex; reason: string }[] = []
-    for (const item of items) {
+    // Each row's verify+decrypt is independent — run them under the same bounded worker pool a
+    // direct read uses (in-9 R-5), then partition the indexed results in list order so anchored,
+    // pending and skipped keep exactly the order the serial loop produced.
+    type RowOutcome =
+      | { kind: "anchored"; object: ContextObject }
+      | { kind: "pending"; object: ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex } }
+      | { kind: "skipped"; skipped: { contextId: Hex; reason: string } }
+    const processItem = async (item: (typeof items)[number]): Promise<RowOutcome> => {
       const message = item.save.message
       // A row the store filed under the wrong owner or namespace is out of scope for this read:
       // skip it before verification or decryption ever run on it.
       if (message.owner.toLowerCase() !== ownerAddress || message.namespaceId.toLowerCase() !== namespaceId) {
-        skipped.push({ contextId: item.contextId, reason: "wrong-scope" })
-        continue
+        return { kind: "skipped", skipped: { contextId: item.contextId, reason: "wrong-scope" } }
       }
       // The declared union matters: without it the ternary's inferred union collapses — the
       // anchored ok-member is a subtype of the pending one and TS discards it, taking the
@@ -486,8 +489,7 @@ export class MidaAgent {
           ? await verifyBatchedItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient, requireLatest: true })
           : await verifyPendingItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient })
       if (!verdict.ok) {
-        skipped.push({ contextId: item.contextId, reason: verdict.reason })
-        continue
+        return { kind: "skipped", skipped: { contextId: item.contextId, reason: verdict.reason } }
       }
       const readEpoch = decodeUint64(message.readEpoch)
       let payload: ContextPayload
@@ -511,8 +513,7 @@ export class MidaAgent {
       } catch {
         // One row that will not open — sealed under a key this agent cannot unwrap, or bytes that
         // pass the commitments but fail the AAD — skips the row, not the whole read.
-        skipped.push({ contextId: item.contextId, reason: "decrypt" })
-        continue
+        return { kind: "skipped", skipped: { contextId: item.contextId, reason: "decrypt" } }
       }
       const base = {
         contextId: item.contextId,
@@ -533,17 +534,39 @@ export class MidaAgent {
           verdict.anchorBlock !== undefined
             ? { at: await blockTime(verdict.anchorBlock), block: verdict.anchorBlock, index: item.position }
             : undefined
-        anchored.push({ ...base, lineageId: item.lineageId!, version: item.version!, ...(chain === undefined ? {} : { chain }) })
-      } else {
-        // Nothing is anchored yet: derive the would-be head fields from the signed message itself.
-        pending.push({
+        return { kind: "anchored", object: { ...base, lineageId: item.lineageId!, version: item.version!, ...(chain === undefined ? {} : { chain }) } }
+      }
+      // Nothing is anchored yet: derive the would-be head fields from the signed message itself.
+      return {
+        kind: "pending",
+        object: {
           ...base,
           lineageId: message.parentId === zeroHash ? item.contextId : message.lineageId,
           version: message.parentVersion + 1,
-          anchor: "PENDING_ANCHOR",
+          anchor: "PENDING_ANCHOR" as const,
           authorAgentId: verdict.agentId,
-        })
+        },
       }
+    }
+    const outcomes = new Array<RowOutcome>(items.length)
+    let next = 0
+    const worker = async (): Promise<void> => {
+      while (next < items.length) {
+        const index = next
+        next += 1
+        outcomes[index] = await processItem(items[index]!)
+      }
+    }
+    const workers: Promise<void>[] = []
+    for (let i = 0; i < Math.min(READ_CONCURRENCY, items.length); i += 1) workers.push(worker())
+    await Promise.all(workers)
+    const anchored: ContextObject[] = []
+    const pending: (ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex })[] = []
+    const skipped: { contextId: Hex; reason: string }[] = []
+    for (const outcome of outcomes) {
+      if (outcome.kind === "anchored") anchored.push(outcome.object)
+      else if (outcome.kind === "pending") pending.push(outcome.object)
+      else skipped.push(outcome.skipped)
     }
     return { anchored, pending, skipped, partial }
   }
@@ -938,8 +961,11 @@ export class MidaAgent {
     }
     let evidenceTargets = 0
     let confirmedFrom = 0
-    for (const reference of references) {
-      const target = await this.#reader.getRecord(reference.recordId)
+    // The reference lookups are independent chain reads — asked together (in-9 R-5), then each
+    // judged in order exactly as the serial loop did.
+    const targets = await Promise.all(references.map((reference) => this.#reader.getRecord(reference.recordId)))
+    for (const [index, reference] of references.entries()) {
+      const target = targets[index]!
       if (target === null || target.owner !== owner) {
         throw new MidaError("COMMITMENT_MISMATCH", `referenced record ${reference.recordId} does not exist for this owner`)
       }

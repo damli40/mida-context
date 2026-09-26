@@ -48,6 +48,12 @@ const CAPABILITY_REUSE_MS = 30_000
 const COPY_MAX_KEYS = 20
 /** A failed refresh logs at most this often per key — a dead network must not spam the daemon log. */
 const REFRESH_FAIL_LOG_MS = 60_000
+/**
+ * A background refresh shares the handoff's read budget: once it is spent the refresh's read
+ * scope starts no new chain calls, so a stuck refresh cannot keep spending the shared RPC
+ * limiter behind the prompts it stopped serving (in-9 R-5).
+ */
+const REFRESH_READ_LIMIT_MS = 7_500
 
 interface CopyEntry {
   /** The decrypted list — daemon memory only, never written to disk. */
@@ -278,9 +284,13 @@ export async function buildWhatsNew(
   try {
     const now = deps.now ?? Date.now
     const copies = deps.copies ?? new CheckpointCopies(now)
+    // in-9 R-5: the gates and a refresh that fires from this request share one read scope —
+    // identical chain questions inside it cost one wire call, and a refresh outliving its
+    // budget starts no new reads. A test double without readScope runs unscoped as before.
+    const scoped = runtime.readScope?.({ deadlineMs: REFRESH_READ_LIMIT_MS }) ?? runtime
     // the capability cache is keyed (agent, projectId) — the project check produces the id first
     let projectId = ""
-    const access = await checkAccess(runtime, { agent: input.agent, cwd: input.cwd }, {
+    const access = await checkAccess(scoped, { agent: input.agent, cwd: input.cwd }, {
       isRevoked: deps.isRevoked,
       checkProject: async (rt, i) => {
         const check = await (deps.checkProject ?? checkProject)(rt, i)
@@ -308,7 +318,7 @@ export async function buildWhatsNew(
         input.agent,
         access.approval.projectId,
         async () => {
-          const result = await (deps.read ?? readCheckpoints)(runtime, input.agent, access.approval.projectId)
+          const result = await (deps.read ?? readCheckpoints)(scoped, input.agent, access.approval.projectId)
           // a list the store itself calls incomplete must never replace the copy — treated as a
           // failed refresh, so the last complete list keeps answering until a full one lands (M3-D)
           if (result.partial) throw new MidaError("PARTIAL_READ", "the store's list was incomplete")

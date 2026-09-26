@@ -9,7 +9,7 @@ import { REQUEST_WINDOW_SECONDS } from "./auth-pure.js"
 // The pure half of request authentication — headers, canonical target, signature check — lives in
 // auth-pure.js so the browser bundle can reach it through client.js without node:fs. Re-exported
 // here so every importer of auth.js (app.ts, file-stores.ts, index.ts, tests) is unchanged.
-export { AUTH_HEADERS, REQUEST_WINDOW_SECONDS, targetOf, assertAuthHeaderShape, authenticateRequest } from "./auth-pure.js"
+export { AUTH_HEADERS, READ_SCOPE_HEADER, READ_SCOPE_TOKEN_PATTERN, REQUEST_WINDOW_SECONDS, targetOf, assertAuthHeaderShape, authenticateRequest } from "./auth-pure.js"
 
 interface SeenNonce {
   signer: Address

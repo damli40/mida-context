@@ -18,6 +18,18 @@ export const AUTH_HEADERS = {
   signature: "x-mida-signature",
 } as const
 
+/**
+ * in-9 R-5: an optional, unsigned token naming the ONE logical read operation a request belongs
+ * to (a handoff, a whats-new refresh). Requests carrying the same token share the answers their
+ * identical chain reads already paid for; a request without it is its own operation. The token is
+ * not part of the signature — it names a cache bucket, never an authorization, and a guessed or
+ * replayed one can only return answers that were real chain state seconds ago.
+ */
+export const READ_SCOPE_HEADER = "x-mida-read-scope"
+
+/** The token shape the server honors: 0x plus 64 lowercase hex — a 256-bit random name. */
+export const READ_SCOPE_TOKEN_PATTERN = /^0x[0-9a-f]{64}$/
+
 export const REQUEST_WINDOW_SECONDS = 60n
 
 /** Builds the §12.1 canonical target from a URL: path plus query sorted by key. Repeated keys are rejected. */

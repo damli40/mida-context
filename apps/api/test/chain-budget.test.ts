@@ -12,7 +12,7 @@ import { join } from "node:path"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import { ContractFunctionExecutionError, ContractFunctionRevertedError, encodeErrorResult, zeroHash } from "viem"
 import type { PublicClient } from "viem"
-import { OWNER_AUTHOR_ID, contextId as deriveContextId, namespaceId } from "@mida/protocol"
+import { OWNER_AUTHOR_ID, PERMISSION, contextId as deriveContextId, namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { hexOf, manifestHash } from "@mida/crypto"
 import { contentHash } from "@mida/storage"
@@ -440,5 +440,110 @@ describe("a batched getRecords anchor check", () => {
       client.request("GET", `/objects?owner=${owner}&namespaceId=${NAMESPACE}`),
     ).rejects.toMatchObject({ code: "CHAIN_UNAVAILABLE" })
     expect(last!.status).toBe(503)
+  })
+})
+
+describe("in-9 R-5: the operation-scoped read memo shared over the wire", () => {
+  const agentAccount = privateKeyToAccount(generatePrivateKey())
+  const agentId = hexOf(randomBytes(32))
+  const capabilityId = hexOf(randomBytes(32))
+
+  /**
+   * Every chain read authorizeAgent needs, answered and counted by name: identity, agent record,
+   * capability, agent epoch, chain time, hasAuthority. An empty store then costs the route itself
+   * nothing — six reads per request, all of them identical between two requests of one operation.
+   */
+  function authReader(calls: string[]): RegistryReader {
+    return {
+      now: async () => {
+        calls.push("now")
+        return NOW
+      },
+      agentIdOfSigner: async (signer: Address) => {
+        calls.push("agentIdOfSigner")
+        return signer === agentAccount.address.toLowerCase() ? agentId : null
+      },
+      getAgent: async (id: Hex) => {
+        calls.push("getAgent")
+        return id === agentId
+          ? {
+              agentId,
+              operator: owner,
+              signer: agentAccount.address.toLowerCase() as Address,
+              encryptionPublicKey: hexOf(randomBytes(32)),
+              encryptionKeyVersion: 1,
+              callbackOriginHash: hexOf(randomBytes(32)),
+              capabilityManifestHash: hexOf(randomBytes(32)),
+              capabilityManifestVersion: 1,
+              active: true,
+            }
+          : null
+      },
+      getCapability: async (id: Hex) => {
+        calls.push("getCapability")
+        return id === capabilityId
+          ? {
+              owner,
+              agentId,
+              namespaceId: NAMESPACE,
+              permissions: PERMISSION.READ,
+              provenancePolicy: 0,
+              issuedAt: 1n,
+              expiresAt: 0n,
+              agentEpoch: 1n,
+              grantedAtReadEpoch: 1n,
+              revoked: false,
+            }
+          : null
+      },
+      agentEpoch: async () => {
+        calls.push("agentEpoch")
+        return 1n
+      },
+      hasAuthority: async () => {
+        calls.push("hasAuthority")
+        return true
+      },
+      getRecords: async () => [],
+      getRecord: async () => null,
+      recordBatchSize: async () => 1,
+    } as unknown as RegistryReader
+  }
+
+  function scopedClient(app: ReturnType<typeof createContextApi>["app"], readScope?: string) {
+    return new ContextApiClient({
+      baseUrl: "http://mida.test",
+      account: agentAccount,
+      chainId: deployment.chainId,
+      capabilityRegistry: deployment.capabilityRegistry,
+      clock: () => NOW,
+      fetch: async (url, init) => app.request(url, init),
+      ...(readScope === undefined ? {} : { readScope }),
+    })
+  }
+
+  it("requests carrying one scope token share identical chain reads; a new token re-reads", async () => {
+    const calls: string[] = []
+    const { app } = apiFor(authReader(calls))
+    const list = { owner, namespaceId: NAMESPACE, capabilityId }
+
+    const scoped = scopedClient(app, hexOf(randomBytes(32)))
+    await scoped.listObjects(list)
+    const askedOnce = calls.length
+    expect(askedOnce).toBe(6)
+
+    // The second request of the same operation is authorized by answers the first already paid
+    // for — identical questions are not re-asked on the wire.
+    await scoped.listObjects(list)
+    expect(calls.length).toBe(askedOnce)
+
+    // A different token is a different operation: a revoke that landed between them must be seen,
+    // so the questions go back to the chain.
+    await scopedClient(app, hexOf(randomBytes(32))).listObjects(list)
+    expect(calls.length).toBe(askedOnce * 2)
+
+    // And a request with no scope token at all never shares the memo.
+    await scopedClient(app).listObjects(list)
+    expect(calls.length).toBe(askedOnce * 3)
   })
 })

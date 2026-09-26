@@ -26,11 +26,11 @@ import { Hono } from "hono"
 import type { Context } from "hono"
 import { createMiddleware } from "hono/factory"
 import { isAddressEqual, zeroHash } from "viem"
-import { AUTH_HEADERS, assertAuthHeaderShape, authenticateRequest } from "./auth.js"
+import { AUTH_HEADERS, READ_SCOPE_HEADER, READ_SCOPE_TOKEN_PATTERN, assertAuthHeaderShape, authenticateRequest } from "./auth.js"
 import { authorizeAgent } from "./authorize.js"
 import { mountBatchRoutes } from "./batch-routes.js"
 import type { BatchingOptions } from "./batch-routes.js"
-import { BudgetedReader, ChainReadBudgetExceeded, isChainReadBudgetExceeded } from "./chain-budget.js"
+import { BudgetedReader, ChainReadBudgetExceeded, MAX_CHAIN_READS_PER_REQUEST, isChainReadBudgetExceeded } from "./chain-budget.js"
 import type { ContextRecordView, RegistryReader } from "./chain-views.js"
 import { DenyOverlay } from "./deny-overlay.js"
 import type { RevocationTarget } from "./deny-overlay.js"
@@ -45,6 +45,13 @@ import { address, hex, parseObjectUpload, parseReaderWrap } from "./wire.js"
 import type { AnchoredObject } from "./wire.js"
 
 export const CANCELLATION_MAX_LIFETIME_SECONDS = 300n
+
+/**
+ * How long one read-scope token's server-side memo may live (in-9 R-5): one handoff's 7.5 s
+ * deadline plus margin. Fixed from first sight, never extended — a token cannot pin chain answers
+ * past its operation however many requests reuse it.
+ */
+export const READ_SCOPE_TTL_MS = 15_000
 
 /** Manifest GET responses are allowed this stale before the envelope is re-verified against Monad. */
 export const MANIFEST_VERIFY_CACHE_SECONDS = 60n
@@ -134,6 +141,33 @@ export function createContextApi(options: ContextApiOptions) {
   const limits: StoreLimits = { ...DEFAULT_STORE_LIMITS, ...options.limits }
   const app = new Hono<Env>()
 
+  /**
+   * in-9 R-5: the server side of the per-operation read scope. A request carrying
+   * `x-mida-read-scope` names the one logical operation it belongs to; every request with the same
+   * token shares one memo, so the six identical reads authorizeAgent makes are asked once per
+   * operation across however many requests it takes. The entry lives a bounded time — long enough
+   * for one handoff's deadline plus margin, never long enough for a stale answer to outlive the
+   * operation it was read for — and the map is capped, so tokens cannot accumulate as memory.
+   */
+  const readScopes = new Map<string, { memo: Map<string, Promise<unknown>>; expiresAt: number }>()
+  const readScopeMemo = (token: string | undefined): Map<string, Promise<unknown>> | undefined => {
+    if (token === undefined || !READ_SCOPE_TOKEN_PATTERN.test(token)) return undefined
+    const nowMs = Date.now()
+    const held = readScopes.get(token)
+    if (held !== undefined) return held.expiresAt > nowMs ? held.memo : undefined
+    if (readScopes.size >= 128) {
+      for (const [key, entry] of readScopes) {
+        if (entry.expiresAt <= nowMs) readScopes.delete(key)
+      }
+      // Still full of live scopes: serve the request unscoped rather than evict an operation
+      // mid-flight or let the map grow without bound.
+      if (readScopes.size >= 128) return undefined
+    }
+    const created = { memo: new Map<string, Promise<unknown>>(), expiresAt: nowMs + READ_SCOPE_TTL_MS }
+    readScopes.set(token, created)
+    return created.memo
+  }
+
   // The cheapest gate of all: a per-IP request budget, checked before a byte of the body is read. The
   // hosted worker binds Cloudflare's ratelimits; a self-hosted app can inject any implementation.
   const limiter = options.limiter
@@ -212,8 +246,10 @@ export function createContextApi(options: ContextApiOptions) {
         }),
       )
       // One counting wrapper per request: every Monad read below — authorization, quota re-checks,
-      // list scans — spends from the same 30-read budget, never the platform's own ceiling.
-      c.set("chain", new BudgetedReader(reader))
+      // list scans — spends from the same 30-read budget, never the platform's own ceiling. A
+      // request carrying an operation's read-scope token shares that operation's memo, so the
+      // questions its siblings already asked cost this request nothing.
+      c.set("chain", new BudgetedReader(reader, MAX_CHAIN_READS_PER_REQUEST, readScopeMemo(c.req.header(READ_SCOPE_HEADER))))
       c.set("body", body)
       await next()
     })

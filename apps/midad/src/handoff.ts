@@ -1,6 +1,7 @@
 import { statSync } from "node:fs"
 import { isAbsolute } from "node:path"
 import { isMidaError } from "@mida/protocol"
+import { isReadDeadlineError } from "@mida/chain"
 import { compareChainOrder, defuse, handoffHeader, mergeCheckpoints, renderHandoffReport } from "@mida/checkpoint"
 import type { MigrationEnvelope } from "@mida/checkpoint"
 import { isChainBusyError } from "./chain-busy.js"
@@ -216,14 +217,20 @@ export async function capabilityState(runtime: ServiceRuntime, agent: string): P
   }
   if (ids.size === 0) return "none"
   const agentEpoch = await runtime.reader.agentEpoch(runtime.owner, identity.agentId)
-  let sawRevoked = false
-  for (const id of ids) {
-    if (await isCapabilityLive(runtime.chain, id)) return "live"
-    const capability = await runtime.reader.getCapability(id).catch(() => null)
-    if (capability !== null && capability.owner === runtime.owner && (capability.revoked || capability.agentEpoch !== agentEpoch)) {
-      sawRevoked = true
-    }
-  }
+  // The per-id questions are independent of each other — asked together, not one at a time
+  // (in-9 R-5). A live answer still wins over every other verdict, exactly as the serial loop.
+  const verdicts = await Promise.all(
+    [...ids].map(async (id) => {
+      const live = await isCapabilityLive(runtime.chain, id)
+      const capability = live ? null : await runtime.reader.getCapability(id).catch(() => null)
+      return { live, capability }
+    }),
+  )
+  if (verdicts.some((verdict) => verdict.live)) return "live"
+  const sawRevoked = verdicts.some(
+    ({ capability }) =>
+      capability !== null && capability.owner === runtime.owner && (capability.revoked || capability.agentEpoch !== agentEpoch),
+  )
   return sawRevoked ? "revoked" : "none"
 }
 
@@ -328,7 +335,13 @@ export async function buildHandoff(
 ): Promise<HandoffResult> {
   const agent = input.agent
   try {
-    const access = await checkAccess(runtime, { agent, cwd: input.cwd }, deps)
+    const limitMs = deps.limitMs ?? HANDOFF_READ_LIMIT_MS
+    // in-9 R-5: one read memo and one deadline for the whole operation — the capability gate,
+    // the checkpoint read and the fact read share it, so each distinct chain question costs
+    // one wire request and nothing new starts once the budget is spent. A test double built
+    // as a bare `{ home }` object has no readScope and runs unscoped, exactly as before.
+    const scoped = runtime.readScope?.({ deadlineMs: limitMs }) ?? runtime
+    const access = await checkAccess(scoped, { agent, cwd: input.cwd }, deps)
     if (!access.ok) return refused(access.reason, access.text)
     const check = access.approval
 
@@ -347,18 +360,17 @@ export async function buildHandoff(
     const readStarted = now()
     // `settled` never rejects, so a read that finishes or fails after the deadline is discarded
     // quietly — no unhandled rejection, and its text is never logged or rendered.
-    const settled = (deps.read ?? readCheckpoints)(runtime, agent, check.projectId).then(
+    const settled = (deps.read ?? readCheckpoints)(scoped, agent, check.projectId).then(
       (value): ReadOutcome => ({ status: "ok", checkpoints: value.checkpoints, partial: value.partial }),
       (error): ReadOutcome => ({ status: "failed", error }),
     )
     // The owner-fact read shares the deadline but degrades, never refuses: a failure here means a
     // handoff with facts: 0 and a stable code for the daemon log — unlike a checkpoint failure.
-    const factSettled = (deps.readFacts ?? readOwnerFacts)(runtime, agent).then(
+    const factSettled = (deps.readFacts ?? readOwnerFacts)(scoped, agent).then(
       (facts): FactOutcome => ({ status: "ok", facts }),
       (): FactOutcome => ({ status: "failed" }),
     )
     let timer: ReturnType<typeof setTimeout> | undefined
-    const limitMs = deps.limitMs ?? HANDOFF_READ_LIMIT_MS
     const slow = new Promise<ReadOutcome | FactOutcome>((resolve) => {
       timer = setTimeout(() => resolve({ status: "slow" }), limitMs)
     })
@@ -375,6 +387,8 @@ export async function buildHandoff(
     if (outcome.status === "slow") return refused("read-slow", noContextText("read-slow"))
     if (outcome.status === "failed") {
       const error = outcome.error
+      // a scope-deadline refusal IS the slow answer — it only fires once the budget is spent
+      if (isReadDeadlineError(error)) return refused("read-slow", noContextText("read-slow"))
       if (isMidaError(error, "CAPABILITY_REVOKED")) return refused("revoked", revokedText(agent))
       if (isMidaError(error, "CAPABILITY_DENIED") || isMidaError(error, "CAPABILITY_EXPIRED")) {
         return refused("not-approved", notApprovedText(agent))
@@ -502,6 +516,7 @@ export async function buildHandoff(
     // a chain answer that never arrived gets its own reason — the capability check's throw is
     // how a rate-limited RPC used to reach "internal" (and, at the store, "not-approved")
     if (isChainBusyError(error)) return refused("chain-busy", CHAIN_BUSY_TEXT)
+    if (isReadDeadlineError(error)) return refused("read-slow", noContextText("read-slow"))
     return refused("internal", noContextText("internal"))
   }
 }

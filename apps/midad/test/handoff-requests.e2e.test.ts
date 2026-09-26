@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { rpcTransportProbe } from "@mida/chain"
+import { readScopeProbe, rpcTransportProbe } from "@mida/chain"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
@@ -77,12 +77,19 @@ describe("the RPC request count of one session-start handoff (in-6 R2)", () => {
 
   it("one handoff resolves with 3 checkpoints, and its request count is recorded", async () => {
     rpcTransportProbe.reset()
+    readScopeProbe.reset()
     const result = (await callDaemon(home, "/handoff", { agent: "codex", cwd: workDir }, { timeoutMs: STEP_TIMEOUT })).body as HandoffResult
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
     expect(result.checkpoints).toBe(3)
     const count = rpcTransportProbe.sentAt.length
-    console.log(`in-6 R2: one session-start handoff made ${count} HTTP request(s) on the local chain`)
-    expect(count).toBeGreaterThan(0)
+    console.log(
+      `in-6 R2 / in-9 R5: one session-start handoff made ${count} HTTP request(s) on the local chain ` +
+        `(read scope: ${readScopeProbe.hits} shared calls, ${readScopeProbe.misses} new questions)`,
+    )
+    // in-9 R-5: one operation asks each distinct question once. The repeated capability,
+    // agent-record and block lookups (~30 of ~47 requests before the fix) collapse to one
+    // wire call apiece; what remains is the per-object record reads and the capability gate.
+    expect(count).toBeLessThanOrEqual(30)
   }, STEP_TIMEOUT)
 })

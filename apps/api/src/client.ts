@@ -3,7 +3,7 @@ import type { Address, BatchSaveMessage, Hex, ObjectManifest, ReaderEpochWrap, S
 import { hexOf } from "@mida/crypto"
 import { randomBytes } from "@noble/hashes/utils.js"
 import type { LocalAccount } from "viem"
-import { AUTH_HEADERS, targetOf } from "./auth-pure.js"
+import { AUTH_HEADERS, READ_SCOPE_HEADER, targetOf } from "./auth-pure.js"
 import { errorFromBody } from "./errors.js"
 import type { WebAuthnAssertionInput } from "./verify-assertion.js"
 import type { AnchoredObject, ObjectUploadBody } from "./wire.js"
@@ -16,6 +16,12 @@ export interface ContextApiClientOptions {
   capabilityRegistry: Address
   fetch?: (input: string, init: RequestInit) => Promise<Response>
   clock?: () => bigint
+  /**
+   * The one logical read operation this client's requests belong to (in-9 R-5): a random scope
+   * token the daemon stamps so the server can share identical chain answers across the operation's
+   * requests. Never set on a client that outlives one operation.
+   */
+  readScope?: string
 }
 
 /**
@@ -41,6 +47,7 @@ export class ContextApiClient implements ContextApiRoutes {
     for (const [key, value] of Object.entries(options.query ?? {})) url.searchParams.set(key, value)
     const body = options.body === undefined ? new Uint8Array() : new TextEncoder().encode(JSON.stringify(options.body))
     const headers: Record<string, string> = { "content-type": "application/json" }
+    if (this.#options.readScope !== undefined) headers[READ_SCOPE_HEADER] = this.#options.readScope
     if (options.signed !== false) {
       const timestamp = (this.#options.clock ?? (() => BigInt(Math.floor(Date.now() / 1000))))()
       const nonce = hexOf(randomBytes(32))

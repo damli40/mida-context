@@ -176,19 +176,27 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string, opti
   // own supersession link, so a replaced fact is marked by what Monad recorded, never by a
   // payload claim.
   const supersededBy = new Map<string, { contextId: Hex; createdAt: bigint }>()
-  for (const namespace of FACT_NAMESPACES) {
-    let objects
-    try {
-      objects = await agent.read(owner, namespace)
-    } catch (error) {
-      // "No grant" contributes nothing — the M1 single-scope grant is exactly this case.
-      if (isMidaError(error, "CAPABILITY_DENIED")) continue
-      throw error
-    }
-    for (const object of objects) {
-      // The chain's record decides who said this — never a field inside the encrypted payload.
-      const record = await reader.getRecord(object.contextId)
-      if (record === null) continue
+  // The two namespace reads are independent — asked together (in-9 R-5); "no grant" still
+  // contributes nothing, the M1 single-scope grant being exactly that case.
+  const listed = await Promise.all(
+    FACT_NAMESPACES.map(async (namespace) => {
+      try {
+        return await agent.read(owner, namespace)
+      } catch (error) {
+        if (isMidaError(error, "CAPABILITY_DENIED")) return []
+        throw error
+      }
+    }),
+  )
+  for (const [nsIndex, namespace] of FACT_NAMESPACES.entries()) {
+    const objects = listed[nsIndex]!
+    // The chain's record decides who said this — never a field inside the encrypted payload.
+    // The object already passed the SDK's own getRecord during read, so under a read scope
+    // these are the same wire answers, served from the operation's memo.
+    const records = await Promise.all(objects.map((object) => reader.getRecord(object.contextId)))
+    for (const [index, object] of objects.entries()) {
+      const record = records[index]
+      if (record === null || record === undefined) continue
       if (record.parentId !== zeroHash) supersededBy.set(record.parentId.toLowerCase(), { contextId: record.contextId, createdAt: record.createdAt })
       if (record.author !== OWNER_AUTHOR_ID) continue
       if (record.provenanceSource !== PROVENANCE_SOURCE.USER_ASSERTED) continue

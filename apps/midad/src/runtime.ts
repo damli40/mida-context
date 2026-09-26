@@ -4,8 +4,8 @@ import type { LocalAccount } from "viem"
 import { MidaError, PERMISSION } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
 import { bytesOf } from "@mida/crypto"
-import { chainFor, createSponsoredSender, createWriteContext, rpcTransport, sendValue } from "@mida/chain"
-import type { ChainContext, Deployment, LocalWriteContext, SendCost } from "@mida/chain"
+import { chainFor, createReadScope, createSponsoredSender, createWriteContext, memoizedReads, rpcTransport, sendValue } from "@mida/chain"
+import type { ChainContext, Deployment, LocalWriteContext, ReadScope, SendCost } from "@mida/chain"
 import { ContextApiClient, RegistryReader } from "@mida/api"
 import { FakeVaultAuthority } from "@mida/fake-vault"
 import { MidaAgent } from "@mida/sdk"
@@ -192,8 +192,8 @@ function processAlive(pid: number): boolean {
   }
 }
 
-export function apiClient(baseUrl: string, deployment: Deployment, account: LocalAccount): ContextApiClient {
-  return new ContextApiClient({ baseUrl, account, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry })
+export function apiClient(baseUrl: string, deployment: Deployment, account: LocalAccount, readScope?: string): ContextApiClient {
+  return new ContextApiClient({ baseUrl, account, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry, ...(readScope === undefined ? {} : { readScope }) })
 }
 
 /** A coded refusal — an agent-facing command that hits this must never print a bare `ERROR`. */
@@ -210,9 +210,14 @@ function buildAgent(
   apiBaseUrl: string,
   identity: AgentIdentity,
   progress?: (line: string) => void,
+  reads?: ReadScope,
 ): MidaAgent {
   const signer = privateKeyToAccount(identity.signerPrivateKey)
   const chain = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: signer })
+  // Inside a read scope the agent's fresh client still shares the operation's memo — the
+  // checkpoint read and the fact read ask each distinct chain question once between them — and its
+  // api client carries the scope token, so the store's own chain reads join the same operation.
+  if (reads !== undefined) chain.publicClient = memoizedReads(chain.publicClient, reads)
   const sponsorUrl = parseSponsorUrl(network.sponsorUrl)
   if (sponsorUrl !== undefined) {
     // An agent signer holds no MON by design — the sponsored send is how its chain calls get paid.
@@ -224,7 +229,7 @@ function buildAgent(
     callbackOrigin: identity.callbackOrigin,
     encryptionPrivateKey: bytesOf(identity.encryptionPrivateKey, 32),
     chain,
-    api: apiClient(apiBaseUrl, network.deployment, signer),
+    api: apiClient(apiBaseUrl, network.deployment, signer, reads?.id),
     requests: new FileAccessRequestStore(home, identity.name),
     grants: loadGrants(home, identity.name),
   })
@@ -298,6 +303,12 @@ async function resolveOwnerApi(
  */
 export class ServiceRuntime {
   readonly #close: () => Promise<void>
+  /**
+   * The operation's shared read memo — set only on the facades `readScope` returns. Agents
+   * built through a scoped runtime wrap their fresh client with it, so every identical
+   * read-only chain call in the operation is one wire request (in-9 R-5).
+   */
+  #reads?: ReadScope
   readonly reader: RegistryReader
   /**
    * One plain line to the owner while a slow step runs — the `mida` command sets it to STDERR;
@@ -398,7 +409,35 @@ export class ServiceRuntime {
   agent(name: string): MidaAgent {
     const identity = loadAgentIdentity(this.home, name)
     if (identity === undefined) throw agentNotSetup(name)
-    return buildAgent(this.home, this.network, this.apiBaseUrl, identity, (line) => this.progress?.(line))
+    return buildAgent(this.home, this.network, this.apiBaseUrl, identity, (line) => this.progress?.(line), this.#reads)
+  }
+
+  /**
+   * One operation's view of this runtime (in-9 R-5). The facade shares everything — home,
+   * owner, API, deployment — except the chain reads: its own `chain`/`reader` and every agent
+   * it builds run through a memo that answers each identical read-only call (same function,
+   * same args, same block tag) with one wire request, and — when `deadlineMs` is given — that
+   * starts no new chain read once the operation's budget is spent, so an abandoned handoff
+   * stops consuming the shared RPC limiter.
+   *
+   * The memo is a per-operation snapshot by design: build a fresh scope per operation and a
+   * revocation written between two operations is always seen by the second — the memo can
+   * only ever hold what the chain already answered inside this one.
+   */
+  readScope(options?: { deadlineMs?: number }): ServiceRuntime {
+    const scope = createReadScope(options)
+    const scoped = new ServiceRuntime(
+      this.home,
+      this.network,
+      this.owner,
+      { publicClient: memoizedReads(this.chain.publicClient, scope), deployment: this.chain.deployment },
+      this.apiBaseUrl,
+      // the facade owns nothing: close() stays with the real runtime
+      async () => {},
+    )
+    scoped.#reads = scope
+    scoped.progress = this.progress
+    return scoped
   }
 
   close(): Promise<void> {

@@ -37,13 +37,23 @@ export function isChainReadBudgetExceeded(value: unknown): value is ChainReadBud
 export class BudgetedReader extends RegistryReader {
   readonly #inner: RegistryReader
   readonly #limit: number
+  readonly #memo: Map<string, Promise<unknown>> | undefined
   #spent = 0
   #batchSize: number | undefined
 
-  constructor(inner: RegistryReader, limit: number = MAX_CHAIN_READS_PER_REQUEST) {
+  /**
+   * `memo` is the operation-scope the request belongs to (in-9 R-5): when the caller carries a
+   * read-scope token, the app hands every request of that operation the same map, so an identical
+   * question a sibling request already asked — the six reads of `authorizeAgent` above all — is
+   * answered once per operation, not once per request. A memo hit spends no budget: it is not a
+   * chain read at all. A rejected call is evicted so one transient failure never poisons the
+   * operation.
+   */
+  constructor(inner: RegistryReader, limit: number = MAX_CHAIN_READS_PER_REQUEST, memo?: Map<string, Promise<unknown>>) {
     super(inner.context)
     this.#inner = inner
     this.#limit = limit
+    this.#memo = memo
   }
 
   /** Chain reads spent so far in this request. */
@@ -56,58 +66,72 @@ export class BudgetedReader extends RegistryReader {
     return this.#limit - this.#spent
   }
 
-  async #read<T>(call: () => Promise<T>): Promise<T> {
+  async #read<T>(key: string, call: () => Promise<T>): Promise<T> {
+    const memo = this.#memo
+    if (memo !== undefined) {
+      const held = memo.get(key)
+      if (held !== undefined) return held as Promise<T>
+    }
     if (this.#spent >= this.#limit) throw new ChainReadBudgetExceeded()
     this.#spent += 1
-    return call()
+    const pending = call()
+    if (memo !== undefined) {
+      memo.set(key, pending)
+      pending.catch(() => {
+        if (memo.get(key) === pending) memo.delete(key)
+      })
+    }
+    return pending
   }
 
   override now(): Promise<bigint> {
-    return this.#read(() => this.#inner.now())
+    return this.#read("now:", () => this.#inner.now())
   }
 
   override agentIdOfSigner(signer: Address): Promise<Hex | null> {
-    return this.#read(() => this.#inner.agentIdOfSigner(signer))
+    return this.#read(`agentIdOfSigner:${signer}`, () => this.#inner.agentIdOfSigner(signer))
   }
 
   override getAgent(agentId: Hex): Promise<AgentRecord | null> {
-    return this.#read(() => this.#inner.getAgent(agentId))
+    return this.#read(`getAgent:${agentId}`, () => this.#inner.getAgent(agentId))
   }
 
   override getCapability(capabilityId: Hex): Promise<CapabilityView | null> {
-    return this.#read(() => this.#inner.getCapability(capabilityId))
+    return this.#read(`getCapability:${capabilityId}`, () => this.#inner.getCapability(capabilityId))
   }
 
   override agentEpoch(owner: Address, agentId: Hex): Promise<bigint> {
-    return this.#read(() => this.#inner.agentEpoch(owner, agentId))
+    return this.#read(`agentEpoch:${owner}:${agentId}`, () => this.#inner.agentEpoch(owner, agentId))
   }
 
   override activeCapabilityIds(owner: Address, agentId: Hex): Promise<readonly Hex[]> {
-    return this.#read(() => this.#inner.activeCapabilityIds(owner, agentId))
+    return this.#read(`activeCapabilityIds:${owner}:${agentId}`, () => this.#inner.activeCapabilityIds(owner, agentId))
   }
 
   override hasAuthority(owner: Address, agentId: Hex, namespaceId: Hex, permissions: number, provenanceBits: number): Promise<boolean> {
-    return this.#read(() => this.#inner.hasAuthority(owner, agentId, namespaceId, permissions, provenanceBits))
+    return this.#read(`hasAuthority:${owner}:${agentId}:${namespaceId}:${permissions}:${provenanceBits}`, () =>
+      this.#inner.hasAuthority(owner, agentId, namespaceId, permissions, provenanceBits),
+    )
   }
 
   override requiredReadEpoch(owner: Address, namespaceId: Hex): Promise<bigint> {
-    return this.#read(() => this.#inner.requiredReadEpoch(owner, namespaceId))
+    return this.#read(`requiredReadEpoch:${owner}:${namespaceId}`, () => this.#inner.requiredReadEpoch(owner, namespaceId))
   }
 
   override epochPublicKey(owner: Address, namespaceId: Hex, epoch: bigint): Promise<Hex | null> {
-    return this.#read(() => this.#inner.epochPublicKey(owner, namespaceId, epoch))
+    return this.#read(`epochPublicKey:${owner}:${namespaceId}:${epoch}`, () => this.#inner.epochPublicKey(owner, namespaceId, epoch))
   }
 
   override isWriteEpochValid(owner: Address, namespaceId: Hex, epoch: bigint): Promise<boolean> {
-    return this.#read(() => this.#inner.isWriteEpochValid(owner, namespaceId, epoch))
+    return this.#read(`isWriteEpochValid:${owner}:${namespaceId}:${epoch}`, () => this.#inner.isWriteEpochValid(owner, namespaceId, epoch))
   }
 
   override ownerP256Key(owner: Address): Promise<{ qx: bigint; qy: bigint } | null> {
-    return this.#read(() => this.#inner.ownerP256Key(owner))
+    return this.#read(`ownerP256Key:${owner}`, () => this.#inner.ownerP256Key(owner))
   }
 
   override getRecord(contextId: Hex): Promise<ContextRecordView | null> {
-    return this.#read(() => this.#inner.getRecord(contextId))
+    return this.#read(`getRecord:${contextId}`, () => this.#inner.getRecord(contextId))
   }
 
   override recordBatchSize(): Promise<number> {
@@ -124,7 +148,7 @@ export class BudgetedReader extends RegistryReader {
       this.#batchSize = this.#inner.knownRecordBatchSize
       return Promise.resolve(this.#batchSize)
     }
-    return this.#read(async () => (this.#batchSize = await this.#inner.recordBatchSize()))
+    return this.#read("recordBatchSize:", async () => (this.#batchSize = await this.#inner.recordBatchSize()))
   }
 
   override getRecords(contextIds: readonly Hex[]): Promise<(ContextRecordView | null)[]> {
@@ -132,6 +156,6 @@ export class BudgetedReader extends RegistryReader {
     if (typeof this.#inner.getRecords !== "function") {
       return Promise.all(contextIds.map((contextId) => this.getRecord(contextId)))
     }
-    return this.#read(() => this.#inner.getRecords(contextIds))
+    return this.#read(`getRecords:${contextIds.join(",")}`, () => this.#inner.getRecords(contextIds))
   }
 }
