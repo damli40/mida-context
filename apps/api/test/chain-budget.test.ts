@@ -5,7 +5,7 @@
 // authorization and reports x-mida-partial when rows were left; the client retries and tells the
 // caller when the list stayed incomplete.
 
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -445,7 +445,7 @@ describe("a batched getRecords anchor check", () => {
   })
 })
 
-describe("in-9 R-5: the operation-scoped read memo shared over the wire", () => {
+describe("in-9 R-5 + in-12 N-10: the operation-scoped read memo shared over the wire", () => {
   const agentAccount = privateKeyToAccount(generatePrivateKey())
   const agentId = hexOf(randomBytes(32))
   const capabilityId = hexOf(randomBytes(32))
@@ -512,40 +512,218 @@ describe("in-9 R-5: the operation-scoped read memo shared over the wire", () => 
     } as unknown as RegistryReader
   }
 
-  function scopedClient(app: ReturnType<typeof createContextApi>["app"], readScope?: string) {
+  /**
+   * A scoped client whose token pouch is the `tokens` map — signer → the last token the server
+   * issued it, exactly as the daemon's per-operation ReadScope hands out.
+   */
+  function scopedClient(app: ReturnType<typeof createContextApi>["app"], tokens?: Map<string, string>, account = agentAccount) {
     return new ContextApiClient({
       baseUrl: "http://mida.test",
-      account: agentAccount,
+      account,
       chainId: deployment.chainId,
       capabilityRegistry: deployment.capabilityRegistry,
       clock: () => NOW,
       fetch: async (url, init) => app.request(url, init),
-      ...(readScope === undefined ? {} : { readScope }),
+      ...(tokens === undefined ? {} : { readScope: tokens }),
     })
   }
 
-  it("requests carrying one scope token share identical chain reads; a new token re-reads", async () => {
+  it("a scoped operation shares content reads across its requests, but authorization is re-asked on every one", async () => {
     const calls: string[] = []
-    const { app } = apiFor(authReader(calls))
+    const counted = authReader(calls)
+    const reader = {
+      ...counted,
+      getRecords: async (ids: Hex[]) => {
+        calls.push("getRecords")
+        return ids.map(() => null)
+      },
+      recordBatchSize: async () => {
+        calls.push("recordBatchSize")
+        return 1
+      },
+    } as unknown as RegistryReader
+    const { app, store } = apiFor(reader)
+    // One never-anchored upload: every list checks it against Monad and it stays unmarked, so the
+    // content read is observable on every request.
+    await store.putObject(storedObject(upload(randomBytes(4))))
+    const list = { owner, namespaceId: NAMESPACE, capabilityId }
+    const count = (name: string) => calls.filter((c) => c === name).length
+
+    // The first request of an operation carries no token — the server has issued none yet — and
+    // the response's minted token is what the client adopts for the requests after it.
+    const tokens = new Map<string, string>()
+    const scoped = scopedClient(app, tokens)
+    await scoped.listObjects(list)
+    expect(tokens.size).toBe(1)
+    expect(count("getRecords")).toBe(1)
+
+    // The second request opens the bucket and pays for its own content reads; the third is the
+    // sibling that benefits.
+    await scoped.listObjects(list)
+    expect(count("getRecords")).toBe(2)
+    await scoped.listObjects(list)
+    expect(count("getRecords")).toBe(2)
+    expect(count("recordBatchSize")).toBe(2)
+
+    // Authorization is not shareable: identity, capability, epoch, time and authority went back
+    // to the chain on EVERY request — a revoked agent cannot inherit a pre-revoke "allowed".
+    for (const name of ["agentIdOfSigner", "getAgent", "getCapability", "agentEpoch", "now", "hasAuthority"]) {
+      expect(count(name)).toBe(3)
+    }
+
+    // A request with no scope at all pays for everything, always.
+    await scopedClient(app).listObjects(list)
+    expect(count("getRecords")).toBe(3)
+  })
+
+  it("a token the server never signed opens nothing — junk cannot occupy the scope map", async () => {
+    const calls: string[] = []
+    const counted = authReader(calls)
+    const reader = {
+      ...counted,
+      getRecords: async (ids: Hex[]) => {
+        calls.push("getRecords")
+        return ids.map(() => null)
+      },
+      recordBatchSize: async () => 1,
+    } as unknown as RegistryReader
+    const { app, store } = apiFor(reader)
+    await store.putObject(storedObject(upload(randomBytes(4))))
     const list = { owner, namespaceId: NAMESPACE, capabilityId }
 
-    const scoped = scopedClient(app, hexOf(randomBytes(32)))
+    // A well-formed but forged token: right shape, wrong HMAC. The request is simply unscoped —
+    // no error, no bucket, no shared answers.
+    const forged = `0x${"ab".repeat(32)}.${(Date.now() + 5_000).toString(36)}.${"00".repeat(64)}`
+    const scope = new Map([[agentAccount.address.toLowerCase(), forged]])
+    const scoped = scopedClient(app, scope)
     await scoped.listObjects(list)
-    const askedOnce = calls.length
-    expect(askedOnce).toBe(6)
-
-    // The second request of the same operation is authorized by answers the first already paid
-    // for — identical questions are not re-asked on the wire.
     await scoped.listObjects(list)
-    expect(calls.length).toBe(askedOnce)
+    const count = (name: string) => calls.filter((c) => c === name).length
+    expect(count("getRecords")).toBe(2) // both requests paid for the content check themselves
 
-    // A different token is a different operation: a revoke that landed between them must be seen,
-    // so the questions go back to the chain.
-    await scopedClient(app, hexOf(randomBytes(32))).listObjects(list)
-    expect(calls.length).toBe(askedOnce * 2)
+    // And a forged token cannot poison the pouch for a real one: the next operation scoped
+    // normally still shares its content reads.
+    const realScope = new Map<string, string>()
+    const real = scopedClient(app, realScope)
+    await real.listObjects(list)
+    await real.listObjects(list)
+    await real.listObjects(list)
+    expect(count("getRecords")).toBe(4) // +2 — the third scoped request hit the bucket
+  })
 
-    // And a request with no scope token at all never shares the memo.
-    await scopedClient(app).listObjects(list)
-    expect(calls.length).toBe(askedOnce * 3)
+  it("a token minted for one signer opens no bucket for another", async () => {
+    const calls: string[] = []
+    const counted = authReader(calls)
+    const otherAccount = privateKeyToAccount(generatePrivateKey())
+    const otherAgentId = hexOf(randomBytes(32))
+    const otherCapabilityId = hexOf(randomBytes(32))
+    const reader = {
+      ...counted,
+      agentIdOfSigner: async (signer: Address) => {
+        calls.push("agentIdOfSigner")
+        const lower = signer.toLowerCase()
+        return lower === agentAccount.address.toLowerCase() ? agentId : lower === otherAccount.address.toLowerCase() ? otherAgentId : null
+      },
+      getAgent: async (id: Hex) => {
+        calls.push("getAgent")
+        return id === otherAgentId
+          ? {
+              agentId: otherAgentId,
+              operator: owner,
+              signer: otherAccount.address.toLowerCase() as Address,
+              encryptionPublicKey: hexOf(randomBytes(32)),
+              encryptionKeyVersion: 1,
+              callbackOriginHash: hexOf(randomBytes(32)),
+              capabilityManifestHash: hexOf(randomBytes(32)),
+              capabilityManifestVersion: 1,
+              active: true,
+            }
+          : id === agentId
+            ? counted.getAgent(id)
+            : null
+      },
+      getCapability: async (id: Hex) => {
+        calls.push("getCapability")
+        if (id === otherCapabilityId) {
+          return {
+            owner,
+            agentId: otherAgentId,
+            namespaceId: NAMESPACE,
+            permissions: PERMISSION.READ,
+            provenancePolicy: 0,
+            issuedAt: 1n,
+            expiresAt: 0n,
+            agentEpoch: 1n,
+            grantedAtReadEpoch: 1n,
+            revoked: false,
+          }
+        }
+        return counted.getCapability(id)
+      },
+      getRecords: async (ids: Hex[]) => {
+        calls.push("getRecords")
+        return ids.map(() => null)
+      },
+      recordBatchSize: async () => 1,
+    } as unknown as RegistryReader
+    const { app, store } = apiFor(reader)
+    await store.putObject(storedObject(upload(randomBytes(4))))
+    const count = (name: string) => calls.filter((c) => c === name).length
+
+    // Agent A warms its bucket across two requests.
+    const aScope = new Map<string, string>()
+    const aClient = scopedClient(app, aScope)
+    const aList = { owner, namespaceId: NAMESPACE, capabilityId }
+    await aClient.listObjects(aList)
+    await aClient.listObjects(aList)
+    const before = count("getRecords")
+
+    // Agent B stamps A's token — the HMAC was computed over A's signer, so B's request is
+    // unscoped: the bucket's shared answers are closed to it.
+    const stolen = aScope.get(agentAccount.address.toLowerCase())!
+    const bScope = new Map([[otherAccount.address.toLowerCase(), stolen]])
+    const bClient = scopedClient(app, bScope, otherAccount)
+    await bClient.listObjects({ owner, namespaceId: NAMESPACE, capabilityId: otherCapabilityId })
+    expect(count("getRecords")).toBe(before + 1)
+  })
+
+  it("an expired token opens no bucket — the client re-mints from the next response", async () => {
+    const calls: string[] = []
+    const counted = authReader(calls)
+    const reader = {
+      ...counted,
+      getRecords: async (ids: Hex[]) => {
+        calls.push("getRecords")
+        return ids.map(() => null)
+      },
+      recordBatchSize: async () => 1,
+    } as unknown as RegistryReader
+    const { app, store } = apiFor(reader)
+    await store.putObject(storedObject(upload(randomBytes(4))))
+    const list = { owner, namespaceId: NAMESPACE, capabilityId }
+    const count = (name: string) => calls.filter((c) => c === name).length
+
+    const t0 = Date.now()
+    const clock = vi.spyOn(Date, "now").mockReturnValue(t0)
+    try {
+      const tokens = new Map<string, string>()
+      const scoped = scopedClient(app, tokens)
+      await scoped.listObjects(list)
+      await scoped.listObjects(list)
+      await scoped.listObjects(list)
+      expect(count("getRecords")).toBe(2) // the third request hit the live bucket
+
+      // Past the token's life the same bytes name a dead bucket — the request runs unscoped and
+      // the client adopts the freshly minted token the response carries.
+      clock.mockReturnValue(t0 + 9_000)
+      await scoped.listObjects(list)
+      expect(count("getRecords")).toBe(3)
+      await scoped.listObjects(list)
+      expect(count("getRecords")).toBe(4) // new token, new bucket — first scoped read pays again
+      await scoped.listObjects(list)
+      expect(count("getRecords")).toBe(4) // then shares it
+    } finally {
+      clock.mockRestore()
+    }
   })
 })

@@ -11,6 +11,9 @@ import {
 } from "@mida/protocol"
 import type { Address, Hex, SignedAgentCapabilityManifest } from "@mida/protocol"
 import { bytesOf, hexOf, manifestHash, verifyObjectManifest } from "@mida/crypto"
+import { hmac } from "@noble/hashes/hmac.js"
+import { sha256 } from "@noble/hashes/sha2.js"
+import { randomBytes } from "@noble/hashes/utils.js"
 import type { Deployment } from "@mida/chain"
 import {
   manifestBindingFor,
@@ -47,11 +50,12 @@ import type { AnchoredObject } from "./wire.js"
 export const CANCELLATION_MAX_LIFETIME_SECONDS = 300n
 
 /**
- * How long one read-scope token's server-side memo may live (in-9 R-5): one handoff's 7.5 s
- * deadline plus margin. Fixed from first sight, never extended — a token cannot pin chain answers
- * past its operation however many requests reuse it.
+ * How long one read-scope token — and the server-side memo it opens — may live (in-12 N-10): a
+ * handoff's 7.5 s deadline is the operation it exists for, so 8 s covers it with no room for a
+ * stale answer to outlive the operation. Fixed from first sight, never extended: a renewed token
+ * points at the same bucket, whose expiry was set when the bucket was born.
  */
-export const READ_SCOPE_TTL_MS = 15_000
+export const READ_SCOPE_TTL_MS = 8_000
 
 /** Manifest GET responses are allowed this stale before the envelope is re-verified against Monad. */
 export const MANIFEST_VERIFY_CACHE_SECONDS = 60n
@@ -142,29 +146,46 @@ export function createContextApi(options: ContextApiOptions) {
   const app = new Hono<Env>()
 
   /**
-   * in-9 R-5: the server side of the per-operation read scope. A request carrying
-   * `x-mida-read-scope` names the one logical operation it belongs to; every request with the same
-   * token shares one memo, so the six identical reads authorizeAgent makes are asked once per
-   * operation across however many requests it takes. The entry lives a bounded time — long enough
-   * for one handoff's deadline plus margin, never long enough for a stale answer to outlive the
-   * operation it was read for — and the map is capped, so tokens cannot accumulate as memory.
+   * in-9 R-5, hardened in in-12 N-10: the server side of the per-operation read scope.
+   *
+   * A token is `0x<id64>.<expiryMs36>.<hmac64>` where the HMAC covers `signer:id:expiry` under a
+   * per-process random key — the server mints it on every authenticated response, so a client only
+   * ever replays a grant it was issued, bound to its own signer. Verification runs BEFORE the map
+   * is touched: a junk token costs one HMAC and no memory — it can never occupy a slot, evict a
+   * real operation or inherit another signer's answers. A valid token opens the bucket its
+   * `signer:id` pair names; the bucket's expiry was fixed when it was created and is never
+   * extended, however fresh the presented token is.
    */
+  const readScopeKey = randomBytes(32)
+  const readScopeMac = (signer: Address, id: string, expiry: number): string =>
+    hexOf(hmac(sha256, readScopeKey, new TextEncoder().encode(`${signer}:${id}:${expiry}`)))
+  const mintReadScope = (signer: Address): string => {
+    const id = hexOf(randomBytes(32))
+    const expiry = Date.now() + READ_SCOPE_TTL_MS
+    return `${id}.${expiry.toString(36)}.${readScopeMac(signer, id, expiry).slice(2)}`
+  }
   const readScopes = new Map<string, { memo: Map<string, Promise<unknown>>; expiresAt: number }>()
-  const readScopeMemo = (token: string | undefined): Map<string, Promise<unknown>> | undefined => {
+  const readScopeMemo = (token: string | undefined, signer: Address): Map<string, Promise<unknown>> | undefined => {
     if (token === undefined || !READ_SCOPE_TOKEN_PATTERN.test(token)) return undefined
+    const [id, expiry36, mac] = token.split(".")
+    const expiry = Number.parseInt(expiry36!, 36)
+    const expected = readScopeMac(signer, id!, expiry).slice(2)
+    if (mac !== expected) return undefined
     const nowMs = Date.now()
-    const held = readScopes.get(token)
+    if (expiry <= nowMs) return undefined
+    const key = `${signer}:${id}`
+    const held = readScopes.get(key)
     if (held !== undefined) return held.expiresAt > nowMs ? held.memo : undefined
     if (readScopes.size >= 128) {
-      for (const [key, entry] of readScopes) {
-        if (entry.expiresAt <= nowMs) readScopes.delete(key)
+      for (const [scopeKey, entry] of readScopes) {
+        if (entry.expiresAt <= nowMs) readScopes.delete(scopeKey)
       }
       // Still full of live scopes: serve the request unscoped rather than evict an operation
       // mid-flight or let the map grow without bound.
       if (readScopes.size >= 128) return undefined
     }
-    const created = { memo: new Map<string, Promise<unknown>>(), expiresAt: nowMs + READ_SCOPE_TTL_MS }
-    readScopes.set(token, created)
+    const created = { memo: new Map<string, Promise<unknown>>(), expiresAt: Math.min(expiry, nowMs + READ_SCOPE_TTL_MS) }
+    readScopes.set(key, created)
     return created.memo
   }
 
@@ -232,24 +253,26 @@ export function createContextApi(options: ContextApiOptions) {
       assertAuthHeaderShape(c.req.raw.headers)
       const body = await readBodyWithin(c, maxBodyBytes)
       if (body.length > 0) json(body)
-      c.set(
-        "signer",
-        await authenticateRequest({
-          method: c.req.method,
-          url: new URL(c.req.url),
-          headers: c.req.raw.headers,
-          body,
-          chainId: deployment.chainId,
-          capabilityRegistry: deployment.capabilityRegistry,
-          now: clock(),
-          replay,
-        }),
-      )
+      const signer = await authenticateRequest({
+        method: c.req.method,
+        url: new URL(c.req.url),
+        headers: c.req.raw.headers,
+        body,
+        chainId: deployment.chainId,
+        capabilityRegistry: deployment.capabilityRegistry,
+        now: clock(),
+        replay,
+      })
+      c.set("signer", signer)
+      // The response carries a fresh scope token for this signer (N-10): an operation's client
+      // stamps it on its next request, and — while it lasts — that request shares the bucket's
+      // non-authorization answers instead of re-paying them.
+      c.header(READ_SCOPE_HEADER, mintReadScope(signer))
       // One counting wrapper per request: every Monad read below — authorization, quota re-checks,
       // list scans — spends from the same 30-read budget, never the platform's own ceiling. A
-      // request carrying an operation's read-scope token shares that operation's memo, so the
-      // questions its siblings already asked cost this request nothing.
-      c.set("chain", new BudgetedReader(reader, MAX_CHAIN_READS_PER_REQUEST, readScopeMemo(c.req.header(READ_SCOPE_HEADER))))
+      // request carrying a valid scope token shares that operation's memo for content questions
+      // only — every authorization answer is read fresh on this request's own budget.
+      c.set("chain", new BudgetedReader(reader, MAX_CHAIN_READS_PER_REQUEST, readScopeMemo(c.req.header(READ_SCOPE_HEADER), signer)))
       c.set("body", body)
       await next()
     })

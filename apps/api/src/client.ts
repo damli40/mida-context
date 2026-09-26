@@ -17,11 +17,14 @@ export interface ContextApiClientOptions {
   fetch?: (input: string, init: RequestInit) => Promise<Response>
   clock?: () => bigint
   /**
-   * The one logical read operation this client's requests belong to (in-9 R-5): a random scope
-   * token the daemon stamps so the server can share identical chain answers across the operation's
-   * requests. Never set on a client that outlives one operation.
+   * The one logical read operation this client's requests belong to (in-9 R-5, hardened in-12
+   * N-10): signer address → the read-scope token the server issued it. The token is minted by the
+   * server — HMAC-signed, signer-bound, eight seconds — so this map is only ever filled from
+   * response headers: a request stamps the token it currently holds, then adopts the fresh one the
+   * response carries once the held one has lapsed. Never set on a client that outlives one
+   * operation.
    */
-  readScope?: string
+  readScope?: Map<string, string>
   /**
    * Where the store's compat warnings land (in-12 N-7): default stderr — right for a bare
    * script — while the daemon passes its own log so the line reaches a log someone reads.
@@ -53,7 +56,9 @@ export class ContextApiClient implements ContextApiRoutes {
     for (const [key, value] of Object.entries(options.query ?? {})) url.searchParams.set(key, value)
     const body = options.body === undefined ? new Uint8Array() : new TextEncoder().encode(JSON.stringify(options.body))
     const headers: Record<string, string> = { "content-type": "application/json" }
-    if (this.#options.readScope !== undefined) headers[READ_SCOPE_HEADER] = this.#options.readScope
+    const signer = this.account.address.toLowerCase()
+    const scopeToken = this.#options.readScope?.get(signer)
+    if (scopeToken !== undefined && !readScopeExpired(scopeToken)) headers[READ_SCOPE_HEADER] = scopeToken
     if (options.signed !== false) {
       const timestamp = (this.#options.clock ?? (() => BigInt(Math.floor(Date.now() / 1000))))()
       const nonce = hexOf(randomBytes(32))
@@ -94,6 +99,14 @@ export class ContextApiClient implements ContextApiRoutes {
       }
     }
     if (!response.ok) throw errorFromBody(response.status, parsed)
+    // Adopt the token this response issued once the one being stamped has lapsed (or there is
+    // none): keeping the CURRENT token while it lives is what keeps one bucket shared across the
+    // operation's requests — the bucket dies with its token, and only then does the next issued
+    // token name a fresh bucket.
+    const issued = response.headers.get(READ_SCOPE_HEADER)
+    if (issued !== null && this.#options.readScope !== undefined && (scopeToken === undefined || readScopeExpired(scopeToken))) {
+      this.#options.readScope.set(signer, issued)
+    }
     return { body: parsed as T, response }
   }
 
@@ -224,6 +237,15 @@ export class ContextApiClient implements ContextApiRoutes {
   flushBatch() {
     return this.request<{ flushed: boolean; reason?: "empty" | "rate-limited" }>("POST", "/batch/flush")
   }
+}
+
+/**
+ * A read-scope token's claimed expiry, `0x<id>.<expiryMs36>.<mac>` — false for anything that does
+ * not parse, so a malformed token is simply never stamped.
+ */
+function readScopeExpired(token: string): boolean {
+  const expiry = Number.parseInt(token.split(".")[1] ?? "", 36)
+  return !Number.isFinite(expiry) || expiry <= Date.now()
 }
 
 /**

@@ -19,16 +19,18 @@ export const AUTH_HEADERS = {
 } as const
 
 /**
- * in-9 R-5: an optional, unsigned token naming the ONE logical read operation a request belongs
- * to (a handoff, a whats-new refresh). Requests carrying the same token share the answers their
- * identical chain reads already paid for; a request without it is its own operation. The token is
- * not part of the signature — it names a cache bucket, never an authorization, and a guessed or
- * replayed one can only return answers that were real chain state seconds ago.
+ * in-9 R-5, hardened in in-12 N-10: an optional token naming the ONE logical read operation a
+ * request belongs to (a handoff, a whats-new refresh). The server mints it — a random id, an
+ * expiry and an HMAC over the requester's own signer — and hands it out on every authenticated
+ * response, so the client only ever replays what it was issued. Requests carrying the same token
+ * share the answers their identical NON-AUTHORIZATION chain reads already paid for; a request
+ * without it, or with a forged or expired one, is simply unscoped — the token names a cache
+ * bucket, never an authorization, and authorization answers are never memoized across requests.
  */
 export const READ_SCOPE_HEADER = "x-mida-read-scope"
 
-/** The token shape the server honors: 0x plus 64 lowercase hex — a 256-bit random name. */
-export const READ_SCOPE_TOKEN_PATTERN = /^0x[0-9a-f]{64}$/
+/** The token shape the server honors: `0x` + 64-hex random id, base-36 expiry ms, 64-hex HMAC. */
+export const READ_SCOPE_TOKEN_PATTERN = /^0x[0-9a-f]{64}\.[0-9a-z]+\.[0-9a-f]{64}$/
 
 export const REQUEST_WINDOW_SECONDS = 60n
 

@@ -1,4 +1,3 @@
-import { randomBytes } from "node:crypto"
 import type { PublicClient } from "viem"
 
 /**
@@ -24,11 +23,12 @@ import type { PublicClient } from "viem"
  */
 export interface ReadScope {
   /**
-   * The operation's random token. The daemon's own api client stamps it on every request of the
-   * operation (`x-mida-read-scope`), so the Context API can share the same answers across the
-   * requests of this one operation — the server keys its memo by it and forgets it within seconds.
+   * signer (lowercase address) → the read-scope token the store last issued for it (in-12 N-10).
+   * The token is the store's own HMAC-signed grant — client code never invents one — so this map
+   * is only ever filled from response headers, and an entry that has expired is replaced by the
+   * next response's token rather than stamped again.
    */
-  readonly id: string
+  readonly tokens: Map<string, string>
   /** `(method, serialized args)` → the one in-flight or settled wire call the operation shares. */
   readonly memo: Map<string, Promise<unknown>>
   /** epoch ms after which the scope starts no new chain read; absent means no deadline. */
@@ -54,7 +54,7 @@ export function isReadDeadlineError(error: unknown): boolean {
 
 export function createReadScope(options?: { deadlineMs?: number }): ReadScope {
   return {
-    id: `0x${randomBytes(32).toString("hex")}`,
+    tokens: new Map(),
     memo: new Map(),
     ...(options?.deadlineMs === undefined ? {} : { deadlineAt: Date.now() + options.deadlineMs }),
   }

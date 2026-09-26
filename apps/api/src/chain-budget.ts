@@ -44,10 +44,12 @@ export class BudgetedReader extends RegistryReader {
   /**
    * `memo` is the operation-scope the request belongs to (in-9 R-5): when the caller carries a
    * read-scope token, the app hands every request of that operation the same map, so an identical
-   * question a sibling request already asked — the six reads of `authorizeAgent` above all — is
-   * answered once per operation, not once per request. A memo hit spends no budget: it is not a
-   * chain read at all. A rejected call is evicted so one transient failure never poisons the
-   * operation.
+   * NON-AUTHORIZATION question a sibling request already asked is answered once per operation.
+   * in-12 N-10 draws the line: an authorization answer — identity resolution, the agent record,
+   * capability and epoch state, the authority verdict — is never shared across HTTP requests, so a
+   * token held past a revocation can only ever return content verifications, never a stale
+   * "allowed". A memo hit spends no budget: it is not a chain read at all. A rejected call is
+   * evicted so one transient failure never poisons the operation.
    */
   constructor(inner: RegistryReader, limit: number = MAX_CHAIN_READS_PER_REQUEST, memo?: Map<string, Promise<unknown>>) {
     super(inner.context)
@@ -66,8 +68,13 @@ export class BudgetedReader extends RegistryReader {
     return this.#limit - this.#spent
   }
 
-  async #read<T>(key: string, call: () => Promise<T>): Promise<T> {
-    const memo = this.#memo
+  /**
+   * `shared` marks a read whose answer may cross requests through the operation memo — content
+   * verification only (`getRecord`/`getRecords`, the Multicall3 probe). Authorization answers take
+   * the default `false`: each request asks Monad itself, on its own budget.
+   */
+  async #read<T>(key: string, call: () => Promise<T>, shared = false): Promise<T> {
+    const memo = shared ? this.#memo : undefined
     if (memo !== undefined) {
       const held = memo.get(key)
       if (held !== undefined) return held as Promise<T>
@@ -131,7 +138,9 @@ export class BudgetedReader extends RegistryReader {
   }
 
   override getRecord(contextId: Hex): Promise<ContextRecordView | null> {
-    return this.#read(`getRecord:${contextId}`, () => this.#inner.getRecord(contextId))
+    // Content verification — "does this contextId hold these commitments" — is the one answer a
+    // scoped operation may share across its requests (N-10).
+    return this.#read(`getRecord:${contextId}`, () => this.#inner.getRecord(contextId), true)
   }
 
   override recordBatchSize(): Promise<number> {
@@ -148,7 +157,7 @@ export class BudgetedReader extends RegistryReader {
       this.#batchSize = this.#inner.knownRecordBatchSize
       return Promise.resolve(this.#batchSize)
     }
-    return this.#read("recordBatchSize:", async () => (this.#batchSize = await this.#inner.recordBatchSize()))
+    return this.#read("recordBatchSize:", async () => (this.#batchSize = await this.#inner.recordBatchSize()), true)
   }
 
   override getRecords(contextIds: readonly Hex[]): Promise<(ContextRecordView | null)[]> {
@@ -156,6 +165,6 @@ export class BudgetedReader extends RegistryReader {
     if (typeof this.#inner.getRecords !== "function") {
       return Promise.all(contextIds.map((contextId) => this.getRecord(contextId)))
     }
-    return this.#read(`getRecords:${contextIds.join(",")}`, () => this.#inner.getRecords(contextIds))
+    return this.#read(`getRecords:${contextIds.join(",")}`, () => this.#inner.getRecords(contextIds), true)
   }
 }

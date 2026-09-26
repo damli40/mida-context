@@ -133,8 +133,8 @@ describe("the per-operation read scope (in-9 R-5)", () => {
     expect(client.calls).toHaveLength(6)
   })
 
-  it("every scope carries a unique token — the server keys its memo by it", () => {
-    expect(createReadScope().id).toMatch(/^0x[0-9a-f]{64}$/)
-    expect(createReadScope().id).not.toBe(createReadScope().id)
+  it("a fresh scope holds no server-issued tokens — the store mints them, not the client", () => {
+    expect(createReadScope().tokens.size).toBe(0)
+    expect(createReadScope().tokens).not.toBe(createReadScope().tokens)
   })
 })

@@ -197,7 +197,7 @@ export function apiClient(
   baseUrl: string,
   deployment: Deployment,
   account: LocalAccount,
-  readScope?: string,
+  readScopeTokens?: Map<string, string>,
   home?: MidaHome,
 ): ContextApiClient {
   return new ContextApiClient({
@@ -205,7 +205,7 @@ export function apiClient(
     account,
     chainId: deployment.chainId,
     capabilityRegistry: deployment.capabilityRegistry,
-    ...(readScope === undefined ? {} : { readScope }),
+    ...(readScopeTokens === undefined ? {} : { readScope: readScopeTokens }),
     // a client built inside midad reports its compat warnings to the daemon log, not the
     // stderr of a detached process (in-12 N-7); a home-less caller keeps console.warn
     ...(home === undefined ? {} : { warn: daemonWarning(home) }),
@@ -245,7 +245,7 @@ function buildAgent(
     callbackOrigin: identity.callbackOrigin,
     encryptionPrivateKey: bytesOf(identity.encryptionPrivateKey, 32),
     chain,
-    api: apiClient(apiBaseUrl, network.deployment, signer, reads?.id, home),
+    api: apiClient(apiBaseUrl, network.deployment, signer, reads?.tokens, home),
     requests: new FileAccessRequestStore(home, identity.name),
     grants: loadGrants(home, identity.name),
   })
