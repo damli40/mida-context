@@ -7,11 +7,12 @@ import type { LocalAccount } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { assertHex } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
-import { batchAnchorAbi, rpcTransport } from "@mida/chain"
+import { batchAnchorAbi } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import { AUTH_HEADERS, MANIFEST_VERIFY_CACHE_SECONDS, MAX_CHAIN_READS_PER_REQUEST, RegistryReader, SWEEP_MAX_OBJECTS_PER_RUN, createContextApi } from "@mida/api"
 import type { BatchingOptions, StoreLimits } from "@mida/api"
 import { D1BatchStore, d1Stores, runSweep } from "./index.js"
+import { storePublicClient } from "./public-client.js"
 import type { D1Like } from "./d1.js"
 
 export { BatchCoordinator } from "./batch-coordinator.js"
@@ -246,7 +247,7 @@ function buildWorker(env: WorkerEnv): Built {
   } catch {
     throw new Error(`environment variable RPC_URL must be an absolute URL`)
   }
-  const publicClient = createPublicClient({ batch: { multicall: true }, transport: rpcTransport(rpcUrl) })
+  const publicClient = storePublicClient(rpcUrl, deployment.chainId)
   const reader = new RegistryReader({ publicClient, deployment })
   const stores = d1Stores(env.DB)
   const batching = batchingOptions(env, deployment, publicClient)

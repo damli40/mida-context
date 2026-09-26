@@ -133,7 +133,7 @@ export function showListReSigned(
 
 /** The real environment: navigator.credentials, the chain RPC, the sponsor, the hosted store. */
 export function makeEnv(): FlowEnvironment {
-  const publicClient = createPublicClient({ chain: chainFor(DEPLOYMENT.chainId), transport: http(RPC_URL) })
+  const publicClient = createPublicClient({ chain: chainFor(DEPLOYMENT.chainId), batch: { multicall: true }, transport: http(RPC_URL) })
   return {
     credentials: navigator.credentials,
     publicClient: publicClient as never,

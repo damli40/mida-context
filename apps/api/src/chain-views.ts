@@ -1,6 +1,7 @@
 import { isMidaError } from "@mida/protocol"
 import type { Address, AgentRecord, Hex } from "@mida/protocol"
 import { capabilityRegistryAbi, contextRegistryAbi, latestTimestamp, readAgentRecord, toMidaError } from "@mida/chain"
+import { MULTICALL3_ADDRESS } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { zeroHash } from "viem"
 
@@ -41,12 +42,10 @@ export interface ContextRecordView {
 
 const lower = <T extends string>(value: T) => value.toLowerCase() as T
 
-/**
- * Canonical Multicall3 deployment — verified present on Monad testnet. One aggregate3 `eth_call`
- * answers a whole batch of `getRecord` checks; chains without it (local rigs, test chains) take the
- * per-row path unchanged.
- */
-export const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11" as const
+// The canonical Multicall3 address is the shared constant exported from @mida/chain — the same
+// one rpcChain declares on Monad testnet clients (in-13 M-2). One aggregate3 `eth_call` answers a
+// whole batch of `getRecord` checks; chains without it (local rigs, test chains) take the per-row
+// path unchanged.
 
 /** The most contextIds one batched `getRecords` asks about — one Multicall3 `eth_call` per batch. */
 export const RECORDS_PER_MULTICALL = 200

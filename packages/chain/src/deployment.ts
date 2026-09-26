@@ -1,5 +1,6 @@
 import { MidaError, assertHex } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
+import { defineChain } from "viem"
 import type { Chain } from "viem"
 import { foundry, monadTestnet } from "viem/chains"
 
@@ -67,4 +68,30 @@ export function chainFor(chainId: bigint): Chain {
   if (chainId === LOCAL_CHAIN_ID) return foundry
   if (chainId === MONAD_TESTNET_CHAIN_ID) return monadTestnet
   throw new MidaError("INVALID_WIRE", `unsupported chain ${chainId}`)
+}
+
+/** The canonical Multicall3 deployment — present on Monad testnet (chain 10143) at this address. */
+export const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11" as Address
+
+/**
+ * The chain a standalone read client is built on when only the deployment's chain id is known —
+ * the hosted store learns its config from env vars, not a checked-in network file. viem engages
+ * `batch: { multicall: true }` only when the client's chain declares a Multicall3 contract; a
+ * chain-less client silently sends one eth_call per read (in-13 M-2 — the Sep 25 RPC-limit
+ * incident's root cause). Monad testnet pins the canonical Multicall3 here so the store and the
+ * explicit batch reader agree on one shared constant; the local Anvil chain (foundry) and any
+ * unknown chain id declare none — it is not verifiable from here whether such a chain carries
+ * the contract, so reads stay one-per-call there exactly as before instead of throwing.
+ */
+export function rpcChain(chainId: bigint): Chain {
+  if (chainId === LOCAL_CHAIN_ID) return foundry
+  if (chainId === MONAD_TESTNET_CHAIN_ID) {
+    return { ...monadTestnet, contracts: { ...monadTestnet.contracts, multicall3: { address: MULTICALL3_ADDRESS } } }
+  }
+  return defineChain({
+    id: Number(chainId),
+    name: `chain ${chainId.toString(10)}`,
+    nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+    rpcUrls: { default: { http: [] } },
+  })
 }
