@@ -145,13 +145,15 @@ export interface ContextObject {
   /**
    * Monad's own placement of the save — set only on records the chain has actually recorded.
    * `at` is the timestamp the chain stamped (the ContextRegistry row's createdAt for a direct
-   * save, the anchor block's time for a batched one); `block` and `index` are its position in
-   * the chain's order — the log index for a direct save, the batch's own position for a batched
-   * one. Absent entirely when no chain fact places the record — a pending batched save above
-   * all — and `block`/`index` are absent when only the stamp could be recovered. Whatever an
-   * object claims inside its own payload never reaches this field.
+   * save, the anchor block's time for a batched one); `block`, `transaction` and `index` are
+   * its position in the chain's order — the anchoring block, the anchoring transaction's index
+   * inside it, then the save's own position inside the transaction (the log index for a direct
+   * save, the batch's own position for a batched one). Absent entirely when no chain fact
+   * places the record — a pending batched save above all — and `block`/`transaction`/`index`
+   * are absent when only the stamp could be recovered. Whatever an object claims inside its
+   * own payload never reaches this field.
    */
-  chain?: { at: bigint; block?: bigint; index?: number }
+  chain?: { at: bigint; block?: bigint; transaction?: number; index?: number }
 }
 
 /**
@@ -208,16 +210,22 @@ export interface MidaAgentConfig {
 const AGENT_SOURCES: ReadonlySet<string> = new Set(["AGENT_INFERRED", "IMPORTED", "EXTERNAL_ATTESTATION"])
 
 /**
- * The ContextRegistered log's placement inside a register receipt — the block and intra-block
- * index the chain recorded for exactly this contextId. A receipt that somehow carries no matching
- * log leaves the position absent; `at` (the record's chain-stored createdAt) is still set by the
- * caller.
+ * The ContextRegistered log's placement inside a register receipt — the block, the
+ * transaction's index inside it, and the log's intra-block index the chain recorded for
+ * exactly this contextId. A receipt that somehow carries no matching log leaves the position
+ * absent; `at` (the record's chain-stored createdAt) is still set by the caller.
  */
 function receiptPlacement(receipt: TransactionReceipt, contextId: Hex): RecordPlacement | undefined {
   const log = parseEventLogs({ abi: contextRegistryAbi, eventName: "ContextRegistered", logs: receipt.logs }).find(
     (entry) => (entry.args as { contextId?: Hex }).contextId?.toLowerCase() === contextId.toLowerCase(),
   )
-  return log === undefined || log.blockNumber === null ? undefined : { block: log.blockNumber, index: log.logIndex }
+  return log === undefined || log.blockNumber === null
+    ? undefined
+    : {
+        block: log.blockNumber,
+        ...(typeof receipt.transactionIndex === "number" ? { transaction: receipt.transactionIndex } : {}),
+        index: log.logIndex,
+      }
 }
 
 /** §13.1 agent/server SDK. Every authority it relies on is re-read from Monad; nothing the API returns is trusted alone. */

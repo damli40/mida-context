@@ -45,6 +45,8 @@ export interface DecodedLog {
   blockNumber: bigint | null
   transactionHash: Hex | null
   logIndex: number | null
+  /** The index of the transaction that emitted this log inside its block (in-13 M-5). */
+  transactionIndex: number | null
 }
 
 /** Structural subset of viem's PublicClient used for log scans, so tests can pass a recording fake. */

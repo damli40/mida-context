@@ -168,6 +168,17 @@ function fakeRuntime(home: MidaHome, over: {
   agent?: unknown
   /** What `BatchAnchor.hasBatchedSaves(owner)` answers; absent makes the chain read throw. */
   hasBatchedSaves?: (owner: Address) => Promise<boolean>
+  /**
+   * The tie-scan surface `recordPlacementsNear` reads (in-13 M-5): `head`/`tsOf` answer
+   * getBlock, `direct`/`batched` are the ContextRegistered and SaveAnchored logs a getLogs
+   * window returns, keyed by the address it was asked.
+   */
+  tieScan?: {
+    head: bigint
+    tsOf: (n: bigint) => bigint
+    direct?: Map<string, { block: bigint; logIndex: number; transactionIndex: number }>
+    batched?: Map<string, { block: bigint; position: number; transactionIndex: number }>
+  }
 } = {}): ServiceRuntime {
   return {
     home,
@@ -183,6 +194,35 @@ function fakeRuntime(home: MidaHome, over: {
             return over.hasBatchedSaves(args[0])
           }
           throw new Error(`unexpected chain read ${functionName}`)
+        },
+        getBlock: async (parameters?: { blockTag?: string; blockNumber?: bigint }) => {
+          const scan = over.tieScan
+          if (scan === undefined) throw new Error("no tie-scan fake")
+          if (parameters?.blockNumber !== undefined) {
+            const n = parameters.blockNumber
+            if (n < 0 || n > scan.head) return null
+            return { number: n, timestamp: scan.tsOf(n) }
+          }
+          return { number: scan.head, timestamp: scan.tsOf(scan.head) }
+        },
+        getLogs: async (parameters: { address?: string; fromBlock: bigint; toBlock: bigint; args?: { contextId?: string[] } }) => {
+          const scan = over.tieScan
+          if (scan === undefined) throw new Error("no tie-scan fake")
+          const wanted = parameters.args?.contextId?.map((c) => c.toLowerCase())
+          const inWindow = (block: bigint) => block >= parameters.fromBlock && block <= parameters.toBlock
+          if (parameters.address === DEPLOYMENT_BATCHED.batchAnchor) {
+            return [...(scan.batched ?? new Map()).entries()]
+              .filter(([cid, p]) => (wanted === undefined || wanted.includes(cid)) && inWindow(p.block))
+              .map(([cid, p]) => ({ args: { contextId: cid, position: p.position }, blockNumber: p.block, logIndex: p.position, transactionIndex: p.transactionIndex }))
+          }
+          return [...(scan.direct ?? new Map()).entries()]
+            .filter(([cid, p]) => (wanted === undefined || wanted.includes(cid)) && inWindow(p.block))
+            .map(([cid, p]) => ({ args: { contextId: cid }, blockNumber: p.block, logIndex: p.logIndex, transactionIndex: p.transactionIndex }))
+        },
+        getBlockNumber: async () => {
+          const scan = over.tieScan
+          if (scan === undefined) throw new Error("no tie-scan fake")
+          return scan.head
         },
       },
     },
@@ -203,7 +243,7 @@ const ENVELOPE = (eventId: string) =>
   })
 
 /** A ContextObject-shaped row the way agent.readBatchedWithStatus returns it. */
-const anchoredObject = (contextId: Hex, eventId: string) => ({
+const anchoredObject = (contextId: Hex, eventId: string, chain?: { at: bigint; block?: bigint; index?: number }) => ({
   contextId,
   owner: OWNER,
   namespace: "goals.career",
@@ -215,6 +255,7 @@ const anchoredObject = (contextId: Hex, eventId: string) => ({
   readEpoch: 1n,
   recordType: 0,
   payload: { v: 1, value: ENVELOPE(eventId), kind: "EPISODE", provenance: { source: "AGENT_INFERRED" } },
+  ...(chain === undefined ? {} : { chain }),
 })
 
 const pendingItem = (contextId: Hex, eventId: string, authorAgentId: Hex) => ({
@@ -479,6 +520,139 @@ describe("readCheckpoints — the batched lane's records merge in, marked", () =
       })
       const result = await readCheckpoints(runtime, "claude-code", "p-1")
       expect(result.partial).toBe(true)
+    } finally {
+      await store.close()
+    }
+  })
+})
+
+describe("readCheckpoints — a same-second tie across the two lanes (in-13 M-5)", () => {
+  /**
+   * A direct record gets a placement only when it ties with another DIRECT record — the
+   * SDK's own scan never sees the batched lane. A cross-lane tie reaches readCheckpoints
+   * with the batched record stamped {at, block, position} and the direct one holding only
+   * {at}, so "no block sorts first" would crown the batched record whatever really landed
+   * later. The merge-level scan must place EVERY member of the tie — (block, the anchoring
+   * transaction's index inside it, position inside the transaction) — and a group it
+   * cannot complete keeps none.
+   */
+  const SECOND = 1_500n
+  const tsOf = (n: bigint) => 2_000n - (1_000n - n) // one second per block; SECOND sits at block 500
+  const tiedObjects = (directObj: unknown, batchedObj: unknown) => ({
+    readWithStatus: async () => ({ objects: [directObj], partial: false }),
+    readBatchedWithStatus: async () => ({ ...emptyBatched, anchored: [batchedObj] }),
+  })
+  const tieScan = (events: {
+    direct?: Map<string, { block: bigint; logIndex: number; transactionIndex: number }>
+    batched?: Map<string, { block: bigint; position: number; transactionIndex: number }>
+  }) => ({ head: 1_000n, tsOf, ...events })
+
+  it("a direct save that landed after a batched one in the same second is current — different blocks", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const directId = `0x${"e1".repeat(32)}` as Hex
+      const batchedId = `0x${"e2".repeat(32)}` as Hex
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent: tiedObjects(
+          anchoredObject(directId, "cp-direct", { at: SECOND }),
+          anchoredObject(batchedId, "cp-batched", { at: SECOND, block: 480n, index: 0 }),
+        ),
+        tieScan: tieScan({
+          direct: new Map([[directId, { block: 500n, logIndex: 40, transactionIndex: 2 }]]),
+          batched: new Map([[batchedId, { block: 480n, position: 0, transactionIndex: 5 }]]),
+        }),
+      })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1")
+      expect(result.checkpoints.map((cp) => cp.contextId)).toEqual([batchedId, directId])
+      expect(result.checkpoints[1]!.checkpoint.objective).toBe("objective-cp-direct")
+      // the direct record gained its real placement — the batched one keeps its position
+      expect(result.checkpoints[1]!.chain).toEqual({ at: SECOND, block: 500n, index: 40, transaction: 2 })
+      expect(result.checkpoints[0]!.chain).toEqual({ at: SECOND, block: 480n, index: 0, transaction: 5 })
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("a direct save that landed after a batched one in the same second is current — same block, later transaction", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const directId = `0x${"e3".repeat(32)}` as Hex
+      const batchedId = `0x${"e4".repeat(32)}` as Hex
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent: tiedObjects(
+          anchoredObject(directId, "cp-direct", { at: SECOND }),
+          anchoredObject(batchedId, "cp-batched", { at: SECOND, block: 500n, index: 0 }),
+        ),
+        tieScan: tieScan({
+          direct: new Map([[directId, { block: 500n, logIndex: 3, transactionIndex: 7 }]]),
+          batched: new Map([[batchedId, { block: 500n, position: 0, transactionIndex: 2 }]]),
+        }),
+      })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1")
+      expect(result.checkpoints.map((cp) => cp.contextId)).toEqual([batchedId, directId])
+      expect(result.checkpoints[1]!.checkpoint.objective).toBe("objective-cp-direct")
+      expect(result.checkpoints[1]!.chain).toEqual({ at: SECOND, block: 500n, index: 3, transaction: 7 })
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("a batched save that landed after a direct one in the same second is current — different blocks", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const directId = `0x${"e5".repeat(32)}` as Hex
+      const batchedId = `0x${"e6".repeat(32)}` as Hex
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent: tiedObjects(
+          anchoredObject(directId, "cp-direct", { at: SECOND }),
+          anchoredObject(batchedId, "cp-batched", { at: SECOND, block: 500n, index: 0 }),
+        ),
+        tieScan: tieScan({
+          direct: new Map([[directId, { block: 480n, logIndex: 2, transactionIndex: 1 }]]),
+          batched: new Map([[batchedId, { block: 500n, position: 0, transactionIndex: 3 }]]),
+        }),
+      })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1")
+      expect(result.checkpoints.map((cp) => cp.contextId)).toEqual([directId, batchedId])
+      expect(result.checkpoints[1]!.checkpoint.objective).toBe("objective-cp-batched")
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("a tie the scan cannot complete keeps NO member's placement — the whole second falls to contextId together", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const directId = `0x${"aa".repeat(32)}` as Hex // id-sorted before batchedId on purpose
+      const batchedId = `0x${"bb".repeat(32)}` as Hex
+      const runtime = fakeRuntime(home, {
+        network: batchedNetwork(store.url),
+        apiBaseUrl: store.url,
+        agent: tiedObjects(
+          anchoredObject(directId, "cp-direct", { at: SECOND }),
+          anchoredObject(batchedId, "cp-batched", { at: SECOND, block: 500n, index: 0 }),
+        ),
+        tieScan: tieScan({
+          // the direct record's ContextRegistered is nowhere in the window — partial answer
+          batched: new Map([[batchedId, { block: 500n, position: 0, transactionIndex: 3 }]]),
+        }),
+      })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1")
+      // a found record may never order before an unfound one on the same stamp: the batched
+      // row's own {block, index} is dropped too, and the contextId orders both together
+      expect(result.checkpoints.map((cp) => cp.contextId)).toEqual([directId, batchedId])
+      expect(result.checkpoints[0]!.chain).toEqual({ at: SECOND })
+      expect(result.checkpoints[1]!.chain).toEqual({ at: SECOND })
     } finally {
       await store.close()
     }

@@ -36,14 +36,15 @@ export interface StoredCheckpoint {
   /**
    * Monad's own placement of the save — carried by every record the SDK's reads return. `at` is
    * the timestamp the chain stamped (the registry row's createdAt for a direct save, the anchor
-   * block's time for a batched one); `block` and `index` are its position in the chain's order
-   * (log index for a direct save, batch position for a batched one). Absent for a save the chain
-   * has not placed — a pending batched save, or a fixture built by hand — and `block`/`index`
-   * absent when only the stamp was recoverable. `checkpoint.createdAt` is the writer's own
-   * claim: it is encrypted content and never enters the ordering or the displayed time — the
-   * chain's stamp decides both (in-12 N-1).
+   * block's time for a batched one); `block`, `transaction` and `index` are its position in the
+   * chain's order (block, then the anchoring transaction's index inside it, then the save's own
+   * position — log index for a direct save, batch position for a batched one). Absent for a save
+   * the chain has not placed — a pending batched save, or a fixture built by hand — and
+   * `block`/`transaction`/`index` absent when only the stamp was recoverable. `checkpoint.createdAt`
+   * is the writer's own claim: it is encrypted content and never enters the ordering or the
+   * displayed time — the chain's stamp decides both (in-12 N-1).
    */
-  chain?: { at: bigint; block?: bigint; index?: number }
+  chain?: { at: bigint; block?: bigint; transaction?: number; index?: number }
   /**
    * Set only on records `mida migrate` moved here — the sealed envelope carried beside the
    * checkpoint. It is the ONE exception to chain-time ordering: a moved record orders and
@@ -132,7 +133,8 @@ export const recordedAt = (s: StoredCheckpoint): string =>
 /**
  * The order Monad wrote the saves in: each record's effective instant (its chain stamp — a
  * moved record's earliest of envelope originalCreatedAt and replay stamp — see `orderTime`), then
- * block, then log index — the contextId only ever breaks a tie between records that carry none
+ * block, then the anchoring transaction's index inside it, then the save's own position inside
+ * the transaction — the contextId only ever breaks a tie between records that carry none
  * of those. A record the chain placed sorts after an unplaced one at the same instant (absent
  * fields order first); a pending save never enters this comparison — the handoff keeps it out
  * of the merge entirely.
@@ -146,6 +148,17 @@ export const compareChainOrder = (a: StoredCheckpoint, b: StoredCheckpoint): num
     if (aBlock === undefined) return -1
     if (bBlock === undefined) return 1
     if (aBlock !== bBlock) return aBlock < bBlock ? -1 : 1
+  }
+  // Inside one block the anchoring TRANSACTION's index decides first: a batched save's
+  // `index` is its position inside the batch, a direct save's `index` its ContextRegistered
+  // log's index in the block — two different units that may never be compared, so `index`
+  // is only read once the transaction is tied (or unknown on both sides) (in-13 M-5).
+  const aTransaction = a.chain?.transaction
+  const bTransaction = b.chain?.transaction
+  if (aTransaction !== undefined || bTransaction !== undefined) {
+    if (aTransaction === undefined) return -1
+    if (bTransaction === undefined) return 1
+    if (aTransaction !== bTransaction) return aTransaction - bTransaction
   }
   const aIndex = a.chain?.index
   const bIndex = b.chain?.index

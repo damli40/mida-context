@@ -1164,12 +1164,20 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
       if (bBlock === undefined) return -1
       if (aBlock !== bBlock) return bBlock - aBlock
     }
+    // `index` is a log index on the direct lane and a position inside its own batch on the
+    // batched one — comparable only between two direct records, or two saves of the SAME
+    // batch. The page's sources carry no per-transaction index that could order across lanes
+    // or across batches in one block, so those ties fall straight to the contextId rather
+    // than comparing two different units as if they were one (in-13 M-5).
     const aIndex = a.chain?.index
     const bIndex = b.chain?.index
     if (aIndex !== undefined || bIndex !== undefined) {
-      if (aIndex === undefined) return 1
-      if (bIndex === undefined) return -1
-      if (aIndex !== bIndex) return bIndex - aIndex
+      const sameUnit = a.lane === b.lane && (a.lane === "direct" || a.batchId === b.batchId)
+      if (sameUnit) {
+        if (aIndex === undefined) return 1
+        if (bIndex === undefined) return -1
+        if (aIndex !== bIndex) return bIndex - aIndex
+      }
     }
     return a.contextId < b.contextId ? -1 : a.contextId > b.contextId ? 1 : 0
   })

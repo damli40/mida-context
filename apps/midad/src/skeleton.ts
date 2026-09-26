@@ -2,8 +2,8 @@ import { privateKeyToAccount } from "viem/accounts"
 import { entryPoint08Address } from "viem/account-abstraction"
 import { MidaError, PERMISSION, decodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
 import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScope } from "@mida/protocol"
-import { batchAnchorAbi, capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord } from "@mida/chain"
-import type { ChainContext, HistoryScanCursor } from "@mida/chain"
+import { batchAnchorAbi, capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord, recordPlacementsNear } from "@mida/chain"
+import type { ChainContext, HistoryScanCursor, RecordPlacement } from "@mida/chain"
 import { DENY_CANCEL_EXPIRY_SECONDS, provisionAgent } from "@mida/fake-vault"
 import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
@@ -811,6 +811,57 @@ export async function readCheckpoints(
         if (has) partial = true
       } catch {
         partial = true
+      }
+    }
+  }
+  // A same-second tie that spans the two lanes needs every member's chain placement before
+  // the sort below can be trusted — "no block orders first" would otherwise crown whichever
+  // lane earned a placement, whatever really landed later (in-13 M-5). The SDK's own tie
+  // scan only queries the lane the read listed (a batched record never joins the direct
+  // lane's scan), so a cross-lane tie reaches here with the batched member stamped and the
+  // direct one not. One bounded re-scan covering BOTH events places the whole second
+  // together; a second it cannot complete keeps NO member's placement and the whole group
+  // falls to the contextId order — the same rule the scan itself applies to partial answers.
+  if (mergedBatched && deployment !== undefined) {
+    const bySecond = new Map<bigint, StoredCheckpoint[]>()
+    for (const cp of checkpoints) {
+      if (cp.chain === undefined) continue
+      const list = bySecond.get(cp.chain.at)
+      if (list === undefined) bySecond.set(cp.chain.at, [cp])
+      else list.push(cp)
+    }
+    const tied = new Map<bigint, Hex[]>()
+    for (const [second, members] of bySecond) {
+      if (members.length < 2) continue
+      // a second whose members already all carry a full placement orders itself — only a
+      // missing block or transaction index means the lanes were never scanned together
+      if (members.some((cp) => cp.chain!.block === undefined || cp.chain!.transaction === undefined)) {
+        tied.set(second, members.map((cp) => cp.contextId as Hex))
+      }
+    }
+    if (tied.size > 0) {
+      const placements = await recordPlacementsNear({
+        client: runtime.chain.publicClient,
+        deployment,
+        owner: runtime.owner,
+        namespaceId: NAMESPACE_ID,
+        tied,
+      }).catch(() => new Map<string, RecordPlacement>())
+      for (const second of tied.keys()) {
+        const members = bySecond.get(second)!
+        const complete = members.every((cp) => placements.has(cp.contextId.toLowerCase()))
+        for (const cp of members) {
+          const placement = complete ? placements.get(cp.contextId.toLowerCase()) : undefined
+          cp.chain =
+            placement === undefined
+              ? { at: cp.chain!.at }
+              : {
+                  at: cp.chain!.at,
+                  block: placement.block,
+                  ...(placement.transaction === undefined ? {} : { transaction: placement.transaction }),
+                  index: placement.index,
+                }
+        }
       }
     }
   }

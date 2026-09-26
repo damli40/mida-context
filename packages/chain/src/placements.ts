@@ -1,22 +1,28 @@
 import { getAbiItem } from "viem"
 import type { AbiEvent } from "viem"
 import type { Address, Hex } from "@mida/protocol"
-import { contextRegistryAbi } from "./abis.js"
+import { batchAnchorAbi, contextRegistryAbi } from "./abis.js"
 import type { Deployment } from "./deployment.js"
 import { chainFor } from "./deployment.js"
 import { SAFE_LOG_BLOCK_RANGE, blockWindows, getLogsChunked } from "./logs.js"
 import type { LogClient } from "./logs.js"
 
 const CONTEXT_REGISTERED = getAbiItem({ abi: contextRegistryAbi, name: "ContextRegistered" }) as AbiEvent
+const SAVE_ANCHORED = getAbiItem({ abi: batchAnchorAbi, name: "SaveAnchored" }) as AbiEvent
 
 /**
- * Where Monad placed one save: the block its anchoring event sits in and the log's index inside
- * that block — the chain's own intra-block order. `record.createdAt` already carries Monad's
- * timestamp (the contract stores `block.timestamp`); the block and index exist only in the event
- * log, so a reader that needs them scans it.
+ * Where Monad placed one save: the block its anchoring event sits in, the anchoring
+ * transaction's index inside that block, and the save's own position inside the transaction
+ * — a batch position for a batched save, the log's index in the block for a direct one.
+ * `record.createdAt` already carries Monad's timestamp (the contract stores
+ * `block.timestamp`); the placement fields exist only in the event log, so a reader that
+ * needs them scans it. `index` is a different unit in each lane and must never be compared
+ * across them — one transaction never emits both events (in-13 M-5).
  */
 export interface RecordPlacement {
   block: bigint
+  /** The anchoring transaction's index inside the block — absent when the log carried none. */
+  transaction?: number
   index: number
 }
 
@@ -53,7 +59,11 @@ export async function recordPlacements(input: {
   for (const log of logs) {
     const contextId = (log.args as { contextId?: unknown }).contextId
     if (typeof contextId !== "string" || log.blockNumber === null || log.logIndex === null) continue
-    map.set(contextId.toLowerCase(), { block: log.blockNumber, index: log.logIndex })
+    map.set(contextId.toLowerCase(), {
+      block: log.blockNumber,
+      ...(log.transactionIndex === null || log.transactionIndex === undefined ? {} : { transaction: log.transactionIndex }),
+      index: log.logIndex,
+    })
   }
   return map
 }
@@ -193,27 +203,55 @@ export async function recordPlacementsNear(input: {
     input.namespaceId === undefined
       ? ({ owner: input.owner } as Record<string, unknown>)
       : { owner: input.owner, namespaceId: input.namespaceId }
+  // A tied second can hold records from BOTH lanes (in-13 M-5): a direct save's
+  // ContextRegistered on the registry and a batched save's SaveAnchored on the batch
+  // anchor. Each log answers for its own contextIds — the batch lane's placement is the
+  // position inside the batch, the direct lane's the log index, and each carries its
+  // anchoring transaction's index in the block so the merge never compares the two
+  // `index` units against each other.
   const requests = windows.flatMap((window) =>
-    blockWindows(window.fromBlock, window.toBlock, SAFE_LOG_BLOCK_RANGE).map((piece) => ({ piece, contextIds: window.contextIds })),
+    blockWindows(window.fromBlock, window.toBlock, SAFE_LOG_BLOCK_RANGE).flatMap((piece) => {
+      const lanes: { lane: "direct" | "batched"; request: Promise<readonly unknown[]> }[] = [
+        {
+          lane: "direct" as const,
+          request: input.client.getLogs({
+            address: input.deployment.contextRegistry,
+            event: CONTEXT_REGISTERED,
+            args: { ...args, contextId: [...window.contextIds] },
+            fromBlock: piece.fromBlock,
+            toBlock: piece.toBlock,
+            strict: true,
+          }),
+        },
+      ]
+      if (input.deployment.batchAnchor !== undefined) {
+        lanes.push({
+          lane: "batched" as const,
+          request: input.client.getLogs({
+            address: input.deployment.batchAnchor,
+            event: SAVE_ANCHORED,
+            args: { owner: input.owner, contextId: [...window.contextIds] },
+            fromBlock: piece.fromBlock,
+            toBlock: piece.toBlock,
+            strict: true,
+          }),
+        })
+      }
+      return lanes
+    }),
   )
-  const pages = await Promise.all(
-    requests.map(({ piece, contextIds }) =>
-      input.client.getLogs({
-        address: input.deployment.contextRegistry,
-        event: CONTEXT_REGISTERED,
-        args: { ...args, contextId: [...contextIds] },
-        fromBlock: piece.fromBlock,
-        toBlock: piece.toBlock,
-        strict: true,
-      }),
-    ),
-  )
-  for (const logs of pages) {
+  const pages = await Promise.all(requests.map(async ({ lane, request }) => ({ lane, logs: await request })))
+  for (const { lane, logs } of pages) {
     for (const log of logs) {
       const decoded = log as DecodedLogForPlacement
       const contextId = decoded.args.contextId
-      if (typeof contextId !== "string" || decoded.blockNumber === null || decoded.logIndex === null) continue
-      map.set(contextId.toLowerCase(), { block: decoded.blockNumber, index: decoded.logIndex })
+      const position = lane === "direct" ? decoded.logIndex : decoded.args.position
+      if (typeof contextId !== "string" || decoded.blockNumber === null || typeof position !== "number") continue
+      map.set(contextId.toLowerCase(), {
+        block: decoded.blockNumber,
+        ...(typeof decoded.transactionIndex === "number" ? { transaction: decoded.transactionIndex } : {}),
+        index: position,
+      })
     }
   }
   // A tie only orders by placement when EVERY record sharing its second was found — a partial
@@ -232,6 +270,7 @@ interface DecodedLogForPlacement {
   args: Record<string, unknown>
   blockNumber: bigint | null
   logIndex: number | null
+  transactionIndex: number | null
 }
 
 /**

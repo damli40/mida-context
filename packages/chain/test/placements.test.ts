@@ -8,6 +8,7 @@ import type { Deployment } from "@mida/chain"
 
 const OWNER = `0x${"33".repeat(20)}` as `0x${string}`
 const CONTEXT_REGISTRY = `0x${"22".repeat(20)}` as `0x${string}`
+const BATCH_ANCHOR = `0x${"44".repeat(20)}` as `0x${string}`
 const DEPLOYMENT: Deployment = {
   chainId: MONAD_TESTNET_CHAIN_ID, // the chain whose static blockTime is 400 ms
   capabilityRegistry: `0x${"11".repeat(20)}` as `0x${string}`,
@@ -17,6 +18,8 @@ const DEPLOYMENT: Deployment = {
   vaultRpIdHash: `0x${"13".repeat(32)}` as `0x${string}`,
   deploymentBlock: 10n,
 }
+/** The same deployment with a BatchAnchor — the scan reads SaveAnchored from it (in-13 M-5). */
+const DEPLOYMENT_BATCHED: Deployment = { ...DEPLOYMENT, batchAnchor: BATCH_ANCHOR, batchAnchorBlock: 10n }
 
 const id = (fill: string) => `0x${fill.repeat(32)}` as `0x${string}`
 const ID_A = id("aa")
@@ -34,14 +37,17 @@ interface FakeChain {
 
 /**
  * A chain whose TRUE block time differs from the declared 400 ms: `tsOf` is the timestamp
- * function (block number → seconds), `placements` maps contextId → the real block its event
- * sits in. Every getBlock probe and getLogs window is recorded.
+ * function (block number → seconds), `placements` maps contextId → the real block its
+ * ContextRegistered event sits in. Every getBlock probe and getLogs window is recorded.
+ * `batchedPlacements` is the second lane: contextId → the block, position inside the batch
+ * and anchoring transaction's index a SaveAnchored log on `batchAnchor` would report.
  */
 function fakeChain(input: {
   head: bigint
   headTs: bigint
   tsOf: (n: bigint) => bigint
-  placements: Map<string, { block: bigint; index: number }>
+  placements: Map<string, { block: bigint; index: number; transaction?: number }>
+  batchedPlacements?: Map<string, { block: bigint; position: number; transaction?: number }>
 }): FakeChain {
   const logCalls: { fromBlock: bigint; toBlock: bigint }[] = []
   const blockProbes: bigint[] = []
@@ -55,12 +61,27 @@ function fakeChain(input: {
       }
       return { number: input.head, timestamp: input.headTs }
     },
-    getLogs: async (parameters: { fromBlock: bigint; toBlock: bigint; args?: { contextId?: string[] } }) => {
+    getLogs: async (parameters: { fromBlock: bigint; toBlock: bigint; address?: string; args?: { contextId?: string[] } }) => {
       logCalls.push({ fromBlock: parameters.fromBlock, toBlock: parameters.toBlock })
       const wanted = parameters.args?.contextId?.map((c) => c.toLowerCase())
+      if (parameters.address === BATCH_ANCHOR) {
+        return [...(input.batchedPlacements ?? new Map()).entries()]
+          .filter(([cid, p]) => (wanted === undefined || wanted.includes(cid)) && p.block >= parameters.fromBlock && p.block <= parameters.toBlock)
+          .map(([cid, p]) => ({
+            args: { contextId: cid, position: p.position },
+            blockNumber: p.block,
+            logIndex: p.position,
+            ...(p.transaction === undefined ? {} : { transactionIndex: p.transaction }),
+          }))
+      }
       return [...input.placements.entries()]
         .filter(([cid, p]) => (wanted === undefined || wanted.includes(cid)) && p.block >= parameters.fromBlock && p.block <= parameters.toBlock)
-        .map(([cid, p]) => ({ args: { contextId: cid }, blockNumber: p.block, logIndex: p.index }))
+        .map(([cid, p]) => ({
+          args: { contextId: cid },
+          blockNumber: p.block,
+          logIndex: p.index,
+          ...(p.transaction === undefined ? {} : { transactionIndex: p.transaction }),
+        }))
     },
     getBlockNumber: async () => input.head,
   }
@@ -184,5 +205,63 @@ describe("recordPlacementsNear — the corrected estimate and bounded window (in
     for (const call of chain.logCalls) {
       expect(call.toBlock - call.fromBlock + 1n).toBeLessThanOrEqual(SAFE_LOG_BLOCK_RANGE)
     }
+  })
+})
+
+describe("recordPlacementsNear — a tie spanning both lanes (in-13 M-5)", () => {
+  const HEAD = 70_000_000n
+  const HEAD_TS = 1_800_000_000n
+  // linear 400 ms blocks so the static estimate lands inside the window without correction
+  const tsOf = (n: bigint) => HEAD_TS - ((HEAD - n) * 400n) / 1_000n
+  const second = HEAD_TS - 40n // 100 blocks back at 400 ms
+  const realBlock = HEAD - 100n
+
+  it("places each lane's record from its own event: ContextRegistered's log index and SaveAnchored's batch position, each carrying its anchoring transaction's index", async () => {
+    const chain = fakeChain({
+      head: HEAD,
+      headTs: HEAD_TS,
+      tsOf,
+      placements: new Map([[ID_A, { block: realBlock, index: 41, transaction: 2 }]]),
+      batchedPlacements: new Map([[ID_B, { block: realBlock, position: 0, transaction: 7 }]]),
+    })
+    const map = await recordPlacementsNear({ client: chain.client as never, deployment: DEPLOYMENT_BATCHED, owner: OWNER, tied: tied(second, [ID_A, ID_B]) })
+    expect(map.get(ID_A)).toEqual({ block: realBlock, index: 41, transaction: 2 })
+    expect(map.get(ID_B)).toEqual({ block: realBlock, index: 0, transaction: 7 })
+  })
+
+  it("a batched member found in a different block than the direct one keeps its own block", async () => {
+    const chain = fakeChain({
+      head: HEAD,
+      headTs: HEAD_TS,
+      tsOf,
+      placements: new Map([[ID_A, { block: realBlock, index: 3, transaction: 0 }]]),
+      batchedPlacements: new Map([[ID_B, { block: realBlock + 40n, position: 6, transaction: 1 }]]),
+    })
+    const map = await recordPlacementsNear({ client: chain.client as never, deployment: DEPLOYMENT_BATCHED, owner: OWNER, tied: tied(second, [ID_A, ID_B]) })
+    expect(map.get(ID_B)).toEqual({ block: realBlock + 40n, index: 6, transaction: 1 })
+  })
+
+  it("a mixed group whose batched member is absent keeps NO placements — the whole second falls to contextId together", async () => {
+    const chain = fakeChain({
+      head: HEAD,
+      headTs: HEAD_TS,
+      tsOf,
+      placements: new Map([[ID_A, { block: realBlock, index: 3, transaction: 0 }]]),
+      batchedPlacements: new Map(), // B's SaveAnchored is nowhere in the window
+    })
+    const map = await recordPlacementsNear({ client: chain.client as never, deployment: DEPLOYMENT_BATCHED, owner: OWNER, tied: tied(second, [ID_A, ID_B]) })
+    expect(map.size).toBe(0)
+  })
+
+  it("a deployment with no batchAnchor still scans only ContextRegistered", async () => {
+    const chain = fakeChain({
+      head: HEAD,
+      headTs: HEAD_TS,
+      tsOf,
+      placements: new Map([[ID_A, { block: realBlock, index: 3, transaction: 0 }], [ID_B, { block: realBlock, index: 4, transaction: 0 }]]),
+    })
+    const map = await recordPlacementsNear({ client: chain.client as never, deployment: DEPLOYMENT, owner: OWNER, tied: tied(second, [ID_A, ID_B]) })
+    expect(map.get(ID_A)).toEqual({ block: realBlock, index: 3, transaction: 0 })
+    expect(map.get(ID_B)).toEqual({ block: realBlock, index: 4, transaction: 0 })
   })
 })

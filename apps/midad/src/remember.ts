@@ -235,7 +235,8 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string, opti
   }
   const shown = options.history === true ? facts : facts.filter(({ fact }) => fact.replacedBy === undefined)
   // Newest first by the original stating time; a same-second tie breaks by the order Monad
-  // actually wrote the records in — block, then log index — so a slow or lying clock can never
+  // actually wrote the records in — block, then the anchoring transaction's index inside it,
+  // then the save's own position inside the transaction — so a slow or lying clock can never
   // reorder what the chain already fixed. contextId is the last resort only, for records that
   // carry no placement at all.
   shown.sort((a, b) => {
@@ -247,6 +248,16 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string, opti
       if (aBlock === undefined) return 1
       if (bBlock === undefined) return -1
       if (aBlock !== bBlock) return aBlock < bBlock ? 1 : -1
+    }
+    // Inside one block the anchoring transaction decides before the save's own position —
+    // `index` is a log index on the direct lane and a batch position on the batched one, two
+    // units that may never be compared (in-13 M-5).
+    const aTransaction = a.chain?.transaction
+    const bTransaction = b.chain?.transaction
+    if (aTransaction !== undefined || bTransaction !== undefined) {
+      if (aTransaction === undefined) return 1
+      if (bTransaction === undefined) return -1
+      if (aTransaction !== bTransaction) return bTransaction - aTransaction
     }
     const aIndex = a.chain?.index
     const bIndex = b.chain?.index

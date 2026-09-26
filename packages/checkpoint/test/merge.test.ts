@@ -8,7 +8,7 @@ function stored(
     continuesSession?: string | null
     at: string
     /** Monad's own placement of the save — what the SDK's reads carry on `ContextObject.chain`. */
-    chain?: { at: bigint; block?: bigint; index?: number }
+    chain?: { at: bigint; block?: bigint; transaction?: number; index?: number }
   },
 ): StoredCheckpoint {
   n += 1
@@ -228,6 +228,58 @@ describe("mergeCheckpoints", () => {
     const same = mergeCheckpoints([first, second])!
     expect(same.nextAction).toBe("chain-later action")
     expect(same.provenance.map((row) => row.contextId)).toEqual([first.contextId, second.contextId])
+  })
+
+  it("a direct save and a batched save tied in one second order by (block, transaction index, batch position) — never a log index against a batch position (in-13 M-5)", () => {
+    // The two lanes stamp `chain.index` with different units: a direct record carries its
+    // ContextRegistered log's index in the block, a batched one its position inside the batch.
+    // Same block, direct save in the LATER transaction: its log index can still be smaller than
+    // the batch position of an earlier batch — the position is not an intra-block counter.
+    const directLater = stored({
+      sessionId: "s-direct-later", at: "2026-09-21T10:00:00.000Z", objective: "direct-landed-later", progress: ["p"],
+      chain: { at: 1_700_000_000n, block: 5n, transaction: 9, index: 30 },
+    })
+    const batchedEarlier = stored({
+      sessionId: "s-batched-earlier", at: "2026-09-21T10:00:00.000Z", objective: "batched-landed-earlier", progress: ["p"],
+      chain: { at: 1_700_000_000n, block: 5n, transaction: 1, index: 35 },
+    })
+    for (const order of [[directLater, batchedEarlier], [batchedEarlier, directLater]] as const) {
+      expect(mergeCheckpoints([...order])!.objective).toBe("direct-landed-later")
+    }
+
+    // Same block, batched save in the later transaction: a direct log index that happens to be
+    // larger than the batch position must not crown the direct save.
+    const directEarlier = stored({
+      sessionId: "s-direct-earlier", at: "2026-09-21T10:00:00.000Z", objective: "direct-landed-earlier", progress: ["p"],
+      chain: { at: 1_700_000_000n, block: 5n, transaction: 1, index: 30 },
+    })
+    const batchedLater = stored({
+      sessionId: "s-batched-later", at: "2026-09-21T10:00:00.000Z", objective: "batched-landed-later", progress: ["p"],
+      chain: { at: 1_700_000_000n, block: 5n, transaction: 9, index: 0 },
+    })
+    for (const order of [[directEarlier, batchedLater], [batchedLater, directEarlier]] as const) {
+      expect(mergeCheckpoints([...order])!.objective).toBe("batched-landed-later")
+    }
+
+    // Different blocks: the block alone decides, whichever lane landed later.
+    const directB9 = stored({ sessionId: "s-direct-b9", at: "2026-09-21T10:00:00.000Z", objective: "direct-later-block", progress: ["p"], chain: { at: 1_700_000_000n, block: 9n, transaction: 0, index: 0 } })
+    const batchedB5 = stored({ sessionId: "s-batched-b5", at: "2026-09-21T10:00:00.000Z", objective: "batched-earlier-block", progress: ["p"], chain: { at: 1_700_000_000n, block: 5n, transaction: 7, index: 2 } })
+    for (const order of [[directB9, batchedB5], [batchedB5, directB9]] as const) {
+      expect(mergeCheckpoints([...order])!.objective).toBe("direct-later-block")
+    }
+    const batchedB9 = stored({ sessionId: "s-batched-b9", at: "2026-09-21T10:00:00.000Z", objective: "batched-later-block", progress: ["p"], chain: { at: 1_700_000_000n, block: 9n, transaction: 7, index: 2 } })
+    const directB5 = stored({ sessionId: "s-direct-b5", at: "2026-09-21T10:00:00.000Z", objective: "direct-earlier-block", progress: ["p"], chain: { at: 1_700_000_000n, block: 5n, transaction: 0, index: 0 } })
+    for (const order of [[directB5, batchedB9], [batchedB9, directB5]] as const) {
+      expect(mergeCheckpoints([...order])!.objective).toBe("batched-later-block")
+    }
+
+    // Two batched saves anchored by the SAME transaction are the one place `index` compares —
+    // positions inside one batch are the same unit.
+    const pos0 = stored({ sessionId: "s-pos-0", at: "2026-09-21T10:00:00.000Z", objective: "batch-position-0", progress: ["p"], chain: { at: 1_700_000_000n, block: 5n, transaction: 3, index: 0 } })
+    const pos4 = stored({ sessionId: "s-pos-4", at: "2026-09-21T10:00:00.000Z", objective: "batch-position-4", progress: ["p"], chain: { at: 1_700_000_000n, block: 5n, transaction: 3, index: 4 } })
+    for (const order of [[pos0, pos4], [pos4, pos0]] as const) {
+      expect(mergeCheckpoints([...order])!.objective).toBe("batch-position-4")
+    }
   })
 
   it("a save carrying an older claim that landed LATER on chain is the current one (in-12 N-1)", () => {
