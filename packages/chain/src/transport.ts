@@ -85,7 +85,10 @@ export function isChainBusy(error: unknown): boolean {
 /** The Sep 25 live answer worded it "requests limited to 15/sec"; providers say it a few ways. */
 const BUSY_MESSAGE = /requests? limit|rate limit|too many requests/i
 
-/** HTTP 429, or a JSON-RPC error message that names rate limiting — single or batched body. */
+/**
+ * HTTP 429, or a JSON-RPC error message that names rate limiting — single or batched body.
+ * 429 is also "transient" in the 4xx sense, but it is answered first and gets ChainBusyError.
+ */
 async function busyAnswer(response: Response): Promise<boolean> {
   if (response.status === 429) return true
   let data: unknown
@@ -102,6 +105,16 @@ async function busyAnswer(response: Response): Promise<boolean> {
 }
 
 const RETRY_DELAYS_MS = [250, 500, 1_000] as const
+
+/**
+ * in-9 R-6 — the answers a retry can change: a gateway blip (5xx) or a timed-out request (408).
+ * Anything else 4xx is the request itself being wrong — retrying it just burns the allowance.
+ * A fetch that throws (DNS, refused connection, dropped socket) is transient the same way and
+ * is handled inside fetchFn, where the thrown error can be caught.
+ */
+function transientAnswer(status: number): boolean {
+  return status === 408 || status >= 500
+}
 
 /** Waits until this request's send fits inside the origin's sliding 1-second window. */
 async function acquire(bucket: Bucket): Promise<void> {
@@ -161,9 +174,22 @@ export function rpcTransport(url: string) {
       for (let attempt = 0; ; attempt += 1) {
         // every attempt is one HTTP request — the bucket counts retries too
         await admit()
-        const response = await fetch(input, init)
-        if (!(await busyAnswer(response))) return response
-        if (attempt >= RETRY_DELAYS_MS.length) throw new ChainBusyError()
+        let response: Response
+        try {
+          response = await fetch(input, init)
+        } catch (error) {
+          if (attempt >= RETRY_DELAYS_MS.length) throw error
+          await sleep(RETRY_DELAYS_MS[attempt]!)
+          continue
+        }
+        if (await busyAnswer(response)) {
+          if (attempt >= RETRY_DELAYS_MS.length) throw new ChainBusyError()
+          await sleep(RETRY_DELAYS_MS[attempt]!)
+          continue
+        }
+        if (!transientAnswer(response.status)) return response
+        // Out of retries: hand the last answer back so viem reports the real status.
+        if (attempt >= RETRY_DELAYS_MS.length) return response
         await sleep(RETRY_DELAYS_MS[attempt]!)
       }
     },

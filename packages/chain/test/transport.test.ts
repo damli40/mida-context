@@ -293,3 +293,94 @@ describe("rate-limit retries (in-6 R3)", () => {
     expect(calls).toBe(2)
   }, 30_000)
 })
+
+// ---------------------------------------------------------------------------
+// in-9 R-6 — a transient answer (408/5xx, a dropped connection) is retried like a rate limit
+// ---------------------------------------------------------------------------
+
+describe("transient retries (in-9 R-6)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    rpcTransportProbe.reset()
+  })
+
+  const call = (origin: string) => {
+    const client = createPublicClient({ chain: foundry, transport: rpcTransport(origin) })
+    return client.request({ method: "eth_chainId" })
+  }
+
+  it("502, 502, then a good answer → the call succeeds; each attempt is one HTTP request", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      calls += 1
+      if (calls <= 2) return new Response("bad gateway", { status: 502 })
+      const body = JSON.parse(String(init?.body))
+      return ok(body)
+    }))
+    await expect(call("http://r6-a.test")).resolves.toBe("0x7a69")
+    expect(calls).toBe(3)
+    expect(rpcTransportProbe.sentAt).toHaveLength(3)
+  }, 30_000)
+
+  it("an HTTP 408 is retried the same way — then succeeds", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      calls += 1
+      if (calls === 1) return new Response("timeout", { status: 408 })
+      const body = JSON.parse(String(init?.body))
+      return ok(body)
+    }))
+    await expect(call("http://r6-b.test")).resolves.toBe("0x7a69")
+    expect(calls).toBe(2)
+  }, 30_000)
+
+  it("always 503 → error after exactly 3 retries on the 250/500/1000 ms schedule", async () => {
+    const fetchAt: number[] = []
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      fetchAt.push(Date.now())
+      return new Response("unavailable", { status: 503 })
+    }))
+    await expect(call("http://r6-c.test")).rejects.toThrow()
+    expect(fetchAt).toHaveLength(4) // 1 try + 3 retries
+    const gaps = fetchAt.slice(1).map((t, i) => t - fetchAt[i]!)
+    expect(gaps[0]).toBeGreaterThanOrEqual(240)
+    expect(gaps[1]).toBeGreaterThanOrEqual(490)
+    expect(gaps[2]).toBeGreaterThanOrEqual(990)
+  }, 30_000)
+
+  it("a thrown fetch/network error is retried, then succeeds", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn(async (_u: unknown, init?: { body?: string }) => {
+      calls += 1
+      if (calls <= 2) throw new Error("socket hang up")
+      const body = JSON.parse(String(init?.body))
+      return ok(body)
+    }))
+    await expect(call("http://r6-d.test")).resolves.toBe("0x7a69")
+    expect(calls).toBe(3)
+  }, 30_000)
+
+  it("a fetch that always throws → error after exactly 3 retries", async () => {
+    let calls = 0
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      calls += 1
+      throw new TypeError("fetch failed")
+    }))
+    await expect(call("http://r6-e.test")).rejects.toThrow()
+    expect(calls).toBe(4)
+    expect(rpcTransportProbe.sentAt).toHaveLength(4)
+  }, 30_000)
+
+  it("a 400/404 answer is NOT retried — only 408 and 5xx are transient", async () => {
+    for (const status of [400, 404]) {
+      let calls = 0
+      vi.stubGlobal("fetch", vi.fn(async () => {
+        calls += 1
+        return new Response("bad request", { status })
+      }))
+      await expect(call("http://r6-f.test")).rejects.toThrow()
+      expect(calls).toBe(1)
+      vi.unstubAllGlobals()
+    }
+  }, 30_000)
+})
