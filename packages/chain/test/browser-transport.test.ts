@@ -47,7 +47,8 @@ describe("the browser bundle (in-12 N-2)", () => {
     const sandbox: Record<string, unknown> = {
       fetch: async (url: unknown, init?: { body?: string }) => {
         sent.push({ url: String(url), body: JSON.parse(String(init?.body)) })
-        return new Response(JSON.stringify({ jsonrpc: "2.0", id: sent[sent.length - 1]!.body.id ?? 1, result: "0x279f" }), {
+        const id = (sent[sent.length - 1]!.body as { id?: unknown }).id
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: id ?? 1, result: "0x279f" }), {
           status: 200,
           headers: { "content-type": "application/json" },
         })

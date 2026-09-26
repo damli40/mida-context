@@ -12,6 +12,9 @@ const DEPLOYMENT: Deployment = {
   chainId: MONAD_TESTNET_CHAIN_ID, // the chain whose static blockTime is 400 ms
   capabilityRegistry: `0x${"11".repeat(20)}` as `0x${string}`,
   contextRegistry: CONTEXT_REGISTRY,
+  policyHashV1: `0x${"12".repeat(32)}` as `0x${string}`,
+  vaultRpId: "mida.test",
+  vaultRpIdHash: `0x${"13".repeat(32)}` as `0x${string}`,
   deploymentBlock: 10n,
 }
 

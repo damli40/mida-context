@@ -73,7 +73,7 @@ export interface BlockClient {
  * a single numbered block's timestamp. A missing block answers `null`, never a throw.
  */
 export interface TieScanClient extends LogClient {
-  getBlock(parameters?: { blockTag?: "latest"; blockNumber?: bigint }): Promise<{ number: bigint | null; timestamp: bigint } | null>
+  getBlock(parameters?: { blockTag: "latest" } | { blockNumber: bigint }): Promise<{ number: bigint | null; timestamp: bigint } | null>
 }
 
 /**
@@ -144,7 +144,7 @@ export async function recordPlacementsNear(input: {
   const groups = await Promise.all(
     [...input.tied].map(async ([second, contextIds]) => {
       const age = head.timestamp > second ? head.timestamp - second : 0n
-      let center = head.number - (age * 1_000n) / guessedMsPerBlock
+      let center = headPoint.number - (age * 1_000n) / guessedMsPerBlock
       // Probe 1: the block the guess points at — its own timestamp is the ruler check.
       const first = await probe(center)
       if (first !== null) {
