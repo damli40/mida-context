@@ -72,6 +72,20 @@ function sqliteError(error: unknown): Error {
 }
 
 /**
+ * True when this runtime can open the sessions database — node:sqlite is a
+ * builtin only from Node 22.13. doctor prints its PROBLEM line off this; the
+ * drain's own opener raises DevinSqliteUnavailableError on the same absence.
+ */
+export function devinSqliteAvailable(): boolean {
+  try {
+    const mod = createRequire(import.meta.url)("node:sqlite") as { DatabaseSync?: unknown }
+    return typeof mod.DatabaseSync === "function"
+  } catch {
+    return false
+  }
+}
+
+/**
  * The default opener: DatabaseSync read-only — Mida never writes Devin's store — with
  * a two-second busy timeout, since Devin writes the WAL file live and a read-only
  * handle must wait out a writer's short lock instead of failing the job at once.

@@ -1486,6 +1486,9 @@ async function main(): Promise<void> {
       // doctor checks the home install recorded — a CODEX_HOME exported since must not
       // redirect the check away from where the hooks actually live (F8)
       codex: join(trustedCodexHome(home, process.env, homedir()), "config.toml"),
+      // the check itself is silent when ~/.config/devin does not exist — Devin is
+      // simply not installed there and earns no line
+      devin: resolveDevinConfigPath(process.env, homedir()),
     }
     if (argv[1] === "--live") {
       const tool = argv[2] ?? ""

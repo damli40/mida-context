@@ -8,7 +8,7 @@ import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { parseDeployment } from "@mida/chain"
-import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, installClaudeCode, installCodex, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, installClaudeCode, installCodex, installDevin, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
 
@@ -317,6 +317,76 @@ describe("mida doctor without a chain", () => {
     const lines: string[] = []
     await runDoctor({ home, print: (line) => lines.push(line), settings: { codex: config }, env: {}, daemonProbeMs: 50 })
     expect(lines.some((line) => line.includes("Codex will ignore these hooks"))).toBe(false)
+  })
+
+  it("devin without ~/.config/devin prints nothing about it — not installed is not a problem", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    // the path names a directory that does not exist — Devin was never installed here
+    const devinConfig = join(dir(), "devin", "config.json")
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), settings: { devin: devinConfig }, env: {}, daemonProbeMs: 50 })
+    expect(lines.some((line) => line.toLowerCase().includes("devin"))).toBe(false)
+  })
+
+  it("installed devin hooks report ok; a stale block reports the version problem", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const devinDir = join(dir(), "devin")
+    mkdirSync(devinDir, { recursive: true })
+    const devinConfig = join(devinDir, "config.json")
+    installDevin(devinConfig)
+    const run = async () => {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: { devin: devinConfig }, env: {}, daemonProbeMs: 50 })
+      return lines
+    }
+    expect(await run()).toContain("ok: devin hooks installed")
+
+    // an older block: every event still names a mida command, but none matches the pinned path
+    const bare = (kind: "mida-hook" | "mida-inject") => ({ hooks: [{ type: "command", command: `${kind} devin` }] })
+    writeFileSync(
+      devinConfig,
+      JSON.stringify({
+        hooks: {
+          SessionStart: [bare("mida-inject")],
+          UserPromptSubmit: [bare("mida-inject")],
+          PostToolUse: [bare("mida-hook")],
+          Stop: [bare("mida-hook")],
+          PostCompaction: [bare("mida-hook")],
+          SessionEnd: [bare("mida-hook")],
+        },
+      }),
+    )
+    const lines = await run()
+    expect(lines).toContain("PROBLEM: devin's hook block is an older version — run `mida install devin`")
+  })
+
+  it("a runtime without node:sqlite reports the devin PROBLEM — and stays silent without Devin", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const devinDir = join(dir(), "devin")
+    mkdirSync(devinDir, { recursive: true })
+    const devinConfig = join(devinDir, "config.json")
+    installDevin(devinConfig)
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: { devin: devinConfig },
+      env: {},
+      daemonProbeMs: 50,
+      devinSqliteAvailable: () => false,
+    })
+    expect(lines.some((line) => line.startsWith("PROBLEM:") && line.includes("node:sqlite"))).toBe(true)
+
+    const lines2: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines2.push(line),
+      settings: { devin: join(dir(), "missing-dir", "config.json") },
+      env: {},
+      daemonProbeMs: 50,
+      devinSqliteAvailable: () => false,
+    })
+    expect(lines2.some((line) => line.includes("node:sqlite"))).toBe(false)
   })
 
   it("an unreadable approved-projects file is a permissions problem — never a signature claim", async () => {

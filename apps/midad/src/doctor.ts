@@ -1,6 +1,6 @@
 import { accessSync, constants, existsSync, mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { isAbsolute, join } from "node:path"
+import { dirname, isAbsolute, join } from "node:path"
 import { spawn } from "node:child_process"
 import { createPublicClient, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
@@ -8,7 +8,7 @@ import { isMidaError } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { chainFor, rpcTransport } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
-import { COMPILE_PROVIDERS, compileModelChoice } from "@mida/compiler"
+import { COMPILE_PROVIDERS, compileModelChoice, devinSqliteAvailable } from "@mida/compiler"
 import { ContextApiClient, DenyOverlay, RegistryReader } from "@mida/api"
 import type { RevocationTarget } from "@mida/api"
 import type { LocalAccount } from "viem"
@@ -18,8 +18,9 @@ import { laneWhyText } from "./batching.js"
 import { callDaemon } from "./control.js"
 import { codeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
+import { DEVIN_NODE_SQLITE_MIN } from "./devin-facts.js"
 import { drainerEnv } from "./hook.js"
-import { CODEX_TRUST_SENTENCE, claudeHooksStatus, codexHooksStatus, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, parseMidaCommand } from "./install.js"
+import { CODEX_TRUST_SENTENCE, claudeHooksStatus, codexHooksStatus, devinHooksStatus, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
 import type { InstallTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
@@ -44,6 +45,8 @@ export interface DoctorDeps {
   settings?: Partial<Record<InstallTool, string>>
   /** Shell environment for the API-key check; default process.env. Values are never printed. */
   env?: NodeJS.ProcessEnv
+  /** node:sqlite probe for the devin check — injectable since a test cannot uninstall a builtin. */
+  devinSqliteAvailable?: () => boolean
   now?: () => number
   /** /health probe timeout; default 1 s. */
   daemonProbeMs?: number
@@ -632,6 +635,29 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           // hook text and skips an untrusted hook SILENTLY, and doctor cannot read Codex's trust
           // state, so the reminder runs whenever the block is there (R5-6)
           if (status !== "absent") lines.push(`note: ${CODEX_TRUST_SENTENCE}`)
+        }
+        // Devin without ~/.config/devin is simply not installed — it is not a problem and
+        // earns no line. The directory's existence is the tell (the file may legitimately
+        // not exist yet — Devin writes it on first change — and that IS "not installed").
+        const devinPath = deps.settings?.devin ?? env.MIDA_DEVIN_CONFIG
+        if (devinPath !== undefined && existsSync(dirname(devinPath))) {
+          const status = devinHooksStatus(devinPath)
+          lines.push(
+            status === "installed"
+              ? "ok: devin hooks installed"
+              : status === "outdated"
+                ? problem("devin's hook block is an older version", "run `mida install devin`")
+                : status === "unreadable"
+                  ? problem("devin's hook block cannot be read safely", "fix the file, then run `mida install devin`")
+                  : problem("devin hooks are not installed", "run `mida install devin`"),
+          )
+          if (status === "installed" || status === "outdated") {
+            lines.push(...hookPathProblems(midaCommandsInDevinConfig(devinPath), "devin"))
+          }
+          const sqliteOk = (deps.devinSqliteAvailable ?? devinSqliteAvailable)()
+          if (!sqliteOk) {
+            lines.push(problem(`devin's session database needs node:sqlite — Node ${DEVIN_NODE_SQLITE_MIN} or later`, "upgrade Node"))
+          }
         }
         return lines.length === 0 ? ["ok: no hook paths to check"] : lines
       },
