@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest"
 import { MidaError, isMidaError } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
-import { failedBeforeSend, sendContract, sendValue } from "@mida/chain"
+import { SponsorDidNotPay, failedBeforeSend, sendContract, sendValue } from "@mida/chain"
 import type { WriteContext } from "@mida/chain"
 
 const ADDRESS: Address = "0x5fbdb2315678afecb367f032d93f642f64180aa3"
@@ -49,6 +49,7 @@ function stubContext(overrides: {
   sendTransaction?: () => Promise<Hex>
   waitForTransactionReceipt?: () => Promise<unknown>
   sponsor?: WriteContext["sponsor"]
+  beforeSend?: WriteContext["beforeSend"]
 } = {}) {
   const progress: string[] = []
   const context = {
@@ -66,6 +67,7 @@ function stubContext(overrides: {
       sendTransaction: overrides.sendTransaction ?? (async () => HASH),
     },
     sponsor: overrides.sponsor,
+    beforeSend: overrides.beforeSend,
     progress: (line: string) => progress.push(line),
     deployment: {
       chainId: 31337n,
@@ -206,5 +208,166 @@ describe("the bounded send (in-15 J-4)", () => {
     ).then(() => null, (e: unknown) => e)
     expect(isMidaError(error, "CAPABILITY_DENIED")).toBe(true)
     expect(clock.timers).toHaveLength(0)
+  })
+})
+
+// in-16 K-1 — the in-15 watchdog refused at the cap but never STOPPED the send: a slow pre-send
+// step (simulate, estimate, the top-up inside `beforeSend`, or a sponsor answering late with
+// SponsorDidNotPay) finished after the refusal and the write call still ran — exactly the
+// double-send the "nothing was sent" line denied. The cap now abandons the send: every broadcast
+// point checks the gate first, and the abandoned error is still marked sent:false so the batcher
+// may resubmit the batch without the orphaned send ever broadcasting.
+describe("a timed-out send is abandoned, not orphaned (in-16 K-1)", () => {
+  /** A promise the test resolves by hand after the cap has fired — the late answer. */
+  function deferred<T>() {
+    let resolve!: (value: T) => void
+    let reject!: (error: unknown) => void
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
+
+  it("a simulate answering after the cap never reaches writeContract", async () => {
+    const clock = fakeClock()
+    const late = deferred<{ request: unknown }>()
+    let writes = 0
+    const { context } = stubContext({
+      simulateContract: () => late.promise as Promise<unknown>,
+      writeContract: async () => {
+        writes += 1
+        return HASH
+      },
+    })
+    context.sendWatch = watch(clock, 15_000, 15_000)
+    const outcome = sendContract(
+      context,
+      { address: ADDRESS, abi: [], functionName: "register", args: [] },
+      "context.register",
+    ).then(() => null, (error: unknown) => error)
+    clock.fire() // the cap fires while the simulate is still out
+    const error = await outcome
+    expect(isMidaError(error, "SEND_TIMEOUT")).toBe(true)
+    expect(failedBeforeSend(error)).toBe(true)
+    // The simulate answers late — the orphaned work must stop at the gate, not broadcast.
+    late.resolve({ request: { address: ADDRESS } })
+    await flush()
+    await flush()
+    expect(writes).toBe(0)
+  })
+
+  it("a top-up inside beforeSend answering after the cap never reaches writeContract", async () => {
+    const clock = fakeClock()
+    const late = deferred<void>()
+    let writes = 0
+    const { context } = stubContext({
+      beforeSend: () => late.promise,
+      writeContract: async () => {
+        writes += 1
+        return HASH
+      },
+    })
+    context.sendWatch = watch(clock, 15_000, 15_000)
+    const outcome = sendContract(
+      context,
+      { address: ADDRESS, abi: [], functionName: "register", args: [] },
+      "context.register",
+    ).then(() => null, (error: unknown) => error)
+    await flush() // let the body reach the balance guard
+    clock.fire() // the cap fires while the top-up's own receipt wait is still out
+    const error = await outcome
+    expect(isMidaError(error, "SEND_TIMEOUT")).toBe(true)
+    expect(failedBeforeSend(error)).toBe(true)
+    late.resolve()
+    await flush()
+    await flush()
+    expect(writes).toBe(0)
+  })
+
+  it("a sponsor refusing after the cap cannot fall back into a self-paid send", async () => {
+    const clock = fakeClock()
+    const late = deferred<never>()
+    let writes = 0
+    const sponsor = {
+      send: () => late.promise,
+    } as unknown as NonNullable<WriteContext["sponsor"]>
+    const { context } = stubContext({
+      sponsor,
+      writeContract: async () => {
+        writes += 1
+        return HASH
+      },
+    })
+    context.sendWatch = watch(clock, 15_000, 15_000)
+    const outcome = sendContract(
+      context,
+      { address: ADDRESS, abi: [], functionName: "register", args: [] },
+      "context.register",
+    ).then(() => null, (error: unknown) => error)
+    await flush() // the sponsor call is in flight — attempted, no hash
+    clock.fire() // the cap fires
+    const error = await outcome
+    expect(isMidaError(error, "SEND_TIMEOUT")).toBe(true)
+    expect(failedBeforeSend(error)).toBe(false)
+    // The sponsor answers "did not pay" after the refusal — the self-paid fallback must not send.
+    late.reject(new SponsorDidNotPay("sponsor offline"))
+    await flush()
+    await flush()
+    expect(writes).toBe(0)
+  })
+
+  it("a sendValue estimate answering after the cap never reaches sendTransaction", async () => {
+    const clock = fakeClock()
+    const late = deferred<void>()
+    let sends = 0
+    const { context } = stubContext({
+      beforeSend: () => late.promise,
+      sendTransaction: async () => {
+        sends += 1
+        return HASH
+      },
+    })
+    context.sendWatch = watch(clock, 15_000, 15_000)
+    const outcome = sendValue(context, { to: ADDRESS, value: 10n }, "funding").then(() => null, (error: unknown) => error)
+    await flush()
+    clock.fire() // the cap fires inside the balance guard
+    const error = await outcome
+    expect(isMidaError(error, "SEND_TIMEOUT")).toBe(true)
+    expect(failedBeforeSend(error)).toBe(true)
+    late.resolve()
+    await flush()
+    await flush()
+    expect(sends).toBe(0)
+  })
+
+  it("an abandoned send is requeue-safe for the batcher — marked unsent and never broadcast", async () => {
+    // The batcher reads `sent === false` and resubmits the rows: safe only because the gate makes
+    // the abandoned send provably unable to broadcast. This is the exact race a resubmit would
+    // otherwise have turned into a second anchor on the chain.
+    const clock = fakeClock()
+    const late = deferred<{ request: unknown }>()
+    let writes = 0
+    const { context } = stubContext({
+      simulateContract: () => late.promise as Promise<unknown>,
+      writeContract: async () => {
+        writes += 1
+        return HASH
+      },
+    })
+    context.sendWatch = watch(clock, 15_000, 15_000)
+    const outcome = sendContract(
+      context,
+      { address: ADDRESS, abi: [], functionName: "register", args: [] },
+      "context.register",
+    ).then(() => null, (error: unknown) => error)
+    clock.fire()
+    const error = await outcome
+    // the batcher will requeue on this mark — the late continuation below must not broadcast
+    expect(failedBeforeSend(error)).toBe(true)
+    late.resolve({ request: { address: ADDRESS } })
+    await flush()
+    await flush()
+    expect(writes).toBe(0)
   })
 })

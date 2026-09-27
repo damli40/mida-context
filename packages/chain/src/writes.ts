@@ -129,6 +129,17 @@ export const SEND_PROGRESS_EVERY_MS = 15_000
 export const SEND_CAP_MS = 120_000
 
 /**
+ * The gate a send checks in the same synchronous stretch as every broadcast point — once the
+ * watchdog's cap has fired, a slow pre-send step (a simulate, an estimate, a top-up's own
+ * receipt wait) resolving late must not turn the refusal the caller already saw into a real
+ * send (in-16 K-1). The check and the send call sit back to back so no timer can run between
+ * them; after it throws, the abandoned work promise unwinds without broadcasting.
+ */
+export interface SendGate {
+  checkAbandoned(): void
+}
+
+/**
  * The race every owner send runs: work against a tick chain that prints `still waiting for
  * Monad (N s)…` each `everyMs` and gives up at `capMs`. The give-up error names only what the
  * caller can vouch for — three states, in order of knowledge:
@@ -138,11 +149,14 @@ export const SEND_CAP_MS = 120_000
  *   transaction may be out there without a hash to show, so the line cannot claim "nothing
  *   was sent" — that would send the owner into a possible double-send;
  * - no attempt yet (the hang was in the simulate/estimate/guard steps): nothing was sent.
+ *
+ * The cap also SETS `gaveUp`, and every broadcast point in the send body gates on it — a timed-out
+ * send can never go out after its refusal was already reported.
  */
 async function watchSend<T>(
   context: WriteContext,
   state: { hashOf(): Hex | undefined; attempted(): boolean },
-  work: () => Promise<T>,
+  work: (gate: SendGate) => Promise<T>,
 ): Promise<T> {
   const watch = context.sendWatch
   const setTimer = watch?.setTimeout ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
@@ -162,19 +176,29 @@ async function watchSend<T>(
           "SEND_TIMEOUT",
           "the send may still have gone out without a hash to show for it — run `mida doctor` to check before running the command again",
         )
-      : // pre-attempt is provably unsent — the batcher may resubmit it like any pre-send failure
+      : // pre-attempt is provably unsent — the gate below keeps it that way, so the batcher may
+        // resubmit it like any pre-send failure without risking a double-send
         markUnsent(new MidaError("SEND_TIMEOUT", "nothing was sent: run the same command again"))
+  }
+  let gaveUp = false
+  const gate: SendGate = {
+    checkAbandoned() {
+      if (gaveUp) throw timeout()
+    },
   }
   let timer: unknown
   try {
     return await Promise.race([
-      work(),
+      work(gate),
       new Promise<never>((_resolve, reject) => {
         // `waited` is advanced when each timer is SCHEDULED, so it always names the moment the
         // timer that is firing was aimed at — the cap is a tick that refuses instead of prints.
         let waited = 0
         const tick = (): void => {
           if (waited >= capMs) {
+            // Past the cap the send is abandoned, not just unanswered: the flag makes every
+            // broadcast point in the work body throw instead of sending (in-16 K-1).
+            gaveUp = true
             reject(timeout())
             return
           }
@@ -243,7 +267,7 @@ export async function sendContract(
   // write call itself hung, or the sponsor went quiet after accepting.
   let hash: Hex | undefined
   let sentAttempted = false
-  return watchSend(context, { hashOf: () => hash, attempted: () => sentAttempted }, async () => {
+  return watchSend(context, { hashOf: () => hash, attempted: () => sentAttempted }, async (gate) => {
     let request: unknown
     try {
       ;({ request } = await context.publicClient.simulateContract({
@@ -260,6 +284,9 @@ export async function sendContract(
     }
     let sponsorReason: string | undefined
     if (context.sponsor !== undefined) {
+      // If the cap already fired while the simulate was out, this must not become a broadcast —
+      // the refusal the caller saw was the last word (in-16 K-1).
+      gate.checkAbandoned()
       sentAttempted = true
       try {
         return await context.sponsor.send(call, kind)
@@ -319,6 +346,8 @@ export async function sendContract(
     } catch (error) {
       throw markUnsent(error)
     }
+    // The gate and the write call are one synchronous stretch — after the cap there is no send.
+    gate.checkAbandoned()
     sentAttempted = true
     hash = await context.walletClient.writeContract({ ...(request as object), gas, ...fee } as never)
     const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
@@ -382,7 +411,7 @@ export async function sendValue(
 ): Promise<SentReceipt> {
   let hash: Hex | undefined
   let sentAttempted = false
-  return watchSend(context, { hashOf: () => hash, attempted: () => sentAttempted }, async () => {
+  return watchSend(context, { hashOf: () => hash, attempted: () => sentAttempted }, async (gate) => {
     let gas: bigint
     let fee: SendFee
     // Everything before sendTransaction is still pre-send — estimate, fee, and the balance guard
@@ -394,6 +423,8 @@ export async function sendValue(
     } catch (error) {
       throw markUnsent(toMidaError(error))
     }
+    // The gate and the send call are one synchronous stretch — after the cap there is no send.
+    gate.checkAbandoned()
     sentAttempted = true
     hash = await context.walletClient.sendTransaction({
       account: context.account,
