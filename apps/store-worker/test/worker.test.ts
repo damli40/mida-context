@@ -519,11 +519,26 @@ describe("the worker entry", () => {
     expect(body["sweep"]).toEqual({ cron: "*/15 * * * *", maxObjectsPerRun: 25 })
     // This Miniflare env binds no [[ratelimits]], so the worker honestly reports no per-IP budget.
     expect(body["rateLimitsPerMinute"]).toEqual({ signed: null, unsigned: null })
-    expect(body["notice"]).toBe(
-      "This server stores ciphertext only. It holds no keys and cannot read what it stores. Source: <repo url placeholder>",
-    )
+    // in-15 J-9: SOURCE_URL is unset in this env — the notice drops the Source clause entirely
+    // instead of printing the placeholder the Sep 27 deploy showed.
+    expect(body["notice"]).toBe("This server stores ciphertext only. It holds no keys and cannot read what it stores.")
+    expect(String(body["notice"])).not.toContain("Source")
     expect(response.headers.get("access-control-allow-origin")).toBe("*")
     expect(response.headers.get("access-control-allow-credentials")).toBeNull()
+  })
+
+  it("GET / ends its notice with 'Source: <url>' only when SOURCE_URL is set (in-15 J-9)", async () => {
+    const sourcedEnv: WorkerEnv = { ...env(db, rpc.url), SOURCE_URL: "https://github.com/example/mida-context" }
+    const response = await handleRequest(sourcedEnv, new Request("http://worker.test/"))
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as Record<string, unknown>
+    expect(body["notice"]).toBe(
+      "This server stores ciphertext only. It holds no keys and cannot read what it stores. Source: https://github.com/example/mida-context",
+    )
+    // an empty variable is the same as an unset one — the clause is omitted, never "Source: "
+    const emptyEnv: WorkerEnv = { ...env(db, rpc.url), SOURCE_URL: "" }
+    const emptyBody = (await (await handleRequest(emptyEnv, new Request("http://worker.test/"))).json()) as Record<string, unknown>
+    expect(emptyBody["notice"]).toBe("This server stores ciphertext only. It holds no keys and cannot read what it stores.")
   })
 
   it("answers CORS preflights for reads and writes from any origin, never with credentials", async () => {

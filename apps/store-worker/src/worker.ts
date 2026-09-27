@@ -54,6 +54,11 @@ export interface WorkerEnv {
   /** The block BatchAnchor was deployed in — the floor for its historical log scans. */
   BATCH_ANCHOR_BLOCK?: string
   BATCH_COORDINATOR?: DurableObjectNamespaceLike
+  /**
+   * The public-source URL the GET / notice ends with as "Source: <url>" (in-15 J-9). Unset or
+   * empty drops the clause entirely — the notice never prints a placeholder.
+   */
+  SOURCE_URL?: string
 }
 
 interface ExecutionContextLike {
@@ -289,7 +294,16 @@ function withCors(response: Response): Response {
 }
 
 const ROOT_NOTICE =
-  "This server stores ciphertext only. It holds no keys and cannot read what it stores. Source: <repo url placeholder>"
+  "This server stores ciphertext only. It holds no keys and cannot read what it stores."
+
+/**
+ * The notice GET / reports: a Source clause exists only when the SOURCE_URL variable names one —
+ * the placeholder the live deploy showed (Sep 27) is gone; an unset variable omits the clause.
+ */
+function rootNotice(env: WorkerEnv): string {
+  const source = env.SOURCE_URL
+  return typeof source === "string" && source.length > 0 ? `${ROOT_NOTICE} Source: ${source}` : ROOT_NOTICE
+}
 
 /**
  * The per-IP request budgets the [[ratelimits]] bindings in wrangler.toml enforce — kept here for GET / to
@@ -347,7 +361,7 @@ export async function handleRequest(env: WorkerEnv, request: Request, ctx?: Exec
           signed: env.LIMITER_SIGNED === undefined ? null : RATE_LIMIT_SIGNED_PER_MINUTE,
           unsigned: env.LIMITER_UNSIGNED === undefined ? null : RATE_LIMIT_UNSIGNED_PER_MINUTE,
         },
-        notice: ROOT_NOTICE,
+        notice: rootNotice(env),
       })
       status = 200
       bytes = payload.length

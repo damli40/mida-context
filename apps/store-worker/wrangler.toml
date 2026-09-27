@@ -72,6 +72,10 @@ BATCHING_ENABLED = "false"
 # admit to POST /batch/saves — every other owner gets a plain 403. Empty or absent means open.
 #BATCH_OWNER_ALLOWLIST = "0xOWNER_ONE,0xOWNER_TWO"
 
+# Optional: the public-source URL the GET / notice ends with as "Source: <url>". Leave it unset
+# and the notice omits the Source clause entirely — it never prints a placeholder.
+#SOURCE_URL = "https://github.com/you/mida-context"
+
 # Secrets (wrangler secret put …):
 #   RPC_URL              — a URL, may carry an API key
 #   BATCHER_PRIVATE_KEY  — the funded account that pays for submitBatch; also the batchId seed
