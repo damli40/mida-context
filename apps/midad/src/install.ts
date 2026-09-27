@@ -204,11 +204,21 @@ export function macosProtectedFolderNote(
   //-insensitively, so both sides are resolved (realpath when they exist) and lowercased before the
   // prefix check — a launcher under e.g. ~/documents or a symlinked ~/Desktop still warns (in-16 K-8).
   // homeDir always exists; the leaf names join AFTER resolving so a symlinked home still prefixes.
+  // A path that is not on disk yet (the launcher is installed after this check) resolves its
+  // longest existing ancestor and keeps the tail — otherwise a symlinked home would compare
+  // resolved on one side and raw on the other, and the prefix check would silently never match.
   const canonical = (path: string): string => {
-    try {
-      return realpathSync.native(path)
-    } catch {
-      return path
+    let probe = path
+    const tail: string[] = []
+    while (true) {
+      try {
+        return join(realpathSync.native(probe), ...tail)
+      } catch {
+        const parent = dirname(probe)
+        if (parent === probe) return path
+        tail.unshift(basename(probe))
+        probe = parent
+      }
     }
   }
   const home = canonical(homeDir)
