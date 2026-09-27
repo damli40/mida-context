@@ -27,6 +27,7 @@ import { checkProject as checkProjectAgainstList } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { findProjectMarker, isSafeName, listJobs, moveToBad, removeJob } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
+import { resolveSessionTask, taskOrUndefined } from "./task.js"
 import type { ServiceRuntime } from "./runtime.js"
 import { followPendingAnchors, pendingAnchors, sweepPendingPlaintexts } from "./batching.js"
 import { isCapabilityLive } from "./skeleton.js"
@@ -298,6 +299,15 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           continue
         }
         const projectId = project.approval.projectId
+        // tk-1: the task rides the job file from enqueue — stamped once, immutable for the
+        // session (invariant 1). A job written before tasks exist carries none and resolves
+        // here the same way the hook would have: pin → predecessor → folder default → main.
+        const task = resolveSessionTask(deps.home, {
+          sessionId,
+          projectId,
+          cwd: job.cwd,
+          explicit: taskOrUndefined(job.task),
+        }).task
 
         // size and last line come from ONE open descriptor — a growing transcript cannot show
         // the drainer a size and a tail from different moments. A devin session has no file:
@@ -409,6 +419,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             continuesSession: readContinues(deps.home, sessionId, projectId),
             compiledBy: compiled.compiledBy,
             checkpoint: compiled.checkpoint,
+            task,
           })
           compileMeta = {
             compileMs,
@@ -432,6 +443,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           continuesSession: envelope.continuesSession,
           compiledBy: envelope.compiledBy,
           checkpoint: envelope.checkpoint,
+          ...(envelope.task === undefined ? {} : { task: envelope.task }),
         })
         writeState(deps.home, sessionId, terminal)
         // the saved checkpoint's content fields — and its verbatim
@@ -453,6 +465,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             outcome: "queued",
             lane: "batched",
             eventId,
+            task,
             contextId: saved.contextId,
             model: envelope.compiledBy,
             compileMs: compileMeta.compileMs,
@@ -479,6 +492,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           // the store was disabled, unreachable, or the lane check itself failed
           ...(saved.laneWhy !== undefined ? { laneWhy: saved.laneWhy } : {}),
           eventId,
+          task,
           // the model that actually wrote the checkpoint — a fallback save names the fallback
           model: envelope.compiledBy,
           compileMs: compileMeta.compileMs,

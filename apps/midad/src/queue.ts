@@ -20,6 +20,8 @@ export interface CaptureJob {
   transcriptPath: string
   cwd: string
   error: string | null
+  /** tk-1: the task this session was captured under — stamped at enqueue so a later `mida task` switch cannot move it. */
+  task?: string
   at: string
 }
 
@@ -119,6 +121,8 @@ function asJob(raw: unknown, id: string): CaptureJob | undefined {
     transcriptPath: r.transcriptPath,
     cwd: r.cwd,
     error: r.error as string | null,
+    // carried through raw — the drainer re-validates before it is trusted (jobs predate tasks)
+    ...(typeof r.task === "string" ? { task: r.task } : {}),
     at: r.at,
   }
 }

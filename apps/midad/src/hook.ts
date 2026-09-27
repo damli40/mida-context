@@ -6,7 +6,8 @@ import { callDaemon } from "./control.js"
 import { DEVIN_SAVE_EVENTS, devinDbPathAllowed, foreignClientReplayReason, parentProcessBasename, resolveDevinDbPath } from "./devin-facts.js"
 import type { MidaHome } from "./home.js"
 import { appendLog } from "./log.js"
-import { enqueue, isSafeName } from "./queue.js"
+import { enqueue, isSafeName, projectIdFor } from "./queue.js"
+import { pinSessionTask, resolveSessionTask, taskOrUndefined } from "./task.js"
 
 /** The Claude Code events Mida listens to. */
 export type HookEvent = "PostToolUse" | "Stop" | "StopFailure" | "PreCompact" | "SessionEnd"
@@ -171,6 +172,25 @@ export async function runHook(input: {
       log({ event, sessionId, outcome: "ignored", reason: "bad-agent" })
       return
     }
+    // tk-1, invariant 1: stamp the job with the session's ONCE-resolved task — MIDA_TASK, then
+    // the pin a previous event wrote, then the predecessor's task, then the folder default.
+    // Resolving here (and pinning) is what makes a `mida task` switch mid-session unable to
+    // move this session's later saves; a job written before tasks exist carries no field and
+    // the drainer resolves it the same way.
+    const safeSessionId = sessionId // const, so the narrowing above survives into the closure
+    const taskFor = (cwd: string): string => {
+      const projectId = projectIdFor(cwd) ?? undefined
+      const resolved = resolveSessionTask(input.home, {
+        sessionId: safeSessionId,
+        projectId,
+        cwd,
+        explicit: taskOrUndefined(input.env.MIDA_TASK),
+      })
+      if (projectId !== undefined && resolved.source !== "session") {
+        pinSessionTask(input.home, safeSessionId, projectId, resolved.task)
+      }
+      return resolved.task
+    }
     let job
     if (input.agent === "devin") {
       // Devin's payload is session_id + prompt_id and per-event fields — no transcript_path
@@ -182,12 +202,14 @@ export async function runHook(input: {
         log({ event, sessionId, outcome: "ignored", reason: "devin-db-missing" })
         return
       }
+      const cwd = input.env.DEVIN_PROJECT_DIR ?? process.cwd()
       job = enqueue(input.home, {
         agent: input.agent,
         event: event as HookEvent | "PostCompaction",
         sessionId,
         transcriptPath: dbPath,
-        cwd: input.env.DEVIN_PROJECT_DIR ?? process.cwd(),
+        cwd,
+        task: taskFor(cwd),
         error:
           typeof record.error === "string" ? record.error
           : event === "SessionEnd" && typeof record.reason === "string" ? record.reason
@@ -198,12 +220,14 @@ export async function runHook(input: {
         log({ event, sessionId, outcome: "ignored", reason: "bad-transcript-path" })
         return
       }
+      const cwd = typeof record.cwd === "string" && record.cwd !== "" ? record.cwd : process.cwd()
       job = enqueue(input.home, {
         agent: input.agent,
         event: event as HookEvent,
         sessionId,
         transcriptPath: record.transcript_path,
-        cwd: typeof record.cwd === "string" && record.cwd !== "" ? record.cwd : process.cwd(),
+        cwd,
+        task: taskFor(cwd),
         error: typeof record.error === "string" ? record.error : null,
       })
     }
