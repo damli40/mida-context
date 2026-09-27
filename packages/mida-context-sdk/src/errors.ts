@@ -29,6 +29,7 @@ export type MidaSdkErrorCode =
   | "invalid-shape"
   | "invalid-content"
   | "invalid-namespace"
+  | "too-large"
   | "not-found"
   | "partial-read"
   | "chain-busy"
@@ -58,6 +59,7 @@ const SERVICE_REASONS: ReadonlySet<string> = new Set([
   "invalid-content",
   "invalid-namespace",
   "invalid-option",
+  "too-large",
   "not-found",
   "partial-read",
   "chain-busy",

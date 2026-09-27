@@ -82,6 +82,11 @@ export interface PendingAnchor {
   sessionId: string
   agent: string
   queuedAt: string
+  /**
+   * The area the save was sealed under — absent on entries written before /remember existed
+   * (all checkpoints), so a resubmit falls back to the checkpoint namespace.
+   */
+  namespace?: string
   /** HELD is still in-flight: the store is holding the save while a revoke is pending (in-3 I5). */
   state: "QUEUED" | "SUBMITTED" | "HELD"
   /** Stale-epoch resubmissions already spent on this save — the cap is MAX_EPOCH_RETRIES. */
@@ -465,11 +470,14 @@ async function resubmitStaleEpoch(
   if (identity === undefined || isRevoked(home, entry.agent)) return "refused"
   const input = pendingPlaintext(home, entry.contextId)
   if (input === undefined) return "refused"
+  // the area the save was sealed under — a checkpoint-era entry carries none, and those were
+  // all written to the checkpoint area
+  const namespace = entry.namespace ?? NAMESPACE
   try {
     const allowed = await runtime.reader.hasAuthority(
       runtime.owner,
       identity.agentId,
-      namespaceId(NAMESPACE),
+      namespaceId(namespace),
       PERMISSION.CREATE,
       PROVENANCE_POLICY.ALLOW_INFERENCE,
     )
@@ -482,7 +490,7 @@ async function resubmitStaleEpoch(
   // The try covers the POST alone: only an answer from the store may classify the outcome —
   // a local ledger write failing (an fs error, whose .code is a string too) must throw through
   // to the pass rather than masquerade as a store refusal.
-  const requeue = () => runtime.agent(entry.agent).createBatched(runtime.owner, NAMESPACE, input as unknown as CreateContextInput)
+  const requeue = () => runtime.agent(entry.agent).createBatched(runtime.owner, namespace, input as unknown as CreateContextInput)
   let queued: { contextId: Hex }
   try {
     queued = await requeue()
@@ -530,6 +538,7 @@ async function resubmitStaleEpoch(
     sessionId: entry.sessionId,
     agent: entry.agent,
     queuedAt: new Date().toISOString(),
+    ...(entry.namespace === undefined ? {} : { namespace: entry.namespace }),
     retries,
   })
   recordSavedId(home, entry.eventId, queued.contextId)
@@ -568,7 +577,7 @@ async function resubmitOnClosedLane(
   const home = runtime.home
   let created: { contextId: Hex; transactionHash?: Hex | null }
   try {
-    created = await runtime.agent(entry.agent).create(runtime.owner, NAMESPACE, input as unknown as CreateContextInput)
+    created = await runtime.agent(entry.agent).create(runtime.owner, entry.namespace ?? NAMESPACE, input as unknown as CreateContextInput)
   } catch (error) {
     const code = (error as { code?: unknown }).code
     // an authority verdict on the direct lane judges the save itself — as final as on the batched one

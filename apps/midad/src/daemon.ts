@@ -16,6 +16,8 @@ import { buildMcpSave } from "./mcp-save.js"
 import type { McpSaveDeps } from "./mcp-save.js"
 import { buildContextRead } from "./context-read.js"
 import type { ContextReadDeps } from "./context-read.js"
+import { buildRemember } from "./remember-save.js"
+import type { RememberDeps } from "./remember-save.js"
 import { pendingAnchors } from "./batching.js"
 import { FLUSH_EVENTS } from "./hook.js"
 import type { MidaHome } from "./home.js"
@@ -67,6 +69,8 @@ export interface DaemonDeps {
   mcpSaveDeps?: Partial<McpSaveDeps>
   /** Gate and read overrides for /context — same role as handoffDeps. */
   contextDeps?: Partial<ContextReadDeps>
+  /** Gate and write overrides for /remember — same role as mcpSaveDeps. */
+  rememberDeps?: Partial<RememberDeps>
   /** The code identity /health reports; default codeIdentity() — tests inject a foreign one. */
   identity?: CodeIdentity
   /** The fallback socket folder's parent (default tmpdir()); tests inject a private temp dir. */
@@ -161,6 +165,10 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   // POST /save's rate map: the last admitted save time per identity+project, for the life of this
   // daemon — a restart resets it, but the chain-side gates and the save id's dedup still apply
   const lastMcpSaves = new Map<string, number>()
+
+  // POST /remember's rate window: the admitted-write timestamps per lane+agent — the limit is
+  // service-side, so two SDK clients writing as one agent share the same minute
+  const admittedRemembers = new Map<string, number[]>()
 
   const startedAt = new Date(deps.now()).toISOString()
   let stopped = false
@@ -458,6 +466,30 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         reason: result.kind === "refused" ? result.reason : null,
         items: result.kind === "context" ? result.items.length : 0,
         partial: result.kind === "context" && result.partial === true,
+        ms: deps.now() - started,
+      })
+      respond(res, 200, result)
+      return
+    }
+    // the SDK's write: one memory record — a note, a finding, a decision — through the same
+    // identity, approval, grant and revoke gates /save runs, onto the same direct/batched lanes
+    if (req.url === "/remember") {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(body.toString("utf8"))
+      } catch {
+        parsed = undefined
+      }
+      const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
+      const started = deps.now()
+      const result = await buildRemember(runtime, record, { admittedSaves: admittedRemembers, now: deps.now, ...deps.rememberDeps })
+      // codes, names and the lane — never the content written
+      deps.log({
+        event: "remember",
+        agent: isSafeName(record.agent) ? record.agent : null,
+        kind: result.kind,
+        reason: result.kind === "refused" ? result.reason : null,
+        lane: result.kind === "saved" ? result.lane : (result.lane ?? null),
         ms: deps.now() - started,
       })
       respond(res, 200, result)

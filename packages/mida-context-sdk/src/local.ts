@@ -153,6 +153,8 @@ export class LocalTransport implements Transport {
       "/remember",
       {
         agent: this.#agent,
+        // the folder this write stands in — the daemon's project gate keys `projects.current` on it
+        cwd: this.#project,
         namespace: input.namespace,
         content: input.content,
         ...(input.kind === undefined ? {} : { kind: input.kind }),
