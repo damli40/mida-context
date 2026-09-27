@@ -111,6 +111,7 @@ function fakeChain(overrides: Record<string, (args: readonly unknown[]) => unkno
       return 100n
     },
     async getLogs() {
+      calls.push({ what: "logs" })
       return []
     },
   }
@@ -343,6 +344,33 @@ describe("PasskeyVaultAuthority", () => {
     expect(approval.response.capabilities).toHaveLength(1)
     expect(apiCalls.map((c) => c.what)).toEqual(["api:publishEpochWrap"])
     expect(approval.response.owner).toBe(fx.owner)
+  })
+
+  it("refuses an expired request before the agent/history reads — one getBlock, zero scans (in-16 K-6)", async () => {
+    // The J-2 order on the passkey page: the request window is checked against chain time BEFORE
+    // the agent-record and owner-history reads it could never pass. An expired request must cost
+    // one getBlock and nothing else — no getAgent, no getLogs scan.
+    const body = manifestBody()
+    const manifest = await signManifest(body)
+    const unsigned = unsignedRequest(
+      [{ namespace: "preferences.communication", permissions: PERMISSION.READ }],
+      { chainId: encodeUint64(CHAIN_ID), capabilityRegistry: REGISTRY, requestExpiresAt: encodeUint64(NOW - 1n) },
+    )
+    const accessRequest = await signRequest(unsigned)
+    const chain = fakeChain({ getAgent: () => agentRecordFor(body) })
+    const { sponsor, sends } = fakeSponsor()
+    const { api, calls: apiCalls } = fakeApi()
+    const auth = authority({ publicClient: chain.publicClient, sponsor, api })
+    await expect(
+      auth.approveGrant({
+        accessRequest,
+        manifest,
+        selection: { kind: "custom", scopes: unsigned.scopes, expiresAt: CAP_EXPIRY },
+      }),
+    ).rejects.toThrowError(/REQUEST_EXPIRED|validity window/)
+    expect(chain.calls).toEqual([])
+    expect(sends).toHaveLength(0)
+    expect(apiCalls).toHaveLength(0)
   })
 
   it("refuses a grant when the assertion signed a different challenge — no send, nothing stored", async () => {

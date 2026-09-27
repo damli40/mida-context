@@ -41,7 +41,7 @@ import {
   toMidaError,
 } from "@mida/chain/browser"
 import type { Deployment, SponsoredReceipt, SponsoredSender, TxKind } from "@mida/chain/browser"
-import { POLICY_HASH_V1, adviseGrant, assertFinalSelection } from "@mida/grant-advisor"
+import { POLICY_HASH_V1, adviseGrant, assertFinalSelection, assertRequestFresh } from "@mida/grant-advisor"
 import { fakePrfOutput, toAccessRequestStruct } from "@mida/fake-vault/browser"
 import type {
   GrantApproval,
@@ -575,6 +575,11 @@ export async function prepareGrant(
   ) {
     throw new MidaError("INVALID_WIRE", "access request targets a different chain or registry than this authority")
   }
+  // The request's own expiry window is checked before the agent-record and owner-history reads —
+  // an expired request refuses here on one getBlock, never after a getLogs scan (in-15 J-2's
+  // order, applied on the passkey page too — in-16 K-6).
+  const now = await latestTimestamp(ctx)
+  assertRequestFresh(accessRequest, now)
   const agentRecord = await readAgentRecord(ctx, accessRequest.agentId)
   const history = await ownerHistory({
     client: ctx.publicClient,
@@ -582,7 +587,6 @@ export async function prepareGrant(
     owner,
     agentId: accessRequest.agentId,
   })
-  const now = await latestTimestamp(ctx)
   const advice = adviseGrant({ request: accessRequest, manifest: request.manifest, agentRecord, ownerHistory: history, now })
 
   const selected =
