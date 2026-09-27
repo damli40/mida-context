@@ -462,7 +462,55 @@ folder no longer exists.
 
 *Status: NOT RUN interactively — the commands and their refusals are covered by
 `apps/midad/test/projects.test.ts` and `apps/midad/test/cli.test.ts`; the
-handoff-across-folders proof is `apps/midad/test/link.e2e.test.ts` on local Anvil.*
+handoff-across-folders proof is `apps/mida/test/link.e2e.test.ts` on local Anvil.*
+
+## Named tasks — several efforts in one project
+
+One project folder can hold more than one effort at a time — a grant application in one agent
+session, SDK work in another. Without tasks, every checkpoint lands in one shared pile and each
+session's handoff loads the other effort's context along with its own. Named tasks split the pile
+into threads while keeping one project, one approval, one chain area.
+
+```bash
+mida task grant-app    # this folder's new sessions start under "grant-app"
+mida task              # shows the current task and every task the project holds
+mida task --clear      # back to "main", the task every project starts with
+mida task show sdk     # prints the "sdk" thread's handoff — read-only
+```
+
+Three rules decide everything:
+
+- **A session's task is decided once, when it starts.** `MIDA_TASK` in the agent's launch
+  environment wins; otherwise the folder's current task applies; otherwise `main`. Mida writes
+  the answer down for that session and never re-asks — running `mida task <name>` while an agent
+  is working does **not** move its later saves into the new task. A session that continues a
+  previous one inherits the task it was shown.
+- **A task name is checkpoint content, not identity.** It rides inside the sealed envelope like
+  the objective does. It changes nothing on chain — no record ids, grants or project identity —
+  and nothing in the approval system knows it exists. Old checkpoints written before tasks
+  existed simply read as `main`.
+- **Other tasks are awareness, not context.** A handoff loads only the session task's thread.
+  Other tasks that saved in the last 14 days get one line each — name, who last saved, how long
+  ago — and nothing else. No foreign checkpoint text reaches the agent unless a human
+  deliberately runs `mida task show <name>`.
+
+To run a second effort in the same folder without changing the folder's default, name it at the
+agent's launch instead:
+
+```bash
+MIDA_TASK=grant-app claude     # this session works under "grant-app"
+MIDA_TASK=sdk codex            # and this one, same folder, under "sdk"
+```
+
+Each session saves and hands off inside its own task; the other's line in the handoff is all it
+ever sees of the neighbour. `mida-mcp --task <name>` (or `MIDA_TASK` on the server's launch) does
+the same for an MCP client — one server process is one session. `mida doctor` prints this
+folder's current task and flags a task file that will not parse (sessions then fall back to
+`main`).
+
+*Status: covered by `apps/midad/test/tasks.test.ts` (names, pins, resolution order, envelope,
+isolation, CLI, doctor) and `apps/midad/test/tasks.e2e.test.ts` (two live sessions keeping their
+task when the folder default moves, `mida task`/`task show` end to end) on local Anvil.*
 
 ## The compile model: DeepSeek by default — RUN (benchmarked)
 
