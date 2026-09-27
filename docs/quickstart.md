@@ -39,7 +39,7 @@ mida --help
 Expected output:
 
 ```
-usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink | project new | batching on|off | migrate [--undo]   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or the identity a client installs)
+usage: mida init | install <tool> | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or any identity add-agent or a client install provisions)
 ```
 
 *Status: RUN — `pnpm check:publish` installs the packed tarball into a fresh folder outside the repo and runs `npx mida --help` to exit 0 with this text. The `-g` global-install variant links the same bins through npm's standard path.*
@@ -508,6 +508,33 @@ folder's current task and flags a task file that will not parse (sessions then f
 *Status: covered by `apps/midad/test/tasks.test.ts` (names, pins, resolution order, envelope,
 isolation, CLI, doctor) and `apps/midad/test/tasks.e2e.test.ts` (two live sessions keeping their
 task when the folder default moves, `mida task`/`task show` end to end) on local Anvil.*
+
+## 15. Leaving Mida — RUN on local Anvil
+
+One command writes everything the chain attributes to you into a folder you choose:
+
+```bash
+mida export ~/mida-backup
+```
+
+```
+Exported 5 records (3 namespaces) to /home/you/mida-backup.
+```
+
+The folder is created fresh — it refuses to overwrite anything that already exists, writes into a sibling `…​.partial-…​` folder first, and only renames it into place when every file is done. A failure mid-export deletes the partial folder, so a failed run never leaves half-written plaintext behind; if an export is interrupted by a crash or power loss, the next export into the same parent folder removes the leftover — but only once its writer is provably gone: the staging marker records the writer's machine, pid and that process's start time, so a leftover still being written (on this machine or another sharing the folder) is kept and named, never deleted. Folder mode is 0700, every file 0600.
+
+What is inside:
+
+- `records.json` — every record, machine-readable: who wrote it (you, or the agent's name), when Monad stamped it, which lineage it sits in, whether a newer record superseded it, and — for checkpoints — which one a handoff would continue from, plus the decrypted content.
+- `records.md` — the same records readable, grouped by context area, newest first.
+- `encrypted/` — the exact manifest and ciphertext bytes the store serves for each record. The encrypted files can be checked against Monad without trusting Mida — `README.md` inside the folder gives the recipe: hash the manifest file and compare it to the record's on-chain `manifestHash` (`ContextRegistry.getRecord` for a direct save, the BatchAnchor row for a batched one), then hash the ciphertext file against the manifest. The readable files are what this machine decrypted from them.
+- `README.md` — what the folder is, the counts, the chain and contract addresses it came from, and the check above.
+
+Two honest warnings, printed inside the folder too: **the readable files are plaintext — anyone who can read the folder can read your context — and the folder contains no Mida keys**, so losing it loses nothing cryptographic. Anything you saved as a credential appears here in readable form. Saves still queued on this laptop (taken by hooks, not yet on Monad) and batched saves still waiting for their anchor are not in the export — neither is chain-certified; the command prints a line naming both counts when either is not zero.
+
+`export` is an owner command — it refuses Mida's tools and agent identities (it is not an MCP tool and no hook can trigger it), but a program running as you, with a shell, can run it: the terminal check is a speed bump, and the owner key is a file on your disk until passkey export exists. A passkey setup refuses — export needs the local software owner key to decrypt, and a passkey home holds none.
+
+*Status: RUN on local Anvil — `apps/midad/test/export.e2e.test.ts` exports a six-record universe (two agents, a superseded checkpoint plus a newer plain-create checkpoint, an owner fact, a second-namespace record, one batched save) through the real CLI, then executes the README's own hash recipe against the chain. `apps/midad/test/export.test.ts` covers every refusal and the staging cleanup.*
 
 ## The compile model: DeepSeek by default — RUN (benchmarked)
 

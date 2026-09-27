@@ -13,7 +13,7 @@ import type { MidaHome } from "./home.js"
 import { callDaemon } from "./control.js"
 import { daemonWarning } from "./log.js"
 import { FileAccessRequestStore } from "./request-store.js"
-import { listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerStartBlock, saveOwnerStartBlock } from "./keys.js"
+import { listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerSecrets, loadOwnerStartBlock, saveOwnerStartBlock } from "./keys.js"
 import type { AgentIdentity } from "./keys.js"
 import { startPersistentApi } from "./api-server.js"
 
@@ -491,11 +491,24 @@ export class Runtime extends ServiceRuntime {
     this.ownerStartBlock = ownerStartBlock
   }
 
-  static override async open(home: MidaHome, network: Network, timing?: { lockWaitMs?: number; lockStepMs?: number }): Promise<Runtime> {
+  /**
+   * `keys: "load-only"` makes the open read-only for owner material — a caller that must never
+   * mint a key (export) opens this way; a missing `owner/secrets.json` then throws
+   * `no-owner-key` instead of writing a fresh one into the home.
+   */
+  static override async open(
+    home: MidaHome,
+    network: Network,
+    timing?: { lockWaitMs?: number; lockStepMs?: number },
+    keys: "load-or-create" | "load-only" = "load-or-create",
+  ): Promise<Runtime> {
     const sponsorUrl = parseSponsorUrl(network.sponsorUrl)
     const { apiBaseUrl, server, locked } = await resolveOwnerApi(home, network, timing)
     try {
-      const secrets = loadOrCreateOwnerSecrets(home)
+      const secrets = keys === "load-only" ? loadOwnerSecrets(home) : loadOrCreateOwnerSecrets(home)
+      if (secrets === undefined) {
+        throw Object.assign(new Error("no owner key on this machine — export needs the local software owner key"), { code: "no-owner-key" })
+      }
       const ownerAccount = privateKeyToAccount(secrets.privateKey)
       // An owner has no history before it existed. On a live chain the contract may have been deployed hundreds of
       // thousands of blocks ago, and ownerHistory would scan all of it on every approveGrant.
