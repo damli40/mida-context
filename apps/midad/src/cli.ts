@@ -219,6 +219,19 @@ export async function runCliWithRuntime(
     if (command === "request") {
       print(`requested ${agent} ${(await requestAccess(runtime, agent)).requestId}`)
     } else if (command === "save-demo") {
+      // the same gate `read <agent> <projectId>` runs: the folder must be approved for this
+      // agent, and the named project must be THIS folder's project — a save under another
+      // project's id is refused exactly as a read is (in-15 J-6)
+      const cwd = context?.cwd
+      const check: ProjectCheck = cwd === undefined ? { ok: false, reason: "not-approved" } : await checkProject(runtime, { agent, cwd })
+      if (!check.ok) {
+        print(projectCheckRefusal(runtime, agent, check).text)
+        return 1
+      }
+      if (projectId !== check.approval.projectId) {
+        print(`project-mismatch: this folder is approved for ${check.approval.projectId}, not ${projectId}`)
+        return 1
+      }
       const result = await saveCheckpoint(runtime, agent, {
         projectId,
         sessionId: "cli-demo",

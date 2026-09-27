@@ -1206,6 +1206,49 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     expect(lines).toEqual([`project-mismatch: this folder is approved for ${marker.projectId}, not p-other`])
   })
 
+  it("save-demo <agent> <projectId> enforces the same folder↔project check as read (in-15 J-6)", async () => {
+    // Sep 27 live: `save-demo claude-code hosted-check` saved from a folder approved for a
+    // different project while `read` refused. A guard on one path but not the other — the
+    // save path must answer exactly what read answers.
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-j6-")))
+    writeIdentity(home, "reader")
+    const owner = privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey).address
+    const stub = { home, owner } as unknown as ServiceRuntime
+    const approved = mkdtempSync(join(tmpdir(), "mida-j6-approved-"))
+    await approveProject(stub as unknown as Runtime, { agent: "reader", cwd: approved })
+    const marker = JSON.parse(readFileSync(join(approved, ".mida", "project.json"), "utf8")) as { projectId: string }
+    const lines: string[] = []
+    const mismatched = await runCliWithRuntime(
+      ["save-demo", "reader", "p-other"],
+      stub,
+      (line) => lines.push(line),
+      { cwd: approved },
+    )
+    expect(mismatched).toBe(1)
+    expect(lines).toEqual([`project-mismatch: this folder is approved for ${marker.projectId}, not p-other`])
+    // an unapproved folder refuses the same way read does — a save is never written under it
+    lines.length = 0
+    const unapproved = await runCliWithRuntime(
+      ["save-demo", "reader", "p1"],
+      stub,
+      (line) => lines.push(line),
+      { cwd: markedFolder("p1") },
+    )
+    expect(unapproved).toBe(1)
+    expect(lines).toEqual(["Mida: reader is not approved for this project — run `mida approve reader` in this folder."])
+    // the matching project id passes the gate — the bare stub has no save path, so the
+    // loud refusal below is proof the check itself let the command through (not project-mismatch)
+    lines.length = 0
+    const matching = await runCliWithRuntime(
+      ["save-demo", "reader", marker.projectId],
+      stub,
+      (line) => lines.push(line),
+      { cwd: approved },
+    )
+    expect(matching).toBe(1)
+    expect(lines.every((line) => !line.includes("project-mismatch") && !line.includes("not approved"))).toBe(true)
+  })
+
   it("read --as assistant projects.current names the real fix, never request+approve assistant (G8)", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-g8-")))
     writeIdentity(home, "assistant", "general_assistance")
