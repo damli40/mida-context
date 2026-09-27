@@ -484,13 +484,6 @@ async function runFolderCommand(argv: string[], deps: CliDeps): Promise<number> 
       }
       const result = await linkProject(owner, { projectId: plan.projectId, dir: plan.root })
       deps.print(`linked ${result.root} to project ${plan.projectId} for ${result.agents.length === 0 ? "no agents yet" : result.agents.join(", ")}`)
-      if (result.droppedRows !== 0) {
-        deps.print(
-          result.droppedRows === null
-            ? "note: the approved-projects list failed its signature check — its unverifiable rows were dropped"
-            : `note: the approved-projects list failed its signature check — ${result.droppedRows} row(s) it held could not be trusted and were dropped`,
-        )
-      }
       return 0
     }
     return usage()

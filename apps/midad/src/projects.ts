@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto"
-import { mkdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { mkdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
 import { verifyMessage } from "viem"
@@ -327,6 +327,17 @@ export function writeProjectMarker(dir: string, projectId: string): void {
   writeMarkerFile(join(dir, ".mida", "project.json"), projectId)
 }
 
+/** Removes a folder's own marker; `.mida/` goes only when the marker was all it held. */
+export function removeProjectMarker(markerDir: string): void {
+  const midaDir = join(markerDir, ".mida")
+  rmSync(join(midaDir, "project.json"), { force: true })
+  try {
+    rmdirSync(midaDir)
+  } catch {
+    // something else lives in .mida — the marker is gone, the rest is untouched
+  }
+}
+
 /** `link <folder>` accepts every spelling of a folder: ~, relative-to-cwd, absolute, symlinked. */
 function resolveFolderInput(folder: string, cwd: string, homeDir: string): string {
   if (folder === "~" || folder.startsWith("~/")) return join(homeDir, folder.slice(1))
@@ -350,7 +361,7 @@ const realpathOr = (dir: string, fallback: string): string => {
 export type ProjectLinkPlan =
   | { kind: "ok"; projectId: string; sourceRoot: string; root: string; agents: string[] }
   | { kind: "already"; projectId: string; agents: string[] }
-  | { kind: "refused"; code: "no-project" | "same-folder" | "different-project" | "list-unreadable"; message: string }
+  | { kind: "refused"; code: "no-project" | "same-folder" | "different-project" | "list-unreadable" | "list-tampered"; message: string }
 
 export async function planProjectLink(
   runtime: ListOwner,
@@ -388,8 +399,13 @@ export async function planProjectLink(
     }
   }
   const file = await readApprovalsFile(runtime.home, runtime.owner)
+  // which agents the project allows lives only in the signed list — a list it cannot verify or
+  // read makes that unknowable, so link refuses rather than guess or rebuild
   if (file.kind === "unreadable") {
     return { kind: "refused", code: "list-unreadable", message: LIST_UNREADABLE }
+  }
+  if (file.kind === "bad-signature") {
+    return { kind: "refused", code: "list-tampered", message: LIST_TAMPERED }
   }
   const entries = file.kind === "signed" ? file.entries : []
   // every agent the project already allows — the list is the authority, whatever folder their
@@ -407,18 +423,21 @@ export async function planProjectLink(
 /**
  * The post-confirmation half of `mida link`: B's own marker takes the project's id, then one
  * signed row per agent the project already allows — through the same serialized, signed write
- * `approveProject` uses, so a tampered list rebuilds from trusted content and reports it. No
- * transaction, no chain read of any kind — the list is local, owner-signed data.
+ * `approveProject` uses. Unlike approve it never rebuilds an unverifiable list from empty: the
+ * agents to add live in that list, so a failed verification can only refuse — and B's marker
+ * stays recoverable by re-running link once the list is. No transaction, no chain read of any
+ * kind — the list is local, owner-signed data.
  */
 export async function linkProject(
   runtime: ListOwner,
   input: { projectId: string; dir: string },
-): Promise<{ root: string; agents: string[]; added: string[]; droppedRows: number | null }> {
+): Promise<{ root: string; agents: string[]; added: string[] }> {
   const root = realpathSync.native(input.dir)
   writeProjectMarker(input.dir, input.projectId)
   return serializeListWrite(async () => {
     const file = await readApprovalsFile(runtime.home, runtime.owner)
     if (file.kind === "unreadable") throw listRefusal("list-unreadable")
+    if (file.kind === "bad-signature") throw listRefusal("list-tampered")
     const entries = file.kind === "signed" ? file.entries : []
     const agents = [...new Set(entries.filter((e) => e.projectId === input.projectId).map((e) => e.agent))].sort()
     // canonical comparison decides what is missing — a symlink, typed case or relative spelling
@@ -429,8 +448,76 @@ export async function linkProject(
     const approvedAt = new Date().toISOString()
     const next = [...entries, ...added.map((agent) => ({ agent, projectId: input.projectId, root, approvedAt }))]
     runtime.home.writeSecretJson(LIST_FILE, { entries: next, signature: await signEntries(runtime, next) })
-    return { root, agents, added, droppedRows: file.kind === "bad-signature" ? file.rows : 0 }
+    return { root, agents, added }
   })
+}
+
+/**
+ * What `mida unlink` must show the owner before the typed yes — or the refusal. `rows` are the
+ * signed rows this folder's root carries (every agent); `otherRoots` are the project's other
+ * approved folders. A project with no other approved folder cannot be unlinked — that would
+ * orphan the project, and the refusal says so.
+ */
+export type ProjectUnlinkPlan =
+  | { kind: "ok"; projectId: string; markerDir: string; root: string; rows: ProjectApproval[]; otherRoots: string[] }
+  | { kind: "refused"; code: "not-a-project" | "only-folder" | "list-unreadable" | "list-tampered"; message: string }
+
+export async function planProjectUnlink(
+  runtime: ListOwner,
+  input: { cwd: string },
+): Promise<ProjectUnlinkPlan> {
+  const marker = findProjectMarker(input.cwd)
+  if (marker === null || marker.projectId === null) {
+    return { kind: "refused", code: "not-a-project", message: "this folder has no project of its own — nothing to unlink" }
+  }
+  const root = realpathSync.native(marker.markerDir)
+  const file = await readApprovalsFile(runtime.home, runtime.owner)
+  // unlink removes rows — with a list it cannot verify or read, which rows name this folder is
+  // unknowable. Unlike approve it never rebuilds from empty: that would drop every project's
+  // rows to remove one folder's. It refuses instead.
+  if (file.kind === "unreadable") {
+    return { kind: "refused", code: "list-unreadable", message: LIST_UNREADABLE }
+  }
+  if (file.kind === "bad-signature") {
+    return { kind: "refused", code: "list-tampered", message: LIST_TAMPERED }
+  }
+  const entries = file.kind === "signed" ? file.entries : []
+  const rows = entries.filter((e) => e.projectId === marker.projectId && sameProjectRoot(e.root, root))
+  const otherRoots = [
+    ...new Set(entries.filter((e) => e.projectId === marker.projectId && !sameProjectRoot(e.root, root)).map((e) => e.root)),
+  ].sort()
+  if (otherRoots.length === 0) {
+    return {
+      kind: "refused",
+      code: "only-folder",
+      message: `project ${marker.projectId} has no other folder — unlinking would orphan it; there is nothing to unlink`,
+    }
+  }
+  return { kind: "ok", projectId: marker.projectId, markerDir: marker.markerDir, root, rows, otherRoots }
+}
+
+/**
+ * The post-confirmation half of `mida unlink`: every signed row naming this folder's canonical
+ * root (for this project, every agent) leaves the list, and the folder's own `.mida/` marker is
+ * removed. The project, its other folders and all its records are untouched — the only write is
+ * the re-signed list.
+ */
+export async function unlinkProject(
+  runtime: ListOwner,
+  input: { projectId: string; markerDir: string },
+): Promise<{ root: string; removed: number }> {
+  const root = realpathSync.native(input.markerDir)
+  const removed = await serializeListWrite(async () => {
+    const file = await readApprovalsFile(runtime.home, runtime.owner)
+    if (file.kind === "unreadable") throw listRefusal("list-unreadable")
+    if (file.kind === "bad-signature") throw listRefusal("list-tampered")
+    const entries = file.kind === "signed" ? file.entries : []
+    const kept = entries.filter((e) => !(e.projectId === input.projectId && sameProjectRoot(e.root, root)))
+    runtime.home.writeSecretJson(LIST_FILE, { entries: kept, signature: await signEntries(runtime, kept) })
+    return entries.length - kept.length
+  })
+  removeProjectMarker(input.markerDir)
+  return { root, removed }
 }
 
 

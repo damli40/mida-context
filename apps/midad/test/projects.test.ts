@@ -405,6 +405,26 @@ describe("mida link — a second folder joins an existing project (lk-1)", () =>
     expect(existsSync(join(dirB, ".mida"))).toBe(false)
   })
 
+  it("refuses a tampered list — who the project allows is unknowable, so it never rebuilds empty", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mkdirSync(dirB)
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    const file = home.readJson<{ entries: ProjectApproval[]; signature: Hex }>(LIST)!
+    home.writeSecretJson(LIST, {
+      entries: [...file.entries, { agent: "evil", projectId: "p-a", root: "/tmp/evil", approvedAt: "x" }],
+      signature: file.signature,
+    })
+    // the plan refuses before any yes could be typed — and nothing moves
+    expect(await planProjectLink(runtime, { folder: dirA, cwd: dirB })).toMatchObject({ kind: "refused", code: "list-tampered" })
+    expect(existsSync(join(dirB, ".mida"))).toBe(false)
+    // the write path refuses too — unlike approve, link cannot rebuild from trusted content:
+    // the agents it would add are the very thing the broken file no longer proves
+    await expect(linkProject(runtime, { projectId: "p-a", dir: dirB })).rejects.toMatchObject({ code: "list-tampered" })
+    // every row the owner actually signed still sits in the file — verifyMessage fails only on the added line
+    expect(await approvalsFileStatus(home, runtime.owner)).toBe("bad-signature")
+  })
+
   it("a second link into the same project is the no-op the owner is told about", async () => {
     const { dir, home, runtime } = setup()
     const dirA = join(dir, "a"); const dirB = join(dir, "b")
