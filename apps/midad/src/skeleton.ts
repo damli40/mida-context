@@ -5,7 +5,7 @@ import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScop
 import { batchAnchorAbi, capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord, recordPlacementsNear } from "@mida/chain"
 import type { ChainContext, HistoryScanCursor, RecordPlacement } from "@mida/chain"
 import { DENY_CANCEL_EXPIRY_SECONDS, provisionAgent } from "@mida/fake-vault"
-import { POLICY_DOCUMENT_V1, adviseGrant, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
+import { POLICY_DOCUMENT_V1, adviseGrant, assertRequestFresh, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
 import type { BatchReceipt } from "@mida/api"
 import { compareChainOrder } from "@mida/checkpoint"
@@ -351,6 +351,11 @@ export function historyCursor(home: MidaHome, agentId: Hex, chainId: bigint, reg
  * deciding. assertRequestIsCurrent throws for a stale request here, exactly as it would below.
  */
 async function grantAdviceFor(runtime: Runtime, name: string, request: AccessRequest, manifest: Parameters<typeof adviseGrant>[0]["manifest"]): Promise<GrantAdvice> {
+  // the expiry window needs only the chain's clock — one getBlock — so it is checked before the
+  // agent-record and revocation-history reads: an expired request refuses here, never after a
+  // getLogs scan (in-15 J-2 — Sep 27 live printed "about 928 requests" before REQUEST_EXPIRED)
+  const now = await latestTimestamp(runtime.ownerChain)
+  assertRequestFresh(request, now)
   const agentRecord = await readAgentRecord(runtime.ownerChain, request.agentId)
   const history = await ownerHistory({
     client: runtime.ownerChain.publicClient,
@@ -366,7 +371,6 @@ async function grantAdviceFor(runtime: Runtime, name: string, request: AccessReq
         `reading ${name}'s revocations history: ${total === 0 ? 100 : Math.floor((done * 100) / total)}% (${done.toLocaleString("en-US")} of about ${total.toLocaleString("en-US")} requests)`,
       ),
   })
-  const now = await latestTimestamp(runtime.ownerChain)
   return adviseGrant({ request, manifest, agentRecord, ownerHistory: history, now })
 }
 

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { zeroHash } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
-import { P256_N, PERMISSION, isMidaError, namespaceId, sortScopes } from "@mida/protocol"
+import { P256_N, PERMISSION, encodeUint64, isMidaError, namespaceId, sortScopes } from "@mida/protocol"
 import type { Address, Hex, ObjectManifest, ReaderEpochWrap, UnsignedAccessRequest } from "@mida/protocol"
 import {
   bytesOf,
@@ -206,6 +206,40 @@ describe("FakeVaultAuthority (plan Task 22)", () => {
       vault.approveGrant({ accessRequest: request, manifest: agentA.manifest, selection: { kind: "custom", scopes: broader, expiresAt } }),
     ).rejects.toSatisfy((error: unknown) => isMidaError(error, "RESPONSE_MISMATCH"))
     expect(await read<bigint>("grantNonce", [vault.owner])).toBe(1n)
+  })
+
+  it("an expired request refuses BEFORE the revocation-history reads — zero scan calls (in-15 J-2)", async () => {
+    // Sep 27 live: `approve --all` printed "checking devin's history on the chain (about 928
+    // requests)…" and only then answered REQUEST_EXPIRED. The expiry window needs only the
+    // request and the chain's clock — one getBlock — so every read past that is counted here.
+    let logScans = 0
+    let epochReads = 0
+    const counting = new Proxy(owner.publicClient, {
+      get(target, prop, receiver) {
+        if (prop === "getLogs") {
+          return async (...args: unknown[]) => {
+            logScans += 1
+            return (target.getLogs as (...a: never[]) => Promise<unknown>)(...(args as never[]))
+          }
+        }
+        if (prop === "readContract") {
+          return async (parameters: { functionName?: string }) => {
+            if (parameters.functionName === "agentEpoch") epochReads += 1
+            return target.readContract(parameters as never)
+          }
+        }
+        return Reflect.get(target, prop, receiver)
+      },
+    })
+    const countingVault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: P256_KEY, chain: { ...owner, publicClient: counting }, api })
+    const expired = await signedRequest(agentB, [{ namespace: "goals.career", permissions: PERMISSION.READ }], {
+      requestExpiresAt: encodeUint64((await latestTimestamp(owner)) - 60n),
+    })
+    await expect(
+      countingVault.approveGrant({ accessRequest: expired, manifest: agentB.manifest, selection: { kind: "recommended" } }),
+    ).rejects.toSatisfy((error: unknown) => isMidaError(error, "REQUEST_EXPIRED"))
+    expect(logScans).toBe(0)
+    expect(epochReads).toBe(0)
   })
 
   it("uploads owner ciphertext first, then anchors matching commitments that decrypt under epoch 1", async () => {

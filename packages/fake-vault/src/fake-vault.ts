@@ -57,7 +57,7 @@ import {
   toMidaError,
 } from "@mida/chain"
 import type { TxKind, WriteContext } from "@mida/chain"
-import { POLICY_HASH_V1, adviseGrant, assertFinalSelection } from "@mida/grant-advisor"
+import { POLICY_HASH_V1, adviseGrant, assertFinalSelection, assertRequestFresh } from "@mida/grant-advisor"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { parseEventLogs, zeroHash } from "viem"
 import type { Abi, TransactionReceipt } from "viem"
@@ -236,6 +236,11 @@ export class FakeVaultAuthority implements VaultAuthority {
     ) {
       throw new MidaError("INVALID_WIRE", "access request targets a different chain or registry than this Vault")
     }
+    // the expiry window needs only the chain's clock — one getBlock — so it is checked before
+    // the agent-record and revocation-history reads: an expired request refuses here, never
+    // after a getLogs scan (in-15 J-2)
+    const now = await latestTimestamp(this.#chain)
+    assertRequestFresh(accessRequest, now)
     const agentRecord = await readAgentRecord(this.#chain, accessRequest.agentId)
     const history = await ownerHistory({
       client: this.#chain.publicClient,
@@ -243,7 +248,6 @@ export class FakeVaultAuthority implements VaultAuthority {
       owner: this.owner,
       agentId: accessRequest.agentId,
     })
-    const now = await latestTimestamp(this.#chain)
     const advice = adviseGrant({ request: accessRequest, manifest: request.manifest, agentRecord, ownerHistory: history, now })
 
     const selected =

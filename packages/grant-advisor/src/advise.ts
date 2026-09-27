@@ -76,6 +76,25 @@ function warning(code: ScopeWarningCode, scopeId?: Hex, relatedNamespaceIds?: He
   }
 }
 
+/**
+ * The request's own validity window. It needs only the request and the chain's clock — one
+ * getBlock — so callers check it BEFORE paying for the agent-record and owner-history reads the
+ * full advisor needs: an expired request refuses cheaply, with the same REQUEST_EXPIRED the
+ * full check below would throw (in-15 J-2). assertRequestIsCurrent calls this too, so nothing
+ * that reaches the signature checks escapes it.
+ */
+export function assertRequestFresh(request: AccessRequest, now: bigint): void {
+  const issuedAt = decodeUint64(request.issuedAt)
+  const requestExpiresAt = decodeUint64(request.requestExpiresAt)
+  const capabilityExpiresAt = decodeUint64(request.capabilityExpiresAt)
+  if (issuedAt > now || now >= requestExpiresAt || requestExpiresAt - issuedAt > MAX_REQUEST_WINDOW_SECONDS) {
+    throw new MidaError("REQUEST_EXPIRED", "request is outside its validity window")
+  }
+  if (capabilityExpiresAt !== 0n && capabilityExpiresAt <= now) {
+    throw new MidaError("REQUEST_EXPIRED", "requested capability expiry is not in the future")
+  }
+}
+
 /** Algorithm step 1–2: every identity, manifest, signature, version and freshness check. Failure returns no advice. */
 function assertRequestIsCurrent(input: GrantAdvisorInput): void {
   const { request, agentRecord, ownerHistory, now } = input
@@ -119,15 +138,7 @@ function assertRequestIsCurrent(input: GrantAdvisorInput): void {
     throw new MidaError("PURPOSE_UNKNOWN", `purpose ${String(request.purposeId)} is not declared by the manifest`)
   }
 
-  const issuedAt = decodeUint64(request.issuedAt)
-  const requestExpiresAt = decodeUint64(request.requestExpiresAt)
-  const capabilityExpiresAt = decodeUint64(request.capabilityExpiresAt)
-  if (issuedAt > now || now >= requestExpiresAt || requestExpiresAt - issuedAt > MAX_REQUEST_WINDOW_SECONDS) {
-    throw new MidaError("REQUEST_EXPIRED", "request is outside its validity window")
-  }
-  if (capabilityExpiresAt !== 0n && capabilityExpiresAt <= now) {
-    throw new MidaError("REQUEST_EXPIRED", "requested capability expiry is not in the future")
-  }
+  assertRequestFresh(request, now)
   assertCanonicalScopes(request.scopes)
 }
 

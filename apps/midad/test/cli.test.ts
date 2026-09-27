@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
+import { randomBytes } from "node:crypto"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { BaseError, HttpRequestError } from "viem"
@@ -217,6 +218,41 @@ describe("the crude mida command", () => {
     // and the provisioned name is a real approve target even though it is not a default agent
     expect(await run3("approve", "devin")).toBe(0)
     expect(out.some((line) => line.startsWith("approved devin"))).toBe(true)
+  }, 300_000)
+
+  it("an expired pending request refuses BEFORE the history scan — no 'about N requests' line (in-15 J-2)", async () => {
+    // Sep 27 live: `approve --all` printed "checking devin's history on the chain (about 928
+    // requests)…" before answering REQUEST_EXPIRED. The window needs only the chain's clock.
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-expired-")))
+    const out: string[] = []
+    const progress: string[] = []
+    const run3 = (...argv: string[]) =>
+      runCli(argv, {
+        home: fresh, network, cwd: projectDir, print: (line) => out.push(line),
+        progress: (line) => progress.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await run3("init")).toBe(0)
+    expect(await run3("request", "codex")).toBe(0)
+    // a properly signed request whose window closed two hours ago — anvil's latest block is
+    // always minutes old at worst, so this is safely expired by the chain's own clock
+    const identity = loadAgentIdentity(fresh, "codex")!
+    const pending = fresh.readJson<{ request: AccessRequest }>("agents/codex/pending-request.json")!.request
+    const { agentSignature: _dropped, ...unsigned } = pending
+    const wallNow = BigInt(Math.floor(Date.now() / 1000))
+    const stale = {
+      ...unsigned,
+      requestId: `0x${randomBytes(32).toString("hex")}` as Hex,
+      issuedAt: encodeUint64(wallNow - 7_260n),
+      requestExpiresAt: encodeUint64(wallNow - 7_200n),
+    }
+    const request = { ...stale, agentSignature: await privateKeyToAccount(identity.signerPrivateKey).signTypedData(accessRequestTypedData(stale)) }
+    await new FileAccessRequestStore(fresh, "codex").save(request)
+    fresh.writeSecretJson("agents/codex/pending-request.json", { request })
+    progress.length = 0
+    expect(await run3("approve", "codex")).toBe(1)
+    expect(out).toContain("codex's request has expired (a request lasts 5 minutes): run `mida request codex` and approve again")
+    expect(progress.some((line) => line.includes("history on the chain"))).toBe(false)
   }, 300_000)
 
   it("install <client> asks for a real terminal like approve, a non-client is usage, the daemon refuses it", async () => {
