@@ -567,6 +567,84 @@ describe("mida install codex", () => {
   })
 })
 
+describe("Codex's [hooks.state] trust records inside the managed block", () => {
+  // Codex fingerprints hook commands and writes the records the user trusted with /hooks as
+  // [hooks.state."<path>:<event>:<row>:<index>"] tables — appended after the LAST hooks table in
+  // the file, which lands inside our markers, before the close marker. They are Codex's data —
+  // including another tool's entries (ecc@ecc here) — never ours to compare or delete.
+  const trustedHash = (seed: string) => `trusted_hash = "sha256:${seed.padEnd(64, "0")}"`
+  const codexStateTables = [
+    "[hooks.state]",
+    "",
+    '[hooks.state."/Users/you/.codex/config.toml:session_start:0:0"]',
+    trustedHash("ed997f3f"),
+    "",
+    '[hooks.state."/Users/you/.codex/config.toml:session_start:1:0"]',
+    trustedHash("88ef7545"),
+    "",
+    '[hooks.state."/Users/you/.codex/config.toml:user_prompt_submit:0:0"]',
+    trustedHash("005fd533"),
+    "",
+    '[hooks.state."/Users/you/.codex/config.toml:stop:0:0"]',
+    trustedHash("22234841"),
+    "",
+    '[hooks.state."ecc@ecc:hooks/codex-hooks.json:session_start:0:0"]',
+    trustedHash("323e8107"),
+  ].join("\n")
+
+  /** The live shape: our block, then Codex's state tables, then the close marker. */
+  const withCodexState = (block: string) =>
+    `${block.slice(0, block.lastIndexOf("# <<< mida hooks <<<"))}\n${codexStateTables}\n# <<< mida hooks <<<`
+
+  it("a current block plus Codex's trust records reads installed, and install is a byte-identical no-op", () => {
+    const config = join(dir(), "config.toml")
+    const text = `model = "gpt-5"\n\n${withCodexState(codexBlock())}\n`
+    writeFileSync(config, text)
+    expect(codexHooksStatus(config)).toBe("installed")
+    expect(installCodex(config)).toBe("already-installed")
+    expect(readFileSync(config, "utf8")).toBe(text)
+  })
+
+  it("an upgrade from an older managed block keeps every trust record, re-emitted after the close marker", () => {
+    for (const legacy of [CODEX_BLOCK_V1, CODEX_BLOCK]) {
+      const config = join(dir(), "config.toml")
+      const before = 'model = "gpt-5"\n'
+      writeFileSync(config, `${before}\n${withCodexState(legacy)}\n`)
+      expect(codexHooksStatus(config)).toBe("outdated")
+      expect(installCodex(config)).toBe("installed")
+      const text = readFileSync(config, "utf8")
+      // bytes outside preserved, the new block written, all five records after the close marker
+      expect(text).toBe(`${before}\n${codexBlock()}\n${codexStateTables}\n`)
+      expect(codexHooksStatus(config)).toBe("installed")
+      expect(installCodex(config)).toBe("already-installed")
+      expect(readFileSync(config, "utf8")).toBe(text)
+    }
+  })
+
+  it("uninstall removes only our tables — all five trust records survive, including the other tool's", () => {
+    const config = join(dir(), "config.toml")
+    const before = 'model = "gpt-5"\n'
+    writeFileSync(config, `${before}\n${withCodexState(codexBlock())}\n`)
+    expect(uninstallCodex(config)).toBe("uninstalled")
+    const text = readFileSync(config, "utf8")
+    expect(text).toBe(`${before}\n${codexStateTables}\n`)
+    expect(text.match(/trusted_hash/g)).toHaveLength(5)
+    expect(text).toContain("ecc@ecc")
+    expect(text).not.toContain("mida hooks")
+  })
+
+  it("a state section carrying foreign lines is not Codex's — the block still refuses", () => {
+    const config = join(dir(), "config.toml")
+    const text = `${withCodexState(codexBlock()).replace(trustedHash("323e8107"), 'custom_field = "value"')}\n`
+    writeFileSync(config, text)
+    for (const act of [installCodex, uninstallCodex]) {
+      expect(() => act(config)).toThrowError(expect.objectContaining({ code: "settings-unreadable" }))
+      expect(readFileSync(config, "utf8")).toBe(text)
+    }
+    expect(codexHooksStatus(config)).toBe("unreadable")
+  })
+})
+
 describe("the Codex trust reminder", () => {
   it("the sentence is the exact line the tools' docs describe", () => {
     expect(CODEX_TRUST_SENTENCE).toBe(

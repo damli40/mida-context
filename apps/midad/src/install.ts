@@ -667,8 +667,23 @@ function codexKnownBlocks(): Readonly<Record<string, "current" | "bare" | "v1">>
 export const CODEX_TRUST_SENTENCE =
   "Codex will ignore these hooks until you trust them: open codex, type /hooks, and trust the Mida entries."
 
+/**
+ * Codex writes its hook-trust records — the rows `/hooks` produced — as `[hooks.state]` and
+ * `[hooks.state."<path>:<event>:<row>:<index>"]` tables holding `trusted_hash` lines. It appends
+ * them after the LAST hooks table in the file, which lands inside our markers, before the close
+ * marker. They are Codex's data (and can hold other tools' entries), never part of our block:
+ * the version compare ignores them, and install/uninstall carry them past the close marker
+ * verbatim instead of deleting them.
+ */
+const CODEX_STATE_TABLE = /^\[hooks\.state(?:\.[^\][]*)?\]$/
+const CODEX_STATE_FIELD = /^trusted_hash\s*=\s*"[^"]*"$/
+const CODEX_STATE_START = /\n\[hooks\.state(?:\.|\])/
+
+const isCodexStateLine = (line: string): boolean =>
+  line.trim() === "" || CODEX_STATE_TABLE.test(line.trim()) || CODEX_STATE_FIELD.test(line.trim())
+
 /** Finds a KNOWN managed block between its markers; "absent" when neither marker is present. */
-function locateCodexBlock(text: string): { start: number; end: number; version: "current" | "bare" | "v1" | "stale" } | "absent" {
+function locateCodexBlock(text: string): { start: number; end: number; version: "current" | "bare" | "v1" | "stale"; stateTail: string } | "absent" {
   const hasOpen = text.includes(CODEX_MARKER_OPEN)
   const hasClose = text.includes(CODEX_MARKER_CLOSE)
   if (!hasOpen && !hasClose) return "absent"
@@ -676,15 +691,29 @@ function locateCodexBlock(text: string): { start: number; end: number; version: 
   const closeAt = text.indexOf(CODEX_MARKER_CLOSE)
   if (!hasOpen || !hasClose || closeAt < start) throw settingsUnreadable()
   const end = closeAt + CODEX_MARKER_CLOSE.length
-  const version = codexKnownBlocks()[text.slice(start, end)]
-  if (version !== undefined) return { start, end, version }
+  const blockText = text.slice(start, end)
+  // A [hooks.state…] suffix inside the markers is Codex's trust state, not our block: split it
+  // off before comparing. Anything else in that suffix — a field we do not recognise, a table
+  // that is not state — is the same edited content the bare markers refuse on.
+  const interior = blockText.slice(CODEX_MARKER_OPEN.length, blockText.length - CODEX_MARKER_CLOSE.length)
+  let core = blockText
+  let stateTail = ""
+  const stateAt = interior.search(CODEX_STATE_START)
+  if (stateAt >= 0) {
+    const tail = interior.slice(stateAt)
+    if (!tail.split("\n").every(isCodexStateLine)) throw settingsUnreadable()
+    core = `${CODEX_MARKER_OPEN}${interior.slice(0, stateAt)}${CODEX_MARKER_CLOSE}`
+    stateTail = tail.replace(/\n+$/, "")
+  }
+  const version = codexKnownBlocks()[core]
+  if (version !== undefined) return { start, end, version, stateTail }
   // A block we do not byte-match can still be ours: an absolute-path block written from a
   // different checkout (the repo moved, or an older build's dist). Every command line must
   // parse as a Mida hook for that to be true — anything else between the markers is a
   // human's edit and refuses.
-  const commands = [...text.slice(start, end).matchAll(/command = "([^"]*)"/g)].map((match) => match[1]!)
+  const commands = [...core.matchAll(/command = "([^"]*)"/g)].map((match) => match[1]!)
   if (commands.length > 0 && commands.every((command) => parseMidaCommand(command) !== null)) {
-    return { start, end, version: "stale" }
+    return { start, end, version: "stale", stateTail }
   }
   throw settingsUnreadable()
 }
@@ -702,8 +731,10 @@ export function installCodex(configPath: string): InstallOutcome {
     const block = locateCodexBlock(text)
     if (block !== "absent") {
       if (block.version === "current") return "already-installed"
-      // an older managed block is ours to replace in place — same outcome as a fresh append
-      writeFileAtomic(configPath, `${text.slice(0, block.start)}${codexBlock()}${text.slice(block.end)}`)
+      // an older managed block is ours to replace in place — same outcome as a fresh append.
+      // Codex's trust records come back out immediately AFTER the close marker: still valid
+      // TOML, and outside the region the next locate treats as ours to rewrite.
+      writeFileAtomic(configPath, `${text.slice(0, block.start)}${codexBlock()}${block.stateTail}${text.slice(block.end)}`)
       return "installed"
     }
   }
@@ -768,6 +799,7 @@ export function uninstallCodex(configPath: string): UninstallOutcome {
   // install added one blank line ("\n") when the file ended in a lone newline — the common case.
   // Two or more blank lines before the block could not have come from install: they stay.
   const restored = before.endsWith("\n\n") && !before.endsWith("\n\n\n") ? before.slice(0, -1) : before
-  writeFileAtomic(configPath, restored + after)
+  // Codex's trust records are not ours to delete — they stay where the block stood, valid TOML
+  writeFileAtomic(configPath, `${restored}${block.stateTail === "" ? "" : `${block.stateTail}\n`}${after}`)
   return "uninstalled"
 }
