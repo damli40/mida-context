@@ -4,6 +4,8 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createInterface } from "node:readline"
+import { compareChainOrder, orderTime, recordedAt, taskOf } from "@mida/checkpoint"
+import type { StoredCheckpoint } from "@mida/checkpoint"
 import { decodeUint64, isMidaError, namespaceById } from "@mida/protocol"
 import type { Address, Hex, RequestedScope } from "@mida/protocol"
 import { privateKeyToAccount } from "viem/accounts"
@@ -15,9 +17,10 @@ import { callDaemon, ensureCurrentDaemon } from "./control.js"
 import { batchStatusProbe, decideLane, laneWhyText } from "./batching.js"
 import { debugLine, refusalCode } from "./debug-line.js"
 import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
-import { generalAssistanceText, identityUnreadableText, isGeneralAssistant, noIdentityText, projectCheckRefusal } from "./handoff.js"
+import { buildHandoff, generalAssistanceText, identityUnreadableText, isGeneralAssistant, noIdentityText, projectCheckRefusal } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
+import { agoText } from "./hook-output.js"
 import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, uninstallClaudeCode, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
 import { resolveDevinConfigPath } from "./devin-facts.js"
 import type { InstallTool, McpClientTool } from "./install.js"
@@ -44,6 +47,7 @@ import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
 import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, pendingApprovalAdvice, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint } from "./skeleton.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerMode, saveOwnerAddress } from "./keys.js"
+import { DEFAULT_TASK, TASK_RULE_TEXT, clearFolderTask, folderTaskFor, isTaskName, resolveSessionTask, taskOrUndefined, writeFolderTask } from "./task.js"
 import type { OwnerMode } from "./keys.js"
 import { migrate, migrateUndo } from "./migrate.js"
 import { OwnerLinkOutcome, approvePasskey, initPasskey, provisionPasskeyAgents, revokePasskey } from "./owner-link/flows.js"
@@ -71,10 +75,10 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
  */
 const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | migrate [--undo]" +
+  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | migrate [--undo] | task [<name> | --clear | show <name>]" +
   "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or the identity a client installs)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
-export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", "link", "unlink", "project", ...WITH_AGENT]
+export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", "link", "unlink", "project", "task", ...WITH_AGENT]
 /**
  * The commands that change who has access — or which folder belongs to which project. Only `mida`
  * in the owner's own terminal may run them: they never go to the daemon socket. `install` for an
@@ -210,14 +214,17 @@ export async function runCliWithRuntime(
   argv: string[],
   runtime: ServiceRuntime,
   print: (line: string) => void,
-  /** `cwd` is the folder the command ran in; `debug` is the daemon's pass-through of MIDA_DEBUG=1. */
-  context?: { cwd?: string; debug?: boolean },
+  /** `cwd` is the folder the command ran in; `debug` is the daemon's pass-through of MIDA_DEBUG=1; `task` is the caller's MIDA_TASK. */
+  context?: { cwd?: string; debug?: boolean; task?: string },
 ): Promise<number> {
   const [command = ""] = argv
   if (OWNER_COMMANDS.includes(command)) {
     print(ownerOnlyLine(command))
     return 2
   }
+  // tk-1: `task` is folder state plus the same gated reads `read` makes — not an owner command:
+  // nothing here signs, and a session may legitimately name its own effort mid-work.
+  if (command === "task") return runTaskCommand(argv.slice(1), runtime, print, context)
   const asFlag = command === "read" && argv[1] === "--as"
   const agent = asFlag ? (argv[2] ?? "") : (argv[1] ?? "")
   const projectId = argv[2] ?? ""
@@ -427,6 +434,144 @@ export async function runCliWithRuntime(
     if (context?.debug === true) print(debugLine(error))
     return 1
   }
+}
+
+/**
+ * The identity a task read stands behind (tk-1): listing tasks and `task show` both read
+ * checkpoints, so they need an agent the owner approved for this folder — the first registered
+ * name whose project gate passes, in sorted order for a stable answer. A refusal is quoted as
+ * the first candidate's, exactly as `read` does.
+ */
+async function taskReadAgent(
+  runtime: ServiceRuntime,
+  cwd: string,
+): Promise<{ ok: true; agent: string } | { ok: false; text: string }> {
+  const candidates = [...new Set([...AGENTS, ...listAgentNames(runtime.home)])].sort()
+  if (candidates.length === 0) {
+    return { ok: false, text: `no agents are set up in this Mida home (${runtime.home.root}) — run \`mida init\` first` }
+  }
+  let firstRefusal: string | undefined
+  for (const agent of candidates) {
+    const check = await checkProject(runtime, { agent, cwd })
+    if (check.ok) return { ok: true, agent }
+    firstRefusal ??= projectCheckRefusal(runtime, agent, check).text
+  }
+  return { ok: false, text: firstRefusal ?? `refused: not-approved` }
+}
+
+/**
+ * `mida task` (tk-1): the named-task command. Bare prints the folder's current task and every
+ * task that has checkpoints, newest activity first; `task <name>` sets the folder's default;
+ * `task --clear` takes it back to `main`; `task show <name>` prints that task's handoff — the
+ * one deliberate boundary crossing, and strictly read-only (no session id means no pin, no
+ * continuation link and no seen-set write).
+ */
+async function runTaskCommand(
+  argv: string[],
+  runtime: ServiceRuntime,
+  print: (line: string) => void,
+  context?: { cwd?: string; debug?: boolean; task?: string },
+): Promise<number> {
+  const usage = () => {
+    print(USAGE)
+    return 2
+  }
+  const cwd = context?.cwd ?? process.cwd()
+  const folder = folderTaskFor(cwd)
+  const notAProject = () => {
+    print("this folder is not a Mida project — tasks live inside one: run `mida approve <agent>` here first")
+    return 1
+  }
+  const arg = argv[0]
+
+  if (arg === "show") {
+    const name = argv[1]
+    if (name === undefined || argv.length !== 2) return usage()
+    if (!isTaskName(name)) {
+      print(`refused: "${name}" — ${TASK_RULE_TEXT}`)
+      return 2
+    }
+    if (folder.markerDir === null || folder.projectId === null) return notAProject()
+    const picked = await taskReadAgent(runtime, cwd)
+    if (!picked.ok) {
+      print(picked.text)
+      return 1
+    }
+    const result = await buildHandoff(runtime, {
+      agent: picked.agent,
+      cwd,
+      authorNames: authorNamesFor(runtime),
+      task: name,
+    })
+    print(result.text)
+    return result.kind === "refused" ? 1 : 0
+  }
+
+  if (arg === "--clear") {
+    if (argv.length !== 1) return usage()
+    if (folder.markerDir === null) return notAProject()
+    clearFolderTask(folder.markerDir)
+    print(`current task: ${DEFAULT_TASK}`)
+    return 0
+  }
+
+  if (arg !== undefined && !arg.startsWith("-")) {
+    if (argv.length !== 1) return usage()
+    if (!isTaskName(arg)) {
+      print(`refused: "${arg}" — ${TASK_RULE_TEXT}`)
+      return 2
+    }
+    if (folder.markerDir === null) return notAProject()
+    writeFolderTask(folder.markerDir, arg)
+    print(arg === DEFAULT_TASK ? `current task: ${DEFAULT_TASK}` : `current task: ${arg} — new sessions in this folder start under it`)
+    return 0
+  }
+
+  if (arg !== undefined) return usage()
+
+  // bare `mida task`: the task THIS shell resolves under — MIDA_TASK first, then the folder's
+  // default — and every task the project holds checkpoints for, newest activity first.
+  const resolved = resolveSessionTask(runtime.home, {
+    cwd,
+    projectId: folder.projectId ?? undefined,
+    explicit: taskOrUndefined(context?.task),
+  })
+  const where =
+    resolved.source === "explicit" ? " (MIDA_TASK)"
+    : resolved.source === "folder" ? " (folder)"
+    : resolved.source === "default" ? " (default)"
+    : ` (${resolved.source})`
+  print(`current task: ${resolved.task}${where}`)
+  if (folder.markerDir === null || folder.projectId === null) {
+    print("this folder is not a Mida project — no task list")
+    return 0
+  }
+  const picked = await taskReadAgent(runtime, cwd)
+  if (!picked.ok) {
+    print(picked.text)
+    return 1
+  }
+  let checkpoints: StoredCheckpoint[]
+  try {
+    checkpoints = (await readCheckpoints(runtime, picked.agent, folder.projectId)).checkpoints
+  } catch (error) {
+    print(`could not read the task list (${refusalCode(error)})`)
+    return 1
+  }
+  const newest = new Map<string, StoredCheckpoint>()
+  for (const cp of checkpoints) {
+    const prev = newest.get(taskOf(cp))
+    if (prev === undefined || compareChainOrder(cp, prev) > 0) newest.set(taskOf(cp), cp)
+  }
+  const names = authorNamesFor(runtime)
+  const now = Date.now()
+  const rows = [...newest.values()].sort((a, b) => compareChainOrder(b, a))
+  print(rows.length === 0 ? "no checkpoints saved yet" : "tasks:")
+  for (const cp of rows) {
+    const author = names[cp.authorId.toLowerCase()] ?? "unknown agent"
+    print(`  ${taskOf(cp)} — ${author} — ${agoText(recordedAt(cp), now)}`)
+  }
+  return 0
 }
 
 /**
@@ -1659,7 +1804,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     }
     try {
       session.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
-      return await runCliWithRuntime(argv, session, deps.print, { cwd: deps.cwd })
+      return await runCliWithRuntime(argv, session, deps.print, { cwd: deps.cwd, task: (deps.env ?? process.env).MIDA_TASK })
     } finally {
       await session.close()
     }
@@ -1669,7 +1814,9 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     // Owner-command narration goes to STDERR by default: `print` output keeps its exact shape.
     runtime.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
     const command = argv[0]!
-    if (!OWNER_COMMANDS.includes(command)) return await runCliWithRuntime(argv, runtime, deps.print, { cwd: deps.cwd })
+    if (!OWNER_COMMANDS.includes(command)) {
+      return await runCliWithRuntime(argv, runtime, deps.print, { cwd: deps.cwd, task: (deps.env ?? process.env).MIDA_TASK })
+    }
     const code = await runOwnerCommand(argv, runtime, deps)
     if (code === 0 && (command === "approve" || command === "revoke" || command === "batching")) {
       await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
@@ -1889,7 +2036,12 @@ async function main(): Promise<void> {
     // say so on stderr so the command's stdout keeps its shape
     process.stderr.write(`restarted the Mida service (it was running code from ${ensured.replaced.codeRoot} @ ${ensured.replaced.codeCommit.slice(0, 7)})\n`)
   }
-  const reply = await callDaemon(home, "/cli", { argv, cwd: process.cwd(), debug: process.env.MIDA_DEBUG === "1" }, { timeoutMs: CLI_CALL_TIMEOUT_MS })
+  const reply = await callDaemon(
+    home,
+    "/cli",
+    { argv, cwd: process.cwd(), debug: process.env.MIDA_DEBUG === "1", task: process.env.MIDA_TASK },
+    { timeoutMs: CLI_CALL_TIMEOUT_MS },
+  )
   const body = reply.body as { code?: unknown; lines?: unknown } | null
   if (reply.status === 0 || typeof body?.code !== "number" || !Array.isArray(body.lines)) {
     print("midad did not answer")
