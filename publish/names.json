@@ -1,4 +1,4 @@
 {
   "cli": "mida-context",
-  "sdk": "mida-context-sdk"
+  "sdk": "@mida-context/sdk"
 }

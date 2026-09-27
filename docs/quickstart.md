@@ -260,30 +260,27 @@ The same preview and typed-`yes` ask apply. Afterwards the handoff an agent rece
 
 ## 12. The SDK path — RUN on local Anvil
 
-Everything above is driven by the CLI. The same lifecycle — request, approve, write, read, revoke — is reachable from your own process through `mida-context-sdk`. Install it next to the CLI (`npm i mida-context-sdk`, or the packed tarball), then:
+Everything above is driven by the CLI. The same lifecycle — request, approve, write, read, revoke — is reachable from your own process through `@mida-context/sdk`. Install it next to the CLI (`npm i @mida-context/sdk`, or the packed tarball), then:
 
 ```js
 // agent.mjs — run twice: once to request, once after `mida approve codex`
-import { connectAgent, PERMISSION, PROVENANCE_POLICY } from "mida-context-sdk"
+import { Mida, isMidaSdkError } from "@mida-context/sdk"
 
-const conn = connectAgent({ name: "codex" })               // the home `mida init` made
-if (conn.agent.grants.length === 0) {
-  await conn.requestAccess({                               // files the request `mida approve` completes
-    purposeId: "project_assistance",
-    scopes: [{ namespace: "projects.current",
-               permissions: PERMISSION.READ | PERMISSION.CREATE | PERMISSION.SUPERSEDE_OWN,
-               provenancePolicy: PROVENANCE_POLICY.ALLOW_INFERENCE }],
-  })
-  console.log("requested — run `mida approve codex`, then run this script again")
+const mida = new Mida({ agent: "codex" })            // project = this folder, home = $MIDA_HOME
+const status = await mida.status()
+if (status.agent?.verdict !== "approved") {
+  const request = await mida.requestAccess()         // files the request `mida approve` completes
+  console.log(`requested — ${request.nextStep}`)
   process.exit(0)
 }
 try {
-  const saved = await conn.agent.create(conn.owner, "projects.current",
-    { kind: "EPISODE", source: "AGENT_INFERRED", value: { note: "written by my script" } })
-  console.log("wrote", saved.contextId)
-  console.log("readable:", (await conn.agent.read(conn.owner, "projects.current")).length, "record(s)")
+  const saved = await mida.remember({ namespace: "projects.current",
+    content: { note: "written by my script" } })
+  console.log("wrote", saved.id, `(${saved.state})`)
+  const { items } = await mida.context({ namespace: "projects.current", limit: 8192 })
+  console.log("readable:", items.length, "record(s)")
 } catch (error) {
-  console.log("refused:", error.code)                      // CAPABILITY_DENIED after `mida revoke codex`
+  if (isMidaSdkError(error)) console.log("refused:", error.code)  // revoked after `mida revoke codex`
 }
 ```
 
@@ -294,12 +291,12 @@ node agent.mjs
 ```
 
 - **First run** — `requested — run mida approve codex…`, and `mida approve codex` picks the request up.
-- **Second run** — `wrote 0x<64 hex>` then `readable: 1 record(s)`.
-- **After `mida revoke codex`** — `refused: CAPABILITY_DENIED` (or `CAPABILITY_REVOKED`).
+- **Second run** — `wrote 0x<64 hex> (anchored)` then `readable: 1 record(s)`.
+- **After `mida revoke codex`** — `refused: revoked`.
 
-`connectAgent` reads the identity, grants and `network.json` the CLI wrote, so the SDK and the CLI always agree on which store, sponsor and deployment are in use. For an agent that has never been through `mida init`, pass `identity` + `owner` explicitly instead of `name` — see `ConnectOptions` in the SDK's `index.d.ts`.
+`new Mida({ agent })` reads the identity, grants and `network.json` the CLI wrote, so the SDK and the CLI always agree on which store, sponsor and deployment are in use. The full API — the seven calls, the error codes, the byte limits — is `docs/sdk.md`.
 
-*Status: RUN on local Anvil — `apps/midad/test/connect.e2e.test.ts` executes this exact sequence (connect → request → `mida approve` → create → read → `mida revoke` → refused) against a fresh chain, and `pnpm check:publish` runs and type-checks an SDK consumer installed from the packed tarball. NOT RUN on the live testnet.*
+*Status: RUN on local Anvil — `packages/mida-context-sdk/test/local.e2e.test.ts` executes this exact lifecycle (status → request → `mida approve` → remember → context → `mida revoke` → refused) against a fresh chain, `packages/mida-context-sdk/test/example.e2e.test.ts` runs `examples/sdk-basic.ts` unmodified, and `pnpm check:publish` runs and type-checks an SDK consumer installed from the packed tarball. NOT RUN on the live testnet.*
 
 ## 13. Use Mida from an MCP client — NOT RUN against any real client
 

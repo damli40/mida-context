@@ -169,6 +169,9 @@ importers:
 
   .:
     dependencies:
+      '@mida-context/sdk':
+        specifier: workspace:*
+        version: link:packages/mida-context-sdk
       '@mida/api':
         specifier: workspace:*
         version: link:apps/api
