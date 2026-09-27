@@ -65,6 +65,7 @@ const OWN_HEADINGS = [
   "Progress:",
   "Saved by:",
   "Other recent sessions",
+  "Other active tasks",
   "What you have told Mida about yourself",
   "Mida note:",
   "PENDING_ANCHOR:",
@@ -83,6 +84,26 @@ export function defuse(text: string): string {
     .map((line) => (OWN_HEADINGS.some((h) => line.startsWith(h)) ? `> ${line}` : line))
     .join("\n")
 }
+
+/**
+ * One other-task mention line, the only shape a handoff ever prints (tk-1): task name, last
+ * saver, age — and nothing else. A mention is awareness, not context; the task's own thread is
+ * a deliberate `mida task show <name>` away. Exported so the daemon's pending-only and empty
+ * handoffs print the identical line the merged render produces.
+ */
+export const otherTaskLine = (t: { name: string; agent: string; savedAt: string }, nowMs: number): string => {
+  const at = Date.parse(t.savedAt)
+  return `- ${defuse(t.name)} — ${defuse(t.agent)} — ${Number.isNaN(at) ? "a while ago" : ageText(at, nowMs)}`
+}
+
+/**
+ * The whole "Other active tasks" block — heading plus one `otherTaskLine` per task. Empty input
+ * returns "" so a project with no active other tasks renders byte-identical to before tasks.
+ */
+export const otherTasksBlock = (tasks: { name: string; agent: string; savedAt: string }[], nowMs: number): string =>
+  tasks.length === 0
+    ? ""
+    : `Other active tasks in this project (read one with \`mida task show <name>\`):\n${tasks.map((t) => otherTaskLine(t, nowMs)).join("\n")}`
 
 /**
  * One fact's stamp, appended to its line: the first 8 hex characters of the context id (the id an
@@ -119,6 +140,12 @@ export function renderHandoff(
     adapterNote?: string
     /** The daemon's count of its own undelivered saves — printed verbatim, same position. */
     pendingSavesNote?: string
+    /**
+     * Named tasks sharing this project (tk-1): one mention line each — name, who last saved, how
+     * long ago — and nothing else. A mention is awareness, not context: no foreign task's text
+     * ever reaches the handoff through here. Absent or empty renders byte-identical to before.
+     */
+    otherTasks?: { name: string; agent: string; savedAt: string }[]
     /** The clock the header's age wording reads — tests inject it; the daemon passes its own. */
     now?: () => number
   } = {},
@@ -142,6 +169,12 @@ export function renderHandoffReport(
     adapterNote?: string
     /** The daemon's count of its own undelivered saves — printed verbatim, same position. */
     pendingSavesNote?: string
+    /**
+     * Named tasks sharing this project (tk-1): one mention line each — name, who last saved, how
+     * long ago — and nothing else. A mention is awareness, not context: no foreign task's text
+     * ever reaches the handoff through here. Absent or empty renders byte-identical to before.
+     */
+    otherTasks?: { name: string; agent: string; savedAt: string }[]
     /** The clock the header's age wording reads — tests inject it; the daemon passes its own. */
     now?: () => number
   } = {},
@@ -220,6 +253,11 @@ export function renderHandoffReport(
             )
             .join("\n"),
       )
+    }
+    // Named-task mentions (tk-1): one line per OTHER task — name, last saver, age — and nothing
+    // else. The task's thread is a deliberate `mida task show <name>` away, never inlined.
+    if (options.otherTasks !== undefined && options.otherTasks.length > 0) {
+      parts.push(otherTasksBlock(options.otherTasks, (options.now ?? Date.now)()))
     }
     if (merged.missingEarlierSession) {
       parts.push("(An earlier session this one continued could not be read.)")
