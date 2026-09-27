@@ -35,6 +35,17 @@ const GRANT_LIFETIME_SECONDS = 30 * 24 * 60 * 60
 
 const SERVICE_DOWN = "the Mida service is not answering — run any `mida` command to start it"
 
+/**
+ * Folder-level refusal reasons → the line `mida_status` prints instead of an agent verdict —
+ * reproduced verbatim; the strings are the adapter's, not this package's to reword.
+ */
+const FOLDER_LINES: Record<string, string> = {
+  "not-a-project": "this folder is not a Mida project — no .mida marker found",
+  "folder-mismatch": "this folder's .mida marker belongs to a different folder — it was moved or copied",
+  "list-tampered": "the approved-projects list failed its signature check — run `mida doctor`",
+  "list-unreadable": "the approved-projects list could not be read — check the file's permissions",
+}
+
 const HEX_ID = /^0x[0-9a-fA-F]{64}$/
 const REFERENCE_RELATIONS = new Set(["supports", "derived_from", "confirmed_from"])
 
@@ -299,7 +310,8 @@ export class LocalTransport implements Transport {
       return { kind: "updates", text: record.note }
     }
     if (record.kind === "none") {
-      return { kind: "none", text: "" }
+      // the same line mida_whats_new prints for a none answer — an empty text would read as an error
+      return { kind: "none", text: "Mida: nothing new since the last check." }
     }
     throw new MidaSdkError("failed", "the Mida service returned a what's-new answer this SDK does not understand")
   }
@@ -333,31 +345,38 @@ export class LocalTransport implements Transport {
     )
     const kind = (probe.body as { kind?: unknown } | null)?.kind
     const reason = (probe.body as { reason?: unknown } | null)?.reason
+    // A refusal about the folder or the approval list is not a verdict on the agent — mida_status
+    // collapses those into one folder line; the same line stands in for the agent's verdict here.
+    const folderLine = typeof reason === "string" ? FOLDER_LINES[reason] : undefined
     const verdictLine =
-      probe.status === 0
-        ? `${this.#agent}: no answer from the daemon`
-        : kind === "handoff" || kind === "empty"
-          ? `${this.#agent}: approved for this folder`
-          : reason === "revoked"
-            ? `${this.#agent}: access revoked by the owner`
-            : reason === "general-assistance"
-              ? `${this.#agent}: a general assistant — it cannot read project context`
-              : reason === "not-approved"
-                ? `${this.#agent}: not approved for this folder`
-                : `${this.#agent}: cannot tell (${typeof reason === "string" ? reason : "bad reply"})`
+      folderLine !== undefined
+        ? folderLine
+        : probe.status === 0
+          ? `${this.#agent}: no answer from the daemon`
+          : kind === "handoff" || kind === "empty"
+            ? `${this.#agent}: approved for this folder`
+            : reason === "revoked"
+              ? `${this.#agent}: access revoked by the owner`
+              : reason === "general-assistance"
+                ? `${this.#agent}: a general assistant — it cannot read project context`
+                : reason === "not-approved"
+                  ? `${this.#agent}: not approved for this folder`
+                  : `${this.#agent}: cannot tell (${typeof reason === "string" ? reason : "bad reply"})`
     lines.push(verdictLine)
     const verdict: NonNullable<StatusAnswer["agent"]>["verdict"] =
-      probe.status === 0
+      folderLine !== undefined
         ? "unknown"
-        : kind === "handoff" || kind === "empty"
-          ? "approved"
-          : reason === "revoked"
-            ? "revoked"
-            : reason === "general-assistance"
-              ? "general-assistance"
-              : reason === "not-approved"
-                ? "not-approved"
-                : "unknown"
+        : probe.status === 0
+          ? "unknown"
+          : kind === "handoff" || kind === "empty"
+            ? "approved"
+            : reason === "revoked"
+              ? "revoked"
+              : reason === "general-assistance"
+                ? "general-assistance"
+                : reason === "not-approved"
+                  ? "not-approved"
+                  : "unknown"
     return { up: true, service, agent: { name: this.#agent, verdict }, text: lines.join("\n") }
   }
 }

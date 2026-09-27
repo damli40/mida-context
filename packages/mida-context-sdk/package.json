@@ -11,5 +11,10 @@
     "@mida/protocol": "workspace:*",
     "@mida/sdk": "workspace:*",
     "@noble/hashes": "2.4.0"
+  },
+  "devDependencies": {
+    "@mida/cli": "workspace:*",
+    "@mida/compiler": "workspace:*",
+    "@mida/midad": "workspace:*"
   }
 }

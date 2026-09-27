@@ -532,6 +532,16 @@ importers:
       '@noble/hashes':
         specifier: 2.4.0
         version: 2.4.0
+    devDependencies:
+      '@mida/cli':
+        specifier: workspace:*
+        version: link:../../apps/cli
+      '@mida/compiler':
+        specifier: workspace:*
+        version: link:../compiler
+      '@mida/midad':
+        specifier: workspace:*
+        version: link:../../apps/midad
 
   packages/protocol:
     dependencies:
