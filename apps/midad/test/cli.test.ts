@@ -1650,8 +1650,8 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
 describe("the dev launcher bin/mida (in-15 J-8)", () => {
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
 
-  const makeRoot = () => {
-    const root = mkdtempSync(join(tmpdir(), "mida-bin-"))
+  const makeRoot = (prefix = "mida-bin-") => {
+    const root = mkdtempSync(join(tmpdir(), prefix))
     mkdirSync(join(root, "bin"), { recursive: true })
     mkdirSync(join(root, "node_modules", "tsx", "dist"), { recursive: true })
     mkdirSync(join(root, "apps", "midad", "src"), { recursive: true })
@@ -1681,5 +1681,15 @@ describe("the dev launcher bin/mida (in-15 J-8)", () => {
     const loaded = await runLauncher(root)
     expect(loaded.code).toBe(0)
     expect(loaded.stdout).toContain("sentinel=found")
+  }, 60_000)
+
+  it("loads .env when the checkout path contains a space (in-16 K-5)", async () => {
+    // An unquoted $ENV_ARG split `--env-file=/tmp/mida bin/…/.env` at the space — node then saw a
+    // missing flag target and stray arguments. The quoted expansion passes it as one argument.
+    const root = makeRoot("mida bin space-")
+    writeFileSync(join(root, ".env"), "MIDA_J8_SENTINEL=spaced\n")
+    const loaded = await runLauncher(root)
+    expect(loaded.code).toBe(0)
+    expect(loaded.stdout).toContain("sentinel=spaced")
   }, 60_000)
 })

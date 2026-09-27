@@ -9,4 +9,4 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # --env-file target is missing. The flag is added only when the file is really there.
 ENV_ARG=
 if [ -f "$ROOT/.env" ]; then ENV_ARG="--env-file=$ROOT/.env"; fi
-exec node $ENV_ARG --import "$ROOT/node_modules/tsx/dist/loader.mjs" "$ROOT/apps/midad/src/cli.ts" "$@"
+exec node ${ENV_ARG:+"$ENV_ARG"} --import "$ROOT/node_modules/tsx/dist/loader.mjs" "$ROOT/apps/midad/src/cli.ts" "$@"
