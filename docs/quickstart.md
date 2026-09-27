@@ -448,3 +448,49 @@ The honest limit: Mida cannot judge a custom model's output quality. The benchma
 | Compile model | `deepseek` if `DEEPSEEK_API_KEY` is set, else `kimi`, else `claude-haiku` | `MIDA_COMPILE_MODEL` | — |
 
 `mida doctor` shows which are in effect — host names only, never values that could be secrets.
+
+## Troubleshooting (found in live runs)
+
+Each entry: what you see, what it means, what to do. First seen in the Sep 27, 2026 live test unless noted.
+
+**Claude Desktop: "MCP mida-claude-desktop: Server disconnected".**
+Look in `~/Library/Logs/Claude/mcp-server-mida-claude-desktop.log`. If it says
+`/bin/sh: …/bin/mida-mcp: Operation not permitted`, macOS is blocking Claude Desktop from reading the folder Mida
+runs from. macOS protects `~/Desktop`, `~/Documents` and `~/Downloads`. Terminal has access, so hook clients work;
+Claude Desktop is a separate app and does not. Fix one of two ways: give Claude Desktop access (System Settings →
+Privacy & Security → Files and Folders → Claude → turn on the folder, e.g. Desktop Folder), then quit Claude
+Desktop with Cmd-Q and reopen it; or run Mida from a folder outside those three (an npm global install puts
+`mida-mcp` outside them). Cursor and other desktop apps can hit the same wall.
+
+**`mida doctor`: "codex's hook block is an older version", right after you trusted the hooks in Codex.**
+A known false alarm. When you trust hooks, Codex writes its trust records (`[hooks.state]`, `trusted_hash`) inside
+Mida's marked block, and doctor compares the block byte for byte. Your hooks are installed and trusted. Do NOT run
+`mida install codex` again to "fix" it: that rewrites the block and deletes Codex's trust records (including other
+tools' records), so Codex asks you to trust everything again. A fix is coming.
+
+**"<agent>'s request has expired (a request lasts 5 minutes)".**
+Run `mida request <agent>`, then `mida approve <agent>` straight away. `mida install devin` files a request too; if
+you approve later than 5 minutes after it, request again first. (`mida doctor` may say "run `mida approve`" for an
+expired request; request first anyway. A fix is coming.)
+
+**`mida request <agent>` says "already approved on chain".**
+That agent already holds a grant. To use it in a new folder, run `mida approve <agent>` in that folder: it adds the
+folder, with no transaction and nothing to pay. This message exits with an error code, so a chain like
+`mida request a && mida request b` stops at it: run the commands one at a time.
+
+**`mida approve` sits at "sending the grant (about 5 seconds)…" for much longer.**
+Press Ctrl-C and run the same `mida approve` again. It asks the chain what the agent already holds before sending,
+so a grant that already landed is not sent twice. (A progress line and a timeout are coming.)
+
+**`mida doctor`: "midad runs … @ <old commit>; this command runs … @ <new commit>".**
+The Mida service is still the old version after an update. Run any `mida` command; it replaces the service.
+
+**`mida read <agent> <projectId>`: "project-mismatch: this folder is approved for …".**
+Each folder has its own project id, in `.mida/project.json`. Use that id, or run the command from the folder the
+project belongs to.
+
+**`mida doctor`: "store: local (this setup saved no store address)" / "sponsor: none — this setup pays its own gas".**
+A setup keeps the store and gas settings it was created with. New setups use the hosted store and the gas sponsor
+by default (the table above); a setup made before those defaults stays local and pays its own gas, so its earlier
+records stay where they are. Every grant and revoke then spends your wallet's testnet MON (about 0.09 MON per grant
+and 0.055 per revoke on Sep 27). Moving an existing setup to the hosted store is on the roadmap.
