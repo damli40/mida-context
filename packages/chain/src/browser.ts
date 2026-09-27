@@ -9,7 +9,7 @@
  * and are deliberately absent here so nothing can reach them transitively.
  */
 export * from "./abis.js"
-export { LOCAL_CHAIN_ID, MONAD_TESTNET_CHAIN_ID, chainFor, parseDeployment } from "./deployment.js"
+export { LOCAL_CHAIN_ID, MONAD_TESTNET_CHAIN_ID, MULTICALL3_ADDRESS, chainFor, parseDeployment } from "./deployment.js"
 export type { Deployment } from "./deployment.js"
 export * from "./logs.js"
 export * from "./history.js"
