@@ -35,8 +35,19 @@ export type { MigrateDeps, MigrateStep, MigrateUndoDeps } from "./migrate.js"
 export { CLI_COMMANDS, NEEDS_TERMINAL_LINE, OWNER_COMMANDS, USAGE, namespaceLabel, networkForCommand, ownerOnlyLine, ownerRefusalLine, runCli, runCliWithRuntime, runInstall, validCliArgv } from "./cli.js"
 export type { CliDeps } from "./cli.js"
 export * from "./queue.js"
-export { approveProject, approvalsFileStatus, canonicalEntries, checkProject, ensureProjectMarker, removeAgentApprovals, writeSignedApprovals } from "./projects.js"
-export type { ProjectApproval, ProjectCheck } from "./projects.js"
+export {
+  approveProject,
+  approvalsFileStatus,
+  canonicalEntries,
+  checkProject,
+  ensureProjectMarker,
+  linkProject,
+  planProjectLink,
+  removeAgentApprovals,
+  writeProjectMarker,
+  writeSignedApprovals,
+} from "./projects.js"
+export type { ListOwner, ProjectApproval, ProjectCheck, ProjectLinkPlan } from "./projects.js"
 export { FLUSH_EVENTS, drainerEnv, runHook, transcriptPathAllowed, transcriptRoots } from "./hook.js"
 export type { HookEvent } from "./hook.js"
 export { clearCodexHome, recordCodexHome, recordedCodexHome, resolveCodexHome, trustedCodexHome } from "./codex-home.js"

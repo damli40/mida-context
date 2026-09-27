@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { tmpdir } from "node:os"
@@ -9,7 +9,7 @@ import { BaseError, HttpRequestError } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
 import type { Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
@@ -1337,6 +1337,128 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     expect(ownerRefusalLine("request", "codex", already, undefined, undefined, home)).toBe(
       "codex is already approved on chain. To use it in THIS folder, run `mida approve codex` here (no transaction, nothing to pay).",
     )
+  })
+
+  /**
+   * lk-1 — `mida link` runs where the owner typed it: folder B joins the project the named
+   * folder belongs to. Rows are owner-signed local data, so these tests need no chain and no
+   * `mida init`: a fresh home's owner address comes from the local key file.
+   */
+  const folderHome = (prefix: string) => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), prefix)))
+    const owner = {
+      home,
+      owner: privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey).address,
+    } as unknown as Runtime
+    const network = { deployment: { capabilityRegistry: REGISTRY } } as unknown as Network
+    return { home, owner, network }
+  }
+
+  it("mida link writes B's marker with A's project id and one signed row per approved agent (lk-1)", async () => {
+    const { home, owner, network } = folderHome("mida-link-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-link-a-"))
+    const dirB = mkdtempSync(join(tmpdir(), "mida-link-b-"))
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-link" }))
+    await approveProject(owner, { agent: "claude-code", cwd: dirA })
+    await approveProject(owner, { agent: "codex", cwd: dirA })
+
+    const lines: string[] = []
+    const asked: string[] = []
+    const runB = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, cwd: dirB, print: (line) => lines.push(line),
+        prompt: async (question) => { asked.push(question); return "yes" },
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await runB("link", dirA)).toBe(0)
+    // the owner saw the project, A's marker folder, B's canonical path and the agents — then typed yes
+    expect(asked).toEqual(["Type yes to link: "])
+    expect(lines.some((line) => line.includes("p-link"))).toBe(true)
+    expect(lines.some((line) => line.includes("claude-code") && line.includes("codex"))).toBe(true)
+    expect(lines.at(-1)).toBe(`linked ${realpathSync(dirB)} to project p-link for claude-code, codex`)
+    // B's own marker now names A's project
+    const marker = JSON.parse(readFileSync(join(dirB, ".mida", "project.json"), "utf8")) as { projectId: string }
+    expect(marker.projectId).toBe("p-link")
+    // one signed row per agent that was approved for A — verified through the security gate
+    expect(await checkProject(owner, { agent: "claude-code", cwd: dirB })).toMatchObject({ ok: true })
+    expect(await checkProject(owner, { agent: "codex", cwd: dirB })).toMatchObject({ ok: true })
+
+    // already linked: same answer as approve's no-op — exit 0, nothing changes
+    lines.length = 0
+    expect(await runB("link", dirA)).toBe(0)
+    expect(lines.at(-1)).toContain("already linked")
+  })
+
+  it("mida link needs a real terminal, is refused through the daemon, and 'no' writes nothing (lk-1)", async () => {
+    const { home, owner, network } = folderHome("mida-linkref-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-linkref-a-"))
+    const dirB = mkdtempSync(join(tmpdir(), "mida-linkref-b-"))
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-lref" }))
+    await approveProject(owner, { agent: "claude-code", cwd: dirA })
+
+    // an agent-launched or scripted run never gets the ask
+    const refused: string[] = []
+    expect(await runCli(["link", dirA], {
+      home, network, cwd: dirB, print: (line) => refused.push(line),
+      prompt: async () => "yes", stdinIsTTY: false, stdoutIsTTY: true,
+    })).toBe(2)
+    expect(refused).toEqual([NEEDS_TERMINAL_LINE])
+    // through the daemon's /cli route it is refused like every owner command
+    const daemonLines: string[] = []
+    const stub = { home: new MidaHome(mkdtempSync(join(tmpdir(), "mida-link-stub-"))) } as unknown as ServiceRuntime
+    expect(await runCliWithRuntime(["link", dirA], stub, (line) => daemonLines.push(line))).toBe(2)
+    expect(daemonLines[0]).toContain("mida link")
+    // an answer other than yes leaves B exactly as it was
+    const out: string[] = []
+    expect(await runCli(["link", dirA], {
+      home, network, cwd: dirB, print: (line) => out.push(line),
+      prompt: async () => "no", stdinIsTTY: true, stdoutIsTTY: true,
+    })).toBe(1)
+    expect(out).toContain("not approved")
+    expect(existsSync(join(dirB, ".mida"))).toBe(false)
+  })
+
+  it("mida link refuses: no project on the named folder, B IS A, B's own different project (lk-1)", async () => {
+    const { home, network } = folderHome("mida-linkx-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-linkx-a-"))
+    const bare = mkdtempSync(join(tmpdir(), "mida-linkx-bare-"))
+    const dirC = mkdtempSync(join(tmpdir(), "mida-linkx-c-"))
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-lx" }))
+    mkdirSync(join(dirC, ".mida"))
+    writeFileSync(join(dirC, ".mida", "project.json"), JSON.stringify({ projectId: "p-c-own" }))
+    const out: string[] = []
+    const runIn = (cwd: string, ...argv: string[]) =>
+      runCli(argv, {
+        home, network, cwd, print: (line) => out.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // <folder> names no project — nothing to join
+    expect(await runIn(bare, "link", bare)).toBe(1)
+    expect(out.at(-1)).toContain("no .mida/project.json")
+    // B IS A — the folder already is the project's marker folder
+    expect(await runIn(dirA, "link", dirA)).toBe(1)
+    expect(out.at(-1)).toContain("already IS")
+    // B already carries its own marker for a different project — link would hijack it
+    expect(await runIn(dirC, "link", dirA)).toBe(1)
+    expect(out.at(-1)).toContain("mida unlink")
+    // and none of the refusals wrote a marker anywhere new
+    expect(existsSync(join(bare, ".mida"))).toBe(false)
+  })
+
+  it("mida link with the wrong argument count is usage, like every command (lk-1)", async () => {
+    const { home, network } = folderHome("mida-linkuse-home-")
+    const out: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, cwd: mkdtempSync(join(tmpdir(), "mida-linkuse-")), print: (line) => out.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await run2("link")).toBe(2)
+    expect(await run2("link", "a", "b")).toBe(2)
+    expect(out.filter((line) => line === USAGE)).toHaveLength(2)
   })
 })
 

@@ -5,7 +5,8 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createInterface } from "node:readline"
 import { decodeUint64, isMidaError, namespaceById } from "@mida/protocol"
-import type { Hex, RequestedScope } from "@mida/protocol"
+import type { Address, Hex, RequestedScope } from "@mida/protocol"
+import { privateKeyToAccount } from "viem/accounts"
 import type { Deployment } from "@mida/chain"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { permissionNames } from "@mida/grant-advisor"
@@ -20,8 +21,13 @@ import { drainerEnv } from "./hook.js"
 import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, uninstallClaudeCode, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
 import { resolveDevinConfigPath } from "./devin-facts.js"
 import type { InstallTool, McpClientTool } from "./install.js"
-import { checkProject, ensureProjectMarker } from "./projects.js"
-import type { ProjectCheck } from "./projects.js"
+import {
+  checkProject,
+  ensureProjectMarker,
+  linkProject,
+  planProjectLink,
+} from "./projects.js"
+import type { ListOwner, ProjectCheck } from "./projects.js"
 import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, factShortId, factStamp, readOwnerFacts, remember, resolveFactId } from "./remember.js"
 import type { FactNamespace } from "./remember.js"
@@ -31,7 +37,7 @@ import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag }
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
 import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, pendingApprovalAdvice, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint } from "./skeleton.js"
-import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOwnerMode } from "./keys.js"
+import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerMode } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
 import { migrate, migrateUndo } from "./migrate.js"
 import { OwnerLinkOutcome, approvePasskey, initPasskey, provisionPasskeyAgents, revokePasskey } from "./owner-link/flows.js"
@@ -59,18 +65,19 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
  */
 const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]" +
+  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | batching on|off | migrate [--undo]" +
   "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or the identity a client installs)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
-export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", ...WITH_AGENT]
+export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", "link", ...WITH_AGENT]
 /**
- * The commands that change who has access. Only `mida` in the owner's own terminal may run them —
- * they open the owner runtime in-process and are never sent to the daemon socket. `install` for
- * an MCP client belongs here: it registers that client's identity on the chain.
+ * The commands that change who has access — or which folder belongs to which project. Only `mida`
+ * in the owner's own terminal may run them: they never go to the daemon socket. `install` for an
+ * MCP client belongs here: it registers that client's identity on the chain. `link` signs only
+ * the owner list — it never opens the runtime.
  */
-export const OWNER_COMMANDS: readonly string[] = ["init", "install", "approve", "revoke", "remember", "migrate", "batching"]
+export const OWNER_COMMANDS: readonly string[] = ["init", "install", "approve", "revoke", "remember", "migrate", "batching", "link"]
 /** The owner commands that must see a real terminal. `init` is exempt: it grants nothing to an agent. */
-const TERMINAL_COMMANDS: readonly string[] = ["install", "approve", "revoke", "remember", "migrate", "batching"]
+const TERMINAL_COMMANDS: readonly string[] = ["install", "approve", "revoke", "remember", "migrate", "batching", "link"]
 export const NEEDS_TERMINAL_LINE = "needs-terminal: run this yourself in a terminal window"
 
 /** What the daemon answers when an owner command reaches /cli anyway. */
@@ -412,6 +419,84 @@ export async function runCliWithRuntime(
       print(`refused: ${code}`)
     }
     if (context?.debug === true) print(debugLine(error))
+    return 1
+  }
+}
+
+/**
+ * The `{ home, owner }` the folder commands sign the approved-projects list with — never the
+ * owner runtime. Signing is local cryptography, so link, unlink and project new run with no
+ * chain in reach: the owner address comes from the saved file or the key the file names.
+ */
+function listOwnerFor(home: MidaHome): ListOwner {
+  return {
+    home,
+    owner: loadOwnerAddress(home) ?? privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey).address,
+  }
+}
+
+/**
+ * The folder commands (lk-1): `link <folder>` joins this folder to the project <folder> belongs
+ * to, `unlink` takes this folder back out, `project new` starts a separate project here. They
+ * run in the `mida` process like every owner command — but sign only the owner-signed list or a
+ * folder marker, so they open no runtime and reach no chain at all.
+ */
+async function runFolderCommand(argv: string[], deps: CliDeps): Promise<number> {
+  const command = argv[0]!
+  const usage = () => {
+    deps.print(USAGE)
+    return 2
+  }
+  const cwd = deps.cwd ?? process.cwd()
+  const prompt = deps.prompt ?? terminalPrompt
+  const drain = deps.drainInput ?? drainBufferedStdin
+  const askYes = async (question: string): Promise<boolean> => {
+    await drain()
+    return (await prompt(question)).trim() === "yes"
+  }
+  let ownerAddress: Address | undefined
+  try {
+    if (command === "link") {
+      if (argv.length !== 2) return usage()
+      const owner = listOwnerFor(deps.home)
+      ownerAddress = owner.owner
+      const plan = await planProjectLink(owner, { folder: argv[1]!, cwd, homeDir: deps.homeDir })
+      if (plan.kind === "refused") {
+        deps.print(plan.message)
+        return 1
+      }
+      if (plan.kind === "already") {
+        deps.print(`already linked to project ${plan.projectId} — nothing to change`)
+        return 0
+      }
+      // what the owner is confirming: the project, its marker folder, this folder's canonical
+      // path, and every agent that will be allowed to work here
+      deps.print(`project ${plan.projectId} — its marker is ${plan.sourceRoot}`)
+      deps.print(`linking ${plan.root}`)
+      deps.print(
+        plan.agents.length === 0
+          ? "no agent is approved for this project yet — run `mida approve <agent>` in it after linking"
+          : `agents allowed to work in ${plan.root}: ${plan.agents.join(", ")}`,
+      )
+      if (!(await askYes("Type yes to link: "))) {
+        deps.print("not approved")
+        return 1
+      }
+      const result = await linkProject(owner, { projectId: plan.projectId, dir: plan.root })
+      deps.print(`linked ${result.root} to project ${plan.projectId} for ${result.agents.length === 0 ? "no agents yet" : result.agents.join(", ")}`)
+      if (result.droppedRows !== 0) {
+        deps.print(
+          result.droppedRows === null
+            ? "note: the approved-projects list failed its signature check — its unverifiable rows were dropped"
+            : `note: the approved-projects list failed its signature check — ${result.droppedRows} row(s) it held could not be trusted and were dropped`,
+        )
+      }
+      return 0
+    }
+    return usage()
+  } catch (error) {
+    deps.print(ownerRefusalLine(command, argv[1] ?? "", error, ownerAddress, deps.network.deployment.capabilityRegistry, deps.home))
+    if (process.env.MIDA_DEBUG === "1") deps.print(debugLine(error))
     return 1
   }
 }
@@ -1386,6 +1471,20 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
       if (process.env.MIDA_DEBUG === "1") deps.print(debugLine(error))
       return 1
     }
+  }
+  // `mida link` (lk-1) is local work — it re-signs only the owner-signed list — so it runs
+  // before the runtime opens and never reaches the chain. A passkey home cannot sign the list
+  // (the page's sign path carries a different shape), so link refuses plainly there.
+  if (command === "link") {
+    if (loadOwnerMode(deps.home) === "passkey") {
+      deps.print(`${command} is not available with a passkey owner yet`)
+      return 2
+    }
+    const code = await runFolderCommand(argv, deps)
+    if (code === 0) {
+      await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
+    }
+    return code
   }
   const mode = loadOwnerMode(deps.home)
   const passkeyInit = command === "init" && argv[1] === "--passkey"

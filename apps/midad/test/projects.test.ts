@@ -5,7 +5,8 @@ import { join } from "node:path"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import type { Hex } from "@mida/protocol"
 import {
-  MidaHome, approveProject, approvalsFileStatus, canonicalEntries, checkProject, loadOrCreateOwnerSecrets, removeAgentApprovals,
+  MidaHome, approveProject, approvalsFileStatus, canonicalEntries, checkProject, linkProject, loadOrCreateOwnerSecrets,
+  planProjectLink, removeAgentApprovals,
 } from "@mida/midad"
 import type { ProjectApproval, Runtime } from "@mida/midad"
 
@@ -319,5 +320,152 @@ describe("removeAgentApprovals", () => {
     expect(await checkProject(runtime, { agent: "claude-code", cwd: dirC })).toMatchObject({ ok: true })
     // the row that was there before the tamper is gone too — nothing unverifiable is kept
     expect(await checkProject(runtime, { agent: "claude-code", cwd: dirA })).toEqual({ ok: false, reason: "not-approved" })
+  })
+})
+
+/**
+ * lk-1 — `mida link` puts a second folder under an existing project: B's own marker takes the
+ * project's id and the signed list gains one row per agent the project already allows. The list
+ * is owner-signed local data, so the same stub runtime drives every step — no chain anywhere.
+ */
+describe("mida link — a second folder joins an existing project (lk-1)", () => {
+  const entriesOf = (home: MidaHome) => home.readJson<{ entries: ProjectApproval[] }>(LIST)!.entries
+
+  it("B gets A's project id, one signed row per approved agent, and every pre-existing row is untouched", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b"); const other = join(dir, "other")
+    mark(dirA, "p-a"); mark(other, "p-x")
+    mkdirSync(dirB)
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    await approveProject(runtime, { agent: "codex", cwd: dirA })
+    // an agent approved somewhere else must not gain a row in B
+    await approveProject(runtime, { agent: "gemini", cwd: other })
+    const before = entriesOf(home)
+
+    const plan = await planProjectLink(runtime, { folder: dirA, cwd: dirB })
+    expect(plan).toMatchObject({ kind: "ok", projectId: "p-a", agents: ["claude-code", "codex"] })
+    const linked = await linkProject(runtime, { projectId: "p-a", dir: dirB })
+    expect(linked.added).toEqual(["claude-code", "codex"])
+
+    // B now carries A's project id
+    const marker = JSON.parse(readFileSync(join(dirB, ".mida", "project.json"), "utf8")) as { projectId: string }
+    expect(marker.projectId).toBe("p-a")
+    const rows = entriesOf(home).filter((e) => e.root === realpathSync(dirB))
+    expect(rows.map((e) => e.agent).sort()).toEqual(["claude-code", "codex"])
+    expect(rows.every((e) => e.projectId === "p-a")).toBe(true)
+    // every row that was there before is untouched — other projects and folders included
+    expect(entriesOf(home).filter((e) => e.root !== realpathSync(dirB))).toEqual(before)
+    // the list still verifies, and the security gate now answers ok in B — including a subfolder
+    expect(await approvalsFileStatus(home, runtime.owner)).toBe("signed")
+    expect(await checkProject(runtime, { agent: "claude-code", cwd: dirB })).toMatchObject({ ok: true })
+    const nested = join(dirB, "nested")
+    mkdirSync(nested)
+    expect(await checkProject(runtime, { agent: "claude-code", cwd: nested })).toMatchObject({ ok: true })
+    // gemini was approved for a different project — B refuses it as before
+    expect(await checkProject(runtime, { agent: "gemini", cwd: dirB })).toEqual({ ok: false, reason: "not-approved" })
+  })
+
+  it("refuses when the named folder is not inside a project — and when it does not exist at all", async () => {
+    const { dir, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mkdirSync(dirA); mkdirSync(dirB)
+    expect(await planProjectLink(runtime, { folder: dirA, cwd: dirB })).toMatchObject({ kind: "refused", code: "no-project" })
+    // a typo'd path refuses too — it must not silently resolve to a parent's project
+    expect(await planProjectLink(runtime, { folder: join(dir, "ghost"), cwd: dirB })).toMatchObject({ kind: "refused", code: "no-project" })
+    expect(existsSync(join(dirB, ".mida"))).toBe(false)
+  })
+
+  it("refuses to link the folder to itself — B IS A once both paths are canonical", async () => {
+    const { dir, runtime } = setup()
+    const dirA = join(dir, "a"); mark(dirA, "p-a")
+    const alias = join(dir, "alias-of-a")
+    symlinkSync(dirA, alias)
+    expect(await planProjectLink(runtime, { folder: dirA, cwd: dirA })).toMatchObject({ kind: "refused", code: "same-folder" })
+    // the named folder spelled through a symlink lands on the same canonical folder
+    expect(await planProjectLink(runtime, { folder: alias, cwd: dirA })).toMatchObject({ kind: "refused", code: "same-folder" })
+  })
+
+  it("refuses when B already carries its own marker for a DIFFERENT project — nothing written", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mark(dirB, "p-b")
+    expect(await planProjectLink(runtime, { folder: dirA, cwd: dirB })).toMatchObject({ kind: "refused", code: "different-project" })
+    // B's marker still names its own project — the refusal wrote nothing
+    const marker = JSON.parse(readFileSync(join(dirB, ".mida", "project.json"), "utf8")) as { projectId: string }
+    expect(marker.projectId).toBe("p-b")
+    expect(home.has(LIST)).toBe(false)
+  })
+
+  it("refuses to preview a link when the signed list cannot be read", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mkdirSync(dirB)
+    writeFileSync(home.path(LIST), "{not json")
+    expect(await planProjectLink(runtime, { folder: dirA, cwd: dirB })).toMatchObject({ kind: "refused", code: "list-unreadable" })
+    expect(existsSync(join(dirB, ".mida"))).toBe(false)
+  })
+
+  it("a second link into the same project is the no-op the owner is told about", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mkdirSync(dirB)
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    await linkProject(runtime, { projectId: "p-a", dir: dirB })
+    expect(entriesOf(home)).toHaveLength(2)
+    expect(await planProjectLink(runtime, { folder: dirA, cwd: dirB })).toMatchObject({ kind: "already", projectId: "p-a" })
+    expect(entriesOf(home)).toHaveLength(2)
+  })
+
+  it("a relative spelling of <folder> joins the same project — B's row is still its realpath", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mkdirSync(dirB)
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    const plan = await planProjectLink(runtime, { folder: "../a", cwd: dirB })
+    expect(plan).toMatchObject({ kind: "ok", projectId: "p-a" })
+    const linked = await linkProject(runtime, { projectId: "p-a", dir: dirB })
+    expect(linked.root).toBe(realpathSync(dirB))
+    expect(entriesOf(home).filter((e) => e.root === realpathSync(dirB))).toHaveLength(1)
+  })
+
+  it("a tilde spelling of <folder> expands against the home dir before the marker walk", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mkdirSync(dirB)
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    expect(await planProjectLink(runtime, { folder: "~/a", cwd: dirB, homeDir: dir })).toMatchObject({ kind: "ok", projectId: "p-a" })
+    expect(await planProjectLink(runtime, { folder: "~/nope", cwd: dirB, homeDir: dir })).toMatchObject({ kind: "refused", code: "no-project" })
+  })
+
+  it("linking through a symlinked cwd signs the realpath row — a second spelling adds nothing", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mkdirSync(dirB)
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    const link = join(dir, "b-link")
+    symlinkSync(dirB, link)
+    const linked = await linkProject(runtime, { projectId: "p-a", dir: link })
+    expect(linked.root).toBe(realpathSync(dirB))
+    expect(entriesOf(home)).toHaveLength(2)
+    // the same folder through its real path is already linked — no second row, no second marker write needed
+    expect(await planProjectLink(runtime, { folder: dirA, cwd: dirB })).toMatchObject({ kind: "already" })
+    expect(entriesOf(home)).toHaveLength(2)
+  })
+
+  const caseInsensitive = (() => {
+    const probe = mkdtempSync(join(realpathSync(tmpdir()), "mida-LkCi-"))
+    return existsSync(probe.toLowerCase())
+  })()
+
+  it.skipIf(!caseInsensitive)("a case-only spelling of the same folder adds no second row (in-6 R6 rule)", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "MiXeD-B")
+    mark(dirA, "p-a"); mkdirSync(dirB)
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    await linkProject(runtime, { projectId: "p-a", dir: join(dir, "mixed-b") })
+    expect(entriesOf(home)).toHaveLength(2)
+    // already linked through the other case — nothing to add
+    expect(await planProjectLink(runtime, { folder: dirA, cwd: dirB })).toMatchObject({ kind: "already" })
+    expect(entriesOf(home)).toHaveLength(2)
   })
 })
