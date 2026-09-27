@@ -1069,6 +1069,10 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
       return `this folder cannot hold a project — run \`mida approve ${agent}\` inside the project's folder`
     case "list-unreadable":
       return "the approved-projects list could not be read — check the file's permissions"
+    // The plan refuses a tampered list before the ask, so reaching this means the file broke
+    // mid-command — the answer is still the same: nothing was written by this run.
+    case "list-tampered":
+      return "the approved-projects list failed its signature check — run `mida doctor`"
     case "SPONSOR_PENDING": {
       // The call was accepted by the sponsor but its receipt never confirmed — resending would be
       // the double-send this error exists to prevent, so the line says where it stands and how to
