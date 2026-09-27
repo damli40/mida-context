@@ -17,7 +17,7 @@ import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
 import { generalAssistanceText, identityUnreadableText, isGeneralAssistant, noIdentityText, projectCheckRefusal } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
-import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installDevin, installMcpClient, uninstallClaudeCode, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
+import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, uninstallClaudeCode, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
 import { resolveDevinConfigPath } from "./devin-facts.js"
 import type { InstallTool, McpClientTool } from "./install.js"
 import { checkProject, ensureProjectMarker } from "./projects.js"
@@ -163,6 +163,15 @@ export interface CliDeps {
   claudeDesktopConfig?: string
   /** Devin's config file — `mida install devin` merges the hook block into it. Tests inject a temp path. */
   devinConfig?: string
+  /**
+   * The account home and OS platform the macOS privacy note judges the launcher path against —
+   * macOS protects <home>/Desktop, Documents and Downloads from ungranted apps (in-15 J-7).
+   * `launcherPath` overrides the path checked; the default is the launcher install writes.
+   * Tests inject all three so the note's firing does not depend on where this checkout lives.
+   */
+  homeDir?: string
+  platform?: NodeJS.Platform
+  launcherPath?: string
 }
 
 /**
@@ -550,6 +559,13 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       // the per-workspace mcp.json carries personal absolute paths (the launcher, the home) —
       // committing it would leak the machine's layout to anyone reading the repo
       if (client === "cursor") deps.print("heads-up: .cursor/mcp.json holds absolute paths from this machine — do not commit it")
+      const protectedNote = macosProtectedFolderNote(
+        client,
+        deps.launcherPath ?? mcpLauncherPath(),
+        deps.homeDir ?? homedir(),
+        deps.platform ?? process.platform,
+      )
+      if (protectedNote !== undefined) deps.print(protectedNote)
       deps.print(`next: run \`mida approve ${client}\` in this folder`)
     } else if (command === "batching") {
       return await runBatching(runtime, argv[1], deps)
@@ -1094,6 +1110,13 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
           deps.print(outcome === "already-installed" ? "already installed" : "installed")
         }
         if (client === "cursor") deps.print("heads-up: .cursor/mcp.json holds absolute paths from this machine — do not commit it")
+        const protectedNote = macosProtectedFolderNote(
+          client,
+          deps.launcherPath ?? mcpLauncherPath(),
+          deps.homeDir ?? homedir(),
+          deps.platform ?? process.platform,
+        )
+        if (protectedNote !== undefined) deps.print(protectedNote)
         deps.print(`next: run \`mida approve ${client}\` in this folder`)
         return 0
       } finally {

@@ -1,5 +1,5 @@
 import { accessSync, constants, existsSync, mkdtempSync, readFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { homedir, tmpdir } from "node:os"
 import { dirname, isAbsolute, join } from "node:path"
 import { spawn } from "node:child_process"
 import { createPublicClient, http } from "viem"
@@ -21,8 +21,8 @@ import { codeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
 import { DEVIN_NODE_SQLITE_MIN } from "./devin-facts.js"
 import { drainerEnv } from "./hook.js"
-import { CODEX_TRUST_SENTENCE, claudeHooksStatus, codexHooksStatus, devinHooksStatus, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
-import type { InstallTool } from "./install.js"
+import { CODEX_TRUST_SENTENCE, claudeDesktopConfigPath, claudeHooksStatus, codexHooksStatus, cursorMcpConfigPath, devinHooksStatus, installedMcpLauncherPath, macosProtectedFolderNote, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
+import type { InstallTool, McpClientTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
 import { approvalsFileStatus } from "./projects.js"
@@ -44,6 +44,16 @@ export interface DoctorDeps {
   print(line: string): void
   /** Each tool's real config path — built only inside cli.ts main(); tests pass temp paths. */
   settings?: Partial<Record<InstallTool, string>>
+  /**
+   * Each MCP client's config path for the protected-folder note (in-15 J-7). Defaults: Claude
+   * Desktop's account-level config under `homeDir`, Cursor's `.cursor/mcp.json` under `cwd`.
+   */
+  mcpConfigs?: Partial<Record<McpClientTool, string>>
+  /** The account home and OS platform the protected-folder note is judged on — tests inject both. */
+  homeDir?: string
+  platform?: NodeJS.Platform
+  /** Where Cursor's `.cursor/mcp.json` is looked for; default process.cwd(). */
+  cwd?: string
   /** Shell environment for the API-key check; default process.env. Values are never printed. */
   env?: NodeJS.ProcessEnv
   /** node:sqlite probe for the devin check — injectable since a test cannot uninstall a builtin. */
@@ -671,6 +681,29 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           }
         }
         return lines.length === 0 ? ["ok: no hook paths to check"] : lines
+      },
+    },
+    {
+      // in-15 J-7: an installed MCP entry whose launcher sits under a macOS-protected folder
+      // cannot be spawned by the app — Claude Desktop showed "Server disconnected" while
+      // Terminal-run hooks worked. The note is the same line install prints. An absent entry
+      // or a non-macOS platform earns no line.
+      name: "mcp-clients",
+      run: async () => {
+        const homeDir = deps.homeDir ?? homedir()
+        const platform = deps.platform ?? process.platform
+        const entries: [McpClientTool, string][] = [
+          ["claude-desktop", deps.mcpConfigs?.["claude-desktop"] ?? claudeDesktopConfigPath(homeDir)],
+          ["cursor", deps.mcpConfigs?.cursor ?? cursorMcpConfigPath(deps.cwd ?? process.cwd())],
+        ]
+        const lines: string[] = []
+        for (const [client, configPath] of entries) {
+          const commandPath = installedMcpLauncherPath(client, configPath, home.root)
+          if (commandPath === undefined) continue
+          const note = macosProtectedFolderNote(client, commandPath, homeDir, platform)
+          if (note !== undefined) lines.push(note)
+        }
+        return lines
       },
     },
     {

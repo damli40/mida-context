@@ -882,6 +882,73 @@ describe("mida doctor names a store that predates the pending-revoke check", () 
   })
 })
 
+// in-15 J-7 — the same warning install prints, repeated for an entry that is already installed:
+// a launcher under a macOS-protected folder cannot be spawned by the app, so the entry shows
+// "Server disconnected". Platform and home are injected; nothing here touches the real ~/Library.
+describe("mida doctor warns about an MCP launcher inside a macOS-protected folder (in-15 J-7)", () => {
+  const writeConfig = (config: string, launcher: string, midaHome: string) => {
+    mkdirSync(dirname(config), { recursive: true })
+    writeFileSync(
+      config,
+      JSON.stringify({
+        mcpServers: {
+          "mida-claude-desktop": {
+            command: launcher,
+            args: ["--as", "claude-desktop", "--project", "/work"],
+            env: { MIDA_HOME: midaHome },
+          },
+        },
+      }),
+    )
+  }
+
+  const doctorLines = async (deps: { config: string; fakeHome: string; platform: NodeJS.Platform; home: MidaHome }): Promise<string[]> => {
+    const lines: string[] = []
+    await runDoctor({
+      home: deps.home,
+      print: (line) => lines.push(line),
+      env: {},
+      daemonProbeMs: 50,
+      mcpConfigs: { "claude-desktop": deps.config, cursor: join(dir(), "no-cursor", "mcp.json") },
+      homeDir: deps.fakeHome,
+      platform: deps.platform,
+    })
+    return lines
+  }
+
+  it("an installed entry under ~/Desktop prints the fix; off macOS or outside the folders it is silent", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "mida-macos-home-"))
+    const home = new MidaHome(join(dir(), "home"))
+    const protectedLauncher = join(fakeHome, "Desktop", "mida-context", "bin", "mida-mcp")
+    const config = join(dir(), "claude_desktop_config.json")
+    writeConfig(config, protectedLauncher, home.root)
+
+    const darwin = await doctorLines({ config, fakeHome, platform: "darwin", home })
+    expect(darwin).toContain(
+      `note: macOS protects ~/Desktop, ~/Documents and ~/Downloads — the mida-claude-desktop launcher ` +
+        `is inside one at ${protectedLauncher}, so macOS may block Claude Desktop from running it: ` +
+        `grant Claude Desktop access in System Settings → Privacy & Security → Files and Folders, or run Mida outside those folders`,
+    )
+    const linux = await doctorLines({ config, fakeHome, platform: "linux", home })
+    expect(linux.every((line) => !line.includes("macOS protects"))).toBe(true)
+
+    const outside = join(fakeHome, "opt", "mida", "bin", "mida-mcp")
+    writeConfig(config, outside, home.root)
+    const outsideLines = await doctorLines({ config, fakeHome, platform: "darwin", home })
+    expect(outsideLines.every((line) => !line.includes("macOS protects"))).toBe(true)
+  })
+
+  it("an entry Mida did not write is not judged", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "mida-macos-home-"))
+    const home = new MidaHome(join(dir(), "home"))
+    const config = join(dir(), "claude_desktop_config.json")
+    // a same-name entry belonging to another Mida home — doctor must not claim it
+    writeConfig(config, join(fakeHome, "Desktop", "other", "bin", "mida-mcp"), "/some/other/home")
+    const lines = await doctorLines({ config, fakeHome, platform: "darwin", home })
+    expect(lines.every((line) => !line.includes("macOS protects"))).toBe(true)
+  })
+})
+
 // in-15 J-3 — Sep 27 live: doctor printed "devin asked but is not approved — run mida approve
 // devin" for a request whose five-minute window had already closed; approve then refused
 // REQUEST_EXPIRED. The expired ask gets its own advice: a fresh request, then approve right away.

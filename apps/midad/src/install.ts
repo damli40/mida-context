@@ -1,5 +1,5 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
-import { basename, dirname, isAbsolute, join } from "node:path"
+import { basename, dirname, isAbsolute, join, sep } from "node:path"
 import { randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { isDeepStrictEqual } from "node:util"
@@ -60,7 +60,7 @@ export const cursorMcpConfigPath = (cwd: string): string => join(cwd, ".cursor",
  * The mcp launcher. Bundled the dist file is the executable entry; from source the sh launcher
  * is the path a client can spawn without a Mida PATH.
  */
-function mcpServerCommand(): string {
+export function mcpLauncherPath(): string {
   if (isBundled()) return siblingEntryPath("mida-mcp")
   return fileURLToPath(new URL("../../../bin/mida-mcp", import.meta.url))
 }
@@ -68,7 +68,7 @@ function mcpServerCommand(): string {
 /** The entry written into the client's mcpServers — absolute launcher, own identity, its home. */
 function mcpServerEntry(client: McpClientTool, homeRoot: string, cwd: string): Record<string, unknown> {
   return {
-    command: mcpServerCommand(),
+    command: mcpLauncherPath(),
     // Cursor substitutes ${workspaceFolder} itself; Claude Desktop has no workspace variable, so
     // its project is the folder `mida install` ran in
     args: ["--as", client, "--project", client === "cursor" ? "${workspaceFolder}" : cwd],
@@ -163,6 +163,51 @@ export function uninstallMcpClient(client: McpClientTool, configPath: string, ho
   }
   writeFileAtomic(configPath, `${JSON.stringify(config, null, detectIndent(text))}\n`)
   return "uninstalled"
+}
+
+/**
+ * The command an installed Mida entry runs — undefined when the client has no Mida entry or the
+ * config cannot be read as one. Doctor uses this to judge the path the app actually spawns: a
+ * moved checkout's stale launcher is what macOS blocks, not the path this checkout would write.
+ */
+export function installedMcpLauncherPath(client: McpClientTool, configPath: string, homeRoot?: string): string | undefined {
+  const read = readMcpConfig(configPath)
+  if (read === "absent") return undefined
+  const entry = ((read.config.mcpServers ?? {}) as Record<string, unknown>)[MCP_SERVER_NAME[client]]
+  if (!isMidaServerEntry(entry, client, homeRoot)) return undefined
+  return isPlainObject(entry) && typeof entry.command === "string" ? entry.command : undefined
+}
+
+/** The folders macOS hides from apps that lack Files and Folders access. */
+export const MACOS_PROTECTED_FOLDERS = ["Desktop", "Documents", "Downloads"] as const
+
+const MACOS_APP_NAME: Record<McpClientTool, string> = {
+  "claude-desktop": "Claude Desktop",
+  "cursor": "Cursor",
+}
+
+/**
+ * The one warning install prints and doctor repeats (in-15 J-7): when the launcher a client
+ * spawns sits inside a folder macOS protects, the app cannot exec it — the Sep 27 live failure,
+ * "Operation not permitted" in the client's MCP log, showing as "Server disconnected" — while
+ * Terminal-spawned hook clients run fine because Terminal holds the grant. The line names both
+ * fixes. Off macOS, or outside the three folders, there is nothing to warn about.
+ */
+export function macosProtectedFolderNote(
+  client: McpClientTool,
+  commandPath: string,
+  homeDir: string,
+  platform: NodeJS.Platform,
+): string | undefined {
+  if (platform !== "darwin") return undefined
+  const protectedDirs = MACOS_PROTECTED_FOLDERS.map((name) => join(homeDir, name))
+  if (!protectedDirs.some((dir) => commandPath === dir || commandPath.startsWith(`${dir}${sep}`))) return undefined
+  const app = MACOS_APP_NAME[client]
+  return (
+    `note: macOS protects ~/Desktop, ~/Documents and ~/Downloads — the ${MCP_SERVER_NAME[client]} launcher ` +
+    `is inside one at ${commandPath}, so macOS may block ${app} from running it: grant ${app} access in ` +
+    `System Settings → Privacy & Security → Files and Folders, or run Mida outside those folders`
+  )
 }
 
 /** Characters safe to leave unquoted in a command line — anything else is double-quoted. */

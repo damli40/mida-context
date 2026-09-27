@@ -215,6 +215,54 @@ describe("the crude mida command", () => {
     expect(lines.filter((line) => line.includes(".cursor/mcp.json") && line.includes("commit"))).toHaveLength(1)
   }, 300_000)
 
+  it("install warns when the launcher sits inside a macOS-protected folder — and installs anyway (in-15 J-7)", async () => {
+    // Sep 27 live: Claude Desktop's MCP entry showed "Server disconnected"; its log said
+    // /bin/sh: …/bin/mida-mcp: Operation not permitted. macOS blocks apps without Files and
+    // Folders access from exec'ing a launcher under ~/Desktop, ~/Documents or ~/Downloads.
+    const fakeHome = mkdtempSync(join(tmpdir(), "mida-macos-home-"))
+    const protectedLauncher = join(fakeHome, "Desktop", "mida-context", "bin", "mida-mcp")
+    const config = join(mkdtempSync(join(tmpdir(), "mida-desktop-cfg-")), "claude_desktop_config.json")
+    const lines: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+        cwd: projectDir, claudeDesktopConfig: config,
+        homeDir: fakeHome, platform: "darwin", launcherPath: protectedLauncher,
+      })
+    expect(await run2("install", "claude-desktop")).toBe(0)
+    // the warning names both fixes — grant the app access, or run Mida outside the three folders
+    expect(lines).toContain(
+      `note: macOS protects ~/Desktop, ~/Documents and ~/Downloads — the mida-claude-desktop launcher ` +
+        `is inside one at ${protectedLauncher}, so macOS may block Claude Desktop from running it: ` +
+        `grant Claude Desktop access in System Settings → Privacy & Security → Files and Folders, or run Mida outside those folders`,
+    )
+    // and the install still lands — the note is a warning, never a refusal
+    expect(JSON.parse(readFileSync(config, "utf8")).mcpServers["mida-claude-desktop"].args).toContain("--as")
+
+    // a launcher outside the three folders — or any install off macOS — earns no note
+    const lines2: string[] = []
+    const runLinux = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines2.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+        cwd: mkdtempSync(join(tmpdir(), "mida-cursor-work-")),
+        homeDir: fakeHome, platform: "linux", launcherPath: protectedLauncher,
+      })
+    expect(await runLinux("install", "cursor")).toBe(0)
+    expect(lines2.every((line) => !line.includes("macOS protects"))).toBe(true)
+    const lines3: string[] = []
+    const runOutside = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines3.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+        cwd: mkdtempSync(join(tmpdir(), "mida-cursor-work-")),
+        homeDir: fakeHome, platform: "darwin", launcherPath: join(fakeHome, "opt", "mida", "bin", "mida-mcp"),
+      })
+    expect(await runOutside("install", "cursor")).toBe(0)
+    expect(lines3.every((line) => !line.includes("macOS protects"))).toBe(true)
+  }, 300_000)
+
   it("install devin provisions the identity and writes the hook config — init alone registers no devin (in-9)", async () => {
     // A fresh home: `init` must NOT register a devin identity for an owner who never asked —
     // and `mida install devin` is where one comes from (the in-7 default-list change reversed).
