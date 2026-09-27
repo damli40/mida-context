@@ -97,6 +97,8 @@ export class LocalTransport implements Transport {
       "/context",
       {
         agent: this.#agent,
+        // the folder this read stands in — the daemon's project gate keys `projects.current` on it
+        cwd: this.#project,
         ...(input.namespace === undefined ? {} : { namespace: input.namespace }),
         ...(input.namespaces === undefined ? {} : { namespaces: input.namespaces }),
         limit: input.limit,

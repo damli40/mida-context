@@ -14,6 +14,8 @@ import { CheckpointCopies, buildWhatsNew } from "./whatsnew.js"
 import type { WhatsNewDeps } from "./whatsnew.js"
 import { buildMcpSave } from "./mcp-save.js"
 import type { McpSaveDeps } from "./mcp-save.js"
+import { buildContextRead } from "./context-read.js"
+import type { ContextReadDeps } from "./context-read.js"
 import { pendingAnchors } from "./batching.js"
 import { FLUSH_EVENTS } from "./hook.js"
 import type { MidaHome } from "./home.js"
@@ -63,6 +65,8 @@ export interface DaemonDeps {
   whatsnewDeps?: Partial<WhatsNewDeps>
   /** Gate and save overrides for /save (mida_save) — same role as handoffDeps. */
   mcpSaveDeps?: Partial<McpSaveDeps>
+  /** Gate and read overrides for /context — same role as handoffDeps. */
+  contextDeps?: Partial<ContextReadDeps>
   /** The code identity /health reports; default codeIdentity() — tests inject a foreign one. */
   identity?: CodeIdentity
   /** The fallback socket folder's parent (default tmpdir()); tests inject a private temp dir. */
@@ -429,6 +433,31 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         kind: result.kind,
         reason: result.kind === "refused" ? result.reason : null,
         duplicate: result.kind === "saved" ? result.duplicate : null,
+        ms: deps.now() - started,
+      })
+      respond(res, 200, result)
+      return
+    }
+    // the SDK's read: scoped context as verified records — the same gates and merged read the
+    // handoff runs on, answered as items instead of prose so callers never parse handoff text
+    if (req.url === "/context") {
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(body.toString("utf8"))
+      } catch {
+        parsed = undefined
+      }
+      const record = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
+      const started = deps.now()
+      const result = await buildContextRead(runtime, record, deps.contextDeps)
+      // same discipline as the other lines: codes and counts, never record content
+      deps.log({
+        event: "context-read",
+        agent: isSafeName(record.agent) ? record.agent : null,
+        kind: result.kind,
+        reason: result.kind === "refused" ? result.reason : null,
+        items: result.kind === "context" ? result.items.length : 0,
+        partial: result.kind === "context" && result.partial === true,
         ms: deps.now() - started,
       })
       respond(res, 200, result)
