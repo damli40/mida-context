@@ -140,6 +140,16 @@ export interface SendGate {
 }
 
 /**
+ * Ids of the in-flight watches that carry a progress channel — insertion order, so the oldest
+ * owns the "still waiting" line. A send nested inside another send's `beforeSend` (an operator
+ * send triggering an owner top-up) runs its own cap and gate but does not print a second,
+ * identical tick stream (in-16 K-8); when the oldest watch finishes, the next-oldest resumes
+ * printing on its own next tick. A watch with no progress channel never joins — otherwise its
+ * slot would silence a nested send whose ticks are the only ones the user could see.
+ */
+const printingSends = new Set<symbol>()
+
+/**
  * The race every owner send runs: work against a tick chain that prints `still waiting for
  * Monad (N s)…` each `everyMs` and gives up at `capMs`. The give-up error names only what the
  * caller can vouch for — three states, in order of knowledge:
@@ -188,6 +198,8 @@ async function watchSend<T>(
       if (gaveUp) throw timeout()
     },
   }
+  const id = context.progress === undefined ? undefined : Symbol()
+  if (id !== undefined) printingSends.add(id)
   let timer: unknown
   try {
     return await Promise.race([
@@ -204,7 +216,11 @@ async function watchSend<T>(
             reject(timeout())
             return
           }
-          context.progress?.(`still waiting for Monad (${Math.round(waited / 1_000)} s)…`)
+          // Only the oldest progress-bearing watch prints — a nested send's watchdog would
+          // otherwise interleave a second, identical line per interval.
+          if (id !== undefined && printingSends.values().next().value === id) {
+            context.progress?.(`still waiting for Monad (${Math.round(waited / 1_000)} s)…`)
+          }
           const nextIn = Math.min(everyMs, capMs - waited)
           waited += nextIn
           timer = setTimer(tick, nextIn)
@@ -217,6 +233,7 @@ async function watchSend<T>(
       }),
     ])
   } finally {
+    if (id !== undefined) printingSends.delete(id)
     if (timer !== undefined) clearTimer(timer)
   }
 }

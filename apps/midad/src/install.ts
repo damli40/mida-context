@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, sep } from "node:path"
 import { randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
@@ -200,8 +200,21 @@ export function macosProtectedFolderNote(
   platform: NodeJS.Platform,
 ): string | undefined {
   if (platform !== "darwin") return undefined
-  const protectedDirs = MACOS_PROTECTED_FOLDERS.map((name) => join(homeDir, name))
-  if (!protectedDirs.some((dir) => commandPath === dir || commandPath.startsWith(`${dir}${sep}`))) return undefined
+  // The typed path is not the real one: home may sit behind a symlink and macOS matches case
+  //-insensitively, so both sides are resolved (realpath when they exist) and lowercased before the
+  // prefix check — a launcher under e.g. ~/documents or a symlinked ~/Desktop still warns (in-16 K-8).
+  // homeDir always exists; the leaf names join AFTER resolving so a symlinked home still prefixes.
+  const canonical = (path: string): string => {
+    try {
+      return realpathSync.native(path)
+    } catch {
+      return path
+    }
+  }
+  const home = canonical(homeDir)
+  const protectedDirs = MACOS_PROTECTED_FOLDERS.map((name) => join(home, name).toLowerCase())
+  const command = canonical(commandPath).toLowerCase()
+  if (!protectedDirs.some((dir) => command === dir || command.startsWith(`${dir}${sep}`))) return undefined
   const app = MACOS_APP_NAME[client]
   return (
     `note: macOS protects ~/Desktop, ~/Documents and ~/Downloads — the ${MCP_SERVER_NAME[client]} launcher ` +

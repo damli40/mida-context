@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { tmpdir } from "node:os"
@@ -9,7 +9,7 @@ import { BaseError, HttpRequestError } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
 import type { Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
@@ -262,6 +262,31 @@ describe("the crude mida command", () => {
     expect(await runOutside("install", "cursor")).toBe(0)
     expect(lines3.every((line) => !line.includes("macOS protects"))).toBe(true)
   }, 300_000)
+
+  it("the macOS protected-folder check sees through symlinks and case (in-16 K-8)", () => {
+    // The J-7 check was a plain string prefix on the typed path: a checkout reached through a
+    // symlink (~/work → ~/Desktop/app) or a case-different spelling never warned. Both sides are
+    // now resolved to real paths and lowercased before the prefix compare.
+    const homeDir = mkdtempSync(join(tmpdir(), "mida-j7-home-"))
+    mkdirSync(join(homeDir, "Desktop", "mida-context", "bin"), { recursive: true })
+    const realLauncher = join(homeDir, "Desktop", "mida-context", "bin", "mida-mcp")
+    writeFileSync(realLauncher, "#!/bin/sh\n")
+    // a launcher reached through a symlink that hides the protected folder
+    symlinkSync(join(homeDir, "Desktop", "mida-context"), join(homeDir, "work"))
+    const linkedLauncher = join(homeDir, "work", "bin", "mida-mcp")
+    expect(macosProtectedFolderNote("cursor", linkedLauncher, homeDir, "darwin")).toContain("macOS protects")
+    // the resolved real path of that same launcher
+    expect(macosProtectedFolderNote("cursor", realpathSync(linkedLauncher), homeDir, "darwin")).toContain("macOS protects")
+    // a case-different spelling — macOS's filesystem matches case-insensitively
+    expect(macosProtectedFolderNote("cursor", join(homeDir, "desktop", "mida-context", "bin", "mida-mcp"), homeDir, "darwin")).toContain("macOS protects")
+    // a path genuinely outside the folders still earns no note
+    expect(macosProtectedFolderNote("cursor", join(homeDir, "opt", "bin", "mida-mcp"), homeDir, "darwin")).toBeUndefined()
+    // and a sibling whose name merely shares the prefix ("Desktops") is not a match
+    mkdirSync(join(homeDir, "Desktops", "bin"), { recursive: true })
+    const sibling = join(homeDir, "Desktops", "bin", "mida-mcp")
+    writeFileSync(sibling, "#!/bin/sh\n")
+    expect(macosProtectedFolderNote("cursor", sibling, homeDir, "darwin")).toBeUndefined()
+  })
 
   it("install devin provisions the identity and writes the hook config — init alone registers no devin (in-9)", async () => {
     // A fresh home: `init` must NOT register a devin identity for an owner who never asked —

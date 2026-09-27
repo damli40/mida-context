@@ -341,6 +341,39 @@ describe("a timed-out send is abandoned, not orphaned (in-16 K-1)", () => {
     expect(sends).toBe(0)
   })
 
+  it("a nested send does not print a second 'still waiting' stream (in-16 K-8)", async () => {
+    // The reported case: an operator send whose balance guard waits on an owner top-up — two
+    // watchdogs ran and the user saw the same line twice per interval. Only the oldest
+    // progress-bearing watch prints; the nested send keeps its own cap and gate.
+    const outerClock = fakeClock()
+    const innerClock = fakeClock()
+    const inner = stubContext({ waitForTransactionReceipt: () => never() })
+    inner.context.sendWatch = watch(innerClock, 15_000, 60_000)
+    const outer = stubContext({
+      beforeSend: () => sendValue(inner.context, { to: ADDRESS, value: 1n }, "funding").then(() => undefined),
+    })
+    outer.context.sendWatch = watch(outerClock, 15_000, 60_000)
+    const outcome = sendContract(
+      outer.context,
+      { address: ADDRESS, abi: [], functionName: "register", args: [] },
+      "context.register",
+    ).then(() => null, (error: unknown) => error)
+    await flush()
+    await flush()
+    outerClock.fire() // 15 s — both watches are in flight now
+    innerClock.fire()
+    expect(outer.progress).toEqual(["still waiting for Monad (15 s)…"])
+    expect(inner.progress).toEqual([])
+    // the outer cap abandons it; the inner watch, now the oldest printer, ticks again
+    outerClock.fire() // 30 s
+    outerClock.fire() // 45 s
+    outerClock.fire() // 60 s — the cap
+    const error = await outcome
+    expect(isMidaError(error, "SEND_TIMEOUT")).toBe(true)
+    innerClock.fire() // 30 s for the inner send — its clock kept running while it was muted
+    expect(inner.progress).toEqual(["still waiting for Monad (30 s)…"])
+  })
+
   it("an abandoned send is requeue-safe for the batcher — marked unsent and never broadcast", async () => {
     // The batcher reads `sent === false` and resubmits the rows: safe only because the gate makes
     // the abandoned send provably unable to broadcast. This is the exact race a resubmit would
