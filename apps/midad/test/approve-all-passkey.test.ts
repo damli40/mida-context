@@ -1,11 +1,12 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { mkdtempSync } from "node:fs"
+import { mkdtempSync, readFileSync, realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { FileAccessRequestStore, MidaHome, runCli, saveAgentIdentity, saveOwnerMode } from "@mida/midad"
-import type { AgentIdentity, CliDeps } from "@mida/midad"
+import { FileAccessRequestStore, MidaHome, canonicalEntries, loadOrCreateOwnerSecrets, loadOwnerAddress, runCli, saveAgentIdentity, saveOwnerMode } from "@mida/midad"
+import type { AgentIdentity, CliDeps, ProjectApproval } from "@mida/midad"
 import { requestHash } from "@mida/protocol"
 import type { AccessRequest, Address, OwnerLinkResult } from "@mida/protocol"
 import { PERMISSION } from "@mida/protocol"
@@ -213,6 +214,7 @@ describe("mida approve --all on a passkey home (I3)", () => {
     const code = await runCli(["approve", "--all"], {
       home,
       network: { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund },
+      cwd: mkdtempSync(join(tmpdir(), "mida-pkall-empty-folder-")),
       print: (line) => lines.push(line),
       prompt: async () => "yes",
       stdinIsTTY: true,
@@ -220,6 +222,100 @@ describe("mida approve --all on a passkey home (I3)", () => {
       ownerLink: { openLink: async () => { throw new Error("the page must never open") } },
     })
     expect(code).toBe(0)
-    expect(lines).toContain("nothing to approve — no agent has a pending request")
+    expect(lines).toContain("nothing to approve — every agent with permission is already approved for this folder")
   }, 120_000)
+
+  // AUTH-15 on a passkey home: agents approved in folder A hold their grant on chain, so
+  // a new folder has nothing pending — the batch must still list THIS folder for each of
+  // them. The page is asked once per agent because only the passkey can sign the row.
+  it("a fresh folder is approved for every grant-holding agent — one terminal yes, one page round each (AUTH-15)", async () => {
+    const home = new MidaHome(join(mkdtempSync(join(tmpdir(), "mida-pkall-a1-")), "home"))
+    const network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
+    const folderA = mkdtempSync(join(tmpdir(), "mida-pkall-a1-setup-"))
+    const folderB = mkdtempSync(join(tmpdir(), "mida-pkall-a1-folder-"))
+    const setup = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, cwd: folderA, print: () => {},
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // software-mode init + real grants in folder A — the same shape the Sep-27 home had —
+    // then the home flips to passkey; the signing key survives the flip
+    expect(await setup("init")).toBe(0)
+    expect(await setup("request", "claude-code")).toBe(0)
+    expect(await setup("approve", "claude-code")).toBe(0)
+    expect(await setup("request", "codex")).toBe(0)
+    expect(await setup("approve", "codex")).toBe(0)
+    const owner = loadOwnerAddress(home)!
+    const ownerAccount = privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey)
+    saveOwnerMode(home, "passkey")
+
+    const rounds: string[] = []
+    const asked: string[] = []
+    const lines: string[] = []
+    let resolveResult: ((r: OwnerLinkResult) => void) | undefined
+    const code = await runCli(["approve", "--all"], {
+      home,
+      network,
+      cwd: folderB,
+      print: (line) => lines.push(line),
+      prompt: async (question) => {
+        asked.push(question)
+        return "yes"
+      },
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      ownerLink: {
+        startListener: async () => ({
+          port: 4705,
+          result: new Promise<OwnerLinkResult>((resolve) => {
+            resolveResult = resolve
+          }),
+          close: () => {},
+        }),
+        // the fake page does what the real one does for a list-only approve: it signs
+        // the rows it was sent plus the new folder's entry and hands the list back
+        openLink: async (link) => {
+          rounds.push(link.url)
+          const params = new URLSearchParams(link.url.split("#")[1]!)
+          const reqJson = JSON.parse(
+            new TextDecoder().decode(
+              Uint8Array.from(atob(params.get("req")!.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)),
+            ),
+          ) as { entries: ProjectApproval[]; entry: { agent: string; projectId: string; root: string } }
+          const rows: ProjectApproval[] = [
+            ...reqJson.entries,
+            { ...reqJson.entry, approvedAt: new Date(0).toISOString() },
+          ]
+          const signature = await ownerAccount.signMessage({ message: canonicalEntries(rows) })
+          resolveResult!({
+            v: 1,
+            status: "success",
+            nonce: params.get("nonce")!,
+            requestHash: requestHash(link.requestBytes),
+            owner,
+            transactions: [],
+            operations: [],
+            entry: { entries: rows, signature },
+          })
+        },
+      },
+    } satisfies CliDeps)
+
+    expect(code).toBe(0)
+    expect(asked).toEqual(["Type yes to approve all: "])
+    // one page round per folder-listed agent — assistant holds no project purpose and was never asked
+    expect(rounds).toHaveLength(2)
+    expect(rounds.every((url) => url.includes("/approve#"))).toBe(true)
+    const projectIdB = (JSON.parse(readFileSync(join(folderB, ".mida", "project.json"), "utf8")) as { projectId: string }).projectId
+    for (const name of ["claude-code", "codex"]) {
+      expect(lines).toContain(`${name} already holds a live grant; this lists it for project ${projectIdB} (this folder)`)
+      expect(lines).toContain(`${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`)
+    }
+    expect(lines.at(-1)).toBe("approved: claude-code, codex")
+    const list = home.readJson<{ entries: ProjectApproval[] }>("approved-projects.json")
+    const rootB = realpathSync.native(folderB)
+    for (const name of ["claude-code", "codex"]) {
+      expect(list?.entries.some((e) => e.agent === name && e.projectId === projectIdB && e.root === rootB)).toBe(true)
+    }
+  }, 300_000)
 })

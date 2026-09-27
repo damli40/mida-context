@@ -216,10 +216,10 @@ new read key sent to claude-code
 
 Codex is refused on its next read or write; the remaining agents keep access through a rotated key. Revoking one client isolates exactly that client — `mida revoke claude-desktop` stops Claude Desktop and leaves Cursor untouched.
 
-The batch forms save a repeated round: `mida approve --all` lists every pending request, asks for one typed `yes`, then approves each in turn — a failure names its agent and does not stop the rest. `mida revoke --all` is the same shape for every agent that holds an approval:
+The batch forms save a repeated round: `mida approve --all` lists every pending request, asks for one typed `yes`, then approves each in turn — a failure names its agent and does not stop the rest. It also approves THIS folder for every agent that already holds permission on chain but does not yet list the folder — the same "no transaction" listing a single `mida approve <agent>` does — so running it in a new folder after the agents were granted elsewhere wires them up without re-asking. `mida revoke --all` is the same shape for every agent that holds an approval:
 
 ```bash
-mida approve --all     # one list of every pending request, one yes
+mida approve --all     # one list — pending requests + live grants missing this folder — one yes
 mida revoke --all      # one list of every approved agent, one yes
 ```
 

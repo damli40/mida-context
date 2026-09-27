@@ -9,10 +9,12 @@ import { BaseError, HttpRequestError } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
-import type { Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, runDoctor, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
+import type { AgentIdentity, Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
+import { manifestBodyHash } from "@mida/grant-advisor"
+import { AGENT_ID, manifestBody, signManifest } from "../../../packages/grant-advisor/test/fixtures.js"
 
 describe("the crude mida command", () => {
   let env: ScenarioEnvironment
@@ -810,6 +812,148 @@ describe("the crude mida command", () => {
     expect(await run2("approve", "--all")).toBe(0)
     expect(lines).toContain("codex is already approved on chain. This folder was already approved for codex.")
     expect(lines.every((line) => !line.includes("is now approved for codex"))).toBe(true)
+  }, 300_000)
+
+  // AUTH-15 (Sep 27 demo break): once the agents hold their grant, `mida request` files
+  // nothing — so `approve --all` in a fresh folder printed "nothing to approve" and left
+  // every live agent without this folder's row. The batch must cover the same case a
+  // single approve covers: live grant, no row yet → list the folder, no transaction.
+  it("approve --all in a new folder approves THIS folder for agents that already hold the grant (AUTH-15)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-a1-home-")))
+    const setupDir = mkdtempSync(join(tmpdir(), "mida-a1-setup-"))
+    const newDir = mkdtempSync(join(tmpdir(), "mida-a1-folder-"))
+    const quiet = (...argv: string[]) =>
+      runCli(argv, {
+        home: fresh, network, cwd: setupDir, print: () => {},
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await quiet("init")).toBe(0)
+    expect(await quiet("request", "claude-code")).toBe(0)
+    expect(await quiet("approve", "claude-code")).toBe(0)
+    expect(await quiet("request", "codex")).toBe(0)
+    expect(await quiet("approve", "codex")).toBe(0)
+
+    const asked: string[] = []
+    const inNew = (...argv: string[]) =>
+      runCli(argv, {
+        home: fresh, network, cwd: newDir, print: (line) => lines.push(line),
+        prompt: async (question) => { asked.push(question); return "yes" },
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    lines.length = 0
+    expect(await inNew("approve", "--all")).toBe(0)
+    // one shared confirmation covered the whole batch
+    expect(asked).toEqual(["Type yes to approve all: "])
+    const projectId = (JSON.parse(readFileSync(join(newDir, ".mida", "project.json"), "utf8")) as { projectId: string }).projectId
+    for (const name of ["claude-code", "codex"]) {
+      expect(lines).toContain(`${name} already holds a live grant; this lists it for project ${projectId} (this folder)`)
+      expect(lines).toContain(`${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`)
+    }
+    expect(lines.at(-1)).toBe("approved: claude-code, codex")
+    // both rows landed in the owner-signed list for THIS folder's project
+    const root = realpathSync.native(newDir)
+    const list = fresh.readJson<{ entries: { agent: string; projectId: string; root: string }[] }>("approved-projects.json")
+    for (const name of ["claude-code", "codex"]) {
+      expect(list?.entries.some((e) => e.agent === name && e.projectId === projectId && e.root === root)).toBe(true)
+    }
+    // and doctor's project line lists the folder under the project the batch just made
+    const docLines: string[] = []
+    await runDoctor({ home: fresh, print: (line) => docLines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    const projectLine = docLines.find((line) => line.startsWith(`ok: project ${projectId.slice(0, 8)}`))
+    expect(projectLine).toBeDefined()
+    expect(projectLine).toContain(root)
+
+    // a second run: everything already lists — the honest nothing-line, and no ask
+    asked.length = 0
+    expect(await inNew("approve", "--all")).toBe(0)
+    expect(asked).toHaveLength(0)
+    expect(lines.at(-1)).toBe("nothing to approve — every agent with permission is already approved for this folder")
+  }, 300_000)
+
+  it("approve --all mixes a pending request, a folder-only approval and a never-requested agent (AUTH-15)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-a1mix-home-")))
+    const setupDir = mkdtempSync(join(tmpdir(), "mida-a1mix-setup-"))
+    const newDir = mkdtempSync(join(tmpdir(), "mida-a1mix-folder-"))
+    const quiet = (...argv: string[]) =>
+      runCli(argv, {
+        home: fresh, network, cwd: setupDir, print: () => {},
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await quiet("init")).toBe(0)
+    expect(await quiet("request", "claude-code")).toBe(0)
+    expect(await quiet("approve", "claude-code")).toBe(0)
+    // codex is asked but not yet approved — its pending request joins the same batch;
+    // zzz-agent holds a real identity file but was never granted on chain
+    expect(await quiet("request", "codex")).toBe(0)
+    const fake: AgentIdentity = {
+      name: "zzz-agent",
+      agentId: AGENT_ID,
+      signerPrivateKey: `0x${"66".repeat(32)}`,
+      encryptionPrivateKey: `0x${"77".repeat(32)}`,
+      encryptionPublicKey: `0x${"88".repeat(32)}`,
+      callbackOrigin: "https://zzz-agent.mida.example",
+      purposeId: "project_assistance",
+      manifest: await signManifest(manifestBody()),
+      manifestHash: manifestBodyHash(manifestBody()),
+    }
+    await saveAgentIdentity(fresh, fake)
+
+    const asked: string[] = []
+    const inNew = (...argv: string[]) =>
+      runCli(argv, {
+        home: fresh, network, cwd: newDir, print: (line) => lines.push(line),
+        prompt: async (question) => { asked.push(question); return "yes" },
+        stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    lines.length = 0
+    expect(await inNew("approve", "--all")).toBe(0)
+    expect(asked).toEqual(["Type yes to approve all: "])
+    const projectId = (JSON.parse(readFileSync(join(newDir, ".mida", "project.json"), "utf8")) as { projectId: string }).projectId
+    // all three kinds sit in the one combined preview
+    expect(lines.some((line) => line === "codex is asking for:")).toBe(true)
+    expect(lines).toContain(`claude-code already holds a live grant; this lists it for project ${projectId} (this folder)`)
+    expect(lines).toContain("zzz-agent: no permission yet — run `mida request zzz-agent` first")
+    // the yes covers the pending grant and the folder listing alike
+    expect(lines.some((line) => line.startsWith("approved codex tx "))).toBe(true)
+    expect(lines).toContain("claude-code is already approved on chain. This folder is now approved for claude-code too (no transaction).")
+    // the never-requested agent is reported, not a failure — the batch still exits 0
+    expect(lines.at(-1)).toBe("approved: claude-code, codex")
+    const root = realpathSync.native(newDir)
+    const list = fresh.readJson<{ entries: { agent: string; projectId: string; root: string }[] }>("approved-projects.json")
+    for (const name of ["claude-code", "codex"]) {
+      expect(list?.entries.some((e) => e.agent === name && e.projectId === projectId && e.root === root)).toBe(true)
+    }
+    expect(list?.entries.some((e) => e.agent === "zzz-agent")).toBeFalsy()
+  }, 300_000)
+
+  it("the Sep-27 rehearsal sequence: request's already-approved hint, then approve --all approves the folder (AUTH-15)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-a1seq-home-")))
+    const setupDir = mkdtempSync(join(tmpdir(), "mida-a1seq-setup-"))
+    const newDir = mkdtempSync(join(tmpdir(), "mida-a1seq-folder-"))
+    const quiet = (...argv: string[]) =>
+      runCli(argv, {
+        home: fresh, network, cwd: setupDir, print: () => {},
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await quiet("init")).toBe(0)
+    expect(await quiet("request", "claude-code")).toBe(0)
+    expect(await quiet("approve", "claude-code")).toBe(0)
+
+    const inNew = (...argv: string[]) =>
+      runCli(argv, {
+        home: fresh, network, cwd: newDir, print: (line) => lines.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    lines.length = 0
+    // `request` in the new folder can only say already-approved — nothing is filed, so
+    // the batch that used to key on pending files found nothing to do (the break)
+    expect(await inNew("request", "claude-code")).toBe(0)
+    expect(lines).toContain("claude-code is already approved on chain. To use it in THIS folder, run `mida approve claude-code` here (no transaction, nothing to pay).")
+    expect(fresh.has("agents/claude-code/pending-request.json")).toBe(false)
+    expect(await inNew("approve", "--all")).toBe(0)
+    const projectId = (JSON.parse(readFileSync(join(newDir, ".mida", "project.json"), "utf8")) as { projectId: string }).projectId
+    const list = fresh.readJson<{ entries: { agent: string; projectId: string; root: string }[] }>("approved-projects.json")
+    expect(list?.entries.some((e) => e.agent === "claude-code" && e.projectId === projectId && e.root === realpathSync.native(newDir))).toBe(true)
   }, 300_000)
 
   it("revoke --all lists every approved agent, asks once, and revokes each (I4)", async () => {

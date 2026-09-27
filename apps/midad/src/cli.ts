@@ -30,14 +30,16 @@ import {
   planFolderUnlink,
   planProjectUnlink,
   projectNewPlan,
+  readApprovalsFile,
+  sameProjectRoot,
   unlinkFolderRows,
   unlinkProject,
 } from "./projects.js"
-import type { ListOwner, ProjectCheck, ProjectUnlinkPlan } from "./projects.js"
+import type { ListOwner, ProjectApproval, ProjectCheck, ProjectUnlinkPlan } from "./projects.js"
 import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, factShortId, factStamp, readOwnerFacts, remember, resolveFactId } from "./remember.js"
 import type { FactNamespace } from "./remember.js"
-import { Runtime, NAMESPACE, ServiceRuntime } from "./runtime.js"
+import { Runtime, NAMESPACE, PURPOSE_ID, ServiceRuntime } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag } from "./network.js"
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
@@ -832,26 +834,52 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
 }
 
 /**
- * The agents `approve --all` lists: every registered identity whose pending request is still
- * waiting — the file `mida request` or `mida install` left for the owner to answer. Sorted by
- * listAgentNames, so the list reads the same on every run.
+ * One registered agent's place in an `approve --all` batch: its pending request goes through
+ * the advisor gate, a live grant without this folder's row needs only the row (the AUTH-15
+ * case — `mida request` files nothing once the grant exists), an agent with neither is
+ * reported with its fix and is never a failure, and an agent whose row is already signed in —
+ * or the `assistant` identity, which project approvals exclude by design — leaves no work.
  */
-function pendingAgents(home: MidaHome): string[] {
-  return listAgentNames(home).filter((name) => home.has(`agents/${name}/pending-request.json`))
-}
+type BatchAgent = { name: string; kind: "pending" | "folder" | "noperm" }
 
 /**
- * The combined preview `approve --all` prints before its single ask: per pending agent the same
- * "is asking for" scope lines a single approve shows, plus the project this folder holds. This
- * reads the pending file only — each approve re-checks everything against the chain before it
- * signs, so a request that went stale between the list and its turn lands in `failed`, never in
- * a wrong grant.
+ * The agents `approve --all` works over, in listAgentNames order so the preview reads the same
+ * on every run. With no folder to approve (cwd unset) the batch is exactly the pending list —
+ * the pre-AUTH-15 behaviour — since a live grant's only remaining work is the folder row.
  */
-function printPendingApprovals(deps: CliDeps, home: MidaHome, agents: string[], projectId: string | undefined): void {
-  for (const name of agents) printPendingAsk(deps, home, name, projectId)
+async function batchAgents(
+  runtime: ServiceRuntime,
+  marker: { markerDir: string; projectId: string } | undefined,
+): Promise<BatchAgent[]> {
+  const out: BatchAgent[] = []
+  let root = ""
+  let entries: ProjectApproval[] = []
+  if (marker !== undefined) {
+    root = realpathSync.native(marker.markerDir)
+    const file = await readApprovalsFile(runtime.home, runtime.owner)
+    entries = file.kind === "signed" ? file.entries : []
+  }
+  for (const name of listAgentNames(runtime.home)) {
+    if (runtime.home.has(`agents/${name}/pending-request.json`)) {
+      out.push({ name, kind: "pending" })
+      continue
+    }
+    if (marker === undefined) continue
+    const identity = loadAgentIdentity(runtime.home, name)
+    if (identity === undefined || identity.purposeId !== PURPOSE_ID) continue
+    if (!(await hasAnyLiveCapability(runtime, identity.agentId))) {
+      out.push({ name, kind: "noperm" })
+      continue
+    }
+    const listed = entries.some(
+      (e) => e.agent === name && e.projectId === marker.projectId && sameProjectRoot(e.root, root),
+    )
+    if (!listed) out.push({ name, kind: "folder" })
+  }
+  return out
 }
 
-/** One agent's ask inside the combined preview — the same lines a single approve shows. */
+/** One pending agent's ask inside the combined preview — the same lines a single approve shows. */
 function printPendingAsk(deps: CliDeps, home: MidaHome, name: string, projectId: string | undefined): void {
   deps.print(`${name} is asking for:`)
   if (projectId !== undefined) deps.print(`  project ${projectId} (this folder)`)
@@ -867,25 +895,43 @@ function printPendingAsk(deps: CliDeps, home: MidaHome, name: string, projectId:
 /**
  * `mida approve --all`: one combined list, one typed yes, then each approve runs in turn — the
  * batch ask already covered every agent, so each approve signs without asking again. A failure
- * names itself and the next agent still runs; the last line is the verdict. Nothing pending says
+ * names itself and the next agent still runs; the last line is the verdict. Nothing to do says
  * so and exits 0 — the answer "everyone is approved" is honest without a transaction.
  */
 async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
-  const agents = pendingAgents(runtime.home)
-  if (agents.length === 0) {
-    deps.print("nothing to approve — no agent has a pending request")
+  // The marker resolves before the list, exactly as a single approve resolves it before the ask:
+  // a folder that may not hold a project refuses here, before any signature. It also decides
+  // which live-grant agents still need this folder's row (AUTH-15).
+  const marker = deps.cwd === undefined ? undefined : ensureProjectMarker(deps.cwd)
+  const batch = await batchAgents(runtime, marker)
+  if (!batch.some((agent) => agent.kind !== "noperm")) {
+    for (const { name, kind } of batch) {
+      if (kind === "noperm") deps.print(`${name}: no permission yet — run \`mida request ${name}\` first`)
+    }
+    deps.print(
+      marker === undefined
+        ? "nothing to approve — no agent has a pending request"
+        : "nothing to approve — every agent with permission is already approved for this folder",
+    )
     return 0
   }
-  // The marker resolves before the list, exactly as a single approve resolves it before the ask:
-  // a folder that may not hold a project refuses here, before any signature.
-  const marker = deps.cwd === undefined ? undefined : ensureProjectMarker(deps.cwd)
-  // Each pending agent gets the same gate a single approve runs before its prompt — the ask, then
-  // the grant advisor's verdict, printed into this one list. A request that fails the advisor's
-  // current-request checks (expired, consumed, stale signature) is named here and excluded before
-  // the prompt — nothing is ever sent for it.
+  // One combined preview in agent order. Each pending agent gets the same gate a single approve
+  // runs before its prompt — the ask, then the grant advisor's verdict; a request that fails
+  // the advisor's current-request checks (expired, consumed, stale signature) is named here and
+  // excluded before the prompt — nothing is ever sent for it. A live grant gets the same line
+  // a single approve's project preview shows, and a no-permission agent its fix.
   const ready: string[] = []
   const failed: string[] = []
-  for (const name of agents) {
+  for (const { name, kind } of batch) {
+    if (kind === "noperm") {
+      deps.print(`${name}: no permission yet — run \`mida request ${name}\` first`)
+      continue
+    }
+    if (kind === "folder") {
+      deps.print(`${name} already holds a live grant; this lists it for project ${marker!.projectId} (this folder)`)
+      ready.push(name)
+      continue
+    }
     printPendingAsk(deps, runtime.home, name, marker?.projectId)
     try {
       const advice = await pendingApprovalAdvice(runtime, name)
@@ -897,8 +943,8 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
       failed.push(`${name} (${refusalCode(error)})`)
     }
   }
-  // Every pending request failed the gate — there is nothing left to confirm, so the batch ends
-  // with the verdict instead of an ask.
+  // Everything the batch could try failed the gate — there is nothing left to confirm, so the
+  // batch ends with the verdict instead of an ask.
   if (ready.length === 0) {
     deps.print(`approved: none${failed.length === 0 ? "" : `; failed: ${failed.join(", ")}`}`)
     return 1
@@ -1446,13 +1492,38 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
  * and never once for the batch. A declined or failed agent names itself and the next still runs.
  */
 async function passkeyApproveAll(session: ServiceRuntime, deps: CliDeps, linkDeps: PasskeyDeps): Promise<number> {
-  const agents = pendingAgents(session.home)
-  if (agents.length === 0) {
-    deps.print("nothing to approve — no agent has a pending request")
+  // The marker resolves before the list, as in software mode: a folder that may not hold a
+  // project refuses here, before any signature — and it decides which live-grant agents still
+  // need this folder's row (AUTH-15).
+  const marker = deps.cwd === undefined ? undefined : ensureProjectMarker(deps.cwd)
+  const batch = await batchAgents(session, marker)
+  if (!batch.some((agent) => agent.kind !== "noperm")) {
+    for (const { name, kind } of batch) {
+      if (kind === "noperm") deps.print(`${name}: no permission yet — run \`mida request ${name}\` first`)
+    }
+    deps.print(
+      marker === undefined
+        ? "nothing to approve — no agent has a pending request"
+        : "nothing to approve — every agent with permission is already approved for this folder",
+    )
     return 0
   }
-  const marker = deps.cwd === undefined ? undefined : ensureProjectMarker(deps.cwd)
-  printPendingApprovals(deps, session.home, agents, marker?.projectId)
+  // One combined preview in agent order, same as software mode: a pending request shows its
+  // ask, a live grant its folder line, a no-permission agent its fix — never a failure.
+  const agents: string[] = []
+  for (const { name, kind } of batch) {
+    if (kind === "noperm") {
+      deps.print(`${name}: no permission yet — run \`mida request ${name}\` first`)
+      continue
+    }
+    if (kind === "folder") {
+      deps.print(`${name} already holds a live grant; this lists it for project ${marker!.projectId} (this folder)`)
+      agents.push(name)
+      continue
+    }
+    printPendingAsk(deps, session.home, name, marker?.projectId)
+    agents.push(name)
+  }
   deps.print("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
   const prompt = deps.prompt ?? terminalPrompt
   const drain = deps.drainInput ?? drainBufferedStdin
