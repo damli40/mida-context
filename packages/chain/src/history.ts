@@ -18,7 +18,7 @@ const same = (a: unknown, b: string) => typeof a === "string" && a.toLowerCase()
  */
 /** A log client that can also read a contract view — viem's PublicClient is one. */
 export interface HistoryClient extends LogClient {
-  readContract?(parameters: { address: Address; abi: typeof capabilityRegistryAbi; functionName: "agentEpoch"; args: readonly [Address, Hex] }): Promise<unknown>
+  readContract?(parameters: { address: Address; abi: typeof capabilityRegistryAbi; functionName: "agentEpoch" | "activeCapabilityIds"; args: readonly [Address, Hex] }): Promise<unknown>
 }
 
 /**
@@ -65,6 +65,23 @@ export async function ownerHistory(input: {
     // Counter 0: no AgentRevoked event can exist for this pair. Only a single-capability revoke,
     // which does not move the counter, could — so that one event still has to be scanned for.
     agentLevelRevokePossible = false
+    // Epoch 0 leaves only capability-level revokes possible — and even those need the agent to
+    // have held a capability. The contract's _activeByAgent gains entries only at grant and loses
+    // its last one only inside the epoch-bumping revoke, so an empty active list with epoch 0
+    // proves the agent was NEVER granted — and a never-granted agent can have no CapabilityRevoked
+    // event either. One read replaces the whole scan, cursor or no (in-15 J-10 — Sep 27's fresh
+    // agent burned ~928 getLogs requests reaching this same answer).
+    const active = await input.client.readContract({
+      address: input.deployment.capabilityRegistry,
+      abi: capabilityRegistryAbi,
+      functionName: "activeCapabilityIds",
+      args: [input.owner, input.agentId],
+    })
+    if (!Array.isArray(active)) throw new Error("activeCapabilityIds did not return a list")
+    if (active.length === 0) {
+      await input.cursor?.save({ observedThroughBlock: toBlock, previouslyRevoked: false })
+      return { owner: input.owner, agentId: input.agentId, previouslyRevoked: false, observedThroughBlock: toBlock }
+    }
   }
   // The cursor is consulted only AFTER the contract answered: an epoch above 0 already proved a
   // revoke with one request, and no cache should shadow that. A saved true is sticky — revoked is

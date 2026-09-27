@@ -339,7 +339,49 @@ describe("owner history (§14.6 PREVIOUSLY_REVOKED)", () => {
 
   it("a counter of 0 still scans, but only for single-capability revokes", async () => {
     const { client, calls } = recordingClient(20n, (call) => (call.event.name === "CapabilityRevoked" ? [log(OWNER, AGENT)] : []))
-    const withView = { ...client, getBlockNumber: client.getBlockNumber.bind(client), getLogs: client.getLogs.bind(client), readContract: async () => 0n }
+    // epoch 0 but the agent still holds entries — the never-granted shortcut does not apply
+    const withView = {
+      ...client,
+      getBlockNumber: client.getBlockNumber.bind(client),
+      getLogs: client.getLogs.bind(client),
+      readContract: async (parameters: { functionName: string }) =>
+        parameters.functionName === "activeCapabilityIds" ? [`0x${"1".repeat(64)}`] : 0n,
+    }
+    expect((await ownerHistory({ client: withView, deployment, owner: OWNER, agentId: AGENT })).previouslyRevoked).toBe(true)
+    expect(new Set(calls.map((call) => call.event))).toEqual(new Set(["CapabilityRevoked"]))
+  })
+
+  it("a never-granted agent answers with two reads and no log scan — epoch 0 + empty active list (in-15 J-10)", async () => {
+    // Sep 27 live: a fresh agent's approve spent ~928 getLogs requests answering "no revocations"
+    // when the contract could prove it in two reads. _activeByAgent gains entries only at grant
+    // and loses its last one only inside the epoch-bumping revoke, so empty + epoch 0 means the
+    // agent was never granted — and a never-granted agent can have no revoke events at all.
+    const { client, calls } = recordingClient(20n, () => [])
+    const reads: string[] = []
+    const neverGranted = {
+      ...client,
+      getBlockNumber: client.getBlockNumber.bind(client),
+      getLogs: client.getLogs.bind(client),
+      readContract: async (parameters: { functionName: string }) => {
+        reads.push(parameters.functionName)
+        return parameters.functionName === "activeCapabilityIds" ? [] : 0n
+      },
+    }
+    const history = await ownerHistory({ client: neverGranted, deployment, owner: OWNER, agentId: AGENT })
+    expect(history).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: false, observedThroughBlock: 20n })
+    expect(calls).toHaveLength(0)
+    expect(reads).toEqual(["agentEpoch", "activeCapabilityIds"])
+  })
+
+  it("a non-empty active list still scans for single-capability revokes", async () => {
+    const { client, calls } = recordingClient(20n, (call) => (call.event.name === "CapabilityRevoked" ? [log(OWNER, AGENT)] : []))
+    const withView = {
+      ...client,
+      getBlockNumber: client.getBlockNumber.bind(client),
+      getLogs: client.getLogs.bind(client),
+      readContract: async (parameters: { functionName: string }) =>
+        parameters.functionName === "activeCapabilityIds" ? [`0x${"1".repeat(64)}`] : 0n,
+    }
     expect((await ownerHistory({ client: withView, deployment, owner: OWNER, agentId: AGENT })).previouslyRevoked).toBe(true)
     expect(new Set(calls.map((call) => call.event))).toEqual(new Set(["CapabilityRevoked"]))
   })
@@ -365,7 +407,9 @@ describe("the history scan cursor (R4-9)", () => {
     ...client,
     getBlockNumber: client.getBlockNumber.bind(client),
     getLogs: client.getLogs.bind(client),
-    readContract: async () => 0n,
+    // epoch 0 with a non-empty active list — the cursor tests exercise the scan path
+    readContract: async (parameters: { functionName: string }) =>
+      parameters.functionName === "activeCapabilityIds" ? [`0x${"1".repeat(64)}`] : 0n,
   })
   /** An in-memory cursor standing in for the CLI's state/history/<agentId>.json file. */
   const memoryCursor = (saved: { observedThroughBlock: bigint; previouslyRevoked: boolean } | undefined) => {
