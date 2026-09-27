@@ -5,4 +5,8 @@
 # reads or prints it. `exec` keeps your terminal attached, which `approve`, `revoke` and
 # `remember` require.
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-exec node --env-file="$ROOT/.env" --import "$ROOT/node_modules/tsx/dist/loader.mjs" "$ROOT/apps/midad/src/cli.ts" "$@"
+# `.env` is optional — a clean checkout has only .env.example, and node fails hard when an
+# --env-file target is missing. The flag is added only when the file is really there.
+ENV_ARG=
+if [ -f "$ROOT/.env" ]; then ENV_ARG="--env-file=$ROOT/.env"; fi
+exec node $ENV_ARG --import "$ROOT/node_modules/tsx/dist/loader.mjs" "$ROOT/apps/midad/src/cli.ts" "$@"

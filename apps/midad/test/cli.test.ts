@@ -1,8 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs"
+import { spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 import { BaseError, HttpRequestError } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
@@ -1227,4 +1229,47 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
       "codex is already approved on chain. To use it in THIS folder, run `mida approve codex` here (no transaction, nothing to pay).",
     )
   })
+})
+
+/**
+ * in-15 J-8 — the dev launcher `bin/mida` must run on a checkout that has no `.env`: node
+ * fails hard when an `--env-file` target is missing, and older Node has no
+ * `--env-file-if-exists`, so the script passes the flag only when the file exists. The test
+ * root is a throwaway checkout holding only the three paths the script touches.
+ */
+describe("the dev launcher bin/mida (in-15 J-8)", () => {
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
+
+  const makeRoot = () => {
+    const root = mkdtempSync(join(tmpdir(), "mida-bin-"))
+    mkdirSync(join(root, "bin"), { recursive: true })
+    mkdirSync(join(root, "node_modules", "tsx", "dist"), { recursive: true })
+    mkdirSync(join(root, "apps", "midad", "src"), { recursive: true })
+    writeFileSync(join(root, "bin", "mida"), readFileSync(join(repoRoot, "bin", "mida"), "utf8"))
+    writeFileSync(join(root, "node_modules", "tsx", "dist", "loader.mjs"), "")
+    writeFileSync(join(root, "apps", "midad", "src", "cli.ts"), 'console.log(`sentinel=${process.env.MIDA_J8_SENTINEL ?? "unset"}`)\n')
+    return root
+  }
+
+  const runLauncher = (root: string) =>
+    new Promise<{ code: number | null; stdout: string; stderr: string }>((done, reject) => {
+      const child = spawn("sh", [join(root, "bin", "mida")], { env: { PATH: process.env.PATH ?? "" } })
+      let stdout = ""
+      let stderr = ""
+      child.stdout.on("data", (chunk) => (stdout += chunk))
+      child.stderr.on("data", (chunk) => (stderr += chunk))
+      child.on("error", reject)
+      child.on("close", (code) => done({ code, stdout, stderr }))
+    })
+
+  it("runs with no .env — and an existing .env is still loaded", async () => {
+    const root = makeRoot()
+    const bare = await runLauncher(root)
+    expect(bare.code).toBe(0)
+    expect(bare.stdout).toContain("sentinel=unset")
+    writeFileSync(join(root, ".env"), "MIDA_J8_SENTINEL=found\n")
+    const loaded = await runLauncher(root)
+    expect(loaded.code).toBe(0)
+    expect(loaded.stdout).toContain("sentinel=found")
+  }, 60_000)
 })
