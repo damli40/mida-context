@@ -43,16 +43,18 @@ export {
   ensureProjectMarker,
   linkProject,
   newProject,
+  planFolderUnlink,
   planProjectLink,
   planProjectUnlink,
   projectNewPlan,
   removeAgentApprovals,
   removeProjectMarker,
+  unlinkFolderRows,
   unlinkProject,
   writeProjectMarker,
   writeSignedApprovals,
 } from "./projects.js"
-export type { ListOwner, ProjectApproval, ProjectCheck, ProjectLinkPlan, ProjectNewPlan, ProjectUnlinkPlan } from "./projects.js"
+export type { FolderUnlinkPlan, ListOwner, ProjectApproval, ProjectCheck, ProjectLinkPlan, ProjectNewPlan, ProjectUnlinkPlan } from "./projects.js"
 export { FLUSH_EVENTS, drainerEnv, runHook, transcriptPathAllowed, transcriptRoots } from "./hook.js"
 export type { HookEvent } from "./hook.js"
 export { clearCodexHome, recordCodexHome, recordedCodexHome, resolveCodexHome, trustedCodexHome } from "./codex-home.js"

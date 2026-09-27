@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { tmpdir } from "node:os"
@@ -1634,6 +1634,89 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     // nothing moved: A is still approved and marked
     expect(await checkProject(owner, { agent: "claude-code", cwd: dirA })).toMatchObject({ ok: true })
     expect(existsSync(join(dirA, ".mida", "project.json"))).toBe(true)
+  })
+
+  it("mida unlink --folder removes a deleted folder's rows from anywhere (in-16 B3)", async () => {
+    const { home, owner, network } = folderHome("mida-unflag-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-unflag-a-"))
+    const dirB = mkdtempSync(join(tmpdir(), "mida-unflag-b-"))
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-unflag" }))
+    await approveProject(owner, { agent: "claude-code", cwd: dirA })
+    await approveProject(owner, { agent: "codex", cwd: dirA })
+    // link B, then delete it — the folder unlink would have to run inside is gone
+    const lines: string[] = []
+    expect(await runCli(["link", dirA], {
+      home, network, cwd: dirB, print: (line) => lines.push(line),
+      prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+    })).toBe(0)
+    const gone = realpathSync(dirB)
+    rmSync(dirB, { recursive: true, force: true })
+
+    const out: string[] = []
+    const asked: string[] = []
+    expect(await runCli(["unlink", "--folder", gone], {
+      home, network, cwd: dirA, print: (line) => out.push(line),
+      prompt: async (q) => { asked.push(q); return "yes" }, stdinIsTTY: true, stdoutIsTTY: true,
+    })).toBe(0)
+    expect(asked).toEqual(["Type yes to unlink: "])
+    expect(out.some((line) => line.includes("is gone"))).toBe(true)
+    expect(out.at(-1)).toContain("unlinked")
+    // B's rows left the signed list for every agent; A's stand
+    const file = home.readJson<{ entries: { root: string }[] }>("approved-projects.json")!
+    expect(file.entries).toHaveLength(2)
+    expect(file.entries.every((e) => e.root === realpathSync(dirA))).toBe(true)
+    expect(await checkProject(owner, { agent: "claude-code", cwd: dirA })).toMatchObject({ ok: true })
+  })
+
+  it("mida link run inside a subfolder of the source is the stated no-op — exit 0, no writes (in-16 B4)", async () => {
+    const { home, owner, network } = folderHome("mida-linksub-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-linksub-a-"))
+    const sub = join(dirA, "sub")
+    mkdirSync(sub)
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-lsub" }))
+    await approveProject(owner, { agent: "claude-code", cwd: dirA })
+    const lines: string[] = []
+    const asked: string[] = []
+    expect(await runCli(["link", dirA], {
+      home, network, cwd: sub, print: (line) => lines.push(line),
+      prompt: async (q) => { asked.push(q); return "yes" }, stdinIsTTY: true, stdoutIsTTY: true,
+    })).toBe(0)
+    // no question was asked — linking the subfolder would silently split it off, so the plan
+    // answers "already belongs" and exits clean
+    expect(asked).toEqual([])
+    expect(lines.at(-1)).toContain("already")
+    expect(existsSync(join(sub, ".mida"))).toBe(false)
+  })
+
+  it("a refused link on a fresh home creates no owner secrets (in-16 L8)", async () => {
+    // no loadOrCreateOwnerSecrets — this home has never had owner material
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-fresh-home-")))
+    const network = { deployment: { capabilityRegistry: REGISTRY } } as unknown as Network
+    const dirB = mkdtempSync(join(tmpdir(), "mida-fresh-b-"))
+    const out: string[] = []
+    expect(await runCli(["link", join(dirB, "does-not-exist")], {
+      home, network, cwd: dirB, print: (line) => out.push(line),
+      prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+    })).toBe(1)
+    expect(out.at(-1)).toContain("not a folder that exists")
+    // the refusal asked nothing and created nothing — secrets appear only once a write needs them
+    expect(home.has("owner/secrets.json")).toBe(false)
+  })
+
+  it("mida unlink --folder needs its argument and refuses unknown flags (in-16 B3)", async () => {
+    const { home, network } = folderHome("mida-unarg-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-unarg-a-"))
+    const out: string[] = []
+    const runIn = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, cwd: dirA, print: (line) => out.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await runIn("unlink", "--folder")).toBe(2)
+    expect(out.at(-1)).toBe(USAGE)
+    expect(await runIn("unlink", "--bogus", "x")).toBe(2)
   })
 
   it("mida project new marks a fresh project in a bare folder — no parent, no question (lk-1)", async () => {

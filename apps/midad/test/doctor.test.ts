@@ -459,7 +459,9 @@ describe("mida doctor without a chain", () => {
     expect(after.some((l) => l.startsWith("ok: project ae3e5609…"))).toBe(true)
     const missing = after.find((l) => l.startsWith("PROBLEM:") && l.includes(goneRoot))
     expect(missing).toBeDefined()
-    expect(missing).toContain("mida unlink")
+    // the fix names a command that exists (in-16 B3): unlink inside a deleted folder is
+    // impossible, and hand-editing the list breaks the owner signature — the flag form works
+    expect(missing).toContain(`mida unlink --folder ${goneRoot}`)
     expect(missing).toContain("approved-projects.json")
   })
 

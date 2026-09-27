@@ -611,7 +611,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
               lines.push(
                 problem(
                   `project ${short(projectId)} names ${root}, which no longer exists`,
-                  "run `mida unlink` in that folder, or remove its row from approved-projects.json",
+                  `run \`mida unlink --folder ${root}\` — never hand-edit approved-projects.json, the owner signature protects every row`,
                 ),
               )
             }

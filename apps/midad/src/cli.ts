@@ -27,11 +27,13 @@ import {
   linkProject,
   newProject,
   planProjectLink,
+  planFolderUnlink,
   planProjectUnlink,
   projectNewPlan,
+  unlinkFolderRows,
   unlinkProject,
 } from "./projects.js"
-import type { ListOwner, ProjectCheck } from "./projects.js"
+import type { ListOwner, ProjectCheck, ProjectUnlinkPlan } from "./projects.js"
 import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, factShortId, factStamp, readOwnerFacts, remember, resolveFactId } from "./remember.js"
 import type { FactNamespace } from "./remember.js"
@@ -41,7 +43,7 @@ import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag }
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
 import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, pendingApprovalAdvice, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint } from "./skeleton.js"
-import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerMode } from "./keys.js"
+import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerMode, saveOwnerAddress } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
 import { migrate, migrateUndo } from "./migrate.js"
 import { OwnerLinkOutcome, approvePasskey, initPasskey, provisionPasskeyAgents, revokePasskey } from "./owner-link/flows.js"
@@ -69,7 +71,7 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
  */
 const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink | project new | batching on|off | migrate [--undo]" +
+  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | migrate [--undo]" +
   "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or the identity a client installs)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
 export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", "link", "unlink", "project", ...WITH_AGENT]
@@ -428,15 +430,34 @@ export async function runCliWithRuntime(
 }
 
 /**
+ * The owner address for a folder command's PLAN — read-only (in-16 L8): a refused link or unlink
+ * must not write `owner/secrets.json` to discover it was refused, so the plan runs on the saved
+ * address alone. A home with a key file but no address record derives the address from the key
+ * without creating anything; a fresh home plans with no owner at all — the list either does not
+ * exist (empty) or cannot be verified (the plan refuses `no-owner`).
+ */
+function ownerAddressFor(home: MidaHome): Address | undefined {
+  const saved = loadOwnerAddress(home)
+  if (saved !== undefined) return saved
+  return home.has("owner/secrets.json")
+    ? privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey).address
+    : undefined
+}
+
+/**
  * The `{ home, owner }` the folder commands sign the approved-projects list with — never the
  * owner runtime. Signing is local cryptography, so link, unlink and project new run with no
- * chain in reach: the owner address comes from the saved file or the key the file names.
+ * chain in reach: the owner address comes from the saved file or the key the file names. This
+ * runs only after the owner typed yes — creating owner material is a consequence of signing,
+ * never of asking (in-16 L8) — and the address lands in `owner-address.json` so the list the
+ * command just signed can be verified the same way next time.
  */
 function listOwnerFor(home: MidaHome): ListOwner {
-  return {
-    home,
-    owner: loadOwnerAddress(home) ?? privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey).address,
-  }
+  const saved = loadOwnerAddress(home)
+  if (saved !== undefined) return { home, owner: saved }
+  const account = privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey)
+  saveOwnerAddress(home, account.address)
+  return { home, owner: account.address }
 }
 
 /**
@@ -459,18 +480,41 @@ async function runFolderCommand(argv: string[], deps: CliDeps): Promise<number> 
     return (await prompt(question)).trim() === "yes"
   }
   let ownerAddress: Address | undefined
+  // the shared unlink tail — what will be removed, the typed yes, the signed write and the
+  // marker removal — used by plain `unlink` and by `unlink --folder` on a live marked folder
+  const runUnlinkPlan = async (plan: Extract<ProjectUnlinkPlan, { kind: "ok" }>): Promise<number> => {
+    const agents = [...new Set(plan.rows.map((e) => e.agent))].sort()
+    deps.print(`project ${plan.projectId} — unlinking ${plan.root}`)
+    deps.print(
+      `this removes ${plan.rows.length} approval row(s)${agents.length > 0 ? ` (${agents.join(", ")})` : ""} ` +
+        `and the marker ${join(plan.markerDir, ".mida")}`,
+    )
+    if (plan.otherRoots.length > 0) deps.print(`the project keeps its other folder(s): ${plan.otherRoots.join(", ")}`)
+    if (!(await askYes("Type yes to unlink: "))) {
+      deps.print("not approved")
+      return 1
+    }
+    const owner = listOwnerFor(deps.home)
+    ownerAddress = owner.owner
+    const result = await unlinkProject(owner, { projectId: plan.projectId, markerDir: plan.markerDir })
+    deps.print(`unlinked ${plan.root} from project ${plan.projectId} (${result.removed} row(s) removed)`)
+    return 0
+  }
   try {
     if (command === "link") {
       if (argv.length !== 2) return usage()
-      const owner = listOwnerFor(deps.home)
-      ownerAddress = owner.owner
-      const plan = await planProjectLink(owner, { folder: argv[1]!, cwd, homeDir: deps.homeDir })
+      // the plan runs on the saved address alone — a refused link on a fresh home must not
+      // create the owner key file to discover it was refused (in-16 L8); the key is created
+      // only when a confirmed link actually signs the list
+      const reader = { home: deps.home, owner: ownerAddressFor(deps.home) }
+      ownerAddress = reader.owner
+      const plan = await planProjectLink(reader, { folder: argv[1]!, cwd, homeDir: deps.homeDir })
       if (plan.kind === "refused") {
         deps.print(plan.message)
         return 1
       }
       if (plan.kind === "already") {
-        deps.print(`already linked to project ${plan.projectId} — nothing to change`)
+        deps.print(plan.message ?? `already linked to project ${plan.projectId} — nothing to change`)
         return 0
       }
       if (plan.kind === "move") {
@@ -492,6 +536,8 @@ async function runFolderCommand(argv: string[], deps: CliDeps): Promise<number> 
           deps.print("not approved")
           return 1
         }
+        const owner = listOwnerFor(deps.home)
+        ownerAddress = owner.owner
         const result = await linkProject(owner, { projectId: plan.projectId, dir: plan.root, fromProjectId: plan.fromProjectId })
         deps.print(
           `moved ${result.root} from project ${plan.fromProjectId} to project ${plan.projectId} ` +
@@ -512,33 +558,59 @@ async function runFolderCommand(argv: string[], deps: CliDeps): Promise<number> 
         deps.print("not approved")
         return 1
       }
+      const owner = listOwnerFor(deps.home)
+      ownerAddress = owner.owner
       const result = await linkProject(owner, { projectId: plan.projectId, dir: plan.root })
       deps.print(`linked ${result.root} to project ${plan.projectId} for ${result.agents.length === 0 ? "no agents yet" : result.agents.join(", ")}`)
       return 0
     }
     if (command === "unlink") {
+      const reader = { home: deps.home, owner: ownerAddressFor(deps.home) }
+      ownerAddress = reader.owner
+      // `--folder <path>` (in-16 B3) is for the folder unlink cannot be run inside — deleted or
+      // otherwise unreachable: its rows leave through the same signed write, and doctor can name
+      // a fix that exists. A live folder with its own marker plans as a normal unlink instead.
+      if (argv[1] === "--folder") {
+        if (argv.length !== 3) return usage()
+        const plan = await planFolderUnlink(reader, { folder: argv[2]!, cwd, homeDir: deps.homeDir })
+        if (plan.kind === "refused") {
+          deps.print(plan.message)
+          return 1
+        }
+        if ("removals" in plan) {
+          deps.print(
+            plan.gone
+              ? `${plan.root} is gone — removing the rows the signed list still keeps for it`
+              : `${plan.root} carries no marker of its own — removing the rows the signed list keeps for it`,
+          )
+          for (const removal of plan.removals) {
+            const agents = [...new Set(removal.rows.map((e) => e.agent))].sort()
+            deps.print(`project ${removal.projectId}: ${removal.rows.length} row(s) (${agents.join(", ")})`)
+          }
+          if (!(await askYes("Type yes to unlink: "))) {
+            deps.print("not approved")
+            return 1
+          }
+          const owner = listOwnerFor(deps.home)
+          ownerAddress = owner.owner
+          const result = await unlinkFolderRows(owner, {
+            root: plan.root,
+            asTyped: plan.asTyped,
+            projectIds: plan.removals.map((r) => r.projectId),
+          })
+          deps.print(`unlinked ${plan.root} (${result.removed} row(s) removed)`)
+          return 0
+        }
+        // a live folder with its own marker — the normal plan below
+        return await runUnlinkPlan(plan)
+      }
       if (argv.length !== 1) return usage()
-      const owner = listOwnerFor(deps.home)
-      ownerAddress = owner.owner
-      const plan = await planProjectUnlink(owner, { cwd })
+      const plan = await planProjectUnlink(reader, { cwd })
       if (plan.kind === "refused") {
         deps.print(plan.message)
         return 1
       }
-      const agents = [...new Set(plan.rows.map((e) => e.agent))].sort()
-      deps.print(`project ${plan.projectId} — unlinking ${plan.root}`)
-      deps.print(
-        `this removes ${plan.rows.length} approval row(s)${agents.length > 0 ? ` (${agents.join(", ")})` : ""} ` +
-          `and the marker ${join(plan.markerDir, ".mida")}`,
-      )
-      deps.print(`the project keeps its other folder(s): ${plan.otherRoots.join(", ")}`)
-      if (!(await askYes("Type yes to unlink: "))) {
-        deps.print("not approved")
-        return 1
-      }
-      const result = await unlinkProject(owner, { projectId: plan.projectId, markerDir: plan.markerDir })
-      deps.print(`unlinked ${plan.root} from project ${plan.projectId} (${result.removed} row(s) removed)`)
-      return 0
+      return await runUnlinkPlan(plan)
     }
     // command === "project" — the only subcommand is `new`
     if (argv.length !== 2 || argv[1] !== "new") return usage()
@@ -1782,10 +1854,11 @@ async function main(): Promise<void> {
     return
   }
 
-  // Everything below touches the chain, so this is where the network is resolved — the saved
-  // setup's contract and services when there is one, the built-in record for a first-time home
-  // — never earlier: `--help`, `install` and `doctor` must work with no RPC reachable at all.
-  const resolved = await networkForCommand(home, process.env)
+  // `link`, `unlink` and `project new` sign only local owner data — the chain probe would fail
+  // them on a machine with no RPC reachable, so for them the resolution stays file-only
+  // (in-16 B6): the saved setup's contract still fills deps.network for any refusal line.
+  const folderOnly = argv[0] === "link" || argv[0] === "unlink" || argv[0] === "project"
+  const resolved = await networkForCommand(home, process.env, folderOnly ? { probeChainId: false } : undefined)
 
   // Owner commands — init, approve, revoke, remember — run in this process on the owner
   // runtime and are never sent to the daemon socket. `init` still spawns the daemon when one

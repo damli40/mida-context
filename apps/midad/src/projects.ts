@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto"
 import { mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { join, resolve } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import { verifyMessage } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import type { Address, Hex } from "@mida/protocol"
@@ -309,16 +309,40 @@ export async function checkProject(runtime: ServiceRuntime, input: { agent: stri
  * Everything a signed-list command needs: the home the file lives in and the owner address that
  * verifies it. Signing is local cryptography — `mida link`, `mida unlink` and `mida project new`
  * never open a runtime and never reach the chain.
+ *
+ * `owner` is allowed to be absent (in-16 L8): a plan can refuse before any owner material exists,
+ * and a refused command must not create the key file to do so. With no owner a missing list is
+ * simply empty; a list that EXISTS cannot be verified, which is its own refusal (`no-owner`).
+ * The write paths sign through `signEntries`, which creates the key only by then — after the
+ * owner answered yes.
  */
-export type ListOwner = { home: ServiceRuntime["home"]; owner: Address }
+export type ListOwner = { home: ServiceRuntime["home"]; owner: Address | undefined }
 
 const LIST_UNREADABLE = "the approved-projects list could not be read: check the file's permissions"
 const LIST_TAMPERED = "the approved-projects list failed its signature check — run `mida doctor`"
+const NO_OWNER = "this home has no owner yet — run `mida init` first"
 
-function listRefusal(code: "list-unreadable" | "list-tampered"): Error {
-  const error = new Error(code === "list-unreadable" ? LIST_UNREADABLE : LIST_TAMPERED) as Error & { code: string }
+function listRefusal(code: "list-unreadable" | "list-tampered" | "no-owner"): Error {
+  const error = new Error(
+    code === "list-unreadable" ? LIST_UNREADABLE : code === "list-tampered" ? LIST_TAMPERED : NO_OWNER,
+  ) as Error & { code: string }
   error.code = code
   return error
+}
+
+/**
+ * The signed list for a command that may run before any owner material exists. With an owner
+ * address this is `readApprovalsFile`. Without one: a missing file is empty, anything on disk is
+ * unverifiable — never silently treated as empty, and never verified against a made-up address.
+ */
+export type ListRead = ApprovalsFile | { kind: "no-owner" }
+
+async function readListForPlan(
+  home: ServiceRuntime["home"],
+  owner: Address | undefined,
+): Promise<ListRead> {
+  if (owner !== undefined) return readApprovalsFile(home, owner)
+  return home.has(LIST_FILE) ? { kind: "no-owner" } : { kind: "missing" }
 }
 
 /** Writes `<dir>/.mida/project.json` — the same marker, modes and atomic write approve uses. */
@@ -349,6 +373,26 @@ const realpathOr = (dir: string, fallback: string): string => {
     return realpathSync.native(dir)
   } catch {
     return fallback
+  }
+}
+
+/**
+ * The canonical form of a path that may not exist (a deleted folder, a path under a symlinked
+ * parent): realpath the longest ancestor still on disk and keep the tail. That lands on the same
+ * string the rows store — which were realpaths when written — so a gone folder's rows still match.
+ */
+function canonicalPath(path: string): string {
+  let probe = path
+  const tail: string[] = []
+  for (;;) {
+    try {
+      return join(realpathSync.native(probe), ...tail)
+    } catch {
+      const parent = dirname(probe)
+      if (parent === probe) return path
+      tail.unshift(basename(probe))
+      probe = parent
+    }
   }
 }
 
@@ -411,8 +455,8 @@ export type ProjectLinkPlan =
       fromFolders: number
       checkpoints: number | null
     }
-  | { kind: "already"; projectId: string; agents: string[] }
-  | { kind: "refused"; code: "no-project" | "same-folder" | "list-unreadable" | "list-tampered"; message: string }
+  | { kind: "already"; projectId: string; agents: string[]; message?: string }
+  | { kind: "refused"; code: "no-project" | "same-folder" | "list-unreadable" | "list-tampered" | "no-owner"; message: string }
 
 export async function planProjectLink(
   runtime: ListOwner,
@@ -442,9 +486,12 @@ export async function planProjectLink(
   // cwd still lands on the same folder) means this folder already answers for a project.
   const own = findProjectMarker(input.cwd)
   const ownIsSelf = own !== null && realpathOr(own.markerDir, resolve(own.markerDir)) === root
-  const file = await readApprovalsFile(runtime.home, runtime.owner)
+  const file = await readListForPlan(runtime.home, runtime.owner)
   // which agents the project allows lives only in the signed list — a list it cannot verify or
   // read makes that unknowable, so link refuses rather than guess or rebuild
+  if (file.kind === "no-owner") {
+    return { kind: "refused", code: "no-owner", message: NO_OWNER }
+  }
   if (file.kind === "unreadable") {
     return { kind: "refused", code: "list-unreadable", message: LIST_UNREADABLE }
   }
@@ -475,7 +522,18 @@ export async function planProjectLink(
   const missing = agents.filter(
     (agent) => !entries.some((e) => e.agent === agent && e.projectId === source.projectId && sameProjectRoot(e.root, root)),
   )
-  if (ownIsSelf && own!.projectId === source.projectId && missing.length === 0) {
+  if (own !== null && own.projectId === source.projectId && !ownIsSelf) {
+    // B sits inside the very project it is being linked to — its nearest marker already names
+    // it. Splitting the subfolder off with its own marker would change what the folder answers
+    // for, so the link is a stated no-op, not a write (in-16 B4).
+    return {
+      kind: "already",
+      projectId: source.projectId,
+      agents,
+      message: `this folder already belongs to project ${source.projectId} (the nearest .mida/project.json wins); nothing to link`,
+    }
+  }
+  if (ownIsSelf && missing.length === 0) {
     return { kind: "already", projectId: source.projectId, agents }
   }
   return { kind: "ok", projectId: source.projectId, sourceRoot, root, agents }
@@ -498,7 +556,8 @@ export async function linkProject(
   const root = realpathSync.native(input.dir)
   let removed: ProjectApproval[] = []
   const result = await serializeListWrite(async () => {
-    const file = await readApprovalsFile(runtime.home, runtime.owner)
+    const file = await readListForPlan(runtime.home, runtime.owner)
+    if (file.kind === "no-owner") throw listRefusal("no-owner")
     if (file.kind === "unreadable") throw listRefusal("list-unreadable")
     if (file.kind === "bad-signature") throw listRefusal("list-tampered")
     const entries = file.kind === "signed" ? file.entries : []
@@ -527,7 +586,7 @@ export async function linkProject(
     // the old project's rows return verbatim
     const addedAgents = new Set(result.added)
     const restored = await serializeListWrite(async () => {
-      const file = await readApprovalsFile(runtime.home, runtime.owner)
+      const file = await readListForPlan(runtime.home, runtime.owner)
       if (file.kind !== "signed") return false // a list that broke mid-move is never rewritten blind
       const kept = file.entries.filter(
         (e) => !(e.projectId === input.projectId && sameProjectRoot(e.root, root) && addedAgents.has(e.agent)),
@@ -555,7 +614,7 @@ export async function linkProject(
  */
 export type ProjectUnlinkPlan =
   | { kind: "ok"; projectId: string; markerDir: string; root: string; rows: ProjectApproval[]; otherRoots: string[] }
-  | { kind: "refused"; code: "not-a-project" | "only-folder" | "list-unreadable" | "list-tampered"; message: string }
+  | { kind: "refused"; code: "not-a-project" | "only-folder" | "list-unreadable" | "list-tampered" | "no-owner"; message: string }
 
 export async function planProjectUnlink(
   runtime: ListOwner,
@@ -566,10 +625,13 @@ export async function planProjectUnlink(
     return { kind: "refused", code: "not-a-project", message: "this folder has no project of its own — nothing to unlink" }
   }
   const root = realpathSync.native(marker.markerDir)
-  const file = await readApprovalsFile(runtime.home, runtime.owner)
+  const file = await readListForPlan(runtime.home, runtime.owner)
   // unlink removes rows — with a list it cannot verify or read, which rows name this folder is
   // unknowable. Unlike approve it never rebuilds from empty: that would drop every project's
   // rows to remove one folder's. It refuses instead.
+  if (file.kind === "no-owner") {
+    return { kind: "refused", code: "no-owner", message: NO_OWNER }
+  }
   if (file.kind === "unreadable") {
     return { kind: "refused", code: "list-unreadable", message: LIST_UNREADABLE }
   }
@@ -578,14 +640,23 @@ export async function planProjectUnlink(
   }
   const entries = file.kind === "signed" ? file.entries : []
   const rows = entries.filter((e) => e.projectId === marker.projectId && sameProjectRoot(e.root, root))
-  const otherRoots = [
-    ...new Set(entries.filter((e) => e.projectId === marker.projectId && !sameProjectRoot(e.root, root)).map((e) => e.root)),
-  ].sort()
-  if (otherRoots.length === 0) {
+  // The only-folder guard counts FOLDERS, not approval rows (in-16 B2/L5): a project whose
+  // owner approved zero agents has no rows anywhere, so counting rows said "no other folder"
+  // about a project that plainly had one. A listed root counts only while the folder still
+  // exists and still carries this project's marker — a deleted folder, or one `project new`
+  // re-pointed, does not keep the project alive. When the project has no rows at all there is
+  // nothing the list could orphan, so unlinking the marker is allowed.
+  const live = liveProjectFolders(entries, marker.projectId)
+  live.delete(root)
+  const otherRoots = [...live].sort()
+  // The guard fires only when this folder carries rows and no other live folder remains: a
+  // marker-only unlink removes nothing from the list, so it cannot orphan signed state — even
+  // when the project's other rows name folders that are already gone.
+  if (otherRoots.length === 0 && rows.length > 0) {
     return {
       kind: "refused",
       code: "only-folder",
-      message: `project ${marker.projectId} has no other folder — unlinking would orphan it; there is nothing to unlink`,
+      message: `project ${marker.projectId} has no other folder — unlinking would orphan it; run \`mida link <other project's folder>\` here to move this folder instead`,
     }
   }
   return { kind: "ok", projectId: marker.projectId, markerDir: marker.markerDir, root, rows, otherRoots }
@@ -603,7 +674,8 @@ export async function unlinkProject(
 ): Promise<{ root: string; removed: number }> {
   const root = realpathSync.native(input.markerDir)
   const removed = await serializeListWrite(async () => {
-    const file = await readApprovalsFile(runtime.home, runtime.owner)
+    const file = await readListForPlan(runtime.home, runtime.owner)
+    if (file.kind === "no-owner") throw listRefusal("no-owner")
     if (file.kind === "unreadable") throw listRefusal("list-unreadable")
     if (file.kind === "bad-signature") throw listRefusal("list-tampered")
     const entries = file.kind === "signed" ? file.entries : []
@@ -613,6 +685,102 @@ export async function unlinkProject(
   })
   removeProjectMarker(input.markerDir)
   return { root, removed }
+}
+
+/**
+ * What `mida unlink --folder <path>` shows before the typed yes (in-16 B3): the flag exists for
+ * the folder unlink cannot reach from inside — deleted, or otherwise unreachable — where doctor's
+ * old advice ("run `mida unlink` in that folder") was impossible, and hand-editing the list would
+ * break the owner signature for every agent. A folder that still lives and carries its own marker
+ * is a normal unlink (the only-folder guard applies), so the plan delegates to it; anything else
+ * is rows-only: every signed row naming the folder's canonical root, grouped by project, removed
+ * in one signed write. The marker is never the target here — a gone folder has none left that
+ * matters, and a live one went through the normal plan.
+ */
+export type FolderUnlinkPlan =
+  | {
+      kind: "ok"
+      root: string
+      /** The path as typed, resolved absolute — a second match form for rows stored non-canonical. */
+      asTyped: string
+      gone: boolean
+      removals: { projectId: string; rows: ProjectApproval[] }[]
+    }
+  | { kind: "refused"; code: "nothing" | "no-owner" | "list-unreadable" | "list-tampered"; message: string }
+
+export async function planFolderUnlink(
+  runtime: ListOwner,
+  input: { folder: string; cwd: string; homeDir?: string },
+): Promise<ProjectUnlinkPlan | FolderUnlinkPlan> {
+  const resolved = resolveFolderInput(input.folder, input.cwd, input.homeDir ?? homedir())
+  const root = canonicalPath(resolved)
+  let exists = false
+  try {
+    exists = statSync(root).isDirectory()
+  } catch {
+    exists = false
+  }
+  const marker = exists ? findProjectMarker(resolved) : null
+  // still a live marked folder — the normal plan (and its only-folder guard) answers
+  if (
+    marker !== null &&
+    marker.projectId !== null &&
+    realpathOr(marker.markerDir, resolve(marker.markerDir)) === root
+  ) {
+    return planProjectUnlink(runtime, { cwd: resolved })
+  }
+  const file = await readListForPlan(runtime.home, runtime.owner)
+  if (file.kind === "no-owner") return { kind: "refused", code: "no-owner", message: NO_OWNER }
+  if (file.kind === "unreadable") return { kind: "refused", code: "list-unreadable", message: LIST_UNREADABLE }
+  if (file.kind === "bad-signature") return { kind: "refused", code: "list-tampered", message: LIST_TAMPERED }
+  const entries = file.kind === "signed" ? file.entries : []
+  const byProject = new Map<string, ProjectApproval[]>()
+  for (const entry of entries) {
+    // a row for a deleted folder can no longer be canonicalised, so match the canonical path AND
+    // the absolute spelling the owner typed — a pre-fix row's stored string still lands
+    if (!sameProjectRoot(entry.root, root) && entry.root !== resolve(resolved)) continue
+    const list = byProject.get(entry.projectId) ?? []
+    list.push(entry)
+    byProject.set(entry.projectId, list)
+  }
+  if (byProject.size === 0) {
+    return {
+      kind: "refused",
+      code: "nothing",
+      message:
+        marker !== null && marker.projectId !== null
+          ? `${resolved} has no marker of its own — it currently uses project ${marker.projectId} (marker in ${marker.markerDir}); nothing to unlink`
+          : `the signed list names no rows for ${resolved} — nothing to unlink`,
+    }
+  }
+  const removals = [...byProject.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([projectId, rows]) => ({ projectId, rows }))
+  return { kind: "ok", root, asTyped: resolve(resolved), gone: !exists, removals }
+}
+
+/** The write half of `mida unlink --folder`: every row naming the root under the named projects leaves, in one signed write. */
+export async function unlinkFolderRows(
+  runtime: ListOwner,
+  input: { root: string; asTyped: string; projectIds: readonly string[] },
+): Promise<{ removed: number }> {
+  return serializeListWrite(async () => {
+    const file = await readListForPlan(runtime.home, runtime.owner)
+    if (file.kind === "no-owner") throw listRefusal("no-owner")
+    if (file.kind === "unreadable") throw listRefusal("list-unreadable")
+    if (file.kind === "bad-signature") throw listRefusal("list-tampered")
+    const entries = file.kind === "signed" ? file.entries : []
+    const ids = new Set(input.projectIds)
+    const kept = entries.filter(
+      (e) =>
+        !(
+          ids.has(e.projectId) &&
+          (sameProjectRoot(e.root, input.root) || e.root === input.root || e.root === input.asTyped)
+        ),
+    )
+    runtime.home.writeSecretJson(LIST_FILE, { entries: kept, signature: await signEntries(runtime, kept) })
+    return { removed: entries.length - kept.length }
+  })
 }
 
 /**

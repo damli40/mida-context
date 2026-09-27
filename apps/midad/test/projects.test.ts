@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import type { Hex } from "@mida/protocol"
 import {
   MidaHome, approveProject, approvalsFileStatus, canonicalEntries, checkProject, findProjectMarker, linkProject,
-  loadOrCreateOwnerSecrets, newProject, planProjectLink, planProjectUnlink, projectNewPlan, removeAgentApprovals,
-  unlinkProject,
+  loadOrCreateOwnerSecrets, newProject, planFolderUnlink, planProjectLink, planProjectUnlink, projectNewPlan,
+  removeAgentApprovals, unlinkFolderRows, unlinkProject,
 } from "@mida/midad"
 import type { ProjectApproval, Runtime } from "@mida/midad"
 
@@ -585,6 +585,109 @@ describe("mida link — a second folder joins an existing project (lk-1)", () =>
     expect(entriesOf(home)).toHaveLength(2)
   })
 
+  it("a subfolder of the source project is a stated no-op, not a split (in-16 B4)", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a")
+    const sub = join(dirA, "sub")
+    mark(dirA, "p-a")
+    mkdirSync(sub)
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    const plan = await planProjectLink(runtime, { folder: dirA, cwd: sub })
+    // the nearest marker already names p-a — linking the subfolder would split it off, so the
+    // plan answers "already belongs" and the CLI exits 0 having written nothing
+    expect(plan).toMatchObject({ kind: "already", projectId: "p-a" })
+    expect((plan as { message?: string }).message).toContain("already belongs to project p-a")
+    expect(existsSync(join(sub, ".mida"))).toBe(false)
+    expect(entriesOf(home)).toHaveLength(1)
+  })
+
+  it("a folder inside ANOTHER project's tree plans a move that names that project (in-16 B5)", async () => {
+    const { dir, runtime } = setup()
+    const dirP = join(dir, "p"); const dirB = join(dirP, "b"); const dirA = join(dir, "a")
+    mark(dirP, "p-parent"); mkdirSync(dirB); mark(dirA, "p-a")
+    await approveProject(runtime, { agent: "claude-code", cwd: dirP })
+    await approveProject(runtime, { agent: "codex", cwd: dirA })
+    const plan = await planProjectLink(runtime, { folder: dirA, cwd: dirB })
+    // B carries no marker of its own but inherits p-parent's — the move prompt names it
+    expect(plan).toMatchObject({ kind: "move", fromProjectId: "p-parent", projectId: "p-a", fromFolders: 1 })
+  })
+
+  it("a link into a project with zero approved agents writes a marker and no rows — and still reverses (in-16 B2)", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mkdirSync(dirB)
+    // p-a has no approved agents, so the link adds no rows — but the marker still lands
+    const plan = await planProjectLink(runtime, { folder: dirA, cwd: dirB })
+    expect(plan).toMatchObject({ kind: "ok", projectId: "p-a", agents: [] })
+    await linkProject(runtime, { projectId: "p-a", dir: dirB })
+    expect(entriesOf(home)).toHaveLength(0)
+    expect(findProjectMarker(dirB)).toMatchObject({ projectId: "p-a" })
+    // unlink is a live folder count, not a row count: the marker-only folder leaves cleanly
+    const unlink = await planProjectUnlink(runtime, { cwd: dirB })
+    expect(unlink.kind).toBe("ok")
+    await unlinkProject(runtime, { projectId: "p-a", markerDir: dirB })
+    expect(existsSync(join(dirB, ".mida"))).toBe(false)
+    // and `project new` is reachable afterwards — the dead end is gone
+    expect(projectNewPlan(dirB, join(dir, "owner-home"))).toMatchObject({ kind: "ok" })
+  })
+
+  it("a deleted or re-pointed folder does not count against the only-folder guard (in-16 L5)", async () => {
+    const { dir, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mkdirSync(dirB)
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    await linkProject(runtime, { projectId: "p-a", dir: dirB })
+    // B is deleted — its rows remain, but they must not count as a live folder
+    rmSync(dirB, { recursive: true, force: true })
+    expect(await planProjectUnlink(runtime, { cwd: dirA })).toMatchObject({ kind: "refused", code: "only-folder" })
+    // same when the other folder was re-pointed by project new — its stale rows are dead weight
+    const { dir: d2, runtime: r2 } = setup()
+    const a2 = join(d2, "a"); const c2 = join(d2, "c")
+    mark(a2, "p-a"); mkdirSync(c2)
+    await approveProject(r2, { agent: "claude-code", cwd: a2 })
+    await linkProject(r2, { projectId: "p-a", dir: c2 })
+    rmSync(join(c2, ".mida"), { recursive: true })
+    mark(c2, "p-new")
+    expect(await planProjectUnlink(r2, { cwd: a2 })).toMatchObject({ kind: "refused", code: "only-folder" })
+  })
+
+  it("unlink run from a deep subfolder targets the marker's folder (in-16 L6)", async () => {
+    const { dir, runtime } = setup()
+    const dirA = join(dir, "a"); const deep = join(dirA, "x", "y")
+    const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mkdirSync(deep, { recursive: true }); mkdirSync(dirB)
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    await linkProject(runtime, { projectId: "p-a", dir: dirB })
+    const plan = await planProjectUnlink(runtime, { cwd: deep })
+    // the marker dir is the unlink's root — the rows and marker it plans to remove are A's
+    expect(plan).toMatchObject({ kind: "ok", markerDir: dirA, root: realpathSync(dirA) })
+    expect(plan).toMatchObject({ otherRoots: [realpathSync(dirB)] })
+  })
+
+  it("the filesystem root is not a project — `link /` refuses without touching anything (in-16 L9)", async () => {
+    const { dir, runtime } = setup()
+    const dirB = join(dir, "b")
+    mkdirSync(dirB)
+    expect(await planProjectLink(runtime, { folder: "/", cwd: dirB })).toMatchObject({ kind: "refused", code: "no-project" })
+  })
+
+  it("a home with a list but no owner cannot verify it — the plan refuses no-owner, not a guess (in-16 L8)", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mkdirSync(dirB)
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    // a reader carrying no owner address: the list exists, so missing is not the answer
+    const reader = { home, owner: undefined }
+    expect(await planProjectLink(reader, { folder: dirA, cwd: dirB })).toMatchObject({ kind: "refused", code: "no-owner" })
+    expect(await planProjectUnlink(reader, { cwd: dirA })).toMatchObject({ kind: "refused", code: "no-owner" })
+    // and with the list missing entirely the plan needs no owner at all
+    const fresh = setup()
+    const dirC = join(fresh.dir, "c"); const dirD = join(fresh.dir, "d")
+    mark(dirC, "p-c"); mkdirSync(dirD)
+    const freshReader = { home: fresh.home, owner: undefined }
+    expect(await planProjectLink(freshReader, { folder: dirC, cwd: dirD })).toMatchObject({ kind: "ok", projectId: "p-c" })
+  })
+
   describe("mida unlink — a linked folder leaves the project (lk-1)", () => {
     it("drops this folder's rows for every agent, removes the marker, and A keeps working", async () => {
       const { dir, home, runtime } = setup()
@@ -674,6 +777,59 @@ describe("mida link — a second folder joins an existing project (lk-1)", () =>
       expect(result.removed).toBe(1)
       expect(entriesOf(home)).toHaveLength(1)
       expect(existsSync(join(dirB, ".mida"))).toBe(false)
+    })
+
+    it("--folder removes a DELETED folder's rows through the signed write — the fix doctor names (in-16 B3)", async () => {
+      const { dir, home, runtime } = setup()
+      const dirA = join(dir, "a"); const dirB = join(dir, "b")
+      mark(dirA, "p-a"); mkdirSync(dirB)
+      await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+      await approveProject(runtime, { agent: "codex", cwd: dirA })
+      await linkProject(runtime, { projectId: "p-a", dir: dirB })
+      const gone = realpathSync(dirB)
+      rmSync(dirB, { recursive: true, force: true })
+      expect(entriesOf(home)).toHaveLength(4)
+
+      // unlink cannot run inside a folder that is gone — the flag names it from anywhere
+      const plan = await planFolderUnlink(runtime, { folder: gone, cwd: dirA })
+      expect(plan).toMatchObject({ kind: "ok", root: gone, gone: true })
+      const removals = (plan as { removals: { projectId: string; rows: ProjectApproval[] }[] }).removals
+      expect(removals).toHaveLength(1)
+      expect(removals[0]!.rows).toHaveLength(2)
+      const result = await unlinkFolderRows(runtime, { root: gone, asTyped: gone, projectIds: ["p-a"] })
+      expect(result.removed).toBe(2)
+      // B's rows are gone, A's stand, and the list still verifies — no hand-edit broke it
+      const entries = entriesOf(home)
+      expect(entries).toHaveLength(2)
+      expect(entries.every((e) => e.root === realpathSync(dirA))).toBe(true)
+      expect(await approvalsFileStatus(home, runtime.owner)).toBe("signed")
+      expect(await checkProject(runtime, { agent: "claude-code", cwd: dirA })).toMatchObject({ ok: true })
+    })
+
+    it("--folder on a live marked folder is the normal unlink — the only-folder guard still applies (in-16 B3)", async () => {
+      const { dir, runtime } = setup()
+      const dirA = join(dir, "a")
+      mark(dirA, "p-a")
+      await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+      // A is the project's only live folder — the flag form must not skip the guard
+      expect(await planFolderUnlink(runtime, { folder: dirA, cwd: join(dir, "work") })).toMatchObject({
+        kind: "refused",
+        code: "only-folder",
+      })
+    })
+
+    it("--folder refuses plainly when nothing names the folder — and says which project a subfolder inherits (in-16 B3)", async () => {
+      const { dir, runtime } = setup()
+      const dirA = join(dir, "a"); const bare = join(dir, "bare"); const sub = join(dirA, "sub")
+      mark(dirA, "p-a"); mkdirSync(bare); mkdirSync(sub)
+      await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+      // a folder no row names and no marker covers — nothing to remove
+      expect(await planFolderUnlink(runtime, { folder: bare, cwd: dir })).toMatchObject({ kind: "refused", code: "nothing" })
+      // a subfolder inherits A's marker — unlinking IT would mean nothing; the refusal names A
+      const plan = await planFolderUnlink(runtime, { folder: sub, cwd: dir })
+      expect(plan).toMatchObject({ kind: "refused", code: "nothing" })
+      expect((plan as { message: string }).message).toContain("p-a")
+      expect((plan as { message: string }).message).toContain(realpathSync(dirA))
     })
   })
 
