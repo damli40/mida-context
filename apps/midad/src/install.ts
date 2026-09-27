@@ -736,22 +736,46 @@ export const CODEX_TRUST_SENTENCE =
   "Codex will ignore these hooks until you trust them: open codex, type /hooks, and trust the Mida entries."
 
 /**
- * Codex writes its hook-trust records — the rows `/hooks` produced — as `[hooks.state]` and
- * `[hooks.state."<path>:<event>:<row>:<index>"]` tables holding `trusted_hash` lines. It appends
- * them after the LAST hooks table in the file, which lands inside our markers, before the close
- * marker. They are Codex's data (and can hold other tools' entries), never part of our block:
- * the version compare ignores them, and install/uninstall carry them past the close marker
- * verbatim instead of deleting them.
+ * The table headers Mida's managed block is made of — the `[[hooks.<event>]]` and
+ * `[[hooks.<event>.hooks]]` array-of-table headers across every recognised block version.
+ * Anything appended after the last hooks table lands inside our markers, before the close
+ * marker — Codex's `[hooks.state]` trust records, a `[projects."…"]` table, whatever a tool
+ * or a person put there (in-16 K-3). A table whose header is NOT one of ours is foreign
+ * content: never part of the block we compare, never deleted — it is carried past the close
+ * marker verbatim on a rewrite.
  */
-const CODEX_STATE_TABLE = /^\[hooks\.state(?:\.[^\][]*)?\]$/
-const CODEX_STATE_FIELD = /^trusted_hash\s*=\s*"[^"]*"$/
-const CODEX_STATE_START = /\n\[hooks\.state(?:\.|\])/
+function codexOwnTables(): Set<string> {
+  const tables = new Set<string>()
+  for (const block of Object.keys(codexKnownBlocks())) {
+    for (const line of block.split("\n")) if (line.startsWith("[")) tables.add(line)
+  }
+  return tables
+}
 
-const isCodexStateLine = (line: string): boolean =>
-  line.trim() === "" || CODEX_STATE_TABLE.test(line.trim()) || CODEX_STATE_FIELD.test(line.trim())
+/**
+ * A core block with each `command = "…"` line replaced by a blank placeholder — the shape
+ * compare that recognises OUR block written from a different checkout (absolute paths differ).
+ * A command line that does not parse as a Mida hook returns null: a foreign command inside
+ * the markers means the block is not ours to rewrite.
+ */
+function codexBlockShape(text: string): string | null {
+  const out: string[] = []
+  for (const line of text.split("\n")) {
+    const command = /^command = "([^"]*)"$/.exec(line)
+    if (command === null) {
+      out.push(line)
+      continue
+    }
+    if (parseMidaCommand(command[1]!) === null) return null
+    out.push('command = ""')
+  }
+  return out.join("\n")
+}
 
 /** Finds a KNOWN managed block between its markers; "absent" when neither marker is present. */
-function locateCodexBlock(text: string): { start: number; end: number; version: "current" | "bare" | "v1" | "stale"; stateTail: string } | "absent" {
+function locateCodexBlock(text: string):
+  | { start: number; end: number; tailStart: number; version: "current" | "bare" | "v1" | "stale"; foreignTail: string }
+  | "absent" {
   const hasOpen = text.includes(CODEX_MARKER_OPEN)
   const hasClose = text.includes(CODEX_MARKER_CLOSE)
   if (!hasOpen && !hasClose) return "absent"
@@ -759,29 +783,44 @@ function locateCodexBlock(text: string): { start: number; end: number; version: 
   const closeAt = text.indexOf(CODEX_MARKER_CLOSE)
   if (!hasOpen || !hasClose || closeAt < start) throw settingsUnreadable()
   const end = closeAt + CODEX_MARKER_CLOSE.length
-  const blockText = text.slice(start, end)
-  // A [hooks.state…] suffix inside the markers is Codex's trust state, not our block: split it
-  // off before comparing. Anything else in that suffix — a field we do not recognise, a table
-  // that is not state — is the same edited content the bare markers refuse on.
-  const interior = blockText.slice(CODEX_MARKER_OPEN.length, blockText.length - CODEX_MARKER_CLOSE.length)
-  let core = blockText
-  let stateTail = ""
-  const stateAt = interior.search(CODEX_STATE_START)
-  if (stateAt >= 0) {
-    const tail = interior.slice(stateAt)
-    if (!tail.split("\n").every(isCodexStateLine)) throw settingsUnreadable()
-    core = `${CODEX_MARKER_OPEN}${interior.slice(0, stateAt)}${CODEX_MARKER_CLOSE}`
-    stateTail = tail.replace(/\n+$/, "")
+  const interior = text.slice(start + CODEX_MARKER_OPEN.length, closeAt)
+  // The interior is ours up to the first foreign table header. Whatever line break precedes
+  // that header — `\n` or the `\r\n` of a CRLF file — belongs to the tail so it re-lands on a
+  // line boundary when moved after the close marker.
+  const own = codexOwnTables()
+  const lines = interior.split("\n")
+  let tailFrom = -1
+  let offset = 0
+  for (const raw of lines) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw
+    if (line.startsWith("[") && !own.has(line)) {
+      tailFrom = interior[offset - 2] === "\r" ? offset - 2 : offset - 1
+      break
+    }
+    offset += raw.length + 1
   }
-  const version = codexKnownBlocks()[core]
-  if (version !== undefined) return { start, end, version, stateTail }
+  const foreignTail = tailFrom >= 0 ? interior.slice(tailFrom).replace(/[\r\n]+$/, "") : ""
+  const coreEnd = tailFrom >= 0 ? tailFrom : interior.length
+  const coreInterior = interior
+    .slice(0, coreEnd)
+    .split("\n")
+    .map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line))
+    .join("\n")
+    .replace(/\n+$/, "")
+  const core = `${CODEX_MARKER_OPEN}${coreInterior}\n${CODEX_MARKER_CLOSE}`
+  const tailStart = start + CODEX_MARKER_OPEN.length + coreEnd
+  const known = codexKnownBlocks()[core]
+  if (known !== undefined) return { start, end, tailStart, version: known, foreignTail }
   // A block we do not byte-match can still be ours: an absolute-path block written from a
-  // different checkout (the repo moved, or an older build's dist). Every command line must
-  // parse as a Mida hook for that to be true — anything else between the markers is a
-  // human's edit and refuses.
-  const commands = [...core.matchAll(/command = "([^"]*)"/g)].map((match) => match[1]!)
-  if (commands.length > 0 && commands.every((command) => parseMidaCommand(command) !== null)) {
-    return { start, end, version: "stale", stateTail }
+  // different checkout (the repo moved, or an older build's dist) has our table shape with
+  // different command paths. The shape must match a known block AND every command must parse
+  // as a Mida hook — a foreign command, or any other line a known block does not carry (a
+  // hand-added key like `timeout = 5`), is a human's edit and refuses (in-16 K-3).
+  const shape = codexBlockShape(core)
+  if (shape !== null) {
+    for (const block of Object.keys(codexKnownBlocks())) {
+      if (codexBlockShape(block) === shape) return { start, end, tailStart, version: "stale", foreignTail }
+    }
   }
   throw settingsUnreadable()
 }
@@ -800,15 +839,27 @@ export function installCodex(configPath: string): InstallOutcome {
     if (block !== "absent") {
       if (block.version === "current") return "already-installed"
       // an older managed block is ours to replace in place — same outcome as a fresh append.
-      // Codex's trust records come back out immediately AFTER the close marker: still valid
-      // TOML, and outside the region the next locate treats as ours to rewrite.
-      writeFileAtomic(configPath, `${text.slice(0, block.start)}${codexBlock()}${block.stateTail}${text.slice(block.end)}`)
+      // The foreign tail (Codex's trust records and any other table that landed inside the
+      // markers) comes back out immediately AFTER the close marker: still valid TOML, and
+      // outside the region the next locate treats as ours to rewrite. The rewritten block
+      // keeps the file's own line endings (in-16 K-3).
+      const eol = text.includes("\r\n") ? "\r\n" : "\n"
+      const current = eol === "\r\n" ? codexBlock().replace(/\n/g, "\r\n") : codexBlock()
+      writeFileAtomic(configPath, `${text.slice(0, block.start)}${current}${block.foreignTail}${text.slice(block.end)}`)
       return "installed"
     }
   }
-  const separator = text === null || text === "" ? "" : text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n"
+  const eol = (text ?? "").includes("\r\n") ? "\r\n" : "\n"
+  const separator = text === null || text === ""
+    ? ""
+    : text.endsWith(`${eol}${eol}`)
+      ? ""
+      : text.endsWith("\n")
+        ? eol
+        : `${eol}${eol}`
   mkdirSync(dirname(configPath), { recursive: true })
-  writeFileAtomic(configPath, `${text ?? ""}${separator}${codexBlock()}\n`)
+  const block = eol === "\r\n" ? codexBlock().replace(/\n/g, "\r\n") : codexBlock()
+  writeFileAtomic(configPath, `${text ?? ""}${separator}${block}${eol}`)
   return "installed"
 }
 
@@ -841,7 +892,7 @@ export function midaCommandsInCodexConfig(configPath: string): string[] | "absen
     const block = locateCodexBlock(text)
     if (block === "absent") return "absent"
     const commands: string[] = []
-    for (const match of text.slice(block.start, block.end).matchAll(/command = "([^"]*)"/g)) {
+    for (const match of text.slice(block.start, block.tailStart).matchAll(/command = "([^"]*)"/g)) {
       commands.push(match[1]!)
     }
     return commands
@@ -862,12 +913,23 @@ export function uninstallCodex(configPath: string): UninstallOutcome {
   const block = locateCodexBlock(text)
   if (block === "absent") return "not-installed"
   const before = text.slice(0, block.start)
-  // the newline that ends the close-marker line belongs to the block
-  const after = text[block.end] === "\n" ? text.slice(block.end + 1) : text.slice(block.end)
-  // install added one blank line ("\n") when the file ended in a lone newline — the common case.
+  // the line ending that ends the close-marker line belongs to the block — one or two bytes
+  const after = text.startsWith("\r\n", block.end)
+    ? text.slice(block.end + 2)
+    : text[block.end] === "\n"
+      ? text.slice(block.end + 1)
+      : text.slice(block.end)
+  // install added one blank line when the file ended in a lone newline — the common case.
   // Two or more blank lines before the block could not have come from install: they stay.
-  const restored = before.endsWith("\n\n") && !before.endsWith("\n\n\n") ? before.slice(0, -1) : before
-  // Codex's trust records are not ours to delete — they stay where the block stood, valid TOML
-  writeFileAtomic(configPath, `${restored}${block.stateTail === "" ? "" : `${block.stateTail}\n`}${after}`)
+  const restored = before.endsWith("\r\n\r\n") && !before.endsWith("\r\n\r\n\r\n")
+    ? before.slice(0, -2)
+    : before.endsWith("\n\n") && !before.endsWith("\n\n\n")
+      ? before.slice(0, -1)
+      : before
+  // Codex's trust records — and any other foreign table that landed inside the markers — are
+  // not ours to delete: they stay where the block stood, valid TOML, keeping the file's own
+  // line ending between them and what follows (in-16 K-3).
+  const eol = text.includes("\r\n") ? "\r\n" : "\n"
+  writeFileAtomic(configPath, `${restored}${block.foreignTail === "" ? "" : `${block.foreignTail}${eol}`}${after}`)
   return "uninstalled"
 }

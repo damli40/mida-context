@@ -633,15 +633,113 @@ describe("Codex's [hooks.state] trust records inside the managed block", () => {
     expect(text).not.toContain("mida hooks")
   })
 
-  it("a state section carrying foreign lines is not Codex's — the block still refuses", () => {
+  it("a state table carrying a field we do not know is still Codex's — it is preserved, not refused (in-16 K-3)", () => {
     const config = join(dir(), "config.toml")
+    // a newer Codex could write more than trusted_hash inside its own state tables; the table's
+    // header is not one of Mida's, so the whole table is foreign data carried verbatim
     const text = `${withCodexState(codexBlock()).replace(trustedHash("323e8107"), 'custom_field = "value"')}\n`
     writeFileSync(config, text)
-    for (const act of [installCodex, uninstallCodex]) {
-      expect(() => act(config)).toThrowError(expect.objectContaining({ code: "settings-unreadable" }))
-      expect(readFileSync(config, "utf8")).toBe(text)
+    expect(codexHooksStatus(config)).toBe("installed")
+    expect(installCodex(config)).toBe("already-installed")
+    expect(readFileSync(config, "utf8")).toBe(text)
+    expect(uninstallCodex(config)).toBe("uninstalled")
+    expect(readFileSync(config, "utf8")).toContain('custom_field = "value"')
+  })
+
+  it("[hooks.state] with NO blank line before it still reads installed (in-16 K-3 / P1)", () => {
+    const config = join(dir(), "config.toml")
+    // Codex appends after the last hooks table — nothing says it adds a blank line first
+    const tight = `${codexBlock().slice(0, codexBlock().lastIndexOf("# <<< mida hooks <<<"))}${codexStateTables}\n# <<< mida hooks <<<`
+    const text = `model = "gpt-5"\n\n${tight}\n`
+    writeFileSync(config, text)
+    expect(codexHooksStatus(config)).toBe("installed")
+    expect(installCodex(config)).toBe("already-installed")
+    expect(readFileSync(config, "utf8")).toBe(text)
+  })
+
+  it("any other table inside the markers is foreign data — preserved through install and uninstall (in-16 K-3)", () => {
+    // whatever wrote [hooks.state] inside the markers can write [projects."…"] there too —
+    // doctor must not call that outdated and install/uninstall must not delete it
+    const foreign = '[projects."/Users/x/newproj"]\ntrust_level = "trusted"'
+    const before = 'model = "gpt-5"\n'
+    for (const block of [codexBlock(), CODEX_BLOCK]) {
+      const config = join(dir(), "config.toml")
+      const text = `${before}\n${block.slice(0, block.lastIndexOf("# <<< mida hooks <<<"))}\n${foreign}\n# <<< mida hooks <<<\n`
+      writeFileSync(config, text)
+      const installed = installCodex(config)
+      const after = readFileSync(config, "utf8")
+      expect(after).toContain("newproj")
+      expect(after).toContain('trust_level = "trusted"')
+      // a rewrite moves the foreign table out after the close marker — never deletes it; a
+      // current block needs no rewrite, so it stays where it was (still ours to keep)
+      if (installed === "installed") {
+        expect(after.indexOf(foreign)).toBeGreaterThan(after.indexOf("# <<< mida hooks <<<"))
+      }
+      const config2 = join(dir(), "config.toml")
+      writeFileSync(config2, text)
+      expect(uninstallCodex(config2)).toBe("uninstalled")
+      expect(readFileSync(config2, "utf8")).toContain("newproj")
     }
+  })
+
+  it("a foreign table, THEN state tables, THEN another foreign table — all preserved (in-16 K-3)", () => {
+    const config = join(dir(), "config.toml")
+    const extra = `[projects."/Users/x/newproj"]\ntrust_level = "trusted"\n\n${codexStateTables}\n\n[notice]\nhide_full_access_warning = true`
+    const text = `model = "x"\n\n${codexBlock().slice(0, codexBlock().lastIndexOf("# <<< mida hooks <<<"))}\n${extra}\n# <<< mida hooks <<<\n`
+    writeFileSync(config, text)
+    expect(codexHooksStatus(config)).toBe("installed")
+    expect(uninstallCodex(config)).toBe("uninstalled")
+    const after = readFileSync(config, "utf8")
+    expect(after).toContain("newproj")
+    expect(after).toContain("hide_full_access_warning")
+    expect(after.match(/trusted_hash/g)).toHaveLength(5)
+    expect(after).not.toContain("mida hooks")
+  })
+
+  it("a hand edit INSIDE one of our hook tables refuses — never silently wiped (in-16 K-3 / P6)", () => {
+    const config = join(dir(), "config.toml")
+    const edited = codexBlock().replace('type = "command"', 'type = "command"\ntimeout = 5')
+    const text = `model = "x"\n\n${edited}\n`
+    writeFileSync(config, text)
     expect(codexHooksStatus(config)).toBe("unreadable")
+    expect(() => installCodex(config)).toThrowError(expect.objectContaining({ code: "settings-unreadable" }))
+    expect(readFileSync(config, "utf8")).toBe(text)
+    expect(() => uninstallCodex(config)).toThrowError(expect.objectContaining({ code: "settings-unreadable" }))
+  })
+
+  it("a foreign command line inside the markers refuses — the shape is not ours (in-16 K-3)", () => {
+    const config = join(dir(), "config.toml")
+    const edited = codexBlock().replace(/command = "[^"]*"/, 'command = "other-tool hook"')
+    const text = `model = "x"\n\n${edited}\n`
+    writeFileSync(config, text)
+    expect(codexHooksStatus(config)).toBe("unreadable")
+    expect(() => installCodex(config)).toThrowError(expect.objectContaining({ code: "settings-unreadable" }))
+    expect(readFileSync(config, "utf8")).toBe(text)
+  })
+
+  it("a CRLF file keeps CRLF through upgrade and uninstall — no mixed endings (in-16 K-3 / P5)", () => {
+    const config = join(dir(), "config.toml")
+    const lf = `model = "x"\n\n${CODEX_BLOCK.slice(0, CODEX_BLOCK.lastIndexOf("# <<< mida hooks <<<"))}\n${codexStateTables}\n# <<< mida hooks <<<\n`
+    writeFileSync(config, lf.replace(/\n/g, "\r\n"))
+    expect(codexHooksStatus(config)).toBe("outdated")
+    expect(installCodex(config)).toBe("installed")
+    const after = readFileSync(config, "utf8")
+    // no lone CR, no lone LF: every line break in the file is a full CRLF
+    expect(/\r(?!\n)/.test(after)).toBe(false)
+    expect(/[^\r]\n/.test(after)).toBe(false)
+    expect(after).toContain(codexBlock().replace(/\n/g, "\r\n"))
+    expect(after.match(/trusted_hash/g)).toHaveLength(5)
+    // a CRLF block that is otherwise current reads installed — not rewritten to LF
+    const config2 = join(dir(), "config.toml")
+    writeFileSync(config2, `model = "x"\r\n\r\n${codexBlock().replace(/\n/g, "\r\n")}\r\n`)
+    expect(codexHooksStatus(config2)).toBe("installed")
+    expect(installCodex(config2)).toBe("already-installed")
+    // and uninstall on the upgraded CRLF file leaves clean CRLF
+    expect(uninstallCodex(config)).toBe("uninstalled")
+    const un = readFileSync(config, "utf8")
+    expect(/\r(?!\n)/.test(un)).toBe(false)
+    expect(/[^\r]\n/.test(un)).toBe(false)
+    expect(un.match(/trusted_hash/g)).toHaveLength(5)
   })
 })
 
