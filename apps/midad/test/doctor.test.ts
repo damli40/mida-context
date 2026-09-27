@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { spawn } from "node:child_process"
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import type { AddressInfo, Server } from "node:net"
 import { createServer as createHttpServer } from "node:http"
@@ -8,9 +8,11 @@ import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { toFunctionSelector } from "viem"
+import { privateKeyToAccount } from "viem/accounts"
 import { encodeUint64 } from "@mida/protocol"
 import { parseDeployment } from "@mida/chain"
-import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, installClaudeCode, installCodex, installDevin, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, installClaudeCode, installCodex, installDevin, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
+import type { Runtime } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
 
@@ -418,6 +420,47 @@ describe("mida doctor without a chain", () => {
     const lines: string[] = []
     await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
     expect(lines).toContain("PROBLEM: the approved-projects list failed its signature check — re-run `mida approve <agent>` in each project folder")
+  })
+
+  it("one ok line per project with every approved folder — a listed folder that is gone is a PROBLEM (lk-1)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const owner = privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey).address
+    const runtime = { home, owner } as unknown as Runtime
+    const dirA = mkdtempSync(join(tmpdir(), "mida-docp-a-"))
+    const dirB = mkdtempSync(join(tmpdir(), "mida-docp-b-"))
+    const dirC = mkdtempSync(join(tmpdir(), "mida-docp-c-"))
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "ae3e5609-0000-4000-8000-000000000001" }))
+    mkdirSync(join(dirC, ".mida"))
+    writeFileSync(join(dirC, ".mida", "project.json"), JSON.stringify({ projectId: "bb000000-0000-4000-8000-000000000002" }))
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    await approveProject(runtime, { agent: "claude-code", cwd: dirC })
+    // link adds a second approved folder to project ae3e5609… — one project, two roots
+    await linkProject(runtime, { projectId: "ae3e5609-0000-4000-8000-000000000001", dir: dirB })
+
+    const run = async () => {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      return lines
+    }
+    const lines = await run()
+    // one line per project on the list, each naming every folder its rows cover
+    const projectLine = lines.find((l) => l.startsWith("ok: project ae3e5609…"))
+    expect(projectLine).toBeDefined()
+    expect(projectLine).toContain("2 folders")
+    expect(projectLine).toContain(realpathSync(dirA))
+    expect(projectLine).toContain(realpathSync(dirB))
+    expect(lines).toContain(`ok: project bb000000… — 1 folder (${realpathSync(dirC)})`)
+
+    // a listed folder disappears — the project line stays, the gone root becomes a PROBLEM with the fix
+    const goneRoot = realpathSync(dirB)
+    rmSync(dirB, { recursive: true, force: true })
+    const after = await run()
+    expect(after.some((l) => l.startsWith("ok: project ae3e5609…"))).toBe(true)
+    const missing = after.find((l) => l.startsWith("PROBLEM:") && l.includes(goneRoot))
+    expect(missing).toBeDefined()
+    expect(missing).toContain("mida unlink")
+    expect(missing).toContain("approved-projects.json")
   })
 
   it("names the API-key variables that are set — never their values", async () => {

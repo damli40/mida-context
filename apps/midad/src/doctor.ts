@@ -25,7 +25,7 @@ import { CODEX_TRUST_SENTENCE, claudeDesktopConfigPath, claudeHooksStatus, codex
 import type { InstallTool, McpClientTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
-import { approvalsFileStatus } from "./projects.js"
+import { approvalsFileStatus, readApprovalsFile } from "./projects.js"
 import { listJobs } from "./queue.js"
 import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, serviceUrlInEffect, sponsorReachable } from "./runtime.js"
 import { mismatchLine, readSavedNetwork, resolveNetwork } from "./network.js"
@@ -590,7 +590,34 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         if (status === "bad-signature") {
           return [problem("the approved-projects list failed its signature check", "re-run `mida approve <agent>` in each project folder")]
         }
-        return status === "missing" ? ["ok: no approved projects yet"] : ["ok: approved-projects signature valid"]
+        if (status === "missing") return ["ok: no approved projects yet"]
+        const file = await readApprovalsFile(home, owner)
+        const lines = ["ok: approved-projects signature valid"]
+        // lk-1 — one project may live in several approved folders; the report names each
+        // project with every folder its rows cover, sorted so the lines are stable
+        if (file.kind !== "signed") return lines
+        const byProject = new Map<string, Set<string>>()
+        for (const entry of file.entries) {
+          const roots = byProject.get(entry.projectId) ?? new Set<string>()
+          roots.add(entry.root)
+          byProject.set(entry.projectId, roots)
+        }
+        const short = (id: string) => `${id.slice(0, 8)}…`
+        for (const [projectId, roots] of [...byProject.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+          const folders = [...roots].sort()
+          lines.push(`ok: project ${short(projectId)} — ${folders.length === 1 ? "1 folder" : `${folders.length} folders`} (${folders.join(", ")})`)
+          for (const root of folders) {
+            if (!existsSync(root)) {
+              lines.push(
+                problem(
+                  `project ${short(projectId)} names ${root}, which no longer exists`,
+                  "run `mida unlink` in that folder, or remove its row from approved-projects.json",
+                ),
+              )
+            }
+          }
+        }
+        return lines
       },
     },
     {
