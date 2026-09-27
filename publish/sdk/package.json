@@ -1,5 +1,5 @@
 {
-  "name": "mida-context-sdk",
+  "name": "@mida-context/sdk",
   "version": "0.1.0",
   "description": "Mida SDK — ask a user's Mida for scoped context: request access, read and write what the grant allows.",
   "type": "module",

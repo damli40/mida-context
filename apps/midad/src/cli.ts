@@ -74,20 +74,31 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
  * be an identity is still usage, never read under.
  */
 const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
+/**
+ * The name `mida add-agent` accepts — the SDK-side agents' own rule (`install`/`init` names are
+ * fixed strings): lowercase letters, digits and dashes, starting with a letter or digit.
+ */
+const ADD_AGENT_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/
+/**
+ * The names this build already knows how to provision — init's own agents plus every tool an
+ * install registers. `add-agent` is only for names outside this set.
+ */
+const BUILTIN_AGENT_NAMES: ReadonlySet<string> = new Set([...AGENTS, ...INSTALL_TOOLS])
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | migrate [--undo] | task [<name> | --clear | show <name>]" +
-  "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or the identity a client installs)"
+  "usage: mida init | install <tool> | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | migrate [--undo] | task [<name> | --clear | show <name>]" +
+  "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or any identity add-agent or a client install provisions)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
-export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", "link", "unlink", "project", "task", ...WITH_AGENT]
+export const CLI_COMMANDS: readonly string[] = ["init", "install", "add-agent", "remember", "migrate", "batching", "link", "unlink", "project", "task", ...WITH_AGENT]
 /**
  * The commands that change who has access — or which folder belongs to which project. Only `mida`
  * in the owner's own terminal may run them: they never go to the daemon socket. `install` for an
- * MCP client belongs here: it registers that client's identity on the chain. `link` and `unlink`
+ * MCP client belongs here: it registers that client's identity on the chain. `add-agent` belongs
+ * here for the same reason: it registers a new identity on the chain. `link` and `unlink`
  * sign only the owner list, `project new` writes only a marker — they never open the runtime.
  */
-export const OWNER_COMMANDS: readonly string[] = ["init", "install", "approve", "revoke", "remember", "migrate", "batching", "link", "unlink", "project"]
+export const OWNER_COMMANDS: readonly string[] = ["init", "install", "add-agent", "approve", "revoke", "remember", "migrate", "batching", "link", "unlink", "project"]
 /** The owner commands that must see a real terminal. `init` is exempt: it grants nothing to an agent. */
-const TERMINAL_COMMANDS: readonly string[] = ["install", "approve", "revoke", "remember", "migrate", "batching", "link", "unlink", "project"]
+const TERMINAL_COMMANDS: readonly string[] = ["install", "add-agent", "approve", "revoke", "remember", "migrate", "batching", "link", "unlink", "project"]
 export const NEEDS_TERMINAL_LINE = "needs-terminal: run this yourself in a terminal window"
 
 /** What the daemon answers when an owner command reaches /cli anyway. */
@@ -786,6 +797,26 @@ async function runFolderCommand(argv: string[], deps: CliDeps): Promise<number> 
 }
 
 /**
+ * The gate `mida add-agent <name>` runs before any prompt: the argument has to be present, a
+ * name that can be an identity, not one this build provisions through its own command, and not
+ * one this home already holds. Software and passkey homes share the check — it reads only files.
+ */
+function addAgentCheck(home: MidaHome, argv: string[]): { kind: "usage" } | { kind: "refused"; line: string } | { kind: "ok"; name: string } {
+  if (argv.length !== 2) return { kind: "usage" }
+  const name = argv[1]!
+  if (BUILTIN_AGENT_NAMES.has(name)) {
+    return { kind: "refused", line: `refused: ${name} is a built-in agent — it already has its own setup path` }
+  }
+  if (!ADD_AGENT_NAME.test(name)) {
+    return { kind: "refused", line: `refused: agent names match ^[a-z0-9][a-z0-9-]{0,39}$ — lowercase letters, digits and dashes, starting with a letter or digit` }
+  }
+  if (listAgentNames(home).includes(name)) {
+    return { kind: "refused", line: `refused: ${name} already has an identity in this Mida home — nothing to add` }
+  }
+  return { kind: "ok", name }
+}
+
+/**
  * The owner commands — init, approve, revoke, remember — run here, in the `mida` process, on the
  * owner runtime. They never touch the daemon socket: the daemon cannot sign as the owner, and a
  * socket client must never be able to.
@@ -812,6 +843,25 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       const result = await init(runtime, AGENTS)
       deps.print(`owner ${result.owner}`)
       for (const [name, agentId] of Object.entries(result.agents)) deps.print(`agent ${name} ${agentId}`)
+    } else if (command === "add-agent") {
+      const check = addAgentCheck(runtime.home, argv)
+      if (check.kind === "usage") return usage()
+      if (check.kind === "refused") {
+        deps.print(check.line)
+        return 1
+      }
+      const prompt = deps.prompt ?? terminalPrompt
+      const drain = deps.drainInput ?? drainBufferedStdin
+      deps.print(`add-agent ${check.name}: registers a new project-context identity on chain — the same provision pass \`mida init\` runs per agent`)
+      // same stale-input rule as approve: only a line typed against the visible ask counts
+      await drain()
+      if ((await prompt(`Type yes to add ${check.name}: `)).trim() !== "yes") {
+        deps.print("not approved")
+        return 1
+      }
+      const result = await init(runtime, [check.name])
+      deps.print(`added ${check.name} ${result.agents[check.name]}`)
+      deps.print(`next: the agent files its own access request — run \`mida request ${check.name}\` or let its integration call requestAccess(), then \`mida approve ${check.name}\` in a project folder`)
     } else if (command === "remember") {
       const replaceId = argv[1] === "--replaces" ? (argv[2] ?? "") : undefined
       let replaces: { contextId: Hex; namespace: FactNamespace } | undefined
@@ -1510,6 +1560,38 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
         return 0
       } finally {
         await installSession.close()
+      }
+    }
+    if (command === "add-agent") {
+      const check = addAgentCheck(deps.home, argv)
+      if (check.kind === "usage") {
+        deps.print(USAGE)
+        return 2
+      }
+      if (check.kind === "refused") {
+        deps.print(check.line)
+        return 1
+      }
+      deps.print(`add-agent ${check.name}: registers a new project-context identity on chain — the same provision pass \`mida init --passkey\` runs per agent`)
+      const drain = deps.drainInput ?? drainBufferedStdin
+      const prompt = deps.prompt ?? terminalPrompt
+      await drain()
+      if ((await prompt(`Type yes to add ${check.name}: `)).trim() !== "yes") {
+        deps.print("not approved")
+        return 1
+      }
+      // registering a project-context agent needs no passkey round — the operator carries the
+      // manifest — so add-agent is one provision pass on a secret-less session, exactly like
+      // the install path above
+      const addSession = await ServiceRuntime.openOwnerSession(deps.home, deps.network)
+      try {
+        addSession.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
+        const agents = await provisionPasskeyAgents(addSession, [check.name], linkDeps)
+        deps.print(`added ${check.name} ${agents[check.name]}`)
+        deps.print(`next: the agent files its own access request — run \`mida request ${check.name}\` or let its integration call requestAccess(), then \`mida approve ${check.name}\` in a project folder`)
+        return 0
+      } finally {
+        await addSession.close()
       }
     }
     const agent = argv[1] ?? ""

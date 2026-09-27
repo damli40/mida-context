@@ -139,17 +139,14 @@ check(mcp.status === 0 && !mcp.error, "mida-mcp starts with a registered identit
 const consumerJs = join(project, "consumer.mjs")
 writeFileSync(
   consumerJs,
-  `import { MidaAgent, connectAgent, FileAccessRequestStore, PERMISSION, PROVENANCE_POLICY, HOSTED_STORAGE_URL, HOSTED_SPONSOR_URL } from ${JSON.stringify(names.sdk)}\n\n// the SDK loads and exposes the agent class, the connect helper, the durable store and the bit constants\nif (typeof MidaAgent !== "function" || typeof connectAgent !== "function" || typeof FileAccessRequestStore !== "function") process.exit(1)\nif (PERMISSION.READ !== 1 || PROVENANCE_POLICY.ALLOW_INFERENCE !== 1) process.exit(1)\nconsole.log(HOSTED_STORAGE_URL, HOSTED_SPONSOR_URL)\n`,
+  `import { Mida, MidaSdkError, isMidaSdkError } from ${JSON.stringify(names.sdk)}\n\n// the SDK loads and exposes the Mida class, the typed error and the type guard\nif (typeof Mida !== "function" || typeof isMidaSdkError !== "function") process.exit(1)\nif (!isMidaSdkError(new MidaSdkError("invalid-option", "x"), "invalid-option")) process.exit(1)\nconst mida = new Mida({ agent: "consumer" })\nfor (const method of ["context", "remember", "requestAccess", "verify", "handoff", "whatsNew", "status"]) {\n  if (typeof mida[method] !== "function") process.exit(1)\n}\nconsole.log("sdk ok")\n`,
 )
 const consumer = run([process.execPath, consumerJs], { cwd: project, env })
-check(
-  consumer.status === 0 && (consumer.stdout ?? "").trim() === "https://store.midacontext.xyz https://sponsor.midacontext.xyz",
-  "SDK consumer runs under plain node",
-)
+check(consumer.status === 0 && (consumer.stdout ?? "").trim() === "sdk ok", "SDK consumer runs under plain node")
 
 writeFileSync(
   join(project, "consumer.ts"),
-  `import { connectAgent, PERMISSION, PROVENANCE_POLICY, MidaAgent } from ${JSON.stringify(names.sdk)}\nimport type { AccessRequest, Address, ConnectedAgent, ConnectOptions, FileAccessRequestStore, ScopeInput } from ${JSON.stringify(names.sdk)}\nconst options: ConnectOptions = { name: "codex", env: {} }\nconst scope: ScopeInput = { namespace: "projects.current", permissions: PERMISSION.READ, provenancePolicy: PROVENANCE_POLICY.ALLOW_INFERENCE }\nconst ctor: typeof MidaAgent = MidaAgent\nexport { connectAgent, options, scope, ctor }\nexport type { AccessRequest, Address, ConnectedAgent, FileAccessRequestStore }\n`,
+  `import { Mida, MidaSdkError, isMidaSdkError } from ${JSON.stringify(names.sdk)}\nimport type { ContextInput, ContextItem, ContextResult, MidaOptions, Transport, VerifyResult } from ${JSON.stringify(names.sdk)}\nconst options: MidaOptions = { agent: "consumer" }\nconst mida: Transport = new Mida(options)\nconst input: ContextInput = { namespace: "projects.current", limit: 1024 }\nexport { mida, input, MidaSdkError, isMidaSdkError }\nexport type { ContextItem, ContextResult, VerifyResult }\n`,
 )
 writeFileSync(
   join(project, "tsconfig.json"),

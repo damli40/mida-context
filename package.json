@@ -24,6 +24,7 @@
     "bench": "node --import tsx bench/run.ts"
   },
   "dependencies": {
+    "@mida-context/sdk": "workspace:*",
     "@mida/api": "workspace:*",
     "@mida/chain": "workspace:*",
     "@mida/cli": "workspace:*",

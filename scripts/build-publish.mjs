@@ -5,9 +5,10 @@
 //     per entry point with a node shebang; every @mida/* workspace package is bundled in, every
 //     third-party package stays external and lands in the generated package.json at the exact
 //     version the workspace itself uses. kimi-model.mjs ships as-is beside the bundles.
-//   publish/sdk/dist/index.js + index.d.ts — the SDK's public entry as ESM, with the inlined
-//     workspace packages' declarations emitted under dist/types/ and every @mida/* specifier
-//     rewritten to a relative path, so a consumer's tsc sees full types and no unresolved import.
+//   publish/sdk/dist/index.js + index.d.ts — the @mida-context/sdk public entry (the Mida
+//     class and its local transport) as ESM, with the inlined workspace packages' declarations
+//     emitted under dist/types/ and every @mida/* specifier rewritten to a relative path, so a
+//     consumer's tsc sees full types and no unresolved import.
 //
 // publish/*/package.json is generated from publish/names.json + the committed *.template.json —
 // the package names live in that one file and nowhere else.
@@ -125,14 +126,14 @@ writePackageManifest("cli", names.cli, "cli.package.template.json", cliDeps)
 
 // ---------- SDK bundle ----------
 
-const sdkPkgs = workspaceClosure("@mida/sdk")
+const sdkPkgs = workspaceClosure("@mida-context/sdk")
 const sdkDeps = externalDependencies(sdkPkgs)
 const sdkDist = join(PUBLISH, "sdk", "dist")
 rmSync(sdkDist, { recursive: true, force: true })
 mkdirSync(sdkDist, { recursive: true })
 
 buildSync({
-  entryPoints: [{ in: join(ROOT, "packages/sdk/src/index.ts"), out: "index" }],
+  entryPoints: [{ in: join(ROOT, "packages/mida-context-sdk/src/index.ts"), out: "index" }],
   outdir: sdkDist,
   bundle: true,
   format: "esm",
@@ -190,8 +191,8 @@ for (const emitted of walk(emitDir)) {
   writeFileSync(out, rewritten)
 }
 // The public entry: a single barrel onto the emitted SDK declarations — a consumer's
-// `import { MidaAgent } from "<sdk>"` resolves ./types/sdk/index.d.ts and never sees @mida/*.
-writeFileSync(join(sdkDist, "index.d.ts"), `export * from "./types/sdk/index.js"\n`)
+// `import { Mida } from "<sdk>"` resolves ./types/mida-context-sdk/index.d.ts and never sees @mida/*.
+writeFileSync(join(sdkDist, "index.d.ts"), `export * from "./types/mida-context-sdk/index.js"\n`)
 writePackageManifest("sdk", names.sdk, "sdk.package.template.json", sdkDeps)
 
 rmSync(emitDir, { recursive: true, force: true })

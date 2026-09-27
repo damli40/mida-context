@@ -169,6 +169,9 @@ importers:
 
   .:
     dependencies:
+      '@mida-context/sdk':
+        specifier: workspace:*
+        version: link:packages/mida-context-sdk
       '@mida/api':
         specifier: workspace:*
         version: link:apps/api
@@ -517,6 +520,31 @@ importers:
       viem:
         specifier: 2.56.3
         version: 2.56.3(typescript@5.9.3)(zod@4.5.4)
+
+  packages/mida-context-sdk:
+    dependencies:
+      '@mida/grant-advisor':
+        specifier: workspace:*
+        version: link:../grant-advisor
+      '@mida/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@mida/sdk':
+        specifier: workspace:*
+        version: link:../sdk
+      '@noble/hashes':
+        specifier: 2.4.0
+        version: 2.4.0
+    devDependencies:
+      '@mida/cli':
+        specifier: workspace:*
+        version: link:../../apps/cli
+      '@mida/compiler':
+        specifier: workspace:*
+        version: link:../compiler
+      '@mida/midad':
+        specifier: workspace:*
+        version: link:../../apps/midad
 
   packages/protocol:
     dependencies:

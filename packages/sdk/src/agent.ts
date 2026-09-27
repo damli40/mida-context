@@ -143,6 +143,12 @@ export interface ContextObject {
   payload: ContextPayload
   transactionHash?: Hex
   /**
+   * The commitment the record's bytes were sealed under: the chain row's manifestHash for an
+   * anchored record, the signed batch message's for a pending one. A reader verifies the
+   * payload against it — it is never trusted on its own.
+   */
+  manifestHash?: Hex
+  /**
    * Monad's own placement of the save — set only on records the chain has actually recorded.
    * `at` is the timestamp the chain stamped (the ContextRegistry row's createdAt for a direct
    * save, the anchor block's time for a batched one); `block`, `transaction` and `index` are
@@ -263,6 +269,29 @@ export class MidaAgent {
 
   get grants(): readonly Grant[] {
     return this.#grants.map((grant) => ({ ...grant, capabilities: [...grant.capabilities] }))
+  }
+
+  /** The chain's own record for one contextId — null when the registry holds none. */
+  async chainRecord(contextId: Hex): Promise<ContextRecordView | null> {
+    return this.#reader.getRecord(contextId.toLowerCase() as Hex)
+  }
+
+  /**
+   * Whether Monad lists at least one currently-valid capability for this owner–agent pair —
+   * the contract's `isCapabilityValid` answer per id, not the local grant copy.
+   */
+  async hasLiveCapability(owner: Address): Promise<boolean> {
+    const ownerAddress = owner.toLowerCase() as Address
+    for (const id of await this.#reader.activeCapabilityIds(ownerAddress, this.agentId)) {
+      const live = (await this.#chain.publicClient.readContract({
+        address: this.#chain.deployment.capabilityRegistry,
+        abi: capabilityRegistryAbi,
+        functionName: "isCapabilityValid",
+        args: [id],
+      } as never)) as boolean
+      if (live) return true
+    }
+    return false
   }
 
   /** §13.2: canonical, parent-expanded, sorted exact scopes, signed by the agent's current signer and persisted. */
@@ -458,7 +487,7 @@ export class MidaAgent {
    */
   async readBatchedWithStatus(owner: Address, namespace: string): Promise<{
     anchored: ContextObject[]
-    pending: (ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex })[]
+    pending: (ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex; receivedAt: number })[]
     skipped: { contextId: Hex; reason: string }[]
     partial: boolean
   }> {
@@ -484,7 +513,7 @@ export class MidaAgent {
     // pending and skipped keep exactly the order the serial loop produced.
     type RowOutcome =
       | { kind: "anchored"; object: ContextObject }
-      | { kind: "pending"; object: ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex } }
+      | { kind: "pending"; object: ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex; receivedAt: number } }
       | { kind: "skipped"; skipped: { contextId: Hex; reason: string } }
     const processItem = async (item: (typeof items)[number]): Promise<RowOutcome> => {
       const message = item.save.message
@@ -536,6 +565,7 @@ export class MidaAgent {
         parentId: message.parentId,
         readEpoch,
         recordType: "CONTEXT" as const,
+        manifestHash: message.manifestHash.toLowerCase() as Hex,
         payload,
       }
       if (item.state === "ANCHORED") {
@@ -555,6 +585,7 @@ export class MidaAgent {
         return { kind: "anchored", object: { ...base, lineageId: item.lineageId!, version: item.version!, ...(chain === undefined ? {} : { chain }) } }
       }
       // Nothing is anchored yet: derive the would-be head fields from the signed message itself.
+      // receivedAt is the store's own stamp — the only honest "when" a not-yet-anchored row has.
       return {
         kind: "pending",
         object: {
@@ -563,6 +594,7 @@ export class MidaAgent {
           version: message.parentVersion + 1,
           anchor: "PENDING_ANCHOR" as const,
           authorAgentId: verdict.agentId,
+          receivedAt: item.receivedAt,
         },
       }
     }
@@ -579,7 +611,7 @@ export class MidaAgent {
     for (let i = 0; i < Math.min(READ_CONCURRENCY, items.length); i += 1) workers.push(worker())
     await Promise.all(workers)
     const anchored: ContextObject[] = []
-    const pending: (ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex })[] = []
+    const pending: (ContextObject & { anchor: "PENDING_ANCHOR"; authorAgentId: Hex; receivedAt: number })[] = []
     const skipped: { contextId: Hex; reason: string }[] = []
     for (const outcome of outcomes) {
       if (outcome.kind === "anchored") anchored.push(outcome.object)
@@ -1282,6 +1314,7 @@ export class MidaAgent {
       version: record.version,
       readEpoch: record.readEpoch,
       recordType: record.recordType === RECORD_TYPE.EVIDENCE ? "EVIDENCE" : "CONTEXT",
+      manifestHash: record.manifestHash,
       payload,
       ...(chain === undefined ? {} : { chain }),
     }
@@ -1300,6 +1333,7 @@ export class MidaAgent {
       version: record.version,
       readEpoch: record.readEpoch,
       recordType: record.recordType === RECORD_TYPE.EVIDENCE ? "EVIDENCE" : "CONTEXT",
+      manifestHash: record.manifestHash,
       ...(transactionHash === undefined ? {} : { transactionHash }),
       ...(chain === undefined ? {} : { chain }),
     }
