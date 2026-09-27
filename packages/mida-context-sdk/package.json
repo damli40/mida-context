@@ -1,0 +1,15 @@
+{
+  "name": "@mida-context/sdk",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@mida/grant-advisor": "workspace:*",
+    "@mida/protocol": "workspace:*",
+    "@mida/sdk": "workspace:*",
+    "@noble/hashes": "2.4.0"
+  }
+}

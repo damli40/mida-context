@@ -265,6 +265,29 @@ export class MidaAgent {
     return this.#grants.map((grant) => ({ ...grant, capabilities: [...grant.capabilities] }))
   }
 
+  /** The chain's own record for one contextId — null when the registry holds none. */
+  async chainRecord(contextId: Hex): Promise<ContextRecordView | null> {
+    return this.#reader.getRecord(contextId.toLowerCase() as Hex)
+  }
+
+  /**
+   * Whether Monad lists at least one currently-valid capability for this owner–agent pair —
+   * the contract's `isCapabilityValid` answer per id, not the local grant copy.
+   */
+  async hasLiveCapability(owner: Address): Promise<boolean> {
+    const ownerAddress = owner.toLowerCase() as Address
+    for (const id of await this.#reader.activeCapabilityIds(ownerAddress, this.agentId)) {
+      const live = (await this.#chain.publicClient.readContract({
+        address: this.#chain.deployment.capabilityRegistry,
+        abi: capabilityRegistryAbi,
+        functionName: "isCapabilityValid",
+        args: [id],
+      } as never)) as boolean
+      if (live) return true
+    }
+    return false
+  }
+
   /** §13.2: canonical, parent-expanded, sorted exact scopes, signed by the agent's current signer and persisted. */
   async createAccessRequest(input: AccessRequestInput): Promise<AccessRequest> {
     const { deployment, account } = this.#chain

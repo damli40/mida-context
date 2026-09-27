@@ -518,6 +518,21 @@ importers:
         specifier: 2.56.3
         version: 2.56.3(typescript@5.9.3)(zod@4.5.4)
 
+  packages/mida-context-sdk:
+    dependencies:
+      '@mida/grant-advisor':
+        specifier: workspace:*
+        version: link:../grant-advisor
+      '@mida/protocol':
+        specifier: workspace:*
+        version: link:../protocol
+      '@mida/sdk':
+        specifier: workspace:*
+        version: link:../sdk
+      '@noble/hashes':
+        specifier: 2.4.0
+        version: 2.4.0
+
   packages/protocol:
     dependencies:
       '@noble/hashes':
