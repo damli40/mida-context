@@ -202,7 +202,7 @@ export class LocalTransport implements Transport {
       // an unreadable identity file reaches connectAgent's own error below, which names the file
     }
     if (await connected.agent.hasLiveCapability(connected.owner)) {
-      throw new MidaSdkError("not-approved", `${this.#agent} is already approved — there is nothing to request`)
+      throw new MidaSdkError("already-approved", `${this.#agent} is already approved — there is nothing to request`)
     }
     const input: AccessRequestInput = {
       purposeId,

@@ -7,6 +7,7 @@ import type { ScenarioEnvironment } from "@mida/cli"
 import type { CompileInput, CompileResult } from "@mida/compiler"
 import {
   MidaHome,
+  NAMESPACE,
   Runtime,
   approve,
   callDaemon,
@@ -86,7 +87,7 @@ describe("local transport against a real midad on local Anvil", () => {
 
     const runtime = await Runtime.open(home, { ...network, storageUrl: env.apiBaseUrl })
     try {
-      await init(runtime, ["codex", "cursor", "windsurf"])
+      await init(runtime, ["codex", "cursor", "windsurf", "aider"])
       await requestAccess(runtime, "codex")
       await approve(runtime, "codex", workDir)
       await requestAccess(runtime, "cursor")
@@ -164,6 +165,63 @@ describe("local transport against a real midad on local Anvil", () => {
     expect(body.kind).toBe("none")
     // and the SDK prints the same "nothing new" line mida_whats_new prints, not an empty answer
     expect(answer).toEqual({ kind: "none", text: "Mida: nothing new since the last check." })
+  }, STEP_TIMEOUT)
+
+  it("requestAccess() files the request where `mida approve` looks for it", async () => {
+    const mida = new Mida({ agent: "aider", project: workDir, home: home.root })
+    const result = await mida.requestAccess()
+    expect(result.requestId).toMatch(/^0x[0-9a-f]{64}$/i)
+    expect(result.nextStep).toBe("run `mida approve aider` in a terminal")
+    // the file the owner's `mida approve aider` reads
+    expect(home.has("agents/aider/pending-request.json")).toBe(true)
+    // and the owner path accepts exactly this request — the SDK carries no approve call; the
+    // agent cannot approve itself, the filing only becomes access when the owner approves
+    const runtime = await Runtime.open(home, { ...network, storageUrl: env.apiBaseUrl })
+    try {
+      await approve(runtime, "aider", workDir)
+    } finally {
+      await runtime.close()
+    }
+  }, STEP_TIMEOUT)
+
+  it("requestAccess() on an approved agent answers already-approved; a missing identity answers no-identity", async () => {
+    const codex = new Mida({ agent: "codex", project: workDir, home: home.root })
+    const approved = await codex.requestAccess().catch((error) => error)
+    expect(isMidaSdkError(approved, "already-approved")).toBe(true)
+    const ghost = await new Mida({ agent: "ghost", project: workDir, home: home.root }).requestAccess().catch((error) => error)
+    expect(isMidaSdkError(ghost, "no-identity")).toBe(true)
+  }, STEP_TIMEOUT)
+
+  it("verify() answers valid for a context() item exactly as the service served it", async () => {
+    const mida = new Mida({ agent: "codex", project: workDir, home: home.root })
+    const { items } = await mida.context({ namespace: NAMESPACE, limit: 10_000 })
+    const item = items.find((entry) => entry.author.name === "cursor") ?? items[0]
+    expect(item).toBeDefined()
+    const verdict = await mida.verify(item!)
+    expect(verdict.valid).toBe(true)
+    expect(verdict.checks.map((check) => [check.name, check.ok])).toEqual([
+      ["commitment", true],
+      ["author", true],
+      ["grant-at-write", true],
+    ])
+  }, STEP_TIMEOUT)
+
+  it("verify() fails the named check on a tampered item — and every check on a made-up record", async () => {
+    const mida = new Mida({ agent: "codex", project: workDir, home: home.root })
+    const { items } = await mida.context({ namespace: NAMESPACE, limit: 10_000 })
+    const item = items[0]!
+    // a changed commitment: the record is real, the claim is not — commitment is what fails
+    const tampered = { ...item, proof: { ...item.proof, manifestHash: `0x${"ab".repeat(32)}` as const } }
+    const tamperedVerdict = await mida.verify(tampered)
+    expect(tamperedVerdict.valid).toBe(false)
+    expect(tamperedVerdict.checks.find((check) => check.name === "commitment")?.ok).toBe(false)
+    expect(tamperedVerdict.checks.find((check) => check.name === "author")?.ok).toBe(true)
+    expect(tamperedVerdict.checks.find((check) => check.name === "grant-at-write")?.ok).toBe(true)
+    // an id the registry never heard of: nothing can check out
+    const madeUp = { ...item, proof: { ...item.proof, recordId: `0x${"00".repeat(32)}` as const } }
+    const madeUpVerdict = await mida.verify(madeUp)
+    expect(madeUpVerdict.valid).toBe(false)
+    expect(madeUpVerdict.checks.every((check) => !check.ok)).toBe(true)
   }, STEP_TIMEOUT)
 
   it("status() reports the service and this agent's verdict in mida_status's own words", async () => {

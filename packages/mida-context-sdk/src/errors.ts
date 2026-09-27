@@ -21,6 +21,7 @@ export type MidaSdkErrorCode =
   | "list-tampered"
   | "list-unreadable"
   | "check-failed"
+  | "already-approved"
   | "not-approved"
   | "revoked"
   | "revoke-pending"
@@ -50,6 +51,7 @@ const SERVICE_REASONS: ReadonlySet<string> = new Set([
   "list-tampered",
   "list-unreadable",
   "check-failed",
+  "already-approved",
   "not-approved",
   "revoked",
   "revoke-pending",
