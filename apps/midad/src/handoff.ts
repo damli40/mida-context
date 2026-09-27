@@ -2,8 +2,8 @@ import { statSync } from "node:fs"
 import { isAbsolute } from "node:path"
 import { isMidaError } from "@mida/protocol"
 import { isReadDeadlineError } from "@mida/chain"
-import { compareChainOrder, defuse, handoffHeader, mergeCheckpoints, renderHandoffReport } from "@mida/checkpoint"
-import type { MigrationEnvelope } from "@mida/checkpoint"
+import { compareChainOrder, defuse, handoffHeader, mergeCheckpoints, orderTime, otherTasksBlock, recordedAt, renderHandoffReport, taskOf } from "@mida/checkpoint"
+import type { MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
 import { chainRefusalReason } from "./chain-busy.js"
 import { CHAIN_REFUSAL_TEXT } from "./hook-output.js"
 import { CODING_CLIENTS } from "./install.js"
@@ -13,6 +13,7 @@ import { checkProject } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { isSafeName, peekJobs, projectIdFor } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
+import { DEFAULT_TASK, pinSessionTask, resolveSessionTask, taskOrUndefined } from "./task.js"
 import { pendingAnchors, pendingPlaintext } from "./batching.js"
 import { readOwnerFacts } from "./remember.js"
 import type { MidaHome } from "./home.js"
@@ -115,6 +116,10 @@ export const PARTIAL_LINE = "Some saved context could not be loaded yet; what fo
 export const PENDING_ANCHOR_LINE = "PENDING_ANCHOR: not yet anchored on Monad; may still be rejected"
 const HANDOFF_BEGIN = "=== BEGIN MIDA HANDOFF DATA ==="
 const HANDOFF_TAIL = "=== END MIDA HANDOFF DATA ==="
+/** tk-1: a task counts as "active" when its newest checkpoint is this fresh — older ones go quiet. */
+const ACTIVE_TASK_MS = 14 * 24 * 60 * 60 * 1000
+/** At most this many other tasks get a mention line in a handoff. */
+const OTHER_TASKS_MAX = 5
 
 /** The queued-job scan reads at most this many files — a flooded queue costs one bounded look. */
 const QUEUE_NOTE_SCAN_LIMIT = 200
@@ -354,7 +359,7 @@ type FactOutcome = { status: "ok"; facts: Awaited<ReturnType<typeof readOwnerFac
  */
 export async function buildHandoff(
   runtime: ServiceRuntime,
-  input: { agent: string; cwd: string; authorNames: Record<string, string>; sessionId?: string },
+  input: { agent: string; cwd: string; authorNames: Record<string, string>; sessionId?: string; task?: string },
   deps: HandoffDeps = {},
 ): Promise<HandoffResult> {
   const agent = input.agent
@@ -368,6 +373,26 @@ export async function buildHandoff(
     const access = await checkAccess(scoped, { agent, cwd: input.cwd }, deps)
     if (!access.ok) return refused(access.reason, access.text)
     const check = access.approval
+
+    // tk-1, invariant 1: the session's task is resolved ONCE, here at session start — the
+    // caller's explicit task (the launch's MIDA_TASK, or the deliberate `task show` name), then
+    // the pin written on an earlier call, then the predecessor's, then the folder default, then
+    // main. A session that names itself is pinned under state/tasks/<sid>.json — every later
+    // event reads the pin, so a `mida task` switch mid-session can never migrate a live session.
+    const resolved = resolveSessionTask(runtime.home, {
+      sessionId: input.sessionId,
+      projectId: check.projectId,
+      cwd: input.cwd,
+      // a malformed explicit task is treated as absent — a bad MIDA_TASK falls back to the
+      // folder default; it never breaks a hook that must fail open
+      explicit: taskOrUndefined(input.task),
+    })
+    const task = resolved.task
+    if (isSafeName(input.sessionId) && resolved.source !== "session") {
+      // best-effort: a failed pin only means the NEXT event re-resolves — never a refused handoff;
+      // a resolution that came FROM the pin needs no write — the file provably exists already
+      pinSessionTask(runtime.home, input.sessionId, check.projectId, task)
+    }
 
     // A coding client's "current state" is concrete — its workspace — so its handoff names where
     // to check. Every other identity gets the header's generic words only. The line stays out of
@@ -425,16 +450,44 @@ export async function buildHandoff(
     }
     const facts = factOutcome.status === "ok" ? factOutcome.facts : []
     const factsFailed = factOutcome.status === "ok" ? null : factOutcome.status === "slow" ? "facts-read-slow" : "facts-read-failed"
+    // tk-1: this handoff is the session task's thread ONLY — another task's checkpoint never
+    // enters the merge, the pending blocks or any rendered field. Foreign tasks contribute one
+    // awareness line each and nothing more (invariant 3). `taskOf` applies the absent-is-main
+    // rule, so records from before tasks exist all land in `main`.
+    const inTask = (cp: StoredCheckpoint) => taskOf(cp) === task
+    // The other tasks' newest checkpoint each — awareness, not context: name, last saver, age.
+    // Only a task that saw a checkpoint inside the last 14 days counts as active; newest first,
+    // capped at five — and none of it renders when no other task is active.
+    const otherTasks = (() => {
+      const cutoff = now() - ACTIVE_TASK_MS
+      const newest = new Map<string, StoredCheckpoint>()
+      for (const cp of outcome.checkpoints) {
+        if (inTask(cp)) continue
+        const at = orderTime(cp)
+        if (Number.isNaN(at) || at < cutoff) continue
+        const prev = newest.get(taskOf(cp))
+        if (prev === undefined || compareChainOrder(cp, prev) > 0) newest.set(taskOf(cp), cp)
+      }
+      return [...newest.values()]
+        .sort((a, b) => compareChainOrder(b, a))
+        .slice(0, OTHER_TASKS_MAX)
+        .map((cp) => ({
+          name: taskOf(cp),
+          agent: input.authorNames[cp.authorId.toLowerCase()] ?? "unknown agent",
+          savedAt: recordedAt(cp),
+        }))
+    })()
     // A pending batched save is usable at once but is never described as saved (Amendment B.3):
     // it stays OUT of the merge — every merged section reads as anchored state, and the header's
     // save time counts anchored records only — and renders as its own marked block inside the
     // fence instead.
-    const pending = outcome.checkpoints.filter((cp) => cp.anchor === "PENDING_ANCHOR")
-    const merged = mergeCheckpoints(outcome.checkpoints.filter((cp) => cp.anchor !== "PENDING_ANCHOR"))
+    const pending = outcome.checkpoints.filter((cp) => cp.anchor === "PENDING_ANCHOR" && inTask(cp))
+    const merged = mergeCheckpoints(outcome.checkpoints.filter((cp) => cp.anchor !== "PENDING_ANCHOR" && inTask(cp)))
     const pendingText = pending.map((cp) => pendingBlock(cp, input.authorNames)).join("\n\n")
     // the checkpoints this session may treat as covered — its own never count: a session's own
     // saves are never updates for it and must never enter its seen set. A pending save that was
     // shown marked counts as covered — the session saw it, whatever the chain later decides.
+    // Foreign-task checkpoints count too: their mention line WAS shown.
     const covered = outcome.checkpoints
       .filter((cp) => cp.sessionId !== input.sessionId)
       .sort(compareChainOrder)
@@ -446,15 +499,24 @@ export async function buildHandoff(
       if (pending.length === 0) {
         // A brand-new project is exactly where the queued-saves note matters most: the record is
         // empty AND undelivered saves sit in the queue — the model must hear both halves (R-14).
+        // Named-task wording: the "nothing saved" claim is about THIS task — other tasks get
+        // the same mention block a merged handoff renders, so silence about them never reads
+        // as "no other work exists".
+        const emptyLine =
+          task === DEFAULT_TASK
+            ? EMPTY_TEXT
+            : `Mida: connected. Nothing has been saved for task "${task}" in this project yet.`
+        const mentions = otherTasksBlock(otherTasks, now())
         return {
           kind: "empty",
-          text: [outcome.partial ? `Mida: connected. ${PARTIAL_LINE}` : EMPTY_TEXT, pendingSavesNote]
+          text: [outcome.partial ? `Mida: connected. ${PARTIAL_LINE}` : emptyLine, pendingSavesNote, mentions === "" ? undefined : mentions]
             .filter((line): line is string => line !== undefined)
             .join("\n"),
           facts: facts.length,
           factsFailed,
           readMs,
-          seen: [],
+          // the mention lines WERE delivered — the foreign ids they summarized count as covered
+          seen: covered,
           partial: outcome.partial,
         }
       }
@@ -466,9 +528,11 @@ export async function buildHandoff(
       // is all a not-yet-anchored record has; it only picks whose line renders, never "current".
       const newestPending = pending.slice().sort(compareChainOrder).at(-1)
       const preamble = [handoffHeader(null), adapterNote, pendingSavesNote].filter((line): line is string => line !== undefined).join("\n")
+      const mentionsBlock = otherTasksBlock(otherTasks, now())
+      const mentionsText = mentionsBlock === "" ? "" : `\n\n${mentionsBlock}`
       return {
         kind: "handoff",
-        text: `${outcome.partial ? `${PARTIAL_LINE}\n\n` : ""}${preamble}\n${HANDOFF_BEGIN}\n\n${pendingText}\n\n${HANDOFF_TAIL}`,
+        text: `${outcome.partial ? `${PARTIAL_LINE}\n\n` : ""}${preamble}\n${HANDOFF_BEGIN}\n\n${pendingText}${mentionsText}\n\n${HANDOFF_TAIL}`,
         checkpoints: outcome.checkpoints.length,
         facts: facts.length,
         factsFailed,
@@ -492,6 +556,10 @@ export async function buildHandoff(
         runtime.home.writeSecretJson(`state/continues/${input.sessionId}.json`, {
           continues: merged.headSessionId,
           projectId: check.projectId,
+          // tk-1: the task this session resolved under rides beside the link, so a resumed
+          // session with no pin still inherits it — "main" serializes as no field, the same
+          // absent-is-main rule the envelope keeps
+          ...(task === DEFAULT_TASK ? {} : { task }),
         })
       } catch {
         // a failed record degrades to continuesSession null at save time
@@ -516,7 +584,7 @@ export async function buildHandoff(
           return migration === undefined ? row : { ...row, createdAt: `${row.createdAt} ${movedOnSuffix(migration)}` }
         }),
       },
-      { authorNames: input.authorNames, facts, factsFailed, adapterNote, pendingSavesNote, now },
+      { authorNames: input.authorNames, facts, factsFailed, adapterNote, pendingSavesNote, otherTasks, now },
     )
     const text = (() => {
       if (pending.length === 0) return rendered.text
