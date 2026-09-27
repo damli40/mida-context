@@ -323,8 +323,13 @@ export function buildManifest(
  * a referenced record before the records that point at it. Dependencies are parent links
  * (`parentId`, ordered by `version` within a lineage as well) and `relations`; ids outside the
  * manifest are not dependencies — a reference to a record the owner does not carry stays as-is.
- * Among the records ready to write, the earliest-written goes first (`createdAt`, ties by
- * manifest position): dependencies point back in time, so the replay follows the source's
+ * Among the records ready to write, the earliest-written goes first — by the SOURCE-CHAIN
+ * stamp (`origin.createdAt`, the same stamp the sealed envelope names), ties by manifest
+ * position, which is the order the source registered the records in. The entry's own
+ * `createdAt` — a checkpoint's writer-controlled claim — never orders the replay: two records
+ * sharing one source second tie on their effective instant on the target, and there the
+ * replay order itself becomes the chain placement that decides "current" (in-14 F-2).
+ * Dependencies point back in time, so the replay follows the source's
  * write order whenever the source is consistent — a record a dependency held back still lands
  * in its written slot instead of trailing every independent record.
  * Skipped entries keep their place in the output: Task 5 lists them, it does not write them.
@@ -360,7 +365,8 @@ export function replayOrder(manifest: Manifest): ManifestEntry[] {
   }
 
   // Kahn's algorithm. The ready set always yields the earliest-written entry — smallest
-  // `createdAt`, ties by manifest position — so a record a dependency held back still replays
+  // source-chain stamp (`origin.createdAt`, never the writer's claim), ties by manifest
+  // position — so a record a dependency held back still replays
   // in its written slot, and the output stays deterministic.
   const position = new Map(entries.map((entry, index) => [entry, index]))
   const remaining = new Map(entries.map((entry) => [entry, dependencies.get(entry)?.size ?? 0]))
@@ -371,7 +377,7 @@ export function replayOrder(manifest: Manifest): ManifestEntry[] {
     for (let i = 1; i < ready.length; i += 1) {
       const candidate = ready[i]!
       const current = ready[earliest]!
-      const sooner = Date.parse(candidate.createdAt) - Date.parse(current.createdAt)
+      const sooner = Date.parse(candidate.origin.createdAt) - Date.parse(current.origin.createdAt)
       if (sooner < 0 || (sooner === 0 && position.get(candidate)! < position.get(current)!)) earliest = i
     }
     const entry = ready.splice(earliest, 1)[0]!

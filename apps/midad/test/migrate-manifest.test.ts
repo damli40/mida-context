@@ -4,6 +4,8 @@ import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex } from "@noble/hashes/utils.js"
 import { canonicalBytes, MAX_PAYLOAD_BYTES } from "@mida/protocol"
 import type { ContextPayload, Hex } from "@mida/protocol"
+import { mergeCheckpoints } from "@mida/checkpoint"
+import type { StoredCheckpoint } from "@mida/checkpoint"
 import type { Deployment } from "@mida/chain"
 import { zeroHash } from "viem"
 import {
@@ -301,6 +303,90 @@ describe("replayOrder", () => {
     const manifest = buildManifest([v3, late, v2, v1], {}, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)
     const order = replayOrder(manifest).map((entry) => entry.sourceId)
     expect(order).toEqual([v1.contextId, v2.contextId, v3.contextId, late.contextId])
+  })
+
+  it("two records sharing one source second replay in the SOURCE's order — the writer's claim never breaks the tie (in-14 F-2)", () => {
+    // Converted from .devin/briefs/probes/zz-rv13-migrate-tie.test.ts. The envelope's
+    // originalCreatedAt is whole chain seconds (in-13b M-1), so two records written in one
+    // source second — same block, or one batch, whose members all share the anchor block's
+    // time — tie on their effective instant after the move. The tie is then decided by target
+    // placement, and the target placement IS the replay order, so the replay must run in the
+    // source's own order: stamp first, then manifest position (readOwnerUniverse lists records
+    // in registration order). The entry's `createdAt` is the writer's claim — a checkpoint
+    // with a slow clock that landed SECOND must not replay first.
+    const stamp = 1_758_000_000n
+    const stampIso = new Date(Number(stamp) * 1000).toISOString()
+    const slowClaim = new Date(Number(stamp) * 1000 - 120_000).toISOString()
+    const a = record({
+      authorId: AGENT,
+      createdAt: stamp,
+      payload: checkpointPayload({
+        type: "mida.checkpoint.v1",
+        projectId: "p",
+        sessionId: "s-a",
+        continuesSession: null,
+        compiledBy: "test",
+        checkpoint: sampleCheckpoint({ eventId: "cp-tie-a", createdAt: stampIso, objective: "obj-s-a" }),
+      }),
+    })
+    const b = record({
+      authorId: AGENT,
+      createdAt: stamp,
+      payload: checkpointPayload({
+        type: "mida.checkpoint.v1",
+        projectId: "p",
+        sessionId: "s-b",
+        continuesSession: null,
+        compiledBy: "test",
+        checkpoint: sampleCheckpoint({ eventId: "cp-tie-b", createdAt: slowClaim, objective: "obj-s-b" }),
+      }),
+    })
+    const stored = (rec: SourceRecord, sessionId: string, chain: StoredCheckpoint["chain"], originalCreatedAt?: string): StoredCheckpoint => ({
+      checkpoint: sampleCheckpoint({ eventId: `cp-${sessionId}`, objective: `obj-${sessionId}` }),
+      projectId: "p",
+      sessionId,
+      continuesSession: null,
+      compiledBy: "test",
+      contextId: rec.contextId,
+      authorId: AGENT,
+      namespaceId: rec.namespaceId,
+      chain,
+      ...(originalCreatedAt === undefined
+        ? {}
+        : {
+            migration: {
+              version: 1 as const,
+              originalChainId: "31337",
+              originalContract: SOURCE.contextRegistry,
+              originalRecordId: rec.contextId,
+              originalCommitment: rec.manifestHash,
+              originalAuthor: AGENT,
+              originalCreatedAt,
+              migratedAt: MIGRATED_AT,
+            },
+          }),
+    })
+    // On the source, chain placement already made the slow-clock writer current: A logged at
+    // transaction 0, B at transaction 1, inside one block and one second.
+    const before = mergeCheckpoints([
+      stored(a, "s-a", { at: stamp, block: 100n, transaction: 0, index: 0 }),
+      stored(b, "s-b", { at: stamp, block: 100n, transaction: 1, index: 0 }),
+    ])!
+    expect(before.headSessionId).toBe("s-b")
+
+    const manifest = buildManifest([a, b], AUTHORS, SOURCE, TARGET, HMAC_KEY, MIGRATED_AT)
+    const order = replayOrder(manifest).map((entry) => entry.sourceId)
+    expect(order, "the writer's claim decided the replay order of a same-second tie").toEqual([a.contextId, b.contextId])
+
+    // The same model the probe carried: each replayed record is its own direct write on the
+    // target, stamped in replay order — so replay order IS the target placement order.
+    const placed = order.map((sourceId, i) => {
+      const rec = sourceId === a.contextId ? a : b
+      const entry = manifest.entries.find((e) => e.sourceId === sourceId)!
+      return stored(rec, rec === a ? "s-a" : "s-b", { at: 1_758_600_000n + BigInt(i), block: 5_000n + BigInt(i), transaction: 0, index: 0 }, entry.origin.createdAt)
+    })
+    const after = mergeCheckpoints(placed)!
+    expect(after.headSessionId, "a same-second tie flipped the current record across the move").toBe("s-b")
   })
 })
 

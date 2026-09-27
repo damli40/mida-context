@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { createPublicClient, http, zeroHash } from "viem"
+import { createPublicClient, http } from "viem"
 import type { AbiEvent, PublicClient } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { canonicalBytes } from "@mida/protocol"
@@ -227,12 +227,10 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
       let factsBefore: OwnerFact[]
       let handoffBefore: HandoffResult
       let foldersBefore: unknown
-      let universeBefore: SourceRecord[]
       try {
         factsBefore = await readOwnerFacts(runtime, "codex")
         handoffBefore = await buildHandoff(runtime, { agent: "codex", cwd: workDir, authorNames: authorNamesFor(runtime) })
         foldersBefore = seeded.home.readJson<unknown>("approved-projects.json")
-        universeBefore = await readOwnerUniverse(runtime)
       } finally {
         await runtime.close()
       }
@@ -307,40 +305,16 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
       expect(v2.lineageId.toLowerCase()).toBe(v1.lineageId.toLowerCase())
       expect(v3.lineageId.toLowerCase()).toBe(v1.lineageId.toLowerCase())
 
-      // in-13b M-1 — "current" survives the move per lineage. On the source each record's
-      // instant is its chain stamp; on the target a moved record's instant is the earliest of
-      // its envelope's originalCreatedAt and its replay stamp — the same effective instant
-      // mergeCheckpoints and readOwnerFacts order by. For every lineage, the newest member
-      // before the move must still be the newest member after it.
-      const effectiveAt = (record: SourceRecord): number => {
-        const recordEnvelope = readEnvelope(record.payload)
-        const stamp = Number(record.createdAt) * 1000
-        if (recordEnvelope === undefined) return stamp
-        const original = Date.parse(recordEnvelope.originalCreatedAt)
-        return Number.isNaN(original) ? stamp : Math.min(original, stamp)
-      }
-      const currentByLineage = (records: SourceRecord[]): Map<string, string> => {
-        const current = new Map<string, { id: string; at: number; version: number }>()
-        for (const record of records) {
-          const key = record.lineageId.toLowerCase()
-          const at = effectiveAt(record)
-          const held = current.get(key)
-          if (held === undefined || at > held.at || (at === held.at && record.version > held.version)) {
-            current.set(key, { id: record.contextId.toLowerCase(), at, version: record.version })
-          }
-        }
-        return new Map([...current].map(([key, held]) => [key, held.id]))
-      }
-      const headsBefore = currentByLineage(universeBefore)
-      const headsAfter = currentByLineage(universeAfter)
-      expect(headsAfter.size).toBe(headsBefore.size)
-      for (const [lineageId, sourceId] of headsBefore) {
-        const targetLineage = lineageId === zeroHash ? lineageId : targetIdOf(lineageId as Hex).toLowerCase()
-        expect(
-          headsAfter.get(targetLineage),
-          `lineage ${lineageId} moved its current record`,
-        ).toBe(targetIdOf(sourceId as Hex).toLowerCase())
-      }
+      // in-14 F-2 — the check that can actually fail, replacing the per-lineage one: "current"
+      // is what the HANDOFF opens with, not the newest member inside one lineage (in the seeded
+      // universe every checkpoint is its own one-record lineage, so that comparison could never
+      // move). `seen` is the covered-record list the handoff produced, oldest first — its last
+      // entry is the head — so mapped through the manifest it must come back element-for-element:
+      // the same records, in the same order, under their target ids.
+      expect(
+        handoffAfter.seen.map((id) => id.toLowerCase()),
+        "the records a handoff covers — and which one it opens with — changed across the move",
+      ).toEqual(handoffBefore.seen.map((id) => targetIdOf(id as Hex).toLowerCase()))
 
       // The referrer still points at the evidence — at the evidence's TARGET id, not the source's.
       const referrer = onTarget(seeded.seed.referrerId)
