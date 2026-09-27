@@ -535,11 +535,13 @@ like `mida request a && mida request b` keeps going.
 
 **`mida approve` sits at "sending the grant (about 5 seconds)…" for much longer.**
 Every send now prints "still waiting for Monad (N s)…" every 15 seconds and gives up after 120 seconds with a
-message that says only what is true: a known transaction hash means "sent, not confirmed yet — run `mida doctor`,
-or run the same command again"; no hash means either "the send may still have gone out — check first" or, when the
-hang was provably before broadcast, "nothing was sent: run the same command again". A retry is safe either way:
-the command asks the chain what the agent already holds before sending, so a grant that already landed is not sent
-twice. Ctrl-C still works, and the same advice applies after it.
+message that says only what is true: a known transaction hash means "sent as 0x…, not confirmed yet" — the first
+transaction may still be pending, and a rerun checks only mined state, so the message tells you to wait a minute,
+run `mida doctor`, and not run the command again until it shows the result; with no hash the line is either "the
+send may still have gone out — check with `mida doctor` first, don't rerun yet" or, when the hang was provably
+before broadcast, "nothing was sent: run the same command again". Once `mida doctor` shows the outcome, the same
+command is safe: it asks the chain what the agent already holds before sending, so a grant that already landed is
+not sent twice. Ctrl-C still works, and the same advice applies after it.
 
 **`mida doctor`: "midad runs … @ <old commit>; this command runs … @ <new commit>".**
 The Mida service is still the old version after an update. Run any `mida` command; it replaces the service.

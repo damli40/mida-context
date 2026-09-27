@@ -166,15 +166,17 @@ async function watchSend<T>(
   const timeout = (): MidaError => {
     const hash = state.hashOf()
     if (hash !== undefined) {
+      // A rerun only sees MINED state — a still-pending first transaction is invisible to it, so
+      // the retry advice must say "don't" until `mida doctor` shows the result (in-16 K-4).
       return new MidaError(
         "SEND_TIMEOUT",
-        `sent as ${hash}, not confirmed yet: run \`mida doctor\`, or run the same command again (it checks the chain first, so nothing is sent twice)`,
+        `sent as ${hash}, not confirmed yet. Wait a minute, then run \`mida doctor\`. Don't run the command again until it shows the result, or it may be sent twice.`,
       )
     }
     return state.attempted()
       ? new MidaError(
           "SEND_TIMEOUT",
-          "the send may still have gone out without a hash to show for it — run `mida doctor` to check before running the command again",
+          "the send may still have gone out without a hash to show for it — run `mida doctor` to check, and don't run the command again until it shows the result, or it may be sent twice",
         )
       : // pre-attempt is provably unsent — the gate below keeps it that way, so the batcher may
         // resubmit it like any pre-send failure without risking a double-send

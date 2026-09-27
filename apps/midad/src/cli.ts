@@ -1091,18 +1091,13 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     }
     // A send gave up waiting on Monad (in-15 J-4): the error's own sentence already says what is
     // true — a hash means "sent, not confirmed", none means either "may have gone out" or
-    // "nothing was sent". One rewrite: for `remember` a re-run is NOT idempotent — a second run
-    // writes a second fact — so where the sentence says "run the same command again" the advice
-    // becomes "look first", mirroring the SPONSOR_PENDING split above.
+    // "nothing was sent". Since in-16 K-4 the pending cases carry "don't run the command again
+    // until `mida doctor` shows the result", which is the safe advice for `remember` too — no
+    // command-specific rewrite remains.
     case "SEND_TIMEOUT": {
       if (!(error instanceof Error)) return "refused: SEND_TIMEOUT"
       const prefix = "SEND_TIMEOUT: "
-      const sentence = error.message.startsWith(prefix) ? error.message.slice(prefix.length) : error.message
-      if (command !== "remember") return sentence
-      return sentence.replace(
-        "run the same command again (it checks the chain first, so nothing is sent twice)",
-        "check whether the fact is already there with `mida read --as assistant` before running it again; a second run writes a second fact",
-      )
+      return error.message.startsWith(prefix) ? error.message.slice(prefix.length) : error.message
     }
     // The saved setup names another contract than this build ships. Only `mida migrate` may
     // move it — init refuses rather than rewrite the file (the error carries both addresses).

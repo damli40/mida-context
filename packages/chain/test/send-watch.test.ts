@@ -125,7 +125,7 @@ describe("the bounded send (in-15 J-4)", () => {
     expect(progress).toEqual(["still waiting for Monad (15 s)…"])
     expect(isMidaError(error, "SEND_TIMEOUT")).toBe(true)
     expect((error as Error).message).toContain(
-      `sent as ${HASH}, not confirmed yet: run \`mida doctor\`, or run the same command again (it checks the chain first, so nothing is sent twice)`,
+      `sent as ${HASH}, not confirmed yet. Wait a minute, then run \`mida doctor\`. Don't run the command again until it shows the result, or it may be sent twice.`,
     )
     // the transaction may have landed — never mark it safe-to-resubmit
     expect(failedBeforeSend(error)).toBe(false)
@@ -147,7 +147,7 @@ describe("the bounded send (in-15 J-4)", () => {
     const error = await outcome
     expect(isMidaError(error, "SEND_TIMEOUT")).toBe(true)
     expect((error as Error).message).toContain(
-      "the send may still have gone out without a hash to show for it — run `mida doctor` to check before running the command again",
+      "the send may still have gone out without a hash to show for it — run `mida doctor` to check, and don't run the command again until it shows the result, or it may be sent twice",
     )
     expect(failedBeforeSend(error)).toBe(false)
   })

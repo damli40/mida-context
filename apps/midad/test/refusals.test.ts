@@ -92,30 +92,38 @@ describe("ownerRefusalLine (R4-5)", () => {
     expect(line).not.toContain("run the same command again")
   })
 
-  it("SEND_TIMEOUT prints the send's own honest sentence — hash, maybe-out, or nothing-sent (in-15 J-4)", () => {
+  it("SEND_TIMEOUT prints the send's own honest sentence — hash, maybe-out, or nothing-sent (in-15 J-4, in-16 K-4)", () => {
     const hash = `0x${"ab".repeat(32)}` as Hex
     expect(ownerRefusalLine("approve", "devin", new MidaError("SEND_TIMEOUT", "nothing was sent: run the same command again"))).toBe(
       "nothing was sent: run the same command again",
     )
+    // While a transaction may be pending the sentence warns AGAINST a rerun — a second run checks
+    // only mined state and could send twice.
     expect(
       ownerRefusalLine(
         "approve",
         "devin",
-        new MidaError("SEND_TIMEOUT", `sent as ${hash}, not confirmed yet: run \`mida doctor\`, or run the same command again (it checks the chain first, so nothing is sent twice)`),
+        new MidaError(
+          "SEND_TIMEOUT",
+          `sent as ${hash}, not confirmed yet. Wait a minute, then run \`mida doctor\`. Don't run the command again until it shows the result, or it may be sent twice.`,
+        ),
       ),
-    ).toBe(`sent as ${hash}, not confirmed yet: run \`mida doctor\`, or run the same command again (it checks the chain first, so nothing is sent twice)`)
+    ).toBe(
+      `sent as ${hash}, not confirmed yet. Wait a minute, then run \`mida doctor\`. Don't run the command again until it shows the result, or it may be sent twice.`,
+    )
   })
 
-  it("SEND_TIMEOUT on remember swaps the blind re-run for look-first — a second run writes a second fact", () => {
+  it("SEND_TIMEOUT on remember is safe as printed — the pending cases already say don't rerun", () => {
     const hash = `0x${"ab".repeat(32)}` as Hex
     const line = ownerRefusalLine(
       "remember",
       "",
-      new MidaError("SEND_TIMEOUT", `sent as ${hash}, not confirmed yet: run \`mida doctor\`, or run the same command again (it checks the chain first, so nothing is sent twice)`),
+      new MidaError(
+        "SEND_TIMEOUT",
+        `sent as ${hash}, not confirmed yet. Wait a minute, then run \`mida doctor\`. Don't run the command again until it shows the result, or it may be sent twice.`,
+      ),
     )
-    expect(line).toContain("mida read --as assistant")
-    expect(line).not.toContain("it checks the chain first")
-    // the maybe-out and nothing-sent branches are already safe advice for remember
+    expect(line).toContain("Don't run the command again")
     expect(
       ownerRefusalLine("remember", "", new MidaError("SEND_TIMEOUT", "nothing was sent: run the same command again")),
     ).toBe("nothing was sent: run the same command again")
