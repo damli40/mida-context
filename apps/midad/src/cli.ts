@@ -26,6 +26,8 @@ import {
   ensureProjectMarker,
   linkProject,
   planProjectLink,
+  planProjectUnlink,
+  unlinkProject,
 } from "./projects.js"
 import type { ListOwner, ProjectCheck } from "./projects.js"
 import { projectIdFor } from "./queue.js"
@@ -65,19 +67,19 @@ const READ_AS_NAMESPACES: readonly string[] = ["projects.current", "profile.skil
  */
 const READ_AS_NAME = /^[a-z0-9-]{1,64}$/
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | batching on|off | migrate [--undo]" +
+  "usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink | batching on|off | migrate [--undo]" +
   "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or the identity a client installs)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
-export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", "link", ...WITH_AGENT]
+export const CLI_COMMANDS: readonly string[] = ["init", "install", "remember", "migrate", "batching", "link", "unlink", ...WITH_AGENT]
 /**
  * The commands that change who has access — or which folder belongs to which project. Only `mida`
  * in the owner's own terminal may run them: they never go to the daemon socket. `install` for an
- * MCP client belongs here: it registers that client's identity on the chain. `link` signs only
- * the owner list — it never opens the runtime.
+ * MCP client belongs here: it registers that client's identity on the chain. `link` and `unlink`
+ * sign only the owner list — they never open the runtime.
  */
-export const OWNER_COMMANDS: readonly string[] = ["init", "install", "approve", "revoke", "remember", "migrate", "batching", "link"]
+export const OWNER_COMMANDS: readonly string[] = ["init", "install", "approve", "revoke", "remember", "migrate", "batching", "link", "unlink"]
 /** The owner commands that must see a real terminal. `init` is exempt: it grants nothing to an agent. */
-const TERMINAL_COMMANDS: readonly string[] = ["install", "approve", "revoke", "remember", "migrate", "batching", "link"]
+const TERMINAL_COMMANDS: readonly string[] = ["install", "approve", "revoke", "remember", "migrate", "batching", "link", "unlink"]
 export const NEEDS_TERMINAL_LINE = "needs-terminal: run this yourself in a terminal window"
 
 /** What the daemon answers when an owner command reaches /cli anyway. */
@@ -484,6 +486,30 @@ async function runFolderCommand(argv: string[], deps: CliDeps): Promise<number> 
       }
       const result = await linkProject(owner, { projectId: plan.projectId, dir: plan.root })
       deps.print(`linked ${result.root} to project ${plan.projectId} for ${result.agents.length === 0 ? "no agents yet" : result.agents.join(", ")}`)
+      return 0
+    }
+    if (command === "unlink") {
+      if (argv.length !== 1) return usage()
+      const owner = listOwnerFor(deps.home)
+      ownerAddress = owner.owner
+      const plan = await planProjectUnlink(owner, { cwd })
+      if (plan.kind === "refused") {
+        deps.print(plan.message)
+        return 1
+      }
+      const agents = [...new Set(plan.rows.map((e) => e.agent))].sort()
+      deps.print(`project ${plan.projectId} — unlinking ${plan.root}`)
+      deps.print(
+        `this removes ${plan.rows.length} approval row(s)${agents.length > 0 ? ` (${agents.join(", ")})` : ""} ` +
+          `and the marker ${join(plan.markerDir, ".mida")}`,
+      )
+      deps.print(`the project keeps its other folder(s): ${plan.otherRoots.join(", ")}`)
+      if (!(await askYes("Type yes to unlink: "))) {
+        deps.print("not approved")
+        return 1
+      }
+      const result = await unlinkProject(owner, { projectId: plan.projectId, markerDir: plan.markerDir })
+      deps.print(`unlinked ${plan.root} from project ${plan.projectId} (${result.removed} row(s) removed)`)
       return 0
     }
     return usage()
@@ -1465,10 +1491,11 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
       return 1
     }
   }
-  // `mida link` (lk-1) is local work — it re-signs only the owner-signed list — so it runs
-  // before the runtime opens and never reaches the chain. A passkey home cannot sign the list
-  // (the page's sign path carries a different shape), so link refuses plainly there.
-  if (command === "link") {
+  // `mida link` / `mida unlink` (lk-1) are local work — they re-sign only the owner-signed
+  // list — so they run before the runtime opens and never reach the chain. A passkey home
+  // cannot sign the list (the page's sign path carries a different shape), so they refuse
+  // plainly there.
+  if (command === "link" || command === "unlink") {
     if (loadOwnerMode(deps.home) === "passkey") {
       deps.print(`${command} is not available with a passkey owner yet`)
       return 2

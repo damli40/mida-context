@@ -6,7 +6,7 @@ import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import type { Hex } from "@mida/protocol"
 import {
   MidaHome, approveProject, approvalsFileStatus, canonicalEntries, checkProject, linkProject, loadOrCreateOwnerSecrets,
-  planProjectLink, removeAgentApprovals,
+  planProjectLink, planProjectUnlink, removeAgentApprovals, unlinkProject,
 } from "@mida/midad"
 import type { ProjectApproval, Runtime } from "@mida/midad"
 
@@ -487,5 +487,97 @@ describe("mida link — a second folder joins an existing project (lk-1)", () =>
     // already linked through the other case — nothing to add
     expect(await planProjectLink(runtime, { folder: dirA, cwd: dirB })).toMatchObject({ kind: "already" })
     expect(entriesOf(home)).toHaveLength(2)
+  })
+
+  describe("mida unlink — a linked folder leaves the project (lk-1)", () => {
+    it("drops this folder's rows for every agent, removes the marker, and A keeps working", async () => {
+      const { dir, home, runtime } = setup()
+      const dirA = join(dir, "a"); const dirB = join(dir, "b")
+      mark(dirA, "p-a"); mkdirSync(dirB)
+      await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+      await approveProject(runtime, { agent: "codex", cwd: dirA })
+      await linkProject(runtime, { projectId: "p-a", dir: dirB })
+      expect(entriesOf(home)).toHaveLength(4)
+
+      const plan = await planProjectUnlink(runtime, { cwd: dirB })
+      expect(plan).toMatchObject({ kind: "ok", projectId: "p-a", rows: expect.arrayContaining([
+        expect.objectContaining({ agent: "claude-code" }),
+        expect.objectContaining({ agent: "codex" }),
+      ]) })
+      const result = await unlinkProject(runtime, { projectId: "p-a", markerDir: dirB })
+      expect(result.removed).toBe(2)
+
+      // the marker is gone and B's rows for both agents left the signed list
+      expect(existsSync(join(dirB, ".mida"))).toBe(false)
+      const entries = entriesOf(home)
+      expect(entries).toHaveLength(2)
+      expect(entries.every((e) => e.root === realpathSync(dirA))).toBe(true)
+      // the list still verifies and the project's other folder still works
+      expect(await approvalsFileStatus(home, runtime.owner)).toBe("signed")
+      expect(await checkProject(runtime, { agent: "claude-code", cwd: dirA })).toMatchObject({ ok: true })
+      expect(await checkProject(runtime, { agent: "codex", cwd: dirA })).toMatchObject({ ok: true })
+      // and B itself no longer resolves to a project
+      expect(await checkProject(runtime, { agent: "claude-code", cwd: dirB })).toEqual({ ok: false, reason: "not-a-project" })
+    })
+
+    it("refuses to unlink the project's only folder — that would orphan it", async () => {
+      const { dir, runtime } = setup()
+      const dirA = join(dir, "a")
+      mark(dirA, "p-a")
+      await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+      expect(await planProjectUnlink(runtime, { cwd: dirA })).toMatchObject({ kind: "refused", code: "only-folder" })
+      // the marker and the row are still there
+      expect(existsSync(join(dirA, ".mida", "project.json"))).toBe(true)
+      expect(await checkProject(runtime, { agent: "claude-code", cwd: dirA })).toMatchObject({ ok: true })
+    })
+
+    it("refuses where nothing is marked — there is nothing to unlink", async () => {
+      const { dir, runtime } = setup()
+      const bare = join(dir, "bare")
+      mkdirSync(bare)
+      expect(await planProjectUnlink(runtime, { cwd: bare })).toMatchObject({ kind: "refused", code: "not-a-project" })
+      // a marker file that cannot be parsed answers the same — there is no project to leave
+      const broken = join(dir, "broken")
+      mkdirSync(join(broken, ".mida"), { recursive: true })
+      writeFileSync(join(broken, ".mida", "project.json"), "{not json")
+      expect(await planProjectUnlink(runtime, { cwd: broken })).toMatchObject({ kind: "refused", code: "not-a-project" })
+    })
+
+    it("refuses when the signed list is unreadable or unverifiable — unlink never guesses", async () => {
+      const { dir, home, runtime } = setup()
+      const dirA = join(dir, "a"); const dirB = join(dir, "b")
+      mark(dirA, "p-a"); mkdirSync(dirB)
+      await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+      await linkProject(runtime, { projectId: "p-a", dir: dirB })
+      // the file parses but no longer verifies — which rows name B is unknowable
+      const file = home.readJson<{ entries: ProjectApproval[]; signature: Hex }>(LIST)!
+      home.writeSecretJson(LIST, {
+        entries: [...file.entries, { agent: "evil", projectId: "p-evil", root: "/tmp", approvedAt: "x" }],
+        signature: file.signature,
+      })
+      expect(await planProjectUnlink(runtime, { cwd: dirB })).toMatchObject({ kind: "refused", code: "list-tampered" })
+      expect(existsSync(join(dirB, ".mida", "project.json"))).toBe(true)
+      // and an unreadable file refuses rather than rebuild — unlike approve, unlink must not drop every row
+      chmodSync(home.path(LIST), 0o000)
+      try {
+        expect(await planProjectUnlink(runtime, { cwd: dirB })).toMatchObject({ kind: "refused", code: "list-unreadable" })
+      } finally {
+        chmodSync(home.path(LIST), 0o600)
+      }
+    })
+
+    it("an unlinked folder's row removal is canonical — a symlinked cwd still finds its rows", async () => {
+      const { dir, home, runtime } = setup()
+      const dirA = join(dir, "a"); const dirB = join(dir, "b")
+      mark(dirA, "p-a"); mkdirSync(dirB)
+      await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+      await linkProject(runtime, { projectId: "p-a", dir: dirB })
+      const alias = join(dir, "b-alias")
+      symlinkSync(dirB, alias)
+      const result = await unlinkProject(runtime, { projectId: "p-a", markerDir: alias })
+      expect(result.removed).toBe(1)
+      expect(entriesOf(home)).toHaveLength(1)
+      expect(existsSync(join(dirB, ".mida"))).toBe(false)
+    })
   })
 })

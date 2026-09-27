@@ -1460,6 +1460,100 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     expect(await run2("link", "a", "b")).toBe(2)
     expect(out.filter((line) => line === USAGE)).toHaveLength(2)
   })
+
+  it("mida unlink removes B's rows and its marker after the typed yes — A keeps working (lk-1)", async () => {
+    const { home, owner, network } = folderHome("mida-unlink-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-unlink-a-"))
+    const dirB = mkdtempSync(join(tmpdir(), "mida-unlink-b-"))
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-ul" }))
+    await approveProject(owner, { agent: "claude-code", cwd: dirA })
+    await approveProject(owner, { agent: "codex", cwd: dirA })
+
+    const lines: string[] = []
+    const asked: string[] = []
+    expect(await runCli(["link", dirA], {
+      home, network, cwd: dirB, print: (line) => lines.push(line),
+      prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+    })).toBe(0)
+    lines.length = 0
+
+    expect(await runCli(["unlink"], {
+      home, network, cwd: dirB, print: (line) => lines.push(line),
+      prompt: async (question) => { asked.push(question); return "yes" },
+      stdinIsTTY: true, stdoutIsTTY: true,
+    })).toBe(0)
+    // the owner saw what goes away — the rows, the marker — and that the project keeps A
+    expect(asked).toEqual(["Type yes to unlink: "])
+    expect(lines.some((line) => line.includes("p-ul"))).toBe(true)
+    expect(lines.some((line) => line.includes(realpathSync(dirA)))).toBe(true)
+    expect(lines.at(-1)).toContain("unlinked")
+    // B's marker and both its rows are gone; A's rows and marker are untouched
+    expect(existsSync(join(dirB, ".mida"))).toBe(false)
+    expect(await checkProject(owner, { agent: "claude-code", cwd: dirA })).toMatchObject({ ok: true })
+    expect(await checkProject(owner, { agent: "codex", cwd: dirA })).toMatchObject({ ok: true })
+    expect(await checkProject(owner, { agent: "claude-code", cwd: dirB })).toEqual({ ok: false, reason: "not-a-project" })
+  })
+
+  it("mida unlink needs a real terminal, is refused through the daemon, and 'no' changes nothing (lk-1)", async () => {
+    const { home, owner, network } = folderHome("mida-uref-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-uref-a-"))
+    const dirB = mkdtempSync(join(tmpdir(), "mida-uref-b-"))
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-uref" }))
+    await approveProject(owner, { agent: "claude-code", cwd: dirA })
+    await runCli(["link", dirA], {
+      home, network, cwd: dirB, print: () => {},
+      prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+    })
+
+    const refused: string[] = []
+    expect(await runCli(["unlink"], {
+      home, network, cwd: dirB, print: (line) => refused.push(line),
+      prompt: async () => "yes", stdinIsTTY: false, stdoutIsTTY: true,
+    })).toBe(2)
+    expect(refused).toEqual([NEEDS_TERMINAL_LINE])
+    const daemonLines: string[] = []
+    const stub = { home: new MidaHome(mkdtempSync(join(tmpdir(), "mida-unlink-stub-"))) } as unknown as ServiceRuntime
+    expect(await runCliWithRuntime(["unlink"], stub, (line) => daemonLines.push(line))).toBe(2)
+    expect(daemonLines[0]).toContain("mida unlink")
+    // an answer other than yes keeps B's marker and its row
+    const out: string[] = []
+    expect(await runCli(["unlink"], {
+      home, network, cwd: dirB, print: (line) => out.push(line),
+      prompt: async () => "no", stdinIsTTY: true, stdoutIsTTY: true,
+    })).toBe(1)
+    expect(out).toContain("not approved")
+    expect(existsSync(join(dirB, ".mida", "project.json"))).toBe(true)
+    expect(await checkProject(owner, { agent: "claude-code", cwd: dirB })).toMatchObject({ ok: true })
+  })
+
+  it("mida unlink refuses on the project's only folder and where nothing is marked (lk-1)", async () => {
+    const { home, owner, network } = folderHome("mida-ux-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-ux-a-"))
+    const bare = mkdtempSync(join(tmpdir(), "mida-ux-bare-"))
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-ux" }))
+    await approveProject(owner, { agent: "claude-code", cwd: dirA })
+    const out: string[] = []
+    const runIn = (cwd: string, ...argv: string[]) =>
+      runCli(argv, {
+        home, network, cwd, print: (line) => out.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // the only folder cannot leave — that would orphan the project
+    expect(await runIn(dirA, "unlink")).toBe(1)
+    expect(out.at(-1)).toContain("orphan")
+    // and a folder with no project marker has nothing to unlink
+    expect(await runIn(bare, "unlink")).toBe(1)
+    expect(out.at(-1)).toContain("nothing to unlink")
+    // a stray argument is usage, like every command
+    expect(await runIn(bare, "unlink", "x")).toBe(2)
+    expect(out.at(-1)).toBe(USAGE)
+    // nothing moved: A is still approved and marked
+    expect(await checkProject(owner, { agent: "claude-code", cwd: dirA })).toMatchObject({ ok: true })
+    expect(existsSync(join(dirA, ".mida", "project.json"))).toBe(true)
+  })
 })
 
 /**
