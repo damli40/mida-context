@@ -365,6 +365,9 @@ export async function runCliWithRuntime(
           ? generalAssistanceText(agent)
           : `${agent} is already approved on chain. To use it in THIS folder, run \`mida approve ${agent}\` here (no transaction, nothing to pay).`,
       )
+      // For `request` that line is guidance, not a failure — a `request a && request b` chain
+      // must run on through it (in-15 J-5). Approve still counts it, as before.
+      if (command === "request") return 0
     } else if (code === "chain-busy") {
       // the chain could not be asked at all — the same owner-facing line ownerRefusalLine prints
       print("Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again")

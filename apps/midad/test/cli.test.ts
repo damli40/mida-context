@@ -66,6 +66,24 @@ describe("the crude mida command", () => {
     )
   }, 300_000)
 
+  it("request on an already-approved agent is guidance, not a failure — exit 0 (in-15 J-5)", async () => {
+    // Sep 27 live: `request claude-code && request codex && request devin` stopped at the first
+    // — the already-approved line is the honest next step, so it must not break a && chain.
+    // Self-contained: approve a fresh agent here so the second request really is the second.
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-j5-")))
+    const out: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, { home: fresh, network, cwd: projectDir, print: (line) => out.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
+    expect(await run2("init")).toBe(0)
+    expect(await run2("request", "codex")).toBe(0)
+    expect(await run2("approve", "codex")).toBe(0)
+    out.length = 0
+    expect(await run2("request", "codex")).toBe(0)
+    expect(out).toContain(
+      "codex is already approved on chain. To use it in THIS folder, run `mida approve codex` here (no transaction, nothing to pay).",
+    )
+  }, 300_000)
+
   it("kicks the daemon after a successful approve and revoke so the service notices, and never otherwise", async () => {
     const kicks: string[] = []
     const kick = () => (kicks.push("x"), Promise.resolve())
