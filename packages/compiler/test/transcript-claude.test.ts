@@ -700,3 +700,136 @@ describe("readConversation", () => {
     expect(r.text).not.toContain("omitted")
   })
 })
+
+// P-1 / PROV-09 — a message the user typed mid-session must reach the saved
+// context wherever it sits. Two holes dropped it: a file over
+// HEAD_BYTES + TAIL_BYTES was read only at both ends, so a typed message in
+// the middle never arrived; and even a whole-read file let a wall of later
+// assistant blocks push an early change out of the maxChars fill. The fix is
+// one streamed scan that finds every typed line with its real line number,
+// plus a pinned group that keeps the ones the newest-first fill would lose.
+describe("the user's later typed messages are never lost (P-1)", () => {
+  const userLine = (content: string) =>
+    JSON.stringify({ type: "user", message: { role: "user", content } })
+  const toolLine = (i: number) =>
+    JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", name: "Write", input: { file_path: `src/f${i}.ts`, content: `work-${i} ` + "w".repeat(1_400) } }] },
+    })
+  const assistantText = (text: string) =>
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text }] } })
+
+  // The shape the rehearsal hit: the request on L1, ~70 KB of assistant tool
+  // lines (past the 64 KiB head window), the user's mid lines, then enough
+  // more tool lines to push them out of the 60 KB tail window too.
+  function truncatedShape(dir: string, midLines: string[]) {
+    const lines = [userLine("Build the handoff demo. Constraint: no animations anywhere.")]
+    let size = lines[0]!.length + 1
+    let i = 0
+    while (size < 70_000) {
+      lines.push(toolLine(i++))
+      size += lines.at(-1)!.length + 1
+    }
+    const firstMidLine = lines.length + 1
+    for (const line of midLines) {
+      lines.push(line)
+      size += line.length + 1
+    }
+    while (size < 200_000) {
+      lines.push(toolLine(i++))
+      size += lines.at(-1)!.length + 1
+    }
+    return { t: writeTranscript(dir, lines), firstMidLine }
+  }
+
+  it("a typed change sitting in the unread middle is pinned with its real line number", () => {
+    const dir = tmpdir()
+    const change = "Change the concept: make it show provenance edges in violet."
+    const { t, firstMidLine } = truncatedShape(dir, [userLine(change)])
+    expect(fs.statSync(t).size).toBeGreaterThan(64 * 1024 + 60_000) // genuinely truncated
+    const r = readConversation(t)
+    expect(r.text).toContain("user — later messages you typed, oldest first (outside the recent messages below):")
+    expect(r.text).toContain(`L${firstMidLine}: ${change}`)
+    // the group sits after the pinned request and before the omitted marker
+    expect(r.text.indexOf("later messages you typed")).toBeLessThan(r.text.indexOf("earlier messages omitted"))
+    expect(r.firstUserMessage).toBe("Build the handoff demo. Constraint: no animations anywhere.")
+    expect(r.text.length).toBeLessThanOrEqual(40_000)
+  })
+
+  it("a typed change the newest-first fill would drop is pinned too — a whole-read file", () => {
+    const dir = tmpdir()
+    const change = "Change the goal: make it stream instead."
+    const lines = [userLine("build the parser"), userLine(change)]
+    for (let i = 0; i < 45; i++) lines.push(assistantText(`step ${i} ` + "s".repeat(1_000)))
+    const t = writeTranscript(dir, lines)
+    expect(fs.statSync(t).size).toBeLessThan(64 * 1024) // the whole file was read
+    const r = readConversation(t, { maxChars: 20_000 })
+    expect(r.text).toContain("user — later messages you typed")
+    expect(r.text).toContain(`L2: ${change}`)
+  })
+
+  it("the pinned group keeps the newest typed messages inside its own cap and counts the rest", () => {
+    const dir = tmpdir()
+    const mid: string[] = []
+    for (let m = 0; m < 20; m++) mid.push(userLine(`typed-${m} ${"m".repeat(1_000)}`))
+    const { t } = truncatedShape(dir, mid)
+    const r = readConversation(t)
+    expect(r.text).toContain("user — later messages you typed")
+    expect(r.text).toContain("typed-19")
+    expect(r.text).not.toContain("typed-0 ")
+    expect(r.text).toMatch(/\[\… \d+ older messages of yours omitted \…\]/)
+    expect(r.text.length).toBeLessThanOrEqual(40_000)
+  })
+
+  it("a pasted user line too long to parse is counted and marked — never read whole, never dropped silently", () => {
+    const dir = tmpdir()
+    const paste = `PASTE-BEGIN ${"p".repeat(300_000)} PASTE-END`
+    const { t } = truncatedShape(dir, [userLine(paste)])
+    let maxRead = 0
+    const origReadSync = fs.readSync
+    // @ts-expect-error deliberate measurement shim around the real reader
+    fs.readSync = (...args: Parameters<typeof fs.readSync>) => {
+      const n = origReadSync(...args)
+      maxRead = Math.max(maxRead, n)
+      return n
+    }
+    let r: ReturnType<typeof readConversation>
+    try {
+      r = readConversation(t)
+    } finally {
+      fs.readSync = origReadSync
+    }
+    expect(r.text).toContain("[1 message of yours was too long to read here]")
+    expect(r.text).not.toContain("PASTE-BEGIN")
+    expect(r.text).not.toContain("PASTE-END")
+    expect(maxRead).toBeLessThanOrEqual(64 * 1024)
+  })
+
+  it("tool output, injected lines and built-in echoes never join the group — a custom command does", () => {
+    const dir = tmpdir()
+    const mid = [
+      JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "TOOL-OUT-MARKER must stay unread" }] } }),
+      JSON.stringify({ type: "user", isMeta: true, message: { role: "user", content: "META-MARKER bookkeeping" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "<system-reminder>REM-MARKER bookkeeping</system-reminder>" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>MODEL-ARGS-MARKER</command-args>" } }),
+      JSON.stringify({ type: "user", message: { role: "user", content: "<command-message>brainstorm</command-message>\n<command-name>/brainstorm</command-name>\n<command-args>SKETCH-MARKER the retry policy</command-args>" } }),
+    ]
+    const { t } = truncatedShape(dir, mid)
+    const r = readConversation(t)
+    expect(r.text).toContain("user — later messages you typed")
+    expect(r.text).toContain("/brainstorm SKETCH-MARKER the retry policy")
+    for (const gone of ["TOOL-OUT-MARKER", "META-MARKER", "REM-MARKER", "MODEL-ARGS-MARKER", "command-name"]) {
+      expect(r.text).not.toContain(gone)
+    }
+  })
+
+  it("a secret inside a mid-file typed message is scrubbed before the group renders it", () => {
+    const dir = tmpdir()
+    const secret = "sk-live-abcdefghijklmnop"
+    const change = `staging key is ${secret} — deploys stay manual`
+    const { t, firstMidLine } = truncatedShape(dir, [userLine(change)])
+    const r = readConversation(t)
+    expect(r.text).toContain(`L${firstMidLine}: staging key is [REDACTED] — deploys stay manual`)
+    expect(r.text).not.toContain(secret)
+  })
+})

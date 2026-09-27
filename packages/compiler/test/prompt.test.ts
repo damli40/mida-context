@@ -34,7 +34,7 @@ const previous: Checkpoint = {
 // than rebuilt from the constants it would then tautologically match.
 const FIRST_COMPILE_PROMPT = `You are extracting a compact task checkpoint from an AI coding agent's transcript. Another agent will continue this work from your summary alone.
 
-The transcript below is a list of blocks, each headed "L<n> <role>:" where <n> is the 1-based line number in the transcript file and <role> is "user" or "assistant". The FIRST block is the user's original request — it carries the objective and the constraints; read it first and weight it most. The blocks after it are the most recent messages; a line "[… N earlier messages omitted …]" marks messages dropped in between.
+The transcript below is a list of blocks, each headed "L<n> <role>:" where <n> is the 1-based line number in the transcript file and <role> is "user" or "assistant". The FIRST block is the user's original request — it carries the objective and the constraints; read it first and weight it most. The blocks after it are the most recent messages; a line "[… N earlier messages omitted …]" marks messages dropped in between. A block headed "user — later messages you typed" lists, oldest first, messages the user typed later in the session that fall outside the recent messages. The user's words outrank the assistant's: when a later user message changes the goal or a requirement, the objective, nextAction and remainingPlan follow the user's LATEST instruction, and any decision it caused gives the user as its rationale ("the user asked …"), never the assistant's planning.
 
 Output ONLY a single JSON object — no prose, no code fence — with exactly these fields:
 
@@ -108,6 +108,18 @@ describe("buildExtractPrompt", () => {
     expect(prompt).toContain("infer the task from the conversation and the summary")
     expect(prompt).not.toContain("The FIRST block is the user's original request")
     expect(prompt).not.toContain("PREVIOUS CHECKPOINT")
+  })
+
+  // P-1: the pinned group of later typed messages is part of the transcript
+  // contract — both request variants must say what it is and that the user's
+  // own words outrank the assistant's when the goal changed mid-session.
+  it("both prompt variants describe the typed-messages group and who wins", () => {
+    const group = `A block headed "user — later messages you typed" lists, oldest first, messages the user typed later in the session that fall outside the recent messages.`
+    const outrank = `the objective, nextAction and remainingPlan follow the user's LATEST instruction`
+    expect(buildExtractPrompt("L1 user: keep going", undefined, true)).toContain(group)
+    expect(buildExtractPrompt("L1 user: keep going", undefined, true)).toContain(outrank)
+    expect(buildExtractPrompt("L1 user: keep going", undefined, false)).toContain(group)
+    expect(buildExtractPrompt("L1 user: keep going", undefined, false)).toContain(outrank)
   })
 
   it("a secret sitting in the previous checkpoint is scrubbed before it reaches the model", () => {

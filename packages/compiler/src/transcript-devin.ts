@@ -16,7 +16,7 @@ import { scrubSecrets, scrubValue } from "./scrub.js"
 import { cutSummary } from "./transcript-claude.js"
 import type { Conversation } from "./transcript-claude.js"
 import { isInjectedUserText } from "./transcript-injected.js"
-import { FIRST_USER_CHARS, PART_CHARS, cut, fitMessages, hardCut } from "./transcript-lines.js"
+import { FIRST_USER_CHARS, PART_CHARS, cut, fitMessages, hardCut, twoEndedCut, type TypedMark } from "./transcript-lines.js"
 
 /**
  * The narrow slice of node:sqlite's DatabaseSync this file uses — declared here
@@ -476,7 +476,10 @@ export function readDevinConversation(
   // are not this conversation. Without a summarized_from node the whole live
   // chain renders (cutIdx stays -1). messagesTotal counts every
   // user/assistant/tool node rendered, dropped or skipped within that slice.
-  const msgs: { role: string; block: string }[] = []
+  // A typed mark rides on each user block — the owner's own words by the same
+  // is_user_input check that gates the render — so fitMessages can pin the
+  // ones the fill would lose, labelled N<nodeId> like the blocks themselves.
+  const msgs: { role: string; block: string; typed?: TypedMark }[] = []
   let messagesTotal = 0
   let pinIdx: number | undefined
   for (const n of chain.slice(cutIdx + 1)) {
@@ -491,8 +494,13 @@ export function readDevinConversation(
       if (!isUserInput(msg)) continue // system-injected: bookkeeping, not the owner
       if (typeof msg.content !== "string" || msg.content === "") continue
       const picked = n === earliestRequestNode
-      const body = picked ? scrubSecrets(msg.content) : cut(scrubSecrets(msg.content), PART_CHARS)
-      msgs.push({ role: "user", block: `N${label} user:\n${body}` })
+      // a typed user message keeps both its ends (1,200 + 600), never PART_CHARS
+      const body = picked ? scrubSecrets(msg.content) : twoEndedCut(scrubSecrets(msg.content))
+      msgs.push({
+        role: "user",
+        block: `N${label} user:\n${body}`,
+        typed: { label: `N${label}`, order: n.nodeId, text: msg.content },
+      })
       if (picked) pinIdx = msgs.length - 1
       continue
     }
