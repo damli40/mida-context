@@ -16,11 +16,22 @@
 
 import fs from "node:fs"
 import { StringDecoder } from "node:string_decoder"
+import { scrubSecrets } from "./scrub.js"
 
 export const HEAD_BYTES = 64 * 1024 // bounded head — the first user message lives at the top
 export const TAIL_BYTES = 60_000 // tail window — the newest messages live at the bottom
 export const PART_CHARS = 600
 export const FIRST_USER_CHARS = 6_000
+// A line the format's cheap check flags as a possible typed user message is
+// not parsed past this size — it is counted and marked, never read whole.
+export const USER_LINE_BYTES = 256 * 1024
+// The pinned block of later typed messages gets its own share of the budget,
+// charged before the newest-first fill.
+export const USER_GROUP_CHARS = 8_000
+// A typed user message renders as its first 1,200 and last 600 chars — a
+// pasted log keeps its start and its end instead of only its first lines.
+export const USER_HEAD_CHARS = 1_200
+export const USER_TAIL_CHARS = 600
 // Room kept aside for the "[… N earlier messages omitted …]" marker so the
 // final text stays under maxChars even when the marker is needed.
 export const MARKER_RESERVE = 96
@@ -29,6 +40,16 @@ export const cut = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "�
 // Unlike cut(), the ellipsis is counted INSIDE the limit: the result is at
 // most n chars, so it can never trip the schema's 6,000-char cap.
 export const hardCut = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s)
+
+/**
+ * The user's own words get a wider, two-sided cut than a tool block: the first
+ * USER_HEAD_CHARS and the last USER_TAIL_CHARS joined by a marker. Scrub the
+ * text BEFORE this runs — a secret straddling the cut must already be gone.
+ */
+export function twoEndedCut(text: string): string {
+  if (text.length <= USER_HEAD_CHARS + USER_TAIL_CHARS) return text
+  return `${text.slice(0, USER_HEAD_CHARS)}\n[… middle of your message cut …]\n${text.slice(-USER_TAIL_CHARS)}`
+}
 
 /**
  * One open descriptor, at most HEAD_BYTES + TAIL_BYTES read: the whole file when it fits,
@@ -92,17 +113,54 @@ export function readTranscriptLines(path: string): TranscriptLines {
 const SCAN_CHUNK_BYTES = 64 * 1024
 /** A compact-summary line longer than this is skipped, not retained. */
 export const SUMMARY_LINE_BYTES = 400 * 1024
+/** How much of an over-cap line's start is kept for the cheap candidate check. */
+const SCAN_PREFIX_CHARS = 4 * 1024
 
 /**
- * One streamed pass over the whole file — SCAN_CHUNK_BYTES at a time, the line
- * under construction dropped the moment it passes SUMMARY_LINE_BYTES — for the
- * LAST line whose parsed JSON carries `"isCompactSummary": true`. A summary
- * written more than TAIL_BYTES before the end sits in the unread middle of a
- * truncated transcript, invisible to the head/tail windows; this finds it
- * anyway without ever loading the file whole. Returns the line and its real
- * 1-based number, or null.
+ * What one format needs the streamed pass to know about its lines. Every hook
+ * sees the line's raw text; JSON parsing stays inside the format's code so a
+ * hook can run its cheap string check first and skip the parse entirely.
  */
-export function lastCompactSummaryLine(path: string): { label: string; text: string } | null {
+export interface ScanHooks {
+  /** Cheap pre-check — a line failing it is never parsed for typed text. */
+  candidate(text: string): boolean
+  /**
+   * The line's raw user-role text (tags intact), or "" when the line is not a
+   * candidate or carries none. Feeds the neighbour checks — formats whose
+   * command echoes are decided by the lines around them read this, never the
+   * rendered text.
+   */
+  userText(text: string): string
+  /**
+   * A candidate's typed text — the user's own words as the reader's shared
+   * classifier sees them — or null when the line is not a typed message.
+   * `neighbours.prev` is the previous line's userText; `neighbours.next` is up
+   * to two following lines' userText — the window a command-echo rule needs.
+   */
+  typedText(text: string, neighbours: { prev: string; next: string[] }): string | null
+  /** The format's compact-summary test, when it has one — the last true wins. */
+  summary?(text: string): boolean
+}
+
+export interface TranscriptScan {
+  /** Every typed user line, in file order, each with its real 1-based number. */
+  typed: { line: number; text: string }[]
+  /** Line numbers of candidate lines too long to parse — counted, never dropped silently. */
+  tooLong: number[]
+  /** The last compact-summary line, or null — same answer lastCompactSummaryLine gave. */
+  summary: { label: string; text: string } | null
+}
+
+/**
+ * One streamed pass over the whole file — SCAN_CHUNK_BYTES at a time, never
+ * more than one capped line in memory — returning BOTH the last compact
+ * summary (unchanged behaviour) and every line the format's classifier calls
+ * typed, each with its real 1-based line number. The typed decision may need
+ * the neighbouring lines' userText (one back, up to two ahead), so a line is
+ * classified once two more have passed; over-cap candidates are counted in
+ * `tooLong` instead of parsed.
+ */
+export function scanTranscript(path: string, hooks: ScanHooks): TranscriptScan {
   const fd = fs.openSync(path, "r")
   try {
     const size = fs.fstatSync(fd).size
@@ -112,19 +170,43 @@ export function lastCompactSummaryLine(path: string): { label: string; text: str
     let lineNo = 0
     let piece = "" // the line so far — emptied the moment it outgrows the cap
     let overflow = false // the line under construction already passed the cap
-    let found: { label: string; text: string } | null = null
-    const finish = (text: string, tooLong: boolean): void => {
-      lineNo += 1
-      if (tooLong || text.length > SUMMARY_LINE_BYTES) return
-      if (!text.includes('"isCompactSummary"')) return
-      try {
-        const obj = JSON.parse(text) as { isCompactSummary?: unknown } | null
-        if (obj !== null && typeof obj === "object" && obj.isCompactSummary === true) {
-          found = { label: `${lineNo}`, text }
-        }
-      } catch {
-        // a line that merely mentions the flag inside a value is not the summary
+    let prefix = "" // the line's first bytes — kept even after the cap drops the rest
+    const typed: { line: number; text: string }[] = []
+    const tooLong: number[] = []
+    let summary: { label: string; text: string } | null = null
+    // A candidate's neighbour rule needs the lines around it, so a line waits
+    // in a 3-deep window until its two next neighbours have passed; prevUt is
+    // the userText of the line just ahead of the window's head.
+    let prevUt = ""
+    const window: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number }[] = []
+    const classify = (entry: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number }, next: string[]): void => {
+      if (!entry.cand) return
+      if (entry.big) {
+        tooLong.push(entry.lineNo)
+        return
       }
+      const text = hooks.typedText(entry.text, { prev: prevUt, next })
+      if (text !== null) typed.push({ line: entry.lineNo, text })
+    }
+    const push = (entry: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number }): void => {
+      window.push(entry)
+      if (window.length === 3) {
+        const head = window.shift()!
+        classify(head, [window[0]!.ut, window[1]!.ut])
+        prevUt = head.ut
+      }
+    }
+    const finish = (text: string, tooLongLine: boolean): void => {
+      lineNo += 1
+      if (tooLongLine || text.length > SUMMARY_LINE_BYTES) {
+        // the line itself is gone — the kept prefix still answers the cheap check
+        push({ text: "", ut: "", cand: hooks.candidate(prefix), big: true, lineNo })
+        return
+      }
+      if (hooks.summary !== undefined && hooks.summary(text)) summary = { label: `${lineNo}`, text }
+      const cand = hooks.candidate(text)
+      const big = cand && text.length > USER_LINE_BYTES
+      push({ text, ut: cand && !big ? hooks.userText(text) : "", cand, big, lineNo })
     }
     while (position < size) {
       const n = fs.readSync(fd, buf, 0, Math.min(SCAN_CHUNK_BYTES, size - position), position)
@@ -136,10 +218,12 @@ export function lastCompactSummaryLine(path: string): { label: string; text: str
         if (text.charCodeAt(i) !== 10) continue
         finish(overflow ? "" : piece + text.slice(start, i), overflow)
         piece = ""
+        prefix = ""
         overflow = false
         start = i + 1
       }
       const rest = text.slice(start)
+      if (prefix.length < SCAN_PREFIX_CHARS) prefix = (prefix + rest).slice(0, SCAN_PREFIX_CHARS)
       if (overflow || piece.length + rest.length > SUMMARY_LINE_BYTES) {
         piece = ""
         overflow = true
@@ -149,10 +233,39 @@ export function lastCompactSummaryLine(path: string): { label: string; text: str
     }
     piece += decoder.end()
     if (piece !== "" || overflow) finish(piece, overflow) // a final line without its newline counts
-    return found
+    while (window.length > 0) {
+      const head = window.shift()!
+      classify(head, window.map((entry) => entry.ut))
+      prevUt = head.ut
+    }
+    return { typed, tooLong, summary }
   } finally {
     fs.closeSync(fd)
   }
+}
+
+/**
+ * The summary half of scanTranscript kept under its old name: the LAST line
+ * whose parsed JSON carries `"isCompactSummary": true`, wherever it sits.
+ * Callers that need the typed lines too should take the one-pass scanTranscript
+ * instead of scanning twice.
+ */
+export function lastCompactSummaryLine(path: string): { label: string; text: string } | null {
+  return scanTranscript(path, {
+    candidate: () => false,
+    userText: () => "",
+    typedText: () => null,
+    summary: (text) => {
+      if (!text.includes('"isCompactSummary"')) return false
+      try {
+        const obj = JSON.parse(text) as { isCompactSummary?: unknown } | null
+        return obj !== null && typeof obj === "object" && obj.isCompactSummary === true
+      } catch {
+        // a line that merely mentions the flag inside a value is not the summary
+        return false
+      }
+    },
+  }).summary
 }
 
 /**
@@ -182,13 +295,81 @@ export function lastCompactSummaryLine(path: string): { label: string; text: str
  * pick is then an ordinary message that competes for the tail like every
  * other, never silently dropped.
  */
+/**
+ * One message the user typed, carried beside its rendered block (or found only
+ * by the streamed scan): `label` is its display label — "L812", "N3", "L~5" —
+ * `order` its place in the file (the real line number, or the chain position;
+ * an unpaired tail mark keeps TAIL_ORDER so it sorts after every numbered
+ * line), and `text` the classifier's typed words, unscrubbed.
+ */
+export interface TypedMark {
+  label: string
+  order: number
+  text: string
+  /** The scanned line this tail-window mark stands for — fills in its real label/order. */
+  pair?: TypedMark
+}
+
+/** Order key for a tail-window mark whose real line number is unknowable. */
+export const TAIL_ORDER = Number.MAX_SAFE_INTEGER
+
+/** The typed lines a truncated file's scan found plus the too-long count — the group's scan half. */
+export interface ScannedMarks {
+  marks: TypedMark[]
+  tooLong: number
+}
+
+/**
+ * The pinned group P-1 adds: every typed user message the newest-first fill
+ * would lose — dropped by the fill, or found only in the unread middle — as
+ * one block between the pinned request/summary and the omitted marker:
+ *
+ *   user — later messages you typed, oldest first (outside the recent messages below):
+ *   [… N older messages of yours omitted …]
+ *   L812: <text>
+ *   L1403: <text>
+ *   [2 messages of yours were too long to read here]
+ *
+ * Newest messages win inside the USER_GROUP_CHARS cap; older ones collapse
+ * into the count line. Returns null when there is nothing to pin.
+ */
+function buildUserGroup(candidates: TypedMark[], tooLong: number): string | null {
+  if (candidates.length === 0 && tooLong === 0) return null
+  const lines = candidates
+    .slice()
+    .sort((a, b) => a.order - b.order)
+    .map((m) => `${m.label}: ${twoEndedCut(scrubSecrets(m.text))}`)
+  const tooLongLine =
+    tooLong === 0
+      ? null
+      : `[${tooLong} message${tooLong === 1 ? " of yours was" : "s of yours were"} too long to read here]`
+  const kept: string[] = []
+  let used = tooLongLine === null ? 0 : tooLongLine.length
+  let dropped = 0
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const cost = lines[i]!.length + (used > 0 ? 1 : 0)
+    if (used + cost > USER_GROUP_CHARS) {
+      dropped = i + 1
+      break
+    }
+    kept.unshift(lines[i]!)
+    used += cost
+  }
+  const parts = ["user — later messages you typed, oldest first (outside the recent messages below):"]
+  if (dropped > 0) parts.push(`[… ${dropped} older messages of yours omitted …]`)
+  parts.push(...kept)
+  if (tooLongLine !== null) parts.push(tooLongLine)
+  return parts.join("\n")
+}
+
 export function fitMessages(
-  msgs: { role: string; block: string }[],
+  msgs: { role: string; block: string; typed?: TypedMark }[],
   maxChars: number,
   truncated: boolean,
   pinIdx?: number,
   extraPinned?: string | null,
   leadPinned?: string | null,
+  scanned?: ScannedMarks | null,
 ): { text: string; messagesKept: number; omitted: number } {
   const lead = leadPinned ?? null
   const pin = lead === null && pinIdx !== undefined && pinIdx >= 0 && pinIdx < msgs.length ? pinIdx : -1
@@ -196,29 +377,86 @@ export function fitMessages(
   const head = lead ?? (pin >= 0 ? cut(msgs[pin]!.block, headCap) : null)
   const rest = msgs.filter((_, i) => i !== pin)
 
-  const budget = Math.max(
-    0,
-    maxChars - (head ? head.length + 2 : 0) - (extraPinned ? extraPinned.length + 2 : 0) - MARKER_RESERVE,
-  )
-  const keptTail: { role: string; block: string }[] = []
-  let used = 0
-  for (let i = rest.length - 1; i >= 0; i--) {
-    const cost = rest[i]!.block.length + (keptTail.length ? 2 : 0)
-    if (used + cost > budget) break
-    keptTail.unshift(rest[i]!)
-    used += cost
+  // The scan saw every typed line in the file; the marks carry the ones the
+  // windows rendered. Dedupe by identity: a scanned line whose order matches a
+  // numbered mark is that mark; the LAST K scanned lines pair positionally
+  // with the K tail marks (the tail window is the file's end), giving each
+  // tail mark its real label. Whatever remains lives only in the group.
+  const marks = msgs.map((m) => m.typed)
+  const tailMarkIdx: number[] = []
+  for (let i = 0; i < marks.length; i++) {
+    if (marks[i] !== undefined && marks[i]!.order === TAIL_ORDER) tailMarkIdx.push(i)
   }
+  const numbered = new Set<number>()
+  for (const m of marks) if (m !== undefined && m.order !== TAIL_ORDER) numbered.add(m.order)
+  let scanOnly: TypedMark[] = []
+  if (scanned !== null && scanned !== undefined) {
+    const avail = scanned.marks.filter((s) => !numbered.has(s.order))
+    if (tailMarkIdx.length > 0) {
+      const base = Math.max(0, avail.length - tailMarkIdx.length)
+      for (let j = 0; j < tailMarkIdx.length && base + j < avail.length; j++) {
+        const mark = marks[tailMarkIdx[j]!]!
+        mark.pair = avail[base + j]
+        mark.label = mark.pair!.label
+        mark.order = mark.pair!.order
+      }
+      scanOnly = avail.slice(0, base)
+    } else {
+      scanOnly = avail
+    }
+  }
+
+  const headCost = (head ? head.length + 2 : 0) + (extraPinned ? extraPinned.length + 2 : 0) + MARKER_RESERVE
+  const fill = (budget: number): number[] => {
+    const kept: number[] = []
+    let used = 0
+    for (let i = rest.length - 1; i >= 0; i--) {
+      const cost = rest[i]!.block.length + (kept.length ? 2 : 0)
+      if (used + cost > budget) break
+      kept.unshift(i)
+      used += cost
+    }
+    return kept
+  }
+
+  // The group's members depend on the fill; the fill's budget depends on the
+  // group. Seed it with every typed mark as a candidate, then let survivors
+  // leave the group — strictly shrinking, so a couple of passes settles it.
+  const hasGroupWork = scanOnly.length > 0 || (scanned?.tooLong ?? 0) > 0 || marks.some((m) => m !== undefined)
+  const dropped = new Set<number>()
+  for (let i = 0; i < rest.length; i++) if (rest[i]!.typed !== undefined) dropped.add(i)
+  let group: string | null = null
+  let keptIdx: number[] = []
+  if (hasGroupWork) {
+    for (let iter = 0; iter < 8; iter++) {
+      const candidates = [...scanOnly, ...[...dropped].map((i) => rest[i]!.typed!)]
+      const next = buildUserGroup(candidates, scanned?.tooLong ?? 0)
+      const budget = Math.max(0, maxChars - headCost - (next === null ? 0 : next.length + 2))
+      keptIdx = fill(budget)
+      const survivors = new Set(keptIdx)
+      const before = dropped.size
+      for (const i of [...dropped]) if (survivors.has(i)) dropped.delete(i)
+      group = next
+      if (dropped.size === before) break
+    }
+  } else {
+    keptIdx = fill(Math.max(0, maxChars - headCost))
+  }
+  const keptTail = keptIdx.map((i) => rest[i]!)
   const omitted = rest.length - keptTail.length
 
   const blocks: string[] = []
   if (head) blocks.push(head)
   if (extraPinned) blocks.push(extraPinned)
+  if (group !== null) blocks.push(group)
   if (truncated) blocks.push(`[… earlier messages omitted …]`)
   else if (omitted) blocks.push(`[… ${omitted} earlier messages omitted …]`)
   for (const m of keptTail) blocks.push(m.block)
 
   return {
     text: blocks.join("\n\n"),
+    // the group is a synthetic block, not a transcript message — counting it
+    // would break the omitted = total − kept invariant the callers rely on
     messagesKept: (head ? 1 : 0) + (extraPinned ? 1 : 0) + keptTail.length,
     omitted,
   }

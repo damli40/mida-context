@@ -129,3 +129,70 @@ describe("readCodexConversation", () => {
     expect(c.firstUserMessage).toBe("<note> do not forget the parser edge case")
   })
 })
+
+// P-1 / PROV-09 — same hole as the Claude reader: a rollout over
+// HEAD_BYTES + TAIL_BYTES was read only at both ends, so a typed message in
+// the unread middle never reached the compile. The streamed scan finds it
+// with its real line number.
+describe("the user's later typed messages are never lost (P-1)", () => {
+  const userItem = (text: string) =>
+    JSON.stringify({
+      type: "response_item",
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text }] },
+    })
+  const toolOut = (i: number) =>
+    JSON.stringify({
+      type: "response_item",
+      payload: { type: "function_call_output", output: `out-${i} ` + "o".repeat(1_400) },
+    })
+
+  it("a typed change sitting in the unread middle of a large rollout is pinned with its real line number", () => {
+    const change = "Change the rollout: provenance edges render in violet."
+    const lines = [userItem("Build the handoff demo. Constraint: no animations anywhere.")]
+    let size = lines[0]!.length + 1
+    let i = 0
+    while (size < 70_000) {
+      lines.push(toolOut(i++))
+      size += lines.at(-1)!.length + 1
+    }
+    const changeLine = lines.length + 1
+    lines.push(userItem(change))
+    size += lines.at(-1)!.length + 1
+    while (size < 200_000) {
+      lines.push(toolOut(i++))
+      size += lines.at(-1)!.length + 1
+    }
+    const p = join(mkdtempSync(join(tmpdir(), "cx-")), "t.jsonl")
+    writeFileSync(p, lines.join("\n") + "\n")
+    const c = readCodexConversation(p)
+    expect(c.format).toBe("codex-jsonl")
+    expect(c.text).toContain("user — later messages you typed, oldest first (outside the recent messages below):")
+    expect(c.text).toContain(`L${changeLine}: ${change}`)
+    expect(c.firstUserMessage).toBe("Build the handoff demo. Constraint: no animations anywhere.")
+    expect(c.text.length).toBeLessThanOrEqual(40_000)
+  })
+
+  it("injected user text never joins the group — scaffolding is not typed", () => {
+    const lines = [userItem("build the demo")]
+    let size = lines[0]!.length + 1
+    let i = 0
+    while (size < 70_000) {
+      lines.push(toolOut(i++))
+      size += lines.at(-1)!.length + 1
+    }
+    lines.push(userItem("<environment_context>MID-INJECTED-MARKER cwd=/tmp</environment_context>"))
+    lines.push(userItem("MIDA HANDOFF\nMID-HANDOFF-MARKER must stay unread"))
+    lines.push(userItem("now show provenance edges in violet"))
+    let bytes = lines.map((l) => l.length + 1).reduce((a, b) => a + b, 0)
+    while (bytes < 200_000) {
+      lines.push(toolOut(i++))
+      bytes += lines.at(-1)!.length + 1
+    }
+    const p = join(mkdtempSync(join(tmpdir(), "cx-")), "t.jsonl")
+    writeFileSync(p, lines.join("\n") + "\n")
+    const c = readCodexConversation(p)
+    expect(c.text).toContain("now show provenance edges in violet")
+    expect(c.text).not.toContain("MID-INJECTED-MARKER")
+    expect(c.text).not.toContain("MID-HANDOFF-MARKER")
+  })
+})

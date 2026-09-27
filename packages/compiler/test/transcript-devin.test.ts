@@ -414,4 +414,47 @@ describe("readDevinConversation — the chain the job asked for", () => {
     expect(convo.format).toBe("devin-sqlite")
     expect(convo.text).toContain("tail answer")
   })
+
+  // P-1 / PROV-09 — the Devin reader reads its store whole, but the fill is
+  // the same newest-first race: a wall of later assistant turns pushed the
+  // owner's change out of the budget. The pinned group keeps it, labelled by
+  // node id like every other Devin block.
+  itSqlite("an owner message the newest-first fill would drop is pinned in the group (P-1)", () => {
+    const nodes: NodeRow[] = [
+      { nodeId: 1, chatMessage: system("root") },
+      { nodeId: 2, parentNodeId: 1, chatMessage: user("build the thing") },
+      { nodeId: 3, parentNodeId: 2, chatMessage: user("Change the goal: make it stream instead.") },
+    ]
+    let id = 4
+    let parent = 3
+    for (let i = 0; i < 45; i++) {
+      nodes.push({ nodeId: id, parentNodeId: parent, chatMessage: assistant(`step ${i} ` + "s".repeat(1_000)) })
+      parent = id
+      id += 1
+    }
+    const db = makeDevinDb([{ id: "bald-swordfish", mainChainId: parent }], nodes)
+    const convo = readDevinConversation(db, { sessionId: "bald-swordfish", maxChars: 20_000 })
+    expect(convo.text).toContain("user — later messages you typed, oldest first (outside the recent messages below):")
+    expect(convo.text).toContain("N3: Change the goal: make it stream instead.")
+  })
+
+  itSqlite("an injected is_user_input turn never joins the group — Mida's own text is not typed (P-1)", () => {
+    const nodes: NodeRow[] = [
+      { nodeId: 1, chatMessage: system("root") },
+      { nodeId: 2, parentNodeId: 1, chatMessage: user("build the thing") },
+      { nodeId: 3, parentNodeId: 2, chatMessage: user("MIDA HANDOFF\nMID-HANDOFF-MARKER must stay unread") },
+      { nodeId: 4, parentNodeId: 3, chatMessage: user("Change the goal: make it stream instead.") },
+    ]
+    let id = 5
+    let parent = 4
+    for (let i = 0; i < 45; i++) {
+      nodes.push({ nodeId: id, parentNodeId: parent, chatMessage: assistant(`step ${i} ` + "s".repeat(1_000)) })
+      parent = id
+      id += 1
+    }
+    const db = makeDevinDb([{ id: "bald-swordfish", mainChainId: parent }], nodes)
+    const convo = readDevinConversation(db, { sessionId: "bald-swordfish", maxChars: 20_000 })
+    expect(convo.text).toContain("N4: Change the goal: make it stream instead.")
+    expect(convo.text).not.toContain("MID-HANDOFF-MARKER")
+  })
 })

@@ -28,10 +28,15 @@ import {
   FIRST_USER_CHARS,
   PART_CHARS,
   TAIL_BYTES,
+  TAIL_ORDER,
   cut,
-  hardCut,
   fitMessages,
+  hardCut,
   readTranscriptLines,
+  scanTranscript,
+  twoEndedCut,
+  type ScanHooks,
+  type TypedMark,
 } from "./transcript-lines.js"
 
 // The injected-prefix and Mida-hook lists this reader filters on live in
@@ -97,6 +102,41 @@ function callDetail(v: unknown): string {
   }
 }
 
+/**
+ * ONE classifier for "did the user type this line", shared by the window read
+ * and the streamed scan: a response_item message with role "user" whose text
+ * the injected-scaffolding filter does not reject is the user's own words —
+ * a whole-tag-block prompt counts (it renders, so it is real user text, only
+ * the REQUEST pick is barred). Returns the text, or null.
+ */
+export function codexTypedUserText(obj: { type?: unknown; payload?: unknown } | null): string | null {
+  if (obj === null || typeof obj !== "object" || obj.type !== "response_item") return null
+  const p = obj.payload as CodexPayload | null
+  if (p === null || typeof p !== "object" || p.type !== "message" || p.role !== "user") return null
+  const text = messageParts(p.content).join("\n")
+  if (text === "" || isInjectedUserText(text)) return null
+  return text
+}
+
+/**
+ * The Codex reader's half of the streamed pass: the cheap `"role":"user"`
+ * string check keeps tool/bookkeeping lines from ever reaching JSON.parse,
+ * and the typed test is the shared classifier above. Codex writes no
+ * compact-summary records the reader renders, so there is no summary hook.
+ */
+export const codexScanHooks: ScanHooks = {
+  candidate: (text) => text.includes('"role":"user"') || text.includes('"role": "user"'),
+  userText: () => "",
+  typedText: (text) => {
+    try {
+      const obj = JSON.parse(text) as { type?: unknown; payload?: unknown } | null
+      return codexTypedUserText(obj === null || typeof obj !== "object" ? null : obj)
+    } catch {
+      return null
+    }
+  },
+}
+
 // A tool output is either a string or an array of { type, text } parts — S2
 // saw the array form on custom_tool_call_output.
 function outputText(output: unknown): string {
@@ -129,7 +169,9 @@ export function readCodexConversation(
   const { maxChars = 40_000 } = options
   const { lines, truncated, head: headWindow, tail: tailWindow } = readTranscriptLines(transcriptPath)
 
-  const msgs: { role: string; block: string }[] = []
+  // A typed mark rides on each user block — the user's own words by the shared
+  // classifier — so fitMessages can pin the ones the fill would lose.
+  const msgs: { role: string; block: string; typed?: TypedMark }[] = []
   const cwds: string[] = []
   let messagesTotal = 0
   let firstUserMessage: string | null = null
@@ -182,12 +224,22 @@ export function readCodexConversation(
       }
       const body = parts
         // scrub before the cut: a secret straddling the boundary would otherwise
-        // no longer match the scrubber and most of it would reach the model
-        .map((t) => cut(scrubSecrets(t), PART_CHARS))
+        // no longer match the scrubber and most of it would reach the model.
+        // A typed user part keeps both its ends (1,200 + 600), never PART_CHARS.
+        .map((t) => (role === "user" ? twoEndedCut(scrubSecrets(t)) : cut(scrubSecrets(t), PART_CHARS)))
         .filter((t) => t.length)
         .join("\n")
       if (body) {
-        msgs.push({ role, block: `L${label} ${role}:\n${body}` })
+        const typed = role === "user" ? codexTypedUserText(obj) : null
+        msgs.push({
+          role,
+          block: `L${label} ${role}:\n${body}`,
+          // "~" labels carry no absolute number — the streamed scan pairs the
+          // mark with its real line number before it reaches the group
+          ...(typed === null
+            ? {}
+            : { typed: { label: `L${label}`, order: label.startsWith("~") ? TAIL_ORDER : Number(label), text: typed } }),
+        })
         if (picked) pinIdx = msgs.length - 1
       }
       continue
@@ -236,7 +288,25 @@ export function readCodexConversation(
     }
   }
 
-  const fitted = fitMessages(msgs, maxChars, truncated, keptHead === null ? pinIdx : undefined, null, keptHead)
+  // The head/tail windows see only part of a truncated file — ONE streamed
+  // pass finds every typed line in the unread middle with its real line
+  // number and counts candidate lines too long to parse, the same pass the
+  // Claude reader runs for its summary.
+  const scan = truncated ? scanTranscript(transcriptPath, codexScanHooks) : null
+  const fitted = fitMessages(
+    msgs,
+    maxChars,
+    truncated,
+    keptHead === null ? pinIdx : undefined,
+    null,
+    keptHead,
+    scan === null
+      ? null
+      : {
+          marks: scan.typed.map((t) => ({ label: `L${t.line}`, order: t.line, text: t.text })),
+          tooLong: scan.tooLong.length,
+        },
+  )
   return {
     format: "codex-jsonl",
     text: fitted.text,

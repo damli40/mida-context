@@ -50,11 +50,15 @@ import {
   FIRST_USER_CHARS,
   PART_CHARS,
   TAIL_BYTES,
+  TAIL_ORDER,
   cut,
-  hardCut,
   fitMessages,
-  lastCompactSummaryLine,
+  hardCut,
   readTranscriptLines,
+  scanTranscript,
+  twoEndedCut,
+  type ScanHooks,
+  type TypedMark,
 } from "./transcript-lines.js"
 
 const THINKING_CHARS = 1_000
@@ -209,6 +213,67 @@ function slashCommandRequest(text: string, neighbourLocalCommand: boolean): stri
   return args === undefined || args === "" ? name : `${name} ${args}`
 }
 
+// A command echo's local-plumbing neighbours, named as a rule rather than a
+// position: caveat on the line before, stdout on either of the two after. The
+// window read answers this from its entries (with the head/tail boundary as a
+// wall); the streamed scan answers it from the same raw userText strings.
+export function claudeCommandEchoNeighbour(prev: string, next: string[]): boolean {
+  if (prev.includes("<local-command-caveat>")) return true
+  return next.some((text) => text.includes("<local-command-stdout>"))
+}
+
+/**
+ * ONE classifier for "did the user type this line", shared by the window read
+ * and the streamed scan so they can never disagree: a type:user line that is
+ * not isMeta/isCompactSummary, not a bare tool_result, and not all scaffolding
+ * — a custom slash command returns its "/name args" form, a built-in's echo
+ * stays hidden. Returns the user's words (unscrubbed), or null.
+ */
+export function claudeTypedUserText(obj: TranscriptLine | null, neighbourLocalCommand: boolean): string | null {
+  if (obj === null || obj.type !== "user") return null
+  if (obj.isMeta === true || obj.isCompactSummary === true) return null
+  const userText = userRequestText(obj.message?.content)
+  if (userText === "") return null
+  return slashCommandRequest(userText, neighbourLocalCommand) ?? (userVisibleText(obj.message?.content) || null)
+}
+
+/**
+ * The Claude reader's half of the streamed pass: the cheap `"type":"user"`
+ * string check keeps tool/output lines from ever reaching JSON.parse, the
+ * summary test is the same one lastCompactSummaryLine always ran, and the
+ * typed test is the shared classifier above with the 1-back/2-ahead neighbour
+ * window the command-echo rule needs.
+ */
+export const claudeScanHooks: ScanHooks = {
+  candidate: (text) => text.includes('"type":"user"'),
+  userText: (text) => {
+    try {
+      const obj = JSON.parse(text) as TranscriptLine | null
+      if (obj === null || typeof obj !== "object" || obj.type !== "user") return ""
+      return userRequestText(obj.message?.content)
+    } catch {
+      return ""
+    }
+  },
+  typedText: (text, neighbours) => {
+    try {
+      const obj = JSON.parse(text) as TranscriptLine | null
+      return claudeTypedUserText(obj === null || typeof obj !== "object" ? null : obj, claudeCommandEchoNeighbour(neighbours.prev, neighbours.next))
+    } catch {
+      return null
+    }
+  },
+  summary: (text) => {
+    if (!text.includes('"isCompactSummary"')) return false
+    try {
+      const obj = JSON.parse(text) as TranscriptLine | null
+      return obj !== null && typeof obj === "object" && obj.isCompactSummary === true
+    } catch {
+      return false
+    }
+  },
+}
+
 // The request text of one user line: the string content, or the joined
 // `text` parts of array content. Returns "" for a bare tool_result (or
 // anything without real text) so the caller keeps looking at later lines.
@@ -261,7 +326,9 @@ function renderMessage(label: string, obj: TranscriptLine): string | null {
   // goes, the ask stays; a part that was all scaffolding contributes nothing
   const pushText = (text: string) => {
     const t = isUser ? stripLeadingScaffolds(text) : text
-    if (t !== "") parts.push(t)
+    // a typed user part keeps both its ends (scrub before the cut, like every
+    // other reader path); assistant text is not the user's words, no two-end cut
+    if (t !== "") parts.push(isUser ? twoEndedCut(scrubSecrets(t)) : t)
   }
   if (typeof content === "string") {
     pushText(content)
@@ -350,17 +417,18 @@ export function readConversation(
     if (other?.type !== "user") return ""
     return userRequestText(other.message?.content)
   }
-  const neighbourLocalCommand = (i: number): boolean => {
-    if (inSameWindow(i, i - 1) && userTextAt(i - 1).includes("<local-command-caveat>")) return true
-    for (const j of [i + 1, i + 2]) {
-      if (inSameWindow(i, j) && userTextAt(j).includes("<local-command-stdout>")) return true
-    }
-    return false
-  }
+  const neighbourLocalCommand = (i: number): boolean =>
+    claudeCommandEchoNeighbour(
+      inSameWindow(i, i - 1) ? userTextAt(i - 1) : "",
+      [i + 1, i + 2].map((j) => (inSameWindow(i, j) ? userTextAt(j) : "")),
+    )
 
   // messagesTotal counts every user/assistant line read (even ones that
-  // render empty); msgs holds only those that produced a rendered block.
-  const msgs: { role: string; block: string }[] = []
+  // render empty); msgs holds only those that produced a rendered block. A
+  // typed mark rides on each user block whose line the shared classifier calls
+  // the user's own words — fitMessages moves the ones the fill would lose into
+  // the pinned group, labels and all.
+  const msgs: { role: string; block: string; typed?: TypedMark }[] = []
   const cwds: string[] = []
   let messagesTotal = 0
   let firstUserMessage: string | null = null
@@ -430,7 +498,18 @@ export function readConversation(
           ? `L${label} user:\n${scrubSecrets(laterCommand)}`
           : renderMessage(label, obj)
     if (block) {
-      msgs.push({ role: obj.type, block })
+      const typed = isUser ? claudeTypedUserText(obj, neighbourLocalCommand(i)) : null
+      if (typed === null) {
+        msgs.push({ role: obj.type, block })
+      } else {
+        // "~" labels carry no absolute number — the mark's order is filled in
+        // later by pairing with the streamed scan's real line numbers
+        msgs.push({
+          role: obj.type,
+          block,
+          typed: { label: `L${label}`, order: label.startsWith("~") ? TAIL_ORDER : Number(label), text: typed },
+        })
+      }
       if (picked) pinIdx = msgs.length - 1
     }
   }
@@ -468,8 +547,11 @@ export function readConversation(
   // file's true last summary, so it replaces whatever the windows pinned — and
   // its label is the real line number even when the windows never saw the line.
   // A file that fit the windows was already read end to end, so the windows'
-  // pick IS the last summary — no second pass.
-  const scannedSummary = truncated ? lastCompactSummaryLine(transcriptPath) : null
+  // pick IS the last summary — no second pass. The same ONE pass that finds
+  // the summary also returns every typed line with its real line number and
+  // the count of candidate lines too long to parse — the group's scan half.
+  const scan = truncated ? scanTranscript(transcriptPath, claudeScanHooks) : null
+  const scannedSummary = scan?.summary ?? null
   if (scannedSummary !== null) {
     try {
       const obj = JSON.parse(scannedSummary.text) as TranscriptLine | null
@@ -486,7 +568,20 @@ export function readConversation(
     compactSummary === null
       ? null
       : `L${compactSummary.label} user — Summary of the earlier session (from /compact):\n${cutSummary(scrubSecrets(compactSummary.text))}`
-  const fitted = fitMessages(msgs, maxChars, truncated, keptHead === null ? pinIdx : undefined, summaryBlock, keptHead)
+  const fitted = fitMessages(
+    msgs,
+    maxChars,
+    truncated,
+    keptHead === null ? pinIdx : undefined,
+    summaryBlock,
+    keptHead,
+    scan === null
+      ? null
+      : {
+          marks: scan.typed.map((t) => ({ label: `L${t.line}`, order: t.line, text: t.text })),
+          tooLong: scan.tooLong.length,
+        },
+  )
   return {
     format: "claude-jsonl",
     text: fitted.text,
