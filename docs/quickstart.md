@@ -460,27 +460,33 @@ runs from. macOS protects `~/Desktop`, `~/Documents` and `~/Downloads`. Terminal
 Claude Desktop is a separate app and does not. Fix one of two ways: give Claude Desktop access (System Settings →
 Privacy & Security → Files and Folders → Claude → turn on the folder, e.g. Desktop Folder), then quit Claude
 Desktop with Cmd-Q and reopen it; or run Mida from a folder outside those three (an npm global install puts
-`mida-mcp` outside them). Cursor and other desktop apps can hit the same wall.
+`mida-mcp` outside them). Cursor and other desktop apps can hit the same wall. On macOS, `mida install
+claude-desktop` and `mida install cursor` warn at install time when the launcher they write lives under one of
+those folders — the warning names both fixes — and `mida doctor` repeats the note for an installed entry.
+The warning only prints when the launcher's real path is under a protected folder; installing elsewhere stays quiet.
 
 **`mida doctor`: "codex's hook block is an older version", right after you trusted the hooks in Codex.**
-A known false alarm. When you trust hooks, Codex writes its trust records (`[hooks.state]`, `trusted_hash`) inside
-Mida's marked block, and doctor compares the block byte for byte. Your hooks are installed and trusted. Do NOT run
-`mida install codex` again to "fix" it: that rewrites the block and deletes Codex's trust records (including other
-tools' records), so Codex asks you to trust everything again. A fix is coming.
+Fixed. When you trust hooks, Codex writes its trust records (`[hooks.state]`, `trusted_hash`) inside Mida's marked
+block; doctor now ignores Codex's state and reports the block as installed, and `mida install codex` /
+`mida uninstall codex` preserve the trust records (including other tools' records) instead of rewriting them away.
 
 **"<agent>'s request has expired (a request lasts 5 minutes)".**
 Run `mida request <agent>`, then `mida approve <agent>` straight away. `mida install devin` files a request too; if
-you approve later than 5 minutes after it, request again first. (`mida doctor` may say "run `mida approve`" for an
-expired request; request first anyway. A fix is coming.)
+you approve later than 5 minutes after it, request again first. `mida doctor` says the same: an expired request
+gets "run `mida request <agent>`, then `mida approve <agent>` right away", not the approve-only line.
 
 **`mida request <agent>` says "already approved on chain".**
 That agent already holds a grant. To use it in a new folder, run `mida approve <agent>` in that folder: it adds the
-folder, with no transaction and nothing to pay. This message exits with an error code, so a chain like
-`mida request a && mida request b` stops at it: run the commands one at a time.
+folder, with no transaction and nothing to pay. This is guidance, not a failure — the command exits 0, so a chain
+like `mida request a && mida request b` keeps going.
 
 **`mida approve` sits at "sending the grant (about 5 seconds)…" for much longer.**
-Press Ctrl-C and run the same `mida approve` again. It asks the chain what the agent already holds before sending,
-so a grant that already landed is not sent twice. (A progress line and a timeout are coming.)
+Every send now prints "still waiting for Monad (N s)…" every 15 seconds and gives up after 120 seconds with a
+message that says only what is true: a known transaction hash means "sent, not confirmed yet — run `mida doctor`,
+or run the same command again"; no hash means either "the send may still have gone out — check first" or, when the
+hang was provably before broadcast, "nothing was sent: run the same command again". A retry is safe either way:
+the command asks the chain what the agent already holds before sending, so a grant that already landed is not sent
+twice. Ctrl-C still works, and the same advice applies after it.
 
 **`mida doctor`: "midad runs … @ <old commit>; this command runs … @ <new commit>".**
 The Mida service is still the old version after an update. Run any `mida` command; it replaces the service.
