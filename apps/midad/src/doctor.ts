@@ -4,10 +4,11 @@ import { dirname, isAbsolute, join } from "node:path"
 import { spawn } from "node:child_process"
 import { createPublicClient, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
-import { isMidaError } from "@mida/protocol"
+import { decodeUint64, isMidaError } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { chainFor, rpcTransport } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
+import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
 import { COMPILE_PROVIDERS, compileModelChoice, devinSqliteAvailable } from "@mida/compiler"
 import { ContextApiClient, DenyOverlay, RegistryReader, StoreHttpError } from "@mida/api"
 import type { RevocationTarget } from "@mida/api"
@@ -475,9 +476,13 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             lines.push(problem(`${name}'s access was revoked`, `run \`mida request ${name}\` then \`mida approve ${name}\``))
           } else if (views.length === 0) {
             lines.push(
-              home.has(`agents/${name}/pending-request.json`)
-                ? problem(`${name} asked but is not approved on chain`, `run \`mida approve ${name}\``)
-                : problem(`${name} has never asked for access`, `run \`mida request ${name}\` then \`mida approve ${name}\``),
+              !home.has(`agents/${name}/pending-request.json`)
+                ? problem(`${name} has never asked for access`, `run \`mida request ${name}\` then \`mida approve ${name}\``)
+                : pendingRequestExpired(home, name, now)
+                  ? // an expired request cannot be approved — "run approve" sent the owner into
+                    // REQUEST_EXPIRED; the fix starts with a fresh request (in-15 J-3)
+                    problem(`${name}'s access request expired (requests last ${REQUEST_LIFETIME_SECONDS / 60n} minutes)`, `run \`mida request ${name}\`, then \`mida approve ${name}\` right away`)
+                  : problem(`${name} asked but is not approved on chain`, `run \`mida approve ${name}\``),
             )
           } else if (views.some((v) => v.revoked)) {
             lines.push(problem(`${name}'s access was revoked`, `run \`mida request ${name}\` then \`mida approve ${name}\``))
@@ -1019,6 +1024,21 @@ function whatsnewTimeouts(home: MidaHome, nowMs: number): number {
     }
   }
   return count
+}
+
+/**
+ * Whether the stored pending request's five-minute window has already closed: the file carries
+ * its own `requestExpiresAt`, so the answer needs only the chain's clock — the same boundary
+ * approve's assertRequestFresh applies (`now >= requestExpiresAt`). An unreadable or shapeless
+ * file is not "expired": the plain waiting line stays the answer (in-15 J-3).
+ */
+function pendingRequestExpired(home: MidaHome, name: string, now: bigint): boolean {
+  try {
+    const expiresAt = home.readJson<{ request?: { requestExpiresAt?: unknown } }>(`agents/${name}/pending-request.json`)?.request?.requestExpiresAt
+    return typeof expiresAt === "string" && now >= decodeUint64(expiresAt as Hex)
+  } catch {
+    return false
+  }
 }
 
 function ageText(ms: number): string {

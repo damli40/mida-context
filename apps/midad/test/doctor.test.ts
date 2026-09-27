@@ -7,6 +7,8 @@ import { createServer as createHttpServer } from "node:http"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+import { toFunctionSelector } from "viem"
+import { encodeUint64 } from "@mida/protocol"
 import { parseDeployment } from "@mida/chain"
 import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, installClaudeCode, installCodex, installDevin, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
 
@@ -876,6 +878,135 @@ describe("mida doctor names a store that predates the pending-revoke check", () 
       expect(lines.every((line) => !line.includes("predates the pending-revoke check"))).toBe(true)
     } finally {
       await store.close()
+    }
+  })
+})
+
+// in-15 J-3 — Sep 27 live: doctor printed "devin asked but is not approved — run mida approve
+// devin" for a request whose five-minute window had already closed; approve then refused
+// REQUEST_EXPIRED. The expired ask gets its own advice: a fresh request, then approve right away.
+describe("mida doctor on an expired access request (in-15 J-3)", () => {
+  const DEPLOYMENT = {
+    chainId: "31337",
+    capabilityRegistry: "0x2222222222222222222222222222222222222222",
+    contextRegistry: "0x3333333333333333333333333333333333333333",
+    deploymentBlock: "0",
+    vaultRpId: "vault.mida.xyz",
+    vaultRpIdHash: `0x${"55".repeat(32)}`,
+    policyHashV1: `0x${"44".repeat(32)}`,
+  }
+  const AGENT_ID = `0x${"ab".repeat(32)}`
+
+  /** A stub JSON-RPC chain: empty capability list for every agent, a scripted "latest" timestamp. */
+  async function stubChain(latestTimestamp: bigint): Promise<{ url: string; close(): Promise<void> }> {
+    const ACTIVE_IDS = toFunctionSelector("activeCapabilityIds(address,bytes32)")
+    const OWNER_KEY = toFunctionSelector("ownerP256Key(address)")
+    const server = createHttpServer((req, res) => {
+      let body = ""
+      req.on("data", (chunk) => (body += chunk))
+      req.on("end", () => {
+        const call = JSON.parse(body) as { id: number; method: string; params?: unknown[] }
+        const reply = (result: unknown) => {
+          res.setHeader("content-type", "application/json")
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, result }))
+        }
+        if (call.method === "eth_call") {
+          const data = (call.params?.[0] as { data?: string } | undefined)?.data ?? ""
+          if (data.startsWith(ACTIVE_IDS)) {
+            // abi.encode(empty bytes32[]): offset 0x20, length 0
+            return reply(`0x${"0".repeat(63)}20${"0".repeat(64)}`)
+          }
+          if (data.startsWith(OWNER_KEY)) return reply(`0x${"11".repeat(64)}`)
+          return reply("0x")
+        }
+        if (call.method === "eth_getBlockByNumber") {
+          return reply({
+            number: "0x64",
+            hash: `0x${"cd".repeat(32)}`,
+            parentHash: `0x${"00".repeat(32)}`,
+            nonce: "0x0000000000000000",
+            sha3Uncles: `0x${"00".repeat(32)}`,
+            logsBloom: `0x${"00".repeat(256)}`,
+            transactionsRoot: `0x${"00".repeat(32)}`,
+            stateRoot: `0x${"00".repeat(32)}`,
+            receiptsRoot: `0x${"00".repeat(32)}`,
+            miner: `0x${"00".repeat(20)}`,
+            difficulty: "0x0",
+            totalDifficulty: "0x0",
+            extraData: "0x",
+            size: "0x3e8",
+            gasLimit: "0x1c9c380",
+            gasUsed: "0x0",
+            timestamp: `0x${latestTimestamp.toString(16)}`,
+            transactions: [],
+            uncles: [],
+          })
+        }
+        if (call.method === "eth_getBalance") return reply("0x0")
+        if (call.method === "eth_chainId") return reply("0x7a69")
+        if (call.method === "eth_blockNumber") return reply("0x64")
+        return reply("0x")
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+    const port = (server.address() as AddressInfo).port
+    return { url: `http://127.0.0.1:${port}`, close: () => new Promise<void>((done) => server.close(() => done())) }
+  }
+
+  /** A software home with devin set up and a pending request stamped `requestExpiresAt`. */
+  function homeWithPending(rpcUrl: string, requestExpiresAt: bigint): MidaHome {
+    const home = new MidaHome(join(dir(), "home"))
+    loadOrCreateOwnerSecrets(home)
+    const key = `0x${"ab".repeat(32)}`
+    mkdirSync(join(home.root, "agents", "devin"), { recursive: true })
+    writeFileSync(
+      join(home.root, "agents", "devin", "identity.json"),
+      JSON.stringify({
+        name: "devin",
+        agentId: AGENT_ID,
+        signerPrivateKey: key,
+        encryptionPrivateKey: key,
+        encryptionPublicKey: key,
+        manifestHash: key,
+        callbackOrigin: "http://localhost",
+        purposeId: "project_assistance",
+        manifest: {},
+      }),
+    )
+    home.writeSecretJson("agents/devin/pending-request.json", { request: { requestExpiresAt: encodeUint64(requestExpiresAt) } })
+    home.writeSecretJson("network.json", { rpcUrl, deployment: DEPLOYMENT })
+    return home
+  }
+
+  const doctorLines = async (home: MidaHome): Promise<string[]> => {
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), env: {}, daemonProbeMs: 50 })
+    return lines
+  }
+
+  it("a request past its window gets request-then-approve advice, not the approve line", async () => {
+    const now = BigInt(Math.floor(Date.now() / 1000))
+    const rpc = await stubChain(now)
+    try {
+      const lines = await doctorLines(homeWithPending(rpc.url, now - 1n))
+      expect(lines).toContain(
+        "PROBLEM: devin's access request expired (requests last 5 minutes) — run `mida request devin`, then `mida approve devin` right away",
+      )
+      expect(lines.every((line) => !line.includes("asked but is not approved on chain"))).toBe(true)
+    } finally {
+      await rpc.close()
+    }
+  })
+
+  it("a request still inside its window keeps the approve line", async () => {
+    const now = BigInt(Math.floor(Date.now() / 1000))
+    const rpc = await stubChain(now)
+    try {
+      const lines = await doctorLines(homeWithPending(rpc.url, now + 60n))
+      expect(lines).toContain("PROBLEM: devin asked but is not approved on chain — run `mida approve devin`")
+      expect(lines.every((line) => !line.includes("access request expired"))).toBe(true)
+    } finally {
+      await rpc.close()
     }
   })
 })
