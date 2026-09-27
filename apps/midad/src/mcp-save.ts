@@ -19,6 +19,7 @@ import type { AgentIdentity, RevokePendingMarker } from "./keys.js"
 import { checkProject } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { isSafeName } from "./queue.js"
+import { isTaskName, TASK_RULE_TEXT } from "./task.js"
 import { NAMESPACE_ID, saveCheckpoint } from "./skeleton.js"
 import type { MidaHome } from "./home.js"
 import type { ServiceRuntime } from "./runtime.js"
@@ -71,6 +72,8 @@ export type McpSaveResult =
       projectId: string
       sessionId: string
       checkpoint: Checkpoint
+      /** The task the checkpoint was filed under — absent when it is `main` (tk-1). */
+      task?: string
     }
   | {
       kind: "refused"
@@ -153,12 +156,18 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
   if (!isObj(record)) return badInput
   const agent = typeof record.agent === "string" ? record.agent : ""
   const cwd = typeof record.cwd === "string" ? record.cwd : ""
-  const extraTop = Object.keys(record).filter((k) => k !== "agent" && k !== "cwd" && k !== "fields")
+  const extraTop = Object.keys(record).filter((k) => k !== "agent" && k !== "cwd" && k !== "fields" && k !== "task")
   // the name is interpolated into refusal text — only after it is proven a safe local agent name,
   // and a relative cwd would resolve against the daemon's own working directory
   if (!isSafeName(agent)) return refused("bad-agent", "Mida: bad agent name — nothing was saved.")
   if (cwd === "" || !isAbsolute(cwd)) return badInput
   if (extraTop.length > 0) return refused("bad-input", `Mida: bad save input (${extraTop.join(", ")}) — nothing was saved.`, { fields: extraTop })
+  // tk-1: a named task is refused, never silently dropped — saving under `main` when the model
+  // asked for `sdk` would file the checkpoint where its own session will never look
+  const task = record.task
+  if (task !== undefined && !isTaskName(task)) {
+    return refused("bad-task", `Mida: bad task name — ${TASK_RULE_TEXT}. Nothing was saved.`, { fields: ["task"] })
+  }
 
   // Gate 1: a known MCP client identity — this route signs for mida-mcp's clients only, so a
   // coding agent (which writes through its own hooks) is refused before its identity is even read.
@@ -285,6 +294,7 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
     continuesSession: null,
     compiledBy: agent,
     checkpoint: validated.value,
+    ...(task === undefined ? {} : { task }),
   }
   try {
     const saved = await save(runtime, agent, input)
@@ -305,6 +315,7 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
       projectId,
       sessionId,
       checkpoint: validated.value,
+      ...(task === undefined ? {} : { task }),
     }
   } catch (error) {
     // a save that never landed frees the slot — the next call gets a real answer, not a stale hold

@@ -193,6 +193,8 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
               sessionId: input.sessionId,
               continuesSession: input.continuesSession,
               compiledBy: input.compiledBy,
+              // the save's task rides into the memory copy too, or whats-new would misfile it
+              ...(input.task === undefined ? {} : { task: input.task }),
               contextId: saved.contextId,
               // the on-chain author is the agent's identity; without one the name still tells who saved
               authorId: loadAgentIdentity(home, agent)?.agentId ?? agent,
@@ -309,8 +311,11 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       const cwdRaw = (parsed as { cwd?: unknown } | null)?.cwd
       const cwd = typeof cwdRaw === "string" && isAbsolute(cwdRaw) && cwdRaw.length <= 4096 ? cwdRaw : undefined
       const debug = (parsed as { debug?: unknown } | null)?.debug === true
+      // tk-1: the client's own MIDA_TASK — the daemon's env knows nothing of the shell that ran `mida task`
+      const taskRaw = (parsed as { task?: unknown } | null)?.task
+      const task = typeof taskRaw === "string" ? taskRaw : undefined
       const lines: string[] = []
-      const code = await runCli(argv, runtime, (line) => lines.push(line), { cwd, debug }).catch(() => 1)
+      const code = await runCli(argv, runtime, (line) => lines.push(line), { cwd, debug, task }).catch(() => 1)
       respond(res, 200, { code, lines })
       return
     }
@@ -326,10 +331,13 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       const cwd = typeof record.cwd === "string" ? record.cwd : ""
       // the new session's own id — the hook sends it so a served handoff binds the session to the chain
       const sessionId = typeof record.sessionId === "string" ? record.sessionId : undefined
+      // tk-1: the launch's explicit task (MIDA_TASK from the hook env, or --task/MIDA_TASK from
+      // the MCP adapter) — buildHandoff validates and resolves it; absent means folder rules
+      const task = typeof record.task === "string" ? record.task : undefined
       const started = deps.now()
       const result = await buildHandoff(
         runtime,
-        { agent, cwd, authorNames: authorNamesFor(runtime), sessionId },
+        { agent, cwd, authorNames: authorNamesFor(runtime), sessionId, task },
         {
           ...deps.handoffDeps,
           // the session-start read seeds the same copy whats-new serves — the first prompt is warm.
@@ -375,8 +383,9 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       const agent = typeof record.agent === "string" ? record.agent : ""
       const cwd = typeof record.cwd === "string" ? record.cwd : ""
       const sessionId = typeof record.sessionId === "string" ? record.sessionId : undefined
+      const task = typeof record.task === "string" ? record.task : undefined
       const started = deps.now()
-      const result = await buildWhatsNew(runtime, { agent, cwd, sessionId }, {
+      const result = await buildWhatsNew(runtime, { agent, cwd, sessionId, task }, {
         copies,
         log: deps.log,
         ...deps.whatsnewDeps,
@@ -416,6 +425,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
           sessionId: result.sessionId,
           continuesSession: null,
           compiledBy: typeof record.agent === "string" ? record.agent : "",
+          ...(result.task === undefined ? {} : { task: result.task }),
           contextId: result.contextId,
           authorId:
             typeof record.agent === "string" ? (loadAgentIdentity(home, record.agent)?.agentId ?? record.agent) : "",

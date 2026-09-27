@@ -86,7 +86,9 @@ async function whatsNew(home: MidaHome, agent: string | undefined, record: Recor
     if (!isSafeName(agent)) return
     const cwd = payloadCwd(record)
     const sessionId = typeof record.session_id === "string" ? record.session_id : undefined
-    const reply = await callDaemon(home, "/whatsnew", { agent, cwd, sessionId }, { timeoutMs: WHATS_NEW_TIMEOUT_MS })
+    // MIDA_TASK is the launch's task claim (tk-1) — the daemon validates it; absent env leaves
+    // the key off the body entirely, so the request is byte-identical to a task-less one
+    const reply = await callDaemon(home, "/whatsnew", { agent, cwd, sessionId, task: process.env.MIDA_TASK }, { timeoutMs: WHATS_NEW_TIMEOUT_MS })
     if (reply.status !== 200) {
       // silence stays the prompt's contract — but a give-up is not invisible: doctor counts these
       if (reply.status === 0) appendLog(home, "hook", { event: "whatsnew-timeout", agent, sessionId })
@@ -175,7 +177,13 @@ async function main(): Promise<void> {
   const reply = await callDaemon(
     home,
     "/handoff",
-    { agent, cwd, sessionId: typeof record.session_id === "string" ? record.session_id : undefined },
+    {
+      agent,
+      cwd,
+      sessionId: typeof record.session_id === "string" ? record.session_id : undefined,
+      // the launch's task claim — resolved once daemon-side and pinned for the session
+      task: process.env.MIDA_TASK,
+    },
     { timeoutMs: HANDOFF_TIMEOUT_MS },
   )
   const body = reply.body as SessionStartBody | null

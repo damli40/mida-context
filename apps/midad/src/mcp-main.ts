@@ -9,6 +9,7 @@ import { foreignClientReplayReason, parentProcessBasename } from "./devin-facts.
 import { drainerEnv } from "./hook.js"
 import { MCP_USAGE, createMidaMcpServer, parseMcpArgs, startupCheck } from "./mcp.js"
 import { siblingEntryArgs } from "./sibling.js"
+import { DEFAULT_TASK, folderTaskFor, taskOrUndefined } from "./task.js"
 
 /**
  * `mida-mcp` — the local MCP adapter (M3-G). One stdio MCP server per client launch, a pure
@@ -83,12 +84,17 @@ async function main(): Promise<void> {
   }
   // one session id per server instance — the whats-new seen set lives under it for this process's life
   const sessionId = `mcp-${gate.agent}-${randomBytes(4).toString("hex")}`
+  // tk-1: the task is resolved ONCE here — one server process is one session (invariant 1):
+  // --task beats MIDA_TASK beats the folder's current task; `main` when nothing named one.
+  // Sent explicitly on every call, so a mid-life `mida task` switch cannot re-file this server.
+  const task = parsed.args.task ?? taskOrUndefined(process.env.MIDA_TASK) ?? folderTaskFor(parsed.args.project).task ?? DEFAULT_TASK
   const up = home.has("network.json") && (await ensureDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS }))
   const server = createMidaMcpServer({
     home,
     agent: gate.agent,
     project: parsed.args.project,
     sessionId,
+    task,
     daemonUp: up,
   })
   await server.connect(new StdioServerTransport())

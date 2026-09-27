@@ -9,6 +9,7 @@ import type { SessionStartBody } from "./hook-output.js"
 import { appendLog } from "./log.js"
 import { findProjectMarker } from "./queue.js"
 import { writeSeen } from "./seen.js"
+import { isTaskName, TASK_RULE_TEXT } from "./task.js"
 
 /**
  * The local MCP adapter (M3-G + in-5): a stdio MCP server that is a pure client of the daemon's
@@ -52,7 +53,7 @@ const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${text
 const toolText = (text: string) => ({ content: [{ type: "text" as const, text: capText(text) }] })
 const degraded = (reason: string) => toolText(degradedMessage(reason))
 
-export const MCP_USAGE = "usage: mida-mcp --as <client> [--project <dir>]   (--as is required — each client carries its own identity)"
+export const MCP_USAGE = "usage: mida-mcp --as <client> [--project <dir>] [--task <name>]   (--as is required — each client carries its own identity)"
 
 export interface McpArgs {
   /** Undefined when the launch named no identity — the startup check turns that into a refusal. */
@@ -61,6 +62,8 @@ export interface McpArgs {
   project: string
   /** False when the folder came from the launch cwd. */
   projectGiven: boolean
+  /** tk-1: the named task this server process works under — one process is one session. */
+  task?: string
 }
 
 /**
@@ -73,9 +76,10 @@ export interface McpArgs {
 export function parseMcpArgs(argv: string[]): { ok: true; args: McpArgs } | { ok: false; error: string } {
   let agent: string | undefined
   let project: string | undefined
+  let task: string | undefined
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i]
-    if (flag === "--as" || flag === "--project") {
+    if (flag === "--as" || flag === "--project" || flag === "--task") {
       const value = argv[i + 1]
       if (value === undefined || value === "" || value.startsWith("--")) {
         return { ok: false, error: `${flag} needs a value` }
@@ -83,6 +87,9 @@ export function parseMcpArgs(argv: string[]): { ok: true; args: McpArgs } | { ok
       if (flag === "--as") {
         if (agent !== undefined) return { ok: false, error: "--as given twice" }
         agent = value
+      } else if (flag === "--task") {
+        if (task !== undefined) return { ok: false, error: "--task given twice" }
+        task = value
       } else {
         if (project !== undefined) return { ok: false, error: "--project given twice" }
         project = value
@@ -93,6 +100,7 @@ export function parseMcpArgs(argv: string[]): { ok: true; args: McpArgs } | { ok
     }
   }
   if (agent !== undefined && !AGENT_NAME.test(agent)) return { ok: false, error: `bad agent name "${agent}" — lower-case letters, digits and "-" only` }
+  if (task !== undefined && !isTaskName(task)) return { ok: false, error: `bad task name "${task}" — ${TASK_RULE_TEXT}` }
   // the folder reported to the daemon is canonicalised: a --project typed in another case must
   // land on the same approved root (in-6 R6); a path that cannot be resolved stays the resolve()
   // form and the startup check names what is wrong with it
@@ -103,7 +111,7 @@ export function parseMcpArgs(argv: string[]): { ok: true; args: McpArgs } | { ok
   } catch {
     /* keep the resolved form — the marker check below reports a missing folder plainly */
   }
-  return { ok: true, args: { agent, project: projectRoot, projectGiven: project !== undefined } }
+  return { ok: true, args: { agent, project: projectRoot, projectGiven: project !== undefined, task } }
 }
 
 /** "yes", "no", or "blocked" — a refused read is not a missing file. */
@@ -263,6 +271,15 @@ export interface McpServerDeps {
   project: string
   /** This server instance's session id — the whats-new seen set is keyed by it. */
   sessionId: string
+  /**
+   * tk-1: the task this server resolved ONCE at start — `--task`, then MIDA_TASK, then the
+   * folder's current task; `main` when nothing named one. It travels as an explicit task on
+   * every call, so a `mida task` switch while this server lives can never re-file it — and a
+   * deterministic save session id (`mcp-<agent>-<projectId>`) can never resurrect a previous
+   * process's pinned task. Absent means "no explicit task" — the daemon resolves its own way,
+   * which keeps old call sites and tests valid.
+   */
+  task?: string
   /** False when the daemon could not be brought up at start — tools then answer degraded. */
   daemonUp: boolean
 }
@@ -294,7 +311,7 @@ async function toolHandoff(deps: McpServerDeps) {
   const reply = await callDaemon(
     deps.home,
     "/handoff",
-    { agent: deps.agent, cwd: deps.project, sessionId: deps.sessionId },
+    { agent: deps.agent, cwd: deps.project, sessionId: deps.sessionId, task: deps.task },
     { timeoutMs: HANDOFF_TIMEOUT_MS },
   )
   if (reply.status === 0) return degraded("daemon-down")
@@ -324,7 +341,7 @@ async function toolWhatsNew(deps: McpServerDeps) {
   const reply = await callDaemon(
     deps.home,
     "/whatsnew",
-    { agent: deps.agent, cwd: deps.project, sessionId: deps.sessionId },
+    { agent: deps.agent, cwd: deps.project, sessionId: deps.sessionId, task: deps.task },
     { timeoutMs: WHATS_NEW_TIMEOUT_MS },
   )
   if (reply.status === 0) {
@@ -483,7 +500,7 @@ async function toolSave(deps: McpServerDeps, args: Record<string, unknown> | und
   const reply = await callDaemon(
     deps.home,
     "/save",
-    { agent: deps.agent, cwd: deps.project, fields: args ?? {} },
+    { agent: deps.agent, cwd: deps.project, fields: args ?? {}, task: deps.task },
     { timeoutMs: SAVE_TIMEOUT_MS },
   )
   if (reply.status === 0) return degraded("daemon-down")
