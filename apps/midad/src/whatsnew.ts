@@ -1,4 +1,4 @@
-import { compareChainOrder, defuse, orderTime, recordedAt } from "@mida/checkpoint"
+import { compareChainOrder, defuse, orderTime, recordedAt, taskOf } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
 import { chainRefusalReason } from "./chain-busy.js"
 import { PENDING_ANCHOR_LINE, capabilityState, checkAccess } from "./handoff.js"
@@ -10,6 +10,7 @@ import type { ServiceRuntime } from "./runtime.js"
 import { SEEN_MAX, readSeen } from "./seen.js"
 import { authorNamesFor, readCheckpoints } from "./skeleton.js"
 import type { StoredCheckpoint } from "./skeleton.js"
+import { pinSessionTask, resolveSessionTask, taskOrUndefined } from "./task.js"
 
 /**
  * What the UserPromptSubmit hook asks the daemon: did any OTHER session save to this project
@@ -278,7 +279,7 @@ function buildNote(lines: string[]): string {
  */
 export async function buildWhatsNew(
   runtime: ServiceRuntime,
-  input: { agent: string; cwd: string; sessionId?: string },
+  input: { agent: string; cwd: string; sessionId?: string; task?: string },
   deps: WhatsNewDeps = {},
 ): Promise<WhatsNewResult> {
   try {
@@ -308,6 +309,20 @@ export async function buildWhatsNew(
       // a refusal invalidates everything held for this agent — decrypted copies included
       copies.dropAgent(input.agent)
       return { kind: "refused", reason: access.reason }
+    }
+    // tk-1: the same once-resolved task the handoff pinned — detail lines below belong to this
+    // task only; every other task may contribute a single summary line, never its checkpoint text.
+    // A resolution that came FROM the pin needs no re-pin — the file provably exists already, so
+    // the prompt path pays one small read, never a doomed write plus a read-back.
+    const resolved = resolveSessionTask(runtime.home, {
+      sessionId: input.sessionId,
+      projectId: access.approval.projectId,
+      cwd: input.cwd,
+      explicit: taskOrUndefined(input.task),
+    })
+    const task = resolved.task
+    if (input.sessionId !== undefined && resolved.source !== "session") {
+      pinSessionTask(runtime.home, input.sessionId, access.approval.projectId, task)
     }
     const seen = readSeen(runtime.home, input.sessionId)
     const entry = copies.get(input.agent, access.approval.projectId)
@@ -340,13 +355,30 @@ export async function buildWhatsNew(
     // order. A record with neither can neither lead a
     // line nor serve as a baseline, but it still lands in the covered set so it is never
     // offered either.
+    // tk-1: only the session task's checkpoints get detail lines. Another task's news collapse
+    // to one count line per task — "sdk: 2 new saves by codex" — so the note stays awareness,
+    // never context (invariant 3). Every foreign id still joins the covered set either way:
+    // a mentioned checkpoint is a delivered one.
     const perAuthor = new Map<string, { newest?: StoredCheckpoint; baseline?: StoredCheckpoint }>()
+    const foreignByTask = new Map<string, { count: number; newest: StoredCheckpoint }>()
     const foreignIds: { id: string; at: number }[] = []
     for (const cp of checkpoints) {
       if (cp.sessionId === input.sessionId) continue
       const at = orderTime(cp)
       foreignIds.push({ id: cp.contextId, at: Number.isNaN(at) ? 0 : at })
       if (Number.isNaN(at)) continue
+      if (taskOf(cp) !== task) {
+        if (!seen.has(cp.contextId)) {
+          const held = foreignByTask.get(taskOf(cp))
+          if (held === undefined) {
+            foreignByTask.set(taskOf(cp), { count: 1, newest: cp })
+          } else {
+            held.count += 1
+            if (compareChainOrder(cp, held.newest) > 0) held.newest = cp
+          }
+        }
+        continue
+      }
       const bucket = perAuthor.get(cp.authorId) ?? {}
       if (!seen.has(cp.contextId)) {
         if (bucket.newest === undefined || compareChainOrder(cp, bucket.newest) > 0) bucket.newest = cp
@@ -358,11 +390,21 @@ export async function buildWhatsNew(
     const updates = [...perAuthor.entries()]
       .flatMap(([authorId, bucket]) => (bucket.newest === undefined ? [] : [{ authorId, ...bucket, newest: bucket.newest }]))
       .sort((a, b) => compareChainOrder(b.newest, a.newest))
-    if (updates.length === 0) return { kind: "none" }
     const names = deps.authorNames ?? authorNamesFor(runtime)
-    const lines = updates.map((u) =>
-      updateLine(names[u.authorId.toLowerCase()] ?? "unknown agent", u.newest, u.baseline, now()),
-    )
+    // one summary line per foreign task that saved something new — newest task first; a foreign
+    // task with nothing unseen gets no line at all
+    const foreignLines = [...foreignByTask.entries()]
+      .sort((a, b) => compareChainOrder(b[1].newest, a[1].newest))
+      .map(([name, held]) =>
+        `${defuse(name)}: ${held.count} new save${held.count === 1 ? "" : "s"} by ${defuse(names[held.newest.authorId.toLowerCase()] ?? "unknown agent")}`,
+      )
+    if (updates.length === 0 && foreignLines.length === 0) return { kind: "none" }
+    const lines = [
+      ...updates.map((u) =>
+        updateLine(names[u.authorId.toLowerCase()] ?? "unknown agent", u.newest, u.baseline, now()),
+      ),
+      ...foreignLines,
+    ]
     // the proposed set covers every foreign checkpoint this answer saw — shown in the note or
     // folded into "…and N more" — appended newest-last so the record's cap drops the oldest
     const known = new Set(seen)

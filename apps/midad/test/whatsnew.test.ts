@@ -465,7 +465,10 @@ describe("the daemon's checkpoint copy", () => {
       { agent: "claude-code", cwd: "/repo", sessionId: "s-1" },
       gateDeps({ capability: async () => "live" as const, read, now: () => t, copies }),
     )
-    expect(Date.now() - started).toBeLessThan(50)
+    // the bound proves the prompt never awaits the read — not that it costs nothing: tk-1 added
+    // the session-task resolve (two tiny file reads) and a first-call durable pin write to this
+    // path, so the budget is generous for local IO but still far below the 5 s read
+    expect(Date.now() - started).toBeLessThan(250)
     expect(out.kind).toBe("updates")
     if (out.kind === "updates") expect(out.note).toContain("stale but present")
     resolveRead?.({ checkpoints: [], skipped: 0, milliseconds: 5_000, partial: false })
