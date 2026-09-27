@@ -473,6 +473,32 @@ async function runFolderCommand(argv: string[], deps: CliDeps): Promise<number> 
         deps.print(`already linked to project ${plan.projectId} — nothing to change`)
         return 0
       }
+      if (plan.kind === "move") {
+        // the folder move prompt (in-16 K-2, wording per Dami): what the folder leaves, what
+        // the old project keeps, and that its history is not copied. `checkpoints === null`
+        // means no local count exists — say "unknown number of", never a guess.
+        deps.print(`This folder currently belongs to project ${plan.fromProjectId}.`)
+        deps.print(`Project ${plan.fromProjectId}:`)
+        deps.print(`• ${plan.fromFolders === 1 ? "1 folder" : `${plan.fromFolders} folders`}`)
+        deps.print(plan.checkpoints === null ? "• unknown number of saved checkpoints" : `• ${plan.checkpoints} saved checkpoints`)
+        deps.print(`Linking will move this folder to project ${plan.projectId}.`)
+        deps.print(
+          plan.checkpoints === null
+            ? `The existing checkpoints stay in project ${plan.fromProjectId}'s history.`
+            : `The ${plan.checkpoints} existing checkpoints stay in project ${plan.fromProjectId}'s history.`,
+        )
+        deps.print(`They will NOT be copied into project ${plan.projectId} or appear in project ${plan.projectId}'s handoffs.`)
+        if (!(await askYes("Continue? Type yes: "))) {
+          deps.print("not approved")
+          return 1
+        }
+        const result = await linkProject(owner, { projectId: plan.projectId, dir: plan.root, fromProjectId: plan.fromProjectId })
+        deps.print(
+          `moved ${result.root} from project ${plan.fromProjectId} to project ${plan.projectId} ` +
+            `for ${result.agents.length === 0 ? "no agents yet" : result.agents.join(", ")}`,
+        )
+        return 0
+      }
       // what the owner is confirming: the project, its marker folder, this folder's canonical
       // path, and every agent that will be allowed to work here
       deps.print(`project ${plan.projectId} — its marker is ${plan.sourceRoot}`)
@@ -1073,6 +1099,10 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     // mid-command — the answer is still the same: nothing was written by this run.
     case "list-tampered":
       return "the approved-projects list failed its signature check — run `mida doctor`"
+    // in-16 K-2: the signed write landed but the marker could not flip AND the undo write also
+    // failed — the sentence the error carries is the true state, so print it
+    case "move-not-undone":
+      return error instanceof Error ? error.message : "refused: move-not-undone"
     case "SPONSOR_PENDING": {
       // The call was accepted by the sponsor but its receipt never confirmed — resending would be
       // the double-send this error exists to prevent, so the line says where it stands and how to

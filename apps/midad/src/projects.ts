@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto"
-import { mkdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { mkdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, resolve } from "node:path"
 import { verifyMessage } from "viem"
@@ -193,7 +193,7 @@ function writeMarkerFile(file: string, projectId: string): void {
   }
 }
 
-function codedError(code: "not-a-project", message: string): Error {
+function codedError(code: string, message: string): Error {
   const error = new Error(message) as Error & { code: string }
   error.code = code
   return error
@@ -352,16 +352,67 @@ const realpathOr = (dir: string, fallback: string): string => {
   }
 }
 
+/** The projectId inside `<dir>/.mida/project.json`, or null when there is none or it will not parse. */
+function markerProjectId(dir: string): string | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(join(dir, ".mida", "project.json"), "utf8"))
+    const id = (parsed as { projectId?: unknown } | null)?.projectId
+    return typeof id === "string" && id !== "" ? id : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The folders a project still HAS — canonical roots its signed rows name that exist on disk and
+ * still carry this project's marker. A deleted folder, or one `project new` re-pointed, does not
+ * keep a project alive, so it must not count against the only-folder guard or the folder move's
+ * "Project X: • N folders" line (in-16 B2/L5): counting rows there counted folders that were
+ * already gone.
+ */
+function liveProjectFolders(entries: readonly ProjectApproval[], projectId: string): Set<string> {
+  const roots = new Set<string>()
+  for (const entry of entries) {
+    if (entry.projectId !== projectId) continue
+    let real: string
+    try {
+      real = realpathSync.native(entry.root)
+    } catch {
+      continue
+    }
+    if (markerProjectId(real) !== projectId) continue
+    roots.add(real)
+  }
+  return roots
+}
+
 /**
  * What `mida link <folder>` must show the owner before the typed yes — or the refusal to print.
  * `<folder>` is any folder inside the project to join; it resolves by the same nearest-marker
  * rule every project lookup uses. `ok` carries everything the confirmation line names; `already`
  * means B is linked already and the command exits 0 changing nothing.
+ *
+ * `move` (in-16 K-2/B5) means this folder already answers for ANOTHER project — its own marker,
+ * or an ancestor's marker it inherits. The link is then a folder move: its rows under the old
+ * project leave and its rows under the new one land in ONE signed write, and the marker flips
+ * only after. `fromFolders` counts the old project's live folders (this one included);
+ * `checkpoints` is the saved-record count the owner can verify locally — null when counting
+ * would need the chain (the prompt says "unknown number of", never a guess).
  */
 export type ProjectLinkPlan =
   | { kind: "ok"; projectId: string; sourceRoot: string; root: string; agents: string[] }
+  | {
+      kind: "move"
+      projectId: string
+      fromProjectId: string
+      sourceRoot: string
+      root: string
+      agents: string[]
+      fromFolders: number
+      checkpoints: number | null
+    }
   | { kind: "already"; projectId: string; agents: string[] }
-  | { kind: "refused"; code: "no-project" | "same-folder" | "different-project" | "list-unreadable" | "list-tampered"; message: string }
+  | { kind: "refused"; code: "no-project" | "same-folder" | "list-unreadable" | "list-tampered"; message: string }
 
 export async function planProjectLink(
   runtime: ListOwner,
@@ -391,13 +442,6 @@ export async function planProjectLink(
   // cwd still lands on the same folder) means this folder already answers for a project.
   const own = findProjectMarker(input.cwd)
   const ownIsSelf = own !== null && realpathOr(own.markerDir, resolve(own.markerDir)) === root
-  if (ownIsSelf && own!.projectId !== null && own!.projectId !== source.projectId) {
-    return {
-      kind: "refused",
-      code: "different-project",
-      message: `this folder already belongs to project ${own!.projectId} — run \`mida unlink\` here first, or keep it separate`,
-    }
-  }
   const file = await readApprovalsFile(runtime.home, runtime.owner)
   // which agents the project allows lives only in the signed list — a list it cannot verify or
   // read makes that unknowable, so link refuses rather than guess or rebuild
@@ -411,6 +455,23 @@ export async function planProjectLink(
   // every agent the project already allows — the list is the authority, whatever folder their
   // rows name. Each one gets a row for B.
   const agents = [...new Set(entries.filter((e) => e.projectId === source.projectId).map((e) => e.agent))].sort()
+  // This folder already answers for a DIFFERENT project — its own marker (a worktree approved
+  // before linking existed) or the marker of the project tree it sits inside. Either way the
+  // link is a folder move and the owner is told what the folder leaves (in-16 K-2/B5).
+  if (own !== null && own.projectId !== null && own.projectId !== source.projectId) {
+    const folders = liveProjectFolders(entries, own.projectId)
+    if (ownIsSelf) folders.add(root)
+    return {
+      kind: "move",
+      projectId: source.projectId,
+      fromProjectId: own.projectId,
+      sourceRoot,
+      root,
+      agents,
+      fromFolders: folders.size,
+      checkpoints: null,
+    }
+  }
   const missing = agents.filter(
     (agent) => !entries.some((e) => e.agent === agent && e.projectId === source.projectId && sameProjectRoot(e.root, root)),
   )
@@ -421,35 +482,69 @@ export async function planProjectLink(
 }
 
 /**
- * The post-confirmation half of `mida link`: B's own marker takes the project's id, then one
- * signed row per agent the project already allows — through the same serialized, signed write
- * `approveProject` uses. Unlike approve it never rebuilds an unverifiable list from empty: the
- * agents to add live in that list, so a failed verification can only refuse — and B's marker
- * stays recoverable by re-running link once the list is. No transaction, no chain read of any
- * kind — the list is local, owner-signed data.
+ * The post-confirmation half of `mida link` — and, when `fromProjectId` is set, of a folder
+ * move (in-16 K-2): this root's rows under its old project leave and its rows under the new
+ * one land in the SAME serialized, signed write, so the list is never half-moved. The marker
+ * flips only after that write landed; a marker write that fails puts the list back (the moved
+ * folder's old rows return, the new rows leave), so the folder keeps answering for its old
+ * project. Unlike approve it never rebuilds an unverifiable list from empty: the agents to add
+ * live in that list, so a failed verification can only refuse. No transaction, no chain read
+ * of any kind — the list is local, owner-signed data.
  */
 export async function linkProject(
   runtime: ListOwner,
-  input: { projectId: string; dir: string },
+  input: { projectId: string; dir: string; fromProjectId?: string },
 ): Promise<{ root: string; agents: string[]; added: string[] }> {
   const root = realpathSync.native(input.dir)
-  writeProjectMarker(input.dir, input.projectId)
-  return serializeListWrite(async () => {
+  let removed: ProjectApproval[] = []
+  const result = await serializeListWrite(async () => {
     const file = await readApprovalsFile(runtime.home, runtime.owner)
     if (file.kind === "unreadable") throw listRefusal("list-unreadable")
     if (file.kind === "bad-signature") throw listRefusal("list-tampered")
     const entries = file.kind === "signed" ? file.entries : []
     const agents = [...new Set(entries.filter((e) => e.projectId === input.projectId).map((e) => e.agent))].sort()
+    // a folder move: every row this root carried under the old project goes in the same write —
+    // kept verbatim for the undo path so a failed marker write restores exactly what was signed
+    removed = input.fromProjectId === undefined
+      ? []
+      : entries.filter((e) => e.projectId === input.fromProjectId && sameProjectRoot(e.root, root))
+    const kept = entries.filter((e) => !removed.includes(e))
     // canonical comparison decides what is missing — a symlink, typed case or relative spelling
     // of the same folder can never land a second row
     const added = agents.filter(
-      (agent) => !entries.some((e) => e.agent === agent && e.projectId === input.projectId && sameProjectRoot(e.root, root)),
+      (agent) => !kept.some((e) => e.agent === agent && e.projectId === input.projectId && sameProjectRoot(e.root, root)),
     )
     const approvedAt = new Date().toISOString()
-    const next = [...entries, ...added.map((agent) => ({ agent, projectId: input.projectId, root, approvedAt }))]
+    const next = [...kept, ...added.map((agent) => ({ agent, projectId: input.projectId, root, approvedAt }))]
     runtime.home.writeSecretJson(LIST_FILE, { entries: next, signature: await signEntries(runtime, next) })
     return { root, agents, added }
   })
+  try {
+    writeProjectMarker(input.dir, input.projectId)
+  } catch (error) {
+    // the marker could not flip — put the list back so the folder still answers for the project
+    // it answered for before; only the rows THIS call added leave (pre-existing ones stay), and
+    // the old project's rows return verbatim
+    const addedAgents = new Set(result.added)
+    const restored = await serializeListWrite(async () => {
+      const file = await readApprovalsFile(runtime.home, runtime.owner)
+      if (file.kind !== "signed") return false // a list that broke mid-move is never rewritten blind
+      const kept = file.entries.filter(
+        (e) => !(e.projectId === input.projectId && sameProjectRoot(e.root, root) && addedAgents.has(e.agent)),
+      )
+      const next = [...kept, ...removed]
+      runtime.home.writeSecretJson(LIST_FILE, { entries: next, signature: await signEntries(runtime, next) })
+      return true
+    }).catch(() => false)
+    if (!restored) {
+      throw codedError(
+        "move-not-undone",
+        `the folder move could not be undone — the signed list already carries this folder's ${input.projectId} rows while its marker still names ${input.fromProjectId ?? "its old project"}; run \`mida doctor\` and repair before linking again`,
+      )
+    }
+    throw error
+  }
+  return result
 }
 
 /**

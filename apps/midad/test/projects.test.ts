@@ -386,15 +386,110 @@ describe("mida link — a second folder joins an existing project (lk-1)", () =>
     expect(await planProjectLink(runtime, { folder: alias, cwd: dirA })).toMatchObject({ kind: "refused", code: "same-folder" })
   })
 
-  it("refuses when B already carries its own marker for a DIFFERENT project — nothing written", async () => {
+  it("B with its own marker for a DIFFERENT project plans a folder move — the plan writes nothing (in-16 K-2)", async () => {
     const { dir, home, runtime } = setup()
     const dirA = join(dir, "a"); const dirB = join(dir, "b")
     mark(dirA, "p-a"); mark(dirB, "p-b")
-    expect(await planProjectLink(runtime, { folder: dirA, cwd: dirB })).toMatchObject({ kind: "refused", code: "different-project" })
-    // B's marker still names its own project — the refusal wrote nothing
+    // the move plan names what B leaves: its project, its live folder count, and an honest
+    // "unknown" checkpoint count — the records live sealed in the store, so nothing local can count them
+    expect(await planProjectLink(runtime, { folder: dirA, cwd: dirB })).toMatchObject({
+      kind: "move", projectId: "p-a", fromProjectId: "p-b", fromFolders: 1, checkpoints: null,
+    })
+    // B's marker still names its own project — the plan wrote nothing
     const marker = JSON.parse(readFileSync(join(dirB, ".mida", "project.json"), "utf8")) as { projectId: string }
     expect(marker.projectId).toBe("p-b")
     expect(home.has(LIST)).toBe(false)
+  })
+
+  it("the folder move is atomic — old project's rows leave and the new project's land in one signed write (in-16 K-2)", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b"); const dirC = join(dir, "c")
+    mark(dirA, "p-a"); mark(dirB, "p-b"); mark(dirC, "p-b")
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    await approveProject(runtime, { agent: "codex", cwd: dirA })
+    // p-b has a second folder and an agent A does not know — both stay when B leaves
+    await approveProject(runtime, { agent: "claude-code", cwd: dirB })
+    await approveProject(runtime, { agent: "gemini", cwd: dirC })
+    const before = entriesOf(home).length
+
+    const plan = await planProjectLink(runtime, { folder: dirA, cwd: dirB })
+    expect(plan).toMatchObject({ kind: "move", fromProjectId: "p-b", fromFolders: 2 })
+    const moved = await linkProject(runtime, { projectId: "p-a", dir: dirB, fromProjectId: "p-b" })
+    expect(moved.added).toEqual(["claude-code", "codex"])
+
+    // B's marker flipped to p-a and every row naming B is under p-a now — claude-code's p-b row
+    // for B went away in the same write that added the p-a rows
+    const marker = JSON.parse(readFileSync(join(dirB, ".mida", "project.json"), "utf8")) as { projectId: string }
+    expect(marker.projectId).toBe("p-a")
+    const entries = entriesOf(home)
+    expect(entries.length).toBe(before + 1) // B's one p-b row out, its two p-a rows in
+    expect(entries.filter((e) => e.root === realpathSync(dirB)).every((e) => e.projectId === "p-a")).toBe(true)
+    expect(entries.some((e) => e.projectId === "p-b" && e.root === realpathSync(dirC))).toBe(true)
+    // the security gate agrees: A's agents work in B, p-b's stray agent does not, C is untouched
+    expect(await approvalsFileStatus(home, runtime.owner)).toBe("signed")
+    expect(await checkProject(runtime, { agent: "codex", cwd: dirB })).toMatchObject({ ok: true })
+    expect(await checkProject(runtime, { agent: "gemini", cwd: dirB })).toEqual({ ok: false, reason: "not-approved" })
+    expect(await checkProject(runtime, { agent: "gemini", cwd: dirC })).toMatchObject({ ok: true })
+  })
+
+  it("a list write failure mid-move leaves the folder exactly in its old project (in-16 K-2)", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mark(dirB, "p-b")
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    await approveProject(runtime, { agent: "claude-code", cwd: dirB })
+    // the list breaks before the write — the move refuses and nothing moves
+    const file = home.readJson<{ entries: ProjectApproval[]; signature: Hex }>(LIST)!
+    home.writeSecretJson(LIST, {
+      entries: [...file.entries, { agent: "evil", projectId: "p-evil", root: "/tmp", approvedAt: "x" }],
+      signature: file.signature,
+    })
+    await expect(linkProject(runtime, { projectId: "p-a", dir: dirB, fromProjectId: "p-b" })).rejects.toMatchObject({ code: "list-tampered" })
+    const marker = JSON.parse(readFileSync(join(dirB, ".mida", "project.json"), "utf8")) as { projectId: string }
+    expect(marker.projectId).toBe("p-b")
+    expect(entriesOf(home).filter((e) => e.root === realpathSync(dirB)).every((e) => e.projectId === "p-b")).toBe(true)
+  })
+
+  it("a marker write failure puts the signed list back — never a half-moved folder (in-16 K-2)", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mark(dirB, "p-b")
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    await approveProject(runtime, { agent: "claude-code", cwd: dirB })
+    const before = home.readJson<{ entries: ProjectApproval[] }>(LIST)!.entries
+    // a read-only .mida makes every marker write fail — the signed write lands first
+    chmodSync(join(dirB, ".mida"), 0o500)
+    try {
+      await expect(linkProject(runtime, { projectId: "p-a", dir: dirB, fromProjectId: "p-b" })).rejects.toThrow()
+    } finally {
+      chmodSync(join(dirB, ".mida"), 0o700)
+    }
+    // the list is byte-for-byte what it was: B's p-b row is back and no p-a row names it
+    expect(home.readJson<{ entries: ProjectApproval[] }>(LIST)!.entries).toEqual(before)
+    expect(await approvalsFileStatus(home, runtime.owner)).toBe("signed")
+    // and checkProject still answers for p-b — the folder never left it
+    expect(await checkProject(runtime, { agent: "claude-code", cwd: dirB })).toMatchObject({ ok: true })
+  })
+
+  it("a rollback that also fails is reported, not hidden — the half-move names itself (in-16 K-2)", async () => {
+    const { dir, home, runtime } = setup()
+    const dirA = join(dir, "a"); const dirB = join(dir, "b")
+    mark(dirA, "p-a"); mark(dirB, "p-b")
+    await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+    await approveProject(runtime, { agent: "claude-code", cwd: dirB })
+    chmodSync(join(dirB, ".mida"), 0o500)
+    // the undo write fails too — fail the second signed write this command attempts
+    const real = home.writeSecretJson.bind(home)
+    let writes = 0
+    home.writeSecretJson = ((rel: string, value: unknown) => {
+      if (rel === LIST && ++writes === 2) throw new Error("disk full")
+      return real(rel, value)
+    }) as typeof home.writeSecretJson
+    try {
+      await expect(linkProject(runtime, { projectId: "p-a", dir: dirB, fromProjectId: "p-b" })).rejects.toMatchObject({ code: "move-not-undone" })
+    } finally {
+      chmodSync(join(dirB, ".mida"), 0o700)
+    }
   })
 
   it("refuses to preview a link when the signed list cannot be read", async () => {

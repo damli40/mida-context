@@ -428,8 +428,13 @@ already approved for the project, asks `Type yes to link:`, then writes this fol
 the project's id and adds one owner-signed approved-folder row per agent. No transaction, nothing
 sent — the signed approval list is local data, so a link costs no gas. From then on a handoff saved
 in one folder is what an agent receives in the other. Repeating the link — or typing the same folder
-as a relative path, `~/…` or a symlink — changes nothing. A folder that already carries a different
-project's marker refuses; `mida unlink` is how it leaves.
+as a relative path, `~/…` or a symlink — changes nothing.
+
+A folder that already carries a different project's marker — say a worktree approved before you
+linked it — is a **folder move**: `mida link` shows what the folder leaves (the old project's id,
+its folder and saved-checkpoint counts) and confirms `Continue? Type yes:`, then moves the folder's
+signed rows to the new project and flips its marker, all or nothing. The old project's history stays
+exactly where it is — nothing is copied into the new project or appears in its handoffs.
 
 ```bash
 mida unlink    # inside a linked folder: its rows leave the signed list and its marker goes

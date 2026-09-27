@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
 import { tmpdir } from "node:os"
@@ -1466,11 +1466,67 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     // B IS A — the folder already is the project's marker folder
     expect(await runIn(dirA, "link", dirA)).toBe(1)
     expect(out.at(-1)).toContain("already IS")
-    // B already carries its own marker for a different project — link would hijack it
-    expect(await runIn(dirC, "link", dirA)).toBe(1)
-    expect(out.at(-1)).toContain("mida unlink")
     // and none of the refusals wrote a marker anywhere new
     expect(existsSync(join(bare, ".mida"))).toBe(false)
+  })
+
+  it("mida link on a folder with its own project is a folder move, not a dead end (in-16 K-2)", async () => {
+    const { home, owner, network } = folderHome("mida-move-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-move-a-"))
+    const dirB = mkdtempSync(join(tmpdir(), "mida-move-b-"))
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-a" }))
+    mkdirSync(join(dirB, ".mida"))
+    writeFileSync(join(dirB, ".mida", "project.json"), JSON.stringify({ projectId: "p-b" }))
+    await approveProject(owner, { agent: "claude-code", cwd: dirA })
+    await approveProject(owner, { agent: "claude-code", cwd: dirB })
+
+    const lines: string[] = []
+    const asked: string[] = []
+    expect(await runCli(["link", dirA], {
+      home, network, cwd: dirB, print: (line) => lines.push(line),
+      prompt: async (question) => { asked.push(question); return "yes" },
+      stdinIsTTY: true, stdoutIsTTY: true,
+    })).toBe(0)
+    // the owner saw the folder-move wording — what B leaves, and that X's history is not copied
+    expect(lines).toEqual([
+      "This folder currently belongs to project p-b.",
+      "Project p-b:",
+      "• 1 folder",
+      "• unknown number of saved checkpoints",
+      "Linking will move this folder to project p-a.",
+      "The existing checkpoints stay in project p-b's history.",
+      "They will NOT be copied into project p-a or appear in project p-a's handoffs.",
+      expect.stringContaining("moved") as unknown as string,
+    ])
+    expect(asked).toEqual(["Continue? Type yes: "])
+    // one signed write moved B: its p-b row is gone, its p-a row is in, the marker flipped
+    const marker = JSON.parse(readFileSync(join(dirB, ".mida", "project.json"), "utf8")) as { projectId: string }
+    expect(marker.projectId).toBe("p-a")
+    expect(await checkProject(owner, { agent: "claude-code", cwd: dirB })).toMatchObject({ ok: true })
+  })
+
+  it("a declined folder move changes nothing — the marker and every signed row stay (in-16 K-2)", async () => {
+    const { home, owner, network } = folderHome("mida-moveno-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-moveno-a-"))
+    const dirB = mkdtempSync(join(tmpdir(), "mida-moveno-b-"))
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-a" }))
+    mkdirSync(join(dirB, ".mida"))
+    writeFileSync(join(dirB, ".mida", "project.json"), JSON.stringify({ projectId: "p-b" }))
+    await approveProject(owner, { agent: "claude-code", cwd: dirA })
+    await approveProject(owner, { agent: "claude-code", cwd: dirB })
+    const before = (home.readJson("approved-projects.json") as { entries: unknown[] }).entries.length
+
+    const out: string[] = []
+    expect(await runCli(["link", dirA], {
+      home, network, cwd: dirB, print: (line) => out.push(line),
+      prompt: async () => "no", stdinIsTTY: true, stdoutIsTTY: true,
+    })).toBe(1)
+    expect(out).toContain("not approved")
+    const marker = JSON.parse(readFileSync(join(dirB, ".mida", "project.json"), "utf8")) as { projectId: string }
+    expect(marker.projectId).toBe("p-b")
+    expect((home.readJson("approved-projects.json") as { entries: unknown[] }).entries).toHaveLength(before)
   })
 
   it("mida link with the wrong argument count is usage, like every command (lk-1)", async () => {
