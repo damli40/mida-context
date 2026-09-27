@@ -755,6 +755,8 @@ export async function readCheckpoints(
       // a migrated record's envelope rides on the stored checkpoint as an ordinary typed field —
       // dropped nowhere on the way to the renderers
       ...(envelope.migration === undefined ? {} : { migration: envelope.migration }),
+      // same for the named task (tk-1): absent on old records, which read as "main" downstream
+      ...(envelope.task === undefined ? {} : { task: envelope.task }),
     })
   }
   for (const object of objects) collect(object, "ANCHORED")

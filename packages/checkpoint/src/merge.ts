@@ -56,7 +56,16 @@ export interface StoredCheckpoint {
    * record, never make it newer than the chain's placement (in-12 N-1, keeping in-11 R-10).
    */
   migration?: MigrationEnvelope
+  /**
+   * The named task the checkpoint was saved under (tk-1) — envelope content, absent on every
+   * record written before tasks existed. Absent reads as "main"; callers that compare use
+   * `taskOf`, which applies that default in one place.
+   */
+  task?: string
 }
+
+/** The record's task with the absent-is-`main` rule applied — the ONE place that default lives. */
+export const taskOf = (s: { task?: string }): string => s.task ?? "main"
 
 export interface MergedHandoff {
   // The newest session in the chosen chain — the session a handoff recipient continues.

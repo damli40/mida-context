@@ -3,6 +3,7 @@ import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
 import { LIMITS, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint, MigrationEnvelope } from "@mida/checkpoint"
 import { validateMigrationEnvelope } from "./migration-envelope.js"
+import { DEFAULT_TASK, isTaskName } from "./task.js"
 
 export const CHECKPOINT_TYPE = "mida.checkpoint.v1"
 /**
@@ -41,6 +42,13 @@ export interface CheckpointEnvelope {
   continuesSession: string | null
   compiledBy: string
   checkpoint: Checkpoint
+  /**
+   * Which named task this checkpoint belongs to (tk-1). Content, not identity: it lives inside
+   * the sealed envelope and touches nothing on chain — not the record id, the grants, or the
+   * namespace. Omitted entirely for `main` (and on every pre-tasks record), so a save that names
+   * no task serializes byte-for-byte as it always did, and a missing field reads as `main`.
+   */
+  task?: string
   /**
    * Where the record came from — set only on records `mida migrate` moved here, sealed beside
    * the checkpoint. Omitted entirely on ordinary saves, so their bytes never change.
@@ -95,6 +103,12 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
     throw new CheckpointPayloadError("invalid-checkpoint", `invalid checkpoint: ${checked.errors.join("; ")}`, fieldPathsFromErrors(checked.errors))
   }
   const migration = checkedMigration(input.migration)
+  // a task name is validated like the rest of the envelope — and normalized: `main` is the empty
+  // state, so it serializes as no field at all and stays byte-identical with a task-less save
+  const task = input.task === undefined ? undefined : isTaskName(input.task) ? input.task : undefined
+  if (input.task !== undefined && task === undefined) {
+    throw new CheckpointPayloadError("invalid-checkpoint", `invalid task name: ${JSON.stringify(input.task)}`, ["task"])
+  }
   const checkpoint: Checkpoint = {
     ...checked.value,
     progress: [...checked.value.progress],
@@ -112,6 +126,7 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
     continuesSession: input.continuesSession,
     compiledBy: input.compiledBy,
     checkpoint,
+    ...(task === undefined || task === DEFAULT_TASK ? {} : { task }),
     ...(migration === undefined ? {} : { migration }),
   })
   const bytes = () => Buffer.byteLength(JSON.stringify(envelope()))
@@ -172,6 +187,13 @@ export function unwrapCheckpoint(value: unknown): CheckpointEnvelope | null {
   if (typeof record.compiledBy !== "string") return null
   const checked = validateCheckpoint(record.checkpoint)
   if (!checked.ok) return null
+  // absent reads as `main`; a present-but-invalid name makes the whole record unreadable rather
+  // than silently filing a named checkpoint under the default task
+  let task: string | undefined
+  if (record.task !== undefined) {
+    if (!isTaskName(record.task)) return null
+    if (record.task !== DEFAULT_TASK) task = record.task
+  }
   let migration: MigrationEnvelope | undefined
   if (record.migration !== undefined) {
     const checkedEnvelope = validateMigrationEnvelope(record.migration)
@@ -185,6 +207,7 @@ export function unwrapCheckpoint(value: unknown): CheckpointEnvelope | null {
     continuesSession: record.continuesSession,
     compiledBy: record.compiledBy,
     checkpoint: checked.value,
+    ...(task === undefined ? {} : { task }),
     ...(migration === undefined ? {} : { migration }),
   }
 }
