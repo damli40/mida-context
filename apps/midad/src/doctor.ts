@@ -31,6 +31,7 @@ import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, ser
 import { mismatchLine, readSavedNetwork, resolveNetwork } from "./network.js"
 import type { ResolvedNetwork, SavedNetwork, ServiceSource } from "./network.js"
 import { cliPackageName, isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
+import { folderTaskFor } from "./task.js"
 
 /** The whole run is capped — a check may stall, the report may not. */
 const RUN_CAP_MS = 20_000
@@ -618,6 +619,20 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           }
         }
         return lines
+      },
+    },
+    {
+      name: "task",
+      run: async () => {
+        // tk-1: one line — the current task new sessions in this folder start under. A task
+        // file that will not parse is a real problem: the resolution falls back to `main` and
+        // the agent would silently work the wrong thread.
+        const folder = folderTaskFor(deps.cwd ?? process.cwd())
+        if (folder.markerDir === null) return ["note: this folder is not a Mida project — tasks live inside one"]
+        if (folder.invalid) {
+          return [problem("this folder's .mida/task.json is not a valid task file — sessions fall back to main", "run `mida task <name>` or delete the file")]
+        }
+        return [`ok: this folder's current task is ${folder.task ?? "main"}${folder.task === undefined ? " (default)" : ""}`]
       },
     },
     {
