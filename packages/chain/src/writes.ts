@@ -73,6 +73,19 @@ export interface WriteContext extends ChainContext {
    * the runtime to its own progress channel; unset means silent code paths stay silent.
    */
   progress?: (line: string) => void
+  /**
+   * The bounded wait every send runs under (in-15 J-4): while the chain stays silent a
+   * "still waiting for Monad (N s)…" line ticks on `progress` every `everyMs`, and once `capMs`
+   * passes the send throws SEND_TIMEOUT — the error says whether a transaction hash exists, so
+   * "sent but unconfirmed" and "nothing left the process" are never the same line. Timer
+   * callbacks are injectable so a test runs the clock; defaults below.
+   */
+  sendWatch?: {
+    everyMs?: number
+    capMs?: number
+    setTimeout?: (fn: () => void, ms: number) => unknown
+    clearTimeout?: (timer: unknown) => void
+  }
 }
 
 /** A write context whose account can sign typed data locally (operators, owners and agent signers in tests and the CLI). */
@@ -108,6 +121,78 @@ export function failedBeforeSend(error: unknown): boolean {
 const markUnsent = <T>(error: T): T => {
   if (error instanceof Error) (error as { sent?: boolean }).sent = false
   return error
+}
+
+/** A "still waiting for Monad" line ticks this often while a send is in flight (in-15 J-4). */
+export const SEND_PROGRESS_EVERY_MS = 15_000
+/** The most a send waits on Monad before reporting what it honestly knows (in-15 J-4). */
+export const SEND_CAP_MS = 120_000
+
+/**
+ * The race every owner send runs: work against a tick chain that prints `still waiting for
+ * Monad (N s)…` each `everyMs` and gives up at `capMs`. The give-up error names only what the
+ * caller can vouch for — three states, in order of knowledge:
+ *
+ * - a hash exists: the transaction left, its receipt is what is missing;
+ * - no hash but a send was attempted (the write call or the sponsor is still in flight): the
+ *   transaction may be out there without a hash to show, so the line cannot claim "nothing
+ *   was sent" — that would send the owner into a possible double-send;
+ * - no attempt yet (the hang was in the simulate/estimate/guard steps): nothing was sent.
+ */
+async function watchSend<T>(
+  context: WriteContext,
+  state: { hashOf(): Hex | undefined; attempted(): boolean },
+  work: () => Promise<T>,
+): Promise<T> {
+  const watch = context.sendWatch
+  const setTimer = watch?.setTimeout ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
+  const clearTimer = watch?.clearTimeout ?? ((timer: unknown) => clearTimeout(timer as never))
+  const everyMs = watch?.everyMs ?? SEND_PROGRESS_EVERY_MS
+  const capMs = watch?.capMs ?? SEND_CAP_MS
+  const timeout = (): MidaError => {
+    const hash = state.hashOf()
+    if (hash !== undefined) {
+      return new MidaError(
+        "SEND_TIMEOUT",
+        `sent as ${hash}, not confirmed yet: run \`mida doctor\`, or run the same command again (it checks the chain first, so nothing is sent twice)`,
+      )
+    }
+    return state.attempted()
+      ? new MidaError(
+          "SEND_TIMEOUT",
+          "the send may still have gone out without a hash to show for it — run `mida doctor` to check before running the command again",
+        )
+      : // pre-attempt is provably unsent — the batcher may resubmit it like any pre-send failure
+        markUnsent(new MidaError("SEND_TIMEOUT", "nothing was sent: run the same command again"))
+  }
+  let timer: unknown
+  try {
+    return await Promise.race([
+      work(),
+      new Promise<never>((_resolve, reject) => {
+        // `waited` is advanced when each timer is SCHEDULED, so it always names the moment the
+        // timer that is firing was aimed at — the cap is a tick that refuses instead of prints.
+        let waited = 0
+        const tick = (): void => {
+          if (waited >= capMs) {
+            reject(timeout())
+            return
+          }
+          context.progress?.(`still waiting for Monad (${Math.round(waited / 1_000)} s)…`)
+          const nextIn = Math.min(everyMs, capMs - waited)
+          waited += nextIn
+          timer = setTimer(tick, nextIn)
+          if (typeof (timer as { unref?: unknown }).unref === "function") (timer as { unref(): void }).unref()
+        }
+        const firstIn = Math.min(everyMs, capMs)
+        waited = firstIn
+        timer = setTimer(tick, firstIn)
+        if (typeof (timer as { unref?: unknown }).unref === "function") (timer as { unref(): void }).unref()
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimer(timer)
+  }
 }
 
 /**
@@ -153,83 +238,95 @@ export async function sendContract(
   call: { address: Address; abi: Abi; functionName: string; args: readonly unknown[] },
   kind: TxKind,
 ): Promise<SentReceipt> {
-  let request: unknown
-  try {
-    ;({ request } = await context.publicClient.simulateContract({
-      account: context.account,
-      address: call.address,
-      abi: call.abi,
-      functionName: call.functionName,
-      args: call.args,
-    } as never))
-  } catch (error) {
-    // The simulation failing means nothing was broadcast — the error is marked sent:false so a
-    // retrying caller knows resubmission cannot double-send.
-    throw markUnsent(toMidaError(error))
-  }
-  let sponsorReason: string | undefined
-  if (context.sponsor !== undefined) {
+  // What the watchdog's timeout can vouch for: a hash exists only once writeContract answered;
+  // `sentAttempted` marks the stretch where a transaction may be in flight without one — the
+  // write call itself hung, or the sponsor went quiet after accepting.
+  let hash: Hex | undefined
+  let sentAttempted = false
+  return watchSend(context, { hashOf: () => hash, attempted: () => sentAttempted }, async () => {
+    let request: unknown
     try {
-      return await context.sponsor.send(call, kind)
+      ;({ request } = await context.publicClient.simulateContract({
+        account: context.account,
+        address: call.address,
+        abi: call.abi,
+        functionName: call.functionName,
+        args: call.args,
+      } as never))
     } catch (error) {
-      // SPONSOR_PENDING leaves through this line untouched: the operation was accepted and may
-      // still land, so a self-paid copy is exactly the double-send this seam must never create.
-      // A GAS_CEILING_EXCEEDED from the sponsored path's own bundler-estimate check leaves the
-      // same way — a local policy refusal, never a fallback candidate.
-      if (!(error instanceof SponsorDidNotPay)) throw error
-      if (!SPONSOR_FALLBACK_TO_SELF_PAY) {
-        // The probe (m3-sponsor-probe step f, Sep 21) measured that a delegated address under
-        // 10 MON CAN pay its own gas — while that stays true the fallback below is safe and this
-        // branch is unreachable. If a Monad change ever makes self-pay impossible for delegated
-        // addresses, flipping the constant turns the silent failure mode into this refusal.
-        throw new MidaError(
-          "SPONSOR_FAILED",
-          `the gas sponsor did not pay (${error.reason}) and this build cannot fall back to self-pay — fund the wallet or try the sponsor again later`,
-        )
-      }
-      sponsorReason = error.reason
-      context.progress?.(`the gas sponsor did not pay (${error.reason}); paying from your own wallet…`)
-      // falls through to the self-paid path — exactly one attempt, never a retry loop
+      // The simulation failing means nothing was broadcast — the error is marked sent:false so a
+      // retrying caller knows resubmission cannot double-send.
+      throw markUnsent(toMidaError(error))
     }
-  }
-  let gas: bigint
-  let fee: SendFee | undefined
-  // Everything between the simulation and writeContract is still pre-send — estimate, fee, and the
-  // balance guard all run before a transaction can exist. Whatever they throw is marked sent:false;
-  // the sponsor block above is deliberately outside this marking because its send may be in flight.
-  try {
-    try {
-      // The per-kind ceiling on the self-paid path: the node's estimate is refused over the kind's
-      // ceiling, locally, before the send is priced (M3-D). This estimate is deliberately absent
-      // from the sponsored path above — the payer there is the sponsor, and the bundler's own
-      // callGasLimit is what gets checked.
-      gas = await contractGas(context, call, kind)
-    } catch (error) {
-      // The ceiling refusal stays a ceiling refusal — that is the estimate succeeding with a
-      // number, not the estimate itself being refused.
-      if (isMidaError(error, "GAS_CEILING_EXCEEDED")) throw error
-      ;({ gas, fee } = await estimateAfterRefusal(context, call, kind, sponsorReason, error))
-    }
-    if (fee === undefined) {
+    let sponsorReason: string | undefined
+    if (context.sponsor !== undefined) {
+      sentAttempted = true
       try {
-        // The fee is estimated ONCE here and forwarded into the send below: the balance guard checks
-        // gasLimit × this maxFeePerGas, the node checks the same product, and no second estimate can
-        // drift between the two reads (R5-9).
-        fee = await estimateSendFee(context)
+        return await context.sponsor.send(call, kind)
       } catch (error) {
-        throw toMidaError(error)
+        // SPONSOR_PENDING leaves through this line untouched: the operation was accepted and may
+        // still land, so a self-paid copy is exactly the double-send this seam must never create.
+        // A GAS_CEILING_EXCEEDED from the sponsored path's own bundler-estimate check leaves the
+        // same way — a local policy refusal, never a fallback candidate.
+        if (!(error instanceof SponsorDidNotPay)) throw error
+        if (!SPONSOR_FALLBACK_TO_SELF_PAY) {
+          // The probe (m3-sponsor-probe step f, Sep 21) measured that a delegated address under
+          // 10 MON CAN pay its own gas — while that stays true the fallback below is safe and this
+          // branch is unreachable. If a Monad change ever makes self-pay impossible for delegated
+          // addresses, flipping the constant turns the silent failure mode into this refusal.
+          throw new MidaError(
+            "SPONSOR_FAILED",
+            `the gas sponsor did not pay (${error.reason}) and this build cannot fall back to self-pay — fund the wallet or try the sponsor again later`,
+          )
+        }
+        // SponsorDidNotPay means refused BEFORE accepting — nothing of it is in flight, so the
+        // timeout message can honestly fall back to "nothing was sent" while we self-pay.
+        sentAttempted = false
+        sponsorReason = error.reason
+        context.progress?.(`the gas sponsor did not pay (${error.reason}); paying from your own wallet…`)
+        // falls through to the self-paid path — exactly one attempt, never a retry loop
       }
     }
-    await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee })
-  } catch (error) {
-    throw markUnsent(error)
-  }
-  const hash = await context.walletClient.writeContract({ ...(request as object), gas, ...fee } as never)
-  const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
-  if (receipt.status !== "success") {
-    throw new MidaError("CAPABILITY_DENIED", `${call.functionName} transaction ${hash} reverted on-chain`)
-  }
-  return { ...receipt, gasLimit: gas }
+    let gas: bigint
+    let fee: SendFee | undefined
+    // Everything between the simulation and writeContract is still pre-send — estimate, fee, and the
+    // balance guard all run before a transaction can exist. Whatever they throw is marked sent:false;
+    // the sponsor block above is deliberately outside this marking because its send may be in flight.
+    try {
+      try {
+        // The per-kind ceiling on the self-paid path: the node's estimate is refused over the kind's
+        // ceiling, locally, before the send is priced (M3-D). This estimate is deliberately absent
+        // from the sponsored path above — the payer there is the sponsor, and the bundler's own
+        // callGasLimit is what gets checked.
+        gas = await contractGas(context, call, kind)
+      } catch (error) {
+        // The ceiling refusal stays a ceiling refusal — that is the estimate succeeding with a
+        // number, not the estimate itself being refused.
+        if (isMidaError(error, "GAS_CEILING_EXCEEDED")) throw error
+        ;({ gas, fee } = await estimateAfterRefusal(context, call, kind, sponsorReason, error))
+      }
+      if (fee === undefined) {
+        try {
+          // The fee is estimated ONCE here and forwarded into the send below: the balance guard checks
+          // gasLimit × this maxFeePerGas, the node checks the same product, and no second estimate can
+          // drift between the two reads (R5-9).
+          fee = await estimateSendFee(context)
+        } catch (error) {
+          throw toMidaError(error)
+        }
+      }
+      await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee })
+    } catch (error) {
+      throw markUnsent(error)
+    }
+    sentAttempted = true
+    hash = await context.walletClient.writeContract({ ...(request as object), gas, ...fee } as never)
+    const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
+    if (receipt.status !== "success") {
+      throw new MidaError("CAPABILITY_DENIED", `${call.functionName} transaction ${hash} reverted on-chain`)
+    }
+    return { ...receipt, gasLimit: gas }
+  })
 }
 
 /**
@@ -283,27 +380,35 @@ export async function sendValue(
   transfer: { to: Address; value: bigint },
   kind: TxKind,
 ): Promise<SentReceipt> {
-  let gas: bigint
-  let fee: SendFee
-  try {
-    ;[gas, fee] = await Promise.all([valueGas(context, transfer, kind), estimateSendFee(context)])
-  } catch (error) {
-    throw toMidaError(error)
-  }
-  await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee, value: transfer.value })
-  const hash = await context.walletClient.sendTransaction({
-    account: context.account,
-    chain: context.walletClient.chain,
-    to: transfer.to,
-    value: transfer.value,
-    gas,
-    ...fee,
-  } as never)
-  const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
-  if (receipt.status !== "success") {
-    throw new MidaError("CAPABILITY_DENIED", `funding transaction ${hash} reverted on-chain`)
-  }
-  return { ...receipt, gasLimit: gas }
+  let hash: Hex | undefined
+  let sentAttempted = false
+  return watchSend(context, { hashOf: () => hash, attempted: () => sentAttempted }, async () => {
+    let gas: bigint
+    let fee: SendFee
+    // Everything before sendTransaction is still pre-send — estimate, fee, and the balance guard
+    // all run before a transaction can exist, so their failures are marked sent:false like
+    // sendContract's (the batcher's resubmit rule counts on that marker).
+    try {
+      ;[gas, fee] = await Promise.all([valueGas(context, transfer, kind), estimateSendFee(context)])
+      await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee, value: transfer.value })
+    } catch (error) {
+      throw markUnsent(toMidaError(error))
+    }
+    sentAttempted = true
+    hash = await context.walletClient.sendTransaction({
+      account: context.account,
+      chain: context.walletClient.chain,
+      to: transfer.to,
+      value: transfer.value,
+      gas,
+      ...fee,
+    } as never)
+    const receipt = await context.publicClient.waitForTransactionReceipt({ hash })
+    if (receipt.status !== "success") {
+      throw new MidaError("CAPABILITY_DENIED", `funding transaction ${hash} reverted on-chain`)
+    }
+    return { ...receipt, gasLimit: gas }
+  })
 }
 
 /**

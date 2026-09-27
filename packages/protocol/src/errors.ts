@@ -39,6 +39,10 @@ export const MIDA_ERROR_CODES = [
   "PARTIAL_READ",
   "SPONSOR_FAILED",
   "SPONSOR_PENDING",
+  // A client-side send gave up waiting after its bounded window: the message itself says
+  // whether a transaction hash is known ("sent as 0x…, not confirmed yet") or nothing left the
+  // process — a send is never reported as a silent success (in-15 J-4).
+  "SEND_TIMEOUT",
   // A write the store refused while the owner's revoke is still pending on Monad: distinct from
   // CAPABILITY_REVOKED (the chain already shows the revocation) so a caller can drop the job
   // without treating the transcript as permanently dead — the deny may still be cancelled.

@@ -92,6 +92,35 @@ describe("ownerRefusalLine (R4-5)", () => {
     expect(line).not.toContain("run the same command again")
   })
 
+  it("SEND_TIMEOUT prints the send's own honest sentence — hash, maybe-out, or nothing-sent (in-15 J-4)", () => {
+    const hash = `0x${"ab".repeat(32)}` as Hex
+    expect(ownerRefusalLine("approve", "devin", new MidaError("SEND_TIMEOUT", "nothing was sent: run the same command again"))).toBe(
+      "nothing was sent: run the same command again",
+    )
+    expect(
+      ownerRefusalLine(
+        "approve",
+        "devin",
+        new MidaError("SEND_TIMEOUT", `sent as ${hash}, not confirmed yet: run \`mida doctor\`, or run the same command again (it checks the chain first, so nothing is sent twice)`),
+      ),
+    ).toBe(`sent as ${hash}, not confirmed yet: run \`mida doctor\`, or run the same command again (it checks the chain first, so nothing is sent twice)`)
+  })
+
+  it("SEND_TIMEOUT on remember swaps the blind re-run for look-first — a second run writes a second fact", () => {
+    const hash = `0x${"ab".repeat(32)}` as Hex
+    const line = ownerRefusalLine(
+      "remember",
+      "",
+      new MidaError("SEND_TIMEOUT", `sent as ${hash}, not confirmed yet: run \`mida doctor\`, or run the same command again (it checks the chain first, so nothing is sent twice)`),
+    )
+    expect(line).toContain("mida read --as assistant")
+    expect(line).not.toContain("it checks the chain first")
+    // the maybe-out and nothing-sent branches are already safe advice for remember
+    expect(
+      ownerRefusalLine("remember", "", new MidaError("SEND_TIMEOUT", "nothing was sent: run the same command again")),
+    ).toBe("nothing was sent: run the same command again")
+  })
+
   it("an unknown code keeps `refused: <code>` and a code-less error is named, never ERROR (CHAIN-09)", () => {
     expect(ownerRefusalLine("approve", "codex", coded("SOMETHING_NEW"))).toBe("refused: SOMETHING_NEW")
     expect(ownerRefusalLine("approve", "codex", new Error("a message that is never echoed"))).toBe("refused: UNEXPECTED")
