@@ -1554,6 +1554,91 @@ describe("named refusals on agent commands (CHAIN-09)", () => {
     expect(await checkProject(owner, { agent: "claude-code", cwd: dirA })).toMatchObject({ ok: true })
     expect(existsSync(join(dirA, ".mida", "project.json"))).toBe(true)
   })
+
+  it("mida project new marks a fresh project in a bare folder — no parent, no question (lk-1)", async () => {
+    const { home, network } = folderHome("mida-pnew-home-")
+    const bare = mkdtempSync(join(tmpdir(), "mida-pnew-bare-"))
+    const lines: string[] = []
+    const asked: string[] = []
+    expect(await runCli(["project", "new"], {
+      home, network, cwd: bare, print: (line) => lines.push(line),
+      prompt: async (question) => { asked.push(question); return "yes" },
+      stdinIsTTY: true, stdoutIsTTY: true,
+    })).toBe(0)
+    // nothing to confirm against — no parent project to leave, so no question is asked
+    expect(asked).toEqual([])
+    const marker = JSON.parse(readFileSync(join(bare, ".mida", "project.json"), "utf8")) as { projectId: string }
+    expect(marker.projectId).toMatch(/^[0-9a-f-]{36}$/)
+    expect(lines.some((line) => line.includes(marker.projectId))).toBe(true)
+    expect(lines.at(-1)).toContain("mida approve")
+  })
+
+  it("mida project new inside a project asks which project the folder stops using (lk-1)", async () => {
+    const { home, owner, network } = folderHome("mida-pnest-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-pnest-a-"))
+    const nested = join(dirA, "inner")
+    mkdirSync(nested)
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-pnest" }))
+    await approveProject(owner, { agent: "claude-code", cwd: dirA })
+    const lines: string[] = []
+    const run = (answer: string) =>
+      runCli(["project", "new"], {
+        home, network, cwd: nested, print: (line) => lines.push(line),
+        prompt: async () => answer, stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // no — nothing is written, the folder still belongs to the parent
+    expect(await run("no")).toBe(1)
+    expect(lines).toContain("not approved")
+    expect(lines.some((line) => line.includes("p-pnest"))).toBe(true)
+    expect(existsSync(join(nested, ".mida"))).toBe(false)
+    // yes — a fresh id in nested's own marker; the parent's rows are untouched
+    expect(await run("yes")).toBe(0)
+    const marker = JSON.parse(readFileSync(join(nested, ".mida", "project.json"), "utf8")) as { projectId: string }
+    expect(marker.projectId).not.toBe("p-pnest")
+    expect(await checkProject(owner, { agent: "claude-code", cwd: dirA })).toMatchObject({ ok: true })
+    // and claude-code is NOT approved for the new project — approval is per project
+    expect(await checkProject(owner, { agent: "claude-code", cwd: nested })).toEqual({ ok: false, reason: "not-approved" })
+  })
+
+  it("mida project new needs a real terminal and is refused through the daemon (lk-1)", async () => {
+    const { home, network } = folderHome("mida-pref-home-")
+    const bare = mkdtempSync(join(tmpdir(), "mida-pref-bare-"))
+    const refused: string[] = []
+    expect(await runCli(["project", "new"], {
+      home, network, cwd: bare, print: (line) => refused.push(line),
+      prompt: async () => "yes", stdinIsTTY: false, stdoutIsTTY: true,
+    })).toBe(2)
+    expect(refused).toEqual([NEEDS_TERMINAL_LINE])
+    const daemonLines: string[] = []
+    const stub = { home: new MidaHome(mkdtempSync(join(tmpdir(), "mida-pnew-stub-"))) } as unknown as ServiceRuntime
+    expect(await runCliWithRuntime(["project", "new"], stub, (line) => daemonLines.push(line))).toBe(2)
+    expect(daemonLines[0]).toContain("mida project")
+    expect(existsSync(join(bare, ".mida"))).toBe(false)
+  })
+
+  it("mida project new refuses a folder that is already its own project, and wrong args (lk-1)", async () => {
+    const { home, owner, network } = folderHome("mida-px-home-")
+    const dirA = mkdtempSync(join(tmpdir(), "mida-px-a-"))
+    mkdirSync(join(dirA, ".mida"))
+    writeFileSync(join(dirA, ".mida", "project.json"), JSON.stringify({ projectId: "p-px" }))
+    await approveProject(owner, { agent: "claude-code", cwd: dirA })
+    const out: string[] = []
+    const runIn = (cwd: string, ...argv: string[]) =>
+      runCli(argv, {
+        home, network, cwd, print: (line) => out.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    // already its own project — a second marker would strand the old one's rows
+    expect(await runIn(dirA, "project", "new")).toBe(1)
+    expect(out.at(-1)).toContain("p-px")
+    // wrong subcommand and stray args are usage, like every command
+    expect(await runIn(dirA, "project")).toBe(2)
+    expect(out.at(-1)).toBe(USAGE)
+    expect(await runIn(dirA, "project", "old")).toBe(2)
+    expect(await runIn(dirA, "project", "new", "extra")).toBe(2)
+    expect(await checkProject(owner, { agent: "claude-code", cwd: dirA })).toMatchObject({ ok: true })
+  })
 })
 
 /**

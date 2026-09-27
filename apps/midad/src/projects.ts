@@ -520,4 +520,60 @@ export async function unlinkProject(
   return { root, removed }
 }
 
+/**
+ * What `mida project new` must know before it writes — or the refusal. The same guard
+ * `ensureProjectMarker` applies to marker creation refuses the owner's home folder and the
+ * filesystem root; a folder that already holds its own usable marker is already its own project
+ * and refuses plainly; `parent` is the project this folder would stop using, so the command can
+ * ask for a typed yes.
+ */
+export type ProjectNewPlan =
+  | { kind: "ok"; parent: { markerDir: string; projectId: string } | null }
+  | { kind: "refused"; code: "not-a-project" | "own-marker"; message: string }
+
+export function projectNewPlan(cwd: string, homeDir: string = homedir()): ProjectNewPlan {
+  let realCwd: string
+  try {
+    realCwd = realpathSync.native(cwd)
+  } catch {
+    return { kind: "refused", code: "not-a-project", message: "this folder cannot be read — nothing to mark" }
+  }
+  let realHome: string
+  try {
+    realHome = realpathSync.native(homeDir)
+  } catch {
+    realHome = resolve(homeDir)
+  }
+  const found = findProjectMarker(cwd)
+  // a marker found in THIS folder means the folder already answers for a project — a fresh id
+  // here would strand the old one's rows; it must be detached first, or kept.
+  if (found !== null && realpathOr(found.markerDir, resolve(found.markerDir)) === realCwd) {
+    if (found.projectId !== null) {
+      return {
+        kind: "refused",
+        code: "own-marker",
+        message: `this folder is already its own project ${found.projectId} — run \`mida unlink\` here first, or keep it`,
+      }
+    }
+    // a marker file that carries no usable id is replaced, as ensureProjectMarker replaces it
+    return { kind: "ok", parent: null }
+  }
+  // a new marker here would claim a project out of the owner's home or the filesystem root —
+  // the same refusal ensureProjectMarker makes when it would create one
+  if (realCwd === realHome || realCwd === "/") {
+    return { kind: "refused", code: "not-a-project", message: "refusing to create a project marker here" }
+  }
+  if (found === null) return { kind: "ok", parent: null }
+  // an ancestor's marker wins today — the new marker makes this folder stop using that project
+  if (found.projectId === null) return { kind: "ok", parent: null }
+  return { kind: "ok", parent: { markerDir: realpathOr(found.markerDir, resolve(found.markerDir)), projectId: found.projectId } }
+}
+
+/** The post-confirmation half of `mida project new`: a fresh project id in this folder's own marker. */
+export function newProject(cwd: string): { projectId: string } {
+  const projectId = randomUUID()
+  writeProjectMarker(cwd, projectId)
+  return { projectId }
+}
+
 

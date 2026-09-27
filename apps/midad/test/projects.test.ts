@@ -5,8 +5,9 @@ import { join } from "node:path"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import type { Hex } from "@mida/protocol"
 import {
-  MidaHome, approveProject, approvalsFileStatus, canonicalEntries, checkProject, linkProject, loadOrCreateOwnerSecrets,
-  planProjectLink, planProjectUnlink, removeAgentApprovals, unlinkProject,
+  MidaHome, approveProject, approvalsFileStatus, canonicalEntries, checkProject, findProjectMarker, linkProject,
+  loadOrCreateOwnerSecrets, newProject, planProjectLink, planProjectUnlink, projectNewPlan, removeAgentApprovals,
+  unlinkProject,
 } from "@mida/midad"
 import type { ProjectApproval, Runtime } from "@mida/midad"
 
@@ -578,6 +579,80 @@ describe("mida link — a second folder joins an existing project (lk-1)", () =>
       expect(result.removed).toBe(1)
       expect(entriesOf(home)).toHaveLength(1)
       expect(existsSync(join(dirB, ".mida"))).toBe(false)
+    })
+  })
+
+  describe("mida project new — a folder starts its own project (lk-1)", () => {
+    it("a fresh folder gets a fresh project id in its own marker", () => {
+      const { dir } = setup()
+      const here = join(dir, "fresh")
+      mkdirSync(here)
+      expect(projectNewPlan(here, join(dir, "owner-home"))).toMatchObject({ kind: "ok", parent: null })
+      const { projectId } = newProject(here)
+      const marker = JSON.parse(readFileSync(join(here, ".mida", "project.json"), "utf8")) as { projectId: string }
+      expect(marker.projectId).toBe(projectId)
+      expect(projectId).toMatch(/^[0-9a-f-]{36}$/)
+      // the folder resolves to exactly that project
+      expect(findProjectMarker(here)).toMatchObject({ markerDir: here, projectId })
+    })
+
+    it("inside a parent's tree, the plan names the project this folder stops using — and rows stay", async () => {
+      const { dir, home, runtime } = setup()
+      const dirA = join(dir, "a")
+      mark(dirA, "p-a")
+      const nested = join(dirA, "deep", "inside")
+      mkdirSync(nested, { recursive: true })
+      await approveProject(runtime, { agent: "claude-code", cwd: dirA })
+      const before = entriesOf(home)
+
+      const plan = projectNewPlan(nested, join(dir, "owner-home"))
+      expect(plan).toMatchObject({ kind: "ok", parent: { markerDir: realpathSync(dirA), projectId: "p-a" } })
+
+      const { projectId } = newProject(nested)
+      expect(projectId).not.toBe("p-a")
+      // the nearest-marker rule now resolves the NEW project from nested folders below it
+      const deeper = join(nested, "deeper")
+      mkdirSync(deeper)
+      expect(findProjectMarker(deeper)).toMatchObject({ projectId })
+      // and everything the parent owned is untouched
+      expect(entriesOf(home)).toEqual(before)
+      expect(await checkProject(runtime, { agent: "claude-code", cwd: dirA })).toMatchObject({ ok: true })
+      // the new project is empty — the agent must be approved for it separately
+      expect(await checkProject(runtime, { agent: "claude-code", cwd: nested })).toEqual({ ok: false, reason: "not-approved" })
+    })
+
+    it("refuses on the owner's home folder and the filesystem root — the ensureProjectMarker rule", () => {
+      const { dir } = setup()
+      const ownerHome = join(dir, "owner-home")
+      mkdirSync(ownerHome)
+      expect(projectNewPlan(ownerHome, ownerHome)).toMatchObject({ kind: "refused", code: "not-a-project" })
+      expect(projectNewPlan("/", ownerHome)).toMatchObject({ kind: "refused", code: "not-a-project" })
+      // and no marker was written to either place
+      expect(existsSync(join(ownerHome, ".mida"))).toBe(false)
+    })
+
+    it("refuses when the folder already answers for a project of its own", () => {
+      const { dir } = setup()
+      const dirA = join(dir, "a")
+      mark(dirA, "p-a")
+      const plan = projectNewPlan(dirA, join(dir, "owner-home"))
+      expect(plan).toMatchObject({ kind: "refused", code: "own-marker" })
+      expect(existsSync(join(dirA, ".mida", "project.json"))).toBe(true)
+      // a marker file with no usable id is the one exception — it gets replaced, as ensureProjectMarker replaces it
+      const broken = join(dir, "broken")
+      mkdirSync(join(broken, ".mida"), { recursive: true })
+      writeFileSync(join(broken, ".mida", "project.json"), "{not json")
+      expect(projectNewPlan(broken, join(dir, "owner-home"))).toMatchObject({ kind: "ok", parent: null })
+    })
+
+    it("an ancestor's broken marker does not count as a parent — the folder joins nothing", () => {
+      const { dir } = setup()
+      const dirA = join(dir, "a")
+      mkdirSync(join(dirA, ".mida"), { recursive: true })
+      writeFileSync(join(dirA, ".mida", "project.json"), "{not json")
+      const nested = join(dirA, "inside")
+      mkdirSync(nested)
+      expect(projectNewPlan(nested, join(dir, "owner-home"))).toMatchObject({ kind: "ok", parent: null })
     })
   })
 })
