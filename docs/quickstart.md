@@ -39,7 +39,7 @@ mida --help
 Expected output:
 
 ```
-usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | batching on|off | migrate [--undo]   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or the identity a client installs)
+usage: mida init | install <tool> | uninstall <tool> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink | project new | batching on|off | migrate [--undo]   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or the identity a client installs)
 ```
 
 *Status: RUN — `pnpm check:publish` installs the packed tarball into a fresh folder outside the repo and runs `npx mida --help` to exit 0 with this text. The `-g` global-install variant links the same bins through npm's standard path.*
@@ -405,6 +405,59 @@ Devin's hooks have no transcript file and no `cwd` in the payload: the project f
 - **Node 22.13+ is required** for the database read (`node:sqlite`). On an older Node, `mida doctor` prints a `PROBLEM:` line and devin save jobs end `bad` with reason `devin-needs-node-22.13`.
 
 *Status: NOT RUN against a real Devin — every test uses synthetic payloads and a synthetic SQLite file (`apps/midad/test/devin.e2e.test.ts`, `apps/midad/test/drain-devin.test.ts`, `packages/compiler/test/transcript-devin.test.ts`). No real `~/.config/devin` or `~/.local/share/devin` was touched.*
+
+## One project, several folders
+
+A project is its `.mida/project.json` marker, not a single folder. When you ask Mida which project a
+folder belongs to, **the nearest `.mida/project.json` walking up the tree wins** — a marker in the
+folder itself beats one in a parent, and nothing looks further up once one is found. That one rule
+decides everything below.
+
+Normally one project is one folder. But the same work can live in several places — a git worktree, a
+second clone, a folder you copied. Approving every folder as its own project splits the history: a
+checkpoint saved in one would never surface in the other. `mida link` joins them into one project
+instead.
+
+```bash
+cd <the second folder>          # run INSIDE the folder being added
+mida link <any folder in the project>   # join the project that <folder> belongs to
+```
+
+It shows the project id, the project's marker folder, this folder's canonical path and every agent
+already approved for the project, asks `Type yes to link:`, then writes this folder's marker with
+the project's id and adds one owner-signed approved-folder row per agent. No transaction, nothing
+sent — the signed approval list is local data, so a link costs no gas. From then on a handoff saved
+in one folder is what an agent receives in the other. Repeating the link — or typing the same folder
+as a relative path, `~/…` or a symlink — changes nothing. A folder that already carries a different
+project's marker refuses; `mida unlink` is how it leaves.
+
+```bash
+mida unlink    # inside a linked folder: its rows leave the signed list and its marker goes
+```
+
+Unlink removes this folder's approval rows for every agent and its `.mida/` marker — the project,
+its other folders and everything saved to them are untouched. It refuses the project's only folder:
+unlinking that would orphan the project, so there is nothing to unlink.
+
+```bash
+mida project new   # inside any folder: start a separate project HERE
+```
+
+`project new` writes a fresh project id in this folder's own marker, even inside another project's
+tree. Because the nearest marker wins, the new marker makes this folder — and everything under it —
+stop using the parent's project, which is why it names that parent and asks `yes` first. The parent
+keeps every row and record it had; agents must be approved for the new project separately, as usual.
+A folder that is already its own project refuses (unlink or `project new` at the right level first);
+the owner's home folder and `/` refuse outright.
+
+All three are owner commands like `approve` — real terminal only, never the daemon. `mida doctor`
+shows one line per project with every folder its rows cover (`ok: project ae3e5609… — 2 folders
+(…/a, …/b)`), and a `PROBLEM` naming the fix — `mida unlink` or removing the row — when a listed
+folder no longer exists.
+
+*Status: NOT RUN interactively — the commands and their refusals are covered by
+`apps/midad/test/projects.test.ts` and `apps/midad/test/cli.test.ts`; the
+handoff-across-folders proof is `apps/midad/test/link.e2e.test.ts` on local Anvil.*
 
 ## The compile model: DeepSeek by default — RUN (benchmarked)
 
