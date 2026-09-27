@@ -279,10 +279,11 @@ describe("the RPC request count of one session-start handoff (in-6 R2)", () => {
    * in-13b M-3 — the reviewer's scaling measurement re-run the way production now reads: saves
    * on the batched lane (`mida batching on`, each settled through followPendingAnchors), the
    * store read through a chain-aware multicall client aimed at the RPC proxy, and Multicall3
-   * installed on the Anvil. Records the wire-request count per handoff at 5, 10 and 20 anchored batched
-   * checkpoints, split by which side of the store boundary sent each request. There is no count
-   * assertion — the numbers are the deliverable; the daemon is closed first so its ticks cannot
-   * land inside a measured window.
+   * installed on the Anvil. Asserts the wire-request count per handoff at 5, 10 and 20 anchored
+   * batched checkpoints, split by which side of the store boundary sent each request. in-14 F-4:
+   * the measured totals 35/43/60 become assertions at ~20% headroom (42/52/72) so a request-count
+   * regression fails this test instead of being logged past. The daemon is closed first so its
+   * ticks cannot land inside a measured window.
    */
   it("handoff wire requests at 5/10/20 batched checkpoints, split store/client (in-13b M-3)", async () => {
     await daemon?.close()
@@ -318,6 +319,8 @@ describe("the RPC request count of one session-start handoff (in-6 R2)", () => {
         expect(pendingAnchors(batchHome), "a batched save never anchored").toHaveLength(0)
       }
       let saved = 0
+      // in-14 F-4: the measured totals 35/43/60 become regression caps at ~20% headroom
+      const MAX_REQUESTS: Record<number, number> = { 5: 42, 10: 52, 20: 72 }
       for (const target of [5, 10, 20]) {
         for (; saved < target; saved++) {
           const agent = saved % 2 === 0 ? "claude-code" : "codex"
@@ -347,6 +350,8 @@ describe("the RPC request count of one session-start handoff (in-6 R2)", () => {
             `(store ${store} / client ${client}; read scope: ${readScopeProbe.hits} shared calls, ${readScopeProbe.misses} new questions)`,
         )
         console.log(`in-13b M-3 [${target}] breakdown: ${[...tally.entries()].sort().map(([key, n]) => `${key}=${n}`).join(" ")}`)
+        // the count is asserted now — a wire-request regression fails here, not just the log
+        expect(count, `handoff with ${target} batched checkpoints spent ${count} wire requests (cap ${MAX_REQUESTS[target]})`).toBeLessThanOrEqual(MAX_REQUESTS[target]!)
       }
     } finally {
       await runtime2.close()

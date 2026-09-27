@@ -114,6 +114,12 @@ export interface ContextApiOptions {
    * behaviour is unchanged. Present: the routes mount, gated inside by `batching.enabled`.
    */
   batching?: BatchingOptions
+  /**
+   * The name of THIS store's RPC-endpoint setting, used in CHAIN_MISCONFIGURED/RPC_AUTH_REJECTED
+   * hints (in-14 F-4): "RPC_URL" on the hosted worker, "network.json rpcUrl" on a midad laptop
+   * store. Default is a setting-neutral "RPC endpoint".
+   */
+  rpcHint?: string
 }
 
 type Env = { Variables: { signer: Address; body: Uint8Array; chain: BudgetedReader } }
@@ -230,7 +236,7 @@ export function createContextApi(options: ContextApiOptions) {
       // came — retryable, never an authorization refusal — and the header still asks for a pause
       return c.json({ error: { code: "CHAIN_UNAVAILABLE", message: error.message } }, 503, { "retry-after": "5" })
     }
-    const { status, body } = toErrorBody(error)
+    const { status, body } = toErrorBody(error, { rpcHint: options.rpcHint })
     return c.json(body, status as 400)
   })
 

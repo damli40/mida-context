@@ -50,6 +50,14 @@ export const DEVIN_PROJECT_DIR_ENV = "DEVIN_PROJECT_DIR"
  * throws. A failed lookup must be tellable apart from a real answer, because this feeds a
  * replay guard — not a permission check — and an unanswerable parent may never refuse a
  * real client.
+ *
+ * Known limits of the wall this feeds (in-14 F-4, documented not fixed): it is silently OFF
+ * where `ps` is missing or is a busybox build — busybox `ps` has no `-o comm=` and exits
+ * non-zero, which is indistinguishable from "the parent is not devin" by design. And it
+ * misses a Devin that launches the MCP server through a login shell or `npx` — the direct
+ * parent is then `sh`/`node`, never `devin`. Cost is a spawned `ps` per lookup, ~1.3 ms
+ * measured on macOS — acceptable because the call is lazy (only when the env wall did not
+ * already settle the question).
  */
 export function parentProcessBasename(pid: number = process.ppid): string | undefined {
   try {

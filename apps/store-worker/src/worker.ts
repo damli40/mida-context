@@ -251,7 +251,9 @@ function buildWorker(env: WorkerEnv): Built {
   const reader = new RegistryReader({ publicClient, deployment })
   const stores = d1Stores(env.DB)
   const batching = batchingOptions(env, deployment, publicClient)
-  const { app, limits } = createContextApi({ reader, deployment, stores, ...(batching === undefined ? {} : { batching }) })
+  // in-14 F-4: the hosted store's RPC endpoint is the RPC_URL variable — error hints name it
+  // explicitly rather than a neutral wording that would send the operator hunting
+  const { app, limits } = createContextApi({ reader, deployment, stores, rpcHint: "RPC_URL", ...(batching === undefined ? {} : { batching }) })
   built = { env, value: { app, reader, stores, deployment, limits } }
   return built.value
 }

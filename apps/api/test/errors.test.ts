@@ -63,20 +63,76 @@ describe("toErrorBody (in-6 R4)", () => {
       new ContractFunctionZeroDataError({ functionName: "getAgent" }),
       { abi: capabilityRegistryAbi, functionName: "getAgent", args: [], contractAddress: "0x2222222222222222222222222222222222222222" } as never,
     )
-    const { status, body } = toErrorBody(error)
+    // in-13b M-7: the hosted store is a Worker — its RPC endpoint is the RPC_URL variable, which
+    // it passes as its rpcHint (in-14 F-4). A message naming MONAD_TESTNET_RPC / network.json
+    // sends the operator looking in the wrong place (those are the owner's-side settings).
+    const { status, body } = toErrorBody(error, { rpcHint: "RPC_URL" })
     expect(status).toBe(502)
     expect(body.error.code).toBe("CHAIN_MISCONFIGURED")
-    // in-13b M-7: the store is a Worker — its RPC endpoint is the RPC_URL variable, and a
-    // message naming MONAD_TESTNET_RPC / network.json sends the operator looking in the
-    // wrong place (those are the owner's-side settings, which the store never reads).
     expect(body.error.message).toContain("RPC_URL")
     expect(body.error.message).not.toContain("MONAD_TESTNET_RPC")
     expect(body.error.message).not.toContain("network.json")
   })
 
+  // in-14 F-4: the same toErrorBody also serves the local persistent store, which has no RPC_URL
+  // — its RPC endpoint is the rpcUrl key in network.json. The hint is per-store, and a caller
+  // that declares none gets a neutral wording rather than a setting that does not exist there.
+  it("the RPC hint names the store's own setting — network.json rpcUrl on a laptop store, neutral with no hint", () => {
+    const error = new ContractFunctionExecutionError(
+      new ContractFunctionZeroDataError({ functionName: "getAgent" }),
+      { abi: capabilityRegistryAbi, functionName: "getAgent", args: [], contractAddress: "0x2222222222222222222222222222222222222222" } as never,
+    )
+    const local = toErrorBody(error, { rpcHint: "network.json rpcUrl" })
+    expect(local.body.error.message).toContain("network.json rpcUrl")
+    expect(local.body.error.message).not.toContain("RPC_URL")
+    const bare = toErrorBody(error)
+    expect(bare.body.error.message).toContain("RPC endpoint")
+    expect(bare.body.error.message).not.toContain("RPC_URL")
+    const auth = toErrorBody(new HttpRequestError({ url: "http://rpc.test", status: 401, body: {}, details: "no" }), { rpcHint: "network.json rpcUrl" })
+    expect(auth.body.error.message).toContain("network.json rpcUrl")
+    expect(auth.body.error.message).not.toContain("RPC_URL")
+  })
+
+  it("createContextApi threads the store's rpcHint into the wire answer", async () => {
+    // a misconfigured-RPC answer through the real route — the hint the store declared, verbatim
+    const reader = {
+      agentIdOfSigner: async () => {
+        throw new ContractFunctionExecutionError(
+          new ContractFunctionZeroDataError({ functionName: "getAgent" }),
+          { abi: capabilityRegistryAbi, functionName: "getAgent", args: [], contractAddress: "0x2222222222222222222222222222222222222222" } as never,
+        )
+      },
+      getAgent: async () => null,
+      getRecord: async () => null,
+      now: async () => NOW,
+      requiredReadEpoch: async () => 1n,
+      isWriteEpochValid: async () => true,
+    } as unknown as RegistryReader
+    const { app } = createContextApi({ reader, deployment, dataDir: mkdtempSync(join(tmpdir(), "mida-errors-")), clock: () => NOW, rpcHint: "network.json rpcUrl" })
+    let last: Response | undefined
+    const client = new ContextApiClient({
+      baseUrl: "http://mida.test",
+      account,
+      chainId: deployment.chainId,
+      capabilityRegistry: deployment.capabilityRegistry,
+      clock: () => NOW,
+      fetch: async (url, init) => {
+        const res = await app.request(url, init)
+        last = res.clone()
+        return res
+      },
+    })
+    const otherOwner = `0x${"9".repeat(40)}` as Address
+    await expect(client.request("GET", `/objects?owner=${otherOwner}&namespaceId=${NAMESPACE}`)).rejects.toMatchObject({ code: "CHAIN_MISCONFIGURED" })
+    expect(last!.status).toBe(502)
+    const body = (await last!.json()) as { error?: { message?: string } }
+    expect(body.error?.message).toContain("network.json rpcUrl")
+    expect(body.error?.message).not.toContain("RPC_URL")
+  })
+
   it("an RPC that refused the credential (401/403) answers 502 RPC_AUTH_REJECTED, naming the store's RPC_URL", () => {
     for (const s of [401, 403]) {
-      const { status, body } = toErrorBody(new HttpRequestError({ url: "http://rpc.test", status: s, body: {}, details: "no" }))
+      const { status, body } = toErrorBody(new HttpRequestError({ url: "http://rpc.test", status: s, body: {}, details: "no" }), { rpcHint: "RPC_URL" })
       expect(status, `status ${s}`).toBe(502)
       expect(body.error.code).toBe("RPC_AUTH_REJECTED")
       expect(body.error.message).toContain("RPC_URL")

@@ -42,15 +42,21 @@ export function statusFor(code: MidaErrorCode): number {
  * of those — the chain answered something unexpected — is 500 INTERNAL_ERROR rather than a 503
  * that would lie "unreachable". All still return no data (fail closed): the Sep 25 incident was
  * a busy RPC wearing CAPABILITY_DENIED.
+ *
+ * `options.rpcHint` names THIS store's RPC-endpoint setting in the operator hint (in-14 F-4):
+ * the hosted Worker's is the RPC_URL variable; the local persistent store's is the rpcUrl key in
+ * network.json. A caller that passes neither gets a setting-neutral hint rather than a name that
+ * store does not have.
  */
-export function toErrorBody(error: unknown): { status: number; body: ApiErrorBody } {
+export function toErrorBody(error: unknown, options?: { rpcHint?: string }): { status: number; body: ApiErrorBody } {
+  const rpcHint = options?.rpcHint ?? "RPC endpoint"
   if (isMidaError(error)) return { status: statusFor(error.code), body: { error: { code: error.code, message: error.message } } }
   const kind = chainErrorKind(error)
   if (kind === "misconfigured") {
-    return { status: 502, body: { error: { code: "CHAIN_MISCONFIGURED", message: "the RPC answered but found no Mida contract — check the store's RPC_URL setting" } } }
+    return { status: 502, body: { error: { code: "CHAIN_MISCONFIGURED", message: `the RPC answered but found no Mida contract — check the store's ${rpcHint} setting` } } }
   }
   if (kind === "rpc-auth") {
-    return { status: 502, body: { error: { code: "RPC_AUTH_REJECTED", message: "the RPC provider refused the key — check the store's RPC_URL setting" } } }
+    return { status: 502, body: { error: { code: "RPC_AUTH_REJECTED", message: `the RPC provider refused the key — check the store's ${rpcHint} setting` } } }
   }
   if (kind === "busy") {
     return { status: 503, body: { error: { code: "CHAIN_UNAVAILABLE", message: "the chain could not answer right now — retry in a moment" } } }
