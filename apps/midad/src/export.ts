@@ -489,7 +489,7 @@ function newestCheckpointIds(records: readonly SourceRecord[]): Set<string> {
       ...(envelope.task === undefined ? {} : { task: envelope.task }),
       ...(envelope.migration === undefined ? {} : { migration: envelope.migration }),
     }
-    const key = `${envelope.projectId}${taskOf(stored)}`
+    const key = `${envelope.projectId}\0${taskOf(stored)}`
     const list = byThread.get(key)
     if (list === undefined) byThread.set(key, [stored])
     else list.push(stored)

@@ -947,6 +947,44 @@ describe("mida export — the written folder", () => {
     expect(md).toContain("the checkpoint a handoff for this task opens with")
   })
 
+  it("project ids and task names that collide without the separator still flag both heads (in-21 N-1)", async () => {
+    // The grouping key is projectId + NUL + task. Without the NUL, project "ab" task "c" and
+    // project "a" task "bc" both hash to "abc" — one merged thread whose mixed projectIds make
+    // mergeCheckpoints throw, so a collide-able pair fails the whole export.
+    const checkpoint = (eventId: string, sessionId: string, projectId: string, task: string) => ({
+      v: 1 as const,
+      value: { ...wrapCheckpoint({
+        projectId,
+        sessionId,
+        continuesSession: null,
+        compiledBy: "t",
+        checkpoint: sampleCheckpoint({ eventId }),
+        task,
+      }) } as Record<string, unknown>,
+      kind: "EPISODE" as const,
+      provenance: { source: "AGENT_INFERRED" as const },
+    })
+    const earlier = fixtureRecord({
+      kind: 5,
+      createdAt: 1_700_000_000n,
+      payload: checkpoint("cp-collide-1", "s1", "ab", "c"),
+    })
+    const later = fixtureRecord({
+      kind: 5,
+      createdAt: 1_700_001_000n,
+      payload: checkpoint("cp-collide-2", "s2", "a", "bc"),
+    })
+    const { dest } = await exportWith([earlier, later])
+    const entries = JSON.parse(readFileSync(join(dest, "records.json"), "utf8")) as ExportEntry[]
+    const e1 = entries.find((e) => e.contextId === earlier.contextId)!
+    const e2 = entries.find((e) => e.contextId === later.contextId)!
+    // distinct threads — each head is the checkpoint its own handoff opens with
+    expect(e1.newestCheckpoint).toBe(true)
+    expect(e2.newestCheckpoint).toBe(true)
+    expect(e1.task).toBe("c")
+    expect(e2.task).toBe("bc")
+  })
+
   it("the encrypted files are the store's bytes — manifest hashes to manifestHash", async () => {
     const record = fixtureRecord()
     const { dest } = await exportWith([record])
