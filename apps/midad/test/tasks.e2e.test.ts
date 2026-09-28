@@ -194,18 +194,22 @@ describe("named tasks on local Anvil (tk-1)", () => {
     }
     const log = drainLog()
     expect(log).toContain('"sessionId":"sess-a"')
-    const aLine = log.split("\n").find((line) => line.includes('"sessionId":"sess-a"') && line.includes('"outcome":"saved"'))!
-    const bLine = log.split("\n").find((line) => line.includes('"sessionId":"sess-b"') && line.includes('"outcome":"saved"'))!
-    expect(aLine).toContain('"task":"sdk"')
-    expect(bLine).toContain('"task":"grant-app"')
+    expect(log).toContain('"sessionId":"sess-b"')
+    // the task no longer appears in the log at all (in-18 N1) — it lives only inside each
+    // sealed envelope, so the pin's truth is read back through the tasks' own handoffs
 
-    // and the saved checkpoints file under those tasks: the sdk handoff holds sess-a's compiled
-    // objective, never sess-b's
+    // the saved checkpoints file under those tasks: the sdk handoff holds sess-a's compiled
+    // objective, never sess-b's — and grant-app's holds sess-b's, never sess-a's
     const sdkHandoff = await handoff("codex", workDir, "sess-check-a", "sdk")
     expect(sdkHandoff.kind).toBe("handoff")
     if (sdkHandoff.kind !== "handoff") return
     expect(sdkHandoff.text).toContain("objective-for-sess-a")
     expect(sdkHandoff.text).not.toContain("objective-for-sess-b")
+    const gaHandoff = await handoff("codex", workDir, "sess-check-b", "grant-app")
+    expect(gaHandoff.kind).toBe("handoff")
+    if (gaHandoff.kind !== "handoff") return
+    expect(gaHandoff.text).toContain("objective-for-sess-b")
+    expect(gaHandoff.text).not.toContain("objective-for-sess-a")
   }, STEP_TIMEOUT * 2)
 
   it("(d) `mida task` sets the folder default, lists tasks, shows one task read-only, and clears", async () => {
