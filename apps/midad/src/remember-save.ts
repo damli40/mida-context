@@ -284,7 +284,7 @@ export async function buildRemember(runtime: ServiceRuntime, record: unknown, de
   // consumes a slot, and reserved before the send so a second call during a slow write still
   // refuses. A write that never landed frees its slot.
   let slot = `${laneKind}\n${agent}`
-  let admittedAt = 0
+  let reservation = 0
   const admit = (lane: "direct" | "batched"): RememberSaveResult | null => {
     const key = `${lane}\n${agent}`
     const admitted = (admittedSaves.get(key) ?? []).filter((stamp) => now() - stamp < REMEMBER_WINDOW_MS)
@@ -299,14 +299,21 @@ export async function buildRemember(runtime: ServiceRuntime, record: unknown, de
       )
     }
     slot = key
-    admittedAt = now()
-    admitted.push(admittedAt)
+    // one reservation = one stamp, unique in the window: two calls admitted inside the same
+    // millisecond must never share it, or releasing one would free them both (in-22 V-5)
+    let stamp = now()
+    while (admitted.includes(stamp)) stamp += 1
+    reservation = stamp
+    admitted.push(stamp)
     admittedSaves.set(key, admitted)
     return null
   }
   const release = () => {
-    const without = (admittedSaves.get(slot) ?? []).filter((candidate) => candidate !== admittedAt)
-    admittedSaves.set(slot, without)
+    const stamps = admittedSaves.get(slot) ?? []
+    const idx = stamps.indexOf(reservation)
+    // splice exactly this call's reservation — never every stamp that happens to equal it
+    if (idx !== -1) stamps.splice(idx, 1)
+    admittedSaves.set(slot, stamps)
   }
   const tooSoon = admit(laneKind)
   if (tooSoon !== null) return tooSoon

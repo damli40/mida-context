@@ -317,6 +317,28 @@ describe("buildRemember — the daemon's /remember route", () => {
     expect(retried.kind).toBe("saved")
   })
 
+  it("two reservations in the same millisecond are distinct — a release frees only its own (in-22 V-5)", async () => {
+    const admittedSaves = new Map<string, number[]>()
+    const batched = { kind: "batched", storeUrl: "http://store", batchAnchor: "0x00000000000000000000000000000000000000bb" } as const
+    const body = { agent: "codex", namespace: FACT, content: "x" }
+    const rt = runtime()
+    // a frozen clock makes every reservation land on the same stamp
+    const deps = (over: Partial<RememberDeps> = {}) =>
+      okDeps({ lane: async () => batched, admittedSaves, now: () => 1_700_000_000_000, ...over })
+    expect((await buildRemember(rt, body, deps())).kind).toBe("saved")
+    expect((await buildRemember(rt, body, deps())).kind).toBe("saved")
+    const key = "batched\ncodex"
+    expect(admittedSaves.get(key)).toHaveLength(2)
+    // the third write fails — its release must free its own reservation and no one else's
+    const failed = await buildRemember(
+      rt,
+      body,
+      deps({ createBatched: async () => { throw new MidaError("CHAIN_UNAVAILABLE", "down") } }),
+    )
+    expect(failed.kind).toBe("refused")
+    expect(admittedSaves.get(key)).toHaveLength(2)
+  })
+
   it("chain-side answers mid-save map to the same refusals the gates print", async () => {
     const revoked = await call({ create: async () => { throw new MidaError("CAPABILITY_REVOKED", "revoked") } })
     expect(revoked).toMatchObject({ kind: "refused", reason: "revoked" })
