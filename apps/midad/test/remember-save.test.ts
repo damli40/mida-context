@@ -454,6 +454,25 @@ describe("buildRemember — the daemon's /remember route", () => {
     expect(stillStale()).toBe(true)
   })
 
+  // in-24 (review N-2): the touch refreshes the caller's own SDK session only — `sdk-<agent>-`
+  // exactly and case-sensitively, the shape local.ts mints. Any other safe name is accepted as
+  // transport metadata and touches nothing.
+  it("a session id that belongs to another agent touches nothing", async () => {
+    const dir = home()
+    const { stillStale } = staleSession(dir, "sdk-claude-bbbbbbbb")
+    const result = await call({}, { sessionId: "sdk-claude-bbbbbbbb" }, dir)
+    expect(result.kind).toBe("saved")
+    expect(stillStale()).toBe(true)
+  })
+
+  it("an upper-cased session id touches nothing", async () => {
+    const dir = home()
+    const { stillStale } = staleSession(dir, "SDK-CODEX-A1B2C3D4")
+    const result = await call({}, { sessionId: "SDK-CODEX-A1B2C3D4" }, dir)
+    expect(result.kind).toBe("saved")
+    expect(stillStale()).toBe(true)
+  })
+
   it("the namespace the chain is asked about is the canonicalized one the caller named", async () => {
     const asked: string[] = []
     await call(

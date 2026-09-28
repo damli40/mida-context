@@ -324,10 +324,13 @@ export async function buildRemember(runtime: ServiceRuntime, record: unknown, de
   // not have stays absent, a bad id touches nothing, and the id never lands in the record.
   // in-24 (review N-1): the touch means "the session just did a write", so it runs only on
   // the saved paths below — a refusal or a failed send refreshes nothing.
+  // in-24 (review N-2): and only for the caller's own SDK session — `sdk-<agent>-` exactly as
+  // local.ts mints it, case-sensitive; any other safe name is metadata and touches nothing.
   const touchSession = () => {
-    if (typeof record.sessionId === "string" && isSafeName(record.sessionId)) {
+    const sid = record.sessionId
+    if (typeof sid === "string" && isSafeName(sid) && sid.startsWith(`sdk-${agent}-`)) {
       for (const folder of ["tasks", "lastseen", "continues"]) {
-        runtime.home.touch(`state/${folder}/${record.sessionId}.json`)
+        runtime.home.touch(`state/${folder}/${sid}.json`)
       }
     }
   }
