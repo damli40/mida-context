@@ -102,7 +102,7 @@ export const CLI_COMMANDS: readonly string[] = ["init", "install", "add-agent", 
  */
 export const OWNER_COMMANDS: readonly string[] = ["init", "install", "add-agent", "approve", "revoke", "remember", "migrate", "batching", "link", "unlink", "project", "export"]
 /** The owner commands that must see a real terminal. `init` is exempt: it grants nothing to an agent. */
-const TERMINAL_COMMANDS: readonly string[] = ["install", "add-agent", "approve", "revoke", "remember", "migrate", "batching", "link", "unlink", "project", "export"]
+export const TERMINAL_COMMANDS: readonly string[] = ["install", "add-agent", "approve", "revoke", "remember", "migrate", "batching", "link", "unlink", "project", "export"]
 export const NEEDS_TERMINAL_LINE = "needs-terminal: run this yourself in a terminal window"
 
 /** What the daemon answers when an owner command reaches /cli anyway. */
@@ -520,6 +520,9 @@ async function runTaskCommand(
       authorNames: authorNamesFor(runtime),
       task: name,
     })
+    // the read borrowed an approved agent's identity — name it, so the answer's provenance is
+    // never implicit (in-18 N3)
+    print(`(read as ${picked.agent})`)
     print(result.text)
     return result.kind === "refused" ? 1 : 0
   }
@@ -1121,6 +1124,9 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
   // a single approve's project preview shows, and a no-permission agent its fix.
   const ready: string[] = []
   const failed: string[] = []
+  // the live-grant sweep the batch adds to this folder (in-18 N2) — counted for the summary
+  // line the owner reads right above the yes
+  const gainingFolder: string[] = []
   for (const { name, kind } of batch) {
     if (kind === "noperm") {
       deps.print(`${name}: no permission yet — run \`mida request ${name}\` first`)
@@ -1129,6 +1135,7 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
     if (kind === "folder") {
       deps.print(`${name} already holds a live grant; this lists it for project ${marker!.projectId} (this folder)`)
       ready.push(name)
+      gainingFolder.push(name)
       continue
     }
     printPendingAsk(deps, runtime.home, name, marker?.projectId)
@@ -1149,6 +1156,11 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
     return 1
   }
   deps.print("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
+  // N2: when the sweep adds live-grant agents to this folder, name them in the line the owner
+  // reads last — right above the yes
+  if (gainingFolder.length > 0) {
+    deps.print(`${gainingFolder.length} agent${gainingFolder.length === 1 ? "" : "s"} will gain this folder: ${gainingFolder.join(", ")}`)
+  }
   const prompt = deps.prompt ?? terminalPrompt
   const drain = deps.drainInput ?? drainBufferedStdin
   await drain()
@@ -1842,6 +1854,7 @@ async function passkeyApproveAll(session: ServiceRuntime, deps: CliDeps, linkDep
   // One combined preview in agent order, same as software mode: a pending request shows its
   // ask, a live grant its folder line, a no-permission agent its fix — never a failure.
   const agents: string[] = []
+  const gainingFolder: string[] = []
   for (const { name, kind } of batch) {
     if (kind === "noperm") {
       deps.print(`${name}: no permission yet — run \`mida request ${name}\` first`)
@@ -1850,12 +1863,17 @@ async function passkeyApproveAll(session: ServiceRuntime, deps: CliDeps, linkDep
     if (kind === "folder") {
       deps.print(`${name} already holds a live grant; this lists it for project ${marker!.projectId} (this folder)`)
       agents.push(name)
+      gainingFolder.push(name)
       continue
     }
     printPendingAsk(deps, session.home, name, marker?.projectId)
     agents.push(name)
   }
   deps.print("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
+  // same N2 summary as the software path — the live-grant sweep is named above the yes
+  if (gainingFolder.length > 0) {
+    deps.print(`${gainingFolder.length} agent${gainingFolder.length === 1 ? "" : "s"} will gain this folder: ${gainingFolder.join(", ")}`)
+  }
   const prompt = deps.prompt ?? terminalPrompt
   const drain = deps.drainInput ?? drainBufferedStdin
   await drain()

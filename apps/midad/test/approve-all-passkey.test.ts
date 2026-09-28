@@ -311,6 +311,9 @@ describe("mida approve --all on a passkey home (I3)", () => {
       expect(lines).toContain(`${name} already holds a live grant; this lists it for project ${projectIdB} (this folder)`)
       expect(lines).toContain(`${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`)
     }
+    // N2: same summary line as the software path — the sweep's count sits right above the yes
+    const plainText = lines.indexOf("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
+    expect(lines[plainText + 1]).toBe("2 agents will gain this folder: claude-code, codex")
     expect(lines.at(-1)).toBe("approved: claude-code, codex")
     const list = home.readJson<{ entries: ProjectApproval[] }>("approved-projects.json")
     const rootB = realpathSync.native(folderB)

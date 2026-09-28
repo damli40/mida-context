@@ -9,7 +9,7 @@ import { BaseError, HttpRequestError } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, runDoctor, FileAccessRequestStore, saveAgentIdentity } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, runDoctor, FileAccessRequestStore, saveAgentIdentity, CLI_COMMANDS, OWNER_COMMANDS, TERMINAL_COMMANDS } from "@mida/midad"
 import type { AgentIdentity, Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
@@ -849,6 +849,9 @@ describe("the crude mida command", () => {
       expect(lines).toContain(`${name} already holds a live grant; this lists it for project ${projectId} (this folder)`)
       expect(lines).toContain(`${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`)
     }
+    // N2: the sweep the yes covers is counted and named on the line right above it
+    const plainText = lines.indexOf("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
+    expect(lines[plainText + 1]).toBe("2 agents will gain this folder: claude-code, codex")
     expect(lines.at(-1)).toBe("approved: claude-code, codex")
     // both rows landed in the owner-signed list for THIS folder's project
     const root = realpathSync.native(newDir)
@@ -913,6 +916,8 @@ describe("the crude mida command", () => {
     expect(lines.some((line) => line === "codex is asking for:")).toBe(true)
     expect(lines).toContain(`claude-code already holds a live grant; this lists it for project ${projectId} (this folder)`)
     expect(lines).toContain("zzz-agent: no permission yet — run `mida request zzz-agent` first")
+    // N2: only the live-grant agent is counted — the pending request is what --all always meant
+    expect(lines).toContain("1 agent will gain this folder: claude-code")
     // the yes covers the pending grant and the folder listing alike
     expect(lines.some((line) => line.startsWith("approved codex tx "))).toBe(true)
     expect(lines).toContain("claude-code is already approved on chain. This folder is now approved for claude-code too (no transaction).")
@@ -2000,4 +2005,24 @@ describe("the dev launcher bin/mida (in-15 J-8)", () => {
     expect(loaded.code).toBe(0)
     expect(loaded.stdout).toContain("sentinel=spaced")
   }, 60_000)
+})
+
+// in-18: the three command tables' membership is part of the trust model — `task` reads
+// checkpoints so it may run through the daemon (/cli) but never as an owner or bare-terminal
+// command; `add-agent` and `export` stay owner + terminal + listed. Pinned so a later command
+// move cannot silently widen what the socket or a non-terminal will run.
+describe("the command tables' membership is pinned (in-18)", () => {
+  it("task is a daemon-routable command but never an owner or terminal command", () => {
+    expect(CLI_COMMANDS).toContain("task")
+    expect(OWNER_COMMANDS).not.toContain("task")
+    expect(TERMINAL_COMMANDS).not.toContain("task")
+  })
+
+  it("add-agent and export are listed, owner-only and terminal-bound", () => {
+    for (const command of ["add-agent", "export"]) {
+      expect(CLI_COMMANDS).toContain(command)
+      expect(OWNER_COMMANDS).toContain(command)
+      expect(TERMINAL_COMMANDS).toContain(command)
+    }
+  })
 })

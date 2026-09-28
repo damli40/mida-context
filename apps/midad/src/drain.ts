@@ -465,7 +465,6 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             outcome: "queued",
             lane: "batched",
             eventId,
-            task,
             contextId: saved.contextId,
             model: envelope.compiledBy,
             compileMs: compileMeta.compileMs,
@@ -492,7 +491,6 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           // the store was disabled, unreachable, or the lane check itself failed
           ...(saved.laneWhy !== undefined ? { laneWhy: saved.laneWhy } : {}),
           eventId,
-          task,
           // the model that actually wrote the checkpoint — a fallback save names the fallback
           model: envelope.compiledBy,
           compileMs: compileMeta.compileMs,

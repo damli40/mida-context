@@ -913,6 +913,16 @@ describe("the saved log line carries the compile and save facts (C4)", () => {
     expect(Array.isArray(saved.droppedKeys)).toBe(true)
   })
 
+  it("a named-task save logs no task — the task lives only inside the sealed envelope (in-18 N1)", async () => {
+    const { job, drain, drainLog, saveCalls } = setup()
+    job({ event: "Stop", task: "sdk" }, T0)
+    await drain({ now: () => new Date(T0 + 120_000) })
+    const saved = savedLines(drainLog).at(-1)!
+    expect("task" in saved).toBe(false)
+    // the task itself is not lost — it rides the sealed checkpoint to the store
+    expect(saveCalls.at(-1)).toMatchObject({ task: "sdk" })
+  })
+
   it("a compile that reports provider cache numbers logs cacheHit/cacheMiss (M3-H)", async () => {
     const { job, drain, drainLog } = setup()
     const compile: typeof compileCheckpoint = async (input) => ({

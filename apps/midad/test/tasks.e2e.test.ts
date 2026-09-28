@@ -232,6 +232,8 @@ describe("named tasks on local Anvil (tk-1)", () => {
     }
     const show = await cli("task", "show", "sdk")
     expect(show.code).toBe(0)
+    // the read ran under an approved agent's identity and the output says which (in-18 N3)
+    expect(show.lines[0]).toBe("(read as claude-code)")
     const shown = show.lines.join("\n")
     // the sdk thread — its newest chain is sess-a's drain save from (c); the named task's own
     // text only, nothing from grant-app or main
