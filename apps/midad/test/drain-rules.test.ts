@@ -1353,8 +1353,28 @@ describe("the drain pass sweeps month-old SDK session files (in-21 U-4)", () => 
     }
     await drain()
     expect(home.list("state/tasks")).toHaveLength(5)
-    await drain()
+    // housekeeping is hourly (in-22 N-D): the next sweep needs the clock to have moved on
+    await drain({ now: () => new Date(T0 + 120_000 + 61 * 60 * 1000) })
     expect(home.list("state/tasks")).toHaveLength(0)
+  })
+
+  it("the sweep runs at most once an hour per process — not on every 15 s pass (in-22 N-D)", async () => {
+    const { home, drain } = setup()
+    const stamp = (rel: string) => {
+      home.writeSecretJson(rel, { stale: true })
+      const at = new Date(T0 - 40 * DAY)
+      fs.utimesSync(home.path(rel), at, at)
+    }
+    stamp("state/tasks/sdk-first.json")
+    await drain()
+    expect(home.has("state/tasks/sdk-first.json")).toBe(false)
+    // a stale file that lands between passes is NOT swept fifteen seconds later …
+    stamp("state/tasks/sdk-second.json")
+    await drain({ now: () => new Date(T0 + 120_000 + 15_000) })
+    expect(home.has("state/tasks/sdk-second.json")).toBe(true)
+    // … and IS swept once the hour has passed
+    await drain({ now: () => new Date(T0 + 120_000 + 61 * 60 * 1000) })
+    expect(home.has("state/tasks/sdk-second.json")).toBe(false)
   })
 
   // in-22 V-2 (G-2), promoted from zz-rvfix2-sweep-live-session: the sweep must not strand a
@@ -1380,6 +1400,73 @@ describe("the drain pass sweeps month-old SDK session files (in-21 U-4)", () => 
     expect(home.has(`state/tasks/${dead}.json`)).toBe(false)
     expect(resolveSessionTask(home, { sessionId: live, projectId: "p-1", cwd }))
       .toEqual({ task: "alpha", source: "session" })
+  })
+
+  // in-22 V-3 (G-3) — a malformed entry under state/* must never abort the pass: a directory
+  // that merely LOOKS like a session file, a link that points outside the home, and a file the
+  // pass cannot remove are each skipped and counted while the queued job still drains.
+  it("a directory named sdk-*.json is skipped, not removed — and the queued job still saves", async () => {
+    const { home, drain, drainLog, job } = setup()
+    mkdirSync(home.path("state/tasks/sdk-dir.json"), { recursive: true })
+    const old = new Date(T0 - 40 * DAY)
+    fs.utimesSync(home.path("state/tasks/sdk-dir.json"), old, old)
+    // a genuinely stale file proves the sweep still ran around the bad entry
+    const stale = "state/tasks/sdk-stale.json"
+    home.writeSecretJson(stale, { stale: true })
+    fs.utimesSync(home.path(stale), old, old)
+    job({ event: "Stop" }, T0)
+    const result = await drain()
+    expect(result.saved).toBe(1)
+    expect(fs.lstatSync(home.path("state/tasks/sdk-dir.json")).isDirectory()).toBe(true)
+    expect(home.has(stale)).toBe(false)
+  })
+
+  it("a sdk- link pointing outside the home is never followed — the target survives and the job saves", async () => {
+    const { dir, home, drain, drainLog, job } = setup()
+    const outside = join(dir, "outside.json")
+    writeFileSync(outside, "keep me")
+    mkdirSync(home.path("state/lastseen"), { recursive: true })
+    symlinkSync(outside, join(home.root, "state", "lastseen", "sdk-old.json"))
+    job({ event: "Stop" }, T0)
+    const result = await drain()
+    expect(result.saved).toBe(1)
+    // the link itself is left alone, and the file it pointed at is untouched
+    expect(fs.lstatSync(join(home.root, "state", "lastseen", "sdk-old.json")).isSymbolicLink()).toBe(true)
+    expect(readFileSync(outside, "utf8")).toBe("keep me")
+    expect(drainLog()).toContain("session-sweep-skipped")
+  })
+
+  it("a stale file the sweep cannot remove is skipped and counted — the pass still saves", async () => {
+    const { home, drain, drainLog, job } = setup()
+    const stuck = "state/tasks/sdk-stuck.json"
+    home.writeSecretJson(stuck, { stale: true })
+    const old = new Date(T0 - 40 * DAY)
+    fs.utimesSync(home.path(stuck), old, old)
+    // unlink needs write on the folder — read-only leaves the file in place and throws EPERM
+    fs.chmodSync(home.path("state/tasks"), 0o500)
+    try {
+      job({ event: "Stop" }, T0)
+      const result = await drain()
+      expect(result.saved).toBe(1)
+      expect(home.has(stuck)).toBe(true)
+      expect(drainLog()).toContain("session-sweep-skipped")
+    } finally {
+      fs.chmodSync(home.path("state/tasks"), 0o700)
+    }
+  })
+
+  it("a housekeeping step that throws is logged once — and the pass still saves the queued job", async () => {
+    const { dir, home, drain, drainLog, job } = setup()
+    // queue/bad as a link to outside the home makes home.list throw inside pruneQueue — before
+    // the sweep even starts. The wrapper absorbs it; the queue below still drains.
+    const outside = join(dir, "outside")
+    mkdirSync(outside, { recursive: true })
+    mkdirSync(join(home.root, "queue"), { recursive: true })
+    symlinkSync(outside, join(home.root, "queue", "bad"))
+    job({ event: "Stop" }, T0)
+    const result = await drain()
+    expect(result.saved).toBe(1)
+    expect(drainLog()).toContain("housekeeping-failed")
   })
 })
 

@@ -1,5 +1,5 @@
 import * as fs from "node:fs"
-import { statSync } from "node:fs"
+import { lstatSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { createPublicClient } from "viem"
 import { sha256 } from "@noble/hashes/sha2.js"
@@ -61,6 +61,9 @@ const LOG_KEEP_BYTES = 1024 * 1024
 const SESSION_STATE_DIRS = ["state/tasks", "state/lastseen", "state/continues"] as const
 const SESSION_STATE_MAX_AGE_MS = 30 * DAY_MS
 const SESSION_STATE_MAX_REMOVALS = 500
+/** Housekeeping is housekeeping, not the pass: at most once an hour per process (in-22 N-D). */
+const HOUSEKEEPING_INTERVAL_MS = 60 * 60 * 1000
+const lastHousekeepingAt = new WeakMap<MidaHome, number>()
 /** How much of a failed provider answer a drain log line may quote — scrubbed first, then cut. */
 const LOG_SAMPLE_CHARS = 120
 
@@ -252,7 +255,16 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
     return ok
   }
 
-  pruneQueue(deps.home, now)
+  // Housekeeping runs at most once an hour per process — a drain pass every 15 s does not need
+  // a sweep every pass (in-22 N-D). And it can never starve the queue: one malformed entry or
+  // one failed sweep is logged once and the pass still saves (in-22 V-3).
+  if (housekeepingDue(deps.home, now)) {
+    try {
+      pruneQueue(deps.home, now)
+    } catch {
+      log({ outcome: "note", reason: "housekeeping-failed" })
+    }
+  }
 
   const bySession = new Map<string, CaptureJob[]>()
   for (const job of listJobs(deps.home)) {
@@ -861,11 +873,12 @@ function writeState(home: MidaHome, sessionId: string, state: SessionState): voi
 }
 
 /**
- * Housekeeping on every drain: `queue/bad` and `queue/compiled` entries older than a week, stray
- * `.tmp` files older than an hour, session-state files (`state/tasks`, `state/lastseen`,
- * `state/continues`) untouched for a month — at most 500 a pass — and any JSONL log grown past
- * 5 MB cut back to its last 1 MB (starting at a line boundary so every kept line is a whole
- * record). Nothing here throws.
+ * Housekeeping, run at most once an hour per process: `queue/bad` and `queue/compiled` entries
+ * older than a week, stray `.tmp` files older than an hour, sdk- session-state files
+ * (`state/tasks`, `state/lastseen`, `state/continues`) untouched for a month — at most 500 a
+ * pass — and any JSONL log grown past 5 MB cut back to its last 1 MB (starting at a line
+ * boundary so every kept line is a whole record). The caller wraps the whole step so a failure
+ * here is logged once and never starves the queue below it.
  */
 function pruneQueue(home: MidaHome, now: () => Date): void {
   const nowMs = now().getTime()
@@ -914,16 +927,42 @@ function pruneQueue(home: MidaHome, now: () => Date): void {
   // session source — so the sweep takes sdk- files ONLY and leaves hook and MCP session files
   // alone. Thirty days idle is past any resume, and "idle" means last USE: every successful
   // read of one of these files refreshes its mtime, so a live SDK handle is never swept.
+  // in-22 V-3 (G-3): entries are judged by lstat — a directory, a link, or anything whose stat
+  // or removal throws is skipped and counted, never followed and never fatal to the pass.
   let swept = 0
+  let skipped = 0
   for (const dir of SESSION_STATE_DIRS) {
-    for (const name of home.list(dir)) {
-      if (swept >= SESSION_STATE_MAX_REMOVALS) return
-      if (name.startsWith("sdk-") && name.endsWith(".json") && olderThan(home.path(`${dir}/${name}`), SESSION_STATE_MAX_AGE_MS)) {
-        home.remove(`${dir}/${name}`)
+    let names: string[]
+    try {
+      names = home.list(dir)
+    } catch {
+      skipped += 1
+      continue
+    }
+    for (const name of names) {
+      if (swept >= SESSION_STATE_MAX_REMOVALS) break
+      if (!name.startsWith("sdk-") || !name.endsWith(".json")) continue
+      try {
+        const rel = `${dir}/${name}`
+        const stat = lstatSync(home.path(rel))
+        if (!stat.isFile() || nowMs - stat.mtimeMs <= SESSION_STATE_MAX_AGE_MS) continue
+        home.remove(rel)
         swept += 1
+      } catch {
+        skipped += 1
       }
     }
   }
+  if (skipped > 0) appendLog(home, "drain", { outcome: "note", reason: "session-sweep-skipped", skipped })
+}
+
+/** True once an hour per home per process — the 15 s drain loop pays for a sweep hourly, not per pass. */
+function housekeepingDue(home: MidaHome, now: () => Date): boolean {
+  const at = now().getTime()
+  const last = lastHousekeepingAt.get(home)
+  if (last !== undefined && at - last < HOUSEKEEPING_INTERVAL_MS) return false
+  lastHousekeepingAt.set(home, at)
+  return true
 }
 
 /** A transcript that no longer stats is sized 0 — the caller has already decided the job is done. */
