@@ -45,7 +45,7 @@ export async function decideLane(input: {
   saved: SavedNetwork | undefined
   deployment: Deployment
   storageUrl: string | undefined
-  status: () => Promise<{ enabled: boolean; batchAnchor: Address } | null>
+  status: () => Promise<{ enabled: boolean; batchAnchor?: Address } | null>
 }): Promise<Lane> {
   if (input.saved?.batching !== true) return { kind: "direct", why: "switch-off" }
   const batchAnchor = input.deployment.batchAnchor
@@ -53,7 +53,10 @@ export async function decideLane(input: {
   if (input.storageUrl === undefined) return { kind: "direct", why: "local-store" }
   const answer = await input.status().catch(() => null)
   if (answer === null) return { kind: "direct", why: "store-unreachable" }
-  if (answer.enabled !== true || answer.batchAnchor.toLowerCase() !== batchAnchor.toLowerCase()) {
+  // The anchor is optional on the wire: a lane degraded at boot (in-20 T-1) may answer
+  // enabled:false with none, and a malformed body claiming enabled:true but carrying no
+  // usable anchor must never throw mid-decision — it is simply not offering batching here.
+  if (answer.enabled !== true || typeof answer.batchAnchor !== "string" || answer.batchAnchor.toLowerCase() !== batchAnchor.toLowerCase()) {
     return { kind: "direct", why: "store-disabled" }
   }
   return { kind: "batched", storeUrl: input.storageUrl, batchAnchor }
@@ -233,6 +236,9 @@ function setPendingAnchorStuck(home: MidaHome, contextId: Hex, code: string): vo
  */
 const RESUBMIT_STUCK_TEXT: Record<string, { what: string; fix: (keptAt?: string) => string }> = {
   BATCHING_DISABLED: { what: "the store is no longer offering batching", fix: () => "it is being resent on its own transaction — no action needed" },
+  // in-20 T-1: the lane's own configuration failed at the store's boot — a closed lane, not a
+  // save the store judged. The resubmit rides the direct lane exactly like BATCHING_DISABLED.
+  BATCH_UNAVAILABLE: { what: "the store's batch lane is unavailable — its batching configuration is invalid", fix: () => "it is being resent on its own transaction — no action needed" },
   OWNER_NOT_ALLOWED: { what: "the save's owner is not allowed to write to this store", fix: () => "it is being resent on its own transaction — no action needed" },
   TOO_LARGE: { what: "the save does not fit in a batch", fix: (keptAt) => `its text is kept on this laptop at ${keptAt ?? "the kept-plaintext ledger"} — the save can never land as it is; this is a bug to report` },
   BAD_SHAPE: { what: "the save's fields are malformed for a batched save", fix: (keptAt) => `its text is kept on this laptop at ${keptAt ?? "the kept-plaintext ledger"} — the save can never land as it is; this is a bug to report` },
@@ -291,6 +297,7 @@ const RESUBMIT_AUTHORITY_FINAL = new Set([
  */
 const RESUBMIT_STUCK = new Set([
   "BATCHING_DISABLED",
+  "BATCH_UNAVAILABLE",
   "OWNER_NOT_ALLOWED",
   "TOO_LARGE",
   "BAD_SHAPE",
@@ -304,7 +311,7 @@ const RESUBMIT_STUCK = new Set([
  * re-POSTed can never land, so the resubmit takes the direct lane instead, and doctor phrases
  * the mark as a closed lane, not a save that cannot be resubmitted.
  */
-export const RESUBMIT_LANE_CLOSED = new Set(["BATCHING_DISABLED", "OWNER_NOT_ALLOWED"])
+export const RESUBMIT_LANE_CLOSED = new Set(["BATCHING_DISABLED", "BATCH_UNAVAILABLE", "OWNER_NOT_ALLOWED"])
 
 /** A stuck save is worth one fresh attempt an hour, not one POST per drain pass. */
 const RESUBMIT_STUCK_INTERVAL_MS = 60 * 60 * 1000
@@ -382,15 +389,20 @@ function recordRejectedAnchor(home: MidaHome, entry: PendingAnchor, reason: stri
  * The store's unsigned batching status — `GET /batch/status` needs no signature, so the CLI and
  * doctor can ask it without a signer. Any failure (down, refused, malformed body) is null: the
  * caller cannot tell "off" from "unreachable" on a dead store, and null is what `decideLane` maps
- * to `store-unreachable`.
+ * to `store-unreachable`. The anchor may legitimately be ABSENT — a boot-degraded lane carries
+ * none (in-20 T-1) — so it stays optional and callers compare it only when it is a string.
  */
-export async function batchStatusProbe(storeUrl: string): Promise<{ enabled: boolean; batchAnchor: Address } | null> {
+export async function batchStatusProbe(storeUrl: string): Promise<{ enabled: boolean; batchAnchor?: Address } | null> {
   try {
     const reply = await fetch(`${storeUrl.replace(/\/+$/, "")}/batch/status`, { signal: AbortSignal.timeout(2_000) })
     if (!reply.ok) return null
     const body = (await reply.json()) as { enabled?: unknown; batchAnchor?: unknown }
-    if (typeof body.enabled !== "boolean" || typeof body.batchAnchor !== "string") return null
-    return { enabled: body.enabled, batchAnchor: body.batchAnchor as Address }
+    if (typeof body.enabled !== "boolean") return null
+    if (body.batchAnchor !== undefined && typeof body.batchAnchor !== "string") return null
+    return {
+      enabled: body.enabled,
+      ...(typeof body.batchAnchor === "string" ? { batchAnchor: body.batchAnchor as Address } : {}),
+    }
   } catch {
     return null
   }

@@ -99,10 +99,10 @@ async function stubRpc(): Promise<{ url: string; close(): Promise<void> }> {
 type SaveAnswer = { state: string; reason: string | null; batchId?: Hex } | { httpError: number }
 
 /** A fake hosted store: /batch/status from `status`, /batch/saves/<id> from the `saves` map. */
-async function stubStore(status: { enabled: boolean; batchAnchor: string } = { enabled: true, batchAnchor: ANCHOR }): Promise<{
+async function stubStore(status: { enabled: boolean; batchAnchor?: string } = { enabled: true, batchAnchor: ANCHOR }): Promise<{
   url: string
   host: string
-  status: { enabled: boolean; batchAnchor: string }
+  status: { enabled: boolean; batchAnchor?: string }
   saves: Map<string, SaveAnswer>
   paths: string[]
   close(): Promise<void>
@@ -248,6 +248,20 @@ describe("decideLane — batched only when every condition holds", () => {
     expect(off).toEqual({ kind: "direct", why: "store-disabled" })
     const other = await decideLane({ saved: saved(true), deployment: DEPLOYMENT_BATCHED, storageUrl: "http://store.example", status: async () => ({ enabled: true, batchAnchor: OTHER_ANCHOR }) })
     expect(other).toEqual({ kind: "direct", why: "store-disabled" })
+  })
+
+  it("a status answer without a usable batchAnchor is store-disabled — never a crash (in-20 T-1)", async () => {
+    // A lane degraded by bad store config reports enabled:false and may carry no anchor; a
+    // malformed answer that claims enabled:true but omits it must not throw on .toLowerCase().
+    for (const answer of [{ enabled: false }, { enabled: true }, { enabled: true, batchAnchor: 7 }]) {
+      const lane = await decideLane({
+        saved: saved(true),
+        deployment: DEPLOYMENT_BATCHED,
+        storageUrl: "http://store.example",
+        status: (async () => answer) as never,
+      })
+      expect(lane).toEqual({ kind: "direct", why: "store-disabled" })
+    }
   })
 
   it("switch on + anchor + hosted store + matching status → batched", async () => {
@@ -431,6 +445,33 @@ describe("saveCheckpoint — the batched lane", () => {
       }
       const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
       await expect(saveCheckpoint(runtime, "claude-code", saveInput)).rejects.toMatchObject({ code: "PARTIAL_READ" })
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("a lane-closed answer at POST time — the lane went down between the status check and the save — still lands, on the direct lane (in-20 T-1)", async () => {
+    // The status probe said enabled, then the store's batching config broke before the POST:
+    // the save must take the direct lane, not die on a lane that is already closed.
+    const store = await stubStore()
+    try {
+      for (const code of ["BATCHING_DISABLED", "BATCH_UNAVAILABLE", "OWNER_NOT_ALLOWED"] as const) {
+        const home = batchedHome(store.url)
+        const agent = {
+          findDuplicate: async () => undefined,
+          createBatched: async () => {
+            throw new MidaError(code as never, "the batched lane is closed")
+          },
+          create: async () => ({ contextId: CONTEXT_ID, transactionHash: `0x${"ee".repeat(32)}` as Hex }),
+        }
+        const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
+        const result = await saveCheckpoint(runtime, "claude-code", saveInput)
+        expect(result.lane).toBe("direct")
+        expect(result.contextId).toBe(CONTEXT_ID)
+        expect(result.transactionHash).toBe(`0x${"ee".repeat(32)}`)
+        expect(result.laneWhy).toBe("store-disabled")
+        expect(pendingAnchors(home)).toHaveLength(0)
+      }
     } finally {
       await store.close()
     }
@@ -824,7 +865,7 @@ describe("followPendingAnchors — the ledger's follow-up", () => {
         }
       })
 
-      for (const code of ["BATCHING_DISABLED", "OWNER_NOT_ALLOWED", "TOO_LARGE", "BAD_SHAPE", "COMMITMENT_MISMATCH", "INVALID_WIRE"] as const) {
+      for (const code of ["BATCHING_DISABLED", "BATCH_UNAVAILABLE", "OWNER_NOT_ALLOWED", "TOO_LARGE", "BAD_SHAPE", "COMMITMENT_MISMATCH", "INVALID_WIRE"] as const) {
         it(`a ${code} answer marks the save stuck — plaintext kept, entry kept, nothing final recorded`, async () => {
           const store = await stubStore()
           try {
@@ -932,7 +973,7 @@ describe("followPendingAnchors — the ledger's follow-up", () => {
         return { runtime, created }
       }
 
-      for (const code of ["BATCHING_DISABLED", "OWNER_NOT_ALLOWED"] as const) {
+      for (const code of ["BATCHING_DISABLED", "BATCH_UNAVAILABLE", "OWNER_NOT_ALLOWED"] as const) {
         it(`a ${code} answer resubmits through the direct lane — the save lands, not stuck`, async () => {
           const store = await stubStore()
           try {
@@ -1147,6 +1188,21 @@ describe("doctor — the batching check", () => {
     expect(lines).toContain("PROBLEM: batching is on but saves are taking the direct lane: the hosted store did not answer the batching check — check the store or run `mida batching off`")
   })
 
+  it("a store answering enabled:false with no anchor — the config-invalid shape — is store-disabled, not unreachable (in-20 T-1)", async () => {
+    // The degraded store's status may carry no batchAnchor at all; it ANSWERED, so the honest
+    // reason is "not offering batching on this setup's contracts", never "did not answer".
+    const store = await stubStore({ enabled: false })
+    try {
+      const lines = await doctorLines(batchedHome(store.url, true))
+      expect(lines).toContain("ok: checkpoint saves: one transaction each")
+      expect(lines).toContain(
+        "PROBLEM: batching is on but saves are taking the direct lane: the hosted store is not offering batching on this setup's contracts — check the store or run `mida batching off`",
+      )
+    } finally {
+      await store.close()
+    }
+  })
+
   it("rejected saves each print a PROBLEM naming the reason and session", async () => {
     const home = batchedHome("http://127.0.0.1:1", false)
     home.writeSecretJson("state/batch-rejected.json", {
@@ -1206,6 +1262,7 @@ describe("doctor — the batching check", () => {
   it("every stuck code has a plain-words line — never the raw wire code alone", async () => {
     for (const [code, words] of [
       ["BATCHING_DISABLED", "no longer offering batching"],
+      ["BATCH_UNAVAILABLE", "batch lane is unavailable"],
       ["OWNER_NOT_ALLOWED", "not allowed to write"],
       ["TOO_LARGE", "does not fit"],
       ["BAD_SHAPE", "malformed"],
@@ -1228,7 +1285,7 @@ describe("doctor — the batching check", () => {
   // is the wrong advice (the same bytes fail the direct lane too) — the line says the text is
   // kept on this laptop, where, and that this is a bug to report.
   it("a closed lane says the save goes out on its own transaction — a refused-as-composed save names its kept text and the bug report", async () => {
-    for (const code of ["BATCHING_DISABLED", "OWNER_NOT_ALLOWED"] as const) {
+    for (const code of ["BATCHING_DISABLED", "BATCH_UNAVAILABLE", "OWNER_NOT_ALLOWED"] as const) {
       const home = batchedHome("http://127.0.0.1:1", false)
       addPendingAnchor(home, { contextId: CONTEXT_ID, eventId: EVENT_ID, sessionId: SESSION_ID, agent: "claude-code", queuedAt: "2026-09-24T10:00:00.000Z", stuck: code, stuckAt: "2026-09-24T11:00:00.000Z" })
       const lines = await doctorLines(home)

@@ -105,6 +105,10 @@ const makeApi = (input: {
   enabled?: boolean
   hasAuthority?: (owner: Address, agentId: Hex, namespace: Hex, permission: number, policy: number) => boolean
   ownerAllowlist?: readonly Address[]
+  /** in-20 T-1: a boot-degraded lane — set the message to mount the config-invalid surface. */
+  configInvalid?: string
+  /** Set false to mount a lane that never parsed an anchor — status must omit batchAnchor. */
+  anchor?: boolean
 } = {}): ApiFixture => {
   const dataDir = mkdtempSync(join(tmpdir(), "mida-batch-routes-"))
   const store = new FsBatchStore(dataDir)
@@ -121,9 +125,10 @@ const makeApi = (input: {
     clock: () => NOW_SECONDS,
     batching: {
       enabled: input.enabled ?? true,
-      batchAnchor: BATCH_ANCHOR,
+      ...(input.anchor === false ? {} : { batchAnchor: BATCH_ANCHOR }),
       store,
       receiptAccount,
+      ...(input.configInvalid === undefined ? {} : { configInvalid: input.configInvalid }),
       ...(input.ownerAllowlist === undefined ? {} : { ownerAllowlist: input.ownerAllowlist }),
       notify: () => {
         counts.notified++
@@ -393,6 +398,37 @@ describe("the /batch/* surface", () => {
     await expect(client.flushBatch()).rejects.toThrowError()
     expect(seen.at(-1)).toMatchObject({ status: 503, body: { error: { code: "BATCHING_DISABLED" } } })
     expect(fixture.counts.flushed).toBe(0)
+  })
+
+  it("a config-invalid lane reports it on status, refuses writes 503 BATCH_UNAVAILABLE, and keeps serving reads (in-20 T-1)", async () => {
+    // The store-worker's degraded lane: a bad batching variable closes the lane for writes
+    // without taking the store down — status names the variable's rule, every batch POST gets
+    // the same 503, and the read side (queue rows, ordinary objects) keeps answering.
+    const message = "environment variable BATCHER_PRIVATE_KEY must be a 0x-prefixed 32-byte hex"
+    const fixture = makeApi({ configInvalid: message })
+    const { client, seen } = watchingClient(fixture.app, agentAccount)
+    expect(await client.batchStatus()).toEqual({ enabled: false, batchAnchor: BATCH_ANCHOR, reason: "config-invalid", message })
+
+    const save = await makeSave(agentAccount, AGENT_ID)
+    await expect(client.postBatchSave(save.wire)).rejects.toThrowError()
+    expect(seen.at(-1)).toMatchObject({ status: 503, body: { error: { code: "BATCH_UNAVAILABLE", message } } })
+    await expect(client.flushBatch()).rejects.toThrowError()
+    expect(seen.at(-1)).toMatchObject({ status: 503, body: { error: { code: "BATCH_UNAVAILABLE", message } } })
+    expect(fixture.counts.notified).toBe(0)
+    expect(fixture.counts.flushed).toBe(0)
+
+    // reads are untouched — the queue table still answers under the usual authorization
+    const owner = clientFor(fixture.app, ownerAccount)
+    const listed = await owner.listBatchSaves({ owner: OWNER, namespaceId: NAMESPACE })
+    expect(listed.items).toEqual([])
+
+    // A lane whose anchor never parsed omits the field rather than echoing a bad value.
+    const noAnchor = makeApi({ configInvalid: message, anchor: false })
+    expect(await clientFor(noAnchor.app, ownerAccount).batchStatus()).toEqual({
+      enabled: false,
+      reason: "config-invalid",
+      message,
+    })
   })
 
   it("GET /batch/saves lists QUEUED, SUBMITTED and ANCHORED rows — never REJECTED — under objects' auth", async () => {

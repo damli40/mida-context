@@ -3,7 +3,7 @@ import { isAbsolute } from "node:path"
 import { CONTEXT_KIND, MAX_PAYLOAD_BYTES, PERMISSION, PROVENANCE_POLICY, canonicalizeNamespace, isMidaError, namespaceId } from "@mida/protocol"
 import type { ContextKind, Hex, RecordReference } from "@mida/protocol"
 import type { CreateContextInput } from "@mida/sdk"
-import { addPendingAnchor, keepPendingPlaintext, laneForSave } from "./batching.js"
+import { RESUBMIT_LANE_CLOSED, addPendingAnchor, keepPendingPlaintext, laneForSave } from "./batching.js"
 import type { Lane } from "./batching.js"
 import { chainRefusalReason } from "./chain-busy.js"
 import { capabilityState, projectCheckRefusal } from "./handoff.js"
@@ -314,25 +314,34 @@ export async function buildRemember(runtime: ServiceRuntime, record: unknown, de
       return { kind: "saved", id: written.contextId, state: "anchored", lane: "direct" }
     }
     if (laneKind === "batched") {
-      let queued: { contextId: Hex }
+      let queued: { contextId: Hex } | undefined
       try {
         queued = await createBatched(runtime, agent, namespace, input)
       } catch (error) {
-        if ((error as { code?: unknown }).code !== "ALREADY_QUEUED") throw error
-        const held = (error as { contextId?: unknown }).contextId
-        if (typeof held !== "string" || !HEX_ID.test(held)) throw error
-        queued = { contextId: held.toLowerCase() as Hex }
+        const code = (error as { code?: unknown }).code
+        if (code === "ALREADY_QUEUED") {
+          const held = (error as { contextId?: unknown }).contextId
+          if (typeof held !== "string" || !HEX_ID.test(held)) throw error
+          queued = { contextId: held.toLowerCase() as Hex }
+        } else if (typeof code === "string" && RESUBMIT_LANE_CLOSED.has(code)) {
+          // in-20 T-1: the lane closed between the decision and the POST — the answer judges the
+          // lane, not the note, so the write falls through to the direct create below.
+        } else {
+          throw error
+        }
       }
-      keepPendingPlaintext(runtime.home, queued.contextId, input as unknown as Record<string, unknown>)
-      addPendingAnchor(runtime.home, {
-        contextId: queued.contextId,
-        eventId: queued.contextId,
-        sessionId: `sdk-${agent}`,
-        agent,
-        queuedAt: new Date(now()).toISOString(),
-        namespace,
-      })
-      return { kind: "saved", id: queued.contextId, state: "pending", lane: "batched" }
+      if (queued !== undefined) {
+        keepPendingPlaintext(runtime.home, queued.contextId, input as unknown as Record<string, unknown>)
+        addPendingAnchor(runtime.home, {
+          contextId: queued.contextId,
+          eventId: queued.contextId,
+          sessionId: `sdk-${agent}`,
+          agent,
+          queuedAt: new Date(now()).toISOString(),
+          namespace,
+        })
+        return { kind: "saved", id: queued.contextId, state: "pending", lane: "batched" }
+      }
     }
     const written = await create(runtime, agent, namespace, input)
     return { kind: "saved", id: written.contextId, state: "anchored", lane: "direct" }

@@ -502,7 +502,7 @@ async function main(): Promise<void> {
       const probe = new ContextApiClient({ baseUrl: storeUrl, account: deployerAccount, chainId: deployment.chainId, capabilityRegistry: deployment.capabilityRegistry })
       const status = await probe.batchStatus().catch((error) => fail(`the store at --store did not answer /batch/status: ${(error as Error).message}`))
       if (!status.enabled) fail("the store reports batching disabled — the BATCHING_ENABLED kill switch is off at the store")
-      if (status.batchAnchor.toLowerCase() !== batchAnchor.toLowerCase()) {
+      if (typeof status.batchAnchor !== "string" || status.batchAnchor.toLowerCase() !== batchAnchor.toLowerCase()) {
         fail("the store's batchAnchor differs from this deployment's — wrong store or wrong deployment")
       }
       const clients = agents.map(

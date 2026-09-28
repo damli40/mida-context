@@ -39,7 +39,12 @@ import type { BatchSaveRow, BatchStore } from "./batch-store.js"
 export interface BatchingOptions {
   /** Kill switch — routes stay mounted but POSTs answer 503 BATCHING_DISABLED. */
   enabled: boolean
-  batchAnchor: Address
+  /**
+   * The BatchAnchor contract this lane anchors through. Absent only on a boot-degraded lane
+   * (`configInvalid` set) whose anchor never parsed — /batch/status then omits the field rather
+   * than echo a value a client could wrongly match on.
+   */
+  batchAnchor?: Address
   store: BatchStore
   /**
    * Signs admission receipts; a store key, unrelated to any chain identity. Only the enabled lane
@@ -58,6 +63,14 @@ export interface BatchingOptions {
    * wire's lowercase address). Absent or empty leaves admission exactly as it was.
    */
   ownerAllowlist?: readonly Address[]
+  /**
+   * in-20 T-1: set when the batching configuration failed to build — a bad BATCHER_PRIVATE_KEY,
+   * a missing coordinator binding, a malformed allowlist. The store itself keeps serving; the
+   * lane reports `enabled: false, reason: "config-invalid"` and every batch write answers 503
+   * BATCH_UNAVAILABLE carrying this message, which names the variable and its rule — never its
+   * value. Reads keep answering: queue rows already stored still list.
+   */
+  configInvalid?: string
   /** Wake-up for the batcher, called exactly once per accepted save. */
   notify: () => void
   /** Runs one submission round; invoked by POST /batch/flush after its checks pass. */
@@ -203,10 +216,25 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
   }
 
   // Public: the only fact a would-be submitter needs is whether this store batches, and where.
-  app.get("/batch/status", (c) => c.json({ enabled: batching.enabled, batchAnchor: batching.batchAnchor }))
+  // A config-invalid lane reports enabled:false + the reason and message — and echoes the
+  // anchor only when one actually parsed, so a client never matches on a bad value.
+  app.get("/batch/status", (c) => {
+    const anchor = batching.batchAnchor === undefined ? {} : { batchAnchor: batching.batchAnchor }
+    if (batching.configInvalid !== undefined) {
+      return c.json({ enabled: false, ...anchor, reason: "config-invalid", message: batching.configInvalid })
+    }
+    return c.json({ enabled: batching.enabled, ...anchor })
+  })
 
   app.post("/batch/saves", authenticated(limits.maxRequestBodyBytes), async (c) => {
+    if (batching.configInvalid !== undefined) return reject(c, 503, "BATCH_UNAVAILABLE", batching.configInvalid)
     if (!batching.enabled) return reject(c, 503, "BATCHING_DISABLED", "batched saves are not enabled on this store")
+    const batchAnchor = batching.batchAnchor
+    // Enabled without an anchor is a construction bug — batchingOptions parses one before it
+    // enables — but a hand-rolled BatchingOptions can still reach here; refuse, don't sign.
+    if (batchAnchor === undefined) {
+      return reject(c, 503, "BATCH_UNAVAILABLE", "the batch lane has no anchor configured")
+    }
     const saveRefusal = await anchorRefusal(c)
     if (saveRefusal !== null) return saveRefusal
     const signer = c.get("signer")
@@ -236,7 +264,7 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
       readEpoch: decodeUint64(save.message.readEpoch),
       expiresAt: decodeUint64(save.message.expiresAt),
     }
-    const typed = batchSaveTypedData({ chainId: deployment.chainId, batchAnchor: batching.batchAnchor, message })
+    const typed = batchSaveTypedData({ chainId: deployment.chainId, batchAnchor, message })
     let recovered: Address
     try {
       recovered = (await recoverTypedDataAddress({
@@ -276,7 +304,7 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
     // contextId the signed fields cannot produce fails here as a commitment mismatch.
     const contextId = batchContextId({
       chainId: deployment.chainId,
-      batchAnchor: batching.batchAnchor,
+      batchAnchor,
       owner: save.message.owner,
       agentId,
       namespaceId: save.message.namespaceId,
@@ -397,6 +425,7 @@ export function mountBatchRoutes(app: Hono<BatchRouteEnv>, deps: BatchRouteDeps)
   // Amendment B.4: a reading agent triggers the flush on switch. Only a registered agent or an
   // owner key may ask — a stranger cannot even learn whether the queue holds anything.
   app.post("/batch/flush", authenticated(limits.maxRequestBodyBytes), async (c) => {
+    if (batching.configInvalid !== undefined) return reject(c, 503, "BATCH_UNAVAILABLE", batching.configInvalid)
     if (!batching.enabled) return reject(c, 503, "BATCHING_DISABLED", "batched saves are not enabled on this store")
     const flushRefusal = await anchorRefusal(c)
     if (flushRefusal !== null) return flushRefusal

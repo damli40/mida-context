@@ -572,7 +572,9 @@ describe("the worker entry", () => {
     }
   })
 
-  it("a non-numeric BATCH_ANCHOR_BLOCK fails the enabled lane at boot — and is inert while the lane is off", async () => {
+  it("a non-numeric BATCH_ANCHOR_BLOCK degrades only the batch lane — the rest of the store boots (in-20 T-1)", async () => {
+    // Sep 27 live bug: this env used to answer 500 CONFIG_INVALID on EVERY route — saves and
+    // reads included — because the batching block's boot check threw past the whole worker.
     const vars = envVars(rpc.url)
     vars["BATCH_ANCHOR"] = "0x1111111111111111111111111111111111111aa5"
     vars["BATCH_ANCHOR_BLOCK"] = "yesterday"
@@ -580,11 +582,103 @@ describe("the worker entry", () => {
     const bad = await makeWorker(await bundleWorker(), vars)
     try {
       const response = await bad.mf.dispatchFetch("http://worker.test/")
-      expect(response.status).toBe(500)
-      expect(JSON.stringify(await response.json())).toContain("BATCH_ANCHOR_BLOCK")
+      expect(response.status).toBe(200)
+      const status = await bad.mf.dispatchFetch("http://worker.test/batch/status")
+      expect(status.status).toBe(200)
+      const body = (await status.json()) as Record<string, unknown>
+      expect(body).toMatchObject({ enabled: false, reason: "config-invalid" })
+      expect(String(body["message"])).toContain("BATCH_ANCHOR_BLOCK")
     } finally {
       await bad.mf.dispose()
     }
+  })
+
+  it("a malformed BATCHER_PRIVATE_KEY degrades only the lane — saves and reads serve, the secret leaks nowhere (in-20 T-1)", async () => {
+    // The exact live failure: a mis-formatted key string. The variable's NAME is reported; its
+    // value must appear in no response body and no log line.
+    const secret = "zz-not-hex-secret-marker-1a2b3c"
+    const coordinator: DurableObjectNamespaceLike = {
+      idFromName: () => "batcher",
+      get: () => ({ fetch: async () => new Response(JSON.stringify({ ok: true })) }),
+    }
+    const laneEnv: WorkerEnv = {
+      ...env(db, rpc.url),
+      BATCH_ANCHOR: "0x1111111111111111111111111111111111111aa5",
+      BATCHING_ENABLED: "true",
+      BATCHER_PRIVATE_KEY: secret,
+      RECEIPT_PRIVATE_KEY: `0x${"55".repeat(32)}`,
+      BATCH_COORDINATOR: coordinator,
+    }
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {})
+    try {
+      // The rest of the store serves exactly as with BATCHING_ENABLED="false": root notice,
+      // an ordinary signed save, and an ordinary read.
+      expect((await handleRequest(laneEnv, new Request("http://worker.test/"))).status).toBe(200)
+      const { client, last } = clientForEnv(laneEnv, ownerAccount)
+      const body = upload(randomBytes(24))
+      const put = await client.putObject(body)
+      expect(put).toMatchObject({ contextId: body.manifest.contextId, state: "pending" })
+      const listed = await client.listObjects({ owner, namespaceId: NAMESPACE })
+      expect(Array.isArray(listed.objects)).toBe(true)
+      expect(listed.partial).toBe(false)
+
+      // The lane reports itself degraded: status names the variable, never its value, and
+      // every batch write answers 503 BATCH_UNAVAILABLE with the same plain message.
+      const statusBody = (await (await handleRequest(laneEnv, new Request("http://worker.test/batch/status"))).json()) as Record<string, unknown>
+      expect(statusBody).toMatchObject({ enabled: false, reason: "config-invalid" })
+      expect(String(statusBody["message"])).toContain("BATCHER_PRIVATE_KEY")
+      await client.postBatchSave({} as never).catch(() => {})
+      expect(last()).toMatchObject({ status: 503, body: { error: { code: "BATCH_UNAVAILABLE" } } })
+      expect(JSON.stringify(last()!.body)).toContain("BATCHER_PRIVATE_KEY")
+      await client.flushBatch().catch(() => {})
+      expect(last()).toMatchObject({ status: 503, body: { error: { code: "BATCH_UNAVAILABLE" } } })
+      // Batch reads keep serving — the lane is closed for writes, not unmounted.
+      const batchList = await client.listBatchSaves({ owner, namespaceId: NAMESPACE })
+      expect(Array.isArray(batchList.items)).toBe(true)
+
+      // The secret's value is in no response and no log line; the problem is logged ONCE per
+      // isolate — the built env is memoized, so these requests share the one build.
+      const bodies = [statusBody, last()!.body].map((b) => JSON.stringify(b)).join("\n")
+      expect(bodies).not.toContain(secret)
+      const logged = [...errorSpy.mock.calls, ...logSpy.mock.calls].flat().map(String)
+      expect(logged.every((line) => !line.includes(secret))).toBe(true)
+      expect(logged.filter((line) => line.includes("BATCHER_PRIVATE_KEY"))).toHaveLength(1)
+    } finally {
+      errorSpy.mockRestore()
+      logSpy.mockRestore()
+    }
+  })
+
+  it("a missing BATCH_COORDINATOR binding degrades the lane the same way, naming the binding (in-20 T-1)", async () => {
+    const laneEnv: WorkerEnv = {
+      ...env(db, rpc.url),
+      BATCH_ANCHOR: "0x1111111111111111111111111111111111111aa5",
+      BATCHING_ENABLED: "true",
+      BATCHER_PRIVATE_KEY: `0x${"44".repeat(32)}`,
+      RECEIPT_PRIVATE_KEY: `0x${"55".repeat(32)}`,
+    }
+    expect((await handleRequest(laneEnv, new Request("http://worker.test/"))).status).toBe(200)
+    const body = (await (await handleRequest(laneEnv, new Request("http://worker.test/batch/status"))).json()) as Record<string, unknown>
+    expect(body).toMatchObject({ enabled: false, reason: "config-invalid" })
+    expect(String(body["message"])).toContain("BATCH_COORDINATOR")
+  })
+
+  it("a malformed BATCH_ANCHOR while enabled reports config-invalid and echoes no anchor (in-20 T-1)", async () => {
+    // The lane cannot echo an anchor it never parsed — the status must omit the field, not
+    // invent one, so a client comparing anchors can never match on a bad value.
+    const laneEnv: WorkerEnv = {
+      ...env(db, rpc.url),
+      BATCH_ANCHOR: "not-an-address",
+      BATCHING_ENABLED: "true",
+      BATCHER_PRIVATE_KEY: `0x${"44".repeat(32)}`,
+      RECEIPT_PRIVATE_KEY: `0x${"55".repeat(32)}`,
+    }
+    expect((await handleRequest(laneEnv, new Request("http://worker.test/"))).status).toBe(200)
+    const body = (await (await handleRequest(laneEnv, new Request("http://worker.test/batch/status"))).json()) as Record<string, unknown>
+    expect(body).toMatchObject({ enabled: false, reason: "config-invalid" })
+    expect(String(body["message"])).toContain("BATCH_ANCHOR")
+    expect(body["batchAnchor"]).toBeUndefined()
   })
 
   it("a placeholder BATCH_ANCHOR_BLOCK beside BATCHING_ENABLED=false boots and serves non-batch routes", async () => {
@@ -738,20 +832,24 @@ describe("the worker entry", () => {
     await open.client.postBatchSave(saveFor(blocked) as never).catch(() => {})
     expect(open.last()!.status).toBe(400)
 
-    // A malformed entry while enabled is a boot error naming the variable; while disabled it is inert.
+    // A malformed entry while enabled degrades only the batch lane (in-20 T-1): the store still
+    // serves, and /batch/status names the variable. While disabled the same value is inert.
     const broken = laneEnv({ BATCH_OWNER_ALLOWLIST: "not-an-address" })
-    const refused = await handleRequest(broken, new Request("http://worker.test/"))
-    expect(refused.status).toBe(500)
-    expect(JSON.stringify(await refused.json())).toContain("BATCH_OWNER_ALLOWLIST")
+    expect((await handleRequest(broken, new Request("http://worker.test/"))).status).toBe(200)
+    const brokenBody = (await (await handleRequest(broken, new Request("http://worker.test/batch/status"))).json()) as Record<string, unknown>
+    expect(brokenBody).toMatchObject({ enabled: false, reason: "config-invalid" })
+    expect(String(brokenBody["message"])).toContain("BATCH_OWNER_ALLOWLIST")
     const inert = await handleRequest(laneEnv({ BATCHING_ENABLED: "false", BATCH_OWNER_ALLOWLIST: "not-an-address" }), new Request("http://worker.test/"))
     expect(inert.status).toBe(200)
 
     // Set-but-empty must NOT silently open the lane: "," and " " both parse to zero addresses
-    // while enabled, so each is a boot error that says the list produced zero addresses.
+    // while enabled, so each degrades the lane and says the list produced zero addresses.
     for (const zeroEntries of [",", " "]) {
-      const refusedZero = await handleRequest(laneEnv({ BATCH_OWNER_ALLOWLIST: zeroEntries }), new Request("http://worker.test/"))
-      expect(refusedZero.status).toBe(500)
-      expect(JSON.stringify(await refusedZero.json())).toContain("zero addresses")
+      const degraded = laneEnv({ BATCH_OWNER_ALLOWLIST: zeroEntries })
+      expect((await handleRequest(degraded, new Request("http://worker.test/"))).status).toBe(200)
+      const zeroBody = (await (await handleRequest(degraded, new Request("http://worker.test/batch/status"))).json()) as Record<string, unknown>
+      expect(zeroBody).toMatchObject({ enabled: false, reason: "config-invalid" })
+      expect(String(zeroBody["message"])).toContain("zero addresses")
     }
     // …but only while the lane is on — disabled, the same value is inert.
     const zeroInert = await handleRequest(laneEnv({ BATCHING_ENABLED: "false", BATCH_OWNER_ALLOWLIST: "," }), new Request("http://worker.test/"))

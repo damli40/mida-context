@@ -146,7 +146,8 @@ async function readNamespaceObjects(
   let mergedBatched = false
   if (batchAnchor !== undefined && deployment !== undefined) {
     const status = await batchStatusProbe(runtime.apiBaseUrl)
-    if (status !== null && status.batchAnchor.toLowerCase() === batchAnchor.toLowerCase()) {
+    // the anchor is absent on a degraded lane's answer — only a string it echoed can match
+    if (status !== null && typeof status.batchAnchor === "string" && status.batchAnchor.toLowerCase() === batchAnchor.toLowerCase()) {
       const readBatched = async () => {
         try {
           return await agent.readBatchedWithStatus(runtime.owner, namespace)

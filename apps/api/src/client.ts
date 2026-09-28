@@ -212,7 +212,10 @@ export class ContextApiClient implements ContextApiRoutes {
   }
 
   batchStatus() {
-    return this.request<{ enabled: boolean; batchAnchor: Address }>("GET", "/batch/status", { signed: false })
+    // batchAnchor/reason/message are absent on answers that carry none — a lane degraded at
+    // boot reports { enabled: false, reason: "config-invalid", message } and may have no
+    // anchor to echo (in-20 T-1), so the anchor is optional and callers must check it.
+    return this.request<{ enabled: boolean; batchAnchor?: Address; reason?: string; message?: string }>("GET", "/batch/status", { signed: false })
   }
 
   postBatchSave(body: BatchedSaveWire) {
@@ -357,7 +360,7 @@ export interface ContextApiRoutes {
   cancelRevocation(intentId: Hex, input: { expiresAt: bigint; assertion: WebAuthnAssertionInput }): Promise<{ intentId: Hex; state: string }>
   listRevocations(state?: DenyState): Promise<RevocationIntentView[]>
   reissueRevocationNonce(intentId: Hex): Promise<{ intentId: Hex; state: string; cancellationNonce: string }>
-  batchStatus(): Promise<{ enabled: boolean; batchAnchor: Address }>
+  batchStatus(): Promise<{ enabled: boolean; batchAnchor?: Address; reason?: string; message?: string }>
   postBatchSave(body: BatchedSaveWire): Promise<{ state: "QUEUED"; receipt: BatchReceipt }>
   getBatchSave(contextId: Hex, capabilityId?: Hex): Promise<{ state: BatchedItemState | "REJECTED"; reason: string | null; item?: BatchedReadItem }>
   listBatchSaves(input: { owner: Address; namespaceId: Hex; capabilityId?: Hex }): Promise<{ items: BatchedReadItem[]; partial: boolean }>

@@ -88,6 +88,26 @@ describe("buildRemember — the daemon's /remember route", () => {
     expect(entries[0]!.namespace).toBe(FACT)
   })
 
+  it("a batched lane that closed between the lane decision and the POST still lands — on the direct lane (in-20 T-1)", async () => {
+    // BATCHING_DISABLED / BATCH_UNAVAILABLE / OWNER_NOT_ALLOWED judge the lane, not the note —
+    // the same write goes out on its own transaction rather than being refused or dropped.
+    for (const code of ["BATCHING_DISABLED", "BATCH_UNAVAILABLE", "OWNER_NOT_ALLOWED"] as const) {
+      const dir = home()
+      const result = await call(
+        {
+          lane: async () => ({ kind: "batched", storeUrl: "http://store", batchAnchor: "0x00000000000000000000000000000000000000bb" }),
+          createBatched: async () => {
+            throw new MidaError(code as never, "the batched lane is closed")
+          },
+        },
+        {},
+        dir,
+      )
+      expect(result).toMatchObject({ kind: "saved", id: id(11), state: "anchored", lane: "direct" })
+      expect(pendingAnchors(dir)).toHaveLength(0)
+    }
+  })
+
   it("a caller-supplied provenance source is refused before anything is signed", async () => {
     let written = false
     const deps: Partial<RememberDeps> = {

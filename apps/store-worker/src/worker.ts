@@ -139,14 +139,23 @@ interface Built {
 }
 
 /**
- * The Task 6 batch lane. The surface mounts whenever BATCH_ANCHOR parses as an address — under the
- * kill switch the routes answer 503/{ enabled: false } rather than 404ing, and a missing receipt
- * key then means exactly that: only BATCHING_ENABLED="true" requires the secrets, the coordinator
- * binding and the batcher key — a disabled lane must never take the whole store down. notify is
- * fire-and-forget into the single "batcher" object (covered by the request's waitUntil); flush is
- * awaited. While enabled, the first batch request also proves the anchor contract's own
- * CAPABILITY_REGISTRY() is this deployment's — a wrong contract refuses the surface (cached; a
- * failed read retries rather than latching a verdict it never reached).
+ * The Task 6 batch lane. The surface mounts whenever BATCH_ANCHOR parses as an address — or when
+ * the lane was asked for and could not be built. Under the kill switch the routes answer
+ * 503/{ enabled: false } rather than 404ing, and a missing receipt key then means exactly that:
+ * only BATCHING_ENABLED="true" requires the secrets, the coordinator binding and the batcher key.
+ *
+ * in-20 T-1: a bad value inside the batching block — a malformed BATCH_ANCHOR, a non-numeric
+ * BATCH_ANCHOR_BLOCK, a missing BATCH_COORDINATOR binding, a malformed BATCHER_PRIVATE_KEY or
+ * RECEIPT_PRIVATE_KEY, an allowlist that parses to no addresses — must close ONLY the lane. The
+ * rest of the store boots and serves exactly as with BATCHING_ENABLED="false"; the lane reports
+ * { enabled: false, reason: "config-invalid" } and refuses batch writes with BATCH_UNAVAILABLE,
+ * and the failure is logged ONCE per isolate (this builder is memoized on the env object) with
+ * the variable's NAME — its value is never part of the message and never reaches a log line.
+ *
+ * notify is fire-and-forget into the single "batcher" object (covered by the request's
+ * waitUntil); flush is awaited. While enabled, the first batch request also proves the anchor
+ * contract's own CAPABILITY_REGISTRY() is this deployment's — a wrong contract refuses the
+ * surface (cached; a failed read retries rather than latching a verdict it never reached).
  */
 function batchingOptions(env: WorkerEnv, deployment: Deployment, publicClient: PublicClientLike): BatchingOptions | undefined {
   const enabled = env.BATCHING_ENABLED === "true"
@@ -154,89 +163,107 @@ function batchingOptions(env: WorkerEnv, deployment: Deployment, publicClient: P
     typeof env.BATCH_ANCHOR === "string" && /^0x[0-9a-fA-F]{40}$/.test(env.BATCH_ANCHOR)
       ? (env.BATCH_ANCHOR.toLowerCase() as Address)
       : undefined
-  if (batchAnchor === undefined) {
-    if (enabled) throw new Error("BATCHING_ENABLED=true requires BATCH_ANCHOR to be a 0x-prefixed 20-byte address")
-    return undefined
-  }
-  deployment.batchAnchor = batchAnchor
-  let receiptAccount: LocalAccount | undefined
-  let verifyAnchor: (() => Promise<void>) | undefined
-  let ownerAllowlist: Address[] | undefined
-  if (enabled) {
-    // The anchor's deploy block floors the coordinator's historical scans — only the enabled lane
-    // ever reads it, so a placeholder beside BATCHING_ENABLED="false" stays inert rather than
-    // failing a boot that never asks it anything. Enabled, a non-numeric value is a configuration
-    // error and fails at boot, not inside the object mid-scan.
-    if (env.BATCH_ANCHOR_BLOCK !== undefined && env.BATCH_ANCHOR_BLOCK !== "") {
-      if (!/^(0|[1-9][0-9]*)$/.test(env.BATCH_ANCHOR_BLOCK)) {
-        throw new Error("environment variable BATCH_ANCHOR_BLOCK must be a non-negative integer")
-      }
-      deployment.batchAnchorBlock = BigInt(env.BATCH_ANCHOR_BLOCK)
-    }
-    if (env.BATCH_COORDINATOR === undefined) {
-      throw new Error("BATCHING_ENABLED=true requires the BATCH_COORDINATOR Durable Object binding")
-    }
-    hashEnv(env, "BATCHER_PRIVATE_KEY") // the coordinator reads it again at first use; fail at boot, not mid-queue
-    receiptAccount = privateKeyToAccount(hashEnv(env, "RECEIPT_PRIVATE_KEY"))
-    let verdict: Promise<void> | undefined
-    verifyAnchor = () => {
-      verdict ??= (async () => {
-        let onchain: unknown
-        try {
-          onchain = await publicClient.readContract({
-            address: batchAnchor,
-            abi: batchAnchorAbi,
-            functionName: "CAPABILITY_REGISTRY",
-          })
-        } catch (error) {
-          verdict = undefined // a read that never reached the contract is not a verdict — retry next time
-          throw new Error(`the batch anchor could not be verified against the chain: ${error instanceof Error ? error.message : String(error)}`)
-        }
-        if (typeof onchain !== "string" || onchain.toLowerCase() !== deployment.capabilityRegistry) {
-          throw new Error(
-            `BATCH_ANCHOR ${batchAnchor} reports CAPABILITY_REGISTRY ${String(onchain)}, not this deployment's ${deployment.capabilityRegistry} — the batch surface refuses to run against the wrong contract`,
-          )
-        }
-      })()
-      return verdict
-    }
-    // The trial gate is read only while the lane is on — a stale value beside BATCHING_ENABLED=false
-    // stays inert rather than failing a boot that never asks it anything. Entries may be
-    // mixed-case; the wire's owner field is lowercase, so the list is normalized to match.
-    const rawList = env.BATCH_OWNER_ALLOWLIST
-    if (typeof rawList === "string" && rawList !== "") {
-      const entries = rawList.split(",").map((entry) => entry.trim()).filter((entry) => entry !== "")
-      // A SET value that parses to zero addresses ("," or " ") must not silently mean open —
-      // an operator who meant "closed" would get the opposite. Unset or empty stays "no allowlist".
-      if (entries.length === 0) {
-        throw new Error("environment variable BATCH_OWNER_ALLOWLIST is set but produced zero addresses")
-      }
-      if (!entries.every((entry) => /^0x[0-9a-fA-F]{40}$/.test(entry))) {
-        throw new Error("environment variable BATCH_OWNER_ALLOWLIST must be a comma-separated list of 0x-prefixed 20-byte addresses")
-      }
-      ownerAllowlist = entries.map((entry) => entry.toLowerCase() as Address)
-    }
-  }
+  // No anchor and the lane switched off mounts no batch surface at all — exactly as before.
+  if (batchAnchor === undefined && !enabled) return undefined
+  const store = new D1BatchStore(env.DB)
   const coordinator = (): { fetch(input: string | Request, init?: RequestInit): Promise<Response> } | undefined => {
     const namespace = env.BATCH_COORDINATOR
     return namespace === undefined ? undefined : namespace.get(namespace.idFromName("batcher"))
   }
-  return {
-    enabled,
-    batchAnchor,
-    store: new D1BatchStore(env.DB),
-    ...(receiptAccount === undefined ? {} : { receiptAccount }),
-    ...(verifyAnchor === undefined ? {} : { verifyAnchor }),
-    ...(ownerAllowlist === undefined ? {} : { ownerAllowlist }),
-    notify: () => {
-      background(coordinator()?.fetch("https://batcher.internal/notify", { method: "POST" }))
-    },
-    flush: async () => {
-      const stub = coordinator()
-      if (stub === undefined) throw new Error("the batch coordinator is not bound")
-      const response = await stub.fetch("https://batcher.internal/flush", { method: "POST" })
-      if (!response.ok) throw new Error(`the batch coordinator answered ${response.status}`)
-    },
+  try {
+    if (batchAnchor === undefined) {
+      throw new Error("BATCHING_ENABLED=true requires BATCH_ANCHOR to be a 0x-prefixed 20-byte address")
+    }
+    deployment.batchAnchor = batchAnchor
+    let receiptAccount: LocalAccount | undefined
+    let verifyAnchor: (() => Promise<void>) | undefined
+    let ownerAllowlist: Address[] | undefined
+    if (enabled) {
+      // The anchor's deploy block floors the coordinator's historical scans — only the enabled lane
+      // ever reads it, so a placeholder beside BATCHING_ENABLED="false" stays inert rather than
+      // failing a boot that never asks it anything. Enabled, a non-numeric value degrades the lane.
+      if (env.BATCH_ANCHOR_BLOCK !== undefined && env.BATCH_ANCHOR_BLOCK !== "") {
+        if (!/^(0|[1-9][0-9]*)$/.test(env.BATCH_ANCHOR_BLOCK)) {
+          throw new Error("environment variable BATCH_ANCHOR_BLOCK must be a non-negative integer")
+        }
+        deployment.batchAnchorBlock = BigInt(env.BATCH_ANCHOR_BLOCK)
+      }
+      if (env.BATCH_COORDINATOR === undefined) {
+        throw new Error("BATCHING_ENABLED=true requires the BATCH_COORDINATOR Durable Object binding")
+      }
+      hashEnv(env, "BATCHER_PRIVATE_KEY") // the coordinator reads it again at first use; refuse the lane at boot, not mid-queue
+      receiptAccount = privateKeyToAccount(hashEnv(env, "RECEIPT_PRIVATE_KEY"))
+      let verdict: Promise<void> | undefined
+      verifyAnchor = () => {
+        verdict ??= (async () => {
+          let onchain: unknown
+          try {
+            onchain = await publicClient.readContract({
+              address: batchAnchor,
+              abi: batchAnchorAbi,
+              functionName: "CAPABILITY_REGISTRY",
+            })
+          } catch (error) {
+            verdict = undefined // a read that never reached the contract is not a verdict — retry next time
+            throw new Error(`the batch anchor could not be verified against the chain: ${error instanceof Error ? error.message : String(error)}`)
+          }
+          if (typeof onchain !== "string" || onchain.toLowerCase() !== deployment.capabilityRegistry) {
+            throw new Error(
+              `BATCH_ANCHOR ${batchAnchor} reports CAPABILITY_REGISTRY ${String(onchain)}, not this deployment's ${deployment.capabilityRegistry} — the batch surface refuses to run against the wrong contract`,
+            )
+          }
+        })()
+        return verdict
+      }
+      // The trial gate is read only while the lane is on — a stale value beside BATCHING_ENABLED=false
+      // stays inert rather than failing a boot that never asks it anything. Entries may be
+      // mixed-case; the wire's owner field is lowercase, so the list is normalized to match.
+      const rawList = env.BATCH_OWNER_ALLOWLIST
+      if (typeof rawList === "string" && rawList !== "") {
+        const entries = rawList.split(",").map((entry) => entry.trim()).filter((entry) => entry !== "")
+        // A SET value that parses to zero addresses ("," or " ") must not silently mean open —
+        // an operator who meant "closed" would get the opposite. Unset or empty stays "no allowlist".
+        if (entries.length === 0) {
+          throw new Error("environment variable BATCH_OWNER_ALLOWLIST is set but produced zero addresses")
+        }
+        if (!entries.every((entry) => /^0x[0-9a-fA-F]{40}$/.test(entry))) {
+          throw new Error("environment variable BATCH_OWNER_ALLOWLIST must be a comma-separated list of 0x-prefixed 20-byte addresses")
+        }
+        ownerAllowlist = entries.map((entry) => entry.toLowerCase() as Address)
+      }
+    }
+    return {
+      enabled,
+      batchAnchor,
+      store,
+      ...(receiptAccount === undefined ? {} : { receiptAccount }),
+      ...(verifyAnchor === undefined ? {} : { verifyAnchor }),
+      ...(ownerAllowlist === undefined ? {} : { ownerAllowlist }),
+      notify: () => {
+        background(coordinator()?.fetch("https://batcher.internal/notify", { method: "POST" }))
+      },
+      flush: async () => {
+        const stub = coordinator()
+        if (stub === undefined) throw new Error("the batch coordinator is not bound")
+        const response = await stub.fetch("https://batcher.internal/flush", { method: "POST" })
+        if (!response.ok) throw new Error(`the batch coordinator answered ${response.status}`)
+      },
+    }
+  } catch (error) {
+    // A batching-only failure: the lane reports config-invalid and refuses writes; the store
+    // itself is untouched. The message names the variable and the rule — never the value.
+    const message = `store batching is configured but invalid: ${error instanceof Error ? error.message : String(error)}`
+    console.error(JSON.stringify({ event: "batching-config-invalid", message }))
+    return {
+      enabled: false,
+      ...(batchAnchor === undefined ? {} : { batchAnchor }),
+      store,
+      configInvalid: message,
+      notify: () => {},
+      flush: async () => {
+        throw new Error("the batch lane is closed — its configuration is invalid")
+      },
+    }
   }
 }
 

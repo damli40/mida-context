@@ -11,7 +11,7 @@ import type { BatchReceipt } from "@mida/api"
 import { compareChainOrder } from "@mida/checkpoint"
 import type { StoredCheckpoint as CheckpointRecord } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
-import { addPendingAnchor, batchClient, batchStatusProbe, keepPendingPlaintext, laneForSave } from "./batching.js"
+import { RESUBMIT_LANE_CLOSED, addPendingAnchor, batchClient, batchStatusProbe, keepPendingPlaintext, laneForSave } from "./batching.js"
 import type { Lane } from "./batching.js"
 import { readSavedIds, recordSavedId } from "./saved-ids.js"
 import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl, sponsorReachable } from "./runtime.js"
@@ -619,35 +619,47 @@ export async function saveCheckpoint(runtime: ServiceRuntime, name: string, inpu
     // of this save landed at the store and its answer died on the wire. The SDK attaches the
     // attempted contextId to the error; with it the save is followed under the id the store
     // holds, exactly like a receipt. Without it the save cannot be followed and surfaces.
-    let queued: { contextId: Hex; receipt?: BatchReceipt }
+    let queued: { contextId: Hex; receipt?: BatchReceipt } | undefined
     try {
       queued = await agent.createBatched(runtime.owner, NAMESPACE, create)
     } catch (error) {
-      if ((error as { code?: unknown }).code !== "ALREADY_QUEUED") throw error
-      const held = (error as { contextId?: unknown }).contextId
-      if (typeof held !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(held)) throw error
-      queued = { contextId: held.toLowerCase() as Hex }
+      const code = (error as { code?: unknown }).code
+      if (code === "ALREADY_QUEUED") {
+        const held = (error as { contextId?: unknown }).contextId
+        if (typeof held !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(held)) throw error
+        queued = { contextId: held.toLowerCase() as Hex }
+      } else if (typeof code === "string" && RESUBMIT_LANE_CLOSED.has(code)) {
+        // in-20 T-1: the lane closed between the status check and the POST — a bad batching
+        // variable at the store answers BATCH_UNAVAILABLE, the kill switch BATCHING_DISABLED.
+        // The answer judges the LANE, not this save: the same bytes go out on the save's own
+        // transaction below rather than fail because the lane shut mid-flight.
+        laneWhy = "store-disabled"
+      } else {
+        throw error
+      }
     }
-    // The plaintext stays in the home from this moment (in-2 I3): a stale-epoch rejection is
-    // only recoverable while the bytes that produced the save exist to re-seal. Written before
-    // the pending entry so an entry always implies its plaintext — the reverse is a swept orphan.
-    keepPendingPlaintext(runtime.home, queued.contextId, create)
-    recordSavedId(runtime.home, envelope.checkpoint.eventId, queued.contextId)
-    addPendingAnchor(runtime.home, {
-      contextId: queued.contextId,
-      eventId: envelope.checkpoint.eventId,
-      sessionId: input.sessionId,
-      agent: name,
-      queuedAt: new Date().toISOString(),
-    })
-    return {
-      contextId: queued.contextId,
-      transactionHash: null,
-      milliseconds: Date.now() - started,
-      duplicate: false,
-      lane: "batched",
-      // the ALREADY_QUEUED path carries no receipt — the store never wrote one for this POST
-      batched: { state: "QUEUED", ...(queued.receipt !== undefined ? { receipt: queued.receipt } : {}) },
+    if (queued !== undefined) {
+      // The plaintext stays in the home from this moment (in-2 I3): a stale-epoch rejection is
+      // only recoverable while the bytes that produced the save exist to re-seal. Written before
+      // the pending entry so an entry always implies its plaintext — the reverse is a swept orphan.
+      keepPendingPlaintext(runtime.home, queued.contextId, create)
+      recordSavedId(runtime.home, envelope.checkpoint.eventId, queued.contextId)
+      addPendingAnchor(runtime.home, {
+        contextId: queued.contextId,
+        eventId: envelope.checkpoint.eventId,
+        sessionId: input.sessionId,
+        agent: name,
+        queuedAt: new Date().toISOString(),
+      })
+      return {
+        contextId: queued.contextId,
+        transactionHash: null,
+        milliseconds: Date.now() - started,
+        duplicate: false,
+        lane: "batched",
+        // the ALREADY_QUEUED path carries no receipt — the store never wrote one for this POST
+        batched: { state: "QUEUED", ...(queued.receipt !== undefined ? { receipt: queued.receipt } : {}) },
+      }
     }
   }
   const object = await agent.create(runtime.owner, NAMESPACE, {
@@ -773,7 +785,8 @@ export async function readCheckpoints(
     // store outage clears it. A "true", or a read that fails, marks the answer partial rather
     // than letting a route-less store hide batched saves.
     const status = await batchStatusProbe(runtime.apiBaseUrl)
-    if (status !== null && status.batchAnchor.toLowerCase() === batchAnchor.toLowerCase()) {
+    // the anchor is absent on a degraded lane's answer — only a string it echoed can match
+    if (status !== null && typeof status.batchAnchor === "string" && status.batchAnchor.toLowerCase() === batchAnchor.toLowerCase()) {
       const readBatched = async () => {
         try {
           return await agent.readBatchedWithStatus(runtime.owner, NAMESPACE)
