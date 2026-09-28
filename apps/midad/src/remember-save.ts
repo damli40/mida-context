@@ -283,21 +283,33 @@ export async function buildRemember(runtime: ServiceRuntime, record: unknown, de
   // writing as one agent share the same minute. Checked after every gate so a refused call never
   // consumes a slot, and reserved before the send so a second call during a slow write still
   // refuses. A write that never landed frees its slot.
-  const slot = `${laneKind}\n${agent}`
-  const admitted = (admittedSaves.get(slot) ?? []).filter((stamp) => now() - stamp < REMEMBER_WINDOW_MS)
-  const limit = REMEMBER_LIMITS[laneKind]
-  if (admitted.length >= limit) {
-    const nextAllowedAt = new Date(admitted[0]! + REMEMBER_WINDOW_MS).toISOString()
-    const seconds = Math.ceil((admitted[0]! + REMEMBER_WINDOW_MS - now()) / 1000)
-    return refused(
-      "rate-limited",
-      `Mida: ${agent} may write ${limit} record${limit === 1 ? "" : "s"} per minute on the ${laneKind} lane — the next write is allowed in ${seconds} s (at ${nextAllowedAt}). Nothing was written.`,
-      { lane: laneKind, nextAllowedAt },
-    )
+  let slot = `${laneKind}\n${agent}`
+  let admittedAt = 0
+  const admit = (lane: "direct" | "batched"): RememberSaveResult | null => {
+    const key = `${lane}\n${agent}`
+    const admitted = (admittedSaves.get(key) ?? []).filter((stamp) => now() - stamp < REMEMBER_WINDOW_MS)
+    const limit = REMEMBER_LIMITS[lane]
+    if (admitted.length >= limit) {
+      const nextAllowedAt = new Date(admitted[0]! + REMEMBER_WINDOW_MS).toISOString()
+      const seconds = Math.ceil((admitted[0]! + REMEMBER_WINDOW_MS - now()) / 1000)
+      return refused(
+        "rate-limited",
+        `Mida: ${agent} may write ${limit} record${limit === 1 ? "" : "s"} per minute on the ${lane} lane — the next write is allowed in ${seconds} s (at ${nextAllowedAt}). Nothing was written.`,
+        { lane, nextAllowedAt },
+      )
+    }
+    slot = key
+    admittedAt = now()
+    admitted.push(admittedAt)
+    admittedSaves.set(key, admitted)
+    return null
   }
-  const admittedAt = now()
-  admitted.push(admittedAt)
-  admittedSaves.set(slot, admitted)
+  const release = () => {
+    const without = (admittedSaves.get(slot) ?? []).filter((candidate) => candidate !== admittedAt)
+    admittedSaves.set(slot, without)
+  }
+  const tooSoon = admit(laneKind)
+  if (tooSoon !== null) return tooSoon
 
   const input: CreateContextInput = {
     value: content,
@@ -326,6 +338,11 @@ export async function buildRemember(runtime: ServiceRuntime, record: unknown, de
         } else if (typeof code === "string" && RESUBMIT_LANE_CLOSED.has(code)) {
           // in-20 T-1: the lane closed between the decision and the POST — the answer judges the
           // lane, not the note, so the write falls through to the direct create below.
+          // in-21 U-2: that fall-through IS a direct write — release the batched reservation
+          // and admit against the direct lane's own window before anything is sent.
+          release()
+          const directTooSoon = admit("direct")
+          if (directTooSoon !== null) return directTooSoon
         } else {
           throw error
         }
@@ -347,8 +364,7 @@ export async function buildRemember(runtime: ServiceRuntime, record: unknown, de
     return { kind: "saved", id: written.contextId, state: "anchored", lane: "direct" }
   } catch (error) {
     // a write that never landed frees the slot — the next call gets a real answer, not a stale hold
-    const without = (admittedSaves.get(slot) ?? []).filter((candidate) => candidate !== admittedAt)
-    admittedSaves.set(slot, without)
+    release()
     if (isMidaError(error, "CAPABILITY_REVOKED")) return refused("revoked", revokedText(agent))
     if (isMidaError(error, "WRITE_DENIED")) return refused("revoke-pending", revokePendingText(agent))
     if (isMidaError(error, "CAPABILITY_DENIED")) {

@@ -108,6 +108,36 @@ describe("buildRemember — the daemon's /remember route", () => {
     }
   })
 
+  it("the lane-closed fallback answers to the DIRECT lane's 1/min window, not the batched one (in-21 U-2)", async () => {
+    // The decided lane reserved the batched slot (60/min); the fallback write goes out as its
+    // own direct transaction, so it must pass the direct window exactly as a direct-decided
+    // write does — one per minute, the rest refused `rate-limited` naming the direct lane.
+    const admittedSaves = new Map<string, number[]>()
+    let directSends = 0
+    const deps = okDeps({
+      lane: async () => ({ kind: "batched", storeUrl: "http://store", batchAnchor: "0x00000000000000000000000000000000000000bb" }),
+      createBatched: async () => {
+        throw new MidaError("BATCH_UNAVAILABLE" as never, "the batch lane is closed")
+      },
+      create: async () => {
+        directSends += 1
+        return { contextId: id(20 + directSends), transactionHash: id(51) } as never
+      },
+      admittedSaves,
+    })
+    const rt = runtime()
+    const body = { agent: "codex", cwd: "/work", namespace: NS, content: "x" }
+    const results = []
+    for (let i = 0; i < 3; i += 1) {
+      results.push(await buildRemember(rt, { ...body, content: `n${i}` }, deps))
+    }
+    expect(results[0]).toMatchObject({ kind: "saved", state: "anchored", lane: "direct" })
+    for (const refused of results.slice(1)) {
+      expect(refused).toMatchObject({ kind: "refused", reason: "rate-limited", lane: "direct" })
+    }
+    expect(directSends).toBe(1)
+  })
+
   it("a caller-supplied provenance source is refused before anything is signed", async () => {
     let written = false
     const deps: Partial<RememberDeps> = {
