@@ -1377,6 +1377,50 @@ describe("the drain pass sweeps month-old SDK session files (in-21 U-4)", () => 
     expect(home.has("state/tasks/sdk-second.json")).toBe(false)
   })
 
+  // in-23 W-3 (review R-3): the gate was a WeakMap — every detached drainer spawn swept again.
+  // The last sweep time now lives in the home itself; each "process" below is a fresh MidaHome
+  // on the same root, so only the persisted mark can hold the hour.
+  it("the hourly sweep gate is shared on disk — a second process honours the first's sweep", async () => {
+    const { home, drain } = setup()
+    const stamp = (rel: string) => {
+      home.writeSecretJson(rel, { stale: true })
+      const at = new Date(T0 - 40 * DAY)
+      fs.utimesSync(home.path(rel), at, at)
+    }
+    stamp("state/tasks/sdk-first.json")
+    // process A runs the sweep and leaves its mark in the home
+    await drain({ home: new MidaHome(home.root) })
+    expect(home.has("state/tasks/sdk-first.json")).toBe(false)
+    // process B spawns thirty seconds later — under the old per-process gate it swept again
+    stamp("state/tasks/sdk-second.json")
+    await drain({ home: new MidaHome(home.root), now: () => new Date(T0 + 150_000) })
+    expect(home.has("state/tasks/sdk-second.json")).toBe(true)
+    // once the hour is past, the next process sweeps again
+    await drain({ home: new MidaHome(home.root), now: () => new Date(T0 + 120_000 + 61 * 60 * 1000) })
+    expect(home.has("state/tasks/sdk-second.json")).toBe(false)
+  })
+
+  // same review item: an entry the sweep can never remove used to write a log line on every
+  // hourly pass, forever. The report time persists too, so the note lands at most once a day.
+  it("a persistent skipped sweep entry is logged at most once a day — across processes", async () => {
+    const { dir, home, drain, drainLog } = setup()
+    const outside = join(dir, "outside.json")
+    writeFileSync(outside, "keep me")
+    mkdirSync(home.path("state/lastseen"), { recursive: true })
+    symlinkSync(outside, join(home.root, "state", "lastseen", "sdk-old.json"))
+    const skipLines = () => drainLog().split("\n").filter((line) => line.includes("session-sweep-skipped")).length
+    // process A sweeps and reports the entry it cannot move
+    await drain({ home: new MidaHome(home.root) })
+    expect(skipLines()).toBe(1)
+    // fresh processes sweep again an hour and two hours later — the same bad entry is quiet
+    await drain({ home: new MidaHome(home.root), now: () => new Date(T0 + 120_000 + 61 * 60 * 1000) })
+    await drain({ home: new MidaHome(home.root), now: () => new Date(T0 + 120_000 + 122 * 60 * 1000) })
+    expect(skipLines()).toBe(1)
+    // a day on, the still-stuck entry earns one more line — the log stays honest
+    await drain({ home: new MidaHome(home.root), now: () => new Date(T0 + 120_000 + 25 * 60 * 60 * 1000) })
+    expect(skipLines()).toBe(2)
+  })
+
   // in-22 V-2 (G-2), promoted from zz-rvfix2-sweep-live-session: the sweep must not strand a
   // session that is still being read — a live SDK handle's pin is refreshed by the read
   // itself, so "a month old" only ever describes a session that is truly gone. Ages and the

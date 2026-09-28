@@ -64,6 +64,13 @@ const SESSION_STATE_MAX_REMOVALS = 500
 /** Housekeeping is housekeeping, not the pass: at most once an hour per process (in-22 N-D). */
 const HOUSEKEEPING_INTERVAL_MS = 60 * 60 * 1000
 const lastHousekeepingAt = new WeakMap<MidaHome, number>()
+/**
+ * The marks every process on this home shares (in-23 R-3): `lastSweepAt` holds the hourly gate
+ * across detached drainer spawns — the WeakMap alone re-swept on each — and `skippedLoggedAt`
+ * bounds the session-sweep-skipped note to once a day, so an entry the sweep can never remove
+ * is not reported on every hourly pass forever.
+ */
+const HOUSEKEEPING_MARK = "state/housekeeping.json"
 /** How much of a failed provider answer a drain log line may quote — scrubbed first, then cut. */
 const LOG_SAMPLE_CHARS = 120
 
@@ -255,12 +262,16 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
     return ok
   }
 
-  // Housekeeping runs at most once an hour per process — a drain pass every 15 s does not need
-  // a sweep every pass (in-22 N-D). And it can never starve the queue: one malformed entry or
-  // one failed sweep is logged once and the pass still saves (in-22 V-3).
+  // Housekeeping runs at most once an hour per home — a drain pass every 15 s does not need
+  // a sweep every pass (in-22 N-D), and the persisted mark makes every process honour the same
+  // hour (in-23 R-3). And it can never starve the queue: one malformed entry or one failed
+  // sweep is logged once and the pass still saves (in-22 V-3).
   if (housekeepingDue(deps.home, now)) {
     try {
       pruneQueue(deps.home, now)
+      // written only after the sweep survives — a failed pass holds no hour on disk, so the
+      // next process retries instead of waiting out a sweep that never ran
+      writeHousekeepingMark(deps.home, { lastSweepAt: now().toISOString() })
     } catch {
       log({ outcome: "note", reason: "housekeeping-failed" })
     }
@@ -953,14 +964,52 @@ function pruneQueue(home: MidaHome, now: () => Date): void {
       }
     }
   }
-  if (skipped > 0) appendLog(home, "drain", { outcome: "note", reason: "session-sweep-skipped", skipped })
+  if (skipped > 0) {
+    // in-23 R-3: a stuck entry is reported at most once a day — the mark persists across
+    // processes, so the same bad file cannot fill the log on every spawned drainer's sweep
+    const mark = readHousekeepingMark(home)
+    const reported = typeof mark.skippedLoggedAt === "string" ? Date.parse(mark.skippedLoggedAt) : NaN
+    if (!Number.isFinite(reported) || nowMs - reported >= DAY_MS) {
+      appendLog(home, "drain", { outcome: "note", reason: "session-sweep-skipped", skipped })
+      writeHousekeepingMark(home, { skippedLoggedAt: new Date(nowMs).toISOString() })
+    }
+  }
 }
 
-/** True once an hour per home per process — the 15 s drain loop pays for a sweep hourly, not per pass. */
+/** The persisted marks' object — absent or malformed fields read as "no mark yet". */
+function readHousekeepingMark(home: MidaHome): Record<string, unknown> {
+  try {
+    const raw = home.readJson<unknown>(HOUSEKEEPING_MARK)
+    return typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
+/** Merges a field into the marks file; a mark that will not write never blocks a pass. */
+function writeHousekeepingMark(home: MidaHome, patch: Record<string, unknown>): void {
+  try {
+    home.writeSecretJson(HOUSEKEEPING_MARK, { ...readHousekeepingMark(home), ...patch })
+  } catch {
+    // the per-process gate above still bounds this process — next spawn simply re-sweeps
+  }
+}
+
+/**
+ * True once an hour per home — the 15 s drain loop pays for a sweep hourly, not per pass. The
+ * file's mark is authoritative across processes (in-23 R-3): a fresh drainer honours the sweep
+ * a previous spawn ran, where the WeakMap alone could not see it.
+ */
 function housekeepingDue(home: MidaHome, now: () => Date): boolean {
   const at = now().getTime()
   const last = lastHousekeepingAt.get(home)
   if (last !== undefined && at - last < HOUSEKEEPING_INTERVAL_MS) return false
+  const mark = readHousekeepingMark(home)
+  const stamp = typeof mark.lastSweepAt === "string" ? Date.parse(mark.lastSweepAt) : NaN
+  if (Number.isFinite(stamp)) {
+    lastHousekeepingAt.set(home, stamp)
+    if (at - stamp < HOUSEKEEPING_INTERVAL_MS) return false
+  }
   lastHousekeepingAt.set(home, at)
   return true
 }
