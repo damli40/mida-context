@@ -424,6 +424,51 @@ export function batchClient(
   return apiClient(baseUrl, deployment, privateKeyToAccount(identity.signerPrivateKey), undefined, home)
 }
 
+/** How long a read waits for a foreign-agent pending save to anchor after asking for the flush. */
+export const FLUSH_WAIT_MS = 3_000
+const FLUSH_POLL_MS = 250
+
+/**
+ * The flush-and-wait both read paths run when another agent's saves sit pending in the batch
+ * table (Amendment B.4; one shared copy since in-21 U-3): a pending row that is not the reader's
+ * own earns one POST /batch/flush — "empty" and "rate-limited" are ordinary answers and a failed
+ * flush never fails the read — then the table is re-polled until the foreign rows anchor or the
+ * wait runs out. A lane whose status did not say enabled:true can anchor nothing, so it earns no
+ * flush call and no wait: the pending rows still merge and render marked, as they did while the
+ * lane was open.
+ */
+export async function flushForeignPending<T extends { pending: { contextId: Hex; authorAgentId: Hex }[] }>(input: {
+  runtime: ServiceRuntime
+  agentName: string
+  deployment: Deployment
+  enabled: boolean
+  batched: T
+  readBatched: () => Promise<T | null>
+  flushWaitMs: number
+}): Promise<T> {
+  let batched = input.batched
+  let myAgentId: Hex | undefined
+  try {
+    myAgentId = loadAgentIdentity(input.runtime.home, input.agentName)?.agentId
+  } catch {
+    myAgentId = undefined
+  }
+  const foreign = batched.pending.filter(
+    (item) => myAgentId === undefined || item.authorAgentId.toLowerCase() !== myAgentId.toLowerCase(),
+  )
+  if (foreign.length === 0 || input.enabled !== true) return batched
+  const client = batchClient(input.runtime.home, input.runtime.apiBaseUrl, input.deployment, input.agentName)
+  await client?.flushBatch().catch(() => undefined)
+  const waiting = new Set(foreign.map((item) => item.contextId))
+  const deadline = Date.now() + input.flushWaitMs
+  while (Date.now() < deadline && batched.pending.some((item) => waiting.has(item.contextId))) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(FLUSH_POLL_MS, deadline - Date.now())))
+    const again = await input.readBatched()
+    if (again !== null) batched = again
+  }
+  return batched
+}
+
 /**
  * The lane for one checkpoint save, read fresh off the live runtime: the flag is re-read from
  * network.json on every call so `mida batching on|off` takes effect on the next save without a

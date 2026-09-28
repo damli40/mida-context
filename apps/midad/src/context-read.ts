@@ -8,7 +8,7 @@ import type { RecordPlacement } from "@mida/chain"
 import { compareChainOrder, orderTime, otherTasksFor, taskOf } from "@mida/checkpoint"
 import type { MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
-import { batchClient, batchStatusProbe } from "./batching.js"
+import { FLUSH_WAIT_MS, batchStatusProbe, flushForeignPending } from "./batching.js"
 import { chainRefusalReason } from "./chain-busy.js"
 import { unwrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
@@ -117,18 +117,15 @@ const refused = (reason: string, text: string): ContextReadResult => ({ kind: "r
 
 const BAD_INPUT = "Mida: the context read was malformed — nothing was read."
 
-/** How long a read waits for a foreign-agent pending save to anchor after asking for the flush. */
-const FLUSH_WAIT_MS = 3_000
-const FLUSH_POLL_MS = 250
-
 /**
  * The merge `readCheckpoints` runs on `projects.current`, lifted to whatever namespace the call
  * names: the direct lane's verified read plus — when this deployment anchors batches — the batch
  * table's anchored and verified-pending rows, pending saves from OTHER agents flushed once and
- * awaited briefly, a route-less store answered by the contract's own hasBatchedSaves flag rather
- * than believed empty, and the same-second tie scan that places the members of a cross-lane
- * second together. Everything the store claims is verified inside the SDK calls; nothing here
- * trusts a row's filed shape over what Monad recorded.
+ * awaited briefly while the lane is open (in-21 U-3), a route-less store answered by the
+ * contract's own hasBatchedSaves flag rather than believed empty, and the same-second tie scan
+ * that places the members of a cross-lane second together. Everything the store claims is
+ * verified inside the SDK calls; nothing here trusts a row's filed shape over what Monad
+ * recorded.
  */
 async function readNamespaceObjects(
   runtime: ServiceRuntime,
@@ -159,26 +156,15 @@ async function readNamespaceObjects(
       if (batched === null) {
         partial = true
       } else {
-        let myAgentId: Hex | undefined
-        try {
-          myAgentId = loadAgentIdentity(runtime.home, name)?.agentId
-        } catch {
-          myAgentId = undefined
-        }
-        const foreign = batched.pending.filter(
-          (item) => myAgentId === undefined || item.authorAgentId.toLowerCase() !== myAgentId.toLowerCase(),
-        )
-        if (foreign.length > 0) {
-          const client = batchClient(runtime.home, runtime.apiBaseUrl, deployment, name)
-          await client?.flushBatch().catch(() => undefined)
-          const waiting = new Set(foreign.map((item) => item.contextId))
-          const deadline = Date.now() + (options?.flushWaitMs ?? FLUSH_WAIT_MS)
-          while (Date.now() < deadline && batched.pending.some((item) => waiting.has(item.contextId))) {
-            await new Promise((resolve) => setTimeout(resolve, Math.min(FLUSH_POLL_MS, deadline - Date.now())))
-            const again = await readBatched()
-            if (again !== null) batched = again
-          }
-        }
+        batched = await flushForeignPending({
+          runtime,
+          agentName: name,
+          deployment,
+          enabled: status.enabled,
+          batched,
+          readBatched,
+          flushWaitMs: options?.flushWaitMs ?? FLUSH_WAIT_MS,
+        })
         skipped += batched.skipped.length
         if (batched.partial) partial = true
         const directCount = merged.length

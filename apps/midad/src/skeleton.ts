@@ -11,7 +11,7 @@ import type { BatchReceipt } from "@mida/api"
 import { compareChainOrder } from "@mida/checkpoint"
 import type { StoredCheckpoint as CheckpointRecord } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
-import { RESUBMIT_LANE_CLOSED, addPendingAnchor, batchClient, batchStatusProbe, keepPendingPlaintext, laneForSave } from "./batching.js"
+import { FLUSH_WAIT_MS, RESUBMIT_LANE_CLOSED, addPendingAnchor, batchStatusProbe, flushForeignPending, keepPendingPlaintext, laneForSave } from "./batching.js"
 import type { Lane } from "./batching.js"
 import { readSavedIds, recordSavedId } from "./saved-ids.js"
 import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl, sponsorReachable } from "./runtime.js"
@@ -714,18 +714,15 @@ export function authorNamesFor(runtime: ServiceRuntime): Record<string, string> 
  */
 export type StoredCheckpoint = CheckpointRecord & { anchor?: "ANCHORED" | "PENDING_ANCHOR" }
 
-/** How long a read waits for a foreign-agent pending save to anchor after asking for the flush. */
-const FLUSH_WAIT_MS = 3_000
-const FLUSH_POLL_MS = 250
-
 /**
  * Spec §5D steps 2–3, plus the BatchAnchor read (plan Task 8): a full protocol read as this agent,
  * then — whenever the deployment carries a BatchAnchor, whether or not batching is switched on —
  * the batch table's anchored and verified-pending saves merged in, marked `anchor` so a pending
  * save is never mistaken for an anchored one. A pending save from a DIFFERENT agent triggers the
- * store flush (Amendment B.4): `POST /batch/flush` once, then re-reads every 250 ms until those
- * saves anchor or `flushWaitMs` runs out — never a wait when every pending save is the reader's
- * own. A batched list the store cannot serve leaves `partial` set rather than hiding the gap —
+ * store flush (Amendment B.4) while the lane is open: `POST /batch/flush` once, then re-reads
+ * every 250 ms until those saves anchor or `flushWaitMs` runs out — never a wait when every
+ * pending save is the reader's own, and no flush and no wait at all on a closed lane (in-21 U-3).
+ * A batched list the store cannot serve leaves `partial` set rather than hiding the gap —
  * and when the store serves no batch surface for this anchor at all, the contract's own
  * `hasBatchedSaves(owner)` flag decides whether there is a table to miss: only a confirmed
  * "none" keeps the read complete, anything else is partial too.
@@ -800,29 +797,18 @@ export async function readCheckpoints(
         // incomplete, so partial it is; nothing here may pretend the batch side was empty.
         partial = true
       } else {
-        let myAgentId: Hex | undefined
-        try {
-          myAgentId = loadAgentIdentity(runtime.home, name)?.agentId
-        } catch {
-          myAgentId = undefined
-        }
-        const foreign = batched.pending.filter(
-          (item) => myAgentId === undefined || item.authorAgentId.toLowerCase() !== myAgentId.toLowerCase(),
-        )
-        if (foreign.length > 0) {
-          // Agent switch (Amendment B.4): ask the store to anchor the queue now — once per read.
-          // "empty" and "rate-limited" are ordinary answers, and a failed flush must not fail the
-          // read: the pending saves are still shown, marked.
-          const client = batchClient(runtime.home, runtime.apiBaseUrl, deployment, name)
-          await client?.flushBatch().catch(() => undefined)
-          const waiting = new Set(foreign.map((item) => item.contextId))
-          const deadline = Date.now() + (options?.flushWaitMs ?? FLUSH_WAIT_MS)
-          while (Date.now() < deadline && batched.pending.some((item) => waiting.has(item.contextId))) {
-            await new Promise((resolve) => setTimeout(resolve, Math.min(FLUSH_POLL_MS, deadline - Date.now())))
-            const again = await readBatched()
-            if (again !== null) batched = again
-          }
-        }
+        // Agent switch (Amendment B.4): ask the store to anchor the queue now — once per read,
+        // and only while the lane is open (in-21 U-3: a closed lane anchors nothing, so the
+        // pending rows render marked without a flush call or a wait).
+        batched = await flushForeignPending({
+          runtime,
+          agentName: name,
+          deployment,
+          enabled: status.enabled,
+          batched,
+          readBatched,
+          flushWaitMs: options?.flushWaitMs ?? FLUSH_WAIT_MS,
+        })
         skipped += batched.skipped.length
         if (batched.partial) partial = true
         const directCount = checkpoints.length

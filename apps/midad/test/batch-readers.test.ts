@@ -411,6 +411,32 @@ describe("readCheckpoints — the batched lane's records merge in, marked", () =
     }
   })
 
+  it("a foreign pending save on a CLOSED lane still renders marked — with no flush call and no wait (in-21 U-3)", async () => {
+    // enabled:false means the store cannot anchor anything, so the 3 s flush-and-poll would be
+    // pure delay: the read skips it entirely and shows the pending row exactly as before.
+    const store = await stubStore({ enabled: false, batchAnchor: ANCHOR })
+    try {
+      const home = batchedHome(store.url)
+      const contextId = `0x${"d5".repeat(32)}` as Hex
+      let batchedReads = 0
+      const agent = {
+        readWithStatus: async () => ({ objects: [], partial: false }),
+        readBatchedWithStatus: async () => {
+          batchedReads += 1
+          return { ...emptyBatched, pending: [pendingItem(contextId, "cp-foreign", OTHER_AGENT_ID)] }
+        },
+      }
+      const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1", { flushWaitMs: 300 })
+      expect(result.checkpoints).toEqual([expect.objectContaining({ contextId, anchor: "PENDING_ANCHOR" })])
+      expect(store.flushes).toBe(0)
+      // the counting fake is the clock: the poll loop would have re-read the table
+      expect(batchedReads).toBe(1)
+    } finally {
+      await store.close()
+    }
+  })
+
   it("a batched read that fails marks the result partial — never silently empty", async () => {
     const store = await stubStore()
     try {
