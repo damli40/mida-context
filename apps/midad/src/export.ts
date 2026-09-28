@@ -6,7 +6,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { zeroHash } from "viem"
 import { CONTEXT_KIND, OWNER_AUTHOR_ID, PROVENANCE_SOURCE, RECORD_TYPE, canonicalBytes } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { mergeCheckpoints, orderTime } from "@mida/checkpoint"
+import { mergeCheckpoints, orderTime, taskOf } from "@mida/checkpoint"
 import type { Checkpoint, StoredCheckpoint } from "@mida/checkpoint"
 import type { MidaHome } from "./home.js"
 import { loadOwnerAddress, loadOwnerMode } from "./keys.js"
@@ -109,10 +109,16 @@ export interface ExportEntry {
   /** The record that replaced this one (names it in parentId), or null. */
   supersededBy: Hex | null
   /**
-   * Checkpoints only: the checkpoint the handoff opens with — the head of the
-   * working-session chain mergeCheckpoints chooses, so a newer session with no real work
-   * is not flagged. Ordered by the chain's own stamps, never the writer's claim. False on
-   * every non-checkpoint record.
+   * Checkpoints only: the record's named task — "main" when the envelope names none
+   * (absent reads as main everywhere). Absent on every non-checkpoint record.
+   */
+  task?: string
+  /**
+   * Checkpoints only: the checkpoint a handoff for this record's task opens with — the
+   * head of the working-session chain mergeCheckpoints chooses WITHIN that task, so a
+   * newer session with no real work is not flagged, and two tasks in one project each
+   * flag their own head. Ordered by the chain's own stamps, never the writer's claim.
+   * False on every non-checkpoint record.
    */
   newestCheckpoint: boolean
   lane: "direct" | "batched"
@@ -451,13 +457,18 @@ function latestInLineage(records: readonly SourceRecord[]): Set<string> {
 }
 
 /**
- * The checkpoint the handoff opens with in each project — mergeCheckpoints's own pick
- * (the chosen chain's head). Only records carrying a checkpoint envelope take part, grouped
- * by projectId exactly as a handoff for that project would see them; each record is rebuilt
- * as the StoredCheckpoint the merge consumes, with Monad's own placement as its order.
+ * The checkpoint a handoff opens with in each project × task thread — mergeCheckpoints's
+ * own pick (the chosen chain's head). Only records carrying a checkpoint envelope take
+ * part, grouped by projectId AND the same taskOf() the handoff filters on — a handoff
+ * continues per task, so one project-wide merge would flag a single head and leave every
+ * other task's real head unmarked (in-18 B3). Each record is rebuilt as the
+ * StoredCheckpoint the merge consumes, envelope task included, with Monad's own placement
+ * as its order.
  */
 function newestCheckpointIds(records: readonly SourceRecord[]): Set<string> {
-  const byProject = new Map<string, StoredCheckpoint[]>()
+  // Key: projectId + NUL + task — the first NUL splits uniquely because a task
+  // name (a-z0-9- only) can never contain one.
+  const byThread = new Map<string, StoredCheckpoint[]>()
   for (const record of records) {
     const envelope = unwrapCheckpoint(record.payload.value)
     if (envelope === null) continue
@@ -475,16 +486,18 @@ function newestCheckpointIds(records: readonly SourceRecord[]): Set<string> {
         ...(record.chain?.block === undefined ? {} : { block: record.chain.block }),
         ...(record.chain?.index === undefined ? {} : { index: record.chain.index }),
       },
+      ...(envelope.task === undefined ? {} : { task: envelope.task }),
       ...(envelope.migration === undefined ? {} : { migration: envelope.migration }),
     }
-    const list = byProject.get(envelope.projectId)
-    if (list === undefined) byProject.set(envelope.projectId, [stored])
+    const key = `${envelope.projectId}${taskOf(stored)}`
+    const list = byThread.get(key)
+    if (list === undefined) byThread.set(key, [stored])
     else list.push(stored)
   }
   const newest = new Set<string>()
-  for (const checkpoints of byProject.values()) {
+  for (const checkpoints of byThread.values()) {
     // provenance is the chosen chain in chain order — its last row is the head a handoff
-    // for this project would continue from.
+    // for this project × task would continue from.
     const merged = mergeCheckpoints(checkpoints)
     const head = merged?.provenance.at(-1)?.contextId
     if (head !== undefined) newest.add(head.toLowerCase())
@@ -537,6 +550,7 @@ function entryFor(
       ? "you"
       : names[record.authorId.toLowerCase()] ?? record.authorId
   const { migration, unreadable } = envelopeOf(record)
+  const checkpointEnvelope = unwrapCheckpoint(record.payload.value)
   return {
     contextId: record.contextId,
     namespace: record.namespace,
@@ -556,6 +570,7 @@ function entryFor(
     // (supersededBy names it) or the chain simply holds a higher version.
     superseded: supersededBy.has(record.contextId.toLowerCase()) || !latest.has(record.contextId.toLowerCase()),
     supersededBy: supersededBy.get(record.contextId.toLowerCase()) ?? null,
+    ...(checkpointEnvelope === null ? {} : { task: taskOf(checkpointEnvelope) }),
     newestCheckpoint: newestCheckpoints.has(record.contextId.toLowerCase()),
     lane: record.lane ?? "direct",
     batchId: record.batchId ?? null,
@@ -570,7 +585,7 @@ function entryFor(
 /** A checkpoint envelope's fields in the order a handoff reader would tell them. */
 function checkpointLines(envelope: CheckpointEnvelope): string[] {
   const c = envelope.checkpoint
-  const lines: string[] = [`project ${envelope.projectId} · session ${envelope.sessionId} · compiled by ${envelope.compiledBy}`]
+  const lines: string[] = [`project ${envelope.projectId} · session ${envelope.sessionId} · task ${taskOf(envelope)} · compiled by ${envelope.compiledBy}`]
   lines.push(`objective: ${c.objective}`)
   if (c.originalRequest !== null) lines.push(`asked: ${c.originalRequest}`)
   for (const item of c.progress) lines.push(`progress: ${item}`)
@@ -647,7 +662,7 @@ function recordsMarkdown(entries: ExportEntry[], records: readonly SourceRecord[
       // checkpoint a handoff would continue from — there is no "current" flag to overclaim.
       const flags = [
         ...(entry.superseded ? [entry.supersededBy === null ? "superseded" : `superseded → ${entry.supersededBy}`] : []),
-        ...(entry.newestCheckpoint ? ["the checkpoint the handoff opens with"] : []),
+        ...(entry.newestCheckpoint ? ["the checkpoint a handoff for this task opens with"] : []),
         ...(entry.expired ? ["expired"] : []),
         ...(entry.lane === "batched" ? [`batched in ${entry.batchId}`] : []),
         ...(entry.envelope === "unreadable" ? ["migration envelope unreadable"] : []),
@@ -715,9 +730,10 @@ leftover still being written — on this machine or another — is kept and name
 ## What is inside
 
 - \`records.json\` — every record, machine-readable. Times are ISO-8601 UTC; bigints are decimal strings.
-  On checkpoint records, \`newestCheckpoint\` marks the checkpoint the handoff opens with — the
-  head of the working-session chain the handoff chooses, so a newer session with no real work
-  is not flagged.
+  On checkpoint records, \`task\` names the record's task ("main" when the envelope names none)
+  and \`newestCheckpoint\` marks the checkpoint a handoff for this task opens with — the
+  head of that task's working-session chain, so a newer session with no real work
+  is not flagged and two tasks in one project each flag their own head.
 - \`records.md\` — the same records readable, grouped by context area, newest first.
 - \`encrypted/<contextId>.manifest.json\` — the manifest the store serves for that record, in the
   canonical JSON form the protocol hashes (\`canonicalBytes\`, packages/protocol/src/wire.ts — RFC 8785).
@@ -805,7 +821,7 @@ not read. ${input.unreadableIds.length === 1 ? "It" : "They"} exported anyway �
 exactly as stored and \`envelope\` is "unreadable". \`writtenAt\` is Monad's own stamp — the
 unreadable envelope's dates are not trusted for it. On a checkpoint, \`newestCheckpoint\` still
 follows the handoff's rule: the handoff reads the envelope inside the checkpoint, and the flag
-answers the same question it would.
+answers the same question it would for that record's task.
 
 ${input.unreadableIds.map((id) => `- \`${id}\``).join("\n")}
 `}

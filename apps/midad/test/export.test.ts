@@ -883,16 +883,68 @@ describe("mida export — the written folder", () => {
     const { dest: dest2 } = await exportWith([fixtureRecord()])
     const fact = JSON.parse(readFileSync(join(dest2, "records.json"), "utf8")) as ExportEntry[]
     expect(fact[0]!.newestCheckpoint).toBe(false)
-    // records.md names the flag by what it is — the checkpoint the handoff opens with —
-    // never "newest" (a newer session with no real work is not flagged) and never "current"
-    // (the namespace is projects.current, so match the flag separator, not the word).
+    // records.md names the flag by what it is — the checkpoint a handoff for this task
+    // opens with — never "newest" (a newer session with no real work is not flagged) and
+    // never "current" (the namespace is projects.current, so match the flag separator,
+    // not the word).
     const md = readFileSync(join(dest, "records.md"), "utf8")
-    expect(md).toContain("the checkpoint the handoff opens with")
+    expect(md).toContain("the checkpoint a handoff for this task opens with")
     expect(md).not.toContain("newest checkpoint")
     expect(md).not.toMatch(/· current/)
     // and the README's field list explains newestCheckpoint the same way
     const readme = readFileSync(join(dest, "README.md"), "utf8")
-    expect(readme).toContain("the checkpoint the handoff opens with")
+    expect(readme).toContain("the checkpoint a handoff for this task opens with")
+  })
+
+  it("two tasks in one project each flag their own head, and every checkpoint entry names its task", async () => {
+    // in-18 B3 (probe zz-rvint-export-tasks): a project-wide merge flagged ONE head for all
+    // tasks' checkpoints together — a handoff for the other task would open a different
+    // record. Now each project × task thread merges on its own (the same taskOf() handoff
+    // uses), so both heads are flagged, each entry carries its task, and records.md prints it.
+    const checkpoint = (eventId: string, sessionId: string, task: string | undefined) => ({
+      v: 1 as const,
+      value: { ...wrapCheckpoint({
+        projectId: "proj-x",
+        sessionId,
+        continuesSession: null,
+        compiledBy: "t",
+        checkpoint: sampleCheckpoint({ eventId }),
+        ...(task === undefined ? {} : { task }),
+      }) } as Record<string, unknown>,
+      kind: "EPISODE" as const,
+      provenance: { source: "AGENT_INFERRED" as const },
+    })
+    // task main's checkpoint was saved EARLIER than task sdk's — the buggy project-wide
+    // merge flagged only the sdk one as "the" project head.
+    const mainCp = fixtureRecord({
+      kind: 5,
+      createdAt: 1_700_000_000n,
+      payload: checkpoint("cp-task-main", "s-main", undefined),
+    })
+    const sdkCp = fixtureRecord({
+      kind: 5,
+      createdAt: 1_700_001_000n,
+      payload: checkpoint("cp-task-sdk", "s-sdk", "sdk"),
+    })
+    const { dest } = await exportWith([mainCp, sdkCp])
+    const entries = JSON.parse(readFileSync(join(dest, "records.json"), "utf8")) as ExportEntry[]
+    const main = entries.find((e) => e.contextId === mainCp.contextId)!
+    const sdk = entries.find((e) => e.contextId === sdkCp.contextId)!
+    // BOTH heads flagged — a handoff for each task opens its own checkpoint
+    expect(main.newestCheckpoint).toBe(true)
+    expect(sdk.newestCheckpoint).toBe(true)
+    // and each entry names its task — absent reads as main
+    expect(main.task).toBe("main")
+    expect(sdk.task).toBe("sdk")
+    // a non-checkpoint record carries no task key at all
+    const { dest: dest2 } = await exportWith([fixtureRecord()])
+    const fact = JSON.parse(readFileSync(join(dest2, "records.json"), "utf8")) as ExportEntry[]
+    expect("task" in fact[0]!).toBe(false)
+    // records.md names the task on each checkpoint's header line, and the flag is task-scoped
+    const md = readFileSync(join(dest, "records.md"), "utf8")
+    expect(md).toContain("task sdk")
+    expect(md).toContain("task main")
+    expect(md).toContain("the checkpoint a handoff for this task opens with")
   })
 
   it("the encrypted files are the store's bytes — manifest hashes to manifestHash", async () => {

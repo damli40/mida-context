@@ -355,7 +355,7 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
     expect(entryFor(saved.fact.contextId).newestCheckpoint).toBe(false)
     expect(entryFor(saved.career.contextId).newestCheckpoint).toBe(false)
     const md = readFileSync(join(dest, "records.md"), "utf8")
-    expect(md).toContain("the checkpoint the handoff opens with")
+    expect(md).toContain("the checkpoint a handoff for this task opens with")
     expect(md).not.toMatch(/· current/)
   })
 
