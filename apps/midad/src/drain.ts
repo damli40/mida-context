@@ -53,6 +53,14 @@ const WEEK_MS = 7 * 24 * 60 * 60 * 1000
 const TMP_MAX_AGE_MS = 60 * 60 * 1000
 const LOG_MAX_BYTES = 5 * 1024 * 1024
 const LOG_KEEP_BYTES = 1024 * 1024
+/**
+ * The folders every `new Mida()` session leaves files in (in-21 U-4): its task pin, its
+ * last-seen mark and its continues record. A file untouched for a month belongs to a session
+ * that is over, and the cap bounds a pass over a home that was never swept.
+ */
+const SESSION_STATE_DIRS = ["state/tasks", "state/lastseen", "state/continues"] as const
+const SESSION_STATE_MAX_AGE_MS = 30 * DAY_MS
+const SESSION_STATE_MAX_REMOVALS = 500
 /** How much of a failed provider answer a drain log line may quote — scrubbed first, then cut. */
 const LOG_SAMPLE_CHARS = 120
 
@@ -852,8 +860,10 @@ function writeState(home: MidaHome, sessionId: string, state: SessionState): voi
 
 /**
  * Housekeeping on every drain: `queue/bad` and `queue/compiled` entries older than a week, stray
- * `.tmp` files older than an hour, and any JSONL log grown past 5 MB cut back to its last 1 MB
- * (starting at a line boundary so every kept line is a whole record). Nothing here throws.
+ * `.tmp` files older than an hour, session-state files (`state/tasks`, `state/lastseen`,
+ * `state/continues`) untouched for a month — at most 500 a pass — and any JSONL log grown past
+ * 5 MB cut back to its last 1 MB (starting at a line boundary so every kept line is a whole
+ * record). Nothing here throws.
  */
 function pruneQueue(home: MidaHome, now: () => Date): void {
   const nowMs = now().getTime()
@@ -896,6 +906,19 @@ function pruneQueue(home: MidaHome, now: () => Date): void {
       fs.writeFileSync(full, firstNewline === -1 ? tail : tail.subarray(firstNewline + 1))
     } catch {
       // a log that will not truncate is left for the next pass
+    }
+  }
+  // in-21 U-4: each `new Mida()` is a session, and the three folders above collect one file per
+  // session, forever. Thirty days idle is past any resume; only the session's own .json files
+  // go — a stray folder or another name is never touched.
+  let swept = 0
+  for (const dir of SESSION_STATE_DIRS) {
+    for (const name of home.list(dir)) {
+      if (swept >= SESSION_STATE_MAX_REMOVALS) return
+      if (name.endsWith(".json") && olderThan(home.path(`${dir}/${name}`), SESSION_STATE_MAX_AGE_MS)) {
+        home.remove(`${dir}/${name}`)
+        swept += 1
+      }
     }
   }
 }

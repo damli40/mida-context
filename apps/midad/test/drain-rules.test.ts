@@ -1309,6 +1309,50 @@ describe("a held midad.lock", () => {
   })
 })
 
+describe("the drain pass sweeps month-old SDK session files (in-21 U-4)", () => {
+  const DAY = 24 * 60 * 60 * 1000
+
+  it("state/tasks, state/lastseen and state/continues drop files idle for 30 days — and nothing else", async () => {
+    const { home, drain } = setup()
+    const stamp = (rel: string, when: number) => {
+      home.writeSecretJson(rel, { stale: true })
+      const at = new Date(when)
+      fs.utimesSync(home.path(rel), at, at)
+    }
+    // every `new Mida()` leaves one file in each folder — a month idle means the session is over
+    for (const dir of ["state/tasks", "state/lastseen", "state/continues"]) stamp(`${dir}/s-old.json`, T0 - 31 * DAY)
+    // everything else survives: a younger session file, a non-.json name however old, and an
+    // equally old file under a folder the sweep does not own
+    stamp("state/tasks/s-new.json", T0 - DAY)
+    mkdirSync(home.path("state/lastseen"), { recursive: true })
+    writeFileSync(home.path("state/lastseen/keep.txt"), "not a session file")
+    fs.utimesSync(home.path("state/lastseen/keep.txt"), new Date(T0 - 40 * DAY), new Date(T0 - 40 * DAY))
+    stamp("state/other/s-old.json", T0 - 40 * DAY)
+    await drain()
+    for (const dir of ["state/tasks", "state/lastseen", "state/continues"]) {
+      expect(home.has(`${dir}/s-old.json`)).toBe(false)
+    }
+    expect(home.has("state/tasks/s-new.json")).toBe(true)
+    expect(home.has("state/lastseen/keep.txt")).toBe(true)
+    expect(home.has("state/other/s-old.json")).toBe(true)
+  })
+
+  it("a pass removes at most 500 stale session files; the rest go on the next pass", async () => {
+    const { home, drain } = setup()
+    const old = new Date(T0 - 31 * DAY)
+    mkdirSync(home.path("state/tasks"), { recursive: true })
+    for (let i = 0; i < 505; i += 1) {
+      const rel = `state/tasks/s-${i.toString().padStart(4, "0")}.json`
+      writeFileSync(home.path(rel), "{}")
+      fs.utimesSync(home.path(rel), old, old)
+    }
+    await drain()
+    expect(home.list("state/tasks")).toHaveLength(5)
+    await drain()
+    expect(home.list("state/tasks")).toHaveLength(0)
+  })
+})
+
 describe("the detached drainer never inherits agent-CLI secrets", () => {
   it("drops every ANTHROPIC_* variable from the spawned environment", () => {
     // Values are built by concatenation so no secret-shaped literal sits in the repo.
