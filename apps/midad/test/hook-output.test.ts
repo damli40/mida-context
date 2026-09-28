@@ -66,7 +66,7 @@ describe("sessionStartMessage", () => {
     )
   })
 
-  it("a cut handoff says so", () => {
+  it("a cut handoff says the oldest progress was trimmed to fit — no error words (in-20 T-3)", () => {
     const body = {
       kind: "handoff",
       text: "CTX",
@@ -76,10 +76,13 @@ describe("sessionStartMessage", () => {
       savedAt: "2026-09-21T11:59:20.000Z",
       cut: true,
     }
-    expect(sessionStartMessage(body, "codex", NOW)).toContain("(shortened)")
+    const line = sessionStartMessage(body, "codex", NOW)
+    expect(line).toContain("(oldest progress trimmed to fit)")
+    expect(line).not.toContain("shortened")
+    expect(line).not.toContain("longer than the limit")
   })
 
-  it("an oversized handoff says so — it was not shortened, it is longer than the limit (R5-4)", () => {
+  it("an oversized handoff says it is above the size target; cut-and-still-over says both plainly (R5-4, in-20 T-3)", () => {
     const body = {
       kind: "handoff",
       text: "CTX",
@@ -89,9 +92,25 @@ describe("sessionStartMessage", () => {
       savedAt: "2026-09-21T11:59:20.000Z",
       oversized: true,
     }
-    expect(sessionStartMessage(body, "codex", NOW)).toContain("(longer than the limit)")
+    expect(sessionStartMessage(body, "codex", NOW)).toContain("(above the size target)")
     const both = { ...body, cut: true }
-    expect(sessionStartMessage(both, "codex", NOW)).toContain("(shortened, longer than the limit)")
+    expect(sessionStartMessage(both, "codex", NOW)).toContain("(oldest progress trimmed; still above the size target)")
+  })
+
+  it("a partial store list joins after the size part with '; ' — never a comma list of states (in-20 T-3)", () => {
+    const body = {
+      kind: "handoff",
+      text: "CTX",
+      checkpoints: 1,
+      facts: 0,
+      savedBy: "codex",
+      savedAt: "2026-09-21T11:59:20.000Z",
+      oversized: true,
+      partial: true,
+    }
+    expect(sessionStartMessage(body, "codex", NOW)).toContain(
+      "(above the size target; incomplete — try again in a moment)",
+    )
   })
 
   it("empty: the connected line", () => {

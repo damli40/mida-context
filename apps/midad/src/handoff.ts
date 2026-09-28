@@ -42,9 +42,9 @@ export type HandoffResult =
       seen: string[]
       /** The size limit the text was cut against — the daemon logs it next to the text's length. */
       limitChars: number
-      /** Oldest progress entries were left out so the text fits the limit — the owner sees "(shortened)". */
+      /** Oldest progress entries were left out so the text fits the limit — the owner sees "oldest progress trimmed". */
       cut: boolean
-      /** Still longer than the limit after trimming — the owner sees "(longer than the limit)". */
+      /** Still over the size target after trimming — the owner sees "above the size target". */
       oversized: boolean
       /** The store's list was incomplete — the text opens with the may-be-incomplete line and the owner sees "(incomplete …)". */
       partial: boolean

@@ -115,15 +115,26 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
       typeof body.savedBy === "string" && typeof body.savedAt === "string"
         ? ` (from ${body.savedBy}, ${agoText(body.savedAt, now)})`
         : ""
-    // honest size state: "(shortened)" only when progress was actually left out — a handoff that
-    // is simply longer than the limit says so instead (R5-4). A partial store list gets the same
-    // treatment: the owner hears "incomplete", never a count that looks whole (M3-D).
-    const size = [
-      body.cut === true ? "shortened" : null,
-      body.oversized === true ? "longer than the limit" : null,
-      body.partial === true ? "incomplete — try again in a moment" : null,
-    ].filter((s): s is string => s !== null)
-    const state = size.length > 0 ? ` (${size.join(", ")})` : ""
+    // honest size state in plain words (in-20 T-3): the "(shortened, longer than the
+    // limit)" pair read like a contradiction and a failure. What happened is said
+    // instead — "trimmed" only when progress was actually left out, "above the size
+    // target" when the text is still over, and the two combine with "; still" so a
+    // trimmed handoff that remains over never reads as two separate problems (R5-4).
+    // A partial store list joins with "; " after the size part: the owner hears
+    // "incomplete", never a count that looks whole (M3-D).
+    const size =
+      body.cut === true
+        ? body.oversized === true
+          ? "oldest progress trimmed; still above the size target"
+          : "oldest progress trimmed to fit"
+        : body.oversized === true
+          ? "above the size target"
+          : null
+    const state = size !== null
+      ? ` (${size}${body.partial === true ? "; incomplete — try again in a moment" : ""})`
+      : body.partial === true
+        ? " (incomplete — try again in a moment)"
+        : ""
     return systemMessage(`Mida: handoff loaded — ${counts}${from}${state}`)
   }
   if (body.kind === "empty") {
