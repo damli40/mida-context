@@ -1040,6 +1040,87 @@ describe("interrupted-approval artifacts — never typed, never the instruction 
     expect(r.text).toContain("[tool Bash]")
     expect(r.text).not.toContain("[interrupted here:")
   })
+
+  // in-22 V-4 (G-4 + N-A + N-B), promoted from zz-rvfix2-endings-positive: every rejected call
+  // is named however the results were written; a result followed by a bare marker is an
+  // interrupted ending (shape b); and a line mixing a real result with a rejection renders the
+  // result while the rejected call is named — its "STOP what you are doing" boilerplate never
+  // reaches the handoff raw.
+  it("two parallel calls both rejected on one user line: the block names every call", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("clean and rebuild"),
+      assistant([
+        { type: "tool_use", id: "toolu_a", name: "Bash", input: { command: "rm -rf build" } },
+        { type: "tool_use", id: "toolu_b", name: "Write", input: { file_path: "src/x.ts", content: "" } },
+      ]),
+      user([
+        { type: "tool_result", tool_use_id: "toolu_a", content: REJECTION },
+        { type: "tool_result", tool_use_id: "toolu_b", content: REJECTION },
+      ]),
+      user("[Request interrupted by user for tool use]"),
+    ])
+    const r = readConversation(t)
+    expect(r.text.trimEnd().endsWith(
+      "[interrupted here: 2 tool calls were not approved before the session stopped: (Bash rm -rf build), (Write src/x.ts). They are undecided — neither refused nor approved. Ask the user before running any of them.]",
+    )).toBe(true)
+    expect(r.text).not.toContain("doesn't want to proceed")
+    expect(r.text).not.toContain("Request interrupted")
+  })
+
+  it("two parallel calls both rejected on separate user lines: the block names every call", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("clean and rebuild"),
+      assistant([{ type: "tool_use", id: "toolu_a", name: "Bash", input: { command: "rm -rf build" } }]),
+      assistant([{ type: "tool_use", id: "toolu_b", name: "Write", input: { file_path: "src/x.ts", content: "" } }]),
+      user([{ type: "tool_result", tool_use_id: "toolu_a", content: REJECTION }]),
+      user([{ type: "tool_result", tool_use_id: "toolu_b", content: REJECTION }]),
+      user("[Request interrupted by user for tool use]"),
+    ])
+    const r = readConversation(t)
+    expect(r.text.trimEnd().endsWith(
+      "[interrupted here: 2 tool calls were not approved before the session stopped: (Bash rm -rf build), (Write src/x.ts). They are undecided — neither refused nor approved. Ask the user before running any of them.]",
+    )).toBe(true)
+  })
+
+  it("one user line carrying a result AND a rejection: the result renders, the rejected call is named, the boilerplate never renders raw", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("clean and rebuild"),
+      assistant([
+        { type: "tool_use", id: "toolu_a", name: "Bash", input: { command: "ls" } },
+        { type: "tool_use", id: "toolu_b", name: "Write", input: { file_path: "src/x.ts", content: "" } },
+      ]),
+      user([
+        { type: "tool_result", tool_use_id: "toolu_a", content: "README.md" },
+        { type: "tool_result", tool_use_id: "toolu_b", content: REJECTION },
+      ]),
+      user("[Request interrupted by user for tool use]"),
+    ])
+    const r = readConversation(t)
+    // the call that ran keeps its ordinary result; the block names only the rejected call
+    expect(r.text).toContain("[result] README.md")
+    expect(r.text).not.toContain("doesn't want to proceed")
+    expect(r.text).not.toContain("STOP what you are doing")
+    expect(r.text.trimEnd().endsWith(
+      "[interrupted here: the last tool call (Write src/x.ts) was not approved before the session stopped. It is undecided — neither a refusal nor an approval. Ask the user before running it.]",
+    )).toBe(true)
+  })
+
+  it("a tool result followed by a bare marker: still an interrupted ending (shape b), never the marker verbatim", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("run the tests"),
+      assistant([{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "pnpm test" } }]),
+      user([{ type: "tool_result", tool_use_id: "toolu_1", content: "12 passed" }]),
+      user("[Request interrupted by user]"),
+    ])
+    const r = readConversation(t)
+    expect(r.text).toContain("[result] 12 passed")
+    expect(r.text.trimEnd().endsWith("[interrupted here: the user interrupted the assistant's last reply.]")).toBe(true)
+    expect(r.text).not.toContain("not approved")
+  })
 })
 
 // in-18 R-2 — the tail-window marks pair with the scan by BYTE OFFSET, not by

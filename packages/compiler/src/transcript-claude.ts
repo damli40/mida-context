@@ -591,11 +591,17 @@ export function readConversation(
   // collapse. The trailing newline every JSONL ends with, a summary line and a pending
   // tool_use all parse as skipped/non-message entries — none of them is an interruption, and
   // on the old `endIdx < entries.length` gate every ordinary ending collapsed.
+  //
+  // in-22 V-4: the run stops at the nearest real conversation line — the boundary. A boundary
+  // of the user's own TYPED words keeps the ending conversational (in-21 N-2); a result line
+  // or a pending tool_use followed by markers still ends on the interruption (N-A). One user
+  // line can carry a real result AND a rejection together (N-B): it is the boundary, its
+  // rejection parts are bookkeeping all the same — they are lifted out of the render and the
+  // calls they rejected are named, while the rest of the line renders as it always did.
   let endIdx = entries.length
-  let rejectedToolUseId: string | undefined
-  let sawRejection = false
   let sawArtifact = false
-  let runFollows: "user" | "assistant" | null = null
+  let boundaryIdx = -1
+  let boundaryTyped = false
   while (endIdx > 0) {
     const obj = entries[endIdx - 1]!.obj
     if (obj === null || (obj.type !== "user" && obj.type !== "assistant")) {
@@ -606,30 +612,92 @@ export function readConversation(
       endIdx -= 1
       continue
     }
-    const artifact = interruptionArtifact(obj)
-    if (artifact === null) {
-      runFollows = obj.type
-      break
+    if (interruptionArtifact(obj) !== null) {
+      sawArtifact = true
+      endIdx -= 1
+      continue
     }
-    sawArtifact = true
-    sawRejection ||= artifact.rejected === true
-    rejectedToolUseId ??= artifact.toolUseId
-    endIdx -= 1
+    boundaryIdx = endIdx - 1
+    boundaryTyped =
+      obj.type === "user" && claudeTypedUserText(obj, neighbourLocalCommand(boundaryIdx)) !== null
+    break
   }
-  if (sawArtifact && (sawRejection || runFollows === "assistant")) {
+  // The rejection parts of one line, as their tool_use_ids — a part with no id is still one
+  // rejected call, it just cannot be named.
+  const rejectionIds = (obj: TranscriptLine | null): (string | undefined)[] => {
+    const content = obj?.message?.content
+    if (!Array.isArray(content)) return []
+    const ids: (string | undefined)[] = []
+    for (const p of content) {
+      if (!isPart(p) || p.type !== "tool_result") continue
+      if (!toolResultText(p.content).trimStart().startsWith(TOOL_REJECTION_PREFIX)) continue
+      ids.push(typeof p.tool_use_id === "string" ? p.tool_use_id : undefined)
+    }
+    return ids
+  }
+  // A typed boundary's own boilerplate stays conversational with its words; an untyped
+  // boundary's rejections count toward the collapse even with no artifact run behind them.
+  const boundaryRejects =
+    !boundaryTyped && boundaryIdx >= 0 ? rejectionIds(entries[boundaryIdx]!.obj) : []
+  // Every rejected call in file order — the boundary's first, then the run's — deduped by id.
+  const rejectedCalls: (string | undefined)[] = []
+  const collectRejected = (obj: TranscriptLine | null): void => {
+    for (const id of rejectionIds(obj)) {
+      if (id === undefined || !rejectedCalls.includes(id)) rejectedCalls.push(id)
+    }
+  }
+  if (!boundaryTyped && boundaryIdx >= 0) collectRejected(entries[boundaryIdx]!.obj)
+  for (let i = endIdx; i < entries.length; i++) collectRejected(entries[i]!.obj)
+  // The collapse needs a reason: at least one rejected call, or a real artifact run that does
+  // not end on the user's own typed words.
+  if (rejectedCalls.length > 0 || (sawArtifact && !boundaryTyped)) {
     const gone = new Set(entries.slice(endIdx).map((e) => e.offset))
     for (let i = msgs.length - 1; i >= 0; i--) {
       const off = msgs[i]!.offset
       if (off !== undefined && gone.has(off)) msgs.splice(i, 1)
     }
+    // A mixed boundary line keeps its real parts — re-render it without the rejection
+    // boilerplate, so "STOP what you are doing and wait …" never lands in the handoff raw.
+    if (boundaryRejects.length > 0 && boundaryIdx >= 0) {
+      const boundary = entries[boundaryIdx]!
+      const idx = msgs.findIndex((m) => m.offset === boundary.offset)
+      if (idx !== -1 && boundary.obj !== null) {
+        const content = boundary.obj.message?.content
+        const kept = Array.isArray(content)
+          ? content.filter(
+              (p) =>
+                !(
+                  isPart(p) &&
+                  p.type === "tool_result" &&
+                  toolResultText(p.content).trimStart().startsWith(TOOL_REJECTION_PREFIX)
+                ),
+            )
+          : content
+        const block =
+          boundary.obj.message === undefined
+            ? renderMessage(boundary.label, boundary.obj)
+            : renderMessage(boundary.label, { ...boundary.obj, message: { ...boundary.obj.message, content: kept } })
+        if (block === null) msgs.splice(idx, 1)
+        else msgs[idx]!.block = block
+      }
+    }
     if (pinIdx !== undefined && pinIdx >= msgs.length) pinIdx = undefined
-    // Name the call left unapproved (shape a only): the rejection's own
-    // tool_use when it is in view, else the last tool_use of the nearest
-    // assistant before the run. A command or file path is cut to 120 chars;
-    // no call in view omits the parenthesis.
-    let waiting: string | null = null
-    if (sawRejection) {
-      for (let j = endIdx - 1; j >= 0 && waiting === null; j--) {
+    // Name every call left unapproved (G-4): each rejection's own tool_use when it is in view —
+    // searched back over the contiguous assistant run above the boundary — else the last
+    // tool_use of the nearest assistant line. A command or file path is cut to 120 chars.
+    const describeCall = (call: ContentPart): string => {
+      const input = isPart(call.input) ? (call.input as Record<string, unknown>) : null
+      const target =
+        typeof input?.file_path === "string" ? input.file_path
+        : typeof input?.command === "string" ? input.command
+        : ""
+      const name = typeof call.name === "string" ? call.name : "?"
+      return target === "" ? `(${name})` : `(${name} ${cut(scrubSecrets(target), 120)})`
+    }
+    // the assistant run that made the calls sits at or just above the boundary
+    const searchFrom = boundaryIdx >= 0 && entries[boundaryIdx]!.obj?.type === "assistant" ? boundaryIdx : boundaryIdx - 1
+    const findCall = (id: string | undefined): ContentPart | undefined => {
+      for (let j = searchFrom; j >= 0; j--) {
         const obj = entries[j]!.obj
         if (obj === null || (obj.type !== "user" && obj.type !== "assistant")) continue
         if (obj.isMeta === true || obj.isCompactSummary === true) continue
@@ -637,30 +705,34 @@ export function readConversation(
         const content = obj.message?.content
         if (!Array.isArray(content)) break
         const uses = content.filter((p): p is ContentPart => isPart(p) && p.type === "tool_use")
-        const call =
-          rejectedToolUseId === undefined
-            ? uses.at(-1)
-            : uses.find((p) => p.id === rejectedToolUseId)
+        const call = id === undefined ? uses.at(-1) : uses.find((p) => p.id === id)
         if (call === undefined) {
-          if (rejectedToolUseId !== undefined) continue // the call may sit further back
+          if (id !== undefined) continue // the call may sit further back
           break
         }
-        const input = isPart(call.input) ? (call.input as Record<string, unknown>) : null
-        const target =
-          typeof input?.file_path === "string" ? input.file_path
-          : typeof input?.command === "string" ? input.command
-          : ""
-        const name = typeof call.name === "string" ? call.name : "?"
-        waiting = target === "" ? `(${name})` : `(${name} ${cut(scrubSecrets(target), 120)})`
+        return call
       }
+      return undefined
     }
-    msgs.push({
-      role: "user",
-      block: sawRejection
-        ? `[interrupted here: the last tool call${waiting === null ? "" : ` ${waiting}`} ` +
-          `was not approved before the session stopped. It is undecided — neither a refusal nor an approval. Ask the user before running it.]`
-        : `[interrupted here: the user interrupted the assistant's last reply.]`,
-    })
+    let block: string
+    if (rejectedCalls.length === 0) {
+      block = "[interrupted here: the user interrupted the assistant's last reply.]"
+    } else if (rejectedCalls.length === 1) {
+      const call = findCall(rejectedCalls[0])
+      const waiting = call === undefined ? null : describeCall(call)
+      block =
+        `[interrupted here: the last tool call${waiting === null ? "" : ` ${waiting}`} ` +
+        `was not approved before the session stopped. It is undecided — neither a refusal nor an approval. Ask the user before running it.]`
+    } else {
+      const names = rejectedCalls.map((id) => {
+        const call = findCall(id)
+        return call === undefined ? "(a call the transcript does not name)" : describeCall(call)
+      })
+      block =
+        `[interrupted here: ${rejectedCalls.length} tool calls were not approved before the session stopped: ` +
+        `${names.join(", ")}. They are undecided — neither refused nor approved. Ask the user before running any of them.]`
+    }
+    msgs.push({ role: "user", block })
   }
 
   // The kept earlier request rendered as the head block — it is not a line in
