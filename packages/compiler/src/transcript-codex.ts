@@ -106,15 +106,19 @@ function callDetail(v: unknown): string {
  * ONE classifier for "did the user type this line", shared by the window read
  * and the streamed scan: a response_item message with role "user" whose text
  * the injected-scaffolding filter does not reject is the user's own words —
- * a whole-tag-block prompt counts (it renders, so it is real user text, only
- * the REQUEST pick is barred). Returns the text, or null.
+ * EXCEPT a whole-tag-block text: the request pick already bars one (an
+ * injected block is not the human's ask, G9) and the typed group must not
+ * promote one either — the new prompt's "the user's LATEST instruction wins"
+ * would hand an injected <tag>…</tag> block authority over the objective
+ * (S3). The block still RENDERS in the fill as user content; it is simply
+ * never "typed". Returns the text, or null.
  */
 export function codexTypedUserText(obj: { type?: unknown; payload?: unknown } | null): string | null {
   if (obj === null || typeof obj !== "object" || obj.type !== "response_item") return null
   const p = obj.payload as CodexPayload | null
   if (p === null || typeof p !== "object" || p.type !== "message" || p.role !== "user") return null
   const text = messageParts(p.content).join("\n")
-  if (text === "" || isInjectedUserText(text)) return null
+  if (text === "" || isInjectedUserText(text) || isWholeTagBlock(text)) return null
   return text
 }
 
@@ -167,11 +171,13 @@ export function readCodexConversation(
   } = {},
 ): Conversation {
   const { maxChars = 40_000 } = options
-  const { lines, truncated, head: headWindow, tail: tailWindow } = readTranscriptLines(transcriptPath)
+  // `size` is the window read's fstat snapshot — passed to the streamed scan
+  // so both passes describe the same bytes even if the file is still growing.
+  const { lines, truncated, head: headWindow, tail: tailWindow, size } = readTranscriptLines(transcriptPath)
 
   // A typed mark rides on each user block — the user's own words by the shared
   // classifier — so fitMessages can pin the ones the fill would lose.
-  const msgs: { role: string; block: string; typed?: TypedMark }[] = []
+  const msgs: { role: string; block: string; typed?: TypedMark; offset?: number }[] = []
   const cwds: string[] = []
   let messagesTotal = 0
   let firstUserMessage: string | null = null
@@ -181,7 +187,7 @@ export function readCodexConversation(
   // the index in `msgs` of the block firstUserMessage came from — fitMessages
   // pins exactly it, not whichever user block happens to render first
   let pinIdx: number | undefined
-  for (const { label, text: line } of lines) {
+  for (const { label, text: line, offset } of lines) {
     if (!line.trim()) continue
     let obj: { type?: unknown; payload?: unknown }
     try {
@@ -234,11 +240,12 @@ export function readCodexConversation(
         msgs.push({
           role,
           block: `L${label} ${role}:\n${body}`,
+          offset,
           // "~" labels carry no absolute number — the streamed scan pairs the
-          // mark with its real line number before it reaches the group
+          // mark with its real line, matched on the byte offset
           ...(typed === null
             ? {}
-            : { typed: { label: `L${label}`, order: label.startsWith("~") ? TAIL_ORDER : Number(label), text: typed } }),
+            : { typed: { label: `L${label}`, order: label.startsWith("~") ? TAIL_ORDER : Number(label), text: typed, offset } }),
         })
         if (picked) pinIdx = msgs.length - 1
       }
@@ -249,13 +256,13 @@ export function readCodexConversation(
       messagesTotal++
       const detail = callDetail(p.type === "function_call" ? p.arguments : p.input)
       const name = typeof p.name === "string" ? p.name : "?"
-      msgs.push({ role: "tool", block: `L${label} tool:\n${cut(scrubSecrets(`${name} ${detail}`.trimEnd()), PART_CHARS)}` })
+      msgs.push({ role: "tool", block: `L${label} tool:\n${cut(scrubSecrets(`${name} ${detail}`.trimEnd()), PART_CHARS)}`, offset })
       continue
     }
 
     if (p.type === "function_call_output" || p.type === "custom_tool_call_output") {
       messagesTotal++
-      msgs.push({ role: "tool-result", block: `L${label} tool-result:\n${cut(scrubSecrets(outputText(p.output)), PART_CHARS)}` })
+      msgs.push({ role: "tool-result", block: `L${label} tool-result:\n${cut(scrubSecrets(outputText(p.output)), PART_CHARS)}`, offset })
       continue
     }
     // reasoning (encrypted_content is never rendered), compacted and every
@@ -292,7 +299,7 @@ export function readCodexConversation(
   // pass finds every typed line in the unread middle with its real line
   // number and counts candidate lines too long to parse, the same pass the
   // Claude reader runs for its summary.
-  const scan = truncated ? scanTranscript(transcriptPath, codexScanHooks) : null
+  const scan = truncated ? scanTranscript(transcriptPath, codexScanHooks, size) : null
   const fitted = fitMessages(
     msgs,
     maxChars,
@@ -303,8 +310,9 @@ export function readCodexConversation(
     scan === null
       ? null
       : {
-          marks: scan.typed.map((t) => ({ label: `L${t.line}`, order: t.line, text: t.text })),
+          marks: scan.typed.map((t) => ({ label: `L${t.line}`, order: t.line, offset: t.offset, text: t.text })),
           tooLong: scan.tooLong.length,
+          bound: scan.bound,
         },
   )
   return {

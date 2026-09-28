@@ -179,7 +179,7 @@ const BUILTIN_COMMANDS = new Set([
   "login", "logout", "memory", "mcp", "permissions", "doctor", "status",
   "agents", "hooks", "context", "export", "exit", "rewind", "statusline",
   "add-dir", "bug", "vim", "terminal-setup", "ide", "upgrade",
-  "release-notes", "privacy-settings", "output-style", "todos",
+  "release-notes", "privacy-settings", "output-style", "todos", "usage",
 ])
 
 // A custom slash command's real ask hides inside its echo: Claude Code logs
@@ -382,22 +382,25 @@ export function readConversation(
 
   // Bounded reads from one descriptor: a file that fits inside head+tail is
   // read once end to end; anything bigger gets only its head and tail windows.
-  const { lines, truncated, head: headWindow, tail: tailWindow } = readTranscriptLines(transcriptPath)
+  // `size` is the fstat snapshot of that read — passed to the streamed scan so
+  // both passes describe the same bytes even if the file is still growing.
+  const { lines, truncated, head: headWindow, tail: tailWindow, size } = readTranscriptLines(transcriptPath)
 
   // Every line parsed up front, so a command echo can be judged against its
   // NEIGHBOURING user lines: Claude Code writes a built-in's caveat/stdout on
-  // their own lines next to the echo, never inside it.
-  const entries: { label: string; obj: TranscriptLine | null }[] = []
-  for (const { label, text: line } of lines) {
+  // their own lines next to the echo, never inside it. `offset` is the line's
+  // byte offset in the file — the identity the scan's typed lines pair on.
+  const entries: { label: string; obj: TranscriptLine | null; offset: number }[] = []
+  for (const { label, text: line, offset } of lines) {
     if (!line.trim()) {
-      entries.push({ label, obj: null })
+      entries.push({ label, obj: null, offset })
       continue
     }
     try {
       const obj = JSON.parse(line) as TranscriptLine | null
-      entries.push({ label, obj: obj !== null && typeof obj === "object" ? obj : null })
+      entries.push({ label, obj: obj !== null && typeof obj === "object" ? obj : null, offset })
     } catch {
-      entries.push({ label, obj: null }) // truncated or non-JSON line — skip
+      entries.push({ label, obj: null, offset }) // truncated or non-JSON line — skip
     }
   }
 
@@ -428,7 +431,7 @@ export function readConversation(
   // typed mark rides on each user block whose line the shared classifier calls
   // the user's own words — fitMessages moves the ones the fill would lose into
   // the pinned group, labels and all.
-  const msgs: { role: string; block: string; typed?: TypedMark }[] = []
+  const msgs: { role: string; block: string; typed?: TypedMark; offset?: number }[] = []
   const cwds: string[] = []
   let messagesTotal = 0
   let firstUserMessage: string | null = null
@@ -442,7 +445,7 @@ export function readConversation(
   // labelled block rather than left to the newest-first fill
   let compactSummary: { label: string; text: string } | null = null
   for (let i = 0; i < entries.length; i++) {
-    const { label, obj } = entries[i]!
+    const { label, obj, offset } = entries[i]!
     if (obj === null) continue
     const folder = obj.cwd
     if (typeof folder === "string" && folder !== "" && !cwds.includes(folder)) cwds.push(folder)
@@ -500,14 +503,20 @@ export function readConversation(
     if (block) {
       const typed = isUser ? claudeTypedUserText(obj, neighbourLocalCommand(i)) : null
       if (typed === null) {
-        msgs.push({ role: obj.type, block })
+        msgs.push({ role: obj.type, block, offset })
       } else {
         // "~" labels carry no absolute number — the mark's order is filled in
-        // later by pairing with the streamed scan's real line numbers
+        // later by pairing with the streamed scan, matched on the byte offset
         msgs.push({
           role: obj.type,
           block,
-          typed: { label: `L${label}`, order: label.startsWith("~") ? TAIL_ORDER : Number(label), text: typed },
+          offset,
+          typed: {
+            label: `L${label}`,
+            order: label.startsWith("~") ? TAIL_ORDER : Number(label),
+            text: typed,
+            offset,
+          },
         })
       }
       if (picked) pinIdx = msgs.length - 1
@@ -550,7 +559,7 @@ export function readConversation(
   // pick IS the last summary — no second pass. The same ONE pass that finds
   // the summary also returns every typed line with its real line number and
   // the count of candidate lines too long to parse — the group's scan half.
-  const scan = truncated ? scanTranscript(transcriptPath, claudeScanHooks) : null
+  const scan = truncated ? scanTranscript(transcriptPath, claudeScanHooks, size) : null
   const scannedSummary = scan?.summary ?? null
   if (scannedSummary !== null) {
     try {
@@ -578,8 +587,9 @@ export function readConversation(
     scan === null
       ? null
       : {
-          marks: scan.typed.map((t) => ({ label: `L${t.line}`, order: t.line, text: t.text })),
+          marks: scan.typed.map((t) => ({ label: `L${t.line}`, order: t.line, offset: t.offset, text: t.text })),
           tooLong: scan.tooLong.length,
+          bound: scan.bound,
         },
   )
   return {

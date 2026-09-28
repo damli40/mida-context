@@ -195,4 +195,21 @@ describe("the user's later typed messages are never lost (P-1)", () => {
     expect(c.text).not.toContain("MID-INJECTED-MARKER")
     expect(c.text).not.toContain("MID-HANDOFF-MARKER")
   })
+
+  // in-18 R-6 / S3: a whole <tag>…</tag> user block renders like any user
+  // message, but it is never "typed" — the prompt tells the model the typed
+  // group's words outrank everything else, so an injected block must not
+  // arrive there. Same rule the request pick has always applied (G9).
+  it("a whole <tag>…</tag> block renders in the fill but never joins the typed group", () => {
+    const lines = [
+      userItem("<future_injected>wrapped by a later Codex</future_injected>"),
+      userItem("the real ask"),
+    ]
+    const p = join(mkdtempSync(join(tmpdir(), "cx-")), "t.jsonl")
+    writeFileSync(p, lines.join("\n") + "\n")
+    const c = readCodexConversation(p)
+    expect(c.firstUserMessage).toBe("the real ask")
+    expect(c.text).toContain("wrapped by a later Codex") // still rendered
+    expect(c.text).not.toContain("later messages you typed") // never promoted
+  })
 })

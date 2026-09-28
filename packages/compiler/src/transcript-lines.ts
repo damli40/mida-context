@@ -55,7 +55,7 @@ export function twoEndedCut(text: string): string {
  * One open descriptor, at most HEAD_BYTES + TAIL_BYTES read: the whole file when it fits,
  * else {head: first HEAD_BYTES, tail: last TAIL_BYTES} — the middle stays on disk.
  */
-export function readWindows(path: string): { head: Buffer; tail: Buffer | null } {
+export function readWindows(path: string): { head: Buffer; tail: Buffer | null; size: number } {
   const fd = fs.openSync(path, "r")
   try {
     const size = fs.fstatSync(fd).size
@@ -69,21 +69,52 @@ export function readWindows(path: string): { head: Buffer; tail: Buffer | null }
       }
       return buf.subarray(0, got)
     }
-    if (size <= HEAD_BYTES + TAIL_BYTES) return { head: read(0, size), tail: null }
-    return { head: read(0, HEAD_BYTES), tail: read(size - TAIL_BYTES, TAIL_BYTES) }
+    if (size <= HEAD_BYTES + TAIL_BYTES) return { head: read(0, size), tail: null, size }
+    return { head: read(0, HEAD_BYTES), tail: read(size - TAIL_BYTES, TAIL_BYTES), size }
   } finally {
     fs.closeSync(fd)
   }
 }
 
 export interface TranscriptLines {
-  /** One (label, text) pair per line read — real 1-based numbers in the head, "~n" in the tail. */
-  lines: { label: string; text: string }[]
+  /**
+   * One (label, text, offset) triple per line read — real 1-based numbers in
+   * the head, "~n" in the tail. `offset` is the line's first byte in the file
+   * at snapshot `size` — the identity the streamed scan pairs against, immune
+   * to lines shifting position when the file is appended to between reads.
+   */
+  lines: { label: string; text: string; offset: number }[]
   /** True when the file was bigger than the windows and the middle was never read. */
   truncated: boolean
   /** The raw windows, for a reader's unknown-format tail fallback. */
   head: Buffer
   tail: Buffer | null
+  /**
+   * The file's byte size as fstat'd during the window read. A reader passes
+   * it to scanTranscript so the scan describes exactly the bytes the windows
+   * saw — a live transcript appending between the two reads stays invisible
+   * to the pairing, which is what keeps one message from rendering twice.
+   */
+  size: number
+}
+
+/**
+ * Split a window buffer into lines, tracking each line's byte offset from
+ * `base`. Splitting the BYTES (not the decoded string) is exact: \n is 0x0A
+ * and can never appear inside a multibyte UTF-8 character.
+ */
+function splitOffsets(buf: Buffer, base: number): { offset: number; text: string }[] {
+  const out: { offset: number; text: string }[] = []
+  let start = 0
+  for (;;) {
+    const nl = buf.indexOf(0x0a, start)
+    if (nl === -1) {
+      out.push({ offset: base + start, text: buf.subarray(start).toString("utf8") })
+      return out
+    }
+    out.push({ offset: base + start, text: buf.subarray(start, nl).toString("utf8") })
+    start = nl + 1
+  }
 }
 
 /**
@@ -92,21 +123,21 @@ export interface TranscriptLines {
  * window, since its absolute number is unknowable without the middle.
  */
 export function readTranscriptLines(path: string): TranscriptLines {
-  const { head, tail } = readWindows(path)
+  const { head, tail, size } = readWindows(path)
   const truncated = tail !== null
-  const lines: { label: string; text: string }[] = []
+  const lines: { label: string; text: string; offset: number }[] = []
   if (!truncated) {
-    head.toString("utf8").split("\n").forEach((line, idx) => lines.push({ label: String(idx + 1), text: line }))
+    splitOffsets(head, 0).forEach((line, idx) => lines.push({ label: String(idx + 1), text: line.text, offset: line.offset }))
   } else {
-    const headLines = head.toString("utf8").split("\n")
+    const headLines = splitOffsets(head, 0)
     // a last segment without its terminator is a partial line — its rest sits in the unread middle
     if (head.length > 0 && head[head.length - 1] !== 10) headLines.pop()
-    headLines.forEach((line, idx) => lines.push({ label: String(idx + 1), text: line }))
-    const tailLines = tail.toString("utf8").split("\n")
+    headLines.forEach((line, idx) => lines.push({ label: String(idx + 1), text: line.text, offset: line.offset }))
+    const tailLines = splitOffsets(tail, size - tail.length)
     tailLines.shift() // the first segment began before the window — a partial line
-    tailLines.forEach((line, idx) => lines.push({ label: `~${idx + 1}`, text: line }))
+    tailLines.forEach((line, idx) => lines.push({ label: `~${idx + 1}`, text: line.text, offset: line.offset }))
   }
-  return { lines, truncated, head, tail }
+  return { lines, truncated, head, tail, size }
 }
 
 /** Chunk size for the whole-file scan below — bounded, never the file at once. */
@@ -143,12 +174,18 @@ export interface ScanHooks {
 }
 
 export interface TranscriptScan {
-  /** Every typed user line, in file order, each with its real 1-based number. */
-  typed: { line: number; text: string }[]
+  /** Every typed user line, in file order, each with its real 1-based number and byte offset. */
+  typed: { line: number; offset: number; text: string }[]
   /** Line numbers of candidate lines too long to parse — counted, never dropped silently. */
   tooLong: number[]
   /** The last compact-summary line, or null — same answer lastCompactSummaryLine gave. */
   summary: { label: string; text: string } | null
+  /**
+   * How many bytes of the file the scan actually covered — the `size` bound
+   * the caller passed, or fewer when the file shrank under the read. A
+   * window-read line at offset ≥ bound was never seen by this scan.
+   */
+  bound: number
 }
 
 /**
@@ -160,35 +197,41 @@ export interface TranscriptScan {
  * classified once two more have passed; over-cap candidates are counted in
  * `tooLong` instead of parsed.
  */
-export function scanTranscript(path: string, hooks: ScanHooks): TranscriptScan {
+export function scanTranscript(path: string, hooks: ScanHooks, size?: number): TranscriptScan {
   const fd = fs.openSync(path, "r")
   try {
-    const size = fs.fstatSync(fd).size
+    // `size` is the byte bound the caller's window read fstat'd — read only
+    // [0, size) so the scan describes the SAME bytes the windows did (B2/S1):
+    // lines appended to a live transcript between the two reads are out of
+    // scope here, and a line's byte offset pairs it to its window mark.
+    const bound0 = size ?? fs.fstatSync(fd).size
     const buf = Buffer.allocUnsafe(SCAN_CHUNK_BYTES)
     const decoder = new StringDecoder("utf8")
     let position = 0
     let lineNo = 0
+    let lineStart = 0 // byte offset of the line under construction
+    let lineBytes = 0 // bytes of the current line consumed so far
     let piece = "" // the line so far — emptied the moment it outgrows the cap
     let overflow = false // the line under construction already passed the cap
     let prefix = "" // the line's first bytes — kept even after the cap drops the rest
-    const typed: { line: number; text: string }[] = []
+    const typed: { line: number; offset: number; text: string }[] = []
     const tooLong: number[] = []
     let summary: { label: string; text: string } | null = null
     // A candidate's neighbour rule needs the lines around it, so a line waits
     // in a 3-deep window until its two next neighbours have passed; prevUt is
     // the userText of the line just ahead of the window's head.
     let prevUt = ""
-    const window: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number }[] = []
-    const classify = (entry: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number }, next: string[]): void => {
+    const window: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number; offset: number }[] = []
+    const classify = (entry: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number; offset: number }, next: string[]): void => {
       if (!entry.cand) return
       if (entry.big) {
         tooLong.push(entry.lineNo)
         return
       }
       const text = hooks.typedText(entry.text, { prev: prevUt, next })
-      if (text !== null) typed.push({ line: entry.lineNo, text })
+      if (text !== null) typed.push({ line: entry.lineNo, offset: entry.offset, text })
     }
-    const push = (entry: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number }): void => {
+    const push = (entry: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number; offset: number }): void => {
       window.push(entry)
       if (window.length === 3) {
         const head = window.shift()!
@@ -196,33 +239,39 @@ export function scanTranscript(path: string, hooks: ScanHooks): TranscriptScan {
         prevUt = head.ut
       }
     }
-    const finish = (text: string, tooLongLine: boolean): void => {
+    const finish = (text: string, tooLongLine: boolean, offset: number): void => {
       lineNo += 1
       if (tooLongLine || text.length > SUMMARY_LINE_BYTES) {
         // the line itself is gone — the kept prefix still answers the cheap check
-        push({ text: "", ut: "", cand: hooks.candidate(prefix), big: true, lineNo })
+        push({ text: "", ut: "", cand: hooks.candidate(prefix), big: true, lineNo, offset })
         return
       }
       if (hooks.summary !== undefined && hooks.summary(text)) summary = { label: `${lineNo}`, text }
       const cand = hooks.candidate(text)
       const big = cand && text.length > USER_LINE_BYTES
-      push({ text, ut: cand && !big ? hooks.userText(text) : "", cand, big, lineNo })
+      push({ text, ut: cand && !big ? hooks.userText(text) : "", cand, big, lineNo, offset })
     }
-    while (position < size) {
-      const n = fs.readSync(fd, buf, 0, Math.min(SCAN_CHUNK_BYTES, size - position), position)
+    while (position < bound0) {
+      const n = fs.readSync(fd, buf, 0, Math.min(SCAN_CHUNK_BYTES, bound0 - position), position)
       if (n <= 0) break // the file shrank between stat and read
       position += n
       const text = decoder.write(buf.subarray(0, n))
       let start = 0
       for (let i = 0; i < text.length; i++) {
         if (text.charCodeAt(i) !== 10) continue
-        finish(overflow ? "" : piece + text.slice(start, i), overflow)
+        // the segment's byte length is exact — a held multibyte split reports
+        // its bytes when the decoder emits the completed character later
+        const segBytes = Buffer.byteLength(text.slice(start, i))
+        finish(overflow ? "" : piece + text.slice(start, i), overflow, lineStart)
         piece = ""
         prefix = ""
         overflow = false
+        lineStart += lineBytes + segBytes + 1
+        lineBytes = 0
         start = i + 1
       }
       const rest = text.slice(start)
+      lineBytes += Buffer.byteLength(rest)
       if (prefix.length < SCAN_PREFIX_CHARS) prefix = (prefix + rest).slice(0, SCAN_PREFIX_CHARS)
       if (overflow || piece.length + rest.length > SUMMARY_LINE_BYTES) {
         piece = ""
@@ -232,13 +281,13 @@ export function scanTranscript(path: string, hooks: ScanHooks): TranscriptScan {
       }
     }
     piece += decoder.end()
-    if (piece !== "" || overflow) finish(piece, overflow) // a final line without its newline counts
+    if (piece !== "" || overflow) finish(piece, overflow, lineStart) // a final line without its newline counts
     while (window.length > 0) {
       const head = window.shift()!
       classify(head, window.map((entry) => entry.ut))
       prevUt = head.ut
     }
-    return { typed, tooLong, summary }
+    return { typed, tooLong, summary, bound: position }
   } finally {
     fs.closeSync(fd)
   }
@@ -306,6 +355,12 @@ export interface TypedMark {
   label: string
   order: number
   text: string
+  /**
+   * The line's byte offset inside the transcript at the snapshot the reader
+   * took — the identity the scan pairs on. Absent for marks built without a
+   * file position (synthetic callers, the devin reader's DB-sourced lines).
+   */
+  offset?: number
   /** The scanned line this tail-window mark stands for — fills in its real label/order. */
   pair?: TypedMark
 }
@@ -313,10 +368,12 @@ export interface TypedMark {
 /** Order key for a tail-window mark whose real line number is unknowable. */
 export const TAIL_ORDER = Number.MAX_SAFE_INTEGER
 
-/** The typed lines a truncated file's scan found plus the too-long count — the group's scan half. */
+/** The typed lines a truncated file's scan found, the too-long count, and how far the scan read. */
 export interface ScannedMarks {
   marks: TypedMark[]
   tooLong: number
+  /** Bytes of the file the scan covered — see TranscriptScan.bound. */
+  bound: number
 }
 
 /**
@@ -335,10 +392,7 @@ export interface ScannedMarks {
  */
 function buildUserGroup(candidates: TypedMark[], tooLong: number): string | null {
   if (candidates.length === 0 && tooLong === 0) return null
-  const lines = candidates
-    .slice()
-    .sort((a, b) => a.order - b.order)
-    .map((m) => `${m.label}: ${twoEndedCut(scrubSecrets(m.text))}`)
+  const sorted = candidates.slice().sort((a, b) => a.order - b.order)
   const tooLongLine =
     tooLong === 0
       ? null
@@ -346,13 +400,16 @@ function buildUserGroup(candidates: TypedMark[], tooLong: number): string | null
   const kept: string[] = []
   let used = tooLongLine === null ? 0 : tooLongLine.length
   let dropped = 0
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const cost = lines[i]!.length + (used > 0 ? 1 : 0)
+  // Rendered newest-first and lazily — the settle loop above calls this per
+  // candidate set, and only the admitted few need the scrub + two-sided cut.
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const line = `${sorted[i]!.label}: ${twoEndedCut(scrubSecrets(sorted[i]!.text))}`
+    const cost = line.length + (used > 0 ? 1 : 0)
     if (used + cost > USER_GROUP_CHARS) {
       dropped = i + 1
       break
     }
-    kept.unshift(lines[i]!)
+    kept.unshift(line)
     used += cost
   }
   const parts = ["user — later messages you typed, oldest first (outside the recent messages below):"]
@@ -363,7 +420,7 @@ function buildUserGroup(candidates: TypedMark[], tooLong: number): string | null
 }
 
 export function fitMessages(
-  msgs: { role: string; block: string; typed?: TypedMark }[],
+  msgs: { role: string; block: string; typed?: TypedMark; offset?: number }[],
   maxChars: number,
   truncated: boolean,
   pinIdx?: number,
@@ -377,73 +434,167 @@ export function fitMessages(
   const head = lead ?? (pin >= 0 ? cut(msgs[pin]!.block, headCap) : null)
   const rest = msgs.filter((_, i) => i !== pin)
 
-  // The scan saw every typed line in the file; the marks carry the ones the
-  // windows rendered. Dedupe by identity: a scanned line whose order matches a
-  // numbered mark is that mark; the LAST K scanned lines pair positionally
-  // with the K tail marks (the tail window is the file's end), giving each
-  // tail mark its real label. Whatever remains lives only in the group.
-  const marks = msgs.map((m) => m.typed)
-  const tailMarkIdx: number[] = []
-  for (let i = 0; i < marks.length; i++) {
-    if (marks[i] !== undefined && marks[i]!.order === TAIL_ORDER) tailMarkIdx.push(i)
-  }
-  const numbered = new Set<number>()
-  for (const m of marks) if (m !== undefined && m.order !== TAIL_ORDER) numbered.add(m.order)
+  // The scan is AUTHORITATIVE for every line within its `bound` — it saw the
+  // full neighbour context the truncated windows lacked (B2). Each mark pairs
+  // with the scanned line that IS its line: matched on byte offset — the same
+  // byte identity from the same snapshot — so a boundary-adjacent echo the two
+  // passes classify differently can never shift every later label, and an
+  // append between the reads cannot slide the pairing (S1). A mark the scan
+  // saw but did not call typed loses its mark (it renders untyped in the
+  // fill); a mark past the scan's bound — the file shrank between the reads —
+  // keeps the window's own call. A scanned typed line no mark claimed lands in
+  // the group under its real label, and one that sits inside a rendered
+  // window line attaches there. Marks built with no byte offset at all keep
+  // the pre-offset behaviour: order-keyed for numbered marks, positional for
+  // tail marks.
+  const restMarks = rest.map((m) => m.typed)
   let scanOnly: TypedMark[] = []
   if (scanned !== null && scanned !== undefined) {
-    const avail = scanned.marks.filter((s) => !numbered.has(s.order))
-    if (tailMarkIdx.length > 0) {
-      const base = Math.max(0, avail.length - tailMarkIdx.length)
-      for (let j = 0; j < tailMarkIdx.length && base + j < avail.length; j++) {
-        const mark = marks[tailMarkIdx[j]!]!
-        mark.pair = avail[base + j]
-        mark.label = mark.pair!.label
-        mark.order = mark.pair!.order
+    const byOffset = new Map<number, TypedMark>()
+    const byOrder = new Map<number, TypedMark>()
+    for (const s of scanned.marks) {
+      if (s.offset !== undefined) byOffset.set(s.offset, s)
+      if (s.order !== TAIL_ORDER) byOrder.set(s.order, s)
+    }
+    const consumed = new Set<TypedMark>()
+    const offsetlessTail: TypedMark[] = []
+    for (let i = 0; i < rest.length; i++) {
+      const mark = restMarks[i]
+      if (mark === undefined) continue
+      let hit: TypedMark | undefined
+      if (mark.offset !== undefined) hit = byOffset.get(mark.offset)
+      else if (mark.order !== TAIL_ORDER) hit = byOrder.get(mark.order)
+      if (hit !== undefined) {
+        mark.pair = hit
+        mark.label = hit.label
+        mark.order = hit.order
+        mark.text = hit.text
+        consumed.add(hit)
+      } else if (mark.offset === undefined && mark.order === TAIL_ORDER) {
+        offsetlessTail.push(mark)
+      } else if (mark.offset === undefined || mark.offset < scanned.bound) {
+        restMarks[i] = undefined // the scan saw this line and said it is not typed
       }
-      scanOnly = avail.slice(0, base)
-    } else {
-      scanOnly = avail
+      // else: the file shrank past the mark between the reads — the scan never
+      // saw the line, so the window's call stands, unpaired
+    }
+    if (offsetlessTail.length > 0) {
+      const avail = scanned.marks.filter((s) => !consumed.has(s))
+      const base = Math.max(0, avail.length - offsetlessTail.length)
+      for (let j = 0; j < offsetlessTail.length && base + j < avail.length; j++) {
+        const mark = offsetlessTail[j]!
+        mark.pair = avail[base + j]!
+        mark.label = mark.pair.label
+        mark.order = mark.pair.order
+        mark.text = mark.pair.text
+        consumed.add(mark.pair)
+      }
+    }
+    // Upgrade pass: a line the scan calls typed but the window did not mark —
+    // the scan saw neighbours the truncated window lacked — gets its mark back
+    // under the scan's real label, attached to the window-rendered message at
+    // the same byte offset. Whatever matches nothing rendered lives in the
+    // group alone (scanOnly).
+    const restByOffset = new Map<number, number>()
+    for (let i = 0; i < rest.length; i++) {
+      const offset = rest[i]!.offset
+      if (offset !== undefined) restByOffset.set(offset, i)
+    }
+    const pinOffset = pin >= 0 ? msgs[pin]!.offset : undefined
+    const pinOrder = pin >= 0 ? msgs[pin]!.typed?.order : undefined
+    for (const s of scanned.marks) {
+      if (consumed.has(s)) continue
+      if (pinOffset !== undefined && s.offset === pinOffset) continue // the pinned request is never group content
+      if (s.offset === undefined && pinOrder !== undefined && pinOrder !== TAIL_ORDER && s.order === pinOrder) continue
+      const idx = s.offset === undefined ? undefined : restByOffset.get(s.offset)
+      if (idx === undefined) {
+        scanOnly.push(s)
+      } else {
+        if (restMarks[idx] === undefined) {
+          restMarks[idx] = { label: s.label, order: s.order, offset: s.offset, text: s.text }
+        }
+        consumed.add(s)
+      }
     }
   }
 
   const headCost = (head ? head.length + 2 : 0) + (extraPinned ? extraPinned.length + 2 : 0) + MARKER_RESERVE
-  const fill = (budget: number): number[] => {
-    const kept: number[] = []
+  // The fill always keeps a SUFFIX of rest (newest-first until the next block
+  // no longer fits); `m` is that suffix's left edge — rest[m..] are kept,
+  // rest[0..m) are not.
+  const fill = (budget: number): number => {
+    let m = rest.length
     let used = 0
-    for (let i = rest.length - 1; i >= 0; i--) {
-      const cost = rest[i]!.block.length + (kept.length ? 2 : 0)
+    while (m > 0) {
+      const cost = rest[m - 1]!.block.length + (m < rest.length ? 2 : 0)
       if (used + cost > budget) break
-      kept.unshift(i)
+      m -= 1
       used += cost
     }
-    return kept
+    return m
   }
+  const keptCost = (m: number): number => {
+    if (m >= rest.length) return 0
+    let used = rest[m]!.block.length
+    for (let i = m + 1; i < rest.length; i++) used += rest[i]!.block.length + 2
+    return used
+  }
+  // Every typed mark left of the fill edge is a group candidate — recomputed
+  // from scratch, so an index displaced in either direction is seen again.
+  const droppedFor = (m: number): Set<number> => {
+    const dropped = new Set<number>()
+    for (let i = 0; i < m; i++) if (restMarks[i] !== undefined) dropped.add(i)
+    return dropped
+  }
+  const groupFor = (dropped: Set<number>): string | null =>
+    buildUserGroup([...scanOnly, ...[...dropped].map((i) => restMarks[i]!)], scanned?.tooLong ?? 0)
 
   // The group's members depend on the fill; the fill's budget depends on the
-  // group. Seed it with every typed mark as a candidate, then let survivors
-  // leave the group — strictly shrinking, so a couple of passes settles it.
-  const hasGroupWork = scanOnly.length > 0 || (scanned?.tooLong ?? 0) > 0 || marks.some((m) => m !== undefined)
-  const dropped = new Set<number>()
-  for (let i = 0; i < rest.length; i++) if (rest[i]!.typed !== undefined) dropped.add(i)
+  // group — in BOTH directions: a member the fill keeps leaves the group, but
+  // the cap then admits an older member that was collapsed into the count
+  // line, so the group can GROW and displace a message the fill just kept
+  // (B1). Iterating toward a fixed point finds a consistent pair when one is
+  // reachable quickly; the reconcile loop afterwards is the guarantee — it
+  // rebuilds the group from the fill's true dropped set and releases fill →
+  // group until the pair fits. Each reconcile round that does not finish has
+  // released at least one typed message, so the group is rebuilt at most once
+  // per typed message and the kept set only ever shrinks — the loop always
+  // terminates with every typed message in exactly one place.
+  const hasGroupWork = scanOnly.length > 0 || (scanned?.tooLong ?? 0) > 0 || restMarks.some((m) => m !== undefined)
   let group: string | null = null
-  let keptIdx: number[] = []
+  let m = rest.length
   if (hasGroupWork) {
+    let dropped = droppedFor(m)
     for (let iter = 0; iter < 8; iter++) {
-      const candidates = [...scanOnly, ...[...dropped].map((i) => rest[i]!.typed!)]
-      const next = buildUserGroup(candidates, scanned?.tooLong ?? 0)
-      const budget = Math.max(0, maxChars - headCost - (next === null ? 0 : next.length + 2))
-      keptIdx = fill(budget)
-      const survivors = new Set(keptIdx)
-      const before = dropped.size
-      for (const i of [...dropped]) if (survivors.has(i)) dropped.delete(i)
-      group = next
-      if (dropped.size === before) break
+      group = groupFor(dropped)
+      const budget = Math.max(0, maxChars - headCost - (group === null ? 0 : group.length + 2))
+      m = fill(budget)
+      const after = droppedFor(m)
+      if (after.size === dropped.size && [...after].every((i) => dropped.has(i))) break
+      dropped = after
+    }
+    for (;;) {
+      dropped = droppedFor(m)
+      group = groupFor(dropped)
+      const budget = Math.max(0, maxChars - headCost - (group === null ? 0 : group.length + 2))
+      let used = keptCost(m)
+      if (used <= budget || m >= rest.length) break
+      // Release the oldest kept messages until this gap is closed. Releasing a
+      // typed message grows the group (the next round re-accounts its cost);
+      // releasing untyped ones is pure progress. Fill → group only.
+      let releasedTyped = false
+      while (used > budget && m < rest.length) {
+        if (restMarks[m] !== undefined) releasedTyped = true
+        used -= rest[m]!.block.length + (rest.length - m > 1 ? 2 : 0)
+        m += 1
+      }
+      if (!releasedTyped) break // group cannot grow — done even if still over
     }
   } else {
-    keptIdx = fill(Math.max(0, maxChars - headCost))
+    m = fill(Math.max(0, maxChars - headCost))
   }
-  const keptTail = keptIdx.map((i) => rest[i]!)
-  const omitted = rest.length - keptTail.length
+  const keptTail = rest.slice(m)
+  const omitted = m
 
   const blocks: string[] = []
   if (head) blocks.push(head)

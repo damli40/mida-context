@@ -59,6 +59,14 @@ describe("scanTranscript — the streamed typed-line pass (P-1)", () => {
       }
     })
     const userTexts = raw.map((line) => claudeScanHooks!.userText(line))
+    // byte offsets of each line's start — the scan reports them so the window
+    // pairing can match on identity, never on position (in-18 R-2)
+    const offsets: number[] = []
+    let cursor = 0
+    for (const line of raw) {
+      offsets.push(cursor)
+      cursor += Buffer.byteLength(line, "utf8") + 1
+    }
     const expected = objs
       .map((obj, i) =>
         claudeTypedUserText!(
@@ -66,14 +74,14 @@ describe("scanTranscript — the streamed typed-line pass (P-1)", () => {
           claudeCommandEchoNeighbour!(userTexts[i - 1] ?? "", [userTexts[i + 1] ?? "", userTexts[i + 2] ?? ""]),
         ),
       )
-      .map((text, i) => (text === null ? null : { line: i + 1, text }))
+      .map((text, i) => (text === null ? null : { line: i + 1, offset: offsets[i]!, text }))
       .filter((entry) => entry !== null)
 
     const scan = scanTranscript!(t, claudeScanHooks!)
     expect(scan.typed).toEqual(expected)
     // the typed set really is: the request, the custom command, the change —
     // never the tool_result, isMeta, reminder or built-in echo lines
-    expect(scan.typed).toEqual([
+    expect(scan.typed.map(({ line, text }) => ({ line, text }))).toEqual([
       { line: 2, text: "build the parser" },
       { line: 9, text: "/brainstorm the retry policy" },
       { line: 11, text: "change it to violet" },
@@ -104,16 +112,24 @@ describe("scanTranscript — the streamed typed-line pass (P-1)", () => {
     ]
     const t = writeTranscript(tmpdir(), raw)
 
+    const offsets: number[] = []
+    let cursor = 0
+    for (const line of raw) {
+      offsets.push(cursor)
+      cursor += Buffer.byteLength(line, "utf8") + 1
+    }
     const expected = raw
-      .map((line, i) => ({ line: i + 1, text: codexScanHooks!.typedText(line, { prev: "", next: [] }) }))
-      .filter((entry) => entry.text !== null) as { line: number; text: string }[]
+      .map((line, i) => ({ line: i + 1, offset: offsets[i]!, text: codexScanHooks!.typedText(line, { prev: "", next: [] }) }))
+      .filter((entry) => entry.text !== null) as { line: number; offset: number; text: string }[]
 
     const scan = scanTranscript!(t, codexScanHooks!)
     expect(scan.typed).toEqual(expected)
-    expect(scan.typed).toEqual([
+    // the whole-tag block (line 10) is never "typed" — it renders as a user
+    // block but an injected <tag>…</tag> must not become the user's latest
+    // instruction (in-18 R-6/S3)
+    expect(scan.typed.map(({ line, text }) => ({ line, text }))).toEqual([
       { line: 3, text: "make emergencies pulse, not red" },
       { line: 8, text: "now make it violet" },
-      { line: 10, text: "<mystery_tag>typed inside a tag</mystery_tag>" },
     ])
   })
 
@@ -128,7 +144,7 @@ describe("scanTranscript — the streamed typed-line pass (P-1)", () => {
       JSON.stringify({ type: "user", message: { role: "user", content: "still here" } }),
     ])
     const scan = scanTranscript!(t, claudeScanHooks!)
-    expect(scan.typed).toEqual([
+    expect(scan.typed.map(({ line, text }) => ({ line, text }))).toEqual([
       { line: 1, text: "the request" },
       { line: 4, text: "still here" },
     ])
