@@ -30,9 +30,10 @@ function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "mida-compiler-"))
 }
 
+// in-22 V-1: real JSONL files end with a newline — write it by default.
 function writeTranscript(dir: string, lines: string[]) {
   const p = path.join(dir, "transcript.jsonl")
-  fs.writeFileSync(p, lines.join("\n"))
+  fs.writeFileSync(p, lines.join("\n") + "\n")
   return p
 }
 

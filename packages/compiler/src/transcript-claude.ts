@@ -587,9 +587,14 @@ export function readConversation(
   // run that follows the user's OWN typed words does not collapse — the typed
   // reply is the ending, and the stray marker renders verbatim like any
   // mid-session one.
+  // in-22 V-1: the run must hold at least one real interruption ARTIFACT for anything to
+  // collapse. The trailing newline every JSONL ends with, a summary line and a pending
+  // tool_use all parse as skipped/non-message entries — none of them is an interruption, and
+  // on the old `endIdx < entries.length` gate every ordinary ending collapsed.
   let endIdx = entries.length
   let rejectedToolUseId: string | undefined
   let sawRejection = false
+  let sawArtifact = false
   let runFollows: "user" | "assistant" | null = null
   while (endIdx > 0) {
     const obj = entries[endIdx - 1]!.obj
@@ -606,11 +611,12 @@ export function readConversation(
       runFollows = obj.type
       break
     }
+    sawArtifact = true
     sawRejection ||= artifact.rejected === true
     rejectedToolUseId ??= artifact.toolUseId
     endIdx -= 1
   }
-  if (endIdx < entries.length && (sawRejection || runFollows === "assistant")) {
+  if (sawArtifact && (sawRejection || runFollows === "assistant")) {
     const gone = new Set(entries.slice(endIdx).map((e) => e.offset))
     for (let i = msgs.length - 1; i >= 0; i--) {
       const off = msgs[i]!.offset

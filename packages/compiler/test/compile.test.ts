@@ -43,6 +43,7 @@ function fake(mode: string): ModelCommand {
 beforeEach(() => {
   dir = fs.mkdtempSync(path.join(os.tmpdir(), "mida-compiler-"))
   const transcriptPath = path.join(dir, "transcript.jsonl")
+  // in-22 V-1: real JSONL files end with a newline — every fixture writes one by default
   fs.writeFileSync(
     transcriptPath,
     [
@@ -50,7 +51,7 @@ beforeEach(() => {
       JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "On it — doing step 1 first." }] } }),
       JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "step 1 ok" }] } }),
       JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Step 1 done, on to step 2." }] } }),
-    ].join("\n"),
+    ].join("\n") + "\n",
   )
   stdinLogPath = path.join(dir, "model-stdin.log")
   envLogPath = path.join(dir, "model-env.log")
@@ -91,7 +92,7 @@ describe("compileCheckpoint", () => {
         JSON.stringify({ type: "user", message: { role: "user", content: "<local-command-stdout>Compacted.</local-command-stdout>" } }),
         JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: "condensed summary of the earlier session" } }),
         JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "continuing" }] } }),
-      ].join("\n"),
+      ].join("\n") + "\n",
     )
     const previous: Checkpoint = {
       eventId: "evt-earlier",
@@ -151,7 +152,7 @@ describe("compileCheckpoint", () => {
         JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: "condensed summary of the earlier session" } }),
         JSON.stringify({ type: "user", message: { role: "user", content: "keep going on the parser work" } }),
         JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "on it" }] } }),
-      ].join("\n"),
+      ].join("\n") + "\n",
     )
     const previous: Checkpoint = {
       eventId: "evt-earlier",
@@ -193,7 +194,7 @@ describe("compileCheckpoint", () => {
         JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: "condensed summary of the earlier session" } }),
         JSON.stringify({ type: "user", message: { role: "user", content: "keep going on the parser work" } }),
         JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "on it" }] } }),
-      ].join("\n"),
+      ].join("\n") + "\n",
     )
     const previous: Checkpoint = {
       eventId: "evt-earlier",
@@ -239,7 +240,7 @@ describe("compileCheckpoint", () => {
         JSON.stringify({ type: "user", message: { role: "user", content: "<local-command-caveat>Caveat: local command output follows.</local-command-caveat>" } }),
         JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: "condensed summary of the earlier session" } }),
         JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "continuing" }] } }),
-      ].join("\n"),
+      ].join("\n") + "\n",
     )
     process.env.FAKE_MODEL_STDIN_LOG = stdinLogPath
     const r = await compileCheckpoint({ ...base, transcriptPath: scaffolded, model: fake("good") })
@@ -261,7 +262,7 @@ describe("compileCheckpoint", () => {
         JSON.stringify({ type: "user", message: { role: "user", content: "<command-name>/clear</command-name>\n<command-message>clear</command-message>" } }),
         JSON.stringify({ type: "user", message: { role: "user", content: "now build the websocket retry" } }),
         JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "on it" }] } }),
-      ].join("\n"),
+      ].join("\n") + "\n",
     )
     process.env.FAKE_MODEL_STDIN_LOG = stdinLogPath
     const r = await compileCheckpoint({ ...base, transcriptPath: cleared, model: fake("good") })
@@ -297,7 +298,7 @@ describe("compileCheckpoint", () => {
         JSON.stringify({ type: "user", message: { role: "user", content: "<local-command-caveat>Caveat: local command output follows.</local-command-caveat>" } }),
         JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: "condensed summary of the earlier session" } }),
         JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "continuing" }] } }),
-      ].join("\n"),
+      ].join("\n") + "\n",
     )
     // the log APPENDS — assert on this compile's prompt, not both
     const offset = fs.readFileSync(stdinLogPath, "utf8").length
@@ -325,7 +326,7 @@ describe("compileCheckpoint", () => {
         JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: "condensed summary of the earlier session" } }),
         JSON.stringify({ type: "user", message: { role: "user", content: "continue" } }),
         JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "on it" }] } }),
-      ].join("\n"),
+      ].join("\n") + "\n",
     )
     const previous: Checkpoint = {
       eventId: "evt-earlier",
@@ -372,7 +373,7 @@ describe("compileCheckpoint", () => {
         JSON.stringify({ type: "user", message: { role: "user", content: "<local-command-caveat>Caveat: local command output follows.</local-command-caveat>" } }),
         JSON.stringify({ type: "user", isCompactSummary: true, message: { role: "user", content: "condensed summary of the earlier session" } }),
         JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "continuing" }] } }),
-      ].join("\n"),
+      ].join("\n") + "\n",
     )
     // the log APPENDS — assert on this compile's prompt, not both
     const offset = fs.readFileSync(stdinLogPath, "utf8").length
@@ -873,7 +874,7 @@ describe("compileCheckpoint", () => {
         JSON.stringify({ role: "assistant", content: "the key idea is simple" }),
         JSON.stringify({ role: "assistant", content: 'key: "user:42" survives' }),
         JSON.stringify({ role: "assistant", content: "step 1 done, tests pass." }),
-      ].join("\n"),
+      ].join("\n") + "\n",
     )
     process.env.FAKE_MODEL_STDIN_LOG = stdinLogPath
     const r = await compileCheckpoint({ ...base, transcriptPath, model: fake("good") })

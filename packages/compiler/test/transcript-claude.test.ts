@@ -15,9 +15,11 @@ function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "mida-compiler-"))
 }
 
+// in-22 V-1: real JSONL files end with a newline — write it by default so endings get the
+// same empty final segment real files have (the missing newline is what hid G-1).
 function writeTranscript(dir: string, lines: string[]) {
   const p = path.join(dir, "transcript.jsonl")
-  fs.writeFileSync(p, lines.join("\n"))
+  fs.writeFileSync(p, lines.join("\n") + "\n")
   return p
 }
 
@@ -1001,6 +1003,42 @@ describe("interrupted-approval artifacts — never typed, never the instruction 
     const r = readConversation(t, { maxChars: 20_000 })
     expect(r.text).not.toContain("Request interrupted")
     expect(r.text).not.toContain("later messages you typed")
+  })
+
+  // in-22 V-1 (G-1) — every real JSONL ends with a newline, and writeTranscript now writes
+  // one by default; the collapse must fire only on a real interruption artifact, so the
+  // shapes below are the endings the old `endIdx < entries.length` gate collapsed wrongly.
+  it("an ordinary ending is not an interruption — the trailing newline adds no block", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("what is 2+2"),
+      assistant([{ type: "text", text: "4." }]),
+    ])
+    const r = readConversation(t)
+    expect(r.text).toContain("4.")
+    expect(r.text).not.toContain("[interrupted here:")
+  })
+
+  it("a trailing summary line is bookkeeping, not an interruption", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("hi"),
+      assistant([{ type: "text", text: "hello" }]),
+      JSON.stringify({ type: "summary", summary: "session so far", leafUuid: "x" }),
+    ])
+    const r = readConversation(t)
+    expect(r.text).not.toContain("[interrupted here:")
+  })
+
+  it("a pending tool_use with no result is an unfinished turn, not an interruption", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("check the build"),
+      assistant([{ type: "tool_use", id: "toolu_9", name: "Bash", input: { command: "pnpm build" } }]),
+    ])
+    const r = readConversation(t)
+    expect(r.text).toContain("[tool Bash]")
+    expect(r.text).not.toContain("[interrupted here:")
   })
 })
 
