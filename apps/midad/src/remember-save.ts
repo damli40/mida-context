@@ -322,9 +322,13 @@ export async function buildRemember(runtime: ServiceRuntime, record: unknown, de
   // and continues record exactly as a read does, so a handle that only calls remember() is
   // never swept as idle. `touch` is best-effort and creates nothing: a file the session does
   // not have stays absent, a bad id touches nothing, and the id never lands in the record.
-  if (typeof record.sessionId === "string" && isSafeName(record.sessionId)) {
-    for (const folder of ["tasks", "lastseen", "continues"]) {
-      runtime.home.touch(`state/${folder}/${record.sessionId}.json`)
+  // in-24 (review N-1): the touch means "the session just did a write", so it runs only on
+  // the saved paths below — a refusal or a failed send refreshes nothing.
+  const touchSession = () => {
+    if (typeof record.sessionId === "string" && isSafeName(record.sessionId)) {
+      for (const folder of ["tasks", "lastseen", "continues"]) {
+        runtime.home.touch(`state/${folder}/${record.sessionId}.json`)
+      }
     }
   }
 
@@ -340,6 +344,7 @@ export async function buildRemember(runtime: ServiceRuntime, record: unknown, de
   try {
     if (supersedes !== undefined) {
       const written = await supersede(runtime, agent, supersedes, input)
+      touchSession()
       return { kind: "saved", id: written.contextId, state: "anchored", lane: "direct" }
     }
     if (laneKind === "batched") {
@@ -374,10 +379,12 @@ export async function buildRemember(runtime: ServiceRuntime, record: unknown, de
           queuedAt: new Date(now()).toISOString(),
           namespace,
         })
+        touchSession()
         return { kind: "saved", id: queued.contextId, state: "pending", lane: "batched" }
       }
     }
     const written = await create(runtime, agent, namespace, input)
+    touchSession()
     return { kind: "saved", id: written.contextId, state: "anchored", lane: "direct" }
   } catch (error) {
     // a write that never landed frees the slot — the next call gets a real answer, not a stale hold

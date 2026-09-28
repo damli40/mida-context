@@ -406,6 +406,54 @@ describe("buildRemember — the daemon's /remember route", () => {
     expect(odd.kind).toBe("saved")
   })
 
+  // in-24 (review N-1): the touch refreshes a live session's pin — under the old order it ran
+  // on admission, so a write that never landed still marked a dead session alive. It now runs
+  // only after a saved result, never on a refusal or a failed send.
+  const staleSession = (dir: MidaHome, sid = "sdk-codex-a1b2c3d4") => {
+    const files = [`state/tasks/${sid}.json`, `state/lastseen/${sid}.json`, `state/continues/${sid}.json`]
+    const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000)
+    for (const rel of files) {
+      dir.writeSecretJson(rel, { stale: true })
+      utimesSync(dir.path(rel), old, old)
+    }
+    const stillStale = () =>
+      files.every((rel) => Date.now() - statSync(dir.path(rel)).mtimeMs > 30 * 24 * 60 * 60 * 1000)
+    return { files, stillStale }
+  }
+
+  it("a write refused at send time touches nothing", async () => {
+    const dir = home()
+    const { stillStale } = staleSession(dir)
+    const result = await call(
+      {
+        create: async () => {
+          throw new MidaError("CAPABILITY_DENIED" as never, "the grant is gone")
+        },
+      },
+      { sessionId: "sdk-codex-a1b2c3d4" },
+      dir,
+    )
+    expect(result).toMatchObject({ kind: "refused", reason: "not-approved" })
+    expect(stillStale()).toBe(true)
+  })
+
+  it("a send that throws touches nothing either", async () => {
+    const dir = home()
+    const { stillStale } = staleSession(dir)
+    await expect(
+      call(
+        {
+          create: async () => {
+            throw new Error("the transport died")
+          },
+        },
+        { sessionId: "sdk-codex-a1b2c3d4" },
+        dir,
+      ),
+    ).rejects.toThrow("the transport died")
+    expect(stillStale()).toBe(true)
+  })
+
   it("the namespace the chain is asked about is the canonicalized one the caller named", async () => {
     const asked: string[] = []
     await call(
