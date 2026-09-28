@@ -841,7 +841,11 @@ describe("the user's later typed messages are never lost (P-1)", () => {
 // "[Request interrupted by user for tool use]" line. Since in-17 that line is
 // classified as typed, so the next agent's handoff read "stop and wait" as the
 // user's latest instruction. Neither artifact is ever typed, and a transcript
-// ENDING on them collapses into one neutral "session ended here" block.
+// ENDING on them collapses into one neutral "[interrupted here: …]" block that
+// claims only what the file proves (in-21 U-1): a run holding a rejection
+// tool_result names the unapproved call; a run of bare markers interrupted a
+// reply — and a run that follows the user's own typed words does not collapse
+// at all, since the marker is no longer the ending of an interrupted reply.
 describe("interrupted-approval artifacts — never typed, never the instruction (in-20 T-2)", () => {
   const REJECTION =
     "The user doesn't want to proceed with this tool use. The tool use was rejected " +
@@ -881,10 +885,10 @@ describe("interrupted-approval artifacts — never typed, never the instruction 
     ])
     const r = readConversation(t)
     expect(r.firstUserMessage).toBe("add a rate limiter to the parser")
-    // the render's last line is the neutral block — it names the call that
-    // never ran, and it is not phrased as anything the user asked for
+    // the render's last line is the neutral block — it names the call left
+    // unapproved, and it is not phrased as anything the user asked for
     expect(r.text.trimEnd().endsWith(
-      "[session ended here: the last tool call (Write src/bucket.mjs) was waiting for approval and did not run. The user closed the session; this is not an instruction.]",
+      "[interrupted here: the last tool call (Write src/bucket.mjs) was not approved before the session stopped. It is undecided — neither a refusal nor an approval. Ask the user before running it.]",
     )).toBe(true)
     // neither artifact survives as a user line, and nothing joins the typed group
     expect(r.text).not.toContain("Request interrupted")
@@ -901,7 +905,7 @@ describe("interrupted-approval artifacts — never typed, never the instruction 
       user("[Request interrupted by user for tool use]"),
     ])
     const bash = readConversation(withBash)
-    expect(bash.text).toContain("the last tool call (Bash node migrate.js --dry-run) was waiting for approval")
+    expect(bash.text).toContain("the last tool call (Bash node migrate.js --dry-run) was not approved before the session stopped")
 
     const noCall = writeTranscript(dir, [
       user("do the thing"),
@@ -909,7 +913,7 @@ describe("interrupted-approval artifacts — never typed, never the instruction 
     ])
     const r = readConversation(noCall)
     expect(r.text.trimEnd().endsWith(
-      "[session ended here: the last tool call was waiting for approval and did not run. The user closed the session; this is not an instruction.]",
+      "[interrupted here: the last tool call was not approved before the session stopped. It is undecided — neither a refusal nor an approval. Ask the user before running it.]",
     )).toBe(true)
   })
 
@@ -926,7 +930,60 @@ describe("interrupted-approval artifacts — never typed, never the instruction 
     // typed reply after it is untouched — the ending is conversation, not an interrupt
     expect(r.text).toContain("[result] The user doesn't want to proceed")
     expect(r.text).toContain("L4 user:\nno, use a different file")
-    expect(r.text).not.toContain("session ended here")
+    expect(r.text).not.toContain("[interrupted here:")
+  })
+
+  // in-21 U-1 (F-1) — the block claims only what the file proves: a bare Esc
+  // marker invents no waiting tool call, and a marker after a tool that RAN
+  // says nothing about approvals.
+  it("Esc mid-answer with no tool call in flight: the block must not invent a waiting tool call", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("refactor the parser into two modules"),
+      assistant([{ type: "text", text: "I will start by splitting the tokenizer out of parse.ts and then" }]),
+      user("[Request interrupted by user]"),
+    ])
+    const r = readConversation(t)
+    expect(r.text.trimEnd().endsWith("[interrupted here: the user interrupted the assistant's last reply.]")).toBe(true)
+    expect(r.text).not.toContain("tool call")
+    expect(r.text).not.toContain("did not run")
+  })
+
+  it("Esc after a tool RAN and the reply continued: still the bare-reply wording, never 'not approved'", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("run the tests"),
+      assistant([{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "pnpm test" } }]),
+      user([{ type: "tool_result", tool_use_id: "toolu_1", content: "12 passed" }]),
+      assistant([{ type: "text", text: "All green. Next I will" }]),
+      user("[Request interrupted by user]"),
+    ])
+    const r = readConversation(t)
+    expect(r.text).toContain("12 passed")
+    expect(r.text.trimEnd().endsWith("[interrupted here: the user interrupted the assistant's last reply.]")).toBe(true)
+    expect(r.text).not.toContain("not approved")
+    expect(r.text).not.toContain("did not run")
+  })
+
+  // in-21 U-1 (N-2) — rejection, then the user's typed answer, then a marker:
+  // the typed words are the ending, so nothing collapses and no block lands
+  // after them. The marker renders as the ordinary line it is mid-session.
+  it("rejection, typed words, then a trailing marker: the typed reply is the ending — no block after it", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("add the limiter"),
+      assistant([{ type: "tool_use", id: "toolu_01", name: "Write", input: { file_path: "src/bucket.mjs" } }]),
+      user([{ type: "tool_result", tool_use_id: "toolu_01", content: REJECTION }]),
+      user("no, use a different file"),
+      user("[Request interrupted by user for tool use]"),
+    ])
+    const r = readConversation(t)
+    expect(r.text).toContain("[result] The user doesn't want to proceed")
+    expect(r.text).toContain("no, use a different file")
+    // the marker stays as the verbatim line every mid-session marker renders —
+    // it is true (the session WAS interrupted there) but earns no closing block
+    expect(r.text.trimEnd().endsWith("L5 user:\n[Request interrupted by user for tool use]")).toBe(true)
+    expect(r.text).not.toContain("[interrupted here:")
   })
 
   it("a mid-session interruption marker is never typed — dropped by the fill it stays out of the typed group", () => {
