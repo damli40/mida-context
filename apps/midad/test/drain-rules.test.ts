@@ -1552,6 +1552,124 @@ describe("the drain pass sweeps month-old SDK session files (in-21 U-4)", () => 
     expect(result.saved).toBe(1)
     expect(drainLog()).toContain("housekeeping-failed")
   })
+
+  // in-24 (review F-1): a lastSweepAt the clock has not reached is not a sweep that happened —
+  // under the old read it was "less than an hour ago" until the year 2099, holding every
+  // housekeeping step (and the log cap) off, and staying cached in the daemon even after the
+  // owner deleted the file. More than an hour ahead now counts as no stamp: sweep, overwrite.
+  it("a lastSweepAt in the far future counts as no stamp — the pass sweeps, caps the log and rewrites the mark", async () => {
+    const { home, job, drain, drainLog } = setup()
+    mkdirSync(home.path("state"), { recursive: true })
+    writeFileSync(home.path("state/housekeeping.json"), JSON.stringify({ lastSweepAt: "2099-01-01T00:00:00.000Z" }))
+    const old = new Date(T0 - 40 * DAY)
+    home.writeSecretJson("state/tasks/sdk-old.json", { stale: true })
+    fs.utimesSync(home.path("state/tasks/sdk-old.json"), old, old)
+    mkdirSync(home.path("logs"), { recursive: true })
+    const logPath = home.path("logs/drain.jsonl")
+    writeFileSync(logPath, Buffer.alloc(6 * 1024 * 1024, "\n"))
+    job({ event: "Stop" }, T0)
+    const result = await drain()
+    expect(result.saved).toBe(1)
+    expect(home.has("state/tasks/sdk-old.json")).toBe(false)
+    expect(fs.statSync(logPath).size).toBeLessThan(2 * 1024 * 1024)
+    expect(drainLog()).toContain("housekeeping-stamp-in-future")
+    // the rejected stamp is overwritten, not trusted: the mark now holds the real sweep time
+    const mark = home.readJson<{ lastSweepAt?: string }>("state/housekeeping.json")
+    expect(mark?.lastSweepAt).toBe(new Date(T0 + 120_000).toISOString())
+  })
+
+  it("a rejected stamp is never cached — deleting the mark mid-daemon leaves the next due pass sweeping", async () => {
+    const { home, drain } = setup()
+    mkdirSync(home.path("state"), { recursive: true })
+    writeFileSync(home.path("state/housekeeping.json"), JSON.stringify({ lastSweepAt: "2099-01-01T00:00:00.000Z" }))
+    const old = new Date(T0 - 40 * DAY)
+    const stamp = (rel: string) => {
+      home.writeSecretJson(rel, { stale: true })
+      fs.utimesSync(home.path(rel), old, old)
+    }
+    stamp("state/tasks/sdk-first.json")
+    // the same MidaHome the daemon keeps for its whole life: the future stamp is rejected and
+    // the pass sweeps at once, rewriting the mark with the real time
+    await drain()
+    expect(home.has("state/tasks/sdk-first.json")).toBe(false)
+    // the owner deletes the mark; the in-memory gate holds only the real sweep time, so the
+    // next pass inside the hour still skips …
+    unlinkSync(home.path("state/housekeeping.json"))
+    stamp("state/tasks/sdk-second.json")
+    await drain({ now: () => new Date(T0 + 120_000 + 15_000) })
+    expect(home.has("state/tasks/sdk-second.json")).toBe(true)
+    // … and the next due pass re-reads the (absent) file and sweeps — not in 2099
+    await drain({ now: () => new Date(T0 + 120_000 + 61 * 60 * 1000) })
+    expect(home.has("state/tasks/sdk-second.json")).toBe(false)
+  })
+
+  it("a skippedLoggedAt in the future counts as no stamp too — a stuck entry is reported at once", async () => {
+    const { dir, home, drain, drainLog } = setup()
+    mkdirSync(home.path("state"), { recursive: true })
+    writeFileSync(home.path("state/housekeeping.json"), JSON.stringify({ skippedLoggedAt: "2099-01-01T00:00:00.000Z" }))
+    const outside = join(dir, "outside.json")
+    writeFileSync(outside, "keep me")
+    mkdirSync(home.path("state/lastseen"), { recursive: true })
+    symlinkSync(outside, join(home.root, "state", "lastseen", "sdk-stuck.json"))
+    await drain()
+    expect(drainLog()).toContain("session-sweep-skipped")
+  })
+
+  it("housekeeping-stamp-in-future is logged once per process, however often a future stamp returns", async () => {
+    const { home, drain, drainLog } = setup()
+    const mark = () => {
+      mkdirSync(home.path("state"), { recursive: true })
+      writeFileSync(home.path("state/housekeeping.json"), JSON.stringify({ lastSweepAt: "2099-01-01T00:00:00.000Z" }))
+    }
+    const count = () =>
+      drainLog().split("\n").filter((line) => line.includes("housekeeping-stamp-in-future")).length
+    const old = new Date(T0 - 40 * DAY)
+    mark()
+    await drain()
+    expect(count()).toBe(1)
+    // a future stamp that lands again is rejected and swept past all the same — but not re-reported
+    mark()
+    home.writeSecretJson("state/tasks/sdk-second.json", { stale: true })
+    fs.utimesSync(home.path("state/tasks/sdk-second.json"), old, old)
+    await drain({ now: () => new Date(T0 + 120_000 + 61 * 60 * 1000) })
+    expect(home.has("state/tasks/sdk-second.json")).toBe(false)
+    expect(count()).toBe(1)
+  })
+
+  // in-24 (review N-4): the cap on logs/*.jsonl is the only bound on them — appendLog has none —
+  // so it runs on every pass, not inside the housekeeping step a throw or a skipped hour can kill.
+  it("the log cap runs on a pass where housekeeping is not due", async () => {
+    const { home, job, drain } = setup()
+    mkdirSync(home.path("logs"), { recursive: true })
+    const logPath = home.path("logs/drain.jsonl")
+    writeFileSync(logPath, Buffer.alloc(6 * 1024 * 1024, "\n"))
+    job({ event: "Stop" }, T0)
+    await drain()
+    expect(fs.statSync(logPath).size).toBeLessThan(2 * 1024 * 1024)
+    // fifteen seconds on, housekeeping is not due — the cap still runs
+    writeFileSync(logPath, Buffer.alloc(6 * 1024 * 1024, "\n"))
+    job({ event: "Stop" }, T0 + 30_000)
+    await drain({ now: () => new Date(T0 + 120_000 + 15_000) })
+    expect(fs.statSync(logPath).size).toBeLessThan(2 * 1024 * 1024)
+  })
+
+  it("a throwing sweep still leaves the log capped", async () => {
+    const { dir, home, job, drain, drainLog } = setup()
+    // queue/bad as a link to outside the home makes home.list throw inside pruneQueue — the sweep
+    // below it never starts, but the cap no longer lives inside that step
+    const outside = join(dir, "outside")
+    mkdirSync(outside, { recursive: true })
+    mkdirSync(home.path("queue"), { recursive: true })
+    symlinkSync(outside, home.path("queue/bad"))
+    mkdirSync(home.path("logs"), { recursive: true })
+    const logPath = home.path("logs/drain.jsonl")
+    writeFileSync(logPath, Buffer.alloc(6 * 1024 * 1024, "\n"))
+    job({ event: "Stop" }, T0)
+    const result = await drain()
+    expect(result.saved).toBe(1)
+    expect(drainLog()).toContain("housekeeping-failed")
+    expect(fs.statSync(logPath).size).toBeLessThan(2 * 1024 * 1024)
+  })
 })
 
 describe("the detached drainer never inherits agent-CLI secrets", () => {

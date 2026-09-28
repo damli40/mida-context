@@ -262,6 +262,10 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
     return ok
   }
 
+  // in-24 (review N-4): the cap on logs/*.jsonl is the only bound on them — appendLog has none
+  // — so it runs on every pass, outside the housekeeping step a throw or a skipped hour kills.
+  capLogs(deps.home)
+
   // Housekeeping runs at most once an hour per home — a drain pass every 15 s does not need
   // a sweep every pass (in-22 N-D), and the persisted mark makes every process honour the same
   // hour (in-23 R-3). And it can never starve the queue: one malformed entry or one failed
@@ -884,12 +888,48 @@ function writeState(home: MidaHome, sessionId: string, state: SessionState): voi
 }
 
 /**
+ * The only bound on `logs/*.jsonl` — appendLog itself has none — so the cap runs on every pass
+ * and outside pruneQueue: a throwing sweep or a skipped housekeeping pass must never turn it
+ * off (in-24, review N-4). A log grown past 5 MB keeps its last 1 MB, cut at a line boundary so
+ * every kept line is a whole record; a file that will not truncate is left for the next pass.
+ */
+function capLogs(home: MidaHome): void {
+  let names: string[]
+  try {
+    names = home.list("logs")
+  } catch {
+    return // a logs folder that will not list is left for the next pass
+  }
+  for (const name of names) {
+    if (!name.endsWith(".jsonl")) continue
+    try {
+      const full = home.path(`logs/${name}`)
+      const size = statSync(full).size
+      if (size <= LOG_MAX_BYTES) continue
+      const fd = fs.openSync(full, "r")
+      let tail: Buffer
+      try {
+        const buffer = Buffer.alloc(LOG_KEEP_BYTES)
+        const read = fs.readSync(fd, buffer, 0, LOG_KEEP_BYTES, size - LOG_KEEP_BYTES)
+        tail = buffer.subarray(0, read)
+      } finally {
+        fs.closeSync(fd)
+      }
+      // a mid-line cut would leave a corrupt first record — drop the partial line
+      const firstNewline = tail.indexOf(10)
+      fs.writeFileSync(full, firstNewline === -1 ? tail : tail.subarray(firstNewline + 1))
+    } catch {
+      // a log that will not truncate is left for the next pass
+    }
+  }
+}
+
+/**
  * Housekeeping, run at most once an hour per process: `queue/bad` and `queue/compiled` entries
- * older than a week, stray `.tmp` files older than an hour, sdk- session-state files
+ * older than a week, stray `.tmp` files older than an hour, and sdk- session-state files
  * (`state/tasks`, `state/lastseen`, `state/continues`) untouched for a month — at most 500 a
- * pass — and any JSONL log grown past 5 MB cut back to its last 1 MB (starting at a line
- * boundary so every kept line is a whole record). The caller wraps the whole step so a failure
- * here is logged once and never starves the queue below it.
+ * pass. The caller wraps the whole step so a failure here is logged once and never starves the
+ * queue below it.
  */
 function pruneQueue(home: MidaHome, now: () => Date): void {
   const nowMs = now().getTime()
@@ -910,28 +950,6 @@ function pruneQueue(home: MidaHome, now: () => Date): void {
       if (name.endsWith(".tmp") && olderThan(home.path(`${dir}/${name}`), TMP_MAX_AGE_MS)) {
         home.remove(`${dir}/${name}`)
       }
-    }
-  }
-  for (const name of home.list("logs")) {
-    if (!name.endsWith(".jsonl")) continue
-    try {
-      const full = home.path(`logs/${name}`)
-      const size = statSync(full).size
-      if (size <= LOG_MAX_BYTES) continue
-      const fd = fs.openSync(full, "r")
-      let tail: Buffer
-      try {
-        const buffer = Buffer.alloc(LOG_KEEP_BYTES)
-        const read = fs.readSync(fd, buffer, 0, LOG_KEEP_BYTES, size - LOG_KEEP_BYTES)
-        tail = buffer.subarray(0, read)
-      } finally {
-        fs.closeSync(fd)
-      }
-      // a mid-line cut would leave a corrupt first record — drop the partial line
-      const firstNewline = tail.indexOf(10)
-      fs.writeFileSync(full, firstNewline === -1 ? tail : tail.subarray(firstNewline + 1))
-    } catch {
-      // a log that will not truncate is left for the next pass
     }
   }
   // in-21 U-4 / in-22 V-2: each `new Mida()` mints one `sdk-…` session, the only unbounded
@@ -969,7 +987,7 @@ function pruneQueue(home: MidaHome, now: () => Date): void {
     // processes, so the same bad file cannot fill the log on every spawned drainer's sweep
     const mark = readHousekeepingMark(home)
     const reported = typeof mark.skippedLoggedAt === "string" ? Date.parse(mark.skippedLoggedAt) : NaN
-    if (!Number.isFinite(reported) || nowMs - reported >= DAY_MS) {
+    if (!Number.isFinite(reported) || stampInFuture(home, reported, nowMs) || nowMs - reported >= DAY_MS) {
       appendLog(home, "drain", { outcome: "note", reason: "session-sweep-skipped", skipped })
       writeHousekeepingMark(home, { skippedLoggedAt: new Date(nowMs).toISOString() })
     }
@@ -1006,11 +1024,28 @@ function housekeepingDue(home: MidaHome, now: () => Date): boolean {
   if (last !== undefined && at - last < HOUSEKEEPING_INTERVAL_MS) return false
   const mark = readHousekeepingMark(home)
   const stamp = typeof mark.lastSweepAt === "string" ? Date.parse(mark.lastSweepAt) : NaN
-  if (Number.isFinite(stamp)) {
+  if (Number.isFinite(stamp) && !stampInFuture(home, stamp, at)) {
     lastHousekeepingAt.set(home, stamp)
     if (at - stamp < HOUSEKEEPING_INTERVAL_MS) return false
   }
   lastHousekeepingAt.set(home, at)
+  return true
+}
+
+/**
+ * in-24 (review F-1): a stamp the clock has not reached is not a mark that happened — a stamp
+ * more than an hour ahead reads as "less than an hour ago" forever and would hold housekeeping
+ * off until that date. True means reject it and treat the field as absent: the caller sweeps
+ * and rewrites the mark. An hour of slack still absorbs ordinary clock drift, and the note is
+ * logged once per process per home so a stamp that keeps coming back is not re-reported.
+ */
+const futureStampLogged = new WeakSet<MidaHome>()
+function stampInFuture(home: MidaHome, stamp: number, at: number): boolean {
+  if (stamp - at <= HOUSEKEEPING_INTERVAL_MS) return false
+  if (!futureStampLogged.has(home)) {
+    futureStampLogged.add(home)
+    appendLog(home, "drain", { outcome: "note", reason: "housekeeping-stamp-in-future" })
+  }
   return true
 }
 
