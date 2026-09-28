@@ -38,6 +38,10 @@ new Mida({
 a bad transport or a non-absolute `home` is refused at construction with `invalid-option`,
 before anything touches the service.
 
+Prefer one long-lived `Mida` handle per process — each handle is its own session
+(`sdk-<agent>-<hex>`), and every session leaves state files under the Mida home until the
+drain pass sweeps them a month after their last touch.
+
 ## The seven calls
 
 ### `status()` — is the service up, and what would this agent get?
@@ -117,6 +121,9 @@ Every write is recorded `AGENT_INFERRED`. The provenance is the service's to sta
 caller's — asking for a `USER_*` source is refused before anything is signed. `state` is
 `anchored` on the direct save lane and `pending` on the batching lane (Monad has not anchored
 it yet — it still reads back and still carries its proof fields).
+
+`remember()` content shaped as a Mida checkpoint envelope is treated as a checkpoint
+(workflow memory: project- and task-scoped).
 
 ### `verify(item)` — check one item against the chain
 
