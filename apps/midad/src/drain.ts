@@ -1005,11 +1005,18 @@ function readHousekeepingMark(home: MidaHome): Record<string, unknown> {
 }
 
 /** Merges a field into the marks file; a mark that will not write never blocks a pass. */
+const unwritableMarkLogged = new WeakSet<MidaHome>()
 function writeHousekeepingMark(home: MidaHome, patch: Record<string, unknown>): void {
   try {
     home.writeSecretJson(HOUSEKEEPING_MARK, { ...readHousekeepingMark(home), ...patch })
   } catch {
-    // the per-process gate above still bounds this process — next spawn simply re-sweeps
+    // in-24 (review N-3): a mark that will not write degrades the home silently no longer —
+    // the failure is told once per process, and the per-process gate above still bounds this
+    // process, so the pass carries on and the next spawn simply re-sweeps
+    if (!unwritableMarkLogged.has(home)) {
+      unwritableMarkLogged.add(home)
+      appendLog(home, "drain", { outcome: "note", reason: "housekeeping-mark-unwritable" })
+    }
   }
 }
 

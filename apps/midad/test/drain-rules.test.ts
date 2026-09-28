@@ -1670,6 +1670,32 @@ describe("the drain pass sweeps month-old SDK session files (in-21 U-4)", () => 
     expect(drainLog()).toContain("housekeeping-failed")
     expect(fs.statSync(logPath).size).toBeLessThan(2 * 1024 * 1024)
   })
+
+  // in-24 (review N-3): a mark that cannot be written is a degraded home, not a dead one — the
+  // pass still sweeps and saves, and the failure is told once per process, not every pass.
+  it("an unwritable housekeeping mark is logged once as housekeeping-mark-unwritable — and the pass carries on", async () => {
+    const { home, job, drain, drainLog } = setup()
+    // state/housekeeping.json as a directory: the mark can never be written under that name
+    mkdirSync(home.path("state/housekeeping.json"), { recursive: true })
+    const count = () =>
+      drainLog().split("\n").filter((line) => line.includes("housekeeping-mark-unwritable")).length
+    const old = new Date(T0 - 40 * DAY)
+    home.writeSecretJson("state/tasks/sdk-old.json", { stale: true })
+    fs.utimesSync(home.path("state/tasks/sdk-old.json"), old, old)
+    job({ event: "Stop" }, T0)
+    const result = await drain()
+    expect(result.saved).toBe(1)
+    // the sweep still ran — the mark is bookkeeping, never a gate on it
+    expect(home.has("state/tasks/sdk-old.json")).toBe(false)
+    expect(drainLog()).not.toContain("housekeeping-failed")
+    expect(count()).toBe(1)
+    // a second due pass in the same process sweeps again and reports nothing new
+    home.writeSecretJson("state/tasks/sdk-older.json", { stale: true })
+    fs.utimesSync(home.path("state/tasks/sdk-older.json"), old, old)
+    await drain({ now: () => new Date(T0 + 120_000 + 61 * 60 * 1000) })
+    expect(home.has("state/tasks/sdk-older.json")).toBe(false)
+    expect(count()).toBe(1)
+  })
 })
 
 describe("the detached drainer never inherits agent-CLI secrets", () => {
