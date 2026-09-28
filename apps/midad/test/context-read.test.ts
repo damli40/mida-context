@@ -216,6 +216,47 @@ describe("buildContextRead — the daemon's /context route", () => {
     expect(result.items.map((item) => item.id)).toEqual([id(3), id(1)])
   })
 
+  it("checkpoint items carry their task — named, 'main' when absent, never on a plain record", async () => {
+    // in-18 S2: context() is task-agnostic and serves every task's records together, so a
+    // checkpoint item must name the thread it came from — the envelope's own field, "main"
+    // when the envelope names none, and no key at all on a non-checkpoint record.
+    const checkpoint = {
+      eventId: "cp-0123456789",
+      agent: "codex",
+      source: "agent-tool",
+      createdAt: "2026-09-30T00:00:00.000Z",
+      objective: "o",
+      nextAction: "n",
+      originalRequest: null,
+      progress: [],
+      decisions: [],
+      rejected: [],
+      constraints: [],
+      artifacts: [],
+      remainingPlan: [],
+      evidence: [],
+      unresolvedIssue: null,
+    }
+    const envelope = (task?: string) => ({
+      type: "mida.checkpoint.v1",
+      projectId: PID,
+      sessionId: "s",
+      continuesSession: null,
+      compiledBy: "codex",
+      checkpoint,
+      ...(task === undefined ? {} : { task }),
+    })
+    const sdkTask = object({ contextId: id(1), chain: { at: 3000n }, payload: { v: 1, value: envelope("sdk"), kind: "EPISODE", provenance: { source: "AGENT_INFERRED" } } })
+    const mainTask = object({ contextId: id(2), chain: { at: 2000n }, payload: { v: 1, value: envelope(), kind: "EPISODE", provenance: { source: "AGENT_INFERRED" } } })
+    const plain = object({ contextId: id(3), chain: { at: 1000n }, payload: { v: 1, value: "no envelope", kind: "INFERENCE", provenance: { source: "AGENT_INFERRED" } } })
+    const result = await call({ read: async () => ({ objects: [sdkTask, mainTask, plain], partial: false, skipped: 0 }) })
+    if (result.kind !== "context") throw new Error("expected context")
+    expect(result.items.map((item) => item.id)).toEqual([id(1), id(2), id(3)])
+    expect(result.items[0]!.task).toBe("sdk")
+    expect(result.items[1]!.task).toBe("main")
+    expect("task" in result.items[2]!).toBe(false)
+  })
+
   it("a fact namespace needs no folder approval — the chain grant alone decides", async () => {
     let projectAsked = false
     const result = await call(

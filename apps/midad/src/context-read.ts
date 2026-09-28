@@ -5,7 +5,7 @@ import { canonicalizeNamespace, isMidaError, namespaceId } from "@mida/protocol"
 import type { ContextKind, Hex, RecordReference } from "@mida/protocol"
 import { batchAnchorAbi, recordPlacementsNear } from "@mida/chain"
 import type { RecordPlacement } from "@mida/chain"
-import { compareChainOrder, orderTime } from "@mida/checkpoint"
+import { compareChainOrder, orderTime, taskOf } from "@mida/checkpoint"
 import type { MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
 import { batchClient, batchStatusProbe } from "./batching.js"
@@ -57,6 +57,13 @@ export interface ContextItemWire {
   superseded: false
   references: RecordReference[]
   proof: { manifestHash: Hex; recordId: Hex }
+  /**
+   * Checkpoint records only: the named task the sealed envelope belongs to — "main" when it
+   * names none. context() is task-agnostic and serves every task's records together, so the
+   * item must name which thread it came from rather than let tasks blur silently (in-18 S2).
+   * Absent on every non-checkpoint record.
+   */
+  task?: string
 }
 
 export type ContextReadResult =
@@ -450,6 +457,7 @@ export async function buildContextRead(
 
 /** One record on the wire — authorship and stamp from the verified object, never its payload. */
 function wireItem(object: ReadObject, adapter: StoredCheckpoint, names: Record<string, string>): ContextItemWire {
+  const envelope = unwrapCheckpoint(object.payload.value)
   return {
     id: object.contextId,
     namespace: object.namespace,
@@ -462,5 +470,6 @@ function wireItem(object: ReadObject, adapter: StoredCheckpoint, names: Record<s
     superseded: false,
     references: object.payload.provenance.references ?? [],
     proof: { manifestHash: object.manifestHash ?? zeroHash, recordId: object.contextId },
+    ...(envelope === null ? {} : { task: taskOf(envelope) }),
   }
 }

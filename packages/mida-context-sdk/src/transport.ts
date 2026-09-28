@@ -23,6 +23,12 @@ export interface ContextItem {
   references: RecordReference[]
   /** The on-chain proof of this record: its manifestHash and the record id to verify against. */
   proof: { manifestHash: Hex; recordId: Hex }
+  /**
+   * Checkpoint records only: the named task the record belongs to — "main" when the envelope
+   * names none. `context()` is task-agnostic: it returns records from every task, and each
+   * checkpoint item names which task thread it came from. Absent on non-checkpoint records.
+   */
+  task?: string
 }
 
 export interface ContextInput {

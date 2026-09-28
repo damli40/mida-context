@@ -218,7 +218,11 @@ exactly what midad said: `not-approved`, `revoked`, `revoke-pending`, `already-a
   share the window. The refusal is `rate-limited` and names the lane.
 - **Grants gate everything.** An agent that was never approved gets `not-approved`; a revoked
   one gets `revoked`; a general assistant gets `general-assistance` — never an empty list.
-- **`task`** is accepted on the constructor and passed to `handoff()`/`whatsNew()` unchanged;
-  the service ignores it until named tasks land. Core calls (`context`, `remember`) take no task.
+- **`task`** is accepted on the constructor and passed to `handoff()`/`whatsNew()` unchanged —
+  both calls are scoped to that named task (`"main"` when none is given): the handoff continues
+  that task's thread, and the what's-new note reports that task's saves in detail with other
+  tasks collapsed to a summary line. `context()` is task-agnostic — it returns records from
+  every task together, and each checkpoint item carries `task` naming the thread it came from.
+  Core calls (`context`, `remember`) take no task.
 - **Timeout**: each call fails rather than hanging — `service-unavailable`, never an exception
   the caller cannot name.
