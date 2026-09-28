@@ -5,12 +5,13 @@ import { canonicalizeNamespace, isMidaError, namespaceId } from "@mida/protocol"
 import type { ContextKind, Hex, RecordReference } from "@mida/protocol"
 import { batchAnchorAbi, recordPlacementsNear } from "@mida/chain"
 import type { RecordPlacement } from "@mida/chain"
-import { compareChainOrder, orderTime, taskOf } from "@mida/checkpoint"
+import { compareChainOrder, orderTime, otherTasksFor, taskOf } from "@mida/checkpoint"
 import type { MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
 import { batchClient, batchStatusProbe } from "./batching.js"
 import { chainRefusalReason } from "./chain-busy.js"
 import { unwrapCheckpoint } from "./checkpoint-payload.js"
+import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import { CHAIN_REFUSAL_TEXT } from "./hook-output.js"
 import {
   capabilityState,
@@ -25,6 +26,7 @@ import type { CapabilityState } from "./handoff.js"
 import { isRevoked, loadAgentIdentity } from "./keys.js"
 import { checkProject } from "./projects.js"
 import { isSafeName } from "./queue.js"
+import { pinSessionTask, resolveSessionTask, taskOrUndefined } from "./task.js"
 import { authorNamesFor } from "./skeleton.js"
 import { NAMESPACE } from "./runtime.js"
 import type { ServiceRuntime } from "./runtime.js"
@@ -43,6 +45,13 @@ import type { ServiceRuntime } from "./runtime.js"
  * over the same effective instant, newest first. A pending batched save is shown marked
  * `pending` — never counted as anchored — stamped with the store's own `receivedAt`, the only
  * honest "when" it has.
+ *
+ * In `projects.current` the read is also task-scoped exactly like the handoff (in-19): the
+ * session's task is resolved once via the same `resolveSessionTask` inputs — explicit task,
+ * session pin, predecessor record, folder default, `main` — and only that task's checkpoint
+ * records return. Records without a checkpoint envelope are durable memory and are never
+ * task-filtered, and the project's other active tasks ride along as `otherTasks` — name, last
+ * saver, save time, never their content.
  */
 
 export interface ContextItemWire {
@@ -58,16 +67,29 @@ export interface ContextItemWire {
   references: RecordReference[]
   proof: { manifestHash: Hex; recordId: Hex }
   /**
-   * Checkpoint records only: the named task the sealed envelope belongs to — "main" when it
-   * names none. context() is task-agnostic and serves every task's records together, so the
-   * item must name which thread it came from rather than let tasks blur silently (in-18 S2).
-   * Absent on every non-checkpoint record.
+   * Checkpoint records only: the task the sealed envelope belongs to. context() is task-scoped
+   * (in-19) — on a checkpoint item this always equals the task this read resolved, "main" when
+   * the session named none; a foreign task's checkpoint never lands here at all. Absent on
+   * every non-checkpoint record.
    */
   task?: string
 }
 
 export type ContextReadResult =
-  | { kind: "context"; items: ContextItemWire[]; cursor: string | null; overLimit?: true; partial?: true }
+  | {
+      kind: "context"
+      items: ContextItemWire[]
+      cursor: string | null
+      /**
+       * The project's OTHER active tasks — the same entries the handoff's mention block prints
+       * (in-19): name, the last saver's resolved name, that save's stamp. Awareness only — no
+       * content, no record ids. Empty when the read did not touch `projects.current` or no
+       * other task saved recently.
+       */
+      otherTasks: { name: string; savedBy: string; savedAt: string }[]
+      overLimit?: true
+      partial?: true
+    }
   | { kind: "refused"; reason: string; text: string }
 
 /** A verified object plus the fields the batched lane alone carries: the pending mark and stamp. */
@@ -87,6 +109,8 @@ export interface ContextReadDeps {
   /** One namespace's merged read (direct lane + batch table); tests inject a fake list. */
   read?: (runtime: ServiceRuntime, agent: string, namespace: string) => Promise<NamespaceRead>
   authorNames?: (runtime: ServiceRuntime) => Record<string, string>
+  /** Wall clock for the other-task freshness cutoff; tests inject. */
+  now?: () => number
 }
 
 const refused = (reason: string, text: string): ContextReadResult => ({ kind: "refused", reason, text })
@@ -258,6 +282,25 @@ const orderAdapter = (object: ReadObject): StoredCheckpoint => ({
   ...(migrationOf(object) === undefined ? {} : { migration: migrationOf(object) }),
 })
 
+/**
+ * One in-project checkpoint record as the StoredCheckpoint `otherTasksFor` expects — the same
+ * fields `readCheckpoints`' collect fills: the sealed envelope supplies the content fields
+ * (checkpoint, task, migration); the verified object supplies ids, author and chain placement.
+ */
+const checkpointAdapter = (object: ReadObject, envelope: CheckpointEnvelope): StoredCheckpoint => ({
+  contextId: object.contextId,
+  authorId: object.authorId,
+  namespaceId: object.namespaceId,
+  checkpoint: envelope.checkpoint,
+  projectId: envelope.projectId,
+  sessionId: envelope.sessionId,
+  continuesSession: envelope.continuesSession,
+  compiledBy: envelope.compiledBy,
+  ...(envelope.task === undefined ? {} : { task: envelope.task }),
+  ...(envelope.migration === undefined ? {} : { migration: envelope.migration }),
+  ...(object.chain === undefined ? {} : { chain: object.chain }),
+})
+
 /** A record's migration envelope — beside a string value, inside an object value. */
 function migrationOf(object: ReadObject): MigrationEnvelope | undefined {
   if (object.payload.migration !== undefined) return object.payload.migration as MigrationEnvelope
@@ -315,6 +358,12 @@ export async function buildContextRead(
   }
   const cursor = body.cursor
   if (cursor !== undefined && typeof cursor !== "string") return refused("bad-input", BAD_INPUT)
+  // tk-1/in-19: the same task inputs the handoff takes — the session id the SDK carries and the
+  // handle's explicit task. A non-string session id reads as no session; a task name that is
+  // not a task reads as absent (the folder default applies), never a crash — same rule as
+  // a bad MIDA_TASK on the hook path.
+  const sessionId = typeof body.sessionId === "string" ? body.sessionId : undefined
+  const explicitTask = taskOrUndefined(body.task)
 
   // identity — the same absent-vs-unreadable distinction checkAccess makes (a stat answers again
   // when the quiet load reported nothing, so EPERM never reads as "not set up").
@@ -339,9 +388,9 @@ export async function buildContextRead(
 
   // The owner-signed project list gates `projects.current` only — a fact namespace answers to the
   // chain grant alone and never needs a folder.
+  const cwd = typeof body.cwd === "string" ? body.cwd : ""
   let projectId: string | undefined
   if (namespaces.includes(NAMESPACE)) {
-    const cwd = typeof body.cwd === "string" ? body.cwd : ""
     if (!isAbsolute(cwd)) return refused("bad-input", BAD_INPUT)
     const check = await (deps.checkProject ?? checkProject)(runtime, { agent, cwd })
     if (!check.ok) {
@@ -368,6 +417,20 @@ export async function buildContextRead(
   if (state !== "live") {
     if (isGeneralAssistant(runtime.home, agent)) return refused("general-assistance", generalAssistanceText(agent))
     return refused("not-approved", `Mida: ${agent} is not approved for this context — the owner approves with \`mida approve ${agent}\`.`)
+  }
+
+  // tk-1/in-19: the session's task resolved ONCE, exactly as the handoff resolves it — explicit
+  // task, the pin an earlier call wrote, a predecessor's record, the folder's current task,
+  // then "main". Only a read touching `projects.current` has a task at all; every other
+  // namespace is durable memory, governed by grant alone. The pin keeps a mid-session
+  // `mida task` switch from moving a live session's reads — a refused read never wrote one.
+  let task: string | undefined
+  if (projectId !== undefined) {
+    const resolved = resolveSessionTask(runtime.home, { sessionId, projectId, cwd, explicit: explicitTask })
+    task = resolved.task
+    if (sessionId !== undefined && isSafeName(sessionId) && resolved.source !== "session") {
+      pinSessionTask(runtime.home, sessionId, projectId, task)
+    }
   }
 
   // The reads — every namespace through the same verified path; a chain refusal names its real
@@ -408,7 +471,12 @@ export async function buildContextRead(
       // records of another project stay out — the envelope is verified content, and its claim is
       // only consulted to EXCLUDE, never to include (the folder's own approval already gate-kept).
       const envelope = unwrapCheckpoint(object.payload.value)
-      if (envelope !== null && envelope.projectId !== projectId) return false
+      if (envelope === null) return true // durable memory — governed by grant, never task-filtered
+      if (envelope.projectId !== projectId) return false
+      // in-19: workflow memory is task-scoped — another task's checkpoint returns as an
+      // `otherTasks` mention below, never as an item. The filter runs BEFORE the sort, the
+      // cursor and the byte budget, so a page can neither skip nor repeat a record over it.
+      if (task !== undefined && taskOf(envelope) !== task) return false
     }
     return true
   })
@@ -424,6 +492,23 @@ export async function buildContextRead(
   }
 
   const names = (deps.authorNames ?? authorNamesFor)(runtime)
+  // in-19: the awareness list — computed over every in-project checkpoint this read collected
+  // (the same population the handoff's `readCheckpoints` feeds the shared helper, superseded
+  // rows included; it picks each task's newest by chain order itself). Paging never narrows it:
+  // the answer always knows which other tasks exist, even when the page holds few items.
+  const others =
+    task === undefined
+      ? []
+      : otherTasksFor(
+          objects.flatMap((object) => {
+            if (object.namespace !== NAMESPACE) return []
+            const envelope = unwrapCheckpoint(object.payload.value)
+            return envelope === null || envelope.projectId !== projectId ? [] : [checkpointAdapter(object, envelope)]
+          }),
+          task,
+          names,
+          (deps.now ?? Date.now)(),
+        )
   const items: ContextItemWire[] = []
   let nextCursor: string | null = null
   let overLimit = false
@@ -450,6 +535,8 @@ export async function buildContextRead(
     kind: "context",
     items,
     cursor: nextCursor,
+    // the wire names the field `savedBy` — the helper's `agent` is the same resolved saver name
+    otherTasks: others.map((entry) => ({ name: entry.name, savedBy: entry.agent, savedAt: entry.savedAt })),
     ...(overLimit ? { overLimit: true as const } : {}),
     ...(partial ? { partial: true as const } : {}),
   }

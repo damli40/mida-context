@@ -23,6 +23,8 @@ export interface ConformanceClient {
 export interface ConformanceSetup {
   /** The context area the scenario writes to — `projects.current` for the local transport. */
   namespace: string
+  /** The projectId the binding's folder is approved under — workflow-memory fixtures carry it. */
+  projectId: string
   /** The agent the binding provisioned and approved before the suite ran. */
   writer: string
   /**
@@ -31,8 +33,12 @@ export interface ConformanceSetup {
    * parent's row to name it (the direct lane's own write is the honest way to seed one).
    */
   seed: { id: `0x${string}` }
-  /** A client for the named agent — called more than once for the same agent on purpose. */
-  client(agent: string): ConformanceClient
+  /**
+   * A client for the named agent — called more than once for the same agent on purpose.
+   * `task` is the handle's named task (the Mida `task` option): it scopes which task's
+   * workflow checkpoints `context()` returns.
+   */
+  client(agent: string, options?: { task?: string }): ConformanceClient
   /** The owner-side revoke — the SDK carries no revoke call; this is what it would refuse after. */
   revoke(agent: string): Promise<void>
   /** Tear the binding down — daemon, chain, temp homes. */
@@ -87,6 +93,56 @@ export function conformanceSuite(label: string, setup: () => Promise<Conformance
       }
       const head = items.find((item) => item.id === replacement.id)
       expect(head?.content).toEqual({ note: "seed — revised" })
+    })
+
+    it("workflow memory is task-scoped; durable memory is not — other tasks are awareness only", async () => {
+      const writer = env.client(env.writer)
+      // A checkpoint-envelope value IS workflow memory wherever it was written — the sealed
+      // `mida.checkpoint.v1` marker decides, not the save path. This one belongs to another
+      // task; a plain record beside it is durable memory and is never task-filtered.
+      const foreign = await writer.remember({
+        namespace: env.namespace,
+        content: {
+          type: "mida.checkpoint.v1",
+          projectId: env.projectId,
+          sessionId: "conf-side-quest",
+          continuesSession: null,
+          compiledBy: "conformance",
+          task: "side-quest",
+          checkpoint: {
+            eventId: "cp-conf-side-quest",
+            agent: env.writer,
+            source: "agent-tool",
+            createdAt: new Date().toISOString(),
+            objective: "SIDE-QUEST-UNIQUE-OBJECTIVE",
+            originalRequest: null,
+            progress: [],
+            decisions: [],
+            rejected: [],
+            constraints: [],
+            artifacts: [],
+            remainingPlan: [],
+            evidence: [],
+            unresolvedIssue: null,
+            nextAction: "n",
+          },
+        },
+      })
+      const fact = await writer.remember({ namespace: env.namespace, content: "CONF-DURABLE-FACT" })
+      // this client never named a task — it reads as `main`: the side-quest checkpoint is a
+      // mention in otherTasks only; the durable fact is an ordinary item.
+      const read = await writer.context({ namespace: env.namespace, limit: 100_000 })
+      const ids = read.items.map((item) => item.id)
+      expect(ids).toContain(fact.id)
+      expect(ids).not.toContain(foreign.id)
+      expect(JSON.stringify(read)).not.toContain("SIDE-QUEST-UNIQUE-OBJECTIVE")
+      expect(read.otherTasks.some((t) => t.name === "side-quest" && t.savedBy === env.writer)).toBe(true)
+      // the task's own handle reads it as content — scoped, not hidden; and "main" holds no
+      // checkpoint, so a side-quest handle sees no other task at all
+      const inside = await env.client(env.writer, { task: "side-quest" }).context({ namespace: env.namespace, limit: 100_000 })
+      const hit = inside.items.find((item) => item.id === foreign.id)
+      expect(hit?.task).toBe("side-quest")
+      expect(inside.otherTasks).toEqual([])
     })
 
     it("a revoked agent is refused — never an empty or stale answer", async () => {

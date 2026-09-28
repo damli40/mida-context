@@ -95,9 +95,10 @@ conformanceSuite("local", async (): Promise<ConformanceSetup> => {
   })
   return {
     namespace: NAMESPACE,
+    projectId: PROJECT_ID,
     writer: WRITER,
     seed: { id: seedId },
-    client: (agent) => new Mida({ agent, project: workDir, home: home.root }),
+    client: (agent, options) => new Mida({ agent, project: workDir, home: home.root, task: options?.task }),
     revoke: async (agent) => {
       const owner = await Runtime.open(home, { ...network })
       try {

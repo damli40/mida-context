@@ -29,7 +29,7 @@ new Mida({
   agent: "my-agent",           // a provisioned agent name — the name `mida approve` signed for
   transport: "local",          // optional; the only transport today (see Transports below)
   project: "/path/to/folder",  // optional; what counts as "this project". Default: process.cwd()
-  task: "migration",           // optional; a task name handed to handoff()/whatsNew() unchanged
+  task: "migration",           // optional; scopes handoff()/whatsNew() and context()'s checkpoints
   home: "/path/to/.mida",      // optional; default $MIDA_HOME, else ~/.mida
 })
 ```
@@ -65,7 +65,7 @@ already-approved agent the call refuses `already-approved`.
 ### `context(input)` — read what the grants allow
 
 ```ts
-const { items, cursor, overLimit } = await mida.context({ namespace: "projects.current", limit: 8192 })
+const { items, cursor, overLimit, otherTasks } = await mida.context({ namespace: "projects.current", limit: 8192 })
 ```
 
 `context()` is deterministic — it takes `namespace` **or** `namespaces`, a byte `limit`, an
@@ -92,6 +92,14 @@ Each `ContextItem` carries:
 `limit` is returned alone with `overLimit: true`, never hidden and never truncated. `cursor`
 non-null means more items remain; pass it back as `cursor` to continue. `partial: true` means
 the store's own list was incomplete — the items shown verified, but the list may not be whole.
+
+In `projects.current`, checkpoint records (the handoff/state saves an agent's session writes) are
+**task-scoped**: `context()` returns only the checkpoints of the task this handle resolved —
+the same task `handoff()` resolves from the same inputs. Everything that is not a checkpoint —
+a `remember()` fact, a preference record — is durable memory and comes back whatever task the
+handle is on. Other tasks appear only in `otherTasks`: `{ name, savedBy, savedAt }` each, the
+same awareness list the handoff prints — never content, never ids. There is no cross-task read
+in this version; `mida task show <name>` is the only explicit crossing.
 
 ### `remember(input)` — write one memory
 
@@ -218,11 +226,12 @@ exactly what midad said: `not-approved`, `revoked`, `revoke-pending`, `already-a
   share the window. The refusal is `rate-limited` and names the lane.
 - **Grants gate everything.** An agent that was never approved gets `not-approved`; a revoked
   one gets `revoked`; a general assistant gets `general-assistance` — never an empty list.
-- **`task`** is accepted on the constructor and passed to `handoff()`/`whatsNew()` unchanged —
-  both calls are scoped to that named task (`"main"` when none is given): the handoff continues
-  that task's thread, and the what's-new note reports that task's saves in detail with other
-  tasks collapsed to a summary line. `context()` is task-agnostic — it returns records from
-  every task together, and each checkpoint item carries `task` naming the thread it came from.
-  Core calls (`context`, `remember`) take no task.
+- **`task`** is accepted on the constructor and scopes `handoff()`, `whatsNew()` and the
+  checkpoint records `context()` returns — all three resolve the same task (`"main"` when none
+  is given, or the folder's current task, or the session's pinned one). The handoff continues
+  that task's thread; the what's-new note reports that task's saves in detail with other tasks
+  collapsed to a summary line; `context()` returns only that task's checkpoints plus an
+  `otherTasks` awareness list, while non-checkpoint records are durable memory and never
+  task-filtered. `remember()` takes no task — a write never needs one.
 - **Timeout**: each call fails rather than hanging — `service-unavailable`, never an exception
   the caller cannot name.

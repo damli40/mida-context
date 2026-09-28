@@ -2,7 +2,7 @@ import { statSync } from "node:fs"
 import { isAbsolute } from "node:path"
 import { isMidaError } from "@mida/protocol"
 import { isReadDeadlineError } from "@mida/chain"
-import { compareChainOrder, defuse, handoffHeader, mergeCheckpoints, orderTime, otherTasksBlock, recordedAt, renderHandoffReport, taskOf } from "@mida/checkpoint"
+import { compareChainOrder, defuse, handoffHeader, mergeCheckpoints, otherTasksBlock, otherTasksFor, renderHandoffReport, taskOf } from "@mida/checkpoint"
 import type { MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
 import { chainRefusalReason } from "./chain-busy.js"
 import { CHAIN_REFUSAL_TEXT } from "./hook-output.js"
@@ -116,10 +116,6 @@ export const PARTIAL_LINE = "Some saved context could not be loaded yet; what fo
 export const PENDING_ANCHOR_LINE = "PENDING_ANCHOR: not yet anchored on Monad; may still be rejected"
 const HANDOFF_BEGIN = "=== BEGIN MIDA HANDOFF DATA ==="
 const HANDOFF_TAIL = "=== END MIDA HANDOFF DATA ==="
-/** tk-1: a task counts as "active" when its newest checkpoint is this fresh — older ones go quiet. */
-const ACTIVE_TASK_MS = 14 * 24 * 60 * 60 * 1000
-/** At most this many other tasks get a mention line in a handoff. */
-const OTHER_TASKS_MAX = 5
 
 /** The queued-job scan reads at most this many files — a flooded queue costs one bounded look. */
 const QUEUE_NOTE_SCAN_LIMIT = 200
@@ -456,27 +452,9 @@ export async function buildHandoff(
     // rule, so records from before tasks exist all land in `main`.
     const inTask = (cp: StoredCheckpoint) => taskOf(cp) === task
     // The other tasks' newest checkpoint each — awareness, not context: name, last saver, age.
-    // Only a task that saw a checkpoint inside the last 14 days counts as active; newest first,
-    // capped at five — and none of it renders when no other task is active.
-    const otherTasks = (() => {
-      const cutoff = now() - ACTIVE_TASK_MS
-      const newest = new Map<string, StoredCheckpoint>()
-      for (const cp of outcome.checkpoints) {
-        if (inTask(cp)) continue
-        const at = orderTime(cp)
-        if (Number.isNaN(at) || at < cutoff) continue
-        const prev = newest.get(taskOf(cp))
-        if (prev === undefined || compareChainOrder(cp, prev) > 0) newest.set(taskOf(cp), cp)
-      }
-      return [...newest.values()]
-        .sort((a, b) => compareChainOrder(b, a))
-        .slice(0, OTHER_TASKS_MAX)
-        .map((cp) => ({
-          name: taskOf(cp),
-          agent: input.authorNames[cp.authorId.toLowerCase()] ?? "unknown agent",
-          savedAt: recordedAt(cp),
-        }))
-    })()
+    // One shared computation (in-19): the SDK's context() answers the identical list, so the
+    // two reads can never disagree about which other tasks exist.
+    const otherTasks = otherTasksFor(outcome.checkpoints, task, input.authorNames, now())
     // A pending batched save is usable at once but is never described as saved (Amendment B.3):
     // it stays OUT of the merge — every merged section reads as anchored state, and the header's
     // save time counts anchored records only — and renders as its own marked block inside the

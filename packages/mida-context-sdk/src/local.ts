@@ -153,6 +153,10 @@ export class LocalTransport implements Transport {
         agent: this.#agent,
         // the folder this read stands in — the daemon's project gate keys `projects.current` on it
         cwd: this.#project,
+        // the same session id and task the handoff sends — the daemon resolves the read's task
+        // from exactly these, so context() and handoff() can never disagree (in-19)
+        sessionId: this.#sessionId,
+        ...(this.#task === undefined ? {} : { task: this.#task }),
         ...(input.namespace === undefined ? {} : { namespace: input.namespace }),
         ...(input.namespaces === undefined ? {} : { namespaces: input.namespaces }),
         limit: input.limit,
@@ -161,13 +165,22 @@ export class LocalTransport implements Transport {
       },
       CONTEXT_TIMEOUT_MS,
     )
-    const record = body as { items?: unknown; cursor?: unknown; overLimit?: unknown; partial?: unknown }
+    const record = body as { items?: unknown; cursor?: unknown; overLimit?: unknown; partial?: unknown; otherTasks?: unknown }
     if (!Array.isArray(record.items)) {
       throw new MidaSdkError("failed", "the Mida service returned a context answer this SDK does not understand — nothing was read")
     }
+    // a malformed or absent awareness list reads as empty — it is metadata, never a gate
+    const otherTasks = Array.isArray(record.otherTasks)
+      ? record.otherTasks.flatMap((entry) =>
+          isObj(entry) && typeof entry.name === "string" && typeof entry.savedBy === "string" && typeof entry.savedAt === "string"
+            ? [{ name: entry.name, savedBy: entry.savedBy, savedAt: entry.savedAt }]
+            : [],
+        )
+      : []
     return {
       items: record.items as ContextResult["items"],
       cursor: typeof record.cursor === "string" ? record.cursor : null,
+      otherTasks,
       ...(record.overLimit === true ? { overLimit: true as const } : {}),
       ...(record.partial === true ? { partial: true as const } : {}),
     }

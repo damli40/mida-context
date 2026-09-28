@@ -26,7 +26,7 @@ export interface MidaOptions {
   transport?: TransportKind
   /** The folder this agent works in — what counts as "this project". Default: process.cwd(). */
   project?: string
-  /** The named task this agent is doing; handed to handoff/whatsNew/status unchanged. */
+  /** The named task this agent is doing; scopes handoff()/whatsNew()/status() and the checkpoint records context() returns. */
   task?: string
   /** The Mida home — the folder `mida init` made. Default: $MIDA_HOME, else ~/.mida. */
   home?: string
@@ -79,9 +79,11 @@ export class Mida {
 
   /**
    * Read this user's context in the areas this agent's grants cover — most-recently-anchored
-   * first, byte-budgeted, whole records only. Throws the refusal's code (`not-approved`,
-   * `revoked`, `rate-limited`…) when the service refuses; `service-unavailable` when midad
-   * isn't answering.
+   * first, byte-budgeted, whole records only. In `projects.current`, checkpoint records are
+   * scoped to this handle's task (the same task `handoff()` resolves); the result's
+   * `otherTasks` names the project's other active tasks without their content. Throws the
+   * refusal's code (`not-approved`, `revoked`, `rate-limited`…) when the service refuses;
+   * `service-unavailable` when midad isn't answering.
    */
   context(input: ContextInput): Promise<ContextResult> {
     return this.#transport.context(input)

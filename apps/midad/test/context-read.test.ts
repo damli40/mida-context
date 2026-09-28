@@ -3,10 +3,12 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { MidaError, namespaceId } from "@mida/protocol"
-import { MidaHome, buildContextRead } from "@mida/midad"
-import type { ContextReadDeps, ServiceRuntime } from "@mida/midad"
+import { MidaHome, buildContextRead, buildHandoff, writeFolderTask } from "@mida/midad"
+import type { ContextReadDeps, HandoffDeps, ServiceRuntime } from "@mida/midad"
 import type { ContextObject } from "@mida/sdk"
+import type { Checkpoint, StoredCheckpoint } from "@mida/checkpoint"
 import type { Hex } from "@mida/protocol"
+import { sampleCheckpoint } from "./helpers.js"
 
 const home = () => new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctxread-")))
 
@@ -216,16 +218,16 @@ describe("buildContextRead — the daemon's /context route", () => {
     expect(result.items.map((item) => item.id)).toEqual([id(3), id(1)])
   })
 
-  it("checkpoint items carry their task — named, 'main' when absent, never on a plain record", async () => {
-    // in-18 S2: context() is task-agnostic and serves every task's records together, so a
-    // checkpoint item must name the thread it came from — the envelope's own field, "main"
-    // when the envelope names none, and no key at all on a non-checkpoint record.
-    const checkpoint = {
+  it("checkpoint items carry the resolved task — a foreign task moves to otherTasks, never to items", async () => {
+    // in-19: context() is task-scoped exactly like the handoff. With no explicit task and no
+    // marker folder the read resolves "main" — the sdk checkpoint leaves the item list and
+    // returns as an awareness entry (name, saver, stamp — never content, never the record id).
+    const checkpoint = (objective: string) => ({
       eventId: "cp-0123456789",
       agent: "codex",
-      source: "agent-tool",
+      source: "agent-tool" as const,
       createdAt: "2026-09-30T00:00:00.000Z",
-      objective: "o",
+      objective,
       nextAction: "n",
       originalRequest: null,
       progress: [],
@@ -236,25 +238,28 @@ describe("buildContextRead — the daemon's /context route", () => {
       remainingPlan: [],
       evidence: [],
       unresolvedIssue: null,
-    }
-    const envelope = (task?: string) => ({
+    })
+    const envelope = (task: string | undefined, objective: string) => ({
       type: "mida.checkpoint.v1",
       projectId: PID,
       sessionId: "s",
       continuesSession: null,
       compiledBy: "codex",
-      checkpoint,
+      checkpoint: checkpoint(objective),
       ...(task === undefined ? {} : { task }),
     })
-    const sdkTask = object({ contextId: id(1), chain: { at: 3000n }, payload: { v: 1, value: envelope("sdk"), kind: "EPISODE", provenance: { source: "AGENT_INFERRED" } } })
-    const mainTask = object({ contextId: id(2), chain: { at: 2000n }, payload: { v: 1, value: envelope(), kind: "EPISODE", provenance: { source: "AGENT_INFERRED" } } })
+    const sdkTask = object({ contextId: id(1), chain: { at: 3000n }, payload: { v: 1, value: envelope("sdk", "SDK-ONLY-UNIQUE-OBJECTIVE"), kind: "EPISODE", provenance: { source: "AGENT_INFERRED" } } })
+    const mainTask = object({ contextId: id(2), chain: { at: 2000n }, payload: { v: 1, value: envelope(undefined, "o"), kind: "EPISODE", provenance: { source: "AGENT_INFERRED" } } })
     const plain = object({ contextId: id(3), chain: { at: 1000n }, payload: { v: 1, value: "no envelope", kind: "INFERENCE", provenance: { source: "AGENT_INFERRED" } } })
-    const result = await call({ read: async () => ({ objects: [sdkTask, mainTask, plain], partial: false, skipped: 0 }) })
+    const result = await call({ read: async () => ({ objects: [sdkTask, mainTask, plain], partial: false, skipped: 0 }), now: () => 4_000_000 })
     if (result.kind !== "context") throw new Error("expected context")
-    expect(result.items.map((item) => item.id)).toEqual([id(1), id(2), id(3)])
-    expect(result.items[0]!.task).toBe("sdk")
-    expect(result.items[1]!.task).toBe("main")
-    expect("task" in result.items[2]!).toBe(false)
+    expect(result.items.map((item) => item.id)).toEqual([id(2), id(3)])
+    expect(result.items[0]!.task).toBe("main")
+    expect("task" in result.items[1]!).toBe(false)
+    expect(result.otherTasks).toEqual([{ name: "sdk", savedBy: "codex", savedAt: new Date(3000_000).toISOString() }])
+    const serialized = JSON.stringify(result)
+    expect(serialized).not.toContain("SDK-ONLY-UNIQUE-OBJECTIVE")
+    expect(serialized).not.toContain(id(1))
   })
 
   it("a fact namespace needs no folder approval — the chain grant alone decides", async () => {
@@ -328,5 +333,205 @@ describe("buildContextRead — the daemon's /context route", () => {
   it("a chain failure inside the read names the chain reason, not a generic failure", async () => {
     const result = await call({ read: async () => { throw new MidaError("CHAIN_UNAVAILABLE", "rpc down") } })
     expect(result).toMatchObject({ kind: "refused", reason: "chain-busy" })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// in-19 — context() is task-scoped for workflow memory, exactly like /handoff
+// ---------------------------------------------------------------------------
+
+const T0 = Date.parse("2026-09-27T12:00:00.000Z")
+
+/** A checkpoint record: the envelope marker is what makes a value workflow memory. */
+const cpBody = (objective: string, createdAt = "2026-09-27T10:00:00.000Z"): Checkpoint =>
+  sampleCheckpoint({ objective, createdAt })
+
+const cpEnvelope = (task: string | undefined, objective: string) => ({
+  type: "mida.checkpoint.v1",
+  projectId: PID,
+  sessionId: `s-${task ?? "main"}`,
+  continuesSession: null,
+  compiledBy: "test",
+  checkpoint: cpBody(objective),
+  ...(task === undefined ? {} : { task }),
+})
+
+const cpObject = (n: number, task: string | undefined, at: bigint, objective: string): ContextObject =>
+  object({ contextId: id(n), chain: { at }, payload: { v: 1, value: cpEnvelope(task, objective), kind: "EPISODE", provenance: { source: "AGENT_INFERRED" } } })
+
+/** A project folder on disk: `.mida/project.json` holding PID — same shape `mida approve` leaves. */
+const markFolder = (cwd: string) => {
+  mkdirSync(join(cwd, ".mida"), { recursive: true, mode: 0o700 })
+  writeFileSync(join(cwd, ".mida", "project.json"), JSON.stringify({ projectId: PID }), { mode: 0o600 })
+}
+
+/** A MidaHome carrying a well-formed `codex` identity — buildHandoff's gate reads the real file. */
+const homeWithCodex = (root: string): MidaHome => {
+  const dir = new MidaHome(root)
+  dir.writeSecretJson("agents/codex/identity.json", {
+    name: "codex",
+    agentId: `0x${"1".repeat(64)}`,
+    signerPrivateKey: `0x${"2".repeat(64)}`,
+    encryptionPrivateKey: `0x${"3".repeat(64)}`,
+    encryptionPublicKey: `0x${"4".repeat(64)}`,
+    callbackOrigin: "https://agent.test",
+    purposeId: "test",
+    manifest: {},
+    manifestHash: `0x${"5".repeat(64)}`,
+  })
+  return dir
+}
+
+const storedCp = (n: number, task: string | undefined, objective: string): StoredCheckpoint => ({
+  checkpoint: cpBody(objective),
+  projectId: PID,
+  sessionId: `s-${task ?? "main"}`,
+  continuesSession: null,
+  compiledBy: "test",
+  contextId: id(n),
+  authorId: AGENT_ID,
+  namespaceId: `0x${"2".repeat(64)}`,
+  chain: { at: BigInt(n) * 1000n },
+  ...(task === undefined ? {} : { task }),
+})
+
+describe("task-scoped workflow memory (in-19)", () => {
+  it("an explicit task reads that task's checkpoints only — durable memory is never task-filtered", async () => {
+    const sdk = cpObject(1, "sdk", 3000n, "SDK-TASK-UNIQUE-OBJECTIVE")
+    const main = cpObject(2, undefined, 2000n, "MAIN-TASK-UNIQUE-OBJECTIVE")
+    const fact = object({
+      contextId: id(3),
+      chain: { at: 2500n },
+      payload: { v: 1, value: "DAMI-PREFERS-CONCISE-EXPLANATIONS", kind: "FACT", provenance: { source: "AGENT_INFERRED" } },
+    })
+    const pref = object({
+      contextId: id(4),
+      namespace: "preferences.communication",
+      namespaceId: namespaceId("preferences.communication"),
+      chain: { at: 1000n },
+      payload: { v: 1, value: "CONCISE-STYLE-PREF", kind: "INFERENCE", provenance: { source: "AGENT_INFERRED" } },
+    })
+    const read = async (_r: unknown, _a: string, namespace: string) =>
+      namespace === "preferences.communication"
+        ? { objects: [pref], partial: false, skipped: 0 }
+        : { objects: [sdk, main, fact], partial: false, skipped: 0 }
+    // `now` sits just past the fixture stamps — a wall clock far in their future would read
+    // them as stale and correctly drop them from otherTasks' 14-day window
+    const result = await call({ read, now: () => 4_000_000 }, { task: "sdk", namespace: undefined, namespaces: [NS, "preferences.communication"] })
+    if (result.kind !== "context") throw new Error("expected context")
+    // the sdk checkpoint, the projects.current fact and the preference — no main checkpoint
+    expect(result.items.map((item) => item.id)).toEqual([id(1), id(3), id(4)])
+    expect(result.items[0]!.task).toBe("sdk")
+    // "main" is awareness only: the name, the saver, the stamp — never the record's id or content
+    expect(result.otherTasks).toEqual([{ name: "main", savedBy: "codex", savedAt: new Date(2000_000).toISOString() }])
+    const serialized = JSON.stringify(result)
+    expect(serialized).not.toContain("MAIN-TASK-UNIQUE-OBJECTIVE")
+    expect(serialized).not.toContain(id(2))
+  })
+
+  it("with no explicit task the folder's current task decides; no folder task reads as main", async () => {
+    const work = mkdtempSync(join(tmpdir(), "mida-ctxread-work-"))
+    markFolder(work)
+    const objects = [cpObject(1, "sdk", 2000n, "SDK-ONLY"), cpObject(2, undefined, 1000n, "MAIN-ONLY")]
+    const deps: Partial<ContextReadDeps> = { read: async () => ({ objects, partial: false, skipped: 0 }), now: () => 4_000_000 }
+    writeFolderTask(work, "sdk")
+    const sdkRead = await call(deps, { cwd: work })
+    if (sdkRead.kind !== "context") throw new Error("expected context")
+    expect(sdkRead.items.map((item) => item.id)).toEqual([id(1)])
+    expect(sdkRead.items[0]!.task).toBe("sdk")
+    expect(sdkRead.otherTasks).toEqual([{ name: "main", savedBy: "codex", savedAt: new Date(1000_000).toISOString() }])
+    // back to `main` — `mida task main` removes the file, and the untasked checkpoint is the thread
+    writeFolderTask(work, "main")
+    const mainRead = await call(deps, { cwd: work })
+    if (mainRead.kind !== "context") throw new Error("expected context")
+    expect(mainRead.items.map((item) => item.id)).toEqual([id(2)])
+    expect(mainRead.items[0]!.task).toBe("main")
+    expect(mainRead.otherTasks).toEqual([{ name: "sdk", savedBy: "codex", savedAt: new Date(2000_000).toISOString() }])
+  })
+
+  it("paging walks the filtered set — five in-task records across pages, no repeats, no gaps", async () => {
+    // five sdk checkpoints interleaved with five untasked (main) ones, newest first
+    const objects: ContextObject[] = []
+    for (let i = 0; i < 5; i += 1) {
+      objects.push(cpObject(10 + i, "sdk", BigInt(10 - i * 2) * 1000n, `SDK-STEP-${i}`))
+      objects.push(cpObject(20 + i, undefined, BigInt(9 - i * 2) * 1000n, `MAIN-STEP-${i}`))
+    }
+    const bytes = Math.max(...objects.map((o) => Buffer.byteLength(JSON.stringify(o.payload.value), "utf8")))
+    const deps: Partial<ContextReadDeps> = { read: async () => ({ objects, partial: false, skipped: 0 }), now: () => T0 }
+    const collected: Hex[] = []
+    let cursor: string | undefined
+    for (;;) {
+      const page = await call(deps, { task: "sdk", limit: bytes * 2, ...(cursor === undefined ? {} : { cursor }) })
+      if (page.kind !== "context") throw new Error("expected context")
+      collected.push(...page.items.map((item) => item.id))
+      if (page.cursor === null) break
+      cursor = page.cursor
+    }
+    // exactly the five sdk records, in the chain's order — the main-task records never surface,
+    // and the cursor (computed over the filtered set) neither skipped nor repeated one
+    expect(collected).toEqual([id(10), id(11), id(12), id(13), id(14)])
+    expect(new Set(collected).size).toBe(5)
+  })
+
+  it("context() and handoff() agree — the pin the handoff wrote decides this session's read", async () => {
+    const dir = homeWithCodex(join(mkdtempSync(join(tmpdir(), "mida-ctxread-agree-")), "home"))
+    const rt = runtime(dir)
+    const sdkStored = storedCp(1, "sdk", "SDK-AGREE-OBJECTIVE")
+    const mainStored = storedCp(2, undefined, "MAIN-AGREE-OBJECTIVE")
+    const handoffDeps: HandoffDeps = {
+      checkProject: async () => ({ ok: true, approval: { agent: "codex", projectId: PID, root: "/r", approvedAt: "t" } }),
+      capability: async () => "live",
+      read: async () => ({ checkpoints: [sdkStored, mainStored], skipped: 0, milliseconds: 1, partial: false }),
+      readFacts: async () => [],
+      isRevoked: () => false,
+      now: () => 4_000_000,
+    }
+    const handoff = await buildHandoff(rt, { agent: "codex", cwd: "/work", authorNames: { [AGENT_ID]: "codex" }, sessionId: "s-agree", task: "sdk" }, handoffDeps)
+    if (handoff.kind !== "handoff") throw new Error(`expected handoff, got ${JSON.stringify(handoff)}`)
+    expect(handoff.text).toContain("SDK-AGREE-OBJECTIVE")
+    expect(handoff.text).not.toContain("MAIN-AGREE-OBJECTIVE")
+    // the same session's context() names no task — the pin the handoff just wrote resolves it
+    const context = await buildContextRead(
+      rt,
+      { agent: "codex", cwd: "/work", sessionId: "s-agree", namespace: NS, limit: 100_000 },
+      okDeps({ read: async () => ({ objects: [cpObject(1, "sdk", 1000n, "SDK-AGREE-OBJECTIVE"), cpObject(2, undefined, 2000n, "MAIN-AGREE-OBJECTIVE")], partial: false, skipped: 0 }), now: () => 4_000_000 }),
+    )
+    if (context.kind !== "context") throw new Error("expected context")
+    expect(context.items.map((item) => item.id)).toEqual([id(1)])
+    expect(context.items[0]!.task).toBe("sdk")
+    expect(JSON.stringify(context)).not.toContain("MAIN-AGREE-OBJECTIVE")
+    expect(context.otherTasks).toEqual([{ name: "main", savedBy: "codex", savedAt: new Date(2000_000).toISOString() }])
+  })
+
+  it("a malformed explicit task is absent — the folder's current task applies, never a crash", async () => {
+    const work = mkdtempSync(join(tmpdir(), "mida-ctxread-badtask-"))
+    markFolder(work)
+    writeFolderTask(work, "sdk")
+    const objects = [cpObject(1, "sdk", 2000n, "SDK-ONLY"), cpObject(2, undefined, 1000n, "MAIN-ONLY")]
+    const result = await call(
+      { read: async () => ({ objects, partial: false, skipped: 0 }), now: () => T0 },
+      { cwd: work, task: "NOT A TASK!" },
+    )
+    if (result.kind !== "context") throw new Error("expected context")
+    expect(result.items.map((item) => item.id)).toEqual([id(1)])
+    expect(result.items[0]!.task).toBe("sdk")
+  })
+
+  it("a read outside projects.current carries no task and an empty otherTasks", async () => {
+    const pref = object({
+      contextId: id(4),
+      namespace: "preferences.communication",
+      namespaceId: namespaceId("preferences.communication"),
+      chain: { at: 1000n },
+      payload: { v: 1, value: "CONCISE-STYLE-PREF", kind: "INFERENCE", provenance: { source: "AGENT_INFERRED" } },
+    })
+    const result = await call(
+      { read: async () => ({ objects: [pref], partial: false, skipped: 0 }) },
+      { namespace: "preferences.communication" },
+    )
+    if (result.kind !== "context") throw new Error("expected context")
+    expect(result.items.map((item) => item.id)).toEqual([id(4)])
+    expect("task" in result.items[0]!).toBe(false)
+    expect(result.otherTasks).toEqual([])
   })
 })

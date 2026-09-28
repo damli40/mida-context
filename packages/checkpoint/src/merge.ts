@@ -184,6 +184,44 @@ export const compareChainOrder = (a: StoredCheckpoint, b: StoredCheckpoint): num
 
 const byTime = compareChainOrder
 
+/** A task counts as "active" when its newest checkpoint is this fresh — older ones go quiet (tk-1). */
+const ACTIVE_TASK_MS = 14 * 24 * 60 * 60 * 1000
+/** At most this many other tasks get a mention — the awareness list stays a glance, not a dump. */
+const OTHER_TASKS_MAX = 5
+
+/**
+ * The "other active tasks" awareness every task-scoped read computes the same way (tk-1, in-19 —
+ * the handoff and the SDK's context() share this one helper, so they can never disagree): one
+ * entry per task ≠ `task` whose newest checkpoint landed inside the last 14 days — the task's
+ * name, the last saver's resolved name, that record's effective stamp — newest first, capped at
+ * five. A mention is awareness, not context: it carries no checkpoint content and no record id,
+ * and the task's own thread is a deliberate `mida task show <name>` away.
+ */
+export function otherTasksFor(
+  checkpoints: readonly StoredCheckpoint[],
+  task: string,
+  authorNames: Record<string, string>,
+  nowMs: number,
+): { name: string; agent: string; savedAt: string }[] {
+  const cutoff = nowMs - ACTIVE_TASK_MS
+  const newest = new Map<string, StoredCheckpoint>()
+  for (const cp of checkpoints) {
+    if (taskOf(cp) === task) continue
+    const at = orderTime(cp)
+    if (Number.isNaN(at) || at < cutoff) continue
+    const prev = newest.get(taskOf(cp))
+    if (prev === undefined || compareChainOrder(cp, prev) > 0) newest.set(taskOf(cp), cp)
+  }
+  return [...newest.values()]
+    .sort((a, b) => compareChainOrder(b, a))
+    .slice(0, OTHER_TASKS_MAX)
+    .map((cp) => ({
+      name: taskOf(cp),
+      agent: authorNames[cp.authorId.toLowerCase()] ?? "unknown agent",
+      savedAt: recordedAt(cp),
+    }))
+}
+
 // Dedupe key: JSON with object keys sorted, so two items that differ only in
 // key order ({decision, rationale} vs {rationale, decision}) collapse to one.
 function stableKey(v: unknown): string {

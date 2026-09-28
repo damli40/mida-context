@@ -24,9 +24,10 @@ export interface ContextItem {
   /** The on-chain proof of this record: its manifestHash and the record id to verify against. */
   proof: { manifestHash: Hex; recordId: Hex }
   /**
-   * Checkpoint records only: the named task the record belongs to — "main" when the envelope
-   * names none. `context()` is task-agnostic: it returns records from every task, and each
-   * checkpoint item names which task thread it came from. Absent on non-checkpoint records.
+   * Checkpoint records only: the task the record belongs to. Workflow memory is task-scoped —
+   * `context()` returns only the resolved task's checkpoint records, so on a checkpoint item
+   * this always equals that task ("main" when the handle named none). Absent on every
+   * non-checkpoint record, which is durable memory and never task-filtered.
    */
   task?: string
 }
@@ -49,6 +50,13 @@ export interface ContextResult {
   items: ContextItem[]
   /** Non-null while more items remain beyond this page — pass it back as `cursor`. */
   cursor: string | null
+  /**
+   * The project's other active tasks — name, who last saved, when — the same entries the
+   * handoff prints as "Other active tasks". Awareness only: no content, no record ids; a
+   * task's own thread is a deliberate `mida task show <name>` away. Empty when the read did
+   * not touch `projects.current` or no other task saved recently.
+   */
+  otherTasks: { name: string; savedBy: string; savedAt: string }[]
   /** Set when a single record larger than `limit` was returned alone. */
   overLimit?: true
   /** Set when the store's list was incomplete — the items shown verified, but the list may not be whole. */
