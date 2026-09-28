@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from "node:fs"
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs"
+import { randomBytes } from "node:crypto"
 import { basename, dirname, join } from "node:path"
 import { permissionBits, provenancePolicyBits, POLICY_DOCUMENT_V1 } from "@mida/grant-advisor"
 import { canonicalizeNamespace, isMidaError, namespaceId } from "@mida/protocol"
@@ -49,6 +50,11 @@ const FOLDER_LINES: Record<string, string> = {
 const HEX_ID = /^0x[0-9a-fA-F]{64}$/
 const REFERENCE_RELATIONS = new Set(["supports", "derived_from", "confirmed_from"])
 
+/** The same cap midad's seen.ts keeps — the oldest delivered ids drop past it. */
+const SEEN_MAX = 300
+/** The same safe-name rule midad's queue.ts enforces — a session id becomes a filename in the home. */
+const SAFE_SESSION = /^[A-Za-z0-9._-]{1,128}$/
+
 const isObj = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v)
 
 /**
@@ -63,12 +69,49 @@ export class LocalTransport implements Transport {
   readonly #home: string
   readonly #project: string
   readonly #task: string | undefined
+  /**
+   * One session id per transport instance — the whats-new seen set lives under it for this
+   * instance's life, exactly as the MCP adapter's `mcp-<agent>-<hex>` does. Two Mida objects
+   * are two sessions: what one was already told stays new to the other.
+   */
+  readonly #sessionId: string
 
   constructor(options: { agent: string; home: string; project: string; task?: string }) {
     this.#agent = options.agent
     this.#home = options.home
     this.#project = options.project
     this.#task = options.task
+    this.#sessionId = `sdk-${options.agent}-${randomBytes(4).toString("hex")}`
+  }
+
+  /**
+   * The same writeSeen the hooks and the MCP adapter run against `state/lastseen/<sessionId>.json`
+   * (apps/midad/src/seen.ts — midad is a devDependency, so the path, the `{ seen: [...] }` shape
+   * and the SEEN_MAX cap are replicated here byte-for-byte rather than imported): a 0600 temp
+   * file, fsync, rename into place.
+   */
+  #writeSeen(seen: string[]): void {
+    if (!SAFE_SESSION.test(this.#sessionId) || this.#sessionId === "." || this.#sessionId === "..") return
+    const file = join(this.#home, "state", "lastseen", `${this.#sessionId}.json`)
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+    const temp = `${file}.${randomBytes(6).toString("hex")}.tmp`
+    try {
+      const fd = openSync(temp, "wx", 0o600)
+      try {
+        writeSync(fd, JSON.stringify({ seen: seen.slice(-SEEN_MAX) }, null, 2))
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+      renameSync(temp, file)
+    } catch (error) {
+      try {
+        rmSync(temp, { force: true })
+      } catch {
+        // a leftover temp file is a timestamp, nothing more
+      }
+      throw error
+    }
   }
 
   /**
@@ -289,12 +332,23 @@ export class LocalTransport implements Transport {
   async handoff(): Promise<HandoffAnswer> {
     const body = await this.#call(
       "/handoff",
-      { agent: this.#agent, cwd: this.#project, ...(this.#task === undefined ? {} : { task: this.#task }) },
+      { agent: this.#agent, cwd: this.#project, sessionId: this.#sessionId, ...(this.#task === undefined ? {} : { task: this.#task }) },
       HANDOFF_TIMEOUT_MS,
     )
-    const record = body as { kind?: unknown; text?: unknown }
+    const record = body as { kind?: unknown; text?: unknown; seen?: unknown }
     if ((record.kind !== "handoff" && record.kind !== "empty") || typeof record.text !== "string") {
       throw new MidaSdkError("failed", "the Mida service returned a handoff answer this SDK does not understand")
+    }
+    // the covered contextIds seed this session's seen set — the same writeSeen the hook and the
+    // MCP adapter perform after a delivered handoff, so a whatsNew() right after does not
+    // re-report what this answer already carried
+    const covered = Array.isArray(record.seen) ? record.seen.filter((id): id is string => typeof id === "string") : undefined
+    if (covered !== undefined) {
+      try {
+        this.#writeSeen(covered)
+      } catch {
+        // a failed baseline write only means a later whatsNew() may re-offer what this covered
+      }
     }
     return { kind: record.kind, text: record.text }
   }
@@ -302,11 +356,21 @@ export class LocalTransport implements Transport {
   async whatsNew(): Promise<WhatsNewAnswer> {
     const body = await this.#call(
       "/whatsnew",
-      { agent: this.#agent, cwd: this.#project, ...(this.#task === undefined ? {} : { task: this.#task }) },
+      { agent: this.#agent, cwd: this.#project, sessionId: this.#sessionId, ...(this.#task === undefined ? {} : { task: this.#task }) },
       WHATS_NEW_TIMEOUT_MS,
     )
-    const record = body as { kind?: unknown; note?: unknown }
+    const record = body as { kind?: unknown; note?: unknown; seen?: unknown }
     if (record.kind === "updates" && typeof record.note === "string") {
+      // the delivered note's proposed ids join the seen set — the same writeSeen the MCP adapter
+      // runs, so the note is not repeated on the next call
+      const seen = Array.isArray(record.seen) ? record.seen.filter((id): id is string => typeof id === "string") : undefined
+      if (seen !== undefined) {
+        try {
+          this.#writeSeen(seen)
+        } catch {
+          // a failed state write only means the same note may be offered once more
+        }
+      }
       return { kind: "updates", text: record.note }
     }
     if (record.kind === "none") {

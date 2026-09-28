@@ -141,7 +141,10 @@ const news = await mida.whatsNew()
 ```
 
 The same answer `mida_whats_new` gives — saves by *other* approved agents since this one's
-context was last read.
+context was last read. Each `Mida` instance is its own session (`sdk-<agent>-<hex>`): a note
+already delivered to it goes quiet on the next call, while a second instance still sees the
+same save as new. The seen set lives in `state/lastseen/` under the Mida home — the same
+records the hooks and the MCP adapter keep.
 
 ## The product test
 

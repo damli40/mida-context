@@ -167,6 +167,38 @@ describe("local transport against a real midad on local Anvil", () => {
     expect(answer).toEqual({ kind: "none", text: "Mida: nothing new since the last check." })
   }, STEP_TIMEOUT)
 
+  it("whatsNew() quiets a delivered note for this session — a second Mida still sees it as new", async () => {
+    // in-18 B4 (probe zz-rvint-sdk-whatsnew-seen inverted): the SDK used to send no session id,
+    // so the daemon had no seen set to consult and the same foreign save came back "new" on every
+    // call forever. Now each Mida instance is a session (`sdk-<agent>-<hex>`): the delivered note's
+    // ids are recorded under state/lastseen/<sessionId>.json exactly as the MCP adapter records them.
+    const mida = new Mida({ agent: "codex", project: workDir, home: home.root })
+    const first = await mida.whatsNew()
+    expect(first.kind).toBe("updates")
+    expect(first.text).toContain("cursor")
+    // the delivered note was recorded — the same save is quiet on the very next call
+    const second = await mida.whatsNew()
+    expect(second).toEqual({ kind: "none", text: "Mida: nothing new since the last check." })
+    // a second Mida instance is a SECOND session — what the first consumed is still new to it
+    const other = new Mida({ agent: "codex", project: workDir, home: home.root })
+    const fresh = await other.whatsNew()
+    expect(fresh.kind).toBe("updates")
+    expect(fresh.text).toContain("cursor")
+    // a NEW foreign save is new again to the session that already went quiet
+    const runtime = await Runtime.open(home, { ...network, storageUrl: env.apiBaseUrl })
+    try {
+      await saveCheckpoint(runtime, "cursor", checkpointFor("cursor", "cp-cursor-2"))
+    } finally {
+      await runtime.close()
+    }
+    // the same reseed the daemon does on a real session start: a codex /handoff refreshes its copy
+    const seed = await callDaemon(home, "/handoff", { agent: "codex", cwd: workDir }, { timeoutMs: 30_000 })
+    expect(seed.status).toBe(200)
+    const third = await mida.whatsNew()
+    expect(third.kind).toBe("updates")
+    expect(third.text).toContain("cursor")
+  }, STEP_TIMEOUT * 2)
+
   it("requestAccess() files the request where `mida approve` looks for it", async () => {
     const mida = new Mida({ agent: "aider", project: workDir, home: home.root })
     const result = await mida.requestAccess()
