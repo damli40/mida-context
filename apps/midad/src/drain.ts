@@ -835,6 +835,8 @@ function readContinues(home: MidaHome, sessionId: string, projectId: string): st
     if (typeof raw !== "object" || raw === null) return null
     const record = raw as Record<string, unknown>
     if (record.projectId !== projectId || !isSafeName(record.continues)) return null
+    // last use, not creation: a session still being read is still alive
+    home.touch(`state/continues/${sessionId}.json`)
     return record.continues
   } catch {
     return null
@@ -908,14 +910,15 @@ function pruneQueue(home: MidaHome, now: () => Date): void {
       // a log that will not truncate is left for the next pass
     }
   }
-  // in-21 U-4: each `new Mida()` is a session, and the three folders above collect one file per
-  // session, forever. Thirty days idle is past any resume; only the session's own .json files
-  // go — a stray folder or another name is never touched.
+  // in-21 U-4 / in-22 V-2: each `new Mida()` mints one `sdk-…` session, the only unbounded
+  // session source — so the sweep takes sdk- files ONLY and leaves hook and MCP session files
+  // alone. Thirty days idle is past any resume, and "idle" means last USE: every successful
+  // read of one of these files refreshes its mtime, so a live SDK handle is never swept.
   let swept = 0
   for (const dir of SESSION_STATE_DIRS) {
     for (const name of home.list(dir)) {
       if (swept >= SESSION_STATE_MAX_REMOVALS) return
-      if (name.endsWith(".json") && olderThan(home.path(`${dir}/${name}`), SESSION_STATE_MAX_AGE_MS)) {
+      if (name.startsWith("sdk-") && name.endsWith(".json") && olderThan(home.path(`${dir}/${name}`), SESSION_STATE_MAX_AGE_MS)) {
         home.remove(`${dir}/${name}`)
         swept += 1
       }

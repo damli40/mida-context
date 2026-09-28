@@ -1,6 +1,6 @@
 import {
   chmodSync, closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync,
-  realpathSync, renameSync, rmSync, statSync, writeSync,
+  realpathSync, renameSync, rmSync, statSync, utimesSync, writeSync,
 } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
@@ -89,6 +89,21 @@ export class MidaHome {
 
   has(relativePath: string): boolean {
     return existsSync(this.path(relativePath))
+  }
+
+  /**
+   * Marks a file as used just now — the session-state sweep in drain.ts ages files by LAST
+   * USE, so a live session's read keeps its pin, seen-set and continuation young (in-22 V-2).
+   * Best-effort on purpose: a file that cannot be touched keeps its age; the read it followed
+   * still answered.
+   */
+  touch(relativePath: string): void {
+    try {
+      const now = new Date()
+      utimesSync(this.path(relativePath), now, now)
+    } catch {
+      // absence, a bad path, or a read-only file — none of them undoes the read
+    }
   }
 
   /** undefined only when the file is absent. A file that exists but will not parse throws: never treat corrupt as missing. */

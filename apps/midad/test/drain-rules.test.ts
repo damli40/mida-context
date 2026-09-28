@@ -11,7 +11,7 @@ import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { MidaHome, buildHandoff, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, projectIdFor, tailOf } from "@mida/midad"
+import { MidaHome, buildHandoff, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, resolveSessionTask, tailOf } from "@mida/midad"
 import type { DrainDeps, Runtime, saveCheckpoint } from "@mida/midad"
 import { CONTENT_FIELDS, mergeCheckpoints } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
@@ -1312,29 +1312,34 @@ describe("a held midad.lock", () => {
 describe("the drain pass sweeps month-old SDK session files (in-21 U-4)", () => {
   const DAY = 24 * 60 * 60 * 1000
 
-  it("state/tasks, state/lastseen and state/continues drop files idle for 30 days — and nothing else", async () => {
+  it("state/tasks, state/lastseen and state/continues drop sdk- files idle for 30 days — and nothing else", async () => {
     const { home, drain } = setup()
     const stamp = (rel: string, when: number) => {
       home.writeSecretJson(rel, { stale: true })
       const at = new Date(when)
       fs.utimesSync(home.path(rel), at, at)
     }
-    // every `new Mida()` leaves one file in each folder — a month idle means the session is over
-    for (const dir of ["state/tasks", "state/lastseen", "state/continues"]) stamp(`${dir}/s-old.json`, T0 - 31 * DAY)
-    // everything else survives: a younger session file, a non-.json name however old, and an
-    // equally old file under a folder the sweep does not own
-    stamp("state/tasks/s-new.json", T0 - DAY)
+    // every `new Mida()` leaves one sdk- file in each folder — a month idle means the handle died
+    for (const dir of ["state/tasks", "state/lastseen", "state/continues"]) stamp(`${dir}/sdk-old.json`, T0 - 31 * DAY)
+    // everything else survives: a younger sdk file, a non-.json name however old, an equally old
+    // file under a folder the sweep does not own — and any non-sdk session's file, however old:
+    // hook and MCP sessions are bounded by real sessions, so their state is never swept (V-2)
+    stamp("state/tasks/sdk-new.json", T0 - DAY)
+    stamp("state/tasks/s-old.json", T0 - 40 * DAY)
+    stamp("state/lastseen/mcp-assistant-old.json", T0 - 40 * DAY)
     mkdirSync(home.path("state/lastseen"), { recursive: true })
     writeFileSync(home.path("state/lastseen/keep.txt"), "not a session file")
     fs.utimesSync(home.path("state/lastseen/keep.txt"), new Date(T0 - 40 * DAY), new Date(T0 - 40 * DAY))
-    stamp("state/other/s-old.json", T0 - 40 * DAY)
+    stamp("state/other/sdk-old.json", T0 - 40 * DAY)
     await drain()
     for (const dir of ["state/tasks", "state/lastseen", "state/continues"]) {
-      expect(home.has(`${dir}/s-old.json`)).toBe(false)
+      expect(home.has(`${dir}/sdk-old.json`)).toBe(false)
     }
-    expect(home.has("state/tasks/s-new.json")).toBe(true)
+    expect(home.has("state/tasks/sdk-new.json")).toBe(true)
+    expect(home.has("state/tasks/s-old.json")).toBe(true)
+    expect(home.has("state/lastseen/mcp-assistant-old.json")).toBe(true)
     expect(home.has("state/lastseen/keep.txt")).toBe(true)
-    expect(home.has("state/other/s-old.json")).toBe(true)
+    expect(home.has("state/other/sdk-old.json")).toBe(true)
   })
 
   it("a pass removes at most 500 stale session files; the rest go on the next pass", async () => {
@@ -1342,7 +1347,7 @@ describe("the drain pass sweeps month-old SDK session files (in-21 U-4)", () => 
     const old = new Date(T0 - 31 * DAY)
     mkdirSync(home.path("state/tasks"), { recursive: true })
     for (let i = 0; i < 505; i += 1) {
-      const rel = `state/tasks/s-${i.toString().padStart(4, "0")}.json`
+      const rel = `state/tasks/sdk-${i.toString().padStart(4, "0")}.json`
       writeFileSync(home.path(rel), "{}")
       fs.utimesSync(home.path(rel), old, old)
     }
@@ -1350,6 +1355,31 @@ describe("the drain pass sweeps month-old SDK session files (in-21 U-4)", () => 
     expect(home.list("state/tasks")).toHaveLength(5)
     await drain()
     expect(home.list("state/tasks")).toHaveLength(0)
+  })
+
+  // in-22 V-2 (G-2), promoted from zz-rvfix2-sweep-live-session: the sweep must not strand a
+  // session that is still being read — a live SDK handle's pin is refreshed by the read
+  // itself, so "a month old" only ever describes a session that is truly gone. Ages and the
+  // drain clock are real-now relative: a read refreshes to the real clock, not to T0.
+  it("a live SDK session keeps its pin — the read refreshes it, and resolution never drifts to the folder default", async () => {
+    const { home, drain, cwd } = setup()
+    const live = "sdk-claude-code-live1"
+    const dead = "sdk-claude-code-dead2"
+    pinSessionTask(home, live, "p-1", "alpha")
+    pinSessionTask(home, dead, "p-1", "alpha")
+    const old = new Date(Date.now() - 31 * DAY)
+    fs.utimesSync(home.path(`state/tasks/${live}.json`), old, old)
+    fs.utimesSync(home.path(`state/tasks/${dead}.json`), old, old)
+    // the folder moved to another task — losing the live pin would silently re-pin to beta
+    writeFileSync(join(cwd, ".mida", "task.json"), JSON.stringify({ task: "beta" }))
+    // the handle is alive: reading the pin is what keeps it out of the sweep
+    expect(resolveSessionTask(home, { sessionId: live, projectId: "p-1", cwd }))
+      .toEqual({ task: "alpha", source: "session" })
+    await drain({ now: () => new Date(Date.now() + 120_000) })
+    expect(home.has(`state/tasks/${live}.json`)).toBe(true)
+    expect(home.has(`state/tasks/${dead}.json`)).toBe(false)
+    expect(resolveSessionTask(home, { sessionId: live, projectId: "p-1", cwd }))
+      .toEqual({ task: "alpha", source: "session" })
   })
 })
 

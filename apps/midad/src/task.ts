@@ -127,6 +127,8 @@ export function readSessionTask(home: MidaHome, sessionId: string, projectId: st
     if (typeof raw !== "object" || raw === null) return undefined
     const record = raw as Record<string, unknown>
     if (record.projectId !== projectId || !isTaskName(record.task)) return undefined
+    // the pin ages by last use, not by write — a live session's read keeps it out of the sweep
+    home.touch(`state/tasks/${sessionId}.json`)
     return record.task
   } catch {
     return undefined
@@ -164,6 +166,8 @@ export function continuedTaskFor(home: MidaHome, sessionId: string, projectId: s
     if (typeof raw !== "object" || raw === null) return undefined
     const record = raw as Record<string, unknown>
     if (record.projectId !== projectId || !isTaskName(record.task)) return undefined
+    // last use, not creation: a session still being read is still alive
+    home.touch(`state/continues/${sessionId}.json`)
     return record.task
   } catch {
     return undefined

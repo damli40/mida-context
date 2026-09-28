@@ -24,6 +24,8 @@ export function readSeen(home: MidaHome, sessionId: string | undefined): Set<str
   try {
     const stored = home.readJson<{ seen?: unknown }>(lastSeenPath(sessionId))
     if (!Array.isArray(stored?.seen)) return new Set()
+    // the seen record ages by last use — a live session's read keeps it out of the sweep
+    home.touch(lastSeenPath(sessionId))
     return new Set(stored.seen.filter((id): id is string => typeof id === "string"))
   } catch {
     return new Set()
