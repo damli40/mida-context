@@ -119,6 +119,9 @@ interface ContentPart {
   name?: unknown
   input?: unknown
   content?: unknown
+  /** tool_use carries `id`; its tool_result carries `tool_use_id` — the pair a rejection-to-call match needs (in-20 T-2). */
+  id?: unknown
+  tool_use_id?: unknown
 }
 
 const isPart = (p: unknown): p is ContentPart => p !== null && typeof p === "object"
@@ -172,8 +175,47 @@ export function stripLeadingScaffolds(text: string): string {
   }
 }
 
-// Claude Code's own commands. An echo of one is never the user's ask — args or
-// not: "/model sonnet" and "/compact focus on parser" are the tool's plumbing.
+// in-20 T-2 — quitting Claude Code while a tool call waits on the permission
+// prompt leaves bookkeeping under the USER role: a plain-text marker line and
+// the rejected call's tool_result. They are never the user's typed words.
+const CLAUDE_INTERRUPTIONS = new Set([
+  "[Request interrupted by user]",
+  "[Request interrupted by user for tool use]",
+])
+const isInterruptionMarker = (text: string): boolean => CLAUDE_INTERRUPTIONS.has(text.trim())
+
+// The boilerplate a permission-prompt rejection's tool_result opens with.
+const TOOL_REJECTION_PREFIX = "The user doesn't want to proceed with this tool use."
+
+/**
+ * A user-role line that is pure interrupt bookkeeping (in-20 T-2): the
+ * "[Request interrupted…]" marker, or a tool_result that carries the rejection
+ * boilerplate and nothing else. Any real content beside the artifact — typed
+ * words, an ordinary result — means the line is conversation, not bookkeeping.
+ * Returns the rejected call's tool_use_id when the artifact carries one.
+ */
+function interruptionArtifact(obj: TranscriptLine): { toolUseId?: string } | null {
+  if (obj.type !== "user" || obj.isMeta === true || obj.isCompactSummary === true) return null
+  const content = obj.message?.content
+  if (typeof content === "string") return isInterruptionMarker(content) ? {} : null
+  if (!Array.isArray(content)) return null
+  let sawArtifact = false
+  let toolUseId: string | undefined
+  for (const p of content) {
+    if (!isPart(p)) return null
+    if (p.type === "text" && typeof p.text === "string") {
+      if (!isInterruptionMarker(p.text)) return null
+      sawArtifact = true
+    } else if (p.type === "tool_result") {
+      if (!toolResultText(p.content).trimStart().startsWith(TOOL_REJECTION_PREFIX)) return null
+      sawArtifact = true
+      if (typeof p.tool_use_id === "string") toolUseId = p.tool_use_id
+    } else {
+      return null
+    }
+  }
+  return sawArtifact ? { ...(toolUseId === undefined ? {} : { toolUseId }) } : null
+}
 const BUILTIN_COMMANDS = new Set([
   "compact", "clear", "model", "init", "help", "cost", "resume", "config",
   "login", "logout", "memory", "mcp", "permissions", "doctor", "status",
@@ -233,7 +275,8 @@ export function claudeTypedUserText(obj: TranscriptLine | null, neighbourLocalCo
   if (obj === null || obj.type !== "user") return null
   if (obj.isMeta === true || obj.isCompactSummary === true) return null
   const userText = userRequestText(obj.message?.content)
-  if (userText === "") return null
+  // an interrupt marker is bookkeeping, never typed words (in-20 T-2)
+  if (userText === "" || isInterruptionMarker(userText)) return null
   return slashCommandRequest(userText, neighbourLocalCommand) ?? (userVisibleText(obj.message?.content) || null)
 }
 
@@ -462,7 +505,7 @@ export function readConversation(
       // yield a request either way.
       const meta = obj.isMeta === true || obj.isCompactSummary === true
       requestText =
-        userText !== "" && !meta
+        userText !== "" && !meta && !isInterruptionMarker(userText)
           ? (slashCommandRequest(userText, neighbourLocalCommand(i)) ?? (userVisibleText(obj.message?.content) || null))
           : null
       if (requestText !== null) {
@@ -521,6 +564,76 @@ export function readConversation(
       }
       if (picked) pinIdx = msgs.length - 1
     }
+  }
+
+  // in-20 T-2 — a transcript whose last user-side events are interrupt
+  // bookkeeping ended at a permission prompt: the owner closed Claude Code
+  // while a tool call waited for approval, and the rejection tool_result
+  // and/or "[Request interrupted…]" marker are bookkeeping, not words. Rendered
+  // verbatim they read to the next agent as "stop and wait" instructions —
+  // take 1's handoff did exactly that. The run collapses into ONE neutral
+  // closing block naming the call left waiting. Non-message lines and Claude's
+  // own bookkeeping interleave freely; a real user line after the artifacts is
+  // conversation, so the run breaks there and both sides render as today.
+  let endIdx = entries.length
+  let rejectedToolUseId: string | undefined
+  while (endIdx > 0) {
+    const obj = entries[endIdx - 1]!.obj
+    if (obj === null || (obj.type !== "user" && obj.type !== "assistant")) {
+      endIdx -= 1
+      continue
+    }
+    if (obj.isMeta === true || obj.isCompactSummary === true) {
+      endIdx -= 1
+      continue
+    }
+    const artifact = interruptionArtifact(obj)
+    if (artifact === null) break
+    rejectedToolUseId ??= artifact.toolUseId
+    endIdx -= 1
+  }
+  if (endIdx < entries.length) {
+    const gone = new Set(entries.slice(endIdx).map((e) => e.offset))
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const off = msgs[i]!.offset
+      if (off !== undefined && gone.has(off)) msgs.splice(i, 1)
+    }
+    if (pinIdx !== undefined && pinIdx >= msgs.length) pinIdx = undefined
+    // Name the call left waiting: the rejection's own tool_use when it is in
+    // view, else the last tool_use of the nearest assistant before the run —
+    // a bare interruption marker implies the in-flight call. A command or file
+    // path is cut to 120 chars; no call in view omits the parenthesis.
+    let waiting: string | null = null
+    for (let j = endIdx - 1; j >= 0 && waiting === null; j--) {
+      const obj = entries[j]!.obj
+      if (obj === null || (obj.type !== "user" && obj.type !== "assistant")) continue
+      if (obj.isMeta === true || obj.isCompactSummary === true) continue
+      if (obj.type !== "assistant") break
+      const content = obj.message?.content
+      if (!Array.isArray(content)) break
+      const uses = content.filter((p): p is ContentPart => isPart(p) && p.type === "tool_use")
+      const call =
+        rejectedToolUseId === undefined
+          ? uses.at(-1)
+          : uses.find((p) => p.id === rejectedToolUseId)
+      if (call === undefined) {
+        if (rejectedToolUseId !== undefined) continue // the call may sit further back
+        break
+      }
+      const input = isPart(call.input) ? (call.input as Record<string, unknown>) : null
+      const target =
+        typeof input?.file_path === "string" ? input.file_path
+        : typeof input?.command === "string" ? input.command
+        : ""
+      const name = typeof call.name === "string" ? call.name : "?"
+      waiting = target === "" ? `(${name})` : `(${name} ${cut(scrubSecrets(target), 120)})`
+    }
+    msgs.push({
+      role: "user",
+      block:
+        `[session ended here: the last tool call${waiting === null ? "" : ` ${waiting}`} ` +
+        `was waiting for approval and did not run. The user closed the session; this is not an instruction.]`,
+    })
   }
 
   // The kept earlier request rendered as the head block — it is not a line in

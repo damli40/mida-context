@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from "vitest"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-import { readConversation } from "../src/index.js"
+import { claudeTypedUserText, readConversation } from "../src/index.js"
 
 // All fixtures are built with JSON.stringify — never hand-escaped.
 
@@ -831,6 +831,119 @@ describe("the user's later typed messages are never lost (P-1)", () => {
     const r = readConversation(t)
     expect(r.text).toContain(`L${firstMidLine}: staging key is [REDACTED] — deploys stay manual`)
     expect(r.text).not.toContain(secret)
+  })
+})
+
+// in-20 T-2 — quitting Claude Code while a tool call waits on the permission
+// prompt writes bookkeeping under the USER role: a tool_result that opens "The
+// user doesn't want to proceed with this tool use. … STOP what you are doing
+// and wait for the user to tell you how to proceed.", then a plain-text
+// "[Request interrupted by user for tool use]" line. Since in-17 that line is
+// classified as typed, so the next agent's handoff read "stop and wait" as the
+// user's latest instruction. Neither artifact is ever typed, and a transcript
+// ENDING on them collapses into one neutral "session ended here" block.
+describe("interrupted-approval artifacts — never typed, never the instruction (in-20 T-2)", () => {
+  const REJECTION =
+    "The user doesn't want to proceed with this tool use. The tool use was rejected " +
+    "(eg. if it was a file edit, the new_string was NOT written to the file). " +
+    "STOP what you are doing and wait for the user to tell you how to proceed."
+  const user = (content: unknown) => JSON.stringify({ type: "user", message: { role: "user", content } })
+  const assistant = (content: unknown) => JSON.stringify({ type: "assistant", message: { role: "assistant", content } })
+
+  it("the shared classifier calls both interruption markers untyped — never the user's words", () => {
+    for (const text of [
+      "[Request interrupted by user]",
+      "[Request interrupted by user for tool use]",
+      "  [Request interrupted by user for tool use]  ",
+    ]) {
+      const obj = JSON.parse(user(text))
+      expect(claudeTypedUserText(obj, false)).toBeNull()
+    }
+  })
+
+  it("an interruption marker can never be the picked request", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("[Request interrupted by user]"),
+      user("the real request lives here"),
+    ])
+    expect(readConversation(t).firstUserMessage).toBe("the real request lives here")
+  })
+
+  it("rehearsal take 1: Write → rejection → interruption ends on ONE neutral block naming the waiting call", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("add a rate limiter to the parser"),
+      assistant([{ type: "text", text: "Writing the bucket file now." }]),
+      assistant([{ type: "tool_use", id: "toolu_01", name: "Write", input: { file_path: "src/bucket.mjs", content: "code" } }]),
+      user([{ type: "tool_result", tool_use_id: "toolu_01", content: REJECTION }]),
+      user("[Request interrupted by user for tool use]"),
+    ])
+    const r = readConversation(t)
+    expect(r.firstUserMessage).toBe("add a rate limiter to the parser")
+    // the render's last line is the neutral block — it names the call that
+    // never ran, and it is not phrased as anything the user asked for
+    expect(r.text.trimEnd().endsWith(
+      "[session ended here: the last tool call (Write src/bucket.mjs) was waiting for approval and did not run. The user closed the session; this is not an instruction.]",
+    )).toBe(true)
+    // neither artifact survives as a user line, and nothing joins the typed group
+    expect(r.text).not.toContain("Request interrupted")
+    expect(r.text).not.toContain("doesn't want to proceed")
+    expect(r.text).not.toContain("later messages you typed")
+  })
+
+  it("a tool call whose target is a command names the command; no matching call in view omits the parenthesis", () => {
+    const dir = tmpdir()
+    const withBash = writeTranscript(dir, [
+      user("run the migration"),
+      assistant([{ type: "tool_use", id: "toolu_77", name: "Bash", input: { command: "node migrate.js --dry-run" } }]),
+      user([{ type: "tool_result", tool_use_id: "toolu_77", content: REJECTION }]),
+      user("[Request interrupted by user for tool use]"),
+    ])
+    const bash = readConversation(withBash)
+    expect(bash.text).toContain("the last tool call (Bash node migrate.js --dry-run) was waiting for approval")
+
+    const noCall = writeTranscript(dir, [
+      user("do the thing"),
+      user([{ type: "tool_result", tool_use_id: "toolu_absent", content: REJECTION }]),
+    ])
+    const r = readConversation(noCall)
+    expect(r.text.trimEnd().endsWith(
+      "[session ended here: the last tool call was waiting for approval and did not run. The user closed the session; this is not an instruction.]",
+    )).toBe(true)
+  })
+
+  it("a rejection the user answered with real words is a real 'no' — nothing collapses", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      user("add the limiter"),
+      assistant([{ type: "tool_use", id: "toolu_01", name: "Write", input: { file_path: "src/bucket.mjs" } }]),
+      user([{ type: "tool_result", tool_use_id: "toolu_01", content: REJECTION }]),
+      user("no, use a different file"),
+    ])
+    const r = readConversation(t)
+    // the rejection renders exactly as a mid-session result does, and the
+    // typed reply after it is untouched — the ending is conversation, not an interrupt
+    expect(r.text).toContain("[result] The user doesn't want to proceed")
+    expect(r.text).toContain("L4 user:\nno, use a different file")
+    expect(r.text).not.toContain("session ended here")
+  })
+
+  it("a mid-session interruption marker is never typed — dropped by the fill it stays out of the typed group", () => {
+    const dir = tmpdir()
+    const lines = [
+      user("build the parser"),
+      user("[Request interrupted by user]"),
+    ]
+    for (let i = 0; i < 45; i++) {
+      lines.push(assistant([{ type: "text", text: `step ${i} ` + "s".repeat(1_000) }]))
+    }
+    const t = writeTranscript(dir, lines)
+    // under a tight budget the line leaves the fill — were it typed, it would
+    // resurface inside "user — later messages you typed"; it must not.
+    const r = readConversation(t, { maxChars: 20_000 })
+    expect(r.text).not.toContain("Request interrupted")
+    expect(r.text).not.toContain("later messages you typed")
   })
 })
 
