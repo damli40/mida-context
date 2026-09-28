@@ -11,8 +11,8 @@ import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { MidaHome, buildHandoff, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, resolveSessionTask, tailOf } from "@mida/midad"
-import type { DrainDeps, Runtime, saveCheckpoint } from "@mida/midad"
+import { MidaHome, buildHandoff, buildRemember, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, resolveSessionTask, tailOf } from "@mida/midad"
+import type { DrainDeps, RememberDeps, Runtime, ServiceRuntime, saveCheckpoint } from "@mida/midad"
 import { CONTENT_FIELDS, mergeCheckpoints } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
 
@@ -1400,6 +1400,46 @@ describe("the drain pass sweeps month-old SDK session files (in-21 U-4)", () => 
     expect(home.has(`state/tasks/${dead}.json`)).toBe(false)
     expect(resolveSessionTask(home, { sessionId: live, projectId: "p-1", cwd }))
       .toEqual({ task: "alpha", source: "session" })
+  })
+
+  // in-23 W-1 (review R-1): a handle that only WRITES — remember(), no handoff, no reads —
+  // used to lose its pin and seen set to the 30-day sweep because nothing refreshed them.
+  // The SDK sends its session id on /remember and the route touches the files it already has.
+  it("a write-only SDK session keeps its files across the sweep — remember() refreshes them", async () => {
+    const { home, drain, cwd } = setup()
+    const sid = "sdk-codex-writesonly"
+    const old = new Date(Date.now() - 31 * DAY)
+    const stale = (rel: string) => {
+      home.writeSecretJson(rel, { stale: true })
+      fs.utimesSync(home.path(rel), old, old)
+    }
+    stale(`state/tasks/${sid}.json`)
+    stale(`state/lastseen/${sid}.json`)
+    stale(`state/continues/${sid}.json`)
+    // a same-age file for a session that never writes must still be swept — the control
+    stale("state/tasks/sdk-codex-gone.json")
+
+    const rememberDeps: RememberDeps = {
+      loadIdentity: () => ({ name: "codex", agentId: `0x${"cd".repeat(32)}` }) as never,
+      checkProject: async () => ({ ok: true, approval: { agent: "codex", projectId: "p-1", root: cwd, approvedAt: "2026-09-21T00:00:00.000Z" } }),
+      isRevoked: () => false,
+      revokePending: () => undefined,
+      hasAuthority: async () => true,
+      lane: async () => ({ kind: "direct", why: "switch-off" }),
+      create: async () => ({ contextId: `0x${"ef".repeat(32)}` }) as never,
+    }
+    const result = await buildRemember(
+      { home } as unknown as ServiceRuntime,
+      { agent: "codex", cwd, namespace: "projects.current", content: "a note", sessionId: sid },
+      rememberDeps,
+    )
+    expect(result.kind).toBe("saved")
+
+    await drain({ now: () => new Date(Date.now() + 120_000) })
+    expect(home.has(`state/tasks/${sid}.json`)).toBe(true)
+    expect(home.has(`state/lastseen/${sid}.json`)).toBe(true)
+    expect(home.has(`state/continues/${sid}.json`)).toBe(true)
+    expect(home.has("state/tasks/sdk-codex-gone.json")).toBe(false)
   })
 
   // in-22 V-3 (G-3) — a malformed entry under state/* must never abort the pass: a directory

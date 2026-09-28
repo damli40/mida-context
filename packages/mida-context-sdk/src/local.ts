@@ -222,6 +222,10 @@ export class LocalTransport implements Transport {
         agent: this.#agent,
         // the folder this write stands in — the daemon's project gate keys `projects.current` on it
         cwd: this.#project,
+        // this handle's session — the daemon refreshes its existing state files on the write,
+        // so a handle that only calls remember() is not swept as idle (in-23 R-1). Transport
+        // metadata: the route never writes it into the record.
+        sessionId: this.#sessionId,
         namespace: input.namespace,
         content: input.content,
         ...(input.kind === undefined ? {} : { kind: input.kind }),

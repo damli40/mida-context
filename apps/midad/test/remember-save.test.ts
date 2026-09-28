@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, statSync, utimesSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { MidaError, namespaceId } from "@mida/protocol"
@@ -363,6 +363,47 @@ describe("buildRemember — the daemon's /remember route", () => {
     )
     expect(result).toMatchObject({ kind: "refused", reason: "too-large" })
     expect(written).toBe(false)
+  })
+
+  // in-23 W-1 (review R-1): the SDK sends its session id on /remember so the route can refresh
+  // that session's existing state files — the same keep-alive a read performs. The id is
+  // transport metadata: it never lands in the record, and a write never creates a state file.
+  it("a sessionId refreshes the session's existing state files — creates none, and never enters the record", async () => {
+    const dir = home()
+    const sid = "sdk-codex-a1b2c3d4"
+    const stateFiles = [`state/tasks/${sid}.json`, `state/lastseen/${sid}.json`, `state/continues/${sid}.json`]
+    const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000)
+    for (const rel of stateFiles) {
+      dir.writeSecretJson(rel, { stale: true })
+      utimesSync(dir.path(rel), old, old)
+    }
+    let sealed: unknown
+    const result = await call(
+      {
+        create: async (_r, _a, _n, input) => {
+          sealed = input
+          return { contextId: id(11) } as never
+        },
+      },
+      { sessionId: sid },
+      dir,
+    )
+    expect(result.kind).toBe("saved")
+    for (const rel of stateFiles) {
+      expect(Date.now() - statSync(dir.path(rel)).mtimeMs).toBeLessThan(60_000)
+    }
+    expect(sealed).toBeDefined()
+    expect(Object.keys(sealed as Record<string, unknown>)).not.toContain("sessionId")
+    expect(JSON.stringify(sealed)).not.toContain(sid)
+    // a write never creates a state file the session does not already have
+    const bare = await call({}, { sessionId: "sdk-codex-nothing" }, dir)
+    expect(bare.kind).toBe("saved")
+    for (const folder of ["tasks", "lastseen", "continues"]) {
+      expect(dir.has(`state/${folder}/sdk-codex-nothing.json`)).toBe(false)
+    }
+    // an id that is not a safe filename touches nothing and changes nothing about the write
+    const odd = await call({}, { sessionId: "../escape" }, dir)
+    expect(odd.kind).toBe("saved")
   })
 
   it("the namespace the chain is asked about is the canonicalized one the caller named", async () => {

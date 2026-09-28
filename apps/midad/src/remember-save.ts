@@ -38,7 +38,7 @@ const REMEMBER_WINDOW_MS = 60_000
 
 const HEX_ID = /^0x[0-9a-fA-F]{64}$/
 const REFERENCE_RELATIONS = new Set(["supports", "derived_from", "confirmed_from"])
-const TOP_KEYS = new Set(["agent", "cwd", "namespace", "content", "kind", "references", "supersedes"])
+const TOP_KEYS = new Set(["agent", "cwd", "namespace", "content", "kind", "references", "supersedes", "sessionId"])
 
 export type RememberSaveResult =
   | { kind: "saved"; id: Hex; state: "anchored" | "pending"; lane: "direct" | "batched" }
@@ -317,6 +317,16 @@ export async function buildRemember(runtime: ServiceRuntime, record: unknown, de
   }
   const tooSoon = admit(laneKind)
   if (tooSoon !== null) return tooSoon
+
+  // in-23 R-1: an admitted write is the session still being used — refresh its pin, seen set
+  // and continues record exactly as a read does, so a handle that only calls remember() is
+  // never swept as idle. `touch` is best-effort and creates nothing: a file the session does
+  // not have stays absent, a bad id touches nothing, and the id never lands in the record.
+  if (typeof record.sessionId === "string" && isSafeName(record.sessionId)) {
+    for (const folder of ["tasks", "lastseen", "continues"]) {
+      runtime.home.touch(`state/${folder}/${record.sessionId}.json`)
+    }
+  }
 
   const input: CreateContextInput = {
     value: content,
