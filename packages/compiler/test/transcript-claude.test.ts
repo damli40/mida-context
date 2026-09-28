@@ -1084,6 +1084,37 @@ describe("interrupted-approval artifacts — never typed, never the instruction 
     )).toBe(true)
   })
 
+  // in-23 W-2 (review R-2): the names list is capped — ten calls, then the exact remainder —
+  // so a mass rejection cannot push the closing block, and the render with it, past budget.
+  it("25 rejected calls: the block names ten and folds the rest — the count stays exact", () => {
+    const dir = tmpdir()
+    const uses = Array.from({ length: 25 }, (_, i) => ({
+      type: "tool_use",
+      id: `toolu_${i}`,
+      name: "Bash",
+      input: { command: `cmd-${i}` },
+    }))
+    const results = uses.map((u) => ({ type: "tool_result", tool_use_id: u.id, content: REJECTION }))
+    const t = writeTranscript(dir, [
+      user("run all the checks"),
+      assistant(uses),
+      user(results),
+      user("[Request interrupted by user for tool use]"),
+    ])
+    const r = readConversation(t)
+    const block = r.text.slice(r.text.indexOf("[interrupted here:"))
+    // the total is still exact — 25 — but only the first ten calls are named
+    expect(block).toContain("25 tool calls were not approved before the session stopped")
+    expect(block).toContain("(Bash cmd-0)")
+    expect(block).toContain("(Bash cmd-9)")
+    expect(block).not.toContain("cmd-10")
+    expect(block.trimEnd().endsWith(
+      "(Bash cmd-9), and 15 more. They are undecided — neither refused nor approved. Ask the user before running any of them.]",
+    )).toBe(true)
+    // the whole render — tool calls, results and the block — sits far inside the budget
+    expect(r.text.length).toBeLessThan(10_000)
+  })
+
   it("one user line carrying a result AND a rejection: the result renders, the rejected call is named, the boilerplate never renders raw", () => {
     const dir = tmpdir()
     const t = writeTranscript(dir, [

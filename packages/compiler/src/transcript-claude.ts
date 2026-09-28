@@ -187,6 +187,10 @@ const isInterruptionMarker = (text: string): boolean => CLAUDE_INTERRUPTIONS.has
 // The boilerplate a permission-prompt rejection's tool_result opens with.
 const TOOL_REJECTION_PREFIX = "The user doesn't want to proceed with this tool use."
 
+// The interruption block names at most this many rejected calls — the rest fold into
+// "and N more", exact count preserved, so a mass rejection stays inside the budget (in-23 R-2).
+const REJECTED_NAMED_MAX = 10
+
 /**
  * A user-role line that is pure interrupt bookkeeping (in-20 T-2): the
  * "[Request interrupted…]" marker, or a tool_result that carries the rejection
@@ -724,13 +728,14 @@ export function readConversation(
         `[interrupted here: the last tool call${waiting === null ? "" : ` ${waiting}`} ` +
         `was not approved before the session stopped. It is undecided — neither a refusal nor an approval. Ask the user before running it.]`
     } else {
-      const names = rejectedCalls.map((id) => {
+      const names = rejectedCalls.slice(0, REJECTED_NAMED_MAX).map((id) => {
         const call = findCall(id)
         return call === undefined ? "(a call the transcript does not name)" : describeCall(call)
       })
+      const rest = rejectedCalls.length - names.length
       block =
         `[interrupted here: ${rejectedCalls.length} tool calls were not approved before the session stopped: ` +
-        `${names.join(", ")}. They are undecided — neither refused nor approved. Ask the user before running any of them.]`
+        `${names.join(", ")}${rest > 0 ? `, and ${rest} more` : ""}. They are undecided — neither refused nor approved. Ask the user before running any of them.]`
     }
     msgs.push({ role: "user", block })
   }
