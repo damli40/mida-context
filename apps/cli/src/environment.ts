@@ -14,7 +14,7 @@ import {
   sendValue,
   startAnvil,
 } from "@mida/chain"
-import type { Deployment, LocalWriteContext } from "@mida/chain"
+import type { Deployment, LocalWriteContext, SendGate } from "@mida/chain"
 import { Batcher, DenyOverlay, FsBatchJournal, FsBatchStore, RegistryReader, createBatcherChain, createBatchDenyGate, createContextApi, createNodeTimer, fileStores } from "@mida/api"
 import type { BatcherTimer, BatchingOptions } from "@mida/api"
 import { serve } from "@hono/node-server"
@@ -37,7 +37,7 @@ export interface ScenarioEnvironment {
    * test proves the flush — not the window — anchored a save.
    */
   batcher?: { pauseTimer(): void; resumeTimer(): void }
-  fund(address: Address): Promise<void>
+  fund(address: Address, gate?: SendGate): Promise<void>
   writeContext(account: LocalAccount): LocalWriteContext
   stop(): Promise<void>
 }
@@ -184,8 +184,8 @@ export async function monadTestnetEnvironment(env: Record<string, string | undef
     rpcUrl,
     deployment,
     apiBaseUrl: server.baseUrl,
-    fund: async (address) => {
-      const receipt = await sendValue(funder, { to: address, value: funding }, "funding")
+    fund: async (address, gate) => {
+      const receipt = await sendValue(funder, { to: address, value: funding }, "funding", gate)
       // Monad's asynchronous execution budgets an EOA's inflight gas spend against state from k=3 blocks ago, and a
       // funder below the 10 MON reserve may transfer value only in an "emptying transaction" (no other send within k
       // blocks). Waiting past the lag lets the lagged state see the new balance and keeps consecutive funds eligible.

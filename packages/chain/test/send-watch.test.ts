@@ -341,6 +341,97 @@ describe("a timed-out send is abandoned, not orphaned (in-16 K-1)", () => {
     expect(sends).toBe(0)
   })
 
+  it("a simulate answering after the cap never starts the top-up — no funding send, no main send (in-18 S4)", async () => {
+    // The balance guard's top-up is itself a send — without a gate check ahead of `beforeSend`,
+    // a simulate resolving after the refusal would still run the guard, and its nested sendValue
+    // would broadcast the top-up for a send that was already abandoned.
+    const clock = fakeClock()
+    const innerClock = fakeClock()
+    const late = deferred<{ request: unknown }>()
+    let funds = 0
+    let writes = 0
+    const inner = stubContext({
+      sendTransaction: async () => {
+        funds += 1
+        return HASH
+      },
+    })
+    inner.context.sendWatch = watch(innerClock, 15_000, 60_000)
+    const { context } = stubContext({
+      simulateContract: () => late.promise as Promise<unknown>,
+      // the real wiring: the guard hands the gate it is given down to the nested sendValue
+      beforeSend: async (_cost, gate) => {
+        await sendValue(inner.context, { to: ADDRESS, value: 1n }, "funding", gate)
+      },
+      writeContract: async () => {
+        writes += 1
+        return HASH
+      },
+    })
+    context.sendWatch = watch(clock, 15_000, 15_000)
+    const outcome = sendContract(
+      context,
+      { address: ADDRESS, abi: [], functionName: "register", args: [] },
+      "context.register",
+    ).then(() => null, (error: unknown) => error)
+    clock.fire() // the cap fires while the outer simulate is still out
+    const error = await outcome
+    expect(isMidaError(error, "SEND_TIMEOUT")).toBe(true)
+    expect(failedBeforeSend(error)).toBe(true)
+    // The simulate answers late — the orphaned continuation must stop at the gate BEFORE the
+    // guard can fund anything: no top-up transaction, and no main send.
+    late.resolve({ request: { address: ADDRESS } })
+    await flush()
+    await flush()
+    expect(funds).toBe(0)
+    expect(writes).toBe(0)
+  })
+
+  it("a nested top-up still in flight when the cap fires cannot broadcast afterwards (in-18 S4)", async () => {
+    // The other half: the cap fires WHILE the nested sendValue is already running — its own
+    // watch has a longer cap and never fires, so only the inherited outer gate stops it.
+    const outerClock = fakeClock()
+    const innerClock = fakeClock()
+    const lateEstimate = deferred<bigint>()
+    let funds = 0
+    let writes = 0
+    const inner = stubContext({
+      sendTransaction: async () => {
+        funds += 1
+        return HASH
+      },
+    })
+    inner.context.publicClient.estimateGas = () => lateEstimate.promise as Promise<bigint>
+    inner.context.sendWatch = watch(innerClock, 15_000, 60_000)
+    const outer = stubContext({
+      beforeSend: async (_cost, gate) => {
+        await sendValue(inner.context, { to: ADDRESS, value: 1n }, "funding", gate)
+      },
+      writeContract: async () => {
+        writes += 1
+        return HASH
+      },
+    })
+    outer.context.sendWatch = watch(outerClock, 15_000, 15_000)
+    const outcome = sendContract(
+      outer.context,
+      { address: ADDRESS, abi: [], functionName: "register", args: [] },
+      "context.register",
+    ).then(() => null, (error: unknown) => error)
+    await flush() // outer reaches the guard; the inner send is hung in its estimate
+    await flush()
+    outerClock.fire() // the outer cap fires — the send is abandoned mid-top-up
+    const error = await outcome
+    expect(isMidaError(error, "SEND_TIMEOUT")).toBe(true)
+    expect(failedBeforeSend(error)).toBe(true)
+    // The inner estimate answers late: the inherited gate must refuse the broadcast.
+    lateEstimate.resolve(21_000n)
+    await flush()
+    await flush()
+    expect(funds).toBe(0)
+    expect(writes).toBe(0)
+  })
+
   it("a nested send does not print a second 'still waiting' stream (in-16 K-8)", async () => {
     // The reported case: an operator send whose balance guard waits on an owner top-up — two
     // watchdogs ran and the user saw the same line twice per interval. Only the oldest

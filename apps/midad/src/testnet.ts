@@ -29,8 +29,8 @@ export function funderFor(
   }
   const funder = createWriteContext({ rpcUrl, deployment, account: privateKeyToAccount(key as Hex) })
   const funding = BigInt(env.TESTNET_FUNDING_WEI ?? TESTNET_FUNDING_WEI)
-  return async (address) => {
-    const receipt = await sendValue(funder, { to: address, value: funding }, "funding")
+  return async (address, gate) => {
+    const receipt = await sendValue(funder, { to: address, value: funding }, "funding", gate)
     // Monad's asynchronous execution budgets an EOA's inflight gas spend against state from
     // k=3 blocks ago — waiting past the lag keeps consecutive funds eligible (same rule the
     // dev environment's funder follows).

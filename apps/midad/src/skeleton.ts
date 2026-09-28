@@ -214,7 +214,7 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
   // of a bare node error deep inside a register.
   operator.beforeSend = makeOwnerBalanceGuard({
     chain: operator,
-    fund: network.fund ?? ((address) => runtime.topUpFromOwner(address)),
+    fund: network.fund ?? ((address, gate) => runtime.topUpFromOwner(address, gate)),
     progress: (line) => runtime.progress?.(line),
   })
   const agents: Record<string, Hex> = {}

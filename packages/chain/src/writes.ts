@@ -59,8 +59,11 @@ export interface WriteContext extends ChainContext {
    * estimated cost and topped up, or the send refused before a transaction the wallet cannot
    * pay for goes out (R4-4). Only the owner's context wires this; agent signers keep the bare
    * node error, exactly as before. On the sponsored path it never runs — the user pays nothing.
+   * The `gate` it is handed is THIS send's abandonment gate: a guard that sends a transaction
+   * of its own (an owner top-up) must pass it down, so the nested send stops too when the
+   * outer send's cap already fired (in-18 S4).
    */
-  beforeSend?: (cost: SendCost) => Promise<void>
+  beforeSend?: (cost: SendCost, gate: SendGate) => Promise<void>
   /**
    * When set, `sendContract` asks this sender to pay the gas first (the user still signs; the
    * sponsor pays). A SponsorDidNotPay falls back to the self-paid path — or refuses, when
@@ -167,6 +170,13 @@ async function watchSend<T>(
   context: WriteContext,
   state: { hashOf(): Hex | undefined; attempted(): boolean },
   work: (gate: SendGate) => Promise<T>,
+  /**
+   * A send nested inside another send's `beforeSend` (an owner top-up inside an operator's
+   * balance guard) carries the OUTER send's gate here — the parent's cap firing abandons this
+   * send's broadcast points too, so a timed-out send can never pay for work after its refusal
+   * was already reported (in-18 S4).
+   */
+  outerGate?: SendGate,
 ): Promise<T> {
   const watch = context.sendWatch
   const setTimer = watch?.setTimeout ?? ((fn: () => void, ms: number) => setTimeout(fn, ms))
@@ -196,6 +206,9 @@ async function watchSend<T>(
   const gate: SendGate = {
     checkAbandoned() {
       if (gaveUp) throw timeout()
+      // the inherited check: an outer send already abandoned means this nested send is paying
+      // for work nobody is waiting on — its timeout error is the outer send's own
+      outerGate?.checkAbandoned()
     },
   }
   const id = context.progress === undefined ? undefined : Symbol()
@@ -280,6 +293,8 @@ export async function sendContract(
   context: WriteContext,
   call: { address: Address; abi: Abi; functionName: string; args: readonly unknown[] },
   kind: TxKind,
+  /** A nested send inherits the outer send's abandonment through this — see watchSend. */
+  outerGate?: SendGate,
 ): Promise<SentReceipt> {
   // What the watchdog's timeout can vouch for: a hash exists only once writeContract answered;
   // `sentAttempted` marks the stretch where a transaction may be in flight without one — the
@@ -349,7 +364,7 @@ export async function sendContract(
         // The ceiling refusal stays a ceiling refusal — that is the estimate succeeding with a
         // number, not the estimate itself being refused.
         if (isMidaError(error, "GAS_CEILING_EXCEEDED")) throw error
-        ;({ gas, fee } = await estimateAfterRefusal(context, call, kind, sponsorReason, error))
+        ;({ gas, fee } = await estimateAfterRefusal(context, call, kind, sponsorReason, error, gate))
       }
       if (fee === undefined) {
         try {
@@ -361,7 +376,11 @@ export async function sendContract(
           throw toMidaError(error)
         }
       }
-      await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee })
+      // The guard can top the payer up — a slow funder must not reach the send past the cap:
+      // the gate is checked BEFORE it runs and is handed in, so a nested send it starts
+      // inherits this send's abandonment (in-18 S4).
+      gate.checkAbandoned()
+      await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee }, gate)
     } catch (error) {
       throw markUnsent(error)
     }
@@ -374,7 +393,7 @@ export async function sendContract(
       throw new MidaError("CAPABILITY_DENIED", `${call.functionName} transaction ${hash} reverted on-chain`)
     }
     return { ...receipt, gasLimit: gas }
-  })
+  }, outerGate)
 }
 
 /**
@@ -393,6 +412,7 @@ async function estimateAfterRefusal(
   kind: TxKind,
   sponsorReason: string | undefined,
   error: unknown,
+  gate: SendGate,
 ): Promise<{ gas: bigint; fee: SendFee }> {
   if (context.beforeSend === undefined) throw toMidaError(error)
   let fee: SendFee
@@ -402,7 +422,8 @@ async function estimateAfterRefusal(
     throw toMidaError(feeError)
   }
   try {
-    await context.beforeSend({ payer: context.account.address, gasLimit: GAS_CEILINGS[kind], fee, upperBound: true })
+    gate.checkAbandoned()
+    await context.beforeSend({ payer: context.account.address, gasLimit: GAS_CEILINGS[kind], fee, upperBound: true }, gate)
   } catch (low) {
     if (isMidaError(low, "OWNER_WALLET_LOW") && sponsorReason !== undefined) {
       // the sentence stays intact — the sponsor's one-line reason goes in front of it, so the
@@ -427,6 +448,8 @@ export async function sendValue(
   context: WriteContext,
   transfer: { to: Address; value: bigint },
   kind: TxKind,
+  /** A nested send inherits the outer send's abandonment through this — see watchSend. */
+  outerGate?: SendGate,
 ): Promise<SentReceipt> {
   let hash: Hex | undefined
   let sentAttempted = false
@@ -438,7 +461,10 @@ export async function sendValue(
     // sendContract's (the batcher's resubmit rule counts on that marker).
     try {
       ;[gas, fee] = await Promise.all([valueGas(context, transfer, kind), estimateSendFee(context)])
-      await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee, value: transfer.value })
+      // The guard itself can send (an owner top-up): check the gate BEFORE it runs and hand it
+      // in, so its nested send inherits this send's abandonment (in-18 S4).
+      gate.checkAbandoned()
+      await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee, value: transfer.value }, gate)
     } catch (error) {
       throw markUnsent(toMidaError(error))
     }
@@ -458,7 +484,7 @@ export async function sendValue(
       throw new MidaError("CAPABILITY_DENIED", `funding transaction ${hash} reverted on-chain`)
     }
     return { ...receipt, gasLimit: gas }
-  })
+  }, outerGate)
 }
 
 /**

@@ -817,7 +817,7 @@ export async function migrate(
       }
       operator.beforeSend = makeOwnerBalanceGuard({
         chain: operator,
-        fund: runtime.network.fund ?? ((address) => runtime.topUpFromOwner(address)),
+        fund: runtime.network.fund ?? ((address, gate) => runtime.topUpFromOwner(address, gate)),
       })
       const sponsorUp = sponsorUrl !== undefined && (await sponsorReachable(sponsorUrl))
       if (!sponsorUp) await runtime.ensureFunded(operatorAccount.address, "the operator wallet")

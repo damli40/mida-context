@@ -5,7 +5,7 @@ import { MidaError, PERMISSION } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
 import { bytesOf } from "@mida/crypto"
 import { chainFor, createReadScope, createSponsoredSender, createWriteContext, memoizedReads, rpcTransport, sendValue } from "@mida/chain"
-import type { ChainContext, Deployment, LocalWriteContext, ReadScope, SendCost } from "@mida/chain"
+import type { ChainContext, Deployment, LocalWriteContext, ReadScope, SendCost, SendGate } from "@mida/chain"
 import { ContextApiClient, RegistryReader } from "@mida/api"
 import { FakeVaultAuthority } from "@mida/fake-vault"
 import { MidaAgent } from "@mida/sdk"
@@ -23,9 +23,11 @@ export interface Network {
   /**
    * Tops an account up — exists on the networks that have a funder (local Anvil, Monad
    * testnet). Absent elsewhere: a low owner wallet then fails with OWNER_WALLET_LOW instead
-   * of a bare transaction error (R4-4).
+   * of a bare transaction error (R4-4). Called from inside a send's balance guard it is handed
+   * that send's abandonment gate: a funder that sends a transaction of its own must pass it
+   * down so a timed-out outer send can never pay for the top-up afterwards (in-18 S4).
    */
-  fund?(address: Address): Promise<void>
+  fund?(address: Address, gate?: SendGate): Promise<void>
   /** When set, the Context API lives at this URL (a remote store, M3) and no local server is started. */
   storageUrl?: string
   /**
@@ -596,8 +598,8 @@ export class Runtime extends ServiceRuntime {
    * balance guard, so an owner that cannot afford it fails as OWNER_WALLET_LOW with the real
    * numbers, and the init refusal prints the owner address, not a bare node error.
    */
-  async topUpFromOwner(address: Address): Promise<void> {
-    await sendValue(this.ownerChain, { to: address, value: OWNER_TOP_UP_WEI }, "funding")
+  async topUpFromOwner(address: Address, gate?: SendGate): Promise<void> {
+    await sendValue(this.ownerChain, { to: address, value: OWNER_TOP_UP_WEI }, "funding", gate)
   }
 
   async ensureFunded(address: Address, label?: string): Promise<void> {
@@ -638,9 +640,9 @@ export function formatMon(wei: bigint): string {
  */
 export function makeOwnerBalanceGuard(input: {
   chain: LocalWriteContext
-  fund?: (address: Address) => Promise<void>
+  fund?: (address: Address, gate?: SendGate) => Promise<void>
   progress?: (line: string) => void
-}): (cost: SendCost) => Promise<void> {
+}): (cost: SendCost, gate?: SendGate) => Promise<void> {
   const payer = input.chain.account.address
   // `bound` marks the cost as a ceiling-priced upper bound (the node's own estimate refused to
   // run): the sentence says "up to" rather than claiming the exact figure the estimate refused
@@ -650,14 +652,17 @@ export function makeOwnerBalanceGuard(input: {
       "OWNER_WALLET_LOW",
       `your wallet holds ${formatMon(balance)} MON but this transaction needs ${bound ? "up to " : ""}${formatMon(cost)} MON — ${formatMon(cost - balance)} MON short`,
     )
-  return async ({ gasLimit, fee, value, upperBound }) => {
+  return async ({ gasLimit, fee, value, upperBound }, gate) => {
     const cost = gasLimit * (fee.maxFeePerGas ?? fee.gasPrice ?? 0n) + (value ?? 0n)
     const bound = upperBound === true
     let balance = await input.chain.publicClient.getBalance({ address: payer })
     if (balance >= cost) return
     if (input.fund === undefined) throw low(balance, cost, bound)
     input.progress?.("topping up your wallet…")
-    await input.fund(payer)
+    // The top-up is a send of its own — it inherits this send's abandonment, so a funder still
+    // working when the outer cap fired cannot broadcast after the refusal was already reported
+    // (in-18 S4).
+    await input.fund(payer, gate)
     // A fixed top-up can under-shoot a big send (a revoke.agent at the ceiling needs more than
     // 0.2 MON) — so after the funder's own wait the balance is read AGAIN; still short is a
     // refusal with the real numbers, never a loop and never a send that dies at the node.
