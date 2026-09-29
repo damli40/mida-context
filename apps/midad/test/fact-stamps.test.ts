@@ -69,12 +69,14 @@ const factRuntime = (objects: ContextObject[]): ServiceRuntime =>
       read: async (_owner: string, namespace: string) => (namespace === "preferences.communication" ? objects : []),
     }),
     reader: {
-      getRecord: async () => ({
-        author: OWNER_AUTHOR_ID,
-        provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED,
-        createdAt: CHAIN_SECONDS,
-        parentId: `0x${"00".repeat(32)}`,
-      }),
+      getRecords: async (ids: readonly Hex[]) =>
+        ids.map((contextId) => ({
+          contextId,
+          author: OWNER_AUTHOR_ID,
+          provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED,
+          createdAt: CHAIN_SECONDS,
+          parentId: `0x${"00".repeat(32)}` as Hex,
+        })),
     },
   }) as unknown as ServiceRuntime
 

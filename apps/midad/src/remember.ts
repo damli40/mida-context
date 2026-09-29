@@ -192,9 +192,10 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string, opti
   for (const [nsIndex, namespace] of FACT_NAMESPACES.entries()) {
     const objects = listed[nsIndex]!
     // The chain's record decides who said this — never a field inside the encrypted payload.
-    // The object already passed the SDK's own getRecord during read, so under a read scope
-    // these are the same wire answers, served from the operation's memo.
-    const records = await Promise.all(objects.map((object) => reader.getRecord(object.contextId)))
+    // One getRecords per namespace: the SDK's own record check ran through Multicall3, which
+    // does not share the operation's read memo, so per-object getRecord calls here would be N
+    // fresh wire reads against the shared 10-requests-a-second bucket (in-38 V-1).
+    const records = objects.length === 0 ? [] : await reader.getRecords(objects.map((object) => object.contextId))
     for (const [index, object] of objects.entries()) {
       const record = records[index]
       if (record === null || record === undefined) continue

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { createServer } from "node:http"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -228,7 +228,8 @@ describe("migrated facts in the fact list (migrate B2)", () => {
       reader: {
         // a real RegistryRecord always carries parentId (zeroHash on a root); readOwnerFacts
         // dereferences it, so the stub has to answer like the chain does
-        getRecord: async () => ({ author: OWNER_AUTHOR_ID, provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED, createdAt: 1_758_000_000n, parentId: `0x${"00".repeat(32)}` }),
+        getRecords: async (ids: readonly Hex[]) =>
+          ids.map((contextId) => ({ contextId, author: OWNER_AUTHOR_ID, provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED, createdAt: 1_758_000_000n, parentId: `0x${"00".repeat(32)}` })),
       },
     } as unknown as ServiceRuntime
   }
@@ -272,12 +273,14 @@ describe("migrated facts in the fact list (migrate B2)", () => {
         read: async (_owner: string, namespace: string) => (namespace === "preferences.communication" ? [moved] : []),
       }),
       reader: {
-        getRecord: async () => ({
-          author: OWNER_AUTHOR_ID,
-          provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED,
-          createdAt: 1_800_000_000n, // the replay's stamp — later than the original write
-          parentId: `0x${"00".repeat(32)}`,
-        }),
+        getRecords: async (ids: readonly Hex[]) =>
+          ids.map((contextId) => ({
+            contextId,
+            author: OWNER_AUTHOR_ID,
+            provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED,
+            createdAt: 1_800_000_000n, // the replay's stamp — later than the original write
+            parentId: `0x${"00".repeat(32)}`,
+          })),
       },
     } as unknown as ServiceRuntime
     const facts = await readOwnerFacts(runtime, "claude-code")
@@ -311,12 +314,14 @@ describe("migrated facts in the fact list (migrate B2)", () => {
         read: async (_owner: string, namespace: string) => (namespace === "preferences.communication" ? [older, newer] : []),
       }),
       reader: {
-        getRecord: async (contextId: Hex) => ({
-          author: OWNER_AUTHOR_ID,
-          provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED,
-          createdAt: chainTime.get(contextId)!,
-          parentId: `0x${"00".repeat(32)}`,
-        }),
+        getRecords: async (ids: readonly Hex[]) =>
+          ids.map((contextId) => ({
+            contextId,
+            author: OWNER_AUTHOR_ID,
+            provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED,
+            createdAt: chainTime.get(contextId)!,
+            parentId: `0x${"00".repeat(32)}` as Hex,
+          })),
       },
     } as unknown as ServiceRuntime
     const facts = await readOwnerFacts(runtime, "claude-code")
@@ -324,5 +329,73 @@ describe("migrated facts in the fact list (migrate B2)", () => {
       "written last (moved on 2026-09-25)",
       "written first (moved on 2026-09-25)",
     ])
+  })
+})
+
+/**
+ * in-38 V-1: the author/provenance re-check behind the fact list must not spend one chain
+ * request per fact object. The SDK's read already went through Multicall3 — which bypasses the
+ * operation's memoized readContract — so N per-object getRecord calls here are N fresh wire
+ * reads against the shared 10-requests-a-second bucket. One getRecords per namespace instead.
+ */
+describe("the fact read batches its chain record checks (in-38 V-1)", () => {
+  const factObject = (text: string, contextId: Hex): ContextObject => ({
+    contextId,
+    owner: `0x${"55".repeat(20)}`,
+    namespace: "preferences.communication",
+    namespaceId: `0x${"77".repeat(32)}` as Hex,
+    authorId: OWNER_AUTHOR_ID,
+    lineageId: contextId,
+    parentId: `0x${"00".repeat(32)}` as Hex,
+    version: 1,
+    readEpoch: 1n,
+    recordType: "CONTEXT",
+    payload: {
+      v: 1,
+      kind: "PREFERENCE",
+      provenance: { source: "USER_ASSERTED" },
+      value: { text, assertedAt: "2026-09-18T10:00:00.000Z" },
+    },
+  })
+
+  /** The registry row an owner-authored USER_ASSERTED fact gets — parentId zeroHash like a root. */
+  const recordFor = (contextId: Hex) => ({
+    contextId,
+    author: OWNER_AUTHOR_ID,
+    provenanceSource: PROVENANCE_SOURCE.USER_ASSERTED,
+    createdAt: 1_758_000_000n,
+    parentId: `0x${"00".repeat(32)}` as Hex,
+  })
+
+  const runtimeFor = (objects: ContextObject[], reader: Record<string, unknown>): ServiceRuntime =>
+    ({
+      owner: `0x${"55".repeat(20)}`,
+      agent: () => ({
+        read: async (_owner: string, namespace: string) => (namespace === "preferences.communication" ? objects : []),
+      }),
+      reader,
+    }) as unknown as ServiceRuntime
+
+  it("three facts cost ONE getRecords call and zero per-object getRecord calls", async () => {
+    const objects = [
+      factObject("first", `0x${"61".repeat(32)}` as Hex),
+      factObject("second", `0x${"62".repeat(32)}` as Hex),
+      factObject("third", `0x${"63".repeat(32)}` as Hex),
+    ]
+    const getRecords = vi.fn(async (ids: readonly Hex[]) => ids.map((id) => recordFor(id)))
+    const getRecord = vi.fn(async () => null)
+    const facts = await readOwnerFacts(runtimeFor(objects, { getRecords, getRecord }), "claude-code")
+    expect(facts).toHaveLength(3)
+    expect(getRecords).toHaveBeenCalledTimes(1)
+    expect(getRecords.mock.calls[0]![0]).toEqual(objects.map((object) => object.contextId))
+    expect(getRecord).not.toHaveBeenCalled()
+  })
+
+  it("a fact whose batched record answer is null is still skipped", async () => {
+    const kept = factObject("kept", `0x${"64".repeat(32)}` as Hex)
+    const gone = factObject("gone", `0x${"65".repeat(32)}` as Hex)
+    const getRecords = vi.fn(async (ids: readonly Hex[]) => ids.map((id) => (id === gone.contextId ? null : recordFor(id))))
+    const facts = await readOwnerFacts(runtimeFor([kept, gone], { getRecords }), "claude-code")
+    expect(facts.map((fact) => fact.contextId)).toEqual([kept.contextId])
   })
 })
