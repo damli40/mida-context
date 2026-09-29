@@ -296,11 +296,16 @@ export function uninstallClaudeCodeMcp(opts: {
 /**
  * Doctor's read-only view of the server entry in Claude Code's user config: "installed" only
  * when the mida entry is recognisably ours (this identity, this home — the same rule install
- * and uninstall apply). Absent, foreign and unreadable all answer "not-installed": the named
- * fix is `mida install claude-code`, which adds the entry or refuses a foreign one out loud.
+ * and uninstall apply) AND its command is this build's launcher. Ours-but-another-launcher
+ * answers "outdated" — the entry would start a different copy of Mida than this one, and a
+ * re-install points it here. Absent, foreign and unreadable all answer "not-installed": the
+ * named fix is `mida install claude-code`, which adds the entry or refuses a foreign one out
+ * loud.
  */
-export function claudeCodeMcpStatus(userConfig: string, home: string): "installed" | "not-installed" {
-  return isMidaServerEntry(claudeUserMidaEntry(userConfig), "claude-code", home) ? "installed" : "not-installed"
+export function claudeCodeMcpStatus(userConfig: string, home: string): "installed" | "outdated" | "not-installed" {
+  const entry = claudeUserMidaEntry(userConfig)
+  if (!isPlainObject(entry) || !isMidaServerEntry(entry, "claude-code", home)) return "not-installed"
+  return entry.command === mcpLauncherPath() ? "installed" : "outdated"
 }
 
 /** The folders macOS hides from apps that lack Files and Folders access. */

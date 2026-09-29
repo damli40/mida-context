@@ -697,10 +697,13 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           // problem lines for every other status already end in the same install command.
           if (status === "installed") {
             const userConfig = deps.claudeUserConfig ?? claudeUserConfigPath(env, deps.homeDir ?? homedir())
+            const mcpStatus = claudeCodeMcpStatus(userConfig, home.root)
             lines.push(
-              claudeCodeMcpStatus(userConfig, home.root) === "installed"
+              mcpStatus === "installed"
                 ? "ok: claude-code MCP server installed"
-                : "note: claude-code MCP server not installed. Run mida install claude-code.",
+                : mcpStatus === "outdated"
+                  ? "note: claude-code's MCP server starts a different copy of Mida than this one. Run mida install claude-code to point it here."
+                  : "note: claude-code MCP server not installed. Run mida install claude-code.",
             )
           }
         }

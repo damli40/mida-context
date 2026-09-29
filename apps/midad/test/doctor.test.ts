@@ -11,7 +11,7 @@ import { toFunctionSelector } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { encodeUint64 } from "@mida/protocol"
 import { parseDeployment } from "@mida/chain"
-import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, enqueue, installClaudeCode, installCodex, installDevin, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, enqueue, installClaudeCode, installCodex, installDevin, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
 import type { Runtime } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
@@ -492,6 +492,54 @@ describe("mida doctor without a chain", () => {
       daemonProbeMs: 50,
     })
     expect(lines).toContain("ok: claude-code MCP server installed")
+  })
+
+  it("an ours entry with a stale launcher reports the different-copy note — and install repairs it (F-5)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const settings = join(dir(), "settings.json")
+    const userConfig = join(dir(), "claude.json")
+    installClaudeCode(settings)
+    // our identity, our home — but a launcher from a checkout that has since moved
+    const stale = { command: "/nonexistent/checkout/bin/mida-mcp", args: ["--as", "claude-code"], env: { MIDA_HOME: home.root } }
+    writeFileSync(userConfig, JSON.stringify({ mcpServers: { mida: stale } }))
+    const run = async () => {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: { "claude-code": settings },
+        claudeUserConfig: userConfig,
+        env: {},
+        daemonProbeMs: 50,
+      })
+      return lines
+    }
+    expect(await run()).toContain(
+      "note: claude-code's MCP server starts a different copy of Mida than this one. Run mida install claude-code to point it here.",
+    )
+    // the repair is a real install through an injected claude — remove the stale entry, add ours
+    const calls: string[][] = []
+    const claude = (args: string[]) => {
+      calls.push(args)
+      const parsed = JSON.parse(readFileSync(userConfig, "utf8")) as { mcpServers: Record<string, unknown> }
+      if (args[1] === "remove") delete parsed.mcpServers.mida
+      if (args[1] === "add-json") parsed.mcpServers.mida = JSON.parse(args[5]!)
+      writeFileSync(userConfig, JSON.stringify(parsed))
+      return { status: 0 }
+    }
+    const installLines: string[] = []
+    expect(
+      runInstall(["install", "claude-code"], {
+        print: (line) => installLines.push(line),
+        claudeSettings: settings,
+        codexConfig: join(dir(), "config.toml"),
+        home,
+        claudeUserConfig: userConfig,
+        claudeCli: claude,
+      }),
+    ).toBe(0)
+    expect(calls.map((a) => a[1])).toEqual(["remove", "add-json"])
+    expect(await run()).toContain("ok: claude-code MCP server installed")
   })
 
   it("a tool without installed hooks gets no MCP line — the hook problem owns the fix", async () => {
