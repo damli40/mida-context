@@ -97,12 +97,14 @@ export function callDaemon(home: MidaHome, path: string, body: unknown, options:
     }
     const fail = (failure: NonNullable<ControlReply["failure"]>) => finish({ status: 0, body: null, failure })
     const timer = setTimeout(() => {
+      // the verdict is recorded before teardown — a destroy can surface a late request error
+      // on some Node versions, and a held-but-silent socket is a timeout, never "unreachable"
+      fail("timeout")
       try {
         req?.destroy()
       } catch {
         // already gone
       }
-      fail("timeout")
     }, options.timeoutMs)
     if (typeof timer.unref === "function") timer.unref()
     let req: ReturnType<typeof request> | undefined
