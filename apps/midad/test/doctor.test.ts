@@ -450,7 +450,8 @@ describe("mida doctor without a chain", () => {
     const bare = await run()
     expect(bare).toContain("note: claude-code MCP server not installed. Run mida install claude-code.")
     expect(bare).toContain("note: codex MCP server not installed. Run mida install codex.")
-    expect(bare).toContain("note: devin MCP server not installed. Run mida install devin.")
+    // the devin note names the real limitation — no `mida install devin` can fix it (F-6)
+    expect(bare).toContain("note: devin MCP server not installed. This build does not know where Devin keeps MCP servers.")
     expect(bare).not.toContain("ok: claude-code MCP server installed")
     expect(bare).not.toContain("ok: codex MCP server installed")
 
@@ -470,7 +471,7 @@ describe("mida doctor without a chain", () => {
     expect(installed).toContain("ok: claude-code MCP server installed")
     expect(installed).toContain("ok: codex MCP server installed")
     // devin's can never read ok under this build — its location is not known to it
-    expect(installed).toContain("note: devin MCP server not installed. Run mida install devin.")
+    expect(installed).toContain("note: devin MCP server not installed. This build does not know where Devin keeps MCP servers.")
   })
 
   it("reads .claude.json under CLAUDE_CONFIG_DIR — the same file install wrote (F-3)", async () => {

@@ -756,9 +756,9 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           }
           if (status === "installed") {
             // this build does not know where Devin keeps MCP servers, so the note is all the
-            // line can ever say — it is literal (the server is not installed) and the command
-            // it names explains why
-            lines.push("note: devin MCP server not installed. Run mida install devin.")
+            // line can ever say — it is literal (the server is not installed), and no command
+            // Mida ships can change that; naming one would promise a fix that cannot work
+            lines.push("note: devin MCP server not installed. This build does not know where Devin keeps MCP servers.")
           }
           const sqliteOk = (deps.devinSqliteAvailable ?? devinSqliteAvailable)()
           if (!sqliteOk) {
