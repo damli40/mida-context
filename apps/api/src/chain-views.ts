@@ -64,8 +64,8 @@ function multicall3ProbeEntry(context: ChainContext): { size: number | undefined
   const key = `${context.deployment.chainId}:${MULTICALL3_ADDRESS}`
   const held = multicall3Probes.get(key)
   if (held !== undefined) return held
-  const entry = {
-    size: undefined as number | undefined,
+  const entry: { size: number | undefined; probe: Promise<number> } = {
+    size: undefined,
     // Promise.resolve().then(...) so a client without getCode — a custom transport, a test rig —
     // throws INSIDE the chain and lands on the same eviction as an RPC that refuses the call.
     probe: Promise.resolve()
