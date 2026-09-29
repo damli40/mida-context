@@ -89,7 +89,7 @@ One `ok:` / `note:` / `PROBLEM:` line per check — daemon, network, owner, agen
 ```
 ok: store: store.midacontext.xyz (default)
 ok: sponsor: sponsor.midacontext.xyz (default)
-ok: gas sponsor sponsor.midacontext.xyz answers (… signings per address a day, … a day in total)
+ok: gas sponsor reachable at sponsor.midacontext.xyz (willingness is only proven by a real send; it advertises … signings per address a day, … a day in total)
 ```
 
 A `PROBLEM:` line always ends with its fix (`— npm i -g mida-context`, `— run mida init`, …). Exit code is the number of problems, capped at 9.
@@ -354,7 +354,7 @@ Cursor's `--project` is written as the literal `${workspaceFolder}`, which Curso
 }
 ```
 
-**Codex CLI and the Codex app (live, Sep 27).** Both use the `codex` identity through the hooks `mida install codex` writes (section 4); the same install also adds Mida's MCP server to Codex's config. The Codex tab of the ChatGPT desktop app, working in a local folder, ran Mida's hooks on Sep 27, saves included. A plain ChatGPT chat is not supported.
+**Codex CLI and the Codex app (hooks live, Sep 27; MCP server in tests only).** Both use the `codex` identity through the hooks `mida install codex` writes (section 4); the same install also adds Mida's MCP server to Codex's config. The Codex tab of the ChatGPT desktop app, working in a local folder, ran Mida's hooks on Sep 27, saves included. A plain ChatGPT chat is not supported.
 
 **Any MCP harness (in tests only).** Every stdio config is the same block in a different file: `command` names the `mida-mcp` launcher by absolute path (`<repo>/bin/mida-mcp` from a source checkout finds node for you — PATH, then the usual install spots, then the newest `~/.nvm` version), `args` is `["--as", "<a registered client identity>", "--project", "<project folder>"]`, `env` carries `MIDA_HOME`. Any registered name works — `mida-mcp` refuses `--as` values it cannot serve, so the identity must exist in the home first.
 

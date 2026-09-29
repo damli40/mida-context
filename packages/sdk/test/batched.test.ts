@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { parseEventLogs, recoverTypedDataAddress, zeroHash } from "viem"
-import type { LocalAccount } from "viem"
+import type { LocalAccount, PublicClient } from "viem"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
 import {
   BATCH_REJECT,
@@ -34,10 +34,10 @@ import {
 import type { Deployment, LocalNode, LocalWriteContext } from "@mida/chain"
 import { FakeVaultAuthority, buildSignedAccessRequest, provisionAgent } from "@mida/fake-vault"
 import type { ProvisionedAgent } from "@mida/fake-vault"
-import { ContextApiClient, RegistryReader, createContextApi } from "@mida/api"
+import { ContextApiClient, RegistryReader, createContextApi, evictMulticall3Probe } from "@mida/api"
 import type { BatchedReadItem, BatchedSaveWire } from "@mida/api"
 import { randomBytes } from "@noble/hashes/utils.js"
-import { MidaAgent, signBatchSave, verifyBatchedItem, verifyPendingItem } from "@mida/sdk"
+import { MidaAgent, prefetchBatchedLookups, signBatchSave, verifyBatchedItem, verifyPendingItem } from "@mida/sdk"
 
 const CAREER = namespaceId("goals.career")
 const SEED = new Uint8Array(32).fill(0x42)
@@ -871,6 +871,11 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
       expect(before.reads.get("batchOf")).toBe(83)
       expect(before.reads.get("headCommitOf")).toBe(83)
 
+      // Every read above ran before anvil_setCode — and since in-39 nit 3 the "no Multicall3"
+      // probe answer is cached process-wide, so the measured read would still believe it is not
+      // here. Evict the stale answer; the next read asks the chain and sees the installed code.
+      evictMulticall3Probe(deployment.chainId)
+
       const after: ChainCounts = { reads: new Map(), multicalls: 0, probes: 0 }
       const result = await countedAgent(after).readBatchedWithStatus(vault.owner, "goals.career")
       expect(result.anchored).toHaveLength(5) // the five lineage heads
@@ -957,5 +962,102 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
     expect(counts.reads.get("agentIdOfSigner") ?? 0).toBe(0)
     // the pending row's authority check stays live and per-row — that is the point of it
     expect(counts.reads.get("hasAuthority")).toBe(1)
+  })
+})
+
+// in-39 B-9 nit 3: prefetchBatchedLookups asked the chain's `getCode` for itself on every read —
+// the process-wide probe cache in-38 added for RegistryReader (`apps/api/src/chain-views.ts`)
+// already knows the answer after the first ask, so two reads must cost one probe in total.
+describe("the Multicall3 probe is shared process-wide", () => {
+  it("two batched reads cost the chain one getCode probe", async () => {
+    let probes = 0
+    let multicalls = 0
+    // A stand-in client: getCode answers "Multicall3 is deployed", and multicall returns one
+    // zero result per asked-for call — the prefetch never looks deeper than the array shape.
+    const client = {
+      getCode: async () => {
+        probes += 1
+        return `0x${"60".repeat(4)}`
+      },
+      multicall: async ({ contracts }: { contracts: readonly unknown[] }) => {
+        multicalls += 1
+        return contracts.map(() => zeroHash)
+      },
+    } as unknown as PublicClient
+    // A chain id nothing else in this process probes — the shared cache is keyed by it, so this
+    // deployment starts cold no matter which tests ran first.
+    const deployment: Deployment = {
+      chainId: 4_242_424_242n,
+      capabilityRegistry: `0x${"22".repeat(20)}`,
+      contextRegistry: `0x${"33".repeat(20)}`,
+      deploymentBlock: 0n,
+      policyHashV1: `0x${"55".repeat(32)}`,
+      vaultRpId: "probe-cache.test",
+      vaultRpIdHash: `0x${"66".repeat(32)}`,
+      batchAnchor: `0x${"11".repeat(20)}`,
+      batchAnchorBlock: 0n,
+    }
+    const owner = `0x${"77".repeat(20)}` as Address
+    const namespace = `0x${"88".repeat(32)}` as Hex
+    // One really-signed QUEUED item, so each read walks the whole prefetch path — recover the
+    // signer, then its agentIdOfSigner lookup inside one aggregate call.
+    const message: BatchSaveMessage = {
+      owner,
+      namespaceId: namespace,
+      objectNonce: `0x${"01".repeat(32)}`,
+      lineageId: zeroHash,
+      parentId: zeroHash,
+      parentVersion: 0,
+      rootAuthor: zeroHash,
+      manifestHash: `0x${"aa".repeat(32)}`,
+      ciphertextCommitment: `0x${"bb".repeat(32)}`,
+      readEpoch: 1n,
+      expiresAt: 0n,
+      kind: CONTEXT_KIND.EPISODE,
+      provenanceSource: PROVENANCE_SOURCE.AGENT_INFERRED,
+    }
+    const signature = await signBatchSave({
+      account: privateKeyToAccount(generatePrivateKey()),
+      chainId: deployment.chainId,
+      batchAnchor: deployment.batchAnchor!,
+      message,
+    })
+    const item: BatchedReadItem = {
+      state: "QUEUED",
+      save: {
+        message: { ...message, readEpoch: "1", expiresAt: "0" },
+        signature,
+        // The prefetch never opens these — a verifier does — so any well-shaped values stand in.
+        manifest: {
+          v: 1,
+          contextId: `0x${"99".repeat(32)}`,
+          ciphertextHash: `0x${"bb".repeat(32)}`,
+          ciphertextSize: 1,
+          payloadNonce: `0x${"cc".repeat(32)}`,
+          cryptoVersion: "mida-crypto-v1",
+          readEpoch: "1",
+          epochDekWrap: {
+            v: 1,
+            contextId: `0x${"99".repeat(32)}`,
+            namespaceId: namespace,
+            readEpoch: "1",
+            ephemeralPublicKey: `0x${"dd".repeat(32)}`,
+            nonce: `0x${"ee".repeat(12)}`,
+            wrappedDek: `0x${"ff".repeat(32)}`,
+          },
+        },
+        ciphertext: "0x00",
+      },
+      contextId: `0x${"99".repeat(32)}`,
+      receivedAt: 1,
+    }
+    const input = { items: [item], owner, namespaceId: namespace, chainId: deployment.chainId, deployment, client }
+    const first = await prefetchBatchedLookups(input)
+    const second = await prefetchBatchedLookups(input)
+    expect(first?.signers?.size).toBe(1)
+    expect(second?.signers?.size).toBe(1)
+    // Each read still runs its own aggregate lookups — only the probe is shared.
+    expect(multicalls).toBe(2)
+    expect(probes).toBe(1)
   })
 })

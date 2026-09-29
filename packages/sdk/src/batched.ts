@@ -16,7 +16,7 @@ import { MULTICALL3_ADDRESS, batchAnchorAbi, capabilityRegistryAbi } from "@mida
 import type { Deployment } from "@mida/chain"
 import { hexToBytes, recoverTypedDataAddress, zeroHash } from "viem"
 import type { LocalAccount, PublicClient } from "viem"
-import { RECORDS_PER_MULTICALL } from "@mida/api"
+import { RECORDS_PER_MULTICALL, sharedMulticall3Probe } from "@mida/api"
 import type { BatchedReadItem, BatchedSaveWire } from "@mida/api"
 
 export type { BatchedItemState, BatchedReadItem, BatchedSaveWire, BatchReceipt } from "@mida/api"
@@ -96,8 +96,9 @@ const lowerAddress = (value: string): Address => value.toLowerCase() as Address
  * Fetches the three distinct-value sets one batched read will consult, in aggregate calls of at
  * most RECORDS_PER_MULTICALL contract reads with `allowFailure: false` — a failed lookup fails
  * the read exactly as a failed `readContract` does today. Returns undefined where the chain
- * carries no Multicall3 (no code at the canonical address, or the getCode probe itself fails):
- * the verifiers then read per row, unchanged. Only rows that would reach a chain check spend a
+ * carries no Multicall3 (no code at the canonical address, or the getCode probe itself fails —
+ * the probe is the process-wide one shared with every RegistryReader, in-38 V-3): the verifiers
+ * then read per row, unchanged. Only rows that would reach a chain check spend a
  * lookup — wrong-scope rows and states that refuse before the signature check contribute nothing.
  */
 export async function prefetchBatchedLookups(input: {
@@ -110,8 +111,11 @@ export async function prefetchBatchedLookups(input: {
 }): Promise<BatchedReadLookups | undefined> {
   const batchAnchor = input.deployment.batchAnchor
   if (batchAnchor === undefined) return undefined
-  const code = await input.client.getCode({ address: MULTICALL3_ADDRESS }).catch(() => undefined)
-  if (code === undefined || code === "0x") return undefined
+  // The process-wide probe in-38 added for RegistryReader — one getCode per chain per process —
+  // shared here so the batched lane stops asking the chain the same question on every read.
+  // A chain without Multicall3, or a probe the RPC refused, resolves 1 → the per-row path.
+  const batchSize = await sharedMulticall3Probe({ publicClient: input.client, deployment: input.deployment }).catch(() => 1)
+  if (batchSize === 1) return undefined
   const owner = input.owner.toLowerCase()
   const namespaceId = input.namespaceId.toLowerCase()
   const batchIds = new Set<Hex>()

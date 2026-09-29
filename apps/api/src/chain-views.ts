@@ -80,6 +80,26 @@ function multicall3ProbeEntry(context: ChainContext): { size: number | undefined
 }
 
 /**
+ * The process-wide Multicall3 probe for readers that are not a RegistryReader — the SDK's
+ * batched-lookup prefetch (in-39 nit 3). Resolves to this chain's record batch size
+ * (RECORDS_PER_MULTICALL where Multicall3 answers, 1 where it does not), asking the chain's
+ * `getCode` at most once per process and chain; a rejected probe is evicted and rejects here
+ * too, so the caller falls back to per-row reads and the next call asks the chain again.
+ */
+export function sharedMulticall3Probe(context: ChainContext): Promise<number> {
+  return multicall3ProbeEntry(context).probe
+}
+
+/**
+ * Forget one cached probe answer. Production chains never change whether they carry Multicall3;
+ * a test rig or a rebuilt dev chain can install the runtime mid-process (anvil_setCode), and
+ * then the next reader must ask the chain again rather than trust a stale "not here".
+ */
+export function evictMulticall3Probe(chainId: bigint): void {
+  multicall3Probes.delete(`${chainId}:${MULTICALL3_ADDRESS}`)
+}
+
+/**
  * Every Monad read the Context API and SDK make. Nothing here is cached: each call reads current chain state, so no
  * local value can make Monad authorization true (§12, `currentlyAllowedByMonad`).
  */
@@ -90,9 +110,10 @@ export class RegistryReader {
   constructor(readonly context: ChainContext) {}
 
   /**
-   * The probed batch size once known, undefined while unprobed. Lets a BudgetedReader return a
-   * cached answer without charging the request for a chain read that does not happen — including
-   * when another reader in this process already ran the probe (in-38 V-3).
+   * The probed batch size once known, undefined while unprobed. Lets a BudgetedReader answer
+   * without charging the request — but "unprobed" does not mean "no read": on a cold cache
+   * `multicall3ProbeEntry` starts the `getCode` probe right here, the chain answers it in the
+   * background, and the getter reports undefined until that answer lands (in-38 V-3).
    */
   get knownRecordBatchSize(): number | undefined {
     return this.#recordBatchSize ?? multicall3ProbeEntry(this.context).size
