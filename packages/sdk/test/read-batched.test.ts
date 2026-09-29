@@ -71,8 +71,8 @@ interface Fixture {
   agent: MidaAgent
   objects: { contextId: Hex; value: string }[]
   records: Map<string, Record<string, unknown>>
-  getRecords: ReturnType<typeof vi.spyOn<RegistryReader, "getRecords">>
-  getRecord: ReturnType<typeof vi.spyOn<RegistryReader, "getRecord">>
+  getRecords: ReturnType<typeof vi.spyOn>
+  getRecord: ReturnType<typeof vi.spyOn>
 }
 
 function fixture(count = 3, refs: RefSpec[] = [], extra: Record<string, unknown>[] = []): Fixture {
