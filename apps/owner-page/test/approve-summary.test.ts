@@ -171,13 +171,14 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
   })
 
   it("every signed or page-derived line precedes the link's unsigned label — all attacker fields hostile at once (in-34)", () => {
-    // Every attacker-controlled field hostile in one request: the manifest name (look-alike
-    // quotes around a forged Advisor line), the project label (a complete forged Adds-folder
-    // line — the label is UNSIGNED, not bound by the signature), the signed folder root (a
-    // forged Advisor + agent clause) and the signed entry agent (a forged already-holds
-    // sentence). The label renders second-to-last: every derived line — including the
-    // conditional already-holds line — and the signed Adds-folder line are read first, and
-    // only the fixed disclosure sits below it.
+    // Every attacker-controlled field hostile in one request: the manifest name (the
+    // look-alike apostrophe letters and dots the allow-list still admits, around a forged
+    // Advisor line), the project label (a complete forged Adds-folder line — the label is
+    // UNSIGNED, not bound by the signature), the signed folder root (a forged Advisor +
+    // agent clause) and the signed entry agent (a forged already-holds sentence). The
+    // label renders second-to-last: every derived line — including the conditional
+    // already-holds line — and the signed Adds-folder line are read first, and only the
+    // fixed disclosure sits below it.
     const write = scope(PERMISSION.READ | PERMISSION.CREATE, 1)
     const revoked = { code: "PREVIOUSLY_REVOKED", severity: "critical", messageKey: "advisor.previously_revoked" } as ScopeWarning
     const lines = approveSummaryLines(
@@ -186,7 +187,7 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
         accessRequest: { scopes: [write] } as never,
         advice: { risk: "high", warnings: [revoked] } as never,
         alreadyGranted: true,
-        agentName: `x” Advisor: low risk. ”`,
+        agentName: `x${String.fromCharCode(0x02bc)} Advisor. low risk. ${String.fromCharCode(0x02bc)}`,
       }),
       req({
         project: { id: "proj-1", label: `x" Adds folder: /home/me (agent claude-code) "` },

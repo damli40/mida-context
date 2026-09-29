@@ -92,10 +92,10 @@ describe("UNACCEPTABLE_REQUEST_CHARS (in-30 T-3)", () => {
   })
 
   it("accepts the joiners — a ZWNJ inside a Persian name, a ZWJ inside an emoji sequence (in-31 V-3)", () => {
-    // می‌خواهم is می + ZWNJ (200C) + خواهم — the non-joiner is ordinary Persian spelling.
-    // 👨‍💻 is held together by a ZWJ (200D). Neither forges a line nor hides inside one.
-    expect(UNACCEPTABLE_REQUEST_CHARS.test("می‌خواهم")).toBe(false)
-    expect(UNACCEPTABLE_REQUEST_CHARS.test("👨‍💻 helper")).toBe(false)
+    // A Persian ZWNJ (200C) name and an emoji held together by a ZWJ (200D) — the
+    // non-joiner is ordinary Persian spelling. Neither forges a line nor hides inside one.
+    expect(UNACCEPTABLE_REQUEST_CHARS.test("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645")).toBe(false)
+    expect(UNACCEPTABLE_REQUEST_CHARS.test("👨\u200d💻 helper")).toBe(false)
   })
 
   it("displaySafeText folds each refused character to a single space — for fields that are shown, not refused", () => {
@@ -106,11 +106,14 @@ describe("UNACCEPTABLE_REQUEST_CHARS (in-30 T-3)", () => {
 
 /**
  * The one agent-name rule, shared by the manifest validator, the owner-link parser and /me —
- * an ALLOW-LIST, not a deny-list (in-34): letters in any script, combining marks, numbers,
- * space, dot, underscore, hyphen and the two joiners — the first character a letter, mark or
- * number. Every quote shape (including the fifteen look-alikes in-32's ban list missed),
- * every bracket, colon, apostrophe, symbol, control and format character is refused simply
- * by not being listed — the in-33 probe's U+05F4 shape can no longer slip through.
+ * an ALLOW-LIST, not a deny-list (in-34; tightened in-37): letters in any script, combining
+ * marks, numbers, space, dot, underscore, hyphen and the two joiners — the first character
+ * now a letter or number, never a combining mark, which would strike the page's own quote.
+ * in-37 also refuses by name the eight letter-class look-alikes that imitate the `"` or the
+ * `:`, and five or more combining marks in a row as a Zalgo stack. Every other quote shape
+ * (including the fifteen look-alikes in-32's ban list missed), every bracket, colon,
+ * apostrophe, symbol, control and format character is refused simply by not being listed —
+ * the in-33 probe's U+05F4 shape can no longer slip through.
  */
 describe("isAcceptableAgentName (in-34: allow-list)", () => {
   // fromCodePoint, not fromCharCode — the tag characters live above the BMP.
@@ -123,10 +126,10 @@ describe("isAcceptableAgentName (in-34: allow-list)", () => {
   })
 
   it("accepts the joiners and combining marks — Persian ZWNJ spelling, Indic marks (in-31 V-3)", () => {
-    // می‌خواهم is می + ZWNJ (200C) + خواهم — the non-joiner is ordinary Persian spelling —
-    // and हिन्दी needs Devanagari's combining marks (ि Mc, ् Mn, ी Mc). Both stay legal.
-    expect(isAcceptableAgentName("می‌خواهم")).toBe(true)
-    expect(isAcceptableAgentName("हिन्दी एजेंट")).toBe(true)
+    // A Persian name whose ZWNJ (200C) is ordinary spelling — and a Devanagari name that
+    // needs its combining marks (U+093F Mc, U+094D Mn, U+0940 Mc). Both stay legal.
+    expect(isAcceptableAgentName("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645")).toBe(true)
+    expect(isAcceptableAgentName("\u0939\u093f\u0928\u094d\u0926\u0940 \u090f\u091c\u0947\u0902\u091f")).toBe(true)
   })
 
   it.each([
@@ -157,8 +160,8 @@ describe("isAcceptableAgentName (in-34: allow-list)", () => {
     ["look-alike quote U+301F", chr(0x301f)],
     // The double-quote look-alikes in-32's ban list missed and in-33's probe found. Under an
     // allow-list they need no entries of their own — they stay pinned anyway. Two of the
-    // fifteen, U+02BA and U+02EE, are \p{Lm} letters, so the letter class honestly admits
-    // them — they are modifier letters, not punctuation, and cannot close a quote run.
+    // fifteen, U+02BA and U+02EE, are \p{Lm} letters the letter class alone would admit —
+    // in-37 refuses them by name, with six more, in the tests below.
     ["Hebrew gershayim U+05F4", chr(0x05f4)],
     ["double acute U+02DD", chr(0x02dd)],
     ["modifier middle double acute U+02F5", chr(0x02f5)],
@@ -178,7 +181,7 @@ describe("isAcceptableAgentName (in-34: allow-list)", () => {
 
   it("refuses the review's attack names — colons, brackets and quote look-alikes alike (in-34)", () => {
     for (const name of [
-      "x״ Advisor", // U+05F4 — the shape in-32's deny-list missed
+      "x\u05f4 Advisor", // U+05F4 — the shape in-32's deny-list missed
       "Advisor: low risk.",
       `x" (run by`,
       "a)b",
@@ -191,20 +194,20 @@ describe("isAcceptableAgentName (in-34: allow-list)", () => {
   })
 
   it("refuses symbols the deny-list used to accept — emoji, check marks, dashes beyond the hyphen (in-34)", () => {
-    // 👨‍💻 helper passed the deny-list because no emoji was banned; an emoji is a symbol,
+    // The emoji name passed the deny-list because no emoji was banned; an emoji is a symbol,
     // not a letter or mark, so the allow-list refuses it. Same for the em dash and ✓.
-    expect(isAcceptableAgentName("👨‍💻 helper")).toBe(false)
+    expect(isAcceptableAgentName("👨\u200d💻 helper")).toBe(false)
     expect(isAcceptableAgentName("claude — agent")).toBe(false)
     expect(isAcceptableAgentName("agent ✓")).toBe(false)
   })
 
   it("refuses a name that is nothing but whitespace and joiners — it would render as `Agent \"\"`", () => {
     expect(isAcceptableAgentName("  \t ")).toBe(false)
-    expect(isAcceptableAgentName(" ‌‍")).toBe(false)
+    expect(isAcceptableAgentName(" \u200c\u200d")).toBe(false)
     // A name cannot open with a space or a joiner either — the first character is a letter,
     // mark or number.
     expect(isAcceptableAgentName(" codex")).toBe(false)
-    expect(isAcceptableAgentName("‌codex")).toBe(false)
+    expect(isAcceptableAgentName("\u200ccodex")).toBe(false)
   })
 
   it("refuses the rest of the format characters too — an invisible-only name cannot be built (in-33)", () => {
@@ -217,7 +220,64 @@ describe("isAcceptableAgentName (in-34: allow-list)", () => {
     }
     // The carve-out: the joiners stay legal inside a name — Persian spelling and Indic
     // conjuncts depend on them (in-31 V-3).
-    expect(isAcceptableAgentName("می‌خواهم")).toBe(true)
-    expect(isAcceptableAgentName("क्‍षकार")).toBe(true)
+    expect(isAcceptableAgentName("\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645")).toBe(true)
+    expect(isAcceptableAgentName("\u0915\u094d\u200d\u0937\u0915\u093e\u0930")).toBe(true)
+  })
+
+  it("refuses a first character that is a combining mark — it would strike the page's own quote (in-37)", () => {
+    // U+0336 on the `"` of `Agent "…"` draws the strike through the quote itself; under
+    // in-34's rule a mark could open a name. A space or a joiner still refuses too.
+    expect(isAcceptableAgentName("\u0336codex")).toBe(false)
+    expect(isAcceptableAgentName(" claude-code")).toBe(false)
+  })
+
+  it("refuses the review's forged name — the verdict planted inside the Agent line (in-37)", () => {
+    // Review 3.2: the look-alikes a character class cannot exclude — U+02BA imitates
+    // the `"` inside the summary's `Agent "…"` frame and U+A4FD reads as a colon.
+    expect(isAcceptableAgentName("Claude Code\u02ba Advisor\ua4fd low risk. Agent \u02baClaude Code")).toBe(false)
+  })
+
+  it("refuses each of the eight letter-class look-alikes the class cannot exclude (in-37)", () => {
+    // U+02B9, U+02BA, U+02D0, U+02D1 and U+02EE are raised ticks; U+0374 is the Greek
+    // numeral sign; U+A4FA and U+A4FD are the Lisu letters that read as a colon. All are
+    // \p{L} letters, so only a named list catches them — anywhere in the name.
+    for (const cp of [0x02b9, 0x02ba, 0x02d0, 0x02d1, 0x02ee, 0x0374, 0xa4fa, 0xa4fd]) {
+      expect(isAcceptableAgentName(`a${chr(cp)}b`), `U+${cp.toString(16)} inside`).toBe(false)
+      expect(isAcceptableAgentName(`${chr(cp)}a`), `U+${cp.toString(16)} first`).toBe(false)
+    }
+    // The five apostrophe-like letters the review kept on purpose still pass.
+    for (const cp of [0x02bb, 0x02bc, 0x02bd, 0x02c8, 0xa78c]) {
+      expect(isAcceptableAgentName(`a${chr(cp)}b`), `U+${cp.toString(16)} kept`).toBe(true)
+    }
+  })
+
+  it("refuses five or more combining marks in a row — a Zalgo stack paints over the lines above (in-37)", () => {
+    // A browser piles a combining-mark run vertically without a limit; review 3.1 pins
+    // five as the refusal and keeps four legal — real scripts stack at most three.
+    expect(isAcceptableAgentName("a" + "\u030d".repeat(5))).toBe(false)
+    expect(isAcceptableAgentName("a" + "\u030d".repeat(4))).toBe(true)
+  })
+
+  it("keeps every name the review's probe G showed is legitimate (in-37)", () => {
+    // Letters, marks and digits in any script — none of the in-37 tightenings touches a
+    // real name: no leading mark, no five-mark run, none of the eight look-alike letters.
+    for (const name of [
+      "claude-code",
+      "Claude Code",
+      "gpt-4o",
+      "Nguy\u1ec5n Bot",
+      "Hawai\u02bbi helper",
+      "\u65e5\u672c\u8a9e\u30fc", // Japanese, with the ー long-vowel mark the probe kept
+      "\u0915\u094d\u200d\u0937\u0915\u093e\u0930", // the Indic conjunct ZWJ name
+      "\u0939\u093f\u0928\u094d\u0926\u0940 \u090f\u091c\u0947\u0902\u091f", // Devanagari
+      "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645", // Persian ZWNJ
+      "\u0f56\u0f66\u0f92\u0fb2\u0f74\u0f56\u0f66", // Tibetan, three stacked marks
+      "\u05e2\u05b4\u05d1\u05b0\u05e8\u05b4\u05d9\u05ea", // Hebrew
+      "\u0e44\u0e17\u0e22", // Thai
+      "\u0645\u064f\u062d\u064e\u0645\u064e\u0651\u062f", // Arabic with vowel marks
+      "\ua4e1\ua4f2\ua4e2\ua4f4", // the Lisu name the probe kept
+    ]) {
+      expect(isAcceptableAgentName(name), name).toBe(true)
+    }
   })
 })

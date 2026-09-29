@@ -173,16 +173,16 @@ describe("manifest limits and structure (§14.1)", () => {
   })
 
   it("accepts the joiners and combining marks in a name — a Persian ZWNJ and an Indic name (in-31 V-3, in-34)", () => {
-    // می‌خواهم is ordinary Persian spelling (the 200C non-joiner splits می from خواهم);
-    // हिन्दी सहायक needs Devanagari's combining marks. The zero-width space stays refused.
-    expect(() => validateManifestBody(invalidBody({ name: "می\u200cخواهم" }), NOW)).not.toThrow()
-    expect(() => validateManifestBody(invalidBody({ name: "हिन्दी सहायक" }), NOW)).not.toThrow()
+    // The Persian name is ordinary spelling — its 200C non-joiner splits می from خواهم;
+    // the Indic name needs Devanagari's combining marks. The zero-width space stays refused.
+    expect(() => validateManifestBody(invalidBody({ name: "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645" }), NOW)).not.toThrow()
+    expect(() => validateManifestBody(invalidBody({ name: "\u0939\u093f\u0928\u094d\u0926\u0940 \u0938\u0939\u093e\u092f\u0915" }), NOW)).not.toThrow()
   })
 
   it("rejects a name outside the allow-list — an emoji ZWJ sequence is a symbol, not letters (in-34)", () => {
-    // 👨‍💻 helper passed the old deny-list — no emoji was on it. The allow-list admits only
-    // letters, marks, numbers, space/dot/underscore/hyphen and the joiners, so the emoji make
-    // the name refuse with the same fixed sentence.
+    // The emoji name passed the old deny-list — no emoji was on it. The allow-list admits
+    // only letters, marks, numbers, space/dot/underscore/hyphen and the joiners, so the
+    // emoji make the name refuse with the same fixed sentence.
     let caught: unknown
     try {
       validateManifestBody(invalidBody({ name: "👨\u200d💻 helper" }), NOW)

@@ -117,32 +117,64 @@ export function displaySafeText(value: string): string {
 }
 
 /**
- * The agent-name allow-list (in-34). A name is accepted only when every character is listed:
- * the first must be a letter, combining mark or number in any script; the rest may add space,
- * dot, underscore, hyphen and the two joiners (200C ZWNJ — ordinary Persian spelling — and
- * 200D ZWJ — Indic conjuncts). Written as escapes because the joiners are invisible.
- * Everything else is refused by not being listed — controls, format characters, quotes and
- * their look-alikes, colons, brackets, symbols, emoji — so a deny-list can never be one entry
- * short again (the in-33 probe's U+05F4 shape slipped through in-32's ban list).
+ * The agent-name allow-list (in-34; tightened in-37). A name is accepted only when every
+ * character is listed: the first must be a letter or number in any script — never a
+ * combining mark, which would attach to the page's own opening quote; the rest may add
+ * marks, space, dot, underscore, hyphen and the two joiners (200C ZWNJ — ordinary Persian
+ * spelling — and 200D ZWJ — Indic conjuncts). Written as escapes because the joiners are
+ * invisible. Everything else is refused by not being listed — controls, format characters,
+ * quotes and their look-alikes, colons, brackets, symbols, emoji — so a deny-list can never
+ * be one entry short again (the in-33 probe's U+05F4 shape slipped through in-32's ban
+ * list).
  */
 const ACCEPTABLE_AGENT_NAME_CHARS = new RegExp(
-  "^[\\p{L}\\p{M}\\p{N}][\\p{L}\\p{M}\\p{N} ._\\-\\u200c\\u200d]*$",
+  "^[\\p{L}\\p{N}][\\p{L}\\p{M}\\p{N} ._\\-\\u200c\\u200d]*$",
   "u",
 )
 
 /**
+ * The eight letter-class look-alikes the allow-list cannot exclude by class (in-37, review
+ * 3.2). U+02B9 and U+02BA are raised ticks that read as `"` inside the summary's
+ * `Agent "…"` frame — the review's forged name plants a verdict inside its own line —
+ * U+02D0, U+02D1 and U+02EE are the same raised shapes, U+0374 is the Greek numeral
+ * sign, and U+A4FA and U+A4FD are the Lisu letters that read as a colon. All are \p{L}, so
+ * a named list is the only way to refuse them, anywhere in the name. The kept apostrophe
+ * letters (02BB, 02BC, 02BD, 02C8, A78C) imitate `"` only in a proportional font — the
+ * summary is monospace.
+ */
+const LOOKALIKE_QUOTE_OR_COLON_LETTERS = /[\u02b9\u02ba\u02d0\u02d1\u02ee\u0374\ua4fa\ua4fd]/u
+
+/**
+ * Five or more combining marks in a row is a Zalgo stack, not a name: a browser piles them
+ * vertically without a limit and lets the ink paint over the lines above — the advisor
+ * verdict and warnings on the same page (in-37, review 3.1). Four stays legal — Tibetan
+ * stacks three, and Devanagari, Hebrew, Arabic and Thai all stay under. The owner-link
+ * parser applies the same run limit to every rendered field, so a stack cannot be carried
+ * in through a label or a root either.
+ */
+export const STACKED_MARK_RUN = /\p{M}{5}/u
+
+/**
  * The one agent-name rule, shared by the manifest validator, the owner-link parser and /me
- * (in-32 X-2, in-34) — an allow-list, not a deny-list. A name renders inside the summary's
- * `Agent "…"` quotes, so it admits only the characters a name needs and refuses everything
- * else: a quote shape could close or imitate the quotes, a colon or bracket could forge a
- * rendered line, a symbol or emoji needs no reason to be in a name at all. A name that is
- * empty after trimming, or one that opens with a space or a joiner, is refused too — it would
- * render as `Agent ""` or smuggle a space into the first character. The byte-length limit
- * stays where it always lived — in the manifest validator — not here.
+ * (in-32 X-2, in-34; tightened in-37) — an allow-list, not a deny-list. A name renders
+ * inside the summary's `Agent "…"` quotes, so it admits only the characters a name needs
+ * and refuses everything else: a quote shape could close or imitate the quotes, a colon or
+ * bracket could forge a rendered line, a symbol or emoji needs no reason to be in a name at
+ * all. in-37 adds the three refusals a class allow-list cannot express: the first character
+ * is a letter or number — never a combining mark, which would strike the quote itself —
+ * the eight letter-class look-alikes refuse by name, and five or more combining marks in a
+ * row refuse as a Zalgo stack. A name that is empty after trimming, or one that opens with
+ * a space or a joiner, is refused too — it would render as `Agent ""` or smuggle a space
+ * into the first character. The byte-length limit stays where it always lived — in the
+ * manifest validator — not here.
  */
 export function isAcceptableAgentName(name: string): boolean {
   if (name.trim() === "") return false
-  return ACCEPTABLE_AGENT_NAME_CHARS.test(name)
+  return (
+    ACCEPTABLE_AGENT_NAME_CHARS.test(name) &&
+    !LOOKALIKE_QUOTE_OR_COLON_LETTERS.test(name) &&
+    !STACKED_MARK_RUN.test(name)
+  )
 }
 
 /**
