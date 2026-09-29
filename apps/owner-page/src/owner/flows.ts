@@ -398,7 +398,8 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
       }
       // The hinted credential missed and a discoverable ceremony answered — only now, with the
       // derived owner confirmed registered, does the record learn which credential responded.
-      if (retried) recordAnsweredCredential(env.storage, asserted.credentialId, derived)
+      // The stored transports just missed, so they go too (in-30 NIT 2).
+      if (retried) recordAnsweredCredential(env.storage, asserted.credentialId, derived, { dropTransports: true })
       // The grant assertion must verify against the key on chain — checked here so a passkey whose
       // credential drifted from the registered point fails in words, not as a revert.
       const verdict = verifyCapturedAssertion({
@@ -632,7 +633,7 @@ export async function confirmRevoke(
       if (registeredKey === null) {
         throw new MidaError("AUTH_INVALID", `this owner (${shortAddress(derived)}) has not signed up yet`)
       }
-      if (retried) recordAnsweredCredential(env.storage, asserted.credentialId, derived)
+      if (retried) recordAnsweredCredential(env.storage, asserted.credentialId, derived, { dropTransports: true })
       const made = authorityFor(env, secrets, {})
       const authority = made.authority
       sent = made.sent
@@ -724,7 +725,7 @@ export async function repairReaderWraps(
     if (registeredKey === null) {
       throw new MidaError("AUTH_INVALID", `this owner (${shortAddress(derived)}) has not signed up yet`)
     }
-    if (retried) recordAnsweredCredential(env.storage, asserted.credentialId, derived)
+    if (retried) recordAnsweredCredential(env.storage, asserted.credentialId, derived, { dropTransports: true })
     const { authority } = authorityFor(env, secrets, {})
     const result: ReaderRepairResult = { rewrapped: [], failed: [] }
     const wrapped = new Set<string>()

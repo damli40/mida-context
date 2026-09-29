@@ -78,14 +78,26 @@ export function saveStoredOwner(storage: StorageLike, record: StoredOwner): void
  * different credential replaces the record whole (in-26 Q-1). Called when a discoverable
  * ceremony answered: /me sign-in always, and an owner flow's retry after its hint missed —
  * without it every future prompt repeats the miss (in-27 R-2).
+ *
+ * dropTransports is for the retry case: the hint carried the stored transports and missed, so
+ * they describe a route the credential no longer answers on — keep them and the next prompt
+ * misses the same way (in-30 NIT 2). Sign-in passes no flag: it never sent a hint, so nothing
+ * proved the stored transports stale.
  */
-export function recordAnsweredCredential(storage: StorageLike, credentialId: string, owner: Address): void {
+export function recordAnsweredCredential(
+  storage: StorageLike,
+  credentialId: string,
+  owner: Address,
+  opts?: { dropTransports?: boolean },
+): void {
   const stored = loadStoredOwner(storage)
-  saveStoredOwner(storage, {
+  const merged: StoredOwner = {
     ...(stored !== null && stored.credentialId === credentialId ? stored : {}),
     credentialId,
     owner,
-  })
+  }
+  if (opts?.dropTransports) delete merged.transports
+  saveStoredOwner(storage, merged)
 }
 
 /** Thrown when the passkey maps to a different owner than the link (or this device) expects. */

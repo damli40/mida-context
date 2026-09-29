@@ -6,7 +6,7 @@ import { namespaceId } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
 import type { PreparedRevoke } from "../src/owner/flows.js"
 import { revokeSummaryLines } from "../src/owner/summary.js"
-import { showSummaryLines } from "../src/owner/page.js"
+import { showError, showSummaryLines } from "../src/owner/page.js"
 
 /**
  * The revoke summary (in-30 T-4): it must render through the same one-element-per-line
@@ -63,9 +63,39 @@ describe("the revoke summary lines (in-30 T-4)", () => {
   })
 })
 
+describe("a refused request leaves only the error on the page (in-30 NIT 5)", () => {
+  it("showError empties the summary mount — 'Checking the request…' does not stay up", () => {
+    const summary = fakeEl("div")
+    summary.textContent = "Checking the request…"
+    const error = fakeEl("p")
+    withFakeDoc({ summary, error }, () =>
+      showError("This request contains characters Mida does not accept, so this page will not show or sign it."),
+    )
+    expect(summary.textContent).toBe("")
+    expect(summary.children).toHaveLength(0)
+    expect(error.textContent).toBe(
+      "This request contains characters Mida does not accept, so this page will not show or sign it.",
+    )
+    expect(error.hidden).toBe(false)
+  })
+
+  it("a rendered summary survives a later error — only the placeholder clears", () => {
+    const summary = fakeEl("div")
+    const error = fakeEl("p")
+    withFakeDoc({ summary, error }, () => {
+      showSummaryLines(summary as never, ["line one", "line two"])
+      showError("something failed")
+    })
+    expect(summary.children.map((c) => c.textContent)).toEqual(["line one", "line two"])
+    expect(error.textContent).toBe("something failed")
+  })
+})
+
 interface FakeElement {
   tag: string
   textContent: string
+  hidden: boolean
+  readonly childElementCount: number
   children: FakeElement[]
   appendChild(child: FakeElement): void
   replaceChildren(...nodes: FakeElement[]): void
@@ -75,22 +105,32 @@ function fakeEl(tag: string): FakeElement {
   const el: FakeElement = {
     tag,
     textContent: "",
+    hidden: true,
+    get childElementCount() {
+      return el.children.length
+    },
     children: [],
     appendChild(child) {
       el.children.push(child)
     },
     replaceChildren(...nodes) {
       el.children = [...nodes]
+      el.textContent = "" // replaceChildren() empties text nodes too — the placeholder goes with them
     },
   }
   return el
 }
 
-function withFakeDoc(fn: () => void): void {
+function withFakeDoc(ids: Record<string, FakeElement> | (() => void), fn?: () => void): void {
+  const byId = typeof ids === "function" ? {} : ids
+  const run = typeof ids === "function" ? ids : fn!
   const saved = (globalThis as { document?: unknown }).document
-  ;(globalThis as { document?: unknown }).document = { createElement: (tag: string) => fakeEl(tag) }
+  ;(globalThis as { document?: unknown }).document = {
+    createElement: (tag: string) => fakeEl(tag),
+    getElementById: (id: string) => byId[id] ?? null,
+  }
   try {
-    fn()
+    run()
   } finally {
     ;(globalThis as { document?: unknown }).document = saved
   }

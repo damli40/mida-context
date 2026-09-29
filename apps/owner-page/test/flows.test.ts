@@ -25,7 +25,7 @@ import { parseLinkFragment } from "../src/owner/link.js"
 import type { ParsedLink } from "../src/owner/link.js"
 import { base64UrlEncode } from "../src/check/bytes.js"
 import type { CredentialsContainerLike } from "../src/check/client.js"
-import { makeAssertion, makeKeyPair, throwIfNotAllowed } from "./helpers.js"
+import { bytesEqual, makeAssertion, makeKeyPair, throwIfNotAllowed } from "./helpers.js"
 import {
   confirmApprove,
   confirmRevoke,
@@ -78,7 +78,7 @@ function epochKey(nsId: Hex, epoch: bigint, prf: Uint8Array = PRF): Hex {
 
 // --- fakes ------------------------------------------------------------------
 
-function fakeCredentials(key: ReturnType<typeof makeKeyPair>, prfOutput: Uint8Array, failGet = false) {
+function fakeCredentials(key: ReturnType<typeof makeKeyPair>, prfOutput: Uint8Array, failGet = false, deviceTransports?: readonly string[]) {
   const calls: { kind: "create" | "get"; challenge?: Uint8Array; allowCredentials?: string[] }[] = []
   const rawId = new TextEncoder().encode("owner-credential")
   const prf = prfOutput // the buffer the flow's deriveOwnerSecrets must consume in place
@@ -101,7 +101,7 @@ function fakeCredentials(key: ReturnType<typeof makeKeyPair>, prfOutput: Uint8Ar
     async get(options) {
       const request = options!.publicKey as {
         challenge: Uint8Array
-        allowCredentials?: { id: ArrayLike<number> }[]
+        allowCredentials?: { id: ArrayLike<number>; transports?: string[] }[]
       }
       calls.push({
         kind: "get",
@@ -112,6 +112,17 @@ function fakeCredentials(key: ReturnType<typeof makeKeyPair>, prfOutput: Uint8Ar
       // not listed is never offered and the prompt fails with NotAllowedError. Enforcing it
       // here is what makes the shared-browser tests honest — the old fake ignored the list.
       throwIfNotAllowed(request.allowCredentials, rawId)
+      // A hinted transports list narrows the prompt the same way: when the device's credential
+      // no longer answers over any of them (synced away since signup), the browser finds
+      // nothing and fails NotAllowedError — the miss the discoverable retry covers.
+      const hinted = request.allowCredentials?.find((entry) => bytesEqual(entry.id, rawId))
+      if (
+        hinted?.transports !== undefined &&
+        deviceTransports !== undefined &&
+        !hinted.transports.some((t) => deviceTransports.includes(t))
+      ) {
+        throw new DOMException("The operation either timed out or was not allowed.", "NotAllowedError")
+      }
       if (failGet) throw new DOMException("The operation either timed out or was not allowed.", "NotAllowedError")
       const assertion = makeAssertion(key.privateKey, { challenge: request.challenge, rpId: RP_ID })
       return {
@@ -252,8 +263,9 @@ function makeEnv(opts: {
   releasedSecrets?: OwnerSecrets[]
   intents?: DenyIntent[]
   failGet?: boolean
+  deviceTransports?: readonly string[]
 }): { env: FlowEnvironment; credentials: ReturnType<typeof fakeCredentials>; storage: ReturnType<typeof fakeStorage> } {
-  const credentials = fakeCredentials(passkey, opts.prf ?? PRF.slice(), opts.failGet ?? false)
+  const credentials = fakeCredentials(passkey, opts.prf ?? PRF.slice(), opts.failGet ?? false, opts.deviceTransports)
   const chain = opts.chain ?? fakeChain()
   const sponsor = opts.sponsor ?? fakeSponsor(opts.sends, opts.receiptLogs)
   const store = opts.storage ?? fakeStorage()
@@ -390,6 +402,7 @@ describe("approve flow", () => {
     granted?: () => boolean
     storage?: ReturnType<typeof fakeStorage>
     failGet?: boolean
+    deviceTransports?: readonly string[]
   } = {}) {
     const { manifest, accessRequest } = await approveReq()
     const sends: SendRecord[] = []
@@ -413,6 +426,7 @@ describe("approve flow", () => {
       intents: opts.intents,
       storage: opts.storage,
       failGet: opts.failGet,
+      deviceTransports: opts.deviceTransports,
     })
     const req = {
       chainId: Number(CHAIN_ID),
@@ -613,6 +627,31 @@ describe("approve flow", () => {
     expect(second.status).toBe("success")
     expect(credentials.calls).toHaveLength(3)
     expect(credentials.calls[2]!.allowCredentials).toEqual([answered])
+  })
+
+  it("a same-id retry drops the stale transports — the next prompt is hinted, not doubled (in-30 NIT 2)", async () => {
+    // The record's transports say "internal", but the passkey has since synced off this device
+    // and answers over a transport the record does not name — the hinted prompt misses and the
+    // SAME credential answers the discoverable retry. Keeping the stale transports would aim
+    // the next hint at them and double every future prompt.
+    const credentialId = base64UrlEncode(new TextEncoder().encode("owner-credential"))
+    const store = fakeStorage()
+    store.map.set("mida.owner.v1", JSON.stringify({ credentialId, owner: OWNER, transports: ["internal"] }))
+    const { env, credentials, req } = await setup({ storage: store, deviceTransports: ["hybrid"] })
+    const parsed = link("approve", req)
+    const prep = await prepareApprove(env, parsed)
+    const first = await confirmApprove(env, parsed, prep)
+    expect(first.status).toBe("success")
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get", "get"])
+    expect(credentials.calls[0]!.allowCredentials).toEqual([credentialId])
+    expect(credentials.calls[1]!.allowCredentials).toBeUndefined()
+    // The record still names the answering credential, but the transports that just missed are gone.
+    expect(JSON.parse(store.map.get("mida.owner.v1")!)).toEqual({ credentialId, owner: OWNER })
+    // The next approve pays one hinted prompt — the miss + retry does not repeat.
+    const second = await confirmApprove(env, parsed, prep)
+    expect(second.status).toBe("success")
+    expect(credentials.calls).toHaveLength(3)
+    expect(credentials.calls[2]!.allowCredentials).toEqual([credentialId])
   })
 
   it("a retry answered by a different owner's passkey writes nothing (in-27 R-2)", async () => {

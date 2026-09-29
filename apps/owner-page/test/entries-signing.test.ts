@@ -82,11 +82,11 @@ describe("showEntriesToSign", () => {
     expect(text).toContain(NEW_ENTRY.projectId.slice(0, 10))
     // Count of existing rows being re-signed.
     expect(text).toContain("2")
-    // Every covered row is listed — each existing row's projectId appears, and an agent's own
-    // name sits in quotes so it cannot imitate a line of the page (in-30 T-2).
+    // Every covered row is listed — each existing row's projectId appears, and the agent's name
+    // appears in full inside quotes (in-30 T-2, NIT 4): a cut-down id is no name at all.
     for (const row of rows!.existing) {
       expect(text).toContain(row.projectId)
-      expect(text).toContain(`agent "${row.agent.slice(0, 10)}…"`)
+      expect(text).toContain(`agent "${row.agent}"`)
       expect(text).toContain(row.root.slice(0, 10))
     }
     // The expandable fold: one <details>, one <li> per covered existing row.
@@ -123,12 +123,13 @@ describe("showListReSigned (the revoke-page fold)", () => {
     ;(globalThis as { document?: unknown }).document = saved
   })
 
-  it("quotes the agent's own name on every row it keeps — same rule as approve (in-30 T-2)", () => {
+  it("quotes the agent's own name in full on every row it keeps — same rule as approve (in-30 T-2, NIT 4)", () => {
     const mount = fakeEl("section")
     showListReSigned(mount as never, [ROW_1, ROW_2])
     const text = collectText(mount)
     for (const row of [ROW_1, ROW_2]) {
-      expect(text).toContain(`agent "${row.agent.slice(0, 10)}…"`)
+      expect(text).toContain(`agent "${row.agent}"`)
+      expect(text).not.toContain(`${row.agent.slice(0, 10)}…`)
     }
   })
 })

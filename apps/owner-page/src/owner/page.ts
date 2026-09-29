@@ -32,6 +32,11 @@ export function progressLine(text: string): void {
 }
 
 export function showError(text: string): void {
+  // A "Checking the request…" placeholder still sitting in #summary would read as the page
+  // still working alongside the error — clear it. A rendered summary has one element per line
+  // and stays; only the bare placeholder text goes (in-30 NIT 5).
+  const summary = document.getElementById("summary")
+  if (summary !== null && summary.childElementCount === 0) summary.replaceChildren()
   const box = el<HTMLParagraphElement>("error")
   box.textContent = text
   box.hidden = false
@@ -108,7 +113,7 @@ export function showEntriesToSign(
   const list = document.createElement("ul")
   for (const row of view.existing) {
     const li = document.createElement("li")
-    li.textContent = `${row.projectId} — agent "${short(row.agent)}" — root ${short(row.root)}`
+    li.textContent = `${row.projectId} — agent "${row.agent}" — root ${short(row.root)}`
     list.appendChild(li)
   }
   details.appendChild(list)
@@ -139,7 +144,7 @@ export function showListReSigned(
   const list = document.createElement("ul")
   for (const row of rows) {
     const li = document.createElement("li")
-    li.textContent = `${row.projectId} — agent "${short(row.agent)}" — root ${short(row.root)}`
+    li.textContent = `${row.projectId} — agent "${row.agent}" — root ${short(row.root)}`
     list.appendChild(li)
   }
   details.appendChild(list)
