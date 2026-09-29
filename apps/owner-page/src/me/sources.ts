@@ -100,8 +100,6 @@ export const COUNTS_QUERY = `query MeCounts($owner: String!, $limit: Int!) {
     registeredBlock
     txHash
   }
-  // one-condition where only — Hasura parses more, but the page's own shape guard reads commas
-  // naively; the kind filter runs client-side instead, and contextId rows are all we keep anyway
   TimelineEntry(where: { owner: { _eq: $owner } }, limit: $limit) {
     kind
     contextId

@@ -118,6 +118,40 @@ function capabilityView(over: Partial<CapabilityView> = {}): CapabilityView {
 // old `GlobalStats(id: "global")` / `Owner(id: $owner)` forms can never pass here.
 const LIST_FIELD_ARGS = new Set(["where", "limit", "order_by", "offset", "distinct_on"])
 
+/**
+ * A spec-faithful GraphQL lexer for the token classes a query document can contain, promoted
+ * from the review's zz-rvpage-graphql-lexer probe. Regex-shaped guards cannot catch a `//`
+ * comment — GraphQL has no `/` token (comments are `#`) — so a document that lexes must prove it
+ * against the grammar itself, not a pattern. Returns the first character the grammar cannot
+ * tokenize, or null when the whole document lexes.
+ */
+function firstLexError(source: string): { char: string; line: number } | null {
+  const isNameStart = (c: string) => /[_A-Za-z]/.test(c)
+  const isNameChar = (c: string) => /[_0-9A-Za-z]/.test(c)
+  const punct = new Set(["!", "$", "&", "(", ")", ":", "=", "@", "[", "]", "{", "|", "}"])
+  let i = 0
+  let line = 1
+  while (i < source.length) {
+    const c = source[i]!
+    if (c === "\n") { line++; i++; continue }
+    if (c === " " || c === "\t" || c === "\r" || c === "," || c === "﻿") { i++; continue } // eslint-disable-line no-irregular-whitespace
+    if (c === "#") { while (i < source.length && source[i] !== "\n") i++; continue }
+    if (source.startsWith("...", i)) { i += 3; continue }
+    if (punct.has(c)) { i++; continue }
+    if (isNameStart(c)) { while (i < source.length && isNameChar(source[i]!)) i++; continue }
+    if (/[-0-9]/.test(c)) { i++; while (i < source.length && /[0-9.eE+-]/.test(source[i]!)) i++; continue }
+    if (c === '"') {
+      if (source.startsWith('"""', i)) { const end = source.indexOf('"""', i + 3); if (end < 0) return { char: c, line }; i = end + 3; continue }
+      i++
+      while (i < source.length && source[i] !== '"') { if (source[i] === "\\") i++; if (source[i] === "\n") return { char: c, line }; i++ }
+      i++
+      continue
+    }
+    return { char: c, line }
+  }
+  return null
+}
+
 function checkQueryShape(gql: string): void {
   for (const match of gql.matchAll(/([A-Za-z_]\w*)\s*\(([^()]*)\)/g)) {
     const field = match[1]!
@@ -568,6 +602,17 @@ describe("loadMe — incomplete lists and index contradictions stay visible", ()
 })
 
 describe("the index queries are Hasura-shaped", () => {
+  it("every exported query lexes as a GraphQL document — a // comment is not a GraphQL token", () => {
+    // The shape guard only sees `name(args)` pairs, so it can never catch a token the grammar
+    // lacks. This is the regression in-25 P-1 fixes: COUNTS_QUERY carried two `//` lines and
+    // Hasura refused the whole document on every /me load.
+    for (const gql of [AGENTS_QUERY, BATCHED_QUERY, COUNTS_QUERY]) {
+      expect(firstLexError(gql)).toBeNull()
+    }
+    // the check is real: a // comment line anywhere in the document is caught
+    expect(firstLexError(`query X { a }\n// not a comment\n`)).not.toBeNull()
+  })
+
   it("every exported query uses only where/limit/order_by on list fields, id: only on _by_pk, and _meta for progress", () => {
     for (const gql of [AGENTS_QUERY, BATCHED_QUERY, COUNTS_QUERY]) {
       expect(() => checkQueryShape(gql)).not.toThrow()
