@@ -453,6 +453,35 @@ describe("approvePasskey", () => {
     expect(home.has("agents/codex/pending-request.json")).toBe(true)
   })
 
+  it("a page reason carrying escape codes reaches the terminal as plain text — never raw (in-39 B-8)", async () => {
+    // The page is a website the browser opened; its reason is not trusted text. An ESC byte in
+    // it would let the page redraw or clear the owner's terminal — the reason is sanitised to
+    // printable characters before it can become the line the CLI prints.
+    const home = new MidaHome(join(dir(), "home"))
+    saveAgentIdentity(home, await identity())
+    await pendingRequest(home, [{ namespace: "projects.current", permissions: PERMISSION.READ | PERMISSION.CREATE }])
+    const session = fakeSession(home, {}, {})
+    const deps = fakePageDeps([], (nonce, bytes) => ({
+      v: 1,
+      status: "cancelled",
+      nonce,
+      requestHash: requestHash(bytes),
+      owner: null,
+      transactions: [],
+      operations: [],
+      reason: "\x1b[2J\x1b[Howned — trust me\nrun rm -rf /",
+    }), {})
+
+    const error = await approvePasskey(session, "codex", undefined, deps).then(
+      () => undefined,
+      (e) => e as OwnerLinkOutcome,
+    )
+    expect(error!.line).not.toContain("\x1b")
+    expect(error!.line).not.toContain("\n")
+    expect(error!.line).toBe("[2J [Howned — trust me run rm -rf /")
+    expect(error!.exitCode).toBe(2)
+  })
+
   it("a pending revoke inside the landing window refuses before the page is asked", async () => {
     const home = new MidaHome(join(dir(), "home"))
     saveAgentIdentity(home, await identity())

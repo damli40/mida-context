@@ -10,6 +10,7 @@ import {
   accessRequestHash,
   buildOwnerLink,
   decodeUint64,
+  displaySafeText,
   encodeUint64,
   namespaceById,
 } from "@mida/protocol"
@@ -192,7 +193,8 @@ function declined(result: OwnerLinkResult): never {
       "pending",
     )
   }
-  const reason = result.reason ?? "the page did not finish"
+  // the reason is the page's text — sanitised before it can paint the owner's terminal (in-39 B-8)
+  const reason = displaySafeText(result.reason ?? "the page did not finish").replace(/\s+/g, " ").trim()
   // The page detects a passkey that derives a different owner and reports it in the reason;
   // the brief's fixed line replaces it so the owner always reads the same words.
   if (/different Mida owner/.test(reason)) throw new OwnerLinkOutcome(WRONG_OWNER_LINE, 2, "declined")
