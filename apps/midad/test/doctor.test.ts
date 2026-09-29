@@ -282,7 +282,7 @@ describe("mida doctor without a chain", () => {
     const settings = join(dir(), "settings.json")
     const config = join(dir(), "config.toml")
     installClaudeCode(settings)
-    installCodex(config)
+    installCodex(config, { home: home.root })
     const lines: string[] = []
     await runDoctor({
       home,
@@ -298,7 +298,7 @@ describe("mida doctor without a chain", () => {
   it("the Codex trust reminder prints whenever a managed block exists — installed, outdated or edited", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const config = join(dir(), "config.toml")
-    installCodex(config)
+    installCodex(config, { home: home.root })
     const note = `note: ${CODEX_TRUST_SENTENCE}`
     for (const variant of ["installed", "outdated", "edited"] as const) {
       if (variant === "outdated") writeFileSync(config, `${CODEX_BLOCK_V1}\n`)
@@ -579,7 +579,7 @@ describe("mida doctor without a chain", () => {
     const settings = join(dir(), "settings.json")
     const config = join(dir(), "config.toml")
     installClaudeCode(settings)
-    installCodex(config)
+    installCodex(config, { home: home.root })
     const lines: string[] = []
     // no `settings` dep at all — the env vars name the files, as a throwaway-settings run does
     await runDoctor({
@@ -599,7 +599,7 @@ describe("mida doctor without a chain", () => {
     const home = new MidaHome(join(dir(), "home"))
     // the recorded home holds a complete managed block…
     const recorded = mkdtempSync(join(tmpdir(), "mida-codex-recorded-"))
-    installCodex(join(recorded, "config.toml"))
+    installCodex(join(recorded, "config.toml"), { home: home.root })
     recordCodexHome(home, recorded)
     // …while the shell's CODEX_HOME points at a home with NO hooks
     const elsewhere = mkdtempSync(join(tmpdir(), "mida-codex-elsewhere-"))

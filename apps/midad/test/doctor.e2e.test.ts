@@ -79,7 +79,7 @@ describe("mida doctor on local Anvil", () => {
     claudeSettings = join(mkdtempSync(join(tmpdir(), "mida-doctor-cfg-")), "settings.json")
     codexConfig = join(mkdtempSync(join(tmpdir(), "mida-doctor-cfg-")), "config.toml")
     installClaudeCode(claudeSettings)
-    installCodex(codexConfig)
+    installCodex(codexConfig, { home: home.root })
 
     const runtime = await Runtime.open(home, { ...network, storageUrl: apiServer.baseUrl })
     try {

@@ -2196,7 +2196,7 @@ export function runInstall(
           : deps.codexConfig
   const run =
     argv[0] === "install"
-      ? (p: string) => (tool === "claude-code" ? installClaudeCode(p) : tool === "devin" ? installDevin(p) : installCodex(p))
+      ? (p: string) => (tool === "claude-code" ? installClaudeCode(p) : tool === "devin" ? installDevin(p) : installCodex(p, { home: deps.home.root }))
       : (p: string) => (tool === "claude-code" ? uninstallClaudeCode(p) : tool === "devin" ? uninstallDevin(p) : uninstallCodex(p))
   try {
     const outcome = run(settingsPath)

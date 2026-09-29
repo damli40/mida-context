@@ -688,10 +688,31 @@ export const CODEX_BLOCK = [
   CODEX_MARKER_CLOSE,
 ].join("\n")
 
-/** The managed block a fresh `mida install codex` writes — the same shape, with absolute commands. */
-export function codexBlock(): string {
-  return [
-    CODEX_MARKER_OPEN,
+/** A TOML basic-string value — the two escapes a path can need inside double quotes. */
+const tomlString = (value: string): string => `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+
+/**
+ * The managed block a fresh `mida install codex` writes — the same shape, with absolute
+ * commands. With MCP on (the default) it also carries the [mcp_servers.mida] table FIRST,
+ * before the hook tables: Codex appends its trust records after the last hooks table in the
+ * file, so a table of ours after them could be swept into the foreign tail on a rewrite —
+ * nothing ever lands between the open marker and the first hooks table. The server entry is
+ * the same launcher the file-config clients get, and carries NO --project: the folder the
+ * agent session runs in is the project (mcp.ts defaults it to the process cwd).
+ */
+export function codexBlock(options: { home?: string; mcp?: boolean } = {}): string {
+  const lines = [CODEX_MARKER_OPEN]
+  if (options.mcp !== false) {
+    if (options.home === undefined) throw new Error("codexBlock needs the Mida home for the MCP table")
+    lines.push(
+      "[mcp_servers.mida]",
+      `command = ${tomlString(mcpLauncherPath())}`,
+      `args = ["--as", "codex"]`,
+      `env = { MIDA_HOME = ${tomlString(options.home)} }`,
+      "",
+    )
+  }
+  lines.push(
     "[[hooks.SessionStart]]",
     'matcher = "startup|resume|clear|compact"',
     "",
@@ -711,20 +732,8 @@ export function codexBlock(): string {
     'type = "command"',
     `command = "${hookCommand("codex")}"`,
     CODEX_MARKER_CLOSE,
-  ].join("\n")
-}
-
-/**
- * Every managed-block shape this build recognises as its own — anything else between the
- * markers is a human's edit. Built per call because the current block carries the resolved
- * absolute paths.
- */
-function codexKnownBlocks(): Readonly<Record<string, "current" | "bare" | "v1">> {
-  return {
-    [codexBlock()]: "current",
-    [CODEX_BLOCK]: "bare",
-    [CODEX_BLOCK_V1]: "v1",
-  }
+  )
+  return lines.join("\n")
 }
 
 /**
@@ -746,35 +755,75 @@ export const CODEX_TRUST_SENTENCE =
  */
 function codexOwnTables(): Set<string> {
   const tables = new Set<string>()
-  for (const block of Object.keys(codexKnownBlocks())) {
+  // every block shape this build writes — hooks+MCP, hooks-only, and the two legacy constants
+  for (const block of [codexBlock({ home: "", mcp: true }), codexBlock({ mcp: false }), CODEX_BLOCK, CODEX_BLOCK_V1]) {
     for (const line of block.split("\n")) if (line.startsWith("[")) tables.add(line)
   }
   return tables
 }
 
 /**
- * A core block with each `command = "…"` line replaced by a blank placeholder — the shape
- * compare that recognises OUR block written from a different checkout (absolute paths differ).
- * A command line that does not parse as a Mida hook returns null: a foreign command inside
- * the markers means the block is not ours to rewrite.
+ * A core block with each variable part replaced by a blank placeholder — the shape compare
+ * that recognises OUR block written from a different checkout or for a different Mida home:
+ * hook command paths, the MCP launcher's path and the env's MIDA_HOME value all blank. Inside
+ * the server table a `command` line is the launcher itself — anything whose basename is not
+ * mida-mcp is a hand edit. A command line that does not parse as a Mida hook returns null:
+ * a foreign command inside the markers means the block is not ours to rewrite.
  */
 function codexBlockShape(text: string): string | null {
   const out: string[] = []
+  let inMcpTable = false
   for (const line of text.split("\n")) {
+    if (line.startsWith("[")) inMcpTable = line === "[mcp_servers.mida]"
     const command = /^command = "([^"]*)"$/.exec(line)
-    if (command === null) {
-      out.push(line)
+    if (command !== null) {
+      const own = inMcpTable
+        ? basename(command[1]!).startsWith("mida-mcp")
+        : parseMidaCommand(command[1]!) !== null
+      if (!own) return null
+      out.push('command = ""')
       continue
     }
-    if (parseMidaCommand(command[1]!) === null) return null
-    out.push('command = ""')
+    if (inMcpTable && /^env = \{ MIDA_HOME = "(?:[^"\\]|\\.)*" \}$/.test(line)) {
+      out.push('env = { MIDA_HOME = "" }')
+      continue
+    }
+    out.push(line)
   }
   return out.join("\n")
 }
 
+/**
+ * The recognised block SHAPES — what a managed block is compared against after its variable
+ * parts are blanked. The hooks-only shape is what `--no-mcp` writes; the MCP shape adds the
+ * server table. The bare legacy blocks are matched literally before any of these (they carry
+ * fixed text, so their own shape equals the hooks shape).
+ */
+const CODEX_SHAPE_V1 = codexBlockShape(CODEX_BLOCK_V1)
+const CODEX_SHAPE_HOOKS = codexBlockShape(codexBlock({ mcp: false }))
+const CODEX_SHAPE_MCP = codexBlockShape(codexBlock({ home: "" }))
+
+/** The MIDA_HOME a managed block's server table points at — null when it carries none. */
+function codexBlockMcpHome(core: string): string | null {
+  if (!core.includes("[mcp_servers.mida]")) return null
+  const env = /\nenv = \{ MIDA_HOME = "((?:[^"\\]|\\.)*)" \}/.exec(`\n${core}`)
+  if (env === null) return null
+  return env[1]!.replace(/\\(["\\])/g, "$1")
+}
+
 /** Finds a KNOWN managed block between its markers; "absent" when neither marker is present. */
 function locateCodexBlock(text: string):
-  | { start: number; end: number; tailStart: number; version: "current" | "bare" | "v1" | "stale"; foreignTail: string }
+  | {
+      start: number
+      end: number
+      tailStart: number
+      version: "current" | "no-mcp" | "bare" | "v1" | "stale"
+      foreignTail: string
+      /** The marker-wrapped core, \r-stripped and tail-free — what the block builder writes. */
+      core: string
+      /** The server table's MIDA_HOME when the block carries one; null for hooks-only blocks. */
+      mcpHome: string | null
+    }
   | "absent" {
   const hasOpen = text.includes(CODEX_MARKER_OPEN)
   const hasClose = text.includes(CODEX_MARKER_CLOSE)
@@ -809,19 +858,29 @@ function locateCodexBlock(text: string):
     .replace(/\n+$/, "")
   const core = `${CODEX_MARKER_OPEN}${coreInterior}\n${CODEX_MARKER_CLOSE}`
   const tailStart = start + CODEX_MARKER_OPEN.length + coreEnd
-  const known = codexKnownBlocks()[core]
-  if (known !== undefined) return { start, end, tailStart, version: known, foreignTail }
+  if (core === CODEX_BLOCK) return { start, end, tailStart, version: "bare", foreignTail, core, mcpHome: null }
+  if (core === CODEX_BLOCK_V1) return { start, end, tailStart, version: "v1", foreignTail, core, mcpHome: null }
   // A block we do not byte-match can still be ours: an absolute-path block written from a
   // different checkout (the repo moved, or an older build's dist) has our table shape with
-  // different command paths. The shape must match a known block AND every command must parse
-  // as a Mida hook — a foreign command, or any other line a known block does not carry (a
-  // hand-added key like `timeout = 5`), is a human's edit and refuses (in-16 K-3).
+  // different command paths and maybe another home. The shape must match a known block — a
+  // foreign command, a foreign server command, or any other line a known block does not
+  // carry (a hand-added key like `timeout = 5`) is a human's edit and refuses (in-16 K-3).
   const shape = codexBlockShape(core)
-  if (shape !== null) {
-    for (const block of Object.keys(codexKnownBlocks())) {
-      if (codexBlockShape(block) === shape) return { start, end, tailStart, version: "stale", foreignTail }
-    }
+  if (shape === null) throw settingsUnreadable()
+  if (shape === CODEX_SHAPE_MCP) {
+    const mcpHome = codexBlockMcpHome(core)
+    if (mcpHome === null) throw settingsUnreadable()
+    // the only free value a well-formed current block carries is the home — rebuilding the
+    // canonical block around it is a byte-compare of everything else (this build's commands,
+    // this build's launcher)
+    const version = core === codexBlock({ home: mcpHome }) ? "current" : "stale"
+    return { start, end, tailStart, version, foreignTail, core, mcpHome }
   }
+  if (shape === CODEX_SHAPE_HOOKS) {
+    const version = core === codexBlock({ mcp: false }) ? "no-mcp" : "stale"
+    return { start, end, tailStart, version, foreignTail, core, mcpHome: null }
+  }
+  if (shape === CODEX_SHAPE_V1) return { start, end, tailStart, version: "stale", foreignTail, core, mcpHome: null }
   throw settingsUnreadable()
 }
 
@@ -831,23 +890,36 @@ function locateCodexBlock(text: string):
  * byte-identical no-op; an older KNOWN block is upgraded in place — the markers still mean it
  * is ours to rewrite. Markers around anything else refuse settings-unreadable — the block is
  * never silently overwritten.
+ *
+ * `options.mcp` is the install's `--no-mcp` flag inverted: false writes hooks only — but it
+ * never REMOVES a server table that is already ours (only uninstall does that), so a flag-off
+ * rerun over an MCP block keeps the table, home and all. A `[mcp_servers.mida]` table outside
+ * the markers is someone else's server: writing ours alongside would make a duplicate TOML
+ * table and break the file, so the install refuses — the same "is it ours" rule the JSON
+ * clients apply to a foreign "mida" name.
  */
-export function installCodex(configPath: string): InstallOutcome {
+export function installCodex(configPath: string, options: { home: string; mcp?: boolean }): InstallOutcome {
   const text = existsSync(configPath) ? readFileSync(configPath, "utf8") : null
-  if (text !== null) {
-    const block = locateCodexBlock(text)
-    if (block !== "absent") {
-      if (block.version === "current") return "already-installed"
-      // an older managed block is ours to replace in place — same outcome as a fresh append.
-      // The foreign tail (Codex's trust records and any other table that landed inside the
-      // markers) comes back out immediately AFTER the close marker: still valid TOML, and
-      // outside the region the next locate treats as ours to rewrite. The rewritten block
-      // keeps the file's own line endings (in-16 K-3).
-      const eol = text.includes("\r\n") ? "\r\n" : "\n"
-      const current = eol === "\r\n" ? codexBlock().replace(/\n/g, "\r\n") : codexBlock()
-      writeFileAtomic(configPath, `${text.slice(0, block.start)}${current}${block.foreignTail}${text.slice(block.end)}`)
-      return "installed"
+  const block = text === null ? "absent" : locateCodexBlock(text)
+  const outside = block === "absent" ? (text ?? "") : `${text!.slice(0, block.start)}${text!.slice(block.tailStart)}`
+  for (const line of outside.split("\n")) {
+    if (line === "[mcp_servers.mida]" || line === "[mcp_servers.mida]\r") {
+      throw new Error("a [mcp_servers.mida] table exists outside Mida's managed block — rename it or remove it")
     }
+  }
+  const mcpHome = options.mcp !== false ? options.home : block !== "absent" ? block.mcpHome : null
+  const target = mcpHome === null ? codexBlock({ mcp: false }) : codexBlock({ home: mcpHome })
+  if (block !== "absent") {
+    if (block.core === target) return "already-installed"
+    // an older managed block is ours to replace in place — same outcome as a fresh append.
+    // The foreign tail (Codex's trust records and any other table that landed inside the
+    // markers) comes back out immediately AFTER the close marker: still valid TOML, and
+    // outside the region the next locate treats as ours to rewrite. The rewritten block
+    // keeps the file's own line endings (in-16 K-3).
+    const eol = text!.includes("\r\n") ? "\r\n" : "\n"
+    const current = eol === "\r\n" ? target.replace(/\n/g, "\r\n") : target
+    writeFileAtomic(configPath, `${text!.slice(0, block.start)}${current}${block.foreignTail}${text!.slice(block.end)}`)
+    return "installed"
   }
   const eol = (text ?? "").includes("\r\n") ? "\r\n" : "\n"
   const separator = text === null || text === ""
@@ -858,8 +930,8 @@ export function installCodex(configPath: string): InstallOutcome {
         ? eol
         : `${eol}${eol}`
   mkdirSync(dirname(configPath), { recursive: true })
-  const block = eol === "\r\n" ? codexBlock().replace(/\n/g, "\r\n") : codexBlock()
-  writeFileAtomic(configPath, `${text ?? ""}${separator}${block}${eol}`)
+  const targetText = eol === "\r\n" ? target.replace(/\n/g, "\r\n") : target
+  writeFileAtomic(configPath, `${text ?? ""}${separator}${targetText}${eol}`)
   return "installed"
 }
 
@@ -874,7 +946,28 @@ export function codexHooksStatus(configPath: string): "installed" | "outdated" |
     if (!existsSync(configPath)) return "absent"
     const block = locateCodexBlock(readFileSync(configPath, "utf8"))
     if (block === "absent") return "absent"
-    return block.version === "current" ? "installed" : "outdated"
+    // a hooks-only block carries the same current commands — the missing server table is a
+    // MCP-status concern, not a hook concern
+    return block.version === "current" || block.version === "no-mcp" ? "installed" : "outdated"
+  } catch {
+    return "unreadable"
+  }
+}
+
+/**
+ * Doctor's read-only view of the server table: "installed" only when the block carries THIS
+ * build's entry at THIS home (a stale-path block or another home's table still needs a
+ * reinstall to become ours). "not-installed" covers a hooks-only block and a server table we
+ * recognise but do not own byte-for-byte; "absent" and "unreadable" mean the same as the hooks
+ * status — there is no block, or the block refuses to be read as ours.
+ */
+export function codexMcpStatus(configPath: string, home: string): "installed" | "not-installed" | "absent" | "unreadable" {
+  try {
+    if (!existsSync(configPath)) return "absent"
+    const block = locateCodexBlock(readFileSync(configPath, "utf8"))
+    if (block === "absent") return "absent"
+    if (block.mcpHome === null) return "not-installed"
+    return block.version === "current" && block.mcpHome === home ? "installed" : "not-installed"
   } catch {
     return "unreadable"
   }

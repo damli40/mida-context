@@ -20,6 +20,8 @@ import {
   installCodex,
   installDevin,
   installMcpClient,
+  mcpLauncherPath,
+  codexMcpStatus,
   parseMidaCommand,
   recordCodexHome,
   recordedCodexHome,
@@ -318,10 +320,13 @@ describe("mida uninstall claude-code", () => {
 })
 
 describe("mida install codex", () => {
+  // the env value is a plain string — nothing stats it on disk
+  const home = "/mida-home"
+
   it("creates a missing config.toml with exactly the managed block", () => {
     const config = join(dir(), "nested", "config.toml")
-    expect(installCodex(config)).toBe("installed")
-    expect(readFileSync(config, "utf8")).toBe(`${codexBlock()}\n`)
+    expect(installCodex(config, { home })).toBe("installed")
+    expect(readFileSync(config, "utf8")).toBe(`${codexBlock({ home })}\n`)
   })
 
   it("installs into CODEX_HOME when set and records the resolved home in the Mida home", () => {
@@ -344,8 +349,8 @@ describe("mida install codex", () => {
       else process.env.CODEX_HOME = previous
     }
     expect(code).toBe(0)
-    // the managed block is exactly codexBlock() — an unchanged block never re-asks Codex's trust
-    expect(readFileSync(config, "utf8")).toBe(`${codexBlock()}\n`)
+    // the managed block is exactly codexBlock({ home }) — an unchanged block never re-asks Codex's trust
+    expect(readFileSync(config, "utf8")).toBe(`${codexBlock({ home: midaHome.root })}\n`)
     expect(readFileSync(midaHome.path("codex-home"), "utf8")).toBe(`${codexHome}\n`)
     expect(recordedCodexHome(midaHome)).toBe(codexHome)
   })
@@ -450,12 +455,15 @@ describe("mida install codex", () => {
   })
 
   it("the managed block carries the whats-new hook on the same inject command, absolutely (R5-7)", () => {
-    const block = codexBlock()
+    const block = codexBlock({ home })
     expect(block).toContain("[[hooks.UserPromptSubmit]]")
     expect(block).toContain(`command = "${injectCommand("codex")}"`)
     expect(block).toContain(`command = "${hookCommand("codex")}"`)
-    // every command line in the block names an absolute file
+    // every command line in the block names an absolute file — the hooks parse back to their
+    // entries; the one that does not is the MCP server's own launcher
     for (const match of block.matchAll(/command = "([^"]*)"/g)) {
+      expect(isAbsolute(match[1]!)).toBe(true)
+      if (match[1] === mcpLauncherPath()) continue
       expect(parseMidaCommand(match[1])).not.toBeNull()
     }
   })
@@ -466,12 +474,12 @@ describe("mida install codex", () => {
       const before = 'model = "gpt-5"\n'
       writeFileSync(config, `${before}\n${legacy}\n`)
       expect(codexHooksStatus(config)).toBe("outdated")
-      expect(installCodex(config)).toBe("installed")
+      expect(installCodex(config, { home })).toBe("installed")
       const text = readFileSync(config, "utf8")
-      expect(text).toBe(`${before}\n${codexBlock()}\n`)
+      expect(text).toBe(`${before}\n${codexBlock({ home })}\n`)
       expect(codexHooksStatus(config)).toBe("installed")
       // and the upgrade is idempotent
-      expect(installCodex(config)).toBe("already-installed")
+      expect(installCodex(config, { home })).toBe("already-installed")
       expect(readFileSync(config, "utf8")).toBe(text)
     }
   })
@@ -490,11 +498,11 @@ describe("mida install codex", () => {
     const config = join(dir(), "config.toml")
     const before = 'model = "gpt-5"\napproval_policy = "untrusted"\n'
     writeFileSync(config, before)
-    expect(installCodex(config)).toBe("installed")
+    expect(installCodex(config, { home })).toBe("installed")
     const text = readFileSync(config, "utf8")
-    expect(text).toBe(`${before}\n${codexBlock()}\n`)
+    expect(text).toBe(`${before}\n${codexBlock({ home })}\n`)
     // second install is a byte-identical no-op
-    expect(installCodex(config)).toBe("already-installed")
+    expect(installCodex(config, { home })).toBe("already-installed")
     expect(readFileSync(config, "utf8")).toBe(text)
     expect(statSync(config).mtimeMs).toBe(statSync(config).mtimeMs)
   })
@@ -503,29 +511,29 @@ describe("mida install codex", () => {
     const config = join(dir(), "config.toml")
     const before = 'model = "gpt-5"'
     writeFileSync(config, before)
-    installCodex(config)
-    expect(readFileSync(config, "utf8")).toBe(`${before}\n\n${codexBlock()}\n`)
+    installCodex(config, { home })
+    expect(readFileSync(config, "utf8")).toBe(`${before}\n\n${codexBlock({ home })}\n`)
   })
 
   it("does not add a blank line when the file already ends in one", () => {
     const config = join(dir(), "config.toml")
     const before = 'model = "gpt-5"\n\n'
     writeFileSync(config, before)
-    installCodex(config)
-    expect(readFileSync(config, "utf8")).toBe(`${before}${codexBlock()}\n`)
+    installCodex(config, { home })
+    expect(readFileSync(config, "utf8")).toBe(`${before}${codexBlock({ home })}\n`)
   })
 
   it("refuses settings-unreadable when the markers wrap edited content, writing nothing", () => {
     const config = join(dir(), "config.toml")
     const before = 'model = "gpt-5"\n'
     writeFileSync(config, before)
-    installCodex(config)
+    installCodex(config, { home })
     const tampered = readFileSync(config, "utf8").replace(
       /command = "[^"]*"/,
       'command = "mida-hook codex --extra"',
     )
     writeFileSync(config, tampered)
-    expect(() => installCodex(config)).toThrowError(
+    expect(() => installCodex(config, { home })).toThrowError(
       expect.objectContaining({ code: "settings-unreadable" }),
     )
     expect(readFileSync(config, "utf8")).toBe(tampered)
@@ -535,7 +543,7 @@ describe("mida install codex", () => {
     const config = join(dir(), "config.toml")
     const text = 'model = "x"\n# >>> mida hooks — managed by `mida install codex`; do not edit >>>\n'
     writeFileSync(config, text)
-    expect(() => installCodex(config)).toThrowError(
+    expect(() => installCodex(config, { home })).toThrowError(
       expect.objectContaining({ code: "settings-unreadable" }),
     )
     expect(readFileSync(config, "utf8")).toBe(text)
@@ -545,14 +553,14 @@ describe("mida install codex", () => {
     const config = join(dir(), "config.toml")
     const before = 'model = "gpt-5"\napproval_policy = "untrusted"\n'
     writeFileSync(config, before)
-    installCodex(config)
+    installCodex(config, { home })
     expect(uninstallCodex(config)).toBe("uninstalled")
     expect(readFileSync(config, "utf8")).toBe(before)
   })
 
   it("uninstall on a file created by install leaves an empty file", () => {
     const config = join(dir(), "config.toml")
-    installCodex(config)
+    installCodex(config, { home })
     expect(uninstallCodex(config)).toBe("uninstalled")
     expect(readFileSync(config, "utf8")).toBe("")
   })
@@ -568,6 +576,8 @@ describe("mida install codex", () => {
 })
 
 describe("Codex's [hooks.state] trust records inside the managed block", () => {
+  // the env value is a plain string — nothing stats it on disk
+  const home = "/mida-home"
   // Codex fingerprints hook commands and writes the records the user trusted with /hooks as
   // [hooks.state."<path>:<event>:<row>:<index>"] tables — appended after the LAST hooks table in
   // the file, which lands inside our markers, before the close marker. They are Codex's data —
@@ -598,10 +608,10 @@ describe("Codex's [hooks.state] trust records inside the managed block", () => {
 
   it("a current block plus Codex's trust records reads installed, and install is a byte-identical no-op", () => {
     const config = join(dir(), "config.toml")
-    const text = `model = "gpt-5"\n\n${withCodexState(codexBlock())}\n`
+    const text = `model = "gpt-5"\n\n${withCodexState(codexBlock({ home }))}\n`
     writeFileSync(config, text)
     expect(codexHooksStatus(config)).toBe("installed")
-    expect(installCodex(config)).toBe("already-installed")
+    expect(installCodex(config, { home })).toBe("already-installed")
     expect(readFileSync(config, "utf8")).toBe(text)
   })
 
@@ -611,12 +621,12 @@ describe("Codex's [hooks.state] trust records inside the managed block", () => {
       const before = 'model = "gpt-5"\n'
       writeFileSync(config, `${before}\n${withCodexState(legacy)}\n`)
       expect(codexHooksStatus(config)).toBe("outdated")
-      expect(installCodex(config)).toBe("installed")
+      expect(installCodex(config, { home })).toBe("installed")
       const text = readFileSync(config, "utf8")
       // bytes outside preserved, the new block written, all five records after the close marker
-      expect(text).toBe(`${before}\n${codexBlock()}\n${codexStateTables}\n`)
+      expect(text).toBe(`${before}\n${codexBlock({ home })}\n${codexStateTables}\n`)
       expect(codexHooksStatus(config)).toBe("installed")
-      expect(installCodex(config)).toBe("already-installed")
+      expect(installCodex(config, { home })).toBe("already-installed")
       expect(readFileSync(config, "utf8")).toBe(text)
     }
   })
@@ -624,7 +634,7 @@ describe("Codex's [hooks.state] trust records inside the managed block", () => {
   it("uninstall removes only our tables — all five trust records survive, including the other tool's", () => {
     const config = join(dir(), "config.toml")
     const before = 'model = "gpt-5"\n'
-    writeFileSync(config, `${before}\n${withCodexState(codexBlock())}\n`)
+    writeFileSync(config, `${before}\n${withCodexState(codexBlock({ home }))}\n`)
     expect(uninstallCodex(config)).toBe("uninstalled")
     const text = readFileSync(config, "utf8")
     expect(text).toBe(`${before}\n${codexStateTables}\n`)
@@ -637,10 +647,10 @@ describe("Codex's [hooks.state] trust records inside the managed block", () => {
     const config = join(dir(), "config.toml")
     // a newer Codex could write more than trusted_hash inside its own state tables; the table's
     // header is not one of Mida's, so the whole table is foreign data carried verbatim
-    const text = `${withCodexState(codexBlock()).replace(trustedHash("323e8107"), 'custom_field = "value"')}\n`
+    const text = `${withCodexState(codexBlock({ home })).replace(trustedHash("323e8107"), 'custom_field = "value"')}\n`
     writeFileSync(config, text)
     expect(codexHooksStatus(config)).toBe("installed")
-    expect(installCodex(config)).toBe("already-installed")
+    expect(installCodex(config, { home })).toBe("already-installed")
     expect(readFileSync(config, "utf8")).toBe(text)
     expect(uninstallCodex(config)).toBe("uninstalled")
     expect(readFileSync(config, "utf8")).toContain('custom_field = "value"')
@@ -649,11 +659,11 @@ describe("Codex's [hooks.state] trust records inside the managed block", () => {
   it("[hooks.state] with NO blank line before it still reads installed (in-16 K-3 / P1)", () => {
     const config = join(dir(), "config.toml")
     // Codex appends after the last hooks table — nothing says it adds a blank line first
-    const tight = `${codexBlock().slice(0, codexBlock().lastIndexOf("# <<< mida hooks <<<"))}${codexStateTables}\n# <<< mida hooks <<<`
+    const tight = `${codexBlock({ home }).slice(0, codexBlock({ home }).lastIndexOf("# <<< mida hooks <<<"))}${codexStateTables}\n# <<< mida hooks <<<`
     const text = `model = "gpt-5"\n\n${tight}\n`
     writeFileSync(config, text)
     expect(codexHooksStatus(config)).toBe("installed")
-    expect(installCodex(config)).toBe("already-installed")
+    expect(installCodex(config, { home })).toBe("already-installed")
     expect(readFileSync(config, "utf8")).toBe(text)
   })
 
@@ -662,11 +672,11 @@ describe("Codex's [hooks.state] trust records inside the managed block", () => {
     // doctor must not call that outdated and install/uninstall must not delete it
     const foreign = '[projects."/Users/x/newproj"]\ntrust_level = "trusted"'
     const before = 'model = "gpt-5"\n'
-    for (const block of [codexBlock(), CODEX_BLOCK]) {
+    for (const block of [codexBlock({ home }), CODEX_BLOCK]) {
       const config = join(dir(), "config.toml")
       const text = `${before}\n${block.slice(0, block.lastIndexOf("# <<< mida hooks <<<"))}\n${foreign}\n# <<< mida hooks <<<\n`
       writeFileSync(config, text)
-      const installed = installCodex(config)
+      const installed = installCodex(config, { home })
       const after = readFileSync(config, "utf8")
       expect(after).toContain("newproj")
       expect(after).toContain('trust_level = "trusted"')
@@ -685,7 +695,7 @@ describe("Codex's [hooks.state] trust records inside the managed block", () => {
   it("a foreign table, THEN state tables, THEN another foreign table — all preserved (in-16 K-3)", () => {
     const config = join(dir(), "config.toml")
     const extra = `[projects."/Users/x/newproj"]\ntrust_level = "trusted"\n\n${codexStateTables}\n\n[notice]\nhide_full_access_warning = true`
-    const text = `model = "x"\n\n${codexBlock().slice(0, codexBlock().lastIndexOf("# <<< mida hooks <<<"))}\n${extra}\n# <<< mida hooks <<<\n`
+    const text = `model = "x"\n\n${codexBlock({ home }).slice(0, codexBlock({ home }).lastIndexOf("# <<< mida hooks <<<"))}\n${extra}\n# <<< mida hooks <<<\n`
     writeFileSync(config, text)
     expect(codexHooksStatus(config)).toBe("installed")
     expect(uninstallCodex(config)).toBe("uninstalled")
@@ -698,22 +708,22 @@ describe("Codex's [hooks.state] trust records inside the managed block", () => {
 
   it("a hand edit INSIDE one of our hook tables refuses — never silently wiped (in-16 K-3 / P6)", () => {
     const config = join(dir(), "config.toml")
-    const edited = codexBlock().replace('type = "command"', 'type = "command"\ntimeout = 5')
+    const edited = codexBlock({ home }).replace('type = "command"', 'type = "command"\ntimeout = 5')
     const text = `model = "x"\n\n${edited}\n`
     writeFileSync(config, text)
     expect(codexHooksStatus(config)).toBe("unreadable")
-    expect(() => installCodex(config)).toThrowError(expect.objectContaining({ code: "settings-unreadable" }))
+    expect(() => installCodex(config, { home })).toThrowError(expect.objectContaining({ code: "settings-unreadable" }))
     expect(readFileSync(config, "utf8")).toBe(text)
     expect(() => uninstallCodex(config)).toThrowError(expect.objectContaining({ code: "settings-unreadable" }))
   })
 
   it("a foreign command line inside the markers refuses — the shape is not ours (in-16 K-3)", () => {
     const config = join(dir(), "config.toml")
-    const edited = codexBlock().replace(/command = "[^"]*"/, 'command = "other-tool hook"')
+    const edited = codexBlock({ home }).replace(/command = "[^"]*"/, 'command = "other-tool hook"')
     const text = `model = "x"\n\n${edited}\n`
     writeFileSync(config, text)
     expect(codexHooksStatus(config)).toBe("unreadable")
-    expect(() => installCodex(config)).toThrowError(expect.objectContaining({ code: "settings-unreadable" }))
+    expect(() => installCodex(config, { home })).toThrowError(expect.objectContaining({ code: "settings-unreadable" }))
     expect(readFileSync(config, "utf8")).toBe(text)
   })
 
@@ -722,24 +732,164 @@ describe("Codex's [hooks.state] trust records inside the managed block", () => {
     const lf = `model = "x"\n\n${CODEX_BLOCK.slice(0, CODEX_BLOCK.lastIndexOf("# <<< mida hooks <<<"))}\n${codexStateTables}\n# <<< mida hooks <<<\n`
     writeFileSync(config, lf.replace(/\n/g, "\r\n"))
     expect(codexHooksStatus(config)).toBe("outdated")
-    expect(installCodex(config)).toBe("installed")
+    expect(installCodex(config, { home })).toBe("installed")
     const after = readFileSync(config, "utf8")
     // no lone CR, no lone LF: every line break in the file is a full CRLF
     expect(/\r(?!\n)/.test(after)).toBe(false)
     expect(/[^\r]\n/.test(after)).toBe(false)
-    expect(after).toContain(codexBlock().replace(/\n/g, "\r\n"))
+    expect(after).toContain(codexBlock({ home }).replace(/\n/g, "\r\n"))
     expect(after.match(/trusted_hash/g)).toHaveLength(5)
     // a CRLF block that is otherwise current reads installed — not rewritten to LF
     const config2 = join(dir(), "config.toml")
-    writeFileSync(config2, `model = "x"\r\n\r\n${codexBlock().replace(/\n/g, "\r\n")}\r\n`)
+    writeFileSync(config2, `model = "x"\r\n\r\n${codexBlock({ home }).replace(/\n/g, "\r\n")}\r\n`)
     expect(codexHooksStatus(config2)).toBe("installed")
-    expect(installCodex(config2)).toBe("already-installed")
+    expect(installCodex(config2, { home })).toBe("already-installed")
     // and uninstall on the upgraded CRLF file leaves clean CRLF
     expect(uninstallCodex(config)).toBe("uninstalled")
     const un = readFileSync(config, "utf8")
     expect(/\r(?!\n)/.test(un)).toBe(false)
     expect(/[^\r]\n/.test(un)).toBe(false)
     expect(un.match(/trusted_hash/g)).toHaveLength(5)
+  })
+})
+
+describe("the codex MCP server inside the managed block (in-28)", () => {
+  const midaHome = () => join(dir(), "mida-home")
+
+  /** The hook command lines in a config — the mcp table's own command line is not a hook. */
+  const hookLines = (text: string) =>
+    text
+      .split("\n")
+      .map((line) => /^command = "([^"]*)"$/.exec(line)?.[1])
+      .filter((command): command is string => command !== undefined && parseMidaCommand(command) !== null)
+
+  it("install writes [mcp_servers.mida] inside the managed block — launcher, --as codex, MIDA_HOME, no --project", () => {
+    const config = join(dir(), "config.toml")
+    const home = midaHome()
+    expect(installCodex(config, { home })).toBe("installed")
+    const block = codexBlock({ home })
+    expect(readFileSync(config, "utf8")).toBe(`${block}\n`)
+    const lines = block.split("\n")
+    const at = lines.indexOf("[mcp_servers.mida]")
+    expect(at).toBeGreaterThan(-1)
+    expect(lines[at + 1]).toBe(`command = "${mcpLauncherPath()}"`)
+    expect(lines[at + 2]).toBe('args = ["--as", "codex"]')
+    expect(lines[at + 3]).toBe(`env = { MIDA_HOME = "${home}" }`)
+    // the table sits inside the markers, FIRST — Codex writes its trust records after the
+    // last hooks table, so anything after them is foreign content the block must survive
+    expect(at).toBe(1)
+    expect(at).toBeLessThan(lines.indexOf("[[hooks.SessionStart]]"))
+    // a CLI-agent server never carries --project: the session's own folder is the project
+    expect(block).not.toContain("--project")
+  })
+
+  it("adding the MCP table leaves every hook command line byte-identical — Codex never re-fingerprints them", () => {
+    const config = join(dir(), "config.toml")
+    const home = midaHome()
+    installCodex(config, { home, mcp: false })
+    const before = hookLines(readFileSync(config, "utf8"))
+    expect(before).toHaveLength(3)
+    expect(installCodex(config, { home })).toBe("installed")
+    const after = readFileSync(config, "utf8")
+    expect(after).toContain("[mcp_servers.mida]")
+    expect(hookLines(after)).toEqual(before)
+  })
+
+  it("--no-mcp writes the hooks-only block — installed hooks, no MCP table, no fake upgrade", () => {
+    const config = join(dir(), "config.toml")
+    const home = midaHome()
+    expect(installCodex(config, { home, mcp: false })).toBe("installed")
+    expect(readFileSync(config, "utf8")).toBe(`${codexBlock({ mcp: false })}\n`)
+    expect(codexHooksStatus(config)).toBe("installed")
+    expect(codexMcpStatus(config, home)).toBe("not-installed")
+    // a second --no-mcp run is a no-op, and a default run adds just the table
+    expect(installCodex(config, { home, mcp: false })).toBe("already-installed")
+    expect(installCodex(config, { home })).toBe("installed")
+    expect(codexMcpStatus(config, home)).toBe("installed")
+  })
+
+  it("--no-mcp never strips an existing MCP table — removal belongs to uninstall", () => {
+    const config = join(dir(), "config.toml")
+    const home = midaHome()
+    installCodex(config, { home })
+    expect(installCodex(config, { home, mcp: false })).toBe("already-installed")
+    expect(codexMcpStatus(config, home)).toBe("installed")
+  })
+
+  it("codexMcpStatus answers installed only for this build's entry at this home", () => {
+    const config = join(dir(), "config.toml")
+    const home = midaHome()
+    installCodex(config, { home })
+    expect(codexMcpStatus(config, home)).toBe("installed")
+    // the entry exists but points at another Mida home — not installed FOR this one
+    expect(codexMcpStatus(config, join(dir(), "other-home"))).toBe("not-installed")
+    expect(codexMcpStatus(join(dir(), "missing.toml"), home)).toBe("absent")
+    // uninstall removes the table with the block — only the entry named mida, only ours
+    expect(uninstallCodex(config)).toBe("uninstalled")
+    expect(readFileSync(config, "utf8")).not.toContain("mcp_servers")
+    expect(codexMcpStatus(config, home)).toBe("absent")
+  })
+
+  it("a foreign [mcp_servers.mida] outside the managed block refuses — never a duplicate table", () => {
+    const foreign = '[mcp_servers.mida]\ncommand = "/usr/bin/other"\n'
+    const config = join(dir(), "config.toml")
+    const text = `model = "x"\n\n${foreign}`
+    writeFileSync(config, text)
+    expect(() => installCodex(config, { home: midaHome() })).toThrowError(/mcp_servers\.mida/)
+    expect(readFileSync(config, "utf8")).toBe(text)
+    // and the same table after our block is just as foreign — uninstall keeps it, never deletes it
+    const config2 = join(dir(), "config.toml")
+    writeFileSync(config2, `${codexBlock({ home: midaHome() })}\n\n${foreign}`)
+    expect(uninstallCodex(config2)).toBe("uninstalled")
+    expect(readFileSync(config2, "utf8")).toContain(foreign)
+  })
+
+  it("a stale block carrying the table upgrades — hook paths re-pinned, the MCP entry rebuilt", () => {
+    const config = join(dir(), "config.toml")
+    const home = midaHome()
+    installCodex(config, { home })
+    const stale = readFileSync(config, "utf8")
+      .replace(hookCommand("codex"), "/other/checkout/mida-hook codex")
+      .replaceAll(injectCommand("codex"), "/other/checkout/mida-inject codex")
+      .replace(mcpLauncherPath(), "/other/checkout/bin/mida-mcp")
+      .replace(home, "/other/home")
+    writeFileSync(config, stale)
+    expect(codexHooksStatus(config)).toBe("outdated")
+    expect(installCodex(config, { home })).toBe("installed")
+    expect(readFileSync(config, "utf8")).toBe(`${codexBlock({ home })}\n`)
+    expect(codexMcpStatus(config, home)).toBe("installed")
+  })
+
+  it("a hand edit inside the MCP table refuses — the block is never silently repaired", () => {
+    const config = join(dir(), "config.toml")
+    const home = midaHome()
+    installCodex(config, { home })
+    const edited = readFileSync(config, "utf8").replace(
+      'args = ["--as", "codex"]',
+      'args = ["--as", "codex", "--danger"]',
+    )
+    writeFileSync(config, edited)
+    expect(codexHooksStatus(config)).toBe("unreadable")
+    expect(codexMcpStatus(config, home)).toBe("unreadable")
+    expect(() => installCodex(config, { home })).toThrowError(
+      expect.objectContaining({ code: "settings-unreadable" }),
+    )
+    expect(readFileSync(config, "utf8")).toBe(edited)
+    expect(() => uninstallCodex(config)).toThrowError(
+      expect.objectContaining({ code: "settings-unreadable" }),
+    )
+  })
+
+  it("the MCP table survives inside a CRLF file — endings kept through upgrade (in-16 K-3)", () => {
+    const config = join(dir(), "config.toml")
+    const home = midaHome()
+    writeFileSync(config, `model = "x"\r\n\r\n${CODEX_BLOCK.replace(/\n/g, "\r\n")}\r\n`)
+    expect(installCodex(config, { home })).toBe("installed")
+    const after = readFileSync(config, "utf8")
+    expect(/\r(?!\n)/.test(after)).toBe(false)
+    expect(/[^\r]\n/.test(after)).toBe(false)
+    expect(after).toContain("[mcp_servers.mida]")
+    expect(after).toContain(`env = { MIDA_HOME = "${home}" }`)
   })
 })
 
@@ -750,13 +900,13 @@ describe("the Codex trust reminder", () => {
     )
   })
 
-  const install = (config: string, settings: string, argv: string[]) => {
+  const install = (config: string, settings: string, argv: string[], midaHome = new MidaHome(join(dir(), "mida-home"))) => {
     const lines: string[] = []
     const code = runInstall(argv, {
       print: (line) => lines.push(line),
       claudeSettings: settings,
       codexConfig: config,
-      home: new MidaHome(join(dir(), "mida-home")),
+      home: midaHome,
     })
     return { code, lines }
   }
@@ -778,13 +928,16 @@ describe("the Codex trust reminder", () => {
   it("stays quiet when the config was not changed — already-installed, uninstall, claude-code", () => {
     const config = join(dir(), "config.toml")
     const settings = join(dir(), "settings.json")
-    install(config, settings, ["install", "codex"])
-    const again = install(config, settings, ["install", "codex"])
+    // the same Mida home across the repeat install — a different home means a different
+    // MIDA_HOME env line, which IS a block change
+    const midaHome = new MidaHome(join(dir(), "mida-home"))
+    install(config, settings, ["install", "codex"], midaHome)
+    const again = install(config, settings, ["install", "codex"], midaHome)
     expect(again.lines).toContain("already installed")
     expect(again.lines).not.toContain(CODEX_TRUST_SENTENCE)
-    const removed = install(config, settings, ["uninstall", "codex"])
+    const removed = install(config, settings, ["uninstall", "codex"], midaHome)
     expect(removed.lines).not.toContain(CODEX_TRUST_SENTENCE)
-    const claude = install(config, settings, ["install", "claude-code"])
+    const claude = install(config, settings, ["install", "claude-code"], midaHome)
     expect(claude.lines).not.toContain(CODEX_TRUST_SENTENCE)
   })
 })
