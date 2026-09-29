@@ -117,12 +117,15 @@ const addTimeline = (
     contextId: subjects.contextId === undefined ? undefined : lc(subjects.contextId),
   })
 
-// OUR_OPERATORS: comma-separated addresses that belong to us and do NOT count
-// as traction. Parsed per event so deployments can change it without a rebuild.
-// An empty/unset list means every operator counts as outside (README warns loudly).
+// ENVIO_OUR_OPERATORS: comma-separated addresses that belong to us and do NOT count
+// as traction. Envio Cloud only passes environment variables whose names start with
+// ENVIO_, so that is the name to set there; OUR_OPERATORS is still read, for local
+// runs, when ENVIO_OUR_OPERATORS is unset. Parsed per event so deployments can change
+// it without a rebuild. An empty/unset list means every operator counts as outside
+// (README warns loudly).
 const ourOperators = () =>
   new Set(
-    (process.env.OUR_OPERATORS ?? "")
+    (process.env.ENVIO_OUR_OPERATORS ?? process.env.OUR_OPERATORS ?? "")
       .split(",")
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean),

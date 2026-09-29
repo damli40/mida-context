@@ -60,6 +60,7 @@ const capabilityGranted = (
 
 afterEach(() => {
   delete process.env.OUR_OPERATORS
+  delete process.env.ENVIO_OUR_OPERATORS
 })
 
 describe("AgentRegistered", () => {
@@ -99,6 +100,32 @@ describe("AgentRegistered", () => {
     expect(stats?.agentsByOutsideOperators).toBe(1)
     expect((await idx.Agent.get(AGENT))?.isOutsideOperator).toBe(false)
     expect((await idx.Agent.get(bytes32(0x4002)))?.isOutsideOperator).toBe(true)
+  })
+
+  it("does not count an operator listed in ENVIO_OUR_OPERATORS as outside", async () => {
+    process.env.ENVIO_OUR_OPERATORS = `${OPERATOR},${addr(0x9999)}`
+    const idx = newIndexer()
+    await run(idx, [
+      agentRegistered({ tx: 1, block: B }),
+      agentRegistered({ tx: 2, block: B + 1, agentId: bytes32(0x4002), operator: addr(0x7777) }),
+    ])
+
+    const stats = await idx.GlobalStats.get("global")
+    expect(stats?.agents).toBe(2)
+    expect(stats?.operators).toBe(2)
+    expect(stats?.agentsByOutsideOperators).toBe(1)
+    expect((await idx.Agent.get(AGENT))?.isOutsideOperator).toBe(false)
+    expect((await idx.Agent.get(bytes32(0x4002)))?.isOutsideOperator).toBe(true)
+  })
+
+  it("prefers ENVIO_OUR_OPERATORS over OUR_OPERATORS when both are set", async () => {
+    process.env.ENVIO_OUR_OPERATORS = addr(0x9999)
+    process.env.OUR_OPERATORS = OPERATOR
+    const idx = newIndexer()
+    await run(idx, [agentRegistered({ tx: 1, block: B })])
+
+    expect((await idx.GlobalStats.get("global"))?.agentsByOutsideOperators).toBe(1)
+    expect((await idx.Agent.get(AGENT))?.isOutsideOperator).toBe(true)
   })
 
   it("counts every operator as outside when OUR_OPERATORS is empty", async () => {
