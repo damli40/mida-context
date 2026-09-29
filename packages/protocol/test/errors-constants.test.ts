@@ -94,8 +94,8 @@ describe("UNACCEPTABLE_REQUEST_CHARS (in-30 T-3)", () => {
   it("accepts the joiners — a ZWNJ inside a Persian name, a ZWJ inside an emoji sequence (in-31 V-3)", () => {
     // می‌خواهم is می + ZWNJ (200C) + خواهم — the non-joiner is ordinary Persian spelling.
     // 👨‍💻 is held together by a ZWJ (200D). Neither forges a line nor hides inside one.
-    expect(UNACCEPTABLE_REQUEST_CHARS.test("می\u200cخواهم")).toBe(false)
-    expect(UNACCEPTABLE_REQUEST_CHARS.test("👨\u200d💻 helper")).toBe(false)
+    expect(UNACCEPTABLE_REQUEST_CHARS.test("می‌خواهم")).toBe(false)
+    expect(UNACCEPTABLE_REQUEST_CHARS.test("👨‍💻 helper")).toBe(false)
   })
 
   it("displaySafeText folds each refused character to a single space — for fields that are shown, not refused", () => {
@@ -105,15 +105,29 @@ describe("UNACCEPTABLE_REQUEST_CHARS (in-30 T-3)", () => {
 })
 
 /**
- * The one agent-name rule, shared by the manifest validator, the owner-link parser and /me
- * (in-32 X-2): the whole UNACCEPTABLE_REQUEST_CHARS surface plus the name-specific extras —
- * the Arabic letter mark the old set missed, the invisible formatters 2060–2064 and the tag
- * characters E0000–E007F, and `"` with every look-alike the summary's `Agent "…"` could be
- * forged through.
+ * The one agent-name rule, shared by the manifest validator, the owner-link parser and /me —
+ * an ALLOW-LIST, not a deny-list (in-34): letters in any script, combining marks, numbers,
+ * space, dot, underscore, hyphen and the two joiners — the first character a letter, mark or
+ * number. Every quote shape (including the fifteen look-alikes in-32's ban list missed),
+ * every bracket, colon, apostrophe, symbol, control and format character is refused simply
+ * by not being listed — the in-33 probe's U+05F4 shape can no longer slip through.
  */
-describe("isAcceptableAgentName (in-32 X-2)", () => {
+describe("isAcceptableAgentName (in-34: allow-list)", () => {
   // fromCodePoint, not fromCharCode — the tag characters live above the BMP.
   const chr = (cp: number) => String.fromCodePoint(cp)
+
+  it("accepts the names real agents carry — hyphenated ids, spaced names, dots, underscores, CJK", () => {
+    for (const name of ["claude-code", "codex", "claude-desktop", "Claude Code", "agent v2.1_beta", "中文字符"]) {
+      expect(isAcceptableAgentName(name), name).toBe(true)
+    }
+  })
+
+  it("accepts the joiners and combining marks — Persian ZWNJ spelling, Indic marks (in-31 V-3)", () => {
+    // می‌خواهم is می + ZWNJ (200C) + خواهم — the non-joiner is ordinary Persian spelling —
+    // and हिन्दी needs Devanagari's combining marks (ि Mc, ् Mn, ी Mc). Both stay legal.
+    expect(isAcceptableAgentName("می‌خواهم")).toBe(true)
+    expect(isAcceptableAgentName("हिन्दी एजेंट")).toBe(true)
+  })
 
   it.each([
     ["control", chr(0x0a)],
@@ -130,6 +144,7 @@ describe("isAcceptableAgentName (in-32 X-2)", () => {
     ["byte order mark", chr(0xfeff)],
     ["tag character", chr(0xe0020)],
     ["straight double quote", chr(0x22)],
+    ["straight single quote / apostrophe", chr(0x27)],
     ["look-alike quote U+201C", chr(0x201c)],
     ["look-alike quote U+201D", chr(0x201d)],
     ["look-alike quote U+201E", chr(0x201e)],
@@ -140,13 +155,56 @@ describe("isAcceptableAgentName (in-32 X-2)", () => {
     ["look-alike quote U+301D", chr(0x301d)],
     ["look-alike quote U+301E", chr(0x301e)],
     ["look-alike quote U+301F", chr(0x301f)],
+    // The double-quote look-alikes in-32's ban list missed and in-33's probe found. Under an
+    // allow-list they need no entries of their own — they stay pinned anyway. Two of the
+    // fifteen, U+02BA and U+02EE, are \p{Lm} letters, so the letter class honestly admits
+    // them — they are modifier letters, not punctuation, and cannot close a quote run.
+    ["Hebrew gershayim U+05F4", chr(0x05f4)],
+    ["double acute U+02DD", chr(0x02dd)],
+    ["modifier middle double acute U+02F5", chr(0x02f5)],
+    ["modifier middle double grave U+02F6", chr(0x02f6)],
+    ["Vedic sign U+1CD3", chr(0x1cd3)],
+    ["heavy double comma ornament U+275D", chr(0x275d)],
+    ["heavy double ornament U+275E", chr(0x275e)],
+    ["heavy low comma ornament U+275F", chr(0x275f)],
+    ["heavy low ornament U+2760", chr(0x2760)],
+    ["double low-reversed-9 U+2E42", chr(0x2e42)],
+    ["sans-serif double quote U+1F676", chr(0x1f676)],
+    ["sans-serif heavy double quote U+1F677", chr(0x1f677)],
+    ["sans-serif low double quote U+1F678", chr(0x1f678)],
   ])("refuses a name carrying %s", (_label, char) => {
     expect(isAcceptableAgentName(`a${char}b`)).toBe(false)
   })
 
+  it("refuses the review's attack names — colons, brackets and quote look-alikes alike (in-34)", () => {
+    for (const name of [
+      "x״ Advisor", // U+05F4 — the shape in-32's deny-list missed
+      "Advisor: low risk.",
+      `x" (run by`,
+      "a)b",
+      "a(b",
+      "a[b",
+      "a'b",
+    ]) {
+      expect(isAcceptableAgentName(name), name).toBe(false)
+    }
+  })
+
+  it("refuses symbols the deny-list used to accept — emoji, check marks, dashes beyond the hyphen (in-34)", () => {
+    // 👨‍💻 helper passed the deny-list because no emoji was banned; an emoji is a symbol,
+    // not a letter or mark, so the allow-list refuses it. Same for the em dash and ✓.
+    expect(isAcceptableAgentName("👨‍💻 helper")).toBe(false)
+    expect(isAcceptableAgentName("claude — agent")).toBe(false)
+    expect(isAcceptableAgentName("agent ✓")).toBe(false)
+  })
+
   it("refuses a name that is nothing but whitespace and joiners — it would render as `Agent \"\"`", () => {
     expect(isAcceptableAgentName("  \t ")).toBe(false)
-    expect(isAcceptableAgentName("\u200c\u200d")).toBe(false)
+    expect(isAcceptableAgentName(" ‌‍")).toBe(false)
+    // A name cannot open with a space or a joiner either — the first character is a letter,
+    // mark or number.
+    expect(isAcceptableAgentName(" codex")).toBe(false)
+    expect(isAcceptableAgentName("‌codex")).toBe(false)
   })
 
   it("refuses the rest of the format characters too — an invisible-only name cannot be built (in-33)", () => {
@@ -157,17 +215,9 @@ describe("isAcceptableAgentName (in-32 X-2)", () => {
       expect(isAcceptableAgentName(`a${chr(cp)}b`), `U+${cp.toString(16)} inside a name`).toBe(false)
       expect(isAcceptableAgentName(chr(cp)), `U+${cp.toString(16)} as the whole name`).toBe(false)
     }
-    // The carve-out: the joiners alone must still pass — Persian spelling and emoji sequences
-    // depend on them (in-31 V-3).
-    expect(isAcceptableAgentName("می\u200cخواهم")).toBe(true)
-    expect(isAcceptableAgentName("👨\u200d💻 helper")).toBe(true)
-  })
-
-  it("accepts ordinary names — plain words, dashes, CJK, and the joiners inside a name", () => {
-    expect(isAcceptableAgentName("claude-code — plain text 中文字符 ✓")).toBe(true)
-    // می‌خواهم is می + ZWNJ (200C) + خواهم — the non-joiner is ordinary Persian spelling, and
-    // 👨‍💻 is held together by a ZWJ (200D). Both stay legal inside a name (in-31 V-3).
-    expect(isAcceptableAgentName("می\u200cخواهم")).toBe(true)
-    expect(isAcceptableAgentName("👨\u200d💻 helper")).toBe(true)
+    // The carve-out: the joiners stay legal inside a name — Persian spelling and Indic
+    // conjuncts depend on them (in-31 V-3).
+    expect(isAcceptableAgentName("می‌خواهم")).toBe(true)
+    expect(isAcceptableAgentName("क्‍षकार")).toBe(true)
   })
 })

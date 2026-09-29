@@ -172,11 +172,27 @@ describe("manifest limits and structure (§14.1)", () => {
     )
   })
 
-  it("accepts the joiners in a name — a Persian ZWNJ and an emoji ZWJ sequence (in-31 V-3)", () => {
-    // می‌خواهم is ordinary Persian spelling (the 200C non-joiner splits می from خواهم); 👨‍💻 is
-    // a 200D-joined emoji sequence. The zero-width space stays refused (row above).
+  it("accepts the joiners and combining marks in a name — a Persian ZWNJ and an Indic name (in-31 V-3, in-34)", () => {
+    // می‌خواهم is ordinary Persian spelling (the 200C non-joiner splits می from خواهم);
+    // हिन्दी सहायक needs Devanagari's combining marks. The zero-width space stays refused.
     expect(() => validateManifestBody(invalidBody({ name: "می\u200cخواهم" }), NOW)).not.toThrow()
-    expect(() => validateManifestBody(invalidBody({ name: "👨\u200d💻 helper" }), NOW)).not.toThrow()
+    expect(() => validateManifestBody(invalidBody({ name: "हिन्दी सहायक" }), NOW)).not.toThrow()
+  })
+
+  it("rejects a name outside the allow-list — an emoji ZWJ sequence is a symbol, not letters (in-34)", () => {
+    // 👨‍💻 helper passed the old deny-list — no emoji was on it. The allow-list admits only
+    // letters, marks, numbers, space/dot/underscore/hyphen and the joiners, so the emoji make
+    // the name refuse with the same fixed sentence.
+    let caught: unknown
+    try {
+      validateManifestBody(invalidBody({ name: "👨\u200d💻 helper" }), NOW)
+    } catch (error) {
+      caught = error
+    }
+    expect(isMidaError(caught, "INVALID_WIRE")).toBe(true)
+    expect((caught as Error).message).toBe(
+      "This request contains characters Mida does not accept, so this page will not show or sign it.",
+    )
   })
 
   it("does NOT refuse display-only fields — a description or reason carrying the characters still loads (in-30 T-3)", () => {
@@ -243,7 +259,7 @@ describe("signed manifest verification (§14.1, §15 Advisor rows)", () => {
 
   it("rejects a body mutated after signing", async () => {
     const envelope = await signManifest(manifestBody())
-    const mutated = { ...envelope, manifest: { ...envelope.manifest, name: "CareerAI (all access)" } }
+    const mutated = { ...envelope, manifest: { ...envelope.manifest, name: "CareerAI all-access" } }
     expect(failsWith("MANIFEST_HASH_MISMATCH", () => verify(mutated))).toBe(true)
   })
 
