@@ -1,5 +1,5 @@
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Give your agent the memory a user approved: read and write it through the user's Mida.",
   "type": "module",
   "license": "MIT",

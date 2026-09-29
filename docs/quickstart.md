@@ -18,7 +18,7 @@ Until the package is published, pack it from the repo and install the tarball:
 cd mida-context
 pnpm install && pnpm build:publish
 cd publish/cli && npm pack
-npm install -g mida-context-0.1.0.tgz
+npm install -g mida-context-0.1.1.tgz
 ```
 
 Expected output (the file count may differ; the bin links are the point):
