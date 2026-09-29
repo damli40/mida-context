@@ -9,6 +9,7 @@ import {
   HOOK_COMMAND,
   INJECT_COMMAND,
   MidaHome,
+  USAGE,
   claudeCodeMcpJson,
   claudeHooksStatus,
   codexBlock,
@@ -1792,6 +1793,16 @@ describe("runInstall for the clients", () => {
     expect(code).toBe(0)
     expect(lines[0]).toBe("uninstalled")
     expect(JSON.parse(readFileSync(cursorMcpConfigPath(work), "utf8"))).toEqual({})
+  })
+
+  it("install <client> --no-mcp is usage, not the owner-command refusal — for them the server is the whole install (F-7)", () => {
+    for (const client of ["claude-desktop", "cursor"]) {
+      const { code, lines } = run(["install", client, "--no-mcp"], { cwd: dir() })
+      expect(code).toBe(2)
+      // USAGE — never the owner-command line the bare form gets, which would tell the user
+      // the refusal is about where they ran it, not about the flag being meaningless here
+      expect(lines).toEqual([USAGE])
+    }
   })
 
   it("install <client> is refused here — the identity half belongs to the owner command", () => {

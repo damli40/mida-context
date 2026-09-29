@@ -2278,9 +2278,11 @@ export function runInstall(
 ): number {
   const tool = argv[1] ?? ""
   // --no-mcp is an install flag: it names exactly what it skips. On uninstall there is nothing
-  // to skip — the entry goes with the hooks — so the flag is usage there.
+  // to skip — the entry goes with the hooks — so the flag is usage there. For the MCP-only
+  // clients the server IS the whole install, so skipping it makes the command do nothing:
+  // usage too, and it must be named before the owner-command check claims a different reason.
   const noMcp = argv.length === 3 && argv[2] === "--no-mcp"
-  if (!INSTALL_TOOLS.includes(tool) || (argv.length !== 2 && !(argv[0] === "install" && noMcp))) {
+  if (!INSTALL_TOOLS.includes(tool) || (argv.length !== 2 && !(argv[0] === "install" && noMcp)) || (noMcp && MCP_CLIENT_TOOLS.includes(tool))) {
     deps.print(USAGE)
     return 2
   }
