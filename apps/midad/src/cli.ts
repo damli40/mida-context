@@ -21,7 +21,7 @@ import { buildHandoff, generalAssistanceText, identityUnreadableText, isGeneralA
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { agoText } from "./hook-output.js"
-import { CODEX_TRUST_SENTENCE, InstallRefusal, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installClaudeCodeMcp, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, spawnClaude, uninstallClaudeCode, uninstallClaudeCodeMcp, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
+import { CODEX_TRUST_SENTENCE, InstallRefusal, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, claudeUserConfigPath, cursorMcpConfigPath, installClaudeCode, installClaudeCodeMcp, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, spawnClaude, uninstallClaudeCode, uninstallClaudeCodeMcp, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
 import type { ClaudeCliRunner } from "./install.js"
 import { resolveDevinConfigPath } from "./devin-facts.js"
 import type { InstallTool, McpClientTool } from "./install.js"
@@ -2335,7 +2335,7 @@ export function runInstall(
     if (tool === "claude-code") {
       const claudeOpts = {
         home: deps.home.root,
-        userConfig: deps.claudeUserConfig ?? join(homedir(), ".claude.json"),
+        userConfig: deps.claudeUserConfig ?? claudeUserConfigPath(process.env, homedir()),
         run: deps.claudeCli ?? spawnClaude,
       }
       if (argv[0] === "install" && !noMcp) mcp = installClaudeCodeMcp(claudeOpts)

@@ -473,6 +473,27 @@ describe("mida doctor without a chain", () => {
     expect(installed).toContain("note: devin MCP server not installed. Run mida install devin.")
   })
 
+  it("reads .claude.json under CLAUDE_CONFIG_DIR — the same file install wrote (F-3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const settings = join(dir(), "settings.json")
+    const claudeConfigDir = join(dir(), "claude-config")
+    mkdirSync(claudeConfigDir, { recursive: true })
+    installClaudeCode(settings)
+    writeFileSync(
+      join(claudeConfigDir, ".claude.json"),
+      JSON.stringify({ mcpServers: { mida: JSON.parse(claudeCodeMcpJson(home.root)) } }),
+    )
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: { "claude-code": settings },
+      env: { CLAUDE_CONFIG_DIR: claudeConfigDir },
+      daemonProbeMs: 50,
+    })
+    expect(lines).toContain("ok: claude-code MCP server installed")
+  })
+
   it("a tool without installed hooks gets no MCP line — the hook problem owns the fix", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const devinDir = join(dir(), "devin")

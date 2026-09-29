@@ -22,7 +22,7 @@ import type { MidaHome } from "./home.js"
 import { DEVIN_NODE_SQLITE_MIN } from "./devin-facts.js"
 import { drainerEnv } from "./hook.js"
 import { sessionWaits } from "./drain.js"
-import { CODEX_TRUST_SENTENCE, claudeCodeMcpStatus, claudeDesktopConfigPath, claudeHooksStatus, codexHooksStatus, codexMcpStatus, cursorMcpConfigPath, devinHooksStatus, installedMcpLauncherPath, macosProtectedFolderNote, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
+import { CODEX_TRUST_SENTENCE, claudeCodeMcpStatus, claudeDesktopConfigPath, claudeHooksStatus, claudeUserConfigPath, codexHooksStatus, codexMcpStatus, cursorMcpConfigPath, devinHooksStatus, installedMcpLauncherPath, macosProtectedFolderNote, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
 import type { InstallTool, McpClientTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
@@ -696,7 +696,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           // names the one command that adds it. Only "installed" earns the line: the
           // problem lines for every other status already end in the same install command.
           if (status === "installed") {
-            const userConfig = deps.claudeUserConfig ?? join(deps.homeDir ?? homedir(), ".claude.json")
+            const userConfig = deps.claudeUserConfig ?? claudeUserConfigPath(env, deps.homeDir ?? homedir())
             lines.push(
               claudeCodeMcpStatus(userConfig, home.root) === "installed"
                 ? "ok: claude-code MCP server installed"

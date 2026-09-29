@@ -115,6 +115,7 @@ export {
   claudeCodeMcpStatus,
   claudeDesktopConfigPath,
   claudeHooksStatus,
+  claudeUserConfigPath,
   codexBlock,
   codexHooksStatus,
   codexMcpStatus,

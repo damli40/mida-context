@@ -1105,6 +1105,47 @@ describe("the claude-code MCP server through the claude CLI (in-28)", () => {
     ])
   })
 
+  it("honours CLAUDE_CONFIG_DIR — a second install finds the entry the first one wrote there (F-3)", () => {
+    // Claude Code keeps .claude.json under CLAUDE_CONFIG_DIR when it is set, not under the
+    // account home — a Mida that reads <home>/.claude.json adds the same entry on every install
+    // because it never finds the one the claude CLI just wrote. No claudeUserConfig dep here:
+    // the default resolution is the thing under test.
+    const claudeConfigDir = join(dir(), "claude-config")
+    mkdirSync(claudeConfigDir, { recursive: true })
+    const previous = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = claudeConfigDir
+    try {
+      const settings = join(dir(), "settings.json")
+      const home = new MidaHome(midaHome())
+      const calls: string[][] = []
+      const deps = (run: (args: string[]) => { status: number }) => ({
+        print: () => {},
+        claudeSettings: settings,
+        codexConfig: join(dir(), "config.toml"),
+        home,
+        claudeCli: run,
+      })
+      const writer = (args: string[]) => {
+        calls.push(args)
+        // the real claude writes the entry on add-json — the fake does it at the path Claude
+        // Code itself resolves, under CLAUDE_CONFIG_DIR
+        if (args[1] === "add-json") {
+          writeFileSync(join(claudeConfigDir, ".claude.json"), JSON.stringify({ mcpServers: { mida: JSON.parse(args[5]!) } }))
+        }
+        return { status: 0 }
+      }
+      expect(runInstall(["install", "claude-code"], deps(writer))).toBe(0)
+      expect(calls.map((a) => a[1])).toEqual(["add-json"])
+      calls.length = 0
+      expect(runInstall(["install", "claude-code"], deps(writer))).toBe(0)
+      // the second install found the entry the first one wrote — the claude CLI is not called
+      expect(calls).toHaveLength(0)
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previous
+    }
+  })
+
   it("--no-mcp never reaches for the claude binary at all", () => {
     const settings = join(dir(), "settings.json")
     const home = new MidaHome(midaHome())

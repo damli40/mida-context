@@ -211,6 +211,17 @@ export function claudeCodeMcpJson(homeRoot: string): string {
 }
 
 /**
+ * Where Claude Code keeps the user config that lists MCP servers: `$CLAUDE_CONFIG_DIR/.claude.json`
+ * when the variable is set non-empty, else `<home>/.claude.json`. Every Mida reader resolves it
+ * through here — a user who set the variable would otherwise watch every `mida install
+ * claude-code` add the entry again, because the file it just wrote is never the file Mida read.
+ */
+export function claudeUserConfigPath(env: NodeJS.ProcessEnv, homeDir: string): string {
+  const configured = env.CLAUDE_CONFIG_DIR
+  return configured !== undefined && configured !== "" ? join(configured, ".claude.json") : join(homeDir, ".claude.json")
+}
+
+/**
  * The mida entry in Claude Code's user config — READ ONLY. Claude Code owns ~/.claude.json
  * and rewrites it constantly, so Mida never writes that file; the read exists only to check
  * "is the mida entry ours" before the claude CLI is asked to add or remove. An unreadable
