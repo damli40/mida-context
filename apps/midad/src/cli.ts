@@ -43,9 +43,10 @@ import type { ListOwner, ProjectApproval, ProjectCheck, ProjectUnlinkPlan } from
 import { projectIdFor } from "./queue.js"
 import { DEFAULT_FACT_NAMESPACE, attemptNamespaceRead, factShortId, factStamp, readOwnerFacts, remember, resolveFactId } from "./remember.js"
 import type { FactNamespace } from "./remember.js"
-import { Runtime, NAMESPACE, PURPOSE_ID, ServiceRuntime } from "./runtime.js"
+import { Runtime, HOSTED_SPONSOR_URL, NAMESPACE, PURPOSE_ID, ServiceRuntime, parseSponsorUrl } from "./runtime.js"
 import type { Network } from "./runtime.js"
-import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag } from "./network.js"
+import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag, setSponsorUrl } from "./network.js"
+import { resetOutOfGasWaits } from "./drain.js"
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
 import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, pendingApprovalAdvice, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint } from "./skeleton.js"
@@ -89,10 +90,10 @@ const ADD_AGENT_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/
  */
 const BUILTIN_AGENT_NAMES: ReadonlySet<string> = new Set([...AGENTS, ...INSTALL_TOOLS])
 export const USAGE =
-  "usage: mida init | install <tool> | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>" +
+  "usage: mida init | install <tool> | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | sponsor on|off | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>" +
   "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or any identity add-agent or a client install provisions)"
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
-export const CLI_COMMANDS: readonly string[] = ["init", "install", "add-agent", "remember", "migrate", "batching", "link", "unlink", "project", "task", "export", ...WITH_AGENT]
+export const CLI_COMMANDS: readonly string[] = ["init", "install", "add-agent", "remember", "migrate", "batching", "sponsor", "link", "unlink", "project", "task", "export", ...WITH_AGENT]
 /**
  * The commands that change who has access — or which folder belongs to which project. Only `mida`
  * in the owner's own terminal may run them: they never go to the daemon socket. `install` for an
@@ -101,9 +102,9 @@ export const CLI_COMMANDS: readonly string[] = ["init", "install", "add-agent", 
  * sign only the owner list, `project new` writes only a marker — they never open the runtime. `export`
  * changes nothing, but it decrypts everything, so it is the owner's alone too.
  */
-export const OWNER_COMMANDS: readonly string[] = ["init", "install", "add-agent", "approve", "revoke", "remember", "migrate", "batching", "link", "unlink", "project", "export"]
+export const OWNER_COMMANDS: readonly string[] = ["init", "install", "add-agent", "approve", "revoke", "remember", "migrate", "batching", "sponsor", "link", "unlink", "project", "export"]
 /** The owner commands that must see a real terminal. `init` is exempt: it grants nothing to an agent. */
-export const TERMINAL_COMMANDS: readonly string[] = ["install", "add-agent", "approve", "revoke", "remember", "migrate", "batching", "link", "unlink", "project", "export"]
+export const TERMINAL_COMMANDS: readonly string[] = ["install", "add-agent", "approve", "revoke", "remember", "migrate", "batching", "sponsor", "link", "unlink", "project", "export"]
 export const NEEDS_TERMINAL_LINE = "needs-terminal: run this yourself in a terminal window"
 
 /** What the daemon answers when an owner command reaches /cli anyway. */
@@ -150,6 +151,13 @@ export interface CliDeps {
    * running cannot be kicked, and a failed kick never fails the command. Injectable in tests.
    */
   kickDaemon?: () => unknown | Promise<unknown>
+  /**
+   * After a confirmed `sponsor on|off` the running service is replaced, not kicked: the sponsor
+   * address is loaded into the send path when the service opens, so only a fresh start reads
+   * the new file. The default shuts the answering service down and spawns a new one; a service
+   * that is not running is not started. Best-effort, like the kick. Injectable in tests.
+   */
+  restartDaemon?: () => unknown | Promise<unknown>
   /**
    * One plain line before each slow step — registering keys, opening namespaces, sending
    * transactions, republishing reader wraps. The default writes the line to STDERR, so nothing
@@ -1008,6 +1016,8 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       deps.print(`next: run \`mida approve ${client}\` in this folder`)
     } else if (command === "batching") {
       return await runBatching(runtime, argv[1], deps)
+    } else if (command === "sponsor") {
+      return await runSponsor(runtime, argv[1], deps)
     } else if (command === "revoke" && agent === "--all") {
       if (argv.length !== 2) return usage()
       return await revokeAll(runtime, deps)
@@ -1207,6 +1217,39 @@ async function kickDaemonNow(deps: CliDeps): Promise<void> {
   await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
 }
 
+/** How long a service is given to leave after POST /shutdown before `sponsor` gives up on it — the same ten seconds ensureCurrentDaemon allows a replaced service. */
+const SPONSOR_STOP_WAIT_MS = 10_000
+
+/**
+ * The service poke `runCli` sends after a confirmed `sponsor on|off`. Batching's flag is re-read
+ * from network.json on every save, so a `/kick` suffices for it; the sponsor URL is bound into
+ * the send path when the service opens, so the answering service has to be replaced: POST
+ * /shutdown, poll /health until it goes quiet, then the same detached spawn `mida init` uses. A
+ * service that never answered is not started — the next mida command's ensureCurrentDaemon opens
+ * one that reads the new file. Best-effort like the kick: a service that will not stop is left
+ * alone rather than fought (the change lands on its next start), and a failure never fails the
+ * command. Injectable via `deps.restartDaemon`.
+ */
+async function restartDaemonNow(deps: CliDeps): Promise<void> {
+  if (deps.restartDaemon !== undefined) {
+    await Promise.resolve(deps.restartDaemon()).catch(() => {})
+    return
+  }
+  const health = await callDaemon(deps.home, "/health", undefined, { timeoutMs: 500 })
+  if (health.status === 0) return
+  await callDaemon(deps.home, "/shutdown", {}, { timeoutMs: 2_000 })
+  const deadline = Date.now() + SPONSOR_STOP_WAIT_MS
+  for (;;) {
+    const reply = await callDaemon(deps.home, "/health", undefined, { timeoutMs: 500 })
+    if (reply.status === 0) {
+      spawnDaemon(deps.home.root)
+      return
+    }
+    if (Date.now() >= deadline) return
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+}
+
 /**
  * The agents `revoke --all` lists: every `agents/*` folder that still holds an approval — a live
  * capability on chain, or a grants.json left by a grant that completed while no revoked marker says
@@ -1374,6 +1417,61 @@ async function runBatching(runtime: ServiceRuntime, arg: string | undefined, dep
   }
   setBatchingFlag(runtime.home, true)
   deps.print("batching is on")
+  return 0
+}
+
+/**
+ * `mida sponsor on|off` — the switch between the hosted gas sponsor and self-paid gas, for
+ * setups made before the sponsor existed. `on` writes the sponsor URL this build ships into
+ * network.json (MIDA_SPONSOR_URL still wins over the file while it is set); `off` removes the
+ * pair. Either way every other byte of the file survives, and the service restart that applies
+ * the change happens after this returns — the sponsor lives in the send path the service built
+ * when it opened, so a kick cannot reach it. `on` also clears recorded out-of-gas waits: a
+ * session that was waiting out a dry wallet can save on the next pass (in-29 S-2).
+ */
+async function runSponsor(runtime: ServiceRuntime, arg: string | undefined, deps: CliDeps): Promise<number> {
+  if (arg !== "on" && arg !== "off") {
+    deps.print(USAGE)
+    return 2
+  }
+  let saved
+  try {
+    saved = readSavedNetwork(runtime.home)
+  } catch {
+    deps.print(`sponsor cannot be turned ${arg}: network.json could not be read`)
+    return 1
+  }
+  if (saved === undefined) {
+    deps.print(`sponsor cannot be turned ${arg}: there is no network.json to switch — run \`mida init\` first`)
+    return 1
+  }
+  const prompt = deps.prompt ?? terminalPrompt
+  const drain = deps.drainInput ?? drainBufferedStdin
+  if (arg === "off") {
+    await drain()
+    if ((await prompt("Type yes to turn the sponsor off: ")).trim() !== "yes") {
+      deps.print("not approved")
+      return 1
+    }
+    setSponsorUrl(runtime.home, undefined)
+    deps.print("gas sponsor off: your wallets pay their own gas")
+    return 0
+  }
+  // the value written is the hosted sponsor the build knows — validated by the same rule the
+  // send path applies, so a malformed shipped constant can never land in the file
+  const sponsorUrl = parseSponsorUrl(HOSTED_SPONSOR_URL)!
+  const host = hostOf(sponsorUrl)
+  deps.print(
+    `Your saves and grants will use the gas sponsor at ${host}, so your wallets stop paying. Your wallets keep what they hold as a fallback.`,
+  )
+  await drain()
+  if ((await prompt("Type yes to turn the sponsor on: ")).trim() !== "yes") {
+    deps.print("not approved")
+    return 1
+  }
+  setSponsorUrl(runtime.home, sponsorUrl)
+  resetOutOfGasWaits(runtime.home)
+  deps.print(`gas sponsor on: ${host}`)
   return 0
 }
 
@@ -1677,6 +1775,17 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
       try {
         session.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
         return await runBatching(session, argv[1], deps)
+      } finally {
+        await session.close()
+      }
+    }
+    if (command === "sponsor") {
+      // same story as batching: the switch only edits network.json, no owner signature — a
+      // passkey home's gas payer is decided by that file too, so the command applies
+      const session = await ServiceRuntime.openOwnerSession(deps.home, deps.network)
+      try {
+        session.progress = deps.progress ?? ((line) => process.stderr.write(`${line}\n`))
+        return await runSponsor(session, argv[1], deps)
       } finally {
         await session.close()
       }
@@ -2106,6 +2215,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     if (code === 0 && (command === "approve" || command === "revoke" || command === "batching")) {
       await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
     }
+    if (code === 0 && command === "sponsor") await restartDaemonNow(deps)
     return code
   }
   if (mode === "passkey") {
@@ -2137,6 +2247,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     if (code === 0 && (command === "approve" || command === "revoke" || command === "batching")) {
       await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
     }
+    if (code === 0 && command === "sponsor") await restartDaemonNow(deps)
     return code
   } finally {
     await runtime.close()

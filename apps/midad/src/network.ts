@@ -257,24 +257,9 @@ export async function serviceNetwork(
  * unparsable file is a refusal, never a rewrite.
  */
 export function setBatchingFlag(home: MidaHome, on: boolean): void {
-  const file = home.path("network.json")
-  let text: string
-  try {
-    text = readFileSync(file, "utf8")
-  } catch {
-    throw codedError("network-json-invalid", "network.json is missing or unreadable")
-  }
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    throw codedError("network-json-invalid", "network.json could not be parsed")
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw codedError("network-json-invalid", "network.json is not a JSON object")
-  }
+  const { file, text, parsed } = readNetworkObject(home)
   const value = on ? "true" : "false"
-  const span = batchingSpan(text)
+  const span = fieldSpan(text, "batching")
   let next: string | undefined
   if (Object.hasOwn(parsed, "batching")) {
     if (span?.kind === "replace") next = text.slice(0, span.start) + value + text.slice(span.end)
@@ -296,16 +281,88 @@ export function setBatchingFlag(home: MidaHome, on: boolean): void {
 }
 
 /**
- * Where the top-level `"batching"` key sits inside a JSON object's raw text. `replace` is the
- * existing value's span; `insert-pair` splices `"batching": <v>,` before the first key, reusing
- * that key's leading whitespace so the file keeps its own layout; `insert-value` is the empty
- * object. Keys are matched as raw text at depth 1 only — a `"batching"` nested inside another
- * field is never touched. null when the text is not a well-formed object; the caller then
- * rewrites the file whole.
+ * `mida sponsor on|off`'s file half: writes `sponsorUrl` into network.json — or removes the pair
+ * entirely for `off` — while leaving every other byte untouched, the same guarantee
+ * `setBatchingFlag` makes. Removal cuts the whole pair plus one comma so the file stays valid at
+ * its own layout; a file that already says what was asked is not written at all. Only a file
+ * whose shape the surgical edit cannot honour is rewritten whole (its values still preserved);
+ * a missing or unparsable file is a refusal, never a rewrite.
  */
-function batchingSpan(
+export function setSponsorUrl(home: MidaHome, url: string | undefined): void {
+  const { file, text, parsed } = readNetworkObject(home)
+  const span = fieldSpan(text, "sponsorUrl")
+  let next: string | undefined
+  if (url === undefined) {
+    if (!Object.hasOwn(parsed, "sponsorUrl")) return // already off — the file is its own truth
+    if (span?.kind === "replace") next = text.slice(0, span.removeStart) + text.slice(span.removeEnd)
+  } else {
+    const value = JSON.stringify(url)
+    if (Object.hasOwn(parsed, "sponsorUrl")) {
+      if (span?.kind === "replace") next = text.slice(0, span.start) + value + text.slice(span.end)
+    } else if (span?.kind === "insert-pair") {
+      next = text.slice(0, span.at) + span.leading + `"sponsorUrl": ${value},` + span.leading + text.slice(span.at + span.leading.length)
+    } else if (span?.kind === "insert-value") {
+      next = text.slice(0, span.at) + `"sponsorUrl": ${value}` + text.slice(span.at)
+    }
+  }
+  // a splice that does not leave sponsorUrl === url — a second top-level key later in the object
+  // would still win the parse — falls back to the whole-file rewrite
+  if (next !== undefined) {
+    const check = JSON.parse(next) as { sponsorUrl?: unknown }
+    if ((url === undefined ? check.sponsorUrl !== undefined : check.sponsorUrl !== url)) next = undefined
+  }
+  if (next === undefined) {
+    const clone: Record<string, unknown> = { ...(parsed as Record<string, unknown>) }
+    if (url === undefined) delete clone.sponsorUrl
+    else clone.sponsorUrl = url
+    next = JSON.stringify(clone, null, 2)
+  }
+  writeFileAtomic(file, next)
+}
+
+/**
+ * network.json read raw AND parsed together — the surgical writers need both. A file that is
+ * missing, unreadable, unparsable or not a JSON object is a `network-json-invalid` refusal:
+ * corrupt is never treated as missing, and a broken file is never rewritten.
+ */
+function readNetworkObject(home: MidaHome): { file: string; text: string; parsed: Record<string, unknown> } {
+  const file = home.path("network.json")
+  let text: string
+  try {
+    text = readFileSync(file, "utf8")
+  } catch {
+    throw codedError("network-json-invalid", "network.json is missing or unreadable")
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    throw codedError("network-json-invalid", "network.json could not be parsed")
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw codedError("network-json-invalid", "network.json is not a JSON object")
+  }
+  return { file, text, parsed: parsed as Record<string, unknown> }
+}
+
+/**
+ * Where the top-level `"name"` key sits inside a JSON object's raw text. `replace` carries the
+ * existing value's span (`start`/`end`) plus the span that removes the whole pair cleanly —
+ * `removeStart`/`removeEnd` cover the pair and exactly one comma: a pair followed by a comma
+ * leaves through it (leading whitespace included), the last pair takes the comma before it.
+ * `insert-pair` splices `"name": <v>,` before the first key, reusing that key's leading
+ * whitespace so the file keeps its own layout; `insert-value` is the empty object. Keys are
+ * matched as raw text at depth 1 only — a `"name"` nested inside another field is never
+ * touched. null when the text is not a well-formed object; the caller then rewrites whole.
+ */
+function fieldSpan(
   text: string,
-): { kind: "replace"; start: number; end: number } | { kind: "insert-pair"; at: number; leading: string } | { kind: "insert-value"; at: number } | null {
+  name: string,
+):
+  | { kind: "replace"; start: number; end: number; removeStart: number; removeEnd: number }
+  | { kind: "insert-pair"; at: number; leading: string }
+  | { kind: "insert-value"; at: number }
+  | null {
   const open = text.indexOf("{")
   if (open === -1) return null
   const n = text.length
@@ -358,21 +415,35 @@ function batchingSpan(
   if (text[i] === "}") return { kind: "insert-value", at: open + 1 }
   if (text[i] !== '"') return null
   const leading = text.slice(open + 1, i) // the whitespace before the first key — reused on insert
+  let pairStart = open + 1 // where this pair's leading whitespace begins (just past `{` or the last `,`)
+  let separatorComma = -1 // the `,` between the previous pair and this one — -1 for the first pair
   for (;;) {
     if (text[i] !== '"') return null
     const keyStart = i + 1
     skipString()
-    const name = text.slice(keyStart, i - 1)
+    const key = text.slice(keyStart, i - 1)
     ws()
     if (text[i] !== ":") return null
     i += 1
     ws()
     const valueStart = i
     if (!skipValue()) return null
-    if (name === "batching") return { kind: "replace", start: valueStart, end: i }
+    const valueEnd = i
     ws()
-    if (text[i] === ",") {
+    const followedByComma = text[i] === ","
+    if (key === name) {
+      return {
+        kind: "replace",
+        start: valueStart,
+        end: valueEnd,
+        removeStart: followedByComma || separatorComma === -1 ? pairStart : separatorComma,
+        removeEnd: followedByComma ? i + 1 : valueEnd,
+      }
+    }
+    if (followedByComma) {
+      separatorComma = i
       i += 1
+      pairStart = i
       ws()
       continue
     }
