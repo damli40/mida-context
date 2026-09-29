@@ -11,7 +11,7 @@ import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { MidaHome, buildHandoff, buildRemember, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, resolveSessionTask, tailOf } from "@mida/midad"
+import { MidaHome, buildHandoff, buildRemember, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, resetOutOfGasWaits, resolveSessionTask, tailOf } from "@mida/midad"
 import type { DrainDeps, RememberDeps, Runtime, ServiceRuntime, saveCheckpoint } from "@mida/midad"
 import { CONTENT_FIELDS, mergeCheckpoints } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
@@ -588,16 +588,82 @@ describe("the owner-signed project list gates every save", () => {
     })
     expect(drainLog()).toContain('"reason":"wallet-low"')
     expect(listJobs(home)).toHaveLength(1)
-    // viem's own insufficient-funds error names the same condition
-    const again = setup()
-    again.job()
-    await again.drain({
+  })
+
+  it("the chain's insufficient-funds refusal is out-of-gas — its own reason, recorded on the session's wait (in-29 S-2)", async () => {
+    // Sep 29, item 15: an agent wallet that could not pay logged only "chain-error", so neither
+    // the log nor doctor could say what was actually wrong or what fixes it.
+    const { home, job, drain, drainLog } = setup()
+    job()
+    await drain({
       save: async () => {
         throw new InsufficientFundsError()
       },
     })
-    expect(again.drainLog()).toContain('"reason":"wallet-low"')
-    expect(listJobs(again.home)).toHaveLength(1)
+    expect(drainLog()).toContain('"reason":"out-of-gas"')
+    expect(drainLog()).not.toContain('"reason":"chain-error"')
+    expect(drainLog()).not.toContain('"reason":"wallet-low"')
+    // transient: the job stays queued for the backoff retry — never moved to bad, never removed
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+    // the wait record names the cause — that is what doctor reports and the funding reset clears
+    const state = home.readJson<{ attempts?: number; failedAt?: string; reason?: string }>("queue/state/s1.json")
+    expect(state?.reason).toBe("out-of-gas")
+    expect(state?.attempts).toBe(1)
+  })
+
+  it("a funded wallet clears the recorded gas wait — the held session saves on the very next pass (in-29 S-2)", async () => {
+    const { home, job, drain } = setup()
+    job()
+    let calls = 0
+    const failing: typeof saveCheckpoint = async () => {
+      calls += 1
+      throw new InsufficientFundsError()
+    }
+    const ok: typeof saveCheckpoint = async () => {
+      calls += 1
+      return { contextId: `0x${"ab".repeat(32)}`, transactionHash: null, milliseconds: 1, duplicate: false }
+    }
+    await drain({ save: failing })
+    expect(calls).toBe(1)
+    // still inside the backoff, the next pass holds the job without even asking the save
+    await drain({ save: ok })
+    expect(calls).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+    // `mida init` topped the wallet up (or `mida sponsor on` made sends free) — the wait is stale
+    expect(resetOutOfGasWaits(home)).toBe(1)
+    await drain({ save: ok })
+    expect(calls).toBe(2)
+    expect(listJobs(home)).toHaveLength(0)
+  })
+
+  it("the reset clears a wait recorded before reasons existed, and leaves a non-gas wait alone (in-29 S-2)", async () => {
+    // a state file written before in-29 carries no reason — funding is the likely fix, so it clears
+    const { home, job, drain } = setup()
+    job()
+    home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: new Date(T0).toISOString(), attempts: 3, failedAt: new Date(T0 + 60_000).toISOString() })
+    expect(resetOutOfGasWaits(home)).toBe(1)
+    const cleared = home.readJson<{ attempts?: number; failedAt?: string }>("queue/state/s1.json")
+    expect(cleared?.attempts).toBeUndefined()
+    expect(cleared?.failedAt).toBeUndefined()
+
+    // a chain-busy wait is NOT cleared: funding does not fix the chain being unreachable
+    const second = setup()
+    second.job()
+    let secondCalls = 0
+    const failing: typeof saveCheckpoint = async () => {
+      secondCalls += 1
+      throw new Error("rpc unreachable")
+    }
+    const ok: typeof saveCheckpoint = async () => {
+      secondCalls += 1
+      return { contextId: `0x${"ab".repeat(32)}`, transactionHash: null, milliseconds: 1, duplicate: false }
+    }
+    await second.drain({ save: failing })
+    expect(secondCalls).toBe(1)
+    expect(resetOutOfGasWaits(second.home)).toBe(0)
+    await second.drain({ save: ok })
+    expect(secondCalls).toBe(1) // still inside the backoff
   })
 
   it("a chain-level refusal for a revoked agent also logs revoked, not not-approved (R4-3)", async () => {

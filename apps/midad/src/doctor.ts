@@ -21,6 +21,7 @@ import { codeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
 import { DEVIN_NODE_SQLITE_MIN } from "./devin-facts.js"
 import { drainerEnv } from "./hook.js"
+import { sessionWaits } from "./drain.js"
 import { CODEX_TRUST_SENTENCE, claudeCodeMcpStatus, claudeDesktopConfigPath, claudeHooksStatus, codexHooksStatus, codexMcpStatus, cursorMcpConfigPath, devinHooksStatus, installedMcpLauncherPath, macosProtectedFolderNote, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
 import type { InstallTool, McpClientTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
@@ -848,7 +849,22 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         if (jobs.length === 0) return ["ok: queue empty"]
         const oldest = jobs.reduce((min, job) => Math.min(min, Date.parse(job.at)), Number.POSITIVE_INFINITY)
         const ageMs = Math.max(0, (deps.now ?? Date.now)() - oldest)
-        return [`ok: ${jobs.length} job(s) waiting; oldest ${ageText(ageMs)}`]
+        const lines = [`ok: ${jobs.length} job(s) waiting; oldest ${ageText(ageMs)}`]
+        // in-29 S-2: a session's wait record names the drain code it is waiting on — an
+        // out-of-gas wait names the agent whose wallet is dry and the two ways to clear it,
+        // instead of reading as indistinguishable "chain-error" minutes.
+        const waits = sessionWaits(home, jobs)
+        const outOfGas = [...new Set(waits.filter((wait) => wait.reason === "out-of-gas").map((wait) => wait.agent))].sort()
+        for (const agent of outOfGas) {
+          lines.push(`PROBLEM: ${agent}'s wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.`)
+        }
+        if (waits.length > 0) {
+          const next = waits.reduce((min, wait) => Math.min(min, wait.dueAtMs), Number.POSITIVE_INFINITY)
+          const at = new Date(next)
+          const hhmm = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`
+          lines.push(`note: ${waits.length} session(s) waiting to save; the next try is at ${hhmm} local time.`)
+        }
+        return lines
       },
     },
     {

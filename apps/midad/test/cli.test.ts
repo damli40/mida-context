@@ -106,6 +106,27 @@ describe("the crude mida command", () => {
     expect(await run2("approve", "claude-code")).toBe(0)
   }, 300_000)
 
+  it("a successful init clears a recorded out-of-gas wait so the session's saves resume at once (in-29 S-2)", async () => {
+    // the drain's own backoff record for a session whose last save the chain refused for gas —
+    // init's funding pass makes it stale, so the wait must not hold the retry back another
+    // backoff period
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-gasreset-")))
+    fresh.writeSecretJson("queue/state/s-gas.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-29T10:00:00.000Z",
+      attempts: 5,
+      failedAt: new Date().toISOString(),
+      reason: "out-of-gas",
+    })
+    const run2 = (...argv: string[]) =>
+      runCli(argv, { home: fresh, network, print: () => {}, prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
+    expect(await run2("init")).toBe(0)
+    const state = fresh.readJson<{ attempts?: number; failedAt?: string }>("queue/state/s-gas.json")
+    expect(state?.attempts).toBeUndefined()
+    expect(state?.failedAt).toBeUndefined()
+  }, 300_000)
+
   it("approve prints the ask and the advice, waits for 'yes', and signs nothing without it", async () => {
     const lines: string[] = []
     const asked: string[] = []

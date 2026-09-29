@@ -66,11 +66,22 @@ export function isChainBusyError(error: unknown): boolean {
 }
 
 /**
+ * The chain's own refusal to run a send for lack of gas: viem's InsufficientFundsError, however
+ * deep the SDK or client wrapped it. Named apart from OWNER_WALLET_LOW — the balance guard fires
+ * before a send and names the wallet's owner; this one is what an unfunded agent wallet earns at
+ * send time (in-29 S-2, Sep 29 item 15). Transient: funding the wallet or turning the sponsor on
+ * clears it.
+ */
+export function isOutOfGasError(error: unknown): boolean {
+  return error instanceof BaseError && error.walk((cause) => cause instanceof InsufficientFundsError) !== null
+}
+
+/**
  * A wallet that cannot pay the send: the balance guard's OWNER_WALLET_LOW, or viem's own
  * insufficient-funds answer when the balance moved between the guard and the send. Transient —
  * funding the wallet clears it, so the drain treats it like a chain hiccup, not a refusal.
  */
 export function isWalletLow(error: unknown): boolean {
   if (isMidaError(error, "OWNER_WALLET_LOW")) return true
-  return error instanceof BaseError && error.walk((cause) => cause instanceof InsufficientFundsError) !== null
+  return isOutOfGasError(error)
 }

@@ -14,7 +14,7 @@ import { RegistryReader, StoreHttpError } from "@mida/api"
 import { readTranscriptFor, scrubSecrets } from "@mida/compiler"
 import { devinSessionStat } from "@mida/compiler"
 import type { OpenDevinDb, compileCheckpoint } from "@mida/compiler"
-import { chainRefusalReason, isWalletLow } from "./chain-busy.js"
+import { chainRefusalReason, isOutOfGasError, isWalletLow } from "./chain-busy.js"
 import { CheckpointPayloadError, eventIdFor, unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import { devinDbPathAllowed } from "./devin-facts.js"
@@ -141,6 +141,8 @@ interface SessionState {
   /** Consecutive transient failures on this transcript state; absent means the state is terminal. */
   attempts?: number
   failedAt?: string
+  /** The drain code the last attempt failed with — what the wait is waiting on (in-29 S-2). */
+  reason?: string
 }
 
 export interface DrainResult {
@@ -606,6 +608,8 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           savedAt: readState(deps.home, sessionId)?.savedAt ?? job.at,
           attempts,
           failedAt: now().toISOString(),
+          // the reason rides the wait record: doctor names it and a funding reset clears it
+          reason: code,
         })
         dueSooner(now().getTime() + backoffMs(attempts))
         // transient: no sample — it is quoted once, on the terminal "bad" line above
@@ -672,6 +676,9 @@ function failureCode(error: unknown): string {
   // a refused send is transient: the ceiling may pass on retry after the queue settles or the
   // estimate changes — the job stays and the usual backoff applies (R3-1)
   if (isMidaError(error, "GAS_CEILING_EXCEEDED")) return "gas-ceiling"
+  // the chain's own insufficient-funds refusal names itself (in-29 S-2): a wallet that ran dry
+  // is fixed by funding or the sponsor, not by retrying the same error — so it is not chain-error
+  if (isOutOfGasError(error)) return "out-of-gas"
   // a wallet that cannot pay is transient like a chain hiccup — funding refills it (in-6 R4)
   if (isWalletLow(error)) return "wallet-low"
   // the store answered with bytes that are not a Mida body — an old deploy's plain-text 404, a
@@ -885,6 +892,87 @@ function readState(home: MidaHome, sessionId: string): SessionState | undefined 
 
 function writeState(home: MidaHome, sessionId: string, state: SessionState): void {
   home.writeSecretJson(`queue/state/${sessionId}.json`, state)
+}
+
+/** One queued session's wait, as doctor reports it: the next-try time and what it waits on. */
+export interface SessionWait {
+  sessionId: string
+  agent: string
+  /** Epoch ms at which the session's next try becomes due — the same deadline the pass computes. */
+  dueAtMs: number
+  /** The drain code the last attempt failed with — absent on a gap wait or a pre-in-29 record. */
+  reason: string | undefined
+}
+
+/**
+ * What each queued session is waiting for and until when — the same arithmetic the pass applies
+ * (in-29 S-2): a recorded failure waits out `60 s × 2^attempts` from `failedAt`; a session with no
+ * failure waits out its save gap (the short first-save gap, else the minute); a flush job owes
+ * nothing and is due whenever a pass runs. Jobs are grouped exactly as the pass groups them —
+ * oldest-first list, newest job stands for the session, any flush event in the group counts.
+ */
+export function sessionWaits(home: MidaHome, jobs: CaptureJob[]): SessionWait[] {
+  const bySession = new Map<string, CaptureJob[]>()
+  for (const job of jobs) {
+    const group = bySession.get(job.sessionId)
+    if (group === undefined) bySession.set(job.sessionId, [job])
+    else group.push(job)
+  }
+  const waits: SessionWait[] = []
+  for (const [sessionId, group] of bySession) {
+    const job = group[group.length - 1]!
+    const state = readState(home, sessionId)
+    const attempts = state?.attempts ?? 0
+    const reason = state?.reason
+    if (attempts > 0 && state?.failedAt !== undefined) {
+      waits.push({ sessionId, agent: job.agent, dueAtMs: Date.parse(state.failedAt) + backoffMs(attempts), reason })
+      continue
+    }
+    if (group.some((j) => FLUSH_EVENTS.has(j.event))) {
+      waits.push({ sessionId, agent: job.agent, dueAtMs: 0, reason })
+      continue
+    }
+    const gapRef = Date.parse(state?.savedAt ?? group[0]!.at)
+    waits.push({ sessionId, agent: job.agent, dueAtMs: gapRef + (state?.savedAt === undefined ? DEFAULT_FIRST_GAP_MS : DEFAULT_MIN_GAP_MS), reason })
+  }
+  return waits
+}
+
+/**
+ * The wait reasons a funded wallet — or the gas sponsor — makes stale: the send-side "cannot pay"
+ * failures. Funding one wallet does not prove the others are funded, but the waits it clears only
+ * cost one early retry each if it was not — the waiting direction is the broken one.
+ */
+const GAS_WAIT_REASONS = new Set(["out-of-gas", "wallet-low"])
+
+/**
+ * Clears the recorded failure backoff on every session whose wait was about gas — run after
+ * `mida init`'s funding pass and after `mida sponsor on`, so saves resume on the next pass
+ * instead of waiting out a backoff that described a dry wallet (in-29 S-2). A wait recorded
+ * before reasons existed clears too; a wait that was not about gas keeps its deadline. Returns
+ * the number of waits cleared. Never throws: a state file that will not parse is left for the
+ * drain's own unreadable-state handling.
+ */
+export function resetOutOfGasWaits(home: MidaHome): number {
+  let cleared = 0
+  let names: string[]
+  try {
+    names = home.list("queue/state")
+  } catch {
+    return 0
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json") || name.endsWith(".last.json")) continue
+    const sessionId = name.slice(0, -".json".length)
+    if (!isSafeName(sessionId)) continue
+    const state = readState(home, sessionId)
+    if (state === undefined || state.attempts === undefined || state.failedAt === undefined) continue
+    if (state.reason !== undefined && !GAS_WAIT_REASONS.has(state.reason)) continue
+    const { attempts: _a, failedAt: _f, reason: _r, ...rest } = state
+    writeState(home, sessionId, rest)
+    cleared += 1
+  }
+  return cleared
 }
 
 /**

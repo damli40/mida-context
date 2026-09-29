@@ -17,6 +17,7 @@ import { readSavedIds, recordSavedId } from "./saved-ids.js"
 import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl, sponsorReachable } from "./runtime.js"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
 import { resolveNetwork } from "./network.js"
+import { resetOutOfGasWaits } from "./drain.js"
 import { FACT_NAMESPACES } from "./remember.js"
 import { unwrapCheckpoint, wrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
@@ -266,6 +267,9 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
     }
     agents[name] = identity.agentId
   }
+  // in-29 S-2: the funding pass just ran — a session still waiting out a gas backoff was recorded
+  // against a dry wallet and is stale now; clearing it lets the next drain pass retry at once.
+  resetOutOfGasWaits(home)
   return { owner, agents }
 }
 

@@ -28,6 +28,7 @@ import type { ChainContext } from "@mida/chain"
 import { RegistryReader } from "@mida/api"
 import { provisionAgent } from "@mida/fake-vault"
 import { permissionNames } from "@mida/grant-advisor"
+import { resetOutOfGasWaits } from "../drain.js"
 import { newOwnerNonce, startReturnListener } from "./listener.js"
 import type { ReturnListener } from "./listener.js"
 import { openOwnerLink } from "./open.js"
@@ -429,6 +430,9 @@ export async function provisionPasskeyAgents(
     }
     agents[name] = identity.agentId
   }
+  // in-29 S-2: the funding pass just ran — a session still waiting out a gas backoff was recorded
+  // against a dry wallet and is stale now; clearing it lets the next drain pass retry at once.
+  resetOutOfGasWaits(home)
   return agents
 }
 
