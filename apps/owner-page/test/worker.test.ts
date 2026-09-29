@@ -140,6 +140,21 @@ describe("/me", () => {
     expect(await res.json()).toEqual({ indexUrl: null })
   })
 
+  it("a whitespace-only INDEX_GRAPHQL_URL means not configured too — the value is trimmed first (in-27 R-4)", async () => {
+    // A dashboard paste that left a stray space or newline must read as "no index" — today it
+    // reaches the CSP gate and answers "not allowed", blaming the index instead of the config.
+    const { env } = fakeAssets("  \n  ")
+    const res = await worker.fetch(new Request("https://app.midacontext.xyz/me/config.json"), env)
+    expect(await res.json()).toEqual({ indexUrl: null })
+  })
+
+  it("a padded INDEX_GRAPHQL_URL serves the trimmed URL (in-27 R-4)", async () => {
+    const indexUrl = "https://indexer.dev.hyperindex.xyz/abc123/v1/graphql"
+    const { env } = fakeAssets(`  ${indexUrl}\n`)
+    const res = await worker.fetch(new Request("https://app.midacontext.xyz/me/config.json"), env)
+    expect(await res.json()).toEqual({ indexUrl })
+  })
+
   it("serves an index on the page's own origin — the CSP's 'self' already allows it (in-26 Q-4)", async () => {
     const indexUrl = "https://app.midacontext.xyz/v1/graphql"
     const { env } = fakeAssets(indexUrl)
@@ -246,6 +261,19 @@ describe("the daily index keep-alive", () => {
     const { ctx, pings } = ctxCapture()
 
     await worker.scheduled(cron, keepAliveEnv(), ctx)
+    expect(pings).toEqual([])
+    expect(calls).toEqual([])
+  })
+
+  it("does nothing when INDEX_GRAPHQL_URL is only whitespace (in-27 R-4)", async () => {
+    const calls: unknown[] = []
+    vi.stubGlobal("fetch", async () => {
+      calls.push(1)
+      return new Response("{}")
+    })
+    const { ctx, pings } = ctxCapture()
+
+    await worker.scheduled(cron, keepAliveEnv("   \n"), ctx)
     expect(pings).toEqual([])
     expect(calls).toEqual([])
   })

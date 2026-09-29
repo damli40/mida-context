@@ -31,7 +31,9 @@ export default {
     // dead deployment. A configured URL the page's own CSP refuses is never served as usable —
     // the reason field lets /me say "not allowed" instead of reporting a dead index.
     if (url.pathname === "/me/config.json") {
-      const configured = env.INDEX_GRAPHQL_URL
+      // Trimmed first — a dashboard paste carrying a stray space or newline must read as
+      // "not configured", never as a URL the CSP refused (in-27 R-4).
+      const configured = env.INDEX_GRAPHQL_URL?.trim()
       const body =
         configured === undefined || configured === ""
           ? { indexUrl: null }
@@ -64,7 +66,7 @@ export default {
    * rejected waitUntil would mark the whole invocation failed.
    */
   async scheduled(_event: { cron: string }, env: OwnerPageEnv, ctx: ScheduledContextLike): Promise<void> {
-    const indexUrl = env.INDEX_GRAPHQL_URL
+    const indexUrl = env.INDEX_GRAPHQL_URL?.trim()
     if (!indexUrl) return
     ctx.waitUntil(
       fetch(indexUrl, {
