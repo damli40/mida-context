@@ -77,7 +77,6 @@ describe("UNACCEPTABLE_REQUEST_CHARS (in-30 T-3)", () => {
     ["line separator", chr(0x2028)],
     ["paragraph separator", chr(0x2029)],
     ["zero-width space", chr(0x200b)],
-    ["zero-width joiner", chr(0x200d)],
     ["left-to-right mark", chr(0x200e)],
     ["right-to-left mark", chr(0x200f)],
     ["bidi embedding", chr(0x202a)],
@@ -89,6 +88,13 @@ describe("UNACCEPTABLE_REQUEST_CHARS (in-30 T-3)", () => {
 
   it("still accepts ordinary text — plain words, dashes, emoji and CJK", () => {
     expect(UNACCEPTABLE_REQUEST_CHARS.test("claude-code — plain text 中文字符 ✓")).toBe(false)
+  })
+
+  it("accepts the joiners — a ZWNJ inside a Persian name, a ZWJ inside an emoji sequence (in-31 V-3)", () => {
+    // می‌خواهم is می + ZWNJ (200C) + خواهم — the non-joiner is ordinary Persian spelling.
+    // 👨‍💻 is held together by a ZWJ (200D). Neither forges a line nor hides inside one.
+    expect(UNACCEPTABLE_REQUEST_CHARS.test("می\u200cخواهم")).toBe(false)
+    expect(UNACCEPTABLE_REQUEST_CHARS.test("👨\u200d💻 helper")).toBe(false)
   })
 
   it("displaySafeText folds each refused character to a single space — for fields that are shown, not refused", () => {

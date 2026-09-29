@@ -98,10 +98,13 @@ export const UNACCEPTABLE_REQUEST_TEXT =
 /**
  * The characters that must never reach a field a page or a terminal renders. The set is wider
  * than C0+DEL (in-30 T-3): every control character, the Unicode line and paragraph separators,
- * the zero-width marks (B-200F), the bidirectional controls (202A-202E, 2066-2069) and the BOM.
- * Each can forge a rendered line or hide inside one.
+ * the zero-width space (200B), the directional marks (200E-200F), the bidirectional controls
+ * (202A-202E, 2066-2069) and the BOM. Each can forge a rendered line or hide inside one.
+ * The joiners are NOT refused (in-31 V-3): the zero-width non-joiner (200C) is part of Persian
+ * and Indic spelling and the zero-width joiner (200D) holds emoji sequences together — neither
+ * can mint or hide a line.
  */
-export const UNACCEPTABLE_REQUEST_CHARS = /[\p{Cc}\p{Zl}\p{Zp}​-‏‪-‮⁦-⁩﻿]/u
+export const UNACCEPTABLE_REQUEST_CHARS = /[\p{Cc}\p{Zl}\p{Zp}​‎‏‪-‮⁦-⁩﻿]/u
 
 /**
  * A refused character folded to a single space — for a display-only field that is size-checked

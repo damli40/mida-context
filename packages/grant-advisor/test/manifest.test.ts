@@ -142,6 +142,13 @@ describe("manifest limits and structure (§14.1)", () => {
     expect((caught as Error).message).toBe(sentence)
   })
 
+  it("accepts the joiners in a name — a Persian ZWNJ and an emoji ZWJ sequence (in-31 V-3)", () => {
+    // می‌خواهم is ordinary Persian spelling (the 200C non-joiner splits می from خواهم); 👨‍💻 is
+    // a 200D-joined emoji sequence. The zero-width space stays refused (row above).
+    expect(() => validateManifestBody(invalidBody({ name: "می\u200cخواهم" }), NOW)).not.toThrow()
+    expect(() => validateManifestBody(invalidBody({ name: "👨\u200d💻 helper" }), NOW)).not.toThrow()
+  })
+
   it("does NOT refuse display-only fields — a description or reason carrying the characters still loads (in-30 T-3)", () => {
     // The page never renders these fields for decisions, so refusing them would only break a
     // manifest already registered with a multi-line description. They are size-checked, then
