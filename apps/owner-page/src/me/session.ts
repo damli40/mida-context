@@ -71,12 +71,13 @@ export async function signIn(env: FlowEnvironment, namespaces: readonly Hex[]): 
   // Unknown areas fail before the touch — a bad input never costs a ceremony.
   const nodes = namespaces.map((id) => namespaceById(id))
   const stored = loadStoredOwner(env.storage)
+  // Sign-in is always discoverable — no allowCredentials, ever. The stored credential id is an
+  // allow-list to a real browser, not a suggestion: a device that last used owner B would offer
+  // only B's passkey and fail NotAllowedError before owner A could answer (in-26 Q-1).
   const asserted = await assertOwnerPasskey({
     credentials: env.credentials,
     rpId: env.deployment.vaultRpId,
     challenge: actionChallenge("me.signin", new Uint8Array(0)),
-    ...(stored?.credentialId !== undefined ? { credentialId: stored.credentialId } : {}),
-    ...(stored?.transports !== undefined ? { transports: stored.transports } : {}),
   })
   // Consumes asserted.prfOutput in place — after this line only evmKey + ownerSeed exist.
   const secrets = deriveOwnerSecrets(asserted.prfOutput)
@@ -102,10 +103,15 @@ export async function signIn(env: FlowEnvironment, namespaces: readonly Hex[]): 
         `this owner (${shortAddress(owner)}) has not signed up yet — there is no passkey key registered for it on the chain`,
       )
     }
-    // Merge, never overwrite: a sign-in keeps the record's transports and public point — the
-    // fields /signup wrote and the ceremonies hint from — only the credential id and owner move
-    // to this passkey's (in-25 P-3).
-    saveStoredOwner(env.storage, { ...(stored ?? {}), credentialId: asserted.credentialId, owner })
+    // Transports and the public point describe the credential they were written for — they merge
+    // only onto an unchanged credential id. A different credential replaces the record whole:
+    // carrying the old passkey's metadata onto it would hint flows at a credential it is not
+    // (in-26 Q-1).
+    saveStoredOwner(env.storage, {
+      ...(stored !== null && stored.credentialId === asserted.credentialId ? stored : {}),
+      credentialId: asserted.credentialId,
+      owner,
+    })
     session = makeSession(env.deployment, owner, signer, state)
     return session
   } finally {

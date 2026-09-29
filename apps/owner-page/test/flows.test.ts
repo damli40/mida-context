@@ -25,7 +25,7 @@ import { parseLinkFragment } from "../src/owner/link.js"
 import type { ParsedLink } from "../src/owner/link.js"
 import { base64UrlEncode } from "../src/check/bytes.js"
 import type { CredentialsContainerLike } from "../src/check/client.js"
-import { makeAssertion, makeKeyPair } from "./helpers.js"
+import { makeAssertion, makeKeyPair, throwIfNotAllowed } from "./helpers.js"
 import {
   confirmApprove,
   confirmRevoke,
@@ -78,8 +78,8 @@ function epochKey(nsId: Hex, epoch: bigint, prf: Uint8Array = PRF): Hex {
 
 // --- fakes ------------------------------------------------------------------
 
-function fakeCredentials(key: ReturnType<typeof makeKeyPair>, prfOutput: Uint8Array) {
-  const calls: { kind: "create" | "get"; challenge?: Uint8Array }[] = []
+function fakeCredentials(key: ReturnType<typeof makeKeyPair>, prfOutput: Uint8Array, failGet = false) {
+  const calls: { kind: "create" | "get"; challenge?: Uint8Array; allowCredentials?: string[] }[] = []
   const rawId = new TextEncoder().encode("owner-credential")
   const prf = prfOutput // the buffer the flow's deriveOwnerSecrets must consume in place
   const toBuf = (bytes: Uint8Array) => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
@@ -99,8 +99,20 @@ function fakeCredentials(key: ReturnType<typeof makeKeyPair>, prfOutput: Uint8Ar
       }
     },
     async get(options) {
-      const request = options!.publicKey as { challenge: Uint8Array }
-      calls.push({ kind: "get", challenge: request.challenge })
+      const request = options!.publicKey as {
+        challenge: Uint8Array
+        allowCredentials?: { id: ArrayLike<number> }[]
+      }
+      calls.push({
+        kind: "get",
+        challenge: request.challenge,
+        allowCredentials: request.allowCredentials?.map((entry) => base64UrlEncode(entry.id as Uint8Array)),
+      })
+      // A real browser treats a non-empty allowCredentials as a filter: a credential that is
+      // not listed is never offered and the prompt fails with NotAllowedError. Enforcing it
+      // here is what makes the shared-browser tests honest — the old fake ignored the list.
+      throwIfNotAllowed(request.allowCredentials, rawId)
+      if (failGet) throw new DOMException("The operation either timed out or was not allowed.", "NotAllowedError")
       const assertion = makeAssertion(key.privateKey, { challenge: request.challenge, rpId: RP_ID })
       return {
         type: "public-key",
@@ -239,8 +251,9 @@ function makeEnv(opts: {
   storage?: ReturnType<typeof fakeStorage>
   releasedSecrets?: OwnerSecrets[]
   intents?: DenyIntent[]
+  failGet?: boolean
 }): { env: FlowEnvironment; credentials: ReturnType<typeof fakeCredentials>; storage: ReturnType<typeof fakeStorage> } {
-  const credentials = fakeCredentials(passkey, opts.prf ?? PRF.slice())
+  const credentials = fakeCredentials(passkey, opts.prf ?? PRF.slice(), opts.failGet ?? false)
   const chain = opts.chain ?? fakeChain()
   const sponsor = opts.sponsor ?? fakeSponsor(opts.sends, opts.receiptLogs)
   const store = opts.storage ?? fakeStorage()
@@ -376,6 +389,7 @@ describe("approve flow", () => {
     intents?: DenyIntent[]
     granted?: () => boolean
     storage?: ReturnType<typeof fakeStorage>
+    failGet?: boolean
   } = {}) {
     const { manifest, accessRequest } = await approveReq()
     const sends: SendRecord[] = []
@@ -398,6 +412,7 @@ describe("approve flow", () => {
       releasedSecrets: opts.releasedSecrets,
       intents: opts.intents,
       storage: opts.storage,
+      failGet: opts.failGet,
     })
     const req = {
       chainId: Number(CHAIN_ID),
@@ -458,20 +473,88 @@ describe("approve flow", () => {
     expect(chain.calls.filter((c) => c === "read:grantNonce")).toHaveLength(3)
   })
 
-  it("a device remembering another owner does not block this link's passkey (in-25 P-3)", async () => {
-    // Shared-browser case: /me signed in passkey B last, but this approve link is for owner A
-    // and passkey A answers — the stored record is a hint, not a second gate.
+  it("a device remembering another owner does not block this link's passkey (in-25 P-3, in-26 Q-1)", async () => {
+    // Shared-browser case: /me signed in passkey B last, but this approve link is for owner A.
+    // The stored record names owner B, so it must not be sent as an allow-list — a real browser
+    // would only offer B's passkey and fail the prompt before A can answer. The first prompt is
+    // already discoverable and passkey A answers it.
     const store = fakeStorage()
     store.map.set(
       "mida.owner.v1",
       JSON.stringify({ credentialId: base64UrlEncode(new TextEncoder().encode("other-credential")), owner: ownerOf(OTHER_PRF) }),
     )
-    const { env, sends, req } = await setup({ storage: store })
+    const { env, credentials, sends, req } = await setup({ storage: store })
     const parsed = link("approve", req)
     const prep = await prepareApprove(env, parsed)
     const result = await confirmApprove(env, parsed, prep)
     expect(result.status).toBe("success")
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get"])
+    expect(credentials.calls[0]!.allowCredentials).toBeUndefined() // discoverable — no allow-list sent
     expect(sends.map((s) => s.functionName)).toEqual(["grantBatch"])
+  })
+
+  it("a hinted prompt that finds no stored passkey retries once, discoverable (in-26 Q-1)", async () => {
+    // The record names THIS owner but the credential itself is gone from the device (deleted
+    // passkey): the hinted prompt fails NotAllowedError, and exactly one discoverable retry
+    // offers the resident passkey — Mida passkeys are resident credentials.
+    const gone = base64UrlEncode(new TextEncoder().encode("gone-credential"))
+    const store = fakeStorage()
+    store.map.set("mida.owner.v1", JSON.stringify({ credentialId: gone, owner: OWNER, transports: ["internal"] }))
+    const { env, credentials, sends, req } = await setup({ storage: store })
+    const parsed = link("approve", req)
+    const prep = await prepareApprove(env, parsed)
+    const result = await confirmApprove(env, parsed, prep)
+    expect(result.status).toBe("success")
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get", "get"])
+    expect(credentials.calls[0]!.allowCredentials).toEqual([gone])
+    expect(credentials.calls[1]!.allowCredentials).toBeUndefined()
+    expect(sends.map((s) => s.functionName)).toEqual(["grantBatch"])
+  })
+
+  it("the stored credential is still the hint when the record names this owner (in-26 Q-1)", async () => {
+    const credentialId = base64UrlEncode(new TextEncoder().encode("owner-credential"))
+    const store = fakeStorage()
+    store.map.set("mida.owner.v1", JSON.stringify({ credentialId, owner: OWNER, transports: ["internal"] }))
+    const { env, credentials, sends, req } = await setup({ storage: store })
+    const parsed = link("approve", req)
+    const prep = await prepareApprove(env, parsed)
+    const result = await confirmApprove(env, parsed, prep)
+    expect(result.status).toBe("success")
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get"]) // one hinted prompt, no retry
+    expect(credentials.calls[0]!.allowCredentials).toEqual([credentialId])
+    expect(sends.map((s) => s.functionName)).toEqual(["grantBatch"])
+  })
+
+  it("a record too old to name an owner may hint, and a miss still retries discoverable (in-26 Q-1)", async () => {
+    // Records written before the owner field existed carry no owner — the hint is allowed, and
+    // the same one-shot discoverable retry applies when it does not match this device.
+    const gone = base64UrlEncode(new TextEncoder().encode("gone-credential"))
+    const store = fakeStorage()
+    store.map.set("mida.owner.v1", JSON.stringify({ credentialId: gone }))
+    const { env, credentials, req } = await setup({ storage: store })
+    const parsed = link("approve", req)
+    const prep = await prepareApprove(env, parsed)
+    const result = await confirmApprove(env, parsed, prep)
+    expect(result.status).toBe("success")
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get", "get"])
+    expect(credentials.calls[0]!.allowCredentials).toEqual([gone])
+    expect(credentials.calls[1]!.allowCredentials).toBeUndefined()
+  })
+
+  it("a hinted prompt that fails again discoverable is a real cancel — one retry, never a loop (in-26 Q-1)", async () => {
+    const store = fakeStorage()
+    store.map.set(
+      "mida.owner.v1",
+      JSON.stringify({ credentialId: base64UrlEncode(new TextEncoder().encode("gone-credential")), owner: OWNER }),
+    )
+    const { env, credentials, sends, req } = await setup({ storage: store, failGet: true })
+    const parsed = link("approve", req)
+    const prep = await prepareApprove(env, parsed)
+    const result = await confirmApprove(env, parsed, prep)
+    expect(result.status).toBe("cancelled")
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get", "get"])
+    expect(credentials.calls[1]!.allowCredentials).toBeUndefined()
+    expect(sends).toHaveLength(0)
   })
 
   it("a wrong-owner passkey fails before any send — in words, with both addresses", async () => {
@@ -678,6 +761,25 @@ describe("revoke flow", () => {
     expect(apiCalls).toContain(`api:publishEpochWrap:${SURVIVOR.slice(2, 6)}:${NS_ID.slice(2, 10)}:2`)
     // the revoked agent itself is never re-wrapped — hasAuthority says no
     expect(apiCalls.some((c) => c.includes(AGENT_ID.slice(2, 6)))).toBe(false)
+  })
+
+  it("a device remembering another owner does not block this revoke's passkey (in-26 Q-1)", async () => {
+    // Same shared-browser case through the revoke call site: the stored record names owner B,
+    // so the prompt must be discoverable for owner A rather than allow-listed to B.
+    const store = fakeStorage()
+    store.map.set(
+      "mida.owner.v1",
+      JSON.stringify({ credentialId: base64UrlEncode(new TextEncoder().encode("other-credential")), owner: ownerOf(OTHER_PRF) }),
+    )
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const { env, credentials } = makeEnv({ sends, apiCalls, chain: revokeChain(sends), storage: store })
+    const parsed = link("revoke", { chainId: Number(CHAIN_ID), owner: OWNER, agentId: AGENT_ID, readers: [AGENT_ID, SURVIVOR] })
+    const prep = await prepareRevoke(env, parsed)
+    const result = await confirmRevoke(env, parsed, prep)
+    expect(result.status).toBe("success")
+    expect(credentials.calls[0]!.allowCredentials).toBeUndefined()
+    expect(sends.map((s) => s.functionName)).toEqual(["revokeAgentAndRotate"])
   })
 
   it("revoking an agent with nothing live fails before the passkey prompt", async () => {

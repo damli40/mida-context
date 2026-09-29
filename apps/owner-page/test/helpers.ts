@@ -74,3 +74,18 @@ export function derSignature(r: bigint, s: bigint): Uint8Array {
   const body = concatBytes(derInteger(r), derInteger(s))
   return concatBytes(new Uint8Array([0x30, body.length]), body)
 }
+
+/** Byte-for-byte equality — the comparison a real browser applies between a credential's rawId and each `allowCredentials` entry. */
+export function bytesEqual(a: ArrayLike<number>, b: ArrayLike<number>): boolean {
+  return a.length === b.length && Array.from(a).every((v, i) => v === b[i])
+}
+
+/**
+ * The browser's allow-list behavior, for fakes: a non-empty `allowCredentials` is a filter — a
+ * credential not on the list is never offered and the prompt fails with NotAllowedError.
+ */
+export function throwIfNotAllowed(allowCredentials: { id: ArrayLike<number> }[] | undefined, rawId: Uint8Array): void {
+  if (allowCredentials !== undefined && allowCredentials.length > 0 && !allowCredentials.some((e) => bytesEqual(e.id, rawId))) {
+    throw new DOMException("The operation either timed out or was not allowed.", "NotAllowedError")
+  }
+}

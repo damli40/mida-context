@@ -4,7 +4,7 @@ import { base64UrlEncode } from "../src/check/bytes.js"
 import { RP_ID, RP_NAME, TEST_CHALLENGE } from "../src/check/constants.js"
 import { makeCheckClient } from "../src/check/client.js"
 import type { CheckClientDeps, CredentialsContainerLike, InvocationCounts } from "../src/check/client.js"
-import { makeAssertion, makeKeyPair } from "./helpers.js"
+import { makeAssertion, makeKeyPair, throwIfNotAllowed } from "./helpers.js"
 
 /**
  * A fake navigator.credentials: records what it was asked for, answers with fabricated
@@ -36,7 +36,10 @@ function fakeCredentials(opts: { createExt?: object; getExt?: object } = {}) {
       }
     },
     async get(options) {
-      calls.push({ kind: "get", publicKey: options!.publicKey as Record<string, unknown> })
+      const request = options!.publicKey as Record<string, unknown> & { allowCredentials?: { id: ArrayLike<number> }[] }
+      calls.push({ kind: "get", publicKey: request })
+      // the browser's real behavior: an unlisted credential is never offered → NotAllowedError
+      throwIfNotAllowed(request.allowCredentials, rawId)
       return {
         type: "public-key",
         rawId,

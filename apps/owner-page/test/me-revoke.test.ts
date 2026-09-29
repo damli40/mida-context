@@ -10,7 +10,8 @@ import { AGENT_ID, CHAIN_ID, NOW, REGISTRY, agentRecordFor, manifestBody } from 
 import { deriveOwnerSecrets, ownerAccount } from "../src/owner/secrets.js"
 import type { OwnerSecrets } from "../src/owner/secrets.js"
 import type { CredentialsContainerLike } from "../src/check/client.js"
-import { makeAssertion, makeKeyPair } from "./helpers.js"
+import { base64UrlEncode } from "../src/check/bytes.js"
+import { makeAssertion, makeKeyPair, throwIfNotAllowed } from "./helpers.js"
 import type { FlowEnvironment } from "../src/owner/flows.js"
 import { readersAfterRevoke } from "../src/me/model.js"
 import { repairReaderWrapsFromMe, revokeFromMe, shouldOfferRepair } from "../src/me/revoke.js"
@@ -65,7 +66,7 @@ function epochKey(nsId: Hex, epoch: bigint, prf: Uint8Array = PRF): Hex {
 // --- fakes — the same shapes flows.test.ts drives --------------------------------------------
 
 function fakeCredentials(key: ReturnType<typeof makeKeyPair>, prfOutput: Uint8Array) {
-  const calls: { kind: "create" | "get"; challenge?: Uint8Array }[] = []
+  const calls: { kind: "create" | "get"; challenge?: Uint8Array; allowCredentials?: string[] }[] = []
   const rawId = new TextEncoder().encode("owner-credential")
   const prf = prfOutput
   const toBuf = (bytes: Uint8Array) => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
@@ -75,8 +76,18 @@ function fakeCredentials(key: ReturnType<typeof makeKeyPair>, prfOutput: Uint8Ar
       throw new Error("revoke never creates a credential")
     },
     async get(options) {
-      const request = options!.publicKey as { challenge: Uint8Array }
-      calls.push({ kind: "get", challenge: request.challenge })
+      const request = options!.publicKey as {
+        challenge: Uint8Array
+        allowCredentials?: { id: ArrayLike<number> }[]
+      }
+      calls.push({
+        kind: "get",
+        challenge: request.challenge,
+        allowCredentials: request.allowCredentials?.map((entry) => base64UrlEncode(entry.id as Uint8Array)),
+      })
+      // A non-empty allowCredentials is a filter, not a hint — a real browser refuses an
+      // unlisted credential with NotAllowedError (in-26 Q-1).
+      throwIfNotAllowed(request.allowCredentials, rawId)
       const assertion = makeAssertion(key.privateKey, { challenge: request.challenge, rpId: RP_ID })
       return {
         type: "public-key",

@@ -8,7 +8,8 @@ import { deriveOwnerSecrets, ownerAccount, shortAddress } from "../src/owner/sec
 import type { OwnerSecrets } from "../src/owner/secrets.js"
 import type { FlowEnvironment } from "../src/owner/flows.js"
 import type { CredentialsContainerLike } from "../src/check/client.js"
-import { makeAssertion, makeKeyPair } from "./helpers.js"
+import { base64UrlEncode } from "../src/check/bytes.js"
+import { makeAssertion, makeKeyPair, throwIfNotAllowed } from "./helpers.js"
 import { signIn } from "../src/me/session.js"
 import { loadStoredOwner, saveStoredOwner } from "../src/owner/session.js"
 
@@ -74,7 +75,7 @@ function sealRow(opts: { prf?: Uint8Array; nsId?: Hex; epoch?: bigint; text?: st
 // --- fakes ------------------------------------------------------------------
 
 function fakeCredentials(prfOutput: Uint8Array) {
-  const calls: { kind: "create" | "get"; challenge?: Uint8Array }[] = []
+  const calls: { kind: "create" | "get"; challenge?: Uint8Array; allowCredentials?: string[] }[] = []
   const rawId = new TextEncoder().encode("owner-credential")
   const prf = prfOutput // the buffer deriveOwnerSecrets must consume in place
   const toBuf = (bytes: Uint8Array) => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
@@ -84,8 +85,18 @@ function fakeCredentials(prfOutput: Uint8Array) {
       throw new Error("sign-in never creates a credential")
     },
     async get(options) {
-      const request = options!.publicKey as { challenge: Uint8Array }
-      calls.push({ kind: "get", challenge: request.challenge })
+      const request = options!.publicKey as {
+        challenge: Uint8Array
+        allowCredentials?: { id: ArrayLike<number> }[]
+      }
+      calls.push({
+        kind: "get",
+        challenge: request.challenge,
+        allowCredentials: request.allowCredentials?.map((entry) => base64UrlEncode(entry.id as Uint8Array)),
+      })
+      // A real browser filters on a non-empty allowCredentials — an unlisted credential is never
+      // offered and the prompt fails NotAllowedError. Sign-in must never send the list.
+      throwIfNotAllowed(request.allowCredentials, rawId)
       const assertion = makeAssertion(passkey.privateKey, { challenge: request.challenge, rpId: DEPLOYMENT.vaultRpId })
       return {
         type: "public-key",
@@ -249,24 +260,61 @@ describe("me session", () => {
     session.end() // idempotent
   })
 
-  it("sign-in merges into the stored record — transports and the public point survive (in-25 P-3)", async () => {
-    const { env, storage } = makeEnv()
-    const other = `0x${"ab".repeat(20)}` as Address
-    // What /signup wrote for another passkey on this shared browser: a full record, hints and all.
+  it("sign-in is always discoverable — a stored record for another owner still signs in (in-26 Q-1)", async () => {
+    const { env, storage, credentials } = makeEnv()
+    // A shared browser's record for owner B: credential id, hints, owner — none of it names
+    // passkey A, and none of it may narrow the sign-in prompt.
     saveStoredOwner(storage.storage, {
-      credentialId: "cred-A",
+      credentialId: "b3RoZXItY3JlZGVudGlhbA", // "other-credential", canonical base64url
+      transports: ["internal"],
+      owner: ownerOf(OTHER_PRF),
+    })
+    const session = await signIn(env, [NS])
+    expect(session.owner).toBe(OWNER)
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get"])
+    // the request carried no allow-list at all — a remembered owner B cannot bar passkey A
+    expect(credentials.calls[0]!.allowCredentials).toBeUndefined()
+    session.end()
+  })
+
+  it("sign-in keeps transports and the public point only on an unchanged credential id (in-26 Q-1)", async () => {
+    const { env, storage } = makeEnv()
+    const sameId = base64UrlEncode(new TextEncoder().encode("owner-credential")) // the fake's own id
+    saveStoredOwner(storage.storage, {
+      credentialId: sameId,
       transports: ["internal", "hybrid"],
       x: "11".repeat(32),
       y: "22".repeat(32),
-      owner: other,
+      owner: OWNER,
     })
     const session = await signIn(env, [NS])
     const after = loadStoredOwner(storage.storage)
+    expect(after?.credentialId).toBe(sameId)
     expect(after?.owner).toBe(session.owner)
-    expect(after?.credentialId).not.toBe("cred-A")
     expect(after?.transports).toEqual(["internal", "hybrid"])
     expect(after?.x).toBe("11".repeat(32))
     expect(after?.y).toBe("22".repeat(32))
+    session.end()
+  })
+
+  it("sign-in on a new credential replaces the record — the old credential's transports and point are not carried over (in-26 Q-1)", async () => {
+    const { env, storage } = makeEnv()
+    // What /signup wrote for another passkey on this shared browser: a full record, hints and all.
+    // The asserted credential id differs, so transports/x/y belong to a credential that is not
+    // this one — carrying them would describe a passkey the new record does not have.
+    saveStoredOwner(storage.storage, {
+      credentialId: "b3RoZXItY3JlZGVudGlhbA",
+      transports: ["internal", "hybrid"],
+      x: "11".repeat(32),
+      y: "22".repeat(32),
+      owner: `0x${"ab".repeat(20)}` as Address,
+    })
+    const session = await signIn(env, [NS])
+    const after = loadStoredOwner(storage.storage)
+    expect(after).toEqual({
+      credentialId: base64UrlEncode(new TextEncoder().encode("owner-credential")),
+      owner: session.owner,
+    })
     session.end()
   })
 

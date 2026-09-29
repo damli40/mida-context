@@ -18,7 +18,7 @@ import type { VaultContextApi } from "@mida/fake-vault/browser"
 import { SponsorPending } from "@mida/chain/browser"
 import type { CredentialsContainerLike } from "../check/client.js"
 import { PasskeyVaultAuthority, prepareGrant } from "./authority.js"
-import type { CapturedAssertion } from "./webauthn.js"
+import type { CapturedAssertion, OwnerAssertResult } from "./webauthn.js"
 import { actionChallenge, assertOwnerPasskey, capturedToAuthStruct, createOwnerPasskey, verifyCapturedAssertion } from "./webauthn.js"
 import { deriveOwnerSecrets, ownerAccount, shortAddress } from "./secrets.js"
 import type { OwnerSecrets } from "./secrets.js"
@@ -82,6 +82,47 @@ function recording(sponsor: SponsoredSender, sent: { transactionHash: Hex; userO
   }
 }
 
+/**
+ * The stored credential id is an allow-list to a real browser, not a suggestion: ask for it and
+ * only that passkey can answer — a credential that is not on this device fails the prompt
+ * outright (NotAllowedError). So the hint is sent only when the record is anonymous or names
+ * this link's owner — a shared browser holding owner B's record must not bar owner A's passkey
+ * (in-26 Q-1) — and a hinted prompt that fails NotAllowedError retries exactly once with no
+ * allow-list: Mida passkeys are resident credentials, so a deleted or moved passkey is not a
+ * dead end. A second NotAllowedError is a true cancel and surfaces unchanged.
+ */
+async function assertForExpectedOwner(
+  env: FlowEnvironment,
+  challenge: Uint8Array,
+  expectedOwner: Address,
+): Promise<OwnerAssertResult> {
+  const stored = loadStoredOwner(env.storage)
+  const hint =
+    stored !== null && (stored.owner === undefined || stored.owner === expectedOwner.toLowerCase()) ? stored : null
+  try {
+    return await assertOwnerPasskey({
+      credentials: env.credentials,
+      rpId: env.deployment.vaultRpId,
+      challenge,
+      ...(hint !== null
+        ? {
+            credentialId: hint.credentialId,
+            ...(hint.transports !== undefined ? { transports: hint.transports } : {}),
+          }
+        : {}),
+    })
+  } catch (error) {
+    if (hint !== null && isUserCancel(error)) {
+      return await assertOwnerPasskey({
+        credentials: env.credentials,
+        rpId: env.deployment.vaultRpId,
+        challenge,
+      })
+    }
+    throw error
+  }
+}
+
 function authorityFor(
   env: FlowEnvironment,
   secrets: OwnerSecrets,
@@ -101,14 +142,7 @@ function authorityFor(
     // The deny-undo path (M3-D4): a failed revoke send cancels its staged deny, which takes a
     // fresh passkey assertion over the cancel digest — a second touch, on the failure path only.
     signCancelAssertion: async (challenge) => {
-      const stored = loadStoredOwner(env.storage)
-      const again = await assertOwnerPasskey({
-        credentials: env.credentials,
-        rpId: env.deployment.vaultRpId,
-        challenge: bytesOf(challenge, 32),
-        ...(stored?.credentialId !== undefined ? { credentialId: stored.credentialId } : {}),
-        ...(stored?.transports !== undefined ? { transports: stored.transports } : {}),
-      })
+      const again = await assertForExpectedOwner(env, bytesOf(challenge, 32), account.address.toLowerCase() as Address)
       try {
         return assertionToWire(capturedToAuthStruct(again.assertion))
       } finally {
@@ -342,13 +376,7 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
   }
   try {
     progress("Waiting for the passkey prompt — use the passkey you signed up with.")
-    const asserted = await assertOwnerPasskey({
-      credentials: env.credentials,
-      rpId: env.deployment.vaultRpId,
-      challenge: bytesOf(prep.challenge, 32),
-      credentialId: loadStoredOwner(env.storage)?.credentialId,
-      transports: loadStoredOwner(env.storage)?.transports,
-    })
+    const asserted = await assertForExpectedOwner(env, bytesOf(prep.challenge, 32), req.owner!)
     const secrets = deriveOwnerSecrets(asserted.prfOutput)
     const account = ownerAccount(secrets)
     const derived = account.address.toLowerCase() as Address
@@ -581,13 +609,7 @@ export async function confirmRevoke(
   }
   try {
     progress("Waiting for the passkey prompt — use the passkey you signed up with.")
-    const asserted = await assertOwnerPasskey({
-      credentials: env.credentials,
-      rpId: env.deployment.vaultRpId,
-      challenge: actionChallenge("revoke", link.requestBytes),
-      credentialId: loadStoredOwner(env.storage)?.credentialId,
-      transports: loadStoredOwner(env.storage)?.transports,
-    })
+    const asserted = await assertForExpectedOwner(env, actionChallenge("revoke", link.requestBytes), req.owner!)
     const secrets = deriveOwnerSecrets(asserted.prfOutput)
     const account = ownerAccount(secrets)
     const derived = account.address.toLowerCase() as Address
@@ -678,13 +700,7 @@ export async function repairReaderWraps(
 ): Promise<ReaderRepairResult> {
   const progress = env.progress ?? (() => {})
   progress("Waiting for the passkey prompt — use the passkey you signed up with.")
-  const asserted = await assertOwnerPasskey({
-    credentials: env.credentials,
-    rpId: env.deployment.vaultRpId,
-    challenge: actionChallenge("me.rewrap", new Uint8Array(0)),
-    credentialId: loadStoredOwner(env.storage)?.credentialId,
-    transports: loadStoredOwner(env.storage)?.transports,
-  })
+  const asserted = await assertForExpectedOwner(env, actionChallenge("me.rewrap", new Uint8Array(0)), input.owner)
   const secrets = deriveOwnerSecrets(asserted.prfOutput)
   const account = ownerAccount(secrets)
   const derived = account.address.toLowerCase() as Address

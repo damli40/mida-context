@@ -7,7 +7,7 @@ import { RP_ID } from "../src/check/constants.js"
 import { base64UrlEncode, bytesToHex, concatBytes } from "../src/check/bytes.js"
 import type { CredentialsContainerLike } from "../src/check/client.js"
 import { parseP256Spki } from "../src/check/spki.js"
-import { makeAssertion, makeKeyPair } from "./helpers.js"
+import { makeAssertion, makeKeyPair, throwIfNotAllowed } from "./helpers.js"
 import {
   actionChallenge,
   assertionChallenge,
@@ -49,8 +49,14 @@ function fakeOwnerCredentials(key: ReturnType<typeof makeKeyPair>, opts: { rpId?
       }
     },
     async get(options) {
-      const request = options!.publicKey as { challenge: Uint8Array; rpId: string }
+      const request = options!.publicKey as {
+        challenge: Uint8Array
+        rpId: string
+        allowCredentials?: { id: ArrayLike<number> }[]
+      }
       calls.push({ kind: "get", publicKey: request })
+      // a real browser refuses a credential absent from a non-empty allowCredentials list
+      throwIfNotAllowed(request.allowCredentials, rawId)
       // a real authenticator signs the challenge it was handed — the fake does too, so a client
       // that failed to substitute OUR challenge produces an assertion that fails verification.
       const assertion = makeAssertion(key.privateKey, { challenge: request.challenge, rpId: opts.rpId ?? RP_ID })
