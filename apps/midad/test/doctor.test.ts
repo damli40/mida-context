@@ -179,6 +179,51 @@ describe("mida doctor without a chain", () => {
     }
   })
 
+  it("a sponsored setup's out-of-gas line names the sponsor that did not pay — never 'run mida sponsor on' (in-39 B-4)", async () => {
+    // A sponsor IS configured on this setup, so "run mida sponsor on" is nonsense advice — the
+    // honest line is that the configured sponsor did not pay, and the wallet needs topping up
+    // until it does. The sponsor/store probes are stubbed so nothing reaches a real service.
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      home.writeSecretJson("network.json", { sponsorUrl: "https://sponsor.example" })
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 3, failedAt, reason: "out-of-gas" })
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        fetch: async () => new Response("{}", { status: 200 }),
+        sponsorReachable: async () => false,
+      })
+      expect(lines).toContain(
+        "PROBLEM: claude-code's wallet ran out of gas and the gas sponsor did not pay, so its saves are waiting. Check doctor's sponsor line; until the sponsor pays again, the wallet needs testnet MON.",
+      )
+      expect(lines.some((line) => line.includes("Run mida sponsor on"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a self-paid setup keeps the top-it-up out-of-gas line (in-39 B-4)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 3, failedAt, reason: "out-of-gas" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain("PROBLEM: claude-code's wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.")
+    } finally {
+      await closeServer(server)
+    }
+  })
+
   it("a session waiting on a non-gas reason gets the note but no wallet line (in-29 S-2)", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const server = await stubDaemon(home, 200, { ok: true })

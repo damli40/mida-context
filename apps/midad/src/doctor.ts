@@ -905,8 +905,18 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         // instead of reading as indistinguishable "chain-error" minutes.
         const waits = sessionWaits(home, jobs)
         const outOfGas = [...new Set(waits.filter((wait) => wait.reason === "out-of-gas").map((wait) => wait.agent))].sort()
-        for (const agent of outOfGas) {
-          lines.push(`PROBLEM: ${agent}'s wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.`)
+        if (outOfGas.length > 0) {
+          // in-39 B-4: on a sponsored setup "run mida sponsor on" is nonsense — a sponsor is
+          // already configured and did not pay, so the honest line says so and points at the
+          // sponsor check. Only a self-paid wallet gets the top-it-up advice.
+          const sponsored = (await doctorServices(deps, shared)).sponsorUrl !== undefined
+          for (const agent of outOfGas) {
+            lines.push(
+              sponsored
+                ? `PROBLEM: ${agent}'s wallet ran out of gas and the gas sponsor did not pay, so its saves are waiting. Check doctor's sponsor line; until the sponsor pays again, the wallet needs testnet MON.`
+                : `PROBLEM: ${agent}'s wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.`,
+            )
+          }
         }
         if (waits.length > 0) {
           if (shared.serviceUp === false) {
