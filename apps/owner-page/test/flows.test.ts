@@ -406,7 +406,7 @@ describe("approve flow", () => {
       entry: { agent: AGENT_ID, projectId: "proj-1", root: `0x${"33".repeat(32)}` },
       readers: [AGENT_ID, SURVIVOR],
     }
-    return { env, credentials, storage, sends, apiCalls, req, accessRequest }
+    return { env, credentials, storage, sends, apiCalls, req, accessRequest, chain }
   }
 
   it("prepare does every check with zero credential calls; confirm runs exactly one get then the sends", async () => {
@@ -436,6 +436,26 @@ describe("approve flow", () => {
     expect((result.entry?.entries as { agent: string }[]).some((e) => e.agent === AGENT_ID)).toBe(true)
     expect(releasedSecrets[0]?.released).toBe(true)
     expect(releasedSecrets[0]?.evmKey.every((b) => b === 0)).toBe(true)
+  })
+
+  it("prepares and sends on one agent/history read set — the page's advice is reused, not re-scanned (in-25 P-8)", async () => {
+    // One approve used to pay the getAgent + agentEpoch + activeCapabilityIds reads three times:
+    // prepare's recommended run, prepare's final run, and approveGrant's internal re-prepare.
+    // The second and third reuse the first run's advice — what the owner saw is what gets sent.
+    const { env, sends, req, chain } = await setup()
+    const parsed = link("approve", req)
+    const prep = await prepareApprove(env, parsed)
+    const result = await confirmApprove(env, parsed, prep)
+    expect(result.status).toBe("success")
+    expect(sends.map((s) => s.functionName)).toEqual(["grantBatch"])
+    // The history scan itself — agentEpoch and the active-capability probe — ran ONCE, in the
+    // first prepareGrant. (The two extra getAgent reads are preparedOperator's display read and
+    // the wrap publish's fresh encryption key — neither is part of the scan.)
+    expect(chain.calls.filter((c) => c === "read:agentEpoch")).toHaveLength(1)
+    expect(chain.calls.filter((c) => c === "read:activeCapabilityIds")).toHaveLength(1)
+    // The K-6 window check and the grantNonce read still ran on all three preparations — the
+    // challenge the passkey signed is the send's own digest (covered by the challenge pin above).
+    expect(chain.calls.filter((c) => c === "read:grantNonce")).toHaveLength(3)
   })
 
   it("a device remembering another owner does not block this link's passkey (in-25 P-3)", async () => {

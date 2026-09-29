@@ -293,11 +293,19 @@ export async function prepareApprove(env: FlowEnvironment, link: ParsedLink): Pr
   const finalPrepared =
     needed.length === 0
       ? prepared
-      : await prepareGrant({ publicClient: env.publicClient, deployment: env.deployment }, owner, {
-          accessRequest,
-          manifest,
-          selection: { kind: "custom", scopes: sortScopes(needed), expiresAt },
-        })
+      : // The recommended run already paid the owner-history scan — reuse its advice verbatim
+        // (in-25 P-8); the nonce and freshness checks below stay per-call.
+        await prepareGrant(
+          { publicClient: env.publicClient, deployment: env.deployment },
+          owner,
+          {
+            accessRequest,
+            manifest,
+            selection: { kind: "custom", scopes: sortScopes(needed), expiresAt },
+          },
+          undefined,
+          prepared.advice,
+        )
   return {
     accessRequest,
     manifest,
@@ -394,11 +402,16 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
           }
         }
         progress("Sending the grant…")
-        const approval = await authority.approveGrant({
-          accessRequest: prep.accessRequest,
-          manifest: prep.manifest,
-          selection: { kind: "custom", scopes: prep.needed, expiresAt: prep.expiresAt },
-        })
+        // The send reuses the advice the page was approved on — no second owner-history scan
+        // (in-25 P-8). assertRequestFresh still runs inside approveGrant immediately before it.
+        const approval = await authority.approveGrant(
+          {
+            accessRequest: prep.accessRequest,
+            manifest: prep.manifest,
+            selection: { kind: "custom", scopes: prep.needed, expiresAt: prep.expiresAt },
+          },
+          prep.advice,
+        )
         granted = approval.response.capabilities.length
         // A rotated epoch invalidates every surviving reader's wrap — re-publish for the agents the
         // terminal named, but only those that still hold READ on chain. A lying list can only waste

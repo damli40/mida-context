@@ -224,7 +224,7 @@ export class PasskeyVaultAuthority implements VaultAuthority {
     return (await this.#sendCapability("epoch.init", "initializeReadEpoch", [id, hexOf(keys.publicKey)])).transactionHash
   }
 
-  async approveGrant(request: GrantRequest): Promise<GrantApproval> {
+  async approveGrant(request: GrantRequest, reuseAdvice?: GrantAdvice): Promise<GrantApproval> {
     this.#live()
     const { accessRequest } = request
     const { deployment } = this.#write
@@ -233,6 +233,7 @@ export class PasskeyVaultAuthority implements VaultAuthority {
       this.owner,
       request,
       (functionName, args) => this.#readCapability(functionName, args),
+      reuseAdvice,
     )
     const auth = this.#grantAssertion(prepared.challenge)
     const receipt = await this.#sendCapability("grant.batch", "grantBatch", [
@@ -566,6 +567,7 @@ export async function prepareGrant(
       functionName,
       args,
     } as never),
+  reuseAdvice?: GrantAdvice,
 ): Promise<PreparedGrant> {
   const { accessRequest } = request
   const { deployment } = ctx
@@ -577,17 +579,28 @@ export async function prepareGrant(
   }
   // The request's own expiry window is checked before the agent-record and owner-history reads —
   // an expired request refuses here on one getBlock, never after a getLogs scan (in-15 J-2's
-  // order, applied on the passkey page too — in-16 K-6).
+  // order, applied on the passkey page too — in-16 K-6). It runs on EVERY call, reused advice or
+  // not: the send's window is checked against the chain clock immediately before minting.
   const now = await latestTimestamp(ctx)
   assertRequestFresh(accessRequest, now)
-  const agentRecord = await readAgentRecord(ctx, accessRequest.agentId)
-  const history = await ownerHistory({
-    client: ctx.publicClient,
-    deployment,
-    owner,
-    agentId: accessRequest.agentId,
-  })
-  const advice = adviseGrant({ request: accessRequest, manifest: request.manifest, agentRecord, ownerHistory: history, now })
+  // The second and third preparations of one approval reuse the first call's advice — the
+  // ownerHistory log scan from the deployment block is the expensive part, and its answer is
+  // already on the page the owner saw (in-25 P-8). Only the request window, the final-selection
+  // check and the grantNonce read stay per-call.
+  const advice =
+    reuseAdvice ??
+    adviseGrant({
+      request: accessRequest,
+      manifest: request.manifest,
+      agentRecord: await readAgentRecord(ctx, accessRequest.agentId),
+      ownerHistory: await ownerHistory({
+        client: ctx.publicClient,
+        deployment,
+        owner,
+        agentId: accessRequest.agentId,
+      }),
+      now,
+    })
 
   const selected =
     request.selection.kind === "recommended"

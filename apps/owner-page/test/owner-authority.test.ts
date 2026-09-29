@@ -32,7 +32,7 @@ import {
   unsignedRequest,
 } from "../../../packages/grant-advisor/test/fixtures.js"
 import { deriveOwnerSecrets, ownerAccount } from "../src/owner/secrets.js"
-import { PasskeyVaultAuthority } from "../src/owner/authority.js"
+import { PasskeyVaultAuthority, prepareGrant } from "../src/owner/authority.js"
 import type { CapturedAssertion } from "../src/owner/webauthn.js"
 import { capturedToAuthStruct, verifyCapturedAssertion } from "../src/owner/webauthn.js"
 import { derSignature, makeAssertion, makeKeyPair } from "./helpers.js"
@@ -613,6 +613,61 @@ describe("PasskeyVaultAuthority", () => {
   it("refuses rotateP256Key plainly — out of scope for this page", () => {
     const auth = authority({ publicClient: fakeChain().publicClient, sponsor: fakeSponsor().sponsor, api: fakeApi().api })
     expect(() => auth.rotateP256Key()).toThrowError(/cannot rotate/)
+  })
+
+  it("approves on a prepared advice: no agent/history reads again, the nonce is still re-read (in-25 P-8)", async () => {
+    // The approve flow hands approveGrant the advice the page already computed — the send must
+    // not pay the getAgent/ownerHistory reads a second time. What stays live: the K-6 window
+    // check, the grantNonce read (the digest the ceremony signed is recomputed from it), the
+    // challenge match, and the wrap publish's own reads.
+    const fx = await grantFixture()
+    const grantedLog = capabilityGrantedLog({
+      owner: fx.owner,
+      agentId: AGENT_ID,
+      namespaceId: NS_ID,
+      capabilityId: `0x${"77".repeat(32)}` as Hex,
+      permissions: PERMISSION.READ,
+      provenancePolicy: 0,
+      expiresAt: CAP_EXPIRY,
+      context: {
+        requestHash: fx.requestHash,
+        manifestHash: fx.unsigned.manifestHash,
+        manifestVersion: BigInt(fx.unsigned.manifestVersion),
+        policyVersionHash: hashString("mida-grant-policy-v1"),
+        namespaceTreeVersionHash: hashString("mida-namespace-tree-v1"),
+        grantNonce: 0n,
+      },
+    })
+    const chain = fakeChain({
+      getAgent: () => agentRecordFor(fx.body),
+      epochPublicKey: () => epochPublicKey(NS_ID, 1n),
+    })
+    const request = {
+      accessRequest: fx.accessRequest,
+      manifest: fx.manifest,
+      selection: { kind: "custom" as const, scopes: fx.finalScopes, expiresAt: CAP_EXPIRY },
+    }
+    const prepared = await prepareGrant({ publicClient: chain.publicClient, deployment: DEPLOYMENT }, fx.owner, request)
+    expect(prepared.challenge).toBe(fx.digest)
+    chain.calls.length = 0 // what follows is the send's own traffic
+
+    const { sponsor, sends } = fakeSponsor([grantedLog])
+    const { api, calls: apiCalls } = fakeApi()
+    const auth = authority({ publicClient: chain.publicClient, sponsor, api, assertion: assertionOver(fx.digest) })
+    const approval = await auth.approveGrant(request, prepared.advice)
+
+    expect(approval.response.capabilities).toHaveLength(1)
+    expect(sends.map((s) => s.call.functionName)).toEqual(["grantBatch"])
+    // nonce re-read → simulate → the wrap publish's own reads; zero history/agent-record reads
+    expect(chain.calls.map((c) => c.what)).toEqual([
+      "read:grantNonce",
+      "simulate:grantBatch",
+      "read:hasAuthority",
+      "read:getAgent",
+      "read:requiredReadEpoch",
+      "read:epochPublicKey",
+    ])
+    expect(apiCalls.map((c) => c.what)).toEqual(["api:publishEpochWrap"])
   })
 
   it("refuses a request bound to a different chain before any send", async () => {
