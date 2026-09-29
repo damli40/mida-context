@@ -594,6 +594,43 @@ describe("approve flow", () => {
     expect(sends).toHaveLength(0)
   })
 
+  it("a retry that succeeds rewrites the record — the next prompt is hinted, not doubled (in-27 R-2)", async () => {
+    const gone = base64UrlEncode(new TextEncoder().encode("gone-credential"))
+    const store = fakeStorage()
+    store.map.set("mida.owner.v1", JSON.stringify({ credentialId: gone, owner: OWNER, transports: ["internal"] }))
+    const { env, credentials, req } = await setup({ storage: store })
+    const parsed = link("approve", req)
+    const prep = await prepareApprove(env, parsed)
+    const first = await confirmApprove(env, parsed, prep)
+    expect(first.status).toBe("success")
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get", "get"])
+    // The record now names the credential that actually answered; a different id replaces the
+    // stale record whole — the old credential's transports do not carry over (in-26 merge rule).
+    const answered = base64UrlEncode(new TextEncoder().encode("owner-credential"))
+    expect(JSON.parse(store.map.get("mida.owner.v1")!)).toEqual({ credentialId: answered, owner: OWNER })
+    // The next approve asks for it by name — one prompt, not a miss plus a retry.
+    const second = await confirmApprove(env, parsed, prep)
+    expect(second.status).toBe("success")
+    expect(credentials.calls).toHaveLength(3)
+    expect(credentials.calls[2]!.allowCredentials).toEqual([answered])
+  })
+
+  it("a retry answered by a different owner's passkey writes nothing (in-27 R-2)", async () => {
+    // Saving happens only after the derived-owner check: a passkey that proves owner B fails the
+    // flow and must not overwrite owner A's record — it would aim the next hint at the wrong key.
+    const before = JSON.stringify({ credentialId: base64UrlEncode(new TextEncoder().encode("gone-credential")), owner: OWNER })
+    const store = fakeStorage()
+    store.map.set("mida.owner.v1", before)
+    const { env, credentials, req } = await setup({ storage: store, prf: OTHER_PRF })
+    const parsed = link("approve", req)
+    const prep = await prepareApprove(env, parsed)
+    const result = await confirmApprove(env, parsed, prep)
+    expect(result.status).toBe("failed")
+    expect(result.reason).toContain("different Mida owner")
+    expect(credentials.calls.map((c) => c.kind)).toEqual(["get", "get"])
+    expect(store.map.get("mida.owner.v1")).toBe(before)
+  })
+
   it("a wrong-owner passkey fails before any send — in words, with both addresses", async () => {
     const { env, sends, req } = await setup({ prf: OTHER_PRF })
     const parsed = link("approve", req)

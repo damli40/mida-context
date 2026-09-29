@@ -72,6 +72,22 @@ export function saveStoredOwner(storage: StorageLike, record: StoredOwner): void
   }
 }
 
+/**
+ * Record the credential that actually answered a ceremony. transports/x/y describe the
+ * credential they were written for — they merge only onto an unchanged credential id; a
+ * different credential replaces the record whole (in-26 Q-1). Called when a discoverable
+ * ceremony answered: /me sign-in always, and an owner flow's retry after its hint missed —
+ * without it every future prompt repeats the miss (in-27 R-2).
+ */
+export function recordAnsweredCredential(storage: StorageLike, credentialId: string, owner: Address): void {
+  const stored = loadStoredOwner(storage)
+  saveStoredOwner(storage, {
+    ...(stored !== null && stored.credentialId === credentialId ? stored : {}),
+    credentialId,
+    owner,
+  })
+}
+
 /** Thrown when the passkey maps to a different owner than the link (or this device) expects. */
 export class WrongOwnerError extends MidaError {
   constructor(derived: Address, expected: Address) {

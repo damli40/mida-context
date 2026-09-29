@@ -29,6 +29,7 @@ import {
   describeError,
   loadStoredOwner,
   readOwnerKey,
+  recordAnsweredCredential,
   saveStoredOwner,
 } from "./session.js"
 import type { StorageLike } from "./session.js"
@@ -95,12 +96,12 @@ async function assertForExpectedOwner(
   env: FlowEnvironment,
   challenge: Uint8Array,
   expectedOwner: Address,
-): Promise<OwnerAssertResult> {
+): Promise<{ asserted: OwnerAssertResult; retried: boolean }> {
   const stored = loadStoredOwner(env.storage)
   const hint =
     stored !== null && (stored.owner === undefined || stored.owner === expectedOwner.toLowerCase()) ? stored : null
   try {
-    return await assertOwnerPasskey({
+    const asserted = await assertOwnerPasskey({
       credentials: env.credentials,
       rpId: env.deployment.vaultRpId,
       challenge,
@@ -111,13 +112,18 @@ async function assertForExpectedOwner(
           }
         : {}),
     })
+    return { asserted, retried: false }
   } catch (error) {
     if (hint !== null && isUserCancel(error)) {
-      return await assertOwnerPasskey({
+      // `retried` tells the caller the credential that answered is not the hinted one — the
+      // stored record must be refreshed after the owner check passes, or every future prompt
+      // repeats the same miss plus discoverable retry (in-27 R-2).
+      const asserted = await assertOwnerPasskey({
         credentials: env.credentials,
         rpId: env.deployment.vaultRpId,
         challenge,
       })
+      return { asserted, retried: true }
     }
     throw error
   }
@@ -142,7 +148,7 @@ function authorityFor(
     // The deny-undo path (M3-D4): a failed revoke send cancels its staged deny, which takes a
     // fresh passkey assertion over the cancel digest — a second touch, on the failure path only.
     signCancelAssertion: async (challenge) => {
-      const again = await assertForExpectedOwner(env, bytesOf(challenge, 32), account.address.toLowerCase() as Address)
+      const { asserted: again } = await assertForExpectedOwner(env, bytesOf(challenge, 32), account.address.toLowerCase() as Address)
       try {
         return assertionToWire(capturedToAuthStruct(again.assertion))
       } finally {
@@ -376,7 +382,7 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
   }
   try {
     progress("Waiting for the passkey prompt — use the passkey you signed up with.")
-    const asserted = await assertForExpectedOwner(env, bytesOf(prep.challenge, 32), req.owner!)
+    const { asserted, retried } = await assertForExpectedOwner(env, bytesOf(prep.challenge, 32), req.owner!)
     const secrets = deriveOwnerSecrets(asserted.prfOutput)
     const account = ownerAccount(secrets)
     const derived = account.address.toLowerCase() as Address
@@ -390,6 +396,9 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
       if (registeredKey === null) {
         throw new MidaError("AUTH_INVALID", `this owner (${shortAddress(derived)}) has not signed up yet — there is no passkey key registered for it on the chain`)
       }
+      // The hinted credential missed and a discoverable ceremony answered — only now, with the
+      // derived owner confirmed registered, does the record learn which credential responded.
+      if (retried) recordAnsweredCredential(env.storage, asserted.credentialId, derived)
       // The grant assertion must verify against the key on chain — checked here so a passkey whose
       // credential drifted from the registered point fails in words, not as a revert.
       const verdict = verifyCapturedAssertion({
@@ -609,7 +618,7 @@ export async function confirmRevoke(
   }
   try {
     progress("Waiting for the passkey prompt — use the passkey you signed up with.")
-    const asserted = await assertForExpectedOwner(env, actionChallenge("revoke", link.requestBytes), req.owner!)
+    const { asserted, retried } = await assertForExpectedOwner(env, actionChallenge("revoke", link.requestBytes), req.owner!)
     const secrets = deriveOwnerSecrets(asserted.prfOutput)
     const account = ownerAccount(secrets)
     const derived = account.address.toLowerCase() as Address
@@ -623,6 +632,7 @@ export async function confirmRevoke(
       if (registeredKey === null) {
         throw new MidaError("AUTH_INVALID", `this owner (${shortAddress(derived)}) has not signed up yet`)
       }
+      if (retried) recordAnsweredCredential(env.storage, asserted.credentialId, derived)
       const made = authorityFor(env, secrets, {})
       const authority = made.authority
       sent = made.sent
@@ -700,7 +710,7 @@ export async function repairReaderWraps(
 ): Promise<ReaderRepairResult> {
   const progress = env.progress ?? (() => {})
   progress("Waiting for the passkey prompt — use the passkey you signed up with.")
-  const asserted = await assertForExpectedOwner(env, actionChallenge("me.rewrap", new Uint8Array(0)), input.owner)
+  const { asserted, retried } = await assertForExpectedOwner(env, actionChallenge("me.rewrap", new Uint8Array(0)), input.owner)
   const secrets = deriveOwnerSecrets(asserted.prfOutput)
   const account = ownerAccount(secrets)
   const derived = account.address.toLowerCase() as Address
@@ -714,6 +724,7 @@ export async function repairReaderWraps(
     if (registeredKey === null) {
       throw new MidaError("AUTH_INVALID", `this owner (${shortAddress(derived)}) has not signed up yet`)
     }
+    if (retried) recordAnsweredCredential(env.storage, asserted.credentialId, derived)
     const { authority } = authorityFor(env, secrets, {})
     const result: ReaderRepairResult = { rewrapped: [], failed: [] }
     const wrapped = new Set<string>()

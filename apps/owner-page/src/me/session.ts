@@ -7,7 +7,7 @@ import type { LocalAccount } from "viem"
 import type { Deployment } from "@mida/chain/browser"
 import type { FlowEnvironment } from "../owner/flows.js"
 import { deriveOwnerSecrets, ownerAccount, shortAddress } from "../owner/secrets.js"
-import { loadStoredOwner, readOwnerKey, saveStoredOwner } from "../owner/session.js"
+import { readOwnerKey, recordAnsweredCredential } from "../owner/session.js"
 import { actionChallenge, assertOwnerPasskey } from "../owner/webauthn.js"
 
 /**
@@ -70,7 +70,6 @@ interface SessionState {
 export async function signIn(env: FlowEnvironment, namespaces: readonly Hex[]): Promise<MeSession> {
   // Unknown areas fail before the touch — a bad input never costs a ceremony.
   const nodes = namespaces.map((id) => namespaceById(id))
-  const stored = loadStoredOwner(env.storage)
   // Sign-in is always discoverable — no allowCredentials, ever. The stored credential id is an
   // allow-list to a real browser, not a suggestion: a device that last used owner B would offer
   // only B's passkey and fail NotAllowedError before owner A could answer (in-26 Q-1).
@@ -103,15 +102,9 @@ export async function signIn(env: FlowEnvironment, namespaces: readonly Hex[]): 
         `this owner (${shortAddress(owner)}) has not signed up yet — there is no passkey key registered for it on the chain`,
       )
     }
-    // Transports and the public point describe the credential they were written for — they merge
-    // only onto an unchanged credential id. A different credential replaces the record whole:
-    // carrying the old passkey's metadata onto it would hint flows at a credential it is not
-    // (in-26 Q-1).
-    saveStoredOwner(env.storage, {
-      ...(stored !== null && stored.credentialId === asserted.credentialId ? stored : {}),
-      credentialId: asserted.credentialId,
-      owner,
-    })
+    // Sign-in answered discoverably — record the credential that responded so the owner flows
+    // can hint it (merge rule in recordAnsweredCredential).
+    recordAnsweredCredential(env.storage, asserted.credentialId, owner)
     session = makeSession(env.deployment, owner, signer, state)
     return session
   } finally {
