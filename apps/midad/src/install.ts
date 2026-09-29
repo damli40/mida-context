@@ -270,6 +270,16 @@ export function uninstallClaudeCodeMcp(opts: {
   return "uninstalled"
 }
 
+/**
+ * Doctor's read-only view of the server entry in Claude Code's user config: "installed" only
+ * when the mida entry is recognisably ours (this identity, this home — the same rule install
+ * and uninstall apply). Absent, foreign and unreadable all answer "not-installed": the named
+ * fix is `mida install claude-code`, which adds the entry or refuses a foreign one out loud.
+ */
+export function claudeCodeMcpStatus(userConfig: string, home: string): "installed" | "not-installed" {
+  return isMidaServerEntry(claudeUserMidaEntry(userConfig), "claude-code", home) ? "installed" : "not-installed"
+}
+
 /** The folders macOS hides from apps that lack Files and Folders access. */
 export const MACOS_PROTECTED_FOLDERS = ["Desktop", "Documents", "Downloads"] as const
 

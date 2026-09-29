@@ -112,6 +112,7 @@ export {
   MCP_CLIENT_TOOLS,
   MCP_SERVER_NAME,
   MACOS_PROTECTED_FOLDERS,
+  claudeCodeMcpStatus,
   claudeDesktopConfigPath,
   claudeHooksStatus,
   codexBlock,

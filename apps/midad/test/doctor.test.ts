@@ -11,7 +11,7 @@ import { toFunctionSelector } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { encodeUint64 } from "@mida/protocol"
 import { parseDeployment } from "@mida/chain"
-import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, installClaudeCode, installCodex, installDevin, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, installClaudeCode, installCodex, installDevin, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
 import type { Runtime } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
@@ -362,6 +362,77 @@ describe("mida doctor without a chain", () => {
     )
     const lines = await run()
     expect(lines).toContain("PROBLEM: devin's hook block is an older version — run `mida install devin`")
+  })
+
+  it("one line per installed CLI tool reports its MCP server — the in-28 doctor lines", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const settings = join(dir(), "settings.json")
+    const userConfig = join(dir(), "claude.json")
+    const config = join(dir(), "config.toml")
+    const devinDir = join(dir(), "devin")
+    mkdirSync(devinDir, { recursive: true })
+    const devinConfig = join(devinDir, "config.json")
+    installClaudeCode(settings)
+    installCodex(config, { home: home.root, mcp: false })
+    installDevin(devinConfig)
+    const run = async () => {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: { "claude-code": settings, codex: config, devin: devinConfig },
+        claudeUserConfig: userConfig,
+        env: {},
+        daemonProbeMs: 50,
+      })
+      return lines
+    }
+    // nothing installed for MCP yet: no claude user config, a hooks-only codex block, and a
+    // devin this build cannot write a server for
+    const bare = await run()
+    expect(bare).toContain("note: claude-code MCP server not installed. Run mida install claude-code.")
+    expect(bare).toContain("note: codex MCP server not installed. Run mida install codex.")
+    expect(bare).toContain("note: devin MCP server not installed. Run mida install devin.")
+    expect(bare).not.toContain("ok: claude-code MCP server installed")
+    expect(bare).not.toContain("ok: codex MCP server installed")
+
+    // a `mida` entry in ~/.claude.json that is not Mida's still reports the note — the line
+    // names the same is-it-ours state install would refuse on
+    writeFileSync(
+      userConfig,
+      JSON.stringify({ mcpServers: { mida: { command: "/usr/bin/true", args: ["--as", "claude-code"], env: { MIDA_HOME: join(dir(), "other-home") } } } }),
+    )
+    expect(await run()).toContain("note: claude-code MCP server not installed. Run mida install claude-code.")
+
+    // ours — the same JSON `mida install claude-code` hands to `claude mcp add-json`
+    writeFileSync(userConfig, JSON.stringify({ mcpServers: { mida: JSON.parse(claudeCodeMcpJson(home.root)) } }))
+    // and the codex block gains its [mcp_servers.mida] table on a plain re-install
+    installCodex(config, { home: home.root })
+    const installed = await run()
+    expect(installed).toContain("ok: claude-code MCP server installed")
+    expect(installed).toContain("ok: codex MCP server installed")
+    // devin's can never read ok under this build — its location is not known to it
+    expect(installed).toContain("note: devin MCP server not installed. Run mida install devin.")
+  })
+
+  it("a tool without installed hooks gets no MCP line — the hook problem owns the fix", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const devinDir = join(dir(), "devin")
+    mkdirSync(devinDir, { recursive: true })
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {
+        "claude-code": join(dir(), "settings.json"),
+        codex: join(dir(), "config.toml"),
+        devin: join(devinDir, "config.json"),
+      },
+      claudeUserConfig: join(dir(), "claude.json"),
+      env: {},
+      daemonProbeMs: 50,
+    })
+    expect(lines.some((line) => line.includes("MCP server"))).toBe(false)
   })
 
   it("a runtime without node:sqlite reports the devin PROBLEM — and stays silent without Devin", async () => {

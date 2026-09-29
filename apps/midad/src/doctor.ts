@@ -21,7 +21,7 @@ import { codeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
 import { DEVIN_NODE_SQLITE_MIN } from "./devin-facts.js"
 import { drainerEnv } from "./hook.js"
-import { CODEX_TRUST_SENTENCE, claudeDesktopConfigPath, claudeHooksStatus, codexHooksStatus, cursorMcpConfigPath, devinHooksStatus, installedMcpLauncherPath, macosProtectedFolderNote, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
+import { CODEX_TRUST_SENTENCE, claudeCodeMcpStatus, claudeDesktopConfigPath, claudeHooksStatus, codexHooksStatus, codexMcpStatus, cursorMcpConfigPath, devinHooksStatus, installedMcpLauncherPath, macosProtectedFolderNote, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
 import type { InstallTool, McpClientTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
 import type { OwnerMode } from "./keys.js"
@@ -50,6 +50,8 @@ export interface DoctorDeps {
    * Desktop's account-level config under `homeDir`, Cursor's `.cursor/mcp.json` under `cwd`.
    */
   mcpConfigs?: Partial<Record<McpClientTool, string>>
+  /** Claude Code's user-level MCP list (~/.claude.json) — read only; the claude CLI writes it. */
+  claudeUserConfig?: string
   /** The account home and OS platform the protected-folder note is judged on — tests inject both. */
   homeDir?: string
   platform?: NodeJS.Platform
@@ -678,6 +680,18 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           if (status === "installed" || status === "outdated") {
             lines.push(...hookPathProblems(midaCommandsInClaudeSettings(claudePath), "claude-code"))
           }
+          // in-28: a tool with hooks installed also reports whether install's MCP half ran —
+          // an older or --no-mcp install has the hooks without the server, and the note
+          // names the one command that adds it. Only "installed" earns the line: the
+          // problem lines for every other status already end in the same install command.
+          if (status === "installed") {
+            const userConfig = deps.claudeUserConfig ?? join(deps.homeDir ?? homedir(), ".claude.json")
+            lines.push(
+              claudeCodeMcpStatus(userConfig, home.root) === "installed"
+                ? "ok: claude-code MCP server installed"
+                : "note: claude-code MCP server not installed. Run mida install claude-code.",
+            )
+          }
         }
         const codexPath = deps.settings?.codex ?? env.MIDA_CODEX_CONFIG
         if (codexPath !== undefined) {
@@ -693,6 +707,15 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           )
           if (status === "installed" || status === "outdated") {
             lines.push(...hookPathProblems(midaCommandsInCodexConfig(codexPath), "codex"))
+          }
+          // in-28: the same "did install's MCP half run" line — a hooks-only block (from a
+          // --no-mcp install or an older build) reports the note, the managed table the ok
+          if (status === "installed") {
+            lines.push(
+              codexMcpStatus(codexPath, home.root) === "installed"
+                ? "ok: codex MCP server installed"
+                : "note: codex MCP server not installed. Run mida install codex.",
+            )
           }
           // any managed block means the config was written or changed — Codex fingerprints the
           // hook text and skips an untrusted hook SILENTLY, and doctor cannot read Codex's trust
@@ -716,6 +739,12 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           )
           if (status === "installed" || status === "outdated") {
             lines.push(...hookPathProblems(midaCommandsInDevinConfig(devinPath), "devin"))
+          }
+          if (status === "installed") {
+            // this build does not know where Devin keeps MCP servers, so the note is all the
+            // line can ever say — it is literal (the server is not installed) and the command
+            // it names explains why
+            lines.push("note: devin MCP server not installed. Run mida install devin.")
           }
           const sqliteOk = (deps.devinSqliteAvailable ?? devinSqliteAvailable)()
           if (!sqliteOk) {
