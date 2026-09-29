@@ -11,6 +11,7 @@ import {
   run,
   txHash,
 } from "./helpers.js"
+import { KNOWN_OUR_OPERATORS } from "../src/our-operators.js"
 
 const OWNER = addr(0x1001)
 const OPERATOR = addr(0x2002)
@@ -128,7 +129,45 @@ describe("AgentRegistered", () => {
     expect((await idx.Agent.get(AGENT))?.isOutsideOperator).toBe(true)
   })
 
-  it("counts every operator as outside when OUR_OPERATORS is empty", async () => {
+  it("counts an operator from the committed list as ours with no env list set", async () => {
+    const idx = newIndexer()
+    await run(idx, [
+      agentRegistered({
+        tx: 1,
+        block: B,
+        operator: "0xe36e9079eec8a46df83a905065d0f3bd12bdd20a",
+      }),
+    ])
+
+    expect((await idx.GlobalStats.get("global"))?.agentsByOutsideOperators).toBe(0)
+    expect((await idx.Agent.get(AGENT))?.isOutsideOperator).toBe(false)
+  })
+
+  it("adds ENVIO_OUR_OPERATORS to the committed list", async () => {
+    process.env.ENVIO_OUR_OPERATORS = OPERATOR
+    const idx = newIndexer()
+    await run(idx, [
+      agentRegistered({ tx: 1, block: B }),
+      agentRegistered({
+        tx: 2,
+        block: B + 1,
+        agentId: bytes32(0x4002),
+        operator: "0x57aa727ba4a1c6603e9d8edaee2112ff1b1e09e4",
+      }),
+    ])
+
+    expect((await idx.GlobalStats.get("global"))?.agentsByOutsideOperators).toBe(0)
+  })
+
+  it("keeps the committed operator list well-formed", () => {
+    expect(KNOWN_OUR_OPERATORS).toHaveLength(8)
+    for (const op of KNOWN_OUR_OPERATORS) {
+      expect(op).toMatch(/^0x[0-9a-f]{40}$/)
+    }
+    expect(new Set(KNOWN_OUR_OPERATORS).size).toBe(KNOWN_OUR_OPERATORS.length)
+  })
+
+  it("counts an unlisted operator as outside when OUR_OPERATORS is empty", async () => {
     process.env.OUR_OPERATORS = ""
     const idx = newIndexer()
     await run(idx, [agentRegistered({ tx: 1, block: B })])
