@@ -99,13 +99,17 @@ export async function startAnvil(options: { hardfork?: string } = {}): Promise<L
 export async function deployLocal(options: { rpcUrl: string; privateKey?: Hex }): Promise<Deployment> {
   const privateKey = options.privateKey ?? ANVIL_PRIVATE_KEYS[0]!
   const lockDir = `${CONTRACTS_DIR()}deployments/.deploy-lock`
-  const deadline = Date.now() + 120_000
+  // The wait must outlast the full-suite queue: every test file that deploys serializes here
+  // (two forge runs each), and a wave of waiters easily stacks past two minutes. The deadline
+  // still bounds a genuinely stuck lock — it just stops firing on normal queue depth.
+  const lockWaitMs = 600_000
+  const deadline = Date.now() + lockWaitMs
   for (;;) {
     try {
       mkdirSync(lockDir)
       break
     } catch {
-      if (Date.now() > deadline) throw new Error(`deploy lock ${lockDir} held for 120s`)
+      if (Date.now() > deadline) throw new Error(`deploy lock ${lockDir} held for ${lockWaitMs / 1000}s`)
       await new Promise((resolve) => setTimeout(resolve, 200))
     }
   }
