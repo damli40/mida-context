@@ -1221,6 +1221,9 @@ async function kickDaemonNow(deps: CliDeps): Promise<void> {
 /** How long a service is given to leave after POST /shutdown before `sponsor` gives up on it — the same ten seconds ensureCurrentDaemon allows a replaced service. */
 const SPONSOR_STOP_WAIT_MS = 10_000
 
+/** What the service did after `sponsor on|off` asked it to restart — kept-running means the old gas setting is still in effect. */
+type DaemonRestartOutcome = "restarted" | "not-running" | "kept-running"
+
 /**
  * The service poke `runCli` sends after a confirmed `sponsor on|off`. Batching's flag is re-read
  * from network.json on every save, so a `/kick` suffices for it; the sponsor URL is bound into
@@ -1229,25 +1232,43 @@ const SPONSOR_STOP_WAIT_MS = 10_000
  * service that never answered is not started — the next mida command's ensureCurrentDaemon opens
  * one that reads the new file. Best-effort like the kick: a service that will not stop is left
  * alone rather than fought (the change lands on its next start), and a failure never fails the
- * command. Injectable via `deps.restartDaemon`.
+ * command — but the outcome is reported so the caller can say when the old gas setting is still
+ * live (in-39 B-6). Injectable via `deps.restartDaemon`; an injected stub may return the outcome
+ * itself, and anything else counts as "restarted" — what every pre-B-6 stub meant.
  */
-async function restartDaemonNow(deps: CliDeps): Promise<void> {
+async function restartDaemonNow(deps: CliDeps): Promise<DaemonRestartOutcome> {
   if (deps.restartDaemon !== undefined) {
-    await Promise.resolve(deps.restartDaemon()).catch(() => {})
-    return
+    const result = await Promise.resolve(deps.restartDaemon()).catch(() => undefined)
+    return result === "restarted" || result === "not-running" || result === "kept-running" ? result : "restarted"
   }
   const health = await callDaemon(deps.home, "/health", undefined, { timeoutMs: 500 })
-  if (health.status === 0) return
+  if (health.status === 0) return "not-running"
   await callDaemon(deps.home, "/shutdown", {}, { timeoutMs: 2_000 })
   const deadline = Date.now() + SPONSOR_STOP_WAIT_MS
   for (;;) {
     const reply = await callDaemon(deps.home, "/health", undefined, { timeoutMs: 500 })
     if (reply.status === 0) {
       spawnDaemon(deps.home.root)
-      return
+      return "restarted"
     }
-    if (Date.now() >= deadline) return
+    if (Date.now() >= deadline) return "kept-running"
     await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+}
+
+/**
+ * After a successful `sponsor on|off`: restart the service so the send path re-opens on the new
+ * file, then say the two things that decide whether the change is already in effect — a service
+ * that survived keeps the OLD setting until its next start, and a MIDA_SPONSOR_URL in this shell
+ * wins over whatever the command just wrote (in-39 B-6, nit 1).
+ */
+async function finishSponsorChange(deps: CliDeps): Promise<void> {
+  const outcome = await restartDaemonNow(deps)
+  if (outcome === "kept-running") {
+    deps.print("note: the Mida service did not restart, so it keeps the old gas setting until its next start. Run mida doctor to check.")
+  }
+  if ((deps.env ?? process.env).MIDA_SPONSOR_URL !== undefined) {
+    deps.print("note: MIDA_SPONSOR_URL is set in this shell and wins over network.json while it is set.")
   }
 }
 
@@ -2216,7 +2237,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     if (code === 0 && (command === "approve" || command === "revoke" || command === "batching")) {
       await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
     }
-    if (code === 0 && command === "sponsor") await restartDaemonNow(deps)
+    if (code === 0 && command === "sponsor") await finishSponsorChange(deps)
     return code
   }
   if (mode === "passkey") {
@@ -2248,7 +2269,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     if (code === 0 && (command === "approve" || command === "revoke" || command === "batching")) {
       await Promise.resolve(deps.kickDaemon ? deps.kickDaemon() : callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 })).catch(() => {})
     }
-    if (code === 0 && command === "sponsor") await restartDaemonNow(deps)
+    if (code === 0 && command === "sponsor") await finishSponsorChange(deps)
     return code
   } finally {
     await runtime.close()

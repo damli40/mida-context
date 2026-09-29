@@ -138,7 +138,15 @@ describe("setSponsorUrl — only the sponsor key's bytes may change", () => {
 })
 
 describe("mida sponsor on|off", () => {
-  const setup = async (over: { networkJson?: boolean; sponsorUrl?: string; passkey?: boolean; customSpace?: boolean } = {}) => {
+  const setup = async (over: {
+    networkJson?: boolean
+    sponsorUrl?: string
+    passkey?: boolean
+    customSpace?: boolean
+    /** What the injected restartDaemon reports back — undefined reads as "restarted" (in-39 B-6). */
+    restartOutcome?: "restarted" | "not-running" | "kept-running"
+    env?: Record<string, string>
+  } = {}) => {
     const rpc = await stubRpc()
     const home = new MidaHome(dir())
     if (over.networkJson !== false) {
@@ -178,8 +186,12 @@ describe("mida sponsor on|off", () => {
         },
         stdinIsTTY: true,
         stdoutIsTTY: true,
+        env: over.env ?? {},
         kickDaemon: () => void kicks.push(1),
-        restartDaemon: () => void restarts.push(1),
+        restartDaemon: () => {
+          restarts.push(1)
+          return over.restartOutcome
+        },
       })
     const close = async () => {
       await rpc.close()
@@ -210,6 +222,50 @@ describe("mida sponsor on|off", () => {
       // what doctor will say about it: the file's value, not the default or the environment
       const resolved = await resolveNetwork(home, {}, { probeChainId: false })
       expect(resolved.sponsor).toEqual({ url: HOSTED_SPONSOR_URL, source: "network.json" })
+    } finally {
+      await close()
+    }
+  })
+
+  it("a service that does not stop keeps the old gas setting — and the command says so (in-39 B-6)", async () => {
+    // The old service survived /shutdown (busy mid-pass, or the probes timed out): telling the
+    // owner "sponsor on: …" alone claims a change that has not taken effect — the note names it.
+    const { lines, run, close } = await setup({ customSpace: true, restartOutcome: "kept-running" })
+    try {
+      expect(await run("sponsor", "on")).toBe(0)
+      expect(lines).toContain("gas sponsor on: sponsor.midacontext.xyz")
+      expect(lines).toContain(
+        "note: the Mida service did not restart, so it keeps the old gas setting until its next start. Run mida doctor to check.",
+      )
+    } finally {
+      await close()
+    }
+  })
+
+  it("a service that was not running is not 'restarted' — and a silent success stays honest (in-39 B-6)", async () => {
+    const { lines, restarts, run, close } = await setup({ customSpace: true, restartOutcome: "not-running" })
+    try {
+      expect(await run("sponsor", "on")).toBe(0)
+      expect(lines).toContain("gas sponsor on: sponsor.midacontext.xyz")
+      // nothing was kept running, so no kept-running note — the file is already the truth the
+      // next service start reads
+      expect(lines.some((line) => line.includes("did not restart"))).toBe(false)
+      expect(restarts).toHaveLength(1) // the restart attempt still ran
+    } finally {
+      await close()
+    }
+  })
+
+  it("MIDA_SPONSOR_URL set in the shell is named after the command's other lines — it wins over the file (in-39 B-6, nit 1)", async () => {
+    const { lines, run, close } = await setup({ customSpace: true, env: { MIDA_SPONSOR_URL: "https://env-sponsor.example" } })
+    try {
+      expect(await run("sponsor", "on")).toBe(0)
+      const sponsorLine = lines.findIndex((line) => line === "gas sponsor on: sponsor.midacontext.xyz")
+      const noteLine = lines.findIndex(
+        (line) => line === "note: MIDA_SPONSOR_URL is set in this shell and wins over network.json while it is set.",
+      )
+      expect(noteLine).toBeGreaterThan(-1)
+      expect(noteLine).toBeGreaterThan(sponsorLine)
     } finally {
       await close()
     }
