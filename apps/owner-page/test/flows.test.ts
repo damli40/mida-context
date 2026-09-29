@@ -375,6 +375,7 @@ describe("approve flow", () => {
     releasedSecrets?: OwnerSecrets[]
     intents?: DenyIntent[]
     granted?: () => boolean
+    storage?: ReturnType<typeof fakeStorage>
   } = {}) {
     const { manifest, accessRequest } = await approveReq()
     const sends: SendRecord[] = []
@@ -396,6 +397,7 @@ describe("approve flow", () => {
       prf: opts.prf,
       releasedSecrets: opts.releasedSecrets,
       intents: opts.intents,
+      storage: opts.storage,
     })
     const req = {
       chainId: Number(CHAIN_ID),
@@ -434,6 +436,22 @@ describe("approve flow", () => {
     expect((result.entry?.entries as { agent: string }[]).some((e) => e.agent === AGENT_ID)).toBe(true)
     expect(releasedSecrets[0]?.released).toBe(true)
     expect(releasedSecrets[0]?.evmKey.every((b) => b === 0)).toBe(true)
+  })
+
+  it("a device remembering another owner does not block this link's passkey (in-25 P-3)", async () => {
+    // Shared-browser case: /me signed in passkey B last, but this approve link is for owner A
+    // and passkey A answers — the stored record is a hint, not a second gate.
+    const store = fakeStorage()
+    store.map.set(
+      "mida.owner.v1",
+      JSON.stringify({ credentialId: base64UrlEncode(new TextEncoder().encode("other-credential")), owner: ownerOf(OTHER_PRF) }),
+    )
+    const { env, sends, req } = await setup({ storage: store })
+    const parsed = link("approve", req)
+    const prep = await prepareApprove(env, parsed)
+    const result = await confirmApprove(env, parsed, prep)
+    expect(result.status).toBe("success")
+    expect(sends.map((s) => s.functionName)).toEqual(["grantBatch"])
   })
 
   it("a wrong-owner passkey fails before any send — in words, with both addresses", async () => {

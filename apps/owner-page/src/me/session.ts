@@ -102,7 +102,10 @@ export async function signIn(env: FlowEnvironment, namespaces: readonly Hex[]): 
         `this owner (${shortAddress(owner)}) has not signed up yet — there is no passkey key registered for it on the chain`,
       )
     }
-    saveStoredOwner(env.storage, { credentialId: asserted.credentialId, owner })
+    // Merge, never overwrite: a sign-in keeps the record's transports and public point — the
+    // fields /signup wrote and the ceremonies hint from — only the credential id and owner move
+    // to this passkey's (in-25 P-3).
+    saveStoredOwner(env.storage, { ...(stored ?? {}), credentialId: asserted.credentialId, owner })
     session = makeSession(env.deployment, owner, signer, state)
     return session
   } finally {

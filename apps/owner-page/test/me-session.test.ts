@@ -10,6 +10,7 @@ import type { FlowEnvironment } from "../src/owner/flows.js"
 import type { CredentialsContainerLike } from "../src/check/client.js"
 import { makeAssertion, makeKeyPair } from "./helpers.js"
 import { signIn } from "../src/me/session.js"
+import { loadStoredOwner, saveStoredOwner } from "../src/owner/session.js"
 
 /**
  * Task 4's /me session, end to end against the same fakes flows.test.ts drives: a credentials
@@ -246,6 +247,27 @@ describe("me session", () => {
     for (const buffer of kept) expect(buffer.every((b) => b === 0)).toBe(true)
     expect(session.open(row)).toEqual({ ok: false })
     session.end() // idempotent
+  })
+
+  it("sign-in merges into the stored record — transports and the public point survive (in-25 P-3)", async () => {
+    const { env, storage } = makeEnv()
+    const other = `0x${"ab".repeat(20)}` as Address
+    // What /signup wrote for another passkey on this shared browser: a full record, hints and all.
+    saveStoredOwner(storage.storage, {
+      credentialId: "cred-A",
+      transports: ["internal", "hybrid"],
+      x: "11".repeat(32),
+      y: "22".repeat(32),
+      owner: other,
+    })
+    const session = await signIn(env, [NS])
+    const after = loadStoredOwner(storage.storage)
+    expect(after?.owner).toBe(session.owner)
+    expect(after?.credentialId).not.toBe("cred-A")
+    expect(after?.transports).toEqual(["internal", "hybrid"])
+    expect(after?.x).toBe("11".repeat(32))
+    expect(after?.y).toBe("22".repeat(32))
+    session.end()
   })
 
   it("a passkey whose owner has no key on chain fails plainly", async () => {

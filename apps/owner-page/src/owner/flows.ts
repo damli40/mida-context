@@ -348,7 +348,6 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
       const { registeredKey } = await assertExpectedOwner({
         derived,
         expected: req.owner!,
-        stored: loadStoredOwner(env.storage),
         publicClient: env.publicClient,
         deployment: env.deployment,
       })
@@ -583,7 +582,6 @@ export async function confirmRevoke(
       const { registeredKey } = await assertExpectedOwner({
         derived,
         expected: req.owner!,
-        stored: loadStoredOwner(env.storage),
         publicClient: env.publicClient,
         deployment: env.deployment,
       })
@@ -681,7 +679,6 @@ export async function repairReaderWraps(
     const { registeredKey } = await assertExpectedOwner({
       derived,
       expected: input.owner,
-      stored: loadStoredOwner(env.storage),
       publicClient: env.publicClient,
       deployment: env.deployment,
     })

@@ -86,22 +86,20 @@ export class WrongOwnerError extends MidaError {
 /**
  * The wrong-owner check every post-signup flow runs right after the single passkey touch, before
  * any network write: the address derived from THIS passkey's PRF output must equal the owner the
- * link names, and the one this device remembers. A passkey that derives an owner with no key
- * registered on chain "has not signed up yet" — a different, plainer failure than a mismatch.
+ * link names. What this device remembers is deliberately not a second gate — a shared browser
+ * holding passkey B's record must not refuse owner A's valid link (in-25 P-3). A passkey that
+ * derives an owner with no key registered on chain "has not signed up yet" — a different,
+ * plainer failure than a mismatch.
  */
 export async function assertExpectedOwner(input: {
   derived: Address
   expected: Address
-  stored: StoredOwner | null
   publicClient: PublicClient
   deployment: Deployment
   /** When true (approve), also verify the captured assertion against the chain-registered key. */
 }): Promise<{ registeredKey: { qx: bigint; qy: bigint } | null }> {
   if (input.derived !== input.expected.toLowerCase()) {
     throw new WrongOwnerError(input.derived, input.expected)
-  }
-  if (input.stored?.owner !== undefined && input.derived !== input.stored.owner) {
-    throw new WrongOwnerError(input.derived, input.stored.owner)
   }
   const [qx, qy] = await readOwnerKey(input.publicClient, input.deployment, input.derived)
   if (qx === 0n && qy === 0n) {
