@@ -38,7 +38,9 @@ const SECONDS_PER_BLOCK = 0.4
 export const STALE_INDEX_BLOCKS = 150
 
 export function lagText(blocksBehind: number | null): { text: string; stale: boolean } {
-  if (blocksBehind === null || !Number.isFinite(blocksBehind)) return { text: "index unavailable", stale: true }
+  // Null means the index ANSWERED but its freshness row was missing, unreadable or for another
+  // chain — "index unavailable" would contradict the badge's "Read from the Envio index".
+  if (blocksBehind === null || !Number.isFinite(blocksBehind)) return { text: "index freshness unknown", stale: true }
   const blocks = Math.max(0, blocksBehind)
   const seconds = Math.round(blocks * SECONDS_PER_BLOCK)
   return { text: `≈ ${seconds} s behind Monad`, stale: blocks > STALE_INDEX_BLOCKS }

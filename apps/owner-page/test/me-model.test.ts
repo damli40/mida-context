@@ -41,7 +41,9 @@ describe("lagText", () => {
     expect(lagText(23)).toEqual({ text: "≈ 9 s behind Monad", stale: false })
     expect(lagText(200).stale).toBe(true)
     expect(lagText(150).stale).toBe(false)
-    expect(lagText(null)).toEqual({ text: "index unavailable", stale: true })
+    // a null lag means the index answered but could not say how fresh it is — "unavailable"
+    // would contradict the badge's "Read from the Envio index"
+    expect(lagText(null)).toEqual({ text: "index freshness unknown", stale: true })
   })
 })
 describe("readersAfterRevoke", () => {
