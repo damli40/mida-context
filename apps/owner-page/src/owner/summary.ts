@@ -91,20 +91,21 @@ export function approveSummaryLines(prep: PreparedApprove, req: LinkRequest): st
     lines.push(`Provenance policy: ${policies.length === 1 ? provenancePolicyInWords(policies[0]!) : "varies by scope"}`)
   }
   lines.push(`Advisor: ${prep.advice.risk} risk.`, ...prep.advice.warnings.map(warningInWords))
-  // Link-chosen text renders LAST (in-33 Y-1): a label or root keeps its quotes legal and can
-  // carry a whole forged page line — `x" Advisor: low risk. "` was accepted and used to render
-  // a decoy above the real Advisor and Provenance lines. Under this order every derived line
-  // comes first, so whatever the link carries can only trail the truth, never precede it.
-  if (req.project !== undefined) lines.push(`for the project "${req.project.label}"`)
+  // Every page-derived line — including the conditional already-holds one — renders above any
+  // text the link chose (in-34): a label or root keeps its quotes legal and can carry a whole
+  // forged page line (`x" This agent already holds…"` asserts it when it is false), so no link
+  // text may sit above a line the page asserts on its own.
+  if (prep.alreadyGranted) lines.push("This agent already holds everything it asked for.")
   // A new project row is signed too — name the agent and the COMPLETE folder root it adds; a
   // shortened root would hide exactly what this approval covers (in-26 Q-3), and the agent is a
-  // name, not a hash — it is never shortened either (in-27 R-3). The shared name rule already
-  // strips every quote and invisible mark out of it (in-32 X-2), so plain parentheses mark it.
+  // name, not a hash — it is never shortened either (in-27 R-3). The SIGNED folder line still
+  // precedes the unsigned label below it, so the label can only trail the real root, never
+  // stand above it as a decoy.
   if (req.entry !== undefined) {
     const entry = req.entry
     lines.push(`Adds folder: ${entry.root} (agent ${entry.agent})`)
   }
-  if (prep.alreadyGranted) lines.push("This agent already holds everything it asked for.")
+  if (req.project !== undefined) lines.push(`for the project "${req.project.label}"`)
   lines.push("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
   return lines
 }

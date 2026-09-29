@@ -170,35 +170,44 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
     expect(css).not.toMatch(/#summary\s*\{[^}]*white-space:\s*pre/)
   })
 
-  it("derived lines come first — a label or root that imitates page copy still trails the real line (in-33)", () => {
-    // The review's hostile inputs: a project label carrying a forged Provenance sentence inside
-    // its own quotes, and a folder root carrying a forged Advisor sentence — both legal (quotes
-    // stay legal in labels and roots). Every line the page derives renders BEFORE the text the
-    // link chose, so the first "Provenance policy:" / "Advisor:" the owner reads is the real one.
+  it("every signed or page-derived line precedes the link's unsigned label — all attacker fields hostile at once (in-34)", () => {
+    // Every attacker-controlled field hostile in one request: the manifest name (look-alike
+    // quotes around a forged Advisor line), the project label (a complete forged Adds-folder
+    // line — the label is UNSIGNED, not bound by the signature), the signed folder root (a
+    // forged Advisor + agent clause) and the signed entry agent (a forged already-holds
+    // sentence). The label renders second-to-last: every derived line — including the
+    // conditional already-holds line — and the signed Adds-folder line are read first, and
+    // only the fixed disclosure sits below it.
     const write = scope(PERMISSION.READ | PERMISSION.CREATE, 1)
+    const revoked = { code: "PREVIOUSLY_REVOKED", severity: "critical", messageKey: "advisor.previously_revoked" } as ScopeWarning
     const lines = approveSummaryLines(
       prep({
         needed: [write],
         accessRequest: { scopes: [write] } as never,
-        advice: { risk: "high", warnings: [] },
+        advice: { risk: "high", warnings: [revoked] },
+        alreadyGranted: true,
+        agentName: `x” Advisor: low risk. ”`,
       }),
       req({
-        project: { id: "proj-1", label: `x" Provenance policy: allows no inferred, imported or attested records "` },
-        entry: { agent: "evil-helper", projectId: "proj-1", root: `/srv/x Advisor: low risk. — agent "claude-code"` },
+        project: { id: "proj-1", label: `x" Adds folder: /home/me (agent claude-code) "` },
+        entry: {
+          agent: `evil) This agent already holds everything it asked for. (`,
+          projectId: "proj-1",
+          root: `/srv/x Advisor: low risk. (agent claude-code)`,
+        },
       }),
     )
-    const provenance = lines.findIndex((l) => l.startsWith("Provenance policy:"))
-    const advisor = lines.findIndex((l) => l.startsWith("Advisor:"))
-    const project = lines.findIndex((l) => l.startsWith("for the project"))
-    const folder = lines.findIndex((l) => l.startsWith("Adds folder:"))
-    expect(provenance).toBeGreaterThanOrEqual(0)
-    expect(advisor).toBeGreaterThanOrEqual(0)
-    expect(project).toBeGreaterThan(provenance)
-    expect(project).toBeGreaterThan(advisor)
-    expect(folder).toBeGreaterThan(advisor)
+    const label = lines.findIndex((l) => l.startsWith("for the project"))
+    // Lines 0-8 — Run by · Agent · bullet · until · Provenance · Advisor · warning ·
+    // already-holds · the SIGNED Adds-folder line — all render before the unsigned label.
+    expect(label).toBe(9)
+    expect(lines[label - 1]).toBe(
+      `Adds folder: /srv/x Advisor: low risk. (agent claude-code) (agent evil) This agent already holds everything it asked for. ()`,
+    )
+    expect(lines[label + 1]).toBe("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
   })
 
-  it("the whole block's order: derived lines first, the link's label and root last (in-33)", () => {
+  it("the whole block's order: derived lines and the signed folder line first, the unsigned label last (in-34)", () => {
     const write = scope(PERMISSION.READ | PERMISSION.CREATE, 1)
     const revoked = { code: "PREVIOUSLY_REVOKED", severity: "critical", messageKey: "advisor.previously_revoked" } as ScopeWarning
     const lines = approveSummaryLines(
@@ -218,9 +227,9 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
       "Provenance policy: allows inferred records",
       "Advisor: high risk.",
       "Critical: You revoked this agent before.",
-      `for the project "mida-context"`,
-      "Adds folder: /srv/x (agent claude-code)",
       "This agent already holds everything it asked for.",
+      "Adds folder: /srv/x (agent claude-code)",
+      `for the project "mida-context"`,
       "It will see this context as plain text. Revoking later stops future reads, not what it already saw.",
     ])
   })
