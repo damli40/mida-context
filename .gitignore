@@ -21,3 +21,11 @@ docs/problem-evidence/*.png
 docs/colosseum-cwf-rules.pdf
 docs/colosseum-cwf-rules.md
 DEVIN-REPORT-*.md
+
+# private working files: kept locally, never published
+log.md
+handoff.md
+CLAUDE.md
+docs/issue-register.md
+spike/DEVIN-REPORT.md
+.devin/
