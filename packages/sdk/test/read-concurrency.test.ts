@@ -11,6 +11,9 @@ import { MidaAgent } from "@mida/sdk"
  * and every verification are identical to the sequential loop. The fixture is a fake Context
  * API and a fake chain over REAL crypto: real sealed objects, real reader wraps, a real
  * RegistryReader-shaped client, so the concurrent path runs the same checks it always did.
+ * Since in-35 R-1 the records arrive in ONE getRecords multicall up front — the concurrency the
+ * worker pool still bounds is the per-object open-and-verify work, measured here through the
+ * one remaining per-object fetch, the epoch wrap.
  */
 
 const CHAIN_ID = 31337n
@@ -21,19 +24,21 @@ const AGENT_ID = `0x${"aa".repeat(32)}` as Hex
 const NAMESPACE = "goals.career"
 const NAMESPACE_ID = namespaceId(NAMESPACE)
 const AGENT_PRIVATE = randomBytes(32)
-const EPOCH_PRIVATE: Record<number, Uint8Array> = { 1: randomBytes(32), 2: randomBytes(32) }
+const EPOCH_PRIVATE: Record<number, Uint8Array> = {}
+const epochPrivate = (n: number): Uint8Array => (EPOCH_PRIVATE[n] ??= randomBytes(32))
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 interface Fixture {
   agent: MidaAgent
   objects: { contextId: Hex; value: string }[]
-  getRecordCalls: { maxInFlight: number }
+  /** in-flight overlap on the per-object work that is still per-object after in-35 R-1: the epoch-key fetch */
+  wrapInFlight: { max: number }
   wrapCalls: bigint[]
   tamper?: (record: Record<string, unknown>, contextId: Hex) => Record<string, unknown>
 }
 
-function fixture(count = 12, delayMs = 12): Fixture {
+function fixture(count = 12, delayMs = 12, epochs = 2): Fixture {
   const deployment = {
     chainId: CHAIN_ID,
     capabilityRegistry: CAPABILITY_REGISTRY,
@@ -43,7 +48,7 @@ function fixture(count = 12, delayMs = 12): Fixture {
   const fx: Fixture = {
     agent: undefined as unknown as MidaAgent,
     objects: [],
-    getRecordCalls: { maxInFlight: 0 },
+    wrapInFlight: { max: 0 },
     wrapCalls: [],
   }
   const records = new Map<string, Record<string, unknown>>()
@@ -51,13 +56,13 @@ function fixture(count = 12, delayMs = 12): Fixture {
   // lowercase 0x hex — the same helpers agent.test.ts uses, sealed.manifest + hexOf(ciphertext).
   const objects: { contextId: Hex; owner: Address; namespaceId: Hex; authorId: Hex; manifest: ObjectManifest; manifestHash: Hex; ciphertext: Hex }[] = []
   for (let i = 0; i < count; i += 1) {
-    const readEpoch = BigInt((i % 2) + 1) // two epochs, interleaved
+    const readEpoch = BigInt((i % epochs) + 1)
     const contextId = hexOf(randomBytes(32))
     const value = `object ${i}`
     const sealed = sealContextObject({
       payload: { v: 1, value, kind: "GOAL", provenance: { source: "AGENT_INFERRED" } },
       binding: { chainId: CHAIN_ID, contextRegistry: CONTEXT_REGISTRY, contextId, namespaceId: NAMESPACE_ID, readEpoch },
-      epochPublicKey: x25519PublicKey(EPOCH_PRIVATE[Number(readEpoch)]!),
+      epochPublicKey: x25519PublicKey(epochPrivate(Number(readEpoch))),
     })
     objects.push({ contextId, owner: OWNER, namespaceId: NAMESPACE_ID, authorId: AGENT_ID, manifest: sealed.manifest, manifestHash: sealed.manifestHash, ciphertext: hexOf(sealed.ciphertext) })
     records.set(contextId, {
@@ -81,8 +86,24 @@ function fixture(count = 12, delayMs = 12): Fixture {
     })
     fx.objects.push({ contextId, value })
   }
-  let inFlight = 0
+  // One record lookup both chain doors share: the batched multicall answers listed records and
+  // a lone readContract.getRecord serves anything else — the tamper hook sees either.
+  const serveRecord = (contextId: string) => {
+    const record = records.get(contextId)
+    if (record === undefined) throw new Error("not found")
+    return fx.tamper === undefined ? record : fx.tamper(record, contextId as Hex)
+  }
   const publicClient = {
+    // Multicall3 present (nonempty bytecode): getRecords takes its single-eth_call path.
+    getCode: async () => "0x6000",
+    multicall: async (params: { contracts: { args: readonly unknown[] }[] }) =>
+      params.contracts.map((contract) => {
+        try {
+          return { status: "success" as const, result: serveRecord((contract.args[0] as string).toLowerCase()) }
+        } catch (error) {
+          return { status: "failure" as const, error }
+        }
+      }),
     readContract: async (params: { address: Address; functionName: string; args: readonly unknown[] }) => {
       if (params.functionName === "getAgent") {
         return {
@@ -96,40 +117,37 @@ function fixture(count = 12, delayMs = 12): Fixture {
           active: true,
         }
       }
-      if (params.functionName === "getRecord") {
-        inFlight += 1
-        fx.getRecordCalls.maxInFlight = Math.max(fx.getRecordCalls.maxInFlight, inFlight)
-        try {
-          await sleep(delayMs)
-          const record = records.get(params.args[0] as string)
-          if (record === undefined) throw new Error("not found")
-          return fx.tamper === undefined ? record : fx.tamper(record, params.args[0] as Hex)
-        } finally {
-          inFlight -= 1
-        }
-      }
+      if (params.functionName === "getRecord") return serveRecord((params.args[0] as string).toLowerCase())
       throw new Error(`unexpected readContract ${params.functionName}`)
     },
   }
+  let wrapInFlight = 0
   const api = {
     account: { address: `0x${"55".repeat(20)}` as Address },
     listObjects: async () => ({ objects, partial: false }),
     getEpochWrap: async (params: { readEpoch: bigint }) => {
       fx.wrapCalls.push(params.readEpoch)
-      return wrapEpochPrivateKeyToAgent({
-        epochPrivateKey: EPOCH_PRIVATE[Number(params.readEpoch)]!,
-        agentEncryptionPublicKey: x25519PublicKey(AGENT_PRIVATE),
-        binding: {
-          chainId: CHAIN_ID,
-          capabilityRegistry: CAPABILITY_REGISTRY,
-          owner: OWNER,
-          namespaceId: NAMESPACE_ID,
-          readEpoch: params.readEpoch,
-          agentId: AGENT_ID,
-          agentKeyVersion: 1,
-        },
-        createdAt: 0n,
-      })
+      wrapInFlight += 1
+      fx.wrapInFlight.max = Math.max(fx.wrapInFlight.max, wrapInFlight)
+      try {
+        await sleep(delayMs)
+        return wrapEpochPrivateKeyToAgent({
+          epochPrivateKey: epochPrivate(Number(params.readEpoch)),
+          agentEncryptionPublicKey: x25519PublicKey(AGENT_PRIVATE),
+          binding: {
+            chainId: CHAIN_ID,
+            capabilityRegistry: CAPABILITY_REGISTRY,
+            owner: OWNER,
+            namespaceId: NAMESPACE_ID,
+            readEpoch: params.readEpoch,
+            agentId: AGENT_ID,
+            agentKeyVersion: 1,
+          },
+          createdAt: 0n,
+        })
+      } finally {
+        wrapInFlight -= 1
+      }
     },
   }
   fx.agent = new MidaAgent({
@@ -167,11 +185,13 @@ describe("MidaAgent.read bounded concurrency (R4-2)", () => {
     expect(results.map((o) => o.payload.value)).toEqual(fx.objects.map((o) => o.value))
   })
 
-  it("at most 6 object verifications are in flight, and the work really does overlap", async () => {
-    const fx = fixture(12)
+  it("at most 6 objects' work is in flight, and the work really does overlap", async () => {
+    // 12 objects on 12 distinct epochs: each worker's first act is the epoch-key fetch, so the
+    // wrap in-flight count tracks the worker pool's concurrency exactly.
+    const fx = fixture(12, 12, 12)
     await fx.agent.read(OWNER, NAMESPACE)
-    expect(fx.getRecordCalls.maxInFlight).toBeGreaterThan(1)
-    expect(fx.getRecordCalls.maxInFlight).toBeLessThanOrEqual(6)
+    expect(fx.wrapInFlight.max).toBeGreaterThan(1)
+    expect(fx.wrapInFlight.max).toBeLessThanOrEqual(6)
   })
 
   it("fetches each distinct epoch key exactly once — two calls for two epochs", async () => {

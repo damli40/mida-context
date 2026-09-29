@@ -421,8 +421,20 @@ export class MidaAgent {
     const { deployment } = this.#chain
     const { objects, partial } = await this.#api.listObjects({ owner: ownerAddress, namespaceId, capabilityId: capability.capabilityId })
     const epochKeyFor = this.#epochKeyResolver(ownerAddress, namespaceId, capability.capabilityId)
+    // One batched registry read fronts all the per-object work (in-35 R-1): the list used to
+    // cost a getRecord per object — ~14 sequential rounds at six workers for an 83-checkpoint
+    // project, past the handoff's 7.5 s read limit — plus a getRecord per reference even when
+    // the target was another listed record. getRecords answers the whole list in one
+    // Multicall3 call and the map serves both checks; only a reference outside the list still
+    // costs a lone getRecord. If the batch call throws, the read fails exactly as a failing
+    // getRecord failed it — no retry, no fallback path, and the map dies with this read.
+    const listed = new Map<string, ContextRecordView | null>()
+    const batched = await this.#reader.getRecords(objects.map((object) => object.contextId))
+    for (const [index, record] of batched.entries()) {
+      listed.set(objects[index]!.contextId.toLowerCase(), record)
+    }
     const readObject = async (object: AnchoredObject): Promise<ContextObject> => {
-      const record = await this.#verifiedRecord(ownerAddress, namespaceId, object)
+      const record = await this.#verifiedRecord(ownerAddress, namespaceId, object, listed)
       const epochPrivateKey = await epochKeyFor(record.readEpoch)
       const payload = openContextObject({
         manifest: object.manifest,
@@ -431,7 +443,7 @@ export class MidaAgent {
         epochPrivateKey,
         binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: record.contextId, namespaceId, readEpoch: record.readEpoch },
       })
-      await this.#verifyReferences(ownerAddress, record, payload)
+      await this.#verifyReferences(ownerAddress, record, payload, listed)
       return this.#toObject(record, name, payload, { at: record.createdAt })
     }
     // Workers pull indexes in list order and results land by index, so the output order is
@@ -1138,8 +1150,20 @@ export class MidaAgent {
     }
   }
 
-  async #verifiedRecord(owner: Address, namespaceId: Hex, object: AnchoredObject): Promise<ContextRecordView> {
-    const record = await this.#reader.getRecord(object.contextId)
+  /**
+   * The record the object claims plus every check that claim implies — the same set either way.
+   * `listed` is the one-batch answer readWithStatus fetched: a key present in it (even a null,
+   * the registry's "no such record") is used as-is; an id the batch somehow did not cover falls
+   * back to a lone getRecord rather than skipping verification.
+   */
+  async #verifiedRecord(
+    owner: Address,
+    namespaceId: Hex,
+    object: AnchoredObject,
+    listed: ReadonlyMap<string, ContextRecordView | null>,
+  ): Promise<ContextRecordView> {
+    const id = object.contextId.toLowerCase()
+    const record = listed.has(id) ? listed.get(id)! : await this.#reader.getRecord(object.contextId)
     if (
       record === null ||
       object.manifest.contextId !== object.contextId ||
@@ -1159,7 +1183,12 @@ export class MidaAgent {
    * acknowledges an agent proposal, which is itself a CONTEXT record. USER_CONFIRMED then needs at least one
    * `confirmed_from` reference, and IMPORTED/EXTERNAL_ATTESTATION at least one evidence-record target.
    */
-  async #verifyReferences(owner: Address, record: ContextRecordView, payload: ContextPayload): Promise<void> {
+  async #verifyReferences(
+    owner: Address,
+    record: ContextRecordView,
+    payload: ContextPayload,
+    listed: ReadonlyMap<string, ContextRecordView | null>,
+  ): Promise<void> {
     const references = payload.provenance.references ?? []
     const commitment = references.length === 0 ? zeroHash : evidenceCommitment(references)
     if (commitment !== record.evidenceCommitment) {
@@ -1167,9 +1196,15 @@ export class MidaAgent {
     }
     let evidenceTargets = 0
     let confirmedFrom = 0
-    // The reference lookups are independent chain reads — asked together (in-9 R-5), then each
-    // judged in order exactly as the serial loop did.
-    const targets = await Promise.all(references.map((reference) => this.#reader.getRecord(reference.recordId)))
+    // The reference lookups are independent reads — asked together (in-9 R-5), then each judged
+    // in order exactly as the serial loop did. A target that is itself a listed record is
+    // already answered by the batch (in-35 R-1); only an outside id still costs a chain call.
+    const targets = await Promise.all(
+      references.map((reference) => {
+        const id = reference.recordId.toLowerCase()
+        return listed.has(id) ? listed.get(id)! : this.#reader.getRecord(reference.recordId)
+      }),
+    )
     for (const [index, reference] of references.entries()) {
       const target = targets[index]!
       if (target === null || target.owner !== owner) {
