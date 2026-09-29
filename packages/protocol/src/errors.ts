@@ -117,6 +117,19 @@ export function displaySafeText(value: string): string {
 }
 
 /**
+ * The multi-line form of displaySafeText (in-40 L-4) — for text whose own line breaks must
+ * survive, like a handoff shown by `mida task show`. The Unicode line and paragraph separators
+ * become `\n` rather than spaces so a line break can never hide, and `\n` and `\t` stay; every
+ * other refused character still folds to one space. No collapsing, no trimming: the writer's
+ * line structure is the contract.
+ */
+export function displaySafeBlock(value: string): string {
+  return value
+    .replace(/[\u2028\u2029]/g, "\n")
+    .replace(new RegExp(UNACCEPTABLE_REQUEST_CHARS.source, "gu"), (ch) => (ch === "\n" || ch === "\t" ? ch : " "))
+}
+
+/**
  * The agent-name allow-list (in-34; tightened in-37). A name is accepted only when every
  * character is listed: the first must be a letter or number in any script — never a
  * combining mark, which would attach to the page's own opening quote; the rest may add

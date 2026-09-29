@@ -541,6 +541,29 @@ describe("the crude mida command", () => {
     expect(lines.some((line) => /^  projects\.current: 0x[0-9a-f]{64} written by /.test(line))).toBe(true)
   }, 300_000)
 
+  it("a fact holding terminal escapes and a bidi override prints one clean line (in-40 L-4)", async () => {
+    const before = lines.length
+    // ESC+[, the bidi override and a newline all count as terminal paint; remember accepts them
+    // (they are refused only in fields that carry meaning), so the print layer must fold them
+    expect(await run("remember", "plain start[2J[Hmiddle‮end\nrest")).toBe(0)
+    expect(await run("read", "--as", "claude-code")).toBe(0)
+    const dirty = lines.slice(before).find((line) => line.includes("plain start") && line.includes("(id "))
+    expect(dirty).toBeDefined()
+    // every refused character became one space, collapsed — the fact stays one printed line
+    expect(dirty).toMatch(/^  preferences\.communication: plain start \[2J \[Hmiddle end rest \(id [0-9a-f]{8}/)
+    expect(dirty).not.toContain("")
+    expect(dirty).not.toContain("‮")
+    expect(dirty).not.toContain("\n")
+  })
+
+  it("a fact's zero-width joiners survive the display fold (in-40 L-4)", async () => {
+    const before = lines.length
+    expect(await run("remember", "can be ‍ joined")).toBe(0)
+    const after = lines.length
+    expect(await run("read", "--as", "claude-code")).toBe(0)
+    expect(lines.slice(after).some((line) => line.includes("can be ‍ joined"))).toBe(true)
+  })
+
   it("a namespace id the tree cannot name prints its first ten characters, never nothing (R5-3)", async () => {
     const { namespaceLabel } = await import("@mida/midad")
     const { namespaceId } = await import("@mida/protocol")

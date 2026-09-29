@@ -7,7 +7,7 @@ import { isDeepStrictEqual } from "node:util"
 import { createInterface } from "node:readline"
 import { compareChainOrder, orderTime, recordedAt, taskOf } from "@mida/checkpoint"
 import type { StoredCheckpoint } from "@mida/checkpoint"
-import { decodeUint64, isMidaError, namespaceById } from "@mida/protocol"
+import { decodeUint64, displaySafeBlock, displaySafeText, isMidaError, namespaceById } from "@mida/protocol"
 import type { Address, Hex, RequestedScope } from "@mida/protocol"
 import { privateKeyToAccount } from "viem/accounts"
 import type { Deployment } from "@mida/chain"
@@ -387,7 +387,11 @@ export async function runCliWithRuntime(
               // date; a fact the chain shows superseded carries its replacement's id and date
               if (only === undefined || fact.namespace === only) {
                 const replaced = fact.replacedBy === undefined ? "" : ` (replaced by ${factShortId(fact.replacedBy.contextId)} on ${factStamp(fact.replacedBy.assertedAt)})`
-                print(`  ${fact.namespace}: ${fact.text} (id ${factShortId(fact.contextId)}, ${factStamp(fact.assertedAt)})${replaced}`)
+                // a fact is stored text the owner did not type today: control chars, bidi
+                // overrides and hidden newlines all become spaces so one fact stays one
+                // printed line and can never repaint the terminal (in-40 L-4)
+                const text = displaySafeText(fact.text).replace(/\s+/g, " ").trim()
+                print(`  ${fact.namespace}: ${text} (id ${factShortId(fact.contextId)}, ${factStamp(fact.assertedAt)})${replaced}`)
               }
             }
           }
@@ -540,7 +544,9 @@ async function runTaskCommand(
     // the read borrowed an approved agent's identity — name it, so the answer's provenance is
     // never implicit (in-18 N3)
     print(`(read as ${picked.agent})`)
-    print(result.text)
+    // the handoff's own line breaks are the contract, but every other unsafe byte — an ESC
+    // sequence, a bidi override, a zero-width space — folds to a space (in-40 L-4)
+    print(displaySafeBlock(result.text))
     return result.kind === "refused" ? 1 : 0
   }
 

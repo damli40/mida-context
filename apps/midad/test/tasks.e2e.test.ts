@@ -92,6 +92,21 @@ describe("named tasks on local Anvil (tk-1)", () => {
         compiledBy: "test",
         checkpoint: sampleCheckpoint({ eventId: "cp-tasks-main", objective: MAIN_MARKER, progress: ["main progress line"] }),
       })
+      // a checkpoint whose own text is hostile to a terminal — an ESC erase sequence, a bidi
+      // override and a zero-width space inside the objective, a joiner and line separators in
+      // progress — under its own task so the per-task assertions above never see it (in-40 L-4)
+      await saveCheckpoint(runtime, "claude-code", {
+        projectId: "proj-tasks",
+        sessionId: "sess-dirty",
+        continuesSession: null,
+        compiledBy: "test",
+        task: "dirty",
+        checkpoint: sampleCheckpoint({
+          eventId: "cp-tasks-dirty",
+          objective: "clean start[2J[Hmid‮end​",
+          progress: ["sec‍ond chance", "own break\ntoo", "second third"],
+        }),
+      })
     } finally {
       await runtime.close()
     }
@@ -290,5 +305,23 @@ describe("named tasks on local Anvil (tk-1)", () => {
     expect(result.text).toContain(MAIN_MARKER)
     expect(result.text).toContain("- sdk — claude-code — ")
     expect(result.text).toContain("- grant-app — claude-code — ")
+  }, STEP_TIMEOUT)
+
+  it("(h) `mida task show` folds terminal escapes out of the handoff but keeps the text's own line breaks (in-40 L-4)", async () => {
+    const show = await cli("task", "show", "dirty")
+    expect(show.code).toBe(0)
+    // the read ran under an approved agent's identity, same as every task show
+    expect(show.lines[0]).toBe("(read as claude-code)")
+    const shown = show.lines.join("\n")
+    // ESC died to a space, leaving "[2J[H" as inert text; the bidi override and the zero-width
+    // space folded the same way — nothing in the checkpoint can repaint the owner's terminal
+    expect(shown).toContain("clean start [2J[Hmid end")
+    expect(shown).not.toContain("")
+    expect(shown).not.toContain("‮")
+    expect(shown).not.toContain("​")
+    // a zero-width JOINER is not paint — it carries meaning inside a word and survives the fold
+    expect(shown).toContain("sec‍ond")
+    // and the text's own line breaks stay line breaks — a literal \n and a folded U+2028 alike
+    expect(shown).toContain("own\nbreak\ntoo")
   }, STEP_TIMEOUT)
 })

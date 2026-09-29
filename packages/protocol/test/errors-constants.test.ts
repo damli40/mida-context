@@ -15,6 +15,7 @@ import {
   RECORD_RELATION_CODE,
   RECORD_TYPE,
   UNACCEPTABLE_REQUEST_CHARS,
+  displaySafeBlock,
   displaySafeText,
   isAcceptableAgentName,
   isMidaError,
@@ -101,6 +102,18 @@ describe("UNACCEPTABLE_REQUEST_CHARS (in-30 T-3)", () => {
   it("displaySafeText folds each refused character to a single space — for fields that are shown, not refused", () => {
     const dirty = `line one${chr(0x0a)}line two${chr(0x2028)}${chr(0x2029)}${chr(0x200b)}bidi${chr(0x202a)}${chr(0x2067)}${chr(0xfeff)}`
     expect(displaySafeText(dirty)).toBe("line one line two   bidi   ")
+  })
+
+  it("displaySafeBlock keeps real line breaks but folds every other refused character — for text shown whole (in-40 L-4)", () => {
+    // ESC opens an erase-screen sequence, 202E reverses the line's text order, 2028/2029 are
+    // Unicode's hidden line separators, 200B hides inside a word — none may reach the terminal.
+    const dirty = `first line${chr(0x1b)}[2J\nsecond${chr(0x202e)}line${chr(0x200b)}\tindented${chr(0x2028)}third${chr(0x2029)}done`
+    expect(displaySafeBlock(dirty)).toBe("first line [2J\nsecond line \tindented\nthird\ndone")
+  })
+
+  it("displaySafeBlock collapses and trims nothing — and keeps the two joiners (in-40 L-4)", () => {
+    const text = `  padded\u200cword\u200dend  \n\n`
+    expect(displaySafeBlock(text)).toBe(text)
   })
 })
 
