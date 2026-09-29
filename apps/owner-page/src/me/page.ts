@@ -27,7 +27,7 @@ import { describeError } from "../owner/session.js"
 import { shortAddress } from "../owner/secrets.js"
 import { chipsFor, isTxHash, provenanceBadge } from "./model.js"
 import type { Badge } from "./model.js"
-import { BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
+import { BLOCKED_AT_STORE_TEXT, INDEX_URL_NOT_ALLOWED_TEXT, loadMe } from "./sources.js"
 import type { AgentRow, MeData, MePorts, RecordRow } from "./sources.js"
 import { signIn } from "./session.js"
 import type { MeSession } from "./session.js"
@@ -547,15 +547,20 @@ function livePorts(env: FlowEnvironment, session: MeSession, indexUrl: string | 
 
 // --- boot ---------------------------------------------------------------------------------------
 
-/** The index URL is Worker configuration (env var → /me/config.json), never baked into the bundle. */
-async function readIndexUrl(): Promise<string | null> {
+/**
+ * The index URL is Worker configuration (env var → /me/config.json), never baked into the
+ * bundle. `notAllowed` means the Worker refused the configured URL — the page's own CSP would
+ * block it, which is a misconfiguration to name, not an index that is down.
+ */
+async function readIndexConfig(): Promise<{ indexUrl: string | null; notAllowed: boolean }> {
   try {
     const response = await fetch("/me/config.json")
-    if (!response.ok) return null
-    const body = (await response.json()) as { indexUrl?: unknown }
-    return typeof body.indexUrl === "string" && body.indexUrl.length > 0 ? body.indexUrl : null
+    if (!response.ok) return { indexUrl: null, notAllowed: false }
+    const body = (await response.json()) as { indexUrl?: unknown; reason?: unknown }
+    const indexUrl = typeof body.indexUrl === "string" && body.indexUrl.length > 0 ? body.indexUrl : null
+    return { indexUrl, notAllowed: body.reason === "index-url-not-allowed" }
   } catch {
-    return null
+    return { indexUrl: null, notAllowed: false }
   }
 }
 
@@ -646,13 +651,13 @@ function boot(): void {
     void (async () => {
       button.disabled = true
       const env = makeEnv()
-      const indexUrl = await readIndexUrl()
+      const indexConfig = await readIndexConfig()
       progressLine("Asking for your passkey…")
       // Secrets for every area in the frozen tree are derived in the one ceremony — the seed is
       // released before signIn returns, whatever the record list turns out to hold.
       const session = await signIn(env, NAMESPACE_TREE_V1.map((node) => node.id))
       progressLine("Signed in — reading agents, grants and records…")
-      const ports = livePorts(env, session, indexUrl)
+      const ports = livePorts(env, session, indexConfig.indexUrl)
       // The store client signs every read as the owner — teardown drops it so a signed-out page
       // cannot issue owner-signed calls on a leftover key.
       const storeHandle = revocableStore(ports.store)
@@ -660,6 +665,11 @@ function boot(): void {
       // Every render is a fresh read — the page re-reads, it does not assume.
       const refresh = async (): Promise<void> => {
         const data = await loadMe(session.owner, ports)
+        if (indexConfig.notAllowed) {
+          // The deployment named an index the page's CSP refuses — say that, never "unreachable".
+          data.lag = { text: INDEX_URL_NOT_ALLOWED_TEXT, stale: true }
+          data.agentsUnavailable = INDEX_URL_NOT_ALLOWED_TEXT
+        }
         const root = renderMe(data, document, (row) => session.open(row))
         el("me-root").replaceChildren(root)
       }

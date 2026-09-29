@@ -125,10 +125,38 @@ describe("/me", () => {
     expect(res.headers.get("Content-Security-Policy")).toBe(CONTENT_SECURITY_POLICY)
   })
 
-  it("answers indexUrl: null when the env var is unset — the page falls back to chain logs", async () => {
+  it("answers indexUrl: null when the env var is unset — the page reports the index missing", async () => {
     const { env } = fakeAssets()
     const res = await worker.fetch(new Request("https://app.midacontext.xyz/me/config.json"), env)
     expect(await res.json()).toEqual({ indexUrl: null })
+  })
+
+  it("never serves an index URL the page's own CSP refuses — a foreign origin answers not-allowed", async () => {
+    // A self-hosted index origin is a valid deployment, but connect-src is a fixed five-entry
+    // list — serving the URL anyway would read as a dead index, not a blocked one.
+    const indexUrl = "https://mida-index.example.org/v1/graphql"
+    const { env } = fakeAssets(indexUrl)
+    const res = await worker.fetch(new Request("https://app.midacontext.xyz/me/config.json"), env)
+    expect(await res.json()).toEqual({ indexUrl: null, reason: "index-url-not-allowed" })
+    // and the CSP does in fact refuse that origin — the gate and the page agree
+    const connectSrc = CONTENT_SECURITY_POLICY.split(";")
+      .map((d) => d.trim())
+      .find((d) => d.startsWith("connect-src"))!
+      .split(/\s+/)
+      .slice(1)
+    expect(connectSrc).not.toContain(new URL(indexUrl).origin)
+  })
+
+  it("an http:// index URL is not-allowed too — mixed content on an https page", async () => {
+    const { env } = fakeAssets("http://localhost:8080/v1/graphql")
+    const res = await worker.fetch(new Request("https://app.midacontext.xyz/me/config.json"), env)
+    expect(await res.json()).toEqual({ indexUrl: null, reason: "index-url-not-allowed" })
+  })
+
+  it("a URL that is not a URL at all answers not-allowed rather than throwing", async () => {
+    const { env } = fakeAssets("not a url")
+    const res = await worker.fetch(new Request("https://app.midacontext.xyz/me/config.json"), env)
+    expect(await res.json()).toEqual({ indexUrl: null, reason: "index-url-not-allowed" })
   })
 })
 

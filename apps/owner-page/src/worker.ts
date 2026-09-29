@@ -1,4 +1,4 @@
-import { securityHeaders } from "./headers.js"
+import { indexUrlAllowed, securityHeaders } from "./headers.js"
 
 /** The Workers static-assets binding declared in wrangler.toml. */
 export interface OwnerPageEnv {
@@ -28,9 +28,17 @@ export default {
     const url = new URL(request.url)
     // The one dynamic answer: /me reads the index URL from Worker config so a re-deployed index
     // changes the path without a rebuild. no-store — a stale answer would point the page at a
-    // dead deployment.
+    // dead deployment. A configured URL the page's own CSP refuses is never served as usable —
+    // the reason field lets /me say "not allowed" instead of reporting a dead index.
     if (url.pathname === "/me/config.json") {
-      return new Response(JSON.stringify({ indexUrl: env.INDEX_GRAPHQL_URL ?? null }), {
+      const configured = env.INDEX_GRAPHQL_URL
+      const body =
+        configured === undefined
+          ? { indexUrl: null }
+          : indexUrlAllowed(configured)
+            ? { indexUrl: configured }
+            : { indexUrl: null, reason: "index-url-not-allowed" }
+      return new Response(JSON.stringify(body), {
         status: 200,
         headers: {
           "content-type": "application/json; charset=utf-8",

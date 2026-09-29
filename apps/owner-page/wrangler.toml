@@ -1,6 +1,8 @@
 name = "mida-owner-page"
 main = "src/worker.ts"
 compatibility_date = "2026-09-21"
+# Dashboard-set INDEX_GRAPHQL_URL must survive every deploy, or /me and the keep-alive go dark.
+keep_vars = true
 
 # The Worker only serves the static bundle produced by `node scripts/build.mjs` — no databases,
 # no secrets, no node imports, so no compatibility flags and no [vars] are needed.

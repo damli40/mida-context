@@ -17,3 +17,25 @@ export function securityHeaders(isHtml: boolean): Record<string, string> {
     ...(isHtml ? { "Cache-Control": "no-store" } : {}),
   }
 }
+
+// The origin list inside connect-src, parsed from the CSP itself so the Worker cannot drift from
+// what the page is actually allowed to call.
+const CONNECT_SRC = CONTENT_SECURITY_POLICY.split(";")
+  .map((directive) => directive.trim())
+  .find((directive) => directive.startsWith("connect-src"))!
+  .split(/\s+/)
+  .slice(1)
+
+/**
+ * Whether the page's own CSP would let /me call this index URL — https and an origin named in
+ * connect-src. Serving a URL the CSP refuses reads as a dead index, never as the misconfiguration
+ * it is, so the Worker answers "not allowed" instead of handing the page a URL it cannot use.
+ */
+export function indexUrlAllowed(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return url.protocol === "https:" && CONNECT_SRC.includes(url.origin)
+  } catch {
+    return false
+  }
+}

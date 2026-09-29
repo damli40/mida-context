@@ -124,6 +124,13 @@ export const AGENT_LIST_NEEDS_INDEX =
  * partial scan, not a list.
  */
 export const AGENT_LIST_SYNCING = "Agent list unavailable — the index is still catching up and the chain scan did not finish"
+/**
+ * The exact wording when the deployment set an index URL the page's own CSP refuses — the
+ * Worker reports `index-url-not-allowed`, and blaming a reachable index would be wrong.
+ * Pinned verbatim by in-25 P-5.
+ */
+export const INDEX_URL_NOT_ALLOWED_TEXT =
+  "The index address in this deployment is not allowed by the page's security settings."
 /** The banner when an index answer fills the query's page — more rows may exist unsent. */
 export const INDEX_LIMIT_TEXT = "list may be incomplete — the index has more rows than the page asked for"
 /** The exact agent-state wording for a store deny — pinned by the plan, rendered by the page. */
