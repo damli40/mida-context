@@ -2501,7 +2501,7 @@ async function main(): Promise<void> {
 
   const ensured = await ensureCurrentDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS })
   if (!ensured.up) {
-    print(ensured.refusal ?? "midad did not start; run `mida init` first")
+    print(ensured.refusal ?? "midad did not start; run mida doctor")
     process.exitCode = 1
     return
   }

@@ -628,9 +628,13 @@ not sent twice. Ctrl-C still works, and the same advice applies after it.
 The Mida service is running but did not answer in time, usually because it is busy. The session carries on without
 the handoff, and the next session asks again. If it keeps happening, run `mida doctor`.
 
-**`mida doctor`: "PROBLEM: the Mida service (pid <pid>) is running but cannot be reached".**
-An older service lost its socket file, so nothing can reach it. Run `kill <pid>`; the next `mida` command or agent
-session starts a fresh service, which sends the saves still waiting in the queue.
+**`mida doctor`: "PROBLEM: the Mida service (pid <pid>) is running but has not answered for 5 s".**
+The service is either busy or lost its socket file. Run `mida doctor` again in a minute; if the line is still there,
+run `kill <pid>`. The next agent session, or `mida task`, starts a fresh service, which sends the saves still waiting in the queue.
+
+**`mida doctor`: "PROBLEM: midad.lock names pid <pid>, which is not a Mida service".**
+The last Mida service did not exit cleanly and another program now has its process number. Open any agent session or
+run `mida task`; the new service clears the stale lock. Do not kill that pid: it is not Mida.
 
 **`mida doctor`: "midad runs … @ <old commit>; this command runs … @ <new commit>".**
 The Mida service is still the old version after an update. Run any `mida` command; it replaces the service.
