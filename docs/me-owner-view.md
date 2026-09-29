@@ -80,13 +80,17 @@ Two honest caveats about the keep-alive:
 The full steps live in `apps/indexer/README.md` ("Deploy to Envio's hosted service"). Short version:
 
 1. Push this repo to GitHub.
-2. On envio.dev, create a hosted indexer from the repo; set the config path to
-   `apps/indexer/config.yaml`.
-3. Set `OUR_OPERATORS` (comma-separated, lowercase, our own operator addresses — see the README's
-   warning: empty means *every* agent counts as "outside", inflating the traction number) and
-   `ENVIO_API_TOKEN` in the deployment's environment.
-4. Envio builds, indexes from `start_block`, and gives you a public GraphQL endpoint of the form
+2. On envio.dev, add an indexer from the repo: root directory `apps/indexer`, config file
+   `config.yaml`, deployment branch `envio`.
+3. Set `ENVIO_OUR_OPERATORS` (comma-separated, lowercase, our own operator addresses — see the
+   README's warning: empty means *every* agent counts as "outside", inflating the traction number)
+   and `ENVIO_API_TOKEN` in the indexer's environment variables. Envio Cloud only passes variables
+   whose names start with `ENVIO_`, so the old name `OUR_OPERATORS` would never reach the indexer.
+4. Push the commit to index to the `envio` branch. Envio builds, indexes from `start_block`, and
+   gives you a public GraphQL endpoint of the form
    `https://indexer.dev.hyperindex.xyz/<deployment-id>/v1/graphql`. No API key is needed to query.
+   If the URL Envio gives you is on a different host, `/me` reports "not allowed" until that host
+   is added to `connect-src` in `apps/owner-page/src/headers.ts` and the Worker is redeployed.
 5. Point the owner page at it: set the Worker's `INDEX_GRAPHQL_URL` variable to that URL (a plain
    variable — `[vars]` in `wrangler.toml` or the Cloudflare dashboard; it is served to the page at
    `/me/config.json`, so it is **not** a secret).

@@ -24,7 +24,7 @@ ids, never plaintext context, so the index never holds anything private.
 | `owners` | Distinct addresses that appeared as `owner` in any event | Not people. One team can be many addresses; one person can rotate wallets. Treat it as "distinct owner keys seen", an upper bound on teams |
 | `agents` | Distinct `agentId`s ever registered | Not "agents still alive" — revoked agents stay in the count (`Agent.revokedByOwners` shows how many times an owner revoked them) |
 | `operators` | Distinct addresses that registered at least one agent | Not teams either — a team may deploy several operator keys |
-| `agentsByOutsideOperators` | Agents whose registering operator is **not** in `OUR_OPERATORS` | **This is the traction number.** It means "someone other than us pointed an agent at Mida". It does not prove they finished an integration — only that they registered on-chain |
+| `agentsByOutsideOperators` | Agents whose registering operator is **not** in `ENVIO_OUR_OPERATORS` | **This is the traction number.** It means "someone other than us pointed an agent at Mida". It does not prove they finished an integration — only that they registered on-chain |
 | `grants` / `activeGrants` | Capability grants ever made / granted and **not revoked** | `activeGrants` does **not** subtract expired grants. The index has no clock: it stores `expiresAt` on each `Grant` and readers filter on it themselves. "Active" here means "still valid as far as the chain knows" |
 | `capabilityRevocations` / `agentRevocations` | `CapabilityRevoked` events (one grant ended) / `AgentRevoked` events (every grant of that owner–agent pair ended at once) | A single `AgentRevoked` can end many grants; `activeGrants` drops by that many, not by one |
 | `contextRecords` | `ContextRegistered` events with `recordType = 0` | Evidence writes emit *both* `ContextRegistered(recordType=1)` and `EvidenceRegistered`; type-1 records count in `evidenceRecords`, never here — no double counting |
@@ -39,17 +39,19 @@ manifest version, `isOutsideOperator` flag), `Grant` (owner, agent, namespace, p
 `ContextRecord`, `Namespace`, and `TimelineEntry` — one row per owner-bearing event, the
 per-owner audit trail.
 
-## ⚠️ `OUR_OPERATORS` — the one config value that changes the headline number
+## ⚠️ `ENVIO_OUR_OPERATORS` — the one config value that changes the headline number
 
-`agentsByOutsideOperators` is computed against `OUR_OPERATORS`, a comma-separated, lowercase
-list of **our own** operator addresses, read from the environment at indexing time.
+`agentsByOutsideOperators` is computed against `ENVIO_OUR_OPERATORS`, a comma-separated, lowercase
+list of **our own** operator addresses, read from the environment at indexing time. Envio Cloud
+only passes environment variables whose names start with `ENVIO_`, so set this name there. For a
+local run, the older name `OUR_OPERATORS` still works when `ENVIO_OUR_OPERATORS` is unset.
 
-**If `OUR_OPERATORS` is empty or unset, every operator counts as outside.** That makes the
+**If the list is empty or unset, every operator counts as outside.** That makes the
 traction number bigger than the truth — exactly the kind of inflated claim this index exists to
 prevent. Before quoting `agentsByOutsideOperators` to anyone, confirm the list is populated:
 
 ```bash
-OUR_OPERATORS=0xourfirstoperator,0xoursecondoperator
+ENVIO_OUR_OPERATORS=0xourfirstoperator,0xoursecondoperator
 ```
 
 To recompute after changing it, re-index from `start_block` (drop the deployment's data and let
@@ -95,10 +97,15 @@ Nothing else hardcodes an address — handlers work purely in ids.
 > **Not run as part of this build** — needs the repo on GitHub and an Envio account.
 
 1. Push this repo to GitHub.
-2. On envio.dev, create a hosted indexer from this repo; set the config path to
-   `apps/indexer/config.yaml`.
-3. Set `OUR_OPERATORS` and `ENVIO_API_TOKEN` in the deployment's environment.
-4. Envio builds, indexes from `start_block`, and serves a public GraphQL endpoint — the URL a
+2. On envio.dev, add an indexer from this repo. Set the root directory to `apps/indexer`, the
+   config file to `config.yaml` (if the form asks for a path from the repo root, use
+   `apps/indexer/config.yaml`), and the deployment branch to `envio`.
+3. In the indexer's environment variables, set `ENVIO_OUR_OPERATORS` (see the warning above) and
+   `ENVIO_API_TOKEN`. Envio Cloud only passes variables whose names start with `ENVIO_`.
+4. Push the commit you want indexed to the `envio` branch. Each push to that branch starts a new
+   deployment that re-indexes from `start_block`, and the free plan allows 3 deployments per
+   indexer, so push there only when you mean to deploy.
+5. Envio builds, indexes from `start_block`, and serves a public GraphQL endpoint — the URL a
    judge queries.
 
 ## Queries a judge can paste
