@@ -131,6 +131,29 @@ describe("/me", () => {
     expect(await res.json()).toEqual({ indexUrl: null })
   })
 
+  it("an empty INDEX_GRAPHQL_URL means not configured — indexUrl: null with no reason (in-26 Q-4)", async () => {
+    // A cleared dashboard field or `[vars] INDEX_GRAPHQL_URL = ""` must read as "no index",
+    // not as a URL the CSP refused — and the cron already treats "" as unset, so the halves
+    // agree.
+    const { env } = fakeAssets("")
+    const res = await worker.fetch(new Request("https://app.midacontext.xyz/me/config.json"), env)
+    expect(await res.json()).toEqual({ indexUrl: null })
+  })
+
+  it("serves an index on the page's own origin — the CSP's 'self' already allows it (in-26 Q-4)", async () => {
+    const indexUrl = "https://app.midacontext.xyz/v1/graphql"
+    const { env } = fakeAssets(indexUrl)
+    const res = await worker.fetch(new Request("https://app.midacontext.xyz/me/config.json"), env)
+    expect(await res.json()).toEqual({ indexUrl })
+  })
+
+  it("but 'self' means THIS page's origin — the same URL on a foreign origin stays refused", async () => {
+    const indexUrl = "https://app.midacontext.xyz/v1/graphql"
+    const { env } = fakeAssets(indexUrl)
+    const res = await worker.fetch(new Request("https://other-host.example.org/me/config.json"), env)
+    expect(await res.json()).toEqual({ indexUrl: null, reason: "index-url-not-allowed" })
+  })
+
   it("never serves an index URL the page's own CSP refuses — a foreign origin answers not-allowed", async () => {
     // A self-hosted index origin is a valid deployment, but connect-src is a fixed five-entry
     // list — serving the URL anyway would read as a dead index, not a blocked one.

@@ -29,13 +29,15 @@ const CONNECT_SRC = CONTENT_SECURITY_POLICY.split(";")
 
 /**
  * Whether the page's own CSP would let /me call this index URL — https and an origin named in
- * connect-src. Serving a URL the CSP refuses reads as a dead index, never as the misconfiguration
- * it is, so the Worker answers "not allowed" instead of handing the page a URL it cannot use.
+ * connect-src, where connect-src's 'self' means the origin the page was served from. Serving a
+ * URL the CSP refuses reads as a dead index, never as the misconfiguration it is, so the Worker
+ * answers "not allowed" instead of handing the page a URL it cannot use.
  */
-export function indexUrlAllowed(value: string): boolean {
+export function indexUrlAllowed(value: string, selfOrigin: string): boolean {
   try {
     const url = new URL(value)
-    return url.protocol === "https:" && CONNECT_SRC.includes(url.origin)
+    if (url.protocol !== "https:") return false
+    return CONNECT_SRC.includes(url.origin) || (CONNECT_SRC.includes("'self'") && url.origin === selfOrigin)
   } catch {
     return false
   }

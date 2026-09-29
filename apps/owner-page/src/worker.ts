@@ -33,9 +33,9 @@ export default {
     if (url.pathname === "/me/config.json") {
       const configured = env.INDEX_GRAPHQL_URL
       const body =
-        configured === undefined
+        configured === undefined || configured === ""
           ? { indexUrl: null }
-          : indexUrlAllowed(configured)
+          : indexUrlAllowed(configured, url.origin)
             ? { indexUrl: configured }
             : { indexUrl: null, reason: "index-url-not-allowed" }
       return new Response(JSON.stringify(body), {

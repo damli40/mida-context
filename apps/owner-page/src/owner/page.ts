@@ -49,8 +49,8 @@ export function parsePageLink(flow: FlowName): ParsedLink {
 /**
  * WebAuthn's rule: the ceremony's rpId must equal the page's host or a registrable suffix of it.
  * The contract pins `deployment.vaultRpId`, so when the page is served somewhere that cannot
- * legitimately claim that rpId (the deployed origin is app.midacontext.xyz while the pinned
- * value is vault.mida.xyz), the ceremony would only fail inside the browser — explain it in
+ * legitimately claim that rpId (the deployment pins app.midacontext.xyz — a preview host or a
+ * renamed domain cannot), the ceremony would only fail inside the browser — explain it in
  * words first, before any prompt.
  */
 export function assertRpGate(): void {
