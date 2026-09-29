@@ -58,6 +58,8 @@ async function stubRpc(): Promise<{ url: string; close(): Promise<void> }> {
       if (call.method === "eth_blockNumber") return reply("0x64")
       if (call.method === "eth_getTransactionCount") return reply("0x0")
       if (call.method === "eth_getBalance") return reply("0x0")
+      // a deployed contract over zero state — decodes cleanly (e.g. ownerP256Key → (0,0))
+      if (call.method === "eth_call") return reply(`0x${"0".repeat(128)}`)
       return reply("0x")
     })
   })
@@ -218,8 +220,66 @@ describe("mida sponsor on|off", () => {
     try {
       expect(await run("sponsor", "on")).toBe(0)
       const lines: string[] = []
-      await runDoctor({ home, print: (line) => lines.push(line), env: {}, daemonProbeMs: 50 })
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        env: {},
+        daemonProbeMs: 50,
+        // a file naming the hosted sponsor must still never reach it (B-7)
+        fetch: async () => new Response("{}", { status: 200 }),
+        sponsorReachable: async () => true,
+      })
       expect(lines).toContain("ok: sponsor: sponsor.midacontext.xyz (network.json)")
+    } finally {
+      await close()
+    }
+  })
+
+  it("doctor's sponsor probes never touch the global fetch — everything goes through the injected one (in-39 B-7)", async () => {
+    // a passkey home with no agents makes no chain reads at all, so the only remote calls a
+    // doctor run could make are the sponsor and store probes — all of them must ride deps.fetch
+    const { home, close } = await setup({ passkey: true, sponsorUrl: HOSTED_SPONSOR_URL })
+    try {
+      const realFetch = globalThis.fetch
+      const fetched: string[] = []
+      const leaked: string[] = []
+      globalThis.fetch = ((input: unknown, init?: RequestInit) => {
+        const url = String(input instanceof Request ? input.url : input)
+        // the test's own stub RPC is a loopback server it started; anything else that rides the
+        // global fetch is a leak — the sponsor must never be one of them
+        if (!/^https?:\/\/(127\.0\.0\.1|localhost)([:/]|$)/.test(url)) {
+          leaked.push(url)
+          return Promise.reject(new Error(`global fetch left the machine during doctor: ${url}`))
+        }
+        return realFetch(input as never, init)
+      }) as typeof fetch
+      try {
+        const lines: string[] = []
+        await runDoctor({
+          home,
+          print: (line) => lines.push(line),
+          env: {},
+          daemonProbeMs: 50,
+          fetch: async (input) => {
+            fetched.push(String(input))
+            return new Response(
+              JSON.stringify({ limits: { signingsPerSenderPerDay: 10, signingsGlobalPerDay: 100 } }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            )
+          },
+          sponsorReachable: async () => true,
+        })
+        // the sponsor check asked the injected fetch — and the sponsor line proves it answered
+        expect(fetched).toEqual([HOSTED_SPONSOR_URL])
+        expect(lines).toContain(
+          "ok: gas sponsor reachable at sponsor.midacontext.xyz (willingness is only proven by a real send; it advertises 10 signings per address a day, 100 a day in total)",
+        )
+        expect(lines).toContain("ok: gas is sponsored by sponsor.midacontext.xyz")
+        expect(leaked, lines.join("\n")).toEqual([])
+        expect(lines.some((line) => line.includes("check failed")), lines.join("\n")).toBe(false)
+      } finally {
+        globalThis.fetch = realFetch
+      }
     } finally {
       await close()
     }

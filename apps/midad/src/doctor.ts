@@ -74,6 +74,14 @@ export interface DoctorDeps {
   /** Whole-run cap; default 20 s. */
   capMs?: number
   /**
+   * The fetch behind doctor's own remote probes — the sponsor reachability check, the store's
+   * write-check and deny list. Defaults to the global fetch; tests inject a stub so a doctor
+   * run can never reach a real service.
+   */
+  fetch?: typeof fetch
+  /** The wallet check's sponsor liveness probe — default the real one; injectable for tests. */
+  sponsorReachable?: (url: string) => Promise<boolean>
+  /**
    * Asks the store where a pending batched save stands — the default is a signed
    * `getBatchSave` as the entry's own agent; null means "could not find out", which counts as
    * still waiting. Injectable so tests script the store's answer.
@@ -359,6 +367,10 @@ function hookPathProblems(commands: string[] | "absent" | "unreadable", tool: In
 /** One line per check, in the order the spec fixes. Each returns its lines; it never decides. */
 function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): Promise<string[]> }[] {
   const home = deps.home
+  // doctor's remote probes go through the injected fetch, never bare global fetch — a test can
+  // then prove no call leaves the machine (in-39 B-7)
+  const remoteFetch = deps.fetch ?? fetch
+  const probeSponsor = deps.sponsorReachable ?? sponsorReachable
   return [
     {
       name: "daemon",
@@ -586,7 +598,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
               chainId: chain.context.deployment.chainId,
               capabilityRegistry: chain.context.deployment.capabilityRegistry,
               // a hung store must not eat the run cap — two seconds, like the sponsor probe
-              fetch: (input, init) => fetch(input, { ...init, signal: AbortSignal.timeout(2_000) }),
+              fetch: (input, init) => remoteFetch(input, { ...init, signal: AbortSignal.timeout(2_000) }),
             })
             targets = (await api.listRevocations("active")).map((intent) => intent.target)
           } else {
@@ -1053,7 +1065,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         // Only with no sponsor configured, or one that is not answering, does a low wallet
         // matter again: the self-paid fallback is what would have to carry the next send.
         const sponsorUrl = (await doctorServices(deps, shared)).sponsorUrl
-        if (sponsorUrl !== undefined && (await sponsorReachable(sponsorUrl))) {
+        if (sponsorUrl !== undefined && (await probeSponsor(sponsorUrl))) {
           // A passkey owner has no wallet on this machine to call a fallback — only software
           // mode prints the owner balance.
           if (passkey) return [`ok: gas is sponsored by ${hostOf(sponsorUrl)}`]
@@ -1115,7 +1127,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         // a local store is this code — the route exists by definition, nothing to probe
         if (storageUrl === undefined) return ["ok: the local store has the pending-revoke check"]
         try {
-          const response = await fetch(`${storageUrl.replace(/\/+$/, "")}/write-authority`, { signal: AbortSignal.timeout(2_000) })
+          const response = await remoteFetch(`${storageUrl.replace(/\/+$/, "")}/write-authority`, { signal: AbortSignal.timeout(2_000) })
           return response.status === 404
             ? [`note: the store at ${hostOf(storageUrl)} predates the pending-revoke check — redeploy the store to enable the pending-revoke check`]
             : [`ok: the store at ${hostOf(storageUrl)} answers the pending-revoke check`]
@@ -1155,7 +1167,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         // the HOST is printed, never the URL — its path or query may carry an operator's key
         const host = hostOf(sponsorUrl)
         try {
-          const reply = await fetch(sponsorUrl, { signal: AbortSignal.timeout(2_000) })
+          const reply = await remoteFetch(sponsorUrl, { signal: AbortSignal.timeout(2_000) })
           if (!reply.ok) {
             return [problem(`the gas sponsor ${host} answered HTTP ${reply.status}`, fix)]
           }
