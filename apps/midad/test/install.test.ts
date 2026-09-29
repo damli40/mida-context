@@ -1001,15 +1001,21 @@ describe("the codex MCP server inside the managed block (in-28)", () => {
     const settings = join(dir(), "settings.json")
     const home = new MidaHome(join(dir(), "mida-home"))
     const lines: string[] = []
+    // the runner is injected like every install claude-code test (F-9) — and it records, so a
+    // regression that reached for the binary under --no-mcp would show up as a call here
+    const calls: string[][] = []
     expect(
       runInstall(["install", "claude-code", "--no-mcp"], {
         print: (line) => lines.push(line),
         claudeSettings: settings,
         codexConfig: join(dir(), "config.toml"),
         home,
+        claudeUserConfig: join(dir(), ".claude.json"),
+        claudeCli: (args: string[]) => (calls.push(args), { status: 0 }),
       }),
     ).toBe(0)
     expect(claudeHooksStatus(settings)).toBe("installed")
+    expect(calls).toHaveLength(0)
   })
 
   it("--no-mcp is an install flag — uninstall refuses it, and a bogus flag is usage", () => {
@@ -1414,8 +1420,20 @@ describe("the Codex trust reminder", () => {
     expect(again.lines).not.toContain(CODEX_TRUST_SENTENCE)
     const removed = install(config, settings, ["uninstall", "codex"], midaHome)
     expect(removed.lines).not.toContain(CODEX_TRUST_SENTENCE)
-    const claude = install(config, settings, ["install", "claude-code"], midaHome)
-    expect(claude.lines).not.toContain(CODEX_TRUST_SENTENCE)
+    // claude-code goes through its own deps — the claude runner and the user config are
+    // injected like everywhere else, because this describe's helper would spawn the real
+    // binary the test wall exists to stop (F-9)
+    const claudeLines: string[] = []
+    const code = runInstall(["install", "claude-code"], {
+      print: (line) => claudeLines.push(line),
+      claudeSettings: settings,
+      codexConfig: config,
+      home: midaHome,
+      claudeUserConfig: join(dir(), ".claude.json"),
+      claudeCli: () => ({ status: 0 }),
+    })
+    expect(code).toBe(0)
+    expect(claudeLines).toEqual(["installed"])
   })
 })
 
