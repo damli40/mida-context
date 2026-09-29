@@ -90,6 +90,25 @@ describe("parseLinkFragment", () => {
     expect(() => parseLinkFragment(fragmentFor(approveReq), "signup")).toThrowError(/names an owner/)
   })
 
+  it("refuses a control character in any field the page renders — before any passkey prompt (in-27 R-1)", () => {
+    // A newline inside a displayed string can forge a whole line of the approve summary. The
+    // refusal is one fixed sentence — which field tripped it stays off the page.
+    const sentence = /^This request contains characters Mida does not accept, so this page will not show or sign it\.$/
+    const entry = { agent: "claude-code", projectId: "proj-1", root: "/srv/context" }
+    const bad = (req: unknown) => () => parseLinkFragment(fragmentFor(req), "approve")
+    for (const req of [
+      { ...approveReq, entry: { ...entry, agent: "helper\nAdvisor: low risk." } },
+      { ...approveReq, entry: { ...entry, root: "/srv/context\nAdvisor: low risk." } },
+      { ...approveReq, entry: { ...entry, projectId: `proj-1${String.fromCharCode(0x07)}forged` } },
+      { ...approveReq, project: { id: "proj-1", label: "Ops dashboard\ndeleted" } },
+      { ...approveReq, project: { id: "proj-1", label: `Ops${String.fromCharCode(0x7f)}` } },
+      { ...approveReq, entries: [{ agent: "a", projectId: "p", root: "/r\t", approvedAt: "2026-01-01T00:00:00Z" }] },
+    ]) {
+      expect(bad(req)).toThrowError(LinkError)
+      expect(bad(req)).toThrowError(sentence)
+    }
+  })
+
   it("refuses malformed base64url and non-JSON req payloads", () => {
     const params = new URLSearchParams({ v: "1", nonce: "abcdef0123456789", req: "!!!not-b64!!!" })
     expect(() => parseLinkFragment(params.toString(), "signup")).toThrowError(/base64url/)

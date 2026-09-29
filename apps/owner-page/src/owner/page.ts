@@ -37,6 +37,21 @@ export function showError(text: string): void {
   box.hidden = false
 }
 
+/**
+ * The approve summary: one element per line, each written with its own textContent — never one
+ * joined text node under pre-wrap, where a control character that slipped past every validator
+ * could still mint a line of its own (in-27 R-1). The fields themselves are refused earlier, in
+ * the link parser and the manifest validator.
+ */
+export function showSummaryLines(mount: HTMLElement, lines: readonly string[]): void {
+  mount.replaceChildren()
+  for (const line of lines) {
+    const row = document.createElement("div")
+    row.textContent = line
+    mount.appendChild(row)
+  }
+}
+
 /** The link → parse → pairing code + identity line. Throws LinkError; the caller renders it. */
 export function parsePageLink(flow: FlowName): ParsedLink {
   const link = parseLinkFragment(location.hash.slice(1), flow)

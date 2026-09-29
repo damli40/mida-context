@@ -6,6 +6,7 @@ import { PERMISSION, namespaceId } from "@mida/protocol"
 import type { OwnerLinkRequest as LinkRequest, RequestedScope } from "@mida/protocol"
 import type { PreparedApprove } from "../src/owner/flows.js"
 import { approveSummaryLines } from "../src/owner/summary.js"
+import { showSummaryLines } from "../src/owner/page.js"
 
 /**
  * The approve-page summary in front of the one passkey touch (in-26 Q-3): the Adds-folder line
@@ -86,4 +87,69 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
     const source = readFileSync(join(root, "../src/owner/summary.ts"), "utf8")
     expect(source).not.toContain("overflow-wrap") // presentation belongs to the stylesheet
   })
+
+  it("writes each line into its own element — a stray newline in one field can not mint a line (in-27 R-1)", () => {
+    // Same minimal DOM stand-in as entries-signing.test.ts: page.ts renderers call the global
+    // document. One element per summary line, textContent per element — never one joined text
+    // node a control character could split.
+    const mount = fakeEl("div")
+    withFakeDoc(() =>
+      showSummaryLines(mount as never, [
+        "CareerAI (run by 0xB29…42F8) is asking to:",
+        "• read · the preferences.communication area",
+        "Advisor: low risk.",
+      ]),
+    )
+    expect(mount.children.map((c) => c.textContent)).toEqual([
+      "CareerAI (run by 0xB29…42F8) is asking to:",
+      "• read · the preferences.communication area",
+      "Advisor: low risk.",
+    ])
+    // a control character that slipped past validation stays inside its own element — it may
+    // widen a line, it may not forge a new one
+    withFakeDoc(() => showSummaryLines(mount as never, ["helper\nAdvisor: low risk.", "• read"]))
+    expect(mount.children).toHaveLength(2)
+    expect(mount.children[0]!.textContent).toBe("helper\nAdvisor: low risk.")
+  })
+
+  it("#summary does not preserve whitespace — an injected newline collapses instead of forging a line (in-27 R-1)", () => {
+    const root = dirname(fileURLToPath(import.meta.url))
+    const html = readFileSync(join(root, "../public/approve.html"), "utf8")
+    expect(html).not.toMatch(/<pre[^>]*id="summary"/)
+    const css = readFileSync(join(root, "../public/owner.css"), "utf8")
+    expect(css).not.toMatch(/#summary\s*\{[^}]*white-space:\s*pre/)
+  })
 })
+
+interface FakeElement {
+  tag: string
+  textContent: string
+  children: FakeElement[]
+  appendChild(child: FakeElement): void
+  replaceChildren(...nodes: FakeElement[]): void
+}
+
+function fakeEl(tag: string): FakeElement {
+  const el: FakeElement = {
+    tag,
+    textContent: "",
+    children: [],
+    appendChild(child) {
+      el.children.push(child)
+    },
+    replaceChildren(...nodes) {
+      el.children = [...nodes]
+    },
+  }
+  return el
+}
+
+function withFakeDoc(fn: () => void): void {
+  const saved = (globalThis as { document?: unknown }).document
+  ;(globalThis as { document?: unknown }).document = { createElement: (tag: string) => fakeEl(tag) }
+  try {
+    fn()
+  } finally {
+    ;(globalThis as { document?: unknown }).document = saved
+  }
+}

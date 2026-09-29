@@ -1,4 +1,4 @@
-import { el, parsePageLink, assertRpGate, makeEnv, progressLine, showEntriesToSign, showError, finish } from "./page.js"
+import { el, parsePageLink, assertRpGate, makeEnv, progressLine, showEntriesToSign, showError, showSummaryLines, finish } from "./page.js"
 import { prepareApprove, confirmApprove, signableProjectRows } from "./flows.js"
 import { approveSummaryLines } from "./summary.js"
 import { describeError } from "./session.js"
@@ -27,8 +27,7 @@ async function main(): Promise<void> {
   try {
     const env = makeEnv()
     const prep = await prepareApprove(env, link)
-    const summary = el("summary")
-    summary.textContent = approveSummaryLines(prep, link.req).join("\n")
+    showSummaryLines(el("summary"), approveSummaryLines(prep, link.req))
     // Above the button: every project row the signature will cover — the new row named by its
     // label, plus the count (and the expandable list) of existing rows being re-signed.
     const rows = signableProjectRows(link.req)

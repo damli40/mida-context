@@ -2,6 +2,8 @@ import {
   MidaError,
   PERMISSION,
   PROVENANCE_POLICY,
+  UNACCEPTABLE_REQUEST_CHARS,
+  UnacceptableCharactersError,
   assertHex,
   canonicalBytes,
   canonicalizeNamespace,
@@ -48,6 +50,9 @@ function text(value: unknown, min: number, max: number, where: string): string {
   if (typeof value !== "string") return wire(`${where} must be a string`)
   const length = utf8Length(value)
   if (length < min || length > max) wire(`${where} must be ${min}-${max} UTF-8 bytes`)
+  // A control character in text the page renders — a name, a reason — can forge a whole line of
+  // the approve summary; the manifest is refused outright, before any signature work (in-27 R-1).
+  if (UNACCEPTABLE_REQUEST_CHARS.test(value)) throw new UnacceptableCharactersError()
   return value
 }
 

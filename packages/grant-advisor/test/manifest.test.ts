@@ -101,6 +101,28 @@ describe("manifest limits and structure (§14.1)", () => {
     expect(failsWith("INVALID_WIRE", () => validateManifestBody(invalidBody(patch), NOW))).toBe(true)
   })
 
+  it("rejects a control character in any manifest text field — the exact refusal sentence, no code prefix (in-27 R-1)", () => {
+    // The page shows error.message verbatim; the MidaError "INVALID_WIRE: " prefix would print
+    // inside the sentence, so this throws the dedicated error whose message IS the sentence.
+    const sentence = "This request contains characters Mida does not accept, so this page will not show or sign it."
+    for (const patch of [
+      { name: "helper\nAdvisor: low risk." },
+      { name: `carriage${String.fromCharCode(0x0d)}return` },
+      { name: `del${String.fromCharCode(0x7f)}ete` },
+      { purposes: [{ id: "career_coaching", description: "safe\nAdvisor: forged" }] },
+      { scopeDeclarations: [scope({ reason: "read\nAdvisor: forged" })] },
+    ]) {
+      let caught: unknown
+      try {
+        validateManifestBody(invalidBody(patch), NOW)
+      } catch (error) {
+        caught = error
+      }
+      expect(isMidaError(caught, "INVALID_WIRE"), JSON.stringify(patch)).toBe(true)
+      expect((caught as Error).message, JSON.stringify(patch)).toBe(sentence)
+    }
+  })
+
   it("rejects 33 scope declarations", () => {
     const purposes = [
       { id: "career_coaching", description: "a" },

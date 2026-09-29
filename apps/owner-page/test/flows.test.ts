@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { encodeAbiParameters, encodeEventTopics, zeroHash } from "viem"
 import type { Address, Hex } from "viem"
-import { PERMISSION, decodeUint64, encodeUint64, hashString, namespaceById, namespaceId } from "@mida/protocol"
+import { MidaError, PERMISSION, decodeUint64, encodeUint64, hashString, namespaceById, namespaceId } from "@mida/protocol"
 import { deriveEpochKeyPair, deriveNamespaceSecret, hexOf } from "@mida/crypto"
 import { capabilityRegistryAbi } from "@mida/chain/browser"
 import type { Deployment, SponsoredReceipt, TxKind } from "@mida/chain/browser"
@@ -451,6 +451,43 @@ describe("approve flow", () => {
     expect((result.entry?.entries as { agent: string }[]).some((e) => e.agent === AGENT_ID)).toBe(true)
     expect(releasedSecrets[0]?.released).toBe(true)
     expect(releasedSecrets[0]?.evmKey.every((b) => b === 0)).toBe(true)
+  })
+
+  it("a manifest name carrying a control character is refused before any passkey prompt (in-27 R-1)", async () => {
+    // The forge: "helper\nAdvisor: low risk." would render a fake advisor line in the summary.
+    // prepareApprove must throw the one refusal sentence and never reach a credential call.
+    const body = manifestBody({ name: "helper\nAdvisor: low risk." })
+    const manifest = await signManifest(body)
+    const unsigned = unsignedRequest(
+      [{ namespace: "preferences.communication", permissions: PERMISSION.READ }],
+      { chainId: encodeUint64(CHAIN_ID), capabilityRegistry: REGISTRY },
+      body,
+    )
+    const accessRequest = await signRequest(unsigned)
+    const sends: SendRecord[] = []
+    const apiCalls: string[] = []
+    const { env, credentials } = makeEnv({
+      sends,
+      apiCalls,
+      chain: fakeChain({ getAgent: () => agentRecordFor(body) }),
+      fetchManifest: async () => manifest,
+    })
+    const parsed = link("approve", {
+      chainId: Number(CHAIN_ID),
+      owner: OWNER,
+      request: accessRequest,
+      entry: { agent: AGENT_ID, projectId: "proj-1", root: `0x${"33".repeat(32)}` },
+    })
+    const caught = await prepareApprove(env, parsed).then(
+      () => null,
+      (error: unknown) => error,
+    )
+    expect(caught).toBeInstanceOf(MidaError)
+    expect((caught as Error).message).toBe(
+      "This request contains characters Mida does not accept, so this page will not show or sign it.",
+    )
+    expect(credentials.calls).toHaveLength(0) // zero prompts — the page signed nothing
+    expect(sends).toHaveLength(0)
   })
 
   it("prepares and sends on one agent/history read set — the page's advice is reused, not re-scanned (in-25 P-8)", async () => {

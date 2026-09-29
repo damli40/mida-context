@@ -27,7 +27,8 @@ h1 { font-size: 1.5rem; }
 }
 .identity { font-size: 0.9rem; color: #555; }
 #summary {
-  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  margin: 1em 0;
   overflow-wrap: anywhere;
   background: #fff;
   border: 1px solid #ddd;

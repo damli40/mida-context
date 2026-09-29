@@ -1,5 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js"
 import { concatBytes, utf8ToBytes } from "@noble/hashes/utils.js"
+import { UNACCEPTABLE_REQUEST_CHARS, UNACCEPTABLE_REQUEST_TEXT } from "./errors.js"
 import type { Address, Hex } from "./types.js"
 
 /**
@@ -314,6 +315,21 @@ function validateRequestObject(decoded: unknown, flow: OwnerLinkFlow): OwnerLink
   }
   if (flow === "revoke" && (req.owner === undefined || req.agentId === undefined)) {
     fail("a revoke link must name the owner and the agent")
+  }
+
+  // A control character in any string the page renders can forge a line of the approve summary —
+  // no legitimate project label, folder root or agent name carries one (in-27 R-1). One sentence
+  // refuses all of them; which field tripped the check stays off the page.
+  const rendered = [
+    req.project?.id,
+    req.project?.label,
+    req.entry?.agent,
+    req.entry?.projectId,
+    req.entry?.root,
+    ...(req.entries ?? []).flatMap((row) => [row.agent, row.projectId, row.root, row.approvedAt]),
+  ]
+  for (const value of rendered) {
+    if (typeof value === "string" && UNACCEPTABLE_REQUEST_CHARS.test(value)) fail(UNACCEPTABLE_REQUEST_TEXT)
   }
   return req
 }

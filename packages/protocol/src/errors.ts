@@ -86,3 +86,27 @@ export class MidaError extends Error {
 export function isMidaError(value: unknown, code?: MidaErrorCode): value is MidaError {
   return value instanceof MidaError && (code === undefined || value.code === code)
 }
+
+/**
+ * The one sentence the owner page shows when a request carries a control character (the C0 controls or DEL \u007f) in a field it renders — a manifest name, a folder root, a project label.
+ * One fixed sentence, with no field name or code, so the refusal itself can never smuggle part
+ * of the request onto the page (in-27 R-1). This string is final copy.
+ */
+export const UNACCEPTABLE_REQUEST_TEXT =
+  "This request contains characters Mida does not accept, so this page will not show or sign it."
+
+/** The characters that must never reach a field a page or a terminal renders. */
+export const UNACCEPTABLE_REQUEST_CHARS = /[\x00-\x1f\u007f]/
+
+/**
+ * INVALID_WIRE whose message is already the owner-facing sentence. MidaError prefixes its detail
+ * with the code — "INVALID_WIRE: This request…" is not the page's text — so this subclass keeps
+ * the code for API/log handling and the bare sentence for describeError.
+ */
+export class UnacceptableCharactersError extends MidaError {
+  constructor() {
+    super("INVALID_WIRE")
+    this.name = "UnacceptableCharactersError"
+    this.message = UNACCEPTABLE_REQUEST_TEXT
+  }
+}
