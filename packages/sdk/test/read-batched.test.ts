@@ -246,6 +246,8 @@ describe("MidaAgent.read record batching (in-35 R-1)", () => {
     expect(error).toBeInstanceOf(MidaError)
     expect(error).toMatchObject({ code: "COMMITMENT_MISMATCH" })
     expect((error as MidaError).message).toBe(`COMMITMENT_MISMATCH: object ${target} does not match its Monad commitments`)
+    // the mismatch came from the batch answer itself — never a per-object refetch (in-38 V-5)
+    expect(fx.getRecord).not.toHaveBeenCalled()
   })
 
   it("a listed object whose manifest hash moved still throws today's COMMITMENT_MISMATCH", async () => {
@@ -256,6 +258,7 @@ describe("MidaAgent.read record batching (in-35 R-1)", () => {
     expect(error).toBeInstanceOf(MidaError)
     expect(error).toMatchObject({ code: "COMMITMENT_MISMATCH" })
     expect((error as MidaError).message).toBe(`COMMITMENT_MISMATCH: object ${target} does not match its Monad commitments`)
+    expect(fx.getRecord).not.toHaveBeenCalled()
   })
 
   it("a getRecords failure fails the read the way a failing getRecord did — thrown, not retried", async () => {
