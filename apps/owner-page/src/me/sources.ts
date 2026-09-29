@@ -1,8 +1,9 @@
 /**
  * /me Task 3 — the data gatherer behind the owner page.
  *
- * Three sources, kept honest about which spoke: the Envio index first (grants, revocations,
- * batch anchors, totals), chain logs as the fallback when the index is absent or fails, and the
+ * Two sources, kept honest about which spoke: the Envio index for the agent list (grants,
+ * revocations, batch anchors, totals — there is no chain-scan fallback; the scan needed
+ * ~39,000 requests against a public RPC that allows ~500 inside the page's deadline), and the
  * store's object/batched-save lists as the list of records. Verification is per lane: every
  * direct object is re-read on ContextRegistry (matching fields → "anchored", missing or
  * mismatched → "unverified"); every ANCHORED batched item re-derives its Merkle leaf — the save
@@ -111,18 +112,16 @@ export const COUNTS_QUERY = `query MeCounts($owner: String!, $limit: Int!) {
 /** The exact banner a truncated store list earns — pinned by the plan. */
 export const PARTIAL_LIST_TEXT = "list incomplete — the store ran out of chain reads; reload"
 /**
- * The exact wording when no agent source answered — the index failed and the bounded chain-log
- * scan failed or ran out of time. Pinned by the plan; the page shows it in place of the count.
+ * The exact wording when the agent list cannot be read: no index configured, or the index
+ * unreachable. The list comes only from the index — the old chain-log scan needed ~39,000
+ * requests against a public RPC that allows ~500 inside the page's budget, so it could never
+ * answer and no longer runs. Pinned verbatim by in-25 P-4.
  */
-export const AGENT_LIST_UNAVAILABLE = "Agent list unavailable — the index is down and the chain scan did not finish"
+export const AGENT_LIST_NEEDS_INDEX =
+  "Your agent list comes from the index, and the index is not reachable right now. The records below are still checked against Monad."
 /**
- * Same unavailability, different blame: no index URL was ever configured, so nothing was "down" —
- * the agents sentence names what is actually missing.
- */
-export const AGENT_LIST_NO_INDEX = "Agent list unavailable — index not configured and the chain scan did not finish"
-/**
- * Same unavailability, third cause: the index answered but reports `isReady: false` — it is
- * mid-sync, so its Grant rows are not a list at all, and the chain scan also failed.
+ * The mid-sync case: the index answered but reports `isReady: false` — its Grant rows are a
+ * partial scan, not a list.
  */
 export const AGENT_LIST_SYNCING = "Agent list unavailable — the index is still catching up and the chain scan did not finish"
 /** The banner when an index answer fills the query's page — more rows may exist unsent. */
@@ -132,23 +131,13 @@ export const BLOCKED_AT_STORE_TEXT = "blocked at the store · revoke pending on 
 
 const INDEX_TIMEOUT_MS = 6_000
 // The three owner areas flows.ts opens on setup — duplicated there and here on purpose: this
-// module stays import-light, and the fallback needs the list even when every index call is down.
+// module stays import-light, and the record lists need them even when every index call is down.
 const OWNER_NAMESPACE_IDS = ["projects.current", "preferences.communication", "profile.skills"].map((name) =>
   namespaceId(name),
 )
 
 // ---------------------------------------------------------------------------------------------
 // Ports and rows — the plan's Task 3 interface, plus the two chain reads named above.
-
-export interface GrantLog {
-  kind: "granted" | "revoked"
-  agentId: Hex
-  capabilityId: Hex | null
-  namespaceId: Hex | null
-  permissions: number | null
-  block: number
-  txHash: Hex
-}
 
 export interface MePorts {
   index: { query<T>(gql: string, vars: Record<string, unknown>): Promise<T> } | null
@@ -162,7 +151,6 @@ export interface MePorts {
     batchBlock(batchId: Hex): Promise<bigint | null>
     /** Monad's timestamp for a block, in seconds — null when the block could not be read. */
     blockTime(block: bigint): Promise<number | null>
-    ownerGrantLogs(owner: Address): Promise<GrantLog[]>
     agentIdOfSigner(signer: Address): Promise<Hex | null>
     getAgent(agentId: Hex): Promise<AgentRecord | null>
     /**
@@ -240,7 +228,8 @@ export interface MeData {
    * empty store, and the page must not read it as "the store holds no records".
    */
   recordsUnavailable: boolean
-  source: "index" | "chain-logs"
+  /** Where the agent list came from: the index, or nothing — "unavailable" never claims a scan. */
+  source: "index" | "unavailable"
   lag: { text: string; stale: boolean }
   batchingOn: boolean | null
   /**
@@ -339,10 +328,9 @@ interface GrantSeed {
   namespaceId: Hex
   /** The index's claim — the chain's capability row, not this field, supplies what is shown. */
   permissions: number
-  /** What the listing claimed — an index Grant row's revokedBlock, or a grant log line. */
+  /** What the listing claimed — an index Grant row's revokedBlock. */
   sourceSaysLive: boolean
   approvedTx: Hex | null
-  block: number
 }
 
 const lower = (value: string) => value.toLowerCase()
@@ -367,8 +355,8 @@ const isNumber = (v: unknown): v is number => typeof v === "number"
 /**
  * The primary index answer is trusted only after it proves its shape — a malformed Grant or
  * Revocation row means this index answer cannot be the source of truth for the agents list, so
- * the whole answer is discarded and the chain-log fallback runs instead. Half-parsed state must
- * never mix with log-derived grants, so this check runs before any row is consumed.
+ * the whole answer is discarded and the list reports unavailable. Half-parsed state must
+ * never mix with a partial answer, so this check runs before any row is consumed.
  */
 function isAgentsAnswer(value: unknown): value is AgentsAnswer {
   if (value === null || typeof value !== "object") return false
@@ -545,7 +533,7 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
     }
   }
 
-  // --- agents: the index first, chain logs when the index cannot answer ----------------------
+  // --- agents: the index only — the chain-log scan it used to fall back to could never finish --
   const grantSeeds: GrantSeed[] = []
   const revokeByAgent = new Map<string, { block: number; txHash: Hex }>()
   const rememberRevoke = (agentId: string, block: number, txHash: string) => {
@@ -567,7 +555,7 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
   // the fallback when the chain could not be asked. Null when the index cannot say how fresh it is.
   let indexLag: number | null = null
   // isReady === false means the index answered but is still catching up: its Grant rows are a
-  // partial scan, not a list, so they are never consumed — the chain-log scan runs instead.
+  // partial scan, not a list, so they are never consumed.
   let indexSyncing = false
   let ownerCounts: { records: number; batchedSaves: number } | null = null
   let youSaidCount = 0
@@ -577,9 +565,9 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
     const primary = raw !== null && isAgentsAnswer(raw) ? raw : null
     const meta = primary === null ? null : metaRowOf(primary._meta)
     if (primary === null) {
-      source = "chain-logs"
+      source = "unavailable"
     } else if (meta !== null && !meta.isReady) {
-      source = "chain-logs"
+      source = "unavailable"
       indexSyncing = true
     } else {
       indexLag =
@@ -600,14 +588,13 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
           permissions: grant.permissions,
           sourceSaysLive: grant.revokedBlock === null,
           approvedTx: isTxHash(grant.txHash) ? grant.txHash : null,
-          block: grant.grantedBlock,
         })
         areaIds.add(lower(grant.namespaceId))
       }
       for (const revocation of revocations) rememberRevoke(revocation.agentId, revocation.block, revocation.txHash)
       const agentIds = [...new Set(grantSeeds.map((g) => lower(g.agentId)))]
-      // Secondary queries degrade their own corner of the page rather than dropping to the
-      // fallback: the agents list already came from the index and stays index-sourced.
+      // Secondary queries degrade their own corner of the page rather than poisoning the
+      // primary answer: the agents list already came from the index and stays index-sourced.
       const [batchedAnswer, countsAnswer] = await Promise.all([
         safe(() => queryIndex<BatchedAnswer>(ports.index!, BATCHED_QUERY, { owner: ownerKey, agents: agentIds, limit })),
         safe(() => queryIndex<CountsAnswer>(ports.index!, COUNTS_QUERY, { owner: ownerKey, limit })),
@@ -653,61 +640,15 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
       }
     }
   } else {
-    source = "chain-logs"
+    source = "unavailable"
   }
 
-  if (source === "chain-logs") {
-    const logs = await safe(() => ports.chain.ownerGrantLogs(owner))
-    if (logs === null) {
-      // No agent source answered — the page must say the list is missing, never "no agents".
-      // The blame is exact: a configured index that failed is "down"; no index URL at all was
-      // never asked; an index mid-sync is still catching up, not down.
-      agentsUnavailable =
-        ports.index === null
-          ? AGENT_LIST_NO_INDEX
-          : indexSyncing
-            ? AGENT_LIST_SYNCING
-            : AGENT_LIST_UNAVAILABLE
-      note("the grant log scan failed — the agent list may be incomplete")
-    } else {
-      const byCapability = new Map<string, GrantSeed>()
-      for (const log of [...logs].sort((a, b) => a.block - b.block)) {
-        if (
-          log?.kind !== "granted" ||
-          !isString(log.capabilityId) ||
-          !isString(log.namespaceId) ||
-          !isString(log.agentId) ||
-          !isNumber(log.block) ||
-          !isString(log.txHash)
-        )
-          continue
-        byCapability.set(lower(log.capabilityId), {
-          agentId: log.agentId,
-          capabilityId: log.capabilityId,
-          namespaceId: log.namespaceId,
-          permissions: log.permissions ?? 0,
-          sourceSaysLive: true,
-          approvedTx: isTxHash(log.txHash) ? log.txHash : null,
-          block: log.block,
-        })
-      }
-      for (const log of logs) {
-        if (log?.kind !== "revoked" || !isString(log.agentId) || !isNumber(log.block) || !isString(log.txHash)) continue
-        rememberRevoke(log.agentId, log.block, log.txHash)
-        if (isString(log.capabilityId)) {
-          // A CapabilityRevoked log ends that one grant.
-          const grant = byCapability.get(lower(log.capabilityId))
-          if (grant !== undefined && grant.block <= log.block) grant.sourceSaysLive = false
-        } else {
-          // An AgentRevoked log ends every grant the owner-agent pair had at that block.
-          for (const grant of byCapability.values()) {
-            if (sameHex(grant.agentId, log.agentId) && grant.block <= log.block) grant.sourceSaysLive = false
-          }
-        }
-      }
-      grantSeeds.push(...byCapability.values())
-      for (const seed of grantSeeds) areaIds.add(lower(seed.namespaceId))
-    }
+  if (source !== "index") {
+    // There is no second source for the agent list: the old chain-log fallback needed ~39,000
+    // requests against a public RPC that allows ~500 inside the page's deadline, so it could
+    // never produce the list it was asked for. The page names the missing index instead of
+    // pretending to scan; the per-record chain checks below are unchanged.
+    agentsUnavailable = indexSyncing ? AGENT_LIST_SYNCING : AGENT_LIST_NEEDS_INDEX
   }
 
   // --- agent names: chain agent record → content-addressed manifest → name -------------------
@@ -1196,7 +1137,7 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
       ? { text: "index not configured", stale: true }
       : indexSyncing
         ? { text: "index still catching up", stale: true }
-        : source === "chain-logs"
+        : source !== "index"
           ? { text: "index unavailable", stale: true }
           : lagText(indexLag)
 

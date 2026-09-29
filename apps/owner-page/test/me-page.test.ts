@@ -6,7 +6,7 @@ import { namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { HIDDEN_LIMIT_MS, armTeardown, renderMe, revocableStore } from "../src/me/page.js"
 import type { AgentRow, MeData, MePorts, RecordRow } from "../src/me/sources.js"
-import { AGENT_LIST_UNAVAILABLE, BLOCKED_AT_STORE_TEXT, PARTIAL_LIST_TEXT } from "../src/me/sources.js"
+import { AGENT_LIST_NEEDS_INDEX, BLOCKED_AT_STORE_TEXT, PARTIAL_LIST_TEXT } from "../src/me/sources.js"
 
 /**
  * Task 5's page tests. The plan prescribes a jsdom environment pragma, but jsdom is not a
@@ -281,12 +281,12 @@ describe("renderMe", () => {
     expect(row!.textContent).not.toContain("Can read")
   })
 
-  it("a failed agent load reads 'Agent list unavailable' — never '0 agents' or 'none granted'", () => {
+  it("a missing index reads the needs-index sentence — never '0 agents' or 'none granted'", () => {
     const root = renderMe(
-      data({ agents: [], agentsUnavailable: AGENT_LIST_UNAVAILABLE, counts: null }),
+      data({ agents: [], agentsUnavailable: AGENT_LIST_NEEDS_INDEX, counts: null }),
       fakeDoc(),
     ) as unknown as FakeEl
-    const unavailable = "Agent list unavailable — the index is down and the chain scan did not finish"
+    const unavailable = AGENT_LIST_NEEDS_INDEX
     // once on the summary tile in place of the count, once where the list would be
     const hits = all(root, ".agent-meta").concat(all(root, ".n")).filter((el) => el.textContent.includes(unavailable))
     expect(hits.length).toBeGreaterThanOrEqual(2)
@@ -333,19 +333,10 @@ describe("renderMe", () => {
     expect(empty.textContent).toContain("The store holds no records")
   })
 
-  it("a flagged grant names the listing that spoke — the index, or in chain-log mode the grant log, never the index", () => {
+  it("a flagged grant names the listing that spoke — the index", () => {
     const flagged = agent({ readLive: false, grants: [grant({ status: { label: "Revoked", flagged: true, unchecked: false } })] })
     const fromIndex = renderMe(data({ agents: [flagged] }), fakeDoc()) as unknown as FakeEl
     expect(fromIndex.querySelector(".grant-status")!.textContent).toBe("Revoked — the index disagrees with the chain")
-
-    const fromLogs = renderMe(
-      data({ source: "chain-logs", lag: { text: "index unavailable", stale: true }, agents: [flagged] }),
-      fakeDoc(),
-    ) as unknown as FakeEl
-    const status = fromLogs.querySelector(".grant-status")
-    expect(status).not.toBeNull()
-    expect(status!.textContent).toBe("Revoked — the grant log disagrees with the chain")
-    expect(status!.textContent).not.toContain("index")
   })
 
   it("count tiles name their source — index figures 'per the index', the pending figure 'per the store'", () => {
@@ -399,7 +390,7 @@ describe("renderMe", () => {
 
   it("an unset index URL reads 'index not configured' — the badge never claims 'unreachable'", () => {
     const root = renderMe(
-      data({ source: "chain-logs", lag: { text: "index not configured", stale: true } }),
+      data({ source: "unavailable", lag: { text: "index not configured", stale: true } }),
       fakeDoc(),
     ) as unknown as FakeEl
     expect(root.textContent).toContain("index not configured")
@@ -408,7 +399,7 @@ describe("renderMe", () => {
 
   it("a failed index reads 'index unavailable' on the badge", () => {
     const root = renderMe(
-      data({ source: "chain-logs", lag: { text: "index unavailable", stale: true } }),
+      data({ source: "unavailable", lag: { text: "index unavailable", stale: true } }),
       fakeDoc(),
     ) as unknown as FakeEl
     expect(root.textContent).toContain("index unavailable")

@@ -31,8 +31,8 @@ describe("boundedScanClient", () => {
         return []
       },
     }
-    // one wrapped client shared by three concurrent scans — the same shape page.ts's
-    // ownerGrantLogs runs — so the cap is measured against the combined request pool
+    // one wrapped client shared by three concurrent scans — the cap is measured against the
+    // combined request pool, not per scan
     const client = boundedScanClient(inner)
     const scan = () =>
       getLogsChunked(client, { address: REGISTRY, event: EVENT, fromBlock: 0n }, { maxRange: 100n })

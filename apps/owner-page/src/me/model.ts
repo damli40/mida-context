@@ -59,7 +59,7 @@ export function readersAfterRevoke(agents: readonly { agentId: Hex }[], revoking
 export type GrantLabel = "Can read" | "Revoked" | "Expired" | "Expired or revoked on Monad" | "Unverified"
 
 export interface GrantTruth {
-  /** What the discovery source claimed — the index row, or a grant log in chain-log mode. */
+  /** What the discovery source claimed — the index row. */
   sourceSaysLive: boolean
   /**
    * The chain's capability row — null when the getCapability read itself failed. A row whose

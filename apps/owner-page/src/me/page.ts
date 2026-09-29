@@ -15,8 +15,7 @@
  */
 
 import { zeroHash } from "viem"
-import type { AbiEvent } from "viem"
-import { batchAnchorAbi, capabilityRegistryAbi, getLogsChunked, latestTimestamp } from "@mida/chain/browser"
+import { batchAnchorAbi, capabilityRegistryAbi, latestTimestamp } from "@mida/chain/browser"
 import type { ChainContext } from "@mida/chain/browser"
 import { ContextApiClient, RegistryReader } from "@mida/api/browser"
 import { NAMESPACE_TREE_V1 } from "@mida/protocol"
@@ -28,9 +27,8 @@ import { describeError } from "../owner/session.js"
 import { shortAddress } from "../owner/secrets.js"
 import { chipsFor, isTxHash, provenanceBadge } from "./model.js"
 import type { Badge } from "./model.js"
-import { boundedScanClient, scanWithDeadline } from "./logscan.js"
 import { BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
-import type { AgentRow, GrantLog, MeData, MePorts, RecordRow } from "./sources.js"
+import type { AgentRow, MeData, MePorts, RecordRow } from "./sources.js"
 import { signIn } from "./session.js"
 import type { MeSession } from "./session.js"
 
@@ -117,15 +115,12 @@ function renderHead(doc: Document, data: MeData): HTMLElement {
   )
   left.appendChild(ownerLine)
   const source = elOf(doc, "p", "source")
-  const stale = data.lag.stale || data.source === "chain-logs"
+  const stale = data.lag.stale || data.source !== "index"
   source.appendChild(elOf(doc, "span", stale ? "dot dot-stale" : "dot"))
   // The lag text already carries the reason the index is not speaking — "index not configured"
   // when no URL was set, "index unavailable" when it failed to answer — so the badge only names
   // what the page actually read, and never claims "unreachable" for an index that does not exist.
-  const text =
-    data.source === "index"
-      ? `Read from the Envio index · ${data.lag.text}`
-      : `Read from chain logs · ${data.lag.text}`
+  const text = data.source === "index" ? `Read from the Envio index · ${data.lag.text}` : data.lag.text
   source.appendChild(elOf(doc, "span", undefined, text))
   head.appendChild(source)
   return head
@@ -180,19 +175,17 @@ function renderSummary(doc: Document, data: MeData): HTMLElement {
   return bento
 }
 
-function grantStatusText(grant: AgentRow["grants"][number], source: MeData["source"]): string | null {
+function grantStatusText(grant: AgentRow["grants"][number]): string | null {
   const { label, flagged, unchecked } = grant.status
   if (label === "Can read" && !flagged) return null
   if (!flagged) return label
   // A chain read that never returned is a check that did not run — not a disagreement between
   // the listing and Monad. Blame Monad, not the index.
   if (unchecked) return `${label} — could not check Monad just now`
-  // In chain-log mode there is no index to disagree — name the listing that actually spoke.
-  const listing = source === "index" ? "the index" : "the grant log"
-  return `${label} — ${listing} disagrees with the chain`
+  return `${label} — the index disagrees with the chain`
 }
 
-function renderAgent(doc: Document, agent: AgentRow, source: MeData["source"]): HTMLElement {
+function renderAgent(doc: Document, agent: AgentRow): HTMLElement {
   const allRevoked = agent.grants.length > 0 && agent.grants.every((g) => g.status.label === "Revoked")
   const flagged = agent.grants.find((g) => g.status.flagged)
   const revokedRow = !agent.readLive && !agent.blockedAtStore && allRevoked
@@ -225,7 +218,7 @@ function renderAgent(doc: Document, agent: AgentRow, source: MeData["source"]): 
       chips.appendChild(elOf(doc, "span", `chip ${on ? "chip-on" : "chip-off"}`, label))
     }
     grantRow.appendChild(chips)
-    const statusText = grantStatusText(grant, source)
+    const statusText = grantStatusText(grant)
     if (statusText !== null) grantRow.appendChild(elOf(doc, "span", "grant-status", statusText))
     grants.appendChild(grantRow)
   }
@@ -276,7 +269,7 @@ function renderAgents(doc: Document, data: MeData): HTMLElement {
     sec.appendChild(elOf(doc, "p", "agent-meta", "No agents have been granted access yet."))
     return sec
   }
-  for (const agent of data.agents) sec.appendChild(renderAgent(doc, agent, data.source))
+  for (const agent of data.agents) sec.appendChild(renderAgent(doc, agent))
   return sec
 }
 
@@ -456,7 +449,7 @@ function renderFoot(doc: Document): HTMLElement {
   contracts.appendChild(elOf(doc, "span", undefined, " · "))
   contracts.appendChild(elOf(doc, "span", "mono", shortHash(DEPLOYMENT.contextRegistry)))
   foot.appendChild(contracts)
-  foot.appendChild(elOf(doc, "span", undefined, "Index: Envio · fallback: direct chain reads"))
+  foot.appendChild(elOf(doc, "span", undefined, "Index: Envio"))
   return foot
 }
 
@@ -477,76 +470,6 @@ export function renderMe(data: MeData, doc: Document, open?: OpenRow): HTMLEleme
 }
 
 // --- live ports: chain views, the store client, the index's GraphQL -----------------------------
-
-const CAPABILITY_GRANTED = capabilityRegistryAbi.find(
-  (entry) => entry.type === "event" && entry.name === "CapabilityGranted",
-) as AbiEvent
-const CAPABILITY_REVOKED = capabilityRegistryAbi.find(
-  (entry) => entry.type === "event" && entry.name === "CapabilityRevoked",
-) as AbiEvent
-const AGENT_REVOKED = capabilityRegistryAbi.find(
-  (entry) => entry.type === "event" && entry.name === "AgentRevoked",
-) as AbiEvent
-
-/**
- * The index-down path's grant universe: CapabilityGranted / CapabilityRevoked / AgentRevoked
- * logs with the owner topic, decoded into the GrantLog shape sources.ts consumes. The
- * capability-level revoke event is scanned too — without it a revoked single grant would look
- * live until the contract read caught it.
- */
-async function ownerGrantLogs(context: ChainContext, owner: Address): Promise<GrantLog[]> {
-  // The index-down path is bounded: at most LOG_SCAN_IN_FLIGHT requests in the air across all
-  // three event scans, and the whole scan abandoned at LOG_SCAN_TIMEOUT_MS — past it, the
-  // page reports the agent list unavailable rather than hanging on the RPC.
-  const client = boundedScanClient(context.publicClient)
-  const scan = (event: AbiEvent) =>
-    getLogsChunked(
-      client,
-      {
-        address: context.deployment.capabilityRegistry,
-        event,
-        args: { owner },
-        fromBlock: context.deployment.deploymentBlock,
-      },
-      {},
-    )
-  const [granted, capabilityRevokes, agentRevokes] = await scanWithDeadline(
-    Promise.all([scan(CAPABILITY_GRANTED), scan(CAPABILITY_REVOKED), scan(AGENT_REVOKED)]),
-  )
-  const out: GrantLog[] = []
-  const hex = (value: unknown): Hex | null => (typeof value === "string" && value.startsWith("0x") ? (value.toLowerCase() as Hex) : null)
-  for (const log of granted) {
-    const args = log.args as Record<string, unknown>
-    const agentId = hex(args.agentId)
-    const capabilityId = hex(args.capabilityId)
-    const namespaceId = hex(args.namespaceId)
-    if (agentId === null || capabilityId === null || namespaceId === null) continue
-    out.push({
-      kind: "granted",
-      agentId,
-      capabilityId,
-      namespaceId,
-      permissions: typeof args.permissions === "number" ? args.permissions : Number(args.permissions ?? 0),
-      block: Number(log.blockNumber ?? 0n),
-      txHash: (log.transactionHash ?? "0x0") as Hex,
-    })
-  }
-  for (const log of [...capabilityRevokes, ...agentRevokes]) {
-    const args = log.args as Record<string, unknown>
-    const agentId = hex(args.agentId)
-    if (agentId === null) continue
-    out.push({
-      kind: "revoked",
-      agentId,
-      capabilityId: hex(args.capabilityId),
-      namespaceId: null,
-      permissions: null,
-      block: Number(log.blockNumber ?? 0n),
-      txHash: (log.transactionHash ?? "0x0") as Hex,
-    })
-  }
-  return out
-}
 
 /** One POST to the Envio GraphQL endpoint — the port sources.ts races against its own timeout. */
 async function indexQuery<T>(url: string, gql: string, vars: Record<string, unknown>): Promise<T> {
@@ -612,7 +535,6 @@ function livePorts(env: FlowEnvironment, session: MeSession, indexUrl: string | 
         const found = await context.publicClient.getBlock({ blockNumber: block })
         return Number(found.timestamp)
       },
-      ownerGrantLogs: (owner) => ownerGrantLogs(context, owner),
       agentIdOfSigner: (signer) => reader.agentIdOfSigner(signer),
       getAgent: (agentId) => reader.getAgent(agentId),
       hasAuthority: (owner, agentId, namespaceId, permission, provenancePolicy) =>

@@ -1,4 +1,6 @@
-// Task 3's /me sources layer. The page loads index-first with a chain-log fallback for agents;
+// Task 3's /me sources layer. The page's agent list comes from the index alone — the old
+// chain-log fallback needed ~39,000 requests against a public RPC that allows ~500 inside the
+// page's deadline, so it never answered and no longer runs;
 // every direct object is re-proven against ContextRegistry, and every batched save is proven on
 // its own Merkle proof — a batched contextId must never reach ContextRegistry. All three ports
 // are in-memory fakes: no network, no real store. The batched fixtures are really signed — the
@@ -25,15 +27,14 @@ import type { AnchoredObject, BatchedReadItem, CapabilityView, ContextRecordView
 import { DEPLOYMENT } from "../src/owner/core.js"
 import {
   AGENTS_QUERY,
-  AGENT_LIST_NO_INDEX,
+  AGENT_LIST_NEEDS_INDEX,
   AGENT_LIST_SYNCING,
-  AGENT_LIST_UNAVAILABLE,
   BATCHED_QUERY,
   COUNTS_QUERY,
   INDEX_LIMIT_TEXT,
   loadMe,
 } from "../src/me/sources.js"
-import type { GrantLog, MePorts } from "../src/me/sources.js"
+import type { MePorts } from "../src/me/sources.js"
 
 const OWNER = `0x${"11".repeat(20)}` as Address
 const AGENT_ID = `0x${"aa".repeat(32)}` as Hex
@@ -224,8 +225,6 @@ function world() {
     batchBlocksError: null as Error | null,
     blockTimes: new Map<number, number>(),
     blockTimesError: null as Error | null,
-    grantLogs: [] as GrantLog[],
-    grantLogsError: null as Error | null,
     agentRecords: new Map<string, AgentRecord>([[AGENT_ID.toLowerCase(), AGENT_RECORD]]),
     signerAgents: new Map<string, Hex>([[AGENT_KEY.address.toLowerCase(), AGENT_ID]]),
     // pending-row write checks — key: `${agentId}:${permission}`; absent means authorized
@@ -304,10 +303,6 @@ function world() {
       blockTime: async (block) => {
         if (state.blockTimesError !== null) throw state.blockTimesError
         return state.blockTimes.get(Number(block)) ?? null
-      },
-      ownerGrantLogs: async () => {
-        if (state.grantLogsError !== null) throw state.grantLogsError
-        return state.grantLogs
       },
       agentIdOfSigner: async (signer) => state.signerAgents.get(signer.toLowerCase()) ?? null,
       getAgent: async (agentId) => state.agentRecords.get(agentId.toLowerCase()) ?? null,
@@ -676,27 +671,28 @@ describe("the index queries are Hasura-shaped", () => {
       ...(state.agentsResult as object),
       _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: false }],
     }
-    // the chain-log scan DID finish — the agents come from Monad's own events, and the
-    // mid-sync index's Grant row (AGENT_ID) must not appear as if it were the list
-    state.grantLogs = [
-      { kind: "granted", agentId: OTHER_ID, capabilityId: CAP2_ID, namespaceId: NS, permissions: 1, block: 100, txHash: TX1 },
-    ]
+    // There is no second source for the list — the mid-sync index's Grant row (AGENT_ID) must
+    // not appear as if it were the list, and nothing scans the chain to replace it.
     const data = await loadMe(OWNER, ports)
-    expect(data.source).toBe("chain-logs")
-    expect(data.agents.map((a) => a.agentId)).toEqual([OTHER_ID])
+    expect(data.source).toBe("unavailable")
+    expect(data.agents).toEqual([])
+    expect(data.agentsUnavailable).toBe(AGENT_LIST_SYNCING)
     expect(data.lag.text).toBe("index still catching up")
   })
 
-  it("isReady === false plus a failed log scan leaves the list unavailable — catching up, not 'no agents'", async () => {
+  it("a mid-sync index still runs the records chain checks — the agent list is the only thing missing", async () => {
     const { state, ports } = world()
     state.agentsResult = {
       ...(state.agentsResult as object),
       _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: false }],
     }
-    state.grantLogsError = new Error("rpc down")
+    const { obj, record } = makeDirectObject()
+    state.objects.set(NS_SKILLS, [obj])
+    state.chainRecords.set(record.contextId, record)
     const data = await loadMe(OWNER, ports)
     expect(data.agentsUnavailable).toBe(AGENT_LIST_SYNCING)
-    expect(data.agents).toEqual([])
+    expect(data.records.find((r) => r.contextId === obj.contextId)!.state).toBe("anchored")
+    expect(state.getRecordsCalls.length).toBeGreaterThan(0)
   })
 
   it("a page-sized answer earns the may-be-incomplete banner — and the row limit goes out in the query", async () => {
@@ -720,25 +716,24 @@ describe("the index queries are Hasura-shaped", () => {
 })
 
 describe("loadMe — the agent list can be missing, not just empty", () => {
-  it("index down AND the log scan failed → agentsUnavailable, never an empty-list fiction", async () => {
+  it("index down → agentsUnavailable with the needs-index text, never an empty-list fiction", async () => {
     const { state, ports } = world()
     state.indexFails = true
-    state.grantLogsError = new Error("rpc down")
     const data = await loadMe(OWNER, ports)
     // the flag carries its own sentence — the page shows the reason, not a boolean
-    expect(data.agentsUnavailable).toBe(AGENT_LIST_UNAVAILABLE)
+    expect(data.agentsUnavailable).toBe(AGENT_LIST_NEEDS_INDEX)
     expect(data.agents).toEqual([])
-    expect(data.source).toBe("chain-logs")
+    expect(data.source).toBe("unavailable")
+    expect(data.lag.text).toBe("index unavailable")
   })
 
-  it("index absent AND the log scan failed → still unavailable, and the banner says the index was never configured", async () => {
+  it("index absent → the same needs-index text, and the badge lag names what was never configured", async () => {
     const { state, ports } = world()
-    state.grantLogsError = new Error("rpc down")
     ports.index = null // indexUrl unset — nothing configured to query
     const data = await loadMe(OWNER, ports)
-    expect(data.agentsUnavailable).toBe(AGENT_LIST_NO_INDEX)
-    // "the index is down" would be the wrong blame — nothing was ever pointed at an index
-    expect(data.agentsUnavailable).toContain("index not configured")
+    expect(data.agentsUnavailable).toBe(AGENT_LIST_NEEDS_INDEX)
+    expect(data.source).toBe("unavailable")
+    // "index unavailable" would be the wrong blame — nothing was ever pointed at an index
     expect(data.lag.text).toBe("index not configured")
   })
 
@@ -756,34 +751,7 @@ describe("loadMe — the agent list can be missing, not just empty", () => {
   })
 })
 
-describe("loadMe — chain-log fallback and names", () => {
-  it("when the index is down, agents come from ownerGrantLogs", async () => {
-    const { state, ports } = world()
-    state.indexFails = true
-    state.grantLogs = [
-      { kind: "granted", agentId: AGENT_ID, capabilityId: CAP_ID, namespaceId: NS, permissions: 3, block: 100, txHash: TX1 },
-      { kind: "granted", agentId: OTHER_ID, capabilityId: CAP2_ID, namespaceId: NS, permissions: 1, block: 101, txHash: TX2 },
-      { kind: "revoked", agentId: OTHER_ID, capabilityId: null, namespaceId: null, permissions: null, block: 102, txHash: TX3 },
-    ]
-    state.validCaps.set(CAP_ID, true)
-    state.validCaps.set(CAP2_ID, false)
-    state.capabilities.set(CAP2_ID.toLowerCase(), capabilityView({ agentId: OTHER_ID, revoked: true }))
-    const data = await loadMe(OWNER, ports)
-    expect(data.source).toBe("chain-logs")
-    expect(data.counts).toBeNull()
-    expect(data.lag.text).toBe("index unavailable")
-    const live = data.agents.find((a) => a.agentId === AGENT_ID)
-    expect(live).toBeDefined()
-    expect(live!.grants[0]!.capabilityId).toBe(CAP_ID)
-    expect(live!.grants[0]!.status.label).toBe("Can read")
-    expect(live!.readLive).toBe(true)
-    const dead = data.agents.find((a) => a.agentId === OTHER_ID)
-    expect(dead).toBeDefined()
-    expect(dead!.grants[0]!.status.label).toBe("Revoked")
-    expect(dead!.revokedTx).toBe(TX3)
-    expect(dead!.readLive).toBe(false)
-  })
-
+describe("loadMe — agent names", () => {
   it("a manifest fetch failure degrades to the shortened agent id, never an empty name", async () => {
     const { state, ports } = world()
     state.manifestsError = new Error("store lost the manifest")
@@ -852,18 +820,6 @@ describe("loadMe — a grant row is only live when the chain's capability agrees
     expect(grant.status.flagged).toBe(false)
   })
 
-  it("in chain-log mode the same checks run — a mismatched capability is Unverified there too", async () => {
-    const { state, ports } = world()
-    state.indexFails = true
-    state.grantLogs = [
-      { kind: "granted", agentId: AGENT_ID, capabilityId: CAP_ID, namespaceId: NS, permissions: 3, block: 100, txHash: TX1 },
-    ]
-    state.capabilities.set(CAP_ID.toLowerCase(), capabilityView({ agentId: OTHER_ID }))
-    const data = await loadMe(OWNER, ports)
-    expect(data.source).toBe("chain-logs")
-    const grant = data.agents.find((a) => a.agentId === AGENT_ID)!.grants[0]!
-    expect(grant.status).toEqual({ label: "Unverified", flagged: true, unchecked: false })
-  })
 })
 
 describe("loadMe — a failed chain check is 'unknown', never 'unverified'", () => {

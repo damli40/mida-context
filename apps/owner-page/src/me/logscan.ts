@@ -1,9 +1,8 @@
 /**
- * The chain-log fallback's bounds. When the index is down, /me reads CapabilityGranted /
- * CapabilityRevoked / AgentRevoked logs straight from the RPC — an unbounded scan of
- * ~65 million blocks could stall the page for minutes at the provider's smallest window, so
- * the scan is capped two ways and either cap ending it means "the agent list is unavailable",
- * never "nobody has access".
+ * Bounded chain-log scanning. /me's full-history agent-list fallback was removed in in-25 P-4:
+ * a scan from the deployment block needed ~39,000 requests against a public RPC that allows
+ * ~500 inside a 20 s budget, so it could never answer. This utility stays as the bounds any
+ * future bounded scan must keep — it is no longer wired into the page.
  *
  *   - at most LOG_SCAN_IN_FLIGHT requests are in the air at once, across ALL event scans —
  *     the cap lives in a LogClient wrapper, so every getLogs/getBlockNumber any scan issues
