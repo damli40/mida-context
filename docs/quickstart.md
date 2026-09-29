@@ -39,7 +39,7 @@ mida --help
 Expected output:
 
 ```
-usage: mida init | install <tool> | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | sponsor on|off | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or any identity add-agent or a client install provisions)
+usage: mida init | install <tool> [--no-mcp] | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | sponsor on|off | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or any identity add-agent or a client install provisions)
 ```
 
 *Status: RUN — `pnpm check:publish` installs the packed tarball into a fresh folder outside the repo and runs `npx mida --help` to exit 0 with this text. The `-g` global-install variant links the same bins through npm's standard path.*
@@ -109,9 +109,9 @@ installed
 Codex will ignore these hooks until you trust them: open codex, type /hooks, and trust the Mida entries.
 ```
 
-(`mida install claude-code` is the same shape; it prints just `installed` because Claude Code needs no trust step.)
+(`mida install claude-code` is the same shape, with no trust step. When the `claude` command is on your PATH, its own line about adding the MCP server prints too.)
 
-`mida install` also adds Mida's MCP server, so the agent can ask for context mid-session (`mida_handoff`, `mida_whats_new`, `mida_read`); `--no-mcp` skips it.
+For Claude Code and Codex, `mida install` also adds Mida's MCP server, so the agent can ask for context mid-session (`mida_handoff`, `mida_whats_new`, `mida_read`); `--no-mcp` skips it. Devin gets the hooks only.
 
 *Status: NOT RUN — it edits `~/.codex/config.toml`, which I did not want to touch on this machine. The managed-block format and idempotent re-install are covered by `apps/midad/test/install.test.ts`.*
 

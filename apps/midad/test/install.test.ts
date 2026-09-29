@@ -1869,6 +1869,10 @@ describe("runInstall for the clients", () => {
     expect(JSON.parse(readFileSync(cursorMcpConfigPath(work), "utf8"))).toEqual({})
   })
 
+  it("usage names the install form's --no-mcp flag (N-2)", () => {
+    expect(USAGE).toContain("install <tool> [--no-mcp]")
+  })
+
   it("install <client> --no-mcp is usage, not the owner-command refusal — for them the server is the whole install (F-7)", () => {
     for (const client of ["claude-desktop", "cursor"]) {
       const { code, lines } = run(["install", client, "--no-mcp"], { cwd: dir() })
