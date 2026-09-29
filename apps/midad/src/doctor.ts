@@ -16,7 +16,7 @@ import type { LocalAccount } from "viem"
 import { RESUBMIT_LANE_CLOSED, batchClient, batchStatusProbe, decideLane, pendingAnchors, pendingPlaintextPath, rejectedAnchors } from "./batching.js"
 import type { Lane, PendingAnchor } from "./batching.js"
 import { laneWhyText, resubmitStuckText } from "./batching.js"
-import { callDaemon } from "./control.js"
+import { callDaemon, socketPathFor } from "./control.js"
 import { codeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
 import { DEVIN_NODE_SQLITE_MIN } from "./devin-facts.js"
@@ -27,7 +27,7 @@ import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwn
 import type { OwnerMode } from "./keys.js"
 import { approvalsFileStatus, readApprovalsFile } from "./projects.js"
 import { listJobs } from "./queue.js"
-import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, serviceUrlInEffect, sponsorReachable } from "./runtime.js"
+import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, liveLockHolderPid, serviceUrlInEffect, sponsorReachable } from "./runtime.js"
 import { mismatchLine, readSavedNetwork, resolveNetwork } from "./network.js"
 import type { ResolvedNetwork, SavedNetwork, ServiceSource } from "./network.js"
 import { cliPackageName, isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
@@ -352,7 +352,17 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       name: "daemon",
       run: async () => {
         const reply = await callDaemon(home, "/health", undefined, { timeoutMs: deps.daemonProbeMs ?? DAEMON_PROBE_MS })
-        if (reply.status === 0) return [problem("midad is not answering", "start the daemon")]
+        if (reply.status === 0) {
+          // in-29 S-1 (Sep 29 item 14): the lock's pid alive while the socket does not answer —
+          // with the socket file or the api-url.json a daemon left behind — is a RUNNING service
+          // that cannot be reached, orphaned most often by an earlier start deleting its socket.
+          // It must be stopped, not started over; "start the daemon" would orphan it again.
+          const pid = liveLockHolderPid(home)
+          if (pid !== undefined && (existsSync(socketPathFor(home)) || home.has("api-url.json"))) {
+            return [`PROBLEM: the Mida service (pid ${pid}) is running but cannot be reached. Stop it with kill ${pid}, then run any mida command to start a fresh one.`]
+          }
+          return [problem("midad is not answering", "start the daemon")]
+        }
         // any answer at all used to read as healthy — only 200 with { ok: true } is midad;
         // anything else is a problem that names the status it actually got
         const body = reply.body as { ok?: unknown; codeRoot?: unknown; codeCommit?: unknown } | null

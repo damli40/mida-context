@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
+import { createServer as createHttpServer } from "node:http"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { CheckpointCopies, MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, ownerOnlyLine, removeJob, socketPathFor, startDaemon, writeSeen } from "@mida/midad"
@@ -98,6 +99,40 @@ describe("startDaemon", () => {
       expect(reply.status).toBe(200)
     } finally {
       await daemon.close()
+    }
+  })
+
+  it("a briefly busy old service keeps its socket — the new start backs off instead of orphaning it (in-29 S-1)", async () => {
+    // Sep 29, item 14: the old service answered /health slower than the 500 ms startup probe, the
+    // new start deleted the socket it listens on, then the lock refused the start — the old
+    // service kept running behind a deleted file and nothing could reach it again. The lock's
+    // pid is the truth: a live holder keeps its socket, whatever the health probe said.
+    const { home, deps } = setup()
+    const socketPath = socketPathFor(home)
+    const old = createHttpServer((req, res) => {
+      setTimeout(() => {
+        res.setHeader("content-type", "application/json")
+        res.end(JSON.stringify({ ok: true, marker: "old" }))
+      }, 200)
+    })
+    await new Promise<void>((resolve, reject) => {
+      old.once("error", reject)
+      old.listen(socketPath, () => resolve())
+    })
+    // the lock the live holder wrote — a live pid stands in for the old service's process
+    home.writeSecretJson("midad.lock", { pid: process.pid })
+    let second: { alreadyRunning: boolean; close(): Promise<void> } | undefined
+    try {
+      second = await startDaemon({ ...deps, staleCheckMs: 50 })
+      expect(second.alreadyRunning).toBe(true)
+      // the socket file must still be the old listener's — and a patient caller still reaches it
+      expect(existsSync(socketPath)).toBe(true)
+      const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 5_000 })
+      expect(reply.status).toBe(200)
+      expect(reply.body).toMatchObject({ marker: "old" })
+    } finally {
+      await second?.close()
+      await new Promise<void>((done) => old.close(() => done()))
     }
   })
 

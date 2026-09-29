@@ -62,6 +62,34 @@ describe("mida doctor without a chain", () => {
     expect(code).toBeLessThanOrEqual(9)
   })
 
+  it("a live lock holder whose socket does not answer is told to kill it, not to start a new one (in-29 S-1)", async () => {
+    // Sep 29, item 14's end state: midad's process is alive (its lock pid is), the socket it
+    // listens on is gone, and api-url.json is still on disk — running but unreachable. Doctor
+    // must name the pid and the fix; "start the daemon" would orphan it a second time.
+    const home = new MidaHome(join(dir(), "home"))
+    home.writeSecretJson("midad.lock", { pid: process.pid })
+    home.writeSecretJson("api-url.json", { baseUrl: "http://127.0.0.1:9" })
+    const lines: string[] = []
+    const code = await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    expect(lines).toContain(
+      `PROBLEM: the Mida service (pid ${process.pid}) is running but cannot be reached. Stop it with kill ${process.pid}, then run any mida command to start a fresh one.`,
+    )
+    expect(lines).not.toContain("PROBLEM: midad is not answering — start the daemon")
+    expect(code).toBeGreaterThan(0)
+  })
+
+  it("a lock whose pid is dead is just a stale lock — the same socket file scenario says start the daemon", async () => {
+    // a crashed service leaves the same files behind but its pid is gone — nothing is running,
+    // so the ordinary missing-daemon line stays right. 4194304 is above the usual pid_max.
+    const home = new MidaHome(join(dir(), "home"))
+    home.writeSecretJson("midad.lock", { pid: 4_194_304 })
+    home.writeSecretJson("api-url.json", { baseUrl: "http://127.0.0.1:9" })
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    expect(lines).toContain("PROBLEM: midad is not answering — start the daemon")
+    expect(lines.some((line) => line.includes("is running but cannot be reached"))).toBe(false)
+  })
+
   it("names the compile model and where the session text goes — per provider, from the real chain (M3-D5)", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const run = async (env: NodeJS.ProcessEnv) => {

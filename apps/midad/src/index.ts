@@ -1,7 +1,7 @@
 export { MidaHome, resolveHome } from "./home.js"
 export { FileAccessRequestStore } from "./request-store.js"
 export * from "./keys.js"
-export { Runtime, ServiceRuntime, AGENT_PERMISSIONS, HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, NAMESPACE, OWNER_TOP_UP_WEI, PURPOSE_ID, formatMon, makeOwnerBalanceGuard, parseSponsorUrl, serviceUrl } from "./runtime.js"
+export { Runtime, ServiceRuntime, AGENT_PERMISSIONS, HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, NAMESPACE, OWNER_TOP_UP_WEI, PURPOSE_ID, formatMon, liveLockHolderPid, makeOwnerBalanceGuard, parseSponsorUrl, serviceUrl } from "./runtime.js"
 export type { Network } from "./runtime.js"
 export { cliPackageName, isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
 export type { SiblingEntry } from "./sibling.js"

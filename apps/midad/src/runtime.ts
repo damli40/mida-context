@@ -195,6 +195,24 @@ function processAlive(pid: number): boolean {
   }
 }
 
+/**
+ * The pid of the process holding this home's lock, when that process is still alive — undefined
+ * when there is no lock, the lock is unreadable, or its pid is dead. The socket probe answers a
+ * different question (is a listener reachable right now); this answers the one that decides
+ * whether the socket file is stale: a live holder's files must never be removed under it (in-29
+ * S-1, the Sep 29 orphaning bug).
+ */
+export function liveLockHolderPid(home: MidaHome): number | undefined {
+  let pid = 0
+  try {
+    const held = home.readJson<{ pid?: unknown }>(LOCK_FILE)
+    if (typeof held?.pid === "number") pid = held.pid
+  } catch {
+    return undefined
+  }
+  return pid > 0 && processAlive(pid) ? pid : undefined
+}
+
 export function apiClient(
   baseUrl: string,
   deployment: Deployment,

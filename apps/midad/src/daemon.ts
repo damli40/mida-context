@@ -24,7 +24,7 @@ import type { MidaHome } from "./home.js"
 import { loadAgentIdentity } from "./keys.js"
 import { isSafeName, listJobs } from "./queue.js"
 import { NAMESPACE_ID, authorNamesFor, readCheckpoints, saveCheckpoint } from "./skeleton.js"
-import { ServiceRuntime } from "./runtime.js"
+import { ServiceRuntime, liveLockHolderPid } from "./runtime.js"
 import type { Network } from "./runtime.js"
 import { OWNER_COMMANDS, USAGE, ownerOnlyLine, runCliWithRuntime, validCliArgv } from "./cli.js"
 
@@ -152,6 +152,10 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   if (existsSync(socketPath)) {
     const alive = await callDaemon(home, "/health", undefined, { timeoutMs: staleCheckMs })
     if (alive.status !== 0) return { alreadyRunning: true, close: async () => {} }
+    // in-29 S-1 (Sep 29 item 14): a holder that is alive but answered slowly keeps its socket —
+    // deleting the file under it leaves it running but unreachable, and the lock below refuses
+    // the new start anyway. Only a dead or absent lock holder makes the socket stale.
+    if (liveLockHolderPid(home) !== undefined) return { alreadyRunning: true, close: async () => {} }
     rmSync(socketPath, { force: true })
   }
 
