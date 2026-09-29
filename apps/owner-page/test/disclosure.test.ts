@@ -15,7 +15,7 @@ const publicDir = join(dirname(fileURLToPath(import.meta.url)), "../public")
  */
 describe("disclosure wording on the owner page", () => {
   it("the approve screen says the agent sees plain text and revoking is not recall", () => {
-    const source = readFileSync(join(ownerSrc, "approve.ts"), "utf8")
+    const source = readFileSync(join(ownerSrc, "summary.ts"), "utf8")
     expect(source).toContain(
       "It will see this context as plain text. Revoking later stops future reads, not what it already saw.",
     )
@@ -35,8 +35,8 @@ describe("disclosure wording on the owner page", () => {
     )
   })
 
-  it("the approve page's static lede says the touch signs the grant", () => {
+  it("the approve page's static lede says to read first, then one passkey touch (in-26 Q-3)", () => {
     const html = readFileSync(join(publicDir, "approve.html"), "utf8")
-    expect(html).toContain("Approving signs the grant with your passkey")
+    expect(html).toContain("Read what it wants below, then approve with one passkey touch.")
   })
 })
