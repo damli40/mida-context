@@ -19,7 +19,7 @@ import { contentHash } from "@mida/storage"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { contextRegistryAbi } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
-import { BudgetedReader, ChainReadBudgetExceeded, ContextApiClient, MAX_CHAIN_READS_PER_REQUEST, RECORDS_PER_MULTICALL, RegistryReader, createContextApi } from "@mida/api"
+import { BudgetedReader, ChainReadBudgetExceeded, ContextApiClient, MAX_CHAIN_READS_PER_REQUEST, RECORDS_PER_MULTICALL, RegistryReader, createContextApi, onMulticall3Absent } from "@mida/api"
 import type { AnchoredObject, ContextRecordView, ObjectUploadBody, StoreLimits, StoredObject } from "@mida/api"
 
 const deployment: Deployment = {
@@ -497,6 +497,32 @@ describe("in-38 V-3: getRecords chunks and the Multicall3 probe is shared proces
     expect(await second.recordBatchSize()).toBe(RECORDS_PER_MULTICALL) // the process retried, not inherited the failure
     expect(await third.recordBatchSize()).toBe(RECORDS_PER_MULTICALL) // and the retried success is shared
     expect(probes).toBe(2)
+  })
+
+  it("fires the absent sink once per process and chain — the daemon's one multicall3-absent line (in-40 L-5)", async () => {
+    // A chain that answers getCode with empty code has no Multicall3: every read there takes the
+    // per-row path, and the operator's only clue is the daemon log line this sink produces. The
+    // verdict is cached process-wide, so the sink fires once per chain — not once per reader.
+    const seen: bigint[] = []
+    onMulticall3Absent((chainId) => seen.push(chainId))
+    try {
+      const noCode = { getCode: async () => "0x" } as unknown as PublicClient
+      const first = { ...deployment, chainId: 999_004n }
+      expect(await new RegistryReader({ deployment: first, publicClient: noCode }).recordBatchSize()).toBe(1)
+      expect(await new RegistryReader({ deployment: first, publicClient: noCode }).recordBatchSize()).toBe(1)
+      expect(seen).toEqual([999_004n])
+      // a second chain without the contract is its own line, and a chain WITH it never fires
+      const second = { ...deployment, chainId: 999_005n }
+      expect(await new RegistryReader({ deployment: second, publicClient: noCode }).recordBatchSize()).toBe(1)
+      expect(seen).toEqual([999_004n, 999_005n])
+      const hasCode = { getCode: async () => "0x6001" } as unknown as PublicClient
+      expect(await new RegistryReader({ deployment: { ...deployment, chainId: 999_006n }, publicClient: hasCode }).recordBatchSize()).toBe(
+        RECORDS_PER_MULTICALL,
+      )
+      expect(seen).toEqual([999_004n, 999_005n])
+    } finally {
+      onMulticall3Absent(undefined)
+    }
   })
 })
 

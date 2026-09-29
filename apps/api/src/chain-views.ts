@@ -60,6 +60,21 @@ export const RECORDS_PER_MULTICALL = 200
  */
 const multicall3Probes = new Map<string, { size: number | undefined; probe: Promise<number> }>()
 
+/**
+ * The "no Multicall3 on this chain" report (in-40 L-5): the first probe verdict per process and
+ * chain that finds no code at the canonical address fires the sink once. The daemon registers it
+ * to write one `multicall3-absent` line to its own log — the operator's clue for why that chain's
+ * reads take the per-row path. Deduped by chain id even across probe evictions, and a throwing
+ * sink never turns a probe verdict into a probe failure.
+ */
+let multicall3AbsentSink: ((chainId: bigint) => void) | undefined
+const multicall3AbsentSent = new Set<bigint>()
+
+/** Registers the process-wide absent-Multicall3 reporter; `undefined` removes it. */
+export function onMulticall3Absent(sink: ((chainId: bigint) => void) | undefined): void {
+  multicall3AbsentSink = sink
+}
+
 function multicall3ProbeEntry(context: ChainContext): { size: number | undefined; probe: Promise<number> } {
   const key = `${context.deployment.chainId}:${MULTICALL3_ADDRESS}`
   const held = multicall3Probes.get(key)
@@ -70,7 +85,20 @@ function multicall3ProbeEntry(context: ChainContext): { size: number | undefined
     // throws INSIDE the chain and lands on the same eviction as an RPC that refuses the call.
     probe: Promise.resolve()
       .then(() => context.publicClient.getCode({ address: MULTICALL3_ADDRESS }))
-      .then((code) => (entry.size = code === undefined || code === "0x" ? 1 : RECORDS_PER_MULTICALL)),
+      .then((code) => {
+        const absent = code === undefined || code === "0x"
+        // a chain that ANSWERED with empty code has no Multicall3 — an errored probe is evicted
+        // above and never reaches the sink; the verdict is reported once per process and chain
+        if (absent && multicall3AbsentSink !== undefined && !multicall3AbsentSent.has(context.deployment.chainId)) {
+          multicall3AbsentSent.add(context.deployment.chainId)
+          try {
+            multicall3AbsentSink(context.deployment.chainId)
+          } catch {
+            // a logging sink must never turn a probe verdict into a probe failure
+          }
+        }
+        return (entry.size = absent ? 1 : RECORDS_PER_MULTICALL)
+      }),
   }
   entry.probe.catch(() => {
     if (multicall3Probes.get(key) === entry) multicall3Probes.delete(key)

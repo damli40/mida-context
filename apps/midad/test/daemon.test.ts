@@ -7,6 +7,9 @@ import { dirname, join } from "node:path"
 import { CheckpointCopies, MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, ownerOnlyLine, removeJob, socketPathFor, startDaemon, writeSeen } from "@mida/midad"
 import type { DrainDeps, DrainResult, Runtime, ServiceRuntime } from "@mida/midad"
 import type { DaemonDeps } from "@mida/midad"
+import { RegistryReader } from "@mida/api"
+import type { Deployment } from "@mida/chain"
+import type { PublicClient } from "viem"
 import { sampleCheckpoint } from "./helpers.js"
 
 const DRAIN_OK: DrainResult = { saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0, earliestDueMs: null }
@@ -213,6 +216,24 @@ describe("startDaemon", () => {
       }
     } finally {
       holder.kill()
+    }
+  })
+
+  it("logs multicall3-absent once when its chain reports no Multicall3 — one line per process (in-40 L-5)", async () => {
+    // The daemon registers the shared probe's absent sink against its own log at start: the first
+    // getCode verdict that a chain has no Multicall3 writes {event: "multicall3-absent", chainId}
+    // to what daemon-main sends to logs/daemon.jsonl, and the cached verdict never repeats it.
+    const { deps, logs } = setup()
+    const daemon = await startDaemon({ ...deps, staleCheckMs: 50 })
+    try {
+      const deployment = { chainId: 999_777n } as Deployment
+      const noCode = { getCode: async () => "0x" } as unknown as PublicClient
+      expect(await new RegistryReader({ deployment, publicClient: noCode }).recordBatchSize()).toBe(1)
+      expect(await new RegistryReader({ deployment, publicClient: noCode }).recordBatchSize()).toBe(1)
+      const events = logs.filter((entry) => (entry as { event?: string }).event === "multicall3-absent")
+      expect(events).toEqual([{ event: "multicall3-absent", chainId: "999777" }])
+    } finally {
+      await daemon.close()
     }
   })
 

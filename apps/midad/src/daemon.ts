@@ -26,6 +26,7 @@ import { isSafeName, listJobs } from "./queue.js"
 import { NAMESPACE_ID, authorNamesFor, readCheckpoints, saveCheckpoint } from "./skeleton.js"
 import { ServiceRuntime, liveLockHolderPid } from "./runtime.js"
 import type { Network } from "./runtime.js"
+import { onMulticall3Absent } from "@mida/api"
 import { OWNER_COMMANDS, USAGE, ownerOnlyLine, runCliWithRuntime, validCliArgv } from "./cli.js"
 
 /** Request bodies over this size are refused with 413 and the connection is closed. */
@@ -141,6 +142,11 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   const drain = deps.drain ?? drainUntilSettled
   const runCli = deps.runCli ?? runCliWithRuntime
   const identity = deps.identity ?? codeIdentity()
+
+  // in-40 L-5: a chain that answers getCode with empty code has no Multicall3, so every read
+  // there takes the per-row path — the daemon reports that verdict to its own log once per
+  // process and chain, which is the only place an operator would learn it from.
+  onMulticall3Absent((chainId) => deps.log({ event: "multicall3-absent", chainId: String(chainId) }))
 
   // a socket outside the home lands in the per-user fallback folder — the daemon itself makes it
   // private; an existing folder that is not a real 0700 directory owned by this user refuses the
