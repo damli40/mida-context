@@ -18,11 +18,6 @@ function provenancePolicyInWords(policy: number): string {
   return parts.length > 0 ? `allows ${parts.join(", ")}` : "allows no inferred, imported or attested records"
 }
 
-/** A long hex value in the summary is shortened the same way the sign-list shortens its ids. */
-function shortHex(value: string): string {
-  return value.length > 14 ? `${value.slice(0, 14)}…` : value
-}
-
 /** The permission bits that let a scope write records — the only ones a provenance policy governs. */
 const WRITE_PERMISSIONS = PERMISSION.CREATE | PERMISSION.SUPERSEDE_OWN | PERMISSION.SUPERSEDE_ANY
 
@@ -45,10 +40,11 @@ export function approveSummaryLines(prep: PreparedApprove, req: LinkRequest): st
     lines.push(`Provenance policy: ${policies.length === 1 ? provenancePolicyInWords(policies[0]!) : "varies by scope"}`)
   }
   // A new project row is signed too — name the agent and the COMPLETE folder root it adds; a
-  // shortened root would hide exactly what this approval covers (in-26 Q-3).
+  // shortened root would hide exactly what this approval covers (in-26 Q-3), and the agent is a
+  // name, not a hash — it is never shortened either (in-27 R-3).
   if (req.entry !== undefined) {
     const entry = req.entry
-    lines.push(`Adds folder: ${entry.root} — agent ${shortHex(entry.agent)}`)
+    lines.push(`Adds folder: ${entry.root} — agent ${entry.agent}`)
   }
   lines.push(`Advisor: ${prep.advice.risk} risk.`, ...prep.advice.warnings.map((w) => `Warning: ${w}`))
   if (prep.alreadyGranted) lines.push("This agent already holds everything it asked for.")

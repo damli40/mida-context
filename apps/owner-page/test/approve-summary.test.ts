@@ -48,6 +48,16 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
     expect(lines.find((l) => l.startsWith("Adds folder:"))).toBe(`Adds folder: ${LONG_ROOT} — agent claude-code`)
   })
 
+  it("Adds folder names the agent in full — it is a name, not a hash to shorten (in-27 R-3)", () => {
+    const lines = approveSummaryLines(
+      prep(),
+      req({ entry: { agent: "claude-code-desktop-assistant", projectId: "proj-1", root: "/srv/x" } }),
+    )
+    expect(lines.find((l) => l.startsWith("Adds folder:"))).toBe(
+      "Adds folder: /srv/x — agent claude-code-desktop-assistant",
+    )
+  })
+
   it("a read-only ask shows no Provenance policy line — the policy governs writes only", () => {
     const lines = approveSummaryLines(prep(), req())
     expect(lines.some((l) => l.startsWith("Provenance policy:"))).toBe(false)
