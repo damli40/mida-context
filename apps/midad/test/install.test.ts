@@ -891,6 +891,70 @@ describe("the codex MCP server inside the managed block (in-28)", () => {
     expect(after).toContain("[mcp_servers.mida]")
     expect(after).toContain(`env = { MIDA_HOME = "${home}" }`)
   })
+
+  it("runInstall defaults to writing the server table alongside the hooks", () => {
+    const config = join(dir(), "config.toml")
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "codex"], {
+        print: (line) => lines.push(line),
+        claudeSettings: join(dir(), "settings.json"),
+        codexConfig: config,
+        home,
+      }),
+    ).toBe(0)
+    const text = readFileSync(config, "utf8")
+    expect(text).toContain("[mcp_servers.mida]")
+    expect(text).toContain(`env = { MIDA_HOME = "${home.root}" }`)
+    expect(codexMcpStatus(config, home.root)).toBe("installed")
+  })
+
+  it("runInstall honours --no-mcp after the tool name — the hooks-only block, no table", () => {
+    const config = join(dir(), "config.toml")
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "codex", "--no-mcp"], {
+        print: (line) => lines.push(line),
+        claudeSettings: join(dir(), "settings.json"),
+        codexConfig: config,
+        home,
+      }),
+    ).toBe(0)
+    expect(readFileSync(config, "utf8")).toBe(`${codexBlock({ mcp: false })}\n`)
+    expect(codexHooksStatus(config)).toBe("installed")
+    expect(codexMcpStatus(config, home.root)).toBe("not-installed")
+  })
+
+  it("--no-mcp parses on the claude-code install too — hooks written, nothing MCP yet", () => {
+    const settings = join(dir(), "settings.json")
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "claude-code", "--no-mcp"], {
+        print: (line) => lines.push(line),
+        claudeSettings: settings,
+        codexConfig: join(dir(), "config.toml"),
+        home,
+      }),
+    ).toBe(0)
+    expect(claudeHooksStatus(settings)).toBe("installed")
+  })
+
+  it("--no-mcp is an install flag — uninstall refuses it, and a bogus flag is usage", () => {
+    const config = join(dir(), "config.toml")
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const deps = {
+      print: (line: string) => lines.push(line),
+      claudeSettings: join(dir(), "settings.json"),
+      codexConfig: config,
+      home,
+    }
+    const lines: string[] = []
+    expect(runInstall(["uninstall", "codex", "--no-mcp"], deps)).toBe(2)
+    expect(runInstall(["install", "codex", "--bogus"], deps)).toBe(2)
+  })
 })
 
 describe("the Codex trust reminder", () => {

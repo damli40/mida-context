@@ -309,7 +309,13 @@ describe("the crude mida command", () => {
     expect(loadAgentIdentity(fresh, "devin")?.name).toBe("devin")
     expect(fresh.has("agents/devin/pending-request.json")).toBe(true)
     expect(devinHooksStatus(config)).toBe("installed")
+    // this build does not know where Devin keeps MCP servers — the install says so, once
+    const noMcpNote = "devin: MCP server not added. This build does not know where Devin keeps MCP servers; hooks are installed."
+    expect(out).toContain(noMcpNote)
     expect(out).toContain("next: run `mida approve devin` in this folder")
+    // --no-mcp on a rerun: hooks already there, no MCP attempted, the note stays silent
+    expect(await run3("install", "devin", "--no-mcp")).toBe(0)
+    expect(out.filter((line) => line === noMcpNote)).toHaveLength(1)
     // and the provisioned name is a real approve target even though it is not a default agent
     expect(await run3("approve", "devin")).toBe(0)
     expect(out.some((line) => line.startsWith("approved devin"))).toBe(true)

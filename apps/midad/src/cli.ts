@@ -955,7 +955,10 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       const tool = argv[1] ?? ""
       // devin is a hook tool, not an MCP client — but its install provisions an identity (in-9:
       // init no longer registers one by default), so it is an owner command all the same.
-      if (argv.length !== 2 || !(MCP_CLIENT_TOOLS.includes(tool) || tool === "devin")) return usage()
+      // --no-mcp is devin's only extra word here: for the MCP clients the entry IS the install,
+      // so a flag that skips it has nothing left to do — that is usage, not a no-op.
+      const devinNoMcp = argv.length === 3 && argv[2] === "--no-mcp" && tool === "devin"
+      if ((argv.length !== 2 && !devinNoMcp) || !(MCP_CLIENT_TOOLS.includes(tool) || tool === "devin")) return usage()
       // the identity comes first — provisioning is init's per-agent pass over this one name, so
       // install is idempotent the same way init is: an existing identity is kept, a missing one
       // registers on chain as a project-context agent (never `assistant`)
@@ -971,6 +974,11 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       if (tool === "devin") {
         const outcome = installDevin(deps.devinConfig ?? resolveDevinConfigPath(process.env, homedir()))
         deps.print(outcome === "already-installed" ? "already installed" : "installed")
+        // Devin's own MCP config location is not in this build — say so, unless the owner
+        // explicitly skipped the server with --no-mcp
+        if (!devinNoMcp) {
+          deps.print("devin: MCP server not added. This build does not know where Devin keeps MCP servers; hooks are installed.")
+        }
         deps.print(`next: run \`mida approve devin\` in this folder`)
         return 0
       }
@@ -2153,7 +2161,10 @@ export function runInstall(
   },
 ): number {
   const tool = argv[1] ?? ""
-  if (argv.length !== 2 || !INSTALL_TOOLS.includes(tool)) {
+  // --no-mcp is an install flag: it names exactly what it skips. On uninstall there is nothing
+  // to skip — the entry goes with the hooks — so the flag is usage there.
+  const noMcp = argv.length === 3 && argv[2] === "--no-mcp"
+  if (!INSTALL_TOOLS.includes(tool) || (argv.length !== 2 && !(argv[0] === "install" && noMcp))) {
     deps.print(USAGE)
     return 2
   }
@@ -2196,7 +2207,7 @@ export function runInstall(
           : deps.codexConfig
   const run =
     argv[0] === "install"
-      ? (p: string) => (tool === "claude-code" ? installClaudeCode(p) : tool === "devin" ? installDevin(p) : installCodex(p, { home: deps.home.root }))
+      ? (p: string) => (tool === "claude-code" ? installClaudeCode(p) : tool === "devin" ? installDevin(p) : installCodex(p, { home: deps.home.root, mcp: !noMcp }))
       : (p: string) => (tool === "claude-code" ? uninstallClaudeCode(p) : tool === "devin" ? uninstallDevin(p) : uninstallCodex(p))
   try {
     const outcome = run(settingsPath)
