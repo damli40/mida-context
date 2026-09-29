@@ -181,7 +181,7 @@ describe("startDaemon", () => {
     try {
       const started = spawnSync("ps", ["-o", "lstart=", "-p", String(holder.pid)], {
         encoding: "utf8",
-        env: { ...process.env, LC_ALL: "C" },
+        env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
       }).stdout.trim()
       home.writeSecretJson("midad.lock", { pid: holder.pid, started, role: "service" })
       writeFileSync(socketPath, "")

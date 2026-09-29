@@ -183,17 +183,19 @@ export interface OpenOptions extends LockTiming {
 
 /**
  * The one process-table lookup behind every lock decision: `ps -o <field>= -p <pid>` under
- * LC_ALL=C, so the `lstart` answer has one fixed format on every machine. Returns the trimmed
- * output, or undefined on any failure — a spawn error, a non-zero exit, or empty output
- * (BusyBox `ps` has no `-p`; a dead pid prints nothing). The lock verdict table treats every
- * one of those as "cannot identify", which is a held verdict, never a removable lock.
+ * LC_ALL=C and TZ=UTC. `lstart` prints LOCAL time, so both the locale and the zone are pinned —
+ * otherwise a lock written under one TZ and read under another compares unequal, a live service
+ * looks like a recycled pid, and its lock and socket get removed. Returns the trimmed output,
+ * or undefined on any failure — a spawn error, a non-zero exit, or empty output (BusyBox `ps`
+ * has no `-p`; a dead pid prints nothing). The lock verdict table treats every one of those as
+ * "cannot identify", which is a held verdict, never a removable lock.
  */
 export type ProcessProbe = (pid: number, field: "lstart" | "command") => string | undefined
 
 const psProbe: ProcessProbe = (pid, field) => {
   const ps = spawnSync("ps", ["-o", `${field}=`, "-p", String(pid)], {
     encoding: "utf8",
-    env: { ...process.env, LC_ALL: "C" },
+    env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
   })
   if (ps.error !== undefined || ps.status !== 0) return undefined
   const out = ps.stdout.trim()

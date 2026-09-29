@@ -25,13 +25,13 @@ const OWNER = "0x1111111111111111111111111111111111111111"
 const freshHome = () => new MidaHome(mkdtempSync(join(tmpdir(), "mida-svc-")))
 
 /**
- * What `ps -o lstart= -p <pid>` prints for a live pid under LC_ALL=C — the exact string a lock
- * writer stores in `started`. A test spawns the child and only ever kills what it spawned.
+ * What `ps -o lstart= -p <pid>` prints for a live pid under LC_ALL=C TZ=UTC — the exact string a
+ * lock writer stores in `started`. A test spawns the child and only ever kills what it spawned.
  */
 const lstartOf = (pid: number): string | undefined => {
   const ps = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
     encoding: "utf8",
-    env: { ...process.env, LC_ALL: "C" },
+    env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
   })
   if (ps.error !== undefined || ps.status !== 0) return undefined
   const out = ps.stdout.trim()
@@ -197,6 +197,42 @@ describe("ServiceRuntime — the daemon's runtime", () => {
       expect(home.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(holder.pid)
     } finally {
       holder.kill()
+    }
+  })
+
+  it("a lock written and read under a swung TZ still holds — ps answers are pinned to UTC (in-41 U-1)", async () => {
+    // The Sep 29 orphaning bug, second half: `ps -o lstart=` prints LOCAL time, so a lock
+    // written under one zone and read under another made a live service look recycled and got
+    // its socket removed. With the process TZ swung to Asia/Tokyo the lock written here must
+    // still prove the holder — `started` must equal the `TZ=UTC LC_ALL=C` ps answer.
+    const savedTz = process.env.TZ
+    process.env.TZ = "Asia/Tokyo"
+    const home = freshHome()
+    home.writeSecretJson("owner-address.json", { address: OWNER })
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
+    const runtime = await ServiceRuntime.open(home, network)
+    try {
+      // what this process wrote is exactly what ps prints with the zone pinned to UTC
+      const lock = home.readJson<{ pid?: number; started?: string }>("midad.lock")
+      expect(lock?.pid).toBe(process.pid)
+      expect(lock?.started).toBe(lstartOf(process.pid))
+      // …and a second open on the same home judges this live lock held, not recycled
+      await expect(
+        ServiceRuntime.open(home, network, { lockWaitMs: 300, lockStepMs: 50 }),
+      ).rejects.toThrow(/another Mida process/)
+      // a foreign lock is held the same way when its `started` is the UTC answer for its pid
+      const home2 = freshHome()
+      home2.writeSecretJson("owner-address.json", { address: OWNER })
+      home2.writeSecretJson("midad.lock", { pid: holder.pid, started: lstartOf(holder.pid!), role: "service" })
+      await expect(
+        ServiceRuntime.open(home2, network, { lockWaitMs: 300, lockStepMs: 50 }),
+      ).rejects.toThrow(/another Mida process/)
+      expect(home2.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(holder.pid)
+    } finally {
+      await runtime.close()
+      holder.kill()
+      if (savedTz === undefined) delete process.env.TZ
+      else process.env.TZ = savedTz
     }
   })
 

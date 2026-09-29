@@ -140,7 +140,7 @@ describe("mida doctor without a chain", () => {
     const holder = spawnHolder("foreign")
     const started = spawnSync("ps", ["-o", "lstart=", "-p", String(holder.pid)], {
       encoding: "utf8",
-      env: { ...process.env, LC_ALL: "C" },
+      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
     }).stdout.trim()
     home.writeSecretJson("midad.lock", { pid: holder.pid, started, role: "command" })
     const lines: string[] = []
@@ -159,7 +159,7 @@ describe("mida doctor without a chain", () => {
     const holder = spawnHolder("foreign")
     const started = spawnSync("ps", ["-o", "lstart=", "-p", String(holder.pid)], {
       encoding: "utf8",
-      env: { ...process.env, LC_ALL: "C" },
+      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
     }).stdout.trim()
     home.writeSecretJson("midad.lock", { pid: holder.pid, started, role: "save-helper" })
     const lines: string[] = []
