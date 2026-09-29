@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-0.43 10.50 280.08 79.00" width="280" height="79" role="img" aria-label="Mida">
+<title>Mida</title>
+<style>
+.arc{fill:none;stroke:#14130F;stroke-width:11;stroke-linecap:round;stroke-dasharray:100 110;stroke-dashoffset:0}
+.l{animation:draw .9s cubic-bezier(.65,0,.35,1) .1s both,open-l 6s ease-in-out 2.4s infinite}
+.r{animation:draw .9s cubic-bezier(.65,0,.35,1) .35s both,open-r 6s ease-in-out 2.4s infinite}
+.dot{fill:#14130F;transform-box:fill-box;transform-origin:center;animation:settle .7s cubic-bezier(.34,1.56,.64,1) .85s both}
+.word{fill:#14130F;animation:rise .8s cubic-bezier(.16,1,.3,1) 1.2s both}
+@keyframes draw{from{stroke-dashoffset:105}to{stroke-dashoffset:0}}
+@keyframes settle{from{transform:scale(0);opacity:0}to{transform:scale(1);opacity:1}}
+@keyframes rise{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
+@keyframes open-l{0%,100%{transform:translateX(0)}50%{transform:translateX(-3px)}}
+@keyframes open-r{0%,100%{transform:translateX(0)}50%{transform:translateX(3px)}}
+@media (prefers-reduced-motion:reduce){.l,.r,.dot,.word{animation:none}}
+</style>
+<path class="arc l" pathLength="100" d="M28.0 16.0A40.0 40.0 0 0 0 28.0 84.0"/>
+<path class="arc r" pathLength="100" d="M72.0 16.0A40.0 40.0 0 0 1 72.0 84.0"/>
+<circle class="dot" cx="50" cy="50" r="14.0"/>
+<g class="word"><g transform="translate(122.43 73.00) scale(0.4600)"><path d="M108.56 -99.57V0.00H88.59V-64.76L61.91 0.00H46.79L19.97 -64.76V0.00H0.00V-99.57H22.68L54.35 -25.53L86.02 -99.57ZM126.11 -100.14Q126.11 -105.14 129.60 -108.49Q133.10 -111.84 138.37 -111.84Q143.65 -111.84 147.15 -108.49Q150.64 -105.14 150.64 -100.14Q150.64 -95.15 147.15 -91.80Q143.65 -88.45 138.37 -88.45Q133.10 -88.45 129.60 -91.80Q126.11 -95.15 126.11 -100.14ZM148.22 -79.03V0.00H128.25V-79.03ZM199.00 -80.31Q206.70 -80.31 213.69 -76.96Q220.68 -73.61 224.82 -68.05V-105.56H245.08V0.00H224.82V-11.70Q221.11 -5.85 214.41 -2.28Q207.70 1.28 198.86 1.28Q188.87 1.28 180.60 -3.85Q172.33 -8.99 167.55 -18.33Q162.77 -27.67 162.77 -39.80Q162.77 -51.78 167.55 -61.06Q172.33 -70.33 180.60 -75.32Q188.87 -80.31 199.00 -80.31ZM203.99 -62.77Q198.43 -62.77 193.72 -60.06Q189.02 -57.35 186.09 -52.14Q183.17 -46.93 183.17 -39.80Q183.17 -32.67 186.09 -27.32Q189.02 -21.97 193.79 -19.12Q198.57 -16.26 203.99 -16.26Q209.56 -16.26 214.41 -19.04Q219.26 -21.83 222.11 -27.03Q224.96 -32.24 224.96 -39.51Q224.96 -46.79 222.11 -52.00Q219.26 -57.20 214.41 -59.99Q209.56 -62.77 203.99 -62.77ZM295.58 -80.31Q304.42 -80.31 311.06 -76.75Q317.69 -73.18 321.68 -67.76V-79.03H341.80V0.00H321.68V-11.55Q317.83 -5.99 311.06 -2.35Q304.28 1.28 295.44 1.28Q285.45 1.28 277.25 -3.85Q269.04 -8.99 264.27 -18.33Q259.49 -27.67 259.49 -39.80Q259.49 -51.78 264.27 -61.06Q269.04 -70.33 277.25 -75.32Q285.45 -80.31 295.58 -80.31ZM300.71 -62.77Q295.15 -62.77 290.44 -60.06Q285.73 -57.35 282.81 -52.14Q279.89 -46.93 279.89 -39.80Q279.89 -32.67 282.81 -27.32Q285.73 -21.97 290.51 -19.12Q295.29 -16.26 300.71 -16.26Q306.28 -16.26 311.13 -19.04Q315.98 -21.83 318.83 -27.03Q321.68 -32.24 321.68 -39.51Q321.68 -46.79 318.83 -52.00Q315.98 -57.20 311.13 -59.99Q306.28 -62.77 300.71 -62.77Z"/></g></g>
+</svg>

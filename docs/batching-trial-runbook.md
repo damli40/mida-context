@@ -7,7 +7,8 @@ contracts.
 
 **The one-sentence version.** Normally every automatic checkpoint save is its own Monad
 transaction. With batching on, saves are signed locally and handed to the hosted store, which
-packs many saves into one shared transaction. The BatchAnchor contract still checks every save on
+anchors them through its batcher. Saves that arrive within the same few seconds, from any owner, share one
+transaction. The BatchAnchor contract still checks every save on
 its own — signature, live grant, area, epoch, parent — and can reject individual saves inside a
 shared batch. Everything else (grants, revokes, facts, owner keys) is unchanged.
 

@@ -10,7 +10,7 @@ ContextRegistry `0x75fB6dB9af93A8d823e51c488CaA913ca711FB78`, BatchAnchor
 
 ## Sep 27: the handoff loop across real agents
 
-Build `17bea89`, a fresh project folder, both agents approved in the owner's terminal.
+Build `0586957`, a fresh project folder, both agents approved in the owner's terminal.
 
 | Run | What happened | Result |
 |---|---|---|
@@ -37,14 +37,14 @@ reader's view, three runs each:
 | | Goal updated to the change | Change credited to the user |
 |---|---|---|
 | Before the fix | 0 of 6 | 1 of 6 |
-| After the fix (build `55755d1` and later) | 6 of 6 | 6 of 6 |
+| After the fix (build `73e6d26` and later) | 6 of 6 | 6 of 6 |
 
 A third condition, where a save happened while the change was still in view, scored 3 of 3 before
 and after.
 
 ## Sep 29: batching, live
 
-Build `c65f6bc`, the demo owner `0x0ba02302f4fa477821f89a5e16f9a23565168715` on the hosted setup, batching
+Build `5f795b3`, the demo owner `0x0ba02302f4fa477821f89a5e16f9a23565168715` on the hosted setup, batching
 turned on with `mida batching on`.
 
 | Save | Anchored in | Block |

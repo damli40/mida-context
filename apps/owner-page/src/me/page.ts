@@ -426,7 +426,7 @@ function renderAnchor(doc: Document, data: MeData): HTMLElement {
   sec.appendChild(grid)
   const cards: [string, string, string, number][] = [
     ["b-neutral", "One save, one transaction", "Records written directly. Grants, revokes and your own facts always go this way.", direct],
-    ["b-info", "Batched", "Checkpoints anchored in shared batches: one transaction, one Merkle root, every signature re-checked by the contract.", batched],
+    ["b-info", "Batched", "Checkpoints anchored by Mida's batcher under one Merkle root per batch. The contract re-checks every signature.", batched],
     ["b-warn", "Pending anchor", "The store's queue: saved and checked, usable in handoffs, not yet on Monad. The contract can still reject them.", pending],
   ]
   for (const [cls, badge, blurb, count] of cards) {

@@ -2,13 +2,11 @@
 
 Date: 2026-09-20 · Status: design as written on Sep 20, before the build · Public cut: the hackathon-planning sections (goals framing, dates, later amendments) were removed before publication; the technical design and the benchmark stand as written.
 
-Builds on: Project 1 protocol core (finished, branch `project-1-protocol-core`, head `18fa78a`,
-live on Monad testnet 10143). Plan of record: the Sep 18 frozen design. Evidence base: the
+Builds on: the Project 1 protocol core (finished, live on Monad testnet 10143). Plan of record: the Sep 18 frozen design. Evidence base: the
 feasibility spike in `spike/` (`FINDINGS-capture.md`, `FINDINGS-delivery.md`).
 
-**Where to look:** §2 is what Monad asks for and how each piece answers it. §5 is the path of one
-checkpoint. §8 is every way this fails and what happens. §11 is the build order with dates.
-§12 is the list of things I have not proven.
+**Where to look:** §5 is the path of one checkpoint. §8 is every way this fails and what happens.
+§12 is the list of things I had not proven yet.
 
 ---
 
@@ -300,7 +298,7 @@ numbers are shown. Stated limits: one scorer, small sample, shows a direction no
    does a normal session produce?
 
 **Answered Sep 20 on Monad testnet** (12 of 12 steps passed; `docs/evidence/m0-monad-testnet.json`,
-commit `83033ba`; local-chain figures in `m0-local-anvil.json` for contrast):
+commit `c35848c`; local-chain figures in `m0-local-anvil.json` for contrast):
 
 1. **Yes.** One operator wallet registered both agents, on the local chain and on testnet. No
    extra wallets to fund.
