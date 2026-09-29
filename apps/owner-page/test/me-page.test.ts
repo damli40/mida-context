@@ -312,6 +312,57 @@ describe("renderMe", () => {
     expect(lead!.textContent).toBe("1 agent · 1 could not be checked just now")
   })
 
+  it("a stale index with live readers keeps the count and admits the lag (in-26 Q-2)", () => {
+    // lag measured past the stale line — "is behind", never "may be"
+    const other = agent({ agentId: `0x${"22".repeat(32)}` as Hex })
+    const root = renderMe(
+      data({ agents: [agent(), other], lag: { text: "≈ 160 s behind Monad", stale: true } }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
+    expect(lead!.textContent).toBe(
+      "At least 2 agents can read your context. The index is behind Monad, so a new approval may not show yet.",
+    )
+  })
+
+  it("a stale index with no live readers says none can read — as far as the index shows (in-26 Q-2)", () => {
+    // live 0 + unchecked 2: "0 agents" would state a fact the stale index cannot prove
+    const a = agent({ readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
+    const b = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
+    const root = renderMe(
+      data({ agents: [a, b], lag: { text: "≈ 160 s behind Monad", stale: true } }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
+    expect(lead!.textContent).toBe(
+      "No agent can read your context, as far as the index shows. 2 could not be checked just now. The index is behind Monad, so a new approval may not show yet.",
+    )
+  })
+
+  it("an index that cannot say how fresh it is answers 'may be behind' (in-26 Q-2)", () => {
+    // freshness unknown — the index answered but its own progress was unreadable
+    const root = renderMe(
+      data({ lag: { text: "index freshness unknown", stale: true } }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
+    expect(lead!.textContent).toBe(
+      "At least 1 agent can read your context. The index may be behind Monad, so a new approval may not show yet.",
+    )
+  })
+
+  it("unknown freshness with no live readers still names the unchecked count (in-26 Q-2)", () => {
+    const a = agent({ readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
+    const root = renderMe(
+      data({ agents: [a], lag: { text: "index freshness unknown", stale: true } }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
+    expect(lead!.textContent).toBe(
+      "No agent can read your context, as far as the index shows. 1 could not be checked just now. The index may be behind Monad, so a new approval may not show yet.",
+    )
+  })
+
   it("a grant whose chain check never ran says 'could not check Monad just now', not an index disagreement", () => {
     const unreachable = agent({
       readLive: false,

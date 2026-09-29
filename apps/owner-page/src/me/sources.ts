@@ -121,9 +121,12 @@ export const AGENT_LIST_NEEDS_INDEX =
   "Your agent list comes from the index, and the index is not reachable right now. The records below are still checked against Monad."
 /**
  * The mid-sync case: the index answered but reports `isReady: false` — its Grant rows are a
- * partial scan, not a list.
+ * partial scan, not a list. The sentence says so without claiming a chain scan happened —
+ * there is none — and without hiding that the records below are still checked against Monad.
+ * Pinned verbatim by in-26 Q-2.
  */
-export const AGENT_LIST_SYNCING = "Agent list unavailable — the index is still catching up and the chain scan did not finish"
+export const AGENT_LIST_SYNCING =
+  "Your agent list is not ready yet: the index is still catching up with Monad. The records below are still checked against Monad."
 /**
  * The exact wording when the deployment set an index URL the page's own CSP refuses — the
  * Worker reports `index-url-not-allowed`, and blaming a reachable index would be wrong.

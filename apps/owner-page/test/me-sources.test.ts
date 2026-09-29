@@ -695,6 +695,18 @@ describe("the index queries are Hasura-shaped", () => {
     expect(state.getRecordsCalls.length).toBeGreaterThan(0)
   })
 
+  it("the mid-sync sentence admits the list is not ready — and that records are still chain-checked (in-26 Q-2)", async () => {
+    const { state, ports } = world()
+    state.agentsResult = {
+      ...(state.agentsResult as object),
+      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: false }],
+    }
+    const data = await loadMe(OWNER, ports)
+    expect(data.agentsUnavailable).toBe(
+      "Your agent list is not ready yet: the index is still catching up with Monad. The records below are still checked against Monad.",
+    )
+  })
+
   it("a page-sized answer earns the may-be-incomplete banner — and the row limit goes out in the query", async () => {
     const { state, ports } = world()
     // Two grants where the page asked for one — a full page means the index may have more.

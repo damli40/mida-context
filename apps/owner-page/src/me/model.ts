@@ -37,10 +37,17 @@ export function isTxHash(value: unknown): value is Hex {
 const SECONDS_PER_BLOCK = 0.4
 export const STALE_INDEX_BLOCKS = 150
 
+/**
+ * lagText's text when the index answered but could not say how fresh it is — exported so the
+ * summary headline can tell "cannot measure" apart from a measured lag and hedge accordingly
+ * ("may be behind" vs "is behind", in-26 Q-2).
+ */
+export const INDEX_FRESHNESS_UNKNOWN_TEXT = "index freshness unknown"
+
 export function lagText(blocksBehind: number | null): { text: string; stale: boolean } {
   // Null means the index ANSWERED but its freshness row was missing, unreadable or for another
   // chain — "index unavailable" would contradict the badge's "Read from the Envio index".
-  if (blocksBehind === null || !Number.isFinite(blocksBehind)) return { text: "index freshness unknown", stale: true }
+  if (blocksBehind === null || !Number.isFinite(blocksBehind)) return { text: INDEX_FRESHNESS_UNKNOWN_TEXT, stale: true }
   const blocks = Math.max(0, blocksBehind)
   const seconds = Math.round(blocks * SECONDS_PER_BLOCK)
   return { text: `≈ ${seconds} s behind Monad`, stale: blocks > STALE_INDEX_BLOCKS }

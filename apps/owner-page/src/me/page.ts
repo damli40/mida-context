@@ -26,7 +26,7 @@ import type { FlowEnvironment } from "../owner/flows.js"
 import { assertRpGate, el, makeEnv, progressLine, showError } from "../owner/page.js"
 import { describeError } from "../owner/session.js"
 import { shortAddress } from "../owner/secrets.js"
-import { chipsFor, isTxHash, provenanceBadge } from "./model.js"
+import { chipsFor, INDEX_FRESHNESS_UNKNOWN_TEXT, isTxHash, provenanceBadge } from "./model.js"
 import type { Badge } from "./model.js"
 import { BLOCKED_AT_STORE_TEXT, INDEX_URL_NOT_ALLOWED_TEXT, loadMe } from "./sources.js"
 import type { AgentRow, MeData, MePorts, RecordRow } from "./sources.js"
@@ -149,12 +149,21 @@ function renderSummary(doc: Document, data: MeData): HTMLElement {
     lead.appendChild(elOf(doc, "p", "l", "The agent list could not be loaded at all."))
   } else {
     // Agents whose chain check could not run are not "0 can read" — count them as unchecked so
-    // the headline never rounds an unknown down to a negative. A stale or unmeasurable index
-    // gets the "At least" wording instead — an agent approved past its progress block is simply
-    // absent, so the fresh-index count would overstate certainty.
+    // the headline never rounds an unknown down to a negative. A stale index gets the "At least"
+    // wording — an agent approved past its progress block is simply absent, so the fresh-index
+    // count would overstate certainty — and when the index could not even measure its own lag
+    // the line hedges ("may be behind") rather than asserting it (in-26 Q-2).
     const unchecked = data.agents.filter((a) => a.unverified).length
     const headline = data.lag.stale
-      ? `At least ${live} agent${live === 1 ? "" : "s"} can read your context. The index is behind Monad, so a new approval may not show yet.`
+      ? [
+          live > 0
+            ? `At least ${live} agent${live === 1 ? "" : "s"} can read your context.`
+            : "No agent can read your context, as far as the index shows.",
+          ...(unchecked > 0 ? [`${unchecked} could not be checked just now.`] : []),
+          data.lag.text === INDEX_FRESHNESS_UNKNOWN_TEXT
+            ? "The index may be behind Monad, so a new approval may not show yet."
+            : "The index is behind Monad, so a new approval may not show yet.",
+        ].join(" ")
       : unchecked > 0
         ? `${live} agent${live === 1 ? "" : "s"} · ${unchecked} could not be checked just now`
         : `${live} agent${live === 1 ? "" : "s"} can read your context right now.`
