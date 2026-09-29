@@ -835,13 +835,63 @@ describe("the codex MCP server inside the managed block (in-28)", () => {
     const config = join(dir(), "config.toml")
     const text = `model = "x"\n\n${foreign}`
     writeFileSync(config, text)
-    expect(() => installCodex(config, { home: midaHome() })).toThrowError(/mcp_servers\.mida/)
+    expect(() => installCodex(config, { home: midaHome() })).toThrowError(
+      `Codex's config at ${config} already defines an MCP server named mida outside Mida's block, so nothing was changed. Rename or remove that server, then run mida install codex again.`,
+    )
     expect(readFileSync(config, "utf8")).toBe(text)
     // and the same table after our block is just as foreign — uninstall keeps it, never deletes it
     const config2 = join(dir(), "config.toml")
     writeFileSync(config2, `${codexBlock({ home: midaHome() })}\n\n${foreign}`)
     expect(uninstallCodex(config2)).toBe("uninstalled")
     expect(readFileSync(config2, "utf8")).toContain(foreign)
+  })
+
+  it("every TOML spelling of a foreign `mida` server refuses, and the file is left byte-identical (F-1)", () => {
+    // TOML spells the same table many ways — each of these would make the block's own
+    // [mcp_servers.mida] a duplicate, and a duplicate table header voids the whole file
+    for (const foreign of [
+      "[mcp_servers.mida] # mine",
+      "[ mcp_servers . mida ]",
+      '[mcp_servers."mida"]',
+      "[mcp_servers.'mida']",
+      "[mcp_servers]\nmida = { command = \"/x\" }",
+      '[mcp_servers]\n"mida" = { command = "/x" }',
+      "[mcp_servers]\n'mida' = { command = \"/x\" }",
+      '[mcp_servers]\nmida.command = "/x"',
+      'mcp_servers.mida.command = "/x"',
+    ]) {
+      const config = join(dir(), "config.toml")
+      const text = `model = "x"\n\n${foreign}\n`
+      writeFileSync(config, text)
+      expect(() => installCodex(config, { home: midaHome() }), foreign).toThrowError(
+        expect.objectContaining({ code: "CODEX_MCP_NAME_TAKEN" }),
+      )
+      expect(readFileSync(config, "utf8"), foreign).toBe(text)
+    }
+  })
+
+  it("a foreign `mida` server table AFTER the managed block refuses just the same (F-1)", () => {
+    const config = join(dir(), "config.toml")
+    const text = `${codexBlock({ home: midaHome() })}\n\n[mcp_servers]\n mida.command = "/x"\n`
+    writeFileSync(config, text)
+    expect(() => installCodex(config, { home: midaHome() })).toThrowError(
+      expect.objectContaining({ code: "CODEX_MCP_NAME_TAKEN" }),
+    )
+    expect(readFileSync(config, "utf8")).toBe(text)
+  })
+
+  it("names that are not the mida server do not collide — [mcp_servers.other], midas, and the block's own table (F-1)", () => {
+    // a server with a different name coexists with ours
+    const config = join(dir(), "config.toml")
+    writeFileSync(config, '[mcp_servers.other]\ncommand = "/usr/bin/other"\n\n[mcp_servers]\nmidas = { command = "/x" }\n')
+    const home = midaHome()
+    expect(installCodex(config, { home })).toBe("installed")
+    const text = readFileSync(config, "utf8")
+    expect(text).toContain('[mcp_servers.other]\ncommand = "/usr/bin/other"')
+    expect(text).toContain("[mcp_servers.mida]")
+    // and the block's OWN table is not a collision with itself — a rerun is a plain no-op
+    expect(installCodex(config, { home })).toBe("already-installed")
+    expect(readFileSync(config, "utf8")).toBe(text)
   })
 
   it("a stale block carrying the table upgrades — hook paths re-pinned, the MCP entry rebuilt", () => {

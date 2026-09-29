@@ -445,6 +445,18 @@ export type UninstallOutcome = "uninstalled" | "not-installed"
 /** An MCP install that overwrote our own stale entry reports what moved (project folder or launcher path). */
 export type McpInstallOutcome = InstallOutcome | { moved: { from: string; to: string } }
 
+/**
+ * A refusal whose message is written for the owner — the code names it for `refusalCode`, and
+ * the message is the line runInstall prints under `refused: <code>` (in-28b F-2).
+ */
+export class InstallRefusal extends Error {
+  readonly code: string
+  constructor(code: string, message: string) {
+    super(message)
+    this.code = code
+  }
+}
+
 function settingsUnreadable(): Error {
   const error = new Error("the settings file cannot be read safely") as Error & { code: string }
   error.code = "settings-unreadable"
@@ -987,6 +999,31 @@ function locateCodexBlock(text: string):
 }
 
 /**
+ * Does the config's own text — everything outside the managed block — already define a
+ * `mcp_servers.mida` server? TOML spells one table many ways: `[mcp_servers.mida]` with or
+ * without spacing, quoting or a trailing comment; an inline `mida = { … }` or dotted
+ * `mida.command = …` line under `[mcp_servers]`; a top-level `mcp_servers.mida.…` key. All of
+ * them make the block's own `[mcp_servers.mida]` a duplicate — and a duplicate table voids the
+ * whole file — so the check reads spelling, never bytes.
+ */
+function codexMcpNameTaken(text: string): boolean {
+  // the table each key line belongs to: the root until the first header, [mcp_servers] after
+  // its own header, anything else is irrelevant — a `mida` key under [other] is not ours
+  let where: "root" | "mcp_servers" | "other" = "root"
+  for (const raw of text.split("\n")) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw
+    if (/^\s*\[/.test(line)) {
+      if (/^\s*\[\s*\[?\s*["']?mcp_servers["']?\s*\.\s*["']?mida["']?\s*\]/.test(line)) return true
+      where = /^\s*\[\s*\[?\s*["']?mcp_servers["']?\s*\]/.test(line) ? "mcp_servers" : "other"
+      continue
+    }
+    if (where === "root" && /^\s*["']?mcp_servers["']?\s*\.\s*["']?mida["']?\s*[=.]/.test(line)) return true
+    if (where === "mcp_servers" && /^\s*["']?mida["']?\s*[=.]/.test(line)) return true
+  }
+  return false
+}
+
+/**
  * Appends the managed block to config.toml, one blank line separating it from whatever came
  * before (or nothing, when the file is created). A block that is already exactly right is a
  * byte-identical no-op; an older KNOWN block is upgraded in place — the markers still mean it
@@ -995,19 +1032,20 @@ function locateCodexBlock(text: string):
  *
  * `options.mcp` is the install's `--no-mcp` flag inverted: false writes hooks only — but it
  * never REMOVES a server table that is already ours (only uninstall does that), so a flag-off
- * rerun over an MCP block keeps the table, home and all. A `[mcp_servers.mida]` table outside
- * the markers is someone else's server: writing ours alongside would make a duplicate TOML
- * table and break the file, so the install refuses — the same "is it ours" rule the JSON
- * clients apply to a foreign "mida" name.
+ * rerun over an MCP block keeps the table, home and all. A `mcp_servers.mida` definition outside
+ * the markers — however TOML spells it — is someone else's server: writing ours alongside would
+ * make a duplicate and break the file, so the install refuses before a byte is written, the same
+ * "is it ours" rule the JSON clients apply to a foreign "mida" name.
  */
 export function installCodex(configPath: string, options: { home: string; mcp?: boolean }): InstallOutcome {
   const text = existsSync(configPath) ? readFileSync(configPath, "utf8") : null
   const block = text === null ? "absent" : locateCodexBlock(text)
   const outside = block === "absent" ? (text ?? "") : `${text!.slice(0, block.start)}${text!.slice(block.tailStart)}`
-  for (const line of outside.split("\n")) {
-    if (line === "[mcp_servers.mida]" || line === "[mcp_servers.mida]\r") {
-      throw new Error("a [mcp_servers.mida] table exists outside Mida's managed block — rename it or remove it")
-    }
+  if (codexMcpNameTaken(outside)) {
+    throw new InstallRefusal(
+      "CODEX_MCP_NAME_TAKEN",
+      `Codex's config at ${configPath} already defines an MCP server named mida outside Mida's block, so nothing was changed. Rename or remove that server, then run mida install codex again.`,
+    )
   }
   const mcpHome = options.mcp !== false ? options.home : block !== "absent" ? block.mcpHome : null
   const target = mcpHome === null ? codexBlock({ mcp: false }) : codexBlock({ home: mcpHome })

@@ -123,6 +123,7 @@ export {
   hookCommand,
   injectCommand,
   claudeCodeMcpJson,
+  InstallRefusal,
   installClaudeCode,
   installClaudeCodeMcp,
   installCodex,
