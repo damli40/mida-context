@@ -1408,6 +1408,24 @@ describe("the Codex trust reminder", () => {
     expect(second.lines).toContain(CODEX_TRUST_SENTENCE)
   })
 
+  it("stays quiet when only the server table or its home changed — the hook lines did not (N-1)", () => {
+    const config = join(dir(), "config.toml")
+    const settings = join(dir(), "settings.json")
+    const home = new MidaHome(join(dir(), "mida-home"))
+    // the hooks-only install earns the reminder — the commands Codex fingerprints changed then
+    const first = install(config, settings, ["install", "codex", "--no-mcp"], home)
+    expect(first.code).toBe(0)
+    expect(first.lines).toEqual(["installed", CODEX_TRUST_SENTENCE])
+    // adding just the [mcp_servers.mida] table changes no hook command — the trust holds
+    const second = install(config, settings, ["install", "codex"], home)
+    expect(second.code).toBe(0)
+    expect(second.lines).toEqual(["installed"])
+    // a new MIDA_HOME rewrites the block but not the commands — still quiet
+    const moved = install(config, settings, ["install", "codex"], new MidaHome(join(dir(), "mida-home-2")))
+    expect(moved.code).toBe(0)
+    expect(moved.lines).toEqual(["installed"])
+  })
+
   it("stays quiet when the config was not changed — already-installed, uninstall, claude-code", () => {
     const config = join(dir(), "config.toml")
     const settings = join(dir(), "settings.json")

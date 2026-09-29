@@ -1157,6 +1157,30 @@ export function codexMcpStatus(configPath: string, home: string): "installed" | 
 }
 
 /**
+ * The hook command lines the managed block carries — never the MCP server table's launcher.
+ * Install's trust reminder compares these between the old and new block: a --no-mcp → full
+ * upgrade or a new MIDA_HOME rewrites the block but leaves the commands byte-identical, and
+ * the trust Codex already granted still covers them (in-28b N-1).
+ */
+export function codexHookCommands(configPath: string): string[] | "absent" | "unreadable" {
+  try {
+    if (!existsSync(configPath)) return "absent"
+    const block = locateCodexBlock(readFileSync(configPath, "utf8"))
+    if (block === "absent") return "absent"
+    const commands: string[] = []
+    let inMcpTable = false
+    for (const line of block.core.split("\n")) {
+      if (line.startsWith("[")) inMcpTable = line === "[mcp_servers.mida]"
+      const command = /^command = "([^"]*)"$/.exec(line)
+      if (command !== null && !inMcpTable) commands.push(command[1]!)
+    }
+    return commands
+  } catch {
+    return "unreadable"
+  }
+}
+
+/**
  * Every command line inside the managed block — doctor stats the paths inside them. Absent
  * or unreadable blocks surface as their own statuses first, so this is only called on a
  * current block.

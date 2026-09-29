@@ -3,6 +3,7 @@ import { realpathSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
+import { isDeepStrictEqual } from "node:util"
 import { createInterface } from "node:readline"
 import { compareChainOrder, orderTime, recordedAt, taskOf } from "@mida/checkpoint"
 import type { StoredCheckpoint } from "@mida/checkpoint"
@@ -21,7 +22,7 @@ import { buildHandoff, generalAssistanceText, identityUnreadableText, isGeneralA
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { agoText } from "./hook-output.js"
-import { CODEX_TRUST_SENTENCE, InstallRefusal, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, claudeUserConfigPath, cursorMcpConfigPath, installClaudeCode, installClaudeCodeMcp, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, spawnClaude, uninstallClaudeCode, uninstallClaudeCodeMcp, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
+import { CODEX_TRUST_SENTENCE, InstallRefusal, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, claudeUserConfigPath, codexHookCommands, cursorMcpConfigPath, installClaudeCode, installClaudeCodeMcp, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, spawnClaude, uninstallClaudeCode, uninstallClaudeCodeMcp, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
 import type { ClaudeCliRunner } from "./install.js"
 import { resolveDevinConfigPath } from "./devin-facts.js"
 import type { InstallTool, McpClientTool } from "./install.js"
@@ -2327,6 +2328,9 @@ export function runInstall(
     argv[0] === "install"
       ? (p: string) => (tool === "claude-code" ? installClaudeCode(p) : tool === "devin" ? installDevin(p) : installCodex(p, { home: deps.home.root, mcp: !noMcp }))
       : (p: string) => (tool === "claude-code" ? uninstallClaudeCode(p) : tool === "devin" ? uninstallDevin(p) : uninstallCodex(p))
+  // the trust reminder answers "did the hook command lines change", not "did the file" — the
+  // block's hook lines are snapshotted before the write and compared after (in-28b N-1)
+  const codexHooksBefore = argv[0] === "install" && tool === "codex" ? codexHookCommands(settingsPath) : undefined
   try {
     const outcome = run(settingsPath)
     // Claude Code's MCP servers live in ~/.claude.json, which only the claude CLI may write —
@@ -2367,7 +2371,9 @@ export function runInstall(
       if (previous !== undefined && previous !== resolved) {
         deps.print(`the Codex home moved: ${previous} is no longer trusted — rollouts under it are not read`)
       }
-      if (outcome === "installed") deps.print(CODEX_TRUST_SENTENCE)
+      // the reminder follows the hook commands, not the write: an MCP-only upgrade or a new
+      // MIDA_HOME rewrites the block while leaving the commands Codex fingerprinted intact
+      if (!isDeepStrictEqual(codexHooksBefore, codexHookCommands(settingsPath))) deps.print(CODEX_TRUST_SENTENCE)
     }
     if (argv[0] === "uninstall" && tool === "codex") {
       // the record clears only after the edit under the recorded home ran — a refused config

@@ -117,6 +117,7 @@ export {
   claudeHooksStatus,
   claudeUserConfigPath,
   codexBlock,
+  codexHookCommands,
   codexHooksStatus,
   codexMcpStatus,
   cursorMcpConfigPath,
