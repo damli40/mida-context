@@ -43,15 +43,15 @@ function areaInWords(id: Hex): string {
  * the code, the same shape an unknown code takes.
  */
 const WARNING_AREA_SENTENCES: Partial<Record<ScopeWarningCode, (area: string) => string>> = {
-  SCOPE_NOT_DECLARED: (area) => `It asks for ${area}, which its own manifest does not list.`,
-  SCOPE_UNCLASSIFIED: (area) => `Mida has no sensitivity rating for ${area}.`,
-  SCOPE_ELEVATED: (area) => `${area} holds more sensitive context than this kind of agent usually needs.`,
-  SCOPE_SUSPICIOUS: (area) => `${area} is unusual for what this agent says it does.`,
+  SCOPE_NOT_DECLARED: (area) => `It asks for ${area} without declaring it for this purpose in its manifest.`,
+  SCOPE_UNCLASSIFIED: (area) => `Mida has no rule on whether this kind of agent needs ${area}, so the advisor does not recommend it.`,
+  SCOPE_ELEVATED: (area) => `The advisor does not recommend ${area} for this kind of agent: it is more than this agent's purpose normally needs.`,
+  SCOPE_SUSPICIOUS: (area) => `Mida does not recommend sharing ${area} with any agent.`,
   HIGH_SENSITIVITY: (area) => `${area} is highly sensitive.`,
   BROAD_PARENT_SCOPE: (area) => `${area} covers several narrower areas at once.`,
   SUPERSEDE_ANY_EXPLICIT: (area) => `It asks to replace records other agents wrote in ${area}.`,
   PERMISSION_NARROWED: (area) => `It asked for more permissions in ${area} than the advisor recommends.`,
-  PROVENANCE_POLICY_NARROWED: (area) => `It asked for a looser write policy in ${area} than the advisor recommends.`,
+  PROVENANCE_POLICY_NARROWED: (area) => `It asked for provenance settings in ${area} that the advisor does not recommend.`,
 }
 
 const WARNING_FREE_SENTENCES: Partial<Record<ScopeWarningCode, string>> = {

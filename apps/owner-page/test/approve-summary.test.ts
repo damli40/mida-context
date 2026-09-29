@@ -227,17 +227,79 @@ describe("advisor warnings the owner reads (in-30 T-1)", () => {
     )
     const lines = approveSummaryLines(prep({ advice: { ...runA, warnings } }), req())
     expect(lines.join("\n")).not.toContain("[object")
-    expect(lines).toContain("Warning: It asks for the projects.current area, which its own manifest does not list.")
-    expect(lines).toContain("Warning: Mida has no sensitivity rating for the goals.learning area.")
-    expect(lines).toContain("Warning: The profile.identity area holds more sensitive context than this kind of agent usually needs.")
-    expect(lines).toContain("Critical: The financial area is unusual for what this agent says it does.")
+    expect(lines).toContain("Warning: It asks for the projects.current area without declaring it for this purpose in its manifest.")
+    expect(lines).toContain("Warning: Mida has no rule on whether this kind of agent needs the goals.learning area, so the advisor does not recommend it.")
+    expect(lines).toContain("Warning: The advisor does not recommend the profile.identity area for this kind of agent: it is more than this agent's purpose normally needs.")
+    expect(lines).toContain("Critical: Mida does not recommend sharing the financial area with any agent.")
     expect(lines).toContain("Critical: The financial area is highly sensitive.")
     expect(lines).toContain("Warning: The preferences area covers several narrower areas at once.")
     expect(lines).toContain("Warning: It asks to replace records other agents wrote in the goals.career area.")
     expect(lines).toContain("Note: It asked for more permissions in the goals.career area than the advisor recommends.")
-    expect(lines).toContain("Note: It asked for a looser write policy in the goals.career area than the advisor recommends.")
+    expect(lines).toContain("Note: It asked for provenance settings in the goals.career area that the advisor does not recommend.")
     expect(lines).toContain("Note: It asked for a longer approval than the advisor recommends.")
     expect(lines).toContain("Critical: You revoked this agent before.")
+  })
+
+  // One test per re-worded code (in-31 V-2): real advice through adviseGrant for the exact
+  // condition that raises the code, then the sentence the owner reads.
+
+  it("SCOPE_SUSPICIOUS — a HIGH-sensitivity area, whatever the agent says it does (in-31 V-2)", async () => {
+    // financial is HIGH sensitivity → SUSPICIOUS for every purpose. The default manifest
+    // declares it under career_coaching, so no not-declared warning rides along.
+    const run = adviseGrant(await advisorInput([{ namespace: "financial", permissions: 1 }]))
+    expect(run.warnings.some((w) => w.code === "SCOPE_SUSPICIOUS" && w.namespaceId === namespaceId("financial"))).toBe(true)
+    const lines = approveSummaryLines(prep({ advice: { ...run } }), req())
+    expect(lines).toContain("Critical: Mida does not recommend sharing the financial area with any agent.")
+  })
+
+  it("SCOPE_ELEVATED — the area is more than this purpose normally needs (in-31 V-2)", async () => {
+    // profile.identity is ELEVATED for career_coaching; declared, so the elevated warning is
+    // the only scope-classification line.
+    const body = manifestBody({
+      scopeDeclarations: [
+        { purposeId: "career_coaching", namespace: "profile.identity", permissions: ["READ"], reason: "Name on CV" },
+      ],
+    })
+    const run = adviseGrant(await advisorInput([{ namespace: "profile.identity", permissions: 1 }], { body }))
+    expect(run.warnings.some((w) => w.code === "SCOPE_ELEVATED" && w.namespaceId === namespaceId("profile.identity"))).toBe(true)
+    const lines = approveSummaryLines(prep({ advice: { ...run } }), req())
+    expect(lines).toContain(
+      "Warning: The advisor does not recommend the profile.identity area for this kind of agent: it is more than this agent's purpose normally needs.",
+    )
+  })
+
+  it("SCOPE_UNCLASSIFIED — no rule for this purpose, not a missing sensitivity rating (in-31 V-2)", async () => {
+    // Every namespace has a sensitivity rating — goals.learning is MEDIUM. For career_coaching
+    // there is no expected/elevated rule, so the advisor withholds its recommendation.
+    const body = manifestBody({
+      scopeDeclarations: [
+        { purposeId: "career_coaching", namespace: "goals.learning", permissions: ["READ"], reason: "Learning plan" },
+      ],
+    })
+    const run = adviseGrant(await advisorInput([{ namespace: "goals.learning", permissions: 1 }], { body }))
+    expect(run.warnings.some((w) => w.code === "SCOPE_UNCLASSIFIED" && w.namespaceId === namespaceId("goals.learning"))).toBe(true)
+    const lines = approveSummaryLines(prep({ advice: { ...run } }), req())
+    expect(lines).toContain(
+      "Warning: Mida has no rule on whether this kind of agent needs the goals.learning area, so the advisor does not recommend it.",
+    )
+  })
+
+  it("SCOPE_NOT_DECLARED — absent from this purpose's declaration list (in-31 V-2)", async () => {
+    // projects.current is not declared under career_coaching in the default manifest — the
+    // warning is about this purpose's list, not the manifest as a whole.
+    const run = adviseGrant(await advisorInput([{ namespace: "projects.current", permissions: 1 }]))
+    expect(run.warnings.some((w) => w.code === "SCOPE_NOT_DECLARED" && w.namespaceId === namespaceId("projects.current"))).toBe(true)
+    const lines = approveSummaryLines(prep({ advice: { ...run } }), req())
+    expect(lines).toContain("Warning: It asks for the projects.current area without declaring it for this purpose in its manifest.")
+  })
+
+  it("PROVENANCE_POLICY_NARROWED — the request's provenance bits exceed what the advisor recommends (in-31 V-2)", async () => {
+    // goals.career recommends ALLOW_INFERENCE (bit 1); asking for all three bits narrows to 1.
+    // The warning fires on the provenance bits, not on a "looser write policy".
+    const run = adviseGrant(await advisorInput([{ namespace: "goals.career", permissions: 3, provenancePolicy: 7 }]))
+    expect(run.warnings.some((w) => w.code === "PROVENANCE_POLICY_NARROWED" && w.namespaceId === namespaceId("goals.career"))).toBe(true)
+    const lines = approveSummaryLines(prep({ advice: { ...run } }), req())
+    expect(lines).toContain("Note: It asked for provenance settings in the goals.career area that the advisor does not recommend.")
   })
 
   it("a code this build does not know still reads as a sentence", () => {
