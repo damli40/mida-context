@@ -125,18 +125,28 @@ const UNACCEPTABLE_AGENT_NAME_CHARS = new RegExp(
 )
 const BLANK_NAME_CHARS = new RegExp("^[\\s\\u200c\\u200d]*$", "u")
 
+// The whole format class — it already covers every invisible mark the list above names (200B,
+// 2060–2064, FEFF, the tag characters) plus the ones it missed: the soft hyphen, the Mongolian
+// vowel separator, the deprecated formatters and the above-BMP controls (in-33 NIT 3). Testing
+// the name with the joiners stripped carves them back out without the `v` regex flag, which the
+// bundled owner page cannot rely on everywhere.
+const FORMAT_NAME_CHARS = /\p{Cf}/u
+const JOINER_CHARS = /[\u200c\u200d]/gu
+
 /**
  * The one agent-name rule, shared by the manifest validator, the owner-link parser and /me
  * (in-32 X-2) — a name renders inside the summary's `Agent "…"` quotes, so it refuses more than
  * a field that is merely displayed: everything in UNACCEPTABLE_REQUEST_CHARS, the rest of the
  * bidirectional-control class (Bidi_Control also covers the Arabic letter mark 061C), the
- * invisible operators 2060–2064, the tag characters E0000–E007F, and `"` with its look-alikes —
- * any of which could close or imitate the quotes around the name. The joiners stay legal INSIDE
- * a name (in-31 V-3), but a name that is nothing but whitespace and joiners renders as
- * `Agent ""`, so it is refused too.
+ * invisible operators 2060–2064, the tag characters E0000–E007F, every other invisible format
+ * character (\p{Cf}, minus the joiners), and `"` with its look-alikes — any of which could
+ * close or imitate the quotes around the name, or render a name as nothing at all. The joiners
+ * stay legal INSIDE a name (in-31 V-3), but a name that is nothing but whitespace and joiners
+ * renders as `Agent ""`, so it is refused too.
  */
 export function isAcceptableAgentName(name: string): boolean {
   if (UNACCEPTABLE_AGENT_NAME_CHARS.test(name)) return false
+  if (FORMAT_NAME_CHARS.test(name.replace(JOINER_CHARS, ""))) return false
   return !BLANK_NAME_CHARS.test(name)
 }
 

@@ -149,6 +149,20 @@ describe("isAcceptableAgentName (in-32 X-2)", () => {
     expect(isAcceptableAgentName("\u200c\u200d")).toBe(false)
   })
 
+  it("refuses the rest of the format characters too — an invisible-only name cannot be built (in-33)", () => {
+    // \p{Cf} minus the joiners: the soft hyphen, the Mongolian vowel separator, the Arabic
+    // number signs, the deprecated formatters, the interlinear marks and the above-BMP format
+    // controls all render as nothing inside `Agent "…"`.
+    for (const cp of [0x00ad, 0x180e, 0x0600, 0x06dd, 0x070f, 0x08e2, 0x206a, 0x206f, 0xfff9, 0xfffb, 0x110bd, 0x13430, 0x1bca0, 0x1d173, 0xe0001]) {
+      expect(isAcceptableAgentName(`a${chr(cp)}b`), `U+${cp.toString(16)} inside a name`).toBe(false)
+      expect(isAcceptableAgentName(chr(cp)), `U+${cp.toString(16)} as the whole name`).toBe(false)
+    }
+    // The carve-out: the joiners alone must still pass — Persian spelling and emoji sequences
+    // depend on them (in-31 V-3).
+    expect(isAcceptableAgentName("می\u200cخواهم")).toBe(true)
+    expect(isAcceptableAgentName("👨\u200d💻 helper")).toBe(true)
+  })
+
   it("accepts ordinary names — plain words, dashes, CJK, and the joiners inside a name", () => {
     expect(isAcceptableAgentName("claude-code — plain text 中文字符 ✓")).toBe(true)
     // می‌خواهم is می + ZWNJ (200C) + خواهم — the non-joiner is ordinary Persian spelling, and
