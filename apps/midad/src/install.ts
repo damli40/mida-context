@@ -1042,25 +1042,121 @@ function locateCodexBlock(text: string):
 }
 
 /**
+ * Masks the parts of a TOML line that are comments or string VALUES so only structure and key
+ * names survive — a quoted key keeps its content (`"mida"` is still the name mida). `state.open`
+ * carries an unclosed multi-line `"""`/`'''` string across lines, so a `[mcp_servers.mida]`
+ * written inside `instructions = """…"""` is the file's prose, never a table (in-39, nit 2).
+ */
+function tomlStructure(line: string, state: { open: '"""' | "'''" | null }): string {
+  const out = line.split("")
+  const mask = (from: number, to: number) => {
+    for (let k = from; k < to && k < out.length; k++) out[k] = " "
+  }
+  const prevCode = (from: number) => {
+    for (let k = from - 1; k >= 0; k--) {
+      if (out[k] !== " " && out[k] !== "\t") return out[k]!
+    }
+    return ""
+  }
+  let i = 0
+  while (i < line.length) {
+    if (state.open !== null) {
+      const close = line.indexOf(state.open, i)
+      if (close === -1) {
+        mask(i, line.length)
+        return out.join("")
+      }
+      mask(i, close + 3)
+      state.open = null
+      i = close + 3
+      continue
+    }
+    const ch = line[i]!
+    if (ch === "#") {
+      mask(i, line.length)
+      break
+    }
+    if (ch === '"' || ch === "'") {
+      const triple = line.startsWith(ch.repeat(3), i)
+      if (triple) {
+        const delim = ch.repeat(3) as '"""' | "'''"
+        const close = line.indexOf(delim, i + 3)
+        mask(i, close === -1 ? line.length : close + 3)
+        if (close === -1) state.open = delim
+        i = close === -1 ? line.length : close + 3
+        continue
+      }
+      let j = i + 1
+      while (j < line.length && line[j] !== ch) j += ch === '"' && line[j] === "\\" ? 2 : 1
+      const end = Math.min(j + 1, line.length)
+      // a string in KEY position — at the line start, or right after . { , [ — is a name, so
+      // its content stays readable and only the quote marks themselves are masked
+      const prev = prevCode(i)
+      if (prev === "" || prev === "." || prev === "{" || prev === "," || prev === "[") {
+        mask(i, i + 1)
+        if (end - 1 > i) mask(end - 1, end)
+      } else {
+        mask(i, end)
+      }
+      i = end
+      continue
+    }
+    i++
+  }
+  return out.join("")
+}
+
+/**
  * Does the config's own text — everything outside the managed block — already define a
  * `mcp_servers.mida` server? TOML spells one table many ways: `[mcp_servers.mida]` with or
  * without spacing, quoting or a trailing comment; an inline `mida = { … }` or dotted
- * `mida.command = …` line under `[mcp_servers]`; a top-level `mcp_servers.mida.…` key. All of
- * them make the block's own `[mcp_servers.mida]` a duplicate — and a duplicate table voids the
- * whole file — so the check reads spelling, never bytes.
+ * `mida.command = …` line under `[mcp_servers]`; a top-level `mcp_servers.mida.…` key or a root
+ * `mcp_servers = { … mida = … }` inline table (in-39 B-3). All of them make the block's own
+ * `[mcp_servers.mida]` a duplicate — and a duplicate table voids the whole file — so the check
+ * reads spelling, never bytes.
  */
 function codexMcpNameTaken(text: string): boolean {
   // the table each key line belongs to: the root until the first header, [mcp_servers] after
   // its own header, anything else is irrelevant — a `mida` key under [other] is not ours
   let where: "root" | "mcp_servers" | "other" = "root"
+  const strings: { open: '"""' | "'''" | null } = { open: null }
+  // the brace depth of a root `mcp_servers = {` that has not closed yet — inline tables may
+  // wrap across lines, and only a `mida` key at depth 1 is the server's name (deeper `mida`
+  // keys belong to some other server's fields)
+  let depth = 0
+  const scanInline = (code: string): boolean => {
+    for (const match of code.matchAll(/\{|\}|["']?mida["']?\s*[=.]/g)) {
+      if (match[0] === "{") { depth++; continue }
+      if (match[0] === "}") { depth--; continue }
+      if (depth !== 1) continue
+      let i = match.index - 1
+      while (i >= 0 && (code[i] === " " || code[i] === "\t")) i--
+      // depth-1 keys begin right after the opening brace or a comma — anything else is the
+      // tail of another value, not a key
+      if (i < 0 || code[i] === "{" || code[i] === ",") return true
+    }
+    return false
+  }
   for (const raw of text.split("\n")) {
-    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw
+    const line = tomlStructure(raw.endsWith("\r") ? raw.slice(0, -1) : raw, strings)
+    if (depth > 0) {
+      if (scanInline(line)) return true
+      continue
+    }
     if (/^\s*\[/.test(line)) {
       if (/^\s*\[\s*\[?\s*["']?mcp_servers["']?\s*\.\s*["']?mida["']?\s*\]/.test(line)) return true
       where = /^\s*\[\s*\[?\s*["']?mcp_servers["']?\s*\]/.test(line) ? "mcp_servers" : "other"
       continue
     }
-    if (where === "root" && /^\s*["']?mcp_servers["']?\s*\.\s*["']?mida["']?\s*[=.]/.test(line)) return true
+    if (where === "root") {
+      if (/^\s*["']?mcp_servers["']?\s*\.\s*["']?mida["']?\s*[=.]/.test(line)) return true
+      const inline = /^\s*["']?mcp_servers["']?\s*=\s*\{/.exec(line)
+      if (inline !== null) {
+        depth = 1
+        if (scanInline(line.slice(inline[0].length))) return true
+        continue
+      }
+    }
     if (where === "mcp_servers" && /^\s*["']?mida["']?\s*[=.]/.test(line)) return true
   }
   return false

@@ -861,6 +861,14 @@ describe("the codex MCP server inside the managed block (in-28)", () => {
       "[mcp_servers]\n'mida' = { command = \"/x\" }",
       '[mcp_servers]\nmida.command = "/x"',
       'mcp_servers.mida.command = "/x"',
+      // root inline-table forms — mcp_servers itself assigned `= { … }` with mida a key (in-39 B-3)
+      'mcp_servers = { mida = { command = "/x" } }',
+      'mcp_servers = { "mida" = { command = "/x" } }',
+      "mcp_servers = { 'mida' = { command = \"/x\" } }",
+      'mcp_servers = { other = { command = "/y" }, mida = { command = "/x" } }',
+      'mcp_servers = { mida.command = "/x" }',
+      'mcp_servers = {\n  mida = { command = "/x" }\n}',
+      '"mcp_servers" = { mida = { command = "/x" } }',
     ]) {
       const config = join(dir(), "config.toml")
       const text = `model = "x"\n\n${foreign}\n`
@@ -880,6 +888,28 @@ describe("the codex MCP server inside the managed block (in-28)", () => {
       expect.objectContaining({ code: "CODEX_MCP_NAME_TAKEN" }),
     )
     expect(readFileSync(config, "utf8")).toBe(text)
+  })
+
+  it("a [mcp_servers.mida] inside a multi-line string is prose, not a table — install proceeds (nit 2)", () => {
+    // The header-looking text sits inside an instructions value; TOML does not define a table
+    // there, so refusing would strand a perfectly installable config.
+    const config = join(dir(), "config.toml")
+    writeFileSync(config, 'instructions = """\n[mcp_servers.mida]\ncommand = "/x"\n"""\n')
+    const home = midaHome()
+    expect(installCodex(config, { home })).toBe("installed")
+    expect(readFileSync(config, "utf8")).toContain("[mcp_servers.mida]")
+    // a literal-string variant too — ''' carries the same prose
+    const config2 = join(dir(), "config2.toml")
+    writeFileSync(config2, "notes = '''\n[mcp_servers.mida]\n'''\n")
+    expect(installCodex(config2, { home })).toBe("installed")
+  })
+
+  it("a mida key nested INSIDE another server is not the mcp_servers.mida name — no refusal", () => {
+    // mcp_servers = { wrapped = { mida = … } } defines mcp_servers.wrapped.mida — deep enough
+    // that our [mcp_servers.mida] table does not collide with it
+    const config = join(dir(), "config.toml")
+    writeFileSync(config, 'model = "x"\n\nmcp_servers = { wrapped = { mida = { command = "/x" } } }\n')
+    expect(() => installCodex(config, { home: midaHome() })).not.toThrow()
   })
 
   it("at the command level the refusal prints its code, then the message — never a bare UNEXPECTED (F-2)", () => {
