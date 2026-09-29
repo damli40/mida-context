@@ -1320,6 +1320,44 @@ describe("the claude-code MCP server through the claude CLI (in-28)", () => {
     expect(readFileSync(userConfig, "utf8")).toBe(JSON.stringify({ mcpServers: { mida: foreign } }))
   })
 
+  it("uninstall leaves an ours-shaped entry pointing at another Mida home — and says so (F-8)", () => {
+    const userConfig = join(dir(), ".claude.json")
+    const home = new MidaHome(midaHome())
+    const otherHome = join(dir(), "other-home")
+    // our --as claude-code args, our launcher's shape — but MIDA_HOME is a different install's
+    const otherHomes = {
+      command: mcpLauncherPath(),
+      args: ["--as", "claude-code"],
+      env: { MIDA_HOME: otherHome },
+    }
+    writeFileSync(userConfig, JSON.stringify({ mcpServers: { mida: otherHomes } }))
+    const calls: string[][] = []
+    const lines: string[] = []
+    // hooks absent → "not installed", then the note names the entry that was left
+    expect(
+      runInstall(["uninstall", "claude-code"], claudeDeps(join(dir(), "settings.json"), home, lines, (args) => (calls.push(args), { status: 0 }), userConfig)),
+    ).toBe(0)
+    expect(calls).toHaveLength(0) // the claude CLI is never asked to remove another home's entry
+    expect(lines).toEqual([
+      "not installed",
+      `claude-code: an MCP server named mida for another Mida home (${otherHome}) was left in place. Remove it with claude mcp remove -s user mida.`,
+    ])
+    // same entry, hooks installed this time — "uninstalled" for the hooks, the note still names it
+    const settings = join(dir(), "settings.json")
+    installClaudeCode(settings)
+    lines.length = 0
+    expect(
+      runInstall(["uninstall", "claude-code"], claudeDeps(settings, home, lines, (args) => (calls.push(args), { status: 0 }), userConfig)),
+    ).toBe(0)
+    expect(calls).toHaveLength(0)
+    expect(lines).toEqual([
+      "uninstalled",
+      `claude-code: an MCP server named mida for another Mida home (${otherHome}) was left in place. Remove it with claude mcp remove -s user mida.`,
+    ])
+    // and the entry is still there, byte-identical
+    expect(readFileSync(userConfig, "utf8")).toBe(JSON.stringify({ mcpServers: { mida: otherHomes } }))
+  })
+
   it("uninstall with no mida entry makes no CLI call — not-installed is honest", () => {
     const settings = join(dir(), "settings.json")
     const home = new MidaHome(midaHome())

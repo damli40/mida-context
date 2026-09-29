@@ -2333,7 +2333,7 @@ export function runInstall(
     // the userConfig read is the is-it-ours check, never an edit. Codex's table needs no
     // extra step here: it rides inside the managed block installCodex wrote. The MCP step
     // runs before the summary line so a refused MCP step never sits under a bare "installed".
-    let mcp: string | undefined
+    let mcp: ReturnType<typeof installClaudeCodeMcp> | ReturnType<typeof uninstallClaudeCodeMcp> | undefined
     if (tool === "claude-code") {
       const claudeOpts = {
         home: deps.home.root,
@@ -2353,6 +2353,9 @@ export function runInstall(
           ? "claude-code: MCP server not added. The claude command is not on your PATH; hooks are installed."
           : "claude-code: MCP server not removed. The claude command is not on your PATH.",
       )
+    }
+    if (typeof mcp === "object") {
+      deps.print(`claude-code: an MCP server named mida for another Mida home (${mcp.otherHome}) was left in place. Remove it with claude mcp remove -s user mida.`)
     }
     if (argv[0] === "install" && tool === "codex") {
       // the hook and the drain never see Codex's own environment — the home install wrote into

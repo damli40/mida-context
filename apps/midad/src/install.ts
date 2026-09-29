@@ -278,15 +278,30 @@ export function installClaudeCodeMcp(opts: {
 /**
  * Removes Mida's server entry through `claude mcp remove` — only when the entry is ours (the
  * same is-it-ours rule the file-config clients apply). "unavailable" means the claude binary
- * is gone from PATH; the entry then stays where it is and the caller says so.
+ * is gone from PATH; the entry then stays where it is and the caller says so. An entry with
+ * our args but another MIDA_HOME is another Mida install's server — it is left untouched and
+ * answered as { otherHome } so the caller can name what was left.
  */
 export function uninstallClaudeCodeMcp(opts: {
   home: string
   userConfig: string
   run: ClaudeCliRunner
-}): "uninstalled" | "not-installed" | "unavailable" {
+}): "uninstalled" | "not-installed" | "unavailable" | { otherHome: string } {
   const existing = claudeUserMidaEntry(opts.userConfig)
-  if (!isMidaServerEntry(existing, "claude-code", opts.home)) return "not-installed"
+  if (!isMidaServerEntry(existing, "claude-code", opts.home)) {
+    // our --as args under another MIDA_HOME means a different Mida install wrote this entry —
+    // it stays in place, but { otherHome } lets the caller name it instead of staying silent
+    if (
+      isPlainObject(existing) &&
+      isMidaServerEntry(existing, "claude-code", undefined) &&
+      isPlainObject(existing.env) &&
+      typeof existing.env.MIDA_HOME === "string" &&
+      existing.env.MIDA_HOME !== ""
+    ) {
+      return { otherHome: existing.env.MIDA_HOME }
+    }
+    return "not-installed"
+  }
   const result = opts.run(["mcp", "remove", "--scope", "user", "mida"])
   if (claudeUnavailable(result)) return "unavailable"
   if (result.status !== 0) throw new InstallRefusal("CLAUDE_CLI_FAILED", claudeCliRemoveFailed(result.status))
