@@ -880,6 +880,24 @@ describe("the codex MCP server inside the managed block (in-28)", () => {
     expect(readFileSync(config, "utf8")).toBe(text)
   })
 
+  it("at the command level the refusal prints its code, then the message — never a bare UNEXPECTED (F-2)", () => {
+    const config = join(dir(), "config.toml")
+    writeFileSync(config, '[mcp_servers]\nmida = { command = "/x" }\n')
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "codex"], {
+        print: (line) => lines.push(line),
+        claudeSettings: join(dir(), "settings.json"),
+        codexConfig: config,
+        home: new MidaHome(join(dir(), "mida-home")),
+      }),
+    ).toBe(1)
+    expect(lines).toEqual([
+      "refused: CODEX_MCP_NAME_TAKEN",
+      `Codex's config at ${config} already defines an MCP server named mida outside Mida's block, so nothing was changed. Rename or remove that server, then run mida install codex again.`,
+    ])
+  })
+
   it("names that are not the mida server do not collide — [mcp_servers.other], midas, and the block's own table (F-1)", () => {
     // a server with a different name coexists with ours
     const config = join(dir(), "config.toml")
@@ -1080,7 +1098,11 @@ describe("the claude-code MCP server through the claude CLI (in-28)", () => {
     ).toBe(1)
     // hooks still landed — the refusal is about the server entry only
     expect(claudeHooksStatus(settings)).toBe("installed")
-    expect(lines).toContain("refused: UNEXPECTED")
+    // the stub exits 97 — the refusal names the code and the message carries the status
+    expect(lines).toEqual([
+      "refused: CLAUDE_CLI_FAILED",
+      "The claude command failed (exit 97) while adding Mida's MCP server, so Mida's hooks are installed but its MCP server is not. Update Claude Code, then run mida install claude-code again.",
+    ])
   })
 
   it("--no-mcp never reaches for the claude binary at all", () => {
@@ -1123,10 +1145,58 @@ describe("the claude-code MCP server through the claude CLI (in-28)", () => {
     expect(
       runInstall(["install", "claude-code"], claudeDeps(settings, home, lines, (args) => (calls.push(args), { status: 0 }), userConfig)),
     ).toBe(1)
-    // the hooks still landed — the refusal is about the server entry only
+    // the hooks still landed — the refusal is about the server entry only, and the message
+    // under the code says exactly that (F-2: never a bare refused: UNEXPECTED)
     expect(claudeHooksStatus(settings)).toBe("installed")
+    expect(lines).toEqual([
+      "refused: CLAUDE_MCP_NAME_TAKEN",
+      "Claude Code already has an MCP server named mida that Mida did not write, so Mida's hooks are installed but its MCP server is not. Rename or remove that server, then run mida install claude-code again.",
+    ])
     expect(calls).toHaveLength(0)
     expect(readFileSync(userConfig, "utf8")).toBe(JSON.stringify({ mcpServers: { mida: foreign } }))
+  })
+
+  it("a failing `claude mcp add-json` names the exit status in the message under the code (F-2)", () => {
+    const settings = join(dir(), "settings.json")
+    const home = new MidaHome(midaHome())
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "claude-code"], claudeDeps(settings, home, lines, () => ({ status: 3 }))),
+    ).toBe(1)
+    expect(lines).toEqual([
+      "refused: CLAUDE_CLI_FAILED",
+      "The claude command failed (exit 3) while adding Mida's MCP server, so Mida's hooks are installed but its MCP server is not. Update Claude Code, then run mida install claude-code again.",
+    ])
+    // killed by a signal there is no exit status — the message says unknown, never "null"
+    lines.length = 0
+    expect(
+      runInstall(["install", "claude-code"], claudeDeps(join(dir(), "settings.json"), home, lines, () => ({ status: null, error: new Error("spawn claude ESRCH") }))),
+    ).toBe(1)
+    expect(lines).toEqual([
+      "refused: CLAUDE_CLI_FAILED",
+      "The claude command failed (exit unknown) while adding Mida's MCP server, so Mida's hooks are installed but its MCP server is not. Update Claude Code, then run mida install claude-code again.",
+    ])
+  })
+
+  it("a failing `claude mcp remove` says the entry is still registered — install path and uninstall path alike (F-2)", () => {
+    const userConfig = join(dir(), ".claude.json")
+    const home = new MidaHome(midaHome())
+    // an ours-but-stale entry (a moved checkout's launcher) makes install remove before add —
+    // a remove that fails there means the entry is still registered, just like on uninstall
+    const stale = { command: "/older/checkout/bin/mida-mcp", args: ["--as", "claude-code"], env: { MIDA_HOME: home.root } }
+    writeFileSync(userConfig, JSON.stringify({ mcpServers: { mida: stale } }))
+    const message =
+      "The claude command failed (exit 2) while removing Mida's MCP server, so it is still registered. Remove it with claude mcp remove -s user mida."
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "claude-code"], claudeDeps(join(dir(), "settings.json"), home, lines, () => ({ status: 2 }), userConfig)),
+    ).toBe(1)
+    expect(lines).toEqual(["refused: CLAUDE_CLI_FAILED", message])
+    lines.length = 0
+    expect(
+      runInstall(["uninstall", "claude-code"], claudeDeps(join(dir(), "settings.json"), home, lines, () => ({ status: 2 }), userConfig)),
+    ).toBe(1)
+    expect(lines).toEqual(["refused: CLAUDE_CLI_FAILED", message])
   })
 
   it("uninstall spawns `claude mcp remove --scope user mida` — only when the entry is ours", () => {

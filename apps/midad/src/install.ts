@@ -193,6 +193,10 @@ export const spawnClaude: ClaudeCliRunner = (args) => spawnSync("claude", args, 
 const claudeUnavailable = (result: ClaudeCliResult): boolean =>
   result.status === null && (result.error as { code?: string } | undefined)?.code === "ENOENT"
 
+/** The failed-remove message — a `claude` exit status, or "unknown" when a signal killed it. */
+const claudeCliRemoveFailed = (status: number | null): string =>
+  `The claude command failed (exit ${status ?? "unknown"}) while removing Mida's MCP server, so it is still registered. Remove it with claude mcp remove -s user mida.`
+
 /**
  * The JSON `claude mcp add-json` takes — the same entry the file-config clients get (absolute
  * launcher, this tool's --as identity, MIDA_HOME), with NO --project: the folder the agent
@@ -240,15 +244,23 @@ export function installClaudeCodeMcp(opts: {
   if (isDeepStrictEqual(existing, JSON.parse(json))) return "already-installed"
   if (existing !== undefined) {
     if (!isMidaServerEntry(existing, "claude-code", opts.home)) {
-      throw new Error("a server named mida exists in Claude Code's user config and is not Mida's — rename it or remove it")
+      throw new InstallRefusal(
+        "CLAUDE_MCP_NAME_TAKEN",
+        "Claude Code already has an MCP server named mida that Mida did not write, so Mida's hooks are installed but its MCP server is not. Rename or remove that server, then run mida install claude-code again.",
+      )
     }
     const removed = opts.run(["mcp", "remove", "--scope", "user", "mida"])
     if (claudeUnavailable(removed)) return "unavailable"
-    if (removed.status !== 0) throw new Error(`claude mcp remove failed (status ${removed.status})`)
+    if (removed.status !== 0) throw new InstallRefusal("CLAUDE_CLI_FAILED", claudeCliRemoveFailed(removed.status))
   }
   const result = opts.run(["mcp", "add-json", "--scope", "user", "mida", json])
   if (claudeUnavailable(result)) return "unavailable"
-  if (result.status !== 0) throw new Error(`claude mcp add-json failed (status ${result.status})`)
+  if (result.status !== 0) {
+    throw new InstallRefusal(
+      "CLAUDE_CLI_FAILED",
+      `The claude command failed (exit ${result.status ?? "unknown"}) while adding Mida's MCP server, so Mida's hooks are installed but its MCP server is not. Update Claude Code, then run mida install claude-code again.`,
+    )
+  }
   return "installed"
 }
 
@@ -266,7 +278,7 @@ export function uninstallClaudeCodeMcp(opts: {
   if (!isMidaServerEntry(existing, "claude-code", opts.home)) return "not-installed"
   const result = opts.run(["mcp", "remove", "--scope", "user", "mida"])
   if (claudeUnavailable(result)) return "unavailable"
-  if (result.status !== 0) throw new Error(`claude mcp remove failed (status ${result.status})`)
+  if (result.status !== 0) throw new InstallRefusal("CLAUDE_CLI_FAILED", claudeCliRemoveFailed(result.status))
   return "uninstalled"
 }
 
