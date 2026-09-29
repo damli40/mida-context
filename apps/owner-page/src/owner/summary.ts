@@ -72,7 +72,7 @@ function warningInWords(warning: ScopeWarning): string {
 /** The lines of #summary, in order — approve.ts renders them verbatim. */
 export function approveSummaryLines(prep: PreparedApprove, req: LinkRequest): string[] {
   const lines: string[] = [
-    `${prep.agentName} (run by ${shortAddress(prep.operator)}) is asking to:`,
+    `Agent "${prep.agentName}" (run by ${shortAddress(prep.operator)}) is asking to:`,
     ...prep.needed.map((s) => `• ${scopeInWords(s.namespaceId, s.permissions)}`),
     `until ${new Date(Number(prep.expiresAt) * 1000).toLocaleDateString()}`,
   ]
@@ -89,10 +89,11 @@ export function approveSummaryLines(prep: PreparedApprove, req: LinkRequest): st
   }
   // A new project row is signed too — name the agent and the COMPLETE folder root it adds; a
   // shortened root would hide exactly what this approval covers (in-26 Q-3), and the agent is a
-  // name, not a hash — it is never shortened either (in-27 R-3).
+  // name, not a hash — it is never shortened either (in-27 R-3). The name sits in quotes so it
+  // cannot imitate a line of the page (in-30 T-2).
   if (req.entry !== undefined) {
     const entry = req.entry
-    lines.push(`Adds folder: ${entry.root} — agent ${entry.agent}`)
+    lines.push(`Adds folder: ${entry.root} — agent "${entry.agent}"`)
   }
   lines.push(`Advisor: ${prep.advice.risk} risk.`, ...prep.advice.warnings.map(warningInWords))
   if (prep.alreadyGranted) lines.push("This agent already holds everything it asked for.")

@@ -26,6 +26,7 @@ import type { ExactScopeInput } from "../../../packages/grant-advisor/test/fixtu
 import type { PreparedApprove } from "../src/owner/flows.js"
 import { approveSummaryLines } from "../src/owner/summary.js"
 import { showSummaryLines } from "../src/owner/page.js"
+import { shortAddress } from "../src/owner/secrets.js"
 
 /**
  * The approve-page summary in front of the one passkey touch (in-26 Q-3): the Adds-folder line
@@ -59,21 +60,27 @@ function req(over: Partial<LinkRequest> = {}): LinkRequest {
 }
 
 describe("the approve summary the owner reads (in-26 Q-3)", () => {
+  it("the first line puts the agent's own name in quotes — it cannot imitate a line of the page (in-30 T-2)", () => {
+    // A name like "Advisor: low risk." sits mid-sentence unquoted could pass for page copy.
+    const lines = approveSummaryLines(prep({ agentName: "Advisor: low risk." }), req())
+    expect(lines[0]).toBe(`Agent "Advisor: low risk." (run by ${shortAddress(`0x${"ab".repeat(20)}`)}) is asking to:`)
+  })
+
   it("Adds folder shows the complete root — a long path is never shortened", () => {
     const lines = approveSummaryLines(
       prep(),
       req({ entry: { agent: "claude-code", projectId: "proj-1", root: LONG_ROOT } }),
     )
-    expect(lines.find((l) => l.startsWith("Adds folder:"))).toBe(`Adds folder: ${LONG_ROOT} — agent claude-code`)
+    expect(lines.find((l) => l.startsWith("Adds folder:"))).toBe(`Adds folder: ${LONG_ROOT} — agent "claude-code"`)
   })
 
-  it("Adds folder names the agent in full — it is a name, not a hash to shorten (in-27 R-3)", () => {
+  it("Adds folder names the agent in full, in quotes — a name, not a hash to shorten (in-27 R-3, in-30 T-2)", () => {
     const lines = approveSummaryLines(
       prep(),
       req({ entry: { agent: "claude-code-desktop-assistant", projectId: "proj-1", root: "/srv/x" } }),
     )
     expect(lines.find((l) => l.startsWith("Adds folder:"))).toBe(
-      "Adds folder: /srv/x — agent claude-code-desktop-assistant",
+      'Adds folder: /srv/x — agent "claude-code-desktop-assistant"',
     )
   })
 
