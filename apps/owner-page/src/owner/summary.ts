@@ -1,5 +1,5 @@
-import { PERMISSION } from "@mida/protocol"
-import type { OwnerLinkRequest as LinkRequest } from "@mida/protocol"
+import { PERMISSION, namespaceById } from "@mida/protocol"
+import type { Hex, OwnerLinkRequest as LinkRequest, ScopeWarning, ScopeWarningCode } from "@mida/protocol"
 import type { PreparedApprove } from "./flows.js"
 import { scopeInWords } from "./page.js"
 import { shortAddress } from "./secrets.js"
@@ -20,6 +20,54 @@ function provenancePolicyInWords(policy: number): string {
 
 /** The permission bits that let a scope write records — the only ones a provenance policy governs. */
 const WRITE_PERMISSIONS = PERMISSION.CREATE | PERMISSION.SUPERSEDE_OWN | PERMISSION.SUPERSEDE_ANY
+
+/** The severity word that opens each advisor line (in-30 T-1). */
+const WARNING_PREFIX: Readonly<Record<ScopeWarning["severity"], string>> = {
+  info: "Note",
+  warning: "Warning",
+  critical: "Critical",
+}
+
+/** The same words the scope lines use for a namespace — "the X area" — falling back to the raw id. */
+function areaInWords(id: Hex): string {
+  try {
+    return `the ${namespaceById(id).name} area`
+  } catch {
+    return `the ${id} area`
+  }
+}
+
+/**
+ * One sentence per warning code — the words from the in-30 review, verbatim. A code that talks
+ * about an area needs the warning's namespaceId; without one the sentence falls back to naming
+ * the code, the same shape an unknown code takes.
+ */
+const WARNING_AREA_SENTENCES: Partial<Record<ScopeWarningCode, (area: string) => string>> = {
+  SCOPE_NOT_DECLARED: (area) => `It asks for ${area}, which its own manifest does not list.`,
+  SCOPE_UNCLASSIFIED: (area) => `Mida has no sensitivity rating for ${area}.`,
+  SCOPE_ELEVATED: (area) => `${area} holds more sensitive context than this kind of agent usually needs.`,
+  SCOPE_SUSPICIOUS: (area) => `${area} is unusual for what this agent says it does.`,
+  HIGH_SENSITIVITY: (area) => `${area} is highly sensitive.`,
+  BROAD_PARENT_SCOPE: (area) => `${area} covers several narrower areas at once.`,
+  SUPERSEDE_ANY_EXPLICIT: (area) => `It asks to replace records other agents wrote in ${area}.`,
+  PERMISSION_NARROWED: (area) => `It asked for more permissions in ${area} than the advisor recommends.`,
+  PROVENANCE_POLICY_NARROWED: (area) => `It asked for a looser write policy in ${area} than the advisor recommends.`,
+}
+
+const WARNING_FREE_SENTENCES: Partial<Record<ScopeWarningCode, string>> = {
+  DURATION_NARROWED: "It asked for a longer approval than the advisor recommends.",
+  PREVIOUSLY_REVOKED: "You revoked this agent before.",
+}
+
+function warningInWords(warning: ScopeWarning): string {
+  const areaTemplate = WARNING_AREA_SENTENCES[warning.code]
+  const sentence =
+    areaTemplate !== undefined && warning.namespaceId !== undefined
+      ? areaTemplate(areaInWords(warning.namespaceId))
+      : (WARNING_FREE_SENTENCES[warning.code] ?? `The advisor flagged this request (${warning.code}).`)
+  const capitalized = sentence.charAt(0).toUpperCase() + sentence.slice(1)
+  return `${WARNING_PREFIX[warning.severity] ?? "Warning"}: ${capitalized}`
+}
 
 /** The lines of #summary, in order — approve.ts renders them verbatim. */
 export function approveSummaryLines(prep: PreparedApprove, req: LinkRequest): string[] {
@@ -46,7 +94,7 @@ export function approveSummaryLines(prep: PreparedApprove, req: LinkRequest): st
     const entry = req.entry
     lines.push(`Adds folder: ${entry.root} — agent ${entry.agent}`)
   }
-  lines.push(`Advisor: ${prep.advice.risk} risk.`, ...prep.advice.warnings.map((w) => `Warning: ${w}`))
+  lines.push(`Advisor: ${prep.advice.risk} risk.`, ...prep.advice.warnings.map(warningInWords))
   if (prep.alreadyGranted) lines.push("This agent already holds everything it asked for.")
   lines.push("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
   return lines
