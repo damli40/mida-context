@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process"
 import { createPublicClient } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import type { LocalAccount } from "viem"
@@ -156,9 +157,9 @@ export function parseSponsorUrl(raw: string | undefined): string | undefined {
 /**
  * Takes the home's lock or throws. A live pid in an existing lock means another Mida process
  * holds it — the waiter retries in `stepMs` steps for up to `waitMs` before giving up, because a
- * drainer that fired during a long CLI run must not die on a transient hold. A dead or
- * unreadable lock is stale and is replaced. `createSecretJsonExclusive` makes the
- * check-then-create race-free.
+ * drainer that fired during a long CLI run must not die on a transient hold. A dead, unreadable
+ * or non-Mida lock is stale and is replaced — a recycled pid holds nothing (in-39 B-1).
+ * `createSecretJsonExclusive` makes the check-then-create race-free.
  */
 async function acquireHomeLock(home: MidaHome, waitMs: number, stepMs: number): Promise<void> {
   const deadline = Date.now() + waitMs
@@ -173,7 +174,7 @@ async function acquireHomeLock(home: MidaHome, waitMs: number, stepMs: number): 
       } catch {
         // A lock file that will not parse is stale: take it over.
       }
-      if (pid > 0 && processAlive(pid)) {
+      if (pid > 0 && processAlive(pid) && isMidaProcess(pid) !== false) {
         heldPid = pid
         break
       }
@@ -196,13 +197,62 @@ function processAlive(pid: number): boolean {
 }
 
 /**
- * The pid of the process holding this home's lock, when that process is still alive — undefined
- * when there is no lock, the lock is unreadable, or its pid is dead. The socket probe answers a
- * different question (is a listener reachable right now); this answers the one that decides
- * whether the socket file is stale: a live holder's files must never be removed under it (in-29
- * S-1, the Sep 29 orphaning bug).
+ * The executable names a Mida entry runs under — the npm package's bins and the shebang form a
+ * package manager's shim ends up as (`node /usr/local/bin/mida`). `mida-drain`, `mida-hook`,
+ * `mida-inject` and `mida-mcp` all take the home lock through ServiceRuntime.open, so they hold
+ * the lock exactly like the daemon does.
  */
-export function liveLockHolderPid(home: MidaHome): number | undefined {
+const MIDA_BIN_NAMES = new Set(["mida", "midad", "mida-drain", "mida-hook", "mida-inject", "mida-mcp"])
+
+/**
+ * The entry files of every form Mida runs while holding midad.lock: the bundled npm package
+ * (`dist/midad.js`, `dist/mida.js`, and the other dist bins) and a source checkout through tsx
+ * (`apps/midad/src/cli.ts`, `daemon-main.ts`, `drain-main.ts`, `hook-main.ts`, `inject-main.ts`,
+ * `mcp-main.ts`) — the `node --import …/tsx/dist/loader.mjs …` shape bin/mida and spawnDaemon
+ * produce.
+ */
+const MIDA_ENTRY = /(?:^|\/)(?:dist\/(?:mida|midad|mida-drain|mida-hook|mida-inject|mida-mcp)\.js|apps\/midad\/src\/(?:cli|daemon-main|drain-main|hook-main|inject-main|mcp-main)\.ts)$/
+
+/** Runners that launch a Mida entry — a bare `midad` bin also counts as argv0 (checked first). */
+const MIDA_RUNNERS = new Set(["node", "nodejs", "tsx", "env"])
+
+/**
+ * Whether pid is one of Mida's own processes, judged by `ps -o command= -p <pid>` — the one
+ * identity check behind every "is this lock really held" decision (in-39 B-1): `kill -0`
+ * answering only proves SOME process owns the number, and a crashed Mida's pid is recycled to
+ * an unrelated program fast enough that liveness alone once made doctor tell the owner to kill
+ * a stranger. An entry path counts only behind a runner — `vim apps/midad/src/daemon-main.ts`
+ * is an editor, not the service. Returns undefined when `ps` itself fails (no ps, a spawn
+ * error): the caller then treats the pid as live-but-unproven — the worst that does is leave a
+ * lock in place, never remove files under a service it could not see.
+ */
+export function isMidaProcess(pid: number): boolean | undefined {
+  const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" })
+  if (ps.error !== undefined) return undefined
+  const command = ps.stdout.trim()
+  // ps ran and named nothing — the pid ended between the liveness check and here
+  if (command === "") return false
+  const tokens = command.split(/\s+/).map((token) => token.replace(/^["']+|["']+$/g, ""))
+  const base = (i: number) => tokens[i]!.split("/").pop()!
+  if (MIDA_BIN_NAMES.has(base(0))) return true
+  for (let i = 0; i < tokens.length; i++) {
+    if (!MIDA_RUNNERS.has(base(i))) continue
+    for (let k = i + 1; k < tokens.length; k++) {
+      if (MIDA_ENTRY.test(tokens[k]!) || MIDA_BIN_NAMES.has(base(k))) return true
+    }
+  }
+  return false
+}
+
+/**
+ * Who midad.lock names and what it is: `mida` — a live process running a Mida entry; `foreign` —
+ * a live pid that is not Mida (a recycled number; the lock it sits in is stale); `unknown` — a
+ * live pid ps could not identify, treated everywhere a file could be deleted as still held;
+ * `dead` — the pid is gone. Undefined means no lock or an unreadable one.
+ */
+export type LockHolderKind = "mida" | "foreign" | "unknown" | "dead"
+
+export function lockHolder(home: MidaHome): { pid: number; kind: LockHolderKind } | undefined {
   let pid = 0
   try {
     const held = home.readJson<{ pid?: unknown }>(LOCK_FILE)
@@ -210,7 +260,24 @@ export function liveLockHolderPid(home: MidaHome): number | undefined {
   } catch {
     return undefined
   }
-  return pid > 0 && processAlive(pid) ? pid : undefined
+  if (pid <= 0) return undefined
+  if (!processAlive(pid)) return { pid, kind: "dead" }
+  const mida = isMidaProcess(pid)
+  return { pid, kind: mida === undefined ? "unknown" : mida ? "mida" : "foreign" }
+}
+
+/**
+ * The pid of the Mida process holding this home's lock — undefined when there is no lock, the
+ * lock is unreadable, its pid is dead, or the pid is live but is not a Mida process (a recycled
+ * number holds nothing, in-39 B-1). The socket probe answers a different question (is a listener
+ * reachable right now); this answers the one that decides whether the socket file is stale: a
+ * live holder's files must never be removed under it (in-29 S-1, the Sep 29 orphaning bug). A
+ * live pid that cannot be identified still counts as held — leaving a lock in place is the safe
+ * error, deleting a running service's files is the bad one.
+ */
+export function liveLockHolderPid(home: MidaHome): number | undefined {
+  const holder = lockHolder(home)
+  return holder !== undefined && (holder.kind === "mida" || holder.kind === "unknown") ? holder.pid : undefined
 }
 
 export function apiClient(

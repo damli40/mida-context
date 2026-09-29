@@ -154,12 +154,18 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
     if (alive.status !== 0) return { alreadyRunning: true, close: async () => {} }
     // in-29 S-1 (Sep 29 item 14): a holder that is alive but answered slowly keeps its socket —
     // deleting the file under it leaves it running but unreachable, and the lock below refuses
-    // the new start anyway. Only a dead or absent lock holder makes the socket stale.
+    // the new start anyway. Only a dead or non-Mida lock holder makes the socket stale (in-39
+    // B-1): a recycled pid holds nothing, and the file is removed only once this process owns
+    // the lock — never before it, so two starters cannot delete each other's fresh socket
+    // (nit 10's race).
     if (liveLockHolderPid(home) !== undefined) return { alreadyRunning: true, close: async () => {} }
-    rmSync(socketPath, { force: true })
   }
 
   const runtime = await (deps.openRuntime ?? (() => ServiceRuntime.open(home, deps.network)))()
+
+  // the lock is held now: a socket file that survived to here belongs to nothing — a service
+  // that took the lock binds a fresh one below, so anything already there is a leftover.
+  rmSync(socketPath, { force: true })
 
   // the memory-held checkpoint copies /whatsnew answers from — decrypted content never leaves
   // daemon memory. The handoff's read and every drain save seed it, so the first prompt of a

@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it } from "vitest"
 import { spawn } from "node:child_process"
+import type { ChildProcess } from "node:child_process"
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import type { AddressInfo, Server } from "node:net"
@@ -11,7 +12,7 @@ import { toFunctionSelector } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { encodeUint64 } from "@mida/protocol"
 import { parseDeployment } from "@mida/chain"
-import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, enqueue, installClaudeCode, installCodex, installDevin, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, enqueue, installClaudeCode, installCodex, installDevin, isMidaProcess, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
 import type { Runtime } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
@@ -19,6 +20,38 @@ const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
 const tsxLoader = join(repo, "node_modules/tsx/dist/loader.mjs")
 const cliMainPath = join(repo, "apps/midad/src/cli.ts")
+
+/**
+ * Live children a test spawns so `midad.lock` can name a real pid — killed in afterEach, only
+ * ever by the test that spawned them. `form` is the command line the pid wears: "bundled" is
+ * the npm package's `node …/dist/midad.js`, "bin" the shebang form `node …/midad`, "source" a
+ * checkout's `node --import tsx …/apps/midad/src/daemon-main.ts`, and "foreign" a plain
+ * `node -e` — the recycled-pid case doctor must never call Mida.
+ */
+const spawned: ChildProcess[] = []
+
+afterEach(() => {
+  while (spawned.length > 0) spawned.pop()!.kill()
+})
+
+function spawnHolder(form: "bundled" | "bin" | "source" | "foreign"): ChildProcess {
+  let args: string[]
+  if (form === "foreign") {
+    args = ["-e", "setInterval(() => {}, 1000)"]
+  } else {
+    const root = dir()
+    const file =
+      form === "bundled" ? join(root, "dist/midad.js")
+      : form === "bin" ? join(root, "bin/midad")
+      : join(root, "apps/midad/src/daemon-main.ts")
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, "setInterval(() => {}, 1000)\n")
+    args = form === "source" ? ["--import", tsxLoader, file] : [file]
+  }
+  const child = spawn(process.execPath, args, { stdio: "ignore" })
+  spawned.push(child)
+  return child
+}
 
 /** A stub listener on the home's control socket that answers every request with `status` + JSON `body`. */
 async function stubDaemon(home: MidaHome, status: number, body: unknown): Promise<Server> {
@@ -62,20 +95,53 @@ describe("mida doctor without a chain", () => {
     expect(code).toBeLessThanOrEqual(9)
   })
 
-  it("a live lock holder whose socket does not answer is told to kill it, not to start a new one (in-29 S-1)", async () => {
+  it("a live Mida lock holder whose socket does not answer is told to kill it, not to start a new one (in-29 S-1)", async () => {
     // Sep 29, item 14's end state: midad's process is alive (its lock pid is), the socket it
     // listens on is gone, and api-url.json is still on disk — running but unreachable. Doctor
-    // must name the pid and the fix; "start the daemon" would orphan it a second time.
+    // must name the pid and the fix; "start the daemon" would orphan it a second time. The pid
+    // is a spawned child whose command line IS the bundled daemon's — a bare live pid stopped
+    // being proof once pids got recycled (in-39 B-1).
     const home = new MidaHome(join(dir(), "home"))
-    home.writeSecretJson("midad.lock", { pid: process.pid })
+    const holder = spawnHolder("bundled")
+    home.writeSecretJson("midad.lock", { pid: holder.pid })
     home.writeSecretJson("api-url.json", { baseUrl: "http://127.0.0.1:9" })
     const lines: string[] = []
     const code = await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
     expect(lines).toContain(
-      `PROBLEM: the Mida service (pid ${process.pid}) is running but cannot be reached. Stop it with kill ${process.pid}, then run any mida command to start a fresh one.`,
+      `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with kill ${holder.pid}, then open any agent session or run mida task to start a fresh one.`,
     )
     expect(lines).not.toContain("PROBLEM: midad is not answering — start the daemon")
     expect(code).toBeGreaterThan(0)
+  })
+
+  it("a lock naming a live non-Mida process is a stale lock — doctor never tells the owner to kill it (in-39 B-1)", async () => {
+    // The recycled-pid case review caught: Mida died without cleanup, the number went to an
+    // unrelated program, and kill(pid,0) still answers. The service is GONE — the fix is a new
+    // one clearing the lock, not a kill aimed at a stranger's process.
+    const home = new MidaHome(join(dir(), "home"))
+    const holder = spawnHolder("foreign")
+    home.writeSecretJson("midad.lock", { pid: holder.pid })
+    home.writeSecretJson("api-url.json", { baseUrl: "http://127.0.0.1:9" })
+    const lines: string[] = []
+    const code = await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    expect(lines).toContain(
+      `PROBLEM: midad.lock names pid ${holder.pid}, which is not a Mida service, so the last Mida service did not exit cleanly. Open any agent session or run mida task; the new service clears the stale lock.`,
+    )
+    // never named as the service, never a kill target
+    expect(lines.some((line) => line.includes("is running but has not answered"))).toBe(false)
+    expect(lines.some((line) => line.includes(`kill ${holder.pid}`))).toBe(false)
+    expect(code).toBeGreaterThan(0)
+  })
+
+  it("isMidaProcess matches every Mida entry form — and not the vitest pid or a foreign child (in-39 B-1)", () => {
+    // the bundled daemon, the shebang'd bin name, and the tsx source form the repo's bin/mida
+    // launcher and the e2e tests spawn — all true; the test runner itself and an arbitrary
+    // node -e child are not.
+    expect(isMidaProcess(spawnHolder("bundled").pid!)).toBe(true)
+    expect(isMidaProcess(spawnHolder("bin").pid!)).toBe(true)
+    expect(isMidaProcess(spawnHolder("source").pid!)).toBe(true)
+    expect(isMidaProcess(spawnHolder("foreign").pid!)).toBe(false)
+    expect(isMidaProcess(process.pid)).toBe(false)
   })
 
   it("a lock whose pid is dead is just a stale lock — the same socket file scenario says start the daemon", async () => {

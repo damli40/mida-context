@@ -28,7 +28,7 @@ import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwn
 import type { OwnerMode } from "./keys.js"
 import { approvalsFileStatus, readApprovalsFile } from "./projects.js"
 import { listJobs } from "./queue.js"
-import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, liveLockHolderPid, serviceUrlInEffect, sponsorReachable } from "./runtime.js"
+import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, lockHolder, serviceUrlInEffect, sponsorReachable } from "./runtime.js"
 import { mismatchLine, readSavedNetwork, resolveNetwork } from "./network.js"
 import type { ResolvedNetwork, SavedNetwork, ServiceSource } from "./network.js"
 import { cliPackageName, isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
@@ -36,8 +36,14 @@ import { folderTaskFor } from "./task.js"
 
 /** The whole run is capped — a check may stall, the report may not. */
 const RUN_CAP_MS = 20_000
-/** How long the /health probe waits before declaring the daemon down. */
-const DAEMON_PROBE_MS = 1_000
+/**
+ * The /health probe retries before the daemon is declared unreachable: three attempts, 1.5 s
+ * each plus a 250 ms gap, landing the verdict at about five seconds — a busy service misses
+ * one probe, and the PROBLEM line names that window (in-39 B-1).
+ */
+const DAEMON_PROBE_MS = 1_500
+const DAEMON_PROBE_ATTEMPTS = 3
+const DAEMON_PROBE_GAP_MS = 250
 /** `doctor --live` waits this long for the SessionStart handoff to reach the daemon log. */
 const LIVE_WATCH_MS = 60_000
 
@@ -63,7 +69,7 @@ export interface DoctorDeps {
   /** node:sqlite probe for the devin check — injectable since a test cannot uninstall a builtin. */
   devinSqliteAvailable?: () => boolean
   now?: () => number
-  /** /health probe timeout; default 1 s. */
+  /** Per-attempt /health probe timeout; the daemon check probes up to three times over ~5 s. Default 1.5 s. */
   daemonProbeMs?: number
   /** Whole-run cap; default 20 s. */
   capMs?: number
@@ -93,6 +99,11 @@ interface Shared {
   approved?: { name: string; agentId: Hex }[]
   /** The run's one resolveNetwork result — null once a resolution was tried and refused. */
   resolved?: ResolvedNetwork | null
+  /**
+   * What the daemon check decided: true when the service answered /health at all, false when
+   * every probe went unanswered — the waiting-sessions note phrases its next try by it (B-2).
+   */
+  serviceUp?: boolean
 }
 
 const problem = (sentence: string, fix: string) => `PROBLEM: ${sentence} — ${fix}`
@@ -352,15 +363,39 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
     {
       name: "daemon",
       run: async () => {
-        const reply = await callDaemon(home, "/health", undefined, { timeoutMs: deps.daemonProbeMs ?? DAEMON_PROBE_MS })
+        const probeMs = deps.daemonProbeMs ?? DAEMON_PROBE_MS
+        let reply = await callDaemon(home, "/health", undefined, { timeoutMs: probeMs })
+        // a busy service misses one probe — the verdict waits for three over about five seconds
+        // before anything is called unreachable (in-39 B-1)
+        for (let attempt = 1; reply.status === 0 && attempt < DAEMON_PROBE_ATTEMPTS; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, DAEMON_PROBE_GAP_MS))
+          reply = await callDaemon(home, "/health", undefined, { timeoutMs: probeMs })
+        }
+        shared.serviceUp = reply.status !== 0
         if (reply.status === 0) {
-          // in-29 S-1 (Sep 29 item 14): the lock's pid alive while the socket does not answer —
-          // with the socket file or the api-url.json a daemon left behind — is a RUNNING service
-          // that cannot be reached, orphaned most often by an earlier start deleting its socket.
-          // It must be stopped, not started over; "start the daemon" would orphan it again.
-          const pid = liveLockHolderPid(home)
-          if (pid !== undefined && (existsSync(socketPathFor(home)) || home.has("api-url.json"))) {
-            return [`PROBLEM: the Mida service (pid ${pid}) is running but cannot be reached. Stop it with kill ${pid}, then run any mida command to start a fresh one.`]
+          // The lock pid decides what "not answering" means — but the pid alone is never proof:
+          // a dead Mida's number is recycled, so only a pid the command line identifies as Mida
+          // may be named or killed here (in-39 B-1). A live foreign pid is a stale lock left by
+          // an unclean exit; a live pid ps could not identify is never called Mida either — and
+          // never suggested as a kill target.
+          const holder = lockHolder(home)
+          if (holder !== undefined && holder.kind === "mida" && (existsSync(socketPathFor(home)) || home.has("api-url.json"))) {
+            return [
+              `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with kill ${holder.pid}, then open any agent session or run mida task to start a fresh one.`,
+            ]
+          }
+          if (holder !== undefined && holder.kind === "foreign") {
+            return [
+              `PROBLEM: midad.lock names pid ${holder.pid}, which is not a Mida service, so the last Mida service did not exit cleanly. Open any agent session or run mida task; the new service clears the stale lock.`,
+            ]
+          }
+          if (holder !== undefined && holder.kind === "unknown") {
+            return [
+              problem(
+                `midad.lock names pid ${holder.pid}, which doctor could not identify — it may still be the Mida service`,
+                "do not kill it on doctor's word; open any agent session or run `mida task`, then re-check",
+              ),
+            ]
           }
           return [problem("midad is not answering", "start the daemon")]
         }

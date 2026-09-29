@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { spawn } from "node:child_process"
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { createServer as createHttpServer } from "node:http"
 import { tmpdir } from "node:os"
@@ -119,8 +120,15 @@ describe("startDaemon", () => {
       old.once("error", reject)
       old.listen(socketPath, () => resolve())
     })
-    // the lock the live holder wrote — a live pid stands in for the old service's process
-    home.writeSecretJson("midad.lock", { pid: process.pid })
+    // the lock the live holder wrote — a spawned child whose command line is the bundled
+    // daemon's `node …/dist/midad.js` stands in for the old service's process. The vitest pid
+    // is no longer accepted here: a live pid is proof only when it is Mida (in-39 B-1).
+    const holderDir = mkdtempSync(join(tmpdir(), "mida-holder-"))
+    const holderScript = join(holderDir, "dist/midad.js")
+    mkdirSync(dirname(holderScript), { recursive: true })
+    writeFileSync(holderScript, "setInterval(() => {}, 1000)\n")
+    const holder = spawn(process.execPath, [holderScript], { stdio: "ignore" })
+    home.writeSecretJson("midad.lock", { pid: holder.pid })
     let second: { alreadyRunning: boolean; close(): Promise<void> } | undefined
     try {
       second = await startDaemon({ ...deps, staleCheckMs: 50 })
@@ -131,8 +139,32 @@ describe("startDaemon", () => {
       expect(reply.status).toBe(200)
       expect(reply.body).toMatchObject({ marker: "old" })
     } finally {
+      holder.kill()
       await second?.close()
       await new Promise<void>((done) => old.close(() => done()))
+    }
+  })
+
+  it("a lock naming a live non-Mida process is stale — the start proceeds and replaces it (in-39 B-1)", async () => {
+    // the recycled pid: Mida's number went to an unrelated program, so the lock it sits in
+    // holds nothing — the new service takes over as if the pid were dead
+    const { home, deps } = setup()
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
+    try {
+      home.writeSecretJson("midad.lock", { pid: holder.pid })
+      writeFileSync(socketPathFor(home), "")
+      const daemon = await startDaemon({ ...deps, staleCheckMs: 50 })
+      try {
+        expect(daemon.alreadyRunning).toBe(false)
+        // the stale lock was replaced by this service's own entry
+        expect(home.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(process.pid)
+        const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 1_000 })
+        expect(reply.status).toBe(200)
+      } finally {
+        await daemon.close()
+      }
+    } finally {
+      holder.kill()
     }
   })
 

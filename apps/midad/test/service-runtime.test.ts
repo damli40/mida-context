@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest"
-import { mkdtempSync, readFileSync } from "node:fs"
+import { spawn } from "node:child_process"
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { MidaHome, ServiceRuntime } from "@mida/midad"
 import type { Network } from "@mida/midad"
 
@@ -61,6 +62,45 @@ describe("ServiceRuntime — the daemon's runtime", () => {
       expect(() => runtime.agent("codex")).toThrow(/run init first/)
     } finally {
       await runtime.close()
+    }
+  })
+
+  it("a lock naming a live non-Mida process is stale — open clears it instead of waiting it out (in-39 B-1)", async () => {
+    // the recycled pid: `kill -0` answers but the number now belongs to a program that is not
+    // Mida, so the lock holds nothing and open replaces it immediately
+    const home = freshHome()
+    home.writeSecretJson("owner-address.json", { address: OWNER })
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
+    try {
+      home.writeSecretJson("midad.lock", { pid: holder.pid })
+      const runtime = await ServiceRuntime.open(home, network, { lockWaitMs: 500, lockStepMs: 50 })
+      try {
+        expect(home.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(process.pid)
+      } finally {
+        await runtime.close()
+      }
+    } finally {
+      holder.kill()
+    }
+  })
+
+  it("a lock naming a live Mida process really is held — open waits, refuses, and leaves it alone (in-39 B-1)", async () => {
+    // the child's command line is the bundled daemon's `node …/dist/midad.js` — the same check
+    // that clears a foreign pid must keep this one untouched
+    const home = freshHome()
+    home.writeSecretJson("owner-address.json", { address: OWNER })
+    const script = join(mkdtempSync(join(tmpdir(), "mida-holder-")), "dist/midad.js")
+    mkdirSync(dirname(script), { recursive: true })
+    writeFileSync(script, "setInterval(() => {}, 1000)\n")
+    const holder = spawn(process.execPath, [script], { stdio: "ignore" })
+    try {
+      home.writeSecretJson("midad.lock", { pid: holder.pid })
+      await expect(ServiceRuntime.open(home, network, { lockWaitMs: 300, lockStepMs: 50 })).rejects.toThrow(
+        `another Mida process (pid ${holder.pid}) already holds this home`,
+      )
+      expect(home.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(holder.pid)
+    } finally {
+      holder.kill()
     }
   })
 })
