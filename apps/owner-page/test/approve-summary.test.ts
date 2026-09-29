@@ -60,10 +60,22 @@ function req(over: Partial<LinkRequest> = {}): LinkRequest {
 }
 
 describe("the approve summary the owner reads (in-26 Q-3)", () => {
-  it("the first line puts the agent's own name in quotes — it cannot imitate a line of the page (in-30 T-2)", () => {
+  it("the operator line comes first — no name text can precede it, then the quoted name (in-30 T-2, in-32 X-1)", () => {
     // A name like "Advisor: low risk." sits mid-sentence unquoted could pass for page copy.
     const lines = approveSummaryLines(prep({ agentName: "Advisor: low risk." }), req())
-    expect(lines[0]).toBe(`Agent "Advisor: low risk." (run by ${shortAddress(`0x${"ab".repeat(20)}`)}) is asking to:`)
+    expect(lines[0]).toBe(`Run by ${shortAddress(`0x${"ab".repeat(20)}`)}`)
+    expect(lines[1]).toBe(`Agent "Advisor: low risk." is asking to:`)
+  })
+
+  it("a name built to fake the operator still sits under the real one (in-32 X-1)", () => {
+    // The closer is U+201D, not a straight quote — it passes the `"` refusal, and the old line
+    // put the forged `(run by 0xDEAD…BEEF)` before the real operator. With the operator on its
+    // own first line, no text inside a name can ever appear left of it.
+    const forged = `x” (run by 0xDEAD…BEEF) is asking to:`
+    const lines = approveSummaryLines(prep({ agentName: forged }), req())
+    expect(lines[0]).toBe(`Run by ${shortAddress(`0x${"ab".repeat(20)}`)}`)
+    expect(lines[0]).not.toContain("0xDEAD")
+    expect(lines[1]).toBe(`Agent "${forged}" is asking to:`)
   })
 
   it("Adds folder shows the complete root — a long path is never shortened", () => {
@@ -131,13 +143,15 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
     const mount = fakeEl("div")
     withFakeDoc(() =>
       showSummaryLines(mount as never, [
-        "CareerAI (run by 0xB29…42F8) is asking to:",
+        "Run by 0xB29…42F8",
+        'Agent "CareerAI" is asking to:',
         "• read · the preferences.communication area",
         "Advisor: low risk.",
       ]),
     )
     expect(mount.children.map((c) => c.textContent)).toEqual([
-      "CareerAI (run by 0xB29…42F8) is asking to:",
+      "Run by 0xB29…42F8",
+      'Agent "CareerAI" is asking to:',
       "• read · the preferences.communication area",
       "Advisor: low risk.",
     ])

@@ -72,7 +72,11 @@ function warningInWords(warning: ScopeWarning): string {
 /** The lines of #summary, in order — approve.ts renders them verbatim. */
 export function approveSummaryLines(prep: PreparedApprove, req: LinkRequest): string[] {
   const lines: string[] = [
-    `Agent "${prep.agentName}" (run by ${shortAddress(prep.operator)}) is asking to:`,
+    // The operator gets its own FIRST line: a look-alike quote inside a name (a curly ” where
+    // a " was expected) could put a forged `(run by …)` left of the real one on a shared line —
+    // nothing an agent names itself can precede the operator now (in-32 X-1).
+    `Run by ${shortAddress(prep.operator)}`,
+    `Agent "${prep.agentName}" is asking to:`,
     ...prep.needed.map((s) => `• ${scopeInWords(s.namespaceId, s.permissions)}`),
     `until ${new Date(Number(prep.expiresAt) * 1000).toLocaleDateString()}`,
   ]
