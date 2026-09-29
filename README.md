@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Monad-testnet%2010143-836EF9?style=flat-square&labelColor=14130F" alt="Monad testnet, chain 10143">
   <img src="https://img.shields.io/badge/status-pre--release-b08800?style=flat-square&labelColor=14130F" alt="Pre-release">
-  <img src="https://img.shields.io/badge/tests-2%2C975%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="2,975 tests passing">
+  <img src="https://img.shields.io/badge/tests-3%2C279%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,279 tests passing">
   <img src="https://img.shields.io/badge/audit-none-7e8c86?style=flat-square&labelColor=14130F" alt="Not audited">
   <img src="https://img.shields.io/badge/license-MIT-7e8c86?style=flat-square&labelColor=14130F" alt="MIT license">
 </p>
@@ -22,6 +22,7 @@
 <p align="center">
   <a href="https://app.midacontext.xyz"><b>Owner page</b></a> &nbsp;·&nbsp;
   <a href="docs/quickstart.md">Full walkthrough</a> &nbsp;·&nbsp;
+  <a href="docs/use-cases.md">Use cases</a> &nbsp;·&nbsp;
   <a href="docs/evidence">Evidence</a> &nbsp;·&nbsp;
   <a href="#quickstart">Run it yourself</a>
 </p>
@@ -65,13 +66,13 @@ Mida is a small service on your machine plus a set of permission rules on a publ
 - **It records permissions and authorship on Monad.** The chain says which agent may read which
   kind of context and which agent wrote each record. Content never goes on chain.
 - **It hands off.** When an approved agent starts a session, Mida prints the latest checkpoint into
-  it. You type "Continue."
+  it. You type "Continue." Mid-session, the agent can ask Mida again through its MCP tools.
 - **You decide.** Only you approve or revoke an agent, from your own terminal. An agent cannot
   approve itself.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/architecture/mida-architecture-dark.svg">
-  <img alt="How one checkpoint travels: an agent's session events reach the local Mida service, which has your chosen model summarise them, encrypts the checkpoint, stores the ciphertext, and registers its author and fingerprint on Monad. The next approved agent receives the checkpoint at session start. You approve and revoke agents on Monad." src="docs/architecture/mida-architecture-light.svg" width="100%">
+  <img alt="How one checkpoint travels: an agent's session events reach the local Mida service, which has your chosen model summarise them, encrypts the checkpoint, stores the ciphertext, and registers its author and fingerprint on Monad. The next approved agent receives the checkpoint at session start, and can ask Mida again mid-session through its MCP tools. You approve and revoke agents on Monad, and a gas sponsor pays for the transactions by default." src="docs/architecture/mida-architecture-light.svg" width="100%">
 </picture>
 
 ## Who builds on Mida
@@ -113,6 +114,7 @@ grants the user signed; your app never holds the user's owner keys. Full referen
 - [Security model and limits](#security-model-and-limits)
 - [What it costs to run](#what-it-costs-to-run)
 - [What works and what doesn't](#what-works-and-what-doesnt)
+- [Where Mida is going](#where-mida-is-going)
 - [Repository layout](#repository-layout)
 
 ---
@@ -120,13 +122,14 @@ grants the user signed; your app never holds the user's owner keys. Full referen
 ## Quickstart
 
 **You need:** Node.js 22 or later, and Claude Code and/or Codex. By default Mida uses a hosted
-encrypted store and a gas sponsor, so you need no testnet tokens.
+encrypted store and a gas sponsor, so you need no testnet tokens. A setup made before the sponsor existed
+joins it with `mida sponsor on`.
 
 ```bash
 npm install -g mida-context
 mida init                       # your owner key and one identity per agent; add --passkey to approve with a passkey
-mida install claude-code
-mida install codex              # then open Codex once, type /hooks, and trust the Mida entries
+mida install claude-code        # hooks, plus Mida's MCP tools so a session can ask Mida mid-task
+mida install codex              # the same; then open Codex once, type /hooks, and trust the Mida entries
 mida doctor                     # one line per check; every PROBLEM names its fix
 ```
 
@@ -154,7 +157,7 @@ The full walkthrough, with the expected output of every step, is
 ```bash
 git clone --recurse-submodules https://github.com/damli40/mida-context && cd mida-context
 pnpm install && pnpm build:publish
-cd publish/cli && npm pack && npm install -g mida-context-0.1.0.tgz
+cd publish/cli && npm pack && npm install -g mida-context-0.1.1.tgz
 ```
 
 </details>
@@ -163,15 +166,15 @@ cd publish/cli && npm pack && npm install -g mida-context-0.1.0.tgz
 
 | Agent | How Mida connects | Status |
 |---|---|---|
-| Claude Code | Hooks | Live, Sep 27 |
-| Codex CLI and the Codex app | Hooks (trust them once in `/hooks`) | Live, Sep 27 |
+| Claude Code | Hooks, plus the MCP server for mid-session reads | Hooks live, Sep 27; MCP server in tests |
+| Codex CLI and the Codex app | Hooks (trust them once in `/hooks`), plus the MCP server | Hooks live, Sep 27; MCP server in tests |
 | Devin | Hooks | Live, Sep 27 |
 | Claude Desktop | MCP server `mida-mcp`: `mida_handoff`, `mida_whats_new`, `mida_read`, `mida_status`, `mida_save` | Live, Sep 27 |
 | Cursor | The same MCP server | In tests |
 | Your own app | The SDK | In tests, local chain |
 
 Each client gets its own identity, so you approve and revoke them one at a time. `mida install
-<client>` writes the configuration for you. ChatGPT chats are not supported: they cannot run local
+<client>` writes the configuration for you, the MCP server included; `--no-mcp` leaves it out. ChatGPT chats are not supported: they cannot run local
 hooks or a local MCP server.
 
 ---
@@ -237,7 +240,7 @@ task.
 | Command | What it does |
 |---|---|
 | `mida init` / `mida init --passkey` | Create your owner key and agent identities, start the service |
-| `mida install <client>` / `uninstall <client>` | Add or remove Mida for `claude-code`, `codex`, `devin`, `claude-desktop`, `cursor` |
+| `mida install <client> [--no-mcp]` / `uninstall <client>` | Add or remove Mida for `claude-code`, `codex`, `devin`, `claude-desktop`, `cursor` |
 | `mida doctor` | Check everything; each problem names its fix |
 | `mida request <agent>` | The agent asks for access |
 | `mida approve <agent>` / `approve --all` | You approve it for this folder (terminal only; type `yes`) |
@@ -249,6 +252,7 @@ task.
 | `mida export <folder>` | Write everything the chain attributes to you, decrypted, into a new folder |
 | `mida add-agent <name>` | Register an identity for your own SDK app |
 | `mida batching on\|off` | Anchor saves in shared batches (sponsored) or one transaction each |
+| `mida sponsor on\|off` | Let the gas sponsor pay for your saves and grants, or go back to paying your own testnet gas |
 
 "Terminal only" means the command refuses to run from inside an agent.
 
@@ -323,12 +327,40 @@ pay nothing; one direct save cost about 0.03 testnet MON on Sep 21. Mainnet cost
 | Hosted store and gas sponsor | ✅ Live |
 | Batching: saves anchored by Mida's batcher, gas sponsored | ✅ Live for invited owners, Sep 29 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | A change of plan you make mid-session reaches the next agent, credited to you | ✅ 6 of 6 on a real model, was 0 of 6 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
+| A new session in a busy project reads every save in batched chain calls: 155 saves in 5.1 s, where it used to time out | ✅ Live, Sep 29 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
+| Mid-session reads from Claude Code and Codex through Mida's MCP tools | ✅ In tests (Claude Desktop live, Sep 27) |
+| `mida sponsor on\|off` for a setup made before the sponsor existed | ✅ In tests |
 | SDK, named tasks, folder linking, `mida export` | ✅ In tests on a local chain; not yet run live |
 | Owner view in the browser (`app.midacontext.xyz/me`) and the public index | 🚧 Built, deploying |
 | npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
 | Security audit | ❌ None |
 
-2,975 automated tests pass on this release: `pnpm test`.
+3,279 automated tests pass on this release: `pnpm test`.
+
+---
+
+## Where Mida is going
+
+AI agents are moving into the cloud and staying on. xAI's Grok Bot, Meta's Muse and OpenAI's dots each run on
+their own cloud computer and learn from you over time. The longer you work inside one, the more it holds about
+your projects, preferences and decisions. You can export a file; months of an agent learning how you work are
+much harder to take with you. Mida keeps that context yours wherever the model runs: the ciphertext can sit on a
+hosted store, because you hold the keys and you approve every reader. Today that works for agents that connect
+through Mida's hooks and MCP tools. Reaching cloud agents like these is part of the plan.
+
+None of the following is built yet:
+
+- **Cloud agents.** A remote Mida endpoint over MCP, with sign-in, for agents and chat apps that cannot run a
+  program on your machine.
+- **Sign in with Mida.** An app asks for scoped access to your context the way it asks you to sign in. You
+  approve it, and later revoke it, like any agent.
+- **Move in, move out.** Bring your context in from the AI tools you already use, and take it with you when you
+  leave.
+- **Teams.** Several people steer one agent, each with their own identity, so you can revoke one teammate
+  without stopping the rest.
+- **A separate permission for training.** Reading your context will not let an agent train on it.
+
+The full list, and what you can use Mida for today: [`docs/use-cases.md`](docs/use-cases.md).
 
 ---
 
