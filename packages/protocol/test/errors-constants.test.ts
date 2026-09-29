@@ -14,6 +14,8 @@ import {
   PROVENANCE_SOURCE,
   RECORD_RELATION_CODE,
   RECORD_TYPE,
+  UNACCEPTABLE_REQUEST_CHARS,
+  displaySafeText,
   isMidaError,
 } from "@mida/protocol"
 
@@ -57,5 +59,40 @@ describe("protocol constants (§10.2, §11.2, §11.8)", () => {
     expect(NAMESPACE_TREE_VERSION).toBe("mida-namespace-tree-v1")
     expect(CRYPTO_VERSION).toBe("mida-crypto-v1")
     expect(MAX_PAYLOAD_BYTES).toBe(65_536)
+  })
+})
+
+/**
+ * The refused set the owner pages enforce (in-30 T-3): not just the C0 controls and DEL — every
+ * class that can forge a rendered line or hide inside one. Control characters, the Unicode line
+ * and paragraph separators, zero-width marks, the bidirectional controls and the BOM.
+ */
+describe("UNACCEPTABLE_REQUEST_CHARS (in-30 T-3)", () => {
+  const chr = (cp: number) => String.fromCharCode(cp)
+
+  it.each([
+    ["C0 control", chr(0x0a)],
+    ["DEL", chr(0x7f)],
+    ["C1 control", chr(0x85)],
+    ["line separator", chr(0x2028)],
+    ["paragraph separator", chr(0x2029)],
+    ["zero-width space", chr(0x200b)],
+    ["zero-width joiner", chr(0x200d)],
+    ["left-to-right mark", chr(0x200e)],
+    ["right-to-left mark", chr(0x200f)],
+    ["bidi embedding", chr(0x202a)],
+    ["bidi isolate", chr(0x2067)],
+    ["byte order mark", chr(0xfeff)],
+  ])("refuses %s", (_label, char) => {
+    expect(UNACCEPTABLE_REQUEST_CHARS.test(`a${char}b`)).toBe(true)
+  })
+
+  it("still accepts ordinary text — plain words, dashes, emoji and CJK", () => {
+    expect(UNACCEPTABLE_REQUEST_CHARS.test("claude-code — plain text 中文字符 ✓")).toBe(false)
+  })
+
+  it("displaySafeText folds each refused character to a single space — for fields that are shown, not refused", () => {
+    const dirty = `line one${chr(0x0a)}line two${chr(0x2028)}${chr(0x2029)}${chr(0x200b)}bidi${chr(0x202a)}${chr(0x2067)}${chr(0xfeff)}`
+    expect(displaySafeText(dirty)).toBe("line one line two   bidi   ")
   })
 })

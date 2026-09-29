@@ -128,6 +128,29 @@ describe("buildOwnerLink / parseOwnerLink", () => {
       }),
     ).toThrowError(OwnerLinkError)
   })
+
+  it("refuses every refused character class in a field the page renders — one fixed sentence (in-30 T-3)", () => {
+    // Control characters, line/paragraph separators, zero-width marks, bidi controls, BOM — each
+    // can forge or hide inside a rendered line. The refusal is the same fixed sentence for all.
+    const sentence = "This request contains characters Mida does not accept, so this page will not show or sign it."
+    const entry = { agent: "claude-code", projectId: "proj-1", root: "/srv/context" }
+    const dirty = (cp: number) => `text${String.fromCharCode(cp)}more`
+    const fragment = (req: unknown) =>
+      new URLSearchParams({ v: "1", nonce: NONCE, req: Buffer.from(JSON.stringify(req)).toString("base64url") }).toString()
+    for (const cp of [0x0a, 0x85, 0x2028, 0x2029, 0x200b, 0x200e, 0x202a, 0x2067, 0xfeff]) {
+      const reqs = [
+        { ...req, entry: { ...entry, agent: dirty(cp) } },
+        { ...req, entry: { ...entry, root: dirty(cp) } },
+        { ...req, project: { id: "proj-1", label: dirty(cp) } },
+        { ...req, entries: [{ ...entry, root: dirty(cp), approvedAt: "2026-01-01T00:00:00Z" }] },
+      ]
+      for (const request of reqs) {
+        expect(() => parseOwnerLink(fragment({ ...request, chainId: 10143, owner: OWNER, request: { agentId: AGENT_ID } }), "approve")).toThrowError(
+          sentence,
+        )
+      }
+    }
+  })
 })
 
 describe("buildOwnerReturnUrl / parseOwnerResult", () => {

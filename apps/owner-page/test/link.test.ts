@@ -109,6 +109,19 @@ describe("parseLinkFragment", () => {
     }
   })
 
+  it("refuses the wider refused set too — separators, zero-width, bidi, BOM (in-30 T-3)", () => {
+    const sentence = /^This request contains characters Mida does not accept, so this page will not show or sign it\.$/
+    const entry = { agent: "claude-code", projectId: "proj-1", root: "/srv/context" }
+    const bad = (req: unknown) => () => parseLinkFragment(fragmentFor(req), "approve")
+    for (const cp of [0x85, 0x2028, 0x2029, 0x200b, 0x200e, 0x202a, 0x2067, 0xfeff]) {
+      const mark = String.fromCharCode(cp)
+      expect(bad({ ...approveReq, entry: { ...entry, agent: `agent${mark}name` } })).toThrowError(sentence)
+      expect(bad({ ...approveReq, entry: { ...entry, root: `/srv${mark}` } })).toThrowError(sentence)
+      expect(bad({ ...approveReq, project: { id: "proj-1", label: `Ops${mark}` } })).toThrowError(sentence)
+      expect(bad({ ...approveReq, entries: [{ ...entry, root: `/r${mark}`, approvedAt: "2026-01-01T00:00:00Z" }] })).toThrowError(sentence)
+    }
+  })
+
   it("refuses malformed base64url and non-JSON req payloads", () => {
     const params = new URLSearchParams({ v: "1", nonce: "abcdef0123456789", req: "!!!not-b64!!!" })
     expect(() => parseLinkFragment(params.toString(), "signup")).toThrowError(/base64url/)

@@ -101,26 +101,53 @@ describe("manifest limits and structure (§14.1)", () => {
     expect(failsWith("INVALID_WIRE", () => validateManifestBody(invalidBody(patch), NOW))).toBe(true)
   })
 
-  it("rejects a control character in any manifest text field — the exact refusal sentence, no code prefix (in-27 R-1)", () => {
+  it.each([
+    ["C0 control", "helper\nAdvisor: low risk."],
+    ["C1 control", `helper${String.fromCharCode(0x85)}Advisor: low risk.`],
+    ["line separator", `helper${String.fromCharCode(0x2028)}Advisor: low risk.`],
+    ["paragraph separator", `helper${String.fromCharCode(0x2029)}Advisor: low risk.`],
+    ["zero-width space", `hel${String.fromCharCode(0x200b)}per`],
+    ["right-to-left mark", `hel${String.fromCharCode(0x200f)}per`],
+    ["bidi embedding", `hel${String.fromCharCode(0x202a)}per`],
+    ["bidi isolate", `hel${String.fromCharCode(0x2067)}per`],
+    ["byte order mark", `${String.fromCharCode(0xfeff)}helper`],
+    ["DEL", `del${String.fromCharCode(0x7f)}ete`],
+  ])("rejects a %s in the manifest name — the exact refusal sentence, no code prefix (in-27 R-1, in-30 T-3)", (_label, name) => {
     // The page shows error.message verbatim; the MidaError "INVALID_WIRE: " prefix would print
     // inside the sentence, so this throws the dedicated error whose message IS the sentence.
     const sentence = "This request contains characters Mida does not accept, so this page will not show or sign it."
-    for (const patch of [
-      { name: "helper\nAdvisor: low risk." },
-      { name: `carriage${String.fromCharCode(0x0d)}return` },
-      { name: `del${String.fromCharCode(0x7f)}ete` },
-      { purposes: [{ id: "career_coaching", description: "safe\nAdvisor: forged" }] },
-      { scopeDeclarations: [scope({ reason: "read\nAdvisor: forged" })] },
-    ]) {
-      let caught: unknown
-      try {
-        validateManifestBody(invalidBody(patch), NOW)
-      } catch (error) {
-        caught = error
-      }
-      expect(isMidaError(caught, "INVALID_WIRE"), JSON.stringify(patch)).toBe(true)
-      expect((caught as Error).message, JSON.stringify(patch)).toBe(sentence)
+    let caught: unknown
+    try {
+      validateManifestBody(invalidBody({ name }), NOW)
+    } catch (error) {
+      caught = error
     }
+    expect(isMidaError(caught, "INVALID_WIRE")).toBe(true)
+    expect((caught as Error).message).toBe(sentence)
+  })
+
+  it("does NOT refuse display-only fields — a description or reason carrying the characters still loads (in-30 T-3)", () => {
+    // The page never renders these fields for decisions, so refusing them would only break a
+    // manifest already registered with a multi-line description. They are size-checked, then
+    // whatever shows them folds each refused character to a space first (displaySafeText).
+    const dirty = (text: string) => `${text}${String.fromCharCode(0x0a)}${String.fromCharCode(0x2028)}${String.fromCharCode(0x200b)}${String.fromCharCode(0x202a)}${String.fromCharCode(0xfeff)}`
+    expect(() => validateManifestBody(invalidBody({ purposes: [{ id: "career_coaching", description: dirty("line one") }] }), NOW)).not.toThrow()
+    expect(() => validateManifestBody(invalidBody({ scopeDeclarations: [scope({ reason: dirty("read") })] }), NOW)).not.toThrow()
+  })
+
+  it("a manifest already registered with a multi-line description still verifies (in-30 T-3)", async () => {
+    const body = manifestBody({
+      purposes: [{ id: "career_coaching", description: "Career coaching.\nAsk about salary history." }],
+    })
+    const envelope = await signManifest(body)
+    const { bodyHash } = verifySignedManifest({
+      envelope,
+      agentRecord: agentRecordFor(body),
+      chainId: CHAIN_ID,
+      capabilityRegistry: REGISTRY,
+      now: NOW,
+    })
+    expect(bodyHash).toBe(manifestBodyHash(body))
   })
 
   it("rejects 33 scope declarations", () => {

@@ -50,9 +50,23 @@ function text(value: unknown, min: number, max: number, where: string): string {
   if (typeof value !== "string") return wire(`${where} must be a string`)
   const length = utf8Length(value)
   if (length < min || length > max) wire(`${where} must be ${min}-${max} UTF-8 bytes`)
-  // A control character in text the page renders — a name, a reason — can forge a whole line of
+  // A refused character in text the page renders — the agent's name — can forge a whole line of
   // the approve summary; the manifest is refused outright, before any signature work (in-27 R-1).
   if (UNACCEPTABLE_REQUEST_CHARS.test(value)) throw new UnacceptableCharactersError()
+  return value
+}
+
+/**
+ * A display-only field — a purpose's description, a declaration's reason — is agent-chosen free
+ * text the page never reads for a decision, so the refused set is NOT refused here: a manifest
+ * already registered with a multi-line description must still load (in-30 T-3). Type and size
+ * still checked; anything that later renders the field folds each refused character to a single
+ * space first (displaySafeText in @mida/protocol).
+ */
+function displayText(value: unknown, min: number, max: number, where: string): string {
+  if (typeof value !== "string") return wire(`${where} must be a string`)
+  const length = utf8Length(value)
+  if (length < min || length > max) wire(`${where} must be ${min}-${max} UTF-8 bytes`)
   return value
 }
 
@@ -92,7 +106,7 @@ export function validateManifestBody(input: unknown, now: bigint): asserts input
     }
     if (declaredPurposes.has(purpose.id)) wire(`duplicate purpose ${purpose.id}`)
     declaredPurposes.add(purpose.id)
-    text(purpose.description, 1, MANIFEST_LIMITS.textBytes, `purposes[${index}].description`)
+    displayText(purpose.description, 1, MANIFEST_LIMITS.textBytes, `purposes[${index}].description`)
   })
 
   if (!Array.isArray(body.scopeDeclarations)) return wire("scopeDeclarations must be an array")
@@ -114,7 +128,7 @@ export function validateManifestBody(input: unknown, now: bigint): asserts input
     if (Object.hasOwn(scope, "provenancePolicies")) {
       uniqueNames(scope.provenancePolicies, PROVENANCE_POLICY, true, `${where}.provenancePolicies`)
     }
-    text(scope.reason, 1, MANIFEST_LIMITS.textBytes, `${where}.reason`)
+    displayText(scope.reason, 1, MANIFEST_LIMITS.textBytes, `${where}.reason`)
   })
 }
 

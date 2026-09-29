@@ -88,15 +88,30 @@ export function isMidaError(value: unknown, code?: MidaErrorCode): value is Mida
 }
 
 /**
- * The one sentence the owner page shows when a request carries a control character (the C0 controls or DEL \u007f) in a field it renders — a manifest name, a folder root, a project label.
+ * The one sentence the owner page shows when a request carries a refused character in a field it renders — a manifest name, a folder root, a project label.
  * One fixed sentence, with no field name or code, so the refusal itself can never smuggle part
  * of the request onto the page (in-27 R-1). This string is final copy.
  */
 export const UNACCEPTABLE_REQUEST_TEXT =
   "This request contains characters Mida does not accept, so this page will not show or sign it."
 
-/** The characters that must never reach a field a page or a terminal renders. */
-export const UNACCEPTABLE_REQUEST_CHARS = /[\x00-\x1f\u007f]/
+/**
+ * The characters that must never reach a field a page or a terminal renders. The set is wider
+ * than C0+DEL (in-30 T-3): every control character, the Unicode line and paragraph separators,
+ * the zero-width marks (B-200F), the bidirectional controls (202A-202E, 2066-2069) and the BOM.
+ * Each can forge a rendered line or hide inside one.
+ */
+export const UNACCEPTABLE_REQUEST_CHARS = /[\p{Cc}\p{Zl}\p{Zp}​-‏‪-‮⁦-⁩﻿]/u
+
+/**
+ * A refused character folded to a single space — for a display-only field that is size-checked
+ * but not refused (a manifest's purpose description or scope reason, in-30 T-3). Validation keeps
+ * the bytes untouched so the manifest's hash still matches what was registered; whatever later
+ * renders the field passes it through here first.
+ */
+export function displaySafeText(value: string): string {
+  return value.replace(new RegExp(UNACCEPTABLE_REQUEST_CHARS.source, "gu"), " ")
+}
 
 /**
  * INVALID_WIRE whose message is already the owner-facing sentence. MidaError prefixes its detail
