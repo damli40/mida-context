@@ -1010,6 +1010,29 @@ describe("the claude-code MCP server through the claude CLI (in-28)", () => {
     )
   })
 
+  it("without an injected runner the install reaches `claude` on PATH — and the test wall answers 97 (in-28b)", () => {
+    // The injected claudeCli is the ONLY road to the binary; this run leaves it unset so
+    // runInstall's production default (spawnSync "claude") executes. Under the global test
+    // wall that spawn is the refusing stub — exit 97, never the real binary — and the throw
+    // it causes is what this test pins. A pass here means: had any earlier test forgotten to
+    // inject, it would have hit the same stub and failed loudly.
+    const settings = join(dir(), "settings.json")
+    const home = new MidaHome(midaHome())
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "claude-code"], {
+        print: (line) => lines.push(line),
+        claudeSettings: settings,
+        codexConfig: join(dir(), "config.toml"),
+        home,
+        claudeUserConfig: join(dir(), ".claude.json"),
+      }),
+    ).toBe(1)
+    // hooks still landed — the refusal is about the server entry only
+    expect(claudeHooksStatus(settings)).toBe("installed")
+    expect(lines).toContain("refused: UNEXPECTED")
+  })
+
   it("--no-mcp never reaches for the claude binary at all", () => {
     const settings = join(dir(), "settings.json")
     const home = new MidaHome(midaHome())
