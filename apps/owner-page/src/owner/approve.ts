@@ -1,5 +1,5 @@
 import { el, parsePageLink, assertRpGate, makeEnv, progressLine, showEntriesToSign, showError, showSummaryLines, finish } from "./page.js"
-import { prepareApprove, confirmApprove, signableProjectRows } from "./flows.js"
+import { prepareApprove, confirmApprove, failure, signableProjectRows } from "./flows.js"
 import { approveSummaryLines } from "./summary.js"
 import { describeError } from "./session.js"
 
@@ -54,6 +54,10 @@ async function main(): Promise<void> {
     })
   } catch (error) {
     showError(describeError(error))
+    // A refusal before signing used to leave mida approve waiting out its ten-minute
+    // timeout (in-37, review 3.3): when the link carries a return port, the terminal gets
+    // the same failed result the confirm path builds — it prints the reason at once.
+    if (link.port !== undefined) finish(link, failure(link, link.req.owner ?? null, error, []))
   }
 }
 

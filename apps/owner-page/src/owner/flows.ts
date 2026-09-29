@@ -754,7 +754,8 @@ export async function repairReaderWraps(
 
 // ---------------------------------------------------------------------------
 
-function failure(
+/** The result every failure path hands back — exported so a pre-sign refusal can return too (in-37). */
+export function failure(
   link: ParsedLink,
   owner: Address | null,
   error: unknown,
