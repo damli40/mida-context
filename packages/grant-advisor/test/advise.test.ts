@@ -166,6 +166,20 @@ describe("narrowing (§14.3, §15 Advisor rows)", () => {
     expect(codes(undeclared)).toContain("PROVENANCE_POLICY_NARROWED")
   })
 
+  it("a refused write raises PERMISSION_NARROWED alone — the provenance collapse is the same cause (in-32 X-3)", async () => {
+    // goals.career declared READ-only with ALLOW_INFERENCE; asking READ|CREATE + inference loses
+    // the write bit, which forces provenancePolicy to 0 as a CONSEQUENCE — one cause, one warning.
+    const body = manifestBody({
+      scopeDeclarations: [
+        { purposeId: "career_coaching", namespace: "goals.career", permissions: ["READ"], provenancePolicies: ["ALLOW_INFERENCE"], reason: "Read goals" },
+      ],
+    })
+    const advice = await advise([{ namespace: "goals.career", permissions: 3, provenancePolicy: 1 }], { body })
+    expect(advice.recommended).toEqual([exact("goals.career", 1)])
+    expect(codes(advice)).toContain("PERMISSION_NARROWED")
+    expect(codes(advice)).not.toContain("PROVENANCE_POLICY_NARROWED")
+  })
+
   it("excludes imported and external-attestation provenance by default", async () => {
     const body = manifestBody({
       scopeDeclarations: [

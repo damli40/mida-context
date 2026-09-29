@@ -216,7 +216,12 @@ export function adviseGrant(input: GrantAdvisorInput): GrantAdvice {
         ? 0
         : scope.provenancePolicy & rule.provenancePolicy & declaration.provenancePolicy & ~ELEVATED_PROVENANCE_BITS
     if (permissions !== scope.permissions) warnings.push(warning("PERMISSION_NARROWED", id))
-    if (provenancePolicy !== scope.provenancePolicy) warnings.push(warning("PROVENANCE_POLICY_NARROWED", id))
+    // A write bit that survives narrowing is what keeps provenance meaningful — when the write
+    // itself was refused, provenance falls to 0 as a consequence, and PERMISSION_NARROWED alone
+    // explains it. A second warning would blame a second cause that does not exist (in-32 X-3).
+    if ((permissions & WRITE_PERMISSION_BITS) !== 0 && provenancePolicy !== scope.provenancePolicy) {
+      warnings.push(warning("PROVENANCE_POLICY_NARROWED", id))
+    }
     if (permissions === 0) continue
     recommended.push({ namespaceId: id, permissions, provenancePolicy })
     strictest = strictest === undefined ? sensitivity : stricterSensitivity(strictest, sensitivity)
