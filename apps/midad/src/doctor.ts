@@ -16,7 +16,7 @@ import type { LocalAccount } from "viem"
 import { RESUBMIT_LANE_CLOSED, batchClient, batchStatusProbe, decideLane, pendingAnchors, pendingPlaintextPath, rejectedAnchors } from "./batching.js"
 import type { Lane, PendingAnchor } from "./batching.js"
 import { laneWhyText, resubmitStuckText } from "./batching.js"
-import { callDaemon, socketPathFor } from "./control.js"
+import { callDaemon } from "./control.js"
 import { codeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
 import { DEVIN_NODE_SQLITE_MIN } from "./devin-facts.js"
@@ -391,28 +391,34 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         }
         shared.serviceUp = reply.status !== 0
         if (reply.status === 0) {
-          // The lock pid decides what "not answering" means — but the pid alone is never proof:
-          // a dead Mida's number is recycled, so only a pid the verdict proves still held by its
-          // writer may be named or killed here (in-39 B-1, in-40 L-1). A live recycled pid is a
-          // stale lock left by an unclean exit; a live pid ps could not identify is never called
-          // Mida either — and never suggested as a kill target.
+          // The lock's own record decides what "not answering" means (in-40 L-2): the writer's
+          // start time proves the pid is still the process that took the lock, and its role says
+          // which kind of Mida it is. Only the service line may name `kill` — a recycled number
+          // belongs to a stranger, and a pid ps cannot read is never a kill target.
           const holder = lockHolder(home, deps.ps)
-          if (holder !== undefined && holder.kind === "held" && (existsSync(socketPathFor(home)) || home.has("api-url.json"))) {
+          if (holder !== undefined && holder.kind === "held") {
+            if (holder.role === "service") {
+              return [
+                `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with kill ${holder.pid}, then open any agent session or run mida task to start a fresh one.`,
+              ]
+            }
+            if (holder.role === "save-helper") {
+              return [
+                `PROBLEM: the Mida service is not running, and Mida's save helper (pid ${holder.pid}) holds this home until it finishes, usually within a minute. Then open any agent session or run mida task.`,
+              ]
+            }
             return [
-              `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with kill ${holder.pid}, then open any agent session or run mida task to start a fresh one.`,
+              `PROBLEM: the Mida service is not running, and a mida command (pid ${holder.pid}) holds this home until it finishes. Finish or cancel that command, then open any agent session or run mida task.`,
             ]
           }
           if (holder !== undefined && holder.kind === "recycled") {
             return [
-              `PROBLEM: midad.lock names pid ${holder.pid}, which is not a Mida service, so the last Mida service did not exit cleanly. Open any agent session or run mida task; the new service clears the stale lock.`,
+              `PROBLEM: midad.lock names pid ${holder.pid}, which is no longer the Mida process that took the lock, so the last Mida service did not exit cleanly. Open any agent session or run mida task; the new service clears the stale lock.`,
             ]
           }
           if (holder !== undefined && holder.kind === "unknown") {
             return [
-              problem(
-                `midad.lock names pid ${holder.pid}, which doctor could not identify — it may still be the Mida service`,
-                "do not kill it on doctor's word; open any agent session or run `mida task`, then re-check",
-              ),
+              `PROBLEM: midad.lock names pid ${holder.pid}, and doctor cannot tell whether that process is still Mida. Run ps -p ${holder.pid} -o command= to see what it is. If it is not Mida, delete ${home.path("midad.lock")}, then open any agent session or run mida task.`,
             ]
           }
           return [problem("midad is not answering", "start the daemon")]

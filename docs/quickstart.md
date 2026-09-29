@@ -632,9 +632,17 @@ the handoff, and the next session asks again. If it keeps happening, run `mida d
 The service is either busy or lost its socket file. Run `mida doctor` again in a minute; if the line is still there,
 run `kill <pid>`. The next agent session, or `mida task`, starts a fresh service, which sends the saves still waiting in the queue.
 
-**`mida doctor`: "PROBLEM: midad.lock names pid <pid>, which is not a Mida service".**
-The last Mida service did not exit cleanly and another program now has its process number. Open any agent session or
-run `mida task`; the new service clears the stale lock. Do not kill that pid: it is not Mida.
+**`mida doctor`: "PROBLEM: midad.lock names pid <pid>, which is no longer the Mida process that took the lock".**
+The last Mida service did not exit cleanly, and another program now has its process number. Open any agent session or
+run `mida task`; the new service clears the stale lock. Do not kill that pid: it belongs to another program now.
+
+**`mida doctor`: "PROBLEM: the Mida service is not running, and a mida command (pid <pid>) holds this home".**
+Another terminal is running a `mida` command, often one waiting for you to type yes. Finish or cancel it; the next
+agent session, or `mida task`, then starts the service.
+
+**`mida doctor`: "PROBLEM: midad.lock names pid <pid>, and doctor cannot tell whether that process is still Mida".**
+Doctor could not read this machine's process list. Run `ps -p <pid> -o command=`. If the command is not Mida, delete
+the `midad.lock` file doctor names, then open any agent session or run `mida task`.
 
 **`mida doctor`: "midad runs … @ <old commit>; this command runs … @ <new commit>".**
 The Mida service is still the old version after an update. Run any `mida` command; it replaces the service.

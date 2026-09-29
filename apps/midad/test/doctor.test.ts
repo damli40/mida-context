@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest"
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
@@ -125,11 +125,72 @@ describe("mida doctor without a chain", () => {
     const lines: string[] = []
     const code = await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
     expect(lines).toContain(
-      `PROBLEM: midad.lock names pid ${holder.pid}, which is not a Mida service, so the last Mida service did not exit cleanly. Open any agent session or run mida task; the new service clears the stale lock.`,
+      `PROBLEM: midad.lock names pid ${holder.pid}, which is no longer the Mida process that took the lock, so the last Mida service did not exit cleanly. Open any agent session or run mida task; the new service clears the stale lock.`,
     )
     // never named as the service, never a kill target
     expect(lines.some((line) => line.includes("is running but has not answered"))).toBe(false)
     expect(lines.some((line) => line.includes(`kill ${holder.pid}`))).toBe(false)
+    expect(code).toBeGreaterThan(0)
+  })
+
+  it("a lock held by a live mida command names the command, never kill (in-40 L-2)", async () => {
+    // A `mida` owner command holds midad.lock while it runs — often waiting on a typed yes. The
+    // lock's own role says so; doctor asks the owner to finish or cancel it, never to kill it.
+    const home = new MidaHome(join(dir(), "home"))
+    const holder = spawnHolder("foreign")
+    const started = spawnSync("ps", ["-o", "lstart=", "-p", String(holder.pid)], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+    }).stdout.trim()
+    home.writeSecretJson("midad.lock", { pid: holder.pid, started, role: "command" })
+    const lines: string[] = []
+    const code = await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    expect(lines).toContain(
+      `PROBLEM: the Mida service is not running, and a mida command (pid ${holder.pid}) holds this home until it finishes. Finish or cancel that command, then open any agent session or run mida task.`,
+    )
+    expect(lines.some((line) => line.includes("kill"))).toBe(false)
+    expect(code).toBeGreaterThan(0)
+  })
+
+  it("a lock held by the save helper says it finishes on its own, never kill (in-40 L-2)", async () => {
+    // The detached drainer holds the home for a save pass. Doctor tells the owner to wait it
+    // out — a kill hint would have them shooting a helper mid-save.
+    const home = new MidaHome(join(dir(), "home"))
+    const holder = spawnHolder("foreign")
+    const started = spawnSync("ps", ["-o", "lstart=", "-p", String(holder.pid)], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+    }).stdout.trim()
+    home.writeSecretJson("midad.lock", { pid: holder.pid, started, role: "save-helper" })
+    const lines: string[] = []
+    const code = await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    expect(lines).toContain(
+      `PROBLEM: the Mida service is not running, and Mida's save helper (pid ${holder.pid}) holds this home until it finishes, usually within a minute. Then open any agent session or run mida task.`,
+    )
+    expect(lines.some((line) => line.includes("kill"))).toBe(false)
+    expect(code).toBeGreaterThan(0)
+  })
+
+  it("a lock pid ps cannot read is unknown — doctor names the lock file, never kill (in-40 L-2)", async () => {
+    // A machine where ps answers nothing (BusyBox has no -p, Windows has no ps) must not get a
+    // kill hint or a stale-lock verdict: doctor says what it could not tell and names the file
+    // the owner would remove once they have checked the pid themselves.
+    const home = new MidaHome(join(dir(), "home"))
+    const holder = spawnHolder("foreign")
+    home.writeSecretJson("midad.lock", { pid: holder.pid, started: "Thu Jan  1 00:00:00 1970", role: "service" })
+    const lines: string[] = []
+    const code = await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      ps: () => undefined,
+    })
+    expect(lines).toContain(
+      `PROBLEM: midad.lock names pid ${holder.pid}, and doctor cannot tell whether that process is still Mida. Run ps -p ${holder.pid} -o command= to see what it is. If it is not Mida, delete ${home.path("midad.lock")}, then open any agent session or run mida task.`,
+    )
+    expect(lines.some((line) => line.includes("kill"))).toBe(false)
     expect(code).toBeGreaterThan(0)
   })
 
