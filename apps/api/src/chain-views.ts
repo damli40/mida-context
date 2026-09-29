@@ -51,6 +51,35 @@ const lower = <T extends string>(value: T) => value.toLowerCase() as T
 export const RECORDS_PER_MULTICALL = 200
 
 /**
+ * Successful Multicall3 `getCode` probes shared by every reader in the process (in-38 V-3): the
+ * daemon builds a reader per operation, so a per-reader cache re-probed the chain on every one.
+ * Keyed by chain id and the Multicall3 address; `size` is set the moment the probe answers so a
+ * later reader can expose the known size synchronously. Only a SUCCESS is ever kept — a rejected
+ * probe is evicted, so the next reader asks the chain again rather than inheriting "no Multicall3"
+ * from one flaky RPC call.
+ */
+const multicall3Probes = new Map<string, { size: number | undefined; probe: Promise<number> }>()
+
+function multicall3ProbeEntry(context: ChainContext): { size: number | undefined; probe: Promise<number> } {
+  const key = `${context.deployment.chainId}:${MULTICALL3_ADDRESS}`
+  const held = multicall3Probes.get(key)
+  if (held !== undefined) return held
+  const entry = {
+    size: undefined as number | undefined,
+    // Promise.resolve().then(...) so a client without getCode — a custom transport, a test rig —
+    // throws INSIDE the chain and lands on the same eviction as an RPC that refuses the call.
+    probe: Promise.resolve()
+      .then(() => context.publicClient.getCode({ address: MULTICALL3_ADDRESS }))
+      .then((code) => (entry.size = code === undefined || code === "0x" ? 1 : RECORDS_PER_MULTICALL)),
+  }
+  entry.probe.catch(() => {
+    if (multicall3Probes.get(key) === entry) multicall3Probes.delete(key)
+  })
+  multicall3Probes.set(key, entry)
+  return entry
+}
+
+/**
  * Every Monad read the Context API and SDK make. Nothing here is cached: each call reads current chain state, so no
  * local value can make Monad authorization true (§12, `currentlyAllowedByMonad`).
  */
@@ -62,26 +91,24 @@ export class RegistryReader {
 
   /**
    * The probed batch size once known, undefined while unprobed. Lets a BudgetedReader return a
-   * cached answer without charging the request for a chain read that does not happen.
+   * cached answer without charging the request for a chain read that does not happen — including
+   * when another reader in this process already ran the probe (in-38 V-3).
    */
   get knownRecordBatchSize(): number | undefined {
-    return this.#recordBatchSize
+    return this.#recordBatchSize ?? multicall3ProbeEntry(this.context).size
   }
 
   /**
    * The most contextIds one `getRecords` call answers in a single chain read: RECORDS_PER_MULTICALL
-   * when the chain carries Multicall3, 1 where it does not. Probed once per reader with `getCode`
-   * and cached; a chain that cannot answer the probe cannot run a multicall either, so a failed
-   * probe also resolves to 1 — the per-row path — rather than breaking reads on an RPC that does
-   * not serve `eth_getCode`.
+   * when the chain carries Multicall3, 1 where it does not. Probed once per PROCESS with `getCode`
+   * — see `multicall3Probes` — and cached per reader once answered; a chain that cannot answer the
+   * probe cannot run a multicall either, so a failed probe resolves to 1 — the per-row path —
+   * rather than breaking reads on an RPC that does not serve `eth_getCode`.
    */
   recordBatchSize(): Promise<number> {
     if (this.#recordBatchSize !== undefined) return Promise.resolve(this.#recordBatchSize)
-    // Promise.resolve().then(...) so a client without getCode — a custom transport, a test rig —
-    // throws INSIDE the chain and lands on the same fallback as an RPC that refuses the call.
-    this.#recordBatchSizeProbe ??= Promise.resolve()
-      .then(() => this.context.publicClient.getCode({ address: MULTICALL3_ADDRESS }))
-      .then((code) => (this.#recordBatchSize = code === undefined || code === "0x" ? 1 : RECORDS_PER_MULTICALL))
+    this.#recordBatchSizeProbe ??= multicall3ProbeEntry(this.context).probe
+      .then((size) => (this.#recordBatchSize = size))
       .catch(() => (this.#recordBatchSize = 1))
     return this.#recordBatchSizeProbe
   }
@@ -162,46 +189,57 @@ export class RegistryReader {
   }
 
   /**
-   * `getRecord` for a batch of contextIds. With Multicall3 the batch is ONE `eth_call` — hundreds of
-   * never-anchored uploads can no longer spend a request's read budget a row at a time. The
-   * `ContextNotFound` revert of an orphaned upload comes back as a null entry — "not anchored",
-   * never an error — and it is the ONLY failure that does: an out-of-gas, an undecodable result or
-   * any other revert throws exactly as `getRecord` throws, so a caller can never read a list that
-   * silently dropped a real record. Chains without Multicall3 fall back to one `getRecord` per id,
-   * unchanged.
-   * Callers pass at most `recordBatchSize()` ids per call, so each call costs exactly one unit of
-   * read budget — or `contextIds.length` units on the per-row path, identical to `getRecord`.
+   * `getRecord` for a batch of contextIds. With Multicall3 each `recordBatchSize()`-sized chunk of
+   * the ids is ONE `eth_call` — hundreds of never-anchored uploads can no longer spend a request's
+   * read budget a row at a time. The `ContextNotFound` revert of an orphaned upload comes back as
+   * a null entry — "not anchored", never an error — and it is the ONLY failure that does: an
+   * out-of-gas, an undecodable result or any other revert throws exactly as `getRecord` throws, so
+   * a caller can never read a list that silently dropped a real record. Chains without Multicall3
+   * fall back to one `getRecord` per id, unchanged.
+   * Chunks run in order and a failing chunk fails the whole call. Callers that pass more than
+   * `recordBatchSize()` ids pay one aggregate call per chunk — the budgeted wrapper slices to the
+   * batch size itself, so inside a request each call still costs exactly one unit of read budget
+   * (or `contextIds.length` units on the per-row path, identical to `getRecord`).
    */
   async getRecords(contextIds: readonly Hex[]): Promise<(ContextRecordView | null)[]> {
     if (contextIds.length === 0) return []
-    if ((await this.recordBatchSize()) === 1) {
+    const batchSize = await this.recordBatchSize()
+    if (batchSize === 1) {
       return Promise.all(contextIds.map((contextId) => this.getRecord(contextId)))
     }
-    const results = await this.context.publicClient.multicall({
-      // batchSize 0 disables viem's calldata chunking (default 1024 bytes): the whole batch is a
-      // single aggregate3 eth_call, which is what one unit of read budget pays for.
-      batchSize: 0,
-      multicallAddress: MULTICALL3_ADDRESS,
-      allowFailure: true,
-      contracts: contextIds.map((contextId) => ({
-        address: this.context.deployment.contextRegistry,
-        abi: contextRegistryAbi,
-        functionName: "getRecord",
-        args: [contextId],
-      })),
-    })
-    return results.map((entry) => {
-      if (entry.status === "success") {
-        const record = entry.result as unknown as ContextRecordView
-        return { ...record, owner: lower(record.owner) }
+    const records: (ContextRecordView | null)[] = []
+    for (let offset = 0; offset < contextIds.length; offset += batchSize) {
+      const results = await this.context.publicClient.multicall({
+        // batchSize 0 disables viem's calldata chunking (default 1024 bytes): the whole batch is a
+        // single aggregate3 eth_call, which is what one unit of read budget pays for.
+        batchSize: 0,
+        multicallAddress: MULTICALL3_ADDRESS,
+        allowFailure: true,
+        contracts: contextIds.slice(offset, offset + batchSize).map((contextId) => ({
+          address: this.context.deployment.contextRegistry,
+          abi: contextRegistryAbi,
+          functionName: "getRecord",
+          args: [contextId],
+        })),
+      })
+      for (const entry of results) {
+        if (entry.status === "success") {
+          const record = entry.result as unknown as ContextRecordView
+          records.push({ ...record, owner: lower(record.owner) })
+          continue
+        }
+        // ContextNotFound is the one failure that means "not anchored". Anything else — an unknown
+        // selector, an empty out-of-gas revert, a decode failure — fails the request the same way a
+        // single `getRecord` would, never returning a shortened list.
+        const mapped = toMidaError(entry.error)
+        if (isMidaError(mapped, "NOT_FOUND")) {
+          records.push(null)
+          continue
+        }
+        throw mapped
       }
-      // ContextNotFound is the one failure that means "not anchored". Anything else — an unknown
-      // selector, an empty out-of-gas revert, a decode failure — fails the request the same way a
-      // single `getRecord` would, never returning a shortened list.
-      const mapped = toMidaError(entry.error)
-      if (isMidaError(mapped, "NOT_FOUND")) return null
-      throw mapped
-    })
+    }
+    return records
   }
 
   async #capability<T>(functionName: string, args: readonly unknown[]): Promise<T> {

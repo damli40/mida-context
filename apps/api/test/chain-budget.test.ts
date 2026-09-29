@@ -19,7 +19,7 @@ import { contentHash } from "@mida/storage"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { contextRegistryAbi } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
-import { BudgetedReader, ChainReadBudgetExceeded, ContextApiClient, MAX_CHAIN_READS_PER_REQUEST, RegistryReader, createContextApi } from "@mida/api"
+import { BudgetedReader, ChainReadBudgetExceeded, ContextApiClient, MAX_CHAIN_READS_PER_REQUEST, RECORDS_PER_MULTICALL, RegistryReader, createContextApi } from "@mida/api"
 import type { AnchoredObject, ContextRecordView, ObjectUploadBody, StoreLimits, StoredObject } from "@mida/api"
 
 const deployment: Deployment = {
@@ -442,6 +442,61 @@ describe("a batched getRecords anchor check", () => {
       client.request("GET", `/objects?owner=${owner}&namespaceId=${NAMESPACE}`),
     ).rejects.toMatchObject({ code: "INTERNAL_ERROR" })
     expect(last!.status).toBe(500)
+  })
+})
+
+describe("in-38 V-3: getRecords chunks and the Multicall3 probe is shared process-wide", () => {
+  it("splits 450 ids into one aggregate call per 200-id chunk, results in the original order", async () => {
+    const ids = Array.from({ length: 450 }, (_, index) => `0x${String(index + 1).padStart(64, "0")}` as Hex)
+    const chunks: Hex[][] = []
+    const template = anchoredRecord(upload(randomBytes(4)))
+    const publicClient = {
+      getCode: async () => "0x6001",
+      multicall: async (args: { contracts: { args: readonly [Hex] }[] }) => {
+        chunks.push(args.contracts.map((contract) => contract.args[0]))
+        return args.contracts.map((contract) => ({ status: "success", result: { ...template, contextId: contract.args[0] } }))
+      },
+    } as unknown as PublicClient
+    const reader = new RegistryReader({ deployment: { ...deployment, chainId: 999_001n }, publicClient })
+    const records = await reader.getRecords(ids)
+    expect(chunks.map((chunk) => chunk.length)).toEqual([200, 200, 50])
+    expect(chunks.flat()).toEqual(ids)
+    expect(records.map((record) => record?.contextId)).toEqual(ids)
+  })
+
+  it("probes Multicall3 once per process per chain — a second reader reuses the answer", async () => {
+    let probes = 0
+    const publicClient = {
+      getCode: async () => {
+        probes += 1
+        return "0x6001"
+      },
+    } as unknown as PublicClient
+    const chainDeployment = { ...deployment, chainId: 999_002n }
+    const first = new RegistryReader({ deployment: chainDeployment, publicClient })
+    const second = new RegistryReader({ deployment: chainDeployment, publicClient })
+    expect(await first.recordBatchSize()).toBe(RECORDS_PER_MULTICALL)
+    expect(await second.recordBatchSize()).toBe(RECORDS_PER_MULTICALL)
+    expect(probes).toBe(1)
+  })
+
+  it("does not cache a failed probe — the next reader asks again, then shares its success", async () => {
+    let probes = 0
+    const publicClient = {
+      getCode: async () => {
+        probes += 1
+        if (probes === 1) throw new Error("rpc refused getCode")
+        return "0x6001"
+      },
+    } as unknown as PublicClient
+    const chainDeployment = { ...deployment, chainId: 999_003n }
+    const first = new RegistryReader({ deployment: chainDeployment, publicClient })
+    const second = new RegistryReader({ deployment: chainDeployment, publicClient })
+    const third = new RegistryReader({ deployment: chainDeployment, publicClient })
+    expect(await first.recordBatchSize()).toBe(1) // this reader falls back to per-row, as before
+    expect(await second.recordBatchSize()).toBe(RECORDS_PER_MULTICALL) // the process retried, not inherited the failure
+    expect(await third.recordBatchSize()).toBe(RECORDS_PER_MULTICALL) // and the retried success is shared
+    expect(probes).toBe(2)
   })
 })
 
