@@ -781,6 +781,23 @@ describe("loadMe — agent names", () => {
     expect(agent!.name).toBe("0xaaaa…aaaa")
     expect(agent!.name.length).toBeGreaterThan(0)
   })
+
+  it("a refused manifest name reads 'an agent with an unreadable name' — /me runs the check itself (in-31 V-4)", async () => {
+    // The store's own manifest check can sit inside its cache, so a refused name CAN reach
+    // the page. A bidi control inside it would let the name forge or hide part of a rendered
+    // line — the page swaps it for the fallback before it is shown, on the agent list and on
+    // a record's author line alike.
+    const { state, ports } = world()
+    state.manifests.set(MANIFEST_HASH.toLowerCase(), {
+      ...AGENT_MANIFEST,
+      manifest: { ...AGENT_MANIFEST.manifest, name: `hel${String.fromCharCode(0x202a)}per` },
+    })
+    const { item, contextId } = await makeBatchedItem({ anchored: false })
+    state.batched.set(NS, [item])
+    const data = await loadMe(OWNER, ports)
+    expect(data.agents.find((a) => a.agentId === AGENT_ID)!.name).toBe("an agent with an unreadable name")
+    expect(data.records.find((r) => r.contextId === contextId)!.authorName).toBe("an agent with an unreadable name")
+  })
 })
 
 describe("loadMe — a grant row is only live when the chain's capability agrees", () => {

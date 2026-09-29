@@ -21,6 +21,7 @@ import { recoverTypedDataAddress, zeroHash } from "viem"
 import {
   PERMISSION,
   PROVENANCE_POLICY,
+  UNACCEPTABLE_REQUEST_CHARS,
   batchLeafHash,
   batchSaveStructHash,
   batchSaveTypedData,
@@ -674,7 +675,12 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
         if (hash !== undefined) {
           const manifest = await safe(() => ports.store.getAgentManifest(hash))
           const name = manifest?.manifest?.name
-          if (typeof name === "string" && name.length > 0) return name
+          // The store's manifest check can sit inside its verification cache, so /me runs the
+          // same check itself (in-31 V-4): a refused name — one carrying a line-forging or
+          // invisible character — is shown as unreadable, never rendered.
+          if (typeof name === "string" && name.length > 0) {
+            return UNACCEPTABLE_REQUEST_CHARS.test(name) ? "an agent with an unreadable name" : name
+          }
         }
         return shortId(agentId)
       })()
