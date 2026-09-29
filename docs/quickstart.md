@@ -111,6 +111,8 @@ Codex will ignore these hooks until you trust them: open codex, type /hooks, and
 
 (`mida install claude-code` is the same shape; it prints just `installed` because Claude Code needs no trust step.)
 
+`mida install` also adds Mida's MCP server, so the agent can ask for context mid-session (`mida_handoff`, `mida_whats_new`, `mida_read`); `--no-mcp` skips it.
+
 *Status: NOT RUN — it edits `~/.codex/config.toml`, which I did not want to touch on this machine. The managed-block format and idempotent re-install are covered by `apps/midad/test/install.test.ts`.*
 
 ## 5. Trust the hooks — NOT RUN
