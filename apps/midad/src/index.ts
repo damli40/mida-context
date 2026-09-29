@@ -121,7 +121,9 @@ export {
   devinHooksStatus,
   hookCommand,
   injectCommand,
+  claudeCodeMcpJson,
   installClaudeCode,
+  installClaudeCodeMcp,
   installCodex,
   installDevin,
   installMcpClient,
@@ -132,12 +134,14 @@ export {
   midaCommandsInCodexConfig,
   midaCommandsInDevinConfig,
   parseMidaCommand,
+  spawnClaude,
   uninstallClaudeCode,
+  uninstallClaudeCodeMcp,
   uninstallCodex,
   uninstallDevin,
   uninstallMcpClient,
 } from "./install.js"
-export type { InstallOutcome, InstallTool, McpClientTool, UninstallOutcome } from "./install.js"
+export type { ClaudeCliResult, ClaudeCliRunner, InstallOutcome, InstallTool, McpClientTool, UninstallOutcome } from "./install.js"
 export {
   DEVIN_DB_SCHEMA,
   DEVIN_EVENTS,

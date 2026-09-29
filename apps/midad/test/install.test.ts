@@ -957,6 +957,150 @@ describe("the codex MCP server inside the managed block (in-28)", () => {
   })
 })
 
+describe("the claude-code MCP server through the claude CLI (in-28)", () => {
+  const midaHome = () => join(dir(), "mida-home")
+
+  /** Deps for a runInstall claude-code round trip — the claude binary is ALWAYS injected. */
+  const claudeDeps = (
+    settings: string,
+    home: MidaHome,
+    lines: string[],
+    run: (args: string[]) => { status: number | null; error?: Error },
+    userConfig = join(dir(), ".claude.json"),
+  ) => ({
+    print: (line: string) => lines.push(line),
+    claudeSettings: settings,
+    codexConfig: join(dir(), "config.toml"),
+    home,
+    claudeUserConfig: userConfig,
+    claudeCli: run,
+  })
+
+  const ENOENT = () => ({ status: null, error: Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" }) })
+
+  it("install spawns `claude mcp add-json --scope user mida` with the launcher's JSON — no --project", () => {
+    const settings = join(dir(), "settings.json")
+    const userConfig = join(dir(), ".claude.json")
+    const home = new MidaHome(midaHome())
+    const calls: string[][] = []
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "claude-code"], claudeDeps(settings, home, lines, (args) => (calls.push(args), { status: 0 }), userConfig)),
+    ).toBe(0)
+    expect(claudeHooksStatus(settings)).toBe("installed")
+    expect(calls).toHaveLength(1)
+    const [verb, sub, scope, scopeName, name, json] = calls[0]!
+    expect([verb, sub, scope, scopeName, name]).toEqual(["mcp", "add-json", "--scope", "user", "mida"])
+    const entry = JSON.parse(json!) as { command: string; args: string[]; env: { MIDA_HOME: string } }
+    expect(entry.command).toBe(mcpLauncherPath())
+    expect(entry.args).toEqual(["--as", "claude-code"])
+    expect(entry.env.MIDA_HOME).toBe(home.root)
+    // no --project anywhere: the session's own folder is the project
+    expect(entry.args).not.toContain("--project")
+  })
+
+  it("a claude binary missing from PATH prints the exact note and the install still succeeds", () => {
+    const settings = join(dir(), "settings.json")
+    const home = new MidaHome(midaHome())
+    const lines: string[] = []
+    expect(runInstall(["install", "claude-code"], claudeDeps(settings, home, lines, () => ENOENT()))).toBe(0)
+    expect(claudeHooksStatus(settings)).toBe("installed")
+    expect(lines).toContain(
+      "claude-code: MCP server not added. The claude command is not on your PATH; hooks are installed.",
+    )
+  })
+
+  it("--no-mcp never reaches for the claude binary at all", () => {
+    const settings = join(dir(), "settings.json")
+    const home = new MidaHome(midaHome())
+    const calls: string[][] = []
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "claude-code", "--no-mcp"], claudeDeps(settings, home, lines, (args) => (calls.push(args), { status: 0 }))),
+    ).toBe(0)
+    expect(claudeHooksStatus(settings)).toBe("installed")
+    expect(calls).toHaveLength(0)
+  })
+
+  it("an identical entry already in ~/.claude.json short-circuits — no CLI call", () => {
+    const settings = join(dir(), "settings.json")
+    const userConfig = join(dir(), ".claude.json")
+    const home = new MidaHome(midaHome())
+    writeFileSync(userConfig, JSON.stringify({
+      mcpServers: {
+        mida: { command: mcpLauncherPath(), args: ["--as", "claude-code"], env: { MIDA_HOME: home.root } },
+      },
+    }))
+    const calls: string[][] = []
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "claude-code"], claudeDeps(settings, home, lines, (args) => (calls.push(args), { status: 0 }), userConfig)),
+    ).toBe(0)
+    expect(calls).toHaveLength(0)
+  })
+
+  it("a foreign mida entry in ~/.claude.json refuses the install — never overwritten", () => {
+    const settings = join(dir(), "settings.json")
+    const userConfig = join(dir(), ".claude.json")
+    const home = new MidaHome(midaHome())
+    const foreign = { command: "/usr/bin/other-server", args: ["--serve"], env: {} }
+    writeFileSync(userConfig, JSON.stringify({ mcpServers: { mida: foreign } }))
+    const calls: string[][] = []
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "claude-code"], claudeDeps(settings, home, lines, (args) => (calls.push(args), { status: 0 }), userConfig)),
+    ).toBe(1)
+    // the hooks still landed — the refusal is about the server entry only
+    expect(claudeHooksStatus(settings)).toBe("installed")
+    expect(calls).toHaveLength(0)
+    expect(readFileSync(userConfig, "utf8")).toBe(JSON.stringify({ mcpServers: { mida: foreign } }))
+  })
+
+  it("uninstall spawns `claude mcp remove --scope user mida` — only when the entry is ours", () => {
+    const settings = join(dir(), "settings.json")
+    const userConfig = join(dir(), ".claude.json")
+    const home = new MidaHome(midaHome())
+    writeFileSync(userConfig, JSON.stringify({
+      mcpServers: {
+        mida: { command: mcpLauncherPath(), args: ["--as", "claude-code"], env: { MIDA_HOME: home.root } },
+        other: { command: "/usr/bin/other" },
+      },
+    }))
+    const calls: string[][] = []
+    const lines: string[] = []
+    expect(
+      runInstall(["uninstall", "claude-code"], claudeDeps(settings, home, lines, (args) => (calls.push(args), { status: 0 }), userConfig)),
+    ).toBe(0)
+    expect(calls).toEqual([["mcp", "remove", "--scope", "user", "mida"]])
+  })
+
+  it("uninstall never removes a foreign mida entry — the CLI is not even called", () => {
+    const settings = join(dir(), "settings.json")
+    const userConfig = join(dir(), ".claude.json")
+    const home = new MidaHome(midaHome())
+    const foreign = { command: "/usr/bin/other-server", args: ["--serve"] }
+    writeFileSync(userConfig, JSON.stringify({ mcpServers: { mida: foreign } }))
+    const calls: string[][] = []
+    const lines: string[] = []
+    expect(
+      runInstall(["uninstall", "claude-code"], claudeDeps(settings, home, lines, (args) => (calls.push(args), { status: 0 }), userConfig)),
+    ).toBe(0)
+    expect(calls).toHaveLength(0)
+    expect(readFileSync(userConfig, "utf8")).toBe(JSON.stringify({ mcpServers: { mida: foreign } }))
+  })
+
+  it("uninstall with no mida entry makes no CLI call — not-installed is honest", () => {
+    const settings = join(dir(), "settings.json")
+    const home = new MidaHome(midaHome())
+    const calls: string[][] = []
+    const lines: string[] = []
+    expect(
+      runInstall(["uninstall", "claude-code"], claudeDeps(settings, home, lines, (args) => (calls.push(args), { status: 0 }))),
+    ).toBe(0)
+    expect(calls).toHaveLength(0)
+  })
+})
+
 describe("the Codex trust reminder", () => {
   it("the sentence is the exact line the tools' docs describe", () => {
     expect(CODEX_TRUST_SENTENCE).toBe(

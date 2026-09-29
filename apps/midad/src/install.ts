@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process"
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, sep } from "node:path"
 import { randomBytes } from "node:crypto"
@@ -99,7 +100,7 @@ function readMcpConfig(configPath: string): { text: string; config: Record<strin
  * shares the mida-<client> name but was written by anything else (or points at another home)
  * is the user's server, and neither install nor uninstall may touch it.
  */
-function isMidaServerEntry(value: unknown, client: McpClientTool, homeRoot: string | undefined): boolean {
+function isMidaServerEntry(value: unknown, client: string, homeRoot: string | undefined): boolean {
   if (!isPlainObject(value)) return false
   const args = value.args
   if (!Array.isArray(args) || args[0] !== "--as" || args[1] !== client) return false
@@ -176,6 +177,97 @@ export function installedMcpLauncherPath(client: McpClientTool, configPath: stri
   const entry = ((read.config.mcpServers ?? {}) as Record<string, unknown>)[MCP_SERVER_NAME[client]]
   if (!isMidaServerEntry(entry, client, homeRoot)) return undefined
   return isPlainObject(entry) && typeof entry.command === "string" ? entry.command : undefined
+}
+
+/**
+ * What a spawned `claude` answers — injectable so tests never touch a real binary. `status`
+ * is null with `error.code === "ENOENT"` when the command is not on PATH.
+ */
+export type ClaudeCliResult = { status: number | null; error?: Error | undefined }
+export type ClaudeCliRunner = (args: string[]) => ClaudeCliResult
+
+/** The default runner — the real `claude` on PATH, inheriting this process's stdio. */
+export const spawnClaude: ClaudeCliRunner = (args) => spawnSync("claude", args, { stdio: "inherit" })
+
+/** spawnSync's ENOENT — the claude binary is not on this PATH. */
+const claudeUnavailable = (result: ClaudeCliResult): boolean =>
+  result.status === null && (result.error as { code?: string } | undefined)?.code === "ENOENT"
+
+/**
+ * The JSON `claude mcp add-json` takes — the same entry the file-config clients get (absolute
+ * launcher, this tool's --as identity, MIDA_HOME), with NO --project: the folder the agent
+ * session runs in is the project.
+ */
+export function claudeCodeMcpJson(homeRoot: string): string {
+  return JSON.stringify({
+    command: mcpLauncherPath(),
+    args: ["--as", "claude-code"],
+    env: { MIDA_HOME: homeRoot },
+  })
+}
+
+/**
+ * The mida entry in Claude Code's user config — READ ONLY. Claude Code owns ~/.claude.json
+ * and rewrites it constantly, so Mida never writes that file; the read exists only to check
+ * "is the mida entry ours" before the claude CLI is asked to add or remove. An unreadable
+ * file answers undefined — the CLI is the authority on its own file.
+ */
+function claudeUserMidaEntry(userConfig: string): unknown {
+  try {
+    if (!existsSync(userConfig)) return undefined
+    const parsed: unknown = JSON.parse(readFileSync(userConfig, "utf8"))
+    if (!isPlainObject(parsed) || !isPlainObject(parsed.mcpServers)) return undefined
+    return parsed.mcpServers.mida
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Adds Mida's server to Claude Code's user scope through `claude mcp add-json` — the file is
+ * Claude Code's own, so only the claude CLI writes it. An identical entry is a no-op; a mida
+ * entry that is not ours (right --as, right MIDA_HOME) refuses rather than overwrite; a stale
+ * but ours entry is removed and re-added, because add-json refuses an existing name.
+ * "unavailable" means the claude binary is not on PATH — the caller keeps the hooks and says so.
+ */
+export function installClaudeCodeMcp(opts: {
+  home: string
+  userConfig: string
+  run: ClaudeCliRunner
+}): "installed" | "already-installed" | "unavailable" {
+  const json = claudeCodeMcpJson(opts.home)
+  const existing = claudeUserMidaEntry(opts.userConfig)
+  if (isDeepStrictEqual(existing, JSON.parse(json))) return "already-installed"
+  if (existing !== undefined) {
+    if (!isMidaServerEntry(existing, "claude-code", opts.home)) {
+      throw new Error("a server named mida exists in Claude Code's user config and is not Mida's — rename it or remove it")
+    }
+    const removed = opts.run(["mcp", "remove", "--scope", "user", "mida"])
+    if (claudeUnavailable(removed)) return "unavailable"
+    if (removed.status !== 0) throw new Error(`claude mcp remove failed (status ${removed.status})`)
+  }
+  const result = opts.run(["mcp", "add-json", "--scope", "user", "mida", json])
+  if (claudeUnavailable(result)) return "unavailable"
+  if (result.status !== 0) throw new Error(`claude mcp add-json failed (status ${result.status})`)
+  return "installed"
+}
+
+/**
+ * Removes Mida's server entry through `claude mcp remove` — only when the entry is ours (the
+ * same is-it-ours rule the file-config clients apply). "unavailable" means the claude binary
+ * is gone from PATH; the entry then stays where it is and the caller says so.
+ */
+export function uninstallClaudeCodeMcp(opts: {
+  home: string
+  userConfig: string
+  run: ClaudeCliRunner
+}): "uninstalled" | "not-installed" | "unavailable" {
+  const existing = claudeUserMidaEntry(opts.userConfig)
+  if (!isMidaServerEntry(existing, "claude-code", opts.home)) return "not-installed"
+  const result = opts.run(["mcp", "remove", "--scope", "user", "mida"])
+  if (claudeUnavailable(result)) return "unavailable"
+  if (result.status !== 0) throw new Error(`claude mcp remove failed (status ${result.status})`)
+  return "uninstalled"
 }
 
 /** The folders macOS hides from apps that lack Files and Folders access. */

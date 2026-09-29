@@ -21,7 +21,8 @@ import { buildHandoff, generalAssistanceText, identityUnreadableText, isGeneralA
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { agoText } from "./hook-output.js"
-import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, uninstallClaudeCode, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
+import { CODEX_TRUST_SENTENCE, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, cursorMcpConfigPath, installClaudeCode, installClaudeCodeMcp, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, spawnClaude, uninstallClaudeCode, uninstallClaudeCodeMcp, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
+import type { ClaudeCliRunner } from "./install.js"
 import { resolveDevinConfigPath } from "./devin-facts.js"
 import type { InstallTool, McpClientTool } from "./install.js"
 import {
@@ -2158,6 +2159,10 @@ export function runInstall(
     cwd?: string
     claudeDesktopConfig?: string
     devinConfig?: string
+    /** Claude Code's MCP servers live in ~/.claude.json — owned by Claude Code, read only for the is-it-ours check. */
+    claudeUserConfig?: string
+    /** The claude binary invocation — injected in tests; the real spawnSync by default. */
+    claudeCli?: ClaudeCliRunner
   },
 ): number {
   const tool = argv[1] ?? ""
@@ -2212,6 +2217,22 @@ export function runInstall(
   try {
     const outcome = run(settingsPath)
     deps.print(outcome === "already-installed" ? "already installed" : outcome === "not-installed" ? "not installed" : outcome)
+    if (tool === "claude-code") {
+      // Claude Code's MCP servers live in ~/.claude.json, which only the claude CLI may write —
+      // the userConfig read is the is-it-ours check, never an edit. Codex's table needs no
+      // extra step here: it rides inside the managed block installCodex wrote.
+      const claudeOpts = {
+        home: deps.home.root,
+        userConfig: deps.claudeUserConfig ?? join(homedir(), ".claude.json"),
+        run: deps.claudeCli ?? spawnClaude,
+      }
+      if (argv[0] === "install" && !noMcp && installClaudeCodeMcp(claudeOpts) === "unavailable") {
+        deps.print("claude-code: MCP server not added. The claude command is not on your PATH; hooks are installed.")
+      }
+      if (argv[0] === "uninstall" && uninstallClaudeCodeMcp(claudeOpts) === "unavailable") {
+        deps.print("claude-code: MCP server not removed. The claude command is not on your PATH.")
+      }
+    }
     if (argv[0] === "install" && tool === "codex") {
       // the hook and the drain never see Codex's own environment — the home install wrote into
       // is recorded so <CODEX_HOME>/sessions becomes a trusted transcript root. When the record
