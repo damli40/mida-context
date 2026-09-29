@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Mida: your context, carried to every AI you use</title>
-  <meta name="description" content="Mida carries your working context between AI agents. Your keys stay on your machine. You choose who reads it. Live on Monad testnet.">
+  <meta name="description" content="Mida carries your working context from one AI agent to the next. You hold the keys and choose which agents read it. Live on Monad testnet.">
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#FAF9F5" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#14130F" media="(prefers-color-scheme: dark)">
@@ -40,11 +40,10 @@
         <div class="hero-copy">
           <h1 id="hero-title" class="reveal r1">Stop re-explaining yourself to every AI.</h1>
           <p class="lede reveal r2">
-            Mida carries your working context between AI agents. Your keys stay on your machine.
-            You choose who reads it.
+            Mida carries your working context from one AI agent to the next. You hold the keys.
           </p>
           <div class="actions reveal r3">
-            <a class="btn btn-primary" href="/me"><svg class="btn-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true" focusable="false"><path d="M184,128a246.64,246.64,0,0,1-18.54,94.24,8,8,0,0,1-7.4,5,8.19,8.19,0,0,1-3-.6,8,8,0,0,1-4.36-10.45A230.67,230.67,0,0,0,168,128a8,8,0,0,1,16,0ZM128,88a40.06,40.06,0,0,1,29.81,13.33,8,8,0,1,0,11.92-10.67A56,56,0,0,0,72,128a136.06,136.06,0,0,1-17,65.85,8,8,0,1,0,14,7.76A152.14,152.14,0,0,0,88,128,40,40,0,0,1,128,88Zm0-64a103.75,103.75,0,0,0-34.67,5.92A8,8,0,0,0,98.67,45,88.05,88.05,0,0,1,216,128a281.31,281.31,0,0,1-6.94,62.23,8,8,0,0,0,6,9.57,7.77,7.77,0,0,0,1.78.2,8,8,0,0,0,7.8-6.23A298.11,298.11,0,0,0,232,128,104.11,104.11,0,0,0,128,24ZM69.34,62.42A8,8,0,1,0,58.67,50.49,104.16,104.16,0,0,0,24,128a87.29,87.29,0,0,1-8,36.66,8,8,0,0,0,14.54,6.68A103.17,103.17,0,0,0,40,128,88.13,88.13,0,0,1,69.34,62.42Zm44.58,138.32a8,8,0,0,0-10.61,3.93c-1.92,4.2-4,8.39-6.29,12.44A8,8,0,0,0,100.14,228a7.88,7.88,0,0,0,3.87,1,8,8,0,0,0,7-4.12c2.44-4.41,4.74-9,6.84-13.52A8,8,0,0,0,113.92,200.74ZM128,120a8,8,0,0,0-8,8,185.07,185.07,0,0,1-5.79,46,8,8,0,0,0,5.75,9.74,8.12,8.12,0,0,0,2,.25,8,8,0,0,0,7.74-6,200.68,200.68,0,0,0,6.3-50A8,8,0,0,0,128,120Z"/></svg><span>Sign in with passkey</span></a>
+            <a class="btn btn-primary" href="#install">Install Mida</a>
             <a class="btn btn-secondary" href="#install">Install the CLI</a>
           </div>
         </div>
@@ -98,11 +97,11 @@
         <dl class="steps">
           <div>
             <dt>Capture</dt>
-            <dd>It records what your agent is working on as you go. There is no save button, and it still works if the agent is killed.</dd>
+            <dd>It saves what your agent is working on as it goes. No save button. If the agent gets killed, the next one starts from the last save.</dd>
           </div>
           <div>
             <dt>Encrypt</dt>
-            <dd>It compiles that work into a checkpoint, encrypts it with keys on your machine, and records it on the Monad blockchain, on testnet today.</dd>
+            <dd>It turns that work into a checkpoint and encrypts it on your machine. The encrypted copy goes to storage, and its fingerprint goes on Monad testnet.</dd>
           </div>
           <div>
             <dt>Share</dt>
@@ -127,11 +126,11 @@
           </li>
           <li>
             <h3>You hold the keys</h3>
-            <p>Your context is encrypted with keys on your machine. Approve an agent, or revoke it.</p>
+            <p>Your context is encrypted with keys only you control. Approve an agent, or revoke it.</p>
           </li>
           <li>
             <h3>No passwords</h3>
-            <p>Sign in with a passkey: Face ID, Touch ID or a security key.</p>
+            <p>Sign in with a passkey: Face ID or Touch ID.</p>
           </li>
           <li>
             <h3>No crypto needed</h3>
@@ -158,11 +157,11 @@
           </li>
           <li>
             <h3>Provenance on chain</h3>
-            <p>Every record shows which agent wrote it.</p>
+            <p>Every record on Monad names the agent that wrote it.</p>
           </li>
           <li>
             <h3>Keys stay with the user</h3>
-            <p>Context is encrypted on their machine. You never hold their keys.</p>
+            <p>Your users' context stays encrypted on their machines. Your app reads only what they approve, and never holds their owner keys.</p>
           </li>
         </ul>
         <a class="btn btn-secondary teams-cta" href="#install">Install the CLI</a>
@@ -174,13 +173,11 @@
         <div>
           <h2 id="install-title">Install the CLI</h2>
           <p class="section-lede">
-            Live on Monad testnet, and early. Works today with Claude Code and Codex. Mida is open source,
-            and the code goes public on September 30.
+            Live on Monad testnet, and early. Works today with Claude Code, Codex, Devin and Claude Desktop. Mida is open source under the MIT licence.
           </p>
           <!-- TODO: replace #github with the public repository URL on September 30. -->
-          <a class="text-link" href="#github">Source code on GitHub, public September 30</a>
+          <a class="text-link" href="#github">Source code on GitHub</a>
         </div>
-        <!-- TODO: the mida-context package is not published to npm yet. Confirm the package name before launch. -->
         <pre class="code install-code"><code><span class="c-prompt" aria-hidden="true">$ </span>npm install -g mida-context
 <span class="c-prompt" aria-hidden="true">$ </span>mida init</code></pre>
       </div>
@@ -189,7 +186,7 @@
     <section class="band closing" aria-labelledby="closing-title">
       <div class="wrap closing-row">
         <h2 id="closing-title">Your context. Your keys. Every AI you approve.</h2>
-        <a class="btn btn-primary" href="/me"><svg class="btn-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor" aria-hidden="true" focusable="false"><path d="M184,128a246.64,246.64,0,0,1-18.54,94.24,8,8,0,0,1-7.4,5,8.19,8.19,0,0,1-3-.6,8,8,0,0,1-4.36-10.45A230.67,230.67,0,0,0,168,128a8,8,0,0,1,16,0ZM128,88a40.06,40.06,0,0,1,29.81,13.33,8,8,0,1,0,11.92-10.67A56,56,0,0,0,72,128a136.06,136.06,0,0,1-17,65.85,8,8,0,1,0,14,7.76A152.14,152.14,0,0,0,88,128,40,40,0,0,1,128,88Zm0-64a103.75,103.75,0,0,0-34.67,5.92A8,8,0,0,0,98.67,45,88.05,88.05,0,0,1,216,128a281.31,281.31,0,0,1-6.94,62.23,8,8,0,0,0,6,9.57,7.77,7.77,0,0,0,1.78.2,8,8,0,0,0,7.8-6.23A298.11,298.11,0,0,0,232,128,104.11,104.11,0,0,0,128,24ZM69.34,62.42A8,8,0,1,0,58.67,50.49,104.16,104.16,0,0,0,24,128a87.29,87.29,0,0,1-8,36.66,8,8,0,0,0,14.54,6.68A103.17,103.17,0,0,0,40,128,88.13,88.13,0,0,1,69.34,62.42Zm44.58,138.32a8,8,0,0,0-10.61,3.93c-1.92,4.2-4,8.39-6.29,12.44A8,8,0,0,0,100.14,228a7.88,7.88,0,0,0,3.87,1,8,8,0,0,0,7-4.12c2.44-4.41,4.74-9,6.84-13.52A8,8,0,0,0,113.92,200.74ZM128,120a8,8,0,0,0-8,8,185.07,185.07,0,0,1-5.79,46,8,8,0,0,0,5.75,9.74,8.12,8.12,0,0,0,2,.25,8,8,0,0,0,7.74-6,200.68,200.68,0,0,0,6.3-50A8,8,0,0,0,128,120Z"/></svg><span>Sign in with passkey</span></a>
+        <a class="btn btn-primary" href="#install">Install Mida</a>
       </div>
     </section>
   </main>

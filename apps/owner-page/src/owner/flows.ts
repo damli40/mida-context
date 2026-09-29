@@ -730,7 +730,7 @@ function failure(
 }
 
 /** A dismissed passkey prompt surfaces as a NotAllowedError — raw, or as a MeraError's cause. */
-function isUserCancel(error: unknown): boolean {
+export function isUserCancel(error: unknown): boolean {
   const name = (value: unknown) =>
     typeof value === "object" && value !== null && "name" in value ? String((value as { name: unknown }).name) : ""
   if (name(error) === "NotAllowedError") return true

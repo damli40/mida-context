@@ -269,7 +269,7 @@ describe("renderMe", () => {
     expect(texts.some((t) => t.includes("2"))).toBe(true)
   })
 
-  it("a store-denied agent reads 'blocked at the store · revoke pending on Monad'", () => {
+  it("a store-denied agent reads 'blocked at the store'", () => {
     const root = renderMe(
       data({ agents: [agent({ blockedAtStore: true, readLive: false })] }),
       fakeDoc(),

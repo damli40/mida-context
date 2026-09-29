@@ -10,7 +10,7 @@ three pages; the page does the work; the terminal reads the result.
 - `/approve` — an agent's signed request arrives in the link fragment; the page checks it, shows
   what the agent is asking for, and one passkey touch signs the grant.
 - `/revoke` — shows what the agent can read today (from the chain, not from the link), and one
-  touch ends it and locks the old keys out of what it already saved.
+  touch stops its future reads and saves. It cannot take back what the agent already read.
 
 ## What the page can and cannot do
 
@@ -69,10 +69,9 @@ pnpm typecheck && pnpm exec vitest run apps/owner-page/test
 - **No real passkey, browser or chain has run these flows.** Vitest drives them against fakes: a
   `navigator.credentials` that signs whatever challenge it is handed, a fake sponsor, a fake
   store, a fake chain reader. The device check (`/check`) is the only flow proven on hardware.
-- **The rpId mismatch is live in the checked-in deployment:** `10143.json` pins
-  `vault.mida.xyz` while the page serves at `app.midacontext.xyz`. Browsers refuse a ceremony
-  whose rpId is not a suffix of the page's host — the pages detect this and explain it before
-  any prompt, so nothing works end-to-end until the deployment rpId and the serving host agree.
+- **The rpId gate is real and now consistent:** `10143.json` pins `app.midacontext.xyz`, the
+  same host the page serves at — an earlier check-in pinned a different domain no browser could
+  satisfy. The pages still detect a wrong-host deploy and explain it before any prompt.
 
 ## The device check (`/check`)
 

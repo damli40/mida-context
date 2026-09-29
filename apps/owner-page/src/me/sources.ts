@@ -134,7 +134,7 @@ export const INDEX_URL_NOT_ALLOWED_TEXT =
 /** The banner when an index answer fills the query's page — more rows may exist unsent. */
 export const INDEX_LIMIT_TEXT = "list may be incomplete — the index has more rows than the page asked for"
 /** The exact agent-state wording for a store deny — pinned by the plan, rendered by the page. */
-export const BLOCKED_AT_STORE_TEXT = "blocked at the store · revoke pending on Monad"
+export const BLOCKED_AT_STORE_TEXT = "blocked at the store"
 
 const INDEX_TIMEOUT_MS = 6_000
 // The three owner areas flows.ts opens on setup — duplicated there and here on purpose: this

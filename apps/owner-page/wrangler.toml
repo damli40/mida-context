@@ -20,7 +20,7 @@ html_handling = "none"
 # rpId it registers passkeys for — https://midacontext.xyz — a passkey created on localhost or a
 # workers.dev URL proves nothing about the real design.
 # routes = [
-#   { pattern = "midacontext.xyz/check*", zone_name = "midacontext.xyz" }
+#   { pattern = "app.midacontext.xyz/*", zone_name = "midacontext.xyz" }
 # ]
 
 # Envio Cloud's free plan deletes a dev deployment after 7 days with no queries — one tiny GraphQL

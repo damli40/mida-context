@@ -10,16 +10,18 @@ describe("securityHeaders", () => {
         "connect-src 'self' https://testnet-rpc.monad.xyz https://store.midacontext.xyz https://sponsor.midacontext.xyz https://indexer.dev.hyperindex.xyz; " +
         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
     )
+    expect(headers["Strict-Transport-Security"]).toBe("max-age=31536000")
     expect(headers["Referrer-Policy"]).toBe("no-referrer")
     expect(headers["X-Content-Type-Options"]).toBe("nosniff")
     expect(headers["Permissions-Policy"]).toBe("publickey-credentials-get=(self), publickey-credentials-create=(self)")
     expect(headers["Cache-Control"]).toBe("no-store")
   })
 
-  it("lets non-HTML assets be cached", () => {
+  it("lets non-HTML assets be cached — HSTS still rides every response", () => {
     const headers = securityHeaders(false)
     expect(headers["Cache-Control"]).toBeUndefined()
     expect(headers["Content-Security-Policy"]).toBe(CONTENT_SECURITY_POLICY)
+    expect(headers["Strict-Transport-Security"]).toBe("max-age=31536000")
   })
 })
 

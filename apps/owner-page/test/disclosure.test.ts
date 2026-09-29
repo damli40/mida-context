@@ -4,6 +4,7 @@ import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const ownerSrc = join(dirname(fileURLToPath(import.meta.url)), "../src/owner")
+const publicDir = join(dirname(fileURLToPath(import.meta.url)), "../public")
 
 /**
  * T7 disclosure wording: the two screens where the owner decides about access must state the true
@@ -23,5 +24,19 @@ describe("disclosure wording on the owner page", () => {
   it("the revoke screen says it does not erase what the agent already read", () => {
     const source = readFileSync(join(ownerSrc, "revoke.ts"), "utf8")
     expect(source).toContain("It does not erase what the agent already read.")
+  })
+
+  // The static ledes drifted once already because only the .ts strings were pinned — pin the
+  // HTML the owner actually reads first.
+  it("the revoke page's static lede says revocation is not recall", () => {
+    const html = readFileSync(join(publicDir, "revoke.html"), "utf8")
+    expect(html).toContain(
+      "This stops the agent below from reading or saving anything new. It cannot take back what the agent already read.",
+    )
+  })
+
+  it("the approve page's static lede says the touch signs the grant", () => {
+    const html = readFileSync(join(publicDir, "approve.html"), "utf8")
+    expect(html).toContain("Approving signs the grant with your passkey")
   })
 })

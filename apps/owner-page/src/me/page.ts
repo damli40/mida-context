@@ -21,6 +21,7 @@ import { ContextApiClient, RegistryReader } from "@mida/api/browser"
 import { NAMESPACE_TREE_V1 } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { DEPLOYMENT, STORE_URL } from "../owner/core.js"
+import { isUserCancel } from "../owner/flows.js"
 import type { FlowEnvironment } from "../owner/flows.js"
 import { assertRpGate, el, makeEnv, progressLine, showError } from "../owner/page.js"
 import { describeError } from "../owner/session.js"
@@ -43,6 +44,10 @@ const COULD_NOT_OPEN = "could not be opened with this passkey"
 
 /** Tab hidden longer than this ends the session and clears the page's plaintext. */
 export const HIDDEN_LIMIT_MS = 5 * 60 * 1000
+
+/** The exact #error text when the passkey prompt is dismissed — pinned verbatim by in-25 P-7. */
+const PASSKEY_CANCELLED_TEXT =
+  "The passkey prompt was cancelled or timed out. No passkey yet? Run mida init --passkey in a terminal first."
 
 const BADGE_CLASS: Record<Badge["kind"], string> = {
   you: "b-ok",
@@ -111,7 +116,7 @@ function renderHead(doc: Document, data: MeData): HTMLElement {
   ownerLine.appendChild(elOf(doc, "span", undefined, "Owner "))
   ownerLine.appendChild(elOf(doc, "code", undefined, shortAddress(data.owner)))
   ownerLine.appendChild(
-    elOf(doc, "span", undefined, ", derived from your passkey on this device. Only your address is kept in browser storage."),
+    elOf(doc, "span", undefined, ", derived from your passkey on this device. This browser stores your address and your passkey's public details, nothing secret."),
   )
   left.appendChild(ownerLine)
   const source = elOf(doc, "p", "source")
@@ -685,7 +690,7 @@ function boot(): void {
       el("sign-out").hidden = false
       armTeardown(session, storeHandle.drop)
     })().catch((error: unknown) => {
-      showError(describeError(error))
+      showError(isUserCancel(error) ? PASSKEY_CANCELLED_TEXT : describeError(error))
       button.disabled = false
     })
   })

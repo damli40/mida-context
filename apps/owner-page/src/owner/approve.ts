@@ -8,6 +8,20 @@ import { shortAddress } from "./secrets.js"
  * checked without a passkey runs in prepareApprove; the button's one touch signs the grant
  * digest (which is also the ceremony's challenge), then the sponsored sends land.
  */
+
+/** The provenance-policy bits a scope carries, in the words the summary shows. */
+function provenancePolicyInWords(policy: number): string {
+  const parts: string[] = []
+  if (policy & 1) parts.push("inferred records")
+  if (policy & 2) parts.push("imported records")
+  if (policy & 4) parts.push("externally attested records")
+  return parts.length > 0 ? `allows ${parts.join(", ")}` : "allows no inferred, imported or attested records"
+}
+
+/** A long hex value in the summary is shortened the same way the sign-list shortens its ids. */
+function shortHex(value: string): string {
+  return value.length > 14 ? `${value.slice(0, 14)}…` : value
+}
 async function main(): Promise<void> {
   let link
   try {
@@ -33,6 +47,17 @@ async function main(): Promise<void> {
       `until ${new Date(Number(prep.expiresAt) * 1000).toLocaleDateString()}`,
     ]
     if (link.req.project !== undefined) lines.push(`for the project "${link.req.project.label}"`)
+    // The signature binds the scopes' provenance policy bits — the owner sees exactly what the
+    // digest authorizes: the needed scopes when a grant mints, the whole request when only the
+    // project row is signed.
+    const digestScopes = prep.alreadyGranted ? prep.accessRequest.scopes : prep.needed
+    const policies = [...new Set(digestScopes.map((s) => s.provenancePolicy))]
+    lines.push(`Provenance policy: ${policies.length === 1 ? provenancePolicyInWords(policies[0]!) : "varies by scope"}`)
+    // A new project row is signed too — name the agent and the folder root it adds.
+    if (link.req.entry !== undefined) {
+      const entry = link.req.entry
+      lines.push(`Adds folder: ${shortHex(entry.root)} — agent ${shortHex(entry.agent)}`)
+    }
     lines.push(`Advisor: ${prep.advice.risk} risk.`, ...prep.advice.warnings.map((w) => `Warning: ${w}`))
     if (prep.alreadyGranted) lines.push("This agent already holds everything it asked for.")
     lines.push("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")

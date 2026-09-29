@@ -11,6 +11,7 @@ export const CONTENT_SECURITY_POLICY =
 export function securityHeaders(isHtml: boolean): Record<string, string> {
   return {
     "Content-Security-Policy": CONTENT_SECURITY_POLICY,
+    "Strict-Transport-Security": "max-age=31536000",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
     "Permissions-Policy": "publickey-credentials-get=(self), publickey-credentials-create=(self)",
