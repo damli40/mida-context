@@ -99,9 +99,10 @@ Nothing else hardcodes an address — handlers work purely in ids.
 
 1. Push this repo to GitHub.
 2. On envio.dev, add an indexer from this repo. Set the root directory to `apps/indexer`, the
-   config file to `config.yaml` (if the form asks for a path from the repo root, use
-   `apps/indexer/config.yaml`), and the deployment branch to `envio`. No API token is needed:
-   indexers on Envio Cloud reach HyperSync without one.
+   config file to `config.yaml` (Envio reads it inside the root directory, so a path from the
+   repo root fails with "Missing config"), and the deployment branch to `envio`. No API token
+   is needed: indexers on Envio Cloud reach HyperSync without one. Envio checks a commit only
+   when it arrives, so after changing these settings, push a new commit to `envio`.
 3. Check that `src/our-operators.ts` lists every operator we have used (see the warning above).
 4. Push the commit you want indexed to the `envio` branch. Each push to that branch starts a new
    deployment that re-indexes from `start_block`, and the free plan allows 3 deployments per
