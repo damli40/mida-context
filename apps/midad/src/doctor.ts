@@ -897,10 +897,22 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           lines.push(`PROBLEM: ${agent}'s wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.`)
         }
         if (waits.length > 0) {
-          const next = waits.reduce((min, wait) => Math.min(min, wait.dueAtMs), Number.POSITIVE_INFINITY)
-          const at = new Date(next)
-          const hhmm = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`
-          lines.push(`note: ${waits.length} session(s) waiting to save; the next try is at ${hhmm} local time.`)
+          if (shared.serviceUp === false) {
+            // the daemon check found nothing answering — no retry clock is honest while the
+            // sender itself is not running; the saves land on the next running service (B-2)
+            lines.push(`note: ${waits.length} session(s) waiting to save; they are sent once the Mida service is running.`)
+          } else {
+            const next = waits.reduce((min, wait) => Math.min(min, wait.dueAtMs), Number.POSITIVE_INFINITY)
+            if (next <= (deps.now ?? Date.now)()) {
+              // a due time that is not in the future — a flush job's epoch-zero due included —
+              // is "now", never a clock reading like 01:00 (in-39 B-2)
+              lines.push(`note: ${waits.length} session(s) waiting to save; the next try is due now.`)
+            } else {
+              const at = new Date(next)
+              const hhmm = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`
+              lines.push(`note: ${waits.length} session(s) waiting to save; the next try is at ${hhmm} local time.`)
+            }
+          }
         }
         return lines
       },

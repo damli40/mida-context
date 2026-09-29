@@ -159,31 +159,70 @@ describe("mida doctor without a chain", () => {
   it("an out-of-gas wait names the agent, the fix, and the next retry time (in-29 S-2)", async () => {
     // Sep 29, item 15: the queue check answered "job(s) waiting" with no reason and no schedule —
     // the owner could not tell a dry wallet from a dead chain. The state file the drain wrote
-    // carries the reason and the failedAt the next-try time is computed from.
+    // carries the reason and the failedAt the next-try time is computed from. A stub service
+    // answers /health so the note can promise a real clock time (B-2: a down service changes it).
     const home = new MidaHome(join(dir(), "home"))
-    enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
-    // three attempts in: the next try is failedAt + 60 s × 2^3 = eight minutes on
-    const failedAt = new Date(Date.now() - 30_000).toISOString()
-    home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 3, failedAt, reason: "out-of-gas" })
-    const lines: string[] = []
-    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
-    expect(lines).toContain("PROBLEM: claude-code's wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.")
-    const due = new Date(Date.parse(failedAt) + 8 * 60_000)
-    const hhmm = `${String(due.getHours()).padStart(2, "0")}:${String(due.getMinutes()).padStart(2, "0")}`
-    expect(lines).toContain(`note: 1 session(s) waiting to save; the next try is at ${hhmm} local time.`)
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      // three attempts in: the next try is failedAt + 60 s × 2^3 = eight minutes on
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 3, failedAt, reason: "out-of-gas" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain("PROBLEM: claude-code's wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.")
+      const due = new Date(Date.parse(failedAt) + 8 * 60_000)
+      const hhmm = `${String(due.getHours()).padStart(2, "0")}:${String(due.getMinutes()).padStart(2, "0")}`
+      expect(lines).toContain(`note: 1 session(s) waiting to save; the next try is at ${hhmm} local time.`)
+    } finally {
+      await closeServer(server)
+    }
   })
 
   it("a session waiting on a non-gas reason gets the note but no wallet line (in-29 S-2)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "codex", event: "Stop", sessionId: "s2", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 5_000).toISOString()
+      home.writeSecretJson("queue/state/s2.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 1, failedAt, reason: "chain-busy" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      const due = new Date(Date.parse(failedAt) + 2 * 60_000)
+      const hhmm = `${String(due.getHours()).padStart(2, "0")}:${String(due.getMinutes()).padStart(2, "0")}`
+      expect(lines).toContain(`note: 1 session(s) waiting to save; the next try is at ${hhmm} local time.`)
+      expect(lines.some((line) => line.includes("ran out of gas"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a wait whose next-try time has already passed says 'due now' — never a stale clock reading (in-39 B-2)", async () => {
+    // a flush job with no failure record owes nothing — its due time is epoch 0, which used to
+    // print as "01:00 local time". The injected clock pins "now" so the boundary is exact.
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50, now: () => 1_760_000_000_000 })
+      expect(lines).toContain("note: 1 session(s) waiting to save; the next try is due now.")
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a service that did not answer moves the waiting note to 'once the Mida service is running' (in-39 B-2)", async () => {
+    // nothing is listening, so no clock reading is honest — the saves land on the next running
+    // service, whenever that is
     const home = new MidaHome(join(dir(), "home"))
     enqueue(home, { agent: "codex", event: "Stop", sessionId: "s2", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
     const failedAt = new Date(Date.now() - 5_000).toISOString()
     home.writeSecretJson("queue/state/s2.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 1, failedAt, reason: "chain-busy" })
     const lines: string[] = []
     await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
-    const due = new Date(Date.parse(failedAt) + 2 * 60_000)
-    const hhmm = `${String(due.getHours()).padStart(2, "0")}:${String(due.getMinutes()).padStart(2, "0")}`
-    expect(lines).toContain(`note: 1 session(s) waiting to save; the next try is at ${hhmm} local time.`)
-    expect(lines.some((line) => line.includes("ran out of gas"))).toBe(false)
+    expect(lines).toContain("note: 1 session(s) waiting to save; they are sent once the Mida service is running.")
+    expect(lines.some((line) => line.includes("next try is at"))).toBe(false)
   })
 
   it("names the compile model and where the session text goes — per provider, from the real chain (M3-D5)", async () => {
