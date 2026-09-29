@@ -9,6 +9,7 @@ import {
   HOOK_COMMAND,
   INJECT_COMMAND,
   MidaHome,
+  claudeCodeMcpJson,
   claudeHooksStatus,
   codexBlock,
   codexHooksStatus,
@@ -1144,6 +1145,51 @@ describe("the claude-code MCP server through the claude CLI (in-28)", () => {
       if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
       else process.env.CLAUDE_CONFIG_DIR = previous
     }
+  })
+
+  it("a hooks-only install followed by a full one prints installed — the MCP half changed (F-4)", () => {
+    const settings = join(dir(), "settings.json")
+    const userConfig = join(dir(), ".claude.json")
+    const home = new MidaHome(midaHome())
+    const calls: string[][] = []
+    const lines: string[] = []
+    const run = (args: string[]) => (calls.push(args), { status: 0 })
+    expect(runInstall(["install", "claude-code", "--no-mcp"], claudeDeps(settings, home, lines, run, userConfig))).toBe(0)
+    expect(lines).toEqual(["installed"])
+    lines.length = 0
+    expect(runInstall(["install", "claude-code"], claudeDeps(settings, home, lines, run, userConfig))).toBe(0)
+    // the hooks were already in place — "installed" now means the MCP half changed
+    expect(lines).toEqual(["installed"])
+    expect(calls.map((a) => a[1])).toEqual(["add-json"])
+  })
+
+  it("a no-op full install still prints already installed — neither half changed (F-4)", () => {
+    const settings = join(dir(), "settings.json")
+    const userConfig = join(dir(), ".claude.json")
+    const home = new MidaHome(midaHome())
+    installClaudeCode(settings)
+    writeFileSync(userConfig, JSON.stringify({ mcpServers: { mida: JSON.parse(claudeCodeMcpJson(home.root)) } }))
+    const calls: string[][] = []
+    const lines: string[] = []
+    expect(
+      runInstall(["install", "claude-code"], claudeDeps(settings, home, lines, (args) => (calls.push(args), { status: 0 }), userConfig)),
+    ).toBe(0)
+    expect(lines).toEqual(["already installed"])
+    expect(calls).toHaveLength(0)
+  })
+
+  it("uninstall prints uninstalled when the MCP half was removed even if hooks were already gone (F-4)", () => {
+    const settings = join(dir(), "settings.json") // absent — the hooks were never installed
+    const userConfig = join(dir(), ".claude.json")
+    const home = new MidaHome(midaHome())
+    writeFileSync(userConfig, JSON.stringify({ mcpServers: { mida: JSON.parse(claudeCodeMcpJson(home.root)) } }))
+    const calls: string[][] = []
+    const lines: string[] = []
+    expect(
+      runInstall(["uninstall", "claude-code"], claudeDeps(settings, home, lines, (args) => (calls.push(args), { status: 0 }), userConfig)),
+    ).toBe(0)
+    expect(lines).toEqual(["uninstalled"])
+    expect(calls).toEqual([["mcp", "remove", "--scope", "user", "mida"]])
   })
 
   it("--no-mcp never reaches for the claude binary at all", () => {

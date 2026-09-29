@@ -2341,7 +2341,10 @@ export function runInstall(
       if (argv[0] === "install" && !noMcp) mcp = installClaudeCodeMcp(claudeOpts)
       if (argv[0] === "uninstall") mcp = uninstallClaudeCodeMcp(claudeOpts)
     }
-    deps.print(outcome === "already-installed" ? "already installed" : outcome === "not-installed" ? "not installed" : outcome)
+    // the summary says changed when the hooks OR the MCP step changed something — a hooks-only
+    // install followed by a full one prints installed because the MCP half changed (in-28b F-4)
+    const changed = outcome === "installed" || outcome === "uninstalled" || mcp === "installed" || mcp === "uninstalled"
+    deps.print(changed ? (argv[0] === "install" ? "installed" : "uninstalled") : outcome === "not-installed" ? "not installed" : "already installed")
     if (mcp === "unavailable") {
       deps.print(
         argv[0] === "install"
