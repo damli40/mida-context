@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest"
-import { mkdtempSync } from "node:fs"
+import { mkdtempSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { parseEventLogs, recoverTypedDataAddress, zeroHash } from "viem"
 import type { LocalAccount } from "viem"
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts"
@@ -20,6 +21,7 @@ import type { Address, BatchSaveMessage, ContextPayload, Hex } from "@mida/proto
 import { bytesOf, generateX25519KeyPair, hexOf, sealContextObject } from "@mida/crypto"
 import {
   ANVIL_PRIVATE_KEYS,
+  MULTICALL3_ADDRESS,
   batchAnchorAbi,
   capabilityRegistryAbi,
   createWriteContext,
@@ -101,7 +103,8 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
       sealKey?: Uint8Array
       /** Binds/signs a readEpoch other than the live one — the wrap lookup for it fails at read time. */
       readEpoch?: bigint
-      parent?: { contextId: Hex; version: number; rootAuthor: Hex }
+      /** `lineageId` names the ROOT of the line; it defaults to the immediate parent, correct for v2. */
+      parent?: { contextId: Hex; version: number; rootAuthor: Hex; lineageId?: Hex }
     } = {},
   ): Promise<SealedSave> => {
     const saveOwner = input.owner ?? vault.owner
@@ -143,7 +146,7 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
       owner: saveOwner,
       namespaceId: saveNamespaceId,
       objectNonce,
-      lineageId: parent?.contextId ?? zeroHash,
+      lineageId: parent?.lineageId ?? parent?.contextId ?? zeroHash,
       parentId: parent?.contextId ?? zeroHash,
       parentVersion: parent?.version ?? 0,
       rootAuthor: parent?.rootAuthor ?? zeroHash,
@@ -722,5 +725,237 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
       parent: { contextId: hexOf(randomBytes(32)), version: 5, rootAuthor: agent.agentId },
     })
     expect(await verifyPending(queuedItem(save))).toEqual({ ok: true, agentId: replacer.agentId })
+  })
+
+  // in-38 V-4: the batched lane asked batchOf + headCommitOf + agentIdOfSigner per row — up to
+  // three chain requests each. The tests below count every readContract on the agent's client.
+  // This node starts WITHOUT Multicall3: the first test proves the per-row fallback, the second
+  // installs the real runtime (the fixture is the verified Monad-testnet bytes, shared with
+  // apps/midad/test) and measures the prefetch. Order matters.
+  interface ChainCounts {
+    /** readContract calls by functionName — the per-row checks the prefetch replaces. */
+    reads: Map<string, number>
+    /** aggregate multicall calls — the prefetch's own reads. */
+    multicalls: number
+    /** getCode probes — the "is Multicall3 here" question itself. */
+    probes: number
+  }
+
+  /**
+   * A MidaAgent on the same signer and grants as `sdk`, but whose publicClient counts the calls
+   * V-4 cares about. `hideMulticall3` answers the getCode probe with no code, forcing the
+   * per-row path on a node where the aggregate contract really exists.
+   */
+  const countedAgent = (counts: ChainCounts, hideMulticall3 = false): MidaAgent => {
+    const chain = createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: agent.signer })
+    const real = chain.publicClient
+    const counted = new Proxy(real, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver)
+        if (prop === "readContract") {
+          return (args: { functionName: string }) => {
+            counts.reads.set(args.functionName, (counts.reads.get(args.functionName) ?? 0) + 1)
+            return value.call(target, args)
+          }
+        }
+        if (prop === "multicall") {
+          return (args: unknown) => {
+            counts.multicalls += 1
+            return value.call(target, args)
+          }
+        }
+        if (prop === "getCode") {
+          return (args: { address: Address }) => {
+            counts.probes += 1
+            return hideMulticall3 && args.address.toLowerCase() === MULTICALL3_ADDRESS.toLowerCase()
+              ? Promise.resolve("0x")
+              : value.call(target, args)
+          }
+        }
+        return value
+      },
+    })
+    const api = clientFor(agent.signer, app)
+    api.listBatchSaves = async () => ({ items: batchItems, partial: batchPartial })
+    return new MidaAgent({
+      agentId: agent.agentId,
+      callbackOrigin: agent.callbackOrigin,
+      encryptionPrivateKey: agent.encryptionPrivateKey,
+      chain: { ...chain, publicClient: counted },
+      api,
+      grants: sdk.grants,
+    })
+  }
+
+  it("readBatchedWithStatus falls back to per-row reads where the chain has no Multicall3 (in-38 V-4)", async () => {
+    const anchored = await submitBatch([await makeSave(agent, { value: "fallback row" })])
+    const pendingSave = await makeSave(agent, { value: "fallback pending" })
+    batchItems = [...anchored.items.values(), queuedItem(pendingSave)]
+    const counts: ChainCounts = { reads: new Map(), multicalls: 0, probes: 0 }
+    try {
+      const result = await countedAgent(counts).readBatchedWithStatus(vault.owner, "goals.career")
+      expect(result.anchored).toHaveLength(1)
+      expect(result.pending).toHaveLength(1)
+    } finally {
+      batchItems = []
+    }
+    expect(counts.multicalls).toBe(0)
+    // Today's per-row path: each row asks the chain for itself.
+    expect(counts.reads.get("batchOf")).toBe(1)
+    expect(counts.reads.get("headCommitOf")).toBe(1)
+    expect(counts.reads.get("agentIdOfSigner")).toBe(2)
+    expect(counts.reads.get("hasAuthority")).toBe(1)
+  })
+
+  it("83 rows in 3 batches and 5 lineages verify with one aggregate call, no per-row lookups (in-38 V-4)", async () => {
+    // The verified Monad-testnet Multicall3 runtime, installed once for the rest of this file —
+    // after this, getCode sees code and the read prefetches through aggregate3.
+    const code = readFileSync(
+      fileURLToPath(new URL("../../../apps/midad/test/fixtures/multicall3-runtime.hex", import.meta.url)),
+      "utf8",
+    )
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("#"))
+      .join("")
+    const setCode = await fetch(node.rpcUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "anvil_setCode", params: [MULTICALL3_ADDRESS, code] }),
+    })
+    expect((await setCode.json() as { error?: unknown }).error).toBeUndefined()
+
+    // Five lineages, each a version chain, spread over three batches — 17+17+17+16+16 = 83 rows.
+    // Only the five heads survive requireLatest; the other 78 rows still cost lookups, which is
+    // what this measures.
+    const sizes = [17, 17, 17, 16, 16]
+    const perLineage: SealedSave[][] = []
+    for (let lineage = 0; lineage < sizes.length; lineage++) {
+      const chain: SealedSave[] = [await makeSave(agent, { value: `lineage ${lineage} v1` })]
+      for (let version = 2; version <= sizes[lineage]!; version++) {
+        chain.push(
+          await makeSave(agent, {
+            value: `lineage ${lineage} v${version}`,
+            parent: {
+              contextId: chain[version - 2]!.contextId,
+              version: version - 1,
+              rootAuthor: agent.agentId,
+              lineageId: chain[0]!.contextId, // the lineage keeps its root's id at every version
+            },
+          }),
+        )
+      }
+      perLineage.push(chain)
+    }
+    const flat: SealedSave[] = []
+    for (let version = 0; version < sizes[0]!; version++) {
+      for (const chain of perLineage) {
+        const save = chain[version]
+        if (save !== undefined) flat.push(save)
+      }
+    }
+    const all: BatchedReadItem[] = []
+    for (const part of [flat.slice(0, 28), flat.slice(28, 56), flat.slice(56)]) {
+      const { items } = await submitBatch(part)
+      all.push(...items.values())
+    }
+    expect(all).toHaveLength(83)
+    batchItems = all
+    try {
+      // The "before" measure on the same rows: hide the Multicall3 code from the probe and the
+      // read pays per row — 83 x (agentIdOfSigner + batchOf + headCommitOf).
+      const before: ChainCounts = { reads: new Map(), multicalls: 0, probes: 0 }
+      await countedAgent(before, true).readBatchedWithStatus(vault.owner, "goals.career")
+      expect(before.multicalls).toBe(0)
+      expect(before.reads.get("agentIdOfSigner")).toBe(83)
+      expect(before.reads.get("batchOf")).toBe(83)
+      expect(before.reads.get("headCommitOf")).toBe(83)
+
+      const after: ChainCounts = { reads: new Map(), multicalls: 0, probes: 0 }
+      const result = await countedAgent(after).readBatchedWithStatus(vault.owner, "goals.career")
+      expect(result.anchored).toHaveLength(5) // the five lineage heads
+      expect(result.skipped).toHaveLength(78)
+      expect(result.skipped.every((row) => row.reason === "stale")).toBe(true)
+      // 3 batches + 5 lineages + 1 signer = 9 distinct lookups → one aggregate call.
+      expect(after.multicalls).toBe(1)
+      expect(after.reads.get("batchOf") ?? 0).toBe(0)
+      expect(after.reads.get("headCommitOf") ?? 0).toBe(0)
+      expect(after.reads.get("agentIdOfSigner") ?? 0).toBe(0)
+    } finally {
+      batchItems = []
+    }
+  })
+
+  it("lookup-verified rows keep their skip reasons: proof, stale and no-authority (in-38 V-4)", async () => {
+    // Multicall3 is installed by the test above — this read goes through the lookup maps and must
+    // land on exactly the same reasons the per-row path produced.
+    const badProofSave = await makeSave(agent, { value: "bad proof" })
+    const { items: proofItems } = await submitBatch([badProofSave])
+    const badProof = { ...proofItems.get(badProofSave.contextId)!, proof: [hexOf(randomBytes(32))] }
+
+    const v1 = await makeSave(agent, { value: "stale head v1" })
+    const first = await submitBatch([v1])
+    const stale = first.items.get(v1.contextId)!
+    const v2 = await makeSave(agent, {
+      value: "stale head v2",
+      parent: { contextId: v1.contextId, version: 1, rootAuthor: agent.agentId },
+    })
+    await submitBatch([v2])
+
+    // A save queued while its author held CREATE, read after the grant is revoked — self-contained
+    // so the test does not depend on a revocation an earlier test performed.
+    const transient = await provisionAgent({
+      operator,
+      name: "Transient",
+      purposeId: "career_coaching",
+      declarations: [{ namespace: "goals.career", permissions: ["CREATE"], provenancePolicies: ["ALLOW_INFERENCE"] }],
+      callbackOrigin: "https://transient.example",
+    })
+    const transientRequest = await buildSignedAccessRequest({
+      chain: owner,
+      agent: transient,
+      scopes: [{ namespace: "goals.career", permissions: PERMISSION.CREATE, provenancePolicy: PROVENANCE_POLICY.ALLOW_INFERENCE }],
+    })
+    const transientGrant = await vault.approveGrant({
+      accessRequest: transientRequest,
+      manifest: transient.manifest,
+      selection: {
+        kind: "custom",
+        scopes: transientRequest.scopes,
+        expiresAt: (await latestTimestamp(owner)) + 7n * 86_400n,
+      },
+    })
+    const revoked = queuedItem(await makeSave(transient, { value: "queued before revocation" }))
+    await sendContract(
+      owner,
+      {
+        address: deployment.capabilityRegistry,
+        abi: capabilityRegistryAbi,
+        functionName: "revoke",
+        args: [transientGrant.response.capabilities[0]!.capabilityId],
+      },
+      "revoke.capability",
+    )
+
+    batchItems = [badProof, stale, revoked]
+    const counts: ChainCounts = { reads: new Map(), multicalls: 0, probes: 0 }
+    try {
+      const result = await countedAgent(counts).readBatchedWithStatus(vault.owner, "goals.career")
+      expect(result.skipped).toEqual([
+        { contextId: badProof.contextId, reason: "proof" },
+        { contextId: stale.contextId, reason: "stale" },
+        { contextId: revoked.contextId, reason: "no-authority" },
+      ])
+      expect(result.anchored).toHaveLength(0)
+      expect(result.pending).toHaveLength(0)
+    } finally {
+      batchItems = []
+    }
+    expect(counts.multicalls).toBe(1) // 2 batches + 2 lineages + 2 signers = 6 lookups
+    expect(counts.reads.get("batchOf") ?? 0).toBe(0)
+    expect(counts.reads.get("headCommitOf") ?? 0).toBe(0)
+    expect(counts.reads.get("agentIdOfSigner") ?? 0).toBe(0)
+    // the pending row's authority check stays live and per-row — that is the point of it
+    expect(counts.reads.get("hasAuthority")).toBe(1)
   })
 })

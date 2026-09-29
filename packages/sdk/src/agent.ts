@@ -49,7 +49,7 @@ import { parseEventLogs, zeroHash } from "viem"
 import type { TransactionReceipt } from "viem"
 import { MemoryAccessRequestStore } from "./request-store.js"
 import type { AccessRequestStore } from "./request-store.js"
-import { signBatchSave, verifyBatchedItem, verifyPendingItem } from "./batched.js"
+import { prefetchBatchedLookups, signBatchSave, verifyBatchedItem, verifyPendingItem } from "./batched.js"
 import type { BatchedVerdict, PendingVerdict } from "./batched.js"
 
 /** §13.2 allows up to 600 seconds; the SDK uses 300 so a request stays valid through a normal consent screen. */
@@ -517,6 +517,19 @@ export class MidaAgent {
       capabilityId: capability.capabilityId,
     })
     const epochKeyFor = this.#epochKeyResolver(ownerAddress, namespaceId, capability.capabilityId)
+    // in-38 V-4: the three chain questions the verifiers ask per row — batchOf, headCommitOf,
+    // agentIdOfSigner — answer once per DISTINCT value through one aggregate call per 200
+    // lookups, instead of up to three reads per row. The maps live only for this read: a lineage
+    // head can move before the next one. Undefined where the chain carries no Multicall3 — the
+    // verifiers then read per row, exactly as before.
+    const lookups = await prefetchBatchedLookups({
+      items,
+      owner: ownerAddress,
+      namespaceId,
+      chainId: deployment.chainId,
+      deployment,
+      client: this.#chain.publicClient,
+    })
     // The anchor transaction's block time is Monad's stamp for every save in that batch — one
     // block lookup per distinct batch, shared across the rows it anchored.
     const blockTime = blockTimeCache(this.#chain.publicClient)
@@ -539,8 +552,8 @@ export class MidaAgent {
       // anchorBlock verdict knew about with it.
       const verdict: BatchedVerdict | PendingVerdict =
         item.state === "ANCHORED"
-          ? await verifyBatchedItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient, requireLatest: true })
-          : await verifyPendingItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient })
+          ? await verifyBatchedItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient, requireLatest: true, lookups })
+          : await verifyPendingItem({ item, chainId: deployment.chainId, deployment, client: this.#chain.publicClient, lookups })
       if (!verdict.ok) {
         return { kind: "skipped", skipped: { contextId: item.contextId, reason: verdict.reason } }
       }
