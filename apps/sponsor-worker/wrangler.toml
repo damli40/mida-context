@@ -39,7 +39,7 @@ ALLOWED_IMPLEMENTATIONS = "0xREPLACE_WITH_IMPL_1,0xREPLACE_WITH_IMPL_2"
 PROVIDER = "pimlico"
 PIMLICO_CHAIN_SLUG = "monad-testnet"
 # Daily sponsored-operation budgets; these are the defaults, override as needed.
-PER_SENDER_DAILY_LIMIT = "30"
+PER_SENDER_DAILY_LIMIT = "300"
 GLOBAL_DAILY_LIMIT = "2000"
 # The real money bound: total wei the endpoint may reserve per UTC day — each signing reserves
 # its worst-case cost (gas limits x maxFeePerGas) against it. Default 25 MON, decimal wei.

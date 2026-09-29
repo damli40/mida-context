@@ -76,7 +76,7 @@ key; the user operation is already signed by the user's own key before it arrive
 - **Spend slowly, at the signing step.** Budgets are consumed by `pm_getPaymasterData` — the
   moment the endpoint commits money — not by `eth_sendUserOperation`, because a returned
   paymaster signature can be submitted through any bundler. Three daily budgets apply (UTC days,
-  all configurable): 30 signings per sender, 2,000 signings globally, and — the real money bound
+  all configurable): 300 signings per sender, 2,000 signings globally, and — the real money bound
   the counts cannot express — `DAILY_WEI_BUDGET` (default 25 MON) of wei, against which each
   signing atomically reserves its worst-case cost ((call + verification + pre-verification +
   paymaster gas limits) × `maxFeePerGas`) in a `spend` D1 table; a reservation that would cross
