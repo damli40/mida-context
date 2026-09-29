@@ -22,7 +22,8 @@ describe("disclosure wording on the owner page", () => {
   })
 
   it("the revoke screen says it does not erase what the agent already read", () => {
-    const source = readFileSync(join(ownerSrc, "revoke.ts"), "utf8")
+    // The line lives in revokeSummaryLines since in-30 T-4 — revoke.ts renders it per line.
+    const source = readFileSync(join(ownerSrc, "summary.ts"), "utf8")
     expect(source).toContain("It does not erase what the agent already read.")
   })
 
