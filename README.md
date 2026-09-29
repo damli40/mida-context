@@ -1,14 +1,30 @@
-# Mida Context
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/mida-lockup-animated-dark.svg">
+    <img alt="Mida Context" src="brand/mida-lockup-animated-light.svg" width="300">
+  </picture>
+</h1>
 
-**Switch AI agents without losing the work.** Mida saves what one agent was doing as a short,
-encrypted checkpoint that you own, and hands it to the next agent you approve. Claude Code today,
-Codex tomorrow, whatever ships next month.
+<p align="center">
+  <img src="https://img.shields.io/badge/Monad-testnet%2010143-836EF9?style=flat-square&labelColor=14130F" alt="Monad testnet, chain 10143">
+  <img src="https://img.shields.io/badge/status-pre--release-b08800?style=flat-square&labelColor=14130F" alt="Pre-release">
+  <img src="https://img.shields.io/badge/tests-2%2C975%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="2,975 tests passing">
+  <img src="https://img.shields.io/badge/audit-none-7e8c86?style=flat-square&labelColor=14130F" alt="Not audited">
+  <img src="https://img.shields.io/badge/license-MIT-7e8c86?style=flat-square&labelColor=14130F" alt="MIT license">
+</p>
 
-> [!IMPORTANT]
-> **Pre-release. Monad testnet only. Not audited.** The full loop ran live on Monad testnet on
-> Sep 27, 2026: Claude Code to Codex and back, Devin, Claude Desktop, and a revoke that cut an agent
-> off mid-project ([what ran](docs/evidence/live-tests-2026-09-27-to-29.md)). See
-> [What works and what doesn't](#what-works-and-what-doesnt) before you rely on it.
+<p align="center">
+  <b>Switch AI agents without losing the work.</b> Mida saves what one agent was doing as a short,
+  encrypted checkpoint you own, and hands it to the next agent you approve. Claude Code today, Codex
+  tomorrow, whatever ships next month.
+</p>
+
+<p align="center">
+  <a href="https://app.midacontext.xyz"><b>Owner page</b></a> &nbsp;·&nbsp;
+  <a href="docs/quickstart.md">Full walkthrough</a> &nbsp;·&nbsp;
+  <a href="docs/evidence">Evidence</a> &nbsp;·&nbsp;
+  <a href="#quickstart">Run it yourself</a>
+</p>
 
 ---
 
@@ -28,6 +44,12 @@ restated the key decision and its reason
 Today you paste transcripts or keep a notes file. That file belongs to no one, any program on your
 machine can read it, and you cannot take it back from an agent you stop trusting. The tools also
 change every few weeks. Your context should not be the reason you stay with one of them.
+
+> [!IMPORTANT]
+> **Pre-release. Monad testnet only. Not audited.** The full loop ran live on Monad testnet on
+> Sep 27, 2026: Claude Code to Codex and back, Devin, Claude Desktop, and a revoke that cut an agent
+> off mid-project ([what ran](docs/evidence/live-tests-2026-09-27-to-29.md)). See
+> [What works and what doesn't](#what-works-and-what-doesnt) before you rely on it.
 
 ## What Mida does
 
@@ -130,7 +152,7 @@ The full walkthrough, with the expected output of every step, is
 <summary>Install from source instead</summary>
 
 ```bash
-git clone https://github.com/damli40/mida-context && cd mida-context
+git clone --recurse-submodules https://github.com/damli40/mida-context && cd mida-context
 pnpm install && pnpm build:publish
 cd publish/cli && npm pack && npm install -g mida-context-0.1.0.tgz
 ```
@@ -300,13 +322,13 @@ pay nothing; one direct save cost about 0.03 testnet MON on Sep 21. Mainnet cost
 | Passkey owner: sign-up and approve in the browser | ✅ Live, Sep 22 ([evidence](docs/evidence/m3-passkey-live-2026-09-22.json)) |
 | Hosted store and gas sponsor | ✅ Live |
 | Batching: saves anchored by Mida's batcher, gas sponsored | ✅ Live for invited owners, Sep 29 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
-| A mid-session change of plan reaches the next agent, credited to you | ✅ Fixed Sep 28: 6 of 6 on a real model, was 0 of 6 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
+| A change of plan you make mid-session reaches the next agent, credited to you | ✅ 6 of 6 on a real model, was 0 of 6 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | SDK, named tasks, folder linking, `mida export` | ✅ In tests on a local chain; not yet run live |
 | Owner view in the browser (`app.midacontext.xyz/me`) and the public index | 🚧 Built, deploying |
-| npm packages | 🚧 Publishing |
+| npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
 | Security audit | ❌ None |
 
-About 3,000 automated tests: `pnpm test`.
+2,975 automated tests pass on this release: `pnpm test`.
 
 ---
 
