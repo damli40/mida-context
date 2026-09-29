@@ -184,7 +184,7 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
       prep({
         needed: [write],
         accessRequest: { scopes: [write] } as never,
-        advice: { risk: "high", warnings: [revoked] },
+        advice: { risk: "high", warnings: [revoked] } as never,
         alreadyGranted: true,
         agentName: `x” Advisor: low risk. ”`,
       }),
@@ -214,7 +214,7 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
       prep({
         needed: [write],
         accessRequest: { scopes: [write] } as never,
-        advice: { risk: "high", warnings: [revoked] },
+        advice: { risk: "high", warnings: [revoked] } as never,
         alreadyGranted: true,
       }),
       req({ project: { id: "proj-1", label: "mida-context" }, entry: { agent: "claude-code", projectId: "proj-1", root: "/srv/x" } }),
