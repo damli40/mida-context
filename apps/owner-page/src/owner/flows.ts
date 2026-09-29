@@ -249,10 +249,15 @@ export interface PreparedApprove {
   advice: GrantAdvice
   /** Requested scopes the chain does not already authorize — the only ones the send may mint. */
   needed: RequestedScope[]
-  /** The exact challenge the ceremony must sign — the grant digest over the final selection. */
+  /**
+   * The exact challenge the ceremony must sign. When scopes send to chain it is the grant
+   * digest over the final selection; when nothing mints (already granted, project row only) it
+   * is the domain-separated `approve.entry` action digest — never a contract-valid grantDigest
+   * the page does not show (in-25 P-2).
+   */
   challenge: Hex
   expiresAt: bigint
-  /** True when every requested scope is already live — the flow refuses without a ceremony. */
+  /** True when every requested scope is already live — the flow refuses only when no project row needs signing either. */
   alreadyGranted: boolean
 }
 
@@ -300,7 +305,13 @@ export async function prepareApprove(env: FlowEnvironment, link: ParsedLink): Pr
     operator: await preparedOperator(env, accessRequest),
     advice: finalPrepared.advice,
     needed,
-    challenge: finalPrepared.challenge,
+    // A still-needed selection signs the grant digest; an already-granted approve signs the
+    // domain-separated action digest — its assertion is only ever shown to the owner, like
+    // revoke's and /me's, so it can never be replayed into grantBatch (in-25 P-2).
+    challenge:
+      needed.length === 0
+        ? hexOf(actionChallenge("approve.entry", link.requestBytes))
+        : finalPrepared.challenge,
     expiresAt,
     alreadyGranted: needed.length === 0,
   }

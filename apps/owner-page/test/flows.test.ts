@@ -34,6 +34,7 @@ import {
   runSignup,
 } from "../src/owner/flows.js"
 import type { FlowEnvironment } from "../src/owner/flows.js"
+import { actionChallenge } from "../src/owner/webauthn.js"
 
 /**
  * The three flows end to end against fakes — a fake navigator.credentials that signs whatever
@@ -489,6 +490,10 @@ describe("approve flow", () => {
     const result = await confirmApprove(env, parsed, prep)
     expect(result.status).toBe("success")
     expect(credentials.calls.map((c) => c.kind)).toEqual(["get"]) // the touch still happens — it signs the row
+    // The signed challenge is the domain-separated approve.entry assertion — never a contract-
+    // valid grantDigest the page does not show. Same shape as revoke and /me (in-25 P-2).
+    expect(hexOf(credentials.calls[0]!.challenge!)).toBe(hexOf(actionChallenge("approve.entry", parsed.requestBytes)))
+    expect(hexOf(credentials.calls[0]!.challenge!)).toBe(prep.challenge)
     expect(sends).toHaveLength(0) // nothing was minted
     expect(result.transactions).toEqual([])
     expect(result.entry?.signature).toMatch(/^0x/)
