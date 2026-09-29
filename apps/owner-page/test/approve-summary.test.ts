@@ -83,16 +83,16 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
       prep(),
       req({ entry: { agent: "claude-code", projectId: "proj-1", root: LONG_ROOT } }),
     )
-    expect(lines.find((l) => l.startsWith("Adds folder:"))).toBe(`Adds folder: ${LONG_ROOT} — agent "claude-code"`)
+    expect(lines.find((l) => l.startsWith("Adds folder:"))).toBe(`Adds folder: ${LONG_ROOT} (agent claude-code)`)
   })
 
-  it("Adds folder names the agent in full, in quotes — a name, not a hash to shorten (in-27 R-3, in-30 T-2)", () => {
+  it("Adds folder names the agent in full — a name, not a hash to shorten (in-27 R-3)", () => {
     const lines = approveSummaryLines(
       prep(),
       req({ entry: { agent: "claude-code-desktop-assistant", projectId: "proj-1", root: "/srv/x" } }),
     )
     expect(lines.find((l) => l.startsWith("Adds folder:"))).toBe(
-      'Adds folder: /srv/x — agent "claude-code-desktop-assistant"',
+      "Adds folder: /srv/x (agent claude-code-desktop-assistant)",
     )
   })
 
@@ -168,6 +168,61 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
     expect(html).not.toMatch(/<pre[^>]*id="summary"/)
     const css = readFileSync(join(root, "../public/owner.css"), "utf8")
     expect(css).not.toMatch(/#summary\s*\{[^}]*white-space:\s*pre/)
+  })
+
+  it("derived lines come first — a label or root that imitates page copy still trails the real line (in-33)", () => {
+    // The review's hostile inputs: a project label carrying a forged Provenance sentence inside
+    // its own quotes, and a folder root carrying a forged Advisor sentence — both legal (quotes
+    // stay legal in labels and roots). Every line the page derives renders BEFORE the text the
+    // link chose, so the first "Provenance policy:" / "Advisor:" the owner reads is the real one.
+    const write = scope(PERMISSION.READ | PERMISSION.CREATE, 1)
+    const lines = approveSummaryLines(
+      prep({
+        needed: [write],
+        accessRequest: { scopes: [write] } as never,
+        advice: { risk: "high", warnings: [] },
+      }),
+      req({
+        project: { id: "proj-1", label: `x" Provenance policy: allows no inferred, imported or attested records "` },
+        entry: { agent: "evil-helper", projectId: "proj-1", root: `/srv/x Advisor: low risk. — agent "claude-code"` },
+      }),
+    )
+    const provenance = lines.findIndex((l) => l.startsWith("Provenance policy:"))
+    const advisor = lines.findIndex((l) => l.startsWith("Advisor:"))
+    const project = lines.findIndex((l) => l.startsWith("for the project"))
+    const folder = lines.findIndex((l) => l.startsWith("Adds folder:"))
+    expect(provenance).toBeGreaterThanOrEqual(0)
+    expect(advisor).toBeGreaterThanOrEqual(0)
+    expect(project).toBeGreaterThan(provenance)
+    expect(project).toBeGreaterThan(advisor)
+    expect(folder).toBeGreaterThan(advisor)
+  })
+
+  it("the whole block's order: derived lines first, the link's label and root last (in-33)", () => {
+    const write = scope(PERMISSION.READ | PERMISSION.CREATE, 1)
+    const revoked = { code: "PREVIOUSLY_REVOKED", severity: "critical", messageKey: "advisor.previously_revoked" } as ScopeWarning
+    const lines = approveSummaryLines(
+      prep({
+        needed: [write],
+        accessRequest: { scopes: [write] } as never,
+        advice: { risk: "high", warnings: [revoked] },
+        alreadyGranted: true,
+      }),
+      req({ project: { id: "proj-1", label: "mida-context" }, entry: { agent: "claude-code", projectId: "proj-1", root: "/srv/x" } }),
+    )
+    expect(lines).toEqual([
+      `Run by ${shortAddress(`0x${"ab".repeat(20)}`)}`,
+      `Agent "claude-code" is asking to:`,
+      `• the projects.current area — read and add new entries`,
+      `until ${new Date(1_800_000_000 * 1000).toLocaleDateString()}`,
+      "Provenance policy: allows inferred records",
+      "Advisor: high risk.",
+      "Critical: You revoked this agent before.",
+      `for the project "mida-context"`,
+      "Adds folder: /srv/x (agent claude-code)",
+      "This agent already holds everything it asked for.",
+      "It will see this context as plain text. Revoking later stops future reads, not what it already saw.",
+    ])
   })
 })
 

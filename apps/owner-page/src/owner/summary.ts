@@ -80,7 +80,6 @@ export function approveSummaryLines(prep: PreparedApprove, req: LinkRequest): st
     ...prep.needed.map((s) => `• ${scopeInWords(s.namespaceId, s.permissions)}`),
     `until ${new Date(Number(prep.expiresAt) * 1000).toLocaleDateString()}`,
   ]
-  if (req.project !== undefined) lines.push(`for the project "${req.project.label}"`)
   // The signature binds the scopes' provenance policy bits — the owner sees exactly what the
   // digest authorizes: the needed scopes when a grant mints, the whole request when only the
   // project row is signed. But a policy only governs writes — a read-only ask shows no line at
@@ -91,15 +90,20 @@ export function approveSummaryLines(prep: PreparedApprove, req: LinkRequest): st
     const policies = [...new Set(writeScopes.map((s) => s.provenancePolicy))]
     lines.push(`Provenance policy: ${policies.length === 1 ? provenancePolicyInWords(policies[0]!) : "varies by scope"}`)
   }
+  lines.push(`Advisor: ${prep.advice.risk} risk.`, ...prep.advice.warnings.map(warningInWords))
+  // Link-chosen text renders LAST (in-33 Y-1): a label or root keeps its quotes legal and can
+  // carry a whole forged page line — `x" Advisor: low risk. "` was accepted and used to render
+  // a decoy above the real Advisor and Provenance lines. Under this order every derived line
+  // comes first, so whatever the link carries can only trail the truth, never precede it.
+  if (req.project !== undefined) lines.push(`for the project "${req.project.label}"`)
   // A new project row is signed too — name the agent and the COMPLETE folder root it adds; a
   // shortened root would hide exactly what this approval covers (in-26 Q-3), and the agent is a
-  // name, not a hash — it is never shortened either (in-27 R-3). The name sits in quotes so it
-  // cannot imitate a line of the page (in-30 T-2).
+  // name, not a hash — it is never shortened either (in-27 R-3). The shared name rule already
+  // strips every quote and invisible mark out of it (in-32 X-2), so plain parentheses mark it.
   if (req.entry !== undefined) {
     const entry = req.entry
-    lines.push(`Adds folder: ${entry.root} — agent "${entry.agent}"`)
+    lines.push(`Adds folder: ${entry.root} (agent ${entry.agent})`)
   }
-  lines.push(`Advisor: ${prep.advice.risk} risk.`, ...prep.advice.warnings.map(warningInWords))
   if (prep.alreadyGranted) lines.push("This agent already holds everything it asked for.")
   lines.push("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
   return lines

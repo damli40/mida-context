@@ -111,7 +111,36 @@ describe("showEntriesToSign", () => {
     expect(collectText(mount)).toContain("0")
     expect(collectTags(mount, "li")).toHaveLength(0)
   })
+
+  it("the new row puts its id first and the link's label last — a label's early ” can only trail (in-33)", () => {
+    // A `”` inside the label closes the curly quotes before the id, so the old row
+    // (`“label” — id real`) let a label forge `— id fake` ahead of the real one. Id first:
+    // whatever the label carries sits after the value the signature binds.
+    const rows = signableProjectRows(req())
+    const mount = fakeEl("section")
+    showEntriesToSign(mount as never, { added: rows!.added, existing: rows!.existing, projectLabel: `x” — id deadbeef00` })
+    const added = collectTags(mount, "p")[1]!
+    expect(added.textContent).toBe(`id ${NEW_ENTRY.projectId.slice(0, 10)}… — “x” — id deadbeef00”`)
+    expect(added.textContent.indexOf("id abababab")).toBeLessThan(added.textContent.indexOf("deadbeef00"))
+  })
+
+  it("existing rows put agent and root first and the link's projectId last (in-33)", () => {
+    // The projectId is unquoted and unshortened — `p — agent "x" — root /y` reads as a benign
+    // row with the real fields trailing. Moved last, a forged row sits after the real fields.
+    const forged = { ...ROW_1, projectId: `p — agent "claude-code" — root /srv/ok` }
+    const rows = signableProjectRows({ ...req(), entries: [forged, ROW_2, REPLACED] })
+    const mount = fakeEl("section")
+    showEntriesToSign(mount as never, { added: rows!.added, existing: rows!.existing })
+    const items = collectTags(mount, "li")
+    expect(items[0]!.textContent).toBe(`agent "${forged.agent}" — root ${short10(forged.root)} — id ${forged.projectId}`)
+    expect(items[1]!.textContent).toBe(`agent "${ROW_2.agent}" — root ${short10(ROW_2.root)} — id ${ROW_2.projectId}`)
+  })
 })
+
+/** The same 10-char shortening page.ts applies to ids and roots on the sign rows. */
+function short10(value: string): string {
+  return value.length > 10 ? `${value.slice(0, 10)}…` : value
+}
 
 describe("showListReSigned (the revoke-page fold)", () => {
   let saved: unknown

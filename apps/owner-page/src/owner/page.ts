@@ -104,7 +104,10 @@ export function showEntriesToSign(
   mount.appendChild(lead)
   const added = document.createElement("p")
   added.className = "sign-row"
-  added.textContent = `“${view.projectLabel ?? view.added.projectId}” — id ${short(view.added.projectId)}`
+  // Id first, the link's label last (in-33 Y-1): a `”` inside the label closes the curly quotes
+  // early, and label-first let a label forge `— id …` ahead of the real id. Whatever the label
+  // carries now trails the value the signature binds.
+  added.textContent = `id ${short(view.added.projectId)} — “${view.projectLabel ?? view.added.projectId}”`
   mount.appendChild(added)
   const details = document.createElement("details")
   const fold = document.createElement("summary")
@@ -113,7 +116,10 @@ export function showEntriesToSign(
   const list = document.createElement("ul")
   for (const row of view.existing) {
     const li = document.createElement("li")
-    li.textContent = `${row.projectId} — agent "${row.agent}" — root ${short(row.root)}`
+    // Agent and root first, the link's projectId last (in-33 Y-1): the projectId is unquoted
+    // and unshortened — `p — agent "x" — root /y` read as a benign row with the real fields
+    // trailing. Last, a forged row can only sit after the real ones.
+    li.textContent = `agent "${row.agent}" — root ${short(row.root)} — id ${row.projectId}`
     list.appendChild(li)
   }
   details.appendChild(list)
@@ -144,7 +150,8 @@ export function showListReSigned(
   const list = document.createElement("ul")
   for (const row of rows) {
     const li = document.createElement("li")
-    li.textContent = `${row.projectId} — agent "${row.agent}" — root ${short(row.root)}`
+    // Same order as showEntriesToSign (in-33 Y-1): the page's values first, projectId last.
+    li.textContent = `agent "${row.agent}" — root ${short(row.root)} — id ${row.projectId}`
     list.appendChild(li)
   }
   details.appendChild(list)
