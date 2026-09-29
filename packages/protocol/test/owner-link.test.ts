@@ -171,12 +171,12 @@ describe("buildOwnerLink / parseOwnerLink", () => {
   })
 
   it("refuses a look-alike quote in an agent name — the shared name rule (in-32 X-2)", () => {
-    // `x” (run by 0xDEAD…BEEF) is asking to:` carries U+201D, not `"`, so the old name check
-    // missed it — the forged `(run by …)` still reads as real. The shared isAcceptableAgentName
-    // predicate refuses it, and a label or root keeps quoting legally.
+    // `x\u201d (run by 0xDEAD…BEEF) is asking to:` carries U+201D, not `"`, so the old name
+    // check missed it — the forged `(run by …)` still reads as real. The shared
+    // isAcceptableAgentName predicate refuses it, and a label or root keeps quoting legally.
     const sentence = "This request contains characters Mida does not accept, so this page will not show or sign it."
     const entry = { agent: "claude-code", projectId: "proj-1", root: "/srv/context" }
-    const forged = `x” (run by 0xDEAD…BEEF) is asking to:`
+    const forged = `x${String.fromCharCode(0x201d)} (run by 0xDEAD…BEEF) is asking to:`
     const fragment = (request: unknown) =>
       new URLSearchParams({ v: "1", nonce: NONCE, req: Buffer.from(JSON.stringify(request)).toString("base64url") }).toString()
     const reqs = [
@@ -187,6 +187,39 @@ describe("buildOwnerLink / parseOwnerLink", () => {
       const request = { chainId: 10143, owner: OWNER, request: { agentId: AGENT_ID }, ...extra }
       expect(() => parseOwnerLink(fragment(request), "approve")).toThrowError(sentence)
     }
+  })
+
+  it("refuses five or more combining marks in a field the page renders — a Zalgo stack (in-37)", () => {
+    // A browser piles a combining-mark run vertically without a limit; five or more lets
+    // the ink paint over the lines above the field's own row (review 3.1). The refusal is
+    // the same fixed sentence the control-character rule gives — which field tripped it
+    // stays off the page.
+    const sentence = "This request contains characters Mida does not accept, so this page will not show or sign it."
+    const entry = { agent: "claude-code", projectId: "proj-1", root: "/srv/context" }
+    const stack = (n: number) => `x${"\u030d".repeat(n)}`
+    const fragment = (request: unknown) =>
+      new URLSearchParams({ v: "1", nonce: NONCE, req: Buffer.from(JSON.stringify(request)).toString("base64url") }).toString()
+    const reqs = [
+      { project: { id: "proj-1", label: stack(5) } },
+      { project: { id: stack(5), label: "Ops dashboard" } },
+      { entry: { ...entry, root: stack(5) } },
+      { entry: { ...entry, projectId: stack(5) } },
+      { entry: { ...entry, agent: `a${"\u030d".repeat(5)}` } },
+      { entries: [{ ...entry, root: stack(5), approvedAt: "2026-01-01T00:00:00Z" }] },
+    ]
+    for (const extra of reqs) {
+      const request = { chainId: 10143, owner: OWNER, request: { agentId: AGENT_ID }, ...extra }
+      expect(() => parseOwnerLink(fragment(request), "approve")).toThrowError(sentence)
+    }
+    // Four stay legal — real scripts stack at most three.
+    const ok = {
+      chainId: 10143,
+      owner: OWNER,
+      request: { agentId: AGENT_ID },
+      project: { id: "proj-1", label: stack(4) },
+      entry: { agent: `a${"\u030d".repeat(4)}`, projectId: "proj-1", root: `/srv${stack(4)}` },
+    }
+    expect(() => parseOwnerLink(fragment(ok), "approve")).not.toThrow()
   })
 })
 

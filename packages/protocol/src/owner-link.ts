@@ -1,6 +1,11 @@
 import { sha256 } from "@noble/hashes/sha2.js"
 import { concatBytes, utf8ToBytes } from "@noble/hashes/utils.js"
-import { UNACCEPTABLE_REQUEST_CHARS, UNACCEPTABLE_REQUEST_TEXT, isAcceptableAgentName } from "./errors.js"
+import {
+  STACKED_MARK_RUN,
+  UNACCEPTABLE_REQUEST_CHARS,
+  UNACCEPTABLE_REQUEST_TEXT,
+  isAcceptableAgentName,
+} from "./errors.js"
 import type { Address, Hex } from "./types.js"
 
 /**
@@ -318,8 +323,10 @@ function validateRequestObject(decoded: unknown, flow: OwnerLinkFlow): OwnerLink
   }
 
   // A control character in any string the page renders can forge a line of the approve summary —
-  // no legitimate project label, folder root or agent name carries one (in-27 R-1). One sentence
-  // refuses all of them; which field tripped the check stays off the page.
+  // no legitimate project label, folder root or agent name carries one (in-27 R-1). A run of
+  // five or more combining marks is refused for the same reason — a Zalgo stack piles its ink
+  // over the lines above the field's own row (in-37, review 3.1). One sentence refuses all of
+  // them; which field tripped the check stays off the page.
   const rendered = [
     req.project?.id,
     req.project?.label,
@@ -329,7 +336,9 @@ function validateRequestObject(decoded: unknown, flow: OwnerLinkFlow): OwnerLink
     ...(req.entries ?? []).flatMap((row) => [row.agent, row.projectId, row.root, row.approvedAt]),
   ]
   for (const value of rendered) {
-    if (typeof value === "string" && UNACCEPTABLE_REQUEST_CHARS.test(value)) fail(UNACCEPTABLE_REQUEST_TEXT)
+    if (typeof value === "string" && (UNACCEPTABLE_REQUEST_CHARS.test(value) || STACKED_MARK_RUN.test(value))) {
+      fail(UNACCEPTABLE_REQUEST_TEXT)
+    }
   }
   // Agent NAMES get the shared name rule (in-32 X-2): a `"` or a look-alike inside one closes
   // the summary's `Agent "…"` quotes early and plants a forged `(run by …)` before the real

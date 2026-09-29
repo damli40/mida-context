@@ -170,6 +170,19 @@ describe("the approve summary the owner reads (in-26 Q-3)", () => {
     expect(css).not.toMatch(/#summary\s*\{[^}]*white-space:\s*pre/)
   })
 
+  it("every rendered row clips a combining-mark stack inside its own box (in-37)", () => {
+    // A legal four-mark stack still draws outside its line box; the rows the link can paint
+    // inside each clip it — the summary rows, the sign-form rows and the sign-list items.
+    const root = dirname(fileURLToPath(import.meta.url))
+    const css = readFileSync(join(root, "../public/owner.css"), "utf8")
+    for (const selector of ["#summary > div", ".sign-row", "#sign-list li"]) {
+      const pattern = new RegExp(
+        selector.replace(/\s*>\s*/g, "\\s*>\\s*").replace(/ /g, "\\s+") + "[^{}]*\\{[^}]*overflow:\\s*hidden",
+      )
+      expect(css, selector).toMatch(pattern)
+    }
+  })
+
   it("every signed or page-derived line precedes the link's unsigned label — all attacker fields hostile at once (in-34)", () => {
     // Every attacker-controlled field hostile in one request: the manifest name (the
     // look-alike apostrophe letters and dots the allow-list still admits, around a forged
