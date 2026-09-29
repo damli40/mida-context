@@ -183,6 +183,53 @@ describe("ensureDaemon", () => {
     expect(state).toBe("down")
     expect(spawned).toBe(1)
   })
+
+  it("ensureDaemonState: a missing socket stays 'down' through a truncated final probe — 200 runs (in-38 V-2)", async () => {
+    // waitMs ~615 makes the loop's last probe start with ~1 ms left: that probe's timer can
+    // fire before the missing socket's refusal arrives, which used to be scored "timeout" and
+    // mislabel a plainly-absent daemon "slow" about one run in fourteen. The runs go together
+    // on purpose — it is event-loop jitter that makes the 1 ms race lose, exactly as in
+    // production when the machine is busy.
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    const states = await Promise.all(Array.from({ length: 200 }, () => ensureDaemonState(home, () => {}, { waitMs: 615 })))
+    expect(states.every((state) => state === "down")).toBe(true)
+  })
+
+  it("ensureDaemonState starts no probe once the wait budget is spent (in-38 V-2)", async () => {
+    // waitMs 530 spends it on one 500 ms probe plus a ~30 ms sleep — the next loop turn has no
+    // budget left. The old code still connected once more with a 1 ms timeout, and the silent
+    // server counts that extra connection in its accept backlog however fast it closes.
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    let connections = 0
+    const server = createServer((socket) => {
+      connections += 1
+      socket.resume() // read the probe's request so its FIN arrives — else server.close() waits on it
+    })
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject)
+      server.listen(socketPathFor(home), () => resolve())
+    })
+    try {
+      const state = await ensureDaemonState(home, () => {}, { waitMs: 530 })
+      expect(state).toBe("slow") // the one probe that fit the budget went the whole 500 ms unanswered
+      expect(connections).toBe(1) // and nothing probed after the budget was gone
+    } finally {
+      await close(server)
+    }
+  })
+
+  it("ensureDaemonState: a silent socket is still 'slow' when the last probe is truncated", async () => {
+    // Same truncated tail as the missing-socket run, but here something holds the socket:
+    // the first probe's full-length timeout already proved "slow" — the tail must not undo it.
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    const server = await fakeDaemon(socketPathFor(home), () => {})
+    try {
+      const state = await ensureDaemonState(home, () => {}, { waitMs: 615 })
+      expect(state).toBe("slow")
+    } finally {
+      await close(server)
+    }
+  })
 })
 
 /**

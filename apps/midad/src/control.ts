@@ -159,6 +159,13 @@ function migrationInProgress(home: MidaHome): boolean {
 }
 
 /**
+ * The shortest probe whose "timeout" may count toward "slow" (in-38 V-2). A probe given only a
+ * few milliseconds cannot tell "the peer held the socket and never answered" from "there is no
+ * socket at all" — its own timer can fire before the missing socket's refusal arrives.
+ */
+const MIN_SLOW_PROBE_MS = 100
+
+/**
  * Polls `GET /health` every 100 ms until the daemon answers or `waitMs` passes. The first failed
  * check fires `spawn()` — once per call, never more — so callers that arrive while a spawned daemon
  * is still opening its runtime just keep polling. A migration marker short-circuits everything:
@@ -167,7 +174,8 @@ function migrationInProgress(home: MidaHome): boolean {
  * The verdict is a tri-state (in-35 R-2): "up" when /health answered; "slow" when the deadline
  * passed with at least one probe lost to its own timer — something held the socket but never
  * replied, a connected daemon that is slow, not absent; "down" otherwise (refused, missing
- * socket, unreadable replies).
+ * socket, unreadable replies). No probe starts once the budget is spent, and a probe given less
+ * than MIN_SLOW_PROBE_MS cannot tell slow from down, so its timeout never scores "slow".
  */
 export async function ensureDaemonState(
   home: MidaHome,
@@ -180,9 +188,11 @@ export async function ensureDaemonState(
   let sawTimeout = false
   for (;;) {
     const remaining = deadline - Date.now()
-    const reply = await callDaemon(home, "/health", undefined, { timeoutMs: Math.min(500, Math.max(1, remaining)) })
+    if (remaining <= 0) return sawTimeout ? "slow" : "down"
+    const timeoutMs = Math.min(500, remaining)
+    const reply = await callDaemon(home, "/health", undefined, { timeoutMs })
     if (reply.status !== 0) return "up"
-    if (reply.failure === "timeout") sawTimeout = true
+    if (reply.failure === "timeout" && timeoutMs >= MIN_SLOW_PROBE_MS) sawTimeout = true
     if (!spawned) {
       spawned = true
       try {
@@ -191,7 +201,6 @@ export async function ensureDaemonState(
         // a spawn that fails synchronously still leaves the poll to run out the clock
       }
     }
-    if (Date.now() >= deadline) return sawTimeout ? "slow" : "down"
     await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
   }
 }
