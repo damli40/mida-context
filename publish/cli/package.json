@@ -1,7 +1,7 @@
 {
   "name": "mida-context",
   "version": "0.1.0",
-  "description": "Mida — passkey-approved context for AI agents. The mida CLI and the midad local service.",
+  "description": "User-owned memory for AI agents: the mida command and the local Mida service.",
   "type": "module",
   "license": "MIT",
   "private": false,
@@ -22,6 +22,23 @@
   "engines": {
     "node": ">=22"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/damli40/mida-context.git",
+    "directory": "publish/cli"
+  },
+  "homepage": "https://github.com/damli40/mida-context#readme",
+  "bugs": {
+    "url": "https://github.com/damli40/mida-context/issues"
+  },
+  "keywords": [
+    "ai-agents",
+    "memory",
+    "claude-code",
+    "codex",
+    "mcp",
+    "monad"
+  ],
   "dependencies": {
     "@hono/node-server": "1.19.17",
     "@modelcontextprotocol/sdk": "1.30.0",

@@ -1,7 +1,7 @@
 {
   "name": "@mida-context/sdk",
   "version": "0.1.0",
-  "description": "Mida SDK — ask a user's Mida for scoped context: request access, read and write what the grant allows.",
+  "description": "Give your agent the memory a user approved: read and write it through the user's Mida.",
   "type": "module",
   "license": "MIT",
   "private": false,
@@ -20,6 +20,22 @@
   "engines": {
     "node": ">=22"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/damli40/mida-context.git",
+    "directory": "publish/sdk"
+  },
+  "homepage": "https://github.com/damli40/mida-context#readme",
+  "bugs": {
+    "url": "https://github.com/damli40/mida-context/issues"
+  },
+  "keywords": [
+    "ai-agents",
+    "memory",
+    "sdk",
+    "mcp",
+    "monad"
+  ],
   "dependencies": {
     "@hono/node-server": "1.19.17",
     "@noble/ciphers": "2.4.0",
