@@ -62,3 +62,25 @@ batcher paid the gas (251,383 for the first). The owner's wallet held 0 MON thro
 anchoring, and one person's saves arrive 15 to 90 seconds apart, so a single user's saves do not share
 a transaction today. Sharing happens when many users save within the same few seconds. The contract
 accepts up to 400 saves in one transaction ([sweep](batch-anchor-sweep-2026-09-24.json)).
+
+## Sep 29: the session-start read in a busy project
+
+The defect: when a session starts, Mida reads the project's saved checkpoints and checks each one on
+Monad, within a 7.5-second limit. The old read checked the records one chain request at a time, and Mida
+sends at most 10 chain requests a second. In the owner's busiest project the read found 83 to 87
+checkpoints in 7.1 to 7.2 seconds and stopped before reading them all; from 06:35 WAT on, every session
+start timed out, seven in a row.
+
+The fix (`91ea961`, and `50cb4e2` for the owner's facts) checks the listed records in batched calls.
+
+The check: the same session-start read, same project, same agent, after the owner's service moved to
+the fixed build. Numbers from the service's own log.
+
+| | Checkpoints read | Complete | Read time (limit 7.5 s) |
+|---|---|---|---|
+| Before the fix | 83 to 87 | no: cut short, then 7 timeouts in a row | 7.1 to 7.2 s |
+| After the fix | 155 | yes | 5.1 s |
+
+**What this does not show.** One project and one run after the fix. We have not measured where the
+5.1 seconds go, so we do not know whether the read time grows with the number of saves; a much larger
+project could reach the limit again.
