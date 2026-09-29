@@ -1,9 +1,9 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PERMISSION, PROVENANCE_POLICY, namespaceId } from "@mida/protocol"
-import { increaseLocalTime } from "@mida/chain"
+import { increaseLocalTime, latestTimestamp } from "@mida/chain"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
@@ -125,6 +125,62 @@ describe("M1 fix round A: expired grants, stale files, impossible scan ranges", 
     // already transacted, so the answer is deploymentBlock.
     expect(runtime.ownerStartBlock).toBe(network.deployment.deploymentBlock)
     expect(runtime.ownerStartBlock).toBeLessThanOrEqual(await runtime.ownerChain.publicClient.getBlockNumber())
+  }, STEP_TIMEOUT)
+
+  it("A5: an expired grant's re-approval folds each wrap-repair failure to one line (in-41 U-2)", async () => {
+    // Re-approving an agent whose READ expired rotates the namespace epoch, after which every
+    // surviving reader is re-keyed — and each refusal lands on a progress note carrying the
+    // store's own reason text. That text must never paint the terminal.
+    await init(runtime, ["coder5", "reader5"])
+    // reader5 holds the ordinary live grant BEFORE the expiry exists, so coder5's approve is
+    // the one that hits the closed epoch — the rotation and its repair pass run there.
+    await requestAccess(runtime, "reader5")
+    await approve(runtime, "reader5")
+
+    const agent = runtime.agent("coder5")
+    // the chain's clock, not the wall's — earlier tests have already moved Anvil ahead
+    const expiresAt = (await latestTimestamp(runtime.ownerChain)) + 45n
+    const request = await agent.createAccessRequest({
+      purposeId: PURPOSE_ID,
+      scopes: [{ namespace: NAMESPACE, permissions: AGENT_PERMISSIONS, provenancePolicy: PROVENANCE_POLICY.ALLOW_INFERENCE }],
+      capabilityExpiresAt: expiresAt,
+    })
+    const approval = await runtime.vault.approveGrant({
+      accessRequest: request,
+      manifest: loadAgentIdentity(home, "coder5")!.manifest,
+      selection: { kind: "custom", scopes: request.scopes, expiresAt },
+    })
+    await agent.completeAccessRequest(request, approval.response)
+    saveGrants(home, "coder5", [...agent.grants])
+    await increaseLocalTime(network.rpcUrl, 300n)
+    await requestAccess(runtime, "coder5")
+
+    // The store refuses every republish but the just-approved agent's own — the grant path
+    // itself calls publishReaderWraps internally for it — so a surviving reader's note is
+    // what prints.
+    const progress: string[] = []
+    runtime.progress = (line) => progress.push(line)
+    const real = runtime.vault.publishReaderWraps.bind(runtime.vault)
+    const spy = vi.spyOn(runtime.vault, "publishReaderWraps").mockImplementation(async (input) => {
+      if (input.agentId !== agent.agentId) {
+        throw new Error(`store says ${String.fromCharCode(0x1b)}[2J wipe\nforged second line`)
+      }
+      return real(input)
+    })
+    try {
+      await approve(runtime, "coder5")
+    } finally {
+      spy.mockRestore()
+      runtime.progress = undefined
+    }
+    const notes = progress.filter((line) => line.startsWith("note: could not send the new key to "))
+    expect(notes.length).toBeGreaterThan(0)
+    for (const note of notes) {
+      expect(note).not.toContain(String.fromCharCode(0x1b))
+      expect(note).not.toContain("\n")
+      expect(note).toContain("store says [2J wipe")
+      expect(note).not.toContain("forged second line")
+    }
   }, STEP_TIMEOUT)
 
   it("A4: a crash between the revoke transaction and the marker still leaves the marker on re-run", async () => {

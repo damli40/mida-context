@@ -16,6 +16,7 @@ import {
   RECORD_TYPE,
   UNACCEPTABLE_REQUEST_CHARS,
   displaySafeBlock,
+  displaySafeLine,
   displaySafeText,
   isAcceptableAgentName,
   isMidaError,
@@ -114,6 +115,37 @@ describe("UNACCEPTABLE_REQUEST_CHARS (in-30 T-3)", () => {
   it("displaySafeBlock collapses and trims nothing — and keeps the two joiners (in-40 L-4)", () => {
     const text = `  padded\u200cword\u200dend  \n\n`
     expect(displaySafeBlock(text)).toBe(text)
+  })
+})
+
+/**
+ * displaySafeLine (in-41 U-2): the single-line form for text a store, a chain error or a
+ * checkpoint handed Mida — output that must print as ONE line that can never paint the
+ * terminal. Every refused character folds to a space, whitespace collapses, the ends are
+ * trimmed, and a line that still runs long ends in `…` inside its character cap.
+ */
+describe("displaySafeLine (in-41 U-2)", () => {
+  const chr = (cp: number) => String.fromCharCode(cp)
+
+  it("folds ESC and bidi controls to spaces, collapses whitespace and trims the ends", () => {
+    // ESC opens an erase-screen, U+202E reverses the line's order, \n forges a second line —
+    // each becomes a space and the run collapses to one.
+    const dirty = `  wipe${chr(0x1b)}[2J\nforged  \t${chr(0x202e)}line  `
+    expect(displaySafeLine(dirty, 200)).toBe("wipe [2J forged line")
+    expect(displaySafeLine(dirty, 200)).not.toContain("\u001b")
+    expect(displaySafeLine(dirty, 200)).not.toContain("\n")
+  })
+
+  it("caps a long line at maxChars with the last character an ellipsis", () => {
+    const out = displaySafeLine("x".repeat(400), 300)
+    expect(out.length).toBe(300)
+    expect(out).toBe(`${"x".repeat(299)}…`)
+    // a value that lands exactly on the cap is not cut
+    expect(displaySafeLine("y".repeat(64), 64)).toBe("y".repeat(64))
+  })
+
+  it("keeps the joiners — a ZWNJ inside Persian spelling, a ZWJ inside an emoji pair (in-31 V-3)", () => {
+    expect(displaySafeLine("می\u200cخواهم ok 👨\u200d💻", 200)).toBe("می\u200cخواهم ok 👨\u200d💻")
   })
 })
 

@@ -194,6 +194,65 @@ describe("mida doctor without a chain", () => {
     expect(code).toBeGreaterThan(0)
   })
 
+  it("a rejected-ledger reason the store wrote prints folded — ESC and newline never reach the line (in-41 U-2)", async () => {
+    // state/batch-rejected.json is data the store handed us: a reason carrying an erase-screen
+    // and a forged second line must land in the PROBLEM line as one folded, harmless string.
+    const home = new MidaHome(join(dir(), "home"))
+    const esc = String.fromCharCode(0x1b)
+    home.writeSecretJson("state/batch-rejected.json", {
+      entries: [
+        {
+          contextId: `0x${"aa".repeat(32)}`,
+          eventId: "e1",
+          sessionId: "s1",
+          agent: "codex",
+          reason: `store says ${esc}[2J wipe\nforged second line`,
+          at: "2026-09-29T00:00:00.000Z",
+        },
+      ],
+    })
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    const line = lines.find((l) => l.includes("rejected on chain"))
+    expect(line).toBeDefined()
+    expect(line).not.toContain(esc)
+    expect(line).not.toContain("\n")
+    expect(line).toContain("store says [2J wipe")
+  })
+
+  it("a store probe's rejection reason folds the same way — one line, no paint (in-41 U-2)", async () => {
+    // The same line built from the live probe's answer rather than the ledger: an old pending
+    // entry asks the store, and whatever reason the answer carries prints folded.
+    const home = new MidaHome(join(dir(), "home"))
+    const esc = String.fromCharCode(0x1b)
+    home.writeSecretJson("state/batch-pending.json", {
+      entries: [
+        {
+          contextId: `0x${"bb".repeat(32)}`,
+          eventId: "e2",
+          sessionId: "s2",
+          agent: "codex",
+          queuedAt: "2020-01-01T00:00:00.000Z",
+          state: "QUEUED",
+        },
+      ],
+    })
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      probeBatchSave: async () => ({ state: "REJECTED", reason: `store says ${esc}[2J wipe\nforged second line` }),
+    })
+    const line = lines.find((l) => l.includes("rejected on chain"))
+    expect(line).toBeDefined()
+    expect(line).not.toContain(esc)
+    expect(line).not.toContain("\n")
+    expect(line).toContain("store says [2J wipe")
+  })
+
   it("isMidaProcess matches every Mida entry form — and not the vitest pid or a foreign child (in-39 B-1)", () => {
     // the bundled daemon, the shebang'd bin name, and the tsx source form the repo's bin/mida
     // launcher and the e2e tests spawn — all true; the test runner itself and an arbitrary

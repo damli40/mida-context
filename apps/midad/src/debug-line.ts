@@ -1,4 +1,5 @@
 import { BaseError } from "viem"
+import { displaySafeLine } from "@mida/protocol"
 import { chainRefusalReason } from "./chain-busy.js"
 
 /**
@@ -14,7 +15,8 @@ export function refusalCode(error: unknown): string {
   const chainReason = chainRefusalReason(error)
   if (chainReason !== undefined) return chainReason
   const code = (error as { code?: unknown } | null | undefined)?.code
-  if (typeof code === "string" && code !== "") return code
+  // the code is untrusted text a store or chain wrote — fold it before it reaches a refused: line
+  if (typeof code === "string" && code !== "") return displaySafeLine(code, 64)
   if (error instanceof BaseError) return "CHAIN_CALL_FAILED"
   return "UNEXPECTED"
 }

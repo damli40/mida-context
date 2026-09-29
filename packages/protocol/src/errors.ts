@@ -130,6 +130,19 @@ export function displaySafeBlock(value: string): string {
 }
 
 /**
+ * The single-line form of displaySafeText (in-41 U-2) — for text Mida did not write that must
+ * print as ONE line: a checkpoint's stored task name, a reason the store returned, a code an
+ * RPC error carried. Every refused character folds to a space, whitespace runs collapse to one
+ * space, the ends are trimmed, and a line still longer than `maxChars` ends in `…` inside the
+ * cap — no value from a store or a chain can open a control sequence or forge a second line.
+ */
+export function displaySafeLine(value: string, maxChars: number): string {
+  const line = displaySafeText(value).replace(/\s+/g, " ").trim()
+  if (line.length <= maxChars) return line
+  return `${line.slice(0, Math.max(0, maxChars - 1))}…`
+}
+
+/**
  * The agent-name allow-list (in-34; tightened in-37). A name is accepted only when every
  * character is listed: the first must be a letter or number in any script — never a
  * combining mark, which would attach to the page's own opening quote; the rest may add

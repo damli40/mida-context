@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
@@ -14,6 +14,7 @@ import type { AgentIdentity, Network, ResolvedNetwork, ServiceRuntime } from "@m
 import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
 import { manifestBodyHash } from "@mida/grant-advisor"
+import { FakeVaultAuthority } from "@mida/fake-vault"
 import { AGENT_ID, manifestBody, signManifest } from "../../../packages/grant-advisor/test/fixtures.js"
 
 describe("the crude mida command", () => {
@@ -642,6 +643,65 @@ describe("the crude mida command", () => {
     expect(out.at(-1)).toBe(
       "Mida: claude-code's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
     )
+  }, 300_000)
+
+  it("a refused wrap's store reason prints folded on the per-agent line — no ESC, one line (in-41 U-2)", async () => {
+    // `failure.reason` is error text the store or chain handed back — a wipe sequence or a
+    // forged newline in it must never reach the owner's terminal as written.
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-fold-revoke-")))
+    const out: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, { home: fresh, network, print: (line) => out.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
+    expect(await run2("init")).toBe(0)
+    expect(await run2("request", "claude-code")).toBe(0)
+    expect(await run2("approve", "claude-code")).toBe(0)
+    expect(await run2("request", "codex")).toBe(0)
+    expect(await run2("approve", "codex")).toBe(0)
+    out.length = 0
+    const esc = String.fromCharCode(0x1b)
+    const spy = vi
+      .spyOn(FakeVaultAuthority.prototype, "publishReaderWraps")
+      .mockRejectedValue(new Error(`store says ${esc}[2J wipe\nforged second line`))
+    try {
+      expect(await run2("revoke", "claude-code")).toBe(0)
+    } finally {
+      spy.mockRestore()
+    }
+    const failedLine = out.find((line) => line.startsWith("could not send the new key to codex:"))
+    expect(failedLine).toBeDefined()
+    expect(failedLine).not.toContain(esc)
+    expect(failedLine).not.toContain("\n")
+    expect(failedLine).toContain("store says [2J wipe")
+    expect(failedLine).toContain("run `mida approve codex`")
+  }, 300_000)
+
+  it("`revoke --all` folds the same store reason on every failure line (in-41 U-2)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-fold-all-")))
+    const out: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, { home: fresh, network, print: (line) => out.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
+    expect(await run2("init")).toBe(0)
+    expect(await run2("request", "claude-code")).toBe(0)
+    expect(await run2("approve", "claude-code")).toBe(0)
+    expect(await run2("request", "codex")).toBe(0)
+    expect(await run2("approve", "codex")).toBe(0)
+    out.length = 0
+    const esc = String.fromCharCode(0x1b)
+    const spy = vi
+      .spyOn(FakeVaultAuthority.prototype, "publishReaderWraps")
+      .mockRejectedValue(new Error(`store says ${esc}[2J wipe\nforged second line`))
+    try {
+      await run2("revoke", "--all")
+    } finally {
+      spy.mockRestore()
+    }
+    const failedLines = out.filter((line) => line.startsWith("could not send the new key to "))
+    expect(failedLines.length).toBeGreaterThan(0)
+    for (const line of failedLines) {
+      expect(line).not.toContain(esc)
+      expect(line).not.toContain("\n")
+      expect(line).toContain("store says [2J wipe")
+    }
   }, 300_000)
 
   it("an already-approved approve says what the folder listing did — never 'run the command you just ran' (M3-D4)", async () => {

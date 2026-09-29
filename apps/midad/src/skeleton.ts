@@ -1,6 +1,6 @@
 import { privateKeyToAccount } from "viem/accounts"
 import { entryPoint08Address } from "viem/account-abstraction"
-import { MidaError, PERMISSION, decodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
+import { MidaError, PERMISSION, decodeUint64, displaySafeLine, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
 import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScope } from "@mida/protocol"
 import { batchAnchorAbi, capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord, recordPlacementsNear } from "@mida/chain"
 import type { ChainContext, HistoryScanCursor, RecordPlacement } from "@mida/chain"
@@ -429,7 +429,7 @@ export async function approve(
   if (cleared > 0) {
     const repair = await repairReaderWraps(runtime, undefined, identity.agentId)
     for (const failure of repair.failed) {
-      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${failure.reason}`)
+      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${displaySafeLine(failure.reason, 300)}`)
     }
   }
   let pending = home.readJson<{ request: AccessRequest }>(`agents/${name}/pending-request.json`)
@@ -502,7 +502,7 @@ export async function approve(
   if (rotated.length > 0) {
     const repair = await repairReaderWraps(runtime, rotated)
     for (const failure of repair.failed) {
-      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${failure.reason}`)
+      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${displaySafeLine(failure.reason, 300)}`)
     }
   }
   // A marker left by an earlier revoke must not outlive a fresh approval.

@@ -7,7 +7,7 @@ import { isDeepStrictEqual } from "node:util"
 import { createInterface } from "node:readline"
 import { compareChainOrder, orderTime, recordedAt, taskOf } from "@mida/checkpoint"
 import type { StoredCheckpoint } from "@mida/checkpoint"
-import { decodeUint64, displaySafeBlock, displaySafeText, isMidaError, namespaceById } from "@mida/protocol"
+import { decodeUint64, displaySafeBlock, displaySafeLine, displaySafeText, isMidaError, namespaceById } from "@mida/protocol"
 import type { Address, Hex, RequestedScope } from "@mida/protocol"
 import { privateKeyToAccount } from "viem/accounts"
 import type { Deployment } from "@mida/chain"
@@ -248,8 +248,8 @@ export async function runCliWithRuntime(
   argv: string[],
   runtime: ServiceRuntime,
   print: (line: string) => void,
-  /** `cwd` is the folder the command ran in; `debug` is the daemon's pass-through of MIDA_DEBUG=1; `task` is the caller's MIDA_TASK. */
-  context?: { cwd?: string; debug?: boolean; task?: string },
+  /** `cwd` is the folder the command ran in; `debug` is the daemon's pass-through of MIDA_DEBUG=1; `task` is the caller's MIDA_TASK. `readCheckpoints` is a test seam — the daemon's socket carries only JSON, so it can never be set from outside this process. */
+  context?: { cwd?: string; debug?: boolean; task?: string; readCheckpoints?: typeof readCheckpoints },
 ): Promise<number> {
   const [command = ""] = argv
   if (OWNER_COMMANDS.includes(command)) {
@@ -508,7 +508,7 @@ async function runTaskCommand(
   argv: string[],
   runtime: ServiceRuntime,
   print: (line: string) => void,
-  context?: { cwd?: string; debug?: boolean; task?: string },
+  context?: { cwd?: string; debug?: boolean; task?: string; readCheckpoints?: typeof readCheckpoints },
 ): Promise<number> {
   const usage = () => {
     print(USAGE)
@@ -596,7 +596,7 @@ async function runTaskCommand(
   }
   let checkpoints: StoredCheckpoint[]
   try {
-    checkpoints = (await readCheckpoints(runtime, picked.agent, folder.projectId)).checkpoints
+    checkpoints = (await (context?.readCheckpoints ?? readCheckpoints)(runtime, picked.agent, folder.projectId)).checkpoints
   } catch (error) {
     print(`could not read the task list (${refusalCode(error)})`)
     return 1
@@ -612,7 +612,7 @@ async function runTaskCommand(
   print(rows.length === 0 ? "no checkpoints saved yet" : "tasks:")
   for (const cp of rows) {
     const author = names[cp.authorId.toLowerCase()] ?? "unknown agent"
-    print(`  ${taskOf(cp)} — ${author} — ${agoText(recordedAt(cp), now)}`)
+    print(`  ${displaySafeLine(taskOf(cp), 64)} — ${author} — ${agoText(recordedAt(cp), now)}`)
   }
   return 0
 }
@@ -1050,7 +1050,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       }
       for (const name of result.rewrapped) deps.print(`new read key sent to ${name}`)
       for (const failure of result.failed) {
-        deps.print(`could not send the new key to ${failure.name}: ${failure.reason} — run \`mida approve ${failure.name}\``)
+        deps.print(`could not send the new key to ${failure.name}: ${displaySafeLine(failure.reason, 300)} — run \`mida approve ${failure.name}\``)
       }
       if (result.repairError !== undefined) {
         deps.print(`the key repair pass could not run: ${result.repairError} — run \`mida revoke ${agent}\` again to retry it`)
@@ -1415,7 +1415,7 @@ async function revokeAll(runtime: Runtime, deps: CliDeps): Promise<number> {
       }
       for (const other of result.rewrapped) deps.print(`new read key sent to ${other}`)
       for (const failure of result.failed) {
-        deps.print(`could not send the new key to ${failure.name}: ${failure.reason} — run \`mida approve ${failure.name}\``)
+        deps.print(`could not send the new key to ${failure.name}: ${displaySafeLine(failure.reason, 300)} — run \`mida approve ${failure.name}\``)
       }
       if (result.repairError !== undefined) {
         deps.print(`the key repair pass could not run: ${result.repairError} — run \`mida revoke ${name}\` again to retry it`)

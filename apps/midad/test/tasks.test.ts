@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { privateKeyToAccount } from "viem/accounts"
 import { mergeCheckpoints, renderHandoffReport, taskOf } from "@mida/checkpoint"
 import type { Checkpoint, StoredCheckpoint } from "@mida/checkpoint"
 import {
@@ -12,6 +13,7 @@ import {
   buildHandoff,
   buildMcpSave,
   buildWhatsNew,
+  approveProject,
   clearFolderTask,
   continuedTaskFor,
   drainOnce,
@@ -19,6 +21,7 @@ import {
   folderTaskFor,
   isTaskName,
   listJobs,
+  loadOrCreateOwnerSecrets,
   pinSessionTask,
   readFolderTask,
   readSessionTask,
@@ -543,6 +546,38 @@ describe("mida task (tk-1)", () => {
     // no approved agent exists, so the listing refuses after the current-task line
     await runCliWithRuntime(["task"], cliRuntime(home), (line) => lines.push(line), { cwd, task: "sdk" })
     expect(lines[0]).toBe("current task: sdk (MIDA_TASK)")
+  })
+
+  it("a hostile stored task name prints folded — no ESC, no newline, capped at 64 (in-41 U-2)", async () => {
+    // `unwrapCheckpoint` refuses a task name like this outright, so the injected read stands in
+    // for the one way hostile text could still arrive: a store answer that slipped it past every
+    // earlier gate. The print boundary is the last line of defence and it must hold.
+    const dirRoot = dir()
+    const cwd = join(dirRoot, "work")
+    markFolder(cwd)
+    const home = new MidaHome(join(dirRoot, "home"))
+    const owner = privateKeyToAccount(loadOrCreateOwnerSecrets(home).privateKey).address
+    const runtime = { home, owner } as unknown as ServiceRuntime
+    await approveProject(runtime as unknown as Runtime, { agent: "codex", cwd })
+    const esc = String.fromCharCode(0x1b)
+    const hostile = stored(1, { task: `dirty${esc}[2J\nforged` })
+    const overlong = stored(2, { task: "t".repeat(100) })
+    const lines: string[] = []
+    const code = await runCliWithRuntime(["task"], runtime, (line) => lines.push(line), {
+      cwd,
+      readCheckpoints: async () => ({ checkpoints: [hostile, overlong], skipped: 0, milliseconds: 1, partial: false }),
+    })
+    expect(code).toBe(0)
+    const rows = lines.filter((line) => line.startsWith("  "))
+    const forged = rows.find((line) => line.includes("dirty"))
+    expect(forged).toBeDefined()
+    expect(forged).not.toContain(esc)
+    expect(forged).not.toContain("\n")
+    expect(forged).toContain("dirty [2J forged")
+    const capped = rows.find((line) => line.includes("ttt"))
+    expect(capped).toBeDefined()
+    expect(capped).toContain(`${"t".repeat(63)}…`)
+    expect(capped).not.toContain("t".repeat(64))
   })
 
   it("`task show` refuses a bad name before touching anything", async () => {

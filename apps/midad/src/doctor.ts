@@ -4,7 +4,7 @@ import { dirname, isAbsolute, join } from "node:path"
 import { spawn } from "node:child_process"
 import { createPublicClient, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
-import { decodeUint64, isMidaError } from "@mida/protocol"
+import { decodeUint64, displaySafeLine, isMidaError } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { chainFor, rpcTransport } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
@@ -988,7 +988,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         for (const entry of rejectedAnchors(home)) {
           lines.push(
             problem(
-              `a checkpoint save was rejected on chain (${entry.reason}, session ${entry.sessionId})`,
+              `a checkpoint save was rejected on chain (${displaySafeLine(entry.reason, 200)}, session ${entry.sessionId})`,
               "it was not anchored; check the agent's approval with `mida doctor`",
             ),
           )
@@ -1039,7 +1039,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             if (answer !== null && answer.state === "REJECTED") {
               lines.push(
                 problem(
-                  `a checkpoint save was rejected on chain (${answer.reason ?? "unknown"}, session ${entry.sessionId})`,
+                  `a checkpoint save was rejected on chain (${displaySafeLine(answer.reason ?? "unknown", 200)}, session ${entry.sessionId})`,
                   "it was not anchored; check the agent's approval with `mida doctor`",
                 ),
               )

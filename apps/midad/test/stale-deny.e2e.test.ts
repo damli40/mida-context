@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -196,6 +196,36 @@ describe("M3-D4: `mida approve` clears a stale store deny", () => {
     const stub = { ...runtime, sendProgress: runtime.sendProgress.bind(runtime), vault: stubVault } as unknown as Runtime
     await expect(revoke(stub, "codex5")).rejects.toMatchObject({ code: "SPONSOR_PENDING" })
     expect(home.readJson("agents/codex5/revoke-pending.json")).toMatchObject({ intentId, userOpHash: pending.userOpHash })
+  })
+
+  it("a wrap republish's store reason folds to one line on the progress note — no ESC, no forged second line (in-41 U-2)", async () => {
+    await init(runtime, ["codex7"])
+    await requestAccess(runtime, "codex7")
+    await approve(runtime, "codex7")
+    const agentId = loadAgentIdentity(home, "codex7")!.agentId
+    const { intentId } = await runtime.ownerApi.requestRevocationDeny({ owner: runtime.owner, agentId })
+
+    // The stale deny is real, so the repair pass runs — but the store's refusal text carries an
+    // erase-screen and a forged newline. The note the owner reads must hold neither.
+    const spy = vi
+      .spyOn(runtime.vault, "publishReaderWraps")
+      .mockRejectedValue(new Error(`store says ${String.fromCharCode(0x1b)}[2J wipe\nforged second line`))
+    progressLines = []
+    try {
+      await expect(approve(runtime, "codex7")).rejects.toMatchObject({ code: "already-approved" })
+    } finally {
+      spy.mockRestore()
+    }
+    const note = progressLines.find((line) => line.startsWith("note: could not send the new key to codex7:"))
+    expect(note).toBeDefined()
+    expect(note).not.toContain(String.fromCharCode(0x1b))
+    expect(note).not.toContain("\n")
+    expect(note).toContain("store says [2J wipe")
+    expect(note).not.toContain("forged second line")
+    // and the fold changed nothing about the cleanup itself — this deny really was cancelled
+    // (other tests in this file leave their own denies standing, so the check names the intent)
+    expect((await runtime.ownerApi.listRevocations("active")).map((intent) => intent.intentId)).not.toContain(intentId)
+    expect((await runtime.ownerApi.listRevocations("cancelled")).map((intent) => intent.intentId)).toContain(intentId)
   })
 
   it("a capability deny whose read fails is named, not silently skipped", async () => {

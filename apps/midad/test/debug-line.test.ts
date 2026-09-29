@@ -46,6 +46,19 @@ describe("refusalCode (CHAIN-09)", () => {
     expect(refusalCode(new BaseError("request failed"))).toBe("CHAIN_CALL_FAILED")
   })
 
+  it("a code carrying terminal paint folds to one display-safe line, capped at 64 (in-41 U-2)", () => {
+    // the `code` a store or chain error carries is untrusted text — it prints inside
+    // `refused: <code>` lines, so it must arrive already folded: no ESC, no forged newline.
+    const esc = String.fromCharCode(0x1b)
+    const error = Object.assign(new Error("x"), { code: `EVIL${esc}[2J\nFORGED` })
+    const code = refusalCode(error)
+    expect(code).toBe("EVIL [2J FORGED")
+    expect(code).not.toContain(esc)
+    expect(code).not.toContain("\n")
+    const long = refusalCode(Object.assign(new Error("x"), { code: "C".repeat(120) }))
+    expect(long).toBe(`${"C".repeat(63)}…`)
+  })
+
   it("a plain error, a non-error and nothing at all are UNEXPECTED, never ERROR", () => {
     expect(refusalCode(new Error("x"))).toBe("UNEXPECTED")
     expect(refusalCode("not even an error")).toBe("UNEXPECTED")
