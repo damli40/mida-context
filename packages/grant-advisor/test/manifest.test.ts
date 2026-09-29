@@ -126,6 +126,22 @@ describe("manifest limits and structure (§14.1)", () => {
     expect((caught as Error).message).toBe(sentence)
   })
 
+  it("rejects a `\"` in the manifest name — it would close the summary's quotes early (in-31 V-1)", () => {
+    // The name `x" (run by 0xDEAD…BEEF) is asking to:` renders as
+    // `Agent "x" (run by 0xDEAD…BEEF) is asking to:" (run by 0xB29…42F8) is asking to:` — the
+    // forged operator sits before the real one. `"` is not in the refused set (ordinary text
+    // may quote), so the name refuses it on its own, with the same fixed sentence.
+    const sentence = "This request contains characters Mida does not accept, so this page will not show or sign it."
+    let caught: unknown
+    try {
+      validateManifestBody(invalidBody({ name: `x" (run by 0xDEAD…BEEF) is asking to:` }), NOW)
+    } catch (error) {
+      caught = error
+    }
+    expect(isMidaError(caught, "INVALID_WIRE")).toBe(true)
+    expect((caught as Error).message).toBe(sentence)
+  })
+
   it("does NOT refuse display-only fields — a description or reason carrying the characters still loads (in-30 T-3)", () => {
     // The page never renders these fields for decisions, so refusing them would only break a
     // manifest already registered with a multi-line description. They are size-checked, then

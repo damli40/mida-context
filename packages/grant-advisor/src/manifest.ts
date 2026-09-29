@@ -52,7 +52,9 @@ function text(value: unknown, min: number, max: number, where: string): string {
   if (length < min || length > max) wire(`${where} must be ${min}-${max} UTF-8 bytes`)
   // A refused character in text the page renders — the agent's name — can forge a whole line of
   // the approve summary; the manifest is refused outright, before any signature work (in-27 R-1).
-  if (UNACCEPTABLE_REQUEST_CHARS.test(value)) throw new UnacceptableCharactersError()
+  // A `"` is not a refused character — ordinary text may quote — but inside the name it closes
+  // the summary's `Agent "…"` quotes early and plants a forged `(run by …)` (in-31 V-1).
+  if (UNACCEPTABLE_REQUEST_CHARS.test(value) || value.includes('"')) throw new UnacceptableCharactersError()
   return value
 }
 
