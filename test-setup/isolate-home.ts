@@ -29,9 +29,9 @@
  * toolchain the chain tests deploy with, and a git identity so temp repos can commit.
  * The wall is never loosened to fix a failing test — the env belongs here.
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { userInfo } from "node:os"
-import { delimiter, join } from "node:path"
+import { basename, delimiter, dirname, join } from "node:path"
 import { afterAll } from "vitest"
 
 const testRoot = mkdtempSync("/tmp/mida-t-")
@@ -40,17 +40,38 @@ process.env.TMP = testRoot
 process.env.TEMP = testRoot
 
 /**
- * Removes a per-file root whole. The afterAll below runs it on this file's root, and
- * isolation.test.ts runs it on throwaway roots of its own (hence the injectable remover).
- * A root that resists removal is reported to stderr and never thrown — a leftover temp
- * folder is housekeeping, not a test result.
+ * Removes a per-file root whole — and only the wall's own roots (in-41 U-3). The argument is
+ * resolved with realpath and removal runs only when the answer is a direct child of the real
+ * /tmp whose name starts with `mida-t-`, so a nested temp dir, a misnamed sibling, a symlink
+ * out, or `/tmp` itself gets one stderr line and no removal; the remover is never called on
+ * it. The afterAll below runs it on this file's root, and isolation.test.ts runs it on
+ * throwaway roots of its own (hence the injectable remover). A root that resists removal is
+ * reported to stderr and never thrown — a leftover temp folder is housekeeping, not a test
+ * result.
  */
 export function removeTestRoot(
   root: string,
   rm: (path: string, options: { recursive: true; force: true }) => void = rmSync,
 ): void {
+  let realRoot: string | undefined
+  let realTmp: string | undefined
   try {
-    rm(root, { recursive: true, force: true })
+    realRoot = realpathSync(root)
+    realTmp = realpathSync("/tmp")
+  } catch {
+    // missing or unresolvable — whatever it was, it is not a root this wall may delete
+  }
+  if (
+    realRoot === undefined ||
+    realTmp === undefined ||
+    dirname(realRoot) !== realTmp ||
+    !basename(realRoot).startsWith("mida-t-")
+  ) {
+    process.stderr.write(`test wall: refusing to remove ${root}: not a direct /tmp/mida-t-* root\n`)
+    return
+  }
+  try {
+    rm(realRoot, { recursive: true, force: true })
   } catch (error) {
     process.stderr.write(`test wall: could not remove ${root}: ${error instanceof Error ? error.message : String(error)}\n`)
   }

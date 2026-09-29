@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest"
 import { spawnSync } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs"
 import { createServer } from "node:net"
 import { homedir, tmpdir, userInfo } from "node:os"
 import { join, sep } from "node:path"
@@ -53,7 +53,8 @@ describe("the test wall (in-28b)", () => {
   })
 
   it("the wall's cleanup removes a root whole — nested folders and a socket file go with it (in-40 L-6)", async () => {
-    const root = mkdtempSync(join(tmpdir(), "mida-nested-"))
+    // a real /tmp/mida-t-* child — the only shape the cleanup is allowed to remove (in-41 U-3)
+    const root = mkdtempSync("/tmp/mida-t-nested-")
     const deep = join(root, "a", "b")
     mkdirSync(deep, { recursive: true })
     // a real unix socket file, not a stand-in — daemon tests leave these under the root
@@ -70,16 +71,53 @@ describe("the test wall (in-28b)", () => {
   it("a cleanup that cannot remove its root reports to stderr instead of failing the file (in-40 L-6)", () => {
     // A leftover temp folder is housekeeping, not a test result: the injected remover throws the
     // way rmSync does on a stuck filesystem, and the cleanup must absorb it into one stderr line.
+    // The root is a real /tmp/mida-t-* folder so the refusal gate (in-41 U-3) lets the call through.
+    const root = mkdtempSync("/tmp/mida-t-stuck-")
     const spy = vi.spyOn(process.stderr, "write").mockReturnValue(true)
     try {
       expect(() =>
-        removeTestRoot(join(tmpdir(), "mida-stuck-"), () => {
+        removeTestRoot(root, () => {
           throw new Error("EBUSY: resource busy")
         }),
       ).not.toThrow()
-      expect(spy).toHaveBeenCalledWith(expect.stringContaining("mida-stuck-"))
+      expect(spy).toHaveBeenCalledWith(expect.stringContaining("mida-t-stuck-"))
     } finally {
       spy.mockRestore()
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it("the cleanup refuses any path that is not a direct /tmp/mida-t-* root (in-41 U-3)", () => {
+    // The wall deletes one folder per file and nothing else: a nested temp dir inside the wall
+    // root, /tmp itself, and a real /tmp sibling without the mida-t- name all survive the call —
+    // one stderr line each, and the remover is never reached. An injection of a working rm spy
+    // (not rmSync) is deliberate: if a path were wrongly removed here it would really be gone.
+    const err = vi.spyOn(process.stderr, "write").mockReturnValue(true)
+    const rm = vi.fn()
+    const outside = join(tmpdir(), "mida-t-elsewhere") // inside the wall's own root — not /tmp
+    mkdirSync(outside)
+    const sibling = mkdtempSync("/tmp/mida-other-") // a real /tmp child under the wrong name
+    try {
+      for (const refused of [outside, "/tmp", sibling]) {
+        err.mockClear()
+        removeTestRoot(refused, rm)
+        expect(existsSync(refused), refused).toBe(true)
+        expect(rm, refused).not.toHaveBeenCalled()
+        expect(err, refused).toHaveBeenCalledTimes(1)
+      }
+      // the allowed shape still reaches the remover — on the resolved real path
+      rm.mockClear()
+      const good = mkdtempSync("/tmp/mida-t-")
+      try {
+        removeTestRoot(good, rm)
+        expect(rm).toHaveBeenCalledTimes(1)
+        expect(rm).toHaveBeenCalledWith(realpathSync(good), { recursive: true, force: true })
+      } finally {
+        rmSync(good, { recursive: true, force: true })
+      }
+    } finally {
+      err.mockRestore()
+      rmSync(sibling, { recursive: true, force: true })
     }
   })
 })
