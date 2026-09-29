@@ -473,6 +473,30 @@ describe("mida-mcp startup gate", () => {
     expect(existsSync(join(home.root, "midad.sock"))).toBe(false)
   })
 
+  // Devin imports Claude Code's user-scope MCP list too (Sep 26 live probe), so an installed
+  // claude-code entry IS replayed inside Devin. That one stays off but does not error — an
+  // MCP host shows a non-zero exit as a broken server, and Devin's import is expected traffic.
+  it("under DEVIN_PROJECT_DIR the claude-code entry stays off quietly: its exact line, exit 0, no socket", async () => {
+    const home = makeHome()
+    register(home, "claude-code") // registered and the project marked — the guard is the only refusal
+    const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "claude-code", "--project", makeProject()], {
+      env: spawnEnv({ MIDA_HOME: home.root, DEVIN_PROJECT_DIR: makeProject() }),
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    child.stdin.end() // if the guard missed, the live server would hold the process open
+    let stdout = ""
+    let stderr = ""
+    child.stdout.on("data", (b) => (stdout += b))
+    child.stderr.on("data", (b) => (stderr += b))
+    const code = await new Promise((r) => child.on("exit", r))
+    expect(code).toBe(0)
+    expect(stdout).toBe("")
+    expect(stderr).toBe(
+      "mida-mcp: this is Claude Code's Mida server running inside Devin, so it stays off. Devin uses its own Mida server.\n",
+    )
+    expect(existsSync(join(home.root, "midad.sock"))).toBe(false)
+  })
+
   it("under DEVIN_PROJECT_DIR --as devin passes the guard — the startup gate still decides", async () => {
     const home = makeHome() // devin is NOT registered: the refusal must come from the gate, not the guard
     const child = spawn(process.execPath, ["--import", tsxLoader, mcpMainPath, "--as", "devin", "--project", makeProject()], {

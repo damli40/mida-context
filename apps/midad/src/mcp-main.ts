@@ -58,6 +58,15 @@ async function main(): Promise<void> {
   // permission check.
   const replay = foreignClientReplayReason(parsed.args.agent, process.env, parentProcessBasename)
   if (replay !== null) {
+    // Devin imports Claude Code's user MCP list (Sep 26 probe), so a replayed claude-code entry
+    // is EXPECTED traffic, not a broken server: it stays off but exits 0 — a non-zero exit reads
+    // as an error storm in the host, and this server doing nothing is the intended state.
+    if (parsed.args.agent === "claude-code") {
+      process.stderr.write(
+        "mida-mcp: this is Claude Code's Mida server running inside Devin, so it stays off. Devin uses its own Mida server.\n",
+      )
+      return
+    }
     process.stderr.write(
       `mida-mcp: ${replay} — inside Devin's environment only --as devin may serve (got ${parsed.args.agent === undefined ? "no --as" : `--as ${parsed.args.agent}`})\n`,
     )
