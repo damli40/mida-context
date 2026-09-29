@@ -27,7 +27,7 @@ async function main(): Promise<void> {
     }
     // the drainer holds agent keys only — funding is the owner CLI's job
     network.fund = async () => { throw new Error("the drainer cannot fund accounts") }
-    return ServiceRuntime.open(home, network)
+    return ServiceRuntime.open(home, network, { role: "save-helper" })
   }
 
   // The detached drainer honours the same provider choice the daemon resolves —

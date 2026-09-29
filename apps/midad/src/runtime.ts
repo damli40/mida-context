@@ -155,27 +155,93 @@ export function parseSponsorUrl(raw: string | undefined): string | undefined {
 }
 
 /**
+ * The wait a lock-taker shares — plus the process-table seam tests inject. `ps` answers
+ * `ps -o <field>= -p <pid>`; returning undefined for everything is how a test says "this machine
+ * has no usable ps", which must land every lock verdict on unknown-held.
+ */
+export interface LockTiming {
+  lockWaitMs?: number
+  lockStepMs?: number
+  ps?: ProcessProbe
+}
+
+/**
+ * What a process that took midad.lock was doing — written into the lock itself so a later reader
+ * needs no command-line guesswork (in-40 L-1): `service` is the daemon's runtime, `save-helper`
+ * is the detached drainer's (drain-main.ts), and `command` is every owner-command path.
+ */
+export type LockRole = "service" | "save-helper" | "command"
+
+const LOCK_ROLES = new Set<string>(["service", "save-helper", "command"])
+const lockRole = (raw: unknown): LockRole | undefined =>
+  typeof raw === "string" && LOCK_ROLES.has(raw) ? (raw as LockRole) : undefined
+
+/** `ServiceRuntime.open` options: the lock waits plus the role this opener writes into the lock. */
+export interface OpenOptions extends LockTiming {
+  role?: LockRole
+}
+
+/**
+ * The one process-table lookup behind every lock decision: `ps -o <field>= -p <pid>` under
+ * LC_ALL=C, so the `lstart` answer has one fixed format on every machine. Returns the trimmed
+ * output, or undefined on any failure — a spawn error, a non-zero exit, or empty output
+ * (BusyBox `ps` has no `-p`; a dead pid prints nothing). The lock verdict table treats every
+ * one of those as "cannot identify", which is a held verdict, never a removable lock.
+ */
+export type ProcessProbe = (pid: number, field: "lstart" | "command") => string | undefined
+
+const psProbe: ProcessProbe = (pid, field) => {
+  const ps = spawnSync("ps", ["-o", `${field}=`, "-p", String(pid)], {
+    encoding: "utf8",
+    env: { ...process.env, LC_ALL: "C" },
+  })
+  if (ps.error !== undefined || ps.status !== 0) return undefined
+  const out = ps.stdout.trim()
+  return out === "" ? undefined : out
+}
+
+/**
  * Takes the home's lock or throws. A live pid in an existing lock means another Mida process
  * holds it — the waiter retries in `stepMs` steps for up to `waitMs` before giving up, because a
  * drainer that fired during a long CLI run must not die on a transient hold. A dead, unreadable
- * or non-Mida lock is stale and is replaced — a recycled pid holds nothing (in-39 B-1).
+ * or recycled-pid lock is stale and is replaced (in-39 B-1); a pid ps cannot identify is NOT —
+ * it stays held rather than risk deleting files under a service ps could not see (in-40 L-1).
  * `createSecretJsonExclusive` makes the check-then-create race-free.
+ *
+ * The lock this writes carries `{ pid, started, role }`: `started` is this process's own
+ * `ps -o lstart=` answer, read ONCE here and reused on every retry, so the file always names the
+ * same instant. When ps cannot answer, `started` is left out and readers fall back to the
+ * command-line shape check. `ps` runs at most once per distinct pid per call — the memoized
+ * probe below, not once per step.
  */
-async function acquireHomeLock(home: MidaHome, waitMs: number, stepMs: number): Promise<void> {
+async function acquireHomeLock(home: MidaHome, waitMs: number, stepMs: number, options: { role: LockRole; ps?: ProcessProbe }): Promise<void> {
   const deadline = Date.now() + waitMs
+  const ps = options.ps ?? psProbe
+  const started = ps(process.pid, "lstart")
+  const own: { pid: number; started?: string; role: LockRole } = {
+    pid: process.pid,
+    ...(started === undefined ? {} : { started }),
+    role: options.role,
+  }
+  const seen = new Map<string, string | undefined>()
+  const probe: ProcessProbe = (pid, field) => {
+    const key = `${pid}:${field}`
+    if (!seen.has(key)) seen.set(key, ps(pid, field))
+    return seen.get(key)
+  }
   let heldPid = 0
   for (;;) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      if (home.createSecretJsonExclusive(LOCK_FILE, { pid: process.pid })) return
-      let pid = 0
+      if (home.createSecretJsonExclusive(LOCK_FILE, own)) return
+      let record: { pid?: unknown; started?: unknown; role?: unknown } | undefined
       try {
-        const held = home.readJson<{ pid?: unknown }>(LOCK_FILE)
-        if (typeof held?.pid === "number") pid = held.pid
+        record = home.readJson(LOCK_FILE)
       } catch {
-        // A lock file that will not parse is stale: take it over.
+        record = undefined // a lock file that will not parse is stale: take it over
       }
-      if (pid > 0 && processAlive(pid) && isMidaProcess(pid) !== false) {
-        heldPid = pid
+      const holder = lockVerdict(record, probe)
+      if (holder !== undefined && (holder.kind === "held" || holder.kind === "unknown")) {
+        heldPid = holder.pid
         break
       }
       home.remove(LOCK_FILE)
@@ -198,9 +264,10 @@ function processAlive(pid: number): boolean {
 
 /**
  * The executable names a Mida entry runs under — the npm package's bins and the shebang form a
- * package manager's shim ends up as (`node /usr/local/bin/mida`). `mida-drain`, `mida-hook`,
- * `mida-inject` and `mida-mcp` all take the home lock through ServiceRuntime.open, so they hold
- * the lock exactly like the daemon does.
+ * package manager's shim ends up as (`node /usr/local/bin/mida`). Only `midad` (the service) and
+ * `mida-drain` (the save helper) take the home lock through ServiceRuntime.open; `mida` takes it
+ * on owner-command paths through resolveOwnerApi, and `mida-hook`, `mida-inject` and `mida-mcp`
+ * never take it — they enqueue a job or call the control socket.
  */
 const MIDA_BIN_NAMES = new Set(["mida", "midad", "mida-drain", "mida-hook", "mida-inject", "mida-mcp"])
 
@@ -217,67 +284,120 @@ const MIDA_ENTRY = /(?:^|\/)(?:dist\/(?:mida|midad|mida-drain|mida-hook|mida-inj
 const MIDA_RUNNERS = new Set(["node", "nodejs", "tsx", "env"])
 
 /**
- * Whether pid is one of Mida's own processes, judged by `ps -o command= -p <pid>` — the one
- * identity check behind every "is this lock really held" decision (in-39 B-1): `kill -0`
- * answering only proves SOME process owns the number, and a crashed Mida's pid is recycled to
- * an unrelated program fast enough that liveness alone once made doctor tell the owner to kill
- * a stranger. An entry path counts only behind a runner — `vim apps/midad/src/daemon-main.ts`
- * is an editor, not the service. Returns undefined when `ps` itself fails (no ps, a spawn
- * error): the caller then treats the pid as live-but-unproven — the worst that does is leave a
- * lock in place, never remove files under a service it could not see.
+ * The role a matched entry plays — consulted only for a legacy lock with no `started`, where the
+ * command line is the only evidence left. Every entry not listed here (mida, the hooks, the MCP
+ * adapter and their source mains) takes the lock for the length of an owner command.
  */
-export function isMidaProcess(pid: number): boolean | undefined {
-  const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" })
-  if (ps.error !== undefined) return undefined
-  const command = ps.stdout.trim()
-  // ps ran and named nothing — the pid ended between the liveness check and here
-  if (command === "") return false
-  const tokens = command.split(/\s+/).map((token) => token.replace(/^["']+|["']+$/g, ""))
-  const base = (i: number) => tokens[i]!.split("/").pop()!
-  if (MIDA_BIN_NAMES.has(base(0))) return true
-  for (let i = 0; i < tokens.length; i++) {
-    if (!MIDA_RUNNERS.has(base(i))) continue
-    for (let k = i + 1; k < tokens.length; k++) {
-      if (MIDA_ENTRY.test(tokens[k]!) || MIDA_BIN_NAMES.has(base(k))) return true
-    }
-  }
-  return false
+const ENTRY_ROLES: Record<string, LockRole> = {
+  "midad": "service",
+  "midad.js": "service",
+  "daemon-main.ts": "service",
+  "mida-drain": "save-helper",
+  "mida-drain.js": "save-helper",
+  "drain-main.ts": "save-helper",
 }
 
 /**
- * Who midad.lock names and what it is: `mida` — a live process running a Mida entry; `foreign` —
- * a live pid that is not Mida (a recycled number; the lock it sits in is stale); `unknown` — a
- * live pid ps could not identify, treated everywhere a file could be deleted as still held;
- * `dead` — the pid is gone. Undefined means no lock or an unreadable one.
+ * The role a command line implies, or null when it is not a Mida launch at all — the shape check
+ * behind in-39 B-1, kept for locks written before `started` existed. An entry path counts only
+ * behind a runner — `vim apps/midad/src/daemon-main.ts` is an editor, not the service.
  */
-export type LockHolderKind = "mida" | "foreign" | "unknown" | "dead"
+function midaRoleFromCommand(command: string): LockRole | null {
+  const tokens = command.split(/\s+/).map((token) => token.replace(/^["']+|["']+$/g, ""))
+  const base = (token: string) => token.split("/").pop()!
+  if (tokens.length > 0 && MIDA_BIN_NAMES.has(base(tokens[0]!))) return ENTRY_ROLES[base(tokens[0]!)] ?? "command"
+  for (let i = 0; i < tokens.length; i++) {
+    if (!MIDA_RUNNERS.has(base(tokens[i]!))) continue
+    for (let k = i + 1; k < tokens.length; k++) {
+      if (MIDA_ENTRY.test(tokens[k]!) || MIDA_BIN_NAMES.has(base(tokens[k]!))) {
+        return ENTRY_ROLES[base(tokens[k]!)] ?? "command"
+      }
+    }
+  }
+  return null
+}
 
-export function lockHolder(home: MidaHome): { pid: number; kind: LockHolderKind } | undefined {
-  let pid = 0
+/**
+ * Whether pid is one of Mida's own processes, judged by `ps -o command= -p <pid>` — the identity
+ * check a lock verdict falls back to when the lock predates `started` (in-39 B-1): `kill -0`
+ * answering only proves SOME process owns the number, and a crashed Mida's pid is recycled to
+ * an unrelated program fast enough that liveness alone once made doctor tell the owner to kill
+ * a stranger. Returns undefined when `ps` itself fails or prints nothing: the caller then treats
+ * the pid as live-but-unproven — the worst that does is leave a lock in place, never remove
+ * files under a service it could not see.
+ */
+export function isMidaProcess(pid: number): boolean | undefined {
+  const command = psProbe(pid, "command")
+  if (command === undefined) return undefined
+  return midaRoleFromCommand(command) !== null
+}
+
+/**
+ * What midad.lock says about who holds this home. `held` — a live Mida process took it (`role`
+ * says which kind); `dead` — the pid is gone; `recycled` — the pid lives but belongs to a
+ * different process than the one that wrote the lock (the start times disagree, or the command
+ * line is not Mida's); `unknown` — the pid is live but ps cannot say what it is. Held and
+ * unknown both keep every file in place; dead and recycled let the lock be replaced. Undefined
+ * means no lock or an unreadable one.
+ */
+export type LockHolderKind = "held" | "dead" | "recycled" | "unknown"
+export interface LockHolder {
+  pid: number
+  kind: LockHolderKind
+  role?: LockRole
+}
+
+/**
+ * The verdict table every caller shares (in-40 L-1): the writer's own pid is held without asking
+ * ps; a dead pid is stale; a `started` that matches `ps -o lstart=` proves the live pid IS the
+ * process that wrote the lock — whatever shape its command line takes; a mismatch means the
+ * number was recycled onto a stranger; a ps that cannot answer is unknown-held on any lock
+ * shape; and a lock with no `started` (an older Mida wrote it) falls back to the command-line
+ * shape check, which names the role or calls the lock recycled.
+ */
+function lockVerdict(
+  record: { pid?: unknown; started?: unknown; role?: unknown } | undefined,
+  probe: ProcessProbe,
+): LockHolder | undefined {
+  const pid = typeof record?.pid === "number" ? record.pid : 0
+  if (pid <= 0) return undefined
+  const role = lockRole(record?.role)
+  if (pid === process.pid) return { pid, kind: "held", role: role ?? "command" }
+  if (!processAlive(pid)) return { pid, kind: "dead" }
+  const started = typeof record?.started === "string" && record.started !== "" ? record.started : undefined
+  if (started !== undefined) {
+    const seen = probe(pid, "lstart")
+    if (seen === undefined) return { pid, kind: "unknown" }
+    return seen === started ? { pid, kind: "held", ...(role === undefined ? {} : { role }) } : { pid, kind: "recycled" }
+  }
+  const command = probe(pid, "command")
+  if (command === undefined) return { pid, kind: "unknown" }
+  const shaped = midaRoleFromCommand(command)
+  return shaped === null ? { pid, kind: "recycled" } : { pid, kind: "held", role: shaped }
+}
+
+export function lockHolder(home: MidaHome, ps?: ProcessProbe): LockHolder | undefined {
+  let record: { pid?: unknown; started?: unknown; role?: unknown } | undefined
   try {
-    const held = home.readJson<{ pid?: unknown }>(LOCK_FILE)
-    if (typeof held?.pid === "number") pid = held.pid
+    record = home.readJson(LOCK_FILE)
   } catch {
     return undefined
   }
-  if (pid <= 0) return undefined
-  if (!processAlive(pid)) return { pid, kind: "dead" }
-  const mida = isMidaProcess(pid)
-  return { pid, kind: mida === undefined ? "unknown" : mida ? "mida" : "foreign" }
+  return lockVerdict(record, ps ?? psProbe)
 }
 
 /**
- * The pid of the Mida process holding this home's lock — undefined when there is no lock, the
- * lock is unreadable, its pid is dead, or the pid is live but is not a Mida process (a recycled
- * number holds nothing, in-39 B-1). The socket probe answers a different question (is a listener
+ * The pid of the process holding this home's lock — undefined when there is no lock, the lock is
+ * unreadable, its pid is dead, or the pid was recycled onto another program (a recycled number
+ * holds nothing, in-39 B-1). The socket probe answers a different question (is a listener
  * reachable right now); this answers the one that decides whether the socket file is stale: a
  * live holder's files must never be removed under it (in-29 S-1, the Sep 29 orphaning bug). A
  * live pid that cannot be identified still counts as held — leaving a lock in place is the safe
  * error, deleting a running service's files is the bad one.
  */
-export function liveLockHolderPid(home: MidaHome): number | undefined {
-  const holder = lockHolder(home)
-  return holder !== undefined && (holder.kind === "mida" || holder.kind === "unknown") ? holder.pid : undefined
+export function liveLockHolderPid(home: MidaHome, ps?: ProcessProbe): number | undefined {
+  const holder = lockHolder(home, ps)
+  return holder !== undefined && (holder.kind === "held" || holder.kind === "unknown") ? holder.pid : undefined
 }
 
 export function apiClient(
@@ -363,7 +483,7 @@ async function daemonApiBaseUrl(home: MidaHome): Promise<string | undefined> {
 async function resolveOwnerApi(
   home: MidaHome,
   network: Network,
-  timing?: { lockWaitMs?: number; lockStepMs?: number },
+  timing?: LockTiming,
 ): Promise<{ apiBaseUrl: string; server?: { baseUrl: string; close(): Promise<void> }; locked: boolean }> {
   const storageUrl = parseStorageUrl(network.storageUrl)
   let server: { baseUrl: string; close(): Promise<void> } | undefined
@@ -375,7 +495,7 @@ async function resolveOwnerApi(
     apiBaseUrl = (await daemonApiBaseUrl(home)) ?? ""
     if (apiBaseUrl === "") {
       try {
-        await acquireHomeLock(home, timing?.lockWaitMs ?? 30_000, timing?.lockStepMs ?? 250)
+        await acquireHomeLock(home, timing?.lockWaitMs ?? 30_000, timing?.lockStepMs ?? 250, { role: "command", ps: timing?.ps })
         locked = true
       } catch (error) {
         // The holder may be a daemon mid-start: if it has come up since, use its API instead of failing.
@@ -432,7 +552,7 @@ export class ServiceRuntime {
     this.reader = new RegistryReader(chain)
   }
 
-  static async open(home: MidaHome, network: Network, timing?: { lockWaitMs?: number; lockStepMs?: number }): Promise<ServiceRuntime> {
+  static async open(home: MidaHome, network: Network, options?: OpenOptions): Promise<ServiceRuntime> {
     const storageUrl = parseStorageUrl(network.storageUrl)
     parseSponsorUrl(network.sponsorUrl) // a malformed sponsor URL is refused before the lock too
     const owner = loadOwnerAddress(home)
@@ -441,7 +561,7 @@ export class ServiceRuntime {
       error.code = "no-owner-address"
       throw error
     }
-    await acquireHomeLock(home, timing?.lockWaitMs ?? 30_000, timing?.lockStepMs ?? 250)
+    await acquireHomeLock(home, options?.lockWaitMs ?? 30_000, options?.lockStepMs ?? 250, { role: options?.role ?? "service", ps: options?.ps })
     let server: { baseUrl: string; close(): Promise<void> } | undefined
     try {
       if (storageUrl === undefined) {
@@ -476,7 +596,7 @@ export class ServiceRuntime {
    * page does the signing. The owner address comes from owner-address.json — written by
    * `mida init --passkey` after the chain proved the passkey's key is registered.
    */
-  static async openOwnerSession(home: MidaHome, network: Network, timing?: { lockWaitMs?: number; lockStepMs?: number }): Promise<ServiceRuntime> {
+  static async openOwnerSession(home: MidaHome, network: Network, timing?: LockTiming): Promise<ServiceRuntime> {
     parseSponsorUrl(network.sponsorUrl) // a malformed URL is refused before any work, as in Runtime.open
     const owner = loadOwnerAddress(home)
     if (owner === undefined) {
@@ -586,7 +706,7 @@ export class Runtime extends ServiceRuntime {
   static override async open(
     home: MidaHome,
     network: Network,
-    timing?: { lockWaitMs?: number; lockStepMs?: number },
+    timing?: LockTiming,
     keys: "load-or-create" | "load-only" = "load-or-create",
   ): Promise<Runtime> {
     const sponsorUrl = parseSponsorUrl(network.sponsorUrl)

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { createServer as createHttpServer } from "node:http"
 import { tmpdir } from "node:os"
@@ -158,6 +158,54 @@ describe("startDaemon", () => {
         expect(daemon.alreadyRunning).toBe(false)
         // the stale lock was replaced by this service's own entry
         expect(home.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(process.pid)
+        const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 1_000 })
+        expect(reply.status).toBe(200)
+      } finally {
+        await daemon.close()
+      }
+    } finally {
+      holder.kill()
+    }
+  })
+
+  it("a holder whose lock proves it by start time keeps its socket — the command line is not asked (in-40 L-1)", async () => {
+    // The Sep 29 orphaning bug, fixed for good: the child is a bare `node -e` — no Mida-shaped
+    // command line at all — but the lock carries the exact `ps -o lstart=` answer for its pid, so
+    // it IS the process that took the lock. startDaemon must keep the socket file and back off.
+    const { home, deps } = setup()
+    const socketPath = socketPathFor(home)
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
+    try {
+      const started = spawnSync("ps", ["-o", "lstart=", "-p", String(holder.pid)], {
+        encoding: "utf8",
+        env: { ...process.env, LC_ALL: "C" },
+      }).stdout.trim()
+      home.writeSecretJson("midad.lock", { pid: holder.pid, started, role: "service" })
+      writeFileSync(socketPath, "")
+      const daemon = await startDaemon({ ...deps, staleCheckMs: 50 })
+      try {
+        expect(daemon.alreadyRunning).toBe(true)
+        expect(existsSync(socketPath)).toBe(true) // the live holder's file was never removed
+      } finally {
+        await daemon.close()
+      }
+    } finally {
+      holder.kill()
+    }
+  })
+
+  it("a lock whose start time was recycled onto another program lets the start proceed (in-40 L-1)", async () => {
+    // Same shape, one byte off: the pid lives but belongs to a process started at a different
+    // instant, so the lock is stale and the new service takes over — the socket file goes with it.
+    const { home, deps } = setup()
+    const socketPath = socketPathFor(home)
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
+    try {
+      home.writeSecretJson("midad.lock", { pid: holder.pid, started: "Thu Jan  1 00:00:00 1970", role: "service" })
+      writeFileSync(socketPath, "")
+      const daemon = await startDaemon({ ...deps, staleCheckMs: 50 })
+      try {
+        expect(daemon.alreadyRunning).toBe(false)
         const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 1_000 })
         expect(reply.status).toBe(200)
       } finally {

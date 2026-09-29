@@ -29,6 +29,7 @@ import type { OwnerMode } from "./keys.js"
 import { approvalsFileStatus, readApprovalsFile } from "./projects.js"
 import { listJobs } from "./queue.js"
 import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, MIN_BALANCE_WEI, formatMon, lockHolder, serviceUrlInEffect, sponsorReachable } from "./runtime.js"
+import type { ProcessProbe } from "./runtime.js"
 import { mismatchLine, readSavedNetwork, resolveNetwork } from "./network.js"
 import type { ResolvedNetwork, SavedNetwork, ServiceSource } from "./network.js"
 import { cliPackageName, isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
@@ -81,6 +82,11 @@ export interface DoctorDeps {
   fetch?: typeof fetch
   /** The wallet check's sponsor liveness probe — default the real one; injectable for tests. */
   sponsorReachable?: (url: string) => Promise<boolean>
+  /**
+   * The process-table lookup behind the lock verdict (in-40 L-1). Default shells out to `ps`;
+   * a test injects one to force the unknown verdict on a machine that can read `ps` fine.
+   */
+  ps?: ProcessProbe
   /**
    * Asks the store where a pending batched save stands — the default is a signed
    * `getBatchSave` as the entry's own agent; null means "could not find out", which counts as
@@ -386,17 +392,17 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         shared.serviceUp = reply.status !== 0
         if (reply.status === 0) {
           // The lock pid decides what "not answering" means — but the pid alone is never proof:
-          // a dead Mida's number is recycled, so only a pid the command line identifies as Mida
-          // may be named or killed here (in-39 B-1). A live foreign pid is a stale lock left by
-          // an unclean exit; a live pid ps could not identify is never called Mida either — and
-          // never suggested as a kill target.
-          const holder = lockHolder(home)
-          if (holder !== undefined && holder.kind === "mida" && (existsSync(socketPathFor(home)) || home.has("api-url.json"))) {
+          // a dead Mida's number is recycled, so only a pid the verdict proves still held by its
+          // writer may be named or killed here (in-39 B-1, in-40 L-1). A live recycled pid is a
+          // stale lock left by an unclean exit; a live pid ps could not identify is never called
+          // Mida either — and never suggested as a kill target.
+          const holder = lockHolder(home, deps.ps)
+          if (holder !== undefined && holder.kind === "held" && (existsSync(socketPathFor(home)) || home.has("api-url.json"))) {
             return [
               `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with kill ${holder.pid}, then open any agent session or run mida task to start a fresh one.`,
             ]
           }
-          if (holder !== undefined && holder.kind === "foreign") {
+          if (holder !== undefined && holder.kind === "recycled") {
             return [
               `PROBLEM: midad.lock names pid ${holder.pid}, which is not a Mida service, so the last Mida service did not exit cleanly. Open any agent session or run mida task; the new service clears the stale lock.`,
             ]

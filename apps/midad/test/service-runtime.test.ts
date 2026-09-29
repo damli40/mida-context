@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
@@ -23,6 +23,20 @@ const network: Network = { rpcUrl: "http://127.0.0.1:1", deployment: DEPLOYMENT 
 const OWNER = "0x1111111111111111111111111111111111111111"
 
 const freshHome = () => new MidaHome(mkdtempSync(join(tmpdir(), "mida-svc-")))
+
+/**
+ * What `ps -o lstart= -p <pid>` prints for a live pid under LC_ALL=C — the exact string a lock
+ * writer stores in `started`. A test spawns the child and only ever kills what it spawned.
+ */
+const lstartOf = (pid: number): string | undefined => {
+  const ps = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+    encoding: "utf8",
+    env: { ...process.env, LC_ALL: "C" },
+  })
+  if (ps.error !== undefined || ps.status !== 0) return undefined
+  const out = ps.stdout.trim()
+  return out === "" ? undefined : out
+}
 
 describe("ServiceRuntime — the daemon's runtime", () => {
   it("refuses to open when owner-address.json is missing, with one line telling the user to run mida init", async () => {
@@ -102,5 +116,100 @@ describe("ServiceRuntime — the daemon's runtime", () => {
     } finally {
       holder.kill()
     }
+  })
+
+  it("writes the lock with the writer's start time and role — the lock proves who took it", async () => {
+    const home = freshHome()
+    home.writeSecretJson("owner-address.json", { address: OWNER })
+    const runtime = await ServiceRuntime.open(home, network)
+    try {
+      const lock = home.readJson<{ pid?: number; started?: string; role?: string }>("midad.lock")!
+      expect(lock.pid).toBe(process.pid)
+      expect(lock.role).toBe("service")
+      expect(lock.started).toBe(lstartOf(process.pid))
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it("an open role other than the daemon's lands in the lock — the drainer writes save-helper", async () => {
+    const home = freshHome()
+    home.writeSecretJson("owner-address.json", { address: OWNER })
+    const runtime = await ServiceRuntime.open(home, network, { role: "save-helper" })
+    try {
+      expect(home.readJson<{ role?: string }>("midad.lock")?.role).toBe("save-helper")
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  it("a lock whose started matches the live pid is held — even when the command line is not Mida's (in-40 L-1)", async () => {
+    // The Sep 29 orphaning bug's fix: a plain `node -e` child wears no Mida command line, but the
+    // lock it is written into carries its real start time — the match proves the process IS the
+    // one that took the lock, so open refuses and leaves everything alone.
+    const home = freshHome()
+    home.writeSecretJson("owner-address.json", { address: OWNER })
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
+    try {
+      const started = lstartOf(holder.pid!)
+      expect(started).toBeDefined()
+      home.writeSecretJson("midad.lock", { pid: holder.pid, started, role: "service" })
+      await expect(ServiceRuntime.open(home, network, { lockWaitMs: 300, lockStepMs: 50 })).rejects.toThrow(
+        `another Mida process (pid ${holder.pid}) already holds this home`,
+      )
+      expect(home.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(holder.pid)
+    } finally {
+      holder.kill()
+    }
+  })
+
+  it("a lock whose start time does not match the live pid is stale — the number was recycled (in-40 L-1)", async () => {
+    // The process the lock remembers is gone; a different program owns the pid now, so the start
+    // times disagree and open takes the lock over instead of waiting on a stranger.
+    const home = freshHome()
+    home.writeSecretJson("owner-address.json", { address: OWNER })
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
+    try {
+      home.writeSecretJson("midad.lock", { pid: holder.pid, started: "Thu Jan  1 00:00:00 1970", role: "service" })
+      const runtime = await ServiceRuntime.open(home, network, { lockWaitMs: 500, lockStepMs: 50 })
+      try {
+        expect(home.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(process.pid)
+      } finally {
+        await runtime.close()
+      }
+    } finally {
+      holder.kill()
+    }
+  })
+
+  it("a lock ps cannot check at all stays held — a missing ps is never a reason to remove it (in-40 L-1)", async () => {
+    // BusyBox ps has no -p, Windows has no ps: whatever the lock says, an uninspectable pid is
+    // "unknown" — held, not stale — so the live service under it is never mistaken for dead.
+    const home = freshHome()
+    home.writeSecretJson("owner-address.json", { address: OWNER })
+    const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
+    try {
+      home.writeSecretJson("midad.lock", { pid: holder.pid, started: lstartOf(holder.pid!), role: "service" })
+      const noPs = () => undefined
+      await expect(
+        ServiceRuntime.open(home, network, { lockWaitMs: 300, lockStepMs: 50, ps: noPs }),
+      ).rejects.toThrow(/another Mida process/)
+      expect(home.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(holder.pid)
+    } finally {
+      holder.kill()
+    }
+  })
+
+  it("a legacy {pid} lock naming this very process is held — the writer's own pid needs no ps (in-40 L-1)", async () => {
+    // The B7b shape: one process opened the home and the SAME process opens it again — the lock's
+    // pid is this process's own, so the answer is "held" before any process-table question is
+    // asked. Removing it would orphan the live first runtime.
+    const home = freshHome()
+    home.writeSecretJson("owner-address.json", { address: OWNER })
+    home.writeSecretJson("midad.lock", { pid: process.pid })
+    await expect(ServiceRuntime.open(home, network, { lockWaitMs: 300, lockStepMs: 50 })).rejects.toThrow(
+      `another Mida process (pid ${process.pid}) already holds this home`,
+    )
+    expect(home.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(process.pid)
   })
 })
