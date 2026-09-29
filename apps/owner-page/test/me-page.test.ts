@@ -570,6 +570,30 @@ describe("/me is read-only — revoking happens in the terminal", () => {
     }
   })
 
+  it("an agent-chosen name unsafe for a shell command never enters the revoke line (in-30 NIT 7)", () => {
+    const FALLBACK = "To revoke this agent, run mida doctor in your terminal to find its name, then mida revoke with that name."
+    const unsafe = [
+      "; rm -rf ~",
+      "claude; rm -rf ~",
+      "name with space",
+      "Name-With-Upper",
+      "-leading-dash",
+      `a${"b".repeat(40)}`, // 41 chars — one over the bound
+    ]
+    const agents = unsafe.map((name, i) => agent({ agentId: `0x${String(0x10 + i).padStart(2, "0").repeat(32)}` as Hex, name }))
+    const root = renderMe(data({ agents }), fakeDoc()) as unknown as FakeEl
+    const rows = all(root, ".agent")
+    expect(rows).toHaveLength(unsafe.length)
+    for (const [i, name] of unsafe.entries()) {
+      const text = rows[i]!.textContent
+      expect(text, `name ${JSON.stringify(name)} must not enter a command line`).not.toContain(`mida revoke ${name}`)
+      expect(text).toContain(FALLBACK)
+    }
+    // A name inside the safe pattern still gets the direct command.
+    const safe = renderMe(data({ agents: [agent({ name: "codex-cli-9" })] }), fakeDoc()) as unknown as FakeEl
+    expect(all(safe, ".agent")[0]!.textContent).toContain("To revoke: run mida revoke codex-cli-9 in your terminal.")
+  })
+
   it("the agents section states the page is read-only, and why the terminal owns revoking", () => {
     const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
     const sec = root.querySelector('[aria-labelledby="agents-title"]')

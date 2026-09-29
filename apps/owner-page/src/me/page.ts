@@ -259,7 +259,13 @@ function renderAgent(doc: Document, agent: AgentRow): HTMLElement {
   }
   // Read-only build: where the revoke button stood, the row names the terminal command instead.
   // A revoke rotates the area key, and the terminal is where the re-key is guaranteed to run.
-  box.appendChild(elOf(doc, "p", "revoke-note", `To revoke: run mida revoke ${agent.name} in your terminal.`))
+  // The name is the agent's own manifest string — it goes into a command line only when it is
+  // plainly a safe shell word; anything else gets the fallback that finds the name first
+  // (in-30 NIT 7).
+  const revokeNote = /^[a-z0-9][a-z0-9-]{0,39}$/.test(agent.name)
+    ? `To revoke: run mida revoke ${agent.name} in your terminal.`
+    : "To revoke this agent, run mida doctor in your terminal to find its name, then mida revoke with that name."
+  box.appendChild(elOf(doc, "p", "revoke-note", revokeNote))
   return row
 }
 
