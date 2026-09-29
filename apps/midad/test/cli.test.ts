@@ -321,6 +321,55 @@ describe("the crude mida command", () => {
     expect(out.some((line) => line.startsWith("approved devin"))).toBe(true)
   }, 300_000)
 
+  it("the real `mida install devin --no-mcp` reaches the owner command — not runInstall's refusal (in-28)", async () => {
+    // main sends `install devin` (two words) to the owner path because it provisions an
+    // identity; the three-word --no-mcp form instead fell into runInstall, which refuses
+    // devin outright. A spawned non-TTY run answers needs-terminal ONLY if it reached the
+    // owner path — the one discriminator between the two routes.
+    const spawnHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-route-home-")))
+    const deployment = env.deployment
+    spawnHome.writeSecretJson("network.json", {
+      rpcUrl: env.rpcUrl,
+      deployment: {
+        chainId: deployment.chainId.toString(10),
+        capabilityRegistry: deployment.capabilityRegistry,
+        contextRegistry: deployment.contextRegistry,
+        deploymentBlock: deployment.deploymentBlock.toString(10),
+        vaultRpId: deployment.vaultRpId,
+        vaultRpIdHash: deployment.vaultRpIdHash,
+        policyHashV1: deployment.policyHashV1,
+        ...(deployment.batchAnchor === undefined
+          ? {}
+          : { batchAnchor: deployment.batchAnchor, batchAnchorBlock: deployment.batchAnchorBlock!.toString(10) }),
+      },
+    })
+    const repo = resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
+    const res = await new Promise<{ status: number | null; stdout: string; stderr: string }>((done, reject) => {
+      const child = spawn(
+        process.execPath,
+        ["--import", join(repo, "node_modules/tsx/dist/loader.mjs"), join(repo, "apps/midad/src/cli.ts"), "install", "devin", "--no-mcp"],
+        {
+          env: {
+            HOME: mkdtempSync(join(tmpdir(), "mida-route-os-")),
+            MIDA_HOME: spawnHome.root,
+            PATH: process.env.PATH ?? "",
+          },
+          cwd: mkdtempSync(join(tmpdir(), "mida-route-cwd-")),
+        },
+      )
+      let stdout = ""
+      let stderr = ""
+      child.stdout.on("data", (b: Buffer) => (stdout += b.toString("utf8")))
+      child.stderr.on("data", (b: Buffer) => (stderr += b.toString("utf8")))
+      child.on("error", reject)
+      child.on("exit", (code) => done({ status: code, stdout, stderr }))
+    })
+    // needs-terminal says the owner path ran; "is an owner command" says runInstall refused it
+    expect(res.status).toBe(2)
+    expect(res.stdout).toContain(NEEDS_TERMINAL_LINE)
+    expect(res.stdout).not.toContain("is an owner command")
+  }, 120_000)
+
   it("an expired pending request refuses BEFORE the history scan — no 'about N requests' line (in-15 J-2)", async () => {
     // Sep 27 live: `approve --all` printed "checking devin's history on the chain (about 928
     // requests)…" before answering REQUEST_EXPIRED. The window needs only the chain's clock.

@@ -2297,8 +2297,12 @@ async function main(): Promise<void> {
   // whether the daemon is even up — running it through the socket would report on nothing.
   // `install <client>` and `install devin` are the exception: they register the tool's identity
   // on the chain (in-9: devin's install is its provision pass), so they fall through to the
-  // owner commands like approve.
-  if (argv[0] === "uninstall" || (argv[0] === "install" && !(argv.length === 2 && (MCP_CLIENT_TOOLS.includes(argv[1] ?? "") || argv[1] === "devin")))) {
+  // owner commands like approve. `install devin --no-mcp` is that same provisioning install
+  // with the server step skipped — it belongs on the owner path too (in-28b).
+  const installProvisionsIdentity =
+    (argv.length === 2 && (MCP_CLIENT_TOOLS.includes(argv[1] ?? "") || argv[1] === "devin")) ||
+    (argv.length === 3 && argv[1] === "devin" && argv[2] === "--no-mcp")
+  if (argv[0] === "uninstall" || (argv[0] === "install" && !installProvisionsIdentity)) {
     // the real settings paths are built here and only here — tests always pass their own
     process.exitCode = runInstall(argv, {
       print,
