@@ -6,9 +6,10 @@
 // eth_* calls Runtime.open makes; no real sponsor, daemon or chain.
 
 import { describe, expect, it } from "vitest"
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { createServer as createHttpServer } from "node:http"
-import type { AddressInfo } from "node:net"
+import { createServer } from "node:net"
+import type { AddressInfo, Server } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { parseDeployment } from "@mida/chain"
@@ -22,6 +23,7 @@ import {
   runDoctor,
   saveOwnerAddress,
   saveOwnerMode,
+  socketPathFor,
 } from "@mida/midad"
 import type { Network } from "@mida/midad"
 import { setSponsorUrl } from "../src/network.js"
@@ -144,7 +146,13 @@ describe("mida sponsor on|off", () => {
     passkey?: boolean
     customSpace?: boolean
     /** What the injected restartDaemon reports back — undefined reads as "restarted" (in-39 B-6). */
-    restartOutcome?: "restarted" | "not-running" | "kept-running"
+    restartOutcome?: "restarted" | "not-running" | "kept-running" | "stopping" | "stopped-not-started"
+    /** Run the real restartDaemonNow against a stub control socket instead of injecting the outcome (in-40 L-3). */
+    realRestart?: boolean
+    /** Shrinks the restart window so a real-path test does not wait ten seconds. */
+    restartWaitMs?: number
+    /** Fires inside the spawn spy — a test stands its "new service" stub up here. */
+    onSpawn?: () => void
     env?: Record<string, string>
   } = {}) => {
     const rpc = await stubRpc()
@@ -169,10 +177,16 @@ describe("mida sponsor on|off", () => {
       saveOwnerMode(home, "passkey")
       saveOwnerAddress(home, OWNER)
     }
+    if (over.realRestart === true) {
+      // the command sees a service answering the control socket, so it wants the address the
+      // service published — sponsor never calls the store, so any well-formed URL satisfies it
+      home.writeSecretJson("api-url.json", { baseUrl: "http://127.0.0.1:9" })
+    }
     const lines: string[] = []
     const asked: string[] = []
     const restarts: number[] = []
     const kicks: number[] = []
+    const spawns: string[] = []
     let answer = "yes"
     const run = (...argv: string[]) =>
       runCli(argv, {
@@ -188,15 +202,77 @@ describe("mida sponsor on|off", () => {
         stdoutIsTTY: true,
         env: over.env ?? {},
         kickDaemon: () => void kicks.push(1),
-        restartDaemon: () => {
-          restarts.push(1)
-          return over.restartOutcome
-        },
+        ...(over.realRestart === true
+          ? {
+              // the real restartDaemonNow runs against the stub control socket the test stood
+              // up; the spawn is a spy, so no daemon process is ever created
+              spawnService: (cwd: string) => {
+                spawns.push(cwd)
+                over.onSpawn?.()
+              },
+              sponsorRestartWaitMs: over.restartWaitMs ?? 800,
+            }
+          : {
+              restartDaemon: () => {
+                restarts.push(1)
+                return over.restartOutcome
+              },
+            }),
       })
     const close = async () => {
       await rpc.close()
     }
-    return { rpc, home, lines, asked, restarts, kicks, run, close, sayNo: () => (answer = "no") }
+    return { rpc, home, lines, asked, restarts, kicks, spawns, run, close, sayNo: () => (answer = "no") }
+  }
+
+  /**
+   * A fake midad on this home's control socket: every request line that arrives is handed to
+   * `answer`, which returns the HTTP status to send back; "hang" holds the connection open so
+   * the client's own timer fires (the busy-service shape); "destroy" kills the connection —
+   * the probe's unreachable verdict; "close200" answers 200, then closes the listener once the
+   * reply has flushed, which is what a real service's graceful stop looks like from outside.
+   * The test started this server and closes it itself.
+   */
+  const stubService = async (
+    home: MidaHome,
+    answer: (path: string) => number | "hang" | "destroy" | "close200",
+  ): Promise<{ server: Server; close(): Promise<void> }> => {
+    const sockets = new Set<import("node:net").Socket>()
+    const reply = (socket: import("node:net").Socket, status: number) => {
+      const payload = JSON.stringify({ ok: true })
+      socket.end(
+        `HTTP/1.1 ${status} OK\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(payload)}\r\nconnection: close\r\n\r\n${payload}`,
+      )
+    }
+    const server = createServer((socket) => {
+      sockets.add(socket)
+      socket.on("close", () => sockets.delete(socket))
+      socket.on("data", (buf) => {
+        const path = buf.toString("utf8").split(" ")[1] ?? ""
+        const status = answer(path)
+        if (status === "hang") return
+        if (status === "destroy") {
+          socket.destroy()
+          return
+        }
+        if (status === "close200") {
+          reply(socket, 200)
+          socket.once("close", () => void closeSelf())
+          return
+        }
+        reply(socket, status)
+      })
+    })
+    const closeSelf = () =>
+      new Promise<void>((done) => {
+        for (const socket of sockets) socket.destroy()
+        server.close(() => done())
+      })
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject)
+      server.listen(socketPathFor(home), () => resolve())
+    })
+    return { server, close: closeSelf }
   }
 
   it("on writes the hosted sponsor into an old-style file, says so, and restarts the service — every other byte intact", async () => {
@@ -237,6 +313,116 @@ describe("mida sponsor on|off", () => {
       expect(lines).toContain(
         "note: the Mida service did not restart, so it keeps the old gas setting until its next start. Run mida doctor to check.",
       )
+    } finally {
+      await close()
+    }
+  })
+
+  it("a shutdown that was accepted but not finished says the old service is stopping (in-40 L-3)", async () => {
+    // The save pass a draining daemon is mid-way through can outlive the ten-second window —
+    // claiming "keeps the old gas setting" would be wrong: it IS leaving, just not yet gone.
+    const { lines, run, close } = await setup({ customSpace: true, restartOutcome: "stopping" })
+    try {
+      expect(await run("sponsor", "on")).toBe(0)
+      expect(lines).toContain(
+        "note: the Mida service is finishing its current work and will then stop. After that, open any agent session or run mida task to start it with the new gas setting.",
+      )
+    } finally {
+      await close()
+    }
+  })
+
+  it("a spawn that never answers says the service stopped but did not start (in-40 L-3)", async () => {
+    const { lines, run, close } = await setup({ customSpace: true, restartOutcome: "stopped-not-started" })
+    try {
+      expect(await run("sponsor", "on")).toBe(0)
+      expect(lines).toContain(
+        "note: the Mida service stopped, but a new one did not start. Open any agent session or run mida task to start it with the new gas setting.",
+      )
+    } finally {
+      await close()
+    }
+  })
+
+  it("a busy service whose /health times out still counts as running — shutdown and spawn both happen (in-40 L-3)", async () => {
+    // The in-40 bug shape: the first probe's timer fired while a busy daemon held the socket,
+    // and status 0 used to read as "not running" — no shutdown, no spawn, yet "gas sponsor on".
+    // The stub holds /health open so every probe times out, accepts /shutdown, then lets the
+    // socket go quiet; the spawn spy stands the "new" service up.
+    const { home, lines, spawns, run, close } = await setup({
+      customSpace: true,
+      realRestart: true,
+      onSpawn: () => {
+        // the fresh service rebinds the same socket — drop a leftover file first, as the real
+        // daemon's own start does
+        rmSync(socketPathFor(home), { force: true })
+        void stubService(home, () => 200)
+      },
+    })
+    const stub = await stubService(home, (path) => (path === "/shutdown" ? "close200" : "hang"))
+    try {
+      expect(await run("sponsor", "on")).toBe(0)
+      expect(spawns).toEqual([home.root]) // shutdown reached a "busy" service, and the respawn fired
+      expect(lines.some((line) => line.startsWith("note:"))).toBe(false)
+    } finally {
+      await stub.close()
+      await close()
+    }
+  })
+
+  it("a service still answering /health at the deadline is stopping, not kept-running (in-40 L-3)", async () => {
+    const { home, lines, spawns, run, close } = await setup({ customSpace: true, realRestart: true, restartWaitMs: 400 })
+    const stub = await stubService(home, () => 200) // accepts /shutdown, then keeps answering like a drain pass is running
+    try {
+      expect(await run("sponsor", "on")).toBe(0)
+      expect(spawns).toEqual([]) // nothing is spawned over a live service
+      expect(lines).toContain(
+        "note: the Mida service is finishing its current work and will then stop. After that, open any agent session or run mida task to start it with the new gas setting.",
+      )
+    } finally {
+      await stub.close()
+      await close()
+    }
+  })
+
+  it("a service that refuses /shutdown keeps the old gas setting — the kept-running note (in-40 L-3)", async () => {
+    const { home, lines, spawns, run, close } = await setup({ customSpace: true, realRestart: true, restartWaitMs: 400 })
+    const stub = await stubService(home, (path) => (path === "/shutdown" ? 500 : 200))
+    try {
+      expect(await run("sponsor", "on")).toBe(0)
+      expect(spawns).toEqual([])
+      expect(lines).toContain(
+        "note: the Mida service did not restart, so it keeps the old gas setting until its next start. Run mida doctor to check.",
+      )
+    } finally {
+      await stub.close()
+      await close()
+    }
+  })
+
+  it("an old service that stopped but a new one that never answers is said plainly (in-40 L-3)", async () => {
+    // The socket went quiet so the respawn fired — but nothing ever came up: the note must say
+    // stopped-not-started, not claim the new gas setting is live.
+    const { home, lines, spawns, run, close } = await setup({ customSpace: true, realRestart: true, restartWaitMs: 400 })
+    const stub = await stubService(home, (path) => (path === "/shutdown" ? "close200" : 200))
+    try {
+      expect(await run("sponsor", "on")).toBe(0)
+      expect(spawns).toEqual([home.root]) // the respawn was attempted — it is the answer that never came
+      expect(lines).toContain(
+        "note: the Mida service stopped, but a new one did not start. Open any agent session or run mida task to start it with the new gas setting.",
+      )
+    } finally {
+      await stub.close()
+      await close()
+    }
+  })
+
+  it("nothing listening means no spawn and no note — the file the next start reads is already right (in-40 L-3)", async () => {
+    const { lines, spawns, run, close } = await setup({ customSpace: true, realRestart: true, restartWaitMs: 400 })
+    try {
+      expect(await run("sponsor", "on")).toBe(0)
+      expect(spawns).toEqual([])
+      expect(lines.some((line) => line.startsWith("note:"))).toBe(false)
     } finally {
       await close()
     }

@@ -160,6 +160,13 @@ export interface CliDeps {
    */
   restartDaemon?: () => unknown | Promise<unknown>
   /**
+   * The detached service spawn `sponsor on|off` fires once the old service has gone quiet —
+   * a test injects a spy so exercising the restart path never starts a real daemon.
+   */
+  spawnService?: (cwd: string) => void
+  /** The restart window `sponsor on|off` waits inside — default SPONSOR_STOP_WAIT_MS; tests shrink it. */
+  sponsorRestartWaitMs?: number
+  /**
    * One plain line before each slow step — registering keys, opening namespaces, sending
    * transactions, republishing reader wraps. The default writes the line to STDERR, so nothing
    * printed to stdout changes shape. A line is always present tense and never carries a key, a
@@ -1221,38 +1228,63 @@ async function kickDaemonNow(deps: CliDeps): Promise<void> {
 /** How long a service is given to leave after POST /shutdown before `sponsor` gives up on it — the same ten seconds ensureCurrentDaemon allows a replaced service. */
 const SPONSOR_STOP_WAIT_MS = 10_000
 
-/** What the service did after `sponsor on|off` asked it to restart — kept-running means the old gas setting is still in effect. */
-type DaemonRestartOutcome = "restarted" | "not-running" | "kept-running"
+/**
+ * What the service did after `sponsor on|off` asked it to restart (in-40 L-3): `restarted` — a
+ * fresh service is answering; `not-running` — nothing was listening, so nothing was spawned;
+ * `kept-running` — /shutdown was refused or timed out and the old gas setting is still live;
+ * `stopping` — /shutdown was accepted but the old service is still finishing its pass at the
+ * deadline; `stopped-not-started` — the old service left but no fresh one answered in time.
+ */
+type DaemonRestartOutcome = "restarted" | "not-running" | "kept-running" | "stopping" | "stopped-not-started"
+
+const RESTART_OUTCOMES = new Set<string>(["restarted", "not-running", "kept-running", "stopping", "stopped-not-started"])
 
 /**
  * The service poke `runCli` sends after a confirmed `sponsor on|off`. Batching's flag is re-read
  * from network.json on every save, so a `/kick` suffices for it; the sponsor URL is bound into
  * the send path when the service opens, so the answering service has to be replaced: POST
- * /shutdown, poll /health until it goes quiet, then the same detached spawn `mida init` uses. A
- * service that never answered is not started — the next mida command's ensureCurrentDaemon opens
- * one that reads the new file. Best-effort like the kick: a service that will not stop is left
- * alone rather than fought (the change lands on its next start), and a failure never fails the
- * command — but the outcome is reported so the caller can say when the old gas setting is still
- * live (in-39 B-6). Injectable via `deps.restartDaemon`; an injected stub may return the outcome
- * itself, and anything else counts as "restarted" — what every pre-B-6 stub meant.
+ * /shutdown, poll /health until it goes quiet, then the same detached spawn `mida init` uses —
+ * and then prove the fresh service answers before claiming a restart. A `/health` probe that
+ * TIMES OUT counts as a running service — a busy daemon holds the socket open without answering,
+ * and only "nothing is listening" is not-running. A service that never answered is not started —
+ * the next mida command's ensureCurrentDaemon opens one that reads the new file. Best-effort
+ * like the kick: a service that will not stop is left alone rather than fought (the change lands
+ * on its next start), and a failure never fails the command — but the outcome is reported so the
+ * caller can say when the old gas setting is still live (in-39 B-6). Injectable via
+ * `deps.restartDaemon`; an injected stub may return any outcome, and anything else counts as
+ * "restarted" — what every pre-B-6 stub meant.
  */
 async function restartDaemonNow(deps: CliDeps): Promise<DaemonRestartOutcome> {
   if (deps.restartDaemon !== undefined) {
     const result = await Promise.resolve(deps.restartDaemon()).catch(() => undefined)
-    return result === "restarted" || result === "not-running" || result === "kept-running" ? result : "restarted"
+    return typeof result === "string" && RESTART_OUTCOMES.has(result) ? (result as DaemonRestartOutcome) : "restarted"
   }
+  const spawn = deps.spawnService ?? spawnDaemon
+  const waitMs = deps.sponsorRestartWaitMs ?? SPONSOR_STOP_WAIT_MS
   const health = await callDaemon(deps.home, "/health", undefined, { timeoutMs: 500 })
-  if (health.status === 0) return "not-running"
-  await callDaemon(deps.home, "/shutdown", {}, { timeoutMs: 2_000 })
-  const deadline = Date.now() + SPONSOR_STOP_WAIT_MS
+  // "unreachable" is the only verdict that means nothing is listening; a timeout is a busy
+  // service that held the connection, and a bad reply still proves a live peer (in-40 L-3)
+  if (health.status === 0 && health.failure !== "timeout" && health.failure !== "bad-reply") return "not-running"
+  const shutdown = await callDaemon(deps.home, "/shutdown", {}, { timeoutMs: 2_000 })
+  // refused, timed out or answered gibberish — the running service never agreed to stop
+  if (shutdown.status !== 200) return "kept-running"
+  const stopDeadline = Date.now() + waitMs
   for (;;) {
     const reply = await callDaemon(deps.home, "/health", undefined, { timeoutMs: 500 })
-    if (reply.status === 0) {
-      spawnDaemon(deps.home.root)
-      return "restarted"
+    if (reply.status === 0 && reply.failure !== "timeout" && reply.failure !== "bad-reply") {
+      // the socket went quiet: the old service is gone, so the fresh one is spawned — and the
+      // command waits inside the same window for it to answer before calling this a restart
+      spawn(deps.home.root)
+      const upDeadline = Date.now() + waitMs
+      for (;;) {
+        const up = await callDaemon(deps.home, "/health", undefined, { timeoutMs: 500 })
+        if (up.status === 200) return "restarted"
+        if (Date.now() >= upDeadline) return "stopped-not-started"
+        await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, upDeadline - Date.now()))))
+      }
     }
-    if (Date.now() >= deadline) return "kept-running"
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    if (Date.now() >= stopDeadline) return "stopping"
+    await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, stopDeadline - Date.now()))))
   }
 }
 
@@ -1260,12 +1292,16 @@ async function restartDaemonNow(deps: CliDeps): Promise<DaemonRestartOutcome> {
  * After a successful `sponsor on|off`: restart the service so the send path re-opens on the new
  * file, then say the two things that decide whether the change is already in effect — a service
  * that survived keeps the OLD setting until its next start, and a MIDA_SPONSOR_URL in this shell
- * wins over whatever the command just wrote (in-39 B-6, nit 1).
+ * wins over whatever the command just wrote (in-39 B-6, nit 1, in-40 L-3).
  */
 async function finishSponsorChange(deps: CliDeps): Promise<void> {
   const outcome = await restartDaemonNow(deps)
   if (outcome === "kept-running") {
     deps.print("note: the Mida service did not restart, so it keeps the old gas setting until its next start. Run mida doctor to check.")
+  } else if (outcome === "stopping") {
+    deps.print("note: the Mida service is finishing its current work and will then stop. After that, open any agent session or run mida task to start it with the new gas setting.")
+  } else if (outcome === "stopped-not-started") {
+    deps.print("note: the Mida service stopped, but a new one did not start. Open any agent session or run mida task to start it with the new gas setting.")
   }
   if ((deps.env ?? process.env).MIDA_SPONSOR_URL !== undefined) {
     deps.print("note: MIDA_SPONSOR_URL is set in this shell and wins over network.json while it is set.")
