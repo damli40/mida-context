@@ -24,7 +24,7 @@ ids, never plaintext context, so the index never holds anything private.
 | `owners` | Distinct addresses that appeared as `owner` in any event | Not people. One team can be many addresses; one person can rotate wallets. Treat it as "distinct owner keys seen", an upper bound on teams |
 | `agents` | Distinct `agentId`s ever registered | Not "agents still alive" — revoked agents stay in the count (`Agent.revokedByOwners` shows how many times an owner revoked them) |
 | `operators` | Distinct addresses that registered at least one agent | Not teams either — a team may deploy several operator keys |
-| `agentsByOutsideOperators` | Agents whose registering operator is **not** in `ENVIO_OUR_OPERATORS` | **This is the traction number.** It means "someone other than us pointed an agent at Mida". It does not prove they finished an integration — only that they registered on-chain |
+| `agentsByOutsideOperators` | Agents whose registering operator is **not** one of ours (`src/our-operators.ts`) | **This is the traction number.** It means "someone other than us pointed an agent at Mida". It does not prove they finished an integration — only that they registered on-chain |
 | `grants` / `activeGrants` | Capability grants ever made / granted and **not revoked** | `activeGrants` does **not** subtract expired grants. The index has no clock: it stores `expiresAt` on each `Grant` and readers filter on it themselves. "Active" here means "still valid as far as the chain knows" |
 | `capabilityRevocations` / `agentRevocations` | `CapabilityRevoked` events (one grant ended) / `AgentRevoked` events (every grant of that owner–agent pair ended at once) | A single `AgentRevoked` can end many grants; `activeGrants` drops by that many, not by one |
 | `contextRecords` | `ContextRegistered` events with `recordType = 0` | Evidence writes emit *both* `ContextRegistered(recordType=1)` and `EvidenceRegistered`; type-1 records count in `evidenceRecords`, never here — no double counting |
@@ -39,19 +39,20 @@ manifest version, `isOutsideOperator` flag), `Grant` (owner, agent, namespace, p
 `ContextRecord`, `Namespace`, and `TimelineEntry` — one row per owner-bearing event, the
 per-owner audit trail.
 
-## ⚠️ `ENVIO_OUR_OPERATORS` — the one config value that changes the headline number
+## ⚠️ Our operator list — the one config value that changes the headline number
 
-`agentsByOutsideOperators` is computed against `ENVIO_OUR_OPERATORS`, a comma-separated, lowercase
-list of **our own** operator addresses, read from the environment at indexing time. Envio Cloud
-only passes environment variables whose names start with `ENVIO_`, so set this name there. For a
-local run, the older name `OUR_OPERATORS` still works when `ENVIO_OUR_OPERATORS` is unset.
+`agentsByOutsideOperators` counts agents whose registering operator is **not** one of ours. Our
+operators are listed in `src/our-operators.ts`: the 8 addresses that registered agents on these
+contracts before this repo went public, so all of them are ours (read from Monad on Sep 30, 2026).
+The list lives in the repo because Envio Cloud's free plan has no environment variables, and
+because it lets anyone check which agents we count as our own.
 
-**If the list is empty or unset, every operator counts as outside.** That makes the
-traction number bigger than the truth — exactly the kind of inflated claim this index exists to
-prevent. Before quoting `agentsByOutsideOperators` to anyone, confirm the list is populated:
+A new Mida home registers from a new operator address. Add that address to the file and
+redeploy, or its agents count as outside. On a paid Envio plan, `ENVIO_OUR_OPERATORS` adds more
+addresses to the committed list, and a local run also accepts `OUR_OPERATORS`:
 
 ```bash
-ENVIO_OUR_OPERATORS=0xourfirstoperator,0xoursecondoperator
+ENVIO_OUR_OPERATORS=0xanotheroperator,0xyetanotheroperator
 ```
 
 To recompute after changing it, re-index from `start_block` (drop the deployment's data and let
@@ -99,9 +100,9 @@ Nothing else hardcodes an address — handlers work purely in ids.
 1. Push this repo to GitHub.
 2. On envio.dev, add an indexer from this repo. Set the root directory to `apps/indexer`, the
    config file to `config.yaml` (if the form asks for a path from the repo root, use
-   `apps/indexer/config.yaml`), and the deployment branch to `envio`.
-3. In the indexer's environment variables, set `ENVIO_OUR_OPERATORS` (see the warning above) and
-   `ENVIO_API_TOKEN`. Envio Cloud only passes variables whose names start with `ENVIO_`.
+   `apps/indexer/config.yaml`), and the deployment branch to `envio`. No API token is needed:
+   indexers on Envio Cloud reach HyperSync without one.
+3. Check that `src/our-operators.ts` lists every operator we have used (see the warning above).
 4. Push the commit you want indexed to the `envio` branch. Each push to that branch starts a new
    deployment that re-indexes from `start_block`, and the free plan allows 3 deployments per
    indexer, so push there only when you mean to deploy.

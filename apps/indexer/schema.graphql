@@ -74,7 +74,7 @@ type Operator {
 
 # One row per registered agentId.
 # isOutsideOperator is the traction signal: true when the operator address that
-# registered the agent is not in the indexer's ENVIO_OUR_OPERATORS env list.
+# registered the agent is not one of ours (src/our-operators.ts, plus any ENVIO_OUR_OPERATORS list).
 type Agent {
   id: ID!
   operator: String!

@@ -81,11 +81,11 @@ The full steps live in `apps/indexer/README.md` ("Deploy to Envio's hosted servi
 
 1. Push this repo to GitHub.
 2. On envio.dev, add an indexer from the repo: root directory `apps/indexer`, config file
-   `config.yaml`, deployment branch `envio`.
-3. Set `ENVIO_OUR_OPERATORS` (comma-separated, lowercase, our own operator addresses — see the
-   README's warning: empty means *every* agent counts as "outside", inflating the traction number)
-   and `ENVIO_API_TOKEN` in the indexer's environment variables. Envio Cloud only passes variables
-   whose names start with `ENVIO_`, so the old name `OUR_OPERATORS` would never reach the indexer.
+   `config.yaml`, deployment branch `envio`. No API token is needed on Envio Cloud.
+3. Check that `apps/indexer/src/our-operators.ts` lists every operator address we have used
+   (see the README's warning: an address missing from it makes our own agents count as
+   "outside", inflating the traction number). Envio Cloud's free plan has no environment
+   variables, which is why the list is committed.
 4. Push the commit to index to the `envio` branch. Envio builds, indexes from `start_block`, and
    gives you a public GraphQL endpoint of the form
    `https://indexer.dev.hyperindex.xyz/<deployment-id>/v1/graphql`. No API key is needed to query.
