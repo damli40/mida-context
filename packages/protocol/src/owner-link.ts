@@ -1,6 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js"
 import { concatBytes, utf8ToBytes } from "@noble/hashes/utils.js"
-import { UNACCEPTABLE_REQUEST_CHARS, UNACCEPTABLE_REQUEST_TEXT } from "./errors.js"
+import { UNACCEPTABLE_REQUEST_CHARS, UNACCEPTABLE_REQUEST_TEXT, isAcceptableAgentName } from "./errors.js"
 import type { Address, Hex } from "./types.js"
 
 /**
@@ -331,11 +331,11 @@ function validateRequestObject(decoded: unknown, flow: OwnerLinkFlow): OwnerLink
   for (const value of rendered) {
     if (typeof value === "string" && UNACCEPTABLE_REQUEST_CHARS.test(value)) fail(UNACCEPTABLE_REQUEST_TEXT)
   }
-  // A `"` is legal in a label or a root — but inside an agent NAME it closes the approve
-  // summary's `agent "…"` quotes early and plants a forged `(run by …)` before the real one
-  // (in-31 V-1). Names refuse it with the same sentence.
+  // Agent NAMES get the shared name rule (in-32 X-2): a `"` or a look-alike inside one closes
+  // the summary's `Agent "…"` quotes early and plants a forged `(run by …)` before the real
+  // one — quotes stay legal in labels and roots. The same sentence refuses them.
   for (const name of [req.entry?.agent, ...(req.entries ?? []).map((row) => row.agent)]) {
-    if (typeof name === "string" && name.includes('"')) fail(UNACCEPTABLE_REQUEST_TEXT)
+    if (typeof name === "string" && !isAcceptableAgentName(name)) fail(UNACCEPTABLE_REQUEST_TEXT)
   }
   return req
 }

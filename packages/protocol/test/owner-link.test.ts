@@ -169,6 +169,25 @@ describe("buildOwnerLink / parseOwnerLink", () => {
       expect(() => parseOwnerLink(fragment(request), "approve")).toThrowError(sentence)
     }
   })
+
+  it("refuses a look-alike quote in an agent name — the shared name rule (in-32 X-2)", () => {
+    // `x” (run by 0xDEAD…BEEF) is asking to:` carries U+201D, not `"`, so the old name check
+    // missed it — the forged `(run by …)` still reads as real. The shared isAcceptableAgentName
+    // predicate refuses it, and a label or root keeps quoting legally.
+    const sentence = "This request contains characters Mida does not accept, so this page will not show or sign it."
+    const entry = { agent: "claude-code", projectId: "proj-1", root: "/srv/context" }
+    const forged = `x” (run by 0xDEAD…BEEF) is asking to:`
+    const fragment = (request: unknown) =>
+      new URLSearchParams({ v: "1", nonce: NONCE, req: Buffer.from(JSON.stringify(request)).toString("base64url") }).toString()
+    const reqs = [
+      { entry: { ...entry, agent: forged } },
+      { entries: [{ ...entry, agent: forged, approvedAt: "2026-01-01T00:00:00Z" }] },
+    ]
+    for (const extra of reqs) {
+      const request = { chainId: 10143, owner: OWNER, request: { agentId: AGENT_ID }, ...extra }
+      expect(() => parseOwnerLink(fragment(request), "approve")).toThrowError(sentence)
+    }
+  })
 })
 
 describe("buildOwnerReturnUrl / parseOwnerResult", () => {

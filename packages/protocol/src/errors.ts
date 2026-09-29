@@ -116,6 +116,30 @@ export function displaySafeText(value: string): string {
   return value.replace(new RegExp(UNACCEPTABLE_REQUEST_CHARS.source, "gu"), " ")
 }
 
+// Written as escapes, not literal characters — half of this set is invisible and pastes
+// unreliably. The quotes are the straight `"` plus the look-alikes 201C/201D/201E/201F/2033/
+// 2036/FF02/301D/301E/301F (in-32 X-2).
+const UNACCEPTABLE_AGENT_NAME_CHARS = new RegExp(
+  "[\\p{Cc}\\p{Zl}\\p{Zp}\\p{Bidi_Control}\\u200b\\u2060-\\u2064\\ufeff\\u{e0000}-\\u{e007f}\"\\u201c\\u201d\\u201e\\u201f\\u2033\\u2036\\uff02\\u301d\\u301e\\u301f]",
+  "u",
+)
+const BLANK_NAME_CHARS = new RegExp("^[\\s\\u200c\\u200d]*$", "u")
+
+/**
+ * The one agent-name rule, shared by the manifest validator, the owner-link parser and /me
+ * (in-32 X-2) — a name renders inside the summary's `Agent "…"` quotes, so it refuses more than
+ * a field that is merely displayed: everything in UNACCEPTABLE_REQUEST_CHARS, the rest of the
+ * bidirectional-control class (Bidi_Control also covers the Arabic letter mark 061C), the
+ * invisible operators 2060–2064, the tag characters E0000–E007F, and `"` with its look-alikes —
+ * any of which could close or imitate the quotes around the name. The joiners stay legal INSIDE
+ * a name (in-31 V-3), but a name that is nothing but whitespace and joiners renders as
+ * `Agent ""`, so it is refused too.
+ */
+export function isAcceptableAgentName(name: string): boolean {
+  if (UNACCEPTABLE_AGENT_NAME_CHARS.test(name)) return false
+  return !BLANK_NAME_CHARS.test(name)
+}
+
 /**
  * INVALID_WIRE whose message is already the owner-facing sentence. MidaError prefixes its detail
  * with the code — "INVALID_WIRE: This request…" is not the page's text — so this subclass keeps

@@ -16,6 +16,7 @@ import {
   RECORD_TYPE,
   UNACCEPTABLE_REQUEST_CHARS,
   displaySafeText,
+  isAcceptableAgentName,
   isMidaError,
 } from "@mida/protocol"
 
@@ -100,5 +101,59 @@ describe("UNACCEPTABLE_REQUEST_CHARS (in-30 T-3)", () => {
   it("displaySafeText folds each refused character to a single space — for fields that are shown, not refused", () => {
     const dirty = `line one${chr(0x0a)}line two${chr(0x2028)}${chr(0x2029)}${chr(0x200b)}bidi${chr(0x202a)}${chr(0x2067)}${chr(0xfeff)}`
     expect(displaySafeText(dirty)).toBe("line one line two   bidi   ")
+  })
+})
+
+/**
+ * The one agent-name rule, shared by the manifest validator, the owner-link parser and /me
+ * (in-32 X-2): the whole UNACCEPTABLE_REQUEST_CHARS surface plus the name-specific extras —
+ * the Arabic letter mark the old set missed, the invisible formatters 2060–2064 and the tag
+ * characters E0000–E007F, and `"` with every look-alike the summary's `Agent "…"` could be
+ * forged through.
+ */
+describe("isAcceptableAgentName (in-32 X-2)", () => {
+  // fromCodePoint, not fromCharCode — the tag characters live above the BMP.
+  const chr = (cp: number) => String.fromCodePoint(cp)
+
+  it.each([
+    ["control", chr(0x0a)],
+    ["DEL", chr(0x7f)],
+    ["line separator", chr(0x2028)],
+    ["paragraph separator", chr(0x2029)],
+    ["bidi control — Arabic letter mark", chr(0x061c)],
+    ["bidi control — embedding", chr(0x202a)],
+    ["zero-width space", chr(0x200b)],
+    ["left-to-right mark", chr(0x200e)],
+    ["right-to-left mark", chr(0x200f)],
+    ["invisible operator — word joiner", chr(0x2060)],
+    ["invisible operator — invisible plus", chr(0x2064)],
+    ["byte order mark", chr(0xfeff)],
+    ["tag character", chr(0xe0020)],
+    ["straight double quote", chr(0x22)],
+    ["look-alike quote U+201C", chr(0x201c)],
+    ["look-alike quote U+201D", chr(0x201d)],
+    ["look-alike quote U+201E", chr(0x201e)],
+    ["look-alike quote U+201F", chr(0x201f)],
+    ["look-alike quote U+2033", chr(0x2033)],
+    ["look-alike quote U+2036", chr(0x2036)],
+    ["look-alike quote U+FF02", chr(0xff02)],
+    ["look-alike quote U+301D", chr(0x301d)],
+    ["look-alike quote U+301E", chr(0x301e)],
+    ["look-alike quote U+301F", chr(0x301f)],
+  ])("refuses a name carrying %s", (_label, char) => {
+    expect(isAcceptableAgentName(`a${char}b`)).toBe(false)
+  })
+
+  it("refuses a name that is nothing but whitespace and joiners — it would render as `Agent \"\"`", () => {
+    expect(isAcceptableAgentName("  \t ")).toBe(false)
+    expect(isAcceptableAgentName("\u200c\u200d")).toBe(false)
+  })
+
+  it("accepts ordinary names — plain words, dashes, CJK, and the joiners inside a name", () => {
+    expect(isAcceptableAgentName("claude-code — plain text 中文字符 ✓")).toBe(true)
+    // می‌خواهم is می + ZWNJ (200C) + خواهم — the non-joiner is ordinary Persian spelling, and
+    // 👨‍💻 is held together by a ZWJ (200D). Both stay legal inside a name (in-31 V-3).
+    expect(isAcceptableAgentName("می\u200cخواهم")).toBe(true)
+    expect(isAcceptableAgentName("👨\u200d💻 helper")).toBe(true)
   })
 })

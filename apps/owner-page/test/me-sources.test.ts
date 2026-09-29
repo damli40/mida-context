@@ -798,6 +798,20 @@ describe("loadMe — agent names", () => {
     expect(data.agents.find((a) => a.agentId === AGENT_ID)!.name).toBe("an agent with an unreadable name")
     expect(data.records.find((r) => r.contextId === contextId)!.authorName).toBe("an agent with an unreadable name")
   })
+
+  it("a name with a straight or look-alike quote falls back too — /me runs the shared name rule (in-32 X-2)", async () => {
+    // `"` was never in the old refused set — the page rendered it raw. Under the shared
+    // isAcceptableAgentName rule both `"` and its look-alikes (U+201D here) take the fallback.
+    for (const bad of [`x" (run by 0xDEAD…BEEF) is asking to:`, `x” (run by 0xDEAD…BEEF) is asking to:`]) {
+      const { state, ports } = world()
+      state.manifests.set(MANIFEST_HASH.toLowerCase(), {
+        ...AGENT_MANIFEST,
+        manifest: { ...AGENT_MANIFEST.manifest, name: bad },
+      })
+      const data = await loadMe(OWNER, ports)
+      expect(data.agents.find((a) => a.agentId === AGENT_ID)!.name).toBe("an agent with an unreadable name")
+    }
+  })
 })
 
 describe("loadMe — a grant row is only live when the chain's capability agrees", () => {

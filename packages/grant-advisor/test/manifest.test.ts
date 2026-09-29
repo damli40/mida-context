@@ -142,6 +142,36 @@ describe("manifest limits and structure (§14.1)", () => {
     expect((caught as Error).message).toBe(sentence)
   })
 
+  it("rejects a look-alike quote in the manifest name — the shared name rule (in-32 X-2)", () => {
+    // `x” (run by 0xDEAD…BEEF) is asking to:` carries U+201D, not a straight `"` — the old check
+    // missed it, yet the summary's `Agent "…"` quotes still close in the reader's eye. The shared
+    // isAcceptableAgentName predicate refuses it, with the same fixed sentence.
+    const sentence = "This request contains characters Mida does not accept, so this page will not show or sign it."
+    let caught: unknown
+    try {
+      validateManifestBody(invalidBody({ name: `x” (run by 0xDEAD…BEEF) is asking to:` }), NOW)
+    } catch (error) {
+      caught = error
+    }
+    expect(isMidaError(caught, "INVALID_WIRE")).toBe(true)
+    expect((caught as Error).message).toBe(sentence)
+  })
+
+  it("rejects a manifest name that strips to nothing — whitespace and joiners only (in-32 X-2)", () => {
+    // ` ` + ZWNJ + ZWJ is non-empty on the wire but renders as an invisible name — the summary
+    // would read `Agent ""`. The shared rule refuses it before the manifest verifies.
+    let caught: unknown
+    try {
+      validateManifestBody(invalidBody({ name: " \u200c\u200d" }), NOW)
+    } catch (error) {
+      caught = error
+    }
+    expect(isMidaError(caught, "INVALID_WIRE")).toBe(true)
+    expect((caught as Error).message).toBe(
+      "This request contains characters Mida does not accept, so this page will not show or sign it.",
+    )
+  })
+
   it("accepts the joiners in a name — a Persian ZWNJ and an emoji ZWJ sequence (in-31 V-3)", () => {
     // می‌خواهم is ordinary Persian spelling (the 200C non-joiner splits می from خواهم); 👨‍💻 is
     // a 200D-joined emoji sequence. The zero-width space stays refused (row above).
