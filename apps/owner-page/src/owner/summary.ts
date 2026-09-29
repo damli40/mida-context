@@ -1,6 +1,6 @@
 import { PERMISSION, namespaceById } from "@mida/protocol"
 import type { Hex, OwnerLinkRequest as LinkRequest, ScopeWarning, ScopeWarningCode } from "@mida/protocol"
-import type { PreparedApprove } from "./flows.js"
+import type { PreparedApprove, PreparedRevoke } from "./flows.js"
 import { scopeInWords } from "./page.js"
 import { shortAddress } from "./secrets.js"
 
@@ -99,4 +99,29 @@ export function approveSummaryLines(prep: PreparedApprove, req: LinkRequest): st
   if (prep.alreadyGranted) lines.push("This agent already holds everything it asked for.")
   lines.push("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
   return lines
+}
+
+/** The permission bits of a live capability, in the words the revoke summary uses. */
+function revokePermissionWords(permissions: number): string {
+  const bits: string[] = []
+  if (permissions & 1) bits.push("read")
+  if (permissions & 2) bits.push("add entries")
+  if (permissions & 4) bits.push("replace its own entries")
+  if (permissions & 8) bits.push("replace any entry")
+  return bits.length > 0 ? bits.join(" and ") : `permission bits ${permissions}`
+}
+
+/**
+ * The lines of #summary on /revoke, in order — rendered through the same one-element-per-line
+ * showSummaryLines as approve, so a long line wraps on a phone and a stray newline inside a
+ * field can not mint a line (in-30 T-4).
+ */
+export function revokeSummaryLines(prep: PreparedRevoke): string[] {
+  if (prep.live.length === 0) return ["The chain shows nothing live for this agent."]
+  return [
+    "This agent can currently:",
+    ...prep.live.map((c) => `• ${c.namespaceName} — ${revokePermissionWords(c.permissions)}`),
+    "Revoking ends all of this and locks the old keys out of anything it saved.",
+    "It does not erase what the agent already read.",
+  ]
 }
