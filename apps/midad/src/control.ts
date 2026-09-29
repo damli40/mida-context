@@ -70,12 +70,21 @@ export function socketPathFor(home: MidaHome, base: string = tmpdir()): string {
 export interface ControlReply {
   status: number
   body: unknown
+  /**
+   * Why a status-0 reply failed (in-35 R-2) — set only when status is 0: "timeout" means the
+   * call's own timer fired (a peer held the connection but never answered), "unreachable" means
+   * no peer could be reached at all (missing socket, refused connection, request error), and
+   * "bad-reply" means the peer answered with bytes that are not JSON or its stream errored. A
+   * timeout is a connected daemon that is slow, not a missing one — callers that only check
+   * status keep working unchanged.
+   */
+  failure?: "timeout" | "unreachable" | "bad-reply"
 }
 
 /**
  * One JSON call to the daemon over the private socket. Never throws and never hangs: any failure —
- * no socket, refused connection, timeout, a reply that is not JSON — resolves to status 0. A body
- * of `undefined` sends GET; anything else is POSTed as JSON.
+ * no socket, refused connection, timeout, a reply that is not JSON — resolves to status 0 with
+ * `failure` naming which kind. A body of `undefined` sends GET; anything else is POSTed as JSON.
  */
 export function callDaemon(home: MidaHome, path: string, body: unknown, options: { timeoutMs: number }): Promise<ControlReply> {
   return new Promise((resolve) => {
@@ -86,14 +95,14 @@ export function callDaemon(home: MidaHome, path: string, body: unknown, options:
       clearTimeout(timer)
       resolve(reply)
     }
-    const fail = () => finish({ status: 0, body: null })
+    const fail = (failure: NonNullable<ControlReply["failure"]>) => finish({ status: 0, body: null, failure })
     const timer = setTimeout(() => {
       try {
         req?.destroy()
       } catch {
         // already gone
       }
-      fail()
+      fail("timeout")
     }, options.timeoutMs)
     if (typeof timer.unref === "function") timer.unref()
     let req: ReturnType<typeof request> | undefined
@@ -120,16 +129,16 @@ export function callDaemon(home: MidaHome, path: string, body: unknown, options:
             try {
               finish({ status: res.statusCode ?? 0, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) })
             } catch {
-              fail()
+              fail("bad-reply")
             }
           })
-          res.on("error", fail)
+          res.on("error", () => fail("bad-reply"))
         },
       )
-      req.on("error", fail)
+      req.on("error", () => fail("unreachable"))
       req.end(payload ?? undefined)
     } catch {
-      fail()
+      fail("unreachable")
     }
   })
 }
@@ -152,15 +161,26 @@ function migrationInProgress(home: MidaHome): boolean {
  * check fires `spawn()` — once per call, never more — so callers that arrive while a spawned daemon
  * is still opening its runtime just keep polling. A migration marker short-circuits everything:
  * no service may start or be considered up while `migrate/in-progress` exists.
+ *
+ * The verdict is a tri-state (in-35 R-2): "up" when /health answered; "slow" when the deadline
+ * passed with at least one probe lost to its own timer — something held the socket but never
+ * replied, a connected daemon that is slow, not absent; "down" otherwise (refused, missing
+ * socket, unreadable replies).
  */
-export async function ensureDaemon(home: MidaHome, spawn: () => void, options: { waitMs: number }): Promise<boolean> {
-  if (migrationInProgress(home)) return false
+export async function ensureDaemonState(
+  home: MidaHome,
+  spawn: () => void,
+  options: { waitMs: number },
+): Promise<"up" | "slow" | "down"> {
+  if (migrationInProgress(home)) return "down"
   const deadline = Date.now() + options.waitMs
   let spawned = false
+  let sawTimeout = false
   for (;;) {
     const remaining = deadline - Date.now()
     const reply = await callDaemon(home, "/health", undefined, { timeoutMs: Math.min(500, Math.max(1, remaining)) })
-    if (reply.status !== 0) return true
+    if (reply.status !== 0) return "up"
+    if (reply.failure === "timeout") sawTimeout = true
     if (!spawned) {
       spawned = true
       try {
@@ -169,9 +189,14 @@ export async function ensureDaemon(home: MidaHome, spawn: () => void, options: {
         // a spawn that fails synchronously still leaves the poll to run out the clock
       }
     }
-    if (Date.now() >= deadline) return false
+    if (Date.now() >= deadline) return sawTimeout ? "slow" : "down"
     await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, deadline - Date.now()))))
   }
+}
+
+/** The boolean form of `ensureDaemonState` — every existing caller keeps "up or not". */
+export async function ensureDaemon(home: MidaHome, spawn: () => void, options: { waitMs: number }): Promise<boolean> {
+  return (await ensureDaemonState(home, spawn, options)) === "up"
 }
 
 /** What ensureCurrentDaemon settled: the service is up (or not), who it replaced, or why it refused. */

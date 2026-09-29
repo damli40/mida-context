@@ -114,6 +114,7 @@ const deps = (dir: MidaHome, over: Partial<McpServerDeps> = {}): McpServerDeps =
 })
 
 const DEGRADED = "Mida: could not load context (daemon-down) — working without it"
+const DEGRADED_SLOW = "Mida: could not load context (daemon-slow) — working without it"
 
 describe("mida-mcp args", () => {
   it("no --as parses with the agent unset — the startup gate, not the parser, refuses it", () => {
@@ -1160,6 +1161,46 @@ describe("mida-mcp tools against a fake daemon", () => {
         expect(text).not.toMatch(/^\s+at\s/m)
         expect(text).not.toContain("node:internal")
       }
+    } finally {
+      await close()
+    }
+  })
+
+  it("a health probe that times out answers daemon-slow — the daemon is there, just not answering", async () => {
+    const dir = home()
+    // accepts the connection and stays silent: unreachable is down, silent-but-connected is slow
+    const fake = await fakeDaemon(dir, { "/health": { silent: true } })
+    try {
+      const { client, close } = await connect(deps(dir, { daemonUp: false }))
+      try {
+        expect(await callText(client, "mida_handoff")).toBe(DEGRADED_SLOW)
+        expect(await callText(client, "mida_status")).toBe(DEGRADED_SLOW)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("a handoff the connected daemon never answers is daemon-slow, while a dead socket is down", async () => {
+    const dir = home()
+    const fake = await fakeDaemon(dir, { "/health": HEALTH, "/handoff": { silent: true } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        // ~8 s — the real HANDOFF_TIMEOUT_MS, and still the slow line, never down
+        expect(await callText(client, "mida_handoff")).toBe(DEGRADED_SLOW)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+    // no listener at all — the down half of the pair
+    const { client, close } = await connect(deps(home()))
+    try {
+      expect(await callText(client, "mida_handoff")).toBe(DEGRADED)
     } finally {
       await close()
     }

@@ -3,6 +3,7 @@ import { basename, dirname, resolve } from "node:path"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from "@modelcontextprotocol/sdk/types.js"
 import { callDaemon, socketPathFor } from "./control.js"
+import type { ControlReply } from "./control.js"
 import type { MidaHome } from "./home.js"
 import { CHAIN_REFUSAL_TEXT, degradedMessage } from "./hook-output.js"
 import type { SessionStartBody } from "./hook-output.js"
@@ -288,17 +289,28 @@ export interface McpServerDeps {
  * Is the daemon answering? The boot-time `ensureDaemon` has a 4 s window; a daemon that came up
  * late must not stay reported down for the server's whole life, so a latched-false verdict earns
  * one cheap /health re-probe per call — a dead socket refuses fast, so this costs a call almost
- * nothing; a hung daemon costs it at most HEALTH_PROBE_MS before the degraded line.
+ * nothing; a hung daemon costs it at most HEALTH_PROBE_MS before the degraded line. The answer
+ * is a tri-state (in-35 R-2): "slow" when the probe's own timer fired — the socket was held, the
+ * daemon is there but not answering — "down" when nothing could be reached at all.
  */
 const HEALTH_PROBE_MS = 500
 
-async function daemonAnswering(deps: McpServerDeps): Promise<boolean> {
-  if (deps.daemonUp) return true
+type DaemonState = "up" | "slow" | "down"
+
+async function daemonAnswering(deps: McpServerDeps): Promise<DaemonState> {
+  if (deps.daemonUp) return "up"
   const reply = await callDaemon(deps.home, "/health", undefined, { timeoutMs: HEALTH_PROBE_MS })
   const ok = reply.status !== 0 && (reply.body as { ok?: unknown } | null)?.ok === true
-  if (ok) deps.daemonUp = true
-  return ok
+  if (ok) {
+    deps.daemonUp = true
+    return "up"
+  }
+  return reply.failure === "timeout" ? "slow" : "down"
 }
+
+/** A status-0 control reply's degraded reason: a timeout is a slow-but-there daemon, the rest are down. */
+const downReason = (reply: ControlReply): "daemon-slow" | "daemon-down" =>
+  reply.failure === "timeout" ? "daemon-slow" : "daemon-down"
 
 /**
  * `mida_handoff` — the same /handoff call the session-start hook makes: same body, same timeout,
@@ -307,14 +319,15 @@ async function daemonAnswering(deps: McpServerDeps): Promise<boolean> {
  * writeSeen the hook performs.
  */
 async function toolHandoff(deps: McpServerDeps) {
-  if (!(await daemonAnswering(deps))) return degraded("daemon-down")
+  const state = await daemonAnswering(deps)
+  if (state !== "up") return degraded(state === "slow" ? "daemon-slow" : "daemon-down")
   const reply = await callDaemon(
     deps.home,
     "/handoff",
     { agent: deps.agent, cwd: deps.project, sessionId: deps.sessionId, task: deps.task },
     { timeoutMs: HANDOFF_TIMEOUT_MS },
   )
-  if (reply.status === 0) return degraded("daemon-down")
+  if (reply.status === 0) return degraded(downReason(reply))
   const body = reply.body as SessionStartBody | null
   if (typeof body?.text !== "string") return degraded("bad-reply")
   const covered =
@@ -337,7 +350,8 @@ async function toolHandoff(deps: McpServerDeps) {
  * them, so the note is not repeated. A timeout logs the same whatsnew-timeout line the hook logs.
  */
 async function toolWhatsNew(deps: McpServerDeps) {
-  if (!(await daemonAnswering(deps))) return degraded("daemon-down")
+  const state = await daemonAnswering(deps)
+  if (state !== "up") return degraded(state === "slow" ? "daemon-slow" : "daemon-down")
   const reply = await callDaemon(
     deps.home,
     "/whatsnew",
@@ -346,7 +360,7 @@ async function toolWhatsNew(deps: McpServerDeps) {
   )
   if (reply.status === 0) {
     appendLog(deps.home, "hook", { event: "whatsnew-timeout", agent: deps.agent, sessionId: deps.sessionId })
-    return degraded("daemon-down")
+    return degraded(downReason(reply))
   }
   const body = reply.body as { kind?: unknown; note?: unknown; reason?: unknown; seen?: unknown; text?: unknown } | null
   if (body?.kind === "updates" && typeof body.note === "string" && body.note !== "") {
@@ -413,14 +427,15 @@ async function toolWhatsNew(deps: McpServerDeps) {
  * through this path — /cli refuses them before dispatch, and this tool only ever sends `read`.
  */
 async function toolRead(deps: McpServerDeps, args: Record<string, unknown> | undefined) {
-  if (!(await daemonAnswering(deps))) return degraded("daemon-down")
+  const state = await daemonAnswering(deps)
+  if (state !== "up") return degraded(state === "slow" ? "daemon-slow" : "daemon-down")
   const namespace = args?.namespace
   if (namespace !== undefined && (typeof namespace !== "string" || !(READ_NAMESPACES as readonly string[]).includes(namespace))) {
     return toolText(`refused: namespace must be one of ${READ_NAMESPACES.join(", ")}`)
   }
   const argv = ["read", "--as", deps.agent, typeof namespace === "string" ? namespace : "projects.current"]
   const reply = await callDaemon(deps.home, "/cli", { argv, cwd: deps.project }, { timeoutMs: READ_TIMEOUT_MS })
-  if (reply.status === 0) return degraded("daemon-down")
+  if (reply.status === 0) return degraded(downReason(reply))
   const body = reply.body as { code?: unknown; lines?: unknown } | null
   if (typeof body?.code !== "number" || !Array.isArray(body.lines)) return degraded("bad-reply")
   return toolText(body.lines.map((line) => String(line)).join("\n"))
@@ -434,9 +449,10 @@ async function toolRead(deps: McpServerDeps, args: Record<string, unknown> | und
  * directory's own name.
  */
 async function toolStatus(deps: McpServerDeps) {
-  if (!(await daemonAnswering(deps))) return degraded("daemon-down")
+  const state = await daemonAnswering(deps)
+  if (state !== "up") return degraded(state === "slow" ? "daemon-slow" : "daemon-down")
   const health = await callDaemon(deps.home, "/health", undefined, { timeoutMs: STATUS_TIMEOUT_MS })
-  if (health.status === 0) return degraded("daemon-down")
+  if (health.status === 0) return degraded(downReason(health))
   const body = health.body as { ok?: unknown; pid?: unknown; startedAt?: unknown; queueDepth?: unknown } | null
   if (body?.ok !== true) return degraded("bad-reply")
   // the socket is same-user, but a malformed body is still only printed after a shape check —
@@ -496,14 +512,15 @@ async function toolStatus(deps: McpServerDeps) {
  * comes back verbatim. The tool's own timeout is wide: a direct save is a real transaction.
  */
 async function toolSave(deps: McpServerDeps, args: Record<string, unknown> | undefined) {
-  if (!(await daemonAnswering(deps))) return degraded("daemon-down")
+  const state = await daemonAnswering(deps)
+  if (state !== "up") return degraded(state === "slow" ? "daemon-slow" : "daemon-down")
   const reply = await callDaemon(
     deps.home,
     "/save",
     { agent: deps.agent, cwd: deps.project, fields: args ?? {}, task: deps.task },
     { timeoutMs: SAVE_TIMEOUT_MS },
   )
-  if (reply.status === 0) return degraded("daemon-down")
+  if (reply.status === 0) return degraded(downReason(reply))
   const body = reply.body as { kind?: unknown; text?: unknown } | null
   if ((body?.kind !== "saved" && body?.kind !== "refused") || typeof body.text !== "string") return degraded("bad-reply")
   return toolText(body.text)

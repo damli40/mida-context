@@ -75,6 +75,32 @@ const fakeDaemon = (dir: MidaHome, handoffBody: unknown, silent = false): Promis
 const close = (server: Server) => new Promise<void>((done) => server.close(() => done()))
 
 /**
+ * A socket that accepts every connection and never writes a byte — the daemon process is alive
+ * enough to hold the connection but too hung to answer. `stop()` drops open connections first so
+ * the test's close cannot hang.
+ */
+const hungDaemon = (dir: MidaHome) =>
+  new Promise<{ stop(): Promise<void> }>((resolve, reject) => {
+    const sockets = new Set<Socket>()
+    const s = createServer((socket: Socket) => {
+      sockets.add(socket)
+      socket.on("close", () => sockets.delete(socket))
+      socket.on("error", () => {})
+      socket.on("data", () => {})
+    })
+    s.once("error", reject)
+    s.listen(socketPathFor(dir), () =>
+      resolve({
+        stop: () =>
+          new Promise<void>((done) => {
+            for (const socket of sockets) socket.destroy()
+            s.close(() => done())
+          }),
+      }),
+    )
+  })
+
+/**
  * A socket server answering only /whatsnew — the prompt hook goes straight to the socket, it
  * never asks /health and never boots a daemon. `delayMs` models a slow daemon; `silent` a dead
  * one. `stop()` drops open connections first so a delayed answer cannot hold the test open.
@@ -287,7 +313,7 @@ describe("inject-main process", () => {
     }
   }, 30_000)
 
-  it("a daemon that accepts but never answers prints daemon-down inside the client timeout", async () => {
+  it("a daemon that answers /health but never answers the handoff prints daemon-slow inside the client timeout", async () => {
     const { dir, server } = await liveDaemon(null, true)
     try {
       const started = Date.now()
@@ -295,11 +321,43 @@ describe("inject-main process", () => {
       expect(res.status).toBe(0)
       expect(res.stderr).toBe("")
       const out = envelope(res.stdout)
-      expect(out.systemMessage).toBe("Mida: could not load context (daemon-down) — working without it")
+      expect(out.systemMessage).toBe("Mida: could not load context (daemon-slow) — working without it")
+      expect(out.hookSpecificOutput.additionalContext).toBe("Mida: no context available right now (daemon-slow).")
       expect(Date.now() - started).toBeLessThan(15_000)
     } finally {
       await close(server)
     }
+  }, 30_000)
+
+  it("a daemon that holds the socket but never answers even /health prints daemon-slow, not down", async () => {
+    const dir = home()
+    dir.writeSecretJson("network.json", { rpcUrl: "http://127.0.0.1:1", deployment: {} })
+    const hung = await hungDaemon(dir)
+    try {
+      const started = Date.now()
+      const res = await run(["claude-code"], sessionStart(), dir.root)
+      expect(res.status).toBe(0)
+      const out = envelope(res.stdout)
+      expect(out.systemMessage).toBe("Mida: could not load context (daemon-slow) — working without it")
+      expect(out.hookSpecificOutput.additionalContext).toBe("Mida: no context available right now (daemon-slow).")
+      // the health probes run out the 4 s start window — slow, not an unreachable "down"
+      expect(Date.now() - started).toBeLessThan(15_000)
+    } finally {
+      await hung.stop()
+    }
+  }, 30_000)
+
+  it("a home with network.json but no socket at all still prints daemon-down", async () => {
+    // init ran but nothing listens: every /health probe is refused, which is unreachable —
+    // never a timeout — so the verdict stays daemon-down (the spawned midad dies on the stub
+    // network.json before it could bind anything)
+    const dir = home()
+    dir.writeSecretJson("network.json", { rpcUrl: "http://127.0.0.1:1", deployment: {} })
+    const res = await run(["claude-code"], sessionStart(), dir.root)
+    expect(res.status).toBe(0)
+    const out = envelope(res.stdout)
+    expect(out.systemMessage).toBe("Mida: could not load context (daemon-down) — working without it")
+    expect(out.hookSpecificOutput.additionalContext).toBe("Mida: no context available right now (daemon-down).")
   }, 30_000)
 
   it("a served handoff records the covered contextIds as the session's seen set", async () => {

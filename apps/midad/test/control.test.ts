@@ -5,7 +5,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { MidaHome, SOCKET_FILE, callDaemon, ensureDaemon, ensureFallbackSocketDir, fallbackSocketDir, socketPathFor } from "@mida/midad"
-import { ensureCurrentDaemon } from "../src/control.js"
+import { ensureCurrentDaemon, ensureDaemonState } from "../src/control.js"
 
 /** A Unix-socket server the test controls by hand; `onRequest` decides what a connection gets. */
 function fakeDaemon(socketPath: string, onRequest: (socket: Socket, data: Buffer) => void): Promise<Server> {
@@ -94,7 +94,7 @@ describe("callDaemon", () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     const started = Date.now()
     const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 5_000 })
-    expect(reply).toEqual({ status: 0, body: null })
+    expect(reply).toEqual({ status: 0, body: null, failure: "unreachable" })
     expect(Date.now() - started).toBeLessThan(1_000)
   })
 
@@ -117,7 +117,7 @@ describe("callDaemon", () => {
     try {
       const started = Date.now()
       const reply = await callDaemon(home, "/kick", {}, { timeoutMs: 150 })
-      expect(reply).toEqual({ status: 0, body: null })
+      expect(reply).toEqual({ status: 0, body: null, failure: "timeout" })
       expect(Date.now() - started).toBeLessThan(1_000)
     } finally {
       await close(server)
@@ -131,7 +131,7 @@ describe("callDaemon", () => {
     })
     try {
       const reply = await callDaemon(home, "/kick", {}, { timeoutMs: 1_000 })
-      expect(reply).toEqual({ status: 0, body: null })
+      expect(reply).toEqual({ status: 0, body: null, failure: "bad-reply" })
     } finally {
       await close(server)
     }
@@ -160,6 +160,28 @@ describe("ensureDaemon", () => {
     expect(up).toBe(false)
     expect(spawned).toBe(1)
     expect(Date.now() - started).toBeLessThan(2_000)
+  })
+
+  it("ensureDaemonState: a listening socket that never answers /health is slow, not down", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    // accepts the connection and stays silent — connected, just not answering
+    const server = await fakeDaemon(socketPathFor(home), () => {})
+    try {
+      let spawned = 0
+      const state = await ensureDaemonState(home, () => { spawned += 1 }, { waitMs: 800 })
+      expect(state).toBe("slow")
+      expect(spawned).toBe(1)
+    } finally {
+      await close(server)
+    }
+  })
+
+  it("ensureDaemonState: no socket at all is down — unreachable, never a timeout", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    let spawned = 0
+    const state = await ensureDaemonState(home, () => { spawned += 1 }, { waitMs: 300 })
+    expect(state).toBe("down")
+    expect(spawned).toBe(1)
   })
 })
 

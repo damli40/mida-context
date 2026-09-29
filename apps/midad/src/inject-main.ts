@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { callDaemon, ensureDaemon } from "./control.js"
+import { callDaemon, ensureDaemonState } from "./control.js"
 import { noContextText } from "./handoff.js"
 import type { SessionStartBody } from "./hook-output.js"
 import { degradedMessage, hookReply, sessionStartMessage, whatsNewMessage } from "./hook-output.js"
@@ -168,10 +168,11 @@ async function main(): Promise<void> {
   // anything that is not a session start — another hook event, or no event at all — stays silent
   if (record.hook_event_name !== "SessionStart") return
   const cwd = payloadCwd(record)
-  // before `init` wrote network.json no daemon can exist — the spawn would die on the same check
-  const up = home.has("network.json") && (await ensureDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS }))
-  if (!up) {
-    await writeLine(degraded("daemon-down"))
+  // before `init` wrote network.json no daemon can exist — the spawn would die on the same check.
+  // A daemon that held the socket past every probe's timer is slow, not down (in-35 R-2).
+  const state = home.has("network.json") ? await ensureDaemonState(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS }) : "down"
+  if (state !== "up") {
+    await writeLine(degraded(state === "slow" ? "daemon-slow" : "daemon-down"))
     return
   }
   const reply = await callDaemon(
@@ -188,7 +189,7 @@ async function main(): Promise<void> {
   )
   const body = reply.body as SessionStartBody | null
   if (reply.status === 0) {
-    await writeLine(degraded("daemon-down"))
+    await writeLine(degraded(reply.failure === "timeout" ? "daemon-slow" : "daemon-down"))
     return
   }
   if (typeof body?.text !== "string") {
