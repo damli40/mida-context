@@ -54,11 +54,18 @@ contracts:
       - event: BatchAnchored
 
 chains:
-  # Monad testnet. HyperSync is the default data source for supported chains and needs
-  # an ENVIO_API_TOKEN environment variable at runtime (see README). To index without a
-  # token, add `rpc: { url: <endpoint>, for: sync }` here.
+  # Monad testnet, read through Monad's public RPC. Envio 3 reads HyperSync only with an
+  # ENVIO_API_TOKEN, and Envio Cloud's free plan has no environment variables to hold one, so
+  # an indexer left on HyperSync there waits forever with no data (Sep 30, 2026). An `rpc`
+  # entry `for: sync` makes Envio drop HyperSync for this chain. The public RPC answers at
+  # most 100 blocks per log request, hence the two interval settings.
   - id: 10143
     start_block: 65178864
+    rpc:
+      url: https://testnet-rpc.monad.xyz
+      for: sync
+      initial_block_interval: 100
+      interval_ceiling: 100
     contracts:
       - name: CapabilityRegistry
         address: "0xadfbebc7a653e4287ae30c87d32d7ad647d7039b"
