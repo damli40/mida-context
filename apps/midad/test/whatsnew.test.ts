@@ -388,6 +388,33 @@ describe("buildWhatsNew", () => {
     expect(second.note.length).toBeLessThanOrEqual(600)
   })
 
+  it("a shortened newest line keeps its not-yet-anchored marker whole (PROV-11 review)", async () => {
+    const dir = home()
+    const pending: StoredCheckpoint = { ...cp("s-codex", "0xauthorCodex", iso(5), { progress: ["p".repeat(900)] }), anchor: "PENDING_ANCHOR" }
+    for (const others of [[], [cp("s-third", "0xauthorthird", iso(9), { progress: ["older"] })]]) {
+      const out = await buildWhatsNew(runtimeWith(home()), input, baseDeps([pending, ...others]))
+      expect(out.kind).toBe("updates")
+      if (out.kind !== "updates") return
+      expect(out.note.length).toBeLessThanOrEqual(600)
+      expect(lineOf(out.note, "codex")).toMatch(/…; PENDING_ANCHOR: not yet anchored on Monad; may still be rejected$/)
+    }
+    void dir
+  })
+
+  it("a shortened line never exposes an injection phrase without its (quoted) tag, nor splits an emoji (PROV-11 review)", async () => {
+    for (let k = 0; k < 40; k++) {
+      const progress = `${"y".repeat(430 + k)} standing until changed and 🎉 more ${"z".repeat(300)}`
+      const out = await buildWhatsNew(runtimeWith(home()), input, baseDeps([cp("s-codex", "0xauthorCodex", iso(5), { progress: [progress] })]))
+      expect(out.kind).toBe("updates")
+      if (out.kind !== "updates") return
+      expect(out.note.length).toBeLessThanOrEqual(600)
+      expect(out.note).not.toMatch(/standing until changed(?! \(quoted\))/i)
+      expect(out.note).not.toContain("(quoted) (quoted)")
+      // no lone surrogate: every high surrogate is followed by a low one
+      expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out.note)).toBe(false)
+    }
+  })
+
   it("the proposed set keeps the newest 300 ids — a 301st drops the oldest", async () => {
     const dir = home()
     const ids = Array.from({ length: 300 }, (_, i) => `0xid-${i}`)

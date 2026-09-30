@@ -259,6 +259,32 @@ function updateLine(
  * later line that does not fit is skipped, never a stop: a short older line after a long one still
  * shows. Returns which line indexes the note shows — only those count as delivered.
  */
+/**
+ * A line cut to `room` characters, ending "…" — safely (PROV-11 review): a trailing pending-anchor
+ * marker is kept whole after the cut, so a pending save is never described as saved; the cut never
+ * splits a surrogate pair; and the cut text is defused again, because a cut can land between an
+ * injection phrase and the "(quoted)" tag defuse gave it. Re-defusing can lengthen the text, so it
+ * is trimmed until it fits.
+ */
+function shortenLine(line: string, room: number): string {
+  const marker = `; ${PENDING_ANCHOR_LINE}`
+  const suffix = line.endsWith(marker) ? marker : ""
+  const head = line.slice(0, line.length - suffix.length)
+  const avail = Math.max(room - suffix.length - 1, 0)
+  const safeCut = (text: string, n: number) => {
+    const end = n > 0 && /[\uD800-\uDBFF]/.test(text.charAt(n - 1)) ? n - 1 : n
+    return text.slice(0, Math.max(end, 0))
+  }
+  const redefuse = (text: string) => defuse(text).replace(/\(quoted\)(?: \(quoted\))+/g, "(quoted)")
+  let cutHead = safeCut(head, avail)
+  let safe = redefuse(cutHead)
+  while (safe.length > avail && cutHead.length > 0) {
+    cutHead = safeCut(cutHead, cutHead.length - (safe.length - avail))
+    safe = redefuse(cutHead)
+  }
+  return `${safe}…${suffix}`
+}
+
 function buildNote(lines: string[]): { note: string; shown: Set<number> } {
   const moreLine = (n: number) => `…and ${n} more`
   const fits = (parts: string[]) => [WHATS_NEW_HEADER, ...parts].join("\n").length <= NOTE_LIMIT_CHARS
@@ -269,7 +295,7 @@ function buildNote(lines: string[]): { note: string; shown: Set<number> } {
       // the reserve is sized for the most lines that could be left out, so the count line always fits
       const reserve = lines.length > 1 ? moreLine(lines.length - 1).length + 1 : 0
       const room = NOTE_LIMIT_CHARS - WHATS_NEW_HEADER.length - 1 - reserve
-      kept.push(line.length <= room ? line : `${line.slice(0, Math.max(room - 1, 0))}…`)
+      kept.push(line.length <= room ? line : shortenLine(line, room))
       shown.add(0)
     } else if (fits([...kept, line])) {
       kept.push(line)
