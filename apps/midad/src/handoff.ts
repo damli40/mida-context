@@ -130,7 +130,7 @@ const QUEUE_NOTE_SCAN_LIMIT = 200
  * reports what is queued — it never removes, re-orders, waits on or triggers a job, and a queue
  * that cannot be read degrades to no line at all, never a refused handoff.
  */
-function queuedSavesNote(home: MidaHome, projectId: string): string | null {
+function queuedSavesNote(home: MidaHome, projectId: string, nowMs: number): string | null {
   let jobs: CaptureJob[]
   try {
     jobs = peekJobs(home, QUEUE_NOTE_SCAN_LIMIT)
@@ -139,6 +139,9 @@ function queuedSavesNote(home: MidaHome, projectId: string): string | null {
   }
   const perAgent = new Map<string, Set<string>>()
   let lastTryFailed = false
+  // CAP-26: the oldest counted job's queue time — the note says how long it has waited, so the
+  // next agent can tell a save from seconds ago from one stuck for an hour
+  let oldestAt = Number.POSITIVE_INFINITY
   for (const job of jobs) {
     if (!isSafeName(job.agent)) continue
     let jobProject: string | null
@@ -151,6 +154,8 @@ function queuedSavesNote(home: MidaHome, projectId: string): string | null {
     const sessions = perAgent.get(job.agent) ?? new Set<string>()
     sessions.add(job.sessionId)
     perAgent.set(job.agent, sessions)
+    // asJob already refused a job whose `at` will not parse
+    oldestAt = Math.min(oldestAt, Date.parse(job.at))
     // the drainer records a failed try on the session's own state file — read-only, and an
     // unreadable or malformed state only loses the retry clause, never the count
     try {
@@ -176,12 +181,26 @@ function queuedSavesNote(home: MidaHome, projectId: string): string | null {
   const clauses: string[] = []
   if (perAgent.size > 0) {
     const parts = [...perAgent.entries()].map(([name, sessions], index) =>
-      index === 0 ? `${sessions.size} newer save(s) from ${name}` : `${sessions.size} from ${name}`,
+      index === 0 ? `${sessions.size} newer save${sessions.size === 1 ? "" : "s"} from ${name}` : `${sessions.size} from ${name}`,
     )
-    clauses.push(`${parts.join(", ")} have not reached Monad yet; this record may be behind them${lastTryFailed ? " (the last try failed; Mida keeps retrying)" : ""}`)
+    const total = [...perAgent.values()].reduce((sum, sessions) => sum + sessions.size, 0)
+    const waited = waitedText(nowMs - oldestAt)
+    const clause =
+      total === 1
+        ? `${parts.join(", ")} has not reached Monad yet (it has waited ${waited}); this record may be behind it`
+        : `${parts.join(", ")} have not reached Monad yet (the oldest has waited ${waited}); this record may be behind them`
+    clauses.push(`${clause}${lastTryFailed ? " (the last try failed; Mida keeps retrying)" : ""}`)
   }
   if (stuck > 0) clauses.push(`${stuck} save${stuck === 1 ? "" : "s"} could not be sent to Monad: see \`mida doctor\``)
   return `Mida note: ${clauses.join(". ")}.`
+}
+
+/** How long a queued save has waited, in the note's words; a future stamp (clock skew) counts as 0. */
+function waitedText(ms: number): string {
+  const minutes = Math.floor(Math.max(ms, 0) / 60_000)
+  if (minutes < 1) return "under a minute"
+  if (minutes < 120) return `${minutes} min`
+  return `${Math.floor(minutes / 60)} h`
 }
 
 /** The generic refusal line — the only text a session-start hook prints on its own failures. */
@@ -399,9 +418,9 @@ export async function buildHandoff(
 
     // Mida's own undelivered saves are newer work this record cannot know — one read-only count,
     // after access is granted and scoped to this project. Never a queue control.
-    const pendingSavesNote = queuedSavesNote(runtime.home, check.projectId) ?? undefined
-
     const now = deps.now ?? (() => Date.now())
+    const pendingSavesNote = queuedSavesNote(runtime.home, check.projectId, now()) ?? undefined
+
     const readStarted = now()
     // `settled` never rejects, so a read that finishes or fails after the deadline is discarded
     // quietly — no unhandled rejection, and its text is never logged or rendered.

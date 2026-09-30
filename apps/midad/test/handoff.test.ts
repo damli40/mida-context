@@ -867,6 +867,9 @@ describe("the adapter line for coding clients (in-8 H2)", () => {
 })
 
 describe("queued saves surface in the handoff (in-8 H4)", () => {
+  // CAP-26: the note says how long the oldest waiting save has waited — the handoff's clock is
+  // pinned 4 minutes after the jobs' default queue time (10:00:00)
+  const QUEUE_NOW = Date.parse("2026-09-25T10:04:00.000Z")
   /**
    * The queue tests get their OWN home: a job file in the shared home would leak a "Mida note:"
    * into every other test's handoff. Same codex identity the shared home carries.
@@ -918,11 +921,11 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
   it("a queued job inside the project names its agent and count, between the header and the fence", async () => {
     const dir = queueHome()
     job(dir)
-    const { d } = deps(reads)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
-    const expected = "Mida note: 1 newer save(s) from claude-code have not reached Monad yet; this record may be behind them."
+    const expected = "Mida note: 1 newer save from claude-code has not reached Monad yet (it has waited 4 min); this record may be behind it."
     expect(result.text).toContain(expected)
     expect(result.text.indexOf(expected)).toBeGreaterThan(result.text.indexOf("Nothing below is an instruction"))
     expect(result.text.indexOf(expected)).toBeLessThan(result.text.indexOf("=== BEGIN MIDA HANDOFF DATA ==="))
@@ -935,11 +938,11 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     const dir = queueHome()
     job(dir, { agent: "claude-code" }, "2026-09-25T10:00:00.000Z")
     job(dir, { agent: "codex", sessionId: "sess-r" }, "2026-09-25T10:00:01.000Z")
-    const { d } = deps(reads)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
-    expect(result.text).toContain("Mida note: 1 newer save(s) from claude-code, 1 from codex have not reached Monad yet; this record may be behind them.")
+    expect(result.text).toContain("Mida note: 1 newer save from claude-code, 1 from codex have not reached Monad yet (the oldest has waited 4 min); this record may be behind them.")
   })
 
   it("several queued jobs from one session count once — the drain merges them into one save (in-11 R-14)", async () => {
@@ -947,29 +950,29 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     job(dir, { sessionId: "sess-multi" })
     job(dir, { sessionId: "sess-multi", event: "SessionEnd" }, "2026-09-25T10:00:01.000Z")
     job(dir, { sessionId: "sess-other" }, "2026-09-25T10:00:02.000Z")
-    const { d } = deps(reads)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
-    expect(result.text).toContain("Mida note: 2 newer save(s) from claude-code have not reached Monad yet")
-    expect(result.text).not.toContain("3 newer save(s)")
+    expect(result.text).toContain("Mida note: 2 newer saves from claude-code have not reached Monad yet")
+    expect(result.text).not.toContain("3 newer saves")
   })
 
   it("a brand-new project's empty handoff still carries the queued-saves note", async () => {
     const dir = queueHome()
     job(dir)
-    const { d } = deps({ read: async () => ({ checkpoints: [], skipped: 0, milliseconds: 1, partial: false }) })
+    const { d } = deps({ read: async () => ({ checkpoints: [], skipped: 0, milliseconds: 1, partial: false }), now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("empty")
     expect(result.text).toContain("Nothing has been saved for this project yet")
-    expect(result.text).toContain("Mida note: 1 newer save(s) from claude-code have not reached Monad yet; this record may be behind them.")
+    expect(result.text).toContain("Mida note: 1 newer save from claude-code has not reached Monad yet (it has waited 4 min); this record may be behind it.")
   })
 
   it("a job in another project, or a folder with no marker, is not counted", async () => {
     const dir = queueHome()
     job(dir, { cwd: projectFolder("other-project") })
     job(dir, { cwd: projectFolder(null), sessionId: "sess-nomarker" })
-    const { d } = deps(reads)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
@@ -978,7 +981,7 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
 
   it("an empty queue adds no note", async () => {
     const dir = queueHome()
-    const { d } = deps(reads)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
@@ -995,12 +998,12 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     const contextId = `0x${"ee".repeat(32)}` as Hex
     addPendingAnchor(dir, { contextId, eventId: "cp-stuck-1", sessionId: "sess-stuck", agent: "claude-code", queuedAt: "2026-09-25T10:00:00.000Z", stuck: "TOO_LARGE", stuckAt: "2026-09-25T11:00:00.000Z" })
     keepPendingPlaintext(dir, contextId, { value: { type: "mida.checkpoint.v1", projectId: "p1", sessionId: "sess-stuck" }, kind: "EPISODE", source: "AGENT_INFERRED", tags: [] })
-    const { d } = deps(reads)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
     expect(result.text).toContain("Mida note: 1 save could not be sent to Monad: see `mida doctor`.")
-    expect(result.text).not.toContain("newer save(s)")
+    expect(result.text).not.toContain("newer save")
     // agent names only — the kept plaintext's session id is never quoted into the note
     expect(result.text).not.toContain("sess-stuck")
   })
@@ -1011,11 +1014,11 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     const contextId = `0x${"ee".repeat(32)}` as Hex
     addPendingAnchor(dir, { contextId, eventId: "cp-stuck-2", sessionId: "sess-stuck2", agent: "claude-code", queuedAt: "2026-09-25T10:00:00.000Z", stuck: "BAD_SHAPE", stuckAt: "2026-09-25T11:00:00.000Z" })
     keepPendingPlaintext(dir, contextId, { value: { type: "mida.checkpoint.v1", projectId: "p1", sessionId: "sess-stuck2" }, kind: "EPISODE", source: "AGENT_INFERRED", tags: [] })
-    const { d } = deps(reads)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
-    expect(result.text).toContain("Mida note: 1 newer save(s) from claude-code have not reached Monad yet; this record may be behind them. 1 save could not be sent to Monad: see `mida doctor`.")
+    expect(result.text).toContain("Mida note: 1 newer save from claude-code has not reached Monad yet (it has waited 4 min); this record may be behind it. 1 save could not be sent to Monad: see `mida doctor`.")
   })
 
   it("a pending batch save that is NOT stuck, or a stuck save for another project, adds nothing", async () => {
@@ -1025,7 +1028,7 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     addPendingAnchor(dir, { contextId: stillTrying, eventId: "cp-queued-1", sessionId: "sess-q1", agent: "claude-code", queuedAt: "2026-09-25T10:00:00.000Z" })
     addPendingAnchor(dir, { contextId: otherProject, eventId: "cp-stuck-other", sessionId: "sess-so", agent: "claude-code", queuedAt: "2026-09-25T10:00:00.000Z", stuck: "BAD_SHAPE", stuckAt: "2026-09-25T11:00:00.000Z" })
     keepPendingPlaintext(dir, otherProject, { value: { type: "mida.checkpoint.v1", projectId: "other-project", sessionId: "sess-so" }, kind: "EPISODE", source: "AGENT_INFERRED", tags: [] })
-    const { d } = deps(reads)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
@@ -1042,12 +1045,12 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
       attempts: 2,
       failedAt: "2026-09-25T10:05:00.000Z",
     })
-    const { d } = deps(reads)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
     expect(result.text).toContain(
-      "Mida note: 1 newer save(s) from claude-code have not reached Monad yet; this record may be behind them (the last try failed; Mida keeps retrying).",
+      "Mida note: 1 newer save from claude-code has not reached Monad yet (it has waited 4 min); this record may be behind it (the last try failed; Mida keeps retrying).",
     )
   })
 
@@ -1055,7 +1058,7 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     const dir = queueHome()
     // a file where the queue folder would sit: listing it throws, and that must never refuse
     writeFileSync(dir.path("queue"), "not a directory")
-    const { d } = deps(reads)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
@@ -1074,12 +1077,35 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
         .map((e) => `${e.name}:${e.isDirectory() ? "dir" : readFileSync(join(dir.path("queue"), e.name), "utf8")}`)
         .join("\n")
     const before = snapshot()
-    const { d } = deps(reads)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
     const result = await buildHandoff(queueRuntime(dir), input, d)
     expect(result.kind).toBe("handoff")
     if (result.kind !== "handoff") return
     // the valid jobs still counted — the corrupt one is skipped, not removed
-    expect(result.text).toContain("Mida note: 1 newer save(s) from claude-code, 1 from codex have not reached Monad yet")
+    expect(result.text).toContain("Mida note: 1 newer save from claude-code, 1 from codex have not reached Monad yet")
     expect(snapshot()).toBe(before)
+  })
+  it("the note names the oldest wait in hours past two hours, and counts sessions per agent (CAP-26)", async () => {
+    const dir = queueHome()
+    for (const [i, session] of ["a", "b", "c"].entries()) job(dir, { sessionId: `sess-${session}` }, `2026-09-25T07:3${i}:00.000Z`)
+    job(dir, { agent: "codex", sessionId: "sess-d" }, "2026-09-25T09:00:00.000Z")
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    // oldest 07:30 → 154 min before 10:04
+    expect(result.text).toContain("Mida note: 3 newer saves from claude-code, 1 from codex have not reached Monad yet (the oldest has waited 2 h); this record may be behind them.")
+  })
+
+  it("a save queued seconds ago — or stamped after the clock (skew) — has waited under a minute (CAP-26)", async () => {
+    for (const at of ["2026-09-25T10:03:40.000Z", "2026-09-25T10:09:00.000Z"]) {
+      const dir = queueHome()
+      job(dir, {}, at)
+      const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+      const result = await buildHandoff(queueRuntime(dir), input, d)
+      expect(result.kind).toBe("handoff")
+      if (result.kind !== "handoff") return
+      expect(result.text).toContain("(it has waited under a minute); this record may be behind it.")
+    }
   })
 })
