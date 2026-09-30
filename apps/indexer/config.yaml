@@ -55,10 +55,11 @@ contracts:
 
 chains:
   # Monad testnet, read through Monad's public RPC. Envio 3 reads HyperSync only with an
-  # ENVIO_API_TOKEN, and Envio Cloud's free plan has no environment variables to hold one, so
-  # an indexer left on HyperSync there waits forever with no data (Sep 30, 2026). An `rpc`
-  # entry `for: sync` makes Envio drop HyperSync for this chain. The public RPC answers at
-  # most 100 blocks per log request, hence the two interval settings.
+  # ENVIO_API_TOKEN, and Envio Cloud's free plan has no environment variables to hold one; an
+  # `rpc` entry `for: sync` makes Envio drop HyperSync for this chain, so no token is needed.
+  # The public RPC answers at most 100 blocks per log request, hence the two interval settings.
+  # On Sep 30, 2026 a hosted deployment on either source started and then synced nothing; the
+  # cause is not known yet.
   - id: 10143
     start_block: 65178864
     rpc:
