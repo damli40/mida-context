@@ -333,6 +333,61 @@ describe("buildWhatsNew", () => {
     expect(second.kind).toBe("none")
   })
 
+  // PROV-11: an update that does not fit is shortened (the newest) or offered again later (the
+  // rest) — never silently hidden and then recorded as delivered
+  const input = { agent: "claude-code", cwd: "/repo", sessionId: "s-1" }
+  const lineOf = (note: string, agent: string) => note.split("\n").find((l) => l.startsWith(`- ${agent} (`))
+
+  it("a newest update too long for the note is shortened, never dropped; the folded one comes next time (PROV-11)", async () => {
+    const dir = home()
+    const long = cp("s-codex", "0xauthorCodex", iso(5), { progress: ["x".repeat(900)] })
+    const older = cp("s-third", "0xauthorthird", iso(9), { progress: ["short older work"] })
+    const deps = baseDeps([long, older])
+    const first = await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(first.kind).toBe("updates")
+    if (first.kind !== "updates") return
+    expect(first.note.length).toBeLessThanOrEqual(600)
+    expect(lineOf(first.note, "codex")?.endsWith("…")).toBe(true)
+    expect(first.note).toContain("…and 1 more")
+    expect(first.note).not.toContain("short older work")
+    // only what the note showed is delivered — the folded update is not
+    expect(first.seen).toContain(long.contextId)
+    expect(first.seen).not.toContain(older.contextId)
+    expect(first.updates.map((u) => u.agent)).toEqual(["codex"])
+    writeSeen(dir, "s-1", first.seen)
+    const second = await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(second.kind).toBe("updates")
+    if (second.kind !== "updates") return
+    expect(second.note).toContain("short older work")
+    expect(second.note).not.toContain("xxxx")
+    writeSeen(dir, "s-1", second.seen)
+    expect((await buildWhatsNew(runtimeWith(dir), input, deps)).kind).toBe("none")
+  })
+
+  it("a middle update that does not fit is skipped, not a stop — the older short one still shows (PROV-11)", async () => {
+    const dir = home()
+    const newest = cp("s-codex", "0xauthorCodex", iso(3), { progress: ["newest short work"] })
+    const middle = cp("s-claude", "0xauthorClaude", iso(6), { progress: ["y".repeat(900)] })
+    const oldest = cp("s-third", "0xauthorthird", iso(9), { progress: ["oldest short work"] })
+    const deps = baseDeps([newest, middle, oldest])
+    const first = await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(first.kind).toBe("updates")
+    if (first.kind !== "updates") return
+    expect(first.note.length).toBeLessThanOrEqual(600)
+    expect(first.note).toContain("newest short work")
+    expect(first.note).toContain("oldest short work")
+    expect(first.note).toContain("…and 1 more")
+    expect(first.seen).toEqual(expect.arrayContaining([newest.contextId, oldest.contextId]))
+    expect(first.seen).not.toContain(middle.contextId)
+    writeSeen(dir, "s-1", first.seen)
+    const second = await buildWhatsNew(runtimeWith(dir), input, deps)
+    expect(second.kind).toBe("updates")
+    if (second.kind !== "updates") return
+    // alone now, the long update leads the note — shortened to fit
+    expect(lineOf(second.note, "claude-code")?.endsWith("…")).toBe(true)
+    expect(second.note.length).toBeLessThanOrEqual(600)
+  })
+
   it("the proposed set keeps the newest 300 ids — a 301st drops the oldest", async () => {
     const dir = home()
     const ids = Array.from({ length: 300 }, (_, i) => `0xid-${i}`)

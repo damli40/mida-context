@@ -252,20 +252,38 @@ function updateLine(
   return `- ${defuse(name)} (${agoText(recordedAt(newest), now)}): ${body}`
 }
 
-/** Header plus as many lines as fit, newest first; leftovers collapse into a count line. */
-function buildNote(lines: string[]): string {
+/**
+ * Header plus as many lines as fit, newest first; leftovers collapse into a count line. The newest
+ * line is always shown, shortened to fit when it alone is too long — with room kept for the count
+ * line whenever anything else is left out, so the reader always learns more exists (PROV-11). A
+ * later line that does not fit is skipped, never a stop: a short older line after a long one still
+ * shows. Returns which line indexes the note shows — only those count as delivered.
+ */
+function buildNote(lines: string[]): { note: string; shown: Set<number> } {
+  const moreLine = (n: number) => `…and ${n} more`
+  const fits = (parts: string[]) => [WHATS_NEW_HEADER, ...parts].join("\n").length <= NOTE_LIMIT_CHARS
   const kept: string[] = []
-  for (const line of lines) {
-    if ([WHATS_NEW_HEADER, ...kept, line].join("\n").length > NOTE_LIMIT_CHARS) break
-    kept.push(line)
+  const shown = new Set<number>()
+  lines.forEach((line, index) => {
+    if (index === 0) {
+      // the reserve is sized for the most lines that could be left out, so the count line always fits
+      const reserve = lines.length > 1 ? moreLine(lines.length - 1).length + 1 : 0
+      const room = NOTE_LIMIT_CHARS - WHATS_NEW_HEADER.length - 1 - reserve
+      kept.push(line.length <= room ? line : `${line.slice(0, Math.max(room - 1, 0))}…`)
+      shown.add(0)
+    } else if (fits([...kept, line])) {
+      kept.push(line)
+      shown.add(index)
+    }
+  })
+  // the count line must fit too: give back the latest later lines until it does (never the newest)
+  while (shown.size < lines.length && !fits([...kept, moreLine(lines.length - shown.size)]) && kept.length > 1) {
+    kept.pop()
+    shown.delete(Math.max(...shown))
   }
-  const dropped = lines.length - kept.length
-  if (dropped > 0) {
-    const more = `…and ${dropped} more`
-    if ([WHATS_NEW_HEADER, ...kept, more].join("\n").length <= NOTE_LIMIT_CHARS) kept.push(more)
-  }
+  if (shown.size < lines.length) kept.push(moreLine(lines.length - shown.size))
   const note = [WHATS_NEW_HEADER, ...kept].join("\n")
-  return note.length <= NOTE_LIMIT_CHARS ? note : `${note.slice(0, NOTE_LIMIT_CHARS - 1)}…`
+  return { note: note.length <= NOTE_LIMIT_CHARS ? note : `${note.slice(0, NOTE_LIMIT_CHARS - 1)}…`, shown }
 }
 
 /**
@@ -359,28 +377,37 @@ export async function buildWhatsNew(
     // to one count line per task — "sdk: 2 new saves by codex" — so the note stays awareness,
     // never context (invariant 3). Every foreign id still joins the covered set either way:
     // a mentioned checkpoint is a delivered one.
-    const perAuthor = new Map<string, { newest?: StoredCheckpoint; baseline?: StoredCheckpoint }>()
-    const foreignByTask = new Map<string, { count: number; newest: StoredCheckpoint }>()
+    // PROV-11: each line carries the unseen ids it stands for (`ids`), so only the lines the note
+    // actually shows are recorded as delivered — a folded line is offered again next time.
+    const perAuthor = new Map<string, { newest?: StoredCheckpoint; baseline?: StoredCheckpoint; ids: string[] }>()
+    const foreignByTask = new Map<string, { count: number; newest: StoredCheckpoint; ids: string[] }>()
     const foreignIds: { id: string; at: number }[] = []
+    // a record with no usable instant can never lead a line — it is delivered at once, as before
+    const neverShown = new Set<string>()
     for (const cp of checkpoints) {
       if (cp.sessionId === input.sessionId) continue
       const at = orderTime(cp)
       foreignIds.push({ id: cp.contextId, at: Number.isNaN(at) ? 0 : at })
-      if (Number.isNaN(at)) continue
+      if (Number.isNaN(at)) {
+        neverShown.add(cp.contextId)
+        continue
+      }
       if (taskOf(cp) !== task) {
         if (!seen.has(cp.contextId)) {
           const held = foreignByTask.get(taskOf(cp))
           if (held === undefined) {
-            foreignByTask.set(taskOf(cp), { count: 1, newest: cp })
+            foreignByTask.set(taskOf(cp), { count: 1, newest: cp, ids: [cp.contextId] })
           } else {
             held.count += 1
+            held.ids.push(cp.contextId)
             if (compareChainOrder(cp, held.newest) > 0) held.newest = cp
           }
         }
         continue
       }
-      const bucket = perAuthor.get(cp.authorId) ?? {}
+      const bucket = perAuthor.get(cp.authorId) ?? { ids: [] }
       if (!seen.has(cp.contextId)) {
+        bucket.ids.push(cp.contextId)
         if (bucket.newest === undefined || compareChainOrder(cp, bucket.newest) > 0) bucket.newest = cp
       } else if (bucket.baseline === undefined || compareChainOrder(cp, bucket.baseline) > 0) {
         bucket.baseline = cp
@@ -393,11 +420,10 @@ export async function buildWhatsNew(
     const names = deps.authorNames ?? authorNamesFor(runtime)
     // one summary line per foreign task that saved something new — newest task first; a foreign
     // task with nothing unseen gets no line at all
-    const foreignLines = [...foreignByTask.entries()]
-      .sort((a, b) => compareChainOrder(b[1].newest, a[1].newest))
-      .map(([name, held]) =>
-        `${defuse(name)}: ${held.count} new save${held.count === 1 ? "" : "s"} by ${defuse(names[held.newest.authorId.toLowerCase()] ?? "unknown agent")}`,
-      )
+    const foreignTasks = [...foreignByTask.entries()].sort((a, b) => compareChainOrder(b[1].newest, a[1].newest))
+    const foreignLines = foreignTasks.map(([name, held]) =>
+      `${defuse(name)}: ${held.count} new save${held.count === 1 ? "" : "s"} by ${defuse(names[held.newest.authorId.toLowerCase()] ?? "unknown agent")}`,
+    )
     if (updates.length === 0 && foreignLines.length === 0) return { kind: "none" }
     const lines = [
       ...updates.map((u) =>
@@ -405,12 +431,17 @@ export async function buildWhatsNew(
       ),
       ...foreignLines,
     ]
-    // the proposed set covers every foreign checkpoint this answer saw — shown in the note or
-    // folded into "…and N more" — appended newest-last so the record's cap drops the oldest
+    // line i stands for these unseen ids — an author line covers that author's older unseen saves too
+    const lineIds = [...updates.map((u) => u.ids), ...foreignTasks.map(([, held]) => held.ids)]
+    const { note, shown } = buildNote(lines)
+    const delivered = new Set(neverShown)
+    for (const index of shown) for (const id of lineIds[index] ?? []) delivered.add(id)
+    // the proposed set adds only what this note showed (plus records that can never lead a line),
+    // appended newest-last so the record's cap drops the oldest
     const known = new Set(seen)
     const arrived: { id: string; at: number }[] = []
     for (const f of foreignIds) {
-      if (known.has(f.id)) continue
+      if (known.has(f.id) || !delivered.has(f.id)) continue
       known.add(f.id) // a duplicate record in the copy lands its id once
       arrived.push(f)
     }
@@ -418,11 +449,13 @@ export async function buildWhatsNew(
     const proposed = [...seen, ...arrived.map((f) => f.id)].slice(-SEEN_MAX)
     return {
       kind: "updates",
-      note: buildNote(lines),
-      updates: updates.map((u) => ({
-        agent: names[u.authorId.toLowerCase()] ?? "unknown agent",
-        savedAt: recordedAt(u.newest),
-      })),
+      note,
+      updates: updates
+        .filter((_, index) => shown.has(index))
+        .map((u) => ({
+          agent: names[u.authorId.toLowerCase()] ?? "unknown agent",
+          savedAt: recordedAt(u.newest),
+        })),
       seen: proposed,
     }
   } catch (error) {
