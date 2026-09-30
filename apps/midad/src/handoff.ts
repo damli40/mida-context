@@ -139,9 +139,10 @@ function queuedSavesNote(home: MidaHome, projectId: string, nowMs: number): stri
   }
   const perAgent = new Map<string, Set<string>>()
   let lastTryFailed = false
-  // CAP-26: the oldest counted job's queue time — the note says how long it has waited, so the
-  // next agent can tell a save from seconds ago from one stuck for an hour
-  let oldestAt = Number.POSITIVE_INFINITY
+  // CAP-26: each counted session's NEWEST queued change. The drain merges a session's jobs and
+  // keeps only the newest, so that is all the queue can honestly tell. The stalest of those is the
+  // signal: a session with no new change for an hour that is still not on Monad is stuck.
+  const newestChange = new Map<string, number>()
   for (const job of jobs) {
     if (!isSafeName(job.agent)) continue
     let jobProject: string | null
@@ -155,7 +156,7 @@ function queuedSavesNote(home: MidaHome, projectId: string, nowMs: number): stri
     sessions.add(job.sessionId)
     perAgent.set(job.agent, sessions)
     // asJob already refused a job whose `at` will not parse
-    oldestAt = Math.min(oldestAt, Date.parse(job.at))
+    newestChange.set(job.sessionId, Math.max(newestChange.get(job.sessionId) ?? Number.NEGATIVE_INFINITY, Date.parse(job.at)))
     // the drainer records a failed try on the session's own state file — read-only, and an
     // unreadable or malformed state only loses the retry clause, never the count
     try {
@@ -184,19 +185,22 @@ function queuedSavesNote(home: MidaHome, projectId: string, nowMs: number): stri
       index === 0 ? `${sessions.size} newer save${sessions.size === 1 ? "" : "s"} from ${name}` : `${sessions.size} from ${name}`,
     )
     const total = [...perAgent.values()].reduce((sum, sessions) => sum + sessions.size, 0)
-    const waited = waitedText(nowMs - oldestAt)
+    const stalest = Math.min(...newestChange.values())
+    const age = ageText(nowMs - stalest)
     const clause =
       total === 1
-        ? `${parts.join(", ")} has not reached Monad yet (it has waited ${waited}); this record may be behind it`
-        : `${parts.join(", ")} have not reached Monad yet (the oldest has waited ${waited}); this record may be behind them`
+        ? `${parts.join(", ")} has not reached Monad yet (its newest change is ${age} old); this record may be behind it`
+        : `${parts.join(", ")} have not reached Monad yet (${
+            age === "under a minute" ? "each changed within the last minute" : `one of them has not changed for ${age}`
+          }); this record may be behind them`
     clauses.push(`${clause}${lastTryFailed ? " (the last try failed; Mida keeps retrying)" : ""}`)
   }
   if (stuck > 0) clauses.push(`${stuck} save${stuck === 1 ? "" : "s"} could not be sent to Monad: see \`mida doctor\``)
   return `Mida note: ${clauses.join(". ")}.`
 }
 
-/** How long a queued save has waited, in the note's words; a future stamp (clock skew) counts as 0. */
-function waitedText(ms: number): string {
+/** An age in the note's words; a future stamp (clock skew) counts as 0. */
+function ageText(ms: number): string {
   const minutes = Math.floor(Math.max(ms, 0) / 60_000)
   if (minutes < 1) return "under a minute"
   if (minutes < 120) return `${minutes} min`
