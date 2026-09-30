@@ -8,6 +8,7 @@ import type { MidaHome } from "./home.js"
 import { CHAIN_REFUSAL_TEXT, degradedMessage } from "./hook-output.js"
 import type { SessionStartBody } from "./hook-output.js"
 import { appendLog } from "./log.js"
+import { MCP_CLIENT_TOOLS } from "./mcp-clients.js"
 import { findProjectMarker } from "./queue.js"
 import { writeSeen } from "./seen.js"
 import { isTaskName, TASK_RULE_TEXT } from "./task.js"
@@ -210,7 +211,7 @@ export const MCP_TOOLS = [
   {
     name: "mida_save",
     description:
-      "Save a checkpoint of your work on this project so another approved agent can pick it up. Call it when the user asks to save context or hand off, and before you finish a task. The daemon signs it as this client's own identity after the owner's approval gates pass — one save per minute at most.",
+      "Save a checkpoint of your work on this project so another approved agent can pick it up. Call it when the user asks to save context or hand off, and before you finish a task. Claude Desktop and Cursor get this tool; agents with Mida hooks, like Claude Code and Codex, save through those hooks instead. The daemon signs each save as this client's own identity after the owner's approval checks pass. One save per minute at most.",
     inputSchema: {
       type: "object",
       properties: {
@@ -544,15 +545,22 @@ async function toolSave(deps: McpServerDeps, args: Record<string, unknown> | und
  * line — never a stack, never a protocol error for a daemon problem.
  */
 export function createMidaMcpServer(deps: McpServerDeps): Server {
+  // AUTH-17: mida_save is offered only to the identities the save route signs for — a hook-saved
+  // client (claude-code, codex) or an unknown name would only ever get its refusal. The refusal
+  // stays in mcp-save.ts as the backstop: clients cache tool lists.
+  const offersSave = MCP_CLIENT_TOOLS.includes(deps.agent)
   const server = new Server(
     { name: "mida-mcp", version: "0.1.0" },
     {
       capabilities: { tools: {} },
-      instructions:
-        "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status, and it can save a checkpoint with mida_save — the daemon validates, gates, scrubs and signs that write. Owner operations stay deliberately absent: there is no approve, revoke, request or remember here, because a model must never be able to change who has access through MCP.",
+      instructions: offersSave
+        ? "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status, and it can save a checkpoint with mida_save — the daemon validates, gates, scrubs and signs that write. Owner operations stay deliberately absent: there is no approve, revoke, request or remember here, because a model must never be able to change who has access through MCP."
+        : "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This client saves through its Mida hooks, so this server has no save tool. Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
     },
   )
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [...MCP_TOOLS] }))
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: MCP_TOOLS.filter((tool) => offersSave || tool.name !== "mida_save"),
+  }))
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const args = request.params.arguments as Record<string, unknown> | undefined
     switch (request.params.name) {

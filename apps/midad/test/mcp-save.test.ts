@@ -110,6 +110,10 @@ describe("buildMcpSave — the daemon's mida_save route", () => {
       { agent: "codex" },
     )
     expect(result).toMatchObject({ kind: "refused", reason: "not-an-mcp-client" })
+    // AUTH-17: the refusal says where this agent's saves go instead
+    expect((result as { text?: string }).text).toBe(
+      "Mida: codex saves through its Mida hooks. mida_save signs only for claude-desktop and cursor, so this call saved nothing.",
+    )
     expect(projectAsked).toBe(false)
     expect(saved).toBe(false)
   })

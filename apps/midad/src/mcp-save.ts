@@ -128,7 +128,7 @@ const noIdentityText = (agent: string, homeRoot: string): string =>
 const identityUnreadableText = (agent: string, homeRoot: string): string =>
   `Mida: ${agent}'s identity in this Mida home (${homeRoot}) exists but could not be read. Nothing was saved. Run \`mida doctor\`.`
 const notMcpClientText = (agent: string): string =>
-  `Mida: ${agent} is not an MCP client identity — mida_save signs for ${MCP_CLIENT_TOOLS.join(" and ")}. Nothing was saved.`
+  `Mida: ${agent} saves through its Mida hooks. mida_save signs only for ${MCP_CLIENT_TOOLS.join(" and ")}, so this call saved nothing.`
 const rateLimitedText = (agent: string, seconds: number, at: string): string =>
   `Mida: ${agent} may save once per minute in a project — the next save is allowed in ${seconds} s (at ${at}). Nothing was saved.`
 

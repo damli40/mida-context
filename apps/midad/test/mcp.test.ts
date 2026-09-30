@@ -739,7 +739,8 @@ const SAVE_ARGS: Record<string, unknown> = {
 
 describe("mida-mcp tools against a fake daemon", () => {
   it("lists exactly the five stable tools, with the pinned input schemas", async () => {
-    const { client, close } = await connect(deps(home(), { daemonUp: false }))
+    // an MCP client identity — the only kind mida_save signs for (AUTH-17)
+    const { client, close } = await connect(deps(home(), { agent: "claude-desktop", daemonUp: false }))
     try {
       const listed = await client.listTools()
       expect(listed.tools.map((t) => t.name)).toEqual(["mida_handoff", "mida_whats_new", "mida_read", "mida_status", "mida_save"])
@@ -769,6 +770,42 @@ describe("mida-mcp tools against a fake daemon", () => {
     } finally {
       await close()
     }
+  })
+
+  // AUTH-17: a client that saves through hooks is never offered a save tool that can only refuse
+  const toolsFor = async (agent: string): Promise<{ names: string[]; instructions: string | undefined }> => {
+    const { client, close } = await connect(deps(home(), { agent, daemonUp: false }))
+    try {
+      return { names: (await client.listTools()).tools.map((t) => t.name), instructions: client.getInstructions() }
+    } finally {
+      await close()
+    }
+  }
+
+  it("hook-saved clients and unknown names get the four read tools, no mida_save (AUTH-17)", async () => {
+    for (const agent of ["claude-code", "codex", "assistant", ""]) {
+      expect((await toolsFor(agent)).names).toEqual(["mida_handoff", "mida_whats_new", "mida_read", "mida_status"])
+    }
+  })
+
+  it("claude-desktop and cursor still get all five tools (AUTH-17)", async () => {
+    for (const agent of ["claude-desktop", "cursor"]) {
+      expect((await toolsFor(agent)).names).toEqual(["mida_handoff", "mida_whats_new", "mida_read", "mida_status", "mida_save"])
+    }
+  })
+
+  it("the server's instructions mention mida_save only to clients that get it (AUTH-17)", async () => {
+    expect((await toolsFor("claude-code")).instructions).toBe(
+      "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This client saves through its Mida hooks, so this server has no save tool. Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
+    )
+    expect((await toolsFor("cursor")).instructions).toContain("it can save a checkpoint with mida_save")
+  })
+
+  it("mida_save's description names the clients it serves (AUTH-17)", async () => {
+    const save = MCP_TOOLS.find((t) => t.name === "mida_save")!
+    expect(save.description).toBe(
+      "Save a checkpoint of your work on this project so another approved agent can pick it up. Call it when the user asks to save context or hand off, and before you finish a task. Claude Desktop and Cursor get this tool; agents with Mida hooks, like Claude Code and Codex, save through those hooks instead. The daemon signs each save as this client's own identity after the owner's approval checks pass. One save per minute at most.",
+    )
   })
 
   it("mida_handoff sends the hook's body and returns the daemon's text verbatim", async () => {
