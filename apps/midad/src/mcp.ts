@@ -283,6 +283,8 @@ export interface McpServerDeps {
   task?: string
   /** False when the daemon could not be brought up at start — tools then answer degraded. */
   daemonUp: boolean
+  /** mida_status's per-agent probe limit; STATUS_PROBE_TIMEOUT_MS unless a test shortens it. */
+  statusProbeMs?: number
 }
 
 /**
@@ -470,8 +472,9 @@ async function toolStatus(deps: McpServerDeps) {
   const agents = [
     ...new Set([deps.agent, ...deps.home.list("agents").filter((name) => AGENT_NAME.test(name) && deps.home.has(`agents/${name}/identity.json`))]),
   ].sort()
+  const probeMs = deps.statusProbeMs ?? STATUS_PROBE_TIMEOUT_MS
   const probes = await Promise.all(
-    agents.map((name) => callDaemon(deps.home, "/handoff", { agent: name, cwd: deps.project }, { timeoutMs: STATUS_PROBE_TIMEOUT_MS })),
+    agents.map((name) => callDaemon(deps.home, "/handoff", { agent: name, cwd: deps.project }, { timeoutMs: probeMs })),
   )
   const reason = (i: number): string | undefined => {
     const b = probes[i]?.body as { kind?: unknown; reason?: unknown } | null
@@ -494,11 +497,19 @@ async function toolStatus(deps: McpServerDeps) {
       const name = agents[i]!
       const probe = probes[i]!
       const kind = (probe.body as { kind?: unknown } | null)?.kind
-      if (probe.status === 0) lines.push(`${name}: no answer from the daemon`)
+      // AUTH-16: status 0 covers three different failures. Only "unreachable" means the daemon
+      // did not answer; this call's health check already found it up, so a timeout is a slow
+      // read and a bad reply is an unreadable one — neither may read as a missing daemon.
+      if (probe.status === 0 && probe.failure === "unreachable") lines.push(`${name}: no answer from the daemon`)
+      else if (probe.status === 0 && probe.failure === "timeout") {
+        const seconds = Number.isInteger(probeMs / 1000) ? String(probeMs / 1000) : (probeMs / 1000).toFixed(1)
+        lines.push(`${name}: approval not checked. Reading its context took over ${seconds} s. The daemon is up, so ask again in a moment.`)
+      } else if (probe.status === 0) lines.push(`${name}: approval not checked. Mida could not read the daemon's reply.`)
       else if (kind === "handoff" || kind === "empty") lines.push(`${name}: approved for this folder`)
       else if (reason(i) === "revoked") lines.push(`${name}: access revoked by the owner`)
       else if (reason(i) === "general-assistance") lines.push(`${name}: a general assistant — it cannot read project context`)
       else if (reason(i) === "not-approved") lines.push(`${name}: not approved for this folder`)
+      else if (reason(i) === "read-slow") lines.push(`${name}: approval not checked. The daemon ran out of time reading its context. Ask again in a moment.`)
       else lines.push(`${name}: cannot tell (${reason(i) ?? "bad reply"})`)
     }
   }

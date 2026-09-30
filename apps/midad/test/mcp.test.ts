@@ -38,7 +38,13 @@ const spawnEnv = (extra: Record<string, string>): NodeJS.ProcessEnv => {
  * and a record of what the adapter sent. A route value is the JSON body to answer, a function of
  * the parsed request body, or `{ silent: true }` for a daemon that accepts but never answers.
  */
-type Route = Record<string, unknown> | { silent: true } | ((body: Record<string, unknown> | undefined) => unknown)
+type Route =
+  | Record<string, unknown>
+  | { silent: true }
+  // `raw` answers 200 with a body that is not JSON; `hangup` drops the connection unanswered
+  | { raw: string }
+  | { hangup: true }
+  | ((body: Record<string, unknown> | undefined) => unknown)
 
 const fakeDaemon = (dir: MidaHome, routes: Record<string, Route>) =>
   new Promise<{ requests: { path: string; body: Record<string, unknown> | undefined }[]; stop(): Promise<void> }>((res, rej) => {
@@ -61,8 +67,13 @@ const fakeDaemon = (dir: MidaHome, routes: Record<string, Route>) =>
         requests.push({ path, body })
         const route = routes[path]
         if (route === undefined || (typeof route === "object" && route !== null && "silent" in route)) return
-        const answer = typeof route === "function" ? route(body) : route
-        const payload = JSON.stringify(answer)
+        if (typeof route === "object" && route !== null && "hangup" in route) {
+          socket.destroy()
+          return
+        }
+        const payload = typeof route === "object" && route !== null && "raw" in route && typeof route.raw === "string"
+          ? route.raw
+          : JSON.stringify(typeof route === "function" ? route(body) : route)
         socket.end(`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(payload)}\r\nconnection: close\r\n\r\n${payload}`)
       })
     })
@@ -1076,6 +1087,48 @@ describe("mida-mcp tools against a fake daemon", () => {
     } finally {
       await fake.stop()
     }
+  })
+
+  // AUTH-16: a probe that did not come back in time is a slow daemon, not a missing one
+  const statusWith = async (handoff: Route, over: Partial<McpServerDeps> = {}): Promise<string> => {
+    const dir = home()
+    mkdirSync(join(dir.root, "agents", "claude-code"), { recursive: true })
+    writeFileSync(join(dir.root, "agents", "claude-code", "identity.json"), "{}")
+    const fake = await fakeDaemon(dir, { "/health": HEALTH, "/handoff": handoff })
+    try {
+      const { client, close } = await connect(deps(dir, { agent: "claude-code", ...over }))
+      try {
+        return await callText(client, "mida_status")
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  }
+
+  it("mida_status: a probe that times out says approval was not checked, never 'no answer' (AUTH-16)", async () => {
+    const text = await statusWith({ silent: true }, { statusProbeMs: 200 })
+    expect(text).toContain("midad: answering")
+    expect(text).not.toContain("no answer from the daemon")
+    expect(text).toContain("claude-code: approval not checked. Reading its context took over 0.2 s. The daemon is up, so ask again in a moment.")
+  })
+
+  it("mida_status: the daemon's own read-slow refusal says approval was not checked (AUTH-16)", async () => {
+    const text = await statusWith({ kind: "refused", reason: "read-slow", text: "x" })
+    expect(text).not.toContain("cannot tell")
+    expect(text).toContain("claude-code: approval not checked. The daemon ran out of time reading its context. Ask again in a moment.")
+  })
+
+  it("mida_status: a reply that is not JSON says it could not be read (AUTH-16)", async () => {
+    const text = await statusWith({ raw: "<html>not json</html>" })
+    expect(text).not.toContain("no answer from the daemon")
+    expect(text).toContain("claude-code: approval not checked. Mida could not read the daemon's reply.")
+  })
+
+  it("mida_status: a daemon that drops the probe unanswered still says 'no answer' (AUTH-16)", async () => {
+    const text = await statusWith({ hangup: true })
+    expect(text).toContain("claude-code: no answer from the daemon")
   })
 
   it("mida_status says so when the folder is not a Mida project at all", async () => {
