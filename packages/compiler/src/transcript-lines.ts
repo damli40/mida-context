@@ -28,6 +28,8 @@ export const USER_LINE_BYTES = 256 * 1024
 // The pinned block of later typed messages gets its own share of the budget,
 // charged before the newest-first fill.
 export const USER_GROUP_CHARS = 8_000
+/** The first words of a pinned answer to the agent's question tool (PROV-10) — admitted after typed messages. */
+export const ANSWER_MARK = "[answered the agent's question]"
 // A typed user message renders as its first 1,200 and last 600 chars — a
 // pasted log keeps its start and its end instead of only its first lines.
 export const USER_HEAD_CHARS = 1_200
@@ -397,24 +399,38 @@ function buildUserGroup(candidates: TypedMark[], tooLong: number): string | null
     tooLong === 0
       ? null
       : `[${tooLong} message${tooLong === 1 ? " of yours was" : "s of yours were"} too long to read here]`
-  const kept: string[] = []
   let used = tooLongLine === null ? 0 : tooLongLine.length
-  let dropped = 0
-  // Rendered newest-first and lazily — the settle loop above calls this per
-  // candidate set, and only the admitted few need the scrub + two-sided cut.
-  for (let i = sorted.length - 1; i >= 0; i--) {
-    const line = `${sorted[i]!.label}: ${twoEndedCut(scrubSecrets(sorted[i]!.text))}`
-    const cost = line.length + (used > 0 ? 1 : 0)
-    if (used + cost > USER_GROUP_CHARS) {
-      dropped = i + 1
-      break
+  const rendered = new Map<number, string>()
+  // PROV-10 review: answers to the agent's questions share this cap, but the user's typed
+  // messages are admitted first — a session with dozens of answers must never push a typed
+  // change out. Each kind fills newest-first and stops at its first misfit, so every one it
+  // leaves out is older than every one it keeps. Rendered lazily — the settle loop above calls
+  // this per candidate set, and only the admitted few need the scrub + two-sided cut.
+  const admit = (isAnswer: boolean): number => {
+    let dropped = 0
+    for (let i = sorted.length - 1; i >= 0; i--) {
+      if (sorted[i]!.text.startsWith(ANSWER_MARK) !== isAnswer) continue
+      if (dropped > 0) {
+        dropped += 1
+        continue
+      }
+      const line = `${sorted[i]!.label}: ${twoEndedCut(scrubSecrets(sorted[i]!.text))}`
+      const cost = line.length + (used > 0 ? 1 : 0)
+      if (used + cost > USER_GROUP_CHARS) {
+        dropped = 1
+        continue
+      }
+      rendered.set(i, line)
+      used += cost
     }
-    kept.unshift(line)
-    used += cost
+    return dropped
   }
+  const droppedTyped = admit(false)
+  const droppedAnswers = admit(true)
   const parts = ["user — later messages you typed, oldest first (outside the recent messages below):"]
-  if (dropped > 0) parts.push(`[… ${dropped} older messages of yours omitted …]`)
-  parts.push(...kept)
+  if (droppedTyped > 0) parts.push(`[… ${droppedTyped} older messages of yours omitted …]`)
+  if (droppedAnswers > 0) parts.push(`[… ${droppedAnswers} older answers to the agent's questions omitted …]`)
+  parts.push(...[...rendered.entries()].sort((a, b) => a[0] - b[0]).map(([, line]) => line))
   if (tooLongLine !== null) parts.push(tooLongLine)
   return parts.join("\n")
 }

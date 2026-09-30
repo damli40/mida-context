@@ -47,6 +47,7 @@
 
 import { scrubSecrets, scrubTranscript, scrubValue } from "./scrub.js"
 import {
+  ANSWER_MARK,
   FIRST_USER_CHARS,
   PART_CHARS,
   TAIL_BYTES,
@@ -317,12 +318,16 @@ export function claudeAnswerText(obj: TranscriptLine | null): string | null {
     const notes = typeof entry === "object" && entry !== null ? (entry as { notes?: unknown }).notes : undefined
     return typeof notes === "string" && notes.trim() !== "" ? notes : null
   }
+  // PROV-10 review: the question and the option labels are the AGENT's words — a newline in them
+  // could start a forged "L999: …" line inside the pinned group. Every part is flattened to one line.
+  const flat = (text: string) => text.replace(/\s+/g, " ").trim()
   const entries: string[] = []
-  for (const [question, answer] of Object.entries(answers as Record<string, unknown>)) {
+  for (const [rawQuestion, answer] of Object.entries(answers as Record<string, unknown>)) {
     if (typeof answer !== "string" || answer.trim() === "") continue
-    const asked = question.length <= ANSWER_QUESTION_CHARS ? question : `${question.slice(0, ANSWER_QUESTION_CHARS - 1)}…`
-    const notes = notesFor(question)
-    entries.push(`[answered the agent's question] ${asked} = ${answer}${notes === null ? "" : ` (note: ${notes})`}`)
+    const question = [...flat(rawQuestion)]
+    const asked = question.length <= ANSWER_QUESTION_CHARS ? question.join("") : `${question.slice(0, ANSWER_QUESTION_CHARS - 1).join("")}…`
+    const notes = notesFor(rawQuestion)
+    entries.push(`${ANSWER_MARK} ${asked} = ${flat(answer)}${notes === null ? "" : ` (note: ${flat(notes)})`}`)
   }
   return entries.length === 0 ? null : entries.join("; ")
 }
@@ -588,14 +593,21 @@ export function readConversation(
     // PROV-10: the user's answer to the agent's question renders as the user's words, whole —
     // never as a [result] cut at 600 chars behind the question — and is pinned like a typed message
     const answer = isUser && !picked && !dropped && laterCommand === null ? claudeAnswerText(obj) : null
+    // cut at both ends like a typed message (PROV-10 review: one real answer ran 11,240 chars);
+    // a line that carries other parts beside the answer keeps them, rendered as before
+    const answerText = answer === null ? null : twoEndedCut(scrubSecrets(answer))
+    const content = obj.message?.content
+    const answerOnly = Array.isArray(content) && content.length === 1
     const block = picked
       ? `L${label} user:\n${scrubSecrets(requestText!)}`
       : dropped
         ? null
         : laterCommand !== null
           ? `L${label} user:\n${scrubSecrets(laterCommand)}`
-          : answer !== null
-            ? `L${label} user:\n${scrubSecrets(answer)}`
+          : answerText !== null
+            ? answerOnly
+              ? `L${label} user:\n${answerText}`
+              : `${renderMessage(label, obj) ?? `L${label} user:`}\n${answerText}`
             : renderMessage(label, obj)
     if (block) {
       const typed = isUser ? (claudeTypedUserText(obj, neighbourLocalCommand(i)) ?? answer) : null
