@@ -801,6 +801,13 @@ describe("mida-mcp tools against a fake daemon", () => {
     expect((await toolsFor("cursor")).instructions).toContain("it can save a checkpoint with mida_save")
   })
 
+  it("mida_read's description says what each namespace returns (PROV-12)", () => {
+    const read = MCP_TOOLS.find((t) => t.name === "mida_read")!
+    expect(read.description).toBe(
+      "Read one Mida context area through the daemon; you get the same output as `mida read --as <agent>`. For profile.skills and preferences.communication you get the saved facts. For projects.current (the default) you get each saved checkpoint's id and author only; call mida_handoff for the content.",
+    )
+  })
+
   it("mida_save's description names the clients it serves (AUTH-17)", async () => {
     const save = MCP_TOOLS.find((t) => t.name === "mida_save")!
     expect(save.description).toBe(

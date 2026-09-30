@@ -190,7 +190,7 @@ export const MCP_TOOLS = [
   {
     name: "mida_read",
     description:
-      "Read one Mida context area through the daemon — the same output `mida read --as <agent>` prints. Default namespace is projects.current, this folder's saved checkpoints.",
+      "Read one Mida context area through the daemon; you get the same output as `mida read --as <agent>`. For profile.skills and preferences.communication you get the saved facts. For projects.current (the default) you get each saved checkpoint's id and author only; call mida_handoff for the content.",
     inputSchema: {
       type: "object",
       properties: {
