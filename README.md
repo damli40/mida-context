@@ -331,7 +331,8 @@ pay nothing; one direct save cost about 0.03 testnet MON on Sep 21. Mainnet cost
 | Mid-session reads from Claude Code and Codex through Mida's MCP tools | ✅ In tests (Claude Desktop live, Sep 27) |
 | `mida sponsor on\|off` for a setup made before the sponsor existed | ✅ In tests |
 | SDK, named tasks, folder linking, `mida export` | ✅ In tests on a local chain; not yet run live |
-| Owner view in the browser (`app.midacontext.xyz/me`) and the public index | 🚧 Built, deploying |
+| Owner view in the browser (`app.midacontext.xyz/me`) | ✅ Live, Sep 29; its agent list waits for the index |
+| Public Envio index of agents and saves | 🚧 Deployed on Envio Cloud, not syncing yet |
 | npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
 | Security audit | ❌ None |
 
