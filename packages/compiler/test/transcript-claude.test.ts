@@ -744,6 +744,85 @@ describe("the user's later typed messages are never lost (P-1)", () => {
     return { t: writeTranscript(dir, lines), firstMidLine }
   }
 
+  // PROV-10: the user's answer to the agent's question tool (Claude Code AskUserQuestion) comes
+  // back as a tool RESULT. The shape is taken from real transcripts: the answers live in the
+  // line's top-level toolUseResult; the result text's wording varies between versions.
+  const QUESTION = `Which parts of the Home plan ship first? ${"context ".repeat(180)}END-OF-QUESTION`
+  const ANSWER = "Sign in with Mida (web), Home dashboard (/me), Revoke from Home, allowing apps like chatgpt and claude to access mida memory from mobile"
+  const OPTIONS = [{ label: "A", description: "a" }, { label: "B", description: "b" }]
+  const askLine = (id: string, question: string) =>
+    JSON.stringify({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "tool_use", id, name: "AskUserQuestion", input: { questions: [{ question, header: "Scope", options: OPTIONS, multiSelect: false }] } }] },
+    })
+  const answerLine = (id: string, question: string, answer: string, prefix = "Your questions have been answered: ", annotations: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: `${prefix}"${question}"="${answer}". You can now continue with these answers in mind.` }] },
+      toolUseResult: { questions: [{ question, header: "Scope", options: OPTIONS, multiSelect: false }], answers: { [question]: answer }, annotations },
+    })
+  const filler = () => Array.from({ length: 45 }, (_, i) => assistantText(`step ${i} ` + "s".repeat(1_000)))
+
+  it("an answer to the agent's question after a 1,500-char question reaches the output whole (PROV-10)", () => {
+    expect(QUESTION.length).toBeGreaterThan(1_400)
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [userLine("plan the Home build"), askLine("toolu_q1", QUESTION), answerLine("toolu_q1", QUESTION, ANSWER), ...filler()])
+    const r = readConversation(t, { maxChars: 20_000 })
+    expect(r.text).toContain(ANSWER)
+    expect(r.text).toContain(`[answered the agent's question] ${QUESTION.slice(0, 119)}… = ${ANSWER}`)
+    expect(r.text.length).toBeLessThanOrEqual(20_000)
+  })
+
+  it("the answer is found by its structured record, whatever the result text says (PROV-10)", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [userLine("plan it"), askLine("toolu_q2", QUESTION), answerLine("toolu_q2", QUESTION, ANSWER, "The user answered: "), ...filler()])
+    expect(readConversation(t, { maxChars: 20_000 }).text).toContain(ANSWER)
+  })
+
+  it("an answer in the unread middle of a long transcript is still pinned (PROV-10)", () => {
+    const dir = tmpdir()
+    const { t } = truncatedShape(dir, [askLine("toolu_q3", QUESTION), answerLine("toolu_q3", QUESTION, ANSWER)])
+    const r = readConversation(t)
+    expect(r.text).toContain(ANSWER)
+    expect(r.text.length).toBeLessThanOrEqual(40_000)
+  })
+
+  it("a secret typed into an answer is scrubbed, in the recent window and when pinned (PROV-10)", () => {
+    const secretAnswer = "use API_KEY=sk-live-abcdefghijklmnop1234 for the staging run"
+    const dir = tmpdir()
+    const pinned = writeTranscript(dir, [userLine("go"), askLine("toolu_q4", "Which key?"), answerLine("toolu_q4", "Which key?", secretAnswer), ...filler()])
+    const recent = writeTranscript(tmpdir(), [userLine("go"), askLine("toolu_q5", "Which key?"), answerLine("toolu_q5", "Which key?", secretAnswer)])
+    for (const t of [pinned, recent]) {
+      const text = readConversation(t, { maxChars: 20_000 }).text
+      expect(text).toContain("for the staging run")
+      expect(text).not.toContain("sk-live-abcdefghijklmnop1234")
+    }
+  })
+
+  it("an ordinary tool result is still cut at 600 chars and never pinned (PROV-10)", () => {
+    const dir = tmpdir()
+    const result = JSON.stringify({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_b", content: `${"r".repeat(2_000)} TAIL-MARK` }] },
+      toolUseResult: { stdout: "r", stderr: "" },
+    })
+    const t = writeTranscript(dir, [userLine("run it"), JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_b", name: "Bash", input: { command: "ls" } }] } }), result])
+    const text = readConversation(t).text
+    expect(text).toContain("[result] ")
+    expect(text).not.toContain("TAIL-MARK")
+    expect(text).not.toContain("[answered the agent's question]")
+  })
+
+  it("a note the user typed beside an answer is kept (PROV-10)", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      userLine("style it"),
+      askLine("toolu_q6", "Which theme?"),
+      answerLine("toolu_q6", "Which theme?", "Dark", "Your questions have been answered: ", { "Which theme?": { notes: "prefer the violet accent" } }),
+    ])
+    expect(readConversation(t).text).toContain("[answered the agent's question] Which theme? = Dark (note: prefer the violet accent)")
+  })
+
   it("a typed change sitting in the unread middle is pinned with its real line number", () => {
     const dir = tmpdir()
     const change = "Change the concept: make it show provenance edges in violet."
