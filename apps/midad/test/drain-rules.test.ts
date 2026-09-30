@@ -380,6 +380,10 @@ describe("a failed save does not buy a new model call", () => {
     expect(compileCalls).toHaveLength(1)   // one compile, eight save attempts
     expect(listJobs(home)).toHaveLength(0)
     expect(drainLog()).toContain("gave-up")
+    // CAP-26 review: the terminal line names the kind of error too
+    const gaveUp = drainLog().trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>).find((o) => o.reason === "gave-up")!
+    expect(gaveUp.errorChain).toEqual(["Error"])
+    expect(drainLog()).not.toContain("rpc unreachable")
   })
 
   it("a permanently-too-large envelope removes the job with too-large and is never recompiled", async () => {
@@ -625,13 +629,13 @@ describe("the owner-signed project list gates every save", () => {
     await drain({
       save: async () => {
         throw named("ContractFunctionExecutionError", "call failed https://rpc.example/KEY123", {},
-          named("HttpRequestError", "HTTP request failed https://rpc.example/KEY123", { status: 502 }))
+          named("HttpRequestError", "HTTP request failed https://rpc.example/KEY123", { status: 400 }))
       },
     })
     const line = failedLine(drainLog())
     expect(line.reason).toBe("chain-error")
     expect(line.errorChain).toEqual(["ContractFunctionExecutionError", "HttpRequestError"])
-    expect(line.httpStatus).toBe(502)
+    expect(line.httpStatus).toBe(400)
     expect(line.rpcCode).toBeUndefined()
     expect(drainLog()).not.toContain("KEY123")
     expect(drainLog()).not.toContain("rpc.example")
@@ -664,6 +668,44 @@ describe("the owner-signed project list gates every save", () => {
     expect(line.reason).toBe("chain-error")
     expect(line.errorChain).toEqual(["Unknown"])
     expect(drainLog()).not.toContain("KEY123")
+  })
+
+  it("a Mida error code that falls through to chain-error is kept as errorCode (CAP-26 review)", async () => {
+    const { job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw named("ContractFunctionExecutionError", "wrapped", {}, new MidaError("SEND_TIMEOUT", "no receipt after 120 s at https://rpc.example/KEY123"))
+      },
+    })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("chain-error")
+    expect(line.errorCode).toBe("SEND_TIMEOUT")
+    expect(line.errorChain).toEqual(["ContractFunctionExecutionError", "MidaError"])
+    expect(drainLog()).not.toContain("KEY123")
+  })
+
+  it("an error whose properties throw when read still logs a failed line and keeps its backoff (CAP-26 review)", async () => {
+    const { home, job, drain, drainLog } = setup()
+    job()
+    const hostile = new Proxy({}, { get: () => { throw new Error("boom") } })
+    await drain({ save: async () => { throw hostile } })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("chain-error")
+    expect(line.errorChain).toEqual(["Unknown"])
+    // the attempt was recorded, so the retry waits out its backoff instead of spinning
+    expect(home.readJson<{ attempts?: number }>("queue/state/s1.json")?.attempts).toBe(1)
+  })
+
+  it("a deep error chain keeps its root cause and code (CAP-26 review)", async () => {
+    const { job, drain, drainLog } = setup()
+    job()
+    const root = named("RpcRequestError", "nonce too low", { code: -32000 })
+    const chain = ["A1", "A2", "A3", "A4", "A5"].reduceRight<unknown>((cause, name) => named(name, "wrap", {}, cause), root)
+    await drain({ save: async () => { throw chain } })
+    const line = failedLine(drainLog())
+    expect(line.errorChain).toEqual(["A1", "A2", "A3", "A4", "A5", "RpcRequestError"])
+    expect(line.rpcCode).toBe(-32000)
   })
 
   it("the error-shape fields ride chain-error only — a named failure carries none (CAP-26)", async () => {

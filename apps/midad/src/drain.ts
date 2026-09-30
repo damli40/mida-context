@@ -562,7 +562,14 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             : {}),
         })
       } catch (error) {
-        const code = failureCode(error)
+        // an error whose properties throw when read (a hostile getter or Proxy) must still count as
+        // a transient failure with its attempt and backoff recorded — never abort the pass (CAP-26 review)
+        let code: string
+        try {
+          code = failureCode(error)
+        } catch {
+          code = "chain-error"
+        }
         // field names are safe to log; values, validator messages and error.message are not
         // (CAP-26: a chain-error adds its error names and numeric codes — never a message)
         const fields = {
@@ -669,26 +676,40 @@ class DrainFailure extends Error {
 
 /**
  * CAP-26: what KIND of error a chain-error was — so the log can say why a save keeps failing
- * without quoting it. Only names and numbers leave: the `.name` of the error and each nested
- * `.cause` (outermost first, at most 4; a name outside a plain identifier shape reads "Unknown"),
- * the first integer `.code` (a JSON-RPC code) and the first HTTP `.status` along that chain.
- * Never a message, URL, body or detail: those can carry RPC keys and transcript text (H5).
- * A thrown non-object is `["Unknown"]`.
+ * without quoting it. Only names and closed-list codes leave: the `.name` of the error and each
+ * nested `.cause` (outermost first, at most 8, so viem's usual 4-deep write chain keeps its root;
+ * a name outside a plain identifier shape reads "Unknown"), the first integer `.code` (a JSON-RPC
+ * code), the first upper-snake string `.code` (a MidaError's closed-list code such as SEND_TIMEOUT
+ * — the most useful single fact, review finding), and the first HTTP `.status` along that chain.
+ * Never a message, URL, body or detail: those can carry RPC keys and transcript text (H5). A
+ * thrown non-object — or an error whose properties throw when read — is `["Unknown"]`, so a hostile
+ * error can never abort the drain pass before its attempt and backoff are recorded.
  */
-export function chainErrorShape(error: unknown): { errorChain: string[]; rpcCode?: number; httpStatus?: number } {
-  const errorChain: string[] = []
-  let rpcCode: number | undefined
-  let httpStatus: number | undefined
-  let current: unknown = error
-  while (errorChain.length < 4 && typeof current === "object" && current !== null) {
-    const { name, code, status, cause } = current as { name?: unknown; code?: unknown; status?: unknown; cause?: unknown }
-    errorChain.push(typeof name === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : "Unknown")
-    if (rpcCode === undefined && typeof code === "number" && Number.isInteger(code)) rpcCode = code
-    if (httpStatus === undefined && typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) httpStatus = status
-    current = cause
+export function chainErrorShape(error: unknown): { errorChain: string[]; rpcCode?: number; errorCode?: string; httpStatus?: number } {
+  try {
+    const errorChain: string[] = []
+    let rpcCode: number | undefined
+    let errorCode: string | undefined
+    let httpStatus: number | undefined
+    let current: unknown = error
+    while (errorChain.length < 8 && typeof current === "object" && current !== null) {
+      const { name, code, status, cause } = current as { name?: unknown; code?: unknown; status?: unknown; cause?: unknown }
+      errorChain.push(typeof name === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : "Unknown")
+      if (rpcCode === undefined && typeof code === "number" && Number.isInteger(code)) rpcCode = code
+      if (errorCode === undefined && typeof code === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(code)) errorCode = code
+      if (httpStatus === undefined && typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) httpStatus = status
+      current = cause
+    }
+    if (errorChain.length === 0) errorChain.push("Unknown")
+    return {
+      errorChain,
+      ...(rpcCode === undefined ? {} : { rpcCode }),
+      ...(errorCode === undefined ? {} : { errorCode }),
+      ...(httpStatus === undefined ? {} : { httpStatus }),
+    }
+  } catch {
+    return { errorChain: ["Unknown"] }
   }
-  if (errorChain.length === 0) errorChain.push("Unknown")
-  return { errorChain, ...(rpcCode === undefined ? {} : { rpcCode }), ...(httpStatus === undefined ? {} : { httpStatus }) }
 }
 
 /** Maps any thrown value onto a stable drain code; everything unrecognised is a transient chain-error. */
