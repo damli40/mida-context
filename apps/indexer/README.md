@@ -65,19 +65,12 @@ it resync — the count is derived state, not source truth).
 
 ```bash
 pnpm install
-export ENVIO_API_TOKEN=...   # HyperSync on Monad testnet reads this from the environment
 pnpm --filter @mida/indexer codegen
 cd apps/indexer && pnpm exec envio dev
 ```
 
-`envio dev` indexes from `start_block` and serves GraphQL (default `http://localhost:8080`).
-If you have no `ENVIO_API_TOKEN`, add an RPC fallback under the chain in `config.yaml`:
-
-```yaml
-    rpc:
-      url: https://your-monad-testnet-rpc
-      for: sync
-```
+`envio dev` indexes from `start_block` and serves GraphQL (default `http://localhost:8080`). It
+reads Monad through the public RPC set in `config.yaml`, so it needs no `ENVIO_API_TOKEN`.
 
 ## Re-point after a contract redeploy
 
@@ -101,8 +94,9 @@ Nothing else hardcodes an address — handlers work purely in ids.
 2. On envio.dev, add an indexer from this repo. Set the root directory to `apps/indexer`, the
    config file to `config.yaml` (Envio reads it inside the root directory, so a path from the
    repo root fails with "Missing config"), and the deployment branch to `envio`. No API token
-   is needed: indexers on Envio Cloud reach HyperSync without one. Envio checks a commit only
-   when it arrives, so after changing these settings, push a new commit to `envio`.
+   is needed: `config.yaml` reads Monad through its public RPC, not HyperSync, which in Envio 3
+   needs a token that Envio Cloud's free plan cannot hold. Envio checks a commit only when it
+   arrives, so after changing these settings, push a new commit to `envio`.
 3. Check that `src/our-operators.ts` lists every operator we have used (see the warning above).
 4. Push the commit you want indexed to the `envio` branch. Each push to that branch starts a new
    deployment that re-indexes from `start_block`, and the free plan allows 3 deployments per

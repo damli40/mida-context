@@ -81,7 +81,8 @@ The full steps live in `apps/indexer/README.md` ("Deploy to Envio's hosted servi
 
 1. Push this repo to GitHub.
 2. On envio.dev, add an indexer from the repo: root directory `apps/indexer`, config file
-   `config.yaml`, deployment branch `envio`. No API token is needed on Envio Cloud.
+   `config.yaml`, deployment branch `envio`. No API token is needed: the index reads Monad
+   through its public RPC, set in `apps/indexer/config.yaml`.
 3. Check that `apps/indexer/src/our-operators.ts` lists every operator address we have used
    (see the README's warning: an address missing from it makes our own agents count as
    "outside", inflating the traction number). Envio Cloud's free plan has no environment
