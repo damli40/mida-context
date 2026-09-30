@@ -612,6 +612,75 @@ describe("the owner-signed project list gates every save", () => {
     expect(state?.attempts).toBe(1)
   })
 
+  // CAP-26: 566 failed tries on the live home were logged as bare "chain-error" — nobody could
+  // say why. A chain-error line now names the KIND of error, never its message (H5: URLs carry keys)
+  const failedLine = (log: string) =>
+    log.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>).find((o) => o.outcome === "failed")!
+  const named = (name: string, message: string, extra: Record<string, unknown> = {}, cause?: unknown) =>
+    Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { name, ...extra })
+
+  it("a chain-error names the error chain and HTTP status, never the message or URL (CAP-26)", async () => {
+    const { job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw named("ContractFunctionExecutionError", "call failed https://rpc.example/KEY123", {},
+          named("HttpRequestError", "HTTP request failed https://rpc.example/KEY123", { status: 502 }))
+      },
+    })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("chain-error")
+    expect(line.errorChain).toEqual(["ContractFunctionExecutionError", "HttpRequestError"])
+    expect(line.httpStatus).toBe(502)
+    expect(line.rpcCode).toBeUndefined()
+    expect(drainLog()).not.toContain("KEY123")
+    expect(drainLog()).not.toContain("rpc.example")
+  })
+
+  it("a chain-error carries a JSON-RPC code from anywhere in the chain; a bad name reads Unknown (CAP-26)", async () => {
+    // -32000 stays chain-error; -32603 and -32005 are already chain-busy (chainErrorKind)
+    const { job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw named("bad name with spaces", "x", {}, named("RpcRequestError", "y", { code: -32000 }))
+      },
+    })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("chain-error")
+    expect(line.errorChain).toEqual(["Unknown", "RpcRequestError"])
+    expect(line.rpcCode).toBe(-32000)
+  })
+
+  it("a thrown non-Error is a chain-error with an Unknown chain (CAP-26)", async () => {
+    const { job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw "a bare string with https://rpc.example/KEY123"
+      },
+    })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("chain-error")
+    expect(line.errorChain).toEqual(["Unknown"])
+    expect(drainLog()).not.toContain("KEY123")
+  })
+
+  it("the error-shape fields ride chain-error only — a named failure carries none (CAP-26)", async () => {
+    const { job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw new MidaError("OWNER_WALLET_LOW", "the owner wallet holds 0.01 MON; the send needs 0.2")
+      },
+    })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("wallet-low")
+    expect(line).not.toHaveProperty("errorChain")
+    expect(line).not.toHaveProperty("rpcCode")
+    expect(line).not.toHaveProperty("httpStatus")
+  })
+
   it("a funded wallet clears the recorded gas wait — the held session saves on the very next pass (in-29 S-2)", async () => {
     const { home, job, drain } = setup()
     job()

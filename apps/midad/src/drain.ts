@@ -564,7 +564,11 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
       } catch (error) {
         const code = failureCode(error)
         // field names are safe to log; values, validator messages and error.message are not
-        const fields = error instanceof CheckpointPayloadError && error.fields !== undefined ? { fields: error.fields } : {}
+        // (CAP-26: a chain-error adds its error names and numeric codes — never a message)
+        const fields = {
+          ...(error instanceof CheckpointPayloadError && error.fields !== undefined ? { fields: error.fields } : {}),
+          ...(code === "chain-error" ? chainErrorShape(error) : {}),
+        }
         // a prefix of the last provider answer belongs on the TERMINAL failure only — re-quoting
         // it on every retry would repeat provider output once per attempt. Scrubbed and capped
         // again here rather than trusting the bound upstream set.
@@ -661,6 +665,30 @@ class DrainFailure extends Error {
     super(code)
     this.name = "DrainFailure"
   }
+}
+
+/**
+ * CAP-26: what KIND of error a chain-error was — so the log can say why a save keeps failing
+ * without quoting it. Only names and numbers leave: the `.name` of the error and each nested
+ * `.cause` (outermost first, at most 4; a name outside a plain identifier shape reads "Unknown"),
+ * the first integer `.code` (a JSON-RPC code) and the first HTTP `.status` along that chain.
+ * Never a message, URL, body or detail: those can carry RPC keys and transcript text (H5).
+ * A thrown non-object is `["Unknown"]`.
+ */
+export function chainErrorShape(error: unknown): { errorChain: string[]; rpcCode?: number; httpStatus?: number } {
+  const errorChain: string[] = []
+  let rpcCode: number | undefined
+  let httpStatus: number | undefined
+  let current: unknown = error
+  while (errorChain.length < 4 && typeof current === "object" && current !== null) {
+    const { name, code, status, cause } = current as { name?: unknown; code?: unknown; status?: unknown; cause?: unknown }
+    errorChain.push(typeof name === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : "Unknown")
+    if (rpcCode === undefined && typeof code === "number" && Number.isInteger(code)) rpcCode = code
+    if (httpStatus === undefined && typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) httpStatus = status
+    current = cause
+  }
+  if (errorChain.length === 0) errorChain.push("Unknown")
+  return { errorChain, ...(rpcCode === undefined ? {} : { rpcCode }), ...(httpStatus === undefined ? {} : { httpStatus }) }
 }
 
 /** Maps any thrown value onto a stable drain code; everything unrecognised is a transient chain-error. */
