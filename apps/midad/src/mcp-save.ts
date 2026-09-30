@@ -14,6 +14,7 @@ import { capabilityState, noContextText, projectCheckRefusal } from "./handoff.j
 import { CHAIN_REFUSAL_TEXT } from "./hook-output.js"
 import type { CapabilityState } from "./handoff.js"
 import { MCP_CLIENT_TOOLS } from "./install.js"
+import { HOOK_CLIENTS } from "./mcp-clients.js"
 import { isRevoked, loadAgentIdentity, revokePending } from "./keys.js"
 import type { AgentIdentity, RevokePendingMarker } from "./keys.js"
 import { checkProject } from "./projects.js"
@@ -127,8 +128,12 @@ const noIdentityText = (agent: string, homeRoot: string): string =>
   `Mida: no agent "${agent}" is set up in this Mida home (${homeRoot}). Nothing was saved.`
 const identityUnreadableText = (agent: string, homeRoot: string): string =>
   `Mida: ${agent}'s identity in this Mida home (${homeRoot}) exists but could not be read. Nothing was saved. Run \`mida doctor\`.`
+// only a hook client is told where its saves come from — an identity with no hooks (a harness
+// added with `mida add-agent`, an unknown name) has no save path, and is never told it has one
 const notMcpClientText = (agent: string): string =>
-  `Mida: ${agent} saves through its Mida hooks. mida_save signs only for ${MCP_CLIENT_TOOLS.join(" and ")}, so this call saved nothing.`
+  HOOK_CLIENTS.includes(agent)
+    ? `Mida: ${agent} saves only through its Mida hooks. mida_save signs only for ${MCP_CLIENT_TOOLS.join(" and ")}, so this call saved nothing.`
+    : `Mida: mida_save signs only for ${MCP_CLIENT_TOOLS.join(" and ")}, so this call saved nothing.`
 const rateLimitedText = (agent: string, seconds: number, at: string): string =>
   `Mida: ${agent} may save once per minute in a project — the next save is allowed in ${seconds} s (at ${at}). Nothing was saved.`
 

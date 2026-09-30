@@ -101,6 +101,7 @@ export type { WhatsNewDeps, WhatsNewResult } from "./whatsnew.js"
 export { agoText, degradedMessage, hookReply, sessionStartMessage, systemMessage, whatsNewMessage, CHAIN_BUSY_TEXT, STORE_CHAIN_MISCONFIGURED_TEXT, STORE_RPC_AUTH_TEXT } from "./hook-output.js"
 export { chainRefusalReason, isChainBusyError, isOutOfGasError, isWalletLow } from "./chain-busy.js"
 export type { SessionStartBody } from "./hook-output.js"
+export { HOOK_CLIENTS } from "./mcp-clients.js"
 export { AGENT_NAME, MCP_TOOLS, MCP_USAGE, READ_NAMESPACES, createMidaMcpServer, parseMcpArgs, startupCheck } from "./mcp.js"
 export type { McpArgs, McpServerDeps, ReadNamespace } from "./mcp.js"
 export {

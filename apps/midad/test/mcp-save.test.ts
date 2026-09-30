@@ -5,6 +5,8 @@ import { join } from "node:path"
 import { MidaError, PERMISSION, PROVENANCE_POLICY } from "@mida/protocol"
 import {
   CheckpointPayloadError,
+  HOOK_CLIENTS,
+  HOOK_COMMAND,
   MidaHome,
   buildMcpSave,
   expectedScopesFor,
@@ -112,10 +114,22 @@ describe("buildMcpSave — the daemon's mida_save route", () => {
     expect(result).toMatchObject({ kind: "refused", reason: "not-an-mcp-client" })
     // AUTH-17: the refusal says where this agent's saves go instead
     expect((result as { text?: string }).text).toBe(
-      "Mida: codex saves through its Mida hooks. mida_save signs only for claude-desktop and cursor, so this call saved nothing.",
+      "Mida: codex saves only through its Mida hooks. mida_save signs only for claude-desktop and cursor, so this call saved nothing.",
     )
     expect(projectAsked).toBe(false)
     expect(saved).toBe(false)
+  })
+
+  it("an identity with no Mida hooks is never told it saves through hooks (AUTH-17 review)", async () => {
+    for (const agent of ["windsurf", "nosuch"]) {
+      const result = await call({ save: async () => { throw new Error("unreachable") } }, { agent })
+      expect(result).toMatchObject({ kind: "refused", reason: "not-an-mcp-client" })
+      expect((result as { text?: string }).text).toBe("Mida: mida_save signs only for claude-desktop and cursor, so this call saved nothing.")
+    }
+  })
+
+  it("the hook-client list is exactly the tools install writes hooks for", () => {
+    expect([...HOOK_CLIENTS].sort()).toEqual(Object.keys(HOOK_COMMAND).sort())
   })
 
   it("an unknown or unreadable identity refuses without a folder check", async () => {

@@ -8,7 +8,7 @@ import type { MidaHome } from "./home.js"
 import { CHAIN_REFUSAL_TEXT, degradedMessage } from "./hook-output.js"
 import type { SessionStartBody } from "./hook-output.js"
 import { appendLog } from "./log.js"
-import { MCP_CLIENT_TOOLS } from "./mcp-clients.js"
+import { HOOK_CLIENTS, MCP_CLIENT_TOOLS } from "./mcp-clients.js"
 import { findProjectMarker } from "./queue.js"
 import { writeSeen } from "./seen.js"
 import { isTaskName, TASK_RULE_TEXT } from "./task.js"
@@ -17,7 +17,7 @@ import { isTaskName, TASK_RULE_TEXT } from "./task.js"
  * The local MCP adapter (M3-G + in-5): a stdio MCP server that is a pure client of the daemon's
  * Unix socket, exactly like the hooks. It holds no keys and signs nothing. Its tools are reads —
  * `read --as` through /cli, /handoff, /whatsnew, /health — plus the one write the owner decided
- * every client may have, `mida_save`, which forwards the model's checkpoint fields to the daemon's
+ * MCP clients may have (claude-desktop and cursor only — AUTH-17), `mida_save`, which forwards the model's checkpoint fields to the daemon's
  * POST /save. The daemon keeps every gate — identity, project approval, the CREATE grant and
  * revocation are answered there, never here — and seals, stores and signs the checkpoint itself.
  *
@@ -190,7 +190,7 @@ export const MCP_TOOLS = [
   {
     name: "mida_read",
     description:
-      "Read one Mida context area through the daemon; you get the same output as `mida read --as <agent>`. For profile.skills and preferences.communication you get the saved facts. For projects.current (the default) you get each saved checkpoint's id and author only; call mida_handoff for the content.",
+      "Read one Mida context area through the daemon; you get the same output as `mida read --as <agent> <namespace>`. For profile.skills and preferences.communication you get the facts saved there that this agent may read (an area it has no access to lists none). For projects.current (the default) you get only each saved checkpoint's id and author, across every task; mida_handoff gives the content for the current task.",
     inputSchema: {
       type: "object",
       properties: {
@@ -503,8 +503,10 @@ async function toolStatus(deps: McpServerDeps) {
       // read and a bad reply is an unreadable one — neither may read as a missing daemon.
       if (probe.status === 0 && probe.failure === "unreachable") lines.push(`${name}: no answer from the daemon`)
       else if (probe.status === 0 && probe.failure === "timeout") {
-        const seconds = Number.isInteger(probeMs / 1000) ? String(probeMs / 1000) : (probeMs / 1000).toFixed(1)
-        lines.push(`${name}: approval not checked. Reading its context took over ${seconds} s. The daemon is up, so ask again in a moment.`)
+        // rounded DOWN to a tenth, so "took over N s" is never more than the limit; no claim the
+        // daemon is up — it may have frozen after this call's health check
+        const seconds = String(Math.floor(probeMs / 100) / 10)
+        lines.push(`${name}: approval not checked. Reading its context took over ${seconds} s. Ask again in a moment.`)
       } else if (probe.status === 0) lines.push(`${name}: approval not checked. Mida could not read the daemon's reply.`)
       else if (kind === "handoff" || kind === "empty") lines.push(`${name}: approved for this folder`)
       else if (reason(i) === "revoked") lines.push(`${name}: access revoked by the owner`)
@@ -555,7 +557,9 @@ export function createMidaMcpServer(deps: McpServerDeps): Server {
       capabilities: { tools: {} },
       instructions: offersSave
         ? "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status, and it can save a checkpoint with mida_save — the daemon validates, gates, scrubs and signs that write. Owner operations stay deliberately absent: there is no approve, revoke, request or remember here, because a model must never be able to change who has access through MCP."
-        : "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This client saves through its Mida hooks, so this server has no save tool. Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
+        : HOOK_CLIENTS.includes(deps.agent)
+          ? "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool: this client's saves come only from its Mida hooks (`mida doctor` checks they are installed and trusted). Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP."
+          : "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool for this client: mida_save signs only for claude-desktop and cursor. Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
     },
   )
   server.setRequestHandler(ListToolsRequestSchema, async () => ({

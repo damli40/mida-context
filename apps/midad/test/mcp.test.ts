@@ -796,15 +796,21 @@ describe("mida-mcp tools against a fake daemon", () => {
 
   it("the server's instructions mention mida_save only to clients that get it (AUTH-17)", async () => {
     expect((await toolsFor("claude-code")).instructions).toBe(
-      "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This client saves through its Mida hooks, so this server has no save tool. Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
+      "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool: this client's saves come only from its Mida hooks (`mida doctor` checks they are installed and trusted). Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
     )
+    // an identity with no hooks (a harness added with `mida add-agent`) is never told it saves
+    const other = (await toolsFor("windsurf")).instructions
+    expect(other).toBe(
+      "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool for this client: mida_save signs only for claude-desktop and cursor. Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
+    )
+    expect(other).not.toContain("hooks")
     expect((await toolsFor("cursor")).instructions).toContain("it can save a checkpoint with mida_save")
   })
 
   it("mida_read's description says what each namespace returns (PROV-12)", () => {
     const read = MCP_TOOLS.find((t) => t.name === "mida_read")!
     expect(read.description).toBe(
-      "Read one Mida context area through the daemon; you get the same output as `mida read --as <agent>`. For profile.skills and preferences.communication you get the saved facts. For projects.current (the default) you get each saved checkpoint's id and author only; call mida_handoff for the content.",
+      "Read one Mida context area through the daemon; you get the same output as `mida read --as <agent> <namespace>`. For profile.skills and preferences.communication you get the facts saved there that this agent may read (an area it has no access to lists none). For projects.current (the default) you get only each saved checkpoint's id and author, across every task; mida_handoff gives the content for the current task.",
     )
   })
 
@@ -1155,7 +1161,13 @@ describe("mida-mcp tools against a fake daemon", () => {
     const text = await statusWith({ silent: true }, { statusProbeMs: 200 })
     expect(text).toContain("midad: answering")
     expect(text).not.toContain("no answer from the daemon")
-    expect(text).toContain("claude-code: approval not checked. Reading its context took over 0.2 s. The daemon is up, so ask again in a moment.")
+    expect(text).toContain("claude-code: approval not checked. Reading its context took over 0.2 s. Ask again in a moment.")
+    expect(text).not.toContain("daemon is up")
+  })
+
+  it("mida_status: the production limit prints whole seconds, rounded down (AUTH-16)", async () => {
+    const text = await statusWith({ silent: true }, { statusProbeMs: 1_000 })
+    expect(text).toContain("claude-code: approval not checked. Reading its context took over 1 s. Ask again in a moment.")
   })
 
   it("mida_status: the daemon's own read-slow refusal says approval was not checked (AUTH-16)", async () => {
@@ -1455,7 +1467,8 @@ describe("mida-mcp tools against a fake daemon", () => {
   })
 
   it("no tool schema carries an identity, home or project field", async () => {
-    const { client, close } = await connect(deps(home(), { daemonUp: false }))
+    // an MCP client identity, so the list includes mida_save — the one write tool (AUTH-17 review)
+    const { client, close } = await connect(deps(home(), { agent: "claude-desktop", daemonUp: false }))
     try {
       const { tools } = await client.listTools()
       for (const tool of tools) {
