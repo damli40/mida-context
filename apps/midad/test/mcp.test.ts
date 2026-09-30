@@ -796,8 +796,11 @@ describe("mida-mcp tools against a fake daemon", () => {
 
   it("the server's instructions mention mida_save only to clients that get it (AUTH-17)", async () => {
     expect((await toolsFor("claude-code")).instructions).toBe(
-      "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool: this client's saves come only from its Mida hooks (`mida doctor` checks they are installed and trusted). Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
+      "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool: this client's saves come only from its Mida hooks, and only while they are installed. Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
     )
+    // Codex ignores untrusted hooks, and doctor cannot see trust — the owner is told what to do (Fable review)
+    expect((await toolsFor("codex")).instructions).toContain("Codex ignores them until you trust them: open codex, type /hooks, and trust the Mida entries.")
+    expect((await toolsFor("claude-code")).instructions).not.toContain("mida doctor")
     // an identity with no hooks (a harness added with `mida add-agent`) is never told it saves
     const other = (await toolsFor("windsurf")).instructions
     expect(other).toBe(
@@ -1161,25 +1164,25 @@ describe("mida-mcp tools against a fake daemon", () => {
     const text = await statusWith({ silent: true }, { statusProbeMs: 200 })
     expect(text).toContain("midad: answering")
     expect(text).not.toContain("no answer from the daemon")
-    expect(text).toContain("claude-code: approval not checked. Reading its context took over 0.2 s. Ask again in a moment.")
+    expect(text).toContain("claude-code: could not tell. Reading its context took over 0.2 s. Ask again in a moment.")
     expect(text).not.toContain("daemon is up")
   })
 
   it("mida_status: the production limit prints whole seconds, rounded down (AUTH-16)", async () => {
     const text = await statusWith({ silent: true }, { statusProbeMs: 1_000 })
-    expect(text).toContain("claude-code: approval not checked. Reading its context took over 1 s. Ask again in a moment.")
+    expect(text).toContain("claude-code: could not tell. Reading its context took over 1 s. Ask again in a moment.")
   })
 
   it("mida_status: the daemon's own read-slow refusal says approval was not checked (AUTH-16)", async () => {
     const text = await statusWith({ kind: "refused", reason: "read-slow", text: "x" })
     expect(text).not.toContain("cannot tell")
-    expect(text).toContain("claude-code: approval not checked. The daemon ran out of time reading its context. Ask again in a moment.")
+    expect(text).toContain("claude-code: could not tell. The daemon ran out of time reading its context; its approval may already have passed. Ask again in a moment.")
   })
 
   it("mida_status: a reply that is not JSON says it could not be read (AUTH-16)", async () => {
     const text = await statusWith({ raw: "<html>not json</html>" })
     expect(text).not.toContain("no answer from the daemon")
-    expect(text).toContain("claude-code: approval not checked. Mida could not read the daemon's reply.")
+    expect(text).toContain("claude-code: could not tell. Mida could not read the daemon's reply.")
   })
 
   it("mida_status: a daemon that drops the probe unanswered still says 'no answer' (AUTH-16)", async () => {

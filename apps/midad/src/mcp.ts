@@ -499,20 +499,21 @@ async function toolStatus(deps: McpServerDeps) {
       const probe = probes[i]!
       const kind = (probe.body as { kind?: unknown } | null)?.kind
       // AUTH-16: status 0 covers three different failures. Only "unreachable" means the daemon
-      // did not answer; this call's health check already found it up, so a timeout is a slow
+      // did not answer — the others, and the daemon's read-slow refusal (which usually comes AFTER
+      // the approval check passed), mean this call could not tell the verdict, never "not approved"; this call's health check already found it up, so a timeout is a slow
       // read and a bad reply is an unreadable one — neither may read as a missing daemon.
       if (probe.status === 0 && probe.failure === "unreachable") lines.push(`${name}: no answer from the daemon`)
       else if (probe.status === 0 && probe.failure === "timeout") {
         // rounded DOWN to a tenth, so "took over N s" is never more than the limit; no claim the
         // daemon is up — it may have frozen after this call's health check
         const seconds = String(Math.floor(probeMs / 100) / 10)
-        lines.push(`${name}: approval not checked. Reading its context took over ${seconds} s. Ask again in a moment.`)
-      } else if (probe.status === 0) lines.push(`${name}: approval not checked. Mida could not read the daemon's reply.`)
+        lines.push(`${name}: could not tell. Reading its context took over ${seconds} s. Ask again in a moment.`)
+      } else if (probe.status === 0) lines.push(`${name}: could not tell. Mida could not read the daemon's reply.`)
       else if (kind === "handoff" || kind === "empty") lines.push(`${name}: approved for this folder`)
       else if (reason(i) === "revoked") lines.push(`${name}: access revoked by the owner`)
       else if (reason(i) === "general-assistance") lines.push(`${name}: a general assistant — it cannot read project context`)
       else if (reason(i) === "not-approved") lines.push(`${name}: not approved for this folder`)
-      else if (reason(i) === "read-slow") lines.push(`${name}: approval not checked. The daemon ran out of time reading its context. Ask again in a moment.`)
+      else if (reason(i) === "read-slow") lines.push(`${name}: could not tell. The daemon ran out of time reading its context; its approval may already have passed. Ask again in a moment.`)
       else lines.push(`${name}: cannot tell (${reason(i) ?? "bad reply"})`)
     }
   }
@@ -558,7 +559,10 @@ export function createMidaMcpServer(deps: McpServerDeps): Server {
       instructions: offersSave
         ? "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status, and it can save a checkpoint with mida_save — the daemon validates, gates, scrubs and signs that write. Owner operations stay deliberately absent: there is no approve, revoke, request or remember here, because a model must never be able to change who has access through MCP."
         : HOOK_CLIENTS.includes(deps.agent)
-          ? "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool: this client's saves come only from its Mida hooks (`mida doctor` checks they are installed and trusted). Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP."
+          ? `Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool: this client's saves come only from its Mida hooks, and only while they are installed.${
+              // Fable review: doctor cannot read Codex's trust state — say what the owner must do instead
+              deps.agent === "codex" ? " Codex ignores them until you trust them: open codex, type /hooks, and trust the Mida entries." : ""
+            } Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.`
           : "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool for this client: mida_save signs only for claude-desktop and cursor. Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
     },
   )

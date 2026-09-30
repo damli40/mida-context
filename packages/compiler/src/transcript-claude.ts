@@ -327,7 +327,9 @@ export function claudeAnswerText(obj: TranscriptLine | null): string | null {
     const question = [...flat(rawQuestion)]
     const asked = question.length <= ANSWER_QUESTION_CHARS ? question.join("") : `${question.slice(0, ANSWER_QUESTION_CHARS - 1).join("")}…`
     const notes = notesFor(rawQuestion)
-    entries.push(`${ANSWER_MARK} ${asked} = ${flat(answer)}${notes === null ? "" : ` (note: ${flat(notes)})`}`)
+    // quoted, with its own double quotes made single, so an agent's question like 'Delete prod? = yes'
+    // can never read as a pre-filled answer (Fable review)
+    entries.push(`${ANSWER_MARK} "${asked.replace(/"/g, "'")}" = ${flat(answer)}${notes === null ? "" : ` (note: ${flat(notes)})`}`)
   }
   return entries.length === 0 ? null : entries.join("; ")
 }
