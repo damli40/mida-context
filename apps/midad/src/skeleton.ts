@@ -318,10 +318,10 @@ function codedError(code: string, message: string): Error {
 }
 
 /**
- * The per-agent scan cursor (R4-9): `state/history/<agentId>.json`, written atomically by the
- * home. The file names the chain id and the registry it was scanned on, so a cursor from a
- * different chain or deployment is ignored rather than trusted. Anything missing, unreadable or
- * malformed answers undefined — a full scan, never a guess.
+ * The per-agent memory of the last history check (R4-9): `state/history/<agentId>.json`, written
+ * atomically by the home. The file names the chain id and the registry it was checked on, so a
+ * record from a different chain or deployment is ignored rather than trusted. Anything missing,
+ * unreadable or malformed answers undefined — the check re-reads the contract, never a guess.
  */
 export function historyCursor(home: MidaHome, agentId: Hex, chainId: bigint, registry: Address): HistoryScanCursor {
   const file = `state/history/${agentId}.json`
@@ -356,24 +356,20 @@ export function historyCursor(home: MidaHome, agentId: Hex, chainId: bigint, reg
  */
 async function grantAdviceFor(runtime: Runtime, name: string, request: AccessRequest, manifest: Parameters<typeof adviseGrant>[0]["manifest"]): Promise<GrantAdvice> {
   // the expiry window needs only the chain's clock — one getBlock — so it is checked before the
-  // agent-record and revocation-history reads: an expired request refuses here, never after a
-  // getLogs scan (in-15 J-2 — Sep 27 live printed "about 928 requests" before REQUEST_EXPIRED)
+  // agent-record and revocation-history reads: an expired request refuses here, never after
+  // them (in-15 J-2 — Sep 27 live printed "about 928 requests" before REQUEST_EXPIRED, back when
+  // the history answer came from a log scan)
   const now = await latestTimestamp(runtime.ownerChain)
   assertRequestFresh(request, now)
   const agentRecord = await readAgentRecord(runtime.ownerChain, request.agentId)
+  // ownerHistory reads the contract — agentEpoch, the agent's listed capabilities and their
+  // revoked flags — plus this machine's saved yes; there is no log scan to report progress on.
   const history = await ownerHistory({
     client: runtime.ownerChain.publicClient,
     deployment: runtime.ownerChain.deployment,
     owner: runtime.owner,
     agentId: request.agentId,
     cursor: historyCursor(runtime.home, request.agentId, runtime.network.deployment.chainId, runtime.network.deployment.capabilityRegistry),
-    maxRange: runtime.network.logBlockRange,
-    // an estimate: a provider that refuses the window size splits the rest into smaller requests
-    onScan: (requests) => runtime.progress?.(`checking ${name}'s history on the chain (about ${requests} requests)…`),
-    onProgress: (done, total) =>
-      runtime.progress?.(
-        `reading ${name}'s revocations history: ${total === 0 ? 100 : Math.floor((done * 100) / total)}% (${done.toLocaleString("en-US")} of about ${total.toLocaleString("en-US")} requests)`,
-      ),
   })
   return adviseGrant({ request, manifest, agentRecord, ownerHistory: history, now })
 }

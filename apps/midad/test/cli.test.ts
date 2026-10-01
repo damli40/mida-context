@@ -427,6 +427,49 @@ describe("the crude mida command", () => {
     expect(progress.some((line) => line.includes("history on the chain"))).toBe(false)
   }, 300_000)
 
+  it("an approve for an agent that already holds a grant prints neither history-scan line (CHAIN-03)", async () => {
+    // ownerHistory answers from contract reads now — there is no log scan to report, so the
+    // "checking <name>'s history on the chain (about N requests)…" and "reading <name>'s
+    // revocations history: …" lines are gone even on the path that used to print them:
+    // `approve --all`'s advisor pass over a pending request from an agent that already holds
+    // a grant.
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-noscan-")))
+    const progress: string[] = []
+    const run4 = (...argv: string[]) =>
+      runCli(argv, {
+        home: fresh, network, cwd: projectDir, print: () => {},
+        progress: (line) => progress.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await run4("init")).toBe(0)
+    expect(await run4("request", "codex")).toBe(0)
+    // approve removes the pending-request file, so the request is captured before it runs —
+    // the same shape the AUTH-15 test files by hand below
+    const identity = loadAgentIdentity(fresh, "codex")!
+    const original = fresh.readJson<{ request: AccessRequest }>("agents/codex/pending-request.json")!.request
+    expect(await run4("approve", "codex")).toBe(0)
+    // a second, fresh-signed request for scopes codex already holds — `request` files nothing
+    // once the grant exists, so the file is written by hand
+    const { agentSignature: _dropped, ...unsigned } = original
+    const now = BigInt(Math.floor(Date.now() / 1000))
+    const renewed = {
+      ...unsigned,
+      requestId: `0x${randomBytes(32).toString("hex")}` as Hex,
+      nonce: `0x${randomBytes(32).toString("hex")}` as Hex,
+      // the window is checked against the CHAIN's last block timestamp, not the wall clock —
+      // a fresh anvil block can lag, so the same margins the AUTH-15 test uses
+      issuedAt: encodeUint64(now - 120n),
+      requestExpiresAt: encodeUint64(now + 300n),
+    }
+    const request = { ...renewed, agentSignature: await privateKeyToAccount(identity.signerPrivateKey).signTypedData(accessRequestTypedData(renewed)) }
+    await new FileAccessRequestStore(fresh, "codex").save(request)
+    fresh.writeSecretJson("agents/codex/pending-request.json", { request })
+    progress.length = 0
+    expect(await run4("approve", "--all")).toBe(0)
+    expect(progress.some((line) => line.includes("history on the chain"))).toBe(false)
+    expect(progress.some((line) => line.includes("revocations history"))).toBe(false)
+  }, 300_000)
+
   it("install <client> asks for a real terminal like approve, a non-client is usage, the daemon refuses it", async () => {
     const out: string[] = []
     expect(await runCli(["install", "cursor"], {

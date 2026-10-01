@@ -514,9 +514,9 @@ describe("approve flow", () => {
     const result = await confirmApprove(env, parsed, prep)
     expect(result.status).toBe("success")
     expect(sends.map((s) => s.functionName)).toEqual(["grantBatch"])
-    // The history scan itself — agentEpoch and the active-capability probe — ran ONCE, in the
+    // The history check itself — agentEpoch and the active-capability probe — ran ONCE, in the
     // first prepareGrant. (The two extra getAgent reads are preparedOperator's display read and
-    // the wrap publish's fresh encryption key — neither is part of the scan.)
+    // the wrap publish's fresh encryption key — neither is part of the check.)
     expect(chain.calls.filter((c) => c === "read:agentEpoch")).toHaveLength(1)
     expect(chain.calls.filter((c) => c === "read:activeCapabilityIds")).toHaveLength(1)
     // The K-6 window check and the grantNonce read still ran on all three preparations — the
