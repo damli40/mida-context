@@ -2753,6 +2753,21 @@ async function main(): Promise<void> {
       // simply not installed there and earns no line
       devin: resolveDevinConfigPath(process.env, homedir()),
     }
+    // UF-P3 P3c: an update can leave the OLD service running and doctor is the command the
+    // README sends the owner to — so doctor replaces a stale service exactly like the other
+    // commands (same ensureCurrentDaemon comparison), writes the same stderr line, and NEVER
+    // starts a service that is down: doctor's own daemon check reports that. A refused
+    // replacement or a service that does not come up goes to stderr and the checks still run.
+    const replaceStaleService = async (): Promise<void> => {
+      const ensured = await ensureCurrentDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS, whenDown: "leave" })
+      if (ensured.replaced !== undefined && ensured.up) {
+        process.stderr.write(
+          `restarted the Mida service (it was running code from ${ensured.replaced.codeRoot} @ ${ensured.replaced.codeCommit.slice(0, 7)})\n`,
+        )
+      } else if (ensured.replaced !== undefined || ensured.refusal !== undefined) {
+        process.stderr.write(`${ensured.refusal ?? "midad did not start; run mida doctor"}\n`)
+      }
+    }
     if (argv[1] === "--live") {
       const tool = argv[2] ?? ""
       if (argv.length !== 3 || !HOOK_TOOLS.includes(tool)) {
@@ -2760,6 +2775,7 @@ async function main(): Promise<void> {
         process.exitCode = 2
         return
       }
+      await replaceStaleService()
       process.exitCode = await runDoctorLive(tool as InstallTool, { home, print })
       return
     }
@@ -2768,6 +2784,7 @@ async function main(): Promise<void> {
       process.exitCode = 2
       return
     }
+    await replaceStaleService()
     process.exitCode = await runDoctor({ home, print, settings })
     return
   }

@@ -442,6 +442,77 @@ describe("ensureCurrentDaemon", () => {
       await closeQuiet(server)
     }
   })
+
+  // UF-P3 item P3c: `mida doctor` must replace a stale service but never START one — the
+  // `whenDown: "leave"` option means "do nothing when nothing answers".
+  it("whenDown 'leave': no daemon answering means {up:false}, no spawn, no shutdown", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    let spawned = 0
+    const started = Date.now()
+    const result = await ensureCurrentDaemon(home, () => { spawned += 1 }, {
+      waitMs: 5_000,
+      whenDown: "leave",
+      self: { codeRoot: "/code/here", codeCommit: "abc1234" },
+    })
+    // one probe, then a straight answer — not the whole waitMs a start would poll for
+    expect(Date.now() - started).toBeLessThan(3_000)
+    expect(result).toEqual({ up: false })
+    expect(spawned).toBe(0)
+    expect(existsSync(socketPathFor(home))).toBe(false)
+  })
+
+  it("whenDown 'leave': a daemon on other code is still replaced — shutdown, spawn, replaced", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    const posts: string[] = []
+    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+      if (req.method === "POST") {
+        posts.push(req.path)
+        replyJson(socket, 200, { ok: true })
+        if (req.path === "/shutdown") void closeQuiet(oldServer)
+        return
+      }
+      replyJson(socket, 200, { ok: true, pid: 7, codeRoot: "/code/here", codeCommit: "old1234" })
+    })
+    let spawned = 0
+    let replacement: Server | undefined
+    const result = await ensureCurrentDaemon(home, () => {
+      spawned += 1
+      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+        replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "new5678" }),
+      ).then((s) => { replacement = s })
+    }, { waitMs: 5_000, whenDown: "leave", self: { codeRoot: "/code/here", codeCommit: "new5678" } })
+    try {
+      expect(result.up).toBe(true)
+      expect(result.replaced).toEqual({ codeRoot: "/code/here", codeCommit: "old1234", pid: 7 })
+      expect(posts).toEqual(["/shutdown"])
+      expect(spawned).toBe(1)
+    } finally {
+      await closeQuiet(replacement)
+      await closeQuiet(oldServer)
+    }
+  })
+
+  it("whenDown 'leave': a daemon on THIS code is left alone — no spawn, no shutdown, nothing written", async () => {
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    const posts: string[] = []
+    const server = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+      if (req.method === "POST") posts.push(req.path)
+      replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "abc1234" })
+    })
+    try {
+      let spawned = 0
+      const result = await ensureCurrentDaemon(home, () => { spawned += 1 }, {
+        waitMs: 2_000,
+        whenDown: "leave",
+        self: { codeRoot: "/code/here", codeCommit: "abc1234" },
+      })
+      expect(result).toEqual({ up: true })
+      expect(spawned).toBe(0)
+      expect(posts).toEqual([])
+    } finally {
+      await closeQuiet(server)
+    }
+  })
 })
 
 describe("the migrate/in-progress marker (migrate B6)", () => {

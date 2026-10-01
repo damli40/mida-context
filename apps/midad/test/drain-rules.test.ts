@@ -2226,7 +2226,7 @@ describe("a save that found no summary model waits, not fails (UF-P3)", () => {
     home.writeSecretJson("queue/state/s4.json", wait("chain-error", 2))
     expect(resetSummarizerWaits(home)).toBe(2)
     for (const id of ["s1", "s2"]) {
-      const cleared = home.readJson<{ attempts?: number; failedAt?: string; reason?: string; savedAt?: string }>(`queue/state/${id}.json`)
+      const cleared = home.readJson<{ attempts?: number; failedAt?: string; reason?: string; savedAt?: string; transcriptBytes?: number }>(`queue/state/${id}.json`)
       expect(cleared?.attempts).toBeUndefined()
       expect(cleared?.failedAt).toBeUndefined()
       expect(cleared?.reason).toBeUndefined()

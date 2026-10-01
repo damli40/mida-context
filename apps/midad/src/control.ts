@@ -241,12 +241,15 @@ const SHUTDOWN_WAIT_MS = 10_000
 export async function ensureCurrentDaemon(
   home: MidaHome,
   spawn: () => void,
-  options: { waitMs: number; shutdownWaitMs?: number; self?: CodeIdentity },
+  options: { waitMs: number; shutdownWaitMs?: number; self?: CodeIdentity; whenDown?: "start" | "leave" },
 ): Promise<EnsureResult> {
   if (migrationInProgress(home)) return { up: false, refusal: MIGRATION_REFUSAL }
   const self = options.self ?? codeIdentity()
   const probe = await callDaemon(home, "/health", undefined, { timeoutMs: Math.min(500, Math.max(1, options.waitMs)) })
   if (probe.status === 0) {
+    // UF-P3: "leave" is for mida doctor — it reports a down service itself and must not start
+    // one; everything else still gets the spawn-then-poll ensureDaemon gives
+    if (options.whenDown === "leave") return { up: false }
     return { up: await ensureDaemon(home, spawn, { waitMs: options.waitMs }) }
   }
   const body = probe.body as { codeRoot?: unknown; codeCommit?: unknown; pid?: unknown } | null
