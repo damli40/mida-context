@@ -936,7 +936,19 @@ async function initOpening(deps: CliDeps): Promise<boolean> {
 
 /** The one `Summaries:` line printed after init's own lines when nobody was asked this call. */
 function summariesLine(deps: CliDeps): string {
-  const choice = currentSummarizer(deps.home, deps.env ?? process.env, deps.onPath !== undefined ? { onPath: deps.onPath } : undefined)
+  const env = deps.env ?? process.env
+  const choice = currentSummarizer(deps.home, env, deps.onPath !== undefined ? { onPath: deps.onPath } : undefined)
+  // agents mode names what is really installed — "your agents' small models" alone
+  // promised a writer that may not exist on this machine
+  const onPath = deps.onPath ?? ((bin: string) => binaryOnPath(bin, env.PATH))
+  const agentsWhat = () => {
+    const claude = onPath("claude")
+    const codex = onPath("codex")
+    if (claude && codex) return "Claude Code's small model, then Codex's if Claude can't"
+    if (claude) return "Claude Code's small model"
+    if (codex) return "Codex's small model"
+    return "your agents' small models, once Claude Code or Codex is installed"
+  }
   const what =
     readSummarizer(deps.home) === "invalid"
       ? "none (summarizer.json cannot be read)"
@@ -944,7 +956,7 @@ function summariesLine(deps: CliDeps): string {
         ? `${choice.entries[0]?.display ?? "your endpoint"}, with your own API key`
         : choice.mode === "environment"
           ? "the models your environment variables set"
-          : "your agents' small models"
+          : agentsWhat()
   return `Summaries: ${what}. Change it with: mida summarizer`
 }
 

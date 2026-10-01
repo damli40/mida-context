@@ -1397,7 +1397,7 @@ describe("the crude mida command", () => {
     expect(fresh.has("summarizer.json")).toBe(false)
     // the mark is absent — neither the graphic nor the plain line
     expect(out.every((line) => !line.includes("your context, in a store you own") && line !== "  ╭     ╮" && line !== "  ╰     ╯")).toBe(true)
-    expect(out.at(-1)).toBe("Summaries: your agents' small models. Change it with: mida summarizer")
+    expect(out.at(-1)).toBe("Summaries: your agents' small models, once Claude Code or Codex is installed. Change it with: mida summarizer")
   }, 300_000)
 
   it("init on a terminal shows the mark, the sentence and the block, and Enter saves agents — no Summaries line (UF-P2c)", async () => {
@@ -1446,7 +1446,38 @@ describe("the crude mida command", () => {
     expect(code).toBe(0)
     expect(asks).toBe(0)
     expect(out.slice(0, BANNER.length)).toEqual([...BANNER])
-    expect(out.at(-1)).toBe("Summaries: your agents' small models. Change it with: mida summarizer")
+    expect(out.at(-1)).toBe("Summaries: your agents' small models, once Claude Code or Codex is installed. Change it with: mida summarizer")
+  }, 300_000)
+
+  it("the Summaries line names what is actually installed: both, only claude, only codex, neither (UF-P1R)", async () => {
+    const cases: [string[], string][] = [
+      [
+        ["claude", "codex"],
+        "Summaries: Claude Code's small model, then Codex's if Claude can't. Change it with: mida summarizer",
+      ],
+      [["claude"], "Summaries: Claude Code's small model. Change it with: mida summarizer"],
+      [["codex"], "Summaries: Codex's small model. Change it with: mida summarizer"],
+      [[], "Summaries: your agents' small models, once Claude Code or Codex is installed. Change it with: mida summarizer"],
+    ]
+    for (const [installed, expected] of cases) {
+      const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-line-")))
+      writeSummarizer(fresh, { use: "agents" })
+      const out: string[] = []
+      const code = await runCli(["init"], {
+        home: fresh,
+        network,
+        cwd: projectDir,
+        print: (line) => out.push(line),
+        prompt: async () => "",
+        secretPrompt: async () => "",
+        stdinIsTTY: true,
+        stdoutIsTTY: true,
+        env: { LANG: "en_US.UTF-8" },
+        onPath: (bin) => installed.includes(bin),
+      })
+      expect(code).toBe(0)
+      expect(out.at(-1)).toBe(expected)
+    }
   }, 300_000)
 })
 

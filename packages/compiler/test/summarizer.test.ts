@@ -51,7 +51,9 @@ describe("codexSummaryCommand", () => {
     const cmd = codexSummaryCommand({})
     expect(cmd.argv).toEqual([
       "codex", "exec", "--ignore-user-config", "--ignore-rules", "--disable", "hooks",
-      "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-m", "gpt-6-luna", "-",
+      "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
+      "-c", "features.shell_tool=false", "-c", 'web_search="disabled"',
+      "-m", "gpt-6-luna", "-",
     ])
     expect(cmd.label).toBe("codex-luna")
     expect(cmd.timeoutMs).toBe(180_000)

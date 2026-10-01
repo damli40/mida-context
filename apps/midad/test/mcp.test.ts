@@ -258,6 +258,30 @@ describe("mida-mcp args", () => {
     expect(res.status).toBe(0)
     expect(res.stderr).toBe("")
   }, 20_000)
+
+  it("MIDA_INNER=1 — inside Mida's own summariser run the entry exits 0 and writes nothing, before it even parses args", async () => {
+    // even a flag that would otherwise exit 2 is not looked at: the guard comes first
+    const res = await new Promise<{ status: number | null; stdout: string; stderr: string }>((done, reject) => {
+      const child = spawn(BIN_MIDA_MCP, ["--bogus"], {
+        env: spawnEnv({ MIDA_HOME: home().root, MIDA_INNER: "1" }),
+        cwd: "/tmp",
+      })
+      let stdout = ""
+      let stderr = ""
+      child.stdout.on("data", (d: Buffer) => {
+        stdout += d.toString("utf8")
+      })
+      child.stderr.on("data", (d: Buffer) => {
+        stderr += d.toString("utf8")
+      })
+      child.on("error", reject)
+      child.on("exit", (code) => done({ status: code, stdout, stderr }))
+      child.stdin.end()
+    })
+    expect(res.status).toBe(0)
+    expect(res.stdout).toBe("")
+    expect(res.stderr).toBe("")
+  }, 20_000)
 })
 
 describe("mida-mcp startup gate", () => {

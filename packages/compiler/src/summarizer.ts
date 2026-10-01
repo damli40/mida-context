@@ -36,7 +36,9 @@ export function claudeSummaryCommand(env: NodeJS.ProcessEnv, safeMode: boolean):
 
 /**
  * Codex's own CLI as the summariser: `codex exec` non-interactive, user config
- * and rules off, read-only sandbox, prompt on stdin.
+ * and rules off, read-only sandbox — and no shell: a real run answered `ls /`,
+ * so `features.shell_tool=false` and `web_search="disabled"` (the double quotes
+ * are part of the value) close that off too. Prompt on stdin.
  */
 export function codexSummaryCommand(env: NodeJS.ProcessEnv): ModelCommand {
   const model = env.MIDA_CODEX_SUMMARY_MODEL !== undefined && env.MIDA_CODEX_SUMMARY_MODEL !== ""
@@ -44,7 +46,7 @@ export function codexSummaryCommand(env: NodeJS.ProcessEnv): ModelCommand {
     : CODEX_SUMMARY_MODEL_DEFAULT
   const short = model.replace(/^gpt-\d+-/, "")
   return {
-    argv: ["codex", "exec", "--ignore-user-config", "--ignore-rules", "--disable", "hooks", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-m", model, "-"],
+    argv: ["codex", "exec", "--ignore-user-config", "--ignore-rules", "--disable", "hooks", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-c", "features.shell_tool=false", "-c", 'web_search="disabled"', "-m", model, "-"],
     label: `codex-${short}`,
     timeoutMs: 180_000,
     agentCli: true,
