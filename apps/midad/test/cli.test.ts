@@ -199,6 +199,21 @@ describe("the crude mida command", () => {
     expect(order).toEqual(["drain", "prompt"])
   }, 300_000)
 
+  it("init drains buffered stdin before the summariser question is asked (UF-QB)", async () => {
+    const order: string[] = []
+    const initHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-qb-init-")))
+    expect(
+      await runCli(["init"], {
+        home: initHome, network, print: () => {},
+        stdinIsTTY: true, stdoutIsTTY: true, env: {}, onPath: () => false,
+        drainInput: async () => void order.push("drain"),
+        prompt: async () => (order.push("prompt"), "1"),
+      }),
+    ).toBe(0)
+    expect(order.slice(0, 2)).toEqual(["drain", "prompt"])
+    expect(readSummarizer(initHome)).toEqual({ use: "agents" })
+  }, 300_000)
+
   it("install claude-desktop registers its own identity, files the pending request and writes the client config (I1)", async () => {
     const lines: string[] = []
     const work = mkdtempSync(join(tmpdir(), "mida-desktop-work-"))

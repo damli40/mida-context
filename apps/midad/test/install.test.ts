@@ -1967,6 +1967,22 @@ describe("the summariser ask after install (UF-P2c)", () => {
     expect(readSummarizer(home)).toEqual({ use: "agents" })
   })
 
+  // UF-QB3: input pasted while install ran must not be read as the answer to the choice
+  // question — the buffered stdin is dropped before the ask, the way approve does.
+  it("install drains buffered stdin before the summariser question (UF-QB)", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const order: string[] = []
+    const code = await runInstall(["install", "claude-code"], {
+      ...ttyDeps(home, lines, []),
+      drainInput: async () => void order.push("drain"),
+      prompt: async (question: string) => (order.push("prompt"), "1"),
+    })
+    expect(code).toBe(0)
+    expect(order.slice(0, 2)).toEqual(["drain", "prompt"])
+    expect(readSummarizer(home)).toEqual({ use: "agents" })
+  })
+
   it("install claude-code on a terminal with a saved choice asks nothing", async () => {
     const home = new MidaHome(join(dir(), "mida-home"))
     writeSummarizer(home, { use: "agents" })

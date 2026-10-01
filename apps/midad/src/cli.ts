@@ -1952,9 +1952,13 @@ function terminalPrompt(question: string): Promise<string> {
  * but the line reader closing before an answer — Ctrl-C, Ctrl-D, stdin ending — resolves
  * undefined instead of never answering, so the caller can leave the rest of the command alive.
  */
-function terminalPromptOrAbandoned(question: string): Promise<string | undefined> {
+export function terminalPromptOrAbandoned(
+  question: string,
+  input: NodeJS.ReadableStream = process.stdin,
+  output: NodeJS.WritableStream = process.stdout,
+): Promise<string | undefined> {
   return new Promise((resolve) => {
-    const rl = createInterface({ input: process.stdin, output: process.stdout })
+    const rl = createInterface({ input, output })
     let settled = false
     const finish = (answer: string | undefined) => {
       if (settled) return
@@ -1962,7 +1966,7 @@ function terminalPromptOrAbandoned(question: string): Promise<string | undefined
       rl.close()
       // an abandoned ask left the cursor on the question's own line — end it so the
       // caller's "Nothing saved." line does not sit on the prompt line
-      if (answer === undefined) process.stdout.write("\n")
+      if (answer === undefined) output.write("\n")
       resolve(answer)
     }
     rl.question(question, (answer) => finish(answer))
@@ -1978,10 +1982,12 @@ function terminalPromptOrAbandoned(question: string): Promise<string | undefined
  * Only ever called when stdin is a real terminal; without one it falls back to a plain
  * question so nothing hangs.
  */
-function terminalSecretPrompt(question: string): Promise<SecretPromptResult> {
-  const stdin = process.stdin
-  const stdout = process.stdout
-  if (stdin.isTTY !== true || typeof stdin.setRawMode !== "function") return terminalPromptOrAbandoned(question)
+export function terminalSecretPrompt(
+  question: string,
+  stdin: NodeJS.ReadStream = process.stdin,
+  stdout: NodeJS.WritableStream = process.stdout,
+): Promise<SecretPromptResult> {
+  if (stdin.isTTY !== true || typeof stdin.setRawMode !== "function") return terminalPromptOrAbandoned(question, stdin, stdout)
   return new Promise((resolve) => {
     const wasRaw = stdin.isRaw === true
     let state = secretInputStart()

@@ -34,7 +34,7 @@ export type { ExportDeps, ExportEntry, ExportResult, SweepProbes } from "./expor
 export * from "./migrate-manifest.js"
 export { migrate, migrateUndo } from "./migrate.js"
 export type { MigrateDeps, MigrateStep, MigrateUndoDeps } from "./migrate.js"
-export { ABOUT, CLI_COMMANDS, NEEDS_TERMINAL_LINE, OWNER_COMMANDS, TERMINAL_COMMANDS, USAGE, helpLines, namespaceLabel, networkForCommand, ownerOnlyLine, ownerRefusalLine, runCli, runCliWithRuntime, runInstall, validCliArgv } from "./cli.js"
+export { ABOUT, CLI_COMMANDS, NEEDS_TERMINAL_LINE, OWNER_COMMANDS, TERMINAL_COMMANDS, USAGE, helpLines, namespaceLabel, networkForCommand, ownerOnlyLine, ownerRefusalLine, runCli, runCliWithRuntime, runInstall, terminalPromptOrAbandoned, terminalSecretPrompt, validCliArgv } from "./cli.js"
 export type { CliDeps } from "./cli.js"
 export * from "./queue.js"
 export * from "./task.js"
