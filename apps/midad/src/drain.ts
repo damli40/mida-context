@@ -973,9 +973,9 @@ function readContinues(home: MidaHome, sessionId: string, projectId: string): st
 }
 
 /**
- * A sponsor's daily limit resets at 00:00 UTC. The hourly retry costs the sponsor nothing (it
- * refuses before it calls its provider) and picks up a limit the sponsor's owner raised during
- * the day.
+ * A sponsor's daily limit resets at 00:00 UTC. The hourly retry is cheap for the sponsor (a
+ * refused try makes at most three calls to its provider) and picks up a limit the sponsor's
+ * owner raised during the day.
  *
  * When the next try on a failed session becomes due — the ONE rule the pass and `sessionWaits`
  * share so they can never disagree: a sponsor-limit failure waits the EARLIER of `failedAt + 60

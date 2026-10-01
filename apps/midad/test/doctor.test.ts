@@ -346,24 +346,40 @@ describe("mida doctor without a chain", () => {
   })
 
   // UF-O item O4: two waits the queue check used to mislabel or hide — a wallet funded below the
-  // send threshold is the same "cannot pay" as a dry wallet, and a sponsor-limit wait is the
-  // sponsor's daily cap, which resets at 00:00 UTC.
-  it("a wallet-low wait gets the same out-of-gas line a dry wallet gets (UF-O)", async () => {
-    const home = new MidaHome(join(dir(), "home"))
-    const server = await stubDaemon(home, 200, { ok: true })
-    try {
-      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
-      const failedAt = new Date(Date.now() - 30_000).toISOString()
-      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 2, failedAt, reason: "wallet-low" })
-      const lines: string[] = []
-      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
-      expect(lines).toContain("PROBLEM: claude-code's wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.")
-    } finally {
-      await closeServer(server)
+  // send threshold cannot pay either, and a sponsor-limit wait is the sponsor's daily cap, which
+  // resets at 00:00 UTC. UF-QA: wallet-low is its own line now — the wallet is LOW, not out —
+  // and the sponsor-limit line says the sponsor stopped paying, never whose limit ran out: the
+  // same wait happens when the sponsor's shared daily budget is spent, not only one agent's cap.
+  it("a wallet-low wait says the paying wallet is low on gas, self-paid or sponsored alike (UF-QA)", async () => {
+    for (const sponsored of [false, true]) {
+      const home = new MidaHome(join(dir(), `home-${sponsored}`))
+      const server = await stubDaemon(home, 200, { ok: true })
+      try {
+        if (sponsored) home.writeSecretJson("network.json", { sponsorUrl: "https://sponsor.example" })
+        enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+        const failedAt = new Date(Date.now() - 30_000).toISOString()
+        home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 2, failedAt, reason: "wallet-low" })
+        const lines: string[] = []
+        await runDoctor({
+          home,
+          print: (line) => lines.push(line),
+          settings: {},
+          env: {},
+          daemonProbeMs: 50,
+          fetch: async () => new Response("{}", { status: 200 }),
+          sponsorReachable: async () => false,
+        })
+        expect(lines, `sponsored=${sponsored}`).toContain(
+          "PROBLEM: claude-code's saves are waiting because the wallet that pays for them is low on gas. See doctor's sponsor and wallets lines.",
+        )
+        expect(lines.some((line) => line.includes("ran out of gas")), `sponsored=${sponsored}`).toBe(false)
+      } finally {
+        await closeServer(server)
+      }
     }
   })
 
-  it("a sponsor-limit wait names the sponsor's daily limit and its 00:00 UTC reset (UF-O)", async () => {
+  it("a sponsor-limit wait says the sponsor stopped paying — its limits reset at 00:00 UTC (UF-QA)", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const server = await stubDaemon(home, 200, { ok: true })
     try {
@@ -373,8 +389,10 @@ describe("mida doctor without a chain", () => {
       const lines: string[] = []
       await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
       expect(lines).toContain(
-        "PROBLEM: the gas sponsor's daily limit for claude-code is used up, so its saves are waiting. Mida sends them after the limit resets at 00:00 UTC.",
+        "PROBLEM: the gas sponsor has stopped paying for today, so claude-code's saves are waiting. Mida sends them after its limits reset at 00:00 UTC.",
       )
+      // the old wording blamed the agent's own limit — the same wait happens on the shared budget
+      expect(lines.some((line) => line.includes("daily limit for claude-code"))).toBe(false)
     } finally {
       await closeServer(server)
     }
@@ -440,6 +458,65 @@ describe("mida doctor without a chain", () => {
         })
         expect(lines).toContain(
           `ok: gas sponsor reachable at sponsor.example (willingness is only proven by a real send; it pays for up to ${saves} saves per agent a day, 2000 a day across everyone)`,
+        )
+      } finally {
+        await closeServer(server)
+      }
+    }
+  })
+
+  // UF-QA: the sponsor's GET reply also carries limits.dailyWeiBudget — a decimal string of wei,
+  // the daily budget shared by EVERYONE, which runs out long before the count limits do. When it
+  // is a decimal string the detail names it in whole MON; when absent or malformed the old count
+  // wording stands. perAgent clamps at 0 — a freeCalls field of 0, 1 or -5 is never "-3 saves".
+  it("a sponsor carrying a daily budget says it is shared by everyone, in whole MON (UF-QA)", async () => {
+    const cases: { limits: Record<string, unknown>; detail: string }[] = [
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, dailyWeiBudget: "150000000000000000000" },
+        detail: "; it pays for up to 300 saves per agent a day, from a daily budget of 150 MON shared by everyone",
+      },
+      {
+        // wei under the next whole MON rounds DOWN — 150.9 MON prints as 150
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, dailyWeiBudget: "150999999999999999999" },
+        detail: "; it pays for up to 300 saves per agent a day, from a daily budget of 150 MON shared by everyone",
+      },
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, dailyWeiBudget: "not-a-decimal" },
+        detail: "; it pays for up to 300 saves per agent a day, 2000 a day across everyone",
+      },
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, dailyWeiBudget: 150000000000000000000 },
+        detail: "; it pays for up to 300 saves per agent a day, 2000 a day across everyone",
+      },
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, freeCallsPerSenderPerDay: 0, dailyWeiBudget: "150000000000000000000" },
+        detail: "; it pays for up to 0 saves per agent a day, from a daily budget of 150 MON shared by everyone",
+      },
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, freeCallsPerSenderPerDay: 1, dailyWeiBudget: "150000000000000000000" },
+        detail: "; it pays for up to 0 saves per agent a day, from a daily budget of 150 MON shared by everyone",
+      },
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, freeCallsPerSenderPerDay: -5, dailyWeiBudget: "150000000000000000000" },
+        detail: "; it pays for up to 0 saves per agent a day, from a daily budget of 150 MON shared by everyone",
+      },
+    ]
+    for (const [i, { limits, detail }] of cases.entries()) {
+      const home = new MidaHome(join(dir(), `home-budget-${i}`))
+      const server = await stubDaemon(home, 200, { ok: true })
+      try {
+        home.writeSecretJson("network.json", { sponsorUrl: "https://sponsor.example" })
+        const lines: string[] = []
+        await runDoctor({
+          home,
+          print: (line) => lines.push(line),
+          settings: {},
+          env: {},
+          daemonProbeMs: 50,
+          fetch: async () => new Response(JSON.stringify({ limits }), { status: 200 }),
+        })
+        expect(lines, JSON.stringify(limits)).toContain(
+          `ok: gas sponsor reachable at sponsor.example (willingness is only proven by a real send${detail})`,
         )
       } finally {
         await closeServer(server)

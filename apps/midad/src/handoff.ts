@@ -142,6 +142,12 @@ export interface QueuedSaves {
   newestChange: Map<string, number>
   lastTryFailed: boolean
   /**
+   * UF-QA: at least one counted session has a failed try for a reason that is NOT one of the
+   * three wait reasons (attempts > 0 on another code) — so a "waiting on" clause must say
+   * "some are" and name the retries still happening beside it.
+   */
+  otherFailures: boolean
+  /**
    * What at least one counted session is waiting on — a string union because later wait kinds
    * land here; "sponsor-limit" means the gas sponsor's daily cap, which resets at 00:00 UTC;
    * the other two mean no summary model can write right now (UF-P3).
@@ -167,6 +173,7 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
   }
   const perAgent = new Map<string, Set<string>>()
   let lastTryFailed = false
+  let otherFailures = false
   const waitSeen = new Set<WaitReason>()
   // CAP-26: each counted session's NEWEST queued change. The drain merges a session's jobs and
   // keeps only the newest, so that is all the queue can honestly tell. The stalest of those is the
@@ -190,7 +197,12 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
     // unreadable or malformed state only loses the retry clause, never the count
     try {
       const state = home.readJson<{ attempts?: unknown; reason?: unknown; failedAt?: unknown }>(`queue/state/${job.sessionId}.json`)
-      if (typeof state?.attempts === "number" && state.attempts > 0) lastTryFailed = true
+      if (typeof state?.attempts === "number" && state.attempts > 0) {
+        lastTryFailed = true
+        // UF-QA: a failed try on a reason that is not one of the three waits still means Mida is
+        // retrying that session — the "waiting on" clause must not claim every wait is the same
+        if (!(WAIT_ORDER as readonly string[]).includes(state.reason as string)) otherFailures = true
+      }
       // UF-O/UF-P3: a capacity wait carries no attempts — an allowance, not a failed try — so
       // it is noticed by reason + failedAt, and it never sets lastTryFailed above
       if (typeof state?.failedAt === "string" && (WAIT_ORDER as readonly string[]).includes(state.reason as string)) {
@@ -213,7 +225,7 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
     if (typeof value !== "object" || value === null || (value as { projectId?: unknown }).projectId !== projectId) continue
     stuck += 1
   }
-  return { perAgent, newestChange, lastTryFailed, waitingOn, stuck }
+  return { perAgent, newestChange, lastTryFailed, otherFailures, waitingOn, stuck }
 }
 
 /** Two queue snapshots as one: every session either saw, its newest change, any failed try. */
@@ -230,6 +242,7 @@ function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): QueuedSaves 
     perAgent,
     newestChange,
     lastTryFailed: a.lastTryFailed || b.lastTryFailed,
+    otherFailures: a.otherFailures || b.otherFailures,
     // same fixed order readQueuedSaves applies — a merged snapshot picks the higher-priority wait
     waitingOn:
       a.waitingOn === undefined
@@ -247,7 +260,7 @@ function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): QueuedSaves 
  */
 export function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shownUnsent: number): string | null {
   if (queued === null) return null
-  const { perAgent, newestChange, lastTryFailed, waitingOn, stuck } = queued
+  const { perAgent, newestChange, lastTryFailed, otherFailures, waitingOn, stuck } = queued
   if (perAgent.size === 0 && stuck === 0) return null
   const clauses: string[] = []
   if (perAgent.size > 0) {
@@ -270,17 +283,25 @@ export function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shown
           ? "; it is shown below, marked UNSENT"
           : `; ${shownUnsent} of them ${shownUnsent === 1 ? "is" : "are"} shown below, marked UNSENT`
     // UF-O/UF-P3: a capacity wait is an allowance or a missing model, not a failed try — its
-    // clause says so and the "last try failed" clause is not added on top of it
-    const waiting =
+    // clause says so and the "last try failed" clause is not added on top of it. UF-QA: but when
+    // another counted session DID fail a try for a different reason, the clause must not claim
+    // every wait is the same — it says "some are" and names the retries beside it.
+    const inner =
       waitingOn === "sponsor-limit"
-        ? " (waiting for the gas sponsor's daily limit to reset at 00:00 UTC)"
+        ? "waiting for the gas sponsor's daily limit to reset at 00:00 UTC"
         : waitingOn === "summarizer-limit"
-          ? " (waiting for the model that writes Mida's summaries: it hit its usage limit)"
+          ? "waiting for the model that writes Mida's summaries: it hit its usage limit"
           : waitingOn === "no-summarizer"
-            ? " (waiting: no model is set up to write Mida's summaries; the user can run mida summarizer)"
-            : lastTryFailed
-              ? " (the last try failed; Mida keeps retrying)"
-              : ""
+            ? "waiting: no model is set up to write Mida's summaries; the user can run mida summarizer"
+            : undefined
+    const waiting =
+      inner !== undefined
+        ? otherFailures
+          ? ` (some are ${inner}; Mida keeps retrying the others)`
+          : ` (${inner})`
+        : lastTryFailed
+          ? " (the last try failed; Mida keeps retrying)"
+          : ""
     clauses.push(`${clause}${waiting}${shown}`)
   }
   if (stuck > 0) clauses.push(`${stuck} save${stuck === 1 ? "" : "s"} could not be sent to Monad: see \`mida doctor\``)

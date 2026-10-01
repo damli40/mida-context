@@ -1238,6 +1238,77 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     expect(result.text).not.toContain("the last try failed")
   })
 
+  // UF-QA: when every counted session that has a failed try is waiting on a wait reason the
+  // clause is plain " (waiting …)". When at least one counted session failed for ANOTHER reason
+  // (attempts > 0 on a non-wait reason), the clause must not pretend all of them wait — it says
+  // "some are …; Mida keeps retrying the others".
+  it("a sponsor-limit wait alongside a real failed try gets the 'some are' clause (UF-QA)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-limited" })
+    job(dir, { sessionId: "sess-ordinary" }, "2026-09-25T10:00:01.000Z")
+    dir.writeSecretJson("queue/state/sess-limited.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason: "sponsor-limit",
+    })
+    dir.writeSecretJson("queue/state/sess-ordinary.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      attempts: 2,
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason: "chain-error",
+    })
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("(some are waiting for the gas sponsor's daily limit to reset at 00:00 UTC; Mida keeps retrying the others)")
+    expect(result.text).not.toContain("(the last try failed; Mida keeps retrying)")
+  })
+
+  it("two sponsor-limit sessions get the plain clause — nothing else is being retried (UF-QA)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-a" })
+    job(dir, { sessionId: "sess-b" }, "2026-09-25T10:00:01.000Z")
+    const wait = {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason: "sponsor-limit",
+    }
+    dir.writeSecretJson("queue/state/sess-a.json", wait)
+    dir.writeSecretJson("queue/state/sess-b.json", wait)
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("(waiting for the gas sponsor's daily limit to reset at 00:00 UTC)")
+    expect(result.text).not.toContain("some are")
+    expect(result.text).not.toContain("the last try failed")
+  })
+
+  it("a sponsor-limit state that carries no failedAt is no wait at all — the clause stays off (UF-QA)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-limited" })
+    dir.writeSecretJson("queue/state/sess-limited.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      reason: "sponsor-limit",
+    })
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("has not reached Monad yet")
+    expect(result.text).not.toContain("waiting for the gas sponsor")
+    expect(result.text).not.toContain("the last try failed")
+  })
+
   // UF-P3 item P3b: the two "no model can write" waits are named like sponsor-limit — what the
   // save is waiting for, never the retry clause (those waits carry no attempts).
   it("a summarizer-limit wait names the model's usage limit, not a failed try", async () => {

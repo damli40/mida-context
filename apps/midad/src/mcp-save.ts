@@ -5,6 +5,7 @@ import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
 import { CONTENT_FIELDS, LIMITS, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint } from "@mida/checkpoint"
 import { scrubValue } from "@mida/compiler"
+import { sponsorDailyLimitOf } from "@mida/chain"
 import { PERMISSION, PROVENANCE_POLICY, isMidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
 import { chainRefusalReason } from "./chain-busy.js"
@@ -361,6 +362,14 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
     if (isMidaError(error, "PARTIAL_READ")) return refused("check-failed", noContextText("check-failed"))
     if ((error as { code?: unknown }).code === "agent-not-setup") {
       return refused("no-identity", noIdentityText(agent, runtime.home.root))
+    }
+    // UF-QA: the sponsor refused on its daily limit and the wallet could not pay either — this is
+    // a refusal the model can act on (save again after the reset), not an internal error
+    if (sponsorDailyLimitOf(error) !== undefined) {
+      return refused(
+        "sponsor-limit",
+        "Mida: the gas sponsor's daily limit is used up, so this was not saved. It resets at 00:00 UTC. Save again after that.",
+      )
     }
     // a send or read that died on a chain that could not answer is a refusal, not "not-approved" (in-6 R4)
     const chainReason = chainRefusalReason(error)

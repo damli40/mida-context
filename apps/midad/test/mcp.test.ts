@@ -1704,6 +1704,7 @@ describe("mida-mcp tools against a fake daemon", () => {
           perAgent: new Map([["claude-code", new Set(Array.from({ length: sessions }, (_, i) => `sess-${i}`))]]),
           newestChange: new Map(Array.from({ length: sessions }, (_, i) => [`sess-${i}`, at + i])),
           lastTryFailed,
+          otherFailures: false,
           waitingOn: undefined,
           stuck: 0,
         },

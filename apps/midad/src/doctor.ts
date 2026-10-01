@@ -965,11 +965,15 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         // out-of-gas wait names the agent whose wallet is dry and the two ways to clear it,
         // instead of reading as indistinguishable "chain-error" minutes.
         const waits = sessionWaits(home, jobs)
-        // UF-O: a wallet funded below the send threshold cannot pay either — wallet-low is the
-        // same wait as out-of-gas and names the same agent and the same fixes
-        const outOfGas = [
-          ...new Set(waits.filter((wait) => wait.reason === "out-of-gas" || wait.reason === "wallet-low").map((wait) => wait.agent)),
-        ].sort()
+        // UF-QA: wallet-low is not a dry wallet — the paying wallet is funded under the send
+        // threshold — so it gets its own line pointing at the sponsor and wallets checks
+        const walletLow = [...new Set(waits.filter((wait) => wait.reason === "wallet-low").map((wait) => wait.agent))].sort()
+        for (const agent of walletLow) {
+          lines.push(
+            `PROBLEM: ${agent}'s saves are waiting because the wallet that pays for them is low on gas. See doctor's sponsor and wallets lines.`,
+          )
+        }
+        const outOfGas = [...new Set(waits.filter((wait) => wait.reason === "out-of-gas").map((wait) => wait.agent))].sort()
         if (outOfGas.length > 0) {
           // in-39 B-4: on a sponsored setup "run mida sponsor on" is nonsense — a sponsor is
           // already configured and did not pay, so the honest line says so and points at the
@@ -983,11 +987,12 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             )
           }
         }
-        // UF-O: a sponsor-limit wait is not a dry wallet — the sponsor's daily cap is used up and
-        // the drain sends the save after the 00:00 UTC reset, so the line says exactly that
+        // UF-QA: a sponsor-limit wait is not a dry wallet — the sponsor stopped paying for today
+        // (its shared daily budget or its count limits) and the drain sends the save after the
+        // 00:00 UTC reset, so the line says exactly that
         const sponsorLimited = [...new Set(waits.filter((wait) => wait.reason === "sponsor-limit").map((wait) => wait.agent))].sort()
         for (const agent of sponsorLimited) {
-          lines.push(`PROBLEM: the gas sponsor's daily limit for ${agent} is used up, so its saves are waiting. Mida sends them after the limit resets at 00:00 UTC.`)
+          lines.push(`PROBLEM: the gas sponsor has stopped paying for today, so ${agent}'s saves are waiting. Mida sends them after its limits reset at 00:00 UTC.`)
         }
         // UF-P3: a save held because no summary model can write is not a gas problem either —
         // the line names the wait and the command that shows or changes the choice
@@ -1263,18 +1268,31 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             return [problem(`the gas sponsor ${host} answered HTTP ${reply.status}`, fix)]
           }
           const body = (await reply.json().catch(() => undefined)) as
-            | { limits?: { signingsPerSenderPerDay?: unknown; signingsGlobalPerDay?: unknown; freeCallsPerSenderPerDay?: unknown } }
+            | {
+                limits?: {
+                  signingsPerSenderPerDay?: unknown
+                  signingsGlobalPerDay?: unknown
+                  freeCallsPerSenderPerDay?: unknown
+                  dailyWeiBudget?: unknown
+                }
+              }
             | undefined
           const limits = body?.limits
           // UF-O: the limits read as SAVES, not signings — one save spends two free calls (stub
-          // data + gas estimate), so a low free-call cap binds tighter than the signing cap
+          // data + gas estimate), so a low free-call cap binds tighter than the signing cap. The
+          // count is clamped at 0: a spent or negative free-call field is "0 saves", never "-3".
+          // UF-QA: limits.dailyWeiBudget (a decimal string of wei) is the sponsor's daily budget
+          // shared by EVERYONE — it runs out long before the count limits — so when it parses,
+          // the detail names it in whole MON; absent or malformed keeps the count wording.
+          const perSender = limits?.signingsPerSenderPerDay
+          const globalCap = limits?.signingsGlobalPerDay
+          const freeCalls = limits?.freeCallsPerSenderPerDay
+          const budget = limits?.dailyWeiBudget
           const detail =
-            typeof limits?.signingsPerSenderPerDay === "number" && typeof limits?.signingsGlobalPerDay === "number"
-              ? `; it pays for up to ${
-                  typeof limits.freeCallsPerSenderPerDay === "number"
-                    ? Math.min(limits.signingsPerSenderPerDay, Math.floor(limits.freeCallsPerSenderPerDay / 2))
-                    : limits.signingsPerSenderPerDay
-                } saves per agent a day, ${limits.signingsGlobalPerDay} a day across everyone`
+            typeof perSender === "number" && typeof globalCap === "number"
+              ? typeof budget === "string" && /^\d+$/.test(budget)
+                ? `; it pays for up to ${Math.max(0, typeof freeCalls === "number" ? Math.min(perSender, Math.floor(freeCalls / 2)) : perSender)} saves per agent a day, from a daily budget of ${(BigInt(budget) / 1_000_000_000_000_000_000n).toString()} MON shared by everyone`
+                : `; it pays for up to ${Math.max(0, typeof freeCalls === "number" ? Math.min(perSender, Math.floor(freeCalls / 2)) : perSender)} saves per agent a day, ${globalCap} a day across everyone`
               : ""
           // a 2xx proves reachable, never willing — the Sep 22 refusal came from a reachable sponsor
           return [`ok: gas sponsor reachable at ${host} (willingness is only proven by a real send${detail})`]

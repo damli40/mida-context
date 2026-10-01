@@ -393,6 +393,23 @@ describe("buildMcpSave — the daemon's mida_save route", () => {
     if (badPayload.kind === "refused") expect(badPayload.reason).toBe("too-large")
   })
 
+  // UF-QA: a save refused by the sponsor's daily limit used to surface as a bare internal error.
+  // The marker @mida/chain's sendContract sets on that refusal is recognised and the tool answers
+  // like its other refusals: a reason plus a line that says what happened and when to try again.
+  it("a save refused on the sponsor's daily limit answers with the reset time (UF-QA)", async () => {
+    const result = await call({
+      save: (async () => {
+        throw Object.assign(new Error("insufficient funds for gas * price + value"), {
+          sponsorDailyLimit: "refused: this sender used its 120 free calls for today — try tomorrow",
+        })
+      }) as never,
+    })
+    expect(result).toMatchObject({ kind: "refused", reason: "sponsor-limit" })
+    expect((result as { text?: string }).text).toBe(
+      "Mida: the gas sponsor's daily limit is used up, so this was not saved. It resets at 00:00 UTC. Save again after that.",
+    )
+  })
+
   it("a refused call never reaches the injected save", async () => {
     let saved = false
     await call({

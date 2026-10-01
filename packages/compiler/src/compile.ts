@@ -249,9 +249,10 @@ function trimFields(picked: Record<string, unknown>, trimmed: string[], previous
   }
   const rawIssue = picked.unresolvedIssue
   if (rawIssue === null || rawIssue === undefined || typeof rawIssue === "string") {
-    // Every note-shaped segment leaves the model's text BEFORE the length cut, complete or cut
-    // off at the end of the string — a tail the cap cut mid-note would otherwise stay forever
-    // (UF-K). The lists a note the MODEL wrote claims are stripped with it and never trusted
+    // Every note-shaped segment leaves the model's text BEFORE the length cut — but only an
+    // EXACT note leaves it (UF-QA): an unclosed note — one a length cut cut off mid-note, say —
+    // is left in the text as it is, because anything that is not a real Mida note is the model's
+    // own text. The lists a note the MODEL wrote claims are stripped with it and never trusted
     // (UF-L): the note is rebuilt only from this compile's own cuts and the previous note.
     const issue = cutStr(
       typeof rawIssue === "string" ? splitLimitNote(rawIssue).text : "",
