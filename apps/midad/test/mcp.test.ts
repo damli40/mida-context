@@ -13,6 +13,7 @@ import type { McpServerDeps } from "@mida/midad"
 import { OVERSIZE_NOTE_LEAD, renderHandoffReport } from "@mida/checkpoint"
 import type { MergedHandoff } from "@mida/checkpoint"
 import { OVERSIZE_NOTE_LEAD as LEAF_OVERSIZE_NOTE_LEAD } from "../src/hook-output.js"
+import { queuedSavesNote } from "../src/handoff.js"
 
 const BIN_MIDA_MCP = fileURLToPath(new URL("../../../bin/mida-mcp", import.meta.url))
 const SRC_DIR = fileURLToPath(new URL("../src", import.meta.url))
@@ -1539,18 +1540,91 @@ describe("mida-mcp tools against a fake daemon", () => {
     expect(preamble).not.toContain("Nothing was left out")
   })
 
-  it("a cut reply drops the 'shown below, marked UNSENT' clause — the blocks it named are gone (UF-K)", async () => {
-    const merged = mergedOf({ constraints: BIG_CONSTRAINTS })
+  /** A rendered handoff padded to exactly `target` chars — the request field renders verbatim. */
+  const renderSized = (constraintCount: number, target: number) => {
+    const constraints = Array.from({ length: constraintCount }, (_, i) => `constraint ${i} ${"c".repeat(880)}`)
+    const first = renderHandoffReport(mergedOf({ constraints })).text
+    const pad = target - first.length
+    if (pad < 0) throw new Error(`fixture overshoots ${target}: ${first.length}`)
+    const text = renderHandoffReport(mergedOf({ constraints, originalRequest: `do the thing${"x".repeat(pad)}` })).text
+    if (text.length !== target) throw new Error(`padded to ${text.length}, wanted ${target}`)
+    return text
+  }
+
+  const END_COUNT = (text: string) => text.split("=== END MIDA HANDOFF DATA ===").length - 1
+
+  it("a reply just over the cap takes the short form: the lead alone, no cut claim, one END line (UF-L)", async () => {
+    // 40,001 and 40,050: the long note's tail clause is the only excess — shrinking it to the
+    // lead alone brings the reply under the cap, so nothing is cut and nothing may say it was
+    for (const target of [40_001, 40_050]) {
+      const rendered = renderSized(43, target)
+      expect(rendered).toContain(`${OVERSIZE_NOTE_LEAD} No constraint, decision or rejected approach was left out to shorten it. Nothing was left out.`)
+      const text = await cappedReply(rendered)
+      expect(text.length).toBeLessThanOrEqual(40_000)
+      expect(END_COUNT(text)).toBe(1)
+      expect(text).not.toContain("was cut")
+      expect(text).not.toContain("Text after this point is missing")
+      // the note survives as the lead alone — still true: the handoff WAS over its target
+      expect(text.split("\n")).toContain(OVERSIZE_NOTE_LEAD)
+      // and every rule is still there — nothing was removed
+      expect(text).toContain("constraint 0 ")
+      expect(text).toContain("constraint 42 ")
+    }
+  })
+
+  it("a reply the short form cannot save takes the cut form: cut note, one END line, under the cap (UF-L)", async () => {
+    const rendered = renderSized(50, 60_000)
+    const text = await cappedReply(rendered)
+    expect(text.length).toBeLessThanOrEqual(40_000)
+    expect(text.length).toBeLessThan(rendered.length)
+    expect(END_COUNT(text)).toBe(1)
+    const preamble = text.slice(0, text.indexOf(BEGIN_FENCE))
+    expect(preamble).toContain(REPLY_CUT_NOTE)
+    expect(text.endsWith(`…\n${CUT_LINE}\n\n=== END MIDA HANDOFF DATA ===`)).toBe(true)
+  })
+
+  it("a cut reply keeps only the text before the END line, one END total — and something is always removed (UF-L)", async () => {
+    // synthetic on purpose: a real render ends AT the END line, so only a hand-shaped reply can
+    // put text after it — the cap must still answer with one END line and a real cut
+    const rendered = `MIDA HANDOFF header\n${BEGIN_FENCE}\n${"a".repeat(20_000)}\n\n=== END MIDA HANDOFF DATA ===\n${"junk ".repeat(9_000)}`
+    expect(rendered.length).toBeGreaterThan(40_000)
+    const text = await cappedReply(rendered)
+    expect(END_COUNT(text)).toBe(1)
+    expect(text).not.toContain("junk")
+    // the reply says it was cut — so the kept text really ends at least one char early:
+    // the last kept char is 'a', then the … tail, with the cut line and exactly one fence
+    expect(text.endsWith(`a\n…\n${CUT_LINE}\n\n=== END MIDA HANDOFF DATA ===`)).toBe(true)
+  })
+
+  it("a cut reply drops the 'shown below, marked UNSENT' clause — the blocks it named are gone (UF-K, UF-L)", async () => {
+    // UF-L: the notes come from the REAL queuedSavesNote — a typed copy could keep passing a
+    // clause shape the code no longer strips (or vice versa)
+    const nowMs = Date.parse("2026-09-25T10:04:00.000Z")
+    const at = Date.parse("2026-09-25T10:00:00.000Z")
+    const realNote = (sessions: number, shown: number, lastTryFailed = false) =>
+      queuedSavesNote(
+        {
+          perAgent: new Map([["claude-code", new Set(Array.from({ length: sessions }, (_, i) => `sess-${i}`))]]),
+          newestChange: new Map(Array.from({ length: sessions }, (_, i) => [`sess-${i}`, at + i])),
+          lastTryFailed,
+          stuck: 0,
+        },
+        nowMs,
+        shown,
+      )!
     for (const pendingSavesNote of [
-      "Mida note: 1 newer save from claude-code has not reached Monad yet (its newest change is 4 min old); this record may be behind it; it is shown below, marked UNSENT.",
-      "Mida note: 2 newer saves from claude-code have not reached Monad yet (each changed within the last minute); this record may be behind them; 2 of them are shown below, marked UNSENT.",
+      realNote(1, 1), // singular: "; it is shown below, marked UNSENT"
+      realNote(2, 2), // plural: "; 2 of them are shown below, marked UNSENT"
+      realNote(1, 1, true), // with the retry clause: "(the last try failed; Mida keeps retrying); it is shown…"
     ]) {
-      const rendered = renderHandoffReport(merged, { pendingSavesNote }).text
+      expect(pendingSavesNote).toContain("shown below, marked UNSENT")
+      const rendered = renderHandoffReport(mergedOf({ constraints: BIG_CONSTRAINTS }), { pendingSavesNote }).text
       const text = await cappedReply(rendered)
       const preamble = text.slice(0, text.indexOf(BEGIN_FENCE))
       expect(preamble, pendingSavesNote).not.toContain("shown below")
       // the rest of the note is still true — only the clause pointing at cut-off blocks goes
       expect(preamble, pendingSavesNote).toContain("this record may be behind")
+      if (pendingSavesNote.includes("keeps retrying")) expect(preamble).toContain("keeps retrying")
     }
   })
 

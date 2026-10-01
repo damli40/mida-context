@@ -55,35 +55,48 @@ const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${text
 /**
  * mida_handoff's own cap (UF-H, widened to 40,000 in UF-I): the plain cut could slice the closing
  * fence off the handoff, leaving the agent reading saved, untrusted text with no end marker. A
- * too-long handoff keeps its END line instead — the kept text, then `…`, a line saying where the
- * reply was cut, a blank line, then the fence — and the whole reply still fits the cap. A handoff
- * text without the fence is cut the way capText cuts, at this same cap.
+ * too-long handoff first tries the SHORT form — the preamble's over-target note shrunk to its
+ * lead alone — and if that fits, the reply goes out whole with no cut claimed (UF-L). Otherwise
+ * it keeps its END line: the kept text, then `…`, a line saying where the reply was cut, a blank
+ * line, then the fence — and the whole reply still fits the cap. A handoff text without the
+ * fence is cut the way capText cuts, at this same cap.
  */
 const HANDOFF_TEXT_CAP = 40_000
 const capHandoffText = (text: string): string => {
   if (text.length <= HANDOFF_TEXT_CAP) return text
   if (!text.includes(HANDOFF_TAIL)) return `${text.slice(0, HANDOFF_TEXT_CAP - 1)}…`
-  // UF-K: the cut drops entries near the end — possibly rules, and the marked UNSENT blocks,
-  // which sit at the very end — so whatever the preamble's over-target note claimed ("Nothing
-  // was left out.", "Left out: 2 earlier saves.") is replaced by one line saying the reply was
-  // cut, and every "shown below, marked UNSENT" clause goes: the block it points at is gone.
-  // Whole lines that start with the note's lead only, and only BEFORE the BEGIN line — the
-  // same words inside saved text are the save's own and stay (they are quoted by defuse).
-  // indexOf/slice and a replacer FUNCTION, never a replacement string: saved text can hold `$&`.
-  // Done before measuring the keep length, so the reply still fits the cap.
+  // The preamble is everything before the BEGIN line. Only its WHOLE lines starting with the
+  // over-target note's lead are rewritten — the same words inside saved text are the save's
+  // own and stay (they are quoted by defuse). indexOf/slice and a replacer FUNCTION, never a
+  // replacement string: saved text can hold `$&`.
   const beginAt = text.indexOf(HANDOFF_BEGIN)
-  if (beginAt !== -1) {
-    const cutNote = `${OVERSIZE_NOTE_LEAD.slice(0, -1)}, and this reply was cut at ${HANDOFF_TEXT_CAP.toLocaleString("en-US")} characters, so entries near the end are missing.`
-    const before = text
-      .slice(0, beginAt)
+  const preamble = beginAt === -1 ? "" : text.slice(0, beginAt)
+  const body = beginAt === -1 ? text : text.slice(beginAt)
+  const noteLines = (note: string) =>
+    preamble
       .split("\n")
-      .map((line) => (line.startsWith(OVERSIZE_NOTE_LEAD) ? cutNote : line))
+      .map((line) => (line.startsWith(OVERSIZE_NOTE_LEAD) ? note : line))
       .join("\n")
-      .replace(/; (it is|\d+ of them (is|are)) shown below, marked UNSENT/g, () => "")
-    text = `${before}${text.slice(beginAt)}`
+  // SHORT form first (UF-L): the lead alone still says the handoff was over its size target —
+  // true whether or not the reply was cut — and when that alone brings the reply under the cap
+  // nothing was removed, so no sentence may say it was.
+  if (beginAt !== -1) {
+    const short = `${noteLines(OVERSIZE_NOTE_LEAD)}${body}`
+    if (short.length <= HANDOFF_TEXT_CAP) return short
   }
+  // CUT form on the ORIGINAL text: the cut drops entries near the end — possibly rules, and the
+  // marked UNSENT blocks, which sit at the very end — so the note says the reply was cut, and
+  // every "shown below, marked UNSENT" clause goes: the block it points at is gone (UF-K).
+  const cutNote = `${OVERSIZE_NOTE_LEAD.slice(0, -1)}, and this reply was cut at ${HANDOFF_TEXT_CAP.toLocaleString("en-US")} characters, so entries near the end are missing.`
+  const cut = `${noteLines(cutNote).replace(/; (it is|\d+ of them (is|are)) shown below, marked UNSENT/g, () => "")}${body}`
   const tail = `…\n(Mida cut this reply at ${HANDOFF_TEXT_CAP.toLocaleString("en-US")} characters. Text after this point is missing.)\n\n${HANDOFF_TAIL}`
-  return `${text.slice(0, HANDOFF_TEXT_CAP - tail.length)}${tail}`
+  // UF-L: keep the text BEFORE the END line — a slice of the whole text could carry its own END
+  // line next to the appended one — and at least one char fewer than it has, so a reply that
+  // says it was cut really removed something.
+  const endAt = cut.indexOf(HANDOFF_TAIL)
+  const beforeEnd = endAt === -1 ? cut : cut.slice(0, endAt)
+  const keep = Math.min(HANDOFF_TEXT_CAP - tail.length, Math.max(0, beforeEnd.length - 1))
+  return `${beforeEnd.slice(0, keep)}${tail}`
 }
 
 const toolText = (text: string) => ({ content: [{ type: "text" as const, text: capText(text) }] })

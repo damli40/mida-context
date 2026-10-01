@@ -135,7 +135,7 @@ const QUEUE_NOTE_SCAN_LIMIT = 200
  * reports what is queued — it never removes, re-orders, waits on or triggers a job, and a queue
  * that cannot be read degrades to no line at all, never a refused handoff.
  */
-interface QueuedSaves {
+export interface QueuedSaves {
   /** agent → its counted sessions (distinct sessions, not jobs) */
   perAgent: Map<string, Set<string>>
   /** session → its newest queued change (ms) */
@@ -212,7 +212,7 @@ function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): QueuedSaves 
  * The note's text for what readQueuedSaves found. `shownUnsent` is how many of the counted sessions
  * have their compiled-but-unsent save shown below, marked UNSENT (CAP-26).
  */
-function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shownUnsent: number): string | null {
+export function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shownUnsent: number): string | null {
   if (queued === null) return null
   const { perAgent, newestChange, lastTryFailed, stuck } = queued
   if (perAgent.size === 0 && stuck === 0) return null
