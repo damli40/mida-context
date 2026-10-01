@@ -1238,6 +1238,75 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     expect(result.text).not.toContain("the last try failed")
   })
 
+  // UF-P3 item P3b: the two "no model can write" waits are named like sponsor-limit — what the
+  // save is waiting for, never the retry clause (those waits carry no attempts).
+  it("a summarizer-limit wait names the model's usage limit, not a failed try", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-limited" })
+    dir.writeSecretJson("queue/state/sess-limited.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason: "summarizer-limit",
+    })
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("(waiting for the model that writes Mida's summaries: it hit its usage limit)")
+    expect(result.text).not.toContain("the last try failed")
+  })
+
+  it("a no-summarizer wait points at mida summarizer, not a failed try", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-none" })
+    dir.writeSecretJson("queue/state/sess-none.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason: "no-summarizer",
+    })
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("(waiting: no model is set up to write Mida's summaries; the user can run mida summarizer)")
+    expect(result.text).not.toContain("the last try failed")
+  })
+
+  it("sessions waiting on different reasons resolve in the fixed order: sponsor-limit, then summarizer-limit, then no-summarizer", async () => {
+    const dir = queueHome()
+    // the no-summarizer session was enqueued FIRST — the order is a fixed priority, not arrival
+    job(dir, { sessionId: "sess-none" }, "2026-09-25T09:59:00.000Z")
+    job(dir, { sessionId: "sess-limit" })
+    const wait = (reason: string) => ({
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason,
+    })
+    dir.writeSecretJson("queue/state/sess-none.json", wait("no-summarizer"))
+    dir.writeSecretJson("queue/state/sess-limit.json", wait("summarizer-limit"))
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const first = await buildHandoff(queueRuntime(dir), input, d)
+    expect(first.kind).toBe("handoff")
+    if (first.kind !== "handoff") return
+    expect(first.text).toContain("(waiting for the model that writes Mida's summaries: it hit its usage limit)")
+    expect(first.text).not.toContain("no model is set up")
+
+    // a sponsor-limit session outranks both
+    dir.writeSecretJson("queue/state/sess-none.json", wait("sponsor-limit"))
+    const { d: d2 } = deps({ ...reads, now: () => QUEUE_NOW })
+    const second = await buildHandoff(queueRuntime(dir), input, d2)
+    expect(second.kind).toBe("handoff")
+    if (second.kind !== "handoff") return
+    expect(second.text).toContain("(waiting for the gas sponsor's daily limit to reset at 00:00 UTC)")
+    expect(second.text).not.toContain("the model that writes Mida's summaries")
+  })
+
   it("an ordinary failed try still gets the retry clause", async () => {
     const dir = queueHome()
     job(dir, { sessionId: "sess-ordinary" })

@@ -143,11 +143,20 @@ export interface QueuedSaves {
   lastTryFailed: boolean
   /**
    * What at least one counted session is waiting on — a string union because later wait kinds
-   * land here; "sponsor-limit" means the gas sponsor's daily cap, which resets at 00:00 UTC.
+   * land here; "sponsor-limit" means the gas sponsor's daily cap, which resets at 00:00 UTC;
+   * the other two mean no summary model can write right now (UF-P3).
    */
-  waitingOn: "sponsor-limit" | undefined
+  waitingOn: WaitReason | undefined
   stuck: number
 }
+
+/**
+ * The capacity waits a session state can carry, in the order the note reports them when several
+ * counted sessions wait on different reasons: the sponsor's cap first, then the summary model.
+ * (UF-P3: a fixed priority, not arrival order.)
+ */
+type WaitReason = "sponsor-limit" | "summarizer-limit" | "no-summarizer"
+const WAIT_ORDER: readonly WaitReason[] = ["sponsor-limit", "summarizer-limit", "no-summarizer"]
 
 function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null {
   let jobs: CaptureJob[]
@@ -158,7 +167,7 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
   }
   const perAgent = new Map<string, Set<string>>()
   let lastTryFailed = false
-  let waitingOn: "sponsor-limit" | undefined = undefined
+  const waitSeen = new Set<WaitReason>()
   // CAP-26: each counted session's NEWEST queued change. The drain merges a session's jobs and
   // keeps only the newest, so that is all the queue can honestly tell. The stalest of those is the
   // signal: a session with no new change for an hour that is still not on Monad is stuck.
@@ -182,11 +191,14 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
     try {
       const state = home.readJson<{ attempts?: unknown; reason?: unknown; failedAt?: unknown }>(`queue/state/${job.sessionId}.json`)
       if (typeof state?.attempts === "number" && state.attempts > 0) lastTryFailed = true
-      // UF-O: a sponsor-limit wait carries no attempts — it is a daily allowance, not a failed
-      // try — so it is noticed by reason + failedAt, and it never sets lastTryFailed above
-      if (state?.reason === "sponsor-limit" && typeof state.failedAt === "string") waitingOn = "sponsor-limit"
+      // UF-O/UF-P3: a capacity wait carries no attempts — an allowance, not a failed try — so
+      // it is noticed by reason + failedAt, and it never sets lastTryFailed above
+      if (typeof state?.failedAt === "string" && (WAIT_ORDER as readonly string[]).includes(state.reason as string)) {
+        waitSeen.add(state.reason as WaitReason)
+      }
     } catch { /* keep the count, drop the clause */ }
   }
+  const waitingOn = WAIT_ORDER.find((reason) => waitSeen.has(reason))
   // in-13 M-4: a batched save the store refused as composed sits between ledgers — rejected at
   // the store, plaintext kept for the hourly retry — so no queue job names it and no
   // PENDING_ANCHOR block reaches the handoff. Its project comes from the kept plaintext's
@@ -218,7 +230,13 @@ function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): QueuedSaves 
     perAgent,
     newestChange,
     lastTryFailed: a.lastTryFailed || b.lastTryFailed,
-    waitingOn: a.waitingOn ?? b.waitingOn,
+    // same fixed order readQueuedSaves applies — a merged snapshot picks the higher-priority wait
+    waitingOn:
+      a.waitingOn === undefined
+        ? b.waitingOn
+        : b.waitingOn === undefined || WAIT_ORDER.indexOf(a.waitingOn) <= WAIT_ORDER.indexOf(b.waitingOn)
+          ? a.waitingOn
+          : b.waitingOn,
     stuck: Math.max(a.stuck, b.stuck),
   }
 }
@@ -251,14 +269,18 @@ export function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shown
         : total === 1
           ? "; it is shown below, marked UNSENT"
           : `; ${shownUnsent} of them ${shownUnsent === 1 ? "is" : "are"} shown below, marked UNSENT`
-    // UF-O: a sponsor-limit wait is a daily allowance that resets at 00:00 UTC, not a failed
-    // try — its clause says so and the "last try failed" clause is not added on top of it
+    // UF-O/UF-P3: a capacity wait is an allowance or a missing model, not a failed try — its
+    // clause says so and the "last try failed" clause is not added on top of it
     const waiting =
       waitingOn === "sponsor-limit"
         ? " (waiting for the gas sponsor's daily limit to reset at 00:00 UTC)"
-        : lastTryFailed
-          ? " (the last try failed; Mida keeps retrying)"
-          : ""
+        : waitingOn === "summarizer-limit"
+          ? " (waiting for the model that writes Mida's summaries: it hit its usage limit)"
+          : waitingOn === "no-summarizer"
+            ? " (waiting: no model is set up to write Mida's summaries; the user can run mida summarizer)"
+            : lastTryFailed
+              ? " (the last try failed; Mida keeps retrying)"
+              : ""
     clauses.push(`${clause}${waiting}${shown}`)
   }
   if (stuck > 0) clauses.push(`${stuck} save${stuck === 1 ? "" : "s"} could not be sent to Monad: see \`mida doctor\``)

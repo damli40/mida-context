@@ -12,8 +12,9 @@ import { toFunctionSelector } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { encodeUint64 } from "@mida/protocol"
 import { parseDeployment } from "@mida/chain"
-import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, enqueue, installClaudeCode, installCodex, installDevin, isMidaProcess, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, enqueue, installClaudeCode, installCodex, installDevin, isMidaProcess, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor, writeSummarizer } from "@mida/midad"
 import type { Runtime } from "@mida/midad"
+import { codeIdentity } from "../src/code-identity.js"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
 
@@ -379,6 +380,42 @@ describe("mida doctor without a chain", () => {
     }
   })
 
+  // UF-P3 item P3b: a save held for a summary model is a PROBLEM that names the wait — the
+  // owner is told why and which command shows or changes the choice.
+  it("a summarizer-limit wait names the model's usage limit and points at mida summarizer (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, failedAt, reason: "summarizer-limit" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain(
+        "PROBLEM: the model that writes Mida's summaries hit its usage limit, so claude-code's saves are waiting. Run mida summarizer to see it or to choose another.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a no-summarizer wait says no model is set up and points at mida summarizer (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, failedAt, reason: "no-summarizer" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain(
+        "PROBLEM: no model is set up to write Mida's summaries, so claude-code's saves are waiting. Run mida summarizer.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
   it("the sponsor line says how many SAVES a day its limits really pay for (UF-O)", async () => {
     // one save spends 2 free calls (stub data + gas estimate), so a free-call limit can bind
     // tighter than the signing limit: 120 free calls = 60 saves, not 300
@@ -457,40 +494,50 @@ describe("mida doctor without a chain", () => {
   })
 
   it("names the compile model and where the session text goes — per provider, from the real chain (M3-D5)", async () => {
+    // UF-P3: the check resolves through currentSummarizer now — the same function the service
+    // uses — so the agent tools on PATH count, and a Codex tail names its own label.
     const home = new MidaHome(join(dir(), "home"))
     const run = async (env: NodeJS.ProcessEnv) => {
       const lines: string[] = []
-      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env, daemonProbeMs: 50 })
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env,
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
       return lines
     }
 
-    // no keys: haiku through the claude CLI, no fallback
+    // no keys: haiku through the claude CLI, Codex behind it
     const haiku = await run({})
     expect(haiku).toContain("ok: compile model is claude-haiku")
     const haikuNote = haiku.filter((line) => line.startsWith("note:") && line.includes("transcript text"))
     expect(haikuNote).toHaveLength(1)
     expect(haikuNote[0]).toContain("api.anthropic.com")
-    expect(haikuNote[0]).toContain("no fallback")
+    expect(haikuNote[0]).toContain("a failed call falls back to codex-luna")
 
-    // deepseek key alone: the default, falling back to haiku
+    // deepseek key alone: the default, falling back to the agents
     const deepseek = await run({ DEEPSEEK_API_KEY: "test-key" })
     expect(deepseek).toContain("ok: compile model is deepseek-flash")
     expect(deepseek).toContain(
-      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to claude-haiku",
+      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to claude-haiku, then codex-luna",
     )
     expect(deepseek.join("\n")).not.toContain("test-key")
 
     // both keys: the note names the full real chain
     const both = await run({ DEEPSEEK_API_KEY: "d", KIMI_API_KEY: "k" })
     expect(both).toContain(
-      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to kimi, then claude-haiku",
+      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to kimi, then claude-haiku, then codex-luna",
     )
 
     // kimi alone: Moonshot is where the text goes
     const kimi = await run({ KIMI_API_KEY: "test-key" })
     expect(kimi).toContain("ok: compile model is kimi-k2.7-code-highspeed")
     expect(kimi).toContain(
-      "note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to claude-haiku",
+      "note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to claude-haiku, then codex-luna",
     )
     expect(kimi.join("\n")).not.toContain("test-key")
     expect(kimi.some((line) => line.includes("not Moonshot"))).toBe(false)
@@ -506,7 +553,7 @@ describe("mida doctor without a chain", () => {
       KIMI_API_KEY: "k",
     }
     const lines: string[] = []
-    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: custom, daemonProbeMs: 50 })
+    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: custom, daemonProbeMs: 50, onPath: () => true, claudeSafeMode: () => false })
     expect(lines).toContain("ok: compile model is qwen-local")
     expect(lines).toContain("note: compile text is sent to 127.0.0.1:11434 (your own endpoint); no fallback")
     // the custom base URL is itself — never a 'not Moonshot'-style problem
@@ -520,6 +567,8 @@ describe("mida doctor without a chain", () => {
       settings: {},
       env: { ...custom, MIDA_COMPILE_FALLBACK: "1" },
       daemonProbeMs: 50,
+      onPath: () => true,
+      claudeSafeMode: () => false,
     })
     expect(withFallback).toContain(
       "note: compile text is sent to 127.0.0.1:11434 (your own endpoint); a failed call falls back to deepseek, then kimi, then claude-haiku",
@@ -575,6 +624,137 @@ describe("mida doctor without a chain", () => {
     })
     expect(custom.some((line) => line.startsWith("PROBLEM:") && line.includes("compile text"))).toBe(false)
     expect(custom.some((line) => line.includes("anything.example.com"))).toBe(true)
+  })
+
+  // UF-P3 item P3b: compile-model resolves the chain the SERVICE would use — currentSummarizer,
+  // not the old env-only choice — so a Codex-only PATH, an empty chain, an unreadable saved
+  // choice and a saved key each get their own honest line.
+  it("with only Codex on PATH the compile model is codex-luna and Claude is named a missing backup (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      onPath: (bin) => bin === "codex",
+    })
+    expect(lines).toContain("ok: compile model is codex-luna")
+    expect(lines).toContain(
+      "note: codex-luna sends the session's transcript text to api.openai.com via the codex CLI (secrets are scrubbed first); no fallback",
+    )
+    expect(lines).toContain("note: Claude Code (haiku) is not installed, so it cannot be the backup.")
+  })
+
+  it("with neither agent tool the compile-model check is one PROBLEM line and nothing else (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      onPath: () => false,
+    })
+    const problem = "PROBLEM: no model can write Mida's summaries, so no session is being saved. Install Claude Code or Codex, or run mida summarizer use key."
+    expect(lines).toContain(problem)
+    // nothing else from this check: no ok:, no transcript note, no fallback, no backup note
+    expect(lines.some((line) => line.includes("compile model is"))).toBe(false)
+    expect(lines.some((line) => line.includes("transcript text"))).toBe(false)
+    expect(lines.some((line) => line.includes("cannot be the backup"))).toBe(false)
+    expect(lines.filter((line) => line.includes("Mida's summaries")).length).toBe(1)
+  })
+
+  it("an unreadable summarizer.json is its own PROBLEM line — never an ok model line (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    writeFileSync(home.path("summarizer.json"), "{not json")
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      onPath: () => true,
+    })
+    expect(lines).toContain(
+      "PROBLEM: the saved summariser choice (summarizer.json) cannot be read, so no session is being saved. Run mida summarizer use agents, or mida summarizer use key.",
+    )
+    expect(lines.some((line) => line.includes("compile model is"))).toBe(false)
+  })
+
+  it("a saved key choice names the provider's model — and the key appears in no line (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    writeSummarizer(home, { use: "key", provider: "deepseek", apiKey: "sk-test-secret-key" })
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      onPath: () => true,
+      claudeSafeMode: () => false,
+    })
+    expect(lines).toContain("ok: compile model is deepseek-flash")
+    expect(lines).toContain(
+      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); no fallback",
+    )
+    expect(lines.join("\n")).not.toContain("sk-test-secret-key")
+  })
+
+  it("a running service on a different summarizer chain gets the whose-answer-counts note (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      codeRoot: codeIdentity().codeRoot,
+      codeCommit: codeIdentity().codeCommit,
+      summarizer: { chain: ["deepseek-flash"] },
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
+      expect(lines).toContain(
+        "note: the running Mida service uses deepseek-flash; this shell would use claude-haiku, codex-luna. The service's answer is the one that counts.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a running service on the SAME chain gets no note (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      codeRoot: codeIdentity().codeRoot,
+      codeCommit: codeIdentity().codeCommit,
+      summarizer: { chain: ["claude-haiku", "codex-luna"] },
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
+      expect(lines.some((line) => line.includes("The service's answer is the one that counts"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
   })
 
   it("the environment check lists every compile-provider variable — set or unset, never a value (M3-D5)", async () => {
