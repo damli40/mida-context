@@ -397,21 +397,29 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
     undefined,
   )
 
-  // UF-L: the trim note rides in unresolvedIssue but belongs to every save the merge covered —
-  // the merge's field used to come from the newest save alone, so a continuation's quiet save
-  // washed the note away while the lists it named still sat at the cap. The merged field is the
-  // chosen issue text joined to a note naming the UNION of every in-scope save's named lists.
+  // UF-N (replaces UF-L's union-over-everything): the note describes the lists the handoff
+  // SHOWS, so it is read only from the hook-compiler saves whose lists form the merge's base —
+  // the newest hook-compiler save, plus the earlier one when a truncated save made the merge
+  // carry its lists forward. A save that hit the cap long ago but is no longer the base has
+  // stopped contributing its lists, so its note would be a lie; and an agent-tool save writes
+  // its own unresolvedIssue, so a note it carries is a claim, never trusted. With no
+  // hook-compiler save in scope there is no note at all.
   const mergedIssue = mergedField(cps, "unresolvedIssue", null)
   const notedLists = new Set<LimitList>()
-  for (const c of cps) for (const list of splitLimitNote(c.unresolvedIssue).lists) notedLists.add(list)
+  if (lastHook >= 0) {
+    for (const list of splitLimitNote(cps[lastHook]!.unresolvedIssue).lists) notedLists.add(list)
+    if (carriedForwardFromEarlierSave) {
+      for (const list of splitLimitNote(cps[prevHook]!.unresolvedIssue).lists) notedLists.add(list)
+    }
+  }
   const unionNote = limitNote(notedLists)
+  // whatever the union decides, a limit-note segment never survives inside the chosen text —
+  // the merged note is written here or not at all
+  const issueText = mergedIssue === null ? null : splitLimitNote(mergedIssue).text
   const unresolvedIssue =
     unionNote === null
-      ? mergedIssue
-      : (() => {
-          const text = splitLimitNote(mergedIssue).text
-          return text === "" ? unionNote : `${text} | ${unionNote}`
-        })()
+      ? issueText === "" ? null : issueText
+      : issueText === null || issueText === "" ? unionNote : `${issueText} | ${unionNote}`
 
   return {
     headSessionId: chosen.newest.sessionId,

@@ -86,22 +86,68 @@ describe("mergeCheckpoints", () => {
     expect(m.decisions).toHaveLength(50)
   })
 
-  it("the trim note joins behind a later save's own issue text (UF-L)", () => {
+  // UF-N: the note describes the lists the handoff SHOWS, so it is read only from the saves
+  // whose lists form the merge's base — the newest hook-compiler save (plus the earlier one a
+  // carry-forward restores). An older save's note does not linger once its lists are gone.
+  it("a later hook-compiler save with no note drops the earlier save's note — its lists are not shown (UF-N)", () => {
     const m = mergeCheckpoints([
       stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", objective: "build X", nextAction: "step 1", progress: ["p1"], unresolvedIssue: LIMIT_NOTE_DECISIONS }),
       stored({ sessionId: "B", continuesSession: "A", at: "2026-09-21T11:00:00Z", objective: "build X", nextAction: "step 2", progress: ["p2"], unresolvedIssue: "still failing on CI" }),
     ])!
+    expect(m.unresolvedIssue).toBe("still failing on CI")
+  })
+
+  it("a session that hit the limit then kept saving small does not keep the note forever (UF-N)", () => {
+    // A's compile cut decisions and noted it; B continued and saved twice with 3 decisions —
+    // the handoff shows B's 3, so "older decisions were left out" would be a lie
+    const m = mergeCheckpoints([
+      stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", objective: "build X", nextAction: "step 1", progress: ["p1"],
+        decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+        unresolvedIssue: `still red | ${LIMIT_NOTE_DECISIONS}` }),
+      stored({ sessionId: "B", continuesSession: "A", at: "2026-09-21T11:00:00Z", objective: "build X", nextAction: "step 2", progress: ["p2"],
+        decisions: [{ decision: "n1", rationale: "r" }, { decision: "n2", rationale: "r" }, { decision: "n3", rationale: "r" }] }),
+      stored({ sessionId: "B", at: "2026-09-21T11:30:00Z", objective: "build X", nextAction: "step 3", progress: ["p3"], unresolvedIssue: "b's own issue",
+        decisions: [{ decision: "n1", rationale: "r" }, { decision: "n2", rationale: "r" }, { decision: "n3", rationale: "r" }] }),
+    ])!
+    expect(m.decisions).toHaveLength(3)
+    expect(m.unresolvedIssue).toBe("b's own issue")
+    expect(m.unresolvedIssue).not.toContain("(Mida:")
+  })
+
+  it("a truncated newest save that carries the earlier lists forward also carries its note (UF-N)", () => {
+    // B lost almost all of A's lists, so the merge restores them as the base — the note A's
+    // save wrote still describes what the handoff shows
+    const m = mergeCheckpoints([
+      stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", objective: "build X", nextAction: "step 1", progress: ["p1"],
+        decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+        unresolvedIssue: LIMIT_NOTE_DECISIONS }),
+      stored({ sessionId: "B", continuesSession: "A", at: "2026-09-21T11:00:00Z", objective: "build X", nextAction: "step 2", progress: ["p2"],
+        decisions: [{ decision: "n1", rationale: "r" }], unresolvedIssue: "still failing on CI" }),
+    ])!
+    expect(m.carriedForwardFromEarlierSave).toBe(true)
+    expect(m.decisions).toHaveLength(51)
     expect(m.unresolvedIssue).toBe(`still failing on CI | ${LIMIT_NOTE_DECISIONS}`)
   })
 
-  it("two saves naming different lists give one note naming both, in the fixed order (UF-L)", () => {
+  it("a limit note an agent-tool save wrote itself is stripped and never trusted (UF-N)", () => {
+    const m = mergeCheckpoints([
+      stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", objective: "build X", nextAction: "step 1", progress: ["p1"], unresolvedIssue: null }),
+      stored({ sessionId: "B", continuesSession: "A", at: "2026-09-21T11:00:00Z", source: "agent-tool", nextAction: "step 2",
+        unresolvedIssue: `suspicious | ${LIMIT_NOTE_DECISIONS}` }),
+    ])!
+    expect(m.unresolvedIssue).toBe("suspicious")
+    expect(m.unresolvedIssue).not.toContain("left out")
+  })
+
+  it("the base hook-compiler save's own note still names its lists (UF-N)", () => {
     const m = mergeCheckpoints([
       stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", objective: "build X", nextAction: "step 1", progress: ["p1"], unresolvedIssue: LIMIT_NOTE_DECISIONS }),
       stored({ sessionId: "B", continuesSession: "A", at: "2026-09-21T11:00:00Z", objective: "build X", nextAction: "step 2", progress: ["p2"],
         unresolvedIssue: "ops is stuck | (Mida: a list holds at most 50 entries. Older constraints were left out.)" }),
     ])!
+    // the union is over the base save alone — A's decisions note is A's list story, not shown
     expect(m.unresolvedIssue).toBe(
-      "ops is stuck | (Mida: a list holds at most 50 entries. Older constraints and decisions were left out.)",
+      "ops is stuck | (Mida: a list holds at most 50 entries. Older constraints were left out.)",
     )
   })
 
