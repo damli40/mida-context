@@ -121,6 +121,9 @@ async function whatsNew(home: MidaHome, agent: string | undefined, record: Recor
  * session-start hook must never block the agent.
  */
 async function main(): Promise<void> {
+  // Mida's own summariser run sets MIDA_INNER=1 — inside it this hook does absolutely
+  // nothing: no output, no daemon start, no request, no log line.
+  if (process.env.MIDA_INNER === "1") return
   // an EPIPE on stdout must not become an unhandled stream error — stdout is best-effort
   process.stdout.on("error", () => {})
   const home = resolveHome(process.env)

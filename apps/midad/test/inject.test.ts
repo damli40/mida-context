@@ -208,6 +208,30 @@ describe("inject-main process", () => {
     expect(res.stdout).toBe("")
   }, 30_000)
 
+  it("MIDA_INNER=1 — Mida's own summariser run — prints nothing, exits 0, and makes no request", async () => {
+    const dir = home()
+    dir.writeSecretJson("network.json", { rpcUrl: "http://127.0.0.1:1", deployment: {} })
+    // a daemon that counts every connection it receives: the guard must mean zero
+    let hits = 0
+    const s = createServer((socket: Socket) => {
+      hits += 1
+      socket.on("data", () => {})
+    })
+    await new Promise<void>((resolve, reject) => {
+      s.once("error", reject)
+      s.listen(socketPathFor(dir), () => resolve())
+    })
+    try {
+      const res = await run(["claude-code"], sessionStart(), dir.root, { MIDA_INNER: "1" })
+      expect(res.status).toBe(0)
+      expect(res.stdout).toBe("")
+      expect(res.stderr).toBe("")
+      expect(hits).toBe(0)
+    } finally {
+      await close(s)
+    }
+  }, 30_000)
+
   it("a Stop event prints nothing and exits 0", async () => {
     const res = await run(["claude-code"], JSON.stringify({ hook_event_name: "Stop", session_id: "s1", cwd: "/tmp/work" }), home().root)
     expect(res.status).toBe(0)
