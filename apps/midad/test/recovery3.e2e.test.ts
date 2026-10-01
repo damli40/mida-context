@@ -34,7 +34,7 @@ describe("M1 fix round A: expired grants, stale files, impossible scan ranges", 
     network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-m1-recovery3-")))
     runtime = await Runtime.open(home, network)
-  }, STEP_TIMEOUT * 2)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

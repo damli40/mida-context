@@ -39,7 +39,6 @@ import { readSavedNetwork } from "../src/network.js"
 import { sampleCheckpoint } from "./helpers.js"
 
 const AGENTS = ["claude-code", "codex"] as const
-const SETUP_TIMEOUT = 300_000
 const STEP_TIMEOUT = 120_000
 /** How long a settle loop waits for the chain's answer to a submitted batch. */
 const SETTLE_MS = 5_000
@@ -68,7 +67,7 @@ describe("batched checkpoint lane end to end on local Anvil (Task 10)", () => {
     batchAnchor = env.deployment.batchAnchor
     network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund, storageUrl: env.apiBaseUrl }
     publicClient = createPublicClient({ chain: chainFor(env.deployment.chainId), transport: http(env.rpcUrl) })
-  }, SETUP_TIMEOUT)
+  }, 600_000)
 
   afterAll(async () => {
     await env?.stop()

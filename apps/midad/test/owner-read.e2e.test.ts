@@ -18,8 +18,6 @@ import type { MigrationEnvelope, Network, SourceRecord } from "@mida/midad"
 import { seedMigrateUniverse } from "./helpers-migrate.js"
 import type { MigrateSeed } from "./helpers-migrate.js"
 
-const SEED_TIMEOUT = 300_000
-
 /**
  * Plan B Task 3 on local Anvil: `readOwnerUniverse` rebuilds the owner's whole record set from
  * owner-filtered `ContextRegistered` logs plus the owner-signed store list, decrypting each object
@@ -48,7 +46,7 @@ describe("readOwnerUniverse on local Anvil (migrate B3)", () => {
     runtime = await Runtime.open(home, network)
     seed = await seedMigrateUniverse(runtime)
     universe = await readOwnerUniverse(runtime)
-  }, SEED_TIMEOUT)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

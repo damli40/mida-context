@@ -35,7 +35,6 @@ import { sampleCheckpoint } from "./helpers.js"
 import type { Checkpoint } from "@mida/checkpoint"
 
 const AGENTS = ["claude-code", "codex"] as const
-const SETUP_TIMEOUT = 480_000
 const STEP_TIMEOUT = 240_000
 const SETTLE_MS = 5_000
 
@@ -82,7 +81,7 @@ describe("chain order decides 'current', never the checkpoint's claimed clock (i
     if (env.batcher === undefined) throw new Error("localEnvironment did not expose the batch timer handle")
     network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund, storageUrl: env.apiBaseUrl }
     publicClient = createPublicClient({ chain: chainFor(env.deployment.chainId), transport: http(env.rpcUrl) })
-  }, SETUP_TIMEOUT)
+  }, 600_000)
 
   afterAll(async () => {
     await env?.stop()

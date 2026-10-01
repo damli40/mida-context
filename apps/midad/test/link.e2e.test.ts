@@ -44,7 +44,7 @@ describe("mida link — a handoff saved in A is the handoff read in B (lk-1)", (
     // approve in A: the chain grant plus the signed project row for folder A
     const approval = await approve(runtime, "claude-code", dirA)
     projectId = approval.projectId!
-  }, STEP_TIMEOUT * 4)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

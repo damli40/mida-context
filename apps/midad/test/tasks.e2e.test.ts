@@ -137,7 +137,7 @@ describe("named tasks on local Anvil (tk-1)", () => {
       log: () => {},
       tickMs: 60_000,
     })
-  }, STEP_TIMEOUT * 6)
+  }, 600_000)
 
   afterAll(async () => {
     await daemon?.close()

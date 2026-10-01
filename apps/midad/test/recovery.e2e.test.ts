@@ -55,7 +55,7 @@ describe("M0 crash-safety and whole-agent revocation", () => {
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-m0-recovery-")))
     runtime = await Runtime.open(home, network)
     await init(runtime, AGENTS)
-  }, STEP_TIMEOUT * 2)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

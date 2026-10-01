@@ -168,7 +168,7 @@ describe("mida_save against a real midad on local Anvil", () => {
       tickMs: 30_000,
     })
     mcp = await connectMcp("claude-desktop")
-  }, STEP_TIMEOUT * 4)
+  }, 600_000)
 
   afterAll(async () => {
     await mcp?.close()

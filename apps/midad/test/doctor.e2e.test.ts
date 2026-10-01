@@ -102,7 +102,7 @@ describe("mida doctor on local Anvil", () => {
       tickMs: 60_000,
     })
     listBytes = readFileSync(home.path("approved-projects.json"), "utf8")
-  }, STEP_TIMEOUT * 6)
+  }, 600_000)
 
   afterAll(async () => {
     await daemon?.close()

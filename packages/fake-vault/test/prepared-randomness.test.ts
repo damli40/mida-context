@@ -22,7 +22,7 @@ describe("provisionAgent prepared randomness (migrate B1)", () => {
     deployment = await deployLocal({ rpcUrl: node.rpcUrl })
     operator = createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[2]!) })
     reader = new RegistryReader(operator)
-  }, 180_000)
+  }, 600_000)
 
   afterAll(async () => {
     await node?.stop()

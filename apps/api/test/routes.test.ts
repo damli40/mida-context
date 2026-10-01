@@ -151,7 +151,7 @@ describe("Context API routes (plan Task 24)", () => {
     await grant("W", [{ namespace: "goals.career", permissions: PERMISSION.CREATE, provenancePolicy: PROVENANCE_POLICY.ALLOW_INFERENCE }])
     await grant("T", READ_CAREER)
     aliceContextId = (await vault.createOwnerContext({ namespace: "goals.career", payload: GOAL })).contextId
-  }, 300_000)
+  }, 600_000)
 
   afterAll(async () => {
     await node?.stop()

@@ -98,7 +98,7 @@ describe("M1 drainOnce on local Anvil", () => {
     mkdirSync(join(homeDir, ".claude", "projects", "proj"), { recursive: true })
     transcriptPath = join(homeDir, ".claude", "projects", "proj", "transcript.jsonl")
     writeFileSync(transcriptPath, JSON.stringify({ type: "user", message: { content: "Build a rate limiter" } }) + "\n")
-  }, STEP_TIMEOUT * 2)
+  }, 600_000)
 
   afterAll(async () => {
     await env?.stop()

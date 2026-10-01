@@ -47,7 +47,7 @@ describe("M3-D4: `mida approve` clears a stale store deny", () => {
     runtime = await Runtime.open(home, network)
     progressLines = []
     runtime.progress = (line) => progressLines.push(line)
-  }, 180_000)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

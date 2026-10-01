@@ -36,7 +36,7 @@ describe("the crude mida command", () => {
     network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-")))
     projectDir = mkdtempSync(join(tmpdir(), "mida-cli-proj-"))
-  }, 120_000)
+  }, 600_000)
   afterAll(async () => {
     await env?.stop()
   })

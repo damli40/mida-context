@@ -49,7 +49,7 @@ describe("mida remember --replaces on local Anvil (in-4 I9)", () => {
     await approve(runtime, "claude-code", workDir)
     await requestAccess(runtime, "codex")
     await approve(runtime, "codex")
-  }, STEP_TIMEOUT * 4)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

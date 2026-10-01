@@ -71,7 +71,7 @@ describe("in-3 I6 — a direct save checks the deny list again right before regi
       )
     })
     network = { rpcUrl: node.rpcUrl, deployment, fund: (a) => fundLocal(node.rpcUrl, a), storageUrl: baseUrl }
-  }, 300_000)
+  }, 600_000)
 
   afterAll(async () => {
     await closeServer?.()

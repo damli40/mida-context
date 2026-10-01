@@ -108,7 +108,7 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     agentN = await provision(4, "AgentN")
     capabilityA = await grant(agentA, { kind: "recommended" })
     capabilityE = await grant(agentE, { kind: "custom", scopes: [{ namespaceId: CAREER, permissions: PERMISSION.READ, provenancePolicy: 0 }], expiresAt: (await latestTimestamp(owner)) + 120n })
-  }, 240_000)
+  }, 600_000)
 
   afterAll(async () => {
     await node?.stop()

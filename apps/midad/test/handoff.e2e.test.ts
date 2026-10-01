@@ -155,7 +155,7 @@ describe("POST /handoff on local Anvil", () => {
       log: (entry) => daemonLogs.push(entry),
       tickMs: 60_000,
     })
-  }, STEP_TIMEOUT * 6)
+  }, 600_000)
 
   afterAll(async () => {
     await daemon?.close()

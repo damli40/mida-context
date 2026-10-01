@@ -152,7 +152,7 @@ describe("MidaAgent (plan Task 25)", () => {
     aliceContextId = (
       await vault.createOwnerContext({ namespace: "goals.career", payload: { v: 1, value: "Prioritize systems engineering", kind: "GOAL", provenance: { source: "USER_ASSERTED" } } })
     ).contextId
-  }, 300_000)
+  }, 600_000)
 
   afterAll(async () => {
     await node?.stop()

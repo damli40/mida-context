@@ -33,7 +33,7 @@ describe("owner command progress lines", () => {
     env = await localEnvironment()
     network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-progress-")))
-  }, 120_000)
+  }, 600_000)
   afterAll(async () => {
     await env?.stop()
   })

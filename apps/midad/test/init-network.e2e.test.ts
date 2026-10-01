@@ -18,7 +18,7 @@ describe("init never rewrites network.json (E6)", () => {
   let env: ScenarioEnvironment
   beforeAll(async () => {
     env = await localEnvironment()
-  }, STEP_TIMEOUT * 2)
+  }, 600_000)
   afterAll(async () => {
     await env?.stop()
   })

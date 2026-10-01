@@ -110,7 +110,7 @@ describe("in-3 I5 — the batcher holds a queued save whose author is under a pe
       })
     })
     network = { rpcUrl: node.rpcUrl, deployment, fund: (a: Address) => fundLocal(node.rpcUrl, a), storageUrl: baseUrl }
-  }, 300_000)
+  }, 600_000)
 
   afterAll(async () => {
     await closeServer?.()

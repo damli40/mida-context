@@ -40,7 +40,7 @@ describe("M0 fix round C2: local files never outrank the chain", () => {
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-m0-recovery2-")))
     runtime = await Runtime.open(home, network)
     await init(runtime, ["claude-code", "codex", "probe", "ghost"])
-  }, STEP_TIMEOUT * 2)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

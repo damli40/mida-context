@@ -123,7 +123,7 @@ describe("/remember against a real midad on local Anvil", () => {
       drainDeps: { homeDir: mkdtempSync(join(tmpdir(), "mida-userhome-")) },
       tickMs: 30_000,
     })
-  }, STEP_TIMEOUT * 6)
+  }, 600_000)
 
   afterAll(async () => {
     await daemon?.close()

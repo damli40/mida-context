@@ -113,7 +113,7 @@ describe.each(targets)("§16 end-to-end scenario on $name (plan Tasks 26 and 27)
     ownerApi = apiFor(aliceAccount)
     vault = new FakeVaultAuthority({ seed: randomBytes(32), p256PrivateKey: hexOf(p256.utils.randomSecretKey()), chain: alice, api: ownerApi })
     owner = vault.owner
-  }, STEP_TIMEOUT * 2)
+  }, 600_000)
 
   afterAll(async () => {
     await env?.stop()

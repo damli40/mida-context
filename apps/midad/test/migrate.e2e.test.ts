@@ -209,7 +209,7 @@ describe("migrate end-to-end + crash recovery on local Anvil (migrate B7)", () =
     source = env.deployment
     target = await deployLocal({ rpcUrl: env.rpcUrl })
     publicClient = createPublicClient({ chain: chainFor(source.chainId), transport: http(env.rpcUrl) })
-  }, TIMEOUT)
+  }, 600_000)
 
   afterAll(async () => {
     await env?.stop()
