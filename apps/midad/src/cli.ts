@@ -1960,6 +1960,9 @@ function terminalPromptOrAbandoned(question: string): Promise<string | undefined
       if (settled) return
       settled = true
       rl.close()
+      // an abandoned ask left the cursor on the question's own line — end it so the
+      // caller's "Nothing saved." line does not sit on the prompt line
+      if (answer === undefined) process.stdout.write("\n")
       resolve(answer)
     }
     rl.question(question, (answer) => finish(answer))

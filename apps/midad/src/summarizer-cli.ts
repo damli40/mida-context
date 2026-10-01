@@ -343,7 +343,7 @@ async function showSummarizer(deps: SummarizerCliDeps): Promise<number> {
     let failed = 0
     for (const record of drain) {
       if (record.at === undefined || Number.isNaN(record.at) || now - record.at > DAY_MS) continue
-      if (record.outcome === "saved") written++
+      if (record.outcome === "saved" && typeof record.model === "string") written++
       else if ((record.outcome === "failed" || record.outcome === "bad") && record.reason !== undefined && SUMMARIZER_FAIL_REASONS.has(record.reason)) {
         failed++
       }
@@ -355,11 +355,10 @@ async function showSummarizer(deps: SummarizerCliDeps): Promise<number> {
   // a reply with no summarizer field is a service started by an older version — it never
   // read this home's choice, so name that instead of comparing chains
   const serviceIsOlder =
-    healthReply !== undefined &&
-    (typeof healthReply !== "object" ||
-      healthReply === null ||
-      typeof (healthReply as Record<string, unknown>).summarizer !== "object" ||
-      (healthReply as Record<string, unknown>).summarizer === null)
+    typeof healthReply === "object" &&
+    healthReply !== null &&
+    (healthReply as Record<string, unknown>).ok === true &&
+    !("summarizer" in healthReply)
   if (serviceIsOlder) {
     print("Note: the running Mida service is an older version and does not read this choice. Run mida doctor to restart it.")
   }
@@ -467,6 +466,9 @@ export async function askSummarizerKey(deps: {
  * saved — people paste the URL their endpoint's docs print.
  */
 function endpointChecked(answer: string): { kind: "ok"; url: string } | { kind: "scheme" } | { kind: "extras" } {
+  // the typed text itself is checked: the URL parser drops a bare trailing ? or # and
+  // percent-encodes a space in the path, so url.search/url.hash alone would miss them
+  if (/\s/.test(answer) || answer.includes("?") || answer.includes("#")) return { kind: "extras" }
   let url: URL
   try {
     url = new URL(answer)
@@ -476,7 +478,8 @@ function endpointChecked(answer: string): { kind: "ok"; url: string } | { kind: 
   if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") return { kind: "extras" }
   const local = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]"
   if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) return { kind: "scheme" }
-  let cleaned = answer
+  // origin + pathname, not the raw text: the scheme and host come back lower-cased
+  let cleaned = url.origin + url.pathname
   while (cleaned.endsWith("/")) cleaned = cleaned.slice(0, -1)
   if (cleaned.endsWith("/chat/completions")) {
     cleaned = cleaned.slice(0, cleaned.length - "/chat/completions".length)
@@ -623,7 +626,7 @@ export async function runSummarizer(argv: string[], deps: SummarizerCliDeps): Pr
         print(`${entry.display} could not write it: its command is not installed.`)
         continue
       }
-      print(`Asking ${entry.display} for a test summary. This can take up to ${Math.round((entry.command.timeoutMs ?? 90_000) / 1000)} s.`)
+      print(`Asking ${entry.display} for a test summary. This can take up to ${Math.max(1, Math.round((entry.command.timeoutMs ?? 90_000) / 1000))} s.`)
       const r = await probe(entry.command)
       if (r.ok) {
         print(`Wrote one test summary with ${entry.display} in ${Math.max(1, Math.round(r.ms / 1000))} s.`)

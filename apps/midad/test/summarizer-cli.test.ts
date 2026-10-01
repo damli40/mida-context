@@ -141,6 +141,16 @@ describe("mida summarizer (show)", () => {
     expect(r.lines[1]).toBe("  1st  Claude Code (haiku)   ready, not used yet")
   })
 
+  it("a saved line with no writer field does not count as a written summary (UF-QB)", async () => {
+    const dir = home()
+    drainLine(dir, { at: "2026-10-01T11:30:00.000Z", outcome: "saved", model: "claude-haiku" })
+    drainLine(dir, { at: "2026-10-01T11:31:00.000Z", outcome: "saved" }) // a save no model wrote
+    drainLine(dir, { at: "2026-10-01T11:32:00.000Z", outcome: "saved", lane: "direct" }) // a lane tag is not a writer
+    const r = rig(dir, { onPath: () => true })
+    await r.run(["summarizer"])
+    expect(r.lines).toContain("Last 24 hours: 1 written, 0 failed tries")
+  })
+
   it("the last-24-hours count includes saved and summarizer failures, skips old and unparseable lines", async () => {
     const dir = home()
     drainLine(dir, { at: "2026-10-01T11:30:00.000Z", outcome: "saved", model: "claude-haiku" })
@@ -196,7 +206,7 @@ describe("mida summarizer (show)", () => {
     const dir = home()
     const older = rig(dir, {
       onPath: () => true,
-      health: async () => ({ version: "old", queue: { pending: 0 } }),
+      health: async () => ({ ok: true, version: "old", queue: { pending: 0 } }),
     })
     await older.run(["summarizer"])
     expect(older.lines).toContain(
@@ -207,6 +217,24 @@ describe("mida summarizer (show)", () => {
     const silent = rig(dir, { onPath: () => true, health: async () => undefined })
     await silent.run(["summarizer"])
     expect(silent.lines.every((line) => !line.startsWith("Note: the running Mida service"))).toBe(true)
+  })
+
+  // UF-QB2: the older-service note belongs to exactly one reply shape — { ok: true } with no
+  // summarizer field. Anything else (null, a string, an error object) is not evidence of an
+  // older service and earns no note.
+  it("the older-service note prints only for an ok reply with no summarizer field (UF-QB)", async () => {
+    for (const reply of [null, "x", { error: "not-found" }, { ok: false }, { summarizer: { chain: ["claude-haiku", "codex-luna"] } }]) {
+      const dir = home()
+      const r = rig(dir, { onPath: () => true, health: async () => reply })
+      await r.run(["summarizer"])
+      expect(r.lines.some((line) => line.startsWith("Note: the running Mida service is an older version")), JSON.stringify(reply)).toBe(false)
+    }
+    const dir = home()
+    const r = rig(dir, { onPath: () => true, health: async () => ({ ok: true }) })
+    await r.run(["summarizer"])
+    expect(r.lines).toContain(
+      "Note: the running Mida service is an older version and does not read this choice. Run mida doctor to restart it.",
+    )
   })
 
   it("the tail is an empty line and the change/check pointers", async () => {
@@ -473,6 +501,40 @@ describe("mida summarizer use", () => {
     expect(readSummarizer(dir)).toBeUndefined()
   })
 
+  // UF-QB2: URL parsing silently drops a bare trailing ? or # (search/hash come back empty)
+  // and percent-encodes a space in the path — so the typed text itself must be checked.
+  it("a bare trailing ?, a bare trailing # and a space inside the address are refused (UF-QB)", async () => {
+    const dir = home()
+    const r = rig(dir, {
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      answers: ["3", "https://h/v1?", "https://h/v1#", "https://h/v1 extra"],
+      secrets: [],
+    })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(1)
+    expect(r.lines.filter((line) => line === 'Use the base address only: no username, no "?" and no "#".')).toHaveLength(3)
+    expect(r.lines.at(-1)).toBe("Nothing saved.")
+    expect(readSummarizer(dir)).toBeUndefined()
+  })
+
+  it("the scheme and host are lower-cased before the address is saved (UF-QB)", async () => {
+    const dir = home()
+    const r = rig(dir, {
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      answers: ["3", "HTTPS://H.EXAMPLE/V1", "m-local"],
+      secrets: [""],
+    })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(0)
+    expect(readSummarizer(dir)).toEqual({
+      use: "key",
+      provider: "custom",
+      apiKey: "",
+      baseUrl: "https://h.example/V1",
+      model: "m-local",
+    })
+  })
+
   it("a trailing /chat/completions and trailing slashes are removed before the address is saved (UF-P2R)", async () => {
     const dir = home()
     const r = rig(dir, {
@@ -564,6 +626,18 @@ describe("mida summarizer test", () => {
     expect(await r.run(["summarizer", "test"])).toBe(1)
     expect(r.lines[0]).toBe("Asking Claude Code (haiku) for a test summary. This can take up to 90 s.")
     expect(r.lines[1]).toBe("Claude Code (haiku) could not write it: it gave no answer in 90 s.")
+  })
+
+  // UF-QB2: a sub-second timeout must still promise at least 1 s — Math.round turned 1 ms into 0.
+  // A saved key pins its timeout at 120 s, so the env-decided chain is the way to a 1 ms one.
+  it("a 1 ms timeout prints up to 1 s, not 0 (UF-QB)", async () => {
+    const dir = home()
+    const r = rig(dir, {
+      env: { MIDA_COMPILE_MODEL: "deepseek", DEEPSEEK_TIMEOUT_MS: "1" },
+      probe: async () => ({ ok: true, ms: 1 }),
+    })
+    expect(await r.run(["summarizer", "test"])).toBe(0)
+    expect(r.lines[0]).toBe("Asking DeepSeek (deepseek-flash) for a test summary. This can take up to 1 s.")
   })
 
   it("no entries at all prints the two nothing-can-write lines and returns 1", async () => {

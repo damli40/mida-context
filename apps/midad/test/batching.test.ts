@@ -1001,6 +1001,26 @@ describe("followPendingAnchors — the ledger's follow-up", () => {
         })
       }
 
+      // UF-QB2: the direct-lane saved line must carry the same writer field the batched
+      // lane's saved line earns from the kept plaintext (envelope.compiledBy) — a fallback
+      // save that loses it stops counting as a written summary.
+      it("the direct-lane saved line carries the model field from the kept plaintext (UF-QB)", async () => {
+        const store = await stubStore()
+        try {
+          const home = await homeWithStaleRejected(store)
+          keepPendingPlaintext(home, CONTEXT_ID, { value: { type: "mida-checkpoint", compiledBy: "codex-luna" }, kind: "EPISODE", source: "AGENT_INFERRED", tags: [] })
+          const { runtime } = directResubmitRuntime(store, home, { thrown: () => new MidaError("BATCHING_DISABLED" as never, "closed") })
+          const logged: Record<string, unknown>[] = []
+          const counts = await followPendingAnchors(runtime, (r) => logged.push(r))
+          expect(counts).toEqual({ anchored: 1, rejected: 0, waiting: 0 })
+          expect(logged).toEqual([
+            expect.objectContaining({ outcome: "saved", lane: "direct", contextId: DIRECT_ID, model: "codex-luna" }),
+          ])
+        } finally {
+          await store.close()
+        }
+      })
+
       it("a direct-lane resubmit that cannot get an answer waits — nothing final recorded", async () => {
         const store = await stubStore()
         try {

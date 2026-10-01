@@ -645,6 +645,13 @@ async function resubmitOnClosedLane(
   removePendingAnchor(home, entry.contextId)
   dropPendingPlaintext(home, entry.contextId)
   recordSavedId(home, entry.eventId, created.contextId)
+  // the kept plaintext names which model wrote the save — the batched lane's saved line
+  // carries it as `model` (envelope.compiledBy); the direct fallback must carry it too
+  const keptValue = (input as Record<string, unknown>).value
+  const writer =
+    typeof keptValue === "object" && keptValue !== null
+      ? (keptValue as Record<string, unknown>).compiledBy
+      : undefined
   log({
     sessionId: entry.sessionId,
     agent: entry.agent,
@@ -655,6 +662,7 @@ async function resubmitOnClosedLane(
     previousContextId: entry.contextId,
     transactionHash: created.transactionHash ?? null,
     reason: `batch-rejected:${reason}`,
+    ...(typeof writer === "string" ? { model: writer } : {}),
   })
   return "landed"
 }
