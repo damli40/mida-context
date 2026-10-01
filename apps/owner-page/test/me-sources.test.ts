@@ -563,6 +563,19 @@ describe("loadMe — a failed listing is not an empty store", () => {
     const data = await loadMe(OWNER, ports)
     expect(data.recordsUnavailable).toBe(false)
     expect(data.records.length).toBe(1)
+    // the missing lane is named — that banner is what hides the page's figures
+    expect(data.incomplete.some((t) => t.includes("could not list batched saves"))).toBe(true)
+    expect(data.degraded).toBe(true)
+  })
+
+  it("a deny list the store could not return is named — a blocked save may read as waiting", async () => {
+    const { state, ports } = world()
+    state.deniesError = new Error("store down")
+    const data = await loadMe(OWNER, ports)
+    expect(data.incomplete).toContain(
+      "the store's pending-revocation list could not be read — a blocked save may read as waiting",
+    )
+    expect(data.degraded).toBe(true)
   })
 })
 

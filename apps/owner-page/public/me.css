@@ -54,7 +54,6 @@
 .tile { border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px; background: var(--bg); }
 .tile .n { font-size: 2rem; line-height: 1; letter-spacing: -.03em; color: var(--fg); margin: 0 0 8px; font-variant-numeric: tabular-nums; }
 .tile-lead { grid-column: 1 / -1; }
-@media (min-width: 900px) { .tile-lead { grid-column: auto; } }
 .tile-lead .n { font-size: 1.125rem; letter-spacing: -.01em; line-height: 1.4; }
 
 /* Sections */
