@@ -820,7 +820,10 @@ export async function buildHandoff(
     for (const stored of outcome.checkpoints) {
       if (stored.migration !== undefined) movedOn.set(stored.contextId, stored.migration)
     }
-    const assemble = (reasons: "keep" | "drop") => {
+    // `rest` is the characters the final text carries besides the merged render — the marked
+    // blocks plus the joins, and a partial read's PARTIAL_LINE the same way (UF-H).
+    const rest = (markedText === "" ? 0 : markedText.length + 2) + (outcome.partial ? PARTIAL_LINE.length + 2 : 0)
+    const assemble = (reasons: "keep" | "drop", budget: number, forceOversizeNote = false) => {
       const rendered = renderHandoffReport(
         {
           ...merged,
@@ -838,16 +841,11 @@ export async function buildHandoff(
           otherTasks,
           now,
           reasons,
+          ...(forceOversizeNote ? { forceOversizeNote: true } : {}),
           // CAP-26 review: the marked blocks sit outside this fit, so the merge gets what they leave of
           // the 8,000-char handoff (Claude Code moves injected context over 10,000 chars to a file; the
           // MCP tool's reply cap is 40,000) — dropping its oldest progress first, never the blocks' markers.
-          // UF-H: a partial read's PARTIAL_LINE + blank line join the text after this fit, so their
-          // length comes out of the same budget — the two reductions add when both apply.
-          ...(() => {
-            const overhead =
-              (markedText === "" ? 0 : markedText.length + 2) + (outcome.partial ? PARTIAL_LINE.length + 2 : 0)
-            return overhead === 0 ? {} : { maxChars: Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - overhead) }
-          })(),
+          ...(rest === 0 && !forceOversizeNote ? {} : { maxChars: budget }),
         },
       )
       const text = (() => {
@@ -862,18 +860,27 @@ export async function buildHandoff(
       })()
       return { rendered, finalText: outcome.partial ? `${PARTIAL_LINE}\n\n${text}` : text }
     }
-    // UF-N: whether reasons are left out is decided against the FINAL text the model receives —
-    // marked blocks and the partial line included — not against the merge's reduced budget.
-    // Render the text with every reason; when it does not fit, render it without reasons and
-    // take that ONLY when the delivered text fits. Otherwise keep every reason — dropping them
-    // would say "to fit" in a text that does not fit.
-    const withReasons = assemble("keep")
+    // UF-N2, the owner's order: to make the delivered text fit its 8,000 target, history goes
+    // first — progress, the saved-by lines, file lists — and only then the reasons behind
+    // decisions and rejected approaches; a constraint, decision or rejected approach is never
+    // left out. Below the floor a render stays whole, so the retry drops the floor and hands the
+    // merge only what is actually left once the untrimmable marked blocks are counted — that is
+    // where the oldest progress goes (the floor render's no-trim answer was hiding it). Reasons
+    // leave the data only when even a fully-trimmed history cannot fit; and when nothing fits
+    // the first render goes out whole with the over-target note forced on, because a delivered
+    // text over 8,000 must always say so. Each reported flag describes the chosen text.
+    const flooredBudget = Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - rest)
+    const first = assemble("keep", flooredBudget)
     const chosen =
-      withReasons.finalText.length <= HANDOFF_MAX_CHARS
-        ? withReasons
+      first.finalText.length <= HANDOFF_MAX_CHARS
+        ? first
         : (() => {
-            const withoutReasons = assemble("drop")
-            return withoutReasons.finalText.length <= HANDOFF_MAX_CHARS ? withoutReasons : withReasons
+            const leftover = Math.max(0, HANDOFF_MAX_CHARS - rest)
+            const trimmed = assemble("keep", leftover)
+            if (trimmed.finalText.length <= HANDOFF_MAX_CHARS) return trimmed
+            const dropped = assemble("drop", leftover)
+            if (dropped.finalText.length <= HANDOFF_MAX_CHARS) return dropped
+            return assemble("keep", flooredBudget, true)
           })()
     const { rendered, finalText } = chosen
     return {

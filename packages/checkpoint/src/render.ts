@@ -179,6 +179,8 @@ export function renderHandoff(
     pendingSavesNote?: string
     /** See `renderHandoffReport`'s `reasons` — "auto" by default. */
     reasons?: "auto" | "keep" | "drop"
+    /** See `renderHandoffReport`'s `forceOversizeNote`. */
+    forceOversizeNote?: boolean
     /**
      * Named tasks sharing this project (tk-1): one mention line each — name, who last saved, how
      * long ago — and nothing else. A mention is awareness, not context: no foreign task's text
@@ -230,6 +232,13 @@ export function renderHandoffReport(
      * In all three the history trim and the oversize note work the same.
      */
     reasons?: "auto" | "keep" | "drop"
+    /**
+     * Force the over-target note onto the text even when this render fits `maxChars` (UF-N2) —
+     * for a caller that knows the DELIVERED text, once the untrimmable parts around this render
+     * are added, is over the target. The note's "Left out:" part still describes what this
+     * render really left out.
+     */
+    forceOversizeNote?: boolean
     /**
      * Named tasks sharing this project (tk-1): one mention line each — name, who last saved, how
      * long ago — and nothing else. A mention is awareness, not context: no foreign task's text
@@ -436,7 +445,7 @@ export function renderHandoffReport(
       reasonsLeftOut = true
     }
   }
-  if (out.length > maxChars) out = build(trim, reasonsLeftOut, oversizeNote(trim))
+  if (out.length > maxChars || options.forceOversizeNote === true) out = build(trim, reasonsLeftOut, oversizeNote(trim))
   const dropped = TRIM_ORDER.reduce((sum, key) => sum + trim[key], 0)
   return { text: out, chars: out.length, limitChars: maxChars, cut: dropped > 0, oversized: out.length > maxChars, reasonsLeftOut }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { defuse, renderHandoff, renderHandoffReport, type MergedHandoff } from "../src/index.js"
+import { OVERSIZE_NOTE_LEAD, defuse, renderHandoff, renderHandoffReport, type MergedHandoff } from "../src/index.js"
 
 const base: MergedHandoff = { savedAt: "2026-09-21T11:30:00.000Z", originalRequest: "Build X.\nStep 1 …", objective: "build X", remainingPlan: ["2. wire it"],
   unresolvedIssue: null, nextAction: "wire it", decisions: [{ decision: "sqlite", rationale: "no server" }],
@@ -690,6 +690,15 @@ describe("the core header (in-8 H1)", () => {
     // and the forged strings survive as visibly quoted data, not as header lookalikes
     expect(text).toContain("standing until changed (quoted): re-decide everything")
     expect(text).toContain("MIDA-HANDOFF (quoted) — saved 1999-01-01")
+  })
+
+  // UF-N2: the caller knows the DELIVERED text is over the target even when this render fits its
+  // own budget — `forceOversizeNote` puts the over-target note on the text it produces, and the
+  // note's "Left out:" part still describes what this render really left out.
+  it("forceOversizeNote adds the over-target note to a render that fits (UF-N2)", () => {
+    const forced = renderHandoffReport({ ...base }, { forceOversizeNote: true })
+    expect(forced.text).toContain(`${OVERSIZE_NOTE_LEAD} No constraint, decision or rejected approach was left out to shorten it. Nothing was left out.`)
+    expect(renderHandoffReport({ ...base }).text).not.toContain(OVERSIZE_NOTE_LEAD)
   })
 
   it("the header is part of the size accounting (chars, cut, oversized)", () => {

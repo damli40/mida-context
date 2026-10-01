@@ -676,17 +676,19 @@ describe("buildHandoff", () => {
     expect(result.text.length).toBeLessThanOrEqual(8_000)
   })
 
-  it("oversized is judged on the FINAL text — marked blocks and the partial line included (UF-H)", async () => {
-    // the pending block is untrimmable and huge: the merge fits its floor budget, so the old
-    // rendered.oversized stayed false while the delivered text sailed past 8,000
+  it("oversized is judged on the FINAL text — marked blocks and the partial line included (UF-H, UF-N2)", async () => {
+    // the pending block is untrimmable and huge. UF-N2's owner's order now leaves out old
+    // progress to pay for it — the merge re-renders at the leftover no-floor budget and the
+    // delivered text FITS, so oversized is false; the flag still answers for the final text
     const progress = Array.from({ length: 400 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
     const pending = { ...stored({ nextAction: "a".repeat(5_000) }), anchor: "PENDING_ANCHOR" as const }
     const { d } = deps({ read: async () => ({ checkpoints: [stored({ progress }), pending], skipped: 0, milliseconds: 1, partial: true }) })
     const result = await buildHandoff(runtime, input, d)
-    expect(result).toMatchObject({ kind: "handoff", partial: true, oversized: true })
+    expect(result).toMatchObject({ kind: "handoff", partial: true, cut: true, oversized: false })
     if (result.kind !== "handoff") return
-    expect(result.text.length).toBeGreaterThan(8_000)
+    expect(result.text.length).toBeLessThanOrEqual(8_000)
     expect(result.text.startsWith(PARTIAL_LINE)).toBe(true)
+    expect(result.text).toContain("PENDING_ANCHOR")
   })
 
   // UF-N: whether decision/rejected-approach reasons are left out is decided against the FINAL
@@ -730,6 +732,72 @@ describe("buildHandoff", () => {
     expect(result.reasonsLeftOut).toBe(true)
     expect(result.oversized).toBe(false)
     expect(result.text.length).toBeLessThanOrEqual(8_000)
+  })
+
+  // UF-N2: the owner's order — history (progress, saved-by lines, file lists) is left out BEFORE
+  // the reasons behind decisions. The marked blocks are untrimmable, so the merge is rendered
+  // once more against the leftover budget with NO floor: old progress lines go first, and a
+  // constraint, decision or rejected approach is never left out.
+  it("history is left out before reasons — trimming old progress keeps every reason (UF-N2)", async () => {
+    // the reviewed shape: 10 decisions with reasons, 30 progress entries, and an unbudgeted
+    // pending block (~5,100 chars) big enough that the merge's no-floor budget is ~2,900. The
+    // floor render kept everything and overflowed; the retry leaves out old progress instead
+    // of the reasons.
+    const merged = stored({
+      decisions: Array.from({ length: 10 }, (_, i) => ({ decision: `merged decision ${i} ${"d".repeat(30)}`, rationale: `rationale ${i} ${"r".repeat(100)}` })),
+      progress: Array.from({ length: 30 }, (_, i) => `progress entry number ${i} ${"p".repeat(50)}`),
+    })
+    const pending = { ...stored({ nextAction: "x".repeat(3_500) }, { contextId: `0x${"9".repeat(64)}` }), anchor: "PENDING_ANCHOR" as const }
+    const { d } = deps({ read: async () => ({ checkpoints: [merged, pending], skipped: 0, milliseconds: 1, partial: false }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text.length).toBeLessThanOrEqual(8_000)
+    expect(result.reasonsLeftOut).toBe(false)
+    expect(result.text).not.toContain("(reasons left out to fit)")
+    expect(result.text.match(/ — because: /g) ?? []).toHaveLength(10)
+    // history, not reasons, paid for the fit — and the text says so
+    const shownProgress = (result.text.match(/- progress entry number /g) ?? []).length
+    expect(shownProgress).toBeLessThan(30)
+    expect(result.text).toMatch(/\(\d+ earlier progress entr(y|ies) left out\)/)
+    expect(result.oversized).toBe(false)
+    expect(result.cut).toBe(true)
+  })
+
+  it("reasons go only when leaving history out entirely still cannot fit (UF-N2)", async () => {
+    // even with every progress line left out, the reasons alone put the merge over the
+    // leftover budget — only dropping them fits the delivered text
+    const merged = stored({
+      decisions: Array.from({ length: 20 }, (_, i) => ({ decision: `merged decision ${i} ${"d".repeat(100)}`, rationale: `rationale ${i} ${"r".repeat(200)}` })),
+      progress: Array.from({ length: 5 }, (_, i) => `progress ${i}`),
+    })
+    const pending = { ...stored({ nextAction: "x".repeat(3_500) }, { contextId: `0x${"9".repeat(64)}` }), anchor: "PENDING_ANCHOR" as const }
+    const { d } = deps({ read: async () => ({ checkpoints: [merged, pending], skipped: 0, milliseconds: 1, partial: false }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("Decisions (reasons left out to fit):")
+    expect(result.reasonsLeftOut).toBe(true)
+    expect(result.oversized).toBe(false)
+    expect(result.text.length).toBeLessThanOrEqual(8_000)
+    // the chosen (reasons-dropped) render needed no trim — `cut` describes it, not the
+    // history-trimmed render that was tried first
+    expect(result.cut).toBe(false)
+  })
+
+  it("a delivered text over 8,000 always carries the over-target note (UF-N2)", async () => {
+    // the merged record is small, the pending block untrimmable at 9,500 chars — nothing can
+    // fit it under 8,000, so the text goes out whole and must say so at the top
+    const pending = { ...stored({ nextAction: "x".repeat(9_500) }, { contextId: `0x${"9".repeat(64)}` }), anchor: "PENDING_ANCHOR" as const }
+    const { d } = deps({ read: async () => ({ checkpoints: [stored(), pending], skipped: 0, milliseconds: 1, partial: false }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text.length).toBeGreaterThan(8_000)
+    expect(result.oversized).toBe(true)
+    expect(result.text).toContain("Mida note: this handoff is longer than its size target.")
+    expect(result.cut).toBe(false)
+    expect(result.reasonsLeftOut).toBe(false)
   })
 
   it("a partial read with no usable checkpoints says the list may be incomplete — never 'nothing saved'", async () => {
