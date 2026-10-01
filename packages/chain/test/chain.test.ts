@@ -450,13 +450,27 @@ describe("owner history (§14.6 PREVIOUSLY_REVOKED — contract state, never a l
     }
   })
 
-  it("a cursor ahead of the head is impossible — ignored whole, saved yes included, and overwritten (R5-7)", async () => {
+  it("a cursor ahead of the head is impossible — its block is not trusted, but a saved yes is never erased (R5-7)", async () => {
     const { client } = historyClient({ ids: [CAP_A], capability: () => ({ owner: OWNER, agentId: AGENT, revoked: false }) })
-    const { cursor, writes } = memoryCursor({ observedThroughBlock: 500n, previouslyRevoked: true })
-    const history = await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, cursor })
-    // the file's claimed revoke came from a wrong chain, a redeploy or tampering — never trusted
+    // a saved NO from ahead of the head has no effect — the contract's own reads answer
+    const noCursor = memoryCursor({ observedThroughBlock: 500n, previouslyRevoked: false })
+    const history = await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, cursor: noCursor.cursor })
     expect(history).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: false, observedThroughBlock: 20n })
-    expect(writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: false }])
+    expect(noCursor.writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: false }])
+    // a saved YES from ahead of the head still answers — nothing on the chain un-revokes, and a
+    // lagging answer must not erase the one record of a compacted-away revoke
+    const yesCursor = memoryCursor({ observedThroughBlock: 500n, previouslyRevoked: true })
+    const kept = await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, cursor: yesCursor.cursor })
+    expect(kept).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: true, observedThroughBlock: 20n })
+    expect(yesCursor.writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: true }])
+  })
+
+  it("a cursor exactly AT the head is used — a saved yes there answers true", async () => {
+    const { client } = historyClient({ ids: [CAP_A], capability: () => ({ owner: OWNER, agentId: AGENT, revoked: false }) })
+    const { cursor, writes } = memoryCursor({ observedThroughBlock: 20n, previouslyRevoked: true })
+    const history = await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, cursor })
+    expect(history).toMatchObject({ previouslyRevoked: true, observedThroughBlock: 20n })
+    expect(writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: true }])
   })
 
   it("the contract's answer wins over a saved no — a revoked record beats a cursor that says false", async () => {

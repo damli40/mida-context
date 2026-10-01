@@ -35,6 +35,9 @@ export interface HistoryScanCursor {
  * seen from a machine that never recorded the yes. In the shipped commands only `mida migrate`
  * revokes a single capability; `mida revoke` revokes the whole agent. A failed read throws; it
  * never defaults to "not revoked". Never consults reputation or access telemetry.
+ * A second limit: a capability revoked after it had expired and been compacted away is never seen;
+ * no shipped command does that. After mida migrate, an agent whose replay-only capability was
+ * revoked reads as revoked on the machine that ran it, until the next grant compacts the list.
  */
 export async function ownerHistory(input: {
   client: HistoryClient
@@ -104,11 +107,14 @@ export async function ownerHistory(input: {
   }
   // The third source is this machine's memory of an earlier yes — nothing un-revokes, so a saved
   // yes keeps answering even after the grant that compacted the revoked id away. A cursor ahead
-  // of the head is impossible for an honest file — wrong chain, a redeploy or tampering — and is
-  // ignored whole, saved yes included (R5-7).
-  let cursor = await input.cursor?.load()
-  if (cursor !== undefined && cursor.observedThroughBlock > toBlock) cursor = undefined
-  if (cursor?.previouslyRevoked === true) return answer(true)
+  // of the head is impossible for an honest file — wrong chain, a redeploy or tampering — so its
+  // block number is not trusted; but a remembered yes is never discarded, because no lagging or
+  // ahead-of-head chain answer can un-revoke (R5-7).
+  const cursor = await input.cursor?.load()
+  if (cursor?.previouslyRevoked === true) {
+    await input.cursor?.save({ observedThroughBlock: toBlock, previouslyRevoked: true })
+    return answer(true)
+  }
   await input.cursor?.save({ observedThroughBlock: toBlock, previouslyRevoked: false })
   return answer(false)
 }
