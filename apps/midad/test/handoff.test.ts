@@ -14,7 +14,8 @@ import { MidaAgent } from "@mida/sdk"
 import { ChainBusyError } from "@mida/chain"
 import { CHAIN_BUSY_TEXT, STORE_CHAIN_MISCONFIGURED_TEXT, STORE_RPC_AUTH_TEXT, MidaHome, NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
 import type { HandoffDeps, MigrationEnvelope, ProjectCheck, Runtime } from "@mida/midad"
-import { PARTIAL_LINE, checkAccess } from "../src/handoff.js"
+import { PARTIAL_LINE, checkAccess, mergeQueued } from "../src/handoff.js"
+import type { QueuedSaves } from "../src/handoff.js"
 import { addPendingAnchor, keepPendingPlaintext } from "../src/batching.js"
 import { enqueue } from "../src/queue.js"
 import { markUnsent } from "../src/unsent.js"
@@ -1376,6 +1377,21 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     if (second.kind !== "handoff") return
     expect(second.text).toContain("(waiting for the gas sponsor's daily limit to reset at 00:00 UTC)")
     expect(second.text).not.toContain("the model that writes Mida's summaries")
+  })
+
+  // UF-QC: mergeQueued must apply the SAME fixed order whichever snapshot carries which wait —
+  // a plain a ?? b would let the second-read order leak through
+  it("mergeQueued picks sponsor-limit over summarizer-limit in either operand order (UF-QC)", () => {
+    const snap = (waitingOn: QueuedSaves["waitingOn"]): QueuedSaves => ({
+      perAgent: new Map([["claude-code", new Set(["s1"])]]),
+      newestChange: new Map([["s1", 1]]),
+      lastTryFailed: false,
+      otherFailures: false,
+      waitingOn,
+      stuck: 0,
+    })
+    expect(mergeQueued(snap("sponsor-limit"), snap("summarizer-limit"))?.waitingOn).toBe("sponsor-limit")
+    expect(mergeQueued(snap("summarizer-limit"), snap("sponsor-limit"))?.waitingOn).toBe("sponsor-limit")
   })
 
   it("an ordinary failed try still gets the retry clause", async () => {

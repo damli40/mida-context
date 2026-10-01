@@ -2411,4 +2411,23 @@ describe("a save that found no summary model waits, not fails (UF-P3)", () => {
     expect(state?.attempts).toBe(1)
     expect(state?.reason).toBe("chain-error")
   })
+
+  // UF-QC: a state file that names a wait reason but carries no failedAt records no failure,
+  // so nothing is being waited out — the job owes only its save gap, not a failure deadline
+  it("a wait reason without failedAt is no wait — the job is tried at once (UF-QC)", async () => {
+    const { home, job, drain, compileCalls, saveCalls } = setup()
+    job({ event: "PostToolUse" }) // not a flush, so only a real wait could delay it
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: new Date(T0).toISOString(),
+      reason: "summarizer-limit",
+    })
+    // the gap from savedAt is the only honest wait — one minute, not a failure deadline
+    expect(sessionWaits(home, listJobs(home))[0]?.dueAtMs).toBe(T0 + 60_000)
+    const counts = await drain({ now: () => new Date(T0 + 120_000) })
+    expect(compileCalls).toHaveLength(1)
+    expect(counts.saved).toBe(1)
+    expect(saveCalls).toHaveLength(1)
+  })
 })

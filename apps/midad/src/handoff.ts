@@ -229,7 +229,7 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
 }
 
 /** Two queue snapshots as one: every session either saw, its newest change, any failed try. */
-function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): QueuedSaves | null {
+export function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): QueuedSaves | null {
   if (a === null) return b
   if (b === null) return a
   const perAgent = new Map<string, Set<string>>()
