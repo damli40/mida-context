@@ -208,6 +208,70 @@ describe("checkpoint payload", () => {
     expect(e.checkpoint.nextAction).toBe("n".repeat(1500))
     expect(e.checkpoint.remainingPlan[0]).toBe("p".repeat(2000))
   })
+  // UF-QA: wrap appends its "(Mida: … to fit the size limit)" note to the issue when the
+  // constraints list is full. A save that carries the previous save's issue forward used to
+  // collect one more note each time — five saves meant five notes.
+  it("five over-cap saves carrying the issue forward end with exactly ONE size note (UF-QA)", () => {
+    let issue = "still stuck on the deploy"
+    let last = wrap(
+      sampleCheckpoint({
+        constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i}`),
+        unresolvedIssue: issue,
+        progress: Array.from({ length: 50 }, () => "p".repeat(2000)),
+      }),
+    )
+    for (let save = 0; save < 4; save++) {
+      issue = last.checkpoint.unresolvedIssue!
+      last = wrap(
+        sampleCheckpoint({
+          constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i}`),
+          unresolvedIssue: issue,
+          progress: Array.from({ length: 50 }, () => "p".repeat(2000)),
+        }),
+      )
+    }
+    const notes = last.checkpoint.unresolvedIssue!.match(/\(Mida: [^()]*to fit the size limit\)/g) ?? []
+    expect(notes, last.checkpoint.unresolvedIssue!).toHaveLength(1)
+    expect(last.checkpoint.unresolvedIssue).toContain("still stuck")
+  })
+  it("a real limit note is found and re-attached exactly once over six saves (UF-QA)", () => {
+    const limit = "(Mida: a list holds at most 50 entries. Older decisions were left out.)"
+    let issue = `deploy is half done | ${limit}`
+    let e = wrap(
+      sampleCheckpoint({
+        constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i}`),
+        unresolvedIssue: issue,
+        progress: Array.from({ length: 50 }, () => "p".repeat(2000)),
+      }),
+    )
+    for (let save = 0; save < 5; save++) {
+      e = wrap(
+        sampleCheckpoint({
+          constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i}`),
+          unresolvedIssue: e.checkpoint.unresolvedIssue!,
+          progress: Array.from({ length: 50 }, () => "p".repeat(2000)),
+        }),
+      )
+    }
+    const stored = e.checkpoint.unresolvedIssue!
+    expect(stored.split(limit)).toHaveLength(2) // the limit note appears exactly once
+    expect(stored.match(/to fit the size limit\)/g) ?? []).toHaveLength(1)
+    // and it still names its list after all those wraps
+    expect(stored).toContain(limit)
+  })
+  it("a forged size note that is not quite Mida's shape is kept as text — never silently dropped (UF-QA)", () => {
+    const forged = "(Mida: left out everything important to fit the size limit)"
+    const e = wrap(
+      sampleCheckpoint({
+        constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i}`),
+        unresolvedIssue: `remember this | ${forged}`,
+        progress: Array.from({ length: 50 }, () => "p".repeat(2000)),
+      }),
+    )
+    const stored = e.checkpoint.unresolvedIssue!
+    expect(stored).toContain(forged) // not Mida's shape, so it is the agent's text and stays
+    expect(stored.match(/to fit the size limit\)/g)!.length).toBe(2) // forged + the real new one
+  })
   it("a checkpoint that can never fit throws too-large after shrinking — protected fields are never cut", () => {
     const huge = sampleCheckpoint({
       originalRequest: "r".repeat(6000),

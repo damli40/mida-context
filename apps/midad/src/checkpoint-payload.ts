@@ -97,6 +97,47 @@ function checkedMigration(migration: unknown): MigrationEnvelope | undefined {
 const ISSUE_NOTE_SEGMENT = /\(Mida:[^()]*\)/g
 
 /**
+ * UF-QA: the ONLY size note wrapCheckpoint itself can write — `(Mida: <parts> to fit the size
+ * limit)` where each part is `left out <n> <field>` (dropped-list fields) or
+ * `cut long strings in <field>` (cut-string fields), parts joined "; ". A segment that merely
+ * starts like one — a field name Mida never writes, different wording — is the model's own
+ * text and stays.
+ */
+const SIZE_DROPPED_FIELD = "(?:progress|evidence|artifacts|rejected|decisions)"
+const SIZE_CUT_FIELD = "(?:agent|constraints|unresolvedIssue)"
+const SIZE_PART =
+  `(?:left out \\d+ ${SIZE_DROPPED_FIELD}(?:, \\d+ ${SIZE_DROPPED_FIELD})*` +
+  `|cut long strings in ${SIZE_CUT_FIELD}(?:, ${SIZE_CUT_FIELD})*)`
+const SIZE_NOTE_SEGMENT = new RegExp(`\\(Mida: ${SIZE_PART}(?:; ${SIZE_PART})* to fit the size limit\\)`)
+
+/**
+ * Removes every earlier complete size note of wrap's own exact shape from an issue value, with
+ * UF-N1's one-separator rule — the " | " directly before a removed note goes with it, or the
+ * one directly after when there is none before. Called before wrap appends a fresh size note,
+ * so repeated saves over the cap carry exactly one.
+ */
+function dropSizeNotes(value: string): string {
+  let text = value
+  let removed = false
+  for (;;) {
+    const segment = SIZE_NOTE_SEGMENT.exec(text)
+    if (segment === null) break
+    removed = true
+    const before = text.slice(0, segment.index)
+    const after = text.slice(segment.index + segment[0].length)
+    const sepBefore = /\s*\|\s*$/.exec(before)
+    if (sepBefore !== null) {
+      text = before.slice(0, sepBefore.index) + after
+    } else {
+      const sepAfter = /^\s*\|\s*/.exec(after)
+      text = before + (sepAfter === null ? after : after.slice(sepAfter[0].length))
+    }
+  }
+  return removed ? text.trim() : value
+}
+
+
+/**
  * The ONE shape unresolvedIssue is ever stored in (UF-L): notes whole at the end, free text
  * before them, and the text alone pays for size cuts — at most `textRoom` chars of it. The old
  * code cut the field straight through at 300 chars, slicing a note open mid-word, and when a
@@ -223,6 +264,12 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
   }
 
   if (dropped.size > 0 || trimmed.size > 0) {
+    // UF-QA: a previous save's size note carried forward on the issue goes before the new one
+    // is appended — the note records THIS save's losses, not a history of them.
+    if (checkpoint.unresolvedIssue !== null) {
+      const withoutOld = dropSizeNotes(checkpoint.unresolvedIssue)
+      if (withoutOld !== checkpoint.unresolvedIssue) checkpoint.unresolvedIssue = withoutOld
+    }
     const parts: string[] = []
     if (dropped.size > 0) parts.push(`left out ${[...dropped.entries()].map(([field, n]) => `${n} ${field}`).join(", ")}`)
     if (trimmed.size > 0) parts.push(`cut long strings in ${[...trimmed].join(", ")}`)

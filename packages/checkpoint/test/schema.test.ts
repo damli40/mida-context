@@ -88,12 +88,14 @@ describe("limitNote and splitLimitNote (UF-L)", () => {
     expect(s.text).toBe("a | b")
     expect(s.lists.size).toBe(0)
   })
-  it("a note nested inside another note leaves no (Mida: behind", () => {
+  it("a note nested inside an unclosed opener: the INNER exact note is still a note, the residue is text (UF-QA)", () => {
     const s = splitLimitNote(
       "i | (Mida: a list holds at most (Mida: a list holds at most 50 entries. Older decisions were left out.)",
     )
-    expect(s.text).toBe("i")
-    expect(s.text).not.toContain("(Mida:")
+    // the inner segment is byte-for-byte a real note — removed; the leftover opener is not a
+    // complete note, so it stays as the text it is
+    expect(s.text).toBe("i | (Mida: a list holds at most")
+    expect([...s.lists]).toEqual(["decisions"])
   })
   it("a note cut off mid-way at the end of the string is TEXT, not a note — only a complete segment is ever removed (UF-N2)", () => {
     const s = splitLimitNote("the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Older dec")
@@ -113,9 +115,10 @@ describe("limitNote and splitLimitNote (UF-L)", () => {
     expect(s.text).toBe(value)
     expect(s.lists.size).toBe(0)
   })
-  it("the old numbered wording leaves the text but names no list", () => {
-    const s = splitLimitNote("x | (Mida: a list holds at most 50 entries. Left out: the 3 oldest decisions.)")
-    expect(s.text).toBe("x")
+  it("the old numbered wording is not an exact note — it stays as text and names no list (UF-QA)", () => {
+    const value = "x | (Mida: a list holds at most 50 entries. Left out: the 3 oldest decisions.)"
+    const s = splitLimitNote(value)
+    expect(s.text).toBe(value)
     expect(s.lists.size).toBe(0)
   })
   it("a value with no limit note comes back byte-for-byte — its own pipes are text (UF-N)", () => {
@@ -125,6 +128,29 @@ describe("limitNote and splitLimitNote (UF-L)", () => {
       expect(s.text).toBe(value)
       expect(s.lists.size).toBe(0)
     }
+  })
+  // UF-QA: only a segment that is byte-for-byte a note limitNote can write is ever removed —
+  // text that merely opens like one is ordinary text, even when a ")" shows up later.
+  it("a look-alike segment with a later ')' is ordinary text — only an exact note is removed (UF-QA)", () => {
+    const value = "x (Mida: a list holds at most 50 entries. Older stuff and then (see docs) the important text"
+    const s = splitLimitNote(value)
+    expect(s.text).toBe(value)
+    expect(s.lists.size).toBe(0)
+    // and the same for a wrong cap or a list name Mida never writes
+    for (const fake of [
+      "y | (Mida: a list holds at most 9 entries. Older decisions were left out.)",
+      "z | (Mida: a list holds at most 50 entries. Older stuff were left out.)",
+      "w | (Mida: a list holds at most 50 entries. Older decisions are left out.)",
+    ]) {
+      const r = splitLimitNote(fake)
+      expect(r.text, fake).toBe(fake)
+      expect(r.lists.size, fake).toBe(0)
+    }
+    // while a real note still comes out whole
+    const real = limitNote(new Set(["constraints", "decisions"]))!
+    const kept = splitLimitNote(`issue | ${real}`)
+    expect(kept.text).toBe("issue")
+    expect([...kept.lists]).toEqual(["constraints", "decisions"])
   })
   it("removing a note takes only the one separator that touched it (UF-N)", () => {
     const note = limitNote(new Set(["decisions"]))!

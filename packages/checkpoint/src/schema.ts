@@ -52,11 +52,19 @@ export function limitNote(lists: ReadonlySet<LimitList>): string | null {
   return `(Mida: a list holds at most ${LIMITS.maxArray} entries. Older ${names} were left out.)`
 }
 
-// A "(Mida: a list holds at most" segment runs to the next ")" — and ONLY there (UF-N2): text
-// that merely starts like a note, with no closing bracket, is returned unchanged, important
-// tail text and all. The first ")" ends the segment, so a note nested inside another dies with
-// its parent.
-const LIMIT_NOTE_SEGMENT = /\(Mida: a list holds at most[^)]*\)/
+// UF-QA: a segment is a limit note only when it is EXACTLY one limitNote can write — the real
+// cap and list names joined Mida's way, nothing else. Every string limitNote returns for the
+// seven non-empty subsets of the three lists is enumerated here, so text that merely starts
+// like a note — a wrong cap, a name Mida never writes, "are" for "were" — is ordinary text and
+// is returned unchanged, even when a ")" shows up later.
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+const LIMIT_NOTE_STRINGS: string[] = []
+for (let mask = 1; mask < 1 << LIMIT_LIST_ORDER.length; mask++) {
+  const subset = new Set(LIMIT_LIST_ORDER.filter((_, i) => (mask & (1 << i)) !== 0))
+  const note = limitNote(subset)
+  if (note !== null) LIMIT_NOTE_STRINGS.push(note)
+}
+const LIMIT_NOTE_SEGMENT = new RegExp(LIMIT_NOTE_STRINGS.map(escapeRe).join("|"))
 
 // A well-formed note of the current wording, anywhere in the value — the whole match is the
 // note, group 1 its list names. Only an exact limitNote output earns its lists back.
