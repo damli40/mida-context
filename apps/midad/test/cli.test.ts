@@ -67,6 +67,14 @@ describe("the crude mida command", () => {
     expect(lines).toContain(
       "Mida: claude-code's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
     )
+    // UF-M2.2: a fresh request after that revoke — the approve preview must print the advisor's
+    // previously-revoked warning line, read from the real contracts, not a fake
+    lines.length = 0
+    expect(await run("request", "claude-code")).toBe(0)
+    expect(await run("approve", "claude-code")).toBe(0)
+    expect(lines.some((line) => line.includes("advisor.previously_revoked"))).toBe(true)
+    // restore the end state the later tests start from: claude-code revoked
+    expect(await run("revoke", "claude-code")).toBe(0)
   }, 300_000)
 
   it("request on an already-approved agent is guidance, not a failure — exit 0 (in-15 J-5)", async () => {

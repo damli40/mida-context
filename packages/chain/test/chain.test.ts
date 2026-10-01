@@ -1,9 +1,11 @@
-import { describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { encodeErrorResult, getAbiItem } from "viem"
 import type { AbiEvent } from "viem"
-import { isMidaError, namespaceId } from "@mida/protocol"
+import { privateKeyToAccount } from "viem/accounts"
+import { PERMISSION, isMidaError, namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import {
+  ANVIL_PRIVATE_KEYS,
   LOG_SCAN_CONCURRENCY,
   MAX_LOG_BLOCK_RANGE,
   REVERT_CODES,
@@ -12,12 +14,18 @@ import {
   capabilityRegistryAbi,
   chainFor,
   contextRegistryAbi,
+  createWriteContext,
+  deployLocal,
   getLogsChunked,
   ownerHistory,
   parseDeployment,
   revertNameFromData,
+  sendContract,
+  startAnvil,
 } from "@mida/chain"
-import type { Deployment, LogClient } from "@mida/chain"
+import type { Deployment, LocalNode, LocalWriteContext, LogClient } from "@mida/chain"
+import { FakeVaultAuthority, buildSignedAccessRequest, provisionAgent } from "@mida/fake-vault"
+import type { ProvisionedAgent, VaultContextApi } from "@mida/fake-vault"
 
 const OWNER: Address = "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
 const AGENT: Hex = `0x${"aa".repeat(32)}`
@@ -505,4 +513,80 @@ describe("owner history (§14.6 PREVIOUSLY_REVOKED — contract state, never a l
     expect(peak).toBeGreaterThan(1)
     expect(peak).toBeLessThanOrEqual(8)
   })
+})
+
+/**
+ * UF-M2.2 — the same check, but on the deployed contracts instead of a hand-written client:
+ * a live grant answers false, `revoke(capabilityId)` flips the listed-record answer to true,
+ * and `revokeAgentAndRotate` flips the counter answer to true. The grants go through the real
+ * Vault approval so the request, signature and grant digest are the shipped ones.
+ */
+describe("owner history on the real contracts (local anvil, real viem client)", () => {
+  const SEED = new Uint8Array(32).fill(0x42)
+  const P256_KEY: Hex = `0x${"4d".repeat(32)}`
+  const CAREER = namespaceId("goals.career")
+  const api: VaultContextApi = {
+    putObject: async () => {},
+    publishEpochWrap: async () => {},
+    requestRevocationDeny: async () => ({ intentId: `0x${"00".repeat(32)}`, cancellationNonce: "1" }),
+    cancelRevocation: async () => ({}),
+  }
+  let node: LocalNode
+  let deployed: Deployment
+  let owner: LocalWriteContext
+  let vault: FakeVaultAuthority
+  let agentA: ProvisionedAgent
+  let agentB: ProvisionedAgent
+
+  const history = (agentId: Hex) => ownerHistory({ client: owner.publicClient, deployment: deployed, owner: vault.owner, agentId })
+
+  const grantCareer = async (agent: ProvisionedAgent): Promise<Hex> => {
+    const request = await buildSignedAccessRequest({ chain: owner, agent, scopes: [{ namespace: "goals.career", permissions: PERMISSION.CREATE }] })
+    const approval = await vault.approveGrant({
+      accessRequest: request,
+      manifest: agent.manifest,
+      selection: { kind: "custom", scopes: [{ namespaceId: CAREER, permissions: PERMISSION.CREATE, provenancePolicy: 0 }], expiresAt: 0n },
+    })
+    return approval.response.capabilities[0]!.capabilityId
+  }
+
+  beforeAll(async () => {
+    node = await startAnvil()
+    deployed = await deployLocal({ rpcUrl: node.rpcUrl })
+    owner = createWriteContext({ rpcUrl: node.rpcUrl, deployment: deployed, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[1]!) })
+    vault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: P256_KEY, chain: owner, api })
+    await vault.registerOwnerKey()
+    const operatorA = createWriteContext({ rpcUrl: node.rpcUrl, deployment: deployed, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[2]!) })
+    const operatorB = createWriteContext({ rpcUrl: node.rpcUrl, deployment: deployed, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[3]!) })
+    const declarations = [{ namespace: "goals.career", permissions: ["CREATE" as const] }]
+    agentA = await provisionAgent({ operator: operatorA, name: "CareerAI", purposeId: "career_coaching", declarations, callbackOrigin: "https://career.example" })
+    agentB = await provisionAgent({ operator: operatorB, name: "Bystander", purposeId: "career_coaching", declarations, callbackOrigin: "https://bystander.example" })
+  }, 600_000)
+
+  afterAll(async () => {
+    await node?.stop()
+  })
+
+  it("a live grant is false; revoke(capabilityId) is true from the still-listed record; revokeAgentAndRotate is true from the counter", async () => {
+    // CREATE only — the grant needs no read epoch — so the vault's own ownerHistory ran first
+    // inside approveGrant and saw false; the direct read agrees.
+    const capabilityId = await grantCareer(agentA)
+    await expect(history(agentA.agentId)).resolves.toMatchObject({ previouslyRevoked: false })
+    await sendContract(
+      owner,
+      { address: deployed.capabilityRegistry, abi: capabilityRegistryAbi, functionName: "revoke", args: [capabilityId] },
+      "revoke.capability",
+    )
+    await expect(history(agentA.agentId)).resolves.toMatchObject({ previouslyRevoked: true })
+
+    // second agent: revokeAgentAndRotate empties the list — only the epoch counter can still say yes
+    await grantCareer(agentB)
+    await expect(history(agentB.agentId)).resolves.toMatchObject({ previouslyRevoked: false })
+    await sendContract(
+      owner,
+      { address: deployed.capabilityRegistry, abi: capabilityRegistryAbi, functionName: "revokeAgentAndRotate", args: [agentB.agentId, []] },
+      "revoke.agent",
+    )
+    await expect(history(agentB.agentId)).resolves.toMatchObject({ previouslyRevoked: true })
+  }, 600_000)
 })
