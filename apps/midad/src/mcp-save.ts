@@ -256,7 +256,19 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
 
   // Secrets are scrubbed with the compiler's own scrubber before anything is sealed — nested
   // arrays and objects included, and sensitive-looking key names redact their values outright.
-  const content = scrubValue(fields) as Record<string, unknown>
+  // An agent's text can never form a Mida note: only Mida writes "(Mida:". Every string value
+  // has each case-insensitive "(mida:" gain one space before the colon, so a forged note an
+  // agent sends can never read as one Mida wrote — Mida's own notes are added later by
+  // wrapCheckpoint and never pass through here.
+  const unmida = (v: unknown): unknown =>
+    typeof v === "string"
+      ? v.replace(/\(mida:/gi, (m) => `${m.slice(0, -1)} :`)
+      : Array.isArray(v)
+        ? v.map(unmida)
+        : isObj(v)
+          ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, unmida(x)]))
+          : v
+  const content = unmida(scrubValue(fields)) as Record<string, unknown>
 
   const sessionId = mcpSaveSessionId(agent, projectId)
   const checkpoint: Checkpoint = {

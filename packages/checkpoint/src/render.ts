@@ -86,9 +86,18 @@ const OWN_HEADINGS = [
   "UNSENT:",
 ]
 
+/**
+ * UF-N2: every character that starts a new visual line — a bare carriage return (\r\n counts as
+ * one break), U+0085, U+2028, U+2029, vertical tab and form feed — so a marker hidden behind an
+ * odd break is checked like any other line start. Written through RegExp + string escapes so the
+ * source holds no literal line-separator character.
+ */
+const VISUAL_BREAKS = new RegExp("\\r\\n|[\\r\\v\\f\\x85\\u2028\\u2029]", "g")
+
 /** Exported so other context surfaces (the whats-new note) defuse checkpoint text the same way. */
 export function defuse(text: string): string {
   return text
+    .replace(VISUAL_BREAKS, "\n")
     .replace(/mida handoff/gi, "MIDA-HANDOFF (quoted)")
     .replace(/standing until changed/gi, "standing until changed (quoted)")
     .replace(/true when observed/gi, "true when observed (quoted)")
@@ -99,23 +108,24 @@ export function defuse(text: string): string {
     // indented copies count too: a heading after leading spaces still reads as Mida's own
     // (CAP-26 review) — and so does a forged "(N earlier …" count line (UF-I)
     .map((line) => {
-      const trimmedStart = line.trimStart()
       // UF-J: a forged count or cut line carries the renderer's own "- " prefix — quote a line
-      // that opens with an optional dash before "(N earlier …" or "(Mida cut this reply"
-      // UF-K, widened in UF-L and UF-N: and "stated by you" in ANY spelling the same way — the
-      // header tells the agent those lines are the user's own words, so a checkpoint must never
-      // start one. Optional bullet (- * • + or "1."), any spacing or case, ASCII or look-alike
-      // colon, and invisible Unicode format characters (a zero-width space is \p{Cf}) are
-      // stripped and NFKC-folded before matching — while the ORIGINAL line is what gets quoted.
-      // Look-alike letters from other alphabets are not caught; that is a known limit.
-      // The renderer's own fact lines are built after their text is defused and are never passed
-      // through here as whole lines.
-      const probe = trimmedStart.replace(/\p{Cf}/gu, "").normalize("NFKC")
+      // that opens with an optional dash before "(N earlier …" or "(Mida cut this reply".
+      // UF-K, widened in UF-L, UF-N and UF-N2: every line-start rule here — the END/BEGIN fences,
+      // the section headings, the count lines, "Mida note:", "UNSENT", "stated by you" — matches
+      // on ONE key: the left-trimmed line with Unicode format characters (\p{Cf}) and combining
+      // marks (\p{M}) removed and NFKC applied, while the ORIGINAL line is what gets shown,
+      // prefixed "> ". "stated by you" matches after any leading bullets, dashes, '#', '*' or
+      // '>' — any punctuation or nothing may follow "you". Look-alike letters from other
+      // alphabets are not caught; that is a known limit. The renderer's own fact lines are
+      // built after their text is defused and are never passed through here as whole lines.
+      const key = line.trimStart().replace(/[\p{Cf}\p{M}]/gu, "").normalize("NFKC")
       const forgedLine =
-        /^(-\s*)?\(\d+ earlier /.test(trimmedStart) ||
-        /^(-\s*)?\(Mida cut this reply/.test(trimmedStart) ||
-        /^(?:[-*•+]|\d+[.)])?\s*stated\s+by\s+you\s*[:：∶꞉]/iu.test(probe)
-      return OWN_HEADINGS.some((h) => trimmedStart.startsWith(h)) || forgedLine ? `> ${line}` : line
+        key.startsWith("=== END MIDA HANDOFF DATA ===") ||
+        key.startsWith("=== BEGIN MIDA HANDOFF DATA ===") ||
+        /^(-\s*)?\(\d+ earlier /.test(key) ||
+        /^(-\s*)?\(Mida cut this reply/.test(key) ||
+        /^[^\p{L}\p{N}]*stated\s+by\s+you(?![\p{L}\p{N}])/iu.test(key)
+      return OWN_HEADINGS.some((h) => key.startsWith(h)) || forgedLine ? `> ${line}` : line
     })
     .join("\n")
 }
@@ -182,7 +192,7 @@ export function renderHandoff(
     /** See `renderHandoffReport`'s `forceOversizeNote`. */
     forceOversizeNote?: boolean
     /**
-     * Named tasks sharing this project (tk-1): one mention line each — name, who last saved, how
+     * Named tasks sharing this project (tk-1): one mention line each — name, last saver, how
      * long ago — and nothing else. A mention is awareness, not context: no foreign task's text
      * ever reaches the handoff through here. Absent or empty renders byte-identical to before.
      */
@@ -240,7 +250,7 @@ export function renderHandoffReport(
      */
     forceOversizeNote?: boolean
     /**
-     * Named tasks sharing this project (tk-1): one mention line each — name, who last saved, how
+     * Named tasks sharing this project (tk-1): one mention line each — name, last saver, how
      * long ago — and nothing else. A mention is awareness, not context: no foreign task's text
      * ever reaches the handoff through here. Absent or empty renders byte-identical to before.
      */
