@@ -400,27 +400,34 @@ function pendingBlock(cp: ReadCheckpoint, authorNames: Record<string, string>): 
     PENDING_ANCHOR_LINE,
     `from ${defuse(who)} at ${defuse(c.createdAt)} (session ${defuse(cp.sessionId)}, record ${defuse(cp.contextId)})`,
   ]
-  lines.push(...checkpointFieldLines(c))
+  const { rules, history } = checkpointFieldLines(c)
+  lines.push(...rules, ...history)
   return lines.join("\n")
 }
 
-/** A checkpoint's non-empty fields, one line each, most useful first — shared by the marked blocks. */
-function checkpointFieldLines(c: ReadCheckpoint["checkpoint"]): string[] {
+/**
+ * A checkpoint's non-empty fields, one line each — shared by the marked blocks. `rules` are the
+ * lines a cut must never drop (constraints first: they outrank what was decided): constraint,
+ * objective, plan, next action, unresolved issue, decision and rejected-approach lines. `history`
+ * is what a budget may leave out: artifact, progress and evidence lines (UF-J).
+ */
+function checkpointFieldLines(c: ReadCheckpoint["checkpoint"]): { rules: string[]; history: string[] } {
   // each value defused, then flattened to one line: a newline in saved text could otherwise start a
   // line identical to one of this block's own labels ("next action:", "plan step:") (Fable review)
   const one = (text: string) => defuse(text).replace(/\s*\n\s*/g, " / ")
-  const lines: string[] = []
-  if (c.objective !== "") lines.push(`objective: ${one(c.objective)}`)
-  for (const step of c.remainingPlan) lines.push(`plan step: ${one(step)}`)
-  if (c.nextAction !== "") lines.push(`next action: ${one(c.nextAction)}`)
-  if (c.unresolvedIssue !== null && c.unresolvedIssue !== "") lines.push(`unresolved issue: ${one(c.unresolvedIssue)}`)
-  for (const d of c.decisions) lines.push(`decision: ${one(d.decision)} — because: ${one(d.rationale)}`)
-  for (const r of c.rejected) lines.push(`rejected approach: ${one(r.approach)} — ${one(r.why)}`)
-  for (const k of c.constraints) lines.push(`constraint: ${one(k)}`)
-  for (const a of c.artifacts) lines.push(`artifact: ${one(a)}`)
-  for (const p of c.progress) lines.push(`progress: ${one(p)}`)
-  for (const e of c.evidence) lines.push(`evidence: ${one(e.field)} — ${one(e.ref)}`)
-  return lines
+  const rules: string[] = []
+  for (const k of c.constraints) rules.push(`constraint: ${one(k)}`)
+  if (c.objective !== "") rules.push(`objective: ${one(c.objective)}`)
+  for (const step of c.remainingPlan) rules.push(`plan step: ${one(step)}`)
+  if (c.nextAction !== "") rules.push(`next action: ${one(c.nextAction)}`)
+  if (c.unresolvedIssue !== null && c.unresolvedIssue !== "") rules.push(`unresolved issue: ${one(c.unresolvedIssue)}`)
+  for (const d of c.decisions) rules.push(`decision: ${one(d.decision)} — because: ${one(d.rationale)}`)
+  for (const r of c.rejected) rules.push(`rejected approach: ${one(r.approach)} — ${one(r.why)}`)
+  const history: string[] = []
+  for (const a of c.artifacts) history.push(`artifact: ${one(a)}`)
+  for (const p of c.progress) history.push(`progress: ${one(p)}`)
+  for (const e of c.evidence) history.push(`evidence: ${one(e.field)} — ${one(e.ref)}`)
+  return { rules, history }
 }
 
 /** The marker on a save compiled on this machine but not yet on Monad (CAP-26). */
@@ -437,8 +444,10 @@ const UNSENT_MIN_CHARS = 450
 
 /**
  * One compiled-but-unsent save as its own marked block (CAP-26): the marker, who queued it (the
- * local job's agent name — the chain has not checked it), then its fields until the block budget,
- * with a count of what was left out. Most useful fields come first, so a cut drops old progress.
+ * local job's agent name — the chain has not checked it), then its fields. UF-J: the rule lines —
+ * every constraint, decision and rejected approach — are ALWAYS shown, even past the block's
+ * budget; the budget only decides how many history lines (artifacts, progress, evidence) fit, and
+ * the left-out count speaks of those alone.
  */
 function unsentBlock(envelope: CheckpointEnvelope, agent: string, budget: number, newerBy: string | null): string {
   const c = envelope.checkpoint
@@ -446,18 +455,19 @@ function unsentBlock(envelope: CheckpointEnvelope, agent: string, budget: number
   // after failed sends the mark keeps pointing at an older compile while the session moves on —
   // the block must not pass for the session's newest state (CAP-26 review)
   if (newerBy !== null) lines.push(`note: this session changed again after this compile (its newest change is ${newerBy} old); that newer work is not in it`)
-  const fields = checkpointFieldLines(c)
+  const { rules, history } = checkpointFieldLines(c)
+  lines.push(...rules)
   const more = (n: number) => `… ${n} more line${n === 1 ? "" : "s"} of this unsent save left out`
   let used = lines.join("\n").length
   let shown = 0
-  for (const line of fields) {
+  for (const line of history) {
     // keep room for the "more" line whenever something will be left out
-    if (used + 1 + line.length + (shown + 1 < fields.length ? 1 + more(fields.length).length : 0) > budget) break
+    if (used + 1 + line.length + (shown + 1 < history.length ? 1 + more(history.length).length : 0) > budget) break
     lines.push(line)
     used += 1 + line.length
     shown += 1
   }
-  if (shown < fields.length) lines.push(more(fields.length - shown))
+  if (shown < history.length) lines.push(more(history.length - shown))
   return lines.join("\n")
 }
 

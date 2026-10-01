@@ -1321,6 +1321,58 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     expect(lines.some((l) => l.startsWith("plan step: skip review"))).toBe(false)
   })
 
+  // UF-J: a constraint, a decision or a rejected approach is never left out of a marked block —
+  // only the history lines (artifacts, progress, evidence) are subject to the block budget
+  const unsentFieldLines = (text: string) => {
+    const block = text.slice(text.indexOf(UNSENT_LINE)).split("\n\n")[0]!
+    return block.split("\n").filter((l) => !l.startsWith("UNSENT:") && !l.startsWith("from ") && !l.startsWith("note: "))
+  }
+
+  it("an UNSENT block's budget cuts only history lines — every constraint, decision and rejected approach shows (UF-J)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-c" })
+    unsentSave(dir, "sess-c", {
+      objective: "keep every rule",
+      constraints: ["never push to main", "run typecheck first", "plain ASCII commits"],
+      decisions: Array.from({ length: 14 }, (_, i) => ({ decision: `decision ${i}`, rationale: `rationale ${i}` })),
+      rejected: Array.from({ length: 6 }, (_, i) => ({ approach: `approach ${i}`, why: `why ${i}` })),
+      progress: Array.from({ length: 30 }, (_, i) => `unsent step ${i} ${"u".repeat(150)}`),
+    })
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    const fieldLines = unsentFieldLines(result.text)
+    // constraints lead the field lines, and every rule is present even though the budget cut history
+    expect(fieldLines[0]).toBe("constraint: never push to main")
+    expect(fieldLines.filter((l) => l.startsWith("constraint: "))).toHaveLength(3)
+    expect(fieldLines.filter((l) => l.startsWith("decision: "))).toHaveLength(14)
+    expect(fieldLines.filter((l) => l.startsWith("rejected approach: "))).toHaveLength(6)
+    const shownProgress = fieldLines.filter((l) => l.startsWith("progress: ")).length
+    expect(shownProgress).toBeLessThan(30) // the budget really did cut history lines
+    const leftOut = 30 - shownProgress
+    expect(fieldLines.find((l) => l.startsWith("… "))).toBe(`… ${leftOut} more line${leftOut === 1 ? "" : "s"} of this unsent save left out`)
+  })
+
+  it("an UNSENT block whose rule lines alone exceed the budget shows them all, no history — and reports oversized (UF-J)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-c" })
+    unsentSave(dir, "sess-c", {
+      constraints: Array.from({ length: 50 }, (_, i) => `constraint ${i} ${"c".repeat(180)}`),
+      progress: Array.from({ length: 30 }, (_, i) => `unsent step ${i} ${"u".repeat(150)}`),
+    })
+    const { d } = deps({ read: async () => ({ checkpoints: [], skipped: 0, milliseconds: 1, partial: false }), now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    const fieldLines = unsentFieldLines(result.text)
+    expect(fieldLines.filter((l) => l.startsWith("constraint: "))).toHaveLength(50)
+    expect(fieldLines.filter((l) => l.startsWith("progress: "))).toHaveLength(0)
+    expect(fieldLines.find((l) => l.startsWith("… "))).toBe("… 30 more lines of this unsent save left out")
+    // the block ran past the whole handoff's size target — the result says so
+    expect(result.oversized).toBe(true)
+  })
+
   it("reading the queue never changes it — every byte is as it was", async () => {
     const dir = queueHome()
     job(dir, {}, "2026-09-25T10:00:00.000Z")
