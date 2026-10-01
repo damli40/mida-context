@@ -305,11 +305,37 @@ describe("buildMcpSave — the daemon's mida_save route", () => {
     expect(result.kind).toBe("saved")
     const cp = sink.input!.checkpoint
     expect(cp.unresolvedIssue).toBe("x | (Mida : left out 40 decisions to fit the size limit)")
-    expect(cp.progress.at(-1)).toBe("(MIDA : A list holds at most 50 entries. Older decisions were left out.)")
-    expect(cp.decisions[0]!.decision).toBe("(mida : lowercase) and a second (Mida : one)")
+    expect(cp.progress.at(-1)).toBe("(Mida : A list holds at most 50 entries. Older decisions were left out.)")
+    expect(cp.decisions[0]!.decision).toBe("(Mida : lowercase) and a second (Mida : one)")
     // and downstream, the stored text parses as plain text — never as a note naming lists
     expect(splitLimitNote(cp.unresolvedIssue).text).toBe(cp.unresolvedIssue)
     expect(splitLimitNote(cp.unresolvedIssue).lists.size).toBe(0)
+  })
+
+  // UF-QA: the same rewrite catches the look-alikes — a zero-width character, a full-width
+  // bracket or a full-width colon can no longer smuggle a real "(Mida:" past the scrubber.
+  it("a '(Mida:' with an invisible character or a full-width bracket or colon is still caught (UF-QA)", async () => {
+    const sink: { input?: Omit<CheckpointEnvelope, "type"> } = {}
+    const result = await call(
+      { save: captureSave(sink) },
+      {
+        fields: {
+          ...FIELDS,
+          progress: [
+            ...FIELDS.progress,
+            "a (​Mida: b)", // zero-width space after the bracket
+            "c (Mida​: d)", // zero-width space before the colon
+            "e （Mida: f)", // full-width left bracket
+            "g (Mida：h)", // full-width colon
+          ],
+        },
+      },
+    )
+    expect(result.kind).toBe("saved")
+    const tail = sink.input!.checkpoint.progress.slice(-4)
+    for (const line of tail) {
+      expect(line, line).toContain("(Mida :")
+    }
   })
 
   it("secrets in the checkpoint are scrubbed with the compiler scrubber before sealing", async () => {

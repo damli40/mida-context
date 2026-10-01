@@ -95,38 +95,129 @@ const OWN_HEADINGS = [
  */
 const VISUAL_BREAKS = new RegExp("\\r\\n|[\\r\\v\\f\\x85\\u2028\\u2029]", "g")
 
+/**
+ * UF-QA: every character ignored when matching a line against Mida's own shapes — whitespace,
+ * separators, format and combining marks, plus the invisible characters that are none of those
+ * (Hangul jamo fillers U+115F and U+1160, Braille blank U+2800, Hangul filler U+3164, halfwidth
+ * Hangul filler U+FFA0). A marker padded with any of them still matches.
+ */
+const IGNORED = /[\s\p{Z}\p{Cf}\p{M}\u115F\u1160\u2800\u3164\uFFA0]/gu
+const IGNORED_RUN = "[\\s\\p{Z}\\p{Cf}\\p{M}\\u115F\\u1160\\u2800\\u3164\\uFFA0]*"
+
+/**
+ * Look-alike letters from other alphabets, keyed by their lowercase form — Cyrillic and Greek
+ * letters that imitate the Latin one a marker is written in. A marker written "Mіda" (Cyrillic
+ * і) still reads as "Mida" to the agent, so the key folds it onto the Latin letter.
+ */
+const LOOK_ALIKE: Record<string, string> = {
+  "а": "a", "α": "a", // Cyrillic а, Greek α
+  "с": "c",
+  "ԁ": "d",
+  "е": "e",
+  "һ": "h",
+  "і": "i", "ї": "i", "ι": "i",
+  "ј": "j",
+  "к": "k",
+  "м": "m", "т": "m", // lowercase Cyrillic м and т both imitate m
+  "ո": "n",
+  "о": "o", "ο": "o",
+  "р": "p",
+  "ѕ": "s",
+  "υ": "u",
+  "х": "x",
+  "у": "y",
+}
+
+/** Latin letter → every look-alike character that folds onto it (for the phrase rules below). */
+const ALIASES: Record<string, string> = {}
+for (const [from, to] of Object.entries(LOOK_ALIKE)) ALIASES[to] = (ALIASES[to] ?? "") + from
+
+const escapeClass = (c: string): string => c.replace(/[\\\]\[^-]/g, "\\$&")
+
+/**
+ * A phrase rule as one loose pattern: every needle letter also accepts its look-alikes, and
+ * ignored characters may sit between any two letters — so "mida  handoff", "MIDA\u200BHAN\u043EOFF"
+ * and the plain spelling all match.
+ */
+const loose = (needle: string): RegExp =>
+  new RegExp(
+    [...needle]
+      .map((c) => (/\p{L}|\p{N}/u.test(c) ? `[${escapeClass(c)}${[...(ALIASES[c] ?? "")].map(escapeClass).join("")}]` : c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+      .join(IGNORED_RUN),
+    "giu",
+  )
+
+/**
+ * The ONE key every rule matches on (UF-QA): NFKC, look-alike letters folded onto the Latin
+ * they imitate, lower-cased, every ignored character removed, then every leading character that
+ * is not a letter, a digit, "(" or "=" dropped — a bullet, a list marker or leading spaces
+ * cannot hide a heading. `ruleKey` additionally drops every remaining non-letter, non-digit
+ * except ":" "(" "=" (a hyphen or bracket inside a marker changes nothing), and `flat` drops
+ * those too. The SHOWN line is always the original line, prefixed "> ".
+ */
+function matchKeys(line: string): { ruleKey: string; flat: string } {
+  const key = [...line.normalize("NFKC").toLowerCase()]
+    .map((ch) => LOOK_ALIKE[ch] ?? ch)
+    .join("")
+    .replace(IGNORED, "")
+    .replace(/^[^\p{L}\p{N}(=]+/u, "")
+  return {
+    ruleKey: key.replace(/[^\p{L}\p{N}:(=]/gu, ""),
+    flat: key.replace(/[^\p{L}\p{N}]/gu, ""),
+  }
+}
+
+const OWN_HEADING_KEYS = OWN_HEADINGS.map((h) => matchKeys(h).ruleKey)
+
+// compiled once — the phrase rules rewrite mid-line look-alikes, the fence rules run only on a
+// line the line-start rules did NOT quote (a quoted line already shows its fence as saved text)
+const PHRASE_RULES: [RegExp, string][] = [
+  [loose("midahandoff"), "MIDA-HANDOFF (quoted)"],
+  [loose("standinguntilchanged"), "standing until changed (quoted)"],
+  [loose("truewhenobserved"), "true when observed (quoted)"],
+  [loose("originalrequest"), "original request (quoted)"],
+]
+const FENCE_RULES: [RegExp, string][] = [
+  [loose("===begin"), "(quoted) BEGIN"],
+  [loose("===end"), "(quoted) END"],
+]
+
 /** Exported so other context surfaces (the whats-new note) defuse checkpoint text the same way. */
 export function defuse(text: string): string {
   return text
     .replace(VISUAL_BREAKS, "\n")
-    .replace(/mida handoff/gi, "MIDA-HANDOFF (quoted)")
-    .replace(/standing until changed/gi, "standing until changed (quoted)")
-    .replace(/true when observed/gi, "true when observed (quoted)")
-    .replace(/original request/gi, "original request (quoted)")
-    .replace(/=== BEGIN/g, "(quoted) BEGIN")
-    .replace(/=== END/g, "(quoted) END")
     .split("\n")
     // indented copies count too: a heading after leading spaces still reads as Mida's own
     // (CAP-26 review) — and so does a forged "(N earlier …" count line (UF-I)
     .map((line) => {
       // UF-J: a forged count or cut line carries the renderer's own "- " prefix — quote a line
       // that opens with an optional dash before "(N earlier …" or "(Mida cut this reply".
-      // UF-K, widened in UF-L, UF-N and UF-N2: every line-start rule here — the END/BEGIN fences,
-      // the section headings, the count lines, "Mida note:", "UNSENT", "stated by you" — matches
-      // on ONE key: the left-trimmed line with Unicode format characters (\p{Cf}) and combining
-      // marks (\p{M}) removed and NFKC applied, while the ORIGINAL line is what gets shown,
-      // prefixed "> ". "stated by you" matches after any leading bullets, dashes, '#', '*' or
-      // '>' — any punctuation or nothing may follow "you". Look-alike letters from other
-      // alphabets are not caught; that is a known limit. The renderer's own fact lines are
-      // built after their text is defused and are never passed through here as whole lines.
-      const key = line.trimStart().replace(/[\p{Cf}\p{M}]/gu, "").normalize("NFKC")
+      // UF-K, widened in UF-L, UF-N, UF-N2 and UF-QA: every line-start rule here — the END/BEGIN
+      // fences, the section headings, the count lines, "Mida note:", "UNSENT", "stated by you" —
+      // matches on ONE key built by matchKeys, while the ORIGINAL line is what gets shown,
+      // prefixed "> ". "stated by you" quotes when "statedbyyou" begins within the flat key's
+      // first 6 characters — a bullet, a list marker like "a)" or "- [x]" and nothing else may
+      // precede it, so ordinary prose ("the user stated by yesterday…") stays unquoted.
+      // Look-alike letters from other alphabets are folded onto the Latin they imitate, so a
+      // marker written with Cyrillic or Greek letters is still caught. Spacing, letter case,
+      // bullets and invisible characters are all ignored when matching. The renderer's own fact
+      // lines are built after their text is defused and are never passed through here as whole
+      // lines.
+      const { ruleKey, flat } = matchKeys(line)
+      const statedAt = flat.indexOf("statedbyyou")
       const forgedLine =
-        key.startsWith("=== END MIDA HANDOFF DATA ===") ||
-        key.startsWith("=== BEGIN MIDA HANDOFF DATA ===") ||
-        /^(-\s*)?\(\d+ earlier /.test(key) ||
-        /^(-\s*)?\(Mida cut this reply/.test(key) ||
-        /^[^\p{L}\p{N}]*(?:\p{N}+[.)]\s*)?[^\p{L}\p{N}]*stated\s+by\s+you(?![\p{L}\p{N}])/iu.test(key)
-      return OWN_HEADINGS.some((h) => key.startsWith(h)) || forgedLine ? `> ${line}` : line
+        ruleKey.startsWith("===endmidahandoffdata===") ||
+        ruleKey.startsWith("===beginmidahandoffdata===") ||
+        /^\(\d+earlier/.test(ruleKey) ||
+        ruleKey.startsWith("(midacutthisreply") ||
+        (statedAt >= 0 && statedAt <= 6)
+      // a line that STARTS with a marker is quoted whole — the original line, prefixed "> "
+      if (OWN_HEADING_KEYS.some((h) => ruleKey.startsWith(h)) || forgedLine) return `> ${line}`
+      // otherwise only mid-line look-alike phrases and fences are rewritten in place
+      let out = line
+      for (const [re, replacement] of PHRASE_RULES) out = out.replace(re, replacement)
+      for (const [re, replacement] of FENCE_RULES) out = out.replace(re, replacement)
+      return out
     })
     .join("\n")
 }

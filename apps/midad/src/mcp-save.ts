@@ -258,12 +258,14 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
   // Secrets are scrubbed with the compiler's own scrubber before anything is sealed — nested
   // arrays and objects included, and sensitive-looking key names redact their values outright.
   // An agent's text can never form a Mida note: only Mida writes "(Mida:". Every string value
-  // has each case-insensitive "(mida:" gain one space before the colon, so a forged note an
-  // agent sends can never read as one Mida wrote — Mida's own notes are added later by
-  // wrapCheckpoint and never pass through here.
+  // has each "(mida:" gain one space before the colon, so a forged note an agent sends can
+  // never read as one Mida wrote — Mida's own notes are added later by wrapCheckpoint and
+  // never pass through here. UF-QA: look-alikes count too — a full-width bracket or colon,
+  // or invisible characters (whitespace, format marks) anywhere inside the marker, are
+  // rewritten the same way.
   const unmida = (v: unknown): unknown =>
     typeof v === "string"
-      ? v.replace(/\(mida:/gi, (m) => `${m.slice(0, -1)} :`)
+      ? v.replace(/[(（][\s\p{Cf}]*m[\p{Cf}]*i[\p{Cf}]*d[\p{Cf}]*a[\s\p{Cf}]*[:：]/giu, "(Mida :")
       : Array.isArray(v)
         ? v.map(unmida)
         : isObj(v)
