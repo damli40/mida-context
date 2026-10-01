@@ -102,15 +102,19 @@ export function defuse(text: string): string {
       const trimmedStart = line.trimStart()
       // UF-J: a forged count or cut line carries the renderer's own "- " prefix — quote a line
       // that opens with an optional dash before "(N earlier …" or "(Mida cut this reply"
-      // UF-K, widened in UF-L: and "stated by you" in ANY spelling the same way — the header
-      // tells the agent those lines are the user's own words, so a checkpoint must never start
-      // one. Optional bullet (- * •), any spacing or case, ASCII or full-width colon. The
-      // renderer's own fact lines are built after their text is defused and are never passed
+      // UF-K, widened in UF-L and UF-N: and "stated by you" in ANY spelling the same way — the
+      // header tells the agent those lines are the user's own words, so a checkpoint must never
+      // start one. Optional bullet (- * • + or "1."), any spacing or case, ASCII or look-alike
+      // colon, and invisible Unicode format characters (a zero-width space is \p{Cf}) are
+      // stripped and NFKC-folded before matching — while the ORIGINAL line is what gets quoted.
+      // Look-alike letters from other alphabets are not caught; that is a known limit.
+      // The renderer's own fact lines are built after their text is defused and are never passed
       // through here as whole lines.
+      const probe = trimmedStart.replace(/\p{Cf}/gu, "").normalize("NFKC")
       const forgedLine =
         /^(-\s*)?\(\d+ earlier /.test(trimmedStart) ||
         /^(-\s*)?\(Mida cut this reply/.test(trimmedStart) ||
-        /^([-*•]\s*)?stated\s+by\s+you\s*[:：]/i.test(trimmedStart)
+        /^(?:[-*•+]|\d+[.)])?\s*stated\s+by\s+you\s*[:：∶꞉]/iu.test(probe)
       return OWN_HEADINGS.some((h) => trimmedStart.startsWith(h)) || forgedLine ? `> ${line}` : line
     })
     .join("\n")

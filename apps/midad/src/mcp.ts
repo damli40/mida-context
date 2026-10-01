@@ -62,9 +62,15 @@ const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${text
  * fence is cut the way capText cuts, at this same cap.
  */
 const HANDOFF_TEXT_CAP = 40_000
+/** A cut may not split a surrogate pair — if the last kept unit is a pair's first half, keep one fewer (UF-N). */
+const safeHead = (text: string, maxChars: number): string => {
+  const head = text.slice(0, maxChars)
+  const last = head.charCodeAt(head.length - 1)
+  return last >= 0xd800 && last <= 0xdbff ? head.slice(0, -1) : head
+}
 const capHandoffText = (text: string): string => {
   if (text.length <= HANDOFF_TEXT_CAP) return text
-  if (!text.includes(HANDOFF_TAIL)) return `${text.slice(0, HANDOFF_TEXT_CAP - 1)}…`
+  if (!text.includes(HANDOFF_TAIL)) return `${safeHead(text, HANDOFF_TEXT_CAP - 1)}…`
   // The preamble is everything before the BEGIN line. Only its WHOLE lines starting with the
   // over-target note's lead are rewritten — the same words inside saved text are the save's
   // own and stay (they are quoted by defuse). indexOf/slice and a replacer FUNCTION, never a
@@ -96,7 +102,7 @@ const capHandoffText = (text: string): string => {
   const endAt = cut.indexOf(HANDOFF_TAIL)
   const beforeEnd = endAt === -1 ? cut : cut.slice(0, endAt)
   const keep = Math.min(HANDOFF_TEXT_CAP - tail.length, Math.max(0, beforeEnd.length - 1))
-  return `${beforeEnd.slice(0, keep)}${tail}`
+  return `${safeHead(beforeEnd, keep)}${tail}`
 }
 
 const toolText = (text: string) => ({ content: [{ type: "text" as const, text: capText(text) }] })

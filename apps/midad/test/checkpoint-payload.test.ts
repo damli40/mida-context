@@ -132,6 +132,35 @@ describe("checkpoint payload", () => {
     expect(stored.endsWith(` | ${limitNote}`)).toBe(true)  // the note survives the text cut
     expect(stored.startsWith(`${"i".repeat(300)}…`)).toBe(true) // and the text is what got cut
   })
+  // UF-N: an unclosed "(Mida:" is ordinary TEXT, not a note — only a complete "(Mida: …)" with
+  // its closing bracket counts. Under the old segment rule the unclosed opener swallowed the
+  // whole rest of the string (and the size note behind it) into one "note".
+  it("an unclosed `(Mida:` is ordinary text — the text is kept, shortened to fit, and the size note stays whole (UF-N)", () => {
+    const fat = sampleCheckpoint({
+      constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i} ${"c".repeat(1200)}`),
+      // 1,950 i's: the input just fits the 2,000-char string cap, but fused with the size note
+      // the fake "note" the old code built overflows it — so the whole tail was dropped
+      unresolvedIssue: `see | (Mida: never closed ${"i".repeat(1950)}`,
+      progress: ["p".repeat(2000), "q".repeat(2000)],
+    })
+    const e = wrap(fat)
+    expect(Buffer.byteLength(JSON.stringify(e))).toBeLessThanOrEqual(MAX_VALUE_BYTES)
+    const stored = e.checkpoint.unresolvedIssue!
+    expect(stored.length).toBeLessThanOrEqual(2000)
+    // the unclosed opener is TEXT: it sits at the start of the kept text and its run of i's is
+    // what took the cut — under the old code the unclosed tail became a fake "note" longer than
+    // the string cap, so the whole field collapsed to just "see" and the size note vanished
+    expect(stored.startsWith("see | (Mida: never closed")).toBe(true)
+    expect(stored).not.toContain("i".repeat(2000))
+    expect(stored).toContain("i".repeat(100))
+    // the size note is its own complete " | "-separated segment at the end
+    const last = stored.split(" | ").at(-1)!
+    expect(last.startsWith("(Mida:")).toBe(true)
+    expect(last).toMatch(/to fit the size limit\)$/)
+    const back = unwrapCheckpoint(JSON.parse(JSON.stringify(e)))
+    expect(back).not.toBeNull()
+    expect(back!.checkpoint.unresolvedIssue).toBe(stored)
+  })
   it("when constraints already holds 50 real entries, the note lands on unresolvedIssue and no constraint is deleted", () => {
     const fat = sampleCheckpoint({
       constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i}`),

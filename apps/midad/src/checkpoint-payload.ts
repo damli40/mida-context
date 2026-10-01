@@ -89,10 +89,12 @@ function checkedMigration(migration: unknown): MigrationEnvelope | undefined {
 
 /**
  * An unresolvedIssue value read as "free text" joined to every "(Mida: …)" note it holds by
- * " | " — each note segment runs to its ")" or, when a cut somewhere upstream sliced it open,
- * to the end of the string.
+ * " | ". Only a COMPLETE segment — opening bracket to closing bracket, with no other bracket
+ * between — is a note. An unclosed "(Mida:" is ordinary text and pays the string cap like any
+ * other words (UF-N: the old /(\)|$)/ alternative let it swallow the rest of the string, and
+ * the note appended behind it, into one fake "note").
  */
-const ISSUE_NOTE_SEGMENT = /\(Mida:[^)]*(\)|$)/g
+const ISSUE_NOTE_SEGMENT = /\(Mida:[^()]*\)/g
 
 /**
  * The ONE shape unresolvedIssue is ever stored in (UF-L): notes whole at the end, free text

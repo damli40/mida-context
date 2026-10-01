@@ -1447,6 +1447,28 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
+  it("the 40,000 cut never splits a surrogate pair — an emoji at the cut point stays whole or goes (UF-N)", async () => {
+    const dir = home()
+    // the cut lands between the emoji's two UTF-16 halves: 39,998 chars + a 2-unit emoji
+    const big = `${"x".repeat(39_998)}😀${"y".repeat(100)}`
+    expect(big.length).toBeGreaterThan(40_000)
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_handoff")
+        // one unit fewer was kept, so no lone surrogate sits before the …
+        expect(text).toBe(`${"x".repeat(39_998)}…`)
+        const beforeEllipsis = text.charCodeAt(text.length - 2)
+        expect(beforeEllipsis >= 0xd800 && beforeEllipsis <= 0xdfff).toBe(false)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
   // UF-K (replaces the UF-J single-sentence swap): the fixtures come from the REAL renderer —
   // a hand-typed preamble would stay green through a renderer reword and let a false claim back.
   // renderHandoffReport produces the daemon's reply; the oversized inputs cross the 40,000 reply
