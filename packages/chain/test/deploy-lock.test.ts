@@ -164,11 +164,13 @@ describe("the local deploy lock", () => {
   // UF-K: a waiter that wins `.steal` must re-check the lock under the mutex before removing
   // it — another waiter may have retaken it while this one was paused between seeing the lock
   // left behind and making the mutex.
-  // UF-L: no sleeps decide that interleaving. Worker B's beforeTakeover logs `paused` and polls
-  // for a `<lock>.go` file; the test parks B there, starts A, and opens the gate only after A's
-  // `start` is in the log — so B's re-check lands while A provably holds the lock. The re-check
-  // makes B's `start` come after A's `end`; without it B removes A's live lock and holds the
-  // same lock beside A.
+  // UF-L, fully signal-driven in UF-N: no sleeps decide the interleaving. Worker B's
+  // beforeTakeover logs `paused`, waits for `<lock>.go`, then logs `resumed` the moment the
+  // gate opens. Worker A holds the lock until `<lock>.release` exists — not for a fixed
+  // sleep. The test parks B, starts A, opens B's gate once A holds the lock, waits for B's
+  // `resumed` (B is now past beforeTakeover, about to make `.steal`), gives it 500 ms to reach
+  // the mutex, then releases A. The re-check makes B's `start` come after A's `end`; without
+  // it B removes A's live lock and holds the same lock beside A.
   it("a waiter that clears a leftover re-checks under the steal mutex — a live holder wins (UF-K)", async () => {
     const worker = fileURLToPath(new URL("./fixtures/lock-worker.ts", import.meta.url))
     const dir = mkdtempSync(join(tmpdir(), "mida-deploy-lock-recheck-"))
@@ -183,18 +185,26 @@ describe("the local deploy lock", () => {
         child.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`lock worker exited with code ${code}`))))
       })
     const untilLogHas = async (mark: string) => {
-      const giveUp = Date.now() + 15_000
+      const giveUp = Date.now() + 40_000 // the worker's own gates give up at 30 — this outlasts them
       while (!(existsSync(logPath) && readFileSync(logPath, "utf8").includes(mark))) {
         if (Date.now() > giveUp) throw new Error(`log never showed "${mark}": ${existsSync(logPath) ? readFileSync(logPath, "utf8") : "(no log)"}`)
         await new Promise((resolve) => setTimeout(resolve, 20))
       }
     }
+    // exit listeners attach at spawn — a worker that exits before its listener lands would
+    // otherwise leave the promise pending forever (that is exactly what a mutex-less
+    // takeDirLock does to worker B: it resumes, steals, runs and exits in milliseconds)
     const b = spawn(process.execPath, ["--import", "tsx", worker, lock, logPath, "", "go", "0"])
+    const bExited = exited(b)
     await untilLogHas("paused")
-    const a = spawn(process.execPath, ["--import", "tsx", worker, lock, logPath, "", "", "500"])
+    const a = spawn(process.execPath, ["--import", "tsx", worker, lock, logPath, "", "", "release"])
+    const aExited = exited(a)
     await untilLogHas(`start ${a.pid}`)
     writeFileSync(`${lock}.go`, "")
-    await Promise.all([exited(b), exited(a)])
+    await untilLogHas(`resumed ${b.pid}`)
+    await new Promise((resolve) => setTimeout(resolve, 500)) // B is at the .steal mutex by now
+    writeFileSync(`${lock}.release`, "")
+    await Promise.all([bExited, aExited])
     const lines = readFileSync(logPath, "utf8").trim().split("\n")
     const aEnd = lines.indexOf(`end ${a.pid}`)
     const bStart = lines.indexOf(`start ${b.pid}`)

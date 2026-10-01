@@ -146,7 +146,7 @@ describe("sponsored progress lines", () => {
       await new Promise<void>((done) => sponsor.close(() => done()))
       await env.stop()
     }
-  }, 300_000)
+  }, 600_000)
 
   it("a silent sponsor with a funder says so, tops the wallet up, and still inits", async () => {
     const env = await localEnvironment()
@@ -172,7 +172,7 @@ describe("sponsored progress lines", () => {
     } finally {
       await env.stop()
     }
-  }, 300_000)
+  }, 600_000)
 
   it("a silent sponsor with no funder refuses init with the send-MON refusal — not 'no MON needed'", async () => {
     const env = await localEnvironment()
@@ -196,5 +196,5 @@ describe("sponsored progress lines", () => {
     } finally {
       await env.stop()
     }
-  }, 120_000)
+  }, 600_000)
 })

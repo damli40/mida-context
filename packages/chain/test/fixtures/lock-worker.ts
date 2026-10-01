@@ -14,9 +14,19 @@ if (Number.isFinite(startAt) && startAt > 0) {
 // UF-K: optional pauses — beforeTakeoverMs sleeps inside takeDirLock's beforeTakeover hook
 // (after the lock was seen left behind, before the .steal mkdir), holdMs is how long the
 // lock is held once taken.
-// UF-L: beforeTakeoverMs "go" is a handshake instead of a sleep — the worker logs `paused`
-// then polls every 20 ms for a `<lockDir>.go` file the test writes, so the two-worker
-// re-check test drives the interleaving instead of hoping a 150 ms stagger lands inside it.
+// UF-L, tightened in UF-N: beforeTakeoverMs "go" and holdMs "release" are handshakes instead
+// of sleeps — the worker logs `paused`, polls for a `<lockDir>.go` file the test writes, then
+// logs `resumed` the moment the gate opens; and a "release" hold polls for `<lockDir>.release`
+// so worker A keeps the lock until the test says the interleaving happened. Every gate wait
+// gives up after 30 seconds and exits 1, so a test that stalls fails instead of hanging.
+const GATE_TIMEOUT_MS = 30_000
+const waitForGate = async (path: string) => {
+  const giveUp = Date.now() + GATE_TIMEOUT_MS
+  while (!existsSync(path)) {
+    if (Date.now() > giveUp) process.exit(1)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+}
 const pauseBeforeTakeover = Number(pauseBeforeTakeoverArg)
 const holdMs = Number.isFinite(Number(holdMsArg)) ? Number(holdMsArg) : 40
 await takeDirLock(lockDir, {
@@ -26,7 +36,8 @@ await takeDirLock(lockDir, {
     ? {
         beforeTakeover: async () => {
           appendFileSync(logPath, `paused ${process.pid}\n`)
-          while (!existsSync(`${lockDir}.go`)) await new Promise((resolve) => setTimeout(resolve, 20))
+          await waitForGate(`${lockDir}.go`)
+          appendFileSync(logPath, `resumed ${process.pid}\n`)
         },
       }
     : Number.isFinite(pauseBeforeTakeover) && pauseBeforeTakeoverArg !== undefined
@@ -35,7 +46,8 @@ await takeDirLock(lockDir, {
 })
 try {
   appendFileSync(logPath, `start ${process.pid}\n`)
-  await new Promise((resolve) => setTimeout(resolve, holdMs))
+  if (holdMsArg === "release") await waitForGate(`${lockDir}.release`)
+  else await new Promise((resolve) => setTimeout(resolve, holdMs))
   appendFileSync(logPath, `end ${process.pid}\n`)
 } finally {
   releaseDirLock(lockDir)

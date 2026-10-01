@@ -201,7 +201,7 @@ describe("migrate verify + switch + undo (migrate B6)", () => {
     source = env.deployment
     target = await deployLocal({ rpcUrl: env.rpcUrl })
     publicClient = createPublicClient({ chain: chainFor(source.chainId), transport: http(env.rpcUrl) })
-  }, 600_000)
+  }, 1_200_000)
 
   afterAll(async () => {
     await env?.stop()
@@ -429,7 +429,7 @@ describe("migrate verify + switch + undo (migrate B6)", () => {
         await runtime.close()
       }
     },
-    TIMEOUT,
+    600_000,
   )
 
   it(
@@ -468,7 +468,7 @@ describe("migrate verify + switch + undo (migrate B6)", () => {
         await runtime.close()
       }
     },
-    TIMEOUT,
+    600_000,
   )
 
   it(

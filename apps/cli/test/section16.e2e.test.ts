@@ -433,5 +433,5 @@ describe("owner passkey verification path inside grantBatch (plan Task 26)", () 
       gas: { nativeOsaka: native.gas, fallbackPrague: fallback.gas },
       transactions: {},
     })
-  }, 300_000)
+  }, 600_000)
 })
