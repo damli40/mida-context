@@ -157,10 +157,14 @@ describe("probeClaudeSafeMode", () => {
     resetClaudeSafeModeCache()
     vi.useRealTimers()
   })
-  const yes = async () => ({ status: 0, stdout: "--safe-mode  --tools" })
+  const yes = async () => ({ status: 0, stdout: "--safe-mode  --tools  --no-session-persistence" })
 
-  it("true when --help lists --safe-mode and --tools", async () => {
+  it("true when --help lists --safe-mode, --tools and --no-session-persistence", async () => {
     expect(await probeClaudeSafeMode(binary, yes)).toBe(true)
+  })
+
+  it("false when --no-session-persistence is missing — the command passes all three (UF-QD)", async () => {
+    expect(await probeClaudeSafeMode(binary, async () => ({ status: 0, stdout: "--safe-mode --tools" }))).toBe(false)
   })
 
   it("false on a non-zero status, and false when only one of the two words is present", async () => {
@@ -171,7 +175,7 @@ describe("probeClaudeSafeMode", () => {
 
   it("the answer is remembered per binary — one run for two calls, known synchronously after", async () => {
     let calls = 0
-    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools" })
+    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools --no-session-persistence" })
     expect(await probeClaudeSafeMode(binary, run)).toBe(true)
     expect(await probeClaudeSafeMode(binary, run)).toBe(true)
     expect(calls).toBe(1)
@@ -181,7 +185,7 @@ describe("probeClaudeSafeMode", () => {
   it("expires after ten minutes — a new probe runs", async () => {
     vi.useFakeTimers()
     let calls = 0
-    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools" })
+    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools --no-session-persistence" })
     expect(await probeClaudeSafeMode(binary, run)).toBe(true)
     vi.setSystemTime(Date.now() + 10 * 60 * 1000 + 1)
     expect(claudeSafeModeKnown(binary)).toBeUndefined()
@@ -192,7 +196,7 @@ describe("probeClaudeSafeMode", () => {
   it("a good run's answer is still remembered at nine minutes (UF-P2R)", async () => {
     vi.useFakeTimers()
     let calls = 0
-    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools" })
+    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools --no-session-persistence" })
     expect(await probeClaudeSafeMode(binary, run)).toBe(true)
     vi.setSystemTime(Date.now() + 9 * 60 * 1000)
     expect(claudeSafeModeKnown(binary)).toBe(true)
@@ -218,7 +222,7 @@ describe("probeClaudeSafeMode", () => {
 
   it("a different mtime is a different binary — it probes again", async () => {
     let calls = 0
-    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools" })
+    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools --no-session-persistence" })
     expect(await probeClaudeSafeMode(binary, run)).toBe(true)
     const day = 24 * 60 * 60 * 1000
     fs.utimesSync(binary, new Date(), new Date(Date.now() + day))
@@ -230,7 +234,7 @@ describe("probeClaudeSafeMode", () => {
     let calls = 0
     let release!: () => void
     const gate = new Promise<void>((r) => (release = r))
-    const run = async () => (calls++, await gate, { status: 0, stdout: "--safe-mode --tools" })
+    const run = async () => (calls++, await gate, { status: 0, stdout: "--safe-mode --tools --no-session-persistence" })
     const a = probeClaudeSafeMode(binary, run)
     const b = probeClaudeSafeMode(binary, run)
     release()
@@ -253,7 +257,7 @@ describe("claudeSafeModeKnown", () => {
 
   it("is undefined before any probe, and never runs anything itself", async () => {
     let calls = 0
-    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools" })
+    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools --no-session-persistence" })
     expect(claudeSafeModeKnown(binary)).toBeUndefined()
     await probeClaudeSafeMode(binary, run)
     expect(claudeSafeModeKnown(binary)).toBe(true)

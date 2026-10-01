@@ -106,13 +106,22 @@ export function secretInputStep(state: SecretInputState, chunk: Buffer): SecretI
       if (state.bytes.length === 0 && i < chunk.length - 1) continue
       state.status = "done"
       // bytes other than more line breaks after the Enter mean the paste kept
-      // going — the answer caught the middle of it and is only part of a key
+      // going — the answer caught the middle of it and is only part of a key.
+      // An escape sequence is not such a byte: the bracketed-paste end marker
+      // (\x1b[201~) follows the Enter inside the same pasted chunk (UF-QD)
       for (let j = i + 1; j < chunk.length; j++) {
         const rest = chunk[j]!
-        if (rest !== 0x0d && rest !== 0x0a) {
-          state.trailing = true
-          break
+        if (rest === 0x0d || rest === 0x0a) continue
+        if (rest === 0x1b) {
+          // skip a whole CSI sequence — Esc [ ... up to its final byte (0x40-0x7e)
+          if (chunk[j + 1] === 0x5b) {
+            j += 2
+            while (j < chunk.length && !(chunk[j]! >= 0x40 && chunk[j]! <= 0x7e)) j += 1
+          }
+          continue
         }
+        state.trailing = true
+        break
       }
       return state
     }

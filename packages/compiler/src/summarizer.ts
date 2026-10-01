@@ -141,7 +141,14 @@ export function probeClaudeSafeMode(
       (out) => {
         entry.ttl = out.status === 0 ? SAFE_MODE_CACHE_MS : SAFE_MODE_FAIL_CACHE_MS
         entry.at = Date.now()
-        return out.status === 0 && out.stdout.includes("--safe-mode") && out.stdout.includes("--tools")
+        // all three flags the safe-mode command passes — a binary that only knows some of
+        // them would still fail when invoked with the full argv
+        return (
+          out.status === 0 &&
+          out.stdout.includes("--safe-mode") &&
+          out.stdout.includes("--tools") &&
+          out.stdout.includes("--no-session-persistence")
+        )
       },
       () => {
         entry.ttl = SAFE_MODE_FAIL_CACHE_MS

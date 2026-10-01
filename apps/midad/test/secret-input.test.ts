@@ -100,6 +100,20 @@ describe("secretInputStep — the hidden prompt's key handling", () => {
     expect(state.trailing).toBe(false)
   })
 
+  it("the bracketed-paste end marker right after Enter is not trailing (UF-QD)", () => {
+    const state = type([B("\x1b[200~sk-1\r\x1b[201~")])
+    expect(state.status).toBe("done")
+    expect(answer(state)).toBe("sk-1")
+    expect(state.trailing).toBe(false)
+  })
+
+  it("plain bytes after Enter still mark the answer trailing (UF-QD)", () => {
+    const state = type([B("sk-1\rmore")])
+    expect(state.status).toBe("done")
+    expect(answer(state)).toBe("sk-1")
+    expect(state.trailing).toBe(true)
+  })
+
   it("a lone Esc does not swallow the next key", () => {
     const state = type([B("\x1bsk-abc\n")])
     expect(state.status).toBe("done")

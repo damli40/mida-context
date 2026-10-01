@@ -48,25 +48,42 @@ export interface ModelCommand {
  * error is worth the retry this guard would skip. Disk quota is not a plan limit.
  */
 export const USAGE_LIMIT_PATTERN =
-  /\b(?:usage|session|weekly|\d+-hour)[ -]limits?\b[^\n]{0,60}\b(?:reached|exceeded|hit)\b|\b(?:hit|reached|exceeded)\b[^\n]{0,60}\b(?:usage|session|weekly|\d+-hour)[ -]limits?\b|\binsufficient_quota\b|(?<!disk )\bquota exceeded\b|credit balance is too low/i
+  /\b(?:usage|session|weekly|\d+-hour)[ -]limits?\b[^\n]{0,60}\b(?:reached|exceeded|hit)\b|\b(?:hit|reached|exceeded)\b[^\n]{0,60}\b(?:usage|session|weekly|\d+-hour)[ -]limits?\b|\bhit your limit\b|\binsufficient_quota\b|(?<!disk )\bquota exceeded\b|credit balance is too low/i
 
 /**
  * Did the tool's OWN output name a usage limit? Codex prints the prompt back on
  * stderr before its answer, so a user request that merely mentions "rate limiter"
- * or "quota" must not make an unrelated failure look like a plan limit: every
- * candidate line that, trimmed, equals a trimmed line of the PROMPT — or is at
- * least 8 characters long and occurs anywhere inside it — is dropped first: it
- * is the tool's echo, not its words. The substring rule exists because the kept
- * stderr tail is capped at 4,096 characters, so an echoed prompt line can
- * arrive cut in half; the half that lands is still echo. What remains (the head
- * of stdout, the kept tail of stderr) is matched line by line.
+ * or "quota" must not make an unrelated failure look like a plan limit. Neither
+ * tool echoes the prompt on stdout, so every non-empty line of the kept head of
+ * stdout is examined. On stderr the echo is cut instead: when a trimmed line of
+ * the kept tail equals the prompt's last non-empty line, everything up to and
+ * including the last such line is the echo and only what follows is examined;
+ * otherwise every line is. (The old per-line "occurs in the prompt" rule dropped
+ * the real limit line when the session itself had ended on that limit — the
+ * transcript carried the sentence, so the prompt did too. UF-QD.)
  */
 export function limitHit(prompt: string, stdout: string, stderrTail: string): boolean {
-  const echoed = new Set(prompt.split("\n").map((line) => line.trim()))
-  for (const raw of `${stdout.slice(0, 4096)}\n${stderrTail}`.split("\n")) {
+  for (const raw of stdout.slice(0, 4096).split("\n")) {
     const line = raw.trim()
-    if (line === "" || echoed.has(line) || (line.length >= 8 && prompt.includes(line))) continue
-    if (USAGE_LIMIT_PATTERN.test(line)) return true
+    if (line !== "" && USAGE_LIMIT_PATTERN.test(line)) return true
+  }
+  let lines = stderrTail.split("\n")
+  const promptLines = prompt.split("\n")
+  let last: string | undefined
+  for (let i = promptLines.length - 1; i >= 0 && last === undefined; i--) {
+    const trimmed = promptLines[i]!.trim()
+    if (trimmed !== "") last = trimmed
+  }
+  if (last !== undefined) {
+    let cut = -1
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i]!.trim() === last) cut = i
+    }
+    if (cut >= 0) lines = lines.slice(cut + 1)
+  }
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (line !== "" && USAGE_LIMIT_PATTERN.test(line)) return true
   }
   return false
 }

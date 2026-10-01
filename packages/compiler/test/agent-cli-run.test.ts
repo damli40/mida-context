@@ -294,6 +294,23 @@ describe("limitHit", () => {
     expect(limitHit("", "", "")).toBe(false)
   })
 
+  it("a limit line the session itself ended on is still recognised on stdout (UF-QD)", () => {
+    // the transcript — and so the prompt — carries the very sentence the tool repeats
+    const prompt = "Summarise this.\nClaude AI usage limit reached|1759363200"
+    expect(limitHit(prompt, "Claude AI usage limit reached|1759363200", "")).toBe(true)
+  })
+
+  it("only what the tool printed AFTER its echo counts on stderr (UF-QD)", () => {
+    const prompt = "Summarise this.\nwe hit the weekly limit on the API\nEND"
+    expect(limitHit(prompt, "", `${prompt}\nYou've hit your usage limit.`)).toBe(true)
+    // when the whole prompt echoes and the rest is an unrelated error, nothing counts
+    expect(limitHit(prompt, "", `${prompt}\nError: not logged in`)).toBe(false)
+  })
+
+  it("the wording 'hit your limit' counts even without a limit noun (UF-QD)", () => {
+    expect(limitHit("", "", "You've hit your limit · resets 3pm")).toBe(true)
+  })
+
   it("a line that is just the echoed prompt does not count", () => {
     const prompt = "Summarise this.\nwe hit the weekly limit on the API"
     expect(limitHit(prompt, "", `Summarise this.\nwe hit the weekly limit on the API`)).toBe(false)
@@ -301,12 +318,13 @@ describe("limitHit", () => {
     expect(limitHit(prompt, "", "we hit the weekly limit elsewhere")).toBe(true)
   })
 
-  it("a line that is only a half-echoed prompt line does not count either (UF-P2R)", () => {
+  it("a line that is only a half-echoed prompt line does count now (UF-QD)", () => {
     // the stderr tail is capped at 4,096 characters, so an echoed prompt line can arrive cut
-    // in half — the half that lands is still the tool's echo, not its words
+    // in half — the prompt's last line is not in the tail, so there is no echo to cut and
+    // the half that lands is examined like any other tool line
     const prompt = "Summarise this.\nfirst half: we hit the weekly limit on the API"
-    expect(limitHit(prompt, "", "we hit the weekly limit on the API")).toBe(false)
-    // a short line (< 8 trimmed chars) still requires the exact-line rule
+    expect(limitHit(prompt, "", "we hit the weekly limit on the API")).toBe(true)
+    // a non-matching line still answers false either way
     expect(limitHit(prompt, "", "API")).toBe(false)
   })
 })
