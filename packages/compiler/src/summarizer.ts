@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process"
 import { accessSync, statSync, constants } from "node:fs"
 import { delimiter, join } from "node:path"
 import type { ModelCommand } from "./compile.js"
-import { compileModelChoice, providerHost, providerModelCommand } from "./model-choice.js"
+import { COMPILE_PROVIDERS, compileModelChoice, providerHost, providerModelCommand } from "./model-choice.js"
 
 export const CLAUDE_SUMMARY_MODEL_DEFAULT = "haiku"
 export const CODEX_SUMMARY_MODEL_DEFAULT = "gpt-6-luna"
@@ -190,18 +190,31 @@ export function resolveSummarizer(input: {
   })
 
   // 1. A saved key provider is the whole chain — one entry, no fallback, the key
-  // rides on the command's env and never into argv, label or display.
+  // rides on the command's env and never into argv, label or display. Every value
+  // the model script can read is PINNED here: a stray DEEPSEEK_BASE_URL or
+  // MIDA_COMPILE_API_KEY in the daemon's environment must never redirect a saved
+  // choice (or lend it a key the owner did not save).
   if (saved?.use === "key") {
     const provider = saved.provider
     const extra: Record<string, string> =
       provider === "deepseek"
-        ? { DEEPSEEK_API_KEY: saved.apiKey, ...(saved.model !== undefined ? { DEEPSEEK_MODEL: saved.model } : {}) }
+        ? {
+            DEEPSEEK_API_KEY: saved.apiKey,
+            DEEPSEEK_BASE_URL: COMPILE_PROVIDERS.deepseek.baseDefault,
+            DEEPSEEK_MODEL: saved.model ?? COMPILE_PROVIDERS.deepseek.modelDefault,
+          }
         : provider === "kimi"
-          ? { KIMI_API_KEY: saved.apiKey, ...(saved.model !== undefined ? { KIMI_MODEL: saved.model } : {}) }
+          ? {
+              KIMI_API_KEY: saved.apiKey,
+              KIMI_BASE_URL: COMPILE_PROVIDERS.kimi.baseDefault,
+              KIMI_MODEL: saved.model ?? COMPILE_PROVIDERS.kimi.modelDefault,
+            }
           : {
               MIDA_COMPILE_BASE_URL: saved.baseUrl ?? "",
               MIDA_COMPILE_MODEL_ID: saved.model ?? "",
-              ...(saved.apiKey !== "" ? { MIDA_COMPILE_API_KEY: saved.apiKey } : {}),
+              // the saved key ALWAYS — the empty string included, so an inherited
+              // MIDA_COMPILE_API_KEY can never ride to the owner's own endpoint
+              MIDA_COMPILE_API_KEY: saved.apiKey,
             }
     const withExtra = { ...env, ...extra }
     const command = providerModelCommand(withExtra, provider)
@@ -243,7 +256,7 @@ export function resolveSummarizer(input: {
         installed: true,
       }
     })
-    if (entries[entries.length - 1]?.id === "claude" && pin !== "haiku") entries.push(codexEntry())
+    if (entries[entries.length - 1]?.id === "claude" && pin !== "haiku" && pin !== "custom") entries.push(codexEntry())
     return choice("environment", true, entries)
   }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { mkdtempSync, statSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, statSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -49,6 +49,14 @@ describe("summarizer store", () => {
       { use: "key", provider: "custom", apiKey: "x", baseUrl: "http://h/v1" }, // no model
       { use: "key", provider: "custom", apiKey: "x", baseUrl: "http://h/v1", model: "" },
       { use: "key", provider: "deepseek", apiKey: "x", model: 5 },
+      // only the exact shapes pass — a stray key anywhere makes the file invalid
+      { use: "agents", provider: "custom", baseUrl: "http://h/v1" },
+      { use: "agents", extra: 1 },
+      { use: "key", provider: "deepseek", apiKey: "x", model: "" },
+      { use: "key", provider: "deepseek", apiKey: "x", baseUrl: "http://h/v1" }, // baseUrl is a custom-only key
+      { use: "key", provider: "kimi", apiKey: "x", baseUrl: "http://h/v1" },
+      { use: "key", provider: "custom", apiKey: "x", baseUrl: "http://h/v1", model: "m", extra: 1 },
+      { use: "key" },
     ]
     for (const shape of badShapes) {
       const dir = home()
@@ -57,6 +65,18 @@ describe("summarizer store", () => {
     }
     const dir = home()
     writeFileSync(dir.path(SUMMARIZER_FILE), "this is not json{")
+    expect(readSummarizer(dir)).toBe("invalid")
+  })
+
+  it("a dangling symlink at the path reads as invalid, not absent — the service fails closed", () => {
+    const dir = home()
+    symlinkSync(join(dir.root, "no-such-target"), dir.path(SUMMARIZER_FILE))
+    expect(readSummarizer(dir)).toBe("invalid")
+  })
+
+  it("a folder at the path reads as invalid, not absent", () => {
+    const dir = home()
+    mkdirSync(dir.path(SUMMARIZER_FILE))
     expect(readSummarizer(dir)).toBe("invalid")
   })
 

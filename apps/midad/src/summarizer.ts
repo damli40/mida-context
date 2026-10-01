@@ -3,6 +3,7 @@
 // is read on EVERY save, never cached: a `mida summariser …` write between two
 // saves must change the next compile without a restart.
 
+import { lstatSync } from "node:fs"
 import { binaryOnPath, claudeSupportsSafeMode, resolveSummarizer } from "@mida/compiler"
 import type { CompileInput, CompileResult, SummarizerChoice, SummarizerSaved } from "@mida/compiler"
 import type { compileCheckpoint } from "@mida/compiler"
@@ -21,29 +22,39 @@ const isString = (value: unknown): value is string => typeof value === "string"
  * cannot be read must never silently fall back to another vendor.
  */
 export function readSummarizer(home: MidaHome): SummarizerSaved | "invalid" | undefined {
+  // "Absent" means lstat finds NOTHING at the path. Anything that exists but is not
+  // exactly one of the two shapes — a dangling symlink, a folder, an unreadable or
+  // unparseable file — is "invalid": the service fails closed rather than fall back
+  // to a vendor the owner never chose.
+  try {
+    lstatSync(home.path(SUMMARIZER_FILE))
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? undefined : "invalid"
+  }
   let value: unknown
   try {
-    if (!home.has(SUMMARIZER_FILE)) return undefined
     value = home.readJson<unknown>(SUMMARIZER_FILE)
+    if (value === undefined) return "invalid" // lstat saw it; it could not be read as a file
   } catch {
     return "invalid"
   }
   if (!isRecord(value)) return "invalid"
-  if (value.use === "agents") return { use: "agents" }
+  // exactly these shapes — any other key in the object makes it invalid
+  const keys = Object.keys(value)
+  const exact = (...allowed: string[]) => keys.length === allowed.length && allowed.every((k) => keys.includes(k))
+  if (value.use === "agents") return exact("use") ? { use: "agents" } : "invalid"
   if (value.use === "key") {
     const provider = value.provider
-    if (provider !== "deepseek" && provider !== "kimi" && provider !== "custom") return "invalid"
-    if (!isString(value.apiKey)) return "invalid"
-    if (provider !== "custom" && value.apiKey === "") return "invalid"
-    if (provider === "custom" && (!isString(value.baseUrl) || value.baseUrl === "" || !isString(value.model) || value.model === "")) return "invalid"
-    if (value.baseUrl !== undefined && !isString(value.baseUrl)) return "invalid"
-    if (value.model !== undefined && !isString(value.model)) return "invalid"
-    return {
-      use: "key",
-      provider,
-      apiKey: value.apiKey,
-      baseUrl: value.baseUrl as string | undefined,
-      model: value.model as string | undefined,
+    if (provider === "deepseek" || provider === "kimi") {
+      if (!exact("use", "provider", "apiKey", ...(value.model !== undefined ? ["model"] : []))) return "invalid"
+      if (!isString(value.apiKey) || value.apiKey === "") return "invalid"
+      if (value.model !== undefined && (!isString(value.model) || value.model === "")) return "invalid"
+      return { use: "key", provider, apiKey: value.apiKey, baseUrl: undefined, model: value.model as string | undefined }
+    }
+    if (provider === "custom") {
+      if (!exact("use", "provider", "apiKey", "baseUrl", "model")) return "invalid"
+      if (!isString(value.apiKey) || !isString(value.baseUrl) || value.baseUrl === "" || !isString(value.model) || value.model === "") return "invalid"
+      return { use: "key", provider, apiKey: value.apiKey, baseUrl: value.baseUrl, model: value.model }
     }
   }
   return "invalid"

@@ -184,15 +184,66 @@ describe("resolveSummarizer", () => {
     expect(e.command.env).toMatchObject({ KIMI_API_KEY: "kk", KIMI_MODEL: "kimi-y" })
   })
 
-  it("a saved custom endpoint sets base/model; an empty key sets no MIDA_COMPILE_API_KEY", () => {
+  it("a saved custom endpoint sets base/model; an empty key still pins MIDA_COMPILE_API_KEY to the empty string", () => {
     const r = resolve({
       saved: { use: "key", provider: "custom", apiKey: "", baseUrl: "http://localhost:8080/v1", model: "m-local" },
+      env: { MIDA_COMPILE_API_KEY: "env-key" }, // a stray env key must never reach a saved endpoint
     })
     const e = r.entries[0]!
     expect(e.display).toBe("your endpoint (m-local)")
     expect(e.host).toBe("localhost:8080")
-    expect(e.command.env).toMatchObject({ MIDA_COMPILE_BASE_URL: "http://localhost:8080/v1", MIDA_COMPILE_MODEL_ID: "m-local" })
-    expect(e.command.env).not.toHaveProperty("MIDA_COMPILE_API_KEY")
+    // the whole pinned env — the saved key ALWAYS wins, the empty string included
+    expect(e.command.env).toEqual({
+      MIDA_COMPILE_BASE_URL: "http://localhost:8080/v1",
+      MIDA_COMPILE_MODEL_ID: "m-local",
+      MIDA_COMPILE_API_KEY: "",
+    })
+  })
+
+  it("a saved deepseek key pins the whole env — a stray DEEPSEEK_BASE_URL cannot redirect it", () => {
+    const r = resolve({
+      saved: { use: "key", provider: "deepseek", apiKey: "sk-deep" },
+      env: { DEEPSEEK_BASE_URL: "https://evil.example", DEEPSEEK_MODEL: "env-model", DEEPSEEK_API_KEY: "env-key" },
+    })
+    const e = r.entries[0]!
+    expect(e.command.env).toEqual({
+      DEEPSEEK_API_KEY: "sk-deep",
+      DEEPSEEK_BASE_URL: "https://api.deepseek.com",
+      DEEPSEEK_MODEL: "deepseek-flash",
+    })
+    expect(e.host).toBe("api.deepseek.com")
+    expect(e.label).toBe("deepseek-flash")
+  })
+
+  it("a saved kimi key pins the whole env the same way", () => {
+    const r = resolve({
+      saved: { use: "key", provider: "kimi", apiKey: "kk", model: "kimi-y" },
+      env: { KIMI_BASE_URL: "https://evil.example", KIMI_API_KEY: "env-key" },
+    })
+    const e = r.entries[0]!
+    expect(e.command.env).toEqual({
+      KIMI_API_KEY: "kk",
+      KIMI_BASE_URL: "https://api.moonshot.ai",
+      KIMI_MODEL: "kimi-y",
+    })
+    expect(e.host).toBe("api.moonshot.ai")
+  })
+
+  it("MIDA_COMPILE_MODEL=custom with MIDA_COMPILE_FALLBACK=1 still never grows a codex tail", () => {
+    const r = resolve({
+      env: {
+        MIDA_COMPILE_MODEL: "custom",
+        MIDA_COMPILE_FALLBACK: "1",
+        MIDA_COMPILE_BASE_URL: "http://h:9/v1",
+        MIDA_COMPILE_MODEL_ID: "m",
+        DEEPSEEK_API_KEY: "k",
+      },
+      onPath: onPath("claude", "codex"),
+    })
+    expect(r.mode).toBe("environment")
+    // the vendor order behind a pinned custom — and no Codex: a privacy pin must
+    // not send the session text to an agent CLI's vendor either
+    expect(r.entries.map((e) => e.id)).toEqual(["custom", "deepseek", "claude"])
   })
 
   it("DEEPSEEK_API_KEY alone: environment mode, deepseek then claude then codex (rule 3)", () => {
