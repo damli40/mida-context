@@ -35,10 +35,12 @@ interface Fixture {
   /** in-flight overlap on the per-object work that is still per-object after in-35 R-1: the epoch-key fetch */
   wrapInFlight: { max: number }
   wrapCalls: bigint[]
+  /** CHAIN-04 tests: the next N wrap fetches fail */
+  failWraps: number
   tamper?: (record: Record<string, unknown>, contextId: Hex) => Record<string, unknown>
 }
 
-function fixture(count = 12, delayMs = 12, epochs = 2): Fixture {
+function fixture(count = 12, delayMs = 12, epochs = 2, epochKeyCache?: Map<string, Promise<Uint8Array>>): Fixture {
   const deployment = {
     chainId: CHAIN_ID,
     capabilityRegistry: CAPABILITY_REGISTRY,
@@ -50,6 +52,7 @@ function fixture(count = 12, delayMs = 12, epochs = 2): Fixture {
     objects: [],
     wrapInFlight: { max: 0 },
     wrapCalls: [],
+    failWraps: 0,
   }
   const records = new Map<string, Record<string, unknown>>()
   // The wire shape (AnchoredObject): the manifest is the parsed object and the ciphertext is
@@ -127,6 +130,10 @@ function fixture(count = 12, delayMs = 12, epochs = 2): Fixture {
     listObjects: async () => ({ objects, partial: false }),
     getEpochWrap: async (params: { readEpoch: bigint }) => {
       fx.wrapCalls.push(params.readEpoch)
+      if (fx.failWraps > 0) {
+        fx.failWraps -= 1
+        throw new Error("store unreachable")
+      }
       wrapInFlight += 1
       fx.wrapInFlight.max = Math.max(fx.wrapInFlight.max, wrapInFlight)
       try {
@@ -156,6 +163,7 @@ function fixture(count = 12, delayMs = 12, epochs = 2): Fixture {
     encryptionPrivateKey: AGENT_PRIVATE,
     chain: { deployment, account: { address: `0x${"55".repeat(20)}` }, publicClient } as never,
     api: api as never,
+    ...(epochKeyCache === undefined ? {} : { epochKeyCache }),
     grants: [
       {
         owner: OWNER,
@@ -198,6 +206,33 @@ describe("MidaAgent.read bounded concurrency (R4-2)", () => {
     const fx = fixture(12)
     await fx.agent.read(OWNER, NAMESPACE)
     expect(fx.wrapCalls.sort()).toEqual([1n, 2n])
+  })
+
+  // CHAIN-04 (Oct 1): on testnet the two key fetches cost ~2 s of a ~5 s read, every read, for
+  // keys that never change for a past epoch — they are kept beyond one read
+  it("a second read on the same agent fetches no epoch key again (CHAIN-04)", async () => {
+    const fx = fixture(12)
+    await fx.agent.read(OWNER, NAMESPACE)
+    await fx.agent.read(OWNER, NAMESPACE)
+    expect(fx.wrapCalls.sort()).toEqual([1n, 2n])
+  })
+
+  it("a shared epoch-key cache carries keys across agent instances, as the daemon rebuilds agents per read (CHAIN-04)", async () => {
+    const shared = new Map<string, Promise<Uint8Array>>()
+    const first = fixture(12, 12, 2, shared)
+    await first.agent.read(OWNER, NAMESPACE)
+    const second = fixture(12, 12, 2, shared)
+    const results = await second.agent.read(OWNER, NAMESPACE)
+    expect(second.wrapCalls).toEqual([])
+    expect(results.map((o) => o.payload.value)).toEqual(second.objects.map((o) => o.value))
+  })
+
+  it("a failed epoch-key fetch is never remembered — the next read tries again (CHAIN-04)", async () => {
+    const fx = fixture(4, 1, 1)
+    fx.failWraps = 1
+    await expect(fx.agent.read(OWNER, NAMESPACE)).rejects.toThrow()
+    const results = await fx.agent.read(OWNER, NAMESPACE)
+    expect(results).toHaveLength(4)
   })
 
   it("one object failing verification still fails the whole read", async () => {
