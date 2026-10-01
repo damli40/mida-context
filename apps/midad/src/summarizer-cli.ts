@@ -31,25 +31,66 @@ export interface SecretInputState {
   status: "typing" | "done" | "abandoned"
   /** the bytes kept so far — never a decoded string, so a half-typed UTF-8 char stays intact */
   bytes: number[]
-  /** 1 = saw 0x1b, waiting for '['; 2 = inside a CSI sequence, skipping until its final byte */
-  escape: 0 | 1 | 2
+  /**
+   * Escape-sequence state carried between chunks: 1 = saw Esc; 2 = inside a CSI
+   * sequence, skipping until its final byte; 3 = inside an OSC sequence, skipping
+   * until BEL or Esc \; 4 = inside an Esc O sequence, skipping one byte;
+   * 5 = inside an OSC sequence and just saw Esc.
+   */
+  escape: 0 | 1 | 2 | 3 | 4 | 5
+  /**
+   * Set when the Enter that ended the input was followed, in the same chunk, by
+   * bytes other than more line breaks — the prompt caught the middle of a paste,
+   * so the answer is only the part before the break.
+   */
+  trailing: boolean
 }
 
 export function secretInputStart(): SecretInputState {
-  return { status: "typing", bytes: [], escape: 0 }
+  return { status: "typing", bytes: [], escape: 0, trailing: false }
 }
 
 export function secretInputStep(state: SecretInputState, chunk: Buffer): SecretInputState {
   if (state.status !== "typing") return state
-  for (const byte of chunk) {
+  for (let i = 0; i < chunk.length; i++) {
+    const byte = chunk[i]!
     if (state.escape === 2) {
       // a CSI sequence (arrow keys, bracketed-paste markers) ends at the first byte in 0x40-0x7e
       if (byte >= 0x40 && byte <= 0x7e) state.escape = 0
       continue
     }
-    if (state.escape === 1) {
-      state.escape = byte === 0x5b ? 2 : 0
+    if (state.escape === 3) {
+      // an OSC sequence ends at BEL, or at the \ of an Esc \ pair
+      if (byte === 0x07) state.escape = 0
+      else if (byte === 0x1b) state.escape = 5
       continue
+    }
+    if (state.escape === 5) {
+      // Esc inside an OSC: \ closes it, another Esc keeps waiting, anything else is payload
+      state.escape = byte === 0x5c ? 0 : byte === 0x1b ? 5 : 3
+      continue
+    }
+    if (state.escape === 4) {
+      // Esc O <one byte> — a function key; all three bytes are dropped
+      state.escape = 0
+      continue
+    }
+    if (state.escape === 1) {
+      if (byte === 0x5b) {
+        state.escape = 2
+        continue
+      }
+      if (byte === 0x4f) {
+        state.escape = 4
+        continue
+      }
+      if (byte === 0x5d) {
+        state.escape = 3
+        continue
+      }
+      // a lone Esc ignores only itself — the next byte is handled like any other,
+      // so Esc then Enter still ends the input and Esc then a letter keeps the letter
+      state.escape = 0
     }
     if (byte === 0x1b) {
       state.escape = 1
@@ -60,7 +101,19 @@ export function secretInputStep(state: SecretInputState, chunk: Buffer): SecretI
       return state
     }
     if (byte === 0x0d || byte === 0x0a) {
+      // a break with nothing typed and more bytes in this chunk is the leading
+      // line break of a paste, not an empty answer
+      if (state.bytes.length === 0 && i < chunk.length - 1) continue
       state.status = "done"
+      // bytes other than more line breaks after the Enter mean the paste kept
+      // going — the answer caught the middle of it and is only part of a key
+      for (let j = i + 1; j < chunk.length; j++) {
+        const rest = chunk[j]!
+        if (rest !== 0x0d && rest !== 0x0a) {
+          state.trailing = true
+          break
+        }
+      }
       return state
     }
     if (byte === 0x04) {
@@ -87,9 +140,42 @@ export function secretInputStep(state: SecretInputState, chunk: Buffer): SecretI
   return state
 }
 
-/** A trimmed key with a space or a control character in it is a paste slip, not a key. */
-function keyHasHiddenChars(key: string): boolean {
-  return /[ \x00-\x1f]/.test(key)
+/**
+ * What the hidden key prompt hands back (UF-QB): the raw answer plus `trailing` —
+ * set when the Enter that ended the prompt was followed by more input in the same
+ * burst, meaning the answer is only the first line of a paste and must be refused.
+ * A bare string is the old shape: the whole answer, never trailing.
+ */
+export interface SecretKeyAnswer {
+  key: string
+  trailing?: boolean
+}
+export type SecretPromptResult = string | SecretKeyAnswer | undefined
+
+/** A real key is only printable ASCII — anything else is a paste slip, not a key. */
+const PLAIN_KEY = /^[\x21-\x7e]+$/
+
+/**
+ * The key the prompt returned, cleaned: trimmed, then one pair of surrounding
+ * quotes removed — people paste `"sk-…"` straight from a doc. `trailing` means
+ * input followed the Enter that ended the prompt, so the key is partial.
+ */
+function keyFromAnswer(raw: SecretPromptResult): { key: string; trailing: boolean } | undefined {
+  if (raw === undefined) return undefined
+  const answer = typeof raw === "string" ? { key: raw, trailing: false } : { key: raw.key, trailing: raw.trailing === true }
+  let key = answer.key.trim()
+  if (
+    key.length >= 2 &&
+    ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'")))
+  ) {
+    key = key.slice(1, -1)
+  }
+  return { key, trailing: answer.trailing }
+}
+
+/** Whether the cleaned key must be refused: partial paste, or not only printable ASCII. */
+function keyRefused(cleaned: { key: string; trailing: boolean }): boolean {
+  return cleaned.trailing || (cleaned.key !== "" && !PLAIN_KEY.test(cleaned.key))
 }
 
 export interface SummarizerCliDeps {
@@ -101,7 +187,7 @@ export interface SummarizerCliDeps {
   stdoutIsTTY?: boolean
   /** undefined means the prompt was abandoned (Ctrl-C, Ctrl-D, stdin ending) — save nothing */
   prompt?: (question: string) => Promise<string | undefined>
-  secretPrompt?: (question: string) => Promise<string | undefined>
+  secretPrompt?: (question: string) => Promise<SecretPromptResult>
   onPath?: (bin: string) => boolean
   claudeSafeMode?: () => boolean
   /** The async `claude --help` probe — only `test` runs it, and only when claude is on PATH. */
@@ -295,7 +381,7 @@ async function showSummarizer(deps: SummarizerCliDeps): Promise<number> {
 export async function askSummarizerKey(deps: {
   print: (line: string) => void
   prompt: (question: string) => Promise<string | undefined>
-  secretPrompt: (question: string) => Promise<string | undefined>
+  secretPrompt: (question: string) => Promise<SecretPromptResult>
 }): Promise<SummarizerSaved | undefined> {
   const { print, prompt, secretPrompt } = deps
   print("Which provider?")
@@ -322,10 +408,10 @@ export async function askSummarizerKey(deps: {
     let bad = 0
     for (;;) {
       const raw = await secretPrompt("API key (typing is hidden): ")
-      if (raw === undefined) return undefined
-      const apiKey = raw.trim()
-      if (apiKey !== "" && !keyHasHiddenChars(apiKey)) return { use: "key", provider, apiKey }
-      print(apiKey === "" ? "No key entered." : "That key has spaces or hidden characters in it. Paste it again.")
+      const cleaned = keyFromAnswer(raw)
+      if (cleaned === undefined) return undefined
+      if (cleaned.key !== "" && !keyRefused(cleaned)) return { use: "key", provider, apiKey: cleaned.key }
+      print(cleaned.key === "" && !cleaned.trailing ? "No key entered." : "That key has spaces or hidden characters in it. Paste it again.")
       bad++
       if (bad >= 3) return undefined
     }
@@ -363,9 +449,9 @@ export async function askSummarizerKey(deps: {
   let badKey = 0
   for (;;) {
     const raw = await secretPrompt("API key (typing is hidden; leave empty if your endpoint needs none): ")
-    if (raw === undefined) return undefined
-    const apiKey = raw.trim()
-    if (!keyHasHiddenChars(apiKey)) return { use: "key", provider: "custom", apiKey, baseUrl, model }
+    const cleaned = keyFromAnswer(raw)
+    if (cleaned === undefined) return undefined
+    if (!keyRefused(cleaned)) return { use: "key", provider: "custom", apiKey: cleaned.key, baseUrl, model }
     print("That key has spaces or hidden characters in it. Paste it again.")
     badKey++
     if (badKey >= 3) return undefined
@@ -405,7 +491,7 @@ export async function chooseSummarizer(deps: {
   env: NodeJS.ProcessEnv
   print: (line: string) => void
   prompt: (question: string) => Promise<string | undefined>
-  secretPrompt: (question: string) => Promise<string | undefined>
+  secretPrompt: (question: string) => Promise<SecretPromptResult>
   onPath: (bin: string) => boolean
   /** drops input already buffered on stdin, the way approve does before its "Type yes" */
   drain?: () => unknown | Promise<unknown>

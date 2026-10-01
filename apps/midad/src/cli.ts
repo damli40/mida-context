@@ -22,7 +22,7 @@ import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
 import { bannerLines } from "./banner.js"
 import { readSummarizer, currentSummarizer } from "./summarizer.js"
 import { chooseSummarizer, runSummarizer, secretInputStart, secretInputStep } from "./summarizer-cli.js"
-import type { SecretInputState } from "./summarizer-cli.js"
+import type { SecretInputState, SecretPromptResult } from "./summarizer-cli.js"
 import { buildHandoff, generalAssistanceText, identityUnreadableText, isGeneralAssistant, noIdentityText, projectCheckRefusal } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
@@ -202,7 +202,7 @@ export interface CliDeps {
    * The hidden prompt for secrets — `summarizer use key` reads the API key through it, so the
    * typed key never echoes. The default reads stdin raw; tests inject an answer.
    */
-  secretPrompt?: (question: string) => Promise<string>
+  secretPrompt?: (question: string) => Promise<SecretPromptResult>
   /**
    * Whether a binary sits on PATH — `init` and `install` ask which agent CLIs exist before
    * offering the summariser choice. The default is a real PATH lookup; tests inject it.
@@ -900,7 +900,7 @@ function summarizerChoiceDeps(deps: {
   env?: Record<string, string | undefined>
   print: (line: string) => void
   prompt?: (question: string) => Promise<string | undefined>
-  secretPrompt?: (question: string) => Promise<string | undefined>
+  secretPrompt?: (question: string) => Promise<SecretPromptResult>
   onPath?: (bin: string) => boolean
   drainInput?: () => unknown | Promise<unknown>
 }): Parameters<typeof chooseSummarizer>[0] {
@@ -1975,7 +1975,7 @@ function terminalPromptOrAbandoned(question: string): Promise<string | undefined
  * Only ever called when stdin is a real terminal; without one it falls back to a plain
  * question so nothing hangs.
  */
-function terminalSecretPrompt(question: string): Promise<string | undefined> {
+function terminalSecretPrompt(question: string): Promise<SecretPromptResult> {
   const stdin = process.stdin
   const stdout = process.stdout
   if (stdin.isTTY !== true || typeof stdin.setRawMode !== "function") return terminalPromptOrAbandoned(question)
@@ -1988,7 +1988,7 @@ function terminalSecretPrompt(question: string): Promise<string | undefined> {
       stdin.setRawMode(wasRaw)
       stdin.pause()
       stdout.write("\n")
-      resolve(s.status === "done" ? Buffer.from(s.bytes).toString("utf8") : undefined)
+      resolve(s.status === "done" ? { key: Buffer.from(s.bytes).toString("utf8"), trailing: s.trailing } : undefined)
     }
     const onData = (chunk: Buffer) => {
       state = secretInputStep(state, chunk)
@@ -2555,7 +2555,7 @@ export function runInstall(
     stdoutIsTTY?: boolean
     /** The summariser choice's prompts — injected in tests. */
     prompt?: (question: string) => Promise<string>
-    secretPrompt?: (question: string) => Promise<string>
+    secretPrompt?: (question: string) => Promise<SecretPromptResult>
     /** The PATH probe the choice block asks about claude/codex — injected in tests. */
     onPath?: (bin: string) => boolean
     /** The environment the choice resolves against — injected in tests. */

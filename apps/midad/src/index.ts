@@ -67,7 +67,7 @@ export { MIGRATION_REFUSAL, SOCKET_FILE, callDaemon, ensureDaemon, ensureDaemonS
 export type { ControlReply } from "./control.js"
 export { SUMMARIZER_FILE, compileWithSummarizer, currentSummarizer, readSummarizer, summarizerSummary, writeSummarizer } from "./summarizer.js"
 export { askSummarizerKey, chooseSummarizer, runSummarizer, secretInputStart, secretInputStep } from "./summarizer-cli.js"
-export type { ProbeResult, SecretInputState, SummarizerCliDeps } from "./summarizer-cli.js"
+export type { ProbeResult, SecretInputState, SecretKeyAnswer, SecretPromptResult, SummarizerCliDeps } from "./summarizer-cli.js"
 export { BANNER, BANNER_PLAIN, bannerLines } from "./banner.js"
 export { startDaemon } from "./daemon.js"
 export type { DaemonDeps, DaemonHandle } from "./daemon.js"

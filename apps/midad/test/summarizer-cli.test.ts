@@ -8,6 +8,7 @@ import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { MidaHome, NEEDS_TERMINAL_LINE, USAGE, askSummarizerKey, chooseSummarizer, readSummarizer, runSummarizer, writeSummarizer } from "@mida/midad"
+import type { SecretKeyAnswer } from "@mida/midad"
 import type { ModelCommand } from "@mida/compiler"
 
 type ProbeResult = { ok: true; ms: number } | { ok: false; why: "limit" | "missing" | "timeout" | "failed"; detail: string; ms: number }
@@ -28,7 +29,8 @@ function rig(
     env?: Record<string, string>
     /** each entry is one typed answer; an explicit undefined is an abandoned prompt (Ctrl-C/Ctrl-D) */
     answers?: (string | undefined)[]
-    secrets?: (string | undefined)[]
+    /** each entry is one hidden-prompt answer — a string, or {key, trailing} like a paste that kept going after Enter */
+    secrets?: (string | SecretKeyAnswer | undefined)[]
     onPath?: (bin: string) => boolean
     stdinIsTTY?: boolean
     stdoutIsTTY?: boolean
@@ -392,6 +394,71 @@ describe("mida summarizer use", () => {
     expect(readSummarizer(dir)).toBeUndefined()
   })
 
+  // UF-QB1: the hidden prompt reports when the Enter ended a chunk that still held input —
+  // the saved part of a mid-paste break is not a key.
+  it("a key the prompt marked trailing is refused and asked again (UF-QB)", async () => {
+    const dir = home()
+    const r = rig(dir, {
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      answers: ["1"],
+      secrets: [{ key: "sk-ab", trailing: true }, "sk-clean"],
+    })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(0)
+    expect(r.lines).toContain("That key has spaces or hidden characters in it. Paste it again.")
+    expect(readSummarizer(dir)).toEqual({ use: "key", provider: "deepseek", apiKey: "sk-clean" })
+  })
+
+  it("one pair of surrounding quotes is removed before the key is saved (UF-QB)", async () => {
+    const dir = home()
+    const r = rig(dir, { stdinIsTTY: true, stdoutIsTTY: true, answers: ["1"], secrets: ['"sk-abc"'] })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(0)
+    expect(readSummarizer(dir)).toEqual({ use: "key", provider: "deepseek", apiKey: "sk-abc" })
+
+    const dir2 = home()
+    const single = rig(dir2, { stdinIsTTY: true, stdoutIsTTY: true, answers: ["1"], secrets: ["'sk-abc'"] })
+    expect(await single.run(["summarizer", "use", "key"])).toBe(0)
+    expect(readSummarizer(dir2)).toEqual({ use: "key", provider: "deepseek", apiKey: "sk-abc" })
+  })
+
+  it("a key that is not plain printable ASCII is refused (UF-QB)", async () => {
+    // a zero-width space, a non-breaking space, and a decode-broken U+FFFD
+    const hidden = [
+      "sk-1" + String.fromCharCode(0x200b),
+      "sk" + String.fromCharCode(0xa0) + "1",
+      "sk-" + String.fromCharCode(0xfffd),
+    ]
+    for (const bad of hidden) {
+    // ["sk-1​", "sk 1", "sk-"]
+    // ["sk-1​", "sk 1", "sk-"]) {
+      const dir = home()
+      const r = rig(dir, { stdinIsTTY: true, stdoutIsTTY: true, answers: ["1"], secrets: [bad, "sk-clean"] })
+      expect(await r.run(["summarizer", "use", "key"]), bad).toBe(0)
+      expect(r.lines).toContain("That key has spaces or hidden characters in it. Paste it again.")
+      expect(readSummarizer(dir)).toEqual({ use: "key", provider: "deepseek", apiKey: "sk-clean" })
+    }
+  })
+
+  it("key characters = / + - _ . are all fine (UF-QB)", async () => {
+    const dir = home()
+    const r = rig(dir, { stdinIsTTY: true, stdoutIsTTY: true, answers: ["1"], secrets: ["sk=a/b+c-d_e.f"] })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(0)
+    expect(readSummarizer(dir)).toEqual({ use: "key", provider: "deepseek", apiKey: "sk=a/b+c-d_e.f" })
+  })
+
+  it("a custom endpoint's key is checked the same way (UF-QB)", async () => {
+    const dir = home()
+    const r = rig(dir, {
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      answers: ["3", "https://openai.example/v1", "local-1"],
+      secrets: ["sp aced", "k-clean"],
+    })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(0)
+    expect(r.lines).toContain("That key has spaces or hidden characters in it. Paste it again.")
+    expect(readSummarizer(dir)).toEqual({ use: "key", provider: "custom", apiKey: "k-clean", baseUrl: "https://openai.example/v1", model: "local-1" })
+  })
+
   it("a URL with a username, a query or a fragment is refused with the base-address line (UF-P2R)", async () => {
     const dir = home()
     const r = rig(dir, {
@@ -648,7 +715,7 @@ describe("chooseSummarizer", () => {
 })
 
 describe("askSummarizerKey", () => {
-  function keyRig(dir: MidaHome, answers: string[], secrets: string[]) {
+  function keyRig(dir: MidaHome, answers: string[], secrets: (string | SecretKeyAnswer | undefined)[]) {
     const lines: string[] = []
     const prompts: string[] = []
     const secretQs: string[] = []

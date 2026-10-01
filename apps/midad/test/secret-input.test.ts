@@ -78,4 +78,67 @@ describe("secretInputStep — the hidden prompt's key handling", () => {
     expect(state.status).toBe("done")
     expect(answer(state)).toBe("sk-1")
   })
+
+  it("a paste's leading line break is ignored, not an empty answer", () => {
+    const state = type([B("\nsk-real\n")])
+    expect(state.status).toBe("done")
+    expect(answer(state)).toBe("sk-real")
+    expect(state.trailing).toBe(false)
+  })
+
+  it("a break with bytes after it ends done and marks the answer trailing (UF-QB)", () => {
+    const state = type([B("sk-ab\ncdef\n")])
+    expect(state.status).toBe("done")
+    expect(answer(state)).toBe("sk-ab")
+    expect(state.trailing).toBe(true)
+  })
+
+  it("a break followed only by more breaks is not trailing", () => {
+    const state = type([B("sk-ab\n\n\n")])
+    expect(state.status).toBe("done")
+    expect(answer(state)).toBe("sk-ab")
+    expect(state.trailing).toBe(false)
+  })
+
+  it("a lone Esc does not swallow the next key", () => {
+    const state = type([B("\x1bsk-abc\n")])
+    expect(state.status).toBe("done")
+    expect(answer(state)).toBe("sk-abc")
+  })
+
+  it("an escape split across two chunks is ignored whole", () => {
+    const state = type([Buffer.from([0x1b]), B("[A"), B("sk-1\n")])
+    expect(state.status).toBe("done")
+    expect(answer(state)).toBe("sk-1")
+  })
+
+  it("an Esc O sequence ignores the O and the one byte after it", () => {
+    const state = type([B("\x1bOA"), B("sk-1\n")])
+    expect(state.status).toBe("done")
+    expect(answer(state)).toBe("sk-1")
+  })
+
+  it("an Esc O sequence alone types nothing", () => {
+    const state = type([B("\x1bOP")])
+    expect(state.status).toBe("typing")
+    expect(answer(state)).toBe("")
+  })
+
+  it("an OSC sequence is ignored up to its BEL", () => {
+    const state = type([B("\x1b]0;t\x07"), B("sk-1\n")])
+    expect(state.status).toBe("done")
+    expect(answer(state)).toBe("sk-1")
+  })
+
+  it("an OSC sequence ended by Esc backslash is ignored too", () => {
+    const state = type([B("\x1b]0;t\x1b\\"), B("sk-1\n")])
+    expect(state.status).toBe("done")
+    expect(answer(state)).toBe("sk-1")
+  })
+
+  it("Esc then Enter with text typed ends the input", () => {
+    const state = type([B("sk-1"), Buffer.from([0x1b]), B("\n")])
+    expect(state.status).toBe("done")
+    expect(answer(state)).toBe("sk-1")
+  })
 })
