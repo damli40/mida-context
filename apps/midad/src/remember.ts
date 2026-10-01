@@ -169,7 +169,13 @@ function factText(value: unknown): string | null {
  * (what `mida read --as` prints); the default returns only lineage heads, which is what the
  * handoff's current-facts list must be.
  */
-export async function readOwnerFacts(runtime: ServiceRuntime, name: string, options: { history?: boolean } = {}): Promise<OwnerFact[]> {
+export async function readOwnerFacts(
+  runtime: ServiceRuntime,
+  name: string,
+  // PROV-13: `onDenied` hears each area this agent holds no grant for — the list stays silent about
+  // it (the handoff wants that), but `mida read` must not print "nothing saved" for "no access"
+  options: { history?: boolean; onDenied?: (namespace: string) => void } = {},
+): Promise<OwnerFact[]> {
   const agent = runtime.agent(name)
   const { reader, owner } = runtime
   const facts: { fact: OwnerFact; statedAt: number; chain?: ContextObject["chain"] }[] = []
@@ -184,7 +190,10 @@ export async function readOwnerFacts(runtime: ServiceRuntime, name: string, opti
       try {
         return await agent.read(owner, namespace)
       } catch (error) {
-        if (isMidaError(error, "CAPABILITY_DENIED")) return []
+        if (isMidaError(error, "CAPABILITY_DENIED")) {
+          options.onDenied?.(namespace)
+          return []
+        }
         throw error
       }
     }),

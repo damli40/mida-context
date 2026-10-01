@@ -370,9 +370,10 @@ export async function runCliWithRuntime(
           }
         } else {
           let facts: Awaited<ReturnType<typeof readOwnerFacts>> | null
+          const denied: string[] = []
           try {
             // the owner's own list keeps history: a superseded fact prints with its replacement
-            facts = await readOwnerFacts(runtime, agent, { history: true })
+            facts = await readOwnerFacts(runtime, agent, { history: true, onDenied: (namespace) => denied.push(namespace) })
           } catch (error) {
             // a list the store calls incomplete is not "no facts" — say so, then still run the attempt
             if (!isMidaError(error, "PARTIAL_READ")) throw error
@@ -393,6 +394,10 @@ export async function runCliWithRuntime(
                 const text = displaySafeText(fact.text).replace(/\s+/g, " ").trim()
                 print(`  ${fact.namespace}: ${text} (id ${factShortId(fact.contextId)}, ${factStamp(fact.assertedAt)})${replaced}`)
               }
+            }
+            // PROV-13: an area this agent cannot read says so — an empty list would read as "nothing saved"
+            for (const namespace of denied) {
+              if (only === undefined || namespace === only) print(`  ${namespace}: refused CAPABILITY_DENIED (${agent} has no read access to this area)`)
             }
           }
           if (only === undefined) {
