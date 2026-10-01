@@ -333,3 +333,223 @@ describe("mida summarizer test", () => {
     ])
   })
 })
+
+// ---------- P2b: the questions ----------
+
+const CHOICE_HEAD = [
+  "How should Mida write its summaries?",
+  "When a session ends, Mida turns the chat into a short",
+  "record for your next agent. A model writes that record.",
+  "",
+]
+const CHOICE_TAIL = [
+  "",
+  "  2  Your own API key",
+  "     Who reads the chat: the provider you choose.",
+  "     What it uses: your key. Most providers charge under one cent a summary.",
+  "",
+]
+const choiceBlock = (a: string, b: string) => [
+  ...CHOICE_HEAD,
+  "  1  Your agents' small models (recommended)",
+  `     ${a}`,
+  `     Who reads the chat: ${b}, under your login.`,
+  "     What it uses: your plan. It stops at your plan's limit.",
+  ...CHOICE_TAIL,
+]
+
+function chooseRig(dir: MidaHome, onPath: (bin: string) => boolean, answers: string[], secrets: string[] = []) {
+  const lines: string[] = []
+  const prompts: string[] = []
+  const secretQs: string[] = []
+  const answersLeft = [...answers]
+  const secretsLeft = [...secrets]
+  return {
+    lines,
+    prompts,
+    secretQs,
+    run: () =>
+      chooseSummarizer({
+        home: dir,
+        env: {},
+        print: (line) => lines.push(line),
+        prompt: async (q) => (prompts.push(q), answersLeft.shift() ?? ""),
+        secretPrompt: async (q) => (secretQs.push(q), secretsLeft.shift() ?? ""),
+        onPath,
+      }),
+  }
+}
+
+describe("chooseSummarizer", () => {
+  const NOTHING_SAVED = "Nothing saved. Mida uses your agents' small models until you choose: mida summarizer"
+
+  it.each<[string, (bin: string) => boolean, string, string]>([
+    [
+      "both agents",
+      () => true,
+      "Claude Code's haiku first, Codex's luna if Claude can't.",
+      "Anthropic or OpenAI",
+    ],
+    [
+      "only claude",
+      (bin) => bin === "claude",
+      "Claude Code's haiku. Install Codex and its luna becomes the backup.",
+      "Anthropic",
+    ],
+    [
+      "only codex",
+      (bin) => bin === "codex",
+      "Codex's luna.",
+      "OpenAI",
+    ],
+    [
+      "neither",
+      () => false,
+      "Neither Claude Code nor Codex is installed yet. Mida uses their small models once one is.",
+      "Anthropic or OpenAI",
+    ],
+  ])("prints the exact block for %s", async (_name, onPath, a, b) => {
+    const dir = home()
+    const r = chooseRig(dir, onPath, ["", ""]) // Enter answers the first question
+    expect(await r.run()).toBe("saved")
+    expect(r.lines.slice(0, choiceBlock(a, b).length)).toEqual(choiceBlock(a, b))
+    expect(r.prompts).toEqual(["Choose 1 or 2 [1]: "])
+  })
+
+  it("Enter and 1 both save { use: agents } and print the two saved lines", async () => {
+    for (const answer of ["", "1", "  1  "]) {
+      const dir = home()
+      const r = chooseRig(dir, () => true, [answer])
+      expect(await r.run()).toBe("saved")
+      expect(readSummarizer(dir)).toEqual({ use: "agents" })
+      expect(r.lines.slice(-2)).toEqual([
+        "Saved: your agents' small models write the summaries.",
+        "Change it later with: mida summarizer",
+      ])
+    }
+  })
+
+  it("2 then DeepSeek and a key saves the key choice and names its display", async () => {
+    const dir = home()
+    const r = chooseRig(dir, () => false, ["2", "1"], ["sk-chosen"])
+    expect(await r.run()).toBe("saved")
+    expect(readSummarizer(dir)).toEqual({ use: "key", provider: "deepseek", apiKey: "sk-chosen" })
+    expect(r.lines.slice(-2)).toEqual([
+      "Saved: DeepSeek (deepseek-flash) writes the summaries, with your key.",
+      "Change it later with: mida summarizer",
+    ])
+    // the provider list was shown between the block and the saved lines
+    expect(r.lines).toContain("Which provider?")
+    expect(r.lines).toContain("  1  DeepSeek")
+    expect(r.lines).toContain("  2  Moonshot (Kimi)")
+    expect(r.lines).toContain("  3  Another OpenAI-compatible endpoint")
+  })
+
+  it("three wrong answers print the nothing-saved line and write nothing", async () => {
+    const dir = home()
+    const r = chooseRig(dir, () => true, ["banana", "9", "what"])
+    expect(await r.run()).toBe("skipped")
+    expect(r.lines.at(-1)).toBe(NOTHING_SAVED)
+    expect(dir.has("summarizer.json")).toBe(false)
+    expect(r.prompts.filter((q) => q === "Choose 1 or 2 [1]: ").length).toBe(3)
+  })
+
+  it("two wrong answers then 1 still saves", async () => {
+    const dir = home()
+    const r = chooseRig(dir, () => true, ["x", "?", "1"])
+    expect(await r.run()).toBe("saved")
+    expect(readSummarizer(dir)).toEqual({ use: "agents" })
+  })
+
+  it("abandoned key questions print the nothing-saved line and return skipped", async () => {
+    const dir = home()
+    const r = chooseRig(dir, () => true, ["2", "9", "9", "9"])
+    expect(await r.run()).toBe("skipped")
+    expect(r.lines.at(-1)).toBe(NOTHING_SAVED)
+    expect(dir.has("summarizer.json")).toBe(false)
+  })
+})
+
+describe("askSummarizerKey", () => {
+  function keyRig(dir: MidaHome, answers: string[], secrets: string[]) {
+    const lines: string[] = []
+    const prompts: string[] = []
+    const secretQs: string[] = []
+    const answersLeft = [...answers]
+    const secretsLeft = [...secrets]
+    return {
+      lines,
+      prompts,
+      secretQs,
+      run: () =>
+        askSummarizerKey({
+          print: (line) => lines.push(line),
+          prompt: async (q) => (prompts.push(q), answersLeft.shift() ?? ""),
+          secretPrompt: async (q) => (secretQs.push(q), secretsLeft.shift() ?? ""),
+        }),
+    }
+  }
+
+  it("asks the provider, then the key through secretPrompt only", async () => {
+    const dir = home()
+    const r = keyRig(dir, ["2"], ["sk-kimi"])
+    const saved = await r.run()
+    expect(saved).toEqual({ use: "key", provider: "kimi", apiKey: "sk-kimi" })
+    expect(r.secretQs).toEqual(["API key (typing is hidden): "])
+    expect(r.prompts).toEqual(["Choose 1, 2 or 3: "])
+    // the key question never goes through the plain prompt
+    expect(r.prompts.every((q) => !q.includes("API key"))).toBe(true)
+    expect(r.lines.every((line) => !line.includes("sk-kimi"))).toBe(true)
+  })
+
+  it("three wrong provider answers return undefined", async () => {
+    const r = keyRig(home(), ["0", "4", "x"], [])
+    expect(await r.run()).toBe(undefined)
+    expect(r.prompts).toEqual(["Choose 1, 2 or 3: ", "Choose 1, 2 or 3: ", "Choose 1, 2 or 3: "])
+  })
+
+  it("an empty DeepSeek key three times returns undefined", async () => {
+    const r = keyRig(home(), ["1"], ["", "", ""])
+    expect(await r.run()).toBe(undefined)
+    expect(r.lines.filter((l) => l === "No key entered.").length).toBe(3)
+    expect(r.secretQs.length).toBe(3)
+  })
+
+  it("custom endpoint: http://example.com is refused, http://localhost:1234/v1 is accepted, empty key is allowed", async () => {
+    const r = keyRig(home(), ["3", "http://example.com", "http://localhost:1234/v1", "llama-9"], [""])
+    expect(await r.run()).toEqual({
+      use: "key",
+      provider: "custom",
+      apiKey: "",
+      baseUrl: "http://localhost:1234/v1",
+      model: "llama-9",
+    })
+    expect(r.lines).toContain("That address must start with https:// (http:// only for this machine).")
+    expect(r.prompts).toEqual([
+      "Choose 1, 2 or 3: ",
+      "Endpoint base URL (for OpenAI: https://api.openai.com/v1): ",
+      "Endpoint base URL (for OpenAI: https://api.openai.com/v1): ",
+      "Model name: ",
+    ])
+    expect(r.secretQs).toEqual(["API key (typing is hidden; leave empty if your endpoint needs none): "])
+  })
+
+  it("https endpoints and three bad URLs behave", async () => {
+    const ok = keyRig(home(), ["3", "https://api.openai.com/v1", "gpt-5"], ["k"])
+    expect(await ok.run()).toEqual({
+      use: "key",
+      provider: "custom",
+      apiKey: "k",
+      baseUrl: "https://api.openai.com/v1",
+      model: "gpt-5",
+    })
+    const bad = keyRig(home(), ["3", "nope", "ftp://x", "http://10.0.0.1"], [])
+    expect(await bad.run()).toBe(undefined)
+    expect(bad.lines.filter((l) => l === "That address must start with https:// (http:// only for this machine).").length).toBe(3)
+  })
+
+  it("three empty model names return undefined", async () => {
+    const r = keyRig(home(), ["3", "https://e.com/v1", "", "", ""], [])
+    expect(await r.run()).toBe(undefined)
+  })
+})
