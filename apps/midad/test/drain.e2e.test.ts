@@ -267,4 +267,37 @@ describe("M1 drainOnce on local Anvil", () => {
     expect(home.has(`queue/bad/${stale.id}.json`)).toBe(true)
     expect(listJobs(home)).toHaveLength(0)
   }, STEP_TIMEOUT)
+
+  it("(k) two readScope() reads on one runtime share epoch keys — the second read spends zero wrap fetches (CHAIN-04)", async () => {
+    // A save of its own keeps this test true when it runs alone, not only after (a)-(j).
+    appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "scope share step" }] } }) + "\n")
+    job({ event: "Stop", sessionId: "s-k" })
+    await drain()
+    // The daemon's actual sharing: every agent() and every readScope() facade hands callers the
+    // runtime's one EpochKeyCache. Scoped reads in one home see one wrap fetch the first time and
+    // none the second — the count here is of real GET /epoch-wraps calls on the store.
+    const service = await openService()
+    try {
+      let wraps = 0
+      const realFetch = globalThis.fetch
+      globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+        if (init?.method === "GET" && new URL(url).pathname === "/epoch-wraps") wraps += 1
+        return realFetch(input, init)
+      }) as typeof fetch
+      try {
+        const first = await readCheckpoints(service.readScope(), "claude-code", PROJECT_ID)
+        const afterFirst = wraps
+        expect(first.checkpoints.length).toBeGreaterThan(0)
+        expect(afterFirst).toBeGreaterThan(0)
+        const second = await readCheckpoints(service.readScope(), "claude-code", PROJECT_ID)
+        expect(wraps).toBe(afterFirst)
+        expect(second.checkpoints.length).toBe(first.checkpoints.length)
+      } finally {
+        globalThis.fetch = realFetch
+      }
+    } finally {
+      await service.close()
+    }
+  }, STEP_TIMEOUT)
 })

@@ -4,7 +4,7 @@ import type { Address, Hex, ObjectManifest } from "@mida/protocol"
 import { hexOf, sealContextObject, wrapEpochPrivateKeyToAgent, x25519PublicKey } from "@mida/crypto"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { zeroHash } from "viem"
-import { MidaAgent } from "@mida/sdk"
+import { EPOCH_KEY_CACHE_MAX, MidaAgent } from "@mida/sdk"
 
 /**
  * R4-2 — `read` overlaps its per-object work with a bounded concurrency of 6: the output order
@@ -40,7 +40,13 @@ interface Fixture {
   tamper?: (record: Record<string, unknown>, contextId: Hex) => Record<string, unknown>
 }
 
-function fixture(count = 12, delayMs = 12, epochs = 2, epochKeyCache?: Map<string, Promise<Uint8Array>>): Fixture {
+function fixture(
+  count = 12,
+  delayMs = 12,
+  epochs = 2,
+  epochKeyCache?: Map<string, Uint8Array>,
+  options?: { agentId?: Hex; stallWraps?: boolean },
+): Fixture {
   const deployment = {
     chainId: CHAIN_ID,
     capabilityRegistry: CAPABILITY_REGISTRY,
@@ -128,12 +134,13 @@ function fixture(count = 12, delayMs = 12, epochs = 2, epochKeyCache?: Map<strin
   const api = {
     account: { address: `0x${"55".repeat(20)}` as Address },
     listObjects: async () => ({ objects, partial: false }),
-    getEpochWrap: async (params: { readEpoch: bigint }) => {
+    getEpochWrap: async (params: { readEpoch: bigint; agentId: Hex }) => {
       fx.wrapCalls.push(params.readEpoch)
       if (fx.failWraps > 0) {
         fx.failWraps -= 1
         throw new Error("store unreachable")
       }
+      if (options?.stallWraps === true) return new Promise(() => {}) as never // a fetch that never answers
       wrapInFlight += 1
       fx.wrapInFlight.max = Math.max(fx.wrapInFlight.max, wrapInFlight)
       try {
@@ -147,7 +154,7 @@ function fixture(count = 12, delayMs = 12, epochs = 2, epochKeyCache?: Map<strin
             owner: OWNER,
             namespaceId: NAMESPACE_ID,
             readEpoch: params.readEpoch,
-            agentId: AGENT_ID,
+            agentId: params.agentId,
             agentKeyVersion: 1,
           },
           createdAt: 0n,
@@ -158,7 +165,7 @@ function fixture(count = 12, delayMs = 12, epochs = 2, epochKeyCache?: Map<strin
     },
   }
   fx.agent = new MidaAgent({
-    agentId: AGENT_ID,
+    agentId: options?.agentId ?? AGENT_ID,
     callbackOrigin: "https://agent.example",
     encryptionPrivateKey: AGENT_PRIVATE,
     chain: { deployment, account: { address: `0x${"55".repeat(20)}` }, publicClient } as never,
@@ -167,7 +174,7 @@ function fixture(count = 12, delayMs = 12, epochs = 2, epochKeyCache?: Map<strin
     grants: [
       {
         owner: OWNER,
-        agentId: AGENT_ID,
+        agentId: options?.agentId ?? AGENT_ID,
         requestId: `0x${"99".repeat(32)}`,
         capabilities: [
           {
@@ -218,7 +225,7 @@ describe("MidaAgent.read bounded concurrency (R4-2)", () => {
   })
 
   it("a shared epoch-key cache carries keys across agent instances, as the daemon rebuilds agents per read (CHAIN-04)", async () => {
-    const shared = new Map<string, Promise<Uint8Array>>()
+    const shared = new Map<string, Uint8Array>()
     const first = fixture(12, 12, 2, shared)
     await first.agent.read(OWNER, NAMESPACE)
     const second = fixture(12, 12, 2, shared)
@@ -233,6 +240,54 @@ describe("MidaAgent.read bounded concurrency (R4-2)", () => {
     await expect(fx.agent.read(OWNER, NAMESPACE)).rejects.toThrow()
     const results = await fx.agent.read(OWNER, NAMESPACE)
     expect(results).toHaveLength(4)
+  })
+
+  // CHAIN-04 follow-up (Oct 1): the shared cache used to hold in-flight PROMISES, so one stalled
+  // wrap fetch pinned every later read on the same dead promise — before the cache was shared,
+  // only the one read suffered.
+  it("one stalled wrap fetch never slows a later read on the same shared cache", async () => {
+    const shared = new Map<string, Uint8Array>()
+    const stalled = fixture(4, 1, 1, shared, { stallWraps: true })
+    const stuck = stalled.agent.read(OWNER, NAMESPACE)
+    void stuck.catch(() => {}) // this read never settles — it is left running on purpose
+    for (let i = 0; i < 500 && stalled.wrapCalls.length === 0; i++) await sleep(10)
+    expect(stalled.wrapCalls.length).toBeGreaterThan(0) // the stall is really inside the fetch
+
+    const second = fixture(4, 1, 1, shared)
+    const results = await second.agent.read(OWNER, NAMESPACE)
+    expect(results.map((o) => o.payload.value)).toEqual(second.objects.map((o) => o.value))
+    expect(shared.size).toBe(1) // the second read's opened key joined the cache; the stalled one never did
+  })
+
+  it("a failed fetch stores nothing in the shared cache — the next read fetches again and succeeds", async () => {
+    const shared = new Map<string, Uint8Array>()
+    const fx = fixture(4, 1, 1, shared)
+    fx.failWraps = 1
+    await expect(fx.agent.read(OWNER, NAMESPACE)).rejects.toThrow()
+    expect(shared.size).toBe(0) // would be 1 if failures were stored, even as a rejected promise
+    const results = await fx.agent.read(OWNER, NAMESPACE)
+    expect(results).toHaveLength(4)
+    expect(shared.size).toBe(1)
+  })
+
+  it("two agents with different ids on one shared cache each fetch their own key", async () => {
+    const shared = new Map<string, Uint8Array>()
+    const first = fixture(4, 1, 1, shared)
+    const second = fixture(4, 1, 1, shared, { agentId: `0x${"bb".repeat(32)}` as Hex })
+    await first.agent.read(OWNER, NAMESPACE)
+    await second.agent.read(OWNER, NAMESPACE)
+    expect(first.wrapCalls).toEqual([1n])
+    expect(second.wrapCalls).toEqual([1n]) // the second agent did not open with the first's entry
+    expect(shared.size).toBe(2)
+  })
+
+  it("the shared cache evicts the oldest opened key once it holds EPOCH_KEY_CACHE_MAX", async () => {
+    const shared = new Map<string, Uint8Array>()
+    for (let i = 0; i < EPOCH_KEY_CACHE_MAX; i += 1) shared.set(`dummy-${i}`, new Uint8Array(32))
+    const fx = fixture(4, 1, 1, shared)
+    await fx.agent.read(OWNER, NAMESPACE)
+    expect(shared.size).toBe(EPOCH_KEY_CACHE_MAX)
+    expect(shared.has("dummy-0")).toBe(false) // the first-inserted entry went first
   })
 
   it("one object failing verification still fails the whole read", async () => {
