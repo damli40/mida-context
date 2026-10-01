@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Monad-testnet%2010143-836EF9?style=flat-square&labelColor=14130F" alt="Monad testnet, chain 10143">
   <img src="https://img.shields.io/badge/status-pre--release-b08800?style=flat-square&labelColor=14130F" alt="Pre-release">
-  <img src="https://img.shields.io/badge/tests-3%2C279%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,279 tests passing">
+  <img src="https://img.shields.io/badge/tests-3%2C175%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,175 tests passing">
   <img src="https://img.shields.io/badge/audit-none-7e8c86?style=flat-square&labelColor=14130F" alt="Not audited">
   <img src="https://img.shields.io/badge/license-MIT-7e8c86?style=flat-square&labelColor=14130F" alt="MIT license">
 </p>
@@ -335,7 +335,7 @@ pay nothing; one direct save cost about 0.03 testnet MON on Sep 21. Mainnet cost
 | npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
 | Security audit | ❌ None |
 
-3,279 automated tests pass on this release: `pnpm test`.
+3,175 automated tests pass on this release: `pnpm test`.
 
 ---
 
