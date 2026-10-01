@@ -1217,6 +1217,46 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     )
   })
 
+  // UF-O item O4: a session waiting on the gas sponsor's daily limit is not "a failed try" — the
+  // clause names what it is really waiting for, and the sponsor-limit state carries no attempts
+  // (O3 never counts them), so the old retry clause must not appear.
+  it("a sponsor-limit wait gets the reset clause, not the retry clause", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-limited" })
+    dir.writeSecretJson("queue/state/sess-limited.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason: "sponsor-limit",
+    })
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("(waiting for the gas sponsor's daily limit to reset at 00:00 UTC)")
+    expect(result.text).not.toContain("the last try failed")
+  })
+
+  it("an ordinary failed try still gets the retry clause", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-ordinary" })
+    dir.writeSecretJson("queue/state/sess-ordinary.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      attempts: 2,
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason: "chain-error",
+    })
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("(the last try failed; Mida keeps retrying)")
+    expect(result.text).not.toContain("sponsor's daily limit")
+  })
+
   it("an unreadable queue still serves the handoff — silently, no note", async () => {
     const dir = queueHome()
     // a file where the queue folder would sit: listing it throws, and that must never refuse

@@ -141,6 +141,11 @@ export interface QueuedSaves {
   /** session → its newest queued change (ms) */
   newestChange: Map<string, number>
   lastTryFailed: boolean
+  /**
+   * What at least one counted session is waiting on — a string union because later wait kinds
+   * land here; "sponsor-limit" means the gas sponsor's daily cap, which resets at 00:00 UTC.
+   */
+  waitingOn: "sponsor-limit" | undefined
   stuck: number
 }
 
@@ -153,6 +158,7 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
   }
   const perAgent = new Map<string, Set<string>>()
   let lastTryFailed = false
+  let waitingOn: "sponsor-limit" | undefined = undefined
   // CAP-26: each counted session's NEWEST queued change. The drain merges a session's jobs and
   // keeps only the newest, so that is all the queue can honestly tell. The stalest of those is the
   // signal: a session with no new change for an hour that is still not on Monad is stuck.
@@ -174,8 +180,11 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
     // the drainer records a failed try on the session's own state file — read-only, and an
     // unreadable or malformed state only loses the retry clause, never the count
     try {
-      const state = home.readJson<{ attempts?: unknown }>(`queue/state/${job.sessionId}.json`)
+      const state = home.readJson<{ attempts?: unknown; reason?: unknown; failedAt?: unknown }>(`queue/state/${job.sessionId}.json`)
       if (typeof state?.attempts === "number" && state.attempts > 0) lastTryFailed = true
+      // UF-O: a sponsor-limit wait carries no attempts — it is a daily allowance, not a failed
+      // try — so it is noticed by reason + failedAt, and it never sets lastTryFailed above
+      if (state?.reason === "sponsor-limit" && typeof state.failedAt === "string") waitingOn = "sponsor-limit"
     } catch { /* keep the count, drop the clause */ }
   }
   // in-13 M-4: a batched save the store refused as composed sits between ledgers — rejected at
@@ -192,7 +201,7 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
     if (typeof value !== "object" || value === null || (value as { projectId?: unknown }).projectId !== projectId) continue
     stuck += 1
   }
-  return { perAgent, newestChange, lastTryFailed, stuck }
+  return { perAgent, newestChange, lastTryFailed, waitingOn, stuck }
 }
 
 /** Two queue snapshots as one: every session either saw, its newest change, any failed try. */
@@ -205,7 +214,13 @@ function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): QueuedSaves 
   }
   const newestChange = new Map(a.newestChange)
   for (const [session, at] of b.newestChange) newestChange.set(session, Math.max(newestChange.get(session) ?? Number.NEGATIVE_INFINITY, at))
-  return { perAgent, newestChange, lastTryFailed: a.lastTryFailed || b.lastTryFailed, stuck: Math.max(a.stuck, b.stuck) }
+  return {
+    perAgent,
+    newestChange,
+    lastTryFailed: a.lastTryFailed || b.lastTryFailed,
+    waitingOn: a.waitingOn ?? b.waitingOn,
+    stuck: Math.max(a.stuck, b.stuck),
+  }
 }
 
 /**
@@ -214,7 +229,7 @@ function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): QueuedSaves 
  */
 export function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shownUnsent: number): string | null {
   if (queued === null) return null
-  const { perAgent, newestChange, lastTryFailed, stuck } = queued
+  const { perAgent, newestChange, lastTryFailed, waitingOn, stuck } = queued
   if (perAgent.size === 0 && stuck === 0) return null
   const clauses: string[] = []
   if (perAgent.size > 0) {
@@ -236,7 +251,15 @@ export function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shown
         : total === 1
           ? "; it is shown below, marked UNSENT"
           : `; ${shownUnsent} of them ${shownUnsent === 1 ? "is" : "are"} shown below, marked UNSENT`
-    clauses.push(`${clause}${lastTryFailed ? " (the last try failed; Mida keeps retrying)" : ""}${shown}`)
+    // UF-O: a sponsor-limit wait is a daily allowance that resets at 00:00 UTC, not a failed
+    // try — its clause says so and the "last try failed" clause is not added on top of it
+    const waiting =
+      waitingOn === "sponsor-limit"
+        ? " (waiting for the gas sponsor's daily limit to reset at 00:00 UTC)"
+        : lastTryFailed
+          ? " (the last try failed; Mida keeps retrying)"
+          : ""
+    clauses.push(`${clause}${waiting}${shown}`)
   }
   if (stuck > 0) clauses.push(`${stuck} save${stuck === 1 ? "" : "s"} could not be sent to Monad: see \`mida doctor\``)
   return `Mida note: ${clauses.join(". ")}.`

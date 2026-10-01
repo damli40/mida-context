@@ -344,6 +344,72 @@ describe("mida doctor without a chain", () => {
     }
   })
 
+  // UF-O item O4: two waits the queue check used to mislabel or hide — a wallet funded below the
+  // send threshold is the same "cannot pay" as a dry wallet, and a sponsor-limit wait is the
+  // sponsor's daily cap, which resets at 00:00 UTC.
+  it("a wallet-low wait gets the same out-of-gas line a dry wallet gets (UF-O)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 2, failedAt, reason: "wallet-low" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain("PROBLEM: claude-code's wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.")
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a sponsor-limit wait names the sponsor's daily limit and its 00:00 UTC reset (UF-O)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, failedAt, reason: "sponsor-limit" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain(
+        "PROBLEM: the gas sponsor's daily limit for claude-code is used up, so its saves are waiting. Mida sends them after the limit resets at 00:00 UTC.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("the sponsor line says how many SAVES a day its limits really pay for (UF-O)", async () => {
+    // one save spends 2 free calls (stub data + gas estimate), so a free-call limit can bind
+    // tighter than the signing limit: 120 free calls = 60 saves, not 300
+    const cases: { limits: Record<string, unknown>; saves: number }[] = [
+      { limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, freeCallsPerSenderPerDay: 120 }, saves: 60 },
+      { limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, freeCallsPerSenderPerDay: 900 }, saves: 300 },
+      { limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000 }, saves: 300 },
+    ]
+    for (const { limits, saves } of cases) {
+      const home = new MidaHome(join(dir(), `home-${saves}`))
+      const server = await stubDaemon(home, 200, { ok: true })
+      try {
+        home.writeSecretJson("network.json", { sponsorUrl: "https://sponsor.example" })
+        const lines: string[] = []
+        await runDoctor({
+          home,
+          print: (line) => lines.push(line),
+          settings: {},
+          env: {},
+          daemonProbeMs: 50,
+          fetch: async () => new Response(JSON.stringify({ limits }), { status: 200 }),
+        })
+        expect(lines).toContain(
+          `ok: gas sponsor reachable at sponsor.example (willingness is only proven by a real send; it pays for up to ${saves} saves per agent a day, 2000 a day across everyone)`,
+        )
+      } finally {
+        await closeServer(server)
+      }
+    }
+  })
+
   it("a session waiting on a non-gas reason gets the note but no wallet line (in-29 S-2)", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const server = await stubDaemon(home, 200, { ok: true })
