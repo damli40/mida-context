@@ -250,6 +250,9 @@ process.stdin.on("end", () => {
           "the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Left out: the 1 oldest de",
       })
       break
+    case "pipes":
+      fenced({ ...GOOD, unresolvedIssue: "CI passes only because of `make test || true`" })
+      break
     case "claims-limit-note":
       fenced({
         ...GOOD,

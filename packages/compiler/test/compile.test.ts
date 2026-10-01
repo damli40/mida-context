@@ -595,6 +595,15 @@ describe("compileCheckpoint", () => {
   // UF-L: a note the MODEL wrote is a claim, not a fact — the lists it names are stripped with
   // the note, never trusted, so a saved note cannot make a later compile say lists went missing
   // that nothing cut.
+  it("a model's own pipes survive — a save without a note never rewrites the text (UF-N)", async () => {
+    // `make test || true` is a different command than `make test | true`; the strip has no
+    // business touching a value that holds no limit-note segment
+    const r = await compileCheckpoint({ ...base, model: fake("pipes") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.unresolvedIssue).toBe("CI passes only because of `make test || true`")
+    }
+  })
   it("a limit note the model itself wrote earns no note — the claim is stripped, not trusted (UF-L)", async () => {
     const r = await compileCheckpoint({ ...base, model: fake("claims-limit-note") })
     expect(r.ok).toBe(true)

@@ -92,6 +92,20 @@ describe("limitNote and splitLimitNote (UF-L)", () => {
     expect(s.text).toBe("x")
     expect(s.lists.size).toBe(0)
   })
+  it("a value with no limit note comes back byte-for-byte — its own pipes are text (UF-N)", () => {
+    // `||` inside real text is an OR operator or a table border, never a separator to tidy
+    for (const value of ["CI passes only because of `make test || true`", "| a | b |"]) {
+      const s = splitLimitNote(value)
+      expect(s.text).toBe(value)
+      expect(s.lists.size).toBe(0)
+    }
+  })
+  it("removing a note takes only the one separator that touched it (UF-N)", () => {
+    const note = limitNote(new Set(["decisions"]))!
+    expect(splitLimitNote(`issue | ${note}`).text).toBe("issue")
+    expect(splitLimitNote(`${note} | issue`).text).toBe("issue")
+    expect(splitLimitNote(`a || b | ${note}`).text).toBe("a || b")
+  })
   it("null and a note-free string give empty text parts and no lists", () => {
     expect(splitLimitNote(null)).toEqual({ text: "", lists: new Set() })
     const s = splitLimitNote("flaky test")

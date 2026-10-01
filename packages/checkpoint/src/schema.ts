@@ -55,7 +55,7 @@ export function limitNote(lists: ReadonlySet<LimitList>): string | null {
 // A "(Mida: a list holds at most" segment runs to the next ")" — or to the end of the string
 // when a size cut sliced the note before its bracket. The first ")" ends the segment, so a note
 // nested inside another dies with its parent.
-const LIMIT_NOTE_SEGMENT = /\(Mida: a list holds at most[^)]*(\)|$)/g
+const LIMIT_NOTE_SEGMENT = /\(Mida: a list holds at most[^)]*(\)|$)/
 
 // A well-formed note of the current wording, anchored at the very end of the value — group 1 is
 // the whole note, group 2 its list names. Only an exact limitNote output earns its lists back.
@@ -64,25 +64,33 @@ const LIMIT_NOTE_AT_END = /(\(Mida: a list holds at most \d+ entries\. Older ([^
 /**
  * Splits an unresolvedIssue value into its free text and the lists a well-formed limit note at
  * the very END names. `text` drops every note-looking segment wherever it sits — one the model
- * forged, one a size cut left mid-word — repeated until none remain, then dangling " | "
- * separators (leading, trailing, doubled) go too; it may come back empty. `lists` is empty
- * unless the value's tail is a note byte-for-byte as limitNote writes it — in name order, with
- * the real cap — so an old numbered note or a mid-string claim names nothing.
+ * forged, one a size cut left mid-word — and with each segment the ONE separator touching it:
+ * the " | " (optional spaces, one pipe, optional spaces) directly before it, or if there is
+ * none, the one directly after. Nothing else in the text changes — a value holding no note
+ * comes back byte-for-byte, `||` and leading or trailing pipes included, because they are the
+ * user's text, not our punctuation (UF-N). Only leading/trailing whitespace is trimmed at the
+ * end; `text` may come back empty. `lists` is empty unless the value's tail is a note
+ * byte-for-byte as limitNote writes it — in name order, with the real cap — so an old numbered
+ * note or a mid-string claim names nothing.
  */
 export function splitLimitNote(value: string | null): { text: string; lists: Set<LimitList> } {
   const lists = new Set<LimitList>()
   if (value === null) return { text: "", lists }
   let text = value
   for (;;) {
-    const next = text.replace(LIMIT_NOTE_SEGMENT, "")
-    if (next === text) break
-    text = next
+    const segment = LIMIT_NOTE_SEGMENT.exec(text)
+    if (segment === null) break
+    const before = text.slice(0, segment.index)
+    const after = text.slice(segment.index + segment[0].length)
+    const sepBefore = /\s*\|\s*$/.exec(before)
+    if (sepBefore !== null) {
+      text = before.slice(0, sepBefore.index) + after
+    } else {
+      const sepAfter = /^\s*\|\s*/.exec(after)
+      text = before + (sepAfter === null ? after : after.slice(sepAfter[0].length))
+    }
   }
-  text = text
-    .replace(/(\s*\|\s*){2,}/g, " | ")
-    .replace(/^\s*\|\s*/, "")
-    .replace(/\s*\|\s*$/, "")
-    .trim()
+  text = text.trim()
   const tail = LIMIT_NOTE_AT_END.exec(value)
   if (tail !== null) {
     const named = new Set<LimitList>()
