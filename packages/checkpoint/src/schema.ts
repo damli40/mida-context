@@ -39,6 +39,35 @@ export const CONTENT_FIELDS: readonly (keyof Checkpoint)[] = [
   "evidence",
 ]
 
+/**
+ * Evidence names its target by position ("decisions[3]", "decisions[3].rationale"). When `dropped`
+ * entries leave the FRONT of `list`, every later entry moves down by that many — so evidence for a
+ * dropped entry is removed and the rest is re-pointed. Without this, each remaining evidence line
+ * would vouch for a different entry than the one it was written for (CAP-29). Returns a new array;
+ * anything that is not an evidence object passes through for the validator to reject.
+ */
+export function repointEvidence<T>(evidence: readonly T[], list: string, dropped: number): T[] {
+  if (dropped <= 0) return [...evidence]
+  const out: T[] = []
+  for (const entry of evidence) {
+    const field = isObj(entry) ? entry.field : undefined
+    if (typeof field !== "string" || !field.startsWith(`${list}[`)) {
+      out.push(entry)
+      continue
+    }
+    const close = field.indexOf("]", list.length + 1)
+    const digits = close === -1 ? "" : field.slice(list.length + 1, close)
+    if (!/^\d+$/.test(digits)) {
+      out.push(entry)
+      continue
+    }
+    const index = Number(digits)
+    if (index < dropped) continue
+    out.push({ ...(entry as object), field: `${list}[${index - dropped}]${field.slice(close + 1)}` } as T)
+  }
+  return out
+}
+
 const SOURCES = new Set<string>(["agent-tool", "hook-compiler"])
 const ALL_KEYS = new Set<string>(["eventId", "agent", "source", "createdAt", ...CONTENT_FIELDS, "originalRequest"])
 

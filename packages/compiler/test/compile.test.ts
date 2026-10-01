@@ -509,12 +509,76 @@ describe("compileCheckpoint", () => {
       expect(r.trimmed).toContain("progress[0]")
     }
   })
-  it("keeps the first 50 of an over-long array and names it in trimmed (A8)", async () => {
+  // CAP-29: this test used to pin "keeps the first 50" (expected d0). The model carries the earlier
+  // checkpoint forward and adds what is new at the end, so keeping the front meant the 51st
+  // decision could never be saved — the next agent kept following a decision the user had changed.
+  it("keeps the NEWEST 50 of an over-long array and names it in trimmed (A8, CAP-29)", async () => {
     const r = await compileCheckpoint({ ...base, model: fake("wide") })
     expect(r.ok).toBe(true)
     if (r.ok) {
       expect(r.checkpoint.decisions).toHaveLength(50)
-      expect(r.checkpoint.decisions[0]!.decision).toBe("d0")
+      expect(r.checkpoint.decisions[0]!.decision).toBe("d1")
+      expect(r.checkpoint.decisions.at(-1)!.decision).toBe("d50")
+      expect(r.trimmed).toContain("decisions")
+    }
+  })
+  it("every list over 50 keeps its newest 50 — except the plan, whose front is what comes next (C11, CAP-29)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("wide-all") })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    const c = r.checkpoint
+    expect([c.decisions[0]!.decision, c.decisions.at(-1)!.decision]).toEqual(["d10", "d59"])
+    expect([c.rejected[0]!.approach, c.rejected.at(-1)!.approach]).toEqual(["x10", "x59"])
+    expect([c.constraints[0], c.constraints.at(-1)]).toEqual(["c10", "c59"])
+    expect([c.artifacts[0], c.artifacts.at(-1)]).toEqual(["src/a10", "src/a59"])
+    expect([c.progress[0], c.progress.at(-1)]).toEqual(["p10", "p59"])
+    expect([c.remainingPlan[0], c.remainingPlan.at(-1)]).toEqual(["step 0", "step 49"])
+    for (const list of ["progress", "decisions", "rejected", "constraints", "artifacts", "remainingPlan"]) {
+      expect(r.trimmed, list).toContain(list)
+    }
+  })
+  it("evidence follows its entry when a list is cut from the front, and goes when its entry goes (C11, CAP-29)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("wide-all") })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.checkpoint.evidence).toEqual([
+      { field: "decisions[0]", ref: "transcript:L10" },
+      { field: "decisions[49].rationale", ref: "transcript:L59" },
+      { field: "progress[49]", ref: "transcript:L159" },
+      { field: "remainingPlan[2]", ref: "transcript:L202" },
+      { field: "nextAction", ref: "transcript:L300" },
+    ])
+    // what each one points at is the entry it was written for
+    expect(r.checkpoint.decisions[0]!.decision).toBe("d10")
+    expect(r.checkpoint.progress[49]).toBe("p59")
+  })
+  // CAP-29: the case the user actually hits — a session already at 50 decisions gains one more.
+  // The fixture echoes the previous block back with "newest" appended, so the save must keep the
+  // newest 50: d1…d49 plus newest. On the old keep-the-front code d0 stayed and newest was lost.
+  it("a session already at 50 decisions saves the 51st — keeps the newest 50 (CAP-29)", async () => {
+    const previous: Checkpoint = {
+      eventId: "evt-prev0001",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: "2026-09-21T09:00:00.000Z",
+      objective: "Implement the rate limiter",
+      originalRequest: "Build a rate limiter in 3 steps",
+      progress: ["skeleton written"],
+      decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+      rejected: [{ approach: "background interval refill", why: "no-timers constraint" }],
+      constraints: ["no dependencies"],
+      artifacts: ["src/a.ts"],
+      unresolvedIssue: null,
+      nextAction: "add tests",
+      remainingPlan: ["2. add tests", "3. write README"],
+      evidence: [],
+    }
+    const r = await compileCheckpoint({ ...base, previous, model: fake("add-decision") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.decisions).toHaveLength(50)
+      expect(r.checkpoint.decisions[0]!.decision).toBe("d1")
+      expect(r.checkpoint.decisions.at(-1)!.decision).toBe("newest")
       expect(r.trimmed).toContain("decisions")
     }
   })

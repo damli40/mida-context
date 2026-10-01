@@ -17,9 +17,14 @@
 //   reasoning — prints only {"thinking":"x"} (no content fields → no-json)
 //   longitem — good, but progress[0] is 2,001 chars (over the schema limit)
 //   wide     — good, but decisions has 51 entries (over the schema limit)
+//   wide-all — good, but every list has 60 entries, with evidence pointing at
+//              cut and kept positions (CAP-29)
 //   echo-previous — parses the JSON on the line after "PREVIOUS CHECKPOINT" in
 //              its stdin and echoes it back with one extra progress item: the
 //              block must reach the model intact and parseable
+//   add-decision — like echo-previous, but appends one decision
+//              {decision:"newest",rationale:"r"}: the 51st decision a session
+//              already at the cap actually produces (CAP-29)
 //   stderr-fail — writes "kimi http 429" to stderr, exits 1 (stderrDetail tests)
 //   cache-stats — GOOD on stdout plus "cache hit=11 miss=22" on stderr, exit 0:
 //              the provider's usage line a compile with stderrDetail reads
@@ -156,6 +161,28 @@ process.stdin.on("end", () => {
         decisions: Array.from({ length: 51 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
       })
       break
+    case "wide-all": {
+      const sixty = (p) => Array.from({ length: 60 }, (_, i) => `${p}${i}`)
+      fenced({
+        ...GOOD,
+        progress: sixty("p"),
+        decisions: sixty("d").map((decision) => ({ decision, rationale: "r" })),
+        rejected: sixty("x").map((approach) => ({ approach, why: "w" })),
+        constraints: sixty("c"),
+        artifacts: sixty("src/a"),
+        remainingPlan: sixty("step "),
+        evidence: [
+          { field: "decisions[5]", ref: "transcript:L5" }, // its decision is cut → dropped
+          { field: "decisions[10]", ref: "transcript:L10" }, // first kept → decisions[0]
+          { field: "decisions[59].rationale", ref: "transcript:L59" }, // → decisions[49].rationale
+          { field: "progress[9]", ref: "transcript:L109" }, // cut → dropped
+          { field: "progress[59]", ref: "transcript:L159" }, // → progress[49]
+          { field: "remainingPlan[2]", ref: "transcript:L202" }, // the plan keeps its front → unchanged
+          { field: "nextAction", ref: "transcript:L300" }, // no position → unchanged
+        ],
+      })
+      break
+    }
     case "stderr-fail":
       process.stderr.write("kimi http 429\n")
       process.exit(1)
@@ -182,6 +209,15 @@ process.stdin.on("end", () => {
       if (i === -1) process.exit(4)
       const prev = JSON.parse(lines[i + 1])
       prev.progress = [...prev.progress, "echo-previous saw the block"]
+      fenced(prev)
+      break
+    }
+    case "add-decision": {
+      const lines = input.split("\n")
+      const i = lines.findIndex((l) => l.startsWith("PREVIOUS CHECKPOINT"))
+      if (i === -1) process.exit(4)
+      const prev = JSON.parse(lines[i + 1])
+      prev.decisions = [...prev.decisions, { decision: "newest", rationale: "r" }]
       fenced(prev)
       break
     }

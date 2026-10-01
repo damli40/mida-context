@@ -23,13 +23,32 @@ describe("checkpoint payload", () => {
     const e = wrap(big)
     expect(Buffer.byteLength(JSON.stringify(e))).toBeLessThanOrEqual(MAX_VALUE_BYTES)
     expect(e.checkpoint.progress).toHaveLength(0)                          // all progress went first
-    expect(e.checkpoint.evidence.at(-1)).toEqual(big.evidence.at(-1))      // newest evidence kept
+    expect(e.checkpoint.evidence.at(-1)!.ref).toBe(big.evidence.at(-1)!.ref) // newest evidence kept
     const note = e.checkpoint.constraints.find((c) => c.startsWith("(Mida:"))
     expect(note).toContain("progress")
     expect(note).toContain("evidence")
     expect(note).toContain("left out")
     expect(e.checkpoint.originalRequest).toBe("keep me")
     expect(e.checkpoint.remainingPlan).toEqual(["1. a"])
+  })
+  // CAP-29: evidence names its target by position, so dropping the oldest progress used to leave
+  // every evidence line pointing at a different progress entry than the one it was written for.
+  it("evidence follows its entry when the oldest progress is dropped, and goes when its entry goes", () => {
+    const big = sampleCheckpoint({
+      progress: Array.from({ length: 40 }, (_, i) => `step-${i} ${"p".repeat(1980)}`),
+      evidence: Array.from({ length: 40 }, (_, i) => ({ field: `progress[${i}]`, ref: `transcript:L${i}` })),
+    })
+    const e = wrap(big)
+    const left = e.checkpoint.progress.length
+    expect(left).toBeGreaterThan(0)
+    expect(left).toBeLessThan(40)                                           // some progress was dropped
+    expect(e.checkpoint.evidence).toHaveLength(left)                        // evidence for dropped entries went with them
+    for (const { field, ref } of e.checkpoint.evidence) {
+      const at = Number(/^progress\[(\d+)\]$/.exec(field)![1])
+      expect(e.checkpoint.progress[at]!.startsWith(`step-${ref.slice("transcript:L".length)} `), `${field} = ${ref}`).toBe(true)
+    }
+    const note = e.checkpoint.constraints.find((c) => c.startsWith("(Mida:"))
+    expect(note).toContain(`left out ${40 - left} progress, ${40 - left} evidence`)
   })
   it("the reviewer's case: decisions and rejected go before protected fields, and the note names them", () => {
     const reviewer = sampleCheckpoint({

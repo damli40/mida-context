@@ -1,6 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
-import { LIMITS, validateCheckpoint } from "@mida/checkpoint"
+import { LIMITS, repointEvidence, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint, MigrationEnvelope } from "@mida/checkpoint"
 import { validateMigrationEnvelope } from "./migration-envelope.js"
 import { DEFAULT_TASK, isTaskName } from "./task.js"
@@ -66,7 +66,8 @@ export function eventIdFor(input: { projectId: string; sessionId: string; transc
   return `cp-${digest.slice(0, 40)}`
 }
 
-// The order in which a too-big checkpoint gives things up: oldest progress first, then evidence,
+// The order in which a too-big checkpoint gives things up: oldest progress first (each taking its own
+// evidence with it), then evidence,
 // artifacts, rejected and decisions. originalRequest, remainingPlan, nextAction and objective are
 // never dropped or cut — they are what make a handoff usable.
 const DROPPABLE = ["progress", "evidence", "artifacts", "rejected", "decisions"] as const
@@ -137,6 +138,14 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
       if (checkpoint[field].length === 0) continue
       checkpoint[field].shift()
       dropped.set(field, (dropped.get(field) ?? 0) + 1)
+      if (field !== "evidence") {
+        // evidence names its target by position ("progress[3]"): follow the entries that just moved
+        // down one, and let go of the evidence for the entry that left (CAP-29)
+        const kept = repointEvidence(checkpoint.evidence, field, 1)
+        const gone = checkpoint.evidence.length - kept.length
+        if (gone > 0) dropped.set("evidence", (dropped.get("evidence") ?? 0) + gone)
+        checkpoint.evidence = kept
+      }
       return true
     }
     return false

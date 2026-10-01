@@ -1,5 +1,37 @@
 import { describe, expect, it } from "vitest"
-import { validateCheckpoint } from "../src/index.js"
+import { repointEvidence, validateCheckpoint } from "../src/index.js"
+
+// CAP-29: evidence names its target by position ("decisions[3]"), so entries leaving the front of
+// a list would leave every later evidence line vouching for a different entry.
+describe("repointEvidence", () => {
+  const evidence = [
+    { field: "decisions[0]", ref: "a" },
+    { field: "decisions[2]", ref: "b" },
+    { field: "decisions[12].rationale", ref: "c" },
+    { field: "progress[1]", ref: "d" },
+    { field: "decisionsX[5]", ref: "e" },
+    { field: "nextAction", ref: "f" },
+  ]
+  it("moves evidence down with its entry and removes evidence whose entry was dropped", () => {
+    expect(repointEvidence(evidence, "decisions", 2)).toEqual([
+      { field: "decisions[0]", ref: "b" },
+      { field: "decisions[10].rationale", ref: "c" },
+      { field: "progress[1]", ref: "d" },
+      { field: "decisionsX[5]", ref: "e" },
+      { field: "nextAction", ref: "f" },
+    ])
+  })
+  it("changes nothing when nothing was dropped, and never changes its input", () => {
+    const before = JSON.stringify(evidence)
+    expect(repointEvidence(evidence, "decisions", 0)).toEqual(evidence)
+    repointEvidence(evidence, "decisions", 2)
+    expect(JSON.stringify(evidence)).toBe(before)
+  })
+  it("passes through entries that are not evidence objects — they are the validator's to reject", () => {
+    const odd = [null, "decisions[0]", { field: 7, ref: "x" }, { field: "decisions[3]", ref: "y" }] as unknown as { field: string }[]
+    expect(repointEvidence(odd, "decisions", 1)).toEqual([null, "decisions[0]", { field: 7, ref: "x" }, { field: "decisions[2]", ref: "y" }])
+  })
+})
 
 function validCp(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

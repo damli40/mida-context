@@ -7,7 +7,7 @@
 import { spawn } from "node:child_process"
 import os from "node:os"
 import path from "node:path"
-import { CONTENT_FIELDS, LIMITS, validateCheckpoint, type Checkpoint } from "@mida/checkpoint"
+import { CONTENT_FIELDS, LIMITS, repointEvidence, validateCheckpoint, type Checkpoint } from "@mida/checkpoint"
 import { extractJsonObject } from "./extract-json.js"
 import { buildExtractPrompt } from "./prompt.js"
 import { scrubSecrets, scrubValue } from "./scrub.js"
@@ -132,9 +132,15 @@ type ModelRun =
 
 // One bad field must not cost the whole save. Strings over the schema limit
 // are cut to it ending in "…"; arrays over the item limit keep 50 entries —
-// the LAST 50 for progress/evidence (the newest entries are the ones that
-// matter), the FIRST 50 for every other array. Each cut is named in
-// `trimmed` ("progress[3]", "decisions", "decisions[3].rationale").
+// the LAST 50 (the newest) for every list except the plan. The model carries
+// the earlier checkpoint forward and adds what is new at the end, so keeping
+// the front meant the 51st decision could never be saved, and the next agent
+// kept following a decision the user had since changed (CAP-29). The plan
+// keeps its FIRST 50: its front is what comes next. Evidence names its target
+// by position ("decisions[3]"), so after a front cut it is re-pointed, and
+// removed when its entry went. Each cut is named in `trimmed` ("progress[3]",
+// "decisions", "decisions[3].rationale" — positions as the model wrote them).
+const KEEPS_FRONT: ReadonlySet<string> = new Set(["remainingPlan"])
 function trimFields(picked: Record<string, unknown>, trimmed: string[]): void {
   const cutStr = (v: unknown, path: string): unknown => {
     if (typeof v !== "string" || v.length <= LIMITS.maxString) return v
@@ -144,20 +150,26 @@ function trimFields(picked: Record<string, unknown>, trimmed: string[]): void {
   for (const field of ["objective", "nextAction", "unresolvedIssue"]) {
     picked[field] = cutStr(picked[field], field)
   }
-  const cutList = (field: string, keepLast: boolean) => {
-    const arr = picked[field]
-    if (!Array.isArray(arr)) return
-    for (let i = 0; i < arr.length; i++) arr[i] = cutStr(arr[i], `${field}[${i}]`)
-    if (arr.length > LIMITS.maxArray) {
-      trimmed.push(field)
-      picked[field] = keepLast ? arr.slice(-LIMITS.maxArray) : arr.slice(0, LIMITS.maxArray)
+  // how many entries left the front of each list — what evidence has to follow
+  const cutFromFront = new Map<string, number>()
+  const cap = (field: string, arr: unknown[]): void => {
+    if (arr.length <= LIMITS.maxArray) return
+    trimmed.push(field)
+    if (KEEPS_FRONT.has(field)) {
+      picked[field] = arr.slice(0, LIMITS.maxArray)
+      return
     }
+    cutFromFront.set(field, arr.length - LIMITS.maxArray)
+    picked[field] = arr.slice(-LIMITS.maxArray)
   }
   for (const field of ["progress", "constraints", "artifacts", "remainingPlan"]) {
-    cutList(field, field === "progress")
+    const arr = picked[field]
+    if (!Array.isArray(arr)) continue
+    for (let i = 0; i < arr.length; i++) arr[i] = cutStr(arr[i], `${field}[${i}]`)
+    cap(field, arr)
   }
   for (const field of ["decisions", "rejected", "evidence"]) {
-    const arr = picked[field]
+    let arr = picked[field]
     if (!Array.isArray(arr)) continue
     for (let i = 0; i < arr.length; i++) {
       const item = arr[i]
@@ -169,10 +181,12 @@ function trimFields(picked: Record<string, unknown>, trimmed: string[]): void {
         )
       }
     }
-    if (arr.length > LIMITS.maxArray) {
-      trimmed.push(field)
-      picked[field] = field === "evidence" ? arr.slice(-LIMITS.maxArray) : arr.slice(0, LIMITS.maxArray)
+    if (field === "evidence") {
+      // evidence comes last in this loop, so every other list's cut is known by now
+      for (const [list, dropped] of cutFromFront) arr = repointEvidence(arr as unknown[], list, dropped)
+      picked[field] = arr
     }
+    cap(field, arr as unknown[])
   }
 }
 
