@@ -8,7 +8,7 @@
 import { describe, expect, it } from "vitest"
 import { MidaError, isMidaError } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
-import { SPONSOR_FALLBACK_TO_SELF_PAY, SponsorDidNotPay, sendContract } from "@mida/chain"
+import { SPONSOR_FALLBACK_TO_SELF_PAY, SponsorDidNotPay, failedBeforeSend, sendContract, sponsorDailyLimitOf } from "@mida/chain"
 import type { SendCost, SponsoredSender, WriteContext } from "@mida/chain"
 
 const ADDRESS: Address = "0x5fbdb2315678afecb367f032d93f642f64180aa3"
@@ -256,6 +256,56 @@ describe("sendContract with a sponsor wired", () => {
     expect(guarded[0]!.upperBound).toBe(true)
     expect(guarded[1]!.gasLimit).toBe(300_000n)
     expect(guarded[1]!.upperBound).not.toBe(true)
+  })
+
+  // UF-O item O2: when the sponsor's refusal was a daily limit and the self-paid fallback then
+  // fails pre-send, the thrown error carries the sponsor's reason on `sponsorDailyLimit` so the
+  // daemon can wait for the UTC reset instead of counting retries. The error's class, code and
+  // message never change.
+  it("a daily-limit refusal marks a failed self-paid fallback with the sponsor's reason", async () => {
+    const reason = "refused: this sender used its 120 free calls for today — try tomorrow"
+    const sponsor = successfulSponsor(async () => {
+      throw new SponsorDidNotPay(reason)
+    })
+    // No beforeSend: the refused estimate throws toMidaError(error) unchanged — a plain Error.
+    const { context, sent } = stubContext({ sponsor, estimateFailures: 99 })
+    const error = await sendContract(context, call, "context.register").then(() => null, (e: unknown) => e)
+    expect(sponsorDailyLimitOf(error)).toBe(reason)
+    expect((error as Error).message).toBe("insufficient funds for gas * price + value")
+    expect(failedBeforeSend(error)).toBe(true)
+    expect(sent).toHaveLength(0)
+  })
+
+  it("a refusal that is not a daily limit carries no marker", async () => {
+    const sponsor = successfulSponsor(async () => {
+      throw new SponsorDidNotPay("offline")
+    })
+    const { context } = stubContext({ sponsor, estimateFailures: 99 })
+    const error = await sendContract(context, call, "context.register").then(() => null, (e: unknown) => e)
+    expect(sponsorDailyLimitOf(error)).toBeUndefined()
+  })
+
+  it("a ceiling refusal after a daily-limit refusal stays clean — no marker on GAS_CEILING_EXCEEDED", async () => {
+    const sponsor = successfulSponsor(async () => {
+      throw new SponsorDidNotPay("refused: this sender used its 120 free calls for today — try tomorrow")
+    })
+    const { context } = stubContext({ sponsor, estimate: 700_000n }) // over context.register's 650_000 ceiling
+    const error = await sendContract(context, call, "context.register").then(() => null, (e: unknown) => e)
+    expect(isMidaError(error, "GAS_CEILING_EXCEEDED")).toBe(true)
+    expect(sponsorDailyLimitOf(error)).toBeUndefined()
+  })
+
+  it("a daily-limit refusal followed by a funded self-paid send returns the receipt as today", async () => {
+    const sponsor = successfulSponsor(async () => {
+      throw new SponsorDidNotPay("refused: this sender used its 120 free calls for today — try tomorrow")
+    })
+    const { context, sent } = stubContext({
+      sponsor,
+      beforeSend: async () => {},
+    })
+    const receipt = await sendContract(context, call, "context.register")
+    expect(receipt.transactionHash).toBe(HASH)
+    expect(sent).toHaveLength(1)
   })
 
   it("the same refused estimate with no sponsor keeps the plain wallet sentence — no sponsor prefix", async () => {

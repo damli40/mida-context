@@ -126,6 +126,19 @@ const markUnsent = <T>(error: T): T => {
   return error
 }
 
+/**
+ * The sponsor's daily-limit reason a failed self-paid fallback carries — set by `sendContract`
+ * when the sponsor refused on a daily limit and the wallet could not pay either. Undefined on
+ * every other error.
+ */
+export function sponsorDailyLimitOf(error: unknown): string | undefined {
+  if (error !== null && typeof error === "object") {
+    const value = (error as { sponsorDailyLimit?: unknown }).sponsorDailyLimit
+    if (typeof value === "string" && value.length > 0) return value
+  }
+  return undefined
+}
+
 /** A "still waiting for Monad" line ticks this often while a send is in flight (in-15 J-4). */
 export const SEND_PROGRESS_EVERY_MS = 15_000
 /** The most a send waits on Monad before reporting what it honestly knows (in-15 J-4). */
@@ -317,6 +330,7 @@ export async function sendContract(
       throw markUnsent(toMidaError(error))
     }
     let sponsorReason: string | undefined
+    let sponsorDailyLimit = false
     if (context.sponsor !== undefined) {
       // If the cap already fired while the simulate was out, this must not become a broadcast —
       // the refusal the caller saw was the last word (in-16 K-1).
@@ -344,6 +358,7 @@ export async function sendContract(
         // timeout message can honestly fall back to "nothing was sent" while we self-pay.
         sentAttempted = false
         sponsorReason = error.reason
+        sponsorDailyLimit = error.dailyLimit === true
         context.progress?.(`the gas sponsor did not pay (${error.reason}); paying from your own wallet…`)
         // falls through to the self-paid path — exactly one attempt, never a retry loop
       }
@@ -382,6 +397,13 @@ export async function sendContract(
       gate.checkAbandoned()
       await context.beforeSend?.({ payer: context.account.address, gasLimit: gas, fee }, gate)
     } catch (error) {
+      // The sponsor refused on its daily limit AND the wallet fallback failed before sending:
+      // carry the sponsor's reason on the error so a caller (the daemon's drain) can tell
+      // "wait for the UTC reset" from a real chain failure. A GAS_CEILING_EXCEEDED is a local
+      // policy refusal, not the limit — it stays clean. Class, code and message never change.
+      if (sponsorDailyLimit && error !== null && typeof error === "object" && !isMidaError(error, "GAS_CEILING_EXCEEDED")) {
+        ;(error as { sponsorDailyLimit?: string }).sponsorDailyLimit = sponsorReason
+      }
       throw markUnsent(error)
     }
     // The gate and the write call are one synchronous stretch — after the cap there is no send.
