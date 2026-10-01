@@ -1,6 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
-import { LIMITS, repointEvidence, validateCheckpoint } from "@mida/checkpoint"
+import { LIMITS, cutText, repointEvidence, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint, MigrationEnvelope } from "@mida/checkpoint"
 import { validateMigrationEnvelope } from "./migration-envelope.js"
 import { DEFAULT_TASK, isTaskName } from "./task.js"
@@ -88,6 +88,24 @@ function checkedMigration(migration: unknown): MigrationEnvelope | undefined {
 }
 
 /**
+ * Appends a "(Mida: …)" note to `unresolvedIssue` so every note in the field stays whole: when
+ * the join would pass the string cap, the free text before the first " | (Mida:" is what
+ * shortens — dropped, with its separator, when nothing of it would remain. (UF-K: a note pushed
+ * the field past 2,000 chars and the stored save then failed validation on read — invisible.)
+ */
+function joinIssueNote(issue: string | null, note: string): string {
+  if (issue === null) return note
+  const joined = `${issue} | ${note}`
+  if (joined.length <= LIMITS.maxString) return joined
+  const first = issue.indexOf(" | (Mida:")
+  const notes = `${first === -1 ? "" : issue.slice(first)} | ${note}`
+  const head = first === -1 ? issue : issue.slice(0, first)
+  const room = LIMITS.maxString - notes.length
+  const kept = room <= 0 ? "" : cutText(head, room)
+  return kept === "" ? notes.slice(3) : `${kept}${notes}`
+}
+
+/**
  * Validates the checkpoint and wraps it in the v1 envelope. If the serialized envelope would exceed
  * the byte cap, the checkpoint is shrunk in the DROPPABLE order — oldest entries first — and any
  * string still longer than 300 chars outside the protected fields is cut to 300 with an ellipsis.
@@ -156,7 +174,7 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
   const cut = (field: string, text: string): string => {
     if (text.length <= CUT_TO) return text
     trimmed.add(field)
-    return `${text.slice(0, CUT_TO)}…`
+    return cutText(text, CUT_TO + 1) // CUT_TO units plus the ellipsis — never a split surrogate
   }
   if (bytes() > MAX_VALUE_BYTES) {
     checkpoint.agent = cut("agent", checkpoint.agent)
@@ -173,7 +191,7 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
     if (checkpoint.constraints.length < LIMITS.maxArray) {
       checkpoint.constraints.push(note)
     } else {
-      checkpoint.unresolvedIssue = checkpoint.unresolvedIssue === null ? note : `${checkpoint.unresolvedIssue} | ${note}`
+      checkpoint.unresolvedIssue = joinIssueNote(checkpoint.unresolvedIssue, note)
     }
     // the note costs bytes too — drop whatever else can go before giving up
     while (bytes() > MAX_VALUE_BYTES && dropOldest()) { /* keep shrinking */ }
@@ -182,7 +200,14 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
     const what = [...dropped.entries()].map(([field, n]) => `${n} ${field}`).join(", ") || "nothing"
     throw new CheckpointPayloadError("too-large", `checkpoint envelope exceeds the ${MAX_VALUE_BYTES}-byte cap even after dropping ${what}`)
   }
-  return envelope()
+  // A save must never be stored in a form that cannot be read back: the shrink steps above edit
+  // the checkpoint after the input validation, so the result is validated once more (UF-K).
+  const final = envelope()
+  const rechecked = validateCheckpoint(final.checkpoint)
+  if (!rechecked.ok) {
+    throw new CheckpointPayloadError("invalid-checkpoint", `invalid checkpoint: ${rechecked.errors.join("; ")}`, fieldPathsFromErrors(rechecked.errors))
+  }
+  return final
 }
 
 /** Reads back a v1 envelope. Anything else — wrong type, missing field, invalid checkpoint — is null, never a throw. */

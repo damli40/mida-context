@@ -7,7 +7,7 @@
 import { spawn } from "node:child_process"
 import os from "node:os"
 import path from "node:path"
-import { CONTENT_FIELDS, LIMITS, repointEvidence, validateCheckpoint, type Checkpoint } from "@mida/checkpoint"
+import { CONTENT_FIELDS, LIMITS, cutText, repointEvidence, validateCheckpoint, type Checkpoint } from "@mida/checkpoint"
 import { extractJsonObject } from "./extract-json.js"
 import { buildExtractPrompt } from "./prompt.js"
 import { scrubSecrets, scrubValue } from "./scrub.js"
@@ -141,13 +141,15 @@ type ModelRun =
 // removed when its entry went. Each cut is named in `trimmed` ("progress[3]",
 // "decisions", "decisions[3].rationale" — positions as the model wrote them).
 const KEEPS_FRONT: ReadonlySet<string> = new Set(["remainingPlan"])
-function trimFields(picked: Record<string, unknown>, trimmed: string[]): void {
+function trimFields(picked: Record<string, unknown>, trimmed: string[], previousIssue: string | null | undefined): void {
   const cutStr = (v: unknown, path: string): unknown => {
     if (typeof v !== "string" || v.length <= LIMITS.maxString) return v
     trimmed.push(path)
-    return v.slice(0, LIMITS.maxString - 1) + "…"
+    return cutText(v, LIMITS.maxString)
   }
-  for (const field of ["objective", "nextAction", "unresolvedIssue"]) {
+  // unresolvedIssue is handled at the end, once the per-list cut counts are known — its
+  // note work needs them, and the general string cap runs on the issue text only, never on a note
+  for (const field of ["objective", "nextAction"]) {
     picked[field] = cutStr(picked[field], field)
   }
   // how many entries left the front of each list — what evidence has to follow
@@ -188,44 +190,58 @@ function trimFields(picked: Record<string, unknown>, trimmed: string[]): void {
     }
     cap(field, arr as unknown[])
   }
-  // UF-J: a front cut on a rule list drops the user's OLDEST entries, and the save must say
+  // UF-K: a front cut on a rule list drops the user's OLDEST entries, and the save must say
   // so — otherwise the next agent never learns the rule that left. The note lands in
-  // unresolvedIssue. Any note the model carried forward from a previous save is stripped
-  // first, so notes never pile up or go stale; only constraints, decisions and rejected
-  // earn one — progress, artifacts, evidence and plan cuts stay silent.
-  const OLD_NOTE = /\s*\|?\s*\(Mida: a list holds at most \d+ entries\.[^)]*\)/g
-  let issue: string | null | undefined = picked.unresolvedIssue as string | null | undefined
-  if (typeof issue === "string") {
-    const stripped = issue.replace(OLD_NOTE, "")
-    if (stripped !== issue) issue = stripped === "" ? null : stripped
+  // unresolvedIssue and is CUMULATIVE over the session: the counts the previous checkpoint's
+  // note recorded are parsed out and added to whatever this compile dropped, so a save that
+  // changes nothing still carries the loss forward instead of washing the note away.
+  // Only constraints, decisions and rejected earn one — progress, artifacts, evidence and
+  // plan cuts stay silent.
+  const carried = { constraints: 0, decisions: 0, rejected: 0 }
+  if (typeof previousIssue === "string") {
+    const m = /\(Mida: a list holds at most \d+ entries\. Left out:([^)]*)\)/.exec(previousIssue)
+    if (m !== null) {
+      for (const part of m[1]!.matchAll(/the (\d+) oldest (constraints?|decisions?|rejected approaches?)/g)) {
+        const key = part[2]!.startsWith("constraint") ? "constraints" : part[2]!.startsWith("decision") ? "decisions" : "rejected"
+        carried[key] += Number(part[1])
+      }
+    }
   }
-  const frontLost = (field: string, one: string, many: string): string | null => {
-    const n = cutFromFront.get(field)
-    if (n === undefined) return null
-    return n === 1 ? `the 1 oldest ${one}` : `the ${n} oldest ${many}`
+  const totals = {
+    constraints: carried.constraints + (cutFromFront.get("constraints") ?? 0),
+    decisions: carried.decisions + (cutFromFront.get("decisions") ?? 0),
+    rejected: carried.rejected + (cutFromFront.get("rejected") ?? 0),
   }
-  const lost = [
-    frontLost("constraints", "constraint", "constraints"),
-    frontLost("decisions", "decision", "decisions"),
-    frontLost("rejected", "rejected approach", "rejected approaches"),
-  ].filter((s): s is string => s !== null)
-  if (lost.length > 0 && (typeof issue === "string" || issue === null || issue === undefined)) {
-    const note = `(Mida: a list holds at most ${LIMITS.maxArray} entries. Left out: ${lost.join(", ")}.)`
-    if (issue === null || issue === undefined || issue === "") {
-      picked.unresolvedIssue = note
+  const rawIssue = picked.unresolvedIssue
+  if (rawIssue === null || rawIssue === undefined || typeof rawIssue === "string") {
+    // Every note-shaped segment leaves the model's text BEFORE the length cut, complete or
+    // cut off at the end of the string — a tail the cap cut mid-note would otherwise stay
+    // forever, never matching the strip again (UF-K).
+    const NOTE_TAIL = /\s*\|?\s*\(Mida: a list holds at most[^)]*(\)|$)/g
+    const issue = cutStr(
+      typeof rawIssue === "string" ? rawIssue.replace(NOTE_TAIL, "").trim() : "",
+      "unresolvedIssue",
+    ) as string
+    const counted = (n: number, one: string, many: string): string | null =>
+      n === 0 ? null : n === 1 ? `the 1 oldest ${one}` : `the ${n} oldest ${many}`
+    const lost = [
+      counted(totals.constraints, "constraint", "constraints"),
+      counted(totals.decisions, "decision", "decisions"),
+      counted(totals.rejected, "rejected approach", "rejected approaches"),
+    ].filter((s): s is string => s !== null)
+    if (lost.length === 0) {
+      picked.unresolvedIssue = issue === "" ? null : issue
     } else {
+      const note = `(Mida: a list holds at most ${LIMITS.maxArray} entries. Left out: ${lost.join(", ")}.)`
       // the note stays whole — when it would push the field past the string cap, the
       // model's own text is what shortens, ending in "…"
-      const sep = " | "
-      const head =
-        issue.length + sep.length + note.length > LIMITS.maxString
-          ? `${issue.slice(0, LIMITS.maxString - sep.length - note.length - 1)}…`
-          : issue
-      picked.unresolvedIssue = `${head}${sep}${note}`
+      picked.unresolvedIssue =
+        issue === ""
+          ? note
+          : `${cutText(issue, LIMITS.maxString - " | ".length - note.length)} | ${note}`
     }
-  } else {
-    picked.unresolvedIssue = issue
   }
+  // a non-string unresolvedIssue is left for the validator to flag
 }
 
 // One model call: the prompt goes on stdin, stdout is captured up to
@@ -510,7 +526,7 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     }
 
     const trimmed: string[] = []
-    trimFields(picked, trimmed)
+    trimFields(picked, trimmed, input.previous?.unresolvedIssue)
 
     const v = validateCheckpoint(picked)
     if (!v.ok) {

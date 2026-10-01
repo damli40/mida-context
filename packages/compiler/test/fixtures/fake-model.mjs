@@ -46,6 +46,10 @@
 //   stale-note-only — GOOD but unresolvedIssue IS such a note alone (UF-J)
 //   long-issue — GOOD with 51 decisions and a 1,990-char unresolvedIssue:
 //              the trim note must fit inside the string cap whole (UF-J)
+//   issue-and-old-note — GOOD with a 1,990-char unresolvedIssue followed by a
+//              complete old note: strip must run before the string cap (UF-K)
+//   cut-note-tail — GOOD with an unresolvedIssue ending in a note cut off
+//              mid-way (no closing bracket): the tail still leaves (UF-K)
 //
 // The mode comes from argv[2] when present, else FAKE_MODEL_MODE — argv lets a
 // primary and a fallback command differ inside one compile even though both
@@ -226,6 +230,21 @@ process.stdin.on("end", () => {
         ...GOOD,
         decisions: Array.from({ length: 51 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
         unresolvedIssue: "i".repeat(1990),
+      })
+      break
+    case "issue-and-old-note":
+      fenced({
+        ...GOOD,
+        unresolvedIssue:
+          "i".repeat(1990) +
+          " | (Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+      })
+      break
+    case "cut-note-tail":
+      fenced({
+        ...GOOD,
+        unresolvedIssue:
+          "the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Left out: the 1 oldest de",
       })
       break
     case "echo-previous": {

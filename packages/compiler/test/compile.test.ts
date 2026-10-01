@@ -567,6 +567,79 @@ describe("compileCheckpoint", () => {
       expect(issue.endsWith("… | (Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)")).toBe(true)
     }
   })
+  // UF-K: the 50-entry note is cumulative over the session. Save 1 drops the 51st decision and
+  // writes the note; save 2 returns that checkpoint unchanged — the note must survive, not wash
+  // out to a silent "unresolvedIssue: none"; save 3 adds one decision and the count grows to 2.
+  it("the 50-entry note is cumulative over the session, never washed out by a quiet save (UF-K)", async () => {
+    const first = await compileCheckpoint({ ...base, model: fake("wide") })
+    expect(first.ok).toBe(true)
+    if (!first.ok) return
+    expect(first.checkpoint.unresolvedIssue).toBe(
+      "(Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+    )
+    const echo = await compileCheckpoint({ ...base, previous: first.checkpoint, model: fake("echo-previous") })
+    expect(echo.ok).toBe(true)
+    if (echo.ok) {
+      expect(echo.checkpoint.unresolvedIssue).toBe(
+        "(Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+      )
+    }
+    const added = await compileCheckpoint({ ...base, previous: first.checkpoint, model: fake("add-decision") })
+    expect(added.ok).toBe(true)
+    if (added.ok) {
+      expect(added.checkpoint.unresolvedIssue).toBe(
+        "(Mida: a list holds at most 50 entries. Left out: the 2 oldest decisions.)",
+      )
+      expect(added.checkpoint.decisions.at(-1)!.decision).toBe("newest")
+    }
+  })
+  // UF-K: a note that rode in on the model's text is stripped BEFORE the string cap runs — when
+  // the cap cut it first, a broken "(Mida: a list holds at…" tail survived the strip regex. With
+  // no previous note there is nothing to rebuild, so the field keeps only the issue text.
+  it("an old note is stripped before the string cap — no broken tail survives (UF-K)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("issue-and-old-note") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.unresolvedIssue).toBe("i".repeat(1990))
+      expect(r.checkpoint.unresolvedIssue).not.toContain("(Mida:")
+    }
+  })
+  // Same fixture with a real previous note: the count is read from the previous checkpoint and
+  // the rebuilt note sits after the issue text, whole, inside the cap.
+  it("a previous note is rebuilt after the issue text, whole and inside the cap (UF-K)", async () => {
+    const previous: Checkpoint = {
+      eventId: "evt-prev0001",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: "2026-09-21T09:00:00.000Z",
+      objective: "Implement the rate limiter",
+      originalRequest: "Build a rate limiter in 3 steps",
+      progress: ["skeleton written"],
+      decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+      rejected: [],
+      constraints: [],
+      artifacts: [],
+      unresolvedIssue: "(Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+      nextAction: "add tests",
+      remainingPlan: [],
+      evidence: [],
+    }
+    const r = await compileCheckpoint({ ...base, previous, model: fake("issue-and-old-note") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      const issue = r.checkpoint.unresolvedIssue!
+      expect(issue.length).toBeLessThanOrEqual(2000)
+      expect(issue.endsWith(" | (Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)")).toBe(true)
+      expect(issue.startsWith("i".repeat(10))).toBe(true)
+    }
+  })
+  it("an unresolvedIssue ending in a note cut off mid-way loses the tail (UF-K)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("cut-note-tail") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.unresolvedIssue).toBe("the deploy key rotation is waiting on ops")
+    }
+  })
   it("evidence follows its entry when a list is cut from the front, and goes when its entry goes (C11, CAP-29)", async () => {
     const r = await compileCheckpoint({ ...base, model: fake("wide-all") })
     expect(r.ok).toBe(true)

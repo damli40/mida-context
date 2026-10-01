@@ -65,6 +65,32 @@ describe("checkpoint payload", () => {
     expect(note).toContain("decisions")
     expect(note).toContain("rejected")
   })
+  // UF-K: the reviewed case. A compile already cut 51 constraints to 50 and wrote its trim note
+  // onto a nearly-full unresolvedIssue; the envelope is still over the byte cap, so wrap appends
+  // its own size note — pushing the field past 2,000 chars, which used to store a save that
+  // unwrapCheckpoint could not read back at all (it returned null and the save was skipped).
+  it("a save stays readable when wrap's size note lands on a nearly-full unresolvedIssue (UF-K)", () => {
+    const compileNote = "(Mida: a list holds at most 50 entries. Left out: the 1 oldest constraint.)"
+    const issue = `${"i".repeat(2000 - compileNote.length - 3)} | ${compileNote}` // exactly 2,000 chars
+    const fat = sampleCheckpoint({
+      constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i} ${"c".repeat(1200)}`),
+      unresolvedIssue: issue,
+      progress: ["p".repeat(2000), "q".repeat(2000)],
+    })
+    const e = wrap(fat)
+    expect(Buffer.byteLength(JSON.stringify(e))).toBeLessThanOrEqual(MAX_VALUE_BYTES)
+    expect(e.checkpoint.constraints).toHaveLength(50)
+    expect(e.checkpoint.constraints.every((c) => c.startsWith("constraint-"))).toBe(true)
+    const stored = e.checkpoint.unresolvedIssue!
+    expect(stored.length).toBeLessThanOrEqual(2000)
+    expect(stored).toContain("(Mida: left out") // wrap's own note survived whole
+    expect(stored).toContain(compileNote)       // and so did the note the compile wrote
+    // the stored save must read back — a checkpoint wrap produced that fails validation is a
+    // silent loss: the chain stores it, then every reader sees null
+    const back = unwrapCheckpoint(JSON.parse(JSON.stringify(e)))
+    expect(back).not.toBeNull()
+    expect(back!.checkpoint.unresolvedIssue).toBe(stored)
+  })
   it("when constraints already holds 50 real entries, the note lands on unresolvedIssue and no constraint is deleted", () => {
     const fat = sampleCheckpoint({
       constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i}`),

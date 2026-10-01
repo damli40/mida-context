@@ -4,6 +4,19 @@
 
 export const LIMITS = { maxString: 2000, maxRequest: 6000, maxArray: 50 } as const
 
+/**
+ * Cuts `text` to at most `max` UTF-16 units ending in "…". A plain slice can land between the
+ * two halves of a surrogate pair and store a broken emoji — when the cut would end on a high
+ * surrogate, one more unit goes so the character stays whole. Returns `text` unchanged when it
+ * already fits.
+ */
+export function cutText(text: string, max: number): string {
+  if (text.length <= max) return text
+  const head = text.slice(0, max - 1)
+  const code = head.charCodeAt(head.length - 1)
+  return `${code >= 0xd800 && code <= 0xdbff ? head.slice(0, -1) : head}…`
+}
+
 export type CheckpointSource = "agent-tool" | "hook-compiler"
 
 export interface Checkpoint {

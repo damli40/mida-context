@@ -1,5 +1,33 @@
 import { describe, expect, it } from "vitest"
+import * as schema from "../src/index.js"
 import { repointEvidence, validateCheckpoint } from "../src/index.js"
+
+// UF-K: every string cut goes through cutText — a plain slice can end on the first half of a
+// surrogate pair and store a broken emoji.
+describe("cutText", () => {
+  const { cutText } = schema
+  it("returns the text unchanged at or under max", () => {
+    expect(cutText("hello", 5)).toBe("hello")
+    expect(cutText("hi", 5)).toBe("hi")
+    expect(cutText("x".repeat(2000), 2000)).toBe("x".repeat(2000))
+  })
+  it("cuts over-long text to max characters ending in the ellipsis", () => {
+    const cut = cutText("x".repeat(2100), 2000)
+    expect(cut).toBe("x".repeat(1999) + "…")
+    expect(cut.length).toBe(2000)
+  })
+  it("never leaves a lone surrogate half at the cut — the emoji stays whole", () => {
+    // the cut point lands between the two halves of the emoji: the head may not end
+    // on a high surrogate
+    const cut = cutText(`abc${"😀"}` + "z".repeat(2100), 5)
+    const head = cut.slice(0, -1)
+    expect(head).not.toMatch(/[\uD800-\uDBFF]$/)
+    expect(cut.endsWith("…")).toBe(true)
+    expect(cut).toBe("abc…")
+    // and a pair wholly inside the budget survives whole
+    expect(cutText("ab" + "😀" + "z".repeat(2100), 6)).toBe("ab😀z…")
+  })
+})
 
 // CAP-29: evidence names its target by position ("decisions[3]"), so entries leaving the front of
 // a list would leave every later evidence line vouching for a different entry.
