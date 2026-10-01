@@ -9,9 +9,10 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { compileCheckpoint, type CompileInput, type ModelCommand } from "../src/index.js"
+import { compileCheckpoint, limitHit, type CompileInput, type ModelCommand } from "../src/index.js"
 
 const fixturePath = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-agent-cli.mjs")
+const echoFixture = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-echo-cli.mjs")
 
 let dir: string
 let base: CompileInput
@@ -142,5 +143,161 @@ describe("agentCli model commands", () => {
     expect(r.reason).toBe("summarizer-limit")
     expect(r.detail).toContain("(usage limit)")
     expect(r.detail).not.toContain("session limit")
+  })
+})
+
+describe("the echoed prompt is never the tool's own words (UF-P1R)", () => {
+  function echoCli(mode: string, over: Partial<ModelCommand> = {}): ModelCommand {
+    process.env.FAKE_CLI_COUNTER = counterPath
+    return { argv: [process.execPath, echoFixture, mode], label: `echo-${mode}`, agentCli: true, ...over }
+  }
+  /** A transcript whose single user line is exactly `line` — that line lands in the prompt the fixture echoes. */
+  const withUserLine = (line: string): CompileInput => {
+    const transcriptPath = path.join(dir, "echo-transcript.jsonl")
+    fs.writeFileSync(transcriptPath, JSON.stringify({ type: "user", message: { role: "user", content: line } }) + "\n")
+    return { ...base, transcriptPath }
+  }
+  const strayTempDirs = (): string[] =>
+    fs.readdirSync(fs.realpathSync(os.tmpdir())).filter((n) => n.startsWith("mida-sum-"))
+
+  it("a prompt that mentions a weekly limit is echoed back — and the plain failure stays model-failed", async () => {
+    const input = withUserLine("we hit the weekly limit on the API and added a rate limiter")
+    const r = await compileCheckpoint({ ...input, model: echoCli("fail"), attempts: 1 })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.reason).toBe("model-failed")
+    expect(r.detail).not.toContain("(usage limit)")
+  })
+
+  it("the same echo followed by the tool's OWN limit line is a limit", async () => {
+    const input = withUserLine("we hit the weekly limit on the API and added a rate limiter")
+    const r = await compileCheckpoint({ ...input, model: echoCli("limit"), attempts: 1 })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.reason).toBe("summarizer-limit")
+  })
+
+  it("a limit line after a 6,000-character echo is still seen — the kept stderr is the tail", async () => {
+    const r = await compileCheckpoint({ ...base, model: echoCli("echo-limit"), attempts: 1 })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.reason).toBe("summarizer-limit")
+  })
+
+  it("a limit line pushed out of the last 4,096 kept characters is honestly missed", async () => {
+    // mode that prints the limit FIRST then a long tail — only the tail is kept
+    const r = await compileCheckpoint({ ...base, model: echoCli("limit-first"), attempts: 1 })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.reason).toBe("model-failed")
+  })
+
+  it("a two-command chain can reach summarizer-limit on a LATER attempt", async () => {
+    // attempt 1: claude plain failure, then codex's limit; attempt 2 re-runs claude → limit.
+    // Every command's most recent failure was a limit → the compile ends at once.
+    const r = await compileCheckpoint({
+      ...base,
+      model: echoCli("fail+limit"),
+      fallbackModels: [echoCli("limit")],
+      attempts: 3,
+    })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.reason).toBe("summarizer-limit")
+    expect(r.attempts).toBe(2)
+    expect(runs()).toBe(3)
+  })
+
+  it("a limit on claude and a plain failure on codex, every attempt, stays model-failed", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: echoCli("limit"),
+      fallbackModels: [echoCli("fail")],
+      attempts: 3,
+    })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.reason).toBe("model-failed")
+    expect(r.attempts).toBe(3)
+    expect(runs()).toBe(4) // attempt1: claude+codex; later attempts re-run only the primary
+  })
+
+  it("a failure to create the empty folder reports the error code, never a path", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: echoCli("fail"),
+      attempts: 1,
+      makeTempDir: () => {
+        throw Object.assign(new Error("mkdir /no/such/parent/mida-sum-x"), { code: "ENOENT" })
+      },
+    })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.detail).toBe("echo-fail: temp folder: ENOENT")
+    expect(r.detail).not.toMatch(/[\\/]/)
+  })
+
+  it("the working folder is removed after a non-zero exit", async () => {
+    const before = strayTempDirs()
+    const r = await compileCheckpoint({ ...base, model: echoCli("fail"), attempts: 1 })
+    expect(r.ok).toBe(false)
+    expect(strayTempDirs()).toEqual(before)
+  })
+
+  it("the working folder is removed after a timeout", async () => {
+    const before = strayTempDirs()
+    const r = await compileCheckpoint({ ...base, model: echoCli("hang", { timeoutMs: 200 }), attempts: 1 })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.detail).toContain("timeout")
+    expect(strayTempDirs()).toEqual(before)
+  })
+
+  it("the working folder is removed after a spawn error", async () => {
+    const before = strayTempDirs()
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: ["/no/such/binary"], label: "ghost", agentCli: true },
+      attempts: 1,
+    })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.detail).toContain("spawn")
+    expect(strayTempDirs()).toEqual(before)
+  })
+
+  it("an ANTHROPIC_* name inside the command's env never reaches the child", async () => {
+    const r = await compileCheckpoint({
+      ...base,
+      model: echoCli("env", { env: { ANTHROPIC_API_KEY: "smuggled", ANTHROPIC_BASE_URL: "http://evil" } }),
+    })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.checkpoint.progress).toContain("anthropic:absent")
+  })
+})
+
+describe("limitHit", () => {
+  it("true for the tools' own limit lines", () => {
+    expect(limitHit("", "", "You've hit your session limit · resets 3:45pm")).toBe(true)
+    expect(limitHit("", "5-hour limit reached", "")).toBe(true)
+    expect(limitHit("", "", "insufficient_quota")).toBe(true)
+    expect(limitHit("", "Credit balance is too low", "")).toBe(true)
+  })
+
+  it("false for rate-limit words, disk quota, a limiter mention and empty output", () => {
+    expect(limitHit("", "", "exceed your organization's rate limit")).toBe(false)
+    // a passing API rate-limit error — retryable in seconds, NOT a plan limit
+    expect(limitHit("", "", "http 429: rate limit exceeded, retry in 2s")).toBe(false)
+    expect(limitHit("", "", "disk quota exceeded")).toBe(false)
+    expect(limitHit("", "", "added a rate limiter")).toBe(false)
+    expect(limitHit("", "", "")).toBe(false)
+  })
+
+  it("a line that is just the echoed prompt does not count", () => {
+    const prompt = "Summarise this.\nwe hit the weekly limit on the API"
+    expect(limitHit(prompt, "", `Summarise this.\nwe hit the weekly limit on the API`)).toBe(false)
+    // but the same words when NOT in the prompt still count
+    expect(limitHit(prompt, "", "we hit the weekly limit elsewhere")).toBe(true)
   })
 })

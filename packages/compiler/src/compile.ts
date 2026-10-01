@@ -41,9 +41,32 @@ export interface ModelCommand {
   agentCli?: boolean
 }
 
-/** The text shape of an agent CLI's "you are out of plan" answer — matched on stdout+stderr. */
+/**
+ * The text shape of an agent CLI's "you are out of plan" answer — a usage/session/
+ * weekly/N-hour limit near a reaching verb, in either order, or one of the API
+ * providers' own phrases. "rate" is deliberately absent: a passing API rate-limit
+ * error is worth the retry this guard would skip. Disk quota is not a plan limit.
+ */
 export const USAGE_LIMIT_PATTERN =
-  /\b(?:usage|session|weekly|rate)[ -]limit|\bquota\b|credit balance is too low/i
+  /\b(?:usage|session|weekly|\d+-hour)[ -]limits?\b[^\n]{0,60}\b(?:reached|exceeded|hit)\b|\b(?:hit|reached|exceeded)\b[^\n]{0,60}\b(?:usage|session|weekly|\d+-hour)[ -]limits?\b|\binsufficient_quota\b|(?<!disk )\bquota exceeded\b|credit balance is too low/i
+
+/**
+ * Did the tool's OWN output name a usage limit? Codex prints the prompt back on
+ * stderr before its answer, so a user request that merely mentions "rate limiter"
+ * or "quota" must not make an unrelated failure look like a plan limit: every
+ * candidate line that, trimmed, equals a trimmed line of the PROMPT is dropped
+ * first — it is the tool's echo, not its words. What remains (the head of stdout,
+ * the kept tail of stderr) is matched line by line.
+ */
+export function limitHit(prompt: string, stdout: string, stderrTail: string): boolean {
+  const echoed = new Set(prompt.split("\n").map((line) => line.trim()))
+  for (const raw of `${stdout.slice(0, 4096)}\n${stderrTail}`.split("\n")) {
+    const line = raw.trim()
+    if (line === "" || echoed.has(line)) continue
+    if (USAGE_LIMIT_PATTERN.test(line)) return true
+  }
+  return false
+}
 
 export const DEFAULT_MODEL: ModelCommand = {
   argv: ["claude", "-p", "--model", "haiku", "--setting-sources", "project", "--strict-mcp-config"],
@@ -74,6 +97,8 @@ export interface CompileInput {
   backoffMs?: readonly number[]
   now?: () => Date
   sleep?: (ms: number) => Promise<void>
+  /** Test seam: how the agent-CLI working folder is made — so a test can make it fail. */
+  makeTempDir?: () => string
 }
 
 export type CompileResult =
@@ -252,7 +277,7 @@ function trimFields(picked: Record<string, unknown>, trimmed: string[], previous
 // settles on 'exit' or the timeout, never on 'close' alone: a grandchild
 // that inherited the stdout pipe keeps it open after the model dies, and
 // 'close' would then never come.
-function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
+function runModel(model: ModelCommand, prompt: string, makeTempDir?: () => string): Promise<ModelRun> {
   const t0 = Date.now()
   const timeoutMs = model.timeoutMs ?? DEFAULT_TIMEOUT_MS
   return new Promise((resolve) => {
@@ -263,9 +288,12 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
     let workDir = os.tmpdir()
     if (model.agentCli === true) {
       try {
-        workDir = mkdtempSync(join(os.tmpdir(), "mida-sum-"))
+        workDir = makeTempDir?.() ?? mkdtempSync(join(os.tmpdir(), "mida-sum-"))
       } catch (err) {
-        resolve({ ok: false, detail: `spawn: ${err instanceof Error ? err.message : String(err)}`, ms: Date.now() - t0 })
+        // the error CODE only ("temp folder: EACCES") — the message can carry
+        // a path, and a path in a log line leaks the local layout
+        const code = (err as NodeJS.ErrnoException).code ?? "unknown"
+        resolve({ ok: false, detail: `temp folder: ${code}`, ms: Date.now() - t0 })
         return
       }
     }
@@ -382,9 +410,10 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
       if (timedOut || exited === null) return
       if (exited.code !== 0) {
         if (model.agentCli === true) {
-          // The limit check reads stdout plus the kept stderr — but the detail
-          // carries only the marker, never a word of the tool's own output.
-          const limit = USAGE_LIMIT_PATTERN.test(`${stdout.slice(0, 4096)}\n${stderr}`)
+          // The limit check reads the tool's OWN lines — the head of stdout plus
+          // the kept tail of stderr, minus anything that is just the echoed prompt
+          // — but the detail carries only the marker, never a word of the output.
+          const limit = limitHit(prompt, stdout, stderr)
           done({
             ok: false,
             detail: `exit ${exited.code} signal ${exited.signal}${limit ? " (usage limit)" : ""}`,
@@ -419,7 +448,11 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
     })
     child.stderr?.setEncoding("utf8")
     child.stderr?.on("data", (c: string) => {
-      if (stderr.length < 4096) stderr += c.slice(0, 4096 - stderr.length)
+      if (model.agentCli === true) {
+        // a rolling TAIL: an agent CLI prints the prompt back on stderr first —
+        // the head is mostly that echo, and a real limit line comes LAST
+        stderr = (stderr + c).slice(-4096)
+      } else if (stderr.length < 4096) stderr += c.slice(0, 4096 - stderr.length)
     })
     child.on("error", (err) => {
       clearTimeout(timer)
@@ -510,9 +543,14 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     reason: "model-failed",
     detail: "no attempt ran",
   }
-  // The unspent fallback providers. Each is shifted out as it runs, so a provider is
-  // never tried twice — a later attempt re-runs the primary, never the chain.
-  const queue = [...(input.fallbackModels ?? [])]
+  // The unspent fallback providers, kept as positions in the full chain so each
+  // command's MOST RECENT failure can be remembered by index: a compile is a
+  // "summarizer-limit" when every command has run at least once and each one's
+  // last failure was a limit — on ANY attempt, not only the first. A later
+  // attempt re-runs the primary (index 0), never the chain.
+  const chain = [model, ...(input.fallbackModels ?? [])]
+  const queue = chain.map((_, i) => i).slice(1)
+  const lastRunWasLimit = new Map<number, boolean>()
   // The primary's one same-provider shape retry (M3-H) — a compile-level flag, so the
   // worst case any compile can add is exactly one call, across every attempt combined.
   let retried = 0
@@ -595,16 +633,9 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     let usage: { cacheHitTokens?: number; cacheMissTokens?: number; inputTokens?: number; outputTokens?: number } = {}
     // the field names of the LAST invalid failure — kept for the terminal report only
     let invalidFields: string[] | undefined
-    // UF-P1: when every command of the chain ran inside this ONE attempt and every
-    // failure was a usage limit, the compile is "summarizer-limit" — a retry would
-    // hit the same walls, so it never runs. A success or any non-limit failure ends the count.
-    const chainLength = 1 + (input.fallbackModels?.length ?? 0)
-    let chainRuns = 0
-    let attemptAllLimit = true
     for (;;) {
-      const run = await runModel(current, prompt)
-      chainRuns += 1
-      if (run.ok || run.limit !== true) attemptAllLimit = false
+      const run = await runModel(current, prompt, input.makeTempDir)
+      lastRunWasLimit.set(chain.indexOf(current), run.ok === true ? false : run.limit === true)
       modelMs += run.ms
       let fail: { reason: "model-failed" | "no-json" | "invalid"; detail: string; sample?: string }
       if (run.ok) {
@@ -652,11 +683,12 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
         retried = 1
         continue
       }
-      const next = queue.shift()
-      if (next === undefined) {
+      const nextIndex = queue.shift()
+      if (nextIndex === undefined) {
         lastFail = { reason: fail.reason, detail: trail.join("; "), ...(fail.sample !== undefined ? { sample: fail.sample } : {}) }
         break
       }
+      const next = chain[nextIndex]!
       hops.push({ from: current.label, to: next.label, reason: `${current.label}: ${fail.detail}` })
       current = next
       label = current.label
@@ -677,7 +709,9 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
           ...(fb !== undefined ? { fellBack: fb } : {}),
         }
       }
-      if (attemptAllLimit && chainRuns >= chainLength) {
+      // every command ran at least once in this compile and each one's most
+      // recent failure was a limit — a retry would hit the same walls, so stop
+      if (lastRunWasLimit.size === chain.length && [...lastRunWasLimit.values()].every(Boolean)) {
         const fb = fellBack()
         return {
           ok: false,
