@@ -296,6 +296,40 @@ describe("HTTP and envelope behaviour", () => {
     expect(policy.delegationClearing).toMatch(/^disabled/)
   })
 
+  // UF-O: unset, the free-call allowance is 3 x the signing limit, so the signing limit is the
+  // one a sender reaches. A worker built without FREE_PER_SENDER_DAILY_LIMIT proves it — the
+  // suite's own worker binds "120" and would hide the default.
+  it("the free-call limit defaults to 3 x the signing limit, and the env value wins (UF-O)", async () => {
+    const limitsOf = async (extra: Record<string, string>) => {
+      const w = new Miniflare({
+        modules: [{ type: "ESModule", path: "worker.mjs", contents: await bundleWorker() }],
+        compatibilityDate: "2026-08-06",
+        compatibilityFlags: ["nodejs_compat"],
+        d1Databases: ["DB"],
+        bindings: {
+          PROVIDER_URL: provider.url,
+          POLICY_ID,
+          RPC_URL: chain.url,
+          CHAIN_ID: CHAIN_ID.toString(10),
+          CAPABILITY_REGISTRY: CAP,
+          CONTEXT_REGISTRY: CTX,
+          ALLOWED_IMPLEMENTATIONS: IMPL,
+          ...extra,
+        },
+      })
+      try {
+        const res = await w.dispatchFetch("http://worker.test/")
+        const info = (await res.json()) as { limits: Record<string, unknown> }
+        return info.limits
+      } finally {
+        await w.dispose()
+      }
+    }
+    expect((await limitsOf({ PER_SENDER_DAILY_LIMIT: "300" })).freeCallsPerSenderPerDay).toBe(900)
+    expect((await limitsOf({})).freeCallsPerSenderPerDay).toBe(90)
+    expect((await limitsOf({ PER_SENDER_DAILY_LIMIT: "300", FREE_PER_SENDER_DAILY_LIMIT: "120" })).freeCallsPerSenderPerDay).toBe(120)
+  })
+
   it("refuses batch bodies outright — batching is how a policy check gets skipped", async () => {
     const res = await mf.dispatchFetch("http://worker.test/", {
       method: "POST",
