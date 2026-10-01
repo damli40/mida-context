@@ -446,9 +446,11 @@ describe("a failed save does not buy a new model call", () => {
     expect(compileCalls).toHaveLength(1)   // one compile, eight save attempts
     expect(listJobs(home)).toHaveLength(0)
     expect(drainLog()).toContain("gave-up")
-    // CAP-26 review: the terminal line names the kind of error too
+    // CAP-26 review: the terminal line names the kind of error too — and, since UF-O, the
+    // drain code of the last failure, so a gave-up after mixed failures still says what ended it
     const gaveUp = drainLog().trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>).find((o) => o.reason === "gave-up")!
     expect(gaveUp.errorChain).toEqual(["Error"])
+    expect(gaveUp.lastReason).toBe("chain-error")
     expect(drainLog()).not.toContain("rpc unreachable")
   })
 
@@ -1954,5 +1956,142 @@ describe("the detached drainer never inherits agent-CLI secrets", () => {
     })
     expect(Object.keys(env).filter((name) => name.startsWith("ANTHROPIC_"))).toEqual([])
     expect(env.PATH).toBe(process.env.PATH)
+  })
+})
+
+// UF-O item O3: a save refused on the gas sponsor's daily limit is not a chain failure — the
+// job waits for the limit's UTC reset instead of spending its eight retries and being dropped.
+// The injected save rejects with the marker @mida/chain's sendContract sets on a fallback failure.
+describe("a save refused by the sponsor's daily limit waits for the reset (UF-O)", () => {
+  const LIMIT_REASON = "refused: this sender used its 120 free calls for today — try tomorrow"
+  const limitError = () => Object.assign(new Error("insufficient funds for gas * price + value"), { sponsorDailyLimit: LIMIT_REASON })
+  const failing: typeof saveCheckpoint = async () => {
+    throw limitError()
+  }
+
+  it("the job stays queued with reason sponsor-limit, no attempts field, and the log carries the sponsor's reason", async () => {
+    const { home, job, drain, drainLog } = setup()
+    job()
+    const counts = await drain({ save: failing })
+    expect(counts.failed).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+    const state = home.readJson<{ attempts?: number; failedAt?: string; reason?: string }>("queue/state/s1.json")
+    expect(state?.reason).toBe("sponsor-limit")
+    expect(state?.failedAt).toBeDefined()
+    expect(state).not.toHaveProperty("attempts")
+    const line = drainLog()
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((o) => o.outcome === "failed")!
+    expect(line.reason).toBe("sponsor-limit")
+    expect(line.attempts).toBe(0)
+    expect(line.sponsorReason).toBe(LIMIT_REASON)
+  })
+
+  it("twenty passes of the same refusal never move the job to queue/bad and never grow attempts", async () => {
+    const { home, job, drain } = setup()
+    job()
+    for (let i = 0; i < 20; i += 1) {
+      // each pass runs once its wait has passed — 61 minutes on from the last failure
+      await drain({ save: failing, now: () => new Date(T0 + 120_000 + i * 3_660_000) })
+    }
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+    expect(home.readJson("queue/state/s1.json")).not.toHaveProperty("attempts")
+  })
+
+  it("the next try is due at the earlier of one hour and just after the UTC-midnight reset — the pass and sessionWaits agree", async () => {
+    const { home, job, drain } = setup()
+    job({}, Date.parse("2026-10-01T09:30:00.000Z")) // the job must be fresh — a day-old one is dropped as stale
+    let calls = 0
+    const counting: typeof saveCheckpoint = async () => {
+      calls += 1
+      throw limitError()
+    }
+    // failedAt 10:00 UTC → the hourly retry (11:00) beats the midnight reset (00:01 next day)
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      failedAt: "2026-10-01T10:00:00.000Z",
+      reason: "sponsor-limit",
+    })
+    const waits = sessionWaits(home, listJobs(home))
+    expect(waits).toHaveLength(1)
+    expect(waits[0]!.dueAtMs).toBe(Date.parse("2026-10-01T11:00:00.000Z"))
+    expect(waits[0]!.reason).toBe("sponsor-limit")
+    // a pass before the due time skips the session without asking save
+    const early = await drain({ save: counting, now: () => new Date("2026-10-01T10:30:00.000Z") })
+    expect(early.skippedTooSoon).toBe(1)
+    expect(calls).toBe(0)
+    // a pass after it retries — and fails into the same wait
+    await drain({ save: counting, now: () => new Date("2026-10-01T11:00:01.000Z") })
+    expect(calls).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+
+    // failedAt 23:30 UTC → midnight + 60 s beats the hour (00:30)
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      failedAt: "2026-10-01T23:30:00.000Z",
+      reason: "sponsor-limit",
+    })
+    expect(sessionWaits(home, listJobs(home))[0]!.dueAtMs).toBe(Date.parse("2026-10-02T00:01:00.000Z"))
+    const beforeMidnight = await drain({ save: counting, now: () => new Date("2026-10-01T23:59:00.000Z") })
+    expect(beforeMidnight.skippedTooSoon).toBe(1)
+    expect(calls).toBe(1)
+    await drain({ save: counting, now: () => new Date("2026-10-02T00:01:30.000Z") })
+    expect(calls).toBe(2)
+  })
+
+  it("an error that carries the marker AND is a revoked capability is still revoked, not sponsor-limit", async () => {
+    const { home, job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw Object.assign(new MidaError("CAPABILITY_REVOKED", "the grant was revoked"), { sponsorDailyLimit: LIMIT_REASON })
+      },
+    })
+    expect(listJobs(home)).toHaveLength(0)
+    expect(drainLog()).toContain('"reason":"revoked"')
+    expect(drainLog()).not.toContain('"reason":"sponsor-limit"')
+  })
+
+  it("a funding reset clears a sponsor-limit wait that carries no attempts", async () => {
+    const { home, job } = setup()
+    job()
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      failedAt: "2026-10-01T10:00:00.000Z",
+      reason: "sponsor-limit",
+    })
+    expect(resetOutOfGasWaits(home)).toBe(1)
+    const cleared = home.readJson<{ attempts?: number; failedAt?: string; reason?: string }>("queue/state/s1.json")
+    expect(cleared?.attempts).toBeUndefined()
+    expect(cleared?.failedAt).toBeUndefined()
+    expect(cleared?.reason).toBeUndefined()
+  })
+
+  it("a state that had attempts keeps them across a sponsor-limit failure", async () => {
+    const { home, job, drain } = setup()
+    job({}, Date.parse("2026-10-01T23:00:00.000Z"))
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      attempts: 3,
+      failedAt: "2026-10-01T10:00:00.000Z",
+      reason: "chain-error",
+    })
+    await drain({ save: failing, now: () => new Date("2026-10-02T00:00:00.000Z") })
+    const state = home.readJson<{ attempts?: number; reason?: string }>("queue/state/s1.json")
+    expect(state?.attempts).toBe(3)
+    expect(state?.reason).toBe("sponsor-limit")
+    expect(listJobs(home)).toHaveLength(1)
   })
 })

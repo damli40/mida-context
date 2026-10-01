@@ -8,7 +8,7 @@ import { isMidaError } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
 import { CONTENT_FIELDS, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint } from "@mida/checkpoint"
-import { chainFor, rpcTransport } from "@mida/chain"
+import { chainFor, rpcTransport, sponsorDailyLimitOf } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { RegistryReader, StoreHttpError } from "@mida/api"
 import { readTranscriptFor, scrubSecrets } from "@mida/compiler"
@@ -402,14 +402,11 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           log({ sessionId, outcome: "removed", reason: removalReason(deps.home, job.agent, "not-approved") })
           continue
         }
-        const attempts = state?.attempts ?? 0
-        if (attempts > 0 && state?.failedAt !== undefined) {
-          const due = Date.parse(state.failedAt) + backoffMs(attempts)
-          if (now().getTime() < due) {
-            counts.skippedTooSoon += 1
-            dueSooner(due)
-            continue // the job stays queued: the retry fires once the backoff has passed
-          }
+        const due = state === undefined ? undefined : dueAfterFailureMs(state)
+        if (due !== undefined && now().getTime() < due) {
+          counts.skippedTooSoon += 1
+          dueSooner(due)
+          continue // the job stays queued: the retry fires once the wait has passed
         }
         // No saved state yet: the gap runs from the session's FIRST queued job (CAP-28). The FIRST save
         // owes only the short first gap — a session killed in its first minute still leaves a
@@ -615,31 +612,45 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           clearUnsent(deps.home, sessionId) // it will never land: not "on its way" any more
           continue
         }
-        // transient: keep the job, count the attempt, and hold the session until the backoff passes
-        const attempts = (readState(deps.home, sessionId)?.attempts ?? 0) + 1
+        // transient: keep the job, count the attempt, and hold the session until the backoff passes.
+        // A sponsor-limit refusal is different (UF-O): it is a daily allowance that resets at 00:00
+        // UTC, not an error — the attempt count must not grow (it would only march the job to
+        // queue/bad for a limit the sponsor's owner may raise during the day), so the state keeps
+        // whatever attempts it already had and is left out when there were none.
+        const priorState = readState(deps.home, sessionId)
+        const attempts = code === "sponsor-limit" ? (priorState?.attempts ?? 0) : (priorState?.attempts ?? 0) + 1
         counts.failed += 1
         const invalidGaveUp = code === "invalid-checkpoint" && attempts >= INVALID_CHECKPOINT_MAX_ATTEMPTS
-        if (attempts >= MAX_ATTEMPTS || invalidGaveUp) {
+        if (code !== "sponsor-limit" && (attempts >= MAX_ATTEMPTS || invalidGaveUp)) {
           moveToBad(deps.home, `${job.id}.json`)
           writeState(deps.home, sessionId, terminalStateFor(job, now().toISOString(), deps.openDevinDb))
-          log({ sessionId, outcome: "bad", reason: invalidGaveUp ? "invalid-checkpoint" : "gave-up", ...fields, ...sample })
+          log({ sessionId, outcome: "bad", reason: invalidGaveUp ? "invalid-checkpoint" : "gave-up", lastReason: code, ...fields, ...sample })
           clearUnsent(deps.home, sessionId)
           continue
         }
-        writeState(deps.home, sessionId, {
+        const waiting: SessionState = {
           // an empty lastLineHash can never match a real transcript, so the state never reads as
           // "unchanged" — the retry is governed by attempts/failedAt alone
           transcriptBytes: statSize(job.transcriptPath),
           lastLineHash: "",
-          savedAt: readState(deps.home, sessionId)?.savedAt ?? job.at,
-          attempts,
+          savedAt: priorState?.savedAt ?? job.at,
+          ...(code === "sponsor-limit" && priorState?.attempts === undefined ? {} : { attempts }),
           failedAt: now().toISOString(),
           // the reason rides the wait record: doctor names it and a funding reset clears it
           reason: code,
-        })
-        dueSooner(now().getTime() + backoffMs(attempts))
+        }
+        writeState(deps.home, sessionId, waiting)
+        const waitUntil = dueAfterFailureMs(waiting)
+        if (waitUntil !== undefined) dueSooner(waitUntil)
         // transient: no sample — it is quoted once, on the terminal "bad" line above
-        log({ sessionId, outcome: "failed", reason: code, attempts, ...fields })
+        log({
+          sessionId,
+          outcome: "failed",
+          reason: code,
+          attempts,
+          ...(code === "sponsor-limit" ? { sponsorReason: sponsorDailyLimitOf(error)!.slice(0, 200) } : {}),
+          ...fields,
+        })
       } finally {
         // CAP-26: a session whose job left the queue this pass — saved, skipped as unchanged,
         // dropped, moved aside — has no save on its way, so it can never be shown as UNSENT. One
@@ -745,6 +756,9 @@ function failureCode(error: unknown): string {
   // a refused send is transient: the ceiling may pass on retry after the queue settles or the
   // estimate changes — the job stays and the usual backoff applies (R3-1)
   if (isMidaError(error, "GAS_CEILING_EXCEEDED")) return "gas-ceiling"
+  // the sponsor's daily limit refused and the wallet could not pay either (the marker sendContract
+  // sets): not a chain fault — the save waits for the limit's UTC reset instead of retrying to death
+  if (sponsorDailyLimitOf(error) !== undefined) return "sponsor-limit"
   // the chain's own insufficient-funds refusal names itself (in-29 S-2): a wallet that ran dry
   // is fixed by funding or the sponsor, not by retrying the same error — so it is not chain-error
   if (isOutOfGasError(error)) return "out-of-gas"
@@ -946,6 +960,26 @@ function readContinues(home: MidaHome, sessionId: string, projectId: string): st
   }
 }
 
+/**
+ * A sponsor's daily limit resets at 00:00 UTC. The hourly retry costs the sponsor nothing (it
+ * refuses before it calls its provider) and picks up a limit the sponsor's owner raised during
+ * the day.
+ *
+ * When the next try on a failed session becomes due — the ONE rule the pass and `sessionWaits`
+ * share so they can never disagree: a sponsor-limit failure waits the EARLIER of `failedAt + 60
+ * minutes` and the first 00:00:00 UTC after `failedAt` + 60 seconds; any other recorded failure
+ * with attempts waits `failedAt + backoffMs(attempts)`; anything else owes no failure wait.
+ */
+function dueAfterFailureMs(state: SessionState): number | undefined {
+  if (state.failedAt === undefined) return undefined
+  const failedAt = Date.parse(state.failedAt)
+  if (state.reason === "sponsor-limit") {
+    const nextMidnight = (Math.floor(failedAt / DAY_MS) + 1) * DAY_MS
+    return Math.min(failedAt + 60 * 60 * 1000, nextMidnight + 60_000)
+  }
+  return (state.attempts ?? 0) > 0 ? failedAt + backoffMs(state.attempts!) : undefined
+}
+
 function readState(home: MidaHome, sessionId: string): SessionState | undefined {
   try {
     const raw = home.readJson<SessionState>(`queue/state/${sessionId}.json`)
@@ -991,10 +1025,10 @@ export function sessionWaits(home: MidaHome, jobs: CaptureJob[]): SessionWait[] 
   for (const [sessionId, group] of bySession) {
     const job = group[group.length - 1]!
     const state = readState(home, sessionId)
-    const attempts = state?.attempts ?? 0
     const reason = state?.reason
-    if (attempts > 0 && state?.failedAt !== undefined) {
-      waits.push({ sessionId, agent: job.agent, dueAtMs: Date.parse(state.failedAt) + backoffMs(attempts), reason })
+    const dueAtMs = state === undefined ? undefined : dueAfterFailureMs(state)
+    if (dueAtMs !== undefined) {
+      waits.push({ sessionId, agent: job.agent, dueAtMs, reason })
       continue
     }
     if (group.some((j) => FLUSH_EVENTS.has(j.event))) {
@@ -1012,7 +1046,7 @@ export function sessionWaits(home: MidaHome, jobs: CaptureJob[]): SessionWait[] 
  * failures. Funding one wallet does not prove the others are funded, but the waits it clears only
  * cost one early retry each if it was not — the waiting direction is the broken one.
  */
-const GAS_WAIT_REASONS = new Set(["out-of-gas", "wallet-low"])
+const GAS_WAIT_REASONS = new Set(["out-of-gas", "wallet-low", "sponsor-limit"])
 
 /**
  * Clears the recorded failure backoff on every session whose wait was about gas — run after
@@ -1035,7 +1069,10 @@ export function resetOutOfGasWaits(home: MidaHome): number {
     const sessionId = name.slice(0, -".json".length)
     if (!isSafeName(sessionId)) continue
     const state = readState(home, sessionId)
-    if (state === undefined || state.attempts === undefined || state.failedAt === undefined) continue
+    // a sponsor-limit wait carries no attempts field — it never counted one — so the attempts
+    // check must not skip it (UF-O)
+    if (state === undefined || state.failedAt === undefined) continue
+    if (state.attempts === undefined && state.reason !== "sponsor-limit") continue
     if (state.reason !== undefined && !GAS_WAIT_REASONS.has(state.reason)) continue
     const { attempts: _a, failedAt: _f, reason: _r, ...rest } = state
     writeState(home, sessionId, rest)
