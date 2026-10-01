@@ -3,7 +3,7 @@ import { isAbsolute } from "node:path"
 import { isMidaError } from "@mida/protocol"
 import { isReadDeadlineError } from "@mida/chain"
 import { compareChainOrder, defuse, handoffHeader, mergeCheckpoints, otherTasksBlock, otherTasksFor, renderHandoffReport, taskOf } from "@mida/checkpoint"
-import type { MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
+import type { MergedHandoff, MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
 import { chainRefusalReason } from "./chain-busy.js"
 import { CHAIN_REFUSAL_TEXT, HANDOFF_BEGIN, HANDOFF_TAIL } from "./hook-output.js"
 import { CODING_CLIENTS } from "./install.js"
@@ -392,14 +392,14 @@ type ReadCheckpoint = Awaited<ReturnType<typeof readCheckpoints>>["checkpoints"]
  * "from", never "saved": the store holds it and the signature checked out, but Monad has not
  * anchored it and still may reject it.
  */
-function pendingBlock(cp: ReadCheckpoint, authorNames: Record<string, string>): string {
+function pendingBlock(cp: ReadCheckpoint, authorNames: Record<string, string>, merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null): string {
   const c = cp.checkpoint
   const who = authorNames[cp.authorId.toLowerCase()] ?? "unknown agent"
   const lines = [
     PENDING_ANCHOR_LINE,
     `from ${defuse(who)} at ${defuse(c.createdAt)} (session ${defuse(cp.sessionId)}, record ${defuse(cp.contextId)})`,
   ]
-  const { rules, history } = checkpointFieldLines(c)
+  const { rules, history } = checkpointFieldLines(c, merged)
   lines.push(...rules, ...history)
   return lines.join("\n")
 }
@@ -408,20 +408,48 @@ function pendingBlock(cp: ReadCheckpoint, authorNames: Record<string, string>): 
  * A checkpoint's non-empty fields, one line each — shared by the marked blocks. `rules` are the
  * lines a cut must never drop (constraints first: they outrank what was decided): constraint,
  * objective, plan, next action, unresolved issue, decision and rejected-approach lines. `history`
- * is what a budget may leave out: artifact, progress and evidence lines (UF-J).
+ * is what a budget may leave out: artifact, progress and evidence lines (UF-J). When a merged
+ * record renders above the block, a rule that is also in that record is left out of the block —
+ * one line where the rule lines end counts what was not repeated (UF-K). With no merged record
+ * (the pending-only handoff) nothing is omitted and no such line is printed.
  */
-function checkpointFieldLines(c: ReadCheckpoint["checkpoint"]): { rules: string[]; history: string[] } {
+function checkpointFieldLines(
+  c: ReadCheckpoint["checkpoint"],
+  merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null = null,
+): { rules: string[]; history: string[] } {
   // each value defused, then flattened to one line: a newline in saved text could otherwise start a
   // line identical to one of this block's own labels ("next action:", "plan step:") (Fable review)
   const one = (text: string) => defuse(text).replace(/\s*\n\s*/g, " / ")
+  // a rule matches the record only as a whole entry: a constraint on its text, a decision on
+  // decision AND reason, a rejected approach on approach AND why — the same decision text with
+  // a different reason is a different rule and stays (UF-K)
+  const mergedConstraints = new Set(merged?.constraints ?? [])
+  const mergedDecisions = new Set((merged?.decisions ?? []).map((d) => `${d.decision}${d.rationale}`))
+  const mergedRejected = new Set((merged?.rejected ?? []).map((r) => `${r.approach}${r.why}`))
+  const repeated = { constraints: 0, decisions: 0, rejected: 0 }
   const rules: string[] = []
-  for (const k of c.constraints) rules.push(`constraint: ${one(k)}`)
+  for (const k of c.constraints) {
+    if (mergedConstraints.has(k)) repeated.constraints += 1
+    else rules.push(`constraint: ${one(k)}`)
+  }
   if (c.objective !== "") rules.push(`objective: ${one(c.objective)}`)
   for (const step of c.remainingPlan) rules.push(`plan step: ${one(step)}`)
   if (c.nextAction !== "") rules.push(`next action: ${one(c.nextAction)}`)
   if (c.unresolvedIssue !== null && c.unresolvedIssue !== "") rules.push(`unresolved issue: ${one(c.unresolvedIssue)}`)
-  for (const d of c.decisions) rules.push(`decision: ${one(d.decision)} — because: ${one(d.rationale)}`)
-  for (const r of c.rejected) rules.push(`rejected approach: ${one(r.approach)} — ${one(r.why)}`)
+  for (const d of c.decisions) {
+    if (mergedDecisions.has(`${d.decision}${d.rationale}`)) repeated.decisions += 1
+    else rules.push(`decision: ${one(d.decision)} — because: ${one(d.rationale)}`)
+  }
+  for (const r of c.rejected) {
+    if (mergedRejected.has(`${r.approach}${r.why}`)) repeated.rejected += 1
+    else rules.push(`rejected approach: ${one(r.approach)} — ${one(r.why)}`)
+  }
+  const notRepeated = [
+    repeated.constraints === 0 ? null : `${repeated.constraints} constraint${repeated.constraints === 1 ? "" : "s"}`,
+    repeated.decisions === 0 ? null : `${repeated.decisions} decision${repeated.decisions === 1 ? "" : "s"}`,
+    repeated.rejected === 0 ? null : `${repeated.rejected} rejected approach${repeated.rejected === 1 ? "" : "es"}`,
+  ].filter((part): part is string => part !== null)
+  if (notRepeated.length > 0) rules.push(`the same as in the record above, not repeated: ${notRepeated.join(", ")}`)
   const history: string[] = []
   for (const a of c.artifacts) history.push(`artifact: ${one(a)}`)
   for (const p of c.progress) history.push(`progress: ${one(p)}`)
@@ -448,13 +476,13 @@ const UNSENT_MIN_CHARS = 450
  * budget; the budget only decides how many history lines (artifacts, progress, evidence) fit, and
  * the left-out count speaks of those alone.
  */
-function unsentBlock(envelope: CheckpointEnvelope, agent: string, budget: number, newerBy: string | null): string {
+function unsentBlock(envelope: CheckpointEnvelope, agent: string, budget: number, newerBy: string | null, merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null): string {
   const c = envelope.checkpoint
   const lines = [UNSENT_LINE, `from ${defuse(agent)} at ${defuse(c.createdAt)} (session ${defuse(envelope.sessionId)}, not verified by the chain)`]
   // after failed sends the mark keeps pointing at an older compile while the session moves on —
   // the block must not pass for the session's newest state (CAP-26 review)
   if (newerBy !== null) lines.push(`note: this session changed again after this compile (its newest change is ${newerBy} old); that newer work is not in it`)
-  const { rules, history } = checkpointFieldLines(c)
+  const { rules, history } = checkpointFieldLines(c, merged)
   lines.push(...rules)
   const more = (n: number) => `… ${n} more line${n === 1 ? "" : "s"} of this unsent save left out`
   let used = lines.join("\n").length
@@ -480,6 +508,7 @@ function unsentBlocks(
   queued: QueuedSaves | null,
   nowMs: number,
   budget: number,
+  merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null,
 ): { text: string; shown: number; lastAgent?: string; lastCreatedAt?: string } {
   const blocks: string[] = []
   let left = budget
@@ -493,7 +522,7 @@ function unsentBlocks(
     // falls back to the compile's own time, which can only miss a change, never invent one
     const covered = u.coveredAt ?? Date.parse(u.envelope.checkpoint.createdAt)
     const newerBy = newest !== undefined && !Number.isNaN(covered) && newest > covered ? ageText(nowMs - newest) : null
-    const block = unsentBlock(u.envelope, u.agent, room, newerBy)
+    const block = unsentBlock(u.envelope, u.agent, room, newerBy, merged)
     blocks.push(block)
     left = room - block.length
     lastAgent = u.agent
@@ -657,7 +686,7 @@ export async function buildHandoff(
     // fence instead.
     const pending = outcome.checkpoints.filter((cp) => cp.anchor === "PENDING_ANCHOR" && inTask(cp))
     const merged = mergeCheckpoints(outcome.checkpoints.filter((cp) => cp.anchor !== "PENDING_ANCHOR" && inTask(cp)))
-    const pendingText = pending.map((cp) => pendingBlock(cp, input.authorNames)).join("\n\n")
+    const pendingText = pending.map((cp) => pendingBlock(cp, input.authorNames, merged)).join("\n\n")
     // the marked blocks — pending (stored, not anchored) and UNSENT (compiled here, not sent) — sit
     // inside the fence beside the merge, never in it: neither is anchored state
     // CAP-26: another session's save compiled here but not yet on Monad, shown marked UNSENT.
@@ -682,7 +711,7 @@ export async function buildHandoff(
         }
       },
     }).filter((u) => !landed.has(u.envelope.checkpoint.eventId))
-    const unsent = unsentBlocks(unsentFound, queued, now(), Math.max(0, UNSENT_TOTAL_CHARS - pendingText.length))
+    const unsent = unsentBlocks(unsentFound, queued, now(), Math.max(0, UNSENT_TOTAL_CHARS - pendingText.length), merged)
     const pendingSavesNote = queuedSavesNote(mergeQueued(queuedBefore, queued), now(), unsent.shown) ?? undefined
     const markedText = [pendingText, unsent.text].filter((t) => t !== "").join("\n\n")
     // the checkpoints this session may treat as covered — its own never count: a session's own

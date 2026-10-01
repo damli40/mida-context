@@ -1385,6 +1385,75 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     expect(result.oversized).toBe(true)
   })
 
+  // UF-K: in the common fast-switch case the unsent save belongs to a session whose earlier save
+  // is already in the merged record, so repeating every rule doubled the text and pushed the
+  // merged record's reasons out. A rule the record above already shows is named once, in a
+  // count line where the block's rule lines end.
+  it("an UNSENT block does not repeat the rules the merged record above already shows (UF-K)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-c" })
+    const shared = {
+      constraints: ["never push to main", "run typecheck first", "plain ASCII commits"],
+      decisions: Array.from({ length: 14 }, (_, i) => ({ decision: `decision ${i}`, rationale: `rationale ${i}` })),
+      rejected: Array.from({ length: 6 }, (_, i) => ({ approach: `approach ${i}`, why: `why ${i}` })),
+    }
+    // the session's unsent compile carries everything its landed save had, plus one new decision
+    unsentSave(dir, "sess-c", { ...shared, decisions: [...shared.decisions, { decision: "use pnpm", rationale: "shared lockfile" }] })
+    const landed = stored({ ...shared, progress: Array.from({ length: 30 }, (_, i) => `anchored step ${i} ${"a".repeat(180)}`) }, { sessionId: "sess-c" })
+    const { d } = deps({ read: async () => ({ checkpoints: [landed], skipped: 0, milliseconds: 1, partial: false }), now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    const fieldLines = unsentFieldLines(result.text)
+    // the one genuinely new rule is shown; every repeated rule is not
+    expect(fieldLines).toContain("decision: use pnpm — because: shared lockfile")
+    expect(fieldLines).toContain("the same as in the record above, not repeated: 3 constraints, 14 decisions, 6 rejected approaches")
+    expect(fieldLines.filter((l) => l.startsWith("constraint: "))).toHaveLength(0)
+    expect(fieldLines.filter((l) => l.startsWith("decision: "))).toHaveLength(1)
+    expect(fieldLines.filter((l) => l.startsWith("rejected approach: "))).toHaveLength(0)
+    // the merged record above still shows each rule — once in the whole text, not twice
+    // (the record renders "- never push to main"; the block's "constraint: …" line is gone)
+    expect(result.text.split("never push to main")).toHaveLength(2)
+    expect(result.text.split("decision 0")).toHaveLength(2)
+    expect(result.text.length).toBeLessThan(10_000)
+  })
+
+  it("a pending-only handoff has no record above — every rule line shows and no 'not repeated' line appears (UF-K)", async () => {
+    const dir = queueHome()
+    const pending = {
+      ...stored({
+        constraints: ["never push to main"],
+        decisions: [{ decision: "use pnpm", rationale: "shared lockfile" }],
+        rejected: [{ approach: "webpack", why: "slower for this" }],
+      }),
+      anchor: "PENDING_ANCHOR" as const,
+    }
+    const { d } = deps({ read: async () => ({ checkpoints: [pending], skipped: 0, milliseconds: 1, partial: false }), now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("constraint: never push to main")
+    expect(result.text).toContain("decision: use pnpm — because: shared lockfile")
+    expect(result.text).toContain("rejected approach: webpack — slower for this")
+    expect(result.text).not.toContain("not repeated")
+  })
+
+  it("a decision with the same text but a different reason is shown, not omitted (UF-K)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-c" })
+    unsentSave(dir, "sess-c", {
+      decisions: [{ decision: "use pnpm", rationale: "the workspace layout needs it" }],
+    })
+    const landed = stored({ decisions: [{ decision: "use pnpm", rationale: "shared lockfile" }] }, { sessionId: "sess-c" })
+    const { d } = deps({ read: async () => ({ checkpoints: [landed], skipped: 0, milliseconds: 1, partial: false }), now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    const fieldLines = unsentFieldLines(result.text)
+    expect(fieldLines).toContain("decision: use pnpm — because: the workspace layout needs it")
+    expect(fieldLines.some((l) => l.startsWith("the same as in the record above"))).toBe(false)
+  })
+
   it("reading the queue never changes it — every byte is as it was", async () => {
     const dir = queueHome()
     job(dir, {}, "2026-09-25T10:00:00.000Z")
