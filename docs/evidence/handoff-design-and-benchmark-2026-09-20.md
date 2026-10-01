@@ -323,7 +323,7 @@ benchmark picture.
 Web page or status page; passkey prompt (P1); Cursor; baseline
 import; benchmark dashboard; review screen for proposed facts; hosted server; per-role scoping
 inside a project; chain-enforced per-project scoping (needs a new namespace-tree version);
-the compiler as its own registered agent; Envio indexing. Under the freeze rule each of these
+the compiler as its own registered agent; an event index. Under the freeze rule each of these
 is a new feature and goes to the post-hackathon list.
 
 ---

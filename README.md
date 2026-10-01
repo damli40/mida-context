@@ -331,8 +331,7 @@ pay nothing; one direct save cost about 0.03 testnet MON on Sep 21. Mainnet cost
 | Mid-session reads from Claude Code and Codex through Mida's MCP tools | ✅ In tests (Claude Desktop live, Sep 27) |
 | `mida sponsor on\|off` for a setup made before the sponsor existed | ✅ In tests |
 | SDK, named tasks, folder linking, `mida export` | ✅ In tests on a local chain; not yet run live |
-| Owner view in the browser (`app.midacontext.xyz/me`) | ✅ Live, Sep 29; its agent list waits for the index |
-| Public Envio index of agents and saves | 🚧 Deployed on Envio Cloud, not syncing yet |
+| Owner view in the browser (`app.midacontext.xyz/me`): your records, each checked on Monad | ✅ Live, Sep 29; it does not list agents yet |
 | npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
 | Security audit | ❌ None |
 
@@ -375,7 +374,7 @@ The full list, and what you can use Mida for today: [`docs/use-cases.md`](docs/u
 | `packages/checkpoint` | The checkpoint schema, merging and rendering |
 | `packages/crypto`, `packages/protocol`, `packages/chain` | Encryption, signatures, chain access |
 | `contracts` | The Solidity contracts and deployments |
-| `apps/store-worker`, `apps/sponsor-worker`, `apps/owner-page`, `apps/indexer` | The hosted store, gas sponsor, passkey page and Envio index |
+| `apps/store-worker`, `apps/sponsor-worker`, `apps/owner-page` | The hosted store, gas sponsor and passkey page |
 | `docs/quickstart.md`, `docs/sdk.md` | The walkthrough and the SDK reference |
 
 Development: `pnpm install`, then `pnpm test` and `pnpm typecheck`. Node 22 or later.

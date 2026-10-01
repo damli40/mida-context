@@ -7,7 +7,7 @@ import {ContextRegistry} from "../src/ContextRegistry.sol";
 import {ICapabilityRegistry} from "../src/ICapabilityRegistry.sol";
 
 /// @notice Deploys CapabilityRegistry then ContextRegistry and writes deployments/<chainId>.json for the
-///         SDK, API and indexer. VAULT_RP_ID defaults to vault.mida.xyz.
+///         SDK and API. VAULT_RP_ID defaults to vault.mida.xyz.
 ///         forge script script/Deploy.s.sol --rpc-url <url> --broadcast --private-key <key>
 contract Deploy is Script {
     function run() external returns (CapabilityRegistry capabilityRegistry, ContextRegistry contextRegistry) {

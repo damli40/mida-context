@@ -11,7 +11,7 @@ animation (a dashboard must be readable without motion), plain backgrounds, no i
 Approved decisions: sections = agents + grants (Read / Write / Update own as aligned pill chips,
 granted = filled, not granted = dashed), recent records + who wrote them ("You said" vs
 "<agent> inferred"), how saves reach Monad (direct / batched / pending anchor), Revoke per agent
-with a passkey confirm panel carrying the disclosure sentence. Data: Envio index first, direct chain
-reads as fallback.
+with a passkey confirm panel carrying the disclosure sentence. Data: the store's record lists, each
+checked on Monad. The live page does not list agents yet; the agents section here is the intended design.
 
 The build spec is not in the public repo.
