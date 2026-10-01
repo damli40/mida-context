@@ -7,8 +7,7 @@
  * an agent manifest, or a record body; loadMe in sources.ts already re-verified every row, and
  * what could not be verified is rendered as such, never silently dropped.
  *
- * The boot path below the builder is thin: fetch the index URL from the Worker's config
- * endpoint, sign in once with the passkey (Task 4's session — seed released at once, namespace
+ * The boot path below the builder is thin: sign in once with the passkey (Task 4's session — seed released at once, namespace
  * secrets kept), gather with loadMe, render. On pagehide, sign-out, or the tab hidden past five
  * minutes the session's keys are overwritten and every decrypted cell is cleared — the page
  * never holds plaintext longer than the owner is looking at it.
@@ -28,7 +27,7 @@ import { describeError } from "../owner/session.js"
 import { shortAddress } from "../owner/secrets.js"
 import { chipsFor, INDEX_FRESHNESS_UNKNOWN_TEXT, isTxHash, provenanceBadge } from "./model.js"
 import type { Badge } from "./model.js"
-import { BLOCKED_AT_STORE_TEXT, INDEX_URL_NOT_ALLOWED_TEXT, loadMe } from "./sources.js"
+import { BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
 import type { AgentRow, MeData, MePorts, RecordRow } from "./sources.js"
 import { signIn } from "./session.js"
 import type { MeSession } from "./session.js"
@@ -111,7 +110,7 @@ function renderHead(doc: Document, data: MeData): HTMLElement {
   const left = elOf(doc, "div")
   head.appendChild(left)
   left.appendChild(elOf(doc, "p", "eyebrow", "Your Mida"))
-  left.appendChild(elOf(doc, "h1", "me-title", "Who can read your context, and who wrote it."))
+  left.appendChild(elOf(doc, "h1", "me-title", "Your records, and who wrote them."))
   const ownerLine = elOf(doc, "p", "owner-line")
   ownerLine.appendChild(elOf(doc, "span", undefined, "Owner "))
   ownerLine.appendChild(elOf(doc, "code", undefined, shortAddress(data.owner)))
@@ -120,13 +119,9 @@ function renderHead(doc: Document, data: MeData): HTMLElement {
   )
   left.appendChild(ownerLine)
   const source = elOf(doc, "p", "source")
-  const stale = data.lag.stale || data.source !== "index"
-  source.appendChild(elOf(doc, "span", stale ? "dot dot-stale" : "dot"))
-  // The lag text already carries the reason the index is not speaking — "index not configured"
-  // when no URL was set, "index unavailable" when it failed to answer — so the badge only names
-  // what the page actually read, and never claims "unreachable" for an index that does not exist.
-  const text = data.source === "index" ? `Read from the Envio index · ${data.lag.text}` : data.lag.text
-  source.appendChild(elOf(doc, "span", undefined, text))
+  source.appendChild(elOf(doc, "span", data.lag.stale ? "dot dot-stale" : "dot"))
+  // The badge names what the page actually read: the store's record lists, checked on Monad.
+  source.appendChild(elOf(doc, "span", undefined, data.lag.text))
   head.appendChild(source)
   return head
 }
@@ -146,7 +141,6 @@ function renderSummary(doc: Document, data: MeData): HTMLElement {
     // flag carries its own sentence so the blame is exact ("the index is down" vs "not
     // configured").
     lead.appendChild(elOf(doc, "p", "n", data.agentsUnavailable))
-    lead.appendChild(elOf(doc, "p", "l", "The agent list could not be loaded at all."))
   } else {
     // Agents whose chain check could not run are not "0 can read" — count them as unchecked so
     // the headline never rounds an unknown down to a negative. A stale index gets the "At least"
@@ -355,7 +349,7 @@ function renderRecordRow(doc: Document, row: RecordRow, open: OpenRow | undefine
     const lane = row.lane === "direct" ? "direct" : "batch"
     const link = txLink(doc, row.tx, `${lane} · ${row.tx === null ? "" : shortHash(row.tx)}`)
     if (link !== null) anchor.appendChild(link)
-    else anchor.appendChild(elOf(doc, "span", "tx-none", `${lane} · anchored — transaction not indexed`))
+    else anchor.appendChild(elOf(doc, "span", "tx-none", `${lane} · anchored on Monad`))
   }
   return tr
 }
@@ -373,7 +367,7 @@ function renderRecords(doc: Document, data: MeData, open: OpenRow | undefined): 
       doc,
       "p",
       "sec-note",
-      "Records the store holds — each re-checked against Monad. Content decrypts on this device after your passkey; the index only knows who and when.",
+      "Records the store holds, each re-checked against Monad. Content decrypts on this device after your passkey.",
     ),
   )
   if (data.records.length === 0) {
@@ -458,7 +452,7 @@ function renderAnchor(doc: Document, data: MeData): HTMLElement {
       "p",
       "honest",
       whole
-        ? "Counted from the records the store holds, each re-checked against Monad — never the index's word."
+        ? "Counted from the records the store holds, each re-checked against Monad."
         : "Figures hidden — the record list is incomplete. The banner above says which list.",
     ),
   )
@@ -474,7 +468,6 @@ function renderFoot(doc: Document): HTMLElement {
   contracts.appendChild(elOf(doc, "span", undefined, " · "))
   contracts.appendChild(elOf(doc, "span", "mono", shortHash(DEPLOYMENT.contextRegistry)))
   foot.appendChild(contracts)
-  foot.appendChild(elOf(doc, "span", undefined, "Index: Envio"))
   return foot
 }
 
@@ -494,31 +487,15 @@ export function renderMe(data: MeData, doc: Document, open?: OpenRow): HTMLEleme
   return root
 }
 
-// --- live ports: chain views, the store client, the index's GraphQL -----------------------------
+// --- live ports: chain views and the store client -------------------------------------------------
 
-/** One POST to the Envio GraphQL endpoint — the port sources.ts races against its own timeout. */
-async function indexQuery<T>(url: string, gql: string, vars: Record<string, unknown>): Promise<T> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ query: gql, variables: vars }),
-    signal: AbortSignal.timeout(6_000),
-  })
-  if (!response.ok) throw new Error(`the index answered HTTP ${response.status}`)
-  const body = (await response.json()) as { data?: T; errors?: unknown }
-  if (body.data === undefined || body.errors !== undefined) throw new Error("the index returned errors")
-  return body.data
-}
-
-function livePorts(env: FlowEnvironment, session: MeSession, indexUrl: string | null): MePorts {
+function livePorts(env: FlowEnvironment, session: MeSession): MePorts {
   const context: ChainContext = { publicClient: env.publicClient, deployment: env.deployment }
   const reader = new RegistryReader(context)
   const deployment = env.deployment
   return {
-    index:
-      indexUrl === null
-        ? null
-        : { query: <T,>(gql: string, vars: Record<string, unknown>) => indexQuery<T>(indexUrl, gql, vars) },
+    // No index is deployed: the agent list is not offered, and records come from the store.
+    index: null,
     // The store client signs as the derived owner — owner reads need no capability.
     store: new ContextApiClient({
       baseUrl: STORE_URL,
@@ -571,23 +548,6 @@ function livePorts(env: FlowEnvironment, session: MeSession, indexUrl: string | 
 }
 
 // --- boot ---------------------------------------------------------------------------------------
-
-/**
- * The index URL is Worker configuration (env var → /me/config.json), never baked into the
- * bundle. `notAllowed` means the Worker refused the configured URL — the page's own CSP would
- * block it, which is a misconfiguration to name, not an index that is down.
- */
-async function readIndexConfig(): Promise<{ indexUrl: string | null; notAllowed: boolean }> {
-  try {
-    const response = await fetch("/me/config.json")
-    if (!response.ok) return { indexUrl: null, notAllowed: false }
-    const body = (await response.json()) as { indexUrl?: unknown; reason?: unknown }
-    const indexUrl = typeof body.indexUrl === "string" && body.indexUrl.length > 0 ? body.indexUrl : null
-    return { indexUrl, notAllowed: body.reason === "index-url-not-allowed" }
-  } catch {
-    return { indexUrl: null, notAllowed: false }
-  }
-}
 
 /**
  * The store port wrapped so teardown can cut it dead: the client inside signs every read as the
@@ -676,13 +636,12 @@ function boot(): void {
     void (async () => {
       button.disabled = true
       const env = makeEnv()
-      const indexConfig = await readIndexConfig()
       progressLine("Asking for your passkey…")
       // Secrets for every area in the frozen tree are derived in the one ceremony — the seed is
       // released before signIn returns, whatever the record list turns out to hold.
       const session = await signIn(env, NAMESPACE_TREE_V1.map((node) => node.id))
-      progressLine("Signed in — reading agents, grants and records…")
-      const ports = livePorts(env, session, indexConfig.indexUrl)
+      progressLine("Signed in. Reading your records…")
+      const ports = livePorts(env, session)
       // The store client signs every read as the owner — teardown drops it so a signed-out page
       // cannot issue owner-signed calls on a leftover key.
       const storeHandle = revocableStore(ports.store)
@@ -690,11 +649,6 @@ function boot(): void {
       // Every render is a fresh read — the page re-reads, it does not assume.
       const refresh = async (): Promise<void> => {
         const data = await loadMe(session.owner, ports)
-        if (indexConfig.notAllowed) {
-          // The deployment named an index the page's CSP refuses — say that, never "unreachable".
-          data.lag = { text: INDEX_URL_NOT_ALLOWED_TEXT, stale: true }
-          data.agentsUnavailable = INDEX_URL_NOT_ALLOWED_TEXT
-        }
         const root = renderMe(data, document, (row) => session.open(row))
         el("me-root").replaceChildren(root)
       }

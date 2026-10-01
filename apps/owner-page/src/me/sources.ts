@@ -119,7 +119,7 @@ export const PARTIAL_LIST_TEXT = "list incomplete — the store ran out of chain
  * answer and no longer runs. Pinned verbatim by in-25 P-4.
  */
 export const AGENT_LIST_NEEDS_INDEX =
-  "Your agent list comes from the index, and the index is not reachable right now. The records below are still checked against Monad."
+  "This page does not list your agents yet. Run mida doctor in your terminal to see the agents approved on that machine. The records below are still checked against Monad."
 /**
  * The mid-sync case: the index answered but reports `isReady: false` — its Grant rows are a
  * partial scan, not a list. The sentence says so without claiming a chain scan happened —
@@ -135,6 +135,11 @@ export const AGENT_LIST_SYNCING =
  */
 export const INDEX_URL_NOT_ALLOWED_TEXT =
   "The index address in this deployment is not allowed by the page's security settings."
+/**
+ * The header badge when no index is deployed. It names the page's method, never an outcome: a
+ * failed store or chain read shows in the dot (stale) and in the banners, not in this sentence.
+ */
+export const NO_INDEX_BADGE_TEXT = "Records come from the store and are checked on Monad"
 /** The banner when an index answer fills the query's page — more rows may exist unsent. */
 export const INDEX_LIMIT_TEXT = "list may be incomplete — the index has more rows than the page asked for"
 /** The exact agent-state wording for a store deny — pinned by the plan, rendered by the page. */
@@ -1151,7 +1156,7 @@ export async function loadMe(owner: Address, ports: MePorts, limit = 500): Promi
   // own block number.
   const lag =
     ports.index === null
-      ? { text: "index not configured", stale: true }
+      ? { text: NO_INDEX_BADGE_TEXT, stale: incomplete.length > 0 || recordsUnavailable }
       : indexSyncing
         ? { text: "index still catching up", stale: true }
         : source !== "index"

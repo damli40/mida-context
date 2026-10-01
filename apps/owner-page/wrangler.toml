@@ -1,7 +1,7 @@
 name = "mida-owner-page"
 main = "src/worker.ts"
 compatibility_date = "2026-09-21"
-# Dashboard-set INDEX_GRAPHQL_URL must survive every deploy, or /me and the keep-alive go dark.
+# Variables set in the Cloudflare dashboard survive a deploy.
 keep_vars = true
 
 # The Worker only serves the static bundle produced by `node scripts/build.mjs` — no databases,
@@ -23,8 +23,6 @@ html_handling = "none"
 #   { pattern = "app.midacontext.xyz/*", zone_name = "midacontext.xyz" }
 # ]
 
-# Envio Cloud's free plan deletes a dev deployment after 7 days with no queries — one tiny GraphQL
-# POST a day keeps the /me index alive through judging. The handler is `scheduled()` in
-# src/worker.ts; it does nothing unless INDEX_GRAPHQL_URL is set.
+# No scheduled work. The empty list removes the daily trigger an earlier deploy registered.
 [triggers]
-crons = ["17 6 * * *"]
+crons = []

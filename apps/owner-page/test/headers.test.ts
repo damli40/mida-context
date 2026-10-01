@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { CONTENT_SECURITY_POLICY, indexUrlAllowed, securityHeaders } from "../src/headers.js"
+import { CONTENT_SECURITY_POLICY, securityHeaders } from "../src/headers.js"
 import { assetPathFor } from "../src/worker.js"
 
 describe("securityHeaders", () => {
@@ -10,7 +10,7 @@ describe("securityHeaders", () => {
     const headers = securityHeaders(true)
     expect(headers["Content-Security-Policy"]).toBe(
       "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; " +
-        "connect-src 'self' https://testnet-rpc.monad.xyz https://store.midacontext.xyz https://sponsor.midacontext.xyz https://indexer.dev.hyperindex.xyz; " +
+        "connect-src 'self' https://testnet-rpc.monad.xyz https://store.midacontext.xyz https://sponsor.midacontext.xyz; " +
         "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
     )
     expect(headers["Strict-Transport-Security"]).toBe("max-age=31536000")
@@ -25,24 +25,6 @@ describe("securityHeaders", () => {
     expect(headers["Cache-Control"]).toBeUndefined()
     expect(headers["Content-Security-Policy"]).toBe(CONTENT_SECURITY_POLICY)
     expect(headers["Strict-Transport-Security"]).toBe("max-age=31536000")
-  })
-})
-
-describe("indexUrlAllowed", () => {
-  const SELF = "https://app.midacontext.xyz"
-
-  it("accepts an https URL on the page's own origin — that is what connect-src 'self' means (in-26 Q-4)", () => {
-    expect(indexUrlAllowed(`${SELF}/v1/graphql`, SELF)).toBe(true)
-  })
-
-  it("still refuses a foreign origin, an http URL, and a non-URL", () => {
-    expect(indexUrlAllowed("https://index.example.org/v1/graphql", SELF)).toBe(false)
-    expect(indexUrlAllowed(`http://app.midacontext.xyz/v1/graphql`, SELF)).toBe(false)
-    expect(indexUrlAllowed("not a url", SELF)).toBe(false)
-  })
-
-  it("keeps accepting the explicitly listed connect-src origins", () => {
-    expect(indexUrlAllowed("https://indexer.dev.hyperindex.xyz/abc/v1/graphql", SELF)).toBe(true)
   })
 })
 

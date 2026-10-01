@@ -6,7 +6,7 @@ import { namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { HIDDEN_LIMIT_MS, armTeardown, renderMe, revocableStore } from "../src/me/page.js"
 import type { AgentRow, MeData, MePorts, RecordRow } from "../src/me/sources.js"
-import { AGENT_LIST_NEEDS_INDEX, BLOCKED_AT_STORE_TEXT, PARTIAL_LIST_TEXT } from "../src/me/sources.js"
+import { AGENT_LIST_NEEDS_INDEX, BLOCKED_AT_STORE_TEXT, NO_INDEX_BADGE_TEXT, PARTIAL_LIST_TEXT } from "../src/me/sources.js"
 
 /**
  * Task 5's page tests. The plan prescribes a jsdom environment pragma, but jsdom is not a
@@ -486,13 +486,51 @@ describe("renderMe", () => {
     expect(unchecked.textContent).not.toContain("disagrees with Monad")
   })
 
-  it("an unset index URL reads 'index not configured' — the badge never claims 'unreachable'", () => {
+  it("with no index deployed the badge names what the page read, on a normal dot", () => {
     const root = renderMe(
-      data({ source: "unavailable", lag: { text: "index not configured", stale: true } }),
+      data({ source: "unavailable", lag: { text: NO_INDEX_BADGE_TEXT, stale: false } }),
       fakeDoc(),
     ) as unknown as FakeEl
-    expect(root.textContent).toContain("index not configured")
+    expect(root.textContent).toContain("Records come from the store and are checked on Monad")
     expect(root.textContent).not.toContain("unreachable")
+    expect(all(root, ".dot-stale")).toEqual([])
+  })
+
+  it("the page a no-index deployment renders never names an index or Envio", () => {
+    const root = renderMe(
+      data({
+        agents: [],
+        agentsUnavailable: AGENT_LIST_NEEDS_INDEX,
+        counts: null,
+        source: "unavailable",
+        lag: { text: NO_INDEX_BADGE_TEXT, stale: false },
+      }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    expect(root.textContent).not.toMatch(/envio/i)
+    expect(root.textContent).not.toMatch(/\bindex/i)
+    expect(root.textContent).toContain("Run mida doctor in your terminal to see the agents approved on that machine.")
+    // nothing on the page offers a revoke here, so the tile carries no line about revoking
+    expect(root.textContent).not.toContain("Revoking stops future reads")
+  })
+
+  it("a failed or partial read shows the warning dot beside the badge", () => {
+    const root = renderMe(
+      data({ source: "unavailable", lag: { text: NO_INDEX_BADGE_TEXT, stale: true } }),
+      fakeDoc(),
+    ) as unknown as FakeEl
+    expect(all(root, ".dot-stale").length).toBe(1)
+  })
+
+  it("the sign-in screen and the loading line promise records, never an agent list", () => {
+    const here = dirname(fileURLToPath(import.meta.url))
+    const html = readFileSync(join(here, "../public/me.html"), "utf8")
+    expect(html).toContain("Your records, and who wrote them.")
+    expect(html).not.toMatch(/every agent|what it can read|Who can read your context/)
+    expect(html).not.toMatch(/envio/i)
+    const page = readFileSync(join(here, "../src/me/page.ts"), "utf8")
+    expect(page).toContain('"Your records, and who wrote them."')
+    expect(page).not.toContain("reading agents, grants")
   })
 
   it("a failed index reads 'index unavailable' on the badge", () => {

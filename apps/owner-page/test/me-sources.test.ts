@@ -739,14 +739,30 @@ describe("loadMe — the agent list can be missing, not just empty", () => {
     expect(data.lag.text).toBe("index unavailable")
   })
 
-  it("index absent → the same needs-index text, and the badge lag names what was never configured", async () => {
+  it("index absent → the page says it does not list agents, and the badge names what it did read", async () => {
     const { state, ports } = world()
     ports.index = null // indexUrl unset — nothing configured to query
     const data = await loadMe(OWNER, ports)
     expect(data.agentsUnavailable).toBe(AGENT_LIST_NEEDS_INDEX)
     expect(data.source).toBe("unavailable")
-    // "index unavailable" would be the wrong blame — nothing was ever pointed at an index
-    expect(data.lag.text).toBe("index not configured")
+    // no index is deployed, so neither line may blame one
+    expect(data.agentsUnavailable).not.toMatch(/index|envio/i)
+    expect(data.lag).toEqual({ text: "Records come from the store and are checked on Monad", stale: false })
+  })
+
+  it("index absent and a list incomplete or the store silent → the badge dot warns", async () => {
+    const partial = world()
+    partial.ports.index = null
+    partial.state.batchedPartial = true
+    expect((await loadMe(OWNER, partial.ports)).lag.stale).toBe(true)
+
+    const down = world()
+    down.ports.index = null
+    down.state.objectsError = new Error("store down")
+    down.state.batchedListError = new Error("store down")
+    const data = await loadMe(OWNER, down.ports)
+    expect(data.recordsUnavailable).toBe(true)
+    expect(data.lag.stale).toBe(true)
   })
 
   it("a capability whose chain check threw stays in the list as Unverified — never dropped", async () => {
