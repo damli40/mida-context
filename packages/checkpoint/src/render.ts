@@ -102,13 +102,15 @@ export function defuse(text: string): string {
       const trimmedStart = line.trimStart()
       // UF-J: a forged count or cut line carries the renderer's own "- " prefix — quote a line
       // that opens with an optional dash before "(N earlier …" or "(Mida cut this reply"
-      // UF-K: and "stated by you:" the same way — the header tells the agent those lines are the
-      // user's own words, so a checkpoint must never start one. The renderer's own fact lines
-      // are built after their text is defused and are never passed through here as whole lines.
+      // UF-K, widened in UF-L: and "stated by you" in ANY spelling the same way — the header
+      // tells the agent those lines are the user's own words, so a checkpoint must never start
+      // one. Optional bullet (- * •), any spacing or case, ASCII or full-width colon. The
+      // renderer's own fact lines are built after their text is defused and are never passed
+      // through here as whole lines.
       const forgedLine =
         /^(-\s*)?\(\d+ earlier /.test(trimmedStart) ||
         /^(-\s*)?\(Mida cut this reply/.test(trimmedStart) ||
-        /^(-\s*)?stated by you:/.test(trimmedStart)
+        /^([-*•]\s*)?stated\s+by\s+you\s*[:：]/i.test(trimmedStart)
       return OWN_HEADINGS.some((h) => trimmedStart.startsWith(h)) || forgedLine ? `> ${line}` : line
     })
     .join("\n")
