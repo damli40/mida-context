@@ -50,7 +50,7 @@ const SAVE_TIMEOUT_MS = 60_000
 
 /** Every tool result except the handoff reply is capped at 8 000 chars, cut with the `…` marker. */
 const TOOL_TEXT_CAP = 8_000
-const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${text.slice(0, TOOL_TEXT_CAP - 1)}…` : text)
+const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${safeHead(text, TOOL_TEXT_CAP - 1)}…` : text)
 
 /**
  * mida_handoff's own cap (UF-H, widened to 40,000 in UF-I): the plain cut could slice the closing

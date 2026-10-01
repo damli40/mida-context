@@ -1,4 +1,5 @@
 import type { MergedHandoff } from "./merge.js"
+import { cutText } from "./schema.js"
 
 // Renders a merged handoff as plain text for the receiving agent.
 // Constraints lead the block — the standing rules sit ahead of the user's own
@@ -269,7 +270,8 @@ export function renderHandoffReport(
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n")
-  const cut = (s: string, n = 300) => (s.length > n ? s.slice(0, n - 1) + "…" : s)
+  // UF-N2: cutText's surrogate-safe cut — a plain slice could end on a pair's first half
+  const cut = (s: string, n = 300) => cutText(s, n)
   // `dropped` oldest items are left out and named by one count line (PROV-14). `whole` entries
   // are rendered uncut — a constraint's exception clause or a decision's reason is part of the
   // rule, and cutting it changes what the next agent obeys (UF-J).

@@ -1469,6 +1469,57 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
+  it("the 8,000 tool cap never splits a surrogate pair either — capText keeps the emoji whole or drops it (UF-N2)", async () => {
+    const dir = home()
+    // the cut lands between the emoji's two UTF-16 halves: 7,998 chars + a 2-unit emoji
+    const big = `${"x".repeat(7_998)}😀${"y".repeat(100)}`
+    expect(big.length).toBeGreaterThan(8_000)
+    const fake = await fakeDaemon(dir, { "/health": HEALTH, "/cli": { code: 0, lines: [big] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_read")
+        expect(text).toBe(`${"x".repeat(7_998)}…`)
+        const before = text.charCodeAt(text.length - 2)
+        expect(before >= 0xd800 && before <= 0xdfff).toBe(false)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("the fenced 40,000 cut never splits a surrogate pair either — the branch real handoffs take (UF-N2)", async () => {
+    const dir = home()
+    // every real handoff carries the END fence, so its cap runs the fenced branch, not the
+    // plain cut the UF-N test above exercises. The kept text ends at `keep` units before the
+    // appended tail — pad so that index lands between the emoji's two UTF-16 halves.
+    const fence = "=== END MIDA HANDOFF DATA ==="
+    const tail = `…\n${CUT_LINE}\n\n${fence}`
+    const keep = 40_000 - tail.length
+    const head = "MIDA HANDOFF\n=== BEGIN MIDA HANDOFF DATA ===\n"
+    const rendered = `${head}${"x".repeat(keep - 1 - head.length)}😀${"y".repeat(1_000)}\n\n${fence}`
+    expect(rendered.length).toBeGreaterThan(40_000)
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: rendered, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_handoff")
+        expect(text.length).toBeLessThanOrEqual(40_000)
+        expect(text.endsWith(tail)).toBe(true)
+        const ellipsisAt = text.indexOf("…")
+        const before = text.charCodeAt(ellipsisAt - 1)
+        expect(before >= 0xd800 && before <= 0xdfff).toBe(false)
+        expect(text).not.toContain("😀")
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
   // UF-K (replaces the UF-J single-sentence swap): the fixtures come from the REAL renderer —
   // a hand-typed preamble would stay green through a renderer reword and let a false claim back.
   // renderHandoffReport produces the daemon's reply; the oversized inputs cross the 40,000 reply

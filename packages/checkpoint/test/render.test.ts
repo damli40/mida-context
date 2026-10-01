@@ -705,6 +705,17 @@ describe("the core header (in-8 H1)", () => {
     expect(renderHandoffReport({ ...base }).text).not.toContain(OVERSIZE_NOTE_LEAD)
   })
 
+  // UF-N2 (item D): a progress entry is cut at 300 chars — 298 chars and a 2-unit emoji put
+  // the emoji's first UTF-16 half at the cut point, and a plain slice would leave it broken
+  // just before the "…". The last kept character must stay whole.
+  it("a progress entry cut inside an emoji keeps the character whole — no lone surrogate before the … (UF-N2)", () => {
+    const text = renderHandoff({ ...base, progress: [`${"x".repeat(298)}😀 and more`] })
+    expect(text).toContain(`- ${"x".repeat(298)}…`)
+    const before = text.slice(0, text.indexOf("…"))
+    const last = before.charCodeAt(before.length - 1)
+    expect(last >= 0xd800 && last <= 0xdfff).toBe(false)
+  })
+
   it("the header is part of the size accounting (chars, cut, oversized)", () => {
     const progress = Array.from({ length: 8 }, (_, i) => `step ${i} ${"x".repeat(400)}`)
     const out = renderHandoffReport({ ...base, progress }, { maxChars: 1200, now: () => NOW })

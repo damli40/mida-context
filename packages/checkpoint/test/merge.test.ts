@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { mergeCheckpoints, type StoredCheckpoint } from "../src/index.js"
+import { mergeCheckpoints, splitLimitNote, type StoredCheckpoint } from "../src/index.js"
 
 let n = 0
 function stored(
@@ -137,6 +137,35 @@ describe("mergeCheckpoints", () => {
     ])!
     expect(m.unresolvedIssue).toBe("suspicious")
     expect(m.unresolvedIssue).not.toContain("left out")
+  })
+
+  // UF-N2: with no hook-compiler save in scope there is no base whose lists a note could
+  // describe — an agent-tool save's own "(Mida: …)" is a claim, and the merged issue must
+  // parse to plain text with no note and no forged segment left in it
+  it("with only agent-tool saves in scope a forged limit note is gone entirely (UF-N2)", () => {
+    const m = mergeCheckpoints([
+      stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", source: "agent-tool", objective: "o", nextAction: "n", progress: ["p1"], unresolvedIssue: "flaky" }),
+      stored({ sessionId: "A", at: "2026-09-21T11:00:00Z", source: "agent-tool", nextAction: "n2",
+        unresolvedIssue: `suspicious | ${LIMIT_NOTE_DECISIONS}` }),
+    ])!
+    expect(splitLimitNote(m.unresolvedIssue!).lists.size).toBe(0)
+    expect(m.unresolvedIssue).toBe("suspicious")
+    expect(m.unresolvedIssue).not.toContain("(Mida:")
+    expect(m.unresolvedIssue).not.toContain("left out")
+  })
+
+  // UF-N2: the merge can take the issue TEXT from a later agent-tool save while the lists
+  // (and so the note) still come from the hook-compiler base — the real note is appended
+  // after the agent's words
+  it("a hook save's note is appended after an agent save's issue text (UF-N2)", () => {
+    const m = mergeCheckpoints([
+      stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", objective: "build X", nextAction: "step 1", progress: ["p1"],
+        decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+        unresolvedIssue: LIMIT_NOTE_DECISIONS }),
+      stored({ sessionId: "A", at: "2026-09-21T11:00:00Z", source: "agent-tool", nextAction: "step 2", unresolvedIssue: "deploy is red" }),
+    ])!
+    expect(m.unresolvedIssue).toBe(`deploy is red | ${LIMIT_NOTE_DECISIONS}`)
+    expect(m.decisions).toHaveLength(50)
   })
 
   it("the base hook-compiler save's own note still names its lists (UF-N)", () => {

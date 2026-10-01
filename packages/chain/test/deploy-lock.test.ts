@@ -211,5 +211,5 @@ describe("the local deploy lock", () => {
     expect(aEnd).toBeGreaterThanOrEqual(0)
     expect(bStart).toBeGreaterThanOrEqual(0)
     expect(bStart).toBeGreaterThan(aEnd)
-  })
+  }, 60_000) // the internal give-up runs to 40 s — over the 30 s suite default
 })
