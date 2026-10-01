@@ -42,7 +42,7 @@ export async function authorizeAgent(input: {
   }
 
   // 4. local deny, on-chain revocation, agent-epoch mismatch
-  await input.overlay.reconcile(input.reader)
+  await input.overlay.reconcileOwner(input.reader, owner)
   if (await input.overlay.denies({ owner, agentId, capabilityId: input.capabilityId })) {
     throw new MidaError("CAPABILITY_REVOKED", "owner revocation intent is active")
   }
