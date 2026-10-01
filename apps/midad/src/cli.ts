@@ -93,6 +93,15 @@ const BUILTIN_AGENT_NAMES: ReadonlySet<string> = new Set([...AGENTS, ...INSTALL_
 export const USAGE =
   "usage: mida init | install <tool> [--no-mcp] | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | sponsor on|off | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>" +
   "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or any identity add-agent or a client install provisions)"
+export const ABOUT: readonly string[] = [
+  "Mida keeps your context in an encrypted store you own: the facts you tell it about yourself, and the checkpoints your AI agents save as they work.",
+  "You approve each agent and you can revoke it. An approved agent reads what the others saved, so one agent can finish what another started.",
+  "First run: mida init, then mida install <tool>, mida request <agent>, mida approve <agent>.",
+]
+/** What `mida --help` prints: what Mida is, a blank line, then the command list. */
+export function helpLines(): string[] {
+  return [...ABOUT, "", USAGE]
+}
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
 export const CLI_COMMANDS: readonly string[] = ["init", "install", "add-agent", "remember", "migrate", "batching", "sponsor", "link", "unlink", "project", "task", "export", ...WITH_AGENT]
 /**
@@ -2495,7 +2504,7 @@ async function main(): Promise<void> {
   const print = (line: string) => console.log(line)
 
   if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
-    print(USAGE)
+    for (const line of helpLines()) print(line)
     process.exitCode = argv.length === 0 ? 2 : 0
     return
   }
