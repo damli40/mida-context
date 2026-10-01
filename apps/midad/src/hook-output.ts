@@ -19,6 +19,14 @@ export const HANDOFF_TAIL = "=== END MIDA HANDOFF DATA ==="
 /** The opening fence — same leaf, same reason: the cap's before-BEGIN scan needs it here. */
 export const HANDOFF_BEGIN = "=== BEGIN MIDA HANDOFF DATA ==="
 
+/**
+ * The opening of the renderer's over-target preamble note — the same literal render.ts exports
+ * as OVERSIZE_NOTE_LEAD, carried on this leaf for the same reason the fences are (the MCP
+ * adapter rewrites whole lines that start with it when its 40,000 cap cuts a reply). A test
+ * pins the two copies together.
+ */
+export const OVERSIZE_NOTE_LEAD = "Mida note: this handoff is longer than its size target."
+
 /** Anything shaped like a raw id or key never reaches the owner's line. */
 const LONG_HEX = /0x[0-9a-f]{40,}|[0-9a-f]{40,}/gi
 

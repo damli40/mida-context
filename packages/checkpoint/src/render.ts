@@ -20,6 +20,13 @@ import type { MergedHandoff } from "./merge.js"
 const BEGIN = "=== BEGIN MIDA HANDOFF DATA ==="
 const TAIL = "=== END MIDA HANDOFF DATA ==="
 
+/**
+ * The opening of the over-target note `build` appends to the preamble — kept as a constant so a
+ * caller that cuts the reply further (the MCP adapter's 40,000-char cap) can find the whole
+ * line and rewrite it honestly (UF-K). hook-output.ts carries the same literal for that leaf.
+ */
+export const OVERSIZE_NOTE_LEAD = "Mida note: this handoff is longer than its size target."
+
 /** The age wording the header's first line carries — whole units, clamped at zero for clock skew. */
 const ageText = (savedMs: number, nowMs: number): string => {
   const minutes = Math.max(0, Math.floor((nowMs - savedMs) / 60_000))
@@ -401,7 +408,7 @@ export function renderHandoffReport(
     if (trim.artifacts > 0) leftOut.push(`${trim.artifacts} earlier ${trim.artifacts === 1 ? "artifact" : "artifacts"}`)
     if (reasonsLeftOut && merged.decisions.length > 0) leftOut.push("the reasons behind decisions")
     if (reasonsLeftOut && merged.rejected.length > 0) leftOut.push("the reasons behind rejected approaches")
-    const note = `Mida note: this handoff is longer than its size target. No constraint, decision or rejected approach was left out to shorten it.${leftOut.length > 0 ? ` Left out: ${leftOut.join(", ")}.` : " Nothing was left out."}`
+    const note = `${OVERSIZE_NOTE_LEAD} No constraint, decision or rejected approach was left out to shorten it.${leftOut.length > 0 ? ` Left out: ${leftOut.join(", ")}.` : " Nothing was left out."}`
     out = build(trim, reasonsLeftOut, note)
   }
   const dropped = TRIM_ORDER.reduce((sum, key) => sum + trim[key], 0)

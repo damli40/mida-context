@@ -5,7 +5,7 @@ import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } fr
 import { callDaemon, socketPathFor } from "./control.js"
 import type { ControlReply } from "./control.js"
 import type { MidaHome } from "./home.js"
-import { CHAIN_REFUSAL_TEXT, HANDOFF_BEGIN, HANDOFF_TAIL, degradedMessage } from "./hook-output.js"
+import { CHAIN_REFUSAL_TEXT, HANDOFF_BEGIN, HANDOFF_TAIL, OVERSIZE_NOTE_LEAD, degradedMessage } from "./hook-output.js"
 import type { SessionStartBody } from "./hook-output.js"
 import { appendLog } from "./log.js"
 import { HOOK_CLIENTS, MCP_CLIENT_TOOLS } from "./mcp-clients.js"
@@ -60,21 +60,27 @@ const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${text
  * text without the fence is cut the way capText cuts, at this same cap.
  */
 const HANDOFF_TEXT_CAP = 40_000
-/** The renderer's over-target preamble sentence — false once this cap drops entries near the end. */
-const NO_RULE_LEFT_OUT = "No constraint, decision or rejected approach was left out to shorten it."
 const capHandoffText = (text: string): string => {
   if (text.length <= HANDOFF_TEXT_CAP) return text
   if (!text.includes(HANDOFF_TAIL)) return `${text.slice(0, HANDOFF_TEXT_CAP - 1)}…`
-  // UF-J: the cut will drop entries near the end — possibly rules — so the preamble's "nothing
-  // left out" claim is swapped for the truth. Searched only BEFORE the BEGIN line: the same words
-  // inside saved text are the save's own and stay. indexOf + slice, never String.replace: saved
-  // text can hold `$&`. Done before measuring the keep length, so the reply still fits the cap.
+  // UF-K: the cut drops entries near the end — possibly rules, and the marked UNSENT blocks,
+  // which sit at the very end — so whatever the preamble's over-target note claimed ("Nothing
+  // was left out.", "Left out: 2 earlier saves.") is replaced by one line saying the reply was
+  // cut, and every "shown below, marked UNSENT" clause goes: the block it points at is gone.
+  // Whole lines that start with the note's lead only, and only BEFORE the BEGIN line — the
+  // same words inside saved text are the save's own and stay (they are quoted by defuse).
+  // indexOf/slice and a replacer FUNCTION, never a replacement string: saved text can hold `$&`.
+  // Done before measuring the keep length, so the reply still fits the cap.
   const beginAt = text.indexOf(HANDOFF_BEGIN)
   if (beginAt !== -1) {
-    const claimAt = text.indexOf(NO_RULE_LEFT_OUT)
-    if (claimAt !== -1 && claimAt < beginAt) {
-      text = `${text.slice(0, claimAt)}This reply was cut at ${HANDOFF_TEXT_CAP.toLocaleString("en-US")} characters, so entries near the end are missing.${text.slice(claimAt + NO_RULE_LEFT_OUT.length)}`
-    }
+    const cutNote = `${OVERSIZE_NOTE_LEAD.slice(0, -1)}, and this reply was cut at ${HANDOFF_TEXT_CAP.toLocaleString("en-US")} characters, so entries near the end are missing.`
+    const before = text
+      .slice(0, beginAt)
+      .split("\n")
+      .map((line) => (line.startsWith(OVERSIZE_NOTE_LEAD) ? cutNote : line))
+      .join("\n")
+      .replace(/; (it is|\d+ of them (is|are)) shown below, marked UNSENT/g, () => "")
+    text = `${before}${text.slice(beginAt)}`
   }
   const tail = `…\n(Mida cut this reply at ${HANDOFF_TEXT_CAP.toLocaleString("en-US")} characters. Text after this point is missing.)\n\n${HANDOFF_TAIL}`
   return `${text.slice(0, HANDOFF_TEXT_CAP - tail.length)}${tail}`

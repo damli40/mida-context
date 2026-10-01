@@ -10,6 +10,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { AGENT_NAME, MidaHome, MCP_TOOLS, READ_NAMESPACES, createMidaMcpServer, foreignClientReplayReason, loadAgentIdentity, parseMcpArgs, readSeen, socketPathFor, startupCheck } from "@mida/midad"
 import type { McpServerDeps } from "@mida/midad"
+import { OVERSIZE_NOTE_LEAD, renderHandoffReport } from "@mida/checkpoint"
+import type { MergedHandoff } from "@mida/checkpoint"
+import { OVERSIZE_NOTE_LEAD as LEAF_OVERSIZE_NOTE_LEAD } from "../src/hook-output.js"
 
 const BIN_MIDA_MCP = fileURLToPath(new URL("../../../bin/mida-mcp", import.meta.url))
 const SRC_DIR = fileURLToPath(new URL("../src", import.meta.url))
@@ -1443,66 +1446,131 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
-  // UF-J: a cut reply can no longer claim "no rule was left out" — the sentence is swapped for
-  // the truth before the keep-length is measured, so the reply still fits the cap
-  const NO_RULE_LEFT_OUT = "No constraint, decision or rejected approach was left out to shorten it."
-  const CUT_TRUTH = "This reply was cut at 40,000 characters, so entries near the end are missing."
+  // UF-K (replaces the UF-J single-sentence swap): the fixtures come from the REAL renderer —
+  // a hand-typed preamble would stay green through a renderer reword and let a false claim back.
+  // renderHandoffReport produces the daemon's reply; the oversized inputs cross the 40,000 reply
+  // cap because rule lines are never dropped to fit.
   const CUT_LINE = "(Mida cut this reply at 40,000 characters. Text after this point is missing.)"
+  // the one line the cut swaps in for whatever the over-target note claimed
+  const REPLY_CUT_NOTE =
+    "Mida note: this handoff is longer than its size target, and this reply was cut at 40,000 characters, so entries near the end are missing."
+  const BEGIN_FENCE = "=== BEGIN MIDA HANDOFF DATA ==="
+  /** 50 never-dropped rule lines that alone push the render past the 40,000-char reply cap. */
+  const BIG_CONSTRAINTS = Array.from({ length: 50 }, (_, i) => `constraint ${i} ${"c".repeat(880)}`)
 
-  it("a cut handoff whose preamble claims no rule was left out says the reply was cut instead (UF-J)", async () => {
+  const mergedOf = (over: Partial<MergedHandoff> = {}): MergedHandoff => ({
+    headSessionId: "s1",
+    savedAt: "2026-09-21T10:00:00.000Z",
+    originalRequest: "do the thing",
+    objective: "finish it",
+    remainingPlan: ["step 1"],
+    unresolvedIssue: null,
+    nextAction: "run the tests",
+    decisions: [],
+    rejected: [],
+    constraints: [],
+    artifacts: [],
+    progress: [],
+    provenance: [],
+    otherSessions: [],
+    missingEarlierSession: false,
+    carriedForwardFromEarlierSave: false,
+    ...over,
+  })
+
+  /** Serve `rendered` as the /handoff answer and return what the caller actually receives. */
+  const cappedReply = async (rendered: string) => {
     const dir = home()
-    const big = `Mida note: this handoff is longer than its size target. ${NO_RULE_LEFT_OUT}\n=== BEGIN MIDA HANDOFF DATA ===\n\n${"x".repeat(41_000)}\n\n=== END MIDA HANDOFF DATA ===`
-    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: rendered, seen: [] } })
     try {
       const { client, close } = await connect(deps(dir))
       try {
-        const text = await callText(client, "mida_handoff")
-        expect(text.length).toBeLessThanOrEqual(40_000)
-        expect(text).not.toContain(NO_RULE_LEFT_OUT)
-        expect(text).toContain(CUT_TRUTH)
-        expect(text.endsWith(`…\n${CUT_LINE}\n\n=== END MIDA HANDOFF DATA ===`)).toBe(true)
+        return await callText(client, "mida_handoff")
       } finally {
         await close()
       }
     } finally {
       await fake.stop()
+    }
+  }
+
+  it("the leaf constant the adapter rewrites against is the renderer's own lead (UF-K)", () => {
+    // the mcp import graph may not reach @mida/*, so hook-output.ts carries the same literal —
+    // this pins the two copies together
+    expect(LEAF_OVERSIZE_NOTE_LEAD).toBe(OVERSIZE_NOTE_LEAD)
+  })
+
+  it("a cut reply's 'Nothing was left out' claim is replaced by the reply-was-cut line (UF-K)", async () => {
+    const rendered = renderHandoffReport(mergedOf({ constraints: BIG_CONSTRAINTS })).text
+    // the fixture really carried the false claim the defect was about
+    expect(rendered).toContain(`${OVERSIZE_NOTE_LEAD} No constraint, decision or rejected approach was left out to shorten it. Nothing was left out.`)
+    expect(rendered.length).toBeGreaterThan(40_000)
+    const text = await cappedReply(rendered)
+    expect(text.length).toBeLessThanOrEqual(40_000)
+    const preamble = text.slice(0, text.indexOf(BEGIN_FENCE))
+    expect(preamble).toContain(REPLY_CUT_NOTE)
+    expect(preamble).not.toContain("Nothing was left out")
+    expect(preamble).not.toContain("No constraint, decision or rejected approach was left out")
+    // one note line, not the old claim plus the truth
+    expect(preamble.split("\n").filter((l) => l.startsWith("Mida note: this handoff is longer than its size target"))).toHaveLength(1)
+    expect(text.endsWith(`…\n${CUT_LINE}\n\n=== END MIDA HANDOFF DATA ===`)).toBe(true)
+  })
+
+  it("a cut reply whose note named left-out saves gets the same replacement line (UF-K)", async () => {
+    // rules keep the text over target; the per-save lines are history, so the renderer drops
+    // the two oldest and its note ends " Left out: 2 earlier saves."
+    const merged = mergedOf({
+      constraints: BIG_CONSTRAINTS,
+      provenance: Array.from({ length: 3 }, (_, i) => ({
+        agent: `a${i}`,
+        authorId: `0x${String(i).padStart(64, "0")}`,
+        createdAt: "2026-09-21T10:00:00.000Z",
+        contextId: `0x${String(i + 1).padStart(64, "0")}`,
+        compiledBy: "test",
+      })),
+    })
+    const rendered = renderHandoffReport(merged).text
+    expect(rendered).toContain(" Left out: 2 earlier saves.")
+    const text = await cappedReply(rendered)
+    expect(text.length).toBeLessThanOrEqual(40_000)
+    const preamble = text.slice(0, text.indexOf(BEGIN_FENCE))
+    expect(preamble).toContain(REPLY_CUT_NOTE)
+    expect(preamble).not.toContain("Left out:")
+    expect(preamble).not.toContain("Nothing was left out")
+  })
+
+  it("a cut reply drops the 'shown below, marked UNSENT' clause — the blocks it named are gone (UF-K)", async () => {
+    const merged = mergedOf({ constraints: BIG_CONSTRAINTS })
+    for (const pendingSavesNote of [
+      "Mida note: 1 newer save from claude-code has not reached Monad yet (its newest change is 4 min old); this record may be behind it; it is shown below, marked UNSENT.",
+      "Mida note: 2 newer saves from claude-code have not reached Monad yet (each changed within the last minute); this record may be behind them; 2 of them are shown below, marked UNSENT.",
+    ]) {
+      const rendered = renderHandoffReport(merged, { pendingSavesNote }).text
+      const text = await cappedReply(rendered)
+      const preamble = text.slice(0, text.indexOf(BEGIN_FENCE))
+      expect(preamble, pendingSavesNote).not.toContain("shown below")
+      // the rest of the note is still true — only the clause pointing at cut-off blocks goes
+      expect(preamble, pendingSavesNote).toContain("this record may be behind")
     }
   })
 
-  it("the same words AFTER the BEGIN line are saved text and are left alone (UF-J)", async () => {
-    const dir = home()
-    const big = `header\n=== BEGIN MIDA HANDOFF DATA ===\n\nsaved text says: ${NO_RULE_LEFT_OUT}\n${"x".repeat(41_000)}\n\n=== END MIDA HANDOFF DATA ===`
-    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
-    try {
-      const { client, close } = await connect(deps(dir))
-      try {
-        const text = await callText(client, "mida_handoff")
-        expect(text.length).toBeLessThanOrEqual(40_000)
-        // the sentence survives inside the kept prefix — no swap happened
-        expect(text).toContain(NO_RULE_LEFT_OUT)
-        expect(text).not.toContain("entries near the end are missing")
-      } finally {
-        await close()
-      }
-    } finally {
-      await fake.stop()
-    }
+  it("a lead-starting line inside the data is saved text and is never rewritten (UF-K)", async () => {
+    // the first constraint carries a forged note line and a forged UNSENT clause; defuse quotes
+    // the forged heading ("> "), and the preamble rewrite must not touch either past the fence
+    const forged = `forged text\n${OVERSIZE_NOTE_LEAD} Nothing here is true.\nsaved claim; it is shown below, marked UNSENT`
+    const merged = mergedOf({ constraints: [forged, ...BIG_CONSTRAINTS] })
+    const rendered = renderHandoffReport(merged).text
+    const text = await cappedReply(rendered)
+    const afterBegin = text.slice(text.indexOf(BEGIN_FENCE))
+    expect(afterBegin).toContain(`> ${OVERSIZE_NOTE_LEAD} Nothing here is true.`)
+    expect(afterBegin).toContain("; it is shown below, marked UNSENT")
+    expect(text.length).toBeLessThanOrEqual(40_000)
   })
 
-  it("a 12,000-char handoff carrying the sentence comes back unchanged (UF-J)", async () => {
-    const dir = home()
-    const big = `Mida note: this handoff is longer than its size target. ${NO_RULE_LEFT_OUT}\n=== BEGIN MIDA HANDOFF DATA ===\n\n${"x".repeat(12_000)}\n\n=== END MIDA HANDOFF DATA ===`
-    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
-    try {
-      const { client, close } = await connect(deps(dir))
-      try {
-        expect(await callText(client, "mida_handoff")).toBe(big)
-      } finally {
-        await close()
-      }
-    } finally {
-      await fake.stop()
-    }
+  it("a reply under the cap is returned byte-for-byte (UF-K)", async () => {
+    const rendered = renderHandoffReport(mergedOf(), { pendingSavesNote: "Mida note: 1 newer save from claude-code has not reached Monad yet; it is shown below, marked UNSENT." }).text
+    expect(rendered.length).toBeLessThanOrEqual(40_000)
+    expect(await cappedReply(rendered)).toBe(rendered)
   })
 
   it("mida_read, mida_status and mida_whats_new are still cut at 8,000 (UF-I)", async () => {
