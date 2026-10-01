@@ -21,7 +21,8 @@ import { debugLine, refusalCode } from "./debug-line.js"
 import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
 import { bannerLines } from "./banner.js"
 import { readSummarizer, currentSummarizer } from "./summarizer.js"
-import { chooseSummarizer, runSummarizer } from "./summarizer-cli.js"
+import { chooseSummarizer, runSummarizer, secretInputStart, secretInputStep } from "./summarizer-cli.js"
+import type { SecretInputState } from "./summarizer-cli.js"
 import { buildHandoff, generalAssistanceText, identityUnreadableText, isGeneralAssistant, noIdentityText, projectCheckRefusal } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
@@ -898,8 +899,8 @@ function summarizerChoiceDeps(deps: {
   home: MidaHome
   env?: Record<string, string | undefined>
   print: (line: string) => void
-  prompt?: (question: string) => Promise<string>
-  secretPrompt?: (question: string) => Promise<string>
+  prompt?: (question: string) => Promise<string | undefined>
+  secretPrompt?: (question: string) => Promise<string | undefined>
   onPath?: (bin: string) => boolean
   drainInput?: () => unknown | Promise<unknown>
 }): Parameters<typeof chooseSummarizer>[0] {
@@ -908,7 +909,7 @@ function summarizerChoiceDeps(deps: {
     home: deps.home,
     env,
     print: deps.print,
-    prompt: deps.prompt ?? terminalPrompt,
+    prompt: deps.prompt ?? terminalPromptOrAbandoned,
     secretPrompt: deps.secretPrompt ?? terminalSecretPrompt,
     onPath: deps.onPath ?? ((bin) => binaryOnPath(bin, env.PATH)),
     drain: deps.drainInput ?? drainBufferedStdin,
@@ -1947,47 +1948,58 @@ function terminalPrompt(question: string): Promise<string> {
 }
 
 /**
- * The hidden prompt for secrets (UF-P2b): writes the question, reads stdin in raw mode
- * without echoing, handles backspace, ends on Enter, restores the terminal mode. Ctrl-C
- * restores the mode and resolves with an empty string. Only ever called when stdin is a
- * real terminal; without one it falls back to a plain question so nothing hangs.
+ * The typed prompt the summariser questions use (UF-P2R): the same question as terminalPrompt,
+ * but the line reader closing before an answer — Ctrl-C, Ctrl-D, stdin ending — resolves
+ * undefined instead of never answering, so the caller can leave the rest of the command alive.
  */
-function terminalSecretPrompt(question: string): Promise<string> {
+function terminalPromptOrAbandoned(question: string): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout })
+    let settled = false
+    const finish = (answer: string | undefined) => {
+      if (settled) return
+      settled = true
+      rl.close()
+      resolve(answer)
+    }
+    rl.question(question, (answer) => finish(answer))
+    rl.on("close", () => finish(undefined))
+  })
+}
+
+/**
+ * The hidden prompt for secrets (UF-P2b): writes the question, reads stdin in raw mode
+ * without echoing, ends on Enter, restores the terminal mode. Every keystroke rule lives in
+ * the pure `secretInputStep` (UF-P2R): control bytes and escape sequences are dropped whole,
+ * Ctrl-C or Ctrl-D on an empty line resolve undefined — an abandoned ask, not an empty key.
+ * Only ever called when stdin is a real terminal; without one it falls back to a plain
+ * question so nothing hangs.
+ */
+function terminalSecretPrompt(question: string): Promise<string | undefined> {
   const stdin = process.stdin
   const stdout = process.stdout
-  if (stdin.isTTY !== true || typeof stdin.setRawMode !== "function") return terminalPrompt(question)
+  if (stdin.isTTY !== true || typeof stdin.setRawMode !== "function") return terminalPromptOrAbandoned(question)
   return new Promise((resolve) => {
     const wasRaw = stdin.isRaw === true
-    let answer = ""
-    const done = (value: string) => {
+    let state = secretInputStart()
+    const done = (s: SecretInputState) => {
       stdin.removeListener("data", onData)
+      stdin.removeListener("end", onEnd)
       stdin.setRawMode(wasRaw)
       stdin.pause()
       stdout.write("\n")
-      resolve(value)
+      resolve(s.status === "done" ? Buffer.from(s.bytes).toString("utf8") : undefined)
     }
     const onData = (chunk: Buffer) => {
-      for (const byte of chunk) {
-        if (byte === 3) {
-          // Ctrl-C: restore and give up with an empty answer
-          done("")
-          return
-        }
-        if (byte === 13 || byte === 10) {
-          done(answer)
-          return
-        }
-        if (byte === 127 || byte === 8) {
-          answer = answer.slice(0, -1)
-          continue
-        }
-        answer += String.fromCharCode(byte)
-      }
+      state = secretInputStep(state, chunk)
+      if (state.status !== "typing") done(state)
     }
+    const onEnd = () => done(state)
     stdout.write(question)
     stdin.setRawMode(true)
     stdin.resume()
     stdin.on("data", onData)
+    stdin.once("end", onEnd)
   })
 }
 
@@ -2769,7 +2781,7 @@ async function main(): Promise<void> {
       print,
       stdinIsTTY: process.stdin.isTTY === true,
       stdoutIsTTY: process.stdout.isTTY === true,
-      prompt: terminalPrompt,
+      prompt: terminalPromptOrAbandoned,
       secretPrompt: terminalSecretPrompt,
       onPath: (bin) => binaryOnPath(bin, process.env.PATH),
       health: async () => {

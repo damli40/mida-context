@@ -19,6 +19,77 @@ import { NEEDS_TERMINAL_LINE, USAGE } from "./cli.js"
 
 export type ProbeResult = Awaited<ReturnType<typeof probeModel>>
 
+/**
+ * The hidden key prompt's keystrokes as a pure function (UF-P2R): `state` holds the raw bytes
+ * kept so far plus `typing | done | abandoned`; each raw stdin chunk steps it forward. The
+ * answer is `Buffer.from(state.bytes).toString("utf8")` once status is "done"; "abandoned"
+ * means Ctrl-C, or Ctrl-D with nothing typed — the caller must treat it as "no answer".
+ */
+export interface SecretInputState {
+  status: "typing" | "done" | "abandoned"
+  /** the bytes kept so far — never a decoded string, so a half-typed UTF-8 char stays intact */
+  bytes: number[]
+  /** 1 = saw 0x1b, waiting for '['; 2 = inside a CSI sequence, skipping until its final byte */
+  escape: 0 | 1 | 2
+}
+
+export function secretInputStart(): SecretInputState {
+  return { status: "typing", bytes: [], escape: 0 }
+}
+
+export function secretInputStep(state: SecretInputState, chunk: Buffer): SecretInputState {
+  if (state.status !== "typing") return state
+  for (const byte of chunk) {
+    if (state.escape === 2) {
+      // a CSI sequence (arrow keys, bracketed-paste markers) ends at the first byte in 0x40-0x7e
+      if (byte >= 0x40 && byte <= 0x7e) state.escape = 0
+      continue
+    }
+    if (state.escape === 1) {
+      state.escape = byte === 0x5b ? 2 : 0
+      continue
+    }
+    if (byte === 0x1b) {
+      state.escape = 1
+      continue
+    }
+    if (byte === 0x03) {
+      state.status = "abandoned"
+      return state
+    }
+    if (byte === 0x0d || byte === 0x0a) {
+      state.status = "done"
+      return state
+    }
+    if (byte === 0x04) {
+      // Ctrl-D ends an empty line the way a terminal ends input; with text typed it means nothing
+      if (state.bytes.length === 0) {
+        state.status = "abandoned"
+        return state
+      }
+      continue
+    }
+    if (byte === 0x15) {
+      state.bytes = []
+      continue
+    }
+    if (byte === 0x7f || byte === 0x08) {
+      // backspace removes the last whole character: any UTF-8 tail bytes, then its lead byte
+      while (state.bytes.length > 0 && (state.bytes[state.bytes.length - 1]! & 0xc0) === 0x80) state.bytes.pop()
+      state.bytes.pop()
+      continue
+    }
+    if (byte < 0x20) continue
+    state.bytes.push(byte)
+  }
+  return state
+}
+
+/** A trimmed key with a space or a control character in it is a paste slip, not a key. */
+function keyHasHiddenChars(key: string): boolean {
+  return /[ \x00-\x1f]/.test(key)
+}
+
 export interface SummarizerCliDeps {
   home: MidaHome
   env: NodeJS.ProcessEnv
@@ -26,8 +97,9 @@ export interface SummarizerCliDeps {
   now?: () => number
   stdinIsTTY?: boolean
   stdoutIsTTY?: boolean
-  prompt?: (question: string) => Promise<string>
-  secretPrompt?: (question: string) => Promise<string>
+  /** undefined means the prompt was abandoned (Ctrl-C, Ctrl-D, stdin ending) — save nothing */
+  prompt?: (question: string) => Promise<string | undefined>
+  secretPrompt?: (question: string) => Promise<string | undefined>
   onPath?: (bin: string) => boolean
   claudeSafeMode?: () => boolean
   /** The async `claude --help` probe — only `test` runs it, and only when claude is on PATH. */
@@ -194,8 +266,8 @@ async function showSummarizer(deps: SummarizerCliDeps): Promise<number> {
 /** The questions behind `use key` (UF-P2b): pick a provider, then give it what it needs. */
 export async function askSummarizerKey(deps: {
   print: (line: string) => void
-  prompt: (question: string) => Promise<string>
-  secretPrompt: (question: string) => Promise<string>
+  prompt: (question: string) => Promise<string | undefined>
+  secretPrompt: (question: string) => Promise<string | undefined>
 }): Promise<SummarizerSaved | undefined> {
   const { print, prompt, secretPrompt } = deps
   print("Which provider?")
@@ -206,7 +278,9 @@ export async function askSummarizerKey(deps: {
   let badProvider = 0
   let provider: "deepseek" | "kimi" | "custom" | undefined
   while (provider === undefined) {
-    const answer = (await prompt("Choose 1, 2 or 3: ")).trim()
+    const raw = await prompt("Choose 1, 2 or 3: ")
+    if (raw === undefined) return undefined
+    const answer = raw.trim()
     if (answer === "1") provider = "deepseek"
     else if (answer === "2") provider = "kimi"
     else if (answer === "3") provider = "custom"
@@ -217,20 +291,24 @@ export async function askSummarizerKey(deps: {
   }
 
   if (provider === "deepseek" || provider === "kimi") {
-    let empty = 0
+    let bad = 0
     for (;;) {
-      const apiKey = (await secretPrompt("API key (typing is hidden): ")).trim()
-      if (apiKey !== "") return { use: "key", provider, apiKey }
-      print("No key entered.")
-      empty++
-      if (empty >= 3) return undefined
+      const raw = await secretPrompt("API key (typing is hidden): ")
+      if (raw === undefined) return undefined
+      const apiKey = raw.trim()
+      if (apiKey !== "" && !keyHasHiddenChars(apiKey)) return { use: "key", provider, apiKey }
+      print(apiKey === "" ? "No key entered." : "That key has spaces or hidden characters in it. Paste it again.")
+      bad++
+      if (bad >= 3) return undefined
     }
   }
 
   let badUrl = 0
   let baseUrl: string | undefined
   while (baseUrl === undefined) {
-    const answer = (await prompt("Endpoint base URL (for OpenAI: https://api.openai.com/v1): ")).trim()
+    const raw = await prompt("Endpoint base URL (for OpenAI: https://api.openai.com/v1): ")
+    if (raw === undefined) return undefined
+    const answer = raw.trim()
     if (endpointAllowed(answer)) {
       baseUrl = answer
     } else {
@@ -243,7 +321,9 @@ export async function askSummarizerKey(deps: {
   let emptyModel = 0
   let model: string | undefined
   while (model === undefined) {
-    const answer = (await prompt("Model name: ")).trim()
+    const raw = await prompt("Model name: ")
+    if (raw === undefined) return undefined
+    const answer = raw.trim()
     if (answer === "") {
       emptyModel++
       if (emptyModel >= 3) return undefined
@@ -252,8 +332,16 @@ export async function askSummarizerKey(deps: {
     }
   }
 
-  const apiKey = (await secretPrompt("API key (typing is hidden; leave empty if your endpoint needs none): ")).trim()
-  return { use: "key", provider: "custom", apiKey, baseUrl, model }
+  let badKey = 0
+  for (;;) {
+    const raw = await secretPrompt("API key (typing is hidden; leave empty if your endpoint needs none): ")
+    if (raw === undefined) return undefined
+    const apiKey = raw.trim()
+    if (!keyHasHiddenChars(apiKey)) return { use: "key", provider: "custom", apiKey, baseUrl, model }
+    print("That key has spaces or hidden characters in it. Paste it again.")
+    badKey++
+    if (badKey >= 3) return undefined
+  }
 }
 
 /** `https:` anywhere; `http:` only for this machine. */
@@ -273,8 +361,8 @@ export async function chooseSummarizer(deps: {
   home: MidaHome
   env: NodeJS.ProcessEnv
   print: (line: string) => void
-  prompt: (question: string) => Promise<string>
-  secretPrompt: (question: string) => Promise<string>
+  prompt: (question: string) => Promise<string | undefined>
+  secretPrompt: (question: string) => Promise<string | undefined>
   onPath: (bin: string) => boolean
   /** drops input already buffered on stdin, the way approve does before its "Type yes" */
   drain?: () => unknown | Promise<unknown>
@@ -313,7 +401,12 @@ export async function chooseSummarizer(deps: {
   await drain?.()
   let wrong = 0
   for (;;) {
-    const answer = (await prompt("Choose 1 or 2 [1]: ")).trim()
+    const raw = await prompt("Choose 1 or 2 [1]: ")
+    if (raw === undefined) {
+      print("Nothing saved. Mida uses your agents' small models until you choose: mida summarizer")
+      return "skipped"
+    }
+    const answer = raw.trim()
     if (answer === "" || answer === "1") {
       const saved: SummarizerSaved = { use: "agents" }
       writeSummarizer(home, saved)
