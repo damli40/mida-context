@@ -2,7 +2,7 @@ import type { Address, Hex, OwnerAgentHistory } from "@mida/protocol"
 import { capabilityRegistryAbi } from "./abis.js"
 import type { Deployment } from "./deployment.js"
 
-/** How many getCapability reads run at once — the public RPC allows about 25 requests a second. */
+/** How many getCapability reads run at once — the shared transport caps requests at 10 a second per RPC origin. */
 const CAPABILITY_READ_CONCURRENCY = 8
 
 /** The contract views and the head height ownerHistory needs — viem's PublicClient is one. There is no log API: the check never scans events. */

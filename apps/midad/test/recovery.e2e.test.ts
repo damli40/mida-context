@@ -215,7 +215,7 @@ describe("M0 crash-safety and whole-agent revocation", () => {
     await expect(readCheckpoints(runtime, "codex", 5 as unknown as string)).rejects.toThrow(/projectId/)
   }, STEP_TIMEOUT)
 
-  it("C1: the owner's history scan starts at the owner's recorded first block, and survives a restart", async () => {
+  it("C1: the owner's history check starts at the owner's recorded first block, and survives a restart", async () => {
     // The shared runtime was opened on a fresh home in beforeAll, so its start block was recorded then.
     const saved = loadOwnerStartBlock(home, network.deployment.chainId)
     expect(saved).toBeDefined()
