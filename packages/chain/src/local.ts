@@ -94,19 +94,13 @@ export async function startAnvil(options: { hardfork?: string } = {}): Promise<L
 
 /**
  * Fallback age for a lock with no readable `owner` file: an old-format lock, or a holder killed
- * between mkdir and writing the owner. A lock with a live owner pid is never stale on age alone;
- * `maxHoldMs` below is the only age that overrides a live pid.
+ * between mkdir and writing the owner. A lock whose `owner` pid is running is never left behind,
+ * however old the directory is — a live deploy that is merely slow keeps its lock.
  */
 const DEPLOY_LOCK_STALE_MS = 5 * 60_000
 
 /** A takeover holds `${lockDir}.steal` for milliseconds; past this its holder was killed mid-steal. */
 const DEPLOY_LOCK_STEAL_STALE_MS = 30_000
-
-/**
- * How long a real deploy can possibly hold the lock: seconds, not minutes. Past this, a live
- * `owner` pid is a recycled pid left over from a killed run — the lock is left behind anyway.
- */
-const DEPLOY_LOCK_MAX_HOLD_MS = 30 * 60_000
 
 /** The pid in `${lockDir}/owner`, or undefined when the file is missing or unreadable. */
 function lockOwnerPid(lockDir: string): number | undefined {
@@ -131,21 +125,14 @@ function pidIsRunning(pid: number): boolean {
 /**
  * True when the lock at `lockDir` was left behind: its `owner` file names a pid that is no longer
  * running, or it has no readable `owner` file and the directory is older than `staleMs`. A lock
- * whose owner pid is still running is never left behind — unless `maxHoldMs` is set and the
- * directory is older than that: a killed run's leftover can name a pid since recycled by an
- * unrelated live process, and a real deploy never holds the lock that long (UF-J).
+ * whose owner pid is still running is never left behind, however old the directory is — a live
+ * deploy that is merely slow (a sleeping laptop) keeps its lock (UF-K). A leftover naming a pid
+ * since recycled by an unrelated process makes waiters time out; the timeout names the pid and
+ * the folder so a person can remove it.
  */
-function lockLeftBehind(lockDir: string, staleMs: number, maxHoldMs: number | undefined): boolean {
+function lockLeftBehind(lockDir: string, staleMs: number): boolean {
   const owner = lockOwnerPid(lockDir)
-  if (owner !== undefined) {
-    if (!pidIsRunning(owner)) return true
-    if (maxHoldMs === undefined) return false
-    try {
-      return Date.now() - statSync(lockDir).mtimeMs > maxHoldMs
-    } catch {
-      return false // the lock vanished between the owner check and this stat
-    }
-  }
+  if (owner !== undefined) return !pidIsRunning(owner)
   try {
     return Date.now() - statSync(lockDir).mtimeMs > staleMs
   } catch {
@@ -157,14 +144,16 @@ function lockLeftBehind(lockDir: string, staleMs: number, maxHoldMs: number | un
  * Takes a directory lock, waiting up to `waitMs`. The holder's pid is written to `owner` inside the
  * lock directory. A left-behind lock — owner pid gone, or ownerless and older than `staleMs`
  * (PROC-07: one such leftover made every later test file wait out the full ten minutes behind a
- * lock nobody held) — is removed and taken. With `maxHoldMs`, a lock older than that is left
- * behind even while its `owner` pid is running — the pid was recycled by an unrelated process.
- * Takeover is serialised through a `${lockDir}.steal`
- * mutex directory so several waiters cannot remove and take the same lock at once.
+ * lock nobody held) — is removed and taken; a lock whose owner pid is running is never taken,
+ * however old. Takeover is serialised through a `${lockDir}.steal` mutex directory so several
+ * waiters cannot remove and take the same lock at once, and the lock is re-checked inside the
+ * mutex before it is removed — another waiter may have retaken it meanwhile. `beforeTakeover`
+ * (tests only; deployLocal never passes it) is awaited after the lock is first seen left behind
+ * and before the `.steal` directory is made — it widens that race window deterministically.
  */
 export async function takeDirLock(
   lockDir: string,
-  options: { waitMs: number; staleMs: number; maxHoldMs?: number },
+  options: { waitMs: number; staleMs: number; beforeTakeover?: () => void | Promise<void> },
 ): Promise<void> {
   const deadline = Date.now() + options.waitMs
   for (;;) {
@@ -180,7 +169,8 @@ export async function takeDirLock(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
     }
-    if (lockLeftBehind(lockDir, options.staleMs, options.maxHoldMs)) {
+    if (lockLeftBehind(lockDir, options.staleMs)) {
+      await options.beforeTakeover?.()
       const stealDir = `${lockDir}.steal`
       let stealing = true
       try {
@@ -199,16 +189,20 @@ export async function takeDirLock(
       if (stealing) {
         try {
           // Re-check under the mutex: another process may have retaken the lock meanwhile.
-          if (lockLeftBehind(lockDir, options.staleMs, options.maxHoldMs)) rmSync(lockDir, { recursive: true, force: true })
+          if (lockLeftBehind(lockDir, options.staleMs)) rmSync(lockDir, { recursive: true, force: true })
         } finally {
           rmSync(stealDir, { recursive: true, force: true })
         }
+        // UF-K: straight back to the take. A waiter whose own wait ran out must not remove the
+        // lock and then throw "held" — it would leave the freed lock to the next waiter while
+        // reporting failure itself.
+        continue
       }
     }
     if (Date.now() > deadline) {
       const owner = lockOwnerPid(lockDir)
       throw new Error(
-        `deploy lock ${lockDir} held for ${options.waitMs / 1000}s${owner === undefined ? "" : ` by pid ${owner}`}`,
+        `deploy lock ${lockDir} held for ${options.waitMs / 1000}s${owner === undefined ? "" : ` by pid ${owner}`}. If no test run is active, delete that folder.`,
       )
     }
     await new Promise((resolve) => setTimeout(resolve, 200))
@@ -239,10 +233,9 @@ export async function deployLocal(options: { rpcUrl: string; privateKey?: Hex })
   const lockDir = `${CONTRACTS_DIR()}deployments/.deploy-lock`
   // The wait must outlast the full-suite queue: every test file that deploys serializes here
   // (two forge runs each), and a wave of waiters easily stacks past two minutes. The deadline
-  // still bounds a genuinely stuck lock — it just stops firing on normal queue depth.
-  // maxHoldMs: a real deploy holds the lock for seconds, so a lock older than 30 minutes was
-  // left behind even when its owner pid now belongs to an unrelated live process.
-  await takeDirLock(lockDir, { waitMs: 600_000, staleMs: DEPLOY_LOCK_STALE_MS, maxHoldMs: DEPLOY_LOCK_MAX_HOLD_MS })
+  // still bounds a genuinely stuck lock — it just stops firing on normal queue depth. A lock
+  // whose owner pid is running is never taken over, however long it has been held.
+  await takeDirLock(lockDir, { waitMs: 600_000, staleMs: DEPLOY_LOCK_STALE_MS })
   try {
     const result = spawnSync(
       `${FOUNDRY_BIN}/forge`,

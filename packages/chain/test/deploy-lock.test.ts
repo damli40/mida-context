@@ -9,9 +9,12 @@ import { releaseDirLock, takeDirLock } from "../src/local.js"
 // PROC-07 (Oct 1): a test run killed mid-deploy left contracts/deployments/.deploy-lock behind, and
 // every later test file that deploys waited out the full ten minutes behind a lock nobody held.
 // The Oct 1 follow-up: deciding "stale" by age alone let two waiters both remove the same lock and
-// both hold it (36 of 40 rounds with 8 processes), and a live deploy paused past five minutes — a
-// sleeping laptop — was robbed. A lock is now left behind only when its owner pid is gone, and
-// takeovers are serialised through a `${lock}.steal` mutex so one waiter removes it at a time.
+// both hold it (36 of 40 rounds with 8 processes). UF-K: a lock is left behind only when its owner
+// pid is gone, or when it has no owner file and is older than the stale threshold — a lock whose
+// owner pid is running is never taken, however old (the 30-minute override robbed live deploys
+// that were merely slow, and two deploys then wrote the same deployment file). Takeovers are
+// serialised through a `${lock}.steal` mutex so one waiter removes a leftover at a time, and the
+// lock is re-checked inside that mutex before it is removed.
 describe("the local deploy lock", () => {
   const lockIn = () => join(mkdtempSync(join(tmpdir(), "mida-deploy-lock-")), ".deploy-lock")
 
@@ -34,36 +37,26 @@ describe("the local deploy lock", () => {
     expect(readFileSync(join(lock, "owner"), "utf8")).toBe(String(process.pid))
   })
 
-  it("still waits for a fresh lock, and says so when the wait runs out", async () => {
-    const lock = lockIn()
-    mkdirSync(lock)
-    await expect(takeDirLock(lock, { waitMs: 400, staleMs: 5 * 60_000 })).rejects.toThrow(/deploy lock .* held/)
-  })
-
-  // UF-J: a killed run's leftover can name a pid since recycled by an unrelated live process —
-  // pid alive is no longer proof of a live holder. Past maxHoldMs the directory is left behind
-  // whatever `owner` says; a real deploy holds the lock for seconds, never half an hour.
-  it("takes over a lock older than maxHoldMs even when its owner pid is still running", async () => {
-    const lock = lockIn()
-    mkdirSync(lock)
-    writeFileSync(join(lock, "owner"), String(process.pid)) // this process really is running
-    const thirtyOneMinutesAgo = new Date(Date.now() - 31 * 60_000)
-    utimesSync(lock, thirtyOneMinutesAgo, thirtyOneMinutesAgo)
-    await takeDirLock(lock, { waitMs: 1_000, staleMs: 5 * 60_000, maxHoldMs: 30 * 60_000 })
-    expect(existsSync(lock)).toBe(true) // held by this caller now
-    expect(readFileSync(join(lock, "owner"), "utf8")).toBe(String(process.pid))
-  })
-
-  it("still waits out a live owner while the lock is younger than maxHoldMs", async () => {
+  it("still waits for a fresh lock, and the timeout names the holder and what to do", async () => {
     const lock = lockIn()
     mkdirSync(lock)
     writeFileSync(join(lock, "owner"), String(process.pid))
-    const tenMinutesAgo = new Date(Date.now() - 10 * 60_000)
-    utimesSync(lock, tenMinutesAgo, tenMinutesAgo)
-    await expect(takeDirLock(lock, { waitMs: 400, staleMs: 5 * 60_000, maxHoldMs: 30 * 60_000 })).rejects.toThrow(/deploy lock .* held/)
+    await expect(takeDirLock(lock, { waitMs: 400, staleMs: 5 * 60_000 })).rejects.toThrow(
+      `deploy lock ${lock} held for 0.4s by pid ${process.pid}. If no test run is active, delete that folder.`,
+    )
   })
 
-  it("never takes a lock whose owner is still running, however old the directory is, when no maxHoldMs is given", async () => {
+  it("the timeout names no pid when the lock's owner is unknown", async () => {
+    const lock = lockIn()
+    mkdirSync(lock) // ownerless and fresh — not left behind, and nobody to name
+    await expect(takeDirLock(lock, { waitMs: 400, staleMs: 5 * 60_000 })).rejects.toThrow(
+      `deploy lock ${lock} held for 0.4s. If no test run is active, delete that folder.`,
+    )
+  })
+
+  // UF-K: a lock whose owner pid is running is never taken, however old — the 30-minute
+  // maxHoldMs override is gone; it took the lock from live deploys that were merely slow.
+  it("never takes a lock whose owner is still running, however old the directory is", async () => {
     const lock = lockIn()
     mkdirSync(lock)
     writeFileSync(join(lock, "owner"), String(process.pid))
@@ -150,5 +143,38 @@ describe("the local deploy lock", () => {
       }
     }
     expect(failures).toEqual([])
+  })
+
+  // UF-K: a waiter that wins `.steal` must re-check the lock under the mutex before removing
+  // it — another waiter may have retaken it while this one was paused between seeing the lock
+  // left behind and making the mutex. Worker B pauses 600 ms there (the beforeTakeover hook);
+  // worker A starts 150 ms later with no pause and holds the lock for 1,200 ms. The re-check
+  // makes B's `start` come after A's `end`; without it B removes A's live lock and holds the
+  // same lock beside A.
+  it("a waiter that clears a leftover re-checks under the steal mutex — a live holder wins (UF-K)", async () => {
+    const worker = fileURLToPath(new URL("./fixtures/lock-worker.ts", import.meta.url))
+    const dir = mkdtempSync(join(tmpdir(), "mida-deploy-lock-recheck-"))
+    const lock = join(dir, ".deploy-lock")
+    const logPath = join(dir, "log")
+    mkdirSync(lock) // a leftover: no owner file, ten minutes old
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60_000)
+    utimesSync(lock, tenMinutesAgo, tenMinutesAgo)
+    const spawnWorker = (beforeTakeoverMs: number, holdMs: number) =>
+      spawn(process.execPath, ["--import", "tsx", worker, lock, logPath, "", String(beforeTakeoverMs), String(holdMs)])
+    const exited = (child: ReturnType<typeof spawn>) =>
+      new Promise<void>((resolve, reject) => {
+        child.once("error", reject)
+        child.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`lock worker exited with code ${code}`))))
+      })
+    const b = spawnWorker(600, 0)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    const a = spawnWorker(0, 1_200)
+    await Promise.all([exited(b), exited(a)])
+    const lines = readFileSync(logPath, "utf8").trim().split("\n")
+    const aEnd = lines.indexOf(`end ${a.pid}`)
+    const bStart = lines.indexOf(`start ${b.pid}`)
+    expect(aEnd).toBeGreaterThanOrEqual(0)
+    expect(bStart).toBeGreaterThanOrEqual(0)
+    expect(bStart).toBeGreaterThan(aEnd)
   })
 })
