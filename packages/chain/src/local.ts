@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
-import { mkdirSync, rmdirSync } from "node:fs"
+import { mkdirSync, rmdirSync, statSync } from "node:fs"
 import { createServer } from "node:net"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
@@ -91,6 +91,36 @@ export async function startAnvil(options: { hardfork?: string } = {}): Promise<L
   }
 }
 
+/** A real deploy holds the lock for seconds (two forge runs); past this it belongs to a killed run. */
+const DEPLOY_LOCK_STALE_MS = 5 * 60_000
+
+/**
+ * Takes a directory lock, waiting up to `waitMs`. A lock older than `staleMs` was left by a run
+ * killed mid-deploy (PROC-07: one such leftover made every later test file wait out the full ten
+ * minutes behind a lock nobody held) — it is removed and taken. Two waiters racing for a stale
+ * lock both try the remove; one mkdir wins and the other keeps waiting, as for any held lock.
+ */
+export async function takeDirLock(lockDir: string, options: { waitMs: number; staleMs: number }): Promise<void> {
+  const deadline = Date.now() + options.waitMs
+  for (;;) {
+    try {
+      mkdirSync(lockDir)
+      return
+    } catch {
+      try {
+        if (Date.now() - statSync(lockDir).mtimeMs > options.staleMs) {
+          rmdirSync(lockDir)
+          continue
+        }
+      } catch {
+        // raced: another waiter removed or retook it — fall through and wait
+      }
+      if (Date.now() > deadline) throw new Error(`deploy lock ${lockDir} held for ${options.waitMs / 1000}s`)
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+  }
+}
+
 /**
  * Deploys with contracts/script/Deploy.s.sol, then DeployBatchAnchor.s.sol beside it, and returns the
  * parsed deployment file (batchAnchor + batchAnchorBlock set). Every local Anvil writes the same
@@ -102,17 +132,7 @@ export async function deployLocal(options: { rpcUrl: string; privateKey?: Hex })
   // The wait must outlast the full-suite queue: every test file that deploys serializes here
   // (two forge runs each), and a wave of waiters easily stacks past two minutes. The deadline
   // still bounds a genuinely stuck lock — it just stops firing on normal queue depth.
-  const lockWaitMs = 600_000
-  const deadline = Date.now() + lockWaitMs
-  for (;;) {
-    try {
-      mkdirSync(lockDir)
-      break
-    } catch {
-      if (Date.now() > deadline) throw new Error(`deploy lock ${lockDir} held for ${lockWaitMs / 1000}s`)
-      await new Promise((resolve) => setTimeout(resolve, 200))
-    }
-  }
+  await takeDirLock(lockDir, { waitMs: 600_000, staleMs: DEPLOY_LOCK_STALE_MS })
   try {
     const result = spawnSync(
       `${FOUNDRY_BIN}/forge`,
