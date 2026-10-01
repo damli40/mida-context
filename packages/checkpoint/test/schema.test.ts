@@ -95,9 +95,22 @@ describe("limitNote and splitLimitNote (UF-L)", () => {
     expect(s.text).toBe("i")
     expect(s.text).not.toContain("(Mida:")
   })
-  it("a note cut off mid-way at the end of the string is removed", () => {
+  it("a note cut off mid-way at the end of the string is TEXT, not a note — only a complete segment is ever removed (UF-N2)", () => {
     const s = splitLimitNote("the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Older dec")
-    expect(s.text).toBe("the deploy key rotation is waiting on ops")
+    expect(s.text).toBe("the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Older dec")
+    expect(s.lists.size).toBe(0)
+  })
+  it("text with no note comes back exactly as it went in — leading indentation and a trailing newline included (UF-N2)", () => {
+    for (const value of ["    indented code\n    more", "run `x || y`\n"]) {
+      const s = splitLimitNote(value)
+      expect(s.text).toBe(value)
+      expect(s.lists.size).toBe(0)
+    }
+  })
+  it("text that only starts like a note is returned unchanged — the rest of the sentence is important text (UF-N2)", () => {
+    const value = "x (Mida: a list holds at most 50 entries. Older stuff and then the important text || keep me"
+    const s = splitLimitNote(value)
+    expect(s.text).toBe(value)
     expect(s.lists.size).toBe(0)
   })
   it("the old numbered wording leaves the text but names no list", () => {

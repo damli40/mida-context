@@ -161,6 +161,22 @@ describe("checkpoint payload", () => {
     expect(back).not.toBeNull()
     expect(back!.checkpoint.unresolvedIssue).toBe(stored)
   })
+  // UF-N2: the size-limit path ran a global separator cleanup UF-N1 removed everywhere else —
+  // a `||` inside the issue's own text (an OR operator, a table border) was rewritten to `|`.
+  // Now only the ONE separator touching a removed or re-attached note changes.
+  it("a save forced over the byte cap keeps the issue's own `||` and still gains the size note (UF-N2)", () => {
+    const fat = sampleCheckpoint({
+      constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i}`),
+      unresolvedIssue: "CI passes only because of `make test || true`",
+      progress: Array.from({ length: 50 }, () => "p".repeat(2000)),
+    })
+    const e = wrap(fat)
+    const stored = e.checkpoint.unresolvedIssue!
+    expect(stored).toContain("`make test || true`")
+    expect(stored).not.toContain("make test | true`")
+    expect(stored).toContain("(Mida:")
+    expect(stored).toContain("left out")
+  })
   it("when constraints already holds 50 real entries, the note lands on unresolvedIssue and no constraint is deleted", () => {
     const fat = sampleCheckpoint({
       constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i}`),

@@ -106,15 +106,26 @@ const ISSUE_NOTE_SEGMENT = /\(Mida:[^()]*\)/g
  */
 function issueKeepingNotes(value: string, textRoom: number): string {
   const notes: string[] = []
-  const text = value
-    .replace(ISSUE_NOTE_SEGMENT, (segment) => {
-      notes.push(segment)
-      return ""
-    })
-    .replace(/(\s*\|\s*){2,}/g, " | ")
-    .replace(/^\s*\|\s*/, "")
-    .replace(/\s*\|\s*$/, "")
-    .trim()
+  let text = value
+  for (;;) {
+    ISSUE_NOTE_SEGMENT.lastIndex = 0
+    const segment = ISSUE_NOTE_SEGMENT.exec(text)
+    if (segment === null) break
+    notes.push(segment[0])
+    const before = text.slice(0, segment.index)
+    const after = text.slice(segment.index + segment[0].length)
+    // UF-N2: the ONE separator touching the removed note goes with it — the one directly
+    // before it, or if there is none, the one directly after. Every other character is the
+    // issue's own text and is left alone: a `||` the model wrote stays `||`.
+    const sepBefore = /\s*\|\s*$/.exec(before)
+    if (sepBefore !== null) {
+      text = before.slice(0, sepBefore.index) + after
+    } else {
+      const sepAfter = /^\s*\|\s*/.exec(after)
+      text = before + (sepAfter === null ? after : after.slice(sepAfter[0].length))
+    }
+  }
+  if (notes.length > 0) text = text.trim()
   let noteRoom = LIMITS.maxString
   const kept: string[] = []
   for (let i = notes.length - 1; i >= 0; i--) {

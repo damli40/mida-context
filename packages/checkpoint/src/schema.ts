@@ -52,10 +52,11 @@ export function limitNote(lists: ReadonlySet<LimitList>): string | null {
   return `(Mida: a list holds at most ${LIMITS.maxArray} entries. Older ${names} were left out.)`
 }
 
-// A "(Mida: a list holds at most" segment runs to the next ")" — or to the end of the string
-// when a size cut sliced the note before its bracket. The first ")" ends the segment, so a note
-// nested inside another dies with its parent.
-const LIMIT_NOTE_SEGMENT = /\(Mida: a list holds at most[^)]*(\)|$)/
+// A "(Mida: a list holds at most" segment runs to the next ")" — and ONLY there (UF-N2): text
+// that merely starts like a note, with no closing bracket, is returned unchanged, important
+// tail text and all. The first ")" ends the segment, so a note nested inside another dies with
+// its parent.
+const LIMIT_NOTE_SEGMENT = /\(Mida: a list holds at most[^)]*\)/
 
 // A well-formed note of the current wording, anywhere in the value — the whole match is the
 // note, group 1 its list names. Only an exact limitNote output earns its lists back.
@@ -69,13 +70,13 @@ const LIMIT_NOTE_TAIL = /^(?:\s|\||\(Mida:[^)]*\))*$/
 
 /**
  * Splits an unresolvedIssue value into its free text and the lists a well-formed limit note at
- * the very END names. `text` drops every note-looking segment wherever it sits — one the model
- * forged, one a size cut left mid-word — and with each segment the ONE separator touching it:
- * the " | " (optional spaces, one pipe, optional spaces) directly before it, or if there is
- * none, the one directly after. Nothing else in the text changes — a value holding no note
- * comes back byte-for-byte, `||` and leading or trailing pipes included, because they are the
- * user's text, not our punctuation (UF-N). Only leading/trailing whitespace is trimmed at the
- * end; `text` may come back empty. `lists` is empty unless a note byte-for-byte as limitNote
+ * the very END names. `text` drops every COMPLETE note-looking segment wherever it sits — one
+ * the model forged included — and with each segment the ONE separator touching it: the " | "
+ * (optional spaces, one pipe, optional spaces) directly before it, or if there is none, the
+ * one directly after. Nothing else in the text changes — a value holding no note comes back
+ * byte-for-byte, `||`, indentation and trailing newlines included, because they are the
+ * user's text, not our punctuation (UF-N/UF-N2: whitespace is trimmed only after a removal);
+ * `text` may come back empty. `lists` is empty unless a note byte-for-byte as limitNote
  * writes it — in name order, with the real cap — is followed by nothing except whitespace,
  * separators and other complete "(Mida: …)" notes (UF-N: the size note wrapCheckpoint appends
  * after the limit note counts; any other text does not), so an old numbered note or a
@@ -85,9 +86,11 @@ export function splitLimitNote(value: string | null): { text: string; lists: Set
   const lists = new Set<LimitList>()
   if (value === null) return { text: "", lists }
   let text = value
+  let removed = false
   for (;;) {
     const segment = LIMIT_NOTE_SEGMENT.exec(text)
     if (segment === null) break
+    removed = true
     const before = text.slice(0, segment.index)
     const after = text.slice(segment.index + segment[0].length)
     const sepBefore = /\s*\|\s*$/.exec(before)
@@ -98,7 +101,7 @@ export function splitLimitNote(value: string | null): { text: string; lists: Set
       text = before + (sepAfter === null ? after : after.slice(sepAfter[0].length))
     }
   }
-  text = text.trim()
+  if (removed) text = text.trim()
   let last: RegExpExecArray | null = null
   for (let m = LIMIT_NOTE_WELL_FORMED.exec(value); m !== null; m = LIMIT_NOTE_WELL_FORMED.exec(value)) last = m
   if (last !== null && LIMIT_NOTE_TAIL.test(value.slice(last.index + last[0].length))) {
