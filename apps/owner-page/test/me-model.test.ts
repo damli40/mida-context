@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { chipsFor, grantStatus, isTxHash, lagText, provenanceBadge, readersAfterRevoke } from "../src/me/model.js"
+import { chipsFor, grantStatus, isTxHash, lagText, provenanceBadge } from "../src/me/model.js"
 import type { GrantTruth } from "../src/me/model.js"
 
 describe("chipsFor", () => {
@@ -44,14 +44,6 @@ describe("lagText", () => {
     // a null lag means the index answered but could not say how fresh it is — "unavailable"
     // would contradict the badge's "Read from the Envio index"
     expect(lagText(null)).toEqual({ text: "index freshness unknown", stale: true })
-  })
-})
-describe("readersAfterRevoke", () => {
-  it("every other agent the page knows — even unverified ones; the chain re-checks READ", () => {
-    const a = ("0x" + "1".repeat(64)) as `0x${string}`, b = ("0x" + "2".repeat(64)) as `0x${string}`, c = ("0x" + "3".repeat(64)) as `0x${string}`
-    // c is whatever non-live state — Unverified, blocked at the store — and must still be
-    // offered to the chain: a live reader skipped here keeps only dead wraps after the rotate.
-    expect(readersAfterRevoke([{ agentId: a }, { agentId: b }, { agentId: c }], a)).toEqual([b, c])
   })
 })
 describe("grantStatus", () => {

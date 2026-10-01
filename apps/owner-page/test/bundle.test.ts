@@ -60,9 +60,8 @@ describe("me browser bundle", () => {
   })
 
   it("ships no revoke machinery — /me is read-only in this build", async () => {
-    // src/me/revoke.ts stays in the repo for the post-hackathon return of the in-page revoke;
-    // what matters is that page.ts no longer imports it, so none of the revoke path — the
-    // confirm step or the wrap republish — can reach the bundle.
+    // The in-page revoke was removed with the agent list it depended on. Revoking happens in
+    // the terminal; none of a revoke path may reach this bundle.
     const code = await bundleCode("src/me/page.ts")
     expect(code).not.toContain("confirmRevoke")
     expect(code).not.toContain("publishReaderWraps")
