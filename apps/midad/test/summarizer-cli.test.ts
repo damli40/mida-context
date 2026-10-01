@@ -34,6 +34,7 @@ function rig(
     stdoutIsTTY?: boolean
     health?: () => Promise<unknown>
     probe?: (command: ModelCommand) => Promise<ProbeResult>
+    kick?: () => unknown | Promise<unknown>
     now?: number
   } = {},
 ): Deps {
@@ -60,6 +61,7 @@ function rig(
         claudeSafeMode: () => false,
         ...(over.health !== undefined ? { health: over.health } : {}),
         ...(over.probe !== undefined ? { probe: over.probe } : {}),
+        ...(over.kick !== undefined ? { kick: over.kick } : {}),
       }),
   }
 }
@@ -269,6 +271,60 @@ describe("mida summarizer use", () => {
     expect(r.lines[saved + 1]).toBe(`Saved in ${dir.path("summarizer.json")}, readable only by you.`)
     expect(r.lines[saved + 2]).toBe("Summaries are written by: DeepSeek (deepseek-flash), with your own API key")
     expect(r.lines.every((line) => !line.includes("sk-live-key"))).toBe(true)
+  })
+
+  // UF-P3 P3a: switching the summariser choice is the way out of a "no model" wait — the waits
+  // clear at once, the running service is asked for a pass, and the owner sees the one line.
+  it("use agents clears a waiting save, kicks the service once and prints the line (UF-P3)", async () => {
+    const dir = home()
+    dir.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T11:00:00.000Z",
+      failedAt: "2026-10-01T11:30:00.000Z",
+      reason: "summarizer-limit",
+    })
+    let kicks = 0
+    const r = rig(dir, { onPath: () => true, kick: () => (kicks += 1) })
+    expect(await r.run(["summarizer", "use", "agents"])).toBe(0)
+    const saved = r.lines.indexOf("Saved: your agents' small models write the summaries.")
+    expect(saved).toBeGreaterThanOrEqual(0)
+    expect(r.lines[saved + 1]).toBe("Saves that were waiting for a summary model will be tried again now.")
+    expect(kicks).toBe(1)
+    const state = dir.readJson<{ failedAt?: string; reason?: string }>("queue/state/s1.json")
+    expect(state?.failedAt).toBeUndefined()
+    expect(state?.reason).toBeUndefined()
+  })
+
+  it("use key clears a waiting save and kicks too (UF-P3)", async () => {
+    const dir = home()
+    dir.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T11:00:00.000Z",
+      failedAt: "2026-10-01T11:30:00.000Z",
+      reason: "no-summarizer",
+    })
+    let kicks = 0
+    const r = rig(dir, {
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      onPath: () => true,
+      answers: ["1"],
+      secrets: ["sk-live-key"],
+      kick: () => (kicks += 1),
+    })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(0)
+    expect(r.lines).toContain("Saves that were waiting for a summary model will be tried again now.")
+    expect(kicks).toBe(1)
+    expect(dir.readJson<{ reason?: string }>("queue/state/s1.json")?.reason).toBeUndefined()
+  })
+
+  it("use agents with nothing waiting prints no retry line (UF-P3)", async () => {
+    const dir = home()
+    const r = rig(dir, { onPath: () => true, kick: () => {} })
+    expect(await r.run(["summarizer", "use", "agents"])).toBe(0)
+    expect(r.lines.some((line) => line.includes("waiting for a summary model"))).toBe(false)
   })
 
   it("use agents returns 0 once the file is written, even with neither tool on PATH (UF-P2R)", async () => {

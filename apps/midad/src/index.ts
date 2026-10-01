@@ -61,7 +61,7 @@ export type { FolderUnlinkPlan, ListOwner, ProjectApproval, ProjectCheck, Projec
 export { FLUSH_EVENTS, drainerEnv, runHook, transcriptPathAllowed, transcriptRoots } from "./hook.js"
 export type { HookEvent } from "./hook.js"
 export { clearCodexHome, recordCodexHome, recordedCodexHome, resolveCodexHome, trustedCodexHome } from "./codex-home.js"
-export { agentApprovedOnChain, drainOnce, drainUntilSettled, resetOutOfGasWaits, sessionWaits, tailOf } from "./drain.js"
+export { agentApprovedOnChain, drainOnce, drainUntilSettled, resetOutOfGasWaits, resetSummarizerWaits, sessionWaits, tailOf } from "./drain.js"
 export type { DrainDeps, DrainResult, SessionWait } from "./drain.js"
 export { MIGRATION_REFUSAL, SOCKET_FILE, callDaemon, ensureDaemon, ensureDaemonState, ensureCurrentDaemon, ensureFallbackSocketDir, fallbackSocketDir, socketPathFor } from "./control.js"
 export type { ControlReply } from "./control.js"

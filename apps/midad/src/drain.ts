@@ -104,6 +104,13 @@ const PERMANENT_FAILURES = new Set([
  */
 const INVALID_CHECKPOINT_MAX_ATTEMPTS = 3
 const backoffMs = (attempts: number) => Math.min(60_000 * 2 ** attempts, MAX_BACKOFF_MS)
+/**
+ * Transient codes that are a capacity wait, not a failed attempt: the sponsor's daily cap (UF-O),
+ * or a compile with no model able to write the summary — the whole chain at its usage limit, or
+ * nothing installed at all (UF-P3). They never count an attempt, never reach queue/bad through
+ * gave-up, and outlive the 24-hour staleness rule.
+ */
+const LIMIT_WAIT_REASONS = new Set(["sponsor-limit", "summarizer-limit", "no-summarizer"])
 
 export interface DrainDeps {
   home: MidaHome
@@ -316,9 +323,15 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
       for (const older of group.slice(0, -1)) removeJob(deps.home, older.id)
       const flush = group.some((j) => FLUSH_EVENTS.has(j.event))
       try {
-        if (now().getTime() - Date.parse(job.at) > DAY_MS) {
+        // UF-P3: the session's state decides the staleness limit, so it is read BEFORE the age
+        // check and reused below — a wait on the sponsor's daily cap or on a missing summary
+        // model can honestly last longer than a day (a weekly plan limit, a budget spent two
+        // days running), and only a full week drops that job; every other job keeps 24 hours.
+        const state = readState(deps.home, sessionId)
+        const longWait = state?.failedAt !== undefined && LIMIT_WAIT_REASONS.has(state.reason ?? "")
+        if (now().getTime() - Date.parse(job.at) > (longWait ? WEEK_MS : DAY_MS)) {
           moveToBad(deps.home, `${job.id}.json`)
-          log({ sessionId, outcome: "bad", reason: "older-than-24h" })
+          log({ sessionId, outcome: "bad", reason: longWait ? "older-than-7d" : "older-than-24h" })
           continue
         }
         // the hook checked this path at enqueue, but the file could have been swapped since —
@@ -362,7 +375,6 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             ? devinFingerprintOf(job.transcriptPath, sessionId, deps.openDevinDb)
             : tailOf(job.transcriptPath)
         const lastLineHash = bytesToHex(sha256(utf8ToBytes(lastLine)))
-        const state = readState(deps.home, sessionId)
         const stateMatches = state !== undefined && state.transcriptBytes === transcriptBytes && state.lastLineHash === lastLineHash
         const terminal = { transcriptBytes, lastLineHash, savedAt: now().toISOString() }
         if (stateMatches && (state.attempts ?? 0) === 0) {
@@ -613,15 +625,15 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           continue
         }
         // transient: keep the job, count the attempt, and hold the session until the backoff passes.
-        // A sponsor-limit refusal is different (UF-O): it is a daily allowance that resets at 00:00
-        // UTC, not an error — the attempt count must not grow (it would only march the job to
-        // queue/bad for a limit the sponsor's owner may raise during the day), so the state keeps
-        // whatever attempts it already had and is left out when there were none.
+        // A capacity wait is different (UF-O sponsor-limit; UF-P3 summarizer-limit/no-summarizer):
+        // the limit is not an error — the attempt count must not grow (it would only march the
+        // job to queue/bad for a limit the owner may lift), so the state keeps whatever attempts
+        // it already had and is left out when there were none.
         const priorState = readState(deps.home, sessionId)
-        const attempts = code === "sponsor-limit" ? (priorState?.attempts ?? 0) : (priorState?.attempts ?? 0) + 1
+        const attempts = LIMIT_WAIT_REASONS.has(code) ? (priorState?.attempts ?? 0) : (priorState?.attempts ?? 0) + 1
         counts.failed += 1
         const invalidGaveUp = code === "invalid-checkpoint" && attempts >= INVALID_CHECKPOINT_MAX_ATTEMPTS
-        if (code !== "sponsor-limit" && (attempts >= MAX_ATTEMPTS || invalidGaveUp)) {
+        if (!LIMIT_WAIT_REASONS.has(code) && (attempts >= MAX_ATTEMPTS || invalidGaveUp)) {
           moveToBad(deps.home, `${job.id}.json`)
           writeState(deps.home, sessionId, terminalStateFor(job, now().toISOString(), deps.openDevinDb))
           log({ sessionId, outcome: "bad", reason: invalidGaveUp ? "invalid-checkpoint" : "gave-up", lastReason: code, ...fields, ...sample })
@@ -634,7 +646,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           transcriptBytes: statSize(job.transcriptPath),
           lastLineHash: "",
           savedAt: priorState?.savedAt ?? job.at,
-          ...(code === "sponsor-limit" && priorState?.attempts === undefined ? {} : { attempts }),
+          ...(LIMIT_WAIT_REASONS.has(code) && priorState?.attempts === undefined ? {} : { attempts }),
           failedAt: now().toISOString(),
           // the reason rides the wait record: doctor names it and a funding reset clears it
           reason: code,
@@ -973,6 +985,8 @@ function readContinues(home: MidaHome, sessionId: string, projectId: string): st
 function dueAfterFailureMs(state: SessionState): number | undefined {
   if (state.failedAt === undefined) return undefined
   const failedAt = Date.parse(state.failedAt)
+  // UF-P3: a summarizer wait retries on the hour only — the UTC-midnight rule is the sponsor's
+  if (state.reason === "summarizer-limit" || state.reason === "no-summarizer") return failedAt + 60 * 60 * 1000
   if (state.reason === "sponsor-limit") {
     const nextMidnight = (Math.floor(failedAt / DAY_MS) + 1) * DAY_MS
     return Math.min(failedAt + 60 * 60 * 1000, nextMidnight + 60_000)
@@ -1074,6 +1088,42 @@ export function resetOutOfGasWaits(home: MidaHome): number {
     if (state === undefined || state.failedAt === undefined) continue
     if (state.attempts === undefined && state.reason !== "sponsor-limit") continue
     if (state.reason !== undefined && !GAS_WAIT_REASONS.has(state.reason)) continue
+    const { attempts: _a, failedAt: _f, reason: _r, ...rest } = state
+    writeState(home, sessionId, rest)
+    cleared += 1
+  }
+  return cleared
+}
+
+/**
+ * The wait reasons a summarizer change — `mida summarizer use …` — makes stale: no model could
+ * write the summary, or every model hit its usage limit. A sponsor's cap or a chain failure is
+ * not the new choice's business, so those waits keep their deadlines.
+ */
+const SUMMARIZER_WAIT_REASONS = new Set(["summarizer-limit", "no-summarizer"])
+
+/**
+ * Clears the recorded failure wait on every session that was waiting on the summary model —
+ * run after `mida summarizer use agents`/`use key` writes the new choice, so the next pass
+ * retries the save at once instead of waiting out the hour. A wait recorded with no attempts
+ * clears too — summarizer waits never counted one. Returns the number of waits cleared.
+ * Never throws: a state file that will not parse is left for the drain's own handling.
+ */
+export function resetSummarizerWaits(home: MidaHome): number {
+  let cleared = 0
+  let names: string[]
+  try {
+    names = home.list("queue/state")
+  } catch {
+    return 0
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json") || name.endsWith(".last.json")) continue
+    const sessionId = name.slice(0, -".json".length)
+    if (!isSafeName(sessionId)) continue
+    const state = readState(home, sessionId)
+    if (state === undefined || state.failedAt === undefined) continue
+    if (state.reason === undefined || !SUMMARIZER_WAIT_REASONS.has(state.reason)) continue
     const { attempts: _a, failedAt: _f, reason: _r, ...rest } = state
     writeState(home, sessionId, rest)
     cleared += 1

@@ -12,6 +12,8 @@ import { closeSync, openSync, readSync, statSync } from "node:fs"
 import { probeClaudeSafeMode, probeModel, resolveBinary, resolveSummarizer } from "@mida/compiler"
 import type { ModelCommand, SummarizerSaved } from "@mida/compiler"
 import type { MidaHome } from "./home.js"
+import { callDaemon } from "./control.js"
+import { resetSummarizerWaits } from "./drain.js"
 import { SUMMARIZER_FILE, currentSummarizer, readSummarizer, writeSummarizer } from "./summarizer.js"
 // USAGE and NEEDS_TERMINAL_LINE are declared in cli.ts; the import cycle is safe because
 // both are only read inside functions, after every module has finished evaluating.
@@ -106,7 +108,21 @@ export interface SummarizerCliDeps {
   probeSafeMode?: (binary: string) => Promise<boolean>
   /** Asks the running service for its /health reply; undefined when it does not answer. */
   health?: () => Promise<unknown>
+  /** Asks the running service to run a drain pass now — the /kick call cli.ts makes after `mida batching`; best-effort. */
+  kick?: () => unknown | Promise<unknown>
   probe?: (command: ModelCommand) => Promise<ProbeResult>
+}
+
+/**
+ * After `use agents`/`use key` writes the new choice (UF-P3): sessions that were waiting on the
+ * summary model get their waits cleared, the owner is told, and the running service is asked for
+ * a pass the way `mida batching` does it — a silent /kick, best-effort, never an error here.
+ */
+async function afterChoiceWritten(deps: SummarizerCliDeps): Promise<void> {
+  const cleared = resetSummarizerWaits(deps.home)
+  if (cleared > 0) deps.print("Saves that were waiting for a summary model will be tried again now.")
+  const kick = deps.kick ?? (() => callDaemon(deps.home, "/kick", {}, { timeoutMs: 2_000 }))
+  await Promise.resolve(kick()).catch(() => {})
 }
 
 // The same three-line rule as ageText in handoff.ts — that one is private to the
@@ -474,6 +490,7 @@ export async function runSummarizer(argv: string[], deps: SummarizerCliDeps): Pr
     const saved: SummarizerSaved = { use: "agents" }
     writeSummarizer(home, saved)
     print("Saved: your agents' small models write the summaries.")
+    await afterChoiceWritten(deps)
     // the write landed — the display that follows never changes that answer
     await showSummarizer(deps)
     return 0
@@ -494,6 +511,7 @@ export async function runSummarizer(argv: string[], deps: SummarizerCliDeps): Pr
       resolveSummarizer({ saved, env, onPath, claudeSafeMode: deps.claudeSafeMode?.() ?? false }).entries[0]?.display ?? "your endpoint"
     print(`Saved: ${display} writes the summaries, with your key.`)
     print(`Saved in ${home.path(SUMMARIZER_FILE)}, readable only by you.`)
+    await afterChoiceWritten(deps)
     await showSummarizer(deps)
     return 0
   }

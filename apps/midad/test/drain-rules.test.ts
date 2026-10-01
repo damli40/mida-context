@@ -11,7 +11,7 @@ import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { MidaHome, buildHandoff, buildRemember, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, readUnsent, resetOutOfGasWaits, resolveSessionTask, sessionWaits, tailOf } from "@mida/midad"
+import { MidaHome, buildHandoff, buildRemember, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, readUnsent, resetOutOfGasWaits, resetSummarizerWaits, resolveSessionTask, sessionWaits, tailOf } from "@mida/midad"
 import type { DrainDeps, RememberDeps, Runtime, ServiceRuntime, saveCheckpoint } from "@mida/midad"
 import { CONTENT_FIELDS, mergeCheckpoints } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
@@ -35,7 +35,7 @@ function setup() {
   writeFileSync(join(cwd, ".mida", "project.json"), JSON.stringify({ projectId: "p-1" }))
   const compileCalls: CompileInput[] = []
   const saveCalls: unknown[] = []
-  const flags: { saveFailures: number; checkpoint?: Checkpoint; compileReason?: "model-failed" | "no-json" | "invalid"; compileSample?: string } = { saveFailures: 0 }
+  const flags: { saveFailures: number; checkpoint?: Checkpoint; compileReason?: "model-failed" | "no-json" | "invalid" | "summarizer-limit" | "no-summarizer"; compileSample?: string } = { saveFailures: 0 }
   const compile: typeof compileCheckpoint = async (input) => {
     compileCalls.push(input)
     if (flags.compileReason !== undefined) {
@@ -2093,5 +2093,260 @@ describe("a save refused by the sponsor's daily limit waits for the reset (UF-O)
     expect(state?.attempts).toBe(3)
     expect(state?.reason).toBe("sponsor-limit")
     expect(listJobs(home)).toHaveLength(1)
+  })
+})
+
+// UF-P3 item P3a: a compile that fails because NO model can write the summary — the chain is at
+// its usage limit, or nothing is installed — is a capacity wait like sponsor-limit, not a failed
+// attempt. The job stays queued, the attempt count is untouched, and the retry is due in an hour.
+describe("a save that found no summary model waits, not fails (UF-P3)", () => {
+  const summarizerLimitCompile: typeof compileCheckpoint = async () => ({
+    ok: false,
+    reason: "summarizer-limit",
+    detail: "every model hit its usage limit",
+    attempts: 2,
+    retried: 0,
+  })
+  const noSummarizerCompile: typeof compileCheckpoint = async () => ({
+    ok: false,
+    reason: "no-summarizer",
+    detail: "no summary model is available",
+    attempts: 0,
+    retried: 0,
+  })
+
+  for (const [reason, compile] of [
+    ["summarizer-limit", summarizerLimitCompile],
+    ["no-summarizer", noSummarizerCompile],
+  ] as const) {
+    it(`${reason}: the job stays queued with the reason recorded and no attempts field`, async () => {
+      const { home, job, drain, drainLog } = setup()
+      job()
+      const counts = await drain({ compile })
+      expect(counts.failed).toBe(1)
+      expect(listJobs(home)).toHaveLength(1)
+      expect(home.list("queue/bad")).toEqual([])
+      const state = home.readJson<{ attempts?: number; failedAt?: string; reason?: string }>("queue/state/s1.json")
+      expect(state?.reason).toBe(reason)
+      expect(state?.failedAt).toBeDefined()
+      expect(state).not.toHaveProperty("attempts")
+      const line = drainLog()
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .find((o) => o.outcome === "failed")!
+      expect(line).toMatchObject({ sessionId: "s1", outcome: "failed", reason, attempts: 0 })
+    })
+
+    it(`${reason}: twenty passes never move the job to queue/bad and never grow attempts`, async () => {
+      const { home, job, drain } = setup()
+      job()
+      for (let i = 0; i < 20; i += 1) {
+        await drain({ compile, now: () => new Date(T0 + 120_000 + i * 3_660_000) })
+      }
+      expect(listJobs(home)).toHaveLength(1)
+      expect(home.list("queue/bad")).toEqual([])
+      expect(home.readJson("queue/state/s1.json")).not.toHaveProperty("attempts")
+    })
+
+    it(`${reason}: the next try is due exactly 60 minutes after failedAt — no midnight rule`, async () => {
+      const { home, job, drain } = setup()
+      let calls = 0
+      const counting: typeof compileCheckpoint = async (input) => {
+        calls += 1
+        return compile(input)
+      }
+      job({}, Date.parse("2026-10-01T09:30:00.000Z"))
+      // failedAt 23:30 UTC: due is 00:30 the next day — NOT 00:01, the sponsor's reset time
+      home.writeSecretJson("queue/state/s1.json", {
+        transcriptBytes: 10,
+        lastLineHash: "",
+        savedAt: "2026-10-01T09:00:00.000Z",
+        failedAt: "2026-10-01T23:30:00.000Z",
+        reason,
+      })
+      expect(sessionWaits(home, listJobs(home))[0]!.dueAtMs).toBe(Date.parse("2026-10-02T00:30:00.000Z"))
+      const early = await drain({ compile: counting, now: () => new Date("2026-10-02T00:29:00.000Z") })
+      expect(early.skippedTooSoon).toBe(1)
+      expect(calls).toBe(0)
+      await drain({ compile: counting, now: () => new Date("2026-10-02T00:30:01.000Z") })
+      expect(calls).toBe(1)
+      expect(listJobs(home)).toHaveLength(1)
+    })
+
+    it(`${reason}: a state that had attempts keeps them exactly as read`, async () => {
+      const { home, job, drain } = setup()
+      job({}, Date.parse("2026-10-01T09:30:00.000Z"))
+      home.writeSecretJson("queue/state/s1.json", {
+        transcriptBytes: 10,
+        lastLineHash: "",
+        savedAt: "2026-10-01T09:00:00.000Z",
+        attempts: 3,
+        failedAt: "2026-10-01T08:00:00.000Z",
+        reason: "chain-error",
+      })
+      await drain({ compile, now: () => new Date("2026-10-01T10:00:00.000Z") })
+      const state = home.readJson<{ attempts?: number; reason?: string }>("queue/state/s1.json")
+      expect(state?.attempts).toBe(3)
+      expect(state?.reason).toBe(reason)
+      expect(listJobs(home)).toHaveLength(1)
+    })
+  }
+
+  it("a state already counting a summarizer-limit wait keeps its attempts written back exactly", async () => {
+    const { home, job, drain } = setup()
+    job({}, Date.parse("2026-10-01T09:30:00.000Z"))
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      attempts: 2,
+      failedAt: "2026-10-01T09:00:00.000Z",
+      reason: "summarizer-limit",
+    })
+    await drain({ compile: summarizerLimitCompile, now: () => new Date("2026-10-01T10:00:00.000Z") })
+    const state = home.readJson<{ attempts?: number; reason?: string }>("queue/state/s1.json")
+    expect(state?.attempts).toBe(2)
+    expect(state?.reason).toBe("summarizer-limit")
+  })
+
+  it("resetSummarizerWaits clears both summarizer reasons and leaves sponsor-limit and chain-error alone", () => {
+    const { home } = setup()
+    const wait = (reason: string, attempts?: number) => ({
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      ...(attempts === undefined ? {} : { attempts }),
+      failedAt: "2026-10-01T10:00:00.000Z",
+      reason,
+    })
+    home.writeSecretJson("queue/state/s1.json", wait("summarizer-limit"))
+    home.writeSecretJson("queue/state/s2.json", wait("no-summarizer", 4))
+    home.writeSecretJson("queue/state/s3.json", wait("sponsor-limit"))
+    home.writeSecretJson("queue/state/s4.json", wait("chain-error", 2))
+    expect(resetSummarizerWaits(home)).toBe(2)
+    for (const id of ["s1", "s2"]) {
+      const cleared = home.readJson<{ attempts?: number; failedAt?: string; reason?: string; savedAt?: string }>(`queue/state/${id}.json`)
+      expect(cleared?.attempts).toBeUndefined()
+      expect(cleared?.failedAt).toBeUndefined()
+      expect(cleared?.reason).toBeUndefined()
+      // the unrelated fields survive the clearing
+      expect(cleared?.savedAt).toBe("2026-10-01T09:00:00.000Z")
+      expect(cleared?.transcriptBytes).toBe(10)
+    }
+    for (const [id, reason] of [["s3", "sponsor-limit"], ["s4", "chain-error"]] as const) {
+      const kept = home.readJson<{ failedAt?: string; reason?: string }>(`queue/state/${id}.json`)
+      expect(kept?.reason).toBe(reason)
+      expect(kept?.failedAt).toBe("2026-10-01T10:00:00.000Z")
+    }
+  })
+
+  it("a model-failed compile still counts attempts and gives up after eight", async () => {
+    const { home, job, drain, drainLog } = setup()
+    job()
+    const failingCompile: typeof compileCheckpoint = async () => ({
+      ok: false,
+      reason: "model-failed",
+      detail: "stub",
+      attempts: 1,
+      retried: 0,
+    })
+    // each pass lands just past the 60 s × 2^attempts backoff of the last failure
+    let t = T0 + 120_000
+    for (let i = 0; i < 8; i += 1) {
+      await drain({ compile: failingCompile, now: () => new Date(t) })
+      t += 60_000 * 2 ** (i + 1) + 1_000
+    }
+    expect(listJobs(home)).toHaveLength(0)
+    expect(drainLog()).toContain("gave-up")
+    expect(drainLog()).toContain('"reason":"model-failed"')
+    const lastFailed = drainLog()
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((o) => o.outcome === "failed")
+      .at(-1)!
+    expect(lastFailed.attempts).toBe(7)
+  })
+
+  // UF-P3 item 3b: a limit can outlast a day — a weekly model plan, or the sponsor's budget spent
+  // two days running. A job whose state records one of the wait reasons keeps the 7-day rule;
+  // every other job still drops at 24 hours.
+  it("a 30-hour-old job waiting on a summarizer reason is kept and tried again once due", async () => {
+    for (const [reason, compile] of [
+      ["summarizer-limit", summarizerLimitCompile],
+      ["no-summarizer", noSummarizerCompile],
+    ] as const) {
+      const { home, job, drain } = setup()
+      let calls = 0
+      const counting: typeof compileCheckpoint = async (input) => {
+        calls += 1
+        return compile(input)
+      }
+      job() // queued at T0
+      home.writeSecretJson("queue/state/s1.json", {
+        transcriptBytes: 10,
+        lastLineHash: "",
+        savedAt: "2026-09-21T11:00:00.000Z",
+        failedAt: new Date(T0 + 28 * 3_600_000).toISOString(),
+        reason,
+      })
+      const counts = await drain({ compile: counting, now: () => new Date(T0 + 30 * 3_600_000) })
+      expect(calls, reason).toBe(1)
+      expect(counts.failed).toBe(1)
+      expect(listJobs(home), reason).toHaveLength(1)
+      expect(home.list("queue/bad"), reason).toEqual([])
+    }
+  })
+
+  it("a 30-hour-old job waiting on sponsor-limit is kept past the 24-hour line too", async () => {
+    const { home, job, drain } = setup()
+    job() // queued at T0
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-21T11:00:00.000Z",
+      failedAt: new Date(T0 + 28 * 3_600_000).toISOString(),
+      reason: "sponsor-limit",
+    })
+    let saves = 0
+    const counts = await drain({
+      save: async () => {
+        saves += 1
+        throw Object.assign(new Error("insufficient funds for gas * price + value"), { sponsorDailyLimit: "120 free calls" })
+      },
+      now: () => new Date(T0 + 30 * 3_600_000),
+    })
+    expect(saves).toBe(1)
+    expect(counts.failed).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("an 8-day-old job waiting on a summarizer reason finally drops with older-than-7d", async () => {
+    const { home, job, drain, drainLog, compileCalls } = setup()
+    job()
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-21T11:00:00.000Z",
+      failedAt: new Date(T0 + 3_600_000).toISOString(),
+      reason: "summarizer-limit",
+    })
+    await drain({ compile: summarizerLimitCompile, now: () => new Date(T0 + 8 * 24 * 3_600_000) })
+    expect(compileCalls).toHaveLength(0)
+    expect(listJobs(home)).toHaveLength(0)
+    expect(home.list("queue/bad")).toHaveLength(1)
+    expect(drainLog()).toContain('"reason":"older-than-7d"')
+  })
+
+  it("a 30-hour-old job with no waiting reason still drops with older-than-24h", async () => {
+    const { home, job, drain, drainLog } = setup()
+    job()
+    await drain({ now: () => new Date(T0 + 30 * 3_600_000) })
+    expect(listJobs(home)).toHaveLength(0)
+    expect(home.list("queue/bad")).toHaveLength(1)
+    expect(drainLog()).toContain('"reason":"older-than-24h"')
+    expect(drainLog()).not.toContain("older-than-7d")
   })
 })
