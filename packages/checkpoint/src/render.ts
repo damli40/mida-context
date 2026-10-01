@@ -101,8 +101,13 @@ export function defuse(text: string): string {
       const trimmedStart = line.trimStart()
       // UF-J: a forged count or cut line carries the renderer's own "- " prefix — quote a line
       // that opens with an optional dash before "(N earlier …" or "(Mida cut this reply"
+      // UF-K: and "stated by you:" the same way — the header tells the agent those lines are the
+      // user's own words, so a checkpoint must never start one. The renderer's own fact lines
+      // are built after their text is defused and are never passed through here as whole lines.
       const forgedLine =
-        /^(-\s*)?\(\d+ earlier /.test(trimmedStart) || /^(-\s*)?\(Mida cut this reply/.test(trimmedStart)
+        /^(-\s*)?\(\d+ earlier /.test(trimmedStart) ||
+        /^(-\s*)?\(Mida cut this reply/.test(trimmedStart) ||
+        /^(-\s*)?stated by you:/.test(trimmedStart)
       return OWN_HEADINGS.some((h) => trimmedStart.startsWith(h)) || forgedLine ? `> ${line}` : line
     })
     .join("\n")
@@ -385,31 +390,45 @@ export function renderHandoffReport(
     return { trim, text: out }
   }
 
+  // The preamble note an over-target text carries: it names exactly what the trim left out —
+  // history first, then the reasons when the reasons-off candidate took them (UF-I, UF-K).
+  const oversizeNote = (t: Trim, reasonsOff: boolean): string => {
+    const leftOut: string[] = []
+    if (t.progress > 0) leftOut.push(`${t.progress} earlier progress ${t.progress === 1 ? "entry" : "entries"}`)
+    if (t.savedBy > 0) leftOut.push(`${t.savedBy} earlier ${t.savedBy === 1 ? "save" : "saves"}`)
+    if (t.artifacts > 0) leftOut.push(`${t.artifacts} earlier ${t.artifacts === 1 ? "artifact" : "artifacts"}`)
+    if (reasonsOff && merged.decisions.length > 0) leftOut.push("the reasons behind decisions")
+    if (reasonsOff && merged.rejected.length > 0) leftOut.push("the reasons behind rejected approaches")
+    return `${OVERSIZE_NOTE_LEAD} No constraint, decision or rejected approach was left out to shorten it.${leftOut.length > 0 ? ` Left out: ${leftOut.join(", ")}.` : " Nothing was left out."}`
+  }
+  // A complete candidate is the fitted text plus the note it must carry when still over.
+  const finalText = (t: Trim, reasonsOff: boolean, text: string): string =>
+    text.length > maxChars ? build(t, reasonsOff, oversizeNote(t, reasonsOff)) : text
+
   let { trim, text: out } = fitOnce(false)
-  // Still over with history trimmed: the reasons behind decisions and rejected approaches go next
-  // — every entry stays, only the "because" / "why" go — but only when that actually shortens
-  // the text. The two longer headings can outweigh one short reason, and a longer output with
-  // fewer facts is a strict loss: keep the reasons and the plain headings instead (UF-J). With
+  // Still over with history trimmed: compare the COMPLETE texts (UF-K). Dropping the reasons
+  // behind decisions and rejected approaches keeps every entry but lengthens the two headings
+  // AND the note (it gains "the reasons behind …"), which together can outweigh the reasons it
+  // saves — the old check compared the texts before the note and so could deliver a longer text
+  // with fewer facts. Reasons off is taken only when the final text is strictly shorter;
+  // otherwise the reasons, the plain headings and reasonsLeftOut: false stay (UF-J, UF-K). With
   // no reasons to drop the text cannot change, so the step is skipped.
   let reasonsLeftOut = false
-  if (out.length > maxChars && (merged.decisions.length > 0 || merged.rejected.length > 0)) {
-    const tried = fitOnce(true)
-    if (tried.text.length < out.length) {
-      ;({ trim, text: out } = tried)
-      reasonsLeftOut = true
-    }
-  }
-  // Still over even then: deliver it whole — a rule is never dropped to shorten the handoff —
-  // with one preamble line that says exactly what was left out (or that nothing was).
   if (out.length > maxChars) {
-    const leftOut: string[] = []
-    if (trim.progress > 0) leftOut.push(`${trim.progress} earlier progress ${trim.progress === 1 ? "entry" : "entries"}`)
-    if (trim.savedBy > 0) leftOut.push(`${trim.savedBy} earlier ${trim.savedBy === 1 ? "save" : "saves"}`)
-    if (trim.artifacts > 0) leftOut.push(`${trim.artifacts} earlier ${trim.artifacts === 1 ? "artifact" : "artifacts"}`)
-    if (reasonsLeftOut && merged.decisions.length > 0) leftOut.push("the reasons behind decisions")
-    if (reasonsLeftOut && merged.rejected.length > 0) leftOut.push("the reasons behind rejected approaches")
-    const note = `${OVERSIZE_NOTE_LEAD} No constraint, decision or rejected approach was left out to shorten it.${leftOut.length > 0 ? ` Left out: ${leftOut.join(", ")}.` : " Nothing was left out."}`
-    out = build(trim, reasonsLeftOut, note)
+    const withReasons = finalText(trim, false, out)
+    if (merged.decisions.length > 0 || merged.rejected.length > 0) {
+      const tried = fitOnce(true)
+      const withoutReasons = finalText(tried.trim, true, tried.text)
+      if (withoutReasons.length < withReasons.length) {
+        trim = tried.trim
+        out = withoutReasons
+        reasonsLeftOut = true
+      } else {
+        out = withReasons
+      }
+    } else {
+      out = withReasons
+    }
   }
   const dropped = TRIM_ORDER.reduce((sum, key) => sum + trim[key], 0)
   return { text: out, chars: out.length, limitChars: maxChars, cut: dropped > 0, oversized: out.length > maxChars, reasonsLeftOut }
