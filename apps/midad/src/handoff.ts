@@ -5,7 +5,7 @@ import { isReadDeadlineError } from "@mida/chain"
 import { compareChainOrder, defuse, handoffHeader, mergeCheckpoints, otherTasksBlock, otherTasksFor, renderHandoffReport, taskOf } from "@mida/checkpoint"
 import type { MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
 import { chainRefusalReason } from "./chain-busy.js"
-import { CHAIN_REFUSAL_TEXT, HANDOFF_TAIL } from "./hook-output.js"
+import { CHAIN_REFUSAL_TEXT, HANDOFF_BEGIN, HANDOFF_TAIL } from "./hook-output.js"
 import { CODING_CLIENTS } from "./install.js"
 import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { movedOnSuffix } from "./migration-envelope.js"
@@ -118,8 +118,7 @@ export const PARTIAL_LINE = "Some saved context could not be loaded yet; what fo
  * marker sits directly above that record's own content.
  */
 export const PENDING_ANCHOR_LINE = "PENDING_ANCHOR: not yet anchored on Monad; may still be rejected"
-const HANDOFF_BEGIN = "=== BEGIN MIDA HANDOFF DATA ==="
-// the closing fence is defined on the hook-output leaf so the MCP adapter's cap can reach it
+// both fence lines are defined on the hook-output leaf so the MCP adapter's cap can reach them
 // without importing this module (mcp.test.ts walks that graph)
 export { HANDOFF_TAIL }
 

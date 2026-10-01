@@ -16,6 +16,9 @@ const MAX_SYSTEM_MESSAGE = 160
  */
 export const HANDOFF_TAIL = "=== END MIDA HANDOFF DATA ==="
 
+/** The opening fence — same leaf, same reason: the cap's before-BEGIN scan needs it here. */
+export const HANDOFF_BEGIN = "=== BEGIN MIDA HANDOFF DATA ==="
+
 /** Anything shaped like a raw id or key never reaches the owner's line. */
 const LONG_HEX = /0x[0-9a-f]{40,}|[0-9a-f]{40,}/gi
 

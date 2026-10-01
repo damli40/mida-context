@@ -5,7 +5,7 @@ import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } fr
 import { callDaemon, socketPathFor } from "./control.js"
 import type { ControlReply } from "./control.js"
 import type { MidaHome } from "./home.js"
-import { CHAIN_REFUSAL_TEXT, HANDOFF_TAIL, degradedMessage } from "./hook-output.js"
+import { CHAIN_REFUSAL_TEXT, HANDOFF_BEGIN, HANDOFF_TAIL, degradedMessage } from "./hook-output.js"
 import type { SessionStartBody } from "./hook-output.js"
 import { appendLog } from "./log.js"
 import { HOOK_CLIENTS, MCP_CLIENT_TOOLS } from "./mcp-clients.js"
@@ -60,9 +60,22 @@ const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${text
  * text without the fence is cut the way capText cuts, at this same cap.
  */
 const HANDOFF_TEXT_CAP = 40_000
+/** The renderer's over-target preamble sentence — false once this cap drops entries near the end. */
+const NO_RULE_LEFT_OUT = "No constraint, decision or rejected approach was left out to shorten it."
 const capHandoffText = (text: string): string => {
   if (text.length <= HANDOFF_TEXT_CAP) return text
   if (!text.includes(HANDOFF_TAIL)) return `${text.slice(0, HANDOFF_TEXT_CAP - 1)}…`
+  // UF-J: the cut will drop entries near the end — possibly rules — so the preamble's "nothing
+  // left out" claim is swapped for the truth. Searched only BEFORE the BEGIN line: the same words
+  // inside saved text are the save's own and stay. indexOf + slice, never String.replace: saved
+  // text can hold `$&`. Done before measuring the keep length, so the reply still fits the cap.
+  const beginAt = text.indexOf(HANDOFF_BEGIN)
+  if (beginAt !== -1) {
+    const claimAt = text.indexOf(NO_RULE_LEFT_OUT)
+    if (claimAt !== -1 && claimAt < beginAt) {
+      text = `${text.slice(0, claimAt)}This reply was cut at ${HANDOFF_TEXT_CAP.toLocaleString("en-US")} characters, so entries near the end are missing.${text.slice(claimAt + NO_RULE_LEFT_OUT.length)}`
+    }
+  }
   const tail = `…\n(Mida cut this reply at ${HANDOFF_TEXT_CAP.toLocaleString("en-US")} characters. Text after this point is missing.)\n\n${HANDOFF_TAIL}`
   return `${text.slice(0, HANDOFF_TEXT_CAP - tail.length)}${tail}`
 }

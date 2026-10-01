@@ -1443,6 +1443,68 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
+  // UF-J: a cut reply can no longer claim "no rule was left out" — the sentence is swapped for
+  // the truth before the keep-length is measured, so the reply still fits the cap
+  const NO_RULE_LEFT_OUT = "No constraint, decision or rejected approach was left out to shorten it."
+  const CUT_TRUTH = "This reply was cut at 40,000 characters, so entries near the end are missing."
+  const CUT_LINE = "(Mida cut this reply at 40,000 characters. Text after this point is missing.)"
+
+  it("a cut handoff whose preamble claims no rule was left out says the reply was cut instead (UF-J)", async () => {
+    const dir = home()
+    const big = `Mida note: this handoff is longer than its size target. ${NO_RULE_LEFT_OUT}\n=== BEGIN MIDA HANDOFF DATA ===\n\n${"x".repeat(41_000)}\n\n=== END MIDA HANDOFF DATA ===`
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_handoff")
+        expect(text.length).toBeLessThanOrEqual(40_000)
+        expect(text).not.toContain(NO_RULE_LEFT_OUT)
+        expect(text).toContain(CUT_TRUTH)
+        expect(text.endsWith(`…\n${CUT_LINE}\n\n=== END MIDA HANDOFF DATA ===`)).toBe(true)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("the same words AFTER the BEGIN line are saved text and are left alone (UF-J)", async () => {
+    const dir = home()
+    const big = `header\n=== BEGIN MIDA HANDOFF DATA ===\n\nsaved text says: ${NO_RULE_LEFT_OUT}\n${"x".repeat(41_000)}\n\n=== END MIDA HANDOFF DATA ===`
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_handoff")
+        expect(text.length).toBeLessThanOrEqual(40_000)
+        // the sentence survives inside the kept prefix — no swap happened
+        expect(text).toContain(NO_RULE_LEFT_OUT)
+        expect(text).not.toContain("entries near the end are missing")
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("a 12,000-char handoff carrying the sentence comes back unchanged (UF-J)", async () => {
+    const dir = home()
+    const big = `Mida note: this handoff is longer than its size target. ${NO_RULE_LEFT_OUT}\n=== BEGIN MIDA HANDOFF DATA ===\n\n${"x".repeat(12_000)}\n\n=== END MIDA HANDOFF DATA ===`
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_handoff")).toBe(big)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
   it("mida_read, mida_status and mida_whats_new are still cut at 8,000 (UF-I)", async () => {
     const dir = home()
     // enough registered agents that the status reply alone is over 8,000 chars
