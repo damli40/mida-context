@@ -40,12 +40,35 @@ describe("the local deploy lock", () => {
     await expect(takeDirLock(lock, { waitMs: 400, staleMs: 5 * 60_000 })).rejects.toThrow(/deploy lock .* held/)
   })
 
-  it("never takes a lock whose owner is still running, however old the directory is", async () => {
+  // UF-J: a killed run's leftover can name a pid since recycled by an unrelated live process —
+  // pid alive is no longer proof of a live holder. Past maxHoldMs the directory is left behind
+  // whatever `owner` says; a real deploy holds the lock for seconds, never half an hour.
+  it("takes over a lock older than maxHoldMs even when its owner pid is still running", async () => {
+    const lock = lockIn()
+    mkdirSync(lock)
+    writeFileSync(join(lock, "owner"), String(process.pid)) // this process really is running
+    const thirtyOneMinutesAgo = new Date(Date.now() - 31 * 60_000)
+    utimesSync(lock, thirtyOneMinutesAgo, thirtyOneMinutesAgo)
+    await takeDirLock(lock, { waitMs: 1_000, staleMs: 5 * 60_000, maxHoldMs: 30 * 60_000 })
+    expect(existsSync(lock)).toBe(true) // held by this caller now
+    expect(readFileSync(join(lock, "owner"), "utf8")).toBe(String(process.pid))
+  })
+
+  it("still waits out a live owner while the lock is younger than maxHoldMs", async () => {
     const lock = lockIn()
     mkdirSync(lock)
     writeFileSync(join(lock, "owner"), String(process.pid))
     const tenMinutesAgo = new Date(Date.now() - 10 * 60_000)
     utimesSync(lock, tenMinutesAgo, tenMinutesAgo)
+    await expect(takeDirLock(lock, { waitMs: 400, staleMs: 5 * 60_000, maxHoldMs: 30 * 60_000 })).rejects.toThrow(/deploy lock .* held/)
+  })
+
+  it("never takes a lock whose owner is still running, however old the directory is, when no maxHoldMs is given", async () => {
+    const lock = lockIn()
+    mkdirSync(lock)
+    writeFileSync(join(lock, "owner"), String(process.pid))
+    const fortyMinutesAgo = new Date(Date.now() - 40 * 60_000)
+    utimesSync(lock, fortyMinutesAgo, fortyMinutesAgo)
     await expect(takeDirLock(lock, { waitMs: 400, staleMs: 5 * 60_000 })).rejects.toThrow(/deploy lock .* held/)
   })
 
@@ -73,9 +96,17 @@ describe("the local deploy lock", () => {
     }
   })
 
-  it("eight waiters never hold the lock at once", async () => {
+  // UF-J: the workers used to race whenever each one's spawn happened to land; with staggered
+  // starts the `.steal` mutex could be removed and the test still passed. Every worker now waits
+  // for one shared instant ~400 ms out before calling takeDirLock, so all twelve hit the leftover
+  // lock together — removing the mutex really does let two holders overlap.
+  it("twelve waiters starting at one instant never hold the lock at once", async () => {
     const worker = fileURLToPath(new URL("./fixtures/lock-worker.ts", import.meta.url))
-    for (let round = 0; round < 5; round++) {
+    // failures collect per round instead of aborting at the first one: when this test is run
+    // against a mutex-less takeDirLock as a check of itself, the message names every round
+    // that let two holders overlap.
+    const failures: number[] = []
+    for (let round = 0; round < 10; round++) {
       const dir = mkdtempSync(join(tmpdir(), "mida-deploy-lock-race-"))
       const lock = join(dir, ".deploy-lock")
       const logPath = join(dir, "log")
@@ -83,34 +114,41 @@ describe("the local deploy lock", () => {
       const tenMinutesAgo = new Date(Date.now() - 10 * 60_000)
       utimesSync(lock, tenMinutesAgo, tenMinutesAgo)
 
-      const children = Array.from({ length: 8 }, () => spawn(process.execPath, ["--import", "tsx", worker, lock, logPath]))
-      await Promise.all(
-        children.map(
-          (child) =>
-            new Promise<void>((resolve, reject) => {
-              child.once("error", reject)
-              child.once("exit", (code) =>
-                code === 0 ? resolve() : reject(new Error(`lock worker exited with code ${code}`)),
-              )
-            }),
-        ),
+      const startAt = Date.now() + 400 // shared instant: every worker waits for it, then strikes
+      const children = Array.from({ length: 12 }, () =>
+        spawn(process.execPath, ["--import", "tsx", worker, lock, logPath, String(startAt)]),
       )
+      try {
+        await Promise.all(
+          children.map(
+            (child) =>
+              new Promise<void>((resolve, reject) => {
+                child.once("error", reject)
+                child.once("exit", (code) =>
+                  code === 0 ? resolve() : reject(new Error(`lock worker exited with code ${code}`)),
+                )
+              }),
+          ),
+        )
 
-      const lines = readFileSync(logPath, "utf8").trim().split("\n")
-      expect(lines).toHaveLength(16)
-      let holder: string | undefined
-      for (const line of lines) {
-        const [kind, pid] = line.split(" ")
-        if (kind === "start") {
-          expect(holder).toBeUndefined() // a start between another pid's start and end means two holders
-          holder = pid
-        } else {
-          expect(kind).toBe("end")
-          expect(pid).toBe(holder)
-          holder = undefined
+        const lines = readFileSync(logPath, "utf8").trim().split("\n")
+        if (lines.length !== 24) throw new Error(`${lines.length} log lines, expected 24`)
+        let holder: string | undefined
+        for (const line of lines) {
+          const [kind, pid] = line.split(" ")
+          if (kind === "start") {
+            if (holder !== undefined) throw new Error(`${pid} started while ${holder} held the lock`)
+            holder = pid
+          } else {
+            if (kind !== "end" || pid !== holder) throw new Error(`out-of-order line "${line}"`)
+            holder = undefined
+          }
         }
+        if (holder !== undefined) throw new Error(`${holder} never ended`)
+      } catch {
+        failures.push(round)
       }
-      expect(holder).toBeUndefined()
     }
+    expect(failures).toEqual([])
   })
 })
