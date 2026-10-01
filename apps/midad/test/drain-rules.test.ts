@@ -368,6 +368,19 @@ describe("a failed save does not buy a new model call", () => {
     expect(listJobs(home)).toHaveLength(0)
   })
 
+  it("a busy session's first save does not wait for a flush: the gap runs from its FIRST event (CAP-28)", async () => {
+    const { home, job, drain, saveCalls } = setup()
+    // an event every 5 s and a drain after each — every pass merges the session's jobs and keeps
+    // only the newest, which used to move the first-save gap's starting point forward each time
+    for (let i = 0; i <= 2; i += 1) {
+      job({ event: "PostToolUse" }, T0 + i * 5_000)
+      await drain({ now: () => new Date(T0 + i * 5_000 + 1_000) })
+    }
+    // 11 s after the first event: the 10 s first-save gap has passed, no Stop needed
+    expect(saveCalls).toHaveLength(1)
+    expect(listJobs(home)).toHaveLength(0)
+  })
+
   it("eight failed attempts give up: the job goes to queue/bad with gave-up", async () => {
     const { home, job, drain, compileCalls, saveCalls, flags, drainLog } = setup()
     job({ event: "Stop" }, T0)

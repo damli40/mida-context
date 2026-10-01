@@ -25,7 +25,7 @@ import { appendLog } from "./log.js"
 import { resolveNetwork } from "./network.js"
 import { checkProject as checkProjectAgainstList } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
-import { findProjectMarker, isSafeName, listJobs, moveToBad, removeJob } from "./queue.js"
+import { findProjectMarker, firstQueuedAt, isSafeName, listJobs, moveToBad, removeJob, stampFirstAt } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
 import { resolveSessionTask, taskOrUndefined } from "./task.js"
 import type { ServiceRuntime } from "./runtime.js"
@@ -307,7 +307,11 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
   try {
     for (const [sessionId, group] of bySession) {
       const job = group[group.length - 1]! // listJobs is oldest-first, so the last is newest
+      // CAP-28: the session's first queue time survives the merge, so the first-save gap runs from
+      // its first event — not from whichever job a previous pass happened to keep
+      const firstAt = firstQueuedAt(group)
       for (const older of group.slice(0, -1)) removeJob(deps.home, older.id)
+      stampFirstAt(deps.home, job, firstAt)
       const flush = group.some((j) => FLUSH_EVENTS.has(j.event))
       try {
         if (now().getTime() - Date.parse(job.at) > DAY_MS) {
@@ -403,12 +407,12 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             continue // the job stays queued: the retry fires once the backoff has passed
           }
         }
-        // No saved state yet: the gap runs from the session's OLDEST queued job. The FIRST save
+        // No saved state yet: the gap runs from the session's FIRST queued job (CAP-28). The FIRST save
         // owes only the short first gap — a session killed in its first minute still leaves a
         // checkpoint; every later save keeps the full gap. A session inside a retry backoff never
         // reaches this line — the backoff check above already holds it.
         const first = state?.savedAt === undefined
-        const gapRef = Date.parse(state?.savedAt ?? group[0]!.at)
+        const gapRef = Date.parse(state?.savedAt ?? firstAt)
         const gapMs = first ? firstGapMs : minGapMs
         if (!flush && now().getTime() - gapRef < gapMs) {
           counts.skippedTooSoon += 1
@@ -981,7 +985,7 @@ export function sessionWaits(home: MidaHome, jobs: CaptureJob[]): SessionWait[] 
       waits.push({ sessionId, agent: job.agent, dueAtMs: 0, reason })
       continue
     }
-    const gapRef = Date.parse(state?.savedAt ?? group[0]!.at)
+    const gapRef = Date.parse(state?.savedAt ?? firstQueuedAt(group))
     waits.push({ sessionId, agent: job.agent, dueAtMs: gapRef + (state?.savedAt === undefined ? DEFAULT_FIRST_GAP_MS : DEFAULT_MIN_GAP_MS), reason })
   }
   return waits
