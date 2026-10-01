@@ -1,4 +1,5 @@
-import type { Checkpoint } from "./schema.js"
+import { limitNote, splitLimitNote } from "./schema.js"
+import type { Checkpoint, LimitList } from "./schema.js"
 
 /**
  * Where a migrated record came from — sealed inside the encrypted payload by `mida migrate`,
@@ -396,13 +397,29 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
     undefined,
   )
 
+  // UF-L: the trim note rides in unresolvedIssue but belongs to every save the merge covered —
+  // the merge's field used to come from the newest save alone, so a continuation's quiet save
+  // washed the note away while the lists it named still sat at the cap. The merged field is the
+  // chosen issue text joined to a note naming the UNION of every in-scope save's named lists.
+  const mergedIssue = mergedField(cps, "unresolvedIssue", null)
+  const notedLists = new Set<LimitList>()
+  for (const c of cps) for (const list of splitLimitNote(c.unresolvedIssue).lists) notedLists.add(list)
+  const unionNote = limitNote(notedLists)
+  const unresolvedIssue =
+    unionNote === null
+      ? mergedIssue
+      : (() => {
+          const text = splitLimitNote(mergedIssue).text
+          return text === "" ? unionNote : `${text} | ${unionNote}`
+        })()
+
   return {
     headSessionId: chosen.newest.sessionId,
     savedAt: savedAt === undefined ? null : new Date(savedAt).toISOString(),
     originalRequest: cps.find((c) => c.originalRequest !== null)?.originalRequest ?? null,
     objective: mergedField(cps, "objective", ""),
     remainingPlan: mergedField(cps, "remainingPlan", []),
-    unresolvedIssue: mergedField(cps, "unresolvedIssue", null),
+    unresolvedIssue,
     nextAction: mergedField(cps, "nextAction", ""),
     decisions: mergedList("decisions"),
     rejected: mergedList("rejected"),

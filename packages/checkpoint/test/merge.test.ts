@@ -70,6 +70,49 @@ describe("mergeCheckpoints", () => {
     expect(m.unresolvedIssue).toBe("flaky test")
   })
 
+  // UF-L: the 50-entry note lives in unresolvedIssue, and the merge used to take that field from
+  // the newest save only — session A lost 3 decisions, agent B continued and saved once, and the
+  // handoff said "Unresolved issue: none" while its decision list still held A's 50. The merged
+  // field now carries the UNION of every in-scope save's named lists.
+  const LIMIT_NOTE_DECISIONS = "(Mida: a list holds at most 50 entries. Older decisions were left out.)"
+  it("the trim note survives a later save with no issue — the merge keeps the union of every save's note (UF-L)", () => {
+    const m = mergeCheckpoints([
+      stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", objective: "build X", nextAction: "step 1", progress: ["p1"],
+        decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+        unresolvedIssue: LIMIT_NOTE_DECISIONS }),
+      stored({ sessionId: "B", continuesSession: "A", at: "2026-09-21T11:00:00Z", objective: "build X", nextAction: "step 2", progress: ["p2"], unresolvedIssue: null }),
+    ])!
+    expect(m.unresolvedIssue).toBe(LIMIT_NOTE_DECISIONS)
+    expect(m.decisions).toHaveLength(50)
+  })
+
+  it("the trim note joins behind a later save's own issue text (UF-L)", () => {
+    const m = mergeCheckpoints([
+      stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", objective: "build X", nextAction: "step 1", progress: ["p1"], unresolvedIssue: LIMIT_NOTE_DECISIONS }),
+      stored({ sessionId: "B", continuesSession: "A", at: "2026-09-21T11:00:00Z", objective: "build X", nextAction: "step 2", progress: ["p2"], unresolvedIssue: "still failing on CI" }),
+    ])!
+    expect(m.unresolvedIssue).toBe(`still failing on CI | ${LIMIT_NOTE_DECISIONS}`)
+  })
+
+  it("two saves naming different lists give one note naming both, in the fixed order (UF-L)", () => {
+    const m = mergeCheckpoints([
+      stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", objective: "build X", nextAction: "step 1", progress: ["p1"], unresolvedIssue: LIMIT_NOTE_DECISIONS }),
+      stored({ sessionId: "B", continuesSession: "A", at: "2026-09-21T11:00:00Z", objective: "build X", nextAction: "step 2", progress: ["p2"],
+        unresolvedIssue: "ops is stuck | (Mida: a list holds at most 50 entries. Older constraints were left out.)" }),
+    ])!
+    expect(m.unresolvedIssue).toBe(
+      "ops is stuck | (Mida: a list holds at most 50 entries. Older constraints and decisions were left out.)",
+    )
+  })
+
+  it("no save carrying a note leaves the merged issue exactly as before (UF-L)", () => {
+    const m = mergeCheckpoints([
+      stored({ sessionId: "A", at: "2026-09-21T10:00:00Z", objective: "build X", nextAction: "step 1", progress: ["p1"], unresolvedIssue: "flaky test" }),
+      stored({ sessionId: "B", continuesSession: "A", at: "2026-09-21T11:00:00Z", objective: "build X", nextAction: "step 2", progress: ["p2"], unresolvedIssue: "still failing on CI" }),
+    ])!
+    expect(m.unresolvedIssue).toBe("still failing on CI")
+  })
+
   it("sorts by createdAt, not by input order", () => {
     const m = mergeCheckpoints([
       stored({ at: "2026-09-21T10:05:00Z", nextAction: "later" }),

@@ -91,6 +91,47 @@ describe("checkpoint payload", () => {
     expect(back).not.toBeNull()
     expect(back!.checkpoint.unresolvedIssue).toBe(stored)
   })
+  // UF-L: the review's exact case — an unresolvedIssue holding an old "(Mida: …)" note followed
+  // by long free text. The old joinIssueNote treated everything after the first " | (Mida:" as
+  // notes, so the trailing text inflated the note tail past the string cap and the final
+  // re-validation threw: the save was LOST after three compiles. Now every "(Mida: …)" segment is
+  // kept whole and the free text takes the cut alone.
+  it("an issue holding an old note followed by long text wraps without throwing and keeps every note whole (UF-L)", () => {
+    const oldNote = "(Mida: a list holds at most 50 entries. Left out: the 2 oldest decisions.)"
+    const fat = sampleCheckpoint({
+      constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i} ${"c".repeat(1200)}`),
+      unresolvedIssue: `x | ${oldNote} ${"i".repeat(1900)}`,
+      progress: ["p".repeat(2000), "q".repeat(2000)],
+    })
+    const e = wrap(fat) // must not throw — the old code's re-validation killed this save
+    expect(Buffer.byteLength(JSON.stringify(e))).toBeLessThanOrEqual(MAX_VALUE_BYTES)
+    const stored = e.checkpoint.unresolvedIssue!
+    expect(stored.length).toBeLessThanOrEqual(2000)
+    // every "(Mida:" segment in the field is a WHOLE note — none is sliced open by a cut
+    const segments = stored.match(/\(Mida:[^)]*\)?/g) ?? []
+    expect(segments.length).toBeGreaterThan(0)
+    for (const s of segments) expect(s.endsWith(")"), s).toBe(true)
+    expect(stored).toContain(oldNote)
+    const back = unwrapCheckpoint(JSON.parse(JSON.stringify(e)))
+    expect(back).not.toBeNull()
+    expect(back!.checkpoint.unresolvedIssue).toBe(stored)
+  })
+  it("an issue of 1,000 chars plus the limit note keeps the note whole when the 300-char cut lands (UF-L)", () => {
+    const limitNote = "(Mida: a list holds at most 50 entries. Older decisions were left out.)"
+    const fat = sampleCheckpoint({
+      objective: "fit",
+      originalRequest: "r".repeat(6000),
+      remainingPlan: Array.from({ length: 27 }, () => "p".repeat(2000)),
+      nextAction: "n".repeat(1500),
+      constraints: ["c".repeat(2000), "d".repeat(1500)],
+      unresolvedIssue: `${"i".repeat(1000)} | ${limitNote}`,
+    })
+    const e = wrap(fat)
+    const stored = e.checkpoint.unresolvedIssue!
+    expect(stored.length).toBeLessThanOrEqual(2000)
+    expect(stored.endsWith(` | ${limitNote}`)).toBe(true)  // the note survives the text cut
+    expect(stored.startsWith(`${"i".repeat(300)}…`)).toBe(true) // and the text is what got cut
+  })
   it("when constraints already holds 50 real entries, the note lands on unresolvedIssue and no constraint is deleted", () => {
     const fat = sampleCheckpoint({
       constraints: Array.from({ length: 50 }, (_, i) => `constraint-${i}`),

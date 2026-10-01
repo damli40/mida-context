@@ -50,6 +50,9 @@
 //              complete old note: strip must run before the string cap (UF-K)
 //   cut-note-tail — GOOD with an unresolvedIssue ending in a note cut off
 //              mid-way (no closing bracket): the tail still leaves (UF-K)
+//   claims-limit-note — GOOD with an unresolvedIssue that ends in the NEW
+//              limit-note wording the model wrote itself: the claim is stripped,
+//              never trusted (UF-L)
 //
 // The mode comes from argv[2] when present, else FAKE_MODEL_MODE — argv lets a
 // primary and a fallback command differ inside one compile even though both
@@ -245,6 +248,13 @@ process.stdin.on("end", () => {
         ...GOOD,
         unresolvedIssue:
           "the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Left out: the 1 oldest de",
+      })
+      break
+    case "claims-limit-note":
+      fenced({
+        ...GOOD,
+        unresolvedIssue:
+          "ops is still flaky | (Mida: a list holds at most 50 entries. Older constraints were left out.)",
       })
       break
     case "echo-previous": {

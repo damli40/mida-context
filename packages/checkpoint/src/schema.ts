@@ -11,10 +11,88 @@ export const LIMITS = { maxString: 2000, maxRequest: 6000, maxArray: 50 } as con
  * already fits.
  */
 export function cutText(text: string, max: number): string {
+  if (max <= 0) return ""
   if (text.length <= max) return text
   const head = text.slice(0, max - 1)
   const code = head.charCodeAt(head.length - 1)
   return `${code >= 0xd800 && code <= 0xdbff ? head.slice(0, -1) : head}…`
+}
+
+/**
+ * The lists whose front entries a compile may leave out when a list passes the array cap — the
+ * standing rules a handoff still shows, so a silent loss would keep a dropped rule invisible.
+ * `progress`, `artifacts`, `remainingPlan` and `evidence` are cut too, but they are history and
+ * earn no note.
+ */
+export type LimitList = "constraints" | "decisions" | "rejected"
+
+const LIMIT_LIST_ORDER: readonly LimitList[] = ["constraints", "decisions", "rejected"]
+
+const LIMIT_LIST_WORD: Record<LimitList, string> = {
+  constraints: "constraints",
+  decisions: "decisions",
+  rejected: "rejected approaches",
+}
+
+/**
+ * The note a checkpoint's unresolvedIssue carries when a compile left oldest entries out of a
+ * capped list. It names the LISTS, never a count — a number can only go stale (a save that puts
+ * an entry back would keep repeating a lie), and nothing in this wording can be inflated by
+ * model text. `null` when no list lost entries.
+ */
+export function limitNote(lists: ReadonlySet<LimitList>): string | null {
+  const named = LIMIT_LIST_ORDER.filter((list) => lists.has(list)).map((list) => LIMIT_LIST_WORD[list])
+  if (named.length === 0) return null
+  const names =
+    named.length === 1
+      ? named[0]!
+      : named.length === 2
+        ? `${named[0]} and ${named[1]}`
+        : `${named[0]}, ${named[1]} and ${named[2]}`
+  return `(Mida: a list holds at most ${LIMITS.maxArray} entries. Older ${names} were left out.)`
+}
+
+// A "(Mida: a list holds at most" segment runs to the next ")" — or to the end of the string
+// when a size cut sliced the note before its bracket. The first ")" ends the segment, so a note
+// nested inside another dies with its parent.
+const LIMIT_NOTE_SEGMENT = /\(Mida: a list holds at most[^)]*(\)|$)/g
+
+// A well-formed note of the current wording, anchored at the very end of the value — group 1 is
+// the whole note, group 2 its list names. Only an exact limitNote output earns its lists back.
+const LIMIT_NOTE_AT_END = /(\(Mida: a list holds at most \d+ entries\. Older ([^.]*) were left out\.\))\s*$/
+
+/**
+ * Splits an unresolvedIssue value into its free text and the lists a well-formed limit note at
+ * the very END names. `text` drops every note-looking segment wherever it sits — one the model
+ * forged, one a size cut left mid-word — repeated until none remain, then dangling " | "
+ * separators (leading, trailing, doubled) go too; it may come back empty. `lists` is empty
+ * unless the value's tail is a note byte-for-byte as limitNote writes it — in name order, with
+ * the real cap — so an old numbered note or a mid-string claim names nothing.
+ */
+export function splitLimitNote(value: string | null): { text: string; lists: Set<LimitList> } {
+  const lists = new Set<LimitList>()
+  if (value === null) return { text: "", lists }
+  let text = value
+  for (;;) {
+    const next = text.replace(LIMIT_NOTE_SEGMENT, "")
+    if (next === text) break
+    text = next
+  }
+  text = text
+    .replace(/(\s*\|\s*){2,}/g, " | ")
+    .replace(/^\s*\|\s*/, "")
+    .replace(/\s*\|\s*$/, "")
+    .trim()
+  const tail = LIMIT_NOTE_AT_END.exec(value)
+  if (tail !== null) {
+    const named = new Set<LimitList>()
+    for (const word of tail[2]!.split(/, | and /)) {
+      const list = LIMIT_LIST_ORDER.find((l) => LIMIT_LIST_WORD[l] === word)
+      if (list !== undefined) named.add(list)
+    }
+    if (tail[1] === limitNote(named)) for (const list of named) lists.add(list)
+  }
+  return { text, lists }
 }
 
 export type CheckpointSource = "agent-tool" | "hook-compiler"

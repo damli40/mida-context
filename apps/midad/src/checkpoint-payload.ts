@@ -88,21 +88,43 @@ function checkedMigration(migration: unknown): MigrationEnvelope | undefined {
 }
 
 /**
- * Appends a "(Mida: …)" note to `unresolvedIssue` so every note in the field stays whole: when
- * the join would pass the string cap, the free text before the first " | (Mida:" is what
- * shortens — dropped, with its separator, when nothing of it would remain. (UF-K: a note pushed
- * the field past 2,000 chars and the stored save then failed validation on read — invisible.)
+ * An unresolvedIssue value read as "free text" joined to every "(Mida: …)" note it holds by
+ * " | " — each note segment runs to its ")" or, when a cut somewhere upstream sliced it open,
+ * to the end of the string.
  */
-function joinIssueNote(issue: string | null, note: string): string {
-  if (issue === null) return note
-  const joined = `${issue} | ${note}`
-  if (joined.length <= LIMITS.maxString) return joined
-  const first = issue.indexOf(" | (Mida:")
-  const notes = `${first === -1 ? "" : issue.slice(first)} | ${note}`
-  const head = first === -1 ? issue : issue.slice(0, first)
-  const room = LIMITS.maxString - notes.length
-  const kept = room <= 0 ? "" : cutText(head, room)
-  return kept === "" ? notes.slice(3) : `${kept}${notes}`
+const ISSUE_NOTE_SEGMENT = /\(Mida:[^)]*(\)|$)/g
+
+/**
+ * The ONE shape unresolvedIssue is ever stored in (UF-L): notes whole at the end, free text
+ * before them, and the text alone pays for size cuts — at most `textRoom` chars of it. The old
+ * code cut the field straight through at 300 chars, slicing a note open mid-word, and when a
+ * note was followed by more text it counted the TEXT toward the note tail until the join passed
+ * the string cap and re-validation threw — the save was lost after three compiles. When even
+ * the notes overflow the string cap the LAST ones are kept: the newest note is the truest.
+ */
+function issueKeepingNotes(value: string, textRoom: number): string {
+  const notes: string[] = []
+  const text = value
+    .replace(ISSUE_NOTE_SEGMENT, (segment) => {
+      notes.push(segment)
+      return ""
+    })
+    .replace(/(\s*\|\s*){2,}/g, " | ")
+    .replace(/^\s*\|\s*/, "")
+    .replace(/\s*\|\s*$/, "")
+    .trim()
+  let noteRoom = LIMITS.maxString
+  const kept: string[] = []
+  for (let i = notes.length - 1; i >= 0; i--) {
+    const cost = notes[i]!.length + (kept.length === 0 ? 0 : " | ".length)
+    if (notes[i]!.length > LIMITS.maxString || cost > noteRoom) break
+    kept.unshift(notes[i]!)
+    noteRoom -= cost
+  }
+  const tail = kept.join(" | ")
+  const room = Math.min(textRoom, LIMITS.maxString - tail.length - (tail === "" ? 0 : " | ".length))
+  const head = cutText(text, room)
+  return tail === "" ? head : head === "" ? tail : `${head} | ${tail}`
 }
 
 /**
@@ -179,7 +201,12 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
   if (bytes() > MAX_VALUE_BYTES) {
     checkpoint.agent = cut("agent", checkpoint.agent)
     checkpoint.constraints = checkpoint.constraints.map((c) => cut("constraints", c))
-    if (checkpoint.unresolvedIssue !== null) checkpoint.unresolvedIssue = cut("unresolvedIssue", checkpoint.unresolvedIssue)
+    // the issue's notes move to the tail WHOLE — the text pays the cut alone, never a note (UF-L)
+    if (checkpoint.unresolvedIssue !== null) {
+      const next = issueKeepingNotes(checkpoint.unresolvedIssue, CUT_TO + 1)
+      if (next.length < checkpoint.unresolvedIssue.length) trimmed.add("unresolvedIssue")
+      checkpoint.unresolvedIssue = next
+    }
   }
 
   if (dropped.size > 0 || trimmed.size > 0) {
@@ -191,7 +218,10 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
     if (checkpoint.constraints.length < LIMITS.maxArray) {
       checkpoint.constraints.push(note)
     } else {
-      checkpoint.unresolvedIssue = joinIssueNote(checkpoint.unresolvedIssue, note)
+      checkpoint.unresolvedIssue = issueKeepingNotes(
+        checkpoint.unresolvedIssue === null ? note : `${checkpoint.unresolvedIssue} | ${note}`,
+        LIMITS.maxString,
+      )
     }
     // the note costs bytes too — drop whatever else can go before giving up
     while (bytes() > MAX_VALUE_BYTES && dropOldest()) { /* keep shrinking */ }

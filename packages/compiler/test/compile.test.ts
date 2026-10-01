@@ -520,9 +520,11 @@ describe("compileCheckpoint", () => {
       expect(r.checkpoint.decisions[0]!.decision).toBe("d1")
       expect(r.checkpoint.decisions.at(-1)!.decision).toBe("d50")
       expect(r.trimmed).toContain("decisions")
-      // UF-J: the dropped oldest rule is no longer silent — the checkpoint itself says so
+      // UF-J: the dropped oldest rule is no longer silent — the checkpoint itself says so.
+      // UF-L: the note names the LIST, never a count — a number goes stale the moment a later
+      // save puts an entry back.
       expect(r.checkpoint.unresolvedIssue).toBe(
-        "(Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+        "(Mida: a list holds at most 50 entries. Older decisions were left out.)",
       )
     }
   })
@@ -540,9 +542,10 @@ describe("compileCheckpoint", () => {
     for (const list of ["progress", "decisions", "rejected", "constraints", "artifacts", "remainingPlan"]) {
       expect(r.trimmed, list).toContain(list)
     }
-    // UF-J: only the rule lists get a note — progress, artifacts, plan and evidence cuts add none
+    // UF-J: only the rule lists get a note — progress, artifacts, plan and evidence cuts add none.
+    // UF-L: the note names every list that lost oldest entries, in the fixed order, with no counts.
     expect(c.unresolvedIssue).toBe(
-      "(Mida: a list holds at most 50 entries. Left out: the 10 oldest constraints, the 10 oldest decisions, the 10 oldest rejected approaches.)",
+      "(Mida: a list holds at most 50 entries. Older constraints, decisions and rejected approaches were left out.)",
     )
   })
   // UF-J: a note the model carried forward from the previous checkpoint must not pile up or
@@ -564,33 +567,39 @@ describe("compileCheckpoint", () => {
     if (r.ok) {
       const issue = r.checkpoint.unresolvedIssue!
       expect(issue.length).toBeLessThanOrEqual(2000)
-      expect(issue.endsWith("… | (Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)")).toBe(true)
+      expect(issue.endsWith("… | (Mida: a list holds at most 50 entries. Older decisions were left out.)")).toBe(true)
     }
   })
-  // UF-K: the 50-entry note is cumulative over the session. Save 1 drops the 51st decision and
+  // UF-L: the 50-entry note is cumulative over the session. Save 1 drops the 51st decision and
   // writes the note; save 2 returns that checkpoint unchanged — the note must survive, not wash
-  // out to a silent "unresolvedIssue: none"; save 3 adds one decision and the count grows to 2.
-  it("the 50-entry note is cumulative over the session, never washed out by a quiet save (UF-K)", async () => {
+  // out to a silent "unresolvedIssue: none"; save 3 adds one decision and the note still names
+  // the same list — the note holds no count, so nothing about it can go stale.
+  it("the 50-entry note is cumulative over the session, never washed out by a quiet save (UF-K, UF-L)", async () => {
+    const note = "(Mida: a list holds at most 50 entries. Older decisions were left out.)"
     const first = await compileCheckpoint({ ...base, model: fake("wide") })
     expect(first.ok).toBe(true)
     if (!first.ok) return
-    expect(first.checkpoint.unresolvedIssue).toBe(
-      "(Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
-    )
+    expect(first.checkpoint.unresolvedIssue).toBe(note)
     const echo = await compileCheckpoint({ ...base, previous: first.checkpoint, model: fake("echo-previous") })
     expect(echo.ok).toBe(true)
     if (echo.ok) {
-      expect(echo.checkpoint.unresolvedIssue).toBe(
-        "(Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
-      )
+      expect(echo.checkpoint.unresolvedIssue).toBe(note)
     }
     const added = await compileCheckpoint({ ...base, previous: first.checkpoint, model: fake("add-decision") })
     expect(added.ok).toBe(true)
     if (added.ok) {
-      expect(added.checkpoint.unresolvedIssue).toBe(
-        "(Mida: a list holds at most 50 entries. Left out: the 2 oldest decisions.)",
-      )
+      expect(added.checkpoint.unresolvedIssue).toBe(note)
       expect(added.checkpoint.decisions.at(-1)!.decision).toBe("newest")
+    }
+  })
+  // UF-L: a note the MODEL wrote is a claim, not a fact — the lists it names are stripped with
+  // the note, never trusted, so a saved note cannot make a later compile say lists went missing
+  // that nothing cut.
+  it("a limit note the model itself wrote earns no note — the claim is stripped, not trusted (UF-L)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("claims-limit-note") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.unresolvedIssue).toBe("ops is still flaky")
     }
   })
   // UF-K: a note that rode in on the model's text is stripped BEFORE the string cap runs — when
@@ -619,7 +628,7 @@ describe("compileCheckpoint", () => {
       rejected: [],
       constraints: [],
       artifacts: [],
-      unresolvedIssue: "(Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+      unresolvedIssue: "(Mida: a list holds at most 50 entries. Older decisions were left out.)",
       nextAction: "add tests",
       remainingPlan: [],
       evidence: [],
@@ -629,7 +638,7 @@ describe("compileCheckpoint", () => {
     if (r.ok) {
       const issue = r.checkpoint.unresolvedIssue!
       expect(issue.length).toBeLessThanOrEqual(2000)
-      expect(issue.endsWith(" | (Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)")).toBe(true)
+      expect(issue.endsWith(" | (Mida: a list holds at most 50 entries. Older decisions were left out.)")).toBe(true)
       expect(issue.startsWith("i".repeat(10))).toBe(true)
     }
   })

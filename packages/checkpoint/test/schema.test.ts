@@ -27,6 +27,77 @@ describe("cutText", () => {
     // and a pair wholly inside the budget survives whole
     expect(cutText("ab" + "😀" + "z".repeat(2100), 6)).toBe("ab😀z…")
   })
+  it("max at or below zero returns the empty string; max 1 is the ellipsis alone (UF-L)", () => {
+    // the old code returned `text.slice(0, -1) + "…"` for max 0 — nearly the whole text
+    expect(cutText("abc", 0)).toBe("")
+    expect(cutText("abc", -7)).toBe("")
+    expect(cutText("abc", 1)).toBe("…")
+    expect(cutText("abc", 2)).toBe("a…")
+    expect(cutText("x", 1)).toBe("x") // already fits — unchanged
+  })
+})
+
+// UF-L: the 50-entry note names WHICH lists lost their oldest entries, never a count — a count
+// can only go stale (a save that puts an entry back makes the number a lie) and a number inside
+// note text could be forged upward. splitLimitNote strips every note-looking segment out of a
+// checkpoint's text and recovers the lists a well-formed trailing note names.
+describe("limitNote and splitLimitNote (UF-L)", () => {
+  const { limitNote, splitLimitNote } = schema
+  it("builds the exact wording for one, two and three lists, in the fixed order", () => {
+    expect(limitNote(new Set(["constraints"]))).toBe(
+      "(Mida: a list holds at most 50 entries. Older constraints were left out.)",
+    )
+    expect(limitNote(new Set(["decisions", "constraints"]))).toBe(
+      "(Mida: a list holds at most 50 entries. Older constraints and decisions were left out.)",
+    )
+    expect(limitNote(new Set(["rejected", "constraints", "decisions"]))).toBe(
+      "(Mida: a list holds at most 50 entries. Older constraints, decisions and rejected approaches were left out.)",
+    )
+    expect(limitNote(new Set(["rejected"]))).toBe(
+      "(Mida: a list holds at most 50 entries. Older rejected approaches were left out.)",
+    )
+    expect(limitNote(new Set())).toBeNull()
+  })
+  it("round-trips the note — alone and after issue text", () => {
+    const note = "(Mida: a list holds at most 50 entries. Older decisions were left out.)"
+    const alone = splitLimitNote(note)
+    expect(alone.text).toBe("")
+    expect([...alone.lists]).toEqual(["decisions"])
+    const joined = splitLimitNote(`still failing on CI | ${note}`)
+    expect(joined.text).toBe("still failing on CI")
+    expect([...joined.lists]).toEqual(["decisions"])
+    const three = splitLimitNote(`stuck | ${limitNote(new Set(["rejected", "constraints", "decisions"]))!}`)
+    expect(three.text).toBe("stuck")
+    expect([...three.lists]).toEqual(["constraints", "decisions", "rejected"])
+  })
+  it("a note in the MIDDLE of the value names no lists but still leaves the text", () => {
+    const s = splitLimitNote("a | (Mida: a list holds at most 50 entries. Older decisions were left out.) | b")
+    expect(s.text).toBe("a | b")
+    expect(s.lists.size).toBe(0)
+  })
+  it("a note nested inside another note leaves no (Mida: behind", () => {
+    const s = splitLimitNote(
+      "i | (Mida: a list holds at most (Mida: a list holds at most 50 entries. Older decisions were left out.)",
+    )
+    expect(s.text).toBe("i")
+    expect(s.text).not.toContain("(Mida:")
+  })
+  it("a note cut off mid-way at the end of the string is removed", () => {
+    const s = splitLimitNote("the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Older dec")
+    expect(s.text).toBe("the deploy key rotation is waiting on ops")
+    expect(s.lists.size).toBe(0)
+  })
+  it("the old numbered wording leaves the text but names no list", () => {
+    const s = splitLimitNote("x | (Mida: a list holds at most 50 entries. Left out: the 3 oldest decisions.)")
+    expect(s.text).toBe("x")
+    expect(s.lists.size).toBe(0)
+  })
+  it("null and a note-free string give empty text parts and no lists", () => {
+    expect(splitLimitNote(null)).toEqual({ text: "", lists: new Set() })
+    const s = splitLimitNote("flaky test")
+    expect(s.text).toBe("flaky test")
+    expect(s.lists.size).toBe(0)
+  })
 })
 
 // CAP-29: evidence names its target by position ("decisions[3]"), so entries leaving the front of
