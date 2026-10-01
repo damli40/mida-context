@@ -54,15 +54,18 @@ export const USAGE_LIMIT_PATTERN =
  * Did the tool's OWN output name a usage limit? Codex prints the prompt back on
  * stderr before its answer, so a user request that merely mentions "rate limiter"
  * or "quota" must not make an unrelated failure look like a plan limit: every
- * candidate line that, trimmed, equals a trimmed line of the PROMPT is dropped
- * first — it is the tool's echo, not its words. What remains (the head of stdout,
- * the kept tail of stderr) is matched line by line.
+ * candidate line that, trimmed, equals a trimmed line of the PROMPT — or is at
+ * least 8 characters long and occurs anywhere inside it — is dropped first: it
+ * is the tool's echo, not its words. The substring rule exists because the kept
+ * stderr tail is capped at 4,096 characters, so an echoed prompt line can
+ * arrive cut in half; the half that lands is still echo. What remains (the head
+ * of stdout, the kept tail of stderr) is matched line by line.
  */
 export function limitHit(prompt: string, stdout: string, stderrTail: string): boolean {
   const echoed = new Set(prompt.split("\n").map((line) => line.trim()))
   for (const raw of `${stdout.slice(0, 4096)}\n${stderrTail}`.split("\n")) {
     const line = raw.trim()
-    if (line === "" || echoed.has(line)) continue
+    if (line === "" || echoed.has(line) || (line.length >= 8 && prompt.includes(line))) continue
     if (USAGE_LIMIT_PATTERN.test(line)) return true
   }
   return false

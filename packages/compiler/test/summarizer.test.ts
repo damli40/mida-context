@@ -189,6 +189,33 @@ describe("probeClaudeSafeMode", () => {
     expect(calls).toBe(2)
   })
 
+  it("a good run's answer is still remembered at nine minutes (UF-P2R)", async () => {
+    vi.useFakeTimers()
+    let calls = 0
+    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools" })
+    expect(await probeClaudeSafeMode(binary, run)).toBe(true)
+    vi.setSystemTime(Date.now() + 9 * 60 * 1000)
+    expect(claudeSafeModeKnown(binary)).toBe(true)
+    await probeClaudeSafeMode(binary, run)
+    expect(calls).toBe(1)
+  })
+
+  it("a failed run's answer is remembered for only a minute (UF-P2R)", async () => {
+    vi.useFakeTimers()
+    let calls = 0
+    const fail = async () => (calls++, { status: 1, stdout: "--safe-mode --tools" })
+    expect(await probeClaudeSafeMode(binary, fail)).toBe(false)
+    vi.setSystemTime(Date.now() + 59_000)
+    // inside the minute the remembered false still answers — the probe does not re-run
+    expect(claudeSafeModeKnown(binary)).toBe(false)
+    expect(await probeClaudeSafeMode(binary, fail)).toBe(false)
+    expect(calls).toBe(1)
+    vi.setSystemTime(Date.now() + 2_000) // 61 s since the run finished
+    expect(claudeSafeModeKnown(binary)).toBeUndefined()
+    expect(await probeClaudeSafeMode(binary, fail)).toBe(false)
+    expect(calls).toBe(2)
+  })
+
   it("a different mtime is a different binary — it probes again", async () => {
     let calls = 0
     const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools" })
@@ -310,6 +337,7 @@ describe("resolveSummarizer", () => {
       MIDA_COMPILE_BASE_URL: "http://localhost:8080/v1",
       MIDA_COMPILE_MODEL_ID: "m-local",
       MIDA_COMPILE_API_KEY: "",
+      MIDA_COMPILE_TIMEOUT_MS: "120000",
     })
   })
 
@@ -323,6 +351,7 @@ describe("resolveSummarizer", () => {
       DEEPSEEK_API_KEY: "sk-deep",
       DEEPSEEK_BASE_URL: "https://api.deepseek.com",
       DEEPSEEK_MODEL: "deepseek-flash",
+      DEEPSEEK_TIMEOUT_MS: "120000",
     })
     expect(e.host).toBe("api.deepseek.com")
     expect(e.label).toBe("deepseek-flash")
@@ -338,8 +367,32 @@ describe("resolveSummarizer", () => {
       KIMI_API_KEY: "kk",
       KIMI_BASE_URL: "https://api.moonshot.ai",
       KIMI_MODEL: "kimi-y",
+      KIMI_TIMEOUT_MS: "120000",
     })
     expect(e.host).toBe("api.moonshot.ai")
+  })
+
+  it("a saved key choice pins the provider's timeout too — a stray outer variable cannot shorten it (UF-P2R)", () => {
+    const deepseek = resolve({
+      saved: { use: "key", provider: "deepseek", apiKey: "sk-deep" },
+      env: { DEEPSEEK_TIMEOUT_MS: "1" },
+    })
+    expect(deepseek.entries[0]!.command.env).toMatchObject({ DEEPSEEK_TIMEOUT_MS: "120000" })
+    expect(deepseek.entries[0]!.command.timeoutMs).toBe(120_000)
+
+    const kimi = resolve({
+      saved: { use: "key", provider: "kimi", apiKey: "kk" },
+      env: { KIMI_TIMEOUT_MS: "1" },
+    })
+    expect(kimi.entries[0]!.command.env).toMatchObject({ KIMI_TIMEOUT_MS: "120000" })
+    expect(kimi.entries[0]!.command.timeoutMs).toBe(120_000)
+
+    const custom = resolve({
+      saved: { use: "key", provider: "custom", apiKey: "k", baseUrl: "https://h/v1", model: "m" },
+      env: { MIDA_COMPILE_TIMEOUT_MS: "1" },
+    })
+    expect(custom.entries[0]!.command.env).toMatchObject({ MIDA_COMPILE_TIMEOUT_MS: "120000" })
+    expect(custom.entries[0]!.command.timeoutMs).toBe(120_000)
   })
 
   it("MIDA_COMPILE_MODEL=custom with MIDA_COMPILE_FALLBACK=1 still never grows a codex tail", () => {

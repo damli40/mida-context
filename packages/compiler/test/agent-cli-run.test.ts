@@ -300,4 +300,13 @@ describe("limitHit", () => {
     // but the same words when NOT in the prompt still count
     expect(limitHit(prompt, "", "we hit the weekly limit elsewhere")).toBe(true)
   })
+
+  it("a line that is only a half-echoed prompt line does not count either (UF-P2R)", () => {
+    // the stderr tail is capped at 4,096 characters, so an echoed prompt line can arrive cut
+    // in half — the half that lands is still the tool's echo, not its words
+    const prompt = "Summarise this.\nfirst half: we hit the weekly limit on the API"
+    expect(limitHit(prompt, "", "we hit the weekly limit on the API")).toBe(false)
+    // a short line (< 8 trimmed chars) still requires the exact-line rule
+    expect(limitHit(prompt, "", "API")).toBe(false)
+  })
 })

@@ -26,8 +26,9 @@ function rig(
   dir: MidaHome,
   over: {
     env?: Record<string, string>
-    answers?: string[]
-    secrets?: string[]
+    /** each entry is one typed answer; an explicit undefined is an abandoned prompt (Ctrl-C/Ctrl-D) */
+    answers?: (string | undefined)[]
+    secrets?: (string | undefined)[]
     onPath?: (bin: string) => boolean
     stdinIsTTY?: boolean
     stdoutIsTTY?: boolean
@@ -53,8 +54,8 @@ function rig(
         now: () => over.now ?? Date.parse("2026-10-01T12:00:00.000Z"),
         stdinIsTTY: over.stdinIsTTY ?? false,
         stdoutIsTTY: over.stdoutIsTTY ?? false,
-        prompt: async (q) => (prompts.push(q), answers.shift() ?? ""),
-        secretPrompt: async (q) => (secrets.push(q), secretAnswers.shift() ?? ""),
+        prompt: async (q) => (prompts.push(q), answers.length === 0 ? "" : answers.shift()),
+        secretPrompt: async (q) => (secrets.push(q), secretAnswers.length === 0 ? "" : secretAnswers.shift()),
         onPath: over.onPath ?? (() => false),
         claudeSafeMode: () => false,
         ...(over.health !== undefined ? { health: over.health } : {}),
@@ -146,7 +147,7 @@ describe("mida summarizer (show)", () => {
     appendFileSync(dir.path("logs/drain.jsonl"), "{this will not parse\n")
     const r = rig(dir, { onPath: () => true })
     await r.run(["summarizer"])
-    expect(r.lines).toContain("Last 24 hours: 1 written, 2 failed")
+    expect(r.lines).toContain("Last 24 hours: 1 written, 2 failed tries")
   })
 
   it("no drain log means no 24-hour line", async () => {
@@ -185,6 +186,23 @@ describe("mida summarizer (show)", () => {
     const silent = rig(dir, { onPath: () => true, health: async () => undefined })
     await silent.run(["summarizer"])
     expect(silent.lines.some((line) => line.startsWith("Note: the running Mida service"))).toBe(false)
+  })
+
+  it("a service that answers without a summarizer field is an older version; no answer earns no note (UF-P2R)", async () => {
+    const dir = home()
+    const older = rig(dir, {
+      onPath: () => true,
+      health: async () => ({ version: "old", queue: { pending: 0 } }),
+    })
+    await older.run(["summarizer"])
+    expect(older.lines).toContain(
+      "Note: the running Mida service is an older version and does not read this choice. Run mida doctor to restart it.",
+    )
+    expect(older.lines.some((line) => line.includes("The service's answer is the one that counts."))).toBe(false)
+
+    const silent = rig(dir, { onPath: () => true, health: async () => undefined })
+    await silent.run(["summarizer"])
+    expect(silent.lines.every((line) => !line.startsWith("Note: the running Mida service"))).toBe(true)
   })
 
   it("the tail is an empty line and the change/check pointers", async () => {
@@ -253,6 +271,103 @@ describe("mida summarizer use", () => {
     expect(r.lines.every((line) => !line.includes("sk-live-key"))).toBe(true)
   })
 
+  it("use agents returns 0 once the file is written, even with neither tool on PATH (UF-P2R)", async () => {
+    const dir = home()
+    const r = rig(dir, { onPath: () => false })
+    expect(await r.run(["summarizer", "use", "agents"])).toBe(0)
+    expect(readSummarizer(dir)).toEqual({ use: "agents" })
+    expect(r.lines[0]).toBe("Saved: your agents' small models write the summaries.")
+  })
+
+  it("an abandoned choice question saves nothing, prints the nothing-saved line and reports skipped (UF-P2R)", async () => {
+    const dir = home()
+    const lines: string[] = []
+    const result = await chooseSummarizer({
+      home: dir,
+      env: {},
+      print: (line) => lines.push(line),
+      prompt: async () => undefined,
+      secretPrompt: async () => undefined,
+      onPath: () => true,
+    })
+    expect(result).toBe("skipped")
+    expect(lines.at(-1)).toBe("Nothing saved. Mida uses your agents' small models until you choose: mida summarizer")
+    expect(readSummarizer(dir)).toBeUndefined()
+  })
+
+  it("an abandoned provider, URL, model or key question inside use key saves nothing (UF-P2R)", async () => {
+    const cases: { name: string; answers: (string | undefined)[]; secrets: (string | undefined)[] }[] = [
+      { name: "provider", answers: [undefined], secrets: [] },
+      { name: "endpoint URL", answers: ["3", undefined], secrets: [] },
+      { name: "model name", answers: ["3", "https://openai.example/v1", undefined], secrets: [] },
+      { name: "deepseek key", answers: ["1"], secrets: [undefined] },
+      { name: "custom endpoint key", answers: ["3", "https://openai.example/v1", "local-1"], secrets: [undefined] },
+    ]
+    for (const c of cases) {
+      const dir = home()
+      const r = rig(dir, { stdinIsTTY: true, stdoutIsTTY: true, answers: c.answers, secrets: c.secrets })
+      expect(await r.run(["summarizer", "use", "key"]), c.name).toBe(1)
+      expect(r.lines.at(-1), c.name).toBe("Nothing saved.")
+      expect(readSummarizer(dir), c.name).toBeUndefined()
+    }
+  })
+
+  it("an empty line at the custom key prompt saves an empty key; an abandoned one saves nothing (UF-P2R)", async () => {
+    const dir = home()
+    const r = rig(dir, { stdinIsTTY: true, stdoutIsTTY: true, answers: ["3", "https://openai.example/v1", "local-1"], secrets: [""] })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(0)
+    expect(readSummarizer(dir)).toEqual({ use: "key", provider: "custom", apiKey: "", baseUrl: "https://openai.example/v1", model: "local-1" })
+  })
+
+  it("a key with a space is refused with the paste-again line and asked again (UF-P2R)", async () => {
+    const dir = home()
+    const r = rig(dir, { stdinIsTTY: true, stdoutIsTTY: true, answers: ["1"], secrets: ["sk 1", "sk-clean"] })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(0)
+    expect(r.lines).toContain("That key has spaces or hidden characters in it. Paste it again.")
+    expect(readSummarizer(dir)).toEqual({ use: "key", provider: "deepseek", apiKey: "sk-clean" })
+  })
+
+  it("three spaced keys run out the same three tries an empty key would (UF-P2R)", async () => {
+    const dir = home()
+    const r = rig(dir, { stdinIsTTY: true, stdoutIsTTY: true, answers: ["1"], secrets: ["sk 1", "sk\t2", "sk 3"] })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(1)
+    expect(r.lines.filter((line) => line === "That key has spaces or hidden characters in it. Paste it again.")).toHaveLength(3)
+    expect(r.lines.at(-1)).toBe("Nothing saved.")
+    expect(readSummarizer(dir)).toBeUndefined()
+  })
+
+  it("a URL with a username, a query or a fragment is refused with the base-address line (UF-P2R)", async () => {
+    const dir = home()
+    const r = rig(dir, {
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      answers: ["3", "https://user:pass@host.example/v1", "https://host.example/v1?x=1", "https://host.example/v1#f"],
+      secrets: [],
+    })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(1)
+    expect(r.lines.filter((line) => line === 'Use the base address only: no username, no "?" and no "#".')).toHaveLength(3)
+    expect(r.lines.at(-1)).toBe("Nothing saved.")
+    expect(readSummarizer(dir)).toBeUndefined()
+  })
+
+  it("a trailing /chat/completions and trailing slashes are removed before the address is saved (UF-P2R)", async () => {
+    const dir = home()
+    const r = rig(dir, {
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      answers: ["3", "https://host.example/v1/chat/completions/", "m-local"],
+      secrets: [""],
+    })
+    expect(await r.run(["summarizer", "use", "key"])).toBe(0)
+    expect(readSummarizer(dir)).toEqual({
+      use: "key",
+      provider: "custom",
+      apiKey: "",
+      baseUrl: "https://host.example/v1",
+      model: "m-local",
+    })
+  })
+
   it("abandoned key questions print Nothing saved and return 1", async () => {
     const dir = home()
     const r = rig(dir, { stdinIsTTY: true, stdoutIsTTY: true, answers: ["9", "9", "9"] })
@@ -278,7 +393,9 @@ describe("mida summarizer test", () => {
     expect(await r.run(["summarizer", "test"])).toBe(0)
     expect(calls).toEqual(["claude-haiku", "codex-luna"])
     expect(r.lines).toEqual([
+      "Asking Claude Code (haiku) for a test summary. This can take up to 90 s.",
       "Claude Code (haiku) could not write it: exit 2 signal null.",
+      "Asking Codex (luna) for a test summary. This can take up to 180 s.",
       "Wrote one test summary with Codex (luna) in 3 s.",
     ])
   })
@@ -298,7 +415,9 @@ describe("mida summarizer test", () => {
     })
     expect(await r.run(["summarizer", "test"])).toBe(1)
     expect(r.lines).toEqual([
+      "Asking Claude Code (haiku) for a test summary. This can take up to 90 s.",
       "Claude Code (haiku) could not write it: its command is not installed.",
+      "Asking Codex (luna) for a test summary. This can take up to 180 s.",
       "Codex (luna) could not write it: it hit its usage limit.",
       "No model could write a test summary. Mida cannot save your sessions until one can.",
     ])
@@ -306,10 +425,11 @@ describe("mida summarizer test", () => {
     calls.length = 0
     const notInstalled = rig(dir, { onPath: (bin) => bin === "codex", probe: probes({ "codex-luna": { ok: true, ms: 100 } }, calls) })
     expect(await notInstalled.run(["summarizer", "test"])).toBe(0)
-    // claude was never probed — its line comes from the PATH answer alone
+    // claude was never probed — its line comes from the PATH answer alone, and earns no Asking line
     expect(calls).toEqual(["codex-luna"])
     expect(notInstalled.lines[0]).toBe("Claude Code (haiku) could not write it: its command is not installed.")
-    expect(notInstalled.lines[1]).toBe("Wrote one test summary with Codex (luna) in 1 s.")
+    expect(notInstalled.lines[1]).toBe("Asking Codex (luna) for a test summary. This can take up to 180 s.")
+    expect(notInstalled.lines[2]).toBe("Wrote one test summary with Codex (luna) in 1 s.")
   })
 
   it("a timeout line carries the whole seconds", async () => {
@@ -319,7 +439,8 @@ describe("mida summarizer test", () => {
       probe: async () => ({ ok: false, why: "timeout", detail: "timeout after 90000 ms", ms: 90_000 }),
     })
     expect(await r.run(["summarizer", "test"])).toBe(1)
-    expect(r.lines[0]).toBe("Claude Code (haiku) could not write it: it gave no answer in 90 s.")
+    expect(r.lines[0]).toBe("Asking Claude Code (haiku) for a test summary. This can take up to 90 s.")
+    expect(r.lines[1]).toBe("Claude Code (haiku) could not write it: it gave no answer in 90 s.")
   })
 
   it("no entries at all prints the two nothing-can-write lines and returns 1", async () => {

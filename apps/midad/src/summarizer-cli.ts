@@ -320,11 +320,11 @@ export async function askSummarizerKey(deps: {
   while (baseUrl === undefined) {
     const raw = await prompt("Endpoint base URL (for OpenAI: https://api.openai.com/v1): ")
     if (raw === undefined) return undefined
-    const answer = raw.trim()
-    if (endpointAllowed(answer)) {
-      baseUrl = answer
+    const checked = endpointChecked(raw.trim())
+    if (checked.kind === "ok") {
+      baseUrl = checked.url
     } else {
-      print("That address must start with https:// (http:// only for this machine).")
+      print(checked.kind === "extras" ? 'Use the base address only: no username, no "?" and no "#".' : "That address must start with https:// (http:// only for this machine).")
       badUrl++
       if (badUrl >= 3) return undefined
     }
@@ -356,16 +356,31 @@ export async function askSummarizerKey(deps: {
   }
 }
 
-/** `https:` anywhere; `http:` only for this machine. */
-function endpointAllowed(answer: string): boolean {
+/**
+ * The custom endpoint's base address. `https:` anywhere; `http:` only for this
+ * machine. A username or password, a query, or a fragment is refused — the
+ * address is the base the provider table appends its path to, so extras would
+ * silently point elsewhere (or carry a credential). A trailing
+ * `/chat/completions` and trailing slashes are stripped before the address is
+ * saved — people paste the URL their endpoint's docs print.
+ */
+function endpointChecked(answer: string): { kind: "ok"; url: string } | { kind: "scheme" } | { kind: "extras" } {
   let url: URL
   try {
     url = new URL(answer)
   } catch {
-    return false
+    return { kind: "scheme" }
   }
-  if (url.protocol === "https:") return true
-  return url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]")
+  if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "") return { kind: "extras" }
+  const local = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]"
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) return { kind: "scheme" }
+  let cleaned = answer
+  while (cleaned.endsWith("/")) cleaned = cleaned.slice(0, -1)
+  if (cleaned.endsWith("/chat/completions")) {
+    cleaned = cleaned.slice(0, cleaned.length - "/chat/completions".length)
+    while (cleaned.endsWith("/")) cleaned = cleaned.slice(0, -1)
+  }
+  return { kind: "ok", url: cleaned }
 }
 
 /** The choice block printed by `init` and `install` when nobody has picked a summariser yet (UF-P2b). */

@@ -84,8 +84,10 @@ export function binaryOnPath(name: string, pathValue: string | undefined): boole
 }
 
 const SAFE_MODE_CACHE_MS = 10 * 60 * 1000
+const SAFE_MODE_FAIL_CACHE_MS = 60 * 1000
 interface SafeModeEntry {
   at: number
+  ttl: number
   promise: Promise<boolean>
   answer?: boolean
 }
@@ -119,9 +121,11 @@ const defaultSafeModeRun = async (binary: string): Promise<{ status: number | nu
 /**
  * Whether this `claude` binary accepts --safe-mode --tools "". Probed by
  * `claude --help`, ASYNC — a slow help must never freeze the service it runs
- * inside. The answer is remembered for ten minutes under the key
- * `<binary>:<mtime>` — a binary that changed on disk is a different binary —
- * and calls made while one probe is in flight share its promise.
+ * inside. The answer is remembered under the key `<binary>:<mtime>` — a binary
+ * that changed on disk is a different binary — for ten minutes when the run
+ * exited 0 and only one minute when it failed or timed out (a transient
+ * failure must not pin a binary as unsafe for ten minutes), and calls made
+ * while one probe is in flight share its promise.
  */
 export function probeClaudeSafeMode(
   binary: string,
@@ -129,12 +133,21 @@ export function probeClaudeSafeMode(
 ): Promise<boolean> {
   const key = `${binary}:${binaryMtime(binary)}`
   const hit = safeModeCache.get(key)
-  if (hit !== undefined && Date.now() - hit.at < SAFE_MODE_CACHE_MS) return hit.promise
+  if (hit !== undefined && Date.now() - hit.at < hit.ttl) return hit.promise
   const entry: SafeModeEntry = {
     at: Date.now(),
+    ttl: SAFE_MODE_CACHE_MS,
     promise: (run ?? defaultSafeModeRun)(binary).then(
-      (out) => out.status === 0 && out.stdout.includes("--safe-mode") && out.stdout.includes("--tools"),
-      () => false,
+      (out) => {
+        entry.ttl = out.status === 0 ? SAFE_MODE_CACHE_MS : SAFE_MODE_FAIL_CACHE_MS
+        entry.at = Date.now()
+        return out.status === 0 && out.stdout.includes("--safe-mode") && out.stdout.includes("--tools")
+      },
+      () => {
+        entry.ttl = SAFE_MODE_FAIL_CACHE_MS
+        entry.at = Date.now()
+        return false
+      },
     ),
   }
   entry.promise.then((answer) => {
@@ -151,7 +164,7 @@ export function probeClaudeSafeMode(
  */
 export function claudeSafeModeKnown(binary: string): boolean | undefined {
   const entry = safeModeCache.get(`${binary}:${binaryMtime(binary)}`)
-  if (entry === undefined || Date.now() - entry.at >= SAFE_MODE_CACHE_MS) return undefined
+  if (entry === undefined || Date.now() - entry.at >= entry.ttl) return undefined
   return entry.answer
 }
 
@@ -269,9 +282,13 @@ export function resolveSummarizer(input: {
               // MIDA_COMPILE_API_KEY can never ride to the owner's own endpoint
               MIDA_COMPILE_API_KEY: saved.apiKey,
             }
+    // the timeout is pinned too: a stray DEEPSEEK_TIMEOUT_MS=1 in the daemon's
+    // environment must not make every summary of a saved choice time out
+    extra[COMPILE_PROVIDERS[provider].timeoutVar] = "120000"
     const withExtra = { ...env, ...extra }
     const command = providerModelCommand(withExtra, provider)
     command.env = extra
+    command.timeoutMs = 120_000
     const entry: SummarizerEntry = {
       id: provider,
       command,
