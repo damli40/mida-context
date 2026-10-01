@@ -13,6 +13,7 @@ import {
   claudeSupportsSafeMode,
   codexSummaryCommand,
   resetClaudeSafeModeCache,
+  resolveSummarizer,
 } from "../src/index.js"
 
 describe("claudeSummaryCommand", () => {
@@ -118,5 +119,116 @@ describe("claudeSupportsSafeMode", () => {
     resetClaudeSafeModeCache()
     expect(claudeSupportsSafeMode(probe)).toBe(true)
     expect(calls).toBe(2)
+  })
+})
+
+describe("resolveSummarizer", () => {
+  const onPath = (...names: string[]) => (bin: string) => names.includes(bin)
+  const resolve = (over: Partial<Parameters<typeof resolveSummarizer>[0]> = {}) =>
+    resolveSummarizer({ saved: undefined, env: {}, onPath: onPath(), claudeSafeMode: false, ...over })
+
+  it("nothing saved, nothing set: the two agents, chosen false (rule 4)", () => {
+    const r = resolve()
+    expect(r.mode).toBe("agents")
+    expect(r.chosen).toBe(false)
+    expect(r.entries.map((e) => e.id)).toEqual(["claude", "codex"])
+    expect(r.chain).toEqual([])
+  })
+
+  it("a saved agents choice is chosen:true with both agent entries (rule 2)", () => {
+    const r = resolve({ saved: { use: "agents" }, onPath: onPath("claude", "codex") })
+    expect(r.mode).toBe("agents")
+    expect(r.chosen).toBe(true)
+    expect(r.entries.map((e) => e.id)).toEqual(["claude", "codex"])
+    expect(r.chain.map((e) => e.id)).toEqual(["claude", "codex"])
+    expect(r.entries[0]!.display).toBe("Claude Code (haiku)")
+    expect(r.entries[0]!.host).toBe("api.anthropic.com")
+    expect(r.entries[1]!.display).toBe("Codex (luna)")
+    expect(r.entries[1]!.host).toBe("api.openai.com")
+  })
+
+  it("only what is on PATH can run — one side, both, or neither", () => {
+    expect(resolve({ saved: { use: "agents" }, onPath: onPath("claude") }).chain.map((e) => e.id)).toEqual(["claude"])
+    expect(resolve({ saved: { use: "agents" }, onPath: onPath("codex") }).chain.map((e) => e.id)).toEqual(["codex"])
+    const none = resolve({ saved: { use: "agents" }, onPath: onPath() })
+    expect(none.chain).toEqual([])
+    expect(none.entries).toHaveLength(2)
+  })
+
+  it("a saved deepseek key is one entry, the key on command.env, never in argv/label/display (rule 1)", () => {
+    const r = resolve({
+      saved: { use: "key", provider: "deepseek", apiKey: "sk-deep", model: "deepseek-x" },
+      env: { DEEPSEEK_API_KEY: "other" }, // a saved choice wins over the environment
+    })
+    expect(r.mode).toBe("key")
+    expect(r.chosen).toBe(true)
+    expect(r.entries).toHaveLength(1)
+    const e = r.entries[0]!
+    expect(e.id).toBe("deepseek")
+    expect(e.display).toBe("DeepSeek (deepseek-x)")
+    expect(e.label).toBe("deepseek-x")
+    expect(e.host).toBe("api.deepseek.com")
+    expect(e.installed).toBe(true)
+    expect(e.command.env).toMatchObject({ DEEPSEEK_API_KEY: "sk-deep", DEEPSEEK_MODEL: "deepseek-x" })
+    expect(e.command.argv.join(" ")).not.toContain("sk-deep")
+    // the key lives only on command.env — never in what the user or the log reads
+    expect(e.label).not.toContain("sk-deep")
+    expect(e.display).not.toContain("sk-deep")
+  })
+
+  it("a saved kimi key builds the kimi env and the Moonshot display", () => {
+    const r = resolve({ saved: { use: "key", provider: "kimi", apiKey: "kk", model: "kimi-y" } })
+    const e = r.entries[0]!
+    expect(e.display).toBe("Moonshot (kimi-y)")
+    expect(e.host).toBe("api.moonshot.ai")
+    expect(e.command.env).toMatchObject({ KIMI_API_KEY: "kk", KIMI_MODEL: "kimi-y" })
+  })
+
+  it("a saved custom endpoint sets base/model; an empty key sets no MIDA_COMPILE_API_KEY", () => {
+    const r = resolve({
+      saved: { use: "key", provider: "custom", apiKey: "", baseUrl: "http://localhost:8080/v1", model: "m-local" },
+    })
+    const e = r.entries[0]!
+    expect(e.display).toBe("your endpoint (m-local)")
+    expect(e.host).toBe("localhost:8080")
+    expect(e.command.env).toMatchObject({ MIDA_COMPILE_BASE_URL: "http://localhost:8080/v1", MIDA_COMPILE_MODEL_ID: "m-local" })
+    expect(e.command.env).not.toHaveProperty("MIDA_COMPILE_API_KEY")
+  })
+
+  it("DEEPSEEK_API_KEY alone: environment mode, deepseek then claude then codex (rule 3)", () => {
+    const r = resolve({ env: { DEEPSEEK_API_KEY: "k" }, onPath: onPath("claude", "codex") })
+    expect(r.mode).toBe("environment")
+    expect(r.chosen).toBe(true)
+    expect(r.entries.map((e) => e.id)).toEqual(["deepseek", "claude", "codex"])
+    expect(r.chain.map((e) => e.id)).toEqual(["deepseek", "claude", "codex"])
+  })
+
+  it("codex drops out of the runnable chain when its binary is absent", () => {
+    const r = resolve({ env: { DEEPSEEK_API_KEY: "k" }, onPath: onPath("claude") })
+    expect(r.entries.map((e) => e.id)).toEqual(["deepseek", "claude", "codex"])
+    expect(r.chain.map((e) => e.id)).toEqual(["deepseek", "claude"])
+  })
+
+  it("MIDA_COMPILE_MODEL=haiku gives the Claude entry only — no codex tail", () => {
+    const r = resolve({ env: { MIDA_COMPILE_MODEL: "haiku" }, onPath: onPath("claude", "codex") })
+    expect(r.mode).toBe("environment")
+    expect(r.entries.map((e) => e.id)).toEqual(["claude"])
+  })
+
+  it("MIDA_COMPILE_MODEL=custom gives the custom entry only", () => {
+    const r = resolve({
+      env: { MIDA_COMPILE_MODEL: "custom", MIDA_COMPILE_BASE_URL: "http://h:9/v1", MIDA_COMPILE_MODEL_ID: "m" },
+    })
+    expect(r.mode).toBe("environment")
+    expect(r.entries.map((e) => e.id)).toEqual(["custom"])
+    expect(r.entries[0]!.display).toBe("your endpoint (m)")
+    expect(r.entries[0]!.host).toBe("h:9")
+  })
+
+  it("claudeSafeMode picks between the two Claude argv forms", () => {
+    const safe = resolve({ saved: { use: "agents" }, claudeSafeMode: true })
+    const unsafe = resolve({ saved: { use: "agents" }, claudeSafeMode: false })
+    expect(safe.entries[0]!.command.argv).toContain("--safe-mode")
+    expect(unsafe.entries[0]!.command.argv).toContain("--setting-sources")
   })
 })
