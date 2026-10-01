@@ -724,3 +724,27 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     ...(fb !== undefined ? { fellBack: fb } : {}),
   }
 }
+
+/** The one prompt `mida summarizer test` sends — any answer holding this shape proves the model writes JSON. */
+const PROBE_PROMPT = 'Reply with exactly this JSON and nothing else: {"objective":"test","nextAction":"none"}'
+
+/**
+ * `mida summarizer test` (UF-P2a): run the command once and classify the outcome. `ok` needs an
+ * answer whose JSON object carries a string `objective`. A failed run becomes `limit` (usage
+ * limit), `missing` (spawn error — the binary is not there), `timeout`, or plain `failed`.
+ */
+export async function probeModel(
+  command: ModelCommand,
+): Promise<{ ok: true; ms: number } | { ok: false; why: "limit" | "missing" | "timeout" | "failed"; detail: string; ms: number }> {
+  const run = await runModel(command, PROBE_PROMPT)
+  if (run.ok) {
+    const obj = extractJsonObject(run.stdout)
+    if (typeof obj === "object" && obj !== null && typeof (obj as Record<string, unknown>).objective === "string") {
+      return { ok: true, ms: run.ms }
+    }
+    return { ok: false, why: "failed", detail: "no JSON in the answer", ms: run.ms }
+  }
+  const why =
+    run.limit === true ? "limit" : run.detail.startsWith("spawn:") ? "missing" : run.detail.startsWith("timeout") ? "timeout" : "failed"
+  return { ok: false, why, detail: run.detail, ms: run.ms }
+}

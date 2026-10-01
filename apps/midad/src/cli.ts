@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { binaryOnPath, claudeSupportsSafeMode, probeModel } from "@mida/compiler"
 import { realpathSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -91,7 +92,7 @@ const ADD_AGENT_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/
  */
 const BUILTIN_AGENT_NAMES: ReadonlySet<string> = new Set([...AGENTS, ...INSTALL_TOOLS])
 export const USAGE =
-  "usage: mida init | install <tool> [--no-mcp] | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | sponsor on|off | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>" +
+  "usage: mida init | install <tool> [--no-mcp] | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | sponsor on|off | summarizer [use agents | use key | test] | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>" +
   "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or any identity add-agent or a client install provisions)"
 export const ABOUT: readonly string[] = [
   "Mida keeps your context in an encrypted store you own: the facts you tell it about yourself, and the checkpoints your AI agents save as they work.",
@@ -1818,6 +1819,51 @@ function terminalPrompt(question: string): Promise<string> {
 }
 
 /**
+ * The hidden prompt for secrets (UF-P2b): writes the question, reads stdin in raw mode
+ * without echoing, handles backspace, ends on Enter, restores the terminal mode. Ctrl-C
+ * restores the mode and resolves with an empty string. Only ever called when stdin is a
+ * real terminal; without one it falls back to a plain question so nothing hangs.
+ */
+function terminalSecretPrompt(question: string): Promise<string> {
+  const stdin = process.stdin
+  const stdout = process.stdout
+  if (stdin.isTTY !== true || typeof stdin.setRawMode !== "function") return terminalPrompt(question)
+  return new Promise((resolve) => {
+    const wasRaw = stdin.isRaw === true
+    let answer = ""
+    const done = (value: string) => {
+      stdin.removeListener("data", onData)
+      stdin.setRawMode(wasRaw)
+      stdin.pause()
+      stdout.write("\n")
+      resolve(value)
+    }
+    const onData = (chunk: Buffer) => {
+      for (const byte of chunk) {
+        if (byte === 3) {
+          // Ctrl-C: restore and give up with an empty answer
+          done("")
+          return
+        }
+        if (byte === 13 || byte === 10) {
+          done(answer)
+          return
+        }
+        if (byte === 127 || byte === 8) {
+          answer = answer.slice(0, -1)
+          continue
+        }
+        answer += String.fromCharCode(byte)
+      }
+    }
+    stdout.write(question)
+    stdin.setRawMode(true)
+    stdin.resume()
+    stdin.on("data", onData)
+  })
+}
+
+/**
  * The owner commands on a passkey home (M3-F2): `init --passkey`, `approve`, `revoke` — and
  * `remember`, which has no passkey path yet. None of them may open Runtime: that call creates
  * owner secrets, and a passkey home is defined by their absence. Every signature goes to the
@@ -2558,6 +2604,28 @@ async function main(): Promise<void> {
       return
     }
     process.exitCode = await runDoctor({ home, print, settings })
+    return
+  }
+
+  // `summarizer` is local like doctor: it answers from this home's files and a PATH probe,
+  // never through the daemon socket, and it is not in CLI_COMMANDS (UF-P2a).
+  if (argv[0] === "summarizer") {
+    process.exitCode = await runSummarizer(argv, {
+      home,
+      env: process.env,
+      print,
+      stdinIsTTY: process.stdin.isTTY === true,
+      stdoutIsTTY: process.stdout.isTTY === true,
+      prompt: terminalPrompt,
+      secretPrompt: terminalSecretPrompt,
+      onPath: (bin) => binaryOnPath(bin, process.env.PATH),
+      claudeSafeMode: () => claudeSupportsSafeMode(),
+      health: async () => {
+        const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
+        return reply.status === 0 ? undefined : reply.body
+      },
+      probe: probeModel,
+    })
     return
   }
 
