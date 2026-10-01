@@ -1,7 +1,6 @@
 packages:
   - "packages/*"
   - "apps/*"
-  - "apps/indexer/generated"
 allowBuilds:
   esbuild: true
   workerd: true
