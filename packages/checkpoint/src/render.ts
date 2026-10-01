@@ -125,7 +125,7 @@ export function defuse(text: string): string {
         key.startsWith("=== BEGIN MIDA HANDOFF DATA ===") ||
         /^(-\s*)?\(\d+ earlier /.test(key) ||
         /^(-\s*)?\(Mida cut this reply/.test(key) ||
-        /^[^\p{L}\p{N}]*stated\s+by\s+you(?![\p{L}\p{N}])/iu.test(key)
+        /^[^\p{L}\p{N}]*(?:\p{N}+[.)]\s*)?[^\p{L}\p{N}]*stated\s+by\s+you(?![\p{L}\p{N}])/iu.test(key)
       return OWN_HEADINGS.some((h) => key.startsWith(h)) || forgedLine ? `> ${line}` : line
     })
     .join("\n")
