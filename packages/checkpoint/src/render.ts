@@ -92,7 +92,11 @@ export function defuse(text: string): string {
     // (CAP-26 review) — and so does a forged "(N earlier …" count line (UF-I)
     .map((line) => {
       const trimmedStart = line.trimStart()
-      return OWN_HEADINGS.some((h) => trimmedStart.startsWith(h)) || /^\(\d+ earlier /.test(trimmedStart) ? `> ${line}` : line
+      // UF-J: a forged count or cut line carries the renderer's own "- " prefix — quote a line
+      // that opens with an optional dash before "(N earlier …" or "(Mida cut this reply"
+      const forgedLine =
+        /^(-\s*)?\(\d+ earlier /.test(trimmedStart) || /^(-\s*)?\(Mida cut this reply/.test(trimmedStart)
+      return OWN_HEADINGS.some((h) => trimmedStart.startsWith(h)) || forgedLine ? `> ${line}` : line
     })
     .join("\n")
 }
@@ -219,10 +223,12 @@ export function renderHandoffReport(
     .filter((line): line is string => line !== undefined)
     .join("\n")
   const cut = (s: string, n = 300) => (s.length > n ? s.slice(0, n - 1) + "…" : s)
-  // `dropped` oldest items are left out and named by one count line (PROV-14)
-  const list = (title: string, items: string[], dropped = 0, noun = "entries"): string | null =>
+  // `dropped` oldest items are left out and named by one count line (PROV-14). `whole` entries
+  // are rendered uncut — a constraint's exception clause or a decision's reason is part of the
+  // rule, and cutting it changes what the next agent obeys (UF-J).
+  const list = (title: string, items: string[], dropped = 0, noun = "entries", whole = false): string | null =>
     items.length
-      ? `${title}:\n${[...(dropped > 0 ? [`- (${dropped} earlier ${noun} left out)`] : []), ...items.slice(dropped).map((i) => `- ${cut(defuse(i))}`)].join("\n")}`
+      ? `${title}:\n${[...(dropped > 0 ? [`- (${dropped} earlier ${noun} left out)`] : []), ...items.slice(dropped).map((i) => `- ${whole ? defuse(i) : cut(defuse(i))}`)].join("\n")}`
       : null
   // Who saved each record is decided by the chain's authorId, never by the agent name the
   // checkpoint claims — the claim is shown only as a quote when it disagrees.
@@ -233,21 +239,6 @@ export function renderHandoffReport(
     return resolved === p.agent ? line : `${line} — the checkpoint itself claims "${defuse(p.agent)}"`
   }
 
-  // Constraints show once: two entries that differ only in case, spacing or a trailing
-  // punctuation mark are the same rule — the first spelling is the one shown (UF-I).
-  const seenConstraints = new Set<string>()
-  const constraints = merged.constraints.filter((c) => {
-    const key = c
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, " ")
-      .replace(/[.!;,]+\s*$/, "")
-      .trimEnd()
-    if (seenConstraints.has(key)) return false
-    seenConstraints.add(key)
-    return true
-  })
-
   const build = (trim: Trim, reasonsOff: boolean, note: string | null = null): string => {
     const dropped = trim.progress
     const parts: string[] = []
@@ -255,8 +246,10 @@ export function renderHandoffReport(
       if (s !== null) parts.push(s)
     }
     // Constraints lead: the standing rules sit above the request, so the thing the agent reads
-    // first is the thing that must still hold (UF-I).
-    push(list("Constraints", constraints))
+    // first is the thing that must still hold (UF-I). They render exactly as the merge gives
+    // them — near-duplicates are NOT merged (UF-J: "."/"!" are different rules), and no rule's
+    // text is ever cut (`whole`: a cut exception clause changes what the agent obeys).
+    push(list("Constraints", merged.constraints, 0, "entries", true))
     if (merged.originalRequest !== null) {
       parts.push(
         "ORIGINAL REQUEST (the user's own words, copied from the first message — not a summary):\n" +
@@ -277,12 +270,18 @@ export function renderHandoffReport(
       list(
         reasonsOff ? "Decisions (reasons left out to fit)" : "Decisions",
         merged.decisions.map((d) => (reasonsOff ? defuse(d.decision) : `${defuse(d.decision)} — because: ${defuse(d.rationale)}`)),
+        0,
+        "entries",
+        true,
       ),
     )
     push(
       list(
         reasonsOff ? "Rejected approaches (reasons left out to fit)" : "Rejected approaches",
         merged.rejected.map((r) => (reasonsOff ? defuse(r.approach) : `${defuse(r.approach)} — ${defuse(r.why)}`)),
+        0,
+        "entries",
+        true,
       ),
     )
     push(list("Artifacts", merged.artifacts, trim.artifacts, "artifacts"))
@@ -381,11 +380,18 @@ export function renderHandoffReport(
 
   let { trim, text: out } = fitOnce(false)
   // Still over with history trimmed: the reasons behind decisions and rejected approaches go next
-  // — every entry stays, only the "because" / "why" go. With no reasons to drop the text cannot
-  // change, so the step is skipped; otherwise history is re-fit under the shorter lines and keeps
-  // as much of it as now fits.
-  const reasonsLeftOut = out.length > maxChars && (merged.decisions.length > 0 || merged.rejected.length > 0)
-  if (reasonsLeftOut) ({ trim, text: out } = fitOnce(true))
+  // — every entry stays, only the "because" / "why" go — but only when that actually shortens
+  // the text. The two longer headings can outweigh one short reason, and a longer output with
+  // fewer facts is a strict loss: keep the reasons and the plain headings instead (UF-J). With
+  // no reasons to drop the text cannot change, so the step is skipped.
+  let reasonsLeftOut = false
+  if (out.length > maxChars && (merged.decisions.length > 0 || merged.rejected.length > 0)) {
+    const tried = fitOnce(true)
+    if (tried.text.length < out.length) {
+      ;({ trim, text: out } = tried)
+      reasonsLeftOut = true
+    }
+  }
   // Still over even then: deliver it whole — a rule is never dropped to shorten the handoff —
   // with one preamble line that says exactly what was left out (or that nothing was).
   if (out.length > maxChars) {
