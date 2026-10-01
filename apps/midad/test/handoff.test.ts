@@ -1676,6 +1676,91 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     expect(result.oversized).toBe(true)
   })
 
+  // UF-QA: a marked block carries its OWN history lines (progress, artifact, evidence), and the
+  // owner's order — history before reasons — applies to them too. When the merge's trimmed
+  // history still cannot fit, the blocks are rebuilt without their history lines (their rules
+  // stay, each still carrying its "… N more lines … left out" count) before any reason leaves.
+  it("a waiting save's own history lines go before any decision's reason (UF-QA)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-c" })
+    dir.writeSecretJson("queue/state/sess-c.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason: "sponsor-limit",
+    })
+    // the reviewed case: one waiting save with 30 progress lines and 10 file lines, beside a
+    // record whose reasons fit only once the block's history is gone
+    unsentSave(dir, "sess-c", {
+      objective: "o",
+      nextAction: "n",
+      progress: Array.from({ length: 30 }, (_, i) => `unsent step ${i} ${"u".repeat(150)}`),
+      artifacts: Array.from({ length: 10 }, (_, i) => `file-${i}.ts ${"f".repeat(150)}`),
+    })
+    const merged = stored({
+      decisions: Array.from({ length: 20 }, (_, i) => ({ decision: `merged decision ${i} ${"d".repeat(40)}`, rationale: `rationale ${i} ${"r".repeat(160)}` })),
+      progress: Array.from({ length: 20 }, (_, i) => `anchored step ${i} ${"a".repeat(120)}`),
+    })
+    const { d } = deps({ read: async () => ({ checkpoints: [merged], skipped: 0, milliseconds: 1, partial: false }), now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text.length).toBeLessThanOrEqual(8_000)
+    expect(result.oversized).toBe(false)
+    // every reason stayed — the block's history paid for them
+    expect(result.reasonsLeftOut).toBe(false)
+    expect(result.text.match(/ — because: /g) ?? []).toHaveLength(20)
+    expect(result.text).not.toContain("(reasons left out to fit)")
+    // and the block really did give up its history: no progress or file line, but the honest count
+    const fieldLines = unsentFieldLines(result.text)
+    expect(fieldLines.filter((l) => l.startsWith("progress: "))).toHaveLength(0)
+    expect(fieldLines.filter((l) => l.startsWith("artifact: "))).toHaveLength(0)
+    expect(fieldLines.find((l) => l.startsWith("… "))).toBe("… 40 more lines of this unsent save left out")
+    // its rules stayed
+    expect(fieldLines).toContain("objective: o")
+    expect(fieldLines).toContain("next action: n")
+  })
+
+  it("a waiting save's reasons go when even the history-free blocks cannot fit with them (UF-QA)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-c" })
+    unsentSave(dir, "sess-c", {
+      objective: "o",
+      nextAction: "n",
+      progress: Array.from({ length: 30 }, (_, i) => `unsent step ${i} ${"u".repeat(150)}`),
+    })
+    // reasons too big for what a bare block leaves — only dropping them fits the delivered text
+    const merged = stored({
+      decisions: Array.from({ length: 30 }, (_, i) => ({ decision: `merged decision ${i} ${"d".repeat(60)}`, rationale: `rationale ${i} ${"r".repeat(300)}` })),
+    })
+    const { d } = deps({ read: async () => ({ checkpoints: [merged], skipped: 0, milliseconds: 1, partial: false }), now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text.length).toBeLessThanOrEqual(8_000)
+    expect(result.oversized).toBe(false)
+    expect(result.reasonsLeftOut).toBe(true)
+    expect(result.text).toContain("Decisions (reasons left out to fit):")
+    const fieldLines = unsentFieldLines(result.text)
+    expect(fieldLines.filter((l) => l.startsWith("progress: "))).toHaveLength(0)
+    expect(fieldLines.find((l) => l.startsWith("… "))).toBe("… 30 more lines of this unsent save left out")
+  })
+
+  it("a handoff that fits at once keeps the waiting save's history lines (UF-QA)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-c" })
+    unsentSave(dir, "sess-c", { objective: "o", progress: ["unsent step 0", "unsent step 1", "unsent step 2"] })
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    // nothing was over the target, so the block renders whole — history included
+    expect(result.text).toContain("progress: unsent step 0")
+    expect(result.text).toContain("progress: unsent step 2")
+    expect(result.text).not.toContain("left out")
+  })
+
   // UF-K: in the common fast-switch case the unsent save belongs to a session whose earlier save
   // is already in the merged record, so repeating every rule doubled the text and pushed the
   // merged record's reasons out. A rule the record above already shows is named once, in a

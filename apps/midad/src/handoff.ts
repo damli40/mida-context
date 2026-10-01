@@ -458,7 +458,7 @@ type ReadCheckpoint = Awaited<ReturnType<typeof readCheckpoints>>["checkpoints"]
  * "from", never "saved": the store holds it and the signature checked out, but Monad has not
  * anchored it and still may reject it.
  */
-function pendingBlock(cp: ReadCheckpoint, authorNames: Record<string, string>, merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null): string {
+function pendingBlock(cp: ReadCheckpoint, authorNames: Record<string, string>, merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null, bare = false): string {
   const c = cp.checkpoint
   const who = authorNames[cp.authorId.toLowerCase()] ?? "unknown agent"
   const lines = [
@@ -466,7 +466,14 @@ function pendingBlock(cp: ReadCheckpoint, authorNames: Record<string, string>, m
     `from ${defuse(who)} at ${defuse(c.createdAt)} (session ${defuse(cp.sessionId)}, record ${defuse(cp.contextId)})`,
   ]
   const { rules, history } = checkpointFieldLines(c, merged)
-  lines.push(...rules, ...history)
+  // UF-QA: a bare block keeps only its rule lines — history pays for the fit before any reason
+  // does, and the count line says honestly what was left out
+  lines.push(...rules)
+  if (bare) {
+    if (history.length > 0) lines.push(`… ${history.length} more line${history.length === 1 ? "" : "s"} of this pending save left out`)
+  } else {
+    lines.push(...history)
+  }
   return lines.join("\n")
 }
 
@@ -548,7 +555,7 @@ const UNSENT_MIN_CHARS = 450
  * budget; the budget only decides how many history lines (artifacts, progress, evidence) fit, and
  * the left-out count speaks of those alone.
  */
-function unsentBlock(envelope: CheckpointEnvelope, agent: string, budget: number, newerBy: string | null, merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null): string {
+function unsentBlock(envelope: CheckpointEnvelope, agent: string, budget: number, newerBy: string | null, merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null, bare = false): string {
   const c = envelope.checkpoint
   const lines = [UNSENT_LINE, `from ${defuse(agent)} at ${defuse(c.createdAt)} (session ${defuse(envelope.sessionId)}, not verified by the chain)`]
   // after failed sends the mark keeps pointing at an older compile while the session moves on —
@@ -557,14 +564,18 @@ function unsentBlock(envelope: CheckpointEnvelope, agent: string, budget: number
   const { rules, history } = checkpointFieldLines(c, merged)
   lines.push(...rules)
   const more = (n: number) => `… ${n} more line${n === 1 ? "" : "s"} of this unsent save left out`
+  // UF-QA: a bare block keeps no history lines at all — the whole history count rides the
+  // "more" line, so the block still says honestly what it left out
   let used = lines.join("\n").length
   let shown = 0
-  for (const line of history) {
-    // keep room for the "more" line whenever something will be left out
-    if (used + 1 + line.length + (shown + 1 < history.length ? 1 + more(history.length).length : 0) > budget) break
-    lines.push(line)
-    used += 1 + line.length
-    shown += 1
+  if (!bare) {
+    for (const line of history) {
+      // keep room for the "more" line whenever something will be left out
+      if (used + 1 + line.length + (shown + 1 < history.length ? 1 + more(history.length).length : 0) > budget) break
+      lines.push(line)
+      used += 1 + line.length
+      shown += 1
+    }
   }
   if (shown < history.length) lines.push(more(history.length - shown))
   return lines.join("\n")
@@ -583,6 +594,7 @@ function unsentBlocks(
   nowMs: number,
   budget: number,
   merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null,
+  bare = false,
 ): { text: string; shown: number; lastAgent?: string; lastCreatedAt?: string } {
   const blocks: string[] = []
   let left = budget
@@ -596,7 +608,7 @@ function unsentBlocks(
     // falls back to the compile's own time, which can only miss a change, never invent one
     const covered = u.coveredAt ?? Date.parse(u.envelope.checkpoint.createdAt)
     const newerBy = newest !== undefined && !Number.isNaN(covered) && newest > covered ? ageText(nowMs - newest) : null
-    const block = unsentBlock(u.envelope, u.agent, room, newerBy, merged)
+    const block = unsentBlock(u.envelope, u.agent, room, newerBy, merged, bare)
     blocks.push(block)
     left = room - block.length
     lastAgent = u.agent
@@ -886,10 +898,11 @@ export async function buildHandoff(
     for (const stored of outcome.checkpoints) {
       if (stored.migration !== undefined) movedOn.set(stored.contextId, stored.migration)
     }
-    // `rest` is the characters the final text carries besides the merged render — the marked
-    // blocks plus the joins, and a partial read's PARTIAL_LINE the same way (UF-H).
-    const rest = (markedText === "" ? 0 : markedText.length + 2) + (outcome.partial ? PARTIAL_LINE.length + 2 : 0)
-    const assemble = (reasons: "keep" | "drop", budget: number, forceOversizeNote = false) => {
+    // `restFor` is the characters the final text carries besides the merged render for a given
+    // marked-blocks text — the blocks plus the joins, and a partial read's PARTIAL_LINE the
+    // same way (UF-H).
+    const restFor = (marked: string) => (marked === "" ? 0 : marked.length + 2) + (outcome.partial ? PARTIAL_LINE.length + 2 : 0)
+    const assemble = (reasons: "keep" | "drop", budget: number, marked: string, forceOversizeNote = false) => {
       const rendered = renderHandoffReport(
         {
           ...merged,
@@ -911,18 +924,18 @@ export async function buildHandoff(
           // CAP-26 review: the marked blocks sit outside this fit, so the merge gets what they leave of
           // the 8,000-char handoff (Claude Code moves injected context over 10,000 chars to a file; the
           // MCP tool's reply cap is 40,000) — dropping its oldest progress first, never the blocks' markers.
-          ...(rest === 0 && !forceOversizeNote ? {} : { maxChars: budget }),
+          ...(restFor(marked) === 0 && !forceOversizeNote ? {} : { maxChars: budget }),
         },
       )
       const text = (() => {
-        if (markedText === "") return rendered.text
+        if (marked === "") return rendered.text
         // inside the fence, before the END line — the marked pending blocks sit beside the merged
         // sections, each under its own "not yet anchored" marker; the header's save time is the
         // anchored merge's newest effective instant, which is exactly what it claims to be
         // sliced, never String.replace: a '$&' in saved text would paste the matched END line and
         // break the fence (CAP-26 review)
         const at = rendered.text.lastIndexOf(`\n\n${HANDOFF_TAIL}`)
-        return at >= 0 ? `${rendered.text.slice(0, at)}\n\n${markedText}${rendered.text.slice(at)}` : `${rendered.text}\n\n${markedText}`
+        return at >= 0 ? `${rendered.text.slice(0, at)}\n\n${marked}${rendered.text.slice(at)}` : `${rendered.text}\n\n${marked}`
       })()
       return { rendered, finalText: outcome.partial ? `${PARTIAL_LINE}\n\n${text}` : text }
     }
@@ -935,18 +948,33 @@ export async function buildHandoff(
     // leave the data only when even a fully-trimmed history cannot fit; and when nothing fits
     // the first render goes out whole with the over-target note forced on, because a delivered
     // text over 8,000 must always say so. Each reported flag describes the chosen text.
-    const flooredBudget = Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - rest)
-    const first = assemble("keep", flooredBudget)
+    // UF-QA: the marked blocks carry their own history lines, and the same owner's order applies
+    // to them — once the merge's own trimmed history cannot fit, the blocks are rebuilt WITHOUT
+    // their history lines (rules stay, each keeping its left-out count) and the fit is tried
+    // again with reasons kept. Only then do reasons leave, against the bare blocks; the final
+    // fallback uses them too.
+    const flooredBudget = Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - restFor(markedText))
+    const first = assemble("keep", flooredBudget, markedText)
     const chosen =
       first.finalText.length <= HANDOFF_MAX_CHARS
         ? first
         : (() => {
-            const leftover = Math.max(0, HANDOFF_MAX_CHARS - rest)
-            const trimmed = assemble("keep", leftover)
+            const leftover = Math.max(0, HANDOFF_MAX_CHARS - restFor(markedText))
+            const trimmed = assemble("keep", leftover, markedText)
             if (trimmed.finalText.length <= HANDOFF_MAX_CHARS) return trimmed
-            const dropped = assemble("drop", leftover)
+            const pendingBare = pending.map((cp) => pendingBlock(cp, input.authorNames, merged, true)).join("\n\n")
+            const unsentBare = unsentBlocks(unsentFound, queued, now(), Math.max(0, UNSENT_TOTAL_CHARS - pendingBare.length), merged, true)
+            const markedBare = [pendingBare, unsentBare.text].filter((t) => t !== "").join("\n\n")
+            const marked2 = markedBare === markedText ? markedText : markedBare
+            const rest2 = restFor(marked2)
+            const leftover2 = Math.max(0, HANDOFF_MAX_CHARS - rest2)
+            if (marked2 !== markedText) {
+              const bare = assemble("keep", leftover2, marked2)
+              if (bare.finalText.length <= HANDOFF_MAX_CHARS) return bare
+            }
+            const dropped = assemble("drop", leftover2, marked2)
             if (dropped.finalText.length <= HANDOFF_MAX_CHARS) return dropped
-            return assemble("keep", flooredBudget, true)
+            return assemble("keep", Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - rest2), marked2, true)
           })()
     const { rendered, finalText } = chosen
     return {
