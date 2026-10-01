@@ -393,6 +393,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         limitChars: result.kind === "handoff" ? result.limitChars : null,
         cut: result.kind === "handoff" && result.cut,
         oversized: result.kind === "handoff" && result.oversized,
+        reasonsLeftOut: result.kind === "handoff" && result.reasonsLeftOut,
         partial: result.kind !== "refused" && result.partial,
         readMs: result.kind === "refused" ? null : result.readMs,
         ms: deps.now() - started,

@@ -11,8 +11,8 @@ const MAX_SYSTEM_MESSAGE = 160
 
 /**
  * The closing fence of every handoff text. It lives on this leaf because the MCP adapter caps
- * tool text at 8,000 chars and must never cut through it — handoff.ts re-exports the same
- * constant so the fence is defined once (mcp.ts may only reach leaf modules).
+ * the handoff reply at 40,000 chars and must never cut through it — handoff.ts re-exports the
+ * same constant so the fence is defined once (mcp.ts may only reach leaf modules).
  */
 export const HANDOFF_TAIL = "=== END MIDA HANDOFF DATA ==="
 
@@ -51,6 +51,8 @@ export interface SessionStartBody {
   savedAt?: string
   cut?: boolean
   oversized?: boolean
+  /** The daemon reports when the render left out reasons behind decisions/rejected approaches. */
+  reasonsLeftOut?: boolean
   /** The store's list was incomplete — the owner's line must say so, never claim completeness. */
   partial?: boolean
   /** The contextIds the handoff covered — the session's whats-new seen set starts from these. */

@@ -48,20 +48,23 @@ const STATUS_PROBE_TIMEOUT_MS = 8_000
 /** A save is a real chain transaction through the daemon's gates — the read budget would cut it short. */
 const SAVE_TIMEOUT_MS = 60_000
 
-/** Every tool result is capped like the handoff text: 8 000 chars, cut with the same `…` marker. */
+/** Every tool result except the handoff reply is capped at 8 000 chars, cut with the `…` marker. */
 const TOOL_TEXT_CAP = 8_000
 const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${text.slice(0, TOOL_TEXT_CAP - 1)}…` : text)
 
 /**
- * mida_handoff's cap (UF-H): the plain cut could slice the closing fence off the handoff, leaving
- * the agent reading saved, untrusted text with no end marker. A too-long handoff keeps its END
- * line instead — the kept text, then `…`, then the fence — still inside the cap. Anything without
- * the fence, and every other tool's text, caps exactly as before.
+ * mida_handoff's own cap (UF-H, widened to 40,000 in UF-I): the plain cut could slice the closing
+ * fence off the handoff, leaving the agent reading saved, untrusted text with no end marker. A
+ * too-long handoff keeps its END line instead — the kept text, then `…`, a line saying where the
+ * reply was cut, a blank line, then the fence — and the whole reply still fits the cap. A handoff
+ * text without the fence is cut the way capText cuts, at this same cap.
  */
+const HANDOFF_TEXT_CAP = 40_000
 const capHandoffText = (text: string): string => {
-  if (text.length <= TOOL_TEXT_CAP || !text.includes(HANDOFF_TAIL)) return capText(text)
-  const tail = `…\n\n${HANDOFF_TAIL}`
-  return `${text.slice(0, TOOL_TEXT_CAP - tail.length)}${tail}`
+  if (text.length <= HANDOFF_TEXT_CAP) return text
+  if (!text.includes(HANDOFF_TAIL)) return `${text.slice(0, HANDOFF_TEXT_CAP - 1)}…`
+  const tail = `…\n(Mida cut this reply at ${HANDOFF_TEXT_CAP.toLocaleString("en-US")} characters. Text after this point is missing.)\n\n${HANDOFF_TAIL}`
+  return `${text.slice(0, HANDOFF_TEXT_CAP - tail.length)}${tail}`
 }
 
 const toolText = (text: string) => ({ content: [{ type: "text" as const, text: capText(text) }] })

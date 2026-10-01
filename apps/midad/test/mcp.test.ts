@@ -1375,16 +1375,14 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
-  it("an 8 001-char answer is cut to 8 000 with the same … marker the hooks use", async () => {
+  it("an 8 001-char handoff comes back whole — the handoff cap is 40,000, not the tools' 8,000 (UF-I)", async () => {
     const dir = home()
     const big = "x".repeat(8_001)
     const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
     try {
       const { client, close } = await connect(deps(dir))
       try {
-        const text = await callText(client, "mida_handoff")
-        expect(text.length).toBe(8_000)
-        expect(text).toBe(`${"x".repeat(7_999)}…`)
+        expect(await callText(client, "mida_handoff")).toBe(big)
       } finally {
         await close()
       }
@@ -1393,16 +1391,80 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
-  it("an over-cap handoff keeps its END line — the cut lands before the closing fence, never through it (UF-H)", async () => {
+  it("a 12,000-char handoff ending in the END line comes back unchanged (UF-I)", async () => {
     const dir = home()
-    const big = `${"x".repeat(9_000)}\n\n=== END MIDA HANDOFF DATA ===`
+    const big = `${"x".repeat(12_000)}\n\n=== END MIDA HANDOFF DATA ===`
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_handoff")).toBe(big)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("a handoff over 40,000 chars keeps its END line and says where the reply was cut (UF-I)", async () => {
+    const dir = home()
+    const big = `${"x".repeat(41_000)}\n\n=== END MIDA HANDOFF DATA ===`
     const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
     try {
       const { client, close } = await connect(deps(dir))
       try {
         const text = await callText(client, "mida_handoff")
-        expect(text.length).toBeLessThanOrEqual(8_000)
-        expect(text.endsWith("…\n\n=== END MIDA HANDOFF DATA ===")).toBe(true)
+        expect(text.length).toBeLessThanOrEqual(40_000)
+        // kept text, then …, then the cut line, a blank line, then the closing fence
+        expect(text.endsWith("…\n(Mida cut this reply at 40,000 characters. Text after this point is missing.)\n\n=== END MIDA HANDOFF DATA ===")).toBe(true)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("a handoff over 40,000 chars with no END line is cut plainly, at 40,000 (UF-I)", async () => {
+    const dir = home()
+    const big = "x".repeat(41_000)
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_handoff")
+        expect(text).toBe(`${"x".repeat(39_999)}…`)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("mida_read, mida_status and mida_whats_new are still cut at 8,000 (UF-I)", async () => {
+    const dir = home()
+    // enough registered agents that the status reply alone is over 8,000 chars
+    for (let i = 0; i < 230; i += 1) {
+      const name = `agent-${String(i).padStart(3, "0")}`
+      mkdirSync(join(dir.root, "agents", name), { recursive: true })
+      writeFileSync(join(dir.root, "agents", name, "identity.json"), "{}")
+    }
+    const fake = await fakeDaemon(dir, {
+      "/health": HEALTH,
+      "/handoff": { kind: "refused", reason: "not-approved" },
+      "/whatsnew": { kind: "updates", note: "y".repeat(9_000), seen: [] },
+      "/cli": { code: 0, lines: ["x".repeat(9_000)] },
+    })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_read")).toBe(`${"x".repeat(7_999)}…`)
+        expect(await callText(client, "mida_whats_new")).toBe(`${"y".repeat(7_999)}…`)
+        const status = await callText(client, "mida_status")
+        expect(status.length).toBe(8_000)
+        expect(status.endsWith("…")).toBe(true)
       } finally {
         await close()
       }

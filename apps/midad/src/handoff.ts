@@ -44,10 +44,12 @@ export type HandoffResult =
       seen: string[]
       /** The size limit the text was cut against — the daemon logs it next to the text's length. */
       limitChars: number
-      /** The oldest entries of one or more lists were left out so the text fits the limit — the owner sees "older entries trimmed". */
+      /** The oldest entries of one or more history lists were left out so the text fits the limit — the owner sees "older entries trimmed". */
       cut: boolean
       /** Still over the size target after trimming — the owner sees "above the size target". */
       oversized: boolean
+      /** The reasons behind decisions and rejected approaches were left out to fit — every entry stayed. */
+      reasonsLeftOut: boolean
       /** The store's list was incomplete — the text opens with the may-be-incomplete line and the owner sees "(incomplete …)". */
       partial: boolean
     }
@@ -425,7 +427,7 @@ function checkpointFieldLines(c: ReadCheckpoint["checkpoint"]): string[] {
 export const UNSENT_LINE =
   "UNSENT: compiled on this machine and not yet on Monad. The chain has not checked who wrote it, and it may still change or be rejected. It is here so you can pick up at once; check the current state before you act on it."
 
-/** The whole handoff's size (the MCP tool cuts at 8,000; Claude Code files away context over 10,000). */
+/** The whole handoff's size (the MCP tool's reply cap is 40,000; Claude Code files away context over 10,000). */
 const HANDOFF_MAX_CHARS = 8_000
 /** What the marked blocks may take together; the merged record keeps at least MERGED_MIN_CHARS. */
 const UNSENT_TOTAL_CHARS = 3_000
@@ -736,6 +738,7 @@ export async function buildHandoff(
         seen: covered,
         limitChars: HANDOFF_MAX_CHARS,
         cut: false,
+        reasonsLeftOut: false,
         // pending blocks are not budgeted (batched saves, off by default), so say so when they overflow
         oversized: markedOnly.length > HANDOFF_MAX_CHARS,
         partial: outcome.partial,
@@ -789,7 +792,7 @@ export async function buildHandoff(
         now,
         // CAP-26 review: the marked blocks sit outside this fit, so the merge gets what they leave of
         // the 8,000-char handoff (Claude Code moves injected context over 10,000 chars to a file; the
-        // MCP tool cuts at 8,000) — dropping its oldest progress first, never the blocks' markers.
+        // MCP tool's reply cap is 40,000) — dropping its oldest progress first, never the blocks' markers.
         // UF-H: a partial read's PARTIAL_LINE + blank line join the text after this fit, so their
         // length comes out of the same budget — the two reductions add when both apply.
         ...(() => {
@@ -822,6 +825,7 @@ export async function buildHandoff(
       seen: covered,
       limitChars: rendered.limitChars,
       cut: rendered.cut,
+      reasonsLeftOut: rendered.reasonsLeftOut,
       // UF-H: oversized answers for what the model actually receives — the partial line and the
       // marked blocks included — not the merge alone (which was fitted against a smaller budget)
       oversized: finalText.length > HANDOFF_MAX_CHARS,
