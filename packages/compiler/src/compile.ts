@@ -5,8 +5,9 @@
 // caller instead of stored — the drainer owns storage.
 
 import { spawn } from "node:child_process"
+import { mkdtempSync, rmSync } from "node:fs"
 import os from "node:os"
-import path from "node:path"
+import path, { join } from "node:path"
 import { CONTENT_FIELDS, LIMITS, cutText, limitNote, repointEvidence, splitLimitNote, validateCheckpoint, type Checkpoint, type LimitList } from "@mida/checkpoint"
 import { extractJsonObject } from "./extract-json.js"
 import { buildExtractPrompt } from "./prompt.js"
@@ -25,7 +26,24 @@ export interface ModelCommand {
    * Without the flag stderr stays ignored — an arbitrary model's stderr is never loggable.
    */
   stderrDetail?: boolean
+  /**
+   * Extra environment for the child process, applied AFTER the ANTHROPIC_* names are
+   * stripped — and an ANTHROPIC_* name inside this map is ignored too, so a command
+   * can never smuggle a redirected endpoint or key back in.
+   */
+  env?: Readonly<Record<string, string>>
+  /**
+   * This command is an AI agent's own command-line tool (claude -p, codex exec). It
+   * runs in a fresh empty folder — never the user's project — keeps its stderr piped
+   * only to spot a usage limit (never into the failure detail), and a non-zero exit
+   * whose output names a usage limit is reported with `limit: true`.
+   */
+  agentCli?: boolean
 }
+
+/** The text shape of an agent CLI's "you are out of plan" answer — matched on stdout+stderr. */
+export const USAGE_LIMIT_PATTERN =
+  /\b(?:usage|session|weekly|rate)[ -]limit|\bquota\b|credit balance is too low/i
 
 export const DEFAULT_MODEL: ModelCommand = {
   argv: ["claude", "-p", "--model", "haiku", "--setting-sources", "project", "--strict-mcp-config"],
@@ -95,7 +113,7 @@ export type CompileResult =
     }
   | {
       ok: false
-      reason: "model-failed" | "no-json" | "invalid"
+      reason: "model-failed" | "no-json" | "invalid" | "summarizer-limit" | "no-summarizer"
       detail: string
       attempts: number
       /** 1 when the primary was re-asked once after a bad shape before the chain walked; else 0. */
@@ -128,7 +146,7 @@ type ModelRun =
       inputTokens?: number
       outputTokens?: number
     }
-  | { ok: false; detail: string; ms: number }
+  | { ok: false; detail: string; ms: number; limit?: boolean }
 
 // One bad field must not cost the whole save. Strings over the schema limit
 // are cut to it ending in "…"; arrays over the item limit keep 50 entries —
@@ -239,6 +257,26 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
   const timeoutMs = model.timeoutMs ?? DEFAULT_TIMEOUT_MS
   return new Promise((resolve) => {
     let settled = false
+    // An agent's own CLI runs in a fresh empty folder: its hooks and project
+    // files must not fire inside a user's repo. The folder goes away on every
+    // settle path — success, failure, timeout, spawn error.
+    let workDir = os.tmpdir()
+    if (model.agentCli === true) {
+      try {
+        workDir = mkdtempSync(join(os.tmpdir(), "mida-sum-"))
+      } catch (err) {
+        resolve({ ok: false, detail: `spawn: ${err instanceof Error ? err.message : String(err)}`, ms: Date.now() - t0 })
+        return
+      }
+    }
+    const cleanup = (): void => {
+      if (model.agentCli !== true) return
+      try {
+        rmSync(workDir, { recursive: true, force: true })
+      } catch {
+        // a folder that will not go away is no reason to fail the compile
+      }
+    }
     const done = (
       r:
         | {
@@ -249,10 +287,11 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
             inputTokens?: number
             outputTokens?: number
           }
-        | { ok: false; detail: string },
+        | { ok: false; detail: string; limit?: boolean },
     ) => {
       if (settled) return
       settled = true
+      cleanup()
       resolve({ ...r, ms: Date.now() - t0 })
     }
 
@@ -269,15 +308,24 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
     for (const key of Object.keys(env)) {
       if (key.startsWith("ANTHROPIC_")) delete env[key]
     }
+    // The command's own additions come last — and an ANTHROPIC_* name inside
+    // them is dropped with the rest, by the same rule as the inherited ones.
+    if (model.env !== undefined) {
+      for (const [key, value] of Object.entries(model.env)) {
+        if (!key.startsWith("ANTHROPIC_")) env[key] = value
+      }
+    }
 
     let child
     try {
       child = spawn(model.argv[0] ?? "", [...model.argv.slice(1)], {
-        cwd: os.tmpdir(),
+        cwd: workDir,
         env,
-        // stderr is piped only for commands whose stderr is a controlled channel (stderrDetail);
-        // an arbitrary model's stderr is ignored, never captured into a log line
-        stdio: ["pipe", "pipe", model.stderrDetail === true ? "pipe" : "ignore"],
+        // stderr is piped for commands whose stderr is a controlled channel (stderrDetail)
+        // and for agent CLIs, whose output is checked for a usage limit. An arbitrary
+        // model's stderr is ignored, never captured into a log line — and an agent
+        // CLI's never reaches the detail either.
+        stdio: ["pipe", "pipe", model.stderrDetail === true || model.agentCli === true ? "pipe" : "ignore"],
         detached: true,
       })
     } catch (err) {
@@ -332,8 +380,20 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
     const settle = () => {
       clearTimeout(timer)
       if (timedOut || exited === null) return
-      if (exited.code !== 0) done({ ok: false, detail: `exit ${exited.code} signal ${exited.signal}${stderrNote()}` })
-      else done({ ok: true, stdout, ...reportedUsage() })
+      if (exited.code !== 0) {
+        if (model.agentCli === true) {
+          // The limit check reads stdout plus the kept stderr — but the detail
+          // carries only the marker, never a word of the tool's own output.
+          const limit = USAGE_LIMIT_PATTERN.test(`${stdout.slice(0, 4096)}\n${stderr}`)
+          done({
+            ok: false,
+            detail: `exit ${exited.code} signal ${exited.signal}${limit ? " (usage limit)" : ""}`,
+            ...(limit ? { limit: true } : {}),
+          })
+          return
+        }
+        done({ ok: false, detail: `exit ${exited.code} signal ${exited.signal}${stderrNote()}` })
+      } else done({ ok: true, stdout, ...reportedUsage() })
     }
 
     const timer = setTimeout(() => {
@@ -535,8 +595,16 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     let usage: { cacheHitTokens?: number; cacheMissTokens?: number; inputTokens?: number; outputTokens?: number } = {}
     // the field names of the LAST invalid failure — kept for the terminal report only
     let invalidFields: string[] | undefined
+    // UF-P1: when every command of the chain ran inside this ONE attempt and every
+    // failure was a usage limit, the compile is "summarizer-limit" — a retry would
+    // hit the same walls, so it never runs. A success or any non-limit failure ends the count.
+    const chainLength = 1 + (input.fallbackModels?.length ?? 0)
+    let chainRuns = 0
+    let attemptAllLimit = true
     for (;;) {
       const run = await runModel(current, prompt)
+      chainRuns += 1
+      if (run.ok || run.limit !== true) attemptAllLimit = false
       modelMs += run.ms
       let fail: { reason: "model-failed" | "no-json" | "invalid"; detail: string; sample?: string }
       if (run.ok) {
@@ -605,6 +673,18 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
           attempts: attempt,
           retried,
           ...(invalidFields !== undefined ? { fields: invalidFields } : {}),
+          ...(lastFail.sample !== undefined ? { sample: lastFail.sample } : {}),
+          ...(fb !== undefined ? { fellBack: fb } : {}),
+        }
+      }
+      if (attemptAllLimit && chainRuns >= chainLength) {
+        const fb = fellBack()
+        return {
+          ok: false,
+          reason: "summarizer-limit",
+          detail: lastFail.detail,
+          attempts: attempt,
+          retried,
           ...(lastFail.sample !== undefined ? { sample: lastFail.sample } : {}),
           ...(fb !== undefined ? { fellBack: fb } : {}),
         }
