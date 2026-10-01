@@ -638,6 +638,11 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         dueSooner(now().getTime() + backoffMs(attempts))
         // transient: no sample — it is quoted once, on the terminal "bad" line above
         log({ sessionId, outcome: "failed", reason: code, attempts, ...fields })
+      } finally {
+        // CAP-26: a session whose job left the queue this pass — saved, skipped as unchanged,
+        // dropped, moved aside — has no save on its way, so it can never be shown as UNSENT. One
+        // check for every exit, including a restart after a crash between saving and clearing.
+        if (!deps.home.has(`queue/${job.id}.json`)) clearUnsent(deps.home, sessionId)
       }
     }
     // The batched lane's follow-up: every pass asks the store where each ledger-owned save stands.
@@ -1095,12 +1100,18 @@ function pruneQueue(home: MidaHome, now: () => Date): void {
       if (olderThan(home.path(`${dir}/${name}`), WEEK_MS)) home.remove(`${dir}/${name}`)
     }
   }
-  for (const dir of ["queue", "queue/bad", "queue/compiled", "queue/state"]) {
+  for (const dir of ["queue", "queue/bad", "queue/compiled", "queue/state", "queue/unsent"]) {
     for (const name of home.list(dir)) {
       if (name.endsWith(".tmp") && olderThan(home.path(`${dir}/${name}`), TMP_MAX_AGE_MS)) {
         home.remove(`${dir}/${name}`)
       }
     }
+  }
+  // CAP-26: an UNSENT mark whose session has no queued job left is a leftover (its job was removed
+  // on some other pass) — swept, so a later job of that session can never resurrect an old save
+  const queuedSessions = new Set(listJobs(home).map((job) => job.sessionId))
+  for (const name of home.list("queue/unsent")) {
+    if (name.endsWith(".json") && !queuedSessions.has(name.slice(0, -".json".length))) home.remove(`queue/unsent/${name}`)
   }
   // in-21 U-4 / in-22 V-2: each `new Mida()` mints one `sdk-…` session, the only unbounded
   // session source — so the sweep takes sdk- files ONLY and leaves hook and MCP session files

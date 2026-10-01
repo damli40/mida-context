@@ -410,6 +410,19 @@ describe("a failed save does not buy a new model call", () => {
     expect(readUnsent(home, "s1")).toBeUndefined()
   })
 
+  it("a mark left behind (a crash after the save landed) is cleared when the job leaves the queue (CAP-26 review)", async () => {
+    const { home, job, drain } = setup()
+    job({ event: "Stop" }, T0)
+    await drain({ now: () => new Date(T0 + 120_000) })
+    // a crash between the save and the clear would leave this behind
+    home.writeSecretJson("queue/unsent/s1.json", { eventId: "cp-leftover" })
+    // the same transcript again: the drain skips it as unchanged and removes the job
+    job({ event: "Stop" }, T0 + 130_000)
+    await drain({ now: () => new Date(T0 + 260_000) })
+    expect(listJobs(home)).toHaveLength(0)
+    expect(home.has("queue/unsent/s1.json")).toBe(false)
+  })
+
   it("a save that gives up for good is no longer marked UNSENT (CAP-26)", async () => {
     const { home, job, drain, flags } = setup()
     job({ event: "Stop" }, T0)

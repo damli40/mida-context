@@ -83,7 +83,8 @@ export function defuse(text: string): string {
     .replace(/=== BEGIN/g, "(quoted) BEGIN")
     .replace(/=== END/g, "(quoted) END")
     .split("\n")
-    .map((line) => (OWN_HEADINGS.some((h) => line.startsWith(h)) ? `> ${line}` : line))
+    // indented copies count too: a heading after leading spaces still reads as Mida's own (CAP-26 review)
+    .map((line) => (OWN_HEADINGS.some((h) => line.trimStart().startsWith(h)) ? `> ${line}` : line))
     .join("\n")
 }
 

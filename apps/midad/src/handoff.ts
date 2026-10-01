@@ -407,28 +407,66 @@ function checkpointFieldLines(c: ReadCheckpoint["checkpoint"]): string[] {
 export const UNSENT_LINE =
   "UNSENT: compiled on this machine and not yet on Monad. The chain has not checked who wrote it, and it may still change or be rejected. It is here so you can pick up at once; check the current state before you act on it."
 
-/** One UNSENT block's budget: it sits outside the merge's 8,000-char fit, so it is capped here. */
-const UNSENT_BLOCK_CHARS = 3_000
+/** The whole handoff's size (the MCP tool cuts at 8,000; Claude Code files away context over 10,000). */
+const HANDOFF_MAX_CHARS = 8_000
+/** What the marked blocks may take together; the merged record keeps at least MERGED_MIN_CHARS. */
+const UNSENT_TOTAL_CHARS = 3_000
+const MERGED_MIN_CHARS = 4_500
+/** Below this, an UNSENT block cannot say what it is and one useful field — it is not shown. */
+const UNSENT_MIN_CHARS = 450
 
 /**
  * One compiled-but-unsent save as its own marked block (CAP-26): the marker, who queued it (the
  * local job's agent name — the chain has not checked it), then its fields until the block budget,
  * with a count of what was left out. Most useful fields come first, so a cut drops old progress.
  */
-function unsentBlock(envelope: CheckpointEnvelope, agent: string): string {
+function unsentBlock(envelope: CheckpointEnvelope, agent: string, budget: number, newerBy: string | null): string {
   const c = envelope.checkpoint
   const lines = [UNSENT_LINE, `from ${defuse(agent)} at ${defuse(c.createdAt)} (session ${defuse(envelope.sessionId)}, not verified by the chain)`]
-  let used = lines.join("\n").length
+  // after failed sends the mark keeps pointing at an older compile while the session moves on —
+  // the block must not pass for the session's newest state (CAP-26 review)
+  if (newerBy !== null) lines.push(`note: this session changed again after this compile (its newest change is ${newerBy} old); that newer work is not in it`)
   const fields = checkpointFieldLines(c)
+  const more = (n: number) => `… ${n} more line${n === 1 ? "" : "s"} of this unsent save left out`
+  let used = lines.join("\n").length
   let shown = 0
   for (const line of fields) {
-    if (used + 1 + line.length > UNSENT_BLOCK_CHARS) break
+    // keep room for the "more" line whenever something will be left out
+    if (used + 1 + line.length + (shown + 1 < fields.length ? 1 + more(fields.length).length : 0) > budget) break
     lines.push(line)
     used += 1 + line.length
     shown += 1
   }
-  if (shown < fields.length) lines.push(`… ${fields.length - shown} more line${fields.length - shown === 1 ? "" : "s"} of this unsent save left out`)
+  if (shown < fields.length) lines.push(more(fields.length - shown))
   return lines.join("\n")
+}
+
+/**
+ * The UNSENT blocks that fit `budget` together, oldest compile first; a block that cannot fit its
+ * marker and one useful field is not shown — and `shown` counts only the blocks rendered, so the
+ * note's "shown below" is true.
+ */
+function unsentBlocks(
+  found: { agent: string; sessionId: string; envelope: CheckpointEnvelope }[],
+  queued: QueuedSaves | null,
+  nowMs: number,
+  budget: number,
+): { text: string; shown: number; lastAgent?: string } {
+  const blocks: string[] = []
+  let left = budget
+  let lastAgent: string | undefined
+  for (const u of found) {
+    const room = left - (blocks.length > 0 ? 2 : 0)
+    if (room < UNSENT_MIN_CHARS) break
+    const newest = queued?.newestChange.get(u.sessionId)
+    const compiledAt = Date.parse(u.envelope.checkpoint.createdAt)
+    const newerBy = newest !== undefined && !Number.isNaN(compiledAt) && newest > compiledAt ? ageText(nowMs - newest) : null
+    const block = unsentBlock(u.envelope, u.agent, room, newerBy)
+    blocks.push(block)
+    left = room - block.length
+    lastAgent = u.agent
+  }
+  return { text: blocks.join("\n\n"), shown: blocks.length, ...(lastAgent === undefined ? {} : { lastAgent }) }
 }
 
 /**
@@ -439,17 +477,24 @@ function unsentBlock(envelope: CheckpointEnvelope, agent: string): string {
 function unsentSaves(
   home: MidaHome,
   queued: QueuedSaves | null,
-  scope: { projectId: string; task: string; askingSession?: string },
-): { agent: string; envelope: CheckpointEnvelope }[] {
+  scope: { projectId: string; task: string; askingAgent: string; askingSession?: string; isRevoked: (agent: string) => boolean },
+): { agent: string; sessionId: string; envelope: CheckpointEnvelope }[] {
   if (queued === null) return []
-  const found: { agent: string; envelope: CheckpointEnvelope }[] = []
+  // An MCP caller's session id (`mcp-<agent>-…`) is never its hook session's id, so "its own save"
+  // cannot be matched by session there: an MCP or session-less caller skips its own agent's saves.
+  const byAgentOnly = scope.askingSession === undefined || scope.askingSession.startsWith("mcp-")
+  const seen = new Set<string>()
+  const found: { agent: string; sessionId: string; envelope: CheckpointEnvelope }[] = []
   for (const [agent, sessions] of queued.perAgent) {
+    if (scope.isRevoked(agent)) continue // a revoked agent's last save is never offered
+    if (byAgentOnly && agent === scope.askingAgent) continue
     for (const sessionId of sessions) {
-      if (sessionId === scope.askingSession) continue
+      if (sessionId === scope.askingSession || seen.has(sessionId)) continue
+      seen.add(sessionId) // one session queued under two agent names is still one block
       const envelope = readUnsent(home, sessionId)
       if (envelope === undefined || envelope.projectId !== scope.projectId) continue
       if ((envelope.task ?? DEFAULT_TASK) !== scope.task) continue
-      found.push({ agent, envelope })
+      found.push({ agent, sessionId, envelope })
     }
   }
   return found.sort((a, b) => Date.parse(a.envelope.checkpoint.createdAt) - Date.parse(b.envelope.checkpoint.createdAt))
@@ -509,14 +554,6 @@ export async function buildHandoff(
     // Mida's own undelivered saves are newer work this record cannot know — one read-only count,
     // after access is granted and scoped to this project. Never a queue control.
     const now = deps.now ?? (() => Date.now())
-    const queued = readQueuedSaves(runtime.home, check.projectId)
-    // CAP-26: another session's save compiled here but not yet on Monad — shown, marked UNSENT,
-    // only for a session that still has a queued job (so it has not landed), never the asking
-    // session's own, and only for this project and this session's task
-    const unsent = unsentSaves(runtime.home, queued, { projectId: check.projectId, task, askingSession: input.sessionId })
-    const unsentText = unsent.map((u) => unsentBlock(u.envelope, u.agent)).join("\n\n")
-    const pendingSavesNote = queuedSavesNote(queued, now(), unsent.length) ?? undefined
-
     const readStarted = now()
     // `settled` never rejects, so a read that finishes or fails after the deadline is discarded
     // quietly — no unhandled rejection, and its text is never logged or rendered.
@@ -579,7 +616,22 @@ export async function buildHandoff(
     const pendingText = pending.map((cp) => pendingBlock(cp, input.authorNames)).join("\n\n")
     // the marked blocks — pending (stored, not anchored) and UNSENT (compiled here, not sent) — sit
     // inside the fence beside the merge, never in it: neither is anchored state
-    const markedText = [pendingText, unsentText].filter((t) => t !== "").join("\n\n")
+    // CAP-26: another session's save compiled here but not yet on Monad, shown marked UNSENT.
+    // Read AFTER the chain read: a save that landed meanwhile (its eventId is in what the read
+    // returned, anchored or pending) is dropped, never shown twice. The note counts only the
+    // blocks that fit the shared budget, so "shown below" is true.
+    const queued = readQueuedSaves(runtime.home, check.projectId)
+    const landed = new Set(outcome.checkpoints.map((cp) => cp.checkpoint.eventId))
+    const unsentFound = unsentSaves(runtime.home, queued, {
+      projectId: check.projectId,
+      task,
+      askingAgent: agent,
+      askingSession: input.sessionId,
+      isRevoked: deps.isRevoked ?? ((name) => isRevoked(runtime.home, name)),
+    }).filter((u) => !landed.has(u.envelope.checkpoint.eventId))
+    const unsent = unsentBlocks(unsentFound, queued, now(), Math.max(0, UNSENT_TOTAL_CHARS - pendingText.length))
+    const pendingSavesNote = queuedSavesNote(queued, now(), unsent.shown) ?? undefined
+    const markedText = [pendingText, unsent.text].filter((t) => t !== "").join("\n\n")
     // the checkpoints this session may treat as covered — its own never count: a session's own
     // saves are never updates for it and must never enter its seen set. A pending save that was
     // shown marked counts as covered — the session saw it, whatever the chain later decides.
@@ -633,7 +685,10 @@ export async function buildHandoff(
         facts: facts.length,
         factsFailed,
         readMs,
-        savedBy: newestPending === undefined ? "unknown agent" : (input.authorNames[newestPending.authorId.toLowerCase()] ?? "unknown agent"),
+        savedBy:
+          newestPending !== undefined
+            ? (input.authorNames[newestPending.authorId.toLowerCase()] ?? "unknown agent")
+            : (unsent.lastAgent ?? "unknown agent"),
         savedAt: newestPending?.checkpoint.createdAt ?? "",
         seen: covered,
         limitChars: 8000,
@@ -680,16 +735,29 @@ export async function buildHandoff(
           return migration === undefined ? row : { ...row, createdAt: `${row.createdAt} ${movedOnSuffix(migration)}` }
         }),
       },
-      { authorNames: input.authorNames, facts, factsFailed, adapterNote, pendingSavesNote, otherTasks, now },
+      {
+        authorNames: input.authorNames,
+        facts,
+        factsFailed,
+        adapterNote,
+        pendingSavesNote,
+        otherTasks,
+        now,
+        // CAP-26 review: the marked blocks sit outside this fit, so the merge gets what they leave of
+        // the 8,000-char handoff (Claude Code moves injected context over 10,000 chars to a file; the
+        // MCP tool cuts at 8,000) — dropping its oldest progress first, never the blocks' markers
+        ...(markedText === "" ? {} : { maxChars: Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - markedText.length - 2) }),
+      },
     )
     const text = (() => {
       if (markedText === "") return rendered.text
       // inside the fence, before the END line — the marked pending blocks sit beside the merged
       // sections, each under its own "not yet anchored" marker; the header's save time is the
       // anchored merge's newest effective instant, which is exactly what it claims to be
-      return rendered.text.includes(`\n\n${HANDOFF_TAIL}`)
-        ? rendered.text.replace(`\n\n${HANDOFF_TAIL}`, `\n\n${markedText}\n\n${HANDOFF_TAIL}`)
-        : `${rendered.text}\n\n${markedText}`
+      // sliced, never String.replace: a '$&' in saved text would paste the matched END line and
+      // break the fence (CAP-26 review)
+      const at = rendered.text.lastIndexOf(`\n\n${HANDOFF_TAIL}`)
+      return at >= 0 ? `${rendered.text.slice(0, at)}\n\n${markedText}${rendered.text.slice(at)}` : `${rendered.text}\n\n${markedText}`
     })()
     return {
       kind: "handoff",
