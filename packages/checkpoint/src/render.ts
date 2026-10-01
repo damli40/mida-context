@@ -149,7 +149,7 @@ export interface RenderedHandoff {
   text: string
   /** The final text's length — what the model receives. */
   chars: number
-  /** The size limit the text was cut against. */
+  /** The size target the render worked to — the text may still be over it (`oversized`). */
   limitChars: number
   /** At least one history entry — an old progress entry, a save line or an artifact — was left out. */
   cut: boolean

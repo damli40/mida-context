@@ -213,7 +213,7 @@ describe("renderHandoff", () => {
 })
 
 describe("renderHandoffReport (R5-4)", () => {
-  it("reports the text's size, the limit it was cut against, and that nothing was cut", () => {
+  it("reports the text's size, the size target it was rendered to, and that nothing was cut", () => {
     const out = renderHandoffReport(base)
     expect(out.text).toBe(renderHandoff(base))
     expect(out.chars).toBe(out.text.length)

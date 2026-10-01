@@ -42,7 +42,7 @@ export type HandoffResult =
       savedAt: string
       /** The foreign contextIds this handoff covered, oldest first — the session's whats-new seen set starts here. */
       seen: string[]
-      /** The size limit the text was cut against — the daemon logs it next to the text's length. */
+      /** The render's size target — the daemon logs it next to the text's length. */
       limitChars: number
       /** The oldest entries of one or more history lists were left out so the text fits the limit — the owner sees "older entries trimmed". */
       cut: boolean
@@ -499,9 +499,11 @@ function unsentBlock(envelope: CheckpointEnvelope, agent: string, budget: number
 }
 
 /**
- * The UNSENT blocks that fit `budget` together, oldest compile first; a block that cannot fit its
- * marker and one useful field is not shown — and `shown` counts only the blocks rendered, so the
- * note's "shown below" is true.
+ * The UNSENT blocks, oldest compile first, while the shared `budget` has room to start one — the
+ * budget only decides whether a block begins and how many of its HISTORY lines show; a block's
+ * rule lines always render whole, so a rendered block can run past what was left. A block whose
+ * remaining room cannot hold its marker and one useful field is not shown — and `shown` counts
+ * only the blocks rendered, so the note's "shown below" is true.
  */
 function unsentBlocks(
   found: { agent: string; sessionId: string; envelope: CheckpointEnvelope; coveredAt?: number }[],
@@ -692,7 +694,7 @@ export async function buildHandoff(
     // CAP-26: another session's save compiled here but not yet on Monad, shown marked UNSENT.
     // Read AFTER the chain read: a save that landed meanwhile (its eventId is in what the read
     // returned, anchored or pending) is dropped, never shown twice. The note counts only the
-    // blocks that fit the shared budget, so "shown below" is true.
+    // blocks the shared budget still had room to render, so "shown below" is true.
     const queued = readQueuedSaves(runtime.home, check.projectId)
     const landed = new Set(outcome.checkpoints.map((cp) => cp.checkpoint.eventId))
     const revokedCheck = deps.isRevoked ?? ((name: string) => isRevoked(runtime.home, name))
