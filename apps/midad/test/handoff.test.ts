@@ -14,7 +14,7 @@ import { MidaAgent } from "@mida/sdk"
 import { ChainBusyError } from "@mida/chain"
 import { CHAIN_BUSY_TEXT, STORE_CHAIN_MISCONFIGURED_TEXT, STORE_RPC_AUTH_TEXT, MidaHome, NAMESPACE, buildHandoff, readCheckpoints } from "@mida/midad"
 import type { HandoffDeps, MigrationEnvelope, ProjectCheck, Runtime } from "@mida/midad"
-import { checkAccess } from "../src/handoff.js"
+import { PARTIAL_LINE, checkAccess } from "../src/handoff.js"
 import { addPendingAnchor, keepPendingPlaintext } from "../src/batching.js"
 import { enqueue } from "../src/queue.js"
 import { markUnsent } from "../src/unsent.js"
@@ -636,6 +636,45 @@ describe("buildHandoff", () => {
     // the checkpoint that DID load is still in the report — partial means "maybe more", not "discard"
     expect(result.text).toContain(stored().contextId)
     expect(result.text.startsWith("Some saved context could not be loaded yet; what follows may be incomplete.")).toBe(true)
+  })
+
+  it("a partial read's may-be-incomplete line counts toward the 8,000-char fit (UF-H)", async () => {
+    // the same trimmable merge as the cut test above, but partial: the rendered text used to be
+    // fitted to 8,000 and then have PARTIAL_LINE + a blank line put in front, landing over
+    const progress = Array.from({ length: 400 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
+    const { d } = deps({ read: async () => ({ checkpoints: [stored({ progress })], skipped: 0, milliseconds: 1, partial: true }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toMatchObject({ kind: "handoff", partial: true, cut: true, oversized: false })
+    if (result.kind !== "handoff") return
+    expect(result.text.startsWith(PARTIAL_LINE)).toBe(true)
+    expect(result.text.length).toBeLessThanOrEqual(8_000)
+  })
+
+  it("the partial line and a marked block's reductions add together (UF-H)", async () => {
+    // a PENDING_ANCHOR block beside a trimmable merge, with a partial read: both the block's
+    // length and PARTIAL_LINE + 2 must come out of the merge's budget
+    const progress = Array.from({ length: 400 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
+    const pending = { ...stored({ nextAction: "ship it" }), anchor: "PENDING_ANCHOR" as const }
+    const { d } = deps({ read: async () => ({ checkpoints: [stored({ progress }), pending], skipped: 0, milliseconds: 1, partial: true }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toMatchObject({ kind: "handoff", partial: true, oversized: false })
+    if (result.kind !== "handoff") return
+    expect(result.text.startsWith(PARTIAL_LINE)).toBe(true)
+    expect(result.text).toContain("PENDING_ANCHOR")
+    expect(result.text.length).toBeLessThanOrEqual(8_000)
+  })
+
+  it("oversized is judged on the FINAL text — marked blocks and the partial line included (UF-H)", async () => {
+    // the pending block is untrimmable and huge: the merge fits its floor budget, so the old
+    // rendered.oversized stayed false while the delivered text sailed past 8,000
+    const progress = Array.from({ length: 400 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
+    const pending = { ...stored({ nextAction: "a".repeat(5_000) }), anchor: "PENDING_ANCHOR" as const }
+    const { d } = deps({ read: async () => ({ checkpoints: [stored({ progress }), pending], skipped: 0, milliseconds: 1, partial: true }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toMatchObject({ kind: "handoff", partial: true, oversized: true })
+    if (result.kind !== "handoff") return
+    expect(result.text.length).toBeGreaterThan(8_000)
+    expect(result.text.startsWith(PARTIAL_LINE)).toBe(true)
   })
 
   it("a partial read with no usable checkpoints says the list may be incomplete — never 'nothing saved'", async () => {

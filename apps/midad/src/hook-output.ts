@@ -9,6 +9,13 @@
 /** The warning line must stay a line — hard cap, counting the ellipsis. */
 const MAX_SYSTEM_MESSAGE = 160
 
+/**
+ * The closing fence of every handoff text. It lives on this leaf because the MCP adapter caps
+ * tool text at 8,000 chars and must never cut through it — handoff.ts re-exports the same
+ * constant so the fence is defined once (mcp.ts may only reach leaf modules).
+ */
+export const HANDOFF_TAIL = "=== END MIDA HANDOFF DATA ==="
+
 /** Anything shaped like a raw id or key never reaches the owner's line. */
 const LONG_HEX = /0x[0-9a-f]{40,}|[0-9a-f]{40,}/gi
 

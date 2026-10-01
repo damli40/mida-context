@@ -1393,6 +1393,40 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
+  it("an over-cap handoff keeps its END line — the cut lands before the closing fence, never through it (UF-H)", async () => {
+    const dir = home()
+    const big = `${"x".repeat(9_000)}\n\n=== END MIDA HANDOFF DATA ===`
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_handoff")
+        expect(text.length).toBeLessThanOrEqual(8_000)
+        expect(text.endsWith("…\n\n=== END MIDA HANDOFF DATA ===")).toBe(true)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("a handoff of exactly 8 000 chars ending in the END line comes back unchanged (UF-H)", async () => {
+    const dir = home()
+    const exact = `${"x".repeat(8_000 - "…\n\n=== END MIDA HANDOFF DATA ===".length)}…\n\n=== END MIDA HANDOFF DATA ===`
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: exact, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_handoff")).toBe(exact)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
   it("an unknown tool name is a protocol error, and no owner tool exists to call", async () => {
     const { client, close } = await connect(deps(home(), { daemonUp: false }))
     try {

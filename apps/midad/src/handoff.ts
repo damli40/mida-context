@@ -5,7 +5,7 @@ import { isReadDeadlineError } from "@mida/chain"
 import { compareChainOrder, defuse, handoffHeader, mergeCheckpoints, otherTasksBlock, otherTasksFor, renderHandoffReport, taskOf } from "@mida/checkpoint"
 import type { MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
 import { chainRefusalReason } from "./chain-busy.js"
-import { CHAIN_REFUSAL_TEXT } from "./hook-output.js"
+import { CHAIN_REFUSAL_TEXT, HANDOFF_TAIL } from "./hook-output.js"
 import { CODING_CLIENTS } from "./install.js"
 import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { movedOnSuffix } from "./migration-envelope.js"
@@ -117,7 +117,9 @@ export const PARTIAL_LINE = "Some saved context could not be loaded yet; what fo
  */
 export const PENDING_ANCHOR_LINE = "PENDING_ANCHOR: not yet anchored on Monad; may still be rejected"
 const HANDOFF_BEGIN = "=== BEGIN MIDA HANDOFF DATA ==="
-const HANDOFF_TAIL = "=== END MIDA HANDOFF DATA ==="
+// the closing fence is defined on the hook-output leaf so the MCP adapter's cap can reach it
+// without importing this module (mcp.test.ts walks that graph)
+export { HANDOFF_TAIL }
 
 /** The queued-job scan reads at most this many files — a flooded queue costs one bounded look. */
 const QUEUE_NOTE_SCAN_LIMIT = 200
@@ -787,8 +789,14 @@ export async function buildHandoff(
         now,
         // CAP-26 review: the marked blocks sit outside this fit, so the merge gets what they leave of
         // the 8,000-char handoff (Claude Code moves injected context over 10,000 chars to a file; the
-        // MCP tool cuts at 8,000) — dropping its oldest progress first, never the blocks' markers
-        ...(markedText === "" ? {} : { maxChars: Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - markedText.length - 2) }),
+        // MCP tool cuts at 8,000) — dropping its oldest progress first, never the blocks' markers.
+        // UF-H: a partial read's PARTIAL_LINE + blank line join the text after this fit, so their
+        // length comes out of the same budget — the two reductions add when both apply.
+        ...(() => {
+          const overhead =
+            (markedText === "" ? 0 : markedText.length + 2) + (outcome.partial ? PARTIAL_LINE.length + 2 : 0)
+          return overhead === 0 ? {} : { maxChars: Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - overhead) }
+        })(),
       },
     )
     const text = (() => {
@@ -801,9 +809,10 @@ export async function buildHandoff(
       const at = rendered.text.lastIndexOf(`\n\n${HANDOFF_TAIL}`)
       return at >= 0 ? `${rendered.text.slice(0, at)}\n\n${markedText}${rendered.text.slice(at)}` : `${rendered.text}\n\n${markedText}`
     })()
+    const finalText = outcome.partial ? `${PARTIAL_LINE}\n\n${text}` : text
     return {
       kind: "handoff",
-      text: outcome.partial ? `${PARTIAL_LINE}\n\n${text}` : text,
+      text: finalText,
       checkpoints: outcome.checkpoints.length,
       facts: facts.length,
       factsFailed,
@@ -813,7 +822,9 @@ export async function buildHandoff(
       seen: covered,
       limitChars: rendered.limitChars,
       cut: rendered.cut,
-      oversized: rendered.oversized,
+      // UF-H: oversized answers for what the model actually receives — the partial line and the
+      // marked blocks included — not the merge alone (which was fitted against a smaller budget)
+      oversized: finalText.length > HANDOFF_MAX_CHARS,
       partial: outcome.partial,
     }
   } catch (error) {

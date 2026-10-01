@@ -5,7 +5,7 @@ import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } fr
 import { callDaemon, socketPathFor } from "./control.js"
 import type { ControlReply } from "./control.js"
 import type { MidaHome } from "./home.js"
-import { CHAIN_REFUSAL_TEXT, degradedMessage } from "./hook-output.js"
+import { CHAIN_REFUSAL_TEXT, HANDOFF_TAIL, degradedMessage } from "./hook-output.js"
 import type { SessionStartBody } from "./hook-output.js"
 import { appendLog } from "./log.js"
 import { HOOK_CLIENTS, MCP_CLIENT_TOOLS } from "./mcp-clients.js"
@@ -52,7 +52,20 @@ const SAVE_TIMEOUT_MS = 60_000
 const TOOL_TEXT_CAP = 8_000
 const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${text.slice(0, TOOL_TEXT_CAP - 1)}…` : text)
 
+/**
+ * mida_handoff's cap (UF-H): the plain cut could slice the closing fence off the handoff, leaving
+ * the agent reading saved, untrusted text with no end marker. A too-long handoff keeps its END
+ * line instead — the kept text, then `…`, then the fence — still inside the cap. Anything without
+ * the fence, and every other tool's text, caps exactly as before.
+ */
+const capHandoffText = (text: string): string => {
+  if (text.length <= TOOL_TEXT_CAP || !text.includes(HANDOFF_TAIL)) return capText(text)
+  const tail = `…\n\n${HANDOFF_TAIL}`
+  return `${text.slice(0, TOOL_TEXT_CAP - tail.length)}${tail}`
+}
+
 const toolText = (text: string) => ({ content: [{ type: "text" as const, text: capText(text) }] })
+const handoffToolText = (text: string) => ({ content: [{ type: "text" as const, text: capHandoffText(text) }] })
 const degraded = (reason: string) => toolText(degradedMessage(reason))
 
 export const MCP_USAGE = "usage: mida-mcp --as <client> [--project <dir>] [--task <name>]   (--as is required — each client carries its own identity)"
@@ -344,7 +357,7 @@ async function toolHandoff(deps: McpServerDeps) {
       // a failed baseline write only means a later whats-new may re-offer what this covered
     }
   }
-  return toolText(body.text)
+  return handoffToolText(body.text)
 }
 
 /**
