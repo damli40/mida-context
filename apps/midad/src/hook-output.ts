@@ -125,8 +125,8 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
     const size =
       body.cut === true
         ? body.oversized === true
-          ? "oldest progress trimmed; still above the size target"
-          : "oldest progress trimmed to fit"
+          ? "older entries trimmed; still above the size target"
+          : "older entries trimmed to fit"
         : body.oversized === true
           ? "above the size target"
           : null

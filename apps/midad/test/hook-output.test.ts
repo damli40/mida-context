@@ -77,7 +77,7 @@ describe("sessionStartMessage", () => {
       cut: true,
     }
     const line = sessionStartMessage(body, "codex", NOW)
-    expect(line).toContain("(oldest progress trimmed to fit)")
+    expect(line).toContain("(older entries trimmed to fit)")
     expect(line).not.toContain("shortened")
     expect(line).not.toContain("longer than the limit")
   })
@@ -94,7 +94,7 @@ describe("sessionStartMessage", () => {
     }
     expect(sessionStartMessage(body, "codex", NOW)).toContain("(above the size target)")
     const both = { ...body, cut: true }
-    expect(sessionStartMessage(both, "codex", NOW)).toContain("(oldest progress trimmed; still above the size target)")
+    expect(sessionStartMessage(both, "codex", NOW)).toContain("(older entries trimmed; still above the size target)")
   })
 
   it("a partial store list joins after the size part with '; ' — never a comma list of states (in-20 T-3)", () => {

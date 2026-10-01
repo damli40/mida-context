@@ -44,7 +44,7 @@ export type HandoffResult =
       seen: string[]
       /** The size limit the text was cut against — the daemon logs it next to the text's length. */
       limitChars: number
-      /** Oldest progress entries were left out so the text fits the limit — the owner sees "oldest progress trimmed". */
+      /** The oldest entries of one or more lists were left out so the text fits the limit — the owner sees "older entries trimmed". */
       cut: boolean
       /** Still over the size target after trimming — the owner sees "above the size target". */
       oversized: boolean

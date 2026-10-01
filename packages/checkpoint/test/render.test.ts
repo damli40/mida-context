@@ -192,10 +192,13 @@ describe("renderHandoff", () => {
     expect(text).toMatch(/\(\d+ earlier progress entries left out\)/)
     expect(text).not.toContain("progress entry number 0 ")
   })
-  it("says so plainly when nothing but progress could be cut and it still does not fit", () => {
+  it("a long request with many decisions keeps the request whole and leaves out the oldest decisions (PROV-14)", () => {
     const text = renderHandoff({ ...base, originalRequest: "r".repeat(6000), decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i} ${"y".repeat(150)}`, rationale: "z".repeat(150) })) })
     expect(text).toContain("r".repeat(6000))
-    expect(text).toContain("(handoff longer than the limit; nothing further was cut)")
+    expect(text.length).toBeLessThanOrEqual(8000)
+    expect(text).toMatch(/\(\d+ earlier decisions left out\)/)
+    expect(text).toContain("d49 ") // the newest decision stays
+    expect(text).not.toContain("nothing further was cut")
   })
 })
 
@@ -223,11 +226,61 @@ describe("renderHandoffReport (R5-4)", () => {
     expect(out.text).toContain("(handoff longer than the limit; nothing further was cut)")
   })
   it("a handoff that was trimmed AND still does not fit reports both", () => {
+    // only what is never left out (the request) can keep a trimmed handoff over the limit
     const progress = Array.from({ length: 400 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
-    const decisions = Array.from({ length: 60 }, (_, i) => ({ decision: `d${i} ${"y".repeat(300)}`, rationale: "z".repeat(300) }))
-    const out = renderHandoffReport({ ...base, progress, decisions })
+    const out = renderHandoffReport({ ...base, originalRequest: "r".repeat(9000), progress })
     expect(out.cut).toBe(true)
     expect(out.oversized).toBe(true)
+  })
+})
+
+// PROV-14 (Oct 1): on the live home 81 of 99 served handoffs were over 8,000 chars (up to 32,481)
+// because only progress could be left out. Claude Code files away injected context over 10,000.
+describe("the handoff fits its limit by leaving out the oldest entries, least important first (PROV-14)", () => {
+  const many = <T,>(n: number, make: (i: number) => T): T[] => Array.from({ length: n }, (_, i) => make(i))
+  const big: MergedHandoff = {
+    ...base,
+    originalRequest: "Build the owner page. ".repeat(40),
+    remainingPlan: many(6, (i) => `plan step ${i}: ${"p".repeat(60)}`),
+    progress: many(120, (i) => `progress ${i} ${"x".repeat(80)}`),
+    provenance: many(60, (i) => ({ agent: "claude-code", authorId: "0xclaudeauthor", createdAt: `2026-09-2${i % 9}T10:00:00Z`, contextId: `0xsave${String(i).padStart(3, "0")}${"0".repeat(54)}`, compiledBy: "deepseek-flash" })),
+    artifacts: many(80, (i) => `src/file-${i}.ts`),
+    rejected: many(30, (i) => ({ approach: `rejected ${i} ${"r".repeat(80)}`, why: "w".repeat(80) })),
+    decisions: many(60, (i) => ({ decision: `decision ${i} ${"d".repeat(90)}`, rationale: "b".repeat(90) })),
+    constraints: many(30, (i) => `constraint ${i} ${"c".repeat(80)}`),
+  }
+
+  it("a 60-save session fits 8,000 chars, keeps what must never go, and says what was left out", () => {
+    const out = renderHandoffReport(big)
+    expect(out.chars).toBeLessThanOrEqual(8000)
+    expect(out.oversized).toBe(false)
+    expect(out.cut).toBe(true)
+    // never left out: the request, every plan step, the next action, the objective
+    expect(out.text).toContain("Build the owner page. ".repeat(40).trim())
+    for (let i = 0; i < 6; i += 1) expect(out.text).toContain(`plan step ${i}:`)
+    expect(out.text).toContain("Next action: wire it")
+    expect(out.text).toContain("Objective: build X")
+    // the newest of each list stays; the oldest go, with a count
+    expect(out.text).toContain("progress 119 ")
+    expect(out.text).toContain("0xsave059")
+    expect(out.text).toMatch(/\(\d+ earlier saves left out\)/)
+    expect(out.text).toMatch(/\(\d+ earlier progress entries left out\)/)
+    expect(out.text).not.toContain("nothing further was cut")
+  })
+
+  it("leaves content alone when leaving out old progress and old save lines is enough", () => {
+    const out = renderHandoffReport({ ...base, progress: big.progress, provenance: big.provenance, decisions: many(8, (i) => ({ decision: `keep decision ${i}`, rationale: "why" })) })
+    expect(out.chars).toBeLessThanOrEqual(8000)
+    for (let i = 0; i < 8; i += 1) expect(out.text).toContain(`keep decision ${i} `)
+    expect(out.text).not.toMatch(/earlier decisions left out/)
+  })
+
+  it("constraints go last: decisions and rejected approaches are left out before any constraint", () => {
+    const out = renderHandoffReport({ ...base, decisions: big.decisions, rejected: big.rejected, constraints: many(12, (i) => `rule ${i} ${"c".repeat(40)}`) })
+    expect(out.chars).toBeLessThanOrEqual(8000)
+    for (let i = 0; i < 12; i += 1) expect(out.text).toContain(`rule ${i} `)
+    expect(out.text).toMatch(/earlier (decisions|rejected approaches) left out/)
+    expect(out.text).not.toMatch(/earlier constraints left out/)
   })
 })
 

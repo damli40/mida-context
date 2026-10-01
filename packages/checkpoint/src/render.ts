@@ -156,6 +156,18 @@ export function renderHandoff(
   return renderHandoffReport(merged, options).text
 }
 
+/** How many of each list's OLDEST entries a fitted handoff leaves out (PROV-14). */
+interface Trim {
+  progress: number
+  savedBy: number
+  artifacts: number
+  rejected: number
+  decisions: number
+  constraints: number
+}
+/** Least important first: bookkeeping before content, and constraints — standing rules — last. */
+const TRIM_ORDER: (keyof Trim)[] = ["progress", "savedBy", "artifacts", "rejected", "decisions", "constraints"]
+
 /**
  * The render plus an honest account of its size: `cut` means oldest progress entries were left
  * out, `oversized` means the text is still longer than the limit (the text says so itself). A
@@ -193,8 +205,11 @@ export function renderHandoffReport(
     .filter((line): line is string => line !== undefined)
     .join("\n")
   const cut = (s: string, n = 300) => (s.length > n ? s.slice(0, n - 1) + "…" : s)
-  const list = (title: string, items: string[]): string | null =>
-    items.length ? `${title}:\n${items.map((i) => `- ${cut(defuse(i))}`).join("\n")}` : null
+  // `dropped` oldest items are left out and named by one count line (PROV-14)
+  const list = (title: string, items: string[], dropped = 0, noun = "entries"): string | null =>
+    items.length
+      ? `${title}:\n${[...(dropped > 0 ? [`- (${dropped} earlier ${noun} left out)`] : []), ...items.slice(dropped).map((i) => `- ${cut(defuse(i))}`)].join("\n")}`
+      : null
   // Who saved each record is decided by the chain's authorId, never by the agent name the
   // checkpoint claims — the claim is shown only as a quote when it disagrees.
   const authorName = (authorId: string): string => options.authorNames?.[authorId.toLowerCase()] ?? "unknown agent"
@@ -204,7 +219,8 @@ export function renderHandoffReport(
     return resolved === p.agent ? line : `${line} — the checkpoint itself claims "${defuse(p.agent)}"`
   }
 
-  const build = (dropped: number, note: string | null = null): string => {
+  const build = (trim: Trim, note: string | null = null): string => {
+    const dropped = trim.progress
     const parts: string[] = []
     if (merged.originalRequest !== null) {
       parts.push(
@@ -223,10 +239,10 @@ export function renderHandoffReport(
     parts.push(`Next action: ${defuse(merged.nextAction)}`)
     parts.push(`Objective: ${defuse(merged.objective)}`)
     parts.push(`Unresolved issue: ${merged.unresolvedIssue === null ? "none" : defuse(merged.unresolvedIssue)}`)
-    push(list("Decisions", merged.decisions.map((d) => `${defuse(d.decision)} — because: ${defuse(d.rationale)}`)))
-    push(list("Rejected approaches", merged.rejected.map((r) => `${defuse(r.approach)} — ${defuse(r.why)}`)))
-    push(list("Constraints", merged.constraints))
-    push(list("Artifacts", merged.artifacts))
+    push(list("Decisions", merged.decisions.map((d) => `${defuse(d.decision)} — because: ${defuse(d.rationale)}`), trim.decisions, "decisions"))
+    push(list("Rejected approaches", merged.rejected.map((r) => `${defuse(r.approach)} — ${defuse(r.why)}`), trim.rejected, "rejected approaches"))
+    push(list("Constraints", merged.constraints, trim.constraints, "constraints"))
+    push(list("Artifacts", merged.artifacts, trim.artifacts, "artifacts"))
     // Facts the owner told Mida once, kept ahead of progress: under the size limit the original
     // request and plan are preserved first, then every fact, and progress is what gets trimmed.
     if (options.facts !== undefined && options.facts.length > 0) {
@@ -268,34 +284,52 @@ export function renderHandoffReport(
     if (merged.carriedForwardFromEarlierSave) {
       parts.push("(Some entries were restored from an earlier save because the newest one looked incomplete.)")
     }
-    push(list("Saved by", merged.provenance.map(savedBy)))
+    push(list("Saved by", merged.provenance.map(savedBy), trim.savedBy, "saves"))
     if (note !== null) parts.push(note)
     return `${preamble}\n${BEGIN}\n\n${parts.join("\n\n")}\n\n${TAIL}`
   }
 
-  // Dropping more oldest-progress entries only ever makes the output shorter,
-  // so the smallest count that fits is found by binary search instead of a
-  // drop-one-and-rebuild loop (thousands of entries → thousands of rebuilds).
-  let dropped = 0
-  let out = build(0)
-  if (out.length > maxChars && merged.progress.length > 1) {
-    const hi = merged.progress.length - 1 // always keep at least one entry
-    if (build(hi).length <= maxChars) {
+  // PROV-14: the handoff fits its limit by leaving out the OLDEST entries of one list at a time,
+  // least important first — progress, then the per-save "Saved by" lines, then artifacts,
+  // rejected approaches, decisions and, last, constraints (a dropped constraint is a rule the
+  // next agent may break). The newest entry of every list always stays, and each list says how
+  // many it left out. The request, the remaining plan, the next action, the objective, the
+  // unresolved issue and the owner's facts are never left out: if those alone do not fit, the
+  // text says so. Before this only progress could go, and on a real home 81 of 99 handoffs ran
+  // over the limit (up to 32,481 chars). Leaving out more only ever shortens the output, so each
+  // list's smallest sufficient count is found by binary search, not a rebuild per entry.
+  const sizes: Trim = {
+    progress: merged.progress.length,
+    savedBy: merged.provenance.length,
+    artifacts: merged.artifacts.length,
+    rejected: merged.rejected.length,
+    decisions: merged.decisions.length,
+    constraints: merged.constraints.length,
+  }
+  const trim: Trim = { progress: 0, savedBy: 0, artifacts: 0, rejected: 0, decisions: 0, constraints: 0 }
+  let out = build(trim)
+  for (const key of TRIM_ORDER) {
+    if (out.length <= maxChars) break
+    const hi = sizes[key] - 1 // always keep the newest entry
+    if (hi <= 0) continue
+    const fitsAt = (n: number) => build({ ...trim, [key]: n }).length <= maxChars
+    if (fitsAt(hi)) {
       let lo = 0
       let upper = hi
       while (lo < upper) {
         const mid = (lo + upper) >> 1
-        if (build(mid).length <= maxChars) upper = mid
+        if (fitsAt(mid)) upper = mid
         else lo = mid + 1
       }
-      dropped = lo
+      trim[key] = lo
     } else {
-      dropped = hi
+      trim[key] = hi
     }
-    out = build(dropped)
+    out = build(trim)
   }
   if (out.length > maxChars) {
-    out = build(dropped, "(handoff longer than the limit; nothing further was cut)")
+    out = build(trim, "(handoff longer than the limit; nothing further was cut)")
   }
+  const dropped = TRIM_ORDER.reduce((sum, key) => sum + trim[key], 0)
   return { text: out, chars: out.length, limitChars: maxChars, cut: dropped > 0, oversized: out.length > maxChars }
 }
