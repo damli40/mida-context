@@ -1,10 +1,13 @@
 import type { MergedHandoff } from "./merge.js"
 
 // Renders a merged handoff as plain text for the receiving agent.
-// The ORIGINAL REQUEST section leads the block — the user's own words, not a
-// summary — and is never trimmed. When the output would exceed maxChars the
-// oldest progress entries collapse into a count line; nothing else is cut
-// silently, and a still-oversize result says so in the text itself.
+// Constraints lead the block — the standing rules sit ahead of the user's own
+// words (ORIGINAL REQUEST, never trimmed) — and constraints, decisions and
+// rejected approaches are never left out. When the output would exceed maxChars
+// only history shrinks: the oldest progress, saved-by and artifact entries
+// collapse into count lines. When that is still not enough, the reasons behind
+// decisions and rejected approaches go (every entry stays), and a still-oversize
+// result says so in a preamble note rather than dropping a rule.
 //
 // The output is text injected into another model's context, so it is fenced:
 // a header built per render sits ahead of the BEGIN line and tells the reader
@@ -59,7 +62,9 @@ const OWN_HEADINGS = [
   "Objective:",
   "Unresolved issue:",
   "Decisions:",
+  "Decisions (reasons left out to fit):",
   "Rejected approaches:",
+  "Rejected approaches (reasons left out to fit):",
   "Constraints:",
   "Artifacts:",
   "Progress:",
@@ -83,8 +88,12 @@ export function defuse(text: string): string {
     .replace(/=== BEGIN/g, "(quoted) BEGIN")
     .replace(/=== END/g, "(quoted) END")
     .split("\n")
-    // indented copies count too: a heading after leading spaces still reads as Mida's own (CAP-26 review)
-    .map((line) => (OWN_HEADINGS.some((h) => line.trimStart().startsWith(h)) ? `> ${line}` : line))
+    // indented copies count too: a heading after leading spaces still reads as Mida's own
+    // (CAP-26 review) — and so does a forged "(N earlier …" count line (UF-I)
+    .map((line) => {
+      const trimmedStart = line.trimStart()
+      return OWN_HEADINGS.some((h) => trimmedStart.startsWith(h)) || /^\(\d+ earlier /.test(trimmedStart) ? `> ${line}` : line
+    })
     .join("\n")
 }
 
@@ -126,10 +135,12 @@ export interface RenderedHandoff {
   chars: number
   /** The size limit the text was cut against. */
   limitChars: number
-  /** Oldest progress entries were left out so the text fits the limit. */
+  /** At least one history entry — an old progress entry, a save line or an artifact — was left out. */
   cut: boolean
-  /** Still longer than the limit after trimming — the text itself says so. */
+  /** Still longer than the limit after trimming — the text itself says so in a preamble note. */
   oversized: boolean
+  /** The reasons behind decisions and rejected approaches were left out to fit; every entry stayed. */
+  reasonsLeftOut: boolean
 }
 
 export function renderHandoff(
@@ -156,22 +167,25 @@ export function renderHandoff(
   return renderHandoffReport(merged, options).text
 }
 
-/** How many of each list's OLDEST entries a fitted handoff leaves out (PROV-14). */
+/**
+ * How many of each history list's OLDEST entries a fitted handoff leaves out (UF-I). History is
+ * the only thing that trims: constraints, decisions and rejected approaches are rules — they are
+ * never left out, and the renderer never prints a count line for them.
+ */
 interface Trim {
   progress: number
   savedBy: number
   artifacts: number
-  rejected: number
-  decisions: number
-  constraints: number
 }
-/** Least important first: bookkeeping before content, and constraints — standing rules — last. */
-const TRIM_ORDER: (keyof Trim)[] = ["progress", "savedBy", "artifacts", "rejected", "decisions", "constraints"]
+/** Bookkeeping before content: progress first, then the per-save "Saved by" lines, then artifacts. */
+const TRIM_ORDER: (keyof Trim)[] = ["progress", "savedBy", "artifacts"]
 
 /**
- * The render plus an honest account of its size: `cut` means oldest progress entries were left
- * out, `oversized` means the text is still longer than the limit (the text says so itself). A
- * caller that logs the handoff should record all three numbers, never re-derive them.
+ * The render plus an honest account of its size: `cut` means history entries were left out,
+ * `reasonsLeftOut` means the reasons behind decisions and rejected approaches went (the entries
+ * all stayed), `oversized` means the text is still longer than the limit (a preamble line in the
+ * text says exactly what was left out). A caller that logs the handoff should record these, never
+ * re-derive them.
  */
 export function renderHandoffReport(
   merged: MergedHandoff,
@@ -219,17 +233,35 @@ export function renderHandoffReport(
     return resolved === p.agent ? line : `${line} — the checkpoint itself claims "${defuse(p.agent)}"`
   }
 
-  const build = (trim: Trim, note: string | null = null): string => {
+  // Constraints show once: two entries that differ only in case, spacing or a trailing
+  // punctuation mark are the same rule — the first spelling is the one shown (UF-I).
+  const seenConstraints = new Set<string>()
+  const constraints = merged.constraints.filter((c) => {
+    const key = c
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/[.!;,]+\s*$/, "")
+      .trimEnd()
+    if (seenConstraints.has(key)) return false
+    seenConstraints.add(key)
+    return true
+  })
+
+  const build = (trim: Trim, reasonsOff: boolean, note: string | null = null): string => {
     const dropped = trim.progress
     const parts: string[] = []
+    const push = (s: string | null) => {
+      if (s !== null) parts.push(s)
+    }
+    // Constraints lead: the standing rules sit above the request, so the thing the agent reads
+    // first is the thing that must still hold (UF-I).
+    push(list("Constraints", constraints))
     if (merged.originalRequest !== null) {
       parts.push(
         "ORIGINAL REQUEST (the user's own words, copied from the first message — not a summary):\n" +
           defuse(merged.originalRequest),
       )
-    }
-    const push = (s: string | null) => {
-      if (s !== null) parts.push(s)
     }
     push(
       merged.remainingPlan.length
@@ -239,9 +271,20 @@ export function renderHandoffReport(
     parts.push(`Next action: ${defuse(merged.nextAction)}`)
     parts.push(`Objective: ${defuse(merged.objective)}`)
     parts.push(`Unresolved issue: ${merged.unresolvedIssue === null ? "none" : defuse(merged.unresolvedIssue)}`)
-    push(list("Decisions", merged.decisions.map((d) => `${defuse(d.decision)} — because: ${defuse(d.rationale)}`), trim.decisions, "decisions"))
-    push(list("Rejected approaches", merged.rejected.map((r) => `${defuse(r.approach)} — ${defuse(r.why)}`), trim.rejected, "rejected approaches"))
-    push(list("Constraints", merged.constraints, trim.constraints, "constraints"))
+    // Reasons off: still over the limit after history trimmed — every decision and rejected
+    // approach keeps its entry, only the "because" / "why" go, and the headings say so (UF-I).
+    push(
+      list(
+        reasonsOff ? "Decisions (reasons left out to fit)" : "Decisions",
+        merged.decisions.map((d) => (reasonsOff ? defuse(d.decision) : `${defuse(d.decision)} — because: ${defuse(d.rationale)}`)),
+      ),
+    )
+    push(
+      list(
+        reasonsOff ? "Rejected approaches (reasons left out to fit)" : "Rejected approaches",
+        merged.rejected.map((r) => (reasonsOff ? defuse(r.approach) : `${defuse(r.approach)} — ${defuse(r.why)}`)),
+      ),
+    )
     push(list("Artifacts", merged.artifacts, trim.artifacts, "artifacts"))
     // Facts the owner told Mida once, kept ahead of progress: under the size limit the original
     // request and plan are preserved first, then every fact, and progress is what gets trimmed.
@@ -285,51 +328,76 @@ export function renderHandoffReport(
       parts.push("(Some entries were restored from an earlier save because the newest one looked incomplete.)")
     }
     push(list("Saved by", merged.provenance.map(savedBy), trim.savedBy, "saves"))
-    if (note !== null) parts.push(note)
-    return `${preamble}\n${BEGIN}\n\n${parts.join("\n\n")}\n\n${TAIL}`
+    // An oversized handoff says so in the preamble — after the header and the caller's notes,
+    // before the fence — where the agent reads it before any data (UF-I).
+    return `${note === null ? preamble : `${preamble}\n${note}`}\n${BEGIN}\n\n${parts.join("\n\n")}\n\n${TAIL}`
   }
 
-  // PROV-14: the handoff fits its limit by leaving out the OLDEST entries of one list at a time,
-  // least important first — progress, then the per-save "Saved by" lines, then artifacts,
-  // rejected approaches, decisions and, last, constraints (a dropped constraint is a rule the
-  // next agent may break). The newest entry of every list always stays, and each list says how
-  // many it left out. The request, the remaining plan, the next action, the objective, the
-  // unresolved issue and the owner's facts are never left out: if those alone do not fit, the
-  // text says so. Before this only progress could go, and on a real home 81 of 99 handoffs ran
-  // over the limit (up to 32,481 chars). Leaving out more only ever shortens the output, so each
-  // list's smallest sufficient count is found by binary search, not a rebuild per entry.
+  // UF-I: the handoff fits its limit by leaving out the OLDEST entries of the history lists only —
+  // progress first, then the per-save "Saved by" lines, then artifacts. Constraints, decisions and
+  // rejected approaches are rules the next agent must keep; they are never left out. The newest
+  // entry of every trimmed list always stays, each trimmed list says how many it left out, and a
+  // trim is taken only when it really shortens the text (a count line can cost more than the short
+  // entry it replaces). The request, the remaining plan, the next action, the objective, the
+  // unresolved issue and the owner's facts are never left out either. Leaving out more only ever
+  // shortens the output, so each list's smallest sufficient count is found by binary search, not a
+  // rebuild per entry.
   const sizes: Trim = {
     progress: merged.progress.length,
     savedBy: merged.provenance.length,
     artifacts: merged.artifacts.length,
-    rejected: merged.rejected.length,
-    decisions: merged.decisions.length,
-    constraints: merged.constraints.length,
   }
-  const trim: Trim = { progress: 0, savedBy: 0, artifacts: 0, rejected: 0, decisions: 0, constraints: 0 }
-  let out = build(trim)
-  for (const key of TRIM_ORDER) {
-    if (out.length <= maxChars) break
-    const hi = sizes[key] - 1 // always keep the newest entry
-    if (hi <= 0) continue
-    const fitsAt = (n: number) => build({ ...trim, [key]: n }).length <= maxChars
-    if (fitsAt(hi)) {
-      let lo = 0
-      let upper = hi
-      while (lo < upper) {
-        const mid = (lo + upper) >> 1
-        if (fitsAt(mid)) upper = mid
-        else lo = mid + 1
+  const fitOnce = (reasonsOff: boolean): { trim: Trim; text: string } => {
+    const trim: Trim = { progress: 0, savedBy: 0, artifacts: 0 }
+    let out = build(trim, reasonsOff)
+    for (const key of TRIM_ORDER) {
+      if (out.length <= maxChars) break
+      const hi = sizes[key] - 1 // always keep the newest entry
+      if (hi <= 0) continue
+      const fitsAt = (n: number) => build({ ...trim, [key]: n }, reasonsOff).length <= maxChars
+      if (fitsAt(hi)) {
+        let lo = 0
+        let upper = hi
+        while (lo < upper) {
+          const mid = (lo + upper) >> 1
+          if (fitsAt(mid)) upper = mid
+          else lo = mid + 1
+        }
+        trim[key] = lo
+      } else {
+        // does not fit even at the newest entry alone — leaving out the oldest still gives a few
+        // more chars back, but only take it when the count line is not longer than what it replaces
+        const shorter = build({ ...trim, [key]: hi }, reasonsOff)
+        if (shorter.length < out.length) {
+          trim[key] = hi
+          out = shorter
+          continue
+        }
       }
-      trim[key] = lo
-    } else {
-      trim[key] = hi
+      out = build(trim, reasonsOff)
     }
-    out = build(trim)
+    return { trim, text: out }
   }
+
+  let { trim, text: out } = fitOnce(false)
+  // Still over with history trimmed: the reasons behind decisions and rejected approaches go next
+  // — every entry stays, only the "because" / "why" go. With no reasons to drop the text cannot
+  // change, so the step is skipped; otherwise history is re-fit under the shorter lines and keeps
+  // as much of it as now fits.
+  const reasonsLeftOut = out.length > maxChars && (merged.decisions.length > 0 || merged.rejected.length > 0)
+  if (reasonsLeftOut) ({ trim, text: out } = fitOnce(true))
+  // Still over even then: deliver it whole — a rule is never dropped to shorten the handoff —
+  // with one preamble line that says exactly what was left out (or that nothing was).
   if (out.length > maxChars) {
-    out = build(trim, "(handoff longer than the limit; nothing further was cut)")
+    const leftOut: string[] = []
+    if (trim.progress > 0) leftOut.push(`${trim.progress} earlier progress ${trim.progress === 1 ? "entry" : "entries"}`)
+    if (trim.savedBy > 0) leftOut.push(`${trim.savedBy} earlier ${trim.savedBy === 1 ? "save" : "saves"}`)
+    if (trim.artifacts > 0) leftOut.push(`${trim.artifacts} earlier ${trim.artifacts === 1 ? "artifact" : "artifacts"}`)
+    if (reasonsLeftOut && merged.decisions.length > 0) leftOut.push("the reasons behind decisions")
+    if (reasonsLeftOut && merged.rejected.length > 0) leftOut.push("the reasons behind rejected approaches")
+    const note = `Mida note: this handoff is longer than its size target. No constraint, decision or rejected approach was left out to shorten it.${leftOut.length > 0 ? ` Left out: ${leftOut.join(", ")}.` : " Nothing was left out."}`
+    out = build(trim, reasonsLeftOut, note)
   }
   const dropped = TRIM_ORDER.reduce((sum, key) => sum + trim[key], 0)
-  return { text: out, chars: out.length, limitChars: maxChars, cut: dropped > 0, oversized: out.length > maxChars }
+  return { text: out, chars: out.length, limitChars: maxChars, cut: dropped > 0, oversized: out.length > maxChars, reasonsLeftOut }
 }
