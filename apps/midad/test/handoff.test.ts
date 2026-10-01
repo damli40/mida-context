@@ -1454,6 +1454,73 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     expect(fieldLines.some((l) => l.startsWith("the same as in the record above"))).toBe(false)
   })
 
+  // UF-L: the match key was `${decision}${rationale}` — no separator — so decision "ab" with
+  // reason "c" in the block collided with decision "a" with reason "bc" in the record, and a
+  // different decision was omitted as if repeated.
+  it("a decision split differently than the record's is shown, not omitted (UF-L)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-c" })
+    unsentSave(dir, "sess-c", { decisions: [{ decision: "ab", rationale: "c" }] })
+    const landed = stored({ decisions: [{ decision: "a", rationale: "bc" }] }, { sessionId: "sess-c" })
+    const { d } = deps({ read: async () => ({ checkpoints: [landed], skipped: 0, milliseconds: 1, partial: false }), now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    const fieldLines = unsentFieldLines(result.text)
+    expect(fieldLines).toContain("decision: ab — because: c")
+    expect(fieldLines.some((l) => l.startsWith("the same as in the record above"))).toBe(false)
+  })
+
+  it("a rejected approach with the same name but a different reason is shown, not omitted (UF-L)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-c" })
+    unsentSave(dir, "sess-c", { rejected: [{ approach: "webpack", why: "a different reason than the record's" }] })
+    const landed = stored({ rejected: [{ approach: "webpack", why: "slower for this" }] }, { sessionId: "sess-c" })
+    const { d } = deps({ read: async () => ({ checkpoints: [landed], skipped: 0, milliseconds: 1, partial: false }), now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    const fieldLines = unsentFieldLines(result.text)
+    expect(fieldLines).toContain("rejected approach: webpack — a different reason than the record's")
+    expect(fieldLines.some((l) => l.startsWith("the same as in the record above"))).toBe(false)
+  })
+
+  it("a PENDING block beside a merged record omits repeated rules and prints the count line (UF-L)", async () => {
+    const dir = queueHome()
+    const rules = {
+      constraints: ["never push to main"],
+      decisions: [{ decision: "use pnpm", rationale: "shared lockfile" }],
+      rejected: [{ approach: "webpack", why: "slower for this" }],
+    }
+    const landed = stored(rules)
+    const pending = { ...stored(rules, { sessionId: "sess-p" }), anchor: "PENDING_ANCHOR" as const }
+    const { d } = deps({ read: async () => ({ checkpoints: [landed, pending], skipped: 0, milliseconds: 1, partial: false }), now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    // the PENDING block's own "field: value" lines for the repeated rules are gone …
+    expect(result.text).not.toContain("constraint: never push to main")
+    expect(result.text).not.toContain("decision: use pnpm — because: shared lockfile")
+    expect(result.text).not.toContain("rejected approach: webpack — slower for this")
+    // … replaced by the one count line (the merged record's "- …" lines still show each rule)
+    expect(result.text).toContain("the same as in the record above, not repeated: 1 constraint, 1 decision, 1 rejected approach")
+    expect(result.text).toContain("- never push to main")
+  })
+
+  it("a rule listed twice in the block counts once in the 'not repeated' line (UF-L)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-c" })
+    unsentSave(dir, "sess-c", { constraints: ["never push to main", "never push to main"] })
+    const landed = stored({ constraints: ["never push to main"] }, { sessionId: "sess-c" })
+    const { d } = deps({ read: async () => ({ checkpoints: [landed], skipped: 0, milliseconds: 1, partial: false }), now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    const fieldLines = unsentFieldLines(result.text)
+    // one DISTINCT rule was not repeated — the record above shows it once, so the count is 1
+    expect(fieldLines).toContain("the same as in the record above, not repeated: 1 constraint")
+  })
+
   it("reading the queue never changes it — every byte is as it was", async () => {
     const dir = queueHome()
     job(dir, {}, "2026-09-25T10:00:00.000Z")

@@ -422,14 +422,18 @@ function checkpointFieldLines(
   const one = (text: string) => defuse(text).replace(/\s*\n\s*/g, " / ")
   // a rule matches the record only as a whole entry: a constraint on its text, a decision on
   // decision AND reason, a rejected approach on approach AND why — the same decision text with
-  // a different reason is a different rule and stays (UF-K)
+  // a different reason is a different rule and stays (UF-K). The key is a JSON pair, never a
+  // plain join: "a"+"bc" equals "ab"+"c", which would omit a DIFFERENT decision as if it were
+  // already shown (UF-L).
   const mergedConstraints = new Set(merged?.constraints ?? [])
-  const mergedDecisions = new Set((merged?.decisions ?? []).map((d) => `${d.decision}${d.rationale}`))
-  const mergedRejected = new Set((merged?.rejected ?? []).map((r) => `${r.approach}${r.why}`))
-  const repeated = { constraints: 0, decisions: 0, rejected: 0 }
+  const mergedDecisions = new Set((merged?.decisions ?? []).map((d) => JSON.stringify([d.decision, d.rationale])))
+  const mergedRejected = new Set((merged?.rejected ?? []).map((r) => JSON.stringify([r.approach, r.why])))
+  // the count line counts DISTINCT rules the record already shows — a rule listed twice in the
+  // block was still repeated once (UF-L)
+  const repeated = { constraints: new Set<string>(), decisions: new Set<string>(), rejected: new Set<string>() }
   const rules: string[] = []
   for (const k of c.constraints) {
-    if (mergedConstraints.has(k)) repeated.constraints += 1
+    if (mergedConstraints.has(k)) repeated.constraints.add(k)
     else rules.push(`constraint: ${one(k)}`)
   }
   if (c.objective !== "") rules.push(`objective: ${one(c.objective)}`)
@@ -437,17 +441,19 @@ function checkpointFieldLines(
   if (c.nextAction !== "") rules.push(`next action: ${one(c.nextAction)}`)
   if (c.unresolvedIssue !== null && c.unresolvedIssue !== "") rules.push(`unresolved issue: ${one(c.unresolvedIssue)}`)
   for (const d of c.decisions) {
-    if (mergedDecisions.has(`${d.decision}${d.rationale}`)) repeated.decisions += 1
+    const key = JSON.stringify([d.decision, d.rationale])
+    if (mergedDecisions.has(key)) repeated.decisions.add(key)
     else rules.push(`decision: ${one(d.decision)} — because: ${one(d.rationale)}`)
   }
   for (const r of c.rejected) {
-    if (mergedRejected.has(`${r.approach}${r.why}`)) repeated.rejected += 1
+    const key = JSON.stringify([r.approach, r.why])
+    if (mergedRejected.has(key)) repeated.rejected.add(key)
     else rules.push(`rejected approach: ${one(r.approach)} — ${one(r.why)}`)
   }
   const notRepeated = [
-    repeated.constraints === 0 ? null : `${repeated.constraints} constraint${repeated.constraints === 1 ? "" : "s"}`,
-    repeated.decisions === 0 ? null : `${repeated.decisions} decision${repeated.decisions === 1 ? "" : "s"}`,
-    repeated.rejected === 0 ? null : `${repeated.rejected} rejected approach${repeated.rejected === 1 ? "" : "es"}`,
+    repeated.constraints.size === 0 ? null : `${repeated.constraints.size} constraint${repeated.constraints.size === 1 ? "" : "s"}`,
+    repeated.decisions.size === 0 ? null : `${repeated.decisions.size} decision${repeated.decisions.size === 1 ? "" : "s"}`,
+    repeated.rejected.size === 0 ? null : `${repeated.rejected.size} rejected approach${repeated.rejected.size === 1 ? "" : "es"}`,
   ].filter((part): part is string => part !== null)
   if (notRepeated.length > 0) rules.push(`the same as in the record above, not repeated: ${notRepeated.join(", ")}`)
   const history: string[] = []
