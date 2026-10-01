@@ -5,8 +5,8 @@ import { fileURLToPath } from "node:url"
 import { namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { HIDDEN_LIMIT_MS, armTeardown, renderMe, revocableStore } from "../src/me/page.js"
-import type { AgentRow, MeData, MePorts, RecordRow } from "../src/me/sources.js"
-import { AGENT_LIST_NEEDS_INDEX, BLOCKED_AT_STORE_TEXT, NO_INDEX_BADGE_TEXT, PARTIAL_LIST_TEXT } from "../src/me/sources.js"
+import type { MeData, MePorts, RecordRow } from "../src/me/sources.js"
+import { AGENT_LIST_NEEDS_INDEX, NO_INDEX_BADGE_TEXT, PARTIAL_LIST_TEXT } from "../src/me/sources.js"
 
 /**
  * Task 5's page tests. The plan prescribes a jsdom environment pragma, but jsdom is not a
@@ -133,37 +133,9 @@ function all(root: FakeEl, sel: string): FakeEl[] {
 
 const OWNER = `0x${"aa".repeat(20)}` as Address
 const AGENT = `0x${"11".repeat(32)}` as Hex
-const CAP = `0x${"44".repeat(32)}` as Hex
 const NS = namespaceId("projects.current")
 const TX = `0x${"7a".repeat(32)}` as Hex
 const CTX = `0x${"cc".repeat(32)}` as Hex
-
-type Grant = AgentRow["grants"][number]
-
-function grant(over: Partial<Grant> = {}): Grant {
-  return {
-    namespaceId: NS,
-    area: "projects.current",
-    permissions: 1 | 2 | 4,
-    capabilityId: CAP,
-    status: { label: "Can read", flagged: false, unchecked: false },
-    approvedTx: TX,
-    ...over,
-  }
-}
-
-function agent(over: Partial<AgentRow> = {}): AgentRow {
-  return {
-    agentId: AGENT,
-    name: "claude-code",
-    grants: [grant()],
-    revokedTx: null,
-    blockedAtStore: false,
-    readLive: true,
-    unverified: false,
-    ...over,
-  }
-}
 
 function record(over: Partial<RecordRow> = {}): RecordRow {
   return {
@@ -188,16 +160,16 @@ function record(over: Partial<RecordRow> = {}): RecordRow {
 function data(over: Partial<MeData> = {}): MeData {
   return {
     owner: OWNER,
-    agents: [agent()],
+    agents: [],
     records: [record()],
     incomplete: [],
-    agentsUnavailable: null,
+    agentsUnavailable: AGENT_LIST_NEEDS_INDEX,
     recordsUnavailable: false,
-    source: "index",
-    lag: { text: "9 s behind Monad", stale: false },
+    source: "unavailable",
+    lag: { text: NO_INDEX_BADGE_TEXT, stale: false },
     batchingOn: true,
     batchedListComplete: true,
-    counts: { records: 31, youSaid: 9, pending: 2 },
+    counts: null,
     ...over,
   }
 }
@@ -207,12 +179,10 @@ const openText = (text: string, provenanceSource: number | null = null) => () =>
 // --- the render contract ----------------------------------------------------------------------
 
 describe("renderMe", () => {
-  it("an agent named like an attack renders as literal text and creates no element", () => {
+  it("a record author named like an attack renders as literal text and creates no element", () => {
     const evil = '<img src=x onerror=alert(1)>'
-    const root = renderMe(data({ agents: [agent({ name: evil })] }), fakeDoc()) as unknown as FakeEl
-    const name = root.querySelector(".agent-name")
-    expect(name).not.toBeNull()
-    expect(name!.textContent).toBe(evil)
+    const root = renderMe(data({ records: [record({ authorName: evil })] }), fakeDoc()) as unknown as FakeEl
+    expect(root.textContent).toContain(evil)
     expect(all(root, "img")).toHaveLength(0)
     expect(all(root, "script")).toHaveLength(0)
   })
@@ -230,10 +200,7 @@ describe("renderMe", () => {
 
   it("a tx value that is not a 32-byte hash renders no link; a real hash links", () => {
     // every tx field in this fixture is malformed — no <a> may exist anywhere
-    const bad = data({
-      agents: [agent({ grants: [grant({ approvedTx: "not-a-hash" as Hex })], revokedTx: "also-not" as Hex })],
-      records: [record({ tx: "0xZZZ-not-a-hash" as Hex })],
-    })
+    const bad = data({ records: [record({ tx: "0xZZZ-not-a-hash" as Hex })] })
     const rootBad = renderMe(bad, fakeDoc()) as unknown as FakeEl
     expect(all(rootBad, "a")).toHaveLength(0)
 
@@ -247,179 +214,22 @@ describe("renderMe", () => {
     }
   })
 
-  it("an incomplete list shows the banner and hides the index counts", () => {
-    const root = renderMe(
-      data({ incomplete: [PARTIAL_LIST_TEXT], counts: null }),
-      fakeDoc(),
-    ) as unknown as FakeEl
+  it("an incomplete list shows the banner, and no count tile carries a figure", () => {
+    const root = renderMe(data({ incomplete: [PARTIAL_LIST_TEXT] }), fakeDoc()) as unknown as FakeEl
     const banners = all(root, ".me-banner")
     expect(banners.length).toBe(1)
     expect(banners[0]!.textContent).toBe(PARTIAL_LIST_TEXT)
-    // the counts the index would have supplied are absent — no tile may carry a figure
     expect(all(root, "[data-count]")).toHaveLength(0)
   })
 
-  it("complete data shows the three count tiles with their figures", () => {
+  it("the agent area says the page does not list agents — never '0 agents' or 'none granted'", () => {
     const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
-    const tiles = all(root, "[data-count]")
-    expect(tiles).toHaveLength(3)
-    const texts = tiles.map((t) => t.textContent)
-    expect(texts.some((t) => t.includes("31"))).toBe(true)
-    expect(texts.some((t) => t.includes("9"))).toBe(true)
-    expect(texts.some((t) => t.includes("2"))).toBe(true)
-  })
-
-  it("a store-denied agent reads 'blocked at the store'", () => {
-    const root = renderMe(
-      data({ agents: [agent({ blockedAtStore: true, readLive: false })] }),
-      fakeDoc(),
-    ) as unknown as FakeEl
-    const row = root.querySelector(".agent")
-    expect(row).not.toBeNull()
-    expect(row!.textContent).toContain(BLOCKED_AT_STORE_TEXT)
-    // and it must never be described as able to read
-    expect(row!.textContent).not.toContain("Can read")
-  })
-
-  it("a missing index reads the needs-index sentence — never '0 agents' or 'none granted'", () => {
-    const root = renderMe(
-      data({ agents: [], agentsUnavailable: AGENT_LIST_NEEDS_INDEX, counts: null }),
-      fakeDoc(),
-    ) as unknown as FakeEl
     const unavailable = AGENT_LIST_NEEDS_INDEX
     // once on the summary tile in place of the count, once where the list would be
     const hits = all(root, ".agent-meta").concat(all(root, ".n")).filter((el) => el.textContent.includes(unavailable))
     expect(hits.length).toBeGreaterThanOrEqual(2)
     expect(root.textContent).not.toContain("0 agents can read")
     expect(root.textContent).not.toContain("No agents have been granted access")
-  })
-
-  it("agents the chain could not be asked about are counted, not rounded down to '0 can read'", () => {
-    // two rows exist, the reads for both failed — "0 agents can read" would be a false negative
-    const unverifiable = agent({ readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
-    const another = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
-    const root = renderMe(data({ agents: [unverifiable, another] }), fakeDoc()) as unknown as FakeEl
-    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
-    expect(lead).not.toBeNull()
-    expect(lead!.textContent).toBe("0 agents · 2 could not be checked just now")
-    expect(root.textContent).not.toContain("0 agents can read")
-  })
-
-  it("a mixed list counts both figures — live readers and the unchecked tail", () => {
-    const unknown = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
-    const root = renderMe(data({ agents: [agent(), unknown] }), fakeDoc()) as unknown as FakeEl
-    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
-    expect(lead!.textContent).toBe("1 agent · 1 could not be checked just now")
-  })
-
-  it("a stale index with live readers keeps the count and admits the lag (in-26 Q-2)", () => {
-    // lag measured past the stale line — "is behind", never "may be"
-    const other = agent({ agentId: `0x${"22".repeat(32)}` as Hex })
-    const root = renderMe(
-      data({ agents: [agent(), other], lag: { text: "≈ 160 s behind Monad", stale: true } }),
-      fakeDoc(),
-    ) as unknown as FakeEl
-    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
-    expect(lead!.textContent).toBe(
-      "At least 2 agents can read your context. The index is behind Monad, so a new approval may not show yet.",
-    )
-  })
-
-  it("a stale index with no live readers says none can read — as far as the index shows (in-26 Q-2)", () => {
-    // live 0 + unchecked 2: "0 agents" would state a fact the stale index cannot prove
-    const a = agent({ readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
-    const b = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
-    const root = renderMe(
-      data({ agents: [a, b], lag: { text: "≈ 160 s behind Monad", stale: true } }),
-      fakeDoc(),
-    ) as unknown as FakeEl
-    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
-    expect(lead!.textContent).toBe(
-      "No agent can read your context, as far as the index shows. 2 could not be checked just now. The index is behind Monad, so a new approval may not show yet.",
-    )
-  })
-
-  it("an index that cannot say how fresh it is answers 'may be behind' (in-26 Q-2)", () => {
-    // freshness unknown — the index answered but its own progress was unreadable
-    const root = renderMe(
-      data({ lag: { text: "index freshness unknown", stale: true } }),
-      fakeDoc(),
-    ) as unknown as FakeEl
-    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
-    expect(lead!.textContent).toBe(
-      "At least 1 agent can read your context. The index may be behind Monad, so a new approval may not show yet.",
-    )
-  })
-
-  it("unknown freshness with no live readers still names the unchecked count (in-26 Q-2)", () => {
-    const a = agent({ readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
-    const root = renderMe(
-      data({ agents: [a], lag: { text: "index freshness unknown", stale: true } }),
-      fakeDoc(),
-    ) as unknown as FakeEl
-    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
-    expect(lead!.textContent).toBe(
-      "No agent can read your context, as far as the index shows. 1 could not be checked just now. The index may be behind Monad, so a new approval may not show yet.",
-    )
-  })
-
-  it("a stale index with both live and unchecked agents names both counts (in-27 R-3)", () => {
-    // live ≥1 + unchecked ≥1 was the one stale-state split the tests did not pin
-    const unknown = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
-    const root = renderMe(
-      data({ agents: [agent(), unknown], lag: { text: "≈ 160 s behind Monad", stale: true } }),
-      fakeDoc(),
-    ) as unknown as FakeEl
-    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
-    expect(lead!.textContent).toBe(
-      "At least 1 agent can read your context. 1 could not be checked just now. The index is behind Monad, so a new approval may not show yet.",
-    )
-  })
-
-  it("a stale index over an empty list says none can read — and still admits the lag (in-27 R-3)", () => {
-    const root = renderMe(
-      data({ agents: [], lag: { text: "≈ 160 s behind Monad", stale: true } }),
-      fakeDoc(),
-    ) as unknown as FakeEl
-    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
-    expect(lead!.textContent).toBe(
-      "No agent can read your context, as far as the index shows. The index is behind Monad, so a new approval may not show yet.",
-    )
-  })
-
-  it("unknown freshness with both live and unchecked agents names both counts (in-27 R-3)", () => {
-    const unknown = agent({ agentId: `0x${"22".repeat(32)}` as Hex, readLive: false, unverified: true, grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })] })
-    const root = renderMe(
-      data({ agents: [agent(), unknown], lag: { text: "index freshness unknown", stale: true } }),
-      fakeDoc(),
-    ) as unknown as FakeEl
-    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
-    expect(lead!.textContent).toBe(
-      "At least 1 agent can read your context. 1 could not be checked just now. The index may be behind Monad, so a new approval may not show yet.",
-    )
-  })
-
-  it("unknown freshness over an empty list still admits it cannot say (in-27 R-3)", () => {
-    const root = renderMe(
-      data({ agents: [], lag: { text: "index freshness unknown", stale: true } }),
-      fakeDoc(),
-    ) as unknown as FakeEl
-    const lead = root.querySelector(".tile-lead")!.querySelector(".n")
-    expect(lead!.textContent).toBe(
-      "No agent can read your context, as far as the index shows. The index may be behind Monad, so a new approval may not show yet.",
-    )
-  })
-
-  it("a grant whose chain check never ran says 'could not check Monad just now', not an index disagreement", () => {
-    const unreachable = agent({
-      readLive: false,
-      grants: [grant({ status: { label: "Unverified", flagged: true, unchecked: true } })],
-    })
-    const root = renderMe(data({ agents: [unreachable] }), fakeDoc()) as unknown as FakeEl
-    const status = root.querySelector(".grant-status")
-    expect(status).not.toBeNull()
-    expect(status!.textContent).toBe("Unverified — could not check Monad just now")
-    expect(status!.textContent).not.toContain("disagrees")
   })
 
   it("a store that failed every listing says 'could not load records' — never 'holds no records'", () => {
@@ -429,32 +239,6 @@ describe("renderMe", () => {
     // and a store that answered empty stays "holds no records" — the two are not interchangeable
     const empty = renderMe(data({ records: [], recordsUnavailable: false }), fakeDoc()) as unknown as FakeEl
     expect(empty.textContent).toContain("The store holds no records")
-  })
-
-  it("a flagged grant names the listing that spoke — the index", () => {
-    const flagged = agent({ readLive: false, grants: [grant({ status: { label: "Revoked", flagged: true, unchecked: false } })] })
-    const fromIndex = renderMe(data({ agents: [flagged] }), fakeDoc()) as unknown as FakeEl
-    expect(fromIndex.querySelector(".grant-status")!.textContent).toBe("Revoked — the index disagrees with the chain")
-  })
-
-  it("count tiles name their source — index figures 'per the index', the pending figure 'per the store'", () => {
-    const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
-    expect(root.querySelector('[data-count="records"]')!.textContent).toContain("per the index")
-    expect(root.querySelector('[data-count="youSaid"]')!.textContent).toContain("per the index")
-    const pending = root.querySelector('[data-count="pending"]')
-    expect(pending).not.toBeNull()
-    expect(pending!.textContent).toContain("waiting to be anchored")
-    expect(pending!.textContent).toContain("per the store")
-    // no invented block number anywhere in the figures
-    expect(root.textContent).not.toMatch(/block \d/i)
-  })
-
-  it("the pending tile hides outright when the store's batched list could not be fully read", () => {
-    const root = renderMe(data({ batchedListComplete: false }), fakeDoc()) as unknown as FakeEl
-    expect(root.querySelector('[data-count="pending"]')).toBeNull()
-    expect(root.textContent).not.toContain("waiting to be anchored")
-    // the index's own figures still show — they do not depend on the store list
-    expect(root.querySelector('[data-count="records"]')).not.toBeNull()
   })
 
   it("provenance badges only ever ride on anchored rows — unverified and pending read Source unknown", () => {
@@ -486,27 +270,15 @@ describe("renderMe", () => {
     expect(unchecked.textContent).not.toContain("disagrees with Monad")
   })
 
-  it("with no index deployed the badge names what the page read, on a normal dot", () => {
-    const root = renderMe(
-      data({ source: "unavailable", lag: { text: NO_INDEX_BADGE_TEXT, stale: false } }),
-      fakeDoc(),
-    ) as unknown as FakeEl
+  it("the badge names what the page read, on a normal dot", () => {
+    const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
     expect(root.textContent).toContain("Records come from the store and are checked on Monad")
     expect(root.textContent).not.toContain("unreachable")
     expect(all(root, ".dot-stale")).toEqual([])
   })
 
-  it("the page a no-index deployment renders never names an index or Envio", () => {
-    const root = renderMe(
-      data({
-        agents: [],
-        agentsUnavailable: AGENT_LIST_NEEDS_INDEX,
-        counts: null,
-        source: "unavailable",
-        lag: { text: NO_INDEX_BADGE_TEXT, stale: false },
-      }),
-      fakeDoc(),
-    ) as unknown as FakeEl
+  it("the rendered page never names an index or Envio", () => {
+    const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
     expect(root.textContent).not.toMatch(/envio/i)
     expect(root.textContent).not.toMatch(/\bindex/i)
     expect(root.textContent).toContain("Run mida doctor in your terminal to see the agents approved on that machine.")
@@ -515,10 +287,7 @@ describe("renderMe", () => {
   })
 
   it("a failed or partial read shows the warning dot beside the badge", () => {
-    const root = renderMe(
-      data({ source: "unavailable", lag: { text: NO_INDEX_BADGE_TEXT, stale: true } }),
-      fakeDoc(),
-    ) as unknown as FakeEl
+    const root = renderMe(data({ lag: { text: NO_INDEX_BADGE_TEXT, stale: true } }), fakeDoc()) as unknown as FakeEl
     expect(all(root, ".dot-stale").length).toBe(1)
   })
 
@@ -531,15 +300,6 @@ describe("renderMe", () => {
     const page = readFileSync(join(here, "../src/me/page.ts"), "utf8")
     expect(page).toContain('"Your records, and who wrote them."')
     expect(page).not.toContain("reading agents, grants")
-  })
-
-  it("a failed index reads 'index unavailable' on the badge", () => {
-    const root = renderMe(
-      data({ source: "unavailable", lag: { text: "index unavailable", stale: true } }),
-      fakeDoc(),
-    ) as unknown as FakeEl
-    expect(root.textContent).toContain("index unavailable")
-    expect(root.textContent).not.toContain("index not configured")
   })
 
   it("a row whose chain check could not run says 'could not check Monad just now' — never 'not on Monad'", () => {
@@ -566,11 +326,7 @@ describe("renderMe", () => {
 
 describe("/me is read-only — revoking happens in the terminal", () => {
   it("no button or link carries 'revoke', and no revoke/repair control exists anywhere", () => {
-    // two live readers so the rows exercise the spot the button used to occupy
-    const root = renderMe(
-      data({ agents: [agent(), agent({ agentId: `0x${"22".repeat(32)}` as Hex, name: "codex" })] }),
-      fakeDoc(),
-    ) as unknown as FakeEl
+    const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
     for (const node of root.walk()) {
       if (node.tag === "button" || node.tag === "a") {
         expect(node.textContent.toLowerCase(), `a <${node.tag}> must not offer revoking`).not.toContain("revoke")
@@ -588,48 +344,6 @@ describe("/me is read-only — revoking happens in the terminal", () => {
     ]) {
       expect(all(root, sel), `${sel} must not be rendered`).toHaveLength(0)
     }
-  })
-
-  it("every agent row names the terminal command that revokes it", () => {
-    const revoked = agent({
-      agentId: `0x${"33".repeat(32)}` as Hex,
-      name: "old-agent",
-      readLive: false,
-      revokedTx: TX,
-      grants: [grant({ status: { label: "Revoked", flagged: false, unchecked: false } })],
-    })
-    const agents = [agent(), agent({ agentId: `0x${"22".repeat(32)}` as Hex, name: "codex" }), revoked]
-    const root = renderMe(data({ agents }), fakeDoc()) as unknown as FakeEl
-    const rows = all(root, ".agent")
-    expect(rows).toHaveLength(3)
-    // live or already revoked, the pointer is the same plain sentence — never a control
-    for (const [i, a] of agents.entries()) {
-      expect(rows[i]!.textContent).toContain(`To revoke: run mida revoke ${a.name} in your terminal.`)
-    }
-  })
-
-  it("an agent-chosen name unsafe for a shell command never enters the revoke line (in-30 NIT 7)", () => {
-    const FALLBACK = "To revoke this agent, run mida doctor in your terminal to find its name, then mida revoke with that name."
-    const unsafe = [
-      "; rm -rf ~",
-      "claude; rm -rf ~",
-      "name with space",
-      "Name-With-Upper",
-      "-leading-dash",
-      `a${"b".repeat(40)}`, // 41 chars — one over the bound
-    ]
-    const agents = unsafe.map((name, i) => agent({ agentId: `0x${String(0x10 + i).padStart(2, "0").repeat(32)}` as Hex, name }))
-    const root = renderMe(data({ agents }), fakeDoc()) as unknown as FakeEl
-    const rows = all(root, ".agent")
-    expect(rows).toHaveLength(unsafe.length)
-    for (const [i, name] of unsafe.entries()) {
-      const text = rows[i]!.textContent
-      expect(text, `name ${JSON.stringify(name)} must not enter a command line`).not.toContain(`mida revoke ${name}`)
-      expect(text).toContain(FALLBACK)
-    }
-    // A name inside the safe pattern still gets the direct command.
-    const safe = renderMe(data({ agents: [agent({ name: "codex-cli-9" })] }), fakeDoc()) as unknown as FakeEl
-    expect(all(safe, ".agent")[0]!.textContent).toContain("To revoke: run mida revoke codex-cli-9 in your terminal.")
   })
 
   it("the agents section states the page is read-only, and why the terminal owns revoking", () => {

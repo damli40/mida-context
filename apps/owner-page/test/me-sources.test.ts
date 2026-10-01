@@ -1,9 +1,8 @@
-// Task 3's /me sources layer. The page's agent list comes from the index alone — the old
-// chain-log fallback needed ~39,000 requests against a public RPC that allows ~500 inside the
-// page's deadline, so it never answered and no longer runs;
-// every direct object is re-proven against ContextRegistry, and every batched save is proven on
-// its own Merkle proof — a batched contextId must never reach ContextRegistry. All three ports
-// are in-memory fakes: no network, no real store. The batched fixtures are really signed — the
+// The /me sources layer. The page does not list agents (a scan of the chain's history needed
+// ~39,000 requests against a public RPC that allows ~500 inside the page's deadline, so nothing
+// here scans). Every direct object is re-proven against ContextRegistry, and every batched save
+// is proven on its own Merkle proof — a batched contextId must never reach ContextRegistry. Both
+// ports are in-memory fakes: no network, no real store. The batched fixtures are really signed — the
 // test account signs the same MidaBatchSaveV1 typed data the contract verifies — so the leaf and
 // proof checks run on the actual hashes.
 
@@ -25,15 +24,7 @@ import type { Address, AgentRecord, BatchSaveMessage, Hex, SignedAgentCapability
 import { deriveEpochKeyPair, hexOf, sealContextObject } from "@mida/crypto"
 import type { AnchoredObject, BatchedReadItem, CapabilityView, ContextRecordView, RevocationIntentView } from "@mida/api"
 import { DEPLOYMENT } from "../src/owner/core.js"
-import {
-  AGENTS_QUERY,
-  AGENT_LIST_NEEDS_INDEX,
-  AGENT_LIST_SYNCING,
-  BATCHED_QUERY,
-  COUNTS_QUERY,
-  INDEX_LIMIT_TEXT,
-  loadMe,
-} from "../src/me/sources.js"
+import { AGENT_LIST_NEEDS_INDEX, loadMe } from "../src/me/sources.js"
 import type { MePorts } from "../src/me/sources.js"
 
 const OWNER = `0x${"11".repeat(20)}` as Address
@@ -45,9 +36,6 @@ const BATCH_ID = `0x${"b5".repeat(32)}` as Hex
 const ANCHOR = DEPLOYMENT.batchAnchor as Address
 const NS = namespaceId("projects.current")
 const NS_SKILLS = namespaceId("profile.skills")
-const TX1 = `0x${"01".repeat(32)}` as Hex
-const TX2 = `0x${"02".repeat(32)}` as Hex
-const TX3 = `0x${"03".repeat(32)}` as Hex
 const MANIFEST_HASH = `0x${"77".repeat(32)}` as Hex
 const AGENT_KEY = privateKeyToAccount(`0x${"a5".repeat(32)}` as Hex)
 const SECRET = new Uint8Array(32).fill(0x42)
@@ -78,22 +66,6 @@ const AGENT_MANIFEST: SignedAgentCapabilityManifest = {
   operatorSignature: `0x${"00".repeat(65)}` as Hex,
 }
 
-function grantRow(over: Record<string, unknown> = {}) {
-  return {
-    id: CAP_ID,
-    agent: AGENT_ID,
-    namespaceId: NS,
-    permissions: 3, // READ | CREATE
-    provenancePolicy: 1,
-    expiresAt: "9999999999",
-    grantedBlock: 100,
-    revokedBlock: null,
-    revokedBy: null,
-    txHash: TX1,
-    ...over,
-  }
-}
-
 /** The chain's capability row for CAP_ID — matching owner, agent and area, never expiring. */
 function capabilityView(over: Partial<CapabilityView> = {}): CapabilityView {
   return {
@@ -111,96 +83,10 @@ function capabilityView(over: Partial<CapabilityView> = {}): CapabilityView {
   }
 }
 
-// --- Hasura strictness ------------------------------------------------------------------------
-// Envio serves Hasura-flavoured GraphQL: a LIST field takes where/limit/order_by/offset/
-// distinct_on and answers an ARRAY; a single row is `<Entity>_by_pk(id: ...)`. The fake index
-// enforces both halves — a query calling a list field with `id:` is rejected before it is
-// answered, and an answer carrying an object where an array belongs is rejected too — so the
-// old `GlobalStats(id: "global")` / `Owner(id: $owner)` forms can never pass here.
-const LIST_FIELD_ARGS = new Set(["where", "limit", "order_by", "offset", "distinct_on"])
-
-/**
- * A spec-faithful GraphQL lexer for the token classes a query document can contain, promoted
- * from the review's zz-rvpage-graphql-lexer probe. Regex-shaped guards cannot catch a `//`
- * comment — GraphQL has no `/` token (comments are `#`) — so a document that lexes must prove it
- * against the grammar itself, not a pattern. Returns the first character the grammar cannot
- * tokenize, or null when the whole document lexes.
- */
-function firstLexError(source: string): { char: string; line: number } | null {
-  const isNameStart = (c: string) => /[_A-Za-z]/.test(c)
-  const isNameChar = (c: string) => /[_0-9A-Za-z]/.test(c)
-  const punct = new Set(["!", "$", "&", "(", ")", ":", "=", "@", "[", "]", "{", "|", "}"])
-  let i = 0
-  let line = 1
-  while (i < source.length) {
-    const c = source[i]!
-    if (c === "\n") { line++; i++; continue }
-    if (c === " " || c === "\t" || c === "\r" || c === "," || c === "﻿") { i++; continue } // eslint-disable-line no-irregular-whitespace
-    if (c === "#") { while (i < source.length && source[i] !== "\n") i++; continue }
-    if (source.startsWith("...", i)) { i += 3; continue }
-    if (punct.has(c)) { i++; continue }
-    if (isNameStart(c)) { while (i < source.length && isNameChar(source[i]!)) i++; continue }
-    if (/[-0-9]/.test(c)) { i++; while (i < source.length && /[0-9.eE+-]/.test(source[i]!)) i++; continue }
-    if (c === '"') {
-      if (source.startsWith('"""', i)) { const end = source.indexOf('"""', i + 3); if (end < 0) return { char: c, line }; i = end + 3; continue }
-      i++
-      while (i < source.length && source[i] !== '"') { if (source[i] === "\\") i++; if (source[i] === "\n") return { char: c, line }; i++ }
-      i++
-      continue
-    }
-    return { char: c, line }
-  }
-  return null
-}
-
-function checkQueryShape(gql: string): void {
-  for (const match of gql.matchAll(/([A-Za-z_]\w*)\s*\(([^()]*)\)/g)) {
-    const field = match[1]!
-    const args = match[2]!
-    // the operation header itself — `query MeAgents($owner: ...)` — is not a field call
-    const before = gql.slice(0, match.index).trimEnd()
-    if (/(^|\s)(query|mutation|subscription)$/.test(before)) continue
-    for (const arg of args.split(",")) {
-      const name = arg.split(":")[0]!.trim()
-      if (name.length === 0) continue
-      if (name === "id") {
-        if (!field.endsWith("_by_pk")) throw new Error(`${field} is a list field — id: is not a valid argument (use ${field}_by_pk or where)`)
-      } else if (!LIST_FIELD_ARGS.has(name)) {
-        throw new Error(`${field} called with non-Hasura argument "${name}"`)
-      }
-    }
-  }
-}
-
-function checkAnswerShape(answer: unknown): void {
-  if (answer === null || typeof answer !== "object") return
-  for (const [key, value] of Object.entries(answer)) {
-    if (value === undefined || value === null) continue
-    if (key.endsWith("_by_pk")) {
-      if (typeof value !== "object" || Array.isArray(value)) throw new Error(`${key} must answer one object, not an array`)
-    } else if (!Array.isArray(value)) {
-      throw new Error(`${key} is a list field — it must answer an array`)
-    }
-  }
-}
-
 function world() {
   const state = {
     // spies
     getRecordsCalls: [] as Hex[][],
-    // index answers — undefined keys mean "query throws"
-    indexFails: false,
-    indexAbsent: false,
-    agentsResult: {
-      Grant: [grantRow()],
-      Revocation: [] as unknown[],
-      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: true }],
-    } as unknown,
-    batchedResult: { BatchedSave: [] as unknown[], Agent: [{ id: AGENT_ID, signer: AGENT_KEY.address }] } as unknown,
-    countsResult: {
-      Owner_by_pk: { records: 1, batchedSaves: 1 },
-      ContextRecord: [] as unknown[],
-    } as unknown,
     // store answers
     objects: new Map<string, AnchoredObject[]>(),
     batched: new Map<string, BatchedReadItem[]>(),
@@ -235,27 +121,10 @@ function world() {
     // against the index's self-reported sourceBlock
     chainBlock: 1000n,
     chainBlockError: null as Error | null,
-    queries: [] as { gql: string; vars: Record<string, unknown> }[],
   }
 
   const ports: MePorts = {
-    index: state.indexAbsent
-      ? null
-      : {
-          query: async <T>(gql: string, vars: Record<string, unknown> = {}): Promise<T> => {
-            if (state.indexFails) throw new Error("index down")
-            state.queries.push({ gql, vars })
-            checkQueryShape(gql)
-            const answer =
-              gql === AGENTS_QUERY ? state.agentsResult
-              : gql === BATCHED_QUERY ? state.batchedResult
-              : gql === COUNTS_QUERY ? state.countsResult
-              : null
-            if (answer === null) throw new Error(`unexpected index query: ${gql.slice(0, 40)}`)
-            checkAnswerShape(answer)
-            return answer as T
-          },
-        },
+    index: null,
     store: {
       listObjects: async ({ namespaceId: ns }) => {
         if (state.objectsError !== null) throw state.objectsError
@@ -435,17 +304,12 @@ describe("loadMe — batched records verify on their own proof", () => {
     const { item, root, contextId } = await makeBatchedItem()
     state.batched.set(NS, [item])
     state.batchRoots.set(BATCH_ID, root)
-    state.batchedResult = {
-      BatchedSave: [{ id: contextId, namespaceId: NS, batchId: BATCH_ID, position: 0, lineageId: contextId, version: 1, agentId: AGENT_ID, block: 150, txHash: TX2 }],
-      Agent: [{ id: AGENT_ID, signer: AGENT_KEY.address }],
-    }
     const data = await loadMe(OWNER, ports)
     const row = data.records.find((r) => r.contextId === contextId)
     expect(row).toBeDefined()
     expect(row!.lane).toBe("batched")
     expect(row!.state).toBe("anchored")
     expect(row!.batchId).toBe(BATCH_ID)
-    expect(row!.tx).toBe(TX2)
     expect(row!.authorId).toBe(AGENT_ID)
     expect(row!.authorName).toBe("claude-code")
     // The one rule that keeps the lanes honest: ContextRegistry never sees a batched contextId.
@@ -487,52 +351,34 @@ describe("loadMe — direct records re-verify on ContextRegistry", () => {
     expect(row!.state).toBe("unverified")
   })
 
-  it("a store object whose chain record matches is anchored, with index tx attached", async () => {
+  it("a store object whose chain record matches is anchored", async () => {
     const { state, ports } = world()
     const { obj, record } = makeDirectObject()
     state.objects.set(NS_SKILLS, [obj])
     state.chainRecords.set(record.contextId, record)
-    state.countsResult = {
-      Owner_by_pk: { records: 1, batchedSaves: 0 },
-      ContextRecord: [{ id: record.contextId, namespaceId: NS_SKILLS, provenanceSource: 1, createdAt: String(NOW - 3600), txHash: TX3 }],
-    }
     const data = await loadMe(OWNER, ports)
     const row = data.records.find((r) => r.contextId === obj.contextId)
     expect(row).toBeDefined()
     expect(row!.state).toBe("anchored")
     expect(row!.lane).toBe("direct")
     expect(row!.source).toBe(1)
-    expect(row!.tx).toBe(TX3)
     expect(row!.readEpoch).toBe(1n)
   })
 })
 
 describe("loadMe — the record list orders by Monad's placement", () => {
-  it("a same-second tie breaks by chain order (block, log index) — never the random contextId", async () => {
+  it("two direct records in the same second fall to the contextId — the only order the page can prove", async () => {
     const { state, ports } = world()
-    // Both records carry the same chain second; the chain placed `a` after `b`, and the
-    // contextIds are arranged so the old contextId tie-break names the wrong one first.
-    const a = makeDirectObject() // 0xdd.. — larger id, chain-LATER (logIndex 7)
+    // The page has no source for a direct record's block or log index, so a same-second tie is
+    // broken by the contextId alone, the same way on every load.
+    const a = makeDirectObject() // 0xdd…
     const b = makeDirectObject({ contextId: `0x${"1c".padEnd(64, "0")}` as Hex, createdAt: BigInt(NOW) })
     a.record.createdAt = BigInt(NOW)
     state.objects.set(NS_SKILLS, [a.obj, b.obj])
     state.chainRecords.set(a.obj.contextId.toLowerCase(), a.record)
     state.chainRecords.set(b.obj.contextId.toLowerCase(), b.record)
-    state.countsResult = {
-      Owner_by_pk: { records: 2, batchedSaves: 0 },
-      ContextRecord: [
-        { id: a.obj.contextId, namespaceId: NS_SKILLS, provenanceSource: 1, createdAt: String(NOW), txHash: TX1, registeredBlock: 90 },
-        { id: b.obj.contextId, namespaceId: NS_SKILLS, provenanceSource: 1, createdAt: String(NOW), txHash: TX2, registeredBlock: 90 },
-      ],
-      TimelineEntry: [
-        { kind: "context_registered", contextId: a.obj.contextId, block: 90, logIndex: 7 },
-        { kind: "context_registered", contextId: b.obj.contextId, block: 90, logIndex: 3 },
-        // a same-contextId entry of another kind never overrides the register event's placement
-        { kind: "context_superseded", contextId: a.obj.contextId, block: 95, logIndex: 0 },
-      ],
-    }
     const data = await loadMe(OWNER, ports)
-    expect(data.records.map((r) => r.contextId)).toEqual([a.obj.contextId, b.obj.contextId])
+    expect(data.records.map((r) => r.contextId)).toEqual([b.obj.contextId, a.obj.contextId])
   })
 
   it("an anchored batched row sorts by its anchor block's time, not the store's receivedAt", async () => {
@@ -546,10 +392,8 @@ describe("loadMe — the record list orders by Monad's placement", () => {
     state.chainRecords.set(direct.obj.contextId.toLowerCase(), direct.record)
     state.batched.set(NS, [item])
     state.batchRoots.set(BATCH_ID, root)
-    state.batchedResult = {
-      BatchedSave: [{ id: contextId, namespaceId: NS, batchId: BATCH_ID, position: 0, lineageId: contextId, version: 1, agentId: AGENT_ID, block: 150, txHash: TX2 }],
-      Agent: [{ id: AGENT_ID, signer: AGENT_KEY.address }],
-    }
+    // Monad's own placement: the batch anchored in block 150, stamped NOW.
+    state.batchBlocks.set(BATCH_ID.toLowerCase(), 150)
     state.blockTimes.set(150, NOW)
     const data = await loadMe(OWNER, ports)
     expect(data.records.map((r) => r.contextId)).toEqual([contextId, direct.obj.contextId])
@@ -558,206 +402,33 @@ describe("loadMe — the record list orders by Monad's placement", () => {
   })
 })
 
-describe("loadMe — incomplete lists and index contradictions stay visible", () => {
-  it("a partial listBatchSaves adds the reload banner and hides counts", async () => {
+describe("loadMe — incomplete lists stay visible", () => {
+  it("a partial listBatchSaves adds the reload banner", async () => {
     const { state, ports } = world()
     state.batchedPartial = true
     const data = await loadMe(OWNER, ports)
     expect(data.incomplete).toContain("list incomplete — the store ran out of chain reads; reload")
-    expect(data.counts).toBeNull()
   })
 
-  it("a grant the index calls live but the chain calls revoked is flagged, not live", async () => {
-    const { state, ports } = world()
-    state.validCaps.set(CAP_ID, false)
-    state.capabilities.set(CAP_ID.toLowerCase(), capabilityView({ revoked: true }))
-    const data = await loadMe(OWNER, ports)
-    const agent = data.agents.find((a) => a.agentId === AGENT_ID)
-    expect(agent).toBeDefined()
-    const grant = agent!.grants.find((g) => g.capabilityId === CAP_ID)
-    expect(grant).toBeDefined()
-    // The capability never expires, so dead-on-chain means revoked — not the vague old label.
-    expect(grant!.status.label).toBe("Revoked")
-    expect(grant!.status.flagged).toBe(true)
-    expect(agent!.readLive).toBe(false)
-  })
-
-  it("an active store deny blocks the agent even while the chain grant is live", async () => {
-    const { state, ports } = world()
-    state.denies = [
-      { intentId: `0x${"d1".repeat(32)}` as Hex, state: "active", target: { kind: "agent", agentId: AGENT_ID }, agentEpochAtIntent: "1" },
-    ]
-    const data = await loadMe(OWNER, ports)
-    const agent = data.agents.find((a) => a.agentId === AGENT_ID)
-    expect(agent!.blockedAtStore).toBe(true)
-    expect(agent!.readLive).toBe(false)
-    // The chain still says the grant is valid — the page shows both facts, not a merged fiction.
-    expect(agent!.grants[0]!.status.label).toBe("Can read")
-  })
 })
 
-describe("the index queries are Hasura-shaped", () => {
-  it("every exported query lexes as a GraphQL document — a // comment is not a GraphQL token", () => {
-    // The shape guard only sees `name(args)` pairs, so it can never catch a token the grammar
-    // lacks. This is the regression in-25 P-1 fixes: COUNTS_QUERY carried two `//` lines and
-    // Hasura refused the whole document on every /me load.
-    for (const gql of [AGENTS_QUERY, BATCHED_QUERY, COUNTS_QUERY]) {
-      expect(firstLexError(gql)).toBeNull()
-    }
-    // the check is real: a // comment line anywhere in the document is caught
-    expect(firstLexError(`query X { a }\n// not a comment\n`)).not.toBeNull()
-  })
+describe("loadMe — the agent list is not offered", () => {
 
-  it("every exported query uses only where/limit/order_by on list fields, id: only on _by_pk, and _meta for progress", () => {
-    for (const gql of [AGENTS_QUERY, BATCHED_QUERY, COUNTS_QUERY]) {
-      expect(() => checkQueryShape(gql)).not.toThrow()
-    }
-    // the regression this guard exists for: a list field must never be called with id:
-    expect(() => checkQueryShape(`query X { GlobalStats(id: "global") { lastTimestamp } }`)).toThrow(/list field/)
-    expect(() => checkQueryShape(`query X($owner: String!) { Owner(id: $owner) { records } }`)).toThrow(/list field/)
-    // and the allowed forms do pass: _by_pk, where/limit/order_by, and the bare _meta list
-    expect(() => checkQueryShape(`query X($owner: String!) { Owner_by_pk(id: $owner) { records } }`)).not.toThrow()
-    expect(() => checkQueryShape(`query X { _meta { chainId progressBlock sourceBlock isReady } }`)).not.toThrow()
-  })
-
-  it("index lag comes from _meta's own progress — blocks behind, read as seconds at ~0.4 s/block", async () => {
-    const { state, ports } = world()
-    state.agentsResult = {
-      ...(state.agentsResult as object),
-      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 1000 - 25, sourceBlock: 1000, isReady: true }],
-    }
-    const data = await loadMe(OWNER, ports)
-    // 25 blocks at ~0.4 s/block ≈ 10 s
-    expect(data.lag).toEqual({ text: "≈ 10 s behind Monad", stale: false })
-    expect(data.source).toBe("index")
-  })
-
-  it("an index more than 150 blocks behind reports stale", async () => {
-    const { state, ports } = world()
-    state.agentsResult = {
-      ...(state.agentsResult as object),
-      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 1000 - 400, sourceBlock: 1000, isReady: true }],
-    }
-    const data = await loadMe(OWNER, ports)
-    expect(data.lag.stale).toBe(true)
-    expect(data.lag.text).toBe("≈ 160 s behind Monad")
-  })
-
-  it("the lag is measured against Monad's block number, not the index's self-report", async () => {
-    const { state, ports } = world()
-    // The index claims the head is 1000 and it is 1 behind — but Monad's real head is 2200,
-    // so the honest lag is 1201 blocks, far past the stale line the self-report hides.
-    state.agentsResult = {
-      ...(state.agentsResult as object),
-      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: true }],
-    }
-    state.chainBlock = 2200n
-    const data = await loadMe(OWNER, ports)
-    expect(data.lag.stale).toBe(true)
-    expect(data.lag.text).toBe("≈ 480 s behind Monad") // 1201 × ~0.4 s
-  })
-
-  it("a dead block-number read falls back to the index's own progress report", async () => {
-    const { state, ports } = world()
-    state.chainBlockError = new Error("rpc down")
-    const data = await loadMe(OWNER, ports)
-    // progress 999 vs sourceBlock 1000 — the index's own 1-block claim is all the page has
-    expect(data.lag).toEqual({ text: "≈ 0 s behind Monad", stale: false })
-  })
-
-  it("isReady === false means still catching up — the index's Grant rows are not a list at all", async () => {
-    const { state, ports } = world()
-    state.agentsResult = {
-      ...(state.agentsResult as object),
-      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: false }],
-    }
-    // There is no second source for the list — the mid-sync index's Grant row (AGENT_ID) must
-    // not appear as if it were the list, and nothing scans the chain to replace it.
-    const data = await loadMe(OWNER, ports)
-    expect(data.source).toBe("unavailable")
-    expect(data.agents).toEqual([])
-    expect(data.agentsUnavailable).toBe(AGENT_LIST_SYNCING)
-    expect(data.lag.text).toBe("index still catching up")
-  })
-
-  it("a mid-sync index still runs the records chain checks — the agent list is the only thing missing", async () => {
-    const { state, ports } = world()
-    state.agentsResult = {
-      ...(state.agentsResult as object),
-      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: false }],
-    }
-    const { obj, record } = makeDirectObject()
-    state.objects.set(NS_SKILLS, [obj])
-    state.chainRecords.set(record.contextId, record)
-    const data = await loadMe(OWNER, ports)
-    expect(data.agentsUnavailable).toBe(AGENT_LIST_SYNCING)
-    expect(data.records.find((r) => r.contextId === obj.contextId)!.state).toBe("anchored")
-    expect(state.getRecordsCalls.length).toBeGreaterThan(0)
-  })
-
-  it("the mid-sync sentence admits the list is not ready — and that records are still chain-checked (in-26 Q-2)", async () => {
-    const { state, ports } = world()
-    state.agentsResult = {
-      ...(state.agentsResult as object),
-      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: false }],
-    }
-    const data = await loadMe(OWNER, ports)
-    expect(data.agentsUnavailable).toBe(
-      "Your agent list is not ready yet: the index is still catching up with Monad. The records below are still checked against Monad.",
-    )
-  })
-
-  it("a page-sized answer earns the may-be-incomplete banner — and the row limit goes out in the query", async () => {
-    const { state, ports } = world()
-    // Two grants where the page asked for one — a full page means the index may have more.
-    state.agentsResult = {
-      Grant: [grantRow(), grantRow({ id: CAP2_ID, agent: OTHER_ID })],
-      Revocation: [],
-      _meta: [{ chainId: Number(DEPLOYMENT.chainId), progressBlock: 999, sourceBlock: 1000, isReady: true }],
-    }
-    const data = await loadMe(OWNER, ports, 1)
-    expect(state.queries.find((q) => q.gql === AGENTS_QUERY)!.vars.limit).toBe(1)
-    expect(state.queries.find((q) => q.gql === COUNTS_QUERY)!.vars.limit).toBe(1)
-    expect(data.incomplete).toContain(INDEX_LIMIT_TEXT)
-    // the banner warns — it does not hide the rows that did arrive
-    expect(data.agents).toHaveLength(2)
-    // and a short answer earns no banner
-    const calm = await loadMe(OWNER, ports)
-    expect(calm.incomplete).not.toContain(INDEX_LIMIT_TEXT)
-  })
-})
-
-describe("loadMe — the agent list can be missing, not just empty", () => {
-  it("index down → agentsUnavailable with the needs-index text, never an empty-list fiction", async () => {
-    const { state, ports } = world()
-    state.indexFails = true
-    const data = await loadMe(OWNER, ports)
-    // the flag carries its own sentence — the page shows the reason, not a boolean
-    expect(data.agentsUnavailable).toBe(AGENT_LIST_NEEDS_INDEX)
-    expect(data.agents).toEqual([])
-    expect(data.source).toBe("unavailable")
-    expect(data.lag.text).toBe("index unavailable")
-  })
-
-  it("index absent → the page says it does not list agents, and the badge names what it did read", async () => {
-    const { state, ports } = world()
-    ports.index = null // indexUrl unset — nothing configured to query
+  it("the page says it does not list agents, and the badge names what it did read", async () => {
+    const { ports } = world()
     const data = await loadMe(OWNER, ports)
     expect(data.agentsUnavailable).toBe(AGENT_LIST_NEEDS_INDEX)
-    expect(data.source).toBe("unavailable")
-    // no index is deployed, so neither line may blame one
+    // no index exists, so neither line may blame one
     expect(data.agentsUnavailable).not.toMatch(/index|envio/i)
     expect(data.lag).toEqual({ text: "Records come from the store and are checked on Monad", stale: false })
   })
 
-  it("index absent and a list incomplete or the store silent → the badge dot warns", async () => {
+  it("a list incomplete or the store silent → the badge dot warns", async () => {
     const partial = world()
-    partial.ports.index = null
     partial.state.batchedPartial = true
     expect((await loadMe(OWNER, partial.ports)).lag.stale).toBe(true)
 
     const down = world()
-    down.ports.index = null
     down.state.objectsError = new Error("store down")
     down.state.batchedListError = new Error("store down")
     const data = await loadMe(OWNER, down.ports)
@@ -765,44 +436,31 @@ describe("loadMe — the agent list can be missing, not just empty", () => {
     expect(data.lag.stale).toBe(true)
   })
 
-  it("a capability whose chain check threw stays in the list as Unverified — never dropped", async () => {
-    const { ports } = world()
-    ports.chain.isCapabilityValid = () => Promise.reject(new Error("rpc down"))
-    const data = await loadMe(OWNER, ports)
-    const agent = data.agents.find((a) => a.agentId === AGENT_ID)
-    expect(agent).toBeDefined()
-    expect(agent!.grants[0]!.status.label).toBe("Unverified")
-    // and it cannot count as able to read — but it counts as an agent we could not check
-    expect(agent!.readLive).toBe(false)
-    expect(agent!.unverified).toBe(true)
-    expect(data.agentsUnavailable).toBeNull()
-  })
 })
 
-describe("loadMe — agent names", () => {
+describe("loadMe — a record author's name", () => {
   it("a manifest fetch failure degrades to the shortened agent id, never an empty name", async () => {
     const { state, ports } = world()
     state.manifestsError = new Error("store lost the manifest")
+    const { item, contextId } = await makeBatchedItem({ anchored: false })
+    state.batched.set(NS, [item])
     const data = await loadMe(OWNER, ports)
-    const agent = data.agents.find((a) => a.agentId === AGENT_ID)
-    expect(agent!.name).toBe("0xaaaa…aaaa")
-    expect(agent!.name.length).toBeGreaterThan(0)
+    expect(data.records.find((r) => r.contextId === contextId)!.authorName).toBe("0xaaaa…aaaa")
   })
 
   it("a failed getAgent call also degrades to the shortened id", async () => {
     const { state, ports } = world()
     state.agentRecords.clear()
+    const { item, contextId } = await makeBatchedItem({ anchored: false })
+    state.batched.set(NS, [item])
     const data = await loadMe(OWNER, ports)
-    const agent = data.agents.find((a) => a.agentId === AGENT_ID)
-    expect(agent!.name).toBe("0xaaaa…aaaa")
-    expect(agent!.name.length).toBeGreaterThan(0)
+    expect(data.records.find((r) => r.contextId === contextId)!.authorName).toBe("0xaaaa…aaaa")
   })
 
   it("a refused manifest name reads 'an agent with an unreadable name' — /me runs the check itself (in-31 V-4)", async () => {
     // The store's own manifest check can sit inside its cache, so a refused name CAN reach
     // the page. A bidi control inside it would let the name forge or hide part of a rendered
-    // line — the page swaps it for the fallback before it is shown, on the agent list and on
-    // a record's author line alike.
+    // line — the page swaps it for the fallback before it is shown on a record's author line.
     const { state, ports } = world()
     state.manifests.set(MANIFEST_HASH.toLowerCase(), {
       ...AGENT_MANIFEST,
@@ -811,7 +469,6 @@ describe("loadMe — agent names", () => {
     const { item, contextId } = await makeBatchedItem({ anchored: false })
     state.batched.set(NS, [item])
     const data = await loadMe(OWNER, ports)
-    expect(data.agents.find((a) => a.agentId === AGENT_ID)!.name).toBe("an agent with an unreadable name")
     expect(data.records.find((r) => r.contextId === contextId)!.authorName).toBe("an agent with an unreadable name")
   })
 
@@ -824,61 +481,12 @@ describe("loadMe — agent names", () => {
         ...AGENT_MANIFEST,
         manifest: { ...AGENT_MANIFEST.manifest, name: bad },
       })
+      const { item, contextId } = await makeBatchedItem({ anchored: false })
+      state.batched.set(NS, [item])
       const data = await loadMe(OWNER, ports)
-      expect(data.agents.find((a) => a.agentId === AGENT_ID)!.name).toBe("an agent with an unreadable name")
+      expect(data.records.find((r) => r.contextId === contextId)!.authorName).toBe("an agent with an unreadable name")
     }
   })
-})
-
-describe("loadMe — a grant row is only live when the chain's capability agrees", () => {
-  it("a capability naming another owner, agent or area is Unverified — even when isCapabilityValid says true", async () => {
-    for (const field of ["owner", "agentId", "namespaceId"] as const) {
-      const { state, ports } = world()
-      // The chain row for this capabilityId answers about a DIFFERENT grant — the listing's id
-      // pointed at the wrong row, so nothing it claims can stand in for this grant.
-      const foreign = `0x${"99".repeat(field === "owner" ? 20 : 32)}`
-      state.capabilities.set(CAP_ID.toLowerCase(), capabilityView({ [field]: foreign }))
-      const data = await loadMe(OWNER, ports)
-      const grant = data.agents.find((a) => a.agentId === AGENT_ID)!.grants[0]!
-      // the chain ANSWERED — with a row for a different grant: a disagreement, not a dead read
-      expect(grant.status, `mismatched ${field} must never read live`).toEqual({ label: "Unverified", flagged: true, unchecked: false })
-      expect(data.agents[0]!.readLive).toBe(false)
-    }
-  })
-
-  it("a capabilityId the chain cannot return at all is Unverified, never Can read", async () => {
-    const { state, ports } = world()
-    state.capabilities.delete(CAP_ID.toLowerCase()) // getCapability answers null — the read failed
-    const data = await loadMe(OWNER, ports)
-    // nothing came back from Monad — the row is unchecked, which is a different claim than "the
-    // index disagrees"
-    expect(data.agents[0]!.grants[0]!.status).toEqual({ label: "Unverified", flagged: true, unchecked: true })
-    expect(data.agents[0]!.readLive).toBe(false)
-  })
-
-  it("the permission bits come from the chain's capability row, not the listing's claim", async () => {
-    const { state, ports } = world()
-    // The index row claims READ | CREATE (3); the chain's capability says READ only (1).
-    state.capabilities.set(CAP_ID.toLowerCase(), capabilityView({ permissions: 1 }))
-    const data = await loadMe(OWNER, ports)
-    const grant = data.agents[0]!.grants[0]!
-    expect(grant.status.label).toBe("Can read")
-    expect(grant.permissions).toBe(1)
-  })
-
-  it("an expired grant reads Expired — a wall-clock fact, not a vague revoke and not 'the index disagrees' wording", async () => {
-    const { state, ports } = world()
-    state.validCaps.set(CAP_ID, false)
-    // expiresAt is in the past on the chain clock (chainTime = NOW + 5).
-    state.capabilities.set(CAP_ID.toLowerCase(), capabilityView({ expiresAt: BigInt(NOW) }))
-    const data = await loadMe(OWNER, ports)
-    const grant = data.agents[0]!.grants[0]!
-    expect(grant.status.label).toBe("Expired")
-    expect(grant.status.label).not.toContain("revoked")
-    // the index has no expiry awareness — an aged-out grant is never an index disagreement
-    expect(grant.status.flagged).toBe(false)
-  })
-
 })
 
 describe("loadMe — a failed chain check is 'unknown', never 'unverified'", () => {
@@ -931,10 +539,8 @@ describe("loadMe — a failed chain check is 'unknown', never 'unverified'", () 
     const { item, contextId, root } = await makeBatchedItem()
     state.batched.set(NS, [item])
     state.batchRoots.set(BATCH_ID, root) // the root exists — the proof could run if the author were known
-    // the chain cannot name the signer, and the index offers no fallback row or signer map —
-    // the leaf can never be built, so the check itself never ran
+    // the chain cannot name the signer — the leaf can never be built, so the check never ran
     ports.chain.agentIdOfSigner = () => Promise.reject(new Error("rpc down"))
-    state.batchedResult = { BatchedSave: [], Agent: [] }
     const data = await loadMe(OWNER, ports)
     const row = data.records.find((r) => r.contextId === contextId)
     expect(row!.state).toBe("unknown")
@@ -962,41 +568,12 @@ describe("loadMe — a failed listing is not an empty store", () => {
   })
 })
 
-describe("loadMe — the pending figure is a store fact", () => {
-  it("a failed listBatchSaves marks the pending figure incomplete — the tile must not show", async () => {
-    const { state, ports } = world()
-    state.batchedListError = new Error("store down")
-    const data = await loadMe(OWNER, ports)
-    expect(data.batchedListComplete).toBe(false)
-  })
-
-  it("a partial listBatchSaves also marks it incomplete", async () => {
-    const { state, ports } = world()
-    state.batchedPartial = true
-    const data = await loadMe(OWNER, ports)
-    expect(data.batchedListComplete).toBe(false)
-    expect(data.counts).toBeNull()
-  })
-
-  it("a clean batched list keeps the pending figure", async () => {
-    const { state, ports } = world()
-    const data = await loadMe(OWNER, ports)
-    expect(data.batchedListComplete).toBe(true)
-    expect(data.counts!.pending).toBe(0)
-  })
-})
-
 describe("loadMe — provenance only rides on verified rows", () => {
-  it("an unverified direct row never borrows the index's provenance claim", async () => {
+  it("an unverified direct row carries no provenance claim", async () => {
     const { state, ports } = world()
     const { obj } = makeDirectObject()
     state.objects.set(NS_SKILLS, [obj])
-    // The index claims the owner said it — the chain holds no such record, so the row carries
-    // no provenance at all.
-    state.countsResult = {
-      Owner_by_pk: { records: 1, batchedSaves: 0 },
-      ContextRecord: [{ id: obj.contextId, namespaceId: NS_SKILLS, provenanceSource: 1, createdAt: String(NOW - 3600), txHash: TX3 }],
-    }
+    // The chain holds no such record, so the row carries no provenance at all.
     const data = await loadMe(OWNER, ports)
     const row = data.records.find((r) => r.contextId === obj.contextId)
     expect(row!.state).toBe("unverified")
@@ -1078,8 +655,8 @@ describe("loadMe — a pending save reads blocked when its author cannot write",
     ]
     const data = await loadMe(OWNER, ports)
     expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("blocked")
-    // Blocked is not pending — the headline count must not claim it is still waiting.
-    expect(data.counts?.pending).toBe(0)
+    // Blocked is not pending — nothing may count it as still waiting.
+    expect(data.records.filter((r) => r.state === "pending")).toHaveLength(0)
   })
 
   it("a HELD save reads blocked on the store's own verdict, deny list or not", async () => {
@@ -1107,7 +684,7 @@ describe("loadMe — a pending save reads blocked when its author cannot write",
     state.batched.set(NS, [item])
     const data = await loadMe(OWNER, ports)
     expect(data.records.find((r) => r.contextId === contextId)!.state).toBe("pending")
-    expect(data.counts?.pending).toBe(1)
+    expect(data.records.filter((r) => r.state === "pending")).toHaveLength(1)
   })
 
   it("an unrelated agent's QUEUED save stays pending beside a denied one", async () => {
