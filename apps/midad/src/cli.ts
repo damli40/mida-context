@@ -19,6 +19,9 @@ import { callDaemon, ensureCurrentDaemon } from "./control.js"
 import { batchStatusProbe, decideLane, laneWhyText } from "./batching.js"
 import { debugLine, refusalCode } from "./debug-line.js"
 import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
+import { bannerLines } from "./banner.js"
+import { readSummarizer, currentSummarizer } from "./summarizer.js"
+import { chooseSummarizer, runSummarizer } from "./summarizer-cli.js"
 import { buildHandoff, generalAssistanceText, identityUnreadableText, isGeneralAssistant, noIdentityText, projectCheckRefusal } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
@@ -194,6 +197,16 @@ export interface CliDeps {
    * answer. There is no flag, file or environment variable that skips the question.
    */
   prompt?: (question: string) => Promise<string>
+  /**
+   * The hidden prompt for secrets — `summarizer use key` reads the API key through it, so the
+   * typed key never echoes. The default reads stdin raw; tests inject an answer.
+   */
+  secretPrompt?: (question: string) => Promise<string>
+  /**
+   * Whether a binary sits on PATH — `init` and `install` ask which agent CLIs exist before
+   * offering the summariser choice. The default is a real PATH lookup; tests inject it.
+   */
+  onPath?: (bin: string) => boolean
   /**
    * Terminal presence for the commands that require it — approve, revoke, remember. The defaults
    * are the real `process.stdin`/`process.stdout`; tests inject them. There is no flag, file or
@@ -876,7 +889,86 @@ function addAgentCheck(home: MidaHome, argv: string[]): { kind: "usage" } | { ki
  * The owner commands — init, approve, revoke, remember — run here, in the `mida` process, on the
  * owner runtime. They never touch the daemon socket: the daemon cannot sign as the owner, and a
  * socket client must never be able to.
+ *
+ * The three helpers below are UF-P2c: the mark and the summariser choice opening of `init`, the
+ * `Summaries:` line after it, and the ask after `install`.
  */
+/** The deps `chooseSummarizer` needs, built from the wider CLI/install deps (UF-P2c). */
+function summarizerChoiceDeps(deps: {
+  home: MidaHome
+  env?: Record<string, string | undefined>
+  print: (line: string) => void
+  prompt?: (question: string) => Promise<string>
+  secretPrompt?: (question: string) => Promise<string>
+  onPath?: (bin: string) => boolean
+}): Parameters<typeof chooseSummarizer>[0] {
+  const env = deps.env ?? process.env
+  return {
+    home: deps.home,
+    env,
+    print: deps.print,
+    prompt: deps.prompt ?? terminalPrompt,
+    secretPrompt: deps.secretPrompt ?? terminalSecretPrompt,
+    onPath: deps.onPath ?? ((bin) => binaryOnPath(bin, env.PATH)),
+  }
+}
+
+/**
+ * The opening of `mida init` (UF-P2c): the mark first, then — only when a real terminal is
+ * attached on both sides — the one-sentence explanation, and, when nobody has chosen a
+ * summariser yet, the choice block followed by an empty line. Returns whether the choice was
+ * asked this call, so the caller knows whether the trailing `Summaries:` line belongs.
+ */
+async function initOpening(deps: CliDeps): Promise<boolean> {
+  const stdinTTY = deps.stdinIsTTY ?? process.stdin.isTTY === true
+  const stdoutTTY = deps.stdoutIsTTY ?? process.stdout.isTTY === true
+  for (const line of bannerLines(deps.env ?? process.env, stdoutTTY)) deps.print(line)
+  if (!(stdinTTY && stdoutTTY)) return false
+  deps.print("Mida keeps what you tell it and what your AI agents save, encrypted under keys you hold.")
+  deps.print("")
+  if (readSummarizer(deps.home) === undefined) {
+    await chooseSummarizer(summarizerChoiceDeps(deps))
+    deps.print("")
+    return true
+  }
+  return false
+}
+
+/** The one `Summaries:` line printed after init's own lines when nobody was asked this call. */
+function summariesLine(deps: CliDeps): string {
+  const choice = currentSummarizer(deps.home, deps.env ?? process.env, deps.onPath !== undefined ? { onPath: deps.onPath } : undefined)
+  const what =
+    readSummarizer(deps.home) === "invalid"
+      ? "none (summarizer.json cannot be read)"
+      : choice.mode === "key"
+        ? `${choice.entries[0]?.display ?? "your endpoint"}, with your own API key`
+        : choice.mode === "environment"
+          ? "the models your environment variables set"
+          : "your agents' small models"
+  return `Summaries: ${what}. Change it with: mida summarizer`
+}
+
+/**
+ * The ask after `install` (UF-P2c): an empty line and the choice block, only when the command
+ * printed a success word, stdin AND stdout are terminals, and nobody has chosen yet.
+ */
+/** Whether install may ask: both sides of a real terminal, and nobody has chosen yet. */
+function installAskWanted(deps: {
+  home: MidaHome
+  stdinIsTTY?: boolean
+  stdoutIsTTY?: boolean
+}): boolean {
+  const stdinTTY = deps.stdinIsTTY ?? process.stdin.isTTY === true
+  const stdoutTTY = deps.stdoutIsTTY ?? process.stdout.isTTY === true
+  return stdinTTY && stdoutTTY && readSummarizer(deps.home) === undefined
+}
+
+async function installAsk(deps: Parameters<typeof summarizerChoiceDeps>[0]): Promise<void> {
+  deps.print("")
+  await chooseSummarizer(summarizerChoiceDeps(deps))
+}
+
+/** The owner commands themselves — see the doc comment above the helpers. */
 async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps): Promise<number> {
   const command = argv[0]!
   const agent = argv[1] ?? ""
@@ -896,9 +988,11 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
 
   try {
     if (command === "init") {
+      const asked = await initOpening(deps)
       const result = await init(runtime, AGENTS)
       deps.print(`owner ${result.owner}`)
       for (const [name, agentId] of Object.entries(result.agents)) deps.print(`agent ${name} ${agentId}`)
+      if (!asked) deps.print(summariesLine(deps))
     } else if (command === "add-agent") {
       const check = addAgentCheck(runtime.home, argv)
       if (check.kind === "usage") return usage()
@@ -1027,6 +1121,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
           deps.print("devin: MCP server not added. This build does not know where Devin keeps MCP servers; hooks are installed.")
         }
         deps.print(`next: run \`mida approve devin\` in this folder`)
+        if (installAskWanted(deps)) await installAsk(deps)
         return 0
       }
       const client = tool as McpClientTool
@@ -1886,9 +1981,11 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
         deps.print("this home already has a software owner key; a passkey owner needs a fresh MIDA_HOME")
         return 2
       }
+      const asked = await initOpening(deps)
       const result = await initPasskey(deps.home, deps.network, AGENTS, linkDeps)
       deps.print(`owner ${result.owner}`)
       for (const [name, agentId] of Object.entries(result.agents)) deps.print(`agent ${name} ${agentId}`)
+      if (!asked) deps.print(summariesLine(deps))
       return 0
     }
     if (command === "remember") {
@@ -1947,6 +2044,7 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
           const outcome = installDevin(deps.devinConfig ?? resolveDevinConfigPath(process.env, homedir()))
           deps.print(outcome === "already-installed" ? "already installed" : "installed")
           deps.print(`next: run \`mida approve devin\` in this folder`)
+          if (installAskWanted(deps)) await installAsk(deps)
           return 0
         }
         const client = tool as McpClientTool
@@ -2407,8 +2505,18 @@ export function runInstall(
     claudeUserConfig?: string
     /** The claude binary invocation — injected in tests; the real spawnSync by default. */
     claudeCli?: ClaudeCliRunner
+    /** Terminal presence for the post-install summariser ask (UF-P2c); defaults to the real TTY flags. */
+    stdinIsTTY?: boolean
+    stdoutIsTTY?: boolean
+    /** The summariser choice's prompts — injected in tests. */
+    prompt?: (question: string) => Promise<string>
+    secretPrompt?: (question: string) => Promise<string>
+    /** The PATH probe the choice block asks about claude/codex — injected in tests. */
+    onPath?: (bin: string) => boolean
+    /** The environment the choice resolves against — injected in tests. */
+    env?: Record<string, string | undefined>
   },
-): number {
+): number | Promise<number> {
   const tool = argv[1] ?? ""
   // --no-mcp is an install flag: it names exactly what it skips. On uninstall there is nothing
   // to skip — the entry goes with the hooks — so the flag is usage there. For the MCP-only
@@ -2465,6 +2573,11 @@ export function runInstall(
   const codexHooksBefore = argv[0] === "install" && tool === "codex" ? codexHookCommands(settingsPath) : undefined
   try {
     const outcome = run(settingsPath)
+    // UF-P2c: an install that lands — or was already there — offers the summariser choice at a
+    // real terminal when nobody has picked one yet. The ask is async, so only then does this
+    // function return a promise; every other outcome stays the number it always was.
+    const offer =
+      argv[0] === "install" && (outcome === "installed" || outcome === "already-installed") ? () => installAsk(deps) : undefined
     // Claude Code's MCP servers live in ~/.claude.json, which only the claude CLI may write —
     // the userConfig read is the is-it-ours check, never an edit. Codex's table needs no
     // extra step here: it rides inside the managed block installCodex wrote. The MCP step
@@ -2505,13 +2618,17 @@ export function runInstall(
       }
       // the reminder follows the hook commands, not the write: an MCP-only upgrade or a new
       // MIDA_HOME rewrites the block while leaving the commands Codex fingerprinted intact
-      if (!isDeepStrictEqual(codexHooksBefore, codexHookCommands(settingsPath))) deps.print(CODEX_TRUST_SENTENCE)
+      if (!isDeepStrictEqual(codexHooksBefore, codexHookCommands(settingsPath))) {
+        deps.print(CODEX_TRUST_SENTENCE)
+        deps.print("Then run mida doctor --live codex to check the hooks fire.")
+      }
     }
     if (argv[0] === "uninstall" && tool === "codex") {
       // the record clears only after the edit under the recorded home ran — a refused config
       // keeps it, because the trust the record describes was never lifted
       clearCodexHome(deps.home)
     }
+    if (offer !== undefined && installAskWanted(deps)) return offer().then(() => 0)
     return 0
   } catch (error) {
     deps.print(`refused: ${refusalCode(error)}`)
@@ -2550,6 +2667,7 @@ async function main(): Promise<void> {
   const print = (line: string) => console.log(line)
 
   if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
+    for (const line of bannerLines(process.env, process.stdout.isTTY === true)) print(line)
     for (const line of helpLines()) print(line)
     process.exitCode = argv.length === 0 ? 2 : 0
     return
@@ -2567,7 +2685,7 @@ async function main(): Promise<void> {
     (argv.length === 3 && argv[1] === "devin" && argv[2] === "--no-mcp")
   if (argv[0] === "uninstall" || (argv[0] === "install" && !installProvisionsIdentity)) {
     // the real settings paths are built here and only here — tests always pass their own
-    process.exitCode = runInstall(argv, {
+    process.exitCode = await runInstall(argv, {
       print,
       claudeSettings: join(homedir(), ".claude", "settings.json"),
       codexConfig: join(resolveCodexHome(process.env, homedir()), "config.toml"),

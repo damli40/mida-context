@@ -10,7 +10,7 @@ import { privateKeyToAccount } from "viem/accounts"
 import { capabilityRegistryAbi } from "@mida/chain"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, runDoctor, FileAccessRequestStore, saveAgentIdentity, CLI_COMMANDS, OWNER_COMMANDS, TERMINAL_COMMANDS } from "@mida/midad"
+import { MidaHome, BANNER, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, readSummarizer, runCli, runCliWithRuntime, runDoctor, FileAccessRequestStore, saveAgentIdentity, writeSummarizer, CLI_COMMANDS, OWNER_COMMANDS, TERMINAL_COMMANDS } from "@mida/midad"
 import type { AgentIdentity, Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
@@ -1376,6 +1376,78 @@ describe("the crude mida command", () => {
     const output = lines.join("\n")
     for (const secret of secrets) expect(output.includes(secret)).toBe(false)
   })
+
+  it("init with no terminal prints no mark, asks nothing, saves nothing, and ends with the Summaries line (UF-P2c)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-notty-")))
+    const out: string[] = []
+    let asks = 0
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => (asks++, ""),
+      secretPrompt: async () => (asks++, ""),
+      stdinIsTTY: false,
+      stdoutIsTTY: false,
+      env: { LANG: "en_US.UTF-8" },
+    })
+    expect(code).toBe(0)
+    expect(asks).toBe(0)
+    expect(fresh.has("summarizer.json")).toBe(false)
+    // the mark is absent — neither the graphic nor the plain line
+    expect(out.every((line) => !line.includes("your context, in a store you own") && line !== "  ╭     ╮" && line !== "  ╰     ╯")).toBe(true)
+    expect(out.at(-1)).toBe("Summaries: your agents' small models. Change it with: mida summarizer")
+  }, 300_000)
+
+  it("init on a terminal shows the mark, the sentence and the block, and Enter saves agents — no Summaries line (UF-P2c)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-tty-")))
+    const out: string[] = []
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => "",
+      secretPrompt: async () => "",
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: { LANG: "en_US.UTF-8" },
+      onPath: () => false,
+    })
+    expect(code).toBe(0)
+    // the mark is the first four lines, then the sentence and an empty line, then the block
+    expect(out.slice(0, BANNER.length)).toEqual([...BANNER])
+    expect(out[BANNER.length]).toBe("Mida keeps what you tell it and what your AI agents save, encrypted under keys you hold.")
+    expect(out[BANNER.length + 1]).toBe("")
+    expect(out).toContain("How should Mida write its summaries?")
+    expect(readSummarizer(fresh)).toEqual({ use: "agents" })
+    // the choice ran this call, so the Summaries line is not printed
+    expect(out.every((line) => !line.startsWith("Summaries:"))).toBe(true)
+  }, 300_000)
+
+  it("a second init on a terminal with a saved choice asks nothing and prints the Summaries line (UF-P2c)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-saved-")))
+    writeSummarizer(fresh, { use: "agents" })
+    const out: string[] = []
+    let asks = 0
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => (asks++, ""),
+      secretPrompt: async () => (asks++, ""),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: { LANG: "en_US.UTF-8" },
+      onPath: () => false,
+    })
+    expect(code).toBe(0)
+    expect(asks).toBe(0)
+    expect(out.slice(0, BANNER.length)).toEqual([...BANNER])
+    expect(out.at(-1)).toBe("Summaries: your agents' small models. Change it with: mida summarizer")
+  }, 300_000)
 })
 
 /**

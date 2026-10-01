@@ -61,6 +61,9 @@ function fakeDeps(home: MidaHome, lines: string[], page: FakePage = {}): CliDeps
     print: (line) => lines.push(line),
     stdinIsTTY: true,
     stdoutIsTTY: true,
+    // UF-P2c: init asks "who writes the summaries" on a terminal — Enter saves the default
+    prompt: async () => "",
+    secretPrompt: async () => "",
     ownerLink: {
       startListener: async () => ({
         port: 4321,
@@ -208,6 +211,9 @@ describe("mida init --passkey", () => {
       print: (line) => lines.push(line),
       stdinIsTTY: true,
       stdoutIsTTY: true,
+      // UF-P2c: init asks "who writes the summaries" on a terminal — Enter saves the default
+      prompt: async () => "",
+      secretPrompt: async () => "",
       ownerLink: {
         // the REAL listener — the fake "page" POSTs a result smuggling a 32-byte `seed`,
         // then a well-formed result so the round can settle
