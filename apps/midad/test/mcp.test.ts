@@ -1705,7 +1705,7 @@ describe("mida-mcp tools against a fake daemon", () => {
           newestChange: new Map(Array.from({ length: sessions }, (_, i) => [`sess-${i}`, at + i])),
           lastTryFailed,
           otherFailures: false,
-          waitingOn: undefined,
+          waitReasons: [],
           stuck: 0,
         },
         nowMs,

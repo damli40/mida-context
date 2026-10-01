@@ -148,11 +148,11 @@ export interface QueuedSaves {
    */
   otherFailures: boolean
   /**
-   * What at least one counted session is waiting on — a string union because later wait kinds
-   * land here; "sponsor-limit" means the gas sponsor's daily cap, which resets at 00:00 UTC;
+   * Every wait reason present among the counted sessions, in WAIT_ORDER (UF-QD — the note names
+   * them all): "sponsor-limit" means the gas sponsor's daily cap, which resets at 00:00 UTC;
    * the other two mean no summary model can write right now (UF-P3).
    */
-  waitingOn: WaitReason | undefined
+  waitReasons: WaitReason[]
   stuck: number
 }
 
@@ -210,7 +210,7 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
       }
     } catch { /* keep the count, drop the clause */ }
   }
-  const waitingOn = WAIT_ORDER.find((reason) => waitSeen.has(reason))
+  const waitReasons = WAIT_ORDER.filter((reason) => waitSeen.has(reason))
   // in-13 M-4: a batched save the store refused as composed sits between ledgers — rejected at
   // the store, plaintext kept for the hourly retry — so no queue job names it and no
   // PENDING_ANCHOR block reaches the handoff. Its project comes from the kept plaintext's
@@ -225,7 +225,7 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
     if (typeof value !== "object" || value === null || (value as { projectId?: unknown }).projectId !== projectId) continue
     stuck += 1
   }
-  return { perAgent, newestChange, lastTryFailed, otherFailures, waitingOn, stuck }
+  return { perAgent, newestChange, lastTryFailed, otherFailures, waitReasons, stuck }
 }
 
 /** Two queue snapshots as one: every session either saw, its newest change, any failed try. */
@@ -243,13 +243,8 @@ export function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): Queue
     newestChange,
     lastTryFailed: a.lastTryFailed || b.lastTryFailed,
     otherFailures: a.otherFailures || b.otherFailures,
-    // same fixed order readQueuedSaves applies — a merged snapshot picks the higher-priority wait
-    waitingOn:
-      a.waitingOn === undefined
-        ? b.waitingOn
-        : b.waitingOn === undefined || WAIT_ORDER.indexOf(a.waitingOn) <= WAIT_ORDER.indexOf(b.waitingOn)
-          ? a.waitingOn
-          : b.waitingOn,
+    // the union of both lists, in the same fixed order readQueuedSaves applies (UF-QD)
+    waitReasons: WAIT_ORDER.filter((reason) => a.waitReasons.includes(reason) || b.waitReasons.includes(reason)),
     stuck: Math.max(a.stuck, b.stuck),
   }
 }
@@ -260,7 +255,7 @@ export function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): Queue
  */
 export function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shownUnsent: number): string | null {
   if (queued === null) return null
-  const { perAgent, newestChange, lastTryFailed, otherFailures, waitingOn, stuck } = queued
+  const { perAgent, newestChange, lastTryFailed, otherFailures, waitReasons, stuck } = queued
   if (perAgent.size === 0 && stuck === 0) return null
   const clauses: string[] = []
   if (perAgent.size > 0) {
@@ -283,25 +278,24 @@ export function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shown
           ? "; it is shown below, marked UNSENT"
           : `; ${shownUnsent} of them ${shownUnsent === 1 ? "is" : "are"} shown below, marked UNSENT`
     // UF-O/UF-P3: a capacity wait is an allowance or a missing model, not a failed try — its
-    // clause says so and the "last try failed" clause is not added on top of it. UF-QA: but when
-    // another counted session DID fail a try for a different reason, the clause must not claim
-    // every wait is the same — it says "some are" and names the retries beside it.
-    const inner =
-      waitingOn === "sponsor-limit"
+    // clause says so and the "last try failed" clause is not added on top of it. UF-QD: every
+    // wait reason present is named — one alone with no other failure keeps the plain clause,
+    // otherwise each is "some are …", and when another counted session DID fail a try for a
+    // different reason the clause names the retries beside the waits.
+    const inner = (reason: WaitReason): string =>
+      reason === "sponsor-limit"
         ? "waiting for the gas sponsor's daily limit to reset at 00:00 UTC"
-        : waitingOn === "summarizer-limit"
+        : reason === "summarizer-limit"
           ? "waiting for the model that writes Mida's summaries: it hit its usage limit"
-          : waitingOn === "no-summarizer"
-            ? "waiting: no model is set up to write Mida's summaries; the user can run mida summarizer"
-            : undefined
+          : "waiting: no model is set up to write Mida's summaries; the user can run mida summarizer"
     const waiting =
-      inner !== undefined
-        ? otherFailures
-          ? ` (some are ${inner}; Mida keeps retrying the others)`
-          : ` (${inner})`
-        : lastTryFailed
+      waitReasons.length === 0
+        ? lastTryFailed
           ? " (the last try failed; Mida keeps retrying)"
           : ""
+        : waitReasons.length === 1 && !otherFailures
+          ? ` (${inner(waitReasons[0]!)})`
+          : ` (${waitReasons.map((reason) => `some are ${inner(reason)}`).join("; ")}${otherFailures ? "; Mida keeps retrying the others" : ""})`
     clauses.push(`${clause}${waiting}${shown}`)
   }
   if (stuck > 0) clauses.push(`${stuck} save${stuck === 1 ? "" : "s"} could not be sent to Monad: see \`mida doctor\``)

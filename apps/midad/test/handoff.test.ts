@@ -1348,7 +1348,58 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     expect(result.text).not.toContain("the last try failed")
   })
 
-  it("sessions waiting on different reasons resolve in the fixed order: sponsor-limit, then summarizer-limit, then no-summarizer", async () => {
+  // UF-QD: with more than one wait reason among the counted sessions the note names every one,
+  // each as "some are …", joined by "; " — the fixed order, not arrival order.
+  it("two wait reasons both get named, in the fixed order, no other failure (UF-QD)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-limit" })
+    job(dir, { sessionId: "sess-sponsor" }, "2026-09-25T10:00:01.000Z")
+    const wait = (reason: string) => ({
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason,
+    })
+    dir.writeSecretJson("queue/state/sess-limit.json", wait("summarizer-limit"))
+    dir.writeSecretJson("queue/state/sess-sponsor.json", wait("sponsor-limit"))
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("(some are waiting for the gas sponsor's daily limit to reset at 00:00 UTC; some are waiting for the model that writes Mida's summaries: it hit its usage limit)")
+  })
+
+  it("two wait reasons plus a real failed try also name the retries beside them (UF-QD)", async () => {
+    const dir = queueHome()
+    job(dir, { sessionId: "sess-limit" })
+    job(dir, { sessionId: "sess-sponsor" }, "2026-09-25T10:00:01.000Z")
+    job(dir, { sessionId: "sess-ordinary" }, "2026-09-25T10:00:02.000Z")
+    const wait = (reason: string) => ({
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason,
+    })
+    dir.writeSecretJson("queue/state/sess-limit.json", wait("summarizer-limit"))
+    dir.writeSecretJson("queue/state/sess-sponsor.json", wait("sponsor-limit"))
+    dir.writeSecretJson("queue/state/sess-ordinary.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-25T10:00:00.000Z",
+      attempts: 2,
+      failedAt: "2026-09-25T10:05:00.000Z",
+      reason: "chain-error",
+    })
+    const { d } = deps({ ...reads, now: () => QUEUE_NOW })
+    const result = await buildHandoff(queueRuntime(dir), input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("(some are waiting for the gas sponsor's daily limit to reset at 00:00 UTC; some are waiting for the model that writes Mida's summaries: it hit its usage limit; Mida keeps retrying the others)")
+  })
+
+  it("all three wait reasons are named, in the fixed order, whatever the arrival order (UF-QD)", async () => {
     const dir = queueHome()
     // the no-summarizer session was enqueued FIRST — the order is a fixed priority, not arrival
     job(dir, { sessionId: "sess-none" }, "2026-09-25T09:59:00.000Z")
@@ -1366,32 +1417,33 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
     const first = await buildHandoff(queueRuntime(dir), input, d)
     expect(first.kind).toBe("handoff")
     if (first.kind !== "handoff") return
-    expect(first.text).toContain("(waiting for the model that writes Mida's summaries: it hit its usage limit)")
-    expect(first.text).not.toContain("no model is set up")
+    expect(first.text).toContain("(some are waiting for the model that writes Mida's summaries: it hit its usage limit; some are waiting: no model is set up to write Mida's summaries; the user can run mida summarizer)")
 
-    // a sponsor-limit session outranks both
+    // a sponsor-limit session is named first of the two
     dir.writeSecretJson("queue/state/sess-none.json", wait("sponsor-limit"))
     const { d: d2 } = deps({ ...reads, now: () => QUEUE_NOW })
     const second = await buildHandoff(queueRuntime(dir), input, d2)
     expect(second.kind).toBe("handoff")
     if (second.kind !== "handoff") return
-    expect(second.text).toContain("(waiting for the gas sponsor's daily limit to reset at 00:00 UTC)")
-    expect(second.text).not.toContain("the model that writes Mida's summaries")
+    expect(second.text).toContain("(some are waiting for the gas sponsor's daily limit to reset at 00:00 UTC; some are waiting for the model that writes Mida's summaries: it hit its usage limit)")
   })
 
-  // UF-QC: mergeQueued must apply the SAME fixed order whichever snapshot carries which wait —
-  // a plain a ?? b would let the second-read order leak through
-  it("mergeQueued picks sponsor-limit over summarizer-limit in either operand order (UF-QC)", () => {
-    const snap = (waitingOn: QueuedSaves["waitingOn"]): QueuedSaves => ({
+  // UF-QC/UF-QD: mergeQueued must UNION the wait lists and keep the same fixed order whichever
+  // snapshot carries which wait — a plain a ?? b would let the second-read order leak through
+  it("mergeQueued unions the wait lists and keeps the fixed order in either operand order (UF-QD)", () => {
+    const snap = (waitReasons: QueuedSaves["waitReasons"]): QueuedSaves => ({
       perAgent: new Map([["claude-code", new Set(["s1"])]]),
       newestChange: new Map([["s1", 1]]),
       lastTryFailed: false,
       otherFailures: false,
-      waitingOn,
+      waitReasons,
       stuck: 0,
     })
-    expect(mergeQueued(snap("sponsor-limit"), snap("summarizer-limit"))?.waitingOn).toBe("sponsor-limit")
-    expect(mergeQueued(snap("summarizer-limit"), snap("sponsor-limit"))?.waitingOn).toBe("sponsor-limit")
+    expect(mergeQueued(snap(["sponsor-limit"]), snap(["summarizer-limit"]))?.waitReasons).toEqual(["sponsor-limit", "summarizer-limit"])
+    expect(mergeQueued(snap(["summarizer-limit"]), snap(["sponsor-limit"]))?.waitReasons).toEqual(["sponsor-limit", "summarizer-limit"])
+    expect(mergeQueued(snap(["no-summarizer"]), snap(["sponsor-limit", "summarizer-limit"]))?.waitReasons).toEqual(["sponsor-limit", "summarizer-limit", "no-summarizer"])
+    expect(mergeQueued(snap(["sponsor-limit"]), snap(["sponsor-limit"]))?.waitReasons).toEqual(["sponsor-limit"])
+    expect(mergeQueued(snap([]), snap([]))?.waitReasons).toEqual([])
   })
 
   it("an ordinary failed try still gets the retry clause", async () => {
