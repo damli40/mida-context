@@ -195,19 +195,21 @@ describe("renderHandoff", () => {
     expect(text).toMatch(/\(\d+ earlier progress entries left out\)/)
     expect(text).not.toContain("progress entry number 0 ")
   })
-  it("a long request with many decisions keeps the request whole and every decision — only the reasons go (UF-I)", () => {
+  it("a long request with many decisions keeps the request whole and every decision — reasons stay too (UF-I, UF-L)", () => {
     const out = renderHandoffReport({ ...base, originalRequest: "r".repeat(6000), decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i} ${"y".repeat(150)}`, rationale: "z".repeat(150) })) })
     expect(out.text).toContain("r".repeat(6000))
     // decisions are never left out — not the oldest, not the newest, not any
     expect(out.text).toContain("d0 ")
     expect(out.text).toContain("d49 ")
     expect(out.text).not.toMatch(/earlier decisions left out/)
-    // what goes instead is the reasons — and the heading says so
-    expect(out.text).toContain("Decisions (reasons left out to fit):")
-    expect(out.text).not.toContain(" — because: ")
-    expect(out.reasonsLeftOut).toBe(true)
+    // UF-L: the reasons-off render is still over the limit, so dropping 50 reasons would buy
+    // nothing — they stay, the heading stays plain, and the note names no reasons
+    expect(out.text).toContain("Decisions:")
+    expect(out.text).not.toContain("(reasons left out to fit)")
+    expect(out.text).toContain(" — because: ")
+    expect(out.reasonsLeftOut).toBe(false)
     expect(out.oversized).toBe(true)
-    expect(out.text.split("\n")).toContain("Mida note: this handoff is longer than its size target. No constraint, decision or rejected approach was left out to shorten it. Left out: the reasons behind decisions, the reasons behind rejected approaches.")
+    expect(out.text.split("\n")).toContain("Mida note: this handoff is longer than its size target. No constraint, decision or rejected approach was left out to shorten it. Nothing was left out.")
     expect(out.text).not.toContain("nothing further was cut")
   })
 })
@@ -281,19 +283,21 @@ describe("the handoff leaves out history only — every rule is kept, and the te
     // the untrimmable lists alone are far over 8,000 now — the answer is to say so, not to drop a rule
     expect(out.oversized).toBe(true)
     expect(out.cut).toBe(true)
-    expect(out.reasonsLeftOut).toBe(true)
+    expect(out.reasonsLeftOut).toBe(false)
     // never left out: the request, every plan step, the next action, the objective
     expect(out.text).toContain("Build the owner page. ".repeat(40).trim())
     for (let i = 0; i < 6; i += 1) expect(out.text).toContain(`plan step ${i}:`)
     expect(out.text).toContain("Next action: wire it")
     expect(out.text).toContain("Objective: build X")
-    // every rule survives, oldest included — only the reasons behind them went
+    // every rule survives, oldest included — and (UF-L) the reasons stay too: this text is
+    // over the limit either way, so dropping them would buy nothing
     for (let i = 0; i < 30; i += 1) expect(out.text).toContain(`constraint ${i} `)
     for (let i = 0; i < 60; i += 1) expect(out.text).toContain(`decision ${i} `)
     for (let i = 0; i < 30; i += 1) expect(out.text).toContain(`rejected ${i} `)
-    expect(out.text).toContain("Decisions (reasons left out to fit):")
-    expect(out.text).toContain("Rejected approaches (reasons left out to fit):")
-    expect(out.text).not.toContain(" — because: ")
+    expect(out.text).toContain("Decisions:")
+    expect(out.text).toContain("Rejected approaches:")
+    expect(out.text).not.toContain("(reasons left out to fit)")
+    expect(out.text).toContain(" — because: ")
     expect(out.text).not.toMatch(/earlier (constraints|decisions|rejected approaches) left out/)
     // history is what shrank — the newest of each list stays, with a count line
     expect(out.text).toContain("progress 119 ")
@@ -302,8 +306,8 @@ describe("the handoff leaves out history only — every rule is kept, and the te
     expect(out.text).toContain("(119 earlier progress entries left out)")
     expect(out.text).toContain("(59 earlier saves left out)")
     expect(out.text).toContain("(79 earlier artifacts left out)")
-    // and the preamble says plainly what went — the old tail note is gone
-    expect(out.text.split("\n")).toContain("Mida note: this handoff is longer than its size target. No constraint, decision or rejected approach was left out to shorten it. Left out: 119 earlier progress entries, 59 earlier saves, 79 earlier artifacts, the reasons behind decisions, the reasons behind rejected approaches.")
+    // and the preamble says plainly what went — only history items, never reasons (UF-L)
+    expect(out.text.split("\n")).toContain("Mida note: this handoff is longer than its size target. No constraint, decision or rejected approach was left out to shorten it. Left out: 119 earlier progress entries, 59 earlier saves, 79 earlier artifacts.")
     expect(out.text).not.toContain("nothing further was cut")
   })
 
@@ -333,7 +337,7 @@ describe("the handoff leaves out history only — every rule is kept, and the te
     expect(out.text.split("\n").some((l) => l.startsWith("Mida note: this handoff is longer than its size target."))).toBe(true)
   })
 
-  it("still over after trimming history: reasons go, entries stay, headings and note say so", () => {
+  it("still over after trimming history AND over without reasons: every reason stays, the note names only history (UF-L)", () => {
     const out = renderHandoffReport({
       ...base,
       originalRequest: "r".repeat(6_000),
@@ -348,17 +352,58 @@ describe("the handoff leaves out history only — every rule is kept, and the te
       expect(out.text).toContain(`decision ${i} `)
       expect(out.text).toContain(`approach ${i} `)
     }
-    expect(out.text).toContain("Decisions (reasons left out to fit):")
-    expect(out.text).toContain("Rejected approaches (reasons left out to fit):")
-    expect(out.text).not.toContain(" — because: ")
-    expect(out.reasonsLeftOut).toBe(true)
+    // UF-L: dropping the reasons still leaves the text over the limit, so nothing about the
+    // rules changes — the entries AND their reasons stay, and the headings stay plain
+    expect(out.text).toContain("Decisions:")
+    expect(out.text).toContain("Rejected approaches:")
+    expect(out.text).not.toContain("(reasons left out to fit)")
+    expect(out.text).toContain(" — because: ")
+    expect(out.reasonsLeftOut).toBe(false)
     expect(out.oversized).toBe(true)
-    // the note is a preamble line — before the fence — with the exact items, in order
-    const note = "Mida note: this handoff is longer than its size target. No constraint, decision or rejected approach was left out to shorten it. Left out: 4 earlier progress entries, the reasons behind decisions, the reasons behind rejected approaches."
+    // the note is a preamble line — before the fence — and names only the history that went
+    const note = "Mida note: this handoff is longer than its size target. No constraint, decision or rejected approach was left out to shorten it. Left out: 4 earlier progress entries."
     const lines = out.text.split("\n")
     expect(lines.indexOf(note)).toBeGreaterThanOrEqual(0)
     expect(lines.indexOf(note)).toBeLessThan(lines.indexOf("=== BEGIN MIDA HANDOFF DATA ==="))
     expect(out.text).not.toContain("nothing further was cut")
+  })
+
+  // UF-L: the review caught reasons dropped from a handoff that did not fit anyway — 50 reasons
+  // gone for nothing under a "(reasons left out to fit)" heading on a 22,055-char text aimed at
+  // 8,000. Reasons now go ONLY when that alone makes the text fit.
+  it("over the limit either way: every reason stays and the note never names reasons (UF-L)", () => {
+    const out = renderHandoffReport({
+      ...base,
+      originalRequest: "r".repeat(6_000),
+      constraints: many(30, (i) => `constraint ${i} ${"c".repeat(40)}`),
+      decisions: many(30, (i) => ({ decision: `decision ${i} ${"d".repeat(60)}`, rationale: `rationale ${i} ${"r".repeat(60)}` })),
+    })
+    expect(out.oversized).toBe(true)
+    expect(out.reasonsLeftOut).toBe(false)
+    for (let i = 0; i < 30; i += 1) {
+      expect(out.text).toContain(`decision ${i} ${"d".repeat(60)} — because: `)
+    }
+    expect(out.text).toContain("Decisions:")
+    expect(out.text).not.toContain("(reasons left out to fit)")
+    const note = out.text.split("\n").find((l) => l.startsWith("Mida note: this handoff is longer"))!
+    expect(note).toBe("Mida note: this handoff is longer than its size target. No constraint, decision or rejected approach was left out to shorten it. Nothing was left out.")
+    expect(note).not.toContain("the reasons behind")
+  })
+
+  it("reasons go when that alone makes the handoff fit — both headings say so, no oversize note (UF-L)", () => {
+    const out = renderHandoffReport({
+      ...base,
+      decisions: many(40, (i) => ({ decision: `decision ${i}`, rationale: "r".repeat(150) })),
+      rejected: many(10, (i) => ({ approach: `approach ${i}`, why: "w".repeat(150) })),
+    })
+    expect(out.oversized).toBe(false)
+    expect(out.chars).toBeLessThanOrEqual(out.limitChars)
+    expect(out.reasonsLeftOut).toBe(true)
+    expect(out.text).toContain("Decisions (reasons left out to fit):")
+    expect(out.text).toContain("Rejected approaches (reasons left out to fit):")
+    expect(out.text).not.toContain(" — because: ")
+    // a fitting handoff carries no oversize note at all
+    expect(out.text).not.toContain("Mida note:")
   })
 
   it("reasons stay when leaving out old history is enough", () => {

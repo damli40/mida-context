@@ -6,8 +6,9 @@ import type { MergedHandoff } from "./merge.js"
 // rejected approaches are never left out. When the output would exceed maxChars
 // only history shrinks: the oldest progress, saved-by and artifact entries
 // collapse into count lines. When that is still not enough, the reasons behind
-// decisions and rejected approaches go (every entry stays), and a still-oversize
-// result says so in a preamble note rather than dropping a rule.
+// decisions and rejected approaches go (every entry stays) — but ONLY when that
+// brings the text to the limit, and a still-oversize result keeps every reason
+// and says so in a preamble note rather than dropping a rule.
 //
 // The output is text injected into another model's context, so it is fenced:
 // a header built per render sits ahead of the BEGIN line and tells the reader
@@ -390,46 +391,33 @@ export function renderHandoffReport(
     return { trim, text: out }
   }
 
-  // The preamble note an over-target text carries: it names exactly what the trim left out —
-  // history first, then the reasons when the reasons-off candidate took them (UF-I, UF-K).
-  const oversizeNote = (t: Trim, reasonsOff: boolean): string => {
+  // The preamble note an over-target text carries: it names exactly what the trim left out.
+  // Only history items can be named — reasons are dropped only when that alone makes the text
+  // fit, so a text carrying this note always kept them (UF-I, UF-L).
+  const oversizeNote = (t: Trim): string => {
     const leftOut: string[] = []
     if (t.progress > 0) leftOut.push(`${t.progress} earlier progress ${t.progress === 1 ? "entry" : "entries"}`)
     if (t.savedBy > 0) leftOut.push(`${t.savedBy} earlier ${t.savedBy === 1 ? "save" : "saves"}`)
     if (t.artifacts > 0) leftOut.push(`${t.artifacts} earlier ${t.artifacts === 1 ? "artifact" : "artifacts"}`)
-    if (reasonsOff && merged.decisions.length > 0) leftOut.push("the reasons behind decisions")
-    if (reasonsOff && merged.rejected.length > 0) leftOut.push("the reasons behind rejected approaches")
     return `${OVERSIZE_NOTE_LEAD} No constraint, decision or rejected approach was left out to shorten it.${leftOut.length > 0 ? ` Left out: ${leftOut.join(", ")}.` : " Nothing was left out."}`
   }
-  // A complete candidate is the fitted text plus the note it must carry when still over.
-  const finalText = (t: Trim, reasonsOff: boolean, text: string): string =>
-    text.length > maxChars ? build(t, reasonsOff, oversizeNote(t, reasonsOff)) : text
 
   let { trim, text: out } = fitOnce(false)
-  // Still over with history trimmed: compare the COMPLETE texts (UF-K). Dropping the reasons
-  // behind decisions and rejected approaches keeps every entry but lengthens the two headings
-  // AND the note (it gains "the reasons behind …"), which together can outweigh the reasons it
-  // saves — the old check compared the texts before the note and so could deliver a longer text
-  // with fewer facts. Reasons off is taken only when the final text is strictly shorter;
-  // otherwise the reasons, the plain headings and reasonsLeftOut: false stay (UF-J, UF-K). With
-  // no reasons to drop the text cannot change, so the step is skipped.
+  // Still over with history trimmed: try the reasons-off render, but take it ONLY when it
+  // actually fits (UF-L) — the old code took a merely shorter text, which once left 50 reasons
+  // out of a 22,055-char handoff aimed at 8,000. A handoff that stays over keeps every reason,
+  // the plain headings and reasonsLeftOut: false, and carries the oversize note. With no
+  // reasons to drop the text cannot change, so the step is skipped.
   let reasonsLeftOut = false
-  if (out.length > maxChars) {
-    const withReasons = finalText(trim, false, out)
-    if (merged.decisions.length > 0 || merged.rejected.length > 0) {
-      const tried = fitOnce(true)
-      const withoutReasons = finalText(tried.trim, true, tried.text)
-      if (withoutReasons.length < withReasons.length) {
-        trim = tried.trim
-        out = withoutReasons
-        reasonsLeftOut = true
-      } else {
-        out = withReasons
-      }
-    } else {
-      out = withReasons
+  if (out.length > maxChars && (merged.decisions.length > 0 || merged.rejected.length > 0)) {
+    const tried = fitOnce(true)
+    if (tried.text.length <= maxChars) {
+      trim = tried.trim
+      out = tried.text
+      reasonsLeftOut = true
     }
   }
+  if (out.length > maxChars) out = build(trim, reasonsLeftOut, oversizeNote(trim))
   const dropped = TRIM_ORDER.reduce((sum, key) => sum + trim[key], 0)
   return { text: out, chars: out.length, limitChars: maxChars, cut: dropped > 0, oversized: out.length > maxChars, reasonsLeftOut }
 }
