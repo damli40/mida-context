@@ -81,6 +81,11 @@ describe("startDaemon", () => {
       const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 1_000 })
       expect(reply.status).toBe(200)
       expect(reply.body).toMatchObject({ ok: true, pid: process.pid, queueDepth: 1 })
+      // /health also reports the summariser — mode and the runnable chain, never a command or key
+      const body = reply.body as { summarizer?: { mode?: unknown; chain?: unknown; entries?: Record<string, unknown>[] } }
+      expect(["agents", "key", "environment"]).toContain(body.summarizer?.mode)
+      expect(Array.isArray(body.summarizer?.chain)).toBe(true)
+      expect(body.summarizer?.entries?.every((e) => !("command" in e))).toBe(true)
 
       const second = await startDaemon(deps)
       expect(second.alreadyRunning).toBe(true)

@@ -65,6 +65,7 @@ export { agentApprovedOnChain, drainOnce, drainUntilSettled, resetOutOfGasWaits,
 export type { DrainDeps, DrainResult, SessionWait } from "./drain.js"
 export { MIGRATION_REFUSAL, SOCKET_FILE, callDaemon, ensureDaemon, ensureDaemonState, ensureCurrentDaemon, ensureFallbackSocketDir, fallbackSocketDir, socketPathFor } from "./control.js"
 export type { ControlReply } from "./control.js"
+export { SUMMARIZER_FILE, compileWithSummarizer, currentSummarizer, readSummarizer, summarizerSummary, writeSummarizer } from "./summarizer.js"
 export { startDaemon } from "./daemon.js"
 export type { DaemonDeps, DaemonHandle } from "./daemon.js"
 export { runDoctor, runDoctorLive } from "./doctor.js"

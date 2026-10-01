@@ -593,7 +593,7 @@ describe("mida doctor without a chain", () => {
     expect(unset).toBeDefined()
     expect(set).toContain("DEEPSEEK_API_KEY")
     expect(set).toContain("MIDA_COMPILE_MODEL")
-    for (const name of ["DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "DEEPSEEK_TIMEOUT_MS", "KIMI_API_KEY", "MIDA_COMPILE_API_KEY", "MIDA_COMPILE_BASE_URL", "MIDA_COMPILE_MODEL_ID", "MIDA_COMPILE_TIMEOUT_MS", "MIDA_COMPILE_FALLBACK"]) {
+    for (const name of ["DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "DEEPSEEK_TIMEOUT_MS", "KIMI_API_KEY", "MIDA_COMPILE_API_KEY", "MIDA_COMPILE_BASE_URL", "MIDA_COMPILE_MODEL_ID", "MIDA_COMPILE_TIMEOUT_MS", "MIDA_COMPILE_FALLBACK", "MIDA_CLAUDE_SUMMARY_MODEL", "MIDA_CODEX_SUMMARY_MODEL"]) {
       expect(unset).toContain(name)
     }
     // values never reach a doctor line

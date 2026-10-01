@@ -1,5 +1,6 @@
-import { compileCheckpoint, compileModelChoice } from "@mida/compiler"
+import { compileCheckpoint } from "@mida/compiler"
 import { drainUntilSettled } from "./drain.js"
+import { compileWithSummarizer } from "./summarizer.js"
 import { resolveHome } from "./home.js"
 import { appendLog } from "./log.js"
 import { serviceNetwork } from "./network.js"
@@ -30,16 +31,14 @@ async function main(): Promise<void> {
     return ServiceRuntime.open(home, network, { role: "save-helper" })
   }
 
-  // The detached drainer honours the same provider choice the daemon resolves —
-  // a drain that ignored DEEPSEEK_API_KEY or a pin would silently compile with haiku.
-  const compileModel = compileModelChoice(process.env)
-
   // One settle run: it waits out the save gap inside the drain lock rather than leaving a
-  // held-back job for a hook that may never come.
+  // held-back job for a hook that may never come. The summariser is re-read on EVERY compile
+  // inside compileWithSummarizer — the drainer honours the same saved choice, environment and
+  // PATH as the daemon, so a drain never silently compiles with a model nobody chose.
   const result = await drainUntilSettled({
     home,
     open,
-    compile: (input) => compileCheckpoint({ ...input, model: compileModel.model, fallbackModels: compileModel.fallbacks }),
+    compile: compileWithSummarizer(home, process.env, compileCheckpoint),
   })
   // drainUntilSettled already wrote the "lock-held" line when another drainer owns the
   // queue — logging "pass" here too would claim a clean pass that never ran

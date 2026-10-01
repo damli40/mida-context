@@ -696,7 +696,7 @@ function removalReason(home: MidaHome, agent: string, reason: string): string {
 /** A transient failure raised inside the drain pass, carrying the stable code the log uses. */
 class DrainFailure extends Error {
   constructor(
-    readonly code: "model-failed" | "no-json",
+    readonly code: "model-failed" | "no-json" | "summarizer-limit" | "no-summarizer",
     /** A bounded, already-scrubbed prefix of the provider's last answer — the compiler supplies it. */
     readonly sample?: string,
   ) {

@@ -1,5 +1,6 @@
-import { compileCheckpoint, compileModelChoice } from "@mida/compiler"
+import { compileCheckpoint } from "@mida/compiler"
 import { startDaemon } from "./daemon.js"
+import { compileWithSummarizer } from "./summarizer.js"
 import { resolveHome } from "./home.js"
 import { appendLog } from "./log.js"
 import { serviceNetwork } from "./network.js"
@@ -25,13 +26,14 @@ async function main(): Promise<void> {
   // the daemon holds agent keys only — funding is the owner CLI's job
   network.fund = async () => { throw new Error("the daemon cannot fund accounts") }
 
-  // The compile model is chosen once here from the environment (MIDA_COMPILE_MODEL /
-  // the provider keys): deepseek → kimi → haiku, with the chain as its ordered fallbacks.
-  const compileModel = compileModelChoice(process.env)
+  // The summariser is NOT chosen here: the saved choice (summarizer.json), the environment
+  // and PATH are re-read on EVERY compile inside compileWithSummarizer, so a choice written
+  // while the daemon runs takes effect on the next save — no restart. An empty chain fails
+  // honestly as "no-summarizer" with no model run.
   const daemon = await startDaemon({
     home,
     network,
-    compile: (input) => compileCheckpoint({ ...input, model: compileModel.model, fallbackModels: compileModel.fallbacks }),
+    compile: compileWithSummarizer(home, process.env, compileCheckpoint),
     now: () => Date.now(),
     log: (entry) => appendLog(home, "daemon", entry as Record<string, unknown>),
   })
