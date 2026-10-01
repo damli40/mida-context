@@ -25,7 +25,7 @@ import { appendLog } from "./log.js"
 import { resolveNetwork } from "./network.js"
 import { checkProject as checkProjectAgainstList } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
-import { findProjectMarker, firstQueuedAt, isSafeName, listJobs, moveToBad, removeJob, stampFirstAt } from "./queue.js"
+import { findProjectMarker, firstQueuedAt, isSafeName, listJobs, moveToBad, peekJobs, removeJob, stampFirstAt } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
 import { clearUnsent, markUnsent } from "./unsent.js"
 import { resolveSessionTask, taskOrUndefined } from "./task.js"
@@ -107,8 +107,8 @@ const backoffMs = (attempts: number) => Math.min(60_000 * 2 ** attempts, MAX_BAC
 /**
  * Transient codes that are a capacity wait, not a failed attempt: the sponsor's daily cap (UF-O),
  * or a compile with no model able to write the summary — the whole chain at its usage limit, or
- * nothing installed at all (UF-P3). They never count an attempt, never reach queue/bad through
- * gave-up, and outlive the 24-hour staleness rule.
+ * nothing installed at all (UF-P3). They never count an attempt and never reach queue/bad
+ * through gave-up.
  */
 const LIMIT_WAIT_REASONS = new Set(["sponsor-limit", "summarizer-limit", "no-summarizer"])
 
@@ -323,15 +323,13 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
       for (const older of group.slice(0, -1)) removeJob(deps.home, older.id)
       const flush = group.some((j) => FLUSH_EVENTS.has(j.event))
       try {
-        // UF-P3: the session's state decides the staleness limit, so it is read BEFORE the age
-        // check and reused below — a wait on the sponsor's daily cap or on a missing summary
-        // model can honestly last longer than a day (a weekly plan limit, a budget spent two
-        // days running), and only a full week drops that job; every other job keeps 24 hours.
+        // UF-QC: ONE age rule for every job, whatever happened to it — a queued save is kept
+        // for seven days. The session's state is read here anyway and reused below; it no
+        // longer decides staleness, so a wait reason clearing can never drop the save.
         const state = readState(deps.home, sessionId)
-        const longWait = state?.failedAt !== undefined && LIMIT_WAIT_REASONS.has(state.reason ?? "")
-        if (now().getTime() - Date.parse(job.at) > (longWait ? WEEK_MS : DAY_MS)) {
+        if (now().getTime() - Date.parse(job.at) > WEEK_MS) {
           moveToBad(deps.home, `${job.id}.json`)
-          log({ sessionId, outcome: "bad", reason: longWait ? "older-than-7d" : "older-than-24h" })
+          log({ sessionId, outcome: "bad", reason: "older-than-7d" })
           continue
         }
         // the hook checked this path at enqueue, but the file could have been swapped since —
@@ -1106,8 +1104,10 @@ const SUMMARIZER_WAIT_REASONS = new Set(["summarizer-limit", "no-summarizer"])
  * Clears the recorded failure wait on every session that was waiting on the summary model —
  * run after `mida summarizer use agents`/`use key` writes the new choice, so the next pass
  * retries the save at once instead of waiting out the hour. A wait recorded with no attempts
- * clears too — summarizer waits never counted one. Returns the number of waits cleared.
- * Never throws: a state file that will not parse is left for the drain's own handling.
+ * clears too — summarizer waits never counted one. Returns how many of the cleared waits belong
+ * to a session that still has a job in the queue right now — the number the "will be tried
+ * again" line depends on (UF-QC). Never throws: a state file that will not parse is left for
+ * the drain's own handling.
  */
 export function resetSummarizerWaits(home: MidaHome): number {
   let cleared = 0
@@ -1117,6 +1117,10 @@ export function resetSummarizerWaits(home: MidaHome): number {
   } catch {
     return 0
   }
+  // UF-QC: the count answers "how many queued saves just became due" — a cleared wait whose
+  // session has no job in the queue right now clears anyway (it costs nothing) but is not
+  // counted, so the "will be tried again" line only prints when something will
+  const queued = new Set(peekJobs(home).map((job) => job.sessionId))
   for (const name of names) {
     if (!name.endsWith(".json") || name.endsWith(".last.json")) continue
     const sessionId = name.slice(0, -".json".length)
@@ -1126,7 +1130,7 @@ export function resetSummarizerWaits(home: MidaHome): number {
     if (state.reason === undefined || !SUMMARIZER_WAIT_REASONS.has(state.reason)) continue
     const { attempts: _a, failedAt: _f, reason: _r, ...rest } = state
     writeState(home, sessionId, rest)
-    cleared += 1
+    if (queued.has(sessionId)) cleared += 1
   }
   return cleared
 }

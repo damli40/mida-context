@@ -141,7 +141,7 @@ function asJob(raw: unknown, id: string): CaptureJob | undefined {
   if (
     typeof r.agent !== "string" || typeof r.event !== "string" || typeof r.sessionId !== "string" ||
     typeof r.transcriptPath !== "string" || typeof r.cwd !== "string" ||
-    // an `at` that will not parse could never age past the 24-hour stale rule — treat it as corrupt
+    // an `at` that will not parse could never age past the seven-day stale rule — treat it as corrupt
     typeof r.at !== "string" || Number.isNaN(Date.parse(r.at)) ||
     (r.error !== null && typeof r.error !== "string") ||
     // a hand-crafted file with path-shaped names must never reach writeState/loadAgentIdentity

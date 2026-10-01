@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest"
 import { appendFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { MidaHome, NEEDS_TERMINAL_LINE, USAGE, askSummarizerKey, chooseSummarizer, readSummarizer, runSummarizer, writeSummarizer } from "@mida/midad"
+import { MidaHome, NEEDS_TERMINAL_LINE, USAGE, askSummarizerKey, chooseSummarizer, enqueue, readSummarizer, runSummarizer, writeSummarizer } from "@mida/midad"
 import type { SecretKeyAnswer } from "@mida/midad"
 import type { ModelCommand } from "@mida/compiler"
 
@@ -307,6 +307,8 @@ describe("mida summarizer use", () => {
   // clear at once, the running service is asked for a pass, and the owner sees the one line.
   it("use agents clears a waiting save, kicks the service once and prints the line (UF-P3)", async () => {
     const dir = home()
+    // UF-QC: the retry line names saves that are really queued, so s1 needs a job
+    enqueue(dir, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
     dir.writeSecretJson("queue/state/s1.json", {
       transcriptBytes: 10,
       lastLineHash: "",
@@ -328,6 +330,7 @@ describe("mida summarizer use", () => {
 
   it("use key clears a waiting save and kicks too (UF-P3)", async () => {
     const dir = home()
+    enqueue(dir, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
     dir.writeSecretJson("queue/state/s1.json", {
       transcriptBytes: 10,
       lastLineHash: "",
@@ -355,6 +358,28 @@ describe("mida summarizer use", () => {
     const r = rig(dir, { onPath: () => true, kick: () => {} })
     expect(await r.run(["summarizer", "use", "agents"])).toBe(0)
     expect(r.lines.some((line) => line.includes("waiting for a summary model"))).toBe(false)
+  })
+
+  it("use agents with a waiting state but no queued job clears it yet prints no retry line (UF-QC)", async () => {
+    const dir = home()
+    dir.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T11:00:00.000Z",
+      failedAt: "2026-10-01T11:30:00.000Z",
+      reason: "summarizer-limit",
+    })
+    const r = rig(dir, { onPath: () => true, kick: () => {} })
+    expect(await r.run(["summarizer", "use", "agents"])).toBe(0)
+    expect(r.lines.some((line) => line.includes("waiting for a summary model"))).toBe(false)
+    expect(dir.readJson<{ failedAt?: string }>("queue/state/s1.json")?.failedAt).toBeUndefined()
+  })
+
+  it("a kick that rejects after use agents still returns 0 and prints nothing extra (UF-QC)", async () => {
+    const dir = home()
+    const r = rig(dir, { onPath: () => true, kick: () => Promise.reject(new Error("no service")) })
+    expect(await r.run(["summarizer", "use", "agents"])).toBe(0)
+    expect(r.lines[0]).toBe("Saved: your agents' small models write the summaries.")
   })
 
   it("use agents returns 0 once the file is written, even with neither tool on PATH (UF-P2R)", async () => {
