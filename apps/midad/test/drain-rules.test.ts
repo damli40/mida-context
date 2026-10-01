@@ -1990,16 +1990,20 @@ describe("a save refused by the sponsor's daily limit waits for the reset (UF-O)
     expect(line.sponsorReason).toBe(LIMIT_REASON)
   })
 
-  it("twenty passes of the same refusal never move the job to queue/bad and never grow attempts", async () => {
+  // UF-QA: thirty passes — the run crosses the one-day line, and a sponsor-limit wait is kept
+  // past it (the "kept past the 24-hour line" case below pins the same rule on the state file)
+  it("thirty passes of the same refusal never move the job to queue/bad and never grow attempts", async () => {
     const { home, job, drain } = setup()
     job()
-    for (let i = 0; i < 20; i += 1) {
+    for (let i = 0; i < 30; i += 1) {
       // each pass runs once its wait has passed — 61 minutes on from the last failure
       await drain({ save: failing, now: () => new Date(T0 + 120_000 + i * 3_660_000) })
     }
     expect(listJobs(home)).toHaveLength(1)
     expect(home.list("queue/bad")).toEqual([])
-    expect(home.readJson("queue/state/s1.json")).not.toHaveProperty("attempts")
+    const state = home.readJson<{ reason?: string }>("queue/state/s1.json")
+    expect(state?.reason).toBe("sponsor-limit")
+    expect(state).not.toHaveProperty("attempts")
   })
 
   it("the next try is due at the earlier of one hour and just after the UTC-midnight reset — the pass and sessionWaits agree", async () => {

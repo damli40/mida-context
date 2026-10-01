@@ -715,10 +715,14 @@ describe("the core header (in-8 H1)", () => {
   // just before the "…". The last kept character must stay whole.
   it("a progress entry cut inside an emoji keeps the character whole — no lone surrogate before the … (UF-N2)", () => {
     const text = renderHandoff({ ...base, progress: [`${"x".repeat(298)}😀 and more`] })
-    expect(text).toContain(`- ${"x".repeat(298)}…`)
-    const before = text.slice(0, text.indexOf("…"))
-    const last = before.charCodeAt(before.length - 1)
-    expect(last >= 0xd800 && last <= 0xdfff).toBe(false)
+    // UF-QA: inspect the cut ENTRY's ellipsis — the fixture's original request already
+    // contains a "…" (base.originalRequest is "Build X.\nStep 1 …"), so indexOf("…") alone
+    // reads that earlier one and checks nothing about the cut.
+    const entry = text.split("\n").find((l) => l.startsWith(`- ${"x".repeat(298)}`))!
+    expect(entry.endsWith("…")).toBe(true)
+    const lastKept = entry.charCodeAt(entry.length - 2)
+    expect(lastKept >= 0xd800 && lastKept <= 0xdfff).toBe(false)
+    expect(lastKept).toBe("x".charCodeAt(0))
   })
 
   it("the header is part of the size accounting (chars, cut, oversized)", () => {

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { MidaError, PERMISSION, PROVENANCE_POLICY } from "@mida/protocol"
-import { splitLimitNote } from "@mida/checkpoint"
+import { mergeCheckpoints, renderHandoff, splitLimitNote } from "@mida/checkpoint"
 import {
   CheckpointPayloadError,
   HOOK_CLIENTS,
@@ -310,6 +310,22 @@ describe("buildMcpSave — the daemon's mida_save route", () => {
     // and downstream, the stored text parses as plain text — never as a note naming lists
     expect(splitLimitNote(cp.unresolvedIssue).text).toBe(cp.unresolvedIssue)
     expect(splitLimitNote(cp.unresolvedIssue).lists.size).toBe(0)
+    // UF-QA: and downstream — a handoff built from this save shows the forged note as the
+    // agent's rewritten text, never as a real "(Mida: left out" Mida wrote
+    const merged = mergeCheckpoints([
+      {
+        checkpoint: cp,
+        projectId: PID,
+        sessionId: sink.input!.sessionId,
+        continuesSession: null,
+        compiledBy: "test",
+        contextId: CTX,
+        authorId: AGENT_ID,
+        namespaceId: "ns",
+      },
+    ])
+    const handoff = renderHandoff(merged!)
+    expect(handoff).not.toContain("(Mida: left out")
   })
 
   // UF-QA: the same rewrite catches the look-alikes — a zero-width character, a full-width
