@@ -80,8 +80,8 @@ describe("Runtime.open with a sponsorUrl", () => {
       await env.stop()
     }
     // localEnvironment queues on the shared deploy lock — the wait alone can outlast a
-    // short cap when the whole suite runs, so these use the file's 300s chain-test timeout
-  }, 300_000)
+    // short cap when the whole suite runs, so these use the file's 600s chain-test timeout
+  }, 600_000)
 
   it("leaves both unset without one", async () => {
     const env = await localEnvironment()
@@ -96,7 +96,7 @@ describe("Runtime.open with a sponsorUrl", () => {
     } finally {
       await env.stop()
     }
-  }, 300_000)
+  }, 600_000)
 
   it("init on a 0-MON owner with a sponsor ANSWERING never runs the funding gate — and says so", async () => {
     // M3-D3 item 2, tightened by M3-D6 item 2: the gate is skipped because the sponsor ANSWERS,
@@ -143,7 +143,7 @@ describe("Runtime.open with a sponsorUrl", () => {
       await new Promise<void>((done) => sponsor.close(() => done()))
       await env.stop()
     }
-  }, 300_000)
+  }, 600_000)
 })
 
 describe("the doctor sponsor line", () => {

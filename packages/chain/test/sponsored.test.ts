@@ -745,5 +745,5 @@ describe("sendContract on Anvil with a zero-balance wallet", () => {
     } finally {
       await node.stop()
     }
-  }, 120_000)
+  }, 600_000)
 })

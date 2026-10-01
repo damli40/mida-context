@@ -42,7 +42,7 @@ describe("the local deploy lock", () => {
     mkdirSync(lock)
     writeFileSync(join(lock, "owner"), String(process.pid))
     await expect(takeDirLock(lock, { waitMs: 400, staleMs: 5 * 60_000 })).rejects.toThrow(
-      `deploy lock ${lock} held for 0.4s by pid ${process.pid}. If no test run is active, delete that folder.`,
+      `waited 0.4s for deploy lock ${lock}, now held by pid ${process.pid}. If no test run is active, delete that folder.`,
     )
   })
 
@@ -50,7 +50,7 @@ describe("the local deploy lock", () => {
     const lock = lockIn()
     mkdirSync(lock) // ownerless and fresh — not left behind, and nobody to name
     await expect(takeDirLock(lock, { waitMs: 400, staleMs: 5 * 60_000 })).rejects.toThrow(
-      `deploy lock ${lock} held for 0.4s. If no test run is active, delete that folder.`,
+      `waited 0.4s for deploy lock ${lock}. If no test run is active, delete that folder.`,
     )
   })
 
@@ -63,6 +63,22 @@ describe("the local deploy lock", () => {
     const fortyMinutesAgo = new Date(Date.now() - 40 * 60_000)
     utimesSync(lock, fortyMinutesAgo, fortyMinutesAgo)
     await expect(takeDirLock(lock, { waitMs: 400, staleMs: 5 * 60_000 })).rejects.toThrow(/deploy lock .* held/)
+  })
+
+  // UF-L: a waiter whose own wait runs out while it is paused between seeing the leftover and
+  // making `.steal` still finishes the take — the `continue` after removing the leftover sends it
+  // back to the mkdir instead of letting the deadline check throw "waited" for a lock it just freed.
+  it("a waiter whose wait ran out mid-takeover still finishes the take", async () => {
+    const lock = lockIn()
+    mkdirSync(lock) // a leftover: no owner file, ten minutes old
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60_000)
+    utimesSync(lock, tenMinutesAgo, tenMinutesAgo)
+    await takeDirLock(lock, {
+      waitMs: 1,
+      staleMs: 5 * 60_000,
+      beforeTakeover: () => new Promise((resolve) => setTimeout(resolve, 50)),
+    })
+    expect(readFileSync(join(lock, "owner"), "utf8")).toBe(String(process.pid))
   })
 
   it("releaseDirLock removes only a lock this process owns", async () => {
@@ -147,8 +163,10 @@ describe("the local deploy lock", () => {
 
   // UF-K: a waiter that wins `.steal` must re-check the lock under the mutex before removing
   // it — another waiter may have retaken it while this one was paused between seeing the lock
-  // left behind and making the mutex. Worker B pauses 600 ms there (the beforeTakeover hook);
-  // worker A starts 150 ms later with no pause and holds the lock for 1,200 ms. The re-check
+  // left behind and making the mutex.
+  // UF-L: no sleeps decide that interleaving. Worker B's beforeTakeover logs `paused` and polls
+  // for a `<lock>.go` file; the test parks B there, starts A, and opens the gate only after A's
+  // `start` is in the log — so B's re-check lands while A provably holds the lock. The re-check
   // makes B's `start` come after A's `end`; without it B removes A's live lock and holds the
   // same lock beside A.
   it("a waiter that clears a leftover re-checks under the steal mutex — a live holder wins (UF-K)", async () => {
@@ -159,16 +177,23 @@ describe("the local deploy lock", () => {
     mkdirSync(lock) // a leftover: no owner file, ten minutes old
     const tenMinutesAgo = new Date(Date.now() - 10 * 60_000)
     utimesSync(lock, tenMinutesAgo, tenMinutesAgo)
-    const spawnWorker = (beforeTakeoverMs: number, holdMs: number) =>
-      spawn(process.execPath, ["--import", "tsx", worker, lock, logPath, "", String(beforeTakeoverMs), String(holdMs)])
     const exited = (child: ReturnType<typeof spawn>) =>
       new Promise<void>((resolve, reject) => {
         child.once("error", reject)
         child.once("exit", (code) => (code === 0 ? resolve() : reject(new Error(`lock worker exited with code ${code}`))))
       })
-    const b = spawnWorker(600, 0)
-    await new Promise((resolve) => setTimeout(resolve, 150))
-    const a = spawnWorker(0, 1_200)
+    const untilLogHas = async (mark: string) => {
+      const giveUp = Date.now() + 15_000
+      while (!(existsSync(logPath) && readFileSync(logPath, "utf8").includes(mark))) {
+        if (Date.now() > giveUp) throw new Error(`log never showed "${mark}": ${existsSync(logPath) ? readFileSync(logPath, "utf8") : "(no log)"}`)
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+    }
+    const b = spawn(process.execPath, ["--import", "tsx", worker, lock, logPath, "", "go", "0"])
+    await untilLogHas("paused")
+    const a = spawn(process.execPath, ["--import", "tsx", worker, lock, logPath, "", "", "500"])
+    await untilLogHas(`start ${a.pid}`)
+    writeFileSync(`${lock}.go`, "")
     await Promise.all([exited(b), exited(a)])
     const lines = readFileSync(logPath, "utf8").trim().split("\n")
     const aEnd = lines.indexOf(`end ${a.pid}`)

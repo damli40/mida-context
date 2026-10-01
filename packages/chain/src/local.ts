@@ -202,7 +202,7 @@ export async function takeDirLock(
     if (Date.now() > deadline) {
       const owner = lockOwnerPid(lockDir)
       throw new Error(
-        `deploy lock ${lockDir} held for ${options.waitMs / 1000}s${owner === undefined ? "" : ` by pid ${owner}`}. If no test run is active, delete that folder.`,
+        `waited ${options.waitMs / 1000}s for deploy lock ${lockDir}${owner === undefined ? "" : `, now held by pid ${owner}`}. If no test run is active, delete that folder.`,
       )
     }
     await new Promise((resolve) => setTimeout(resolve, 200))
@@ -232,10 +232,11 @@ export async function deployLocal(options: { rpcUrl: string; privateKey?: Hex })
   const privateKey = options.privateKey ?? ANVIL_PRIVATE_KEYS[0]!
   const lockDir = `${CONTRACTS_DIR()}deployments/.deploy-lock`
   // The wait must outlast the full-suite queue: every test file that deploys serializes here
-  // (two forge runs each), and a wave of waiters easily stacks past two minutes. The deadline
-  // still bounds a genuinely stuck lock — it just stops firing on normal queue depth. A lock
-  // whose owner pid is running is never taken over, however long it has been held.
-  await takeDirLock(lockDir, { waitMs: 600_000, staleMs: DEPLOY_LOCK_STALE_MS })
+  // (two forge runs each), and a wave of waiters easily stacks past two minutes. It ends at
+  // 540 s — inside the 600 s hook timeout whose clock started first — so a genuinely stuck lock
+  // reports its own message instead of surfacing as "Hook timed out in 600000ms". A lock whose
+  // owner pid is running is never taken over, however long it has been held.
+  await takeDirLock(lockDir, { waitMs: 540_000, staleMs: DEPLOY_LOCK_STALE_MS })
   try {
     const result = spawnSync(
       `${FOUNDRY_BIN}/forge`,
