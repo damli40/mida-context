@@ -242,8 +242,10 @@ export async function drainUntilSettled(deps: DrainDeps): Promise<DrainResult> {
  * `queue/state/<sessionId>.json`: an unchanged transcript is skipped even on a flush, and a changed
  * one inside `minGapMs` of the last save waits — its job stays queued so a later drain (or a flush)
  * still saves it. A transient failure is recorded as `attempts`/`failedAt` on the state and retried
- * only after `60 s × 2^attempts` (capped at an hour); the eighth attempt moves the job to
- * `queue/bad/` as `gave-up`. A permanent failure removes the job and records the transcript state
+ * only after `60 s × 2^attempts` (capped at an hour). Only an answered-but-unusable model reply
+ * gives up on a count (`no-json` at eight tries, `invalid-checkpoint` at three); every other
+ * transient failure keeps retrying until the seven-day age rule drops the job. A permanent
+ * failure removes the job and records the transcript state
  * so an identical job later skips as unchanged. A compiled envelope is cached at
  * `queue/compiled/<eventId>.json` so a retried save never pays for a second model call.
  *
@@ -630,8 +632,13 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         const priorState = readState(deps.home, sessionId)
         const attempts = LIMIT_WAIT_REASONS.has(code) ? (priorState?.attempts ?? 0) : (priorState?.attempts ?? 0) + 1
         counts.failed += 1
+        // UF-QD: only an answered-but-unusable model reply is terminal on a count — no-json
+        // after eight tries, invalid-checkpoint after three. Every other transient reason
+        // retries until the seven-day age rule drops the job: the count is not a death sentence
+        // for a chain problem or a model that is down for the afternoon.
         const invalidGaveUp = code === "invalid-checkpoint" && attempts >= INVALID_CHECKPOINT_MAX_ATTEMPTS
-        if (!LIMIT_WAIT_REASONS.has(code) && (attempts >= MAX_ATTEMPTS || invalidGaveUp)) {
+        const noJsonGaveUp = code === "no-json" && attempts >= MAX_ATTEMPTS
+        if (invalidGaveUp || noJsonGaveUp) {
           moveToBad(deps.home, `${job.id}.json`)
           writeState(deps.home, sessionId, terminalStateFor(job, now().toISOString(), deps.openDevinDb))
           log({ sessionId, outcome: "bad", reason: invalidGaveUp ? "invalid-checkpoint" : "gave-up", lastReason: code, ...fields, ...sample })

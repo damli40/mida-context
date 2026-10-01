@@ -428,30 +428,29 @@ describe("a failed save does not buy a new model call", () => {
   it("a save that gives up for good is no longer marked UNSENT (CAP-26)", async () => {
     const { home, job, drain, flags } = setup()
     job({ event: "Stop" }, T0)
-    flags.saveFailures = 100
+    // UF-QD: only an answered-but-unusable model reply can still give up — no-json is one
+    flags.compileReason = "no-json"
     for (let i = 0; i < 8; i += 1) await drain({ now: () => new Date(T0 + 120_000 + i * 7_200_000) })
     expect(home.list("queue/bad").length).toBeGreaterThan(0)
     expect(readUnsent(home, "s1")).toBeUndefined()
   })
 
-  it("eight failed attempts give up: the job goes to queue/bad with gave-up", async () => {
+  it("eight no-json answers give up: the job goes to queue/bad with gave-up", async () => {
     const { home, job, drain, compileCalls, saveCalls, flags, drainLog } = setup()
     job({ event: "Stop" }, T0)
-    flags.saveFailures = 100
+    flags.compileReason = "no-json"
     for (let i = 0; i < 8; i += 1) {
       // each drain runs far past any backoff so the retry always fires
       await drain({ now: () => new Date(T0 + 120_000 + i * 7_200_000) })
     }
-    expect(saveCalls).toHaveLength(8)
-    expect(compileCalls).toHaveLength(1)   // one compile, eight save attempts
+    expect(compileCalls).toHaveLength(8)
+    expect(saveCalls).toHaveLength(0) // the model's answer never parsed — no save was tried
     expect(listJobs(home)).toHaveLength(0)
+    expect(home.list("queue/bad")).toHaveLength(1)
     expect(drainLog()).toContain("gave-up")
-    // CAP-26 review: the terminal line names the kind of error too — and, since UF-O, the
-    // drain code of the last failure, so a gave-up after mixed failures still says what ended it
+    // the terminal line names the drain code of the last failure — what ended it
     const gaveUp = drainLog().trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>).find((o) => o.reason === "gave-up")!
-    expect(gaveUp.errorChain).toEqual(["Error"])
-    expect(gaveUp.lastReason).toBe("chain-error")
-    expect(drainLog()).not.toContain("rpc unreachable")
+    expect(gaveUp.lastReason).toBe("no-json")
   })
 
   it("a permanently-too-large envelope removes the job with too-large and is never recompiled", async () => {
@@ -2251,7 +2250,10 @@ describe("a save that found no summary model waits, not fails (UF-P3)", () => {
     }
   })
 
-  it("a model-failed compile still counts attempts and gives up after eight", async () => {
+  // UF-QD: model-failed is transient — the old code ended it in gave-up after eight tries,
+  // which is how 27 real saves were lost on Oct 1. Now the attempt count climbs, the backoff
+  // (capped at an hour) decides the next try, and only the seven-day age rule ends the job.
+  it("twelve model-failed tries in a row: still queued, attempts 12, next wait an hour (UF-QD)", async () => {
     const { home, job, drain, drainLog } = setup()
     job()
     const failingCompile: typeof compileCheckpoint = async () => ({
@@ -2261,14 +2263,16 @@ describe("a save that found no summary model waits, not fails (UF-P3)", () => {
       attempts: 1,
       retried: 0,
     })
-    // each pass lands just past the 60 s × 2^attempts backoff of the last failure
+    // each pass lands just past the 60 s × 2^attempts backoff of the last failure (capped
+    // at one hour, so the later passes step an hour each)
     let t = T0 + 120_000
-    for (let i = 0; i < 8; i += 1) {
+    for (let i = 0; i < 12; i += 1) {
       await drain({ compile: failingCompile, now: () => new Date(t) })
-      t += 60_000 * 2 ** (i + 1) + 1_000
+      t += Math.min(60_000 * 2 ** (i + 1), 3_600_000) + 1_000
     }
-    expect(listJobs(home)).toHaveLength(0)
-    expect(drainLog()).toContain("gave-up")
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+    expect(drainLog()).not.toContain("gave-up")
     expect(drainLog()).toContain('"reason":"model-failed"')
     const lastFailed = drainLog()
       .trim()
@@ -2276,7 +2280,62 @@ describe("a save that found no summary model waits, not fails (UF-P3)", () => {
       .map((l) => JSON.parse(l) as Record<string, unknown>)
       .filter((o) => o.outcome === "failed")
       .at(-1)!
-    expect(lastFailed.attempts).toBe(7)
+    expect(lastFailed.attempts).toBe(12)
+    const state = home.readJson<{ failedAt?: string }>("queue/state/s1.json")!
+    expect(sessionWaits(home, listJobs(home)).find((w) => w.sessionId === "s1")?.dueAtMs).toBe(
+      Date.parse(state.failedAt!) + 3_600_000,
+    )
+  })
+
+  it("twelve chain-error tries in a row: still queued, attempts 12, next wait an hour (UF-QD)", async () => {
+    const { home, job, drain, flags, saveCalls, drainLog } = setup()
+    job()
+    flags.saveFailures = 100 // "rpc unreachable" — a transient chain error
+    let t = T0 + 120_000
+    for (let i = 0; i < 12; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += Math.min(60_000 * 2 ** (i + 1), 3_600_000) + 1_000
+    }
+    expect(saveCalls).toHaveLength(12)
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+    expect(drainLog()).not.toContain("gave-up")
+    const lastFailed = drainLog()
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((o) => o.outcome === "failed")
+      .at(-1)!
+    expect(lastFailed.attempts).toBe(12)
+    const state = home.readJson<{ failedAt?: string }>("queue/state/s1.json")!
+    expect(sessionWaits(home, listJobs(home)).find((w) => w.sessionId === "s1")?.dueAtMs).toBe(
+      Date.parse(state.failedAt!) + 3_600_000,
+    )
+  })
+
+  it("a job still failing with model-failed when it turns seven days old drops with older-than-7d (UF-QD)", async () => {
+    const { home, job, drain, drainLog, compileCalls } = setup()
+    job()
+    const failingCompile: typeof compileCheckpoint = async () => ({
+      ok: false,
+      reason: "model-failed",
+      detail: "stub",
+      attempts: 1,
+      retried: 0,
+    })
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-21T11:00:00.000Z",
+      attempts: 30,
+      failedAt: new Date(T0 + 3_600_000).toISOString(),
+      reason: "model-failed",
+    })
+    await drain({ compile: failingCompile, now: () => new Date(T0 + 8 * 24 * 3_600_000) })
+    expect(compileCalls).toHaveLength(0)
+    expect(listJobs(home)).toHaveLength(0)
+    expect(home.list("queue/bad")).toHaveLength(1)
+    expect(drainLog()).toContain('"reason":"older-than-7d"')
   })
 
   // UF-P3 item 3b: a limit can outlast a day — a weekly model plan, or the sponsor's budget spent
