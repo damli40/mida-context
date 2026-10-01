@@ -45,7 +45,7 @@ function fixture(
   delayMs = 12,
   epochs = 2,
   epochKeyCache?: Map<string, Uint8Array>,
-  options?: { agentId?: Hex; stallWraps?: boolean },
+  options?: { agentId?: Hex; stallWraps?: boolean; corrupt?: number },
 ): Fixture {
   const deployment = {
     chainId: CHAIN_ID,
@@ -94,6 +94,13 @@ function fixture(
       provenanceSource: 0,
     })
     fx.objects.push({ contextId, value })
+  }
+  // UF-J: flip the last byte of one object's ciphertext only — the manifest and chain record
+  // stay consistent, so verification passes and the bytes fail inside openContextObject, the
+  // "damaged save" case that must not cost the shared cache its key.
+  if (options?.corrupt !== undefined) {
+    const target = objects[options.corrupt]!
+    target.ciphertext = (target.ciphertext.endsWith("00") ? `${target.ciphertext.slice(0, -2)}ff` : `${target.ciphertext.slice(0, -2)}00`) as Hex
   }
   // One record lookup both chain doors share: the batched multicall answers listed records and
   // a lone readContract.getRecord serves anything else — the tamper hook sees either.
@@ -257,6 +264,19 @@ describe("MidaAgent.read bounded concurrency (R4-2)", () => {
     const results = await second.agent.read(OWNER, NAMESPACE)
     expect(results.map((o) => o.payload.value)).toEqual(second.objects.map((o) => o.value))
     expect(shared.size).toBe(1) // the second read's opened key joined the cache; the stalled one never did
+  })
+
+  // UF-J: a flipped ciphertext byte fails the object's own check, which says nothing about
+  // the epoch key — evicting it made every later read fetch a key that was never wrong.
+  it("an object that fails to open leaves the key in the shared cache — the next read fetches nothing (UF-J)", async () => {
+    const shared = new Map<string, Uint8Array>()
+    const first = fixture(4, 1, 1, shared, { corrupt: 2 })
+    await expect(first.agent.read(OWNER, NAMESPACE)).rejects.toThrow()
+    expect(shared.size).toBe(1) // the opened key stays cached even though this read failed
+    const second = fixture(4, 1, 1, shared)
+    const results = await second.agent.read(OWNER, NAMESPACE)
+    expect(second.wrapCalls).toEqual([]) // a fresh agent on the same cache reuses the key
+    expect(results.map((o) => o.payload.value)).toEqual(second.objects.map((o) => o.value))
   })
 
   it("a failed fetch stores nothing in the shared cache — the next read fetches again and succeeds", async () => {

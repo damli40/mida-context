@@ -452,19 +452,13 @@ export class MidaAgent {
     const readObject = async (object: AnchoredObject): Promise<ContextObject> => {
       const record = await this.#verifiedRecord(ownerAddress, namespaceId, object, listed)
       const epochPrivateKey = await epochKeyFor(record.readEpoch)
-      let payload: ContextPayload
-      try {
-        payload = openContextObject({
-          manifest: object.manifest,
-          expectedManifestHash: record.manifestHash,
-          ciphertext: bytesOf(object.ciphertext, object.manifest.ciphertextSize),
-          epochPrivateKey,
-          binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: record.contextId, namespaceId, readEpoch: record.readEpoch },
-        })
-      } catch (error) {
-        this.#dropEpochKey(ownerAddress, namespaceId, record.readEpoch, epochPrivateKey)
-        throw error
-      }
+      const payload = openContextObject({
+        manifest: object.manifest,
+        expectedManifestHash: record.manifestHash,
+        ciphertext: bytesOf(object.ciphertext, object.manifest.ciphertextSize),
+        epochPrivateKey,
+        binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: record.contextId, namespaceId, readEpoch: record.readEpoch },
+      })
       await this.#verifyReferences(ownerAddress, record, payload, listed)
       return this.#toObject(record, name, payload, { at: record.createdAt })
     }
@@ -581,11 +575,10 @@ export class MidaAgent {
       }
       const readEpoch = decodeUint64(message.readEpoch)
       let payload: ContextPayload
-      let epochPrivateKey: Uint8Array | undefined
       try {
         // The key fetch is inside the guard too: a row sealed under an epoch this agent has no wrap
         // for throws there, and must skip the row — not abort the whole batched read.
-        epochPrivateKey = await epochKeyFor(readEpoch)
+        const epochPrivateKey = await epochKeyFor(readEpoch)
         payload = openContextObject({
           manifest: item.save.manifest,
           expectedManifestHash: message.manifestHash.toLowerCase() as Hex,
@@ -600,8 +593,6 @@ export class MidaAgent {
           },
         })
       } catch {
-        // a shared-cache key that failed to open this row is dropped so the next read refetches it
-        if (epochPrivateKey !== undefined) this.#dropEpochKey(ownerAddress, namespaceId, readEpoch, epochPrivateKey)
         // One row that will not open — sealed under a key this agent cannot unwrap, or bytes that
         // pass the commitments but fail the AAD — skips the row, not the whole read.
         return { kind: "skipped", skipped: { contextId: item.contextId, reason: "decrypt" } }
@@ -716,19 +707,13 @@ export class MidaAgent {
         const object = objects[index]!
         const readEpoch = decodeUint64(object.manifest.readEpoch)
         const epochPrivateKey = await epochKeyFor(readEpoch)
-        let payload: ContextPayload
-        try {
-          payload = openContextObject({
-            manifest: object.manifest,
-            expectedManifestHash: object.manifestHash,
-            ciphertext: bytesOf(object.ciphertext, object.manifest.ciphertextSize),
-            epochPrivateKey,
-            binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: object.contextId, namespaceId, readEpoch },
-          })
-        } catch (error) {
-          this.#dropEpochKey(ownerAddress, namespaceId, readEpoch, epochPrivateKey)
-          throw error
-        }
+        const payload = openContextObject({
+          manifest: object.manifest,
+          expectedManifestHash: object.manifestHash,
+          ciphertext: bytesOf(object.ciphertext, object.manifest.ciphertextSize),
+          epochPrivateKey,
+          binding: { chainId: deployment.chainId, contextRegistry: deployment.contextRegistry, contextId: object.contextId, namespaceId, readEpoch },
+        })
         matched[index] = match(payload.value)
       }
     }
@@ -782,10 +767,9 @@ export class MidaAgent {
             const item = items[index]!
             const message = item.save.message
             if (message.owner.toLowerCase() !== ownerAddress || message.namespaceId.toLowerCase() !== namespaceId) continue
-            const readEpoch = decodeUint64(message.readEpoch)
-            let epochPrivateKey: Uint8Array | undefined
             try {
-              epochPrivateKey = await epochKeyFor(readEpoch)
+              const readEpoch = decodeUint64(message.readEpoch)
+              const epochPrivateKey = await epochKeyFor(readEpoch)
               const payload = openContextObject({
                 manifest: item.save.manifest,
                 expectedManifestHash: message.manifestHash.toLowerCase() as Hex,
@@ -795,7 +779,6 @@ export class MidaAgent {
               })
               batchedMatch[index] = match(payload.value)
             } catch {
-              if (epochPrivateKey !== undefined) this.#dropEpochKey(ownerAddress, namespaceId, readEpoch, epochPrivateKey)
               // unopenable — skipped
             }
           }
@@ -1152,16 +1135,6 @@ export class MidaAgent {
   /** The shared-cache key for one epoch key — agent, owner, namespace and epoch. */
   #epochCacheKey(ownerAddress: Address, namespaceId: Hex, readEpoch: bigint): string {
     return `${this.agentId}:${ownerAddress.toLowerCase()}:${namespaceId.toLowerCase()}:${readEpoch}`
-  }
-
-  /**
-   * Drops the shared-cache entry for one epoch when the stored key failed to open an object —
-   * the next read fetches the key again instead of failing for the process's whole life.
-   * Compare-then-delete: an entry a parallel read already replaced is left alone.
-   */
-  #dropEpochKey(ownerAddress: Address, namespaceId: Hex, readEpoch: bigint, key: Uint8Array): void {
-    const cacheKey = this.#epochCacheKey(ownerAddress, namespaceId, readEpoch)
-    if (this.#epochKeys.get(cacheKey) === key) this.#epochKeys.delete(cacheKey)
   }
 
   /**
