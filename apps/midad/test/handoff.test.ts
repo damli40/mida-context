@@ -689,6 +689,49 @@ describe("buildHandoff", () => {
     expect(result.text.startsWith(PARTIAL_LINE)).toBe(true)
   })
 
+  // UF-N: whether decision/rejected-approach reasons are left out is decided against the FINAL
+  // text the model receives — marked blocks and all — not against the reduced budget the merge
+  // was rendered to.
+  it("reasons stay when the handoff is over 8,000 with or without them (UF-N)", async () => {
+    // 36 merged decisions with reasons, plus a pending block holding 28 new decisions — big
+    // enough that the merge renders at its 4,500 floor and the final text is over 8,000 either
+    // way. Leaving the reasons out would say "to fit" in a text that does not fit.
+    const merged = stored({
+      decisions: Array.from({ length: 36 }, (_, i) => ({ decision: `merged decision ${i} ${"d".repeat(60)}`, rationale: `because ${"r".repeat(60)}` })),
+    })
+    const pending = { ...stored({
+      decisions: Array.from({ length: 28 }, (_, i) => ({ decision: `pending decision ${i} ${"p".repeat(60)}`, rationale: `why ${"w".repeat(60)}` })),
+      nextAction: "finish the pending work",
+    }, { contextId: `0x${"9".repeat(64)}` }), anchor: "PENDING_ANCHOR" as const }
+    const { d } = deps({ read: async () => ({ checkpoints: [merged, pending], skipped: 0, milliseconds: 1, partial: false }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text.length).toBeGreaterThan(8_000)
+    expect(result.oversized).toBe(true)
+    expect(result.reasonsLeftOut).toBe(false)
+    expect(result.text).toContain("\nDecisions:\n")
+    expect(result.text).not.toContain("(reasons left out to fit)")
+    expect(result.text.match(/ — because: /g) ?? []).toHaveLength(64)
+  })
+
+  it("reasons go exactly when leaving them out makes the delivered handoff fit (UF-N)", async () => {
+    // 17 decisions and a pending block large enough to hold the merge at its floor: the final
+    // text is over 8,000 with reasons and at most 8,000 without — so they go.
+    const merged = stored({
+      decisions: Array.from({ length: 17 }, (_, i) => ({ decision: `merged decision ${i} ${"d".repeat(130)}`, rationale: `r`.repeat(35) })),
+    })
+    const pending = { ...stored({ nextAction: "x".repeat(3_500) }, { contextId: `0x${"9".repeat(64)}` }), anchor: "PENDING_ANCHOR" as const }
+    const { d } = deps({ read: async () => ({ checkpoints: [merged, pending], skipped: 0, milliseconds: 1, partial: false }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result.kind).toBe("handoff")
+    if (result.kind !== "handoff") return
+    expect(result.text).toContain("Decisions (reasons left out to fit):")
+    expect(result.reasonsLeftOut).toBe(true)
+    expect(result.oversized).toBe(false)
+    expect(result.text.length).toBeLessThanOrEqual(8_000)
+  })
+
   it("a partial read with no usable checkpoints says the list may be incomplete — never 'nothing saved'", async () => {
     const { d } = deps({ read: async () => ({ checkpoints: [], skipped: 0, milliseconds: 1, partial: true }) })
     const result = await buildHandoff(runtime, input, d)

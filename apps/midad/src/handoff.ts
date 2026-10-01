@@ -820,45 +820,62 @@ export async function buildHandoff(
     for (const stored of outcome.checkpoints) {
       if (stored.migration !== undefined) movedOn.set(stored.contextId, stored.migration)
     }
-    const rendered = renderHandoffReport(
-      {
-        ...merged,
-        provenance: merged.provenance.map((row) => {
-          const migration = movedOn.get(row.contextId)
-          return migration === undefined ? row : { ...row, createdAt: `${row.createdAt} ${movedOnSuffix(migration)}` }
-        }),
-      },
-      {
-        authorNames: input.authorNames,
-        facts,
-        factsFailed,
-        adapterNote,
-        pendingSavesNote,
-        otherTasks,
-        now,
-        // CAP-26 review: the marked blocks sit outside this fit, so the merge gets what they leave of
-        // the 8,000-char handoff (Claude Code moves injected context over 10,000 chars to a file; the
-        // MCP tool's reply cap is 40,000) — dropping its oldest progress first, never the blocks' markers.
-        // UF-H: a partial read's PARTIAL_LINE + blank line join the text after this fit, so their
-        // length comes out of the same budget — the two reductions add when both apply.
-        ...(() => {
-          const overhead =
-            (markedText === "" ? 0 : markedText.length + 2) + (outcome.partial ? PARTIAL_LINE.length + 2 : 0)
-          return overhead === 0 ? {} : { maxChars: Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - overhead) }
-        })(),
-      },
-    )
-    const text = (() => {
-      if (markedText === "") return rendered.text
-      // inside the fence, before the END line — the marked pending blocks sit beside the merged
-      // sections, each under its own "not yet anchored" marker; the header's save time is the
-      // anchored merge's newest effective instant, which is exactly what it claims to be
-      // sliced, never String.replace: a '$&' in saved text would paste the matched END line and
-      // break the fence (CAP-26 review)
-      const at = rendered.text.lastIndexOf(`\n\n${HANDOFF_TAIL}`)
-      return at >= 0 ? `${rendered.text.slice(0, at)}\n\n${markedText}${rendered.text.slice(at)}` : `${rendered.text}\n\n${markedText}`
-    })()
-    const finalText = outcome.partial ? `${PARTIAL_LINE}\n\n${text}` : text
+    const assemble = (reasons: "keep" | "drop") => {
+      const rendered = renderHandoffReport(
+        {
+          ...merged,
+          provenance: merged.provenance.map((row) => {
+            const migration = movedOn.get(row.contextId)
+            return migration === undefined ? row : { ...row, createdAt: `${row.createdAt} ${movedOnSuffix(migration)}` }
+          }),
+        },
+        {
+          authorNames: input.authorNames,
+          facts,
+          factsFailed,
+          adapterNote,
+          pendingSavesNote,
+          otherTasks,
+          now,
+          reasons,
+          // CAP-26 review: the marked blocks sit outside this fit, so the merge gets what they leave of
+          // the 8,000-char handoff (Claude Code moves injected context over 10,000 chars to a file; the
+          // MCP tool's reply cap is 40,000) — dropping its oldest progress first, never the blocks' markers.
+          // UF-H: a partial read's PARTIAL_LINE + blank line join the text after this fit, so their
+          // length comes out of the same budget — the two reductions add when both apply.
+          ...(() => {
+            const overhead =
+              (markedText === "" ? 0 : markedText.length + 2) + (outcome.partial ? PARTIAL_LINE.length + 2 : 0)
+            return overhead === 0 ? {} : { maxChars: Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - overhead) }
+          })(),
+        },
+      )
+      const text = (() => {
+        if (markedText === "") return rendered.text
+        // inside the fence, before the END line — the marked pending blocks sit beside the merged
+        // sections, each under its own "not yet anchored" marker; the header's save time is the
+        // anchored merge's newest effective instant, which is exactly what it claims to be
+        // sliced, never String.replace: a '$&' in saved text would paste the matched END line and
+        // break the fence (CAP-26 review)
+        const at = rendered.text.lastIndexOf(`\n\n${HANDOFF_TAIL}`)
+        return at >= 0 ? `${rendered.text.slice(0, at)}\n\n${markedText}${rendered.text.slice(at)}` : `${rendered.text}\n\n${markedText}`
+      })()
+      return { rendered, finalText: outcome.partial ? `${PARTIAL_LINE}\n\n${text}` : text }
+    }
+    // UF-N: whether reasons are left out is decided against the FINAL text the model receives —
+    // marked blocks and the partial line included — not against the merge's reduced budget.
+    // Render the text with every reason; when it does not fit, render it without reasons and
+    // take that ONLY when the delivered text fits. Otherwise keep every reason — dropping them
+    // would say "to fit" in a text that does not fit.
+    const withReasons = assemble("keep")
+    const chosen =
+      withReasons.finalText.length <= HANDOFF_MAX_CHARS
+        ? withReasons
+        : (() => {
+            const withoutReasons = assemble("drop")
+            return withoutReasons.finalText.length <= HANDOFF_MAX_CHARS ? withoutReasons : withReasons
+          })()
+    const { rendered, finalText } = chosen
     return {
       kind: "handoff",
       text: finalText,

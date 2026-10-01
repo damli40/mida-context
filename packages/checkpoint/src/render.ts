@@ -173,6 +173,8 @@ export function renderHandoff(
     adapterNote?: string
     /** The daemon's count of its own undelivered saves — printed verbatim, same position. */
     pendingSavesNote?: string
+    /** See `renderHandoffReport`'s `reasons` — "auto" by default. */
+    reasons?: "auto" | "keep" | "drop"
     /**
      * Named tasks sharing this project (tk-1): one mention line each — name, who last saved, how
      * long ago — and nothing else. A mention is awareness, not context: no foreign task's text
@@ -217,6 +219,13 @@ export function renderHandoffReport(
     adapterNote?: string
     /** The daemon's count of its own undelivered saves — printed verbatim, same position. */
     pendingSavesNote?: string
+    /**
+     * How the reasons behind decisions and rejected approaches are treated (UF-N): "auto" is the
+     * standing rule — drop them only when that makes the render fit `maxChars`; "keep" never
+     * drops them; "drop" drops them whenever at least one decision or rejected approach exists.
+     * In all three the history trim and the oversize note work the same.
+     */
+    reasons?: "auto" | "keep" | "drop"
     /**
      * Named tasks sharing this project (tk-1): one mention line each — name, who last saved, how
      * long ago — and nothing else. A mention is awareness, not context: no foreign task's text
@@ -404,14 +413,18 @@ export function renderHandoffReport(
     return `${OVERSIZE_NOTE_LEAD} No constraint, decision or rejected approach was left out to shorten it.${leftOut.length > 0 ? ` Left out: ${leftOut.join(", ")}.` : " Nothing was left out."}`
   }
 
-  let { trim, text: out } = fitOnce(false)
+  const reasonsOption = options.reasons ?? "auto"
+  const hasReasons = merged.decisions.length > 0 || merged.rejected.length > 0
+  const forcedDrop = reasonsOption === "drop" && hasReasons
+  let { trim, text: out } = fitOnce(forcedDrop)
   // Still over with history trimmed: try the reasons-off render, but take it ONLY when it
   // actually fits (UF-L) — the old code took a merely shorter text, which once left 50 reasons
   // out of a 22,055-char handoff aimed at 8,000. A handoff that stays over keeps every reason,
   // the plain headings and reasonsLeftOut: false, and carries the oversize note. With no
-  // reasons to drop the text cannot change, so the step is skipped.
-  let reasonsLeftOut = false
-  if (out.length > maxChars && (merged.decisions.length > 0 || merged.rejected.length > 0)) {
+  // reasons to drop the text cannot change, so the step is skipped. "keep" and "drop" callers
+  // decide for themselves against the text they assemble (UF-N) — this retry is auto's alone.
+  let reasonsLeftOut = forcedDrop
+  if (reasonsOption === "auto" && out.length > maxChars && hasReasons) {
     const tried = fitOnce(true)
     if (tried.text.length <= maxChars) {
       trim = tried.trim
