@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { binaryOnPath, claudeSupportsSafeMode, probeModel } from "@mida/compiler"
+import { binaryOnPath, probeModel } from "@mida/compiler"
 import { realpathSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -2737,7 +2737,6 @@ async function main(): Promise<void> {
       prompt: terminalPrompt,
       secretPrompt: terminalSecretPrompt,
       onPath: (bin) => binaryOnPath(bin, process.env.PATH),
-      claudeSafeMode: () => claudeSupportsSafeMode(),
       health: async () => {
         const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
         return reply.status === 0 ? undefined : reply.body

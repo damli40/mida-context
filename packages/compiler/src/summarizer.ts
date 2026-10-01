@@ -4,9 +4,10 @@
 // and nothing else. An agent CLI runs as an agentCli command: a fresh empty
 // folder, MIDA_INNER set, and a usage limit named for what it is.
 
-import { spawnSync } from "node:child_process"
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
 import { accessSync, statSync, constants } from "node:fs"
-import { delimiter, join } from "node:path"
+import { delimiter, isAbsolute, join } from "node:path"
 import type { ModelCommand } from "./compile.js"
 import { COMPILE_PROVIDERS, compileModelChoice, providerHost, providerModelCommand } from "./model-choice.js"
 
@@ -50,61 +51,111 @@ export function codexSummaryCommand(env: NodeJS.ProcessEnv): ModelCommand {
   }
 }
 
+const execFileAsync = promisify(execFile)
+
 /**
- * True when some folder on PATH holds a regular, executable file called `name`.
- * It never spawns the binary — install checks must not run what they probe.
+ * The absolute path of the first regular, executable file called `name` in an
+ * ABSOLUTE folder of `pathValue`; non-absolute PATH entries — the empty entry
+ * included — are skipped: a relative folder would resolve against whatever cwd
+ * the long-lived service happens to have. It never spawns the binary — install
+ * checks must not run what they probe.
  */
-export function binaryOnPath(name: string, pathValue: string | undefined): boolean {
-  if (pathValue === undefined || pathValue === "") return false
+export function resolveBinary(name: string, pathValue: string | undefined): string | undefined {
+  if (pathValue === undefined || pathValue === "") return undefined
   for (const dir of pathValue.split(delimiter)) {
-    if (dir === "") continue
+    if (!isAbsolute(dir)) continue
     const file = join(dir, name)
     try {
       if (!statSync(file).isFile()) continue
       accessSync(file, constants.X_OK)
-      return true
+      return file
     } catch {
       // absent, a folder of that name, or not executable by this user
     }
   }
-  return false
+  return undefined
+}
+
+/** True when some folder on PATH holds a regular, executable file called `name`. */
+export function binaryOnPath(name: string, pathValue: string | undefined): boolean {
+  return resolveBinary(name, pathValue) !== undefined
 }
 
 const SAFE_MODE_CACHE_MS = 10 * 60 * 1000
-let safeModeCache: { answer: boolean; at: number } | undefined
+interface SafeModeEntry {
+  at: number
+  promise: Promise<boolean>
+  answer?: boolean
+}
+let safeModeCache = new Map<string, SafeModeEntry>()
 
-/**
- * Whether the installed `claude` accepts --safe-mode --tools "". Probed once by
- * `claude --help`, remembered for ten minutes per process — every save asks.
- */
-export function claudeSupportsSafeMode(run?: () => { status: number | null; stdout: string }): boolean {
-  if (safeModeCache !== undefined && Date.now() - safeModeCache.at < SAFE_MODE_CACHE_MS) {
-    return safeModeCache.answer
-  }
-  const probe =
-    run ??
-    (() => {
-      const env: NodeJS.ProcessEnv = { ...process.env, MIDA_INNER: "1" }
-      for (const key of Object.keys(env)) {
-        if (key.startsWith("ANTHROPIC_")) delete env[key]
-      }
-      const r = spawnSync("claude", ["--help"], { encoding: "utf8", timeout: 3000, env })
-      return { status: r.status, stdout: r.stdout ?? "" }
-    })
-  let answer = false
+/** The mtime that keys a binary's remembered answer — 0 when the file cannot be stat'ed. */
+const binaryMtime = (binary: string): number => {
   try {
-    const out = probe()
-    answer = out.status === 0 && out.stdout.includes("--safe-mode") && out.stdout.includes("--tools")
+    return statSync(binary).mtimeMs
   } catch {
-    answer = false
+    return 0
   }
-  safeModeCache = { answer, at: Date.now() }
-  return answer
 }
 
-/** Tests only: forget the remembered safe-mode answer so a new probe runs. */
+/** The real `claude --help`: 3 s, SIGKILL on expiry, no ANTHROPIC_* names, MIDA_INNER set. */
+const defaultSafeModeRun = async (binary: string): Promise<{ status: number | null; stdout: string }> => {
+  const env: NodeJS.ProcessEnv = { ...process.env, MIDA_INNER: "1" }
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("ANTHROPIC_")) delete env[key]
+  }
+  try {
+    const { stdout } = await execFileAsync(binary, ["--help"], { timeout: 3000, killSignal: "SIGKILL", env, encoding: "utf8" })
+    return { status: 0, stdout: stdout ?? "" }
+  } catch (error) {
+    // a non-zero exit carries its code; a timeout, signal or spawn failure is status null
+    const e = error as { code?: unknown; stdout?: unknown }
+    return { status: typeof e.code === "number" ? e.code : null, stdout: typeof e.stdout === "string" ? e.stdout : "" }
+  }
+}
+
+/**
+ * Whether this `claude` binary accepts --safe-mode --tools "". Probed by
+ * `claude --help`, ASYNC — a slow help must never freeze the service it runs
+ * inside. The answer is remembered for ten minutes under the key
+ * `<binary>:<mtime>` — a binary that changed on disk is a different binary —
+ * and calls made while one probe is in flight share its promise.
+ */
+export function probeClaudeSafeMode(
+  binary: string,
+  run?: (binary: string) => Promise<{ status: number | null; stdout: string }>,
+): Promise<boolean> {
+  const key = `${binary}:${binaryMtime(binary)}`
+  const hit = safeModeCache.get(key)
+  if (hit !== undefined && Date.now() - hit.at < SAFE_MODE_CACHE_MS) return hit.promise
+  const entry: SafeModeEntry = {
+    at: Date.now(),
+    promise: (run ?? defaultSafeModeRun)(binary).then(
+      (out) => out.status === 0 && out.stdout.includes("--safe-mode") && out.stdout.includes("--tools"),
+      () => false,
+    ),
+  }
+  entry.promise.then((answer) => {
+    entry.answer = answer
+  })
+  safeModeCache.set(key, entry)
+  return entry.promise
+}
+
+/**
+ * The remembered safe-mode answer for this binary, read synchronously — undefined
+ * when there is none or it expired. It never starts a process: the readers that
+ * only DISPLAY the choice (/health, `mida summarizer`, init's line) use this.
+ */
+export function claudeSafeModeKnown(binary: string): boolean | undefined {
+  const entry = safeModeCache.get(`${binary}:${binaryMtime(binary)}`)
+  if (entry === undefined || Date.now() - entry.at >= SAFE_MODE_CACHE_MS) return undefined
+  return entry.answer
+}
+
+/** Tests only: forget every remembered safe-mode answer so a new probe runs. */
 export function resetClaudeSafeModeCache(): void {
-  safeModeCache = undefined
+  safeModeCache = new Map()
 }
 
 /** What the owner saved as their summariser choice (summarizer.json in the Mida home). */

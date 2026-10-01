@@ -9,7 +9,7 @@
  */
 
 import { closeSync, openSync, readSync, statSync } from "node:fs"
-import { probeModel, resolveSummarizer } from "@mida/compiler"
+import { probeClaudeSafeMode, probeModel, resolveBinary, resolveSummarizer } from "@mida/compiler"
 import type { ModelCommand, SummarizerSaved } from "@mida/compiler"
 import type { MidaHome } from "./home.js"
 import { SUMMARIZER_FILE, currentSummarizer, readSummarizer, writeSummarizer } from "./summarizer.js"
@@ -30,6 +30,8 @@ export interface SummarizerCliDeps {
   secretPrompt?: (question: string) => Promise<string>
   onPath?: (bin: string) => boolean
   claudeSafeMode?: () => boolean
+  /** The async `claude --help` probe — only `test` runs it, and only when claude is on PATH. */
+  probeSafeMode?: (binary: string) => Promise<boolean>
   /** Asks the running service for its /health reply; undefined when it does not answer. */
   health?: () => Promise<unknown>
   probe?: (command: ModelCommand) => Promise<ProbeResult>
@@ -370,7 +372,16 @@ export async function runSummarizer(argv: string[], deps: SummarizerCliDeps): Pr
   }
 
   if (argv.length === 2 && argv[1] === "test") {
-    const choice = currentSummarizer(home, env, { onPath: deps.onPath, claudeSafeMode: deps.claudeSafeMode })
+    let choice = currentSummarizer(home, env, { onPath: deps.onPath, claudeSafeMode: deps.claudeSafeMode })
+    // `test` is about to RUN the entries, so it may afford the one async probe the
+    // display paths never start: a runnable claude entry's argv depends on it.
+    if (deps.claudeSafeMode === undefined && choice.chain.some((entry) => entry.id === "claude")) {
+      const binary = resolveBinary("claude", env.PATH)
+      if (binary !== undefined) {
+        const safe = await (deps.probeSafeMode ?? probeClaudeSafeMode)(binary)
+        choice = currentSummarizer(home, env, { onPath: deps.onPath, claudeSafeMode: () => safe })
+      }
+    }
     if (choice.entries.length === 0) {
       for (const line of EMPTY_CHAIN_LINES) print(line)
       return 1

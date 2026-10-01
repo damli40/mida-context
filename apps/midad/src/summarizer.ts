@@ -4,7 +4,7 @@
 // saves must change the next compile without a restart.
 
 import { lstatSync } from "node:fs"
-import { binaryOnPath, claudeSupportsSafeMode, resolveSummarizer } from "@mida/compiler"
+import { binaryOnPath, claudeSafeModeKnown, probeClaudeSafeMode, resolveBinary, resolveSummarizer } from "@mida/compiler"
 import type { CompileInput, CompileResult, SummarizerChoice, SummarizerSaved } from "@mida/compiler"
 import type { compileCheckpoint } from "@mida/compiler"
 import type { MidaHome } from "./home.js"
@@ -66,9 +66,10 @@ export function writeSummarizer(home: MidaHome, value: SummarizerSaved): void {
 }
 
 /**
- * The summariser choice for THIS save. `onPath` defaults to a real PATH lookup and
- * `claudeSafeMode` defaults to the cached `--help` probe — called only when `claude` is
- * actually on PATH, so a Codex-only install never spawns a probe for a binary it lacks.
+ * The summariser choice for THIS save. Synchronous and NEVER starts a process:
+ * `claudeSafeMode` defaults to the remembered probe answer (`claudeSafeModeKnown`)
+ * — absent or expired means false. Callers that are about to RUN the chain probe
+ * first themselves; the display callers (/health, `mida summarizer`, init) never do.
  */
 export function currentSummarizer(
   home: MidaHome,
@@ -82,7 +83,9 @@ export function currentSummarizer(
   const onPath = deps?.onPath ?? ((bin: string) => binaryOnPath(bin, env.PATH))
   let claudeSafeMode = false
   if (saved?.use !== "key" && onPath("claude")) {
-    claudeSafeMode = deps?.claudeSafeMode?.() ?? claudeSupportsSafeMode()
+    const binary = resolveBinary("claude", env.PATH)
+    claudeSafeMode =
+      deps?.claudeSafeMode?.() ?? (binary !== undefined ? (claudeSafeModeKnown(binary) ?? false) : false)
   }
   return { ...resolveSummarizer({ saved, env, onPath, claudeSafeMode }), invalid: false }
 }
@@ -114,10 +117,31 @@ export function compileWithSummarizer(
   home: MidaHome,
   env: NodeJS.ProcessEnv,
   compile: typeof compileCheckpoint,
-  deps?: { onPath?: (bin: string) => boolean; claudeSafeMode?: () => boolean },
+  deps?: {
+    onPath?: (bin: string) => boolean
+    claudeSafeMode?: () => boolean
+    probeSafeMode?: (binary: string) => Promise<boolean>
+  },
 ): (input: CompileInput) => Promise<CompileResult> {
   return async (input) => {
-    const choice = currentSummarizer(home, env, deps)
+    // This caller is about to RUN the chain, so it may afford the one async probe:
+    // when `claude` really resolves on PATH and the saved choice is not a key, the
+    // answer is fetched (or shared) BEFORE the choice is compiled — the entry's
+    // argv depends on it. A saved key or a missing binary never spawns a probe.
+    let claudeSafeMode = deps?.claudeSafeMode?.()
+    if (claudeSafeMode === undefined) {
+      const saved = readSummarizer(home)
+      if (saved !== "invalid" && saved?.use !== "key") {
+        const binary = resolveBinary("claude", env.PATH)
+        if (binary !== undefined) {
+          claudeSafeMode = await (deps?.probeSafeMode ?? probeClaudeSafeMode)(binary)
+        }
+      }
+    }
+    const choice = currentSummarizer(home, env, {
+      onPath: deps?.onPath,
+      claudeSafeMode: claudeSafeMode === undefined ? undefined : () => claudeSafeMode,
+    })
     const [first, ...rest] = choice.chain
     if (first === undefined) {
       return { ok: false, reason: "no-summarizer", detail: "no summary model is available", attempts: 0, retried: 0 }

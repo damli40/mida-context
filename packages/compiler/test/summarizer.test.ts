@@ -3,16 +3,18 @@
 // probe, and resolveSummarizer's order of decision — saved key, saved agents,
 // environment, agents-unchosen.
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import {
   binaryOnPath,
+  claudeSafeModeKnown,
   claudeSummaryCommand,
-  claudeSupportsSafeMode,
   codexSummaryCommand,
+  probeClaudeSafeMode,
   resetClaudeSafeModeCache,
+  resolveBinary,
   resolveSummarizer,
 } from "../src/index.js"
 
@@ -92,33 +94,142 @@ describe("binaryOnPath", () => {
   })
 })
 
-describe("claudeSupportsSafeMode", () => {
-  beforeEach(() => resetClaudeSafeModeCache())
+describe("resolveBinary", () => {
+  let dir: string
+  let other: string
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "mida-rb1-"))
+    other = fs.mkdtempSync(path.join(os.tmpdir(), "mida-rb2-"))
+  })
+  const executable = (folder: string, name = "mida-tool"): string => {
+    const bin = path.join(folder, name)
+    fs.writeFileSync(bin, "#!/bin/sh\n")
+    fs.chmodSync(bin, 0o755)
+    return bin
+  }
+
+  it("returns the absolute path of the first executable on PATH — here the second folder", () => {
+    const bin = executable(other)
+    expect(resolveBinary("mida-tool", [dir, other].join(path.delimiter))).toBe(bin)
+  })
+
+  it("skips a relative PATH entry even when it holds the file", () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "mida-rb-rel-"))
+    fs.mkdirSync(path.join(parent, "rel"))
+    executable(path.join(parent, "rel"))
+    const joined = ["rel", dir].join(path.delimiter)
+    // cwd-independent: the relative entry must never count
+    expect(resolveBinary("mida-tool", joined)).toBeUndefined()
+    // sanity: with the folder absolute it is found
+    expect(resolveBinary("mida-tool", path.join(parent, "rel"))).toBe(path.join(parent, "rel", "mida-tool"))
+  })
+
+  it("skips the empty PATH entry", () => {
+    executable(dir)
+    expect(resolveBinary("mida-tool", ["", dir].join(path.delimiter))).toBe(path.join(dir, "mida-tool"))
+  })
+
+  it("follows a symlink to an executable", () => {
+    const real = executable(other)
+    fs.symlinkSync(real, path.join(dir, "mida-link"))
+    expect(resolveBinary("mida-link", dir)).toBe(path.join(dir, "mida-link"))
+  })
+
+  it("a folder of that name is not a binary", () => {
+    fs.mkdirSync(path.join(dir, "mida-tool"))
+    expect(resolveBinary("mida-tool", dir)).toBeUndefined()
+  })
+})
+
+describe("probeClaudeSafeMode", () => {
+  let dir: string
+  let binary: string
+  beforeEach(() => {
+    resetClaudeSafeModeCache()
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "mida-probe-"))
+    binary = path.join(dir, "claude")
+    fs.writeFileSync(binary, "#!/bin/sh\n")
+    fs.chmodSync(binary, 0o755)
+  })
+  afterEach(() => {
+    resetClaudeSafeModeCache()
+    vi.useRealTimers()
+  })
+  const yes = async () => ({ status: 0, stdout: "--safe-mode  --tools" })
+
+  it("true when --help lists --safe-mode and --tools", async () => {
+    expect(await probeClaudeSafeMode(binary, yes)).toBe(true)
+  })
+
+  it("false on a non-zero status, and false when only one of the two words is present", async () => {
+    expect(await probeClaudeSafeMode(binary, async () => ({ status: 1, stdout: "--safe-mode --tools" }))).toBe(false)
+    resetClaudeSafeModeCache()
+    expect(await probeClaudeSafeMode(binary, async () => ({ status: 0, stdout: "--safe-mode only" }))).toBe(false)
+  })
+
+  it("the answer is remembered per binary — one run for two calls, known synchronously after", async () => {
+    let calls = 0
+    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools" })
+    expect(await probeClaudeSafeMode(binary, run)).toBe(true)
+    expect(await probeClaudeSafeMode(binary, run)).toBe(true)
+    expect(calls).toBe(1)
+    expect(claudeSafeModeKnown(binary)).toBe(true)
+  })
+
+  it("expires after ten minutes — a new probe runs", async () => {
+    vi.useFakeTimers()
+    let calls = 0
+    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools" })
+    expect(await probeClaudeSafeMode(binary, run)).toBe(true)
+    vi.setSystemTime(Date.now() + 10 * 60 * 1000 + 1)
+    expect(claudeSafeModeKnown(binary)).toBeUndefined()
+    expect(await probeClaudeSafeMode(binary, run)).toBe(true)
+    expect(calls).toBe(2)
+  })
+
+  it("a different mtime is a different binary — it probes again", async () => {
+    let calls = 0
+    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools" })
+    expect(await probeClaudeSafeMode(binary, run)).toBe(true)
+    const day = 24 * 60 * 60 * 1000
+    fs.utimesSync(binary, new Date(), new Date(Date.now() + day))
+    expect(await probeClaudeSafeMode(binary, run)).toBe(true)
+    expect(calls).toBe(2)
+  })
+
+  it("two calls while one is in flight share the same run", async () => {
+    let calls = 0
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    const run = async () => (calls++, await gate, { status: 0, stdout: "--safe-mode --tools" })
+    const a = probeClaudeSafeMode(binary, run)
+    const b = probeClaudeSafeMode(binary, run)
+    release()
+    expect(await a).toBe(true)
+    expect(await b).toBe(true)
+    expect(calls).toBe(1)
+  })
+})
+
+describe("claudeSafeModeKnown", () => {
+  let binary: string
+  beforeEach(() => {
+    resetClaudeSafeModeCache()
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mida-known-"))
+    binary = path.join(dir, "claude")
+    fs.writeFileSync(binary, "#!/bin/sh\n")
+    fs.chmodSync(binary, 0o755)
+  })
   afterEach(() => resetClaudeSafeModeCache())
 
-  it("true when --help lists --safe-mode and --tools", () => {
-    const answer = claudeSupportsSafeMode(() => ({ status: 0, stdout: "--safe-mode  --tools" }))
-    expect(answer).toBe(true)
-  })
-
-  it("false on a non-zero status, and false when --tools is missing", () => {
-    expect(claudeSupportsSafeMode(() => ({ status: 1, stdout: "--safe-mode --tools" }))).toBe(false)
-    resetClaudeSafeModeCache()
-    expect(claudeSupportsSafeMode(() => ({ status: 0, stdout: "--safe-mode only" }))).toBe(false)
-  })
-
-  it("the answer is remembered — no second probe until the cache is reset", () => {
+  it("is undefined before any probe, and never runs anything itself", async () => {
     let calls = 0
-    const probe = () => {
-      calls += 1
-      return { status: 0, stdout: "--safe-mode --tools" }
-    }
-    expect(claudeSupportsSafeMode(probe)).toBe(true)
-    expect(claudeSupportsSafeMode(probe)).toBe(true)
+    const run = async () => (calls++, { status: 0, stdout: "--safe-mode --tools" })
+    expect(claudeSafeModeKnown(binary)).toBeUndefined()
+    await probeClaudeSafeMode(binary, run)
+    expect(claudeSafeModeKnown(binary)).toBe(true)
+    expect(claudeSafeModeKnown(binary)).toBe(true)
     expect(calls).toBe(1)
-    resetClaudeSafeModeCache()
-    expect(claudeSupportsSafeMode(probe)).toBe(true)
-    expect(calls).toBe(2)
   })
 })
 
