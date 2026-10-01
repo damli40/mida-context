@@ -15,10 +15,15 @@ import { isSafeName } from "./queue.js"
  */
 const markPath = (sessionId: string) => `queue/unsent/${sessionId}.json`
 
-export function markUnsent(home: MidaHome, sessionId: string, eventId: string): void {
+/**
+ * `coveredAt` is the moment the drain read the transcript this compile came from — what it covers.
+ * A queued change after it is newer work the compile cannot contain (the compile's own `createdAt`
+ * is later, when the model finished, so it would hide changes made while the compile ran).
+ */
+export function markUnsent(home: MidaHome, sessionId: string, eventId: string, coveredAt?: string): void {
   if (!isSafeName(sessionId) || !isSafeName(eventId)) return
   try {
-    home.writeSecretJson(markPath(sessionId), { eventId })
+    home.writeSecretJson(markPath(sessionId), { eventId, ...(coveredAt === undefined ? {} : { coveredAt }) })
   } catch {
     // a failed mark only means the next agent waits for the chain, as it did before CAP-26
   }
@@ -38,16 +43,17 @@ export function clearUnsent(home: MidaHome, sessionId: string): void {
  * mark must name a safe event id, the envelope must parse as a checkpoint envelope, and it must
  * belong to the session that marked it.
  */
-export function readUnsent(home: MidaHome, sessionId: string): CheckpointEnvelope | undefined {
+export function readUnsent(home: MidaHome, sessionId: string): { envelope: CheckpointEnvelope; coveredAt?: number } | undefined {
   if (!isSafeName(sessionId)) return undefined
   try {
-    const mark = home.readJson<{ eventId?: unknown }>(markPath(sessionId))
+    const mark = home.readJson<{ eventId?: unknown; coveredAt?: unknown }>(markPath(sessionId))
     if (mark === undefined || !isSafeName(mark.eventId)) return undefined
     const raw = home.readJson<Record<string, unknown>>(`queue/compiled/${mark.eventId}.json`)
     if (raw === undefined) return undefined
     const envelope = unwrapCheckpoint(raw)
     if (envelope === null || envelope.sessionId !== sessionId) return undefined
-    return envelope
+    const coveredAt = typeof mark.coveredAt === "string" ? Date.parse(mark.coveredAt) : Number.NaN
+    return { envelope, ...(Number.isNaN(coveredAt) ? {} : { coveredAt }) }
   } catch {
     return undefined
   }

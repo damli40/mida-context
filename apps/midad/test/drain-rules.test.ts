@@ -403,8 +403,10 @@ describe("a failed save does not buy a new model call", () => {
     flags.saveFailures = 1
     await drain({ now: () => new Date(T0 + 120_000) })
     const unsent = readUnsent(home, "s1")
-    expect(unsent?.sessionId).toBe("s1")
-    expect(unsent?.projectId).toBe("p-1")
+    expect(unsent?.envelope.sessionId).toBe("s1")
+    expect(unsent?.envelope.projectId).toBe("p-1")
+    // the mark records what the compile covered: the moment this pass read the transcript
+    expect(unsent?.coveredAt).toBe(T0 + 120_000)
     // past the backoff the retry lands — the mark goes, so the saved version is never shown twice
     await drain({ now: () => new Date(T0 + 120_000 + 121_000) })
     expect(readUnsent(home, "s1")).toBeUndefined()

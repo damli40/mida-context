@@ -355,6 +355,8 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         // size and last line come from ONE open descriptor — a growing transcript cannot show
         // the drainer a size and a tail from different moments. A devin session has no file:
         // its fingerprint is (main_chain_id, max node_id, node count) from one database read.
+        // CAP-26: what a compile from this read covers — the next agent's "newer work" check
+        const coveredAt = now().toISOString()
         const { bytes: transcriptBytes, lastLine } =
           job.agent === "devin"
             ? devinFingerprintOf(job.transcriptPath, sessionId, deps.openDevinDb)
@@ -481,7 +483,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         }
         // CAP-26: from here until it lands (or fails for good) this compiled save is the session's
         // newest state — the next agent's handoff may show it, marked UNSENT, for a fast switch
-        markUnsent(deps.home, sessionId, eventId)
+        markUnsent(deps.home, sessionId, eventId, coveredAt)
         const runtime = await openRuntime()
         const saved = await save(runtime, job.agent, {
           projectId: envelope.projectId,
