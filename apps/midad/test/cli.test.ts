@@ -5,8 +5,9 @@ import { randomBytes } from "node:crypto"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { BaseError, HttpRequestError } from "viem"
+import { BaseError, HttpRequestError, getAbiItem, toFunctionSelector } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
+import { capabilityRegistryAbi } from "@mida/chain"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, runDoctor, FileAccessRequestStore, saveAgentIdentity, CLI_COMMANDS, OWNER_COMMANDS, TERMINAL_COMMANDS } from "@mida/midad"
@@ -400,16 +401,17 @@ describe("the crude mida command", () => {
     expect(res.stdout).not.toContain("is an owner command")
   }, 120_000)
 
-  it("an expired pending request refuses BEFORE the history scan — no 'about N requests' line (in-15 J-2)", async () => {
+  it("an expired pending request refuses BEFORE the history check — zero agentEpoch reads (in-15 J-2)", async () => {
     // Sep 27 live: `approve --all` printed "checking devin's history on the chain (about 928
-    // requests)…" before answering REQUEST_EXPIRED. The window needs only the chain's clock.
+    // requests)…" before answering REQUEST_EXPIRED. The window needs only the chain's clock —
+    // one getBlock — so the ownerHistory reads must never run. The scan-line is gone, so this
+    // is anchored the way fake-vault.test.ts does it: the agentEpoch contract read is counted
+    // on the wire (inside a multicall aggregate its selector still shows in the calldata).
     const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-expired-")))
     const out: string[] = []
-    const progress: string[] = []
     const run3 = (...argv: string[]) =>
       runCli(argv, {
         home: fresh, network, cwd: projectDir, print: (line) => out.push(line),
-        progress: (line) => progress.push(line),
         prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
       })
     expect(await run3("init")).toBe(0)
@@ -429,10 +431,20 @@ describe("the crude mida command", () => {
     const request = { ...stale, agentSignature: await privateKeyToAccount(identity.signerPrivateKey).signTypedData(accessRequestTypedData(stale)) }
     await new FileAccessRequestStore(fresh, "codex").save(request)
     fresh.writeSecretJson("agents/codex/pending-request.json", { request })
-    progress.length = 0
-    expect(await run3("approve", "codex")).toBe(1)
+    const agentEpochSelector = toFunctionSelector(getAbiItem({ abi: capabilityRegistryAbi, name: "agentEpoch" }))
+    let epochReads = 0
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: unknown, init?: { body?: unknown }) => {
+      if (String(init?.body ?? "").includes(agentEpochSelector)) epochReads += 1
+      return realFetch(input as never, init as never)
+    }) as typeof fetch
+    try {
+      expect(await run3("approve", "codex")).toBe(1)
+    } finally {
+      globalThis.fetch = realFetch
+    }
     expect(out).toContain("codex's request has expired (a request lasts 5 minutes): run `mida request codex` and approve again")
-    expect(progress.some((line) => line.includes("history on the chain"))).toBe(false)
+    expect(epochReads).toBe(0)
   }, 300_000)
 
   it("an approve for an agent that already holds a grant prints neither history-scan line (CHAIN-03)", async () => {
@@ -443,9 +455,10 @@ describe("the crude mida command", () => {
     // a grant.
     const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-noscan-")))
     const progress: string[] = []
+    const out: string[] = []
     const run4 = (...argv: string[]) =>
       runCli(argv, {
-        home: fresh, network, cwd: projectDir, print: () => {},
+        home: fresh, network, cwd: projectDir, print: (line) => out.push(line),
         progress: (line) => progress.push(line),
         prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
       })
@@ -473,9 +486,13 @@ describe("the crude mida command", () => {
     await new FileAccessRequestStore(fresh, "codex").save(request)
     fresh.writeSecretJson("agents/codex/pending-request.json", { request })
     progress.length = 0
+    out.length = 0
     expect(await run4("approve", "--all")).toBe(0)
     expect(progress.some((line) => line.includes("history on the chain"))).toBe(false)
     expect(progress.some((line) => line.includes("revocations history"))).toBe(false)
+    // the absent lines alone proved nothing — the approve must also have run and answered: the
+    // batch verdict line is the success the owner sees
+    expect(out).toContain("approved: codex")
   }, 300_000)
 
   it("install <client> asks for a real terminal like approve, a non-client is usage, the daemon refuses it", async () => {
