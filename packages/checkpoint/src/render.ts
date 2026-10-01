@@ -69,6 +69,8 @@ const OWN_HEADINGS = [
   "What you have told Mida about yourself",
   "Mida note:",
   "PENDING_ANCHOR:",
+  // CAP-26: the marker on a save compiled on this machine but not yet on Monad
+  "UNSENT:",
 ]
 
 /** Exported so other context surfaces (the whats-new note) defuse checkpoint text the same way. */

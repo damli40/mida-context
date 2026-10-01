@@ -27,6 +27,7 @@ import { checkProject as checkProjectAgainstList } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
 import { findProjectMarker, firstQueuedAt, isSafeName, listJobs, moveToBad, removeJob, stampFirstAt } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
+import { clearUnsent, markUnsent } from "./unsent.js"
 import { resolveSessionTask, taskOrUndefined } from "./task.js"
 import type { ServiceRuntime } from "./runtime.js"
 import { followPendingAnchors, pendingAnchors, sweepPendingPlaintexts } from "./batching.js"
@@ -477,6 +478,9 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           deps.home.writeSecretJson(`queue/compiled/${eventId}.json`, { ...envelope, compileMeta })
           reusedCompiled = false
         }
+        // CAP-26: from here until it lands (or fails for good) this compiled save is the session's
+        // newest state — the next agent's handoff may show it, marked UNSENT, for a fast switch
+        markUnsent(deps.home, sessionId, eventId)
         const runtime = await openRuntime()
         const saved = await save(runtime, job.agent, {
           projectId: envelope.projectId,
@@ -487,6 +491,8 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           ...(envelope.task === undefined ? {} : { task: envelope.task }),
         })
         writeState(deps.home, sessionId, terminal)
+        // landed (stored, or batched for anchoring — the pending ledger shows that one): never UNSENT again
+        clearUnsent(deps.home, sessionId)
         // the saved checkpoint's content fields — and its verbatim
         // originalRequest — are the next compile's `previous`: without the
         // request in the file, a post-/compact save can never keep the
@@ -603,6 +609,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             writeState(deps.home, sessionId, terminalStateFor(job, now().toISOString(), deps.openDevinDb))
           }
           log({ sessionId, outcome: "bad", reason: code, ...fields, ...sample })
+          clearUnsent(deps.home, sessionId) // it will never land: not "on its way" any more
           continue
         }
         // transient: keep the job, count the attempt, and hold the session until the backoff passes
@@ -613,6 +620,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           moveToBad(deps.home, `${job.id}.json`)
           writeState(deps.home, sessionId, terminalStateFor(job, now().toISOString(), deps.openDevinDb))
           log({ sessionId, outcome: "bad", reason: invalidGaveUp ? "invalid-checkpoint" : "gave-up", ...fields, ...sample })
+          clearUnsent(deps.home, sessionId)
           continue
         }
         writeState(deps.home, sessionId, {

@@ -11,7 +11,7 @@ import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { MidaHome, buildHandoff, buildRemember, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, resetOutOfGasWaits, resolveSessionTask, tailOf } from "@mida/midad"
+import { MidaHome, buildHandoff, buildRemember, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, readUnsent, resetOutOfGasWaits, resolveSessionTask, tailOf } from "@mida/midad"
 import type { DrainDeps, RememberDeps, Runtime, ServiceRuntime, saveCheckpoint } from "@mida/midad"
 import { CONTENT_FIELDS, mergeCheckpoints } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
@@ -379,6 +379,28 @@ describe("a failed save does not buy a new model call", () => {
     // 11 s after the first event: the 10 s first-save gap has passed, no Stop needed
     expect(saveCalls).toHaveLength(1)
     expect(listJobs(home)).toHaveLength(0)
+  })
+
+  it("a compiled save whose send failed stays marked UNSENT for the next agent; a later success clears it (CAP-26)", async () => {
+    const { home, job, drain, flags } = setup()
+    job({ event: "Stop" }, T0)
+    flags.saveFailures = 1
+    await drain({ now: () => new Date(T0 + 120_000) })
+    const unsent = readUnsent(home, "s1")
+    expect(unsent?.sessionId).toBe("s1")
+    expect(unsent?.projectId).toBe("p-1")
+    // past the backoff the retry lands — the mark goes, so the saved version is never shown twice
+    await drain({ now: () => new Date(T0 + 120_000 + 121_000) })
+    expect(readUnsent(home, "s1")).toBeUndefined()
+  })
+
+  it("a save that gives up for good is no longer marked UNSENT (CAP-26)", async () => {
+    const { home, job, drain, flags } = setup()
+    job({ event: "Stop" }, T0)
+    flags.saveFailures = 100
+    for (let i = 0; i < 8; i += 1) await drain({ now: () => new Date(T0 + 120_000 + i * 7_200_000) })
+    expect(home.list("queue/bad").length).toBeGreaterThan(0)
+    expect(readUnsent(home, "s1")).toBeUndefined()
   })
 
   it("eight failed attempts give up: the job goes to queue/bad with gave-up", async () => {

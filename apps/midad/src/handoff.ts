@@ -14,6 +14,8 @@ import type { ProjectCheck } from "./projects.js"
 import { isSafeName, peekJobs, projectIdFor } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
 import { DEFAULT_TASK, pinSessionTask, resolveSessionTask, taskOrUndefined } from "./task.js"
+import type { CheckpointEnvelope } from "./checkpoint-payload.js"
+import { readUnsent } from "./unsent.js"
 import { pendingAnchors, pendingPlaintext } from "./batching.js"
 import { readOwnerFacts } from "./remember.js"
 import type { MidaHome } from "./home.js"
@@ -130,7 +132,16 @@ const QUEUE_NOTE_SCAN_LIMIT = 200
  * reports what is queued — it never removes, re-orders, waits on or triggers a job, and a queue
  * that cannot be read degrades to no line at all, never a refused handoff.
  */
-function queuedSavesNote(home: MidaHome, projectId: string, nowMs: number): string | null {
+interface QueuedSaves {
+  /** agent → its counted sessions (distinct sessions, not jobs) */
+  perAgent: Map<string, Set<string>>
+  /** session → its newest queued change (ms) */
+  newestChange: Map<string, number>
+  lastTryFailed: boolean
+  stuck: number
+}
+
+function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null {
   let jobs: CaptureJob[]
   try {
     jobs = peekJobs(home, QUEUE_NOTE_SCAN_LIMIT)
@@ -178,6 +189,16 @@ function queuedSavesNote(home: MidaHome, projectId: string, nowMs: number): stri
     if (typeof value !== "object" || value === null || (value as { projectId?: unknown }).projectId !== projectId) continue
     stuck += 1
   }
+  return { perAgent, newestChange, lastTryFailed, stuck }
+}
+
+/**
+ * The note's text for what readQueuedSaves found. `shownUnsent` is how many of the counted sessions
+ * have their compiled-but-unsent save shown below, marked UNSENT (CAP-26).
+ */
+function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shownUnsent: number): string | null {
+  if (queued === null) return null
+  const { perAgent, newestChange, lastTryFailed, stuck } = queued
   if (perAgent.size === 0 && stuck === 0) return null
   const clauses: string[] = []
   if (perAgent.size > 0) {
@@ -193,7 +214,13 @@ function queuedSavesNote(home: MidaHome, projectId: string, nowMs: number): stri
         : `${parts.join(", ")} have not reached Monad yet (${
             age === "under a minute" ? "each changed within the last minute" : `one of them has not changed for ${age}`
           }); this record may be behind them`
-    clauses.push(`${clause}${lastTryFailed ? " (the last try failed; Mida keeps retrying)" : ""}`)
+    const shown =
+      shownUnsent === 0
+        ? ""
+        : total === 1
+          ? "; it is shown below, marked UNSENT"
+          : `; ${shownUnsent} of them ${shownUnsent === 1 ? "is" : "are"} shown below, marked UNSENT`
+    clauses.push(`${clause}${lastTryFailed ? " (the last try failed; Mida keeps retrying)" : ""}${shown}`)
   }
   if (stuck > 0) clauses.push(`${stuck} save${stuck === 1 ? "" : "s"} could not be sent to Monad: see \`mida doctor\``)
   return `Mida note: ${clauses.join(". ")}.`
@@ -356,6 +383,13 @@ function pendingBlock(cp: ReadCheckpoint, authorNames: Record<string, string>): 
     PENDING_ANCHOR_LINE,
     `from ${defuse(who)} at ${defuse(c.createdAt)} (session ${defuse(cp.sessionId)}, record ${defuse(cp.contextId)})`,
   ]
+  lines.push(...checkpointFieldLines(c))
+  return lines.join("\n")
+}
+
+/** A checkpoint's non-empty fields, one line each, most useful first — shared by the marked blocks. */
+function checkpointFieldLines(c: ReadCheckpoint["checkpoint"]): string[] {
+  const lines: string[] = []
   if (c.objective !== "") lines.push(`objective: ${defuse(c.objective)}`)
   for (const step of c.remainingPlan) lines.push(`plan step: ${defuse(step)}`)
   if (c.nextAction !== "") lines.push(`next action: ${defuse(c.nextAction)}`)
@@ -366,7 +400,59 @@ function pendingBlock(cp: ReadCheckpoint, authorNames: Record<string, string>): 
   for (const a of c.artifacts) lines.push(`artifact: ${defuse(a)}`)
   for (const p of c.progress) lines.push(`progress: ${defuse(p)}`)
   for (const e of c.evidence) lines.push(`evidence: ${defuse(e.field)} — ${defuse(e.ref)}`)
+  return lines
+}
+
+/** The marker on a save compiled on this machine but not yet on Monad (CAP-26). */
+export const UNSENT_LINE =
+  "UNSENT: compiled on this machine and not yet on Monad. The chain has not checked who wrote it, and it may still change or be rejected. It is here so you can pick up at once; check the current state before you act on it."
+
+/** One UNSENT block's budget: it sits outside the merge's 8,000-char fit, so it is capped here. */
+const UNSENT_BLOCK_CHARS = 3_000
+
+/**
+ * One compiled-but-unsent save as its own marked block (CAP-26): the marker, who queued it (the
+ * local job's agent name — the chain has not checked it), then its fields until the block budget,
+ * with a count of what was left out. Most useful fields come first, so a cut drops old progress.
+ */
+function unsentBlock(envelope: CheckpointEnvelope, agent: string): string {
+  const c = envelope.checkpoint
+  const lines = [UNSENT_LINE, `from ${defuse(agent)} at ${defuse(c.createdAt)} (session ${defuse(envelope.sessionId)}, not verified by the chain)`]
+  let used = lines.join("\n").length
+  const fields = checkpointFieldLines(c)
+  let shown = 0
+  for (const line of fields) {
+    if (used + 1 + line.length > UNSENT_BLOCK_CHARS) break
+    lines.push(line)
+    used += 1 + line.length
+    shown += 1
+  }
+  if (shown < fields.length) lines.push(`… ${fields.length - shown} more line${fields.length - shown === 1 ? "" : "s"} of this unsent save left out`)
   return lines.join("\n")
+}
+
+/**
+ * The compiled-but-unsent saves another agent may see: for each session the queue counted (it
+ * still has a queued job, so its save has not landed), the session's marked envelope — skipping the
+ * asking session itself, another project's, and another task's. Oldest compile first.
+ */
+function unsentSaves(
+  home: MidaHome,
+  queued: QueuedSaves | null,
+  scope: { projectId: string; task: string; askingSession?: string },
+): { agent: string; envelope: CheckpointEnvelope }[] {
+  if (queued === null) return []
+  const found: { agent: string; envelope: CheckpointEnvelope }[] = []
+  for (const [agent, sessions] of queued.perAgent) {
+    for (const sessionId of sessions) {
+      if (sessionId === scope.askingSession) continue
+      const envelope = readUnsent(home, sessionId)
+      if (envelope === undefined || envelope.projectId !== scope.projectId) continue
+      if ((envelope.task ?? DEFAULT_TASK) !== scope.task) continue
+      found.push({ agent, envelope })
+    }
+  }
+  return found.sort((a, b) => Date.parse(a.envelope.checkpoint.createdAt) - Date.parse(b.envelope.checkpoint.createdAt))
 }
 
 type FactOutcome = { status: "ok"; facts: Awaited<ReturnType<typeof readOwnerFacts>> } | { status: "failed" } | { status: "slow" }
@@ -423,7 +509,13 @@ export async function buildHandoff(
     // Mida's own undelivered saves are newer work this record cannot know — one read-only count,
     // after access is granted and scoped to this project. Never a queue control.
     const now = deps.now ?? (() => Date.now())
-    const pendingSavesNote = queuedSavesNote(runtime.home, check.projectId, now()) ?? undefined
+    const queued = readQueuedSaves(runtime.home, check.projectId)
+    // CAP-26: another session's save compiled here but not yet on Monad — shown, marked UNSENT,
+    // only for a session that still has a queued job (so it has not landed), never the asking
+    // session's own, and only for this project and this session's task
+    const unsent = unsentSaves(runtime.home, queued, { projectId: check.projectId, task, askingSession: input.sessionId })
+    const unsentText = unsent.map((u) => unsentBlock(u.envelope, u.agent)).join("\n\n")
+    const pendingSavesNote = queuedSavesNote(queued, now(), unsent.length) ?? undefined
 
     const readStarted = now()
     // `settled` never rejects, so a read that finishes or fails after the deadline is discarded
@@ -485,6 +577,9 @@ export async function buildHandoff(
     const pending = outcome.checkpoints.filter((cp) => cp.anchor === "PENDING_ANCHOR" && inTask(cp))
     const merged = mergeCheckpoints(outcome.checkpoints.filter((cp) => cp.anchor !== "PENDING_ANCHOR" && inTask(cp)))
     const pendingText = pending.map((cp) => pendingBlock(cp, input.authorNames)).join("\n\n")
+    // the marked blocks — pending (stored, not anchored) and UNSENT (compiled here, not sent) — sit
+    // inside the fence beside the merge, never in it: neither is anchored state
+    const markedText = [pendingText, unsentText].filter((t) => t !== "").join("\n\n")
     // the checkpoints this session may treat as covered — its own never count: a session's own
     // saves are never updates for it and must never enter its seen set. A pending save that was
     // shown marked counts as covered — the session saw it, whatever the chain later decides.
@@ -497,7 +592,7 @@ export async function buildHandoff(
     // channels must say the list was incomplete: the model text opens with PARTIAL_LINE, the
     // owner's line adds "(incomplete — try again in a moment)", the daemon log records it.
     if (merged === null) {
-      if (pending.length === 0) {
+      if (markedText === "") {
         // A brand-new project is exactly where the queued-saves note matters most: the record is
         // empty AND undelivered saves sit in the queue — the model must hear both halves (R-14).
         // Named-task wording: the "nothing saved" claim is about THIS task — other tasks get
@@ -533,7 +628,7 @@ export async function buildHandoff(
       const mentionsText = mentionsBlock === "" ? "" : `\n\n${mentionsBlock}`
       return {
         kind: "handoff",
-        text: `${outcome.partial ? `${PARTIAL_LINE}\n\n` : ""}${preamble}\n${HANDOFF_BEGIN}\n\n${pendingText}${mentionsText}\n\n${HANDOFF_TAIL}`,
+        text: `${outcome.partial ? `${PARTIAL_LINE}\n\n` : ""}${preamble}\n${HANDOFF_BEGIN}\n\n${markedText}${mentionsText}\n\n${HANDOFF_TAIL}`,
         checkpoints: outcome.checkpoints.length,
         facts: facts.length,
         factsFailed,
@@ -588,13 +683,13 @@ export async function buildHandoff(
       { authorNames: input.authorNames, facts, factsFailed, adapterNote, pendingSavesNote, otherTasks, now },
     )
     const text = (() => {
-      if (pending.length === 0) return rendered.text
+      if (markedText === "") return rendered.text
       // inside the fence, before the END line — the marked pending blocks sit beside the merged
       // sections, each under its own "not yet anchored" marker; the header's save time is the
       // anchored merge's newest effective instant, which is exactly what it claims to be
       return rendered.text.includes(`\n\n${HANDOFF_TAIL}`)
-        ? rendered.text.replace(`\n\n${HANDOFF_TAIL}`, `\n\n${pendingText}\n\n${HANDOFF_TAIL}`)
-        : `${rendered.text}\n\n${pendingText}`
+        ? rendered.text.replace(`\n\n${HANDOFF_TAIL}`, `\n\n${markedText}\n\n${HANDOFF_TAIL}`)
+        : `${rendered.text}\n\n${markedText}`
     })()
     return {
       kind: "handoff",
