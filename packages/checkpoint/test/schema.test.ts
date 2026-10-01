@@ -70,6 +70,19 @@ describe("limitNote and splitLimitNote (UF-L)", () => {
     expect(three.text).toBe("stuck")
     expect([...three.lists]).toEqual(["constraints", "decisions", "rejected"])
   })
+  it("a limit note followed by the size note still names its lists (UF-N)", () => {
+    // wrapCheckpoint appends "(Mida: left out … to fit the size limit)" AFTER the limit note —
+    // the note is then no longer the value's tail, but it is still the record of what was lost
+    const note = limitNote(new Set(["decisions"]))!
+    const s = splitLimitNote(`issue | ${note} | (Mida: left out 3 progress to fit the size limit)`)
+    expect([...s.lists]).toEqual(["decisions"])
+    expect(s.text).toBe("issue | (Mida: left out 3 progress to fit the size limit)")
+  })
+  it("a limit note followed by other text names no lists", () => {
+    const note = limitNote(new Set(["decisions"]))!
+    expect(splitLimitNote(`${note} more text`).lists.size).toBe(0)
+    expect(splitLimitNote(`${note} | still discussing this`).lists.size).toBe(0)
+  })
   it("a note in the MIDDLE of the value names no lists but still leaves the text", () => {
     const s = splitLimitNote("a | (Mida: a list holds at most 50 entries. Older decisions were left out.) | b")
     expect(s.text).toBe("a | b")

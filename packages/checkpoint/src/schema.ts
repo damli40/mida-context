@@ -57,9 +57,15 @@ export function limitNote(lists: ReadonlySet<LimitList>): string | null {
 // nested inside another dies with its parent.
 const LIMIT_NOTE_SEGMENT = /\(Mida: a list holds at most[^)]*(\)|$)/
 
-// A well-formed note of the current wording, anchored at the very end of the value — group 1 is
-// the whole note, group 2 its list names. Only an exact limitNote output earns its lists back.
-const LIMIT_NOTE_AT_END = /(\(Mida: a list holds at most \d+ entries\. Older ([^.]*) were left out\.\))\s*$/
+// A well-formed note of the current wording, anywhere in the value — the whole match is the
+// note, group 1 its list names. Only an exact limitNote output earns its lists back.
+const LIMIT_NOTE_WELL_FORMED = /\(Mida: a list holds at most \d+ entries\. Older ([^.]*) were left out\.\)/g
+
+// What may follow a limit note and still let it name its lists: whitespace, " | " separators,
+// and other COMPLETE "(Mida: …)" notes — wrapCheckpoint appends its "(Mida: … to fit the size
+// limit)" note after the limit note, and the limit note must still be read through it (UF-N).
+// A note followed by any other text — an unclosed "(Mida:" included — names nothing.
+const LIMIT_NOTE_TAIL = /^(?:\s|\||\(Mida:[^)]*\))*$/
 
 /**
  * Splits an unresolvedIssue value into its free text and the lists a well-formed limit note at
@@ -69,9 +75,11 @@ const LIMIT_NOTE_AT_END = /(\(Mida: a list holds at most \d+ entries\. Older ([^
  * none, the one directly after. Nothing else in the text changes — a value holding no note
  * comes back byte-for-byte, `||` and leading or trailing pipes included, because they are the
  * user's text, not our punctuation (UF-N). Only leading/trailing whitespace is trimmed at the
- * end; `text` may come back empty. `lists` is empty unless the value's tail is a note
- * byte-for-byte as limitNote writes it — in name order, with the real cap — so an old numbered
- * note or a mid-string claim names nothing.
+ * end; `text` may come back empty. `lists` is empty unless a note byte-for-byte as limitNote
+ * writes it — in name order, with the real cap — is followed by nothing except whitespace,
+ * separators and other complete "(Mida: …)" notes (UF-N: the size note wrapCheckpoint appends
+ * after the limit note counts; any other text does not), so an old numbered note or a
+ * mid-string claim names nothing.
  */
 export function splitLimitNote(value: string | null): { text: string; lists: Set<LimitList> } {
   const lists = new Set<LimitList>()
@@ -91,14 +99,15 @@ export function splitLimitNote(value: string | null): { text: string; lists: Set
     }
   }
   text = text.trim()
-  const tail = LIMIT_NOTE_AT_END.exec(value)
-  if (tail !== null) {
+  let last: RegExpExecArray | null = null
+  for (let m = LIMIT_NOTE_WELL_FORMED.exec(value); m !== null; m = LIMIT_NOTE_WELL_FORMED.exec(value)) last = m
+  if (last !== null && LIMIT_NOTE_TAIL.test(value.slice(last.index + last[0].length))) {
     const named = new Set<LimitList>()
-    for (const word of tail[2]!.split(/, | and /)) {
+    for (const word of last[1]!.split(/, | and /)) {
       const list = LIMIT_LIST_ORDER.find((l) => LIMIT_LIST_WORD[l] === word)
       if (list !== undefined) named.add(list)
     }
-    if (tail[1] === limitNote(named)) for (const list of named) lists.add(list)
+    if (last[0] === limitNote(named)) for (const list of named) lists.add(list)
   }
   return { text, lists }
 }

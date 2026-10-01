@@ -651,6 +651,34 @@ describe("compileCheckpoint", () => {
       expect(issue.startsWith("i".repeat(10))).toBe(true)
     }
   })
+  // UF-N: wrapCheckpoint writes its size note AFTER the limit note, so on the next save the
+  // previous checkpoint's tail is the size note, not the limit note. The lists must still be
+  // read through the size note — otherwise the limit note silently dies on the following save.
+  it("a limit note is still read when the size note follows it (UF-N)", async () => {
+    const constraintsNote = "(Mida: a list holds at most 50 entries. Older constraints were left out.)"
+    const previous: Checkpoint = {
+      eventId: "evt-prev0002",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: "2026-09-21T09:00:00.000Z",
+      objective: "Implement the rate limiter",
+      originalRequest: "Build a rate limiter in 3 steps",
+      progress: ["skeleton written"],
+      decisions: [],
+      rejected: [],
+      constraints: ["no dependencies"],
+      artifacts: [],
+      unresolvedIssue: `CI still red | ${constraintsNote} | (Mida: left out 50 progress to fit the size limit)`,
+      nextAction: "add tests",
+      remainingPlan: [],
+      evidence: [],
+    }
+    const r = await compileCheckpoint({ ...base, previous, model: fake("echo-previous") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.unresolvedIssue!.endsWith(` | ${constraintsNote}`)).toBe(true)
+    }
+  })
   it("an unresolvedIssue ending in a note cut off mid-way loses the tail (UF-K)", async () => {
     const r = await compileCheckpoint({ ...base, model: fake("cut-note-tail") })
     expect(r.ok).toBe(true)
