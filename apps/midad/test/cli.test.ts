@@ -1479,6 +1479,100 @@ describe("the crude mida command", () => {
       expect(out.at(-1)).toBe(expected)
     }
   }, 300_000)
+
+  it("init on a terminal asks nothing when the environment already decides: MIDA_COMPILE_MODEL=custom (UF-P2R)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-envcustom-")))
+    const out: string[] = []
+    let asks = 0
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => (asks++, ""),
+      secretPrompt: async () => (asks++, ""),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: {
+        LANG: "en_US.UTF-8",
+        MIDA_COMPILE_MODEL: "custom",
+        MIDA_COMPILE_BASE_URL: "http://127.0.0.1:9/v1",
+        MIDA_COMPILE_MODEL_ID: "local-1",
+      },
+      onPath: () => true,
+    })
+    expect(code).toBe(0)
+    expect(asks).toBe(0)
+    expect(fresh.has("summarizer.json")).toBe(false)
+    expect(out.at(-1)).toBe("Summaries: the models your environment variables set. Change it with: mida summarizer")
+  }, 300_000)
+
+  it("init on a terminal asks nothing when only DEEPSEEK_API_KEY is set (UF-P2R)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-envkey-")))
+    const out: string[] = []
+    let asks = 0
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => (asks++, ""),
+      secretPrompt: async () => (asks++, ""),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: { LANG: "en_US.UTF-8", DEEPSEEK_API_KEY: "env-key" },
+      onPath: () => true,
+    })
+    expect(code).toBe(0)
+    expect(asks).toBe(0)
+    expect(fresh.has("summarizer.json")).toBe(false)
+    expect(out.at(-1)).toBe("Summaries: the models your environment variables set. Change it with: mida summarizer")
+  }, 300_000)
+
+  it("init on a terminal asks nothing when CI is set (UF-P2R)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-ci-")))
+    const out: string[] = []
+    let asks = 0
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => (asks++, ""),
+      secretPrompt: async () => (asks++, ""),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: { LANG: "en_US.UTF-8", CI: "1" },
+      onPath: () => true,
+    })
+    expect(code).toBe(0)
+    expect(asks).toBe(0)
+    expect(fresh.has("summarizer.json")).toBe(false)
+  }, 300_000)
+
+  it("a summariser question that throws still lets init finish: owner and agent lines print, exit 0 (UF-P2R)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-throw-")))
+    const out: string[] = []
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => {
+        throw new Error("prompt blew up")
+      },
+      secretPrompt: async () => "",
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: { LANG: "en_US.UTF-8" },
+      onPath: () => true,
+    })
+    expect(code).toBe(0)
+    expect(out.some((line) => line.startsWith("owner "))).toBe(true)
+    expect(out.some((line) => line.startsWith("agent claude-code "))).toBe(true)
+    expect(out).toContain("Nothing saved. Mida uses your agents' small models until you choose: mida summarizer")
+    expect(fresh.has("summarizer.json")).toBe(false)
+  }, 300_000)
 })
 
 /**

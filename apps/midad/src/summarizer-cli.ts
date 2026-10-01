@@ -276,8 +276,10 @@ export async function chooseSummarizer(deps: {
   prompt: (question: string) => Promise<string>
   secretPrompt: (question: string) => Promise<string>
   onPath: (bin: string) => boolean
+  /** drops input already buffered on stdin, the way approve does before its "Type yes" */
+  drain?: () => unknown | Promise<unknown>
 }): Promise<"saved" | "skipped"> {
-  const { home, env, print, prompt, secretPrompt, onPath } = deps
+  const { home, env, print, prompt, secretPrompt, onPath, drain } = deps
   const claude = onPath("claude")
   const codex = onPath("codex")
   const a = claude && codex
@@ -307,6 +309,8 @@ export async function chooseSummarizer(deps: {
     print(line)
   }
 
+  // an Enter pressed while the command was starting is not an answer to this question
+  await drain?.()
   let wrong = 0
   for (;;) {
     const answer = (await prompt("Choose 1 or 2 [1]: ")).trim()
@@ -350,7 +354,9 @@ export async function runSummarizer(argv: string[], deps: SummarizerCliDeps): Pr
     const saved: SummarizerSaved = { use: "agents" }
     writeSummarizer(home, saved)
     print("Saved: your agents' small models write the summaries.")
-    return showSummarizer(deps)
+    // the write landed — the display that follows never changes that answer
+    await showSummarizer(deps)
+    return 0
   }
 
   if (argv.length === 3 && argv[1] === "use" && argv[2] === "key") {
@@ -368,7 +374,8 @@ export async function runSummarizer(argv: string[], deps: SummarizerCliDeps): Pr
       resolveSummarizer({ saved, env, onPath, claudeSafeMode: deps.claudeSafeMode?.() ?? false }).entries[0]?.display ?? "your endpoint"
     print(`Saved: ${display} writes the summaries, with your key.`)
     print(`Saved in ${home.path(SUMMARIZER_FILE)}, readable only by you.`)
-    return showSummarizer(deps)
+    await showSummarizer(deps)
+    return 0
   }
 
   if (argv.length === 2 && argv[1] === "test") {

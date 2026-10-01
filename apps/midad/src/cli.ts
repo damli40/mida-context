@@ -901,6 +901,7 @@ function summarizerChoiceDeps(deps: {
   prompt?: (question: string) => Promise<string>
   secretPrompt?: (question: string) => Promise<string>
   onPath?: (bin: string) => boolean
+  drainInput?: () => unknown | Promise<unknown>
 }): Parameters<typeof chooseSummarizer>[0] {
   const env = deps.env ?? process.env
   return {
@@ -910,7 +911,15 @@ function summarizerChoiceDeps(deps: {
     prompt: deps.prompt ?? terminalPrompt,
     secretPrompt: deps.secretPrompt ?? terminalSecretPrompt,
     onPath: deps.onPath ?? ((bin) => binaryOnPath(bin, env.PATH)),
+    drain: deps.drainInput ?? drainBufferedStdin,
   }
+}
+
+/** Whether init/install may ask: nobody has decided, the choice file reads clean, and no CI. */
+function summarizerAskWanted(home: MidaHome, env: Record<string, string | undefined>, onPath?: (bin: string) => boolean): boolean {
+  if ((env.CI ?? "") !== "") return false
+  const choice = currentSummarizer(home, env, onPath !== undefined ? { onPath } : undefined)
+  return !choice.chosen && !choice.invalid
 }
 
 /**
@@ -922,12 +931,18 @@ function summarizerChoiceDeps(deps: {
 async function initOpening(deps: CliDeps): Promise<boolean> {
   const stdinTTY = deps.stdinIsTTY ?? process.stdin.isTTY === true
   const stdoutTTY = deps.stdoutIsTTY ?? process.stdout.isTTY === true
-  for (const line of bannerLines(deps.env ?? process.env, stdoutTTY)) deps.print(line)
+  const env = deps.env ?? process.env
+  for (const line of bannerLines(env, stdoutTTY)) deps.print(line)
   if (!(stdinTTY && stdoutTTY)) return false
   deps.print("Mida keeps what you tell it and what your AI agents save, encrypted under keys you hold.")
   deps.print("")
-  if (readSummarizer(deps.home) === undefined) {
-    await chooseSummarizer(summarizerChoiceDeps(deps))
+  if (summarizerAskWanted(deps.home, env, deps.onPath)) {
+    try {
+      await chooseSummarizer(summarizerChoiceDeps(deps))
+    } catch {
+      // a prompt that dies mid-ask saves nothing and stops nothing else in init
+      deps.print("Nothing saved. Mida uses your agents' small models until you choose: mida summarizer")
+    }
     deps.print("")
     return true
   }
@@ -967,17 +982,23 @@ function summariesLine(deps: CliDeps): string {
 /** Whether install may ask: both sides of a real terminal, and nobody has chosen yet. */
 function installAskWanted(deps: {
   home: MidaHome
+  env?: Record<string, string | undefined>
+  onPath?: (bin: string) => boolean
   stdinIsTTY?: boolean
   stdoutIsTTY?: boolean
 }): boolean {
   const stdinTTY = deps.stdinIsTTY ?? process.stdin.isTTY === true
   const stdoutTTY = deps.stdoutIsTTY ?? process.stdout.isTTY === true
-  return stdinTTY && stdoutTTY && readSummarizer(deps.home) === undefined
+  return stdinTTY && stdoutTTY && summarizerAskWanted(deps.home, deps.env ?? process.env, deps.onPath)
 }
 
 async function installAsk(deps: Parameters<typeof summarizerChoiceDeps>[0]): Promise<void> {
   deps.print("")
-  await chooseSummarizer(summarizerChoiceDeps(deps))
+  try {
+    await chooseSummarizer(summarizerChoiceDeps(deps))
+  } catch {
+    deps.print("Nothing saved. Mida uses your agents' small models until you choose: mida summarizer")
+  }
 }
 
 /** The owner commands themselves — see the doc comment above the helpers. */
@@ -2527,6 +2548,8 @@ export function runInstall(
     onPath?: (bin: string) => boolean
     /** The environment the choice resolves against — injected in tests. */
     env?: Record<string, string | undefined>
+    /** Drops stdin already buffered before the summariser question — the approve rule (UF-P2R). */
+    drainInput?: () => unknown | Promise<unknown>
   },
 ): number | Promise<number> {
   const tool = argv[1] ?? ""

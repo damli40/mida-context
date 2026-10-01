@@ -2002,4 +2002,63 @@ describe("the summariser ask after install (UF-P2c)", () => {
     expect(await runInstall(["uninstall", "codex"], deps2)).toBe(0)
     expect(asked).toEqual([])
   })
+
+  it("install claude-code asks nothing when the environment already decides: MIDA_COMPILE_MODEL=custom (UF-P2R)", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const asked: string[] = []
+    const code = await runInstall(["install", "claude-code"], {
+      ...ttyDeps(home, lines, asked),
+      env: {
+        MIDA_COMPILE_MODEL: "custom",
+        MIDA_COMPILE_BASE_URL: "http://127.0.0.1:9/v1",
+        MIDA_COMPILE_MODEL_ID: "local-1",
+      },
+    })
+    expect(code).toBe(0)
+    expect(asked).toEqual([])
+    expect(lines.every((line) => line !== "How should Mida write its summaries?")).toBe(true)
+    expect(home.has("summarizer.json")).toBe(false)
+  })
+
+  it("install claude-code asks nothing when only DEEPSEEK_API_KEY is set (UF-P2R)", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const asked: string[] = []
+    const code = await runInstall(["install", "claude-code"], {
+      ...ttyDeps(home, lines, asked),
+      env: { DEEPSEEK_API_KEY: "env-key" },
+    })
+    expect(code).toBe(0)
+    expect(asked).toEqual([])
+    expect(home.has("summarizer.json")).toBe(false)
+  })
+
+  it("install claude-code asks nothing when CI is set (UF-P2R)", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const asked: string[] = []
+    const code = await runInstall(["install", "claude-code"], {
+      ...ttyDeps(home, lines, asked),
+      env: { CI: "1" },
+    })
+    expect(code).toBe(0)
+    expect(asked).toEqual([])
+    expect(home.has("summarizer.json")).toBe(false)
+  })
+
+  it("a summariser question that throws keeps the exit code the install earned (UF-P2R)", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const code = await runInstall(["install", "claude-code"], {
+      ...ttyDeps(home, lines, []),
+      prompt: async () => {
+        throw new Error("prompt blew up")
+      },
+    })
+    expect(code).toBe(0)
+    expect(lines).toContain("installed")
+    expect(lines).toContain("Nothing saved. Mida uses your agents' small models until you choose: mida summarizer")
+    expect(home.has("summarizer.json")).toBe(false)
+  })
 })
