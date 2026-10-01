@@ -788,6 +788,7 @@ describe("mida doctor without a chain", () => {
       ok: true,
       codeRoot: codeIdentity().codeRoot,
       codeCommit: codeIdentity().codeCommit,
+      codeVersion: codeIdentity().codeVersion,
       summarizer: { chain: ["deepseek-flash"] },
     })
     try {
@@ -809,12 +810,48 @@ describe("mida doctor without a chain", () => {
     }
   })
 
+  it("a service at the same folder and commit but another codeVersion is reported as other code (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      codeRoot: codeIdentity().codeRoot,
+      codeCommit: codeIdentity().codeCommit,
+      codeVersion: "0.0.0-older",
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines.some((line) => line.includes("this command runs the same"))).toBe(false)
+      expect(lines.some((line) => line.startsWith("PROBLEM:") && line.includes("midad runs"))).toBe(true)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a service that names root and commit but no codeVersion is reported as other code (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      codeRoot: codeIdentity().codeRoot,
+      codeCommit: codeIdentity().codeCommit,
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines.some((line) => line.includes("this command runs the same"))).toBe(false)
+      expect(lines.some((line) => line.startsWith("PROBLEM:") && line.includes("midad"))).toBe(true)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
   it("a running service on the SAME chain gets no note (UF-P3)", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const server = await stubDaemon(home, 200, {
       ok: true,
       codeRoot: codeIdentity().codeRoot,
       codeCommit: codeIdentity().codeCommit,
+      codeVersion: codeIdentity().codeVersion,
       summarizer: { chain: ["claude-haiku", "codex-luna"] },
     })
     try {
@@ -1437,6 +1474,48 @@ describe("mida doctor --live", () => {
     })
     expect(code).toBe(2)
     expect(lines).toEqual(["refused: live checks need an interactive terminal"])
+  })
+
+  it("a refused --live replaces nothing — the stale-service check never runs (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    let replaced = 0
+    const code = await runDoctorLive("codex", {
+      home,
+      print: (line) => lines.push(line),
+      env: { CI: "true" },
+      stdinIsTTY: true,
+      replaceStaleService: async () => {
+        replaced += 1
+      },
+    })
+    expect(code).toBe(2)
+    expect(lines).toEqual(["refused: live checks do not run in CI"])
+    expect(replaced).toBe(0)
+  })
+
+  it("once the refusals pass, --live replaces a stale service before the session starts (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    let replaced = 0
+    let sessions = 0
+    const code = await runDoctorLive("codex", {
+      home,
+      print: (line) => lines.push(line),
+      env: {},
+      stdinIsTTY: true,
+      watchMs: 50,
+      replaceStaleService: async () => {
+        replaced += 1
+      },
+      startSession: () => {
+        sessions += 1
+        return { stop() {} }
+      },
+    })
+    expect(code).toBe(1)
+    expect(replaced).toBe(1)
+    expect(sessions).toBe(1)
   })
 })
 

@@ -280,19 +280,85 @@ describe("ensureCurrentDaemon", () => {
     const posts: string[] = []
     const server = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
       if (req.method === "POST") posts.push(req.path)
-      replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "abc1234" })
+      replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" })
     })
     try {
       let spawned = 0
       const result = await ensureCurrentDaemon(home, () => { spawned += 1 }, {
         waitMs: 2_000,
-        self: { codeRoot: "/code/here", codeCommit: "abc1234" },
+        self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" },
       })
       expect(result).toEqual({ up: true })
       expect(spawned).toBe(0)
       expect(posts).toEqual([])
     } finally {
       await closeQuiet(server)
+    }
+  })
+
+  it("the same folder and commit but another codeVersion is a different install — replaced (UF-QC)", async () => {
+    // the npm-update case: same install folder, no meaningful git commit, but the service
+    // answers /health with the OLD package version while this command carries the new one
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    const posts: string[] = []
+    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+      if (req.method === "POST") {
+        posts.push(req.path)
+        replyJson(socket, 200, { ok: true })
+        if (req.path === "/shutdown") void closeQuiet(oldServer)
+        return
+      }
+      replyJson(socket, 200, { ok: true, pid: 7, codeRoot: "/code/here", codeCommit: "unknown", codeVersion: "1.0.0" })
+    })
+    let spawned = 0
+    let replacement: Server | undefined
+    const result = await ensureCurrentDaemon(home, () => {
+      spawned += 1
+      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+        replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "unknown", codeVersion: "1.0.1" }),
+      ).then((s) => { replacement = s })
+    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "unknown", codeVersion: "1.0.1" } })
+    try {
+      expect(result.up).toBe(true)
+      expect(result.replaced).toEqual({ codeRoot: "/code/here", codeCommit: "unknown", pid: 7 })
+      expect(posts).toEqual(["/shutdown"])
+      expect(spawned).toBe(1)
+    } finally {
+      await closeQuiet(replacement)
+      await closeQuiet(oldServer)
+    }
+  })
+
+  it("a reply with no codeVersion at all is a different install — replaced (UF-QC)", async () => {
+    // a service from before version reporting: same folder, same commit, nothing to compare
+    // against this command's version — that absence IS a difference
+    const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
+    const posts: string[] = []
+    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+      if (req.method === "POST") {
+        posts.push(req.path)
+        replyJson(socket, 200, { ok: true })
+        if (req.path === "/shutdown") void closeQuiet(oldServer)
+        return
+      }
+      replyJson(socket, 200, { ok: true, pid: 9, codeRoot: "/code/here", codeCommit: "abc1234" })
+    })
+    let spawned = 0
+    let replacement: Server | undefined
+    const result = await ensureCurrentDaemon(home, () => {
+      spawned += 1
+      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+        replyJson(socket, 200, { ok: true, pid: 10, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.0.1" }),
+      ).then((s) => { replacement = s })
+    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.0.1" } })
+    try {
+      expect(result.up).toBe(true)
+      expect(result.replaced).toEqual({ codeRoot: "/code/here", codeCommit: "abc1234", pid: 9 })
+      expect(posts).toEqual(["/shutdown"])
+      expect(spawned).toBe(1)
+    } finally {
+      await closeQuiet(replacement)
+      await closeQuiet(oldServer)
     }
   })
 
@@ -303,9 +369,9 @@ describe("ensureCurrentDaemon", () => {
     const result = await ensureCurrentDaemon(home, () => {
       spawned += 1
       void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
-        replyJson(socket, 200, { ok: true, pid: 2, codeRoot: "/code/here", codeCommit: "abc1234" }),
+        replyJson(socket, 200, { ok: true, pid: 2, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" }),
       ).then((s) => { server = s })
-    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234" } })
+    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" } })
     try {
       expect(result).toEqual({ up: true })
       expect(spawned).toBe(1)
@@ -324,16 +390,16 @@ describe("ensureCurrentDaemon", () => {
         if (req.path === "/shutdown") void closeQuiet(oldServer)
         return
       }
-      replyJson(socket, 200, { ok: true, pid: 7, codeRoot: "/code/here", codeCommit: "old1234" })
+      replyJson(socket, 200, { ok: true, pid: 7, codeRoot: "/code/here", codeCommit: "old1234", codeVersion: "1.2.3" })
     })
     let spawned = 0
     let replacement: Server | undefined
     const result = await ensureCurrentDaemon(home, () => {
       spawned += 1
       void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
-        replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "new5678" }),
+        replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "new5678", codeVersion: "1.2.3" }),
       ).then((s) => { replacement = s })
-    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "new5678" } })
+    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "new5678", codeVersion: "1.2.3" } })
     try {
       expect(result.up).toBe(true)
       expect(result.replaced).toEqual({ codeRoot: "/code/here", codeCommit: "old1234", pid: 7 })
@@ -359,9 +425,9 @@ describe("ensureCurrentDaemon", () => {
     let replacement: Server | undefined
     const result = await ensureCurrentDaemon(home, () => {
       void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
-        replyJson(socket, 200, { ok: true, pid: 10, codeRoot: "/code/here", codeCommit: "abc1234" }),
+        replyJson(socket, 200, { ok: true, pid: 10, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" }),
       ).then((s) => { replacement = s })
-    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234" } })
+    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" } })
     try {
       expect(result.up).toBe(true)
       expect(result.replaced).toMatchObject({ codeRoot: "unknown", codeCommit: "unknown", pid: 9 })
@@ -375,12 +441,12 @@ describe("ensureCurrentDaemon", () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     // both sides "unknown" — nothing to compare, so nothing is replaced
     const sameServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) =>
-      replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "unknown" }),
+      replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "unknown", codeVersion: "unknown" }),
     )
     try {
       const result = await ensureCurrentDaemon(home, () => { throw new Error("must not spawn") }, {
         waitMs: 2_000,
-        self: { codeRoot: "/code/here", codeCommit: "unknown" },
+        self: { codeRoot: "/code/here", codeCommit: "unknown", codeVersion: "unknown" },
       })
       expect(result).toEqual({ up: true })
     } finally {
@@ -395,14 +461,14 @@ describe("ensureCurrentDaemon", () => {
         if (req.path === "/shutdown") void closeQuiet(oldServer)
         return
       }
-      replyJson(socket, 200, { ok: true, pid: 3, codeRoot: "/code/here", codeCommit: "unknown" })
+      replyJson(socket, 200, { ok: true, pid: 3, codeRoot: "/code/here", codeCommit: "unknown", codeVersion: "1.2.3" })
     })
     let replacement: Server | undefined
     const result = await ensureCurrentDaemon(home2, () => {
       void fakeHttpDaemon(socketPathFor(home2), (req, socket) =>
-        replyJson(socket, 200, { ok: true, pid: 4, codeRoot: "/code/here", codeCommit: "abc1234" }),
+        replyJson(socket, 200, { ok: true, pid: 4, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" }),
       ).then((s) => { replacement = s })
-    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234" } })
+    }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" } })
     try {
       expect(result.up).toBe(true)
       expect(result.replaced).toMatchObject({ codeCommit: "unknown", pid: 3 })
@@ -428,7 +494,7 @@ describe("ensureCurrentDaemon", () => {
       const result = await ensureCurrentDaemon(home, () => { spawned += 1 }, {
         waitMs: 5_000,
         shutdownWaitMs: 200,
-        self: { codeRoot: "/new/root", codeCommit: "beef7654321" },
+        self: { codeRoot: "/new/root", codeCommit: "beef7654321", codeVersion: "1.2.3" },
       })
       expect(result.up).toBe(false)
       expect(Date.now() - started).toBeLessThan(3_000)
@@ -452,7 +518,7 @@ describe("ensureCurrentDaemon", () => {
     const result = await ensureCurrentDaemon(home, () => { spawned += 1 }, {
       waitMs: 5_000,
       whenDown: "leave",
-      self: { codeRoot: "/code/here", codeCommit: "abc1234" },
+      self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" },
     })
     // one probe, then a straight answer — not the whole waitMs a start would poll for
     expect(Date.now() - started).toBeLessThan(3_000)
@@ -471,16 +537,16 @@ describe("ensureCurrentDaemon", () => {
         if (req.path === "/shutdown") void closeQuiet(oldServer)
         return
       }
-      replyJson(socket, 200, { ok: true, pid: 7, codeRoot: "/code/here", codeCommit: "old1234" })
+      replyJson(socket, 200, { ok: true, pid: 7, codeRoot: "/code/here", codeCommit: "old1234", codeVersion: "1.2.3" })
     })
     let spawned = 0
     let replacement: Server | undefined
     const result = await ensureCurrentDaemon(home, () => {
       spawned += 1
       void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
-        replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "new5678" }),
+        replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "new5678", codeVersion: "1.2.3" }),
       ).then((s) => { replacement = s })
-    }, { waitMs: 5_000, whenDown: "leave", self: { codeRoot: "/code/here", codeCommit: "new5678" } })
+    }, { waitMs: 5_000, whenDown: "leave", self: { codeRoot: "/code/here", codeCommit: "new5678", codeVersion: "1.2.3" } })
     try {
       expect(result.up).toBe(true)
       expect(result.replaced).toEqual({ codeRoot: "/code/here", codeCommit: "old1234", pid: 7 })
@@ -497,14 +563,14 @@ describe("ensureCurrentDaemon", () => {
     const posts: string[] = []
     const server = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
       if (req.method === "POST") posts.push(req.path)
-      replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "abc1234" })
+      replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" })
     })
     try {
       let spawned = 0
       const result = await ensureCurrentDaemon(home, () => { spawned += 1 }, {
         waitMs: 2_000,
         whenDown: "leave",
-        self: { codeRoot: "/code/here", codeCommit: "abc1234" },
+        self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" },
       })
       expect(result).toEqual({ up: true })
       expect(spawned).toBe(0)
@@ -561,7 +627,7 @@ describe("the migrate/in-progress marker (migrate B6)", () => {
       let spawned = 0
       const result = await ensureCurrentDaemon(home, () => { spawned += 1 }, {
         waitMs: 3_000,
-        self: { codeRoot: "/code/here", codeCommit: "abc1234" },
+        self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" },
       })
       expect(result).toEqual({
         up: false,

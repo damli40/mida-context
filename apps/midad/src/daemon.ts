@@ -283,7 +283,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (req.method === "GET" && req.url === "/health") {
-      respond(res, 200, { ok: true, pid: process.pid, startedAt, queueDepth: listJobs(home).length, codeRoot: identity.codeRoot, codeCommit: identity.codeCommit, summarizer: summarizerSummary(currentSummarizer(home, process.env)) })
+      respond(res, 200, { ok: true, pid: process.pid, startedAt, queueDepth: listJobs(home).length, codeRoot: identity.codeRoot, codeCommit: identity.codeCommit, codeVersion: identity.codeVersion, summarizer: summarizerSummary(currentSummarizer(home, process.env)) })
       return
     }
     if (req.method !== "POST") {

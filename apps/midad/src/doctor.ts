@@ -110,6 +110,12 @@ interface DoctorLiveDeps extends DoctorDeps {
   watchMs?: number
   /** Starts the throwaway headless session; the default spawns the real tool. */
   startSession?: (tool: InstallTool, cwd: string) => { stop(): void }
+  /**
+   * Replaces a service left over from an older install — the same stale-service swap plain
+   * `mida doctor` does. Called only AFTER this check's own refusals pass, so a refused
+   * `--live` never touches a running service (UF-QC).
+   */
+  replaceStaleService?: () => Promise<void>
 }
 
 /** What the chain checks need; built lazily once the network has been resolved. */
@@ -441,19 +447,21 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         }
         // any answer at all used to read as healthy — only 200 with { ok: true } is midad;
         // anything else is a problem that names the status it actually got
-        const body = reply.body as { ok?: unknown; codeRoot?: unknown; codeCommit?: unknown } | null
+        const body = reply.body as { ok?: unknown; codeRoot?: unknown; codeCommit?: unknown; codeVersion?: unknown } | null
         if (!(reply.status === 200 && body !== null && typeof body === "object" && body.ok === true)) {
           return [problem(`midad answered with status ${reply.status}, not ok:true`, "restart midad")]
         }
         // an answering midad must also be running THIS code — a service from another checkout
-        // quietly serves agent commands with the wrong build
+        // quietly serves agent commands with the wrong build, and one at the same folder on an
+        // older package version is other code too (UF-QC: its reply simply carries no version)
         const lines = ["ok: midad answers"]
         const self = codeIdentity()
         const codeRoot = typeof body.codeRoot === "string" ? body.codeRoot : undefined
         const codeCommit = typeof body.codeCommit === "string" ? body.codeCommit : undefined
+        const codeVersion = typeof body.codeVersion === "string" ? body.codeVersion : undefined
         if (codeRoot === undefined || codeCommit === undefined) {
           lines.push(problem("midad predates code reporting", "run any mida command to replace it"))
-        } else if (codeRoot === self.codeRoot && codeCommit === self.codeCommit) {
+        } else if (codeRoot === self.codeRoot && codeCommit === self.codeCommit && codeVersion === self.codeVersion) {
           lines.push(`ok: midad runs ${codeRoot} @ ${codeCommit.slice(0, 7)}; this command runs the same`)
         } else {
           lines.push(problem(`midad runs ${codeRoot} @ ${codeCommit.slice(0, 7)}; this command runs ${self.codeRoot} @ ${self.codeCommit.slice(0, 7)}`, "run any mida command to replace it"))
@@ -1407,6 +1415,8 @@ export async function runDoctorLive(tool: InstallTool, deps: DoctorLiveDeps): Pr
     deps.print("refused: live checks need an interactive terminal")
     return 2
   }
+  // only now may the service be looked at: every refusal above leaves it exactly as found
+  await deps.replaceStaleService?.()
   const started = (deps.now ?? Date.now)()
   const deadline = started + (deps.watchMs ?? LIVE_WATCH_MS)
   const cwd = mkdtempSync(join(tmpdir(), "mida-live-"))

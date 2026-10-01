@@ -252,12 +252,15 @@ export async function ensureCurrentDaemon(
     if (options.whenDown === "leave") return { up: false }
     return { up: await ensureDaemon(home, spawn, { waitMs: options.waitMs }) }
   }
-  const body = probe.body as { codeRoot?: unknown; codeCommit?: unknown; pid?: unknown } | null
+  const body = probe.body as { codeRoot?: unknown; codeCommit?: unknown; codeVersion?: unknown; pid?: unknown } | null
   const codeRoot = typeof body?.codeRoot === "string" ? body.codeRoot : undefined
   const codeCommit = typeof body?.codeCommit === "string" ? body.codeCommit : undefined
+  const codeVersion = typeof body?.codeVersion === "string" ? body.codeVersion : undefined
   const pid = typeof body?.pid === "number" ? body.pid : -1
   const pidText = typeof body?.pid === "number" ? String(body.pid) : "?"
-  if (codeRoot === self.codeRoot && codeCommit === self.codeCommit) return { up: true }
+  // same code means all three agree — a service from before version reporting answers no
+  // codeVersion at all, and that absence differs from any version this command carries (UF-QC)
+  if (codeRoot === self.codeRoot && codeCommit === self.codeCommit && codeVersion === self.codeVersion) return { up: true }
 
   const replaced = { codeRoot: codeRoot ?? "unknown", codeCommit: codeCommit ?? "unknown", pid }
   await callDaemon(home, "/shutdown", {}, { timeoutMs: 2_000 })

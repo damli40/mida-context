@@ -2784,8 +2784,10 @@ async function main(): Promise<void> {
         process.exitCode = 2
         return
       }
-      await replaceStaleService()
-      process.exitCode = await runDoctorLive(tool as InstallTool, { home, print })
+      // the stale-service swap lives inside runDoctorLive so its own refusals (CI, no
+      // terminal) are checked BEFORE the service is looked at — a refused --live replaces
+      // nothing (UF-QC). The bad-tool-name guard above already refused before this point.
+      process.exitCode = await runDoctorLive(tool as InstallTool, { home, print, replaceStaleService })
       return
     }
     if (argv.length !== 1) {
