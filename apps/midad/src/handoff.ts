@@ -832,7 +832,9 @@ export async function buildHandoff(
       savedBy,
       savedAt: newest?.createdAt ?? "",
       seen: covered,
-      limitChars: rendered.limitChars,
+      // UF-J: the log pairs the final text's size with the target it is judged against —
+      // the marked blocks' share shrinks the merge's render budget, but never the real limit
+      limitChars: HANDOFF_MAX_CHARS,
       cut: rendered.cut,
       reasonsLeftOut: rendered.reasonsLeftOut,
       // UF-H: oversized answers for what the model actually receives — the partial line and the

@@ -97,6 +97,41 @@ describe("sessionStartMessage", () => {
     expect(sessionStartMessage(both, "codex", NOW)).toContain("(older entries trimmed; still above the size target)")
   })
 
+  // UF-J: the size part names WHAT was left out — "older entries" for a history cut,
+  // "reasons" for dropped because/why, both words when both went — and "above the size
+  // target" is said whenever the delivered text is still over. All eight states.
+  describe("the size part names what was left out (UF-J)", () => {
+    const sizeOf = (over: Record<string, unknown>): string | null => {
+      const line = sessionStartMessage({ kind: "handoff", text: "CTX", checkpoints: 1, facts: 0, ...over }, "codex", NOW)
+      const m = /^Mida: handoff loaded — 1 checkpoint, 0 facts(?: \((.*)\))?$/.exec(line)
+      expect(m).not.toBeNull()
+      return m![1] ?? null
+    }
+    const cases: [over: Record<string, unknown>, want: string | null][] = [
+      [{}, null],
+      [{ oversized: true }, "above the size target"],
+      [{ cut: true }, "older entries trimmed to fit"],
+      [{ cut: true, oversized: true }, "older entries trimmed; still above the size target"],
+      [{ reasonsLeftOut: true }, "reasons trimmed to fit"],
+      [{ reasonsLeftOut: true, oversized: true }, "reasons trimmed; still above the size target"],
+      [{ cut: true, reasonsLeftOut: true }, "older entries and reasons trimmed to fit"],
+      [{ cut: true, reasonsLeftOut: true, oversized: true }, "older entries and reasons trimmed; still above the size target"],
+    ]
+    for (const [over, want] of cases) {
+      it(`cut=${over.cut === true} reasons=${over.reasonsLeftOut === true} oversized=${over.oversized === true} → ${want === null ? "no size text" : want}`, () => {
+        expect(sizeOf(over)).toBe(want)
+      })
+    }
+    it("the partial clause still joins after any size part", () => {
+      const line = sessionStartMessage(
+        { kind: "handoff", text: "CTX", checkpoints: 1, facts: 0, reasonsLeftOut: true, oversized: true, partial: true },
+        "codex",
+        NOW,
+      )
+      expect(line).toContain("(reasons trimmed; still above the size target; incomplete — try again in a moment)")
+    })
+  })
+
   it("a partial store list joins after the size part with '; ' — never a comma list of states (in-20 T-3)", () => {
     const body = {
       kind: "handoff",

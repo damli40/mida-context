@@ -129,19 +129,30 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
         : ""
     // honest size state in plain words (in-20 T-3): the "(shortened, longer than the
     // limit)" pair read like a contradiction and a failure. What happened is said
-    // instead — "trimmed" only when progress was actually left out, "above the size
+    // instead — "trimmed" only when something was actually left out, "above the size
     // target" when the text is still over, and the two combine with "; still" so a
     // trimmed handoff that remains over never reads as two separate problems (R5-4).
+    // UF-J: "trimmed" now names WHAT went — "older entries" for a history cut, "reasons"
+    // for the reasons behind decisions and rejected approaches, both when both went —
+    // so the owner never hears "trimmed" for a rule the text kept silent about.
     // A partial store list joins with "; " after the size part: the owner hears
     // "incomplete", never a count that looks whole (M3-D).
+    const what =
+      body.cut === true && body.reasonsLeftOut === true
+        ? "older entries and reasons"
+        : body.cut === true
+          ? "older entries"
+          : body.reasonsLeftOut === true
+            ? "reasons"
+            : null
     const size =
-      body.cut === true
+      what === null
         ? body.oversized === true
-          ? "older entries trimmed; still above the size target"
-          : "older entries trimmed to fit"
-        : body.oversized === true
           ? "above the size target"
           : null
+        : body.oversized === true
+          ? `${what} trimmed; still above the size target`
+          : `${what} trimmed to fit`
     const state = size !== null
       ? ` (${size}${body.partial === true ? "; incomplete — try again in a moment" : ""})`
       : body.partial === true

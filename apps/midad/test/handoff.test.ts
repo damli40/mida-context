@@ -611,6 +611,18 @@ describe("buildHandoff", () => {
     expect(result.text.length).toBeLessThanOrEqual(result.limitChars)
   })
 
+  // UF-J: marked blocks reduce the merge's render budget, but the log's limitChars must still
+  // report the real 8,000-char target the final text is judged against — never the reduced one.
+  it("limitChars reports the real 8,000 target even when a marked block shrank the merge's budget (UF-J)", async () => {
+    const progress = Array.from({ length: 400 }, (_, i) => `progress entry number ${i} ${"x".repeat(60)}`)
+    const pending = { ...stored({ nextAction: "ship it" }), anchor: "PENDING_ANCHOR" as const }
+    const { d } = deps({ read: async () => ({ checkpoints: [stored({ progress }), pending], skipped: 0, milliseconds: 1, partial: false }) })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toMatchObject({ kind: "handoff", cut: true, limitChars: 8000, oversized: false })
+    if (result.kind !== "handoff") return
+    expect(result.text.length).toBeLessThanOrEqual(result.limitChars)
+  })
+
   it("a handoff that could not fit reports oversized instead of cut — the truth, not a guess (R5-4)", async () => {
     const { d } = deps({
       read: async () => ({ checkpoints: [stored({ originalRequest: "r".repeat(9000) })], skipped: 0, milliseconds: 1, partial: false }),
