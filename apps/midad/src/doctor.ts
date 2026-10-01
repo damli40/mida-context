@@ -133,8 +133,8 @@ interface Shared {
    */
   serviceUp?: boolean
   /**
-   * The /health body the daemon check last received — the compile-model check reads
-   * `summarizer.chain` from it to compare the running service's models against this shell's (UF-P3).
+   * The /health body the daemon check last received — the compile-model check builds its lines
+   * from the reply's `summarizer` entries and chain when they are present (UF-QC).
    */
   healthBody?: unknown
 }
@@ -389,6 +389,136 @@ function hookPathProblems(commands: string[] | "absent" | "unreadable", tool: In
     }
   }
   return [...problems]
+}
+
+/**
+ * What the compile-model check builds its lines from (UF-QC): the mode in force, every entry
+ * the mode names (installed or not), and the labels that can actually run, in order. The
+ * entries' `command.env` exists only on the shell's own resolution — a service-built view
+ * cannot see the service's environment, so the env-variable PROBLEM runs only locally.
+ */
+interface CompileModelView {
+  mode: string
+  invalid: boolean
+  entries: {
+    id: string
+    label: string
+    display: string
+    host: string | undefined
+    installed: boolean
+    command?: SummarizerEntry["command"]
+  }[]
+  chain: string[]
+  /** true when the view is this shell's resolution — the env-var checks can only run there */
+  local: boolean
+}
+
+/** The service's summarizer answer, when its /health reply carries `entries` and `chain`. */
+function remoteSummarizerView(body: unknown): CompileModelView | undefined {
+  const summarizer = (body as { summarizer?: unknown } | null | undefined)?.summarizer
+  if (typeof summarizer !== "object" || summarizer === null) return undefined
+  const raw = summarizer as Record<string, unknown>
+  if (!Array.isArray(raw.entries) || !Array.isArray(raw.chain)) return undefined
+  const entries = raw.entries
+    .filter((e): e is Record<string, unknown> => typeof e === "object" && e !== null)
+    .map((e) => ({
+      id: typeof e.id === "string" ? e.id : "",
+      label: typeof e.label === "string" ? e.label : "",
+      display: typeof e.display === "string" ? e.display : "",
+      host: typeof e.host === "string" ? e.host : undefined,
+      installed: e.installed === true,
+    }))
+  return {
+    mode: typeof raw.mode === "string" ? raw.mode : "",
+    invalid: raw.invalid === true,
+    entries,
+    chain: raw.chain.filter((label): label is string => typeof label === "string"),
+    local: false,
+  }
+}
+
+function localSummarizerView(choice: ReturnType<typeof currentSummarizer>): CompileModelView {
+  return {
+    mode: choice.mode,
+    invalid: choice.invalid,
+    entries: choice.entries,
+    chain: choice.chain.map((entry) => entry.label),
+    local: true,
+  }
+}
+
+/** The compile-model lines for one view — the service's own answer or this shell's resolution. */
+function compileModelLines(view: CompileModelView, env: NodeJS.ProcessEnv): string[] {
+  if (view.invalid) {
+    return [
+      "PROBLEM: the saved summariser choice (summarizer.json) cannot be read, so no session is being saved. Run mida summarizer use agents, or mida summarizer use key.",
+    ]
+  }
+  if (view.chain.length === 0) {
+    return [
+      "PROBLEM: no model can write Mida's summaries, so no session is being saved. Install Claude Code or Codex, or run mida summarizer use key.",
+    ]
+  }
+  const byLabel = new Map(view.entries.map((entry) => [entry.label, entry]))
+  const nameOf = (entry: CompileModelView["entries"][number]) => (entry.id === "claude" || entry.id === "codex" ? entry.label : entry.id)
+  // a fallback names where the text would be SENT — the host in brackets, the name alone when
+  // the entry reports none
+  const fallbackText = (label: string) => {
+    const entry = byLabel.get(label)
+    const name = entry === undefined ? label : nameOf(entry)
+    return entry !== undefined && entry.host !== undefined && entry.host !== "" ? `${name} (${entry.host})` : name
+  }
+  const headLabel = view.chain[0]!
+  const head = byLabel.get(headLabel)
+  const rest = view.chain.slice(1)
+  const fallbackClause = rest.length === 0 ? "no fallback" : `a failed call falls back to ${rest.map(fallbackText).join(", then ")}`
+  const lines = [`ok: compile model is ${headLabel}`]
+  if (head?.id === "custom") {
+    lines.push(`note: compile text is sent to ${head.host ?? "an address that does not parse"} (your own endpoint); ${fallbackClause}`)
+    // a pinned custom under ENVIRONMENT control without its required vars fails every compile —
+    // name the vars, never values; a saved choice pins them on the command's env, so this check
+    // exists only when the environment is the decider and only this shell's env is visible
+    if (view.local && view.mode === "environment") {
+      const missing = [COMPILE_PROVIDERS.custom.baseVar, COMPILE_PROVIDERS.custom.modelVar].filter(
+        (v) => (env[v] ?? head.command?.env?.[v]) === undefined || (env[v] ?? head.command?.env?.[v]) === "",
+      )
+      if (missing.length > 0) {
+        lines.push(problem(`MIDA_COMPILE_MODEL=custom needs ${missing.join(" and ")}`, "set them or unset MIDA_COMPILE_MODEL"))
+      }
+    }
+  } else {
+    const via = head?.id === "claude" ? " via the claude CLI" : head?.id === "codex" ? " via the codex CLI" : ""
+    lines.push(
+      `note: ${head === undefined ? headLabel : nameOf(head)} sends the session's transcript text to ${head?.host ?? "an address that does not parse"}${via} (secrets are scrubbed first); ${fallbackClause}`,
+    )
+  }
+  // an overridden base URL on a NAMED provider in the chain means the key and the transcript
+  // go somewhere other than the vendor — the owner must see which HOST that is; the full URL
+  // is never printed (its path or query may be secret). Only while the environment decides:
+  // a saved choice pins its own endpoint and makes these variables irrelevant.
+  if (view.mode === "environment") {
+    for (const entry of view.entries) {
+      if (entry.id !== "deepseek" && entry.id !== "kimi") continue
+      const table = COMPILE_PROVIDERS[entry.id]
+      // locally the override is only live when the variable is actually set; a service-built
+      // view has no env to consult, so its reported host alone decides
+      if (view.local && env[table.baseVar] === undefined && entry.command?.env?.[table.baseVar] === undefined) continue
+      const vendor = entry.id === "deepseek" ? "DeepSeek" : "Moonshot"
+      const defaultHost = new URL(table.baseDefault).host
+      const host = entry.host !== undefined && entry.host !== "" ? entry.host : "an address that does not parse"
+      if (host !== defaultHost) {
+        lines.push(problem(`compile text is being sent to ${host}, not ${vendor}`, `unset ${table.baseVar} to compile against ${vendor}`))
+      }
+    }
+  }
+  // an entry that is not installed cannot serve the chain — name it so a "no fallback" or
+  // short chain does not read as a choice the owner made
+  for (const entry of view.entries) {
+    if (!entry.installed) {
+      lines.push(`note: ${entry.display} is not installed, so Mida cannot use it.`)
+    }
+  }
+  return lines
 }
 
 /** One line per check, in the order the spec fixes. Each returns its lines; it never decides. */
@@ -887,77 +1017,30 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
     {
       name: "compile-model",
       run: async () => {
-        // UF-P3: the check resolves through currentSummarizer — the SAME function the service
-        // and the drainer use — so the reported chain is the one a save would run: a saved
-        // choice file, the environment, or the agent tools, installed or not.
+        // UF-QC: the check describes the RUNNING service's chain when /health carries one —
+        // the service may see other tools on PATH than this shell, so its entries and chain
+        // build every line, and the local resolution only fills in when the service cannot
+        // or did not say (UF-P3: both resolve through currentSummarizer, the same function
+        // the service and the drainer use).
         const env = deps.env ?? process.env
         const choice = currentSummarizer(home, env, { onPath: deps.onPath, claudeSafeMode: deps.claudeSafeMode })
-        if (choice.invalid) {
-          return [
-            "PROBLEM: the saved summariser choice (summarizer.json) cannot be read, so no session is being saved. Run mida summarizer use agents, or mida summarizer use key.",
-          ]
-        }
-        if (choice.chain.length === 0) {
-          return [
-            "PROBLEM: no model can write Mida's summaries, so no session is being saved. Install Claude Code or Codex, or run mida summarizer use key.",
-          ]
-        }
-        const lines = [`ok: compile model is ${choice.chain[0]!.label}`]
-        const head = choice.chain[0]!
-        const rest = choice.chain.slice(1)
-        const nameOf = (entry: SummarizerEntry) => (entry.id === "claude" || entry.id === "codex" ? entry.label : entry.id)
-        const fallbackClause = rest.length === 0 ? "no fallback" : `a failed call falls back to ${rest.map(nameOf).join(", then ")}`
-        if (head.id === "custom") {
-          lines.push(`note: compile text is sent to ${head.host ?? "an address that does not parse"} (your own endpoint); ${fallbackClause}`)
-          // a pinned custom without its required vars fails every compile — name the vars, never
-          // values; a saved choice pins them on the command's env, the environment on itself
-          const missing = [COMPILE_PROVIDERS.custom.baseVar, COMPILE_PROVIDERS.custom.modelVar].filter(
-            (v) => (env[v] ?? head.command.env?.[v]) === undefined || (env[v] ?? head.command.env?.[v]) === "",
-          )
-          if (missing.length > 0) {
-            lines.push(problem(`MIDA_COMPILE_MODEL=custom needs ${missing.join(" and ")}`, "set them or unset MIDA_COMPILE_MODEL"))
-          }
-        } else {
-          const via = head.id === "claude" ? " via the claude CLI" : head.id === "codex" ? " via the codex CLI" : ""
-          lines.push(
-            `note: ${nameOf(head)} sends the session's transcript text to ${head.host ?? "an address that does not parse"}${via} (secrets are scrubbed first); ${fallbackClause}`,
-          )
-        }
-        // an overridden base URL on a NAMED provider in the chain means the key and the transcript
-        // go somewhere other than the vendor — the owner must see which HOST that is; the full URL
-        // is never printed (its path or query may be secret). A custom base URL is not a problem:
-        // it IS the endpoint the user chose.
-        for (const entry of choice.entries) {
-          if (entry.id !== "deepseek" && entry.id !== "kimi") continue
-          const table = COMPILE_PROVIDERS[entry.id]
-          if (env[table.baseVar] === undefined && entry.command.env?.[table.baseVar] === undefined) continue
-          const vendor = entry.id === "deepseek" ? "DeepSeek" : "Moonshot"
-          const defaultHost = new URL(table.baseDefault).host
-          const host = entry.host !== undefined && entry.host !== "" ? entry.host : "an address that does not parse"
-          if (host !== defaultHost) {
-            lines.push(problem(`compile text is being sent to ${host}, not ${vendor}`, `unset ${table.baseVar} to compile against ${vendor}`))
-          }
-        }
-        // UF-P3: an agent entry that is not installed cannot serve as the backup — name it so a
-        // "no fallback"/short chain does not read as a choice the owner made
-        for (const entry of choice.entries) {
-          if ((entry.id === "claude" || entry.id === "codex") && !entry.installed) {
-            lines.push(`note: ${entry.display} is not installed, so it cannot be the backup.`)
-          }
-        }
-        // UF-P3: the RUNNING service resolved this chain at its own start-up under its own
-        // environment — when /health reports different labels, the service's answer is the one
-        // that counts and the note says which is which
-        const running = (shared.healthBody as { summarizer?: { chain?: unknown } } | null | undefined)?.summarizer?.chain
-        if (Array.isArray(running)) {
-          const theirs = running.filter((label): label is string => typeof label === "string")
+        const remote = remoteSummarizerView(shared.healthBody)
+        if (remote !== undefined) {
+          const lines = compileModelLines(remote, env)
           const mine = choice.chain.map((entry) => entry.label)
-          if (theirs.join(", ") !== mine.join(", ")) {
+          if (remote.chain.join(", ") !== mine.join(", ")) {
             lines.push(
-              `note: the running Mida service uses ${theirs.join(", ") || "none"}; this shell would use ${mine.join(", ") || "none"}. The service's answer is the one that counts.`,
+              `note: the running Mida service uses ${remote.chain.join(", ") || "none"}; this shell would use ${mine.join(", ") || "none"}. The service's answer is the one that counts.`,
             )
           }
+          return lines
         }
+        const lines = compileModelLines(localSummarizerView(choice), env)
+        lines.push(
+          shared.serviceUp === true
+            ? "note: the running Mida service did not say which model it uses; the lines above describe this shell."
+            : "note: the Mida service is not running; the lines above describe what it would use if started from this shell.",
+        )
         return lines
       },
     },

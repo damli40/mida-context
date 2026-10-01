@@ -600,21 +600,21 @@ describe("mida doctor without a chain", () => {
     const deepseek = await run({ DEEPSEEK_API_KEY: "test-key" })
     expect(deepseek).toContain("ok: compile model is deepseek-flash")
     expect(deepseek).toContain(
-      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to claude-haiku, then codex-luna",
+      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to claude-haiku (api.anthropic.com), then codex-luna (api.openai.com)",
     )
     expect(deepseek.join("\n")).not.toContain("test-key")
 
     // both keys: the note names the full real chain
     const both = await run({ DEEPSEEK_API_KEY: "d", KIMI_API_KEY: "k" })
     expect(both).toContain(
-      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to kimi, then claude-haiku, then codex-luna",
+      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to kimi (api.moonshot.ai), then claude-haiku (api.anthropic.com), then codex-luna (api.openai.com)",
     )
 
     // kimi alone: Moonshot is where the text goes
     const kimi = await run({ KIMI_API_KEY: "test-key" })
     expect(kimi).toContain("ok: compile model is kimi-k2.7-code-highspeed")
     expect(kimi).toContain(
-      "note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to claude-haiku, then codex-luna",
+      "note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to claude-haiku (api.anthropic.com), then codex-luna (api.openai.com)",
     )
     expect(kimi.join("\n")).not.toContain("test-key")
     expect(kimi.some((line) => line.includes("not Moonshot"))).toBe(false)
@@ -648,7 +648,7 @@ describe("mida doctor without a chain", () => {
       claudeSafeMode: () => false,
     })
     expect(withFallback).toContain(
-      "note: compile text is sent to 127.0.0.1:11434 (your own endpoint); a failed call falls back to deepseek, then kimi, then claude-haiku",
+      "note: compile text is sent to 127.0.0.1:11434 (your own endpoint); a failed call falls back to deepseek (api.deepseek.com), then kimi (api.moonshot.ai), then claude-haiku (api.anthropic.com)",
     )
 
     // a pinned custom missing its required vars is a PROBLEM — every compile would fail
@@ -721,7 +721,7 @@ describe("mida doctor without a chain", () => {
     expect(lines).toContain(
       "note: codex-luna sends the session's transcript text to api.openai.com via the codex CLI (secrets are scrubbed first); no fallback",
     )
-    expect(lines).toContain("note: Claude Code (haiku) is not installed, so it cannot be the backup.")
+    expect(lines).toContain("note: Claude Code (haiku) is not installed, so Mida cannot use it.")
   })
 
   it("with neither agent tool the compile-model check is one PROBLEM line and nothing else (UF-P3)", async () => {
@@ -789,7 +789,13 @@ describe("mida doctor without a chain", () => {
       codeRoot: codeIdentity().codeRoot,
       codeCommit: codeIdentity().codeCommit,
       codeVersion: codeIdentity().codeVersion,
-      summarizer: { chain: ["deepseek-flash"] },
+      summarizer: {
+        mode: "key",
+        chosen: true,
+        invalid: false,
+        entries: [{ id: "deepseek", label: "deepseek-flash", display: "DeepSeek (deepseek-flash)", host: "api.deepseek.com", installed: true }],
+        chain: ["deepseek-flash"],
+      },
     })
     try {
       const lines: string[] = []
@@ -852,7 +858,16 @@ describe("mida doctor without a chain", () => {
       codeRoot: codeIdentity().codeRoot,
       codeCommit: codeIdentity().codeCommit,
       codeVersion: codeIdentity().codeVersion,
-      summarizer: { chain: ["claude-haiku", "codex-luna"] },
+      summarizer: {
+        mode: "agents",
+        chosen: true,
+        invalid: false,
+        entries: [
+          { id: "claude", label: "claude-haiku", display: "Claude Code (haiku)", host: "api.anthropic.com", installed: true },
+          { id: "codex", label: "codex-luna", display: "Codex (luna)", host: "api.openai.com", installed: true },
+        ],
+        chain: ["claude-haiku", "codex-luna"],
+      },
     })
     try {
       const lines: string[] = []
@@ -869,6 +884,148 @@ describe("mida doctor without a chain", () => {
     } finally {
       await closeServer(server)
     }
+  })
+
+  // UF-QC: the compile-model check describes the RUNNING service's chain — the entries and the
+  // chain labels in its /health reply — not the chain this shell would resolve. The local
+  // resolution is only the fallback when the service cannot or did not say.
+  const selfIdentity = () => ({ codeRoot: codeIdentity().codeRoot, codeCommit: codeIdentity().codeCommit, codeVersion: codeIdentity().codeVersion })
+  const agentEntries = (claudeInstalled: boolean, codexInstalled: boolean) => [
+    { id: "claude", label: "claude-haiku", display: "Claude Code (haiku)", host: "api.anthropic.com", installed: claudeInstalled },
+    { id: "codex", label: "codex-luna", display: "Codex (luna)", host: "api.openai.com", installed: codexInstalled },
+  ]
+
+  it("the service reporting an empty chain is the PROBLEM even when this shell has both tools (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      ...selfIdentity(),
+      summarizer: { mode: "agents", chosen: true, invalid: false, entries: agentEntries(true, true), chain: [] },
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
+      expect(lines.filter((line) => line.includes("no model can write Mida's summaries"))).toHaveLength(1)
+      expect(lines.some((line) => line.includes("compile model is"))).toBe(false)
+      expect(lines).toContain(
+        "note: the running Mida service uses none; this shell would use claude-haiku, codex-luna. The service's answer is the one that counts.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a service with only codex-luna is ok even when this shell has no tool at all (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      ...selfIdentity(),
+      summarizer: { mode: "agents", chosen: true, invalid: false, entries: agentEntries(false, true), chain: ["codex-luna"] },
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => false,
+      })
+      expect(lines).toContain("ok: compile model is codex-luna")
+      expect(lines).toContain(
+        "note: the running Mida service uses codex-luna; this shell would use none. The service's answer is the one that counts.",
+      )
+      // the service's Claude is not installed, and the note says so in its own words
+      expect(lines).toContain("note: Claude Code (haiku) is not installed, so Mida cannot use it.")
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("with no service the lines are this shell's chain plus the not-running note (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      onPath: () => true,
+      claudeSafeMode: () => false,
+    })
+    expect(lines).toContain("ok: compile model is claude-haiku")
+    expect(lines).toContain("note: the Mida service is not running; the lines above describe what it would use if started from this shell.")
+  })
+
+  it("a service whose reply carries no summarizer field gets the did-not-say note (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true, ...selfIdentity() })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
+      expect(lines).toContain("ok: compile model is claude-haiku")
+      expect(lines).toContain("note: the running Mida service did not say which model it uses; the lines above describe this shell.")
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("the fallback clause names each fallback's host (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      ...selfIdentity(),
+      summarizer: { mode: "agents", chosen: true, invalid: false, entries: agentEntries(true, true), chain: ["claude-haiku", "codex-luna"] },
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
+      expect(lines.some((line) => line.includes("a failed call falls back to codex-luna (api.openai.com)"))).toBe(true)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a saved custom choice with an empty MIDA_COMPILE_BASE_URL prints no needs line (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    writeSummarizer(home, { use: "key", provider: "custom", apiKey: "k", baseUrl: "https://x.example/v1", model: "m" })
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: { MIDA_COMPILE_BASE_URL: "" },
+      daemonProbeMs: 50,
+      onPath: () => true,
+      claudeSafeMode: () => false,
+    })
+    expect(lines.some((line) => line.includes("MIDA_COMPILE_MODEL=custom needs"))).toBe(false)
   })
 
   it("the environment check lists every compile-provider variable — set or unset, never a value (M3-D5)", async () => {
