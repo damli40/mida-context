@@ -759,8 +759,19 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
   }
 }
 
-/** The one prompt `mida summarizer test` sends — any answer holding this shape proves the model writes JSON. */
-const PROBE_PROMPT = 'Reply with exactly this JSON and nothing else: {"objective":"test","nextAction":"none"}'
+/**
+ * The throwaway session `mida summarizer test` turns into the real extraction prompt: the
+ * one-line "reply with JSON" prompt read to Claude's small model as an injection attempt and
+ * made the test report a working model as broken (UF-P2R). Five lines, `\n`-ended.
+ */
+export const PROBE_TRANSCRIPT =
+  [
+    "L1 user:",
+    'Add a hello() function to src/hello.ts that returns "hello". Use pnpm, never npm.',
+    "",
+    "L2 assistant:",
+    'Created src/hello.ts with hello() returning "hello". The test file is not written yet.',
+  ].join("\n") + "\n"
 
 /**
  * `mida summarizer test` (UF-P2a): run the command once and classify the outcome. `ok` needs an
@@ -770,7 +781,7 @@ const PROBE_PROMPT = 'Reply with exactly this JSON and nothing else: {"objective
 export async function probeModel(
   command: ModelCommand,
 ): Promise<{ ok: true; ms: number } | { ok: false; why: "limit" | "missing" | "timeout" | "failed"; detail: string; ms: number }> {
-  const run = await runModel(command, PROBE_PROMPT)
+  const run = await runModel(command, buildExtractPrompt(PROBE_TRANSCRIPT))
   if (run.ok) {
     const obj = extractJsonObject(run.stdout)
     if (typeof obj === "object" && obj !== null && typeof (obj as Record<string, unknown>).objective === "string") {

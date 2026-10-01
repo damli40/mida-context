@@ -683,6 +683,13 @@ export async function followPendingAnchors(
       continue
     }
     if (answer.state === "ANCHORED") {
+      // the kept plaintext names which model wrote the save — the direct lane logs it as
+      // `model` (envelope.compiledBy); a batched saved line must carry the same field
+      const kept = pendingPlaintext(runtime.home, entry.contextId)
+      const writer =
+        kept !== undefined && typeof kept.value === "object" && kept.value !== null
+          ? (kept.value as Record<string, unknown>).compiledBy
+          : undefined
       removePendingAnchor(runtime.home, entry.contextId)
       dropPendingPlaintext(runtime.home, entry.contextId)
       counts.anchored += 1
@@ -694,6 +701,7 @@ export async function followPendingAnchors(
         lane: "batched",
         contextId: entry.contextId,
         batchId: answer.item?.batchId ?? null,
+        ...(typeof writer === "string" ? { model: writer } : {}),
       })
     } else if (answer.state === "REJECTED") {
       const reason = answer.reason ?? "unknown"

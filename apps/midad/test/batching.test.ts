@@ -601,13 +601,16 @@ describe("followPendingAnchors — the ledger's follow-up", () => {
     const store = await stubStore()
     try {
       const home = homeWithPending()
+      // the kept plaintext names which model wrote the save — the batched lane's saved line
+      // must carry it the way the direct lane does (UF-P2R)
+      keepPendingPlaintext(home, CONTEXT_ID, { value: { ...saveInput, compiledBy: "codex-luna" } })
       const batchId = `0x${"b1".repeat(32)}` as Hex
       store.saves.set(CONTEXT_ID, { state: "ANCHORED", reason: null, batchId })
       const logged: Record<string, unknown>[] = []
       const counts = await followPendingAnchors(fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url }), (r) => logged.push(r))
       expect(counts).toEqual({ anchored: 1, rejected: 0, waiting: 0 })
       expect(pendingAnchors(home)).toHaveLength(0)
-      expect(logged).toEqual([expect.objectContaining({ outcome: "saved", lane: "batched", contextId: CONTEXT_ID, batchId, sessionId: SESSION_ID, eventId: EVENT_ID })])
+      expect(logged).toEqual([expect.objectContaining({ outcome: "saved", lane: "batched", contextId: CONTEXT_ID, batchId, sessionId: SESSION_ID, eventId: EVENT_ID, model: "codex-luna" })])
     } finally {
       await store.close()
     }

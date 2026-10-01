@@ -246,12 +246,24 @@ async function showSummarizer(deps: SummarizerCliDeps): Promise<number> {
         failed++
       }
     }
-    print(`Last 24 hours: ${written} written, ${failed} failed`)
+    print(`Last 24 hours: ${written} written, ${failed} failed tries`)
   }
 
-  const running = remoteChain(await deps.health?.())
+  const healthReply = await deps.health?.()
+  // a reply with no summarizer field is a service started by an older version — it never
+  // read this home's choice, so name that instead of comparing chains
+  const serviceIsOlder =
+    healthReply !== undefined &&
+    (typeof healthReply !== "object" ||
+      healthReply === null ||
+      typeof (healthReply as Record<string, unknown>).summarizer !== "object" ||
+      (healthReply as Record<string, unknown>).summarizer === null)
+  if (serviceIsOlder) {
+    print("Note: the running Mida service is an older version and does not read this choice. Run mida doctor to restart it.")
+  }
+  const running = remoteChain(healthReply)
   const local = choice.chain.map((entry) => entry.label)
-  if (running !== undefined && (running.length !== local.length || running.some((label, index) => label !== local[index]))) {
+  if (!serviceIsOlder && running !== undefined && (running.length !== local.length || running.some((label, index) => label !== local[index]))) {
     const theirs = running.join(", ") || "none"
     const ours = local.join(", ") || "none"
     print(`Note: the running Mida service uses ${theirs}. This shell would use ${ours}. The service's answer is the one that counts.`)
@@ -492,6 +504,7 @@ export async function runSummarizer(argv: string[], deps: SummarizerCliDeps): Pr
         print(`${entry.display} could not write it: its command is not installed.`)
         continue
       }
+      print(`Asking ${entry.display} for a test summary. This can take up to ${Math.round((entry.command.timeoutMs ?? 90_000) / 1000)} s.`)
       const r = await probe(entry.command)
       if (r.ok) {
         print(`Wrote one test summary with ${entry.display} in ${Math.max(1, Math.round(r.ms / 1000))} s.`)
