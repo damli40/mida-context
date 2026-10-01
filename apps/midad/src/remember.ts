@@ -172,9 +172,11 @@ function factText(value: unknown): string | null {
 export async function readOwnerFacts(
   runtime: ServiceRuntime,
   name: string,
-  // PROV-13: `onDenied` hears each area this agent holds no grant for — the list stays silent about
-  // it (the handoff wants that), but `mida read` must not print "nothing saved" for "no access"
-  options: { history?: boolean; onDenied?: (namespace: string) => void } = {},
+  // PROV-13: `onDenied` hears each area the store refused, with the refusal code — the list stays
+  // silent about it (the handoff wants that), but `mida read` must not print "nothing saved" for
+  // "no access". With a listener, an expired or revoked grant is reported for its area too,
+  // instead of aborting the whole read; without one (the handoff), those still throw as before.
+  options: { history?: boolean; onDenied?: (namespace: string, code: string) => void } = {},
 ): Promise<OwnerFact[]> {
   const agent = runtime.agent(name)
   const { reader, owner } = runtime
@@ -191,8 +193,16 @@ export async function readOwnerFacts(
         return await agent.read(owner, namespace)
       } catch (error) {
         if (isMidaError(error, "CAPABILITY_DENIED")) {
-          options.onDenied?.(namespace)
+          options.onDenied?.(namespace, "CAPABILITY_DENIED")
           return []
+        }
+        if (options.onDenied !== undefined) {
+          for (const code of ["CAPABILITY_EXPIRED", "CAPABILITY_REVOKED"] as const) {
+            if (isMidaError(error, code)) {
+              options.onDenied(namespace, code)
+              return []
+            }
+          }
         }
         throw error
       }

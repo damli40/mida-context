@@ -43,9 +43,11 @@ export function firstQueuedAt(group: readonly CaptureJob[]): string {
 
 /**
  * Records `firstAt` on the job file the drain keeps after a merge, so the session's first queue
- * time survives the older jobs' removal. Hooks only ever create new job files and the drainer holds
- * the queue lock, so rewriting this one cannot race a writer. A write that fails only costs the
- * stamp: the next pass falls back to this job's own `at`, the old behaviour.
+ * time survives the older jobs' removal — written before they are removed, so a crash in between
+ * loses nothing. Hooks only ever create new job files, and the drainer holds the queue lock; a
+ * drainer whose stale lock was taken over could rewrite a job the new one already removed, which
+ * the next pass simply drains. A write that fails only costs the stamp: the next pass falls back to
+ * this job's own `at`, the old behaviour.
  */
 export function stampFirstAt(home: MidaHome, job: CaptureJob, firstAt: string): void {
   if ((job.firstAt ?? job.at) === firstAt) return

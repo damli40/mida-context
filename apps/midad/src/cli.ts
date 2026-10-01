@@ -370,10 +370,10 @@ export async function runCliWithRuntime(
           }
         } else {
           let facts: Awaited<ReturnType<typeof readOwnerFacts>> | null
-          const denied: string[] = []
+          const denied: { namespace: string; code: string }[] = []
           try {
             // the owner's own list keeps history: a superseded fact prints with its replacement
-            facts = await readOwnerFacts(runtime, agent, { history: true, onDenied: (namespace) => denied.push(namespace) })
+            facts = await readOwnerFacts(runtime, agent, { history: true, onDenied: (namespace, code) => denied.push({ namespace, code }) })
           } catch (error) {
             // a list the store calls incomplete is not "no facts" — say so, then still run the attempt
             if (!isMidaError(error, "PARTIAL_READ")) throw error
@@ -395,10 +395,19 @@ export async function runCliWithRuntime(
                 print(`  ${fact.namespace}: ${text} (id ${factShortId(fact.contextId)}, ${factStamp(fact.assertedAt)})${replaced}`)
               }
             }
-            // PROV-13: an area this agent cannot read says so — an empty list would read as "nothing saved"
-            for (const namespace of denied) {
-              if (only === undefined || namespace === only) print(`  ${namespace}: refused CAPABILITY_DENIED (${agent} has no read access to this area)`)
+            // PROV-13: an area the store refused says so — an empty list would read as "nothing saved".
+            // DENIED also covers agent-wide causes (not approved, revoked, a stale key), so its line
+            // names both; a refused area that was asked for by name fails the command, as a refused
+            // projects.current read does.
+            const why: Record<string, string> = {
+              CAPABILITY_DENIED: `the store refused it: ${agent} holds no grant for this area, or is not approved or was revoked`,
+              CAPABILITY_EXPIRED: `${agent}'s grant for this area has expired`,
+              CAPABILITY_REVOKED: `${agent}'s access was revoked`,
             }
+            for (const { namespace, code } of denied) {
+              if (only === undefined || namespace === only) print(`  ${namespace}: refused ${code} (${why[code] ?? "the store refused it"})`)
+            }
+            if (only !== undefined && denied.some((d) => d.namespace === only)) return 1
           }
           if (only === undefined) {
             const attempt = await attemptNamespaceRead(runtime, agent, NAMESPACE)

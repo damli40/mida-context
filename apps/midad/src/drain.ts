@@ -311,8 +311,9 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
       // CAP-28: the session's first queue time survives the merge, so the first-save gap runs from
       // its first event — not from whichever job a previous pass happened to keep
       const firstAt = firstQueuedAt(group)
-      for (const older of group.slice(0, -1)) removeJob(deps.home, older.id)
+      // stamp BEFORE removing the older jobs: a crash in between then loses nothing (review)
       stampFirstAt(deps.home, job, firstAt)
+      for (const older of group.slice(0, -1)) removeJob(deps.home, older.id)
       const flush = group.some((j) => FLUSH_EVENTS.has(j.event))
       try {
         if (now().getTime() - Date.parse(job.at) > DAY_MS) {

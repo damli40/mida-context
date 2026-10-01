@@ -112,14 +112,21 @@ async function f3() {
   const parsed = extractJsonObject(braces)
   const parseMs = performance.now() - t1
 
-  // a 100 MB transcript: the request, ~50 MB of tool output, a message the user typed, ~49 MB more
+  // a 100 MB transcript of tool output with three messages the user typed in the UNREAD middle:
+  // ~1 MB past the 64 KiB head window, at ~50 MB, and ~1 MB before the 60 KB tail window — so a
+  // scan that stops early, or reads only part of the middle, misses one and turns F3 red (review)
   const big = join(dir, "f3-big.jsonl")
   writeFileSync(big, JSON.stringify(userLine("tail marker zzz")) + "\n")
   const fd = fs.openSync(big, "a")
   const toolOutput = Buffer.from(`${JSON.stringify(assistantLine("f".repeat(1024 * 1024 - 64)))}\n`)
-  for (let i = 0; i < 50; i += 1) fs.writeSync(fd, toolOutput)
-  fs.writeSync(fd, Buffer.from(JSON.stringify(userLine("middle typed marker: change the plan")) + "\n"))
+  const typed = (text: string) => fs.writeSync(fd, Buffer.from(JSON.stringify(userLine(text)) + "\n"))
+  fs.writeSync(fd, toolOutput)
+  typed("early typed marker: rename the module")
   for (let i = 0; i < 49; i += 1) fs.writeSync(fd, toolOutput)
+  typed("middle typed marker: change the plan")
+  for (let i = 0; i < 48; i += 1) fs.writeSync(fd, toolOutput)
+  typed("late typed marker: ship on friday")
+  fs.writeSync(fd, toolOutput)
   fs.writeSync(fd, Buffer.from(JSON.stringify(userLine("final tail marker")) + "\n"))
   fs.closeSync(fd)
   // peak memory (maxRSS is a high-water mark, in KB): what the read adds above everything before it.
@@ -130,7 +137,7 @@ async function f3() {
   const read = readConversation(big)
   const readMs = performance.now() - t2
   const extraPeakMb = (process.resourceUsage().maxRSS - peakBeforeKb) / 1024
-  const foundMiddle = read.text.includes("middle typed marker: change the plan")
+  const foundMiddle = ["early typed marker: rename the module", "middle typed marker: change the plan", "late typed marker: ship on friday"].every((m) => read.text.includes(m))
   return {
     pass: renderMs < 60 && parseMs < 1_000 && parsed === undefined && readMs < 1_000 && extraPeakMb < 64 && foundMiddle,
     value: {

@@ -11,7 +11,7 @@ import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { MidaHome, buildHandoff, buildRemember, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, readUnsent, resetOutOfGasWaits, resolveSessionTask, tailOf } from "@mida/midad"
+import { MidaHome, buildHandoff, buildRemember, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, readUnsent, resetOutOfGasWaits, resolveSessionTask, sessionWaits, tailOf } from "@mida/midad"
 import type { DrainDeps, RememberDeps, Runtime, ServiceRuntime, saveCheckpoint } from "@mida/midad"
 import { CONTENT_FIELDS, mergeCheckpoints } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
@@ -369,16 +369,32 @@ describe("a failed save does not buy a new model call", () => {
   })
 
   it("a busy session's first save does not wait for a flush: the gap runs from its FIRST event (CAP-28)", async () => {
-    const { home, job, drain, saveCalls } = setup()
-    // an event every 5 s and a drain after each — every pass merges the session's jobs and keeps
-    // only the newest, which used to move the first-save gap's starting point forward each time
+    const { home, job, drain, saveCalls, transcriptPath } = setup()
+    // an event every 5 s (the transcript grows each time) and a drain after each — every pass
+    // merges the session's jobs and keeps only the newest, which used to restart the first-save gap
     for (let i = 0; i <= 2; i += 1) {
+      appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `step ${i}` }] } }) + "\n")
       job({ event: "PostToolUse" }, T0 + i * 5_000)
+      if (i === 2) {
+        // after a merge (the i=1 pass removed the first job) the kept job still carries the first time:
+        // due at 10 s, where the old code said 15 s
+        expect(sessionWaits(home, listJobs(home)).find((w) => w.sessionId === "s1")?.dueAtMs).toBe(T0 + 10_000)
+      }
       await drain({ now: () => new Date(T0 + i * 5_000 + 1_000) })
+      // never early: no save before 10 s have passed since the first event
+      if (i < 2) expect(saveCalls).toHaveLength(0)
     }
-    // 11 s after the first event: the 10 s first-save gap has passed, no Stop needed
+    // 11 s after the first event: the gap has passed, no Stop needed
     expect(saveCalls).toHaveLength(1)
     expect(listJobs(home)).toHaveLength(0)
+  })
+
+  it("a job file claiming a firstAt later than its own time is not trusted (CAP-28)", async () => {
+    const { home, job } = setup()
+    const queued = job({ event: "PostToolUse" }, T0)
+    home.writeSecretJson(`queue/${queued.id}.json`, { ...queued, id: undefined, firstAt: new Date(T0 + 60_000).toISOString() })
+    expect(listJobs(home)[0]?.firstAt).toBeUndefined()
+    expect(sessionWaits(home, listJobs(home)).find((w) => w.sessionId === "s1")?.dueAtMs).toBe(T0 + 10_000)
   })
 
   it("a compiled save whose send failed stays marked UNSENT for the next agent; a later success clears it (CAP-26)", async () => {

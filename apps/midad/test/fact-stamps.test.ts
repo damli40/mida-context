@@ -82,13 +82,13 @@ const factRuntime = (objects: ContextObject[]): ServiceRuntime =>
 
 describe("a fact area the agent cannot read says so (PROV-13)", () => {
   // profile.skills is denied (the one-area grant case); preferences.communication is granted but empty
-  const deniedRuntime = (): ServiceRuntime =>
+  const deniedRuntime = (code: "CAPABILITY_DENIED" | "CAPABILITY_EXPIRED" | "CAPABILITY_REVOKED" = "CAPABILITY_DENIED"): ServiceRuntime =>
     ({
       home: stampHome(),
       owner: `0x${"55".repeat(20)}`,
       agent: () => ({
         read: async (_owner: string, namespace: string) => {
-          if (namespace === "profile.skills") throw new MidaError("CAPABILITY_DENIED", "no capability for this namespace")
+          if (namespace === "profile.skills") throw new MidaError(code, "refused for this namespace")
           return []
         },
       }),
@@ -97,8 +97,21 @@ describe("a fact area the agent cannot read says so (PROV-13)", () => {
 
   it("mida read --as on a denied area prints refused, not an empty list that reads as 'nothing saved'", async () => {
     const lines: string[] = []
-    expect(await runCliWithRuntime(["read", "--as", "claude-code", "profile.skills"], deniedRuntime(), (line) => lines.push(line))).toBe(0)
-    expect(lines).toContain("  profile.skills: refused CAPABILITY_DENIED (claude-code has no read access to this area)")
+    // a refusal is a failure, as a refused projects.current read is: exit 1, never 0 (review)
+    expect(await runCliWithRuntime(["read", "--as", "claude-code", "profile.skills"], deniedRuntime(), (line) => lines.push(line))).toBe(1)
+    // DENIED also covers agent-wide causes (not approved, revoked, a stale key), so the line names both
+    expect(lines).toContain("  profile.skills: refused CAPABILITY_DENIED (the store refused it: claude-code holds no grant for this area, or is not approved or was revoked)")
+  })
+
+  it("an expired or revoked grant names its area and code instead of aborting the read (review)", async () => {
+    for (const [code, why] of [
+      ["CAPABILITY_EXPIRED", "claude-code's grant for this area has expired"],
+      ["CAPABILITY_REVOKED", "claude-code's access was revoked"],
+    ] as const) {
+      const lines: string[] = []
+      expect(await runCliWithRuntime(["read", "--as", "claude-code", "profile.skills"], deniedRuntime(code), (line) => lines.push(line))).toBe(1)
+      expect(lines).toContain(`  profile.skills: refused ${code} (${why})`)
+    }
   })
 
   it("a granted area with no facts prints no refusal", async () => {
