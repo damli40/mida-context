@@ -128,11 +128,12 @@ describe("sessionStartMessage", () => {
         "codex",
         NOW,
       )
-      expect(line).toContain("(reasons trimmed; still above the size target; incomplete — try again in a moment)")
+      // UF-K: "incomplete" comes FIRST — the 160-char cut must never be able to remove it
+      expect(line).toContain("(incomplete — try again in a moment; reasons trimmed; still above the size target)")
     })
   })
 
-  it("a partial store list joins after the size part with '; ' — never a comma list of states (in-20 T-3)", () => {
+  it("a partial store list opens the bracket — 'incomplete' first, then the size part (in-20 T-3, UF-K)", () => {
     const body = {
       kind: "handoff",
       text: "CTX",
@@ -144,8 +145,32 @@ describe("sessionStartMessage", () => {
       partial: true,
     }
     expect(sessionStartMessage(body, "codex", NOW)).toContain(
-      "(above the size target; incomplete — try again in a moment)",
+      "(incomplete — try again in a moment; above the size target)",
     )
+  })
+
+  it("the 160-char cut can never remove 'incomplete' — it leads the bracket (UF-K)", () => {
+    // all four states set and a 30-character saver name: the old order put "incomplete" last
+    // and the cut removed it whole — the owner was told a partial read was complete
+    const line = sessionStartMessage(
+      {
+        kind: "handoff",
+        text: "CTX",
+        checkpoints: 1,
+        facts: 0,
+        savedBy: "a".repeat(30),
+        savedAt: "2026-09-21T11:59:20.000Z",
+        cut: true,
+        reasonsLeftOut: true,
+        oversized: true,
+        partial: true,
+      },
+      "codex",
+      NOW,
+    )
+    expect(line.length).toBeLessThanOrEqual(160)
+    expect(line).toContain("incomplete")
+    expect(line).toContain("(incomplete — try again in a moment")
   })
 
   it("empty: the connected line", () => {

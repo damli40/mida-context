@@ -143,8 +143,9 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
     // UF-J: "trimmed" now names WHAT went — "older entries" for a history cut, "reasons"
     // for the reasons behind decisions and rejected approaches, both when both went —
     // so the owner never hears "trimmed" for a rule the text kept silent about.
-    // A partial store list joins with "; " after the size part: the owner hears
-    // "incomplete", never a count that looks whole (M3-D).
+    // A partial store list must be heard: "incomplete" OPENS the bracket, ahead of the size
+    // part — the line is cut at 160 chars and a trailing "incomplete" falls off the end
+    // entirely, telling the owner a partial read was complete (M3-D, UF-K).
     const what =
       body.cut === true && body.reasonsLeftOut === true
         ? "older entries and reasons"
@@ -161,11 +162,12 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
         : body.oversized === true
           ? `${what} trimmed; still above the size target`
           : `${what} trimmed to fit`
-    const state = size !== null
-      ? ` (${size}${body.partial === true ? "; incomplete — try again in a moment" : ""})`
-      : body.partial === true
-        ? " (incomplete — try again in a moment)"
-        : ""
+    const state =
+      body.partial === true
+        ? ` (incomplete — try again in a moment${size !== null ? `; ${size}` : ""})`
+        : size !== null
+          ? ` (${size})`
+          : ""
     return systemMessage(`Mida: handoff loaded — ${counts}${from}${state}`)
   }
   if (body.kind === "empty") {
