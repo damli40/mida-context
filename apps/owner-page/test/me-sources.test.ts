@@ -24,7 +24,7 @@ import type { Address, AgentRecord, BatchSaveMessage, Hex, SignedAgentCapability
 import { deriveEpochKeyPair, hexOf, sealContextObject } from "@mida/crypto"
 import type { AnchoredObject, BatchedReadItem, CapabilityView, ContextRecordView, RevocationIntentView } from "@mida/api"
 import { DEPLOYMENT } from "../src/owner/core.js"
-import { AGENT_LIST_NEEDS_INDEX, loadMe } from "../src/me/sources.js"
+import { AGENTS_NOT_LISTED_TEXT, SOURCE_BADGE_TEXT, loadMe } from "../src/me/sources.js"
 import type { MePorts } from "../src/me/sources.js"
 
 const OWNER = `0x${"11".repeat(20)}` as Address
@@ -100,7 +100,6 @@ function world() {
     manifests: new Map<string, SignedAgentCapabilityManifest>([[MANIFEST_HASH.toLowerCase(), AGENT_MANIFEST]]),
     manifestsError: null as Error | null,
     // chain answers
-    validCaps: new Map<string, boolean>([[CAP_ID.toLowerCase(), true]]),
     capabilities: new Map<string, CapabilityView>([[CAP_ID.toLowerCase(), capabilityView()]]),
     chainRecords: new Map<string, ContextRecordView>(),
     getRecordsError: null as Error | null,
@@ -116,15 +115,9 @@ function world() {
     // pending-row write checks — key: `${agentId}:${permission}`; absent means authorized
     authorities: new Map<string, boolean>(),
     authorityError: null as Error | null,
-    chainTime: NOW + 5,
-    // Monad's own head — the lag the page owes the owner is measured against this, never
-    // against the index's self-reported sourceBlock
-    chainBlock: 1000n,
-    chainBlockError: null as Error | null,
   }
 
   const ports: MePorts = {
-    index: null,
     store: {
       listObjects: async ({ namespaceId: ns }) => {
         if (state.objectsError !== null) throw state.objectsError
@@ -153,7 +146,6 @@ function world() {
       },
     },
     chain: {
-      isCapabilityValid: async (capabilityId) => state.validCaps.get(capabilityId.toLowerCase()) ?? false,
       getCapability: async (capabilityId) => state.capabilities.get(capabilityId.toLowerCase()) ?? null,
       getRecords: async (ids) => {
         state.getRecordsCalls.push([...ids])
@@ -178,11 +170,6 @@ function world() {
       hasAuthority: async (_owner, agentId, _namespaceId, permission) => {
         if (state.authorityError !== null) throw state.authorityError
         return state.authorities.get(`${agentId.toLowerCase()}:${permission}`) ?? true
-      },
-      latestTimestamp: async () => state.chainTime,
-      latestBlock: async () => {
-        if (state.chainBlockError !== null) throw state.chainBlockError
-        return state.chainBlock
       },
     },
   }
@@ -412,30 +399,41 @@ describe("loadMe — incomplete lists stay visible", () => {
 
 })
 
-describe("loadMe — the agent list is not offered", () => {
-
-  it("the page says it does not list agents, and the badge names what it did read", async () => {
-    const { ports } = world()
-    const data = await loadMe(OWNER, ports)
-    expect(data.agentsUnavailable).toBe(AGENT_LIST_NEEDS_INDEX)
-    // no index exists, so neither line may blame one
-    expect(data.agentsUnavailable).not.toMatch(/index|envio/i)
-    expect(data.lag).toEqual({ text: "Records come from the store and are checked on Monad", stale: false })
+describe("loadMe — what the page may claim about itself", () => {
+  it("the two sentences the page prints name no index", () => {
+    expect(AGENTS_NOT_LISTED_TEXT).not.toMatch(/\bindex/i)
+    expect(AGENTS_NOT_LISTED_TEXT).toContain("Run mida doctor in your terminal")
+    expect(SOURCE_BADGE_TEXT).toBe("Records come from the store and are checked on Monad")
   })
 
-  it("a list incomplete or the store silent → the badge dot warns", async () => {
+  it("a clean read is not degraded — the badge dot stays calm", async () => {
+    const { state, ports } = world()
+    const { obj, record } = makeDirectObject()
+    state.objects.set(NS_SKILLS, [obj])
+    state.chainRecords.set(record.contextId, record)
+    const data = await loadMe(OWNER, ports)
+    expect(data.incomplete).toEqual([])
+    expect(data.degraded).toBe(false)
+  })
+
+  it("a list incomplete, a check that could not run, or a silent store → degraded, so the dot warns", async () => {
     const partial = world()
     partial.state.batchedPartial = true
-    expect((await loadMe(OWNER, partial.ports)).lag.stale).toBe(true)
+    expect((await loadMe(OWNER, partial.ports)).degraded).toBe(true)
+
+    const unchecked = world()
+    const { obj } = makeDirectObject()
+    unchecked.state.objects.set(NS_SKILLS, [obj])
+    unchecked.state.getRecordsError = new Error("rpc down")
+    expect((await loadMe(OWNER, unchecked.ports)).degraded).toBe(true)
 
     const down = world()
     down.state.objectsError = new Error("store down")
     down.state.batchedListError = new Error("store down")
     const data = await loadMe(OWNER, down.ports)
     expect(data.recordsUnavailable).toBe(true)
-    expect(data.lag.stale).toBe(true)
+    expect(data.degraded).toBe(true)
   })
-
 })
 
 describe("loadMe — a record author's name", () => {

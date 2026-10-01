@@ -2,10 +2,10 @@
  * Task 5 — the /me page: route content, data wiring, and the DOM builder.
  *
  * renderMe is a pure builder — every string lands through textContent (the guard test scans
- * this directory for markup-writing APIs and fails the build on any), and a transaction link is
- * created only from a value matching model.isTxHash. Nothing here trusts the store, the index,
- * an agent manifest, or a record body; loadMe in sources.ts already re-verified every row, and
- * what could not be verified is rendered as such, never silently dropped.
+ * this directory for markup-writing APIs and fails the build on any), and the page renders no
+ * links. Nothing here trusts the store, an agent manifest, or a record body; loadMe in
+ * sources.ts already re-verified every row, and what could not be verified is rendered as such,
+ * never silently dropped.
  *
  * The boot path below the builder is thin: sign in once with the passkey (Task 4's session — seed released at once, namespace
  * secrets kept), gather with loadMe, render. On pagehide, sign-out, or the tab hidden past five
@@ -14,7 +14,7 @@
  */
 
 import { zeroHash } from "viem"
-import { batchAnchorAbi, capabilityRegistryAbi, latestTimestamp } from "@mida/chain/browser"
+import { batchAnchorAbi } from "@mida/chain/browser"
 import type { ChainContext } from "@mida/chain/browser"
 import { ContextApiClient, RegistryReader } from "@mida/api/browser"
 import { NAMESPACE_TREE_V1 } from "@mida/protocol"
@@ -25,15 +25,12 @@ import type { FlowEnvironment } from "../owner/flows.js"
 import { assertRpGate, el, makeEnv, progressLine, showError } from "../owner/page.js"
 import { describeError } from "../owner/session.js"
 import { shortAddress } from "../owner/secrets.js"
-import { chipsFor, INDEX_FRESHNESS_UNKNOWN_TEXT, isTxHash, provenanceBadge } from "./model.js"
+import { provenanceBadge } from "./model.js"
 import type { Badge } from "./model.js"
-import { BLOCKED_AT_STORE_TEXT, loadMe } from "./sources.js"
-import type { AgentRow, MeData, MePorts, RecordRow } from "./sources.js"
+import { AGENTS_NOT_LISTED_TEXT, SOURCE_BADGE_TEXT, loadMe } from "./sources.js"
+import type { MeData, MePorts, RecordRow } from "./sources.js"
 import { signIn } from "./session.js"
 import type { MeSession } from "./session.js"
-
-/** Monad testnet's explorer — the only destination a transaction link ever gets. */
-const EXPLORER_TX = "https://testnet.monadexplorer.com/tx/"
 
 /** Records rendered per page, newest first — decrypting in the browser is not free. */
 const RECORD_PAGE = 20
@@ -68,29 +65,6 @@ function elOf<K extends keyof HTMLElementTagNameMap>(
 
 const shortHash = (hash: string): string => `${hash.slice(0, 6)}…${hash.slice(-4)}`
 
-/**
- * The one place a transaction becomes a link: the value must be a full lowercase 32-byte hash.
- * Anything else — missing, truncated, uppercase, non-hash — returns null and the caller renders
- * plain text instead.
- */
-function txLink(doc: Document, tx: Hex | null, text: string): HTMLAnchorElement | null {
-  if (tx === null || !isTxHash(tx)) return null
-  const a = elOf(doc, "a", "tx", text)
-  a.setAttribute("href", `${EXPLORER_TX}${tx}`)
-  a.setAttribute("target", "_blank")
-  a.setAttribute("rel", "noopener noreferrer")
-  return a
-}
-
-function metaWithTx(doc: Document, lead: string, tx: Hex | null, fallback: string): HTMLElement {
-  const p = elOf(doc, "p", "agent-meta")
-  p.appendChild(elOf(doc, "span", undefined, `${lead} · `))
-  const link = txLink(doc, tx, `tx ${tx === null ? "" : shortHash(tx)}`)
-  if (link !== null) p.appendChild(link)
-  else p.appendChild(elOf(doc, "span", undefined, fallback))
-  return p
-}
-
 function formatWhen(createdAtMs: number): string {
   if (createdAtMs <= 0) return "time unknown"
   const diff = Date.now() - createdAtMs
@@ -119,151 +93,25 @@ function renderHead(doc: Document, data: MeData): HTMLElement {
   )
   left.appendChild(ownerLine)
   const source = elOf(doc, "p", "source")
-  source.appendChild(elOf(doc, "span", data.lag.stale ? "dot dot-stale" : "dot"))
-  // The badge names what the page actually read: the store's record lists, checked on Monad.
-  source.appendChild(elOf(doc, "span", undefined, data.lag.text))
+  source.appendChild(elOf(doc, "span", data.degraded ? "dot dot-stale" : "dot"))
+  // The badge names the page's method; the dot warns when a list or a check fell short.
+  source.appendChild(elOf(doc, "span", undefined, SOURCE_BADGE_TEXT))
   head.appendChild(source)
   return head
 }
 
-function renderSummary(doc: Document, data: MeData): HTMLElement {
+function renderSummary(doc: Document): HTMLElement {
   const bento = elOf(doc, "section", "bento")
   bento.setAttribute("aria-label", "Summary")
-  const live = data.agents.filter((a) => a.readLive).length
-  const revoked = data.agents.filter(
-    (a) =>
-      !a.readLive &&
-      (a.revokedTx !== null || (a.grants.length > 0 && a.grants.every((g) => g.status.label === "Revoked"))),
-  ).length
+  // The page does not list agents, so it shows no count of readers: a number here would invent
+  // certainty the page does not have.
   const lead = elOf(doc, "div", "tile tile-lead")
-  if (data.agentsUnavailable !== null) {
-    // No agent source answered — a count would invent certainty the page does not have. The
-    // flag carries its own sentence so the blame is exact ("the index is down" vs "not
-    // configured").
-    lead.appendChild(elOf(doc, "p", "n", data.agentsUnavailable))
-  } else {
-    // Agents whose chain check could not run are not "0 can read" — count them as unchecked so
-    // the headline never rounds an unknown down to a negative. A stale index gets the "At least"
-    // wording — an agent approved past its progress block is simply absent, so the fresh-index
-    // count would overstate certainty — and when the index could not even measure its own lag
-    // the line hedges ("may be behind") rather than asserting it (in-26 Q-2).
-    const unchecked = data.agents.filter((a) => a.unverified).length
-    const headline = data.lag.stale
-      ? [
-          live > 0
-            ? `At least ${live} agent${live === 1 ? "" : "s"} can read your context.`
-            : "No agent can read your context, as far as the index shows.",
-          ...(unchecked > 0 ? [`${unchecked} could not be checked just now.`] : []),
-          data.lag.text === INDEX_FRESHNESS_UNKNOWN_TEXT
-            ? "The index may be behind Monad, so a new approval may not show yet."
-            : "The index is behind Monad, so a new approval may not show yet.",
-        ].join(" ")
-      : unchecked > 0
-        ? `${live} agent${live === 1 ? "" : "s"} · ${unchecked} could not be checked just now`
-        : `${live} agent${live === 1 ? "" : "s"} can read your context right now.`
-    lead.appendChild(
-      elOf(doc, "p", "n", revoked === 0 ? headline : `${headline} ${revoked} ${revoked === 1 ? "was" : "were"} revoked.`),
-    )
-    lead.appendChild(elOf(doc, "p", "l", "Revoking stops future reads. It cannot recall what an agent already read."))
-  }
+  lead.appendChild(elOf(doc, "p", "n", AGENTS_NOT_LISTED_TEXT))
   bento.appendChild(lead)
-  // Each figure names its own source: records and "stated by you" are the index's totals, while
-  // "waiting to be anchored" is counted from the store's batched list — and is hidden outright
-  // when that list could not be fully read. The group is absent entirely when the index could
-  // not vouch for its side or a store list came back partial (the banner says why).
-  if (data.counts !== null) {
-    const tiles: [keyof typeof data.counts, string][] = [
-      ["records", "records saved — per the index"],
-      ["youSaid", "stated by you — per the index"],
-    ]
-    if (data.batchedListComplete) tiles.push(["pending", "waiting to be anchored — per the store"])
-    for (const [key, label] of tiles) {
-      const tile = elOf(doc, "div", "tile")
-      tile.setAttribute("data-count", key)
-      tile.appendChild(elOf(doc, "p", "n", String(data.counts[key])))
-      tile.appendChild(elOf(doc, "p", "l", label))
-      bento.appendChild(tile)
-    }
-  }
   return bento
 }
 
-function grantStatusText(grant: AgentRow["grants"][number]): string | null {
-  const { label, flagged, unchecked } = grant.status
-  if (label === "Can read" && !flagged) return null
-  if (!flagged) return label
-  // A chain read that never returned is a check that did not run — not a disagreement between
-  // the listing and Monad. Blame Monad, not the index.
-  if (unchecked) return `${label} — could not check Monad just now`
-  return `${label} — the index disagrees with the chain`
-}
-
-function renderAgent(doc: Document, agent: AgentRow): HTMLElement {
-  const allRevoked = agent.grants.length > 0 && agent.grants.every((g) => g.status.label === "Revoked")
-  const flagged = agent.grants.find((g) => g.status.flagged)
-  const revokedRow = !agent.readLive && !agent.blockedAtStore && allRevoked
-  const row = elOf(doc, "div", revokedRow ? "agent is-revoked" : "agent")
-
-  const identity = elOf(doc, "div")
-  row.appendChild(identity)
-  identity.appendChild(elOf(doc, "p", "agent-name", agent.name))
-  const approvedTx = agent.grants.map((g) => g.approvedTx).find((tx) => tx !== null) ?? null
-  identity.appendChild(metaWithTx(doc, "Approved", approvedTx, "grant transaction not indexed"))
-  if (agent.revokedTx !== null || revokedRow) {
-    identity.appendChild(metaWithTx(doc, "Revoked", agent.revokedTx, "revocation not indexed"))
-  }
-
-  const grants = elOf(doc, "div", "grants")
-  row.appendChild(grants)
-  grants.appendChild(elOf(doc, "p", "grants-label", "Grants"))
-  for (const grant of agent.grants) {
-    const grantRow = elOf(doc, "div", "grant-row")
-    grantRow.appendChild(elOf(doc, "span", "area", grant.area))
-    const chips = elOf(doc, "span", "chips")
-    const c = chipsFor(grant.permissions)
-    const slots: [string, boolean][] = [
-      ["Read", c.read],
-      ["Write", c.write],
-      ["Update own", c.updateOwn],
-    ]
-    if (c.updateAny) slots.push(["Update any", true])
-    for (const [label, on] of slots) {
-      chips.appendChild(elOf(doc, "span", `chip ${on ? "chip-on" : "chip-off"}`, label))
-    }
-    grantRow.appendChild(chips)
-    const statusText = grantStatusText(grant)
-    if (statusText !== null) grantRow.appendChild(elOf(doc, "span", "grant-status", statusText))
-    grants.appendChild(grantRow)
-  }
-
-  const box = elOf(doc, "div", "revoke-box")
-  row.appendChild(box)
-  const badge = agent.blockedAtStore
-    ? { cls: "b-warn", text: BLOCKED_AT_STORE_TEXT }
-    : agent.readLive
-      ? { cls: "b-ok", text: "Can read" }
-      : flagged !== undefined
-        ? { cls: "b-warn", text: flagged.status.label }
-        : allRevoked
-          ? { cls: "b-bad", text: "Revoked" }
-          : { cls: "b-neutral", text: "No read access" }
-  box.appendChild(elOf(doc, "span", `badge ${badge.cls}`, badge.text))
-  if (revokedRow) {
-    box.appendChild(elOf(doc, "p", "revoke-note", "Refused since revocation. Anything it read before then stays with it."))
-  }
-  // Read-only build: where the revoke button stood, the row names the terminal command instead.
-  // A revoke rotates the area key, and the terminal is where the re-key is guaranteed to run.
-  // The name is the agent's own manifest string — it goes into a command line only when it is
-  // plainly a safe shell word; anything else gets the fallback that finds the name first
-  // (in-30 NIT 7).
-  const revokeNote = /^[a-z0-9][a-z0-9-]{0,39}$/.test(agent.name)
-    ? `To revoke: run mida revoke ${agent.name} in your terminal.`
-    : "To revoke this agent, run mida doctor in your terminal to find its name, then mida revoke with that name."
-  box.appendChild(elOf(doc, "p", "revoke-note", revokeNote))
-  return row
-}
-
-function renderAgents(doc: Document, data: MeData): HTMLElement {
+function renderAgents(doc: Document): HTMLElement {
   const sec = elOf(doc, "section", "sec")
   sec.setAttribute("aria-labelledby", "agents-title")
   const head = elOf(doc, "div", "sec-head")
@@ -280,15 +128,7 @@ function renderAgents(doc: Document, data: MeData): HTMLElement {
       "This page is read-only. Revoking happens in your terminal, where your other agents get the new key.",
     ),
   )
-  if (data.agentsUnavailable !== null) {
-    sec.appendChild(elOf(doc, "p", "agent-meta", data.agentsUnavailable))
-    return sec
-  }
-  if (data.agents.length === 0) {
-    sec.appendChild(elOf(doc, "p", "agent-meta", "No agents have been granted access yet."))
-    return sec
-  }
-  for (const agent of data.agents) sec.appendChild(renderAgent(doc, agent))
+  sec.appendChild(elOf(doc, "p", "agent-meta", AGENTS_NOT_LISTED_TEXT))
   return sec
 }
 
@@ -346,10 +186,9 @@ function renderRecordRow(doc: Document, row: RecordRow, open: OpenRow | undefine
   } else if (row.state === "unverified") {
     anchor.appendChild(elOf(doc, "span", "badge b-bad", "not on Monad — unverified"))
   } else {
+    // No link: the page has no source for the transaction that anchored a record.
     const lane = row.lane === "direct" ? "direct" : "batch"
-    const link = txLink(doc, row.tx, `${lane} · ${row.tx === null ? "" : shortHash(row.tx)}`)
-    if (link !== null) anchor.appendChild(link)
-    else anchor.appendChild(elOf(doc, "span", "tx-none", `${lane} · anchored on Monad`))
+    anchor.appendChild(elOf(doc, "span", "tx-none", `${lane} · anchored on Monad`))
   }
   return tr
 }
@@ -479,8 +318,8 @@ export function renderMe(data: MeData, doc: Document, open?: OpenRow): HTMLEleme
   const root = elOf(doc, "div", "me-content")
   root.appendChild(renderHead(doc, data))
   for (const line of data.incomplete) root.appendChild(elOf(doc, "p", "me-banner", line))
-  root.appendChild(renderSummary(doc, data))
-  root.appendChild(renderAgents(doc, data))
+  root.appendChild(renderSummary(doc))
+  root.appendChild(renderAgents(doc))
   root.appendChild(renderRecords(doc, data, open))
   root.appendChild(renderAnchor(doc, data))
   root.appendChild(renderFoot(doc))
@@ -494,8 +333,6 @@ function livePorts(env: FlowEnvironment, session: MeSession): MePorts {
   const reader = new RegistryReader(context)
   const deployment = env.deployment
   return {
-    // No index is deployed: the agent list is not offered, and records come from the store.
-    index: null,
     // The store client signs as the derived owner — owner reads need no capability.
     store: new ContextApiClient({
       baseUrl: STORE_URL,
@@ -504,13 +341,6 @@ function livePorts(env: FlowEnvironment, session: MeSession): MePorts {
       capabilityRegistry: deployment.capabilityRegistry,
     }),
     chain: {
-      isCapabilityValid: async (capabilityId) =>
-        (await context.publicClient.readContract({
-          address: deployment.capabilityRegistry,
-          abi: capabilityRegistryAbi,
-          functionName: "isCapabilityValid",
-          args: [capabilityId],
-        } as never)) as boolean,
       getCapability: (capabilityId) => reader.getCapability(capabilityId),
       getRecords: (ids) => reader.getRecords(ids),
       batchRoot: async (batchId) => {
@@ -541,8 +371,6 @@ function livePorts(env: FlowEnvironment, session: MeSession): MePorts {
       getAgent: (agentId) => reader.getAgent(agentId),
       hasAuthority: (owner, agentId, namespaceId, permission, provenancePolicy) =>
         reader.hasAuthority(owner, agentId, namespaceId, permission, provenancePolicy),
-      latestTimestamp: async () => Number(await latestTimestamp(context)),
-      latestBlock: () => context.publicClient.getBlockNumber(),
     },
   }
 }

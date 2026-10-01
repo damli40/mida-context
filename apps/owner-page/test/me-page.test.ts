@@ -6,7 +6,7 @@ import { namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import { HIDDEN_LIMIT_MS, armTeardown, renderMe, revocableStore } from "../src/me/page.js"
 import type { MeData, MePorts, RecordRow } from "../src/me/sources.js"
-import { AGENT_LIST_NEEDS_INDEX, NO_INDEX_BADGE_TEXT, PARTIAL_LIST_TEXT } from "../src/me/sources.js"
+import { AGENTS_NOT_LISTED_TEXT, PARTIAL_LIST_TEXT, SOURCE_BADGE_TEXT } from "../src/me/sources.js"
 
 /**
  * Task 5's page tests. The plan prescribes a jsdom environment pragma, but jsdom is not a
@@ -134,7 +134,6 @@ function all(root: FakeEl, sel: string): FakeEl[] {
 const OWNER = `0x${"aa".repeat(20)}` as Address
 const AGENT = `0x${"11".repeat(32)}` as Hex
 const NS = namespaceId("projects.current")
-const TX = `0x${"7a".repeat(32)}` as Hex
 const CTX = `0x${"cc".repeat(32)}` as Hex
 
 function record(over: Partial<RecordRow> = {}): RecordRow {
@@ -148,7 +147,6 @@ function record(over: Partial<RecordRow> = {}): RecordRow {
     authorId: AGENT,
     authorName: "claude-code",
     source: 3,
-    tx: TX,
     batchId: null,
     ciphertext: "0x12",
     manifest: {},
@@ -160,16 +158,11 @@ function record(over: Partial<RecordRow> = {}): RecordRow {
 function data(over: Partial<MeData> = {}): MeData {
   return {
     owner: OWNER,
-    agents: [],
     records: [record()],
     incomplete: [],
-    agentsUnavailable: AGENT_LIST_NEEDS_INDEX,
     recordsUnavailable: false,
-    source: "unavailable",
-    lag: { text: NO_INDEX_BADGE_TEXT, stale: false },
+    degraded: false,
     batchingOn: true,
-    batchedListComplete: true,
-    counts: null,
     ...over,
   }
 }
@@ -198,20 +191,15 @@ describe("renderMe", () => {
     expect(cell!.getAttribute("data-decrypted")).toBe("1")
   })
 
-  it("a tx value that is not a 32-byte hash renders no link; a real hash links", () => {
-    // every tx field in this fixture is malformed — no <a> may exist anywhere
-    const bad = data({ records: [record({ tx: "0xZZZ-not-a-hash" as Hex })] })
-    const rootBad = renderMe(bad, fakeDoc()) as unknown as FakeEl
-    expect(all(rootBad, "a")).toHaveLength(0)
-
-    const ok = renderMe(data(), fakeDoc()) as unknown as FakeEl
-    const links = all(ok, "a.tx")
-    expect(links.length).toBeGreaterThan(0)
-    for (const link of links) {
-      expect(link.getAttribute("href")!.endsWith(TX)).toBe(true)
-      expect(link.getAttribute("target")).toBe("_blank")
-      expect(link.getAttribute("rel")).toBe("noopener noreferrer")
-    }
+  it("the page renders no links — it has no source for a transaction hash", () => {
+    const rows = [
+      record(),
+      record({ lane: "batched", contextId: `0x${"d4".repeat(32)}` as Hex, batchId: `0x${"b5".repeat(32)}` as Hex }),
+    ]
+    const root = renderMe(data({ records: rows }), fakeDoc()) as unknown as FakeEl
+    expect(all(root, "a")).toHaveLength(0)
+    expect(root.textContent).toContain("direct · anchored on Monad")
+    expect(root.textContent).toContain("batch · anchored on Monad")
   })
 
   it("an incomplete list shows the banner, and no count tile carries a figure", () => {
@@ -224,7 +212,7 @@ describe("renderMe", () => {
 
   it("the agent area says the page does not list agents — never '0 agents' or 'none granted'", () => {
     const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
-    const unavailable = AGENT_LIST_NEEDS_INDEX
+    const unavailable = AGENTS_NOT_LISTED_TEXT
     // once on the summary tile in place of the count, once where the list would be
     const hits = all(root, ".agent-meta").concat(all(root, ".n")).filter((el) => el.textContent.includes(unavailable))
     expect(hits.length).toBeGreaterThanOrEqual(2)
@@ -272,14 +260,14 @@ describe("renderMe", () => {
 
   it("the badge names what the page read, on a normal dot", () => {
     const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
-    expect(root.textContent).toContain("Records come from the store and are checked on Monad")
+    expect(root.textContent).toContain(SOURCE_BADGE_TEXT)
+    expect(SOURCE_BADGE_TEXT).toBe("Records come from the store and are checked on Monad")
     expect(root.textContent).not.toContain("unreachable")
     expect(all(root, ".dot-stale")).toEqual([])
   })
 
-  it("the rendered page never names an index or Envio", () => {
+  it("the rendered page never names an index", () => {
     const root = renderMe(data(), fakeDoc()) as unknown as FakeEl
-    expect(root.textContent).not.toMatch(/envio/i)
     expect(root.textContent).not.toMatch(/\bindex/i)
     expect(root.textContent).toContain("Run mida doctor in your terminal to see the agents approved on that machine.")
     // nothing on the page offers a revoke here, so the tile carries no line about revoking
@@ -287,7 +275,7 @@ describe("renderMe", () => {
   })
 
   it("a failed or partial read shows the warning dot beside the badge", () => {
-    const root = renderMe(data({ lag: { text: NO_INDEX_BADGE_TEXT, stale: true } }), fakeDoc()) as unknown as FakeEl
+    const root = renderMe(data({ degraded: true }), fakeDoc()) as unknown as FakeEl
     expect(all(root, ".dot-stale").length).toBe(1)
   })
 
@@ -296,7 +284,7 @@ describe("renderMe", () => {
     const html = readFileSync(join(here, "../public/me.html"), "utf8")
     expect(html).toContain("Your records, and who wrote them.")
     expect(html).not.toMatch(/every agent|what it can read|Who can read your context/)
-    expect(html).not.toMatch(/envio/i)
+    expect(html).not.toMatch(/\bindex\b/i)
     const page = readFileSync(join(here, "../src/me/page.ts"), "utf8")
     expect(page).toContain('"Your records, and who wrote them."')
     expect(page).not.toContain("reading agents, grants")
