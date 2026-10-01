@@ -56,7 +56,7 @@ describe("agentCli model commands", () => {
     const r = await compileCheckpoint({ ...base, model: cli("report", { agentCli: true }) })
     expect(r.ok).toBe(true)
     if (!r.ok) return
-    const cwd = r.checkpoint.artifacts[0]
+    const cwd = r.checkpoint.artifacts[0]!
     // /tmp is a symlink on macOS — the child reports its cwd fully resolved
     const tmpReal = fs.realpathSync(os.tmpdir())
     expect(fs.realpathSync(path.dirname(cwd))).toBe(tmpReal)
@@ -68,7 +68,7 @@ describe("agentCli model commands", () => {
 
   it("a command without agentCli still runs in os.tmpdir()", async () => {
     const r = await compileCheckpoint({ ...base, model: cli("report") })
-    expect(r.ok && fs.realpathSync(r.checkpoint.artifacts[0])).toBe(fs.realpathSync(os.tmpdir()))
+    expect(r.ok && fs.realpathSync(r.checkpoint.artifacts[0]!)).toBe(fs.realpathSync(os.tmpdir()))
   })
 
   it("the command's env additions reach the child — but never an ANTHROPIC_ name", async () => {
