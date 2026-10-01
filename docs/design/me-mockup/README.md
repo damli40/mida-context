@@ -14,4 +14,4 @@ granted = filled, not granted = dashed), recent records + who wrote them ("You s
 with a passkey confirm panel carrying the disclosure sentence. Data: Envio index first, direct chain
 reads as fallback.
 
-The build spec is `docs/superpowers/specs/2026-09-25-me-owner-view-design.md`.
+The build spec is not in the public repo.

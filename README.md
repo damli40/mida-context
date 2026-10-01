@@ -40,7 +40,7 @@ We measured what "blind" costs. We gave a fresh Codex session a half-finished jo
 was done, because it never learned that two of the five steps existed. With a Mida handoff printed
 into the session at start, it finished **3 of 3**, kept a rule only the first agent had heard, and
 restated the key decision and its reason
-([method and runs](docs/superpowers/specs/2026-09-20-p0-handoff-design.md)).
+([method and runs](docs/evidence/handoff-design-and-benchmark-2026-09-20.md)).
 
 Today you paste transcripts or keep a notes file. That file belongs to no one, any program on your
 machine can read it, and you cannot take it back from an agent you stop trusting. The tools also

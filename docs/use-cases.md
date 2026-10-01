@@ -17,7 +17,7 @@ Claude Code hits its limit halfway through a feature. You open Codex in the same
 Codex starts with Mida's checkpoint: your original request word for word, what the first agent decided and why,
 what it tried and dropped, and the next step. We gave a fresh Codex a half-finished job and that one word. It
 finished 0 of 6 runs without a handoff and 3 of 3 with one
-([method and runs](superpowers/specs/2026-09-20-p0-handoff-design.md)). The handoff ran both ways between Claude
+([method and runs](evidence/handoff-design-and-benchmark-2026-09-20.md)). The handoff ran both ways between Claude
 Code and Codex on Sep 27, and Devin picked up the same project through its own hooks.
 
 ### Keep your change of plan in a long session (tested on the real compile model)
