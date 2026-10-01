@@ -188,6 +188,44 @@ function trimFields(picked: Record<string, unknown>, trimmed: string[]): void {
     }
     cap(field, arr as unknown[])
   }
+  // UF-J: a front cut on a rule list drops the user's OLDEST entries, and the save must say
+  // so — otherwise the next agent never learns the rule that left. The note lands in
+  // unresolvedIssue. Any note the model carried forward from a previous save is stripped
+  // first, so notes never pile up or go stale; only constraints, decisions and rejected
+  // earn one — progress, artifacts, evidence and plan cuts stay silent.
+  const OLD_NOTE = /\s*\|?\s*\(Mida: a list holds at most \d+ entries\.[^)]*\)/g
+  let issue: string | null | undefined = picked.unresolvedIssue as string | null | undefined
+  if (typeof issue === "string") {
+    const stripped = issue.replace(OLD_NOTE, "")
+    if (stripped !== issue) issue = stripped === "" ? null : stripped
+  }
+  const frontLost = (field: string, one: string, many: string): string | null => {
+    const n = cutFromFront.get(field)
+    if (n === undefined) return null
+    return n === 1 ? `the 1 oldest ${one}` : `the ${n} oldest ${many}`
+  }
+  const lost = [
+    frontLost("constraints", "constraint", "constraints"),
+    frontLost("decisions", "decision", "decisions"),
+    frontLost("rejected", "rejected approach", "rejected approaches"),
+  ].filter((s): s is string => s !== null)
+  if (lost.length > 0 && (typeof issue === "string" || issue === null || issue === undefined)) {
+    const note = `(Mida: a list holds at most ${LIMITS.maxArray} entries. Left out: ${lost.join(", ")}.)`
+    if (issue === null || issue === undefined || issue === "") {
+      picked.unresolvedIssue = note
+    } else {
+      // the note stays whole — when it would push the field past the string cap, the
+      // model's own text is what shortens, ending in "…"
+      const sep = " | "
+      const head =
+        issue.length + sep.length + note.length > LIMITS.maxString
+          ? `${issue.slice(0, LIMITS.maxString - sep.length - note.length - 1)}…`
+          : issue
+      picked.unresolvedIssue = `${head}${sep}${note}`
+    }
+  } else {
+    picked.unresolvedIssue = issue
+  }
 }
 
 // One model call: the prompt goes on stdin, stdout is captured up to

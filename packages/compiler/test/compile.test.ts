@@ -520,6 +520,10 @@ describe("compileCheckpoint", () => {
       expect(r.checkpoint.decisions[0]!.decision).toBe("d1")
       expect(r.checkpoint.decisions.at(-1)!.decision).toBe("d50")
       expect(r.trimmed).toContain("decisions")
+      // UF-J: the dropped oldest rule is no longer silent — the checkpoint itself says so
+      expect(r.checkpoint.unresolvedIssue).toBe(
+        "(Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+      )
     }
   })
   it("every list over 50 keeps its newest 50 — except the plan, whose front is what comes next (C11, CAP-29)", async () => {
@@ -535,6 +539,32 @@ describe("compileCheckpoint", () => {
     expect([c.remainingPlan[0], c.remainingPlan.at(-1)]).toEqual(["step 0", "step 49"])
     for (const list of ["progress", "decisions", "rejected", "constraints", "artifacts", "remainingPlan"]) {
       expect(r.trimmed, list).toContain(list)
+    }
+    // UF-J: only the rule lists get a note — progress, artifacts, plan and evidence cuts add none
+    expect(c.unresolvedIssue).toBe(
+      "(Mida: a list holds at most 50 entries. Left out: the 10 oldest constraints, the 10 oldest decisions, the 10 oldest rejected approaches.)",
+    )
+  })
+  // UF-J: a note the model carried forward from the previous checkpoint must not pile up or
+  // go stale — it is stripped before the fresh one (if any) is appended.
+  it("a carried-forward trim note is removed when nothing was cut this save (UF-J)", async () => {
+    const stale = await compileCheckpoint({ ...base, model: fake("stale-note") })
+    expect(stale.ok).toBe(true)
+    if (stale.ok) {
+      expect(stale.checkpoint.unresolvedIssue).toBe("the deploy key rotation is waiting on ops")
+    }
+    // and when the model's value was ONLY the old note, the field goes back to null
+    const only = await compileCheckpoint({ ...base, model: fake("stale-note-only") })
+    expect(only.ok).toBe(true)
+    if (only.ok) expect(only.checkpoint.unresolvedIssue).toBeNull()
+  })
+  it("the trim note stays whole when the model's unresolvedIssue nearly fills the string cap (UF-J)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("long-issue") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      const issue = r.checkpoint.unresolvedIssue!
+      expect(issue.length).toBeLessThanOrEqual(2000)
+      expect(issue.endsWith("… | (Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)")).toBe(true)
     }
   })
   it("evidence follows its entry when a list is cut from the front, and goes when its entry goes (C11, CAP-29)", async () => {

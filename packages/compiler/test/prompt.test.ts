@@ -133,6 +133,14 @@ describe("buildExtractPrompt", () => {
     expect(buildExtractPrompt("L1 user: keep going", undefined, true)).not.toContain("did not run")
   })
 
+  // UF-J: the update instruction must send new entries to the END of a list — the 50-cap
+  // keeps the newest, so a model that inserts at the top gets the oldest dropped twice over.
+  it("the update instruction tells the model new entries go at the end of a list", () => {
+    const prompt = buildExtractPrompt("L1 user: do the thing", previous)
+    expect(prompt).toContain("add what is new at the end of its list;")
+    expect(prompt).not.toContain("add what is new;")
+  })
+
   it("a secret sitting in the previous checkpoint is scrubbed before it reaches the model", () => {
     const leaky = { ...previous, progress: ["set sk-live-abcdefgh12345678 in env"] }
     const prompt = buildExtractPrompt("text", leaky)

@@ -820,7 +820,7 @@ describe("mida-mcp tools against a fake daemon", () => {
   it("mida_save's description names the clients it serves (AUTH-17)", async () => {
     const save = MCP_TOOLS.find((t) => t.name === "mida_save")!
     expect(save.description).toBe(
-      "Save a checkpoint of your work on this project so another approved agent can pick it up. Call it when the user asks to save context or hand off, and before you finish a task. Claude Desktop and Cursor get this tool; agents with Mida hooks, like Claude Code and Codex, save through those hooks instead. The daemon signs each save as this client's own identity after the owner's approval checks pass. One save per minute at most.",
+      "Save a checkpoint of your work on this project so another approved agent can pick it up. Call it when the user asks to save context or hand off, and before you finish a task. Claude Desktop and Cursor get this tool; agents with Mida hooks, like Claude Code and Codex, save through those hooks instead. The daemon signs each save as this client's own identity after the owner's approval checks pass. A list holds at most 50 entries. One save per minute at most.",
     )
   })
 

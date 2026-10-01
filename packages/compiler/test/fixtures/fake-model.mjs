@@ -41,6 +41,11 @@
 //              fired once on the primary and never on a fallback
 //   prose-secret — prints a long paragraph holding a key shape and no JSON:
 //              the failure sample must carry it scrubbed and cut to 200 chars
+//   stale-note — GOOD but unresolvedIssue carries a note a previous compile
+//              would have written about a dropped list entry (UF-J)
+//   stale-note-only — GOOD but unresolvedIssue IS such a note alone (UF-J)
+//   long-issue — GOOD with 51 decisions and a 1,990-char unresolvedIssue:
+//              the trim note must fit inside the string cap whole (UF-J)
 //
 // The mode comes from argv[2] when present, else FAKE_MODEL_MODE — argv lets a
 // primary and a fallback command differ inside one compile even though both
@@ -202,6 +207,26 @@ process.stdin.on("end", () => {
     case "cache-stats-bad":
       process.stderr.write("cache hit=soon miss=later\n")
       fenced(GOOD)
+      break
+    case "stale-note":
+      fenced({
+        ...GOOD,
+        unresolvedIssue:
+          "the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+      })
+      break
+    case "stale-note-only":
+      fenced({
+        ...GOOD,
+        unresolvedIssue: "(Mida: a list holds at most 50 entries. Left out: the 2 oldest constraints.)",
+      })
+      break
+    case "long-issue":
+      fenced({
+        ...GOOD,
+        decisions: Array.from({ length: 51 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+        unresolvedIssue: "i".repeat(1990),
+      })
       break
     case "echo-previous": {
       const lines = input.split("\n")

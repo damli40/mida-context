@@ -2,7 +2,7 @@ import { statSync } from "node:fs"
 import { isAbsolute } from "node:path"
 import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
-import { CONTENT_FIELDS, validateCheckpoint } from "@mida/checkpoint"
+import { CONTENT_FIELDS, LIMITS, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint } from "@mida/checkpoint"
 import { scrubValue } from "@mida/compiler"
 import { PERMISSION, PROVENANCE_POLICY, isMidaError } from "@mida/protocol"
@@ -279,6 +279,18 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
   const validated = validateCheckpoint(checkpoint)
   if (!validated.ok) {
     const bad = fieldPathsFromErrors(validated.errors)
+    // UF-J: when the ONLY failures are lists over the schema cap, name the limit and each
+    // submitted count — "invalid fields" alone would never tell the model what to fix. Any
+    // other mix of errors keeps the generic wording.
+    const capError = `: array exceeds ${LIMITS.maxArray} items`
+    if (validated.errors.every((e) => e.endsWith(capError))) {
+      const counts = bad.map((f) => `${f} has ${(content[f] as unknown[]).length}`)
+      return refused(
+        "invalid-shape",
+        `Mida: a list holds at most ${LIMITS.maxArray} entries (${counts.join(", ")}). Nothing was saved.`,
+        { fields: bad },
+      )
+    }
     return refused("invalid-shape", `Mida: invalid checkpoint fields: ${bad.join(", ")} — nothing was saved.`, { fields: bad })
   }
 

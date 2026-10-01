@@ -249,6 +249,41 @@ describe("buildMcpSave — the daemon's mida_save route", () => {
     if (badType.kind === "refused") expect(badType.fields).toContain("progress")
   })
 
+  // UF-J: when the ONLY thing wrong is lists over the schema's 50-entry cap, the refusal
+  // names the limit and each submitted count — "invalid fields" alone would not tell the
+  // model what to fix.
+  it("a list over the 50-entry cap refuses by naming the limit and the count (UF-J)", async () => {
+    const decisions = Array.from({ length: 51 }, (_, i) => ({ decision: `d${i}`, rationale: "r" }))
+    const result = await call({}, { fields: { ...FIELDS, decisions } })
+    expect(result).toMatchObject({ kind: "refused", reason: "invalid-shape" })
+    if (result.kind === "refused") {
+      expect(result.text).toBe("Mida: a list holds at most 50 entries (decisions has 51). Nothing was saved.")
+      expect(result.fields).toEqual(["decisions"])
+    }
+  })
+
+  it("several over-long lists name every count inside one refusal (UF-J)", async () => {
+    const decisions = Array.from({ length: 51 }, (_, i) => ({ decision: `d${i}`, rationale: "r" }))
+    const constraints = Array.from({ length: 60 }, (_, i) => `c${i}`)
+    const result = await call({}, { fields: { ...FIELDS, decisions, constraints } })
+    expect(result).toMatchObject({ kind: "refused", reason: "invalid-shape" })
+    if (result.kind === "refused") {
+      // the validator's own error order: constraints is checked before decisions
+      expect(result.text).toBe(
+        "Mida: a list holds at most 50 entries (constraints has 60, decisions has 51). Nothing was saved.",
+      )
+    }
+  })
+
+  it("an over-long list mixed with another kind of error keeps the generic refusal (UF-J)", async () => {
+    const decisions = Array.from({ length: 51 }, (_, i) => ({ decision: `d${i}`, rationale: "r" }))
+    const result = await call({}, { fields: { ...FIELDS, decisions, progress: "not-an-array" } })
+    expect(result).toMatchObject({ kind: "refused", reason: "invalid-shape" })
+    if (result.kind === "refused") {
+      expect(result.text).toBe("Mida: invalid checkpoint fields: progress, decisions — nothing was saved.")
+    }
+  })
+
   it("secrets in the checkpoint are scrubbed with the compiler scrubber before sealing", async () => {
     const sink: { input?: Omit<CheckpointEnvelope, "type"> } = {}
     const secret = "AKIAIOSFODNN7EXAMPLE"
