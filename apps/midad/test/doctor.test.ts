@@ -744,6 +744,23 @@ describe("mida doctor without a chain", () => {
     expect(lines.filter((line) => line.includes("Mida's summaries")).length).toBe(1)
   })
 
+  it("an environment pin for a model that cannot run names the environment as the chooser (UF-QD)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: { MIDA_COMPILE_MODEL: "haiku" },
+      daemonProbeMs: 50,
+      onPath: (bin) => bin === "codex",
+    })
+    expect(lines).toContain(
+      "PROBLEM: no model can write Mida's summaries, so no session is being saved. Your environment variables choose a model that cannot run here. Run mida summarizer use agents, or unset MIDA_COMPILE_MODEL.",
+    )
+    expect(lines.some((line) => line.includes("Install Claude Code or Codex"))).toBe(false)
+  })
+
   it("an unreadable summarizer.json is its own PROBLEM line — never an ok model line (UF-P3)", async () => {
     const home = new MidaHome(join(dir(), "home"))
     writeFileSync(home.path("summarizer.json"), "{not json")

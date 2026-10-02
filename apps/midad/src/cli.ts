@@ -2768,7 +2768,15 @@ async function main(): Promise<void> {
     // starts a service that is down: doctor's own daemon check reports that. A refused
     // replacement or a service that does not come up goes to stderr and the checks still run.
     const replaceStaleService = async (): Promise<void> => {
-      const ensured = await ensureCurrentDaemon(home, () => spawnDaemon(home.root), { waitMs: DAEMON_WAIT_MS, whenDown: "leave" })
+      const ensured = await ensureCurrentDaemon(home, () => spawnDaemon(home.root), {
+        waitMs: DAEMON_WAIT_MS,
+        whenDown: "leave",
+        // UF-QD: an older service can be mid-save — allow it a minute, and once it has been
+        // three seconds say the wait is for the save, not a hang
+        shutdownWaitMs: 65_000,
+        onStillUp: () =>
+          process.stderr.write("The older Mida service is finishing a save. Waiting up to a minute for it to stop.\n"),
+      })
       if (ensured.replaced !== undefined && ensured.up) {
         process.stderr.write(
           `restarted the Mida service (it was running code from ${ensured.replaced.codeRoot} @ ${ensured.replaced.codeCommit.slice(0, 7)})\n`,

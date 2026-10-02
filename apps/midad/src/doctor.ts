@@ -455,6 +455,14 @@ function compileModelLines(view: CompileModelView, env: NodeJS.ProcessEnv): stri
     ]
   }
   if (view.chain.length === 0) {
+    // UF-QD: when the environment variables are the decider and nothing they name can run,
+    // the fix is to unset the pin or choose agents — installing a tool would not help, the
+    // pin would still point at the missing one
+    if (view.mode === "environment") {
+      return [
+        "PROBLEM: no model can write Mida's summaries, so no session is being saved. Your environment variables choose a model that cannot run here. Run mida summarizer use agents, or unset MIDA_COMPILE_MODEL.",
+      ]
+    }
     return [
       "PROBLEM: no model can write Mida's summaries, so no session is being saved. Install Claude Code or Codex, or run mida summarizer use key.",
     ]

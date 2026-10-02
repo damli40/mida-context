@@ -528,7 +528,7 @@ export async function chooseSummarizer(deps: {
     "  1  Your agents' small models (recommended)",
     `     ${a}`,
     `     Who reads the chat: ${b}, under your login.`,
-    "     What it uses: your plan. It stops at your plan's limit.",
+    "     What it uses: your plan, about one small-model message each time your agent finishes a turn. It stops at your plan's limit.",
     "",
     "  2  Your own API key",
     "     Who reads the chat: the provider you choose.",

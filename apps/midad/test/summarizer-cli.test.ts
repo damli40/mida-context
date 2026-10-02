@@ -697,7 +697,7 @@ const choiceBlock = (a: string, b: string) => [
   "  1  Your agents' small models (recommended)",
   `     ${a}`,
   `     Who reads the chat: ${b}, under your login.`,
-  "     What it uses: your plan. It stops at your plan's limit.",
+  "     What it uses: your plan, about one small-model message each time your agent finishes a turn. It stops at your plan's limit.",
   ...CHOICE_TAIL,
 ]
 
