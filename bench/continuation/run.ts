@@ -29,14 +29,17 @@
 
 import { execFileSync, spawn, spawnSync } from "node:child_process"
 import {
-  appendFileSync, cpSync, mkdirSync, openSync, closeSync, readFileSync,
-  readdirSync, rmSync, statSync, symlinkSync, writeFileSync,
+  appendFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync,
+  closeSync, readFileSync, readdirSync, realpathSync, rmSync, statSync,
+  symlinkSync, writeFileSync,
 } from "node:fs"
 import os from "node:os"
 import { basename, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { localEnvironment } from "@mida/cli"
-import { compileCheckpoint, scrubTranscript } from "../../packages/compiler/src/index.js"
+import {
+  compileCheckpoint, readConversation, scrubTranscript,
+} from "../../packages/compiler/src/index.js"
 import {
   MidaHome, Runtime, approve, init, requestAccess, startDaemon,
 } from "../../apps/midad/src/index.js"
@@ -89,8 +92,11 @@ const agentBArgv = (): string[] => [
 
 // The hook command text runs the entry point directly — nothing installs the
 // mida-* bins onto PATH inside a run, and this is the same file they exec.
-const injectCmd = (agent: string) => `node --import tsx ${INJECT_MAIN} ${agent}`
-const hookCmd = (agent: string) => `node --import tsx ${HOOK_MAIN} ${agent}`
+// tsx is named by its absolute loader path: the work folder lives outside the
+// repo while the agents run, so "--import tsx" alone would not resolve there.
+const TSX_LOADER = join(REPO_ROOT, "node_modules", "tsx", "dist", "loader.mjs")
+export const injectCmd = (agent: string) => `node --import ${TSX_LOADER} ${INJECT_MAIN} ${agent}`
+export const hookCmd = (agent: string) => `node --import ${TSX_LOADER} ${HOOK_MAIN} ${agent}`
 
 /** The hook element shape install.ts writes into Claude Code's settings.json. */
 const hookElement = (command: string) => ({ hooks: [{ type: "command", command }] })
@@ -207,7 +213,7 @@ function planFiles(args: Args, runDir: string): PlannedFile[] {
 function layoutLines(args: Args, runDir: string, codexAuth: string | undefined): string[] {
   const rel = (p: string) => `  ${p}`
   const lines = [`${runDir}/`]
-  lines.push(rel("work/                  continuation-task copy minus TASK.md + score.json, git-initialised"))
+  lines.push(rel("work/                  a temp folder outside the repo while the agents run (task copy minus TASK.md + score.json, git-initialised); copied here at the end"))
   if (args.condition === "mida") {
     lines.push(rel("mida-home/             MIDA_HOME — provisioned on a local anvil chain"))
     lines.push(rel("claude-settings.json   agent A's --settings: the real mida hook commands"))
@@ -331,6 +337,24 @@ export function tokensUsedOf(bOutputText: string): number | null {
  *  (a B that worked until the harness's time limit did run). */
 export function bRanOf(exitCode: number | null, seconds: number): boolean {
   return exitCode === 0 || seconds >= 60
+}
+
+/** What the `raw` condition pastes: the readable text of agent A's Claude Code session (the same
+ *  text Mida's summary step reads), scrubbed, cut to its last `chars` characters. */
+export function rawPasteOf(transcriptPath: string, chars: number): { text: string; fullChars: number } {
+  const scrubbed = scrubTranscript(readConversation(transcriptPath).text)
+  return { text: scrubbed.slice(-chars), fullChars: scrubbed.length }
+}
+
+const HARNESS_MARKERS = ["TASK.md", "score.json", "a-output", "raw-tail"]
+
+/** Which harness artefacts appear in agent B's output: run-folder files one
+ *  level up from the work folder, or the repo root path itself. A record for
+ *  the person reading the results — the summary does not use it. */
+export function harnessMarkersIn(bOutputText: string, repoRoot: string): string[] {
+  const found = new Set(HARNESS_MARKERS.filter((m) => bOutputText.includes(m)))
+  if (bOutputText.includes(repoRoot)) found.add(repoRoot)
+  return [...found].sort()
 }
 
 /** Wait until the daemon has drained every queued job (bounded), mirroring the spike's inflight wait. */
@@ -495,15 +519,26 @@ function dryRun(args: Args): void {
 // ---------- real run ----------
 
 async function realRun(args: Args): Promise<number> {
+  // The hook commands resolve tsx by absolute path; without the file they
+  // would fail only after an agent had been paid for.
+  if (!existsSync(TSX_LOADER)) {
+    throw new Error(`harness: ${TSX_LOADER} is missing; run pnpm install`)
+  }
   // The rubric loads before anything is created or started: a broken score.json
   // must fail here, not after an agent has been paid for.
   const score = loadScore(join(TOY_TASK, "score.json"))
   const runDir = join(RUNS_ROOT, args.condition, String(args.run))
-  const work = join(runDir, "work")
   const codexHome = join(runDir, "codex-home")
   const midaHomePath = join(runDir, "mida-home")
 
   rmSync(runDir, { recursive: true, force: true })
+  // The work folder lives outside the repo while the agents run: agent B's ".."
+  // must not reach a-output.jsonl, raw-tail.txt, TASK.md or score.json. realpathSync
+  // because macOS reaches the temp folder through a symlink — Mida's project
+  // approval and the hooks must see the same path. Copied into the run folder
+  // at the end (see finally).
+  const workParent = realpathSync(mkdtempSync(join(os.tmpdir(), "mida-bench-")))
+  const work = join(workParent, "work")
   mkdirSync(work, { recursive: true })
   mkdirSync(codexHome, { recursive: true })
   cpSync(TOY_TASK, work, {
@@ -623,10 +658,13 @@ async function realRun(args: Args): Promise<number> {
       queueLeft = waited.left
     }
 
-    // raw: the tail of A's OWN session file, scrubbed, is all B is allowed to
-    // see. If that file cannot be found there is nothing fair to paste, so the
-    // run fails here — before agent B is started — and no run.json is written.
+    // raw: the readable tail of A's OWN session, scrubbed, is all B is allowed
+    // to see — the same conversation text Mida's summary step reads, not a
+    // slice of the session file's encoded bytes. If that file cannot be found
+    // there is nothing fair to paste, so the run fails here — before agent B
+    // is started — and no run.json is written.
     let rawTailChars = 0
+    let rawFullChars: number | null = null
     if (args.condition === "raw") {
       const transcript = aSessionId === null
         ? null
@@ -634,10 +672,10 @@ async function realRun(args: Args): Promise<number> {
       if (transcript === null) {
         throw new Error("raw: agent A's own session file was not found, so agent B was not started")
       }
-      const text = scrubTranscript(readFileSync(transcript, "utf8"))
-      const tail = text.slice(-RAW_TAIL_CHARS)
-      writeFileSync(join(runDir, "raw-tail.txt"), tail)
-      rawTailChars = tail.length
+      const paste = rawPasteOf(transcript, RAW_TAIL_CHARS)
+      writeFileSync(join(runDir, "raw-tail.txt"), paste.text)
+      rawTailChars = paste.text.length
+      rawFullChars = paste.fullChars
     }
 
     // --- Agent B ---
@@ -677,11 +715,14 @@ async function realRun(args: Args): Promise<number> {
       queueWaitMs,
       queueLeft,
       rawTailChars,
+      rawFullChars,
       rawTranscriptFound: args.condition === "raw" ? true : null,
       bSeconds: b.seconds,
       bExitCode: b.exitCode,
       bRan: bRanOf(b.exitCode, b.seconds),
       bTokensUsed: tokensUsedOf(bOutput),
+      bSawHarnessFiles: harnessMarkersIn(bOutput, REPO_ROOT),
+      workRanIn: "temp-outside-repo",
       stepsBuilt: steps.filter((s) => s.built).length,
       stepsAtHandover,
       aLeftWork,
@@ -693,6 +734,15 @@ async function realRun(args: Args): Promise<number> {
     console.log(JSON.stringify(run))
     return 0
   } finally {
+    // Bring the finished work folder back into the run folder, then drop the
+    // temp parent. Neither step may throw: a failed copy must not hide the
+    // run's own error.
+    try {
+      if (existsSync(work)) cpSync(work, join(runDir, "work"), { recursive: true })
+    } catch { /* the run's own error, if any, still surfaces */ }
+    try {
+      rmSync(workParent, { recursive: true, force: true })
+    } catch { /* temp litter, not a run failure */ }
     if (daemon !== null) await daemon.close()
     if (chain !== null) await chain.stop()
   }

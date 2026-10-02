@@ -8,10 +8,15 @@
 import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs"
 import os from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
 import {
-  bRanOf, parseArgs, sessionIdOf, tokensUsedOf, transcriptOfSession,
+  bRanOf, harnessMarkersIn, hookCmd, injectCmd, parseArgs, rawPasteOf,
+  sessionIdOf, tokensUsedOf, transcriptOfSession,
 } from "../continuation/run.js"
+
+const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url))
+const TRIE_SESSION = join(REPO_ROOT, "bench", "fixtures", "transcripts", "trie-session.jsonl")
 
 const tempDir = () => mkdtempSync(join(os.tmpdir(), "mida-bench-run-"))
 
@@ -110,5 +115,60 @@ describe("parseArgs --stop-at", () => {
   it("rejects a missing value like the other flags", () => {
     expect(() => parseArgs([...base, "--stop-at"])).toThrowError()
     expect(() => parseArgs([...base, "--stop-at", ""])).toThrowError()
+  })
+})
+
+describe("rawPasteOf", () => {
+  it("pastes the readable conversation, not encoded file bytes", () => {
+    const { text, fullChars } = rawPasteOf(TRIE_SESSION, 8_000)
+    // the session's first user request survives as readable text, rendered in
+    // the compiler's "L<n> <role>:" block format — not the session file's JSON
+    expect(text).toContain("Port the session cache to a trie")
+    expect(text).toMatch(/^L\d+ user:/m)
+    expect(text).not.toMatch(/^\{"type":/m)
+    // the old slice of raw file bytes was mostly base64-like signature data
+    expect(/[A-Za-z0-9+/=]{200,}/.test(text)).toBe(false)
+    expect(text.length).toBeLessThanOrEqual(8_000)
+    expect(fullChars).toBeGreaterThanOrEqual(text.length)
+  })
+
+  it("cuts to the last `chars` characters and reports the whole length", () => {
+    const { text, fullChars } = rawPasteOf(TRIE_SESSION, 100)
+    expect(text.length).toBeLessThanOrEqual(100)
+    expect(fullChars).toBeGreaterThanOrEqual(text.length)
+  })
+
+  it("returns the whole text when chars exceeds it", () => {
+    const { text, fullChars } = rawPasteOf(TRIE_SESSION, 10_000_000)
+    expect(text.length).toBe(fullChars)
+  })
+})
+
+describe("harnessMarkersIn", () => {
+  it("finds each marker and the repo root string", () => {
+    const out = "I looked at TASK.md and score.json, then ../a-output.jsonl and raw-tail.txt"
+    expect(harnessMarkersIn(out, "/repo")).toEqual(
+      ["TASK.md", "a-output", "raw-tail", "score.json"].sort(),
+    )
+    expect(harnessMarkersIn(`files under /repo are off limits`, "/repo")).toEqual(["/repo"])
+  })
+
+  it("gives [] when agent B touched nothing outside the work folder", () => {
+    expect(harnessMarkersIn("edited src/bucket.mjs and ran npm test", "/repo")).toEqual([])
+  })
+
+  it("is sorted and has no duplicates", () => {
+    const out = "TASK.md TASK.md a-output a-output raw-tail"
+    const found = harnessMarkersIn(out, "/repo")
+    expect(found).toEqual([...new Set(found)].sort())
+  })
+})
+
+describe("hook commands", () => {
+  it("load tsx by its absolute path so they work outside the repo", () => {
+    for (const cmd of [injectCmd("codex"), hookCmd("claude-code")]) {
+      expect(cmd).toContain(join(REPO_ROOT, "node_modules", "tsx", "dist", "loader.mjs"))
+      expect(cmd).not.toContain("--import tsx ")
+    }
   })
 })
