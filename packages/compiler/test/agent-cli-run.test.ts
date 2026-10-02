@@ -318,13 +318,37 @@ describe("limitHit", () => {
     expect(limitHit(prompt, "", "we hit the weekly limit elsewhere")).toBe(true)
   })
 
-  it("a line that is only a half-echoed prompt line does count now (UF-QD)", () => {
+  it("a line that is only a half-echoed prompt line ends the echo now (UF-QF)", () => {
     // the stderr tail is capped at 4,096 characters, so an echoed prompt line can arrive cut
-    // in half — the prompt's last line is not in the tail, so there is no echo to cut and
-    // the half that lands is examined like any other tool line
+    // in half — UF-QF: a long enough suffix of the prompt's last line IS the echo's end, so
+    // it and everything before it is the echo and a non-matching line after it is examined
+    // alone. (UF-QD expected the half-echo to count as tool output; that was the defect —
+    // it cannot be told apart from the echo's cut tail.)
     const prompt = "Summarise this.\nfirst half: we hit the weekly limit on the API"
-    expect(limitHit(prompt, "", "we hit the weekly limit on the API")).toBe(true)
+    expect(limitHit(prompt, "", "we hit the weekly limit on the API")).toBe(false)
     // a non-matching line still answers false either way
     expect(limitHit(prompt, "", "API")).toBe(false)
+  })
+
+  it("a prompt's last line longer than the kept tail never matches whole — its cut half still ends the echo (UF-QF)", () => {
+    // the previous checkpoint is one JSON line; at 4,996 characters it is longer than the
+    // 4,096 of stderr that survive, so the prompt's last line is never found whole. The half
+    // of it that IS in the tail still ends the echo, so only what the tool printed after it
+    // is examined — a checkpoint that mentions a limit must not turn a plain failure into
+    // summarizer-limit.
+    const jsonLine = `{"note":"${"x".repeat(4960)} we hit the usage limit"}`
+    const prompt = `Summarise this.\n${jsonLine}`
+    const tail = prompt.slice(-4096)
+    expect(limitHit(prompt, "", `${tail}\nERROR: stream disconnected`)).toBe(false)
+    // …but the tool's own limit line, after the same echo, still counts
+    expect(limitHit(prompt, "", `${tail}\nYou've hit your usage limit.`)).toBe(true)
+  })
+
+  it("the tool repeating the very sentence the session ended on is a limit, not the echo (UF-QF)", () => {
+    // the prompt ends on the limit sentence, and the tool prints it as its own error too —
+    // two copies is the tool's words, one would have been just the echo
+    const prompt = "Summarise this.\nYou've hit your usage limit."
+    const stderr = `Summarise this.\nYou've hit your usage limit.\nYou've hit your usage limit.`
+    expect(limitHit(prompt, "", stderr)).toBe(true)
   })
 })

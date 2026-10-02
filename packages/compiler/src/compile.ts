@@ -55,12 +55,18 @@ export const USAGE_LIMIT_PATTERN =
  * stderr before its answer, so a user request that merely mentions "rate limiter"
  * or "quota" must not make an unrelated failure look like a plan limit. Neither
  * tool echoes the prompt on stdout, so every non-empty line of the kept head of
- * stdout is examined. On stderr the echo is cut instead: when a trimmed line of
- * the kept tail equals the prompt's last non-empty line, everything up to and
- * including the last such line is the echo and only what follows is examined;
- * otherwise every line is. (The old per-line "occurs in the prompt" rule dropped
- * the real limit line when the session itself had ended on that limit — the
- * transcript carried the sentence, so the prompt did too. UF-QD.)
+ * stdout is examined. On stderr the echo is cut instead: a trimmed line of the
+ * kept tail ends the echo when it equals the prompt's last non-empty line, or
+ * when it is at least 16 characters and that last line ends with it — the tail
+ * cap can cut the echoed line in half, so the whole line is never found but its
+ * surviving half still marks where the echo stops (UF-QF). Everything up to and
+ * including the LAST echo-ending line is the echo and only what follows is
+ * examined; when no line ends the echo, every line is. One exception: when two
+ * or more lines equal the last line exactly and that line itself names a limit,
+ * the tool repeated the sentence the session ended on and the answer is true.
+ * (The old per-line "occurs in the prompt" rule dropped the real limit line when
+ * the session itself had ended on that limit — the transcript carried the
+ * sentence, so the prompt did too. UF-QD.)
  */
 export function limitHit(prompt: string, stdout: string, stderrTail: string): boolean {
   for (const raw of stdout.slice(0, 4096).split("\n")) {
@@ -76,10 +82,18 @@ export function limitHit(prompt: string, stdout: string, stderrTail: string): bo
   }
   if (last !== undefined) {
     let cut = -1
+    let exactCopies = 0
     for (let i = 0; i < lines.length; i++) {
-      if (lines[i]!.trim() === last) cut = i
+      const line = lines[i]!.trim()
+      if (line === last || (line.length >= 16 && last.endsWith(line))) {
+        cut = i
+        if (line === last) exactCopies++
+      }
     }
-    if (cut >= 0) lines = lines.slice(cut + 1)
+    if (cut >= 0) {
+      if (exactCopies >= 2 && USAGE_LIMIT_PATTERN.test(last)) return true
+      lines = lines.slice(cut + 1)
+    }
   }
   for (const raw of lines) {
     const line = raw.trim()
