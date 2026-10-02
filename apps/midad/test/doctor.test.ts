@@ -434,10 +434,11 @@ describe("mida doctor without a chain", () => {
     }
   })
 
-  // UF-QF: a save stuck past its eighth failed try on an ordinary reason is not waiting on an
-  // allowance — Mida is still retrying it, more slowly and one cheap call at a time, until the
-  // job is seven days old. The queue check says exactly that.
-  it("a save that has failed nine times on an ordinary reason gets the keeps-trying line (UF-QF)", async () => {
+  // UF-QH: a save stuck past its eighth failed try on an ordinary reason is not waiting on an
+  // allowance — Mida is still retrying it, and the line says how often and when it stops: seven
+  // quiet days counted from the session's newest queued event. A summary failure also names the
+  // command that retries it now.
+  it("a save that has failed nine times on a summary reason gets the keeps-trying line naming the retry command (UF-QH)", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const server = await stubDaemon(home, 200, { ok: true })
     try {
@@ -447,8 +448,82 @@ describe("mida doctor without a chain", () => {
       const lines: string[] = []
       await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
       expect(lines).toContain(
-        "PROBLEM: a save from claude-code has failed 9 times (model-failed). Mida keeps trying, more slowly, and drops it when it is seven days old.",
+        "PROBLEM: a save from claude-code has failed 9 times (model-failed). Mida now tries it a few times a day and stops once that session has been quiet for seven days. To retry now, run mida summarizer test: when it passes, Mida tries the save again.",
       )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("eight failed tries on an ordinary reason prints the every-hour line (UF-QH)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 8, failedAt, reason: "chain-error" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain(
+        "PROBLEM: a save from claude-code has failed 8 times (chain-error). Mida now tries it every hour and stops once that session has been quiet for seven days.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("seven failed tries print no keeps-trying line (UF-QH)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 7, failedAt, reason: "chain-error" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines.some((line) => line.includes("has failed"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("nine failed tries on out-of-gas prints the gas line, never the keeps-trying line (UF-QH)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 9, failedAt, reason: "out-of-gas" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain("PROBLEM: claude-code's wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.")
+      expect(lines.some((line) => line.includes("has failed"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("nine failed tries on wallet-low prints the low-gas line, never the keeps-trying line (UF-QH)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 9, failedAt, reason: "wallet-low" })
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        fetch: async () => new Response("{}", { status: 200 }),
+        sponsorReachable: async () => false,
+      })
+      expect(lines).toContain(
+        "PROBLEM: claude-code's saves are waiting because the wallet that pays for them is low on gas. See doctor's sponsor and wallets lines.",
+      )
+      expect(lines.some((line) => line.includes("has failed"))).toBe(false)
     } finally {
       await closeServer(server)
     }

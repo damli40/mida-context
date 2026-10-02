@@ -209,7 +209,8 @@ export interface SummarizerCliDeps {
 }
 
 /**
- * After `use agents`/`use key` writes the new choice (UF-P3): sessions that were waiting on the
+ * After `use agents`/`use key` writes the new choice, or after `mida summarizer test` passes
+ * (UF-P3, UF-QH): sessions that were waiting on the
  * summary model get their waits cleared, the owner is told, and the running service is asked for
  * a pass the way `mida batching` does it — a silent /kick, best-effort, never an error here.
  */
@@ -639,6 +640,7 @@ export async function runSummarizer(argv: string[], deps: SummarizerCliDeps): Pr
       const r = await probe(entry.command)
       if (r.ok) {
         print(`Wrote one test summary with ${entry.display} in ${Math.max(1, Math.round(r.ms / 1000))} s.`)
+        await afterChoiceWritten(deps)
         return 0
       }
       if (r.why === "missing") {

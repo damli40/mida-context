@@ -675,6 +675,63 @@ describe("mida summarizer test", () => {
       "Install Claude Code or Codex, or run: mida summarizer use key",
     ])
   })
+
+  // UF-QH: a passing test is also the way out of a save whose summary has failed eight or more
+  // times — the same clearing `use agents` performs, so the wait resets and the service kicks.
+  it("a passing test clears a waiting save's failure, kicks once and prints the retry line (UF-QH)", async () => {
+    const dir = home()
+    enqueue(dir, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+    dir.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T11:00:00.000Z",
+      attempts: 9,
+      failedAt: "2026-10-01T11:30:00.000Z",
+      reason: "model-failed",
+    })
+    let kicks = 0
+    const r = rig(dir, { onPath: () => true, kick: () => (kicks += 1), probe: async () => ({ ok: true, ms: 2500 }) })
+    expect(await r.run(["summarizer", "test"])).toBe(0)
+    expect(r.lines.at(-2)).toBe("Wrote one test summary with Claude Code (haiku) in 3 s.")
+    expect(r.lines.at(-1)).toBe("Saves that were waiting for a summary model will be tried again now.")
+    expect(kicks).toBe(1)
+    const state = dir.readJson<Record<string, unknown>>("queue/state/s1.json")
+    expect(state?.attempts).toBeUndefined()
+    expect(state?.failedAt).toBeUndefined()
+    expect(state?.reason).toBeUndefined()
+    expect(state?.unusable).toBeUndefined()
+  })
+
+  it("a failing test leaves the wait in place, prints no retry line and never kicks (UF-QH)", async () => {
+    const dir = home()
+    enqueue(dir, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+    dir.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T11:00:00.000Z",
+      attempts: 9,
+      failedAt: "2026-10-01T11:30:00.000Z",
+      reason: "model-failed",
+    })
+    let kicks = 0
+    const r = rig(dir, {
+      onPath: () => true,
+      kick: () => (kicks += 1),
+      probe: async () => ({ ok: false, why: "limit", detail: "exit 1 (usage limit)", ms: 5 }),
+    })
+    expect(await r.run(["summarizer", "test"])).toBe(1)
+    expect(kicks).toBe(0)
+    expect(r.lines.some((line) => line.includes("tried again"))).toBe(false)
+    const state = dir.readJson<Record<string, unknown>>("queue/state/s1.json")
+    expect(state).toMatchObject({ attempts: 9, failedAt: "2026-10-01T11:30:00.000Z", reason: "model-failed" })
+  })
+
+  it("a passing test with nothing waiting prints no retry line (UF-QH)", async () => {
+    const dir = home()
+    const r = rig(dir, { onPath: () => true, kick: () => {}, probe: async () => ({ ok: true, ms: 100 }) })
+    expect(await r.run(["summarizer", "test"])).toBe(0)
+    expect(r.lines.some((line) => line.includes("waiting for a summary model"))).toBe(false)
+  })
 })
 
 // ---------- P2b: the questions ----------

@@ -22,7 +22,7 @@ import { codeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
 import { DEVIN_NODE_SQLITE_MIN } from "./devin-facts.js"
 import { drainerEnv } from "./hook.js"
-import { sessionWaits } from "./drain.js"
+import { SUMMARY_FAILURE_REASONS, sessionWaits } from "./drain.js"
 import { currentSummarizer } from "./summarizer.js"
 import { CODEX_TRUST_SENTENCE, claudeCodeMcpStatus, claudeDesktopConfigPath, claudeHooksStatus, claudeUserConfigPath, codexHooksStatus, codexMcpStatus, cursorMcpConfigPath, devinHooksStatus, installedMcpLauncherPath, macosProtectedFolderNote, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
 import type { InstallTool, McpClientTool } from "./install.js"
@@ -491,7 +491,7 @@ function compileModelLines(view: CompileModelView, env: NodeJS.ProcessEnv): stri
         (v) => (env[v] ?? head.command?.env?.[v]) === undefined || (env[v] ?? head.command?.env?.[v]) === "",
       )
       if (missing.length > 0) {
-        lines.push(problem(`MIDA_COMPILE_MODEL=custom needs ${missing.join(" and ")}`, "set them or unset MIDA_COMPILE_MODEL"))
+        lines.push(problem(`MIDA_COMPILE_MODEL=custom needs ${missing.join(" and ")}`, "set them, or run mida summarizer use agents"))
       }
     }
   } else {
@@ -1103,18 +1103,20 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         for (const agent of noSummarizer) {
           lines.push(`PROBLEM: no model is set up to write Mida's summaries, so ${agent}'s saves are waiting. Run mida summarizer.`)
         }
-        // UF-QF: a save that has already failed eight or more tries on an ordinary (non-wait)
-        // reason is still being retried — the line says so honestly: the retry is slower and
-        // cheaper now, and the job is dropped when it is seven days old.
+        // UF-QH: a save that has failed eight or more tries is still retried. The line says how often
+        // and when Mida stops: seven days after the session's newest queued event, so a session still
+        // in use is never dropped. A summary failure also names the command that retries it now.
         for (const wait of waits) {
           if (
             typeof wait.attempts === "number" &&
             wait.attempts >= 8 &&
             typeof wait.reason === "string" &&
-            !(["sponsor-limit", "summarizer-limit", "no-summarizer"] as readonly string[]).includes(wait.reason)
+            !(["sponsor-limit", "summarizer-limit", "no-summarizer", "out-of-gas", "wallet-low"] as readonly string[]).includes(wait.reason)
           ) {
             lines.push(
-              `PROBLEM: a save from ${wait.agent} has failed ${wait.attempts} times (${wait.reason}). Mida keeps trying, more slowly, and drops it when it is seven days old.`,
+              SUMMARY_FAILURE_REASONS.has(wait.reason)
+                ? `PROBLEM: a save from ${wait.agent} has failed ${wait.attempts} times (${wait.reason}). Mida now tries it a few times a day and stops once that session has been quiet for seven days. To retry now, run mida summarizer test: when it passes, Mida tries the save again.`
+                : `PROBLEM: a save from ${wait.agent} has failed ${wait.attempts} times (${wait.reason}). Mida now tries it every hour and stops once that session has been quiet for seven days.`,
             )
           }
         }

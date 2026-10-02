@@ -110,7 +110,7 @@ const INVALID_CHECKPOINT_MAX_ATTEMPTS = 3
  * the three reasons a try can spend a model call on, so once the tries run long each one
  * waits six hours and (with `attempts: 1`, below) spends a single call.
  */
-const SUMMARY_FAILURE_REASONS = new Set(["model-failed", "no-json", "invalid-checkpoint"])
+export const SUMMARY_FAILURE_REASONS = new Set(["model-failed", "no-json", "invalid-checkpoint"])
 const SUMMARY_BACKOFF_CAP_MS = 6 * 60 * 60 * 1000
 const backoffMs = (attempts: number, cap: number = MAX_BACKOFF_MS) => Math.min(60_000 * 2 ** attempts, cap)
 /**
