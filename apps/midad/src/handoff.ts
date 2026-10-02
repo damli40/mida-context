@@ -142,17 +142,17 @@ export interface QueuedSaves {
   newestChange: Map<string, number>
   lastTryFailed: boolean
   /**
-   * UF-QA: at least one counted session has a failed try for a reason that is NOT one of the
-   * three wait reasons (attempts > 0 on another code) — so a "waiting on" clause must say
-   * "some are" and name the retries still happening beside it.
+   * UF-QF: each counted session's wait reason — session id → the reason its state carried.
+   * Kept per session (not as a bare list of reasons) so the two queue reads merge by session
+   * id and one session is never counted under two reasons.
    */
-  otherFailures: boolean
+  waitingOn: Map<string, WaitReason>
   /**
-   * Every wait reason present among the counted sessions, in WAIT_ORDER (UF-QD — the note names
-   * them all): "sponsor-limit" means the gas sponsor's daily cap, which resets at 00:00 UTC;
-   * the other two mean no summary model can write right now (UF-P3).
+   * UF-QF/UF-QA: the counted sessions whose last failed try was for a reason that is NOT one of
+   * the three waits (attempts > 0 on another code) — the note names the retries still happening
+   * beside the waits ("Mida keeps retrying the rest").
    */
-  waitReasons: WaitReason[]
+  otherFailed: Set<string>
   stuck: number
 }
 
@@ -161,7 +161,7 @@ export interface QueuedSaves {
  * counted sessions wait on different reasons: the sponsor's cap first, then the summary model.
  * (UF-P3: a fixed priority, not arrival order.)
  */
-type WaitReason = "sponsor-limit" | "summarizer-limit" | "no-summarizer"
+export type WaitReason = "sponsor-limit" | "summarizer-limit" | "no-summarizer"
 const WAIT_ORDER: readonly WaitReason[] = ["sponsor-limit", "summarizer-limit", "no-summarizer"]
 
 function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null {
@@ -173,8 +173,8 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
   }
   const perAgent = new Map<string, Set<string>>()
   let lastTryFailed = false
-  let otherFailures = false
-  const waitSeen = new Set<WaitReason>()
+  const waitingOn = new Map<string, WaitReason>()
+  const otherFailed = new Set<string>()
   // CAP-26: each counted session's NEWEST queued change. The drain merges a session's jobs and
   // keeps only the newest, so that is all the queue can honestly tell. The stalest of those is the
   // signal: a session with no new change for an hour that is still not on Monad is stuck.
@@ -197,20 +197,23 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
     // unreadable or malformed state only loses the retry clause, never the count
     try {
       const state = home.readJson<{ attempts?: unknown; reason?: unknown; failedAt?: unknown }>(`queue/state/${job.sessionId}.json`)
-      if (typeof state?.attempts === "number" && state.attempts > 0) {
+      // UF-O/UF-P3: a capacity wait carries no attempts — an allowance, not a failed try — so
+      // it is noticed by reason + failedAt, and it never sets lastTryFailed. UF-QF: the reason
+      // is kept per session — one session holds exactly one reason in each snapshot.
+      const isWait =
+        typeof state?.failedAt === "string" && (WAIT_ORDER as readonly string[]).includes(state.reason as string)
+      if (isWait) {
+        waitingOn.set(job.sessionId, state.reason as WaitReason)
+        otherFailed.delete(job.sessionId)
+      } else if (typeof state?.attempts === "number" && state.attempts > 0) {
         lastTryFailed = true
         // UF-QA: a failed try on a reason that is not one of the three waits still means Mida is
         // retrying that session — the "waiting on" clause must not claim every wait is the same
-        if (!(WAIT_ORDER as readonly string[]).includes(state.reason as string)) otherFailures = true
-      }
-      // UF-O/UF-P3: a capacity wait carries no attempts — an allowance, not a failed try — so
-      // it is noticed by reason + failedAt, and it never sets lastTryFailed above
-      if (typeof state?.failedAt === "string" && (WAIT_ORDER as readonly string[]).includes(state.reason as string)) {
-        waitSeen.add(state.reason as WaitReason)
+        waitingOn.delete(job.sessionId)
+        if (!(WAIT_ORDER as readonly string[]).includes(state?.reason as string)) otherFailed.add(job.sessionId)
       }
     } catch { /* keep the count, drop the clause */ }
   }
-  const waitReasons = WAIT_ORDER.filter((reason) => waitSeen.has(reason))
   // in-13 M-4: a batched save the store refused as composed sits between ledgers — rejected at
   // the store, plaintext kept for the hourly retry — so no queue job names it and no
   // PENDING_ANCHOR block reaches the handoff. Its project comes from the kept plaintext's
@@ -225,10 +228,14 @@ function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null 
     if (typeof value !== "object" || value === null || (value as { projectId?: unknown }).projectId !== projectId) continue
     stuck += 1
   }
-  return { perAgent, newestChange, lastTryFailed, otherFailures, waitReasons, stuck }
+  return { perAgent, newestChange, lastTryFailed, waitingOn, otherFailed, stuck }
 }
 
-/** Two queue snapshots as one: every session either saw, its newest change, any failed try. */
+/**
+ * Two queue snapshots as one: every session either saw, its newest change, any failed try.
+ * The wait reasons merge PER SESSION (UF-QF): a session present in both reads keeps only the
+ * second read's reason, so it is counted once — never once under each reason it carried.
+ */
 export function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): QueuedSaves | null {
   if (a === null) return b
   if (b === null) return a
@@ -238,13 +245,24 @@ export function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): Queue
   }
   const newestChange = new Map(a.newestChange)
   for (const [session, at] of b.newestChange) newestChange.set(session, Math.max(newestChange.get(session) ?? Number.NEGATIVE_INFINITY, at))
+  const waitingOn = new Map(a.waitingOn)
+  const otherFailed = new Set(a.otherFailed)
+  // the second read wins: its classification of a session replaces the first read's, whether
+  // the session moved to a different wait reason or to an ordinary failed try
+  for (const [session, reason] of b.waitingOn) {
+    waitingOn.set(session, reason)
+    otherFailed.delete(session)
+  }
+  for (const session of b.otherFailed) {
+    otherFailed.add(session)
+    waitingOn.delete(session)
+  }
   return {
     perAgent,
     newestChange,
     lastTryFailed: a.lastTryFailed || b.lastTryFailed,
-    otherFailures: a.otherFailures || b.otherFailures,
-    // the union of both lists, in the same fixed order readQueuedSaves applies (UF-QD)
-    waitReasons: WAIT_ORDER.filter((reason) => a.waitReasons.includes(reason) || b.waitReasons.includes(reason)),
+    waitingOn,
+    otherFailed,
     stuck: Math.max(a.stuck, b.stuck),
   }
 }
@@ -255,7 +273,7 @@ export function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): Queue
  */
 export function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shownUnsent: number): string | null {
   if (queued === null) return null
-  const { perAgent, newestChange, lastTryFailed, otherFailures, waitReasons, stuck } = queued
+  const { perAgent, newestChange, lastTryFailed, waitingOn, otherFailed, stuck } = queued
   if (perAgent.size === 0 && stuck === 0) return null
   const clauses: string[] = []
   if (perAgent.size > 0) {
@@ -279,23 +297,26 @@ export function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shown
           : `; ${shownUnsent} of them ${shownUnsent === 1 ? "is" : "are"} shown below, marked UNSENT`
     // UF-O/UF-P3: a capacity wait is an allowance or a missing model, not a failed try — its
     // clause says so and the "last try failed" clause is not added on top of it. UF-QD: every
-    // wait reason present is named — one alone with no other failure keeps the plain clause,
-    // otherwise each is "some are …", and when another counted session DID fail a try for a
-    // different reason the clause names the retries beside the waits.
+    // wait reason present is named, in the fixed order. UF-QF: the count is per reason now —
+    // "1 is …"/"2 are …" — one reason every counted session shares keeps the plain clause, and
+    // sessions whose last try failed for another reason are named beside the waits as "the rest".
     const inner = (reason: WaitReason): string =>
       reason === "sponsor-limit"
         ? "waiting for the gas sponsor's daily limit to reset at 00:00 UTC"
         : reason === "summarizer-limit"
           ? "waiting for the model that writes Mida's summaries: it hit its usage limit"
           : "waiting: no model is set up to write Mida's summaries; the user can run mida summarizer"
+    const reasonCounts = WAIT_ORDER
+      .map((reason) => ({ reason, n: [...waitingOn.values()].filter((r) => r === reason).length }))
+      .filter(({ n }) => n > 0)
     const waiting =
-      waitReasons.length === 0
+      reasonCounts.length === 0
         ? lastTryFailed
           ? " (the last try failed; Mida keeps retrying)"
           : ""
-        : waitReasons.length === 1 && !otherFailures
-          ? ` (${inner(waitReasons[0]!)})`
-          : ` (${waitReasons.map((reason) => `some are ${inner(reason)}`).join("; ")}${otherFailures ? "; Mida keeps retrying the others" : ""})`
+        : reasonCounts.length === 1 && reasonCounts[0]!.n === total
+          ? ` (${inner(reasonCounts[0]!.reason)})`
+          : ` (${reasonCounts.map(({ reason, n }) => `${n} ${n === 1 ? "is" : "are"} ${inner(reason)}`).join("; ")}${otherFailed.size > 0 ? "; Mida keeps retrying the rest" : ""})`
     clauses.push(`${clause}${waiting}${shown}`)
   }
   if (stuck > 0) clauses.push(`${stuck} save${stuck === 1 ? "" : "s"} could not be sent to Monad: see \`mida doctor\``)
