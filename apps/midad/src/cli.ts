@@ -2714,6 +2714,35 @@ function spawnDaemon(cwd: string): void {
   child.unref()
 }
 
+/**
+ * `mida doctor`'s stale-service replacement, extracted so a test can inject the ensure call
+ * and check both the minute-long shutdown wait and what the onStillUp callback prints (UF-QF).
+ * `whenDown: "leave"` is the point of doctor's own swap: it never starts a service that is
+ * down — doctor's daemon check reports that instead.
+ */
+export async function doctorReplaceStaleService(
+  home: MidaHome,
+  ensure: typeof ensureCurrentDaemon = ensureCurrentDaemon,
+): Promise<void> {
+  const ensured = await ensure(home, () => spawnDaemon(home.root), {
+    waitMs: DAEMON_WAIT_MS,
+    whenDown: "leave",
+    // UF-QD: an older service can be slow to stop — allow it a minute, and once it has been
+    // three seconds say the wait is real, not a hang. UF-QF: it may only be sleeping between
+    // tries, so the line no longer claims a save is in flight.
+    shutdownWaitMs: 65_000,
+    onStillUp: () =>
+      process.stderr.write("The older Mida service is still busy. Waiting up to a minute for it to stop.\n"),
+  })
+  if (ensured.replaced !== undefined && ensured.up) {
+    process.stderr.write(
+      `restarted the Mida service (it was running code from ${ensured.replaced.codeRoot} @ ${ensured.replaced.codeCommit.slice(0, 7)})\n`,
+    )
+  } else if (ensured.replaced !== undefined || ensured.refusal !== undefined) {
+    process.stderr.write(`${ensured.refusal ?? "midad did not start; run mida doctor"}\n`)
+  }
+}
+
 /** Entry point for the `mida` command. Monad testnet only; a funder is optional (see testnet.ts). */
 async function main(): Promise<void> {
   // MIDA_HOME must mean the same folder here as in the daemon and both hooks (they all read it);
@@ -2767,24 +2796,7 @@ async function main(): Promise<void> {
     // commands (same ensureCurrentDaemon comparison), writes the same stderr line, and NEVER
     // starts a service that is down: doctor's own daemon check reports that. A refused
     // replacement or a service that does not come up goes to stderr and the checks still run.
-    const replaceStaleService = async (): Promise<void> => {
-      const ensured = await ensureCurrentDaemon(home, () => spawnDaemon(home.root), {
-        waitMs: DAEMON_WAIT_MS,
-        whenDown: "leave",
-        // UF-QD: an older service can be mid-save — allow it a minute, and once it has been
-        // three seconds say the wait is for the save, not a hang
-        shutdownWaitMs: 65_000,
-        onStillUp: () =>
-          process.stderr.write("The older Mida service is finishing a save. Waiting up to a minute for it to stop.\n"),
-      })
-      if (ensured.replaced !== undefined && ensured.up) {
-        process.stderr.write(
-          `restarted the Mida service (it was running code from ${ensured.replaced.codeRoot} @ ${ensured.replaced.codeCommit.slice(0, 7)})\n`,
-        )
-      } else if (ensured.replaced !== undefined || ensured.refusal !== undefined) {
-        process.stderr.write(`${ensured.refusal ?? "midad did not start; run mida doctor"}\n`)
-      }
-    }
+    const replaceStaleService = () => doctorReplaceStaleService(home)
     if (argv[1] === "--live") {
       const tool = argv[2] ?? ""
       if (argv.length !== 3 || !HOOK_TOOLS.includes(tool)) {

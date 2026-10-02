@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { spawn, spawnSync } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
@@ -12,7 +12,7 @@ import { toFunctionSelector } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { encodeUint64 } from "@mida/protocol"
 import { parseDeployment } from "@mida/chain"
-import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, enqueue, installClaudeCode, installCodex, installDevin, isMidaProcess, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor, writeSummarizer } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, doctorReplaceStaleService, enqueue, ensureCurrentDaemon, installClaudeCode, installCodex, installDevin, isMidaProcess, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor, writeSummarizer } from "@mida/midad"
 import type { Runtime } from "@mida/midad"
 import { codeIdentity } from "../src/code-identity.js"
 
@@ -434,6 +434,84 @@ describe("mida doctor without a chain", () => {
     }
   })
 
+  // UF-QF: a save stuck past its eighth failed try on an ordinary reason is not waiting on an
+  // allowance — Mida is still retrying it, more slowly and one cheap call at a time, until the
+  // job is seven days old. The queue check says exactly that.
+  it("a save that has failed nine times on an ordinary reason gets the keeps-trying line (UF-QF)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 9, failedAt, reason: "model-failed" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain(
+        "PROBLEM: a save from claude-code has failed 9 times (model-failed). Mida keeps trying, more slowly, and drops it when it is seven days old.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("the keeps-trying line waits for eight tries — three failures earn no line (UF-QF)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 3, failedAt, reason: "model-failed" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines.some((line) => line.includes("has failed"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a session waiting on a capacity reason earns its own line, never the keeps-trying one (UF-QF)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 9, failedAt, reason: "sponsor-limit" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines.some((line) => line.includes("has failed"))).toBe(false)
+      expect(lines).toContain(
+        "PROBLEM: the gas sponsor has stopped paying for today, so claude-code's saves are waiting. Mida sends them after its limits reset at 00:00 UTC.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  // UF-QF: the review's empty test — `mida doctor`'s stale-service swap must allow the old
+  // service a full minute to stop and must print the busy line through the callback, not a
+  // "finishing a save" claim the service may not be doing. The ensure call is injected.
+  it("doctor's stale-service swap waits a minute and prints the busy line through the callback (UF-QF)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    let seen: Parameters<typeof ensureCurrentDaemon>[2] | undefined
+    const written: string[] = []
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      written.push(String(chunk))
+      return true
+    }) as typeof process.stderr.write)
+    try {
+      await doctorReplaceStaleService(home, async (_h, _spawn, options) => {
+        seen = options
+        options.onStillUp?.()
+        return { up: false }
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(seen?.shutdownWaitMs).toBe(65_000)
+    expect(seen?.whenDown).toBe("leave")
+    expect(written).toContain("The older Mida service is still busy. Waiting up to a minute for it to stop.\n")
+  })
+
   it("the sponsor line says how many SAVES a day its limits really pay for (UF-O)", async () => {
     // one save spends 2 free calls (stub data + gas estimate), so a free-call limit can bind
     // tighter than the signing limit: 120 free calls = 60 saves, not 300
@@ -756,7 +834,7 @@ describe("mida doctor without a chain", () => {
       onPath: (bin) => bin === "codex",
     })
     expect(lines).toContain(
-      "PROBLEM: no model can write Mida's summaries, so no session is being saved. Your environment variables choose a model that cannot run here. Run mida summarizer use agents, or unset MIDA_COMPILE_MODEL.",
+      "PROBLEM: no model can write Mida's summaries, so no session is being saved. Your environment variables choose a model that cannot run here. Run mida summarizer use agents.",
     )
     expect(lines.some((line) => line.includes("Install Claude Code or Codex"))).toBe(false)
   })

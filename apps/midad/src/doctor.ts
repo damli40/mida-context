@@ -460,7 +460,7 @@ function compileModelLines(view: CompileModelView, env: NodeJS.ProcessEnv): stri
     // pin would still point at the missing one
     if (view.mode === "environment") {
       return [
-        "PROBLEM: no model can write Mida's summaries, so no session is being saved. Your environment variables choose a model that cannot run here. Run mida summarizer use agents, or unset MIDA_COMPILE_MODEL.",
+        "PROBLEM: no model can write Mida's summaries, so no session is being saved. Your environment variables choose a model that cannot run here. Run mida summarizer use agents.",
       ]
     }
     return [
@@ -1102,6 +1102,21 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         const noSummarizer = [...new Set(waits.filter((wait) => wait.reason === "no-summarizer").map((wait) => wait.agent))].sort()
         for (const agent of noSummarizer) {
           lines.push(`PROBLEM: no model is set up to write Mida's summaries, so ${agent}'s saves are waiting. Run mida summarizer.`)
+        }
+        // UF-QF: a save that has already failed eight or more tries on an ordinary (non-wait)
+        // reason is still being retried — the line says so honestly: the retry is slower and
+        // cheaper now, and the job is dropped when it is seven days old.
+        for (const wait of waits) {
+          if (
+            typeof wait.attempts === "number" &&
+            wait.attempts >= 8 &&
+            typeof wait.reason === "string" &&
+            !(["sponsor-limit", "summarizer-limit", "no-summarizer"] as readonly string[]).includes(wait.reason)
+          ) {
+            lines.push(
+              `PROBLEM: a save from ${wait.agent} has failed ${wait.attempts} times (${wait.reason}). Mida keeps trying, more slowly, and drops it when it is seven days old.`,
+            )
+          }
         }
         if (waits.length > 0) {
           if (shared.serviceUp === false) {

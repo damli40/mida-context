@@ -1057,6 +1057,8 @@ export interface SessionWait {
   dueAtMs: number
   /** The drain code the last attempt failed with — absent on a gap wait or a pre-in-29 record. */
   reason: string | undefined
+  /** How many failed tries the state carries — doctor needs it to name a save that keeps failing (UF-QF). */
+  attempts: number | undefined
 }
 
 /**
@@ -1078,17 +1080,18 @@ export function sessionWaits(home: MidaHome, jobs: CaptureJob[]): SessionWait[] 
     const job = group[group.length - 1]!
     const state = readState(home, sessionId)
     const reason = state?.reason
+    const attempts = state?.attempts
     const dueAtMs = state === undefined ? undefined : dueAfterFailureMs(state)
     if (dueAtMs !== undefined) {
-      waits.push({ sessionId, agent: job.agent, dueAtMs, reason })
+      waits.push({ sessionId, agent: job.agent, dueAtMs, reason, attempts })
       continue
     }
     if (group.some((j) => FLUSH_EVENTS.has(j.event))) {
-      waits.push({ sessionId, agent: job.agent, dueAtMs: 0, reason })
+      waits.push({ sessionId, agent: job.agent, dueAtMs: 0, reason, attempts })
       continue
     }
     const gapRef = Date.parse(state?.savedAt ?? firstQueuedAt(group))
-    waits.push({ sessionId, agent: job.agent, dueAtMs: gapRef + (state?.savedAt === undefined ? DEFAULT_FIRST_GAP_MS : DEFAULT_MIN_GAP_MS), reason })
+    waits.push({ sessionId, agent: job.agent, dueAtMs: gapRef + (state?.savedAt === undefined ? DEFAULT_FIRST_GAP_MS : DEFAULT_MIN_GAP_MS), reason, attempts })
   }
   return waits
 }
