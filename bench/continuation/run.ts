@@ -101,12 +101,15 @@ const agentBArgv = (): string[] => [
 
 // --late-change: while agent B is already working, the owner changes one
 // decision in a THIRD session (agent C, another Claude Code) that edits
-// nothing. Only Mida's per-prompt hook can carry it to B.
+// nothing. Only Mida's per-prompt hook can carry it to B. The prompt states
+// the decision only and carries no "do not touch anything" restriction: agent
+// C cannot edit anyway (it runs with --allowedTools Read and no permission
+// mode), and a restriction written into the prompt would be saved by Mida and
+// handed on to agent B as a standing rule.
 export const LATE_CHANGE_PROMPT =
   "The owner changed one decision for this project: the keyed limiter class must " +
   "be named KeyedRateLimiter, not KeyedLimiter, everywhere (source, tests and " +
-  "README). Do not open, create or change any file in this session, and do not " +
-  "run any command. Reply with one sentence confirming the new name."
+  "README). Reply with one sentence confirming you have noted it."
 
 // Agent C: no --permission-mode, so it cannot edit; Read only, so it cannot run
 // a command either. The prompt is the whole job — say the new name, touch nothing.

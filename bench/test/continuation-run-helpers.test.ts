@@ -11,7 +11,7 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
 import {
-  LATE_RUNS_ROOT, agentBResumeArgv, agentCArgv, bRanOf, codexSessionIdOf,
+  LATE_CHANGE_PROMPT, LATE_RUNS_ROOT, agentBResumeArgv, agentCArgv, bRanOf, codexSessionIdOf,
   codexToml, harnessMarkersIn, hookCmd, injectCmd, loadScore, parseArgs,
   rawPasteOf, scoreFiles, sessionIdOf, tokensUsedOf, transcriptOfSession,
 } from "../continuation/run.js"
@@ -277,6 +277,16 @@ describe("the late-change rubric", () => {
       score,
     )
     expect(steps.map((s) => s.built)).toEqual([true, false])
+  })
+})
+
+describe("LATE_CHANGE_PROMPT", () => {
+  it("states the decision and carries no session-only restriction", () => {
+    expect(LATE_CHANGE_PROMPT).toContain("KeyedRateLimiter")
+    expect(LATE_CHANGE_PROMPT).toContain("KeyedLimiter")
+    for (const banned of ["do not", "don't", "this session", "any command", "any file"]) {
+      expect(LATE_CHANGE_PROMPT.toLowerCase()).not.toContain(banned)
+    }
   })
 })
 
