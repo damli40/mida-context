@@ -1,0 +1,244 @@
+# A first run of Mida on a Windows machine, started by hand. Two jobs:
+#
+#   native: the published npm package on Windows itself. Mida does not support Windows yet;
+#           this job exists to record exactly which steps fail and how. Every step is allowed
+#           to fail, and the last step prints each step's exit code.
+#   wsl:    the same first run as the Linux job, inside WSL (the Linux layer built into
+#           Windows). This is the route a Windows user can try today.
+#
+# Neither job has Claude Code or Codex, so the agents' own hooks never fire and no model writes
+# a summary. Both use the hosted store and the hosted gas sponsor on Monad testnet: about ten
+# sponsored transactions per job that gets as far as approving. Keys live only on the runner.
+name: Windows first run
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "mida-context version to install from npm"
+        required: false
+        default: "latest"
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: The machine
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\log" | Out-Null
+          [System.Environment]::OSVersion.VersionString
+          node --version
+          npm --version
+
+      - name: Install from npm
+        continue-on-error: true
+        run: |
+          npm install -g "mida-context@${{ inputs.version }}" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install.txt"
+          "install $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          Get-Command mida, midad, mida-hook, mida-inject, mida-mcp -ErrorAction SilentlyContinue | Format-Table Name, Source
+          exit 0
+
+      - name: mida --help
+        continue-on-error: true
+        run: |
+          mida --help 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\help.txt"
+          "help $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: mida init
+        continue-on-error: true
+        timeout-minutes: 6
+        run: |
+          mida init 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\init.txt"
+          "init $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: mida doctor
+        continue-on-error: true
+        timeout-minutes: 4
+        run: |
+          mida doctor 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\doctor.txt"
+          "doctor $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: mida request, in a project folder
+        continue-on-error: true
+        timeout-minutes: 4
+        run: |
+          New-Item -ItemType Directory -Force -Path "$HOME\demo-project" | Out-Null
+          Set-Location "$HOME\demo-project"
+          git init -q .
+          mida request claude-code 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\request-claude-code.txt"
+          "request-claude-code $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          mida request codex 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\request-codex.txt"
+          "request-codex $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: mida approve --all (no terminal here; records what it says)
+        continue-on-error: true
+        timeout-minutes: 4
+        run: |
+          Set-Location "$HOME\demo-project"
+          mida approve --all 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\approve.txt"
+          "approve $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: mida install claude-code and codex
+        continue-on-error: true
+        timeout-minutes: 4
+        run: |
+          mida install claude-code 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install-claude-code.txt"
+          "install-claude-code $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          mida install codex 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install-codex.txt"
+          "install-codex $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: The session-start hook, as an agent would call it
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          Set-Location "$HOME\demo-project"
+          $payload = @{ session_id = "windows-first-run-1"; cwd = (Get-Location).Path; hook_event_name = "SessionStart"; source = "startup" } | ConvertTo-Json -Compress
+          $payload | mida-inject codex 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\handoff.txt"
+          "inject $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: What Mida left on disk, and what is running
+        continue-on-error: true
+        run: |
+          if (Test-Path "$HOME\.mida") {
+            Get-ChildItem -Recurse -File "$HOME\.mida" | ForEach-Object { $_.FullName.Substring("$HOME\.mida".Length + 1) } | Sort-Object | Tee-Object "$env:RUNNER_TEMP\log\files.txt"
+            "--- who may read the owner's key file ---"
+            if (Test-Path "$HOME\.mida\owner\secrets.json") { (Get-Acl "$HOME\.mida\owner\secrets.json").Access | Format-Table IdentityReference, FileSystemRights, AccessControlType | Out-String | Tee-Object "$env:RUNNER_TEMP\log\key-file-acl.txt" }
+          } else { "no .mida folder was created" | Tee-Object "$env:RUNNER_TEMP\log\files.txt" }
+          Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Select-Object ProcessId, CommandLine | Format-List | Out-String | Tee-Object "$env:RUNNER_TEMP\log\node-processes.txt"
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          "## Windows first run, native" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "Exit code of each step (0 = the command reported success):" | Add-Content $env:GITHUB_STEP_SUMMARY
+          "" | Add-Content $env:GITHUB_STEP_SUMMARY
+          if (Test-Path "$env:RUNNER_TEMP\log\exit-codes.txt") { Get-Content "$env:RUNNER_TEMP\log\exit-codes.txt" | ForEach-Object { "- $_" } | Add-Content $env:GITHUB_STEP_SUMMARY }
+          Get-Content "$env:RUNNER_TEMP\log\exit-codes.txt" -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-native-first-run-log
+          path: ${{ runner.temp }}/log
+
+  wsl:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: wsl-bash {0}
+    env:
+      DEMO_OBJECTIVE: "M0 demo checkpoint"
+    steps:
+      - uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-24.04
+          update: "true"
+          additional-packages: curl ca-certificates expect git
+
+      - name: The machine
+        run: |
+          uname -a
+          grep PRETTY_NAME /etc/os-release
+          echo "WSL kernel: $(cat /proc/version)"
+          curl -fsSL https://deb.nodesource.com/setup_22.x | bash - > /dev/null
+          apt-get install -y -q nodejs > /dev/null
+          node --version
+          npm --version
+          mkdir -p /tmp/log
+
+      - name: Install from npm
+        run: |
+          npm install -g "mida-context@${{ inputs.version }}"
+          which mida midad mida-hook mida-inject mida-mcp
+          npm ls -g mida-context
+
+      - name: mida init
+        run: |
+          set -o pipefail
+          date -u +"start %FT%TZ" | tee /tmp/log/times.txt
+          mida init 2>&1 | tee /tmp/log/init.txt
+          test -d "$HOME/.mida"
+
+      - name: Request and approve two agents in a project folder
+        run: |
+          set -o pipefail
+          mkdir -p "$HOME/demo-project" && cd "$HOME/demo-project"
+          git init -q .
+          mida request claude-code 2>&1 | tee /tmp/log/request-claude-code.txt
+          mida request codex 2>&1 | tee /tmp/log/request-codex.txt
+          cat > /tmp/yes.exp <<'EOF'
+          set timeout 240
+          spawn {*}$argv
+          expect {
+            -re {[Tt]ype yes[^\n:]*:} { sleep 1; send "yes\r"; exp_continue }
+            eof
+          }
+          lassign [wait] pid spawnid os_error value
+          exit $value
+          EOF
+          expect /tmp/yes.exp mida approve --all 2>&1 | tee /tmp/log/approve.txt
+          test -f .mida/project.json
+
+      - name: mida doctor
+        run: |
+          cd "$HOME/demo-project"
+          mida doctor 2>&1 | tee /tmp/log/doctor.txt || true
+
+      - name: Save one checkpoint as claude-code
+        run: |
+          set -o pipefail
+          cd "$HOME/demo-project"
+          PROJECT_ID=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(".mida/project.json","utf8")).projectId)')
+          mida save-demo claude-code "$PROJECT_ID" 2>&1 | tee /tmp/log/save.txt
+          grep -q "^saved 0x" /tmp/log/save.txt
+
+      - name: Codex starts a session and receives the handoff
+        run: |
+          set -o pipefail
+          cd "$HOME/demo-project"
+          printf '{"session_id":"wsl-first-run-1","cwd":"%s","hook_event_name":"SessionStart","source":"startup"}' "$PWD" \
+            | mida-inject codex 2>&1 | tee /tmp/log/handoff.txt
+          grep -q "$DEMO_OBJECTIVE" /tmp/log/handoff.txt
+          date -u +"handoff %FT%TZ" | tee -a /tmp/log/times.txt
+
+      - name: Revoke codex, then its next session gets nothing
+        run: |
+          set -o pipefail
+          cd "$HOME/demo-project"
+          expect /tmp/yes.exp mida revoke codex 2>&1 | tee /tmp/log/revoke.txt
+          printf '{"session_id":"wsl-first-run-2","cwd":"%s","hook_event_name":"SessionStart","source":"startup"}' "$PWD" \
+            | mida-inject codex 2>&1 | tee /tmp/log/handoff-after-revoke.txt
+          if grep -q "$DEMO_OBJECTIVE" /tmp/log/handoff-after-revoke.txt; then
+            echo "FAIL: a revoked agent still received the checkpoint"; exit 1
+          fi
+          date -u +"revoked %FT%TZ" | tee -a /tmp/log/times.txt
+
+      - name: File permissions, the background service, and the times
+        if: always()
+        run: |
+          echo "home folder mode: $(stat -c '%a' "$HOME/.mida" 2>/dev/null || echo none)"
+          echo "files readable by group or others (names only):"
+          find "$HOME/.mida" -type f -perm /077 -printf '%m %P\n' 2>/dev/null || true
+          pgrep -fl midad || true
+          cat /tmp/log/times.txt 2>/dev/null || true
