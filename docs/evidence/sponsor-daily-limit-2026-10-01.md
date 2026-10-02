@@ -17,7 +17,7 @@
 
 **What a save costs the sponsor.** 283 sponsored saves: mean 0.067 MON, median 0.067 MON each (gas limit times the price paid; Monad bills the limit).
 
-**The fix.** The owner set `FREE_PER_SENDER_DAILY_LIMIT=900` on the live sponsor on Oct 1; the sponsor's public limits read 120 before and 900 after. In code (branch `user-facing-fixes`): a refused save is labelled as a sponsor limit, waits for the 00:00 UTC reset and is never dropped for it; the handoff and `mida doctor` say saves are waiting; the free-call limit follows the signing limit when unset. Register row CAP-32.
+**The fix.** The owner set `FREE_PER_SENDER_DAILY_LIMIT=900` on the live sponsor on Oct 1; the sponsor's public limits read 120 before and 900 after. In code (release 0.1.2): a refused save is labelled as a sponsor limit, waits for the 00:00 UTC reset and is never dropped for it; the handoff and `mida doctor` say saves are waiting; the free-call limit follows the signing limit when unset.
 
 **How.** Counted from the service's own log on the owner's machine (`~/.mida/logs/drain.jsonl`): lines with `outcome: "saved"` and `sponsored: true`, `outcome: "failed"` by `reason`, and `outcome: "bad"` (dropped). The service was running commit `cb8294a` (npm 0.1.1).
 

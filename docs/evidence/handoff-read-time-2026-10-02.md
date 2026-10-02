@@ -26,6 +26,6 @@
 
 **What it means for a new user.** A new install is fast. An estimate, drawn through two points and not measured: with the fix, the first read after a service start crosses the limit at roughly 400 saved checkpoints, later reads at roughly 600 to 700.
 
-**Status.** Accepted limit (register row CHAIN-04). The planned fix, an index so a read lists one project and not every project, is not built.
+**Status.** Accepted limit, stated in the README under "How it scales". The planned fix, an index so a read lists one project and not every project, is not built.
 
 **Raw data.** `handoff-read-time-2026-10-02.json` (one row per day; counts and milliseconds only).

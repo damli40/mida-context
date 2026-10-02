@@ -8,15 +8,16 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Monad-testnet%2010143-836EF9?style=flat-square&labelColor=14130F" alt="Monad testnet, chain 10143">
   <img src="https://img.shields.io/badge/status-pre--release-b08800?style=flat-square&labelColor=14130F" alt="Pre-release">
-  <img src="https://img.shields.io/badge/tests-3%2C175%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,175 tests passing">
+  <img src="https://img.shields.io/badge/tests-3%2C712%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,712 tests passing">
   <img src="https://img.shields.io/badge/audit-none-7e8c86?style=flat-square&labelColor=14130F" alt="Not audited">
   <img src="https://img.shields.io/badge/license-MIT-7e8c86?style=flat-square&labelColor=14130F" alt="MIT license">
 </p>
 
 <p align="center">
-  <b>Switch AI agents without losing the work.</b> Mida saves what one agent was doing as a short,
-  encrypted checkpoint you own, and hands it to the next agent you approve. Claude Code today, Codex
-  tomorrow, whatever ships next month.
+  <b>Your context, in a store you own.</b> Tell one AI, and every AI you approve can read it. Mida
+  keeps what you tell it about yourself and what your agents learn about your work, encrypted under
+  keys you hold. The first thing it proves is the hardest: one coding agent finishes the job another
+  one started, with your decisions, preferences, last-minute changes and style rules carried over.
 </p>
 
 <p align="center">
@@ -31,8 +32,9 @@
 
 ## The problem
 
-You work with more than one AI agent. One runs out of usage, crashes, or you want a different one
-for the next part of the job. The new agent starts blind. What you asked for, what the first agent
+Right now you are the API between your AI tools: when you switch, you carry the context across by
+hand. One agent runs out of usage, crashes, or you want a different one for the next part of the
+job. The new agent starts blind. What you asked for, what the first agent
 decided and why, what it tried and dropped, what is left: all of it stays inside the first tool.
 
 We measured what "blind" costs. We gave a fresh Codex session a half-finished job and one word,
@@ -72,7 +74,7 @@ Mida is a small service on your machine plus a set of permission rules on a publ
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/architecture/mida-architecture-dark.svg">
-  <img alt="How one checkpoint travels: an agent's session events reach the local Mida service, which has your chosen model summarise them, encrypts the checkpoint, stores the ciphertext, and registers its author and fingerprint on Monad. The next approved agent receives the checkpoint at session start, and can ask Mida again mid-session through its MCP tools. You approve and revoke agents on Monad, and a gas sponsor pays for the transactions by default." src="docs/architecture/mida-architecture-light.svg" width="100%">
+  <img alt="How work passes from one agent to the next. An agent such as Claude Code, Codex or Devin works, and Mida, running on your machine, receives what happens in the session. A model you choose (your agents' own small models, or your own API key) writes a short summary of what was decided and what is left to do; secrets are removed first. Mida locks the summary on your machine and sends out two things: the locked copy to a store that holds it but cannot read it, and a fingerprint plus who wrote it to the Monad blockchain, where a gas sponsor pays the fee by default. When the next agent starts, Mida checks on Monad that you approved it, fetches the locked copy, unlocks it on your machine and hands the summary to the agent, which continues the work. Only you approve or revoke an agent, from your terminal or a passkey page, and that decision is recorded on Monad. If a save cannot go out yet, it waits on your machine, Mida retries it, and the next agent is told." src="docs/architecture/mida-architecture-light.svg" width="100%">
 </picture>
 
 ## Who builds on Mida
@@ -110,7 +112,8 @@ grants the user signed; your app never holds the user's owner keys. Full referen
 - [Supported agents](#supported-agents)
 - [How it works](#how-it-works)
 - [Commands](#commands)
-- [Bring your own compile model](#bring-your-own-compile-model)
+- [Who writes the summaries](#who-writes-the-summaries)
+- [Remove Mida](#remove-mida)
 - [Security model and limits](#security-model-and-limits)
 - [What it costs to run](#what-it-costs-to-run)
 - [What works and what doesn't](#what-works-and-what-doesnt)
@@ -122,24 +125,35 @@ grants the user signed; your app never holds the user's owner keys. Full referen
 
 ## Quickstart
 
-**You need:** Node.js 22 or later, and Claude Code and/or Codex. By default Mida uses a hosted
-encrypted store and a gas sponsor, so you need no testnet tokens. A setup made before the sponsor existed
-joins it with `mida sponsor on`.
+**You need:** macOS or Linux, Node.js 22 or later, and Claude Code and/or Codex. Windows is not
+supported yet. By default Mida uses a hosted encrypted store and a gas sponsor, so you need no
+testnet tokens. A setup made before the sponsor existed joins it with `mida sponsor on`.
+
+Mida needs a model to write its summaries. With Claude Code or Codex installed it uses their small
+models. With neither (Claude Desktop or Cursor only, for example), give it an API key with
+`mida summarizer use key`; until you do, nothing is saved, and `mida doctor` says so.
 
 ```bash
 npm install -g mida-context
-mida init                       # your owner key and one identity per agent; add --passkey to approve with a passkey
+mida init                       # your owner key, one identity per agent, and one question (below)
 mida install claude-code        # hooks, plus Mida's MCP tools so a session can ask Mida mid-task
 mida install codex              # the same; then open Codex once, type /hooks, and trust the Mida entries
-mida doctor                     # one line per check; every PROBLEM names its fix
+mida doctor                     # one line per check; a PROBLEM line says what is wrong
 ```
+
+`mida init` asks one question: who writes your summaries. Press Enter to use your agents' own
+small models, or choose your own API key. It asks only in a terminal, and only when nothing has
+chosen yet; `mida summarizer` shows the current choice at any time.
+[Who writes the summaries](#who-writes-the-summaries) says who reads your chat in each case. Add
+`--passkey` to approve with a passkey.
 
 Then, inside your project folder, in a real terminal window:
 
 ```bash
 mida request claude-code
 mida request codex
-mida approve --all              # shows what each agent asks for; type yes
+mida approve --all              # shows what each agent asks for; type yes (a request lasts 5 minutes)
+mida doctor --live claude-code  # starts a throwaway session and checks that Mida's hook fires
 ```
 
 Work in Claude Code as usual. When you stop, or it runs out, open Codex in the same folder. The
@@ -152,13 +166,21 @@ mida revoke codex               # codex's future reads are refused, on chain
 The full walkthrough, with the expected output of every step, is
 [`docs/quickstart.md`](docs/quickstart.md).
 
+**Updating.** Run `npm install -g mida-context@latest`, then `mida doctor`. Doctor replaces the
+background service the old version left running; if that service is finishing a save, doctor waits
+up to a minute for it.
+
+**Something wrong?** Run `mida doctor` and `mida summarizer`, then open an
+[issue](https://github.com/damli40/mida-context/issues) with both outputs. They print no API keys
+and none of your session text.
+
 <details>
 <summary>Install from source instead</summary>
 
 ```bash
 git clone --recurse-submodules https://github.com/damli40/mida-context && cd mida-context
 pnpm install && pnpm build:publish
-cd publish/cli && npm pack && npm install -g mida-context-0.1.1.tgz
+cd publish/cli && npm pack && npm install -g mida-context-0.1.2.tgz
 ```
 
 </details>
@@ -175,7 +197,7 @@ cd publish/cli && npm pack && npm install -g mida-context-0.1.1.tgz
 | Your own app | The SDK | In tests, local chain |
 
 Each client gets its own identity, so you approve and revoke them one at a time. `mida install
-<client>` writes the configuration for you, the MCP server included; `--no-mcp` leaves it out. ChatGPT chats are not supported: they cannot run local
+<client>` writes the configuration for you, the MCP server included; for Claude Code and Codex, `--no-mcp` leaves it out. ChatGPT chats are not supported: they cannot run local
 hooks or a local MCP server.
 
 ---
@@ -241,8 +263,9 @@ task.
 | Command | What it does |
 |---|---|
 | `mida init` / `mida init --passkey` | Create your owner key and agent identities, start the service |
-| `mida install <client> [--no-mcp]` / `uninstall <client>` | Add or remove Mida for `claude-code`, `codex`, `devin`, `claude-desktop`, `cursor` |
-| `mida doctor` | Check everything; each problem names its fix |
+| `mida install <client> [--no-mcp]` / `uninstall <client>` | Add or remove Mida for `claude-code`, `codex`, `devin`, `claude-desktop`, `cursor`. `--no-mcp` applies to `claude-code` and `codex` |
+| `mida doctor` / `doctor --live claude-code\|codex` | Check everything; a PROBLEM line says what is wrong and, where there is one, the command that fixes it. `--live` starts a throwaway session and checks the hook fires |
+| `mida summarizer` / `summarizer use agents\|key` / `summarizer test` | See who writes your summaries, switch it, or write one test summary |
 | `mida request <agent>` | The agent asks for access |
 | `mida approve <agent>` / `approve --all` | You approve it for this folder (terminal only; type `yes`) |
 | `mida revoke <agent>` / `revoke --all` | End its access and rotate the read keys (terminal only) |
@@ -259,24 +282,72 @@ task.
 
 ---
 
-## Bring your own compile model
+## Who writes the summaries
 
-The compile model is the one part of Mida that reads your session text, so you choose it. By default
-Mida tries DeepSeek (if `DEEPSEEK_API_KEY` is set), then Kimi (if `KIMI_API_KEY` is set), then Claude
-Haiku through your local `claude` login. Any server that speaks the OpenAI-compatible
-chat-completions API can replace all three, a local model included:
+When a session ends, Mida turns the chat into a short record for your next agent. A model has to
+write that record, and it is the one part of Mida that reads your session text. So you choose it:
+`mida init` asks, and `mida summarizer` shows the answer and changes it.
+
+| Choice | Who reads your chat | What it uses |
+|---|---|---|
+| **Your agents' small models** (the default) | Anthropic or OpenAI, under your own login. Claude Code's `haiku` goes first; Codex's `luna` takes over if Claude can't | Your plan: about one small-model message a minute while your agent works. When your plan hits its limit, that model stops |
+| **Your own API key** | The provider you choose: DeepSeek, Moonshot, or any OpenAI-compatible endpoint, a local model included | Your key. Most providers charge under one cent a summary |
+
+```bash
+mida summarizer                 # who writes them now, and whether it is working
+mida summarizer use agents      # your agents' small models
+mida summarizer use key         # asks for a provider and a key; stores it in ~/.mida, readable only by you
+mida summarizer test            # writes one test summary, says who wrote it, retries waiting saves
+```
+
+What to know before you pick:
+
+- **Install both tools if you can.** A plan's limit covers every model on that plan, the small one
+  included. With only Claude Code installed, summaries stop when Claude does. With Codex installed
+  too, Codex's small model writes them, and the hand-off still works.
+- **The backup crosses companies.** When Codex writes the summary of a Claude Code session, OpenAI
+  reads that session's text. Choose your own key if you want one named reader.
+- **Your own key has no backup.** A failed call is retried, never sent to another provider.
+- **A save that cannot be written yet waits.** A save waiting on a usage limit is retried every
+  hour. A save whose summary keeps failing is retried often at first, then a few times a day,
+  by then asking each model once per try, so a stuck save cannot drain your plan. Mida stops
+  once that session has been quiet for seven days. The next agent's handoff says saves are
+  waiting, and `mida doctor` names the reason. Fixed the cause? Run `mida summarizer test`: when
+  it passes, Mida retries the waiting saves. Mida gives up early in one case: a save the model
+  keeps answering with something it cannot use.
+- Secrets are scrubbed before any model sees the text, and again from its answer.
+
+The agent tools run in an empty folder with their hooks and your personal settings switched off.
+Codex runs in its read-only sandbox, so it can change nothing. A current Claude Code runs with no
+tools at all. An older Claude Code that lacks that switch runs with its tools under their default
+permission rules, so update Claude Code if you rely on this.
+Measured on Oct 1, 2026 with one sample
+([evidence](docs/evidence/summariser-probe-2026-10-01.md)): a 5,000-character session took Claude's
+small model 21 seconds and Codex's 35 seconds; both returned a valid record, and each missed one
+detail the other caught.
+
+<details>
+<summary>Environment variables (what Mida used before 0.1.2, still honoured when you have saved no choice)</summary>
+
+With no saved choice, Mida tries DeepSeek (if `DEEPSEEK_API_KEY` is set), then Kimi (if
+`KIMI_API_KEY` is set), then your agents' small models. Any server that speaks the OpenAI-compatible
+chat-completions API can replace them, a local model included:
 
 ```bash
 export MIDA_COMPILE_MODEL=custom
 export MIDA_COMPILE_BASE_URL=http://127.0.0.1:11434/v1    # e.g. a local Ollama server
 export MIDA_COMPILE_MODEL_ID=<your model name>
-mida doctor                                             # shows the provider and the host your text goes to
+mida summarizer                                         # shows what the running service uses
 ```
 
 - The endpoint must be `https://`, or `http://` on loopback only.
 - A failed custom compile has no fallback, so Mida never sends your text to a vendor you did not
   pick. Set `MIDA_COMPILE_FALLBACK=1` to allow it.
 - Mida strips `ANTHROPIC_*` variables from everything it starts.
+- The background service reads these from whatever started it, which may not be your shell. A
+  saved choice (`mida summarizer use ...`) does not have that problem.
+
+</details>
 
 Your model returns one JSON object with ten fields; the schema and limits are in
 [`packages/checkpoint/src/schema.ts`](packages/checkpoint/src/schema.ts). Mida trims fields over
@@ -304,16 +375,74 @@ their limits, retries a bad answer once, and scrubs secrets from the output agai
   read every task in it.
 - **Software-mode keys are files on your disk.** Passkey mode keeps the owner key off disk; agent
   keys are always files.
-- **Your compile model sees your scrubbed session text.** A local model keeps it on your machine.
+- **The model that writes your summaries sees your scrubbed session text.** A local model keeps it
+  on your machine. [Who writes the summaries](#who-writes-the-summaries) names the reader for each
+  choice.
 - **Testnet only, not audited.** Do not store anything you cannot afford to lose.
+
+**What a handoff keeps, and what it leaves out**
+
+- A handoff never leaves out a constraint, a decision or a rejected approach to save space. When
+  it runs long, Mida trims progress notes, the list of saves and file lists first, then the
+  reasons behind decisions, and says at the top what it left out.
+- A list holds at most 50 entries per save. Past that, Mida keeps the newest 50 (for the remaining
+  plan, the first 50). When constraints, decisions or rejected approaches were left out, the
+  handoff says so; progress notes and file lists are cut without a note.
+- A save that has not reached Monad yet is shown to the next agent marked `UNSENT`, with a warning
+  that the chain has not checked it.
+
+**The gas sponsor's limits**
+
+- The hosted sponsor pays for a set number of saves per agent each day, and has one daily budget
+  shared by everyone. `mida doctor` prints the live numbers. Both reset at 00:00 UTC.
+- When the limit is reached, saves wait on your machine. Mida retries them every hour and right
+  after the reset. The next
+  agent's handoff says they are waiting. Mida keeps a waiting save until its session has been
+  quiet for seven days.
+
+**Approvals**
+
+- Approving an agent again after its grant expires (grants last 30 days) no longer scans the
+  chain's history; it asks the contract. One case is not seen: a single permission revoked on its
+  own and later tidied away by a new grant, on a machine that never saw the revoke. `mida revoke`
+  always revokes the whole agent, which every machine sees.
 
 ---
 
 ## What it costs to run
 
-Each save is one call to your compile model and one Monad transaction, or a share of a batch with
-batching on. An agent at work saves about once a minute. On testnet the sponsor pays the gas, so you
-pay nothing; one direct save cost about 0.03 testnet MON on Sep 21. Mainnet costs are not measured.
+Each save is one call to the model that writes your summaries and one Monad transaction, or a share
+of a batch with batching on. An agent at work saves about once a minute at most.
+
+- **Gas.** On testnet the sponsor pays, so you pay nothing. A sponsored save cost about 0.067
+  testnet MON on average (191 saves, Sep 29 to Oct 1). Mainnet costs are not measured.
+- **Summaries on your agents' plans.** Each summary is one small-model message. Mida's Claude
+  command adds about 3,600 tokens of overhead per call; Codex's adds about 25,000, which is why
+  Claude goes first (measured Oct 1, one call each).
+- **Summaries on your own key.** A typical summary reads about 3,800 tokens and writes about
+  5,000 (median of 235 saves). At list prices on Oct 1, 2026 that is under one cent on most
+  providers.
+
+---
+
+## Remove Mida
+
+```bash
+mida revoke --all                       # end every agent's access, on chain
+mida uninstall claude-code              # remove the hooks and the MCP entry; repeat for each tool
+mida uninstall codex
+npm uninstall -g mida-context
+```
+
+Mida's background service keeps running until you restart your machine. To stop it now, find it
+with `pgrep -fl midad` and `kill` the number it prints. There is no `mida stop` command yet.
+
+Three things stay until you delete them: `~/.mida` on your machine (your keys, the queue and the
+logs), the `.mida` folder in each project, and the encrypted records in the store. Records of who
+wrote what, and which agent you approved or revoked, are on Monad testnet and cannot be removed;
+they hold fingerprints, never content. Delete `~/.mida` only when you are sure: in the default
+setup it holds the only copies of your keys, and without them nobody can decrypt what you saved,
+you included. `mida export <folder>` writes a readable copy first.
 
 ---
 
@@ -330,6 +459,8 @@ pay nothing; one direct save cost about 0.03 testnet MON on Sep 21. Mainnet cost
 | A change of plan you make mid-session reaches the next agent, credited to you | ✅ 6 of 6 on a real model, was 0 of 6 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | A new session in a busy project reads every save in batched chain calls: 155 saves in 5.1 s, where it used to time out | ✅ Live, Sep 29 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | Session start in a large account | ⚠️ Measured Oct 1: 6.1 s at 250 saved sessions, against a 7.5 s cut-off. It slows as you save more ([How it scales](#how-it-scales)) |
+| Summaries written by your agents' own small models: Claude Code's first, Codex's when Claude can't | ✅ Run for real, Oct 1 and 2 ([evidence](docs/evidence/summariser-probe-2026-10-01.md)) |
+| A save that can't go out yet waits and is retried, and the next agent is told: the sponsor's daily limit, a model at its usage limit | ✅ In tests. We found the gap in a real outage on Oct 1 ([evidence](docs/evidence/sponsor-daily-limit-2026-10-01.md)) |
 | Mid-session reads from Claude Code and Codex through Mida's MCP tools | ✅ In tests (Claude Desktop live, Sep 27) |
 | `mida sponsor on\|off` for a setup made before the sponsor existed | ✅ In tests |
 | SDK, named tasks, folder linking, `mida export` | ✅ In tests on a local chain; not yet run live |
@@ -337,7 +468,7 @@ pay nothing; one direct save cost about 0.03 testnet MON on Sep 21. Mainnet cost
 | npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
 | Security audit | ❌ None |
 
-3,175 automated tests pass on this release: `pnpm test`.
+3,712 automated tests pass on this release: `pnpm test`.
 
 ---
 
@@ -377,8 +508,15 @@ about one in four, did not get their full memory
 
 </details>
 
+**What 0.1.2 changes.** Every read used to fetch two keys that never change, about 2 seconds each
+time. 0.1.2 keeps them in memory. On the same account, at 298 saves, the first read after the
+service started took 6.3 s and the next two took 3.3 s and 2.8 s
+([method and raw data](docs/evidence/handoff-read-time-2026-10-02.md)). That is three reads on a
+test build. We have not measured it on a running service over days.
+
 **Not measured yet:** how much each extra checkpoint adds (we timed one size), and a session start
-on a new account with a handful of saves. Both measurements come from one owner on one machine.
+on a new account with a handful of saves. All of these measurements come from one owner on one
+machine.
 
 **We designed the fix. It is not in this release.** Each agent will keep a memory index: a signed,
 encrypted table of contents of its saved sessions. In the common case a session start will read the
