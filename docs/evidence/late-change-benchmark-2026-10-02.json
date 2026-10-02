@@ -1,0 +1,396 @@
+{
+ "benchmark": "late change: a decision made in another session after the second agent started",
+ "date": "2026-10-02",
+ "product_commit": "22d79d99 (0.1.2)",
+ "task": "bench/fixtures/continuation-task (the rate-limiter task)",
+ "stop_at": "tryTake (agent A is stopped once step 1 is written)",
+ "agent_a_and_c": "Claude Code 2.1.287, model sonnet",
+ "agent_b": "Codex CLI 0.159.2, model gpt-6.1-sol, two turns in one session (exec, then exec resume), each told only \"Continue.\"",
+ "late_change_prompt": "The owner changed one decision for this project: the keyed limiter class must be named KeyedRateLimiter, not KeyedLimiter, everywhere (source, tests and README). Reply with one sentence confirming you have noted it.",
+ "runs": [
+  {
+   "condition": "mida",
+   "run": 1,
+   "aSecondsBeforeStop": 9,
+   "bFirstTurnSeconds": 128,
+   "bFirstTurnTokens": 17883,
+   "cSeconds": 4,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 30,
+   "bSecondTurnTokens": 23323,
+   "bRan": true,
+   "newNameExported": true,
+   "oldNameGone": true,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": true,
+   "oldNameMentionsLeftAnywhere": 0,
+   "handoffsServedToCodex": [
+    {
+     "chars": 3844,
+     "checkpoints": 1
+    },
+    {
+     "chars": 3549,
+     "checkpoints": 3
+    }
+   ],
+   "perPromptNoteUpdates": [
+    0,
+    0
+   ]
+  },
+  {
+   "condition": "mida",
+   "run": 2,
+   "aSecondsBeforeStop": 8,
+   "bFirstTurnSeconds": 135,
+   "bFirstTurnTokens": 18766,
+   "cSeconds": 5,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 25,
+   "bSecondTurnTokens": 24219,
+   "bRan": true,
+   "newNameExported": true,
+   "oldNameGone": true,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": true,
+   "oldNameMentionsLeftAnywhere": 0,
+   "handoffsServedToCodex": [
+    {
+     "chars": 4112,
+     "checkpoints": 1
+    },
+    {
+     "chars": 3725,
+     "checkpoints": 3
+    }
+   ],
+   "perPromptNoteUpdates": [
+    0,
+    0
+   ]
+  },
+  {
+   "condition": "mida",
+   "run": 3,
+   "aSecondsBeforeStop": 9,
+   "bFirstTurnSeconds": 130,
+   "bFirstTurnTokens": 18594,
+   "cSeconds": 5,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 28,
+   "bSecondTurnTokens": 39869,
+   "bRan": true,
+   "newNameExported": true,
+   "oldNameGone": true,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": true,
+   "oldNameMentionsLeftAnywhere": 0,
+   "handoffsServedToCodex": [
+    {
+     "chars": 4362,
+     "checkpoints": 1
+    },
+    {
+     "chars": 3556,
+     "checkpoints": 3
+    }
+   ],
+   "perPromptNoteUpdates": [
+    0,
+    0
+   ]
+  },
+  {
+   "condition": "mida",
+   "run": 4,
+   "aSecondsBeforeStop": 9,
+   "bFirstTurnSeconds": 119,
+   "bFirstTurnTokens": 17586,
+   "cSeconds": 6,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 28,
+   "bSecondTurnTokens": 23209,
+   "bRan": true,
+   "newNameExported": true,
+   "oldNameGone": true,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": true,
+   "oldNameMentionsLeftAnywhere": 0,
+   "handoffsServedToCodex": [
+    {
+     "chars": 4016,
+     "checkpoints": 1
+    },
+    {
+     "chars": 3578,
+     "checkpoints": 3
+    }
+   ],
+   "perPromptNoteUpdates": [
+    0,
+    0
+   ]
+  },
+  {
+   "condition": "mida",
+   "run": 5,
+   "aSecondsBeforeStop": 12,
+   "bFirstTurnSeconds": 129,
+   "bFirstTurnTokens": 40260,
+   "cSeconds": 8,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 25,
+   "bSecondTurnTokens": 47753,
+   "bRan": true,
+   "newNameExported": true,
+   "oldNameGone": true,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": true,
+   "oldNameMentionsLeftAnywhere": 0,
+   "handoffsServedToCodex": [
+    {
+     "chars": 4212,
+     "checkpoints": 1
+    },
+    {
+     "chars": 3683,
+     "checkpoints": 3
+    }
+   ],
+   "perPromptNoteUpdates": [
+    0,
+    0
+   ]
+  },
+  {
+   "condition": "none",
+   "run": 1,
+   "aSecondsBeforeStop": 10,
+   "bFirstTurnSeconds": 37,
+   "bFirstTurnTokens": 10290,
+   "cSeconds": 4,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 10,
+   "bSecondTurnTokens": 10545,
+   "bRan": true,
+   "newNameExported": false,
+   "oldNameGone": true,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": false,
+   "oldNameMentionsLeftAnywhere": 0
+  },
+  {
+   "condition": "none",
+   "run": 2,
+   "aSecondsBeforeStop": 9,
+   "bFirstTurnSeconds": 33,
+   "bFirstTurnTokens": 9881,
+   "cSeconds": 4,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 42,
+   "bSecondTurnTokens": 12994,
+   "bRan": true,
+   "newNameExported": false,
+   "oldNameGone": true,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": false,
+   "oldNameMentionsLeftAnywhere": 0
+  },
+  {
+   "condition": "none",
+   "run": 3,
+   "aSecondsBeforeStop": 15,
+   "bFirstTurnSeconds": 44,
+   "bFirstTurnTokens": 10838,
+   "cSeconds": 4,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 11,
+   "bSecondTurnTokens": 20345,
+   "bRan": true,
+   "newNameExported": false,
+   "oldNameGone": true,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": false,
+   "oldNameMentionsLeftAnywhere": 0
+  },
+  {
+   "condition": "none",
+   "run": 4,
+   "aSecondsBeforeStop": 10,
+   "bFirstTurnSeconds": 36,
+   "bFirstTurnTokens": 18225,
+   "cSeconds": 5,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 38,
+   "bSecondTurnTokens": 22242,
+   "bRan": true,
+   "newNameExported": false,
+   "oldNameGone": true,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": false,
+   "oldNameMentionsLeftAnywhere": 0
+  },
+  {
+   "condition": "none",
+   "run": 5,
+   "aSecondsBeforeStop": 9,
+   "bFirstTurnSeconds": 61,
+   "bFirstTurnTokens": 20414,
+   "cSeconds": 4,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 10,
+   "bSecondTurnTokens": 21443,
+   "bRan": true,
+   "newNameExported": false,
+   "oldNameGone": true,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": false,
+   "oldNameMentionsLeftAnywhere": 0
+  },
+  {
+   "condition": "raw",
+   "run": 1,
+   "aSecondsBeforeStop": 8,
+   "bFirstTurnSeconds": 107,
+   "bFirstTurnTokens": 16344,
+   "cSeconds": 3,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 15,
+   "bSecondTurnTokens": 19294,
+   "bRan": true,
+   "newNameExported": false,
+   "oldNameGone": false,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": false,
+   "oldNameMentionsLeftAnywhere": 7,
+   "pastedCharsAtStart": 3280
+  },
+  {
+   "condition": "raw",
+   "run": 2,
+   "aSecondsBeforeStop": 9,
+   "bFirstTurnSeconds": 127,
+   "bFirstTurnTokens": 21460,
+   "cSeconds": 6,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 18,
+   "bSecondTurnTokens": 24185,
+   "bRan": true,
+   "newNameExported": false,
+   "oldNameGone": false,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": false,
+   "oldNameMentionsLeftAnywhere": 8,
+   "pastedCharsAtStart": 3368
+  },
+  {
+   "condition": "raw",
+   "run": 3,
+   "aSecondsBeforeStop": 8,
+   "bFirstTurnSeconds": 115,
+   "bFirstTurnTokens": 28304,
+   "cSeconds": 4,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 16,
+   "bSecondTurnTokens": 30940,
+   "bRan": true,
+   "newNameExported": false,
+   "oldNameGone": false,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": false,
+   "oldNameMentionsLeftAnywhere": 8,
+   "pastedCharsAtStart": 3569
+  },
+  {
+   "condition": "raw",
+   "run": 4,
+   "aSecondsBeforeStop": 9,
+   "bFirstTurnSeconds": 107,
+   "bFirstTurnTokens": 27814,
+   "cSeconds": 4,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 18,
+   "bSecondTurnTokens": 32597,
+   "bRan": true,
+   "newNameExported": false,
+   "oldNameGone": false,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": false,
+   "oldNameMentionsLeftAnywhere": 7,
+   "pastedCharsAtStart": 3220
+  },
+  {
+   "condition": "raw",
+   "run": 5,
+   "aSecondsBeforeStop": 10,
+   "bFirstTurnSeconds": 110,
+   "bFirstTurnTokens": 16806,
+   "cSeconds": 4,
+   "cChangedFiles": false,
+   "bSecondTurnSeconds": 17,
+   "bSecondTurnTokens": 33679,
+   "bRan": true,
+   "newNameExported": false,
+   "oldNameGone": false,
+   "noTimersRuleKept": true,
+   "testsPass": true,
+   "bSawHarnessFiles": [],
+   "lateChangeApplied": false,
+   "oldNameMentionsLeftAnywhere": 8,
+   "pastedCharsAtStart": 3322
+  }
+ ],
+ "summary": {
+  "mida": {
+   "runs": 5,
+   "lateChangeApplied": 5,
+   "cChangedFiles": 0,
+   "bSecondTurnSeconds_median": 28,
+   "bSecondTurnTokens_median": 24219
+  },
+  "none": {
+   "runs": 5,
+   "lateChangeApplied": 0,
+   "cChangedFiles": 0,
+   "bSecondTurnSeconds_median": 11,
+   "bSecondTurnTokens_median": 20345
+  },
+  "raw": {
+   "runs": 5,
+   "lateChangeApplied": 0,
+   "cChangedFiles": 0,
+   "bSecondTurnSeconds_median": 17,
+   "bSecondTurnTokens_median": 30940
+  }
+ },
+ "pilots_not_counted": "3 runs with an earlier wording of the late-change prompt; see the .md file"
+}
