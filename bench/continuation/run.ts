@@ -7,7 +7,7 @@
 // provisioned on the local chain, with a real daemon holding the home while
 // the agents run.
 //
-//   --condition none|raw|mida  --run <n>  [--a-seconds 240]
+//   --condition none|raw|mida  --run <n>  [--a-seconds 240]  [--stop-at <text>]
 //   [--codex-auth <path>]  [--dry-run]  [--agent-a-cmd|--agent-b-cmd '<json>']
 //
 // The three conditions differ only in what agent B sees at session start:
@@ -52,7 +52,10 @@ const TOY_TASK = join(REPO_ROOT, "bench", "fixtures", "continuation-task")
 const HOOK_MAIN = join(REPO_ROOT, "apps", "midad", "src", "hook-main.ts")
 const INJECT_MAIN = join(REPO_ROOT, "apps", "midad", "src", "inject-main.ts")
 export const RUNS_ROOT = join(REPO_ROOT, "bench", "continuation", "runs")
-const WATCH = "msUntilAvailable" // string in bucket.mjs that ends A's run early
+// Default text the poll looks for in src/bucket.mjs to stop agent A early.
+// Overridden by --stop-at: today's Claude Code writes several steps in one
+// edit, so the point where A is stopped is a setting, not a constant.
+const WATCH = "msUntilAvailable"
 const RAW_TAIL_CHARS = 8_000 // ~the handoff's own size budget, so raw competes fairly
 const QUEUE_WAIT_CAP_MS = 150_000
 const B_LIMIT_MS = 600_000
@@ -96,19 +99,24 @@ interface Args {
   condition: "none" | "raw" | "mida"
   run: number
   aSeconds: number
+  /** the text in src/bucket.mjs that stops agent A; default WATCH */
+  stopAt: string
   codexAuth?: string
   dryRun: boolean
   agentACmd?: string
   agentBCmd?: string
 }
 
-function parseArgs(argv: readonly string[]): Args {
+export function parseArgs(argv: readonly string[]): Args {
   const args: Record<string, string> & { dryRun: boolean } = { dryRun: false }
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]!
     if (a === "--dry-run") args.dryRun = true
-    else if (a.startsWith("--")) args[a.slice(2)] = argv[++i]
-    else throw new Error(`unknown arg: ${a}`)
+    else if (a.startsWith("--")) {
+      const v = argv[++i]
+      if (v === undefined) throw new Error(`${a} needs a value`)
+      args[a.slice(2)] = v
+    } else throw new Error(`unknown arg: ${a}`)
   }
   if (!["none", "raw", "mida"].includes(args.condition ?? "")) {
     throw new Error("--condition none|raw|mida is required")
@@ -116,10 +124,15 @@ function parseArgs(argv: readonly string[]): Args {
   if (args.run === undefined || !/^\d+$/.test(args.run)) throw new Error("--run <n> is required")
   const aSeconds = args["a-seconds"] !== undefined ? Number(args["a-seconds"]) : 240
   if (!Number.isFinite(aSeconds) || aSeconds <= 0) throw new Error("--a-seconds needs a positive number")
+  const stopAt = args["stop-at"] ?? WATCH
+  if (args["stop-at"] !== undefined && (args["stop-at"] === "" || args["stop-at"].startsWith("--"))) {
+    throw new Error("--stop-at needs a non-empty string")
+  }
   return {
     condition: args.condition as Args["condition"],
     run: Number.parseInt(args.run, 10),
     aSeconds,
+    stopAt,
     codexAuth: args["codex-auth"],
     dryRun: args.dryRun,
     agentACmd: args["agent-a-cmd"],
@@ -270,27 +283,54 @@ function snapshotDiff(work: string, outFile: string): void {
   )
 }
 
-/** The newest Claude transcript touched since `sinceMs` — agent A's own session file. */
-function newestTranscript(sinceMs: number): string | null {
-  const root = join(os.homedir(), ".claude", "projects")
-  let best: { path: string; mtime: number } | null = null
+/** The session id Claude Code printed in its stream-json output: the first line that parses as
+ *  JSON and carries a non-empty string `session_id`. Null when there is none. */
+export function sessionIdOf(aOutputText: string): string | null {
+  for (const line of aOutputText.split("\n")) {
+    let body: unknown
+    try {
+      body = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (typeof body !== "object" || body === null) continue
+    const id = (body as Record<string, unknown>).session_id
+    if (typeof id !== "string" || id === "") continue
+    // only letters, digits and "-" make an id; anything else could be a path
+    return /^[A-Za-z0-9-]+$/.test(id) ? id : null
+  }
+  return null
+}
+
+/** The path of `<projectsRoot>/<any one folder>/<sessionId>.jsonl`, or null when no folder under
+ *  projectsRoot holds that file (or projectsRoot cannot be read). Never looks at any other file. */
+export function transcriptOfSession(projectsRoot: string, sessionId: string): string | null {
   let dirs: string[]
   try {
-    dirs = readdirSync(root)
+    dirs = readdirSync(projectsRoot)
   } catch {
     return null
   }
   for (const dir of dirs) {
+    const candidate = join(projectsRoot, dir, `${sessionId}.jsonl`)
     try {
-      for (const name of readdirSync(join(root, dir))) {
-        if (!name.endsWith(".jsonl")) continue
-        const file = join(root, dir, name)
-        const mtime = statSync(file).mtimeMs
-        if (mtime >= sinceMs && (best === null || mtime > best.mtime)) best = { path: file, mtime }
-      }
-    } catch { /* unreadable project dir — not ours */ }
+      if (statSync(candidate).isFile()) return candidate
+    } catch { /* not in this folder */ }
   }
-  return best?.path ?? null
+  return null
+}
+
+/** The token count in agent B's output: "tokens used: 1,234" or the two-line
+ *  layout codex prints today ("tokens used" then the number on the next line). */
+export function tokensUsedOf(bOutputText: string): number | null {
+  const m = /tokens used:?\s*([\d,]+)/i.exec(bOutputText)
+  return m === null ? null : Number(m[1]!.replaceAll(",", ""))
+}
+
+/** Whether agent B ran at all: a clean exit, or at least 60 seconds of work
+ *  (a B that worked until the harness's time limit did run). */
+export function bRanOf(exitCode: number | null, seconds: number): boolean {
+  return exitCode === 0 || seconds >= 60
 }
 
 /** Wait until the daemon has drained every queued job (bounded), mirroring the spike's inflight wait. */
@@ -448,6 +488,7 @@ function dryRun(args: Args): void {
   ]
   console.log("\n# agent commands it would run (env shows additions only — every child gets the parent env minus ANTHROPIC_*)")
   for (const c of commands) console.log(JSON.stringify(c))
+  console.log(`\n# agent A is stopped when the text ${JSON.stringify(args.stopAt)} appears in src/bucket.mjs`)
   console.log("\n# nothing was created and nothing was started")
 }
 
@@ -461,7 +502,6 @@ async function realRun(args: Args): Promise<number> {
   const work = join(runDir, "work")
   const codexHome = join(runDir, "codex-home")
   const midaHomePath = join(runDir, "mida-home")
-  const startedMs = Date.now()
 
   rmSync(runDir, { recursive: true, force: true })
   mkdirSync(work, { recursive: true })
@@ -527,8 +567,8 @@ async function realRun(args: Args): Promise<number> {
     const abort = new AbortController()
     const poll = setInterval(() => {
       try {
-        if (readFileSync(join(work, "src", "bucket.mjs"), "utf8").includes(WATCH)) {
-          abort.abort("msUntilAvailable implemented")
+        if (readFileSync(join(work, "src", "bucket.mjs"), "utf8").includes(args.stopAt)) {
+          abort.abort(`${args.stopAt} appeared in src/bucket.mjs`)
         }
       } catch { /* file not written yet */ }
     }, 250)
@@ -544,15 +584,21 @@ async function realRun(args: Args): Promise<number> {
     clearInterval(poll)
     closeSync(aOut)
 
-    let aTurns = 0
+    let aOutputText = ""
     try {
-      for (const line of readFileSync(join(runDir, "a-output.jsonl"), "utf8").split("\n")) {
-        if (line === "") continue
-        try {
-          if ((JSON.parse(line) as { type?: string }).type === "assistant") aTurns += 1
-        } catch { /* partial line */ }
-      }
+      aOutputText = readFileSync(join(runDir, "a-output.jsonl"), "utf8")
     } catch { /* no output file */ }
+    let aTurns = 0
+    for (const line of aOutputText.split("\n")) {
+      if (line === "") continue
+      try {
+        if ((JSON.parse(line) as { type?: string }).type === "assistant") aTurns += 1
+      } catch { /* partial line */ }
+    }
+    // Agent A's own session id, recorded for every condition — the raw
+    // condition needs it to find A's transcript rather than whatever session
+    // file happens to be newest on this machine.
+    const aSessionId = sessionIdOf(aOutputText)
     if (aTurns === 0) {
       console.error("*** WARNING: Agent A produced no assistant output — treat this run as invalid ***")
     }
@@ -577,11 +623,18 @@ async function realRun(args: Args): Promise<number> {
       queueLeft = waited.left
     }
 
-    // raw: the tail of A's own transcript, scrubbed, is all B is allowed to see.
+    // raw: the tail of A's OWN session file, scrubbed, is all B is allowed to
+    // see. If that file cannot be found there is nothing fair to paste, so the
+    // run fails here — before agent B is started — and no run.json is written.
     let rawTailChars = 0
     if (args.condition === "raw") {
-      const transcript = newestTranscript(startedMs)
-      const text = transcript === null ? "" : scrubTranscript(readFileSync(transcript, "utf8"))
+      const transcript = aSessionId === null
+        ? null
+        : transcriptOfSession(join(os.homedir(), ".claude", "projects"), aSessionId)
+      if (transcript === null) {
+        throw new Error("raw: agent A's own session file was not found, so agent B was not started")
+      }
+      const text = scrubTranscript(readFileSync(transcript, "utf8"))
       const tail = text.slice(-RAW_TAIL_CHARS)
       writeFileSync(join(runDir, "raw-tail.txt"), tail)
       rawTailChars = tail.length
@@ -610,22 +663,25 @@ async function realRun(args: Args): Promise<number> {
       pass: spawnSync(argv[0]!, argv.slice(1), { cwd: work, env: childEnv(), timeout: 120_000 }).status === 0,
     }))
     const bOutput = readFileSync(join(runDir, "b-output.txt"), "utf8")
-    const tokenMatch = /tokens used:\s*([\d,]+)/i.exec(bOutput)
 
     const run = {
       condition: args.condition,
       run: args.run,
+      stopAt: args.stopAt,
       aStopReason: a.reason,
       aSeconds: a.seconds,
       aTurns,
       aProducedOutput: aTurns > 0,
+      aSessionId,
       apiKeyVarsStripped,
       queueWaitMs,
       queueLeft,
       rawTailChars,
+      rawTranscriptFound: args.condition === "raw" ? true : null,
       bSeconds: b.seconds,
       bExitCode: b.exitCode,
-      bTokensUsed: tokenMatch === null ? null : Number(tokenMatch[1]!.replaceAll(",", "")),
+      bRan: bRanOf(b.exitCode, b.seconds),
+      bTokensUsed: tokensUsedOf(bOutput),
       stepsBuilt: steps.filter((s) => s.built).length,
       stepsAtHandover,
       aLeftWork,
