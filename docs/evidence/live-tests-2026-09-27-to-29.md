@@ -68,7 +68,7 @@ accepts up to 400 saves in one transaction ([sweep](batch-anchor-sweep-2026-09-2
 The defect: when a session starts, Mida reads the project's saved checkpoints and checks each one on
 Monad, within a 7.5-second limit. The old read checked the records one chain request at a time, and Mida
 sends at most 10 chain requests a second. In the owner's busiest project the read found 83 to 87
-checkpoints in 7.1 to 7.2 seconds and stopped before reading them all; from 06:35 WAT on, every session
+checkpoints in 7.0 to 7.5 seconds and stopped before reading them all; from 06:35 WAT on, every session
 start timed out, seven in a row.
 
 The fix (`91ea961`, and `50cb4e2` for the owner's facts) checks the listed records in batched calls.
@@ -78,9 +78,14 @@ the fixed build. Numbers from the service's own log.
 
 | | Checkpoints read | Complete | Read time (limit 7.5 s) |
 |---|---|---|---|
-| Before the fix | 83 to 87 | no: cut short, then 7 timeouts in a row | 7.1 to 7.2 s |
+| Before the fix | 83 to 87 | no: cut short, then 7 timeouts in a row | 7.0 to 7.5 s |
 | After the fix | 155 | yes | 5.1 s |
 
 **What this does not show.** One project and one run after the fix. We have not measured where the
 5.1 seconds go, so we do not know whether the read time grows with the number of saves; a much larger
 project could reach the limit again.
+
+**Oct 1 update.** We timed each step of the read at 250 checkpoints and counted what the session
+starts after this fix got: [session-start-read-2026-10-01](session-start-read-2026-10-01/README.md).
+The raw log published there holds 13 cut-short reads from before the fix, at 7.0 to 7.5 s. This
+section said 7.1 to 7.2 s until Oct 2.

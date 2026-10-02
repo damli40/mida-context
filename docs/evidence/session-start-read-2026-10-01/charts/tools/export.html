@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><title>exporting</title><body><script type="module">
+const name = new URLSearchParams(location.search).get("name");
+try {
+  const utils = await import("https://esm.sh/@excalidraw/utils@0.1.2");
+  const { exportToSvg } = utils.default;
+  const data = await (await fetch("/" + name + ".excalidraw")).json();
+  const svg = await exportToSvg({ elements: data.elements, appState: { ...data.appState, exportBackground: true }, files: data.files || {} });
+  await fetch("/save?name=" + name, { method: "POST", body: svg.outerHTML });
+  document.title = "done";
+} catch (e) {
+  await fetch("/save?name=" + name + ".error", { method: "POST", body: String(e && e.stack || e) });
+  document.title = "failed";
+}
+</script></body>

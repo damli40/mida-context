@@ -114,6 +114,7 @@ grants the user signed; your app never holds the user's owner keys. Full referen
 - [Security model and limits](#security-model-and-limits)
 - [What it costs to run](#what-it-costs-to-run)
 - [What works and what doesn't](#what-works-and-what-doesnt)
+- [How it scales](#how-it-scales)
 - [Where Mida is going](#where-mida-is-going)
 - [Repository layout](#repository-layout)
 
@@ -328,6 +329,7 @@ pay nothing; one direct save cost about 0.03 testnet MON on Sep 21. Mainnet cost
 | Batching: saves anchored by Mida's batcher, gas sponsored | ✅ Live for invited owners, Sep 29 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | A change of plan you make mid-session reaches the next agent, credited to you | ✅ 6 of 6 on a real model, was 0 of 6 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | A new session in a busy project reads every save in batched chain calls: 155 saves in 5.1 s, where it used to time out | ✅ Live, Sep 29 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
+| Session start in a large account | ⚠️ Measured Oct 1: 6.1 s at 250 saved sessions, against a 7.5 s cut-off. It slows as you save more ([How it scales](#how-it-scales)) |
 | Mid-session reads from Claude Code and Codex through Mida's MCP tools | ✅ In tests (Claude Desktop live, Sep 27) |
 | `mida sponsor on\|off` for a setup made before the sponsor existed | ✅ In tests |
 | SDK, named tasks, folder linking, `mida export` | ✅ In tests on a local chain; not yet run live |
@@ -336,6 +338,53 @@ pay nothing; one direct save cost about 0.03 testnet MON on Sep 21. Mainnet cost
 | Security audit | ❌ None |
 
 3,175 automated tests pass on this release: `pnpm test`.
+
+---
+
+## How it scales
+
+A session start reads every checkpoint you have saved, in every project, and keeps the ones for the
+project you are in. The store holds only ciphertext, so it cannot sort checkpoints by project; your
+machine opens each one to find out. The read takes longer as you save more, and Mida gives it
+7.5 seconds. Past that, the session starts without its memory.
+
+We measured how close that cut-off is.
+
+**One read, timed step by step (Oct 1).** In a project with 250 saved sessions the read took
+6.1 seconds, the median of five. Listing the checkpoints took 2.1 s. Downloading and decrypting them
+took 2.4 s. Both steps touch every checkpoint, so both grow as you save more. The read also opened
+the owner's checkpoints from other projects, and the run did not record how many
+([method and raw data](docs/evidence/session-start-read-2026-10-01/01-session-start-read-busy-project.md)).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/evidence/session-start-read-2026-10-01/charts/01-session-start-breakdown-dark.svg">
+  <img alt="Bar chart: one session-start read in a project with 250 saved sessions takes 6.1 seconds against a 7.5 second limit. Listing the saved checkpoints takes 2.1 seconds and downloading and decrypting them takes 2.4 seconds; both grow as you save more. Reading the facts saved with mida remember takes 3.0 seconds and runs at the same time." src="docs/evidence/session-start-read-2026-10-01/charts/01-session-start-breakdown-light.svg" width="100%">
+</picture>
+
+**Real session starts (Sep 29 to Oct 1).** The log of one owner's Mida service holds 26 session
+starts that began a read after the Sep 29 fix. 17 loaded everything. 3 loaded only part of the
+memory, 3 timed out and started with none, and 3 had nothing saved for their task. So 6 of the 26,
+about one in four, did not get their full memory
+([counts and limits](docs/evidence/session-start-read-2026-10-01/02-session-start-outcomes.md)).
+
+<details>
+<summary>Chart: what those 26 session starts got</summary>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/evidence/session-start-read-2026-10-01/charts/02-session-start-outcomes-dark.svg">
+  <img alt="Bar chart: of 26 real session starts after the Sep 29 read fix, 17 loaded the full memory, 3 loaded part of it, 3 had nothing saved for their task, and 3 timed out and started with no memory." src="docs/evidence/session-start-read-2026-10-01/charts/02-session-start-outcomes-light.svg" width="100%">
+</picture>
+
+</details>
+
+**Not measured yet:** how much each extra checkpoint adds (we timed one size), and a session start
+on a new account with a handful of saves. Both measurements come from one owner on one machine.
+
+**We designed the fix. It is not in this release.** Each agent will keep a memory index: a signed,
+encrypted table of contents of its saved sessions. In the common case a session start will read the
+index, check a handful of entries on Monad, and open the one checkpoint it needs. Checkpoints stay
+the source of truth, and the chain decides which copy is newest. We built and tested the store side
+on a development branch. We have not built the client side.
 
 ---
 
