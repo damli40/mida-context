@@ -18,6 +18,7 @@ interface RecordOpts {
   constraints?: { constraint: string; kept: boolean }[]
   aProducedOutput?: boolean
   aLeftWork?: boolean
+  bRan?: boolean
 }
 
 const record = (over: RecordOpts = {}) => ({
@@ -25,6 +26,7 @@ const record = (over: RecordOpts = {}) => ({
   run: 1,
   aProducedOutput: over.aProducedOutput ?? true,
   aLeftWork: over.aLeftWork ?? true,
+  bRan: over.bRan ?? true,
   steps: over.steps ?? [{ file: "src/lru.mjs", built: true }],
   checks: over.checks ?? [{ command: "node --test", pass: true }],
   constraints: over.constraints ?? [{ constraint: "c", kept: true }],
@@ -48,19 +50,19 @@ function exampleRoot(): string {
   // mida: 5 scored, 4 finished, 1 nothingLeft (A had built every step already)
   for (let n = 1; n <= 4; n += 1) writeRun(root, "mida", n, record())
   writeRun(root, "mida", 5, record({ aLeftWork: false }))
-  // none: 5 scored, none finished, all 5 checksOnly, 2 of 5 rules kept
+  // none: 5 scored, none finished, 4 checksOnly, 1 where B never ran, 2 of 5 rules kept
   const notBuilt = [{ file: "src/lru.mjs", built: true }, { file: "src/bucket.mjs", built: false }]
   writeRun(root, "none", 1, record({ steps: notBuilt }))
   writeRun(root, "none", 2, record({ steps: notBuilt }))
   writeRun(root, "none", 3, record({ steps: notBuilt, constraints: [constraint(false)] }))
   writeRun(root, "none", 4, record({ steps: notBuilt, constraints: [constraint(false)] }))
-  writeRun(root, "none", 5, record({ steps: notBuilt, constraints: [constraint(false)] }))
+  writeRun(root, "none", 5, record({ bRan: false, constraints: [constraint(false)] }))
   // raw: 5 started, 4 scored (run 5 crashed before writing run.json),
-  // 1 finished, 2 checksOnly, 1 nothingLeft, 4 of 4 rules kept
+  // 1 finished, 2 checksOnly, 1 where A produced nothing, 4 of 4 rules kept
   writeRun(root, "raw", 1, record())
   writeRun(root, "raw", 2, record({ steps: notBuilt }))
   writeRun(root, "raw", 3, record({ steps: notBuilt }))
-  writeRun(root, "raw", 4, record({ aLeftWork: false }))
+  writeRun(root, "raw", 4, record({ aProducedOutput: false }))
   writeRun(root, "raw", 5, "none")
   return root
 }
@@ -96,6 +98,22 @@ describe("readRuns", () => {
     expect(row).toMatchObject({ scored: false, finished: false })
   })
 
+  it("does not score a run.json without a boolean bRan", () => {
+    const root = tempRoot()
+    const r = record() as Record<string, unknown>
+    delete r.bRan
+    writeRun(root, "mida", 1, r)
+    const [row] = readRuns(root)
+    expect(row).toMatchObject({ scored: false, finished: false })
+  })
+
+  it("flags a scored run with bRan false as bDidNotRun, never finished even when steps and checks all hold", () => {
+    const root = tempRoot()
+    writeRun(root, "mida", 1, record({ bRan: false }))
+    const [row] = readRuns(root)
+    expect(row).toMatchObject({ scored: true, bDidNotRun: true, finished: false, checksOnly: false })
+  })
+
   it("does not score a run.json whose constraints carry the old literalInSource field", () => {
     const root = tempRoot()
     const r = record() as Record<string, unknown>
@@ -122,9 +140,9 @@ describe("summarize", () => {
   it("renders the example counts", () => {
     const summary = summarize(readRuns(exampleRoot()))
     expect(summary).toEqual({
-      mida: { started: 5, scored: 5, finished: 4, checksOnly: 0, agentAEmpty: 0, nothingLeft: 1, constraintsKept: 5, constraintsTotal: 5 },
-      none: { started: 5, scored: 5, finished: 0, checksOnly: 5, agentAEmpty: 0, nothingLeft: 0, constraintsKept: 2, constraintsTotal: 5 },
-      raw: { started: 5, scored: 4, finished: 1, checksOnly: 2, agentAEmpty: 0, nothingLeft: 1, constraintsKept: 4, constraintsTotal: 4 },
+      mida: { started: 5, scored: 5, finished: 4, checksOnly: 0, agentAEmpty: 0, nothingLeft: 1, bDidNotRun: 0, leftOut: 1, constraintsKept: 5, constraintsTotal: 5 },
+      none: { started: 5, scored: 5, finished: 0, checksOnly: 4, agentAEmpty: 0, nothingLeft: 0, bDidNotRun: 1, leftOut: 1, constraintsKept: 2, constraintsTotal: 5 },
+      raw: { started: 5, scored: 4, finished: 1, checksOnly: 2, agentAEmpty: 1, nothingLeft: 0, bDidNotRun: 0, leftOut: 1, constraintsKept: 4, constraintsTotal: 4 },
     })
   })
 
@@ -155,6 +173,14 @@ describe("summarize", () => {
     const summary = summarize(readRuns(root))
     expect(summary.none).toMatchObject({ agentAEmpty: 1 })
   })
+
+  it("subtracts a run that is both aLeftWork false and bRan false only once", () => {
+    const root = tempRoot()
+    writeRun(root, "mida", 1, record())
+    writeRun(root, "mida", 2, record({ aLeftWork: false, bRan: false }))
+    const summary = summarize(readRuns(root))
+    expect(summary.mida).toMatchObject({ nothingLeft: 1, bDidNotRun: 1, leftOut: 1 })
+  })
 })
 
 describe("renderSummary", () => {
@@ -163,16 +189,16 @@ describe("renderSummary", () => {
     expect(renderSummary(summarize(readRuns(root)), root)).toBe(
       `Continuation benchmark: 15 runs in ${root}\n` +
       `\n` +
-      `| Condition | Runs started | Scored | Finished | Checks passed, job not finished | Agent A produced nothing | Nothing left to continue | Rules kept |\n` +
-      `|---|---|---|---|---|---|---|---|\n` +
-      `| With Mida (mida) | 5 | 5 | 4 | 0 | 0 | 1 | 5 of 5 |\n` +
-      `| Without Mida, nothing given (none) | 5 | 5 | 0 | 5 | 0 | 0 | 2 of 5 |\n` +
-      `| Without Mida, transcript tail pasted (raw) | 5 | 4 | 1 | 2 | 0 | 1 | 4 of 4 |\n` +
+      `| Condition | Runs started | Scored | Finished | Checks passed, job not finished | Agent A produced nothing | Nothing left to continue | Agent B did not run | Rules kept |\n` +
+      `|---|---|---|---|---|---|---|---|---|\n` +
+      `| With Mida (mida) | 5 | 5 | 4 | 0 | 0 | 1 | 0 | 5 of 5 |\n` +
+      `| Without Mida, nothing given (none) | 5 | 5 | 0 | 4 | 0 | 0 | 1 | 2 of 5 |\n` +
+      `| Without Mida, transcript tail pasted (raw) | 5 | 4 | 1 | 2 | 1 | 0 | 0 | 4 of 4 |\n` +
       `\n` +
       `With Mida: 4 of 4 runs finished.\n` +
-      `Without Mida: 1 of 9 runs finished (nothing given: 0 of 5; transcript tail pasted: 1 of 4).\n` +
+      `Without Mida: 1 of 8 runs finished (nothing given: 0 of 4; transcript tail pasted: 1 of 4).\n` +
       `\n` +
-      `Finished means every step was built and every check passed. "Of" counts every run that was started, so a run that crashed or was never scored counts as not finished. A run where the first agent had already built every step before it was stopped is left out of "of": there was nothing to continue.\n`,
+      `Finished means every step was built and every check passed. "Of" counts every run that was started, so a run that crashed or was never scored counts as not finished. Three kinds of run are left out of "of" because they are not continuation tests: the first agent produced nothing, the first agent had already built every step before it was stopped, or the second agent never ran.\n`,
     )
   })
 
@@ -182,7 +208,25 @@ describe("renderSummary", () => {
     writeRun(root, "mida", 2, record({ aLeftWork: false }))
     const text = renderSummary(summarize(readRuns(root)), root)
     expect(text).toContain("With Mida: 1 of 1 run finished.\n")
-    expect(text).toContain("| With Mida (mida) | 2 | 2 | 1 | 0 | 0 | 1 | 2 of 2 |\n")
+    expect(text).toContain("| With Mida (mida) | 2 | 2 | 1 | 0 | 0 | 1 | 0 | 2 of 2 |\n")
+  })
+
+  it("leaves a bRan false run out of the of number, even one whose steps and checks all hold", () => {
+    const root = tempRoot()
+    writeRun(root, "mida", 1, record())
+    writeRun(root, "mida", 2, record({ bRan: false }))
+    const text = renderSummary(summarize(readRuns(root)), root)
+    expect(text).toContain("| With Mida (mida) | 2 | 2 | 1 | 0 | 0 | 0 | 1 | 2 of 2 |\n")
+    expect(text).toContain("With Mida: 1 of 1 run finished.\n")
+  })
+
+  it("leaves an aProducedOutput false run out of the of number", () => {
+    const root = tempRoot()
+    writeRun(root, "mida", 1, record())
+    writeRun(root, "mida", 2, record({ aProducedOutput: false }))
+    const text = renderSummary(summarize(readRuns(root)), root)
+    expect(text).toContain("| With Mida (mida) | 2 | 2 | 1 | 0 | 1 | 0 | 0 | 2 of 2 |\n")
+    expect(text).toContain("With Mida: 1 of 1 run finished.\n")
   })
 
   it("keeps a started-but-unscored run in the of number: 5 started, 1 unscored, 1 nothingLeft gives 'of 4', never 'of 3'", () => {
@@ -193,7 +237,7 @@ describe("renderSummary", () => {
     writeRun(root, "mida", 4, record({ aLeftWork: false }))
     writeRun(root, "mida", 5, "none") // started, crashed before run.json: stays in "of"
     const text = renderSummary(summarize(readRuns(root)), root)
-    expect(text).toContain("| With Mida (mida) | 5 | 4 | 1 | 1 | 0 | 1 | 4 of 4 |\n")
+    expect(text).toContain("| With Mida (mida) | 5 | 4 | 1 | 1 | 0 | 1 | 0 | 4 of 4 |\n")
     expect(text).toContain("With Mida: 1 of 4 runs finished.\n")
     expect(text).not.toContain("of 3")
   })
@@ -225,8 +269,10 @@ describe("main", () => {
       const parsed = JSON.parse(spy.mock.calls.map((c) => String(c[0])).join("\n")) as ReturnType<typeof summarize>
       expect(parsed).toEqual(summarize(readRuns(root)))
       expect(parsed.mida.nothingLeft).toBe(1)
-      expect(parsed.raw.nothingLeft).toBe(1)
+      expect(parsed.raw.nothingLeft).toBe(0)
       expect(parsed.none.nothingLeft).toBe(0)
+      expect(parsed.none.bDidNotRun).toBe(1)
+      expect(parsed.mida.bDidNotRun).toBe(0)
     } finally {
       spy.mockRestore()
     }
