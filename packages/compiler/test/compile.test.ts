@@ -456,6 +456,20 @@ describe("compileCheckpoint", () => {
     if (!r.ok) expect(r.fields).toContain("objective")
     expect(fs.readFileSync(counter, "utf8")).toBe("2")
   })
+  it("a compile asked for one attempt spends ONE model call — no same-provider retry on a bad shape (UF-QF)", async () => {
+    // the drain asks for attempts:1 once a save has failed eight times, so one try must not
+    // spend a second call re-asking the same provider — the counter file proves one run
+    const counter = path.join(dir, "one-attempt-count.log")
+    process.env.FAKE_MODEL_COUNTER = counter
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "badshape-count"], label: "fake" },
+      attempts: 1,
+      sleep: async () => {},
+    })
+    expect(r).toMatchObject({ ok: false, reason: "invalid", attempts: 1, retried: 0 })
+    expect(fs.readFileSync(counter, "utf8")).toBe("1")
+  })
   it("kills a hanging model at the timeout", async () => {
     const started = Date.now()
     const r = await compileCheckpoint({ ...base, model: { ...fake("hang"), timeoutMs: 300 }, attempts: 1 })
@@ -848,7 +862,9 @@ describe("compileCheckpoint", () => {
       ...base,
       model: { argv: [process.execPath, fixturePath, "garbage"], label: "deepseek-x" },
       fallbackModels: [{ argv: [process.execPath, fixturePath, "good"], label: "kimi-y" }],
-      attempts: 1,
+      // UF-QF: attempts:1 now means one model call — a single attempt cannot also hold a
+      // same-provider retry, so this test asks for two (the fallback still ends it at once)
+      attempts: 2,
       sleep: async () => {},
     })
     expect(r.ok).toBe(true)

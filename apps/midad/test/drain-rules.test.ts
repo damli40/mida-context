@@ -35,13 +35,22 @@ function setup() {
   writeFileSync(join(cwd, ".mida", "project.json"), JSON.stringify({ projectId: "p-1" }))
   const compileCalls: CompileInput[] = []
   const saveCalls: unknown[] = []
-  const flags: { saveFailures: number; checkpoint?: Checkpoint; compileReason?: "model-failed" | "no-json" | "invalid" | "summarizer-limit" | "no-summarizer"; compileSample?: string } = { saveFailures: 0 }
+  type CompileFailReason = "model-failed" | "no-json" | "invalid" | "summarizer-limit" | "no-summarizer"
+  const flags: {
+    saveFailures: number
+    checkpoint?: Checkpoint
+    compileReason?: CompileFailReason
+    /** per-call failure reasons — shifted one per compile; the last (or compileReason) repeats */
+    compileReasons?: CompileFailReason[]
+    compileSample?: string
+  } = { saveFailures: 0 }
   const compile: typeof compileCheckpoint = async (input) => {
     compileCalls.push(input)
-    if (flags.compileReason !== undefined) {
+    const reason = flags.compileReasons !== undefined && flags.compileReasons.length > 0 ? flags.compileReasons.shift() : flags.compileReason
+    if (reason !== undefined) {
       return {
         ok: false,
-        reason: flags.compileReason,
+        reason,
         detail: "stub",
         attempts: 1,
         retried: 0,
@@ -426,11 +435,21 @@ describe("a failed save does not buy a new model call", () => {
   })
 
   it("a save that gives up for good is no longer marked UNSENT (CAP-26)", async () => {
-    const { home, job, drain, flags } = setup()
+    const { home, job, drain, flags, transcriptPath } = setup()
     job({ event: "Stop" }, T0)
-    // UF-QD: only an answered-but-unusable model reply can still give up — no-json is one
+    // UF-QF: the mark this test clears must really exist — a no-json compile never marks, so
+    // the mark is set the way the drain sets it: one compiled save whose send failed
+    flags.saveFailures = 1
+    await drain({ now: () => new Date(T0 + 120_000) })
+    expect(readUnsent(home, "s1")).toBeDefined() // the mark the assertion below checks is real
     flags.compileReason = "no-json"
-    for (let i = 0; i < 8; i += 1) await drain({ now: () => new Date(T0 + 120_000 + i * 7_200_000) })
+    for (let i = 1; i <= 8; i += 1) {
+      // a fresh line each try: a new eventId makes the compile (and its no-json) run again —
+      // without it the cached envelope is re-sent and no unusable answer is ever counted
+      appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `more ${i}` }] } }) + "\n")
+      // each drain runs far past any backoff (the cap is six hours now), so the retry fires
+      await drain({ now: () => new Date(T0 + 120_000 + i * 25_200_000) })
+    }
     expect(home.list("queue/bad").length).toBeGreaterThan(0)
     expect(readUnsent(home, "s1")).toBeUndefined()
   })
@@ -440,8 +459,8 @@ describe("a failed save does not buy a new model call", () => {
     job({ event: "Stop" }, T0)
     flags.compileReason = "no-json"
     for (let i = 0; i < 8; i += 1) {
-      // each drain runs far past any backoff so the retry always fires
-      await drain({ now: () => new Date(T0 + 120_000 + i * 7_200_000) })
+      // each drain runs far past any backoff (the cap is six hours now), so the retry fires
+      await drain({ now: () => new Date(T0 + 120_000 + i * 25_200_000) })
     }
     expect(compileCalls).toHaveLength(8)
     expect(saveCalls).toHaveLength(0) // the model's answer never parsed — no save was tried
@@ -2252,8 +2271,9 @@ describe("a save that found no summary model waits, not fails (UF-P3)", () => {
 
   // UF-QD: model-failed is transient — the old code ended it in gave-up after eight tries,
   // which is how 27 real saves were lost on Oct 1. Now the attempt count climbs, the backoff
-  // (capped at an hour) decides the next try, and only the seven-day age rule ends the job.
-  it("twelve model-failed tries in a row: still queued, attempts 12, next wait an hour (UF-QD)", async () => {
+  // (capped at six hours for a summary failure — UF-QF) decides the next try, and only the
+  // seven-day age rule ends the job.
+  it("twelve model-failed tries in a row: still queued, attempts 12, next wait six hours (UF-QF)", async () => {
     const { home, job, drain, drainLog } = setup()
     job()
     const failingCompile: typeof compileCheckpoint = async () => ({
@@ -2264,11 +2284,11 @@ describe("a save that found no summary model waits, not fails (UF-P3)", () => {
       retried: 0,
     })
     // each pass lands just past the 60 s × 2^attempts backoff of the last failure (capped
-    // at one hour, so the later passes step an hour each)
+    // at six hours for a summary failure, so the later passes step six hours each — UF-QF)
     let t = T0 + 120_000
     for (let i = 0; i < 12; i += 1) {
       await drain({ compile: failingCompile, now: () => new Date(t) })
-      t += Math.min(60_000 * 2 ** (i + 1), 3_600_000) + 1_000
+      t += Math.min(60_000 * 2 ** (i + 1), 6 * 3_600_000) + 1_000
     }
     expect(listJobs(home)).toHaveLength(1)
     expect(home.list("queue/bad")).toEqual([])
@@ -2283,7 +2303,7 @@ describe("a save that found no summary model waits, not fails (UF-P3)", () => {
     expect(lastFailed.attempts).toBe(12)
     const state = home.readJson<{ failedAt?: string }>("queue/state/s1.json")!
     expect(sessionWaits(home, listJobs(home)).find((w) => w.sessionId === "s1")?.dueAtMs).toBe(
-      Date.parse(state.failedAt!) + 3_600_000,
+      Date.parse(state.failedAt!) + 6 * 3_600_000,
     )
   })
 
@@ -2488,5 +2508,204 @@ describe("a save that found no summary model waits, not fails (UF-P3)", () => {
     expect(compileCalls).toHaveLength(1)
     expect(counts.saved).toBe(1)
     expect(saveCalls).toHaveLength(1)
+  })
+})
+
+// UF-QF item 1: only answers the model got WRONG can drop a save — no-json and
+// invalid-checkpoint count toward `unusable`; send failures and model-failed transport errors
+// never do. A summary failure backs off to a six-hour cap once attempts run long, and from the
+// ninth try on the compile is asked for a single attempt so one try spends one model call.
+describe("only unusable answers count toward giving up (UF-QF)", () => {
+  const stateOf = (home: MidaHome) =>
+    home.readJson<{ attempts?: number; unusable?: number; reason?: string; failedAt?: string }>("queue/state/s1.json")
+
+  it("eight model-failed tries then one no-json: still queued, attempts 9, unusable 1", async () => {
+    const { home, job, drain, flags } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReasons = [...Array(8).fill("model-failed"), "no-json"]
+    let t = T0 + 120_000
+    for (let i = 0; i < 9; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 7 * 3_600_000 // always past the longest backoff
+    }
+    const state = stateOf(home)
+    expect(state?.attempts).toBe(9)
+    expect(state?.unusable).toBe(1)
+    expect(state?.reason).toBe("no-json")
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("twelve send failures then one no-json is still queued — send failures never count (UF-QF)", async () => {
+    const { home, job, drain, flags, transcriptPath } = setup()
+    job({ event: "Stop" }, T0)
+    flags.saveFailures = 12 // a send failure is a transient chain-error, not an unusable answer
+    let t = T0 + 120_000
+    for (let i = 0; i < 12; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 2 * 3_600_000
+    }
+    // a send failure reuses the compiled envelope — the thirteenth try only compiles again
+    // because the transcript moved on; that fresh compile is what answers no-json
+    appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "grew" }] } }) + "\n")
+    flags.compileReason = "no-json"
+    await drain({ now: () => new Date(t) })
+    const state = stateOf(home)
+    expect(state?.attempts).toBe(13)
+    expect(state?.unusable).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("two model-failed tries then one invalid-checkpoint stays queued — unusable is 1, not attempts 3", async () => {
+    const { home, job, drain, flags } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReasons = ["model-failed", "model-failed", "invalid"]
+    let t = T0 + 120_000
+    for (let i = 0; i < 3; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 2 * 3_600_000
+    }
+    const state = stateOf(home)
+    expect(state?.attempts).toBe(3)
+    expect(state?.unusable).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("eight no-json tries still give up — unusable reached MAX_ATTEMPTS (UF-QF)", async () => {
+    const { home, job, drain, flags, drainLog } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReason = "no-json"
+    let t = T0 + 120_000
+    for (let i = 0; i < 8; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 7 * 3_600_000
+    }
+    expect(listJobs(home)).toHaveLength(0)
+    expect(home.list("queue/bad")).toHaveLength(1)
+    const log = drainLog()
+    expect(log).toContain('"reason":"gave-up"')
+    expect(log).toContain('"lastReason":"no-json"')
+  })
+
+  it("a summary failure backs off by powers of two up to six hours, a send failure stays at one (UF-QF)", async () => {
+    const { home, job, drain, flags } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReason = "model-failed"
+    let t = T0 + 120_000
+    for (const minutes of [2, 4, 8, 16, 32, 64, 128, 256]) {
+      await drain({ now: () => new Date(t) })
+      const wait = sessionWaits(home, listJobs(home))[0]
+      expect(wait?.dueAtMs !== undefined ? wait.dueAtMs - t : undefined).toBe(minutes * 60_000)
+      t += (minutes + 1) * 60_000
+    }
+    // from the ninth try the wait is the six-hour cap, however far the exponent ran
+    for (let i = 0; i < 3; i += 1) {
+      await drain({ now: () => new Date(t) })
+      const wait = sessionWaits(home, listJobs(home))[0]
+      expect(wait?.dueAtMs !== undefined ? wait.dueAtMs - t : undefined).toBe(360 * 60_000)
+      t += 7 * 3_600_000
+    }
+  })
+
+  it("a chain-error backoff is capped at one hour (UF-QF)", async () => {
+    const { home, job, drain, flags } = setup()
+    job({ event: "Stop" }, T0)
+    flags.saveFailures = 8
+    let t = T0 + 120_000
+    for (let i = 0; i < 8; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 2 * 3_600_000
+    }
+    const wait = sessionWaits(home, listJobs(home))[0]
+    const last = stateOf(home)?.failedAt
+    expect(wait?.reason).toBe("chain-error")
+    expect(wait?.dueAtMs).toBe(Date.parse(last ?? "") + 3_600_000)
+  })
+
+  it("the compile is asked for a single attempt from the ninth try on, never before (UF-QF)", async () => {
+    const { home, job, drain, flags, compileCalls } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReason = "model-failed"
+    let t = T0 + 120_000
+    for (let i = 0; i < 10; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 7 * 3_600_000
+    }
+    expect(home.list("queue/bad")).toEqual([]) // model-failed never gives up
+    expect(compileCalls).toHaveLength(10)
+    for (let i = 0; i < 8; i += 1) expect(compileCalls[i]!.attempts).toBeUndefined()
+    expect(compileCalls[8]!.attempts).toBe(1)
+    expect(compileCalls[9]!.attempts).toBe(1)
+  })
+
+  it("a failed approval read inside the wait records ONE failed try, not one per pass (UF-QF)", async () => {
+    const { home, job, drain, compileCalls } = setup()
+    job({ event: "Stop" }, T0)
+    const isApproved = async () => {
+      throw new Error("rpc unreachable")
+    }
+    // ten passes ten seconds apart — every pass but the first is inside the two-minute backoff
+    for (let i = 0; i < 10; i += 1) {
+      await drain({ isApproved, now: () => new Date(T0 + 120_000 + i * 10_000) })
+    }
+    const state = stateOf(home)
+    expect(state?.attempts).toBe(1)
+    expect(compileCalls).toHaveLength(0)
+  })
+
+  it("resetSummarizerWaits releases a summary-failure wait and its unusable count too (UF-QF)", async () => {
+    const { home, job, drain, compileCalls, saveCalls } = setup()
+    job({ event: "Stop", sessionId: "s1" }, T0)
+    job({ event: "Stop", sessionId: "s2" }, T0)
+    job({ event: "Stop", sessionId: "s3" }, T0)
+    const failedAt = new Date(T0 + 30_000).toISOString()
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10, lastLineHash: "", savedAt: failedAt,
+      attempts: 8, failedAt, reason: "model-failed", unusable: 4,
+    })
+    home.writeSecretJson("queue/state/s2.json", {
+      transcriptBytes: 10, lastLineHash: "", savedAt: failedAt,
+      failedAt, reason: "sponsor-limit",
+    })
+    home.writeSecretJson("queue/state/s3.json", {
+      transcriptBytes: 10, lastLineHash: "", savedAt: failedAt,
+      attempts: 2, failedAt, reason: "chain-error",
+    })
+    expect(resetSummarizerWaits(home)).toBe(1)
+    // s1's wait fields are cleared — attempts, failedAt, reason and unusable all go
+    const s1 = stateOf(home)
+    expect(s1?.attempts).toBeUndefined()
+    expect(s1?.unusable).toBeUndefined()
+    expect(s1?.reason).toBeUndefined()
+    expect(s1?.failedAt).toBeUndefined()
+    const s2 = home.readJson<{ reason?: string }>("queue/state/s2.json")
+    const s3 = home.readJson<{ reason?: string; attempts?: number }>("queue/state/s3.json")
+    expect(s2?.reason).toBe("sponsor-limit")
+    expect(s3?.reason).toBe("chain-error")
+    expect(s3?.attempts).toBe(2)
+    const counts = await drain({ now: () => new Date(T0 + 120_000) })
+    expect(counts.saved).toBe(1) // only s1 was due
+    expect(compileCalls).toHaveLength(1)
+    expect(saveCalls).toHaveLength(1)
+  })
+
+  it("a save whose summary fails forever costs at most 36 model calls in seven days (UF-QF)", async () => {
+    const { home, job, drain, flags, compileCalls } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReason = "model-failed"
+    let t = T0 + 120_000
+    // each drain jumps straight to the next due time — the skipped passes between change
+    // nothing — until the seven-day age rule drops the job and nothing is due any more
+    for (;;) {
+      await drain({ now: () => new Date(t) })
+      const due = sessionWaits(home, listJobs(home))[0]?.dueAtMs
+      if (due === undefined) break
+      t = due
+    }
+    expect(compileCalls.length).toBeLessThanOrEqual(36)
+    expect(compileCalls.length).toBeGreaterThan(8) // it really did keep trying all week
+    expect(home.list("queue/bad")).toHaveLength(1) // dropped only when the job turned seven days old
   })
 })

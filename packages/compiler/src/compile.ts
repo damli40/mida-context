@@ -700,7 +700,9 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
       // One same-provider retry on a bad SHAPE — never on a transport failure — and only
       // the primary earns it: a fallback's bad answer walks at once. Once per compile, so
       // the worst case adds exactly one call (M3-H).
-      if ((fail.reason === "invalid" || fail.reason === "no-json") && current === model && retried === 0) {
+      // UF-QF: a caller that asked for ONE attempt (a drain retrying a long-stuck save) gets
+      // one model call — no same-provider second try on a bad shape
+      if ((fail.reason === "invalid" || fail.reason === "no-json") && current === model && retried === 0 && attempts > 1) {
         retried = 1
         continue
       }

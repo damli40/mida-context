@@ -100,10 +100,19 @@ const PERMANENT_FAILURES = new Set([
 ])
 /**
  * A checkpoint the validator rejects is usually fixed by a fresh model call, so
- * `invalid-checkpoint` is transient for the first two attempts; the third is permanent.
+ * `invalid-checkpoint` is transient for the first two unusable answers; the third is permanent.
  */
 const INVALID_CHECKPOINT_MAX_ATTEMPTS = 3
-const backoffMs = (attempts: number) => Math.min(60_000 * 2 ** attempts, MAX_BACKOFF_MS)
+
+/**
+ * UF-QF: a SUMMARY failure — the model ran but produced nothing usable — backs off to a
+ * six-hour cap, not the one-hour cap a send failure keeps. The summary failures are exactly
+ * the three reasons a try can spend a model call on, so once the tries run long each one
+ * waits six hours and (with `attempts: 1`, below) spends a single call.
+ */
+const SUMMARY_FAILURE_REASONS = new Set(["model-failed", "no-json", "invalid-checkpoint"])
+const SUMMARY_BACKOFF_CAP_MS = 6 * 60 * 60 * 1000
+const backoffMs = (attempts: number, cap: number = MAX_BACKOFF_MS) => Math.min(60_000 * 2 ** attempts, cap)
 /**
  * Transient codes that are a capacity wait, not a failed attempt: the sponsor's daily cap (UF-O),
  * or a compile with no model able to write the summary — the whole chain at its usage limit, or
@@ -151,6 +160,13 @@ interface SessionState {
   failedAt?: string
   /** The drain code the last attempt failed with — what the wait is waiting on (in-29 S-2). */
   reason?: string
+  /**
+   * UF-QF: how many tries ended on an unusable answer (`no-json` or `invalid-checkpoint`).
+   * Only those two reasons raise it — a transport or send failure never does — and it is the
+   * only count that can move a job to queue/bad. A state file written before the field
+   * existed reads as zero.
+   */
+  unusable?: number
 }
 
 export interface DrainResult {
@@ -242,9 +258,10 @@ export async function drainUntilSettled(deps: DrainDeps): Promise<DrainResult> {
  * `queue/state/<sessionId>.json`: an unchanged transcript is skipped even on a flush, and a changed
  * one inside `minGapMs` of the last save waits — its job stays queued so a later drain (or a flush)
  * still saves it. A transient failure is recorded as `attempts`/`failedAt` on the state and retried
- * only after `60 s × 2^attempts` (capped at an hour). Only an answered-but-unusable model reply
- * gives up on a count (`no-json` at eight tries, `invalid-checkpoint` at three); every other
- * transient failure keeps retrying until the seven-day age rule drops the job. A permanent
+ * only after `60 s × 2^attempts` (capped at six hours for a summary failure, one hour otherwise).
+ * Only an answered-but-unusable model reply counts toward giving up (`unusable`: `no-json` at
+ * eight, `invalid-checkpoint` at three); every other transient failure keeps retrying until the
+ * seven-day age rule drops the job. A permanent
  * failure removes the job and records the transcript state
  * so an identical job later skips as unchanged. A compiled envelope is cached at
  * `queue/compiled/<eventId>.json` so a retried save never pays for a second model call.
@@ -334,6 +351,15 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           log({ sessionId, outcome: "bad", reason: "older-than-7d" })
           continue
         }
+        // UF-QF: the wait check runs FIRST — before the project-list and approval reads it would
+        // otherwise pay for. A session inside its backoff is skipped before any chain read, so a
+        // pass every 15 s cannot record a failed try per pass while the chain is unreachable.
+        const due = state === undefined ? undefined : dueAfterFailureMs(state)
+        if (due !== undefined && now().getTime() < due) {
+          counts.skippedTooSoon += 1
+          dueSooner(due)
+          continue // the job stays queued: the retry fires once the wait has passed
+        }
         // the hook checked this path at enqueue, but the file could have been swapped since —
         // re-check the same rule before the drainer opens it. A devin job's "transcript" is
         // the sessions database — the check is the configured-path rule, not a .jsonl root.
@@ -414,12 +440,6 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           log({ sessionId, outcome: "removed", reason: removalReason(deps.home, job.agent, "not-approved") })
           continue
         }
-        const due = state === undefined ? undefined : dueAfterFailureMs(state)
-        if (due !== undefined && now().getTime() < due) {
-          counts.skippedTooSoon += 1
-          dueSooner(due)
-          continue // the job stays queued: the retry fires once the wait has passed
-        }
         // No saved state yet: the gap runs from the session's FIRST queued job (CAP-28). The FIRST save
         // owes only the short first gap — a session killed in its first minute still leaves a
         // checkpoint; every later save keeps the full gap. A session inside a retry backoff never
@@ -458,6 +478,10 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             cwd: job.cwd,
             homeDir,
             previous: previous.checkpoint,
+            // UF-QF: from the ninth failed try on, one try spends ONE model call — the compile
+            // is asked for a single attempt, so the fallback chain is walked once and no
+            // same-provider retry fires on a bad shape
+            ...((state?.attempts ?? 0) >= MAX_ATTEMPTS ? { attempts: 1 } : {}),
           })
           const compileMs = now().getTime() - compileStart
           if (!compiled.ok) {
@@ -631,13 +655,18 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         // it already had and is left out when there were none.
         const priorState = readState(deps.home, sessionId)
         const attempts = LIMIT_WAIT_REASONS.has(code) ? (priorState?.attempts ?? 0) : (priorState?.attempts ?? 0) + 1
+        // UF-QF: unusable counts answers the model got wrong — it rises only on no-json and
+        // invalid-checkpoint and is carried across every other failure, so a save that sat all
+        // afternoon on a network problem is not dropped the first time the model answers badly.
+        const unusable =
+          (priorState?.unusable ?? 0) + (code === "no-json" || code === "invalid-checkpoint" ? 1 : 0)
         counts.failed += 1
-        // UF-QD: only an answered-but-unusable model reply is terminal on a count — no-json
-        // after eight tries, invalid-checkpoint after three. Every other transient reason
-        // retries until the seven-day age rule drops the job: the count is not a death sentence
-        // for a chain problem or a model that is down for the afternoon.
-        const invalidGaveUp = code === "invalid-checkpoint" && attempts >= INVALID_CHECKPOINT_MAX_ATTEMPTS
-        const noJsonGaveUp = code === "no-json" && attempts >= MAX_ATTEMPTS
+        // UF-QF: only the unusable count is terminal on a count — no-json after eight bad
+        // answers, invalid-checkpoint after three. Every other transient reason retries until
+        // the seven-day age rule drops the job: `attempts` is not a death sentence for a chain
+        // problem or a model that is down for the afternoon.
+        const invalidGaveUp = code === "invalid-checkpoint" && unusable >= INVALID_CHECKPOINT_MAX_ATTEMPTS
+        const noJsonGaveUp = code === "no-json" && unusable >= MAX_ATTEMPTS
         if (invalidGaveUp || noJsonGaveUp) {
           moveToBad(deps.home, `${job.id}.json`)
           writeState(deps.home, sessionId, terminalStateFor(job, now().toISOString(), deps.openDevinDb))
@@ -655,6 +684,7 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           failedAt: now().toISOString(),
           // the reason rides the wait record: doctor names it and a funding reset clears it
           reason: code,
+          ...(unusable > 0 ? { unusable } : {}),
         }
         writeState(deps.home, sessionId, waiting)
         const waitUntil = dueAfterFailureMs(waiting)
@@ -996,7 +1026,10 @@ function dueAfterFailureMs(state: SessionState): number | undefined {
     const nextMidnight = (Math.floor(failedAt / DAY_MS) + 1) * DAY_MS
     return Math.min(failedAt + 60 * 60 * 1000, nextMidnight + 60_000)
   }
-  return (state.attempts ?? 0) > 0 ? failedAt + backoffMs(state.attempts!) : undefined
+  // UF-QF: a summary failure — one whose next try costs a model call — backs off to a
+  // six-hour cap; every other failed try keeps the one-hour cap.
+  const cap = SUMMARY_FAILURE_REASONS.has(state.reason ?? "") ? SUMMARY_BACKOFF_CAP_MS : MAX_BACKOFF_MS
+  return (state.attempts ?? 0) > 0 ? failedAt + backoffMs(state.attempts!, cap) : undefined
 }
 
 function readState(home: MidaHome, sessionId: string): SessionState | undefined {
@@ -1102,10 +1135,18 @@ export function resetOutOfGasWaits(home: MidaHome): number {
 
 /**
  * The wait reasons a summarizer change — `mida summarizer use …` — makes stale: no model could
- * write the summary, or every model hit its usage limit. A sponsor's cap or a chain failure is
- * not the new choice's business, so those waits keep their deadlines.
+ * write the summary, every model hit its usage limit, or the SUMMARY itself kept failing
+ * (UF-QF — a model-failed, no-json or invalid-checkpoint wait is waiting on the model the
+ * choice replaces). A sponsor's cap or a chain failure is not the new choice's business, so
+ * those waits keep their deadlines.
  */
-const SUMMARIZER_WAIT_REASONS = new Set(["summarizer-limit", "no-summarizer"])
+const SUMMARIZER_WAIT_REASONS = new Set([
+  "summarizer-limit",
+  "no-summarizer",
+  "model-failed",
+  "no-json",
+  "invalid-checkpoint",
+])
 
 /**
  * Clears the recorded failure wait on every session that was waiting on the summary model —
@@ -1135,7 +1176,7 @@ export function resetSummarizerWaits(home: MidaHome): number {
     const state = readState(home, sessionId)
     if (state === undefined || state.failedAt === undefined) continue
     if (state.reason === undefined || !SUMMARIZER_WAIT_REASONS.has(state.reason)) continue
-    const { attempts: _a, failedAt: _f, reason: _r, ...rest } = state
+    const { attempts: _a, failedAt: _f, reason: _r, unusable: _u, ...rest } = state
     writeState(home, sessionId, rest)
     if (queued.has(sessionId)) cleared += 1
   }
