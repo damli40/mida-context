@@ -25,6 +25,7 @@ import { loadAgentIdentity } from "./keys.js"
 import { isSafeName, listJobs } from "./queue.js"
 import { NAMESPACE_ID, authorNamesFor, readCheckpoints, saveCheckpoint } from "./skeleton.js"
 import { ServiceRuntime, liveLockHolderPid } from "./runtime.js"
+import { currentSummarizer, summarizerSummary } from "./summarizer.js"
 import type { Network } from "./runtime.js"
 import { onMulticall3Absent } from "@mida/api"
 import { OWNER_COMMANDS, USAGE, ownerOnlyLine, runCliWithRuntime, validCliArgv } from "./cli.js"
@@ -282,7 +283,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (req.method === "GET" && req.url === "/health") {
-      respond(res, 200, { ok: true, pid: process.pid, startedAt, queueDepth: listJobs(home).length, codeRoot: identity.codeRoot, codeCommit: identity.codeCommit })
+      respond(res, 200, { ok: true, pid: process.pid, startedAt, queueDepth: listJobs(home).length, codeRoot: identity.codeRoot, codeCommit: identity.codeCommit, codeVersion: identity.codeVersion, summarizer: summarizerSummary(currentSummarizer(home, process.env)) })
       return
     }
     if (req.method !== "POST") {
@@ -387,12 +388,13 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         checkpoints: result.kind === "handoff" ? result.checkpoints : 0,
         facts: result.kind === "refused" ? 0 : result.facts,
         factsFailed: result.kind === "refused" ? null : result.factsFailed,
-        // the size the model received, the limit it was cut against, and whether it was cut —
+        // the size the model received, the size target it was rendered to, and whether it was cut —
         // never re-derived from the text: the render reports them itself
         chars: result.text.length,
         limitChars: result.kind === "handoff" ? result.limitChars : null,
         cut: result.kind === "handoff" && result.cut,
         oversized: result.kind === "handoff" && result.oversized,
+        reasonsLeftOut: result.kind === "handoff" && result.reasonsLeftOut,
         partial: result.kind !== "refused" && result.partial,
         readMs: result.kind === "refused" ? null : result.readMs,
         ms: deps.now() - started,

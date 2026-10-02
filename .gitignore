@@ -7,6 +7,8 @@ contracts/out/
 contracts/cache/
 contracts/broadcast/*/31337/
 contracts/deployments/31337.json
+contracts/deployments/.deploy-lock/
+contracts/deployments/.deploy-lock.steal/
 coverage/
 
 # built packages and packed tarballs — the templates and generators are committed, these are not

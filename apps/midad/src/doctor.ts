@@ -9,7 +9,8 @@ import type { Address, Hex } from "@mida/protocol"
 import { chainFor, rpcTransport } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
-import { COMPILE_PROVIDERS, compileModelChoice, devinSqliteAvailable } from "@mida/compiler"
+import { COMPILE_PROVIDERS, devinSqliteAvailable } from "@mida/compiler"
+import type { SummarizerEntry } from "@mida/compiler"
 import { ContextApiClient, DenyOverlay, RegistryReader, StoreHttpError } from "@mida/api"
 import type { RevocationTarget } from "@mida/api"
 import type { LocalAccount } from "viem"
@@ -21,7 +22,8 @@ import { codeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
 import { DEVIN_NODE_SQLITE_MIN } from "./devin-facts.js"
 import { drainerEnv } from "./hook.js"
-import { sessionWaits } from "./drain.js"
+import { SUMMARY_FAILURE_REASONS, sessionWaits } from "./drain.js"
+import { currentSummarizer } from "./summarizer.js"
 import { CODEX_TRUST_SENTENCE, claudeCodeMcpStatus, claudeDesktopConfigPath, claudeHooksStatus, claudeUserConfigPath, codexHooksStatus, codexMcpStatus, cursorMcpConfigPath, devinHooksStatus, installedMcpLauncherPath, macosProtectedFolderNote, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
 import type { InstallTool, McpClientTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
@@ -67,6 +69,12 @@ export interface DoctorDeps {
   cwd?: string
   /** Shell environment for the API-key check; default process.env. Values are never printed. */
   env?: NodeJS.ProcessEnv
+  /**
+   * The PATH probe and the Claude safe-mode answer the compile-model check resolves through —
+   * injectable so a test can say which agent tools exist without touching the real PATH (UF-P3).
+   */
+  onPath?: (bin: string) => boolean
+  claudeSafeMode?: () => boolean
   /** node:sqlite probe for the devin check — injectable since a test cannot uninstall a builtin. */
   devinSqliteAvailable?: () => boolean
   now?: () => number
@@ -102,6 +110,12 @@ interface DoctorLiveDeps extends DoctorDeps {
   watchMs?: number
   /** Starts the throwaway headless session; the default spawns the real tool. */
   startSession?: (tool: InstallTool, cwd: string) => { stop(): void }
+  /**
+   * Replaces a service left over from an older install — the same stale-service swap plain
+   * `mida doctor` does. Called only AFTER this check's own refusals pass, so a refused
+   * `--live` never touches a running service (UF-QC).
+   */
+  replaceStaleService?: () => Promise<void>
 }
 
 /** What the chain checks need; built lazily once the network has been resolved. */
@@ -118,6 +132,11 @@ interface Shared {
    * every probe went unanswered — the waiting-sessions note phrases its next try by it (B-2).
    */
   serviceUp?: boolean
+  /**
+   * The /health body the daemon check last received — the compile-model check builds its lines
+   * from the reply's `summarizer` entries and chain when they are present (UF-QC).
+   */
+  healthBody?: unknown
 }
 
 const problem = (sentence: string, fix: string) => `PROBLEM: ${sentence} — ${fix}`
@@ -316,6 +335,8 @@ const ENV_VARS = [
   "MIDA_COMPILE_BASE_URL",
   "MIDA_COMPILE_MODEL_ID",
   "MIDA_COMPILE_TIMEOUT_MS",
+  "MIDA_CLAUDE_SUMMARY_MODEL",
+  "MIDA_CODEX_SUMMARY_MODEL",
   "MIDA_CLAUDE_SETTINGS",
   "MIDA_CODEX_CONFIG",
   "MIDA_INNER",
@@ -370,6 +391,144 @@ function hookPathProblems(commands: string[] | "absent" | "unreadable", tool: In
   return [...problems]
 }
 
+/**
+ * What the compile-model check builds its lines from (UF-QC): the mode in force, every entry
+ * the mode names (installed or not), and the labels that can actually run, in order. The
+ * entries' `command.env` exists only on the shell's own resolution — a service-built view
+ * cannot see the service's environment, so the env-variable PROBLEM runs only locally.
+ */
+interface CompileModelView {
+  mode: string
+  invalid: boolean
+  entries: {
+    id: string
+    label: string
+    display: string
+    host: string | undefined
+    installed: boolean
+    command?: SummarizerEntry["command"]
+  }[]
+  chain: string[]
+  /** true when the view is this shell's resolution — the env-var checks can only run there */
+  local: boolean
+}
+
+/** The service's summarizer answer, when its /health reply carries `entries` and `chain`. */
+function remoteSummarizerView(body: unknown): CompileModelView | undefined {
+  const summarizer = (body as { summarizer?: unknown } | null | undefined)?.summarizer
+  if (typeof summarizer !== "object" || summarizer === null) return undefined
+  const raw = summarizer as Record<string, unknown>
+  if (!Array.isArray(raw.entries) || !Array.isArray(raw.chain)) return undefined
+  const entries = raw.entries
+    .filter((e): e is Record<string, unknown> => typeof e === "object" && e !== null)
+    .map((e) => ({
+      id: typeof e.id === "string" ? e.id : "",
+      label: typeof e.label === "string" ? e.label : "",
+      display: typeof e.display === "string" ? e.display : "",
+      host: typeof e.host === "string" ? e.host : undefined,
+      installed: e.installed === true,
+    }))
+  return {
+    mode: typeof raw.mode === "string" ? raw.mode : "",
+    invalid: raw.invalid === true,
+    entries,
+    chain: raw.chain.filter((label): label is string => typeof label === "string"),
+    local: false,
+  }
+}
+
+function localSummarizerView(choice: ReturnType<typeof currentSummarizer>): CompileModelView {
+  return {
+    mode: choice.mode,
+    invalid: choice.invalid,
+    entries: choice.entries,
+    chain: choice.chain.map((entry) => entry.label),
+    local: true,
+  }
+}
+
+/** The compile-model lines for one view — the service's own answer or this shell's resolution. */
+function compileModelLines(view: CompileModelView, env: NodeJS.ProcessEnv): string[] {
+  if (view.invalid) {
+    return [
+      "PROBLEM: the saved summariser choice (summarizer.json) cannot be read, so no session is being saved. Run mida summarizer use agents, or mida summarizer use key.",
+    ]
+  }
+  if (view.chain.length === 0) {
+    // UF-QD: when the environment variables are the decider and nothing they name can run,
+    // the fix is to unset the pin or choose agents — installing a tool would not help, the
+    // pin would still point at the missing one
+    if (view.mode === "environment") {
+      return [
+        "PROBLEM: no model can write Mida's summaries, so no session is being saved. Your environment variables choose a model that cannot run here. Run mida summarizer use agents.",
+      ]
+    }
+    return [
+      "PROBLEM: no model can write Mida's summaries, so no session is being saved. Install Claude Code or Codex, or run mida summarizer use key.",
+    ]
+  }
+  const byLabel = new Map(view.entries.map((entry) => [entry.label, entry]))
+  const nameOf = (entry: CompileModelView["entries"][number]) => (entry.id === "claude" || entry.id === "codex" ? entry.label : entry.id)
+  // a fallback names where the text would be SENT — the host in brackets, the name alone when
+  // the entry reports none
+  const fallbackText = (label: string) => {
+    const entry = byLabel.get(label)
+    const name = entry === undefined ? label : nameOf(entry)
+    return entry !== undefined && entry.host !== undefined && entry.host !== "" ? `${name} (${entry.host})` : name
+  }
+  const headLabel = view.chain[0]!
+  const head = byLabel.get(headLabel)
+  const rest = view.chain.slice(1)
+  const fallbackClause = rest.length === 0 ? "no fallback" : `a failed call falls back to ${rest.map(fallbackText).join(", then ")}`
+  const lines = [`ok: compile model is ${headLabel}`]
+  if (head?.id === "custom") {
+    lines.push(`note: compile text is sent to ${head.host ?? "an address that does not parse"} (your own endpoint); ${fallbackClause}`)
+    // a pinned custom under ENVIRONMENT control without its required vars fails every compile —
+    // name the vars, never values; a saved choice pins them on the command's env, so this check
+    // exists only when the environment is the decider and only this shell's env is visible
+    if (view.local && view.mode === "environment") {
+      const missing = [COMPILE_PROVIDERS.custom.baseVar, COMPILE_PROVIDERS.custom.modelVar].filter(
+        (v) => (env[v] ?? head.command?.env?.[v]) === undefined || (env[v] ?? head.command?.env?.[v]) === "",
+      )
+      if (missing.length > 0) {
+        lines.push(problem(`MIDA_COMPILE_MODEL=custom needs ${missing.join(" and ")}`, "set them, or run mida summarizer use agents"))
+      }
+    }
+  } else {
+    const via = head?.id === "claude" ? " via the claude CLI" : head?.id === "codex" ? " via the codex CLI" : ""
+    lines.push(
+      `note: ${head === undefined ? headLabel : nameOf(head)} sends the session's transcript text to ${head?.host ?? "an address that does not parse"}${via} (secrets are scrubbed first); ${fallbackClause}`,
+    )
+  }
+  // an overridden base URL on a NAMED provider in the chain means the key and the transcript
+  // go somewhere other than the vendor — the owner must see which HOST that is; the full URL
+  // is never printed (its path or query may be secret). Only while the environment decides:
+  // a saved choice pins its own endpoint and makes these variables irrelevant.
+  if (view.mode === "environment") {
+    for (const entry of view.entries) {
+      if (entry.id !== "deepseek" && entry.id !== "kimi") continue
+      const table = COMPILE_PROVIDERS[entry.id]
+      // locally the override is only live when the variable is actually set; a service-built
+      // view has no env to consult, so its reported host alone decides
+      if (view.local && env[table.baseVar] === undefined && entry.command?.env?.[table.baseVar] === undefined) continue
+      const vendor = entry.id === "deepseek" ? "DeepSeek" : "Moonshot"
+      const defaultHost = new URL(table.baseDefault).host
+      const host = entry.host !== undefined && entry.host !== "" ? entry.host : "an address that does not parse"
+      if (host !== defaultHost) {
+        lines.push(problem(`compile text is being sent to ${host}, not ${vendor}`, `unset ${table.baseVar} to compile against ${vendor}`))
+      }
+    }
+  }
+  // an entry that is not installed cannot serve the chain — name it so a "no fallback" or
+  // short chain does not read as a choice the owner made
+  for (const entry of view.entries) {
+    if (!entry.installed) {
+      lines.push(`note: ${entry.display} is not installed, so Mida cannot use it.`)
+    }
+  }
+  return lines
+}
+
 /** One line per check, in the order the spec fixes. Each returns its lines; it never decides. */
 function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): Promise<string[]> }[] {
   const home = deps.home
@@ -390,6 +549,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           reply = await callDaemon(home, "/health", undefined, { timeoutMs: probeMs })
         }
         shared.serviceUp = reply.status !== 0
+        if (reply.status !== 0) shared.healthBody = reply.body
         if (reply.status === 0) {
           // The lock's own record decides what "not answering" means (in-40 L-2): the writer's
           // start time proves the pid is still the process that took the lock, and its role says
@@ -425,19 +585,21 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         }
         // any answer at all used to read as healthy — only 200 with { ok: true } is midad;
         // anything else is a problem that names the status it actually got
-        const body = reply.body as { ok?: unknown; codeRoot?: unknown; codeCommit?: unknown } | null
+        const body = reply.body as { ok?: unknown; codeRoot?: unknown; codeCommit?: unknown; codeVersion?: unknown } | null
         if (!(reply.status === 200 && body !== null && typeof body === "object" && body.ok === true)) {
           return [problem(`midad answered with status ${reply.status}, not ok:true`, "restart midad")]
         }
         // an answering midad must also be running THIS code — a service from another checkout
-        // quietly serves agent commands with the wrong build
+        // quietly serves agent commands with the wrong build, and one at the same folder on an
+        // older package version is other code too (UF-QC: its reply simply carries no version)
         const lines = ["ok: midad answers"]
         const self = codeIdentity()
         const codeRoot = typeof body.codeRoot === "string" ? body.codeRoot : undefined
         const codeCommit = typeof body.codeCommit === "string" ? body.codeCommit : undefined
+        const codeVersion = typeof body.codeVersion === "string" ? body.codeVersion : undefined
         if (codeRoot === undefined || codeCommit === undefined) {
           lines.push(problem("midad predates code reporting", "run any mida command to replace it"))
-        } else if (codeRoot === self.codeRoot && codeCommit === self.codeCommit) {
+        } else if (codeRoot === self.codeRoot && codeCommit === self.codeCommit && codeVersion === self.codeVersion) {
           lines.push(`ok: midad runs ${codeRoot} @ ${codeCommit.slice(0, 7)}; this command runs the same`)
         } else {
           lines.push(problem(`midad runs ${codeRoot} @ ${codeCommit.slice(0, 7)}; this command runs ${self.codeRoot} @ ${self.codeCommit.slice(0, 7)}`, "run any mida command to replace it"))
@@ -863,44 +1025,30 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
     {
       name: "compile-model",
       run: async () => {
-        // the same resolution the daemon used at start-up — the owner sees which model compiles
-        // sessions, exactly which host the transcript text goes to (secrets are scrubbed first),
-        // and the real fallback chain — all computed from the choice, never hard-coded
+        // UF-QC: the check describes the RUNNING service's chain when /health carries one —
+        // the service may see other tools on PATH than this shell, so its entries and chain
+        // build every line, and the local resolution only fills in when the service cannot
+        // or did not say (UF-P3: both resolve through currentSummarizer, the same function
+        // the service and the drainer use).
         const env = deps.env ?? process.env
-        const choice = compileModelChoice(env)
-        const lines = [`ok: compile model is ${choice.model.label}`]
-        const head = choice.chain[0]!
-        const rest = choice.chain.slice(1)
-        const nameOf = (entry: (typeof choice.chain)[number]) => (entry.provider === "haiku" ? entry.label : entry.provider)
-        const fallbackClause = rest.length === 0 ? "no fallback" : `a failed call falls back to ${rest.map(nameOf).join(", then ")}`
-        if (head.provider === "custom") {
-          lines.push(`note: compile text is sent to ${head.host ?? "an address that does not parse"} (your own endpoint); ${fallbackClause}`)
-          // a pinned custom without its required vars fails every compile — name the vars, never values
-          const missing = [COMPILE_PROVIDERS.custom.baseVar, COMPILE_PROVIDERS.custom.modelVar].filter((v) => env[v] === undefined || env[v] === "")
-          if (missing.length > 0) {
-            lines.push(problem(`MIDA_COMPILE_MODEL=custom needs ${missing.join(" and ")}`, "set them or unset MIDA_COMPILE_MODEL"))
+        const choice = currentSummarizer(home, env, { onPath: deps.onPath, claudeSafeMode: deps.claudeSafeMode })
+        const remote = remoteSummarizerView(shared.healthBody)
+        if (remote !== undefined) {
+          const lines = compileModelLines(remote, env)
+          const mine = choice.chain.map((entry) => entry.label)
+          if (remote.chain.join(", ") !== mine.join(", ")) {
+            lines.push(
+              `note: the running Mida service uses ${remote.chain.join(", ") || "none"}; this shell would use ${mine.join(", ") || "none"}. The service's answer is the one that counts.`,
+            )
           }
-        } else {
-          const via = head.provider === "haiku" ? " via the claude CLI" : ""
-          lines.push(
-            `note: ${nameOf(head)} sends the session's transcript text to ${head.host ?? "an address that does not parse"}${via} (secrets are scrubbed first); ${fallbackClause}`,
-          )
+          return lines
         }
-        // an overridden base URL on a NAMED provider in the chain means the key and the transcript
-        // go somewhere other than the vendor — the owner must see which HOST that is; the full URL
-        // is never printed (its path or query may be secret). A custom base URL is not a problem:
-        // it IS the endpoint the user chose.
-        for (const entry of choice.chain) {
-          if (entry.provider !== "deepseek" && entry.provider !== "kimi") continue
-          const table = COMPILE_PROVIDERS[entry.provider]
-          if (env[table.baseVar] === undefined) continue
-          const vendor = entry.provider === "deepseek" ? "DeepSeek" : "Moonshot"
-          const defaultHost = new URL(table.baseDefault).host
-          const host = entry.host !== undefined && entry.host !== "" ? entry.host : "an address that does not parse"
-          if (host !== defaultHost) {
-            lines.push(problem(`compile text is being sent to ${host}, not ${vendor}`, `unset ${table.baseVar} to compile against ${vendor}`))
-          }
-        }
+        const lines = compileModelLines(localSummarizerView(choice), env)
+        lines.push(
+          shared.serviceUp === true
+            ? "note: the running Mida service did not say which model it uses; the lines above describe this shell."
+            : "note: the Mida service is not running; the lines above describe what it would use if started from this shell.",
+        )
         return lines
       },
     },
@@ -916,6 +1064,14 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         // out-of-gas wait names the agent whose wallet is dry and the two ways to clear it,
         // instead of reading as indistinguishable "chain-error" minutes.
         const waits = sessionWaits(home, jobs)
+        // UF-QA: wallet-low is not a dry wallet — the paying wallet is funded under the send
+        // threshold — so it gets its own line pointing at the sponsor and wallets checks
+        const walletLow = [...new Set(waits.filter((wait) => wait.reason === "wallet-low").map((wait) => wait.agent))].sort()
+        for (const agent of walletLow) {
+          lines.push(
+            `PROBLEM: ${agent}'s saves are waiting because the wallet that pays for them is low on gas. See doctor's sponsor and wallets lines.`,
+          )
+        }
         const outOfGas = [...new Set(waits.filter((wait) => wait.reason === "out-of-gas").map((wait) => wait.agent))].sort()
         if (outOfGas.length > 0) {
           // in-39 B-4: on a sponsored setup "run mida sponsor on" is nonsense — a sponsor is
@@ -927,6 +1083,40 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
               sponsored
                 ? `PROBLEM: ${agent}'s wallet ran out of gas and the gas sponsor did not pay, so its saves are waiting. Check doctor's sponsor line; until the sponsor pays again, the wallet needs testnet MON.`
                 : `PROBLEM: ${agent}'s wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.`,
+            )
+          }
+        }
+        // UF-QA: a sponsor-limit wait is not a dry wallet — the sponsor stopped paying for today
+        // (its shared daily budget or its count limits) and the drain sends the save after the
+        // 00:00 UTC reset, so the line says exactly that
+        const sponsorLimited = [...new Set(waits.filter((wait) => wait.reason === "sponsor-limit").map((wait) => wait.agent))].sort()
+        for (const agent of sponsorLimited) {
+          lines.push(`PROBLEM: the gas sponsor has stopped paying for today, so ${agent}'s saves are waiting. Mida sends them after its limits reset at 00:00 UTC.`)
+        }
+        // UF-P3: a save held because no summary model can write is not a gas problem either —
+        // the line names the wait and the command that shows or changes the choice
+        const summarizerLimited = [...new Set(waits.filter((wait) => wait.reason === "summarizer-limit").map((wait) => wait.agent))].sort()
+        for (const agent of summarizerLimited) {
+          lines.push(`PROBLEM: the model that writes Mida's summaries hit its usage limit, so ${agent}'s saves are waiting. Run mida summarizer to see it or to choose another.`)
+        }
+        const noSummarizer = [...new Set(waits.filter((wait) => wait.reason === "no-summarizer").map((wait) => wait.agent))].sort()
+        for (const agent of noSummarizer) {
+          lines.push(`PROBLEM: no model is set up to write Mida's summaries, so ${agent}'s saves are waiting. Run mida summarizer.`)
+        }
+        // UF-QH: a save that has failed eight or more tries is still retried. The line says how often
+        // and when Mida stops: seven days after the session's newest queued event, so a session still
+        // in use is never dropped. A summary failure also names the command that retries it now.
+        for (const wait of waits) {
+          if (
+            typeof wait.attempts === "number" &&
+            wait.attempts >= 8 &&
+            typeof wait.reason === "string" &&
+            !(["sponsor-limit", "summarizer-limit", "no-summarizer", "out-of-gas", "wallet-low"] as readonly string[]).includes(wait.reason)
+          ) {
+            lines.push(
+              SUMMARY_FAILURE_REASONS.has(wait.reason)
+                ? `PROBLEM: a save from ${wait.agent} has failed ${wait.attempts} times (${wait.reason}). Mida now tries it a few times a day and stops once that session has been quiet for seven days. To retry now, run mida summarizer test: when it passes, Mida tries the save again.`
+                : `PROBLEM: a save from ${wait.agent} has failed ${wait.attempts} times (${wait.reason}). Mida now tries it every hour and stops once that session has been quiet for seven days.`,
             )
           }
         }
@@ -1194,12 +1384,31 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             return [problem(`the gas sponsor ${host} answered HTTP ${reply.status}`, fix)]
           }
           const body = (await reply.json().catch(() => undefined)) as
-            | { limits?: { signingsPerSenderPerDay?: unknown; signingsGlobalPerDay?: unknown; freeCallsPerSenderPerDay?: unknown } }
+            | {
+                limits?: {
+                  signingsPerSenderPerDay?: unknown
+                  signingsGlobalPerDay?: unknown
+                  freeCallsPerSenderPerDay?: unknown
+                  dailyWeiBudget?: unknown
+                }
+              }
             | undefined
           const limits = body?.limits
+          // UF-O: the limits read as SAVES, not signings — one save spends two free calls (stub
+          // data + gas estimate), so a low free-call cap binds tighter than the signing cap. The
+          // count is clamped at 0: a spent or negative free-call field is "0 saves", never "-3".
+          // UF-QA: limits.dailyWeiBudget (a decimal string of wei) is the sponsor's daily budget
+          // shared by EVERYONE — it runs out long before the count limits — so when it parses,
+          // the detail names it in whole MON; absent or malformed keeps the count wording.
+          const perSender = limits?.signingsPerSenderPerDay
+          const globalCap = limits?.signingsGlobalPerDay
+          const freeCalls = limits?.freeCallsPerSenderPerDay
+          const budget = limits?.dailyWeiBudget
           const detail =
-            typeof limits?.signingsPerSenderPerDay === "number" && typeof limits?.signingsGlobalPerDay === "number"
-              ? `; it advertises ${limits.signingsPerSenderPerDay} signings per address a day, ${limits.signingsGlobalPerDay} a day in total`
+            typeof perSender === "number" && typeof globalCap === "number"
+              ? typeof budget === "string" && /^\d+$/.test(budget)
+                ? `; it pays for up to ${Math.max(0, typeof freeCalls === "number" ? Math.min(perSender, Math.floor(freeCalls / 2)) : perSender)} saves per agent a day, from a daily budget of ${(BigInt(budget) / 1_000_000_000_000_000_000n).toString()} MON shared by everyone`
+                : `; it pays for up to ${Math.max(0, typeof freeCalls === "number" ? Math.min(perSender, Math.floor(freeCalls / 2)) : perSender)} saves per agent a day, ${globalCap} a day across everyone`
               : ""
           // a 2xx proves reachable, never willing — the Sep 22 refusal came from a reachable sponsor
           return [`ok: gas sponsor reachable at ${host} (willingness is only proven by a real send${detail})`]
@@ -1314,6 +1523,8 @@ export async function runDoctorLive(tool: InstallTool, deps: DoctorLiveDeps): Pr
     deps.print("refused: live checks need an interactive terminal")
     return 2
   }
+  // only now may the service be looked at: every refusal above leaves it exactly as found
+  await deps.replaceStaleService?.()
   const started = (deps.now ?? Date.now)()
   const deadline = started + (deps.watchMs ?? LIVE_WATCH_MS)
   const cwd = mkdtempSync(join(tmpdir(), "mida-live-"))

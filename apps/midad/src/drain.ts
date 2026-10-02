@@ -8,7 +8,7 @@ import { isMidaError } from "@mida/protocol"
 import type { Address } from "@mida/protocol"
 import { CONTENT_FIELDS, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint } from "@mida/checkpoint"
-import { chainFor, rpcTransport } from "@mida/chain"
+import { chainFor, rpcTransport, sponsorDailyLimitOf } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { RegistryReader, StoreHttpError } from "@mida/api"
 import { readTranscriptFor, scrubSecrets } from "@mida/compiler"
@@ -25,8 +25,9 @@ import { appendLog } from "./log.js"
 import { resolveNetwork } from "./network.js"
 import { checkProject as checkProjectAgainstList } from "./projects.js"
 import type { ProjectCheck } from "./projects.js"
-import { findProjectMarker, isSafeName, listJobs, moveToBad, removeJob } from "./queue.js"
+import { findProjectMarker, firstQueuedAt, isSafeName, listJobs, moveToBad, peekJobs, removeJob, stampFirstAt } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
+import { clearUnsent, markUnsent } from "./unsent.js"
 import { resolveSessionTask, taskOrUndefined } from "./task.js"
 import type { ServiceRuntime } from "./runtime.js"
 import { followPendingAnchors, pendingAnchors, sweepPendingPlaintexts } from "./batching.js"
@@ -99,10 +100,26 @@ const PERMANENT_FAILURES = new Set([
 ])
 /**
  * A checkpoint the validator rejects is usually fixed by a fresh model call, so
- * `invalid-checkpoint` is transient for the first two attempts; the third is permanent.
+ * `invalid-checkpoint` is transient for the first two unusable answers; the third is permanent.
  */
 const INVALID_CHECKPOINT_MAX_ATTEMPTS = 3
-const backoffMs = (attempts: number) => Math.min(60_000 * 2 ** attempts, MAX_BACKOFF_MS)
+
+/**
+ * UF-QF: a SUMMARY failure — the model ran but produced nothing usable — backs off to a
+ * six-hour cap, not the one-hour cap a send failure keeps. The summary failures are exactly
+ * the three reasons a try can spend a model call on, so once the tries run long each one
+ * waits six hours and (with `attempts: 1`, below) asks each model in the list once.
+ */
+export const SUMMARY_FAILURE_REASONS = new Set(["model-failed", "no-json", "invalid-checkpoint"])
+const SUMMARY_BACKOFF_CAP_MS = 6 * 60 * 60 * 1000
+const backoffMs = (attempts: number, cap: number = MAX_BACKOFF_MS) => Math.min(60_000 * 2 ** attempts, cap)
+/**
+ * Transient codes that are a capacity wait, not a failed attempt: the sponsor's daily cap (UF-O),
+ * or a compile with no model able to write the summary — the whole chain at its usage limit, or
+ * nothing installed at all (UF-P3). They never count an attempt and never reach queue/bad
+ * through gave-up.
+ */
+const LIMIT_WAIT_REASONS = new Set(["sponsor-limit", "summarizer-limit", "no-summarizer"])
 
 export interface DrainDeps {
   home: MidaHome
@@ -143,6 +160,13 @@ interface SessionState {
   failedAt?: string
   /** The drain code the last attempt failed with — what the wait is waiting on (in-29 S-2). */
   reason?: string
+  /**
+   * UF-QF: how many tries ended on an unusable answer (`no-json` or `invalid-checkpoint`).
+   * Only those two reasons raise it — a transport or send failure never does — and it is the
+   * only count that can move a job to queue/bad. A state file written before the field
+   * existed reads as zero.
+   */
+  unusable?: number
 }
 
 export interface DrainResult {
@@ -234,8 +258,11 @@ export async function drainUntilSettled(deps: DrainDeps): Promise<DrainResult> {
  * `queue/state/<sessionId>.json`: an unchanged transcript is skipped even on a flush, and a changed
  * one inside `minGapMs` of the last save waits — its job stays queued so a later drain (or a flush)
  * still saves it. A transient failure is recorded as `attempts`/`failedAt` on the state and retried
- * only after `60 s × 2^attempts` (capped at an hour); the eighth attempt moves the job to
- * `queue/bad/` as `gave-up`. A permanent failure removes the job and records the transcript state
+ * only after `60 s × 2^attempts` (capped at six hours for a summary failure, one hour otherwise).
+ * Only an answered-but-unusable model reply counts toward giving up (`unusable`: `no-json` at
+ * eight, `invalid-checkpoint` at three); every other transient failure keeps retrying until the
+ * seven-day age rule drops the job. A permanent
+ * failure removes the job and records the transcript state
  * so an identical job later skips as unchanged. A compiled envelope is cached at
  * `queue/compiled/<eventId>.json` so a retried save never pays for a second model call.
  *
@@ -307,13 +334,31 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
   try {
     for (const [sessionId, group] of bySession) {
       const job = group[group.length - 1]! // listJobs is oldest-first, so the last is newest
+      // CAP-28: the session's first queue time survives the merge, so the first-save gap runs from
+      // its first event — not from whichever job a previous pass happened to keep
+      const firstAt = firstQueuedAt(group)
+      // stamp BEFORE removing the older jobs: a crash in between then loses nothing (review)
+      stampFirstAt(deps.home, job, firstAt)
       for (const older of group.slice(0, -1)) removeJob(deps.home, older.id)
       const flush = group.some((j) => FLUSH_EVENTS.has(j.event))
       try {
-        if (now().getTime() - Date.parse(job.at) > DAY_MS) {
+        // UF-QC: ONE age rule for every job, whatever happened to it — a queued save is kept
+        // for seven days. The session's state is read here anyway and reused below; it no
+        // longer decides staleness, so a wait reason clearing can never drop the save.
+        const state = readState(deps.home, sessionId)
+        if (now().getTime() - Date.parse(job.at) > WEEK_MS) {
           moveToBad(deps.home, `${job.id}.json`)
-          log({ sessionId, outcome: "bad", reason: "older-than-24h" })
+          log({ sessionId, outcome: "bad", reason: "older-than-7d" })
           continue
+        }
+        // UF-QF: the wait check runs FIRST — before the project-list and approval reads it would
+        // otherwise pay for. A session inside its backoff is skipped before any chain read, so a
+        // pass every 15 s cannot record a failed try per pass while the chain is unreachable.
+        const due = state === undefined ? undefined : dueAfterFailureMs(state)
+        if (due !== undefined && now().getTime() < due) {
+          counts.skippedTooSoon += 1
+          dueSooner(due)
+          continue // the job stays queued: the retry fires once the wait has passed
         }
         // the hook checked this path at enqueue, but the file could have been swapped since —
         // re-check the same rule before the drainer opens it. A devin job's "transcript" is
@@ -349,12 +394,13 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
         // size and last line come from ONE open descriptor — a growing transcript cannot show
         // the drainer a size and a tail from different moments. A devin session has no file:
         // its fingerprint is (main_chain_id, max node_id, node count) from one database read.
+        // CAP-26: what a compile from this read covers — the next agent's "newer work" check
+        const coveredAt = now().toISOString()
         const { bytes: transcriptBytes, lastLine } =
           job.agent === "devin"
             ? devinFingerprintOf(job.transcriptPath, sessionId, deps.openDevinDb)
             : tailOf(job.transcriptPath)
         const lastLineHash = bytesToHex(sha256(utf8ToBytes(lastLine)))
-        const state = readState(deps.home, sessionId)
         const stateMatches = state !== undefined && state.transcriptBytes === transcriptBytes && state.lastLineHash === lastLineHash
         const terminal = { transcriptBytes, lastLineHash, savedAt: now().toISOString() }
         if (stateMatches && (state.attempts ?? 0) === 0) {
@@ -394,21 +440,12 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           log({ sessionId, outcome: "removed", reason: removalReason(deps.home, job.agent, "not-approved") })
           continue
         }
-        const attempts = state?.attempts ?? 0
-        if (attempts > 0 && state?.failedAt !== undefined) {
-          const due = Date.parse(state.failedAt) + backoffMs(attempts)
-          if (now().getTime() < due) {
-            counts.skippedTooSoon += 1
-            dueSooner(due)
-            continue // the job stays queued: the retry fires once the backoff has passed
-          }
-        }
-        // No saved state yet: the gap runs from the session's OLDEST queued job. The FIRST save
+        // No saved state yet: the gap runs from the session's FIRST queued job (CAP-28). The FIRST save
         // owes only the short first gap — a session killed in its first minute still leaves a
         // checkpoint; every later save keeps the full gap. A session inside a retry backoff never
         // reaches this line — the backoff check above already holds it.
         const first = state?.savedAt === undefined
-        const gapRef = Date.parse(state?.savedAt ?? group[0]!.at)
+        const gapRef = Date.parse(state?.savedAt ?? firstAt)
         const gapMs = first ? firstGapMs : minGapMs
         if (!flush && now().getTime() - gapRef < gapMs) {
           counts.skippedTooSoon += 1
@@ -441,6 +478,10 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             cwd: job.cwd,
             homeDir,
             previous: previous.checkpoint,
+            // UF-QF: from the ninth failed try on, one try asks each model in the list ONCE: the
+            // compile is asked for a single attempt, so the fallback chain is walked once (one call
+            // with one tool installed, two with Claude Code and Codex) and no same-provider retry fires
+            ...((state?.attempts ?? 0) >= MAX_ATTEMPTS ? { attempts: 1 } : {}),
           })
           const compileMs = now().getTime() - compileStart
           if (!compiled.ok) {
@@ -473,6 +514,9 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           deps.home.writeSecretJson(`queue/compiled/${eventId}.json`, { ...envelope, compileMeta })
           reusedCompiled = false
         }
+        // CAP-26: from here until it lands (or fails for good) this compiled save is the session's
+        // newest state — the next agent's handoff may show it, marked UNSENT, for a fast switch
+        markUnsent(deps.home, sessionId, eventId, coveredAt)
         const runtime = await openRuntime()
         const saved = await save(runtime, job.agent, {
           projectId: envelope.projectId,
@@ -483,6 +527,8 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
           ...(envelope.task === undefined ? {} : { task: envelope.task }),
         })
         writeState(deps.home, sessionId, terminal)
+        // landed (stored, or batched for anchoring — the pending ledger shows that one): never UNSENT again
+        clearUnsent(deps.home, sessionId)
         // the saved checkpoint's content fields — and its verbatim
         // originalRequest — are the next compile's `previous`: without the
         // request in the file, a post-/compact save can never keep the
@@ -562,9 +608,20 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             : {}),
         })
       } catch (error) {
-        const code = failureCode(error)
+        // an error whose properties throw when read (a hostile getter or Proxy) must still count as
+        // a transient failure with its attempt and backoff recorded — never abort the pass (CAP-26 review)
+        let code: string
+        try {
+          code = failureCode(error)
+        } catch {
+          code = "chain-error"
+        }
         // field names are safe to log; values, validator messages and error.message are not
-        const fields = error instanceof CheckpointPayloadError && error.fields !== undefined ? { fields: error.fields } : {}
+        // (CAP-26: a chain-error adds its error names and numeric codes — never a message)
+        const fields = {
+          ...(error instanceof CheckpointPayloadError && error.fields !== undefined ? { fields: error.fields } : {}),
+          ...(code === "chain-error" ? chainErrorShape(error) : {}),
+        }
         // a prefix of the last provider answer belongs on the TERMINAL failure only — re-quoting
         // it on every retry would repeat provider output once per attempt. Scrubbed and capped
         // again here rather than trusting the bound upstream set.
@@ -588,32 +645,64 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             writeState(deps.home, sessionId, terminalStateFor(job, now().toISOString(), deps.openDevinDb))
           }
           log({ sessionId, outcome: "bad", reason: code, ...fields, ...sample })
+          clearUnsent(deps.home, sessionId) // it will never land: not "on its way" any more
           continue
         }
-        // transient: keep the job, count the attempt, and hold the session until the backoff passes
-        const attempts = (readState(deps.home, sessionId)?.attempts ?? 0) + 1
+        // transient: keep the job, count the attempt, and hold the session until the backoff passes.
+        // A capacity wait is different (UF-O sponsor-limit; UF-P3 summarizer-limit/no-summarizer):
+        // the limit is not an error — the attempt count must not grow (it would only march the
+        // job to queue/bad for a limit the owner may lift), so the state keeps whatever attempts
+        // it already had and is left out when there were none.
+        const priorState = readState(deps.home, sessionId)
+        const attempts = LIMIT_WAIT_REASONS.has(code) ? (priorState?.attempts ?? 0) : (priorState?.attempts ?? 0) + 1
+        // UF-QF: unusable counts answers the model got wrong — it rises only on no-json and
+        // invalid-checkpoint and is carried across every other failure, so a save that sat all
+        // afternoon on a network problem is not dropped the first time the model answers badly.
+        const unusable =
+          (priorState?.unusable ?? 0) + (code === "no-json" || code === "invalid-checkpoint" ? 1 : 0)
         counts.failed += 1
-        const invalidGaveUp = code === "invalid-checkpoint" && attempts >= INVALID_CHECKPOINT_MAX_ATTEMPTS
-        if (attempts >= MAX_ATTEMPTS || invalidGaveUp) {
+        // UF-QF: only the unusable count is terminal on a count — no-json after eight bad
+        // answers, invalid-checkpoint after three. Every other transient reason retries until
+        // the seven-day age rule drops the job: `attempts` is not a death sentence for a chain
+        // problem or a model that is down for the afternoon.
+        const invalidGaveUp = code === "invalid-checkpoint" && unusable >= INVALID_CHECKPOINT_MAX_ATTEMPTS
+        const noJsonGaveUp = code === "no-json" && unusable >= MAX_ATTEMPTS
+        if (invalidGaveUp || noJsonGaveUp) {
           moveToBad(deps.home, `${job.id}.json`)
           writeState(deps.home, sessionId, terminalStateFor(job, now().toISOString(), deps.openDevinDb))
-          log({ sessionId, outcome: "bad", reason: invalidGaveUp ? "invalid-checkpoint" : "gave-up", ...fields, ...sample })
+          log({ sessionId, outcome: "bad", reason: invalidGaveUp ? "invalid-checkpoint" : "gave-up", lastReason: code, ...fields, ...sample })
+          clearUnsent(deps.home, sessionId)
           continue
         }
-        writeState(deps.home, sessionId, {
+        const waiting: SessionState = {
           // an empty lastLineHash can never match a real transcript, so the state never reads as
           // "unchanged" — the retry is governed by attempts/failedAt alone
           transcriptBytes: statSize(job.transcriptPath),
           lastLineHash: "",
-          savedAt: readState(deps.home, sessionId)?.savedAt ?? job.at,
-          attempts,
+          savedAt: priorState?.savedAt ?? job.at,
+          ...(LIMIT_WAIT_REASONS.has(code) && priorState?.attempts === undefined ? {} : { attempts }),
           failedAt: now().toISOString(),
           // the reason rides the wait record: doctor names it and a funding reset clears it
           reason: code,
-        })
-        dueSooner(now().getTime() + backoffMs(attempts))
+          ...(unusable > 0 ? { unusable } : {}),
+        }
+        writeState(deps.home, sessionId, waiting)
+        const waitUntil = dueAfterFailureMs(waiting)
+        if (waitUntil !== undefined) dueSooner(waitUntil)
         // transient: no sample — it is quoted once, on the terminal "bad" line above
-        log({ sessionId, outcome: "failed", reason: code, attempts, ...fields })
+        log({
+          sessionId,
+          outcome: "failed",
+          reason: code,
+          attempts,
+          ...(code === "sponsor-limit" ? { sponsorReason: sponsorDailyLimitOf(error)!.slice(0, 200) } : {}),
+          ...fields,
+        })
+      } finally {
+        // CAP-26: a session whose job left the queue this pass — saved, skipped as unchanged,
+        // dropped, moved aside — has no save on its way, so it can never be shown as UNSENT. One
+        // check for every exit, including a restart after a crash between saving and clearing.
+        if (!deps.home.has(`queue/${job.id}.json`)) clearUnsent(deps.home, sessionId)
       }
     }
     // The batched lane's follow-up: every pass asks the store where each ledger-owned save stands.
@@ -654,12 +743,50 @@ function removalReason(home: MidaHome, agent: string, reason: string): string {
 /** A transient failure raised inside the drain pass, carrying the stable code the log uses. */
 class DrainFailure extends Error {
   constructor(
-    readonly code: "model-failed" | "no-json",
+    readonly code: "model-failed" | "no-json" | "summarizer-limit" | "no-summarizer",
     /** A bounded, already-scrubbed prefix of the provider's last answer — the compiler supplies it. */
     readonly sample?: string,
   ) {
     super(code)
     this.name = "DrainFailure"
+  }
+}
+
+/**
+ * CAP-26: what KIND of error a chain-error was — so the log can say why a save keeps failing
+ * without quoting it. Only names and closed-list codes leave: the `.name` of the error and each
+ * nested `.cause` (outermost first, at most 8, so viem's usual 4-deep write chain keeps its root;
+ * a name outside a plain identifier shape reads "Unknown"), the first integer `.code` (a JSON-RPC
+ * code), the first upper-snake string `.code` (a MidaError's closed-list code such as SEND_TIMEOUT
+ * — the most useful single fact, review finding), and the first HTTP `.status` along that chain.
+ * Never a message, URL, body or detail: those can carry RPC keys and transcript text (H5). A
+ * thrown non-object — or an error whose properties throw when read — is `["Unknown"]`, so a hostile
+ * error can never abort the drain pass before its attempt and backoff are recorded.
+ */
+export function chainErrorShape(error: unknown): { errorChain: string[]; rpcCode?: number; errorCode?: string; httpStatus?: number } {
+  try {
+    const errorChain: string[] = []
+    let rpcCode: number | undefined
+    let errorCode: string | undefined
+    let httpStatus: number | undefined
+    let current: unknown = error
+    while (errorChain.length < 8 && typeof current === "object" && current !== null) {
+      const { name, code, status, cause } = current as { name?: unknown; code?: unknown; status?: unknown; cause?: unknown }
+      errorChain.push(typeof name === "string" && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name) ? name : "Unknown")
+      if (rpcCode === undefined && typeof code === "number" && Number.isInteger(code)) rpcCode = code
+      if (errorCode === undefined && typeof code === "string" && /^[A-Z][A-Z0-9_]{1,63}$/.test(code)) errorCode = code
+      if (httpStatus === undefined && typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) httpStatus = status
+      current = cause
+    }
+    if (errorChain.length === 0) errorChain.push("Unknown")
+    return {
+      errorChain,
+      ...(rpcCode === undefined ? {} : { rpcCode }),
+      ...(errorCode === undefined ? {} : { errorCode }),
+      ...(httpStatus === undefined ? {} : { httpStatus }),
+    }
+  } catch {
+    return { errorChain: ["Unknown"] }
   }
 }
 
@@ -676,6 +803,9 @@ function failureCode(error: unknown): string {
   // a refused send is transient: the ceiling may pass on retry after the queue settles or the
   // estimate changes — the job stays and the usual backoff applies (R3-1)
   if (isMidaError(error, "GAS_CEILING_EXCEEDED")) return "gas-ceiling"
+  // the sponsor's daily limit refused and the wallet could not pay either (the marker sendContract
+  // sets): not a chain fault — the save waits for the limit's UTC reset instead of retrying to death
+  if (sponsorDailyLimitOf(error) !== undefined) return "sponsor-limit"
   // the chain's own insufficient-funds refusal names itself (in-29 S-2): a wallet that ran dry
   // is fixed by funding or the sponsor, not by retrying the same error — so it is not chain-error
   if (isOutOfGasError(error)) return "out-of-gas"
@@ -877,6 +1007,31 @@ function readContinues(home: MidaHome, sessionId: string, projectId: string): st
   }
 }
 
+/**
+ * A sponsor's daily limit resets at 00:00 UTC. The hourly retry is cheap for the sponsor (a
+ * refused try makes at most three calls to its provider) and picks up a limit the sponsor's
+ * owner raised during the day.
+ *
+ * When the next try on a failed session becomes due — the ONE rule the pass and `sessionWaits`
+ * share so they can never disagree: a sponsor-limit failure waits the EARLIER of `failedAt + 60
+ * minutes` and the first 00:00:00 UTC after `failedAt` + 60 seconds; any other recorded failure
+ * with attempts waits `failedAt + backoffMs(attempts)`; anything else owes no failure wait.
+ */
+function dueAfterFailureMs(state: SessionState): number | undefined {
+  if (state.failedAt === undefined) return undefined
+  const failedAt = Date.parse(state.failedAt)
+  // UF-P3: a summarizer wait retries on the hour only — the UTC-midnight rule is the sponsor's
+  if (state.reason === "summarizer-limit" || state.reason === "no-summarizer") return failedAt + 60 * 60 * 1000
+  if (state.reason === "sponsor-limit") {
+    const nextMidnight = (Math.floor(failedAt / DAY_MS) + 1) * DAY_MS
+    return Math.min(failedAt + 60 * 60 * 1000, nextMidnight + 60_000)
+  }
+  // UF-QF: a summary failure — one whose next try costs a model call — backs off to a
+  // six-hour cap; every other failed try keeps the one-hour cap.
+  const cap = SUMMARY_FAILURE_REASONS.has(state.reason ?? "") ? SUMMARY_BACKOFF_CAP_MS : MAX_BACKOFF_MS
+  return (state.attempts ?? 0) > 0 ? failedAt + backoffMs(state.attempts!, cap) : undefined
+}
+
 function readState(home: MidaHome, sessionId: string): SessionState | undefined {
   try {
     const raw = home.readJson<SessionState>(`queue/state/${sessionId}.json`)
@@ -902,6 +1057,8 @@ export interface SessionWait {
   dueAtMs: number
   /** The drain code the last attempt failed with — absent on a gap wait or a pre-in-29 record. */
   reason: string | undefined
+  /** How many failed tries the state carries — doctor needs it to name a save that keeps failing (UF-QF). */
+  attempts: number | undefined
 }
 
 /**
@@ -922,18 +1079,19 @@ export function sessionWaits(home: MidaHome, jobs: CaptureJob[]): SessionWait[] 
   for (const [sessionId, group] of bySession) {
     const job = group[group.length - 1]!
     const state = readState(home, sessionId)
-    const attempts = state?.attempts ?? 0
     const reason = state?.reason
-    if (attempts > 0 && state?.failedAt !== undefined) {
-      waits.push({ sessionId, agent: job.agent, dueAtMs: Date.parse(state.failedAt) + backoffMs(attempts), reason })
+    const attempts = state?.attempts
+    const dueAtMs = state === undefined ? undefined : dueAfterFailureMs(state)
+    if (dueAtMs !== undefined) {
+      waits.push({ sessionId, agent: job.agent, dueAtMs, reason, attempts })
       continue
     }
     if (group.some((j) => FLUSH_EVENTS.has(j.event))) {
-      waits.push({ sessionId, agent: job.agent, dueAtMs: 0, reason })
+      waits.push({ sessionId, agent: job.agent, dueAtMs: 0, reason, attempts })
       continue
     }
-    const gapRef = Date.parse(state?.savedAt ?? group[0]!.at)
-    waits.push({ sessionId, agent: job.agent, dueAtMs: gapRef + (state?.savedAt === undefined ? DEFAULT_FIRST_GAP_MS : DEFAULT_MIN_GAP_MS), reason })
+    const gapRef = Date.parse(state?.savedAt ?? firstQueuedAt(group))
+    waits.push({ sessionId, agent: job.agent, dueAtMs: gapRef + (state?.savedAt === undefined ? DEFAULT_FIRST_GAP_MS : DEFAULT_MIN_GAP_MS), reason, attempts })
   }
   return waits
 }
@@ -943,7 +1101,7 @@ export function sessionWaits(home: MidaHome, jobs: CaptureJob[]): SessionWait[] 
  * failures. Funding one wallet does not prove the others are funded, but the waits it clears only
  * cost one early retry each if it was not — the waiting direction is the broken one.
  */
-const GAS_WAIT_REASONS = new Set(["out-of-gas", "wallet-low"])
+const GAS_WAIT_REASONS = new Set(["out-of-gas", "wallet-low", "sponsor-limit"])
 
 /**
  * Clears the recorded failure backoff on every session whose wait was about gas — run after
@@ -966,11 +1124,64 @@ export function resetOutOfGasWaits(home: MidaHome): number {
     const sessionId = name.slice(0, -".json".length)
     if (!isSafeName(sessionId)) continue
     const state = readState(home, sessionId)
-    if (state === undefined || state.attempts === undefined || state.failedAt === undefined) continue
+    // a sponsor-limit wait carries no attempts field — it never counted one — so the attempts
+    // check must not skip it (UF-O)
+    if (state === undefined || state.failedAt === undefined) continue
+    if (state.attempts === undefined && state.reason !== "sponsor-limit") continue
     if (state.reason !== undefined && !GAS_WAIT_REASONS.has(state.reason)) continue
     const { attempts: _a, failedAt: _f, reason: _r, ...rest } = state
     writeState(home, sessionId, rest)
     cleared += 1
+  }
+  return cleared
+}
+
+/**
+ * The wait reasons a summarizer change — `mida summarizer use …` — makes stale: no model could
+ * write the summary, every model hit its usage limit, or the SUMMARY itself kept failing
+ * (UF-QF — a model-failed, no-json or invalid-checkpoint wait is waiting on the model the
+ * choice replaces). A sponsor's cap or a chain failure is not the new choice's business, so
+ * those waits keep their deadlines.
+ */
+const SUMMARIZER_WAIT_REASONS = new Set([
+  "summarizer-limit",
+  "no-summarizer",
+  "model-failed",
+  "no-json",
+  "invalid-checkpoint",
+])
+
+/**
+ * Clears the recorded failure wait on every session that was waiting on the summary model —
+ * run after `mida summarizer use agents`/`use key` writes the new choice, so the next pass
+ * retries the save at once instead of waiting out the hour. A wait recorded with no attempts
+ * clears too — summarizer waits never counted one. Returns how many of the cleared waits belong
+ * to a session that still has a job in the queue right now — the number the "will be tried
+ * again" line depends on (UF-QC). Never throws: a state file that will not parse is left for
+ * the drain's own handling.
+ */
+export function resetSummarizerWaits(home: MidaHome): number {
+  let cleared = 0
+  let names: string[]
+  try {
+    names = home.list("queue/state")
+  } catch {
+    return 0
+  }
+  // UF-QC: the count answers "how many queued saves just became due" — a cleared wait whose
+  // session has no job in the queue right now clears anyway (it costs nothing) but is not
+  // counted, so the "will be tried again" line only prints when something will
+  const queued = new Set(peekJobs(home).map((job) => job.sessionId))
+  for (const name of names) {
+    if (!name.endsWith(".json") || name.endsWith(".last.json")) continue
+    const sessionId = name.slice(0, -".json".length)
+    if (!isSafeName(sessionId)) continue
+    const state = readState(home, sessionId)
+    if (state === undefined || state.failedAt === undefined) continue
+    if (state.reason === undefined || !SUMMARIZER_WAIT_REASONS.has(state.reason)) continue
+    const { attempts: _a, failedAt: _f, reason: _r, unusable: _u, ...rest } = state
+    writeState(home, sessionId, rest)
+    if (queued.has(sessionId)) cleared += 1
   }
   return cleared
 }
@@ -1033,12 +1244,18 @@ function pruneQueue(home: MidaHome, now: () => Date): void {
       if (olderThan(home.path(`${dir}/${name}`), WEEK_MS)) home.remove(`${dir}/${name}`)
     }
   }
-  for (const dir of ["queue", "queue/bad", "queue/compiled", "queue/state"]) {
+  for (const dir of ["queue", "queue/bad", "queue/compiled", "queue/state", "queue/unsent"]) {
     for (const name of home.list(dir)) {
       if (name.endsWith(".tmp") && olderThan(home.path(`${dir}/${name}`), TMP_MAX_AGE_MS)) {
         home.remove(`${dir}/${name}`)
       }
     }
+  }
+  // CAP-26: an UNSENT mark whose session has no queued job left is a leftover (its job was removed
+  // on some other pass) — swept, so a later job of that session can never resurrect an old save
+  const queuedSessions = new Set(listJobs(home).map((job) => job.sessionId))
+  for (const name of home.list("queue/unsent")) {
+    if (name.endsWith(".json") && !queuedSessions.has(name.slice(0, -".json".length))) home.remove(`queue/unsent/${name}`)
   }
   // in-21 U-4 / in-22 V-2: each `new Mida()` mints one `sdk-…` session, the only unbounded
   // session source — so the sweep takes sdk- files ONLY and leaves hook and MCP session files

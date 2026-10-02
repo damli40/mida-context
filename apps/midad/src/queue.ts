@@ -23,6 +23,40 @@ export interface CaptureJob {
   /** tk-1: the task this session was captured under — stamped at enqueue so a later `mida task` switch cannot move it. */
   task?: string
   at: string
+  /**
+   * CAP-28: the earliest queue time of the jobs this one stands for. The drain merges a session's
+   * jobs and keeps only the newest; without this, the first-save gap would restart on every merge.
+   * Absent on a job that never absorbed another — its own `at` is then its first.
+   */
+  firstAt?: string
+}
+
+/** The session's first queue time across a group of its jobs — each job's `firstAt`, else its `at`. */
+export function firstQueuedAt(group: readonly CaptureJob[]): string {
+  let first = group[0]!.firstAt ?? group[0]!.at
+  for (const job of group) {
+    const at = job.firstAt ?? job.at
+    if (Date.parse(at) < Date.parse(first)) first = at
+  }
+  return first
+}
+
+/**
+ * Records `firstAt` on the job file the drain keeps after a merge, so the session's first queue
+ * time survives the older jobs' removal — written before they are removed, so a crash in between
+ * loses nothing. Hooks only ever create new job files, and the drainer holds the queue lock; a
+ * drainer whose stale lock was taken over could rewrite a job the new one already removed, which
+ * the next pass simply drains. A write that fails only costs the stamp: the next pass falls back to
+ * this job's own `at`, the old behaviour.
+ */
+export function stampFirstAt(home: MidaHome, job: CaptureJob, firstAt: string): void {
+  if ((job.firstAt ?? job.at) === firstAt) return
+  try {
+    const { id, ...stored } = job
+    home.writeSecretJson(`queue/${id}.json`, { ...stored, firstAt })
+  } catch {
+    // keep going — see above
+  }
 }
 
 /**
@@ -107,7 +141,7 @@ function asJob(raw: unknown, id: string): CaptureJob | undefined {
   if (
     typeof r.agent !== "string" || typeof r.event !== "string" || typeof r.sessionId !== "string" ||
     typeof r.transcriptPath !== "string" || typeof r.cwd !== "string" ||
-    // an `at` that will not parse could never age past the 24-hour stale rule — treat it as corrupt
+    // an `at` that will not parse could never age past the seven-day stale rule — treat it as corrupt
     typeof r.at !== "string" || Number.isNaN(Date.parse(r.at)) ||
     (r.error !== null && typeof r.error !== "string") ||
     // a hand-crafted file with path-shaped names must never reach writeState/loadAgentIdentity
@@ -124,6 +158,10 @@ function asJob(raw: unknown, id: string): CaptureJob | undefined {
     // carried through raw — the drainer re-validates before it is trusted (jobs predate tasks)
     ...(typeof r.task === "string" ? { task: r.task } : {}),
     at: r.at,
+    // a firstAt that will not parse, or claims a time after `at`, is ignored — never trusted
+    ...(typeof r.firstAt === "string" && !Number.isNaN(Date.parse(r.firstAt)) && Date.parse(r.firstAt) <= Date.parse(r.at)
+      ? { firstAt: r.firstAt }
+      : {}),
   }
 }
 

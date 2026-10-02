@@ -5,9 +5,10 @@ import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } fr
 import { callDaemon, socketPathFor } from "./control.js"
 import type { ControlReply } from "./control.js"
 import type { MidaHome } from "./home.js"
-import { CHAIN_REFUSAL_TEXT, degradedMessage } from "./hook-output.js"
+import { CHAIN_REFUSAL_TEXT, HANDOFF_BEGIN, HANDOFF_TAIL, OVERSIZE_NOTE_LEAD, degradedMessage } from "./hook-output.js"
 import type { SessionStartBody } from "./hook-output.js"
 import { appendLog } from "./log.js"
+import { HOOK_CLIENTS, MCP_CLIENT_TOOLS } from "./mcp-clients.js"
 import { findProjectMarker } from "./queue.js"
 import { writeSeen } from "./seen.js"
 import { isTaskName, TASK_RULE_TEXT } from "./task.js"
@@ -16,7 +17,7 @@ import { isTaskName, TASK_RULE_TEXT } from "./task.js"
  * The local MCP adapter (M3-G + in-5): a stdio MCP server that is a pure client of the daemon's
  * Unix socket, exactly like the hooks. It holds no keys and signs nothing. Its tools are reads —
  * `read --as` through /cli, /handoff, /whatsnew, /health — plus the one write the owner decided
- * every client may have, `mida_save`, which forwards the model's checkpoint fields to the daemon's
+ * MCP clients may have (claude-desktop and cursor only — AUTH-17), `mida_save`, which forwards the model's checkpoint fields to the daemon's
  * POST /save. The daemon keeps every gate — identity, project approval, the CREATE grant and
  * revocation are answered there, never here — and seals, stores and signs the checkpoint itself.
  *
@@ -47,11 +48,65 @@ const STATUS_PROBE_TIMEOUT_MS = 8_000
 /** A save is a real chain transaction through the daemon's gates — the read budget would cut it short. */
 const SAVE_TIMEOUT_MS = 60_000
 
-/** Every tool result is capped like the handoff text: 8 000 chars, cut with the same `…` marker. */
+/** Every tool result except the handoff reply is capped at 8 000 chars, cut with the `…` marker. */
 const TOOL_TEXT_CAP = 8_000
-const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${text.slice(0, TOOL_TEXT_CAP - 1)}…` : text)
+const capText = (text: string): string => (text.length > TOOL_TEXT_CAP ? `${safeHead(text, TOOL_TEXT_CAP - 1)}…` : text)
+
+/**
+ * mida_handoff's own cap (UF-H, widened to 40,000 in UF-I): the plain cut could slice the closing
+ * fence off the handoff, leaving the agent reading saved, untrusted text with no end marker. A
+ * too-long handoff first tries the SHORT form — the preamble's over-target note shrunk to its
+ * lead alone — and if that fits, the reply goes out whole with no cut claimed (UF-L). Otherwise
+ * it keeps its END line: the kept text, then `…`, a line saying where the reply was cut, a blank
+ * line, then the fence — and the whole reply still fits the cap. A handoff text without the
+ * fence is cut the way capText cuts, at this same cap.
+ */
+const HANDOFF_TEXT_CAP = 40_000
+/** A cut may not split a surrogate pair — if the last kept unit is a pair's first half, keep one fewer (UF-N). */
+const safeHead = (text: string, maxChars: number): string => {
+  const head = text.slice(0, maxChars)
+  const last = head.charCodeAt(head.length - 1)
+  return last >= 0xd800 && last <= 0xdbff ? head.slice(0, -1) : head
+}
+const capHandoffText = (text: string): string => {
+  if (text.length <= HANDOFF_TEXT_CAP) return text
+  if (!text.includes(HANDOFF_TAIL)) return `${safeHead(text, HANDOFF_TEXT_CAP - 1)}…`
+  // The preamble is everything before the BEGIN line. Only its WHOLE lines starting with the
+  // over-target note's lead are rewritten — the same words inside saved text are the save's
+  // own and stay (they are quoted by defuse). indexOf/slice and a replacer FUNCTION, never a
+  // replacement string: saved text can hold `$&`.
+  const beginAt = text.indexOf(HANDOFF_BEGIN)
+  const preamble = beginAt === -1 ? "" : text.slice(0, beginAt)
+  const body = beginAt === -1 ? text : text.slice(beginAt)
+  const noteLines = (note: string) =>
+    preamble
+      .split("\n")
+      .map((line) => (line.startsWith(OVERSIZE_NOTE_LEAD) ? note : line))
+      .join("\n")
+  // SHORT form first (UF-L): the lead alone still says the handoff was over its size target —
+  // true whether or not the reply was cut — and when that alone brings the reply under the cap
+  // nothing was removed, so no sentence may say it was.
+  if (beginAt !== -1) {
+    const short = `${noteLines(OVERSIZE_NOTE_LEAD)}${body}`
+    if (short.length <= HANDOFF_TEXT_CAP) return short
+  }
+  // CUT form on the ORIGINAL text: the cut drops entries near the end — possibly rules, and the
+  // marked UNSENT blocks, which sit at the very end — so the note says the reply was cut, and
+  // every "shown below, marked UNSENT" clause goes: the block it points at is gone (UF-K).
+  const cutNote = `${OVERSIZE_NOTE_LEAD.slice(0, -1)}, and this reply was cut at ${HANDOFF_TEXT_CAP.toLocaleString("en-US")} characters, so entries near the end are missing.`
+  const cut = `${noteLines(cutNote).replace(/; (it is|\d+ of them (is|are)) shown below, marked UNSENT/g, () => "")}${body}`
+  const tail = `…\n(Mida cut this reply at ${HANDOFF_TEXT_CAP.toLocaleString("en-US")} characters. Text after this point is missing.)\n\n${HANDOFF_TAIL}`
+  // UF-L: keep the text BEFORE the END line — a slice of the whole text could carry its own END
+  // line next to the appended one — and at least one char fewer than it has, so a reply that
+  // says it was cut really removed something.
+  const endAt = cut.indexOf(HANDOFF_TAIL)
+  const beforeEnd = endAt === -1 ? cut : cut.slice(0, endAt)
+  const keep = Math.min(HANDOFF_TEXT_CAP - tail.length, Math.max(0, beforeEnd.length - 1))
+  return `${safeHead(beforeEnd, keep)}${tail}`
+}
 
 const toolText = (text: string) => ({ content: [{ type: "text" as const, text: capText(text) }] })
+const handoffToolText = (text: string) => ({ content: [{ type: "text" as const, text: capHandoffText(text) }] })
 const degraded = (reason: string) => toolText(degradedMessage(reason))
 
 export const MCP_USAGE = "usage: mida-mcp --as <client> [--project <dir>] [--task <name>]   (--as is required — each client carries its own identity)"
@@ -189,7 +244,7 @@ export const MCP_TOOLS = [
   {
     name: "mida_read",
     description:
-      "Read one Mida context area through the daemon — the same output `mida read --as <agent>` prints. Default namespace is projects.current, this folder's saved checkpoints.",
+      "Read one Mida context area through the daemon; you get the same output as `mida read --as <agent> <namespace>`. For profile.skills and preferences.communication you get the facts saved there that this agent may read (an area it has no access to says refused). For projects.current (the default) you get only each saved checkpoint's id and author, across every task; mida_handoff gives the content for the current task.",
     inputSchema: {
       type: "object",
       properties: {
@@ -210,7 +265,7 @@ export const MCP_TOOLS = [
   {
     name: "mida_save",
     description:
-      "Save a checkpoint of your work on this project so another approved agent can pick it up. Call it when the user asks to save context or hand off, and before you finish a task. The daemon signs it as this client's own identity after the owner's approval gates pass — one save per minute at most.",
+      "Save a checkpoint of your work on this project so another approved agent can pick it up. Call it when the user asks to save context or hand off, and before you finish a task. Claude Desktop and Cursor get this tool; agents with Mida hooks, like Claude Code and Codex, save through those hooks instead. The daemon signs each save as this client's own identity after the owner's approval checks pass. A list holds at most 50 entries. One save per minute at most.",
     inputSchema: {
       type: "object",
       properties: {
@@ -283,6 +338,8 @@ export interface McpServerDeps {
   task?: string
   /** False when the daemon could not be brought up at start — tools then answer degraded. */
   daemonUp: boolean
+  /** mida_status's per-agent probe limit; STATUS_PROBE_TIMEOUT_MS unless a test shortens it. */
+  statusProbeMs?: number
 }
 
 /**
@@ -341,7 +398,7 @@ async function toolHandoff(deps: McpServerDeps) {
       // a failed baseline write only means a later whats-new may re-offer what this covered
     }
   }
-  return toolText(body.text)
+  return handoffToolText(body.text)
 }
 
 /**
@@ -470,8 +527,9 @@ async function toolStatus(deps: McpServerDeps) {
   const agents = [
     ...new Set([deps.agent, ...deps.home.list("agents").filter((name) => AGENT_NAME.test(name) && deps.home.has(`agents/${name}/identity.json`))]),
   ].sort()
+  const probeMs = deps.statusProbeMs ?? STATUS_PROBE_TIMEOUT_MS
   const probes = await Promise.all(
-    agents.map((name) => callDaemon(deps.home, "/handoff", { agent: name, cwd: deps.project }, { timeoutMs: STATUS_PROBE_TIMEOUT_MS })),
+    agents.map((name) => callDaemon(deps.home, "/handoff", { agent: name, cwd: deps.project }, { timeoutMs: probeMs })),
   )
   const reason = (i: number): string | undefined => {
     const b = probes[i]?.body as { kind?: unknown; reason?: unknown } | null
@@ -494,11 +552,22 @@ async function toolStatus(deps: McpServerDeps) {
       const name = agents[i]!
       const probe = probes[i]!
       const kind = (probe.body as { kind?: unknown } | null)?.kind
-      if (probe.status === 0) lines.push(`${name}: no answer from the daemon`)
+      // AUTH-16: status 0 covers three different failures. Only "unreachable" means the daemon
+      // did not answer — the others, and the daemon's read-slow refusal (which usually comes AFTER
+      // the approval check passed), mean this call could not tell the verdict, never "not approved"; this call's health check already found it up, so a timeout is a slow
+      // read and a bad reply is an unreadable one — neither may read as a missing daemon.
+      if (probe.status === 0 && probe.failure === "unreachable") lines.push(`${name}: no answer from the daemon`)
+      else if (probe.status === 0 && probe.failure === "timeout") {
+        // rounded DOWN to a tenth, so "took over N s" is never more than the limit; no claim the
+        // daemon is up — it may have frozen after this call's health check
+        const seconds = String(Math.floor(probeMs / 100) / 10)
+        lines.push(`${name}: could not tell. Reading its context took over ${seconds} s. Ask again in a moment.`)
+      } else if (probe.status === 0) lines.push(`${name}: could not tell. Mida could not read the daemon's reply.`)
       else if (kind === "handoff" || kind === "empty") lines.push(`${name}: approved for this folder`)
       else if (reason(i) === "revoked") lines.push(`${name}: access revoked by the owner`)
       else if (reason(i) === "general-assistance") lines.push(`${name}: a general assistant — it cannot read project context`)
       else if (reason(i) === "not-approved") lines.push(`${name}: not approved for this folder`)
+      else if (reason(i) === "read-slow") lines.push(`${name}: could not tell. The daemon ran out of time reading its context; its approval may already have passed. Ask again in a moment.`)
       else lines.push(`${name}: cannot tell (${reason(i) ?? "bad reply"})`)
     }
   }
@@ -533,15 +602,27 @@ async function toolSave(deps: McpServerDeps, args: Record<string, unknown> | und
  * line — never a stack, never a protocol error for a daemon problem.
  */
 export function createMidaMcpServer(deps: McpServerDeps): Server {
+  // AUTH-17: mida_save is offered only to the identities the save route signs for — a hook-saved
+  // client (claude-code, codex) or an unknown name would only ever get its refusal. The refusal
+  // stays in mcp-save.ts as the backstop: clients cache tool lists.
+  const offersSave = MCP_CLIENT_TOOLS.includes(deps.agent)
   const server = new Server(
     { name: "mida-mcp", version: "0.1.0" },
     {
       capabilities: { tools: {} },
-      instructions:
-        "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status, and it can save a checkpoint with mida_save — the daemon validates, gates, scrubs and signs that write. Owner operations stay deliberately absent: there is no approve, revoke, request or remember here, because a model must never be able to change who has access through MCP.",
+      instructions: offersSave
+        ? "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status, and it can save a checkpoint with mida_save — the daemon validates, gates, scrubs and signs that write. Owner operations stay deliberately absent: there is no approve, revoke, request or remember here, because a model must never be able to change who has access through MCP."
+        : HOOK_CLIENTS.includes(deps.agent)
+          ? `Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool: this client's saves come only from its Mida hooks, and only while they are installed.${
+              // Fable review: doctor cannot read Codex's trust state — say what the owner must do instead
+              deps.agent === "codex" ? " Codex ignores them until you trust them: open codex, type /hooks, and trust the Mida entries." : ""
+            } Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.`
+          : "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool for this client: mida_save signs only for claude-desktop and cursor. Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
     },
   )
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [...MCP_TOOLS] }))
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: MCP_TOOLS.filter((tool) => offersSave || tool.name !== "mida_save"),
+  }))
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const args = request.params.arguments as Record<string, unknown> | undefined
     switch (request.params.name) {

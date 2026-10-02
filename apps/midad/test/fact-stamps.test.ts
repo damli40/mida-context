@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { generatePrivateKey } from "viem/accounts"
-import { OWNER_AUTHOR_ID, PROVENANCE_SOURCE } from "@mida/protocol"
+import { MidaError, OWNER_AUTHOR_ID, PROVENANCE_SOURCE } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
 import type { ContextObject } from "@mida/sdk"
 import { MidaHome, buildHandoff, runCliWithRuntime } from "@mida/midad"
@@ -79,6 +79,47 @@ const factRuntime = (objects: ContextObject[]): ServiceRuntime =>
         })),
     },
   }) as unknown as ServiceRuntime
+
+describe("a fact area the agent cannot read says so (PROV-13)", () => {
+  // profile.skills is denied (the one-area grant case); preferences.communication is granted but empty
+  const deniedRuntime = (code: "CAPABILITY_DENIED" | "CAPABILITY_EXPIRED" | "CAPABILITY_REVOKED" = "CAPABILITY_DENIED"): ServiceRuntime =>
+    ({
+      home: stampHome(),
+      owner: `0x${"55".repeat(20)}`,
+      agent: () => ({
+        read: async (_owner: string, namespace: string) => {
+          if (namespace === "profile.skills") throw new MidaError(code, "refused for this namespace")
+          return []
+        },
+      }),
+      reader: { getRecords: async () => [] },
+    }) as unknown as ServiceRuntime
+
+  it("mida read --as on a denied area prints refused, not an empty list that reads as 'nothing saved'", async () => {
+    const lines: string[] = []
+    // a refusal is a failure, as a refused projects.current read is: exit 1, never 0 (review)
+    expect(await runCliWithRuntime(["read", "--as", "claude-code", "profile.skills"], deniedRuntime(), (line) => lines.push(line))).toBe(1)
+    // DENIED also covers agent-wide causes (not approved, revoked, a stale key), so the line names both
+    expect(lines).toContain("  profile.skills: refused CAPABILITY_DENIED (the store refused it: claude-code holds no grant for this area, or is not approved or was revoked)")
+  })
+
+  it("an expired or revoked grant names its area and code instead of aborting the read (review)", async () => {
+    for (const [code, why] of [
+      ["CAPABILITY_EXPIRED", "claude-code's grant for this area has expired"],
+      ["CAPABILITY_REVOKED", "claude-code's access was revoked"],
+    ] as const) {
+      const lines: string[] = []
+      expect(await runCliWithRuntime(["read", "--as", "claude-code", "profile.skills"], deniedRuntime(code), (line) => lines.push(line))).toBe(1)
+      expect(lines).toContain(`  profile.skills: refused ${code} (${why})`)
+    }
+  })
+
+  it("a granted area with no facts prints no refusal", async () => {
+    const lines: string[] = []
+    expect(await runCliWithRuntime(["read", "--as", "claude-code", "preferences.communication"], deniedRuntime(), (line) => lines.push(line))).toBe(0)
+    expect(lines.some((line) => line.includes("refused"))).toBe(false)
+  })
+})
 
 describe("fact ids and chain dates (in-4 I8)", () => {
   it("mida read --as names every fact by short id and chain date", async () => {

@@ -1,5 +1,202 @@
 import { describe, expect, it } from "vitest"
-import { validateCheckpoint } from "../src/index.js"
+import * as schema from "../src/index.js"
+import { repointEvidence, validateCheckpoint } from "../src/index.js"
+
+// UF-K: every string cut goes through cutText — a plain slice can end on the first half of a
+// surrogate pair and store a broken emoji.
+describe("cutText", () => {
+  const { cutText } = schema
+  it("returns the text unchanged at or under max", () => {
+    expect(cutText("hello", 5)).toBe("hello")
+    expect(cutText("hi", 5)).toBe("hi")
+    expect(cutText("x".repeat(2000), 2000)).toBe("x".repeat(2000))
+  })
+  it("cuts over-long text to max characters ending in the ellipsis", () => {
+    const cut = cutText("x".repeat(2100), 2000)
+    expect(cut).toBe("x".repeat(1999) + "…")
+    expect(cut.length).toBe(2000)
+  })
+  it("never leaves a lone surrogate half at the cut — the emoji stays whole", () => {
+    // the cut point lands between the two halves of the emoji: the head may not end
+    // on a high surrogate
+    const cut = cutText(`abc${"😀"}` + "z".repeat(2100), 5)
+    const head = cut.slice(0, -1)
+    expect(head).not.toMatch(/[\uD800-\uDBFF]$/)
+    expect(cut.endsWith("…")).toBe(true)
+    expect(cut).toBe("abc…")
+    // and a pair wholly inside the budget survives whole
+    expect(cutText("ab" + "😀" + "z".repeat(2100), 6)).toBe("ab😀z…")
+  })
+  it("max at or below zero returns the empty string; max 1 is the ellipsis alone (UF-L)", () => {
+    // the old code returned `text.slice(0, -1) + "…"` for max 0 — nearly the whole text
+    expect(cutText("abc", 0)).toBe("")
+    expect(cutText("abc", -7)).toBe("")
+    expect(cutText("abc", 1)).toBe("…")
+    expect(cutText("abc", 2)).toBe("a…")
+    expect(cutText("x", 1)).toBe("x") // already fits — unchanged
+  })
+})
+
+// UF-L: the 50-entry note names WHICH lists lost their oldest entries, never a count — a count
+// can only go stale (a save that puts an entry back makes the number a lie) and a number inside
+// note text could be forged upward. splitLimitNote strips every note-looking segment out of a
+// checkpoint's text and recovers the lists a well-formed trailing note names.
+describe("limitNote and splitLimitNote (UF-L)", () => {
+  const { limitNote, splitLimitNote } = schema
+  it("builds the exact wording for one, two and three lists, in the fixed order", () => {
+    expect(limitNote(new Set(["constraints"]))).toBe(
+      "(Mida: a list holds at most 50 entries. Older constraints were left out.)",
+    )
+    expect(limitNote(new Set(["decisions", "constraints"]))).toBe(
+      "(Mida: a list holds at most 50 entries. Older constraints and decisions were left out.)",
+    )
+    expect(limitNote(new Set(["rejected", "constraints", "decisions"]))).toBe(
+      "(Mida: a list holds at most 50 entries. Older constraints, decisions and rejected approaches were left out.)",
+    )
+    expect(limitNote(new Set(["rejected"]))).toBe(
+      "(Mida: a list holds at most 50 entries. Older rejected approaches were left out.)",
+    )
+    expect(limitNote(new Set())).toBeNull()
+  })
+  it("round-trips the note — alone and after issue text", () => {
+    const note = "(Mida: a list holds at most 50 entries. Older decisions were left out.)"
+    const alone = splitLimitNote(note)
+    expect(alone.text).toBe("")
+    expect([...alone.lists]).toEqual(["decisions"])
+    const joined = splitLimitNote(`still failing on CI | ${note}`)
+    expect(joined.text).toBe("still failing on CI")
+    expect([...joined.lists]).toEqual(["decisions"])
+    const three = splitLimitNote(`stuck | ${limitNote(new Set(["rejected", "constraints", "decisions"]))!}`)
+    expect(three.text).toBe("stuck")
+    expect([...three.lists]).toEqual(["constraints", "decisions", "rejected"])
+  })
+  it("a limit note followed by the size note still names its lists (UF-N)", () => {
+    // wrapCheckpoint appends "(Mida: left out … to fit the size limit)" AFTER the limit note —
+    // the note is then no longer the value's tail, but it is still the record of what was lost
+    const note = limitNote(new Set(["decisions"]))!
+    const s = splitLimitNote(`issue | ${note} | (Mida: left out 3 progress to fit the size limit)`)
+    expect([...s.lists]).toEqual(["decisions"])
+    expect(s.text).toBe("issue | (Mida: left out 3 progress to fit the size limit)")
+  })
+  it("a limit note followed by other text names no lists", () => {
+    const note = limitNote(new Set(["decisions"]))!
+    expect(splitLimitNote(`${note} more text`).lists.size).toBe(0)
+    expect(splitLimitNote(`${note} | still discussing this`).lists.size).toBe(0)
+  })
+  it("a note in the MIDDLE of the value names no lists but still leaves the text", () => {
+    const s = splitLimitNote("a | (Mida: a list holds at most 50 entries. Older decisions were left out.) | b")
+    expect(s.text).toBe("a | b")
+    expect(s.lists.size).toBe(0)
+  })
+  it("a note nested inside an unclosed opener: the INNER exact note is still a note, the residue is text (UF-QA)", () => {
+    const s = splitLimitNote(
+      "i | (Mida: a list holds at most (Mida: a list holds at most 50 entries. Older decisions were left out.)",
+    )
+    // the inner segment is byte-for-byte a real note — removed; the leftover opener is not a
+    // complete note, so it stays as the text it is
+    expect(s.text).toBe("i | (Mida: a list holds at most")
+    expect([...s.lists]).toEqual(["decisions"])
+  })
+  it("a note cut off mid-way at the end of the string is TEXT, not a note — only a complete segment is ever removed (UF-N2)", () => {
+    const s = splitLimitNote("the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Older dec")
+    expect(s.text).toBe("the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Older dec")
+    expect(s.lists.size).toBe(0)
+  })
+  it("text with no note comes back exactly as it went in — leading indentation and a trailing newline included (UF-N2)", () => {
+    for (const value of ["    indented code\n    more", "run `x || y`\n"]) {
+      const s = splitLimitNote(value)
+      expect(s.text).toBe(value)
+      expect(s.lists.size).toBe(0)
+    }
+  })
+  it("text that only starts like a note is returned unchanged — the rest of the sentence is important text (UF-N2)", () => {
+    const value = "x (Mida: a list holds at most 50 entries. Older stuff and then the important text || keep me"
+    const s = splitLimitNote(value)
+    expect(s.text).toBe(value)
+    expect(s.lists.size).toBe(0)
+  })
+  it("the old numbered wording is not an exact note — it stays as text and names no list (UF-QA)", () => {
+    const value = "x | (Mida: a list holds at most 50 entries. Left out: the 3 oldest decisions.)"
+    const s = splitLimitNote(value)
+    expect(s.text).toBe(value)
+    expect(s.lists.size).toBe(0)
+  })
+  it("a value with no limit note comes back byte-for-byte — its own pipes are text (UF-N)", () => {
+    // `||` inside real text is an OR operator or a table border, never a separator to tidy
+    for (const value of ["CI passes only because of `make test || true`", "| a | b |"]) {
+      const s = splitLimitNote(value)
+      expect(s.text).toBe(value)
+      expect(s.lists.size).toBe(0)
+    }
+  })
+  // UF-QA: only a segment that is byte-for-byte a note limitNote can write is ever removed —
+  // text that merely opens like one is ordinary text, even when a ")" shows up later.
+  it("a look-alike segment with a later ')' is ordinary text — only an exact note is removed (UF-QA)", () => {
+    const value = "x (Mida: a list holds at most 50 entries. Older stuff and then (see docs) the important text"
+    const s = splitLimitNote(value)
+    expect(s.text).toBe(value)
+    expect(s.lists.size).toBe(0)
+    // and the same for a wrong cap or a list name Mida never writes
+    for (const fake of [
+      "y | (Mida: a list holds at most 9 entries. Older decisions were left out.)",
+      "z | (Mida: a list holds at most 50 entries. Older stuff were left out.)",
+      "w | (Mida: a list holds at most 50 entries. Older decisions are left out.)",
+    ]) {
+      const r = splitLimitNote(fake)
+      expect(r.text, fake).toBe(fake)
+      expect(r.lists.size, fake).toBe(0)
+    }
+    // while a real note still comes out whole
+    const real = limitNote(new Set(["constraints", "decisions"]))!
+    const kept = splitLimitNote(`issue | ${real}`)
+    expect(kept.text).toBe("issue")
+    expect([...kept.lists]).toEqual(["constraints", "decisions"])
+  })
+  it("removing a note takes only the one separator that touched it (UF-N)", () => {
+    const note = limitNote(new Set(["decisions"]))!
+    expect(splitLimitNote(`issue | ${note}`).text).toBe("issue")
+    expect(splitLimitNote(`${note} | issue`).text).toBe("issue")
+    expect(splitLimitNote(`a || b | ${note}`).text).toBe("a || b")
+  })
+  it("null and a note-free string give empty text parts and no lists", () => {
+    expect(splitLimitNote(null)).toEqual({ text: "", lists: new Set() })
+    const s = splitLimitNote("flaky test")
+    expect(s.text).toBe("flaky test")
+    expect(s.lists.size).toBe(0)
+  })
+})
+
+// CAP-29: evidence names its target by position ("decisions[3]"), so entries leaving the front of
+// a list would leave every later evidence line vouching for a different entry.
+describe("repointEvidence", () => {
+  const evidence = [
+    { field: "decisions[0]", ref: "a" },
+    { field: "decisions[2]", ref: "b" },
+    { field: "decisions[12].rationale", ref: "c" },
+    { field: "progress[1]", ref: "d" },
+    { field: "decisionsX[5]", ref: "e" },
+    { field: "nextAction", ref: "f" },
+  ]
+  it("moves evidence down with its entry and removes evidence whose entry was dropped", () => {
+    expect(repointEvidence(evidence, "decisions", 2)).toEqual([
+      { field: "decisions[0]", ref: "b" },
+      { field: "decisions[10].rationale", ref: "c" },
+      { field: "progress[1]", ref: "d" },
+      { field: "decisionsX[5]", ref: "e" },
+      { field: "nextAction", ref: "f" },
+    ])
+  })
+  it("changes nothing when nothing was dropped, and never changes its input", () => {
+    const before = JSON.stringify(evidence)
+    expect(repointEvidence(evidence, "decisions", 0)).toEqual(evidence)
+    repointEvidence(evidence, "decisions", 2)
+    expect(JSON.stringify(evidence)).toBe(before)
+  })
+  it("passes through entries that are not evidence objects — they are the validator's to reject", () => {
+    const odd = [null, "decisions[0]", { field: 7, ref: "x" }, { field: "decisions[3]", ref: "y" }] as unknown as { field: string }[]
+    expect(repointEvidence(odd, "decisions", 1)).toEqual([null, "decisions[0]", { field: 7, ref: "x" }, { field: "decisions[2]", ref: "y" }])
+  })
+})
 
 function validCp(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

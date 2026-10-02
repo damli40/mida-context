@@ -23,7 +23,7 @@ export interface RevocationIntent {
   cancellationNonce: string | null
 }
 
-/** The persisted shape `denies`, `reconcile` and `cancel` dereference; a malformed entry fails construction. */
+/** The persisted shape `denies`, `reconcileOwner` and `cancel` dereference; a malformed entry fails construction. */
 export function isRevocationIntent(value: unknown): value is RevocationIntent {
   if (value === null || typeof value !== "object") return false
   const intent = value as RevocationIntent
@@ -171,16 +171,10 @@ export class DenyOverlay {
     return false
   }
 
-  /** active → anchored only when Monad shows the matching revocation. Failed or missing transactions leave it active. */
-  async reconcile(reader: RegistryReader): Promise<void> {
-    for (const intent of await this.#store.list()) {
-      await this.#reconcileIntent(reader, intent)
-    }
-  }
-
   /**
-   * The same pass narrowed to one owner (M3-D6): a request authenticated as an owner must not
-   * spend chain reads on every other owner's intents — reconcile only what the caller may see.
+   * The only reconcile: the active → anchored pass narrowed to one owner (M3-D6). Every request is
+   * about exactly one owner, and its chain-read budget must not be spent on other owners' intents —
+   * reconcile only what the caller may see.
    */
   async reconcileOwner(reader: RegistryReader, owner: Address): Promise<void> {
     const lower = owner.toLowerCase()

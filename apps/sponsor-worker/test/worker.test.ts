@@ -22,6 +22,7 @@ import { privateKeyToAccount } from "viem/accounts"
 import type { D1Like } from "../src/budget.js"
 import { reserveSpend } from "../src/budget.js"
 import { operationIdentity, operationMaxCostWei } from "../src/policy.js"
+import { isSponsorDailyLimitReason } from "@mida/chain"
 import { DEFAULT_ALLOWED_ORIGINS, allowedOrigins, handleFetch, resolveGasCeilings, withCors } from "../src/worker.js"
 import type { SponsorEnv } from "../src/worker.js"
 import {
@@ -294,6 +295,40 @@ describe("HTTP and envelope behaviour", () => {
     expect(policy.budgets).toMatch(/pm_getPaymasterData/)
     expect(policy.factory).toMatch(/0x7702/)
     expect(policy.delegationClearing).toMatch(/^disabled/)
+  })
+
+  // UF-O: unset, the free-call allowance is 3 x the signing limit, so the signing limit is the
+  // one a sender reaches. A worker built without FREE_PER_SENDER_DAILY_LIMIT proves it — the
+  // suite's own worker binds "120" and would hide the default.
+  it("the free-call limit defaults to 3 x the signing limit, and the env value wins (UF-O)", async () => {
+    const limitsOf = async (extra: Record<string, string>) => {
+      const w = new Miniflare({
+        modules: [{ type: "ESModule", path: "worker.mjs", contents: await bundleWorker() }],
+        compatibilityDate: "2026-08-06",
+        compatibilityFlags: ["nodejs_compat"],
+        d1Databases: ["DB"],
+        bindings: {
+          PROVIDER_URL: provider.url,
+          POLICY_ID,
+          RPC_URL: chain.url,
+          CHAIN_ID: CHAIN_ID.toString(10),
+          CAPABILITY_REGISTRY: CAP,
+          CONTEXT_REGISTRY: CTX,
+          ALLOWED_IMPLEMENTATIONS: IMPL,
+          ...extra,
+        },
+      })
+      try {
+        const res = await w.dispatchFetch("http://worker.test/")
+        const info = (await res.json()) as { limits: Record<string, unknown> }
+        return info.limits
+      } finally {
+        await w.dispose()
+      }
+    }
+    expect((await limitsOf({ PER_SENDER_DAILY_LIMIT: "300" })).freeCallsPerSenderPerDay).toBe(900)
+    expect((await limitsOf({})).freeCallsPerSenderPerDay).toBe(90)
+    expect((await limitsOf({ PER_SENDER_DAILY_LIMIT: "300", FREE_PER_SENDER_DAILY_LIMIT: "120" })).freeCallsPerSenderPerDay).toBe(120)
   })
 
   it("refuses batch bodies outright — batching is how a policy check gets skipped", async () => {
@@ -998,5 +1033,65 @@ describe("pm_getPaymasterData and eth_sendUserOperation require every gas field"
     const op = await opSignedBy(randomKey(), { verificationGasLimit: undefined, maxFeePerGas: undefined })
     expect((await stubOp(op)).error).toBeUndefined()
     expect((await rpc("eth_estimateUserOperationGas", [op, ENTRY_POINT])).error).toBeUndefined()
+  })
+})
+
+// UF-O item O2: the worker sends no machine-readable refusal reason, so @mida/chain recognises a
+// daily-limit refusal by its text — this test pins the two ends together: each refusal the worker
+// really returns must read true under isSponsorDailyLimitReason.
+describe("the daily-limit refusal texts match the client's pattern (UF-O)", () => {
+  it("per-sender signings, global signings, the wei budget and free calls all match", async () => {
+    // per-sender signing limit
+    {
+      const op = await opSignedBy(randomKey())
+      const sender = (op.sender as string).toLowerCase()
+      await db
+        .prepare("INSERT INTO sponsor_sender_signings (day, sender, count) VALUES (?, ?, ?)")
+        .bind(today(), sender, 30)
+        .run()
+      const reply = await signOp(op)
+      expect(reply.error?.message).toMatch(/sponsored signings for today/)
+      expect(isSponsorDailyLimitReason(reply.error?.message ?? "")).toBe(true)
+    }
+    // global signing limit
+    {
+      const prior =
+        (await db.prepare("SELECT count FROM sponsor_global_signings WHERE day = ?").bind(today()).first<{ count: number }>())
+          ?.count ?? 0
+      await db.prepare("INSERT OR REPLACE INTO sponsor_global_signings (day, count) VALUES (?, ?)").bind(today(), 2000).run()
+      try {
+        const reply = await signOp(await opSignedBy(randomKey()))
+        expect(reply.error?.message).toMatch(/daily budget is exhausted/)
+        expect(isSponsorDailyLimitReason(reply.error?.message ?? "")).toBe(true)
+      } finally {
+        await db.prepare("INSERT OR REPLACE INTO sponsor_global_signings (day, count) VALUES (?, ?)").bind(today(), prior).run()
+      }
+    }
+    // the daily wei budget
+    {
+      const prior = (await db.prepare("SELECT wei FROM spend WHERE day = ?").bind(today()).first<{ wei: string }>())?.wei ?? "0"
+      await db.prepare("INSERT OR REPLACE INTO spend (day, wei) VALUES (?, ?)").bind(today(), "1000000000000000000").run()
+      try {
+        const reply = await signOp(await opSignedBy(randomKey()))
+        expect(reply.error?.message).toMatch(/daily budget is spent/)
+        expect(isSponsorDailyLimitReason(reply.error?.message ?? "")).toBe(true)
+      } finally {
+        await db.prepare("INSERT OR REPLACE INTO spend (day, wei) VALUES (?, ?)").bind(today(), prior).run()
+      }
+    }
+    // free calls
+    {
+      const op = await opSignedBy(randomKey())
+      const sender = (op.sender as string).toLowerCase()
+      await db
+        .prepare("INSERT INTO sponsor_free_calls (day, sender, count) VALUES (?, ?, ?)")
+        .bind(today(), sender, 120)
+        .run()
+      const reply = await stubOp(op)
+      expect(reply.error?.message).toMatch(/free calls for today/)
+      expect(isSponsorDailyLimitReason(reply.error?.message ?? "")).toBe(true)
+    }
+    // and a refusal that is not a daily limit reads false
+    expect(isSponsorDailyLimitReason("refused: the sender is not delegated to an allowed implementation")).toBe(false)
   })
 })

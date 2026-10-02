@@ -44,6 +44,17 @@ export const SPONSOR_RECEIPT_NOTICE_MS = 15_000
 const DELEGATION_PREFIX = "0xef0100"
 
 /**
+ * The four daily-limit refusals of apps/sponsor-worker/src/worker.ts, matched by their text
+ * because the worker sends no machine-readable reason. A test in the worker's suite pins the
+ * two together.
+ */
+export function isSponsorDailyLimitReason(reason: string): boolean {
+  return /refused: (?:this sender used its \d+ (?:sponsored signings|free calls) for today|the sponsor's daily budget is (?:exhausted|spent))/.test(
+    reason,
+  )
+}
+
+/**
  * Every way a sponsored send can fail before the operation lands: refusal, unreachable endpoint,
  * timeout, malformed answer. `sendContract` falls back to self-pay only on this type — an operation
  * that was included and reverted is a different outcome (the sponsor DID pay) and is never retried.
@@ -51,11 +62,14 @@ const DELEGATION_PREFIX = "0xef0100"
 export class SponsorDidNotPay extends MidaError {
   /** The short human reason, surfaced on the fallback progress line. */
   readonly reason: string
+  /** Whether the refusal was the sponsor's daily limit — a wait-until-midnight failure, not an error. */
+  readonly dailyLimit: boolean
 
   constructor(reason: string) {
     super("SPONSOR_FAILED", reason)
     this.name = "SponsorDidNotPay"
     this.reason = reason
+    this.dailyLimit = isSponsorDailyLimitReason(reason)
   }
 }
 

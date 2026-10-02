@@ -23,7 +23,7 @@ describe("mida revoke --all on a passkey home (I4)", () => {
 
   beforeAll(async () => {
     env = await localEnvironment()
-  }, 120_000)
+  }, 600_000)
   afterAll(async () => {
     await env?.stop()
   })

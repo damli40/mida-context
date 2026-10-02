@@ -333,7 +333,7 @@ export async function prepareApprove(env: FlowEnvironment, link: ParsedLink): Pr
   const finalPrepared =
     needed.length === 0
       ? prepared
-      : // The recommended run already paid the owner-history scan — reuse its advice verbatim
+      : // The recommended run already paid the owner-history reads — reuse its advice verbatim
         // (in-25 P-8); the nonce and freshness checks below stay per-call.
         await prepareGrant(
           { publicClient: env.publicClient, deployment: env.deployment },
@@ -440,7 +440,7 @@ export async function confirmApprove(env: FlowEnvironment, link: ParsedLink, pre
           }
         }
         progress("Sending the grant…")
-        // The send reuses the advice the page was approved on — no second owner-history scan
+        // The send reuses the advice the page was approved on — no second owner-history check
         // (in-25 P-8). assertRequestFresh still runs inside approveGrant immediately before it.
         const approval = await authority.approveGrant(
           {

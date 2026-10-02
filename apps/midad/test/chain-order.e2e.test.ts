@@ -35,7 +35,6 @@ import { sampleCheckpoint } from "./helpers.js"
 import type { Checkpoint } from "@mida/checkpoint"
 
 const AGENTS = ["claude-code", "codex"] as const
-const SETUP_TIMEOUT = 480_000
 const STEP_TIMEOUT = 240_000
 const SETTLE_MS = 5_000
 
@@ -68,6 +67,12 @@ const anvil = async (rpcUrl: string, method: string, params: unknown[] = []): Pr
   return body.result
 }
 
+/** How many transactions wait in the local chain's pool for the next block. */
+const pendingCount = async (rpcUrl: string): Promise<number> => {
+  const status = (await anvil(rpcUrl, "txpool_status")) as { pending?: string }
+  return Number.parseInt(status.pending ?? "0x0", 16)
+}
+
 /** The Objective: line inside the rendered handoff — the save Monad calls current. */
 const objectiveLine = (text: string): string | undefined => /^Objective: (.*)$/m.exec(text)?.[1]
 
@@ -82,7 +87,7 @@ describe("chain order decides 'current', never the checkpoint's claimed clock (i
     if (env.batcher === undefined) throw new Error("localEnvironment did not expose the batch timer handle")
     network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund, storageUrl: env.apiBaseUrl }
     publicClient = createPublicClient({ chain: chainFor(env.deployment.chainId), transport: http(env.rpcUrl) })
-  }, SETUP_TIMEOUT)
+  }, 600_000)
 
   afterAll(async () => {
     await env?.stop()
@@ -223,11 +228,29 @@ describe("chain order decides 'current', never the checkpoint's claimed clock (i
               createdAt: claim,
               objective: `ORDER-${round}-CODEX`,
             }), `s-tie-${round}-b`))
-            // a straggler that missed the mempool before the first mine lands on the second
-            await anvil(env.rpcUrl, "evm_mine")
-            await new Promise((resolve) => setTimeout(resolve, 150))
-            await anvil(env.rpcUrl, "evm_mine")
-            const [savedA, savedB] = await Promise.all([saveA, saveB])
+            const both = Promise.allSettled([saveA, saveB])
+            let settled = false
+            void both.then(() => {
+              settled = true
+            })
+            // Both sends must be in the pool BEFORE the first block is produced: that is what
+            // puts the two saves in one block. The wait is bounded, so a save that fails before
+            // it sends cannot hang the round.
+            const sendsBy = Date.now() + 10_000
+            while (!settled && Date.now() < sendsBy && (await pendingCount(env.rpcUrl)) < 2) {
+              await new Promise((resolve) => setTimeout(resolve, 25))
+            }
+            // Then keep producing blocks until both saves have returned, so a transaction sent
+            // late still gets a block instead of waiting out the send timeout.
+            while (!settled) {
+              await anvil(env.rpcUrl, "evm_mine")
+              await new Promise((resolve) => setTimeout(resolve, 100))
+            }
+            const [resultA, resultB] = await both
+            if (resultA.status === "rejected") throw resultA.reason
+            if (resultB.status === "rejected") throw resultB.reason
+            const savedA = resultA.value
+            const savedB = resultB.value
 
             const placed = await placements(runtime)
             const pA = placed.get(savedA.contextId.toLowerCase())

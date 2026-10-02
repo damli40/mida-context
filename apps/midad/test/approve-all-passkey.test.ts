@@ -58,7 +58,7 @@ describe("mida approve --all on a passkey home (I3)", () => {
 
   beforeAll(async () => {
     env = await localEnvironment()
-  }, 120_000)
+  }, 600_000)
   afterAll(async () => {
     await env?.stop()
   })

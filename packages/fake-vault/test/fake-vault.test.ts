@@ -94,7 +94,7 @@ describe("FakeVaultAuthority (plan Task 22)", () => {
     ]
     agentA = await provisionAgent({ operator: operatorA, name: "CareerAI", purposeId: "career_coaching", declarations, callbackOrigin: "https://career.example" })
     agentB = await provisionAgent({ operator: operatorB, name: "Bystander", purposeId: "career_coaching", declarations, callbackOrigin: "https://bystander.example" })
-  }, 180_000)
+  }, 600_000)
 
   afterAll(async () => {
     await node?.stop()

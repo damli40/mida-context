@@ -25,6 +25,7 @@ import {
   mcpLauncherPath,
   codexMcpStatus,
   parseMidaCommand,
+  readSummarizer,
   recordCodexHome,
   recordedCodexHome,
   resolveDevinConfigPath,
@@ -34,6 +35,7 @@ import {
   uninstallCodex,
   uninstallDevin,
   uninstallMcpClient,
+  writeSummarizer,
 } from "@mida/midad"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-install-"))
@@ -331,7 +333,7 @@ describe("mida install codex", () => {
     expect(readFileSync(config, "utf8")).toBe(`${codexBlock({ home })}\n`)
   })
 
-  it("installs into CODEX_HOME when set and records the resolved home in the Mida home", () => {
+  it("installs into CODEX_HOME when set and records the resolved home in the Mida home", async () => {
     const codexHome = mkdtempSync(join(tmpdir(), "mida-codex-home-"))
     const midaHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-home-")))
     const config = join(codexHome, "config.toml")
@@ -340,7 +342,7 @@ describe("mida install codex", () => {
     const lines: string[] = []
     let code = -1
     try {
-      code = runInstall(["install", "codex"], {
+      code = await runInstall(["install", "codex"], {
         print: (line) => lines.push(line),
         claudeSettings: join(dir(), "settings.json"),
         codexConfig: config,
@@ -1445,7 +1447,8 @@ describe("the Codex trust reminder", () => {
     // the hooks-only install earns the reminder — the commands Codex fingerprints changed then
     const first = install(config, settings, ["install", "codex", "--no-mcp"], home)
     expect(first.code).toBe(0)
-    expect(first.lines).toEqual(["installed", CODEX_TRUST_SENTENCE])
+    // UF-P2c: the doctor follow-up prints directly after the trust sentence
+    expect(first.lines).toEqual(["installed", CODEX_TRUST_SENTENCE, "Then run mida doctor --live codex to check the hooks fire."])
     // adding just the [mcp_servers.mida] table changes no hook command — the trust holds
     const second = install(config, settings, ["install", "codex"], home)
     expect(second.code).toBe(0)
@@ -1923,5 +1926,155 @@ describe("runInstall for the clients", () => {
     const { code, lines } = run(["uninstall", "cursor"], { cwd: dir() })
     expect(code).toBe(0)
     expect(lines).toEqual(["not installed"])
+  })
+})
+
+describe("the summariser ask after install (UF-P2c)", () => {
+  /** Deps for a local runInstall with a real terminal faked and every outside effect injected. */
+  const ttyDeps = (home: MidaHome, lines: string[], asked: string[]) => ({
+    print: (line: string) => lines.push(line),
+    claudeSettings: join(dir(), "settings.json"),
+    codexConfig: join(dir(), "config.toml"),
+    home,
+    claudeUserConfig: join(dir(), ".claude.json"),
+    claudeCli: () => ({ status: 0 }),
+    stdinIsTTY: true,
+    stdoutIsTTY: true,
+    prompt: async (question: string) => (asked.push(question), ""),
+    secretPrompt: async () => "",
+    onPath: () => true,
+    env: {},
+  })
+
+  it("install codex prints the doctor line directly after the trust sentence", async () => {
+    const lines: string[] = []
+    const code = await runInstall(["install", "codex"], ttyDeps(new MidaHome(join(dir(), "mida-home")), lines, []))
+    expect(code).toBe(0)
+    const trust = lines.indexOf(CODEX_TRUST_SENTENCE)
+    expect(trust).toBeGreaterThanOrEqual(0)
+    expect(lines[trust + 1]).toBe("Then run mida doctor --live codex to check the hooks fire.")
+  })
+
+  it("install claude-code on a terminal with no saved choice asks, and Enter saves agents", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const asked: string[] = []
+    const code = await runInstall(["install", "claude-code"], ttyDeps(home, lines, asked))
+    expect(code).toBe(0)
+    expect(asked).toEqual(["Choose 1 or 2 [1]: "])
+    expect(lines).toContain("installed")
+    expect(lines).toContain("How should Mida write its summaries?")
+    expect(readSummarizer(home)).toEqual({ use: "agents" })
+  })
+
+  // UF-QB3: input pasted while install ran must not be read as the answer to the choice
+  // question — the buffered stdin is dropped before the ask, the way approve does.
+  it("install drains buffered stdin before the summariser question (UF-QB)", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const order: string[] = []
+    const code = await runInstall(["install", "claude-code"], {
+      ...ttyDeps(home, lines, []),
+      drainInput: async () => void order.push("drain"),
+      prompt: async (question: string) => (order.push("prompt"), "1"),
+    })
+    expect(code).toBe(0)
+    expect(order.slice(0, 2)).toEqual(["drain", "prompt"])
+    expect(readSummarizer(home)).toEqual({ use: "agents" })
+  })
+
+  it("install claude-code on a terminal with a saved choice asks nothing", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    writeSummarizer(home, { use: "agents" })
+    const lines: string[] = []
+    const asked: string[] = []
+    const code = await runInstall(["install", "claude-code"], ttyDeps(home, lines, asked))
+    expect(code).toBe(0)
+    expect(asked).toEqual([])
+    expect(lines.every((line) => line !== "How should Mida write its summaries?")).toBe(true)
+  })
+
+  it("install without a terminal asks nothing", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const asked: string[] = []
+    const code = await runInstall(["install", "claude-code"], {
+      ...ttyDeps(home, lines, asked),
+      stdinIsTTY: false,
+    })
+    expect(code).toBe(0)
+    expect(asked).toEqual([])
+  })
+
+  it("uninstall never asks", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const asked: string[] = []
+    const deps = ttyDeps(home, lines, asked)
+    expect(await runInstall(["uninstall", "claude-code"], deps)).toBe(0)
+    expect(asked).toEqual([])
+    // even on an install-shaped home there is still no ask on the uninstall verb
+    const deps2 = ttyDeps(home, lines, asked)
+    expect(await runInstall(["uninstall", "codex"], deps2)).toBe(0)
+    expect(asked).toEqual([])
+  })
+
+  it("install claude-code asks nothing when the environment already decides: MIDA_COMPILE_MODEL=custom (UF-P2R)", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const asked: string[] = []
+    const code = await runInstall(["install", "claude-code"], {
+      ...ttyDeps(home, lines, asked),
+      env: {
+        MIDA_COMPILE_MODEL: "custom",
+        MIDA_COMPILE_BASE_URL: "http://127.0.0.1:9/v1",
+        MIDA_COMPILE_MODEL_ID: "local-1",
+      },
+    })
+    expect(code).toBe(0)
+    expect(asked).toEqual([])
+    expect(lines.every((line) => line !== "How should Mida write its summaries?")).toBe(true)
+    expect(home.has("summarizer.json")).toBe(false)
+  })
+
+  it("install claude-code asks nothing when only DEEPSEEK_API_KEY is set (UF-P2R)", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const asked: string[] = []
+    const code = await runInstall(["install", "claude-code"], {
+      ...ttyDeps(home, lines, asked),
+      env: { DEEPSEEK_API_KEY: "env-key" },
+    })
+    expect(code).toBe(0)
+    expect(asked).toEqual([])
+    expect(home.has("summarizer.json")).toBe(false)
+  })
+
+  it("install claude-code asks nothing when CI is set (UF-P2R)", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const asked: string[] = []
+    const code = await runInstall(["install", "claude-code"], {
+      ...ttyDeps(home, lines, asked),
+      env: { CI: "1" },
+    })
+    expect(code).toBe(0)
+    expect(asked).toEqual([])
+    expect(home.has("summarizer.json")).toBe(false)
+  })
+
+  it("a summariser question that throws keeps the exit code the install earned (UF-P2R)", async () => {
+    const home = new MidaHome(join(dir(), "mida-home"))
+    const lines: string[] = []
+    const code = await runInstall(["install", "claude-code"], {
+      ...ttyDeps(home, lines, []),
+      prompt: async () => {
+        throw new Error("prompt blew up")
+      },
+    })
+    expect(code).toBe(0)
+    expect(lines).toContain("installed")
+    expect(lines).toContain("Nothing saved. Mida uses your agents' small models until you choose: mida summarizer")
+    expect(home.has("summarizer.json")).toBe(false)
   })
 })

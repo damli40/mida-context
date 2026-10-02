@@ -61,7 +61,10 @@ export interface SponsorEnv {
   ALLOWED_IMPLEMENTATIONS: string
   PER_SENDER_DAILY_LIMIT?: string
   GLOBAL_DAILY_LIMIT?: string
-  /** Daily allowance for the unsigned methods (stub data, gas estimation) — 120 by default. */
+  /**
+   * Daily allowance for the unsigned methods (stub data, gas estimation). A save uses 2.
+   * Unset: 3 x PER_SENDER_DAILY_LIMIT, so the signing limit is the one a sender reaches.
+   */
   FREE_PER_SENDER_DAILY_LIMIT?: string
   /**
    * The most sponsorship the endpoint spends per UTC day, as a decimal wei string — each signing
@@ -264,6 +267,7 @@ export function buildWorker(env: SponsorEnv): SponsorConfig {
     return entry.promise
   }
 
+  const perSenderDailyLimit = parseLimit(env.PER_SENDER_DAILY_LIMIT, 30, "PER_SENDER_DAILY_LIMIT")
   const config: SponsorConfig = {
     provider,
     policy: {
@@ -275,9 +279,9 @@ export function buildWorker(env: SponsorEnv): SponsorConfig {
       allowClearing: env.ALLOW_CLEARING === "true",
     },
     secrets,
-    perSenderDailyLimit: parseLimit(env.PER_SENDER_DAILY_LIMIT, 30, "PER_SENDER_DAILY_LIMIT"),
+    perSenderDailyLimit,
     globalDailyLimit: parseLimit(env.GLOBAL_DAILY_LIMIT, 2000, "GLOBAL_DAILY_LIMIT"),
-    freePerSenderDailyLimit: parseLimit(env.FREE_PER_SENDER_DAILY_LIMIT, 120, "FREE_PER_SENDER_DAILY_LIMIT"),
+    freePerSenderDailyLimit: parseLimit(env.FREE_PER_SENDER_DAILY_LIMIT, perSenderDailyLimit * 3, "FREE_PER_SENDER_DAILY_LIMIT"),
     dailyWeiBudget: parseWeiBudget(env.DAILY_WEI_BUDGET, 25_000_000_000_000_000_000n, "DAILY_WEI_BUDGET"),
     gasPrice,
     log(method, refused, sender, ms) {

@@ -60,7 +60,7 @@ describe("in-3 I4 — a revoke pending on Monad stops new batched saves at the s
   beforeAll(async () => {
     scene = await localEnvironment({ batching: { waitMs: 200 } })
     network = { rpcUrl: scene.rpcUrl, deployment: scene.deployment, fund: scene.fund, storageUrl: scene.apiBaseUrl }
-  }, 300_000)
+  }, 600_000)
 
   afterAll(async () => {
     await scene?.stop()

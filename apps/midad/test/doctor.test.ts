@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import { spawn, spawnSync } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
@@ -12,8 +12,9 @@ import { toFunctionSelector } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { encodeUint64 } from "@mida/protocol"
 import { parseDeployment } from "@mida/chain"
-import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, enqueue, installClaudeCode, installCodex, installDevin, isMidaProcess, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, doctorReplaceStaleService, enqueue, ensureCurrentDaemon, installClaudeCode, installCodex, installDevin, isMidaProcess, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor, writeSummarizer } from "@mida/midad"
 import type { Runtime } from "@mida/midad"
+import { codeIdentity } from "../src/code-identity.js"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
 
@@ -344,6 +345,338 @@ describe("mida doctor without a chain", () => {
     }
   })
 
+  // UF-O item O4: two waits the queue check used to mislabel or hide — a wallet funded below the
+  // send threshold cannot pay either, and a sponsor-limit wait is the sponsor's daily cap, which
+  // resets at 00:00 UTC. UF-QA: wallet-low is its own line now — the wallet is LOW, not out —
+  // and the sponsor-limit line says the sponsor stopped paying, never whose limit ran out: the
+  // same wait happens when the sponsor's shared daily budget is spent, not only one agent's cap.
+  it("a wallet-low wait says the paying wallet is low on gas, self-paid or sponsored alike (UF-QA)", async () => {
+    for (const sponsored of [false, true]) {
+      const home = new MidaHome(join(dir(), `home-${sponsored}`))
+      const server = await stubDaemon(home, 200, { ok: true })
+      try {
+        if (sponsored) home.writeSecretJson("network.json", { sponsorUrl: "https://sponsor.example" })
+        enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+        const failedAt = new Date(Date.now() - 30_000).toISOString()
+        home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 2, failedAt, reason: "wallet-low" })
+        const lines: string[] = []
+        await runDoctor({
+          home,
+          print: (line) => lines.push(line),
+          settings: {},
+          env: {},
+          daemonProbeMs: 50,
+          fetch: async () => new Response("{}", { status: 200 }),
+          sponsorReachable: async () => false,
+        })
+        expect(lines, `sponsored=${sponsored}`).toContain(
+          "PROBLEM: claude-code's saves are waiting because the wallet that pays for them is low on gas. See doctor's sponsor and wallets lines.",
+        )
+        expect(lines.some((line) => line.includes("ran out of gas")), `sponsored=${sponsored}`).toBe(false)
+      } finally {
+        await closeServer(server)
+      }
+    }
+  })
+
+  it("a sponsor-limit wait says the sponsor stopped paying — its limits reset at 00:00 UTC (UF-QA)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, failedAt, reason: "sponsor-limit" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain(
+        "PROBLEM: the gas sponsor has stopped paying for today, so claude-code's saves are waiting. Mida sends them after its limits reset at 00:00 UTC.",
+      )
+      // the old wording blamed the agent's own limit — the same wait happens on the shared budget
+      expect(lines.some((line) => line.includes("daily limit for claude-code"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  // UF-P3 item P3b: a save held for a summary model is a PROBLEM that names the wait — the
+  // owner is told why and which command shows or changes the choice.
+  it("a summarizer-limit wait names the model's usage limit and points at mida summarizer (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, failedAt, reason: "summarizer-limit" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain(
+        "PROBLEM: the model that writes Mida's summaries hit its usage limit, so claude-code's saves are waiting. Run mida summarizer to see it or to choose another.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a no-summarizer wait says no model is set up and points at mida summarizer (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, failedAt, reason: "no-summarizer" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain(
+        "PROBLEM: no model is set up to write Mida's summaries, so claude-code's saves are waiting. Run mida summarizer.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  // UF-QH: a save stuck past its eighth failed try on an ordinary reason is not waiting on an
+  // allowance — Mida is still retrying it, and the line says how often and when it stops: seven
+  // quiet days counted from the session's newest queued event. A summary failure also names the
+  // command that retries it now.
+  it("a save that has failed nine times on a summary reason gets the keeps-trying line naming the retry command (UF-QH)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 9, failedAt, reason: "model-failed" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain(
+        "PROBLEM: a save from claude-code has failed 9 times (model-failed). Mida now tries it a few times a day and stops once that session has been quiet for seven days. To retry now, run mida summarizer test: when it passes, Mida tries the save again.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("eight failed tries on an ordinary reason prints the every-hour line (UF-QH)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 8, failedAt, reason: "chain-error" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain(
+        "PROBLEM: a save from claude-code has failed 8 times (chain-error). Mida now tries it every hour and stops once that session has been quiet for seven days.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("seven failed tries print no keeps-trying line (UF-QH)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 7, failedAt, reason: "chain-error" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines.some((line) => line.includes("has failed"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("nine failed tries on out-of-gas prints the gas line, never the keeps-trying line (UF-QH)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 9, failedAt, reason: "out-of-gas" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines).toContain("PROBLEM: claude-code's wallet ran out of gas, so its saves are waiting. Run mida sponsor on, or mida init to top it up.")
+      expect(lines.some((line) => line.includes("has failed"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("nine failed tries on wallet-low prints the low-gas line, never the keeps-trying line (UF-QH)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 9, failedAt, reason: "wallet-low" })
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        fetch: async () => new Response("{}", { status: 200 }),
+        sponsorReachable: async () => false,
+      })
+      expect(lines).toContain(
+        "PROBLEM: claude-code's saves are waiting because the wallet that pays for them is low on gas. See doctor's sponsor and wallets lines.",
+      )
+      expect(lines.some((line) => line.includes("has failed"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("the keeps-trying line waits for eight tries — three failures earn no line (UF-QF)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 3, failedAt, reason: "model-failed" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines.some((line) => line.includes("has failed"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a session waiting on a capacity reason earns its own line, never the keeps-trying one (UF-QF)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true })
+    try {
+      enqueue(home, { agent: "claude-code", event: "Stop", sessionId: "s1", transcriptPath: "/tmp/t.jsonl", cwd: "/tmp", error: null })
+      const failedAt = new Date(Date.now() - 30_000).toISOString()
+      home.writeSecretJson("queue/state/s1.json", { transcriptBytes: 10, lastLineHash: "", savedAt: failedAt, attempts: 9, failedAt, reason: "sponsor-limit" })
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines.some((line) => line.includes("has failed"))).toBe(false)
+      expect(lines).toContain(
+        "PROBLEM: the gas sponsor has stopped paying for today, so claude-code's saves are waiting. Mida sends them after its limits reset at 00:00 UTC.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  // UF-QF: the review's empty test — `mida doctor`'s stale-service swap must allow the old
+  // service a full minute to stop and must print the busy line through the callback, not a
+  // "finishing a save" claim the service may not be doing. The ensure call is injected.
+  it("doctor's stale-service swap waits a minute and prints the busy line through the callback (UF-QF)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    let seen: Parameters<typeof ensureCurrentDaemon>[2] | undefined
+    const written: string[] = []
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      written.push(String(chunk))
+      return true
+    }) as typeof process.stderr.write)
+    try {
+      await doctorReplaceStaleService(home, async (_h, _spawn, options) => {
+        seen = options
+        options.onStillUp?.()
+        return { up: false }
+      })
+    } finally {
+      spy.mockRestore()
+    }
+    expect(seen?.shutdownWaitMs).toBe(65_000)
+    expect(seen?.whenDown).toBe("leave")
+    expect(written).toContain("The older Mida service is still busy. Waiting up to a minute for it to stop.\n")
+  })
+
+  it("the sponsor line says how many SAVES a day its limits really pay for (UF-O)", async () => {
+    // one save spends 2 free calls (stub data + gas estimate), so a free-call limit can bind
+    // tighter than the signing limit: 120 free calls = 60 saves, not 300
+    const cases: { limits: Record<string, unknown>; saves: number }[] = [
+      { limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, freeCallsPerSenderPerDay: 120 }, saves: 60 },
+      { limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, freeCallsPerSenderPerDay: 900 }, saves: 300 },
+      { limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000 }, saves: 300 },
+    ]
+    for (const { limits, saves } of cases) {
+      const home = new MidaHome(join(dir(), `home-${saves}`))
+      const server = await stubDaemon(home, 200, { ok: true })
+      try {
+        home.writeSecretJson("network.json", { sponsorUrl: "https://sponsor.example" })
+        const lines: string[] = []
+        await runDoctor({
+          home,
+          print: (line) => lines.push(line),
+          settings: {},
+          env: {},
+          daemonProbeMs: 50,
+          fetch: async () => new Response(JSON.stringify({ limits }), { status: 200 }),
+        })
+        expect(lines).toContain(
+          `ok: gas sponsor reachable at sponsor.example (willingness is only proven by a real send; it pays for up to ${saves} saves per agent a day, 2000 a day across everyone)`,
+        )
+      } finally {
+        await closeServer(server)
+      }
+    }
+  })
+
+  // UF-QA: the sponsor's GET reply also carries limits.dailyWeiBudget — a decimal string of wei,
+  // the daily budget shared by EVERYONE, which runs out long before the count limits do. When it
+  // is a decimal string the detail names it in whole MON; when absent or malformed the old count
+  // wording stands. perAgent clamps at 0 — a freeCalls field of 0, 1 or -5 is never "-3 saves".
+  it("a sponsor carrying a daily budget says it is shared by everyone, in whole MON (UF-QA)", async () => {
+    const cases: { limits: Record<string, unknown>; detail: string }[] = [
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, dailyWeiBudget: "150000000000000000000" },
+        detail: "; it pays for up to 300 saves per agent a day, from a daily budget of 150 MON shared by everyone",
+      },
+      {
+        // wei under the next whole MON rounds DOWN — 150.9 MON prints as 150
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, dailyWeiBudget: "150999999999999999999" },
+        detail: "; it pays for up to 300 saves per agent a day, from a daily budget of 150 MON shared by everyone",
+      },
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, dailyWeiBudget: "not-a-decimal" },
+        detail: "; it pays for up to 300 saves per agent a day, 2000 a day across everyone",
+      },
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, dailyWeiBudget: 150000000000000000000 },
+        detail: "; it pays for up to 300 saves per agent a day, 2000 a day across everyone",
+      },
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, freeCallsPerSenderPerDay: 0, dailyWeiBudget: "150000000000000000000" },
+        detail: "; it pays for up to 0 saves per agent a day, from a daily budget of 150 MON shared by everyone",
+      },
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, freeCallsPerSenderPerDay: 1, dailyWeiBudget: "150000000000000000000" },
+        detail: "; it pays for up to 0 saves per agent a day, from a daily budget of 150 MON shared by everyone",
+      },
+      {
+        limits: { signingsPerSenderPerDay: 300, signingsGlobalPerDay: 2000, freeCallsPerSenderPerDay: -5, dailyWeiBudget: "150000000000000000000" },
+        detail: "; it pays for up to 0 saves per agent a day, from a daily budget of 150 MON shared by everyone",
+      },
+    ]
+    for (const [i, { limits, detail }] of cases.entries()) {
+      const home = new MidaHome(join(dir(), `home-budget-${i}`))
+      const server = await stubDaemon(home, 200, { ok: true })
+      try {
+        home.writeSecretJson("network.json", { sponsorUrl: "https://sponsor.example" })
+        const lines: string[] = []
+        await runDoctor({
+          home,
+          print: (line) => lines.push(line),
+          settings: {},
+          env: {},
+          daemonProbeMs: 50,
+          fetch: async () => new Response(JSON.stringify({ limits }), { status: 200 }),
+        })
+        expect(lines, JSON.stringify(limits)).toContain(
+          `ok: gas sponsor reachable at sponsor.example (willingness is only proven by a real send${detail})`,
+        )
+      } finally {
+        await closeServer(server)
+      }
+    }
+  })
+
   it("a session waiting on a non-gas reason gets the note but no wallet line (in-29 S-2)", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const server = await stubDaemon(home, 200, { ok: true })
@@ -391,40 +724,50 @@ describe("mida doctor without a chain", () => {
   })
 
   it("names the compile model and where the session text goes — per provider, from the real chain (M3-D5)", async () => {
+    // UF-P3: the check resolves through currentSummarizer now — the same function the service
+    // uses — so the agent tools on PATH count, and a Codex tail names its own label.
     const home = new MidaHome(join(dir(), "home"))
     const run = async (env: NodeJS.ProcessEnv) => {
       const lines: string[] = []
-      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env, daemonProbeMs: 50 })
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env,
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
       return lines
     }
 
-    // no keys: haiku through the claude CLI, no fallback
+    // no keys: haiku through the claude CLI, Codex behind it
     const haiku = await run({})
     expect(haiku).toContain("ok: compile model is claude-haiku")
     const haikuNote = haiku.filter((line) => line.startsWith("note:") && line.includes("transcript text"))
     expect(haikuNote).toHaveLength(1)
     expect(haikuNote[0]).toContain("api.anthropic.com")
-    expect(haikuNote[0]).toContain("no fallback")
+    expect(haikuNote[0]).toContain("a failed call falls back to codex-luna")
 
-    // deepseek key alone: the default, falling back to haiku
+    // deepseek key alone: the default, falling back to the agents
     const deepseek = await run({ DEEPSEEK_API_KEY: "test-key" })
     expect(deepseek).toContain("ok: compile model is deepseek-flash")
     expect(deepseek).toContain(
-      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to claude-haiku",
+      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to claude-haiku (api.anthropic.com), then codex-luna (api.openai.com)",
     )
     expect(deepseek.join("\n")).not.toContain("test-key")
 
     // both keys: the note names the full real chain
     const both = await run({ DEEPSEEK_API_KEY: "d", KIMI_API_KEY: "k" })
     expect(both).toContain(
-      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to kimi, then claude-haiku",
+      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); a failed call falls back to kimi (api.moonshot.ai), then claude-haiku (api.anthropic.com), then codex-luna (api.openai.com)",
     )
 
     // kimi alone: Moonshot is where the text goes
     const kimi = await run({ KIMI_API_KEY: "test-key" })
     expect(kimi).toContain("ok: compile model is kimi-k2.7-code-highspeed")
     expect(kimi).toContain(
-      "note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to claude-haiku",
+      "note: kimi sends the session's transcript text to api.moonshot.ai (secrets are scrubbed first); a failed call falls back to claude-haiku (api.anthropic.com), then codex-luna (api.openai.com)",
     )
     expect(kimi.join("\n")).not.toContain("test-key")
     expect(kimi.some((line) => line.includes("not Moonshot"))).toBe(false)
@@ -440,7 +783,7 @@ describe("mida doctor without a chain", () => {
       KIMI_API_KEY: "k",
     }
     const lines: string[] = []
-    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: custom, daemonProbeMs: 50 })
+    await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: custom, daemonProbeMs: 50, onPath: () => true, claudeSafeMode: () => false })
     expect(lines).toContain("ok: compile model is qwen-local")
     expect(lines).toContain("note: compile text is sent to 127.0.0.1:11434 (your own endpoint); no fallback")
     // the custom base URL is itself — never a 'not Moonshot'-style problem
@@ -454,9 +797,11 @@ describe("mida doctor without a chain", () => {
       settings: {},
       env: { ...custom, MIDA_COMPILE_FALLBACK: "1" },
       daemonProbeMs: 50,
+      onPath: () => true,
+      claudeSafeMode: () => false,
     })
     expect(withFallback).toContain(
-      "note: compile text is sent to 127.0.0.1:11434 (your own endpoint); a failed call falls back to deepseek, then kimi, then claude-haiku",
+      "note: compile text is sent to 127.0.0.1:11434 (your own endpoint); a failed call falls back to deepseek (api.deepseek.com), then kimi (api.moonshot.ai), then claude-haiku (api.anthropic.com)",
     )
 
     // a pinned custom missing its required vars is a PROBLEM — every compile would fail
@@ -511,6 +856,348 @@ describe("mida doctor without a chain", () => {
     expect(custom.some((line) => line.includes("anything.example.com"))).toBe(true)
   })
 
+  // UF-P3 item P3b: compile-model resolves the chain the SERVICE would use — currentSummarizer,
+  // not the old env-only choice — so a Codex-only PATH, an empty chain, an unreadable saved
+  // choice and a saved key each get their own honest line.
+  it("with only Codex on PATH the compile model is codex-luna and Claude is named a missing backup (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      onPath: (bin) => bin === "codex",
+    })
+    expect(lines).toContain("ok: compile model is codex-luna")
+    expect(lines).toContain(
+      "note: codex-luna sends the session's transcript text to api.openai.com via the codex CLI (secrets are scrubbed first); no fallback",
+    )
+    expect(lines).toContain("note: Claude Code (haiku) is not installed, so Mida cannot use it.")
+  })
+
+  it("with neither agent tool the compile-model check is one PROBLEM line and nothing else (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      onPath: () => false,
+    })
+    const problem = "PROBLEM: no model can write Mida's summaries, so no session is being saved. Install Claude Code or Codex, or run mida summarizer use key."
+    expect(lines).toContain(problem)
+    // nothing else from this check: no ok:, no transcript note, no fallback, no backup note
+    expect(lines.some((line) => line.includes("compile model is"))).toBe(false)
+    expect(lines.some((line) => line.includes("transcript text"))).toBe(false)
+    expect(lines.some((line) => line.includes("cannot be the backup"))).toBe(false)
+    expect(lines.filter((line) => line.includes("Mida's summaries")).length).toBe(1)
+  })
+
+  it("an environment pin for a model that cannot run names the environment as the chooser (UF-QD)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: { MIDA_COMPILE_MODEL: "haiku" },
+      daemonProbeMs: 50,
+      onPath: (bin) => bin === "codex",
+    })
+    expect(lines).toContain(
+      "PROBLEM: no model can write Mida's summaries, so no session is being saved. Your environment variables choose a model that cannot run here. Run mida summarizer use agents.",
+    )
+    expect(lines.some((line) => line.includes("Install Claude Code or Codex"))).toBe(false)
+  })
+
+  it("an unreadable summarizer.json is its own PROBLEM line — never an ok model line (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    writeFileSync(home.path("summarizer.json"), "{not json")
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      onPath: () => true,
+    })
+    expect(lines).toContain(
+      "PROBLEM: the saved summariser choice (summarizer.json) cannot be read, so no session is being saved. Run mida summarizer use agents, or mida summarizer use key.",
+    )
+    expect(lines.some((line) => line.includes("compile model is"))).toBe(false)
+  })
+
+  it("a saved key choice names the provider's model — and the key appears in no line (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    writeSummarizer(home, { use: "key", provider: "deepseek", apiKey: "sk-test-secret-key" })
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      onPath: () => true,
+      claudeSafeMode: () => false,
+    })
+    expect(lines).toContain("ok: compile model is deepseek-flash")
+    expect(lines).toContain(
+      "note: deepseek sends the session's transcript text to api.deepseek.com (secrets are scrubbed first); no fallback",
+    )
+    expect(lines.join("\n")).not.toContain("sk-test-secret-key")
+  })
+
+  it("a running service on a different summarizer chain gets the whose-answer-counts note (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      codeRoot: codeIdentity().codeRoot,
+      codeCommit: codeIdentity().codeCommit,
+      codeVersion: codeIdentity().codeVersion,
+      summarizer: {
+        mode: "key",
+        chosen: true,
+        invalid: false,
+        entries: [{ id: "deepseek", label: "deepseek-flash", display: "DeepSeek (deepseek-flash)", host: "api.deepseek.com", installed: true }],
+        chain: ["deepseek-flash"],
+      },
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
+      expect(lines).toContain(
+        "note: the running Mida service uses deepseek-flash; this shell would use claude-haiku, codex-luna. The service's answer is the one that counts.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a service at the same folder and commit but another codeVersion is reported as other code (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      codeRoot: codeIdentity().codeRoot,
+      codeCommit: codeIdentity().codeCommit,
+      codeVersion: "0.0.0-older",
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines.some((line) => line.includes("this command runs the same"))).toBe(false)
+      expect(lines.some((line) => line.startsWith("PROBLEM:") && line.includes("midad runs"))).toBe(true)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a service that names root and commit but no codeVersion is reported as other code (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      codeRoot: codeIdentity().codeRoot,
+      codeCommit: codeIdentity().codeCommit,
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+      expect(lines.some((line) => line.includes("this command runs the same"))).toBe(false)
+      expect(lines.some((line) => line.startsWith("PROBLEM:") && line.includes("midad"))).toBe(true)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a running service on the SAME chain gets no note (UF-P3)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      codeRoot: codeIdentity().codeRoot,
+      codeCommit: codeIdentity().codeCommit,
+      codeVersion: codeIdentity().codeVersion,
+      summarizer: {
+        mode: "agents",
+        chosen: true,
+        invalid: false,
+        entries: [
+          { id: "claude", label: "claude-haiku", display: "Claude Code (haiku)", host: "api.anthropic.com", installed: true },
+          { id: "codex", label: "codex-luna", display: "Codex (luna)", host: "api.openai.com", installed: true },
+        ],
+        chain: ["claude-haiku", "codex-luna"],
+      },
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
+      expect(lines.some((line) => line.includes("The service's answer is the one that counts"))).toBe(false)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  // UF-QC: the compile-model check describes the RUNNING service's chain — the entries and the
+  // chain labels in its /health reply — not the chain this shell would resolve. The local
+  // resolution is only the fallback when the service cannot or did not say.
+  const selfIdentity = () => ({ codeRoot: codeIdentity().codeRoot, codeCommit: codeIdentity().codeCommit, codeVersion: codeIdentity().codeVersion })
+  const agentEntries = (claudeInstalled: boolean, codexInstalled: boolean) => [
+    { id: "claude", label: "claude-haiku", display: "Claude Code (haiku)", host: "api.anthropic.com", installed: claudeInstalled },
+    { id: "codex", label: "codex-luna", display: "Codex (luna)", host: "api.openai.com", installed: codexInstalled },
+  ]
+
+  it("the service reporting an empty chain is the PROBLEM even when this shell has both tools (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      ...selfIdentity(),
+      summarizer: { mode: "agents", chosen: true, invalid: false, entries: agentEntries(true, true), chain: [] },
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
+      expect(lines.filter((line) => line.includes("no model can write Mida's summaries"))).toHaveLength(1)
+      expect(lines.some((line) => line.includes("compile model is"))).toBe(false)
+      expect(lines).toContain(
+        "note: the running Mida service uses none; this shell would use claude-haiku, codex-luna. The service's answer is the one that counts.",
+      )
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a service with only codex-luna is ok even when this shell has no tool at all (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      ...selfIdentity(),
+      summarizer: { mode: "agents", chosen: true, invalid: false, entries: agentEntries(false, true), chain: ["codex-luna"] },
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => false,
+      })
+      expect(lines).toContain("ok: compile model is codex-luna")
+      expect(lines).toContain(
+        "note: the running Mida service uses codex-luna; this shell would use none. The service's answer is the one that counts.",
+      )
+      // the service's Claude is not installed, and the note says so in its own words
+      expect(lines).toContain("note: Claude Code (haiku) is not installed, so Mida cannot use it.")
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("with no service the lines are this shell's chain plus the not-running note (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: {},
+      daemonProbeMs: 50,
+      onPath: () => true,
+      claudeSafeMode: () => false,
+    })
+    expect(lines).toContain("ok: compile model is claude-haiku")
+    expect(lines).toContain("note: the Mida service is not running; the lines above describe what it would use if started from this shell.")
+  })
+
+  it("a service whose reply carries no summarizer field gets the did-not-say note (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, { ok: true, ...selfIdentity() })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
+      expect(lines).toContain("ok: compile model is claude-haiku")
+      expect(lines).toContain("note: the running Mida service did not say which model it uses; the lines above describe this shell.")
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("the fallback clause names each fallback's host (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const server = await stubDaemon(home, 200, {
+      ok: true,
+      ...selfIdentity(),
+      summarizer: { mode: "agents", chosen: true, invalid: false, entries: agentEntries(true, true), chain: ["claude-haiku", "codex-luna"] },
+    })
+    try {
+      const lines: string[] = []
+      await runDoctor({
+        home,
+        print: (line) => lines.push(line),
+        settings: {},
+        env: {},
+        daemonProbeMs: 50,
+        onPath: () => true,
+        claudeSafeMode: () => false,
+      })
+      expect(lines.some((line) => line.includes("a failed call falls back to codex-luna (api.openai.com)"))).toBe(true)
+    } finally {
+      await closeServer(server)
+    }
+  })
+
+  it("a saved custom choice with an empty MIDA_COMPILE_BASE_URL prints no needs line (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    writeSummarizer(home, { use: "key", provider: "custom", apiKey: "k", baseUrl: "https://x.example/v1", model: "m" })
+    const lines: string[] = []
+    await runDoctor({
+      home,
+      print: (line) => lines.push(line),
+      settings: {},
+      env: { MIDA_COMPILE_BASE_URL: "" },
+      daemonProbeMs: 50,
+      onPath: () => true,
+      claudeSafeMode: () => false,
+    })
+    expect(lines.some((line) => line.includes("MIDA_COMPILE_MODEL=custom needs"))).toBe(false)
+  })
+
   it("the environment check lists every compile-provider variable — set or unset, never a value (M3-D5)", async () => {
     const home = new MidaHome(join(dir(), "home"))
     const lines: string[] = []
@@ -527,7 +1214,7 @@ describe("mida doctor without a chain", () => {
     expect(unset).toBeDefined()
     expect(set).toContain("DEEPSEEK_API_KEY")
     expect(set).toContain("MIDA_COMPILE_MODEL")
-    for (const name of ["DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "DEEPSEEK_TIMEOUT_MS", "KIMI_API_KEY", "MIDA_COMPILE_API_KEY", "MIDA_COMPILE_BASE_URL", "MIDA_COMPILE_MODEL_ID", "MIDA_COMPILE_TIMEOUT_MS", "MIDA_COMPILE_FALLBACK"]) {
+    for (const name of ["DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "DEEPSEEK_TIMEOUT_MS", "KIMI_API_KEY", "MIDA_COMPILE_API_KEY", "MIDA_COMPILE_BASE_URL", "MIDA_COMPILE_MODEL_ID", "MIDA_COMPILE_TIMEOUT_MS", "MIDA_COMPILE_FALLBACK", "MIDA_CLAUDE_SUMMARY_MODEL", "MIDA_CODEX_SUMMARY_MODEL"]) {
       expect(unset).toContain(name)
     }
     // values never reach a doctor line
@@ -1114,6 +1801,48 @@ describe("mida doctor --live", () => {
     })
     expect(code).toBe(2)
     expect(lines).toEqual(["refused: live checks need an interactive terminal"])
+  })
+
+  it("a refused --live replaces nothing — the stale-service check never runs (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    let replaced = 0
+    const code = await runDoctorLive("codex", {
+      home,
+      print: (line) => lines.push(line),
+      env: { CI: "true" },
+      stdinIsTTY: true,
+      replaceStaleService: async () => {
+        replaced += 1
+      },
+    })
+    expect(code).toBe(2)
+    expect(lines).toEqual(["refused: live checks do not run in CI"])
+    expect(replaced).toBe(0)
+  })
+
+  it("once the refusals pass, --live replaces a stale service before the session starts (UF-QC)", async () => {
+    const home = new MidaHome(join(dir(), "home"))
+    const lines: string[] = []
+    let replaced = 0
+    let sessions = 0
+    const code = await runDoctorLive("codex", {
+      home,
+      print: (line) => lines.push(line),
+      env: {},
+      stdinIsTTY: true,
+      watchMs: 50,
+      replaceStaleService: async () => {
+        replaced += 1
+      },
+      startSession: () => {
+        sessions += 1
+        return { stop() {} }
+      },
+    })
+    expect(code).toBe(1)
+    expect(replaced).toBe(1)
+    expect(sessions).toBe(1)
   })
 })
 

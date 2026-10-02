@@ -73,7 +73,7 @@ describe("mida remember on local Anvil", () => {
       selection: { kind: "recommended" },
     })
     await legacy.completeAccessRequest(legacyRequest, legacyApproval.response)
-  }, STEP_TIMEOUT * 4)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

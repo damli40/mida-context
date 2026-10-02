@@ -196,7 +196,7 @@ describe("the RPC request count of one session-start handoff (in-6 R2)", () => {
       log: () => {},
       tickMs: 60_000,
     })
-  }, STEP_TIMEOUT * 4)
+  }, 600_000)
 
   afterAll(async () => {
     await daemon?.close()

@@ -47,7 +47,7 @@ const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url))
 const TOY_TASK = join(REPO_ROOT, "bench", "fixtures", "toy-task")
 const HOOK_MAIN = join(REPO_ROOT, "apps", "midad", "src", "hook-main.ts")
 const INJECT_MAIN = join(REPO_ROOT, "apps", "midad", "src", "inject-main.ts")
-const RUNS_ROOT = join(REPO_ROOT, "bench", "continuation", "runs")
+export const RUNS_ROOT = join(REPO_ROOT, "bench", "continuation", "runs")
 const WATCH = "msUntilAvailable" // string in bucket.mjs that ends A's run early
 const RAW_TAIL_CHARS = 8_000 // ~the handoff's own size budget, so raw competes fairly
 const QUEUE_WAIT_CAP_MS = 150_000
@@ -582,12 +582,17 @@ async function main(): Promise<number> {
   return realRun(args)
 }
 
-main()
-  .then((code) => {
-    process.exitCode = code
-  })
-  .catch((error: unknown) => {
-    // the error's own message — `harness: Error` for a missing --condition named nothing (R4-8)
-    console.error(`harness: ${error instanceof Error ? error.message : String(error)}`)
-    process.exitCode = 1
-  })
+// run only when this file is the entry point — summary.ts imports RUNS_ROOT,
+// and without the guard that import would parse summary.ts's own argv here
+const invokedAs = process.argv[1] !== undefined ? fileURLToPath(import.meta.url) === process.argv[1] : false
+if (invokedAs) {
+  main()
+    .then((code) => {
+      process.exitCode = code
+    })
+    .catch((error: unknown) => {
+      // the error's own message — `harness: Error` for a missing --condition named nothing (R4-8)
+      console.error(`harness: ${error instanceof Error ? error.message : String(error)}`)
+      process.exitCode = 1
+    })
+}

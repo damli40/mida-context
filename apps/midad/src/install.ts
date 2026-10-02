@@ -33,7 +33,7 @@ export const INJECT_COMMAND = {
 export type InstallTool = keyof typeof HOOK_COMMAND
 
 /** The MCP clients — each connects over mida-mcp with its own identity, never a hook. */
-export const MCP_CLIENT_TOOLS: readonly string[] = ["claude-desktop", "cursor"]
+export { MCP_CLIENT_TOOLS } from "./mcp-clients.js"
 export type McpClientTool = "claude-desktop" | "cursor"
 
 /**

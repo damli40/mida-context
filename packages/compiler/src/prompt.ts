@@ -62,7 +62,7 @@ ${TRANSCRIPT_LINE}
 // request's byte-exact prefix, so the part that changes every compile must
 // come last — a second compile's prompt is then literally the first compile's
 // prompt plus this tail, and the whole transcript head stays a cache hit.
-const PREVIOUS_LEAD = `PREVIOUS CHECKPOINT (below the transcript above — your own earlier summary of this same session, as JSON). Update it: keep every entry that is still true, in its existing wording; add what is new; move finished steps out of "remainingPlan" and into "progress"; remove an "unresolvedIssue" that the transcript shows was resolved. Never restate an existing entry in new words. Never drop a decision, rejected approach or constraint unless the transcript shows it was reversed.`
+const PREVIOUS_LEAD = `PREVIOUS CHECKPOINT (below the transcript above — your own earlier summary of this same session, as JSON). Update it: keep every entry that is still true, in its existing wording; add what is new at the end of its list; move finished steps out of "remainingPlan" and into "progress"; remove an "unresolvedIssue" that the transcript shows was resolved. Never restate an existing entry in new words. Never drop a decision, rejected approach or constraint unless the transcript shows it was reversed.`
 
 export function buildExtractPrompt(
   transcriptText: string,

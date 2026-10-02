@@ -1,9 +1,11 @@
-import { describe, expect, it } from "vitest"
+import { afterAll, beforeAll, describe, expect, it } from "vitest"
 import { encodeErrorResult, getAbiItem } from "viem"
 import type { AbiEvent } from "viem"
-import { isMidaError, namespaceId } from "@mida/protocol"
+import { privateKeyToAccount } from "viem/accounts"
+import { PERMISSION, isMidaError, namespaceId } from "@mida/protocol"
 import type { Address, Hex } from "@mida/protocol"
 import {
+  ANVIL_PRIVATE_KEYS,
   LOG_SCAN_CONCURRENCY,
   MAX_LOG_BLOCK_RANGE,
   REVERT_CODES,
@@ -12,16 +14,21 @@ import {
   capabilityRegistryAbi,
   chainFor,
   contextRegistryAbi,
+  createWriteContext,
+  deployLocal,
   getLogsChunked,
   ownerHistory,
   parseDeployment,
   revertNameFromData,
+  sendContract,
+  startAnvil,
 } from "@mida/chain"
-import type { Deployment, LogClient } from "@mida/chain"
+import type { Deployment, LocalNode, LocalWriteContext, LogClient } from "@mida/chain"
+import { FakeVaultAuthority, buildSignedAccessRequest, provisionAgent } from "@mida/fake-vault"
+import type { ProvisionedAgent, VaultContextApi } from "@mida/fake-vault"
 
 const OWNER: Address = "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
 const AGENT: Hex = `0x${"aa".repeat(32)}`
-const OTHER_AGENT: Hex = `0x${"bb".repeat(32)}`
 
 const deployment: Deployment = {
   chainId: 31337n,
@@ -310,107 +317,34 @@ describe("adaptive log scan windows (range-limit fallback)", () => {
   })
 })
 
-describe("owner history (§14.6 PREVIOUSLY_REVOKED)", () => {
-  const log = (owner: string, agentId: string) => ({ args: { owner, agentId }, blockNumber: 9n, transactionHash: null, logIndex: 0 })
+describe("owner history (§14.6 PREVIOUSLY_REVOKED — contract state, never a log scan)", () => {
+  const CAP_A: Hex = `0x${"1".repeat(64)}`
+  const CAP_B: Hex = `0x${"2".repeat(64)}`
 
-  it("starts at deploymentBlock, filters by exactly (owner, agentId), and scans both revocation events", async () => {
-    const { client, calls } = recordingClient(20n, () => [])
-    const history = await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT })
-    expect(history).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: false, observedThroughBlock: 20n })
-    expect(new Set(calls.map((call) => call.event))).toEqual(new Set(["CapabilityRevoked", "AgentRevoked"]))
-    for (const call of calls) {
-      expect(call.fromBlock).toBe(5n)
-      expect(call.args).toEqual({ owner: OWNER, agentId: AGENT })
-    }
-  })
-
-  it("reports a revocation of this exact pair", async () => {
-    const { client } = recordingClient(20n, (call) => (call.event.name === "AgentRevoked" ? [log(OWNER, AGENT.toUpperCase().replace("0X", "0x"))] : []))
-    expect((await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT })).previouslyRevoked).toBe(true)
-  })
-
-  it("a revocation counter above 0 answers in one request, with no log scan at all", async () => {
-    const { client, calls } = recordingClient(20n, () => [])
-    const withView = { ...client, getBlockNumber: client.getBlockNumber.bind(client), getLogs: client.getLogs.bind(client), readContract: async () => 1n }
-    const history = await ownerHistory({ client: withView, deployment, owner: OWNER, agentId: AGENT })
-    expect(history).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: true, observedThroughBlock: 20n })
-    expect(calls).toHaveLength(0)
-  })
-
-  it("a counter of 0 still scans, but only for single-capability revokes", async () => {
-    const { client, calls } = recordingClient(20n, (call) => (call.event.name === "CapabilityRevoked" ? [log(OWNER, AGENT)] : []))
-    // epoch 0 but the agent still holds entries — the never-granted shortcut does not apply
-    const withView = {
-      ...client,
-      getBlockNumber: client.getBlockNumber.bind(client),
-      getLogs: client.getLogs.bind(client),
-      readContract: async (parameters: { functionName: string }) =>
-        parameters.functionName === "activeCapabilityIds" ? [`0x${"1".repeat(64)}`] : 0n,
-    }
-    expect((await ownerHistory({ client: withView, deployment, owner: OWNER, agentId: AGENT })).previouslyRevoked).toBe(true)
-    expect(new Set(calls.map((call) => call.event))).toEqual(new Set(["CapabilityRevoked"]))
-  })
-
-  it("a never-granted agent answers with two reads and no log scan — epoch 0 + empty active list (in-15 J-10)", async () => {
-    // Sep 27 live: a fresh agent's approve spent ~928 getLogs requests answering "no revocations"
-    // when the contract could prove it in two reads. _activeByAgent gains entries only at grant
-    // and loses its last one only inside the epoch-bumping revoke, so empty + epoch 0 means the
-    // agent was never granted — and a never-granted agent can have no revoke events at all.
-    const { client, calls } = recordingClient(20n, () => [])
-    const reads: string[] = []
-    const neverGranted = {
-      ...client,
-      getBlockNumber: client.getBlockNumber.bind(client),
-      getLogs: client.getLogs.bind(client),
-      readContract: async (parameters: { functionName: string }) => {
-        reads.push(parameters.functionName)
-        return parameters.functionName === "activeCapabilityIds" ? [] : 0n
+  /**
+   * A fake HistoryClient answering the three contract views from an in-memory picture and
+   * recording every read. Its getLogs is a trap — ownerHistory must never call it, so the trap
+   * rejects loudly instead of returning logs.
+   */
+  function historyClient(state: { head?: bigint; epoch?: unknown; ids?: unknown; capability?: (capabilityId: Hex) => unknown }) {
+    const reads: { functionName: string; args: readonly unknown[] }[] = []
+    const client = {
+      getBlockNumber: () => Promise.resolve(state.head ?? 20n),
+      getLogs: () => Promise.reject(new Error("ownerHistory must never call getLogs")),
+      readContract: (parameters: { functionName: string; args: readonly unknown[] }): Promise<unknown> => {
+        reads.push(parameters)
+        if (parameters.functionName === "agentEpoch") return Promise.resolve(state.epoch ?? 0n)
+        if (parameters.functionName === "activeCapabilityIds") {
+          const ids = typeof state.ids === "function" ? (state.ids as () => unknown)() : state.ids
+          return Promise.resolve(ids ?? [])
+        }
+        if (parameters.functionName === "getCapability") return Promise.resolve(state.capability?.(parameters.args[0] as Hex))
+        return Promise.reject(new Error(`unexpected read ${parameters.functionName}`))
       },
     }
-    const history = await ownerHistory({ client: neverGranted, deployment, owner: OWNER, agentId: AGENT })
-    expect(history).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: false, observedThroughBlock: 20n })
-    expect(calls).toHaveLength(0)
-    expect(reads).toEqual(["agentEpoch", "activeCapabilityIds"])
-  })
+    return { client, reads }
+  }
 
-  it("a non-empty active list still scans for single-capability revokes", async () => {
-    const { client, calls } = recordingClient(20n, (call) => (call.event.name === "CapabilityRevoked" ? [log(OWNER, AGENT)] : []))
-    const withView = {
-      ...client,
-      getBlockNumber: client.getBlockNumber.bind(client),
-      getLogs: client.getLogs.bind(client),
-      readContract: async (parameters: { functionName: string }) =>
-        parameters.functionName === "activeCapabilityIds" ? [`0x${"1".repeat(64)}`] : 0n,
-    }
-    expect((await ownerHistory({ client: withView, deployment, owner: OWNER, agentId: AGENT })).previouslyRevoked).toBe(true)
-    expect(new Set(calls.map((call) => call.event))).toEqual(new Set(["CapabilityRevoked"]))
-  })
-
-  it("a counter read that fails, or returns nonsense, fails the whole check — never 'not revoked'", async () => {
-    const { client } = recordingClient(20n, () => [])
-    const base = { ...client, getBlockNumber: client.getBlockNumber.bind(client), getLogs: client.getLogs.bind(client) }
-    await expect(ownerHistory({ client: { ...base, readContract: async () => { throw new Error("rpc down") } }, deployment, owner: OWNER, agentId: AGENT })).rejects.toThrow("rpc down")
-    await expect(ownerHistory({ client: { ...base, readContract: async () => "1" }, deployment, owner: OWNER, agentId: AGENT })).rejects.toThrow()
-  })
-
-  it("ignores revocations of another agent or by another owner even if a provider returns them", async () => {
-    const { client } = recordingClient(20n, () => [
-      log(OWNER, OTHER_AGENT),
-      log("0xb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2", AGENT),
-    ])
-    expect((await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT })).previouslyRevoked).toBe(false)
-  })
-})
-
-describe("the history scan cursor (R4-9)", () => {
-  const zeroCounter = (client: LogClient) => ({
-    ...client,
-    getBlockNumber: client.getBlockNumber.bind(client),
-    getLogs: client.getLogs.bind(client),
-    // epoch 0 with a non-empty active list — the cursor tests exercise the scan path
-    readContract: async (parameters: { functionName: string }) =>
-      parameters.functionName === "activeCapabilityIds" ? [`0x${"1".repeat(64)}`] : 0n,
-  })
   /** An in-memory cursor standing in for the CLI's state/history/<agentId>.json file. */
   const memoryCursor = (saved: { observedThroughBlock: bigint; previouslyRevoked: boolean } | undefined) => {
     const writes: { observedThroughBlock: bigint; previouslyRevoked: boolean }[] = []
@@ -425,88 +359,234 @@ describe("the history scan cursor (R4-9)", () => {
     }
   }
 
-  it("a saved previouslyRevoked answers with no log scan at all", async () => {
-    const { client, calls } = recordingClient(20n, () => [])
-    const { cursor } = memoryCursor({ observedThroughBlock: 10n, previouslyRevoked: true })
-    const history = await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })
-    expect(history.previouslyRevoked).toBe(true)
-    expect(history.observedThroughBlock).toBe(20n)
-    expect(calls).toHaveLength(0)
+  it("a live grant, epoch 0 and nothing revoked answers false — and getLogs is never called", async () => {
+    const { client, reads } = historyClient({ ids: [CAP_A], capability: () => ({ owner: OWNER, agentId: AGENT, revoked: false }) })
+    await expect(ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT })).resolves.toEqual({
+      owner: OWNER,
+      agentId: AGENT,
+      previouslyRevoked: false,
+      observedThroughBlock: 20n,
+    })
+    // the pair-scoped reads ask for exactly (owner, agentId); each capability read asks for a listed id
+    expect(reads.map((read) => [read.functionName, ...read.args])).toEqual([
+      ["agentEpoch", OWNER, AGENT],
+      ["activeCapabilityIds", OWNER, AGENT],
+      ["getCapability", CAP_A],
+    ])
   })
 
-  it("a cursor at the head scans nothing", async () => {
-    const { client, calls } = recordingClient(20n, () => [])
-    const { cursor } = memoryCursor({ observedThroughBlock: 20n, previouslyRevoked: false })
-    const history = await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })
-    expect(history.previouslyRevoked).toBe(false)
-    expect(calls).toHaveLength(0)
-  })
-
-  it("a cursor AHEAD of the head is impossible — it is ignored, scanned over in full, and overwritten (R5-7)", async () => {
-    // head+1 with a real CapabilityRevoked in the range: an honest file could never have observed it
-    const { client, calls } = recordingClient(20n, (call) =>
-      call.event.name === "CapabilityRevoked" ? [{ args: { owner: OWNER, agentId: AGENT }, blockNumber: 9n, transactionHash: null, logIndex: 0 }] : [],
-    )
-    const { cursor, writes } = memoryCursor({ observedThroughBlock: 21n, previouslyRevoked: false })
-    const history = await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })
-    expect(history.previouslyRevoked).toBe(true)
-    expect(history.observedThroughBlock).toBe(20n)
-    // the scan ran the full range from deploymentBlock, not the fake position — and the file was rewritten
-    expect(calls.length).toBeGreaterThan(0)
-    expect(Math.min(...calls.map((call) => Number(call.fromBlock)))).toBe(5)
-    expect(writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: true }])
-  })
-
-  it("an ahead-of-head cursor that claims a revoke is still not trusted — the scan decides", async () => {
-    const { client, calls } = recordingClient(20n, () => [])
-    const { cursor, writes } = memoryCursor({ observedThroughBlock: 500n, previouslyRevoked: true })
-    const history = await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })
-    // no events on this chain — the file's claimed revoke was wrong-chain or tampered
-    expect(history.previouslyRevoked).toBe(false)
-    expect(calls.length).toBeGreaterThan(0)
-    expect(writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: false }])
-  })
-
-  it("a cursor behind the head scans only the new range and then saves the new position", async () => {
-    const { client, calls } = recordingClient(250n, () => [])
-    const { cursor, writes } = memoryCursor({ observedThroughBlock: 100n, previouslyRevoked: false })
-    const scans: number[] = []
-    const history = await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor, onScan: (n) => scans.push(n) })
-    expect(history).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: false, observedThroughBlock: 250n })
-    // the scan resumes one block after the cursor — never rescans what was already observed
-    expect(calls.length).toBeGreaterThan(0)
-    expect(Math.min(...calls.map((call) => Number(call.fromBlock)))).toBe(101)
-    expect(writes).toEqual([{ observedThroughBlock: 250n, previouslyRevoked: false }])
-    // the progress line gets the window count before the requests start
-    expect(scans).toEqual([blockWindows(101n, 250n).length])
-  })
-
-  it("a found revocation is saved sticky — previouslyRevoked: true", async () => {
-    const { client } = recordingClient(20n, (call) =>
-      call.event.name === "CapabilityRevoked" ? [{ args: { owner: OWNER, agentId: AGENT }, blockNumber: 9n, transactionHash: null, logIndex: 0 }] : [],
-    )
-    const { cursor, writes } = memoryCursor(undefined)
-    await ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor })
-    expect(writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: true }])
-  })
-
-  it("a scan that fails saves no cursor — a partial position would hide a missed revoke", async () => {
-    const { client, calls } = recordingClient(250n, (call) => {
-      if (call.fromBlock === 105n) throw new Error("window down")
-      return []
+  it("a single-capability revoke still listed answers true — the record's revoked flag, no scan", async () => {
+    const { client } = historyClient({
+      ids: [CAP_A, CAP_B],
+      capability: (capabilityId) => ({ owner: OWNER, agentId: AGENT, revoked: capabilityId === CAP_B }),
     })
     const { cursor, writes } = memoryCursor(undefined)
-    await expect(ownerHistory({ client: zeroCounter(client), deployment, owner: OWNER, agentId: AGENT, cursor, maxRange: 100n })).rejects.toThrow("window down")
-    expect(calls.length).toBeGreaterThan(0)
-    expect(writes).toHaveLength(0)
-  }, 15_000)
-
-  it("the contract's own answer wins over any cursor — the cursor is consulted only after the counter read", async () => {
-    const { client, calls } = recordingClient(20n, () => [])
-    const withView = { ...zeroCounter(client), readContract: async () => 3n }
-    const { cursor } = memoryCursor({ observedThroughBlock: 10n, previouslyRevoked: false })
-    const history = await ownerHistory({ client: withView, deployment, owner: OWNER, agentId: AGENT, cursor })
+    const history = await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, cursor })
     expect(history.previouslyRevoked).toBe(true)
-    expect(calls).toHaveLength(0)
+    // the machine keeps the yes — the later grant that compacts the revoked id away must not lose it
+    expect(writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: true }])
   })
+
+  it("KNOWN LIMIT: a single revoke compacted out of the list by a later grant is only seen through this machine's saved yes", async () => {
+    // revoke(cap) leaves the id listed with revoked = true — the check sees it and saves the yes.
+    // The next grant's _storeCapability compacts the list, so afterwards nothing in contract
+    // state still carries the revoke; a machine that never saved the yes cannot see it.
+    let ids: Hex[] = [CAP_A]
+    const { client } = historyClient({
+      ids: () => ids,
+      capability: (capabilityId) => ({ owner: OWNER, agentId: AGENT, revoked: capabilityId === CAP_A }),
+    })
+    const saved: { observedThroughBlock: bigint; previouslyRevoked: boolean }[] = []
+    const cursor = {
+      load: () => saved[saved.length - 1],
+      save: (state: { observedThroughBlock: bigint; previouslyRevoked: boolean }) => void saved.push(state),
+    }
+    await expect(ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, toBlock: 30n, cursor })).resolves.toMatchObject({ previouslyRevoked: true })
+    ids = [CAP_B] // the new grant's _compact removed the revoked id; only the fresh id remains
+    await expect(ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, toBlock: 31n, cursor })).resolves.toMatchObject({ previouslyRevoked: true })
+    await expect(ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, toBlock: 31n })).resolves.toMatchObject({ previouslyRevoked: false })
+  })
+
+  it("a failed getCapability read rejects — a read that cannot answer never counts as 'not revoked'", async () => {
+    const { client } = historyClient({
+      ids: [CAP_A, CAP_B],
+      capability: (capabilityId) => (capabilityId === CAP_B ? Promise.reject(new Error("rpc down")) : { revoked: false }),
+    })
+    const { cursor, writes } = memoryCursor(undefined)
+    await expect(ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, cursor })).rejects.toThrow("rpc down")
+    // a failed check writes nothing — a half-answer must not be remembered
+    expect(writes).toHaveLength(0)
+  })
+
+  it("a getCapability answer that is not a record with a boolean revoked flag rejects", async () => {
+    for (const answer of [{ revoked: "yes" }, { owner: OWNER }, null, "capability", 7]) {
+      const { client } = historyClient({ ids: [CAP_A], capability: () => answer })
+      await expect(ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT })).rejects.toThrow()
+    }
+  })
+
+  it("a whole-agent revoke counter above 0 answers true after exactly one contract read", async () => {
+    const { client, reads } = historyClient({ epoch: 3n })
+    await expect(ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT })).resolves.toEqual({
+      owner: OWNER,
+      agentId: AGENT,
+      previouslyRevoked: true,
+      observedThroughBlock: 20n,
+    })
+    expect(reads.map((read) => [read.functionName, ...read.args])).toEqual([["agentEpoch", OWNER, AGENT]])
+  })
+
+  it("a never-granted agent answers false after two reads — epoch 0 and an empty active list (in-15 J-10)", async () => {
+    // _activeByAgent gains entries only at grant and loses its last one only inside the
+    // epoch-bumping revoke, so empty + epoch 0 means the agent was never granted — and a
+    // never-granted agent has nothing that could have been revoked.
+    const { client, reads } = historyClient({ ids: [] })
+    const history = await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT })
+    expect(history).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: false, observedThroughBlock: 20n })
+    expect(reads.map((read) => read.functionName)).toEqual(["agentEpoch", "activeCapabilityIds"])
+  })
+
+  it("an epoch or list read that fails — or answers nonsense — fails the check, never 'not revoked'", async () => {
+    for (const broken of [
+      { epoch: Promise.reject(new Error("rpc down")) },
+      { epoch: "7" },
+      { ids: "not a list" },
+      { ids: Promise.reject(new Error("rpc down")) },
+    ]) {
+      const { client } = historyClient(broken)
+      await expect(ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT })).rejects.toThrow()
+    }
+  })
+
+  it("a cursor ahead of the head is impossible — its block is not trusted, but a saved yes is never erased (R5-7)", async () => {
+    const { client } = historyClient({ ids: [CAP_A], capability: () => ({ owner: OWNER, agentId: AGENT, revoked: false }) })
+    // a saved NO from ahead of the head has no effect — the contract's own reads answer
+    const noCursor = memoryCursor({ observedThroughBlock: 500n, previouslyRevoked: false })
+    const history = await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, cursor: noCursor.cursor })
+    expect(history).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: false, observedThroughBlock: 20n })
+    expect(noCursor.writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: false }])
+    // a saved YES from ahead of the head still answers — nothing on the chain un-revokes, and a
+    // lagging answer must not erase the one record of a compacted-away revoke
+    const yesCursor = memoryCursor({ observedThroughBlock: 500n, previouslyRevoked: true })
+    const kept = await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, cursor: yesCursor.cursor })
+    expect(kept).toEqual({ owner: OWNER, agentId: AGENT, previouslyRevoked: true, observedThroughBlock: 20n })
+    expect(yesCursor.writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: true }])
+  })
+
+  it("a cursor exactly AT the head is used — a saved yes there answers true", async () => {
+    const { client } = historyClient({ ids: [CAP_A], capability: () => ({ owner: OWNER, agentId: AGENT, revoked: false }) })
+    const { cursor, writes } = memoryCursor({ observedThroughBlock: 20n, previouslyRevoked: true })
+    const history = await ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, cursor })
+    expect(history).toMatchObject({ previouslyRevoked: true, observedThroughBlock: 20n })
+    expect(writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: true }])
+  })
+
+  it("the contract's answer wins over a saved no — a revoked record beats a cursor that says false", async () => {
+    const { client } = historyClient({ ids: [CAP_A], capability: () => ({ owner: OWNER, agentId: AGENT, revoked: true }) })
+    const { cursor, writes } = memoryCursor({ observedThroughBlock: 20n, previouslyRevoked: false })
+    await expect(ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, cursor })).resolves.toMatchObject({ previouslyRevoked: true })
+    expect(writes).toEqual([{ observedThroughBlock: 20n, previouslyRevoked: true }])
+  })
+
+  it("a whole-agent revoke answers true even over a saved no — the counter beats the cursor", async () => {
+    const { client } = historyClient({ epoch: 2n })
+    const { cursor } = memoryCursor({ observedThroughBlock: 10n, previouslyRevoked: false })
+    await expect(ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT, cursor })).resolves.toMatchObject({ previouslyRevoked: true })
+  })
+
+  it("12 listed ids are read with at most 8 in flight at once", async () => {
+    let inFlight = 0
+    let peak = 0
+    const ids = Array.from({ length: 12 }, (_, i) => `0x${(i + 1).toString(16).padStart(64, "0")}` as Hex)
+    const { client, reads } = historyClient({
+      ids,
+      capability: async () => {
+        inFlight += 1
+        peak = Math.max(peak, inFlight)
+        await Promise.resolve()
+        inFlight -= 1
+        return { revoked: false }
+      },
+    })
+    await expect(ownerHistory({ client, deployment, owner: OWNER, agentId: AGENT })).resolves.toMatchObject({ previouslyRevoked: false })
+    expect(reads.filter((read) => read.functionName === "getCapability")).toHaveLength(12)
+    expect(peak).toBeGreaterThan(1)
+    expect(peak).toBeLessThanOrEqual(8)
+  })
+})
+
+/**
+ * UF-M2.2 — the same check, but on the deployed contracts instead of a hand-written client:
+ * a live grant answers false, `revoke(capabilityId)` flips the listed-record answer to true,
+ * and `revokeAgentAndRotate` flips the counter answer to true. The grants go through the real
+ * Vault approval so the request, signature and grant digest are the shipped ones.
+ */
+describe("owner history on the real contracts (local anvil, real viem client)", () => {
+  const SEED = new Uint8Array(32).fill(0x42)
+  const P256_KEY: Hex = `0x${"4d".repeat(32)}`
+  const CAREER = namespaceId("goals.career")
+  const api: VaultContextApi = {
+    putObject: async () => {},
+    publishEpochWrap: async () => {},
+    requestRevocationDeny: async () => ({ intentId: `0x${"00".repeat(32)}`, cancellationNonce: "1" }),
+    cancelRevocation: async () => ({}),
+  }
+  let node: LocalNode
+  let deployed: Deployment
+  let owner: LocalWriteContext
+  let vault: FakeVaultAuthority
+  let agentA: ProvisionedAgent
+  let agentB: ProvisionedAgent
+
+  const history = (agentId: Hex) => ownerHistory({ client: owner.publicClient, deployment: deployed, owner: vault.owner, agentId })
+
+  const grantCareer = async (agent: ProvisionedAgent): Promise<Hex> => {
+    const request = await buildSignedAccessRequest({ chain: owner, agent, scopes: [{ namespace: "goals.career", permissions: PERMISSION.CREATE }] })
+    const approval = await vault.approveGrant({
+      accessRequest: request,
+      manifest: agent.manifest,
+      selection: { kind: "custom", scopes: [{ namespaceId: CAREER, permissions: PERMISSION.CREATE, provenancePolicy: 0 }], expiresAt: 0n },
+    })
+    return approval.response.capabilities[0]!.capabilityId
+  }
+
+  beforeAll(async () => {
+    node = await startAnvil()
+    deployed = await deployLocal({ rpcUrl: node.rpcUrl })
+    owner = createWriteContext({ rpcUrl: node.rpcUrl, deployment: deployed, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[1]!) })
+    vault = new FakeVaultAuthority({ seed: SEED, p256PrivateKey: P256_KEY, chain: owner, api })
+    await vault.registerOwnerKey()
+    const operatorA = createWriteContext({ rpcUrl: node.rpcUrl, deployment: deployed, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[2]!) })
+    const operatorB = createWriteContext({ rpcUrl: node.rpcUrl, deployment: deployed, account: privateKeyToAccount(ANVIL_PRIVATE_KEYS[3]!) })
+    const declarations = [{ namespace: "goals.career", permissions: ["CREATE" as const] }]
+    agentA = await provisionAgent({ operator: operatorA, name: "CareerAI", purposeId: "career_coaching", declarations, callbackOrigin: "https://career.example" })
+    agentB = await provisionAgent({ operator: operatorB, name: "Bystander", purposeId: "career_coaching", declarations, callbackOrigin: "https://bystander.example" })
+  }, 600_000)
+
+  afterAll(async () => {
+    await node?.stop()
+  })
+
+  it("a live grant is false; revoke(capabilityId) is true from the still-listed record; revokeAgentAndRotate is true from the counter", async () => {
+    // CREATE only — the grant needs no read epoch — so the vault's own ownerHistory ran first
+    // inside approveGrant and saw false; the direct read agrees.
+    const capabilityId = await grantCareer(agentA)
+    await expect(history(agentA.agentId)).resolves.toMatchObject({ previouslyRevoked: false })
+    await sendContract(
+      owner,
+      { address: deployed.capabilityRegistry, abi: capabilityRegistryAbi, functionName: "revoke", args: [capabilityId] },
+      "revoke.capability",
+    )
+    await expect(history(agentA.agentId)).resolves.toMatchObject({ previouslyRevoked: true })
+
+    // second agent: revokeAgentAndRotate empties the list — only the epoch counter can still say yes
+    await grantCareer(agentB)
+    await expect(history(agentB.agentId)).resolves.toMatchObject({ previouslyRevoked: false })
+    await sendContract(
+      owner,
+      { address: deployed.capabilityRegistry, abi: capabilityRegistryAbi, functionName: "revokeAgentAndRotate", args: [agentB.agentId, []] },
+      "revoke.agent",
+    )
+    await expect(history(agentB.agentId)).resolves.toMatchObject({ previouslyRevoked: true })
+  }, 600_000)
 })

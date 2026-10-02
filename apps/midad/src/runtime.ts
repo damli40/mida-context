@@ -10,6 +10,7 @@ import type { ChainContext, Deployment, LocalWriteContext, ReadScope, SendCost, 
 import { ContextApiClient, RegistryReader } from "@mida/api"
 import { FakeVaultAuthority } from "@mida/fake-vault"
 import { MidaAgent } from "@mida/sdk"
+import type { EpochKeyCache } from "@mida/sdk"
 import type { MidaHome } from "./home.js"
 import { callDaemon } from "./control.js"
 import { daemonWarning } from "./log.js"
@@ -436,6 +437,7 @@ function buildAgent(
   identity: AgentIdentity,
   progress?: (line: string) => void,
   reads?: ReadScope,
+  epochKeys?: EpochKeyCache,
 ): MidaAgent {
   const signer = privateKeyToAccount(identity.signerPrivateKey)
   const chain = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: signer })
@@ -457,6 +459,7 @@ function buildAgent(
     api: apiClient(apiBaseUrl, network.deployment, signer, reads?.tokens, home),
     requests: new FileAccessRequestStore(home, identity.name),
     grants: loadGrants(home, identity.name),
+    ...(epochKeys === undefined ? {} : { epochKeyCache: epochKeys }),
   })
 }
 
@@ -534,6 +537,13 @@ export class ServiceRuntime {
    * read-only chain call in the operation is one wire request (in-9 R-5).
    */
   #reads?: ReadScope
+  /**
+   * CHAIN-04: opened epoch keys, kept for this runtime's life and shared with every agent it
+   * builds and every read scope it hands out — agents are rebuilt per call (so grants and revokes
+   * are always fresh), but a past epoch's key never changes. Measured on testnet Oct 1: the two
+   * wrap fetches were ~2 s of a ~5-6 s handoff read, every read. Memory only, never on disk.
+   */
+  #epochKeys: EpochKeyCache = new Map()
   readonly reader: RegistryReader
   /**
    * One plain line to the owner while a slow step runs — the `mida` command sets it to STDERR;
@@ -634,7 +644,7 @@ export class ServiceRuntime {
   agent(name: string): MidaAgent {
     const identity = loadAgentIdentity(this.home, name)
     if (identity === undefined) throw agentNotSetup(name)
-    return buildAgent(this.home, this.network, this.apiBaseUrl, identity, (line) => this.progress?.(line), this.#reads)
+    return buildAgent(this.home, this.network, this.apiBaseUrl, identity, (line) => this.progress?.(line), this.#reads, this.#epochKeys)
   }
 
   /**
@@ -661,6 +671,7 @@ export class ServiceRuntime {
       async () => {},
     )
     scoped.#reads = scope
+    scoped.#epochKeys = this.#epochKeys // the scoped facade shares the real runtime's keys
     scoped.progress = this.progress
     return scoped
   }
@@ -719,11 +730,11 @@ export class Runtime extends ServiceRuntime {
         throw Object.assign(new Error("no owner key on this machine — export needs the local software owner key"), { code: "no-owner-key" })
       }
       const ownerAccount = privateKeyToAccount(secrets.privateKey)
-      // An owner has no history before it existed. On a live chain the contract may have been deployed hundreds of
-      // thousands of blocks ago, and ownerHistory would scan all of it on every approveGrant.
+      // An owner has no context before it existed. On a live chain the contract may have been deployed hundreds of
+      // thousands of blocks ago, and the owner's own context scans would walk all of it.
       // The first open on this chain therefore records a start block and only the owner's own context scans from
       // it. The head-minus-margin shortcut is valid only for a brand-new owner: if this owner already sent any
-      // transaction on this chain, its history could reach back to deploymentBlock, so that is the start.
+      // transaction on this chain, its records could reach back to deploymentBlock, so that is the start.
       const probe = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: ownerAccount })
       const head = await probe.publicClient.getBlockNumber()
       let ownerStartBlock = loadOwnerStartBlock(home, network.deployment.chainId, {

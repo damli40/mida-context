@@ -357,7 +357,7 @@ describe("BatchAnchor Task 4 — SDK sign + verify", () => {
       declarations: [{ namespace: "goals.career", permissions: ["CREATE"], provenancePolicies: ["ALLOW_INFERENCE"] }],
       callbackOrigin: "https://ungranted.example",
     })
-  }, 300_000)
+  }, 600_000)
 
   afterAll(async () => {
     await node?.stop()

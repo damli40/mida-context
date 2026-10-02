@@ -4,7 +4,8 @@
 //      median over 8,000 ms is a RED check, and the run must stop there.
 //   F2 approve time against chain age — needs the testnet: skipped
 //   F3 worst-case input budgets: 2,500 progress entries render < 60 ms;
-//      8 MB of `{` parses < 1 s; a 100 MB transcript tail read < 131 KB
+//      8 MB of `{` parses < 1 s; a 100 MB transcript reads in < 1 s with < 64 MB extra peak
+//      memory and still finds a message typed in its middle (CAP-27)
 // F1 goes through the real chain and the real buildHandoff; F3 exercises the
 // real render, extractor, and transcript reader in-process.
 
@@ -21,6 +22,9 @@ import {
 } from "../../apps/midad/src/index.js"
 import { benchChain, benchDir, benchHome, sampleCheckpoint, userLine } from "../lib/env.js"
 import { needsTestnet, runGroup, median } from "../lib/checks.js"
+
+/** One assistant transcript line — the bulk of a long session is the agent's own output. */
+const assistantLine = (text: string) => ({ type: "assistant", message: { content: [{ type: "text", text }] } })
 
 const chain = await benchChain()
 const dir = benchDir("f")
@@ -81,7 +85,11 @@ async function f1() {
 
 // F3 — red if any worst-case input escapes its budget: the render must stay
 // linear, the extractor must give up on unclosed JSON fast, and the transcript
-// reader must bound the bytes it touches.
+// reader must stay fast and small on a 100 MB file. CAP-27: the old budget was
+// bytes read (< 131 KB, a tail window), but PROV-09's fix streams the WHOLE file
+// on purpose, so no message the user typed in the unread middle is ever lost.
+// What matters is what that costs: time and peak memory (CAP-16's failure was
+// 438 MB of memory, not bytes) — and that the middle message is really found.
 async function f3() {
   // 2,500 progress entries through the real merge+render path
   const fat = sampleCheckpoint({
@@ -104,47 +112,42 @@ async function f3() {
   const parsed = extractJsonObject(braces)
   const parseMs = performance.now() - t1
 
-  // a 100 MB transcript — count every byte the reader touches
+  // a 100 MB transcript of tool output with three messages the user typed in the UNREAD middle:
+  // ~1 MB past the 64 KiB head window, at ~50 MB, and ~1 MB before the 60 KB tail window — so a
+  // scan that stops early, or reads only part of the middle, misses one and turns F3 red (review)
   const big = join(dir, "f3-big.jsonl")
-  const line = JSON.stringify(userLine("tail marker zzz")) + "\n"
-  writeFileSync(big, line)
+  writeFileSync(big, JSON.stringify(userLine("tail marker zzz")) + "\n")
   const fd = fs.openSync(big, "a")
-  const filler = Buffer.alloc(1024 * 1024, "f")
-  for (let i = 0; i < 99; i += 1) fs.writeSync(fd, filler)
+  const toolOutput = Buffer.from(`${JSON.stringify(assistantLine("f".repeat(1024 * 1024 - 64)))}\n`)
+  const typed = (text: string) => fs.writeSync(fd, Buffer.from(JSON.stringify(userLine(text)) + "\n"))
+  fs.writeSync(fd, toolOutput)
+  typed("early typed marker: rename the module")
+  for (let i = 0; i < 49; i += 1) fs.writeSync(fd, toolOutput)
+  typed("middle typed marker: change the plan")
+  for (let i = 0; i < 48; i += 1) fs.writeSync(fd, toolOutput)
+  typed("late typed marker: ship on friday")
+  fs.writeSync(fd, toolOutput)
   fs.writeSync(fd, Buffer.from(JSON.stringify(userLine("final tail marker")) + "\n"))
   fs.closeSync(fd)
-  let bytesRead = 0
-  let insideReadFile = false
-  const origReadFileSync = fs.readFileSync
-  const origReadSync = fs.readSync
-  // @ts-expect-error deliberate measurement shim around the real reader
-  fs.readFileSync = (...args: Parameters<typeof fs.readFileSync>) => {
-    insideReadFile = true
-    try {
-      const out = origReadFileSync(...args)
-      bytesRead += out.length
-      return out
-    } finally {
-      insideReadFile = false
-    }
-  }
-  // @ts-expect-error deliberate measurement shim around the real reader
-  fs.readSync = (...args: Parameters<typeof fs.readSync>) => {
-    const n = origReadSync(...args)
-    if (!insideReadFile) bytesRead += n
-    return n
-  }
-  try {
-    readConversation(big)
-  } finally {
-    fs.readFileSync = origReadFileSync
-    fs.readSync = origReadSync
-  }
-  const TAIL_LIMIT = 131_072
+  // peak memory (maxRSS is a high-water mark, in KB): what the read adds above everything before it.
+  // A whole-file read (CAP-16: ~4x the file in memory) raises it far past 64 MB and turns this red;
+  // growth that stays under an earlier step's peak is not seen — this guards the big regression only.
+  const peakBeforeKb = process.resourceUsage().maxRSS
+  const t2 = performance.now()
+  const read = readConversation(big)
+  const readMs = performance.now() - t2
+  const extraPeakMb = (process.resourceUsage().maxRSS - peakBeforeKb) / 1024
+  const foundMiddle = ["early typed marker: rename the module", "middle typed marker: change the plan", "late typed marker: ship on friday"].every((m) => read.text.includes(m))
   return {
-    pass: renderMs < 60 && parseMs < 1_000 && parsed === undefined && bytesRead <= TAIL_LIMIT,
-    value: { renderMs: Math.round(renderMs * 100) / 100, parseMs: Math.round(parseMs * 100) / 100, transcriptBytesRead: bytesRead },
-    limit: { renderMs: 60, parseMs: 1_000, transcriptBytes: TAIL_LIMIT },
+    pass: renderMs < 60 && parseMs < 1_000 && parsed === undefined && readMs < 1_000 && extraPeakMb < 64 && foundMiddle,
+    value: {
+      renderMs: Math.round(renderMs * 100) / 100,
+      parseMs: Math.round(parseMs * 100) / 100,
+      transcriptReadMs: Math.round(readMs),
+      transcriptExtraPeakMb: Math.round(extraPeakMb * 10) / 10,
+      foundMiddleTypedMessage: foundMiddle,
+    },
+    limit: { renderMs: 60, parseMs: 1_000, transcriptReadMs: 1_000, transcriptExtraPeakMb: 64, foundMiddleTypedMessage: true },
   }
 }
 

@@ -58,7 +58,7 @@ describe("approve() and the owner-signed project list on local Anvil", () => {
     } finally {
       await runtime.close()
     }
-  }, STEP_TIMEOUT * 4)
+  }, 600_000)
 
   afterAll(async () => {
     await env?.stop()

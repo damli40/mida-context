@@ -578,13 +578,13 @@ export async function prepareGrant(
     throw new MidaError("INVALID_WIRE", "access request targets a different chain or registry than this authority")
   }
   // The request's own expiry window is checked before the agent-record and owner-history reads —
-  // an expired request refuses here on one getBlock, never after a getLogs scan (in-15 J-2's
+  // an expired request refuses here on one getBlock, never after those reads (in-15 J-2's
   // order, applied on the passkey page too — in-16 K-6). It runs on EVERY call, reused advice or
   // not: the send's window is checked against the chain clock immediately before minting.
   const now = await latestTimestamp(ctx)
   assertRequestFresh(accessRequest, now)
   // The second and third preparations of one approval reuse the first call's advice — the
-  // ownerHistory log scan from the deployment block is the expensive part, and its answer is
+  // ownerHistory contract reads are the expensive part, and its answer is
   // already on the page the owner saw (in-25 P-8). Only the request window, the final-selection
   // check and the grantNonce read stay per-call.
   const advice =

@@ -4,7 +4,7 @@ import type { Address, Hex, ObjectManifest } from "@mida/protocol"
 import { hexOf, sealContextObject, wrapEpochPrivateKeyToAgent, x25519PublicKey } from "@mida/crypto"
 import { randomBytes } from "@noble/hashes/utils.js"
 import { zeroHash } from "viem"
-import { MidaAgent } from "@mida/sdk"
+import { EPOCH_KEY_CACHE_MAX, MidaAgent } from "@mida/sdk"
 
 /**
  * R4-2 — `read` overlaps its per-object work with a bounded concurrency of 6: the output order
@@ -35,10 +35,18 @@ interface Fixture {
   /** in-flight overlap on the per-object work that is still per-object after in-35 R-1: the epoch-key fetch */
   wrapInFlight: { max: number }
   wrapCalls: bigint[]
+  /** CHAIN-04 tests: the next N wrap fetches fail */
+  failWraps: number
   tamper?: (record: Record<string, unknown>, contextId: Hex) => Record<string, unknown>
 }
 
-function fixture(count = 12, delayMs = 12, epochs = 2): Fixture {
+function fixture(
+  count = 12,
+  delayMs = 12,
+  epochs = 2,
+  epochKeyCache?: Map<string, Uint8Array>,
+  options?: { agentId?: Hex; stallWraps?: boolean; corrupt?: number },
+): Fixture {
   const deployment = {
     chainId: CHAIN_ID,
     capabilityRegistry: CAPABILITY_REGISTRY,
@@ -50,6 +58,7 @@ function fixture(count = 12, delayMs = 12, epochs = 2): Fixture {
     objects: [],
     wrapInFlight: { max: 0 },
     wrapCalls: [],
+    failWraps: 0,
   }
   const records = new Map<string, Record<string, unknown>>()
   // The wire shape (AnchoredObject): the manifest is the parsed object and the ciphertext is
@@ -85,6 +94,13 @@ function fixture(count = 12, delayMs = 12, epochs = 2): Fixture {
       provenanceSource: 0,
     })
     fx.objects.push({ contextId, value })
+  }
+  // UF-J: flip the last byte of one object's ciphertext only — the manifest and chain record
+  // stay consistent, so verification passes and the bytes fail inside openContextObject, the
+  // "damaged save" case that must not cost the shared cache its key.
+  if (options?.corrupt !== undefined) {
+    const target = objects[options.corrupt]!
+    target.ciphertext = (target.ciphertext.endsWith("00") ? `${target.ciphertext.slice(0, -2)}ff` : `${target.ciphertext.slice(0, -2)}00`) as Hex
   }
   // One record lookup both chain doors share: the batched multicall answers listed records and
   // a lone readContract.getRecord serves anything else — the tamper hook sees either.
@@ -125,8 +141,13 @@ function fixture(count = 12, delayMs = 12, epochs = 2): Fixture {
   const api = {
     account: { address: `0x${"55".repeat(20)}` as Address },
     listObjects: async () => ({ objects, partial: false }),
-    getEpochWrap: async (params: { readEpoch: bigint }) => {
+    getEpochWrap: async (params: { readEpoch: bigint; agentId: Hex }) => {
       fx.wrapCalls.push(params.readEpoch)
+      if (fx.failWraps > 0) {
+        fx.failWraps -= 1
+        throw new Error("store unreachable")
+      }
+      if (options?.stallWraps === true) return new Promise(() => {}) as never // a fetch that never answers
       wrapInFlight += 1
       fx.wrapInFlight.max = Math.max(fx.wrapInFlight.max, wrapInFlight)
       try {
@@ -140,7 +161,7 @@ function fixture(count = 12, delayMs = 12, epochs = 2): Fixture {
             owner: OWNER,
             namespaceId: NAMESPACE_ID,
             readEpoch: params.readEpoch,
-            agentId: AGENT_ID,
+            agentId: params.agentId,
             agentKeyVersion: 1,
           },
           createdAt: 0n,
@@ -151,15 +172,16 @@ function fixture(count = 12, delayMs = 12, epochs = 2): Fixture {
     },
   }
   fx.agent = new MidaAgent({
-    agentId: AGENT_ID,
+    agentId: options?.agentId ?? AGENT_ID,
     callbackOrigin: "https://agent.example",
     encryptionPrivateKey: AGENT_PRIVATE,
     chain: { deployment, account: { address: `0x${"55".repeat(20)}` }, publicClient } as never,
     api: api as never,
+    ...(epochKeyCache === undefined ? {} : { epochKeyCache }),
     grants: [
       {
         owner: OWNER,
-        agentId: AGENT_ID,
+        agentId: options?.agentId ?? AGENT_ID,
         requestId: `0x${"99".repeat(32)}`,
         capabilities: [
           {
@@ -198,6 +220,94 @@ describe("MidaAgent.read bounded concurrency (R4-2)", () => {
     const fx = fixture(12)
     await fx.agent.read(OWNER, NAMESPACE)
     expect(fx.wrapCalls.sort()).toEqual([1n, 2n])
+  })
+
+  // CHAIN-04 (Oct 1): on testnet the two key fetches cost ~2 s of a ~5 s read, every read, for
+  // keys that never change for a past epoch — they are kept beyond one read
+  it("a second read on the same agent fetches no epoch key again (CHAIN-04)", async () => {
+    const fx = fixture(12)
+    await fx.agent.read(OWNER, NAMESPACE)
+    await fx.agent.read(OWNER, NAMESPACE)
+    expect(fx.wrapCalls.sort()).toEqual([1n, 2n])
+  })
+
+  it("a shared epoch-key cache carries keys across agent instances, as the daemon rebuilds agents per read (CHAIN-04)", async () => {
+    const shared = new Map<string, Uint8Array>()
+    const first = fixture(12, 12, 2, shared)
+    await first.agent.read(OWNER, NAMESPACE)
+    const second = fixture(12, 12, 2, shared)
+    const results = await second.agent.read(OWNER, NAMESPACE)
+    expect(second.wrapCalls).toEqual([])
+    expect(results.map((o) => o.payload.value)).toEqual(second.objects.map((o) => o.value))
+  })
+
+  it("a failed epoch-key fetch is never remembered — the next read tries again (CHAIN-04)", async () => {
+    const fx = fixture(4, 1, 1)
+    fx.failWraps = 1
+    await expect(fx.agent.read(OWNER, NAMESPACE)).rejects.toThrow()
+    const results = await fx.agent.read(OWNER, NAMESPACE)
+    expect(results).toHaveLength(4)
+  })
+
+  // CHAIN-04 follow-up (Oct 1): the shared cache used to hold in-flight PROMISES, so one stalled
+  // wrap fetch pinned every later read on the same dead promise — before the cache was shared,
+  // only the one read suffered.
+  it("one stalled wrap fetch never slows a later read on the same shared cache", async () => {
+    const shared = new Map<string, Uint8Array>()
+    const stalled = fixture(4, 1, 1, shared, { stallWraps: true })
+    const stuck = stalled.agent.read(OWNER, NAMESPACE)
+    void stuck.catch(() => {}) // this read never settles — it is left running on purpose
+    for (let i = 0; i < 500 && stalled.wrapCalls.length === 0; i++) await sleep(10)
+    expect(stalled.wrapCalls.length).toBeGreaterThan(0) // the stall is really inside the fetch
+
+    const second = fixture(4, 1, 1, shared)
+    const results = await second.agent.read(OWNER, NAMESPACE)
+    expect(results.map((o) => o.payload.value)).toEqual(second.objects.map((o) => o.value))
+    expect(shared.size).toBe(1) // the second read's opened key joined the cache; the stalled one never did
+  })
+
+  // UF-J: a flipped ciphertext byte fails the object's own check, which says nothing about
+  // the epoch key — evicting it made every later read fetch a key that was never wrong.
+  it("an object that fails to open leaves the key in the shared cache — the next read fetches nothing (UF-J)", async () => {
+    const shared = new Map<string, Uint8Array>()
+    const first = fixture(4, 1, 1, shared, { corrupt: 2 })
+    await expect(first.agent.read(OWNER, NAMESPACE)).rejects.toThrow()
+    expect(shared.size).toBe(1) // the opened key stays cached even though this read failed
+    const second = fixture(4, 1, 1, shared)
+    const results = await second.agent.read(OWNER, NAMESPACE)
+    expect(second.wrapCalls).toEqual([]) // a fresh agent on the same cache reuses the key
+    expect(results.map((o) => o.payload.value)).toEqual(second.objects.map((o) => o.value))
+  })
+
+  it("a failed fetch stores nothing in the shared cache — the next read fetches again and succeeds", async () => {
+    const shared = new Map<string, Uint8Array>()
+    const fx = fixture(4, 1, 1, shared)
+    fx.failWraps = 1
+    await expect(fx.agent.read(OWNER, NAMESPACE)).rejects.toThrow()
+    expect(shared.size).toBe(0) // would be 1 if failures were stored, even as a rejected promise
+    const results = await fx.agent.read(OWNER, NAMESPACE)
+    expect(results).toHaveLength(4)
+    expect(shared.size).toBe(1)
+  })
+
+  it("two agents with different ids on one shared cache each fetch their own key", async () => {
+    const shared = new Map<string, Uint8Array>()
+    const first = fixture(4, 1, 1, shared)
+    const second = fixture(4, 1, 1, shared, { agentId: `0x${"bb".repeat(32)}` as Hex })
+    await first.agent.read(OWNER, NAMESPACE)
+    await second.agent.read(OWNER, NAMESPACE)
+    expect(first.wrapCalls).toEqual([1n])
+    expect(second.wrapCalls).toEqual([1n]) // the second agent did not open with the first's entry
+    expect(shared.size).toBe(2)
+  })
+
+  it("the shared cache evicts the oldest opened key once it holds EPOCH_KEY_CACHE_MAX", async () => {
+    const shared = new Map<string, Uint8Array>()
+    for (let i = 0; i < EPOCH_KEY_CACHE_MAX; i += 1) shared.set(`dummy-${i}`, new Uint8Array(32))
+    const fx = fixture(4, 1, 1, shared)
+    await fx.agent.read(OWNER, NAMESPACE)
+    expect(shared.size).toBe(EPOCH_KEY_CACHE_MAX)
+    expect(shared.has("dummy-0")).toBe(false) // the first-inserted entry went first
   })
 
   it("one object failing verification still fails the whole read", async () => {

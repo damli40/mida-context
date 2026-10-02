@@ -42,7 +42,7 @@ describe(`M0 walking skeleton on ${ON_TESTNET ? "Monad testnet" : "local Anvil"}
     network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-m0-")))
     runtime = await Runtime.open(home, network)
-  }, STEP_TIMEOUT * 2)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

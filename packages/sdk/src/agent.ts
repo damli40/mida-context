@@ -61,6 +61,8 @@ export const REQUEST_LIFETIME_SECONDS = 300n
  * bounded — never unbounded — while still overlapping the slow network waits.
  */
 const READ_CONCURRENCY = 6
+/** Bound on kept epoch keys; the oldest goes first. */
+export const EPOCH_KEY_CACHE_MAX = 512
 
 export interface AccessRequestInput {
   purposeId: PurposeId
@@ -199,10 +201,22 @@ export interface SealedRecord {
  */
 export type SentRecord = Omit<ContextObject, "payload">
 
+/**
+ * Opened epoch private keys, kept beyond one read (CHAIN-04). A key for a past read epoch never
+ * changes, so a long-lived process (the daemon rebuilds its agents per call) passes one map to
+ * every agent it builds instead of re-fetching and re-authorizing the same wraps on every read.
+ * Keys are scoped by agent, owner, namespace and epoch. Only keys that opened are held — a
+ * stalled or failed fetch is never stored, so it can never pin every later read on the same
+ * dead promise.
+ */
+export type EpochKeyCache = Map<string, Uint8Array>
+
 export interface MidaAgentConfig {
   agentId: Hex
   callbackOrigin: string
   encryptionPrivateKey: Uint8Array
+  /** Optional shared epoch-key cache (CHAIN-04); without one, this agent keeps its own. */
+  epochKeyCache?: EpochKeyCache
   /** Write context whose account is the agent's current registered signer. */
   chain: LocalWriteContext
   /** Context API client bound to the same signer. */
@@ -246,6 +260,7 @@ export class MidaAgent {
   readonly #encryptionPrivateKey: Uint8Array
   readonly #requests: AccessRequestStore
   readonly #reader: RegistryReader
+  readonly #epochKeys: EpochKeyCache
   readonly #grants: Grant[] = []
 
   constructor(config: MidaAgentConfig) {
@@ -259,6 +274,7 @@ export class MidaAgent {
     this.#encryptionPrivateKey = Uint8Array.from(config.encryptionPrivateKey)
     this.#requests = config.requests ?? new MemoryAccessRequestStore()
     this.#reader = new RegistryReader(config.chain)
+    this.#epochKeys = config.epochKeyCache ?? new Map()
     for (const grant of config.grants ?? []) {
       if (grant.agentId.toLowerCase() !== this.agentId) {
         throw new MidaError("AUTH_INVALID", "a restored grant belongs to a different agent")
@@ -1116,20 +1132,34 @@ export class MidaAgent {
     return capability
   }
 
+  /** The shared-cache key for one epoch key — agent, owner, namespace and epoch. */
+  #epochCacheKey(ownerAddress: Address, namespaceId: Hex, readEpoch: bigint): string {
+    return `${this.agentId}:${ownerAddress.toLowerCase()}:${namespaceId.toLowerCase()}:${readEpoch}`
+  }
+
   /**
    * The epoch-key fetch `readWithStatus` and `readBatchedWithStatus` share. The agent record's key
    * version is needed only to unwrap an epoch key — and only a non-empty list has objects to open,
-   * so an empty read spends no chain call here. Each distinct epoch key is fetched exactly once,
-   * also under concurrency: the map holds the in-flight promise, so workers on the same epoch share
-   * one call.
+   * so an empty read spends no chain call here. Each distinct epoch key is fetched exactly once
+   * per read, also under concurrency: `inFlight` lives for this resolver alone, so workers on the
+   * same epoch share one call. The shared cache holds only keys that opened — a stalled fetch is
+   * never published into it, so one slow store cannot slow every later read behind the same dead
+   * promise, and a failed fetch is never kept.
    */
   #epochKeyResolver(ownerAddress: Address, namespaceId: Hex, capabilityId: Hex): (readEpoch: bigint) => Promise<Uint8Array> {
     const { deployment } = this.#chain
     let agentRecord: Promise<Awaited<ReturnType<typeof readAgentRecord>>> | undefined
     const agent = () => (agentRecord ??= readAgentRecord(this.#chain, this.agentId))
-    const epochKeys = new Map<bigint, Promise<Uint8Array>>()
+    const epochKeys = this.#epochKeys
+    const inFlight = new Map<string, Promise<Uint8Array>>()
     return (readEpoch: bigint): Promise<Uint8Array> => {
-      let pending = epochKeys.get(readEpoch)
+      // the epoch's private key is the same whatever the agent's key version, so the version (a chain
+      // read) is only asked when a key must really be fetched; the capability is not part of the key —
+      // listing the objects is what each read's own authorization still decides (CHAIN-04)
+      const cacheKey = this.#epochCacheKey(ownerAddress, namespaceId, readEpoch)
+      const opened = epochKeys.get(cacheKey)
+      if (opened !== undefined) return Promise.resolve(opened)
+      let pending = inFlight.get(cacheKey)
       if (pending === undefined) {
         pending = agent().then((record) =>
           this.#api
@@ -1157,7 +1187,12 @@ export class MidaAgent {
               }),
             ),
         )
-        epochKeys.set(readEpoch, pending)
+        // only a key that really opened joins the shared cache — a failed fetch is never kept
+        pending.then((key) => {
+          if (epochKeys.size >= EPOCH_KEY_CACHE_MAX) epochKeys.delete(epochKeys.keys().next().value!)
+          epochKeys.set(cacheKey, key)
+        }, () => {})
+        inFlight.set(cacheKey, pending)
       }
       return pending
     }

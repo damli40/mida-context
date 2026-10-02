@@ -1,8 +1,9 @@
 import { spawn, spawnSync } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
-import { mkdirSync, rmdirSync } from "node:fs"
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import { homedir } from "node:os"
+import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import type { Hex } from "@mida/protocol"
 import { loadDeployment } from "./deployment-fs.js"
@@ -92,6 +93,137 @@ export async function startAnvil(options: { hardfork?: string } = {}): Promise<L
 }
 
 /**
+ * Fallback age for a lock with no readable `owner` file: an old-format lock, or a holder killed
+ * between mkdir and writing the owner. A lock whose `owner` pid is running is never left behind,
+ * however old the directory is — a live deploy that is merely slow keeps its lock.
+ */
+const DEPLOY_LOCK_STALE_MS = 5 * 60_000
+
+/** A takeover holds `${lockDir}.steal` for milliseconds; past this its holder was killed mid-steal. */
+const DEPLOY_LOCK_STEAL_STALE_MS = 30_000
+
+/** The pid in `${lockDir}/owner`, or undefined when the file is missing or unreadable. */
+function lockOwnerPid(lockDir: string): number | undefined {
+  try {
+    const pid = Number(readFileSync(join(lockDir, "owner"), "utf8").trim())
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** True while `pid` names a running process; EPERM means it runs but we may not signal it. */
+function pidIsRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
+/**
+ * True when the lock at `lockDir` was left behind: its `owner` file names a pid that is no longer
+ * running, or it has no readable `owner` file and the directory is older than `staleMs`. A lock
+ * whose owner pid is still running is never left behind, however old the directory is — a live
+ * deploy that is merely slow (a sleeping laptop) keeps its lock (UF-K). A leftover naming a pid
+ * since recycled by an unrelated process makes waiters time out; the timeout names the pid and
+ * the folder so a person can remove it.
+ */
+function lockLeftBehind(lockDir: string, staleMs: number): boolean {
+  const owner = lockOwnerPid(lockDir)
+  if (owner !== undefined) return !pidIsRunning(owner)
+  try {
+    return Date.now() - statSync(lockDir).mtimeMs > staleMs
+  } catch {
+    return false // the lock vanished between the failed mkdir and this check
+  }
+}
+
+/**
+ * Takes a directory lock, waiting up to `waitMs`. The holder's pid is written to `owner` inside the
+ * lock directory. A left-behind lock — owner pid gone, or ownerless and older than `staleMs`
+ * (PROC-07: one such leftover made every later test file wait out the full ten minutes behind a
+ * lock nobody held) — is removed and taken; a lock whose owner pid is running is never taken,
+ * however old. Takeover is serialised through a `${lockDir}.steal` mutex directory so several
+ * waiters cannot remove and take the same lock at once, and the lock is re-checked inside the
+ * mutex before it is removed — another waiter may have retaken it meanwhile. `beforeTakeover`
+ * (tests only; deployLocal never passes it) is awaited after the lock is first seen left behind
+ * and before the `.steal` directory is made — it widens that race window deterministically.
+ */
+export async function takeDirLock(
+  lockDir: string,
+  options: { waitMs: number; staleMs: number; beforeTakeover?: () => void | Promise<void> },
+): Promise<void> {
+  const deadline = Date.now() + options.waitMs
+  for (;;) {
+    try {
+      mkdirSync(lockDir)
+      try {
+        writeFileSync(join(lockDir, "owner"), String(process.pid))
+      } catch (error) {
+        rmSync(lockDir, { recursive: true, force: true }) // don't leave an ownerless lock behind
+        throw error
+      }
+      return
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+    }
+    if (lockLeftBehind(lockDir, options.staleMs)) {
+      await options.beforeTakeover?.()
+      const stealDir = `${lockDir}.steal`
+      let stealing = true
+      try {
+        mkdirSync(stealDir)
+      } catch {
+        stealing = false
+        // Another waiter holds `.steal`. It keeps it for milliseconds, so one older than
+        // DEPLOY_LOCK_STEAL_STALE_MS was left behind by a killed stealer — remove it and loop.
+        try {
+          if (Date.now() - statSync(stealDir).mtimeMs > DEPLOY_LOCK_STEAL_STALE_MS)
+            rmSync(stealDir, { recursive: true, force: true })
+        } catch {
+          // raced: the stealer finished, or another waiter removed it first
+        }
+      }
+      if (stealing) {
+        try {
+          // Re-check under the mutex: another process may have retaken the lock meanwhile.
+          if (lockLeftBehind(lockDir, options.staleMs)) rmSync(lockDir, { recursive: true, force: true })
+        } finally {
+          rmSync(stealDir, { recursive: true, force: true })
+        }
+        // UF-K: straight back to the take. A waiter whose own wait ran out must not remove the
+        // lock and then throw "held" — it would leave the freed lock to the next waiter while
+        // reporting failure itself.
+        continue
+      }
+    }
+    if (Date.now() > deadline) {
+      const owner = lockOwnerPid(lockDir)
+      throw new Error(
+        `waited ${options.waitMs / 1000}s for deploy lock ${lockDir}${owner === undefined ? "" : `, now held by pid ${owner}`}. If no test run is active, delete that folder.`,
+      )
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+}
+
+/**
+ * Releases the lock at `lockDir` when this process owns it. Does nothing — and never throws — when
+ * the lock is already gone or belongs to another process, so a deploy whose lock was taken over
+ * cannot remove the new holder's lock from its `finally`.
+ */
+export function releaseDirLock(lockDir: string): void {
+  if (lockOwnerPid(lockDir) !== process.pid) return
+  try {
+    rmSync(lockDir, { recursive: true, force: true })
+  } catch {
+    // already gone — nothing to release
+  }
+}
+
+/**
  * Deploys with contracts/script/Deploy.s.sol, then DeployBatchAnchor.s.sol beside it, and returns the
  * parsed deployment file (batchAnchor + batchAnchorBlock set). Every local Anvil writes the same
  * deployments/31337.json, so deployments from parallel test files are serialized with a directory lock.
@@ -100,19 +232,11 @@ export async function deployLocal(options: { rpcUrl: string; privateKey?: Hex })
   const privateKey = options.privateKey ?? ANVIL_PRIVATE_KEYS[0]!
   const lockDir = `${CONTRACTS_DIR()}deployments/.deploy-lock`
   // The wait must outlast the full-suite queue: every test file that deploys serializes here
-  // (two forge runs each), and a wave of waiters easily stacks past two minutes. The deadline
-  // still bounds a genuinely stuck lock — it just stops firing on normal queue depth.
-  const lockWaitMs = 600_000
-  const deadline = Date.now() + lockWaitMs
-  for (;;) {
-    try {
-      mkdirSync(lockDir)
-      break
-    } catch {
-      if (Date.now() > deadline) throw new Error(`deploy lock ${lockDir} held for ${lockWaitMs / 1000}s`)
-      await new Promise((resolve) => setTimeout(resolve, 200))
-    }
-  }
+  // (two forge runs each), and a wave of waiters easily stacks past two minutes. It ends at
+  // 540 s — inside the 600 s hook timeout whose clock started first — so a genuinely stuck lock
+  // reports its own message instead of surfacing as "Hook timed out in 600000ms". A lock whose
+  // owner pid is running is never taken over, however long it has been held.
+  await takeDirLock(lockDir, { waitMs: 540_000, staleMs: DEPLOY_LOCK_STALE_MS })
   try {
     const result = spawnSync(
       `${FOUNDRY_BIN}/forge`,
@@ -129,7 +253,7 @@ export async function deployLocal(options: { rpcUrl: string; privateKey?: Hex })
       throw new Error(`forge script DeployBatchAnchor failed:\n${anchorResult.stdout}\n${anchorResult.stderr}`)
     return loadDeployment(31337n)
   } finally {
-    rmdirSync(lockDir)
+    releaseDirLock(lockDir)
   }
 }
 

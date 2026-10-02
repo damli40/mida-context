@@ -77,7 +77,7 @@ describe("sessionStartMessage", () => {
       cut: true,
     }
     const line = sessionStartMessage(body, "codex", NOW)
-    expect(line).toContain("(oldest progress trimmed to fit)")
+    expect(line).toContain("(older entries trimmed to fit)")
     expect(line).not.toContain("shortened")
     expect(line).not.toContain("longer than the limit")
   })
@@ -94,10 +94,46 @@ describe("sessionStartMessage", () => {
     }
     expect(sessionStartMessage(body, "codex", NOW)).toContain("(above the size target)")
     const both = { ...body, cut: true }
-    expect(sessionStartMessage(both, "codex", NOW)).toContain("(oldest progress trimmed; still above the size target)")
+    expect(sessionStartMessage(both, "codex", NOW)).toContain("(older entries trimmed; still above the size target)")
   })
 
-  it("a partial store list joins after the size part with '; ' — never a comma list of states (in-20 T-3)", () => {
+  // UF-J: the size part names WHAT was left out — "older entries" for a history cut,
+  // "reasons" for dropped because/why, both words when both went — and "above the size
+  // target" is said whenever the delivered text is still over. All eight states.
+  describe("the size part names what was left out (UF-J)", () => {
+    const sizeOf = (over: Record<string, unknown>): string | null => {
+      const line = sessionStartMessage({ kind: "handoff", text: "CTX", checkpoints: 1, facts: 0, ...over }, "codex", NOW)
+      const m = /^Mida: handoff loaded — 1 checkpoint, 0 facts(?: \((.*)\))?$/.exec(line)
+      expect(m).not.toBeNull()
+      return m![1] ?? null
+    }
+    const cases: [over: Record<string, unknown>, want: string | null][] = [
+      [{}, null],
+      [{ oversized: true }, "above the size target"],
+      [{ cut: true }, "older entries trimmed to fit"],
+      [{ cut: true, oversized: true }, "older entries trimmed; still above the size target"],
+      [{ reasonsLeftOut: true }, "reasons trimmed to fit"],
+      [{ reasonsLeftOut: true, oversized: true }, "reasons trimmed; still above the size target"],
+      [{ cut: true, reasonsLeftOut: true }, "older entries and reasons trimmed to fit"],
+      [{ cut: true, reasonsLeftOut: true, oversized: true }, "older entries and reasons trimmed; still above the size target"],
+    ]
+    for (const [over, want] of cases) {
+      it(`cut=${over.cut === true} reasons=${over.reasonsLeftOut === true} oversized=${over.oversized === true} → ${want === null ? "no size text" : want}`, () => {
+        expect(sizeOf(over)).toBe(want)
+      })
+    }
+    it("the partial clause still joins after any size part", () => {
+      const line = sessionStartMessage(
+        { kind: "handoff", text: "CTX", checkpoints: 1, facts: 0, reasonsLeftOut: true, oversized: true, partial: true },
+        "codex",
+        NOW,
+      )
+      // UF-K: "incomplete" comes FIRST — the 160-char cut must never be able to remove it
+      expect(line).toContain("(incomplete — try again in a moment; reasons trimmed; still above the size target)")
+    })
+  })
+
+  it("a partial store list opens the bracket — 'incomplete' first, then the size part (in-20 T-3, UF-K)", () => {
     const body = {
       kind: "handoff",
       text: "CTX",
@@ -109,8 +145,32 @@ describe("sessionStartMessage", () => {
       partial: true,
     }
     expect(sessionStartMessage(body, "codex", NOW)).toContain(
-      "(above the size target; incomplete — try again in a moment)",
+      "(incomplete — try again in a moment; above the size target)",
     )
+  })
+
+  it("the 160-char cut can never remove 'incomplete' — it leads the bracket (UF-K)", () => {
+    // all four states set and a 30-character saver name: the old order put "incomplete" last
+    // and the cut removed it whole — the owner was told a partial read was complete
+    const line = sessionStartMessage(
+      {
+        kind: "handoff",
+        text: "CTX",
+        checkpoints: 1,
+        facts: 0,
+        savedBy: "a".repeat(30),
+        savedAt: "2026-09-21T11:59:20.000Z",
+        cut: true,
+        reasonsLeftOut: true,
+        oversized: true,
+        partial: true,
+      },
+      "codex",
+      NOW,
+    )
+    expect(line.length).toBeLessThanOrEqual(160)
+    expect(line).toContain("incomplete")
+    expect(line).toContain("(incomplete — try again in a moment")
   })
 
   it("empty: the connected line", () => {

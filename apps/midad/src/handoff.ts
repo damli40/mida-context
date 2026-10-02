@@ -3,9 +3,9 @@ import { isAbsolute } from "node:path"
 import { isMidaError } from "@mida/protocol"
 import { isReadDeadlineError } from "@mida/chain"
 import { compareChainOrder, defuse, handoffHeader, mergeCheckpoints, otherTasksBlock, otherTasksFor, renderHandoffReport, taskOf } from "@mida/checkpoint"
-import type { MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
+import type { MergedHandoff, MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
 import { chainRefusalReason } from "./chain-busy.js"
-import { CHAIN_REFUSAL_TEXT } from "./hook-output.js"
+import { CHAIN_REFUSAL_TEXT, HANDOFF_BEGIN, HANDOFF_TAIL } from "./hook-output.js"
 import { CODING_CLIENTS } from "./install.js"
 import { isRevoked, loadAgentIdentity, loadGrants } from "./keys.js"
 import { movedOnSuffix } from "./migration-envelope.js"
@@ -14,6 +14,8 @@ import type { ProjectCheck } from "./projects.js"
 import { isSafeName, peekJobs, projectIdFor } from "./queue.js"
 import type { CaptureJob } from "./queue.js"
 import { DEFAULT_TASK, pinSessionTask, resolveSessionTask, taskOrUndefined } from "./task.js"
+import type { CheckpointEnvelope } from "./checkpoint-payload.js"
+import { readUnsent } from "./unsent.js"
 import { pendingAnchors, pendingPlaintext } from "./batching.js"
 import { readOwnerFacts } from "./remember.js"
 import type { MidaHome } from "./home.js"
@@ -40,12 +42,14 @@ export type HandoffResult =
       savedAt: string
       /** The foreign contextIds this handoff covered, oldest first — the session's whats-new seen set starts here. */
       seen: string[]
-      /** The size limit the text was cut against — the daemon logs it next to the text's length. */
+      /** The render's size target — the daemon logs it next to the text's length. */
       limitChars: number
-      /** Oldest progress entries were left out so the text fits the limit — the owner sees "oldest progress trimmed". */
+      /** The oldest entries of one or more history lists were left out so the text fits the limit — the owner sees "older entries trimmed". */
       cut: boolean
       /** Still over the size target after trimming — the owner sees "above the size target". */
       oversized: boolean
+      /** The reasons behind decisions and rejected approaches were left out to fit — every entry stayed. */
+      reasonsLeftOut: boolean
       /** The store's list was incomplete — the text opens with the may-be-incomplete line and the owner sees "(incomplete …)". */
       partial: boolean
     }
@@ -114,8 +118,9 @@ export const PARTIAL_LINE = "Some saved context could not be loaded yet; what fo
  * marker sits directly above that record's own content.
  */
 export const PENDING_ANCHOR_LINE = "PENDING_ANCHOR: not yet anchored on Monad; may still be rejected"
-const HANDOFF_BEGIN = "=== BEGIN MIDA HANDOFF DATA ==="
-const HANDOFF_TAIL = "=== END MIDA HANDOFF DATA ==="
+// both fence lines are defined on the hook-output leaf so the MCP adapter's cap can reach them
+// without importing this module (mcp.test.ts walks that graph)
+export { HANDOFF_TAIL }
 
 /** The queued-job scan reads at most this many files — a flooded queue costs one bounded look. */
 const QUEUE_NOTE_SCAN_LIMIT = 200
@@ -130,7 +135,36 @@ const QUEUE_NOTE_SCAN_LIMIT = 200
  * reports what is queued — it never removes, re-orders, waits on or triggers a job, and a queue
  * that cannot be read degrades to no line at all, never a refused handoff.
  */
-function queuedSavesNote(home: MidaHome, projectId: string): string | null {
+export interface QueuedSaves {
+  /** agent → its counted sessions (distinct sessions, not jobs) */
+  perAgent: Map<string, Set<string>>
+  /** session → its newest queued change (ms) */
+  newestChange: Map<string, number>
+  lastTryFailed: boolean
+  /**
+   * UF-QF: each counted session's wait reason — session id → the reason its state carried.
+   * Kept per session (not as a bare list of reasons) so the two queue reads merge by session
+   * id and one session is never counted under two reasons.
+   */
+  waitingOn: Map<string, WaitReason>
+  /**
+   * UF-QF/UF-QA: the counted sessions whose last failed try was for a reason that is NOT one of
+   * the three waits (attempts > 0 on another code) — the note names the retries still happening
+   * beside the waits ("Mida keeps retrying the rest").
+   */
+  otherFailed: Set<string>
+  stuck: number
+}
+
+/**
+ * The capacity waits a session state can carry, in the order the note reports them when several
+ * counted sessions wait on different reasons: the sponsor's cap first, then the summary model.
+ * (UF-P3: a fixed priority, not arrival order.)
+ */
+export type WaitReason = "sponsor-limit" | "summarizer-limit" | "no-summarizer"
+const WAIT_ORDER: readonly WaitReason[] = ["sponsor-limit", "summarizer-limit", "no-summarizer"]
+
+function readQueuedSaves(home: MidaHome, projectId: string): QueuedSaves | null {
   let jobs: CaptureJob[]
   try {
     jobs = peekJobs(home, QUEUE_NOTE_SCAN_LIMIT)
@@ -139,6 +173,12 @@ function queuedSavesNote(home: MidaHome, projectId: string): string | null {
   }
   const perAgent = new Map<string, Set<string>>()
   let lastTryFailed = false
+  const waitingOn = new Map<string, WaitReason>()
+  const otherFailed = new Set<string>()
+  // CAP-26: each counted session's NEWEST queued change. The drain merges a session's jobs and
+  // keeps only the newest, so that is all the queue can honestly tell. The stalest of those is the
+  // signal: a session with no new change for an hour that is still not on Monad is stuck.
+  const newestChange = new Map<string, number>()
   for (const job of jobs) {
     if (!isSafeName(job.agent)) continue
     let jobProject: string | null
@@ -151,11 +191,27 @@ function queuedSavesNote(home: MidaHome, projectId: string): string | null {
     const sessions = perAgent.get(job.agent) ?? new Set<string>()
     sessions.add(job.sessionId)
     perAgent.set(job.agent, sessions)
+    // asJob already refused a job whose `at` will not parse
+    newestChange.set(job.sessionId, Math.max(newestChange.get(job.sessionId) ?? Number.NEGATIVE_INFINITY, Date.parse(job.at)))
     // the drainer records a failed try on the session's own state file — read-only, and an
     // unreadable or malformed state only loses the retry clause, never the count
     try {
-      const state = home.readJson<{ attempts?: unknown }>(`queue/state/${job.sessionId}.json`)
-      if (typeof state?.attempts === "number" && state.attempts > 0) lastTryFailed = true
+      const state = home.readJson<{ attempts?: unknown; reason?: unknown; failedAt?: unknown }>(`queue/state/${job.sessionId}.json`)
+      // UF-O/UF-P3: a capacity wait carries no attempts — an allowance, not a failed try — so
+      // it is noticed by reason + failedAt, and it never sets lastTryFailed. UF-QF: the reason
+      // is kept per session — one session holds exactly one reason in each snapshot.
+      const isWait =
+        typeof state?.failedAt === "string" && (WAIT_ORDER as readonly string[]).includes(state.reason as string)
+      if (isWait) {
+        waitingOn.set(job.sessionId, state.reason as WaitReason)
+        otherFailed.delete(job.sessionId)
+      } else if (typeof state?.attempts === "number" && state.attempts > 0) {
+        lastTryFailed = true
+        // UF-QA: a failed try on a reason that is not one of the three waits still means Mida is
+        // retrying that session — the "waiting on" clause must not claim every wait is the same
+        waitingOn.delete(job.sessionId)
+        if (!(WAIT_ORDER as readonly string[]).includes(state?.reason as string)) otherFailed.add(job.sessionId)
+      }
     } catch { /* keep the count, drop the clause */ }
   }
   // in-13 M-4: a batched save the store refused as composed sits between ledgers — rejected at
@@ -172,16 +228,107 @@ function queuedSavesNote(home: MidaHome, projectId: string): string | null {
     if (typeof value !== "object" || value === null || (value as { projectId?: unknown }).projectId !== projectId) continue
     stuck += 1
   }
+  return { perAgent, newestChange, lastTryFailed, waitingOn, otherFailed, stuck }
+}
+
+/**
+ * Two queue snapshots as one: every session either saw, its newest change, any failed try.
+ * The wait reasons merge PER SESSION (UF-QF): a session present in both reads keeps only the
+ * second read's reason, so it is counted once — never once under each reason it carried.
+ */
+export function mergeQueued(a: QueuedSaves | null, b: QueuedSaves | null): QueuedSaves | null {
+  if (a === null) return b
+  if (b === null) return a
+  const perAgent = new Map<string, Set<string>>()
+  for (const q of [a, b]) {
+    for (const [agent, sessions] of q.perAgent) perAgent.set(agent, new Set([...(perAgent.get(agent) ?? []), ...sessions]))
+  }
+  const newestChange = new Map(a.newestChange)
+  for (const [session, at] of b.newestChange) newestChange.set(session, Math.max(newestChange.get(session) ?? Number.NEGATIVE_INFINITY, at))
+  const waitingOn = new Map(a.waitingOn)
+  const otherFailed = new Set(a.otherFailed)
+  // the second read wins: its classification of a session replaces the first read's, whether
+  // the session moved to a different wait reason or to an ordinary failed try
+  for (const [session, reason] of b.waitingOn) {
+    waitingOn.set(session, reason)
+    otherFailed.delete(session)
+  }
+  for (const session of b.otherFailed) {
+    otherFailed.add(session)
+    waitingOn.delete(session)
+  }
+  return {
+    perAgent,
+    newestChange,
+    lastTryFailed: a.lastTryFailed || b.lastTryFailed,
+    waitingOn,
+    otherFailed,
+    stuck: Math.max(a.stuck, b.stuck),
+  }
+}
+
+/**
+ * The note's text for what readQueuedSaves found. `shownUnsent` is how many of the counted sessions
+ * have their compiled-but-unsent save shown below, marked UNSENT (CAP-26).
+ */
+export function queuedSavesNote(queued: QueuedSaves | null, nowMs: number, shownUnsent: number): string | null {
+  if (queued === null) return null
+  const { perAgent, newestChange, lastTryFailed, waitingOn, otherFailed, stuck } = queued
   if (perAgent.size === 0 && stuck === 0) return null
   const clauses: string[] = []
   if (perAgent.size > 0) {
     const parts = [...perAgent.entries()].map(([name, sessions], index) =>
-      index === 0 ? `${sessions.size} newer save(s) from ${name}` : `${sessions.size} from ${name}`,
+      index === 0 ? `${sessions.size} newer save${sessions.size === 1 ? "" : "s"} from ${name}` : `${sessions.size} from ${name}`,
     )
-    clauses.push(`${parts.join(", ")} have not reached Monad yet; this record may be behind them${lastTryFailed ? " (the last try failed; Mida keeps retrying)" : ""}`)
+    const total = [...perAgent.values()].reduce((sum, sessions) => sum + sessions.size, 0)
+    const stalest = Math.min(...newestChange.values())
+    const age = ageText(nowMs - stalest)
+    const clause =
+      total === 1
+        ? `${parts.join(", ")} has not reached Monad yet (its newest change is ${age} old); this record may be behind it`
+        : `${parts.join(", ")} have not reached Monad yet (${
+            age === "under a minute" ? "each changed within the last minute" : `one of them has not changed for ${age}`
+          }); this record may be behind them`
+    const shown =
+      shownUnsent === 0
+        ? ""
+        : total === 1
+          ? "; it is shown below, marked UNSENT"
+          : `; ${shownUnsent} of them ${shownUnsent === 1 ? "is" : "are"} shown below, marked UNSENT`
+    // UF-O/UF-P3: a capacity wait is an allowance or a missing model, not a failed try — its
+    // clause says so and the "last try failed" clause is not added on top of it. UF-QD: every
+    // wait reason present is named, in the fixed order. UF-QF: the count is per reason now —
+    // "1 is …"/"2 are …" — one reason every counted session shares keeps the plain clause, and
+    // sessions whose last try failed for another reason are named beside the waits as "the rest".
+    const inner = (reason: WaitReason): string =>
+      reason === "sponsor-limit"
+        ? "waiting for the gas sponsor's daily limit to reset at 00:00 UTC"
+        : reason === "summarizer-limit"
+          ? "waiting for the model that writes Mida's summaries: it hit its usage limit"
+          : "waiting: no model is set up to write Mida's summaries; the user can run mida summarizer"
+    const reasonCounts = WAIT_ORDER
+      .map((reason) => ({ reason, n: [...waitingOn.values()].filter((r) => r === reason).length }))
+      .filter(({ n }) => n > 0)
+    const waiting =
+      reasonCounts.length === 0
+        ? lastTryFailed
+          ? " (the last try failed; Mida keeps retrying)"
+          : ""
+        : reasonCounts.length === 1 && reasonCounts[0]!.n === total
+          ? ` (${inner(reasonCounts[0]!.reason)})`
+          : ` (${reasonCounts.map(({ reason, n }) => `${n} ${n === 1 ? "is" : "are"} ${inner(reason)}`).join("; ")}${otherFailed.size > 0 ? "; Mida keeps retrying the rest" : ""})`
+    clauses.push(`${clause}${waiting}${shown}`)
   }
   if (stuck > 0) clauses.push(`${stuck} save${stuck === 1 ? "" : "s"} could not be sent to Monad: see \`mida doctor\``)
   return `Mida note: ${clauses.join(". ")}.`
+}
+
+/** An age in the note's words; a future stamp (clock skew) counts as 0. */
+function ageText(ms: number): string {
+  const minutes = Math.floor(Math.max(ms, 0) / 60_000)
+  if (minutes < 1) return "under a minute"
+  if (minutes < 120) return `${minutes} min`
+  return `${Math.floor(minutes / 60)} h`
 }
 
 /** The generic refusal line — the only text a session-start hook prints on its own failures. */
@@ -326,24 +473,201 @@ type ReadCheckpoint = Awaited<ReturnType<typeof readCheckpoints>>["checkpoints"]
  * "from", never "saved": the store holds it and the signature checked out, but Monad has not
  * anchored it and still may reject it.
  */
-function pendingBlock(cp: ReadCheckpoint, authorNames: Record<string, string>): string {
+function pendingBlock(cp: ReadCheckpoint, authorNames: Record<string, string>, merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null, bare = false): string {
   const c = cp.checkpoint
   const who = authorNames[cp.authorId.toLowerCase()] ?? "unknown agent"
   const lines = [
     PENDING_ANCHOR_LINE,
     `from ${defuse(who)} at ${defuse(c.createdAt)} (session ${defuse(cp.sessionId)}, record ${defuse(cp.contextId)})`,
   ]
-  if (c.objective !== "") lines.push(`objective: ${defuse(c.objective)}`)
-  for (const step of c.remainingPlan) lines.push(`plan step: ${defuse(step)}`)
-  if (c.nextAction !== "") lines.push(`next action: ${defuse(c.nextAction)}`)
-  if (c.unresolvedIssue !== null && c.unresolvedIssue !== "") lines.push(`unresolved issue: ${defuse(c.unresolvedIssue)}`)
-  for (const d of c.decisions) lines.push(`decision: ${defuse(d.decision)} — because: ${defuse(d.rationale)}`)
-  for (const r of c.rejected) lines.push(`rejected approach: ${defuse(r.approach)} — ${defuse(r.why)}`)
-  for (const k of c.constraints) lines.push(`constraint: ${defuse(k)}`)
-  for (const a of c.artifacts) lines.push(`artifact: ${defuse(a)}`)
-  for (const p of c.progress) lines.push(`progress: ${defuse(p)}`)
-  for (const e of c.evidence) lines.push(`evidence: ${defuse(e.field)} — ${defuse(e.ref)}`)
+  const { rules, history } = checkpointFieldLines(c, merged)
+  // UF-QA: a bare block keeps only its rule lines — history pays for the fit before any reason
+  // does, and the count line says honestly what was left out
+  lines.push(...rules)
+  if (bare) {
+    if (history.length > 0) lines.push(`… ${history.length} more line${history.length === 1 ? "" : "s"} of this pending save left out`)
+  } else {
+    lines.push(...history)
+  }
   return lines.join("\n")
+}
+
+/**
+ * A checkpoint's non-empty fields, one line each — shared by the marked blocks. `rules` are the
+ * lines a cut must never drop (constraints first: they outrank what was decided): constraint,
+ * objective, plan, next action, unresolved issue, decision and rejected-approach lines. `history`
+ * is what a budget may leave out: artifact, progress and evidence lines (UF-J). When a merged
+ * record renders above the block, a rule that is also in that record is left out of the block —
+ * one line where the rule lines end counts what was not repeated (UF-K). With no merged record
+ * (the pending-only handoff) nothing is omitted and no such line is printed.
+ */
+function checkpointFieldLines(
+  c: ReadCheckpoint["checkpoint"],
+  merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null = null,
+): { rules: string[]; history: string[] } {
+  // each value defused, then flattened to one line: a newline in saved text could otherwise start a
+  // line identical to one of this block's own labels ("next action:", "plan step:") (Fable review)
+  const one = (text: string) => defuse(text).replace(/\s*\n\s*/g, " / ")
+  // a rule matches the record only as a whole entry: a constraint on its text, a decision on
+  // decision AND reason, a rejected approach on approach AND why — the same decision text with
+  // a different reason is a different rule and stays (UF-K). The key is a JSON pair, never a
+  // plain join: "a"+"bc" equals "ab"+"c", which would omit a DIFFERENT decision as if it were
+  // already shown (UF-L).
+  const mergedConstraints = new Set(merged?.constraints ?? [])
+  const mergedDecisions = new Set((merged?.decisions ?? []).map((d) => JSON.stringify([d.decision, d.rationale])))
+  const mergedRejected = new Set((merged?.rejected ?? []).map((r) => JSON.stringify([r.approach, r.why])))
+  // the count line counts DISTINCT rules the record already shows — a rule listed twice in the
+  // block was still repeated once (UF-L)
+  const repeated = { constraints: new Set<string>(), decisions: new Set<string>(), rejected: new Set<string>() }
+  const rules: string[] = []
+  for (const k of c.constraints) {
+    if (mergedConstraints.has(k)) repeated.constraints.add(k)
+    else rules.push(`constraint: ${one(k)}`)
+  }
+  if (c.objective !== "") rules.push(`objective: ${one(c.objective)}`)
+  for (const step of c.remainingPlan) rules.push(`plan step: ${one(step)}`)
+  if (c.nextAction !== "") rules.push(`next action: ${one(c.nextAction)}`)
+  if (c.unresolvedIssue !== null && c.unresolvedIssue !== "") rules.push(`unresolved issue: ${one(c.unresolvedIssue)}`)
+  for (const d of c.decisions) {
+    const key = JSON.stringify([d.decision, d.rationale])
+    if (mergedDecisions.has(key)) repeated.decisions.add(key)
+    else rules.push(`decision: ${one(d.decision)} — because: ${one(d.rationale)}`)
+  }
+  for (const r of c.rejected) {
+    const key = JSON.stringify([r.approach, r.why])
+    if (mergedRejected.has(key)) repeated.rejected.add(key)
+    else rules.push(`rejected approach: ${one(r.approach)} — ${one(r.why)}`)
+  }
+  const notRepeated = [
+    repeated.constraints.size === 0 ? null : `${repeated.constraints.size} constraint${repeated.constraints.size === 1 ? "" : "s"}`,
+    repeated.decisions.size === 0 ? null : `${repeated.decisions.size} decision${repeated.decisions.size === 1 ? "" : "s"}`,
+    repeated.rejected.size === 0 ? null : `${repeated.rejected.size} rejected approach${repeated.rejected.size === 1 ? "" : "es"}`,
+  ].filter((part): part is string => part !== null)
+  if (notRepeated.length > 0) rules.push(`the same as in the record above, not repeated: ${notRepeated.join(", ")}`)
+  const history: string[] = []
+  for (const a of c.artifacts) history.push(`artifact: ${one(a)}`)
+  for (const p of c.progress) history.push(`progress: ${one(p)}`)
+  for (const e of c.evidence) history.push(`evidence: ${one(e.field)} — ${one(e.ref)}`)
+  return { rules, history }
+}
+
+/** The marker on a save compiled on this machine but not yet on Monad (CAP-26). */
+export const UNSENT_LINE =
+  "UNSENT: compiled on this machine and not yet on Monad. The chain has not checked who wrote it, and it may still change or be rejected. It is here so you can pick up at once; check the current state before you act on it."
+
+/** The whole handoff's size (the MCP tool's reply cap is 40,000; Claude Code files away context over 10,000). */
+const HANDOFF_MAX_CHARS = 8_000
+/** What the marked blocks may take together; the merged record keeps at least MERGED_MIN_CHARS. */
+const UNSENT_TOTAL_CHARS = 3_000
+const MERGED_MIN_CHARS = 4_500
+/** Below this, an UNSENT block cannot say what it is and one useful field — it is not shown. */
+const UNSENT_MIN_CHARS = 450
+
+/**
+ * One compiled-but-unsent save as its own marked block (CAP-26): the marker, who queued it (the
+ * local job's agent name — the chain has not checked it), then its fields. UF-J: the rule lines —
+ * every constraint, decision and rejected approach — are ALWAYS shown, even past the block's
+ * budget; the budget only decides how many history lines (artifacts, progress, evidence) fit, and
+ * the left-out count speaks of those alone.
+ */
+function unsentBlock(envelope: CheckpointEnvelope, agent: string, budget: number, newerBy: string | null, merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null, bare = false): string {
+  const c = envelope.checkpoint
+  const lines = [UNSENT_LINE, `from ${defuse(agent)} at ${defuse(c.createdAt)} (session ${defuse(envelope.sessionId)}, not verified by the chain)`]
+  // after failed sends the mark keeps pointing at an older compile while the session moves on —
+  // the block must not pass for the session's newest state (CAP-26 review)
+  if (newerBy !== null) lines.push(`note: this session changed again after this compile (its newest change is ${newerBy} old); that newer work is not in it`)
+  const { rules, history } = checkpointFieldLines(c, merged)
+  lines.push(...rules)
+  const more = (n: number) => `… ${n} more line${n === 1 ? "" : "s"} of this unsent save left out`
+  // UF-QA: a bare block keeps no history lines at all — the whole history count rides the
+  // "more" line, so the block still says honestly what it left out
+  let used = lines.join("\n").length
+  let shown = 0
+  if (!bare) {
+    for (const line of history) {
+      // keep room for the "more" line whenever something will be left out
+      if (used + 1 + line.length + (shown + 1 < history.length ? 1 + more(history.length).length : 0) > budget) break
+      lines.push(line)
+      used += 1 + line.length
+      shown += 1
+    }
+  }
+  if (shown < history.length) lines.push(more(history.length - shown))
+  return lines.join("\n")
+}
+
+/**
+ * The UNSENT blocks, oldest compile first, while the shared `budget` has room to start one — the
+ * budget only decides whether a block begins and how many of its HISTORY lines show; a block's
+ * rule lines always render whole, so a rendered block can run past what was left. A block whose
+ * remaining room cannot hold its marker and one useful field is not shown — and `shown` counts
+ * only the blocks rendered, so the note's "shown below" is true.
+ */
+function unsentBlocks(
+  found: { agent: string; sessionId: string; envelope: CheckpointEnvelope; coveredAt?: number }[],
+  queued: QueuedSaves | null,
+  nowMs: number,
+  budget: number,
+  merged: Pick<MergedHandoff, "constraints" | "decisions" | "rejected"> | null,
+  bare = false,
+): { text: string; shown: number; lastAgent?: string; lastCreatedAt?: string } {
+  const blocks: string[] = []
+  let left = budget
+  let lastAgent: string | undefined
+  let lastCreatedAt: string | undefined
+  for (const u of found) {
+    const room = left - (blocks.length > 0 ? 2 : 0)
+    if (room < UNSENT_MIN_CHARS) break
+    const newest = queued?.newestChange.get(u.sessionId)
+    // what the compile covered (the drain's transcript read); a mark from before that was recorded
+    // falls back to the compile's own time, which can only miss a change, never invent one
+    const covered = u.coveredAt ?? Date.parse(u.envelope.checkpoint.createdAt)
+    const newerBy = newest !== undefined && !Number.isNaN(covered) && newest > covered ? ageText(nowMs - newest) : null
+    const block = unsentBlock(u.envelope, u.agent, room, newerBy, merged, bare)
+    blocks.push(block)
+    left = room - block.length
+    lastAgent = u.agent
+    lastCreatedAt = u.envelope.checkpoint.createdAt
+  }
+  return {
+    text: blocks.join("\n\n"),
+    shown: blocks.length,
+    ...(lastAgent === undefined ? {} : { lastAgent }),
+    ...(lastCreatedAt === undefined ? {} : { lastCreatedAt }),
+  }
+}
+
+/**
+ * The compiled-but-unsent saves another agent may see: for each session the queue counted (it
+ * still has a queued job, so its save has not landed), the session's marked envelope — skipping the
+ * asking session itself, another project's, and another task's. Oldest compile first.
+ */
+function unsentSaves(
+  home: MidaHome,
+  queued: QueuedSaves | null,
+  scope: { projectId: string; task: string; askingAgent: string; askingSession?: string; isRevoked: (agent: string) => boolean },
+): { agent: string; sessionId: string; envelope: CheckpointEnvelope; coveredAt?: number }[] {
+  if (queued === null) return []
+  // An MCP caller's session id (`mcp-<agent>-…`) is never its hook session's id, so "its own save"
+  // cannot be matched by session there: an MCP or session-less caller skips its own agent's saves.
+  const byAgentOnly = scope.askingSession === undefined || scope.askingSession.startsWith("mcp-")
+  const seen = new Set<string>()
+  const found: { agent: string; sessionId: string; envelope: CheckpointEnvelope; coveredAt?: number }[] = []
+  for (const [agent, sessions] of queued.perAgent) {
+    if (scope.isRevoked(agent)) continue // a revoked agent's last save is never offered
+    if (byAgentOnly && agent === scope.askingAgent) continue
+    for (const sessionId of sessions) {
+      if (sessionId === scope.askingSession || seen.has(sessionId)) continue
+      seen.add(sessionId) // one session queued under two agent names is still one block
+      const marked = readUnsent(home, sessionId)
+      if (marked === undefined) continue
+      const { envelope } = marked
+      if (envelope.projectId !== scope.projectId) continue
+      if ((envelope.task ?? DEFAULT_TASK) !== scope.task) continue
+      found.push({ agent, sessionId, envelope, ...(marked.coveredAt === undefined ? {} : { coveredAt: marked.coveredAt }) })
+    }
+  }
+  return found.sort((a, b) => Date.parse(a.envelope.checkpoint.createdAt) - Date.parse(b.envelope.checkpoint.createdAt))
 }
 
 type FactOutcome = { status: "ok"; facts: Awaited<ReturnType<typeof readOwnerFacts>> } | { status: "failed" } | { status: "slow" }
@@ -399,9 +723,11 @@ export async function buildHandoff(
 
     // Mida's own undelivered saves are newer work this record cannot know — one read-only count,
     // after access is granted and scoped to this project. Never a queue control.
-    const pendingSavesNote = queuedSavesNote(runtime.home, check.projectId) ?? undefined
-
     const now = deps.now ?? (() => Date.now())
+    // CAP-26 (Fable review): the queue as it was BEFORE the read — a save that lands while the read
+    // runs is missing from what the read returns AND from the queue after it; this snapshot keeps
+    // the note's "this record may be behind it" for exactly that fast-switch moment
+    const queuedBefore = readQueuedSaves(runtime.home, check.projectId)
     const readStarted = now()
     // `settled` never rejects, so a read that finishes or fails after the deadline is discarded
     // quietly — no unhandled rejection, and its text is never logged or rendered.
@@ -461,7 +787,34 @@ export async function buildHandoff(
     // fence instead.
     const pending = outcome.checkpoints.filter((cp) => cp.anchor === "PENDING_ANCHOR" && inTask(cp))
     const merged = mergeCheckpoints(outcome.checkpoints.filter((cp) => cp.anchor !== "PENDING_ANCHOR" && inTask(cp)))
-    const pendingText = pending.map((cp) => pendingBlock(cp, input.authorNames)).join("\n\n")
+    const pendingText = pending.map((cp) => pendingBlock(cp, input.authorNames, merged)).join("\n\n")
+    // the marked blocks — pending (stored, not anchored) and UNSENT (compiled here, not sent) — sit
+    // inside the fence beside the merge, never in it: neither is anchored state
+    // CAP-26: another session's save compiled here but not yet on Monad, shown marked UNSENT.
+    // Read AFTER the chain read: a save that landed meanwhile (its eventId is in what the read
+    // returned, anchored or pending) is dropped, never shown twice. The note counts only the
+    // blocks the shared budget still had room to render, so "shown below" is true.
+    const queued = readQueuedSaves(runtime.home, check.projectId)
+    const landed = new Set(outcome.checkpoints.map((cp) => cp.checkpoint.eventId))
+    const revokedCheck = deps.isRevoked ?? ((name: string) => isRevoked(runtime.home, name))
+    const unsentFound = unsentSaves(runtime.home, queued, {
+      projectId: check.projectId,
+      task,
+      askingAgent: agent,
+      askingSession: input.sessionId,
+      // a queue job only needs a safe file name, not a valid identity name — the revoke check
+      // throws on e.g. "Claude.Code", and one such job must never refuse every handoff: skip it
+      isRevoked: (name) => {
+        try {
+          return revokedCheck(name)
+        } catch {
+          return true
+        }
+      },
+    }).filter((u) => !landed.has(u.envelope.checkpoint.eventId))
+    const unsent = unsentBlocks(unsentFound, queued, now(), Math.max(0, UNSENT_TOTAL_CHARS - pendingText.length), merged)
+    const pendingSavesNote = queuedSavesNote(mergeQueued(queuedBefore, queued), now(), unsent.shown) ?? undefined
+    const markedText = [pendingText, unsent.text].filter((t) => t !== "").join("\n\n")
     // the checkpoints this session may treat as covered — its own never count: a session's own
     // saves are never updates for it and must never enter its seen set. A pending save that was
     // shown marked counts as covered — the session saw it, whatever the chain later decides.
@@ -474,7 +827,7 @@ export async function buildHandoff(
     // channels must say the list was incomplete: the model text opens with PARTIAL_LINE, the
     // owner's line adds "(incomplete — try again in a moment)", the daemon log records it.
     if (merged === null) {
-      if (pending.length === 0) {
+      if (markedText === "") {
         // A brand-new project is exactly where the queued-saves note matters most: the record is
         // empty AND undelivered saves sit in the queue — the model must hear both halves (R-14).
         // Named-task wording: the "nothing saved" claim is about THIS task — other tasks get
@@ -508,19 +861,25 @@ export async function buildHandoff(
       const preamble = [handoffHeader(null), adapterNote, pendingSavesNote].filter((line): line is string => line !== undefined).join("\n")
       const mentionsBlock = otherTasksBlock(otherTasks, now())
       const mentionsText = mentionsBlock === "" ? "" : `\n\n${mentionsBlock}`
+      const markedOnly = `${outcome.partial ? `${PARTIAL_LINE}\n\n` : ""}${preamble}\n${HANDOFF_BEGIN}\n\n${markedText}${mentionsText}\n\n${HANDOFF_TAIL}`
       return {
         kind: "handoff",
-        text: `${outcome.partial ? `${PARTIAL_LINE}\n\n` : ""}${preamble}\n${HANDOFF_BEGIN}\n\n${pendingText}${mentionsText}\n\n${HANDOFF_TAIL}`,
+        text: markedOnly,
         checkpoints: outcome.checkpoints.length,
         facts: facts.length,
         factsFailed,
         readMs,
-        savedBy: newestPending === undefined ? "unknown agent" : (input.authorNames[newestPending.authorId.toLowerCase()] ?? "unknown agent"),
-        savedAt: newestPending?.checkpoint.createdAt ?? "",
+        savedBy:
+          newestPending !== undefined
+            ? (input.authorNames[newestPending.authorId.toLowerCase()] ?? "unknown agent")
+            : (unsent.lastAgent ?? "unknown agent"),
+        savedAt: newestPending?.checkpoint.createdAt ?? unsent.lastCreatedAt ?? "",
         seen: covered,
-        limitChars: 8000,
+        limitChars: HANDOFF_MAX_CHARS,
         cut: false,
-        oversized: false,
+        reasonsLeftOut: false,
+        // pending blocks are not budgeted (batched saves, off by default), so say so when they overflow
+        oversized: markedOnly.length > HANDOFF_MAX_CHARS,
         partial: outcome.partial,
       }
     }
@@ -554,28 +913,88 @@ export async function buildHandoff(
     for (const stored of outcome.checkpoints) {
       if (stored.migration !== undefined) movedOn.set(stored.contextId, stored.migration)
     }
-    const rendered = renderHandoffReport(
-      {
-        ...merged,
-        provenance: merged.provenance.map((row) => {
-          const migration = movedOn.get(row.contextId)
-          return migration === undefined ? row : { ...row, createdAt: `${row.createdAt} ${movedOnSuffix(migration)}` }
-        }),
-      },
-      { authorNames: input.authorNames, facts, factsFailed, adapterNote, pendingSavesNote, otherTasks, now },
-    )
-    const text = (() => {
-      if (pending.length === 0) return rendered.text
-      // inside the fence, before the END line — the marked pending blocks sit beside the merged
-      // sections, each under its own "not yet anchored" marker; the header's save time is the
-      // anchored merge's newest effective instant, which is exactly what it claims to be
-      return rendered.text.includes(`\n\n${HANDOFF_TAIL}`)
-        ? rendered.text.replace(`\n\n${HANDOFF_TAIL}`, `\n\n${pendingText}\n\n${HANDOFF_TAIL}`)
-        : `${rendered.text}\n\n${pendingText}`
-    })()
+    // `restFor` is the characters the final text carries besides the merged render for a given
+    // marked-blocks text — the blocks plus the joins, and a partial read's PARTIAL_LINE the
+    // same way (UF-H).
+    const restFor = (marked: string) => (marked === "" ? 0 : marked.length + 2) + (outcome.partial ? PARTIAL_LINE.length + 2 : 0)
+    const assemble = (reasons: "keep" | "drop", budget: number, marked: string, forceOversizeNote = false) => {
+      const rendered = renderHandoffReport(
+        {
+          ...merged,
+          provenance: merged.provenance.map((row) => {
+            const migration = movedOn.get(row.contextId)
+            return migration === undefined ? row : { ...row, createdAt: `${row.createdAt} ${movedOnSuffix(migration)}` }
+          }),
+        },
+        {
+          authorNames: input.authorNames,
+          facts,
+          factsFailed,
+          adapterNote,
+          pendingSavesNote,
+          otherTasks,
+          now,
+          reasons,
+          ...(forceOversizeNote ? { forceOversizeNote: true } : {}),
+          // CAP-26 review: the marked blocks sit outside this fit, so the merge gets what they leave of
+          // the 8,000-char handoff (Claude Code moves injected context over 10,000 chars to a file; the
+          // MCP tool's reply cap is 40,000) — dropping its oldest progress first, never the blocks' markers.
+          ...(restFor(marked) === 0 && !forceOversizeNote ? {} : { maxChars: budget }),
+        },
+      )
+      const text = (() => {
+        if (marked === "") return rendered.text
+        // inside the fence, before the END line — the marked pending blocks sit beside the merged
+        // sections, each under its own "not yet anchored" marker; the header's save time is the
+        // anchored merge's newest effective instant, which is exactly what it claims to be
+        // sliced, never String.replace: a '$&' in saved text would paste the matched END line and
+        // break the fence (CAP-26 review)
+        const at = rendered.text.lastIndexOf(`\n\n${HANDOFF_TAIL}`)
+        return at >= 0 ? `${rendered.text.slice(0, at)}\n\n${marked}${rendered.text.slice(at)}` : `${rendered.text}\n\n${marked}`
+      })()
+      return { rendered, finalText: outcome.partial ? `${PARTIAL_LINE}\n\n${text}` : text }
+    }
+    // UF-N2, the owner's order: to make the delivered text fit its 8,000 target, history goes
+    // first — progress, the saved-by lines, file lists — and only then the reasons behind
+    // decisions and rejected approaches; a constraint, decision or rejected approach is never
+    // left out. Below the floor a render stays whole, so the retry drops the floor and hands the
+    // merge only what is actually left once the untrimmable marked blocks are counted — that is
+    // where the oldest progress goes (the floor render's no-trim answer was hiding it). Reasons
+    // leave the data only when even a fully-trimmed history cannot fit; and when nothing fits
+    // the first render goes out whole with the over-target note forced on, because a delivered
+    // text over 8,000 must always say so. Each reported flag describes the chosen text.
+    // UF-QA: the marked blocks carry their own history lines, and the same owner's order applies
+    // to them — once the merge's own trimmed history cannot fit, the blocks are rebuilt WITHOUT
+    // their history lines (rules stay, each keeping its left-out count) and the fit is tried
+    // again with reasons kept. Only then do reasons leave, against the bare blocks; the final
+    // fallback uses them too.
+    const flooredBudget = Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - restFor(markedText))
+    const first = assemble("keep", flooredBudget, markedText)
+    const chosen =
+      first.finalText.length <= HANDOFF_MAX_CHARS
+        ? first
+        : (() => {
+            const leftover = Math.max(0, HANDOFF_MAX_CHARS - restFor(markedText))
+            const trimmed = assemble("keep", leftover, markedText)
+            if (trimmed.finalText.length <= HANDOFF_MAX_CHARS) return trimmed
+            const pendingBare = pending.map((cp) => pendingBlock(cp, input.authorNames, merged, true)).join("\n\n")
+            const unsentBare = unsentBlocks(unsentFound, queued, now(), Math.max(0, UNSENT_TOTAL_CHARS - pendingBare.length), merged, true)
+            const markedBare = [pendingBare, unsentBare.text].filter((t) => t !== "").join("\n\n")
+            const marked2 = markedBare === markedText ? markedText : markedBare
+            const rest2 = restFor(marked2)
+            const leftover2 = Math.max(0, HANDOFF_MAX_CHARS - rest2)
+            if (marked2 !== markedText) {
+              const bare = assemble("keep", leftover2, marked2)
+              if (bare.finalText.length <= HANDOFF_MAX_CHARS) return bare
+            }
+            const dropped = assemble("drop", leftover2, marked2)
+            if (dropped.finalText.length <= HANDOFF_MAX_CHARS) return dropped
+            return assemble("keep", Math.max(MERGED_MIN_CHARS, HANDOFF_MAX_CHARS - rest2), marked2, true)
+          })()
+    const { rendered, finalText } = chosen
     return {
       kind: "handoff",
-      text: outcome.partial ? `${PARTIAL_LINE}\n\n${text}` : text,
+      text: finalText,
       checkpoints: outcome.checkpoints.length,
       facts: facts.length,
       factsFailed,
@@ -583,9 +1002,14 @@ export async function buildHandoff(
       savedBy,
       savedAt: newest?.createdAt ?? "",
       seen: covered,
-      limitChars: rendered.limitChars,
+      // UF-J: the log pairs the final text's size with the target it is judged against —
+      // the marked blocks' share shrinks the merge's render budget, but never the real limit
+      limitChars: HANDOFF_MAX_CHARS,
       cut: rendered.cut,
-      oversized: rendered.oversized,
+      reasonsLeftOut: rendered.reasonsLeftOut,
+      // UF-H: oversized answers for what the model actually receives — the partial line and the
+      // marked blocks included — not the merge alone (which was fitted against a smaller budget)
+      oversized: finalText.length > HANDOFF_MAX_CHARS,
       partial: outcome.partial,
     }
   } catch (error) {

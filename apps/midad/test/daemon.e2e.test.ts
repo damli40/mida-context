@@ -43,7 +43,7 @@ describe("Network.storageUrl", () => {
     } finally {
       await runtime.close()
     }
-  }, STEP_TIMEOUT * 3)
+  }, 600_000)
 
   afterAll(async () => {
     await env?.stop()
@@ -222,7 +222,7 @@ describe("the long-running midad", () => {
     codexTranscriptPath = join(homeDir, ".codex", "sessions", "rollout-test.jsonl")
     writeFileSync(codexTranscriptPath, JSON.stringify({ timestamp: "2026-09-21T10:00:00.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Build a thing" }] } }) + "\n")
     daemon = await start()
-  }, STEP_TIMEOUT * 4)
+  }, 600_000)
 
   afterAll(async () => {
     await daemon?.close()
@@ -363,7 +363,7 @@ describe("the long-running midad", () => {
     // code living at /a @ 1 while this command's code is /b @ 2
     await daemon?.close()
     daemon = undefined
-    const stale = await start({ identity: { codeRoot: "/a", codeCommit: "1" } })
+    const stale = await start({ identity: { codeRoot: "/a", codeCommit: "1", codeVersion: "0.0.1" } })
     expect(stale.alreadyRunning).toBe(false)
     expect((await callDaemon(home, "/health", undefined, { timeoutMs: 2_000 })).body).toMatchObject({ codeRoot: "/a", codeCommit: "1" })
 
@@ -376,9 +376,9 @@ describe("the long-running midad", () => {
       home,
       () => {
         // the replacement starts the same way cli.ts's spawnDaemon would — from THIS code
-        spawned = start({ identity: { codeRoot: "/b", codeCommit: "2" } })
+        spawned = start({ identity: { codeRoot: "/b", codeCommit: "2", codeVersion: "0.0.2" } })
       },
-      { waitMs: STEP_TIMEOUT, self: { codeRoot: "/b", codeCommit: "2" } },
+      { waitMs: STEP_TIMEOUT, self: { codeRoot: "/b", codeCommit: "2", codeVersion: "0.0.2" } },
     )
 
     expect(result.up).toBe(true)

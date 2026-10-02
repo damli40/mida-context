@@ -232,7 +232,9 @@ const SHUTDOWN_WAIT_MS = 10_000
  * - /health down → exactly what ensureDaemon does (spawn once, poll until waitMs).
  * - /health up with no codeRoot (a service from before code reporting), a different codeRoot, or a
  *   different codeCommit → POST /shutdown, then poll /health every 100 ms until it stops answering,
- *   at most shutdownWaitMs (default 10 s); then spawn and wait as ensureDaemon does.
+ *   at most shutdownWaitMs (default 10 s); then spawn and wait as ensureDaemon does. A service
+ *   still answering three seconds after the shutdown request fires `onStillUp` once — it is
+ *   finishing a save, and the caller may want to say the wait is real, not a hang (UF-QD).
  * - "unknown" counts as equal only when BOTH sides are "unknown" — a service that cannot name its
  *   commit next to a command that can is a difference, and the service is replaced.
  * - a service that still answers after the shutdown wait earns a refusal naming its pid, both
@@ -241,34 +243,59 @@ const SHUTDOWN_WAIT_MS = 10_000
 export async function ensureCurrentDaemon(
   home: MidaHome,
   spawn: () => void,
-  options: { waitMs: number; shutdownWaitMs?: number; self?: CodeIdentity },
+  options: {
+    waitMs: number
+    shutdownWaitMs?: number
+    self?: CodeIdentity
+    whenDown?: "start" | "leave"
+    /** Fires once when the old service still answers 3 s after the shutdown request. */
+    onStillUp?: () => void
+    /** Test seams for the shutdown-wait loop: the clock and the between-probe pause. */
+    now?: () => number
+    sleep?: (ms: number) => Promise<void>
+  },
 ): Promise<EnsureResult> {
   if (migrationInProgress(home)) return { up: false, refusal: MIGRATION_REFUSAL }
   const self = options.self ?? codeIdentity()
   const probe = await callDaemon(home, "/health", undefined, { timeoutMs: Math.min(500, Math.max(1, options.waitMs)) })
   if (probe.status === 0) {
+    // UF-P3: "leave" is for mida doctor — it reports a down service itself and must not start
+    // one; everything else still gets the spawn-then-poll ensureDaemon gives
+    if (options.whenDown === "leave") return { up: false }
     return { up: await ensureDaemon(home, spawn, { waitMs: options.waitMs }) }
   }
-  const body = probe.body as { codeRoot?: unknown; codeCommit?: unknown; pid?: unknown } | null
+  const body = probe.body as { codeRoot?: unknown; codeCommit?: unknown; codeVersion?: unknown; pid?: unknown } | null
   const codeRoot = typeof body?.codeRoot === "string" ? body.codeRoot : undefined
   const codeCommit = typeof body?.codeCommit === "string" ? body.codeCommit : undefined
+  const codeVersion = typeof body?.codeVersion === "string" ? body.codeVersion : undefined
   const pid = typeof body?.pid === "number" ? body.pid : -1
   const pidText = typeof body?.pid === "number" ? String(body.pid) : "?"
-  if (codeRoot === self.codeRoot && codeCommit === self.codeCommit) return { up: true }
+  // same code means all three agree — a service from before version reporting answers no
+  // codeVersion at all, and that absence differs from any version this command carries (UF-QC)
+  if (codeRoot === self.codeRoot && codeCommit === self.codeCommit && codeVersion === self.codeVersion) return { up: true }
 
   const replaced = { codeRoot: codeRoot ?? "unknown", codeCommit: codeCommit ?? "unknown", pid }
   await callDaemon(home, "/shutdown", {}, { timeoutMs: 2_000 })
   const shutdownWaitMs = options.shutdownWaitMs ?? SHUTDOWN_WAIT_MS
-  const deadline = Date.now() + shutdownWaitMs
+  const now = options.now ?? (() => Date.now())
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const shutdownAt = now()
+  const deadline = shutdownAt + shutdownWaitMs
+  let announced = false
   for (;;) {
-    const remaining = deadline - Date.now()
+    const remaining = deadline - now()
     if (remaining <= 0) break
     const reply = await callDaemon(home, "/health", undefined, { timeoutMs: Math.min(500, remaining) })
     if (reply.status === 0) {
       const up = await ensureDaemon(home, spawn, { waitMs: options.waitMs })
       return { up, replaced }
     }
-    await new Promise((resolve) => setTimeout(resolve, Math.min(100, Math.max(1, remaining))))
+    // still answering three seconds after the request: the save in flight is what takes it
+    if (!announced && now() - shutdownAt >= 3_000) {
+      announced = true
+      options.onStillUp?.()
+    }
+    await sleep(Math.min(100, Math.max(1, remaining)))
   }
   const secs = shutdownWaitMs % 1000 === 0 ? String(shutdownWaitMs / 1000) : (shutdownWaitMs / 1000).toFixed(1)
   return {

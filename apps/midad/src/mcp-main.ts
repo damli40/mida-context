@@ -37,6 +37,11 @@ function spawnDaemon(cwd: string): void {
 }
 
 async function main(): Promise<void> {
+  // Mida's own summariser run sets MIDA_INNER=1 — inside it this entry is not an MCP
+  // server at all: exit 0 at once, before parsing, before the home, before any socket.
+  // Nothing is written — stdout is the JSON-RPC channel and stderr would leak into the
+  // tool's own output that the limit check reads.
+  if (process.env.MIDA_INNER === "1") return
   // stdout is the JSON-RPC channel — a client that dies mid-write must not become an unhandled
   // stream error, and every diagnostic (including the usage refusal) goes to stderr
   process.stdout.on("error", () => {})

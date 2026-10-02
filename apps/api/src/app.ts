@@ -670,7 +670,7 @@ export function createContextApi(options: ContextApiOptions) {
     if (agent === null) throw new MidaError("CAPABILITY_DENIED", "recipient is not an active agent")
     if (agent.encryptionKeyVersion !== wrap.agentKeyVersion) throw new MidaError("WRAP_KEY_VERSION_MISMATCH", "wrap targets a stale agent key version")
     // 4. recipient holds active exact READ, and no local deny covers the relationship
-    await overlay.reconcile(chain)
+    await overlay.reconcileOwner(chain, wrap.owner)
     if (
       (await overlay.deniesRelationship(chain, { owner: wrap.owner, agentId: wrap.agentId, namespaceId: wrap.namespaceId })) ||
       !(await chain.hasAuthority(wrap.owner, wrap.agentId, wrap.namespaceId, PERMISSION.READ, 0))

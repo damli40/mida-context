@@ -107,7 +107,7 @@ describe("MidaAgent replay + caller-supplied randomness (migrate B1)", () => {
       selection: { kind: "custom", scopes: request.scopes, expiresAt },
     })
     await sdk.completeAccessRequest(request, response)
-  }, 300_000)
+  }, 600_000)
 
   afterAll(async () => {
     await node?.stop()

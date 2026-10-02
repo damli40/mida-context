@@ -10,6 +10,7 @@ import type { DaemonDeps } from "@mida/midad"
 import { RegistryReader } from "@mida/api"
 import type { Deployment } from "@mida/chain"
 import type { PublicClient } from "viem"
+import { codeIdentity } from "../src/code-identity.js"
 import { sampleCheckpoint } from "./helpers.js"
 
 const DRAIN_OK: DrainResult = { saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0, earliestDueMs: null }
@@ -81,6 +82,16 @@ describe("startDaemon", () => {
       const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 1_000 })
       expect(reply.status).toBe(200)
       expect(reply.body).toMatchObject({ ok: true, pid: process.pid, queueDepth: 1 })
+      // UF-QC: the code identity carries the package version next to root and commit, so a
+      // command can tell an updated install's service from an older one at the same folder
+      const identity = reply.body as { codeRoot?: unknown; codeCommit?: unknown; codeVersion?: unknown }
+      expect(typeof identity.codeVersion).toBe("string")
+      expect(identity.codeVersion).toBe(codeIdentity().codeVersion)
+      // /health also reports the summariser — mode and the runnable chain, never a command or key
+      const body = reply.body as { summarizer?: { mode?: unknown; chain?: unknown; entries?: Record<string, unknown>[] } }
+      expect(["agents", "key", "environment"]).toContain(body.summarizer?.mode)
+      expect(Array.isArray(body.summarizer?.chain)).toBe(true)
+      expect(body.summarizer?.entries?.every((e) => !("command" in e))).toBe(true)
 
       const second = await startDaemon(deps)
       expect(second.alreadyRunning).toBe(true)

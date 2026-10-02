@@ -132,8 +132,8 @@ export function loadOrCreateOperatorSecrets(home: MidaHome): OperatorSecrets {
 }
 
 /**
- * The block the owner's history scan starts from on this chain. An owner has no history before it existed, so
- * Runtime.open records a start block on this home's first open and every later ownerHistory scan skips the —
+ * The block the owner's context scans start from on this chain. An owner has no context before it existed, so
+ * Runtime.open records a start block on this home's first open and every later context scan skips the —
  * on a live chain enormous — contract-only range before it. The record also pins the capability registry it
  * was computed for: a file from another deployment, an old two-field file, or a block above the current head
  * is ignored and recomputed rather than trusted.

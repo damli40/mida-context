@@ -645,6 +645,13 @@ async function resubmitOnClosedLane(
   removePendingAnchor(home, entry.contextId)
   dropPendingPlaintext(home, entry.contextId)
   recordSavedId(home, entry.eventId, created.contextId)
+  // the kept plaintext names which model wrote the save — the batched lane's saved line
+  // carries it as `model` (envelope.compiledBy); the direct fallback must carry it too
+  const keptValue = (input as Record<string, unknown>).value
+  const writer =
+    typeof keptValue === "object" && keptValue !== null
+      ? (keptValue as Record<string, unknown>).compiledBy
+      : undefined
   log({
     sessionId: entry.sessionId,
     agent: entry.agent,
@@ -655,6 +662,7 @@ async function resubmitOnClosedLane(
     previousContextId: entry.contextId,
     transactionHash: created.transactionHash ?? null,
     reason: `batch-rejected:${reason}`,
+    ...(typeof writer === "string" ? { model: writer } : {}),
   })
   return "landed"
 }
@@ -683,6 +691,13 @@ export async function followPendingAnchors(
       continue
     }
     if (answer.state === "ANCHORED") {
+      // the kept plaintext names which model wrote the save — the direct lane logs it as
+      // `model` (envelope.compiledBy); a batched saved line must carry the same field
+      const kept = pendingPlaintext(runtime.home, entry.contextId)
+      const writer =
+        kept !== undefined && typeof kept.value === "object" && kept.value !== null
+          ? (kept.value as Record<string, unknown>).compiledBy
+          : undefined
       removePendingAnchor(runtime.home, entry.contextId)
       dropPendingPlaintext(runtime.home, entry.contextId)
       counts.anchored += 1
@@ -694,6 +709,7 @@ export async function followPendingAnchors(
         lane: "batched",
         contextId: entry.contextId,
         batchId: answer.item?.batchId ?? null,
+        ...(typeof writer === "string" ? { model: writer } : {}),
       })
     } else if (answer.state === "REJECTED") {
       const reason = answer.reason ?? "unknown"

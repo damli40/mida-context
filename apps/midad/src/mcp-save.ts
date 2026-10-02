@@ -2,9 +2,10 @@ import { statSync } from "node:fs"
 import { isAbsolute } from "node:path"
 import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
-import { CONTENT_FIELDS, validateCheckpoint } from "@mida/checkpoint"
+import { CONTENT_FIELDS, LIMITS, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint } from "@mida/checkpoint"
 import { scrubValue } from "@mida/compiler"
+import { sponsorDailyLimitOf } from "@mida/chain"
 import { PERMISSION, PROVENANCE_POLICY, isMidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
 import { chainRefusalReason } from "./chain-busy.js"
@@ -14,6 +15,7 @@ import { capabilityState, noContextText, projectCheckRefusal } from "./handoff.j
 import { CHAIN_REFUSAL_TEXT } from "./hook-output.js"
 import type { CapabilityState } from "./handoff.js"
 import { MCP_CLIENT_TOOLS } from "./install.js"
+import { HOOK_CLIENTS } from "./mcp-clients.js"
 import { isRevoked, loadAgentIdentity, revokePending } from "./keys.js"
 import type { AgentIdentity, RevokePendingMarker } from "./keys.js"
 import { checkProject } from "./projects.js"
@@ -127,8 +129,12 @@ const noIdentityText = (agent: string, homeRoot: string): string =>
   `Mida: no agent "${agent}" is set up in this Mida home (${homeRoot}). Nothing was saved.`
 const identityUnreadableText = (agent: string, homeRoot: string): string =>
   `Mida: ${agent}'s identity in this Mida home (${homeRoot}) exists but could not be read. Nothing was saved. Run \`mida doctor\`.`
+// only a hook client is told where its saves come from — an identity with no hooks (a harness
+// added with `mida add-agent`, an unknown name) has no save path, and is never told it has one
 const notMcpClientText = (agent: string): string =>
-  `Mida: ${agent} is not an MCP client identity — mida_save signs for ${MCP_CLIENT_TOOLS.join(" and ")}. Nothing was saved.`
+  HOOK_CLIENTS.includes(agent)
+    ? `Mida: ${agent} saves only through its Mida hooks. mida_save signs only for ${MCP_CLIENT_TOOLS.join(" and ")}, so this call saved nothing.`
+    : `Mida: mida_save signs only for ${MCP_CLIENT_TOOLS.join(" and ")}, so this call saved nothing.`
 const rateLimitedText = (agent: string, seconds: number, at: string): string =>
   `Mida: ${agent} may save once per minute in a project — the next save is allowed in ${seconds} s (at ${at}). Nothing was saved.`
 
@@ -251,7 +257,21 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
 
   // Secrets are scrubbed with the compiler's own scrubber before anything is sealed — nested
   // arrays and objects included, and sensitive-looking key names redact their values outright.
-  const content = scrubValue(fields) as Record<string, unknown>
+  // An agent's text can never form a Mida note: only Mida writes "(Mida:". Every string value
+  // has each "(mida:" gain one space before the colon, so a forged note an agent sends can
+  // never read as one Mida wrote — Mida's own notes are added later by wrapCheckpoint and
+  // never pass through here. UF-QA: look-alikes count too — a full-width bracket or colon,
+  // or invisible characters (whitespace, format marks) anywhere inside the marker, are
+  // rewritten the same way.
+  const unmida = (v: unknown): unknown =>
+    typeof v === "string"
+      ? v.replace(/[(（][\s\p{Cf}]*m[\p{Cf}]*i[\p{Cf}]*d[\p{Cf}]*a[\s\p{Cf}]*[:：]/giu, "(Mida :")
+      : Array.isArray(v)
+        ? v.map(unmida)
+        : isObj(v)
+          ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, unmida(x)]))
+          : v
+  const content = unmida(scrubValue(fields)) as Record<string, unknown>
 
   const sessionId = mcpSaveSessionId(agent, projectId)
   const checkpoint: Checkpoint = {
@@ -274,6 +294,18 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
   const validated = validateCheckpoint(checkpoint)
   if (!validated.ok) {
     const bad = fieldPathsFromErrors(validated.errors)
+    // UF-J: when the ONLY failures are lists over the schema cap, name the limit and each
+    // submitted count — "invalid fields" alone would never tell the model what to fix. Any
+    // other mix of errors keeps the generic wording.
+    const capError = `: array exceeds ${LIMITS.maxArray} items`
+    if (validated.errors.every((e) => e.endsWith(capError))) {
+      const counts = bad.map((f) => `${f} has ${(content[f] as unknown[]).length}`)
+      return refused(
+        "invalid-shape",
+        `Mida: a list holds at most ${LIMITS.maxArray} entries (${counts.join(", ")}). Nothing was saved.`,
+        { fields: bad },
+      )
+    }
     return refused("invalid-shape", `Mida: invalid checkpoint fields: ${bad.join(", ")} — nothing was saved.`, { fields: bad })
   }
 
@@ -332,6 +364,14 @@ export async function buildMcpSave(runtime: ServiceRuntime, record: unknown, dep
     if (isMidaError(error, "PARTIAL_READ")) return refused("check-failed", noContextText("check-failed"))
     if ((error as { code?: unknown }).code === "agent-not-setup") {
       return refused("no-identity", noIdentityText(agent, runtime.home.root))
+    }
+    // UF-QA: the sponsor refused on its daily limit and the wallet could not pay either — this is
+    // a refusal the model can act on (save again after the reset), not an internal error
+    if (sponsorDailyLimitOf(error) !== undefined) {
+      return refused(
+        "sponsor-limit",
+        "Mida: the gas sponsor's daily limit is used up, so this was not saved. It resets at 00:00 UTC. Save again after that.",
+      )
     }
     // a send or read that died on a chain that could not answer is a refusal, not "not-approved" (in-6 R4)
     const chainReason = chainRefusalReason(error)

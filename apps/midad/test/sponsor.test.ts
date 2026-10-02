@@ -514,7 +514,7 @@ describe("mida sponsor on|off", () => {
         // the sponsor check asked the injected fetch — and the sponsor line proves it answered
         expect(fetched).toEqual([HOSTED_SPONSOR_URL])
         expect(lines).toContain(
-          "ok: gas sponsor reachable at sponsor.midacontext.xyz (willingness is only proven by a real send; it advertises 10 signings per address a day, 100 a day in total)",
+          "ok: gas sponsor reachable at sponsor.midacontext.xyz (willingness is only proven by a real send; it pays for up to 10 saves per agent a day, 100 a day across everyone)",
         )
         expect(lines).toContain("ok: gas is sponsored by sponsor.midacontext.xyz")
         expect(leaked, lines.join("\n")).toEqual([])

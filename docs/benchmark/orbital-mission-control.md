@@ -87,6 +87,42 @@ user does what people do today: explains the project, pastes the requirements th
 corrects mistakes. Time it. Count the characters. This is the honest cost of being the API
 between your AIs; don't shortcut it.
 
-Prior measurement for context (toy task, 3 runs per setup, one scorer): fresh Codex with the
-Mida handoff finished 3 of 3; without it **0 of 6 completed the requirements; 6 of 6 reported
-completion**. Say the sample size when quoting it.
+### The headline number: the runs, and how many finished
+
+The first thing the benchmark reports is a count. It is the number to quote, and it replaces
+"3 of 3 against 0 of 6".
+
+| Condition | Runs started | Finished | Checks passed, job not finished | Stopped early (and why) |
+|---|---|---|---|---|
+| With Mida (`Continue.`) | | | | |
+| Without Mida, nothing given | | | | |
+| Without Mida, manual handoff or transcript pasted | | | | |
+
+Rules for the count:
+
+- **Every run that was started counts.** A run that crashed, was stopped, or hit a usage limit is
+  a row in the log with its reason, and it counts as not finished. No run is dropped afterwards.
+- **Finished** means the task was completed AND nothing was done the default way: for this
+  scenario, "Task completed" is yes and "Incorrect assumptions" is 0. A dashboard that runs but
+  says `LOW FUEL` is not finished.
+- **"Checks passed, job not finished"** is counted on its own, because it is the failure the
+  first measurement found: the agent's own tests were green and it said it was done.
+- Decide the number of runs per condition before the first run and write it here: ____. (The
+  plan is 15 runs.)
+- Quote counts, never only a percentage ("7 of 8 runs finished"), with the task, the models and
+  who scored it.
+
+Where the count comes from:
+
+- **The automated benchmark** (`bench/continuation/run.ts`, the toy task, conditions `mida`,
+  `none` and `raw`): `pnpm bench:summary` reads every run's `run.json` and prints this table and
+  two sentences, "With Mida: N of M runs finished." and "Without Mida: N of M runs finished."
+  There, finished means every step was built and every check passed.
+- **This scenario's dry runs**: one `docs/evidence/orbital-<date>-<n>.json` per run,
+  the failed ones included; fill the table from those files.
+
+**Until the table is filled, the old figure stays, with its sample size said every time:** on a
+toy task, 3 runs per setup and one scorer, a fresh Codex with the Mida handoff finished 3 of 3;
+without it **0 of 6 completed the requirements; 6 of 6 reported completion**
+([method and runs](../evidence/handoff-design-and-benchmark-2026-09-20.md)). When the new count
+exists, it replaces that sentence in the README, the quickstart and the pitch.

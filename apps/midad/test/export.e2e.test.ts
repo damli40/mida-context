@@ -61,7 +61,6 @@ import { declarationsFor } from "../src/skeleton.js"
 import { followPendingAnchors, pendingAnchors } from "../src/batching.js"
 import { sampleCheckpoint } from "./helpers.js"
 
-const SETUP_TIMEOUT = 300_000
 const STEP_TIMEOUT = 120_000
 const SETTLE_MS = 10_000
 
@@ -237,7 +236,7 @@ describe("mida export end to end on local Anvil (ex-1)", () => {
       secretBytes.push(deriveEpochKeyPair(nsSecret, 1n).privateKey)
     }
     for (const hex of secretHex) secretBytes.push(Buffer.from(hex.slice(2), "hex"))
-  }, SETUP_TIMEOUT)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

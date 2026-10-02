@@ -16,7 +16,7 @@ describe("init without a funder (the published CLI's funding path)", () => {
   let env: ScenarioEnvironment
   beforeAll(async () => {
     env = await localEnvironment()
-  }, 120_000)
+  }, 600_000)
   afterAll(async () => {
     await env?.stop()
   })

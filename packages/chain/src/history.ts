@@ -1,38 +1,44 @@
 import type { Address, Hex, OwnerAgentHistory } from "@mida/protocol"
-import { getAbiItem } from "viem"
-import type { AbiEvent } from "viem"
 import { capabilityRegistryAbi } from "./abis.js"
 import type { Deployment } from "./deployment.js"
-import { blockWindows, clampLogRange, getLogsChunked } from "./logs.js"
-import type { LogClient } from "./logs.js"
 
-const CAPABILITY_REVOKED = getAbiItem({ abi: capabilityRegistryAbi, name: "CapabilityRevoked" }) as AbiEvent
-const AGENT_REVOKED = getAbiItem({ abi: capabilityRegistryAbi, name: "AgentRevoked" }) as AbiEvent
+/** How many getCapability reads run at once — the shared transport caps requests at 10 a second per RPC origin. */
+const CAPABILITY_READ_CONCURRENCY = 8
 
-const same = (a: unknown, b: string) => typeof a === "string" && a.toLowerCase() === b.toLowerCase()
-
-/**
- * §14.6 PREVIOUSLY_REVOKED input. Built only from CapabilityRevoked and AgentRevoked events for exactly
- * this (owner, agentId) pair. Topic filters narrow the query; the explicit comparison below guards against
- * a provider that ignores them. Never consults reputation or access telemetry.
- */
-/** A log client that can also read a contract view — viem's PublicClient is one. */
-export interface HistoryClient extends LogClient {
-  readContract?(parameters: { address: Address; abi: typeof capabilityRegistryAbi; functionName: "agentEpoch" | "activeCapabilityIds"; args: readonly [Address, Hex] }): Promise<unknown>
+/** The contract views and the head height ownerHistory needs — viem's PublicClient is one. There is no log API: the check never scans events. */
+export interface HistoryClient {
+  getBlockNumber(): Promise<bigint>
+  readContract(parameters: { address: Address; abi: typeof capabilityRegistryAbi; functionName: "agentEpoch" | "activeCapabilityIds"; args: readonly [Address, Hex] }): Promise<unknown>
+  readContract(parameters: { address: Address; abi: typeof capabilityRegistryAbi; functionName: "getCapability"; args: readonly [Hex] }): Promise<unknown>
 }
 
 /**
- * Where the last successful scan stopped for one (owner, agentId) pair (R4-9). A cache of chain
- * facts, never an authority: the caller supplies load/save (the CLI keeps it at
- * `state/history/<agentId>.json`, keyed on chain id and registry) and a missing, malformed or
- * wrong-chain answer from load() means a full scan, not a guess. `previouslyRevoked` is sticky —
- * nothing on the chain un-revokes — so a saved true answers without any scan at all.
+ * This machine's memory of the last check for one (owner, agentId) pair (R4-9) — not where a
+ * scan stopped, because there is no scan. `observedThroughBlock` records the head that check ran
+ * at, and `previouslyRevoked` is a saved yes: nothing on the chain un-revokes, so a remembered
+ * yes keeps answering. A cache of facts, never an authority: the caller supplies load/save (the
+ * CLI keeps it at `state/history/<agentId>.json`, keyed on chain id and registry) and a missing,
+ * malformed or wrong-chain answer from load() is ignored rather than guessed over. The file
+ * format is unchanged, so files written by older builds still load.
  */
 export interface HistoryScanCursor {
   load(): { observedThroughBlock: bigint; previouslyRevoked: boolean } | undefined | Promise<{ observedThroughBlock: bigint; previouslyRevoked: boolean } | undefined>
   save(state: { observedThroughBlock: bigint; previouslyRevoked: boolean }): void | Promise<void>
 }
 
+/**
+ * The PREVIOUSLY_REVOKED input, read from contract state with no log scan. Three sources: the
+ * owner-agent revoke counter (agentEpoch above 0: a whole-agent revoke, exact and permanent); the
+ * revoked flag of every capability still in the agent's list (a single-capability revoke stays
+ * listed until the next grant compacts the list); and this machine's saved yes from an earlier
+ * check. Known limit: a single capability revoked and later compacted away by a new grant is not
+ * seen from a machine that never recorded the yes. In the shipped commands only `mida migrate`
+ * revokes a single capability; `mida revoke` revokes the whole agent. A failed read throws; it
+ * never defaults to "not revoked". Never consults reputation or access telemetry.
+ * A second limit: a capability revoked after it had expired and been compacted away is never seen;
+ * no shipped command does that. After mida migrate, an agent whose replay-only capability was
+ * revoked reads as revoked on the machine that ran it, until the next grant compacts the list.
+ */
 export async function ownerHistory(input: {
   client: HistoryClient
   deployment: Deployment
@@ -40,83 +46,75 @@ export async function ownerHistory(input: {
   agentId: Hex
   toBlock?: bigint
   cursor?: HistoryScanCursor
-  /** The window size the scan opens with — the CLI passes the resolved MIDA_LOG_BLOCK_RANGE. */
-  maxRange?: bigint
-  /** Called once, before the log scan starts, with an ESTIMATE of the requests it will take. */
-  onScan?: (requests: number) => void
-  /** Live progress for each log scan — (completed, planned) requests; planned is the same estimate. */
-  onProgress?: (done: number, total: number) => void
 }): Promise<OwnerAgentHistory> {
   const toBlock = input.toBlock ?? (await input.client.getBlockNumber())
-  // Ask the contract before scanning anything. `agentEpoch(owner, agentId)` starts at 0, every
-  // agent-level revoke adds 1, and nothing lowers it — so a value above 0 IS the answer, in one
-  // request. (Live, Sep 21: the scan alone outlasted the 10-minute request window, so re-approving
-  // a revoked agent could never succeed.) A failed read throws: it never defaults to "not revoked".
-  let agentLevelRevokePossible = true
-  if (input.client.readContract !== undefined) {
-    const epoch = await input.client.readContract({
-      address: input.deployment.capabilityRegistry,
-      abi: capabilityRegistryAbi,
-      functionName: "agentEpoch",
-      args: [input.owner, input.agentId],
-    })
-    if (typeof epoch !== "bigint") throw new Error("agentEpoch did not return an integer")
-    if (epoch > 0n) return { owner: input.owner, agentId: input.agentId, previouslyRevoked: true, observedThroughBlock: toBlock }
-    // Counter 0: no AgentRevoked event can exist for this pair. Only a single-capability revoke,
-    // which does not move the counter, could — so that one event still has to be scanned for.
-    agentLevelRevokePossible = false
-    // Epoch 0 leaves only capability-level revokes possible — and even those need the agent to
-    // have held a capability. The contract's _activeByAgent gains entries only at grant and loses
-    // its last one only inside the epoch-bumping revoke, so an empty active list with epoch 0
-    // proves the agent was NEVER granted — and a never-granted agent can have no CapabilityRevoked
-    // event either. One read replaces the whole scan, cursor or no (in-15 J-10 — Sep 27's fresh
-    // agent burned ~928 getLogs requests reaching this same answer).
-    const active = await input.client.readContract({
-      address: input.deployment.capabilityRegistry,
-      abi: capabilityRegistryAbi,
-      functionName: "activeCapabilityIds",
-      args: [input.owner, input.agentId],
-    })
-    if (!Array.isArray(active)) throw new Error("activeCapabilityIds did not return a list")
-    if (active.length === 0) {
-      await input.cursor?.save({ observedThroughBlock: toBlock, previouslyRevoked: false })
-      return { owner: input.owner, agentId: input.agentId, previouslyRevoked: false, observedThroughBlock: toBlock }
+  const answer = (previouslyRevoked: boolean): OwnerAgentHistory => ({
+    owner: input.owner,
+    agentId: input.agentId,
+    previouslyRevoked,
+    observedThroughBlock: toBlock,
+  })
+  // agentEpoch(owner, agentId) starts at 0, every whole-agent revoke adds 1
+  // (Revocations.revokeAgentAndRotate), and nothing lowers it — a counter above 0 IS the answer,
+  // in one read. A failed or malformed read throws: it never defaults to "not revoked".
+  const epoch = await input.client.readContract({
+    address: input.deployment.capabilityRegistry,
+    abi: capabilityRegistryAbi,
+    functionName: "agentEpoch",
+    args: [input.owner, input.agentId],
+  })
+  if (typeof epoch !== "bigint") throw new Error("agentEpoch did not return an integer")
+  if (epoch > 0n) return answer(true)
+  // Epoch 0 rules the whole-agent revoke out. The agent's list is empty only before its first
+  // grant or after an epoch-bumping revoke — _storeCapability compacts and then pushes, so a
+  // granted pair never reads empty — and nothing that was never granted could have been revoked.
+  const ids = await input.client.readContract({
+    address: input.deployment.capabilityRegistry,
+    abi: capabilityRegistryAbi,
+    functionName: "activeCapabilityIds",
+    args: [input.owner, input.agentId],
+  })
+  if (!Array.isArray(ids)) throw new Error("activeCapabilityIds did not return a list")
+  if (ids.length === 0) {
+    await input.cursor?.save({ observedThroughBlock: toBlock, previouslyRevoked: false })
+    return answer(false)
+  }
+  // The second source: a single-capability revoke sets the record's revoked flag but leaves the
+  // id listed until the next grant's _compact removes it — so every listed id's record is read.
+  // A failed read or a non-record answer throws; it never counts as "not revoked".
+  let revoked = false
+  let next = 0
+  const readOne = async (): Promise<void> => {
+    while (!revoked && next < ids.length) {
+      const id = ids[next] as Hex
+      next += 1
+      const capability = await input.client.readContract({
+        address: input.deployment.capabilityRegistry,
+        abi: capabilityRegistryAbi,
+        functionName: "getCapability",
+        args: [id],
+      })
+      if (capability === null || typeof capability !== "object" || typeof (capability as { revoked?: unknown }).revoked !== "boolean") {
+        throw new Error("getCapability did not return a capability record")
+      }
+      if ((capability as { revoked: boolean }).revoked) revoked = true
     }
   }
-  // The cursor is consulted only AFTER the contract answered: an epoch above 0 already proved a
-  // revoke with one request, and no cache should shadow that. A saved true is sticky — revoked is
-  // forever — and a position AT the head leaves nothing new to scan.
-  let cursor = await input.cursor?.load()
-  if (cursor !== undefined && cursor.observedThroughBlock > toBlock) {
-    // a cursor ahead of the head is impossible for an honest file — wrong chain, a redeploy or a
-    // tampered file. It is treated exactly like a malformed one: ignored wholesale (the saved
-    // `previouslyRevoked` included) and overwritten by the scan below (R5-7).
-    cursor = undefined
+  await Promise.all(Array.from({ length: Math.min(CAPABILITY_READ_CONCURRENCY, ids.length) }, () => readOne()))
+  if (revoked) {
+    await input.cursor?.save({ observedThroughBlock: toBlock, previouslyRevoked: true })
+    return answer(true)
   }
-  if (cursor !== undefined) {
-    if (cursor.previouslyRevoked) {
-      return { owner: input.owner, agentId: input.agentId, previouslyRevoked: true, observedThroughBlock: toBlock }
-    }
-    if (cursor.observedThroughBlock === toBlock) {
-      return { owner: input.owner, agentId: input.agentId, previouslyRevoked: false, observedThroughBlock: toBlock }
-    }
+  // The third source is this machine's memory of an earlier yes — nothing un-revokes, so a saved
+  // yes keeps answering even after the grant that compacted the revoked id away. A cursor ahead
+  // of the head is impossible for an honest file — wrong chain, a redeploy or tampering — so its
+  // block number is not trusted; but a remembered yes is never discarded, because no lagging or
+  // ahead-of-head chain answer can un-revoke (R5-7).
+  const cursor = await input.cursor?.load()
+  if (cursor?.previouslyRevoked === true) {
+    await input.cursor?.save({ observedThroughBlock: toBlock, previouslyRevoked: true })
+    return answer(true)
   }
-  const fromBlock =
-    cursor !== undefined && cursor.observedThroughBlock + 1n > input.deployment.deploymentBlock
-      ? cursor.observedThroughBlock + 1n
-      : input.deployment.deploymentBlock
-  const filter = { owner: input.owner, agentId: input.agentId }
-  // The estimate counts one request per window at the size the scan opens with — a range refusal
-  // splits the rest into smaller pieces, so the real count can grow past it.
-  const maxRange = clampLogRange(input.maxRange)
-  input.onScan?.(blockWindows(fromBlock, toBlock, maxRange).length)
-  const logs = [
-    ...(await getLogsChunked(input.client, { address: input.deployment.capabilityRegistry, fromBlock, toBlock, event: CAPABILITY_REVOKED, args: filter }, { maxRange, onProgress: input.onProgress })),
-    ...(agentLevelRevokePossible ? await getLogsChunked(input.client, { address: input.deployment.capabilityRegistry, fromBlock, toBlock, event: AGENT_REVOKED, args: filter }, { maxRange, onProgress: input.onProgress }) : []),
-  ]
-  const previouslyRevoked = logs.some((log) => same(log.args.owner, input.owner) && same(log.args.agentId, input.agentId))
-  // Only a complete scan may move the cursor — a failed window threw above, so what is saved here
-  // always covers every block up to toBlock.
-  await input.cursor?.save({ observedThroughBlock: toBlock, previouslyRevoked })
-  return { owner: input.owner, agentId: input.agentId, previouslyRevoked, observedThroughBlock: toBlock }
+  await input.cursor?.save({ observedThroughBlock: toBlock, previouslyRevoked: false })
+  return answer(false)
 }

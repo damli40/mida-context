@@ -17,9 +17,14 @@
 //   reasoning — prints only {"thinking":"x"} (no content fields → no-json)
 //   longitem — good, but progress[0] is 2,001 chars (over the schema limit)
 //   wide     — good, but decisions has 51 entries (over the schema limit)
+//   wide-all — good, but every list has 60 entries, with evidence pointing at
+//              cut and kept positions (CAP-29)
 //   echo-previous — parses the JSON on the line after "PREVIOUS CHECKPOINT" in
 //              its stdin and echoes it back with one extra progress item: the
 //              block must reach the model intact and parseable
+//   add-decision — like echo-previous, but appends one decision
+//              {decision:"newest",rationale:"r"}: the 51st decision a session
+//              already at the cap actually produces (CAP-29)
 //   stderr-fail — writes "kimi http 429" to stderr, exits 1 (stderrDetail tests)
 //   cache-stats — GOOD on stdout plus "cache hit=11 miss=22" on stderr, exit 0:
 //              the provider's usage line a compile with stderrDetail reads
@@ -36,6 +41,20 @@
 //              fired once on the primary and never on a fallback
 //   prose-secret — prints a long paragraph holding a key shape and no JSON:
 //              the failure sample must carry it scrubbed and cut to 200 chars
+//   stale-note — GOOD but unresolvedIssue ends in the OLD counted note wording
+//              this branch once wrote (not an exact note now — kept as text, UF-J)
+//   stale-note-only — GOOD but unresolvedIssue IS that old wording alone —
+//              kept whole, never collapsed to null (UF-J)
+//   long-issue — GOOD with 51 decisions and a 1,990-char unresolvedIssue:
+//              the trim note must fit inside the string cap whole (UF-J)
+//   issue-and-old-note — GOOD with a 1,990-char unresolvedIssue followed by a
+//              complete current note: strip must run before the string cap (UF-K)
+//   cut-note-tail — GOOD with an unresolvedIssue ending in a tail that only
+//              STARTS like a note (no closing bracket): not an exact note, so
+//              it is the model's own text and is kept as it is (UF-K, UF-QA)
+//   claims-limit-note — GOOD with an unresolvedIssue that ends in the NEW
+//              limit-note wording the model wrote itself: the claim is stripped,
+//              never trusted (UF-L)
 //
 // The mode comes from argv[2] when present, else FAKE_MODEL_MODE — argv lets a
 // primary and a fallback command differ inside one compile even though both
@@ -156,6 +175,28 @@ process.stdin.on("end", () => {
         decisions: Array.from({ length: 51 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
       })
       break
+    case "wide-all": {
+      const sixty = (p) => Array.from({ length: 60 }, (_, i) => `${p}${i}`)
+      fenced({
+        ...GOOD,
+        progress: sixty("p"),
+        decisions: sixty("d").map((decision) => ({ decision, rationale: "r" })),
+        rejected: sixty("x").map((approach) => ({ approach, why: "w" })),
+        constraints: sixty("c"),
+        artifacts: sixty("src/a"),
+        remainingPlan: sixty("step "),
+        evidence: [
+          { field: "decisions[5]", ref: "transcript:L5" }, // its decision is cut → dropped
+          { field: "decisions[10]", ref: "transcript:L10" }, // first kept → decisions[0]
+          { field: "decisions[59].rationale", ref: "transcript:L59" }, // → decisions[49].rationale
+          { field: "progress[9]", ref: "transcript:L109" }, // cut → dropped
+          { field: "progress[59]", ref: "transcript:L159" }, // → progress[49]
+          { field: "remainingPlan[2]", ref: "transcript:L202" }, // the plan keeps its front → unchanged
+          { field: "nextAction", ref: "transcript:L300" }, // no position → unchanged
+        ],
+      })
+      break
+    }
     case "stderr-fail":
       process.stderr.write("kimi http 429\n")
       process.exit(1)
@@ -176,12 +217,66 @@ process.stdin.on("end", () => {
       process.stderr.write("cache hit=soon miss=later\n")
       fenced(GOOD)
       break
+    case "stale-note":
+      fenced({
+        ...GOOD,
+        unresolvedIssue:
+          "the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+      })
+      break
+    case "stale-note-only":
+      fenced({
+        ...GOOD,
+        unresolvedIssue: "(Mida: a list holds at most 50 entries. Left out: the 2 oldest constraints.)",
+      })
+      break
+    case "long-issue":
+      fenced({
+        ...GOOD,
+        decisions: Array.from({ length: 51 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+        unresolvedIssue: "i".repeat(1990),
+      })
+      break
+    case "issue-and-old-note":
+      fenced({
+        ...GOOD,
+        unresolvedIssue:
+          "i".repeat(1990) +
+          " | (Mida: a list holds at most 50 entries. Older decisions were left out.)",
+      })
+      break
+    case "cut-note-tail":
+      fenced({
+        ...GOOD,
+        unresolvedIssue:
+          "the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Left out: the 1 oldest de",
+      })
+      break
+    case "pipes":
+      fenced({ ...GOOD, unresolvedIssue: "CI passes only because of `make test || true`" })
+      break
+    case "claims-limit-note":
+      fenced({
+        ...GOOD,
+        unresolvedIssue:
+          "ops is still flaky | (Mida: a list holds at most 50 entries. Older constraints were left out.)",
+      })
+      break
     case "echo-previous": {
       const lines = input.split("\n")
       const i = lines.findIndex((l) => l.startsWith("PREVIOUS CHECKPOINT"))
       if (i === -1) process.exit(4)
       const prev = JSON.parse(lines[i + 1])
       prev.progress = [...prev.progress, "echo-previous saw the block"]
+      fenced(prev)
+      break
+    }
+    case "add-decision": {
+      const lines = input.split("\n")
+      const i = lines.findIndex((l) => l.startsWith("PREVIOUS CHECKPOINT"))
+      if (i === -1) process.exit(4)
+      const prev = JSON.parse(lines[i + 1])
+      prev.decisions = [...prev.decisions, { decision: "newest", rationale: "r" }]
       fenced(prev)
       break
     }

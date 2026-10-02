@@ -9,6 +9,24 @@
 /** The warning line must stay a line — hard cap, counting the ellipsis. */
 const MAX_SYSTEM_MESSAGE = 160
 
+/**
+ * The closing fence of every handoff text. It lives on this leaf because the MCP adapter caps
+ * the handoff reply at 40,000 chars and must never cut through it — handoff.ts re-exports the
+ * same constant so the fence is defined once (mcp.ts may only reach leaf modules).
+ */
+export const HANDOFF_TAIL = "=== END MIDA HANDOFF DATA ==="
+
+/** The opening fence — same leaf, same reason: the cap's before-BEGIN scan needs it here. */
+export const HANDOFF_BEGIN = "=== BEGIN MIDA HANDOFF DATA ==="
+
+/**
+ * The opening of the renderer's over-target preamble note — the same literal render.ts exports
+ * as OVERSIZE_NOTE_LEAD, carried on this leaf for the same reason the fences are (the MCP
+ * adapter rewrites whole lines that start with it when its 40,000 cap cuts a reply). A test
+ * pins the two copies together.
+ */
+export const OVERSIZE_NOTE_LEAD = "Mida note: this handoff is longer than its size target."
+
 /** Anything shaped like a raw id or key never reaches the owner's line. */
 const LONG_HEX = /0x[0-9a-f]{40,}|[0-9a-f]{40,}/gi
 
@@ -44,6 +62,8 @@ export interface SessionStartBody {
   savedAt?: string
   cut?: boolean
   oversized?: boolean
+  /** The daemon reports when the render left out reasons behind decisions/rejected approaches. */
+  reasonsLeftOut?: boolean
   /** The store's list was incomplete — the owner's line must say so, never claim completeness. */
   partial?: boolean
   /** The contextIds the handoff covered — the session's whats-new seen set starts from these. */
@@ -117,24 +137,37 @@ export function sessionStartMessage(body: SessionStartBody | null | undefined, a
         : ""
     // honest size state in plain words (in-20 T-3): the "(shortened, longer than the
     // limit)" pair read like a contradiction and a failure. What happened is said
-    // instead — "trimmed" only when progress was actually left out, "above the size
+    // instead — "trimmed" only when something was actually left out, "above the size
     // target" when the text is still over, and the two combine with "; still" so a
     // trimmed handoff that remains over never reads as two separate problems (R5-4).
-    // A partial store list joins with "; " after the size part: the owner hears
-    // "incomplete", never a count that looks whole (M3-D).
+    // UF-J: "trimmed" now names WHAT went — "older entries" for a history cut, "reasons"
+    // for the reasons behind decisions and rejected approaches, both when both went —
+    // so the owner never hears "trimmed" for a rule the text kept silent about.
+    // A partial store list must be heard: "incomplete" OPENS the bracket, ahead of the size
+    // part — the line is cut at 160 chars and a trailing "incomplete" falls off the end
+    // entirely, telling the owner a partial read was complete (M3-D, UF-K).
+    const what =
+      body.cut === true && body.reasonsLeftOut === true
+        ? "older entries and reasons"
+        : body.cut === true
+          ? "older entries"
+          : body.reasonsLeftOut === true
+            ? "reasons"
+            : null
     const size =
-      body.cut === true
+      what === null
         ? body.oversized === true
-          ? "oldest progress trimmed; still above the size target"
-          : "oldest progress trimmed to fit"
-        : body.oversized === true
           ? "above the size target"
           : null
-    const state = size !== null
-      ? ` (${size}${body.partial === true ? "; incomplete — try again in a moment" : ""})`
-      : body.partial === true
-        ? " (incomplete — try again in a moment)"
-        : ""
+        : body.oversized === true
+          ? `${what} trimmed; still above the size target`
+          : `${what} trimmed to fit`
+    const state =
+      body.partial === true
+        ? ` (incomplete — try again in a moment${size !== null ? `; ${size}` : ""})`
+        : size !== null
+          ? ` (${size})`
+          : ""
     return systemMessage(`Mida: handoff loaded — ${counts}${from}${state}`)
   }
   if (body.kind === "empty") {

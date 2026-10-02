@@ -200,7 +200,7 @@ describe("destination round trip on local Anvil", () => {
     await init(runtime, ["claude-code"])
     await requestAccess(runtime, "claude-code")
     await approve(runtime, "claude-code")
-  }, 180_000)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

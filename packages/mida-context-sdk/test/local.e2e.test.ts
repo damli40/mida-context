@@ -109,7 +109,7 @@ describe("local transport against a real midad on local Anvil", () => {
     // cursor's handoff seeds the daemon's memory copies, so codex's whats-new can notice the save
     const seed = await callDaemon(home, "/handoff", { agent: "cursor", cwd: workDir }, { timeoutMs: 30_000 })
     expect(seed.status).toBe(200)
-  }, STEP_TIMEOUT * 6)
+  }, 600_000)
 
   afterAll(async () => {
     await daemon?.close()

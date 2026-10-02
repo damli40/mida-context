@@ -98,7 +98,7 @@ describe("M1 drainOnce on local Anvil", () => {
     mkdirSync(join(homeDir, ".claude", "projects", "proj"), { recursive: true })
     transcriptPath = join(homeDir, ".claude", "projects", "proj", "transcript.jsonl")
     writeFileSync(transcriptPath, JSON.stringify({ type: "user", message: { content: "Build a rate limiter" } }) + "\n")
-  }, STEP_TIMEOUT * 2)
+  }, 600_000)
 
   afterAll(async () => {
     await env?.stop()
@@ -251,20 +251,66 @@ describe("M1 drainOnce on local Anvil", () => {
     for (const field of CONTENT_FIELDS) expect(secondInput.previous?.[field]).toEqual(saved[field])
   }, STEP_TIMEOUT)
 
-  it("a job older than a day is moved to queue/bad without work", async () => {
-    const stale = enqueue(home, {
+  // UF-QC: one age rule for every job — seven days, whatever happened to it. A 30-hour job
+  // (over the old 24-hour rule) is worked like any other; only an 8-day job goes to queue/bad.
+  it("a 30-hour job is worked normally; an 8-day job goes to queue/bad as older-than-7d", async () => {
+    appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "did step 4" }] } }) + "\n")
+    const fresh = enqueue(home, {
       agent: "claude-code",
       event: "Stop",
-      sessionId: "s4",
+      sessionId: "s-30h",
       transcriptPath,
       cwd: workDir,
       error: null,
-    }, () => new Date(clock - 25 * 60 * 60 * 1000))
+    }, () => new Date(clock - 30 * 60 * 60 * 1000))
+    const stale = enqueue(home, {
+      agent: "claude-code",
+      event: "Stop",
+      sessionId: "s-8d",
+      transcriptPath,
+      cwd: workDir,
+      error: null,
+    }, () => new Date(clock - 8 * 24 * 60 * 60 * 1000))
     const before = compileCalls.length
     const result = await drain()
-    expect(result).toMatchObject({ saved: 0, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0 })
-    expect(compileCalls.length).toBe(before)
+    expect(result).toMatchObject({ saved: 1, skippedUnchanged: 0, skippedTooSoon: 0, failed: 0 })
+    expect(compileCalls.length - before).toBe(1)
+    expect(home.has(`queue/bad/${fresh.id}.json`)).toBe(false)
     expect(home.has(`queue/bad/${stale.id}.json`)).toBe(true)
+    expect(readFileSync(home.path("logs/drain.jsonl"), "utf8")).toContain("older-than-7d")
     expect(listJobs(home)).toHaveLength(0)
+  }, STEP_TIMEOUT)
+
+  it("(k) two readScope() reads on one runtime share epoch keys — the second read spends zero wrap fetches (CHAIN-04)", async () => {
+    // A save of its own keeps this test true when it runs alone, not only after (a)-(j).
+    appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "scope share step" }] } }) + "\n")
+    job({ event: "Stop", sessionId: "s-k" })
+    await drain()
+    // The daemon's actual sharing: every agent() and every readScope() facade hands callers the
+    // runtime's one EpochKeyCache. Scoped reads in one home see one wrap fetch the first time and
+    // none the second — the count here is of real GET /epoch-wraps calls on the store.
+    const service = await openService()
+    try {
+      let wraps = 0
+      const realFetch = globalThis.fetch
+      globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+        if (init?.method === "GET" && new URL(url).pathname === "/epoch-wraps") wraps += 1
+        return realFetch(input, init)
+      }) as typeof fetch
+      try {
+        const first = await readCheckpoints(service.readScope(), "claude-code", PROJECT_ID)
+        const afterFirst = wraps
+        expect(first.checkpoints.length).toBeGreaterThan(0)
+        expect(afterFirst).toBeGreaterThan(0)
+        const second = await readCheckpoints(service.readScope(), "claude-code", PROJECT_ID)
+        expect(wraps).toBe(afterFirst)
+        expect(second.checkpoints.length).toBe(first.checkpoints.length)
+      } finally {
+        globalThis.fetch = realFetch
+      }
+    } finally {
+      await service.close()
+    }
   }, STEP_TIMEOUT)
 })

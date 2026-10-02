@@ -13,6 +13,7 @@ import { MidaError } from "@mida/protocol"
 import {
   SPONSORED_IMPLEMENTATION,
   SponsorDidNotPay,
+  isSponsorDailyLimitReason,
   capabilityRegistryAbi,
   chainFor,
   contextRegistryAbi,
@@ -745,5 +746,28 @@ describe("sendContract on Anvil with a zero-balance wallet", () => {
     } finally {
       await node.stop()
     }
-  }, 120_000)
+  }, 600_000)
+})
+
+// UF-O item O2: the worker's refusal carries no machine-readable code, so the client recognises
+// a daily-limit refusal by its text. The worker's own suite pins these four strings to what it
+// really returns.
+describe("isSponsorDailyLimitReason (UF-O)", () => {
+  it("is true for each of the four daily-limit refusal texts, false otherwise", () => {
+    for (const text of [
+      "refused: this sender used its 300 sponsored signings for today — pay gas yourself or try tomorrow",
+      "refused: the sponsor's daily budget is exhausted — pay gas yourself or try tomorrow",
+      "refused: the sponsor's daily budget is spent — your wallet can pay instead",
+      "refused: this sender used its 120 free calls for today — try tomorrow",
+    ]) {
+      expect(isSponsorDailyLimitReason(text)).toBe(true)
+    }
+    expect(isSponsorDailyLimitReason("refused: the sender is not delegated to an allowed implementation")).toBe(false)
+    expect(isSponsorDailyLimitReason("")).toBe(false)
+  })
+
+  it("SponsorDidNotPay.dailyLimit records whether the refusal was a daily limit", () => {
+    expect(new SponsorDidNotPay("refused: this sender used its 120 free calls for today — try tomorrow").dailyLimit).toBe(true)
+    expect(new SponsorDidNotPay("offline").dailyLimit).toBe(false)
+  })
 })

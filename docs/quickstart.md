@@ -8,17 +8,22 @@ Each step ends with a status line. **Live** means it ran on Monad testnet with r
 
 - Node.js 22 or later (`node --version`)
 - Codex and/or Claude Code installed (the hooks work with either; the demo uses Codex then Claude Code)
+- A model to write the summaries. Claude Code or Codex being installed is enough: Mida uses their own small models, and step 2 asks you to confirm. With neither, step 2 lets you give an API key
 - Nothing else — the hosted store (`store.midacontext.xyz`) and gas sponsor (`sponsor.midacontext.xyz`) are the defaults, so no testnet MON is needed on the happy path
 
 ## 1. Install the CLI
 
-Until the package is published, pack it from the repo and install the tarball:
+```bash
+npm install -g mida-context
+```
+
+Or build it from the repo and install the tarball:
 
 ```bash
 cd mida-context
 pnpm install && pnpm build:publish
 cd publish/cli && npm pack
-npm install -g mida-context-0.1.1.tgz
+npm install -g mida-context-0.1.2.tgz
 ```
 
 Expected output (the file count may differ; the bin links are the point):
@@ -36,13 +41,17 @@ Then confirm it is on your PATH:
 mida --help
 ```
 
-Expected output:
+Expected output (npm `0.1.1` prints only the last line and has no `summarizer` command; in a terminal, 0.1.2 prints the Mida mark above these lines):
 
 ```
-usage: mida init | install <tool> [--no-mcp] | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | sponsor on|off | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or any identity add-agent or a client install provisions)
+Mida keeps your context in an encrypted store you own: the facts you tell it about yourself, and the checkpoints your AI agents save as they work.
+You approve each agent and you can revoke it. An approved agent reads what the others saved, so one agent can finish what another started.
+First run: mida init, then mida install <tool>, mida request <agent>, mida approve <agent>.
+
+usage: mida init | install <tool> [--no-mcp] | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | sponsor on|off | summarizer [use agents | use key | test] | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or any identity add-agent or a client install provisions)
 ```
 
-*Status: in tests. `pnpm check:publish` installs the packed tarball into a fresh folder outside the repo and runs `npx mida --help` to exit 0 with this text. The `-g` global-install variant links the same bins through npm's standard path.*
+*Status: in tests. `pnpm check:publish` installs the packed tarball into a fresh folder outside the repo and runs `npx mida --help` and checks that it exits 0 and prints the command list. The `-g` global-install variant links the same bins through npm's standard path.*
 
 ## 2. Create your vault and register the agents
 
@@ -50,7 +59,36 @@ usage: mida init | install <tool> [--no-mcp] | uninstall <tool> | add-agent <nam
 mida init
 ```
 
-What it does: generates your owner wallet and one identity per agent (`claude-code`, `codex`, `assistant`), registers them on Monad testnet, and starts the local daemon (`midad`). With the sponsor on — the default — every send is paid by the sponsor; your wallets can stay empty. (Devin is not among them: `mida install devin` registers that identity when you install the tool.)
+In a terminal, `mida init` opens with the Mida mark and one question: who writes your summaries. When a session ends, Mida turns the chat into a short record for your next agent, and a model has to write that record, so it is the one part of Mida that reads your session text.
+
+```
+  ╭     ╮
+  │  ●  │   mida
+  ╰     ╯   your context, in a store you own
+
+Mida keeps what you tell it and what your AI agents save, encrypted under keys you hold.
+
+How should Mida write its summaries?
+When a session ends, Mida turns the chat into a short
+record for your next agent. A model writes that record.
+
+  1  Your agents' small models (recommended)
+     Claude Code's haiku first, Codex's luna if Claude can't.
+     Who reads the chat: Anthropic or OpenAI, under your login.
+     What it uses: your plan, about one small-model message a minute while your agent works. It stops at your plan's limit.
+
+  2  Your own API key
+     Who reads the chat: the provider you choose.
+     What it uses: your key. Most providers charge under one cent a summary.
+
+Choose 1 or 2 [1]: 
+Saved: your agents' small models write the summaries.
+Change it later with: mida summarizer
+```
+
+Press Enter for option 1. The second line of option 1 names the tools you have installed (with only Codex it reads `Codex's luna.`). The question is asked once, and only when nothing has decided it already: not when you saved a choice before, not when an environment variable such as `DEEPSEEK_API_KEY` or `MIDA_COMPILE_MODEL` picks the model, and not when no terminal is attached (a script). In those cases `mida init` ends with one line that says what is in force, for example `Summaries: Claude Code's small model, then Codex's if Claude can't. Change it with: mida summarizer`. Ctrl-C at the question skips it and setup carries on. [Who writes the summaries](#who-writes-the-summaries) has the details.
+
+What it does next: generates your owner wallet and one identity per agent (`claude-code`, `codex`, `assistant`), registers them on Monad testnet, and starts the local daemon (`midad`). With the sponsor on — the default — every send is paid by the sponsor; your wallets can stay empty. (Devin is not among them: `mida install devin` registers that identity when you install the tool.)
 
 Expected output:
 
@@ -376,7 +414,7 @@ The server refuses to start — one line on stderr, exit 2, nothing on stdout �
 
 The model keys used for compiles live in the daemon, not in this server: start the daemon from a terminal that has them (any `mida` command does), and the MCP server reuses it over the socket; a daemon the client spawns itself would have no keys and could not compile.
 
-The client then sees five tools — `mida_handoff` (the same text a session-start hook would inject), `mida_whats_new` (the per-prompt note), `mida_read` (a context namespace), `mida_status` (health plus each agent's verdict for this folder) and `mida_save`. `mida doctor` prints `ok: mida-mcp resolves to <path>` once the package is installed.
+The client then sees five tools — `mida_handoff` (the same text a session-start hook would inject), `mida_whats_new` (the per-prompt note), `mida_read` (a context namespace), `mida_status` (health plus each agent's verdict for this folder) and `mida_save`. Every other identity sees only the first four: Claude Code and Codex save through their Mida hooks instead, and an agent added with `mida add-agent` has no save path through this server. `mida doctor` prints `ok: mida-mcp resolves to <path>` once the package is installed.
 
 `mida_save` is the one write: the model fills the ten checkpoint fields (objective, progress, decisions, rejected, constraints, artifacts, unresolvedIssue, nextAction, remainingPlan, evidence — plus an optional `originalRequest` carrying the user's own words, up to 6,000 characters) and sends them to the daemon over the socket. The adapter still holds no keys — `midad` validates the shape and names any field it does not know, scrubs secrets with the same scrubber the transcript compiler uses, checks the same gates a read passes (registered MCP identity → this folder is approved for it → the chain grant includes CREATE on the project area → not revoked), then seals, stores and registers the checkpoint signed as the client's own identity. Every save by one client in one project chains under one stable session id, so a later handoff merges them as a single history. A client the owner approved for READ only gets the actionable line instead: `<name> can read but not write here — run \`mida request <name>\` and \`mida approve <name>\` to add write access`. The approval a client needs is the one `mida approve <client>` already grants — its access request asks for READ | CREATE | SUPERSEDE_OWN on the project area.
 
@@ -540,9 +578,46 @@ Two honest warnings, printed inside the folder too: **the readable files are pla
 
 *Status: in tests, on a local chain. `apps/midad/test/export.e2e.test.ts` exports a six-record universe (two agents, a superseded checkpoint plus a newer plain-create checkpoint, an owner fact, a second-namespace record, one batched save) through the real CLI, then executes the README's own hash recipe against the chain. `apps/midad/test/export.test.ts` covers every refusal and the staging cleanup.*
 
-## The compile model: DeepSeek by default
+## Who writes the summaries
 
-Every checkpoint save runs one compile call: the session's transcript text (secrets scrubbed first) goes to a model that returns the compact checkpoint. You choose the provider:
+Every checkpoint save runs one model call: the session's transcript text (secrets scrubbed first) goes to a model that returns the compact checkpoint. You choose who that is, at `mida init` or later:
+
+```bash
+mida summarizer                 # who writes them now, and whether it is working
+mida summarizer use agents      # your agents' own small models
+mida summarizer use key         # asks for a provider and a key (typing is hidden)
+mida summarizer test            # writes one test summary and says who wrote it
+```
+
+Expected output of `mida summarizer` on a machine with both tools and the default choice:
+
+```
+Summaries are written by: your agents' small models
+  1st  Claude Code (haiku)   ready, not used yet
+  2nd  Codex (luna)          ready, not used yet
+
+Change it: mida summarizer use agents | mida summarizer use key
+Check it:  mida summarizer test
+```
+
+and of `mida summarizer test`:
+
+```
+Asking Claude Code (haiku) for a test summary. This can take up to 90 s.
+Wrote one test summary with Claude Code (haiku) in 30 s.
+```
+
+**Your agents' small models (the default).** Claude Code's `haiku` writes the summary; when it cannot (a usage limit, not logged in, not installed), Codex's `gpt-6-luna` does. Both run in an empty folder with their hooks and your personal settings off; a current Claude Code runs with no tools (an older one that lacks that switch keeps its tools under their default permission rules, so update it), Codex with its shell tool off in its read-only sandbox. It draws on your plan: about one small-model message a minute while your agent works. A plan's limit covers every model on that plan, so with only one tool installed the summaries stop when that tool does; with both, the other one takes over, which also means OpenAI reads a Claude Code session's text in that case (and the other way round).
+
+**Your own API key.** `mida summarizer use key` asks for DeepSeek, Moonshot (Kimi) or any OpenAI-compatible endpoint (for OpenAI itself: `https://api.openai.com/v1`), then for the key. It is stored in `~/.mida/summarizer.json`, readable only by you, and it has exactly one reader: a failed call is retried, never sent to another provider.
+
+**When no model can write.** The save waits and Mida keeps retrying it: hourly while it waits on a known limit; when the summary itself keeps failing, often at first and then a few times a day, asking each model in your list once per try. Mida stops once that session has been quiet for seven days, so a session you are still using is never dropped. The next agent's handoff says saves are waiting and why, and `mida doctor` prints a `PROBLEM:` line. After you fix the cause, run `mida summarizer test`: when it passes, Mida retries the waiting saves. Mida gives up early in one case: a save the model keeps answering with something it cannot use (it drops that save after three to eight such answers).
+
+*Status: in tests, and run for real on Oct 1 and 2 with both tools ([evidence](evidence/summariser-probe-2026-10-01.md)): each wrote a valid summary of the same sample session; with Claude made to fail, Codex took over. One sample, so not proof of equal quality.*
+
+### Environment variables (what 0.1.1 used; still honoured when you have saved no choice)
+
+With no saved choice, a key in the environment decides: DeepSeek, then Kimi, then your agents' small models.
 
 | Provider | You set | Model | Measured on the same transcript |
 |---|---|---|---|
@@ -550,9 +625,9 @@ Every checkpoint save runs one compile call: the session's transcript text (secr
 | Kimi | `KIMI_API_KEY` | `kimi-k2.7-code-highspeed` | 10.4 s median, 15/15, 3/3 |
 | Claude Haiku | nothing — uses your `claude` CLI login | `claude-haiku` | 22.6 s median, 15/15, 3/3 |
 
-With no keys at all the compiler is Haiku through the `claude` CLI — no extra setup, just slower. Set `DEEPSEEK_API_KEY` and DeepSeek takes over: it is roughly 10× cheaper than the others and has no fixed requests-per-minute cap. (DeepSeek charges double during UTC weekday mornings — even at peak it stays far below the alternatives.) If a call fails — rate limit, 5xx, timeout, or output that is not usable JSON — the compile walks to the next provider that is configured, ending at Haiku; each provider is tried at most once per compile and the checkpoint records which one actually wrote it. Compiles after the first one reuse the provider's prompt cache (DeepSeek and Kimi do this automatically); `~/.mida/logs/drain.jsonl` shows `cacheHit` per compile.
+With no keys at all the summaries come from your agents' small models, as above. Set `DEEPSEEK_API_KEY` and DeepSeek takes over: it is roughly 10× cheaper than the others and has no fixed requests-per-minute cap. (DeepSeek charges double during UTC weekday mornings — even at peak it stays far below the alternatives.) If a call fails — rate limit, 5xx, timeout, or output that is not usable JSON — the compile walks to the next provider that is configured, ending at your agents' small models; each provider is tried at most once per compile and the checkpoint records which one actually wrote it. Compiles after the first one reuse the provider's prompt cache (DeepSeek and Kimi do this automatically); `~/.mida/logs/drain.jsonl` shows `cacheHit` per compile.
 
-`MIDA_COMPILE_MODEL` pins the choice: `deepseek` | `kimi` | `haiku` | `custom`. Per-provider overrides: `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` / `DEEPSEEK_TIMEOUT_MS`, and the same trio for `KIMI_*`. `mida doctor` prints which provider is active, which host the text goes to, and the fallback chain — hosts only, never a full URL (its path could carry a key).
+`MIDA_COMPILE_MODEL` pins the choice: `deepseek` | `kimi` | `haiku` | `custom`. Per-provider overrides: `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` / `DEEPSEEK_TIMEOUT_MS`, and the same trio for `KIMI_*`. The background service reads these variables from whatever started it, which may not be your shell; a saved choice does not have that problem. `mida doctor` prints which model the running service uses, which host the text goes to, and the fallback chain with each fallback's host — hosts only, never a full URL (its path could carry a key).
 
 *Measured numbers and method: `docs/evidence/compile-model-speed-deepseek-2026-09-22.json` (DeepSeek) and `docs/evidence/compile-model-speed-2026-09-21.json` (Kimi, Haiku) — same 62-line transcript, 15 must-keep items checked per run. `deepseek-v4-pro` was benchmarked and rejected (~70 s, one no-JSON failure) — it is not offered.*
 

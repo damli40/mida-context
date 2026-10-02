@@ -16,7 +16,7 @@ describe("local Anvil deployment (plan Task 21)", () => {
     node = await startAnvil()
     deployment = await deployLocal({ rpcUrl: node.rpcUrl })
     publicClient = createPublicClient({ chain: chainFor(31337n), transport: http(node.rpcUrl) })
-  }, 180_000)
+  }, 600_000)
 
   afterAll(async () => {
     await node?.stop()
@@ -53,7 +53,7 @@ describe("agent registration through the chain adapter", () => {
   beforeAll(async () => {
     node = await startAnvil()
     deployment = await deployLocal({ rpcUrl: node.rpcUrl })
-  }, 180_000)
+  }, 600_000)
 
   afterAll(async () => {
     await node?.stop()

@@ -21,7 +21,8 @@
     "mida": "node --env-file=.env --import tsx apps/midad/src/cli.ts",
     "mida-hook": "node --import tsx apps/midad/src/hook-main.ts",
     "mida-drain": "node --import tsx apps/midad/src/drain-main.ts",
-    "bench": "node --import tsx bench/run.ts"
+    "bench": "node --import tsx bench/run.ts",
+    "bench:summary": "node --import tsx bench/continuation/summary.ts"
   },
   "dependencies": {
     "@mida-context/sdk": "workspace:*",

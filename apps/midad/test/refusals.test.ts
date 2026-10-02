@@ -253,9 +253,9 @@ describe("ownerRefusalLine (R4-5)", () => {
 })
 
 /**
- * R4-9 — the on-disk history cursor: `state/history/<agentId>.json` records where the last
- * successful scan ended, keyed on chain id and registry. Anything that does not match, or
- * cannot be read, answers undefined — a full scan, never a guess.
+ * R4-9 — the on-disk history cursor: `state/history/<agentId>.json` records the head the last
+ * check ran at and any saved yes, keyed on chain id and registry. Anything that does not match,
+ * or cannot be read, answers undefined — the contract is re-read, never a guess.
  */
 describe("historyCursor (R4-9)", () => {
   const home = () => new MidaHome(mkdtempSync(join(tmpdir(), "mida-history-")))

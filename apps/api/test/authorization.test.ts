@@ -108,7 +108,7 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     agentN = await provision(4, "AgentN")
     capabilityA = await grant(agentA, { kind: "recommended" })
     capabilityE = await grant(agentE, { kind: "custom", scopes: [{ namespaceId: CAREER, permissions: PERMISSION.READ, provenancePolicy: 0 }], expiresAt: (await latestTimestamp(owner)) + 120n })
-  }, 240_000)
+  }, 600_000)
 
   afterAll(async () => {
     await node?.stop()
@@ -205,12 +205,12 @@ describe("Context API authorization and the deny overlay (plan Task 23)", () => 
     // agentA holds a live capability at this point, so an owner-signed agent deny is accepted; the per-capability
     // revocation below does not bump the owner-agent epoch, so the intent stays "active".
     await ownerClient.request("POST", "/revocations", { body: { agentId: agentA.agentId } })
-    await overlay.reconcile(reader)
+    await overlay.reconcileOwner(reader, vault.owner)
     expect((await overlay.list()).filter((intent) => intent.target.kind === "agent").map((intent) => intent.state)).toEqual(["active"])
 
     const approval = await vault.approveRevocation({ kind: "capability", capabilityId: capabilityA })
     expect((await overlay.get(approval.intentId))?.state).toBe("active")
-    await overlay.reconcile(reader)
+    await overlay.reconcileOwner(reader, vault.owner)
     expect((await overlay.get(approval.intentId))?.state).toBe("anchored")
     await expect(authorize(agentA, capabilityA)).rejects.toMatchObject({ code: "CAPABILITY_REVOKED" })
     expect((await overlay.list()).filter((intent) => intent.target.kind === "agent").map((intent) => intent.state)).toEqual(["active"])

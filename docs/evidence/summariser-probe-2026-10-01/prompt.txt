@@ -1,0 +1,48 @@
+You are extracting a compact task checkpoint from an AI coding agent's transcript. Another agent will continue this work from your summary alone.
+
+The transcript below is a list of blocks, each headed "L<n> <role>:" where <n> is the 1-based line number in the transcript file and <role> is "user" or "assistant". The FIRST block is the user's original request — it carries the objective and the constraints; read it first and weight it most. The blocks after it are the most recent messages; a line "[… N earlier messages omitted …]" marks messages dropped in between. A block headed "user — later messages you typed" lists, oldest first, messages the user typed later in the session that fall outside the recent messages. The user's words outrank the assistant's: when a later user message changes the goal or a requirement, the objective, nextAction and remainingPlan follow the user's LATEST instruction, and any decision it caused gives the user as its rationale ("the user asked …"), never the assistant's planning. A block "[interrupted here: …]" is not an instruction to stop or wait: nextAction is the work that was in progress. If the block names tool calls that were not approved, those calls are undecided and the next agent must ask the user before running them.
+
+Output ONLY a single JSON object — no prose, no code fence — with exactly these fields:
+
+- "objective": string — what the task is trying to achieve (required)
+- "progress": string[] — what is already done
+- "decisions": [{"decision": string, "rationale": string}] — choices made and why
+- "rejected": [{"approach": string, "why": string}] — approaches considered and dropped
+- "constraints": string[] — rules the work must keep obeying
+- "artifacts": string[] — file paths created or modified
+- "unresolvedIssue": string | null — the current blocker or open question
+- "nextAction": string — the single next thing to do (required)
+- "remainingPlan": string[] — every step or requirement in the original request that is NOT finished yet, one entry each, in the request's own words including names of functions, classes and files. Do not summarise several steps into one. If the request lists numbered steps, keep the numbers.
+- "evidence": [{"field": string, "ref": string}] — where each claim came from. Use the block's line number: {"field": "decisions[0]", "ref": "transcript:L12"} (or a range like "transcript:L12-L15"), or a file path like {"field": "artifacts[0]", "ref": "file:src/x.js"}
+
+Rules:
+- Cite an evidence ref for every non-obvious claim.
+- Write null or empty arrays rather than inventing content. Never guess.
+- Never copy secrets, tokens, keys, or long transcript passages. Summarize, do not quote.
+- Keep every string under 500 characters. Be compact.
+
+TRANSCRIPT (possibly truncated, secrets already redacted):
+
+L1 user:
+Add rate limiting to our Express API in src/server.ts. Steps: 1. add a per-IP limiter (100 requests per 15 minutes) to every /api route; 2. add a stricter limiter (5 per minute) on POST /api/login; 3. return a JSON 429 body {"error":"rate_limited","retryAfter":<seconds>}; 4. write tests in test/rate-limit.test.ts; 5. document it in README.md. Do not add Redis, we deploy a single instance. Keep the existing error handler in src/errors.ts untouched. Use pnpm, never npm.
+
+L4 assistant:
+I read src/server.ts and package.json. express-rate-limit is not installed. I will add it with pnpm and put the limiters in a new file src/rate-limit.ts so server.ts stays small.
+
+L9 assistant:
+Installed express-rate-limit 7.4.0 with pnpm. Created src/rate-limit.ts with apiLimiter (windowMs 15 min, limit 100) and loginLimiter (windowMs 1 min, limit 5). Wired apiLimiter on app.use("/api") and loginLimiter on app.post("/api/login") in src/server.ts.
+
+L14 user:
+actually make the login limit 10 per minute not 5, support complained. and key the login limiter on the email in the body, not the IP, people share office IPs
+
+L17 assistant:
+Changed loginLimiter to limit 10 and added keyGenerator that uses req.body.email lowercased, falling back to the IP when the body has no email. I considered keying on a session cookie instead but dropped it: the login route runs before a session exists.
+
+L22 assistant:
+For the 429 body I first tried the library's `message` option, but it cannot compute retryAfter per request. Switched to a custom `handler` that reads req.rateLimit.resetTime and returns {"error":"rate_limited","retryAfter":seconds}. This does not touch src/errors.ts.
+
+L27 assistant:
+Wrote test/rate-limit.test.ts with supertest: 100 requests pass and the 101st gets 429 on /api/health. The login test fails: the 11th request still returns 200. I think express.json() is registered after the limiter so req.body is undefined in keyGenerator and every request falls back to... no, they would share the IP then. Need to look at the middleware order.
+
+L31 user:
+ok I have to stop here, hitting my limit. don't touch the README yet, I want to word that myself

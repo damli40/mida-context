@@ -208,6 +208,64 @@ describe("inject-main process", () => {
     expect(res.stdout).toBe("")
   }, 30_000)
 
+  it("MIDA_INNER=1 — Mida's own summariser run — prints nothing, exits 0, and makes no request", async () => {
+    const dir = home()
+    dir.writeSecretJson("network.json", { rpcUrl: "http://127.0.0.1:1", deployment: {} })
+    // a daemon that counts every connection it receives: the guard must mean zero
+    let hits = 0
+    const s = createServer((socket: Socket) => {
+      hits += 1
+      socket.on("data", () => {})
+    })
+    await new Promise<void>((resolve, reject) => {
+      s.once("error", reject)
+      s.listen(socketPathFor(dir), () => resolve())
+    })
+    try {
+      const res = await run(["claude-code"], sessionStart(), dir.root, { MIDA_INNER: "1" })
+      expect(res.status).toBe(0)
+      expect(res.stdout).toBe("")
+      expect(res.stderr).toBe("")
+      expect(hits).toBe(0)
+    } finally {
+      await close(s)
+    }
+  }, 30_000)
+
+  it("MIDA_INNER=1 still drains stdin to its end before exiting — a hook must not leave the pipe unread", async () => {
+    const dir = home()
+    const res = await new Promise<{ status: number | null; stdout: string; stderr: string; aliveBeforeEof: boolean }>(
+      (resolve, reject) => {
+        const env: NodeJS.ProcessEnv = { ...process.env, MIDA_HOME: dir.root, MIDA_INNER: "1" }
+        delete env.DEVIN_PROJECT_DIR
+        const child = spawn(process.execPath, ["--import", "tsx", INJECT_MAIN, "claude-code"], { env, cwd: REPO_ROOT })
+        let stdout = ""
+        let stderr = ""
+        let aliveBeforeEof = false
+        child.stdout.on("data", (d: Buffer) => {
+          stdout += d.toString("utf8")
+        })
+        child.stderr.on("data", (d: Buffer) => {
+          stderr += d.toString("utf8")
+        })
+        child.on("error", reject)
+        child.on("exit", (code) => resolve({ status: code, stdout, stderr, aliveBeforeEof }))
+        // input is still arriving — the child must still be waiting on the pipe.
+        // The window clears tsx's ~1 s boot: a child that exits WITHOUT draining
+        // would already be gone; a drainer is still alive.
+        child.stdin.write(sessionStart())
+        setTimeout(() => {
+          aliveBeforeEof = child.exitCode === null
+          child.stdin.end()
+        }, 2_500)
+      },
+    )
+    expect(res.aliveBeforeEof).toBe(true)
+    expect(res.status).toBe(0)
+    expect(res.stdout).toBe("")
+    expect(res.stderr).toBe("")
+  }, 30_000)
+
   it("a Stop event prints nothing and exits 0", async () => {
     const res = await run(["claude-code"], JSON.stringify({ hook_event_name: "Stop", session_id: "s1", cwd: "/tmp/work" }), home().root)
     expect(res.status).toBe(0)

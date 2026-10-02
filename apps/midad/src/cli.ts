@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process"
+import { binaryOnPath, probeModel } from "@mida/compiler"
 import { realpathSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -18,6 +19,10 @@ import { callDaemon, ensureCurrentDaemon } from "./control.js"
 import { batchStatusProbe, decideLane, laneWhyText } from "./batching.js"
 import { debugLine, refusalCode } from "./debug-line.js"
 import { hostOf, runDoctor, runDoctorLive } from "./doctor.js"
+import { bannerLines } from "./banner.js"
+import { readSummarizer, currentSummarizer } from "./summarizer.js"
+import { chooseSummarizer, runSummarizer, secretInputStart, secretInputStep } from "./summarizer-cli.js"
+import type { SecretInputState, SecretPromptResult } from "./summarizer-cli.js"
 import { buildHandoff, generalAssistanceText, identityUnreadableText, isGeneralAssistant, noIdentityText, projectCheckRefusal } from "./handoff.js"
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
@@ -91,8 +96,17 @@ const ADD_AGENT_NAME = /^[a-z0-9][a-z0-9-]{0,39}$/
  */
 const BUILTIN_AGENT_NAMES: ReadonlySet<string> = new Set([...AGENTS, ...INSTALL_TOOLS])
 export const USAGE =
-  "usage: mida init | install <tool> [--no-mcp] | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | sponsor on|off | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>" +
+  "usage: mida init | install <tool> [--no-mcp] | uninstall <tool> | add-agent <name> | doctor [--live <tool>] | request <agent> | approve <agent> | approve --all | save-demo <agent> <projectId> | read <agent> <projectId> | read --as <agent> | remember <fact> | remember --replaces <id> <fact> | revoke <agent> | revoke --all | link <folder> | unlink [--folder <path>] | project new | batching on|off | sponsor on|off | summarizer [use agents | use key | test] | migrate [--undo] | task [<name> | --clear | show <name>] | export <folder>" +
   "   (tool = claude-code | codex | devin | claude-desktop | cursor; agent = claude-code | codex | devin | assistant — or any identity add-agent or a client install provisions)"
+export const ABOUT: readonly string[] = [
+  "Mida keeps your context in an encrypted store you own: the facts you tell it about yourself, and the checkpoints your AI agents save as they work.",
+  "You approve each agent and you can revoke it. An approved agent reads what the others saved, so one agent can finish what another started.",
+  "First run: mida init, then mida install <tool>, mida request <agent>, mida approve <agent>.",
+]
+/** What `mida --help` prints: what Mida is, a blank line, then the command list. */
+export function helpLines(): string[] {
+  return [...ABOUT, "", USAGE]
+}
 /** Every first word runCli understands — the daemon's /cli route refuses anything else. */
 export const CLI_COMMANDS: readonly string[] = ["init", "install", "add-agent", "remember", "migrate", "batching", "sponsor", "link", "unlink", "project", "task", "export", ...WITH_AGENT]
 /**
@@ -184,6 +198,16 @@ export interface CliDeps {
    * answer. There is no flag, file or environment variable that skips the question.
    */
   prompt?: (question: string) => Promise<string>
+  /**
+   * The hidden prompt for secrets — `summarizer use key` reads the API key through it, so the
+   * typed key never echoes. The default reads stdin raw; tests inject an answer.
+   */
+  secretPrompt?: (question: string) => Promise<SecretPromptResult>
+  /**
+   * Whether a binary sits on PATH — `init` and `install` ask which agent CLIs exist before
+   * offering the summariser choice. The default is a real PATH lookup; tests inject it.
+   */
+  onPath?: (bin: string) => boolean
   /**
    * Terminal presence for the commands that require it — approve, revoke, remember. The defaults
    * are the real `process.stdin`/`process.stdout`; tests inject them. There is no flag, file or
@@ -370,9 +394,10 @@ export async function runCliWithRuntime(
           }
         } else {
           let facts: Awaited<ReturnType<typeof readOwnerFacts>> | null
+          const denied: { namespace: string; code: string }[] = []
           try {
             // the owner's own list keeps history: a superseded fact prints with its replacement
-            facts = await readOwnerFacts(runtime, agent, { history: true })
+            facts = await readOwnerFacts(runtime, agent, { history: true, onDenied: (namespace, code) => denied.push({ namespace, code }) })
           } catch (error) {
             // a list the store calls incomplete is not "no facts" — say so, then still run the attempt
             if (!isMidaError(error, "PARTIAL_READ")) throw error
@@ -394,6 +419,19 @@ export async function runCliWithRuntime(
                 print(`  ${fact.namespace}: ${text} (id ${factShortId(fact.contextId)}, ${factStamp(fact.assertedAt)})${replaced}`)
               }
             }
+            // PROV-13: an area the store refused says so — an empty list would read as "nothing saved".
+            // DENIED also covers agent-wide causes (not approved, revoked, a stale key), so its line
+            // names both; a refused area that was asked for by name fails the command, as a refused
+            // projects.current read does.
+            const why: Record<string, string> = {
+              CAPABILITY_DENIED: `the store refused it: ${agent} holds no grant for this area, or is not approved or was revoked`,
+              CAPABILITY_EXPIRED: `${agent}'s grant for this area has expired`,
+              CAPABILITY_REVOKED: `${agent}'s access was revoked`,
+            }
+            for (const { namespace, code } of denied) {
+              if (only === undefined || namespace === only) print(`  ${namespace}: refused ${code} (${why[code] ?? "the store refused it"})`)
+            }
+            if (only !== undefined && denied.some((d) => d.namespace === only)) return 1
           }
           if (only === undefined) {
             const attempt = await attemptNamespaceRead(runtime, agent, NAMESPACE)
@@ -852,7 +890,119 @@ function addAgentCheck(home: MidaHome, argv: string[]): { kind: "usage" } | { ki
  * The owner commands — init, approve, revoke, remember — run here, in the `mida` process, on the
  * owner runtime. They never touch the daemon socket: the daemon cannot sign as the owner, and a
  * socket client must never be able to.
+ *
+ * The three helpers below are UF-P2c: the mark and the summariser choice opening of `init`, the
+ * `Summaries:` line after it, and the ask after `install`.
  */
+/** The deps `chooseSummarizer` needs, built from the wider CLI/install deps (UF-P2c). */
+function summarizerChoiceDeps(deps: {
+  home: MidaHome
+  env?: Record<string, string | undefined>
+  print: (line: string) => void
+  prompt?: (question: string) => Promise<string | undefined>
+  secretPrompt?: (question: string) => Promise<SecretPromptResult>
+  onPath?: (bin: string) => boolean
+  drainInput?: () => unknown | Promise<unknown>
+}): Parameters<typeof chooseSummarizer>[0] {
+  const env = deps.env ?? process.env
+  return {
+    home: deps.home,
+    env,
+    print: deps.print,
+    prompt: deps.prompt ?? terminalPromptOrAbandoned,
+    secretPrompt: deps.secretPrompt ?? terminalSecretPrompt,
+    onPath: deps.onPath ?? ((bin) => binaryOnPath(bin, env.PATH)),
+    drain: deps.drainInput ?? drainBufferedStdin,
+  }
+}
+
+/** Whether init/install may ask: nobody has decided, the choice file reads clean, and no CI. */
+function summarizerAskWanted(home: MidaHome, env: Record<string, string | undefined>, onPath?: (bin: string) => boolean): boolean {
+  if ((env.CI ?? "") !== "") return false
+  const choice = currentSummarizer(home, env, onPath !== undefined ? { onPath } : undefined)
+  return !choice.chosen && !choice.invalid
+}
+
+/**
+ * The opening of `mida init` (UF-P2c): the mark first, then — only when a real terminal is
+ * attached on both sides — the one-sentence explanation, and, when nobody has chosen a
+ * summariser yet, the choice block followed by an empty line. Returns whether the choice was
+ * asked this call, so the caller knows whether the trailing `Summaries:` line belongs.
+ */
+async function initOpening(deps: CliDeps): Promise<boolean> {
+  const stdinTTY = deps.stdinIsTTY ?? process.stdin.isTTY === true
+  const stdoutTTY = deps.stdoutIsTTY ?? process.stdout.isTTY === true
+  const env = deps.env ?? process.env
+  for (const line of bannerLines(env, stdoutTTY)) deps.print(line)
+  if (!(stdinTTY && stdoutTTY)) return false
+  deps.print("Mida keeps what you tell it and what your AI agents save, encrypted under keys you hold.")
+  deps.print("")
+  if (summarizerAskWanted(deps.home, env, deps.onPath)) {
+    try {
+      await chooseSummarizer(summarizerChoiceDeps(deps))
+    } catch {
+      // a prompt that dies mid-ask saves nothing and stops nothing else in init
+      deps.print("Nothing saved. Mida uses your agents' small models until you choose: mida summarizer")
+    }
+    deps.print("")
+    return true
+  }
+  return false
+}
+
+/** The one `Summaries:` line printed after init's own lines when nobody was asked this call. */
+function summariesLine(deps: CliDeps): string {
+  const env = deps.env ?? process.env
+  const choice = currentSummarizer(deps.home, env, deps.onPath !== undefined ? { onPath: deps.onPath } : undefined)
+  // agents mode names what is really installed — "your agents' small models" alone
+  // promised a writer that may not exist on this machine
+  const onPath = deps.onPath ?? ((bin: string) => binaryOnPath(bin, env.PATH))
+  const agentsWhat = () => {
+    const claude = onPath("claude")
+    const codex = onPath("codex")
+    if (claude && codex) return "Claude Code's small model, then Codex's if Claude can't"
+    if (claude) return "Claude Code's small model"
+    if (codex) return "Codex's small model"
+    return "your agents' small models, once Claude Code or Codex is installed"
+  }
+  const what =
+    readSummarizer(deps.home) === "invalid"
+      ? "none (summarizer.json cannot be read)"
+      : choice.mode === "key"
+        ? `${choice.entries[0]?.display ?? "your endpoint"}, with your own API key`
+        : choice.mode === "environment"
+          ? "the models your environment variables set"
+          : agentsWhat()
+  return `Summaries: ${what}. Change it with: mida summarizer`
+}
+
+/**
+ * The ask after `install` (UF-P2c): an empty line and the choice block, only when the command
+ * printed a success word, stdin AND stdout are terminals, and nobody has chosen yet.
+ */
+/** Whether install may ask: both sides of a real terminal, and nobody has chosen yet. */
+function installAskWanted(deps: {
+  home: MidaHome
+  env?: Record<string, string | undefined>
+  onPath?: (bin: string) => boolean
+  stdinIsTTY?: boolean
+  stdoutIsTTY?: boolean
+}): boolean {
+  const stdinTTY = deps.stdinIsTTY ?? process.stdin.isTTY === true
+  const stdoutTTY = deps.stdoutIsTTY ?? process.stdout.isTTY === true
+  return stdinTTY && stdoutTTY && summarizerAskWanted(deps.home, deps.env ?? process.env, deps.onPath)
+}
+
+async function installAsk(deps: Parameters<typeof summarizerChoiceDeps>[0]): Promise<void> {
+  deps.print("")
+  try {
+    await chooseSummarizer(summarizerChoiceDeps(deps))
+  } catch {
+    deps.print("Nothing saved. Mida uses your agents' small models until you choose: mida summarizer")
+  }
+}
+
+/** The owner commands themselves — see the doc comment above the helpers. */
 async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps): Promise<number> {
   const command = argv[0]!
   const agent = argv[1] ?? ""
@@ -872,9 +1022,11 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
 
   try {
     if (command === "init") {
+      const asked = await initOpening(deps)
       const result = await init(runtime, AGENTS)
       deps.print(`owner ${result.owner}`)
       for (const [name, agentId] of Object.entries(result.agents)) deps.print(`agent ${name} ${agentId}`)
+      if (!asked) deps.print(summariesLine(deps))
     } else if (command === "add-agent") {
       const check = addAgentCheck(runtime.home, argv)
       if (check.kind === "usage") return usage()
@@ -1003,6 +1155,7 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
           deps.print("devin: MCP server not added. This build does not know where Devin keeps MCP servers; hooks are installed.")
         }
         deps.print(`next: run \`mida approve devin\` in this folder`)
+        if (installAskWanted(deps)) await installAsk(deps)
         return 0
       }
       const client = tool as McpClientTool
@@ -1795,6 +1948,71 @@ function terminalPrompt(question: string): Promise<string> {
 }
 
 /**
+ * The typed prompt the summariser questions use (UF-P2R): the same question as terminalPrompt,
+ * but the line reader closing before an answer — Ctrl-C, Ctrl-D, stdin ending — resolves
+ * undefined instead of never answering, so the caller can leave the rest of the command alive.
+ */
+export function terminalPromptOrAbandoned(
+  question: string,
+  input: NodeJS.ReadableStream = process.stdin,
+  output: NodeJS.WritableStream = process.stdout,
+): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input, output })
+    let settled = false
+    const finish = (answer: string | undefined) => {
+      if (settled) return
+      settled = true
+      rl.close()
+      // an abandoned ask left the cursor on the question's own line — end it so the
+      // caller's "Nothing saved." line does not sit on the prompt line
+      if (answer === undefined) output.write("\n")
+      resolve(answer)
+    }
+    rl.question(question, (answer) => finish(answer))
+    rl.on("close", () => finish(undefined))
+  })
+}
+
+/**
+ * The hidden prompt for secrets (UF-P2b): writes the question, reads stdin in raw mode
+ * without echoing, ends on Enter, restores the terminal mode. Every keystroke rule lives in
+ * the pure `secretInputStep` (UF-P2R): control bytes and escape sequences are dropped whole,
+ * Ctrl-C or Ctrl-D on an empty line resolve undefined — an abandoned ask, not an empty key.
+ * Only ever called when stdin is a real terminal; without one it falls back to a plain
+ * question so nothing hangs.
+ */
+export function terminalSecretPrompt(
+  question: string,
+  stdin: NodeJS.ReadStream = process.stdin,
+  stdout: NodeJS.WritableStream = process.stdout,
+): Promise<SecretPromptResult> {
+  if (stdin.isTTY !== true || typeof stdin.setRawMode !== "function") return terminalPromptOrAbandoned(question, stdin, stdout)
+  return new Promise((resolve) => {
+    const wasRaw = stdin.isRaw === true
+    let state = secretInputStart()
+    const done = (s: SecretInputState) => {
+      stdin.removeListener("data", onData)
+      stdin.removeListener("end", onEnd)
+      stdin.setRawMode(wasRaw)
+      stdin.pause()
+      stdout.write("\n")
+      resolve(s.status === "done" ? { key: Buffer.from(s.bytes).toString("utf8"), trailing: s.trailing } : undefined)
+    }
+    const onData = (chunk: Buffer) => {
+      state = secretInputStep(state, chunk)
+      if (state.status !== "typing") done(state)
+    }
+    const onEnd = () => done(state)
+    stdout.write(question)
+    stdin.setRawMode(true)
+    stdin.resume()
+    stdin.on("data", onData)
+    stdin.once("end", onEnd)
+  })
+}
+
+/**
  * The owner commands on a passkey home (M3-F2): `init --passkey`, `approve`, `revoke` — and
  * `remember`, which has no passkey path yet. None of them may open Runtime: that call creates
  * owner secrets, and a passkey home is defined by their absence. Every signature goes to the
@@ -1817,9 +2035,11 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
         deps.print("this home already has a software owner key; a passkey owner needs a fresh MIDA_HOME")
         return 2
       }
+      const asked = await initOpening(deps)
       const result = await initPasskey(deps.home, deps.network, AGENTS, linkDeps)
       deps.print(`owner ${result.owner}`)
       for (const [name, agentId] of Object.entries(result.agents)) deps.print(`agent ${name} ${agentId}`)
+      if (!asked) deps.print(summariesLine(deps))
       return 0
     }
     if (command === "remember") {
@@ -1878,6 +2098,7 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
           const outcome = installDevin(deps.devinConfig ?? resolveDevinConfigPath(process.env, homedir()))
           deps.print(outcome === "already-installed" ? "already installed" : "installed")
           deps.print(`next: run \`mida approve devin\` in this folder`)
+          if (installAskWanted(deps)) await installAsk(deps)
           return 0
         }
         const client = tool as McpClientTool
@@ -2338,8 +2559,20 @@ export function runInstall(
     claudeUserConfig?: string
     /** The claude binary invocation — injected in tests; the real spawnSync by default. */
     claudeCli?: ClaudeCliRunner
+    /** Terminal presence for the post-install summariser ask (UF-P2c); defaults to the real TTY flags. */
+    stdinIsTTY?: boolean
+    stdoutIsTTY?: boolean
+    /** The summariser choice's prompts — injected in tests. */
+    prompt?: (question: string) => Promise<string>
+    secretPrompt?: (question: string) => Promise<SecretPromptResult>
+    /** The PATH probe the choice block asks about claude/codex — injected in tests. */
+    onPath?: (bin: string) => boolean
+    /** The environment the choice resolves against — injected in tests. */
+    env?: Record<string, string | undefined>
+    /** Drops stdin already buffered before the summariser question — the approve rule (UF-P2R). */
+    drainInput?: () => unknown | Promise<unknown>
   },
-): number {
+): number | Promise<number> {
   const tool = argv[1] ?? ""
   // --no-mcp is an install flag: it names exactly what it skips. On uninstall there is nothing
   // to skip — the entry goes with the hooks — so the flag is usage there. For the MCP-only
@@ -2396,6 +2629,11 @@ export function runInstall(
   const codexHooksBefore = argv[0] === "install" && tool === "codex" ? codexHookCommands(settingsPath) : undefined
   try {
     const outcome = run(settingsPath)
+    // UF-P2c: an install that lands — or was already there — offers the summariser choice at a
+    // real terminal when nobody has picked one yet. The ask is async, so only then does this
+    // function return a promise; every other outcome stays the number it always was.
+    const offer =
+      argv[0] === "install" && (outcome === "installed" || outcome === "already-installed") ? () => installAsk(deps) : undefined
     // Claude Code's MCP servers live in ~/.claude.json, which only the claude CLI may write —
     // the userConfig read is the is-it-ours check, never an edit. Codex's table needs no
     // extra step here: it rides inside the managed block installCodex wrote. The MCP step
@@ -2436,13 +2674,17 @@ export function runInstall(
       }
       // the reminder follows the hook commands, not the write: an MCP-only upgrade or a new
       // MIDA_HOME rewrites the block while leaving the commands Codex fingerprinted intact
-      if (!isDeepStrictEqual(codexHooksBefore, codexHookCommands(settingsPath))) deps.print(CODEX_TRUST_SENTENCE)
+      if (!isDeepStrictEqual(codexHooksBefore, codexHookCommands(settingsPath))) {
+        deps.print(CODEX_TRUST_SENTENCE)
+        deps.print("Then run mida doctor --live codex to check the hooks fire.")
+      }
     }
     if (argv[0] === "uninstall" && tool === "codex") {
       // the record clears only after the edit under the recorded home ran — a refused config
       // keeps it, because the trust the record describes was never lifted
       clearCodexHome(deps.home)
     }
+    if (offer !== undefined && installAskWanted(deps)) return offer().then(() => 0)
     return 0
   } catch (error) {
     deps.print(`refused: ${refusalCode(error)}`)
@@ -2472,6 +2714,35 @@ function spawnDaemon(cwd: string): void {
   child.unref()
 }
 
+/**
+ * `mida doctor`'s stale-service replacement, extracted so a test can inject the ensure call
+ * and check both the minute-long shutdown wait and what the onStillUp callback prints (UF-QF).
+ * `whenDown: "leave"` is the point of doctor's own swap: it never starts a service that is
+ * down — doctor's daemon check reports that instead.
+ */
+export async function doctorReplaceStaleService(
+  home: MidaHome,
+  ensure: typeof ensureCurrentDaemon = ensureCurrentDaemon,
+): Promise<void> {
+  const ensured = await ensure(home, () => spawnDaemon(home.root), {
+    waitMs: DAEMON_WAIT_MS,
+    whenDown: "leave",
+    // UF-QD: an older service can be slow to stop — allow it a minute, and once it has been
+    // three seconds say the wait is real, not a hang. UF-QF: it may only be sleeping between
+    // tries, so the line no longer claims a save is in flight.
+    shutdownWaitMs: 65_000,
+    onStillUp: () =>
+      process.stderr.write("The older Mida service is still busy. Waiting up to a minute for it to stop.\n"),
+  })
+  if (ensured.replaced !== undefined && ensured.up) {
+    process.stderr.write(
+      `restarted the Mida service (it was running code from ${ensured.replaced.codeRoot} @ ${ensured.replaced.codeCommit.slice(0, 7)})\n`,
+    )
+  } else if (ensured.replaced !== undefined || ensured.refusal !== undefined) {
+    process.stderr.write(`${ensured.refusal ?? "midad did not start; run mida doctor"}\n`)
+  }
+}
+
 /** Entry point for the `mida` command. Monad testnet only; a funder is optional (see testnet.ts). */
 async function main(): Promise<void> {
   // MIDA_HOME must mean the same folder here as in the daemon and both hooks (they all read it);
@@ -2481,7 +2752,8 @@ async function main(): Promise<void> {
   const print = (line: string) => console.log(line)
 
   if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
-    print(USAGE)
+    for (const line of bannerLines(process.env, process.stdout.isTTY === true)) print(line)
+    for (const line of helpLines()) print(line)
     process.exitCode = argv.length === 0 ? 2 : 0
     return
   }
@@ -2498,7 +2770,7 @@ async function main(): Promise<void> {
     (argv.length === 3 && argv[1] === "devin" && argv[2] === "--no-mcp")
   if (argv[0] === "uninstall" || (argv[0] === "install" && !installProvisionsIdentity)) {
     // the real settings paths are built here and only here — tests always pass their own
-    process.exitCode = runInstall(argv, {
+    process.exitCode = await runInstall(argv, {
       print,
       claudeSettings: join(homedir(), ".claude", "settings.json"),
       codexConfig: join(resolveCodexHome(process.env, homedir()), "config.toml"),
@@ -2519,6 +2791,12 @@ async function main(): Promise<void> {
       // simply not installed there and earns no line
       devin: resolveDevinConfigPath(process.env, homedir()),
     }
+    // UF-P3 P3c: an update can leave the OLD service running and doctor is the command the
+    // README sends the owner to — so doctor replaces a stale service exactly like the other
+    // commands (same ensureCurrentDaemon comparison), writes the same stderr line, and NEVER
+    // starts a service that is down: doctor's own daemon check reports that. A refused
+    // replacement or a service that does not come up goes to stderr and the checks still run.
+    const replaceStaleService = () => doctorReplaceStaleService(home)
     if (argv[1] === "--live") {
       const tool = argv[2] ?? ""
       if (argv.length !== 3 || !HOOK_TOOLS.includes(tool)) {
@@ -2526,7 +2804,10 @@ async function main(): Promise<void> {
         process.exitCode = 2
         return
       }
-      process.exitCode = await runDoctorLive(tool as InstallTool, { home, print })
+      // the stale-service swap lives inside runDoctorLive so its own refusals (CI, no
+      // terminal) are checked BEFORE the service is looked at — a refused --live replaces
+      // nothing (UF-QC). The bad-tool-name guard above already refused before this point.
+      process.exitCode = await runDoctorLive(tool as InstallTool, { home, print, replaceStaleService })
       return
     }
     if (argv.length !== 1) {
@@ -2534,7 +2815,29 @@ async function main(): Promise<void> {
       process.exitCode = 2
       return
     }
+    await replaceStaleService()
     process.exitCode = await runDoctor({ home, print, settings })
+    return
+  }
+
+  // `summarizer` is local like doctor: it answers from this home's files and a PATH probe,
+  // never through the daemon socket, and it is not in CLI_COMMANDS (UF-P2a).
+  if (argv[0] === "summarizer") {
+    process.exitCode = await runSummarizer(argv, {
+      home,
+      env: process.env,
+      print,
+      stdinIsTTY: process.stdin.isTTY === true,
+      stdoutIsTTY: process.stdout.isTTY === true,
+      prompt: terminalPromptOrAbandoned,
+      secretPrompt: terminalSecretPrompt,
+      onPath: (bin) => binaryOnPath(bin, process.env.PATH),
+      health: async () => {
+        const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 500 })
+        return reply.status === 0 ? undefined : reply.body
+      },
+      probe: probeModel,
+    })
     return
   }
 

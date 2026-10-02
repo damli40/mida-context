@@ -1,10 +1,15 @@
 import type { MergedHandoff } from "./merge.js"
+import { cutText } from "./schema.js"
 
 // Renders a merged handoff as plain text for the receiving agent.
-// The ORIGINAL REQUEST section leads the block — the user's own words, not a
-// summary — and is never trimmed. When the output would exceed maxChars the
-// oldest progress entries collapse into a count line; nothing else is cut
-// silently, and a still-oversize result says so in the text itself.
+// Constraints lead the block — the standing rules sit ahead of the user's own
+// words (ORIGINAL REQUEST, never trimmed) — and constraints, decisions and
+// rejected approaches are never left out. When the output would exceed maxChars
+// only history shrinks: the oldest progress, saved-by and artifact entries
+// collapse into count lines. When that is still not enough, the reasons behind
+// decisions and rejected approaches go (every entry stays) — but ONLY when that
+// brings the text to the limit, and a still-oversize result keeps every reason
+// and says so in a preamble note rather than dropping a rule.
 //
 // The output is text injected into another model's context, so it is fenced:
 // a header built per render sits ahead of the BEGIN line and tells the reader
@@ -16,6 +21,13 @@ import type { MergedHandoff } from "./merge.js"
 
 const BEGIN = "=== BEGIN MIDA HANDOFF DATA ==="
 const TAIL = "=== END MIDA HANDOFF DATA ==="
+
+/**
+ * The opening of the over-target note `build` appends to the preamble — kept as a constant so a
+ * caller that cuts the reply further (the MCP adapter's 40,000-char cap) can find the whole
+ * line and rewrite it honestly (UF-K). hook-output.ts carries the same literal for that leaf.
+ */
+export const OVERSIZE_NOTE_LEAD = "Mida note: this handoff is longer than its size target."
 
 /** The age wording the header's first line carries — whole units, clamped at zero for clock skew. */
 const ageText = (savedMs: number, nowMs: number): string => {
@@ -59,7 +71,9 @@ const OWN_HEADINGS = [
   "Objective:",
   "Unresolved issue:",
   "Decisions:",
+  "Decisions (reasons left out to fit):",
   "Rejected approaches:",
+  "Rejected approaches (reasons left out to fit):",
   "Constraints:",
   "Artifacts:",
   "Progress:",
@@ -69,19 +83,142 @@ const OWN_HEADINGS = [
   "What you have told Mida about yourself",
   "Mida note:",
   "PENDING_ANCHOR:",
+  // CAP-26: the marker on a save compiled on this machine but not yet on Monad
+  "UNSENT:",
+]
+
+/**
+ * UF-N2: every character that starts a new visual line — a bare carriage return (\r\n counts as
+ * one break), U+0085, U+2028, U+2029, vertical tab and form feed — so a marker hidden behind an
+ * odd break is checked like any other line start. Written through RegExp + string escapes so the
+ * source holds no literal line-separator character.
+ */
+const VISUAL_BREAKS = new RegExp("\\r\\n|[\\r\\v\\f\\x85\\u2028\\u2029]", "g")
+
+/**
+ * UF-QA: every character ignored when matching a line against Mida's own shapes — whitespace,
+ * separators, format and combining marks, plus the invisible characters that are none of those
+ * (Hangul jamo fillers U+115F and U+1160, Braille blank U+2800, Hangul filler U+3164, halfwidth
+ * Hangul filler U+FFA0). A marker padded with any of them still matches.
+ */
+const IGNORED = /[\s\p{Z}\p{Cf}\p{M}\u115F\u1160\u2800\u3164\uFFA0]/gu
+const IGNORED_RUN = "[\\s\\p{Z}\\p{Cf}\\p{M}\\u115F\\u1160\\u2800\\u3164\\uFFA0]*"
+
+/**
+ * Look-alike letters from other alphabets, keyed by their lowercase form — Cyrillic and Greek
+ * letters that imitate the Latin one a marker is written in. A marker written "Mіda" (Cyrillic
+ * і) still reads as "Mida" to the agent, so the key folds it onto the Latin letter.
+ */
+const LOOK_ALIKE: Record<string, string> = {
+  "а": "a", "α": "a", // Cyrillic а, Greek α
+  "с": "c",
+  "ԁ": "d",
+  "е": "e",
+  "һ": "h",
+  "і": "i", "ї": "i", "ι": "i",
+  "ј": "j",
+  "к": "k",
+  "м": "m", "т": "m", // lowercase Cyrillic м and т both imitate m
+  "ո": "n",
+  "о": "o", "ο": "o",
+  "р": "p",
+  "ѕ": "s",
+  "υ": "u",
+  "х": "x",
+  "у": "y",
+}
+
+/** Latin letter → every look-alike character that folds onto it (for the phrase rules below). */
+const ALIASES: Record<string, string> = {}
+for (const [from, to] of Object.entries(LOOK_ALIKE)) ALIASES[to] = (ALIASES[to] ?? "") + from
+
+const escapeClass = (c: string): string => c.replace(/[\\\]\[^-]/g, "\\$&")
+
+/**
+ * A phrase rule as one loose pattern: every needle letter also accepts its look-alikes, and
+ * ignored characters may sit between any two letters — so "mida  handoff", "MIDA\u200BHAN\u043EOFF"
+ * and the plain spelling all match.
+ */
+const loose = (needle: string): RegExp =>
+  new RegExp(
+    [...needle]
+      .map((c) => (/\p{L}|\p{N}/u.test(c) ? `[${escapeClass(c)}${[...(ALIASES[c] ?? "")].map(escapeClass).join("")}]` : c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+      .join(IGNORED_RUN),
+    "giu",
+  )
+
+/**
+ * The ONE key every rule matches on (UF-QA): NFKC, look-alike letters folded onto the Latin
+ * they imitate, lower-cased, every ignored character removed, then every leading character that
+ * is not a letter, a digit, "(" or "=" dropped — a bullet, a list marker or leading spaces
+ * cannot hide a heading. `ruleKey` additionally drops every remaining non-letter, non-digit
+ * except ":" "(" "=" (a hyphen or bracket inside a marker changes nothing), and `flat` drops
+ * those too. The SHOWN line is always the original line, prefixed "> ".
+ */
+function matchKeys(line: string): { ruleKey: string; flat: string } {
+  const key = [...line.normalize("NFKC").toLowerCase()]
+    .map((ch) => LOOK_ALIKE[ch] ?? ch)
+    .join("")
+    .replace(IGNORED, "")
+    .replace(/^[^\p{L}\p{N}(=]+/u, "")
+  return {
+    ruleKey: key.replace(/[^\p{L}\p{N}:(=]/gu, ""),
+    flat: key.replace(/[^\p{L}\p{N}]/gu, ""),
+  }
+}
+
+const OWN_HEADING_KEYS = OWN_HEADINGS.map((h) => matchKeys(h).ruleKey)
+
+// compiled once — the phrase rules rewrite mid-line look-alikes, the fence rules run only on a
+// line the line-start rules did NOT quote (a quoted line already shows its fence as saved text)
+const PHRASE_RULES: [RegExp, string][] = [
+  [loose("midahandoff"), "MIDA-HANDOFF (quoted)"],
+  [loose("standinguntilchanged"), "standing until changed (quoted)"],
+  [loose("truewhenobserved"), "true when observed (quoted)"],
+  [loose("originalrequest"), "original request (quoted)"],
+]
+const FENCE_RULES: [RegExp, string][] = [
+  [loose("===begin"), "(quoted) BEGIN"],
+  [loose("===end"), "(quoted) END"],
 ]
 
 /** Exported so other context surfaces (the whats-new note) defuse checkpoint text the same way. */
 export function defuse(text: string): string {
   return text
-    .replace(/mida handoff/gi, "MIDA-HANDOFF (quoted)")
-    .replace(/standing until changed/gi, "standing until changed (quoted)")
-    .replace(/true when observed/gi, "true when observed (quoted)")
-    .replace(/original request/gi, "original request (quoted)")
-    .replace(/=== BEGIN/g, "(quoted) BEGIN")
-    .replace(/=== END/g, "(quoted) END")
+    .replace(VISUAL_BREAKS, "\n")
     .split("\n")
-    .map((line) => (OWN_HEADINGS.some((h) => line.startsWith(h)) ? `> ${line}` : line))
+    // indented copies count too: a heading after leading spaces still reads as Mida's own
+    // (CAP-26 review) — and so does a forged "(N earlier …" count line (UF-I)
+    .map((line) => {
+      // UF-J: a forged count or cut line carries the renderer's own "- " prefix — quote a line
+      // that opens with an optional dash before "(N earlier …" or "(Mida cut this reply".
+      // UF-K, widened in UF-L, UF-N, UF-N2 and UF-QA: every line-start rule here — the END/BEGIN
+      // fences, the section headings, the count lines, "Mida note:", "UNSENT", "stated by you" —
+      // matches on ONE key built by matchKeys, while the ORIGINAL line is what gets shown,
+      // prefixed "> ". "stated by you" quotes when "statedbyyou" begins within the flat key's
+      // first 6 characters — a bullet, a list marker like "a)" or "- [x]" and nothing else may
+      // precede it, so ordinary prose ("the user stated by yesterday…") stays unquoted.
+      // Look-alike letters from other alphabets are folded onto the Latin they imitate, so a
+      // marker written with Cyrillic or Greek letters is still caught. Spacing, letter case,
+      // bullets and invisible characters are all ignored when matching. The renderer's own fact
+      // lines are built after their text is defused and are never passed through here as whole
+      // lines.
+      const { ruleKey, flat } = matchKeys(line)
+      const statedAt = flat.indexOf("statedbyyou")
+      const forgedLine =
+        ruleKey.startsWith("===endmidahandoffdata===") ||
+        ruleKey.startsWith("===beginmidahandoffdata===") ||
+        /^\(\d+earlier/.test(ruleKey) ||
+        ruleKey.startsWith("(midacutthisreply") ||
+        (statedAt >= 0 && statedAt <= 6)
+      // a line that STARTS with a marker is quoted whole — the original line, prefixed "> "
+      if (OWN_HEADING_KEYS.some((h) => ruleKey.startsWith(h)) || forgedLine) return `> ${line}`
+      // otherwise only mid-line look-alike phrases and fences are rewritten in place
+      let out = line
+      for (const [re, replacement] of PHRASE_RULES) out = out.replace(re, replacement)
+      for (const [re, replacement] of FENCE_RULES) out = out.replace(re, replacement)
+      return out
+    })
     .join("\n")
 }
 
@@ -121,12 +258,14 @@ export interface RenderedHandoff {
   text: string
   /** The final text's length — what the model receives. */
   chars: number
-  /** The size limit the text was cut against. */
+  /** The size target the render worked to — the text may still be over it (`oversized`). */
   limitChars: number
-  /** Oldest progress entries were left out so the text fits the limit. */
+  /** At least one history entry — an old progress entry, a save line or an artifact — was left out. */
   cut: boolean
-  /** Still longer than the limit after trimming — the text itself says so. */
+  /** Still longer than the limit after trimming — the text itself says so in a preamble note. */
   oversized: boolean
+  /** The reasons behind decisions and rejected approaches were left out to fit; every entry stayed. */
+  reasonsLeftOut: boolean
 }
 
 export function renderHandoff(
@@ -140,8 +279,12 @@ export function renderHandoff(
     adapterNote?: string
     /** The daemon's count of its own undelivered saves — printed verbatim, same position. */
     pendingSavesNote?: string
+    /** See `renderHandoffReport`'s `reasons` — "auto" by default. */
+    reasons?: "auto" | "keep" | "drop"
+    /** See `renderHandoffReport`'s `forceOversizeNote`. */
+    forceOversizeNote?: boolean
     /**
-     * Named tasks sharing this project (tk-1): one mention line each — name, who last saved, how
+     * Named tasks sharing this project (tk-1): one mention line each — name, last saver, how
      * long ago — and nothing else. A mention is awareness, not context: no foreign task's text
      * ever reaches the handoff through here. Absent or empty renders byte-identical to before.
      */
@@ -154,9 +297,24 @@ export function renderHandoff(
 }
 
 /**
- * The render plus an honest account of its size: `cut` means oldest progress entries were left
- * out, `oversized` means the text is still longer than the limit (the text says so itself). A
- * caller that logs the handoff should record all three numbers, never re-derive them.
+ * How many of each history list's OLDEST entries a fitted handoff leaves out (UF-I). History is
+ * the only thing that trims: constraints, decisions and rejected approaches are rules — they are
+ * never left out, and the renderer never prints a count line for them.
+ */
+interface Trim {
+  progress: number
+  savedBy: number
+  artifacts: number
+}
+/** Bookkeeping before content: progress first, then the per-save "Saved by" lines, then artifacts. */
+const TRIM_ORDER: (keyof Trim)[] = ["progress", "savedBy", "artifacts"]
+
+/**
+ * The render plus an honest account of its size: `cut` means history entries were left out,
+ * `reasonsLeftOut` means the reasons behind decisions and rejected approaches went (the entries
+ * all stayed), `oversized` means the text is still longer than the limit (a preamble line in the
+ * text says exactly what was left out). A caller that logs the handoff should record these, never
+ * re-derive them.
  */
 export function renderHandoffReport(
   merged: MergedHandoff,
@@ -170,7 +328,21 @@ export function renderHandoffReport(
     /** The daemon's count of its own undelivered saves — printed verbatim, same position. */
     pendingSavesNote?: string
     /**
-     * Named tasks sharing this project (tk-1): one mention line each — name, who last saved, how
+     * How the reasons behind decisions and rejected approaches are treated (UF-N): "auto" is the
+     * standing rule — drop them only when that makes the render fit `maxChars`; "keep" never
+     * drops them; "drop" drops them whenever at least one decision or rejected approach exists.
+     * In all three the history trim and the oversize note work the same.
+     */
+    reasons?: "auto" | "keep" | "drop"
+    /**
+     * Force the over-target note onto the text even when this render fits `maxChars` (UF-N2) —
+     * for a caller that knows the DELIVERED text, once the untrimmable parts around this render
+     * are added, is over the target. The note's "Left out:" part still describes what this
+     * render really left out.
+     */
+    forceOversizeNote?: boolean
+    /**
+     * Named tasks sharing this project (tk-1): one mention line each — name, last saver, how
      * long ago — and nothing else. A mention is awareness, not context: no foreign task's text
      * ever reaches the handoff through here. Absent or empty renders byte-identical to before.
      */
@@ -189,9 +361,15 @@ export function renderHandoffReport(
   ]
     .filter((line): line is string => line !== undefined)
     .join("\n")
-  const cut = (s: string, n = 300) => (s.length > n ? s.slice(0, n - 1) + "…" : s)
-  const list = (title: string, items: string[]): string | null =>
-    items.length ? `${title}:\n${items.map((i) => `- ${cut(defuse(i))}`).join("\n")}` : null
+  // UF-N2: cutText's surrogate-safe cut — a plain slice could end on a pair's first half
+  const cut = (s: string, n = 300) => cutText(s, n)
+  // `dropped` oldest items are left out and named by one count line (PROV-14). `whole` entries
+  // are rendered uncut — a constraint's exception clause or a decision's reason is part of the
+  // rule, and cutting it changes what the next agent obeys (UF-J).
+  const list = (title: string, items: string[], dropped = 0, noun = "entries", whole = false): string | null =>
+    items.length
+      ? `${title}:\n${[...(dropped > 0 ? [`- (${dropped} earlier ${noun} left out)`] : []), ...items.slice(dropped).map((i) => `- ${whole ? defuse(i) : cut(defuse(i))}`)].join("\n")}`
+      : null
   // Who saved each record is decided by the chain's authorId, never by the agent name the
   // checkpoint claims — the claim is shown only as a quote when it disagrees.
   const authorName = (authorId: string): string => options.authorNames?.[authorId.toLowerCase()] ?? "unknown agent"
@@ -201,16 +379,22 @@ export function renderHandoffReport(
     return resolved === p.agent ? line : `${line} — the checkpoint itself claims "${defuse(p.agent)}"`
   }
 
-  const build = (dropped: number, note: string | null = null): string => {
+  const build = (trim: Trim, reasonsOff: boolean, note: string | null = null): string => {
+    const dropped = trim.progress
     const parts: string[] = []
+    const push = (s: string | null) => {
+      if (s !== null) parts.push(s)
+    }
+    // Constraints lead: the standing rules sit above the request, so the thing the agent reads
+    // first is the thing that must still hold (UF-I). They render exactly as the merge gives
+    // them — near-duplicates are NOT merged (UF-J: "."/"!" are different rules), and no rule's
+    // text is ever cut (`whole`: a cut exception clause changes what the agent obeys).
+    push(list("Constraints", merged.constraints, 0, "entries", true))
     if (merged.originalRequest !== null) {
       parts.push(
         "ORIGINAL REQUEST (the user's own words, copied from the first message — not a summary):\n" +
           defuse(merged.originalRequest),
       )
-    }
-    const push = (s: string | null) => {
-      if (s !== null) parts.push(s)
     }
     push(
       merged.remainingPlan.length
@@ -220,10 +404,27 @@ export function renderHandoffReport(
     parts.push(`Next action: ${defuse(merged.nextAction)}`)
     parts.push(`Objective: ${defuse(merged.objective)}`)
     parts.push(`Unresolved issue: ${merged.unresolvedIssue === null ? "none" : defuse(merged.unresolvedIssue)}`)
-    push(list("Decisions", merged.decisions.map((d) => `${defuse(d.decision)} — because: ${defuse(d.rationale)}`)))
-    push(list("Rejected approaches", merged.rejected.map((r) => `${defuse(r.approach)} — ${defuse(r.why)}`)))
-    push(list("Constraints", merged.constraints))
-    push(list("Artifacts", merged.artifacts))
+    // Reasons off: still over the limit after history trimmed — every decision and rejected
+    // approach keeps its entry, only the "because" / "why" go, and the headings say so (UF-I).
+    push(
+      list(
+        reasonsOff ? "Decisions (reasons left out to fit)" : "Decisions",
+        merged.decisions.map((d) => (reasonsOff ? defuse(d.decision) : `${defuse(d.decision)} — because: ${defuse(d.rationale)}`)),
+        0,
+        "entries",
+        true,
+      ),
+    )
+    push(
+      list(
+        reasonsOff ? "Rejected approaches (reasons left out to fit)" : "Rejected approaches",
+        merged.rejected.map((r) => (reasonsOff ? defuse(r.approach) : `${defuse(r.approach)} — ${defuse(r.why)}`)),
+        0,
+        "entries",
+        true,
+      ),
+    )
+    push(list("Artifacts", merged.artifacts, trim.artifacts, "artifacts"))
     // Facts the owner told Mida once, kept ahead of progress: under the size limit the original
     // request and plan are preserved first, then every fact, and progress is what gets trimmed.
     if (options.facts !== undefined && options.facts.length > 0) {
@@ -265,34 +466,89 @@ export function renderHandoffReport(
     if (merged.carriedForwardFromEarlierSave) {
       parts.push("(Some entries were restored from an earlier save because the newest one looked incomplete.)")
     }
-    push(list("Saved by", merged.provenance.map(savedBy)))
-    if (note !== null) parts.push(note)
-    return `${preamble}\n${BEGIN}\n\n${parts.join("\n\n")}\n\n${TAIL}`
+    push(list("Saved by", merged.provenance.map(savedBy), trim.savedBy, "saves"))
+    // An oversized handoff says so in the preamble — after the header and the caller's notes,
+    // before the fence — where the agent reads it before any data (UF-I).
+    return `${note === null ? preamble : `${preamble}\n${note}`}\n${BEGIN}\n\n${parts.join("\n\n")}\n\n${TAIL}`
   }
 
-  // Dropping more oldest-progress entries only ever makes the output shorter,
-  // so the smallest count that fits is found by binary search instead of a
-  // drop-one-and-rebuild loop (thousands of entries → thousands of rebuilds).
-  let dropped = 0
-  let out = build(0)
-  if (out.length > maxChars && merged.progress.length > 1) {
-    const hi = merged.progress.length - 1 // always keep at least one entry
-    if (build(hi).length <= maxChars) {
-      let lo = 0
-      let upper = hi
-      while (lo < upper) {
-        const mid = (lo + upper) >> 1
-        if (build(mid).length <= maxChars) upper = mid
-        else lo = mid + 1
+  // UF-I: the handoff fits its limit by leaving out the OLDEST entries of the history lists only —
+  // progress first, then the per-save "Saved by" lines, then artifacts. Constraints, decisions and
+  // rejected approaches are rules the next agent must keep; they are never left out. The newest
+  // entry of every trimmed list always stays, each trimmed list says how many it left out, and a
+  // trim is taken only when it really shortens the text (a count line can cost more than the short
+  // entry it replaces). The request, the remaining plan, the next action, the objective, the
+  // unresolved issue and the owner's facts are never left out either. Leaving out more only ever
+  // shortens the output, so each list's smallest sufficient count is found by binary search, not a
+  // rebuild per entry.
+  const sizes: Trim = {
+    progress: merged.progress.length,
+    savedBy: merged.provenance.length,
+    artifacts: merged.artifacts.length,
+  }
+  const fitOnce = (reasonsOff: boolean): { trim: Trim; text: string } => {
+    const trim: Trim = { progress: 0, savedBy: 0, artifacts: 0 }
+    let out = build(trim, reasonsOff)
+    for (const key of TRIM_ORDER) {
+      if (out.length <= maxChars) break
+      const hi = sizes[key] - 1 // always keep the newest entry
+      if (hi <= 0) continue
+      const fitsAt = (n: number) => build({ ...trim, [key]: n }, reasonsOff).length <= maxChars
+      if (fitsAt(hi)) {
+        let lo = 0
+        let upper = hi
+        while (lo < upper) {
+          const mid = (lo + upper) >> 1
+          if (fitsAt(mid)) upper = mid
+          else lo = mid + 1
+        }
+        trim[key] = lo
+      } else {
+        // does not fit even at the newest entry alone — leaving out the oldest still gives a few
+        // more chars back, but only take it when the count line is not longer than what it replaces
+        const shorter = build({ ...trim, [key]: hi }, reasonsOff)
+        if (shorter.length < out.length) {
+          trim[key] = hi
+          out = shorter
+          continue
+        }
       }
-      dropped = lo
-    } else {
-      dropped = hi
+      out = build(trim, reasonsOff)
     }
-    out = build(dropped)
+    return { trim, text: out }
   }
-  if (out.length > maxChars) {
-    out = build(dropped, "(handoff longer than the limit; nothing further was cut)")
+
+  // The preamble note an over-target text carries: it names exactly what the trim left out.
+  // Only history items can be named — reasons are dropped only when that alone makes the text
+  // fit, so a text carrying this note always kept them (UF-I, UF-L).
+  const oversizeNote = (t: Trim): string => {
+    const leftOut: string[] = []
+    if (t.progress > 0) leftOut.push(`${t.progress} earlier progress ${t.progress === 1 ? "entry" : "entries"}`)
+    if (t.savedBy > 0) leftOut.push(`${t.savedBy} earlier ${t.savedBy === 1 ? "save" : "saves"}`)
+    if (t.artifacts > 0) leftOut.push(`${t.artifacts} earlier ${t.artifacts === 1 ? "artifact" : "artifacts"}`)
+    return `${OVERSIZE_NOTE_LEAD} No constraint, decision or rejected approach was left out to shorten it.${leftOut.length > 0 ? ` Left out: ${leftOut.join(", ")}.` : " Nothing was left out."}`
   }
-  return { text: out, chars: out.length, limitChars: maxChars, cut: dropped > 0, oversized: out.length > maxChars }
+
+  const reasonsOption = options.reasons ?? "auto"
+  const hasReasons = merged.decisions.length > 0 || merged.rejected.length > 0
+  const forcedDrop = reasonsOption === "drop" && hasReasons
+  let { trim, text: out } = fitOnce(forcedDrop)
+  // Still over with history trimmed: try the reasons-off render, but take it ONLY when it
+  // actually fits (UF-L) — the old code took a merely shorter text, which once left 50 reasons
+  // out of a 22,055-char handoff aimed at 8,000. A handoff that stays over keeps every reason,
+  // the plain headings and reasonsLeftOut: false, and carries the oversize note. With no
+  // reasons to drop the text cannot change, so the step is skipped. "keep" and "drop" callers
+  // decide for themselves against the text they assemble (UF-N) — this retry is auto's alone.
+  let reasonsLeftOut = forcedDrop
+  if (reasonsOption === "auto" && out.length > maxChars && hasReasons) {
+    const tried = fitOnce(true)
+    if (tried.text.length <= maxChars) {
+      trim = tried.trim
+      out = tried.text
+      reasonsLeftOut = true
+    }
+  }
+  if (out.length > maxChars || options.forceOversizeNote === true) out = build(trim, reasonsLeftOut, oversizeNote(trim))
+  const dropped = TRIM_ORDER.reduce((sum, key) => sum + trim[key], 0)
+  return { text: out, chars: out.length, limitChars: maxChars, cut: dropped > 0, oversized: out.length > maxChars, reasonsLeftOut }
 }

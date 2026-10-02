@@ -456,6 +456,20 @@ describe("compileCheckpoint", () => {
     if (!r.ok) expect(r.fields).toContain("objective")
     expect(fs.readFileSync(counter, "utf8")).toBe("2")
   })
+  it("a compile asked for one attempt spends ONE model call — no same-provider retry on a bad shape (UF-QF)", async () => {
+    // the drain asks for attempts:1 once a save has failed eight times, so one try must not
+    // spend a second call re-asking the same provider — the counter file proves one run
+    const counter = path.join(dir, "one-attempt-count.log")
+    process.env.FAKE_MODEL_COUNTER = counter
+    const r = await compileCheckpoint({
+      ...base,
+      model: { argv: [process.execPath, fixturePath, "badshape-count"], label: "fake" },
+      attempts: 1,
+      sleep: async () => {},
+    })
+    expect(r).toMatchObject({ ok: false, reason: "invalid", attempts: 1, retried: 0 })
+    expect(fs.readFileSync(counter, "utf8")).toBe("1")
+  })
   it("kills a hanging model at the timeout", async () => {
     const started = Date.now()
     const r = await compileCheckpoint({ ...base, model: { ...fake("hang"), timeoutMs: 300 }, attempts: 1 })
@@ -509,12 +523,263 @@ describe("compileCheckpoint", () => {
       expect(r.trimmed).toContain("progress[0]")
     }
   })
-  it("keeps the first 50 of an over-long array and names it in trimmed (A8)", async () => {
+  // CAP-29: this test used to pin "keeps the first 50" (expected d0). The model carries the earlier
+  // checkpoint forward and adds what is new at the end, so keeping the front meant the 51st
+  // decision could never be saved — the next agent kept following a decision the user had changed.
+  it("keeps the NEWEST 50 of an over-long array and names it in trimmed (A8, CAP-29)", async () => {
     const r = await compileCheckpoint({ ...base, model: fake("wide") })
     expect(r.ok).toBe(true)
     if (r.ok) {
       expect(r.checkpoint.decisions).toHaveLength(50)
-      expect(r.checkpoint.decisions[0]!.decision).toBe("d0")
+      expect(r.checkpoint.decisions[0]!.decision).toBe("d1")
+      expect(r.checkpoint.decisions.at(-1)!.decision).toBe("d50")
+      expect(r.trimmed).toContain("decisions")
+      // UF-J: the dropped oldest rule is no longer silent — the checkpoint itself says so.
+      // UF-L: the note names the LIST, never a count — a number goes stale the moment a later
+      // save puts an entry back.
+      expect(r.checkpoint.unresolvedIssue).toBe(
+        "(Mida: a list holds at most 50 entries. Older decisions were left out.)",
+      )
+    }
+  })
+  it("every list over 50 keeps its newest 50 — except the plan, whose front is what comes next (C11, CAP-29)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("wide-all") })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    const c = r.checkpoint
+    expect([c.decisions[0]!.decision, c.decisions.at(-1)!.decision]).toEqual(["d10", "d59"])
+    expect([c.rejected[0]!.approach, c.rejected.at(-1)!.approach]).toEqual(["x10", "x59"])
+    expect([c.constraints[0], c.constraints.at(-1)]).toEqual(["c10", "c59"])
+    expect([c.artifacts[0], c.artifacts.at(-1)]).toEqual(["src/a10", "src/a59"])
+    expect([c.progress[0], c.progress.at(-1)]).toEqual(["p10", "p59"])
+    expect([c.remainingPlan[0], c.remainingPlan.at(-1)]).toEqual(["step 0", "step 49"])
+    for (const list of ["progress", "decisions", "rejected", "constraints", "artifacts", "remainingPlan"]) {
+      expect(r.trimmed, list).toContain(list)
+    }
+    // UF-J: only the rule lists get a note — progress, artifacts, plan and evidence cuts add none.
+    // UF-L: the note names every list that lost oldest entries, in the fixed order, with no counts.
+    expect(c.unresolvedIssue).toBe(
+      "(Mida: a list holds at most 50 entries. Older constraints, decisions and rejected approaches were left out.)",
+    )
+  })
+  // UF-J: a note the model carried forward from the previous checkpoint must not pile up —
+  // the model's copy is stripped and this compile's own note (the previous note's lists union
+  // this save's cuts) is rebuilt, so a save that changes nothing still ends on the note,
+  // exactly once. The counted wording this branch once wrote ("Left out: the N oldest …") is
+  // no longer a note (1afed16): text carrying it is the model's own text and is kept as it is.
+  it("a carried-forward note survives a quiet save exactly once; old-wording text is kept (UF-J)", async () => {
+    const note = "(Mida: a list holds at most 50 entries. Older decisions were left out.)"
+    const previous: Checkpoint = {
+      eventId: "evt-prev0001",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: "2026-09-21T09:00:00.000Z",
+      objective: "Implement the rate limiter",
+      originalRequest: "Build a rate limiter in 3 steps",
+      progress: ["skeleton written"],
+      decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+      rejected: [],
+      constraints: [],
+      artifacts: [],
+      unresolvedIssue: note,
+      nextAction: "add tests",
+      remainingPlan: [],
+      evidence: [],
+    }
+    const echo = await compileCheckpoint({ ...base, previous, model: fake("echo-previous") })
+    expect(echo.ok).toBe(true)
+    if (echo.ok) {
+      expect(echo.checkpoint.unresolvedIssue).toBe(note)
+    }
+    // the OLD wording was never released: the model's text keeps it untouched, whether it
+    // sits after real issue text or is the whole value — it does not collapse to null
+    const stale = await compileCheckpoint({ ...base, model: fake("stale-note") })
+    expect(stale.ok).toBe(true)
+    if (stale.ok) {
+      expect(stale.checkpoint.unresolvedIssue).toBe(
+        "the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+      )
+    }
+    const only = await compileCheckpoint({ ...base, model: fake("stale-note-only") })
+    expect(only.ok).toBe(true)
+    if (only.ok) {
+      expect(only.checkpoint.unresolvedIssue).toBe(
+        "(Mida: a list holds at most 50 entries. Left out: the 2 oldest constraints.)",
+      )
+    }
+  })
+  it("the trim note stays whole when the model's unresolvedIssue nearly fills the string cap (UF-J)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("long-issue") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      const issue = r.checkpoint.unresolvedIssue!
+      expect(issue.length).toBeLessThanOrEqual(2000)
+      expect(issue.endsWith("… | (Mida: a list holds at most 50 entries. Older decisions were left out.)")).toBe(true)
+    }
+  })
+  // UF-L: the 50-entry note is cumulative over the session. Save 1 drops the 51st decision and
+  // writes the note; save 2 returns that checkpoint unchanged — the note must survive, not wash
+  // out to a silent "unresolvedIssue: none"; save 3 adds one decision and the note still names
+  // the same list — the note holds no count, so nothing about it can go stale.
+  it("the 50-entry note is cumulative over the session, never washed out by a quiet save (UF-K, UF-L)", async () => {
+    const note = "(Mida: a list holds at most 50 entries. Older decisions were left out.)"
+    const first = await compileCheckpoint({ ...base, model: fake("wide") })
+    expect(first.ok).toBe(true)
+    if (!first.ok) return
+    expect(first.checkpoint.unresolvedIssue).toBe(note)
+    const echo = await compileCheckpoint({ ...base, previous: first.checkpoint, model: fake("echo-previous") })
+    expect(echo.ok).toBe(true)
+    if (echo.ok) {
+      expect(echo.checkpoint.unresolvedIssue).toBe(note)
+    }
+    const added = await compileCheckpoint({ ...base, previous: first.checkpoint, model: fake("add-decision") })
+    expect(added.ok).toBe(true)
+    if (added.ok) {
+      expect(added.checkpoint.unresolvedIssue).toBe(note)
+      expect(added.checkpoint.decisions.at(-1)!.decision).toBe("newest")
+    }
+  })
+  // UF-L: a note the MODEL wrote is a claim, not a fact — the lists it names are stripped with
+  // the note, never trusted, so a saved note cannot make a later compile say lists went missing
+  // that nothing cut.
+  it("a model's own pipes survive — a save without a note never rewrites the text (UF-N)", async () => {
+    // `make test || true` is a different command than `make test | true`; the strip has no
+    // business touching a value that holds no limit-note segment
+    const r = await compileCheckpoint({ ...base, model: fake("pipes") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.unresolvedIssue).toBe("CI passes only because of `make test || true`")
+    }
+  })
+  it("a limit note the model itself wrote earns no note — the claim is stripped, not trusted (UF-L)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("claims-limit-note") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.unresolvedIssue).toBe("ops is still flaky")
+    }
+  })
+  // UF-K: a complete note that rode in on the model's text is stripped BEFORE the string cap
+  // runs — if the cap cut first, a broken "(Mida: a list holds at…" tail would survive. With
+  // no previous note there is nothing to rebuild, so the field keeps only the issue text.
+  it("a complete note is stripped before the string cap — no broken tail survives (UF-K)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("issue-and-old-note") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.unresolvedIssue).toBe("i".repeat(1990))
+      expect(r.checkpoint.unresolvedIssue).not.toContain("(Mida:")
+    }
+  })
+  // Same fixture with a real previous note: the count is read from the previous checkpoint and
+  // the rebuilt note sits after the issue text, whole, inside the cap.
+  it("a previous note is rebuilt after the issue text, whole and inside the cap (UF-K)", async () => {
+    const previous: Checkpoint = {
+      eventId: "evt-prev0001",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: "2026-09-21T09:00:00.000Z",
+      objective: "Implement the rate limiter",
+      originalRequest: "Build a rate limiter in 3 steps",
+      progress: ["skeleton written"],
+      decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+      rejected: [],
+      constraints: [],
+      artifacts: [],
+      unresolvedIssue: "(Mida: a list holds at most 50 entries. Older decisions were left out.)",
+      nextAction: "add tests",
+      remainingPlan: [],
+      evidence: [],
+    }
+    const r = await compileCheckpoint({ ...base, previous, model: fake("issue-and-old-note") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      const issue = r.checkpoint.unresolvedIssue!
+      expect(issue.length).toBeLessThanOrEqual(2000)
+      expect(issue.endsWith(" | (Mida: a list holds at most 50 entries. Older decisions were left out.)")).toBe(true)
+      expect(issue.startsWith("i".repeat(10))).toBe(true)
+    }
+  })
+  // UF-N: wrapCheckpoint writes its size note AFTER the limit note, so on the next save the
+  // previous checkpoint's tail is the size note, not the limit note. The lists must still be
+  // read through the size note — otherwise the limit note silently dies on the following save.
+  it("a limit note is still read when the size note follows it (UF-N)", async () => {
+    const constraintsNote = "(Mida: a list holds at most 50 entries. Older constraints were left out.)"
+    const previous: Checkpoint = {
+      eventId: "evt-prev0002",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: "2026-09-21T09:00:00.000Z",
+      objective: "Implement the rate limiter",
+      originalRequest: "Build a rate limiter in 3 steps",
+      progress: ["skeleton written"],
+      decisions: [],
+      rejected: [],
+      constraints: ["no dependencies"],
+      artifacts: [],
+      unresolvedIssue: `CI still red | ${constraintsNote} | (Mida: left out 50 progress to fit the size limit)`,
+      nextAction: "add tests",
+      remainingPlan: [],
+      evidence: [],
+    }
+    const r = await compileCheckpoint({ ...base, previous, model: fake("echo-previous") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.unresolvedIssue!.endsWith(` | ${constraintsNote}`)).toBe(true)
+    }
+  })
+  // UF-K + UF-QA: only an EXACT current note is a note. A tail that merely starts like one —
+  // here an unclosed fragment of the old counted wording, no ")" — is the model's own text
+  // and stays byte-for-byte; stripping it would eat user text the schema never wrote.
+  it("an unresolvedIssue ending in a tail that only looks like a note keeps it as ordinary text (UF-K)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("cut-note-tail") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.unresolvedIssue).toBe(
+        "the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Left out: the 1 oldest de",
+      )
+    }
+  })
+  it("evidence follows its entry when a list is cut from the front, and goes when its entry goes (C11, CAP-29)", async () => {
+    const r = await compileCheckpoint({ ...base, model: fake("wide-all") })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.checkpoint.evidence).toEqual([
+      { field: "decisions[0]", ref: "transcript:L10" },
+      { field: "decisions[49].rationale", ref: "transcript:L59" },
+      { field: "progress[49]", ref: "transcript:L159" },
+      { field: "remainingPlan[2]", ref: "transcript:L202" },
+      { field: "nextAction", ref: "transcript:L300" },
+    ])
+    // what each one points at is the entry it was written for
+    expect(r.checkpoint.decisions[0]!.decision).toBe("d10")
+    expect(r.checkpoint.progress[49]).toBe("p59")
+  })
+  // CAP-29: the case the user actually hits — a session already at 50 decisions gains one more.
+  // The fixture echoes the previous block back with "newest" appended, so the save must keep the
+  // newest 50: d1…d49 plus newest. On the old keep-the-front code d0 stayed and newest was lost.
+  it("a session already at 50 decisions saves the 51st — keeps the newest 50 (CAP-29)", async () => {
+    const previous: Checkpoint = {
+      eventId: "evt-prev0001",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: "2026-09-21T09:00:00.000Z",
+      objective: "Implement the rate limiter",
+      originalRequest: "Build a rate limiter in 3 steps",
+      progress: ["skeleton written"],
+      decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+      rejected: [{ approach: "background interval refill", why: "no-timers constraint" }],
+      constraints: ["no dependencies"],
+      artifacts: ["src/a.ts"],
+      unresolvedIssue: null,
+      nextAction: "add tests",
+      remainingPlan: ["2. add tests", "3. write README"],
+      evidence: [],
+    }
+    const r = await compileCheckpoint({ ...base, previous, model: fake("add-decision") })
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.checkpoint.decisions).toHaveLength(50)
+      expect(r.checkpoint.decisions[0]!.decision).toBe("d1")
+      expect(r.checkpoint.decisions.at(-1)!.decision).toBe("newest")
       expect(r.trimmed).toContain("decisions")
     }
   })
@@ -597,7 +862,9 @@ describe("compileCheckpoint", () => {
       ...base,
       model: { argv: [process.execPath, fixturePath, "garbage"], label: "deepseek-x" },
       fallbackModels: [{ argv: [process.execPath, fixturePath, "good"], label: "kimi-y" }],
-      attempts: 1,
+      // UF-QF: attempts:1 now means one model call — a single attempt cannot also hold a
+      // same-provider retry, so this test asks for two (the fallback still ends it at once)
+      attempts: 2,
       sleep: async () => {},
     })
     expect(r.ok).toBe(true)

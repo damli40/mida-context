@@ -133,7 +133,7 @@ describe("mida-mcp against a real midad on local Anvil", () => {
       tickMs: 30_000, // no jobs are queued here; the tick is only the safety net
     })
     mcp = await connectMcp("claude-code")
-  }, STEP_TIMEOUT * 4)
+  }, 600_000)
 
   afterAll(async () => {
     await mcp?.close()

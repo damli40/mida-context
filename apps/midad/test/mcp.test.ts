@@ -10,6 +10,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { AGENT_NAME, MidaHome, MCP_TOOLS, READ_NAMESPACES, createMidaMcpServer, foreignClientReplayReason, loadAgentIdentity, parseMcpArgs, readSeen, socketPathFor, startupCheck } from "@mida/midad"
 import type { McpServerDeps } from "@mida/midad"
+import { OVERSIZE_NOTE_LEAD, renderHandoffReport } from "@mida/checkpoint"
+import type { MergedHandoff } from "@mida/checkpoint"
+import { OVERSIZE_NOTE_LEAD as LEAF_OVERSIZE_NOTE_LEAD } from "../src/hook-output.js"
+import { queuedSavesNote } from "../src/handoff.js"
 
 const BIN_MIDA_MCP = fileURLToPath(new URL("../../../bin/mida-mcp", import.meta.url))
 const SRC_DIR = fileURLToPath(new URL("../src", import.meta.url))
@@ -38,7 +42,13 @@ const spawnEnv = (extra: Record<string, string>): NodeJS.ProcessEnv => {
  * and a record of what the adapter sent. A route value is the JSON body to answer, a function of
  * the parsed request body, or `{ silent: true }` for a daemon that accepts but never answers.
  */
-type Route = Record<string, unknown> | { silent: true } | ((body: Record<string, unknown> | undefined) => unknown)
+type Route =
+  | Record<string, unknown>
+  | { silent: true }
+  // `raw` answers 200 with a body that is not JSON; `hangup` drops the connection unanswered
+  | { raw: string }
+  | { hangup: true }
+  | ((body: Record<string, unknown> | undefined) => unknown)
 
 const fakeDaemon = (dir: MidaHome, routes: Record<string, Route>) =>
   new Promise<{ requests: { path: string; body: Record<string, unknown> | undefined }[]; stop(): Promise<void> }>((res, rej) => {
@@ -61,8 +71,13 @@ const fakeDaemon = (dir: MidaHome, routes: Record<string, Route>) =>
         requests.push({ path, body })
         const route = routes[path]
         if (route === undefined || (typeof route === "object" && route !== null && "silent" in route)) return
-        const answer = typeof route === "function" ? route(body) : route
-        const payload = JSON.stringify(answer)
+        if (typeof route === "object" && route !== null && "hangup" in route) {
+          socket.destroy()
+          return
+        }
+        const payload = typeof route === "object" && route !== null && "raw" in route && typeof route.raw === "string"
+          ? route.raw
+          : JSON.stringify(typeof route === "function" ? route(body) : route)
         socket.end(`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(payload)}\r\nconnection: close\r\n\r\n${payload}`)
       })
     })
@@ -241,6 +256,30 @@ describe("mida-mcp args", () => {
       child.stdin.end()
     })
     expect(res.status).toBe(0)
+    expect(res.stderr).toBe("")
+  }, 20_000)
+
+  it("MIDA_INNER=1 — inside Mida's own summariser run the entry exits 0 and writes nothing, before it even parses args", async () => {
+    // even a flag that would otherwise exit 2 is not looked at: the guard comes first
+    const res = await new Promise<{ status: number | null; stdout: string; stderr: string }>((done, reject) => {
+      const child = spawn(BIN_MIDA_MCP, ["--bogus"], {
+        env: spawnEnv({ MIDA_HOME: home().root, MIDA_INNER: "1" }),
+        cwd: "/tmp",
+      })
+      let stdout = ""
+      let stderr = ""
+      child.stdout.on("data", (d: Buffer) => {
+        stdout += d.toString("utf8")
+      })
+      child.stderr.on("data", (d: Buffer) => {
+        stderr += d.toString("utf8")
+      })
+      child.on("error", reject)
+      child.on("exit", (code) => done({ status: code, stdout, stderr }))
+      child.stdin.end()
+    })
+    expect(res.status).toBe(0)
+    expect(res.stdout).toBe("")
     expect(res.stderr).toBe("")
   }, 20_000)
 })
@@ -728,7 +767,8 @@ const SAVE_ARGS: Record<string, unknown> = {
 
 describe("mida-mcp tools against a fake daemon", () => {
   it("lists exactly the five stable tools, with the pinned input schemas", async () => {
-    const { client, close } = await connect(deps(home(), { daemonUp: false }))
+    // an MCP client identity — the only kind mida_save signs for (AUTH-17)
+    const { client, close } = await connect(deps(home(), { agent: "claude-desktop", daemonUp: false }))
     try {
       const listed = await client.listTools()
       expect(listed.tools.map((t) => t.name)).toEqual(["mida_handoff", "mida_whats_new", "mida_read", "mida_status", "mida_save"])
@@ -758,6 +798,58 @@ describe("mida-mcp tools against a fake daemon", () => {
     } finally {
       await close()
     }
+  })
+
+  // AUTH-17: a client that saves through hooks is never offered a save tool that can only refuse
+  const toolsFor = async (agent: string): Promise<{ names: string[]; instructions: string | undefined }> => {
+    const { client, close } = await connect(deps(home(), { agent, daemonUp: false }))
+    try {
+      return { names: (await client.listTools()).tools.map((t) => t.name), instructions: client.getInstructions() }
+    } finally {
+      await close()
+    }
+  }
+
+  it("hook-saved clients and unknown names get the four read tools, no mida_save (AUTH-17)", async () => {
+    for (const agent of ["claude-code", "codex", "assistant", ""]) {
+      expect((await toolsFor(agent)).names).toEqual(["mida_handoff", "mida_whats_new", "mida_read", "mida_status"])
+    }
+  })
+
+  it("claude-desktop and cursor still get all five tools (AUTH-17)", async () => {
+    for (const agent of ["claude-desktop", "cursor"]) {
+      expect((await toolsFor(agent)).names).toEqual(["mida_handoff", "mida_whats_new", "mida_read", "mida_status", "mida_save"])
+    }
+  })
+
+  it("the server's instructions mention mida_save only to clients that get it (AUTH-17)", async () => {
+    expect((await toolsFor("claude-code")).instructions).toBe(
+      "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool: this client's saves come only from its Mida hooks, and only while they are installed. Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
+    )
+    // Codex ignores untrusted hooks, and doctor cannot see trust — the owner is told what to do (Fable review)
+    expect((await toolsFor("codex")).instructions).toContain("Codex ignores them until you trust them: open codex, type /hooks, and trust the Mida entries.")
+    expect((await toolsFor("claude-code")).instructions).not.toContain("mida doctor")
+    // an identity with no hooks (a harness added with `mida add-agent`) is never told it saves
+    const other = (await toolsFor("windsurf")).instructions
+    expect(other).toBe(
+      "Mida adapter over the local midad daemon. It can fetch the project handoff, the what's-new note, a namespace read and status. This server has no save tool for this client: mida_save signs only for claude-desktop and cursor. Owner operations stay absent: no approve, revoke, request or remember, because a model must never change who has access through MCP.",
+    )
+    expect(other).not.toContain("hooks")
+    expect((await toolsFor("cursor")).instructions).toContain("it can save a checkpoint with mida_save")
+  })
+
+  it("mida_read's description says what each namespace returns (PROV-12)", () => {
+    const read = MCP_TOOLS.find((t) => t.name === "mida_read")!
+    expect(read.description).toBe(
+      "Read one Mida context area through the daemon; you get the same output as `mida read --as <agent> <namespace>`. For profile.skills and preferences.communication you get the facts saved there that this agent may read (an area it has no access to says refused). For projects.current (the default) you get only each saved checkpoint's id and author, across every task; mida_handoff gives the content for the current task.",
+    )
+  })
+
+  it("mida_save's description names the clients it serves (AUTH-17)", async () => {
+    const save = MCP_TOOLS.find((t) => t.name === "mida_save")!
+    expect(save.description).toBe(
+      "Save a checkpoint of your work on this project so another approved agent can pick it up. Call it when the user asks to save context or hand off, and before you finish a task. Claude Desktop and Cursor get this tool; agents with Mida hooks, like Claude Code and Codex, save through those hooks instead. The daemon signs each save as this client's own identity after the owner's approval checks pass. A list holds at most 50 entries. One save per minute at most.",
+    )
   })
 
   it("mida_handoff sends the hook's body and returns the daemon's text verbatim", async () => {
@@ -1078,6 +1170,54 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
+  // AUTH-16: a probe that did not come back in time is a slow daemon, not a missing one
+  const statusWith = async (handoff: Route, over: Partial<McpServerDeps> = {}): Promise<string> => {
+    const dir = home()
+    mkdirSync(join(dir.root, "agents", "claude-code"), { recursive: true })
+    writeFileSync(join(dir.root, "agents", "claude-code", "identity.json"), "{}")
+    const fake = await fakeDaemon(dir, { "/health": HEALTH, "/handoff": handoff })
+    try {
+      const { client, close } = await connect(deps(dir, { agent: "claude-code", ...over }))
+      try {
+        return await callText(client, "mida_status")
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  }
+
+  it("mida_status: a probe that times out says approval was not checked, never 'no answer' (AUTH-16)", async () => {
+    const text = await statusWith({ silent: true }, { statusProbeMs: 200 })
+    expect(text).toContain("midad: answering")
+    expect(text).not.toContain("no answer from the daemon")
+    expect(text).toContain("claude-code: could not tell. Reading its context took over 0.2 s. Ask again in a moment.")
+    expect(text).not.toContain("daemon is up")
+  })
+
+  it("mida_status: the production limit prints whole seconds, rounded down (AUTH-16)", async () => {
+    const text = await statusWith({ silent: true }, { statusProbeMs: 1_000 })
+    expect(text).toContain("claude-code: could not tell. Reading its context took over 1 s. Ask again in a moment.")
+  })
+
+  it("mida_status: the daemon's own read-slow refusal says approval was not checked (AUTH-16)", async () => {
+    const text = await statusWith({ kind: "refused", reason: "read-slow", text: "x" })
+    expect(text).not.toContain("cannot tell")
+    expect(text).toContain("claude-code: could not tell. The daemon ran out of time reading its context; its approval may already have passed. Ask again in a moment.")
+  })
+
+  it("mida_status: a reply that is not JSON says it could not be read (AUTH-16)", async () => {
+    const text = await statusWith({ raw: "<html>not json</html>" })
+    expect(text).not.toContain("no answer from the daemon")
+    expect(text).toContain("claude-code: could not tell. Mida could not read the daemon's reply.")
+  })
+
+  it("mida_status: a daemon that drops the probe unanswered still says 'no answer' (AUTH-16)", async () => {
+    const text = await statusWith({ hangup: true })
+    expect(text).toContain("claude-code: no answer from the daemon")
+  })
+
   it("mida_status says so when the folder is not a Mida project at all", async () => {
     const dir = home()
     const fake = await fakeDaemon(dir, {
@@ -1263,16 +1403,387 @@ describe("mida-mcp tools against a fake daemon", () => {
     }
   })
 
-  it("an 8 001-char answer is cut to 8 000 with the same … marker the hooks use", async () => {
+  it("an 8 001-char handoff comes back whole — the handoff cap is 40,000, not the tools' 8,000 (UF-I)", async () => {
     const dir = home()
     const big = "x".repeat(8_001)
     const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
     try {
       const { client, close } = await connect(deps(dir))
       try {
+        expect(await callText(client, "mida_handoff")).toBe(big)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("a 12,000-char handoff ending in the END line comes back unchanged (UF-I)", async () => {
+    const dir = home()
+    const big = `${"x".repeat(12_000)}\n\n=== END MIDA HANDOFF DATA ===`
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_handoff")).toBe(big)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("a handoff over 40,000 chars keeps its END line and says where the reply was cut (UF-I)", async () => {
+    const dir = home()
+    const big = `${"x".repeat(41_000)}\n\n=== END MIDA HANDOFF DATA ===`
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
         const text = await callText(client, "mida_handoff")
-        expect(text.length).toBe(8_000)
-        expect(text).toBe(`${"x".repeat(7_999)}…`)
+        expect(text.length).toBeLessThanOrEqual(40_000)
+        // kept text, then …, then the cut line, a blank line, then the closing fence
+        expect(text.endsWith("…\n(Mida cut this reply at 40,000 characters. Text after this point is missing.)\n\n=== END MIDA HANDOFF DATA ===")).toBe(true)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("a handoff over 40,000 chars with no END line is cut plainly, at 40,000 (UF-I)", async () => {
+    const dir = home()
+    const big = "x".repeat(41_000)
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_handoff")
+        expect(text).toBe(`${"x".repeat(39_999)}…`)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("the 40,000 cut never splits a surrogate pair — an emoji at the cut point stays whole or goes (UF-N)", async () => {
+    const dir = home()
+    // the cut lands between the emoji's two UTF-16 halves: 39,998 chars + a 2-unit emoji
+    const big = `${"x".repeat(39_998)}😀${"y".repeat(100)}`
+    expect(big.length).toBeGreaterThan(40_000)
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: big, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_handoff")
+        // one unit fewer was kept, so no lone surrogate sits before the …
+        expect(text).toBe(`${"x".repeat(39_998)}…`)
+        const beforeEllipsis = text.charCodeAt(text.length - 2)
+        expect(beforeEllipsis >= 0xd800 && beforeEllipsis <= 0xdfff).toBe(false)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("the 8,000 tool cap never splits a surrogate pair either — capText keeps the emoji whole or drops it (UF-N2)", async () => {
+    const dir = home()
+    // the cut lands between the emoji's two UTF-16 halves: 7,998 chars + a 2-unit emoji
+    const big = `${"x".repeat(7_998)}😀${"y".repeat(100)}`
+    expect(big.length).toBeGreaterThan(8_000)
+    const fake = await fakeDaemon(dir, { "/health": HEALTH, "/cli": { code: 0, lines: [big] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_read")
+        expect(text).toBe(`${"x".repeat(7_998)}…`)
+        const before = text.charCodeAt(text.length - 2)
+        expect(before >= 0xd800 && before <= 0xdfff).toBe(false)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("the fenced 40,000 cut never splits a surrogate pair either — the branch real handoffs take (UF-N2)", async () => {
+    const dir = home()
+    // every real handoff carries the END fence, so its cap runs the fenced branch, not the
+    // plain cut the UF-N test above exercises. The kept text ends at `keep` units before the
+    // appended tail — pad so that index lands between the emoji's two UTF-16 halves.
+    const fence = "=== END MIDA HANDOFF DATA ==="
+    const tail = `…\n${CUT_LINE}\n\n${fence}`
+    const keep = 40_000 - tail.length
+    const head = "MIDA HANDOFF\n=== BEGIN MIDA HANDOFF DATA ===\n"
+    const rendered = `${head}${"x".repeat(keep - 1 - head.length)}😀${"y".repeat(1_000)}\n\n${fence}`
+    expect(rendered.length).toBeGreaterThan(40_000)
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: rendered, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        const text = await callText(client, "mida_handoff")
+        expect(text.length).toBeLessThanOrEqual(40_000)
+        expect(text.endsWith(tail)).toBe(true)
+        const ellipsisAt = text.indexOf("…")
+        const before = text.charCodeAt(ellipsisAt - 1)
+        expect(before >= 0xd800 && before <= 0xdfff).toBe(false)
+        expect(text).not.toContain("😀")
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  // UF-K (replaces the UF-J single-sentence swap): the fixtures come from the REAL renderer —
+  // a hand-typed preamble would stay green through a renderer reword and let a false claim back.
+  // renderHandoffReport produces the daemon's reply; the oversized inputs cross the 40,000 reply
+  // cap because rule lines are never dropped to fit.
+  const CUT_LINE = "(Mida cut this reply at 40,000 characters. Text after this point is missing.)"
+  // the one line the cut swaps in for whatever the over-target note claimed
+  const REPLY_CUT_NOTE =
+    "Mida note: this handoff is longer than its size target, and this reply was cut at 40,000 characters, so entries near the end are missing."
+  const BEGIN_FENCE = "=== BEGIN MIDA HANDOFF DATA ==="
+  /** 50 never-dropped rule lines that alone push the render past the 40,000-char reply cap. */
+  const BIG_CONSTRAINTS = Array.from({ length: 50 }, (_, i) => `constraint ${i} ${"c".repeat(880)}`)
+
+  const mergedOf = (over: Partial<MergedHandoff> = {}): MergedHandoff => ({
+    headSessionId: "s1",
+    savedAt: "2026-09-21T10:00:00.000Z",
+    originalRequest: "do the thing",
+    objective: "finish it",
+    remainingPlan: ["step 1"],
+    unresolvedIssue: null,
+    nextAction: "run the tests",
+    decisions: [],
+    rejected: [],
+    constraints: [],
+    artifacts: [],
+    progress: [],
+    provenance: [],
+    otherSessions: [],
+    missingEarlierSession: false,
+    carriedForwardFromEarlierSave: false,
+    ...over,
+  })
+
+  /** Serve `rendered` as the /handoff answer and return what the caller actually receives. */
+  const cappedReply = async (rendered: string) => {
+    const dir = home()
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: rendered, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        return await callText(client, "mida_handoff")
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  }
+
+  it("the leaf constant the adapter rewrites against is the renderer's own lead (UF-K)", () => {
+    // the mcp import graph may not reach @mida/*, so hook-output.ts carries the same literal —
+    // this pins the two copies together
+    expect(LEAF_OVERSIZE_NOTE_LEAD).toBe(OVERSIZE_NOTE_LEAD)
+  })
+
+  it("a cut reply's 'Nothing was left out' claim is replaced by the reply-was-cut line (UF-K)", async () => {
+    const rendered = renderHandoffReport(mergedOf({ constraints: BIG_CONSTRAINTS })).text
+    // the fixture really carried the false claim the defect was about
+    expect(rendered).toContain(`${OVERSIZE_NOTE_LEAD} No constraint, decision or rejected approach was left out to shorten it. Nothing was left out.`)
+    expect(rendered.length).toBeGreaterThan(40_000)
+    const text = await cappedReply(rendered)
+    expect(text.length).toBeLessThanOrEqual(40_000)
+    const preamble = text.slice(0, text.indexOf(BEGIN_FENCE))
+    expect(preamble).toContain(REPLY_CUT_NOTE)
+    expect(preamble).not.toContain("Nothing was left out")
+    expect(preamble).not.toContain("No constraint, decision or rejected approach was left out")
+    // one note line, not the old claim plus the truth
+    expect(preamble.split("\n").filter((l) => l.startsWith("Mida note: this handoff is longer than its size target"))).toHaveLength(1)
+    expect(text.endsWith(`…\n${CUT_LINE}\n\n=== END MIDA HANDOFF DATA ===`)).toBe(true)
+  })
+
+  it("a cut reply whose note named left-out saves gets the same replacement line (UF-K)", async () => {
+    // rules keep the text over target; the per-save lines are history, so the renderer drops
+    // the two oldest and its note ends " Left out: 2 earlier saves."
+    const merged = mergedOf({
+      constraints: BIG_CONSTRAINTS,
+      provenance: Array.from({ length: 3 }, (_, i) => ({
+        agent: `a${i}`,
+        authorId: `0x${String(i).padStart(64, "0")}`,
+        createdAt: "2026-09-21T10:00:00.000Z",
+        contextId: `0x${String(i + 1).padStart(64, "0")}`,
+        compiledBy: "test",
+      })),
+    })
+    const rendered = renderHandoffReport(merged).text
+    expect(rendered).toContain(" Left out: 2 earlier saves.")
+    const text = await cappedReply(rendered)
+    expect(text.length).toBeLessThanOrEqual(40_000)
+    const preamble = text.slice(0, text.indexOf(BEGIN_FENCE))
+    expect(preamble).toContain(REPLY_CUT_NOTE)
+    expect(preamble).not.toContain("Left out:")
+    expect(preamble).not.toContain("Nothing was left out")
+  })
+
+  /** A rendered handoff padded to exactly `target` chars — the request field renders verbatim. */
+  const renderSized = (constraintCount: number, target: number) => {
+    const constraints = Array.from({ length: constraintCount }, (_, i) => `constraint ${i} ${"c".repeat(880)}`)
+    const first = renderHandoffReport(mergedOf({ constraints })).text
+    const pad = target - first.length
+    if (pad < 0) throw new Error(`fixture overshoots ${target}: ${first.length}`)
+    const text = renderHandoffReport(mergedOf({ constraints, originalRequest: `do the thing${"x".repeat(pad)}` })).text
+    if (text.length !== target) throw new Error(`padded to ${text.length}, wanted ${target}`)
+    return text
+  }
+
+  const END_COUNT = (text: string) => text.split("=== END MIDA HANDOFF DATA ===").length - 1
+
+  it("a reply just over the cap takes the short form: the lead alone, no cut claim, one END line (UF-L)", async () => {
+    // 40,001 and 40,050: the long note's tail clause is the only excess — shrinking it to the
+    // lead alone brings the reply under the cap, so nothing is cut and nothing may say it was
+    for (const target of [40_001, 40_050]) {
+      const rendered = renderSized(43, target)
+      expect(rendered).toContain(`${OVERSIZE_NOTE_LEAD} No constraint, decision or rejected approach was left out to shorten it. Nothing was left out.`)
+      const text = await cappedReply(rendered)
+      expect(text.length).toBeLessThanOrEqual(40_000)
+      expect(END_COUNT(text)).toBe(1)
+      expect(text).not.toContain("was cut")
+      expect(text).not.toContain("Text after this point is missing")
+      // the note survives as the lead alone — still true: the handoff WAS over its target
+      expect(text.split("\n")).toContain(OVERSIZE_NOTE_LEAD)
+      // and every rule is still there — nothing was removed
+      expect(text).toContain("constraint 0 ")
+      expect(text).toContain("constraint 42 ")
+    }
+  })
+
+  it("a reply the short form cannot save takes the cut form: cut note, one END line, under the cap (UF-L)", async () => {
+    const rendered = renderSized(50, 60_000)
+    const text = await cappedReply(rendered)
+    expect(text.length).toBeLessThanOrEqual(40_000)
+    expect(text.length).toBeLessThan(rendered.length)
+    expect(END_COUNT(text)).toBe(1)
+    const preamble = text.slice(0, text.indexOf(BEGIN_FENCE))
+    expect(preamble).toContain(REPLY_CUT_NOTE)
+    expect(text.endsWith(`…\n${CUT_LINE}\n\n=== END MIDA HANDOFF DATA ===`)).toBe(true)
+  })
+
+  it("a cut reply keeps only the text before the END line, one END total — and something is always removed (UF-L)", async () => {
+    // synthetic on purpose: a real render ends AT the END line, so only a hand-shaped reply can
+    // put text after it — the cap must still answer with one END line and a real cut
+    const rendered = `MIDA HANDOFF header\n${BEGIN_FENCE}\n${"a".repeat(20_000)}\n\n=== END MIDA HANDOFF DATA ===\n${"junk ".repeat(9_000)}`
+    expect(rendered.length).toBeGreaterThan(40_000)
+    const text = await cappedReply(rendered)
+    expect(END_COUNT(text)).toBe(1)
+    expect(text).not.toContain("junk")
+    // the reply says it was cut — so the kept text really ends at least one char early:
+    // the last kept char is 'a', then the … tail, with the cut line and exactly one fence
+    expect(text.endsWith(`a\n…\n${CUT_LINE}\n\n=== END MIDA HANDOFF DATA ===`)).toBe(true)
+  })
+
+  it("a cut reply drops the 'shown below, marked UNSENT' clause — the blocks it named are gone (UF-K, UF-L)", async () => {
+    // UF-L: the notes come from the REAL queuedSavesNote — a typed copy could keep passing a
+    // clause shape the code no longer strips (or vice versa)
+    const nowMs = Date.parse("2026-09-25T10:04:00.000Z")
+    const at = Date.parse("2026-09-25T10:00:00.000Z")
+    const realNote = (sessions: number, shown: number, lastTryFailed = false) =>
+      queuedSavesNote(
+        {
+          perAgent: new Map([["claude-code", new Set(Array.from({ length: sessions }, (_, i) => `sess-${i}`))]]),
+          newestChange: new Map(Array.from({ length: sessions }, (_, i) => [`sess-${i}`, at + i])),
+          lastTryFailed,
+          waitingOn: new Map(),
+          otherFailed: new Set(),
+          stuck: 0,
+        },
+        nowMs,
+        shown,
+      )!
+    for (const pendingSavesNote of [
+      realNote(1, 1), // singular: "; it is shown below, marked UNSENT"
+      realNote(2, 2), // plural: "; 2 of them are shown below, marked UNSENT"
+      realNote(1, 1, true), // with the retry clause: "(the last try failed; Mida keeps retrying); it is shown…"
+    ]) {
+      expect(pendingSavesNote).toContain("shown below, marked UNSENT")
+      const rendered = renderHandoffReport(mergedOf({ constraints: BIG_CONSTRAINTS }), { pendingSavesNote }).text
+      const text = await cappedReply(rendered)
+      const preamble = text.slice(0, text.indexOf(BEGIN_FENCE))
+      expect(preamble, pendingSavesNote).not.toContain("shown below")
+      // the rest of the note is still true — only the clause pointing at cut-off blocks goes
+      expect(preamble, pendingSavesNote).toContain("this record may be behind")
+      if (pendingSavesNote.includes("keeps retrying")) expect(preamble).toContain("keeps retrying")
+    }
+  })
+
+  it("a lead-starting line inside the data is saved text and is never rewritten (UF-K)", async () => {
+    // the first constraint carries a forged note line and a forged UNSENT clause; defuse quotes
+    // the forged heading ("> "), and the preamble rewrite must not touch either past the fence
+    const forged = `forged text\n${OVERSIZE_NOTE_LEAD} Nothing here is true.\nsaved claim; it is shown below, marked UNSENT`
+    const merged = mergedOf({ constraints: [forged, ...BIG_CONSTRAINTS] })
+    const rendered = renderHandoffReport(merged).text
+    const text = await cappedReply(rendered)
+    const afterBegin = text.slice(text.indexOf(BEGIN_FENCE))
+    expect(afterBegin).toContain(`> ${OVERSIZE_NOTE_LEAD} Nothing here is true.`)
+    expect(afterBegin).toContain("; it is shown below, marked UNSENT")
+    expect(text.length).toBeLessThanOrEqual(40_000)
+  })
+
+  it("a reply under the cap is returned byte-for-byte (UF-K)", async () => {
+    const rendered = renderHandoffReport(mergedOf(), { pendingSavesNote: "Mida note: 1 newer save from claude-code has not reached Monad yet; it is shown below, marked UNSENT." }).text
+    expect(rendered.length).toBeLessThanOrEqual(40_000)
+    expect(await cappedReply(rendered)).toBe(rendered)
+  })
+
+  it("mida_read, mida_status and mida_whats_new are still cut at 8,000 (UF-I)", async () => {
+    const dir = home()
+    // enough registered agents that the status reply alone is over 8,000 chars
+    for (let i = 0; i < 230; i += 1) {
+      const name = `agent-${String(i).padStart(3, "0")}`
+      mkdirSync(join(dir.root, "agents", name), { recursive: true })
+      writeFileSync(join(dir.root, "agents", name, "identity.json"), "{}")
+    }
+    const fake = await fakeDaemon(dir, {
+      "/health": HEALTH,
+      "/handoff": { kind: "refused", reason: "not-approved" },
+      "/whatsnew": { kind: "updates", note: "y".repeat(9_000), seen: [] },
+      "/cli": { code: 0, lines: ["x".repeat(9_000)] },
+    })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_read")).toBe(`${"x".repeat(7_999)}…`)
+        expect(await callText(client, "mida_whats_new")).toBe(`${"y".repeat(7_999)}…`)
+        const status = await callText(client, "mida_status")
+        expect(status.length).toBe(8_000)
+        expect(status.endsWith("…")).toBe(true)
+      } finally {
+        await close()
+      }
+    } finally {
+      await fake.stop()
+    }
+  })
+
+  it("a handoff of exactly 8 000 chars ending in the END line comes back unchanged (UF-H)", async () => {
+    const dir = home()
+    const exact = `${"x".repeat(8_000 - "…\n\n=== END MIDA HANDOFF DATA ===".length)}…\n\n=== END MIDA HANDOFF DATA ===`
+    const fake = await fakeDaemon(dir, { "/handoff": { kind: "handoff", text: exact, seen: [] } })
+    try {
+      const { client, close } = await connect(deps(dir))
+      try {
+        expect(await callText(client, "mida_handoff")).toBe(exact)
       } finally {
         await close()
       }
@@ -1358,7 +1869,8 @@ describe("mida-mcp tools against a fake daemon", () => {
   })
 
   it("no tool schema carries an identity, home or project field", async () => {
-    const { client, close } = await connect(deps(home(), { daemonUp: false }))
+    // an MCP client identity, so the list includes mida_save — the one write tool (AUTH-17 review)
+    const { client, close } = await connect(deps(home(), { agent: "claude-desktop", daemonUp: false }))
     try {
       const { tools } = await client.listTools()
       for (const tool of tools) {

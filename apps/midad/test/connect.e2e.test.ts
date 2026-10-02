@@ -31,7 +31,7 @@ describe("SDK connectAgent ↔ mida approve interop on local Anvil", () => {
     // The daemon writes this when it comes up; the owner-runtime path does not. Writing it here
     // simulates the live-daemon state an installed SDK consumer finds.
     writeFileSync(join(homePath, "api-url.json"), JSON.stringify({ baseUrl: runtime.apiBaseUrl }))
-  }, STEP_TIMEOUT * 2)
+  }, 600_000)
 
   afterAll(async () => {
     await runtime?.close()

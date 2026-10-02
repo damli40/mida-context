@@ -1,0 +1,105 @@
+{
+ "source": "~/.mida/logs/drain.jsonl",
+ "generatedAt": "2026-10-02T02:34:29.408Z",
+ "runningCode": "cb8294a (npm 0.1.1)",
+ "oct1": {
+  "sponsoredSavesBeforeTheLimitWasRaised": 60,
+  "lastBefore": "2026-10-01T01:38:58.697Z",
+  "sponsoredSavesAfter": 51,
+  "firstAfter": "2026-10-01T18:49:49.276Z"
+ },
+ "sponsoredSaveCostMon": {
+  "n": 283,
+  "mean": 0.067,
+  "median": 0.0668,
+  "rule": "gasLimit x effectiveGasPrice of each sponsored save"
+ },
+ "days": [
+  {
+   "day": "2026-09-27",
+   "saved": 9,
+   "sponsoredSaves": 0,
+   "lastSponsoredSaveAt": null,
+   "failedTriesByReason": {
+    "chain-error": 118,
+    "model-failed": 5,
+    "no-json": 2,
+    "chain-busy": 7
+   },
+   "droppedByReason": {
+    "gave-up": 17
+   }
+  },
+  {
+   "day": "2026-09-28",
+   "saved": 0,
+   "sponsoredSaves": 0,
+   "lastSponsoredSaveAt": null,
+   "failedTriesByReason": {
+    "chain-error": 21,
+    "model-failed": 2
+   },
+   "droppedByReason": {
+    "gave-up": 5
+   }
+  },
+  {
+   "day": "2026-09-29",
+   "saved": 72,
+   "sponsoredSaves": 60,
+   "lastSponsoredSaveAt": "2026-09-29T10:26:35.647Z",
+   "failedTriesByReason": {
+    "chain-error": 119,
+    "model-failed": 13,
+    "no-json": 7,
+    "invalid-checkpoint": 1
+   },
+   "droppedByReason": {
+    "gave-up": 9,
+    "invalid-checkpoint": 1
+   }
+  },
+  {
+   "day": "2026-09-30",
+   "saved": 71,
+   "sponsoredSaves": 71,
+   "lastSponsoredSaveAt": "2026-09-30T14:01:01.145Z",
+   "failedTriesByReason": {
+    "model-failed": 24,
+    "no-json": 4,
+    "chain-error": 33,
+    "chain-busy": 12
+   },
+   "droppedByReason": {
+    "unknown-transcript-format": 1,
+    "gave-up": 6
+   }
+  },
+  {
+   "day": "2026-10-01",
+   "saved": 111,
+   "sponsoredSaves": 111,
+   "lastSponsoredSaveAt": "2026-10-01T23:55:48.340Z",
+   "failedTriesByReason": {
+    "model-failed": 36,
+    "no-json": 12,
+    "chain-error": 253,
+    "chain-busy": 1
+   },
+   "droppedByReason": {
+    "gave-up": 28
+   }
+  },
+  {
+   "day": "2026-10-02",
+   "saved": 41,
+   "sponsoredSaves": 41,
+   "lastSponsoredSaveAt": "2026-10-02T02:30:55.062Z",
+   "failedTriesByReason": {
+    "model-failed": 4,
+    "no-json": 2
+   },
+   "droppedByReason": {}
+  }
+ ]
+}

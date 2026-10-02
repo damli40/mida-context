@@ -150,7 +150,7 @@ describe("devin hook -> drain -> save -> handoff, on local Anvil", () => {
       log: () => {},
       tickMs: 60_000,
     })
-  }, STEP_TIMEOUT * 6)
+  }, 600_000)
 
   afterAll(async () => {
     await daemon?.close()

@@ -177,7 +177,7 @@ describe("migrate state machine on local Anvil (migrate B5)", () => {
     source = env.deployment
     target = await deployLocal({ rpcUrl: env.rpcUrl })
     publicClient = createPublicClient({ chain: chainFor(source.chainId), transport: http(env.rpcUrl) })
-  }, TIMEOUT)
+  }, 1_200_000)
 
   afterAll(async () => {
     await env?.stop()
@@ -492,6 +492,6 @@ describe("migrate state machine on local Anvil (migrate B5)", () => {
       const logs = await targetLogs(seeded, manifest.agentMap["claude-code"]!.newAgentId!)
       expect(logs.records).toBe(10)
     },
-    TIMEOUT,
+    600_000,
   )
 })

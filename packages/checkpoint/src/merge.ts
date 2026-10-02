@@ -1,4 +1,5 @@
-import type { Checkpoint } from "./schema.js"
+import { limitNote, splitLimitNote } from "./schema.js"
+import type { Checkpoint, LimitList } from "./schema.js"
 
 /**
  * Where a migrated record came from — sealed inside the encrypted payload by `mida migrate`,
@@ -396,13 +397,37 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
     undefined,
   )
 
+  // UF-N (replaces UF-L's union-over-everything): the note describes the lists the handoff
+  // SHOWS, so it is read only from the hook-compiler saves whose lists form the merge's base —
+  // the newest hook-compiler save, plus the earlier one when a truncated save made the merge
+  // carry its lists forward. A save that hit the cap long ago but is no longer the base has
+  // stopped contributing its lists, so its note would be a lie; and an agent-tool save writes
+  // its own unresolvedIssue, so a note it carries is a claim, never trusted. With no
+  // hook-compiler save in scope there is no note at all.
+  const mergedIssue = mergedField(cps, "unresolvedIssue", null)
+  const notedLists = new Set<LimitList>()
+  if (lastHook >= 0) {
+    for (const list of splitLimitNote(cps[lastHook]!.unresolvedIssue).lists) notedLists.add(list)
+    if (carriedForwardFromEarlierSave) {
+      for (const list of splitLimitNote(cps[prevHook]!.unresolvedIssue).lists) notedLists.add(list)
+    }
+  }
+  const unionNote = limitNote(notedLists)
+  // whatever the union decides, a limit-note segment never survives inside the chosen text —
+  // the merged note is written here or not at all
+  const issueText = mergedIssue === null ? null : splitLimitNote(mergedIssue).text
+  const unresolvedIssue =
+    unionNote === null
+      ? issueText === "" ? null : issueText
+      : issueText === null || issueText === "" ? unionNote : `${issueText} | ${unionNote}`
+
   return {
     headSessionId: chosen.newest.sessionId,
     savedAt: savedAt === undefined ? null : new Date(savedAt).toISOString(),
     originalRequest: cps.find((c) => c.originalRequest !== null)?.originalRequest ?? null,
     objective: mergedField(cps, "objective", ""),
     remainingPlan: mergedField(cps, "remainingPlan", []),
-    unresolvedIssue: mergedField(cps, "unresolvedIssue", null),
+    unresolvedIssue,
     nextAction: mergedField(cps, "nextAction", ""),
     decisions: mergedList("decisions"),
     rejected: mergedList("rejected"),

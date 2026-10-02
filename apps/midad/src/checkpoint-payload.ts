@@ -1,6 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2.js"
 import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
-import { LIMITS, validateCheckpoint } from "@mida/checkpoint"
+import { LIMITS, cutText, repointEvidence, validateCheckpoint } from "@mida/checkpoint"
 import type { Checkpoint, MigrationEnvelope } from "@mida/checkpoint"
 import { validateMigrationEnvelope } from "./migration-envelope.js"
 import { DEFAULT_TASK, isTaskName } from "./task.js"
@@ -66,7 +66,8 @@ export function eventIdFor(input: { projectId: string; sessionId: string; transc
   return `cp-${digest.slice(0, 40)}`
 }
 
-// The order in which a too-big checkpoint gives things up: oldest progress first, then evidence,
+// The order in which a too-big checkpoint gives things up: oldest progress first (each taking its own
+// evidence with it), then evidence,
 // artifacts, rejected and decisions. originalRequest, remainingPlan, nextAction and objective are
 // never dropped or cut — they are what make a handoff usable.
 const DROPPABLE = ["progress", "evidence", "artifacts", "rejected", "decisions"] as const
@@ -84,6 +85,100 @@ function checkedMigration(migration: unknown): MigrationEnvelope | undefined {
     throw new CheckpointPayloadError("invalid-checkpoint", `invalid migration envelope: ${checked.errors.join("; ")}`, fieldPathsFromErrors(checked.errors))
   }
   return checked.value
+}
+
+/**
+ * An unresolvedIssue value read as "free text" joined to every "(Mida: …)" note it holds by
+ * " | ". Only a COMPLETE segment — opening bracket to closing bracket, with no other bracket
+ * between — is a note. An unclosed "(Mida:" is ordinary text and pays the string cap like any
+ * other words (UF-N: the old /(\)|$)/ alternative let it swallow the rest of the string, and
+ * the note appended behind it, into one fake "note").
+ */
+const ISSUE_NOTE_SEGMENT = /\(Mida:[^()]*\)/g
+
+/**
+ * UF-QA: the ONLY size note wrapCheckpoint itself can write — `(Mida: <parts> to fit the size
+ * limit)` where each part is `left out <n> <field>` (dropped-list fields) or
+ * `cut long strings in <field>` (cut-string fields), parts joined "; ". A segment that merely
+ * starts like one — a field name Mida never writes, different wording — is the model's own
+ * text and stays.
+ */
+const SIZE_DROPPED_FIELD = "(?:progress|evidence|artifacts|rejected|decisions)"
+const SIZE_CUT_FIELD = "(?:agent|constraints|unresolvedIssue)"
+const SIZE_PART =
+  `(?:left out \\d+ ${SIZE_DROPPED_FIELD}(?:, \\d+ ${SIZE_DROPPED_FIELD})*` +
+  `|cut long strings in ${SIZE_CUT_FIELD}(?:, ${SIZE_CUT_FIELD})*)`
+const SIZE_NOTE_SEGMENT = new RegExp(`\\(Mida: ${SIZE_PART}(?:; ${SIZE_PART})* to fit the size limit\\)`)
+
+/**
+ * Removes every earlier complete size note of wrap's own exact shape from an issue value, with
+ * UF-N1's one-separator rule — the " | " directly before a removed note goes with it, or the
+ * one directly after when there is none before. Called before wrap appends a fresh size note,
+ * so repeated saves over the cap carry exactly one.
+ */
+function dropSizeNotes(value: string): string {
+  let text = value
+  let removed = false
+  for (;;) {
+    const segment = SIZE_NOTE_SEGMENT.exec(text)
+    if (segment === null) break
+    removed = true
+    const before = text.slice(0, segment.index)
+    const after = text.slice(segment.index + segment[0].length)
+    const sepBefore = /\s*\|\s*$/.exec(before)
+    if (sepBefore !== null) {
+      text = before.slice(0, sepBefore.index) + after
+    } else {
+      const sepAfter = /^\s*\|\s*/.exec(after)
+      text = before + (sepAfter === null ? after : after.slice(sepAfter[0].length))
+    }
+  }
+  return removed ? text.trim() : value
+}
+
+
+/**
+ * The ONE shape unresolvedIssue is ever stored in (UF-L): notes whole at the end, free text
+ * before them, and the text alone pays for size cuts — at most `textRoom` chars of it. The old
+ * code cut the field straight through at 300 chars, slicing a note open mid-word, and when a
+ * note was followed by more text it counted the TEXT toward the note tail until the join passed
+ * the string cap and re-validation threw — the save was lost after three compiles. When even
+ * the notes overflow the string cap the LAST ones are kept: the newest note is the truest.
+ */
+function issueKeepingNotes(value: string, textRoom: number): string {
+  const notes: string[] = []
+  let text = value
+  for (;;) {
+    ISSUE_NOTE_SEGMENT.lastIndex = 0
+    const segment = ISSUE_NOTE_SEGMENT.exec(text)
+    if (segment === null) break
+    notes.push(segment[0])
+    const before = text.slice(0, segment.index)
+    const after = text.slice(segment.index + segment[0].length)
+    // UF-N2: the ONE separator touching the removed note goes with it — the one directly
+    // before it, or if there is none, the one directly after. Every other character is the
+    // issue's own text and is left alone: a `||` the model wrote stays `||`.
+    const sepBefore = /\s*\|\s*$/.exec(before)
+    if (sepBefore !== null) {
+      text = before.slice(0, sepBefore.index) + after
+    } else {
+      const sepAfter = /^\s*\|\s*/.exec(after)
+      text = before + (sepAfter === null ? after : after.slice(sepAfter[0].length))
+    }
+  }
+  if (notes.length > 0) text = text.trim()
+  let noteRoom = LIMITS.maxString
+  const kept: string[] = []
+  for (let i = notes.length - 1; i >= 0; i--) {
+    const cost = notes[i]!.length + (kept.length === 0 ? 0 : " | ".length)
+    if (notes[i]!.length > LIMITS.maxString || cost > noteRoom) break
+    kept.unshift(notes[i]!)
+    noteRoom -= cost
+  }
+  const tail = kept.join(" | ")
+  const room = Math.min(textRoom, LIMITS.maxString - tail.length - (tail === "" ? 0 : " | ".length))
+  const head = cutText(text, room)
+  return tail === "" ? head : head === "" ? tail : `${head} | ${tail}`
 }
 
 /**
@@ -137,6 +232,14 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
       if (checkpoint[field].length === 0) continue
       checkpoint[field].shift()
       dropped.set(field, (dropped.get(field) ?? 0) + 1)
+      if (field !== "evidence") {
+        // evidence names its target by position ("progress[3]"): follow the entries that just moved
+        // down one, and let go of the evidence for the entry that left (CAP-29)
+        const kept = repointEvidence(checkpoint.evidence, field, 1)
+        const gone = checkpoint.evidence.length - kept.length
+        if (gone > 0) dropped.set("evidence", (dropped.get("evidence") ?? 0) + gone)
+        checkpoint.evidence = kept
+      }
       return true
     }
     return false
@@ -147,15 +250,26 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
   const cut = (field: string, text: string): string => {
     if (text.length <= CUT_TO) return text
     trimmed.add(field)
-    return `${text.slice(0, CUT_TO)}…`
+    return cutText(text, CUT_TO + 1) // CUT_TO units plus the ellipsis — never a split surrogate
   }
   if (bytes() > MAX_VALUE_BYTES) {
     checkpoint.agent = cut("agent", checkpoint.agent)
     checkpoint.constraints = checkpoint.constraints.map((c) => cut("constraints", c))
-    if (checkpoint.unresolvedIssue !== null) checkpoint.unresolvedIssue = cut("unresolvedIssue", checkpoint.unresolvedIssue)
+    // the issue's notes move to the tail WHOLE — the text pays the cut alone, never a note (UF-L)
+    if (checkpoint.unresolvedIssue !== null) {
+      const next = issueKeepingNotes(checkpoint.unresolvedIssue, CUT_TO + 1)
+      if (next.length < checkpoint.unresolvedIssue.length) trimmed.add("unresolvedIssue")
+      checkpoint.unresolvedIssue = next
+    }
   }
 
   if (dropped.size > 0 || trimmed.size > 0) {
+    // UF-QA: a previous save's size note carried forward on the issue goes before the new one
+    // is appended — the note records THIS save's losses, not a history of them.
+    if (checkpoint.unresolvedIssue !== null) {
+      const withoutOld = dropSizeNotes(checkpoint.unresolvedIssue)
+      if (withoutOld !== checkpoint.unresolvedIssue) checkpoint.unresolvedIssue = withoutOld
+    }
     const parts: string[] = []
     if (dropped.size > 0) parts.push(`left out ${[...dropped.entries()].map(([field, n]) => `${n} ${field}`).join(", ")}`)
     if (trimmed.size > 0) parts.push(`cut long strings in ${[...trimmed].join(", ")}`)
@@ -164,7 +278,10 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
     if (checkpoint.constraints.length < LIMITS.maxArray) {
       checkpoint.constraints.push(note)
     } else {
-      checkpoint.unresolvedIssue = checkpoint.unresolvedIssue === null ? note : `${checkpoint.unresolvedIssue} | ${note}`
+      checkpoint.unresolvedIssue = issueKeepingNotes(
+        checkpoint.unresolvedIssue === null ? note : `${checkpoint.unresolvedIssue} | ${note}`,
+        LIMITS.maxString,
+      )
     }
     // the note costs bytes too — drop whatever else can go before giving up
     while (bytes() > MAX_VALUE_BYTES && dropOldest()) { /* keep shrinking */ }
@@ -173,7 +290,14 @@ export function wrapCheckpoint(input: Omit<CheckpointEnvelope, "type">): Checkpo
     const what = [...dropped.entries()].map(([field, n]) => `${n} ${field}`).join(", ") || "nothing"
     throw new CheckpointPayloadError("too-large", `checkpoint envelope exceeds the ${MAX_VALUE_BYTES}-byte cap even after dropping ${what}`)
   }
-  return envelope()
+  // A save must never be stored in a form that cannot be read back: the shrink steps above edit
+  // the checkpoint after the input validation, so the result is validated once more (UF-K).
+  const final = envelope()
+  const rechecked = validateCheckpoint(final.checkpoint)
+  if (!rechecked.ok) {
+    throw new CheckpointPayloadError("invalid-checkpoint", `invalid checkpoint: ${rechecked.errors.join("; ")}`, fieldPathsFromErrors(rechecked.errors))
+  }
+  return final
 }
 
 /** Reads back a v1 envelope. Anything else — wrong type, missing field, invalid checkpoint — is null, never a throw. */

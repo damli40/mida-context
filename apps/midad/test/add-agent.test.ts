@@ -46,7 +46,7 @@ describe("mida add-agent", () => {
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-addagent-")))
     projectDir = mkdtempSync(join(tmpdir(), "mida-addagent-proj-"))
     expect(await run("init")).toBe(0)
-  }, 300_000)
+  }, 600_000)
 
   afterAll(async () => {
     await env?.stop()

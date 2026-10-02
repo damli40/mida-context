@@ -5,9 +5,10 @@
 // caller instead of stored — the drainer owns storage.
 
 import { spawn } from "node:child_process"
+import { mkdtempSync, rmSync } from "node:fs"
 import os from "node:os"
-import path from "node:path"
-import { CONTENT_FIELDS, LIMITS, validateCheckpoint, type Checkpoint } from "@mida/checkpoint"
+import path, { join } from "node:path"
+import { CONTENT_FIELDS, LIMITS, cutText, limitNote, repointEvidence, splitLimitNote, validateCheckpoint, type Checkpoint, type LimitList } from "@mida/checkpoint"
 import { extractJsonObject } from "./extract-json.js"
 import { buildExtractPrompt } from "./prompt.js"
 import { scrubSecrets, scrubValue } from "./scrub.js"
@@ -25,6 +26,80 @@ export interface ModelCommand {
    * Without the flag stderr stays ignored — an arbitrary model's stderr is never loggable.
    */
   stderrDetail?: boolean
+  /**
+   * Extra environment for the child process, applied AFTER the ANTHROPIC_* names are
+   * stripped — and an ANTHROPIC_* name inside this map is ignored too, so a command
+   * can never smuggle a redirected endpoint or key back in.
+   */
+  env?: Readonly<Record<string, string>>
+  /**
+   * This command is an AI agent's own command-line tool (claude -p, codex exec). It
+   * runs in a fresh empty folder — never the user's project — keeps its stderr piped
+   * only to spot a usage limit (never into the failure detail), and a non-zero exit
+   * whose output names a usage limit is reported with `limit: true`.
+   */
+  agentCli?: boolean
+}
+
+/**
+ * The text shape of an agent CLI's "you are out of plan" answer — a usage/session/
+ * weekly/N-hour limit near a reaching verb, in either order, or one of the API
+ * providers' own phrases. "rate" is deliberately absent: a passing API rate-limit
+ * error is worth the retry this guard would skip. Disk quota is not a plan limit.
+ */
+export const USAGE_LIMIT_PATTERN =
+  /\b(?:usage|session|weekly|\d+-hour)[ -]limits?\b[^\n]{0,60}\b(?:reached|exceeded|hit)\b|\b(?:hit|reached|exceeded)\b[^\n]{0,60}\b(?:usage|session|weekly|\d+-hour)[ -]limits?\b|\bhit your limit\b|\binsufficient_quota\b|(?<!disk )\bquota exceeded\b|credit balance is too low/i
+
+/**
+ * Did the tool's OWN output name a usage limit? Codex prints the prompt back on
+ * stderr before its answer, so a user request that merely mentions "rate limiter"
+ * or "quota" must not make an unrelated failure look like a plan limit. Neither
+ * tool echoes the prompt on stdout, so every non-empty line of the kept head of
+ * stdout is examined. On stderr the echo is cut instead: a trimmed line of the
+ * kept tail ends the echo when it equals the prompt's last non-empty line, or
+ * when it is at least 16 characters and that last line ends with it — the tail
+ * cap can cut the echoed line in half, so the whole line is never found but its
+ * surviving half still marks where the echo stops (UF-QF). Everything up to and
+ * including the LAST echo-ending line is the echo and only what follows is
+ * examined; when no line ends the echo, every line is. One exception: when two
+ * or more lines equal the last line exactly and that line itself names a limit,
+ * the tool repeated the sentence the session ended on and the answer is true.
+ * (The old per-line "occurs in the prompt" rule dropped the real limit line when
+ * the session itself had ended on that limit — the transcript carried the
+ * sentence, so the prompt did too. UF-QD.)
+ */
+export function limitHit(prompt: string, stdout: string, stderrTail: string): boolean {
+  for (const raw of stdout.slice(0, 4096).split("\n")) {
+    const line = raw.trim()
+    if (line !== "" && USAGE_LIMIT_PATTERN.test(line)) return true
+  }
+  let lines = stderrTail.split("\n")
+  const promptLines = prompt.split("\n")
+  let last: string | undefined
+  for (let i = promptLines.length - 1; i >= 0 && last === undefined; i--) {
+    const trimmed = promptLines[i]!.trim()
+    if (trimmed !== "") last = trimmed
+  }
+  if (last !== undefined) {
+    let cut = -1
+    let exactCopies = 0
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!.trim()
+      if (line === last || (line.length >= 16 && last.endsWith(line))) {
+        cut = i
+        if (line === last) exactCopies++
+      }
+    }
+    if (cut >= 0) {
+      if (exactCopies >= 2 && USAGE_LIMIT_PATTERN.test(last)) return true
+      lines = lines.slice(cut + 1)
+    }
+  }
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (line !== "" && USAGE_LIMIT_PATTERN.test(line)) return true
+  }
+  return false
 }
 
 export const DEFAULT_MODEL: ModelCommand = {
@@ -56,6 +131,8 @@ export interface CompileInput {
   backoffMs?: readonly number[]
   now?: () => Date
   sleep?: (ms: number) => Promise<void>
+  /** Test seam: how the agent-CLI working folder is made — so a test can make it fail. */
+  makeTempDir?: () => string
 }
 
 export type CompileResult =
@@ -95,7 +172,7 @@ export type CompileResult =
     }
   | {
       ok: false
-      reason: "model-failed" | "no-json" | "invalid"
+      reason: "model-failed" | "no-json" | "invalid" | "summarizer-limit" | "no-summarizer"
       detail: string
       attempts: number
       /** 1 when the primary was re-asked once after a bad shape before the chain walked; else 0. */
@@ -128,36 +205,50 @@ type ModelRun =
       inputTokens?: number
       outputTokens?: number
     }
-  | { ok: false; detail: string; ms: number }
+  | { ok: false; detail: string; ms: number; limit?: boolean }
 
 // One bad field must not cost the whole save. Strings over the schema limit
 // are cut to it ending in "…"; arrays over the item limit keep 50 entries —
-// the LAST 50 for progress/evidence (the newest entries are the ones that
-// matter), the FIRST 50 for every other array. Each cut is named in
-// `trimmed` ("progress[3]", "decisions", "decisions[3].rationale").
-function trimFields(picked: Record<string, unknown>, trimmed: string[]): void {
+// the LAST 50 (the newest) for every list except the plan. The model carries
+// the earlier checkpoint forward and adds what is new at the end, so keeping
+// the front meant the 51st decision could never be saved, and the next agent
+// kept following a decision the user had since changed (CAP-29). The plan
+// keeps its FIRST 50: its front is what comes next. Evidence names its target
+// by position ("decisions[3]"), so after a front cut it is re-pointed, and
+// removed when its entry went. Each cut is named in `trimmed` ("progress[3]",
+// "decisions", "decisions[3].rationale" — positions as the model wrote them).
+const KEEPS_FRONT: ReadonlySet<string> = new Set(["remainingPlan"])
+function trimFields(picked: Record<string, unknown>, trimmed: string[], previousIssue: string | null | undefined): void {
   const cutStr = (v: unknown, path: string): unknown => {
     if (typeof v !== "string" || v.length <= LIMITS.maxString) return v
     trimmed.push(path)
-    return v.slice(0, LIMITS.maxString - 1) + "…"
+    return cutText(v, LIMITS.maxString)
   }
-  for (const field of ["objective", "nextAction", "unresolvedIssue"]) {
+  // unresolvedIssue is handled at the end, once the per-list cut counts are known — its
+  // note work needs them, and the general string cap runs on the issue text only, never on a note
+  for (const field of ["objective", "nextAction"]) {
     picked[field] = cutStr(picked[field], field)
   }
-  const cutList = (field: string, keepLast: boolean) => {
-    const arr = picked[field]
-    if (!Array.isArray(arr)) return
-    for (let i = 0; i < arr.length; i++) arr[i] = cutStr(arr[i], `${field}[${i}]`)
-    if (arr.length > LIMITS.maxArray) {
-      trimmed.push(field)
-      picked[field] = keepLast ? arr.slice(-LIMITS.maxArray) : arr.slice(0, LIMITS.maxArray)
+  // how many entries left the front of each list — what evidence has to follow
+  const cutFromFront = new Map<string, number>()
+  const cap = (field: string, arr: unknown[]): void => {
+    if (arr.length <= LIMITS.maxArray) return
+    trimmed.push(field)
+    if (KEEPS_FRONT.has(field)) {
+      picked[field] = arr.slice(0, LIMITS.maxArray)
+      return
     }
+    cutFromFront.set(field, arr.length - LIMITS.maxArray)
+    picked[field] = arr.slice(-LIMITS.maxArray)
   }
   for (const field of ["progress", "constraints", "artifacts", "remainingPlan"]) {
-    cutList(field, field === "progress")
+    const arr = picked[field]
+    if (!Array.isArray(arr)) continue
+    for (let i = 0; i < arr.length; i++) arr[i] = cutStr(arr[i], `${field}[${i}]`)
+    cap(field, arr)
   }
   for (const field of ["decisions", "rejected", "evidence"]) {
-    const arr = picked[field]
+    let arr = picked[field]
     if (!Array.isArray(arr)) continue
     for (let i = 0; i < arr.length; i++) {
       const item = arr[i]
@@ -169,11 +260,46 @@ function trimFields(picked: Record<string, unknown>, trimmed: string[]): void {
         )
       }
     }
-    if (arr.length > LIMITS.maxArray) {
-      trimmed.push(field)
-      picked[field] = field === "evidence" ? arr.slice(-LIMITS.maxArray) : arr.slice(0, LIMITS.maxArray)
+    if (field === "evidence") {
+      // evidence comes last in this loop, so every other list's cut is known by now
+      for (const [list, dropped] of cutFromFront) arr = repointEvidence(arr as unknown[], list, dropped)
+      picked[field] = arr
+    }
+    cap(field, arr as unknown[])
+  }
+  // UF-L: a front cut on a rule list drops the user's OLDEST entries, and the save must say
+  // WHICH lists lost some — a count went stale the moment a later save put an entry back (and a
+  // count inside note text could be forged upward). The note names lists, never numbers, and is
+  // CUMULATIVE over the session: the lists the previous checkpoint's note named union with
+  // whatever this compile cut, so a save that changes nothing still carries the loss forward.
+  // Only constraints, decisions and rejected earn one — progress, artifacts, evidence and
+  // plan cuts stay silent.
+  const lists = new Set<LimitList>(splitLimitNote(typeof previousIssue === "string" ? previousIssue : null).lists)
+  for (const field of ["constraints", "decisions", "rejected"] as const) {
+    if (cutFromFront.has(field)) lists.add(field)
+  }
+  const rawIssue = picked.unresolvedIssue
+  if (rawIssue === null || rawIssue === undefined || typeof rawIssue === "string") {
+    // Every note-shaped segment leaves the model's text BEFORE the length cut — but only an
+    // EXACT note leaves it (UF-QA): an unclosed note — one a length cut cut off mid-note, say —
+    // is left in the text as it is, because anything that is not a real Mida note is the model's
+    // own text. The lists a note the MODEL wrote claims are stripped with it and never trusted
+    // (UF-L): the note is rebuilt only from this compile's own cuts and the previous note.
+    const issue = cutStr(
+      typeof rawIssue === "string" ? splitLimitNote(rawIssue).text : "",
+      "unresolvedIssue",
+    ) as string
+    const note = limitNote(lists)
+    if (note === null) {
+      picked.unresolvedIssue = issue === "" ? null : issue
+    } else {
+      // the note stays whole — when it would push the field past the string cap, the
+      // model's own text is what shortens, ending in "…"
+      const head = cutText(issue, LIMITS.maxString - " | ".length - note.length)
+      picked.unresolvedIssue = head === "" ? note : `${head} | ${note}`
     }
   }
+  // a non-string unresolvedIssue is left for the validator to flag
 }
 
 // One model call: the prompt goes on stdin, stdout is captured up to
@@ -186,11 +312,34 @@ function trimFields(picked: Record<string, unknown>, trimmed: string[]): void {
 // settles on 'exit' or the timeout, never on 'close' alone: a grandchild
 // that inherited the stdout pipe keeps it open after the model dies, and
 // 'close' would then never come.
-function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
+function runModel(model: ModelCommand, prompt: string, makeTempDir?: () => string): Promise<ModelRun> {
   const t0 = Date.now()
   const timeoutMs = model.timeoutMs ?? DEFAULT_TIMEOUT_MS
   return new Promise((resolve) => {
     let settled = false
+    // An agent's own CLI runs in a fresh empty folder: its hooks and project
+    // files must not fire inside a user's repo. The folder goes away on every
+    // settle path — success, failure, timeout, spawn error.
+    let workDir = os.tmpdir()
+    if (model.agentCli === true) {
+      try {
+        workDir = makeTempDir?.() ?? mkdtempSync(join(os.tmpdir(), "mida-sum-"))
+      } catch (err) {
+        // the error CODE only ("temp folder: EACCES") — the message can carry
+        // a path, and a path in a log line leaks the local layout
+        const code = (err as NodeJS.ErrnoException).code ?? "unknown"
+        resolve({ ok: false, detail: `temp folder: ${code}`, ms: Date.now() - t0 })
+        return
+      }
+    }
+    const cleanup = (): void => {
+      if (model.agentCli !== true) return
+      try {
+        rmSync(workDir, { recursive: true, force: true })
+      } catch {
+        // a folder that will not go away is no reason to fail the compile
+      }
+    }
     const done = (
       r:
         | {
@@ -201,10 +350,11 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
             inputTokens?: number
             outputTokens?: number
           }
-        | { ok: false; detail: string },
+        | { ok: false; detail: string; limit?: boolean },
     ) => {
       if (settled) return
       settled = true
+      cleanup()
       resolve({ ...r, ms: Date.now() - t0 })
     }
 
@@ -221,15 +371,24 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
     for (const key of Object.keys(env)) {
       if (key.startsWith("ANTHROPIC_")) delete env[key]
     }
+    // The command's own additions come last — and an ANTHROPIC_* name inside
+    // them is dropped with the rest, by the same rule as the inherited ones.
+    if (model.env !== undefined) {
+      for (const [key, value] of Object.entries(model.env)) {
+        if (!key.startsWith("ANTHROPIC_")) env[key] = value
+      }
+    }
 
     let child
     try {
       child = spawn(model.argv[0] ?? "", [...model.argv.slice(1)], {
-        cwd: os.tmpdir(),
+        cwd: workDir,
         env,
-        // stderr is piped only for commands whose stderr is a controlled channel (stderrDetail);
-        // an arbitrary model's stderr is ignored, never captured into a log line
-        stdio: ["pipe", "pipe", model.stderrDetail === true ? "pipe" : "ignore"],
+        // stderr is piped for commands whose stderr is a controlled channel (stderrDetail)
+        // and for agent CLIs, whose output is checked for a usage limit. An arbitrary
+        // model's stderr is ignored, never captured into a log line — and an agent
+        // CLI's never reaches the detail either.
+        stdio: ["pipe", "pipe", model.stderrDetail === true || model.agentCli === true ? "pipe" : "ignore"],
         detached: true,
       })
     } catch (err) {
@@ -284,8 +443,21 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
     const settle = () => {
       clearTimeout(timer)
       if (timedOut || exited === null) return
-      if (exited.code !== 0) done({ ok: false, detail: `exit ${exited.code} signal ${exited.signal}${stderrNote()}` })
-      else done({ ok: true, stdout, ...reportedUsage() })
+      if (exited.code !== 0) {
+        if (model.agentCli === true) {
+          // The limit check reads the tool's OWN lines — the head of stdout plus
+          // the kept tail of stderr, minus anything that is just the echoed prompt
+          // — but the detail carries only the marker, never a word of the output.
+          const limit = limitHit(prompt, stdout, stderr)
+          done({
+            ok: false,
+            detail: `exit ${exited.code} signal ${exited.signal}${limit ? " (usage limit)" : ""}`,
+            ...(limit ? { limit: true } : {}),
+          })
+          return
+        }
+        done({ ok: false, detail: `exit ${exited.code} signal ${exited.signal}${stderrNote()}` })
+      } else done({ ok: true, stdout, ...reportedUsage() })
     }
 
     const timer = setTimeout(() => {
@@ -311,7 +483,11 @@ function runModel(model: ModelCommand, prompt: string): Promise<ModelRun> {
     })
     child.stderr?.setEncoding("utf8")
     child.stderr?.on("data", (c: string) => {
-      if (stderr.length < 4096) stderr += c.slice(0, 4096 - stderr.length)
+      if (model.agentCli === true) {
+        // a rolling TAIL: an agent CLI prints the prompt back on stderr first —
+        // the head is mostly that echo, and a real limit line comes LAST
+        stderr = (stderr + c).slice(-4096)
+      } else if (stderr.length < 4096) stderr += c.slice(0, 4096 - stderr.length)
     })
     child.on("error", (err) => {
       clearTimeout(timer)
@@ -402,9 +578,14 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     reason: "model-failed",
     detail: "no attempt ran",
   }
-  // The unspent fallback providers. Each is shifted out as it runs, so a provider is
-  // never tried twice — a later attempt re-runs the primary, never the chain.
-  const queue = [...(input.fallbackModels ?? [])]
+  // The unspent fallback providers, kept as positions in the full chain so each
+  // command's MOST RECENT failure can be remembered by index: a compile is a
+  // "summarizer-limit" when every command has run at least once and each one's
+  // last failure was a limit — on ANY attempt, not only the first. A later
+  // attempt re-runs the primary (index 0), never the chain.
+  const chain = [model, ...(input.fallbackModels ?? [])]
+  const queue = chain.map((_, i) => i).slice(1)
+  const lastRunWasLimit = new Map<number, boolean>()
   // The primary's one same-provider shape retry (M3-H) — a compile-level flag, so the
   // worst case any compile can add is exactly one call, across every attempt combined.
   let retried = 0
@@ -458,7 +639,7 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     }
 
     const trimmed: string[] = []
-    trimFields(picked, trimmed)
+    trimFields(picked, trimmed, input.previous?.unresolvedIssue)
 
     const v = validateCheckpoint(picked)
     if (!v.ok) {
@@ -488,7 +669,8 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     // the field names of the LAST invalid failure — kept for the terminal report only
     let invalidFields: string[] | undefined
     for (;;) {
-      const run = await runModel(current, prompt)
+      const run = await runModel(current, prompt, input.makeTempDir)
+      lastRunWasLimit.set(chain.indexOf(current), run.ok === true ? false : run.limit === true)
       modelMs += run.ms
       let fail: { reason: "model-failed" | "no-json" | "invalid"; detail: string; sample?: string }
       if (run.ok) {
@@ -532,15 +714,18 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
       // One same-provider retry on a bad SHAPE — never on a transport failure — and only
       // the primary earns it: a fallback's bad answer walks at once. Once per compile, so
       // the worst case adds exactly one call (M3-H).
-      if ((fail.reason === "invalid" || fail.reason === "no-json") && current === model && retried === 0) {
+      // UF-QF: a caller that asked for ONE attempt (a drain retrying a long-stuck save) gets
+      // one model call — no same-provider second try on a bad shape
+      if ((fail.reason === "invalid" || fail.reason === "no-json") && current === model && retried === 0 && attempts > 1) {
         retried = 1
         continue
       }
-      const next = queue.shift()
-      if (next === undefined) {
+      const nextIndex = queue.shift()
+      if (nextIndex === undefined) {
         lastFail = { reason: fail.reason, detail: trail.join("; "), ...(fail.sample !== undefined ? { sample: fail.sample } : {}) }
         break
       }
+      const next = chain[nextIndex]!
       hops.push({ from: current.label, to: next.label, reason: `${current.label}: ${fail.detail}` })
       current = next
       label = current.label
@@ -557,6 +742,20 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
           attempts: attempt,
           retried,
           ...(invalidFields !== undefined ? { fields: invalidFields } : {}),
+          ...(lastFail.sample !== undefined ? { sample: lastFail.sample } : {}),
+          ...(fb !== undefined ? { fellBack: fb } : {}),
+        }
+      }
+      // every command ran at least once in this compile and each one's most
+      // recent failure was a limit — a retry would hit the same walls, so stop
+      if (lastRunWasLimit.size === chain.length && [...lastRunWasLimit.values()].every(Boolean)) {
+        const fb = fellBack()
+        return {
+          ok: false,
+          reason: "summarizer-limit",
+          detail: lastFail.detail,
+          attempts: attempt,
+          retried,
           ...(lastFail.sample !== undefined ? { sample: lastFail.sample } : {}),
           ...(fb !== undefined ? { fellBack: fb } : {}),
         }
@@ -595,4 +794,39 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
     ...(lastFail.sample !== undefined ? { sample: lastFail.sample } : {}),
     ...(fb !== undefined ? { fellBack: fb } : {}),
   }
+}
+
+/**
+ * The throwaway session `mida summarizer test` turns into the real extraction prompt: the
+ * one-line "reply with JSON" prompt read to Claude's small model as an injection attempt and
+ * made the test report a working model as broken (UF-P2R). Five lines, `\n`-ended.
+ */
+export const PROBE_TRANSCRIPT =
+  [
+    "L1 user:",
+    'Add a hello() function to src/hello.ts that returns "hello". Use pnpm, never npm.',
+    "",
+    "L2 assistant:",
+    'Created src/hello.ts with hello() returning "hello". The test file is not written yet.',
+  ].join("\n") + "\n"
+
+/**
+ * `mida summarizer test` (UF-P2a): run the command once and classify the outcome. `ok` needs an
+ * answer whose JSON object carries a string `objective`. A failed run becomes `limit` (usage
+ * limit), `missing` (spawn error — the binary is not there), `timeout`, or plain `failed`.
+ */
+export async function probeModel(
+  command: ModelCommand,
+): Promise<{ ok: true; ms: number } | { ok: false; why: "limit" | "missing" | "timeout" | "failed"; detail: string; ms: number }> {
+  const run = await runModel(command, buildExtractPrompt(PROBE_TRANSCRIPT))
+  if (run.ok) {
+    const obj = extractJsonObject(run.stdout)
+    if (typeof obj === "object" && obj !== null && typeof (obj as Record<string, unknown>).objective === "string") {
+      return { ok: true, ms: run.ms }
+    }
+    return { ok: false, why: "failed", detail: "no JSON in the answer", ms: run.ms }
+  }
+  const why =
+    run.limit === true ? "limit" : run.detail.startsWith("spawn:") ? "missing" : run.detail.startsWith("timeout") ? "timeout" : "failed"
+  return { ok: false, why, detail: run.detail, ms: run.ms }
 }

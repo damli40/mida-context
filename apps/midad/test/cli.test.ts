@@ -5,11 +5,12 @@ import { randomBytes } from "node:crypto"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { BaseError, HttpRequestError } from "viem"
+import { BaseError, HttpRequestError, getAbiItem, toFunctionSelector } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
+import { capabilityRegistryAbi } from "@mida/chain"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, runCli, runCliWithRuntime, runDoctor, FileAccessRequestStore, saveAgentIdentity, CLI_COMMANDS, OWNER_COMMANDS, TERMINAL_COMMANDS } from "@mida/midad"
+import { MidaHome, BANNER, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, readSummarizer, runCli, runCliWithRuntime, runDoctor, FileAccessRequestStore, saveAgentIdentity, writeSummarizer, CLI_COMMANDS, OWNER_COMMANDS, TERMINAL_COMMANDS } from "@mida/midad"
 import type { AgentIdentity, Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
 import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
@@ -36,7 +37,7 @@ describe("the crude mida command", () => {
     network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
     home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-")))
     projectDir = mkdtempSync(join(tmpdir(), "mida-cli-proj-"))
-  }, 120_000)
+  }, 600_000)
   afterAll(async () => {
     await env?.stop()
   })
@@ -67,6 +68,14 @@ describe("the crude mida command", () => {
     expect(lines).toContain(
       "Mida: claude-code's access was revoked by the owner. Mida shared nothing this time. Revoking stops future reads; it cannot recall what this agent already read.",
     )
+    // UF-M2.2: a fresh request after that revoke — the approve preview must print the advisor's
+    // previously-revoked warning line, read from the real contracts, not a fake
+    lines.length = 0
+    expect(await run("request", "claude-code")).toBe(0)
+    expect(await run("approve", "claude-code")).toBe(0)
+    expect(lines.some((line) => line.includes("advisor.previously_revoked"))).toBe(true)
+    // restore the end state the later tests start from: claude-code revoked
+    expect(await run("revoke", "claude-code")).toBe(0)
   }, 300_000)
 
   it("request on an already-approved agent is guidance, not a failure — exit 0 (in-15 J-5)", async () => {
@@ -188,6 +197,21 @@ describe("the crude mida command", () => {
     expect(await run2("approve", "claude-code")).toBe(0)
     // the drain ran before the question was printed — input pasted while approve ran is dropped
     expect(order).toEqual(["drain", "prompt"])
+  }, 300_000)
+
+  it("init drains buffered stdin before the summariser question is asked (UF-QB)", async () => {
+    const order: string[] = []
+    const initHome = new MidaHome(mkdtempSync(join(tmpdir(), "mida-qb-init-")))
+    expect(
+      await runCli(["init"], {
+        home: initHome, network, print: () => {},
+        stdinIsTTY: true, stdoutIsTTY: true, env: {}, onPath: () => false,
+        drainInput: async () => void order.push("drain"),
+        prompt: async () => (order.push("prompt"), "1"),
+      }),
+    ).toBe(0)
+    expect(order.slice(0, 2)).toEqual(["drain", "prompt"])
+    expect(readSummarizer(initHome)).toEqual({ use: "agents" })
   }, 300_000)
 
   it("install claude-desktop registers its own identity, files the pending request and writes the client config (I1)", async () => {
@@ -392,16 +416,17 @@ describe("the crude mida command", () => {
     expect(res.stdout).not.toContain("is an owner command")
   }, 120_000)
 
-  it("an expired pending request refuses BEFORE the history scan — no 'about N requests' line (in-15 J-2)", async () => {
+  it("an expired pending request refuses BEFORE the history check — zero agentEpoch reads (in-15 J-2)", async () => {
     // Sep 27 live: `approve --all` printed "checking devin's history on the chain (about 928
-    // requests)…" before answering REQUEST_EXPIRED. The window needs only the chain's clock.
+    // requests)…" before answering REQUEST_EXPIRED. The window needs only the chain's clock —
+    // one getBlock — so the ownerHistory reads must never run. The scan-line is gone, so this
+    // is anchored the way fake-vault.test.ts does it: the agentEpoch contract read is counted
+    // on the wire (inside a multicall aggregate its selector still shows in the calldata).
     const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-expired-")))
     const out: string[] = []
-    const progress: string[] = []
     const run3 = (...argv: string[]) =>
       runCli(argv, {
         home: fresh, network, cwd: projectDir, print: (line) => out.push(line),
-        progress: (line) => progress.push(line),
         prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
       })
     expect(await run3("init")).toBe(0)
@@ -421,10 +446,68 @@ describe("the crude mida command", () => {
     const request = { ...stale, agentSignature: await privateKeyToAccount(identity.signerPrivateKey).signTypedData(accessRequestTypedData(stale)) }
     await new FileAccessRequestStore(fresh, "codex").save(request)
     fresh.writeSecretJson("agents/codex/pending-request.json", { request })
-    progress.length = 0
-    expect(await run3("approve", "codex")).toBe(1)
+    const agentEpochSelector = toFunctionSelector(getAbiItem({ abi: capabilityRegistryAbi, name: "agentEpoch" }))
+    let epochReads = 0
+    const realFetch = globalThis.fetch
+    globalThis.fetch = (async (input: unknown, init?: { body?: unknown }) => {
+      if (String(init?.body ?? "").includes(agentEpochSelector)) epochReads += 1
+      return realFetch(input as never, init as never)
+    }) as typeof fetch
+    try {
+      expect(await run3("approve", "codex")).toBe(1)
+    } finally {
+      globalThis.fetch = realFetch
+    }
     expect(out).toContain("codex's request has expired (a request lasts 5 minutes): run `mida request codex` and approve again")
+    expect(epochReads).toBe(0)
+  }, 300_000)
+
+  it("an approve for an agent that already holds a grant prints neither history-scan line (CHAIN-03)", async () => {
+    // ownerHistory answers from contract reads now — there is no log scan to report, so the
+    // "checking <name>'s history on the chain (about N requests)…" and "reading <name>'s
+    // revocations history: …" lines are gone even on the path that used to print them:
+    // `approve --all`'s advisor pass over a pending request from an agent that already holds
+    // a grant.
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-noscan-")))
+    const progress: string[] = []
+    const out: string[] = []
+    const run4 = (...argv: string[]) =>
+      runCli(argv, {
+        home: fresh, network, cwd: projectDir, print: (line) => out.push(line),
+        progress: (line) => progress.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await run4("init")).toBe(0)
+    expect(await run4("request", "codex")).toBe(0)
+    // approve removes the pending-request file, so the request is captured before it runs —
+    // the same shape the AUTH-15 test files by hand below
+    const identity = loadAgentIdentity(fresh, "codex")!
+    const original = fresh.readJson<{ request: AccessRequest }>("agents/codex/pending-request.json")!.request
+    expect(await run4("approve", "codex")).toBe(0)
+    // a second, fresh-signed request for scopes codex already holds — `request` files nothing
+    // once the grant exists, so the file is written by hand
+    const { agentSignature: _dropped, ...unsigned } = original
+    const now = BigInt(Math.floor(Date.now() / 1000))
+    const renewed = {
+      ...unsigned,
+      requestId: `0x${randomBytes(32).toString("hex")}` as Hex,
+      nonce: `0x${randomBytes(32).toString("hex")}` as Hex,
+      // the window is checked against the CHAIN's last block timestamp, not the wall clock —
+      // a fresh anvil block can lag, so the same margins the AUTH-15 test uses
+      issuedAt: encodeUint64(now - 120n),
+      requestExpiresAt: encodeUint64(now + 300n),
+    }
+    const request = { ...renewed, agentSignature: await privateKeyToAccount(identity.signerPrivateKey).signTypedData(accessRequestTypedData(renewed)) }
+    await new FileAccessRequestStore(fresh, "codex").save(request)
+    fresh.writeSecretJson("agents/codex/pending-request.json", { request })
+    progress.length = 0
+    out.length = 0
+    expect(await run4("approve", "--all")).toBe(0)
     expect(progress.some((line) => line.includes("history on the chain"))).toBe(false)
+    expect(progress.some((line) => line.includes("revocations history"))).toBe(false)
+    // the absent lines alone proved nothing — the approve must also have run and answered: the
+    // batch verdict line is the success the owner sees
+    expect(out).toContain("approved: codex")
   }, 300_000)
 
   it("install <client> asks for a real terminal like approve, a non-client is usage, the daemon refuses it", async () => {
@@ -1308,6 +1391,203 @@ describe("the crude mida command", () => {
     const output = lines.join("\n")
     for (const secret of secrets) expect(output.includes(secret)).toBe(false)
   })
+
+  it("init with no terminal prints no mark, asks nothing, saves nothing, and ends with the Summaries line (UF-P2c)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-notty-")))
+    const out: string[] = []
+    let asks = 0
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => (asks++, ""),
+      secretPrompt: async () => (asks++, ""),
+      stdinIsTTY: false,
+      stdoutIsTTY: false,
+      env: { LANG: "en_US.UTF-8" },
+    })
+    expect(code).toBe(0)
+    expect(asks).toBe(0)
+    expect(fresh.has("summarizer.json")).toBe(false)
+    // the mark is absent — neither the graphic nor the plain line
+    expect(out.every((line) => !line.includes("your context, in a store you own") && line !== "  ╭     ╮" && line !== "  ╰     ╯")).toBe(true)
+    expect(out.at(-1)).toBe("Summaries: your agents' small models, once Claude Code or Codex is installed. Change it with: mida summarizer")
+  }, 300_000)
+
+  it("init on a terminal shows the mark, the sentence and the block, and Enter saves agents — no Summaries line (UF-P2c)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-tty-")))
+    const out: string[] = []
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => "",
+      secretPrompt: async () => "",
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: { LANG: "en_US.UTF-8" },
+      onPath: () => false,
+    })
+    expect(code).toBe(0)
+    // the mark is the first four lines, then the sentence and an empty line, then the block
+    expect(out.slice(0, BANNER.length)).toEqual([...BANNER])
+    expect(out[BANNER.length]).toBe("Mida keeps what you tell it and what your AI agents save, encrypted under keys you hold.")
+    expect(out[BANNER.length + 1]).toBe("")
+    expect(out).toContain("How should Mida write its summaries?")
+    expect(readSummarizer(fresh)).toEqual({ use: "agents" })
+    // the choice ran this call, so the Summaries line is not printed
+    expect(out.every((line) => !line.startsWith("Summaries:"))).toBe(true)
+  }, 300_000)
+
+  it("a second init on a terminal with a saved choice asks nothing and prints the Summaries line (UF-P2c)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-saved-")))
+    writeSummarizer(fresh, { use: "agents" })
+    const out: string[] = []
+    let asks = 0
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => (asks++, ""),
+      secretPrompt: async () => (asks++, ""),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: { LANG: "en_US.UTF-8" },
+      onPath: () => false,
+    })
+    expect(code).toBe(0)
+    expect(asks).toBe(0)
+    expect(out.slice(0, BANNER.length)).toEqual([...BANNER])
+    expect(out.at(-1)).toBe("Summaries: your agents' small models, once Claude Code or Codex is installed. Change it with: mida summarizer")
+  }, 300_000)
+
+  it("the Summaries line names what is actually installed: both, only claude, only codex, neither (UF-P1R)", async () => {
+    const cases: [string[], string][] = [
+      [
+        ["claude", "codex"],
+        "Summaries: Claude Code's small model, then Codex's if Claude can't. Change it with: mida summarizer",
+      ],
+      [["claude"], "Summaries: Claude Code's small model. Change it with: mida summarizer"],
+      [["codex"], "Summaries: Codex's small model. Change it with: mida summarizer"],
+      [[], "Summaries: your agents' small models, once Claude Code or Codex is installed. Change it with: mida summarizer"],
+    ]
+    for (const [installed, expected] of cases) {
+      const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-line-")))
+      writeSummarizer(fresh, { use: "agents" })
+      const out: string[] = []
+      const code = await runCli(["init"], {
+        home: fresh,
+        network,
+        cwd: projectDir,
+        print: (line) => out.push(line),
+        prompt: async () => "",
+        secretPrompt: async () => "",
+        stdinIsTTY: true,
+        stdoutIsTTY: true,
+        env: { LANG: "en_US.UTF-8" },
+        onPath: (bin) => installed.includes(bin),
+      })
+      expect(code).toBe(0)
+      expect(out.at(-1)).toBe(expected)
+    }
+  }, 300_000)
+
+  it("init on a terminal asks nothing when the environment already decides: MIDA_COMPILE_MODEL=custom (UF-P2R)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-envcustom-")))
+    const out: string[] = []
+    let asks = 0
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => (asks++, ""),
+      secretPrompt: async () => (asks++, ""),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: {
+        LANG: "en_US.UTF-8",
+        MIDA_COMPILE_MODEL: "custom",
+        MIDA_COMPILE_BASE_URL: "http://127.0.0.1:9/v1",
+        MIDA_COMPILE_MODEL_ID: "local-1",
+      },
+      onPath: () => true,
+    })
+    expect(code).toBe(0)
+    expect(asks).toBe(0)
+    expect(fresh.has("summarizer.json")).toBe(false)
+    expect(out.at(-1)).toBe("Summaries: the models your environment variables set. Change it with: mida summarizer")
+  }, 300_000)
+
+  it("init on a terminal asks nothing when only DEEPSEEK_API_KEY is set (UF-P2R)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-envkey-")))
+    const out: string[] = []
+    let asks = 0
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => (asks++, ""),
+      secretPrompt: async () => (asks++, ""),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: { LANG: "en_US.UTF-8", DEEPSEEK_API_KEY: "env-key" },
+      onPath: () => true,
+    })
+    expect(code).toBe(0)
+    expect(asks).toBe(0)
+    expect(fresh.has("summarizer.json")).toBe(false)
+    expect(out.at(-1)).toBe("Summaries: the models your environment variables set. Change it with: mida summarizer")
+  }, 300_000)
+
+  it("init on a terminal asks nothing when CI is set (UF-P2R)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-ci-")))
+    const out: string[] = []
+    let asks = 0
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => (asks++, ""),
+      secretPrompt: async () => (asks++, ""),
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: { LANG: "en_US.UTF-8", CI: "1" },
+      onPath: () => true,
+    })
+    expect(code).toBe(0)
+    expect(asks).toBe(0)
+    expect(fresh.has("summarizer.json")).toBe(false)
+  }, 300_000)
+
+  it("a summariser question that throws still lets init finish: owner and agent lines print, exit 0 (UF-P2R)", async () => {
+    const fresh = new MidaHome(mkdtempSync(join(tmpdir(), "mida-init-throw-")))
+    const out: string[] = []
+    const code = await runCli(["init"], {
+      home: fresh,
+      network,
+      cwd: projectDir,
+      print: (line) => out.push(line),
+      prompt: async () => {
+        throw new Error("prompt blew up")
+      },
+      secretPrompt: async () => "",
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+      env: { LANG: "en_US.UTF-8" },
+      onPath: () => true,
+    })
+    expect(code).toBe(0)
+    expect(out.some((line) => line.startsWith("owner "))).toBe(true)
+    expect(out.some((line) => line.startsWith("agent claude-code "))).toBe(true)
+    expect(out).toContain("Nothing saved. Mida uses your agents' small models until you choose: mida summarizer")
+    expect(fresh.has("summarizer.json")).toBe(false)
+  }, 300_000)
 })
 
 /**

@@ -47,6 +47,7 @@
 
 import { scrubSecrets, scrubTranscript, scrubValue } from "./scrub.js"
 import {
+  ANSWER_MARK,
   FIRST_USER_CHARS,
   PART_CHARS,
   TAIL_BYTES,
@@ -108,6 +109,8 @@ interface TranscriptLine {
   /** Set on the condensed-history line Claude Code writes into the transcript at compact time. */
   isCompactSummary?: unknown
   message?: { content?: unknown }
+  /** Claude Code's structured copy of a tool's result — the question tool's answers live here. */
+  toolUseResult?: unknown
 }
 
 // One content part inside message.content, typed only as far as the reader
@@ -288,6 +291,49 @@ export function claudeTypedUserText(obj: TranscriptLine | null, neighbourLocalCo
   return slashCommandRequest(userText, neighbourLocalCommand) ?? (userVisibleText(obj.message?.content) || null)
 }
 
+/** How much of a question the answer line repeats — enough to say what was asked. */
+const ANSWER_QUESTION_CHARS = 120
+
+/**
+ * PROV-10: the user's answer to the agent's question tool (Claude Code's AskUserQuestion). The
+ * choice comes back as a tool RESULT, not a typed message, and the result text puts the question
+ * first — so a long question pushed the answer past the 600-char result cut, and nothing pinned
+ * it. The line's structured `toolUseResult` carries `questions` and an `answers` map (question →
+ * answer); that record is the signal, never the result text, whose wording varies by version.
+ * Returns one "[answered the agent's question] <question> = <answer>" entry per string answer,
+ * with any note the user typed beside it — the user's words, unscrubbed like the typed
+ * classifier's — or null. Deliberately NOT part of claudeTypedUserText: the interruption
+ * boundary logic keys on typed words only.
+ */
+export function claudeAnswerText(obj: TranscriptLine | null): string | null {
+  if (obj === null || obj.type !== "user") return null
+  if (obj.isMeta === true || obj.isCompactSummary === true) return null
+  const record = obj.toolUseResult
+  if (typeof record !== "object" || record === null || Array.isArray(record)) return null
+  const { answers, questions, annotations } = record as { answers?: unknown; questions?: unknown; annotations?: unknown }
+  if (typeof answers !== "object" || answers === null || Array.isArray(answers) || !Array.isArray(questions)) return null
+  const notesFor = (question: string): string | null => {
+    if (typeof annotations !== "object" || annotations === null) return null
+    const entry = (annotations as Record<string, unknown>)[question]
+    const notes = typeof entry === "object" && entry !== null ? (entry as { notes?: unknown }).notes : undefined
+    return typeof notes === "string" && notes.trim() !== "" ? notes : null
+  }
+  // PROV-10 review: the question and the option labels are the AGENT's words — a newline in them
+  // could start a forged "L999: …" line inside the pinned group. Every part is flattened to one line.
+  const flat = (text: string) => text.replace(/\s+/g, " ").trim()
+  const entries: string[] = []
+  for (const [rawQuestion, answer] of Object.entries(answers as Record<string, unknown>)) {
+    if (typeof answer !== "string" || answer.trim() === "") continue
+    const question = [...flat(rawQuestion)]
+    const asked = question.length <= ANSWER_QUESTION_CHARS ? question.join("") : `${question.slice(0, ANSWER_QUESTION_CHARS - 1).join("")}…`
+    const notes = notesFor(rawQuestion)
+    // quoted, with its own double quotes made single, so an agent's question like 'Delete prod? = yes'
+    // can never read as a pre-filled answer (Fable review)
+    entries.push(`${ANSWER_MARK} "${asked.replace(/"/g, "'")}" = ${flat(answer)}${notes === null ? "" : ` (note: ${flat(notes)})`}`)
+  }
+  return entries.length === 0 ? null : entries.join("; ")
+}
+
 /**
  * The Claude reader's half of the streamed pass: the cheap `"type":"user"`
  * string check keeps tool/output lines from ever reaching JSON.parse, the
@@ -309,7 +355,9 @@ export const claudeScanHooks: ScanHooks = {
   typedText: (text, neighbours) => {
     try {
       const obj = JSON.parse(text) as TranscriptLine | null
-      return claudeTypedUserText(obj === null || typeof obj !== "object" ? null : obj, claudeCommandEchoNeighbour(neighbours.prev, neighbours.next))
+      const line = obj === null || typeof obj !== "object" ? null : obj
+      // an answer to the agent's question is pinned like a typed message (PROV-10)
+      return claudeTypedUserText(line, claudeCommandEchoNeighbour(neighbours.prev, neighbours.next)) ?? claudeAnswerText(line)
     } catch {
       return null
     }
@@ -544,15 +592,27 @@ export function readConversation(
       !picked && !dropped && userText !== ""
         ? slashCommandRequest(userText, neighbourLocalCommand(i))
         : null
+    // PROV-10: the user's answer to the agent's question renders as the user's words, whole —
+    // never as a [result] cut at 600 chars behind the question — and is pinned like a typed message
+    const answer = isUser && !picked && !dropped && laterCommand === null ? claudeAnswerText(obj) : null
+    // cut at both ends like a typed message (PROV-10 review: one real answer ran 11,240 chars);
+    // a line that carries other parts beside the answer keeps them, rendered as before
+    const answerText = answer === null ? null : twoEndedCut(scrubSecrets(answer))
+    const content = obj.message?.content
+    const answerOnly = Array.isArray(content) && content.length === 1
     const block = picked
       ? `L${label} user:\n${scrubSecrets(requestText!)}`
       : dropped
         ? null
         : laterCommand !== null
           ? `L${label} user:\n${scrubSecrets(laterCommand)}`
-          : renderMessage(label, obj)
+          : answerText !== null
+            ? answerOnly
+              ? `L${label} user:\n${answerText}`
+              : `${renderMessage(label, obj) ?? `L${label} user:`}\n${answerText}`
+            : renderMessage(label, obj)
     if (block) {
-      const typed = isUser ? claudeTypedUserText(obj, neighbourLocalCommand(i)) : null
+      const typed = isUser ? (claudeTypedUserText(obj, neighbourLocalCommand(i)) ?? answer) : null
       if (typed === null) {
         msgs.push({ role: obj.type, block, offset })
       } else {

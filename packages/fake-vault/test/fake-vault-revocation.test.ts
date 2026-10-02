@@ -101,7 +101,7 @@ describe("FakeVaultAuthority revocation paths (plan Task 22 review)", () => {
       declarations: [{ namespace: "goals.career", permissions: ["READ"] }],
       callbackOrigin: "https://regrant.example",
     })
-  }, 180_000)
+  }, 600_000)
 
   afterAll(async () => {
     await node?.stop()

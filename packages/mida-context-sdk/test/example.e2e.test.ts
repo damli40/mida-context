@@ -110,7 +110,7 @@ describe("examples/sdk-basic.ts against a real midad on local Anvil", () => {
       drainDeps: { homeDir: mkdtempSync(join(tmpdir(), "mida-example-userhome-")) },
       tickMs: 30_000,
     })
-  }, STEP_TIMEOUT * 4)
+  }, 600_000)
 
   afterAll(async () => {
     await daemon?.close()

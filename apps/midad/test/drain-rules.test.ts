@@ -11,7 +11,7 @@ import type { CompileInput, compileCheckpoint } from "@mida/compiler"
 import type { Checkpoint } from "@mida/checkpoint"
 import { MidaError } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { MidaHome, buildHandoff, buildRemember, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, resetOutOfGasWaits, resolveSessionTask, tailOf } from "@mida/midad"
+import { MidaHome, buildHandoff, buildRemember, drainOnce, drainerEnv, drainUntilSettled, enqueue, listJobs, markRevoked, pinSessionTask, projectIdFor, readUnsent, resetOutOfGasWaits, resetSummarizerWaits, resolveSessionTask, sessionWaits, tailOf } from "@mida/midad"
 import type { DrainDeps, RememberDeps, Runtime, ServiceRuntime, saveCheckpoint } from "@mida/midad"
 import { CONTENT_FIELDS, mergeCheckpoints } from "@mida/checkpoint"
 import { sampleCheckpoint } from "./helpers.js"
@@ -35,13 +35,22 @@ function setup() {
   writeFileSync(join(cwd, ".mida", "project.json"), JSON.stringify({ projectId: "p-1" }))
   const compileCalls: CompileInput[] = []
   const saveCalls: unknown[] = []
-  const flags: { saveFailures: number; checkpoint?: Checkpoint; compileReason?: "model-failed" | "no-json" | "invalid"; compileSample?: string } = { saveFailures: 0 }
+  type CompileFailReason = "model-failed" | "no-json" | "invalid" | "summarizer-limit" | "no-summarizer"
+  const flags: {
+    saveFailures: number
+    checkpoint?: Checkpoint
+    compileReason?: CompileFailReason
+    /** per-call failure reasons — shifted one per compile; the last (or compileReason) repeats */
+    compileReasons?: CompileFailReason[]
+    compileSample?: string
+  } = { saveFailures: 0 }
   const compile: typeof compileCheckpoint = async (input) => {
     compileCalls.push(input)
-    if (flags.compileReason !== undefined) {
+    const reason = flags.compileReasons !== undefined && flags.compileReasons.length > 0 ? flags.compileReasons.shift() : flags.compileReason
+    if (reason !== undefined) {
       return {
         ok: false,
-        reason: flags.compileReason,
+        reason,
         detail: "stub",
         attempts: 1,
         retried: 0,
@@ -368,18 +377,99 @@ describe("a failed save does not buy a new model call", () => {
     expect(listJobs(home)).toHaveLength(0)
   })
 
-  it("eight failed attempts give up: the job goes to queue/bad with gave-up", async () => {
+  it("a busy session's first save does not wait for a flush: the gap runs from its FIRST event (CAP-28)", async () => {
+    const { home, job, drain, saveCalls, transcriptPath } = setup()
+    // an event every 5 s (the transcript grows each time) and a drain after each — every pass
+    // merges the session's jobs and keeps only the newest, which used to restart the first-save gap
+    for (let i = 0; i <= 2; i += 1) {
+      appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `step ${i}` }] } }) + "\n")
+      job({ event: "PostToolUse" }, T0 + i * 5_000)
+      if (i === 2) {
+        // after a merge (the i=1 pass removed the first job) the kept job still carries the first time:
+        // due at 10 s, where the old code said 15 s
+        expect(sessionWaits(home, listJobs(home)).find((w) => w.sessionId === "s1")?.dueAtMs).toBe(T0 + 10_000)
+      }
+      await drain({ now: () => new Date(T0 + i * 5_000 + 1_000) })
+      // never early: no save before 10 s have passed since the first event
+      if (i < 2) expect(saveCalls).toHaveLength(0)
+    }
+    // 11 s after the first event: the gap has passed, no Stop needed
+    expect(saveCalls).toHaveLength(1)
+    expect(listJobs(home)).toHaveLength(0)
+  })
+
+  it("a job file claiming a firstAt later than its own time is not trusted (CAP-28)", async () => {
+    const { home, job } = setup()
+    const queued = job({ event: "PostToolUse" }, T0)
+    home.writeSecretJson(`queue/${queued.id}.json`, { ...queued, id: undefined, firstAt: new Date(T0 + 60_000).toISOString() })
+    expect(listJobs(home)[0]?.firstAt).toBeUndefined()
+    expect(sessionWaits(home, listJobs(home)).find((w) => w.sessionId === "s1")?.dueAtMs).toBe(T0 + 10_000)
+  })
+
+  it("a compiled save whose send failed stays marked UNSENT for the next agent; a later success clears it (CAP-26)", async () => {
+    const { home, job, drain, flags } = setup()
+    job({ event: "Stop" }, T0)
+    flags.saveFailures = 1
+    await drain({ now: () => new Date(T0 + 120_000) })
+    const unsent = readUnsent(home, "s1")
+    expect(unsent?.envelope.sessionId).toBe("s1")
+    expect(unsent?.envelope.projectId).toBe("p-1")
+    // the mark records what the compile covered: the moment this pass read the transcript
+    expect(unsent?.coveredAt).toBe(T0 + 120_000)
+    // past the backoff the retry lands — the mark goes, so the saved version is never shown twice
+    await drain({ now: () => new Date(T0 + 120_000 + 121_000) })
+    expect(readUnsent(home, "s1")).toBeUndefined()
+  })
+
+  it("a mark left behind (a crash after the save landed) is cleared when the job leaves the queue (CAP-26 review)", async () => {
+    const { home, job, drain } = setup()
+    job({ event: "Stop" }, T0)
+    await drain({ now: () => new Date(T0 + 120_000) })
+    // a crash between the save and the clear would leave this behind
+    home.writeSecretJson("queue/unsent/s1.json", { eventId: "cp-leftover" })
+    // the same transcript again: the drain skips it as unchanged and removes the job
+    job({ event: "Stop" }, T0 + 130_000)
+    await drain({ now: () => new Date(T0 + 260_000) })
+    expect(listJobs(home)).toHaveLength(0)
+    expect(home.has("queue/unsent/s1.json")).toBe(false)
+  })
+
+  it("a save that gives up for good is no longer marked UNSENT (CAP-26)", async () => {
+    const { home, job, drain, flags, transcriptPath } = setup()
+    job({ event: "Stop" }, T0)
+    // UF-QF: the mark this test clears must really exist — a no-json compile never marks, so
+    // the mark is set the way the drain sets it: one compiled save whose send failed
+    flags.saveFailures = 1
+    await drain({ now: () => new Date(T0 + 120_000) })
+    expect(readUnsent(home, "s1")).toBeDefined() // the mark the assertion below checks is real
+    flags.compileReason = "no-json"
+    for (let i = 1; i <= 8; i += 1) {
+      // a fresh line each try: a new eventId makes the compile (and its no-json) run again —
+      // without it the cached envelope is re-sent and no unusable answer is ever counted
+      appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `more ${i}` }] } }) + "\n")
+      // each drain runs far past any backoff (the cap is six hours now), so the retry fires
+      await drain({ now: () => new Date(T0 + 120_000 + i * 25_200_000) })
+    }
+    expect(home.list("queue/bad").length).toBeGreaterThan(0)
+    expect(readUnsent(home, "s1")).toBeUndefined()
+  })
+
+  it("eight no-json answers give up: the job goes to queue/bad with gave-up", async () => {
     const { home, job, drain, compileCalls, saveCalls, flags, drainLog } = setup()
     job({ event: "Stop" }, T0)
-    flags.saveFailures = 100
+    flags.compileReason = "no-json"
     for (let i = 0; i < 8; i += 1) {
-      // each drain runs far past any backoff so the retry always fires
-      await drain({ now: () => new Date(T0 + 120_000 + i * 7_200_000) })
+      // each drain runs far past any backoff (the cap is six hours now), so the retry fires
+      await drain({ now: () => new Date(T0 + 120_000 + i * 25_200_000) })
     }
-    expect(saveCalls).toHaveLength(8)
-    expect(compileCalls).toHaveLength(1)   // one compile, eight save attempts
+    expect(compileCalls).toHaveLength(8)
+    expect(saveCalls).toHaveLength(0) // the model's answer never parsed — no save was tried
     expect(listJobs(home)).toHaveLength(0)
+    expect(home.list("queue/bad")).toHaveLength(1)
     expect(drainLog()).toContain("gave-up")
+    // the terminal line names the drain code of the last failure — what ended it
+    const gaveUp = drainLog().trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>).find((o) => o.reason === "gave-up")!
+    expect(gaveUp.lastReason).toBe("no-json")
   })
 
   it("a permanently-too-large envelope removes the job with too-large and is never recompiled", async () => {
@@ -610,6 +700,113 @@ describe("the owner-signed project list gates every save", () => {
     const state = home.readJson<{ attempts?: number; failedAt?: string; reason?: string }>("queue/state/s1.json")
     expect(state?.reason).toBe("out-of-gas")
     expect(state?.attempts).toBe(1)
+  })
+
+  // CAP-26: 566 failed tries on the live home were logged as bare "chain-error" — nobody could
+  // say why. A chain-error line now names the KIND of error, never its message (H5: URLs carry keys)
+  const failedLine = (log: string) =>
+    log.trim().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>).find((o) => o.outcome === "failed")!
+  const named = (name: string, message: string, extra: Record<string, unknown> = {}, cause?: unknown) =>
+    Object.assign(new Error(message, cause === undefined ? undefined : { cause }), { name, ...extra })
+
+  it("a chain-error names the error chain and HTTP status, never the message or URL (CAP-26)", async () => {
+    const { job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw named("ContractFunctionExecutionError", "call failed https://rpc.example/KEY123", {},
+          named("HttpRequestError", "HTTP request failed https://rpc.example/KEY123", { status: 400 }))
+      },
+    })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("chain-error")
+    expect(line.errorChain).toEqual(["ContractFunctionExecutionError", "HttpRequestError"])
+    expect(line.httpStatus).toBe(400)
+    expect(line.rpcCode).toBeUndefined()
+    expect(drainLog()).not.toContain("KEY123")
+    expect(drainLog()).not.toContain("rpc.example")
+  })
+
+  it("a chain-error carries a JSON-RPC code from anywhere in the chain; a bad name reads Unknown (CAP-26)", async () => {
+    // -32000 stays chain-error; -32603 and -32005 are already chain-busy (chainErrorKind)
+    const { job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw named("bad name with spaces", "x", {}, named("RpcRequestError", "y", { code: -32000 }))
+      },
+    })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("chain-error")
+    expect(line.errorChain).toEqual(["Unknown", "RpcRequestError"])
+    expect(line.rpcCode).toBe(-32000)
+  })
+
+  it("a thrown non-Error is a chain-error with an Unknown chain (CAP-26)", async () => {
+    const { job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw "a bare string with https://rpc.example/KEY123"
+      },
+    })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("chain-error")
+    expect(line.errorChain).toEqual(["Unknown"])
+    expect(drainLog()).not.toContain("KEY123")
+  })
+
+  it("a Mida error code that falls through to chain-error is kept as errorCode (CAP-26 review)", async () => {
+    const { job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw named("ContractFunctionExecutionError", "wrapped", {}, new MidaError("SEND_TIMEOUT", "no receipt after 120 s at https://rpc.example/KEY123"))
+      },
+    })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("chain-error")
+    expect(line.errorCode).toBe("SEND_TIMEOUT")
+    expect(line.errorChain).toEqual(["ContractFunctionExecutionError", "MidaError"])
+    expect(drainLog()).not.toContain("KEY123")
+  })
+
+  it("an error whose properties throw when read still logs a failed line and keeps its backoff (CAP-26 review)", async () => {
+    const { home, job, drain, drainLog } = setup()
+    job()
+    const hostile = new Proxy({}, { get: () => { throw new Error("boom") } })
+    await drain({ save: async () => { throw hostile } })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("chain-error")
+    expect(line.errorChain).toEqual(["Unknown"])
+    // the attempt was recorded, so the retry waits out its backoff instead of spinning
+    expect(home.readJson<{ attempts?: number }>("queue/state/s1.json")?.attempts).toBe(1)
+  })
+
+  it("a deep error chain keeps its root cause and code (CAP-26 review)", async () => {
+    const { job, drain, drainLog } = setup()
+    job()
+    const root = named("RpcRequestError", "nonce too low", { code: -32000 })
+    const chain = ["A1", "A2", "A3", "A4", "A5"].reduceRight<unknown>((cause, name) => named(name, "wrap", {}, cause), root)
+    await drain({ save: async () => { throw chain } })
+    const line = failedLine(drainLog())
+    expect(line.errorChain).toEqual(["A1", "A2", "A3", "A4", "A5", "RpcRequestError"])
+    expect(line.rpcCode).toBe(-32000)
+  })
+
+  it("the error-shape fields ride chain-error only — a named failure carries none (CAP-26)", async () => {
+    const { job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw new MidaError("OWNER_WALLET_LOW", "the owner wallet holds 0.01 MON; the send needs 0.2")
+      },
+    })
+    const line = failedLine(drainLog())
+    expect(line.reason).toBe("wallet-low")
+    expect(line).not.toHaveProperty("errorChain")
+    expect(line).not.toHaveProperty("rpcCode")
+    expect(line).not.toHaveProperty("httpStatus")
   })
 
   it("a funded wallet clears the recorded gas wait — the held session saves on the very next pass (in-29 S-2)", async () => {
@@ -1777,5 +1974,739 @@ describe("the detached drainer never inherits agent-CLI secrets", () => {
     })
     expect(Object.keys(env).filter((name) => name.startsWith("ANTHROPIC_"))).toEqual([])
     expect(env.PATH).toBe(process.env.PATH)
+  })
+})
+
+// UF-O item O3: a save refused on the gas sponsor's daily limit is not a chain failure — the
+// job waits for the limit's UTC reset instead of spending its eight retries and being dropped.
+// The injected save rejects with the marker @mida/chain's sendContract sets on a fallback failure.
+describe("a save refused by the sponsor's daily limit waits for the reset (UF-O)", () => {
+  const LIMIT_REASON = "refused: this sender used its 120 free calls for today — try tomorrow"
+  const limitError = () => Object.assign(new Error("insufficient funds for gas * price + value"), { sponsorDailyLimit: LIMIT_REASON })
+  const failing: typeof saveCheckpoint = async () => {
+    throw limitError()
+  }
+
+  it("the job stays queued with reason sponsor-limit, no attempts field, and the log carries the sponsor's reason", async () => {
+    const { home, job, drain, drainLog } = setup()
+    job()
+    const counts = await drain({ save: failing })
+    expect(counts.failed).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+    const state = home.readJson<{ attempts?: number; failedAt?: string; reason?: string }>("queue/state/s1.json")
+    expect(state?.reason).toBe("sponsor-limit")
+    expect(state?.failedAt).toBeDefined()
+    expect(state).not.toHaveProperty("attempts")
+    const line = drainLog()
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .find((o) => o.outcome === "failed")!
+    expect(line.reason).toBe("sponsor-limit")
+    expect(line.attempts).toBe(0)
+    expect(line.sponsorReason).toBe(LIMIT_REASON)
+  })
+
+  // UF-QA: thirty passes — the run crosses the one-day line, and a sponsor-limit wait is kept
+  // past it (the "kept past the 24-hour line" case below pins the same rule on the state file)
+  it("thirty passes of the same refusal never move the job to queue/bad and never grow attempts", async () => {
+    const { home, job, drain } = setup()
+    job()
+    for (let i = 0; i < 30; i += 1) {
+      // each pass runs once its wait has passed — 61 minutes on from the last failure
+      await drain({ save: failing, now: () => new Date(T0 + 120_000 + i * 3_660_000) })
+    }
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+    const state = home.readJson<{ reason?: string }>("queue/state/s1.json")
+    expect(state?.reason).toBe("sponsor-limit")
+    expect(state).not.toHaveProperty("attempts")
+  })
+
+  it("the next try is due at the earlier of one hour and just after the UTC-midnight reset — the pass and sessionWaits agree", async () => {
+    const { home, job, drain } = setup()
+    job({}, Date.parse("2026-10-01T09:30:00.000Z")) // the job must be fresh — a day-old one is dropped as stale
+    let calls = 0
+    const counting: typeof saveCheckpoint = async () => {
+      calls += 1
+      throw limitError()
+    }
+    // failedAt 10:00 UTC → the hourly retry (11:00) beats the midnight reset (00:01 next day)
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      failedAt: "2026-10-01T10:00:00.000Z",
+      reason: "sponsor-limit",
+    })
+    const waits = sessionWaits(home, listJobs(home))
+    expect(waits).toHaveLength(1)
+    expect(waits[0]!.dueAtMs).toBe(Date.parse("2026-10-01T11:00:00.000Z"))
+    expect(waits[0]!.reason).toBe("sponsor-limit")
+    // a pass before the due time skips the session without asking save
+    const early = await drain({ save: counting, now: () => new Date("2026-10-01T10:30:00.000Z") })
+    expect(early.skippedTooSoon).toBe(1)
+    expect(calls).toBe(0)
+    // a pass after it retries — and fails into the same wait
+    await drain({ save: counting, now: () => new Date("2026-10-01T11:00:01.000Z") })
+    expect(calls).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+
+    // failedAt 23:30 UTC → midnight + 60 s beats the hour (00:30)
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      failedAt: "2026-10-01T23:30:00.000Z",
+      reason: "sponsor-limit",
+    })
+    expect(sessionWaits(home, listJobs(home))[0]!.dueAtMs).toBe(Date.parse("2026-10-02T00:01:00.000Z"))
+    const beforeMidnight = await drain({ save: counting, now: () => new Date("2026-10-01T23:59:00.000Z") })
+    expect(beforeMidnight.skippedTooSoon).toBe(1)
+    expect(calls).toBe(1)
+    await drain({ save: counting, now: () => new Date("2026-10-02T00:01:30.000Z") })
+    expect(calls).toBe(2)
+  })
+
+  it("an error that carries the marker AND is a revoked capability is still revoked, not sponsor-limit", async () => {
+    const { home, job, drain, drainLog } = setup()
+    job()
+    await drain({
+      save: async () => {
+        throw Object.assign(new MidaError("CAPABILITY_REVOKED", "the grant was revoked"), { sponsorDailyLimit: LIMIT_REASON })
+      },
+    })
+    expect(listJobs(home)).toHaveLength(0)
+    expect(drainLog()).toContain('"reason":"revoked"')
+    expect(drainLog()).not.toContain('"reason":"sponsor-limit"')
+  })
+
+  it("a funding reset clears a sponsor-limit wait that carries no attempts", async () => {
+    const { home, job } = setup()
+    job()
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      failedAt: "2026-10-01T10:00:00.000Z",
+      reason: "sponsor-limit",
+    })
+    expect(resetOutOfGasWaits(home)).toBe(1)
+    const cleared = home.readJson<{ attempts?: number; failedAt?: string; reason?: string }>("queue/state/s1.json")
+    expect(cleared?.attempts).toBeUndefined()
+    expect(cleared?.failedAt).toBeUndefined()
+    expect(cleared?.reason).toBeUndefined()
+  })
+
+  it("a state that had attempts keeps them across a sponsor-limit failure", async () => {
+    const { home, job, drain } = setup()
+    job({}, Date.parse("2026-10-01T23:00:00.000Z"))
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      attempts: 3,
+      failedAt: "2026-10-01T10:00:00.000Z",
+      reason: "chain-error",
+    })
+    await drain({ save: failing, now: () => new Date("2026-10-02T00:00:00.000Z") })
+    const state = home.readJson<{ attempts?: number; reason?: string }>("queue/state/s1.json")
+    expect(state?.attempts).toBe(3)
+    expect(state?.reason).toBe("sponsor-limit")
+    expect(listJobs(home)).toHaveLength(1)
+  })
+})
+
+// UF-P3 item P3a: a compile that fails because NO model can write the summary — the chain is at
+// its usage limit, or nothing is installed — is a capacity wait like sponsor-limit, not a failed
+// attempt. The job stays queued, the attempt count is untouched, and the retry is due in an hour.
+describe("a save that found no summary model waits, not fails (UF-P3)", () => {
+  const summarizerLimitCompile: typeof compileCheckpoint = async () => ({
+    ok: false,
+    reason: "summarizer-limit",
+    detail: "every model hit its usage limit",
+    attempts: 2,
+    retried: 0,
+  })
+  const noSummarizerCompile: typeof compileCheckpoint = async () => ({
+    ok: false,
+    reason: "no-summarizer",
+    detail: "no summary model is available",
+    attempts: 0,
+    retried: 0,
+  })
+
+  for (const [reason, compile] of [
+    ["summarizer-limit", summarizerLimitCompile],
+    ["no-summarizer", noSummarizerCompile],
+  ] as const) {
+    it(`${reason}: the job stays queued with the reason recorded and no attempts field`, async () => {
+      const { home, job, drain, drainLog } = setup()
+      job()
+      const counts = await drain({ compile })
+      expect(counts.failed).toBe(1)
+      expect(listJobs(home)).toHaveLength(1)
+      expect(home.list("queue/bad")).toEqual([])
+      const state = home.readJson<{ attempts?: number; failedAt?: string; reason?: string }>("queue/state/s1.json")
+      expect(state?.reason).toBe(reason)
+      expect(state?.failedAt).toBeDefined()
+      expect(state).not.toHaveProperty("attempts")
+      const line = drainLog()
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>)
+        .find((o) => o.outcome === "failed")!
+      expect(line).toMatchObject({ sessionId: "s1", outcome: "failed", reason, attempts: 0 })
+    })
+
+    it(`${reason}: twenty passes never move the job to queue/bad and never grow attempts`, async () => {
+      const { home, job, drain } = setup()
+      job()
+      for (let i = 0; i < 20; i += 1) {
+        await drain({ compile, now: () => new Date(T0 + 120_000 + i * 3_660_000) })
+      }
+      expect(listJobs(home)).toHaveLength(1)
+      expect(home.list("queue/bad")).toEqual([])
+      expect(home.readJson("queue/state/s1.json")).not.toHaveProperty("attempts")
+    })
+
+    it(`${reason}: the next try is due exactly 60 minutes after failedAt — no midnight rule`, async () => {
+      const { home, job, drain } = setup()
+      let calls = 0
+      const counting: typeof compileCheckpoint = async (input) => {
+        calls += 1
+        return compile(input)
+      }
+      job({}, Date.parse("2026-10-01T09:30:00.000Z"))
+      // failedAt 23:30 UTC: due is 00:30 the next day — NOT 00:01, the sponsor's reset time
+      home.writeSecretJson("queue/state/s1.json", {
+        transcriptBytes: 10,
+        lastLineHash: "",
+        savedAt: "2026-10-01T09:00:00.000Z",
+        failedAt: "2026-10-01T23:30:00.000Z",
+        reason,
+      })
+      expect(sessionWaits(home, listJobs(home))[0]!.dueAtMs).toBe(Date.parse("2026-10-02T00:30:00.000Z"))
+      const early = await drain({ compile: counting, now: () => new Date("2026-10-02T00:29:00.000Z") })
+      expect(early.skippedTooSoon).toBe(1)
+      expect(calls).toBe(0)
+      await drain({ compile: counting, now: () => new Date("2026-10-02T00:30:01.000Z") })
+      expect(calls).toBe(1)
+      expect(listJobs(home)).toHaveLength(1)
+    })
+
+    it(`${reason}: a state that had attempts keeps them exactly as read`, async () => {
+      const { home, job, drain } = setup()
+      job({}, Date.parse("2026-10-01T09:30:00.000Z"))
+      home.writeSecretJson("queue/state/s1.json", {
+        transcriptBytes: 10,
+        lastLineHash: "",
+        savedAt: "2026-10-01T09:00:00.000Z",
+        attempts: 3,
+        failedAt: "2026-10-01T08:00:00.000Z",
+        reason: "chain-error",
+      })
+      await drain({ compile, now: () => new Date("2026-10-01T10:00:00.000Z") })
+      const state = home.readJson<{ attempts?: number; reason?: string }>("queue/state/s1.json")
+      expect(state?.attempts).toBe(3)
+      expect(state?.reason).toBe(reason)
+      expect(listJobs(home)).toHaveLength(1)
+    })
+  }
+
+  it("a state already counting a summarizer-limit wait keeps its attempts written back exactly", async () => {
+    const { home, job, drain } = setup()
+    job({}, Date.parse("2026-10-01T09:30:00.000Z"))
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      attempts: 2,
+      failedAt: "2026-10-01T09:00:00.000Z",
+      reason: "summarizer-limit",
+    })
+    await drain({ compile: summarizerLimitCompile, now: () => new Date("2026-10-01T10:00:00.000Z") })
+    const state = home.readJson<{ attempts?: number; reason?: string }>("queue/state/s1.json")
+    expect(state?.attempts).toBe(2)
+    expect(state?.reason).toBe("summarizer-limit")
+  })
+
+  it("resetSummarizerWaits clears both summarizer reasons and leaves sponsor-limit and chain-error alone", () => {
+    const { home, job } = setup()
+    const wait = (reason: string, attempts?: number) => ({
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-10-01T09:00:00.000Z",
+      ...(attempts === undefined ? {} : { attempts }),
+      failedAt: "2026-10-01T10:00:00.000Z",
+      reason,
+    })
+    // UF-QC: the count is of cleared waits whose session still has a job queued — s5's
+    // wait clears too, but with nothing queued it is not counted
+    job({ sessionId: "s1" })
+    job({ sessionId: "s2" })
+    home.writeSecretJson("queue/state/s1.json", wait("summarizer-limit"))
+    home.writeSecretJson("queue/state/s2.json", wait("no-summarizer", 4))
+    home.writeSecretJson("queue/state/s3.json", wait("sponsor-limit"))
+    home.writeSecretJson("queue/state/s4.json", wait("chain-error", 2))
+    home.writeSecretJson("queue/state/s5.json", wait("summarizer-limit"))
+    expect(resetSummarizerWaits(home)).toBe(2)
+    expect(home.readJson<{ failedAt?: string }>("queue/state/s5.json")?.failedAt).toBeUndefined()
+    for (const id of ["s1", "s2"]) {
+      const cleared = home.readJson<{ attempts?: number; failedAt?: string; reason?: string; savedAt?: string; transcriptBytes?: number }>(`queue/state/${id}.json`)
+      expect(cleared?.attempts).toBeUndefined()
+      expect(cleared?.failedAt).toBeUndefined()
+      expect(cleared?.reason).toBeUndefined()
+      // the unrelated fields survive the clearing
+      expect(cleared?.savedAt).toBe("2026-10-01T09:00:00.000Z")
+      expect(cleared?.transcriptBytes).toBe(10)
+    }
+    for (const [id, reason] of [["s3", "sponsor-limit"], ["s4", "chain-error"]] as const) {
+      const kept = home.readJson<{ failedAt?: string; reason?: string }>(`queue/state/${id}.json`)
+      expect(kept?.reason).toBe(reason)
+      expect(kept?.failedAt).toBe("2026-10-01T10:00:00.000Z")
+    }
+  })
+
+  // UF-QD: model-failed is transient — the old code ended it in gave-up after eight tries,
+  // which is how 27 real saves were lost on Oct 1. Now the attempt count climbs, the backoff
+  // (capped at six hours for a summary failure — UF-QF) decides the next try, and only the
+  // seven-day age rule ends the job.
+  it("twelve model-failed tries in a row: still queued, attempts 12, next wait six hours (UF-QF)", async () => {
+    const { home, job, drain, drainLog } = setup()
+    job()
+    const failingCompile: typeof compileCheckpoint = async () => ({
+      ok: false,
+      reason: "model-failed",
+      detail: "stub",
+      attempts: 1,
+      retried: 0,
+    })
+    // each pass lands just past the 60 s × 2^attempts backoff of the last failure (capped
+    // at six hours for a summary failure, so the later passes step six hours each — UF-QF)
+    let t = T0 + 120_000
+    for (let i = 0; i < 12; i += 1) {
+      await drain({ compile: failingCompile, now: () => new Date(t) })
+      t += Math.min(60_000 * 2 ** (i + 1), 6 * 3_600_000) + 1_000
+    }
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+    expect(drainLog()).not.toContain("gave-up")
+    expect(drainLog()).toContain('"reason":"model-failed"')
+    const lastFailed = drainLog()
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((o) => o.outcome === "failed")
+      .at(-1)!
+    expect(lastFailed.attempts).toBe(12)
+    const state = home.readJson<{ failedAt?: string }>("queue/state/s1.json")!
+    expect(sessionWaits(home, listJobs(home)).find((w) => w.sessionId === "s1")?.dueAtMs).toBe(
+      Date.parse(state.failedAt!) + 6 * 3_600_000,
+    )
+  })
+
+  it("twelve chain-error tries in a row: still queued, attempts 12, next wait an hour (UF-QD)", async () => {
+    const { home, job, drain, flags, saveCalls, drainLog } = setup()
+    job()
+    flags.saveFailures = 100 // "rpc unreachable" — a transient chain error
+    let t = T0 + 120_000
+    for (let i = 0; i < 12; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += Math.min(60_000 * 2 ** (i + 1), 3_600_000) + 1_000
+    }
+    expect(saveCalls).toHaveLength(12)
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+    expect(drainLog()).not.toContain("gave-up")
+    const lastFailed = drainLog()
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((o) => o.outcome === "failed")
+      .at(-1)!
+    expect(lastFailed.attempts).toBe(12)
+    const state = home.readJson<{ failedAt?: string }>("queue/state/s1.json")!
+    expect(sessionWaits(home, listJobs(home)).find((w) => w.sessionId === "s1")?.dueAtMs).toBe(
+      Date.parse(state.failedAt!) + 3_600_000,
+    )
+  })
+
+  it("a job still failing with model-failed when it turns seven days old drops with older-than-7d (UF-QD)", async () => {
+    const { home, job, drain, drainLog, compileCalls } = setup()
+    job()
+    const failingCompile: typeof compileCheckpoint = async () => ({
+      ok: false,
+      reason: "model-failed",
+      detail: "stub",
+      attempts: 1,
+      retried: 0,
+    })
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-21T11:00:00.000Z",
+      attempts: 30,
+      failedAt: new Date(T0 + 3_600_000).toISOString(),
+      reason: "model-failed",
+    })
+    await drain({ compile: failingCompile, now: () => new Date(T0 + 8 * 24 * 3_600_000) })
+    expect(compileCalls).toHaveLength(0)
+    expect(listJobs(home)).toHaveLength(0)
+    expect(home.list("queue/bad")).toHaveLength(1)
+    expect(drainLog()).toContain('"reason":"older-than-7d"')
+  })
+
+  // UF-P3 item 3b: a limit can outlast a day — a weekly model plan, or the sponsor's budget spent
+  // two days running. A job whose state records one of the wait reasons keeps the 7-day rule;
+  // every other job still drops at 24 hours.
+  it("a 30-hour-old job waiting on a summarizer reason is kept and tried again once due", async () => {
+    for (const [reason, compile] of [
+      ["summarizer-limit", summarizerLimitCompile],
+      ["no-summarizer", noSummarizerCompile],
+    ] as const) {
+      const { home, job, drain } = setup()
+      let calls = 0
+      const counting: typeof compileCheckpoint = async (input) => {
+        calls += 1
+        return compile(input)
+      }
+      job() // queued at T0
+      home.writeSecretJson("queue/state/s1.json", {
+        transcriptBytes: 10,
+        lastLineHash: "",
+        savedAt: "2026-09-21T11:00:00.000Z",
+        failedAt: new Date(T0 + 28 * 3_600_000).toISOString(),
+        reason,
+      })
+      const counts = await drain({ compile: counting, now: () => new Date(T0 + 30 * 3_600_000) })
+      expect(calls, reason).toBe(1)
+      expect(counts.failed).toBe(1)
+      expect(listJobs(home), reason).toHaveLength(1)
+      expect(home.list("queue/bad"), reason).toEqual([])
+    }
+  })
+
+  it("a 30-hour-old job waiting on sponsor-limit is kept past the 24-hour line too", async () => {
+    const { home, job, drain } = setup()
+    job() // queued at T0
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-21T11:00:00.000Z",
+      failedAt: new Date(T0 + 28 * 3_600_000).toISOString(),
+      reason: "sponsor-limit",
+    })
+    let saves = 0
+    const counts = await drain({
+      save: async () => {
+        saves += 1
+        throw Object.assign(new Error("insufficient funds for gas * price + value"), { sponsorDailyLimit: "120 free calls" })
+      },
+      now: () => new Date(T0 + 30 * 3_600_000),
+    })
+    expect(saves).toBe(1)
+    expect(counts.failed).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("an 8-day-old job waiting on a summarizer reason finally drops with older-than-7d", async () => {
+    const { home, job, drain, drainLog, compileCalls } = setup()
+    job()
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-21T11:00:00.000Z",
+      failedAt: new Date(T0 + 3_600_000).toISOString(),
+      reason: "summarizer-limit",
+    })
+    await drain({ compile: summarizerLimitCompile, now: () => new Date(T0 + 8 * 24 * 3_600_000) })
+    expect(compileCalls).toHaveLength(0)
+    expect(listJobs(home)).toHaveLength(0)
+    expect(home.list("queue/bad")).toHaveLength(1)
+    expect(drainLog()).toContain('"reason":"older-than-7d"')
+  })
+
+  // UF-QC: the age rule is one rule for every job — seven days. Nothing else about the
+  // session's state can shorten it, so these run against the plain drop path.
+  it("a 30-hour-old job with no state at all is still tried (UF-QC)", async () => {
+    const { home, job, drain, compileCalls, saveCalls } = setup()
+    job()
+    const counts = await drain({ now: () => new Date(T0 + 30 * 3_600_000) })
+    expect(compileCalls).toHaveLength(1)
+    expect(counts.saved).toBe(1)
+    expect(saveCalls).toHaveLength(1)
+    expect(listJobs(home)).toHaveLength(0)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("a 30-hour-old job that waited on summarizer-limit is saved after resetSummarizerWaits (UF-QC)", async () => {
+    const { home, job, drain, compileCalls, saveCalls } = setup()
+    job()
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-21T11:00:00.000Z",
+      failedAt: new Date(T0 + 28 * 3_600_000).toISOString(),
+      reason: "summarizer-limit",
+    })
+    expect(resetSummarizerWaits(home)).toBe(1)
+    const counts = await drain({ now: () => new Date(T0 + 30 * 3_600_000) })
+    expect(compileCalls).toHaveLength(1)
+    expect(counts.saved).toBe(1)
+    expect(saveCalls).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("a 30-hour-old job that waited on sponsor-limit is saved after resetOutOfGasWaits (UF-QC)", async () => {
+    const { home, job, drain, compileCalls, saveCalls } = setup()
+    job()
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: "2026-09-21T11:00:00.000Z",
+      failedAt: new Date(T0 + 28 * 3_600_000).toISOString(),
+      reason: "sponsor-limit",
+    })
+    expect(resetOutOfGasWaits(home)).toBe(1)
+    const counts = await drain({ now: () => new Date(T0 + 30 * 3_600_000) })
+    expect(compileCalls).toHaveLength(1)
+    expect(counts.saved).toBe(1)
+    expect(saveCalls).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("a 30-hour-old job whose next try fails with chain-error stays queued with attempts: 1 (UF-QC)", async () => {
+    const { home, job, drain, flags } = setup()
+    job()
+    flags.saveFailures = 1 // "rpc unreachable" — a transient chain error, not a wait reason
+    const counts = await drain({ now: () => new Date(T0 + 30 * 3_600_000) })
+    expect(counts.failed).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+    const state = home.readJson<{ attempts?: number; reason?: string }>("queue/state/s1.json")
+    expect(state?.attempts).toBe(1)
+    expect(state?.reason).toBe("chain-error")
+  })
+
+  // UF-QC: a state file that names a wait reason but carries no failedAt records no failure,
+  // so nothing is being waited out — the job owes only its save gap, not a failure deadline
+  it("a wait reason without failedAt is no wait — the job is tried at once (UF-QC)", async () => {
+    const { home, job, drain, compileCalls, saveCalls } = setup()
+    job({ event: "PostToolUse" }) // not a flush, so only a real wait could delay it
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10,
+      lastLineHash: "",
+      savedAt: new Date(T0).toISOString(),
+      reason: "summarizer-limit",
+    })
+    // the gap from savedAt is the only honest wait — one minute, not a failure deadline
+    expect(sessionWaits(home, listJobs(home))[0]?.dueAtMs).toBe(T0 + 60_000)
+    const counts = await drain({ now: () => new Date(T0 + 120_000) })
+    expect(compileCalls).toHaveLength(1)
+    expect(counts.saved).toBe(1)
+    expect(saveCalls).toHaveLength(1)
+  })
+})
+
+// UF-QF item 1: only answers the model got WRONG can drop a save — no-json and
+// invalid-checkpoint count toward `unusable`; send failures and model-failed transport errors
+// never do. A summary failure backs off to a six-hour cap once attempts run long, and from the
+// ninth try on the compile is asked for a single attempt so one try spends one model call.
+describe("only unusable answers count toward giving up (UF-QF)", () => {
+  const stateOf = (home: MidaHome) =>
+    home.readJson<{ attempts?: number; unusable?: number; reason?: string; failedAt?: string }>("queue/state/s1.json")
+
+  it("eight model-failed tries then one no-json: still queued, attempts 9, unusable 1", async () => {
+    const { home, job, drain, flags } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReasons = [...Array(8).fill("model-failed"), "no-json"]
+    let t = T0 + 120_000
+    for (let i = 0; i < 9; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 7 * 3_600_000 // always past the longest backoff
+    }
+    const state = stateOf(home)
+    expect(state?.attempts).toBe(9)
+    expect(state?.unusable).toBe(1)
+    expect(state?.reason).toBe("no-json")
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("twelve send failures then one no-json is still queued — send failures never count (UF-QF)", async () => {
+    const { home, job, drain, flags, transcriptPath } = setup()
+    job({ event: "Stop" }, T0)
+    flags.saveFailures = 12 // a send failure is a transient chain-error, not an unusable answer
+    let t = T0 + 120_000
+    for (let i = 0; i < 12; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 2 * 3_600_000
+    }
+    // a send failure reuses the compiled envelope — the thirteenth try only compiles again
+    // because the transcript moved on; that fresh compile is what answers no-json
+    appendFileSync(transcriptPath, JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "grew" }] } }) + "\n")
+    flags.compileReason = "no-json"
+    await drain({ now: () => new Date(t) })
+    const state = stateOf(home)
+    expect(state?.attempts).toBe(13)
+    expect(state?.unusable).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("two model-failed tries then one invalid-checkpoint stays queued — unusable is 1, not attempts 3", async () => {
+    const { home, job, drain, flags } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReasons = ["model-failed", "model-failed", "invalid"]
+    let t = T0 + 120_000
+    for (let i = 0; i < 3; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 2 * 3_600_000
+    }
+    const state = stateOf(home)
+    expect(state?.attempts).toBe(3)
+    expect(state?.unusable).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+    expect(home.list("queue/bad")).toEqual([])
+  })
+
+  it("eight no-json tries still give up — unusable reached MAX_ATTEMPTS (UF-QF)", async () => {
+    const { home, job, drain, flags, drainLog } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReason = "no-json"
+    let t = T0 + 120_000
+    for (let i = 0; i < 8; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 7 * 3_600_000
+    }
+    expect(listJobs(home)).toHaveLength(0)
+    expect(home.list("queue/bad")).toHaveLength(1)
+    const log = drainLog()
+    expect(log).toContain('"reason":"gave-up"')
+    expect(log).toContain('"lastReason":"no-json"')
+  })
+
+  it("a summary failure backs off by powers of two up to six hours, a send failure stays at one (UF-QF)", async () => {
+    const { home, job, drain, flags } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReason = "model-failed"
+    let t = T0 + 120_000
+    for (const minutes of [2, 4, 8, 16, 32, 64, 128, 256]) {
+      await drain({ now: () => new Date(t) })
+      const wait = sessionWaits(home, listJobs(home))[0]
+      expect(wait?.dueAtMs !== undefined ? wait.dueAtMs - t : undefined).toBe(minutes * 60_000)
+      t += (minutes + 1) * 60_000
+    }
+    // from the ninth try the wait is the six-hour cap, however far the exponent ran
+    for (let i = 0; i < 3; i += 1) {
+      await drain({ now: () => new Date(t) })
+      const wait = sessionWaits(home, listJobs(home))[0]
+      expect(wait?.dueAtMs !== undefined ? wait.dueAtMs - t : undefined).toBe(360 * 60_000)
+      t += 7 * 3_600_000
+    }
+  })
+
+  it("a chain-error backoff is capped at one hour (UF-QF)", async () => {
+    const { home, job, drain, flags } = setup()
+    job({ event: "Stop" }, T0)
+    flags.saveFailures = 8
+    let t = T0 + 120_000
+    for (let i = 0; i < 8; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 2 * 3_600_000
+    }
+    const wait = sessionWaits(home, listJobs(home))[0]
+    const last = stateOf(home)?.failedAt
+    expect(wait?.reason).toBe("chain-error")
+    expect(wait?.dueAtMs).toBe(Date.parse(last ?? "") + 3_600_000)
+  })
+
+  it("the compile is asked for a single attempt from the ninth try on, never before (UF-QF)", async () => {
+    const { home, job, drain, flags, compileCalls } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReason = "model-failed"
+    let t = T0 + 120_000
+    for (let i = 0; i < 10; i += 1) {
+      await drain({ now: () => new Date(t) })
+      t += 7 * 3_600_000
+    }
+    expect(home.list("queue/bad")).toEqual([]) // model-failed never gives up
+    expect(compileCalls).toHaveLength(10)
+    for (let i = 0; i < 8; i += 1) expect(compileCalls[i]!.attempts).toBeUndefined()
+    expect(compileCalls[8]!.attempts).toBe(1)
+    expect(compileCalls[9]!.attempts).toBe(1)
+  })
+
+  it("a failed approval read inside the wait records ONE failed try, not one per pass (UF-QF)", async () => {
+    const { home, job, drain, compileCalls } = setup()
+    job({ event: "Stop" }, T0)
+    const isApproved = async () => {
+      throw new Error("rpc unreachable")
+    }
+    // ten passes ten seconds apart — every pass but the first is inside the two-minute backoff
+    for (let i = 0; i < 10; i += 1) {
+      await drain({ isApproved, now: () => new Date(T0 + 120_000 + i * 10_000) })
+    }
+    const state = stateOf(home)
+    expect(state?.attempts).toBe(1)
+    expect(compileCalls).toHaveLength(0)
+  })
+
+  it("resetSummarizerWaits releases a summary-failure wait and its unusable count too (UF-QF)", async () => {
+    const { home, job, drain, compileCalls, saveCalls } = setup()
+    job({ event: "Stop", sessionId: "s1" }, T0)
+    job({ event: "Stop", sessionId: "s2" }, T0)
+    job({ event: "Stop", sessionId: "s3" }, T0)
+    const failedAt = new Date(T0 + 30_000).toISOString()
+    home.writeSecretJson("queue/state/s1.json", {
+      transcriptBytes: 10, lastLineHash: "", savedAt: failedAt,
+      attempts: 8, failedAt, reason: "model-failed", unusable: 4,
+    })
+    home.writeSecretJson("queue/state/s2.json", {
+      transcriptBytes: 10, lastLineHash: "", savedAt: failedAt,
+      failedAt, reason: "sponsor-limit",
+    })
+    home.writeSecretJson("queue/state/s3.json", {
+      transcriptBytes: 10, lastLineHash: "", savedAt: failedAt,
+      attempts: 2, failedAt, reason: "chain-error",
+    })
+    expect(resetSummarizerWaits(home)).toBe(1)
+    // s1's wait fields are cleared — attempts, failedAt, reason and unusable all go
+    const s1 = stateOf(home)
+    expect(s1?.attempts).toBeUndefined()
+    expect(s1?.unusable).toBeUndefined()
+    expect(s1?.reason).toBeUndefined()
+    expect(s1?.failedAt).toBeUndefined()
+    const s2 = home.readJson<{ reason?: string }>("queue/state/s2.json")
+    const s3 = home.readJson<{ reason?: string; attempts?: number }>("queue/state/s3.json")
+    expect(s2?.reason).toBe("sponsor-limit")
+    expect(s3?.reason).toBe("chain-error")
+    expect(s3?.attempts).toBe(2)
+    const counts = await drain({ now: () => new Date(T0 + 120_000) })
+    expect(counts.saved).toBe(1) // only s1 was due
+    expect(compileCalls).toHaveLength(1)
+    expect(saveCalls).toHaveLength(1)
+  })
+
+  it("a save whose summary fails forever is tried at most 36 times in seven days (UF-QF)", async () => {
+    const { home, job, drain, flags, compileCalls } = setup()
+    job({ event: "Stop" }, T0)
+    flags.compileReason = "model-failed"
+    let t = T0 + 120_000
+    // each drain jumps straight to the next due time — the skipped passes between change
+    // nothing — until the seven-day age rule drops the job and nothing is due any more
+    for (let pass = 0; pass < 200; pass += 1) {
+      await drain({ now: () => new Date(t) })
+      const due = sessionWaits(home, listJobs(home))[0]?.dueAtMs
+      if (due === undefined) break
+      t = due
+    }
+    expect(sessionWaits(home, listJobs(home))).toHaveLength(0) // the loop ended because nothing is due, not because it ran out of passes
+    expect(compileCalls.length).toBeLessThanOrEqual(36)
+    expect(compileCalls.length).toBeGreaterThan(8) // it really did keep trying all week
+    expect(home.list("queue/bad")).toHaveLength(1) // dropped only when the job turned seven days old
   })
 })
