@@ -1,0 +1,24 @@
+{
+  "comment": "The rubric for the continuation benchmark. Scoring reads the finished files in the run folder, never an agent's own report. The first agent is stopped after step 3 of TASK.md, so steps 4 and 5 and the no-timers rule are things the second agent can only know from the first agent's session.",
+  "steps": [
+    {
+      "name": "step 4: KeyedLimiter is exported from a file under src/",
+      "under": "src",
+      "present": "export\\s+(?:default\\s+)?(?:class|function)\\s+KeyedLimiter\\b|export\\s*\\{[^}]*\\bKeyedLimiter\\b"
+    },
+    {
+      "name": "step 5: README.md has a usage section",
+      "file": "README.md",
+      "present": "^#{1,6}[ \\t].*usage",
+      "flags": "im"
+    }
+  ],
+  "constraints": [
+    {
+      "name": "no timers under src/ (setTimeout, setInterval)",
+      "under": "src",
+      "absent": "\\bset(?:Timeout|Interval)\\s*\\("
+    }
+  ],
+  "checks": [["node", "--test"]]
+}
