@@ -1,0 +1,168 @@
+{
+  "objective": "Add per-IP rate limiting to the Express API and a stricter email-keyed login limiter, return the specified JSON 429 response, and cover the behavior with tests. README documentation is deferred at the user's request.",
+  "progress": [
+    "Installed express-rate-limit 7.4.0 with pnpm.",
+    "Created src/rate-limit.ts with a 100-request, 15-minute API limiter and a 10-request, 1-minute login limiter keyed by lowercased email, falling back to IP.",
+    "Wired the API limiter to /api and the login limiter to POST /api/login in src/server.ts.",
+    "Implemented a custom 429 handler that returns the requested error and retryAfter fields.",
+    "Created test/rate-limit.test.ts. The API limit test passes; the login limit test fails because the 11th request returns 200."
+  ],
+  "decisions": [
+    {
+      "decision": "Key the login limiter by lowercased email, falling back to IP when email is absent.",
+      "rationale": "The user changed the limit to 10 per minute and requested email-based keys because people share office IPs."
+    },
+    {
+      "decision": "Use a custom limiter handler to compute retryAfter per request.",
+      "rationale": "The library's message option cannot compute the per-request value."
+    },
+    {
+      "decision": "Defer README changes.",
+      "rationale": "The user said they want to word the README documentation themselves."
+    }
+  ],
+  "rejected": [
+    {
+      "approach": "Key the login limiter on a session cookie.",
+      "why": "The login route runs before a session exists."
+    },
+    {
+      "approach": "Use the library's message option for the 429 body.",
+      "why": "It cannot compute retryAfter per request."
+    }
+  ],
+  "constraints": [
+    "Use pnpm, never npm.",
+    "Do not add Redis; deployment is a single instance.",
+    "Leave src/errors.ts untouched.",
+    "Do not touch README.md until the user asks."
+  ],
+  "artifacts": [
+    "src/rate-limit.ts",
+    "src/server.ts",
+    "test/rate-limit.test.ts"
+  ],
+  "unresolvedIssue": "The login limiter test fails: the 11th request returns 200. Middleware order may leave req.body undefined when the email key is generated.",
+  "nextAction": "Inspect middleware order in src/server.ts and fix the login limiter so it correctly applies the email-based 10-per-minute limit, then confirm the login test passes.",
+  "remainingPlan": [
+    "1. add a per-IP limiter (100 requests per 15 minutes) to every /api route",
+    "2. add a stricter limiter (5 per minute) on POST /api/login",
+    "3. return a JSON 429 body {\"error\":\"rate_limited\",\"retryAfter\":<seconds>}",
+    "4. write tests in test/rate-limit.test.ts",
+    "5. document it in README.md"
+  ],
+  "evidence": [
+    {
+      "field": "objective",
+      "ref": "transcript:L1-L1"
+    },
+    {
+      "field": "objective",
+      "ref": "transcript:L14-L14"
+    },
+    {
+      "field": "objective",
+      "ref": "transcript:L31-L31"
+    },
+    {
+      "field": "progress[0]",
+      "ref": "transcript:L9-L9"
+    },
+    {
+      "field": "progress[1]",
+      "ref": "transcript:L9-L9"
+    },
+    {
+      "field": "progress[1]",
+      "ref": "transcript:L17-L17"
+    },
+    {
+      "field": "progress[2]",
+      "ref": "transcript:L9-L9"
+    },
+    {
+      "field": "progress[3]",
+      "ref": "transcript:L22-L22"
+    },
+    {
+      "field": "progress[4]",
+      "ref": "transcript:L27-L27"
+    },
+    {
+      "field": "decisions[0]",
+      "ref": "transcript:L14-L17"
+    },
+    {
+      "field": "decisions[1]",
+      "ref": "transcript:L22-L22"
+    },
+    {
+      "field": "decisions[2]",
+      "ref": "transcript:L31-L31"
+    },
+    {
+      "field": "rejected[0]",
+      "ref": "transcript:L17-L17"
+    },
+    {
+      "field": "rejected[1]",
+      "ref": "transcript:L22-L22"
+    },
+    {
+      "field": "constraints[0]",
+      "ref": "transcript:L1-L1"
+    },
+    {
+      "field": "constraints[1]",
+      "ref": "transcript:L1-L1"
+    },
+    {
+      "field": "constraints[2]",
+      "ref": "transcript:L1-L1"
+    },
+    {
+      "field": "constraints[3]",
+      "ref": "transcript:L31-L31"
+    },
+    {
+      "field": "artifacts[0]",
+      "ref": "transcript:L9-L9"
+    },
+    {
+      "field": "artifacts[1]",
+      "ref": "transcript:L9-L9"
+    },
+    {
+      "field": "artifacts[2]",
+      "ref": "transcript:L27-L27"
+    },
+    {
+      "field": "unresolvedIssue",
+      "ref": "transcript:L27-L27"
+    },
+    {
+      "field": "nextAction",
+      "ref": "transcript:L27-L27"
+    },
+    {
+      "field": "remainingPlan[0]",
+      "ref": "transcript:L1-L1"
+    },
+    {
+      "field": "remainingPlan[1]",
+      "ref": "transcript:L1-L1"
+    },
+    {
+      "field": "remainingPlan[2]",
+      "ref": "transcript:L1-L1"
+    },
+    {
+      "field": "remainingPlan[3]",
+      "ref": "transcript:L1-L1"
+    },
+    {
+      "field": "remainingPlan[4]",
+      "ref": "transcript:L1-L1"
+    }
+  ]
+}

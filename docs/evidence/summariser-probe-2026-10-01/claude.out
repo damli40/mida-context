@@ -1,0 +1,106 @@
+```json
+{
+  "objective": "Add rate limiting to Express API: per-IP limiter (100/15min) on /api routes, per-email limiter (10/min) on POST /api/login, return JSON 429 with retryAfter, write tests, document in README",
+  "progress": [
+    "Installed express-rate-limit 7.4.0 with pnpm",
+    "Created src/rate-limit.ts with apiLimiter (100 requests/15 minutes) and loginLimiter (10 requests/minute)",
+    "Wired apiLimiter to app.use('/api') and loginLimiter to app.post('/api/login') in src/server.ts",
+    "Updated loginLimiter to key on lowercased email from req.body with IP fallback, not IP alone",
+    "Implemented custom 429 handler returning JSON {\"error\":\"rate_limited\",\"retryAfter\":seconds} computed from req.rateLimit.resetTime",
+    "Started test/rate-limit.test.ts with supertest; per-IP limiter test passes (100 requests allowed, 101st gets 429)"
+  ],
+  "decisions": [
+    {
+      "decision": "Created separate src/rate-limit.ts file instead of inline limiters in server.ts",
+      "rationale": "Keep server.ts small and modular"
+    },
+    {
+      "decision": "Changed loginLimiter limit from 5 to 10 per minute",
+      "rationale": "User requested change due to support feedback"
+    },
+    {
+      "decision": "Key loginLimiter on req.body.email (lowercased) with IP fallback, not IP alone",
+      "rationale": "User said people share office IPs and wanted email-based limiting"
+    },
+    {
+      "decision": "Used custom handler function instead of library's message option for 429 response",
+      "rationale": "message option cannot dynamically compute retryAfter per request"
+    }
+  ],
+  "rejected": [
+    {
+      "approach": "Key login limiter on session cookie instead of email",
+      "why": "Login route runs before session exists"
+    },
+    {
+      "approach": "Use library's message option for 429 body",
+      "why": "Cannot compute retryAfter dynamically per request"
+    }
+  ],
+  "constraints": [
+    "Single instance deployment, no Redis",
+    "Use pnpm, never npm",
+    "Keep existing error handler in src/errors.ts untouched",
+    "Return JSON 429 body with {\"error\":\"rate_limited\",\"retryAfter\":<seconds>}"
+  ],
+  "artifacts": [
+    "package.json (added express-rate-limit)",
+    "src/rate-limit.ts (created with apiLimiter and loginLimiter)",
+    "src/server.ts (modified to wire limiters)",
+    "test/rate-limit.test.ts (created with partial tests)"
+  ],
+  "unresolvedIssue": "Login limiter test fails: 11th request returns 200 instead of 429. Likely cause is middleware order — express.json() may be registered after rate limiters, so req.body is undefined in keyGenerator and email keying falls back to IP, defeating the 10-per-minute limit",
+  "nextAction": "Fix middleware order by ensuring express.json() runs before rate limiters so req.body is available in keyGenerator for email extraction",
+  "remainingPlan": [
+    "2. Fix login limiter keying so it properly reads email from request body",
+    "4. Write passing tests in test/rate-limit.test.ts",
+    "5. Document rate limiting in README.md (user will write this themselves)"
+  ],
+  "evidence": [
+    {
+      "field": "objective",
+      "ref": "transcript:L1"
+    },
+    {
+      "field": "progress[0]",
+      "ref": "transcript:L9"
+    },
+    {
+      "field": "progress[1-2]",
+      "ref": "transcript:L9"
+    },
+    {
+      "field": "progress[3]",
+      "ref": "transcript:L17"
+    },
+    {
+      "field": "progress[4]",
+      "ref": "transcript:L22"
+    },
+    {
+      "field": "progress[5]",
+      "ref": "transcript:L27"
+    },
+    {
+      "field": "decisions[1]",
+      "ref": "transcript:L14"
+    },
+    {
+      "field": "decisions[2]",
+      "ref": "transcript:L14,L17"
+    },
+    {
+      "field": "unresolvedIssue",
+      "ref": "transcript:L27"
+    },
+    {
+      "field": "nextAction",
+      "ref": "transcript:L27"
+    },
+    {
+      "field": "remainingPlan",
+      "ref": "transcript:L1,L31"
+    }
+  ]
+}
+```

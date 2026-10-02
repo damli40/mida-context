@@ -1,0 +1,100 @@
+{
+ "source": "~/.mida/logs/daemon.jsonl, records with event=handoff",
+ "generatedAt": "2026-10-02T02:34:29.399Z",
+ "runningCode": "cb8294a (npm 0.1.1)",
+ "totals": {
+  "served": 152,
+  "refusedReadSlow": 44,
+  "records": 326
+ },
+ "days": [
+  {
+   "day": "2026-09-21",
+   "served": 5,
+   "refusedReadSlow": 0,
+   "refusedOtherReasons": 1,
+   "medianReadMs": 3528,
+   "largestCheckpointCount": 3
+  },
+  {
+   "day": "2026-09-22",
+   "served": 1,
+   "refusedReadSlow": 1,
+   "refusedOtherReasons": 4,
+   "medianReadMs": 5904,
+   "largestCheckpointCount": 1
+  },
+  {
+   "day": "2026-09-23",
+   "served": 0,
+   "refusedReadSlow": 13,
+   "refusedOtherReasons": 6,
+   "medianReadMs": null,
+   "largestCheckpointCount": 0
+  },
+  {
+   "day": "2026-09-24",
+   "served": 4,
+   "refusedReadSlow": 0,
+   "refusedOtherReasons": 0,
+   "medianReadMs": 3435,
+   "largestCheckpointCount": 26
+  },
+  {
+   "day": "2026-09-25",
+   "served": 29,
+   "refusedReadSlow": 0,
+   "refusedOtherReasons": 7,
+   "medianReadMs": 4242,
+   "largestCheckpointCount": 79
+  },
+  {
+   "day": "2026-09-26",
+   "served": 0,
+   "refusedReadSlow": 0,
+   "refusedOtherReasons": 10,
+   "medianReadMs": null,
+   "largestCheckpointCount": 0
+  },
+  {
+   "day": "2026-09-27",
+   "served": 19,
+   "refusedReadSlow": 3,
+   "refusedOtherReasons": 11,
+   "medianReadMs": 6845,
+   "largestCheckpointCount": 83
+  },
+  {
+   "day": "2026-09-29",
+   "served": 16,
+   "refusedReadSlow": 13,
+   "refusedOtherReasons": 29,
+   "medianReadMs": 5998,
+   "largestCheckpointCount": 155
+  },
+  {
+   "day": "2026-09-30",
+   "served": 15,
+   "refusedReadSlow": 5,
+   "refusedOtherReasons": 9,
+   "medianReadMs": 5739,
+   "largestCheckpointCount": 214
+  },
+  {
+   "day": "2026-10-01",
+   "served": 46,
+   "refusedReadSlow": 8,
+   "refusedOtherReasons": 49,
+   "medianReadMs": 6157,
+   "largestCheckpointCount": 294
+  },
+  {
+   "day": "2026-10-02",
+   "served": 17,
+   "refusedReadSlow": 1,
+   "refusedOtherReasons": 4,
+   "medianReadMs": 6612,
+   "largestCheckpointCount": 334
+  }
+ ]
+}
