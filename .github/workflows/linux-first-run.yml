@@ -26,7 +26,7 @@ permissions:
 jobs:
   first-run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
     defaults:
       run:
         # bash with pipefail: a failed command fails its step even when its output is piped to a log
@@ -68,10 +68,10 @@ jobs:
           mida request codex 2>&1 | tee "$RUNNER_TEMP/log/request-codex.txt"
           # approve asks for a typed "yes" and refuses to run without a terminal, so give it one
           cat > "$RUNNER_TEMP/yes.exp" <<'EOF'
-          set timeout 600
+          set timeout 240
           spawn {*}$argv
           expect {
-            -re {[Tt]ype yes[^\n]*: ?$} { sleep 1; send "yes\r"; exp_continue }
+            -re {[Tt]ype yes[^\n:]*:} { sleep 1; send "yes\r"; exp_continue }
             eof
           }
           lassign [wait] pid spawnid os_error value
