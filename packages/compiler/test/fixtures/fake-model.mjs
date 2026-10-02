@@ -41,15 +41,17 @@
 //              fired once on the primary and never on a fallback
 //   prose-secret — prints a long paragraph holding a key shape and no JSON:
 //              the failure sample must carry it scrubbed and cut to 200 chars
-//   stale-note — GOOD but unresolvedIssue carries a note a previous compile
-//              would have written about a dropped list entry (UF-J)
-//   stale-note-only — GOOD but unresolvedIssue IS such a note alone (UF-J)
+//   stale-note — GOOD but unresolvedIssue ends in the OLD counted note wording
+//              this branch once wrote (not an exact note now — kept as text, UF-J)
+//   stale-note-only — GOOD but unresolvedIssue IS that old wording alone —
+//              kept whole, never collapsed to null (UF-J)
 //   long-issue — GOOD with 51 decisions and a 1,990-char unresolvedIssue:
 //              the trim note must fit inside the string cap whole (UF-J)
 //   issue-and-old-note — GOOD with a 1,990-char unresolvedIssue followed by a
-//              complete old note: strip must run before the string cap (UF-K)
-//   cut-note-tail — GOOD with an unresolvedIssue ending in a note cut off
-//              mid-way (no closing bracket): the tail still leaves (UF-K)
+//              complete current note: strip must run before the string cap (UF-K)
+//   cut-note-tail — GOOD with an unresolvedIssue ending in a tail that only
+//              STARTS like a note (no closing bracket): not an exact note, so
+//              it is the model's own text and is kept as it is (UF-K, UF-QA)
 //   claims-limit-note — GOOD with an unresolvedIssue that ends in the NEW
 //              limit-note wording the model wrote itself: the claim is stripped,
 //              never trusted (UF-L)
@@ -240,7 +242,7 @@ process.stdin.on("end", () => {
         ...GOOD,
         unresolvedIssue:
           "i".repeat(1990) +
-          " | (Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+          " | (Mida: a list holds at most 50 entries. Older decisions were left out.)",
       })
       break
     case "cut-note-tail":

@@ -548,18 +548,51 @@ describe("compileCheckpoint", () => {
       "(Mida: a list holds at most 50 entries. Older constraints, decisions and rejected approaches were left out.)",
     )
   })
-  // UF-J: a note the model carried forward from the previous checkpoint must not pile up or
-  // go stale — it is stripped before the fresh one (if any) is appended.
-  it("a carried-forward trim note is removed when nothing was cut this save (UF-J)", async () => {
+  // UF-J: a note the model carried forward from the previous checkpoint must not pile up —
+  // the model's copy is stripped and this compile's own note (the previous note's lists union
+  // this save's cuts) is rebuilt, so a save that changes nothing still ends on the note,
+  // exactly once. The counted wording this branch once wrote ("Left out: the N oldest …") is
+  // no longer a note (1afed16): text carrying it is the model's own text and is kept as it is.
+  it("a carried-forward note survives a quiet save exactly once; old-wording text is kept (UF-J)", async () => {
+    const note = "(Mida: a list holds at most 50 entries. Older decisions were left out.)"
+    const previous: Checkpoint = {
+      eventId: "evt-prev0001",
+      agent: "claude-code",
+      source: "hook-compiler",
+      createdAt: "2026-09-21T09:00:00.000Z",
+      objective: "Implement the rate limiter",
+      originalRequest: "Build a rate limiter in 3 steps",
+      progress: ["skeleton written"],
+      decisions: Array.from({ length: 50 }, (_, i) => ({ decision: `d${i}`, rationale: "r" })),
+      rejected: [],
+      constraints: [],
+      artifacts: [],
+      unresolvedIssue: note,
+      nextAction: "add tests",
+      remainingPlan: [],
+      evidence: [],
+    }
+    const echo = await compileCheckpoint({ ...base, previous, model: fake("echo-previous") })
+    expect(echo.ok).toBe(true)
+    if (echo.ok) {
+      expect(echo.checkpoint.unresolvedIssue).toBe(note)
+    }
+    // the OLD wording was never released: the model's text keeps it untouched, whether it
+    // sits after real issue text or is the whole value — it does not collapse to null
     const stale = await compileCheckpoint({ ...base, model: fake("stale-note") })
     expect(stale.ok).toBe(true)
     if (stale.ok) {
-      expect(stale.checkpoint.unresolvedIssue).toBe("the deploy key rotation is waiting on ops")
+      expect(stale.checkpoint.unresolvedIssue).toBe(
+        "the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Left out: the 1 oldest decision.)",
+      )
     }
-    // and when the model's value was ONLY the old note, the field goes back to null
     const only = await compileCheckpoint({ ...base, model: fake("stale-note-only") })
     expect(only.ok).toBe(true)
-    if (only.ok) expect(only.checkpoint.unresolvedIssue).toBeNull()
+    if (only.ok) {
+      expect(only.checkpoint.unresolvedIssue).toBe(
+        "(Mida: a list holds at most 50 entries. Left out: the 2 oldest constraints.)",
+      )
+    }
   })
   it("the trim note stays whole when the model's unresolvedIssue nearly fills the string cap (UF-J)", async () => {
     const r = await compileCheckpoint({ ...base, model: fake("long-issue") })
@@ -611,10 +644,10 @@ describe("compileCheckpoint", () => {
       expect(r.checkpoint.unresolvedIssue).toBe("ops is still flaky")
     }
   })
-  // UF-K: a note that rode in on the model's text is stripped BEFORE the string cap runs — when
-  // the cap cut it first, a broken "(Mida: a list holds at…" tail survived the strip regex. With
+  // UF-K: a complete note that rode in on the model's text is stripped BEFORE the string cap
+  // runs — if the cap cut first, a broken "(Mida: a list holds at…" tail would survive. With
   // no previous note there is nothing to rebuild, so the field keeps only the issue text.
-  it("an old note is stripped before the string cap — no broken tail survives (UF-K)", async () => {
+  it("a complete note is stripped before the string cap — no broken tail survives (UF-K)", async () => {
     const r = await compileCheckpoint({ ...base, model: fake("issue-and-old-note") })
     expect(r.ok).toBe(true)
     if (r.ok) {
@@ -679,11 +712,16 @@ describe("compileCheckpoint", () => {
       expect(r.checkpoint.unresolvedIssue!.endsWith(` | ${constraintsNote}`)).toBe(true)
     }
   })
-  it("an unresolvedIssue ending in a note cut off mid-way loses the tail (UF-K)", async () => {
+  // UF-K + UF-QA: only an EXACT current note is a note. A tail that merely starts like one —
+  // here an unclosed fragment of the old counted wording, no ")" — is the model's own text
+  // and stays byte-for-byte; stripping it would eat user text the schema never wrote.
+  it("an unresolvedIssue ending in a tail that only looks like a note keeps it as ordinary text (UF-K)", async () => {
     const r = await compileCheckpoint({ ...base, model: fake("cut-note-tail") })
     expect(r.ok).toBe(true)
     if (r.ok) {
-      expect(r.checkpoint.unresolvedIssue).toBe("the deploy key rotation is waiting on ops")
+      expect(r.checkpoint.unresolvedIssue).toBe(
+        "the deploy key rotation is waiting on ops | (Mida: a list holds at most 50 entries. Left out: the 1 oldest de",
+      )
     }
   })
   it("evidence follows its entry when a list is cut from the front, and goes when its entry goes (C11, CAP-29)", async () => {

@@ -182,7 +182,7 @@ describe("the doctor sponsor line", () => {
     const lines = await doctorLines(home)
     // a 2xx GET proves the endpoint answers — the Sep 22 refusal came from a reachable sponsor
     expect(lines).toContain(
-      `ok: gas sponsor reachable at ${new URL(baseUrl).host} (willingness is only proven by a real send; it advertises 30 signings per address a day, 2000 a day in total)`,
+      `ok: gas sponsor reachable at ${new URL(baseUrl).host} (willingness is only proven by a real send; it pays for up to 30 saves per agent a day, 2000 a day across everyone)`,
     )
     expect(lines.join("\n")).not.toContain(baseUrl) // host only, never the URL
   })
@@ -194,7 +194,7 @@ describe("the doctor sponsor line", () => {
     home.writeSecretJson("network.json", { sponsorUrl: "http://127.0.0.1:1" })
     let lines = await doctorLines(home, { MIDA_SPONSOR_URL: live })
     expect(lines).toContain(
-      `ok: gas sponsor reachable at ${new URL(live).host} (willingness is only proven by a real send; it advertises 30 signings per address a day, 2000 a day in total)`,
+      `ok: gas sponsor reachable at ${new URL(live).host} (willingness is only proven by a real send; it pays for up to 30 saves per agent a day, 2000 a day across everyone)`,
     )
     expect(lines.some((line) => line.includes("127.0.0.1:1"))).toBe(false)
     // env → off wins over the stored live one: every send self-pays, so doctor must not probe or claim it
