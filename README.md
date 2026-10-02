@@ -48,6 +48,12 @@ minutes long, so the transcript fit. Mida does that step for you, in every tool.
 no longer fits in a paste, and this benchmark has not tested one yet
 ([method and every run](docs/evidence/continuation-benchmark-2026-10-02.md)).
 
+A paste is also frozen at the moment you make it. In a second benchmark the owner changed one
+decision in another agent's session after Codex had started work, and nothing on disk recorded
+it. With Mida, Codex applied the change in **5 of 5** runs when its session resumed. Without
+Mida the change never reached it, in 10 of 10 runs
+([method and every run](docs/evidence/late-change-benchmark-2026-10-02.md)).
+
 Today you paste transcripts or keep a notes file. That file belongs to no one, any program on your
 machine can read it, and you cannot take it back from an agent you stop trusting. The tools also
 change every few weeks. Your context should not be the reason you stay with one of them.
@@ -406,6 +412,9 @@ their limits, retries a bad answer once, and scrubs secrets from the output agai
   handoff says so; progress notes and file lists are cut without a note.
 - A save that has not reached Monad yet is shown to the next agent marked `UNSENT`, with a warning
   that the chain has not checked it.
+- An instruction you meant for one session can reach the next agent as a standing rule. "Do step 1,
+  then stop" made the next agent answer "Stopped as requested"; "don't change files in this
+  session" made it ask for permission. When you continue, say what comes next.
 
 **The gas sponsor's limits**
 

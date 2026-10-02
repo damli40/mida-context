@@ -11,8 +11,9 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
 import {
-  bRanOf, harnessMarkersIn, hookCmd, injectCmd, parseArgs, rawPasteOf,
-  sessionIdOf, tokensUsedOf, transcriptOfSession,
+  LATE_CHANGE_PROMPT, LATE_RUNS_ROOT, agentBResumeArgv, agentCArgv, bRanOf, codexSessionIdOf,
+  codexToml, harnessMarkersIn, hookCmd, injectCmd, loadScore, parseArgs,
+  rawPasteOf, scoreFiles, sessionIdOf, tokensUsedOf, transcriptOfSession,
 } from "../continuation/run.js"
 
 const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url))
@@ -161,6 +162,137 @@ describe("harnessMarkersIn", () => {
     const out = "TASK.md TASK.md a-output a-output raw-tail"
     const found = harnessMarkersIn(out, "/repo")
     expect(found).toEqual([...new Set(found)].sort())
+  })
+})
+
+describe("parseArgs --late-change", () => {
+  const base = ["--condition", "mida", "--run", "1", "--dry-run"]
+
+  it("is false by default and true when passed", () => {
+    expect(parseArgs(base).lateChange).toBe(false)
+    expect(parseArgs([...base, "--late-change"]).lateChange).toBe(true)
+  })
+})
+
+describe("codexSessionIdOf", () => {
+  const header = [
+    "workdir: /tmp/work",
+    "model: gpt-5-codex",
+    "session id: 01a0fd04-fe9a-7ab3-87eb-e5a871ade246",
+    "--------",
+  ].join("\n")
+
+  it("finds the id in a real-shaped Codex header", () => {
+    expect(codexSessionIdOf(header)).toBe("01a0fd04-fe9a-7ab3-87eb-e5a871ade246")
+  })
+
+  it("returns null when no session id line is present", () => {
+    expect(codexSessionIdOf("workdir: /tmp/work\nmodel: gpt-5\n")).toBeNull()
+    expect(codexSessionIdOf("")).toBeNull()
+  })
+
+  it("does not accept the words in the middle of other text", () => {
+    expect(codexSessionIdOf("the session id: 01a0fd04-fe9a-7ab3-87eb-e5a871ade246 was printed")).toBeNull()
+    expect(codexSessionIdOf("session id: abc")).toBeNull()
+  })
+})
+
+describe("agentCArgv", () => {
+  const argv = agentCArgv("the late-change prompt")
+
+  it("carries the prompt and a read-only tool set", () => {
+    expect(argv).toContain("--allowedTools")
+    expect(argv).toContain("Read")
+    expect(argv).toContain("the late-change prompt")
+    expect(argv.join(" ")).not.toContain("--permission-mode")
+    expect(argv.join(" ")).not.toContain("acceptEdits")
+  })
+
+  it("carries the settings file only when one is given", () => {
+    expect(agentCArgv("p", "/run/claude-settings.json")).toContain("/run/claude-settings.json")
+    expect(agentCArgv("p")).not.toContain("--settings")
+  })
+})
+
+describe("agentBResumeArgv", () => {
+  it("starts with codex exec resume <id> Continue.", () => {
+    const argv = agentBResumeArgv("sess-42")
+    expect(argv.slice(0, 5)).toEqual(["codex", "exec", "resume", "sess-42", "Continue."])
+  })
+})
+
+describe("codexToml and the late-change hook", () => {
+  it("adds [[hooks.UserPromptSubmit]] for mida only when late-change is on", () => {
+    const on = codexToml("mida", "/run", true)!
+    const off = codexToml("mida", "/run", false)!
+    expect(on).toContain("[[hooks.UserPromptSubmit]]")
+    expect(off).not.toContain("[[hooks.UserPromptSubmit]]")
+    // same inject command text as SessionStart carries
+    expect(on).toContain(`command = ${JSON.stringify(injectCmd("codex"))}`)
+  })
+
+  it("is identical for raw and none with and without late-change", () => {
+    expect(codexToml("raw", "/run", true)).toBe(codexToml("raw", "/run", false))
+    expect(codexToml("none", "/run", true)).toBe(codexToml("none", "/run", false))
+    expect(codexToml("none", "/run", true)).toBeNull()
+  })
+})
+
+describe("the late-change rubric", () => {
+  const LATE_SCORE = join(REPO_ROOT, "bench", "fixtures", "continuation-task", "score-late-change.json")
+
+  it("loadScore returns 2 steps, 1 constraint, 1 check", () => {
+    const score = loadScore(LATE_SCORE)
+    expect(score.steps).toHaveLength(2)
+    expect(score.constraints).toHaveLength(1)
+    expect(score.checks).toHaveLength(1)
+  })
+
+  const work = (files: Record<string, string>) => {
+    const dir = tempDir()
+    for (const [rel, text] of Object.entries(files)) {
+      const p = join(dir, rel)
+      mkdirSync(join(p, ".."), { recursive: true })
+      writeFileSync(p, text)
+    }
+    return dir
+  }
+
+  it("only the old name exported: neither step is built", () => {
+    const score = loadScore(LATE_SCORE)
+    const { steps } = scoreFiles(work({ "src/keyed.mjs": "export class KeyedLimiter {}" }), score)
+    expect(steps.map((s) => s.built)).toEqual([false, false])
+  })
+
+  it("only the new name exported: both steps are built", () => {
+    const score = loadScore(LATE_SCORE)
+    const { steps } = scoreFiles(work({ "src/keyed.mjs": "export class KeyedRateLimiter {}" }), score)
+    expect(steps.map((s) => s.built)).toEqual([true, true])
+  })
+
+  it("both names exported: the rename landed but the old name is still there", () => {
+    const score = loadScore(LATE_SCORE)
+    const { steps } = scoreFiles(
+      work({ "src/keyed.mjs": "export class KeyedLimiter {}\nexport class KeyedRateLimiter {}" }),
+      score,
+    )
+    expect(steps.map((s) => s.built)).toEqual([true, false])
+  })
+})
+
+describe("LATE_CHANGE_PROMPT", () => {
+  it("states the decision and carries no session-only restriction", () => {
+    expect(LATE_CHANGE_PROMPT).toContain("KeyedRateLimiter")
+    expect(LATE_CHANGE_PROMPT).toContain("KeyedLimiter")
+    for (const banned of ["do not", "don't", "this session", "any command", "any file"]) {
+      expect(LATE_CHANGE_PROMPT.toLowerCase()).not.toContain(banned)
+    }
+  })
+})
+
+describe("LATE_RUNS_ROOT", () => {
+  it("is the runs-late-change folder", () => {
+    expect(LATE_RUNS_ROOT).toContain("runs-late-change")
   })
 })
 

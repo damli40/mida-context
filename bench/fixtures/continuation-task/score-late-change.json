@@ -1,0 +1,23 @@
+{
+  "comment": "The rubric for the late-change benchmark. After the second agent has started, the owner changes one decision in ANOTHER agent's session: the keyed limiter must be named KeyedRateLimiter. Nothing on disk says so. The second agent is then told 'Continue.' again. Scoring reads the finished files.",
+  "steps": [
+    {
+      "name": "the late change is applied: KeyedRateLimiter is exported from a file under src/",
+      "under": "src",
+      "present": "export\\s+(?:default\\s+)?(?:class|function)\\s+KeyedRateLimiter\\b|export\\s*\\{[^}]*\\bKeyedRateLimiter\\b"
+    },
+    {
+      "name": "the old name is gone: KeyedLimiter is not exported from any file under src/",
+      "under": "src",
+      "absent": "export\\s+(?:default\\s+)?(?:class|function)\\s+KeyedLimiter\\b|export\\s*\\{[^}]*\\bKeyedLimiter\\b"
+    }
+  ],
+  "constraints": [
+    {
+      "name": "no timers under src/ (setTimeout, setInterval)",
+      "under": "src",
+      "absent": "\\bset(?:Timeout|Interval)\\s*\\("
+    }
+  ],
+  "checks": [["node", "--test"]]
+}
