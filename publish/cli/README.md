@@ -9,7 +9,7 @@ limit live in the repository: https://github.com/damli40/mida-context
 
 This package holds the `mida` command and the local Mida service:
 
-- `mida`: set up, check, approve, revoke, remember, read, export
+- `mida`: set up, check, approve, revoke, remember, read, export, choose who writes your summaries
 - `midad`: the local service your agents' hooks talk to
 - `mida-hook`, `mida-inject`, `mida-drain`: the entries `mida install` wires into your agent
 - `mida-mcp`: an MCP server, so Claude Desktop and Cursor can read your context and save to it
@@ -21,11 +21,16 @@ are the defaults.
 
 ```sh
 npm install -g mida-context
-mida init                       # add --passkey to approve with a passkey
+mida init                       # asks who writes your summaries; add --passkey to approve with a passkey
 mida install claude-code
 mida install codex              # then open Codex, type /hooks, and trust the Mida entries
-mida doctor                     # every PROBLEM line names its fix
+mida doctor                     # one line per check; a PROBLEM line says what is wrong
 ```
+
+A model writes the short summary your next agent receives, and it is the one part of Mida that
+reads your session text. By default your agents' own small models write it, on your plan: Claude
+Code's first, Codex's when Claude can't. You can use your own API key instead. Mida needs one of
+the three to save anything. `mida summarizer` shows the choice and changes it.
 
 Then, inside your project folder, in a real terminal window:
 
