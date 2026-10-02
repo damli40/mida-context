@@ -37,12 +37,16 @@ hand. One agent runs out of usage, crashes, or you want a different one for the 
 job. The new agent starts blind. What you asked for, what the first agent
 decided and why, what it tried and dropped, what is left: all of it stays inside the first tool.
 
-We measured what "blind" costs. We gave a fresh Codex session a half-finished job and one word,
-"Continue." Without a handoff it finished **0 of 6** runs. In all six it passed its tests and said it
-was done, because it never learned that two of the five steps existed. With a Mida handoff printed
-into the session at start, it finished **3 of 3**, kept a rule only the first agent had heard, and
-restated the key decision and its reason
-([method and runs](docs/evidence/handoff-design-and-benchmark-2026-09-20.md)).
+We measured what "blind" costs. Claude Code started a five-step job and was cut off after the
+first step. A fresh Codex session in the same folder got one word, "Continue." Handed nothing, it
+finished **0 of 5** runs. In all five its tests passed and it stopped there, because it never
+learned that the other four steps existed. Handed a Mida handoff, it finished **5 of 5**.
+A second scorer checked all fifteen runs without knowing which was which, and agreed.
+
+Pasting the first session's whole transcript also finished 5 of 5. Those sessions were under two
+minutes long, so the transcript fit. Mida does that step for you, in every tool. A long session
+no longer fits in a paste, and this benchmark has not tested one yet
+([method and every run](docs/evidence/continuation-benchmark-2026-10-02.md)).
 
 Today you paste transcripts or keep a notes file. That file belongs to no one, any program on your
 machine can read it, and you cannot take it back from an agent you stop trusting. The tools also
