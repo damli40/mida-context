@@ -1,0 +1,13 @@
+# HOME=<T>/home
+# mida=<T>/npm/bin/mida
+# cwd=<T>/project
+# start 12:41:35 UTC
+$ "$T/tty.exp" "Type yes to approve" "yes" -- mida approve claude-code
+asking the chain what claude-code already holds…
+claude-code already holds a live grant; this lists it for project 3a304229-43e8-4a27-aa63-4a1bd0e2734d
+It will see this context as plain text. Revoking later stops future reads, not what it already saw.
+Type yes to approve: yes
+
+claude-code is already approved on chain. This folder is now approved for claude-code too (no transaction).
+exit=0
+# end 12:41:38 UTC

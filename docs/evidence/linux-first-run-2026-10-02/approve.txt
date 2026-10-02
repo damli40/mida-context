@@ -1,0 +1,26 @@
+spawn mida approve --all
+claude-code is asking for:
+  project e22cc73c-fdad-4f12-9a5f-4604ef8809ac (this folder)
+  profile.skills: READ
+  projects.current: READ + CREATE + SUPERSEDE_OWN
+  preferences.communication: READ
+  until 2026-11-01T14:27:12.000Z
+grant advisor: low risk; recommends 3 scope(s) until 2026-11-01T14:27:12.000Z
+codex is asking for:
+  project e22cc73c-fdad-4f12-9a5f-4604ef8809ac (this folder)
+  profile.skills: READ
+  projects.current: READ + CREATE + SUPERSEDE_OWN
+  preferences.communication: READ
+  until 2026-11-01T14:27:13.000Z
+grant advisor: low risk; recommends 3 scope(s) until 2026-11-01T14:27:13.000Z
+It will see this context as plain text. Revoking later stops future reads, not what it already saw.
+Type yes to approve all: yes
+asking the chain what claude-code already holds…
+sending the grant (sponsored)…
+proving the grant on the chain…
+approved claude-code tx 0x90a35525b1e1373a357299584343c90b008b1f3b34391f4804d40e7451ff5211
+asking the chain what codex already holds…
+sending the grant (sponsored)…
+proving the grant on the chain…
+approved codex tx 0xe5a43f9ae08aace75d25b93eec645f49caae735c5fd5206277fe40384777ea3d
+approved: claude-code, codex

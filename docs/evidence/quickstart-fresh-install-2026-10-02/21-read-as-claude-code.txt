@@ -1,0 +1,11 @@
+# HOME=<T>/home
+# mida=<T>/npm/bin/mida
+# cwd=<T>/project
+# start 12:51:03 UTC
+$ mida read --as claude-code
+What you have told Mida about yourself
+  preferences.communication: refused CAPABILITY_DENIED (the store refused it: claude-code holds no grant for this area, or is not approved or was revoked)
+  profile.skills: refused CAPABILITY_DENIED (the store refused it: claude-code holds no grant for this area, or is not approved or was revoked)
+projects.current: refused CAPABILITY_DENIED
+exit=0
+# end 12:51:07 UTC

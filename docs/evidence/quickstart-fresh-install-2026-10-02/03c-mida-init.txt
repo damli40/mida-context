@@ -1,0 +1,38 @@
+$ mida init   (pseudo-terminal via expect; Enter pressed when "Choose 1 or 2" appears)
+  ╭     ╮
+  │  ●  │   mida
+  ╰     ╯   your context, in a store you own
+
+Mida keeps what you tell it and what your AI agents save, encrypted under keys you hold.
+
+How should Mida write its summaries?
+When a session ends, Mida turns the chat into a short
+record for your next agent. A model writes that record.
+
+  1  Your agents' small models (recommended)
+     Claude Code's haiku first, Codex's luna if Claude can't.
+     Who reads the chat: Anthropic or OpenAI, under your login.
+     What it uses: your plan, about one small-model message a minute while your agent works. It stops at your plan's limit.
+
+  2  Your own API key
+     Who reads the chat: the provider you choose.
+     What it uses: your key. Most providers charge under one cent a summary.
+
+Choose 1 or 2 [1]: 
+
+Saved: your agents' small models write the summaries.
+Change it later with: mida summarizer
+
+gas sponsor on — no MON needed
+registering your key on the chain…
+opening 3 context areas (3 transactions)…
+registering claude-code on the chain…
+registering codex on the chain…
+registering assistant on the chain…
+sending assistant's grant (sponsored)…
+owner 0x695bca33be339bd4035adecbea5712029854904a
+agent claude-code 0xdf6c392f77ccbdf3d74d6b014b29742c531641d490b1d1ca220aee80ae83ebdf
+agent codex 0x6ed0b980bba1e4d9016111427269699458eb6704e938051fbb4fbf29ef954680
+agent assistant 0x490ddc2d170cbbcc8567c6bb75dca31ab58f4bf135167bc35cf9103ba9a2fb4e
+exit=0
+12:37:21

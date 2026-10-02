@@ -126,16 +126,17 @@ grants the user signed; your app never holds the user's owner keys. Full referen
 ## Quickstart
 
 **You need:** macOS or Linux, Node.js 22 or later, and Claude Code and/or Codex. Windows is not
-supported yet. By default Mida uses a hosted encrypted store and a gas sponsor, so you need no
+supported yet. Nearly all our live runs are on macOS; Linux has one
+[first run](docs/evidence/linux-first-run-2026-10-02.md) on Ubuntu, without an agent. By default Mida uses a hosted encrypted store and a gas sponsor, so you need no
 testnet tokens. A setup made before the sponsor existed joins it with `mida sponsor on`.
 
-Mida needs a model to write its summaries. With Claude Code or Codex installed it uses their small
-models. With neither (Claude Desktop or Cursor only, for example), give it an API key with
-`mida summarizer use key`; until you do, nothing is saved, and `mida doctor` says so.
+Mida needs a model to write its summaries. With Claude Code or Codex installed and logged in, it
+uses their small models. With neither (Claude Desktop or Cursor only, for example), give it an API
+key with `mida summarizer use key`; until you do, nothing is saved, and `mida doctor` says so.
 
 ```bash
-npm install -g mida-context
-mida init                       # your owner key, one identity per agent, and one question (below)
+npm install -g mida-context     # npm prints peer-dependency warnings about `ox`; they are harmless
+mida init                       # your owner key, an identity for each agent, and one question (below)
 mida install claude-code        # hooks, plus Mida's MCP tools so a session can ask Mida mid-task
 mida install codex              # the same; then open Codex once, type /hooks, and trust the Mida entries
 mida doctor                     # one line per check; a PROBLEM line says what is wrong
@@ -147,6 +148,10 @@ chosen yet; `mida summarizer` shows the current choice at any time.
 [Who writes the summaries](#who-writes-the-summaries) says who reads your chat in each case. Add
 `--passkey` to approve with a passkey.
 
+`mida init` sets up three identities: `claude-code`, `codex`, and a general one called `assistant`
+that never gets access to a project. At this point `mida doctor` prints two PROBLEM lines, because
+neither agent has asked for access yet. The next block fixes that.
+
 Then, inside your project folder, in a real terminal window:
 
 ```bash
@@ -156,8 +161,15 @@ mida approve --all              # shows what each agent asks for; type yes (a re
 mida doctor --live claude-code  # starts a throwaway session and checks that Mida's hook fires
 ```
 
-Work in Claude Code as usual. When you stop, or it runs out, open Codex in the same folder. The
-session starts with a `Mida:` block holding the checkpoint. Type **Continue.**
+These commands talk to Monad testnet. If one says the request timed out, run it again.
+
+Work in Claude Code as usual. When you stop, or it runs out, give Mida about a minute to save:
+`mida doctor` prints `queue empty` when it is done. Then open Codex in the same folder. Mida hands
+it a block that starts `MIDA HANDOFF` and holds the checkpoint. Type **Continue.** If your last
+request told the first agent to stop at a certain point, say what comes next instead, for example
+"Continue with step 2."
+
+When you want to cut an agent off:
 
 ```bash
 mida revoke codex               # codex's future reads are refused, on chain
@@ -171,8 +183,8 @@ background service the old version left running; if that service is finishing a 
 up to a minute for it.
 
 **Something wrong?** Run `mida doctor` and `mida summarizer`, then open an
-[issue](https://github.com/damli40/mida-context/issues) with both outputs. They print no API keys
-and none of your session text.
+[issue](https://github.com/damli40/mida-context/issues) with both outputs and your version
+(`npm ls -g mida-context`). They print no API keys and none of your session text.
 
 <details>
 <summary>Install from source instead</summary>
@@ -270,7 +282,7 @@ task.
 | `mida approve <agent>` / `approve --all` | You approve it for this folder (terminal only; type `yes`) |
 | `mida revoke <agent>` / `revoke --all` | End its access and rotate the read keys (terminal only) |
 | `mida remember "<fact>"` | Save a fact about you that approved agents can read |
-| `mida read --as <agent>` | See exactly what that agent can read |
+| `mida read --as <agent>` | See which areas that agent can read, and how many records in each |
 | `mida link <folder>` / `unlink` / `project new` | Manage which folders share a project |
 | `mida task [<name> \| --clear \| show <name>]` | Set, clear or read a named task |
 | `mida export <folder>` | Write everything the chain attributes to you, decrypted, into a new folder |
@@ -294,7 +306,7 @@ write that record, and it is the one part of Mida that reads your session text. 
 | **Your own API key** | The provider you choose: DeepSeek, Moonshot, or any OpenAI-compatible endpoint, a local model included | Your key. Most providers charge under one cent a summary |
 
 ```bash
-mida summarizer                 # who writes them now, and whether it is working
+mida summarizer                 # who writes them now; `mida summarizer test` is the real check that one works
 mida summarizer use agents      # your agents' small models
 mida summarizer use key         # asks for a provider and a key; stores it in ~/.mida, readable only by you
 mida summarizer test            # writes one test summary, says who wrote it, retries waiting saves
@@ -428,14 +440,15 @@ of a batch with batching on. An agent at work saves about once a minute at most.
 ## Remove Mida
 
 ```bash
-mida revoke --all                       # end every agent's access, on chain
+mida revoke --all                       # end every agent's access, on chain; run in a terminal, type yes
 mida uninstall claude-code              # remove the hooks and the MCP entry; repeat for each tool
 mida uninstall codex
+pgrep -fl midad                         # Mida's background service; `kill` the number it prints
 npm uninstall -g mida-context
 ```
 
-Mida's background service keeps running until you restart your machine. To stop it now, find it
-with `pgrep -fl midad` and `kill` the number it prints. There is no `mida stop` command yet.
+Stop the background service before you uninstall the package; left alone, it keeps running until
+you restart your machine. There is no `mida stop` command yet.
 
 Three things stay until you delete them: `~/.mida` on your machine (your keys, the queue and the
 logs), the `.mida` folder in each project, and the encrypted records in the store. Records of who
@@ -455,6 +468,7 @@ you included. `mida export <folder>` writes a readable copy first.
 | Devin, Claude Desktop, the Codex app | ✅ Live, Sep 27 |
 | Passkey owner: sign-up and approve in the browser | ✅ Live, Sep 22 ([evidence](docs/evidence/m3-passkey-live-2026-09-22.json)) |
 | Hosted store and gas sponsor | ✅ Live |
+| Linux: install, set up, approve, save, hand off, revoke | ✅ One run on Ubuntu, Oct 2, with no agent on the machine ([evidence](docs/evidence/linux-first-run-2026-10-02.md)) |
 | Batching: saves anchored by Mida's batcher, gas sponsored | ✅ Live for invited owners, Sep 29 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | A change of plan you make mid-session reaches the next agent, credited to you | ✅ 6 of 6 on a real model, was 0 of 6 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | A new session in a busy project reads every save in batched chain calls: 155 saves in 5.1 s, where it used to time out | ✅ Live, Sep 29 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |

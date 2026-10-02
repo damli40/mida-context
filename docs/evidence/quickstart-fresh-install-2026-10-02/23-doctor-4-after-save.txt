@@ -1,0 +1,41 @@
+# HOME=<T>/home
+# mida=<T>/npm/bin/mida
+# cwd=<T>/project
+# start 12:54:18 UTC
+$ mida doctor
+ok: midad answers
+ok: midad runs <T>/npm/lib @ unknown; this command runs the same
+ok: network.json present
+contract 0xadfb…
+ok: chain RPC testnet-rpc.monad.xyz (network.json)
+ok: owner registered on chain
+ok: assistant approved
+ok: claude-code approved
+ok: codex approved
+ok: store blocks nobody who is approved
+ok: approved-projects signature valid
+ok: project 3a304229… — 1 folder (<T>/project)
+ok: this folder's current task is main (default)
+ok: mida-hook resolves to <T>/npm/lib/node_modules/mida-context/dist/mida-hook.js
+ok: mida-inject resolves to <T>/npm/lib/node_modules/mida-context/dist/mida-inject.js
+ok: mida-mcp resolves to <T>/npm/lib/node_modules/mida-context/dist/mida-mcp.js
+ok: claude-code hooks installed
+ok: claude-code MCP server installed
+ok: codex hooks installed
+ok: codex MCP server installed
+note: Codex will ignore these hooks until you trust them: open codex, type /hooks, and trust the Mida entries.
+ok: no Anthropic key variable in the shell
+ok: compile model is claude-haiku
+note: claude-haiku sends the session's transcript text to api.anthropic.com via the claude CLI (secrets are scrubbed first); a failed call falls back to codex-luna (api.openai.com)
+ok: queue empty
+ok: checkpoint saves: one transaction each
+ok: the per-prompt update is answering
+ok: gas is sponsored by sponsor.midacontext.xyz — wallet holds 0.0000 MON (kept as a fallback)
+ok: store: store.midacontext.xyz (network.json)
+ok: sponsor: sponsor.midacontext.xyz (network.json)
+ok: the store at store.midacontext.xyz answers the pending-revoke check
+ok: environment — set: MIDA_HOME
+ok: environment — unset: MIDA_STORAGE_URL, MIDA_SPONSOR_URL, MIDA_DEPLOYMENTS_DIR, MIDA_DEBUG, MIDA_COMPILE_MODEL, MIDA_COMPILE_FALLBACK, MIDA_COMPILE_API_KEY, MIDA_COMPILE_BASE_URL, MIDA_COMPILE_MODEL_ID, MIDA_COMPILE_TIMEOUT_MS, MIDA_CLAUDE_SUMMARY_MODEL, MIDA_CODEX_SUMMARY_MODEL, MIDA_CLAUDE_SETTINGS, MIDA_CODEX_CONFIG, MIDA_INNER, MIDA_E2E_MONAD_TESTNET, DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_TIMEOUT_MS, KIMI_API_KEY, KIMI_BASE_URL, KIMI_MODEL, KIMI_TIMEOUT_MS, MONAD_TESTNET_RPC, DEPLOYER_PRIVATE_KEY, TESTNET_FUNDING_WEI, FOUNDRY_BIN, VAULT_RP_ID
+ok: gas sponsor reachable at sponsor.midacontext.xyz (willingness is only proven by a real send; it pays for up to 300 saves per agent a day, from a daily budget of 150 MON shared by everyone)
+exit=0
+# end 12:54:23 UTC

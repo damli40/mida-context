@@ -1,0 +1,11 @@
+# HOME=<T>/home
+# mida=<T>/npm/bin/mida
+# cwd=<T>/project
+# start 13:00:15 UTC
+$ mida read --as codex
+What you have told Mida about yourself
+  profile.skills: refused CAPABILITY_REVOKED (codex's access was revoked)
+  preferences.communication: refused CAPABILITY_REVOKED (codex's access was revoked)
+projects.current: refused CAPABILITY_REVOKED
+exit=0
+# end 13:00:17 UTC

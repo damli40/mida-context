@@ -1,0 +1,14 @@
+# HOME=<T>/home
+# mida=<T>/npm/bin/mida
+# cwd=<T>/project
+# start 12:54:23 UTC
+$ mida summarizer
+Summaries are written by: your agents' small models
+  1st  Claude Code (haiku)   ready, not used yet
+  2nd  Codex (luna)          working, used under a minute ago
+Last 24 hours: 1 written, 0 failed tries
+
+Change it: mida summarizer use agents | mida summarizer use key
+Check it:  mida summarizer test
+exit=0
+# end 12:54:23 UTC

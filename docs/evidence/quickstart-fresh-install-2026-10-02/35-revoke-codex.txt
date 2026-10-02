@@ -1,0 +1,14 @@
+# HOME=<T>/home
+# mida=<T>/npm/bin/mida
+# cwd=<T>/project
+# start 12:59:46 UTC
+$ "$T/tty.exp" "ype yes" "yes" :: mida revoke codex
+asking the chain what codex already holds…
+sending the revocation (sponsored)…
+sending the new key to 2 agents…
+revoked codex on chain (sponsored) — tx 0xcc18492c6ffe1506b6798a8fe585b4b1ae97b4533006db20246d4bcfb662c4cc
+This stops future reads through Mida. It does not erase what codex already read.
+new read key sent to assistant
+new read key sent to claude-code
+exit=0
+# end 13:00:15 UTC

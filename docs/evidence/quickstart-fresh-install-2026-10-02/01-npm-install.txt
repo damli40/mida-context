@@ -1,0 +1,32 @@
+$ npm install -g mida-context --prefix T/npm
+npm warn ERESOLVE overriding peer dependency
+npm warn While resolving: permissionless@0.4.1
+npm warn Found: ox@1.7.4
+npm warn node_modules/mida-context/node_modules/ox
+npm warn   ox@"1.7.4" from mida-context@0.1.2
+npm warn   node_modules/mida-context
+npm warn     mida-context@"*" from the root project
+npm warn
+npm warn Could not resolve dependency:
+npm warn peerOptional ox@"^0.11.3" from permissionless@0.4.1
+npm warn node_modules/mida-context/node_modules/permissionless
+npm warn   permissionless@"0.4.1" from mida-context@0.1.2
+npm warn   node_modules/mida-context
+npm warn
+npm warn Conflicting peer dependency: ox@0.11.3
+npm warn node_modules/ox
+npm warn   peerOptional ox@"^0.11.3" from permissionless@0.4.1
+npm warn   node_modules/mida-context/node_modules/permissionless
+npm warn     permissionless@"0.4.1" from mida-context@0.1.2
+npm warn     node_modules/mida-context
+
+added 122 packages in 47s
+
+56 packages are looking for funding
+  run `npm fund` for details
+npm notice
+npm notice New minor version of npm available! 11.11.0 -> 11.21.0
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.21.0
+npm notice To update run: npm install -g npm@11.21.0
+npm notice
+exit=0

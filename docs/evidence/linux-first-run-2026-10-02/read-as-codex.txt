@@ -1,0 +1,2 @@
+projects.current: read 1 object(s)
+  projects.current: 0xff97f8530692a8648e7875a221579d3c8d0a0e0c82e5e45211d91c3ddd78e4fe written by claude-code (on-chain author 0x3dc334f6…)

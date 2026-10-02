@@ -1,0 +1,30 @@
+# HOME=<T>/home
+# mida=<T>/npm/bin/mida
+# cwd=<T>/project
+# start 12:42:59 UTC
+$ mida doctor
+ok: midad answers
+ok: midad runs <T>/npm/lib @ unknown; this command runs the same
+ok: network.json present
+contract 0xadfb…
+ok: chain RPC testnet-rpc.monad.xyz (network.json)
+PROBLEM: the owner check failed (check-failed) — re-run `mida doctor`
+PROBLEM: the agents check failed (check-timeout) — re-run `mida doctor`
+PROBLEM: the store-denies check did not run — re-run `mida doctor`
+PROBLEM: the approved-projects check did not run — re-run `mida doctor`
+PROBLEM: the task check did not run — re-run `mida doctor`
+PROBLEM: the hook-commands check did not run — re-run `mida doctor`
+PROBLEM: the hooks check did not run — re-run `mida doctor`
+PROBLEM: the mcp-clients check did not run — re-run `mida doctor`
+PROBLEM: the api-keys check did not run — re-run `mida doctor`
+PROBLEM: the compile-model check did not run — re-run `mida doctor`
+PROBLEM: the queue check did not run — re-run `mida doctor`
+PROBLEM: the batching check did not run — re-run `mida doctor`
+PROBLEM: the whatsnew check did not run — re-run `mida doctor`
+PROBLEM: the wallets check did not run — re-run `mida doctor`
+PROBLEM: the services check did not run — re-run `mida doctor`
+PROBLEM: the store-write-check check did not run — re-run `mida doctor`
+PROBLEM: the environment check did not run — re-run `mida doctor`
+PROBLEM: the sponsor check did not run — re-run `mida doctor`
+exit=9
+# end 12:43:44 UTC

@@ -1,0 +1,22 @@
+# HOME=<T>/home
+# mida=<T>/npm/bin/mida
+# cwd=<T>/project
+# start 13:00:28 UTC
+$ "$T/tty.exp" "Type yes to revoke all" "yes" :: mida revoke --all
+assistant holds an approval
+claude-code holds an approval
+Type yes to revoke all: yes
+
+asking the chain what assistant already holds…
+sending the revocation (sponsored)…
+sending the new key to 1 agent…
+revoked assistant on chain (sponsored) — tx 0x7e6903db3d7261a521d745a041aa0d061db06cc76db6b35d340eff81ed48d170
+This stops future reads through Mida. It does not erase what assistant already read.
+new read key sent to claude-code
+asking the chain what claude-code already holds…
+sending the revocation (sponsored)…
+revoked claude-code on chain (sponsored) — tx 0x2df4abe69cdc7c00dc1c7bb23b2c5c7acb5abb515d75236c04e20dd83d778404
+This stops future reads through Mida. It does not erase what claude-code already read.
+revoked: assistant, claude-code
+exit=0
+# end 13:00:55 UTC

@@ -1,0 +1,14 @@
+# HOME=<T>/home
+# mida=<T>/npm/bin/mida
+# cwd=<T>/project
+# start 12:40:02 UTC
+$ mida request claude-code
+mida: The request took too long to respond.
+
+URL: https://testnet-rpc.monad.xyz/
+Request body: {"method":"eth_chainId"}
+
+Details: The request timed out.
+Version: viem@2.56.3
+exit=1
+# end 12:40:13 UTC

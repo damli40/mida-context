@@ -1,0 +1,34 @@
+# HOME=<T>/home
+# mida=<T>/npm/bin/mida
+# cwd=<T>/project
+# start 12:40:39 UTC
+$ "$T/tty.exp" "Type yes to approve" "yes" -- mida approve --all
+claude-code is asking for:
+  project 3a304229-43e8-4a27-aa63-4a1bd0e2734d (this folder)
+  profile.skills: READ
+  projects.current: READ + CREATE + SUPERSEDE_OWN
+  preferences.communication: READ
+  until 2026-11-01T12:40:27.000Z
+grant advisor: low risk; recommends 3 scope(s) until 2026-11-01T12:40:27.000Z
+codex is asking for:
+  project 3a304229-43e8-4a27-aa63-4a1bd0e2734d (this folder)
+  profile.skills: READ
+  projects.current: READ + CREATE + SUPERSEDE_OWN
+  preferences.communication: READ
+  until 2026-11-01T12:40:19.000Z
+grant advisor: low risk; recommends 3 scope(s) until 2026-11-01T12:40:19.000Z
+It will see this context as plain text. Revoking later stops future reads, not what it already saw.
+Type yes to approve all: yes
+
+asking the chain what claude-code already holds…
+sending the grant (sponsored)…
+the gas sponsor did not pay (The request timed out.); paying from your own wallet…
+still waiting for Monad (15 s)…
+the gas sponsor did not pay (The request timed out.); your wallet holds 0.0000 MON but this transaction needs up to 0.1830 MON — 0.1830 MON short
+asking the chain what codex already holds…
+sending the grant (sponsored)…
+proving the grant on the chain…
+approved codex tx 0x09596e3926374df8d5b24538fd04368c61020bb3bb8e456dc7f692f0950070fe
+approved: codex; failed: claude-code (OWNER_WALLET_LOW)
+exit=1
+# end 12:41:27 UTC

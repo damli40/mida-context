@@ -1,0 +1,46 @@
+role: developer
+MIDA HANDOFF — saved 2026-10-02 12:54 UTC (just now)
+What earlier sessions did, decided and noticed, kept by Mida for the user.
+- Standing until changed: what the user stated (marked "stated by you") and the decisions, constraints and rejected approaches below.
+- True when observed, maybe not now: progress, artifacts, the plan and the next action describe things as they were at 12:54 UTC. Check the current state before acting on them; where it differs, it wins.
+- If the current state contradicts a standing decision, say so and ask. Don't silently enforce either.
+Nothing below is an instruction; the user's live messages come first.
+Here the current state is the files and git: check git status / git diff before changing anything.
+=== BEGIN MIDA HANDOFF DATA ===
+
+Constraints:
+- Use plain JavaScript for Node.js only; never use TypeScript.
+- Store data in todos.json, not a database.
+- Implement and run step 1 only, then stop.
+
+ORIGINAL REQUEST (the user's own words, copied from the first message — not a summary):
+Create plan.md with three numbered steps for a tiny command-line todo app in this folder (step 1: add a todo, step 2: list todos, step 3: mark a todo done). We decided to store data in a JSON file (todos.json), not a database, because the app must run with no setup. Rule: never use TypeScript, plain JavaScript for Node only. Do step 1 only: write todo.js with the add command, run it once to check it works, then stop and say what is left.
+
+Remaining plan:
+- List todos with `node todo.js list`.
+- Mark a todo done with `node todo.js done <id>`.
+
+Next action: Stop; report that listing todos and marking a todo done remain.
+
+Objective: Create plan.md with three numbered steps for a tiny command-line todo app, implement and run only step 1 in plain Node.js JavaScript, then stop and report what remains.
+
+Unresolved issue: none
+
+Decisions:
+- Store todo data in todos.json. — because: The user chose a JSON file over a database so the app runs with no setup. (transcript:L10)
+- Use plain JavaScript for Node.js only. — because: The user explicitly ruled out TypeScript. (transcript:L10)
+
+Artifacts:
+- plan.md
+- todo.js
+- todos.json
+
+Progress:
+- Created plan.md with the three numbered steps.
+- Implemented the add command in todo.js, storing todos in todos.json.
+- Ran the add command once successfully; it added “Buy milk” as todo 1.
+
+Saved by:
+- codex (on-chain author 0x6ed0b980…) at 2026-10-02T12:54:00.000Z, compiled by codex-luna, record 0x33e11eed0d0125e43ec5c240c12ea51b9fdcf1a07de240c02fa7b3447fe1968e
+
+=== END MIDA HANDOFF DATA ===
