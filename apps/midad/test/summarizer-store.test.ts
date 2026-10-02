@@ -256,4 +256,21 @@ describe("compileWithSummarizer", () => {
     await run(input)
     expect(fallbacks).toEqual(["codex-luna"])
   })
+
+  // UF-QH: the drain's "from the ninth failed try, one cheap call" relies on `attempts: 1`
+  // surviving the wrapper — the forwarded object must carry it, and an absent one must stay
+  // absent (the caller's default, not a forced value).
+  it("the caller's attempts reaches compile untouched — 1 stays 1, absent stays absent (UF-QH)", async () => {
+    const dir = home()
+    writeSummarizer(dir, { use: "agents" })
+    const seen: (number | undefined)[] = []
+    const compile = (async (arg: { attempts?: number }) => {
+      seen.push(arg.attempts)
+      return { ok: true } as CompileResult
+    }) as unknown as Parameters<typeof compileWithSummarizer>[2]
+    const run = compileWithSummarizer(dir, {}, compile, { onPath: allPath, claudeSafeMode: () => false })
+    await run({ ...input, attempts: 1 })
+    await run(input)
+    expect(seen).toEqual([1, undefined])
+  })
 })

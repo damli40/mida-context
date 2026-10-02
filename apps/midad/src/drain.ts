@@ -108,7 +108,7 @@ const INVALID_CHECKPOINT_MAX_ATTEMPTS = 3
  * UF-QF: a SUMMARY failure — the model ran but produced nothing usable — backs off to a
  * six-hour cap, not the one-hour cap a send failure keeps. The summary failures are exactly
  * the three reasons a try can spend a model call on, so once the tries run long each one
- * waits six hours and (with `attempts: 1`, below) spends a single call.
+ * waits six hours and (with `attempts: 1`, below) asks each model in the list once.
  */
 export const SUMMARY_FAILURE_REASONS = new Set(["model-failed", "no-json", "invalid-checkpoint"])
 const SUMMARY_BACKOFF_CAP_MS = 6 * 60 * 60 * 1000
@@ -478,9 +478,9 @@ async function drainPass(deps: DrainDeps, now: () => Date): Promise<DrainResult>
             cwd: job.cwd,
             homeDir,
             previous: previous.checkpoint,
-            // UF-QF: from the ninth failed try on, one try spends ONE model call — the compile
-            // is asked for a single attempt, so the fallback chain is walked once and no
-            // same-provider retry fires on a bad shape
+            // UF-QF: from the ninth failed try on, one try asks each model in the list ONCE: the
+            // compile is asked for a single attempt, so the fallback chain is walked once (one call
+            // with one tool installed, two with Claude Code and Codex) and no same-provider retry fires
             ...((state?.attempts ?? 0) >= MAX_ATTEMPTS ? { attempts: 1 } : {}),
           })
           const compileMs = now().getTime() - compileStart

@@ -2691,19 +2691,20 @@ describe("only unusable answers count toward giving up (UF-QF)", () => {
     expect(saveCalls).toHaveLength(1)
   })
 
-  it("a save whose summary fails forever costs at most 36 model calls in seven days (UF-QF)", async () => {
+  it("a save whose summary fails forever is tried at most 36 times in seven days (UF-QF)", async () => {
     const { home, job, drain, flags, compileCalls } = setup()
     job({ event: "Stop" }, T0)
     flags.compileReason = "model-failed"
     let t = T0 + 120_000
     // each drain jumps straight to the next due time — the skipped passes between change
     // nothing — until the seven-day age rule drops the job and nothing is due any more
-    for (;;) {
+    for (let pass = 0; pass < 200; pass += 1) {
       await drain({ now: () => new Date(t) })
       const due = sessionWaits(home, listJobs(home))[0]?.dueAtMs
       if (due === undefined) break
       t = due
     }
+    expect(sessionWaits(home, listJobs(home))).toHaveLength(0) // the loop ended because nothing is due, not because it ran out of passes
     expect(compileCalls.length).toBeLessThanOrEqual(36)
     expect(compileCalls.length).toBeGreaterThan(8) // it really did keep trying all week
     expect(home.list("queue/bad")).toHaveLength(1) // dropped only when the job turned seven days old
