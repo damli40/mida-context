@@ -8,7 +8,16 @@
 // the agents run.
 //
 //   --condition none|raw|mida  --run <n>  [--a-seconds 240]  [--stop-at <text>]
-//   [--codex-auth <path>]  [--dry-run]  [--agent-a-cmd|--agent-b-cmd '<json>']
+//   [--codex-auth <path>]  [--dry-run]  [--late-change]
+//   [--agent-a-cmd|--agent-b-cmd '<json>']
+//
+// With --late-change the run gains a second movement: after agent B's first
+// turn, a third session (agent C, Claude Code, read-only) states a decision the
+// owner just made — KeyedLimiter becomes KeyedRateLimiter — and B is resumed
+// for a second "Continue.". Only the mida condition has a channel for it (the
+// UserPromptSubmit hook); raw and none cannot see a change made after B
+// started. Runs land in runs-late-change/ and score from
+// score-late-change.json.
 //
 // The three conditions differ only in what agent B sees at session start:
 //   none — nothing; B works from the files agent A left behind
@@ -55,6 +64,7 @@ const TOY_TASK = join(REPO_ROOT, "bench", "fixtures", "continuation-task")
 const HOOK_MAIN = join(REPO_ROOT, "apps", "midad", "src", "hook-main.ts")
 const INJECT_MAIN = join(REPO_ROOT, "apps", "midad", "src", "inject-main.ts")
 export const RUNS_ROOT = join(REPO_ROOT, "bench", "continuation", "runs")
+export const LATE_RUNS_ROOT = join(REPO_ROOT, "bench", "continuation", "runs-late-change")
 // Default text the poll looks for in src/bucket.mjs to stop agent A early.
 // Overridden by --stop-at: today's Claude Code writes several steps in one
 // edit, so the point where A is stopped is a setting, not a constant.
@@ -88,6 +98,36 @@ const agentBArgv = (): string[] => [
   "codex", "exec", "--dangerously-bypass-hook-trust", "Continue.",
   "--skip-git-repo-check", "--sandbox", "workspace-write",
 ]
+
+// --late-change: while agent B is already working, the owner changes one
+// decision in a THIRD session (agent C, another Claude Code) that edits
+// nothing. Only Mida's per-prompt hook can carry it to B.
+export const LATE_CHANGE_PROMPT =
+  "The owner changed one decision for this project: the keyed limiter class must " +
+  "be named KeyedRateLimiter, not KeyedLimiter, everywhere (source, tests and " +
+  "README). Do not open, create or change any file in this session, and do not " +
+  "run any command. Reply with one sentence confirming the new name."
+
+// Agent C: no --permission-mode, so it cannot edit; Read only, so it cannot run
+// a command either. The prompt is the whole job — say the new name, touch nothing.
+export const agentCArgv = (prompt: string, settings?: string): string[] => [
+  "claude", "-p", prompt,
+  "--model", "sonnet",
+  "--allowedTools", "Read",
+  "--setting-sources", "project",
+  "--strict-mcp-config",
+  ...(settings !== undefined ? ["--settings", settings] : []),
+  "--output-format", "stream-json",
+  "--verbose",
+]
+
+// Agent B's second turn: resume B's OWN session and say "Continue." again.
+export const agentBResumeArgv = (sessionId: string): string[] => [
+  "codex", "exec", "resume", sessionId, "Continue.",
+  "--dangerously-bypass-hook-trust",
+  "--skip-git-repo-check",
+  "-c", 'sandbox_mode="workspace-write"',
+]
 // =============================================================
 
 // The hook command text runs the entry point directly — nothing installs the
@@ -109,15 +149,17 @@ interface Args {
   stopAt: string
   codexAuth?: string
   dryRun: boolean
+  lateChange: boolean
   agentACmd?: string
   agentBCmd?: string
 }
 
 export function parseArgs(argv: readonly string[]): Args {
-  const args: Record<string, string> & { dryRun: boolean } = { dryRun: false }
+  const args: Record<string, string> & { dryRun: boolean; lateChange: boolean } = { dryRun: false, lateChange: false }
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]!
     if (a === "--dry-run") args.dryRun = true
+    else if (a === "--late-change") args.lateChange = true
     else if (a.startsWith("--")) {
       const v = argv[++i]
       if (v === undefined) throw new Error(`${a} needs a value`)
@@ -141,6 +183,7 @@ export function parseArgs(argv: readonly string[]): Args {
     stopAt,
     codexAuth: args["codex-auth"],
     dryRun: args.dryRun,
+    lateChange: args.lateChange,
     agentACmd: args["agent-a-cmd"],
     agentBCmd: args["agent-b-cmd"],
   }
@@ -169,7 +212,7 @@ function claudeSettings(): Record<string, unknown> {
   }
 }
 
-function codexToml(condition: Args["condition"], runDir: string): string | null {
+export function codexToml(condition: Args["condition"], runDir: string, lateChange = false): string | null {
   if (condition === "none") return null
   if (condition === "raw") {
     return (
@@ -178,12 +221,19 @@ function codexToml(condition: Args["condition"], runDir: string): string | null 
       `command = ${JSON.stringify(`node ${join(runDir, "print-file.mjs")} ${join(runDir, "raw-tail.txt")}`)}\n`
     )
   }
-  // the real managed block's shape, with this run's command text substituted
+  // the real managed block's shape, with this run's command text substituted.
+  // The UserPromptSubmit table appears only in late-change runs: B's second
+  // "Continue." is the only prompt in the benchmark that could carry a change
+  // made after B started, and that hook is the channel that answers it.
   return (
     `[[hooks.SessionStart]]\nmatcher = "startup|resume|clear|compact"\n\n` +
     `[[hooks.SessionStart.hooks]]\ntype = "command"\n` +
-    `command = ${JSON.stringify(injectCmd("codex"))}\n\n` +
-    `[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = "command"\n` +
+    `command = ${JSON.stringify(injectCmd("codex"))}\n` +
+    (lateChange
+      ? `\n[[hooks.UserPromptSubmit]]\n\n[[hooks.UserPromptSubmit.hooks]]\ntype = "command"\n` +
+        `command = ${JSON.stringify(injectCmd("codex"))}\n`
+      : "") +
+    `\n[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = "command"\n` +
     `command = ${JSON.stringify(hookCmd("codex"))}\n`
   )
 }
@@ -203,7 +253,7 @@ function planFiles(args: Args, runDir: string): PlannedFile[] {
   if (args.condition === "mida") {
     files.push({ rel: "claude-settings.json", content: `${JSON.stringify(claudeSettings(), null, 2)}\n` })
   }
-  const toml = codexToml(args.condition, runDir)
+  const toml = codexToml(args.condition, runDir, args.lateChange)
   if (toml !== null) files.push({ rel: "codex-home/config.toml", content: toml })
   if (args.condition === "raw") files.push({ rel: "print-file.mjs", content: PRINT_FILE_SRC })
   return files
@@ -220,7 +270,7 @@ function layoutLines(args: Args, runDir: string, codexAuth: string | undefined):
     lines.push(rel("daemon.jsonl           the daemon's event log"))
   }
   lines.push(rel("codex-home/            throwaway CODEX_HOME for agent B"))
-  if (codexToml(args.condition, runDir) !== null) {
+  if (codexToml(args.condition, runDir, args.lateChange) !== null) {
     lines.push(rel("codex-home/config.toml session-start hook (raw: prints the tail; mida: real inject)"))
   }
   if (codexAuth !== undefined) {
@@ -234,6 +284,11 @@ function layoutLines(args: Args, runDir: string, codexAuth: string | undefined):
   lines.push(rel("b-output.txt           agent B output"))
   lines.push(rel("a-final.diff           work/ diff after agent A"))
   lines.push(rel("b-final.diff           work/ diff after agent B"))
+  if (args.lateChange) {
+    lines.push(rel("c-output.jsonl         agent C stream-json (the late-change session)"))
+    lines.push(rel("b2-output.txt          agent B output, second turn"))
+    lines.push(rel("b2-final.diff          work/ diff after agent B's second turn"))
+  }
   lines.push(rel("run.json               result record"))
   return lines
 }
@@ -324,6 +379,13 @@ export function transcriptOfSession(projectsRoot: string, sessionId: string): st
     } catch { /* not in this folder */ }
   }
   return null
+}
+
+/** The session id in agent B's Codex output: the id on the first whole line
+ *  shaped like "session id: <hex-and-dashes>", else null. */
+export function codexSessionIdOf(bOutputText: string): string | null {
+  const m = /^session id:\s*([0-9a-fA-F-]{8,})\s*$/m.exec(bOutputText)
+  return m === null ? null : m[1]!
 }
 
 /** The token count in agent B's output: "tokens used: 1,234" or the two-line
@@ -465,8 +527,10 @@ export function scoreFiles(work: string, score: Score): {
 
 // ---------- dry-run ----------
 
+const runsRootOf = (args: Args) => (args.lateChange ? LATE_RUNS_ROOT : RUNS_ROOT)
+
 function dryRun(args: Args): void {
-  const runDir = join(RUNS_ROOT, args.condition, String(args.run))
+  const runDir = join(runsRootOf(args), args.condition, String(args.run))
   const work = join(runDir, "work")
   const codexHome = join(runDir, "codex-home")
   const midaHome = join(runDir, "mida-home")
@@ -510,6 +574,28 @@ function dryRun(args: Args): void {
       argv: args.agentBCmd !== undefined ? JSON.parse(args.agentBCmd) : agentBArgv(),
     },
   ]
+  if (args.lateChange) {
+    commands.push(
+      {
+        agent: "C",
+        cwd: work,
+        env: args.condition === "mida" ? { MIDA_HOME: midaHome } : {},
+        argv: agentCArgv(
+          LATE_CHANGE_PROMPT,
+          args.condition === "mida" ? join(runDir, "claude-settings.json") : undefined,
+        ),
+      },
+      {
+        agent: "B (second turn)",
+        cwd: work,
+        env: {
+          CODEX_HOME: codexHome,
+          ...(args.condition === "mida" ? { MIDA_HOME: midaHome } : {}),
+        },
+        argv: agentBResumeArgv("<session id from b-output.txt>"),
+      },
+    )
+  }
   console.log("\n# agent commands it would run (env shows additions only — every child gets the parent env minus ANTHROPIC_*)")
   for (const c of commands) console.log(JSON.stringify(c))
   console.log(`\n# agent A is stopped when the text ${JSON.stringify(args.stopAt)} appears in src/bucket.mjs`)
@@ -525,9 +611,10 @@ async function realRun(args: Args): Promise<number> {
     throw new Error(`harness: ${TSX_LOADER} is missing; run pnpm install`)
   }
   // The rubric loads before anything is created or started: a broken score.json
-  // must fail here, not after an agent has been paid for.
-  const score = loadScore(join(TOY_TASK, "score.json"))
-  const runDir = join(RUNS_ROOT, args.condition, String(args.run))
+  // must fail here, not after an agent has been paid for. A late-change run is
+  // scored by score-late-change.json in the same fixture folder.
+  const score = loadScore(join(TOY_TASK, args.lateChange ? "score-late-change.json" : "score.json"))
+  const runDir = join(runsRootOf(args), args.condition, String(args.run))
   const codexHome = join(runDir, "codex-home")
   const midaHomePath = join(runDir, "mida-home")
 
@@ -544,8 +631,12 @@ async function realRun(args: Args): Promise<number> {
   cpSync(TOY_TASK, work, {
     recursive: true,
     // TASK.md stays out: a baseline B could otherwise read the objective from
-    // disk. score.json stays out too — it is the rubric, not task material.
-    filter: (src) => basename(src) !== "TASK.md" && basename(src) !== "score.json",
+    // disk. The rubric files stay out too — they are the rubric, not task
+    // material.
+    filter: (src) =>
+      basename(src) !== "TASK.md" &&
+      basename(src) !== "score.json" &&
+      basename(src) !== "score-late-change.json",
   })
   git(work, ["init", "-q"])
   git(work, ["add", "-A"])
@@ -694,6 +785,70 @@ async function realRun(args: Args): Promise<number> {
     closeSync(bOut)
     snapshotDiff(work, join(runDir, "b-final.diff"))
 
+    // --- late change: agent C makes a decision in ANOTHER session while B is
+    // already started; B is then resumed for a second "Continue." ---
+    let cSeconds: number | null = null
+    let cTurns: number | null = null
+    let cChangedFiles: boolean | null = null
+    let bSessionId: string | null = null
+    let b2Seconds: number | null = null
+    let b2ExitCode: number | null = null
+    if (args.lateChange) {
+      const bOutputSoFar = readFileSync(join(runDir, "b-output.txt"), "utf8")
+      bSessionId = codexSessionIdOf(bOutputSoFar)
+      if (bSessionId === null) {
+        throw new Error("late-change: agent B's session id was not found in its output, so it cannot be resumed")
+      }
+      // Agent C: a second Claude Code session in the SAME work folder, told the
+      // new decision and forbidden from touching anything. In the mida
+      // condition it carries the same settings as A, so the hooks capture it.
+      const cStatusBefore = git(work, ["status", "--porcelain"])
+      const cOut = openSync(join(runDir, "c-output.jsonl"), "w")
+      const c = await runChild(
+        agentCArgv(
+          LATE_CHANGE_PROMPT,
+          args.condition === "mida" ? join(runDir, "claude-settings.json") : undefined,
+        ),
+        { cwd: work, env: aEnv, stdoutFd: cOut, limitMs: 120_000 },
+      )
+      closeSync(cOut)
+      cSeconds = c.seconds
+      cChangedFiles = git(work, ["status", "--porcelain"]) !== cStatusBefore
+      let cOutputText = ""
+      try {
+        cOutputText = readFileSync(join(runDir, "c-output.jsonl"), "utf8")
+      } catch { /* no output file */ }
+      cTurns = 0
+      for (const line of cOutputText.split("\n")) {
+        if (line === "") continue
+        try {
+          if ((JSON.parse(line) as { type?: string }).type === "assistant") cTurns += 1
+        } catch { /* partial line */ }
+      }
+
+      // mida: drain the queue again so C's session is saved before B resumes.
+      if (args.condition === "mida") {
+        await waitQueueEmpty(midaHomePath, QUEUE_WAIT_CAP_MS)
+      }
+
+      // Agent B, second turn: resume B's own session and say "Continue." again.
+      const b2Out = openSync(join(runDir, "b2-output.txt"), "w")
+      const b2 = await runChild(agentBResumeArgv(bSessionId), {
+        cwd: work,
+        env: childEnv({
+          CODEX_HOME: codexHome,
+          ...(args.condition === "mida" ? { MIDA_HOME: midaHomePath } : {}),
+        }),
+        stdoutFd: b2Out,
+        stderrToStdout: true,
+        limitMs: B_LIMIT_MS,
+      })
+      closeSync(b2Out)
+      b2Seconds = b2.seconds
+      b2ExitCode = b2.exitCode
+      snapshotDiff(work, join(runDir, "b2-final.diff"))
+    }
+
     // --- scoring: finished files, rubric constraints, the task's own checks ---
     const { steps, constraints } = scoreFiles(work, score)
     const checks = score.checks.map((argv) => ({
@@ -701,8 +856,32 @@ async function realRun(args: Args): Promise<number> {
       pass: spawnSync(argv[0]!, argv.slice(1), { cwd: work, env: childEnv(), timeout: 120_000 }).status === 0,
     }))
     const bOutput = readFileSync(join(runDir, "b-output.txt"), "utf8")
+    // Both of B's outputs count toward the harness-files record; b2 exists only
+    // in late-change runs.
+    let b2Output = ""
+    try {
+      b2Output = readFileSync(join(runDir, "b2-output.txt"), "utf8")
+    } catch { /* not a late-change run */ }
+
+    // mida late-change runs only: how many times the daemon answered a
+    // what's-new request for agent codex — the channel that could have carried
+    // C's decision to B's second prompt.
+    let midaUpdateEvents: number | null = null
+    if (args.lateChange && args.condition === "mida") {
+      midaUpdateEvents = 0
+      try {
+        for (const line of readFileSync(join(runDir, "daemon.jsonl"), "utf8").split("\n")) {
+          if (line === "") continue
+          try {
+            const entry = JSON.parse(line) as { event?: string; agent?: string }
+            if (entry.event === "whatsnew" && entry.agent === "codex") midaUpdateEvents += 1
+          } catch { /* partial line */ }
+        }
+      } catch { /* no daemon log */ }
+    }
 
     const run = {
+      lateChange: args.lateChange,
       condition: args.condition,
       run: args.run,
       stopAt: args.stopAt,
@@ -719,9 +898,11 @@ async function realRun(args: Args): Promise<number> {
       rawTranscriptFound: args.condition === "raw" ? true : null,
       bSeconds: b.seconds,
       bExitCode: b.exitCode,
-      bRan: bRanOf(b.exitCode, b.seconds),
+      bRan: args.lateChange
+        ? bRanOf(b.exitCode, b.seconds) && bRanOf(b2ExitCode, b2Seconds ?? 0)
+        : bRanOf(b.exitCode, b.seconds),
       bTokensUsed: tokensUsedOf(bOutput),
-      bSawHarnessFiles: harnessMarkersIn(bOutput, REPO_ROOT),
+      bSawHarnessFiles: harnessMarkersIn(`${bOutput}\n${b2Output}`, REPO_ROOT),
       workRanIn: "temp-outside-repo",
       stepsBuilt: steps.filter((s) => s.built).length,
       stepsAtHandover,
@@ -729,6 +910,18 @@ async function realRun(args: Args): Promise<number> {
       steps,
       constraints,
       checks,
+      ...(args.lateChange
+        ? {
+            bSessionId,
+            cSeconds,
+            cTurns,
+            cChangedFiles,
+            b2Seconds,
+            b2ExitCode,
+            b2TokensUsed: tokensUsedOf(b2Output),
+            midaUpdateEvents,
+          }
+        : {}),
     }
     writeFileSync(join(runDir, "run.json"), `${JSON.stringify(run, null, 2)}\n`)
     console.log(JSON.stringify(run))
