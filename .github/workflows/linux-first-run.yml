@@ -1,0 +1,151 @@
+# A first run of Mida on Linux, started by hand.
+#
+# What it proves: on a clean Ubuntu machine, the published npm package installs, sets up an
+# owner and two agents on Monad testnet, approves them, saves one checkpoint as one agent and
+# hands it to the other at session start, and stops handing it over after a revoke.
+#
+# What it does not prove: there is no Claude Code or Codex on this machine, so the agents'
+# own hooks never fire and no model writes a summary. The save is Mida's built-in demo
+# checkpoint, and the handoff is asked for the way Codex's session-start hook asks for it.
+#
+# It uses the hosted store and the hosted gas sponsor: about ten sponsored testnet
+# transactions per run. The keys it creates live only on the runner and are thrown away.
+name: Linux first run
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "mida-context version to install from npm"
+        required: false
+        default: "latest"
+
+permissions:
+  contents: read
+
+jobs:
+  first-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        # bash with pipefail: a failed command fails its step even when its output is piped to a log
+        shell: bash
+    env:
+      DEMO_OBJECTIVE: "M0 demo checkpoint"
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: The machine
+        run: |
+          uname -a
+          grep PRETTY_NAME /etc/os-release
+          node --version
+          npm --version
+          sudo apt-get install -y -q expect > /dev/null
+          expect -v
+
+      - name: Install from npm
+        run: |
+          npm install -g "mida-context@${{ inputs.version }}"
+          which mida midad mida-hook mida-inject mida-mcp
+          npm ls -g mida-context
+
+      - name: mida init
+        run: |
+          mkdir -p "$RUNNER_TEMP/log"
+          date -u +"start %FT%TZ" | tee "$RUNNER_TEMP/log/times.txt"
+          mida init 2>&1 | tee "$RUNNER_TEMP/log/init.txt"
+          test -d "$HOME/.mida"
+
+      - name: Request and approve two agents in a project folder
+        run: |
+          mkdir -p "$HOME/demo-project" && cd "$HOME/demo-project"
+          git init -q .
+          mida request claude-code 2>&1 | tee "$RUNNER_TEMP/log/request-claude-code.txt"
+          mida request codex 2>&1 | tee "$RUNNER_TEMP/log/request-codex.txt"
+          # approve asks for a typed "yes" and refuses to run without a terminal, so give it one
+          cat > "$RUNNER_TEMP/yes.exp" <<'EOF'
+          set timeout 600
+          spawn {*}$argv
+          expect {
+            -re {[Tt]ype yes[^\n]*: ?$} { sleep 1; send "yes\r"; exp_continue }
+            eof
+          }
+          lassign [wait] pid spawnid os_error value
+          exit $value
+          EOF
+          expect "$RUNNER_TEMP/yes.exp" mida approve --all 2>&1 | tee "$RUNNER_TEMP/log/approve.txt"
+          test -f .mida/project.json
+
+      - name: mida doctor
+        run: |
+          cd "$HOME/demo-project"
+          # doctor is expected to report that no model can write summaries here; do not fail on it
+          mida doctor 2>&1 | tee "$RUNNER_TEMP/log/doctor.txt" || true
+
+      - name: Save one checkpoint as claude-code
+        run: |
+          cd "$HOME/demo-project"
+          PROJECT_ID=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(".mida/project.json","utf8")).projectId)')
+          echo "project id: $PROJECT_ID"
+          mida save-demo claude-code "$PROJECT_ID" 2>&1 | tee "$RUNNER_TEMP/log/save.txt"
+          grep -q "^saved 0x" "$RUNNER_TEMP/log/save.txt"
+
+      - name: Codex starts a session and receives the handoff
+        run: |
+          cd "$HOME/demo-project"
+          printf '{"session_id":"linux-first-run-1","cwd":"%s","hook_event_name":"SessionStart","source":"startup"}' "$PWD" \
+            | mida-inject codex 2>&1 | tee "$RUNNER_TEMP/log/handoff.txt"
+          grep -q "$DEMO_OBJECTIVE" "$RUNNER_TEMP/log/handoff.txt"
+          date -u +"handoff %FT%TZ" | tee -a "$RUNNER_TEMP/log/times.txt"
+
+      - name: What codex can read
+        run: |
+          cd "$HOME/demo-project"
+          mida read --as codex projects.current 2>&1 | tee "$RUNNER_TEMP/log/read-as-codex.txt" || true
+
+      - name: Revoke codex, then its next session gets nothing
+        run: |
+          cd "$HOME/demo-project"
+          expect "$RUNNER_TEMP/yes.exp" mida revoke codex 2>&1 | tee "$RUNNER_TEMP/log/revoke.txt"
+          printf '{"session_id":"linux-first-run-2","cwd":"%s","hook_event_name":"SessionStart","source":"startup"}' "$PWD" \
+            | mida-inject codex 2>&1 | tee "$RUNNER_TEMP/log/handoff-after-revoke.txt"
+          if grep -q "$DEMO_OBJECTIVE" "$RUNNER_TEMP/log/handoff-after-revoke.txt"; then
+            echo "FAIL: a revoked agent still received the checkpoint"; exit 1
+          fi
+          date -u +"revoked %FT%TZ" | tee -a "$RUNNER_TEMP/log/times.txt"
+
+      - name: File permissions and the background service
+        run: |
+          echo "home folder mode: $(stat -c '%a' "$HOME/.mida")"
+          echo "files readable by group or others (names only):"
+          find "$HOME/.mida" -type f -perm /077 -printf '%m %P\n' | tee "$RUNNER_TEMP/log/loose-permissions.txt"
+          echo "count: $(wc -l < "$RUNNER_TEMP/log/loose-permissions.txt")"
+          echo "all files (mode and name, no content):"
+          find "$HOME/.mida" -maxdepth 3 -type f -printf '%m %P\n' | sort | tee "$RUNNER_TEMP/log/files.txt"
+          pgrep -fl midad | tee "$RUNNER_TEMP/log/service.txt" || true
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Linux first run"
+            echo
+            echo "- machine: $(grep PRETTY_NAME /etc/os-release | cut -d= -f2), node $(node --version)"
+            echo "- package: $(npm ls -g mida-context 2>/dev/null | grep mida-context || echo 'not installed')"
+            echo "- times (UTC):"
+            sed 's/^/  - /' "$RUNNER_TEMP/log/times.txt" 2>/dev/null || true
+            echo "- save: $(head -1 "$RUNNER_TEMP/log/save.txt" 2>/dev/null || echo 'did not run')"
+            echo "- handoff reached codex: $(grep -q "$DEMO_OBJECTIVE" "$RUNNER_TEMP/log/handoff.txt" 2>/dev/null && echo yes || echo no)"
+            echo "- handoff after revoke: $(grep -q "$DEMO_OBJECTIVE" "$RUNNER_TEMP/log/handoff-after-revoke.txt" 2>/dev/null && echo 'STILL DELIVERED' || echo 'not delivered')"
+            echo "- files in ~/.mida readable by group or others: $(wc -l < "$RUNNER_TEMP/log/loose-permissions.txt" 2>/dev/null || echo unknown)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-first-run-log
+          path: ${{ runner.temp }}/log
