@@ -29,7 +29,7 @@
 
 import { execFileSync, spawn, spawnSync } from "node:child_process"
 import {
-  appendFileSync, cpSync, existsSync, mkdirSync, openSync, closeSync, readFileSync,
+  appendFileSync, cpSync, mkdirSync, openSync, closeSync, readFileSync,
   readdirSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs"
 import os from "node:os"
@@ -44,7 +44,11 @@ import type { DaemonHandle } from "../../apps/midad/src/index.js"
 import type { ScenarioEnvironment } from "@mida/cli"
 
 const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url))
-const TOY_TASK = join(REPO_ROOT, "bench", "fixtures", "toy-task")
+// The September task the runner was written for: five steps built in order,
+// with WATCH (below) appearing in step 3, so agent A is stopped mid-task and
+// agent B has real work to continue. bench/fixtures/toy-task is a different,
+// older task where the watch string never appears.
+const TOY_TASK = join(REPO_ROOT, "bench", "fixtures", "continuation-task")
 const HOOK_MAIN = join(REPO_ROOT, "apps", "midad", "src", "hook-main.ts")
 const INJECT_MAIN = join(REPO_ROOT, "apps", "midad", "src", "inject-main.ts")
 export const RUNS_ROOT = join(REPO_ROOT, "bench", "continuation", "runs")
@@ -190,7 +194,7 @@ function planFiles(args: Args, runDir: string): PlannedFile[] {
 function layoutLines(args: Args, runDir: string, codexAuth: string | undefined): string[] {
   const rel = (p: string) => `  ${p}`
   const lines = [`${runDir}/`]
-  lines.push(rel("work/                  toy-task copy minus TASK.md + score.json, git-initialised"))
+  lines.push(rel("work/                  continuation-task copy minus TASK.md + score.json, git-initialised"))
   if (args.condition === "mida") {
     lines.push(rel("mida-home/             MIDA_HOME — provisioned on a local anvil chain"))
     lines.push(rel("claude-settings.json   agent A's --settings: the real mida hook commands"))
@@ -303,26 +307,96 @@ async function waitQueueEmpty(midaHomePath: string, capMs: number): Promise<{ wa
   return { waitMs: Date.now() - t0, left: left() }
 }
 
-/** Every file under work/, minus .git and node_modules — the finished state the score reads. */
-function workFiles(root: string): string[] {
-  const out: string[] = []
+/** One thing the finished files must show (present) or must not show (absent). */
+export interface Probe {
+  name: string
+  /** one file, relative to the work folder */
+  file?: string
+  /** every regular file under this folder, relative to the work folder, recursively */
+  under?: string
+  /** a regular expression that must match at least one of the texts */
+  present?: string
+  /** a regular expression that must match none of the texts */
+  absent?: string
+  /** regular-expression flags, for example "im" */
+  flags?: string
+}
+
+export interface Score {
+  steps: Probe[]
+  constraints: Probe[]
+  /** each check is one command as a list of words, run in the work folder */
+  checks: string[][]
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null
+
+/** Reads and validates a score.json; throws an Error prefixed "score.json: ". */
+export function loadScore(path: string): Score {
+  const fail = (why: string): never => {
+    throw new Error(`score.json: ${why}`)
+  }
+  const body: unknown = JSON.parse(readFileSync(path, "utf8"))
+  if (!isRecord(body)) return fail("not an object")
+  if (!Array.isArray(body.steps) || body.steps.length === 0) return fail("steps is not a non-empty array")
+  if (!Array.isArray(body.constraints)) return fail("constraints is not an array")
+  if (!Array.isArray(body.checks)) return fail("checks is not an array")
+  const probe = (v: unknown): v is Probe => {
+    if (!isRecord(v) || typeof v.name !== "string") return false
+    const targets = [v.file, v.under].filter((t) => typeof t === "string").length
+    const patterns = [v.present, v.absent].filter((t) => typeof t === "string").length
+    return targets === 1 && patterns === 1 && (v.flags === undefined || typeof v.flags === "string")
+  }
+  if (!body.steps.every(probe)) return fail("a step needs a string name, exactly one of file/under, exactly one of present/absent")
+  if (!body.constraints.every(probe)) return fail("a constraint needs a string name, exactly one of file/under, exactly one of present/absent")
+  const check = (v: unknown): v is string[] =>
+    Array.isArray(v) && v.length > 0 && v.every((w) => typeof w === "string")
+  if (!body.checks.every(check)) return fail("a check is not a non-empty array of strings")
+  return body as unknown as Score
+}
+
+/** The texts a probe reads: one file's content, or every regular file under a folder. */
+function probeTexts(work: string, probe: Probe): string[] {
+  const texts: string[] = []
+  const read = (p: string) => {
+    try {
+      texts.push(readFileSync(p, "utf8"))
+    } catch { /* unreadable file gives no text */ }
+  }
+  if (probe.file !== undefined) {
+    read(join(work, probe.file))
+    return texts
+  }
   const walk = (dir: string) => {
     for (const name of readdirSync(dir)) {
-      if (name === ".git" || name === "node_modules") continue
+      if (name === "node_modules" || name === ".git") continue
       const p = join(dir, name)
       const st = statSync(p)
       if (st.isDirectory()) walk(p)
-      else out.push(p)
+      else if (st.isFile()) read(p)
     }
   }
-  walk(root)
-  return out
+  try {
+    walk(join(work, probe.under!))
+  } catch { /* missing folder gives no text */ }
+  return texts
 }
 
-interface Score {
-  steps: string[]
-  constraints: string[]
-  checks: string[]
+export function probeHolds(work: string, probe: Probe): boolean {
+  const re = new RegExp(probe.present ?? probe.absent!, probe.flags ?? "")
+  const anyMatch = probeTexts(work, probe).some((t) => re.test(t))
+  return probe.present !== undefined ? anyMatch : !anyMatch
+}
+
+export function scoreFiles(work: string, score: Score): {
+  steps: { file: string; built: boolean }[]
+  constraints: { constraint: string; kept: boolean }[]
+} {
+  return {
+    steps: score.steps.map((probe) => ({ file: probe.name, built: probeHolds(work, probe) })),
+    constraints: score.constraints.map((probe) => ({ constraint: probe.name, kept: probeHolds(work, probe) })),
+  }
 }
 
 // ---------- dry-run ----------
@@ -380,6 +454,9 @@ function dryRun(args: Args): void {
 // ---------- real run ----------
 
 async function realRun(args: Args): Promise<number> {
+  // The rubric loads before anything is created or started: a broken score.json
+  // must fail here, not after an agent has been paid for.
+  const score = loadScore(join(TOY_TASK, "score.json"))
   const runDir = join(RUNS_ROOT, args.condition, String(args.run))
   const work = join(runDir, "work")
   const codexHome = join(runDir, "codex-home")
@@ -454,7 +531,7 @@ async function realRun(args: Args): Promise<number> {
           abort.abort("msUntilAvailable implemented")
         }
       } catch { /* file not written yet */ }
-    }, 2_000)
+    }, 250)
     const aArgv = args.agentACmd !== undefined
       ? (JSON.parse(args.agentACmd) as string[])
       : agentAArgv(
@@ -480,6 +557,15 @@ async function realRun(args: Args): Promise<number> {
       console.error("*** WARNING: Agent A produced no assistant output — treat this run as invalid ***")
     }
     snapshotDiff(work, join(runDir, "a-final.diff"))
+
+    // What did A leave for B? A run where every step is already built is not
+    // a continuation test — B could type "Continue." into a finished job.
+    const handover = scoreFiles(work, score)
+    const stepsAtHandover = handover.steps
+    const aLeftWork = stepsAtHandover.some((s) => !s.built)
+    if (!aLeftWork) {
+      console.error("*** NOTE: agent A had already built every step before it was stopped; this run has nothing to continue ***")
+    }
 
     // mida: the daemon drains queued jobs through the real compile; wait for
     // the queue to empty so B's handoff reflects A's whole session.
@@ -518,23 +604,10 @@ async function realRun(args: Args): Promise<number> {
     snapshotDiff(work, join(runDir, "b-final.diff"))
 
     // --- scoring: finished files, rubric constraints, the task's own checks ---
-    const score = JSON.parse(readFileSync(join(TOY_TASK, "score.json"), "utf8")) as Score
-    const files = workFiles(work)
-    const fileText = files.map((f) => {
-      try {
-        return readFileSync(f, "utf8")
-      } catch {
-        return ""
-      }
-    })
-    const steps = score.steps.map((rel) => {
-      const p = join(work, rel)
-      return { file: rel, built: existsSync(p) && statSync(p).size > 0 }
-    })
-    const constraints = score.constraints.map((s) => ({ constraint: s, literalInSource: fileText.some((t) => t.includes(s)) }))
-    const checks = score.checks.map((cmd) => ({
-      command: cmd,
-      pass: spawnSync(cmd, { cwd: work, shell: true, env: childEnv() }).status === 0,
+    const { steps, constraints } = scoreFiles(work, score)
+    const checks = score.checks.map((argv) => ({
+      command: argv.join(" "),
+      pass: spawnSync(argv[0]!, argv.slice(1), { cwd: work, env: childEnv(), timeout: 120_000 }).status === 0,
     }))
     const bOutput = readFileSync(join(runDir, "b-output.txt"), "utf8")
     const tokenMatch = /tokens used:\s*([\d,]+)/i.exec(bOutput)
@@ -554,6 +627,8 @@ async function realRun(args: Args): Promise<number> {
       bExitCode: b.exitCode,
       bTokensUsed: tokenMatch === null ? null : Number(tokenMatch[1]!.replaceAll(",", "")),
       stepsBuilt: steps.filter((s) => s.built).length,
+      stepsAtHandover,
+      aLeftWork,
       steps,
       constraints,
       checks,
