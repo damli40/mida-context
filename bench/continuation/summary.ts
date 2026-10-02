@@ -7,8 +7,13 @@
 //
 // A run folder under <root>/<condition>/ is one run that was STARTED. It is
 // SCORED only if it holds a run.json that parses and carries the fields the
-// summary needs (steps, checks, constraints, aProducedOutput). "Finished"
-// counts started runs, so a crashed run counts as not finished.
+// summary needs (steps, checks, constraints, aProducedOutput, aLeftWork, bRan).
+// "Finished" counts started runs, so a crashed run counts as not finished.
+// Three kinds of scored run are not continuation tests and are left out of the
+// "of" numbers, each in its own column: agent A produced nothing, agent A had
+// already built every step before it was stopped, or agent B never ran (a
+// logged-out or rate-limited CLI exits at once). A run can be counted in more
+// than one of those columns but is subtracted from "of" only once.
 
 import { readdirSync, readFileSync } from "node:fs"
 import { join } from "node:path"
@@ -30,6 +35,10 @@ export interface RunRow {
   checksOnly: boolean
   /** agent A produced no output, so there was nothing to hand over */
   agentAEmpty: boolean
+  /** scored and agent A had built every step already: nothing to continue */
+  nothingLeft: boolean
+  /** scored and agent B never ran (a logged-out CLI exits at once) */
+  bDidNotRun: boolean
   constraintsKept: number
   constraintsTotal: number
 }
@@ -40,6 +49,10 @@ export interface ConditionSummary {
   finished: number
   checksOnly: number
   agentAEmpty: number
+  nothingLeft: number
+  bDidNotRun: number
+  /** scored runs left out of "of": A empty OR nothing left OR B never ran */
+  leftOut: number
   constraintsKept: number
   constraintsTotal: number
 }
@@ -52,9 +65,11 @@ export interface Summary {
 
 interface RunJson {
   aProducedOutput: boolean
+  aLeftWork: boolean
+  bRan: boolean
   steps: { built: boolean }[]
   checks: { pass: boolean }[]
-  constraints: { literalInSource: boolean }[]
+  constraints: { kept: boolean }[]
 }
 
 const isBooleans = (v: unknown, field: string): v is Record<string, boolean>[] =>
@@ -77,9 +92,11 @@ function parseRunJson(path: string): RunJson | null {
   if (typeof body !== "object" || body === null) return null
   const b = body as Record<string, unknown>
   if (typeof b.aProducedOutput !== "boolean") return null
+  if (typeof b.aLeftWork !== "boolean") return null
+  if (typeof b.bRan !== "boolean") return null
   if (!isBooleans(b.steps, "built")) return null
   if (!isBooleans(b.checks, "pass")) return null
-  if (!isBooleans(b.constraints, "literalInSource")) return null
+  if (!isBooleans(b.constraints, "kept")) return null
   return b as unknown as RunJson
 }
 
@@ -90,6 +107,8 @@ function rowFrom(condition: Condition, dir: string): RunRow {
     finished: false,
     checksOnly: false,
     agentAEmpty: false,
+    nothingLeft: false,
+    bDidNotRun: false,
     constraintsKept: 0,
     constraintsTotal: 0,
   }
@@ -98,10 +117,14 @@ function rowFrom(condition: Condition, dir: string): RunRow {
   row.scored = true
   const allChecksPass = run.checks.every((c) => c.pass)
   const allStepsBuilt = run.steps.every((s) => s.built)
-  row.finished = run.steps.length > 0 && allStepsBuilt && allChecksPass
-  row.checksOnly = allChecksPass && run.steps.some((s) => !s.built)
+  row.nothingLeft = !run.aLeftWork
+  row.bDidNotRun = !run.bRan
   row.agentAEmpty = !run.aProducedOutput
-  row.constraintsKept = run.constraints.filter((c) => c.literalInSource).length
+  // a run that never tested a continuation is neither finished nor checksOnly
+  const leftOut = row.agentAEmpty || row.nothingLeft || row.bDidNotRun
+  row.finished = !leftOut && run.steps.length > 0 && allStepsBuilt && allChecksPass
+  row.checksOnly = !leftOut && allChecksPass && run.steps.some((s) => !s.built)
+  row.constraintsKept = run.constraints.filter((c) => c.kept).length
   row.constraintsTotal = run.constraints.length
   return row
 }
@@ -125,7 +148,7 @@ export function readRuns(root: string): RunRow[] {
 }
 
 const emptyCounts = (): ConditionSummary => ({
-  started: 0, scored: 0, finished: 0, checksOnly: 0, agentAEmpty: 0, constraintsKept: 0, constraintsTotal: 0,
+  started: 0, scored: 0, finished: 0, checksOnly: 0, agentAEmpty: 0, nothingLeft: 0, bDidNotRun: 0, leftOut: 0, constraintsKept: 0, constraintsTotal: 0,
 })
 
 export function summarize(rows: RunRow[]): Summary {
@@ -138,6 +161,10 @@ export function summarize(rows: RunRow[]): Summary {
     if (row.finished) s.finished += 1
     if (row.checksOnly) s.checksOnly += 1
     if (row.agentAEmpty) s.agentAEmpty += 1
+    if (row.nothingLeft) s.nothingLeft += 1
+    if (row.bDidNotRun) s.bDidNotRun += 1
+    // one run may sit in more than one of those columns but leaves "of" once
+    if (row.agentAEmpty || row.nothingLeft || row.bDidNotRun) s.leftOut += 1
     s.constraintsKept += row.constraintsKept
     s.constraintsTotal += row.constraintsTotal
   }
@@ -155,22 +182,23 @@ export function renderSummary(summary: Summary, root: string): string {
     )
   }
   const rowLine = (label: string, s: ConditionSummary) =>
-    `| ${label} | ${s.started} | ${s.scored} | ${s.finished} | ${s.checksOnly} | ${s.agentAEmpty} | ${s.constraintsKept} of ${s.constraintsTotal} |\n`
+    `| ${label} | ${s.started} | ${s.scored} | ${s.finished} | ${s.checksOnly} | ${s.agentAEmpty} | ${s.nothingLeft} | ${s.bDidNotRun} | ${s.constraintsKept} of ${s.constraintsTotal} |\n`
+  const ofRuns = (s: ConditionSummary) => s.started - s.leftOut
   const withoutFinished = summary.none.finished + summary.raw.finished
-  const withoutStarted = summary.none.started + summary.raw.started
+  const withoutOf = ofRuns(summary.none) + ofRuns(summary.raw)
   return (
     `Continuation benchmark: ${total} ${runsWord(total)} in ${root}\n\n` +
-    "| Condition | Runs started | Scored | Finished | Checks passed, job not finished | Agent A produced nothing | Rules kept |\n" +
-    "|---|---|---|---|---|---|---|\n" +
+    "| Condition | Runs started | Scored | Finished | Checks passed, job not finished | Agent A produced nothing | Nothing left to continue | Agent B did not run | Rules kept |\n" +
+    "|---|---|---|---|---|---|---|---|---|\n" +
     rowLine("With Mida (mida)", summary.mida) +
     rowLine("Without Mida, nothing given (none)", summary.none) +
     rowLine("Without Mida, transcript tail pasted (raw)", summary.raw) +
     "\n" +
-    `With Mida: ${summary.mida.finished} of ${summary.mida.started} ${runsWord(summary.mida.started)} finished.\n` +
-    `Without Mida: ${withoutFinished} of ${withoutStarted} ${runsWord(withoutStarted)} finished ` +
-    `(nothing given: ${summary.none.finished} of ${summary.none.started}; transcript tail pasted: ${summary.raw.finished} of ${summary.raw.started}).\n` +
+    `With Mida: ${summary.mida.finished} of ${ofRuns(summary.mida)} ${runsWord(ofRuns(summary.mida))} finished.\n` +
+    `Without Mida: ${withoutFinished} of ${withoutOf} ${runsWord(withoutOf)} finished ` +
+    `(nothing given: ${summary.none.finished} of ${ofRuns(summary.none)}; transcript tail pasted: ${summary.raw.finished} of ${ofRuns(summary.raw)}).\n` +
     "\n" +
-    'Finished means every step was built and every check passed. "Of" counts every run that was started, so a run that crashed or was never scored counts as not finished.\n'
+    'Finished means every step was built and every check passed. "Of" counts every run that was started, so a run that crashed or was never scored counts as not finished. Three kinds of run are left out of "of" because they are not continuation tests: the first agent produced nothing, the first agent had already built every step before it was stopped, or the second agent never ran.\n'
   )
 }
 

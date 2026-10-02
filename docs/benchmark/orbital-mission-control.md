@@ -121,8 +121,11 @@ Where the count comes from:
 - **This scenario's dry runs**: one `docs/evidence/orbital-<date>-<n>.json` per run,
   the failed ones included; fill the table from those files.
 
-**Until the table is filled, the old figure stays, with its sample size said every time:** on a
-toy task, 3 runs per setup and one scorer, a fresh Codex with the Mida handoff finished 3 of 3;
-without it **0 of 6 completed the requirements; 6 of 6 reported completion**
-([method and runs](../evidence/handoff-design-and-benchmark-2026-09-20.md)). When the new count
-exists, it replaces that sentence in the README, the quickstart and the pitch.
+**The automated benchmark's count, Oct 2** (the rate-limiter task, 5 runs per condition, scored
+automatically and then by a second scorer who did not know the conditions): with a Mida handoff
+5 of 5 finished; with nothing 0 of 5 finished, and all 5 passed their tests and reported the
+work done; with the whole transcript pasted 5 of 5 finished, because the first session was short
+enough to fit ([method and every run](../evidence/continuation-benchmark-2026-10-02.md)). This
+replaces the Sep 20 figure of 3 of 3 against 0 of 6
+([that measurement](../evidence/handoff-design-and-benchmark-2026-09-20.md)). The table above,
+for this scenario's own dry runs, is still to be filled.
