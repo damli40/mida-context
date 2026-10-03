@@ -6,6 +6,9 @@
 #   wsl:    the same first run as the Linux job, inside WSL (the Linux layer built into
 #           Windows). This is the route a Windows user can try today.
 #
+# The `from` input picks what each job installs: `npm` (the default) is the published package,
+# and `source` checks out the dispatched ref and installs the CLI built from it.
+#
 # Neither job has Claude Code or Codex, so the agents' own hooks never fire and no model writes
 # a summary. Both use the hosted store and the hosted gas sponsor on Monad testnet: about ten
 # sponsored transactions per job that gets as far as approving. Keys live only on the runner.
@@ -18,6 +21,14 @@ on:
         description: "mida-context version to install from npm"
         required: false
         default: "latest"
+      from:
+        description: "what to install: the published npm package, or this ref built from source"
+        type: choice
+        options:
+          - npm
+          - source
+        required: true
+        default: "npm"
 
 permissions:
   contents: read
@@ -41,10 +52,28 @@ jobs:
           node --version
           npm --version
 
+      - uses: actions/checkout@v4
+        if: inputs.from == 'source'
+
       - name: Install from npm
+        if: inputs.from == 'npm'
         continue-on-error: true
         run: |
           npm install -g "mida-context@${{ inputs.version }}" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install.txt"
+          "install $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          Get-Command mida, midad, mida-hook, mida-inject, mida-mcp -ErrorAction SilentlyContinue | Format-Table Name, Source
+          exit 0
+
+      - name: Install from source
+        if: inputs.from == 'source'
+        continue-on-error: true
+        run: |
+          git rev-parse HEAD | Tee-Object "$env:RUNNER_TEMP\log\commit.txt"
+          corepack enable
+          pnpm --version | Tee-Object "$env:RUNNER_TEMP\log\pnpm-version.txt"
+          pnpm install --frozen-lockfile 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\pnpm-install.txt"
+          pnpm build:publish 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\build-publish.txt"
+          npm install -g ./publish/cli 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install.txt"
           "install $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
           Get-Command mida, midad, mida-hook, mida-inject, mida-mcp -ErrorAction SilentlyContinue | Format-Table Name, Source
           exit 0
@@ -114,6 +143,28 @@ jobs:
           "inject $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
           exit 0
 
+      - name: A hook save, as Claude Code's Stop hook would call it
+        continue-on-error: true
+        run: |
+          Set-Location "$HOME\demo-project"
+          $transcript = "$HOME\demo-project\hook-transcript.jsonl"
+          Set-Content -Path $transcript -Value @(
+            '{"type":"user","message":{"role":"user","content":"hello"}}',
+            '{"type":"assistant","message":{"role":"assistant","content":"hi"}}'
+          )
+          # claude-code only trusts transcripts under ~/.claude/projects, so the session copy lives there
+          $sessionTranscript = "$HOME\.claude\projects\demo-project\ci-hook-1.jsonl"
+          New-Item -ItemType Directory -Force -Path "$HOME\.claude\projects\demo-project" | Out-Null
+          Copy-Item $transcript $sessionTranscript
+          $payload = @{ session_id = "ci-hook-1"; transcript_path = $sessionTranscript; cwd = (Get-Location).Path; hook_event_name = "Stop" } | ConvertTo-Json -Compress
+          $payload | mida-hook claude-code 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\hook-save.txt"
+          "hook-save $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          "--- files in the Mida home's queue folder ---"
+          if (Test-Path "$HOME\.mida\queue") {
+            Get-ChildItem -Recurse -File "$HOME\.mida\queue" | ForEach-Object { $_.FullName.Substring("$HOME\.mida".Length + 1) } | Sort-Object | Tee-Object "$env:RUNNER_TEMP\log\hook-save-queue.txt"
+          } else { "no queue folder" | Tee-Object "$env:RUNNER_TEMP\log\hook-save-queue.txt" }
+          exit 0
+
       - name: What Mida left on disk, and what is running
         continue-on-error: true
         run: |
@@ -156,6 +207,9 @@ jobs:
           update: "true"
           additional-packages: curl ca-certificates expect git
 
+      - uses: actions/checkout@v4
+        if: inputs.from == 'source'
+
       - name: The machine
         run: |
           uname -a
@@ -168,10 +222,37 @@ jobs:
           mkdir -p /tmp/log
 
       - name: Install from npm
+        if: inputs.from == 'npm'
         run: |
           npm install -g "mida-context@${{ inputs.version }}"
           which mida midad mida-hook mida-inject mida-mcp
           npm ls -g mida-context
+
+      - name: Build and install from source
+        if: inputs.from == 'source'
+        env:
+          CHECKOUT_DIR: ${{ github.workspace }}
+        run: |
+          set -o pipefail
+          SRC="$CHECKOUT_DIR"
+          case "$SRC" in
+            [A-Za-z]:*)
+              drive=$(printf '%s' "$SRC" | cut -c1 | tr '[:upper:]' '[:lower:]')
+              rest=$(printf '%s' "$SRC" | cut -c4- | tr '\\' '/')
+              SRC="/mnt/$drive/$rest"
+              ;;
+          esac
+          echo "checked-out workspace: $SRC"
+          test -f "$SRC/package.json"
+          cp -r "$SRC/." "$HOME/mida-src"
+          cd "$HOME/mida-src"
+          git rev-parse HEAD | tee /tmp/log/commit.txt
+          corepack enable
+          pnpm --version | tee /tmp/log/pnpm-version.txt
+          pnpm install --frozen-lockfile 2>&1 | tee /tmp/log/pnpm-install.txt
+          pnpm build:publish 2>&1 | tee /tmp/log/build-publish.txt
+          npm install -g ./publish/cli 2>&1 | tee /tmp/log/install.txt
+          which mida midad mida-hook mida-inject mida-mcp
 
       - name: mida init
         run: |
