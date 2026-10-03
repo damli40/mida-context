@@ -6,7 +6,8 @@
 # The gated steps prove one end to end pass: init, a request for each of two agents, a
 # typed approve, one saved checkpoint handed to codex at session start, a Stop hook
 # capture that lands in the queue, and a revoke that ends the handoff. If any of them
-# fails the job fails.
+# fails the job fails. The revoke gate requires the revoke refusal line, and the hook
+# gate requires the hook's own "enqueued" log line.
 #
 # The steps whose names end in "record only: needs Batch 2" exercise mida install and
 # everything that depends on it: the hook entries it writes into Claude Code's and
@@ -227,15 +228,20 @@ jobs:
           $transcript = "$HOME\.claude\projects\ci\s.jsonl"
           New-Item -ItemType Directory -Force -Path (Split-Path $transcript) | Out-Null
           Set-Content -Path $transcript -Value '{"type":"user","message":{"role":"user","content":"ci"}}'
-          $before = 0
-          if (Test-Path "$HOME\.mida\queue") { $before = (Get-ChildItem "$HOME\.mida\queue" -Recurse -File | Measure-Object).Count }
-          $payload = @{ session_id = "ci-capture"; transcript_path = $transcript; cwd = (Get-Location).Path; hook_event_name = "Stop" } | ConvertTo-Json -Compress
+          $payload = @{ session_id = "ci-capture-direct"; transcript_path = $transcript; cwd = (Get-Location).Path; hook_event_name = "Stop" } | ConvertTo-Json -Compress
           $payload | mida-hook claude-code 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\hook-capture.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $after = 0
-          if (Test-Path "$HOME\.mida\queue") { $after = (Get-ChildItem "$HOME\.mida\queue" -Recurse -File | Measure-Object).Count }
-          "queue files: before=$before after=$after"
-          if ($after -le $before) { "FAIL: the Stop hook wrote nothing to the queue"; exit 1 }
+          $hookLog = "$HOME\.mida\logs\hook.jsonl"
+          if (-not (Test-Path $hookLog)) { "FAIL: the hook log $hookLog does not exist"; exit 1 }
+          $enqueued = $null
+          foreach ($line in Get-Content $hookLog) {
+            try { $entry = $line | ConvertFrom-Json } catch { continue }
+            if ($entry.agent -eq "claude-code" -and $entry.event -eq "Stop" -and $entry.sessionId -eq "ci-capture-direct" -and $entry.outcome -eq "enqueued" -and $entry.jobId) { $enqueued = $entry }
+          }
+          if ($null -eq $enqueued) { "FAIL: the Stop hook did not enqueue a job"; exit 1 }
+          "enqueued job: $($enqueued.jobId)"
+          if (Test-Path "$HOME\.mida\queue\bad\$($enqueued.jobId).json") { "FAIL: the queued job was rejected as malformed"; exit 1 }
+          if (Test-Path "$HOME\.mida\queue\$($enqueued.jobId).json") { "queue file $($enqueued.jobId).json is still in the queue" } else { "queue file $($enqueued.jobId).json was already drained" }
 
       - name: Revoke codex, then its next session gets nothing
         run: |
@@ -248,6 +254,7 @@ jobs:
           $payload | mida-inject codex 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\handoff-after-revoke.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Select-String -Path "$env:RUNNER_TEMP\log\handoff-after-revoke.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet) { "FAIL: a revoked agent still received the checkpoint"; exit 1 }
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\log\handoff-after-revoke.txt" -SimpleMatch "(revoked by the owner)" -Quiet)) { "FAIL: the handoff after revoke did not name the revoke as the reason"; exit 1 }
 
       - name: Key files are readable only by this user
         run: |
@@ -256,10 +263,18 @@ jobs:
           pwsh "$env:GITHUB_WORKSPACE\scripts\windows-ci\check-acl.ps1" "$HOME\.mida\owner\secrets.json" "$HOME\.mida\midad.sock.path" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\check-acl.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Collect Mida's own logs
+        if: always()
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Continue"
+          if (Test-Path "$HOME\.mida\logs") {
+            Copy-Item "$HOME\.mida\logs" "$env:RUNNER_TEMP\log\mida-logs" -Recurse -Force
+          }
+          exit 0
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: windows-first-run-log
-          path: |
-            ${{ runner.temp }}\log
-            ~\.mida\logs
+          path: ${{ runner.temp }}\log

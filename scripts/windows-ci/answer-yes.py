@@ -2,7 +2,8 @@
 
 Usage: python answer-yes.py <program> [args...]
 Approve and revoke refuse to run without a real terminal; pywinpty gives them one.
-Exit code: the command's own, or 124 when it is still running after 240 seconds.
+Exit code: the command's own, 1 when the command's exit status is unknown, or 124
+when it is still running after 240 seconds.
 """
 import re
 import sys
@@ -27,6 +28,13 @@ while proc.isalive() and time.time() < deadline:
         proc.write("yes\r\n")
         seen = ""
 if proc.isalive():
+    grace = time.time() + 10
+    while proc.isalive() and time.time() < grace:
+        time.sleep(0.1)
+if proc.isalive():
     proc.terminate(force=True)
     sys.exit(124)
-sys.exit(proc.exitstatus or 0)
+if proc.exitstatus is None:
+    print("answer-yes: the command's exit status is unknown", file=sys.stderr)
+    sys.exit(1)
+sys.exit(proc.exitstatus)
