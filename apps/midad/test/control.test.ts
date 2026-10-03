@@ -837,8 +837,8 @@ describe("Windows: the pipe must prove it is this service's before a request bod
     try {
       const reply = await callDaemon(home, "/cli", { argv: ["handoff", "codex"], cwd: "C:\\work" }, { timeoutMs: 2_000, platform: "win32" })
       expect(reply).toEqual({ status: 0, body: null, failure: "unreachable" })
-      // the only thing the impostor ever saw was the bodyless health probe
-      expect(seen).toEqual([{ method: "GET", url: "/health", body: "" }])
+      // the only thing the impostor ever saw was the bodyless ping probe
+      expect(seen).toEqual([{ method: "GET", url: "/ping", body: "" }])
     } finally {
       await close(server)
     }
@@ -852,7 +852,7 @@ describe("Windows: the pipe must prove it is this service's before a request bod
     try {
       const reply = await callDaemon(home, "/cli", { argv: ["handoff"] }, { timeoutMs: 2_000, platform: "win32" })
       expect(reply.failure).toBe("unreachable")
-      expect(seen.map((r) => `${r.method} ${r.url}`)).toEqual(["GET /health"])
+      expect(seen.map((r) => `${r.method} ${r.url}`)).toEqual(["GET /ping"])
     } finally {
       await close(server)
     }
@@ -863,13 +863,80 @@ describe("Windows: the pipe must prove it is this service's before a request bod
     const stand = standPath()
     writeFileSync(home.path("midad.sock.path"), `${stand}\n${TOKEN}`)
     const { server, seen } = await serve(stand, (req) =>
-      req.url === "/health" ? { status: 200, token: TOKEN, body: { ok: true, pid: 7 } } : { status: 200, token: TOKEN, body: { code: 0, lines: ["done"] } },
+      req.url === "/ping" ? { status: 200, token: TOKEN, body: { ok: true, pid: 7 } } : { status: 200, token: TOKEN, body: { code: 0, lines: ["done"] } },
     )
     try {
       const reply = await callDaemon(home, "/cli", { argv: ["handoff", "codex"] }, { timeoutMs: 2_000, platform: "win32" })
       expect(reply.status).toBe(200)
       expect(reply.body).toEqual({ code: 0, lines: ["done"] })
-      expect(seen.map((r) => `${r.method} ${r.url}`)).toEqual(["GET /health", "POST /cli"])
+      expect(seen.map((r) => `${r.method} ${r.url}`)).toEqual(["GET /ping", "POST /cli"])
+    } finally {
+      await close(server)
+    }
+  })
+
+  it("the real request rides the same connection the probe proved", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    writeFileSync(home.path("midad.sock.path"), `${stand}\n${TOKEN}`)
+    const sockets = new Set<Socket>()
+    const seen: string[] = []
+    const server = createHttpServer((req, res) => {
+      sockets.add(req.socket)
+      const chunks: Buffer[] = []
+      req.on("data", (c) => chunks.push(c))
+      req.on("end", () => {
+        seen.push(`${req.method} ${req.url}`)
+        const payload = JSON.stringify({ ok: true })
+        res.writeHead(200, { "content-type": "application/json", "x-mida-token": TOKEN })
+        res.end(payload)
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(stand, () => resolve()))
+    try {
+      const reply = await callDaemon(home, "/cli", { argv: ["handoff", "codex"] }, { timeoutMs: 2_000, platform: "win32" })
+      expect(reply.status).toBe(200)
+      expect(seen).toEqual(["GET /ping", "POST /cli"])
+      // the token check and the body travelled ONE connection — a squatter that takes the
+      // pipe name between them never sees either
+      expect(sockets.size).toBe(1)
+    } finally {
+      await close(server)
+    }
+  })
+
+  it("a squatter that takes the pipe between the two connections has its answer refused as unreachable", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    writeFileSync(home.path("midad.sock.path"), `${stand}\n${TOKEN}`)
+    const sockets: Socket[] = []
+    const seen: string[] = []
+    const server = createHttpServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on("data", (c) => chunks.push(c))
+      req.on("end", () => {
+        seen.push(`${req.method} ${req.url}`)
+        const payload = JSON.stringify({ ok: true })
+        if (req.socket === sockets[0]) {
+          // connection 1 is the service mid-stop: it proves the token, then drops, and the
+          // client's next request lands on a connection another account may own
+          res.writeHead(200, { "content-type": "application/json", "x-mida-token": TOKEN, connection: "close" })
+        } else {
+          // the squatter: a polite 200, but it cannot name the pointer's secret
+          res.writeHead(200, { "content-type": "application/json" })
+        }
+        res.end(payload)
+      })
+    })
+    server.on("connection", (socket) => sockets.push(socket))
+    await new Promise<void>((resolve) => server.listen(stand, () => resolve()))
+    try {
+      const reply = await callDaemon(home, "/cli", { argv: ["handoff", "codex"] }, { timeoutMs: 2_000, platform: "win32" })
+      // the squatter did receive the body on connection 2 — but its answer is refused rather
+      // than trusted, because the reply itself never proved this start's token
+      expect(reply).toEqual({ status: 0, body: null, failure: "unreachable" })
+      expect(sockets).toHaveLength(2)
+      expect(seen).toEqual(["GET /ping", "POST /cli"])
     } finally {
       await close(server)
     }

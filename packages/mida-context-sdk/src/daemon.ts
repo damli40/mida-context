@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs"
-import { request } from "node:http"
+import { Agent, request } from "node:http"
 import { homedir, tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 import { sha256 } from "@noble/hashes/sha2.js"
@@ -30,7 +30,7 @@ export function resolveMidaHome(home: string | undefined, env: Record<string, st
 
 /**
  * The pointer's two lines on Windows: the pipe name, then the secret this service start answers
- * /health with. A one-line pointer predates the token, and the name it carries could have been
+ * /ping with. A one-line pointer predates the token, and the name it carries could have been
  * re-created by another account on the PC, so it reads as no pointer at all.
  */
 function pipePointerFor(home: string): { name: string; token: string } | undefined {
@@ -74,7 +74,7 @@ export function socketPathFor(home: string, base: string = tmpdir(), platform: N
 /**
  * The channel a client may use: the address, and on Windows the proof it must see before trusting
  * it, that being the token the pointer names, which only the service that wrote the pointer can
- * answer /health with. Mac and Linux channels carry no token; the socket file's own permissions
+ * answer /ping with. Mac and Linux channels carry no token; the socket file's own permissions
  * are the proof there.
  */
 export function channelFor(home: string, base: string = tmpdir(), platform: NodeJS.Platform = process.platform): { socketPath: string; token?: string } | undefined {
@@ -97,9 +97,12 @@ export interface DaemonReply {
  * resolves to status 0, and the caller turns that into `service-unavailable`. A body of
  * `undefined` sends GET; anything else is POSTed as JSON.
  *
- * On Windows the call is two steps: a bodyless GET /health must answer with the token the pointer
- * names, which only the service that wrote the pointer knows, and only then does the real request
- * go. A pipe that answers without the token was made by someone else and receives nothing.
+ * On Windows the call is two steps over ONE keep-alive connection: a bodyless GET /ping must
+ * answer with the token the pointer names, which only the service that wrote the pointer knows,
+ * and only then does the real request go down the same connection. A pipe that answers without
+ * the token was made by someone else and receives nothing — and a real reply that cannot prove
+ * the token is refused the same way, because a probe connection that dropped could have left
+ * the body on a pipe another account owns.
  */
 export function callDaemon(home: string, path: string, body: unknown, options: { timeoutMs: number; platform?: NodeJS.Platform }): Promise<DaemonReply> {
   return new Promise((resolve) => {
@@ -108,6 +111,7 @@ export function callDaemon(home: string, path: string, body: unknown, options: {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      agent?.destroy()
       resolve(reply)
     }
     const fail = () => finish({ status: 0, body: null })
@@ -121,6 +125,7 @@ export function callDaemon(home: string, path: string, body: unknown, options: {
     }, options.timeoutMs)
     if (typeof timer.unref === "function") timer.unref()
     let req: ReturnType<typeof request> | undefined
+    let agent: Agent | undefined
     try {
       const payload = body === undefined ? null : Buffer.from(JSON.stringify(body), "utf8")
       const channel = channelFor(home, tmpdir(), options.platform ?? process.platform)
@@ -137,6 +142,7 @@ export function callDaemon(home: string, path: string, body: unknown, options: {
               path: reqPath,
               method: data === null ? "GET" : "POST",
               headers: data === null ? {} : { "content-type": "application/json", "content-length": data.length },
+              agent,
             },
             (res) => {
               const chunks: Buffer[] = []
@@ -171,12 +177,21 @@ export function callDaemon(home: string, path: string, body: unknown, options: {
         send(path, payload, deliver)
         return
       }
-      send("/health", null, (probe) => {
+      // Windows only: the probe and the real request share one keep-alive connection — one
+      // pooled socket — so the body never leaves the connection the token check proved for a
+      // fresh one another account could own. The reply carries the token check too: a probe
+      // connection that dropped anyway (a service mid-stop does exactly that) puts the body
+      // on a second pipe, and that answer must prove itself the same way before it is trusted.
+      agent = new Agent({ keepAlive: true, maxSockets: 1 })
+      send("/ping", null, (probe) => {
         if (probe.status === 0 || probe.token !== channel.token) {
           fail()
           return
         }
-        send(path, payload, deliver)
+        send(path, payload, (answer) => {
+          if (answer.status !== 0 && answer.token === channel.token) finish({ status: answer.status, body: answer.body })
+          else fail()
+        })
       })
     } catch {
       fail()

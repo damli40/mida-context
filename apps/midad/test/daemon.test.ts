@@ -804,7 +804,7 @@ describe("startDaemon on Windows", () => {
       const [name, token] = readFileSync(home.path("midad.sock.path"), "utf8").split("\n")
       expect(name).toBe(stand)
       expect(token).toMatch(/^[0-9a-f]{64}$/)
-      // the Windows client preflights /health with the pointer's token, and it passes
+      // the Windows client preflights /ping with the pointer's token, and it passes
       expect((await callDaemon(home, "/health", undefined, { timeoutMs: 2_000, platform: "win32" })).status).toBe(200)
     } finally {
       await handle.close()
@@ -825,6 +825,50 @@ describe("startDaemon on Windows", () => {
         }).end()
       })
       expect(headers["x-mida-token"]).toBe(token)
+    } finally {
+      await handle.close()
+    }
+  })
+
+  it("the /ping and /health replies keep the connection open so the request that follows rides the proven one", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    const handle = await startDaemon({ ...setup().deps, home, platform: "win32", pipeName: () => stand })
+    const headersOf = (path: string) =>
+      new Promise<Record<string, unknown>>((resolve) => {
+        httpRequest({ socketPath: stand, path, method: "GET" }, (res) => {
+          res.resume()
+          res.on("end", () => resolve(res.headers))
+        }).end()
+      })
+    try {
+      // keep-alive is what lets the client send its real request down the connection the
+      // token check already proved, instead of a fresh one a squatter could own
+      expect((await headersOf("/ping"))["connection"]).toBe("keep-alive")
+      expect((await headersOf("/health"))["connection"]).toBe("keep-alive")
+    } finally {
+      await handle.close()
+    }
+  })
+
+  it("the Windows preflight costs no queue read: /ping proves the token without listJobs", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    let queueReads = 0
+    const listJobsSpy: typeof listJobs = (h) => {
+      queueReads += 1
+      return listJobs(h)
+    }
+    const handle = await startDaemon({ ...setup().deps, home, platform: "win32", pipeName: () => stand, listJobs: listJobsSpy })
+    try {
+      // a whole Windows callDaemon roundtrip — the probe plus the real request — touches
+      // /ping only, so the hook's 150 ms kick never waits on the queue being parsed
+      const reply = await callDaemon(home, "/cli", { argv: ["read", "codex", "p1"] }, { timeoutMs: 2_000, platform: "win32" })
+      expect(reply.status).toBe(200)
+      expect(queueReads).toBe(0)
+      // /health still reports the depth; it remains the only reader that pays for the listing
+      expect((await callDaemon(home, "/health", undefined, { timeoutMs: 2_000, platform: "win32" })).status).toBe(200)
+      expect(queueReads).toBe(1)
     } finally {
       await handle.close()
     }
@@ -893,8 +937,8 @@ describe("startDaemon on Windows", () => {
         const [name, token] = readFileSync(home.path("midad.sock.path"), "utf8").split("\n")
         expect(name).toBe(stand)
         expect(token).toMatch(/^[0-9a-f]{64}$/)
-        // the impostor saw the bodyless health probe at most, never a real request
-        expect(seen.every((line) => line.startsWith("GET /health "))).toBe(true)
+        // the impostor saw the bodyless ping probe at most, never a real request
+        expect(seen.every((line) => line.startsWith("GET /ping "))).toBe(true)
         // and the fresh service answers its own token check
         expect((await callDaemon(home, "/health", undefined, { timeoutMs: 2_000, platform: "win32" })).status).toBe(200)
       } finally {

@@ -83,6 +83,8 @@ export interface DaemonDeps {
   platform?: NodeJS.Platform
   /** The Windows pipe address this service binds; default a fresh random name per start. Tests inject a stand-in. */
   pipeName?: () => string
+  /** Queue listing for /health and the save loop; default the real listJobs — tests inject a counting spy. */
+  listJobs?: typeof listJobs
 }
 
 export interface DaemonHandle {
@@ -119,9 +121,9 @@ function readBody(req: IncomingMessage): Promise<Buffer | "overflow" | "failed">
   })
 }
 
-function respond(res: ServerResponse, status: number, body: unknown, token?: string): void {
+function respond(res: ServerResponse, status: number, body: unknown, token?: string, keepAlive = false): void {
   const payload = JSON.stringify(body ?? null)
-  const headers: Record<string, string | number> = { "content-type": "application/json", "content-length": Buffer.byteLength(payload), connection: "close" }
+  const headers: Record<string, string | number> = { "content-type": "application/json", "content-length": Buffer.byteLength(payload), connection: keepAlive ? "keep-alive" : "close" }
   // Windows only: every reply carries this start's secret, so a client can tell this pipe
   // from one another account re-created under a name the pointer still records.
   if (token !== undefined) headers["x-mida-token"] = token
@@ -149,7 +151,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   // Windows: the address is a fresh named pipe per start, never a computed name a caller could
   // guess or another account could create first. On Mac/Linux it is the usual socket path.
   const socketPath = windows ? (deps.pipeName ?? newPipeName)() : socketPathFor(home, socketBase)!
-  // Windows only: the secret this start answers /health with, written into the pointer's second
+  // Windows only: the secret this start answers /ping with, written into the pointer's second
   // line so a client can tell this pipe from one a stale name left for another account to take.
   const pipeToken = windows ? randomBytes(32).toString("hex") : undefined
   const pointerFile = `${SOCKET_FILE}.path`
@@ -160,6 +162,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   const drain = deps.drain ?? drainUntilSettled
   const runCli = deps.runCli ?? runCliWithRuntime
   const identity = deps.identity ?? codeIdentity()
+  const listQueueJobs = deps.listJobs ?? listJobs
 
   // in-40 L-5: a chain that answers getCode with empty code has no Multicall3, so every read
   // there takes the per-row path — the daemon reports that verdict to its own log once per
@@ -219,7 +222,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   const runPasses = async (): Promise<void> => {
     for (;;) {
       if (stopped) return
-      const queued = listJobs(home)
+      const queued = listQueueJobs(home)
       if (queued.length === 0) return
       // the flush jobs waiting before this pass — compared against the set after it to tell "a
       // new flush job arrived mid-pass" from "the same job is still queued", which means the
@@ -275,7 +278,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         return
       }
       if (stopped) return
-      const waiting = listJobs(home)
+      const waiting = listQueueJobs(home)
       const flushNow = waiting.filter((job) => FLUSH_EVENTS.has(job.event))
       if (waiting.length === 0 || flushNow.length === 0) return
       // go again at once only when the pass made progress or a flush job genuinely arrived
@@ -304,11 +307,19 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       })
   }
 
-  const reply = (res: ServerResponse, status: number, body: unknown): void => respond(res, status, body, pipeToken)
+  const reply = (res: ServerResponse, status: number, body: unknown, keepAlive = false): void => respond(res, status, body, pipeToken, keepAlive)
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    // Windows only: /ping is the token preflight — it proves this start's secret without paying
+    // for the queue listing /health reports, so a hook's 150 ms kick never waits on the parse.
+    if (req.method === "GET" && req.url === "/ping") {
+      reply(res, 200, { ok: true }, windows)
+      return
+    }
     if (req.method === "GET" && req.url === "/health") {
-      reply(res, 200, { ok: true, pid: process.pid, startedAt, queueDepth: listJobs(home).length, codeRoot: identity.codeRoot, codeCommit: identity.codeCommit, codeVersion: identity.codeVersion, summarizer: summarizerSummary(currentSummarizer(home, process.env)) })
+      // Windows only: the reply stays open so the client's real request reuses the connection
+      // this token just proved — the keep-alive is the only GET on the socket that needs it.
+      reply(res, 200, { ok: true, pid: process.pid, startedAt, queueDepth: listQueueJobs(home).length, codeRoot: identity.codeRoot, codeCommit: identity.codeCommit, codeVersion: identity.codeVersion, summarizer: summarizerSummary(currentSummarizer(home, process.env)) }, windows)
       return
     }
     if (req.method !== "POST") {
@@ -603,6 +614,9 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       if (inFlight !== null) {
         await Promise.race([inFlight, realSleep(passWaitCapMs)])
       }
+      // a Windows keep-alive probe connection can still be open at shutdown — drop idle ones
+      // now so close() does not wait out their keep-alive timeout
+      server.closeIdleConnections()
       await new Promise<void>((done) => server.close(() => done()))
       if (!windows) {
         try {

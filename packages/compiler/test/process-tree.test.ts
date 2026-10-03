@@ -2,11 +2,13 @@ import { describe, expect, it } from "vitest"
 import { killProcessTree } from "../src/process-tree.js"
 
 describe("killProcessTree", () => {
-  it("on Windows calls taskkill by its System32 path and takes the children with it", () => {
+  it("on Windows calls taskkill by its System32 path and takes the children with it, and cannot hang", () => {
     const calls: unknown[][] = []
     killProcessTree(321, { platform: "win32", spawnSync: ((...a: unknown[]) => { calls.push(a); return { status: 0 } }) as never })
     expect(calls[0]![0]).toBe(`${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`)
     expect(calls[0]![1]).toEqual(["/pid", "321", "/T", "/F"])
+    // a wedged taskkill is abandoned after five seconds so the caller can kill the direct child
+    expect(calls[0]![2]).toEqual({ stdio: "ignore", windowsHide: true, timeout: 5000 })
   })
 
   it("a taskkill that cannot run throws, so the caller falls back to the direct child", () => {

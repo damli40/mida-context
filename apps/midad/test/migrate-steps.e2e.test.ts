@@ -28,6 +28,8 @@ import type { MigrateSeed } from "./helpers-migrate.js"
 
 const TIMEOUT = 300_000
 const MIGRATED_AT = "2026-09-23T12:00:00.000Z"
+// the ISO stamp as it appears in file and folder names: ":" is not a Windows filename
+const MIGRATED_STAMP = MIGRATED_AT.replace(/:/g, "-")
 
 const AGENT_REGISTERED = capabilityRegistryAbi.find((e) => e.type === "event" && e.name === "AgentRegistered") as AbiEvent
 const CAPABILITY_GRANTED = capabilityRegistryAbi.find((e) => e.type === "event" && e.name === "CapabilityGranted") as AbiEvent
@@ -280,7 +282,9 @@ describe("migrate state machine on local Anvil (migrate B5)", () => {
       expect(loadAgentIdentity(seeded.home, "claude-code")!.agentId.toLowerCase()).toBe(newAgentId.toLowerCase())
       expect(existsSync(seeded.home.path("migrate/in-progress"))).toBe(false)
       expect(existsSync(seeded.home.path("migrate/target"))).toBe(false)
-      expect(existsSync(seeded.home.path(`migrate/backup-${MIGRATED_AT}/network.json`))).toBe(true)
+      const backup = `migrate/backup-${MIGRATED_STAMP}`
+      expect(backup).not.toContain(":")
+      expect(existsSync(seeded.home.path(`${backup}/network.json`))).toBe(true)
 
       // A home already on the target has nothing to move.
       const again = await runMigrate(seeded)
@@ -447,6 +451,21 @@ describe("migrate state machine on local Anvil (migrate B5)", () => {
       const logs = await targetLogs(seeded, manifest.agentMap["claude-code"]!.newAgentId!)
       expect(logs.records).toBe(10)
       expect(logs.agentRegistrations).toBe(1)
+    },
+    TIMEOUT,
+  )
+
+  it(
+    "the backup folder's name carries no ':' (a Windows filename cannot hold one)",
+    async () => {
+      const seeded = await seedHome()
+      const first = await runMigrate(seeded, { stopAfter: "backed-up" })
+      expect(first).toEqual({ stopped: true })
+      const backups = seeded.home.list("migrate").filter((name) => name.startsWith("backup-"))
+      expect(backups).toEqual([`backup-${MIGRATED_STAMP}`])
+      expect(existsSync(seeded.home.path(`migrate/backup-${MIGRATED_STAMP}/network.json`))).toBe(true)
+      // the stamp inside the data keeps its ISO colons; only the name lost them
+      expect(seeded.home.readJson<{ migratedAt: string }>("migrate/state.json")!.migratedAt).toBe(MIGRATED_AT)
     },
     TIMEOUT,
   )

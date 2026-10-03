@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
+import type { Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Mida, MidaSdkError, isMidaSdkError } from "../src/index.js"
@@ -116,7 +117,7 @@ describe("LocalTransport with no Mida service running", () => {
     try {
       const reply = await callDaemon(home, "/remember", { agent: "codex", namespace: "projects.current", content: "x" }, { timeoutMs: 2_000, platform: "win32" })
       expect(reply.status).toBe(0)
-      expect(seen).toEqual([{ method: "GET", url: "/health", body: "" }])
+      expect(seen).toEqual([{ method: "GET", url: "/ping", body: "" }])
     } finally {
       server.closeAllConnections()
       await new Promise<void>((resolve) => server.close(() => resolve()))
@@ -138,6 +139,44 @@ describe("LocalTransport with no Mida service running", () => {
       const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 2_000, platform: "win32" })
       expect(reply.status).toBe(200)
       expect(reply.body).toEqual({ ok: true, pid: 9 })
+    } finally {
+      server.closeAllConnections()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it("on Windows a squatter answering the second connection is refused — the real reply must prove the token too", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sdk-win-"))
+    const stand = join(mkdtempSync(join(tmpdir(), "sdk-pipe-")), "p.sock")
+    const token = "cd".repeat(32)
+    writeFileSync(join(home, "midad.sock.path"), `${stand}\n${token}`)
+    const sockets: Socket[] = []
+    const seen: string[] = []
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on("data", (c) => chunks.push(c))
+      req.on("end", () => {
+        seen.push(`${req.method} ${req.url}`)
+        const payload = JSON.stringify({ ok: true })
+        if (req.socket === sockets[0]) {
+          // connection 1 is the service mid-stop: proves the token, then drops — the body
+          // lands on a connection another account may own
+          res.writeHead(200, { "content-type": "application/json", "x-mida-token": token, connection: "close" })
+        } else {
+          // the squatter cannot name the pointer's secret
+          res.writeHead(200, { "content-type": "application/json" })
+        }
+        res.end(payload)
+      })
+    })
+    server.on("connection", (socket) => sockets.push(socket))
+    await new Promise<void>((resolve) => server.listen(stand, () => resolve()))
+    try {
+      const reply = await callDaemon(home, "/remember", { agent: "codex", namespace: "projects.current", content: "x" }, { timeoutMs: 2_000, platform: "win32" })
+      expect(reply.status).toBe(0)
+      expect(sockets).toHaveLength(2)
+      expect(seen).toEqual(["GET /ping", "POST /remember"])
     } finally {
       server.closeAllConnections()
       await new Promise<void>((resolve) => server.close(() => resolve()))

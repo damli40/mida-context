@@ -87,10 +87,21 @@ export function enqueue(
   return full
 }
 
+/**
+ * Job names lead with the enqueue instant, but an upgrade can leave old ":" names beside new
+ * "-" ones — ":" sorts after "-" bytewise, so a raw order puts an older ":" job behind a newer
+ * one. Comparing each name with ":" swapped keeps queue-time order for both shapes.
+ */
+const byQueueTime = (a: string, b: string): number => {
+  const ka = a.replace(/:/g, "-")
+  const kb = b.replace(/:/g, "-")
+  return ka < kb ? -1 : ka > kb ? 1 : 0
+}
+
 /** Oldest first. Files that will not parse or lack the job shape are moved to `queue/bad/`. */
 export function listJobs(home: MidaHome): CaptureJob[] {
   const jobs: CaptureJob[] = []
-  for (const name of home.list("queue").filter((n) => n.endsWith(".json")).sort()) {
+  for (const name of home.list("queue").filter((n) => n.endsWith(".json")).sort(byQueueTime)) {
     try {
       const job = asJob(home.readJson<unknown>(`queue/${name}`), name.slice(0, -".json".length))
       if (job === undefined) throw new Error("not a job file")
@@ -112,7 +123,7 @@ export function listJobs(home: MidaHome): CaptureJob[] {
  */
 export function peekJobs(home: MidaHome, limit = Number.POSITIVE_INFINITY): CaptureJob[] {
   const jobs: CaptureJob[] = []
-  for (const name of home.list("queue").filter((n) => n.endsWith(".json")).sort().slice(0, limit)) {
+  for (const name of home.list("queue").filter((n) => n.endsWith(".json")).sort(byQueueTime).slice(0, limit)) {
     try {
       const job = asJob(home.readJson<unknown>(`queue/${name}`), name.slice(0, -".json".length))
       if (job !== undefined) jobs.push(job)

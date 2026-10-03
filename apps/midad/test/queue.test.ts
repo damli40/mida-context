@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { MidaHome, enqueue, listJobs, projectIdFor, removeJob } from "@mida/midad"
+import { MidaHome, enqueue, listJobs, peekJobs, projectIdFor, removeJob } from "@mida/midad"
 
 const T0 = new Date("2026-09-21T10:00:00.000Z")
 const T1 = new Date("2026-09-21T10:00:01.000Z")
@@ -65,6 +65,17 @@ describe("capture queue", () => {
     expect(jobs.map((j) => j.id)).toEqual([oldId, saved.id])
     removeJob(home, oldId)
     expect(listJobs(home).map((j) => j.id)).toEqual([saved.id])
+  })
+
+  it("an old ':' name and a new '-' name sort by the time they were queued, not their bytes", () => {
+    const home = tempHome()
+    // a 0.1.3 hook wrote ":" into the name; after an upgrade it can sit next to "-" names, and
+    // ":" sorts after "-" bytewise, yet the 14:05 job must still come before the 14:30 one
+    const oldId = "2026-09-21T14:05:00.000Z-deadbeef"
+    home.writeSecretJson(`queue/${oldId}.json`, { ...job(), at: "2026-09-21T14:05:00.000Z" })
+    const newer = enqueue(home, job({ sessionId: "s2" }), () => new Date("2026-09-21T14:30:00.000Z"))
+    expect(listJobs(home).map((j) => j.id)).toEqual([oldId, newer.id])
+    expect(peekJobs(home).map((j) => j.id)).toEqual([oldId, newer.id])
   })
 
   it("moves a corrupt job file to queue/bad and still lists the rest", () => {

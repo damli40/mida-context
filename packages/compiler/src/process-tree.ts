@@ -20,9 +20,10 @@ export function killProcessTree(
     const run = opts.spawnSync ?? spawnSync
     // The full path: a PATH that lacks System32 must not lose the tree kill. A non-zero exit
     // throws so the caller's direct-child fallback runs; 128 means the pid was already gone,
-    // which is the outcome wanted.
+    // which is the outcome wanted. The five-second timeout keeps a wedged taskkill from hanging
+    // the caller — the same fallback then runs.
     const root = process.env.SystemRoot ?? "C:\\Windows"
-    const result = run(`${root}\\System32\\taskkill.exe`, ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
+    const result = run(`${root}\\System32\\taskkill.exe`, ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, timeout: 5000 })
     if (result.error !== undefined) throw result.error
     if (result.status !== 0 && result.status !== 128) throw new Error(`taskkill exited ${result.status}`)
     return
