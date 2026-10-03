@@ -26,7 +26,9 @@ import { SUMMARY_FAILURE_REASONS, sessionWaits } from "./drain.js"
 import { currentSummarizer } from "./summarizer.js"
 import { CODEX_TRUST_SENTENCE, claudeCodeMcpStatus, claudeDesktopConfigPath, claudeHooksStatus, claudeUserConfigPath, codexHooksStatus, codexMcpStatus, cursorMcpConfigPath, devinHooksStatus, installedMcpLauncherPath, macosProtectedFolderNote, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
 import type { InstallTool, McpClientTool } from "./install.js"
-import { isRevoked, listAgentNames, loadAgentIdentity, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
+import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
+import { expandScopeInputs } from "@mida/grant-advisor"
+import { expectedScopesFor, liveCapabilityIdsOf, recordedCoverage } from "./skeleton.js"
 import type { OwnerMode } from "./keys.js"
 import { approvalsFileStatus, readApprovalsFile } from "./projects.js"
 import { listJobs } from "./queue.js"
@@ -713,7 +715,29 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           const now = await chain.reader.now()
           const live = views.filter((v) => !v.revoked && (v.expiresAt === 0n || now < v.expiresAt))
           if (live.length > 0) {
-            lines.push(`ok: ${name} approved`)
+            // UF-APR: "approved on chain" is only half the truth, and a grants.json file existing
+            // is the other half ONLY when its capabilities still cover what the chain holds —
+            // a stale grant from before a revoke, or a file that cannot be read, is no record.
+            const covered = recordedCoverage(
+              home,
+              name,
+              await liveCapabilityIdsOf(chain.reader, owner, identity!.agentId),
+              expandScopeInputs(expectedScopesFor(identity!.purposeId)),
+            )
+            if (!covered) {
+              // assistant's grant is sent by `mida init` and `mida approve assistant` is refused,
+              // so its repair is revoke-then-init; a passkey home has no local owner key for
+              // approve to sign with, so its repair walks through request again.
+              lines.push(
+                ownerModeOf(home) === "passkey"
+                  ? `PROBLEM: ${name} is approved on chain, but this machine never finished recording that approval, so ${name} cannot read or save. To repair it: mida revoke ${name}, then mida request ${name}, then mida approve ${name}.`
+                  : name === "assistant"
+                    ? `PROBLEM: assistant is approved on chain, but this machine never finished recording that approval, so assistant cannot read. Run mida revoke assistant, then mida init.`
+                    : `PROBLEM: ${name} is approved on chain, but this machine never finished recording that approval, so ${name} cannot read or save. Run mida approve ${name} to finish it.`,
+              )
+            } else {
+              lines.push(`ok: ${name} approved`)
+            }
             shared.approved!.push({ name, agentId: identity!.agentId })
           } else if (views.length === 0 && isRevoked(home, name)) {
             // an agent-level revoke empties the live capability list entirely — the marker says it

@@ -23,7 +23,7 @@ Or build it from the repo and install the tarball:
 cd mida-context
 pnpm install && pnpm build:publish
 cd publish/cli && npm pack
-npm install -g mida-context-0.1.2.tgz
+npm install -g mida-context-0.1.3.tgz
 ```
 
 Expected output (the file count may differ; the bin links are the point):

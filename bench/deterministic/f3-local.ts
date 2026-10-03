@@ -1,17 +1,13 @@
-// Group F — scale. From docs/issue-register.md §3:
-//   F1 buildHandoff read time at 1/10/50/100 stored checkpoints, 3 repeats,
-//      medians; plus save time at 100. Open measurement — a 50-checkpoint
-//      median over 8,000 ms is a RED check, and the run must stop there.
-//   F2 approve time against chain age — needs the testnet: skipped
-//   F3 worst-case input budgets: 2,500 progress entries render < 60 ms;
-//      8 MB of `{` parses < 1 s; a 100 MB transcript reads in < 1 s with < 64 MB extra peak
-//      memory and still finds a message typed in its middle (CAP-27)
-// F1 goes through the real chain and the real buildHandoff; F3 exercises the
-// real render, extractor, and transcript reader, with each transcript read
-// timed and memory-measured in a fresh child process (UF-C41C E6).
+// Local-only runner for the F3 check body. f-scale.ts brings up a full Anvil +
+// forge chain in benchChain() at module top before any check runs, which cannot
+// work in a worktree without the contracts/lib submodules. F3 itself is a
+// pure-reader check — it never touches the chain — so this file runs its body
+// exactly: same inputs, same reads, same budgets, same measured values.
+// Checked in with the rest of the bench; run with
+// `node --import tsx bench/deterministic/f3-local.ts`.
 
 import fs from "node:fs"
-import { mkdirSync, writeFileSync } from "node:fs"
+import { writeFileSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -19,12 +15,7 @@ import { performance } from "node:perf_hooks"
 import { mergeCheckpoints, renderHandoff } from "../../packages/checkpoint/src/index.js"
 import type { StoredCheckpoint } from "../../packages/checkpoint/src/index.js"
 import { extractJsonObject, readConversation } from "../../packages/compiler/src/index.js"
-import {
-  Runtime, approve, approveProject, authorNamesFor, buildHandoff, init, requestAccess,
-  saveCheckpoint,
-} from "../../apps/midad/src/index.js"
-import { benchChain, benchDir, benchHome, cleanupBenchDir, sampleCheckpoint, userLine } from "../lib/env.js"
-import { needsTestnet, runGroup, median } from "../lib/checks.js"
+import { benchDir, cleanupBenchDir, sampleCheckpoint, userLine } from "../lib/env.js"
 
 // UF-C41C E6 child mode. The parent re-runs this file once per transcript read
 // so each read's peak memory is measured against a fresh process's own
@@ -46,6 +37,8 @@ if (process.argv[2] === "--measure") {
 /** One assistant transcript line — the bulk of a long session is the agent's own output. */
 const assistantLine = (text: string) => ({ type: "assistant", message: { content: [{ type: "text", text }] } })
 
+const dir = benchDir("f")
+
 /** Times one transcript read in a fresh child; `found` is true when every marker is in its text. */
 function measureRead(file: string, markers: string[]): { readMs: number; extraPeakMb: number; found: boolean } {
   const r = spawnSync(
@@ -57,72 +50,10 @@ function measureRead(file: string, markers: string[]): { readMs: number; extraPe
   return JSON.parse(r.stdout) as { readMs: number; extraPeakMb: number; found: boolean }
 }
 
-const chain = await benchChain()
-const dir = benchDir("f")
-const home = benchHome("f")
-const runtime = await Runtime.open(home, chain.network)
-await init(runtime, ["claude-code"])
-await requestAccess(runtime, "claude-code")
-await approve(runtime, "claude-code")
-
-// F1 — red if the 50-checkpoint median crosses 8,000 ms. That red is a STOP
-// signal for the whole task: the owner decides whether a cache is the answer;
-// the benchmark reports and halts.
-async function f1() {
-  const cwd = join(dir, "work-f1")
-  mkdirSync(cwd, { recursive: true })
-  const { approval } = await approveProject(runtime, { agent: "claude-code", cwd })
-  const milestones = [1, 10, 50, 100]
-  const medians: Record<string, number> = {}
-  const saveMs: number[] = []
-  let saved = 0
-  let save100 = 0
-  for (const milestone of milestones) {
-    while (saved < milestone) {
-      saved += 1
-      const sessionId = `f1-s${Math.floor((saved - 1) / 10)}`
-      const result = await saveCheckpoint(runtime, "claude-code", {
-        projectId: approval.projectId,
-        sessionId,
-        continuesSession: null,
-        compiledBy: "bench",
-        checkpoint: sampleCheckpoint({
-          eventId: `ev-f1-${String(saved).padStart(4, "0")}`,
-          createdAt: new Date(Date.parse("2026-09-21T10:00:00Z") + saved * 1000).toISOString(),
-          objective: "scale read",
-          progress: [`entry ${saved}`],
-        }),
-      })
-      saveMs.push(result.milliseconds)
-      if (saved === 100) save100 = result.milliseconds
-    }
-    const times: number[] = []
-    for (let r = 0; r < 3; r += 1) {
-      const t0 = performance.now()
-      await buildHandoff(runtime, { agent: "claude-code", cwd, authorNames: authorNamesFor(runtime) })
-      times.push(performance.now() - t0)
-    }
-    medians[String(milestone)] = Math.round(median(times) * 10) / 10
-  }
-  const median50 = medians["50"]!
-  return {
-    pass: median50 <= 8_000,
-    value: median50,
-    limit: 8_000,
-    unit: "ms",
-    detail: { medians, saveMsAt100: Math.round(save100 * 10) / 10, saveMsMedian: Math.round(median(saveMs) * 10) / 10 },
-  }
-}
-
-// F3 — red if any worst-case input escapes its budget: the render must stay
-// linear, the extractor must give up on unclosed JSON fast, and the transcript
-// reader must stay fast and small on a 100 MB file. CAP-27: the old budget was
-// bytes read (< 131 KB, a tail window), but PROV-09's fix streams the WHOLE file
-// on purpose, so no message the user typed in the unread middle is ever lost.
-// What matters is what that costs: time and peak memory (CAP-16's failure was
-// 438 MB of memory, not bytes) — and that the middle message is really found.
+// F3 — the f-scale.ts body verbatim: 2,500 progress entries render < 60 ms,
+// 8 MB of unclosed braces parse < 1 s, a 100 MB transcript reads < 1 s with
+// < 64 MB extra peak memory and still finds the messages typed in its middle.
 async function f3() {
-  // 2,500 progress entries through the real merge+render path
   const fat = sampleCheckpoint({
     eventId: "ev-f3-01",
     createdAt: "2026-09-21T10:00:00.000Z",
@@ -137,15 +68,11 @@ async function f3() {
   const rendered = renderHandoff(merged)
   const renderMs = performance.now() - t0
 
-  // 8 MB of unclosed braces — the extractor must fail fast, not quadratically
   const braces = "{".repeat(8 * 1024 * 1024)
   const t1 = performance.now()
   const parsed = extractJsonObject(braces)
   const parseMs = performance.now() - t1
 
-  // a 100 MB transcript of tool output with three messages the user typed in the UNREAD middle:
-  // ~1 MB past the 64 KiB head window, at ~50 MB, and ~1 MB before the 60 KB tail window — so a
-  // scan that stops early, or reads only part of the middle, misses one and turns F3 red (review)
   const big = join(dir, "f3-big.jsonl")
   writeFileSync(big, JSON.stringify(userLine("tail marker zzz")) + "\n")
   const fd = fs.openSync(big, "a")
@@ -160,9 +87,6 @@ async function f3() {
   fs.writeSync(fd, toolOutput)
   fs.writeSync(fd, Buffer.from(JSON.stringify(userLine("final tail marker")) + "\n"))
   fs.closeSync(fd)
-  // peak memory (maxRSS is a high-water mark, in KB): what the read adds above everything before it.
-  // A whole-file read (CAP-16: ~4x the file in memory) raises it far past 64 MB and turns this red;
-  // growth that stays under an earlier step's peak is not seen — this guards the big regression only.
   // The read runs in a fresh child so its peak memory is its own (E6).
   const measured = measureRead(big, [
     "early typed marker: rename the module",
@@ -185,12 +109,10 @@ async function f3() {
   }
 }
 
-// F3R — UF-C41B B2. The same transcript read, but over a REALISTIC 100 MB
-// session (the reviewer's scan100.ts shape): ~20 KB Writes, ~2 KB replies,
-// Bash commands and 3 KB tool results, real Claude key order — "type" sits at
-// each line's far end. The old scan parsed every middle assistant line up to
-// 256 KB, which took this read to about 1,100 ms; the fix marks candidates and
-// re-reads only enough to fill the trail. Same limits as F3's transcript read.
+// F3R — UF-C41B B2. The f-scale.ts F3R body verbatim: a REALISTIC 100 MB
+// session (the reviewer's scan100.ts shape) — ~20 KB Writes, ~2 KB replies,
+// Bash commands and 3 KB tool results, real Claude key order with "type" at
+// each line's far end. Same limits as F3's transcript read.
 async function f3r() {
   const asstReal = (parts: unknown[]) =>
     JSON.stringify({
@@ -282,18 +204,12 @@ async function f3r() {
 }
 
 try {
-  await runGroup([
-    { id: "F1", run: f1 },
-    needsTestnet("F2"),
-    { id: "F3", run: f3 },
-    { id: "F3R", run: f3r },
-  ])
+  const outcome = await f3()
+  console.log(JSON.stringify({ id: "F3", ...outcome }))
+  const realistic = await f3r()
+  console.log(JSON.stringify({ id: "F3R", ...realistic }))
 } finally {
-  await runtime.close()
-  await chain.env.stop()
   // UF-C41C E6: the transcript fixtures are ~300 MB of scratch; a run removes
-  // them (and the small temp Mida home) unless KEEP_BENCH_DIR=1 asks for them
-  // to stay.
+  // them unless KEEP_BENCH_DIR=1 asks for them to stay.
   cleanupBenchDir(dir)
-  cleanupBenchDir(home.root)
 }

@@ -1,6 +1,6 @@
 {
   "name": "mida-context",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "User-owned memory for AI agents: the mida command and the local Mida service.",
   "type": "module",
   "license": "MIT",

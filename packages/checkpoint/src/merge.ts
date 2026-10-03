@@ -1,4 +1,5 @@
 import { limitNote, splitLimitNote } from "./schema.js"
+import { onlyScaffolding } from "./scaffold.js"
 import type { Checkpoint, LimitList } from "./schema.js"
 
 /**
@@ -424,7 +425,13 @@ export function mergeCheckpoints(all: readonly StoredCheckpoint[]): MergedHandof
   return {
     headSessionId: chosen.newest.sessionId,
     savedAt: savedAt === undefined ? null : new Date(savedAt).toISOString(),
-    originalRequest: cps.find((c) => c.originalRequest !== null)?.originalRequest ?? null,
+    // The OLDEST request that is real user text — never one that is only Claude
+    // Code scaffolding: a save written before compile.ts re-checked the kept
+    // request can pin a <local-command-caveat> note here, and taking it would
+    // print a system note under ORIGINAL REQUEST (PROV-18). All-scaffolding
+    // answers null, so the rendered handoff simply has no request block.
+    originalRequest:
+      cps.find((c) => c.originalRequest !== null && !onlyScaffolding(c.originalRequest))?.originalRequest ?? null,
     objective: mergedField(cps, "objective", ""),
     remainingPlan: mergedField(cps, "remainingPlan", []),
     unresolvedIssue,

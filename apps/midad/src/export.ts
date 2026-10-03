@@ -6,7 +6,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { zeroHash } from "viem"
 import { CONTEXT_KIND, OWNER_AUTHOR_ID, PROVENANCE_SOURCE, RECORD_TYPE, canonicalBytes } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { mergeCheckpoints, orderTime, taskOf } from "@mida/checkpoint"
+import { mergeCheckpoints, onlyScaffolding, orderTime, taskOf } from "@mida/checkpoint"
 import type { Checkpoint, StoredCheckpoint } from "@mida/checkpoint"
 import type { MidaHome } from "./home.js"
 import { loadOwnerAddress, loadOwnerMode } from "./keys.js"
@@ -587,7 +587,10 @@ function checkpointLines(envelope: CheckpointEnvelope): string[] {
   const c = envelope.checkpoint
   const lines: string[] = [`project ${envelope.projectId} · session ${envelope.sessionId} · task ${taskOf(envelope)} · compiled by ${envelope.compiledBy}`]
   lines.push(`objective: ${c.objective}`)
-  if (c.originalRequest !== null) lines.push(`asked: ${c.originalRequest}`)
+  // UF-C41B B4 — a stored request that is only system scaffolding (a saved
+  // <local-command-caveat> and nothing else) is not the user's ask: the same
+  // onlyScaffolding test the merge and the compiler share suppresses the line.
+  if (c.originalRequest !== null && !onlyScaffolding(c.originalRequest)) lines.push(`asked: ${c.originalRequest}`)
   for (const item of c.progress) lines.push(`progress: ${item}`)
   for (const d of c.decisions) lines.push(`decision: ${d.decision} — ${d.rationale}`)
   for (const r of c.rejected) lines.push(`rejected: ${r.approach} — ${r.why}`)
@@ -634,7 +637,11 @@ function contentLines(record: SourceRecord): string[] {
       `${movedOnSuffix(migration)} — originally record ${migration.originalRecordId} on contract ${migration.originalContract}, chain ${migration.originalChainId}`,
     )
   }
-  return raw.map((line) => (line === "" ? ">" : `> ${line}`))
+  // UF-C41C E5: the entries above are logical fields, not lines; a checkpoint
+  // request, a field value, or the fenced JSON block can each carry embedded
+  // newlines. Split every one first so no continuation line ever stands
+  // outside the quote.
+  return raw.flatMap((line) => line.split(/\r?\n/)).map((line) => (line === "" ? ">" : `> ${line}`))
 }
 
 function recordsMarkdown(entries: ExportEntry[], records: readonly SourceRecord[], exportedAt: string): string {

@@ -3,7 +3,7 @@
 // transcripts and the drain-test stub compile. Nothing here decides a check —
 // checks read the chain, the server, the queue/log files, or the injected text.
 
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -35,6 +35,14 @@ export function benchDir(tag: string): string {
 
 export function benchHome(tag: string): MidaHome {
   return new MidaHome(benchDir(tag))
+}
+
+/**
+ * UF-C41C E6: removes a bench scratch folder (the transcript fixtures are
+ * hundreds of MB) unless KEEP_BENCH_DIR=1 asks for it to stay for inspection.
+ */
+export function cleanupBenchDir(dir: string): void {
+  if (process.env.KEEP_BENCH_DIR !== "1") rmSync(dir, { recursive: true, force: true })
 }
 
 /** Writes `.mida/project.json` — the marker a project folder carries. */

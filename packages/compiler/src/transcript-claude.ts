@@ -45,16 +45,21 @@
 // wherever it sits; the middle is never held in memory or read as
 // conversation.
 
+import fs from "node:fs"
+import { stripLeadingScaffolds } from "@mida/checkpoint"
 import { scrubSecrets, scrubTranscript, scrubValue } from "./scrub.js"
 import {
   ANSWER_MARK,
+  ASSISTANT_TRAIL_CHARS,
   FIRST_USER_CHARS,
   PART_CHARS,
   TAIL_BYTES,
   TAIL_ORDER,
+  USER_LINE_BYTES,
   cut,
   fitMessages,
   hardCut,
+  readRangeAt,
   readTranscriptLines,
   scanTranscript,
   twoEndedCut,
@@ -104,10 +109,15 @@ export interface Conversation {
 interface TranscriptLine {
   type?: string
   cwd?: unknown
+  timestamp?: unknown
+  /** An attachment record's payload — a queued_command's `prompt` is a mid-turn user message (PROV-17). */
+  attachment?: unknown
   /** Claude Code's own bookkeeping flag — caveat and command-echo lines carry it. */
   isMeta?: unknown
   /** Set on the condensed-history line Claude Code writes into the transcript at compact time. */
   isCompactSummary?: unknown
+  /** True on a sub-agent's record — its steps are the sidechain's work, never the main agent's. */
+  isSidechain?: unknown
   message?: { content?: unknown }
   /** Claude Code's structured copy of a tool's result — the question tool's answers live here. */
   toolUseResult?: unknown
@@ -129,54 +139,11 @@ interface ContentPart {
 
 const isPart = (p: unknown): p is ContentPart => p !== null && typeof p === "object"
 
-// Claude Code injects its own user-role lines around the human's words — the
-// /compact caveat, slash-command echoes, hook and reminder blocks. Text that
-// OPENS on one of these tags is scaffolding up to that tag's close; whatever
-// follows it is still the user's.
-const CLAUDE_SCAFFOLD_PREFIXES = [
-  "<local-command-caveat>",
-  "<command-name>",
-  "<command-message>",
-  "<command-args>",
-  "<local-command-stdout>",
-  "<local-command-stderr>",
-  "<bash-input>",
-  "<bash-stdout>",
-  "<bash-stderr>",
-  "<system-reminder>",
-  "<user-prompt-submit-hook>",
-  // IDE-injected context — a file path or selection is bookkeeping, never the
-  // user's words, and must not become the saved request (L8)
-  "<ide_opened_file>",
-  "<ide_selection>",
-]
-
-// The scaffold prefixes as bare tag names, for block stripping below.
-const CLAUDE_SCAFFOLD_TAGS = new Set(CLAUDE_SCAFFOLD_PREFIXES.map((p) => p.slice(1, -1)))
-// Tag names can carry underscores (ide_opened_file) — the class must too.
-const SCAFFOLD_OPEN = /^<([a-z][a-z0-9_-]*)(?:\s[^>]*)?>/
-
-// Strip leading injected <tag>…</tag> blocks (plus whitespace between) from a
-// user text. A real prompt may OPEN on a <system-reminder> — the reminder is
-// scaffolding but the words after it are the ask, so the block goes and the
-// rest stays. Returns "" when the text was scaffolding all the way down — the
-// whole line is then plumbing, never the request and never rendered — or when
-// an unclosed scaffold tag swallows the remainder.
-// (The isCompactSummary line is NOT in this set — the condensed history is
-// real session context and still renders; it just may not be the request.)
-// Exported so compile.ts can run a saved previous request through the same
-// test the reader uses — an empty return means the text was all scaffolding.
-export function stripLeadingScaffolds(text: string): string {
-  let t = text.trimStart()
-  for (;;) {
-    const open = SCAFFOLD_OPEN.exec(t)?.[1]
-    if (open === undefined || !CLAUDE_SCAFFOLD_TAGS.has(open)) return t
-    const close = `</${open}>`
-    const end = t.indexOf(close)
-    if (end === -1) return ""
-    t = t.slice(end + close.length).trimStart()
-  }
-}
+// The scaffold tag list and stripLeadingScaffolds moved to @mida/checkpoint's
+// scaffold.ts — mergeCheckpoints must apply the same "only scaffolding" test to
+// stored requests, and this package may not be imported by checkpoint (PROV-18).
+// Re-exported so importers of this module keep the same public surface.
+export { stripLeadingScaffolds }
 
 // in-20 T-2 — quitting Claude Code while a tool call waits on the permission
 // prompt leaves bookkeeping under the USER role: a plain-text marker line and
@@ -291,6 +258,66 @@ export function claudeTypedUserText(obj: TranscriptLine | null, neighbourLocalCo
   return slashCommandRequest(userText, neighbourLocalCommand) ?? (userVisibleText(obj.message?.content) || null)
 }
 
+/**
+ * PROV-17 — a message the user types while Claude Code is mid-turn is NOT a
+ * `type:"user"` record: it is an `attachment` record of type `queued_command`
+ * (plus `queue-operation` bookkeeping lines, which carry the same text and
+ * render nothing). When `commandMode` is "prompt" and the recorded origin is
+ * the human, the `prompt` IS the user's words: a string, or a list of content
+ * parts whose text parts join with "\n" (image parts are dropped). Every other
+ * queued_command — task notifications, a peer subagent's report, coordinator
+ * records, a missing or unknown origin — is not the user's and returns null.
+ * The match is the exact shape Claude Code 2.1.288 writes — commandMode
+ * "prompt" plus origin.kind "human". A future version changing either value
+ * would hide the user's words again with no error, which is why a test pins
+ * the shape.
+ */
+export function claudeQueuedUserText(obj: TranscriptLine | null): string | null {
+  const parts = claudeQueuedUserParts(obj)
+  if (parts === null) return null
+  const text = parts.map((p) => p.text).join("\n")
+  return text === "" ? null : text
+}
+
+/**
+ * The user's words inside a human queued prompt as text parts: one part for a
+ * string prompt, the text parts of a list prompt (image parts dropped), or
+ * null when the record is not a human queued prompt at all. Keeping the parts
+ * (rather than one joined string) means a scaffold part like a trailing
+ * <system-reminder> is stripped by the typed path's own per-part rule,
+ * exactly as on a typed user line.
+ */
+function claudeQueuedUserParts(obj: TranscriptLine | null): { type: "text"; text: string }[] | null {
+  if (obj === null || obj.type !== "attachment") return null
+  const att = obj.attachment
+  if (typeof att !== "object" || att === null || Array.isArray(att)) return null
+  const a = att as { type?: unknown; commandMode?: unknown; origin?: unknown; prompt?: unknown }
+  if (a.type !== "queued_command" || a.commandMode !== "prompt") return null
+  const origin = a.origin
+  if (typeof origin !== "object" || origin === null || (origin as { kind?: unknown }).kind !== "human") return null
+  const prompt = a.prompt
+  if (typeof prompt === "string") return [{ type: "text", text: prompt }]
+  if (Array.isArray(prompt)) {
+    return prompt
+      .filter((p): p is ContentPart => isPart(p) && p.type === "text" && typeof p.text === "string")
+      .map((p) => ({ type: "text" as const, text: p.text as string }))
+  }
+  return null
+}
+
+/**
+ * The user-line view of a queued mid-turn message: the same record re-shaped
+ * so every downstream check — render, request pick, typed marks, the
+ * interruption boundary — runs the identical code as for a typed message.
+ * Only the fields the reader consumes on a user line are set — type, message,
+ * cwd, timestamp — so nothing else the attachment record carries (an isMeta
+ * or isCompactSummary flag, its rendered copy, any future field) can hide or
+ * recolour the user's words.
+ */
+function queuedAsUserLine(obj: TranscriptLine): TranscriptLine {
+  return { type: "user", cwd: obj.cwd, timestamp: obj.timestamp, message: { content: claudeQueuedUserParts(obj) ?? [] } }
+}
+
 /** How much of a question the answer line repeats — enough to say what was asked. */
 const ANSWER_QUESTION_CHARS = 120
 
@@ -334,20 +361,177 @@ export function claudeAnswerText(obj: TranscriptLine | null): string | null {
   return entries.length === 0 ? null : entries.join("; ")
 }
 
+// CAP-41: one rendered trail row. Order matters, each step load-bearing.
+// Bound the scrub's input to the part's first 16 KB: the multiline key-block
+// pattern rescans for an END marker that may never come, which took ~5.6 s on
+// eight megabyte texts of repeated BEGIN lines (UF-C41C E3). Then scrub
+// BEFORE flattening, while a block secret's own newlines still mark it;
+// flatten whitespace to one line (a payload can never fake a new "L<m>" row
+// or a forged block header); scrub AGAIN: a token a newline hid, like
+// "Bearer\n<token>", only matches once flat. Then cap the row. A step is a
+// summary, never the payload itself.
+const STEP_ROW_CHARS = 200
+const STEP_SCRUB_CHARS = 16 * 1024
+const stepRow = (lineNo: number, body: string): string =>
+  cut(
+    `L${lineNo}: ${scrubSecrets(scrubSecrets(body.slice(0, STEP_SCRUB_CHARS)).replace(/\s+/g, " ").trim())}`,
+    STEP_ROW_CHARS,
+  )
+
+/**
+ * One parsed tool_use part as a step: Write → wrote, the edit family →
+ * edited, Read → read, Bash → ran:, anything else → used <name>. A tool_use
+ * missing the field its verb needs falls back to `used <name>` — never a
+ * path or command invented from nowhere.
+ */
+function toolStepBody(part: ContentPart): string {
+  const name = typeof part.name === "string" ? part.name : "?"
+  const input = isPart(part.input) ? (part.input as Record<string, unknown>) : null
+  const filePath = typeof input?.file_path === "string" ? input.file_path : null
+  const notebookPath = typeof input?.notebook_path === "string" ? input.notebook_path : null
+  const command = typeof input?.command === "string" ? input.command : null
+  const path = filePath ?? notebookPath
+  if (name === "Write" && path !== null) return `wrote ${path}`
+  if ((name === "Edit" || name === "MultiEdit" || name === "NotebookEdit") && path !== null) return `edited ${path}`
+  if (name === "Read" && path !== null) return `read ${path}`
+  if (name === "Bash" && command !== null) return `ran: ${command}`
+  return `used ${name}`
+}
+
+/**
+ * UF-C41B B2 — the step rows of one FULLY-PARSED record. Only a top-level
+ * `type: "assistant"` record that is not a sub-agent's sidechain counts: a
+ * candidate marked only because the marker sat inside a user record, a
+ * progress record or a tool input yields nothing here, and a nested object
+ * that merely looks like a tool call is never read as one — the rows come
+ * from the record's own content parts. A record with no step parts answers
+ * [] — still a counted candidate, just nothing to show.
+ */
+function claudeStepRows(obj: TranscriptLine | null, lineNo: number): string[] | null {
+  if (obj === null || typeof obj !== "object" || obj.type !== "assistant" || obj.isSidechain === true) {
+    return null
+  }
+  const content = obj.message?.content
+  if (typeof content === "string") return [stepRow(lineNo, `said: ${content}`)]
+  if (!Array.isArray(content)) return null
+  const steps: string[] = []
+  for (const part of content) {
+    if (!isPart(part)) continue
+    if (part.type === "tool_use") steps.push(stepRow(lineNo, toolStepBody(part)))
+    else if (part.type === "text" && typeof part.text === "string") steps.push(stepRow(lineNo, `said: ${part.text}`))
+  }
+  return steps
+}
+
+/**
+ * UF-C41B B2 — a marked line longer than this is not re-read; the trail shows
+ * the honest placeholder instead of a half-read guess.
+ */
+const STEP_REREAD_LINE_BYTES = 1 * 1024 * 1024
+/**
+ * UF-C41C E4: the placeholder is owed only to a record that is provably the
+ * main assistant's own. The whole line is never parsed at this size; the
+ * record's identity is checked on its first 512 bytes and last 4 KB, which in
+ * real key order carry `"isSidechain":false` up front and `"type":"assistant"`
+ * at the far end. A sub-agent's progress or sidechain record carries the same
+ * marker text but fails this pair, so it renders nothing and counts nowhere.
+ */
+const STEP_IDENTITY_HEAD_BYTES = 512
+const STEP_IDENTITY_TAIL_BYTES = 4 * 1024
+/**
+ * Total bytes the whole re-read pass may spend on candidate lines — the trail
+ * is a courtesy over the one scan, never a second full read of the middle.
+ */
+const STEP_REREAD_BYTES = 8 * 1024 * 1024
+
+/**
+ * UF-C41B B2 — turn the scan's marks into trail rows. Candidates are walked
+ * NEWEST first: each line up to STEP_REREAD_LINE_BYTES is re-read from the
+ * file at its byte offset and parsed whole — the only read the trail trusts —
+ * and a bigger one renders the placeholder without a read. The walk stops as
+ * soon as the collected rows could fill the trail's own budget (the block is
+ * built inside whatever space B1 leaves, itself never more than
+ * ASSISTANT_TRAIL_CHARS) or the re-read budget is spent, whichever comes
+ * first.
+ *
+ * UF-C41C E1: the answer also carries `notRead`, true when any marked
+ * candidate was never re-read (the walk stopped with candidates unvisited,
+ * or the scan's kept window had already dropped older marks; `markedTotal`
+ * counts every mark, kept or not). A record that WAS re-read and made no row
+ * is named by no count line at all.
+ */
+function collectAssistantSteps(
+  transcriptPath: string,
+  candidates: { line: number; offset: number; byteLen: number }[],
+  markedTotal: number,
+): { rows: string[][]; notRead: boolean } {
+  const groups: string[][] = []
+  const droppedByWindow = markedTotal > candidates.length
+  if (candidates.length === 0) return { rows: groups, notRead: droppedByWindow }
+  const fd = fs.openSync(transcriptPath, "r")
+  try {
+    let reRead = 0
+    let rowChars = 0
+    let unvisited = false
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      const cand = candidates[i]!
+      let rows: string[] | null = null
+      if (cand.byteLen > STEP_REREAD_LINE_BYTES) {
+        // UF-C41C E4: read only the head and tail slices; a marked line whose
+        // ends do not identify the main assistant's own record is no step.
+        reRead += STEP_IDENTITY_HEAD_BYTES + STEP_IDENTITY_TAIL_BYTES
+        const head = readRangeAt(fd, cand.offset, STEP_IDENTITY_HEAD_BYTES)
+        const tail = readRangeAt(fd, cand.offset + cand.byteLen - STEP_IDENTITY_TAIL_BYTES, STEP_IDENTITY_TAIL_BYTES)
+        rows =
+          head.includes('"isSidechain":false') && tail.includes('"type":"assistant"')
+            ? [stepRow(cand.line, "[a step too long to read here]")]
+            : null
+      } else {
+        reRead += cand.byteLen
+        try {
+          rows = claudeStepRows(JSON.parse(readRangeAt(fd, cand.offset, cand.byteLen)) as TranscriptLine | null, cand.line)
+        } catch {
+          rows = null // a line that does not parse whole is no step
+        }
+      }
+      if (rows !== null && rows.length > 0) {
+        groups.push(rows)
+        for (const row of rows) rowChars += row.length + 1
+      }
+      if ((rowChars >= ASSISTANT_TRAIL_CHARS || reRead >= STEP_REREAD_BYTES) && i > 0) {
+        unvisited = true
+        break
+      }
+    }
+    groups.reverse()
+    return { rows: groups, notRead: droppedByWindow || unvisited }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
 /**
  * The Claude reader's half of the streamed pass: the cheap `"type":"user"`
  * string check keeps tool/output lines from ever reaching JSON.parse, the
  * summary test is the same one lastCompactSummaryLine always ran, and the
  * typed test is the shared classifier above with the 1-back/2-ahead neighbour
- * window the command-echo rule needs.
+ * window the command-echo rule needs. The stepMark is UF-C41B B2: a middle
+ * line holding the literal is only MARKED for the reader — the scan never
+ * parses it.
  */
 export const claudeScanHooks: ScanHooks = {
-  candidate: (text) => text.includes('"type":"user"'),
+  stepMark: '"type":"assistant"',
+  // a queued_command attachment can be a mid-turn user message (PROV-17); the
+  // string sits inside the kept 4 KB prefix, so over-cap lines still count
+  candidate: (text) => text.includes('"type":"user"') || text.includes('"queued_command"'),
   userText: (text) => {
     try {
       const obj = JSON.parse(text) as TranscriptLine | null
-      if (obj === null || typeof obj !== "object" || obj.type !== "user") return ""
-      return userRequestText(obj.message?.content)
+      if (obj === null || typeof obj !== "object") return ""
+      if (obj.type === "user") return userRequestText(obj.message?.content)
+      // a queued human message answers its words to the neighbour window like
+      // a typed line does (PROV-17)
+      return claudeQueuedUserText(obj) ?? ""
     } catch {
       return ""
     }
@@ -356,6 +540,13 @@ export const claudeScanHooks: ScanHooks = {
     try {
       const obj = JSON.parse(text) as TranscriptLine | null
       const line = obj === null || typeof obj !== "object" ? null : obj
+      if (line !== null && line.type === "attachment") {
+        // PROV-17 — a human's queued prompt is typed. Claude Code never
+        // re-logs it as a user record, so no neighbour rule applies: a
+        // same-text user record is a separate message and counts on its own.
+        if (claudeQueuedUserText(line) === null) return null
+        return claudeTypedUserText(queuedAsUserLine(line), false)
+      }
       // an answer to the agent's question is pinned like a typed message (PROV-10)
       return claudeTypedUserText(line, claudeCommandEchoNeighbour(neighbours.prev, neighbours.next)) ?? claudeAnswerText(line)
     } catch {
@@ -501,6 +692,25 @@ export function readConversation(
     } catch {
       entries.push({ label, obj: null, offset }) // truncated or non-JSON line — skip
     }
+  }
+
+  // PROV-17 — a message the user types mid-turn is a queued_command
+  // attachment, not a user line. A human-origin prompt attachment IS the
+  // user's message: give its entry the user-line view so everything below —
+  // the render, the first-request pick, the typed marks, the interruption
+  // boundary — runs the identical code as for a typed message. UF-C41B B3:
+  // no duplicate rule — two copies of the same queued record are two records,
+  // and each renders where it sits; the old source_uuid/timestamp keying made
+  // this read drop a copy the streamed scan had already counted, so the two
+  // reads answered differently. Claude Code does not re-log a queued message
+  // as a user record (0 of 276 real mid-turn messages, Oct 3), so a later
+  // same-text user record is a separate message and renders on its own.
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!
+    const obj = entry.obj
+    if (obj === null || obj.type !== "attachment") continue
+    if (claudeQueuedUserText(obj) === null) continue
+    entry.obj = queuedAsUserLine(obj)
   }
 
   // A command echo is local plumbing when Claude Code's own bookkeeping sits at
@@ -836,7 +1046,19 @@ export function readConversation(
   // pick IS the last summary — no second pass. The same ONE pass that finds
   // the summary also returns every typed line with its real line number and
   // the count of candidate lines too long to parse — the group's scan half.
-  const scan = truncated ? scanTranscript(transcriptPath, claudeScanHooks, size) : null
+  //
+  // CAP-41 — the middle is exactly the bytes between the head window's last
+  // complete line and the tail window's first: the head's own last newline
+  // ends the read part (a line the head saw only in part starts right there),
+  // and the first "~" label's offset marks where rendered lines resume. The
+  // same pass walks it for the assistant's own steps — a line it could only
+  // half-read still counts under its real number.
+  const middleStart = truncated ? headWindow.lastIndexOf(0x0a) + 1 : 0
+  const firstTail = lines.find((l) => l.label.startsWith("~"))
+  const middleEnd = firstTail === undefined ? size : firstTail.offset
+  const scan = truncated
+    ? scanTranscript(transcriptPath, claudeScanHooks, size, { start: middleStart, end: middleEnd })
+    : null
   const scannedSummary = scan?.summary ?? null
   if (scannedSummary !== null) {
     try {
@@ -867,6 +1089,15 @@ export function readConversation(
           marks: scan.typed.map((t) => ({ label: `L${t.line}`, order: t.line, offset: t.offset, text: t.text })),
           tooLong: scan.tooLong.length,
           bound: scan.bound,
+          // UF-C41B B1 — fitMessages builds the block itself inside whatever
+          // room the settled render leaves. B2 — the scan only marked the
+          // candidate lines; the rows come from re-reading each mark whole.
+          // UF-C41C E1: `notRead` is the honest answer to whether any mark
+          // went un-read; nothing is counted that was not a produced row.
+          trail:
+            scan.stepsTotal === 0
+              ? null
+              : collectAssistantSteps(transcriptPath, scan.stepCandidates, scan.stepsTotal),
         },
   )
   return {

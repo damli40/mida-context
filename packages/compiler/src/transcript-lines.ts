@@ -142,12 +142,30 @@ export function readTranscriptLines(path: string): TranscriptLines {
   return { lines, truncated, head, tail, size }
 }
 
+/**
+ * Re-read exactly the bytes at `offset` on an already-open file — a line the
+ * streamed scan marked by position but never kept (UF-C41B B2). One
+ * positional read; the caller owns the fd.
+ */
+export function readRangeAt(fd: number, offset: number, byteLen: number): string {
+  const buf = Buffer.allocUnsafe(byteLen)
+  let got = 0
+  while (got < byteLen) {
+    const n = fs.readSync(fd, buf, got, byteLen - got, offset + got)
+    if (n <= 0) break
+    got += n
+  }
+  return buf.subarray(0, got).toString("utf8")
+}
+
 /** Chunk size for the whole-file scan below — bounded, never the file at once. */
 const SCAN_CHUNK_BYTES = 64 * 1024
 /** A compact-summary line longer than this is skipped, not retained. */
 export const SUMMARY_LINE_BYTES = 400 * 1024
 /** How much of an over-cap line's start is kept for the cheap candidate check. */
 const SCAN_PREFIX_CHARS = 4 * 1024
+/** UF-C41B B2 — the scan keeps only the newest step CANDIDATES; the rest still count. */
+const STEP_CANDIDATE_KEEP = 4_096
 
 /**
  * What one format needs the streamed pass to know about its lines. Every hook
@@ -173,6 +191,15 @@ export interface ScanHooks {
   typedText(text: string, neighbours: { prev: string; next: string[] }): string | null
   /** The format's compact-summary test, when it has one — the last true wins. */
   summary?(text: string): boolean
+  /**
+   * UF-C41B B2 — the literal substring that makes a middle line a step
+   * CANDIDATE (for Claude, `"type":"assistant"`). The check runs on the raw
+   * text as it streams — never on a kept prefix, so a mark at the far end of
+   * an over-cap line still counts. The scan records only the line number,
+   * byte offset and byte length; parsing the record and deciding what it
+   * really is belongs to the reader, which re-reads each candidate whole.
+   */
+  stepMark?: string
 }
 
 export interface TranscriptScan {
@@ -188,6 +215,15 @@ export interface TranscriptScan {
    * window-read line at offset ≥ bound was never seen by this scan.
    */
   bound: number
+  /**
+   * UF-C41B B2 — the marked step candidates inside the middle bounds, oldest
+   * first, newest kept when the run exceeds STEP_CANDIDATE_KEEP. Each entry
+   * is the line's 1-based number, byte offset and exact byte length — never
+   * its text; the reader re-reads them whole.
+   */
+  stepCandidates: { line: number; offset: number; byteLen: number }[]
+  /** Every marked candidate line, kept or not — the omitted count's source. */
+  stepsTotal: number
 }
 
 /**
@@ -198,8 +234,19 @@ export interface TranscriptScan {
  * the neighbouring lines' userText (one back, up to two ahead), so a line is
  * classified once two more have passed; over-cap candidates are counted in
  * `tooLong` instead of parsed.
+ *
+ * `middle` is the byte range the caller's windows never read — [start, end) of
+ * the line START offsets. When it and a `stepMark` hook are both present, each
+ * line inside it whose raw text holds the mark is also recorded as a step
+ * candidate (UF-C41B B2): the scan keeps the newest STEP_CANDIDATE_KEEP marks
+ * and counts them all in stepsTotal. No middle line is parsed here.
  */
-export function scanTranscript(path: string, hooks: ScanHooks, size?: number): TranscriptScan {
+export function scanTranscript(
+  path: string,
+  hooks: ScanHooks,
+  size?: number,
+  middle?: { start: number; end: number },
+): TranscriptScan {
   const fd = fs.openSync(path, "r")
   try {
     // `size` is the byte bound the caller's window read fstat'd — read only
@@ -218,12 +265,34 @@ export function scanTranscript(path: string, hooks: ScanHooks, size?: number): T
     let prefix = "" // the line's first bytes — kept even after the cap drops the rest
     const typed: { line: number; offset: number; text: string }[] = []
     const tooLong: number[] = []
+    const stepCandidates: { line: number; offset: number; byteLen: number }[] = []
+    let stepsTotal = 0
     let summary: { label: string; text: string } | null = null
+    // UF-C41B B2 — the mark check runs on the raw text while it streams, so a
+    // mark is found wherever it sits, even past the point the line overflows
+    // its keep cap. stepHit is the current line's answer; stepTail carries the
+    // line's last mark-length-minus-one chars so a mark split across a chunk
+    // boundary still matches.
+    const stepMark = middle === undefined ? undefined : hooks.stepMark
+    let stepHit = false
+    let stepTail = ""
+    const markCheck = (frag: string): void => {
+      if (middle === undefined || stepMark === undefined || stepHit || frag === "") return
+      if (lineStart < middle.start || lineStart >= middle.end) return
+      if (frag.includes(stepMark) || (stepTail + frag.slice(0, stepMark.length - 1)).includes(stepMark)) {
+        stepHit = true
+        return
+      }
+      stepTail = (stepTail + frag).slice(-(stepMark.length - 1))
+    }
     // A candidate's neighbour rule needs the lines around it, so a line waits
     // in a 3-deep window until its two next neighbours have passed; prevUt is
     // the userText of the line just ahead of the window's head.
     let prevUt = ""
     const window: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number; offset: number }[] = []
+    // UF-C41B B3 — no duplicate rule: a queued attachment logged twice is two
+    // records and each renders where it sits. The old keying made this scan
+    // and the window read disagree about the same line.
     const classify = (entry: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number; offset: number }, next: string[]): void => {
       if (!entry.cand) return
       if (entry.big) {
@@ -231,7 +300,8 @@ export function scanTranscript(path: string, hooks: ScanHooks, size?: number): T
         return
       }
       const text = hooks.typedText(entry.text, { prev: prevUt, next })
-      if (text !== null) typed.push({ line: entry.lineNo, offset: entry.offset, text })
+      if (text === null) return
+      typed.push({ line: entry.lineNo, offset: entry.offset, text })
     }
     const push = (entry: { text: string; ut: string; cand: boolean; big: boolean; lineNo: number; offset: number }): void => {
       window.push(entry)
@@ -241,9 +311,26 @@ export function scanTranscript(path: string, hooks: ScanHooks, size?: number): T
         prevUt = head.ut
       }
     }
-    const finish = (text: string, tooLongLine: boolean, offset: number): void => {
+    const finish = (text: string, tooLongLine: boolean, offset: number, byteLen: number): void => {
       lineNo += 1
-      if (tooLongLine || text.length > SUMMARY_LINE_BYTES) {
+      const overCap = tooLongLine || text.length > SUMMARY_LINE_BYTES
+      // UF-C41B B2 — a middle line whose raw text held the mark is a step
+      // candidate: marked by number, offset and length, never parsed here.
+      // The mark check ran on the streaming fragments, so it sees the whole
+      // line even when the line itself is too big to keep.
+      if (stepHit) {
+        stepsTotal += 1
+        stepCandidates.push({ line: lineNo, offset, byteLen })
+        // UF-C41C E2: trimming the oldest marks on EVERY line shifted a
+        // ~4,096-entry array once per mark and dominated the scan on a file
+        // of small records. Let the list grow to twice the window, then drop
+        // back to it in one splice; the end-of-scan trim below keeps the same
+        // newest STEP_CANDIDATE_KEEP marks either way.
+        if (stepCandidates.length > STEP_CANDIDATE_KEEP * 2) {
+          stepCandidates.splice(0, stepCandidates.length - STEP_CANDIDATE_KEEP)
+        }
+      }
+      if (overCap) {
         // the line itself is gone — the kept prefix still answers the cheap check
         push({ text: "", ut: "", cand: hooks.candidate(prefix), big: true, lineNo, offset })
         return
@@ -261,18 +348,23 @@ export function scanTranscript(path: string, hooks: ScanHooks, size?: number): T
       let start = 0
       for (let i = 0; i < text.length; i++) {
         if (text.charCodeAt(i) !== 10) continue
+        const seg = text.slice(start, i)
         // the segment's byte length is exact — a held multibyte split reports
         // its bytes when the decoder emits the completed character later
-        const segBytes = Buffer.byteLength(text.slice(start, i))
-        finish(overflow ? "" : piece + text.slice(start, i), overflow, lineStart)
+        const segBytes = Buffer.byteLength(seg)
+        markCheck(seg)
+        finish(overflow ? "" : piece + seg, overflow, lineStart, lineBytes + segBytes)
         piece = ""
         prefix = ""
         overflow = false
         lineStart += lineBytes + segBytes + 1
         lineBytes = 0
+        stepHit = false
+        stepTail = ""
         start = i + 1
       }
       const rest = text.slice(start)
+      markCheck(rest)
       lineBytes += Buffer.byteLength(rest)
       if (prefix.length < SCAN_PREFIX_CHARS) prefix = (prefix + rest).slice(0, SCAN_PREFIX_CHARS)
       if (overflow || piece.length + rest.length > SUMMARY_LINE_BYTES) {
@@ -282,14 +374,25 @@ export function scanTranscript(path: string, hooks: ScanHooks, size?: number): T
         piece += rest
       }
     }
-    piece += decoder.end()
-    if (piece !== "" || overflow) finish(piece, overflow, lineStart) // a final line without its newline counts
+    const emit = decoder.end()
+    markCheck(emit)
+    piece += emit
+    if (piece !== "" || overflow) {
+      // a final line without its newline counts — its length includes any
+      // multibyte char the decoder was holding until now
+      finish(piece, overflow, lineStart, lineBytes + Buffer.byteLength(emit))
+    }
     while (window.length > 0) {
       const head = window.shift()!
       classify(head, window.map((entry) => entry.ut))
       prevUt = head.ut
     }
-    return { typed, tooLong, summary, bound: position }
+    // UF-C41C E2: the batched trim above can leave up to 2x the window; the
+    // kept set is the newest STEP_CANDIDATE_KEEP marks, identical to before.
+    if (stepCandidates.length > STEP_CANDIDATE_KEEP) {
+      stepCandidates.splice(0, stepCandidates.length - STEP_CANDIDATE_KEEP)
+    }
+    return { typed, tooLong, summary, bound: position, stepCandidates, stepsTotal }
   } finally {
     fs.closeSync(fd)
   }
@@ -376,6 +479,17 @@ export interface ScannedMarks {
   tooLong: number
   /** Bytes of the file the scan covered — see TranscriptScan.bound. */
   bound: number
+  /**
+   * CAP-41 — what the scan knows the assistant did inside the unread middle:
+   * `rows` holds one array of rendered "L<n>: …" rows per middle line that
+   * produced any, oldest first; `notRead` says any marked candidate was
+   * never re-read (the row budget filled first, the re-read budget ran out,
+   * or the kept-candidate window dropped the oldest marks; UF-C41C E1).
+   * The block itself is built inside fitMessages AFTER the request, the
+   * typed group and the recent messages have settled: it gets only what is
+   * left of maxChars (UF-C41B B1), never displacing a byte of them.
+   */
+  trail?: { rows: string[][]; notRead: boolean } | null
 }
 
 /**
@@ -435,6 +549,67 @@ function buildUserGroup(candidates: TypedMark[], tooLong: number): string | null
   return parts.join("\n")
 }
 
+/** The trail of assistant steps is a summary, not a feed — its own cap. */
+export const ASSISTANT_TRAIL_CHARS = 3_000
+
+const TRAIL_HEADER = "assistant — what it did in between, oldest first (outside the recent messages below):"
+
+/** UF-C41C E1: the line for candidates that were never re-read. No number: their kind is unknown. */
+const TRAIL_NOT_READ = "[… older steps not read …]"
+
+/**
+ * The pinned block CAP-41 adds: what the ASSISTANT did inside the unread
+ * middle, one flat rendered row per step, oldest first, under a header that
+ * is never the user's:
+ *
+ *   assistant — what it did in between, oldest first (outside the recent messages below):
+ *   [… older steps not read …]
+ *   [… N earlier steps omitted …]
+ *   L812: wrote /src/x.ts
+ *   L1403: ran: pnpm test
+ *
+ * `rows` holds one array of rendered rows per middle line that produced any
+ * (oldest first); `notRead` says any marked candidate was never re-read
+ * (UF-C41C E1). `budget` is the most the block may be: the space the settled
+ * render left over, itself never more than ASSISTANT_TRAIL_CHARS. Newest
+ * rows win, admitted newest-first like the user group. Two optional lines
+ * sit under the header, in this order: the not-read line whenever `notRead`,
+ * then `[… N earlier steps omitted …]` where N counts produced ROWS that did
+ * not fit, never records that made no row and never candidates that were
+ * never read. Each line is owed the same room as a row: the oldest kept
+ * rows drop until the block fits. Returns null when the middle produced no
+ * row, or when the header plus a single row does not fit.
+ */
+export function buildAssistantTrail(rows: string[][], notRead: boolean, budget: number = ASSISTANT_TRAIL_CHARS): string | null {
+  const cap = Math.min(ASSISTANT_TRAIL_CHARS, budget)
+  const kept: string[] = []
+  let used = TRAIL_HEADER.length
+  outer: for (let g = rows.length - 1; g >= 0; g--) {
+    for (let i = rows[g]!.length - 1; i >= 0; i--) {
+      const cost = rows[g]![i]!.length + 1
+      if (used + cost > cap) break outer
+      kept.unshift(rows[g]![i]!)
+      used += cost
+    }
+  }
+  if (kept.length === 0) return null
+  const produced = rows.reduce((n, g) => n + g.length, 0)
+  for (;;) {
+    const omitted = produced - kept.length
+    const omittedLine = omitted === 0 ? null : `[… ${omitted} earlier steps omitted …]`
+    const markerCost = (notRead ? TRAIL_NOT_READ.length + 1 : 0) + (omittedLine === null ? 0 : omittedLine.length + 1)
+    if (markerCost === 0 || used + markerCost <= cap) {
+      const parts = [TRAIL_HEADER]
+      if (notRead) parts.push(TRAIL_NOT_READ)
+      if (omittedLine !== null) parts.push(omittedLine)
+      parts.push(...kept)
+      return parts.join("\n")
+    }
+    used -= kept.shift()!.length + 1
+    if (kept.length === 0) return null
+  }
+}
+
 export function fitMessages(
   msgs: { role: string; block: string; typed?: TypedMark; offset?: number }[],
   maxChars: number,
@@ -449,6 +624,14 @@ export function fitMessages(
   const headCap = Math.min(FIRST_USER_CHARS, Math.max(0, maxChars - 200))
   const head = lead ?? (pin >= 0 ? cut(msgs[pin]!.block, headCap) : null)
   const rest = msgs.filter((_, i) => i !== pin)
+  // UF-C41B B1 — the assistant-steps trail is a pinned block in PLACEMENT,
+  // not in price: the request, the typed group and the recent messages all
+  // settle below exactly as they would with no trail, and the trail's block
+  // is built afterwards inside only the room they left. Charged against the
+  // fill it moved an older typed message into the group and the group's
+  // oldest into the count, could push the newest kept message out entirely,
+  // and could carry the output past maxChars.
+  const trail = scanned?.trail ?? null
 
   // The scan is AUTHORITATIVE for every line within its `bound` — it saw the
   // full neighbour context the truncated windows lacked (B2). Each mark pairs
@@ -616,9 +799,21 @@ export function fitMessages(
   if (head) blocks.push(head)
   if (extraPinned) blocks.push(extraPinned)
   if (group !== null) blocks.push(group)
-  if (truncated) blocks.push(`[… earlier messages omitted …]`)
-  else if (omitted) blocks.push(`[… ${omitted} earlier messages omitted …]`)
-  for (const m of keptTail) blocks.push(m.block)
+  const tailBlocks: string[] = []
+  if (truncated) tailBlocks.push(`[… earlier messages omitted …]`)
+  else if (omitted) tailBlocks.push(`[… ${omitted} earlier messages omitted …]`)
+  for (const m of keptTail) tailBlocks.push(m.block)
+  // The trail is charged LAST, between the pinned blocks and the omitted
+  // marker: it is built inside whatever the settled blocks leave of
+  // maxChars, so it can never push a byte of them out — and it leaves the
+  // whole thing out when its header and one row do not fit.
+  const baseLen =
+    [...blocks, ...tailBlocks].reduce((n, b) => n + b.length, 0) +
+    2 * Math.max(0, blocks.length + tailBlocks.length - 1)
+  const room = maxChars - baseLen - (blocks.length + tailBlocks.length === 0 ? 0 : 2)
+  const trailBlock = trail === null ? null : buildAssistantTrail(trail.rows, trail.notRead, room)
+  if (trailBlock !== null) blocks.push(trailBlock)
+  blocks.push(...tailBlocks)
 
   return {
     text: blocks.join("\n\n"),
