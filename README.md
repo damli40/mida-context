@@ -226,6 +226,16 @@ hooks or a local MCP server.
 
 ## How it works
 
+### On Monad testnet
+
+| Contract | What it records | Address |
+|---|---|---|
+| CapabilityRegistry | Which agent may read or write which area, and every revocation | [0xADFb…039b](https://testnet.monadvision.com/address/0xADFbeBC7A653E4287ae30c87D32D7aD647D7039b) |
+| ContextRegistry | Who wrote each saved checkpoint: fingerprints, never content | [0x75fB…FB78](https://testnet.monadvision.com/address/0x75fB6dB9af93A8d823e51c488CaA913ca711FB78) |
+| BatchAnchor | One Merkle root per batch of agent-signed saves, each save still signed by its agent | [0xe5dc…a9E1](https://testnet.monadvision.com/address/0xe5dcf76B1109906A16587cD2FE02c1e6f4a7a9E1) |
+
+Source verified on [Sourcify](https://sourcify.dev/).
+
 <details>
 <summary><b>The path of one checkpoint</b></summary>
 
