@@ -230,11 +230,9 @@ jobs:
 
       - name: Build and install from source
         if: inputs.from == 'source'
-        env:
-          CHECKOUT_DIR: ${{ github.workspace }}
         run: |
           set -o pipefail
-          SRC="$CHECKOUT_DIR"
+          SRC="${{ github.workspace }}"
           case "$SRC" in
             [A-Za-z]:*)
               drive=$(printf '%s' "$SRC" | cut -c1 | tr '[:upper:]' '[:lower:]')
@@ -300,7 +298,7 @@ jobs:
           cd "$HOME/demo-project"
           printf '{"session_id":"wsl-first-run-1","cwd":"%s","hook_event_name":"SessionStart","source":"startup"}' "$PWD" \
             | mida-inject codex 2>&1 | tee /tmp/log/handoff.txt
-          grep -q "$DEMO_OBJECTIVE" /tmp/log/handoff.txt
+          grep -q "${{ env.DEMO_OBJECTIVE }}" /tmp/log/handoff.txt
           date -u +"handoff %FT%TZ" | tee -a /tmp/log/times.txt
 
       - name: Revoke codex, then its next session gets nothing
@@ -310,7 +308,7 @@ jobs:
           expect /tmp/yes.exp mida revoke codex 2>&1 | tee /tmp/log/revoke.txt
           printf '{"session_id":"wsl-first-run-2","cwd":"%s","hook_event_name":"SessionStart","source":"startup"}' "$PWD" \
             | mida-inject codex 2>&1 | tee /tmp/log/handoff-after-revoke.txt
-          if grep -q "$DEMO_OBJECTIVE" /tmp/log/handoff-after-revoke.txt; then
+          if grep -q "${{ env.DEMO_OBJECTIVE }}" /tmp/log/handoff-after-revoke.txt; then
             echo "FAIL: a revoked agent still received the checkpoint"; exit 1
           fi
           date -u +"revoked %FT%TZ" | tee -a /tmp/log/times.txt
