@@ -467,7 +467,7 @@ const closeServer = (server: Server) => new Promise<void>((done) => server.close
 describe("runHook kicks the daemon instead of spawning a drainer", () => {
   it("a reachable daemon means zero spawns", async () => {
     const { dir, home, stdinFor } = setup()
-    const server = await fakeDaemon(socketPathFor(home), (socket) => {
+    const server = await fakeDaemon(socketPathFor(home)!, (socket) => {
       socket.end('HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{"ok":true}')
     })
     try {
@@ -493,7 +493,7 @@ describe("runHook kicks the daemon instead of spawning a drainer", () => {
 
   it("a daemon that accepts but never answers still returns inside 300 ms and spawns once", async () => {
     const { dir, home, stdinFor } = setup()
-    const server = await fakeDaemon(socketPathFor(home), () => {}) // silent forever
+    const server = await fakeDaemon(socketPathFor(home)!, () => {}) // silent forever
     try {
       let daemonSpawns = 0
       let drainerSpawns = 0

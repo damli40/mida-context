@@ -1,4 +1,5 @@
 import { chmodSync, existsSync, rmSync, writeFileSync } from "node:fs"
+import { randomBytes } from "node:crypto"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { dirname, isAbsolute } from "node:path"
@@ -25,6 +26,7 @@ import { loadAgentIdentity } from "./keys.js"
 import { isSafeName, listJobs } from "./queue.js"
 import { NAMESPACE_ID, authorNamesFor, readCheckpoints, saveCheckpoint } from "./skeleton.js"
 import { ServiceRuntime, liveLockHolderPid } from "./runtime.js"
+import { isWindows, newPipeName } from "./platform.js"
 import { currentSummarizer, summarizerSummary } from "./summarizer.js"
 import type { Network } from "./runtime.js"
 import { onMulticall3Absent } from "@mida/api"
@@ -77,6 +79,10 @@ export interface DaemonDeps {
   identity?: CodeIdentity
   /** The fallback socket folder's parent (default tmpdir()); tests inject a private temp dir. */
   socketBase?: string
+  /** The platform this start runs on (default process.platform); tests pass "win32" for the Windows path. */
+  platform?: NodeJS.Platform
+  /** The Windows pipe address this service binds; default a fresh random name per start. Tests inject a stand-in. */
+  pipeName?: () => string
 }
 
 export interface DaemonHandle {
@@ -113,9 +119,13 @@ function readBody(req: IncomingMessage): Promise<Buffer | "overflow" | "failed">
   })
 }
 
-function respond(res: ServerResponse, status: number, body: unknown): void {
+function respond(res: ServerResponse, status: number, body: unknown, token?: string): void {
   const payload = JSON.stringify(body ?? null)
-  res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(payload), connection: "close" })
+  const headers: Record<string, string | number> = { "content-type": "application/json", "content-length": Buffer.byteLength(payload), connection: "close" }
+  // Windows only: every reply carries this start's secret, so a client can tell this pipe
+  // from one another account re-created under a name the pointer still records.
+  if (token !== undefined) headers["x-mida-token"] = token
+  res.writeHead(status, headers)
   res.end(payload)
 }
 
@@ -133,8 +143,15 @@ function respond(res: ServerResponse, status: number, body: unknown): void {
  */
 export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   const home = deps.home
+  const platform = deps.platform ?? process.platform
+  const windows = isWindows(platform)
   const socketBase = deps.socketBase ?? tmpdir()
-  const socketPath = socketPathFor(home, socketBase)
+  // Windows: the address is a fresh named pipe per start, never a computed name a caller could
+  // guess or another account could create first. On Mac/Linux it is the usual socket path.
+  const socketPath = windows ? (deps.pipeName ?? newPipeName)() : socketPathFor(home, socketBase)!
+  // Windows only: the secret this start answers /health with, written into the pointer's second
+  // line so a client can tell this pipe from one a stale name left for another account to take.
+  const pipeToken = windows ? randomBytes(32).toString("hex") : undefined
   const pointerFile = `${SOCKET_FILE}.path`
   const tickMs = deps.tickMs ?? TICK_MS
   const sleep = deps.sleep ?? realSleep
@@ -151,13 +168,18 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
 
   // a socket outside the home lands in the per-user fallback folder — the daemon itself makes it
   // private; an existing folder that is not a real 0700 directory owned by this user refuses the
-  // start rather than place the control socket where someone else could reach it
-  if (dirname(socketPath) === fallbackSocketDir(socketBase)) {
+  // start rather than place the control socket where someone else could reach it. A named pipe
+  // needs no folder at all.
+  if (!windows && dirname(socketPath) === fallbackSocketDir(socketBase)) {
     ensureFallbackSocketDir(socketBase)
   }
 
-  if (existsSync(socketPath)) {
-    const alive = await callDaemon(home, "/health", undefined, { timeoutMs: staleCheckMs })
+  // Unix: a socket file on disk may have a live daemon behind it. Windows: nothing on disk marks
+  // the pipe, so the pointer file is the only sign a service ever ran and its presence drives the
+  // same health and lock checks (a stale pointer fails the health check and is overwritten below).
+  const mayBeRunning = windows ? socketPathFor(home, socketBase, platform) !== undefined : existsSync(socketPath)
+  if (mayBeRunning) {
+    const alive = await callDaemon(home, "/health", undefined, { timeoutMs: staleCheckMs, platform })
     if (alive.status !== 0) return { alreadyRunning: true, close: async () => {} }
     // in-29 S-1 (Sep 29 item 14): a holder that is alive but answered slowly keeps its socket —
     // deleting the file under it leaves it running but unreachable, and the lock below refuses
@@ -171,8 +193,9 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   const runtime = await (deps.openRuntime ?? (() => ServiceRuntime.open(home, deps.network)))()
 
   // the lock is held now: a socket file that survived to here belongs to nothing — a service
-  // that took the lock binds a fresh one below, so anything already there is a leftover.
-  rmSync(socketPath, { force: true })
+  // that took the lock binds a fresh one below, so anything already there is a leftover. A named
+  // pipe is not a file and vanishes with the server that bound it, so there is nothing to remove.
+  if (!windows) rmSync(socketPath, { force: true })
 
   // the memory-held checkpoint copies /whatsnew answers from — decrypted content never leaves
   // daemon memory. The handoff's read and every drain save seed it, so the first prompt of a
@@ -281,13 +304,15 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       })
   }
 
+  const reply = (res: ServerResponse, status: number, body: unknown): void => respond(res, status, body, pipeToken)
+
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     if (req.method === "GET" && req.url === "/health") {
-      respond(res, 200, { ok: true, pid: process.pid, startedAt, queueDepth: listJobs(home).length, codeRoot: identity.codeRoot, codeCommit: identity.codeCommit, codeVersion: identity.codeVersion, summarizer: summarizerSummary(currentSummarizer(home, process.env)) })
+      reply(res, 200, { ok: true, pid: process.pid, startedAt, queueDepth: listJobs(home).length, codeRoot: identity.codeRoot, codeCommit: identity.codeCommit, codeVersion: identity.codeVersion, summarizer: summarizerSummary(currentSummarizer(home, process.env)) })
       return
     }
     if (req.method !== "POST") {
-      respond(res, 404, { error: "not-found" })
+      reply(res, 404, { error: "not-found" })
       return
     }
     const body = await readBody(req)
@@ -299,17 +324,17 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       // no connection:close header — an abortive teardown races the still-arriving upload and the
       // client sees EPIPE instead of the 413; a graceful socket.end flushes the reply first
       const payload = JSON.stringify({ error: "too-large" })
-      res.writeHead(413, { "content-type": "application/json", "content-length": Buffer.byteLength(payload) })
+      res.writeHead(413, { "content-type": "application/json", "content-length": Buffer.byteLength(payload), ...(pipeToken === undefined ? {} : { "x-mida-token": pipeToken }) })
       res.end(payload, () => req.socket.end())
       return
     }
     if (req.url === "/kick") {
       schedule()
-      respond(res, 200, { ok: true })
+      reply(res, 200, { ok: true })
       return
     }
     if (req.url === "/shutdown") {
-      respond(res, 200, { ok: true })
+      reply(res, 200, { ok: true })
       // exactly what SIGTERM gets from daemon-main: close() lets the pass in flight finish
       // first, then releases the socket, the lock and the runtime — queued jobs are on disk,
       // so nothing is lost. The catch keeps a failed close from becoming an unhandled rejection.
@@ -325,13 +350,13 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       }
       const argv = (parsed as { argv?: unknown } | null)?.argv
       if (!validCliArgv(argv)) {
-        respond(res, 200, { code: 2, lines: [USAGE] })
+        reply(res, 200, { code: 2, lines: [USAGE] })
         return
       }
       // owner commands are refused before dispatch — no socket client may change who has access,
       // and the service runtime could not sign for them anyway
       if (OWNER_COMMANDS.includes(argv[0]!)) {
-        respond(res, 200, { code: 2, lines: [ownerOnlyLine(argv[0]!)] })
+        reply(res, 200, { code: 2, lines: [ownerOnlyLine(argv[0]!)] })
         return
       }
       // the client tells the daemon where it ran — `approve` signs that folder's project in;
@@ -345,7 +370,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
       const task = typeof taskRaw === "string" ? taskRaw : undefined
       const lines: string[] = []
       const code = await runCli(argv, runtime, (line) => lines.push(line), { cwd, debug, task }).catch(() => 1)
-      respond(res, 200, { code, lines })
+      reply(res, 200, { code, lines })
       return
     }
     if (req.url === "/handoff") {
@@ -399,7 +424,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         readMs: result.kind === "refused" ? null : result.readMs,
         ms: deps.now() - started,
       })
-      respond(res, 200, result)
+      reply(res, 200, result)
       return
     }
     if (req.url === "/whatsnew") {
@@ -429,7 +454,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         updates: result.kind === "updates" ? result.updates.length : 0,
         ms: deps.now() - started,
       })
-      respond(res, 200, result)
+      reply(res, 200, result)
       return
     }
     // mida-mcp's one write: the model's checkpoint fields through the same gates and save path the
@@ -471,7 +496,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         duplicate: result.kind === "saved" ? result.duplicate : null,
         ms: deps.now() - started,
       })
-      respond(res, 200, result)
+      reply(res, 200, result)
       return
     }
     // the SDK's read: scoped context as verified records — the same gates and merged read the
@@ -496,7 +521,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         partial: result.kind === "context" && result.partial === true,
         ms: deps.now() - started,
       })
-      respond(res, 200, result)
+      reply(res, 200, result)
       return
     }
     // the SDK's write: one memory record — a note, a finding, a decision — through the same
@@ -520,16 +545,16 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         lane: result.kind === "saved" ? result.lane : (result.lane ?? null),
         ms: deps.now() - started,
       })
-      respond(res, 200, result)
+      reply(res, 200, result)
       return
     }
-    respond(res, 404, { error: "not-found" })
+    reply(res, 404, { error: "not-found" })
   }
 
   const server: Server = createServer((req, res) => {
     handle(req, res).catch(() => {
       try {
-        respond(res, 500, { error: "internal" })
+        reply(res, 500, { error: "internal" })
       } catch {
         // the connection is already gone
       }
@@ -537,8 +562,9 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
   })
 
   // umask 0o177 for the listen itself: the socket file lands 0600, never connectable by another
-  // user even for the instant before the chmod — then the caller's umask is restored
-  const previousUmask = process.umask(0o177)
+  // user even for the instant before the chmod; then the caller's umask is restored. A named pipe
+  // has no file mode at all, so none of this applies on Windows.
+  const previousUmask = windows ? null : process.umask(0o177)
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject)
@@ -548,11 +574,18 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
     await runtime.close()
     throw error
   } finally {
-    process.umask(previousUmask)
+    if (previousUmask !== null) process.umask(previousUmask)
   }
   // only this user may talk to the socket
-  chmodSync(socketPath, 0o600)
-  if (socketPath !== home.path(SOCKET_FILE)) writeFileSync(home.path(pointerFile), socketPath, { mode: 0o600 })
+  if (!windows) chmodSync(socketPath, 0o600)
+  // the pointer is the only address a client can learn on Windows: two lines, the pipe name
+  // then this start's token, written atomically and only now that listen() owns the name.
+  // On Mac/Linux it is written only for a socket that is not <home>/midad.sock.
+  if (windows) {
+    home.writeSecretFile(pointerFile, `${socketPath}\n${pipeToken}`)
+  } else if (socketPath !== home.path(SOCKET_FILE)) {
+    writeFileSync(home.path(pointerFile), socketPath, { mode: 0o600 })
+  }
 
   deps.log({ event: "started", pid: process.pid })
 
@@ -571,10 +604,12 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         await Promise.race([inFlight, realSleep(passWaitCapMs)])
       }
       await new Promise<void>((done) => server.close(() => done()))
-      try {
-        rmSync(socketPath, { force: true })
-      } catch {
-        // a socket that will not unlink must not stop the lock release
+      if (!windows) {
+        try {
+          rmSync(socketPath, { force: true })
+        } catch {
+          // a socket that will not unlink must not stop the lock release
+        }
       }
       home.remove(pointerFile)
       await runtime.close()

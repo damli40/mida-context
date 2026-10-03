@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest"
-import { mkdtempSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Mida, MidaSdkError, isMidaSdkError } from "../src/index.js"
-import { socketPathFor } from "../src/daemon.js"
+import { callDaemon, socketPathFor } from "../src/daemon.js"
 
 /** A home with no daemon behind it — no socket file ever answers. */
 const home = () => mkdtempSync(join(tmpdir(), "mida-sdk-transport-"))
@@ -53,7 +53,7 @@ describe("LocalTransport with no Mida service running", () => {
         res.end(JSON.stringify({ id: `0x${"ab".repeat(32)}`, state: "anchored" }))
       })
     })
-    await new Promise<void>((resolve) => server.listen(socketPathFor(dir), () => resolve()))
+    await new Promise<void>((resolve) => server.listen(socketPathFor(dir)!, () => resolve()))
     try {
       const mida = new Mida({ agent: "codex", home: dir })
       const result = await mida.remember({ namespace: "projects.current", content: "a note" })
@@ -82,5 +82,66 @@ describe("LocalTransport with no Mida service running", () => {
       expect(thrown).toBeInstanceOf(MidaSdkError)
       expect(["invalid-option", "invalid-namespace"]).toContain((thrown as MidaSdkError).code)
     }
+  })
+
+  it("on Windows the SDK finds the service only through the pointer", () => {
+    const home = mkdtempSync(join(tmpdir(), "sdk-win-"))
+    expect(socketPathFor(home, tmpdir(), "win32")).toBeUndefined()
+    // the pointer's two lines: the pipe name, then this service start's token; a one-line
+    // pointer predates the token and reads as unreachable
+    writeFileSync(join(home, "midad.sock.path"), "\\\\.\\pipe\\mida-ab")
+    expect(socketPathFor(home, tmpdir(), "win32")).toBeUndefined()
+    writeFileSync(join(home, "midad.sock.path"), `\\\\.\\pipe\\mida-ab\n${"ab".repeat(32)}`)
+    expect(socketPathFor(home, tmpdir(), "win32")).toBe("\\\\.\\pipe\\mida-ab")
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it("on Windows the SDK preflights the pointer's token before it sends any request", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sdk-win-"))
+    const stand = join(mkdtempSync(join(tmpdir(), "sdk-pipe-")), "p.sock")
+    const token = "cd".repeat(32)
+    writeFileSync(join(home, "midad.sock.path"), `${stand}\n${token}`)
+    const seen: { method?: string; url?: string; body: string }[] = []
+    const server = createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on("data", (c) => chunks.push(c))
+      req.on("end", () => {
+        seen.push({ method: req.method, url: req.url, body: Buffer.concat(chunks).toString("utf8") })
+        // an impostor: answers 200 but never carries this start's token
+        res.writeHead(200, { "content-type": "application/json" })
+        res.end(JSON.stringify({ ok: true }))
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(stand, () => resolve()))
+    try {
+      const reply = await callDaemon(home, "/remember", { agent: "codex", namespace: "projects.current", content: "x" }, { timeoutMs: 2_000, platform: "win32" })
+      expect(reply.status).toBe(0)
+      expect(seen).toEqual([{ method: "GET", url: "/health", body: "" }])
+    } finally {
+      server.closeAllConnections()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+    rmSync(home, { recursive: true, force: true })
+  })
+
+  it("on Windows the matching token lets the SDK's request through", async () => {
+    const home = mkdtempSync(join(tmpdir(), "sdk-win-"))
+    const stand = join(mkdtempSync(join(tmpdir(), "sdk-pipe-")), "p.sock")
+    const token = "cd".repeat(32)
+    writeFileSync(join(home, "midad.sock.path"), `${stand}\n${token}`)
+    const server = createServer((req, res) => {
+      res.writeHead(200, { "content-type": "application/json", "x-mida-token": token })
+      res.end(JSON.stringify({ ok: true, pid: 9 }))
+    })
+    await new Promise<void>((resolve) => server.listen(stand, () => resolve()))
+    try {
+      const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 2_000, platform: "win32" })
+      expect(reply.status).toBe(200)
+      expect(reply.body).toEqual({ ok: true, pid: 9 })
+    } finally {
+      server.closeAllConnections()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+    rmSync(home, { recursive: true, force: true })
   })
 })

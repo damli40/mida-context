@@ -10,6 +10,7 @@ import os from "node:os"
 import path, { join } from "node:path"
 import { CONTENT_FIELDS, LIMITS, cutText, limitNote, repointEvidence, splitLimitNote, validateCheckpoint, type Checkpoint, type LimitList } from "@mida/checkpoint"
 import { extractJsonObject } from "./extract-json.js"
+import { killProcessTree } from "./process-tree.js"
 import { buildExtractPrompt } from "./prompt.js"
 import { scrubSecrets, scrubValue } from "./scrub.js"
 import { stripLeadingScaffolds } from "./transcript-claude.js"
@@ -390,6 +391,7 @@ function runModel(model: ModelCommand, prompt: string, makeTempDir?: () => strin
         // CLI's never reaches the detail either.
         stdio: ["pipe", "pipe", model.stderrDetail === true || model.agentCli === true ? "pipe" : "ignore"],
         detached: true,
+        windowsHide: true,
       })
     } catch (err) {
       done({ ok: false, detail: `spawn: ${err instanceof Error ? err.message : String(err)}` })
@@ -464,8 +466,9 @@ function runModel(model: ModelCommand, prompt: string, makeTempDir?: () => strin
       timedOut = true
       // Negative pid = the child's whole process group (detached made it the
       // leader); grandchildren die with the model instead of outliving it.
+      // Windows has no process groups: the helper walks the tree with taskkill.
       try {
-        process.kill(-(child.pid as number), "SIGKILL")
+        killProcessTree(child.pid as number)
       } catch {
         child.kill("SIGKILL")
       }

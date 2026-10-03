@@ -3,6 +3,7 @@ import { MidaError } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
 import type { AccessRequestStore, StoredAccessRequest } from "@mida/sdk"
 import type { MidaHome } from "./home.js"
+import { fsyncFolder } from "./platform.js"
 
 /**
  * Pending approval requests on disk, one file per request, so a restart between "agent asked" and "owner approved"
@@ -12,11 +13,13 @@ import type { MidaHome } from "./home.js"
 export class FileAccessRequestStore implements AccessRequestStore {
   readonly #home: MidaHome
   readonly #folder: string
+  readonly #platform: NodeJS.Platform
 
-  constructor(home: MidaHome, agentName: string) {
+  constructor(home: MidaHome, agentName: string, platform: NodeJS.Platform = process.platform) {
     if (!/^[a-z0-9-]+$/.test(agentName)) throw new Error(`bad agent name: ${agentName}`)
     this.#home = home
     this.#folder = `requests/${agentName}`
+    this.#platform = platform
   }
 
   #file(requestId: Hex): string {
@@ -51,11 +54,8 @@ export class FileAccessRequestStore implements AccessRequestStore {
     } finally {
       closeSync(fd)
     }
-    const folderFd = openSync(this.#home.path(this.#folder), "r")
-    try {
-      fsyncSync(folderFd)
-    } finally {
-      closeSync(folderFd)
-    }
+    // Windows refuses a folder fsync (EPERM); fsyncFolder skips there. The marker file above
+    // is already durable on its own.
+    fsyncFolder(this.#home.path(this.#folder), this.#platform)
   }
 }

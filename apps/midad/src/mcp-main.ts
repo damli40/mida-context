@@ -8,7 +8,7 @@ import { resolveHome } from "./home.js"
 import { foreignClientReplayReason, parentProcessBasename } from "./devin-facts.js"
 import { drainerEnv } from "./hook.js"
 import { MCP_USAGE, createMidaMcpServer, parseMcpArgs, startupCheck } from "./mcp.js"
-import { siblingEntryArgs } from "./sibling.js"
+import { detachedSpawnOptions, siblingEntryArgs } from "./sibling.js"
 import { DEFAULT_TASK, folderTaskFor, taskOrUndefined } from "./task.js"
 
 /**
@@ -26,12 +26,7 @@ const DAEMON_WAIT_MS = 4_000
 // sibling.ts decides; the Mida home is the child's working directory. Same env-stripping as the
 // hooks: nothing agent-scoped (ANTHROPIC_* and friends) leaks into the daemon.
 function spawnDaemon(cwd: string): void {
-  const child = spawn(process.execPath, siblingEntryArgs("midad"), {
-    detached: true,
-    stdio: "ignore",
-    cwd,
-    env: drainerEnv(process.env),
-  })
+  const child = spawn(process.execPath, siblingEntryArgs("midad"), detachedSpawnOptions(cwd, drainerEnv(process.env)))
   child.on("error", () => {})
   child.unref()
 }

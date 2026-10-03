@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest"
 import { createServer } from "node:net"
+import { createServer as createHttpServer } from "node:http"
 import type { Server, Socket } from "node:net"
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -34,7 +35,7 @@ const close = (server: Server) => new Promise<void>((done) => server.close(() =>
 describe("socketPathFor", () => {
   it("is <home>/midad.sock for a normal home", () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
-    expect(socketPathFor(home)).toBe(home.path(SOCKET_FILE))
+    expect(socketPathFor(home)!).toBe(home.path(SOCKET_FILE))
   })
 
   it("falls back inside a private per-user tmpdir folder when the home path would exceed the socket limit", () => {
@@ -42,7 +43,7 @@ describe("socketPathFor", () => {
     const deep = join(tmpdir(), "mida-deep-" + "d".repeat(60), "e".repeat(60), "home")
     const home = new MidaHome(deep)
     expect(Buffer.byteLength(home.path(SOCKET_FILE))).toBeGreaterThan(100)
-    const resolved = socketPathFor(home)
+    const resolved = socketPathFor(home)!
     // the socket never sits loose in the shared temp folder — it lives in <tmp>/mida-<uid>/
     expect(dirname(resolved)).toBe(fallbackSocketDir())
     expect(resolved).not.toBe(home.path(SOCKET_FILE))
@@ -55,7 +56,7 @@ describe("socketPathFor", () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     const pointed = join(tmpdir(), "mida-pointed-test.sock")
     writeFileSync(home.path(`${SOCKET_FILE}.path`), pointed, { mode: 0o600 })
-    expect(socketPathFor(home)).toBe(pointed)
+    expect(socketPathFor(home)!).toBe(pointed)
   })
 })
 
@@ -100,7 +101,7 @@ describe("callDaemon", () => {
 
   it("parses the JSON reply and status from a real socket server", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
-    const server = await fakeDaemon(socketPathFor(home), (socket) => replyJson(socket, 200, { ok: true, pid: 4321 }))
+    const server = await fakeDaemon(socketPathFor(home)!, (socket) => replyJson(socket, 200, { ok: true, pid: 4321 }))
     try {
       const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 1_000 })
       expect(reply.status).toBe(200)
@@ -113,7 +114,7 @@ describe("callDaemon", () => {
   it("posts the body and resolves status 0 when the daemon never answers", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     // accepts the connection and stays silent — the timeout alone ends the call
-    const server = await fakeDaemon(socketPathFor(home), () => {})
+    const server = await fakeDaemon(socketPathFor(home)!, () => {})
     try {
       const started = Date.now()
       const reply = await callDaemon(home, "/kick", {}, { timeoutMs: 150 })
@@ -126,7 +127,7 @@ describe("callDaemon", () => {
 
   it("resolves status 0 on a reply that is not JSON", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
-    const server = await fakeDaemon(socketPathFor(home), (socket) => {
+    const server = await fakeDaemon(socketPathFor(home)!, (socket) => {
       socket.end("HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nabc")
     })
     try {
@@ -141,7 +142,7 @@ describe("callDaemon", () => {
 describe("ensureDaemon", () => {
   it("returns true without spawning when the daemon already answers", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
-    const server = await fakeDaemon(socketPathFor(home), (socket) => replyJson(socket, 200, { ok: true }))
+    const server = await fakeDaemon(socketPathFor(home)!, (socket) => replyJson(socket, 200, { ok: true }))
     try {
       let spawned = 0
       const up = await ensureDaemon(home, () => { spawned += 1 }, { waitMs: 2_000 })
@@ -165,7 +166,7 @@ describe("ensureDaemon", () => {
   it("ensureDaemonState: a listening socket that never answers /health is slow, not down", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     // accepts the connection and stays silent — connected, just not answering
-    const server = await fakeDaemon(socketPathFor(home), () => {})
+    const server = await fakeDaemon(socketPathFor(home)!, () => {})
     try {
       let spawned = 0
       const state = await ensureDaemonState(home, () => { spawned += 1 }, { waitMs: 800 })
@@ -207,7 +208,7 @@ describe("ensureDaemon", () => {
     })
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject)
-      server.listen(socketPathFor(home), () => resolve())
+      server.listen(socketPathFor(home)!, () => resolve())
     })
     try {
       const state = await ensureDaemonState(home, () => {}, { waitMs: 530 })
@@ -222,7 +223,7 @@ describe("ensureDaemon", () => {
     // Same truncated tail as the missing-socket run, but here something holds the socket:
     // the first probe's full-length timeout already proved "slow" — the tail must not undo it.
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
-    const server = await fakeDaemon(socketPathFor(home), () => {})
+    const server = await fakeDaemon(socketPathFor(home)!, () => {})
     try {
       const state = await ensureDaemonState(home, () => {}, { waitMs: 615 })
       expect(state).toBe("slow")
@@ -278,7 +279,7 @@ describe("ensureCurrentDaemon", () => {
   it("a daemon running the same code is used as-is — no shutdown, no spawn", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     const posts: string[] = []
-    const server = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+    const server = await fakeHttpDaemon(socketPathFor(home)!, (req, socket) => {
       if (req.method === "POST") posts.push(req.path)
       replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" })
     })
@@ -301,7 +302,7 @@ describe("ensureCurrentDaemon", () => {
     // answers /health with the OLD package version while this command carries the new one
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     const posts: string[] = []
-    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+    const oldServer = await fakeHttpDaemon(socketPathFor(home)!, (req, socket) => {
       if (req.method === "POST") {
         posts.push(req.path)
         replyJson(socket, 200, { ok: true })
@@ -314,7 +315,7 @@ describe("ensureCurrentDaemon", () => {
     let replacement: Server | undefined
     const result = await ensureCurrentDaemon(home, () => {
       spawned += 1
-      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+      void fakeHttpDaemon(socketPathFor(home)!, (req, socket) =>
         replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "unknown", codeVersion: "1.0.1" }),
       ).then((s) => { replacement = s })
     }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "unknown", codeVersion: "1.0.1" } })
@@ -334,7 +335,7 @@ describe("ensureCurrentDaemon", () => {
     // against this command's version — that absence IS a difference
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     const posts: string[] = []
-    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+    const oldServer = await fakeHttpDaemon(socketPathFor(home)!, (req, socket) => {
       if (req.method === "POST") {
         posts.push(req.path)
         replyJson(socket, 200, { ok: true })
@@ -347,7 +348,7 @@ describe("ensureCurrentDaemon", () => {
     let replacement: Server | undefined
     const result = await ensureCurrentDaemon(home, () => {
       spawned += 1
-      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+      void fakeHttpDaemon(socketPathFor(home)!, (req, socket) =>
         replyJson(socket, 200, { ok: true, pid: 10, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.0.1" }),
       ).then((s) => { replacement = s })
     }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.0.1" } })
@@ -368,7 +369,7 @@ describe("ensureCurrentDaemon", () => {
     let server: Server | undefined
     const result = await ensureCurrentDaemon(home, () => {
       spawned += 1
-      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+      void fakeHttpDaemon(socketPathFor(home)!, (req, socket) =>
         replyJson(socket, 200, { ok: true, pid: 2, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" }),
       ).then((s) => { server = s })
     }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" } })
@@ -383,7 +384,7 @@ describe("ensureCurrentDaemon", () => {
   it("a daemon reporting a different commit gets one /shutdown, then is replaced", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     const posts: string[] = []
-    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+    const oldServer = await fakeHttpDaemon(socketPathFor(home)!, (req, socket) => {
       if (req.method === "POST") {
         posts.push(req.path)
         replyJson(socket, 200, { ok: true })
@@ -396,7 +397,7 @@ describe("ensureCurrentDaemon", () => {
     let replacement: Server | undefined
     const result = await ensureCurrentDaemon(home, () => {
       spawned += 1
-      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+      void fakeHttpDaemon(socketPathFor(home)!, (req, socket) =>
         replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "new5678", codeVersion: "1.2.3" }),
       ).then((s) => { replacement = s })
     }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "new5678", codeVersion: "1.2.3" } })
@@ -413,7 +414,7 @@ describe("ensureCurrentDaemon", () => {
 
   it("a daemon that cannot name its code (no codeRoot in /health) is replaced too", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
-    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+    const oldServer = await fakeHttpDaemon(socketPathFor(home)!, (req, socket) => {
       if (req.method === "POST") {
         replyJson(socket, 200, { ok: true })
         if (req.path === "/shutdown") void closeQuiet(oldServer)
@@ -424,7 +425,7 @@ describe("ensureCurrentDaemon", () => {
     })
     let replacement: Server | undefined
     const result = await ensureCurrentDaemon(home, () => {
-      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+      void fakeHttpDaemon(socketPathFor(home)!, (req, socket) =>
         replyJson(socket, 200, { ok: true, pid: 10, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" }),
       ).then((s) => { replacement = s })
     }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" } })
@@ -440,7 +441,7 @@ describe("ensureCurrentDaemon", () => {
   it('"unknown" counts as equal only when BOTH sides are unknown', async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     // both sides "unknown" — nothing to compare, so nothing is replaced
-    const sameServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+    const sameServer = await fakeHttpDaemon(socketPathFor(home)!, (req, socket) =>
       replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "unknown", codeVersion: "unknown" }),
     )
     try {
@@ -455,7 +456,7 @@ describe("ensureCurrentDaemon", () => {
 
     // one side real, one side "unknown" — that IS a difference and the service is replaced
     const home2 = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
-    const oldServer = await fakeHttpDaemon(socketPathFor(home2), (req, socket) => {
+    const oldServer = await fakeHttpDaemon(socketPathFor(home2)!, (req, socket) => {
       if (req.method === "POST") {
         replyJson(socket, 200, { ok: true })
         if (req.path === "/shutdown") void closeQuiet(oldServer)
@@ -465,7 +466,7 @@ describe("ensureCurrentDaemon", () => {
     })
     let replacement: Server | undefined
     const result = await ensureCurrentDaemon(home2, () => {
-      void fakeHttpDaemon(socketPathFor(home2), (req, socket) =>
+      void fakeHttpDaemon(socketPathFor(home2)!, (req, socket) =>
         replyJson(socket, 200, { ok: true, pid: 4, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" }),
       ).then((s) => { replacement = s })
     }, { waitMs: 5_000, self: { codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" } })
@@ -481,7 +482,7 @@ describe("ensureCurrentDaemon", () => {
   it("a daemon that ignores /shutdown earns a refusal naming the pid, both roots and how to stop it", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     // answers /shutdown politely but never actually stops — the wait must give up, not hang
-    const server = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+    const server = await fakeHttpDaemon(socketPathFor(home)!, (req, socket) => {
       if (req.method === "POST") {
         replyJson(socket, 200, { ok: true })
         return
@@ -524,13 +525,13 @@ describe("ensureCurrentDaemon", () => {
     expect(Date.now() - started).toBeLessThan(3_000)
     expect(result).toEqual({ up: false })
     expect(spawned).toBe(0)
-    expect(existsSync(socketPathFor(home))).toBe(false)
+    expect(existsSync(socketPathFor(home)!)).toBe(false)
   })
 
   it("whenDown 'leave': a daemon on other code is still replaced — shutdown, spawn, replaced", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     const posts: string[] = []
-    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+    const oldServer = await fakeHttpDaemon(socketPathFor(home)!, (req, socket) => {
       if (req.method === "POST") {
         posts.push(req.path)
         replyJson(socket, 200, { ok: true })
@@ -543,7 +544,7 @@ describe("ensureCurrentDaemon", () => {
     let replacement: Server | undefined
     const result = await ensureCurrentDaemon(home, () => {
       spawned += 1
-      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+      void fakeHttpDaemon(socketPathFor(home)!, (req, socket) =>
         replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "new5678", codeVersion: "1.2.3" }),
       ).then((s) => { replacement = s })
     }, { waitMs: 5_000, whenDown: "leave", self: { codeRoot: "/code/here", codeCommit: "new5678", codeVersion: "1.2.3" } })
@@ -567,7 +568,7 @@ describe("ensureCurrentDaemon", () => {
     let fakeNow = start
     let stopped = false
     const posts: string[] = []
-    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+    const oldServer = await fakeHttpDaemon(socketPathFor(home)!, (req, socket) => {
       if (req.method === "POST") {
         posts.push(req.path)
         replyJson(socket, 200, { ok: true })
@@ -585,7 +586,7 @@ describe("ensureCurrentDaemon", () => {
     let firedAt = 0
     const result = await ensureCurrentDaemon(home, () => {
       spawned += 1
-      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+      void fakeHttpDaemon(socketPathFor(home)!, (req, socket) =>
         replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "new5678", codeVersion: "1.2.3" }),
       ).then((s) => { replacement = s })
     }, {
@@ -615,7 +616,7 @@ describe("ensureCurrentDaemon", () => {
 
   it("the still-up note does not fire for a service that stops at once (UF-QD)", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
-    const oldServer = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+    const oldServer = await fakeHttpDaemon(socketPathFor(home)!, (req, socket) => {
       if (req.method === "POST") {
         replyJson(socket, 200, { ok: true })
         if (req.path === "/shutdown") void closeQuiet(oldServer)
@@ -628,7 +629,7 @@ describe("ensureCurrentDaemon", () => {
     let calls = 0
     const result = await ensureCurrentDaemon(home, () => {
       spawned += 1
-      void fakeHttpDaemon(socketPathFor(home), (req, socket) =>
+      void fakeHttpDaemon(socketPathFor(home)!, (req, socket) =>
         replyJson(socket, 200, { ok: true, pid: 8, codeRoot: "/code/here", codeCommit: "new5678", codeVersion: "1.2.3" }),
       ).then((s) => { replacement = s })
     }, {
@@ -650,7 +651,7 @@ describe("ensureCurrentDaemon", () => {
   it("whenDown 'leave': a daemon on THIS code is left alone — no spawn, no shutdown, nothing written", async () => {
     const home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-ctl-")))
     const posts: string[] = []
-    const server = await fakeHttpDaemon(socketPathFor(home), (req, socket) => {
+    const server = await fakeHttpDaemon(socketPathFor(home)!, (req, socket) => {
       if (req.method === "POST") posts.push(req.path)
       replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "abc1234", codeVersion: "1.2.3" })
     })
@@ -690,7 +691,7 @@ describe("the migrate/in-progress marker (migrate B6)", () => {
   it("ensureDaemon does not even probe — a socket answering behind the marker changes nothing", async () => {
     const home = marked()
     let probed = 0
-    const server = await fakeDaemon(socketPathFor(home), (socket, _data) => {
+    const server = await fakeDaemon(socketPathFor(home)!, (socket, _data) => {
       probed += 1
       replyJson(socket, 200, { ok: true, pid: 1 })
     })
@@ -707,7 +708,7 @@ describe("the migrate/in-progress marker (migrate B6)", () => {
     const home = marked()
     const posts: string[] = []
     let probed = 0
-    const server = await fakeDaemon(socketPathFor(home), (socket, data) => {
+    const server = await fakeDaemon(socketPathFor(home)!, (socket, data) => {
       probed += 1
       if (data.toString("utf8").startsWith("POST")) posts.push(data.toString("utf8").split(" ")[1] ?? "")
       replyJson(socket, 200, { ok: true, pid: 1, codeRoot: "/code/here", codeCommit: "abc1234" })
@@ -725,6 +726,178 @@ describe("the migrate/in-progress marker (migrate B6)", () => {
       expect(spawned).toBe(0)
       expect(probed).toBe(0)
       expect(posts).toEqual([])
+    } finally {
+      await close(server)
+    }
+  })
+})
+
+describe("Windows: the pointer is the only address", () => {
+  const made: string[] = []
+  afterAll(() => {
+    for (const dir of made) rmSync(dir, { recursive: true, force: true })
+  })
+  const tempHome = (): MidaHome => {
+    const dir = mkdtempSync(join(tmpdir(), "mida-ctl-"))
+    made.push(dir)
+    return new MidaHome(dir)
+  }
+  const TOKEN = "ab".repeat(32)
+
+  it("socketPathFor returns the pipe name from a two-line pointer", () => {
+    const home = tempHome()
+    writeFileSync(home.path("midad.sock.path"), `\\\\.\\pipe\\mida-0123456789abcdef0123456789abcdef\n${TOKEN}`)
+    expect(socketPathFor(home, tmpdir(), "win32")).toBe("\\\\.\\pipe\\mida-0123456789abcdef0123456789abcdef")
+  })
+
+  it("a one-line pointer predates the token and reads as unreachable", () => {
+    const home = tempHome()
+    writeFileSync(home.path("midad.sock.path"), "\\\\.\\pipe\\mida-0123456789abcdef0123456789abcdef")
+    expect(socketPathFor(home, tmpdir(), "win32")).toBeUndefined()
+  })
+
+  it("a two-line pointer without a token reads as unreachable too", () => {
+    const home = tempHome()
+    writeFileSync(home.path("midad.sock.path"), "\\\\.\\pipe\\mida-0123456789abcdef0123456789abcdef\n")
+    expect(socketPathFor(home, tmpdir(), "win32")).toBeUndefined()
+  })
+
+  it("socketPathFor returns undefined with no pointer, never a guessable name", () => {
+    expect(socketPathFor(tempHome(), tmpdir(), "win32")).toBeUndefined()
+  })
+
+  it("callDaemon answers unreachable at once when there is no address", async () => {
+    const started = Date.now()
+    const reply = await callDaemon(tempHome(), "/health", undefined, { timeoutMs: 5_000, platform: "win32" })
+    expect(reply).toEqual({ status: 0, body: null, failure: "unreachable" })
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  it("a pointer naming a pipe that is gone is unreachable, not a hang (Review Focus 2)", async () => {
+    const home = tempHome()
+    writeFileSync(home.path("midad.sock.path"), `${join(home.root, "gone.sock")}\n${TOKEN}`)
+    const reply = await callDaemon(home, "/health", undefined, { timeoutMs: 2_000, platform: "win32" })
+    expect(reply.failure).toBe("unreachable")
+  })
+})
+
+describe("Windows: the pipe must prove it is this service's before a request body is sent", () => {
+  const made: string[] = []
+  afterAll(() => {
+    for (const dir of made) rmSync(dir, { recursive: true, force: true })
+  })
+  const tempHome = (): MidaHome => {
+    const dir = mkdtempSync(join(tmpdir(), "mida-ctl-"))
+    made.push(dir)
+    return new MidaHome(dir)
+  }
+  const standPath = (): string => {
+    const dir = mkdtempSync(join(tmpdir(), "mp-"))
+    made.push(dir)
+    return join(dir, "p.sock")
+  }
+  const TOKEN = "cd".repeat(32)
+
+  // a short Unix socket stands in for the named pipe, as the Task 3 tests do
+  const serve = async (
+    path: string,
+    answer: (req: { method?: string; url?: string; body: string }) => { status: number; token?: string; body: unknown },
+  ): Promise<{ server: ReturnType<typeof createHttpServer>; seen: { method?: string; url?: string; body: string }[] }> => {
+    const seen: { method?: string; url?: string; body: string }[] = []
+    const server = createHttpServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on("data", (c) => chunks.push(c))
+      req.on("end", () => {
+        const record = { method: req.method, url: req.url, body: Buffer.concat(chunks).toString("utf8") }
+        seen.push(record)
+        const out = answer(record)
+        const payload = JSON.stringify(out.body ?? null)
+        res.writeHead(out.status, {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(payload),
+          ...(out.token === undefined ? {} : { "x-mida-token": out.token }),
+        })
+        res.end(payload)
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(path, () => resolve()))
+    return { server, seen }
+  }
+  const close = (server: ReturnType<typeof createHttpServer>) =>
+    new Promise<void>((done) => {
+      server.closeAllConnections()
+      server.close(() => done())
+    })
+
+  it("an impostor answering without the token is never sent the real request", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    writeFileSync(home.path("midad.sock.path"), `${stand}\n${TOKEN}`)
+    const { server, seen } = await serve(stand, () => ({ status: 200, body: { ok: true } }))
+    try {
+      const reply = await callDaemon(home, "/cli", { argv: ["handoff", "codex"], cwd: "C:\\work" }, { timeoutMs: 2_000, platform: "win32" })
+      expect(reply).toEqual({ status: 0, body: null, failure: "unreachable" })
+      // the only thing the impostor ever saw was the bodyless health probe
+      expect(seen).toEqual([{ method: "GET", url: "/health", body: "" }])
+    } finally {
+      await close(server)
+    }
+  })
+
+  it("a wrong token is the same refusal as no token", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    writeFileSync(home.path("midad.sock.path"), `${stand}\n${TOKEN}`)
+    const { server, seen } = await serve(stand, () => ({ status: 200, token: "ef".repeat(32), body: { ok: true } }))
+    try {
+      const reply = await callDaemon(home, "/cli", { argv: ["handoff"] }, { timeoutMs: 2_000, platform: "win32" })
+      expect(reply.failure).toBe("unreachable")
+      expect(seen.map((r) => `${r.method} ${r.url}`)).toEqual(["GET /health"])
+    } finally {
+      await close(server)
+    }
+  })
+
+  it("the matching token lets the real request through", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    writeFileSync(home.path("midad.sock.path"), `${stand}\n${TOKEN}`)
+    const { server, seen } = await serve(stand, (req) =>
+      req.url === "/health" ? { status: 200, token: TOKEN, body: { ok: true, pid: 7 } } : { status: 200, token: TOKEN, body: { code: 0, lines: ["done"] } },
+    )
+    try {
+      const reply = await callDaemon(home, "/cli", { argv: ["handoff", "codex"] }, { timeoutMs: 2_000, platform: "win32" })
+      expect(reply.status).toBe(200)
+      expect(reply.body).toEqual({ code: 0, lines: ["done"] })
+      expect(seen.map((r) => `${r.method} ${r.url}`)).toEqual(["GET /health", "POST /cli"])
+    } finally {
+      await close(server)
+    }
+  })
+
+  it("a legacy one-line pointer never reaches the pipe at all", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    writeFileSync(home.path("midad.sock.path"), stand)
+    const { server, seen } = await serve(stand, () => ({ status: 200, body: { ok: true } }))
+    try {
+      const reply = await callDaemon(home, "/cli", { argv: ["handoff"] }, { timeoutMs: 2_000, platform: "win32" })
+      expect(reply.failure).toBe("unreachable")
+      expect(seen).toEqual([])
+    } finally {
+      await close(server)
+    }
+  })
+
+  it("on Mac and Linux the same pointer means what it always did — one request, no token check", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    writeFileSync(home.path("midad.sock.path"), stand)
+    const { server, seen } = await serve(stand, () => ({ status: 200, body: { ok: true } }))
+    try {
+      const reply = await callDaemon(home, "/cli", { argv: ["handoff", "codex"] }, { timeoutMs: 2_000, platform: "darwin" })
+      expect(reply.status).toBe(200)
+      expect(seen.map((r) => `${r.method} ${r.url}`)).toEqual(["POST /cli"])
     } finally {
       await close(server)
     }

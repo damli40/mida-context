@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest"
+import { afterAll, describe, expect, it } from "vitest"
 import { spawn, spawnSync } from "node:child_process"
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { MidaHome, ServiceRuntime } from "@mida/midad"
 import type { Network } from "@mida/midad"
+import { lockHolder, processProbeFor, windowsProcessProbe } from "../src/runtime.js"
 
 /**
  * The daemon's runtime carries no owner key. These tests run with no chain: the refusal happens
@@ -247,5 +248,57 @@ describe("ServiceRuntime — the daemon's runtime", () => {
       `another Mida process (pid ${process.pid}) already holds this home`,
     )
     expect(home.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(process.pid)
+  })
+})
+
+describe("Windows process probe", () => {
+  const made: string[] = []
+  afterAll(() => {
+    for (const dir of made) rmSync(dir, { recursive: true, force: true })
+  })
+  const fakeRun = (stdout: string, status = 0) => {
+    const calls: { cmd: string; args: readonly string[] }[] = []
+    const run = ((cmd: string, args: readonly string[]) => {
+      calls.push({ cmd, args })
+      return { status, stdout, stderr: "", error: undefined }
+    }) as unknown as typeof import("node:child_process").spawnSync
+    return { run, calls }
+  }
+
+  it("asks PowerShell for the creation time in UTC and returns it trimmed", () => {
+    const { run, calls } = fakeRun("2026-10-03T01:02:03.4567890Z\r\n")
+    expect(windowsProcessProbe(run)(4242, "lstart")).toBe("2026-10-03T01:02:03.4567890Z")
+    expect(calls[0]!.cmd).toBe("powershell.exe")
+    expect(calls[0]!.args).toContain("-NoProfile")
+    expect(calls[0]!.args.join(" ")).toContain("ProcessId=4242")
+    expect(calls[0]!.args.join(" ")).toContain("ToUniversalTime()")
+  })
+
+  it("asks for the command line for the command field", () => {
+    const { run, calls } = fakeRun("node.exe x\r\n")
+    expect(windowsProcessProbe(run)(7, "command")).toBe("node.exe x")
+    expect(calls[0]!.args.join(" ")).toContain("CommandLine")
+  })
+
+  it("answers undefined for a failed lookup or a non-integer pid, without running anything for the latter", () => {
+    expect(windowsProcessProbe(fakeRun("", 1).run)(7, "lstart")).toBeUndefined()
+    const { run, calls } = fakeRun("x")
+    expect(windowsProcessProbe(run)(1.5, "lstart")).toBeUndefined()
+    expect(calls).toHaveLength(0)
+  })
+
+  it("processProbeFor picks the Windows probe on win32", () => {
+    expect(processProbeFor("win32")).not.toBe(processProbeFor("darwin"))
+  })
+
+  it("an older lock is recognised from a Windows command line", () => {
+    const home = freshHome()
+    made.push(home.root)
+    home.writeSecretJson("midad.lock", { pid: process.ppid })
+    const probe = (_pid: number, field: "lstart" | "command") =>
+      field === "command"
+        ? '"C:\\Program Files\\nodejs\\node.exe" C:\\Users\\Jane\\AppData\\Roaming\\npm\\node_modules\\mida-context\\dist\\midad.js'
+        : undefined
+    expect(lockHolder(home, probe)).toEqual({ pid: process.ppid, kind: "held", role: "service" })
   })
 })

@@ -8,7 +8,7 @@ import type { ContextKind, Hex } from "@mida/protocol"
 import type { ContextObject } from "@mida/sdk"
 import { scrubSecrets } from "@mida/compiler"
 import type { Runtime, ServiceRuntime } from "./runtime.js"
-import { listAgentNames, loadAgentIdentity } from "./keys.js"
+import { listAgentNames, loadAgentIdentity, markWrapsOwed } from "./keys.js"
 import { movedOnSuffix, readEnvelope, validateMigrationEnvelope } from "./migration-envelope.js"
 
 /**
@@ -113,22 +113,29 @@ export async function remember(
  */
 async function repairFactWraps(runtime: Runtime, nsId: Hex): Promise<void> {
   const { vault, reader, owner, home } = runtime
-  const targets: Hex[] = []
-  for (const name of listAgentNames(home)) {
-    let identity: ReturnType<typeof loadAgentIdentity>
-    try {
-      identity = loadAgentIdentity(home, name)
-    } catch {
-      continue
+  try {
+    const targets: Hex[] = []
+    for (const name of listAgentNames(home)) {
+      let identity: ReturnType<typeof loadAgentIdentity>
+      try {
+        identity = loadAgentIdentity(home, name)
+      } catch {
+        continue
+      }
+      if (identity === undefined) continue
+      if (await reader.hasAuthority(owner, identity.agentId, nsId, PERMISSION.READ, 0)) targets.push(identity.agentId)
     }
-    if (identity === undefined) continue
-    if (await reader.hasAuthority(owner, identity.agentId, nsId, PERMISSION.READ, 0)) targets.push(identity.agentId)
-  }
-  if (targets.length > 0) {
-    runtime.progress?.(`sending the new key to ${targets.length} agent${targets.length === 1 ? "" : "s"}…`)
-  }
-  for (const agentId of targets) {
-    await vault.publishReaderWraps({ agentId, namespaceId: nsId })
+    if (targets.length > 0) {
+      runtime.progress?.(`sending the new key to ${targets.length} agent${targets.length === 1 ? "" : "s"}…`)
+    }
+    for (const agentId of targets) {
+      await vault.publishReaderWraps({ agentId, namespaceId: nsId })
+    }
+  } catch (error) {
+    // UF-APR4: an interrupted fact-key send is owed work — the marker makes a later
+    // `mida approve` run the repair pass for the readers that never got it.
+    markWrapsOwed(home)
+    throw error
   }
 }
 

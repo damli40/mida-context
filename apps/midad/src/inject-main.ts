@@ -10,7 +10,7 @@ import { drainerEnv } from "./hook.js"
 import { appendLog } from "./log.js"
 import { isSafeName } from "./queue.js"
 import { writeSeen } from "./whatsnew.js"
-import { siblingEntryArgs } from "./sibling.js"
+import { detachedSpawnOptions, siblingEntryArgs } from "./sibling.js"
 
 const STDIN_CAP_BYTES = 1_000_000
 /** The session-start hook may wait for the daemon to come up — but not forever. */
@@ -48,12 +48,7 @@ function writeLine(line: string): Promise<void> {
 // Built `midad` beside this file in dist, or the .ts entry through the repo's tsx loader —
 // sibling.ts decides; the Mida home is the child's working directory.
 function spawnDaemon(cwd: string): void {
-  const child = spawn(process.execPath, siblingEntryArgs("midad"), {
-    detached: true,
-    stdio: "ignore",
-    cwd,
-    env: drainerEnv(process.env),
-  })
+  const child = spawn(process.execPath, siblingEntryArgs("midad"), detachedSpawnOptions(cwd, drainerEnv(process.env)))
   child.on("error", () => {})
   child.unref()
 }

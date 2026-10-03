@@ -29,6 +29,7 @@ import {
   ownerOnlyLine,
   ownerRefusalLine,
   peekJobs,
+  pidStartedAt,
   runCli,
   runCliWithRuntime,
   readOwnerUniverse,
@@ -1600,5 +1601,73 @@ describe("mida export — an interrupted or left-behind staging folder", () => {
     })
     expect(result.outcome).toBe("exported")
     expect(readFileSync(join(lookalike, "notes.txt"), "utf8")).toBe("somebody else's folder")
+  })
+})
+
+describe("mida export — Windows particulars", () => {
+  it("on win32 the parent folder flush is skipped by design, so no flush warning prints", async () => {
+    // The same refusal the warning test above provokes (mode 0300): had the flush run, the
+    // warning would print. On Windows fsyncFolder never runs it, so there is nothing to warn.
+    const home = ownerHome()
+    const cwd = tempDir()
+    const parent = join(cwd, "locked-parent")
+    mkdirSync(parent)
+    const dest = join(parent, "backup")
+    chmodSync(parent, 0o300)
+    const lines: string[] = []
+    try {
+      const result = await exportRecords({
+        home,
+        network,
+        folder: dest,
+        cwd,
+        platform: "win32",
+        print: (line) => lines.push(line),
+        openRuntime: async () => fakeRuntime(home),
+        readUniverse: async () => [fixtureRecord()],
+      })
+      expect(result).toMatchObject({ outcome: "exported", records: 1 })
+      expect(lines.filter((line) => line.startsWith("warning:"))).toEqual([])
+    } finally {
+      chmodSync(parent, 0o700)
+    }
+  })
+})
+
+describe("pidStartedAt — the staging marker's start-time probe", () => {
+  it("on Mac and Linux it is the pre-214d64f ps call: lstart= in the caller's own env", () => {
+    // A 0.1.3 staging marker was written under `ps -o lstart=` in the user's locale and time
+    // zone. The call must stay byte-identical: same argv, no LC_ALL or TZ override, or the
+    // same live pid would read as a stranger and its folder be swept mid-write.
+    const calls: { file: string; args: string[]; options: Record<string, unknown> }[] = []
+    const execFile = (file: string, args: string[], options: { encoding: "utf8" }) => {
+      calls.push({ file, args, options: { ...options } })
+      return "Sat Oct  3 01:02:03 2026\n"
+    }
+    expect(pidStartedAt(4242, "darwin", execFile)).toBe("Sat Oct  3 01:02:03 2026")
+    expect(pidStartedAt(4242, "linux", execFile)).toBe("Sat Oct  3 01:02:03 2026")
+    expect(calls).toEqual([
+      { file: "ps", args: ["-o", "lstart=", "-p", "4242"], options: { encoding: "utf8" } },
+      { file: "ps", args: ["-o", "lstart=", "-p", "4242"], options: { encoding: "utf8" } },
+    ])
+  })
+
+  it("on Windows it asks the process probe instead of ps", () => {
+    let psCalled = false
+    const execFile = () => {
+      psCalled = true
+      return "unused"
+    }
+    const probe = (pid: number, field: "lstart" | "command") => `${field}-${pid}`
+    expect(pidStartedAt(4242, "win32", execFile, probe)).toBe("lstart-4242")
+    expect(psCalled).toBe(false)
+  })
+
+  it("a ps that cannot answer reads as undefined, never as a dead writer", () => {
+    const failing = () => {
+      throw new Error("ps: no such process")
+    }
+    expect(pidStartedAt(4242, "darwin", failing)).toBeUndefined()
+    expect(pidStartedAt(4242, "darwin", () => "   \n")).toBeUndefined()
   })
 })

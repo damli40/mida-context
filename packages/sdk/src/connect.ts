@@ -1,5 +1,4 @@
 import {
-  chmodSync,
   closeSync,
   existsSync,
   fsyncSync,
@@ -7,7 +6,6 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
-  renameSync,
   rmSync,
   writeSync,
 } from "node:fs"
@@ -25,6 +23,7 @@ import type { AccessRequest, Address, Hex } from "@mida/protocol"
 import { MidaAgent } from "./agent.js"
 import type { AccessRequestInput, Grant } from "./agent.js"
 import type { AccessRequestStore, StoredAccessRequest } from "./request-store.js"
+import { fsyncFolder, writeSecretJson } from "./durability.js"
 
 /**
  * The public endpoints the published CLI and this SDK default to — the same constants
@@ -106,9 +105,11 @@ export interface ConnectedAgent {
  *  request this store saved. */
 export class FileAccessRequestStore implements AccessRequestStore {
   readonly #dir: string
+  readonly #platform: NodeJS.Platform
 
-  constructor(dir: string) {
+  constructor(dir: string, platform: NodeJS.Platform = process.platform) {
     this.#dir = dir
+    this.#platform = platform
   }
 
   #file(requestId: Hex): string {
@@ -160,45 +161,13 @@ export class FileAccessRequestStore implements AccessRequestStore {
     } finally {
       closeSync(fd)
     }
-    const dirFd = openSync(this.#dir, "r")
-    try {
-      fsyncSync(dirFd)
-    } finally {
-      closeSync(dirFd)
-    }
+    fsyncFolder(this.#dir, this.#platform)
   }
 }
 
 function readJsonFile<T>(file: string): T | undefined {
   if (!existsSync(file)) return undefined
   return JSON.parse(readFileSync(file, "utf8")) as T
-}
-
-/** An atomic secret-file write: durable temp file, rename into place, folder fsync. */
-function writeSecretJson(file: string, value: unknown): void {
-  const parent = dirname(file)
-  mkdirSync(parent, { recursive: true, mode: 0o700 })
-  chmodSync(parent, 0o700)
-  const temp = `${file}.${randomBytes(6).toString("hex")}.tmp`
-  try {
-    const fd = openSync(temp, "wx", 0o600)
-    try {
-      writeSync(fd, JSON.stringify(value, null, 2))
-      fsyncSync(fd)
-    } finally {
-      closeSync(fd)
-    }
-    renameSync(temp, file)
-  } catch (error) {
-    rmSync(temp, { force: true })
-    throw error
-  }
-  const dirFd = openSync(parent, "r")
-  try {
-    fsyncSync(dirFd)
-  } finally {
-    closeSync(dirFd)
-  }
 }
 
 function requireHex(record: Record<string, unknown>, field: string, file: string, pattern: RegExp): string {

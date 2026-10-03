@@ -78,7 +78,10 @@ export function enqueue(
   if (!isSafeName(job.agent)) throw new Error("bad-agent")
   if (!isSafeName(job.sessionId)) throw new Error("bad-session-id")
   const at = now().toISOString()
-  const id = `${at}-${randomBytes(4).toString("hex")}`
+  // a Windows filename may not hold ":", so the id swaps each one for "-"; the job's own `at`
+  // field keeps the real ISO time. An upgrade can leave old ":" names in the folder and the
+  // drain still reads them, since nothing here checks the name's shape.
+  const id = `${at.replace(/:/g, "-")}-${randomBytes(4).toString("hex")}`
   const full: CaptureJob = { ...job, id, at }
   home.writeSecretJson(`queue/${id}.json`, full)
   return full

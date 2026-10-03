@@ -498,6 +498,10 @@ async function toolRead(deps: McpServerDeps, args: Record<string, unknown> | und
   return toolText(body.lines.map((line) => String(line)).join("\n"))
 }
 
+/** Where the status line says the service listens: the socket's folder, or "a named pipe" on Windows. */
+const channelLabel = (path: string | undefined): string =>
+  path === undefined ? "no service address" : path.startsWith("\\\\.\\pipe\\") ? "a named pipe" : `socket in ${basename(dirname(path))}`
+
 /**
  * `mida_status` — /health, then one /handoff probe per agent registered in this home (plus this
  * server's own identity) so "approved for this folder" means exactly what the real gate answers
@@ -519,7 +523,7 @@ async function toolStatus(deps: McpServerDeps) {
   const lines = [
     `midad: answering — pid ${typeof body.pid === "number" ? body.pid : "unknown"}, up since ${startedAt}, queue ${
       typeof body.queueDepth === "number" ? body.queueDepth : "unknown"
-    } — socket in ${basename(dirname(socketPathFor(deps.home)))}`,
+    } — ${channelLabel(socketPathFor(deps.home))}`,
   ]
   // the same set keys.ts:listAgentNames computes — reproduced, not imported: keys.ts must stay
   // out of this module's graph — plus this server's own identity, whose verdict is printed even

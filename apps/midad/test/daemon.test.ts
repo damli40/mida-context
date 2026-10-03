@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest"
+import { afterAll, describe, expect, it } from "vitest"
 import { spawn, spawnSync } from "node:child_process"
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs"
-import { createServer as createHttpServer } from "node:http"
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs"
+import { createServer as createHttpServer, request as httpRequest } from "node:http"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { CheckpointCopies, MidaHome, callDaemon, enqueue, fallbackSocketDir, listJobs, ownerOnlyLine, removeJob, socketPathFor, startDaemon, writeSeen } from "@mida/midad"
@@ -106,7 +106,7 @@ describe("startDaemon", () => {
 
   it("replaces a stale socket file that has no listener behind it", async () => {
     const { home, deps } = setup()
-    writeFileSync(socketPathFor(home), "") // a dead daemon's leftover socket
+    writeFileSync(socketPathFor(home)!, "") // a dead daemon's leftover socket
     const daemon = await startDaemon(deps)
     try {
       expect(daemon.alreadyRunning).toBe(false)
@@ -123,7 +123,7 @@ describe("startDaemon", () => {
     // service kept running behind a deleted file and nothing could reach it again. The lock's
     // pid is the truth: a live holder keeps its socket, whatever the health probe said.
     const { home, deps } = setup()
-    const socketPath = socketPathFor(home)
+    const socketPath = socketPathFor(home)!
     const old = createHttpServer((req, res) => {
       setTimeout(() => {
         res.setHeader("content-type", "application/json")
@@ -166,7 +166,7 @@ describe("startDaemon", () => {
     const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
     try {
       home.writeSecretJson("midad.lock", { pid: holder.pid })
-      writeFileSync(socketPathFor(home), "")
+      writeFileSync(socketPathFor(home)!, "")
       const daemon = await startDaemon({ ...deps, staleCheckMs: 50 })
       try {
         expect(daemon.alreadyRunning).toBe(false)
@@ -187,7 +187,7 @@ describe("startDaemon", () => {
     // command line at all — but the lock carries the exact `ps -o lstart=` answer for its pid, so
     // it IS the process that took the lock. startDaemon must keep the socket file and back off.
     const { home, deps } = setup()
-    const socketPath = socketPathFor(home)
+    const socketPath = socketPathFor(home)!
     const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
     try {
       const started = spawnSync("ps", ["-o", "lstart=", "-p", String(holder.pid)], {
@@ -212,7 +212,7 @@ describe("startDaemon", () => {
     // Same shape, one byte off: the pid lives but belongs to a process started at a different
     // instant, so the lock is stale and the new service takes over — the socket file goes with it.
     const { home, deps } = setup()
-    const socketPath = socketPathFor(home)
+    const socketPath = socketPathFor(home)!
     const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })
     try {
       home.writeSecretJson("midad.lock", { pid: holder.pid, started: "Thu Jan  1 00:00:00 1970", role: "service" })
@@ -414,7 +414,7 @@ describe("startDaemon", () => {
 
   it("close() removes the socket and the lock, and a new daemon can start on the same home", async () => {
     const { home, deps } = setup()
-    const socket = socketPathFor(home)
+    const socket = socketPathFor(home)!
     const daemon = await startDaemon(deps)
     await daemon.close()
     expect(existsSync(socket)).toBe(false)
@@ -716,7 +716,7 @@ describe("startDaemon", () => {
     const deep = join(tmpdir(), "mida-deep-" + "d".repeat(60), "e".repeat(60), "home")
     const home = new MidaHome(deep)
     const deps = { ...setup().deps, home }
-    const socket = socketPathFor(home)
+    const socket = socketPathFor(home)!
     expect(socket).not.toBe(home.path("midad.sock"))
     expect(dirname(socket)).toBe(fallbackSocketDir())
     const daemon = await startDaemon(deps)
@@ -748,7 +748,7 @@ describe("startDaemon", () => {
       expect(dirStat.isDirectory()).toBe(true)
       expect(dirStat.mode & 0o777).toBe(0o700)
       expect(dirStat.uid).toBe(process.getuid!())
-      const socket = socketPathFor(home, base)
+      const socket = socketPathFor(home, base)!
       expect(statSync(socket).mode & 0o777).toBe(0o600)
       expect(process.umask()).toBe(umaskBefore)
       expect((await callDaemon(home, "/health", undefined, { timeoutMs: 1_000 })).status).toBe(200)
@@ -776,5 +776,148 @@ describe("startDaemon", () => {
     symlinkSync(mkdtempSync(join(tmpdir(), "mida-real-")), fallbackSocketDir(base))
     await expect(startDaemon(deps)).rejects.toThrow(/mode 0700/)
     expect(home.has("midad.lock")).toBe(false)
+  })
+})
+
+describe("startDaemon on Windows", () => {
+  const made: string[] = []
+  afterAll(() => {
+    for (const dir of made) rmSync(dir, { recursive: true, force: true })
+  })
+  const tempHome = (): MidaHome => {
+    const dir = mkdtempSync(join(tmpdir(), "mida-daemon-"))
+    made.push(dir)
+    return new MidaHome(dir)
+  }
+  // a short Unix socket path stands in for the pipe so the test can really connect on a Mac
+  const standPath = (): string => {
+    const dir = mkdtempSync(join(tmpdir(), "mp-"))
+    made.push(dir)
+    return join(dir, "p.sock")
+  }
+
+  it("listens on a fresh pipe name, records it in the pointer, removes the pointer on close", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    const handle = await startDaemon({ ...setup().deps, home, platform: "win32", pipeName: () => stand })
+    try {
+      const [name, token] = readFileSync(home.path("midad.sock.path"), "utf8").split("\n")
+      expect(name).toBe(stand)
+      expect(token).toMatch(/^[0-9a-f]{64}$/)
+      // the Windows client preflights /health with the pointer's token, and it passes
+      expect((await callDaemon(home, "/health", undefined, { timeoutMs: 2_000, platform: "win32" })).status).toBe(200)
+    } finally {
+      await handle.close()
+    }
+    expect(existsSync(home.path("midad.sock.path"))).toBe(false)
+  })
+
+  it("every reply on the pipe carries this start's token as x-mida-token", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    const handle = await startDaemon({ ...setup().deps, home, platform: "win32", pipeName: () => stand })
+    try {
+      const token = readFileSync(home.path("midad.sock.path"), "utf8").split("\n")[1]!.trim()
+      const headers = await new Promise<Record<string, unknown>>((resolve) => {
+        httpRequest({ socketPath: stand, path: "/health", method: "GET" }, (res) => {
+          res.resume()
+          res.on("end", () => resolve(res.headers))
+        }).end()
+      })
+      expect(headers["x-mida-token"]).toBe(token)
+    } finally {
+      await handle.close()
+    }
+  })
+
+  it("the pointer is written even when the pipe name equals the home's own socket path", async () => {
+    const home = tempHome()
+    const handle = await startDaemon({ ...setup().deps, home, platform: "win32", pipeName: () => home.path("midad.sock") })
+    try {
+      const [name, token] = readFileSync(home.path("midad.sock.path"), "utf8").split("\n")
+      expect(name).toBe(home.path("midad.sock"))
+      expect(token).toMatch(/^[0-9a-f]{64}$/)
+    } finally {
+      await handle.close()
+    }
+  })
+
+  it("a second start while the first answers is alreadyRunning", async () => {
+    const home = tempHome()
+    const stand = standPath()
+    const first = await startDaemon({ ...setup().deps, home, platform: "win32", pipeName: () => stand })
+    try {
+      const second = await startDaemon({ ...setup().deps, home, platform: "win32", pipeName: () => `${stand}2` })
+      expect(second.alreadyRunning).toBe(true)
+    } finally {
+      await first.close()
+    }
+  })
+
+  it("a stale pointer is replaced by the new start", async () => {
+    const home = tempHome()
+    writeFileSync(home.path("midad.sock.path"), join(home.root, "dead.sock"))
+    const stand = standPath()
+    const handle = await startDaemon({ ...setup().deps, home, platform: "win32", pipeName: () => stand })
+    try {
+      const [name, token] = readFileSync(home.path("midad.sock.path"), "utf8").split("\n")
+      expect(name).toBe(stand)
+      expect(token).toMatch(/^[0-9a-f]{64}$/)
+    } finally {
+      await handle.close()
+    }
+  })
+
+  it("a pipe that cannot answer this start's token is an impostor: the service takes a new name and rewrites the pointer", async () => {
+    const home = tempHome()
+    const stale = standPath()
+    // the pointer a crashed service left; another account has since bound the name it records
+    writeFileSync(home.path("midad.sock.path"), `${stale}\n${"0".repeat(64)}`)
+    const seen: string[] = []
+    const impostor = createHttpServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on("data", (c) => chunks.push(c))
+      req.on("end", () => {
+        seen.push(`${req.method} ${req.url} ${Buffer.concat(chunks).toString("utf8")}`)
+        const payload = JSON.stringify({ ok: true })
+        res.writeHead(200, { "content-type": "application/json", "content-length": payload.length })
+        res.end(payload)
+      })
+    })
+    await new Promise<void>((resolve) => impostor.listen(stale, () => resolve()))
+    const stand = standPath()
+    try {
+      const handle = await startDaemon({ ...setup().deps, home, platform: "win32", pipeName: () => stand })
+      try {
+        expect(handle.alreadyRunning).toBe(false)
+        const [name, token] = readFileSync(home.path("midad.sock.path"), "utf8").split("\n")
+        expect(name).toBe(stand)
+        expect(token).toMatch(/^[0-9a-f]{64}$/)
+        // the impostor saw the bodyless health probe at most, never a real request
+        expect(seen.every((line) => line.startsWith("GET /health "))).toBe(true)
+        // and the fresh service answers its own token check
+        expect((await callDaemon(home, "/health", undefined, { timeoutMs: 2_000, platform: "win32" })).status).toBe(200)
+      } finally {
+        await handle.close()
+      }
+    } finally {
+      impostor.closeAllConnections()
+      await new Promise<void>((resolve) => impostor.close(() => resolve()))
+    }
+  })
+
+  it("a legacy one-line pointer lets the service start straight onto a new name", async () => {
+    const home = tempHome()
+    writeFileSync(home.path("midad.sock.path"), join(home.root, "pre-token.sock"))
+    const stand = standPath()
+    const handle = await startDaemon({ ...setup().deps, home, platform: "win32", pipeName: () => stand })
+    try {
+      expect(handle.alreadyRunning).toBe(false)
+      const [name, token] = readFileSync(home.path("midad.sock.path"), "utf8").split("\n")
+      expect(name).toBe(stand)
+      expect(token).toMatch(/^[0-9a-f]{64}$/)
+    } finally {
+      await handle.close()
+    }
   })
 })

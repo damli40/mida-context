@@ -1,16 +1,17 @@
 import { privateKeyToAccount } from "viem/accounts"
 import { entryPoint08Address } from "viem/account-abstraction"
-import { MidaError, PERMISSION, decodeUint64, displaySafeLine, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
-import type { AccessRequest, Address, GrantAdvice, Hex, PurposeId, RequestedScope } from "@mida/protocol"
-import { batchAnchorAbi, capabilityRegistryAbi, createSponsoredSender, createWriteContext, latestTimestamp, ownerHistory, readAgentRecord, recordPlacementsNear } from "@mida/chain"
-import type { ChainContext, HistoryScanCursor, RecordPlacement } from "@mida/chain"
+import type { AbiEvent } from "viem"
+import { MidaError, NAMESPACE_TREE_VERSION, PERMISSION, POLICY_VERSION, accessRequestHash, decodeUint64, displaySafeLine, encodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
+import type { AccessGrantResponse, AccessRequest, Address, GrantAdvice, GrantedCapability, Hex, PurposeId, RequestedScope } from "@mida/protocol"
+import { batchAnchorAbi, capabilityRegistryAbi, createSponsoredSender, createWriteContext, getLogsChunked, latestTimestamp, ownerHistory, readAgentRecord, recordPlacementsNear } from "@mida/chain"
+import type { ChainContext, DecodedLog, HistoryScanCursor, RecordPlacement } from "@mida/chain"
 import { DENY_CANCEL_EXPIRY_SECONDS, provisionAgent } from "@mida/fake-vault"
 import { POLICY_DOCUMENT_V1, adviseGrant, assertRequestFresh, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
 import type { ScopeInput } from "@mida/grant-advisor"
-import type { BatchReceipt } from "@mida/api"
+import type { BatchReceipt, RegistryReader } from "@mida/api"
 import { compareChainOrder } from "@mida/checkpoint"
 import type { StoredCheckpoint as CheckpointRecord } from "@mida/checkpoint"
-import type { ContextObject } from "@mida/sdk"
+import type { ContextObject, Grant } from "@mida/sdk"
 import { FLUSH_WAIT_MS, RESUBMIT_LANE_CLOSED, addPendingAnchor, batchStatusProbe, flushForeignPending, keepPendingPlaintext, laneForSave } from "./batching.js"
 import type { Lane } from "./batching.js"
 import { readSavedIds, recordSavedId } from "./saved-ids.js"
@@ -24,8 +25,8 @@ import type { CheckpointEnvelope } from "./checkpoint-payload.js"
 import { FileAccessRequestStore } from "./request-store.js"
 import type { MidaHome } from "./home.js"
 import {
-  clearRevokePending, identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, loadOrCreateSignerKey,
-  markRevokePending, markRevoked, replaceSignerKey, revokePending, saveAgentIdentity, saveGrants, saveOwnerAddress, saveOwnerMode,
+  clearRevokePending, clearWrapsOwed, identityFrom, isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOperatorSecrets, loadOrCreateSignerKey,
+  markRevokePending, markRevoked, markWrapsOwed, replaceSignerKey, revokePending, saveAgentIdentity, saveGrants, saveOwnerAddress, saveOwnerMode, wrapsOwed,
 } from "./keys.js"
 import type { RevokePendingMarker } from "./keys.js"
 import { approveProject, ensureProjectMarker, removeAgentApprovals } from "./projects.js"
@@ -263,6 +264,8 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
         const agent = runtime.agent(name)
         await agent.completeAccessRequest(request, approval.response)
         saveGrants(home, name, [...agent.grants])
+        // A marker left by an earlier revoke must not outlive the fresh grant init just recorded.
+        home.remove(`agents/${name}/revoked.json`)
       }
     }
     agents[name] = identity.agentId
@@ -316,6 +319,13 @@ function codedError(code: string, message: string): Error {
   error.code = code
   return error
 }
+
+/**
+ * The codes completeAccessRequest throws when the rebuilt response is REFUSED as this request's
+ * grant — the only throws recovery may read as "not found". Everything else (a network failure,
+ * a rate limit) means the check never ran and must surface as approval-check-failed.
+ */
+const SDK_REFUSAL_CODES = ["RESPONSE_MISMATCH", "REQUEST_CONSUMED", "CAPABILITY_DENIED"] as const
 
 /**
  * The per-agent memory of the last history check (R4-9): `state/history/<agentId>.json`, written
@@ -402,7 +412,19 @@ export async function approve(
   name: string,
   cwd?: string,
   confirm?: (preview: ApprovePreview) => Promise<boolean>,
-): Promise<{ capabilityIds: Hex[]; permissions: number[]; transactionHash: Hex | null; gasUsed: bigint; projectId?: string; projectAlreadyListed?: boolean; droppedRows?: number | null }> {
+): Promise<{
+  capabilityIds: Hex[]
+  permissions: number[]
+  transactionHash: Hex | null
+  gasUsed: bigint
+  /** UF-AP: the grant's transaction had already landed when this ran (its earlier reply was lost) — the approval was finished locally without sending anything. */
+  completedEarlier?: boolean
+  /** UF-AP: the chain approves the agent but this machine holds no recorded grant for it — reads and saves will refuse until the repair the CLI prints is run. */
+  unrecorded?: boolean
+  projectId?: string
+  projectAlreadyListed?: boolean
+  droppedRows?: number | null
+}> {
   const { home, vault, reader, owner } = runtime
   // When a project folder is given its marker is resolved first: a folder that may not hold a
   // project (the owner's home, the filesystem root) is refused with not-a-project before any
@@ -425,7 +447,7 @@ export async function approve(
   if (cleared > 0) {
     const repair = await repairReaderWraps(runtime, undefined, identity.agentId)
     for (const failure of repair.failed) {
-      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${displaySafeLine(failure.reason, 300)}`)
+      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${displaySafeLine(failure.reason, 300)} — run \`mida approve ${failure.name}\``)
     }
   }
   let pending = home.readJson<{ request: AccessRequest }>(`agents/${name}/pending-request.json`)
@@ -435,12 +457,47 @@ export async function approve(
   // for. The result says whether the row was new so the CLI can say "now approved" only when it was.
   // `assistant` is never listed: it gets no project approval, ever.
   const alreadyApprovedResult = async () => {
+    // UF-APR3: "already approved" is still a chance to repair. An earlier approve may have died
+    // after the grant landed but before its key re-send finished; this run re-sends the keys for
+    // this agent's granted READ namespaces to every reader of them, so the command the failure
+    // notes name does the work it promises. The strict chain read stays first: a read that
+    // throws must fail the command with nothing changed, never after a repair ran.
+    const covering = pending?.request.scopes ?? expandScopeInputs(expectedScopesFor(identity.purposeId))
+    let liveIds: Set<string>
+    try {
+      liveIds = await liveCapabilityIdsOf(runtime.reader, runtime.owner, identity.agentId)
+    } catch (error) {
+      throw codedError("approval-check-failed", `the chain could not be read while checking ${name}'s approval: ${displaySafeLine(error instanceof Error ? error.message : String(error), 300)}`)
+    }
+    const repairNamespaces = [...new Set(covering.filter((scope) => (scope.permissions & PERMISSION.READ) !== 0).map((scope) => scope.namespaceId))]
+    // UF-APR4: the pass runs only while wraps-owed.json says a send is owed. Nothing missing and
+    // no marker means nothing to send — no sends, no sending line.
+    if (repairNamespaces.length > 0 && wrapsOwed(home)) {
+      try {
+        const repair = await repairReaderWraps(runtime, repairNamespaces)
+        for (const failure of repair.failed) {
+          runtime.progress?.(`note: could not send the new key to ${failure.name}: ${displaySafeLine(failure.reason, 300)} — run \`mida approve ${failure.name}\``)
+        }
+      } catch (error) {
+        runtime.progress?.(
+          `note: ${name} is approved, but Mida could not send the key to the other agents: ${displaySafeLine(wrapFailureReason(error), 300)} — run \`mida approve ${name}\` again to finish`,
+        )
+      }
+    }
     if (cwd === undefined || identity.purposeId !== PURPOSE_ID) {
       throw codedError("already-approved", `agent "${name}" is already approved`)
     }
     if (confirm !== undefined && !(await confirm({ kind: "project", agent: name, projectId: marker!.projectId }))) throw notApprovedError()
-    const listed = await approveProject(runtime, { agent: name, cwd })
-    return { capabilityIds: [] as Hex[], permissions: [] as number[], transactionHash: null, gasUsed: 0n, projectId: listed.approval.projectId, projectAlreadyListed: listed.alreadyListed, droppedRows: listed.droppedRows }
+    // UF-AP: "approved on chain" is only half the truth — when no saved grant covers the scopes
+    // this approval was for, the agent still cannot read or save here, and the result must say
+    // so instead of answering like an ordinary approval.
+    // UF-APR2: the chain read runs BEFORE the folder row is written — a read that throws must
+    // fail the command with nothing written, not list the folder and then fail.
+    const listed = await approveProject(runtime, { agent: name, cwd }).catch((error: unknown) => {
+      throw approvedUnlisted(name, error)
+    })
+    const unrecorded = !recordedCoverage(home, name, liveIds, covering)
+    return { capabilityIds: [] as Hex[], permissions: [] as number[], transactionHash: null, gasUsed: 0n, ...(unrecorded ? { unrecorded: true } : {}), projectId: listed.approval.projectId, projectAlreadyListed: listed.alreadyListed, droppedRows: listed.droppedRows }
   }
 
   if (pending === undefined) {
@@ -461,13 +518,66 @@ export async function approve(
   }
 
   const stored = await new FileAccessRequestStore(home, name).load(pending.request.requestId)
-  if (stored === undefined || stored.consumed) throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
+  if (stored === undefined || stored.consumed) {
+    // UF-APR4 D2: a request this run cannot use — consumed already, or its record gone — is a
+    // refusal only when the chain says the request's grant never really happened. If the agent
+    // already holds every scope the request asked for (the same per-scope hasAuthority check
+    // migrate.ts runs), the post-grant cleanup is what failed last time: remove the stale
+    // pending-request and revoked markers and answer from the already-approved path, which also
+    // finishes any sends the owed-keys marker still records. Anything less than full coverage —
+    // a revoked agent, a request that genuinely never completed — keeps the refusal.
+    const stillOwed = await ungrantedScopes(runtime, identity.agentId, pending.request.scopes)
+    if (stillOwed.length === 0) {
+      home.remove(`agents/${name}/pending-request.json`)
+      home.remove(`agents/${name}/revoked.json`)
+      return alreadyApprovedResult()
+    }
+    throw codedError("no-pending-request", `agent "${name}" has no pending request; run requestAccess first`)
+  }
   // Only what the chain does not already authorize is granted — a request whose scopes are all live
   // mints nothing, so a second approve sends no transaction.
   const needed = await ungrantedScopes(runtime, identity.agentId, pending.request.scopes)
-  // A pending request whose scopes are all already live is the same answer: nothing to send, but the
-  // folder still gets its list row when there is one — this is the path the Sep-22 incident hit.
-  if (needed.length === 0) return alreadyApprovedResult()
+  // A pending request whose scopes are all already live is normally the same answer: nothing to
+  // send, but the folder still gets its list row — this is the path the Sep-22 incident hit.
+  // UF-AP first: when this machine never completed THIS request (its grant transaction landed but
+  // the reply was lost), the honest move is to finish that approval — the grant is found on chain
+  // and recorded through the same SDK check, and no transaction goes out.
+  if (needed.length === 0) {
+    const unfinished = !loadGrants(home, name).some((grant) => grant.requestId === pending.request.requestId)
+    if (unfinished) {
+      // UF-APR: a chain or store call that THROWS during the finish is not "the grant was not
+      // found" — nothing local was written, and the coded refusal keeps the owner off the
+      // revoke-and-repair advice for what may just be a busy RPC.
+      let grant: Grant | undefined
+      try {
+        grant = await finishOnChainApproval(runtime, name, identity.agentId, pending.request)
+      } catch (error) {
+        throw codedError("approval-check-failed", `the chain could not be read while finishing ${name}'s approval: ${displaySafeLine(error instanceof Error ? error.message : String(error), 300)}`)
+      }
+      if (grant !== undefined) {
+        const listed =
+          cwd === undefined || identity.purposeId !== PURPOSE_ID
+            ? undefined
+            : // The folder asks the same typed yes alreadyApprovedResult asks — the grant is
+              // already recorded either way, so a decline leaves the row unwritten.
+              await (async () => {
+                if (confirm !== undefined && !(await confirm({ kind: "project", agent: name, projectId: marker!.projectId }))) throw notApprovedError()
+                return approveProject(runtime, { agent: name, cwd }).catch((error: unknown) => {
+                  throw approvedUnlisted(name, error)
+                })
+              })()
+        return {
+          capabilityIds: grant.capabilities.map((capability) => capability.capabilityId),
+          permissions: grant.capabilities.map((capability) => capability.permissions),
+          transactionHash: null,
+          gasUsed: 0n,
+          completedEarlier: true,
+          ...(listed === undefined ? {} : { projectId: listed.approval.projectId, projectAlreadyListed: listed.alreadyListed, droppedRows: listed.droppedRows }),
+        }
+      }
+    }
+    return alreadyApprovedResult()
+  }
   // The owner sees the ask and the advisor's advice before anything is signed — only an explicit
   // confirm gets past this point. The question and the answer live in the CLI, which injects it.
   if (confirm !== undefined) {
@@ -483,6 +593,9 @@ export async function approve(
       runtime.progress?.(`rotating the ${namespaceById(nsId).name} epoch…`)
       await vault.rotateExpiredEpoch(nsId)
       rotated.push(nsId)
+      // UF-APR4: the moment an epoch turns, every other reader's wraps are dead — the debt exists
+      // whether or not the grant below ever lands.
+      markWrapsOwed(home)
     }
   }
   runtime.sendProgress("sending the grant")
@@ -493,18 +606,64 @@ export async function approve(
   })
   const agent = runtime.agent(name)
   runtime.progress?.("proving the grant on the chain…")
-  const grant = await agent.completeAccessRequest(pending.request, approval.response)
-  saveGrants(home, name, [...agent.grants])
-  if (rotated.length > 0) {
-    const repair = await repairReaderWraps(runtime, rotated)
-    for (const failure of repair.failed) {
-      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${displaySafeLine(failure.reason, 300)}`)
-    }
+  let grant: Grant
+  try {
+    grant = await agent.completeAccessRequest(pending.request, approval.response)
+  } catch (error) {
+    // UF-APR4 D3: approveGrant already returned — the grant transaction went out. A refusal code
+    // from the SDK's own check keeps its meaning, but every other throw here (a receipt read
+    // that died, a rate limit) is a confirmation that never RAN, not an approval that never
+    // happened: the grant may be live on chain. The wrapper carries no `cause` on purpose —
+    // chainErrorKind walks causes, and one holding a transport error would re-classify this as
+    // chain-busy, the line that claims nothing was sent.
+    if (error instanceof MidaError && (SDK_REFUSAL_CODES as readonly string[]).includes(error.code)) throw error
+    throw codedError(
+      "grant-unconfirmed",
+      `the grant for ${name} was sent to Monad, but Mida could not confirm it: ${displaySafeLine(wrapFailureReason(error), 300)} — run \`mida approve ${name}\` again to finish; it sends nothing new if the grant landed`,
+    )
   }
-  // A marker left by an earlier revoke must not outlive a fresh approval.
+  saveGrants(home, name, [...agent.grants])
+  const grantReadNamespaces = grant.capabilities.filter((capability) => (capability.permissions & PERMISSION.READ) !== 0).map((capability) => capability.namespaceId)
+  // UF-APR4 D1: the owed-keys marker is written the moment the grant is safe — before the marker
+  // removals, the folder row and the re-send — so a crash in ANY later step leaves a debt the
+  // next approve can see and finish. A grant with no READ side and no rotation owes no wraps.
+  if (grantReadNamespaces.length > 0 || rotated.length > 0) markWrapsOwed(home)
+  // UF-APR3: once the grant is safe on disk and on chain, nothing later may strand the
+  // approval: the stale-revoke marker and the consumed request go first, then the folder row.
+  // Only the key re-send is left, and it is the one step a retry can still repair.
   home.remove(`agents/${name}/revoked.json`)
   home.remove(`agents/${name}/pending-request.json`)
-  const listed = cwd === undefined || identity.purposeId !== PURPOSE_ID ? undefined : await approveProject(runtime, { agent: name, cwd })
+  // Every reader of the granted READ namespaces gets the key re-sent, always, not only when this
+  // run rotated. An earlier approve may have replaced an expired key and then died before the
+  // grant send; this run cannot see that, and skipping the re-send leaves every other reader
+  // failing NO_EPOCH_WRAP. Rotated namespaces already in the grant's list are sent once. The pass
+  // itself is best-effort: a throw here (the RPC dying mid-enumeration) must not fail an approval
+  // that already succeeded, so it becomes a note naming the one command that finishes it.
+  const repairNamespaces = [...new Set<Hex>([...grantReadNamespaces, ...rotated])]
+  if (repairNamespaces.length > 0) {
+    try {
+      // approveGrant already published this agent's wrap for every READ namespace it granted;
+      // the pass owes those namespaces to the OTHER readers only.
+      const repair = await repairReaderWraps(runtime, repairNamespaces, undefined, { agentId: identity.agentId, namespaceIds: grantReadNamespaces }, rotated.length > 0)
+      for (const failure of repair.failed) {
+        runtime.progress?.(`note: could not send the new key to ${failure.name}: ${displaySafeLine(failure.reason, 300)} — run \`mida approve ${failure.name}\``)
+      }
+    } catch (error) {
+      runtime.progress?.(
+        `note: ${name} is approved, but Mida could not send the key to the other agents: ${displaySafeLine(wrapFailureReason(error), 300)} — run \`mida approve ${name}\` again to finish`,
+      )
+    }
+  }
+  // UF-APR4 D4: the folder row is written AFTER the re-send, not before — a list read that dies
+  // here can no longer skip the sends the rotated keys owe the other readers. The error is still
+  // thrown (the row is genuinely missing), but approvedUnlisted makes its line say the agent IS
+  // approved and name the retry that adds the folder.
+  const listed =
+    cwd === undefined || identity.purposeId !== PURPOSE_ID
+      ? undefined
+      : await approveProject(runtime, { agent: name, cwd }).catch((error: unknown) => {
+          throw approvedUnlisted(name, error)
+        })
   return {
     capabilityIds: grant.capabilities.map((capability) => capability.capabilityId),
     permissions: grant.capabilities.map((capability) => capability.permissions),
@@ -512,6 +671,239 @@ export async function approve(
     gasUsed: approval.gasUsed,
     ...(listed !== undefined ? { projectId: listed.approval.projectId, droppedRows: listed.droppedRows } : {}),
   }
+}
+
+// ── UF-AP: finishing an approval that landed on chain but was never recorded ──────────────────
+// A grant transaction whose reply was lost (the sponsor timed out) leaves pending-request.json
+// behind while the chain already approves the agent — and approve's `needed.length === 0` branch
+// would then answer "already approved" forever, with the agent's reads refusing CAPABILITY_DENIED.
+// The finish below sends nothing: it finds the transaction that emitted CapabilityGranted for
+// the pending request's capabilities inside the request's own validity window, rebuilds the
+// exact AccessGrantResponse approveGrant would have returned, republishes the read keys the same
+// way, and hands the response to completeAccessRequest — the only path a grant is ever recorded
+// through. A lookup that cannot find the transaction writes nothing and reports "unrecorded".
+
+/**
+ * The grant can only have been mined while the request was valid: the scan window is
+ * [issuedAt - 60 s, requestExpiresAt + 120 s] (clock skew and mining lag on either side), and a
+ * window wider than this cap is treated as "not found" rather than scanned — the log scan is
+ * never unbounded.
+ */
+const GRANT_TX_MARGIN_BEFORE_S = 60n
+const GRANT_TX_MARGIN_AFTER_S = 120n
+const GRANT_TX_MAX_BLOCKS = 6_000n
+
+const CAPABILITY_GRANTED_EVENT = capabilityRegistryAbi.find(
+  (entry) => entry.type === "event" && entry.name === "CapabilityGranted",
+) as AbiEvent
+
+/** The first block in [lo, hi] whose timestamp is >= `timestamp` — undefined when none qualifies. */
+async function blockAtOrAfter(get: (blockNumber: bigint) => Promise<{ timestamp: bigint }>, timestamp: bigint, lo: bigint, hi: bigint): Promise<bigint | undefined> {
+  if (lo > hi || (await get(hi)).timestamp < timestamp) return undefined
+  while (lo < hi) {
+    const mid = (lo + hi) / 2n
+    if ((await get(mid)).timestamp >= timestamp) hi = mid
+    else lo = mid + 1n
+  }
+  return lo
+}
+
+/** The last block in [lo, hi] whose timestamp is <= `timestamp` — undefined when none qualifies. */
+async function blockAtOrBefore(get: (blockNumber: bigint) => Promise<{ timestamp: bigint }>, timestamp: bigint, lo: bigint, hi: bigint): Promise<bigint | undefined> {
+  if (lo > hi || (await get(lo)).timestamp > timestamp) return undefined
+  while (lo < hi) {
+    const mid = (lo + hi + 1n) / 2n
+    if ((await get(mid)).timestamp <= timestamp) lo = mid
+    else hi = mid - 1n
+  }
+  return lo
+}
+
+/**
+ * The CapabilityGranted logs this request's grant emitted, found inside the request's validity
+ * window — [issuedAt - 60 s, requestExpiresAt + 120 s] of block timestamps, resolved by binary
+ * search on getBlock and capped at GRANT_TX_MAX_BLOCKS so a strange clock can never open an
+ * unbounded scan. undefined when no transaction qualifies.
+ */
+async function findGrantLogs(runtime: Runtime, request: AccessRequest, capabilityIds: ReadonlySet<string>): Promise<DecodedLog[] | undefined> {
+  // Scope coverage alone cannot identify THIS request's grant — the same scopes approved under
+  // a different request would otherwise masquerade as the lost reply. The event's context
+  // carries the request hash the vault computed, so matching it is the binding check.
+  const requestHashExpected = accessRequestHash(request).toLowerCase()
+  const client = runtime.chain.publicClient
+  const deployment = runtime.network.deployment
+  const latest = await client.getBlock()
+  const fromTs = decodeUint64(request.issuedAt) - GRANT_TX_MARGIN_BEFORE_S
+  const toTs = decodeUint64(request.requestExpiresAt) + GRANT_TX_MARGIN_AFTER_S
+  if (latest.timestamp < fromTs) return undefined
+  const floor = deployment.deploymentBlock < latest.number ? deployment.deploymentBlock : latest.number
+  const get = (blockNumber: bigint) => client.getBlock({ blockNumber })
+  const fromBlock = await blockAtOrAfter(get, fromTs, floor, latest.number)
+  if (fromBlock === undefined) return undefined
+  const toBlock = await blockAtOrBefore(get, toTs, fromBlock, latest.number)
+  if (toBlock === undefined || toBlock - fromBlock + 1n > GRANT_TX_MAX_BLOCKS) return undefined
+  const logs = await getLogsChunked(client, {
+    address: deployment.capabilityRegistry,
+    event: CAPABILITY_GRANTED_EVENT,
+    args: { owner: runtime.owner, agentId: request.agentId },
+    fromBlock,
+    toBlock,
+  })
+  const found = logs.filter((log) => {
+    const context = log.args.context as { requestHash?: unknown } | undefined
+    return (
+      log.transactionHash !== null &&
+      typeof log.args.capabilityId === "string" &&
+      capabilityIds.has(log.args.capabilityId.toLowerCase()) &&
+      typeof context?.requestHash === "string" &&
+      context.requestHash.toLowerCase() === requestHashExpected
+    )
+  })
+  return found.length === 0 ? undefined : found
+}
+
+/**
+ * Rebuilds the AccessGrantResponse approveGrant would have returned, from a grant transaction's
+ * CapabilityGranted logs: the same fields, the capabilities taken from the found logs only.
+ * Exported so the recovery tests can prove the unchanged SDK check refuses a response that
+ * names a capability the request never got.
+ */
+export function grantResponseFromLogs(request: AccessRequest, owner: Address, logs: readonly DecodedLog[]): AccessGrantResponse {
+  return {
+    v: 1,
+    chainId: request.chainId,
+    capabilityRegistry: request.capabilityRegistry,
+    requestId: request.requestId,
+    nonce: request.nonce,
+    requestHash: accessRequestHash(request),
+    owner,
+    agentId: request.agentId,
+    manifestHash: request.manifestHash,
+    manifestVersion: request.manifestVersion,
+    policyVersion: POLICY_VERSION,
+    namespaceTreeVersion: NAMESPACE_TREE_VERSION,
+    capabilities: logs.map(
+      (log): GrantedCapability => ({
+        namespaceId: log.args.namespaceId as Hex,
+        permissions: Number(log.args.permissions),
+        provenancePolicy: Number(log.args.provenancePolicy),
+        expiresAt: encodeUint64(log.args.expiresAt as bigint),
+        capabilityId: log.args.capabilityId as Hex,
+        transactionHash: log.transactionHash!,
+      }),
+    ),
+  }
+}
+
+/**
+ * Finishes an approval the chain already holds — no transaction is sent. Returns the grant the
+ * unchanged SDK check accepted; undefined when the grant's transaction cannot be found inside
+ * the request's window or the rebuilt response fails the SDK's validation (the caller then
+ * reports the approval as unrecorded). A chain or store call that throws reaches the caller
+ * as a throw: "cannot read the chain" is not "not found".
+ */
+async function finishOnChainApproval(runtime: Runtime, name: string, agentId: Hex, request: AccessRequest): Promise<Grant | undefined> {
+  const { home, reader, owner, vault } = runtime
+  // The live capabilities matching the pending request's scopes — the same records
+  // ungrantedScopes asked about above, read again so each id can be named in the log scan.
+  const now = await reader.now()
+  const wanted = new Set<string>()
+  for (const id of await reader.activeCapabilityIds(owner, agentId)) {
+    const view = await reader.getCapability(id)
+    if (view === null || view.revoked || (view.expiresAt !== 0n && now >= view.expiresAt)) continue
+    const covers = request.scopes.some(
+      (scope) =>
+        scope.namespaceId.toLowerCase() === view.namespaceId.toLowerCase() &&
+        (view.permissions & scope.permissions) === scope.permissions &&
+        view.provenancePolicy === scope.provenancePolicy,
+    )
+    if (covers) wanted.add(id.toLowerCase())
+  }
+  if (wanted.size === 0) return undefined
+  const logs = await findGrantLogs(runtime, request, wanted)
+  if (logs === undefined) return undefined
+  const response = grantResponseFromLogs(request, owner, logs)
+  // The read keys the normal send publishes before its response returns — skipped here once
+  // meant the grant verified while the agent still could not unwrap what it read.
+  const readNamespaces = [...new Set(response.capabilities.filter((capability) => (capability.permissions & PERMISSION.READ) !== 0).map((capability) => capability.namespaceId))]
+  try {
+    for (const nsId of readNamespaces) {
+      await vault.publishReaderWraps({ agentId, namespaceId: nsId })
+    }
+    // The lost first try may also have replaced an expired key, which invalidated every other
+    // reader's wraps — recovery cannot tell, so it re-sends the new key to every approved reader
+    // over these namespaces, the same pass the normal path runs after a rotation. The agent's own
+    // wraps went out above, so the pass owes those namespaces to the other readers only.
+    const repair = await repairReaderWraps(runtime, readNamespaces, undefined, { agentId, namespaceIds: readNamespaces })
+    for (const failure of repair.failed) {
+      runtime.progress?.(`note: could not send the new key to ${failure.name}: ${displaySafeLine(failure.reason, 300)} — run \`mida approve ${failure.name}\``)
+    }
+  } catch (error) {
+    // UF-APR4: an interrupted re-send here is owed work — the marker makes a later plain
+    // `mida approve <name>` finish it. repairReaderWraps marks its own throws; this also covers
+    // the agent's own-wrap publishes above.
+    markWrapsOwed(home)
+    throw error
+  }
+  const agent = runtime.agent(name)
+  // A refusal from the SDK's own check is a clean "not this request's grant" — the caller then
+  // falls back to the unrecorded answer. Anything else (a network failure, a rate limit) is a
+  // check that could not run, and the throw reaches the caller as approval-check-failed.
+  let grant: Grant | undefined
+  try {
+    grant = await agent.completeAccessRequest(request, response)
+  } catch (error) {
+    if (error instanceof MidaError && (SDK_REFUSAL_CODES as readonly string[]).includes(error.code)) return undefined
+    throw error
+  }
+  if (grant === undefined) return undefined
+  saveGrants(home, name, [...agent.grants])
+  // A marker left by an earlier revoke must not outlive a fresh approval — same as the send path.
+  home.remove(`agents/${name}/revoked.json`)
+  home.remove(`agents/${name}/pending-request.json`)
+  return grant
+}
+
+/**
+ * The agent's capability ids that are live on the chain right now — the raw
+ * activeCapabilityIds list keeps expired and revoked entries until a later write compacts it,
+ * so each id is re-read before it counts.
+ */
+export async function liveCapabilityIdsOf(reader: RegistryReader, owner: Address, agentId: Hex): Promise<Set<string>> {
+  const now = await reader.now()
+  const live = new Set<string>()
+  for (const id of await reader.activeCapabilityIds(owner, agentId)) {
+    const view = await reader.getCapability(id)
+    if (view !== null && !view.revoked && (view.expiresAt === 0n || now < view.expiresAt)) live.add(id.toLowerCase())
+  }
+  return live
+}
+
+/**
+ * Whether this machine's saved grants cover every scope the agent is expected to hold — each
+ * scope by SOME recorded capability, in ANY grant entry, whose id is one of the agent's live
+ * capability ids on chain. Approve's unrecorded answer and doctor's approved line share this
+ * one rule: a saved grant whose capabilities are all dead on chain is no record of the current
+ * approval, and a grants file that cannot be read counts as no record.
+ */
+export function recordedCoverage(home: MidaHome, name: string, liveCapabilityIds: ReadonlySet<string>, scopes: readonly RequestedScope[]): boolean {
+  let grants: Grant[]
+  try {
+    grants = loadGrants(home, name)
+  } catch {
+    grants = []
+  }
+  return scopes.every((scope) =>
+    grants.some((grant) =>
+      grant.capabilities.some(
+        (capability) =>
+          liveCapabilityIds.has(capability.capabilityId.toLowerCase()) &&
+          capability.namespaceId.toLowerCase() === scope.namespaceId.toLowerCase() &&
+          (capability.permissions & scope.permissions) === scope.permissions &&
+          capability.provenancePolicy === scope.provenancePolicy,
+      ),
+    ),
+  )
 }
 
 // The saved-id index moved to saved-ids.ts so batching.ts — which skeleton already imports —
@@ -944,12 +1336,17 @@ export async function revoke(
   for (const id of listed) {
     if (await isCapabilityLive(runtime.ownerChain, id)) anyLive = true
   }
+  // Whether this run actually rotated an epoch decides the pass's line: a revoke transaction
+  // that went out minted a new key ("sending the new key"), a no-transaction re-run re-sends the
+  // current one ("re-sending the read key").
+  let rotatedNewKey = false
   if (anyLive) {
     runtime.sendProgress("sending the revocation")
     try {
       const approval = await vault.approveRevocation({ kind: "agent", agentId })
       transactionHashes.push(approval.transactionHash)
       sponsored = approval.sponsored
+      rotatedNewKey = approval.rotated.length > 0
     } catch (error) {
       // SPONSOR_PENDING means the bundler accepted the revoke and it may still land; its staged
       // deny stays on purpose. The marker is what stops `mida approve` cancelling that deny inside
@@ -976,7 +1373,7 @@ export async function revoke(
   // that already landed. The failure is reported in the result instead.
   let repair: { rewrapped: string[]; failed: { name: string; reason: string }[]; repairError?: string }
   try {
-    repair = await repairReaderWraps(runtime)
+    repair = await repairReaderWraps(runtime, undefined, undefined, undefined, rotatedNewKey)
   } catch (error) {
     repair = { rewrapped: [], failed: [], repairError: wrapFailureReason(error) }
   }
@@ -1145,43 +1542,92 @@ function wrapFailureReason(error: unknown): string {
   return text.split("\n")[0]!
 }
 
+/**
+ * UF-APR4 D4: a folder-listing error raised once the chain approval is settled must not sound
+ * like the approval failed — the agent IS approved and only the folder row is missing. The two
+ * list codes carry their exact repair lines; anything else approveProject raises keeps its own
+ * one-line message after the same prefix. Code `approved-unlisted` makes ownerRefusalLine print
+ * the message as given, and the wrapper holds no `cause` so a thrown transport error underneath
+ * can never launder this back into chain-busy's "nothing was sent".
+ */
+function approvedUnlisted(name: string, error: unknown): Error {
+  const code = (error as { code?: unknown } | null | undefined)?.code
+  if (code === "list-unreadable") {
+    return codedError(
+      "approved-unlisted",
+      `${name} is approved, but the approved-projects list could not be read — check the file's permissions, then run \`mida approve ${name}\` here again to add this folder`,
+    )
+  }
+  if (code === "list-tampered") {
+    return codedError("approved-unlisted", `${name} is approved, but the approved-projects list failed its signature check — run \`mida doctor\``)
+  }
+  return codedError("approved-unlisted", `${name} is approved, but ${displaySafeLine(wrapFailureReason(error), 300)}`)
+}
+
 export async function repairReaderWraps(
   runtime: Runtime,
   namespaceIds: readonly Hex[] = [NAMESPACE_ID, ...FACT_NAMESPACES.map((ns) => namespaceId(ns))],
   onlyAgentId?: Hex,
+  // UF-APR3: the (agent, namespace) pairs the caller already sent this run. approveGrant and the
+  // recovery re-publish hand the just-approved agent its wraps themselves, so the pass owes it
+  // only namespaces NOT in that list (a rotated namespace the grant did not cover still reaches it).
+  alreadySentTo?: { agentId: Hex; namespaceIds: readonly Hex[] },
+  // UF-APR4: whether THIS run minted the key (an epoch rotation). A rotation pass announces
+  // "sending the new key"; every other pass is re-sending the current one and says so.
+  rotated = false,
 ): Promise<{ rewrapped: string[]; failed: { name: string; reason: string }[] }> {
   const { home, vault, reader, owner } = runtime
-  // Who gets a wrap is decided first, so the owner hears how many agents the new key goes to
-  // before the sends start — the authority checks run either way.
-  const targets: { name: string; agentId: Hex; nsIds: Hex[] }[] = []
-  for (const name of listAgentNames(home)) {
-    // A damaged identity.json cannot receive a wrap; it must not stop the others from getting theirs.
-    let identity: ReturnType<typeof loadAgentIdentity>
-    try { identity = loadAgentIdentity(home, name) } catch { continue }
-    if (identity === undefined) continue
-    if (onlyAgentId !== undefined && identity.agentId.toLowerCase() !== onlyAgentId.toLowerCase()) continue
-    const nsIds: Hex[] = []
-    for (const nsId of namespaceIds) {
-      if (await reader.hasAuthority(owner, identity.agentId, nsId, PERMISSION.READ, 0)) nsIds.push(nsId)
-    }
-    if (nsIds.length > 0) targets.push({ name, agentId: identity.agentId, nsIds })
-  }
-  if (targets.length > 0) {
-    runtime.progress?.(`sending the new key to ${targets.length} agent${targets.length === 1 ? "" : "s"}…`)
-  }
-  const rewrapped: string[] = []
-  const failed: { name: string; reason: string }[] = []
-  for (const target of targets) {
-    try {
-      for (const nsId of target.nsIds) {
-        await vault.publishReaderWraps({ agentId: target.agentId, namespaceId: nsId })
+  // UF-APR4: the wraps-owed bookkeeping lives here so every caller keeps it: a pass that throws
+  // or reports a failed send records the debt in wraps-owed.json; a clean pass that looked at
+  // every local agent settles it. A pass narrowed to one agent can owe but never settle — it
+  // never looked at the other readers.
+  try {
+    // Who gets a wrap is decided first, so the owner hears how many agents the new key goes to
+    // before the sends start — the authority checks run either way.
+    const wanted: Hex[] = [...new Set(namespaceIds)]
+    const targets: { name: string; agentId: Hex; nsIds: Hex[] }[] = []
+    for (const name of listAgentNames(home)) {
+      // A damaged identity.json cannot receive a wrap; it must not stop the others from getting theirs.
+      let identity: ReturnType<typeof loadAgentIdentity>
+      try { identity = loadAgentIdentity(home, name) } catch { continue }
+      if (identity === undefined) continue
+      if (onlyAgentId !== undefined && identity.agentId.toLowerCase() !== onlyAgentId.toLowerCase()) continue
+      const already =
+        alreadySentTo !== undefined && identity.agentId.toLowerCase() === alreadySentTo.agentId.toLowerCase()
+          ? new Set(alreadySentTo.namespaceIds.map((id) => id.toLowerCase()))
+          : undefined
+      const nsIds: Hex[] = []
+      for (const nsId of wanted) {
+        if (already?.has(nsId.toLowerCase())) continue
+        if (await reader.hasAuthority(owner, identity.agentId, nsId, PERMISSION.READ, 0)) nsIds.push(nsId)
       }
-      rewrapped.push(target.name)
-    } catch (error) {
-      // M3-D4: one refused wrap must not abort the pass — the rest still publish, and the caller
-      // names each failure with the reason and the fix instead of one error hiding them all.
-      failed.push({ name: target.name, reason: wrapFailureReason(error) })
+      if (nsIds.length > 0) targets.push({ name, agentId: identity.agentId, nsIds })
     }
+    if (targets.length > 0) {
+      runtime.progress?.(`${rotated ? "sending the new key" : "re-sending the read key"} to ${targets.length} agent${targets.length === 1 ? "" : "s"}…`)
+    }
+    const rewrapped: string[] = []
+    const failed: { name: string; reason: string }[] = []
+    for (const target of targets) {
+      try {
+        for (const nsId of target.nsIds) {
+          await vault.publishReaderWraps({ agentId: target.agentId, namespaceId: nsId })
+        }
+        rewrapped.push(target.name)
+      } catch (error) {
+        // M3-D4: one refused wrap must not abort the pass — the rest still publish, and the caller
+        // names each failure with the reason and the fix instead of one error hiding them all.
+        failed.push({ name: target.name, reason: wrapFailureReason(error) })
+      }
+    }
+    if (failed.length === 0) {
+      if (onlyAgentId === undefined) clearWrapsOwed(home)
+    } else {
+      markWrapsOwed(home)
+    }
+    return { rewrapped, failed }
+  } catch (error) {
+    markWrapsOwed(home)
+    throw error
   }
-  return { rewrapped, failed }
 }

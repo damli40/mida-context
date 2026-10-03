@@ -46,6 +46,27 @@ describe("capture queue", () => {
     expect(listJobs(home).map((j) => j.id)).toEqual([first.id, second.id])
   })
 
+  it("a new job id holds no ':' (Windows forbids it) but still leads with the instant", () => {
+    const home = tempHome()
+    const saved = enqueue(home, job(), () => T0)
+    expect(saved.id).not.toContain(":")
+    expect(saved.id.startsWith("2026-09-21T10-00-00.000Z-")).toBe(true)
+    const second = enqueue(home, job({ sessionId: "newer" }), () => T1)
+    expect(listJobs(home).map((j) => j.id)).toEqual([saved.id, second.id])
+  })
+
+  it("a job file named the old way, with ':' in it, still drains and is addressed by its name", () => {
+    const home = tempHome()
+    // the shape a 0.1.3 hook wrote; an upgrade can leave these in the folder
+    const oldId = "2026-09-21T09:59:00.000Z-deadbeef"
+    home.writeSecretJson(`queue/${oldId}.json`, { ...job(), at: "2026-09-21T09:59:00.000Z" })
+    const saved = enqueue(home, job({ sessionId: "s2" }), () => T0)
+    const jobs = listJobs(home)
+    expect(jobs.map((j) => j.id)).toEqual([oldId, saved.id])
+    removeJob(home, oldId)
+    expect(listJobs(home).map((j) => j.id)).toEqual([saved.id])
+  })
+
   it("moves a corrupt job file to queue/bad and still lists the rest", () => {
     const home = tempHome()
     const saved = enqueue(home, job(), () => T0)

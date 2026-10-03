@@ -45,7 +45,7 @@ import type { ScopeInput } from "@mida/grant-advisor"
 import { RegistryReader } from "@mida/api"
 import type { AnchoredObject, BatchReceipt, BatchedSaveWire, ContextApiRoutes, ContextRecordView } from "@mida/api"
 import { randomBytes } from "@noble/hashes/utils.js"
-import { parseEventLogs, zeroHash } from "viem"
+import { TransactionReceiptNotFoundError, parseEventLogs, zeroHash } from "viem"
 import type { TransactionReceipt } from "viem"
 import { MemoryAccessRequestStore } from "./request-store.js"
 import type { AccessRequestStore } from "./request-store.js"
@@ -380,7 +380,13 @@ export class MidaAgent {
       if (!(await this.#reader.hasAuthority(owner, this.agentId, capability.namespaceId, capability.permissions, capability.provenancePolicy))) {
         throw new MidaError("CAPABILITY_DENIED", `capability ${granted.capabilityId} is not currently valid on Monad`)
       }
-      const receipt = await this.#chain.publicClient.getTransactionReceipt({ hash: granted.transactionHash }).catch(() => null)
+      // Only "the chain has no such receipt" may read as the transaction not being this
+      // request's grant. Every other failure (a dead RPC, a rate limit) is the CHECK failing,
+      // so it propagates: the caller treats it as a check that never ran, never as a refusal.
+      const receipt = await this.#chain.publicClient.getTransactionReceipt({ hash: granted.transactionHash }).catch((error: unknown) => {
+        if (error instanceof TransactionReceiptNotFoundError) return null
+        throw error
+      })
       const emitted =
         receipt !== null &&
         receipt.status === "success" &&

@@ -1,6 +1,7 @@
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs"
 import { isAbsolute, join } from "node:path"
 import type { MidaHome } from "./home.js"
+import { fsyncFolder } from "./platform.js"
 
 /**
  * Where Codex keeps its config and session rollouts: `CODEX_HOME` when it is a non-empty absolute
@@ -35,12 +36,7 @@ export function recordCodexHome(home: MidaHome, dir: string): void {
     rmSync(temp, { force: true })
     throw error
   }
-  const dirFd = openSync(home.root, "r")
-  try {
-    fsyncSync(dirFd)
-  } finally {
-    closeSync(dirFd)
-  }
+  fsyncFolder(home.root)
 }
 
 /**

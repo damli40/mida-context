@@ -298,3 +298,30 @@ export function clearRevokePending(home: MidaHome, name: string): void {
   assertName(name)
   home.remove(`agents/${name}/revoke-pending.json`)
 }
+
+/**
+ * UF-APR4 D1: wraps-owed.json at the home root records that read-key sends are owed — a re-send
+ * pass reported a failed send or threw, or a grant was recorded with its re-send still ahead.
+ * It is written ahead of every step that could strand those sends (the removals, the folder row,
+ * the pass itself) and cleared only by a re-send pass that completes with no failure. While it
+ * exists, approving an already-approved agent runs the re-send pass first.
+ */
+export function markWrapsOwed(home: MidaHome): void {
+  let owedSince = new Date().toISOString()
+  try {
+    // Keys were owed since the FIRST unpaid pass — an existing readable marker keeps its stamp.
+    const existing = home.readJson<{ owedSince?: unknown }>("wraps-owed.json")
+    if (typeof existing?.owedSince === "string" && existing.owedSince !== "") owedSince = existing.owedSince
+  } catch {
+    // an unreadable marker is rewritten fresh: the stamp is lost, the debt is not
+  }
+  home.writeSecretJson("wraps-owed.json", { owedSince })
+}
+
+export function wrapsOwed(home: MidaHome): boolean {
+  return home.has("wraps-owed.json")
+}
+
+export function clearWrapsOwed(home: MidaHome): void {
+  home.remove("wraps-owed.json")
+}

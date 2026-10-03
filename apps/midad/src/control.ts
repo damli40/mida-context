@@ -7,6 +7,7 @@ import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js"
 import { codeIdentity } from "./code-identity.js"
 import type { CodeIdentity } from "./code-identity.js"
 import type { MidaHome } from "./home.js"
+import { isWindows } from "./platform.js"
 
 export const SOCKET_FILE = "midad.sock"
 
@@ -46,13 +47,36 @@ export function ensureFallbackSocketDir(base: string = tmpdir()): string {
 }
 
 /**
+ * The pointer's two lines on Windows: the pipe name, then the secret this service start answers
+ * /health with. A one-line pointer predates the token, and the name it carries could have been
+ * re-created by another account on the PC, so it reads as no pointer at all.
+ */
+function pipePointerFor(home: MidaHome): { name: string; token: string } | undefined {
+  try {
+    const pointer = home.path(`${SOCKET_FILE}.path`)
+    if (!existsSync(pointer)) return undefined
+    const [name, token] = readFileSync(pointer, "utf8").split("\n").map((line) => line.trim())
+    if (name === undefined || name === "" || token === undefined || token === "") return undefined
+    return { name, token }
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Where this home's control socket lives. Normally `<home>/midad.sock`; when that path would be too
  * long for a Unix socket, a deterministic name inside the per-user fallback folder —
  * `<base>/mida-<uid>/mida-<16 hex of sha256(home)>.sock` — which the daemon also records in
  * `<home>/midad.sock.path` so the real path is discoverable. A present, non-empty pointer file wins
  * either way. `base` is the fallback folder's parent; tests inject a private temp dir.
+ *
+ * On Windows the answer is the pointer or undefined: the service binds a fresh random named pipe
+ * per start and records it with a secret token in the pointer, so with no two-line pointer there
+ * is no service to reach. A name computed here could be created first by another account
+ * on the PC, which would then receive this user's requests.
  */
-export function socketPathFor(home: MidaHome, base: string = tmpdir()): string {
+export function socketPathFor(home: MidaHome, base: string = tmpdir(), platform: NodeJS.Platform = process.platform): string | undefined {
+  if (isWindows(platform)) return pipePointerFor(home)?.name
   try {
     const pointer = home.path(`${SOCKET_FILE}.path`)
     if (existsSync(pointer)) {
@@ -65,6 +89,27 @@ export function socketPathFor(home: MidaHome, base: string = tmpdir()): string {
   const direct = home.path(SOCKET_FILE)
   if (Buffer.byteLength(direct) <= SOCKET_PATH_LIMIT) return direct
   return join(fallbackSocketDir(base), `mida-${bytesToHex(sha256(utf8ToBytes(home.root))).slice(0, 16)}.sock`)
+}
+
+/**
+ * The channel a client may use: the address, and on Windows the proof it must see before trusting
+ * it, that being the token the pointer names, which only the service that wrote the pointer can
+ * answer /health with. Mac and Linux channels carry no token; the socket file's own permissions
+ * are the proof there.
+ */
+export interface DaemonChannel {
+  socketPath: string
+  /** Windows only: the secret this service start answers /health with. */
+  token?: string
+}
+
+export function channelFor(home: MidaHome, base: string = tmpdir(), platform: NodeJS.Platform = process.platform): DaemonChannel | undefined {
+  if (isWindows(platform)) {
+    const pointer = pipePointerFor(home)
+    return pointer === undefined ? undefined : { socketPath: pointer.name, token: pointer.token }
+  }
+  const socketPath = socketPathFor(home, base, platform)
+  return socketPath === undefined ? undefined : { socketPath }
 }
 
 export interface ControlReply {
@@ -85,8 +130,12 @@ export interface ControlReply {
  * One JSON call to the daemon over the private socket. Never throws and never hangs: any failure —
  * no socket, refused connection, timeout, a reply that is not JSON — resolves to status 0 with
  * `failure` naming which kind. A body of `undefined` sends GET; anything else is POSTed as JSON.
+ *
+ * On Windows the call is two steps: a bodyless GET /health must answer with the token the pointer
+ * names, which only the service that wrote the pointer knows, and only then does the real request
+ * go. A pipe that answers without the token was made by someone else and receives nothing.
  */
-export function callDaemon(home: MidaHome, path: string, body: unknown, options: { timeoutMs: number }): Promise<ControlReply> {
+export function callDaemon(home: MidaHome, path: string, body: unknown, options: { timeoutMs: number; platform?: NodeJS.Platform }): Promise<ControlReply> {
   return new Promise((resolve) => {
     let settled = false
     const finish = (reply: ControlReply) => {
@@ -110,35 +159,64 @@ export function callDaemon(home: MidaHome, path: string, body: unknown, options:
     let req: ReturnType<typeof request> | undefined
     try {
       const payload = body === undefined ? null : Buffer.from(JSON.stringify(body), "utf8")
-      req = request(
-        {
-          socketPath: socketPathFor(home),
-          path,
-          method: payload === null ? "GET" : "POST",
-          headers:
-            payload === null
-              ? {}
-              : { "content-type": "application/json", "content-length": payload.length },
-        },
-        (res) => {
-          const chunks: Buffer[] = []
-          let size = 0
-          res.on("data", (chunk: Buffer) => {
-            size += chunk.length
-            if (size <= 1024 * 1024) chunks.push(chunk)
-          })
-          res.on("end", () => {
-            try {
-              finish({ status: res.statusCode ?? 0, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) })
-            } catch {
-              fail("bad-reply")
-            }
-          })
-          res.on("error", () => fail("bad-reply"))
-        },
-      )
-      req.on("error", () => fail("unreachable"))
-      req.end(payload ?? undefined)
+      const channel = channelFor(home, tmpdir(), options.platform ?? process.platform)
+      if (channel === undefined) {
+        fail("unreachable")
+        return
+      }
+      // One attempt; `done` always runs, since every failure resolves through the callback.
+      const send = (reqPath: string, data: Buffer | null, done: (reply: ControlReply & { token?: string }) => void): void => {
+        try {
+          req = request(
+            {
+              socketPath: channel.socketPath,
+              path: reqPath,
+              method: data === null ? "GET" : "POST",
+              headers: data === null ? {} : { "content-type": "application/json", "content-length": data.length },
+            },
+            (res) => {
+              const chunks: Buffer[] = []
+              let size = 0
+              res.on("data", (chunk: Buffer) => {
+                size += chunk.length
+                if (size <= 1024 * 1024) chunks.push(chunk)
+              })
+              res.on("end", () => {
+                const token = res.headers["x-mida-token"]
+                try {
+                  done({
+                    status: res.statusCode ?? 0,
+                    body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+                    token: typeof token === "string" ? token : undefined,
+                  })
+                } catch {
+                  done({ status: 0, body: null, failure: "bad-reply" })
+                }
+              })
+              res.on("error", () => done({ status: 0, body: null, failure: "bad-reply" }))
+            },
+          )
+          req.on("error", () => done({ status: 0, body: null, failure: "unreachable" }))
+          req.end(data ?? undefined)
+        } catch {
+          done({ status: 0, body: null, failure: "unreachable" })
+        }
+      }
+      const deliver = (reply: ControlReply & { token?: string }): void => {
+        if (reply.failure !== undefined) fail(reply.failure)
+        else finish({ status: reply.status, body: reply.body })
+      }
+      if (channel.token === undefined) {
+        send(path, payload, deliver)
+        return
+      }
+      send("/health", null, (probe) => {
+        if (probe.failure !== undefined || probe.token !== channel.token) {
+          fail("unreachable")
+          return
+        }
+        send(path, payload, deliver)
+      })
     } catch {
       fail("unreachable")
     }
