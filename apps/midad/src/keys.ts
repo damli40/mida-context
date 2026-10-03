@@ -298,3 +298,100 @@ export function clearRevokePending(home: MidaHome, name: string): void {
   assertName(name)
   home.remove(`agents/${name}/revoke-pending.json`)
 }
+
+/**
+ * UF-APR4 D1, UF-APR5 F1: wraps-owed.json at the home root records that read-key sends are owed,
+ * and WHICH namespaces owe them — a re-send pass reported a failed send or threw, or a grant was
+ * recorded with its re-send still ahead. It is written ahead of every step that could strand
+ * those sends (the removals, the folder row, the pass itself) and cleared only by a re-send pass
+ * that covers the still-owed namespaces with no failure. While it exists, approving an
+ * already-approved agent runs the re-send pass first — over the namespaces the marker names, not
+ * only the ones that agent happens to hold.
+ *
+ * A marker with no `namespaces` field is the pre-APR5 shape and owes every reader namespace.
+ * Two commands can overlap when the daemon or the hosted store skips the home lock, so every
+ * write MERGES with what is already on disk — the union of namespace ids, the earliest
+ * owedSince — and a pass settles only the namespaces it covered.
+ */
+export interface WrapsOwedMarker {
+  /** The first moment any still-owed debt was recorded — merged writes keep the earliest. "" when the file gave none. */
+  owedSince: string
+  /** The namespace ids still owed; absent means every reader namespace (the pre-APR5 shape). */
+  namespaces?: Hex[]
+}
+
+const WRAPS_OWED_FILE = "wraps-owed.json"
+
+const dedupeNamespaceIds = (ids: readonly string[]): Hex[] => [...new Map(ids.map((id) => [id.toLowerCase(), id as Hex])).values()]
+
+/**
+ * The marker on disk, or undefined when there is none. An unreadable file is a marker whose
+ * contents cannot be trusted — the safe answer for a debt record is to keep paying it, so it
+ * reads as "every namespace owed".
+ */
+export function wrapsOwed(home: MidaHome): WrapsOwedMarker | undefined {
+  let raw: unknown
+  try {
+    raw = home.readJson<unknown>(WRAPS_OWED_FILE)
+  } catch {
+    return { owedSince: "" }
+  }
+  if (raw === undefined) return undefined
+  const record = (raw ?? {}) as Record<string, unknown>
+  const owedSince = typeof record.owedSince === "string" ? record.owedSince : ""
+  const namespaces = Array.isArray(record.namespaces)
+    ? dedupeNamespaceIds(record.namespaces.filter((id): id is string => typeof id === "string"))
+    : undefined
+  return { owedSince, namespaces }
+}
+
+/**
+ * Record that wrap sends are owed for `namespaces` — omit it when the debt is not provably
+ * bounded and every reader namespace must be treated as owed. The write merges with a marker
+ * already on disk: the union of namespace ids, either side's "every namespace" winning, and the
+ * earliest owedSince. A marker that cannot be read is rewritten with the new debt — the stamp
+ * is lost, the debt is not.
+ */
+export function markWrapsOwed(home: MidaHome, namespaces?: readonly Hex[]): void {
+  let owedSince = new Date().toISOString()
+  let merged = namespaces === undefined ? undefined : dedupeNamespaceIds(namespaces)
+  try {
+    const existing = wrapsOwed(home)
+    if (existing !== undefined) {
+      if (existing.owedSince !== "" && existing.owedSince < owedSince) owedSince = existing.owedSince
+      merged = existing.namespaces === undefined || merged === undefined ? undefined : dedupeNamespaceIds([...existing.namespaces, ...merged])
+    }
+  } catch {
+    // an unreadable marker is rewritten fresh: the stamp is lost, the debt is not
+  }
+  home.writeSecretJson(WRAPS_OWED_FILE, merged === undefined ? { owedSince } : { owedSince, namespaces: merged })
+}
+
+/**
+ * The settle half of the marker's lifecycle: drop from the marker exactly the namespaces a clean
+ * pass covered, and delete the file when nothing remains. The file is re-read at settle time and
+ * the removal runs against what it says NOW — a marker a concurrent process rewrote while the
+ * pass ran keeps the debt that process added rather than being overwritten. For an old-shape
+ * marker, `universe` is the full set it stood for: what the pass did not cover is written back
+ * as an explicit list. Both ways a settle can fail — the re-read and the rewrite/remove — are
+ * swallowed on purpose: a leftover marker only buys one extra pass, while throwing here would
+ * report sends that all succeeded as failed.
+ */
+export function settleWrapsOwed(home: MidaHome, covered: readonly Hex[], universe: readonly Hex[]): void {
+  try {
+    const current = wrapsOwed(home)
+    if (current === undefined) return
+    const coveredIds = new Set(covered.map((id) => id.toLowerCase()))
+    const before = current.namespaces ?? universe
+    const still = before.filter((id) => !coveredIds.has(id.toLowerCase()))
+    if (still.length === before.length && still.length > 0) return
+    if (still.length === 0) {
+      home.remove(WRAPS_OWED_FILE)
+      return
+    }
+    home.writeSecretJson(WRAPS_OWED_FILE, { owedSince: current.owedSince === "" ? new Date().toISOString() : current.owedSince, namespaces: still })
+  } catch {
+    // a leftover marker only costs one extra pass; a throw here must never turn sends that
+    // succeeded into a reported failure
+  }
+}

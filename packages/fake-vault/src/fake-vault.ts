@@ -51,6 +51,7 @@ import {
   capabilityRegistryAbi,
   contextRegistryAbi,
   latestTimestamp,
+  markUnsent,
   ownerHistory,
   readAgentRecord,
   sendContract,
@@ -229,55 +230,74 @@ export class FakeVaultAuthority implements VaultAuthority {
   async approveGrant(request: GrantRequest): Promise<GrantApproval> {
     const { accessRequest } = request
     const { deployment } = this.#chain
-    // Part C handoff: the Advisor verifies signatures under the request's own domain, so the Vault pins the network.
-    if (
-      decodeUint64(accessRequest.chainId) !== deployment.chainId ||
-      accessRequest.capabilityRegistry.toLowerCase() !== deployment.capabilityRegistry
-    ) {
-      throw new MidaError("INVALID_WIRE", "access request targets a different chain or registry than this Vault")
+    // Everything before #sendCapability reads or checks only — no transaction can exist yet — so
+    // a failure anywhere in this stretch is marked not-sent (the mark failedBeforeSend reads) and
+    // rethrown: the owner is never told a grant went out when a pre-send read merely dropped.
+    let prepared: {
+      advice: GrantAdvice
+      selected: { scopes: GrantScope[]; expiresAt: bigint }
+      requestHash: Hex
+      challenge: Hex
     }
-    // the expiry window needs only the chain's clock — one getBlock — so it is checked before
-    // the agent-record and revocation-history reads: an expired request refuses here, never
-    // after those reads (in-15 J-2)
-    const now = await latestTimestamp(this.#chain)
-    assertRequestFresh(accessRequest, now)
-    const agentRecord = await readAgentRecord(this.#chain, accessRequest.agentId)
-    const history = await ownerHistory({
-      client: this.#chain.publicClient,
-      deployment,
-      owner: this.owner,
-      agentId: accessRequest.agentId,
-    })
-    const advice = adviseGrant({ request: accessRequest, manifest: request.manifest, agentRecord, ownerHistory: history, now })
+    try {
+      // Part C handoff: the Advisor verifies signatures under the request's own domain, so the Vault pins the network.
+      if (
+        decodeUint64(accessRequest.chainId) !== deployment.chainId ||
+        accessRequest.capabilityRegistry.toLowerCase() !== deployment.capabilityRegistry
+      ) {
+        throw new MidaError("INVALID_WIRE", "access request targets a different chain or registry than this Vault")
+      }
+      // the expiry window needs only the chain's clock — one getBlock — so it is checked before
+      // the agent-record and revocation-history reads: an expired request refuses here, never
+      // after those reads (in-15 J-2)
+      const now = await latestTimestamp(this.#chain)
+      assertRequestFresh(accessRequest, now)
+      const agentRecord = await readAgentRecord(this.#chain, accessRequest.agentId)
+      const history = await ownerHistory({
+        client: this.#chain.publicClient,
+        deployment,
+        owner: this.owner,
+        agentId: accessRequest.agentId,
+      })
+      const advice = adviseGrant({ request: accessRequest, manifest: request.manifest, agentRecord, ownerHistory: history, now })
 
-    const selected =
-      request.selection.kind === "recommended"
-        ? { scopes: advice.recommended, expiresAt: decodeUint64(advice.recommendedExpiresAt) }
-        : { scopes: sortScopes(request.selection.scopes), expiresAt: request.selection.expiresAt }
-    if (selected.scopes.length === 0) throw new MidaError("CAPABILITY_DENIED", "nothing was selected to grant")
-    assertFinalSelection({
-      requestedScopes: accessRequest.scopes,
-      requestedExpiresAt: decodeUint64(accessRequest.capabilityExpiresAt),
-      finalScopes: selected.scopes,
-      finalExpiresAt: selected.expiresAt,
-      now,
-    })
+      const selected =
+        request.selection.kind === "recommended"
+          ? { scopes: advice.recommended, expiresAt: decodeUint64(advice.recommendedExpiresAt) }
+          : { scopes: sortScopes(request.selection.scopes), expiresAt: request.selection.expiresAt }
+      if (selected.scopes.length === 0) throw new MidaError("CAPABILITY_DENIED", "nothing was selected to grant")
+      assertFinalSelection({
+        requestedScopes: accessRequest.scopes,
+        requestedExpiresAt: decodeUint64(accessRequest.capabilityExpiresAt),
+        finalScopes: selected.scopes,
+        finalExpiresAt: selected.expiresAt,
+        now,
+      })
 
-    const { agentSignature: _signature, ...unsigned } = accessRequest
-    const requestHash = accessRequestHash(unsigned)
-    const nonce = await this.#readCapability<bigint>("grantNonce", [this.owner])
-    const challenge = grantDigest({
-      chainId: deployment.chainId,
-      capabilityRegistry: deployment.capabilityRegistry,
-      owner: this.owner,
-      agentId: accessRequest.agentId,
-      requestHash,
-      manifestHash: accessRequest.manifestHash,
-      manifestVersion: BigInt(accessRequest.manifestVersion),
-      finalScopes: selected.scopes,
-      expiresAt: selected.expiresAt,
-      grantNonce: nonce,
-    })
+      const { agentSignature: _signature, ...unsigned } = accessRequest
+      const requestHash = accessRequestHash(unsigned)
+      const nonce = await this.#readCapability<bigint>("grantNonce", [this.owner])
+      prepared = {
+        advice,
+        selected,
+        requestHash,
+        challenge: grantDigest({
+          chainId: deployment.chainId,
+          capabilityRegistry: deployment.capabilityRegistry,
+          owner: this.owner,
+          agentId: accessRequest.agentId,
+          requestHash,
+          manifestHash: accessRequest.manifestHash,
+          manifestVersion: BigInt(accessRequest.manifestVersion),
+          finalScopes: selected.scopes,
+          expiresAt: selected.expiresAt,
+          grantNonce: nonce,
+        }),
+      }
+    } catch (error) {
+      throw markUnsent(error)
+    }
+    const { advice, selected, requestHash, challenge } = prepared
     const receipt = await this.#sendCapability("grant.batch", "grantBatch", [
       toAccessRequestStruct(accessRequest),
       selected.scopes,

@@ -9,7 +9,7 @@ import { createInterface } from "node:readline"
 import { compareChainOrder, orderTime, recordedAt, taskOf } from "@mida/checkpoint"
 import type { StoredCheckpoint } from "@mida/checkpoint"
 import { decodeUint64, displaySafeBlock, displaySafeLine, displaySafeText, isMidaError, namespaceById } from "@mida/protocol"
-import type { Address, Hex, RequestedScope } from "@mida/protocol"
+import type { AccessRequest, Address, Hex, RequestedScope } from "@mida/protocol"
 import { privateKeyToAccount } from "viem/accounts"
 import type { Deployment } from "@mida/chain"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
@@ -55,7 +55,7 @@ import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag, 
 import { resetOutOfGasWaits } from "./drain.js"
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
 import { siblingEntryArgs } from "./sibling.js"
-import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, pendingApprovalAdvice, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint } from "./skeleton.js"
+import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, pendingApprovalGate, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint, ungrantedScopes } from "./skeleton.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerMode, saveOwnerAddress } from "./keys.js"
 import { DEFAULT_TASK, TASK_RULE_TEXT, clearFolderTask, folderTaskFor, isTaskName, resolveSessionTask, taskOrUndefined, writeFolderTask } from "./task.js"
 import type { OwnerMode } from "./keys.js"
@@ -1108,16 +1108,32 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
         deps.print("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
         return (await prompt("Type yes to approve: ")).trim() === "yes"
       })
-      deps.print(
-        result.transactionHash === null
-          ? // nothing was sent because the chain already approves the agent — the honest answer is
-            // what the folder's list row did, never "run the command you just ran" (M3-D4)
+      if (result.completedEarlier === true) {
+        // UF-AP: the grant had already landed when its reply was lost — this run only finished
+        // recording it, so the line says "finished" instead of "already approved".
+        deps.print(`${agent}'s approval was already on chain from an earlier try. Mida finished recording it on this machine (no transaction).`)
+        if (result.projectId !== undefined) {
+          deps.print(
             result.projectAlreadyListed === true
-            ? `${agent} is already approved on chain. This folder was already approved for ${agent}.`
-            : `${agent} is already approved on chain. This folder is now approved for ${agent} too (no transaction).`
-          : `approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}` +
-              (result.projectId !== undefined ? ` project ${result.projectId}` : ""),
-      )
+              ? `This folder was already approved for ${agent}.`
+              : `This folder is now approved for ${agent} too (no transaction).`,
+          )
+        }
+      } else {
+        deps.print(
+          result.transactionHash === null
+            ? // nothing was sent because the chain already approves the agent — the honest answer is
+              // what the folder's list row did, never "run the command you just ran" (M3-D4)
+              result.projectAlreadyListed === true
+              ? `${agent} is already approved on chain. This folder was already approved for ${agent}.`
+              : `${agent} is already approved on chain. This folder is now approved for ${agent} too (no transaction).`
+            : `approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}` +
+                (result.projectId !== undefined ? ` project ${result.projectId}` : ""),
+        )
+      }
+      if (result.unrecorded === true) {
+        deps.print(`${agent} is approved on chain, but this machine has no record of that approval, so ${agent} cannot read or save here. To repair it: mida revoke ${agent}, then mida request ${agent}, then mida approve ${agent}.`)
+      }
       // a list rebuilt from a bad signature silently dropped rows — the owner must hear the count
       if (result.droppedRows !== undefined && result.droppedRows !== 0) {
         deps.print(
@@ -1212,6 +1228,12 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     return 0
   } catch (error) {
     deps.print(ownerRefusalLine(command, agent, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
+    // UF-AP: a sponsor timeout is the failure that can leave a landed grant unrecorded — the
+    // approve-only hint tells the owner the second run costs nothing and finishes it.
+    if (command === "approve" && agent !== "--all") {
+      const hint = sponsorTimeoutHint(agent, error)
+      if (hint !== undefined) deps.print(hint)
+    }
     // Owner commands run in the owner's own terminal, and an unnamed failure leaves them blind.
     // Only when they ask (MIDA_DEBUG=1): the error's name and first lines, long hex strings masked.
     if (process.env.MIDA_DEBUG === "1") {
@@ -1324,13 +1346,39 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
       gainingFolder.push(name)
       continue
     }
-    printPendingAsk(deps, runtime.home, name, marker?.projectId)
     try {
-      const advice = await pendingApprovalAdvice(runtime, name)
-      deps.print(`grant advisor: ${advice.risk} risk; recommends ${advice.recommended.length} scope(s) until ${new Date(Number(decodeUint64(advice.recommendedExpiresAt)) * 1000).toISOString()}`)
-      for (const warning of advice.warnings) deps.print(`  ${warning.severity}: ${warning.messageKey}`)
+      const gate = await pendingApprovalGate(runtime, name)
+      if (gate.kind === "advice") {
+        printPendingAsk(deps, runtime.home, name, marker?.projectId)
+        deps.print(`grant advisor: ${gate.advice.risk} risk; recommends ${gate.advice.recommended.length} scope(s) until ${new Date(Number(decodeUint64(gate.advice.recommendedExpiresAt)) * 1000).toISOString()}`)
+        for (const warning of gate.advice.warnings) deps.print(`  ${warning.severity}: ${warning.messageKey}`)
+      } else {
+        // UF-APR5 F4: a used-up request's stale ask is never re-printed — the line says what
+        // approving this agent will actually do, and the approve below does it.
+        deps.print(
+          gate.kind === "finish"
+            ? `${name}'s grant already landed on chain — approving finishes what an earlier run left undone (no transaction)`
+            : `${name}'s earlier grant only partly survives — approving renews the scopes that expired`,
+        )
+      }
       ready.push(name)
     } catch (error) {
+      // UF-APR: an expired request whose grant already landed is still finishable — approve's
+      // recovery path sends nothing, so the batch runs it instead of pointing the owner at
+      // `mida request`, which would only answer "already approved". An expired request whose
+      // scopes are not all live keeps the expired-request line.
+      // The extra chain read asking "is every requested scope already live" can fail too — in
+      // that case the expired-request answer stands rather than crashing the whole batch.
+      let allLive = false
+      const pendingRequest = runtime.home.readJson<{ request?: AccessRequest }>(`agents/${name}/pending-request.json`)?.request
+      const identity = loadAgentIdentity(runtime.home, name)
+      if (refusalCode(error) === "REQUEST_EXPIRED" && pendingRequest !== undefined && identity !== undefined) {
+        allLive = await ungrantedScopes(runtime, identity.agentId, pendingRequest.scopes).then((missing) => missing.length === 0).catch(() => false)
+      }
+      if (allLive) {
+        ready.push(name)
+        continue
+      }
       deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
       failed.push(`${name} (${refusalCode(error)})`)
     }
@@ -1359,17 +1407,35 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
     try {
       const result = await approve(runtime, name, deps.cwd)
       approved.push(name)
-      deps.print(
-        result.transactionHash === null
-          ? // "now approved" only when this batch actually wrote the row — a re-list is not a grant
-            result.projectAlreadyListed === true
-            ? `${name} is already approved on chain. This folder was already approved for ${name}.`
-            : `${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`
-          : `approved ${name} tx ${result.transactionHash}`,
-      )
+      // UF-AP: a grant recovered from chain is finished here, not re-sent — the agent still
+      // counts as approved in the summary, but the line says what this run actually did.
+      if (result.completedEarlier === true) {
+        deps.print(`${name}'s approval was already on chain from an earlier try. Mida finished recording it on this machine (no transaction).`)
+      } else {
+        deps.print(
+          result.transactionHash === null
+            ? // "now approved" only when this batch actually wrote the row — a re-list is not a grant
+              result.projectAlreadyListed === true
+              ? `${name} is already approved on chain. This folder was already approved for ${name}.`
+              : `${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`
+            : `approved ${name} tx ${result.transactionHash}`,
+        )
+      }
+      if (result.unrecorded === true) {
+        deps.print(`${name} is approved on chain, but this machine has no record of that approval, so ${name} cannot read or save here. To repair it: mida revoke ${name}, then mida request ${name}, then mida approve ${name}.`)
+      }
     } catch (error) {
       deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
-      failed.push(`${name} (${refusalCode(error)})`)
+      const hint = sponsorTimeoutHint(name, error)
+      if (hint !== undefined) deps.print(hint)
+      // UF-APR5 F4: a used-up request's finish path ends at approve's already-approved answer
+      // when no folder is being listed — the work ran and the line above just said the agent is
+      // approved, so the summary agrees instead of reporting a failure.
+      // UF-APR5 F5: an approved agent whose folder row failed is approved — the line above
+      // already said so; the summary counts it the same way and names the one step left undone.
+      if (refusalCode(error) === "already-approved") approved.push(name)
+      else if (refusalCode(error) === "approved-unlisted") approved.push(`${name} (folder not listed)`)
+      else failed.push(`${name} (${refusalCode(error)})`)
     }
   }
   // A partial batch still changed the chain for its successes — the daemon must hear it even
@@ -1723,6 +1789,20 @@ const migrateProgress = (home: MidaHome | undefined): MigrateProgress => {
   return typeof step !== "string" || !["preview", "paused", "backed-up"].includes(step) ? "mid-run" : "none"
 }
 
+/**
+ * UF-AP: when an approve dies OWNER_WALLET_LOW *because the sponsor's reply timed out*, the
+ * sponsored transaction may still have landed — paying from the owner's empty wallet failed, but
+ * the earlier send may not have. The extra line tells the owner a second approve is free and
+ * finishes the recording if the chain already holds the grant. Any other failure — sponsor
+ * refused, wallet simply low — earns no hint.
+ */
+function sponsorTimeoutHint(agent: string, error: unknown): string | undefined {
+  if (refusalCode(error) !== "OWNER_WALLET_LOW" || !(error instanceof Error)) return undefined
+  const sponsor = /the gas sponsor did not pay \(([^)]*)\)/i.exec(error.message)?.[1]
+  if (sponsor === undefined || !/timed out|did not answer/i.test(sponsor)) return undefined
+  return `The gas sponsor did not answer in time, so its transaction may still have gone through. Run mida approve ${agent} again in a minute: Mida checks the chain first and sends only what is still missing.`
+}
+
 export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string, capabilityRegistry?: string, home?: MidaHome, undo = false): string {
   const code = refusalCode(error)
   // The "nothing was sent/written" claims are true only before migrate's first transaction —
@@ -1748,6 +1828,10 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     case "not-approved": return "not approved"
     case "REQUEST_EXPIRED":
       return `${agent}'s request has expired (a request lasts ${Number(REQUEST_LIFETIME_SECONDS) / 60} minutes): run \`mida request ${agent}\` and approve again`
+    // UF-APR: the chain could not be read while finishing an approval — nothing was changed,
+    // and the retry runs the same check again.
+    case "approval-check-failed":
+      return `Mida could not read the chain to finish ${agent}'s approval. Nothing was changed. Run mida approve ${agent} again.`
     case "already-approved":
       // A general-assistance identity can never hold a project row — pointing at `approve` here
       // would send the owner round a loop that can only ever answer already-approved again.
@@ -1875,6 +1959,21 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
       const who = typeof ids[0] === "string" ? `record ${shortId(ids[0])}` : "a record"
       return `${who} carries a ${field}value${value} this version of mida does not recognise — update mida and run the export again`
     }
+    // UF-APR4 D3: a grant transaction that went out but whose confirmation read never came back.
+    // The wrapped message is already the exact owner-facing sentence — it says the grant WAS
+    // sent and names the retry that finishes it — so this prints it, never "nothing was sent".
+    case "grant-unconfirmed":
+      return error instanceof Error ? error.message : "refused: grant-unconfirmed"
+    // UF-APR5 F2: a grant the chain shows as landed while approveGrant was still finishing. The
+    // wrapped message is the exact owner-facing sentence — it says the grant LANDED and names
+    // the retry that finishes without a second grant — so this prints it.
+    case "grant-landed-unfinished":
+      return error instanceof Error ? error.message : "refused: grant-landed-unfinished"
+    // UF-APR4 D4: the same pattern for a folder-listing failure raised after the approval was
+    // settled — the wrapped message already opens with "<agent> is approved, but" and names the
+    // retry that adds the folder row.
+    case "approved-unlisted":
+      return error instanceof Error ? error.message : "refused: approved-unlisted"
     case "chain-busy":
       return partway === undefined
         ? "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again"

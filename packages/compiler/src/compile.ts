@@ -8,11 +8,10 @@ import { spawn } from "node:child_process"
 import { mkdtempSync, rmSync } from "node:fs"
 import os from "node:os"
 import path, { join } from "node:path"
-import { CONTENT_FIELDS, LIMITS, cutText, limitNote, repointEvidence, splitLimitNote, validateCheckpoint, type Checkpoint, type LimitList } from "@mida/checkpoint"
+import { CONTENT_FIELDS, LIMITS, cutText, limitNote, onlyScaffolding, repointEvidence, splitLimitNote, validateCheckpoint, type Checkpoint, type LimitList } from "@mida/checkpoint"
 import { extractJsonObject } from "./extract-json.js"
 import { buildExtractPrompt } from "./prompt.js"
 import { scrubSecrets, scrubValue } from "./scrub.js"
-import { stripLeadingScaffolds } from "./transcript-claude.js"
 import type { Conversation } from "./transcript-claude.js"
 import { readTranscriptFor } from "./transcript-codex.js"
 
@@ -525,11 +524,11 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
   // the first block when the file's own pick is a continuation — the prompt
   // calls the first block "the user's original request", so the request it
   // names must actually sit there (M1). The kept value is itself re-checked
-  // with the reader's scaffolding test first: a .last.json saved before the
+  // with the shared scaffolding test first: a .last.json saved before the
   // test existed can hold caveat or command-echo text, and keeping it would
   // lock the bad pick into every later save (L3).
   const earlier = input.previous?.originalRequest
-  const kept = typeof earlier === "string" && stripLeadingScaffolds(earlier) !== "" ? earlier : null
+  const kept = typeof earlier === "string" && !onlyScaffolding(earlier) ? earlier : null
   // The reader matches the agent that wrote the transcript. The drain refuses agents with
   // no reader before this is ever called; a direct caller naming one is refused here too —
   // never quietly parsed through another agent's format. The code is the drain's own

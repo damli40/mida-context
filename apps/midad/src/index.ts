@@ -13,6 +13,9 @@ export {
   init,
   requestAccess,
   approve,
+  grantResponseFromLogs,
+  liveCapabilityIdsOf,
+  recordedCoverage,
   saveCheckpoint,
   readCheckpoints,
   revoke,
@@ -23,6 +26,7 @@ export {
   expectedScopesFor,
   purposeFor,
 } from "./skeleton.js"
+export type { ApprovePreview } from "./skeleton.js"
 export { attemptNamespaceRead, factShortId, factStamp, readOwnerFacts, remember, resolveFactId, FACT_NAMESPACES, MAX_FACTS } from "./remember.js"
 export type { FactIdResolution, FactNamespace, OwnerFact, RememberResult } from "./remember.js"
 export * from "./checkpoint-payload.js"
