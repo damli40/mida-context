@@ -73,8 +73,24 @@ jobs:
           pnpm --version | Tee-Object "$env:RUNNER_TEMP\log\pnpm-version.txt"
           pnpm install --frozen-lockfile 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\pnpm-install.txt"
           pnpm build:publish 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\build-publish.txt"
-          npm install -g ./publish/cli 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install.txt"
-          "install $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          $installCode = $LASTEXITCODE
+          if ($installCode -eq 0) {
+            New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\mida-pack" | Out-Null
+            npm pack .\publish\cli --pack-destination "$env:RUNNER_TEMP\mida-pack" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\npm-pack.txt"
+            $packCode = $LASTEXITCODE
+            $tarball = Get-ChildItem "$env:RUNNER_TEMP\mida-pack\*.tgz" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($packCode -eq 0 -and $null -ne $tarball) {
+              "packed tarball: $($tarball.Name)" | Tee-Object "$env:RUNNER_TEMP\log\tarball.txt"
+              npm install -g $tarball.FullName 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install.txt"
+              $installCode = $LASTEXITCODE
+            } else {
+              "npm pack wrote no tarball" | Tee-Object "$env:RUNNER_TEMP\log\tarball.txt"
+              $installCode = 1
+            }
+          } else {
+            "skipped: pnpm build:publish exited $installCode" | Tee-Object "$env:RUNNER_TEMP\log\install.txt"
+          }
+          "install $installCode" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
           Get-Command mida, midad, mida-hook, mida-inject, mida-mcp -ErrorAction SilentlyContinue | Format-Table Name, Source
           exit 0
 
@@ -248,9 +264,25 @@ jobs:
           corepack enable
           pnpm --version | tee /tmp/log/pnpm-version.txt
           pnpm install --frozen-lockfile 2>&1 | tee /tmp/log/pnpm-install.txt
-          pnpm build:publish 2>&1 | tee /tmp/log/build-publish.txt
-          npm install -g ./publish/cli 2>&1 | tee /tmp/log/install.txt
+          install_code=0
+          pnpm build:publish 2>&1 | tee /tmp/log/build-publish.txt || install_code=${PIPESTATUS[0]}
+          if [ "$install_code" -eq 0 ]; then
+            mkdir -p /tmp/mida-pack
+            npm pack ./publish/cli --pack-destination /tmp/mida-pack 2>&1 | tee /tmp/log/npm-pack.txt || pack_code=${PIPESTATUS[0]}
+            tarball=$(ls -1 /tmp/mida-pack/*.tgz 2>/dev/null | head -n 1 || true)
+            if [ "${pack_code:-0}" -eq 0 ] && [ -n "$tarball" ]; then
+              echo "packed tarball: $(basename "$tarball")" | tee /tmp/log/tarball.txt
+              npm install -g "$tarball" 2>&1 | tee /tmp/log/install.txt || install_code=${PIPESTATUS[0]}
+            else
+              echo "npm pack wrote no tarball" | tee /tmp/log/tarball.txt
+              install_code=1
+            fi
+          else
+            echo "skipped: pnpm build:publish exited $install_code" | tee /tmp/log/install.txt
+          fi
+          echo "install $install_code" | tee -a /tmp/log/install.txt
           which mida midad mida-hook mida-inject mida-mcp
+          exit $install_code
 
       - name: mida init
         run: |
