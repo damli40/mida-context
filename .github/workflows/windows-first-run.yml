@@ -1,34 +1,22 @@
-# A first run of Mida on a Windows machine, started by hand. Two jobs:
+# A first run of Mida on a Windows machine, started by hand. There is one job, native,
+# and it tests this branch rather than the published package: it checks out the ref,
+# builds the workspace, packs the CLI and installs the tarball into a folder with a
+# space in its path.
 #
-#   native: the published npm package on Windows itself. Mida does not support Windows yet;
-#           this job exists to record exactly which steps fail and how. Every step is allowed
-#           to fail, and the last step prints each step's exit code.
-#   wsl:    the same first run as the Linux job, inside WSL (the Linux layer built into
-#           Windows). This is the route a Windows user can try today.
+# The gated steps prove one end to end pass: init, a request for each of two agents, a
+# typed approve, one saved checkpoint handed to codex at session start, a Stop hook
+# capture that lands in the queue, and a revoke that ends the handoff. If any of them
+# fails the job fails.
 #
-# The `from` input picks what each job installs: `npm` (the default) is the published package,
-# and `source` checks out the dispatched ref and installs the CLI built from it.
-#
-# Neither job has Claude Code or Codex, so the agents' own hooks never fire and no model writes
-# a summary. Both use the hosted store and the hosted gas sponsor on Monad testnet: about ten
-# sponsored transactions per job that gets as far as approving. Keys live only on the runner.
+# The steps whose names end in "record only: needs Batch 2" exercise mida install and
+# everything that depends on it: the hook entries it writes into Claude Code's and
+# Codex's configs, and the Claude Desktop tool server. Batch 2 of the Windows port is
+# not built yet, so these steps run, write their exit codes to the log and never fail
+# the job. mida doctor is logged too and is never a gate.
 name: Windows first run
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: "mida-context version to install from npm"
-        required: false
-        default: "latest"
-      from:
-        description: "what to install: the published npm package, or this ref built from source"
-        type: choice
-        options:
-          - npm
-          - source
-        required: true
-        default: "npm"
 
 permissions:
   contents: read
@@ -36,320 +24,242 @@ permissions:
 jobs:
   native:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     defaults:
       run:
         shell: pwsh
+    env:
+      DEMO_OBJECTIVE: "M0 demo checkpoint"
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
-      - name: The machine
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up the machine
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\log" | Out-Null
           [System.Environment]::OSVersion.VersionString
           node --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm --version
-
-      - uses: actions/checkout@v4
-        if: inputs.from == 'source'
-
-      - name: Install from npm
-        if: inputs.from == 'npm'
-        continue-on-error: true
-        run: |
-          npm install -g "mida-context@${{ inputs.version }}" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install.txt"
-          "install $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          Get-Command mida, midad, mida-hook, mida-inject, mida-mcp -ErrorAction SilentlyContinue | Format-Table Name, Source
-          exit 0
-
-      - name: Install from source
-        if: inputs.from == 'source'
-        continue-on-error: true
-        run: |
-          git rev-parse HEAD | Tee-Object "$env:RUNNER_TEMP\log\commit.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pip install pywinpty 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\pip.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           corepack enable
-          pnpm --version | Tee-Object "$env:RUNNER_TEMP\log\pnpm-version.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm install --frozen-lockfile 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\pnpm-install.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build, pack and install this branch's CLI
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          git rev-parse HEAD | Tee-Object "$env:RUNNER_TEMP\log\commit.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm build:publish 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\build-publish.txt"
-          $installCode = $LASTEXITCODE
-          if ($installCode -eq 0) {
-            New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\mida-pack" | Out-Null
-            npm pack .\publish\cli --pack-destination "$env:RUNNER_TEMP\mida-pack" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\npm-pack.txt"
-            $packCode = $LASTEXITCODE
-            $tarball = Get-ChildItem "$env:RUNNER_TEMP\mida-pack\*.tgz" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($packCode -eq 0 -and $null -ne $tarball) {
-              "packed tarball: $($tarball.Name)" | Tee-Object "$env:RUNNER_TEMP\log\tarball.txt"
-              npm install -g $tarball.FullName 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install.txt"
-              $installCode = $LASTEXITCODE
-            } else {
-              "npm pack wrote no tarball" | Tee-Object "$env:RUNNER_TEMP\log\tarball.txt"
-              $installCode = 1
-            }
-          } else {
-            "skipped: pnpm build:publish exited $installCode" | Tee-Object "$env:RUNNER_TEMP\log\install.txt"
-          }
-          "install $installCode" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          Get-Command mida, midad, mida-hook, mida-inject, mida-mcp -ErrorAction SilentlyContinue | Format-Table Name, Source
-          exit 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\mida-pack" | Out-Null
+          npm pack .\publish\cli --pack-destination "$env:RUNNER_TEMP\mida-pack" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\npm-pack.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tarball = Get-ChildItem "$env:RUNNER_TEMP\mida-pack\*.tgz" | Select-Object -First 1
+          if ($null -eq $tarball) { "FAIL: npm pack wrote no tarball"; exit 1 }
+          "packed tarball: $($tarball.Name)" | Tee-Object "$env:RUNNER_TEMP\log\tarball.txt"
+          npm install -g --prefix "C:\mida test\npm" $tarball.FullName 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "C:\mida test\npm" | Add-Content $env:GITHUB_PATH
+          $env:PATH = "C:\mida test\npm;$env:PATH"
+          Get-Command mida, midad, mida-hook, mida-inject, mida-mcp | Format-Table Name, Source
 
-      - name: mida --help
-        continue-on-error: true
+      - name: mida init and a request for each agent, in a project folder
         run: |
-          mida --help 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\help.txt"
-          "help $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
-
-      - name: mida init
-        continue-on-error: true
-        timeout-minutes: 6
-        run: |
-          mida init 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\init.txt"
-          "init $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
-
-      - name: mida doctor
-        continue-on-error: true
-        timeout-minutes: 4
-        run: |
-          mida doctor 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\doctor.txt"
-          "doctor $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
-
-      - name: mida request, in a project folder
-        continue-on-error: true
-        timeout-minutes: 4
-        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           New-Item -ItemType Directory -Force -Path "$HOME\demo-project" | Out-Null
           Set-Location "$HOME\demo-project"
           git init -q .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          mida init 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\init.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           mida request claude-code 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\request-claude-code.txt"
-          "request-claude-code $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           mida request codex 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\request-codex.txt"
-          "request-codex $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: mida approve --all (no terminal here; records what it says)
-        continue-on-error: true
-        timeout-minutes: 4
+      - name: Approve both agents with a typed yes
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           Set-Location "$HOME\demo-project"
-          mida approve --all 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\approve.txt"
-          "approve $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
+          python "$env:GITHUB_WORKSPACE\scripts\windows-ci\answer-yes.py" cmd.exe /c mida approve --all 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\approve.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path .mida\project.json)) { "FAIL: .mida\project.json was not written"; exit 1 }
 
-      - name: mida install claude-code and codex
+      - name: "mida install claude-code (record only: needs Batch 2)"
         continue-on-error: true
-        timeout-minutes: 4
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          Set-Location "$HOME\demo-project"
           mida install claude-code 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install-claude-code.txt"
           "install-claude-code $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: "mida install codex (record only: needs Batch 2)"
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          Set-Location "$HOME\demo-project"
           mida install codex 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install-codex.txt"
           "install-codex $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
           exit 0
 
-      - name: The session-start hook, as an agent would call it
+      - name: "mida install claude-desktop (record only: needs Batch 2)"
         continue-on-error: true
-        timeout-minutes: 3
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          Set-Location "$HOME\demo-project"
+          mida install claude-desktop 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install-claude-desktop.txt"
+          "install-claude-desktop $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: mida doctor
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          Set-Location "$HOME\demo-project"
+          # doctor is expected to report that no model can write summaries here; do not fail on it
+          mida doctor 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\doctor.txt"
+          "doctor $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: Save one checkpoint as claude-code
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          Set-Location "$HOME\demo-project"
+          $projectId = (Get-Content .mida\project.json -Raw | ConvertFrom-Json).projectId
+          "project id: $projectId"
+          mida save-demo claude-code $projectId 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\save.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\log\save.txt" -Pattern "^saved 0x" -Quiet)) { "FAIL: save-demo did not print a saved checkpoint"; exit 1 }
+
+      - name: Codex starts a session and receives the handoff
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           Set-Location "$HOME\demo-project"
           $payload = @{ session_id = "windows-first-run-1"; cwd = (Get-Location).Path; hook_event_name = "SessionStart"; source = "startup" } | ConvertTo-Json -Compress
           $payload | mida-inject codex 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\handoff.txt"
-          "inject $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\log\handoff.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet)) { "FAIL: codex did not receive the checkpoint"; exit 1 }
 
-      - name: A hook save, as Claude Code's Stop hook would call it
+      - name: "The session-start hooks, run the way each agent runs them (record only: needs Batch 2)"
         continue-on-error: true
         run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" claude-code "$HOME\demo-project" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\run-hook-claude-code.txt"
+          "run-hook-claude-code $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" codex "$HOME\demo-project" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\run-hook-codex.txt"
+          "run-hook-codex $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: "The Codex config is valid TOML (record only: needs Batch 2)"
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          python -c "import os,tomllib; tomllib.load(open(os.path.join(os.environ['USERPROFILE'], '.codex', 'config.toml'), 'rb'))"
+          "codex-config-toml $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: "The Claude Desktop tool server answers initialize (record only: needs Batch 2)"
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          node "$env:GITHUB_WORKSPACE\scripts\windows-ci\mcp-hello.mjs" "$env:APPDATA\Claude\claude_desktop_config.json" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\mcp-hello.txt"
+          "mcp-hello $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: "The Stop hook as settings.json runs it, with no shell (record only: needs Batch 2)"
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          $code = 1
+          try {
+            $transcript = "$HOME\.claude\projects\ci\s.jsonl"
+            New-Item -ItemType Directory -Force -Path (Split-Path $transcript) | Out-Null
+            Set-Content -Path $transcript -Value '{"type":"user","message":{"role":"user","content":"ci"}}'
+            $settings = Get-Content "$HOME\.claude\settings.json" -Raw | ConvertFrom-Json
+            $hook = $settings.hooks.Stop[0].hooks[0]
+            $hookArgs = @()
+            if ($null -ne $hook.args) { $hookArgs = @($hook.args) }
+            $payload = @{ session_id = "ci-capture"; transcript_path = $transcript; cwd = "$HOME\demo-project"; hook_event_name = "Stop" } | ConvertTo-Json -Compress
+            $payload | & $hook.command @hookArgs 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\stop-hook-via-settings.txt"
+            $code = $LASTEXITCODE
+          } catch {
+            $code = 1
+            "threw: $($_.Exception.Message)" | Tee-Object "$env:RUNNER_TEMP\log\stop-hook-via-settings.txt"
+          }
+          "stop-hook-via-settings $code" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
+
+      - name: A Stop hook capture through mida-hook directly
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
           Set-Location "$HOME\demo-project"
-          $transcript = "$HOME\demo-project\hook-transcript.jsonl"
-          Set-Content -Path $transcript -Value @(
-            '{"type":"user","message":{"role":"user","content":"hello"}}',
-            '{"type":"assistant","message":{"role":"assistant","content":"hi"}}'
-          )
-          # claude-code only trusts transcripts under ~/.claude/projects, so the session copy lives there
-          $sessionTranscript = "$HOME\.claude\projects\demo-project\ci-hook-1.jsonl"
-          New-Item -ItemType Directory -Force -Path "$HOME\.claude\projects\demo-project" | Out-Null
-          Copy-Item $transcript $sessionTranscript
-          $payload = @{ session_id = "ci-hook-1"; transcript_path = $sessionTranscript; cwd = (Get-Location).Path; hook_event_name = "Stop" } | ConvertTo-Json -Compress
-          $payload | mida-hook claude-code 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\hook-save.txt"
-          "hook-save $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          "--- files in the Mida home's queue folder ---"
-          if (Test-Path "$HOME\.mida\queue") {
-            Get-ChildItem -Recurse -File "$HOME\.mida\queue" | ForEach-Object { $_.FullName.Substring("$HOME\.mida".Length + 1) } | Sort-Object | Tee-Object "$env:RUNNER_TEMP\log\hook-save-queue.txt"
-          } else { "no queue folder" | Tee-Object "$env:RUNNER_TEMP\log\hook-save-queue.txt" }
-          exit 0
+          $transcript = "$HOME\.claude\projects\ci\s.jsonl"
+          New-Item -ItemType Directory -Force -Path (Split-Path $transcript) | Out-Null
+          Set-Content -Path $transcript -Value '{"type":"user","message":{"role":"user","content":"ci"}}'
+          $before = 0
+          if (Test-Path "$HOME\.mida\queue") { $before = (Get-ChildItem "$HOME\.mida\queue" -Recurse -File | Measure-Object).Count }
+          $payload = @{ session_id = "ci-capture"; transcript_path = $transcript; cwd = (Get-Location).Path; hook_event_name = "Stop" } | ConvertTo-Json -Compress
+          $payload | mida-hook claude-code 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\hook-capture.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $after = 0
+          if (Test-Path "$HOME\.mida\queue") { $after = (Get-ChildItem "$HOME\.mida\queue" -Recurse -File | Measure-Object).Count }
+          "queue files: before=$before after=$after"
+          if ($after -le $before) { "FAIL: the Stop hook wrote nothing to the queue"; exit 1 }
 
-      - name: What Mida left on disk, and what is running
-        continue-on-error: true
+      - name: Revoke codex, then its next session gets nothing
         run: |
-          if (Test-Path "$HOME\.mida") {
-            Get-ChildItem -Recurse -File "$HOME\.mida" | ForEach-Object { $_.FullName.Substring("$HOME\.mida".Length + 1) } | Sort-Object | Tee-Object "$env:RUNNER_TEMP\log\files.txt"
-            "--- who may read the owner's key file ---"
-            if (Test-Path "$HOME\.mida\owner\secrets.json") { (Get-Acl "$HOME\.mida\owner\secrets.json").Access | Format-Table IdentityReference, FileSystemRights, AccessControlType | Out-String | Tee-Object "$env:RUNNER_TEMP\log\key-file-acl.txt" }
-          } else { "no .mida folder was created" | Tee-Object "$env:RUNNER_TEMP\log\files.txt" }
-          Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Select-Object ProcessId, CommandLine | Format-List | Out-String | Tee-Object "$env:RUNNER_TEMP\log\node-processes.txt"
-          exit 0
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          Set-Location "$HOME\demo-project"
+          python "$env:GITHUB_WORKSPACE\scripts\windows-ci\answer-yes.py" cmd.exe /c mida revoke codex 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\revoke.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $payload = @{ session_id = "windows-first-run-2"; cwd = (Get-Location).Path; hook_event_name = "SessionStart"; source = "startup" } | ConvertTo-Json -Compress
+          $payload | mida-inject codex 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\handoff-after-revoke.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Select-String -Path "$env:RUNNER_TEMP\log\handoff-after-revoke.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet) { "FAIL: a revoked agent still received the checkpoint"; exit 1 }
 
-      - name: Summary
-        if: always()
+      - name: Key files are readable only by this user
         run: |
-          "## Windows first run, native" | Add-Content $env:GITHUB_STEP_SUMMARY
-          "" | Add-Content $env:GITHUB_STEP_SUMMARY
-          "Exit code of each step (0 = the command reported success):" | Add-Content $env:GITHUB_STEP_SUMMARY
-          "" | Add-Content $env:GITHUB_STEP_SUMMARY
-          if (Test-Path "$env:RUNNER_TEMP\log\exit-codes.txt") { Get-Content "$env:RUNNER_TEMP\log\exit-codes.txt" | ForEach-Object { "- $_" } | Add-Content $env:GITHUB_STEP_SUMMARY }
-          Get-Content "$env:RUNNER_TEMP\log\exit-codes.txt" -ErrorAction SilentlyContinue
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $false
+          pwsh "$env:GITHUB_WORKSPACE\scripts\windows-ci\check-acl.ps1" "$HOME\.mida\owner\secrets.json" "$HOME\.mida\midad.sock.path" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\check-acl.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-native-first-run-log
-          path: ${{ runner.temp }}/log
-
-  wsl:
-    runs-on: windows-latest
-    timeout-minutes: 30
-    defaults:
-      run:
-        shell: wsl-bash {0}
-    env:
-      DEMO_OBJECTIVE: "M0 demo checkpoint"
-    steps:
-      - uses: Vampire/setup-wsl@v7
-        with:
-          distribution: Ubuntu-24.04
-          update: "true"
-          additional-packages: curl ca-certificates expect git
-
-      - uses: actions/checkout@v4
-        if: inputs.from == 'source'
-
-      - name: The machine
-        run: |
-          uname -a
-          grep PRETTY_NAME /etc/os-release
-          echo "WSL kernel: $(cat /proc/version)"
-          curl -fsSL https://deb.nodesource.com/setup_22.x | bash - > /dev/null
-          apt-get install -y -q nodejs > /dev/null
-          node --version
-          npm --version
-          mkdir -p /tmp/log
-
-      - name: Install from npm
-        if: inputs.from == 'npm'
-        run: |
-          npm install -g "mida-context@${{ inputs.version }}"
-          which mida midad mida-hook mida-inject mida-mcp
-          npm ls -g mida-context
-
-      - name: Build and install from source
-        if: inputs.from == 'source'
-        run: |
-          set -o pipefail
-          SRC="${{ github.workspace }}"
-          case "$SRC" in
-            [A-Za-z]:*)
-              drive=$(printf '%s' "$SRC" | cut -c1 | tr '[:upper:]' '[:lower:]')
-              rest=$(printf '%s' "$SRC" | cut -c4- | tr '\\' '/')
-              SRC="/mnt/$drive/$rest"
-              ;;
-          esac
-          echo "checked-out workspace: $SRC"
-          test -f "$SRC/package.json"
-          cp -r "$SRC/." "$HOME/mida-src"
-          cd "$HOME/mida-src"
-          git rev-parse HEAD | tee /tmp/log/commit.txt
-          corepack enable
-          pnpm --version | tee /tmp/log/pnpm-version.txt
-          pnpm install --frozen-lockfile 2>&1 | tee /tmp/log/pnpm-install.txt
-          install_code=0
-          pnpm build:publish 2>&1 | tee /tmp/log/build-publish.txt || install_code=${PIPESTATUS[0]}
-          if [ "$install_code" -eq 0 ]; then
-            mkdir -p /tmp/mida-pack
-            npm pack ./publish/cli --pack-destination /tmp/mida-pack 2>&1 | tee /tmp/log/npm-pack.txt || pack_code=${PIPESTATUS[0]}
-            tarball=$(ls -1 /tmp/mida-pack/*.tgz 2>/dev/null | head -n 1 || true)
-            if [ "${pack_code:-0}" -eq 0 ] && [ -n "$tarball" ]; then
-              echo "packed tarball: $(basename "$tarball")" | tee /tmp/log/tarball.txt
-              npm install -g "$tarball" 2>&1 | tee /tmp/log/install.txt || install_code=${PIPESTATUS[0]}
-            else
-              echo "npm pack wrote no tarball" | tee /tmp/log/tarball.txt
-              install_code=1
-            fi
-          else
-            echo "skipped: pnpm build:publish exited $install_code" | tee /tmp/log/install.txt
-          fi
-          echo "install $install_code" | tee -a /tmp/log/install.txt
-          which mida midad mida-hook mida-inject mida-mcp
-          exit $install_code
-
-      - name: mida init
-        run: |
-          set -o pipefail
-          date -u +"start %FT%TZ" | tee /tmp/log/times.txt
-          mida init 2>&1 | tee /tmp/log/init.txt
-          test -d "$HOME/.mida"
-
-      - name: Request and approve two agents in a project folder
-        run: |
-          set -o pipefail
-          mkdir -p "$HOME/demo-project" && cd "$HOME/demo-project"
-          git init -q .
-          mida request claude-code 2>&1 | tee /tmp/log/request-claude-code.txt
-          mida request codex 2>&1 | tee /tmp/log/request-codex.txt
-          cat > /tmp/yes.exp <<'EOF'
-          set timeout 240
-          spawn {*}$argv
-          expect {
-            -re {[Tt]ype yes[^\n:]*:} { sleep 1; send "yes\r"; exp_continue }
-            eof
-          }
-          lassign [wait] pid spawnid os_error value
-          exit $value
-          EOF
-          expect /tmp/yes.exp mida approve --all 2>&1 | tee /tmp/log/approve.txt
-          test -f .mida/project.json
-
-      - name: mida doctor
-        run: |
-          cd "$HOME/demo-project"
-          mida doctor 2>&1 | tee /tmp/log/doctor.txt || true
-
-      - name: Save one checkpoint as claude-code
-        run: |
-          set -o pipefail
-          cd "$HOME/demo-project"
-          PROJECT_ID=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(".mida/project.json","utf8")).projectId)')
-          mida save-demo claude-code "$PROJECT_ID" 2>&1 | tee /tmp/log/save.txt
-          grep -q "^saved 0x" /tmp/log/save.txt
-
-      - name: Codex starts a session and receives the handoff
-        run: |
-          set -o pipefail
-          cd "$HOME/demo-project"
-          printf '{"session_id":"wsl-first-run-1","cwd":"%s","hook_event_name":"SessionStart","source":"startup"}' "$PWD" \
-            | mida-inject codex 2>&1 | tee /tmp/log/handoff.txt
-          grep -q "${{ env.DEMO_OBJECTIVE }}" /tmp/log/handoff.txt
-          date -u +"handoff %FT%TZ" | tee -a /tmp/log/times.txt
-
-      - name: Revoke codex, then its next session gets nothing
-        run: |
-          set -o pipefail
-          cd "$HOME/demo-project"
-          expect /tmp/yes.exp mida revoke codex 2>&1 | tee /tmp/log/revoke.txt
-          printf '{"session_id":"wsl-first-run-2","cwd":"%s","hook_event_name":"SessionStart","source":"startup"}' "$PWD" \
-            | mida-inject codex 2>&1 | tee /tmp/log/handoff-after-revoke.txt
-          if grep -q "${{ env.DEMO_OBJECTIVE }}" /tmp/log/handoff-after-revoke.txt; then
-            echo "FAIL: a revoked agent still received the checkpoint"; exit 1
-          fi
-          date -u +"revoked %FT%TZ" | tee -a /tmp/log/times.txt
-
-      - name: File permissions, the background service, and the times
-        if: always()
-        run: |
-          echo "home folder mode: $(stat -c '%a' "$HOME/.mida" 2>/dev/null || echo none)"
-          echo "files readable by group or others (names only):"
-          find "$HOME/.mida" -type f -perm /077 -printf '%m %P\n' 2>/dev/null || true
-          pgrep -fl midad || true
-          cat /tmp/log/times.txt 2>/dev/null || true
+          name: windows-first-run-log
+          path: |
+            ${{ runner.temp }}\log
+            ~\.mida\logs
