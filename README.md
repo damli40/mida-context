@@ -202,7 +202,7 @@ up to a minute for it.
 ```bash
 git clone --recurse-submodules https://github.com/damli40/mida-context && cd mida-context
 pnpm install && pnpm build:publish
-cd publish/cli && npm pack && npm install -g mida-context-0.1.2.tgz
+cd publish/cli && npm pack && npm install -g mida-context-0.1.3.tgz
 ```
 
 </details>
