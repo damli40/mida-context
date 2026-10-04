@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { basename, dirname, isAbsolute, join } from "node:path"
+import { basename, dirname, isAbsolute, join, resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 import {
   CODEX_BLOCK,
   CODEX_BLOCK_V1,
@@ -11,8 +12,10 @@ import {
   MidaHome,
   USAGE,
   claudeCodeMcpJson,
+  claudeDesktopConfigPath,
   claudeHooksStatus,
   codexBlock,
+  codexHookCommands,
   codexHooksStatus,
   cursorMcpConfigPath,
   devinHooksStatus,
@@ -22,6 +25,7 @@ import {
   installCodex,
   installDevin,
   installMcpClient,
+  installedMcpLauncherPath,
   mcpLauncherPath,
   codexMcpStatus,
   parseMidaCommand,
@@ -30,6 +34,7 @@ import {
   recordedCodexHome,
   resolveDevinConfigPath,
   runInstall,
+  spawnClaude,
   transcriptPathAllowed,
   uninstallClaudeCode,
   uninstallCodex,
@@ -37,6 +42,8 @@ import {
   uninstallMcpClient,
   writeSummarizer,
 } from "@mida/midad"
+
+import { claudeDesktopConfigPaths, fileName, hookEntryCommandLine, jsonHookEntry, midaCommandsInClaudeSettings } from "../src/install.js"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-install-"))
 
@@ -1408,6 +1415,61 @@ describe("the claude-code MCP server through the claude CLI (in-28)", () => {
   })
 })
 
+describe("spawnClaude resolves the claude binary on PATH only", () => {
+  // cross-spawn looks a bare name up in the current folder first on Windows, and a claude.cmd or
+  // claude.bat planted in a project Mida runs in would execute. The lookup is PATH-only, and
+  // the resolved absolute path is what runs.
+  it("a claude.cmd only in the current folder is never run — the answer is not-on-PATH", () => {
+    const cwd = dir()
+    writeFileSync(join(cwd, "claude.cmd"), "@echo off\r\n")
+    const before = process.cwd()
+    const path = process.env.PATH
+    process.chdir(cwd)
+    process.env.PATH = dir()
+    try {
+      const result = spawnClaude(["mcp", "list"])
+      expect(result.status).toBeNull()
+      expect((result.error as { code?: string } | undefined)?.code).toBe("ENOENT")
+    } finally {
+      process.chdir(before)
+      process.env.PATH = path
+    }
+  })
+
+  it("a non-executable file named claude on PATH is still not on PATH", () => {
+    const pathDir = dir()
+    const binary = join(pathDir, "claude")
+    writeFileSync(binary, "#!/bin/sh\nexit 0\n")
+    chmodSync(binary, 0o644)
+    const path = process.env.PATH
+    process.env.PATH = pathDir
+    try {
+      const result = spawnClaude(["mcp", "list"])
+      expect(result.status).toBeNull()
+      expect((result.error as { code?: string } | undefined)?.code).toBe("ENOENT")
+    } finally {
+      process.env.PATH = path
+    }
+  })
+
+  it("an executable claude on PATH runs — its own exit code comes back", () => {
+    const pathDir = dir()
+    const marker = join(dir(), "ran")
+    const binary = join(pathDir, "claude")
+    writeFileSync(binary, `#!/bin/sh\necho ran > "${marker}"\nexit 7\n`)
+    chmodSync(binary, 0o755)
+    const path = process.env.PATH
+    process.env.PATH = pathDir
+    try {
+      const result = spawnClaude(["mcp", "list"])
+      expect(result.status).toBe(7)
+      expect(existsSync(marker)).toBe(true)
+    } finally {
+      process.env.PATH = path
+    }
+  })
+})
+
 describe("the Codex trust reminder", () => {
   it("the sentence is the exact line the tools' docs describe", () => {
     expect(CODEX_TRUST_SENTENCE).toBe(
@@ -2076,5 +2138,361 @@ describe("the summariser ask after install (UF-P2c)", () => {
     expect(lines).toContain("installed")
     expect(lines).toContain("Nothing saved. Mida uses your agents' small models until you choose: mida summarizer")
     expect(home.has("summarizer.json")).toBe(false)
+  })
+})
+
+describe("Windows command lines (Review Focus 1 and 5)", () => {
+  it("Mac and Linux text is unchanged", () => {
+    expect(hookCommand("codex", "darwin")).toBe(hookCommand("codex"))
+    expect(injectCommand("claude-code", "linux")).toBe(injectCommand("claude-code"))
+  })
+
+  it("on Windows the codex command line is a PowerShell call: & then single-quoted tokens", () => {
+    // Codex runs a Windows hook line through powershell -Command (or pwsh), where a line that
+    // starts with a quoted path is a string literal, not a command. The call operator runs it.
+    const line = injectCommand("codex", "win32")
+    expect(line.startsWith("& '")).toBe(true)
+    expect(line.endsWith("' codex")).toBe(true)
+    expect(line).toContain(`'${process.execPath}'`)
+    // every token is single-quoted; a literal apostrophe would double inside a token
+    expect(line.slice(2)).toMatch(/^'(?:[^']|'')*'( '(?:[^']|'')*')* codex$/)
+    expect(parseMidaCommand(line)).toMatchObject({ kind: "inject", tool: "codex" })
+  })
+
+  it("hookCommand('codex', 'win32') is the same call form for the Stop hook", () => {
+    const line = hookCommand("codex", "win32")
+    expect(line.startsWith("& '")).toBe(true)
+    expect(line.endsWith("' codex")).toBe(true)
+    expect(parseMidaCommand(line)).toMatchObject({ kind: "hook", tool: "codex" })
+  })
+
+  it("a PowerShell call line doubles each apostrophe, and parses back to the real path", () => {
+    // What a Windows install under C:\Users\Jane O'Neil writes: '' is one literal apostrophe.
+    const line =
+      `& 'C:\\Users\\Jane O''Neil\\node\\node.exe' 'C:\\Users\\Jane O''Neil\\mida\\mida-inject.js' codex`
+    expect(parseMidaCommand(line)).toEqual({
+      kind: "inject",
+      tool: "codex",
+      paths: [
+        { file: "C:\\Users\\Jane O'Neil\\node\\node.exe", executable: true },
+        { file: "C:\\Users\\Jane O'Neil\\mida\\mida-inject.js", executable: false },
+      ],
+    })
+  })
+
+  it("on Windows Claude Code gets the no-shell form: command + args", () => {
+    const entry = jsonHookEntry("inject", "claude-code", "win32")
+    expect(entry.command).toBe(process.execPath)
+    expect(entry.args!.at(-1)).toBe("claude-code")
+    expect(parseMidaCommand(hookEntryCommandLine(entry))).toMatchObject({ kind: "inject", tool: "claude-code" })
+  })
+
+  it("on Mac Claude Code keeps the single command string", () => {
+    expect(jsonHookEntry("hook", "claude-code", "darwin")).toEqual({ type: "command", command: hookCommand("claude-code", "darwin") })
+  })
+
+  it("Devin never gets the no-shell form", () => {
+    expect(jsonHookEntry("hook", "devin", "win32").args).toBeUndefined()
+  })
+
+  it("a Windows path with a space and an apostrophe parses back as Mida's", () => {
+    const line =
+      `"C:\\Program Files\\nodejs\\node.exe" "C:\\Users\\Jane O'Neil\\AppData\\Roaming\\npm\\node_modules\\mida-context\\dist\\mida-inject.js" codex`
+    expect(parseMidaCommand(line)).toEqual({
+      kind: "inject",
+      tool: "codex",
+      paths: [
+        { file: "C:\\Program Files\\nodejs\\node.exe", executable: true },
+        { file: "C:\\Users\\Jane O'Neil\\AppData\\Roaming\\npm\\node_modules\\mida-context\\dist\\mida-inject.js", executable: false },
+      ],
+    })
+  })
+
+  it("hookEntryCommandLine turns an exec-form entry into a parseable line and refuses junk", () => {
+    expect(hookEntryCommandLine({ type: "command", command: "C:\\n\\node.exe", args: ["C:\\a b\\mida-hook.js", "claude-code"] })).toBe(
+      `"C:\\n\\node.exe" "C:\\a b\\mida-hook.js" "claude-code"`,
+    )
+    expect(hookEntryCommandLine({ type: "command", command: "x", args: [1] })).toBeNull()
+    expect(hookEntryCommandLine("x")).toBeNull()
+  })
+})
+
+const repoRoot = () => resolve(dirname(fileURLToPath(import.meta.url)), "../../..")
+const fixture = (name: string) => join(dirname(fileURLToPath(import.meta.url)), "fixtures", name)
+const normalise = (text: string) => text.split(process.execPath).join("<NODE>").split(repoRoot()).join("<ROOT>")
+
+const tempSettings = (content?: unknown): string => {
+  const file = join(dir(), "settings.json")
+  if (content !== undefined) writeFileSync(file, JSON.stringify(content))
+  return file
+}
+
+const tempCodexConfig = (text: string): string => {
+  const file = join(dir(), "config.toml")
+  writeFileSync(file, text)
+  return file
+}
+
+const tempJson = (content?: unknown): string => {
+  const file = join(dir(), "mcp.json")
+  if (content !== undefined) writeFileSync(file, JSON.stringify(content))
+  return file
+}
+
+describe("Claude Code settings on Windows", () => {
+  const EVENTS = ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "StopFailure", "PreCompact", "SessionEnd"]
+
+  it("a fresh install writes the no-shell form for all seven events, and a second run changes nothing", () => {
+    const file = tempSettings()
+    expect(installClaudeCode(file, "win32")).toBe("installed")
+    const hooks = JSON.parse(readFileSync(file, "utf8")).hooks
+    for (const event of EVENTS) {
+      const hook = hooks[event][0].hooks[0]
+      expect(hook.command, event).toBe(process.execPath)
+      expect(hook.args.at(-1), event).toBe("claude-code")
+    }
+    expect(installClaudeCode(file, "win32")).toBe("already-installed")
+    expect(claudeHooksStatus(file, "win32")).toBe("installed")
+  })
+
+  it("an exec-form entry whose script moved is rewritten to the current one", () => {
+    const file = tempSettings()
+    installClaudeCode(file, "win32")
+    const settings = JSON.parse(readFileSync(file, "utf8"))
+    settings.hooks.Stop[0].hooks[0].args[0] = "C:\\old\\mida-hook.js"
+    writeFileSync(file, JSON.stringify(settings))
+    expect(installClaudeCode(file, "win32")).toBe("installed")
+    expect(JSON.parse(readFileSync(file, "utf8")).hooks.Stop[0].hooks[0].args[0]).not.toBe("C:\\old\\mida-hook.js")
+  })
+
+  it("a Mac-form Mida entry found on Windows is rewritten in place, user hooks untouched", () => {
+    const file = tempSettings({
+      hooks: { Stop: [{ hooks: [{ type: "command", command: "mida-hook claude-code" }, { type: "command", command: "my-own-script" }] }] },
+    })
+    installClaudeCode(file, "win32")
+    const stop = JSON.parse(readFileSync(file, "utf8")).hooks.Stop[0].hooks
+    expect(stop[0].command).toBe(process.execPath)
+    expect(stop[1]).toEqual({ type: "command", command: "my-own-script" })
+  })
+
+  it("doctor's list includes the exec-form entries as parseable lines", () => {
+    const file = tempSettings()
+    installClaudeCode(file, "win32")
+    const lines = midaCommandsInClaudeSettings(file) as string[]
+    expect(lines).toHaveLength(7)
+    expect(lines.every((line) => parseMidaCommand(line) !== null)).toBe(true)
+  })
+
+  it("uninstall removes the exec-form entries and keeps the user's own hook", () => {
+    const file = tempSettings({ hooks: { Stop: [{ hooks: [{ type: "command", command: "my-own-script" }] }] } })
+    installClaudeCode(file, "win32")
+    expect(uninstallClaudeCode(file)).toBe("uninstalled")
+    expect(JSON.parse(readFileSync(file, "utf8")).hooks).toEqual({ Stop: [{ hooks: [{ type: "command", command: "my-own-script" }] }] })
+  })
+
+  it("Mac output is byte-identical to the release before this change (Review Focus 5)", () => {
+    const file = tempSettings()
+    installClaudeCode(file, "darwin")
+    expect(normalise(readFileSync(file, "utf8"))).toBe(readFileSync(fixture("claude-settings-darwin-golden.json"), "utf8"))
+  })
+})
+
+describe("Codex block on Windows", () => {
+  const winHome = "C:\\Users\\Jane O'Neil\\.mida"
+  const unescapedCommands = (block: string) =>
+    [...block.matchAll(/^command = "((?:[^"\\]|\\.)*)"$/gm)].map((m) => m[1]!.replace(/\\(["\\])/g, "$1"))
+
+  it("Mac block bytes are unchanged (Review Focus 5)", () => {
+    expect(normalise(codexBlock({ home: "/h/.mida" }))).toBe(readFileSync(fixture("codex-block-darwin-golden.toml"), "utf8"))
+  })
+
+  it("Windows hook commands are escaped TOML strings that unescape to the exact command line", () => {
+    const commands = unescapedCommands(codexBlock({ home: winHome, platform: "win32" }))
+    expect(commands).toContain(injectCommand("codex", "win32"))
+    expect(commands).toContain(hookCommand("codex", "win32"))
+    expect(commands).toContain(process.execPath) // the MCP table's command
+  })
+
+  it("install, status and uninstall treat the Windows block as Mida's", () => {
+    const config = tempCodexConfig('model = "x"\n')
+    expect(installCodex(config, { home: winHome, platform: "win32" })).toBe("installed")
+    expect(codexHooksStatus(config, "win32")).toBe("installed")
+    expect(codexMcpStatus(config, winHome, "win32")).toBe("installed")
+    expect(installCodex(config, { home: winHome, platform: "win32" })).toBe("already-installed")
+    expect(codexHookCommands(config)).toContain(injectCommand("codex", "win32"))
+    expect(uninstallCodex(config)).toBe("uninstalled")
+    expect(readFileSync(config, "utf8")).toBe('model = "x"\n')
+  })
+
+  it("the Windows block's hook lines are PowerShell calls", () => {
+    const commands = unescapedCommands(codexBlock({ home: winHome, platform: "win32" }))
+    for (const line of commands.slice(-3)) {
+      expect(line.startsWith("& '")).toBe(true)
+      expect(line.endsWith("' codex")).toBe(true)
+      expect(parseMidaCommand(line)).not.toBeNull()
+    }
+  })
+
+  it("a block written for a user folder with an apostrophe is ours: it parses, upgrades, uninstalls", () => {
+    // The block a Windows install under C:\Users\Jane O'Neil wrote: '' is one apostrophe.
+    const toml = (value: string) => `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+    const call = (script: string) =>
+      `& 'C:\\Users\\Jane O''Neil\\node\\node.exe' 'C:\\Users\\Jane O''Neil\\mida\\${script}' codex`
+    const config = tempCodexConfig([
+      'model = "x"',
+      "",
+      "# >>> mida hooks — managed by `mida install codex`; do not edit >>>",
+      "[[hooks.SessionStart]]",
+      'matcher = "startup|resume|clear|compact"',
+      "",
+      "[[hooks.SessionStart.hooks]]",
+      'type = "command"',
+      `command = ${toml(call("mida-inject.js"))}`,
+      "",
+      "[[hooks.UserPromptSubmit]]",
+      "",
+      "[[hooks.UserPromptSubmit.hooks]]",
+      'type = "command"',
+      `command = ${toml(call("mida-inject.js"))}`,
+      "",
+      "[[hooks.Stop]]",
+      "",
+      "[[hooks.Stop.hooks]]",
+      'type = "command"',
+      `command = ${toml(call("mida-hook.js"))}`,
+      "# <<< mida hooks <<<",
+      "",
+    ].join("\n"))
+    expect(codexHookCommands(config)).toEqual([
+      call("mida-inject.js"),
+      call("mida-inject.js"),
+      call("mida-hook.js"),
+    ])
+    expect(codexHooksStatus(config)).not.toBe("unreadable")
+    expect(installCodex(config, { home: winHome, platform: "win32" })).toBe("installed")
+    expect(codexHooksStatus(config, "win32")).toBe("installed")
+    expect(installCodex(config, { home: winHome, platform: "win32" })).toBe("already-installed")
+    expect(uninstallCodex(config)).toBe("uninstalled")
+    expect(readFileSync(config, "utf8")).toBe('model = "x"\n')
+  })
+
+  it("a Batch-2 block with double-quoted Windows lines is rewritten to the PowerShell form", () => {
+    // What Batch 2 wrote on Windows: cmd-style double-quoted commands inside the same block.
+    const toml = (value: string) => `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
+    const quoted = (script: string) =>
+      `"C:\\moved\\node\\node.exe" "C:\\moved\\mida\\${script}" codex`
+    const config = tempCodexConfig([
+      "# >>> mida hooks — managed by `mida install codex`; do not edit >>>",
+      "[mcp_servers.mida]",
+      'command = "C:\\\\moved\\\\node\\\\node.exe"',
+      'args = ["C:\\\\moved\\\\mida\\\\mida-mcp.js", "--as", "codex"]',
+      'env = { MIDA_HOME = "C:\\\\moved\\\\.mida" }',
+      "",
+      "[[hooks.SessionStart]]",
+      'matcher = "startup|resume|clear|compact"',
+      "",
+      "[[hooks.SessionStart.hooks]]",
+      'type = "command"',
+      `command = ${toml(quoted("mida-inject.js"))}`,
+      "",
+      "[[hooks.UserPromptSubmit]]",
+      "",
+      "[[hooks.UserPromptSubmit.hooks]]",
+      'type = "command"',
+      `command = ${toml(quoted("mida-inject.js"))}`,
+      "",
+      "[[hooks.Stop]]",
+      "",
+      "[[hooks.Stop.hooks]]",
+      'type = "command"',
+      `command = ${toml(quoted("mida-hook.js"))}`,
+      "# <<< mida hooks <<<",
+      "",
+    ].join("\n"))
+    expect(installCodex(config, { home: "C:\\other\\.mida", platform: "win32" })).toBe("installed")
+    const text = readFileSync(config, "utf8")
+    for (const line of unescapedCommands(text).slice(-3)) {
+      expect(line.startsWith("& '")).toBe(true)
+      expect(parseMidaCommand(line)).not.toBeNull()
+    }
+    // the rewritten server table points at the home this install was run with
+    expect(text).toContain('env = { MIDA_HOME = "C:\\\\other\\\\.mida" }')
+    expect(codexMcpStatus(config, "C:\\other\\.mida", "win32")).toBe("installed")
+    expect(uninstallCodex(config)).toBe("uninstalled")
+    expect(readFileSync(config, "utf8")).toBe("")
+  })
+
+  it("a hand-edited command inside the Windows block refuses, as on Mac", () => {
+    const config = tempCodexConfig("")
+    installCodex(config, { home: winHome, platform: "win32" })
+    const text = readFileSync(config, "utf8").replace(/^command = ".*hook.*"$/m, 'command = "C:\\\\evil.exe"')
+    writeFileSync(config, text)
+    expect(() => installCodex(config, { home: winHome, platform: "win32" })).toThrow()
+  })
+})
+
+describe("the Codex block when the install path has a space", () => {
+  it("a Mac checkout under a spaced path still writes TOML-valid command lines", () => {
+    // /Users/Jane O'Neil/odd dir: the shell quoting wraps the node path in "…", and a raw
+    // command = "…" line would close the TOML string early. The whole install/status/uninstall
+    // cycle must still call the block ours.
+    const real = process.execPath
+    process.execPath = "/Users/Jane O'Neil/odd dir/bin/node"
+    const config = tempCodexConfig('model = "x"\n')
+    try {
+      expect(installCodex(config, { home: "/Users/Jane O'Neil/odd dir/.mida" })).toBe("installed")
+      const text = readFileSync(config, "utf8")
+      const lines = text.split("\n").filter((line) => line.startsWith("command = "))
+      expect(lines).toHaveLength(4)
+      // every command line is one closed TOML basic string: inner quotes are backslash-escaped
+      for (const line of lines) expect(line).toMatch(/^command = "(?:[^"\\]|\\.)*"$/)
+      expect(text).toContain(String.raw`\"/Users/Jane O'Neil/odd dir/bin/node\"`)
+      expect(codexHooksStatus(config)).toBe("installed")
+      expect(installCodex(config, { home: "/Users/Jane O'Neil/odd dir/.mida" })).toBe("already-installed")
+      expect(uninstallCodex(config)).toBe("uninstalled")
+      expect(readFileSync(config, "utf8")).toBe('model = "x"\n')
+    } finally {
+      process.execPath = real
+    }
+  })
+})
+
+describe("tool-server entries on Windows", () => {
+  const winHome = "C:\\Users\\Jane O'Neil\\.mida"
+
+  it("Cursor's entry runs node.exe with the mida-mcp script first, and round-trips", () => {
+    const config = tempJson()
+    installMcpClient("cursor", config, winHome, "C:\\work\\proj", "win32")
+    const entry = JSON.parse(readFileSync(config, "utf8")).mcpServers["mida-cursor"]
+    expect(entry.command).toBe(process.execPath)
+    expect(fileName(entry.args.find((a: string) => a !== "--import" && !a.endsWith("loader.mjs")))).toMatch(/^mida-mcp|^mcp-main/)
+    expect(entry.args.slice(-4)).toEqual(["--as", "cursor", "--project", "${workspaceFolder}"])
+    expect(installMcpClient("cursor", config, winHome, "C:\\work\\proj", "win32")).toBe("already-installed")
+    expect(fileName(installedMcpLauncherPath("cursor", config, winHome)!)).toMatch(/^mida-mcp|^mcp-main/)
+    expect(uninstallMcpClient("cursor", config, winHome)).toBe("uninstalled")
+  })
+
+  it("a foreign server that merely has --as in its args is never Mida's", () => {
+    const config = tempJson({
+      mcpServers: { "mida-cursor": { command: "C:\\x\\node.exe", args: ["C:\\evil.js", "--as", "cursor"], env: { MIDA_HOME: winHome } } },
+    })
+    expect(() => installMcpClient("cursor", config, winHome, "C:\\w", "win32")).toThrow(/not Mida's/)
+  })
+
+  it("Claude Code's add-json payload on Windows is node.exe + script", () => {
+    const json = JSON.parse(claudeCodeMcpJson(winHome, "win32"))
+    expect(json.command).toBe(process.execPath)
+    expect(json.args.slice(-2)).toEqual(["--as", "claude-code"])
+  })
+
+  it("Claude Desktop config paths: %APPDATA% always, the Store copy when one is installed", () => {
+    const env = { APPDATA: "C:\\Users\\J\\AppData\\Roaming", LOCALAPPDATA: "C:\\Users\\J\\AppData\\Local" }
+    const list = (dir: string) => (dir.endsWith("Packages") ? ["Microsoft.Foo_1", "Claude_pzs8sxrjxfjjc"] : [])
+    expect(claudeDesktopConfigPaths("C:\\Users\\J", env, "win32", list)).toEqual([
+      "C:\\Users\\J\\AppData\\Roaming\\Claude\\claude_desktop_config.json",
+      "C:\\Users\\J\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Roaming\\Claude\\claude_desktop_config.json",
+    ])
+    expect(claudeDesktopConfigPaths("C:\\Users\\J", env, "win32", () => { throw new Error("ENOENT") })).toHaveLength(1)
+    expect(claudeDesktopConfigPaths("/Users/j", {}, "darwin")).toEqual([claudeDesktopConfigPath("/Users/j")])
   })
 })

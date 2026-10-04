@@ -1159,4 +1159,93 @@ describe("compileCheckpoint", () => {
     expect(stdin).toContain("the key idea is simple")
     expect(stdin).toContain("user:42")
   })
+
+  // PROV-17: a message typed while Claude Code is mid-turn arrives as a
+  // queued_command attachment, not a user record. The compile prompt must
+  // still carry it under a user: block, ahead of the assistant's restatement
+  // of it as its own plan — and the session's real first request stays pinned.
+  it("a queued mid-turn user message reaches the prompt as the user's words (PROV-17)", async () => {
+    const transcriptPath = path.join(dir, "queued.jsonl")
+    const queuedText = "QUEUED-CHANGE change the concept: show provenance instead"
+    fs.writeFileSync(
+      transcriptPath,
+      [
+        JSON.stringify({ type: "user", message: { role: "user", content: "Build the orbit view" } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Writing the components." }] } }),
+        JSON.stringify({
+          type: "attachment",
+          attachment: {
+            type: "queued_command",
+            prompt: queuedText,
+            commandMode: "prompt",
+            origin: { kind: "human" },
+            source_uuid: "src-queued-1",
+          },
+        }),
+        JSON.stringify({ type: "queue-operation", operation: "enqueue", content: queuedText }),
+        JSON.stringify({
+          type: "queue-operation",
+          operation: "remove",
+          content: queuedText,
+          reason: "absorbed_mid_turn",
+        }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Plan: add an author field. Say go and I build it." }] } }),
+      ].join("\n") + "\n",
+    )
+    process.env.FAKE_MODEL_STDIN_LOG = stdinLogPath
+    const r = await compileCheckpoint({ ...base, transcriptPath, model: fake("good") })
+    expect(r.ok).toBe(true)
+    const stdin = fs.readFileSync(stdinLogPath, "utf8")
+    // the first request still pins as the original request
+    expect(stdin).toContain("The FIRST block is the user's original request")
+    expect(stdin).toContain("L1 user:\nBuild the orbit view")
+    expect(r.ok && r.checkpoint.originalRequest).toBe("Build the orbit view")
+    // the user's change sits under a user: block BEFORE the assistant's plan
+    const iUser = stdin.indexOf(`user:\n${queuedText}`)
+    const iPlan = stdin.indexOf("assistant:\nPlan: add an author field")
+    expect(iUser).toBeGreaterThan(-1)
+    expect(iPlan).toBeGreaterThan(iUser)
+    // the bookkeeping lines never render
+    expect(stdin).not.toContain("queue-operation")
+  })
+
+  // CAP-41: a transcript too big for the read windows still tells the model
+  // what the assistant DID inside the unread middle — a short trail of its own
+  // steps under its own header, with the prompt sentence that explains it.
+  it("a long transcript's prompt carries the assistant's middle steps under their own header (CAP-41)", async () => {
+    const transcriptPath = path.join(dir, "big.jsonl")
+    const pad = JSON.stringify({ type: "attachment", attachment: { type: "prompt_snapshot", text: "p".repeat(10_000) } })
+    const lines: string[] = [JSON.stringify({ type: "user", message: { role: "user", content: "Build the orbit view" } })]
+    let size = lines[0]!.length + 1
+    while (size < 80_000) {
+      lines.push(pad)
+      size += pad.length + 1
+    }
+    const writeLine = JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", name: "Write", input: { file_path: "/work/orbit.ts", content: "C".repeat(100_000) } }] },
+    })
+    lines.push(writeLine)
+    size += writeLine.length + 1
+    const tailFrom = size
+    while (size - tailFrom < 75_000) {
+      lines.push(pad)
+      size += pad.length + 1
+    }
+    fs.writeFileSync(transcriptPath, lines.join("\n") + "\n")
+    process.env.FAKE_MODEL_STDIN_LOG = stdinLogPath
+    const r = await compileCheckpoint({ ...base, transcriptPath, model: fake("good") })
+    expect(r.ok).toBe(true)
+    const stdin = fs.readFileSync(stdinLogPath, "utf8")
+    // the prompt names the block in both request variants' wording
+    expect(stdin).toContain(
+      `A block headed "assistant — what it did in between" lists, oldest first, the assistant's own steps from the part of the session not shown in full (files it wrote, edited or read, commands it ran, the start of what it said); they are the assistant's actions, never the user's words.`,
+    )
+    // and the block itself is there with the middle step and its real line number
+    const blockStart = stdin.indexOf("assistant — what it did in between", stdin.indexOf("TRANSCRIPT"))
+    expect(blockStart).toBeGreaterThan(-1)
+    expect(stdin.slice(blockStart)).toContain("wrote /work/orbit.ts")
+    // never a byte of the 100 KB written content
+    expect(stdin).not.toContain("C".repeat(80))
+  })
 })

@@ -7,11 +7,14 @@
 //      8 MB of `{` parses < 1 s; a 100 MB transcript reads in < 1 s with < 64 MB extra peak
 //      memory and still finds a message typed in its middle (CAP-27)
 // F1 goes through the real chain and the real buildHandoff; F3 exercises the
-// real render, extractor, and transcript reader in-process.
+// real render, extractor, and transcript reader, with each transcript read
+// timed and memory-measured in a fresh child process (UF-C41C E6).
 
 import fs from "node:fs"
 import { mkdirSync, writeFileSync } from "node:fs"
+import { spawnSync } from "node:child_process"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { performance } from "node:perf_hooks"
 import { mergeCheckpoints, renderHandoff } from "../../packages/checkpoint/src/index.js"
 import type { StoredCheckpoint } from "../../packages/checkpoint/src/index.js"
@@ -20,11 +23,39 @@ import {
   Runtime, approve, approveProject, authorNamesFor, buildHandoff, init, requestAccess,
   saveCheckpoint,
 } from "../../apps/midad/src/index.js"
-import { benchChain, benchDir, benchHome, sampleCheckpoint, userLine } from "../lib/env.js"
+import { benchChain, benchDir, benchHome, cleanupBenchDir, sampleCheckpoint, userLine } from "../lib/env.js"
 import { needsTestnet, runGroup, median } from "../lib/checks.js"
+
+// UF-C41C E6 child mode. The parent re-runs this file once per transcript read
+// so each read's peak memory is measured against a fresh process's own
+// high-water mark. maxRSS never falls, so a baseline taken after writing the
+// file in the same process counts the write's peak too and reports ~0 MB.
+// argv: --measure <file> <marker...>; stdout is one JSON line.
+if (process.argv[2] === "--measure") {
+  const file = process.argv[3]!
+  const markers = process.argv.slice(4)
+  const baseKb = process.resourceUsage().maxRSS
+  const t = performance.now()
+  const read = readConversation(file)
+  const readMs = performance.now() - t
+  const extraPeakMb = (process.resourceUsage().maxRSS - baseKb) / 1024
+  process.stdout.write(JSON.stringify({ readMs, extraPeakMb, found: markers.every((m) => read.text.includes(m)) }))
+  process.exit(0)
+}
 
 /** One assistant transcript line — the bulk of a long session is the agent's own output. */
 const assistantLine = (text: string) => ({ type: "assistant", message: { content: [{ type: "text", text }] } })
+
+/** Times one transcript read in a fresh child; `found` is true when every marker is in its text. */
+function measureRead(file: string, markers: string[]): { readMs: number; extraPeakMb: number; found: boolean } {
+  const r = spawnSync(
+    process.execPath,
+    ["--import", "tsx", fileURLToPath(import.meta.url), "--measure", file, ...markers],
+    { encoding: "utf8" },
+  )
+  if (r.status !== 0) throw new Error(`measure child failed for ${file}: ${r.stderr}`)
+  return JSON.parse(r.stdout) as { readMs: number; extraPeakMb: number; found: boolean }
+}
 
 const chain = await benchChain()
 const dir = benchDir("f")
@@ -132,12 +163,15 @@ async function f3() {
   // peak memory (maxRSS is a high-water mark, in KB): what the read adds above everything before it.
   // A whole-file read (CAP-16: ~4x the file in memory) raises it far past 64 MB and turns this red;
   // growth that stays under an earlier step's peak is not seen — this guards the big regression only.
-  const peakBeforeKb = process.resourceUsage().maxRSS
-  const t2 = performance.now()
-  const read = readConversation(big)
-  const readMs = performance.now() - t2
-  const extraPeakMb = (process.resourceUsage().maxRSS - peakBeforeKb) / 1024
-  const foundMiddle = ["early typed marker: rename the module", "middle typed marker: change the plan", "late typed marker: ship on friday"].every((m) => read.text.includes(m))
+  // The read runs in a fresh child so its peak memory is its own (E6).
+  const measured = measureRead(big, [
+    "early typed marker: rename the module",
+    "middle typed marker: change the plan",
+    "late typed marker: ship on friday",
+  ])
+  const readMs = measured.readMs
+  const extraPeakMb = measured.extraPeakMb
+  const foundMiddle = measured.found
   return {
     pass: renderMs < 60 && parseMs < 1_000 && parsed === undefined && readMs < 1_000 && extraPeakMb < 64 && foundMiddle,
     value: {
@@ -151,13 +185,115 @@ async function f3() {
   }
 }
 
+// F3R — UF-C41B B2. The same transcript read, but over a REALISTIC 100 MB
+// session (the reviewer's scan100.ts shape): ~20 KB Writes, ~2 KB replies,
+// Bash commands and 3 KB tool results, real Claude key order — "type" sits at
+// each line's far end. The old scan parsed every middle assistant line up to
+// 256 KB, which took this read to about 1,100 ms; the fix marks candidates and
+// re-reads only enough to fill the trail. Same limits as F3's transcript read.
+async function f3r() {
+  const asstReal = (parts: unknown[]) =>
+    JSON.stringify({
+      parentUuid: "p",
+      isSidechain: false,
+      userType: "external",
+      cwd: "/w",
+      sessionId: "s",
+      version: "2.1.0",
+      gitBranch: "main",
+      message: { id: "msg_1", type: "message", role: "assistant", model: "m", content: parts, stop_reason: null, usage: { input_tokens: 1 } },
+      requestId: "req_1",
+      type: "assistant",
+      uuid: "u",
+      timestamp: "2026-10-01T00:00:00Z",
+    })
+  const toolResult = () =>
+    JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: "r".repeat(3_000) }] } })
+  const real = join(dir, "f3-real.jsonl")
+  writeFileSync(real, JSON.stringify(userLine("REQ")) + "\n")
+  const fd = fs.openSync(real, "a")
+  let size = 0
+  let n = 0
+  let chunk: string[] = []
+  while (size < 100_000_000) {
+    const k = n % 4
+    const line =
+      k === 0
+        ? asstReal([{ type: "tool_use", name: "Write", input: { file_path: `/w/f${n}.ts`, content: "w".repeat(20_000) } }])
+        : k === 1
+          ? asstReal([{ type: "text", text: "step " + n + " " + "t".repeat(2_000) }])
+          : k === 2
+            ? asstReal([{ type: "tool_use", name: "Bash", input: { command: "pnpm test " + n } }])
+            : toolResult()
+    chunk.push(line)
+    size += line.length + 1
+    n++
+    if (chunk.length >= 500) {
+      fs.writeSync(fd, chunk.join("\n") + "\n")
+      chunk = []
+    }
+  }
+  if (chunk.length) fs.writeSync(fd, chunk.join("\n") + "\n")
+  fs.closeSync(fd)
+  const realRead = measureRead(real, ["what it did in between"])
+  const readMs = realRead.readMs
+  const extraPeakMb = realRead.extraPeakMb
+  const trailShown = realRead.found
+
+  // UF-C41C E2: a middle of nothing but small assistant records, 100 MB of
+  // ~370-byte lines in real key order, every one a step candidate. Trimming
+  // the kept list on each mark made this read take ~2.5 s; batched trims keep
+  // it under the same 1 s limit.
+  const small = join(dir, "f3-small.jsonl")
+  writeFileSync(small, JSON.stringify(userLine("REQ")) + "\n")
+  const fd2 = fs.openSync(small, "a")
+  let size2 = 0
+  let m = 0
+  let chunk2: string[] = []
+  while (size2 < 100_000_000) {
+    const line = asstReal([{ type: "text", text: `step ${m}` }])
+    chunk2.push(line)
+    size2 += line.length + 1
+    m++
+    if (chunk2.length >= 2_000) {
+      fs.writeSync(fd2, chunk2.join("\n") + "\n")
+      chunk2 = []
+    }
+  }
+  if (chunk2.length) fs.writeSync(fd2, chunk2.join("\n") + "\n")
+  fs.closeSync(fd2)
+  const smallRead = measureRead(small, ["what it did in between"])
+  const smallReadMs = smallRead.readMs
+  const smallExtraPeakMb = smallRead.extraPeakMb
+  const smallTrailShown = smallRead.found
+  return {
+    pass: readMs < 1_000 && extraPeakMb < 64 && trailShown && smallReadMs < 1_000 && smallExtraPeakMb < 64 && smallTrailShown,
+    value: {
+      transcriptReadMs: Math.round(readMs),
+      transcriptExtraPeakMb: Math.round(extraPeakMb * 10) / 10,
+      trailShown,
+      smallRecordsLines: m,
+      smallRecordsReadMs: Math.round(smallReadMs),
+      smallRecordsExtraPeakMb: Math.round(smallExtraPeakMb * 10) / 10,
+      smallRecordsTrailShown: smallTrailShown,
+    },
+    limit: { transcriptReadMs: 1_000, transcriptExtraPeakMb: 64, trailShown: true, smallRecordsReadMs: 1_000, smallRecordsExtraPeakMb: 64, smallRecordsTrailShown: true },
+  }
+}
+
 try {
   await runGroup([
     { id: "F1", run: f1 },
     needsTestnet("F2"),
     { id: "F3", run: f3 },
+    { id: "F3R", run: f3r },
   ])
 } finally {
   await runtime.close()
   await chain.env.stop()
+  // UF-C41C E6: the transcript fixtures are ~300 MB of scratch; a run removes
+  // them (and the small temp Mida home) unless KEEP_BENCH_DIR=1 asks for them
+  // to stay.
+  cleanupBenchDir(dir)
+  cleanupBenchDir(home.root)
 }

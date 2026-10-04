@@ -1,0 +1,9 @@
+install-claude-code 0
+install-codex 0
+install-claude-desktop 2
+doctor 1
+run-hook-claude-code 1
+run-hook-codex 1
+codex-config-toml 1
+mcp-hello 1
+stop-hook-via-settings 1

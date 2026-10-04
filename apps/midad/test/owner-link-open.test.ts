@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 import { buildOwnerLink } from "@mida/protocol"
 import { openOwnerLink } from "../src/owner-link/open.js"
 
@@ -16,14 +16,18 @@ const LINK = buildOwnerLink({
   port: 8021,
 })
 
-function fakeSpawn(behavior: "ok" | "error" | "exit1") {
-  const calls: { command: string; args: string[] }[] = []
-  const spawn = (command: string, args: string[]) => {
-    calls.push({ command, args })
+function fakeSpawn(behavior: "ok" | "error" | "exit1" | "hang") {
+  const calls: { command: string; args: string[]; options?: unknown }[] = []
+  const spawn = (command: string, args: string[], options?: unknown) => {
+    calls.push({ command, args, options })
     const child = new EventEmitter()
     queueMicrotask(() => {
+      if (behavior === "hang") return
       if (behavior === "error") child.emit("error", new Error("spawn xdg-open ENOENT"))
-      else child.emit("close", behavior === "ok" ? 0 : 1)
+      else {
+        child.emit("exit", behavior === "ok" ? 0 : 1)
+        child.emit("close", behavior === "ok" ? 0 : 1)
+      }
     })
     return child as never
   }
@@ -45,19 +49,46 @@ describe("openOwnerLink", () => {
   it("on macOS spawns `open <url>`", async () => {
     const { calls, spawn } = fakeSpawn("ok")
     await openOwnerLink(LINK, { print: () => {}, spawn, platform: "darwin" })
-    expect(calls).toEqual([{ command: "open", args: [LINK.url] }])
+    expect(calls).toEqual([{ command: "open", args: [LINK.url], options: { stdio: "ignore" } }])
   })
 
   it("on Linux spawns `xdg-open <url>`", async () => {
     const { calls, spawn } = fakeSpawn("ok")
     await openOwnerLink(LINK, { print: () => {}, spawn, platform: "linux" })
-    expect(calls).toEqual([{ command: "xdg-open", args: [LINK.url] }])
+    expect(calls).toEqual([{ command: "xdg-open", args: [LINK.url], options: { stdio: "ignore" } }])
+  })
+
+  it("on Windows opens the link with rundll32 by its full System32 path", async () => {
+    // a bare name resolves against the current folder first on Windows, and a rundll32.exe
+    // planted in a cloned project would run instead
+    const root = process.env.SystemRoot
+    process.env.SystemRoot = "D:\\WinDir"
+    try {
+      const { calls, spawn } = fakeSpawn("ok")
+      await openOwnerLink(LINK, { print: () => {}, spawn, platform: "win32" })
+      expect(calls).toEqual([{ command: "D:\\WinDir\\System32\\rundll32.exe", args: ["url.dll,FileProtocolHandler", LINK.url], options: { stdio: "ignore" } }])
+    } finally {
+      if (root === undefined) delete process.env.SystemRoot
+      else process.env.SystemRoot = root
+    }
+  })
+
+  it("without SystemRoot the rundll32 path defaults under C:\\Windows", async () => {
+    const root = process.env.SystemRoot
+    delete process.env.SystemRoot
+    try {
+      const { calls, spawn } = fakeSpawn("ok")
+      await openOwnerLink(LINK, { print: () => {}, spawn, platform: "win32" })
+      expect(calls).toEqual([{ command: "C:\\Windows\\System32\\rundll32.exe", args: ["url.dll,FileProtocolHandler", LINK.url], options: { stdio: "ignore" } }])
+    } finally {
+      if (root !== undefined) process.env.SystemRoot = root
+    }
   })
 
   it("on any other platform it prints the link and spawns nothing", async () => {
     const lines: string[] = []
     const { calls, spawn } = fakeSpawn("ok")
-    await openOwnerLink(LINK, { print: (l) => lines.push(l), spawn, platform: "win32" })
+    await openOwnerLink(LINK, { print: (l) => lines.push(l), spawn, platform: "freebsd" })
     expect(calls).toEqual([])
     expect(lines[0]).toBe(LINK.url)
   })
@@ -74,5 +105,43 @@ describe("openOwnerLink", () => {
     const { spawn } = fakeSpawn("exit1")
     await openOwnerLink(LINK, { print: (l) => lines.push(l), spawn, platform: "darwin" })
     expect(lines.at(-1)).toBe("Could not open a browser — open the link above yourself.")
+  })
+
+  it("the opener is spawned with its own stdio ignored", async () => {
+    const { calls, spawn } = fakeSpawn("ok")
+    await openOwnerLink(LINK, { print: () => {}, spawn, platform: "darwin" })
+    expect(calls[0]!.options).toEqual({ stdio: "ignore" })
+  })
+
+  it("an opener that never exits resolves anyway after five seconds", async () => {
+    // the browser may keep running after it takes the link; approve must not wait on it
+    vi.useFakeTimers()
+    try {
+      const { spawn } = fakeSpawn("hang")
+      let resolved = false
+      const opened = openOwnerLink(LINK, { print: () => {}, spawn, platform: "darwin" }).then(() => {
+        resolved = true
+      })
+      await vi.advanceTimersByTimeAsync(4999)
+      expect(resolved).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      await opened
+      expect(resolved).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("only https links open: a file or http link is printed but spawns nothing", async () => {
+    const lines: string[] = []
+    const { calls, spawn } = fakeSpawn("ok")
+    const fileLink = { ...LINK, url: "file:///etc/passwd" }
+    const httpLink = { ...LINK, url: "http://example.com/x" }
+    await openOwnerLink(fileLink, { print: (l) => lines.push(l), spawn, platform: "darwin" })
+    await openOwnerLink(httpLink, { print: (l) => lines.push(l), spawn, platform: "linux" })
+    expect(calls).toEqual([])
+    // the link still printed for the owner to open by hand
+    expect(lines).toContain("file:///etc/passwd")
+    expect(lines).toContain("http://example.com/x")
   })
 })

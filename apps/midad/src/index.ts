@@ -13,6 +13,9 @@ export {
   init,
   requestAccess,
   approve,
+  grantResponseFromLogs,
+  liveCapabilityIdsOf,
+  recordedCoverage,
   saveCheckpoint,
   readCheckpoints,
   revoke,
@@ -23,16 +26,17 @@ export {
   expectedScopesFor,
   purposeFor,
 } from "./skeleton.js"
+export type { ApprovePreview } from "./skeleton.js"
 export { attemptNamespaceRead, factShortId, factStamp, readOwnerFacts, remember, resolveFactId, FACT_NAMESPACES, MAX_FACTS } from "./remember.js"
 export type { FactIdResolution, FactNamespace, OwnerFact, RememberResult } from "./remember.js"
 export * from "./checkpoint-payload.js"
 export * from "./migration-envelope.js"
 export { readOwnerUniverse } from "./owner-read.js"
 export type { ReadOwnerUniverseOptions, SourceEncrypted, SourceRecord } from "./owner-read.js"
-export { exportRecords } from "./export.js"
+export { exportRecords, pidStartedAt } from "./export.js"
 export type { ExportDeps, ExportEntry, ExportResult, SweepProbes } from "./export.js"
 export * from "./migrate-manifest.js"
-export { migrate, migrateUndo } from "./migrate.js"
+export { migrate, migrateUndo, migrateToleratesApprovalRefusal } from "./migrate.js"
 export type { MigrateDeps, MigrateStep, MigrateUndoDeps } from "./migrate.js"
 export { ABOUT, CLI_COMMANDS, NEEDS_TERMINAL_LINE, OWNER_COMMANDS, TERMINAL_COMMANDS, USAGE, doctorReplaceStaleService, helpLines, namespaceLabel, networkForCommand, ownerOnlyLine, ownerRefusalLine, runCli, runCliWithRuntime, runInstall, terminalPromptOrAbandoned, terminalSecretPrompt, validCliArgv } from "./cli.js"
 export type { CliDeps } from "./cli.js"
@@ -63,8 +67,8 @@ export type { HookEvent } from "./hook.js"
 export { clearCodexHome, recordCodexHome, recordedCodexHome, resolveCodexHome, trustedCodexHome } from "./codex-home.js"
 export { agentApprovedOnChain, drainOnce, drainUntilSettled, resetOutOfGasWaits, resetSummarizerWaits, sessionWaits, tailOf } from "./drain.js"
 export type { DrainDeps, DrainResult, SessionWait } from "./drain.js"
-export { MIGRATION_REFUSAL, SOCKET_FILE, callDaemon, ensureDaemon, ensureDaemonState, ensureCurrentDaemon, ensureFallbackSocketDir, fallbackSocketDir, socketPathFor } from "./control.js"
-export type { ControlReply } from "./control.js"
+export { MIGRATION_REFUSAL, SOCKET_FILE, callDaemon, channelFor, ensureDaemon, ensureDaemonState, ensureCurrentDaemon, ensureFallbackSocketDir, fallbackSocketDir, socketPathFor } from "./control.js"
+export type { ControlReply, DaemonChannel } from "./control.js"
 export { SUMMARIZER_FILE, compileWithSummarizer, currentSummarizer, readSummarizer, summarizerSummary, writeSummarizer } from "./summarizer.js"
 export { askSummarizerKey, chooseSummarizer, runSummarizer, secretInputStart, secretInputStep } from "./summarizer-cli.js"
 export type { ProbeResult, SecretInputState, SecretKeyAnswer, SecretPromptResult, SummarizerCliDeps } from "./summarizer-cli.js"

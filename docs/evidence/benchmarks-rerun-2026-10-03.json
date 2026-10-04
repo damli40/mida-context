@@ -1,0 +1,117 @@
+{
+ "what": "Mida-condition re-run of both Oct 2 benchmarks on the rehearsal build; counts and timings only",
+ "build": "56322c5",
+ "branch": "rehearsal-013",
+ "rows": [
+  {
+   "test": "1-continuation",
+   "run": 1,
+   "aSeconds": 10,
+   "bSeconds": 128,
+   "bRan": true,
+   "finished": true
+  },
+  {
+   "test": "1-continuation",
+   "run": 2,
+   "aSeconds": 11,
+   "bSeconds": 138,
+   "bRan": true,
+   "finished": true
+  },
+  {
+   "test": "1-continuation",
+   "run": 3,
+   "aSeconds": 10,
+   "bSeconds": 136,
+   "bRan": true,
+   "finished": true
+  },
+  {
+   "test": "1-continuation",
+   "run": 4,
+   "aSeconds": 10,
+   "bSeconds": 142,
+   "bRan": true,
+   "finished": true
+  },
+  {
+   "test": "1-continuation",
+   "run": 5,
+   "aSeconds": 11,
+   "bSeconds": 131,
+   "bRan": true,
+   "finished": true
+  },
+  {
+   "test": "2-late-change",
+   "run": 1,
+   "aSeconds": 12,
+   "bSeconds": 166,
+   "cSeconds": 4,
+   "b2Seconds": 40,
+   "middleSessionChangedFiles": false,
+   "newNameExported": true,
+   "oldNameMentions": 0,
+   "tests": 10,
+   "testsFailed": 0,
+   "applied": true
+  },
+  {
+   "test": "2-late-change",
+   "run": 2,
+   "aSeconds": 13,
+   "bSeconds": 155,
+   "cSeconds": 5,
+   "b2Seconds": 38,
+   "middleSessionChangedFiles": false,
+   "newNameExported": true,
+   "oldNameMentions": 0,
+   "tests": 10,
+   "testsFailed": 0,
+   "applied": true
+  },
+  {
+   "test": "2-late-change",
+   "run": 3,
+   "aSeconds": 12,
+   "bSeconds": 140,
+   "cSeconds": 5,
+   "b2Seconds": 32,
+   "middleSessionChangedFiles": false,
+   "newNameExported": true,
+   "oldNameMentions": 0,
+   "tests": 7,
+   "testsFailed": 0,
+   "applied": true
+  },
+  {
+   "test": "2-late-change",
+   "run": 4,
+   "aSeconds": 11,
+   "bSeconds": 128,
+   "cSeconds": 5,
+   "b2Seconds": 29,
+   "middleSessionChangedFiles": false,
+   "newNameExported": true,
+   "oldNameMentions": 0,
+   "tests": 7,
+   "testsFailed": 0,
+   "applied": true
+  },
+  {
+   "test": "2-late-change",
+   "run": 5,
+   "aSeconds": 10,
+   "bSeconds": 152,
+   "cSeconds": 5,
+   "b2Seconds": 39,
+   "middleSessionChangedFiles": false,
+   "newNameExported": true,
+   "oldNameMentions": 0,
+   "tests": 8,
+   "testsFailed": 0,
+   "applied": true
+  }
+ ]
+}

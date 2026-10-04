@@ -27,6 +27,7 @@
     "@mida/sdk": "workspace:*",
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",
+    "cross-spawn": "7.0.6",
     "viem": "2.56.3"
   }
 }

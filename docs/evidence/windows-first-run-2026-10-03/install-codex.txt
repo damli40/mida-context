@@ -1,0 +1,3 @@
+installed
+Codex will ignore these hooks until you trust them: open codex, type /hooks, and trust the Mida entries.
+Then run mida doctor --live codex to check the hooks fire.

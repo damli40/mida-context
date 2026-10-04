@@ -467,7 +467,7 @@ const closeServer = (server: Server) => new Promise<void>((done) => server.close
 describe("runHook kicks the daemon instead of spawning a drainer", () => {
   it("a reachable daemon means zero spawns", async () => {
     const { dir, home, stdinFor } = setup()
-    const server = await fakeDaemon(socketPathFor(home), (socket) => {
+    const server = await fakeDaemon(socketPathFor(home)!, (socket) => {
       socket.end('HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{"ok":true}')
     })
     try {
@@ -493,7 +493,7 @@ describe("runHook kicks the daemon instead of spawning a drainer", () => {
 
   it("a daemon that accepts but never answers still returns inside 300 ms and spawns once", async () => {
     const { dir, home, stdinFor } = setup()
-    const server = await fakeDaemon(socketPathFor(home), () => {}) // silent forever
+    const server = await fakeDaemon(socketPathFor(home)!, () => {}) // silent forever
     try {
       let daemonSpawns = 0
       let drainerSpawns = 0
@@ -624,5 +624,105 @@ describe("hook-main process", () => {
     const log = readFileSync(new MidaHome(homeDir).path("logs/hook.jsonl"), "utf8")
     expect(log).toContain("input-too-large")
     expect(log).not.toContain("unreadable-input")
+  }, 30_000)
+})
+
+// CAP-42 — another tool's `claude -p` run fires the same capture hooks an
+// interactive session fires, and was being saved as the owner's session.
+// Claude Code stamps those transcripts `entrypoint: "sdk-cli"` (interactive is
+// "cli", the desktop app "claude-desktop"). The capture path skips a
+// sdk-cli session unless MIDA_CAPTURE_HEADLESS=1 explicitly asks for it.
+describe("runHook — headless claude -p sessions (CAP-42)", () => {
+  /** Rewrites setup()'s transcript so its first records carry the entrypoint. */
+  const withEntrypoint = (transcriptPath: string, entrypoint: string) =>
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: "system", subtype: "init", entrypoint }) + "\n" +
+        JSON.stringify({ type: "user", entrypoint, message: { content: "hi" } }) + "\n",
+    )
+
+  it("a sdk-cli transcript enqueues nothing and logs headless-session", async () => {
+    const { dir, home, transcriptPath, stdinFor } = setup()
+    withEntrypoint(transcriptPath, "sdk-cli")
+    let spawned = 0
+    await hook({ dir, home, stdin: stdinFor(), spawned: () => { spawned += 1 } })
+    expect(spawned).toBe(0)
+    expect(listJobs(home)).toHaveLength(0)
+    const log = readFileSync(home.path("logs/hook.jsonl"), "utf8")
+    expect(log).toContain('"outcome":"ignored"')
+    expect(log).toContain('"reason":"headless-session"')
+  })
+
+  it("MIDA_CAPTURE_HEADLESS=1 opts the same session back in", async () => {
+    const { dir, home, transcriptPath, stdinFor } = setup()
+    withEntrypoint(transcriptPath, "sdk-cli")
+    let spawned = 0
+    await runHook({
+      agent: "claude-code",
+      stdin: stdinFor(),
+      home,
+      homeDir: dir,
+      env: { MIDA_CAPTURE_HEADLESS: "1" },
+      parentBasename: () => undefined,
+      spawnDrainer: () => { spawned += 1 },
+    })
+    expect(spawned).toBe(1)
+    expect(listJobs(home)).toHaveLength(1)
+  })
+
+  it("only the exact value '1' opts in — MIDA_CAPTURE_HEADLESS=0 still skips", async () => {
+    const { dir, home, transcriptPath, stdinFor } = setup()
+    withEntrypoint(transcriptPath, "sdk-cli")
+    await runHook({
+      agent: "claude-code",
+      stdin: stdinFor(),
+      home,
+      homeDir: dir,
+      env: { MIDA_CAPTURE_HEADLESS: "0" },
+      parentBasename: () => undefined,
+      spawnDrainer: () => {},
+    })
+    expect(listJobs(home)).toHaveLength(0)
+    expect(readFileSync(home.path("logs/hook.jsonl"), "utf8")).toContain('"reason":"headless-session"')
+  })
+
+  it("cli and claude-desktop transcripts still enqueue", async () => {
+    const { dir, home, transcriptPath, stdinFor } = setup()
+    for (const entrypoint of ["cli", "claude-desktop"]) {
+      withEntrypoint(transcriptPath, entrypoint)
+      await hook({ dir, home, stdin: stdinFor() })
+    }
+    expect(listJobs(home)).toHaveLength(2)
+  })
+
+  it("an entrypoint beyond the first 64 KB enqueues — the check reads a bounded head", async () => {
+    const { dir, home, transcriptPath, stdinFor } = setup()
+    // one line bigger than the 64 KB read window holds no entrypoint; the
+    // sdk-cli record after it is never seen, so the session captures as today
+    writeFileSync(
+      transcriptPath,
+      JSON.stringify({ type: "attachment", pad: "x".repeat(70 * 1024) }) + "\n" +
+        JSON.stringify({ type: "system", subtype: "init", entrypoint: "sdk-cli" }) + "\n",
+    )
+    await hook({ dir, home, stdin: stdinFor() })
+    expect(listJobs(home)).toHaveLength(1)
+  })
+
+  it("mida-hook claude-code on a sdk-cli transcript prints nothing and queues nothing", () => {
+    const { dir, stdinFor, transcriptPath } = setup()
+    withEntrypoint(transcriptPath, "sdk-cli")
+    const homeDir = join(dir, "hook-home")
+    const res = spawnSync(process.execPath, ["--import", "tsx", HOOK_MAIN, "claude-code"], {
+      input: stdinFor(),
+      env: { ...cleanEnv(), MIDA_HOME: homeDir, HOME: dir },
+      encoding: "utf8",
+      timeout: 20_000,
+      cwd: REPO_ROOT,
+    })
+    expect(res.status).toBe(0)
+    expect(res.stdout).toBe("")
+    expect(listJobs(new MidaHome(homeDir))).toHaveLength(0)
+    const log = readFileSync(new MidaHome(homeDir).path("logs/hook.jsonl"), "utf8")
+    expect(log).toContain('"reason":"headless-session"')
   }, 30_000)
 })

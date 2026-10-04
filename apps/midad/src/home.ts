@@ -5,6 +5,7 @@ import {
 import { homedir } from "node:os"
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { randomBytes } from "node:crypto"
+import { fsyncFolder } from "./platform.js"
 
 /**
  * The one way every entry point finds the home folder (R4-7). `MIDA_HOME` unset means the
@@ -114,13 +115,18 @@ export class MidaHome {
   }
 
   writeSecretJson(relativePath: string, value: unknown): void {
+    this.writeSecretFile(relativePath, JSON.stringify(value, null, 2))
+  }
+
+  /** The same atomic 0600 write as writeSecretJson, for a file whose content is not JSON. */
+  writeSecretFile(relativePath: string, text: string): void {
     const full = this.path(relativePath)
     const parent = this.#prepareParent(full)
     const temp = `${full}.${randomBytes(6).toString("hex")}.tmp`
     try {
       const fd = openSync(temp, "wx", 0o600)
       try {
-        writeSync(fd, JSON.stringify(value, null, 2))
+        writeSync(fd, text)
         fsyncSync(fd)
       } finally {
         closeSync(fd)
@@ -189,11 +195,6 @@ export class MidaHome {
   }
 
   #fsyncFolder(folder: string): void {
-    const fd = openSync(folder, "r")
-    try {
-      fsyncSync(fd)
-    } finally {
-      closeSync(fd)
-    }
+    fsyncFolder(folder)
   }
 }

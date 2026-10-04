@@ -9,6 +9,7 @@ import type { MidaHome } from "./home.js"
 import type { Network } from "./runtime.js"
 import { HOSTED_SPONSOR_URL, HOSTED_STORAGE_URL, serviceUrlInEffect } from "./runtime.js"
 import { funderFor } from "./testnet.js"
+import { fsyncFolder } from "./platform.js"
 
 /**
  * The ONE rule for which contract, RPC, store and sponsor a home uses — every entry point
@@ -468,10 +469,5 @@ function writeFileAtomic(file: string, text: string): void {
     rmSync(temp, { force: true })
     throw error
   }
-  const folder = openSync(dirname(file), "r")
-  try {
-    fsyncSync(folder)
-  } finally {
-    closeSync(folder)
-  }
+  fsyncFolder(dirname(file))
 }

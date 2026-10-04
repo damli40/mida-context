@@ -44,7 +44,7 @@ export function codeVersionFor(moduleFile: string): string {
 export type GitRunner = (args: string[]) => string
 
 const runGit: GitRunner = (args) =>
-  execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 }).trim()
+  execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000, windowsHide: true }).trim()
 
 const commitAt = (root: string, git: GitRunner): string => {
   try {

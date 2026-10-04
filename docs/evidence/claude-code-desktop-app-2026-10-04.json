@@ -1,0 +1,24 @@
+{
+  "what": "One Claude Code desktop app session in a folder with Mida set up; timestamps and outcomes only, no session text",
+  "claudeCodeVersion": "2.1.286",
+  "platform": "macOS",
+  "transcriptEntrypoint": "claude-desktop",
+  "sessionFirstRecord": "2026-10-04T04:10:27.845Z",
+  "sessionLastRecord": "2026-10-04T04:12:39.773Z",
+  "handoffDeliveredAtSessionStart": true,
+  "perPromptNoteDelivered": true,
+  "hookJobs": [
+    { "at": "2026-10-04T04:10:43.334Z", "event": "Stop", "outcome": "enqueued" },
+    { "at": "2026-10-04T04:11:38.956Z", "event": "PostToolUse", "outcome": "enqueued" },
+    { "at": "2026-10-04T04:11:47.469Z", "event": "Stop", "outcome": "enqueued" },
+    { "at": "2026-10-04T04:12:39.700Z", "event": "Stop", "outcome": "enqueued" }
+  ],
+  "saves": [
+    { "at": "2026-10-04T04:11:12.585Z", "outcome": "saved" },
+    { "at": "2026-10-04T04:12:16.307Z", "outcome": "saved" },
+    { "at": "2026-10-04T04:13:01.805Z", "outcome": "saved" },
+    { "at": "2026-10-04T04:13:42.570Z", "outcome": "saved" }
+  ],
+  "midaToolsOffered": ["mida_handoff", "mida_read", "mida_status", "mida_whats_new"],
+  "midaToolsCalled": []
+}

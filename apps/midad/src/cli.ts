@@ -9,7 +9,7 @@ import { createInterface } from "node:readline"
 import { compareChainOrder, orderTime, recordedAt, taskOf } from "@mida/checkpoint"
 import type { StoredCheckpoint } from "@mida/checkpoint"
 import { decodeUint64, displaySafeBlock, displaySafeLine, displaySafeText, isMidaError, namespaceById } from "@mida/protocol"
-import type { Address, Hex, RequestedScope } from "@mida/protocol"
+import type { AccessRequest, Address, Hex, RequestedScope } from "@mida/protocol"
 import { privateKeyToAccount } from "viem/accounts"
 import type { Deployment } from "@mida/chain"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
@@ -27,7 +27,7 @@ import { buildHandoff, generalAssistanceText, identityUnreadableText, isGeneralA
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { agoText } from "./hook-output.js"
-import { CODEX_TRUST_SENTENCE, InstallRefusal, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, claudeUserConfigPath, codexHookCommands, cursorMcpConfigPath, installClaudeCode, installClaudeCodeMcp, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, spawnClaude, uninstallClaudeCode, uninstallClaudeCodeMcp, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
+import { CODEX_TRUST_SENTENCE, InstallRefusal, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, claudeDesktopConfigPaths, claudeUserConfigPath, codexHookCommands, cursorMcpConfigPath, installClaudeCode, installClaudeCodeMcp, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, spawnClaude, uninstallClaudeCode, uninstallClaudeCodeMcp, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
 import type { ClaudeCliRunner } from "./install.js"
 import { resolveDevinConfigPath } from "./devin-facts.js"
 import type { InstallTool, McpClientTool } from "./install.js"
@@ -54,8 +54,8 @@ import type { Network } from "./runtime.js"
 import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag, setSponsorUrl } from "./network.js"
 import { resetOutOfGasWaits } from "./drain.js"
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
-import { siblingEntryArgs } from "./sibling.js"
-import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, pendingApprovalAdvice, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint } from "./skeleton.js"
+import { detachedSpawnOptions, siblingEntryArgs } from "./sibling.js"
+import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, pendingApprovalGate, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint, ungrantedScopes } from "./skeleton.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerMode, saveOwnerAddress } from "./keys.js"
 import { DEFAULT_TASK, TASK_RULE_TEXT, clearFolderTask, folderTaskFor, isTaskName, resolveSessionTask, taskOrUndefined, writeFolderTask } from "./task.js"
 import type { OwnerMode } from "./keys.js"
@@ -236,6 +236,8 @@ export interface CliDeps {
   startService?: () => unknown | Promise<unknown>
   /** Claude Desktop's config file — `mida install claude-desktop` merges into it. Tests inject a temp path. */
   claudeDesktopConfig?: string
+  /** Every Claude Desktop config install writes. Windows can carry the Store copy beside the roaming one. Tests inject a list. */
+  claudeDesktopConfigs?: string[]
   /** Devin's config file — `mida install devin` merges the hook block into it. Tests inject a temp path. */
   devinConfig?: string
   /**
@@ -253,6 +255,15 @@ export interface CliDeps {
  * The /cli route's input rule: argv is data, never shell — an array of at most 8 strings of at most
  * 4,096 chars each, whose first word is a command runCli knows. Anything else is refused.
  */
+/**
+ * Every Claude Desktop config file an install or uninstall touches: the injected list when the
+ * caller knows them, else the platform's own set (Windows' roaming file plus the Store build's
+ * LocalCache copy when a Store package is installed).
+ */
+const claudeDesktopTargets = (deps: { claudeDesktopConfig?: string; claudeDesktopConfigs?: string[] }): string[] =>
+  deps.claudeDesktopConfigs ??
+  (deps.claudeDesktopConfig !== undefined ? [deps.claudeDesktopConfig] : claudeDesktopConfigPaths(homedir()))
+
 export function validCliArgv(argv: unknown): argv is string[] {
   return (
     Array.isArray(argv) &&
@@ -1108,16 +1119,32 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
         deps.print("It will see this context as plain text. Revoking later stops future reads, not what it already saw.")
         return (await prompt("Type yes to approve: ")).trim() === "yes"
       })
-      deps.print(
-        result.transactionHash === null
-          ? // nothing was sent because the chain already approves the agent — the honest answer is
-            // what the folder's list row did, never "run the command you just ran" (M3-D4)
+      if (result.completedEarlier === true) {
+        // UF-AP: the grant had already landed when its reply was lost — this run only finished
+        // recording it, so the line says "finished" instead of "already approved".
+        deps.print(`${agent}'s approval was already on chain from an earlier try. Mida finished recording it on this machine (no transaction).`)
+        if (result.projectId !== undefined) {
+          deps.print(
             result.projectAlreadyListed === true
-            ? `${agent} is already approved on chain. This folder was already approved for ${agent}.`
-            : `${agent} is already approved on chain. This folder is now approved for ${agent} too (no transaction).`
-          : `approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}` +
-              (result.projectId !== undefined ? ` project ${result.projectId}` : ""),
-      )
+              ? `This folder was already approved for ${agent}.`
+              : `This folder is now approved for ${agent} too (no transaction).`,
+          )
+        }
+      } else {
+        deps.print(
+          result.transactionHash === null
+            ? // nothing was sent because the chain already approves the agent — the honest answer is
+              // what the folder's list row did, never "run the command you just ran" (M3-D4)
+              result.projectAlreadyListed === true
+              ? `${agent} is already approved on chain. This folder was already approved for ${agent}.`
+              : `${agent} is already approved on chain. This folder is now approved for ${agent} too (no transaction).`
+            : `approved ${agent} tx ${result.transactionHash} gas ${result.gasUsed}` +
+                (result.projectId !== undefined ? ` project ${result.projectId}` : ""),
+        )
+      }
+      if (result.unrecorded === true) {
+        deps.print(`${agent} is approved on chain, but this machine has no record of that approval, so ${agent} cannot read or save here. To repair it: mida revoke ${agent}, then mida request ${agent}, then mida approve ${agent}.`)
+      }
       // a list rebuilt from a bad signature silently dropped rows — the owner must hear the count
       if (result.droppedRows !== undefined && result.droppedRows !== 0) {
         deps.print(
@@ -1160,15 +1187,17 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       }
       const client = tool as McpClientTool
       const cwd = deps.cwd ?? process.cwd()
-      const configPath = client === "cursor"
-        ? cursorMcpConfigPath(cwd)
-        : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
-      const outcome = installMcpClient(client, configPath, runtime.home.root, cwd)
-      if (typeof outcome === "object") {
-        deps.print("installed")
-        deps.print(`the ${MCP_SERVER_NAME[client]} entry moved from ${outcome.moved.from} to ${outcome.moved.to}`)
-      } else {
-        deps.print(outcome === "already-installed" ? "already installed" : "installed")
+      const configPaths = client === "cursor" ? [cursorMcpConfigPath(cwd)] : claudeDesktopTargets(deps)
+      for (const configPath of configPaths) {
+        const outcome = installMcpClient(client, configPath, runtime.home.root, cwd, deps.platform ?? process.platform)
+        // several files (Windows' roaming + Store configs) name themselves on their own line
+        const suffix = configPaths.length > 1 ? ` (${configPath})` : ""
+        if (typeof outcome === "object") {
+          deps.print(`installed${suffix}`)
+          deps.print(`the ${MCP_SERVER_NAME[client]} entry moved from ${outcome.moved.from} to ${outcome.moved.to}${suffix}`)
+        } else {
+          deps.print(`${outcome === "already-installed" ? "already installed" : "installed"}${suffix}`)
+        }
       }
       // the per-workspace mcp.json carries personal absolute paths (the launcher, the home) —
       // committing it would leak the machine's layout to anyone reading the repo
@@ -1212,6 +1241,12 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
     return 0
   } catch (error) {
     deps.print(ownerRefusalLine(command, agent, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
+    // UF-AP: a sponsor timeout is the failure that can leave a landed grant unrecorded — the
+    // approve-only hint tells the owner the second run costs nothing and finishes it.
+    if (command === "approve" && agent !== "--all") {
+      const hint = sponsorTimeoutHint(agent, error)
+      if (hint !== undefined) deps.print(hint)
+    }
     // Owner commands run in the owner's own terminal, and an unnamed failure leaves them blind.
     // Only when they ask (MIDA_DEBUG=1): the error's name and first lines, long hex strings masked.
     if (process.env.MIDA_DEBUG === "1") {
@@ -1324,13 +1359,39 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
       gainingFolder.push(name)
       continue
     }
-    printPendingAsk(deps, runtime.home, name, marker?.projectId)
     try {
-      const advice = await pendingApprovalAdvice(runtime, name)
-      deps.print(`grant advisor: ${advice.risk} risk; recommends ${advice.recommended.length} scope(s) until ${new Date(Number(decodeUint64(advice.recommendedExpiresAt)) * 1000).toISOString()}`)
-      for (const warning of advice.warnings) deps.print(`  ${warning.severity}: ${warning.messageKey}`)
+      const gate = await pendingApprovalGate(runtime, name)
+      if (gate.kind === "advice") {
+        printPendingAsk(deps, runtime.home, name, marker?.projectId)
+        deps.print(`grant advisor: ${gate.advice.risk} risk; recommends ${gate.advice.recommended.length} scope(s) until ${new Date(Number(decodeUint64(gate.advice.recommendedExpiresAt)) * 1000).toISOString()}`)
+        for (const warning of gate.advice.warnings) deps.print(`  ${warning.severity}: ${warning.messageKey}`)
+      } else {
+        // UF-APR5 F4: a used-up request's stale ask is never re-printed — the line says what
+        // approving this agent will actually do, and the approve below does it.
+        deps.print(
+          gate.kind === "finish"
+            ? `${name}'s grant already landed on chain — approving finishes what an earlier run left undone (no transaction)`
+            : `${name}'s earlier grant only partly survives — approving renews the scopes that expired`,
+        )
+      }
       ready.push(name)
     } catch (error) {
+      // UF-APR: an expired request whose grant already landed is still finishable — approve's
+      // recovery path sends nothing, so the batch runs it instead of pointing the owner at
+      // `mida request`, which would only answer "already approved". An expired request whose
+      // scopes are not all live keeps the expired-request line.
+      // The extra chain read asking "is every requested scope already live" can fail too — in
+      // that case the expired-request answer stands rather than crashing the whole batch.
+      let allLive = false
+      const pendingRequest = runtime.home.readJson<{ request?: AccessRequest }>(`agents/${name}/pending-request.json`)?.request
+      const identity = loadAgentIdentity(runtime.home, name)
+      if (refusalCode(error) === "REQUEST_EXPIRED" && pendingRequest !== undefined && identity !== undefined) {
+        allLive = await ungrantedScopes(runtime, identity.agentId, pendingRequest.scopes).then((missing) => missing.length === 0).catch(() => false)
+      }
+      if (allLive) {
+        ready.push(name)
+        continue
+      }
       deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
       failed.push(`${name} (${refusalCode(error)})`)
     }
@@ -1359,17 +1420,35 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
     try {
       const result = await approve(runtime, name, deps.cwd)
       approved.push(name)
-      deps.print(
-        result.transactionHash === null
-          ? // "now approved" only when this batch actually wrote the row — a re-list is not a grant
-            result.projectAlreadyListed === true
-            ? `${name} is already approved on chain. This folder was already approved for ${name}.`
-            : `${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`
-          : `approved ${name} tx ${result.transactionHash}`,
-      )
+      // UF-AP: a grant recovered from chain is finished here, not re-sent — the agent still
+      // counts as approved in the summary, but the line says what this run actually did.
+      if (result.completedEarlier === true) {
+        deps.print(`${name}'s approval was already on chain from an earlier try. Mida finished recording it on this machine (no transaction).`)
+      } else {
+        deps.print(
+          result.transactionHash === null
+            ? // "now approved" only when this batch actually wrote the row — a re-list is not a grant
+              result.projectAlreadyListed === true
+              ? `${name} is already approved on chain. This folder was already approved for ${name}.`
+              : `${name} is already approved on chain. This folder is now approved for ${name} too (no transaction).`
+            : `approved ${name} tx ${result.transactionHash}`,
+        )
+      }
+      if (result.unrecorded === true) {
+        deps.print(`${name} is approved on chain, but this machine has no record of that approval, so ${name} cannot read or save here. To repair it: mida revoke ${name}, then mida request ${name}, then mida approve ${name}.`)
+      }
     } catch (error) {
       deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
-      failed.push(`${name} (${refusalCode(error)})`)
+      const hint = sponsorTimeoutHint(name, error)
+      if (hint !== undefined) deps.print(hint)
+      // UF-APR5 F4: a used-up request's finish path ends at approve's already-approved answer
+      // when no folder is being listed — the work ran and the line above just said the agent is
+      // approved, so the summary agrees instead of reporting a failure.
+      // UF-APR5 F5: an approved agent whose folder row failed is approved — the line above
+      // already said so; the summary counts it the same way and names the one step left undone.
+      if (refusalCode(error) === "already-approved") approved.push(name)
+      else if (refusalCode(error) === "approved-unlisted") approved.push(`${name} (folder not listed)`)
+      else failed.push(`${name} (${refusalCode(error)})`)
     }
   }
   // A partial batch still changed the chain for its successes — the daemon must hear it even
@@ -1723,7 +1802,29 @@ const migrateProgress = (home: MidaHome | undefined): MigrateProgress => {
   return typeof step !== "string" || !["preview", "paused", "backed-up"].includes(step) ? "mid-run" : "none"
 }
 
+/**
+ * UF-AP: when an approve dies OWNER_WALLET_LOW *because the sponsor's reply timed out*, the
+ * sponsored transaction may still have landed — paying from the owner's empty wallet failed, but
+ * the earlier send may not have. The extra line tells the owner a second approve is free and
+ * finishes the recording if the chain already holds the grant. Any other failure — sponsor
+ * refused, wallet simply low — earns no hint.
+ */
+function sponsorTimeoutHint(agent: string, error: unknown): string | undefined {
+  if (refusalCode(error) !== "OWNER_WALLET_LOW" || !(error instanceof Error)) return undefined
+  const sponsor = /the gas sponsor did not pay \(([^)]*)\)/i.exec(error.message)?.[1]
+  if (sponsor === undefined || !/timed out|did not answer/i.test(sponsor)) return undefined
+  return `The gas sponsor did not answer in time, so its transaction may still have gone through. Run mida approve ${agent} again in a minute: Mida checks the chain first and sends only what is still missing.`
+}
+
 export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string, capabilityRegistry?: string, home?: MidaHome, undo = false): string {
+  // UF-APR7B R5: commands with no agent argument (`mida init`, `mida migrate`) pass "" — or a
+  // flag (`mida init --passkey` passes "--passkey" through argv[1], which is not a name either).
+  // The agent whose step failed rides on the error itself (stamped by the caller), so the
+  // refusal line names "assistant's request" instead of "'s request … run `mida request `".
+  if (agent === "" || agent.startsWith("-")) {
+    const carried = (error as { agent?: unknown } | null | undefined)?.agent
+    if (typeof carried === "string") agent = carried
+  }
   const code = refusalCode(error)
   // The "nothing was sent/written" claims are true only before migrate's first transaction —
   // the state file tells the three cases apart (ex-4 G-1): no move started keeps the plain
@@ -1748,6 +1849,10 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     case "not-approved": return "not approved"
     case "REQUEST_EXPIRED":
       return `${agent}'s request has expired (a request lasts ${Number(REQUEST_LIFETIME_SECONDS) / 60} minutes): run \`mida request ${agent}\` and approve again`
+    // UF-APR: the chain could not be read while finishing an approval — nothing was changed,
+    // and the retry runs the same check again.
+    case "approval-check-failed":
+      return `Mida could not read the chain to finish ${agent}'s approval. Nothing was changed. Run mida approve ${agent} again.`
     case "already-approved":
       // A general-assistance identity can never hold a project row — pointing at `approve` here
       // would send the owner round a loop that can only ever answer already-approved again.
@@ -1875,6 +1980,26 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
       const who = typeof ids[0] === "string" ? `record ${shortId(ids[0])}` : "a record"
       return `${who} carries a ${field}value${value} this version of mida does not recognise — update mida and run the export again`
     }
+    // UF-APR4 D3: a grant transaction that went out but whose confirmation read never came back.
+    // The wrapped message is already the exact owner-facing sentence — it says the grant WAS
+    // sent and names the retry that finishes it — so this prints it, never "nothing was sent".
+    case "grant-unconfirmed":
+      return error instanceof Error ? error.message : "refused: grant-unconfirmed"
+    // UF-APR5 F2: a grant the chain shows as landed while approveGrant was still finishing. The
+    // wrapped message is the exact owner-facing sentence — it says the grant LANDED and names
+    // the retry that finishes without a second grant — so this prints it.
+    case "grant-landed-unfinished":
+      return error instanceof Error ? error.message : "refused: grant-landed-unfinished"
+    // UF-APR4 D4: the same pattern for a folder-listing failure raised after the approval was
+    // settled — the wrapped message already opens with "<agent> is approved, but" and names the
+    // retry that adds the folder row.
+    case "approved-unlisted":
+      return error instanceof Error ? error.message : "refused: approved-unlisted"
+    // UF-APR7: the assistant's grant is init's own — when the chain approves it but this machine
+    // never finished recording it, approve can never finish what only init's saved request can,
+    // so the wrapped message names the command that can.
+    case "assistant-grant-via-init":
+      return error instanceof Error ? error.message : "refused: assistant-grant-via-init"
     case "chain-busy":
       return partway === undefined
         ? "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again"
@@ -2103,15 +2228,16 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
         }
         const client = tool as McpClientTool
         const cwd = deps.cwd ?? process.cwd()
-        const configPath = client === "cursor"
-          ? cursorMcpConfigPath(cwd)
-          : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
-        const outcome = installMcpClient(client, configPath, deps.home.root, cwd)
-        if (typeof outcome === "object") {
-          deps.print("installed")
-          deps.print(`the ${MCP_SERVER_NAME[client]} entry moved from ${outcome.moved.from} to ${outcome.moved.to}`)
-        } else {
-          deps.print(outcome === "already-installed" ? "already installed" : "installed")
+        const configPaths = client === "cursor" ? [cursorMcpConfigPath(cwd)] : claudeDesktopTargets(deps)
+        for (const configPath of configPaths) {
+          const outcome = installMcpClient(client, configPath, deps.home.root, cwd, deps.platform ?? process.platform)
+          const suffix = configPaths.length > 1 ? ` (${configPath})` : ""
+          if (typeof outcome === "object") {
+            deps.print(`installed${suffix}`)
+            deps.print(`the ${MCP_SERVER_NAME[client]} entry moved from ${outcome.moved.from} to ${outcome.moved.to}${suffix}`)
+          } else {
+            deps.print(`${outcome === "already-installed" ? "already installed" : "installed"}${suffix}`)
+          }
         }
         if (client === "cursor") deps.print("heads-up: .cursor/mcp.json holds absolute paths from this machine — do not commit it")
         const protectedNote = macosProtectedFolderNote(
@@ -2554,6 +2680,7 @@ export function runInstall(
     home: MidaHome
     cwd?: string
     claudeDesktopConfig?: string
+    claudeDesktopConfigs?: string[]
     devinConfig?: string
     /** Claude Code's MCP servers live in ~/.claude.json — owned by Claude Code, read only for the is-it-ours check. */
     claudeUserConfig?: string
@@ -2594,14 +2721,15 @@ export function runInstall(
   if (MCP_CLIENT_TOOLS.includes(tool)) {
     const client = tool as McpClientTool
     const cwd = deps.cwd ?? process.cwd()
-    const configPath = client === "cursor"
-      ? cursorMcpConfigPath(cwd)
-      : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
+    const configPaths = client === "cursor" ? [cursorMcpConfigPath(cwd)] : claudeDesktopTargets(deps)
     try {
-      const outcome = uninstallMcpClient(client, configPath, deps.home.root)
-      deps.print(outcome === "not-installed" ? "not installed" : outcome)
-      if (outcome === "uninstalled") {
-        deps.print(`the ${client} identity and its approvals are unchanged — \`mida revoke ${client}\` revokes access`)
+      for (const configPath of configPaths) {
+        const outcome = uninstallMcpClient(client, configPath, deps.home.root)
+        const suffix = configPaths.length > 1 ? ` (${configPath})` : ""
+        deps.print(`${outcome === "not-installed" ? "not installed" : outcome}${suffix}`)
+        if (outcome === "uninstalled") {
+          deps.print(`the ${client} identity and its approvals are unchanged — \`mida revoke ${client}\` revokes access${suffix}`)
+        }
       }
       return 0
     } catch (error) {
@@ -2704,12 +2832,7 @@ const CLI_CALL_TIMEOUT_MS = 120_000
  * directory is the Mida home — never the folder the code happens to live in.
  */
 function spawnDaemon(cwd: string): void {
-  const child = spawn(process.execPath, siblingEntryArgs("midad"), {
-    detached: true,
-    stdio: "ignore",
-    cwd,
-    env: drainerEnv(process.env),
-  })
+  const child = spawn(process.execPath, siblingEntryArgs("midad"), detachedSpawnOptions(cwd, drainerEnv(process.env)))
   child.on("error", () => {})
   child.unref()
 }
@@ -2775,7 +2898,7 @@ async function main(): Promise<void> {
       claudeSettings: join(homedir(), ".claude", "settings.json"),
       codexConfig: join(resolveCodexHome(process.env, homedir()), "config.toml"),
       home,
-      claudeDesktopConfig: claudeDesktopConfigPath(homedir()),
+      claudeDesktopConfigs: claudeDesktopConfigPaths(homedir()),
       devinConfig: resolveDevinConfigPath(process.env, homedir()),
     })
     return

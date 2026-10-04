@@ -6,7 +6,7 @@ import { PERMISSION, PROVENANCE_POLICY, namespaceId } from "@mida/protocol"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
 import {
-  MidaHome, NAMESPACE, PURPOSE_ID, Runtime, approve, init, loadAgentIdentity, readCheckpoints, requestAccess, revoke,
+  MidaHome, NAMESPACE, PURPOSE_ID, Runtime, approve, init, loadAgentIdentity, loadGrants, readCheckpoints, requestAccess, revoke,
   saveCheckpoint,
 } from "@mida/midad"
 import type { Network } from "@mida/midad"
@@ -127,6 +127,15 @@ describe("M0 fix round C2: local files never outrank the chain", () => {
     await expect(requestAccess(runtime, "scribe")).rejects.toThrow(/already approved/)
 
     home.writeSecretJson("agents/scribe/pending-request.json", { request })
-    await expect(approve(runtime, "scribe")).rejects.toThrow(/already approved/)
+    // UF-APR2: a grant that is on chain but never recorded locally is exactly the lost-reply
+    // state approve now finishes, so instead of refusing "already approved", approve records
+    // it through the SDK check, sends no transaction, and reports completedEarlier.
+    const nonceBefore = await runtime.chain.publicClient.getTransactionCount({ address: runtime.owner })
+    const result = await approve(runtime, "scribe")
+    expect(await runtime.chain.publicClient.getTransactionCount({ address: runtime.owner })).toBe(nonceBefore)
+    expect(result.completedEarlier).toBe(true)
+    expect(result.transactionHash).toBeNull()
+    expect(loadGrants(home, "scribe").some((grant) => grant.requestId === request.requestId)).toBe(true)
+    expect(home.has("agents/scribe/pending-request.json")).toBe(false)
   }, STEP_TIMEOUT)
 })

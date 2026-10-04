@@ -1,4 +1,4 @@
-import { lstatSync, realpathSync } from "node:fs"
+import { closeSync, lstatSync, openSync, readSync, realpathSync } from "node:fs"
 import { homedir } from "node:os"
 import { isAbsolute, join, relative } from "node:path"
 import { recordedCodexHome } from "./codex-home.js"
@@ -67,6 +67,46 @@ export function transcriptPathAllowed(transcriptPath: unknown, agent: string, ho
   } catch {
     return false
   }
+}
+
+/** How much of a validated transcript the headless-session check reads (CAP-42). */
+const ENTRYPOINT_HEAD_BYTES = 64 * 1024
+
+/**
+ * CAP-42 — a `claude -p` run another tool started marks its transcript
+ * `"entrypoint": "sdk-cli"` (an interactive terminal session says `"cli"`, the
+ * desktop app `"claude-desktop"`). Its hooks fire exactly like the owner's own
+ * session, so without this check every such run was saved as the owner's work.
+ * Returns the FIRST record's entrypoint found inside the transcript's first
+ * 64 KB, or null when no record with the field shows there or the file cannot
+ * be read — both of which must capture exactly as before.
+ */
+export function firstEntrypoint(transcriptPath: string): string | null {
+  let head: string
+  try {
+    const fd = openSync(transcriptPath, "r")
+    try {
+      const buf = Buffer.allocUnsafe(ENTRYPOINT_HEAD_BYTES)
+      const n = readSync(fd, buf, 0, ENTRYPOINT_HEAD_BYTES, 0)
+      head = buf.subarray(0, n).toString("utf8")
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return null
+  }
+  for (const line of head.split("\n")) {
+    if (!line.includes("entrypoint")) continue
+    try {
+      const obj = JSON.parse(line) as { entrypoint?: unknown } | null
+      if (obj !== null && typeof obj === "object" && "entrypoint" in obj) {
+        return typeof obj.entrypoint === "string" ? obj.entrypoint : null
+      }
+    } catch {
+      // a line the 64 KB read cut in half is skipped, not a match
+    }
+  }
+  return null
 }
 
 /**
@@ -218,6 +258,14 @@ export async function runHook(input: {
     } else {
       if (!transcriptPathAllowed(record.transcript_path, input.agent, input.homeDir ?? homedir(), input.home)) {
         log({ event, sessionId, outcome: "ignored", reason: "bad-transcript-path" })
+        return
+      }
+      // CAP-42 — a `claude -p` run another tool started is not the owner's
+      // session: skip it unless the caller opted headless capture in with
+      // exactly MIDA_CAPTURE_HEADLESS=1. Any other entrypoint, none in the
+      // first 64 KB, or an unreadable file all capture as today.
+      if (firstEntrypoint(record.transcript_path) === "sdk-cli" && input.env.MIDA_CAPTURE_HEADLESS !== "1") {
+        log({ event, sessionId, outcome: "ignored", reason: "headless-session" })
         return
       }
       const cwd = typeof record.cwd === "string" && record.cwd !== "" ? record.cwd : process.cwd()

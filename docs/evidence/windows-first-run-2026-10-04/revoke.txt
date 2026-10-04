@@ -1,0 +1,14 @@
+]0;Administrator:  C:\Windows\system32\cmd.exe \asking the chain what codex already holds�
+
+sending the revocation (sponsored)�
+
+sending the new key to 2 agents�
+
+revoked codex on chain (sponsored) � tx 0xd0306e187fe38a7471f3d30718594cc4b73295b6edbd5642d0cf394f1aecf8fe
+
+This stops future reads through Mida. It does not erase what codex already read.
+
+new read key sent to assistant
+
+new read key sent to claude-code
+

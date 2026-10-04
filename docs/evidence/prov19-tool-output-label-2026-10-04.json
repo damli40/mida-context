@@ -1,0 +1,128 @@
+{
+ "what": "PROV-19 before/after on the owner session cut 2 lines after a hook refusal (2026-10-04T03:30Z); labels, booleans and timings only",
+ "inputLines": 41510,
+ "hookRefusalsInInput": 204,
+ "quotedConstraintAfterFix": "Fact-Forcing Gate: before creating a new file, present the required facts (callers, no duplicate file, data field/structure/date format, and the user's instruction verbatim).",
+ "rows": [
+  {
+   "build": "4235cc9",
+   "model": "deepseek-flash",
+   "run": 1,
+   "ok": true,
+   "hookRuleAsConstraint": false,
+   "hookRuleAsDecision": false,
+   "compileMs": 97754,
+   "labelShownToModel": "user"
+  },
+  {
+   "build": "4235cc9",
+   "model": "deepseek-flash",
+   "run": 2,
+   "ok": true,
+   "hookRuleAsConstraint": false,
+   "hookRuleAsDecision": false,
+   "compileMs": 136307,
+   "labelShownToModel": "user"
+  },
+  {
+   "build": "4235cc9",
+   "model": "deepseek-flash",
+   "run": 3,
+   "ok": true,
+   "hookRuleAsConstraint": false,
+   "hookRuleAsDecision": false,
+   "compileMs": 53799,
+   "labelShownToModel": "user"
+  },
+  {
+   "build": "4235cc9",
+   "model": "claude-haiku",
+   "run": 1,
+   "ok": true,
+   "hookRuleAsConstraint": false,
+   "hookRuleAsDecision": false,
+   "compileMs": 34481,
+   "labelShownToModel": "user"
+  },
+  {
+   "build": "4235cc9",
+   "model": "claude-haiku",
+   "run": 2,
+   "ok": true,
+   "hookRuleAsConstraint": false,
+   "hookRuleAsDecision": false,
+   "compileMs": 35859,
+   "labelShownToModel": "user"
+  },
+  {
+   "build": "4235cc9",
+   "model": "claude-haiku",
+   "run": 3,
+   "ok": true,
+   "hookRuleAsConstraint": false,
+   "hookRuleAsDecision": false,
+   "compileMs": 51006,
+   "labelShownToModel": "user"
+  },
+  {
+   "build": "e29657f+026f381",
+   "model": "deepseek-flash",
+   "run": 1,
+   "ok": true,
+   "hookRuleAsConstraint": false,
+   "hookRuleAsDecision": false,
+   "compileMs": 54199,
+   "labelShownToModel": "tool result"
+  },
+  {
+   "build": "e29657f+026f381",
+   "model": "deepseek-flash",
+   "run": 2,
+   "ok": true,
+   "hookRuleAsConstraint": true,
+   "hookRuleAsDecision": false,
+   "compileMs": 59116,
+   "labelShownToModel": "tool result"
+  },
+  {
+   "build": "e29657f+026f381",
+   "model": "deepseek-flash",
+   "run": 3,
+   "ok": true,
+   "hookRuleAsConstraint": false,
+   "hookRuleAsDecision": false,
+   "compileMs": 57522,
+   "labelShownToModel": "tool result"
+  },
+  {
+   "build": "e29657f+026f381",
+   "model": "claude-haiku",
+   "run": 1,
+   "ok": true,
+   "hookRuleAsConstraint": false,
+   "hookRuleAsDecision": false,
+   "compileMs": 29994,
+   "labelShownToModel": "tool result"
+  },
+  {
+   "build": "e29657f+026f381",
+   "model": "claude-haiku",
+   "run": 2,
+   "ok": true,
+   "hookRuleAsConstraint": false,
+   "hookRuleAsDecision": false,
+   "compileMs": 27743,
+   "labelShownToModel": "tool result"
+  },
+  {
+   "build": "e29657f+026f381",
+   "model": "claude-haiku",
+   "run": 3,
+   "ok": true,
+   "hookRuleAsConstraint": false,
+   "hookRuleAsDecision": false,
+   "compileMs": 45969,
+   "labelShownToModel": "tool result"
+  }
+ ]
+}

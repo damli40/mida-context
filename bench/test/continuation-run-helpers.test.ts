@@ -11,8 +11,8 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { describe, expect, it } from "vitest"
 import {
-  LATE_CHANGE_PROMPT, LATE_RUNS_ROOT, agentBResumeArgv, agentCArgv, bRanOf, codexSessionIdOf,
-  codexToml, harnessMarkersIn, hookCmd, injectCmd, loadScore, parseArgs,
+  LATE_CHANGE_PROMPT, LATE_RUNS_ROOT, agentBResumeArgv, agentCArgv, bRanOf, claudeRunEnv,
+  codexSessionIdOf, codexToml, harnessMarkersIn, hookCmd, injectCmd, loadScore, parseArgs,
   rawPasteOf, scoreFiles, sessionIdOf, tokensUsedOf, transcriptOfSession,
 } from "../continuation/run.js"
 
@@ -293,6 +293,21 @@ describe("LATE_CHANGE_PROMPT", () => {
 describe("LATE_RUNS_ROOT", () => {
   it("is the runs-late-change folder", () => {
     expect(LATE_RUNS_ROOT).toContain("runs-late-change")
+  })
+})
+
+// CAP-42: agents A and C are `claude -p` runs — Claude Code marks such a
+// session "entrypoint":"sdk-cli" and the capture hook now skips headless
+// sessions unless the caller opts in. The bench exists to have them saved, so
+// the env every Claude child gets must carry MIDA_CAPTURE_HEADLESS=1.
+describe("claudeRunEnv", () => {
+  it("opts the headless claude -p runs into capture; MIDA_HOME only for mida", () => {
+    expect(claudeRunEnv("mida", "/run/mida-home")).toEqual({
+      MIDA_CAPTURE_HEADLESS: "1",
+      MIDA_HOME: "/run/mida-home",
+    })
+    expect(claudeRunEnv("none", "/run/mida-home")).toEqual({ MIDA_CAPTURE_HEADLESS: "1" })
+    expect(claudeRunEnv("raw", "/run/mida-home")).toEqual({ MIDA_CAPTURE_HEADLESS: "1" })
   })
 })
 

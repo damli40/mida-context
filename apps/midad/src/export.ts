@@ -1,12 +1,12 @@
-import { randomBytes } from "node:crypto"
 import { execFileSync } from "node:child_process"
+import { randomBytes } from "node:crypto"
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeSync } from "node:fs"
 import { hostname } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { zeroHash } from "viem"
 import { CONTEXT_KIND, OWNER_AUTHOR_ID, PROVENANCE_SOURCE, RECORD_TYPE, canonicalBytes } from "@mida/protocol"
 import type { Hex } from "@mida/protocol"
-import { mergeCheckpoints, orderTime, taskOf } from "@mida/checkpoint"
+import { mergeCheckpoints, onlyScaffolding, orderTime, taskOf } from "@mida/checkpoint"
 import type { Checkpoint, StoredCheckpoint } from "@mida/checkpoint"
 import type { MidaHome } from "./home.js"
 import { loadOwnerAddress, loadOwnerMode } from "./keys.js"
@@ -14,8 +14,9 @@ import { peekJobs } from "./queue.js"
 import { pendingAnchorsStrict } from "./batching.js"
 import { readOwnerUniverse } from "./owner-read.js"
 import type { SourceRecord } from "./owner-read.js"
-import { Runtime } from "./runtime.js"
-import type { Network } from "./runtime.js"
+import { Runtime, processProbeFor } from "./runtime.js"
+import { fsyncFolder, isWindows } from "./platform.js"
+import type { Network, ProcessProbe } from "./runtime.js"
 import { authorNamesFor } from "./skeleton.js"
 import { movedOnSuffix, readEnvelope } from "./migration-envelope.js"
 import type { MigrationEnvelope } from "./migration-envelope.js"
@@ -83,6 +84,8 @@ export interface ExportDeps {
   sweep?: SweepProbes
   /** Test seam: stop the export right after this step, as if the write had failed there. */
   stopAfter?: "staged" | "files"
+  /** Test seam: the platform the folder fsync sees. Default: process.platform. */
+  platform?: NodeJS.Platform
 }
 
 /** One records.json entry — every field the chain holds about a record, plus its plaintext. */
@@ -213,15 +216,30 @@ function processAlive(pid: number): boolean {
   }
 }
 
+/** The exec the Mac and Linux branch of `pidStartedAt` makes; a test injects it to see the call. */
+type ExecFile = (file: string, args: string[], options: { encoding: "utf8" }) => string
+
 /**
- * `ps -o lstart= -p <pid>` — the start time of the process that pid currently names, as one
- * comparable string. Pids get reused, so "pid is alive" alone cannot prove a staging writer
- * still runs; equality between this answer and the marker's `pidStarted` is the proof.
- * undefined means the lookup failed — never proof of death.
+ * The start time of the process that pid currently names, as one comparable string. Pids get
+ * reused, so "pid is alive" alone cannot prove a staging writer still runs; equality between
+ * this answer and the marker's `pidStarted` is the proof. undefined means the lookup failed, and
+ * a failure is never proof of death.
+ *
+ * On Mac and Linux this is exactly the pre-214d64f call: `ps -o lstart= -p <pid>` in the
+ * caller's own locale and time zone, with no environment override. A 0.1.3 export's staging
+ * marker was written under that string, so changing the locale or zone would read the same
+ * live pid as a stranger and its folder would be swept mid-write. Only Windows goes through
+ * processProbeFor.
  */
-function pidStartedAt(pid: number): string | undefined {
+export function pidStartedAt(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+  execFile: ExecFile = execFileSync,
+  probe?: ProcessProbe,
+): string | undefined {
+  if (isWindows(platform)) return (probe ?? processProbeFor(platform))(pid, "lstart")
   try {
-    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" }).trim()
+    const out = execFile("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8" }).trim()
     return out === "" ? undefined : out
   } catch {
     return undefined
@@ -587,7 +605,10 @@ function checkpointLines(envelope: CheckpointEnvelope): string[] {
   const c = envelope.checkpoint
   const lines: string[] = [`project ${envelope.projectId} · session ${envelope.sessionId} · task ${taskOf(envelope)} · compiled by ${envelope.compiledBy}`]
   lines.push(`objective: ${c.objective}`)
-  if (c.originalRequest !== null) lines.push(`asked: ${c.originalRequest}`)
+  // UF-C41B B4 — a stored request that is only system scaffolding (a saved
+  // <local-command-caveat> and nothing else) is not the user's ask: the same
+  // onlyScaffolding test the merge and the compiler share suppresses the line.
+  if (c.originalRequest !== null && !onlyScaffolding(c.originalRequest)) lines.push(`asked: ${c.originalRequest}`)
   for (const item of c.progress) lines.push(`progress: ${item}`)
   for (const d of c.decisions) lines.push(`decision: ${d.decision} — ${d.rationale}`)
   for (const r of c.rejected) lines.push(`rejected: ${r.approach} — ${r.why}`)
@@ -634,7 +655,11 @@ function contentLines(record: SourceRecord): string[] {
       `${movedOnSuffix(migration)} — originally record ${migration.originalRecordId} on contract ${migration.originalContract}, chain ${migration.originalChainId}`,
     )
   }
-  return raw.map((line) => (line === "" ? ">" : `> ${line}`))
+  // UF-C41C E5: the entries above are logical fields, not lines; a checkpoint
+  // request, a field value, or the fenced JSON block can each carry embedded
+  // newlines. Split every one first so no continuation line ever stands
+  // outside the quote.
+  return raw.flatMap((line) => line.split(/\r?\n/)).map((line) => (line === "" ? ">" : `> ${line}`))
 }
 
 function recordsMarkdown(entries: ExportEntry[], records: readonly SourceRecord[], exportedAt: string): string {
@@ -836,6 +861,7 @@ ${input.unreadableIds.map((id) => `- \`${id}\``).join("\n")}
  */
 export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
   const { home, network } = deps
+  const platform = deps.platform ?? process.platform
   const mode = loadOwnerMode(home)
   if (mode === "passkey") {
     return refuse(deps, "passkey-owner", "export supports software-key setups only in this version")
@@ -993,13 +1019,9 @@ export async function exportRecords(deps: ExportDeps): Promise<ExportResult> {
       // The rename made the export complete — flushing the parent's directory entry is the
       // last durability step and strictly best effort: a filesystem that refuses a directory
       // fsync (or the open) must not report failure over a finished folder, nor delete it.
+      // Windows refuses it by design, so fsyncFolder is a no-op there and no warning prints.
       try {
-        const parent = openSync(dirname(dest), "r")
-        try {
-          fsyncSync(parent)
-        } finally {
-          closeSync(parent)
-        }
+        fsyncFolder(dirname(dest), platform)
       } catch {
         parentFlushed = false
       }

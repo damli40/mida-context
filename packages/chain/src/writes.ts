@@ -121,7 +121,13 @@ export function failedBeforeSend(error: unknown): boolean {
   return error instanceof Error && (error as { sent?: boolean }).sent === false
 }
 
-const markUnsent = <T>(error: T): T => {
+/**
+ * Marks an error thrown before any transaction left the process — the mark `failedBeforeSend`
+ * reads. `sendContract` marks its own pre-send stretch internally; the export exists for code
+ * whose pre-send reads run outside it (the vault's reads ahead of the grant send). A failure
+ * after a broadcast point is never marked — the transaction may already be out.
+ */
+export const markUnsent = <T>(error: T): T => {
   if (error instanceof Error) (error as { sent?: boolean }).sent = false
   return error
 }

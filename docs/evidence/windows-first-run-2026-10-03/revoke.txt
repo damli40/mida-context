@@ -1,0 +1,14 @@
+asking the chain what codex already holds�
+
+sending the revocation (sponsored)�
+
+sending the new key to 2 agents�
+
+revoked codex on chain (sponsored) � tx 0x6fa88fb1c4c4d699eb59937f4e9fdee56f7b7d59a39395e8dbf8eaaf24fef53c
+
+This stops future reads through Mida. It does not erase what codex already read.
+
+new read key sent to assistant
+
+new read key sent to claude-code
+

@@ -7,12 +7,12 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { BaseError, HttpRequestError, getAbiItem, toFunctionSelector } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
-import { capabilityRegistryAbi } from "@mida/chain"
+import { capabilityRegistryAbi, increaseLocalTime } from "@mida/chain"
 import { localEnvironment } from "@mida/cli"
 import type { ScenarioEnvironment } from "@mida/cli"
-import { MidaHome, BANNER, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, loadAgentIdentity, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, readSummarizer, runCli, runCliWithRuntime, runDoctor, FileAccessRequestStore, saveAgentIdentity, writeSummarizer, CLI_COMMANDS, OWNER_COMMANDS, TERMINAL_COMMANDS } from "@mida/midad"
+import { MidaHome, BANNER, NEEDS_TERMINAL_LINE, Runtime, USAGE, approveProject, checkProject, devinHooksStatus, expectedScopesFor, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, macosProtectedFolderNote, ownerCommandNotice, ownerRefusalLine, readSummarizer, runCli, runCliWithRuntime, runDoctor, FileAccessRequestStore, saveAgentIdentity, writeSummarizer, CLI_COMMANDS, OWNER_COMMANDS, TERMINAL_COMMANDS } from "@mida/midad"
 import type { AgentIdentity, Network, ResolvedNetwork, ServiceRuntime } from "@mida/midad"
-import { accessRequestTypedData, encodeUint64 } from "@mida/protocol"
+import { accessRequestTypedData, encodeUint64, MidaError } from "@mida/protocol"
 import type { AccessRequest, Hex } from "@mida/protocol"
 import { manifestBodyHash } from "@mida/grant-advisor"
 import { FakeVaultAuthority } from "@mida/fake-vault"
@@ -243,6 +243,29 @@ describe("the crude mida command", () => {
     // the registered client name is a real approve target even though it is not a built-in agent
     expect(await run2("approve", "claude-desktop")).toBe(0)
     expect(lines.some((line) => line.startsWith("approved claude-desktop"))).toBe(true)
+  }, 300_000)
+
+  it("install claude-desktop on Windows writes every Claude config file, one result line each", async () => {
+    const lines: string[] = []
+    const work = mkdtempSync(join(tmpdir(), "mida-desktop-work-"))
+    mkdirSync(join(work, ".mida"))
+    writeFileSync(join(work, ".mida", "project.json"), JSON.stringify({ projectId: "p-desktop" }))
+    const first = join(mkdtempSync(join(tmpdir(), "mida-desktop-cfg-")), "claude_desktop_config.json")
+    const second = join(mkdtempSync(join(tmpdir(), "mida-desktop-cfg-")), "claude_desktop_config.json")
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+        cwd: work, platform: "win32", claudeDesktopConfigs: [first, second],
+      })
+    expect(await run2("install", "claude-desktop")).toBe(0)
+    for (const file of [first, second]) {
+      const entry = JSON.parse(readFileSync(file, "utf8")).mcpServers["mida-claude-desktop"]
+      expect(entry.command).toBe(process.execPath)
+      expect(entry.args.slice(-4)).toEqual(["--as", "claude-desktop", "--project", work])
+      expect(entry.env).toEqual({ MIDA_HOME: home.root })
+      expect(lines).toContain(`installed (${file})`)
+    }
   }, 300_000)
 
   it("install cursor writes <cwd>/.cursor/mcp.json with ${workspaceFolder} and its own identity (I1)", async () => {
@@ -933,11 +956,14 @@ describe("the crude mida command", () => {
         prompt: async () => "yes",
         stdinIsTTY: true, stdoutIsTTY: true,
       })
-    // codex real-pending (it is live, so revoke+request); cursor gets a stale file whose
-    // requestId the store never held — approve refuses it with no-pending-request
+    // codex real-pending (it is live, so revoke+request); stalefile gets a file whose requestId
+    // the store never held. UF-APR6 G3: a used-up file refuses only while the agent holds
+    // NOTHING live — a stale file on an approved agent renews instead of failing — so the
+    // failing half sits on an agent that was never approved.
+    expect(await run2("add-agent", "stalefile")).toBe(0)
     expect(await run2("revoke", "codex")).toBe(0)
     expect(await run2("request", "codex")).toBe(0)
-    home.writeSecretJson("agents/cursor/pending-request.json", {
+    home.writeSecretJson("agents/stalefile/pending-request.json", {
       request: {
         requestId: `0x${"ab".repeat(32)}`,
         scopes: [{ namespaceId: `0x${"11".repeat(32)}`, permissions: 1, provenancePolicy: 0 }],
@@ -946,10 +972,10 @@ describe("the crude mida command", () => {
     })
     expect(await run2("approve", "--all")).toBe(1)
     expect(lines.some((line) => line.startsWith("approved codex"))).toBe(true)
-    expect(lines).toContain("cursor has no pending request — run `mida request cursor` first")
-    expect(lines.at(-1)).toBe("approved: codex; failed: cursor (no-pending-request)")
+    expect(lines).toContain("stalefile has no pending request — run `mida request stalefile` first")
+    expect(lines.at(-1)).toBe("approved: codex; failed: stalefile (no-pending-request)")
     expect(home.has("agents/codex/pending-request.json")).toBe(false)
-    home.remove("agents/cursor/pending-request.json")
+    home.remove("agents/stalefile/pending-request.json")
   }, 300_000)
 
   it("approve --all runs the grant advisor per agent and never sends an expired request", async () => {
@@ -1002,10 +1028,12 @@ describe("the crude mida command", () => {
         home, network, print: () => {}, kickDaemon: () => kicks.push("x"),
         prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
       })
-    // claude-code re-requested for a real approval; cursor's stale file fails the store lookup
+    // claude-code re-requested for a real approval; strayfile holds nothing live, so its stale
+    // file fails the store lookup and refuses (UF-APR6 G3 — a live agent's file renews instead)
+    expect(await run2("add-agent", "strayfile")).toBe(0)
     expect(await run2("revoke", "claude-code")).toBe(0)
     expect(await run2("request", "claude-code")).toBe(0)
-    home.writeSecretJson("agents/cursor/pending-request.json", {
+    home.writeSecretJson("agents/strayfile/pending-request.json", {
       request: {
         requestId: `0x${"cd".repeat(32)}`,
         scopes: [{ namespaceId: `0x${"11".repeat(32)}`, permissions: 1, provenancePolicy: 0 }],
@@ -1016,7 +1044,7 @@ describe("the crude mida command", () => {
     expect(await run2("approve", "--all")).toBe(1)
     // claude-code's approve landed, so the daemon was poked even though the batch exits 1
     expect(kicks).toHaveLength(1)
-    home.remove("agents/cursor/pending-request.json")
+    home.remove("agents/strayfile/pending-request.json")
   }, 300_000)
 
   it("approve --all says 'was already approved' when the folder's row was already there (G14)", async () => {
@@ -1033,8 +1061,10 @@ describe("the crude mida command", () => {
     const identity = loadAgentIdentity(home, "codex")!
     const original = home.readJson<{ request: AccessRequest }>("agents/codex/pending-request.json")!.request
     expect(await run2("approve", "codex")).toBe(0) // chain grant + this folder's list row
-    // file a second, fresh-signed request for scopes codex already holds: the batch's listOnly
-    // arm runs, and with the row already written "now approved" would be a lie
+    // file a second, fresh-signed request for scopes codex already holds — a different request
+    // with a different request hash, so the first grant's logs are NOT this request's recovery
+    // (UF-APR): the honest answer is the ordinary already-approved one
+    const grantsBefore = loadGrants(home, "codex").length
     const { agentSignature: _dropped, ...unsigned } = original
     const now = BigInt(Math.floor(Date.now() / 1000))
     const fresh = {
@@ -1052,8 +1082,13 @@ describe("the crude mida command", () => {
     home.writeSecretJson("agents/codex/pending-request.json", { request })
     lines.length = 0
     expect(await run2("approve", "--all")).toBe(0)
+    // UF-APR: scope coverage alone does not bind a grant to THIS request — recovery looks for a
+    // CapabilityGranted whose context carries this request's hash, finds none, and the batch
+    // answers already-approved. Nothing was sent, nothing was recorded twice.
     expect(lines).toContain("codex is already approved on chain. This folder was already approved for codex.")
+    expect(lines.every((line) => !line.includes("from an earlier try"))).toBe(true)
     expect(lines.every((line) => !line.includes("is now approved for codex"))).toBe(true)
+    expect(loadGrants(home, "codex")).toHaveLength(grantsBefore)
   }, 300_000)
 
   // AUTH-15 (Sep 27 demo break): once the agents hold their grant, `mida request` files
@@ -2464,4 +2499,295 @@ describe("the command tables' membership is pinned (in-18)", () => {
       expect(TERMINAL_COMMANDS).toContain(command)
     }
   })
+})
+
+/**
+ * UF-AP — what the command prints for the Oct 2 lost-reply bug. The seam is the one the e2e
+ * uses, applied through `Runtime.open` (runCli opens its own runtime): `approveGrant` runs the
+ * real grant so the transaction lands, then throws; `publishReaderWraps` is silenced because in
+ * the incident the send died before the post-send tail ran. A plain MidaError in place of the
+ * throw stands in for the sponsor-timeout OWNER_WALLET_LOW the real send path produces.
+ */
+describe("approve says when an approval is on chain but not recorded (UF-AP)", () => {
+  let env: ScenarioEnvironment
+  let network: Network
+  let home: MidaHome
+  let projectDir: string
+  const lines: string[] = []
+  const run = (...argv: string[]) =>
+    runCli(argv, { home, network, cwd: projectDir, print: (line) => lines.push(line), prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true })
+
+  /** Wrap the vault of every runtime runCli opens while the spy is armed. */
+  const spyOnOpen = (wrap: (runtime: Runtime) => void) => {
+    const realOpen = Runtime.open.bind(Runtime)
+    return vi.spyOn(Runtime, "open").mockImplementation(async (h, n, o) => {
+      const runtime = await realOpen(h, n, o)
+      wrap(runtime as Runtime)
+      return runtime
+    })
+  }
+
+  /** The Oct 2 shape: the grant transaction lands, the reply never arrives, the key publish never runs. */
+  const loseReply = (runtime: Runtime) => {
+    const vault = runtime.vault as unknown as {
+      approveGrant: (input: never) => Promise<unknown>
+      publishReaderWraps: (input: never) => Promise<unknown>
+    }
+    const realApprove = vault.approveGrant.bind(runtime.vault) as (input: never) => Promise<unknown>
+    vault.publishReaderWraps = (async () => []) as never
+    vault.approveGrant = (async (input: never) => {
+      await realApprove(input)
+      throw new Error("The request timed out.")
+    }) as never
+  }
+
+  /** An approve that dies the way the incident ended: the sponsor timed out, the owner's wallet was empty. */
+  const sponsorTimeout = (runtime: Runtime) => {
+    const vault = runtime.vault as unknown as { approveGrant: (input: never) => Promise<unknown> }
+    vault.approveGrant = (async () => {
+      throw new MidaError("OWNER_WALLET_LOW", "the gas sponsor did not pay (The request timed out.); your wallet holds 0.0000 MON but this transaction needs up to 0.1830 MON — 0.1830 MON short")
+    }) as never
+  }
+
+  beforeAll(async () => {
+    env = await localEnvironment()
+    network = { rpcUrl: env.rpcUrl, deployment: env.deployment, fund: env.fund }
+    home = new MidaHome(mkdtempSync(join(tmpdir(), "mida-cli-ufap-")))
+    projectDir = mkdtempSync(join(tmpdir(), "mida-cli-ufap-proj-"))
+    lines.length = 0
+    expect(await run("init")).toBe(0)
+    lines.length = 0
+  }, 600_000)
+
+  afterAll(async () => {
+    await env?.stop()
+  })
+
+  it("a grant whose reply was lost finishes on the next approve — and the line says so", async () => {
+    expect(await run("request", "codex")).toBe(0)
+    lines.length = 0
+    const spy = spyOnOpen(loseReply)
+    expect(await run("approve", "codex")).toBe(1)
+    spy.mockRestore()
+    lines.length = 0
+    expect(await run("approve", "codex")).toBe(0)
+    expect(lines).toContain("codex's approval was already on chain from an earlier try. Mida finished recording it on this machine (no transaction).")
+    expect(lines).toContain("This folder is now approved for codex too (no transaction).")
+    expect(lines.every((line) => !line.includes("codex is already approved on chain"))).toBe(true)
+    expect(lines.every((line) => !line.includes("has no record of that approval"))).toBe(true)
+  }, 300_000)
+
+  it("an approve --all recovery says the same and counts the agent approved", async () => {
+    expect(await run("request", "claude-code")).toBe(0)
+    lines.length = 0
+    const spy = spyOnOpen(loseReply)
+    expect(await run("approve", "--all")).toBe(1)
+    spy.mockRestore()
+    lines.length = 0
+    expect(await run("approve", "--all")).toBe(0)
+    expect(lines).toContain("claude-code's approval was already on chain from an earlier try. Mida finished recording it on this machine (no transaction).")
+    expect(lines.at(-1)).toBe("approved: claude-code")
+  }, 300_000)
+
+  it("an approval on chain with no local record prints the repair line, not just 'already approved'", async () => {
+    expect(await run("add-agent", "reviewer")).toBe(0)
+    expect(await run("request", "reviewer")).toBe(0)
+    expect(await run("approve", "reviewer")).toBe(0)
+    // the home as it looks after the bug — or a restore without the grants file
+    home.remove("agents/reviewer/grants.json")
+    lines.length = 0
+    expect(await run("approve", "reviewer")).toBe(0)
+    expect(lines).toContain("reviewer is approved on chain, but this machine has no record of that approval, so reviewer cannot read or save here. To repair it: mida revoke reviewer, then mida request reviewer, then mida approve reviewer.")
+    expect(lines.every((line) => !line.includes("from an earlier try"))).toBe(true)
+  }, 300_000)
+
+  it("an approve --all whose finish step fails prints the repair line for that agent", async () => {
+    // failsafe's grant lands but its reply is lost — the pending request it answers is what
+    // recovery must match (UF-APR: hash, not just scopes). A completeAccessRequest that cannot
+    // verify the rebuilt response then makes this the unrecorded case.
+    expect(await run("add-agent", "failsafe")).toBe(0)
+    expect(await run("request", "failsafe")).toBe(0)
+    const losing = spyOnOpen(loseReply)
+    expect(await run("approve", "--all")).toBe(1)
+    losing.mockRestore()
+    const spy = spyOnOpen((runtime) => {
+      const agent = runtime.agent("failsafe") as unknown as { completeAccessRequest: unknown }
+      agent.completeAccessRequest = async () => {
+        // UF-APR2: only the SDK's refusal codes are "not this request's grant" — a plain Error
+        // is a check that never ran and now fails the command instead.
+        throw new MidaError("RESPONSE_MISMATCH", "grant response did not verify")
+      }
+    })
+    lines.length = 0
+    expect(await run("approve", "--all")).toBe(0)
+    spy.mockRestore()
+    expect(lines).toContain("failsafe is approved on chain, but this machine has no record of that approval, so failsafe cannot read or save here. To repair it: mida revoke failsafe, then mida request failsafe, then mida approve failsafe.")
+    expect(lines.every((line) => !line.includes("from an earlier try"))).toBe(true)
+    expect(lines.at(-1)).toContain("failsafe")
+    home.remove("agents/failsafe/pending-request.json")
+  }, 300_000)
+
+  it("a sponsor timeout that broke on the owner's wallet earns the retry hint", async () => {
+    expect(await run("add-agent", "planner")).toBe(0)
+    expect(await run("request", "planner")).toBe(0)
+    lines.length = 0
+    const spy = spyOnOpen(sponsorTimeout)
+    expect(await run("approve", "planner")).toBe(1)
+    spy.mockRestore()
+    expect(lines).toContain("the gas sponsor did not pay (The request timed out.); your wallet holds 0.0000 MON but this transaction needs up to 0.1830 MON — 0.1830 MON short")
+    expect(lines).toContain("The gas sponsor did not answer in time, so its transaction may still have gone through. Run mida approve planner again in a minute: Mida checks the chain first and sends only what is still missing.")
+  }, 300_000)
+
+  it("a sponsor failure that is NOT a timeout prints no retry hint", async () => {
+    const spy = spyOnOpen((runtime) => {
+      const vault = runtime.vault as unknown as { approveGrant: (input: never) => Promise<unknown> }
+      vault.approveGrant = (async () => {
+        throw new MidaError("OWNER_WALLET_LOW", "the gas sponsor did not pay (the sponsor's daily budget is exhausted); your wallet holds 0.0000 MON but this transaction needs up to 0.1830 MON — 0.1830 MON short")
+      }) as never
+    })
+    lines.length = 0
+    expect(await run("approve", "planner")).toBe(1)
+    spy.mockRestore()
+    expect(lines).toContain("the gas sponsor did not pay (the sponsor's daily budget is exhausted); your wallet holds 0.0000 MON but this transaction needs up to 0.1830 MON — 0.1830 MON short")
+    expect(lines.every((line) => !line.includes("did not answer in time"))).toBe(true)
+  }, 300_000)
+
+  it("an ordinary already-approved approve prints none of the new lines", async () => {
+    lines.length = 0
+    expect(await run("approve", "codex")).toBe(0)
+    expect(lines).toContain("codex is already approved on chain. This folder was already approved for codex.")
+    expect(lines.every((line) => !line.includes("from an earlier try"))).toBe(true)
+    expect(lines.every((line) => !line.includes("has no record of that approval"))).toBe(true)
+    expect(lines.every((line) => !line.includes("did not answer in time"))).toBe(true)
+  }, 300_000)
+
+  // UF-APR: a chain read that dies INSIDE recovery is not "the grant was not found" — the
+  // command names the failure, says nothing changed, and a retry finishes the approval.
+  it("a chain read failure during recovery prints the approval-check-failed line", async () => {
+    expect(await run("add-agent", "fixer")).toBe(0)
+    expect(await run("request", "fixer")).toBe(0)
+    const spy = spyOnOpen(loseReply)
+    expect(await run("approve", "fixer")).toBe(1)
+    spy.mockRestore()
+
+    lines.length = 0
+    const rpcDown = spyOnOpen((runtime) => {
+      vi.spyOn(runtime.chain.publicClient, "getLogs").mockRejectedValue(new Error("the RPC is down"))
+    })
+    expect(await run("approve", "fixer")).toBe(1)
+    rpcDown.mockRestore()
+    expect(lines).toContain("Mida could not read the chain to finish fixer's approval. Nothing was changed. Run mida approve fixer again.")
+    expect(home.has("agents/fixer/pending-request.json")).toBe(true)
+
+    lines.length = 0
+    expect(await run("approve", "fixer")).toBe(0)
+    expect(lines).toContain("fixer's approval was already on chain from an earlier try. Mida finished recording it on this machine (no transaction).")
+  }, 300_000)
+
+  it("approve --all names the same failure under failed: with its code", async () => {
+    expect(await run("add-agent", "triage")).toBe(0)
+    expect(await run("request", "triage")).toBe(0)
+    const spy = spyOnOpen(loseReply)
+    expect(await run("approve", "--all")).toBe(1)
+    spy.mockRestore()
+
+    lines.length = 0
+    const rpcDown = spyOnOpen((runtime) => {
+      vi.spyOn(runtime.chain.publicClient, "getLogs").mockRejectedValue(new Error("the RPC is down"))
+    })
+    expect(await run("approve", "--all")).toBe(1)
+    rpcDown.mockRestore()
+    expect(lines).toContain("Mida could not read the chain to finish triage's approval. Nothing was changed. Run mida approve triage again.")
+    expect(lines.at(-1)).toContain("triage (approval-check-failed)")
+    expect(lines.at(-1)).toContain("failed:")
+  }, 300_000)
+
+  it("approve --all finishes an expired request whose grant already landed — no mida request advice", async () => {
+    expect(await run("add-agent", "remodel")).toBe(0)
+    expect(await run("request", "remodel")).toBe(0)
+    const spy = spyOnOpen(loseReply)
+    expect(await run("approve", "--all")).toBe(1)
+    spy.mockRestore()
+
+    // The request is five minutes old; move the chain's clock past its expiry. The grant is
+    // still live — the batch must recover it, not tell the owner to file a new request.
+    await increaseLocalTime(env.rpcUrl, 400n)
+
+    lines.length = 0
+    await run("approve", "--all")
+    expect(lines).toContain("remodel's approval was already on chain from an earlier try. Mida finished recording it on this machine (no transaction).")
+    expect(lines.at(-1)).toMatch(/approved: [^;]*remodel/)
+    expect(lines.at(-1)).not.toContain("remodel (")
+    expect(lines.some((line) => line.includes("remodel's request has expired"))).toBe(false)
+    expect(lines.some((line) => line.includes("mida request remodel"))).toBe(false)
+  }, 300_000)
+
+  // UF-APR5 F4: a pending-request file the store has already consumed is the leftover a failed
+  // cleanup leaves. The batch's own gate used to refuse it no-pending-request — while single
+  // approve finished it — so `--all` and `approve` disagreed about the same file. The gate now
+  // applies approve's shared chain verdict and the batch finishes the landed approval.
+  it("approve --all finishes a used-up request whose grant is fully live (UF-APR5 F4)", async () => {
+    expect(await run("add-agent", "usedup")).toBe(0)
+    expect(await run("request", "usedup")).toBe(0)
+    const request = home.readJson<{ request: AccessRequest }>("agents/usedup/pending-request.json")!.request
+    expect(await run("approve", "usedup")).toBe(0)
+    // the consumed store record plus the leftover pending file — the failed-cleanup shape
+    home.writeSecretJson("agents/usedup/pending-request.json", { request })
+
+    lines.length = 0
+    expect(await run("approve", "--all")).toBe(0)
+    // the preview names the finish, never the stale ask — and the summary counts the agent.
+    expect(lines).toContain("usedup's grant already landed on chain — approving finishes what an earlier run left undone (no transaction)")
+    expect(lines.some((line) => line.includes("usedup is asking for"))).toBe(false)
+    expect(lines.some((line) => line.startsWith("usedup is already approved on chain"))).toBe(true)
+    expect(lines.at(-1)).toContain("usedup")
+    expect(lines.at(-1)).not.toContain("usedup (")
+    expect(home.has("agents/usedup/pending-request.json")).toBe(false)
+  }, 300_000)
+
+  // UF-APR5 F5: a grant that lands and a folder listing that fails used to be counted under
+  // failed: — while the line right above it said the agent IS approved. The summary now counts
+  // the agent approved and names the one step left undone, and the daemon hears the grant.
+  it("approve --all counts an approved agent whose folder was not listed as approved (UF-APR5 F5)", async () => {
+    const kicks: string[] = []
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, cwd: projectDir, print: (line) => lines.push(line),
+        kickDaemon: () => (kicks.push("x"), Promise.resolve()),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+      })
+    expect(await run2("add-agent", "unlisted")).toBe(0)
+    expect(await run2("request", "unlisted")).toBe(0)
+
+    // The approved-projects list cannot be read for the whole batch: every grant that lands
+    // still lands, but no folder row can be written.
+    const realRead = home.readJson.bind(home)
+    const readJson = vi.spyOn(home, "readJson").mockImplementation(((path: string) => {
+      if (path === "approved-projects.json") throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" })
+      return realRead(path)
+    }) as never)
+    lines.length = 0
+    let code = -1
+    try {
+      code = await run2("approve", "--all")
+    } finally {
+      readJson.mockRestore()
+    }
+
+    // The line above the summary already said the agent IS approved — the summary agrees now,
+    // counting it approved and naming the one step left undone instead of calling it failed.
+    expect(code).toBe(0)
+    expect(lines).toContain(
+      "unlisted is approved, but the approved-projects list could not be read — check the file's permissions, then run `mida approve unlisted` here again to add this folder",
+    )
+    expect(lines.at(-1)).toContain("unlisted (folder not listed)")
+    expect(lines.at(-1)).not.toContain("failed:")
+    // The grant really landed, and the daemon heard about it.
+    expect(loadGrants(home, "unlisted").length).toBeGreaterThan(0)
+    expect(kicks.length).toBeGreaterThan(0)
+    // And the named retry adds the folder row once the list reads again — no transaction.
+    lines.length = 0
+    expect(await run2("approve", "unlisted")).toBe(0)
+    expect(lines.some((line) => line.startsWith("unlisted is already approved on chain"))).toBe(true)
+  }, 300_000)
 })

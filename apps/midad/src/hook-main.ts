@@ -2,7 +2,7 @@ import { spawn } from "node:child_process"
 import { resolveHome } from "./home.js"
 import { drainerEnv, extractHookFields, runHook } from "./hook.js"
 import { appendLog } from "./log.js"
-import { siblingEntryArgs } from "./sibling.js"
+import { detachedSpawnOptions, siblingEntryArgs } from "./sibling.js"
 
 const STDIN_CAP_BYTES = 1_000_000
 const HEAD_BYTES = 64 * 1024
@@ -57,23 +57,13 @@ async function main(): Promise<void> {
     // repo's tsx loader — sibling.ts decides; the Mida home is the child's working directory.
     spawnDaemon: () => {
       if (suppressForMigration()) return
-      const child = spawn(process.execPath, siblingEntryArgs("midad"), {
-        detached: true,
-        stdio: "ignore",
-        cwd: home.root,
-        env: drainerEnv(process.env),
-      })
+      const child = spawn(process.execPath, siblingEntryArgs("midad"), detachedSpawnOptions(home.root, drainerEnv(process.env)))
       child.on("error", () => {})
       child.unref()
     },
     spawnDrainer: () => {
       if (suppressForMigration()) return
-      const child = spawn(process.execPath, siblingEntryArgs("mida-drain"), {
-        detached: true,
-        stdio: "ignore",
-        cwd: home.root,
-        env: drainerEnv(process.env),
-      })
+      const child = spawn(process.execPath, siblingEntryArgs("mida-drain"), detachedSpawnOptions(home.root, drainerEnv(process.env)))
       child.on("error", () => {})
       child.unref()
     },

@@ -270,7 +270,7 @@ describe("mida sponsor on|off", () => {
       })
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject)
-      server.listen(socketPathFor(home), () => resolve())
+      server.listen(socketPathFor(home)!, () => resolve())
     })
     return { server, close: closeSelf }
   }
@@ -355,7 +355,7 @@ describe("mida sponsor on|off", () => {
       onSpawn: () => {
         // the fresh service rebinds the same socket — drop a leftover file first, as the real
         // daemon's own start does
-        rmSync(socketPathFor(home), { force: true })
+        rmSync(socketPathFor(home)!, { force: true })
         void stubService(home, () => 200)
       },
     })

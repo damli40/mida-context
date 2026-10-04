@@ -41,6 +41,8 @@ import { sampleCheckpoint } from "./helpers.js"
 
 const TIMEOUT = 300_000
 const MIGRATED_AT = "2026-09-23T12:00:00.000Z"
+// the ISO stamp as it appears in file and folder names: ":" is not a Windows filename
+const MIGRATED_STAMP = MIGRATED_AT.replace(/:/g, "-")
 
 interface Seeded {
   home: MidaHome
@@ -238,7 +240,8 @@ describe("migrate verify + switch + undo (migrate B6)", () => {
       expect(net.deployment.contextRegistry.toLowerCase()).toBe(target.contextRegistry.toLowerCase())
       expect(net.previous.deployment.capabilityRegistry.toLowerCase()).toBe(source.capabilityRegistry.toLowerCase())
       expect(net.previous.migratedAt).toBe(MIGRATED_AT)
-      expect(net.manifest).toBe(`migrate/manifest-${MIGRATED_AT}.json`)
+      expect(net.manifest).toBe(`migrate/manifest-${MIGRATED_STAMP}.json`)
+      expect(net.manifest).not.toContain(":")
       expect(net.rpcUrl).toBe(env.rpcUrl)
 
       // The kept manifest carries no HMAC key and no plaintext; state.json dropped the key too.
@@ -257,7 +260,7 @@ describe("migrate verify + switch + undo (migrate B6)", () => {
       expect(seeded.home.has("agents/claude-code/revoked.json")).toBe(true)
 
       // The backup holds the whole previous setup — data/ included (the Task 5 gap Task 6 closes).
-      const backup = `migrate/backup-${MIGRATED_AT}`
+      const backup = `migrate/backup-${MIGRATED_STAMP}`
       expect(seeded.home.has(`${backup}/data`)).toBe(true)
       const approved = seeded.home.readJson<unknown>("approved-projects.json")
       if (approved !== undefined) {

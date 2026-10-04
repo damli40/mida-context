@@ -1,0 +1,11 @@
+file:///D:/a/mida-context/mida-context/scripts/windows-ci/run-hook.mjs:21
+  const line = match[1].replace(/\\(["\\])/g, "$1")
+                    ^
+
+TypeError: Cannot read properties of null (reading '1')
+    at file:///D:/a/mida-context/mida-context/scripts/windows-ci/run-hook.mjs:21:21
+    at ModuleJob.run (node:internal/modules/esm/module_job:343:25)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:681:26)
+    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:117:5)
+
+Node.js v22.23.3

@@ -1,20 +1,23 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { spawn, spawnSync } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
+import { EventEmitter } from "node:events"
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import type { AddressInfo, Server } from "node:net"
 import { createServer as createHttpServer } from "node:http"
 import { tmpdir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { toFunctionSelector } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { encodeUint64 } from "@mida/protocol"
 import { parseDeployment } from "@mida/chain"
-import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, doctorReplaceStaleService, enqueue, ensureCurrentDaemon, installClaudeCode, installCodex, installDevin, isMidaProcess, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor, writeSummarizer } from "@mida/midad"
-import type { Runtime } from "@mida/midad"
+import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, doctorReplaceStaleService, enqueue, ensureCurrentDaemon, expectedScopesFor, installClaudeCode, installCodex, installDevin, isMidaProcess, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor, writeSummarizer } from "@mida/midad"
+import { expandScopeInputs } from "@mida/grant-advisor"
+import type { DoctorDeps, Runtime } from "@mida/midad"
 import { codeIdentity } from "../src/code-identity.js"
+import { startToolSession } from "../src/doctor.js"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
 
@@ -66,7 +69,7 @@ async function stubDaemon(home: MidaHome, status: number, body: unknown): Promis
   })
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject)
-    server.listen(socketPathFor(home), () => resolve())
+    server.listen(socketPathFor(home)!, () => resolve())
   })
   return server
 }
@@ -107,7 +110,7 @@ describe("mida doctor without a chain", () => {
     home.writeSecretJson("midad.lock", { pid: holder.pid })
     home.writeSecretJson("api-url.json", { baseUrl: "http://127.0.0.1:9" })
     const lines: string[] = []
-    const code = await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    const code = await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50, platform: "darwin" })
     expect(lines).toContain(
       `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with kill ${holder.pid}, then open any agent session or run mida task to start a fresh one.`,
     )
@@ -1844,6 +1847,55 @@ describe("mida doctor --live", () => {
     expect(replaced).toBe(1)
     expect(sessions).toBe(1)
   })
+
+  it("the tool it starts is resolved on PATH only — a claude.cmd in the working folder is never spawned", () => {
+    const cwd = dir()
+    writeFileSync(join(cwd, "claude.cmd"), "@echo off\r\n")
+    const spawned: string[] = []
+    const session = startToolSession("claude-code", cwd, {
+      env: { PATH: dir() },
+      spawn: ((command: string) => {
+        spawned.push(command)
+        return new EventEmitter()
+      }) as never,
+    })
+    session.stop()
+    expect(spawned).toEqual([])
+  })
+
+  it("the PATH-resolved absolute path is what spawns", () => {
+    const pathDir = dir()
+    const binary = join(pathDir, "claude")
+    writeFileSync(binary, "#!/bin/sh\n")
+    chmodSync(binary, 0o755)
+    const spawned: { command: string; args: string[] }[] = []
+    const session = startToolSession("claude-code", dir(), {
+      env: { PATH: pathDir },
+      spawn: ((command: string, args: string[]) => {
+        spawned.push({ command, args })
+        return new EventEmitter()
+      }) as never,
+    })
+    session.stop()
+    expect(spawned).toEqual([{ command: binary, args: ["-p", "Reply with the word ok."] }])
+  })
+
+  it("codex resolves the same way", () => {
+    const pathDir = dir()
+    const binary = join(pathDir, "codex")
+    writeFileSync(binary, "#!/bin/sh\n")
+    chmodSync(binary, 0o755)
+    const spawned: { command: string; args: string[] }[] = []
+    const session = startToolSession("codex", dir(), {
+      env: { PATH: pathDir },
+      spawn: ((command: string, args: string[]) => {
+        spawned.push({ command, args })
+        return new EventEmitter()
+      }) as never,
+    })
+    session.stop()
+    expect(spawned).toEqual([{ command: binary, args: ["exec", "Reply with the word ok."] }])
+  })
 })
 
 describe("mida doctor on a passkey home", () => {
@@ -2318,5 +2370,283 @@ describe("mida doctor on an expired access request (in-15 J-3)", () => {
     } finally {
       await rpc.close()
     }
+  })
+})
+
+// UF-AP — Oct 2: a grant whose reply was lost leaves the chain approving the agent while this
+// machine holds no recorded grant. Doctor's "ok: <name> approved" was a lie there — every read
+// still refused. The check now compares the chain answer to the grants file and calls the
+// unrecorded case a PROBLEM with the fix named.
+describe("mida doctor on an approval that was never recorded (UF-AP)", () => {
+  const DEPLOYMENT = {
+    chainId: "31337",
+    capabilityRegistry: "0x2222222222222222222222222222222222222222",
+    contextRegistry: "0x3333333333333333333333333333333333333333",
+    deploymentBlock: "0",
+    vaultRpId: "vault.mida.xyz",
+    vaultRpIdHash: `0x${"55".repeat(32)}`,
+    policyHashV1: `0x${"44".repeat(32)}`,
+  }
+  const AGENT_ID = `0x${"ab".repeat(32)}`
+  const CAP_ID = `0x${"77".repeat(32)}` as `0x${string}`
+  const CAP_ID_2 = `0x${"88".repeat(32)}` as `0x${string}`
+  const DEAD_CAP_ID = `0x${"66".repeat(32)}` as `0x${string}`
+  const OWNER = `0x${"cc".repeat(20)}`
+
+  const word = (hex: string) => hex.replace(/^0x/, "").padStart(64, "0")
+  // abi.encode(Capability) — owner, agentId, namespaceId, permissions, provenancePolicy,
+  // issuedAt, expiresAt (0 = never), agentEpoch, grantedAtReadEpoch, revoked=false
+  const LIVE_CAPABILITY =
+    "0x" + [word(OWNER), word(AGENT_ID), word(`0x${"99".repeat(32)}`), word("1"), word("0"), word("1"), word("0"), word("0"), word("0"), word("0")].join("")
+
+  /** A stub JSON-RPC chain that approves the agent: one live capability, everything else empty. */
+  async function stubChain(): Promise<{ url: string; close(): Promise<void> }> {
+    const ACTIVE_IDS = toFunctionSelector("activeCapabilityIds(address,bytes32)")
+    const GET_CAP = toFunctionSelector("getCapability(bytes32)")
+    const OWNER_KEY = toFunctionSelector("ownerP256Key(address)")
+    const now = BigInt(Math.floor(Date.now() / 1000))
+    const server = createHttpServer((req, res) => {
+      let body = ""
+      req.on("data", (chunk) => (body += chunk))
+      req.on("end", () => {
+        const call = JSON.parse(body) as { id: number; method: string; params?: unknown[] }
+        const reply = (result: unknown) => {
+          res.setHeader("content-type", "application/json")
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: call.id, result }))
+        }
+        if (call.method === "eth_call") {
+          const data = (call.params?.[0] as { data?: string } | undefined)?.data ?? ""
+          if (data.startsWith(ACTIVE_IDS)) return reply(`0x${word("20")}${word("2")}${CAP_ID.slice(2)}${CAP_ID_2.slice(2)}`)
+          if (data.startsWith(GET_CAP)) return reply(LIVE_CAPABILITY)
+          if (data.startsWith(OWNER_KEY)) return reply(`0x${"11".repeat(64)}`)
+          return reply("0x")
+        }
+        if (call.method === "eth_getBlockByNumber") {
+          return reply({
+            number: "0x64", hash: `0x${"cd".repeat(32)}`, parentHash: `0x${"00".repeat(32)}`,
+            nonce: "0x0000000000000000", sha3Uncles: `0x${"00".repeat(32)}`, logsBloom: `0x${"00".repeat(256)}`,
+            transactionsRoot: `0x${"00".repeat(32)}`, stateRoot: `0x${"00".repeat(32)}`, receiptsRoot: `0x${"00".repeat(32)}`,
+            miner: `0x${"00".repeat(20)}`, difficulty: "0x0", totalDifficulty: "0x0", extraData: "0x",
+            size: "0x3e8", gasLimit: "0x1c9c380", gasUsed: "0x0", timestamp: `0x${now.toString(16)}`,
+            transactions: [], uncles: [],
+          })
+        }
+        if (call.method === "eth_getBalance") return reply("0x0")
+        if (call.method === "eth_chainId") return reply("0x7a69")
+        if (call.method === "eth_blockNumber") return reply("0x64")
+        return reply("0x")
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+    const port = (server.address() as AddressInfo).port
+    return { url: `http://127.0.0.1:${port}`, close: () => new Promise<void>((done) => server.close(() => done())) }
+  }
+
+  /** One recorded capability per expected scope, spread across the ids the chain holds live. */
+  const coveringCapabilities = (capIds: `0x${string}`[]) =>
+    expandScopeInputs(expectedScopesFor("project_assistance")).map((scope, i) => ({
+      capabilityId: capIds[i % capIds.length],
+      namespaceId: scope.namespaceId,
+      permissions: scope.permissions,
+      provenancePolicy: scope.provenancePolicy,
+      expiresAt: "0",
+      transactionHash: `0x${"dd".repeat(32)}`,
+    }))
+
+  const grantWith = (capabilities: unknown[]) => ({
+    owner: OWNER, agentId: AGENT_ID, requestId: `0x${"66".repeat(32)}`, capabilities,
+  })
+
+  /** A home with one agent set up; `grants` becomes grants.json when given, `passkey` makes it
+   * a passkey home (owner address on disk, no owner key). */
+  function homeWithAgent(
+    rpcUrl: string,
+    opts: { name?: string; agentId?: string; purposeId?: string; grants?: unknown[]; passkey?: boolean } = {},
+  ): MidaHome {
+    const name = opts.name ?? "devin"
+    const agentId = opts.agentId ?? AGENT_ID
+    const home = new MidaHome(join(dir(), "home"))
+    if (opts.passkey === true) {
+      saveOwnerMode(home, "passkey")
+      saveOwnerAddress(home, OWNER as `0x${string}`)
+    } else {
+      loadOrCreateOwnerSecrets(home)
+    }
+    const key = `0x${"ab".repeat(32)}`
+    mkdirSync(join(home.root, "agents", name), { recursive: true })
+    writeFileSync(
+      join(home.root, "agents", name, "identity.json"),
+      JSON.stringify({
+        name, agentId, signerPrivateKey: key, encryptionPrivateKey: key,
+        encryptionPublicKey: key, manifestHash: key, callbackOrigin: "http://localhost",
+        purposeId: opts.purposeId ?? "project_assistance", manifest: {},
+      }),
+    )
+    if (opts.grants !== undefined) {
+      home.writeSecretJson(`agents/${name}/grants.json`, opts.grants)
+    }
+    home.writeSecretJson("network.json", { rpcUrl, deployment: DEPLOYMENT })
+    return home
+  }
+
+  const doctorLines = async (home: MidaHome): Promise<string[]> => {
+    const lines: string[] = []
+    await runDoctor({ home, print: (line) => lines.push(line), env: {}, daemonProbeMs: 50 })
+    return lines
+  }
+
+  it("approved on chain but no recorded grant is a PROBLEM that names the fix, never an ok", async () => {
+    const rpc = await stubChain()
+    try {
+      const lines = await doctorLines(homeWithAgent(rpc.url))
+      expect(lines).toContain("PROBLEM: devin is approved on chain, but this machine never finished recording that approval, so devin cannot read or save. Run mida approve devin to finish it.")
+      expect(lines.every((line) => !line.includes("ok: devin approved"))).toBe(true)
+    } finally {
+      await rpc.close()
+    }
+  })
+
+  it("an agent with a recorded grant keeps the ok line", async () => {
+    const rpc = await stubChain()
+    try {
+      const lines = await doctorLines(homeWithAgent(rpc.url, { grants: [grantWith(coveringCapabilities([CAP_ID]))] }))
+      expect(lines).toContain("ok: devin approved")
+      expect(lines.every((line) => !line.includes("never finished recording"))).toBe(true)
+    } finally {
+      await rpc.close()
+    }
+  })
+
+  // UF-APR: doctor judges by live recorded capabilities across ALL grants — two grants that
+  // share the coverage count together, and a grant whose capabilities are dead on chain does
+  // not count at all.
+  it("an agent whose coverage is split across two saved grants keeps the ok line", async () => {
+    const rpc = await stubChain()
+    try {
+      const caps = coveringCapabilities([CAP_ID, CAP_ID_2])
+      const grants = [grantWith(caps.slice(0, 1)), grantWith(caps.slice(1))]
+      const lines = await doctorLines(homeWithAgent(rpc.url, { grants }))
+      expect(lines).toContain("ok: devin approved")
+      expect(lines.every((line) => !line.includes("never finished recording"))).toBe(true)
+    } finally {
+      await rpc.close()
+    }
+  })
+
+  it("a grant left from before a revoke — saved, but dead on chain — gets the PROBLEM line", async () => {
+    const rpc = await stubChain()
+    try {
+      const lines = await doctorLines(homeWithAgent(rpc.url, { grants: [grantWith(coveringCapabilities([DEAD_CAP_ID]))] }))
+      expect(lines).toContain("PROBLEM: devin is approved on chain, but this machine never finished recording that approval, so devin cannot read or save. Run mida approve devin to finish it.")
+      expect(lines.every((line) => !line.includes("ok: devin approved"))).toBe(true)
+    } finally {
+      await rpc.close()
+    }
+  })
+
+  it("assistant gets the revoke-and-init wording on a software home — mida approve cannot finish it", async () => {
+    const rpc = await stubChain()
+    try {
+      const lines = await doctorLines(homeWithAgent(rpc.url, { name: "assistant", purposeId: "general_assistance" }))
+      expect(lines).toContain("PROBLEM: assistant is approved on chain, but this machine never finished recording that approval, so assistant cannot read. Run mida revoke assistant, then mida init.")
+      expect(lines.every((line) => !line.includes("Run mida approve assistant"))).toBe(true)
+    } finally {
+      await rpc.close()
+    }
+  })
+
+  it("a passkey home gets the revoke-request-approve wording — there is no local key to finish with", async () => {
+    const rpc = await stubChain()
+    try {
+      const lines = await doctorLines(homeWithAgent(rpc.url, { passkey: true }))
+      expect(lines).toContain("PROBLEM: devin is approved on chain, but this machine never finished recording that approval, so devin cannot read or save. To repair it: mida revoke devin, then mida request devin, then mida approve devin.")
+      expect(lines.every((line) => !line.includes("Run mida approve devin to finish it"))).toBe(true)
+    } finally {
+      await rpc.close()
+    }
+  })
+})
+
+// Task 12 of the Windows port. The three checks that change on win32: a hook pointing at a
+// node.exe that is gone names the hook reinstall (Review Focus 3), Windows has no execute bit
+// to check, and a MIDA_HOME outside %USERPROFILE% earns a note because its ACL is unknown.
+describe("doctor on Windows", () => {
+  const HOOK_EVENTS = ["PostToolUse", "Stop", "StopFailure", "PreCompact", "SessionEnd"] as const
+  const INJECT_EVENTS = ["SessionStart", "UserPromptSubmit"] as const
+  const INJECT_SIBLING: Record<string, string> = { "mida-hook": "mida-inject", "mida-hook.js": "mida-inject.js", "hook-main.ts": "inject-main.ts" }
+
+  /** A real file doctor's parser reads as Mida's hook entry: the repo's own hook-main.ts. */
+  const existingScript = (): string => join(repo, "apps/midad/src/hook-main.ts")
+
+  /**
+   * A settings.json that reads as installed-but-stale so the hooks check walks the paths in it:
+   * the given hook entry under the five hook events, its inject sibling under the two prompt
+   * events, the shape a real install leaves.
+   */
+  const tempSettingsWithEntry = (entry: { type: "command"; command: string; args?: string[] }): string => {
+    const file = join(dir(), "settings.json")
+    const inject = {
+      ...entry,
+      args: entry.args?.map((arg, index) => {
+        const mapped = index < (entry.args?.length ?? 0) - 1 ? INJECT_SIBLING[basename(arg)] : undefined
+        return mapped === undefined ? arg : join(dirname(arg), mapped)
+      }),
+    }
+    const hooks: Record<string, unknown> = {}
+    for (const event of HOOK_EVENTS) hooks[event] = [{ hooks: [{ ...entry }] }]
+    for (const event of INJECT_EVENTS) hooks[event] = [{ hooks: [inject] }]
+    writeFileSync(file, `${JSON.stringify({ hooks }, null, 2)}\n`)
+    return file
+  }
+
+  const doctorLines = async (overrides: Partial<DoctorDeps> = {}): Promise<string[]> => {
+    const lines: string[] = []
+    await runDoctor({
+      home: new MidaHome(join(dir(), "home")),
+      print: (line) => lines.push(line),
+      env: {},
+      daemonProbeMs: 50,
+      ...overrides,
+    })
+    return lines
+  }
+
+  it("a hook pointing at a node.exe that is gone names the reinstall (Review Focus 3)", async () => {
+    const settings = tempSettingsWithEntry({ type: "command", command: "C:\\gone\\node.exe", args: [existingScript(), "claude-code"] })
+    const lines = await doctorLines({ platform: "win32", settings: { "claude-code": settings } })
+    expect(lines).toContain(
+      "PROBLEM: the Claude Code hooks run C:\\gone\\node.exe, which is gone (Node was moved or reinstalled) — run mida install claude-code again",
+    )
+  })
+
+  it("Windows has no execute bit: an existing script is fine", async () => {
+    // the program is a file with no execute bit: on any OS this only passes when doctor's
+    // Windows branch answers by existence alone, which is the behaviour under test
+    const program = join(dir(), "node.exe")
+    writeFileSync(program, "not a binary\n")
+    chmodSync(program, 0o644)
+    const settings = tempSettingsWithEntry({ type: "command", command: program, args: [existingScript(), "claude-code"] })
+    const lines = await doctorLines({ platform: "win32", settings: { "claude-code": settings } })
+    expect(lines.some((line) => line.includes("not executable"))).toBe(false)
+  })
+
+  it("a Mida folder outside the user folder gets a note", async () => {
+    const lines = await doctorLines({ platform: "win32", homeRoot: "D:\\mida", userProfile: "C:\\Users\\J" })
+    expect(lines).toContain(
+      "note: Mida's folder D:\\mida is outside your user folder, so Mida cannot vouch for who can read it. Move it under C:\\Users\\J or unset MIDA_HOME.",
+    )
+  })
+
+  it("the stop advice names taskkill on Windows, not the Unix kill", async () => {
+    // the same live-lock, dead-socket setup as the in-29 test; only the command changes
+    const home = new MidaHome(join(dir(), "home"))
+    const holder = spawnHolder("bundled")
+    home.writeSecretJson("midad.lock", { pid: holder.pid })
+    home.writeSecretJson("api-url.json", { baseUrl: "http://127.0.0.1:9" })
+    const lines = await doctorLines({ home, platform: "win32", settings: {} })
+    expect(lines).toContain(
+      `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with taskkill /PID ${holder.pid} /F, then open any agent session or run mida task to start a fresh one.`,
+    )
+    expect(lines.some((line) => line.includes(`kill ${holder.pid}`))).toBe(false)
   })
 })

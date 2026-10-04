@@ -185,3 +185,171 @@ describe("scanTranscript — the streamed typed-line pass (P-1)", () => {
     expect(scan.typed.length).toBeGreaterThan(0)
   })
 })
+
+// UF-C41B B2 — the same one streamed pass no longer renders steps at all. A
+// middle line whose RAW text holds the record mark is only marked: its line
+// number, byte offset and exact byte length, newest 4,096 kept plus a count of
+// them all. The reader then re-reads each marked line whole and decides what
+// the record really is — the scan itself never parses a middle line into rows,
+// so a mark inside a non-assistant record only ever costs the reader a re-read.
+describe("scanTranscript — the assistant's candidate lines in the unread middle (UF-C41B B2)", () => {
+  const user = (content: unknown) =>
+    JSON.stringify({ type: "user", message: { role: "user", content } })
+  const asst = (parts: unknown[]) =>
+    JSON.stringify({ type: "assistant", message: { content: parts } })
+  // A real Claude record carries "type" AFTER the whole message object — the
+  // mark sits at the line's far end, past any prefix a reader could cut.
+  const asstReal = (parts: unknown[]) =>
+    JSON.stringify({
+      parentUuid: "p",
+      isSidechain: false,
+      userType: "external",
+      cwd: "/w",
+      sessionId: "s",
+      version: "2.1.0",
+      gitBranch: "main",
+      message: { id: "msg_1", type: "message", role: "assistant", content: parts },
+      requestId: "req_1",
+      type: "assistant",
+      uuid: "u",
+      timestamp: "2026-10-01T00:00:00Z",
+    })
+
+  const offsets = (lines: string[]): number[] => {
+    const offs: number[] = []
+    let at = 0
+    for (const line of lines) {
+      offs.push(at)
+      at += Buffer.byteLength(line, "utf8") + 1
+    }
+    return offs
+  }
+
+  it("marks every middle line whose raw text holds the mark, in either key order", async () => {
+    const { scanTranscript } = await scanModule()
+    const { claudeScanHooks } = await claudeModule()
+    const raw = [
+      user("build it"),
+      asst([{ type: "tool_use", name: "Write", input: { file_path: "/p/a.ts", content: "code" } }]),
+      asstReal([{ type: "text", text: "said it plainly" }]),
+      user("tool output only"),
+      user("the tail"),
+    ]
+    const offs = offsets(raw)
+    const t = writeTranscript(tmpdir(), raw)
+    // middle = lines 2..4 — the request and the tail sit outside the range
+    const scan = scanTranscript!(t, claudeScanHooks!, undefined, { start: offs[1]!, end: offs[4]! })
+    expect(scan.stepCandidates).toEqual([
+      { line: 2, offset: offs[1]!, byteLen: Buffer.byteLength(raw[1]!, "utf8") },
+      { line: 3, offset: offs[2]!, byteLen: Buffer.byteLength(raw[2]!, "utf8") },
+    ])
+    expect(scan.stepsTotal).toBe(2)
+  })
+
+  it("a mark inside a record that is not an assistant one still marks the line — the reader decides", async () => {
+    const { scanTranscript } = await scanModule()
+    const { claudeScanHooks } = await claudeModule()
+    // a >256 KB user record with `"type":"assistant"` inside its toolUseResult
+    const line = JSON.stringify({
+      type: "user",
+      toolUseResult: { messages: [{ type: "assistant" }] },
+      message: { role: "user", content: "x".repeat(300_000) },
+    })
+    const raw = [user("req"), line, user("tail")]
+    const offs = offsets(raw)
+    const t = writeTranscript(tmpdir(), raw)
+    const scan = scanTranscript!(t, claudeScanHooks!, undefined, { start: offs[1]!, end: offs[2]! })
+    expect(scan.stepCandidates).toEqual([{ line: 2, offset: offs[1]!, byteLen: Buffer.byteLength(line, "utf8") }])
+    expect(scan.stepsTotal).toBe(1)
+    // and it is still counted too long to parse for the typed pass — unchanged
+    expect(scan.tooLong).toEqual([2])
+  })
+
+  it("the mark at the far end of an over-cap line still counts — no kept prefix is ever trusted", async () => {
+    const { scanTranscript } = await scanModule()
+    const { claudeScanHooks } = await claudeModule()
+    // real key order puts `"type":"assistant"` ~500 KB into the line, past the
+    // 4 KB prefix and past the line cap entirely
+    const line = asstReal([{ type: "tool_use", name: "Write", input: { file_path: "/p/big.ts", content: "C".repeat(500_000) } }])
+    const raw = [user("req"), line, user("tail")]
+    const offs = offsets(raw)
+    const t = writeTranscript(tmpdir(), raw)
+    const scan = scanTranscript!(t, claudeScanHooks!, undefined, { start: offs[1]!, end: offs[2]! })
+    expect(scan.stepCandidates).toEqual([{ line: 2, offset: offs[1]!, byteLen: Buffer.byteLength(line, "utf8") }])
+    expect(scan.stepsTotal).toBe(1)
+  })
+
+  it("a middle line without the mark is never a candidate", async () => {
+    const { scanTranscript } = await scanModule()
+    const { claudeScanHooks } = await claudeModule()
+    const raw = [user("req"), user(`PASTE ${"p".repeat(500_000)}`), user("tail")]
+    const offs = offsets(raw)
+    const t = writeTranscript(tmpdir(), raw)
+    const scan = scanTranscript!(t, claudeScanHooks!, undefined, { start: offs[1]!, end: offs[2]! })
+    expect(scan.stepCandidates).toEqual([])
+    expect(scan.stepsTotal).toBe(0)
+    // the typed-candidate path is unchanged: the over-cap user line still counts
+    expect(scan.tooLong).toEqual([2])
+  })
+
+  it("a line outside the middle bounds is never a candidate; with no bounds nothing is marked", async () => {
+    const { scanTranscript } = await scanModule()
+    const { claudeScanHooks } = await claudeModule()
+    const raw = [
+      user("req"),
+      asst([{ type: "tool_use", name: "Write", input: { file_path: "/p/a.ts", content: "c" } }]),
+      asst([{ type: "tool_use", name: "Read", input: { file_path: "/p/b.md" } }]),
+      asst([{ type: "tool_use", name: "Bash", input: { command: "ls" } }]),
+      user("tail"),
+    ]
+    const offs = offsets(raw)
+    const t = writeTranscript(tmpdir(), raw)
+    // only lines 2-3 count as unread — line 4's call was "seen"
+    const scan = scanTranscript!(t, claudeScanHooks!, undefined, { start: offs[1]!, end: offs[3]! })
+    expect(scan.stepCandidates.map((c) => c.line)).toEqual([2, 3])
+    expect(scan.stepsTotal).toBe(2)
+    const none = scanTranscript!(t, claudeScanHooks!)
+    expect(none.stepCandidates).toEqual([])
+    expect(none.stepsTotal).toBe(0)
+  })
+
+  it("typed and queued user lines are never candidates — they still reach the scan as typed", async () => {
+    const { scanTranscript } = await scanModule()
+    const { claudeScanHooks } = await claudeModule()
+    const raw = [
+      user("req"),
+      JSON.stringify({
+        type: "attachment",
+        attachment: { type: "queued_command", commandMode: "prompt", prompt: "QUEUED-MID change it", origin: { kind: "human" }, source_uuid: "sq-cap41" },
+      }),
+      user("TYPED-MID also this"),
+      user("tail"),
+    ]
+    const offs = offsets(raw)
+    const t = writeTranscript(tmpdir(), raw)
+    const scan = scanTranscript!(t, claudeScanHooks!, undefined, { start: offs[1]!, end: offs[3]! })
+    expect(scan.stepCandidates).toEqual([])
+    expect(scan.stepsTotal).toBe(0)
+    // they reach the scan as the user's own words instead — unchanged
+    expect(scan.typed.map((e) => e.text)).toEqual(["req", "QUEUED-MID change it", "TYPED-MID also this", "tail"])
+  })
+
+  it("keeps only the newest 4,096 marks and counts every marked line", async () => {
+    const { scanTranscript } = await scanModule()
+    const { claudeScanHooks } = await claudeModule()
+    const raw = [
+      user("req"),
+      ...Array.from({ length: 4_200 }, (_, i) => asstReal([{ type: "text", text: `s${i + 1}` }])),
+      user("tail"),
+    ]
+    const offs = offsets(raw)
+    const t = writeTranscript(tmpdir(), raw)
+    const scan = scanTranscript!(t, claudeScanHooks!, undefined, { start: offs[1]!, end: offs[raw.length - 1]! })
+    expect(scan.stepsTotal).toBe(4_200)
+    expect(scan.stepCandidates).toHaveLength(4_096)
+    // the kept marks are the newest: marked lines are 2..4201, so the kept
+    // window is lines 106..4201
+    expect(scan.stepCandidates[0]!.line).toBe(106)
+    expect(scan.stepCandidates.at(-1)!.line).toBe(4_201)
+  })
+})

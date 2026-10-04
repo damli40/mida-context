@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
+import type { SpawnOptions } from "node:child_process"
 
 /**
  * The six shipped entry points: the bin name the npm package exposes → the TypeScript source
@@ -51,6 +52,15 @@ export function siblingEntryArgs(name: SiblingEntry): string[] {
  */
 export function siblingEntryPath(name: SiblingEntry): string {
   return fileURLToPath(new URL(isBundled() ? `./${name}.js` : `./${ENTRIES[name]}`, import.meta.url))
+}
+
+/**
+ * The options every detached Mida process starts with: its own process group, no stdio, the Mida
+ * home as working directory, and no console window on Windows (without windowsHide a black window
+ * flashes up each time an agent session starts the service). windowsHide is ignored elsewhere.
+ */
+export function detachedSpawnOptions(cwd: string, env: NodeJS.ProcessEnv): SpawnOptions {
+  return { detached: true, stdio: "ignore", cwd, env, windowsHide: true }
 }
 
 /**

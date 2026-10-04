@@ -1,0 +1,58 @@
+claude-code is asking for:
+
+  project cfb7f7bf-f695-4daf-9244-00762480c231 (this folder)
+
+  profile.skills: READ
+
+  projects.current: READ + CREATE + SUPERSEDE_OWN
+
+  preferences.communication: READ
+
+  until 2026-11-02T19:51:25.000Z
+
+grant advisor: low risk; recommends 3 scope(s) until 2026-11-02T19:51:25.000Z
+
+codex is asking for:
+
+  project cfb7f7bf-f695-4daf-9244-00762480c231 (this folder)
+
+  profile.skills: READ
+
+  projects.current: READ + CREATE + SUPERSEDE_OWN
+
+  preferences.communication: READ
+
+  until 2026-11-02T19:51:27.000Z
+
+grant advisor: low risk; recommends 3 scope(s) until 2026-11-02T19:51:27.000Z
+
+It will see this context as plain text. Revoking later stops future reads, not what it already saw.
+
+
+
+Type yes to approve all: yes
+
+
+
+asking the chain what claude-code already holds�
+
+sending the grant (sponsored)�
+
+proving the grant on the chain�
+
+re-sending the read key to 1 agent�
+
+approved claude-code tx 0x8e5c8651dbfc74e4c28c0223f4b9d1fc747028852aba0b6a0745dabec40fdc68
+
+asking the chain what codex already holds�
+
+sending the grant (sponsored)�
+
+proving the grant on the chain�
+
+re-sending the read key to 2 agents�
+
+approved codex tx 0x0c89bc7646891bf33958a27dd63fdebdcf6c2c6d0207284779a7f2c4783787f3
+
+approved: claude-code, codex
+

@@ -1,0 +1,2 @@
+installed
+claude-code: MCP server not added. The claude command is not on your PATH; hooks are installed.

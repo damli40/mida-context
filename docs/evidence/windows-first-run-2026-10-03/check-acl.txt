@@ -1,0 +1,2 @@
+checked: C:\Users\runneradmin\.mida\owner\secrets.json
+checked: C:\Users\runneradmin\.mida\midad.sock.path

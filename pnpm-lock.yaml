@@ -344,6 +344,9 @@ importers:
       '@noble/hashes':
         specifier: 2.4.0
         version: 2.4.0
+      cross-spawn:
+        specifier: 7.0.6
+        version: 7.0.6
       viem:
         specifier: 2.56.3
         version: 2.56.3(typescript@5.9.3)(zod@4.5.4)
@@ -454,6 +457,9 @@ importers:
       '@mida/checkpoint':
         specifier: workspace:*
         version: link:../checkpoint
+      cross-spawn:
+        specifier: 7.0.6
+        version: 7.0.6
 
   packages/crypto:
     dependencies:

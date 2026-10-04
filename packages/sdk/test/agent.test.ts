@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest"
 import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { recoverTypedDataAddress, zeroHash } from "viem"
+import { TransactionReceiptNotFoundError, recoverTypedDataAddress, zeroHash } from "viem"
 import type { LocalAccount } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import {
@@ -196,6 +196,41 @@ describe("MidaAgent (plan Task 25)", () => {
     await expect(sdk.D!.completeAccessRequest({ ...request, capabilityExpiresAt: "1" }, response)).rejects.toMatchObject({ code: "RESPONSE_MISMATCH" })
     await expect(sdk.D!.completeAccessRequest(request, { ...response, requestId: hexOf(randomBytes(32)) })).rejects.toMatchObject({ code: "RESPONSE_MISMATCH" })
     expect((await sdk.D!.completeAccessRequest(request, response)).capabilities).toHaveLength(1)
+  })
+
+  // UF-APR3 A2: the receipt read inside completeAccessRequest proves the named transaction
+  // emitted the grant. Only "the chain has no such receipt" means the response is wrong; a
+  // dead RPC or a rate limit is the check itself failing, which must propagate so callers can
+  // tell "not this request's grant" from "could not look".
+  it("a receipt read error other than not-found aborts the check instead of answering RESPONSE_MISMATCH", async () => {
+    const chain = createWriteContext({ rpcUrl: node.rpcUrl, deployment, account: provisioned.D!.signer })
+    const agentD = new MidaAgent({
+      agentId: provisioned.D!.agentId,
+      callbackOrigin: provisioned.D!.callbackOrigin,
+      encryptionPrivateKey: provisioned.D!.encryptionPrivateKey,
+      chain,
+      api: apis.D!,
+    })
+    const request = await agentD.createAccessRequest({ purposeId: "career_coaching", scopes: [{ namespace: "goals.career", permissions: PERMISSION.READ }] })
+    const { response } = await vault.approveGrant({ accessRequest: request, manifest: provisioned.D!.manifest, selection: { kind: "recommended" } })
+
+    const receipts = vi.spyOn(chain.publicClient, "getTransactionReceipt")
+    // A receipt the chain does not have is still the refusal it always was.
+    receipts.mockRejectedValueOnce(new TransactionReceiptNotFoundError({ hash: response.capabilities[0]!.transactionHash }))
+    await expect(agentD.completeAccessRequest(request, response)).rejects.toMatchObject({ code: "RESPONSE_MISMATCH" })
+    // A network failure is not evidence against the response: it is rethrown, never re-coded.
+    receipts.mockRejectedValueOnce(new Error("the RPC is down"))
+    const caught = await agentD.completeAccessRequest(request, response).then(
+      () => null,
+      (error) => error as Error & { code?: string },
+    )
+    expect(caught).not.toBeNull()
+    expect(caught!.message).toContain("the RPC is down")
+    expect(caught!.code).not.toBe("RESPONSE_MISMATCH")
+    receipts.mockRestore()
+
+    // Neither failed check consumed the request: a healthy retry completes it.
+    expect((await agentD.completeAccessRequest(request, response)).capabilities).toHaveLength(1)
   })
 
   it("completes a request at most once even when two completions race", async () => {

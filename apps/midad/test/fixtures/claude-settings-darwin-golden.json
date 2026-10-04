@@ -1,0 +1,74 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<NODE> --import <ROOT>/node_modules/tsx/dist/loader.mjs <ROOT>/apps/midad/src/inject-main.ts claude-code"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<NODE> --import <ROOT>/node_modules/tsx/dist/loader.mjs <ROOT>/apps/midad/src/inject-main.ts claude-code"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<NODE> --import <ROOT>/node_modules/tsx/dist/loader.mjs <ROOT>/apps/midad/src/hook-main.ts claude-code"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<NODE> --import <ROOT>/node_modules/tsx/dist/loader.mjs <ROOT>/apps/midad/src/hook-main.ts claude-code"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<NODE> --import <ROOT>/node_modules/tsx/dist/loader.mjs <ROOT>/apps/midad/src/hook-main.ts claude-code"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<NODE> --import <ROOT>/node_modules/tsx/dist/loader.mjs <ROOT>/apps/midad/src/hook-main.ts claude-code"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "<NODE> --import <ROOT>/node_modules/tsx/dist/loader.mjs <ROOT>/apps/midad/src/hook-main.ts claude-code"
+          }
+        ]
+      }
+    ]
+  }
+}

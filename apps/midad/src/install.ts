@@ -1,12 +1,14 @@
-import { spawnSync } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
-import { basename, dirname, isAbsolute, join, sep } from "node:path"
+import crossSpawn from "cross-spawn"
+import { resolveBinary } from "@mida/compiler"
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { basename, dirname, isAbsolute, join, posix, sep, win32 } from "node:path"
 import { randomBytes } from "node:crypto"
 import { fileURLToPath } from "node:url"
 import { isDeepStrictEqual } from "node:util"
 import { isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
 import type { SiblingEntry } from "./sibling.js"
 import { DEVIN_INSTALLED_EVENTS } from "./devin-facts.js"
+import { isWindows } from "./platform.js"
 
 /**
  * The hook command text is exact and carries nothing else — no environment variable, no
@@ -54,6 +56,34 @@ export const MCP_SERVER_NAME: Record<McpClientTool, string> = {
 export const claudeDesktopConfigPath = (homeDir: string): string =>
   join(homeDir, "Library", "Application Support", "Claude", "claude_desktop_config.json")
 
+/**
+ * Every Claude Desktop config an install must write. Mac and Linux: the one file. Windows: the
+ * roaming config ALWAYS, plus the Microsoft Store build's own copy for every installed package.
+ * The Store app reads LocalCache\Roaming, not the roaming profile (claude-code issues 26073,
+ * 29100), so writing only the roaming file leaves a Store-installed Claude Desktop without Mida.
+ */
+export function claudeDesktopConfigPaths(
+  homeDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  list: (dir: string) => string[] = (dir) => readdirSync(dir),
+): string[] {
+  if (!isWindows(platform)) return [claudeDesktopConfigPath(homeDir)]
+  const roaming = env.APPDATA ?? win32.join(homeDir, "AppData", "Roaming")
+  const local = env.LOCALAPPDATA ?? win32.join(homeDir, "AppData", "Local")
+  const paths = [win32.join(roaming, "Claude", "claude_desktop_config.json")]
+  try {
+    for (const name of list(win32.join(local, "Packages"))) {
+      if (/^Claude_/i.test(name)) {
+        paths.push(win32.join(local, "Packages", name, "LocalCache", "Roaming", "Claude", "claude_desktop_config.json"))
+      }
+    }
+  } catch {
+    // no Packages folder: no Store build
+  }
+  return paths
+}
+
 /** Cursor reads <project>/.cursor/mcp.json — the install cwd is the workspace. */
 export const cursorMcpConfigPath = (cwd: string): string => join(cwd, ".cursor", "mcp.json")
 
@@ -66,13 +96,43 @@ export function mcpLauncherPath(): string {
   return fileURLToPath(new URL("../../../bin/mida-mcp", import.meta.url))
 }
 
+/** The mida-mcp script itself: the dist file when bundled, the .ts source in the repo. */
+export function mcpEntryScript(): string {
+  return siblingEntryPath("mida-mcp")
+}
+
+/**
+ * How a client starts Mida's tool server. Mac and Linux: the launcher by its own path. Windows:
+ * node.exe with the script as the first argument (a .js file cannot run by name there, and .cmd
+ * launchers fail in Codex: openai/codex issue 16229).
+ */
+export function mcpInvocation(platform: NodeJS.Platform = process.platform): { command: string; prefixArgs: string[] } {
+  if (!isWindows(platform)) return { command: mcpLauncherPath(), prefixArgs: [] }
+  return { command: process.execPath, prefixArgs: isBundled() ? [mcpEntryScript()] : siblingEntryArgs("mida-mcp") }
+}
+
+/**
+ * The path that IS Mida's server inside a client entry: the launcher's own path on Mac (the
+ * command itself), the script node runs on Windows (an element of args; the command is node.exe).
+ */
+const midaEntryScript = (entry: unknown): string | undefined => {
+  if (!isPlainObject(entry)) return undefined
+  if (typeof entry.command === "string" && fileName(entry.command).startsWith("mida-mcp")) return entry.command
+  const args = entry.args
+  if (!Array.isArray(args)) return undefined
+  return args.find(
+    (a): a is string => typeof a === "string" && (fileName(a).startsWith("mida-mcp") || fileName(a) === "mcp-main.ts"),
+  )
+}
+
 /** The entry written into the client's mcpServers — absolute launcher, own identity, its home. */
-function mcpServerEntry(client: McpClientTool, homeRoot: string, cwd: string): Record<string, unknown> {
+function mcpServerEntry(client: McpClientTool, homeRoot: string, cwd: string, platform: NodeJS.Platform = process.platform): Record<string, unknown> {
+  const { command, prefixArgs } = mcpInvocation(platform)
   return {
-    command: mcpLauncherPath(),
+    command,
     // Cursor substitutes ${workspaceFolder} itself; Claude Desktop has no workspace variable, so
     // its project is the folder `mida install` ran in
-    args: ["--as", client, "--project", client === "cursor" ? "${workspaceFolder}" : cwd],
+    args: [...prefixArgs, "--as", client, "--project", client === "cursor" ? "${workspaceFolder}" : cwd],
     env: { MIDA_HOME: homeRoot },
   }
 }
@@ -103,7 +163,17 @@ function readMcpConfig(configPath: string): { text: string; config: Record<strin
 function isMidaServerEntry(value: unknown, client: string, homeRoot: string | undefined): boolean {
   if (!isPlainObject(value)) return false
   const args = value.args
-  if (!Array.isArray(args) || args[0] !== "--as" || args[1] !== client) return false
+  if (!Array.isArray(args)) return false
+  // Windows entries lead with the script (and maybe a loader flag), so --as is not args[0]
+  // there. Whatever comes before it must be all strings and must include Mida's own script.
+  // a foreign server that happens to carry --as is not ours to touch.
+  const at = args.indexOf("--as")
+  if (at < 0 || args[at + 1] !== client) return false
+  const before = args.slice(0, at)
+  if (before.some((a) => typeof a !== "string")) return false
+  if (at > 0 && !before.some((a) => fileName(a as string).startsWith("mida-mcp") || fileName(a as string) === "mcp-main.ts")) {
+    return false
+  }
   return homeRoot === undefined || (isPlainObject(value.env) && value.env.MIDA_HOME === homeRoot)
 }
 
@@ -115,9 +185,9 @@ function isMidaServerEntry(value: unknown, client: string, homeRoot: string | un
  * refuses rather than overwrite a server someone else owns. An ours-but-stale entry reports
  * what moved — re-installing from another folder or checkout is silent about nothing.
  */
-export function installMcpClient(client: McpClientTool, configPath: string, homeRoot: string, cwd: string): McpInstallOutcome {
+export function installMcpClient(client: McpClientTool, configPath: string, homeRoot: string, cwd: string, platform: NodeJS.Platform = process.platform): McpInstallOutcome {
   const name = MCP_SERVER_NAME[client]
-  const entry = mcpServerEntry(client, homeRoot, cwd)
+  const entry = mcpServerEntry(client, homeRoot, cwd, platform)
   const read = readMcpConfig(configPath)
   if (read === "absent") {
     mkdirSync(dirname(configPath), { recursive: true })
@@ -140,8 +210,8 @@ export function installMcpClient(client: McpClientTool, configPath: string, home
   // name the field that moved: the project folder first, else the launcher path (a moved checkout)
   const projectOf = (value: unknown): unknown =>
     isPlainObject(value) && Array.isArray(value.args) ? value.args[value.args.indexOf("--project") + 1] : undefined
-  const from = projectOf(existing) !== projectOf(entry) ? projectOf(existing) : (existing as { command?: unknown }).command
-  const to = projectOf(existing) !== projectOf(entry) ? projectOf(entry) : entry.command
+  const from = projectOf(existing) !== projectOf(entry) ? projectOf(existing) : midaEntryScript(existing)
+  const to = projectOf(existing) !== projectOf(entry) ? projectOf(entry) : midaEntryScript(entry)
   return { moved: { from: String(from), to: String(to) } }
 }
 
@@ -176,7 +246,7 @@ export function installedMcpLauncherPath(client: McpClientTool, configPath: stri
   if (read === "absent") return undefined
   const entry = ((read.config.mcpServers ?? {}) as Record<string, unknown>)[MCP_SERVER_NAME[client]]
   if (!isMidaServerEntry(entry, client, homeRoot)) return undefined
-  return isPlainObject(entry) && typeof entry.command === "string" ? entry.command : undefined
+  return midaEntryScript(entry)
 }
 
 /**
@@ -186,8 +256,21 @@ export function installedMcpLauncherPath(client: McpClientTool, configPath: stri
 export type ClaudeCliResult = { status: number | null; error?: Error | undefined }
 export type ClaudeCliRunner = (args: string[]) => ClaudeCliResult
 
-/** The default runner — the real `claude` on PATH, inheriting this process's stdio. */
-export const spawnClaude: ClaudeCliRunner = (args) => spawnSync("claude", args, { stdio: "inherit" })
+/**
+ * The default runner: the real `claude` found on PATH, inheriting this process's stdio. The
+ * lookup is PATH-only: cross-spawn resolves a bare name against the current folder first on
+ * Windows, and a claude.cmd planted in a project Mida runs inside would execute. An unresolved
+ * name answers spawnSync's ENOENT, which callers report as "claude is not on your PATH".
+ */
+export const spawnClaude: ClaudeCliRunner = (args) => {
+  const binary = resolveBinary("claude", process.env.PATH)
+  if (binary === undefined) {
+    const error = new Error("spawn claude ENOENT") as Error & { code: string }
+    error.code = "ENOENT"
+    return { status: null, error }
+  }
+  return crossSpawn.sync(binary, args, { stdio: "inherit" })
+}
 
 /** spawnSync's ENOENT — the claude binary is not on this PATH. */
 const claudeUnavailable = (result: ClaudeCliResult): boolean =>
@@ -202,10 +285,11 @@ const claudeCliRemoveFailed = (status: number | null): string =>
  * launcher, this tool's --as identity, MIDA_HOME), with NO --project: the folder the agent
  * session runs in is the project.
  */
-export function claudeCodeMcpJson(homeRoot: string): string {
+export function claudeCodeMcpJson(homeRoot: string, platform: NodeJS.Platform = process.platform): string {
+  const { command, prefixArgs } = mcpInvocation(platform)
   return JSON.stringify({
-    command: mcpLauncherPath(),
-    args: ["--as", "claude-code"],
+    command,
+    args: [...prefixArgs, "--as", "claude-code"],
     env: { MIDA_HOME: homeRoot },
   })
 }
@@ -317,10 +401,15 @@ export function uninstallClaudeCodeMcp(opts: {
  * named fix is `mida install claude-code`, which adds the entry or refuses a foreign one out
  * loud.
  */
-export function claudeCodeMcpStatus(userConfig: string, home: string): "installed" | "outdated" | "not-installed" {
+export function claudeCodeMcpStatus(userConfig: string, home: string, platform: NodeJS.Platform = process.platform): "installed" | "outdated" | "not-installed" {
   const entry = claudeUserMidaEntry(userConfig)
   if (!isPlainObject(entry) || !isMidaServerEntry(entry, "claude-code", home)) return "not-installed"
-  return entry.command === mcpLauncherPath() ? "installed" : "outdated"
+  const launcher = midaEntryScript(entry)
+  const expected = isWindows(platform) ? mcpEntryScript() : mcpLauncherPath()
+  if (launcher !== expected) return "outdated"
+  // on Windows the command must be node itself; an entry that runs the script by name cannot start
+  if (isWindows(platform) && entry.command !== process.execPath) return "outdated"
+  return "installed"
 }
 
 /** The folders macOS hides from apps that lack Files and Folders access. */
@@ -383,25 +472,83 @@ const BARE_TOKEN = /^[A-Za-z0-9_@%+=:,./-]+$/
 const quoteToken = (token: string): string =>
   BARE_TOKEN.test(token) ? token : `"${token.replace(/(["\\$`])/g, "\\$1")}"`
 
+/** A file's name from a Mac, Linux or Windows path: both separators count. */
+export const fileName = (path: string): string => path.split(/[\\/]/).pop() ?? path
+
+/** True for an absolute path in either style: a Windows path read on a Mac test is still absolute. */
+const absoluteAnywhere = (path: string): boolean => posix.isAbsolute(path) || win32.isAbsolute(path)
+
+/** cmd.exe quoting for one token: a Windows path cannot contain a double quote, so wrapping is enough. */
+const quoteWindowsToken = (token: string): string => `"${token}"`
+
+/**
+ * PowerShell quoting for one token: single-quoted, a literal ' inside doubled. Codex runs a
+ * Windows hook line through powershell -Command (or pwsh), where a line that starts with a
+ * quoted path parses as a string, not a command. The call form `& '...'` runs it.
+ */
+const quotePowerShellToken = (token: string): string => `'${token.replace(/'/g, "''")}'`
+
+/**
+ * The program and arguments install writes for one entry. Windows cannot run a .js file by name
+ * (no shebangs), so there it is always node.exe plus the script, bundled or not.
+ */
+function invocationTokens(entry: SiblingEntry, platform: NodeJS.Platform): string[] {
+  if (isWindows(platform)) return [process.execPath, ...(isBundled() ? [siblingEntryPath(entry)] : siblingEntryArgs(entry))]
+  return isBundled() ? [siblingEntryPath(entry)] : [process.execPath, ...siblingEntryArgs(entry)]
+}
+
 /**
  * The invocation install writes for one entry: the entry file absolutely, runnable without
  * PATH. Bundled, the dist file itself is executable (shebang + 0o755 are built in). From the
  * source tree the file is TypeScript, so the command spells out node + the tsx loader — every
  * token still absolute.
  */
-function invocation(entry: SiblingEntry, tool: InstallTool): string {
-  const tokens = isBundled() ? [siblingEntryPath(entry)] : [process.execPath, ...siblingEntryArgs(entry)]
-  return `${tokens.map(quoteToken).join(" ")} ${tool}`
+function invocation(entry: SiblingEntry, tool: InstallTool, platform: NodeJS.Platform = process.platform): string {
+  const tokens = invocationTokens(entry, platform)
+  if (isWindows(platform) && tool === "codex") {
+    return `& ${tokens.map(quotePowerShellToken).join(" ")} ${tool}`
+  }
+  const quote = isWindows(platform) ? quoteWindowsToken : quoteToken
+  return `${tokens.map(quote).join(" ")} ${tool}`
 }
 
 /** The current hook command text for this install — absolute; what a fresh `mida install` writes. */
-export function hookCommand(tool: InstallTool): string {
-  return invocation("mida-hook", tool)
+export function hookCommand(tool: InstallTool, platform: NodeJS.Platform = process.platform): string {
+  return invocation("mida-hook", tool, platform)
 }
 
 /** The current inject command text for this install — absolute; what a fresh `mida install` writes. */
-export function injectCommand(tool: InstallTool): string {
-  return invocation("mida-inject", tool)
+export function injectCommand(tool: InstallTool, platform: NodeJS.Platform = process.platform): string {
+  return invocation("mida-inject", tool, platform)
+}
+
+/** One hook element's command as a JSON-configured client stores it. */
+export interface JsonHookEntry {
+  type: "command"
+  command: string
+  args?: string[]
+}
+
+/**
+ * What install writes for one hook in a JSON client. Claude Code on Windows gets the no-shell
+ * form (command + args): its plain command strings go through Git Bash or PowerShell, and Git
+ * Bash drops backslashes (claude-code issue 88578) while a failed hook shows nothing. Claude
+ * Code's hooks docs recommend exactly node + args on Windows. Everywhere else, and for Devin,
+ * the single command string stays as it is.
+ */
+export function jsonHookEntry(kind: "hook" | "inject", tool: InstallTool, platform: NodeJS.Platform = process.platform): JsonHookEntry {
+  const entry: SiblingEntry = kind === "hook" ? "mida-hook" : "mida-inject"
+  if (!(isWindows(platform) && tool === "claude-code")) return { type: "command", command: invocation(entry, tool, platform) }
+  const [program, ...rest] = invocationTokens(entry, platform)
+  return { type: "command", command: program!, args: [...rest, tool] }
+}
+
+/** A hook element as one command line parseMidaCommand reads; null when it is not a usable command. */
+export function hookEntryCommandLine(hook: unknown): string | null {
+  if (!isPlainObject(hook) || typeof hook.command !== "string") return null
+  if (hook.args === undefined) return hook.command
+  if (!Array.isArray(hook.args) || !hook.args.every((arg) => typeof arg === "string")) return null
+  return [hook.command, ...(hook.args as string[])].map(quoteWindowsToken).join(" ")
 }
 
 /**
@@ -423,10 +570,17 @@ const ENTRY_FILES: Record<"hook" | "inject", readonly string[]> = {
   inject: ["mida-inject", "mida-inject.js", "inject-main.ts"],
 }
 
-/** Splits a command line into tokens; double-quoted spans are kept whole, quotes stripped. */
+/**
+ * Splits a command line into tokens; quoted spans are kept whole and stripped. Reads the
+ * PowerShell call form too: a leading `& ` is the call operator, not a token, and inside a
+ * single-quoted token '' is one literal apostrophe.
+ */
 function commandTokens(command: string): string[] {
+  const line = command.startsWith("& ") ? command.slice(2) : command
   const tokens: string[] = []
-  for (const match of command.matchAll(/"([^"]*)"|(\S+)/g)) tokens.push(match[1] ?? match[2]!)
+  for (const match of line.matchAll(/"([^"]*)"|'((?:[^']|'')*)'|(\S+)/g)) {
+    tokens.push(match[1] ?? match[2]?.replace(/''/g, "'") ?? match[3]!)
+  }
   return tokens
 }
 
@@ -443,7 +597,7 @@ export function parseMidaCommand(command: unknown): ParsedHookCommand | null {
   if (tool === undefined || !(tool in HOOK_COMMAND)) return null
   for (const [index, token] of tokens.slice(0, -1).entries()) {
     for (const kind of ["hook", "inject"] as const) {
-      if (!ENTRY_FILES[kind].includes(basename(token))) continue
+      if (!ENTRY_FILES[kind].includes(fileName(token))) continue
       const paths: ParsedHookCommand["paths"] = []
       const program = tokens[0]!
       if (index === 0) {
@@ -451,7 +605,7 @@ export function parseMidaCommand(command: unknown): ParsedHookCommand | null {
         paths.push({ file: program, executable: true })
       } else {
         // node + loader + script — the program is checked executable, the script readable
-        if (isAbsolute(program)) paths.push({ file: program, executable: true })
+        if (absoluteAnywhere(program)) paths.push({ file: program, executable: true })
         paths.push({ file: token, executable: false })
       }
       return { kind, tool: tool as InstallTool, paths }
@@ -472,15 +626,13 @@ const JSON_HOOK_EVENTS: Record<"claude-code" | "devin", readonly string[]> = {
 }
 type JsonHookTool = keyof typeof JSON_HOOK_EVENTS
 
-/** The command each event carries: the inject command on the two prompt events, the capture hook on the rest. */
-function eventCommands(tool: JsonHookTool): Readonly<Record<string, string>> {
-  const inject = injectCommand(tool)
-  const hook = hookCommand(tool)
-  const commands: Record<string, string> = {}
+/** The hook entry each event carries: the inject entry on the two prompt events, the capture hook on the rest. */
+function eventEntries(tool: JsonHookTool, platform: NodeJS.Platform): Record<string, JsonHookEntry> {
+  const entries: Record<string, JsonHookEntry> = {}
   for (const event of JSON_HOOK_EVENTS[tool]) {
-    commands[event] = kindFor(event) === "inject" ? inject : hook
+    entries[event] = jsonHookEntry(kindFor(event), tool, platform)
   }
-  return commands
+  return entries
 }
 
 export type InstallOutcome = "installed" | "already-installed"
@@ -509,18 +661,17 @@ function settingsUnreadable(): Error {
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value)
 
-/** The one element install appends to an event's array: `{ hooks: [{ type: "command", command }] }`. */
-const hookElement = (command: string): Record<string, unknown> => ({
-  hooks: [{ type: "command", command }],
+/** The one element install appends to an event's array: `{ hooks: [<the entry>] }`. */
+const hookElement = (entry: JsonHookEntry): Record<string, unknown> => ({
+  hooks: [{ ...entry }],
 })
 
-/** True when the event's array already holds an element carrying this exact command string. */
-const eventHasCommand = (element: unknown, command: string): boolean => {
-  if (!isPlainObject(element) || !Array.isArray(element.hooks)) return false
-  return element.hooks.some(
-    (hook) => isPlainObject(hook) && hook.command === command,
-  )
-}
+/**
+ * True when a hook element IS this entry: same command and, for the exec form, the same args.
+ * Mac and Linux entries carry no args; both sides are undefined there and equal by it.
+ */
+const sameEntry = (hook: unknown, expected: JsonHookEntry): boolean =>
+  isPlainObject(hook) && hook.command === expected.command && isDeepStrictEqual(hook.args, expected.args)
 
 /** The indentation of the file being edited — the first indented line wins; two spaces otherwise. */
 function detectIndent(text: string): string | number {
@@ -577,38 +728,42 @@ function readSettings(settingsPath: string, events: readonly string[]): { text: 
  * leaves `<file>.mida-backup` holding the pre-install bytes; a later install never
  * overwrites an existing backup.
  */
-function installJsonHooks(settingsPath: string, tool: JsonHookTool): InstallOutcome {
-  const commands = eventCommands(tool)
+function installJsonHooks(settingsPath: string, tool: JsonHookTool, platform: NodeJS.Platform): InstallOutcome {
+  const entries = eventEntries(tool, platform)
   const events = JSON_HOOK_EVENTS[tool]
   const read = readSettings(settingsPath, events)
   if (read === "absent") {
     const hooks: Record<string, unknown> = {}
-    for (const event of events) hooks[event] = [hookElement(commands[event]!)]
+    for (const event of events) hooks[event] = [hookElement(entries[event]!)]
     mkdirSync(dirname(settingsPath), { recursive: true })
     writeFileAtomic(settingsPath, `${JSON.stringify({ hooks }, null, 2)}\n`)
     return "installed"
   }
   const { text, settings } = read
   const hooks = (settings.hooks ?? {}) as Record<string, unknown>
-  // For each event: rewrite any Mida command of the right kind that is not the current text
-  // (a bare `mida-hook <tool>` from an older install) and append where none exists. An
-  // element is ours to rewrite only when its command parses as Mida's FOR THIS TOOL — a
-  // `mida-hook claude-code` line inside Devin's config is a foreign entry and stays put;
-  // user entries are never edited, reordered or removed.
+  // For each event: rewrite any Mida entry of the right kind that is not the current one
+  // (a bare `mida-hook <tool>` from an older install, or a Mac command string read on
+  // Windows) and append where none exists. An element is ours to rewrite only when its
+  // command line parses as Mida's FOR THIS TOOL. A `mida-hook claude-code` line inside
+  // Devin's config is a foreign entry and stays put; user entries are never edited,
+  // reordered or removed.
   let changed = false
   for (const event of events) {
-    const expected = commands[event]!
+    const expected = entries[event]!
     let present = false
     for (const element of (hooks[event] ?? []) as unknown[]) {
       if (!isPlainObject(element) || !Array.isArray(element.hooks)) continue
       for (const hook of element.hooks as unknown[]) {
         if (!isPlainObject(hook)) continue
-        if (hook.command === expected) {
+        if (sameEntry(hook, expected)) {
           present = true
         } else {
-          const parsed = parseMidaCommand(hook.command)
+          const line = hookEntryCommandLine(hook)
+          const parsed = line === null ? null : parseMidaCommand(line)
           if (parsed !== null && parsed.tool === tool && parsed.kind === kindFor(event)) {
-            hook.command = expected
+            hook.command = expected.command
+            if (expected.args === undefined) delete hook.args
+            else hook.args = expected.args
             present = true
             changed = true
           }
@@ -631,13 +786,13 @@ function installJsonHooks(settingsPath: string, tool: JsonHookTool): InstallOutc
 }
 
 /** `mida install claude-code` — the JSON installer over Claude Code's settings.json. */
-export function installClaudeCode(settingsPath: string): InstallOutcome {
-  return installJsonHooks(settingsPath, "claude-code")
+export function installClaudeCode(settingsPath: string, platform: NodeJS.Platform = process.platform): InstallOutcome {
+  return installJsonHooks(settingsPath, "claude-code", platform)
 }
 
 /** `mida install devin` — the same installer over Devin's own config, its own events. */
 export function installDevin(configPath: string): InstallOutcome {
-  return installJsonHooks(configPath, "devin")
+  return installJsonHooks(configPath, "devin", process.platform)
 }
 
 /** Which sibling an event's command must invoke — inject on the two prompt events, hook on the rest. */
@@ -650,24 +805,24 @@ const kindFor = (event: string): "hook" | "inject" =>
  * (the bare name) — `mida install <tool>` rewrites it in place. "incomplete" covers a
  * missing hooks key and a partial install alike; an unreadable file is reported, never repaired.
  */
-function jsonHooksStatus(settingsPath: string, tool: JsonHookTool): "installed" | "outdated" | "incomplete" | "absent" | "unreadable" {
+function jsonHooksStatus(settingsPath: string, tool: JsonHookTool, platform: NodeJS.Platform): "installed" | "outdated" | "incomplete" | "absent" | "unreadable" {
   try {
     const events = JSON_HOOK_EVENTS[tool]
     const read = readSettings(settingsPath, events)
     if (read === "absent") return "absent"
     const hooks = (read.settings.hooks ?? {}) as Record<string, unknown>
-    const commands = eventCommands(tool)
+    const entries = eventEntries(tool, platform)
     let stale = 0
     for (const event of events) {
       let exact = false
       let ours = false
       for (const element of (hooks[event] ?? []) as unknown[]) {
-        if (eventHasCommand(element, commands[event]!)) exact = true
-        if (isPlainObject(element) && Array.isArray(element.hooks)) {
-          for (const hook of element.hooks as unknown[]) {
-            const parsed = isPlainObject(hook) ? parseMidaCommand(hook.command) : null
-            if (parsed !== null && parsed.tool === tool && parsed.kind === kindFor(event)) ours = true
-          }
+        if (!isPlainObject(element) || !Array.isArray(element.hooks)) continue
+        for (const hook of element.hooks as unknown[]) {
+          if (sameEntry(hook, entries[event]!)) exact = true
+          const line = hookEntryCommandLine(hook)
+          const parsed = line === null ? null : parseMidaCommand(line)
+          if (parsed !== null && parsed.tool === tool && parsed.kind === kindFor(event)) ours = true
         }
       }
       if (!exact && !ours) return "incomplete"
@@ -679,12 +834,12 @@ function jsonHooksStatus(settingsPath: string, tool: JsonHookTool): "installed" 
   }
 }
 
-export function claudeHooksStatus(settingsPath: string): ReturnType<typeof jsonHooksStatus> {
-  return jsonHooksStatus(settingsPath, "claude-code")
+export function claudeHooksStatus(settingsPath: string, platform: NodeJS.Platform = process.platform): ReturnType<typeof jsonHooksStatus> {
+  return jsonHooksStatus(settingsPath, "claude-code", platform)
 }
 
 export function devinHooksStatus(configPath: string): ReturnType<typeof jsonHooksStatus> {
-  return jsonHooksStatus(configPath, "devin")
+  return jsonHooksStatus(configPath, "devin", process.platform)
 }
 
 /**
@@ -704,7 +859,8 @@ export function midaCommandsInClaudeSettings(settingsPath: string): string[] | "
       for (const element of list) {
         if (!isPlainObject(element) || !Array.isArray(element.hooks)) continue
         for (const hook of element.hooks as unknown[]) {
-          if (isPlainObject(hook) && parseMidaCommand(hook.command) !== null) commands.push(hook.command as string)
+          const line = hookEntryCommandLine(hook)
+          if (line !== null && parseMidaCommand(line) !== null) commands.push(line)
         }
       }
     }
@@ -719,8 +875,11 @@ export function midaCommandsInDevinConfig(configPath: string): string[] | "absen
   return midaCommandsInClaudeSettings(configPath)
 }
 
-/** Ours whatever form it takes — the bare name from an older install or an absolute path. */
-const isMidaCommand = (command: unknown): boolean => parseMidaCommand(command) !== null
+/** Ours whatever form it takes: the bare name, an absolute path, or a Windows exec-form entry. */
+const isMidaCommand = (hook: unknown): boolean => {
+  const line = hookEntryCommandLine(hook)
+  return line !== null && parseMidaCommand(line) !== null
+}
 
 /**
  * What the pre-install backup says was there before the first change — the only record of which
@@ -760,7 +919,7 @@ export function uninstallClaudeCode(settingsPath: string): UninstallOutcome {
       if (!isPlainObject(element) || !Array.isArray(element.hooks)) return [element]
       const had = (element.hooks as unknown[]).length
       const inner = (element.hooks as unknown[]).filter(
-        (hook) => !(isPlainObject(hook) && isMidaCommand(hook.command)),
+        (hook) => !(isPlainObject(hook) && isMidaCommand(hook)),
       )
       removed += had - inner.length
       // an element is dropped only when removing our hooks emptied it — one that was already
@@ -857,14 +1016,20 @@ const tomlString = (value: string): string => `"${value.replace(/\\/g, "\\\\").r
  * the same launcher the file-config clients get, and carries NO --project: the folder the
  * agent session runs in is the project (mcp.ts defaults it to the process cwd).
  */
-export function codexBlock(options: { home?: string; mcp?: boolean } = {}): string {
+export function codexBlock(options: { home?: string; mcp?: boolean; platform?: NodeJS.Platform } = {}): string {
+  const platform = options.platform ?? process.platform
+  const windows = isWindows(platform)
+  // Every command line goes through tomlString: a path with a space makes the Mac and Linux
+  // shell quoting add double quotes of its own, and a raw "…" wrap would close the TOML string
+  // early. For a line with no " or \ inside, the bytes are identical either way.
+  const commandLine = (text: string): string => `command = ${tomlString(text)}`
   const lines = [CODEX_MARKER_OPEN]
   if (options.mcp !== false) {
     if (options.home === undefined) throw new Error("codexBlock needs the Mida home for the MCP table")
     lines.push(
       "[mcp_servers.mida]",
-      `command = ${tomlString(mcpLauncherPath())}`,
-      `args = ["--as", "codex"]`,
+      windows ? `command = ${tomlString(process.execPath)}` : `command = ${tomlString(mcpLauncherPath())}`,
+      windows ? `args = [${tomlString(siblingEntryPath("mida-mcp"))}, "--as", "codex"]` : `args = ["--as", "codex"]`,
       `env = { MIDA_HOME = ${tomlString(options.home)} }`,
       "",
     )
@@ -875,19 +1040,19 @@ export function codexBlock(options: { home?: string; mcp?: boolean } = {}): stri
     "",
     "[[hooks.SessionStart.hooks]]",
     'type = "command"',
-    `command = "${injectCommand("codex")}"`,
+    commandLine(injectCommand("codex", platform)),
     "",
     "[[hooks.UserPromptSubmit]]",
     "",
     "[[hooks.UserPromptSubmit.hooks]]",
     'type = "command"',
-    `command = "${injectCommand("codex")}"`,
+    commandLine(injectCommand("codex", platform)),
     "",
     "[[hooks.Stop]]",
     "",
     "[[hooks.Stop.hooks]]",
     'type = "command"',
-    `command = "${hookCommand("codex")}"`,
+    commandLine(hookCommand("codex", platform)),
     CODEX_MARKER_CLOSE,
   )
   return lines.join("\n")
@@ -912,8 +1077,16 @@ export const CODEX_TRUST_SENTENCE =
  */
 function codexOwnTables(): Set<string> {
   const tables = new Set<string>()
-  // every block shape this build writes — hooks+MCP, hooks-only, and the two legacy constants
-  for (const block of [codexBlock({ home: "", mcp: true }), codexBlock({ mcp: false }), CODEX_BLOCK, CODEX_BLOCK_V1]) {
+  // every block shape this build writes: hooks+MCP, hooks-only, their Windows forms, and the
+  // two legacy constants
+  for (const block of [
+    codexBlock({ home: "", mcp: true }),
+    codexBlock({ mcp: false }),
+    codexBlock({ home: "", mcp: true, platform: "win32" }),
+    codexBlock({ mcp: false, platform: "win32" }),
+    CODEX_BLOCK,
+    CODEX_BLOCK_V1,
+  ]) {
     for (const line of block.split("\n")) if (line.startsWith("[")) tables.add(line)
   }
   return tables
@@ -932,18 +1105,31 @@ function codexBlockShape(text: string): string | null {
   let inMcpTable = false
   for (const line of text.split("\n")) {
     if (line.startsWith("[")) inMcpTable = line === "[mcp_servers.mida]"
-    const command = /^command = "([^"]*)"$/.exec(line)
+    const command = /^command = "((?:[^"\\]|\\.)*)"$/.exec(line)
     if (command !== null) {
+      const value = command[1]!.replace(/\\(["\\])/g, "$1")
+      // inside the server table the command is the launcher itself, Mac's mida-mcp path, or
+      // Windows' node.exe; a hook line is ours when the unescaped command parses as Mida's
       const own = inMcpTable
-        ? basename(command[1]!).startsWith("mida-mcp")
-        : parseMidaCommand(command[1]!) !== null
+        ? fileName(value).startsWith("mida-mcp") || /^node(\.exe)?$/i.test(fileName(value))
+        : parseMidaCommand(value) !== null
       if (!own) return null
       out.push('command = ""')
       continue
     }
-    if (inMcpTable && /^env = \{ MIDA_HOME = "(?:[^"\\]|\\.)*" \}$/.test(line)) {
-      out.push('env = { MIDA_HOME = "" }')
-      continue
+    if (inMcpTable) {
+      // the Windows server table carries the script in args, so it must be ours too
+      const args = /^args = \["((?:[^"\\]|\\.)*)", "--as", "codex"\]$/.exec(line)
+      if (args !== null) {
+        const script = args[1]!.replace(/\\(["\\])/g, "$1")
+        if (!(fileName(script).startsWith("mida-mcp") || fileName(script) === "mcp-main.ts")) return null
+        out.push('args = ["", "--as", "codex"]')
+        continue
+      }
+      if (/^env = \{ MIDA_HOME = "(?:[^"\\]|\\.)*" \}$/.test(line)) {
+        out.push('env = { MIDA_HOME = "" }')
+        continue
+      }
     }
     out.push(line)
   }
@@ -959,6 +1145,8 @@ function codexBlockShape(text: string): string | null {
 const CODEX_SHAPE_V1 = codexBlockShape(CODEX_BLOCK_V1)
 const CODEX_SHAPE_HOOKS = codexBlockShape(codexBlock({ mcp: false }))
 const CODEX_SHAPE_MCP = codexBlockShape(codexBlock({ home: "" }))
+const CODEX_SHAPE_HOOKS_WIN = codexBlockShape(codexBlock({ mcp: false, platform: "win32" }))
+const CODEX_SHAPE_MCP_WIN = codexBlockShape(codexBlock({ home: "", platform: "win32" }))
 
 /** The MIDA_HOME a managed block's server table points at — null when it carries none. */
 function codexBlockMcpHome(core: string): string | null {
@@ -969,7 +1157,7 @@ function codexBlockMcpHome(core: string): string | null {
 }
 
 /** Finds a KNOWN managed block between its markers; "absent" when neither marker is present. */
-function locateCodexBlock(text: string):
+function locateCodexBlock(text: string, platform: NodeJS.Platform = process.platform):
   | {
       start: number
       end: number
@@ -1024,17 +1212,18 @@ function locateCodexBlock(text: string):
   // carry (a hand-added key like `timeout = 5`) is a human's edit and refuses (in-16 K-3).
   const shape = codexBlockShape(core)
   if (shape === null) throw settingsUnreadable()
-  if (shape === CODEX_SHAPE_MCP) {
+  if (shape === CODEX_SHAPE_MCP || shape === CODEX_SHAPE_MCP_WIN) {
     const mcpHome = codexBlockMcpHome(core)
     if (mcpHome === null) throw settingsUnreadable()
     // the only free value a well-formed current block carries is the home — rebuilding the
     // canonical block around it is a byte-compare of everything else (this build's commands,
-    // this build's launcher)
-    const version = core === codexBlock({ home: mcpHome }) ? "current" : "stale"
+    // this build's launcher). The compare is against THIS platform's block: a Mac block on
+    // Windows is stale, and install rewrites it to the platform's own form.
+    const version = core === codexBlock({ home: mcpHome, platform }) ? "current" : "stale"
     return { start, end, tailStart, version, foreignTail, core, mcpHome }
   }
-  if (shape === CODEX_SHAPE_HOOKS) {
-    const version = core === codexBlock({ mcp: false }) ? "no-mcp" : "stale"
+  if (shape === CODEX_SHAPE_HOOKS || shape === CODEX_SHAPE_HOOKS_WIN) {
+    const version = core === codexBlock({ mcp: false, platform }) ? "no-mcp" : "stale"
     return { start, end, tailStart, version, foreignTail, core, mcpHome: null }
   }
   if (shape === CODEX_SHAPE_V1) return { start, end, tailStart, version: "stale", foreignTail, core, mcpHome: null }
@@ -1176,9 +1365,10 @@ function codexMcpNameTaken(text: string): boolean {
  * make a duplicate and break the file, so the install refuses before a byte is written, the same
  * "is it ours" rule the JSON clients apply to a foreign "mida" name.
  */
-export function installCodex(configPath: string, options: { home: string; mcp?: boolean }): InstallOutcome {
+export function installCodex(configPath: string, options: { home: string; mcp?: boolean; platform?: NodeJS.Platform }): InstallOutcome {
+  const platform = options.platform ?? process.platform
   const text = existsSync(configPath) ? readFileSync(configPath, "utf8") : null
-  const block = text === null ? "absent" : locateCodexBlock(text)
+  const block = text === null ? "absent" : locateCodexBlock(text, platform)
   const outside = block === "absent" ? (text ?? "") : `${text!.slice(0, block.start)}${text!.slice(block.tailStart)}`
   if (codexMcpNameTaken(outside)) {
     throw new InstallRefusal(
@@ -1187,7 +1377,7 @@ export function installCodex(configPath: string, options: { home: string; mcp?: 
     )
   }
   const mcpHome = options.mcp !== false ? options.home : block !== "absent" ? block.mcpHome : null
-  const target = mcpHome === null ? codexBlock({ mcp: false }) : codexBlock({ home: mcpHome })
+  const target = mcpHome === null ? codexBlock({ mcp: false, platform }) : codexBlock({ home: mcpHome, platform })
   if (block !== "absent") {
     if (block.core === target) return "already-installed"
     // an older managed block is ours to replace in place — same outcome as a fresh append.
@@ -1220,10 +1410,10 @@ export function installCodex(configPath: string, options: { home: string; mcp?: 
  * both land there. "unreadable" means the markers wrap edited content — `mida install codex`
  * would refuse the file too.
  */
-export function codexHooksStatus(configPath: string): "installed" | "outdated" | "absent" | "unreadable" {
+export function codexHooksStatus(configPath: string, platform: NodeJS.Platform = process.platform): "installed" | "outdated" | "absent" | "unreadable" {
   try {
     if (!existsSync(configPath)) return "absent"
-    const block = locateCodexBlock(readFileSync(configPath, "utf8"))
+    const block = locateCodexBlock(readFileSync(configPath, "utf8"), platform)
     if (block === "absent") return "absent"
     // a hooks-only block carries the same current commands — the missing server table is a
     // MCP-status concern, not a hook concern
@@ -1240,10 +1430,10 @@ export function codexHooksStatus(configPath: string): "installed" | "outdated" |
  * recognise but do not own byte-for-byte; "absent" and "unreadable" mean the same as the hooks
  * status — there is no block, or the block refuses to be read as ours.
  */
-export function codexMcpStatus(configPath: string, home: string): "installed" | "not-installed" | "absent" | "unreadable" {
+export function codexMcpStatus(configPath: string, home: string, platform: NodeJS.Platform = process.platform): "installed" | "not-installed" | "absent" | "unreadable" {
   try {
     if (!existsSync(configPath)) return "absent"
-    const block = locateCodexBlock(readFileSync(configPath, "utf8"))
+    const block = locateCodexBlock(readFileSync(configPath, "utf8"), platform)
     if (block === "absent") return "absent"
     if (block.mcpHome === null) return "not-installed"
     return block.version === "current" && block.mcpHome === home ? "installed" : "not-installed"
@@ -1267,8 +1457,8 @@ export function codexHookCommands(configPath: string): string[] | "absent" | "un
     let inMcpTable = false
     for (const line of block.core.split("\n")) {
       if (line.startsWith("[")) inMcpTable = line === "[mcp_servers.mida]"
-      const command = /^command = "([^"]*)"$/.exec(line)
-      if (command !== null && !inMcpTable) commands.push(command[1]!)
+      const command = /^command = "((?:[^"\\]|\\.)*)"$/.exec(line)
+      if (command !== null && !inMcpTable) commands.push(command[1]!.replace(/\\(["\\])/g, "$1"))
     }
     return commands
   } catch {
@@ -1288,8 +1478,8 @@ export function midaCommandsInCodexConfig(configPath: string): string[] | "absen
     const block = locateCodexBlock(text)
     if (block === "absent") return "absent"
     const commands: string[] = []
-    for (const match of text.slice(block.start, block.tailStart).matchAll(/command = "([^"]*)"/g)) {
-      commands.push(match[1]!)
+    for (const match of text.slice(block.start, block.tailStart).matchAll(/command = "((?:[^"\\]|\\.)*)"/g)) {
+      commands.push(match[1]!.replace(/\\(["\\])/g, "$1"))
     }
     return commands
   } catch {
