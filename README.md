@@ -166,8 +166,8 @@ and show you the answer before you go on. The next block it cannot do for you.
 `mida init` asks one question: who writes your summaries. Press Enter to use your agents' own
 small models, or choose your own API key. It asks only in a terminal, and only when nothing has
 chosen yet; `mida summarizer` shows the current choice at any time.
-[Who writes the summaries](#who-writes-the-summaries) says who reads your chat in each case. Add
-`--passkey` to approve with a passkey.
+[Who writes the summaries](#who-writes-the-summaries) says who reads your chat in each case. To own
+your Mida with a passkey instead of a key file, see [Owner key or passkey](#owner-key-or-passkey).
 
 `mida init` sets up three identities: `claude-code`, `codex`, and a general one called `assistant`
 that never gets access to a project. At this point `mida doctor` prints two PROBLEM lines, because
@@ -199,6 +199,31 @@ mida revoke codex               # codex's future reads are refused, on chain
 
 The full walkthrough, with the expected output of every step, is
 [`docs/quickstart.md`](docs/quickstart.md).
+
+### Owner key or passkey
+
+**The default, `mida init`, never uses a passkey.** Your owner key is a file on your computer
+(`~/.mida/owner/`). You approve and revoke agents in the terminal by typing `yes`. The quickstart
+above and the demo use this setup.
+
+**Passkey mode, `mida init --passkey`.** Your owner key is a passkey on your device (for example
+Touch ID or Face ID) and never sits on disk. You touch it only for owner decisions:
+
+1. **Signing up:** once, when you create your owner on [app.midacontext.xyz](https://app.midacontext.xyz).
+2. **Approving an agent:** you see the request in the terminal and type `yes`, then the passkey page
+   asks for one touch per agent. With `mida approve --all` it is still one `yes` in the terminal, then
+   one touch for each agent.
+3. **Revoking an agent:** on the same page.
+4. **Viewing your records** at [app.midacontext.xyz/me](https://app.midacontext.xyz/me), through
+   "Sign in with passkey".
+
+Agents never use your passkey. They save and read with their own keys, so saves, handoffs and
+`Continue.` work the same in both modes. In passkey mode Monad checks your device's signature on each
+approval itself, through its P256 precompile, so the approval is signed by you, not by Mida's server.
+
+Tested live once so far: a passkey owner on a Mac, in Safari
+([evidence](docs/evidence/m3-passkey-live-2026-09-22.json)). Not available in passkey mode yet:
+`mida export`, which supports key-file setups only in this version.
 
 **Updating.** Run `npm install -g mida-context@latest`, then `mida doctor`. Doctor replaces the
 background service the old version left running; if that service is finishing a save, doctor waits
