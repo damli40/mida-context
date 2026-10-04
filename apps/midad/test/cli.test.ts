@@ -2652,6 +2652,46 @@ describe("approve says when an approval is on chain but not recorded (UF-AP)", (
     expect(lines.every((line) => !line.includes("did not answer in time"))).toBe(true)
   }, 300_000)
 
+  // UF-014 B3: a rate-limited sponsor is not "send MON" — the same command a minute later is
+  // the fix. Single approve names itself, the batch names `mida approve --all`.
+  it("a rate-limited sponsor on approve says run the same approve again", async () => {
+    expect(await run("add-agent", "busyone")).toBe(0)
+    expect(await run("request", "busyone")).toBe(0)
+    const spy = spyOnOpen((runtime) => {
+      const vault = runtime.vault as unknown as { approveGrant: (input: never) => Promise<unknown> }
+      vault.approveGrant = (async () => {
+        throw new MidaError("OWNER_WALLET_LOW", "the gas sponsor did not pay (the chain RPC stayed rate-limited through 3 retries); your wallet holds 0.0000 MON but this transaction needs up to 0.1830 MON — 0.1830 MON short")
+      }) as never
+    })
+    lines.length = 0
+    expect(await run("approve", "busyone")).toBe(1)
+    spy.mockRestore()
+    expect(lines).toContain(
+      "Monad testnet is busy: the gas sponsor's requests were rate-limited, and your wallet has no MON to pay instead. Run mida approve busyone again in a minute; Mida checks the chain first and sends only what is still missing.",
+    )
+    expect(lines.every((line) => !line.includes("send at least 0.5 testnet MON"))).toBe(true)
+    home.remove("agents/busyone/pending-request.json")
+  }, 300_000)
+
+  it("a rate-limited sponsor on approve --all says run approve --all again", async () => {
+    expect(await run("add-agent", "busyall")).toBe(0)
+    expect(await run("request", "busyall")).toBe(0)
+    const spy = spyOnOpen((runtime) => {
+      const vault = runtime.vault as unknown as { approveGrant: (input: never) => Promise<unknown> }
+      vault.approveGrant = (async () => {
+        throw new MidaError("OWNER_WALLET_LOW", "the gas sponsor did not pay (the chain RPC stayed rate-limited through 3 retries); your wallet holds 0.0000 MON but this transaction needs up to 0.1830 MON — 0.1830 MON short")
+      }) as never
+    })
+    lines.length = 0
+    expect(await run("approve", "--all")).toBe(1)
+    spy.mockRestore()
+    expect(lines).toContain(
+      "Monad testnet is busy: the gas sponsor's requests were rate-limited, and your wallet has no MON to pay instead. Run mida approve --all again in a minute; Mida checks the chain first and sends only what is still missing.",
+    )
+    expect(lines.every((line) => !line.includes("send at least 0.5 testnet MON"))).toBe(true)
+    home.remove("agents/busyall/pending-request.json")
+  }, 300_000)
+
   it("an ordinary already-approved approve prints none of the new lines", async () => {
     lines.length = 0
     expect(await run("approve", "codex")).toBe(0)
@@ -2790,4 +2830,55 @@ describe("approve says when an approval is on chain but not recorded (UF-AP)", (
     expect(await run2("approve", "unlisted")).toBe(0)
     expect(lines.some((line) => line.startsWith("unlisted is already approved on chain"))).toBe(true)
   }, 300_000)
+})
+
+/**
+ * UF-014 B3 — a busy testnet is not "send MON". When the public Monad RPC rate-limits the gas
+ * sponsor through its retries, Mida falls back to the owner's own wallet, which is empty, and
+ * the command fails OWNER_WALLET_LOW. Running the same command a minute later is the recovery
+ * (each of init/approve checks the chain first and sends only what is still missing), so the
+ * line says that instead of asking for MON. Every other OWNER_WALLET_LOW keeps today's answer.
+ */
+describe("a busy testnet tells the owner to run the command again (UF-014 B3)", () => {
+  const walletShort = "your wallet holds 0.0000 MON but this transaction needs up to 0.1830 MON — 0.1830 MON short"
+  const low = (reason: string | undefined) =>
+    new MidaError("OWNER_WALLET_LOW", reason === undefined ? walletShort : `the gas sponsor did not pay (${reason}); ${walletShort}`)
+  const rateLimited = () => low("the chain RPC stayed rate-limited through 3 retries")
+
+  it("init failing on a rate-limited sponsor says run init again, not send MON", () => {
+    expect(ownerRefusalLine("init", "", rateLimited(), "0xabc")).toBe(
+      "Monad testnet is busy: the gas sponsor's requests were rate-limited, and your wallet has no MON to pay instead. Run mida init again in a minute; Mida checks the chain first and sends only what is still missing.",
+    )
+  })
+
+  it("approve failing on a rate-limited sponsor names the same approve as the fix", () => {
+    expect(ownerRefusalLine("approve", "codex", rateLimited())).toBe(
+      "Monad testnet is busy: the gas sponsor's requests were rate-limited, and your wallet has no MON to pay instead. Run mida approve codex again in a minute; Mida checks the chain first and sends only what is still missing.",
+    )
+  })
+
+  it("approve --all names the batch command, per agent and for a whole-batch failure", () => {
+    expect(ownerRefusalLine("approve --all", "codex", rateLimited())).toBe(
+      "Monad testnet is busy: the gas sponsor's requests were rate-limited, and your wallet has no MON to pay instead. Run mida approve --all again in a minute; Mida checks the chain first and sends only what is still missing.",
+    )
+    expect(ownerRefusalLine("approve", "--all", rateLimited())).toBe(
+      "Monad testnet is busy: the gas sponsor's requests were rate-limited, and your wallet has no MON to pay instead. Run mida approve --all again in a minute; Mida checks the chain first and sends only what is still missing.",
+    )
+  })
+
+  it("any other sponsor reason keeps today's answer", () => {
+    expect(ownerRefusalLine("approve", "codex", low("The request timed out."))).toBe(
+      `the gas sponsor did not pay (The request timed out.); ${walletShort}`,
+    )
+    expect(ownerRefusalLine("init", "", low("The request timed out."), "0xabc")).toBe(
+      "your owner wallet cannot pay for the setup — send at least 0.5 testnet MON to this address, then run `mida init` again: 0xabc",
+    )
+  })
+
+  it("a plain low wallet with no sponsor reason keeps today's answer", () => {
+    expect(ownerRefusalLine("approve", "codex", low(undefined))).toBe(walletShort)
+    expect(ownerRefusalLine("init", "", low(undefined), "0xabc")).toBe(
+      "your owner wallet cannot pay for the setup — send at least 0.5 testnet MON to this address, then run `mida init` again: 0xabc",
+    )
+  })
 })
