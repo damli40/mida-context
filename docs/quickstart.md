@@ -7,6 +7,7 @@ Each step ends with a status line. **Live** means it ran on Monad testnet with r
 ## 0. What you need
 
 - Node.js 22 or later (`node --version`)
+- On Windows: PowerShell or Windows Terminal for every command, and Claude Code 2.1.139 or later (`claude --version`); the README's "On Windows" note says why
 - Codex and/or Claude Code installed (the hooks work with either; the demo uses Codex then Claude Code)
 - A model to write the summaries. Claude Code or Codex being installed is enough: Mida uses their own small models, and step 2 asks you to confirm. With neither, step 2 lets you give an API key
 - Nothing else — the hosted store (`store.midacontext.xyz`) and gas sponsor (`sponsor.midacontext.xyz`) are the defaults, so no testnet MON is needed on the happy path
@@ -25,6 +26,9 @@ pnpm install && pnpm build:publish
 cd publish/cli && npm pack
 npm install -g mida-context-0.1.3.tgz
 ```
+
+This needs pnpm (`npm install -g pnpm`). Windows PowerShell does not accept `&&`: run `pnpm install`,
+`pnpm build:publish`, `cd publish/cli` and `npm pack` on separate lines.
 
 Expected output (the file count may differ; the bin links are the point):
 
@@ -621,7 +625,7 @@ With no saved choice, a key in the environment decides: DeepSeek, then Kimi, the
 
 | Provider | You set | Model | Measured on the same transcript |
 |---|---|---|---|
-| **DeepSeek — default** | `DEEPSEEK_API_KEY` | `deepseek-flash` | **7.9 s median**, 15/15 checks, 3/3 runs |
+| **DeepSeek (first when its key is set)** | `DEEPSEEK_API_KEY` | `deepseek-flash` | **7.9 s median**, 15/15 checks, 3/3 runs |
 | Kimi | `KIMI_API_KEY` | `kimi-k2.7-code-highspeed` | 10.4 s median, 15/15, 3/3 |
 | Claude Haiku | nothing — uses your `claude` CLI login | `claude-haiku` | 22.6 s median, 15/15, 3/3 |
 
@@ -654,7 +658,7 @@ The honest limit: Mida cannot judge a custom model's output quality. The benchma
 | Gas sponsor | `https://sponsor.midacontext.xyz` | `MIDA_SPONSOR_URL` | wallets pay their own gas (testnet MON needed) |
 | Mida home | `~/.mida` | `MIDA_HOME` | — |
 | Monad testnet RPC | public endpoint | `MONAD_TESTNET_RPC` | — |
-| Compile model | `deepseek` if `DEEPSEEK_API_KEY` is set, else `kimi`, else `claude-haiku` | `MIDA_COMPILE_MODEL` | — |
+| Compile model | your saved choice (`mida summarizer`); with none saved, `deepseek` if `DEEPSEEK_API_KEY` is set, else `kimi` if `KIMI_API_KEY` is set, else your agents' small models | `MIDA_COMPILE_MODEL` | — |
 
 `mida doctor` shows which are in effect — host names only, never values that could be secrets.
 
@@ -705,7 +709,7 @@ the handoff, and the next session asks again. If it keeps happening, run `mida d
 
 **`mida doctor`: "PROBLEM: the Mida service (pid <pid>) is running but has not answered for 5 s".**
 The service is either busy or lost its socket file. Run `mida doctor` again in a minute; if the line is still there,
-run `kill <pid>`. The next agent session, or `mida task`, starts a fresh service, which sends the saves still waiting in the queue.
+run `kill <pid>` (on Windows, `taskkill /PID <pid> /F`). The next agent session, or `mida task`, starts a fresh service, which sends the saves still waiting in the queue.
 
 **`mida doctor`: "PROBLEM: midad.lock names pid <pid>, which is no longer the Mida process that took the lock".**
 The last Mida service did not exit cleanly, and another program now has its process number. Open any agent session or
@@ -716,7 +720,8 @@ Another terminal is running a `mida` command, often one waiting for you to type 
 agent session, or `mida task`, then starts the service.
 
 **`mida doctor`: "PROBLEM: midad.lock names pid <pid>, and doctor cannot tell whether that process is still Mida".**
-Doctor could not read this machine's process list. Run `ps -p <pid> -o command=`. If the command is not Mida, delete
+Doctor could not read this machine's process list. Run `ps -p <pid> -o command=` (on Windows,
+`Get-CimInstance Win32_Process -Filter "ProcessId=<pid>" | Select-Object CommandLine`). If the command is not Mida, delete
 the `midad.lock` file doctor names, then open any agent session or run `mida task`.
 
 **`mida doctor`: "midad runs … @ <old commit>; this command runs … @ <new commit>".**

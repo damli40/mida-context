@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Monad-testnet%2010143-836EF9?style=flat-square&labelColor=14130F" alt="Monad testnet, chain 10143">
   <img src="https://img.shields.io/badge/status-pre--release-b08800?style=flat-square&labelColor=14130F" alt="Pre-release">
-  <img src="https://img.shields.io/badge/tests-3%2C712%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,712 tests passing">
+  <img src="https://img.shields.io/badge/tests-3%2C978%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,978 tests passing">
   <img src="https://img.shields.io/badge/audit-none-7e8c86?style=flat-square&labelColor=14130F" alt="Not audited">
   <img src="https://img.shields.io/badge/license-MIT-7e8c86?style=flat-square&labelColor=14130F" alt="MIT license">
 </p>
@@ -156,7 +156,12 @@ mida doctor                     # one line per check; a PROBLEM line says what i
 **On Windows,** run the same commands in PowerShell or Windows Terminal. Claude Code needs version
 2.1.139 or later there: Mida writes its hooks in the form that runs without a shell, and older
 versions skip it. Codex runs hooks through PowerShell, and Mida writes them that way; trust them
-once with `/hooks` as on a Mac.
+once with `/hooks` as on a Mac. In the rare Codex session that runs hooks through `cmd.exe`
+instead, Mida's hooks do not run.
+
+**If an agent sets Mida up for you,** it can run the five commands above. `mida init` cannot ask its
+one question from an agent's shell, so the default applies: ask the agent to run `mida summarizer`
+and show you the answer before you go on. The next block it cannot do for you.
 
 `mida init` asks one question: who writes your summaries. Press Enter to use your agents' own
 small models, or choose your own API key. It asks only in a terminal, and only when nothing has
@@ -168,7 +173,8 @@ chosen yet; `mida summarizer` shows the current choice at any time.
 that never gets access to a project. At this point `mida doctor` prints two PROBLEM lines, because
 neither agent has asked for access yet. The next block fixes that.
 
-Then, inside your project folder, in a real terminal window:
+Then, inside your project folder, in a real terminal window, run these four yourself, one after
+another (a request lasts 5 minutes):
 
 ```bash
 mida request claude-code
@@ -205,10 +211,24 @@ up to a minute for it.
 <details>
 <summary>Install from source instead</summary>
 
+You need pnpm (`npm install -g pnpm`).
+
 ```bash
 git clone --recurse-submodules https://github.com/damli40/mida-context && cd mida-context
 pnpm install && pnpm build:publish
 cd publish/cli && npm pack && npm install -g mida-context-0.1.3.tgz
+```
+
+Windows PowerShell does not accept `&&`, so there it is one command per line:
+
+```powershell
+git clone --recurse-submodules https://github.com/damli40/mida-context
+cd mida-context
+pnpm install
+pnpm build:publish
+cd publish/cli
+npm pack
+npm install -g mida-context-0.1.3.tgz
 ```
 
 </details>
@@ -480,7 +500,10 @@ npm uninstall -g mida-context
 ```
 
 Stop the background service before you uninstall the package; left alone, it keeps running until
-you restart your machine. There is no `mida stop` command yet.
+you restart your machine. There is no `mida stop` command yet. On Windows, `pgrep` does not exist:
+find the service's number with
+`Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object CommandLine -like '*midad*' | Select-Object ProcessId`
+and stop it with `taskkill /PID <number> /F`. Mida's folder there is `%USERPROFILE%\.mida`.
 
 Three things stay until you delete them: `~/.mida` on your machine (your keys, the queue and the
 logs), the `.mida` folder in each project, and the encrypted records in the store. Records of who
