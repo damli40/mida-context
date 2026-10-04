@@ -1,0 +1,2 @@
+{"at":"2026-10-04T05:21:04.535Z","agent":"claude-code","event":"Stop","sessionId":"ci-capture","outcome":"enqueued","jobId":"2026-10-04T05-21-04.526Z-774fcd46","ms":24}
+{"at":"2026-10-04T05:21:05.187Z","agent":"claude-code","event":"Stop","sessionId":"ci-capture-direct","outcome":"enqueued","jobId":"2026-10-04T05-21-05.175Z-e9af3808","ms":23}

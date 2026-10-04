@@ -135,9 +135,10 @@ grants the user signed; your app never holds the user's owner keys. Full referen
 
 ## Quickstart
 
-**You need:** macOS or Linux, Node.js 22 or later, and Claude Code and/or Codex. Windows is not
-supported yet. Nearly all our live runs are on macOS; Linux has one
-[first run](docs/evidence/linux-first-run-2026-10-02.md) on Ubuntu, without an agent. By default Mida uses a hosted encrypted store and a gas sponsor, so you need no
+**You need:** macOS, Linux or Windows, Node.js 22 or later, and Claude Code and/or Codex. Nearly
+all our live runs are on macOS. Linux has one [first run](docs/evidence/linux-first-run-2026-10-02.md)
+on Ubuntu and Windows one [end-to-end run](docs/evidence/windows-first-run-2026-10-04.md) on
+GitHub's Windows machine, both without an agent on the machine. By default Mida uses a hosted encrypted store and a gas sponsor, so you need no
 testnet tokens. A setup made before the sponsor existed joins it with `mida sponsor on`.
 
 Mida needs a model to write its summaries. With Claude Code or Codex installed and logged in, it
@@ -151,6 +152,11 @@ mida install claude-code        # hooks, plus Mida's MCP tools so a session can 
 mida install codex              # the same; then open Codex once, type /hooks, and trust the Mida entries
 mida doctor                     # one line per check; a PROBLEM line says what is wrong
 ```
+
+**On Windows,** run the same commands in PowerShell or Windows Terminal. Claude Code needs version
+2.1.139 or later there: Mida writes its hooks in the form that runs without a shell, and older
+versions skip it. Codex runs hooks through PowerShell, and Mida writes them that way; trust them
+once with `/hooks` as on a Mac.
 
 `mida init` asks one question: who writes your summaries. Press Enter to use your agents' own
 small models, or choose your own API key. It asks only in a terminal, and only when nothing has
@@ -221,6 +227,9 @@ cd publish/cli && npm pack && npm install -g mida-context-0.1.3.tgz
 Each client gets its own identity, so you approve and revoke them one at a time. `mida install
 <client>` writes the configuration for you, the MCP server included; for Claude Code and Codex, `--no-mcp` leaves it out. ChatGPT chats are not supported: they cannot run local
 hooks or a local MCP server.
+
+Mida does not save `claude -p` runs, the one-off Claude Code calls a script makes in your project
+folder. Set `MIDA_CAPTURE_HEADLESS=1` in the environment that starts them if you want them saved.
 
 ---
 
@@ -493,6 +502,7 @@ you included. `mida export <folder>` writes a readable copy first.
 | Passkey owner: sign-up and approve in the browser | ✅ Live, Sep 22 ([evidence](docs/evidence/m3-passkey-live-2026-09-22.json)) |
 | Hosted store and gas sponsor | ✅ Live |
 | Linux: install, set up, approve, save, hand off, revoke | ✅ One run on Ubuntu, Oct 2, with no agent on the machine ([evidence](docs/evidence/linux-first-run-2026-10-02.md)) |
+| Windows: install, set up, approve, the hook entries Claude Code and Codex run (Codex's through PowerShell), Claude Desktop's tool server, save, hand off, revoke | ✅ One run on GitHub's Windows machine, Oct 4, with no agent on the machine ([evidence](docs/evidence/windows-first-run-2026-10-04.md)). No real agent has run on Windows yet |
 | Batching: saves anchored by Mida's batcher, gas sponsored | ✅ Live for invited owners, Sep 29 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | A change of plan you make mid-session reaches the next agent, credited to you | ✅ 6 of 6 on a real model, was 0 of 6 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | A new session in a busy project reads every save in batched chain calls: 155 saves in 5.1 s, where it used to time out | ✅ Live, Sep 29 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
@@ -506,7 +516,7 @@ you included. `mida export <folder>` writes a readable copy first.
 | npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
 | Security audit | ❌ None |
 
-3,712 automated tests pass on this release: `pnpm test`.
+3,978 automated tests pass on this release: `pnpm test`.
 
 ---
 

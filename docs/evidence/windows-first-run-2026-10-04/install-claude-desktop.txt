@@ -1,0 +1,10 @@
+]0;Administrator:  C:\Windows\system32\cmd.exe \gas sponsor on � no MON needed
+
+registering claude-desktop on the chain�
+
+asking the chain what claude-desktop already holds�
+
+installed
+
+next: run `mida approve claude-desktop` in this folder
+

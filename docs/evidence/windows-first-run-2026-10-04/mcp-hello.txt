@@ -1,0 +1,1 @@
+initialize ok: {"name":"mida-mcp","version":"0.1.0"}

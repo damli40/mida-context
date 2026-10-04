@@ -1,5 +1,7 @@
 # A first end-to-end run of Mida on Windows, built from the Windows branch (Oct 3, 2026)
 
+**Superseded.** This run tested the port's first batch. The agent-config steps it records as failing were fixed and pass in [`windows-first-run-2026-10-04.md`](windows-first-run-2026-10-04.md), so its advice not to point Codex at Mida on Windows no longer holds.
+
 **Question.** Mida 0.1.2 does not start on Windows: `mida init` fails before it registers anything. The first batch of the native Windows port replaces the parts that assume a Mac or Linux machine (how files are saved safely, how commands reach the background service, how it starts and stops processes). Does Mida's own path now work end to end on a clean Windows machine?
 
 **Result.** Yes, for Mida's own side. On Windows Server 2025 (`Microsoft Windows NT 10.0.26100.0`) with Node 22.23.3, the branch's build, installed into a folder with a space in its path (`C:\mida test\npm`), passed every gated step:

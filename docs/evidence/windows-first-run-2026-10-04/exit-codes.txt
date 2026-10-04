@@ -1,0 +1,2 @@
+doctor 2
+run-hook codex cmd exit 1 objective False
