@@ -169,7 +169,7 @@ function probeClaudeVersion(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): 
   if (binary === undefined) return undefined
   try {
     const result = crossSpawn.sync(binary, ["--version"], { env, encoding: "utf8", timeout: 5_000, windowsHide: true })
-    if (result.error !== undefined) return undefined
+    if (result.error) return undefined
     return /\d+\.\d+\.\d+/.exec(`${result.stdout ?? ""}\n${result.stderr ?? ""}`)?.[0]
   } catch {
     return undefined
