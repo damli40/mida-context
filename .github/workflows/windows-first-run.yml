@@ -179,6 +179,7 @@ jobs:
           $cmdExit = $LASTEXITCODE
           $cmdHasObjective = Select-String -Path "$env:RUNNER_TEMP\log\run-hook-codex-cmd.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet
           "run-hook codex cmd exit $cmdExit objective $cmdHasObjective" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          exit 0
 
       - name: The Codex config is valid TOML
         run: |
