@@ -3,10 +3,11 @@
 Each file here is one measurement or one live run: what was asked, the result, how it was done, what it does
 not show, and the raw data beside it. A number quoted in the README or anywhere else should point at one of these.
 
-## Oct 3, 2026 (the fix round for 0.1.3)
+## Oct 3 to 4, 2026 (the fix round for 0.1.3)
 
 | File | What it shows | Sample |
 |---|---|---|
+| [`claude-code-desktop-app-2026-10-04.md`](claude-code-desktop-app-2026-10-04.md) | Whether Mida works in the Claude Code desktop app with the setup it already has for the terminal | One session on macOS, Claude Code 2.1.286 |
 | [`prov17-queued-message-2026-10-03.md`](prov17-queued-message-2026-10-03.md) | Whether a change the owner types while Claude Code is working reaches the next agent as the owner's words, before and after the fix | One real session; 3 runs per build and model, DeepSeek and Claude Haiku |
 | [`benchmarks-rerun-2026-10-03.md`](benchmarks-rerun-2026-10-03.md) | Whether the two Oct 2 benchmark results with Mida still hold on the build with the Oct 3 fixes | 10 runs, 5 per benchmark, Mida condition only |
 

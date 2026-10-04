@@ -211,7 +211,7 @@ cd publish/cli && npm pack && npm install -g mida-context-0.1.3.tgz
 
 | Agent | How Mida connects | Status |
 |---|---|---|
-| Claude Code | Hooks, plus the MCP server for mid-session reads | Hooks live, Sep 27; MCP server in tests |
+| Claude Code, in the terminal or the desktop app | Hooks, plus the MCP server for mid-session reads | Hooks live, Sep 27; desktop app live, Oct 4 ([evidence](docs/evidence/claude-code-desktop-app-2026-10-04.md)); MCP server in tests |
 | Codex CLI and the Codex app | Hooks (trust them once in `/hooks`), plus the MCP server | Hooks live, Sep 27; MCP server in tests |
 | Devin | Hooks | Live, Sep 27 |
 | Claude Desktop | MCP server `mida-mcp`: `mida_handoff`, `mida_whats_new`, `mida_read`, `mida_status`, `mida_save` | Live, Sep 27 |
@@ -489,6 +489,7 @@ you included. `mida export <folder>` writes a readable copy first.
 | Set up, approve, save, hand off, revoke, live on Monad testnet | ✅ Sep 22 and Sep 27 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | Handoff both ways between Claude Code and Codex | ✅ Live, Sep 27 |
 | Devin, Claude Desktop, the Codex app | ✅ Live, Sep 27 |
+| The Claude Code desktop app, with the same `mida install claude-code`: handoff at session start, update note on each prompt, saves | ✅ One session on macOS, Oct 4 ([evidence](docs/evidence/claude-code-desktop-app-2026-10-04.md)) |
 | Passkey owner: sign-up and approve in the browser | ✅ Live, Sep 22 ([evidence](docs/evidence/m3-passkey-live-2026-09-22.json)) |
 | Hosted store and gas sponsor | ✅ Live |
 | Linux: install, set up, approve, save, hand off, revoke | ✅ One run on Ubuntu, Oct 2, with no agent on the machine ([evidence](docs/evidence/linux-first-run-2026-10-02.md)) |
