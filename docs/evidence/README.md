@@ -8,6 +8,8 @@ not show, and the raw data beside it. A number quoted in the README or anywhere 
 | File | What it shows | Sample |
 |---|---|---|
 | [`claude-code-desktop-app-2026-10-04.md`](claude-code-desktop-app-2026-10-04.md) | Whether Mida works in the Claude Code desktop app with the setup it already has for the terminal | One session on macOS, Claude Code 2.1.286 |
+| [`prov19-tool-output-label-2026-10-04.md`](prov19-tool-output-label-2026-10-04.md) | Whether tool output and hook messages reached the summary model labelled as the user, before and after the fix | One real session; 3 runs per build and model, DeepSeek and Claude Haiku |
+| [`windows-first-run-2026-10-03.md`](windows-first-run-2026-10-03.md) | Whether Mida's own path works end to end on a clean Windows machine, built from the Windows branch, before the agent-config fixes | One run on GitHub's Windows Server 2025 runner, no agent on the machine |
 | [`prov17-queued-message-2026-10-03.md`](prov17-queued-message-2026-10-03.md) | Whether a change the owner types while Claude Code is working reaches the next agent as the owner's words, before and after the fix | One real session; 3 runs per build and model, DeepSeek and Claude Haiku |
 | [`benchmarks-rerun-2026-10-03.md`](benchmarks-rerun-2026-10-03.md) | Whether the two Oct 2 benchmark results with Mida still hold on the build with the Oct 3 fixes | 10 runs, 5 per benchmark, Mida condition only |
 
