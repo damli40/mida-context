@@ -169,9 +169,16 @@ jobs:
           node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" claude-code "$HOME\demo-project" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\run-hook-claude-code.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Select-String -Path "$env:RUNNER_TEMP\log\run-hook-claude-code.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet)) { "FAIL: claude-code's own hook entry did not deliver the checkpoint"; exit 1 }
-          node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" codex "$HOME\demo-project" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\run-hook-codex.txt"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (-not (Select-String -Path "$env:RUNNER_TEMP\log\run-hook-codex.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet)) { "FAIL: codex's own hook entry did not deliver the checkpoint"; exit 1 }
+          node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" codex "$HOME\demo-project" powershell 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\run-hook-codex-powershell.txt"
+          if ($LASTEXITCODE -ne 0) { "FAIL: codex's own hook entry through powershell exited $LASTEXITCODE"; exit $LASTEXITCODE }
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\log\run-hook-codex-powershell.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet)) { "FAIL: codex's own hook entry did not deliver the checkpoint through powershell"; exit 1 }
+          node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" codex "$HOME\demo-project" pwsh 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\run-hook-codex-pwsh.txt"
+          if ($LASTEXITCODE -ne 0) { "FAIL: codex's own hook entry through pwsh exited $LASTEXITCODE"; exit $LASTEXITCODE }
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\log\run-hook-codex-pwsh.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet)) { "FAIL: codex's own hook entry did not deliver the checkpoint through pwsh"; exit 1 }
+          node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" codex "$HOME\demo-project" cmd 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\run-hook-codex-cmd.txt"
+          $cmdExit = $LASTEXITCODE
+          $cmdHasObjective = Select-String -Path "$env:RUNNER_TEMP\log\run-hook-codex-cmd.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet
+          "run-hook codex cmd exit $cmdExit objective $cmdHasObjective" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
 
       - name: The Codex config is valid TOML
         run: |
@@ -248,7 +255,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Select-String -Path "$env:RUNNER_TEMP\log\handoff-after-revoke.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet) { "FAIL: a revoked agent still received the checkpoint"; exit 1 }
           if (-not (Select-String -Path "$env:RUNNER_TEMP\log\handoff-after-revoke.txt" -SimpleMatch "(revoked by the owner)" -Quiet)) { "FAIL: the handoff after revoke did not name the revoke as the reason"; exit 1 }
-          node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" codex "$HOME\demo-project" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\handoff-after-revoke-codex-way.txt"
+          node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" codex "$HOME\demo-project" powershell 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\handoff-after-revoke-codex-way.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Select-String -Path "$env:RUNNER_TEMP\log\handoff-after-revoke-codex-way.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet) { "FAIL: a revoked agent still received the checkpoint through its own hook entry"; exit 1 }
           if (-not (Select-String -Path "$env:RUNNER_TEMP\log\handoff-after-revoke-codex-way.txt" -SimpleMatch "(revoked by the owner)" -Quiet)) { "FAIL: the handoff through the hook entry after revoke did not name the revoke as the reason"; exit 1 }
