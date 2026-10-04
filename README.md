@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Monad-testnet%2010143-836EF9?style=flat-square&labelColor=14130F" alt="Monad testnet, chain 10143">
   <img src="https://img.shields.io/badge/status-pre--release-b08800?style=flat-square&labelColor=14130F" alt="Pre-release">
-  <img src="https://img.shields.io/badge/tests-3%2C978%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,978 tests passing">
+  <img src="https://img.shields.io/badge/tests-3%2C998%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,998 tests passing">
   <img src="https://img.shields.io/badge/audit-none-7e8c86?style=flat-square&labelColor=14130F" alt="Not audited">
   <img src="https://img.shields.io/badge/license-MIT-7e8c86?style=flat-square&labelColor=14130F" alt="MIT license">
 </p>
@@ -539,7 +539,7 @@ you included. `mida export <folder>` writes a readable copy first.
 | npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
 | Security audit | ❌ None |
 
-3,978 automated tests pass on this release: `pnpm test`.
+3,998 automated tests pass on this release: `pnpm test`.
 
 ---
 
