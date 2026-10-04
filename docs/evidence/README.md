@@ -7,6 +7,7 @@ not show, and the raw data beside it. A number quoted in the README or anywhere 
 
 | File | What it shows | Sample |
 |---|---|---|
+| [`linux-npm-0.1.3-2026-10-04.md`](linux-npm-0.1.3-2026-10-04.md) | Whether the published 0.1.3 installs from npm and works end to end on a clean Linux machine | One run on Ubuntu 24.04, no agent on the machine |
 | [`claude-code-desktop-app-2026-10-04.md`](claude-code-desktop-app-2026-10-04.md) | Whether Mida works in the Claude Code desktop app with the setup it already has for the terminal | One session on macOS, Claude Code 2.1.286 |
 | [`prov19-tool-output-label-2026-10-04.md`](prov19-tool-output-label-2026-10-04.md) | Whether tool output and hook messages reached the summary model labelled as the user, before and after the fix | One real session; 3 runs per build and model, DeepSeek and Claude Haiku |
 | [`windows-first-run-2026-10-04.md`](windows-first-run-2026-10-04.md) | Whether 0.1.3 works end to end on a clean Windows machine with every step a gate: installs, each agent's own hook entry (Codex's through PowerShell), Claude Desktop's tool server, revoke | One run on GitHub's Windows Server 2025 runner, no agent on the machine |

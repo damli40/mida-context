@@ -24,7 +24,7 @@ Or build it from the repo and install the tarball:
 cd mida-context
 pnpm install && pnpm build:publish
 cd publish/cli && npm pack
-npm install -g mida-context-0.1.3.tgz
+npm install -g mida-context-0.1.4.tgz
 ```
 
 This needs pnpm (`npm install -g pnpm`). Windows PowerShell does not accept `&&`: run `pnpm install`,

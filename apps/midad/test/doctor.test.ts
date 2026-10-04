@@ -1894,7 +1894,10 @@ describe("mida doctor --live", () => {
       }) as never,
     })
     session.stop()
-    expect(spawned).toEqual([{ command: binary, args: ["exec", "Reply with the word ok."] }])
+    // --skip-git-repo-check: `codex exec` refuses to run outside a git repository, and the
+    // throwaway session folder is never one — without the flag the live check could never see
+    // the SessionStart hook fire (UF-014 B1)
+    expect(spawned).toEqual([{ command: binary, args: ["exec", "--skip-git-repo-check", "Reply with the word ok."] }])
   })
 })
 
@@ -2648,5 +2651,63 @@ describe("doctor on Windows", () => {
       `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with taskkill /PID ${holder.pid} /F, then open any agent session or run mida task to start a fresh one.`,
     )
     expect(lines.some((line) => line.includes(`kill ${holder.pid}`))).toBe(false)
+  })
+
+  // UF-014 B2: on Windows the hooks go in as the exec form (command + args) that Claude Code
+  // runs only from 2.1.139 — an older claude skips them while the settings still read
+  // "installed". The version answer is injected; the real claude never runs in these tests.
+  const installedClaude = (): string => {
+    const settings = join(dir(), "settings.json")
+    installClaudeCode(settings)
+    return settings
+  }
+
+  it("a Claude Code older than 2.1.139 is named — the exec-form hooks are skipped (UF-014 B2)", async () => {
+    const lines = await doctorLines({
+      platform: "win32",
+      settings: { "claude-code": installedClaude() },
+      claudeUserConfig: join(dir(), "no-user-config.json"),
+      claudeVersion: () => "2.1.138",
+    })
+    expect(lines).toContain(
+      "PROBLEM: Claude Code 2.1.138 skips the hooks Mida writes on Windows (they need 2.1.139 or later) — update Claude Code, then run `mida doctor` again",
+    )
+  })
+
+  it("2.1.139 and later earn no version line", async () => {
+    for (const version of ["2.1.139", "2.2.0"]) {
+      const lines = await doctorLines({
+        platform: "win32",
+        settings: { "claude-code": installedClaude() },
+        claudeUserConfig: join(dir(), "no-user-config.json"),
+        claudeVersion: () => version,
+      })
+      expect(lines.every((line) => !line.includes("skips the hooks"))).toBe(true)
+    }
+  })
+
+  it("a claude whose version cannot be read earns no version line", async () => {
+    const lines = await doctorLines({
+      platform: "win32",
+      settings: { "claude-code": installedClaude() },
+      claudeUserConfig: join(dir(), "no-user-config.json"),
+      claudeVersion: () => undefined,
+    })
+    expect(lines.every((line) => !line.includes("skips the hooks"))).toBe(true)
+  })
+
+  it("off Windows the version probe never runs — not even for a too-old answer", async () => {
+    let calls = 0
+    const lines = await doctorLines({
+      platform: "darwin",
+      settings: { "claude-code": installedClaude() },
+      claudeUserConfig: join(dir(), "no-user-config.json"),
+      claudeVersion: () => {
+        calls += 1
+        return "2.0.0"
+      },
+    })
+    expect(calls).toBe(0)
+    expect(lines.every((line) => !line.includes("skips the hooks"))).toBe(true)
   })
 })

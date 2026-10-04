@@ -8,7 +8,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Monad-testnet%2010143-836EF9?style=flat-square&labelColor=14130F" alt="Monad testnet, chain 10143">
   <img src="https://img.shields.io/badge/status-pre--release-b08800?style=flat-square&labelColor=14130F" alt="Pre-release">
-  <img src="https://img.shields.io/badge/tests-3%2C978%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,978 tests passing">
+  <img src="https://img.shields.io/badge/tests-3%2C998%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,998 tests passing">
   <img src="https://img.shields.io/badge/audit-none-7e8c86?style=flat-square&labelColor=14130F" alt="Not audited">
   <img src="https://img.shields.io/badge/license-MIT-7e8c86?style=flat-square&labelColor=14130F" alt="MIT license">
 </p>
@@ -216,7 +216,7 @@ You need pnpm (`npm install -g pnpm`).
 ```bash
 git clone --recurse-submodules https://github.com/damli40/mida-context && cd mida-context
 pnpm install && pnpm build:publish
-cd publish/cli && npm pack && npm install -g mida-context-0.1.3.tgz
+cd publish/cli && npm pack && npm install -g mida-context-0.1.4.tgz
 ```
 
 Windows PowerShell does not accept `&&`, so there it is one command per line:
@@ -228,7 +228,7 @@ pnpm install
 pnpm build:publish
 cd publish/cli
 npm pack
-npm install -g mida-context-0.1.3.tgz
+npm install -g mida-context-0.1.4.tgz
 ```
 
 </details>
@@ -524,7 +524,7 @@ you included. `mida export <folder>` writes a readable copy first.
 | The Claude Code desktop app, with the same `mida install claude-code`: handoff at session start, update note on each prompt, saves | ✅ One session on macOS, Oct 4 ([evidence](docs/evidence/claude-code-desktop-app-2026-10-04.md)) |
 | Passkey owner: sign-up and approve in the browser | ✅ Live, Sep 22 ([evidence](docs/evidence/m3-passkey-live-2026-09-22.json)) |
 | Hosted store and gas sponsor | ✅ Live |
-| Linux: install, set up, approve, save, hand off, revoke | ✅ One run on Ubuntu, Oct 2, with no agent on the machine ([evidence](docs/evidence/linux-first-run-2026-10-02.md)) |
+| Linux: install, set up, approve, save, hand off, revoke | ✅ Two runs on Ubuntu with no agent on the machine: 0.1.2 on Oct 2 ([evidence](docs/evidence/linux-first-run-2026-10-02.md)), and 0.1.3 installed from npm on Oct 4 ([evidence](docs/evidence/linux-npm-0.1.3-2026-10-04.md)) |
 | Windows: install, set up, approve, the hook entries Claude Code and Codex run (Codex's through PowerShell), Claude Desktop's tool server, save, hand off, revoke | ✅ One run on GitHub's Windows machine, Oct 4, with no agent on the machine ([evidence](docs/evidence/windows-first-run-2026-10-04.md)). No real agent has run on Windows yet |
 | Batching: saves anchored by Mida's batcher, gas sponsored | ✅ Live for invited owners, Sep 29 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
 | A change of plan you make mid-session reaches the next agent, credited to you | ✅ 6 of 6 on a real model, was 0 of 6 ([evidence](docs/evidence/live-tests-2026-09-27-to-29.md)) |
@@ -539,7 +539,7 @@ you included. `mida export <folder>` writes a readable copy first.
 | npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
 | Security audit | ❌ None |
 
-3,978 automated tests pass on this release: `pnpm test`.
+3,998 automated tests pass on this release: `pnpm test`.
 
 ---
 

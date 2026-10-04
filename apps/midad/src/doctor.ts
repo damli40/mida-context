@@ -111,6 +111,12 @@ export interface DoctorDeps {
    * still waiting. Injectable so tests script the store's answer.
    */
   probeBatchSave?: (entry: PendingAnchor) => Promise<{ state: string; reason: string | null } | null>
+  /**
+   * The `claude --version` answer the Windows hooks check reads — the default resolves `claude`
+   * on PATH and runs it once; undefined is "not found, failed, timed out or no version in the
+   * output", which earns no line. Injectable so a test never runs a real claude (UF-014 B2).
+   */
+  claudeVersion?: (env: NodeJS.ProcessEnv, platform: NodeJS.Platform) => string | undefined
 }
 
 interface DoctorLiveDeps extends DoctorDeps {
@@ -151,6 +157,36 @@ interface Shared {
 
 const problem = (sentence: string, fix: string) => `PROBLEM: ${sentence} — ${fix}`
 const INIT_FIX = "run `mida init`"
+
+/**
+ * The real `claude --version`, for the Windows hooks check (UF-014 B2): resolved on PATH only
+ * (a claude.cmd planted in the working folder must never run), one quiet sync call that may
+ * simply not answer. Every failure — no binary, spawn error, timeout, no X.Y.Z in the output —
+ * reads as undefined, and undefined earns no line.
+ */
+function probeClaudeVersion(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string | undefined {
+  const binary = resolveBinary("claude", env.PATH, platform)
+  if (binary === undefined) return undefined
+  try {
+    const result = crossSpawn.sync(binary, ["--version"], { env, encoding: "utf8", timeout: 5_000, windowsHide: true })
+    if (result.error) return undefined
+    return /\d+\.\d+\.\d+/.exec(`${result.stdout ?? ""}\n${result.stderr ?? ""}`)?.[0]
+  } catch {
+    return undefined
+  }
+}
+
+/** Semver "lower than": 2.1.138 is before 2.1.139; 2.1.139 and 2.2.0 are not. */
+function versionBefore(version: string, minimum: string): boolean {
+  const a = version.split(".").map((part) => Number.parseInt(part, 10))
+  const b = minimum.split(".").map((part) => Number.parseInt(part, 10))
+  for (let index = 0; index < b.length; index += 1) {
+    const left = a[index] ?? 0
+    const right = b[index] ?? 0
+    if (left !== right) return left < right
+  }
+  return false
+}
 /** A batched save still QUEUED or SUBMITTED this long is a stuck-batch report, not a note. */
 const STUCK_ANCHOR_MS = 10 * 60 * 1000
 
@@ -978,6 +1014,18 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
                   ? problem("claude-code settings cannot be read safely", "fix the file, then run `mida install claude-code`")
                   : problem("claude-code hooks are not installed", "run `mida install claude-code`"),
           )
+          // UF-014 B2 (Windows only): "installed" proves the settings match — but Claude Code
+          // runs the exec-form hooks Mida writes there only from 2.1.139, and an older claude
+          // skips them silently. A claude that is not on PATH or whose version cannot be read
+          // earns no line: the other checks already report a missing one.
+          if (status === "installed" && isWindows(platform)) {
+            const version = (deps.claudeVersion ?? probeClaudeVersion)(env, platform)
+            if (version !== undefined && versionBefore(version, "2.1.139")) {
+              lines.push(
+                problem(`Claude Code ${version} skips the hooks Mida writes on Windows (they need 2.1.139 or later)`, "update Claude Code, then run `mida doctor` again"),
+              )
+            }
+          }
           // "installed" only proves the text matches — the path inside it is what runs, so it
           // is stat'ed too; an "outdated" file may be a moved checkout's paths, worth the same stat (R5-7)
           if (status === "installed" || status === "outdated") {
@@ -1637,7 +1685,11 @@ export function startToolSession(
   const name = tool === "claude-code" ? "claude" : "codex"
   const binary = resolveBinary(name, env.PATH)
   if (binary === undefined) return { stop() {} }
-  const args = tool === "claude-code" ? ["-p", "Reply with the word ok."] : ["exec", "Reply with the word ok."]
+  // --skip-git-repo-check: `codex exec` refuses to run outside a git repository (the summarizer
+  // passes it for the same reason) and the throwaway folder is never one — without it the
+  // session never starts and the SessionStart watch can only time out (UF-014 B1). It skips the
+  // repo check only, never the hook trust this check exists to prove.
+  const args = tool === "claude-code" ? ["-p", "Reply with the word ok."] : ["exec", "--skip-git-repo-check", "Reply with the word ok."]
   // A model child gets the same environment rule as the drainer: no ANTHROPIC_* name crosses over.
   const child = (deps.spawn ?? crossSpawn)(binary, args, { cwd, stdio: "ignore", env: drainerEnv(env), windowsHide: true })
   child.on("error", () => {})

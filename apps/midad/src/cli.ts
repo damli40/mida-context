@@ -1392,7 +1392,7 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
         ready.push(name)
         continue
       }
-      deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
+      deps.print(ownerRefusalLine("approve --all", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
       failed.push(`${name} (${refusalCode(error)})`)
     }
   }
@@ -1438,7 +1438,7 @@ async function approveAll(runtime: Runtime, deps: CliDeps): Promise<number> {
         deps.print(`${name} is approved on chain, but this machine has no record of that approval, so ${name} cannot read or save here. To repair it: mida revoke ${name}, then mida request ${name}, then mida approve ${name}.`)
       }
     } catch (error) {
-      deps.print(ownerRefusalLine("approve", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
+      deps.print(ownerRefusalLine("approve --all", name, error, runtime.owner, runtime.chain.deployment.capabilityRegistry, runtime.home))
       const hint = sponsorTimeoutHint(name, error)
       if (hint !== undefined) deps.print(hint)
       // UF-APR5 F4: a used-up request's finish path ends at approve's already-approved answer
@@ -1886,6 +1886,26 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     // MidaError prefixes its own message with "<code>: " — the owner reads the sentence, not
     // the code, so that prefix is stripped here.
     case "OWNER_WALLET_LOW": {
+      // UF-014 B3: the sponsor gave up because the public Monad RPC stayed rate-limited and the
+      // owner's own wallet was empty — the recovery is the same command a minute later, not
+      // "send MON": init and every approve check the chain first and send only what is still
+      // missing. Any other sponsor reason (or none) keeps the wallet answers below.
+      if (error instanceof Error) {
+        const sponsor = /the gas sponsor did not pay \(([^)]*)\)/i.exec(error.message)?.[1]
+        if (sponsor !== undefined && /rate-limited/i.test(sponsor)) {
+          const retry =
+            command === "init"
+              ? "mida init"
+              : command === "approve --all" || (command === "approve" && agent === "--all")
+                ? "mida approve --all"
+                : command === "approve"
+                  ? `mida approve ${agent}`
+                  : undefined
+          if (retry !== undefined) {
+            return `Monad testnet is busy: the gas sponsor's requests were rate-limited, and your wallet has no MON to pay instead. Run ${retry} again in a minute; Mida checks the chain first and sends only what is still missing.`
+          }
+        }
+      }
       // No funder and no sponsor means the owner wallet itself pays for everything — so the
       // answer to a failed init is always the address that needs MON, not the wallet that was
       // short mid-run. `init` resumes: re-running it sends only what has not landed yet.
@@ -2425,7 +2445,7 @@ async function passkeyApproveAll(session: ServiceRuntime, deps: CliDeps, linkDep
       )
     } catch (error) {
       // A page outcome already IS the line the owner reads; a coded error goes through the mapper.
-      deps.print(error instanceof OwnerLinkOutcome ? error.line : ownerRefusalLine("approve", name, error, undefined, deps.network.deployment.capabilityRegistry, session.home))
+      deps.print(error instanceof OwnerLinkOutcome ? error.line : ownerRefusalLine("approve --all", name, error, undefined, deps.network.deployment.capabilityRegistry, session.home))
       failed.push(`${name} (${error instanceof OwnerLinkOutcome ? error.kind : refusalCode(error)})`)
     }
   }
